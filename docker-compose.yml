@@ -1,0 +1,41 @@
+# Production stack for lenny2 (standalone Docker, plain compose — not Swarm).
+# Secrets come from a sibling .env file (never committed). See .env.example.
+# The server publishes on 127.0.0.1:8300 only; the host cloudflared tunnel
+# routes rtdb.pardev.net -> localhost:8300.
+services:
+  postgres:
+    image: postgres:17
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: rtdb
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: rtdb
+    volumes:
+      - rtdb-pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rtdb"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  server:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      RTDB_PORT: "8300"
+      RTDB_DATABASE_URL: postgres://rtdb:${POSTGRES_PASSWORD}@postgres:5432/rtdb
+      RTDB_ADMIN_KEY: ${RTDB_ADMIN_KEY:?set RTDB_ADMIN_KEY in .env}
+      RTDB_PUBLIC_URL: ${RTDB_PUBLIC_URL:-https://rtdb.pardev.net}
+      RTDB_ALLOWED_ORIGINS: ${RTDB_ALLOWED_ORIGINS:-https://projects.pardev.net}
+      RTDB_GITHUB_CLIENT_ID: ${RTDB_GITHUB_CLIENT_ID:-}
+      RTDB_GITHUB_CLIENT_SECRET: ${RTDB_GITHUB_CLIENT_SECRET:-}
+      RTDB_SESSION_TTL_DAYS: ${RTDB_SESSION_TTL_DAYS:-30}
+      RUST_LOG: ${RUST_LOG:-info}
+    ports:
+      - "127.0.0.1:8300:8300"
+
+volumes:
+  rtdb-pg:
