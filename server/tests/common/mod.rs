@@ -29,6 +29,7 @@ pub async fn test_state() -> Arc<AppState> {
     AppState::new(pool, test_config())
 }
 
+#[allow(dead_code)]
 pub async fn spawn_app(state: Arc<AppState>) -> SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -80,6 +81,7 @@ pub async fn fresh_db(state: &Arc<AppState>) -> String {
     name
 }
 
+#[allow(dead_code)]
 pub async fn admin_post(
     addr: SocketAddr,
     path: &str,

@@ -4,6 +4,7 @@ pub mod db;
 pub mod ddl;
 pub mod error;
 pub mod schema;
+pub mod txn;
 
 use std::sync::Arc;
 
