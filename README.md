@@ -184,3 +184,9 @@ that ultimately terminates a connection that never closes on its own.
   initiating *origin* (so a malicious page can't receive the session token even if it can
   trigger the flow), but not to the initiating *browser* (no PKCE, no state cookie) — see
   the design spec's Auth section for the accepted-risk rationale.
+
+## TypeScript client
+
+The `client/` package (`@par-rt-db/client`) is the browser/Node SDK: schema builder,
+reactive WebSocket client, React bindings, and HTTP/admin clients. See
+[`client/README.md`](client/README.md).
