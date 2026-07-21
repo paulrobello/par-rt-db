@@ -46,6 +46,16 @@ import { schema } from "./schema";
 const client = new RtDbClient({ url: "wss://rtdb.pardev.net", db: "kanban", getToken: () => localStorage.getItem("rtdb-session-token") });
 const api = createApi(schema);
 
+// RtDbProvider is required around any component using the hooks. `authBaseUrl`
+// is the server's HTTP origin, used for the GitHub sign-in popup and logout.
+function App() {
+  return (
+    <RtDbProvider client={client} authBaseUrl="https://rtdb.pardev.net">
+      <Board projectId="p1" />
+    </RtDbProvider>
+  );
+}
+
 function Board({ projectId }: { projectId: string }) {
   const items = useQuery(api.items.query().withIndex("by_project", [projectId]).collect());
   const mutate = useMutation();

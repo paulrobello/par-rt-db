@@ -2,7 +2,7 @@ COMPOSE_DEV = docker compose -f docker-compose.dev.yml
 export RTDB_TEST_DATABASE_URL ?= postgres://rtdb:rtdb@127.0.0.1:55434/rtdb
 
 .PHONY: build test lint fmt fmt-check typecheck checkall dev-db-up dev-db-down \
-	pre-commit pre-commit-update client-install client-check
+	pre-commit pre-commit-update client-install
 
 build:
 	cd server && cargo build
