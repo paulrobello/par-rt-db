@@ -35,9 +35,17 @@ pub struct SchemaDef {
     pub tables: BTreeMap<String, TableDef>,
 }
 
-/// Table/field identifier regex: `^[a-zA-Z][a-zA-Z0-9_]{0,62}$`.
-fn is_valid_identifier(s: &str) -> bool {
-    if s.is_empty() || s.len() > 63 {
+/// Table and index names cap at 30 chars, and field names at 60 chars, so that
+/// the DDL layer's physical names (`t_`/`f_` prefixes, `i_<table>_<index>`
+/// composition, all lowercased) stay within Postgres's 63-byte identifier limit:
+/// worst case `i_` + 30 + `_` + 30 = 63, exactly at the limit.
+const MAX_TABLE_NAME_LEN: usize = 30;
+const MAX_INDEX_NAME_LEN: usize = 30;
+const MAX_FIELD_NAME_LEN: usize = 60;
+
+/// Identifier regex `^[a-zA-Z][a-zA-Z0-9_]*$` bounded to `max_len` total chars.
+fn is_valid_identifier(s: &str, max_len: usize) -> bool {
+    if s.is_empty() || s.len() > max_len {
         return false;
     }
     let mut chars = s.chars();
@@ -142,10 +150,16 @@ pub fn indexed_column_type(ty: &FieldType) -> Result<(&'static str, bool), RtDbE
 
 impl TableDef {
     fn validate_structure(&self, table_name: &str) -> Result<(), RtDbError> {
+        let mut lower_field_names = HashSet::new();
         for (field_name, field_type) in &self.fields {
-            if !is_valid_identifier(field_name) {
+            if !is_valid_identifier(field_name, MAX_FIELD_NAME_LEN) {
                 return Err(RtDbError::schema(format!(
                     "table '{table_name}' has invalid field name '{field_name}'"
+                )));
+            }
+            if !lower_field_names.insert(field_name.to_lowercase()) {
+                return Err(RtDbError::schema(format!(
+                    "table '{table_name}' has field name '{field_name}' that collides case-insensitively with another field"
                 )));
             }
             validate_field_type(field_type)?;
@@ -153,15 +167,15 @@ impl TableDef {
 
         let mut index_names = HashSet::new();
         for index in &self.indexes {
-            if !is_valid_identifier(&index.name) {
+            if !is_valid_identifier(&index.name, MAX_INDEX_NAME_LEN) {
                 return Err(RtDbError::schema(format!(
                     "table '{table_name}' has invalid index name '{}'",
                     index.name
                 )));
             }
-            if !index_names.insert(index.name.as_str()) {
+            if !index_names.insert(index.name.to_lowercase()) {
                 return Err(RtDbError::schema(format!(
-                    "table '{table_name}' has duplicate index name '{}'",
+                    "table '{table_name}' has duplicate index name '{}' (case-insensitive)",
                     index.name
                 )));
             }
@@ -207,7 +221,7 @@ impl SchemaDef {
     pub fn validate(&self) -> Result<(), RtDbError> {
         let mut lower_names = HashSet::new();
         for (table_name, table_def) in &self.tables {
-            if !is_valid_identifier(table_name) {
+            if !is_valid_identifier(table_name, MAX_TABLE_NAME_LEN) {
                 return Err(RtDbError::schema(format!(
                     "invalid table name '{table_name}'"
                 )));
@@ -399,10 +413,113 @@ mod tests {
     }
 
     #[test]
-    fn rejects_identifier_longer_than_63_chars() {
-        let long_name = "a".repeat(64);
+    fn accepts_table_name_at_max_length_30() {
+        let name = "a".repeat(30);
         let schema = SchemaDef {
-            tables: BTreeMap::from([(long_name, simple_table())]),
+            tables: BTreeMap::from([(name, simple_table())]),
+        };
+        assert!(schema.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_table_name_over_max_length_30() {
+        let name = "a".repeat(31);
+        let schema = SchemaDef {
+            tables: BTreeMap::from([(name, simple_table())]),
+        };
+        assert!(schema.validate().is_err());
+    }
+
+    #[test]
+    fn accepts_field_name_at_max_length_60() {
+        let field_name = "a".repeat(60);
+        let table = TableDef {
+            fields: BTreeMap::from([(field_name, FieldType::String)]),
+            indexes: vec![],
+        };
+        let schema = SchemaDef {
+            tables: BTreeMap::from([("items".to_string(), table)]),
+        };
+        assert!(schema.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_field_name_over_max_length_60() {
+        let field_name = "a".repeat(61);
+        let table = TableDef {
+            fields: BTreeMap::from([(field_name, FieldType::String)]),
+            indexes: vec![],
+        };
+        let schema = SchemaDef {
+            tables: BTreeMap::from([("items".to_string(), table)]),
+        };
+        assert!(schema.validate().is_err());
+    }
+
+    #[test]
+    fn accepts_index_name_at_max_length_30() {
+        let index_name = "a".repeat(30);
+        let table = TableDef {
+            fields: BTreeMap::from([("name".to_string(), FieldType::String)]),
+            indexes: vec![IndexDef {
+                name: index_name,
+                fields: vec!["name".to_string()],
+            }],
+        };
+        let schema = SchemaDef {
+            tables: BTreeMap::from([("items".to_string(), table)]),
+        };
+        assert!(schema.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_index_name_over_max_length_30() {
+        let index_name = "a".repeat(31);
+        let table = TableDef {
+            fields: BTreeMap::from([("name".to_string(), FieldType::String)]),
+            indexes: vec![IndexDef {
+                name: index_name,
+                fields: vec!["name".to_string()],
+            }],
+        };
+        let schema = SchemaDef {
+            tables: BTreeMap::from([("items".to_string(), table)]),
+        };
+        assert!(schema.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_case_insensitive_field_name_collision() {
+        let table = TableDef {
+            fields: BTreeMap::from([
+                ("status".to_string(), FieldType::String),
+                ("Status".to_string(), FieldType::String),
+            ]),
+            indexes: vec![],
+        };
+        let schema = SchemaDef {
+            tables: BTreeMap::from([("items".to_string(), table)]),
+        };
+        assert!(schema.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_case_insensitive_index_name_collision() {
+        let table = TableDef {
+            fields: BTreeMap::from([("name".to_string(), FieldType::String)]),
+            indexes: vec![
+                IndexDef {
+                    name: "by_x".to_string(),
+                    fields: vec!["name".to_string()],
+                },
+                IndexDef {
+                    name: "By_X".to_string(),
+                    fields: vec!["name".to_string()],
+                },
+            ],
+        };
+        let schema = SchemaDef {
+            tables: BTreeMap::from([("items".to_string(), table)]),
         };
         assert!(schema.validate().is_err());
     }
