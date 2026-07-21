@@ -59,17 +59,17 @@ fn insert_work_item_txn() -> Value {
     }}]})
 }
 
-/// Expects the connection to close, and if a close frame carries an explicit
-/// code, asserts it matches `expected_code` (A4: auth failures close with
-/// `4401`, distinct from `4400` for a generic protocol violation).
+/// Expects the connection to close with an explicit close frame carrying
+/// `expected_code` (A4: auth failures close with `4401`, distinct from
+/// `4400` for a generic protocol violation). A missing close frame (`None`
+/// or `Close(None)`) fails the assertion — a future regression that drops
+/// the frame must not pass silently.
 async fn expect_close_with_code(ws: &mut WsStream, expected_code: u16) {
     match ws.next().await {
-        None => {}
-        Some(Ok(Message::Close(None))) => {}
         Some(Ok(Message::Close(Some(frame)))) => {
             assert_eq!(u16::from(frame.code), expected_code);
         }
-        other => panic!("expected connection to close, got {other:?}"),
+        other => panic!("expected a close frame with code {expected_code}, got {other:?}"),
     }
 }
 

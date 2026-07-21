@@ -186,9 +186,11 @@ Client semantics match Convex: `useQuery` returns `undefined` until the first
   initiating *origin* — the callback page's `postMessage` target-origin is pinned to the
   origin validated at `/auth/github?origin=`, so a malicious page cannot receive the
   session token even if it can trigger the flow — but it is not bound to the initiating
-  *browser* (no PKCE, no state cookie). An attacker who can get a victim to complete a
-  GitHub authorization on the attacker's behalf could bind the resulting session to the
-  attacker's account. Accepted as an MVP risk for a personal, allowlisted deployment;
+  *browser* (no PKCE, no state cookie). An attacker who completes their own GitHub OAuth
+  exchange and then gets a victim's browser to load the resulting callback at an allowed
+  origin could have the victim's SPA receive and store the attacker's session token via
+  `postMessage` — logging the victim in as the attacker, not compromising the victim's
+  own account. Accepted as an MVP risk for a personal, allowlisted deployment;
   PKCE/cookie-binding is deferred to Plan 2's auth-client work.
 
 ## TypeScript client (`client/` package)

@@ -195,8 +195,10 @@ pub async fn push_schema(
         }
     }
 
-    let schema_json =
-        serde_json::to_value(&schema).map_err(|err| RtDbError::internal(err.to_string()))?;
+    let schema_json = serde_json::to_value(&schema).map_err(|err| {
+        tracing::error!(error = %err, db, "failed to serialize schema for storage");
+        RtDbError::internal("failed to store schema")
+    })?;
     sqlx::query(&format!(
         "INSERT INTO \"{pg_schema_name}\".meta (key, value) VALUES ('schema', $1) \
          ON CONFLICT (key) DO UPDATE SET value = excluded.value"

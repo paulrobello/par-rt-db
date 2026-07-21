@@ -169,5 +169,18 @@ that ultimately terminates a connection that never closes on its own.
 
 ## Known MVP limitations
 
+- A **session** that expires or is logged out mid-connection keeps its open WebSocket
+  connection working until the client disconnects. Machine-token revocation and
+  allowlist removal ARE enforced live — every `subscribe`/`mutate` re-checks
+  authorization on that open connection — but session-token expiry is not; closing that
+  gap needs the session token hash retained on `Principal::User`, deferred to Plan 2.
+- Graceful shutdown waits for open WebSocket connections to close on their own rather
+  than forcibly dropping them, with no timeout of its own — Docker's SIGTERM→SIGKILL
+  window is the backstop that ultimately terminates a connection that never closes (see
+  [Graceful shutdown](#graceful-shutdown) above).
 - `AuthedUser.name` is always `null`: the `rtdb_auth.users` table has no `name` column, so
   GitHub-authenticated users are only ever identified by `kind` and `email` on the wire.
+- OAuth popup login has an accepted CSRF residual: the `state` token is bound to the
+  initiating *origin* (so a malicious page can't receive the session token even if it can
+  trigger the flow), but not to the initiating *browser* (no PKCE, no state cookie) — see
+  the design spec's Auth section for the accepted-risk rationale.

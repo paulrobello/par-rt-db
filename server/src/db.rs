@@ -200,8 +200,10 @@ pub async fn load_schema(pool: &PgPool, db: &str) -> Result<Option<SchemaDef>, R
 
     match row {
         Some((value,)) => {
-            let schema = serde_json::from_value(value)
-                .map_err(|err| RtDbError::internal(err.to_string()))?;
+            let schema = serde_json::from_value(value).map_err(|err| {
+                tracing::error!(error = %err, db, "failed to deserialize stored schema");
+                RtDbError::internal("failed to read stored schema")
+            })?;
             Ok(Some(schema))
         }
         None => Ok(None),
