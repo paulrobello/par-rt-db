@@ -2,7 +2,7 @@ use std::collections::{BTreeSet, HashSet};
 
 use sqlx::PgPool;
 
-use crate::db::{load_schema, validate_db_name};
+use crate::db::{database_exists, load_schema, validate_db_name};
 use crate::error::RtDbError;
 use crate::schema::{FieldType, SchemaDef, TableDef, indexed_column_type};
 
@@ -107,6 +107,10 @@ pub async fn push_schema(
 ) -> Result<SchemaDef, RtDbError> {
     schema.validate()?;
     validate_db_name(db)?;
+
+    if !database_exists(pool, db).await? {
+        return Err(RtDbError::not_found("unknown database"));
+    }
 
     let previous = load_schema(pool, db).await?;
     if let Some(old_schema) = &previous {

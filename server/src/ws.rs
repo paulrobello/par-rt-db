@@ -22,6 +22,11 @@ const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(10);
 const RATE_LIMIT_MAX: u32 = 200;
 const PING_INTERVAL: Duration = Duration::from_secs(30);
 const LIVENESS_TIMEOUT: Duration = Duration::from_secs(75);
+/// Outbound-queue high-water mark: once a connection's `out_rx` backlog of
+/// unsent `ServerMessage`s (subscription pushes, etc.) exceeds this many, the
+/// reader on the other end is hopelessly behind and the connection is
+/// dropped rather than letting the backlog grow without bound.
+const MAX_OUT_QUEUE: usize = 1024;
 /// WS close code for an auth failure (bad/missing token, forbidden for this
 /// database): distinct from `CLOSE_PROTOCOL_VIOLATION` so clients know not
 /// to blind-retry with the same credentials. Both are in the 4000-4999
@@ -132,6 +137,11 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
             }
             Some(out_msg) = out_rx.recv() => {
                 if send_message(&mut socket, &out_msg).await.is_err() {
+                    break;
+                }
+                // A hopelessly-behind reader: drop it rather than let its
+                // backlog grow without bound. `remove_conn` below still runs.
+                if out_rx.len() > MAX_OUT_QUEUE {
                     break;
                 }
             }

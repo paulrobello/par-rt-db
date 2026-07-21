@@ -51,23 +51,41 @@ impl Committers {
     }
 
     /// Submits a request to `db`'s committer task, lazily spawning it on
-    /// first use. Errors `NotFound` if `db` isn't a registered database.
+    /// first use. Errors `NotFound` if `db` isn't a registered database. If
+    /// the send fails because the committer task is gone (e.g. it panicked),
+    /// evicts `db`'s stale sender from `channels` before returning the
+    /// error, so the next request respawns a fresh task instead of every
+    /// future request to `db` failing forever.
     pub async fn submit(&self, db: &str, req: CommitterRequest) -> Result<(), RtDbError> {
         let sender = self.channel_for(db).await?;
-        sender
-            .send(req)
-            .await
-            .map_err(|_| RtDbError::internal("committer task is no longer running"))
+        if sender.send(req).await.is_err() {
+            self.channels.lock().await.remove(db);
+            return Err(RtDbError::internal("committer task is no longer running"));
+        }
+        Ok(())
     }
 
+    /// Returns `db`'s committer sender, lazily spawning the task on first
+    /// use. No `.await` occurs while `channels` is locked: the cache-hit
+    /// fast path checks and releases the lock immediately; on a miss, the
+    /// lock is dropped before the `database_exists` query, then re-acquired
+    /// to insert (double-checking in case another task won the race and
+    /// already spawned one).
     async fn channel_for(&self, db: &str) -> Result<mpsc::Sender<CommitterRequest>, RtDbError> {
-        let mut guard = self.channels.lock().await;
-        if let Some(sender) = guard.get(db) {
-            return Ok(sender.clone());
+        {
+            let guard = self.channels.lock().await;
+            if let Some(sender) = guard.get(db) {
+                return Ok(sender.clone());
+            }
         }
 
         if !database_exists(&self.pool, db).await? {
             return Err(RtDbError::not_found(format!("database '{db}' not found")));
+        }
+
+        let mut guard = self.channels.lock().await;
+        if let Some(sender) = guard.get(db) {
+            return Ok(sender.clone());
         }
 
         let (tx, rx) = mpsc::channel(CHANNEL_BUFFER);

@@ -144,6 +144,28 @@ async fn destructive_push_removing_a_field_is_rejected() -> anyhow::Result<()> {
     Ok(())
 }
 
+// (d2) B1: push-schema against a database that was never created -> 404 NOT_FOUND
+// (not a raw 500 from the missing schema's `meta` table).
+#[tokio::test]
+async fn push_schema_against_unknown_database_is_not_found() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state).await;
+    let name = fresh_name();
+
+    let resp = admin_post(
+        addr,
+        "/admin/push-schema",
+        serde_json::json!({"db": name, "schema": kanban_schema_json()}),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(body["code"], "NOT_FOUND");
+
+    Ok(())
+}
+
 // (e) wrong admin key -> 401 UNAUTHORIZED.
 #[tokio::test]
 async fn wrong_admin_key_is_unauthorized() -> anyhow::Result<()> {

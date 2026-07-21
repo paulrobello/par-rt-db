@@ -132,7 +132,8 @@ pub async fn create_database(pool: &PgPool, name: &str) -> Result<(), RtDbError>
     let schema_name = pg_schema(name);
     sqlx::query(&format!("CREATE SCHEMA \"{schema_name}\""))
         .execute(&mut *tx)
-        .await?;
+        .await
+        .map_err(map_duplicate_database_error)?;
     sqlx::query(&format!(
         "CREATE TABLE \"{schema_name}\".meta (key text PRIMARY KEY, value jsonb NOT NULL)"
     ))
@@ -143,10 +144,29 @@ pub async fn create_database(pool: &PgPool, name: &str) -> Result<(), RtDbError>
         .bind(name)
         .bind(now_ms())
         .execute(&mut *tx)
-        .await?;
+        .await
+        .map_err(map_duplicate_database_error)?;
 
     tx.commit().await?;
     Ok(())
+}
+
+/// Maps a Postgres unique-violation (`23505`, the `rtdb_auth.databases` name
+/// primary key) or duplicate-schema (`42P06`, a concurrent `CREATE SCHEMA`)
+/// error to a `BadRequest` — both are symptoms of two concurrent
+/// `create_database` calls racing past the pre-check above for the same
+/// name. Any other error passes through as the usual `Internal` mapping.
+fn map_duplicate_database_error(err: sqlx::Error) -> RtDbError {
+    let is_duplicate = matches!(
+        &err,
+        sqlx::Error::Database(db_err)
+            if matches!(db_err.code().as_deref(), Some("23505") | Some("42P06"))
+    );
+    if is_duplicate {
+        RtDbError::bad_request("database already exists")
+    } else {
+        RtDbError::from(err)
+    }
 }
 
 pub async fn database_exists(pool: &PgPool, name: &str) -> Result<bool, RtDbError> {
