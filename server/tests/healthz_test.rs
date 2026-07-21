@@ -30,3 +30,47 @@ async fn healthz_returns_ok() -> anyhow::Result<()> {
     assert_eq!(body, "ok");
     Ok(())
 }
+
+async fn spawn_for_cors() -> anyhow::Result<std::net::SocketAddr> {
+    let pool = sqlx::PgPool::connect(&test_config().database_url).await?;
+    let state = AppState::new(pool, test_config());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    tokio::spawn(axum::serve(listener, build_router(state)).into_future());
+    Ok(addr)
+}
+
+#[tokio::test]
+async fn cors_preflight_echoes_allowed_origin() -> anyhow::Result<()> {
+    let addr = spawn_for_cors().await?;
+
+    let resp = reqwest::Client::new()
+        .request(reqwest::Method::OPTIONS, format!("http://{addr}/api/query"))
+        .header("Origin", "http://localhost:5173")
+        .header("Access-Control-Request-Method", "POST")
+        .send()
+        .await?;
+
+    assert_eq!(
+        resp.headers()
+            .get("access-control-allow-origin")
+            .map(|v| v.to_str().unwrap()),
+        Some("http://localhost:5173")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn cors_preflight_omits_header_for_disallowed_origin() -> anyhow::Result<()> {
+    let addr = spawn_for_cors().await?;
+
+    let resp = reqwest::Client::new()
+        .request(reqwest::Method::OPTIONS, format!("http://{addr}/api/query"))
+        .header("Origin", "http://evil.example")
+        .header("Access-Control-Request-Method", "POST")
+        .send()
+        .await?;
+
+    assert!(resp.headers().get("access-control-allow-origin").is_none());
+    Ok(())
+}

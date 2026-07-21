@@ -16,11 +16,14 @@ pub mod ws;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use axum::http::{HeaderValue, Method, header};
 use axum::{Router, routing::get};
 use committer::Committers;
 use config::Config;
 use db::SchemaCache;
 use subs::SubscriptionManager;
+use tower_http::cors::CorsLayer;
+use tower_http::trace::TraceLayer;
 
 use auth::github::OAuthStateEntry;
 
@@ -49,12 +52,38 @@ impl AppState {
     }
 }
 
+/// Origins allowed to send bearer tokens over CORS to `/auth/*` and the HTTP
+/// one-shot API. Origins that fail `HeaderValue` parsing are skipped (and
+/// logged) rather than rejecting startup — WS is exempt from CORS (Origin is
+/// already enforced at OAuth start, see `auth::github::github_start`).
+fn cors_layer(allowed_origins: &[String]) -> CorsLayer {
+    let origins: Vec<HeaderValue> = allowed_origins
+        .iter()
+        .filter_map(|origin| match HeaderValue::from_str(origin) {
+            Ok(value) => Some(value),
+            Err(err) => {
+                tracing::warn!(origin = %origin, error = %err, "skipping invalid CORS origin");
+                None
+            }
+        })
+        .collect();
+
+    CorsLayer::new()
+        .allow_origin(origins)
+        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
+}
+
 pub fn build_router(state: Arc<AppState>) -> Router {
+    let cors = cors_layer(&state.config.allowed_origins);
+
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .merge(admin::admin_routes())
         .merge(http_api::http_api_routes())
         .merge(ws::ws_routes())
         .merge(auth::github::auth_routes())
+        .layer(TraceLayer::new_for_http())
+        .layer(cors)
         .with_state(state)
 }

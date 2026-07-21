@@ -73,7 +73,10 @@ async fn github_start(
     State(state): State<Arc<AppState>>,
     QueryParams(params): QueryParams<GithubStartParams>,
 ) -> Response {
-    let Some(client_id) = state.config.github_client_id.as_deref() else {
+    let (Some(client_id), Some(_)) = (
+        state.config.github_client_id.as_deref(),
+        state.config.github_client_secret.as_deref(),
+    ) else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(RtDbError::internal("github oauth not configured")),
@@ -172,10 +175,16 @@ async fn complete_github_login(
         })
         .send()
         .await
-        .map_err(|_| RtDbError::internal("github token exchange failed"))?
+        .map_err(|err| {
+            tracing::warn!(error = %err, "github token exchange request failed");
+            RtDbError::internal("github token exchange failed")
+        })?
         .json()
         .await
-        .map_err(|_| RtDbError::internal("github token exchange failed"))?;
+        .map_err(|err| {
+            tracing::warn!(error = %err, "github token exchange response decode failed");
+            RtDbError::internal("github token exchange failed")
+        })?;
 
     let access_token = token_resp.access_token;
 
@@ -188,10 +197,16 @@ async fn complete_github_login(
         )
         .send()
         .await
-        .map_err(|_| RtDbError::internal("github user fetch failed"))?
+        .map_err(|err| {
+            tracing::warn!(error = %err, "github user fetch request failed");
+            RtDbError::internal("github user fetch failed")
+        })?
         .json()
         .await
-        .map_err(|_| RtDbError::internal("github user fetch failed"))?;
+        .map_err(|err| {
+            tracing::warn!(error = %err, "github user fetch response decode failed");
+            RtDbError::internal("github user fetch failed")
+        })?;
 
     let emails: Vec<GithubEmail> = client
         .get(format!("{}/user/emails", state.config.github_api_url))
@@ -202,10 +217,16 @@ async fn complete_github_login(
         )
         .send()
         .await
-        .map_err(|_| RtDbError::internal("github email fetch failed"))?
+        .map_err(|err| {
+            tracing::warn!(error = %err, "github email fetch request failed");
+            RtDbError::internal("github email fetch failed")
+        })?
         .json()
         .await
-        .map_err(|_| RtDbError::internal("github email fetch failed"))?;
+        .map_err(|err| {
+            tracing::warn!(error = %err, "github email fetch response decode failed");
+            RtDbError::internal("github email fetch failed")
+        })?;
 
     let email = emails
         .iter()
@@ -285,12 +306,16 @@ struct OkResponse {
 }
 
 /// `POST /auth/logout`: idempotent regardless of whether the bearer token is
-/// present, valid, or already expired — no information is leaked either way.
-async fn logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Json<OkResponse> {
-    if let Some(token) = bearer_token(&headers) {
-        let _ = session::delete_session(&state.pool, token).await;
+/// present, valid, or already expired — a `DELETE` matching zero rows is not
+/// an error, so only a genuine query failure (not a merely-absent session)
+/// produces a 500 here.
+async fn logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if let Some(token) = bearer_token(&headers)
+        && let Err(err) = session::delete_session(&state.pool, token).await
+    {
+        return err.into_response();
     }
-    Json(OkResponse { ok: true })
+    Json(OkResponse { ok: true }).into_response()
 }
 
 #[derive(Serialize)]
