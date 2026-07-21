@@ -1,5 +1,6 @@
 pub mod config;
 pub mod error;
+pub mod schema;
 
 use std::sync::Arc;
 
