@@ -33,7 +33,7 @@ async fn main() {
             std::process::exit(1);
         });
 
-    tracing::info!("listening on {}", listener.local_addr().unwrap());
+    tracing::info!("listening on 0.0.0.0:{port}");
 
     axum::serve(listener, router).await.unwrap_or_else(|err| {
         eprintln!("server error: {err}");

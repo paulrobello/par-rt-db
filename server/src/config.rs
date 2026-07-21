@@ -22,17 +22,21 @@ impl Config {
             Err(_) => 8300,
         };
 
-        let database_url =
-            std::env::var("RTDB_DATABASE_URL").map_err(|_| "RTDB_DATABASE_URL".to_string())?;
+        let database_url = std::env::var("RTDB_DATABASE_URL")
+            .map_err(|_| "RTDB_DATABASE_URL is required".to_string())?;
 
-        let admin_key =
-            std::env::var("RTDB_ADMIN_KEY").map_err(|_| "RTDB_ADMIN_KEY".to_string())?;
+        let admin_key = std::env::var("RTDB_ADMIN_KEY")
+            .map_err(|_| "RTDB_ADMIN_KEY is required".to_string())?;
 
         let public_url = std::env::var("RTDB_PUBLIC_URL")
             .unwrap_or_else(|_| "http://localhost:8300".to_string());
 
         let allowed_origins = match std::env::var("RTDB_ALLOWED_ORIGINS") {
-            Ok(v) if !v.is_empty() => v.split(',').map(|s| s.trim().to_string()).collect(),
+            Ok(v) if !v.is_empty() => v
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect(),
             _ => Vec::new(),
         };
 
