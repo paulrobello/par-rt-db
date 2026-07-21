@@ -16,23 +16,23 @@ The server itself listens on `RTDB_PORT` (default `8300`); run it with `cargo ru
 
 ## Endpoints
 
-| Method & path              | Auth              | Description |
-|-----------------------------|-------------------|--------------|
-| `GET /healthz`               | none              | Liveness check; returns the body `ok`. |
-| `GET /sync`                  | first WS frame    | Upgrades to WebSocket; speaks the realtime protocol below (auth, subscribe, mutate, ping). |
-| `POST /api/query`             | Bearer token      | One-shot query against a database; see [Query shape](#query-shape). |
-| `POST /api/mutate`            | Bearer token      | One-shot transaction (insert/patch/delete/expectVersion/expectAbsent/upsert steps). |
-| `POST /admin/create-db`       | Bearer admin key  | Creates a new database. |
-| `POST /admin/push-schema`     | Bearer admin key  | Applies additive schema DDL to a database. |
-| `GET /admin/dbs`              | Bearer admin key  | Lists all databases. |
-| `POST /admin/mint-token`      | Bearer admin key  | Mints a machine token scoped to one database. |
-| `POST /admin/revoke-token`    | Bearer admin key  | Revokes a machine token by its id. |
-| `GET /admin/allowlist?db=`   | Bearer admin key  | Lists the emails allowlisted for a database. |
-| `POST /admin/allowlist`       | Bearer admin key  | Adds or removes an email from a database's allowlist. |
-| `GET /auth/github?origin=`   | none              | Starts the GitHub OAuth flow; 302s to GitHub's authorize page. `origin` must be an exact member of `RTDB_ALLOWED_ORIGINS`. |
-| `GET /auth/callback`          | none (state token)| GitHub OAuth callback; exchanges the code, mints a session, and returns HTML that `postMessage`s the session token back to the popup opener. |
-| `POST /auth/logout`           | Bearer session    | Deletes the session for the given bearer token. Idempotent: always 200 unless the delete query itself fails. |
-| `GET /auth/me`                | Bearer session    | Returns the authenticated user. 401 for a machine token (session only). |
+| Method & path              | Auth               | Description                                                                                                                                  |
+| -------------------------- | ------------------ | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| `GET /healthz`             | none               | Liveness check; returns the body `ok`.                                                                                                       |
+| `GET /sync`                | first WS frame     | Upgrades to WebSocket; speaks the realtime protocol below (auth, subscribe, mutate, ping).                                                   |
+| `POST /api/query`          | Bearer token       | One-shot query against a database; see [Query shape](#query-shape).                                                                          |
+| `POST /api/mutate`         | Bearer token       | One-shot transaction (insert/patch/delete/expectVersion/expectAbsent/upsert steps).                                                          |
+| `POST /admin/create-db`    | Bearer admin key   | Creates a new database.                                                                                                                      |
+| `POST /admin/push-schema`  | Bearer admin key   | Applies additive schema DDL to a database.                                                                                                   |
+| `GET /admin/dbs`           | Bearer admin key   | Lists all databases.                                                                                                                         |
+| `POST /admin/mint-token`   | Bearer admin key   | Mints a machine token scoped to one database.                                                                                                |
+| `POST /admin/revoke-token` | Bearer admin key   | Revokes a machine token by its id.                                                                                                           |
+| `GET /admin/allowlist?db=` | Bearer admin key   | Lists the emails allowlisted for a database.                                                                                                 |
+| `POST /admin/allowlist`    | Bearer admin key   | Adds or removes an email from a database's allowlist.                                                                                        |
+| `GET /auth/github?origin=` | none               | Starts the GitHub OAuth flow; 302s to GitHub's authorize page. `origin` must be an exact member of `RTDB_ALLOWED_ORIGINS`.                   |
+| `GET /auth/callback`       | none (state token) | GitHub OAuth callback; exchanges the code, mints a session, and returns HTML that `postMessage`s the session token back to the popup opener. |
+| `POST /auth/logout`        | Bearer session     | Deletes the session for the given bearer token. Idempotent: always 200 unless the delete query itself fails.                                 |
+| `GET /auth/me`             | Bearer session     | Returns the authenticated user. 401 for a machine token (session only).                                                                      |
 
 Bearer tokens are either a per-database **machine token** (minted via `/admin/mint-token`)
 or a **session token** (minted by completing the GitHub OAuth flow). Both resolve through
@@ -43,18 +43,18 @@ frame.
 
 The server reads its configuration from environment variables:
 
-| Variable                    | Required | Default                        |
-|------------------------------|----------|---------------------------------|
-| `RTDB_PORT`                  | no       | `8300`                          |
-| `RTDB_DATABASE_URL`          | yes      | —                                |
-| `RTDB_ADMIN_KEY`             | yes      | —                                |
-| `RTDB_PUBLIC_URL`            | no       | `http://localhost:8300`         |
-| `RTDB_ALLOWED_ORIGINS`       | no       | empty (comma-separated list)    |
-| `RTDB_GITHUB_CLIENT_ID`      | no       | none                             |
-| `RTDB_GITHUB_CLIENT_SECRET`  | no       | none                             |
-| `RTDB_GITHUB_BASE_URL`       | no       | `https://github.com`            |
-| `RTDB_GITHUB_API_URL`        | no       | `https://api.github.com`        |
-| `RTDB_SESSION_TTL_DAYS`      | no       | `30`                             |
+| Variable                    | Required | Default                      |
+| --------------------------- | -------- | ---------------------------- |
+| `RTDB_PORT`                 | no       | `8300`                       |
+| `RTDB_DATABASE_URL`         | yes      | —                            |
+| `RTDB_ADMIN_KEY`            | yes      | —                            |
+| `RTDB_PUBLIC_URL`           | no       | `http://localhost:8300`      |
+| `RTDB_ALLOWED_ORIGINS`      | no       | empty (comma-separated list) |
+| `RTDB_GITHUB_CLIENT_ID`     | no       | none                         |
+| `RTDB_GITHUB_CLIENT_SECRET` | no       | none                         |
+| `RTDB_GITHUB_BASE_URL`      | no       | `https://github.com`         |
+| `RTDB_GITHUB_API_URL`       | no       | `https://api.github.com`     |
+| `RTDB_SESSION_TTL_DAYS`     | no       | `30`                         |
 
 `RTDB_ALLOWED_ORIGINS` is also the exact-match CORS allowlist for `/api/*` and `/auth/*`
 (GET, POST, OPTIONS; `authorization` and `content-type` headers). GitHub OAuth is only
@@ -71,14 +71,14 @@ Every error response — HTTP and WebSocket alike — is a JSON object:
 ```
 
 | `code`                | HTTP status |
-|------------------------|-------------|
-| `UNAUTHORIZED`          | 401 |
-| `FORBIDDEN`             | 403 |
-| `NOT_FOUND`             | 404 |
-| `SCHEMA_VIOLATION`      | 422 |
-| `PRECONDITION_FAILED`   | 409 |
-| `BAD_REQUEST`           | 400 |
-| `INTERNAL`              | 500 |
+| --------------------- | ----------- |
+| `UNAUTHORIZED`        | 401         |
+| `FORBIDDEN`           | 403         |
+| `NOT_FOUND`           | 404         |
+| `SCHEMA_VIOLATION`    | 422         |
+| `PRECONDITION_FAILED` | 409         |
+| `BAD_REQUEST`         | 400         |
+| `INTERNAL`            | 500         |
 
 ## Wire protocol
 
@@ -145,21 +145,29 @@ curl -s -X POST http://localhost:8300/api/query \
 
 ## Make targets
 
-| Target                   | Purpose |
-|---------------------------|----------|
-| `make build`              | `cargo build` |
-| `make fmt`                | `cargo fmt --all` |
-| `make fmt-check`          | `cargo fmt --all -- --check` |
-| `make lint`               | `cargo clippy --all-targets --all-features -- -D warnings` |
-| `make typecheck`          | `cargo check --all-targets` |
-| `make dev-db-up`          | Starts the dev Postgres container (`docker-compose.dev.yml`), waits for healthy |
-| `make dev-db-down`        | Stops the dev Postgres container |
-| `make test`               | `dev-db-up`, then `cargo test` |
-| `make checkall`           | `fmt-check` + `lint` + `typecheck` + `test` |
-| `make pre-commit`         | `pre-commit run --all-files` |
-| `make pre-commit-update`  | `pre-commit autoupdate` |
+| Target                   | Purpose                                                                         |
+| ------------------------ | ------------------------------------------------------------------------------- |
+| `make build`             | `cargo build`                                                                   |
+| `make fmt`               | `cargo fmt --all`                                                               |
+| `make fmt-check`         | `cargo fmt --all -- --check`                                                    |
+| `make lint`              | `cargo clippy --all-targets --all-features -- -D warnings`                      |
+| `make typecheck`         | `cargo check --all-targets`                                                     |
+| `make dev-db-up`         | Starts the dev Postgres container (`docker-compose.dev.yml`), waits for healthy |
+| `make dev-db-down`       | Stops the dev Postgres container                                                |
+| `make test`              | `dev-db-up`, then `cargo test`                                                  |
+| `make checkall`          | `fmt-check` + `lint` + `typecheck` + `test`                                     |
+| `make pre-commit`        | `pre-commit run --all-files`                                                    |
+| `make pre-commit-update` | `pre-commit autoupdate`                                                         |
 
 ## Graceful shutdown
 
 The server exits cleanly on `SIGINT` or `SIGTERM`: in-flight requests are allowed to
-finish (via `axum::serve(...).with_graceful_shutdown(...)`) before the process stops.
+finish (via `axum::serve(...).with_graceful_shutdown(...)`) before the process stops. This
+includes open WebSocket connections — shutdown waits for them to close rather than forcibly
+dropping them, with no timeout of its own; Docker's SIGTERM→SIGKILL window is the backstop
+that ultimately terminates a connection that never closes on its own.
+
+## Known MVP limitations
+
+- `AuthedUser.name` is always `null`: the `rtdb_auth.users` table has no `name` column, so
+  GitHub-authenticated users are only ever identified by `kind` and `email` on the wire.

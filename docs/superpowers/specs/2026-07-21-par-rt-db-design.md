@@ -100,8 +100,9 @@ Server → client: `authOk {user}`, `authErr`, `queryUpdate {queryId, result}`
 (sent on subscribe and on every change), `mutateOk {mutId, result}`,
 `mutateErr {mutId, error}`, `pong`.
 
-Connection rules: 16 KiB message cap, heartbeat with idle reaping, per-session rate
-limit, auto-reconnect handled client-side with resubscribe of all active queries.
+Connection rules: 64 KiB message cap (raised from the original 16 KiB to match axum/tungstenite's
+frame-size enforcement point; amended after Task 9 review), heartbeat with idle reaping,
+per-session rate limit, auto-reconnect handled client-side with resubscribe of all active queries.
 
 ### HTTP (machines + control plane)
 
@@ -181,6 +182,14 @@ Client semantics match Convex: `useQuery` returns `undefined` until the first
 - **Admin:** single `RTDB_ADMIN_KEY` env var gates `/admin/*`.
 - Never auto-generate or rotate secrets silently; all key material is created explicitly
   via admin commands and surfaced once.
+- **Accepted residual risk (login CSRF):** the OAuth `state` token is bound to the
+  initiating *origin* — the callback page's `postMessage` target-origin is pinned to the
+  origin validated at `/auth/github?origin=`, so a malicious page cannot receive the
+  session token even if it can trigger the flow — but it is not bound to the initiating
+  *browser* (no PKCE, no state cookie). An attacker who can get a victim to complete a
+  GitHub authorization on the attacker's behalf could bind the resulting session to the
+  attacker's account. Accepted as an MVP risk for a personal, allowlisted deployment;
+  PKCE/cookie-binding is deferred to Plan 2's auth-client work.
 
 ## TypeScript client (`client/` package)
 
