@@ -241,11 +241,20 @@ export class RtDbClient {
     this.connState = this.reconnectAttempt === 0 ? "connecting" : "reconnecting";
     const provided = this.hasToken ? this.token : this.options.getToken();
     if (isThenable(provided)) {
-      void provided.then((tok) => {
-        if (gen === this.generation && !this.stopped) {
-          this.openWithToken(tok as string | null);
-        }
-      });
+      // A rejected getToken() is treated as "no credential" rather than left
+      // to hang in "connecting" (and to avoid an unhandled promise rejection).
+      void provided.then(
+        (tok) => {
+          if (gen === this.generation && !this.stopped) {
+            this.openWithToken(tok as string | null);
+          }
+        },
+        () => {
+          if (gen === this.generation && !this.stopped) {
+            this.openWithToken(null);
+          }
+        },
+      );
     } else {
       this.openWithToken(provided as string | null);
     }
@@ -255,6 +264,14 @@ export class RtDbClient {
     this.token = token;
     this.hasToken = true;
     if (this.stopped) {
+      return;
+    }
+    if (token == null) {
+      // No credential (initial connect without a token, or sign-out): do not
+      // dial a socket — that would spin the reconnect loop forever. Land
+      // unauthenticated/idle so an explicit connect() can revive later.
+      this.setAuthState("unauthenticated");
+      this.connState = "idle";
       return;
     }
     const socket = this.factory(`${httpToWs(this.options.url)}/sync`);

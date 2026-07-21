@@ -288,7 +288,7 @@ describe("RtDbClient", () => {
     expect(sockets.length).toBe(2);
   });
 
-  it("setToken(null) signs out: connects with no token and lands unauthenticated", () => {
+  it("setToken(null) signs out without dialing a socket, landing unauthenticated", () => {
     const { client, sockets } = newClient();
     client.connect();
     sockets[0].open();
@@ -296,8 +296,30 @@ describe("RtDbClient", () => {
     expect(client.getAuthState()).toBe("authenticated");
 
     client.setToken(null);
-    sockets[1].open(); // onopen sees a null token -> unauthenticated, no auth frame
+    // A null token must NOT dial a new socket (that would spin the reconnect loop).
+    expect(sockets.length).toBe(1);
     expect(client.getAuthState()).toBe("unauthenticated");
-    expect(typeCount(sockets[1], "auth")).toBe(0);
+  });
+
+  it("treats a rejected getToken() as no credential instead of hanging in connecting", async () => {
+    const sockets: FakeSocket[] = [];
+    const client = new RtDbClient({
+      url: "ws://h:8300",
+      db: "kanban",
+      getToken: () => Promise.reject(new Error("token fetch failed")),
+      webSocketFactory: () => {
+        const s = new FakeSocket();
+        sockets.push(s);
+        return s;
+      },
+      heartbeatMs: 0,
+      setTimeoutImpl: () => 0 as unknown as ReturnType<typeof setTimeout>,
+      clearTimeoutImpl: () => {},
+    });
+    client.connect();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(sockets.length).toBe(0); // never dialed
+    expect(client.getAuthState()).toBe("unauthenticated");
   });
 });
