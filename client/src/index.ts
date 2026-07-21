@@ -31,3 +31,7 @@ export { createApi, TableQuery } from "./query.js";
 export type { ClientApi, RtQuery, TableApi } from "./query.js";
 export { mutation, TxnBuilder } from "./mutation.js";
 export { retryOnPrecondition } from "./retry.js";
+export { RtDbHttpClient } from "./http.js";
+export type { RtDbHttpClientOptions } from "./http.js";
+export { RtDbAdminClient } from "./admin.js";
+export type { RtDbAdminClientOptions } from "./admin.js";
