@@ -222,6 +222,22 @@ describe("RtDbClient", () => {
     expect(client.getAuthState()).toBe("authenticated");
   });
 
+  it("revives via an explicit connect() after a 4401 auth-failure", () => {
+    const { client, sockets } = newClient();
+    client.connect();
+    sockets[0].open();
+    sockets[0].deliver({ type: "authOk", user: { kind: "user" } });
+    sockets[0].close(4401, "unauthorized");
+    expect(client.getAuthState()).toBe("unauthenticated");
+
+    // connState was left "idle" (not wedged at "connected"), so connect() reopens.
+    client.connect();
+    expect(sockets.length).toBe(2);
+    sockets[1].open();
+    sockets[1].deliver({ type: "authOk", user: { kind: "user" } });
+    expect(client.getAuthState()).toBe("authenticated");
+  });
+
   it("setToken() cancels a pending reconnect so no duplicate socket opens", () => {
     const { client, sockets, runTimers } = newClient();
     client.connect();
