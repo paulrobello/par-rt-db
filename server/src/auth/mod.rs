@@ -1,3 +1,5 @@
+pub mod github;
+pub mod session;
 pub mod tokens;
 
 use sqlx::PgPool;
@@ -6,7 +8,7 @@ use crate::db::sha256_hex;
 use crate::error::RtDbError;
 use crate::protocol::AuthedUser;
 
-/// Who is making a request: a per-database machine token, or (from Task 10) a
+/// Who is making a request: a per-database machine token, or a
 /// GitHub-authenticated user session.
 #[derive(Debug, Clone)]
 pub enum Principal {
@@ -18,7 +20,7 @@ pub enum Principal {
         user_id: String,
         email: String,
         name: Option<String>,
-    }, // sessions arrive in Task 10
+    },
 }
 
 /// Resolves a bearer token to a `Principal`: first a machine-token digest
@@ -38,7 +40,10 @@ pub async fn resolve_bearer(pool: &PgPool, token: &str) -> Result<Principal, RtD
         return Ok(Principal::Machine { db, token_id });
     }
 
-    // session tokens: Task 10
+    if let Some(principal) = session::resolve_session(pool, token).await? {
+        return Ok(principal);
+    }
+
     Err(RtDbError::unauthorized("invalid token"))
 }
 

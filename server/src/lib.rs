@@ -13,6 +13,7 @@ pub mod subs;
 pub mod txn;
 pub mod ws;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::{Router, routing::get};
@@ -21,12 +22,15 @@ use config::Config;
 use db::SchemaCache;
 use subs::SubscriptionManager;
 
+use auth::github::OAuthStateEntry;
+
 pub struct AppState {
     pub pool: sqlx::PgPool,
     pub config: Config,
     pub schemas: SchemaCache,
     pub subs: Arc<SubscriptionManager>,
     pub committers: Committers,
+    pub oauth_states: tokio::sync::Mutex<HashMap<String, OAuthStateEntry>>,
 }
 
 impl AppState {
@@ -40,6 +44,7 @@ impl AppState {
             schemas,
             subs,
             committers,
+            oauth_states: tokio::sync::Mutex::new(HashMap::new()),
         })
     }
 }
@@ -50,5 +55,6 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .merge(admin::admin_routes())
         .merge(http_api::http_api_routes())
         .merge(ws::ws_routes())
+        .merge(auth::github::auth_routes())
         .with_state(state)
 }
