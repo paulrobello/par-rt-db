@@ -1,0 +1,46 @@
+{
+  "name": "@par-rt-db/client",
+  "version": "0.1.0",
+  "type": "module",
+  "license": "MIT",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./react": {
+      "types": "./dist/react.d.ts",
+      "import": "./dist/react.js"
+    }
+  },
+  "files": ["dist"],
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:integration": "vitest run tests/integration",
+    "lint": "biome lint src tests",
+    "fmt": "biome format --write src tests",
+    "fmt-check": "biome format src tests"
+  },
+  "peerDependencies": {
+    "react": ">=18"
+  },
+  "peerDependenciesMeta": {
+    "react": { "optional": true }
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.5.4",
+    "@testing-library/dom": "^10.4.0",
+    "@testing-library/react": "^16.1.0",
+    "@types/node": "^22.0.0",
+    "@types/react": "^19.0.0",
+    "happy-dom": "^16.0.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "typescript": "^5.7.0",
+    "vitest": "^2.1.0"
+  }
+}
