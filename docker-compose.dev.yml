@@ -1,0 +1,18 @@
+services:
+  postgres:
+    image: postgres:17
+    ports:
+      - "127.0.0.1:55434:5432"
+    environment:
+      POSTGRES_USER: rtdb
+      POSTGRES_PASSWORD: rtdb
+      POSTGRES_DB: rtdb
+    volumes:
+      - rtdb-dev-pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rtdb"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+volumes:
+  rtdb-dev-pg:

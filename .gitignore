@@ -1,0 +1,62 @@
+# Secrets and local config
+.env
+.env.*
+!.env.example
+*.local
+*.local.*
+*-mcp.json
+
+# Logs and runtime output
+*.log
+*.pid
+*.seed
+*.tmp
+tmp/
+temp/
+
+# OS and editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Agent/tool local state
+.superpowers/
+.gemini/
+.gemini-clipboard/
+claude_scratch/
+.claude/.cc2cc-session-id
+.claude/scheduled_tasks.lock
+.claude/statusline-*
+.pi/extensions/discord-relay/state.json
+.pi/status-footer.json
+docs/playgrounds/
+
+# Language/build artifacts
+build/
+dist/
+coverage/
+.cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.venv/
+venv/
+node_modules/
+.next/
+.turbo/
+target/
+.build/
+DerivedData/
+
+# Firmware / embedded generated state
+firmware/**/build*/
+firmware/**/managed_components/
+firmware/**/sdkconfig*
+!firmware/**/sdkconfig.defaults*
+!firmware/**/sdkconfig.defaults.*
+
+server/target/
