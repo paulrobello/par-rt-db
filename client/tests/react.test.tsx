@@ -116,4 +116,25 @@ describe("react bindings", () => {
     expect(screen.getByText("skipped")).toBeTruthy();
     expect(sockets[0].parsed().some((m) => m.type === "subscribe")).toBe(false);
   });
+
+  it("shows AuthLoading (not Unauthenticated) while a stored session reconnects", async () => {
+    localStorage.setItem("rtdb-session-token", "stored-tok");
+    const { client, sockets } = setup();
+    render(
+      <RtDbProvider client={client} authBaseUrl="http://h:8300">
+        <AuthLoading>loading</AuthLoading>
+        <Authenticated>in</Authenticated>
+        <Unauthenticated>out</Unauthenticated>
+      </RtDbProvider>,
+    );
+    // A returning user with a stored token must land on AuthLoading during the
+    // connect+auth roundtrip, not flash Unauthenticated.
+    expect(screen.getByText("loading")).toBeTruthy();
+    await act(async () => {
+      sockets[0].open();
+      sockets[0].deliver({ type: "authOk", user: { kind: "user" } });
+    });
+    expect(screen.getByText("in")).toBeTruthy();
+    localStorage.removeItem("rtdb-session-token");
+  });
 });

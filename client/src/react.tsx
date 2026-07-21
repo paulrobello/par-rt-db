@@ -41,16 +41,22 @@ export function RtDbProvider(props: {
   const [user, setUser] = useState<AuthedUser | null>(() => client.getUser());
 
   useEffect(() => {
+    // Attach the listener BEFORE setToken/connect so the synchronous
+    // authState transitions they trigger are observed, then re-snapshot in
+    // case state advanced before the listener was wired or the client was
+    // already connected when this provider mounted.
+    const off = client.onAuthChange((nextState, nextUser) => {
+      setState(nextState);
+      setUser(nextUser);
+    });
     const stored =
       typeof localStorage !== "undefined" ? localStorage.getItem(TOKEN_STORAGE_KEY) : null;
     if (stored) {
       client.setToken(stored);
     }
-    const off = client.onAuthChange((nextState, nextUser) => {
-      setState(nextState);
-      setUser(nextUser);
-    });
     client.connect();
+    setState(client.getAuthState());
+    setUser(client.getUser());
     return () => {
       off();
     };
@@ -82,6 +88,10 @@ export function useQuery<R>(query: RtQuery<R> | "skip"): R | undefined {
       setValue(undefined);
       return;
     }
+    // Reset to `undefined` when the query changes so a prior query's result is
+    // not shown under the new one; `subscribe` immediately replays a cached
+    // value if this query already has one.
+    setValue(undefined);
     const off = client.subscribe(query, (next) => setValue(next));
     return off;
   }, [client, key]);
