@@ -605,3 +605,80 @@ async fn write_set_reports_all_touched_tables() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+// (m) upsert matching more than one row -> PreconditionFailed, exact message. `by_name` is a
+// plain (non-unique) index, so two ordinary inserts can legitimately share a name.
+#[tokio::test]
+async fn upsert_multiple_matches_is_precondition_failed() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+
+    for _ in 0..2 {
+        execute_txn(
+            &pool,
+            &db,
+            &schema,
+            &Transaction {
+                steps: vec![Step::Insert {
+                    table: "projects".to_string(),
+                    doc: valid_project_doc(),
+                }],
+            },
+        )
+        .await?;
+    }
+
+    let err = execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::Upsert {
+                table: "projects".to_string(),
+                index: "by_name".to_string(),
+                eq: vec![serde_json::json!("Alpha")],
+                insert: valid_project_doc(),
+                patch: serde_json::Map::new(),
+            }],
+        },
+    )
+    .await
+    .expect_err("expected precondition failed");
+    assert_eq!(err.code, ErrorCode::PreconditionFailed);
+    assert_eq!(err.message, "upsert matched multiple documents");
+
+    Ok(())
+}
+
+// (n) MAX_STEPS boundary: 256 steps ok, 257 -> BadRequest.
+#[tokio::test]
+async fn max_steps_boundary() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+
+    let steps_256: Vec<Step> = (0..256)
+        .map(|_| Step::Insert {
+            table: "projects".to_string(),
+            doc: valid_project_doc(),
+        })
+        .collect();
+    let outcome = execute_txn(&pool, &db, &schema, &Transaction { steps: steps_256 }).await?;
+    assert_eq!(outcome.results.len(), 256);
+
+    let steps_257: Vec<Step> = (0..257)
+        .map(|_| Step::Insert {
+            table: "projects".to_string(),
+            doc: valid_project_doc(),
+        })
+        .collect();
+    let err = execute_txn(&pool, &db, &schema, &Transaction { steps: steps_257 })
+        .await
+        .expect_err("expected bad request");
+    assert_eq!(err.code, ErrorCode::BadRequest);
+
+    Ok(())
+}

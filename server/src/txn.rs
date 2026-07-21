@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 
 use sqlx::{PgConnection, PgPool};
 
-use crate::db::{new_id, now_ms};
+use crate::db::{new_id, now_ms, validate_db_name};
 use crate::ddl::{pg_col, pg_schema, pg_table};
 use crate::error::RtDbError;
 use crate::schema::{
@@ -446,6 +446,8 @@ pub async fn execute_txn(
     schema: &SchemaDef,
     txn: &Transaction,
 ) -> Result<TxnOutcome, RtDbError> {
+    validate_db_name(db)?;
+
     if txn.steps.len() > MAX_STEPS {
         return Err(RtDbError::bad_request(format!(
             "transaction exceeds maximum of {MAX_STEPS} steps"
