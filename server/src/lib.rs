@@ -1,9 +1,11 @@
 pub mod admin;
+pub mod auth;
 pub mod committer;
 pub mod config;
 pub mod db;
 pub mod ddl;
 pub mod error;
+pub mod http_api;
 pub mod protocol;
 pub mod query;
 pub mod schema;
@@ -45,5 +47,6 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .merge(admin::admin_routes())
+        .merge(http_api::http_api_routes())
         .with_state(state)
 }
