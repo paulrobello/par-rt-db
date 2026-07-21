@@ -188,6 +188,78 @@ async fn patch_null_clears_optional_field() -> anyhow::Result<()> {
     Ok(())
 }
 
+// (c2) C6: an inserted explicit null for an optional field is stripped, not stored — the
+// same "absent" shape a patch-to-null produces (see (c) above), both in the stored doc and
+// in query results.
+#[tokio::test]
+async fn insert_strips_explicit_null_optional_field() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+
+    let insert_outcome = execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::Insert {
+                table: "projects".to_string(),
+                doc: valid_project_doc(), // "description": null
+            }],
+        },
+    )
+    .await?;
+    let id = insert_outcome.results[0]["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+
+    let pg_schema = format!("db_{db}");
+    let row: (serde_json::Value,) = sqlx::query_as(&format!(
+        "SELECT \"doc\" FROM \"{pg_schema}\".\"t_projects\" WHERE \"id\" = $1"
+    ))
+    .bind(&id)
+    .fetch_one(&pool)
+    .await?;
+    assert!(
+        !row.0
+            .as_object()
+            .expect("doc obj")
+            .contains_key("description")
+    );
+
+    let query_result = rtdb_server::query::execute_query(
+        &pool,
+        &db,
+        &schema,
+        &rtdb_server::query::Query {
+            table: "projects".to_string(),
+            get: Some(id),
+            index: None,
+            eq: vec![],
+            order: None,
+            take: None,
+            unique: false,
+        },
+    )
+    .await?;
+    match query_result {
+        rtdb_server::query::QueryResult::Doc(Some(value)) => {
+            assert!(
+                value
+                    .as_object()
+                    .expect("doc obj")
+                    .get("description")
+                    .is_none()
+            );
+        }
+        other => panic!("expected Doc(Some(_)), got {other:?}"),
+    }
+
+    Ok(())
+}
+
 // (d) patch unknown field -> SchemaViolation (422).
 #[tokio::test]
 async fn patch_unknown_field_is_schema_violation() -> anyhow::Result<()> {

@@ -89,6 +89,33 @@ async fn auth_with_valid_machine_token_returns_auth_ok() -> anyhow::Result<()> {
     Ok(())
 }
 
+// (a2) C1: a pre-auth protocol-level Ping is tolerated (doesn't consume the
+// "first message must be auth" slot) and the following auth frame still succeeds. The
+// transport layer auto-replies with a Pong to our Ping before any app data; drain that
+// first (tungstenite's `_write`/`read_message_frame` queues a Pong reply on any Ping read,
+// independent of the app-level handling this test exercises).
+#[tokio::test]
+async fn protocol_ping_before_auth_frame_is_tolerated() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let db = fresh_db(&state).await;
+    let token = mint_token(addr, &db).await;
+
+    let mut ws = ws_connect(addr).await;
+    ws.send(Message::Ping(Vec::new().into()))
+        .await
+        .expect("send ping frame");
+
+    match ws.next().await.expect("stream ended").expect("frame ok") {
+        Message::Pong(_) => {}
+        other => panic!("expected transport-layer auto pong reply, got {other:?}"),
+    }
+
+    let msg = auth(&mut ws, &token, &db).await;
+    assert_eq!(msg["type"], json!("authOk"));
+    Ok(())
+}
+
 // (b) bad token -> authErr then stream closes.
 #[tokio::test]
 async fn auth_with_bad_token_returns_auth_err_and_closes() -> anyhow::Result<()> {

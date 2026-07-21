@@ -33,6 +33,11 @@ pub enum CommitterRequest {
 /// subscribe for a given database is funneled through that single task, which
 /// processes messages strictly one at a time — see `run_committer` for the
 /// ordering guarantee this provides.
+///
+/// This is the property `execute_txn` (see `txn.rs`) depends on: it runs
+/// under READ COMMITTED with no row locking; correctness depends on all
+/// writes for a database being serialized through the per-db committer.
+/// Never call `execute_txn` from a non-committer production path.
 pub struct Committers {
     pool: PgPool,
     subs: Arc<SubscriptionManager>,

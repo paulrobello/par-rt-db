@@ -48,6 +48,8 @@ pub enum QueryResult {
 /// each typed like Task 5. Sort: unbound index fields in index order, then created_at, then id —
 /// all in `order` direction. No index => eq must be empty, sort by (created_at, id).
 /// Unknown table -> NotFound; unknown index / eq too long / get+query mix / unique+take -> BadRequest.
+/// `take: 0` is valid and returns an empty `Docs([])`, not an error.
+/// `unique` without an `index` scans the whole table (LIMIT 2) and applies the same 0/1/>1 rule.
 pub async fn execute_query(
     pool: &PgPool,
     db: &str,

@@ -51,8 +51,11 @@ async fn ws_upgrade(State(state): State<Arc<AppState>>, ws: WebSocketUpgrade) ->
         .on_upgrade(move |socket| handle_socket(socket, state))
 }
 
-/// Tracks a rolling 10s message-count window per connection: >200 messages
-/// in a window closes the connection (see `handle_text_frame`).
+/// Tracks a tumbling 10s message-count window per connection: >200 messages
+/// in a window closes the connection (see `handle_text_frame`). Tumbling
+/// (not rolling) means a burst spanning a window boundary can briefly see up
+/// to ~2x the nominal rate before the reset; acceptable at this
+/// connection-level granularity.
 struct RateLimiter {
     window_start: Instant,
     count: u32,
@@ -159,30 +162,36 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
     state.subs.remove_conn(&db, conn_id).await;
 }
 
-/// Waits up to `AUTH_TIMEOUT` for the first frame and requires it to be a
-/// valid `Auth` message; any other outcome (timeout, wrong message, bad
-/// frame) sends `AuthErr` and closes. Returns the resolved principal and
-/// authorized database name on success.
+/// Waits up to `AUTH_TIMEOUT` (in total, across any leading `Ping`/`Pong`
+/// frames — a client that opens with a keepalive isn't penalized) for the
+/// first data frame and requires it to be a valid `Auth` message; any other
+/// outcome (timeout, wrong message, bad frame) sends `AuthErr` and closes.
+/// Returns the resolved principal and authorized database name on success.
 async fn authenticate(
     socket: &mut WebSocket,
     state: &Arc<AppState>,
 ) -> Option<(Principal, String)> {
-    let text = match tokio::time::timeout(AUTH_TIMEOUT, socket.recv()).await {
-        Ok(Some(Ok(Message::Text(text)))) => text,
-        Ok(Some(Ok(Message::Close(_)))) | Ok(None) => return None,
-        Ok(Some(Ok(Message::Binary(_)))) => {
-            fail_and_close(
-                socket,
-                RtDbError::bad_request("binary frames are not supported"),
-            )
-            .await;
-            return None;
-        }
-        _ => {
-            // Timeout elapsed, a control frame arrived instead of data, or
-            // the socket errored before a first data frame was received.
-            fail_and_close(socket, RtDbError::unauthorized("authentication required")).await;
-            return None;
+    let deadline = Instant::now() + AUTH_TIMEOUT;
+    let text = loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match tokio::time::timeout(remaining, socket.recv()).await {
+            Ok(Some(Ok(Message::Text(text)))) => break text,
+            Ok(Some(Ok(Message::Close(_)))) | Ok(None) => return None,
+            Ok(Some(Ok(Message::Ping(_) | Message::Pong(_)))) => continue,
+            Ok(Some(Ok(Message::Binary(_)))) => {
+                fail_and_close(
+                    socket,
+                    RtDbError::bad_request("binary frames are not supported"),
+                )
+                .await;
+                return None;
+            }
+            _ => {
+                // Timeout elapsed or the socket errored before a first data
+                // frame was received.
+                fail_and_close(socket, RtDbError::unauthorized("authentication required")).await;
+                return None;
+            }
         }
     };
 
@@ -339,10 +348,18 @@ async fn fail_and_close(socket: &mut WebSocket, error: RtDbError) {
         .await;
 }
 
+/// Serializes `msg` and sends it as a text frame. `ServerMessage` cannot
+/// fail to serialize in practice (no non-string map keys, no NaN/Infinity
+/// floats), so on the theoretical failure this logs and skips the send
+/// (returning `Ok`, since the socket itself is fine) rather than emitting an
+/// invalid `"{}"` frame with no `type` tag.
 async fn send_message(socket: &mut WebSocket, msg: &ServerMessage) -> Result<(), axum::Error> {
-    let text = serde_json::to_string(msg).unwrap_or_else(|err| {
-        tracing::error!(error = %err, "failed to serialize server message");
-        "{}".to_string()
-    });
+    let text = match serde_json::to_string(msg) {
+        Ok(text) => text,
+        Err(err) => {
+            tracing::error!(error = %err, "failed to serialize server message; skipping send");
+            return Ok(());
+        }
+    };
     socket.send(Message::Text(text.into())).await
 }

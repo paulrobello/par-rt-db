@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 
 use crate::error::RtDbError;
+use crate::http_api::ApiJson;
 use crate::schema::SchemaDef;
 use crate::{AppState, auth, db, ddl};
 
@@ -38,7 +39,7 @@ struct CreateDbRequest {
 async fn create_db(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(body): Json<CreateDbRequest>,
+    ApiJson(body): ApiJson<CreateDbRequest>,
 ) -> Result<Json<OkResponse>, RtDbError> {
     require_admin(&headers, &state.config.admin_key)?;
     db::create_database(&state.pool, &body.name).await?;
@@ -54,7 +55,7 @@ struct PushSchemaRequest {
 async fn push_schema(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(body): Json<PushSchemaRequest>,
+    ApiJson(body): ApiJson<PushSchemaRequest>,
 ) -> Result<Json<OkResponse>, RtDbError> {
     require_admin(&headers, &state.config.admin_key)?;
     let applied = ddl::push_schema(&state.pool, &body.db, body.schema).await?;
@@ -92,7 +93,7 @@ struct MintTokenResponse {
 async fn mint_token(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(body): Json<MintTokenRequest>,
+    ApiJson(body): ApiJson<MintTokenRequest>,
 ) -> Result<Json<MintTokenResponse>, RtDbError> {
     require_admin(&headers, &state.config.admin_key)?;
     if !db::database_exists(&state.pool, &body.db).await? {
@@ -111,7 +112,7 @@ struct RevokeTokenRequest {
 async fn revoke_token(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(body): Json<RevokeTokenRequest>,
+    ApiJson(body): ApiJson<RevokeTokenRequest>,
 ) -> Result<Json<OkResponse>, RtDbError> {
     require_admin(&headers, &state.config.admin_key)?;
     auth::tokens::revoke_token(&state.pool, &body.token_id).await?;
@@ -128,7 +129,7 @@ struct AllowlistWriteRequest {
 async fn allowlist_write(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(body): Json<AllowlistWriteRequest>,
+    ApiJson(body): ApiJson<AllowlistWriteRequest>,
 ) -> Result<Json<OkResponse>, RtDbError> {
     require_admin(&headers, &state.config.admin_key)?;
     if !db::database_exists(&state.pool, &body.db).await? {

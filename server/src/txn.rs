@@ -225,6 +225,28 @@ fn apply_patch(
     Ok(doc)
 }
 
+/// Strips keys whose value is an explicit JSON `null` for an `Optional`
+/// field whose inner type does not itself accept `null`, matching
+/// `apply_patch`'s treatment of a patch null as "unset" rather than a stored
+/// null — so an inserted document and a patched-then-nulled document end up
+/// in the same shape (key absent), not two different representations of the
+/// same logical state.
+fn strip_unset_optionals(
+    table: &TableDef,
+    mut doc: serde_json::Map<String, serde_json::Value>,
+) -> serde_json::Map<String, serde_json::Value> {
+    doc.retain(|field_name, value| {
+        if !value.is_null() {
+            return true;
+        }
+        !matches!(
+            table.fields.get(field_name),
+            Some(FieldType::Optional { inner }) if !validate_value(inner, &serde_json::Value::Null)
+        )
+    });
+    doc
+}
+
 /// Inserts a new row for `doc` (already validated by the caller's schema
 /// lookup): `doc` jsonb plus every indexed-field column, `created_at =
 /// now_ms()`, `version` defaulting to 1. Returns the generated id.
@@ -236,6 +258,8 @@ async fn do_insert(
     doc: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<String, RtDbError> {
     validate_doc(table_def, doc)?;
+    let doc = strip_unset_optionals(table_def, doc.clone());
+    let doc = &doc;
 
     let id = new_id();
     let created_at = now_ms();
@@ -440,6 +464,10 @@ async fn eq_lookup(
 /// Executes all of `txn`'s steps in one Postgres transaction; any step's
 /// error aborts and rolls back everything already applied. See module docs
 /// on `Step` for per-step semantics.
+///
+/// Runs under READ COMMITTED with no row locking; correctness depends on all
+/// writes for a database being serialized through the per-db committer.
+/// Never call `execute_txn` from a non-committer production path.
 pub async fn execute_txn(
     pool: &PgPool,
     db: &str,

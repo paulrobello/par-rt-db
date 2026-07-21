@@ -571,6 +571,77 @@ async fn unknown_table_is_not_found() -> anyhow::Result<()> {
     Ok(())
 }
 
+// (n) C5a: take: 0 -> empty Docs([]), not an error.
+#[tokio::test]
+async fn take_zero_returns_empty_docs() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+
+    seed_kanban(&pool, &db, &schema).await?;
+
+    let result = execute_query(
+        &pool,
+        &db,
+        &schema,
+        &Query {
+            table: "workItems".to_string(),
+            get: None,
+            index: None,
+            eq: vec![],
+            order: None,
+            take: Some(0),
+            unique: false,
+        },
+    )
+    .await?;
+
+    match result {
+        QueryResult::Docs(docs) => assert!(docs.is_empty()),
+        other => panic!("expected Docs variant, got {other:?}"),
+    }
+    Ok(())
+}
+
+// (o) C5b: unique without an index scans the whole table: 0 rows -> null, 1 row -> the
+// doc, >1 rows -> PreconditionFailed.
+#[tokio::test]
+async fn unique_without_index_scans_whole_table() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+
+    let unique_query = Query {
+        table: "projects".to_string(),
+        get: None,
+        index: None,
+        eq: vec![],
+        order: None,
+        take: None,
+        unique: true,
+    };
+
+    let result = execute_query(&pool, &db, &schema, &unique_query).await?;
+    assert!(matches!(result, QueryResult::Doc(None)));
+
+    let project_id = insert_project(&pool, &db, &schema, "Alpha").await?;
+    let result = execute_query(&pool, &db, &schema, &unique_query).await?;
+    match result {
+        QueryResult::Doc(Some(value)) => assert_eq!(value["_id"], serde_json::json!(project_id)),
+        other => panic!("expected Doc(Some(_)), got {other:?}"),
+    }
+
+    insert_project(&pool, &db, &schema, "Beta").await?;
+    let err = execute_query(&pool, &db, &schema, &unique_query)
+        .await
+        .expect_err("expected precondition failed");
+    assert_eq!(err.code, ErrorCode::PreconditionFailed);
+
+    Ok(())
+}
+
 // (m) canonical() is a stable string form usable for change detection.
 #[tokio::test]
 async fn canonical_is_stable_for_identical_results() -> anyhow::Result<()> {

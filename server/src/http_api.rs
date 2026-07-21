@@ -23,7 +23,8 @@ fn bearer_token(headers: &HeaderMap) -> Result<&str, RtDbError> {
 /// Like `axum::Json`, but maps deserialization failures (unknown fields,
 /// unknown enum tags, malformed JSON) to the `RtDbError` wire envelope with
 /// `BadRequest` (400) instead of axum's default split between 400 and 422.
-struct ApiJson<T>(T);
+/// Shared with `admin.rs` so malformed admin bodies get the same envelope.
+pub(crate) struct ApiJson<T>(pub(crate) T);
 
 impl<T, S> FromRequest<S> for ApiJson<T>
 where
