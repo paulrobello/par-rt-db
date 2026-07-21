@@ -11,6 +11,7 @@ pub mod query;
 pub mod schema;
 pub mod subs;
 pub mod txn;
+pub mod ws;
 
 use std::sync::Arc;
 
@@ -48,5 +49,6 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/healthz", get(|| async { "ok" }))
         .merge(admin::admin_routes())
         .merge(http_api::http_api_routes())
+        .merge(ws::ws_routes())
         .with_state(state)
 }

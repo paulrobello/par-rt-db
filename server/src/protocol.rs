@@ -45,6 +45,10 @@ pub enum ServerMessage {
         mut_id: String,
         error: RtDbError,
     },
+    SubscribeErr {
+        query_id: String,
+        error: RtDbError,
+    },
     Pong,
 }
 
@@ -150,6 +154,18 @@ mod tests {
             })
             .unwrap()["type"],
             serde_json::json!("mutateErr")
+        );
+        assert_eq!(
+            serde_json::to_value(ServerMessage::SubscribeErr {
+                query_id: "q1".to_string(),
+                error: RtDbError::bad_request("bad index")
+            })
+            .unwrap(),
+            serde_json::json!({
+                "type": "subscribeErr",
+                "queryId": "q1",
+                "error": {"code": "BAD_REQUEST", "message": "bad index"}
+            })
         );
         assert_eq!(
             serde_json::to_value(ServerMessage::Pong).unwrap(),
