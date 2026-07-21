@@ -1,3 +1,7 @@
+// @vitest-environment node
+// Integration tests hit a real server over the network — they need Node's real
+// fetch/WebSocket, not the happy-dom environment the default config uses for the
+// React unit tests.
 import { beforeAll, describe, expect, it } from "vitest";
 import { createApi } from "../../src/query.js";
 import { mutation } from "../../src/mutation.js";
@@ -29,9 +33,12 @@ describe.skipIf(server === null)("e2e against a running server", () => {
 
   it("HTTP insert then HTTP query round-trips with system fields", async () => {
     const http = httpClient(srv, db, token);
-    const [id] = await http.mutate(
+    // An insert step returns `{ id }` (not a bare id string); patch/delete/expect*
+    // return null; upsert returns `{ id, inserted }`.
+    const [insertResult] = await http.mutate(
       mutation().insert("items", { projectId: "p1", title: "first", order: 1 }).build(),
     );
+    const id = (insertResult as { id: string }).id;
     expect(typeof id).toBe("string");
 
     const rows = await http.query(api.items.query().withIndex("by_project", ["p1"]).collect());
