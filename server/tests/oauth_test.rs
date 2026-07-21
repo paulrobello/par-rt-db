@@ -193,6 +193,16 @@ fn verified_primary_email(email: &str) -> Value {
     json!([{"email": email, "primary": true, "verified": true}])
 }
 
+fn insert_work_item_txn() -> Value {
+    json!({"steps": [{"op": "insert", "table": "workItems", "doc": {
+        "projectId": "0".repeat(32),
+        "title": "item",
+        "status": "backlog",
+        "order": 1.0,
+        "completedAt": null
+    }}]})
+}
+
 // (a) full flow: start -> callback -> 200 HTML containing the token and the exact origin.
 #[tokio::test]
 async fn full_oauth_flow_returns_html_with_session_token() -> anyhow::Result<()> {
@@ -260,6 +270,80 @@ async fn session_token_authorizes_ws_only_while_allowlisted() -> anyhow::Result<
     let msg2 = ws_auth(&mut ws2, &token, &db_name).await;
     assert_eq!(msg2["type"], json!("authErr"));
     assert_eq!(msg2["error"]["code"], json!("FORBIDDEN"));
+    Ok(())
+}
+
+// (c2) A3: live authz on every WS op. Subscribe and mutate succeed while allowlisted;
+// after an admin allowlist removal, a mutate on the SAME open connection gets mutateErr
+// FORBIDDEN (not a close) and the connection stays usable (a following ping still pongs).
+#[tokio::test]
+async fn allowlist_removal_mid_session_fails_mutate_without_closing_connection()
+-> anyhow::Result<()> {
+    let mock = MockServer::start().await;
+    mount_github_mocks(&mock, verified_primary_email("probello@gmail.com")).await;
+    let (state, addr) = oauth_state(&mock).await;
+    let db_name = fresh_db(&state).await;
+    let token = login_flow(addr, "http://localhost:5173").await;
+
+    let add_resp = admin_post(
+        addr,
+        "/admin/allowlist",
+        json!({"db": db_name, "action": "add", "email": "probello@gmail.com"}),
+    )
+    .await;
+    assert_eq!(add_resp.status(), reqwest::StatusCode::OK);
+
+    let mut ws = ws_connect(addr).await;
+    let auth_msg = ws_auth(&mut ws, &token, &db_name).await;
+    assert_eq!(auth_msg["type"], json!("authOk"));
+
+    ws_send_json(
+        &mut ws,
+        json!({"type": "subscribe", "queryId": "q1", "query": {"table": "workItems"}}),
+    )
+    .await;
+    let sub_msg = ws_recv_json(&mut ws).await;
+    assert_eq!(sub_msg["type"], json!("queryUpdate"));
+
+    ws_send_json(
+        &mut ws,
+        json!({"type": "mutate", "mutId": "m1", "txn": insert_work_item_txn()}),
+    )
+    .await;
+    let mut saw_mutate_ok = false;
+    for _ in 0..2 {
+        let msg = ws_recv_json(&mut ws).await;
+        if msg["type"] == json!("mutateOk") {
+            assert_eq!(msg["mutId"], json!("m1"));
+            saw_mutate_ok = true;
+        }
+    }
+    assert!(saw_mutate_ok, "expected mutateOk before allowlist removal");
+
+    let remove_resp = admin_post(
+        addr,
+        "/admin/allowlist",
+        json!({"db": db_name, "action": "remove", "email": "probello@gmail.com"}),
+    )
+    .await;
+    assert_eq!(remove_resp.status(), reqwest::StatusCode::OK);
+
+    ws_send_json(
+        &mut ws,
+        json!({"type": "mutate", "mutId": "m2", "txn": insert_work_item_txn()}),
+    )
+    .await;
+    let err_msg = ws_recv_json(&mut ws).await;
+    assert_eq!(err_msg["type"], json!("mutateErr"));
+    assert_eq!(err_msg["mutId"], json!("m2"));
+    assert_eq!(err_msg["error"]["code"], json!("FORBIDDEN"));
+
+    // Connection stays open (not closed by the authz failure): a subsequent
+    // ping still round-trips.
+    ws_send_json(&mut ws, json!({"type": "ping"})).await;
+    let pong = ws_recv_json(&mut ws).await;
+    assert_eq!(pong["type"], json!("pong"));
+
     Ok(())
 }
 

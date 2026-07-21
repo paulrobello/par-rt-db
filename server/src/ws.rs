@@ -4,15 +4,15 @@ use std::time::Duration;
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::State;
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::ws::{CloseFrame, Message, Utf8Bytes, WebSocket, WebSocketUpgrade};
 use axum::response::Response;
 use axum::routing::get;
 use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio::time::{Instant, interval};
 
 use crate::AppState;
-use crate::auth::{authed_user, authorize, resolve_bearer};
-use crate::error::RtDbError;
+use crate::auth::{Principal, authed_user, authorize, resolve_bearer};
+use crate::error::{ErrorCode, RtDbError};
 use crate::protocol::{ClientMessage, ServerMessage};
 use crate::subs::{ConnId, next_conn_id};
 
@@ -22,6 +22,14 @@ const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(10);
 const RATE_LIMIT_MAX: u32 = 200;
 const PING_INTERVAL: Duration = Duration::from_secs(30);
 const LIVENESS_TIMEOUT: Duration = Duration::from_secs(75);
+/// WS close code for an auth failure (bad/missing token, forbidden for this
+/// database): distinct from `CLOSE_PROTOCOL_VIOLATION` so clients know not
+/// to blind-retry with the same credentials. Both are in the 4000-4999
+/// private-use range.
+const CLOSE_AUTH_FAILED: u16 = 4401;
+/// WS close code for any other protocol violation (oversized/malformed
+/// frame, rate limit exceeded, out-of-order message).
+const CLOSE_PROTOCOL_VIOLATION: u16 = 4400;
 
 /// The realtime sync endpoint, speaking `protocol.rs` messages as JSON text
 /// frames (see module-level docs in `protocol.rs` for the wire vocabulary).
@@ -30,7 +38,12 @@ pub fn ws_routes() -> Router<Arc<AppState>> {
 }
 
 async fn ws_upgrade(State(state): State<Arc<AppState>>, ws: WebSocketUpgrade) -> Response {
-    ws.on_upgrade(move |socket| handle_socket(socket, state))
+    // Enforced at the protocol layer (not just the app-level length checks
+    // below) so an unauthenticated `/sync` connection can't run axum's
+    // default 64 MiB max message size as a memory-DoS vector.
+    ws.max_message_size(MAX_FRAME_BYTES)
+        .max_frame_size(MAX_FRAME_BYTES)
+        .on_upgrade(move |socket| handle_socket(socket, state))
 }
 
 /// Tracks a rolling 10s message-count window per connection: >200 messages
@@ -63,14 +76,17 @@ impl RateLimiter {
 /// Drives one WebSocket connection end to end: auth handshake, then a single
 /// `tokio::select!` loop serializing inbound frames, outbound channel
 /// messages, and liveness pings through one socket handle (no read/write
-/// split). Whatever the exit path, `subs.remove_conn` runs once auth has
-/// registered the connection (see the `let ... else { return }` above the
-/// loop: before that point nothing has been registered yet).
+/// split). The resolved `principal` is kept in scope for the whole loop (not
+/// just the handshake) so every `Subscribe`/`Mutate` can re-check
+/// authorization — see `handle_text_frame`. Whatever the exit path,
+/// `subs.remove_conn` runs once auth has registered the connection (see the
+/// `let ... else { return }` above the loop: before that point nothing has
+/// been registered yet).
 async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
     let conn_id = next_conn_id();
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<ServerMessage>();
 
-    let Some(db) = authenticate(&mut socket, &state).await else {
+    let Some((principal, db)) = authenticate(&mut socket, &state).await else {
         return;
     };
 
@@ -100,6 +116,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                         let should_close = handle_text_frame(
                             &mut socket,
                             &state,
+                            &principal,
                             &db,
                             conn_id,
                             &out_tx,
@@ -134,9 +151,12 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
 
 /// Waits up to `AUTH_TIMEOUT` for the first frame and requires it to be a
 /// valid `Auth` message; any other outcome (timeout, wrong message, bad
-/// frame) sends `AuthErr` and closes. Returns the authorized database name on
-/// success.
-async fn authenticate(socket: &mut WebSocket, state: &Arc<AppState>) -> Option<String> {
+/// frame) sends `AuthErr` and closes. Returns the resolved principal and
+/// authorized database name on success.
+async fn authenticate(
+    socket: &mut WebSocket,
+    state: &Arc<AppState>,
+) -> Option<(Principal, String)> {
     let text = match tokio::time::timeout(AUTH_TIMEOUT, socket.recv()).await {
         Ok(Some(Ok(Message::Text(text)))) => text,
         Ok(Some(Ok(Message::Close(_)))) | Ok(None) => return None,
@@ -193,16 +213,26 @@ async fn authenticate(socket: &mut WebSocket, state: &Arc<AppState>) -> Option<S
         return None;
     }
 
-    Some(db)
+    Some((principal, db))
 }
 
 /// Validates and dispatches one post-auth text frame. Returns whether the
 /// connection should now close (frame too large, rate limit exceeded,
 /// malformed JSON, or an out-of-order `auth`); every other message is
-/// handled and the connection stays open.
+/// handled and the connection stays open. `Subscribe` and `Mutate` each
+/// re-check authorization for `principal` on `db` first — authorization can
+/// be revoked mid-session (e.g. an allowlist removal) — and on failure the
+/// operation errors (`SubscribeErr`/`MutateErr`) without closing the
+/// connection.
+// A3's `principal` param pushes this past clippy's default 7-argument
+// threshold; every param is independently needed by a different message
+// arm, so bundling them into a context struct would add indirection without
+// reducing coupling.
+#[allow(clippy::too_many_arguments)]
 async fn handle_text_frame(
     socket: &mut WebSocket,
     state: &Arc<AppState>,
+    principal: &Principal,
     db: &str,
     conn_id: ConnId,
     out_tx: &UnboundedSender<ServerMessage>,
@@ -233,12 +263,19 @@ async fn handle_text_frame(
             true
         }
         ClientMessage::Subscribe { query_id, query } => {
-            if let Err(error) = state
-                .committers
-                .subscribe(db, conn_id, query_id.clone(), query, out_tx.clone())
-                .await
-            {
-                let _ = out_tx.send(ServerMessage::SubscribeErr { query_id, error });
+            match authorize(&state.pool, principal, db).await {
+                Ok(()) => {
+                    if let Err(error) = state
+                        .committers
+                        .subscribe(db, conn_id, query_id.clone(), query, out_tx.clone())
+                        .await
+                    {
+                        let _ = out_tx.send(ServerMessage::SubscribeErr { query_id, error });
+                    }
+                }
+                Err(error) => {
+                    let _ = out_tx.send(ServerMessage::SubscribeErr { query_id, error });
+                }
             }
             false
         }
@@ -247,13 +284,18 @@ async fn handle_text_frame(
             false
         }
         ClientMessage::Mutate { mut_id, txn } => {
-            match state.committers.mutate(db, txn).await {
-                Ok(outcome) => {
-                    let _ = out_tx.send(ServerMessage::MutateOk {
-                        mut_id,
-                        results: outcome.results,
-                    });
-                }
+            match authorize(&state.pool, principal, db).await {
+                Ok(()) => match state.committers.mutate(db, txn).await {
+                    Ok(outcome) => {
+                        let _ = out_tx.send(ServerMessage::MutateOk {
+                            mut_id,
+                            results: outcome.results,
+                        });
+                    }
+                    Err(error) => {
+                        let _ = out_tx.send(ServerMessage::MutateErr { mut_id, error });
+                    }
+                },
                 Err(error) => {
                     let _ = out_tx.send(ServerMessage::MutateErr { mut_id, error });
                 }
@@ -267,11 +309,24 @@ async fn handle_text_frame(
     }
 }
 
-/// Sends `AuthErr { error }` (best-effort) then closes the socket. Used for
-/// every protocol violation, pre- and post-auth alike.
+/// Sends `AuthErr { error }` (best-effort) then closes the socket with a
+/// close code derived from `error`'s `ErrorCode`: `Unauthorized`/`Forbidden`
+/// (bad credentials, revoked authz) close with `CLOSE_AUTH_FAILED` so the
+/// client knows not to blind-retry the same token; anything else closes with
+/// `CLOSE_PROTOCOL_VIOLATION`. Used for every protocol violation, pre- and
+/// post-auth alike.
 async fn fail_and_close(socket: &mut WebSocket, error: RtDbError) {
+    let code = match error.code {
+        ErrorCode::Unauthorized | ErrorCode::Forbidden => CLOSE_AUTH_FAILED,
+        _ => CLOSE_PROTOCOL_VIOLATION,
+    };
     let _ = send_message(socket, &ServerMessage::AuthErr { error }).await;
-    let _ = socket.send(Message::Close(None)).await;
+    let _ = socket
+        .send(Message::Close(Some(CloseFrame {
+            code,
+            reason: Utf8Bytes::from_static(""),
+        })))
+        .await;
 }
 
 async fn send_message(socket: &mut WebSocket, msg: &ServerMessage) -> Result<(), axum::Error> {

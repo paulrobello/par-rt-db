@@ -59,10 +59,16 @@ fn insert_work_item_txn() -> Value {
     }}]})
 }
 
-async fn expect_close(ws: &mut WsStream) {
+/// Expects the connection to close, and if a close frame carries an explicit
+/// code, asserts it matches `expected_code` (A4: auth failures close with
+/// `4401`, distinct from `4400` for a generic protocol violation).
+async fn expect_close_with_code(ws: &mut WsStream, expected_code: u16) {
     match ws.next().await {
         None => {}
-        Some(Ok(Message::Close(_))) => {}
+        Some(Ok(Message::Close(None))) => {}
+        Some(Ok(Message::Close(Some(frame)))) => {
+            assert_eq!(u16::from(frame.code), expected_code);
+        }
         other => panic!("expected connection to close, got {other:?}"),
     }
 }
@@ -94,7 +100,7 @@ async fn auth_with_bad_token_returns_auth_err_and_closes() -> anyhow::Result<()>
     let msg = auth(&mut ws, "bogus-token", &db).await;
     assert_eq!(msg["type"], json!("authErr"));
 
-    expect_close(&mut ws).await;
+    expect_close_with_code(&mut ws, 4401).await;
     Ok(())
 }
 
@@ -109,7 +115,7 @@ async fn first_message_not_auth_closes_connection() -> anyhow::Result<()> {
     let msg = recv_json(&mut ws).await;
     assert_eq!(msg["type"], json!("authErr"));
 
-    expect_close(&mut ws).await;
+    expect_close_with_code(&mut ws, 4401).await;
     Ok(())
 }
 

@@ -73,7 +73,9 @@ impl RtDbError {
 impl From<sqlx::Error> for RtDbError {
     fn from(err: sqlx::Error) -> Self {
         tracing::error!(error = %err, "sqlx error");
-        Self::internal(err.to_string())
+        // Never leak Postgres error text (relation/column names, constraint
+        // details) to clients; the full error is already logged above.
+        Self::internal("internal error")
     }
 }
 
