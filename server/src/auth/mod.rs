@@ -47,18 +47,33 @@ pub async fn resolve_bearer(pool: &PgPool, token: &str) -> Result<Principal, RtD
     Err(RtDbError::unauthorized("invalid token"))
 }
 
-/// Authorization for a database: a machine token must match `db` exactly;
-/// a user must be present in `rtdb_auth.allowlist` for `db`. Allowlist emails
-/// are stored lowercase (see `admin::allowlist_write`), so the principal's
-/// email is lowercased here before the lookup — the sole choke point for
+/// Authorization for a database: a machine token must match `db` exactly and
+/// still be un-revoked — checked live against `rtdb_auth.machine_tokens` on
+/// every call, so a token revoked mid-session is denied on its very next
+/// operation rather than only at the next fresh connection; a user must be
+/// present in `rtdb_auth.allowlist` for `db`. Allowlist emails are stored
+/// lowercase (see `admin::allowlist_write`), so the principal's email is
+/// lowercased here before the lookup — the sole choke point for
 /// case-insensitive comparison.
 pub async fn authorize(pool: &PgPool, principal: &Principal, db: &str) -> Result<(), RtDbError> {
     match principal {
-        Principal::Machine { db: token_db, .. } => {
-            if token_db == db {
+        Principal::Machine {
+            db: token_db,
+            token_id,
+        } => {
+            if token_db != db {
+                return Err(RtDbError::forbidden("token is not valid for this database"));
+            }
+            let (live,): (bool,) = sqlx::query_as(
+                "SELECT EXISTS(SELECT 1 FROM rtdb_auth.machine_tokens WHERE id = $1 AND NOT revoked)",
+            )
+            .bind(token_id)
+            .fetch_one(pool)
+            .await?;
+            if live {
                 Ok(())
             } else {
-                Err(RtDbError::forbidden("token is not valid for this database"))
+                Err(RtDbError::unauthorized("token revoked"))
             }
         }
         Principal::User { email, .. } => {

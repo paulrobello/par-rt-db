@@ -27,6 +27,12 @@ const LIVENESS_TIMEOUT: Duration = Duration::from_secs(75);
 /// reader on the other end is hopelessly behind and the connection is
 /// dropped rather than letting the backlog grow without bound.
 const MAX_OUT_QUEUE: usize = 1024;
+/// Timeout for writing one outbound frame to the socket. Pairs with
+/// `MAX_OUT_QUEUE` above: the backlog check only runs after `socket.send`
+/// returns, so a client that stalls TCP entirely (not just a slow reader)
+/// blocks inside `send` while the channel keeps growing unchecked. On
+/// timeout the connection is dropped, same as any other send failure.
+const SEND_TIMEOUT: Duration = Duration::from_secs(30);
 /// WS close code for an auth failure (bad/missing token, forbidden for this
 /// database): distinct from `CLOSE_PROTOCOL_VIOLATION` so clients know not
 /// to blind-retry with the same credentials. Both are in the 4000-4999
@@ -139,7 +145,8 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                 }
             }
             Some(out_msg) = out_rx.recv() => {
-                if send_message(&mut socket, &out_msg).await.is_err() {
+                let sent = tokio::time::timeout(SEND_TIMEOUT, send_message(&mut socket, &out_msg)).await;
+                if !matches!(sent, Ok(Ok(()))) {
                     break;
                 }
                 // A hopelessly-behind reader: drop it rather than let its

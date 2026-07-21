@@ -60,11 +60,20 @@ impl Committers {
     /// the send fails because the committer task is gone (e.g. it panicked),
     /// evicts `db`'s stale sender from `channels` before returning the
     /// error, so the next request respawns a fresh task instead of every
-    /// future request to `db` failing forever.
+    /// future request to `db` failing forever. The eviction only removes the
+    /// entry if it still holds the same sender that just failed (`same_channel`)
+    /// — otherwise a concurrent caller already respawned under this db key and
+    /// evicting would drop the live replacement instead of the dead one.
     pub async fn submit(&self, db: &str, req: CommitterRequest) -> Result<(), RtDbError> {
         let sender = self.channel_for(db).await?;
         if sender.send(req).await.is_err() {
-            self.channels.lock().await.remove(db);
+            let mut guard = self.channels.lock().await;
+            if guard
+                .get(db)
+                .is_some_and(|current| current.same_channel(&sender))
+            {
+                guard.remove(db);
+            }
             return Err(RtDbError::internal("committer task is no longer running"));
         }
         Ok(())

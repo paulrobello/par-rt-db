@@ -320,6 +320,79 @@ async fn ping_returns_pong() -> anyhow::Result<()> {
     Ok(())
 }
 
+// F1: revoking a machine token mid-session denies its next mutate on the SAME
+// open connection (MutateErr UNAUTHORIZED) without closing it — the
+// connection stays usable afterward (verified via a subsequent ping/pong).
+#[tokio::test]
+async fn revoked_machine_token_denies_mutate_but_keeps_connection_usable() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let db = fresh_db(&state).await;
+
+    let resp = admin_post(
+        addr,
+        "/admin/mint-token",
+        json!({"db": db, "name": "test-token"}),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: Value = resp.json().await.expect("parse mint-token response");
+    let token_id = body["tokenId"].as_str().expect("tokenId").to_string();
+    let token = body["token"].as_str().expect("token").to_string();
+
+    let mut ws = ws_connect(addr).await;
+    auth(&mut ws, &token, &db).await;
+
+    send_json(
+        &mut ws,
+        json!({"type": "subscribe", "queryId": "q1", "query": {"table": "workItems"}}),
+    )
+    .await;
+    let msg = recv_json(&mut ws).await;
+    assert_eq!(msg["type"], json!("queryUpdate"));
+
+    send_json(
+        &mut ws,
+        json!({"type": "mutate", "mutId": "m1", "txn": insert_work_item_txn()}),
+    )
+    .await;
+    let mut saw_mutate_ok = false;
+    let mut saw_query_update = false;
+    for _ in 0..2 {
+        let msg = recv_json(&mut ws).await;
+        match msg["type"].as_str() {
+            Some("mutateOk") => saw_mutate_ok = true,
+            Some("queryUpdate") => saw_query_update = true,
+            other => panic!("unexpected message type {other:?}"),
+        }
+    }
+    assert!(
+        saw_mutate_ok && saw_query_update,
+        "subscribe+mutate OK before revocation"
+    );
+
+    let resp = admin_post(addr, "/admin/revoke-token", json!({"tokenId": token_id})).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    // Same open connection, revoked token: mutate is denied but the
+    // connection is not closed.
+    send_json(
+        &mut ws,
+        json!({"type": "mutate", "mutId": "m2", "txn": insert_work_item_txn()}),
+    )
+    .await;
+    let msg = recv_json(&mut ws).await;
+    assert_eq!(msg["type"], json!("mutateErr"));
+    assert_eq!(msg["mutId"], json!("m2"));
+    assert_eq!(msg["error"]["code"], json!("UNAUTHORIZED"));
+
+    // Connection stays usable: a ping on the same socket still gets a pong.
+    send_json(&mut ws, json!({"type": "ping"})).await;
+    let msg = recv_json(&mut ws).await;
+    assert_eq!(msg["type"], json!("pong"));
+    Ok(())
+}
+
 // Rate limit: >200 messages within the rolling 10s window closes the connection.
 #[tokio::test]
 async fn rate_limit_exceeded_closes_connection() -> anyhow::Result<()> {
