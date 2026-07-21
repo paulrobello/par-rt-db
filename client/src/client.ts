@@ -55,6 +55,13 @@ interface QueuedMutate extends PendingMutate {
 
 const DEFAULT_BACKOFF = { baseMs: 500, maxMs: 15_000 };
 const DEFAULT_HEARTBEAT_MS = 20_000;
+/**
+ * App-range close code we use for the drops WE initiate (heartbeat timeout,
+ * socket error). The WebSocket spec forbids passing the reserved 1006 to
+ * `close()` (it throws `InvalidAccessError`), so we must use 1000 or a
+ * 4000–4999 code. `handleClose` treats any non-4401 code as a reconnectable drop.
+ */
+const CLOSE_APP_DROP = 4000;
 
 function isThenable(value: unknown): value is Promise<unknown> {
   return (
@@ -84,6 +91,7 @@ export class RtDbClient {
   private authState: AuthState = "unauthenticated";
   private user: AuthedUser | null = null;
   private token: string | null = null;
+  private hasToken = false;
 
   private readonly subsByKey = new Map<string, Subscription>();
   private readonly subsById = new Map<string, Subscription>();
@@ -92,6 +100,13 @@ export class RtDbClient {
   private readonly authListeners = new Set<(state: AuthState, user: AuthedUser | null) => void>();
 
   private counter = 0;
+  /**
+   * Bumps on every socket (re)open and every teardown. Async token resolutions
+   * and reconnect-timer callbacks capture the generation they were scheduled in
+   * and abort if it has advanced — this is what stops a stale reconnect or a
+   * late `getToken` promise from opening a duplicate socket.
+   */
+  private generation = 0;
   private reconnectAttempt = 0;
   private stopped = false;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -120,21 +135,25 @@ export class RtDbClient {
 
   close(): void {
     this.stopped = true;
+    this.generation++;
     this.clearTimers();
+    this.detachSocket(1000, "client closed");
     this.connState = "closed";
-    this.detachAndClose(1000, "client closed");
-    this.rejectPendingMutates("client closed");
+    this.setAuthState("unauthenticated");
+    this.rejectAllMutates("client is closed");
   }
 
   setToken(token: string | null): void {
     this.token = token;
+    this.hasToken = true;
     if (this.stopped) {
       return;
     }
-    // Tear the current connection down without triggering a reconnect, then re-auth.
-    this.detachAndClose(1000, "reauth");
-    this.rejectPendingMutates("connection reset for re-authentication");
+    // A fresh credential invalidates every in-flight mutation and any pending
+    // reconnect; `openSocket` tears down the old socket without a reconnect.
+    this.rejectAllMutates("connection reset for re-authentication");
     this.reconnectAttempt = 0;
+    this.setAuthState("authenticating");
     this.openSocket();
   }
 
@@ -193,8 +212,12 @@ export class RtDbClient {
   mutate(txn: TransactionJson): Promise<unknown[]> {
     const mutId = `mut-${++this.counter}`;
     return new Promise<unknown[]>((resolve, reject) => {
+      if (this.stopped) {
+        reject(new RtDbError("INTERNAL", "client is closed"));
+        return;
+      }
       const entry: QueuedMutate = { mutId, txn, resolve, reject };
-      if (this.authState === "authenticated") {
+      if (this.authState === "authenticated" && this.socket) {
         this.dispatchMutate(entry);
       } else {
         // Never sent yet: flush once on the next authOk. Not a retry.
@@ -209,17 +232,28 @@ export class RtDbClient {
   }
 
   private openSocket(): void {
+    // Single entry point for opening a connection: cancel any timers, tear down
+    // any existing socket (no reconnect), and advance the generation so stale
+    // async/timer callbacks abort.
+    this.clearTimers();
+    this.detachSocket(1000, "reopen");
+    const gen = ++this.generation;
     this.connState = this.reconnectAttempt === 0 ? "connecting" : "reconnecting";
-    const provided = this.token ?? this.options.getToken();
+    const provided = this.hasToken ? this.token : this.options.getToken();
     if (isThenable(provided)) {
-      void provided.then((tok) => this.openWithToken(tok as string | null));
+      void provided.then((tok) => {
+        if (gen === this.generation && !this.stopped) {
+          this.openWithToken(tok as string | null);
+        }
+      });
     } else {
-      this.openWithToken(provided);
+      this.openWithToken(provided as string | null);
     }
   }
 
   private openWithToken(token: string | null): void {
     this.token = token;
+    this.hasToken = true;
     if (this.stopped) {
       return;
     }
@@ -230,14 +264,17 @@ export class RtDbClient {
     socket.onopen = () => {
       if (this.token == null) {
         this.setAuthState("unauthenticated");
-        this.detachAndClose(1000, "no token");
+        this.connState = "idle";
+        this.detachSocket(1000, "no token");
         return;
       }
       this.send({ type: "auth", token: this.token, db: this.options.db });
     };
     socket.onmessage = (ev) => this.handleMessage(ev.data);
     socket.onclose = (ev) => this.handleClose(ev.code);
-    socket.onerror = () => socket.close(1006, "error");
+    socket.onerror = () => {
+      this.socket?.close(CLOSE_APP_DROP, "error");
+    };
   }
 
   private handleMessage(data: unknown): void {
@@ -252,8 +289,10 @@ export class RtDbClient {
         this.connState = "connected";
         this.reconnectAttempt = 0;
         this.user = msg.user;
-        this.setAuthState("authenticated");
+        // Resubscribe + flush unsent BEFORE notifying auth listeners, so a
+        // listener that subscribes synchronously does not get a duplicate frame.
         this.flushOnAuth();
+        this.setAuthState("authenticated");
         this.startHeartbeat();
         break;
       case "authErr":
@@ -271,11 +310,17 @@ export class RtDbClient {
         }
         break;
       }
-      case "subscribeErr":
-        // A malformed query (e.g. unknown index) can never succeed; drop the
-        // subscription so it is not resent on reconnect. Listeners stay `undefined`.
-        this.subsById.delete(msg.queryId);
+      case "subscribeErr": {
+        // A malformed query (e.g. unknown index) can never succeed. Remove it
+        // from BOTH maps so it is neither resent on reconnect nor left routing
+        // updates; listeners stay `undefined`.
+        const sub = this.subsById.get(msg.queryId);
+        if (sub) {
+          this.subsById.delete(sub.queryId);
+          this.subsByKey.delete(sub.key);
+        }
         break;
+      }
       case "mutateOk": {
         const pending = this.pendingMutates.get(msg.mutId);
         this.pendingMutates.delete(msg.mutId);
@@ -311,9 +356,11 @@ export class RtDbClient {
     this.rejectPendingMutates("connection closed before the mutation was acknowledged");
     if (code === 4401) {
       this.setAuthState("unauthenticated");
-      return; // do not reconnect until setToken is called
+      this.connState = "idle"; // an explicit connect() (e.g. after re-login) may revive
+      return;
     }
     if (this.stopped) {
+      this.connState = "closed";
       return;
     }
     this.setAuthState("authenticating");
@@ -332,13 +379,33 @@ export class RtDbClient {
     this.pendingMutates.clear();
   }
 
-  /** Closes the current socket without letting its `onclose` schedule a reconnect. */
-  private detachAndClose(code: number, reason: string): void {
+  /** Rejects every mutation — in-flight and never-sent. Used on terminal teardown. */
+  private rejectAllMutates(reason: string): void {
+    this.rejectPendingMutates(reason);
+    if (this.unsentMutates.length === 0) {
+      return;
+    }
+    const error = new RtDbError("INTERNAL", reason);
+    for (const entry of this.unsentMutates.splice(0)) {
+      entry.reject(error);
+    }
+  }
+
+  /** Closes the current socket after detaching its handlers, so its `onclose` cannot reconnect. */
+  private detachSocket(code: number, reason: string): void {
     const socket = this.socket;
     this.socket = null;
-    if (socket) {
-      socket.onclose = null;
+    if (!socket) {
+      return;
+    }
+    socket.onclose = null;
+    socket.onmessage = null;
+    socket.onopen = null;
+    socket.onerror = null;
+    try {
       socket.close(code, reason);
+    } catch {
+      // Ignore invalid-state close (socket already closing/closed).
     }
   }
 
@@ -346,7 +413,12 @@ export class RtDbClient {
     const attempt = this.reconnectAttempt++;
     const raw = Math.min(this.backoff.maxMs, this.backoff.baseMs * 2 ** attempt);
     const delay = raw * (0.5 + this.random() * 0.5);
-    this.reconnectTimer = this.setTimeoutImpl(() => this.openSocket(), delay);
+    const gen = this.generation;
+    this.reconnectTimer = this.setTimeoutImpl(() => {
+      if (gen === this.generation && !this.stopped) {
+        this.openSocket();
+      }
+    }, delay);
   }
 
   private startHeartbeat(): void {
@@ -359,8 +431,8 @@ export class RtDbClient {
   }
 
   private beat(): void {
-    if (this.now() - this.lastPongAt > this.heartbeatMs * 2) {
-      this.socket?.close(1006, "heartbeat timeout");
+    if (this.now() - this.lastPongAt >= this.heartbeatMs * 2) {
+      this.socket?.close(CLOSE_APP_DROP, "heartbeat timeout");
       return;
     }
     this.send({ type: "ping" });
@@ -374,12 +446,16 @@ export class RtDbClient {
     }
   }
 
-  private clearTimers(): void {
-    this.clearHeartbeat();
+  private clearReconnectTimer(): void {
     if (this.reconnectTimer) {
       this.clearTimeoutImpl(this.reconnectTimer);
       this.reconnectTimer = null;
     }
+  }
+
+  private clearTimers(): void {
+    this.clearHeartbeat();
+    this.clearReconnectTimer();
   }
 
   private setAuthState(state: AuthState): void {

@@ -31,20 +31,42 @@ class FakeSocket implements WebSocketLike {
   }
 }
 
-function newClient() {
+/** Like FakeSocket, but rejects close codes a real WebSocket rejects (only 1000 or 3000–4999). */
+class StrictFakeSocket extends FakeSocket {
+  override close(code = 1000, reason = ""): void {
+    if (code !== 1000 && (code < 3000 || code > 4999)) {
+      throw new Error(`InvalidAccessError: close code ${code} is not allowed`);
+    }
+    super.close(code, reason);
+  }
+}
+
+interface Harness {
+  client: RtDbClient;
+  sockets: FakeSocket[];
+  runTimers: () => void;
+}
+
+function newClient(
+  overrides: { heartbeatMs?: number; SocketClass?: typeof FakeSocket } = {},
+): Harness & {
+  setNow: (t: number) => void;
+} {
   const sockets: FakeSocket[] = [];
   const timers: Array<() => void> = [];
+  const clock = { t: 0 };
+  const SocketClass = overrides.SocketClass ?? FakeSocket;
   const client = new RtDbClient({
     url: "ws://h:8300",
     db: "kanban",
     getToken: () => "tok",
     webSocketFactory: () => {
-      const s = new FakeSocket();
+      const s = new SocketClass();
       sockets.push(s);
       return s;
     },
-    heartbeatMs: 0, // disable heartbeat in unit tests; only reconnect timers are queued
-    now: () => 0,
+    heartbeatMs: overrides.heartbeatMs ?? 0, // disabled by default; only reconnect timers are queued
+    now: () => clock.t,
     random: () => 0.5,
     setTimeoutImpl: (fn) => {
       timers.push(fn);
@@ -52,14 +74,18 @@ function newClient() {
     },
     clearTimeoutImpl: () => {},
   });
-  // Fires every queued timer (used to drive a scheduled reconnect deterministically).
+  // Fires every currently-queued timer once (timers scheduled during the run are
+  // left for the next call), so a test drives reconnect/heartbeat deterministically.
   const runTimers = () => {
     for (const fn of timers.splice(0)) {
       fn();
     }
   };
-  return { client, sockets, runTimers };
+  return { client, sockets, runTimers, setNow: (t) => (clock.t = t) };
 }
+
+const frames = (s: FakeSocket) => s.sentParsed as Array<{ type: string; [k: string]: unknown }>;
+const typeCount = (s: FakeSocket, type: string) => frames(s).filter((m) => m.type === type).length;
 
 describe("RtDbClient", () => {
   it("sends auth on connect with the token field (not sessionToken)", () => {
@@ -79,9 +105,7 @@ describe("RtDbClient", () => {
     const q: RtQuery<unknown> = { json: { table: "items" } };
     client.subscribe(q, (v) => updates.push(v));
 
-    const subFrame = sockets[0].sentParsed.find(
-      (m) => (m as { type: string }).type === "subscribe",
-    ) as {
+    const subFrame = frames(sockets[0]).find((m) => m.type === "subscribe") as unknown as {
       queryId: string;
       query: unknown;
     };
@@ -98,18 +122,18 @@ describe("RtDbClient", () => {
     sockets[0].deliver({ type: "authOk", user: { kind: "machine" } });
 
     const okPromise = client.mutate({ steps: [{ op: "insert", table: "items", doc: {} }] });
-    const okFrame = sockets[0].sentParsed.find(
-      (m) => (m as { type: string }).type === "mutate",
-    ) as {
+    const okFrame = frames(sockets[0]).find((m) => m.type === "mutate") as unknown as {
       mutId: string;
     };
     sockets[0].deliver({ type: "mutateOk", mutId: okFrame.mutId, results: ["id-1"] });
     await expect(okPromise).resolves.toEqual(["id-1"]);
 
     const errPromise = client.mutate({ steps: [] });
-    const errFrame = sockets[0].sentParsed
-      .filter((m) => (m as { type: string }).type === "mutate")
-      .at(-1) as { mutId: string };
+    const errFrame = frames(sockets[0])
+      .filter((m) => m.type === "mutate")
+      .at(-1) as unknown as {
+      mutId: string;
+    };
     sockets[0].deliver({
       type: "mutateErr",
       mutId: errFrame.mutId,
@@ -137,9 +161,9 @@ describe("RtDbClient", () => {
     sockets[1].open();
     sockets[1].deliver({ type: "authOk", user: { kind: "user" } });
 
-    const subscribed = sockets[1].sentParsed
-      .filter((m) => (m as { type: string }).type === "subscribe")
-      .map((m) => (m as { query: { table: string } }).query.table)
+    const subscribed = frames(sockets[1])
+      .filter((m) => m.type === "subscribe")
+      .map((m) => (m as unknown as { query: { table: string } }).query.table)
       .sort();
     expect(subscribed).toEqual(["items", "projects"]);
   });
@@ -153,28 +177,111 @@ describe("RtDbClient", () => {
     const q: RtQuery<unknown> = { json: { table: "items" } };
     const off1 = client.subscribe(q, () => {});
     const off2 = client.subscribe(q, () => {});
-    const subCount = sockets[0].sentParsed.filter(
-      (m) => (m as { type: string }).type === "subscribe",
-    ).length;
-    expect(subCount).toBe(1);
+    expect(typeCount(sockets[0], "subscribe")).toBe(1);
 
     off1();
-    expect(sockets[0].sentParsed.some((m) => (m as { type: string }).type === "unsubscribe")).toBe(
-      false,
-    );
+    expect(typeCount(sockets[0], "unsubscribe")).toBe(0);
     off2();
-    expect(sockets[0].sentParsed.some((m) => (m as { type: string }).type === "unsubscribe")).toBe(
-      true,
-    );
+    expect(typeCount(sockets[0], "unsubscribe")).toBe(1);
   });
 
-  it("does not reconnect on a 4401 auth-failure close", () => {
-    const { client, sockets } = newClient();
+  it("does not reconnect on a 4401 auth-failure close, even after timers fire", () => {
+    const { client, sockets, runTimers } = newClient();
     client.connect();
     sockets[0].open();
     sockets[0].deliver({ type: "authOk", user: { kind: "user" } });
     sockets[0].close(4401, "unauthorized");
+    runTimers(); // no reconnect should have been scheduled
     expect(sockets.length).toBe(1);
     expect(client.getAuthState()).toBe("unauthenticated");
+  });
+
+  it("rejects in-flight mutations on close() and rejects mutate() issued after close()", async () => {
+    const { client, sockets } = newClient();
+    client.connect();
+    sockets[0].open();
+    sockets[0].deliver({ type: "authOk", user: { kind: "user" } });
+
+    const inFlight = client.mutate({ steps: [{ op: "insert", table: "items", doc: {} }] });
+    client.close();
+    await expect(inFlight).rejects.toMatchObject({ name: "RtDbError", code: "INTERNAL" });
+    await expect(client.mutate({ steps: [] })).rejects.toMatchObject({ code: "INTERNAL" });
+  });
+
+  it("can reconnect via an explicit connect() after close()", () => {
+    const { client, sockets } = newClient();
+    client.connect();
+    sockets[0].open();
+    sockets[0].deliver({ type: "authOk", user: { kind: "user" } });
+    client.close();
+
+    client.connect();
+    expect(sockets.length).toBe(2);
+    sockets[1].open();
+    sockets[1].deliver({ type: "authOk", user: { kind: "user" } });
+    expect(client.getAuthState()).toBe("authenticated");
+  });
+
+  it("setToken() cancels a pending reconnect so no duplicate socket opens", () => {
+    const { client, sockets, runTimers } = newClient();
+    client.connect();
+    sockets[0].open();
+    sockets[0].deliver({ type: "authOk", user: { kind: "user" } });
+
+    sockets[0].close(1006, "gone"); // schedules a reconnect timer
+    client.setToken("tok2"); // opens socket[1] and must invalidate the pending reconnect
+    runTimers(); // the stale reconnect must NOT open a third socket
+    expect(sockets.length).toBe(2);
+  });
+
+  it("drops a subscribeErr'd query from both maps so it is not resent on reconnect", () => {
+    const { client, sockets, runTimers } = newClient();
+    client.connect();
+    sockets[0].open();
+    sockets[0].deliver({ type: "authOk", user: { kind: "user" } });
+    client.subscribe({ json: { table: "items", index: "nope", eq: [] } }, () => {});
+
+    const badFrame = frames(sockets[0]).find((m) => m.type === "subscribe") as unknown as {
+      queryId: string;
+    };
+    sockets[0].deliver({
+      type: "subscribeErr",
+      queryId: badFrame.queryId,
+      error: { code: "BAD_REQUEST", message: "unknown index" },
+    });
+
+    sockets[0].close(1006, "gone");
+    runTimers();
+    sockets[1].open();
+    sockets[1].deliver({ type: "authOk", user: { kind: "user" } });
+    expect(typeCount(sockets[1], "subscribe")).toBe(0);
+  });
+
+  it("heartbeat timeout force-closes with a valid code and reconnects (no InvalidAccessError)", () => {
+    const { client, sockets, runTimers, setNow } = newClient({
+      heartbeatMs: 1000,
+      SocketClass: StrictFakeSocket,
+    });
+    client.connect();
+    sockets[0].open();
+    sockets[0].deliver({ type: "authOk", user: { kind: "user" } }); // starts the heartbeat timer
+
+    setNow(2000); // two intervals with no pong
+    runTimers(); // beat() must force-close with a spec-valid code (StrictFakeSocket throws otherwise)
+    runTimers(); // fire the reconnect that the close scheduled
+    expect(sockets.length).toBe(2);
+  });
+
+  it("setToken(null) signs out: connects with no token and lands unauthenticated", () => {
+    const { client, sockets } = newClient();
+    client.connect();
+    sockets[0].open();
+    sockets[0].deliver({ type: "authOk", user: { kind: "user" } });
+    expect(client.getAuthState()).toBe("authenticated");
+
+    client.setToken(null);
+    sockets[1].open(); // onopen sees a null token -> unauthenticated, no auth frame
+    expect(client.getAuthState()).toBe("unauthenticated");
+    expect(typeCount(sockets[1], "auth")).toBe(0);
   });
 });
