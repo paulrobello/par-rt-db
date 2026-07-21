@@ -1,4 +1,4 @@
-use rtdb_server::{AppState, build_router, config::Config};
+use rtdb_server::{AppState, build_router, config::Config, db};
 use sqlx::postgres::PgPoolOptions;
 use tracing_subscriber::EnvFilter;
 
@@ -21,6 +21,11 @@ async fn main() {
             eprintln!("failed to connect to database: {err}");
             std::process::exit(1);
         });
+
+    db::bootstrap(&pool).await.unwrap_or_else(|err| {
+        eprintln!("failed to bootstrap database: {err}");
+        std::process::exit(1);
+    });
 
     let port = config.port;
     let state = AppState::new(pool, config);
