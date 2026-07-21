@@ -43,7 +43,10 @@ pub async fn resolve_bearer(pool: &PgPool, token: &str) -> Result<Principal, RtD
 }
 
 /// Authorization for a database: a machine token must match `db` exactly;
-/// a user must be present in `rtdb_auth.allowlist` for `db`.
+/// a user must be present in `rtdb_auth.allowlist` for `db`. Allowlist emails
+/// are stored lowercase (see `admin::allowlist_write`), so the principal's
+/// email is lowercased here before the lookup — the sole choke point for
+/// case-insensitive comparison.
 pub async fn authorize(pool: &PgPool, principal: &Principal, db: &str) -> Result<(), RtDbError> {
     match principal {
         Principal::Machine { db: token_db, .. } => {
@@ -58,7 +61,7 @@ pub async fn authorize(pool: &PgPool, principal: &Principal, db: &str) -> Result
                 "SELECT email FROM rtdb_auth.allowlist WHERE db_name = $1 AND email = $2",
             )
             .bind(db)
-            .bind(email)
+            .bind(email.to_lowercase())
             .fetch_optional(pool)
             .await?;
 

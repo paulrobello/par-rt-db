@@ -3,6 +3,8 @@ mod common;
 use std::net::SocketAddr;
 
 use common::{admin_post, fresh_db, spawn_app, test_state};
+use rtdb_server::auth::{Principal, authorize};
+use rtdb_server::error::ErrorCode;
 use rtdb_server::protocol::ServerMessage;
 use rtdb_server::query::Query;
 use rtdb_server::subs::next_conn_id;
@@ -283,6 +285,44 @@ async fn http_mutate_triggers_registered_subscription() -> anyhow::Result<()> {
         }
         other => panic!("expected QueryUpdate, got {other:?}"),
     }
+
+    Ok(())
+}
+
+// (j) authorize's User branch matches the allowlist case-insensitively, and
+// forbids a non-allowlisted email.
+#[tokio::test]
+async fn authorize_user_branch_matches_allowlist_case_insensitively() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let name = fresh_db(&state).await;
+
+    let resp = admin_post(
+        addr,
+        "/admin/allowlist",
+        json!({"db": name, "action": "add", "email": "probello@gmail.com"}),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    let allowed = Principal::User {
+        user_id: "u1".to_string(),
+        email: "Probello@Gmail.com".to_string(),
+        name: None,
+    };
+    authorize(&state.pool, &allowed, &name)
+        .await
+        .expect("mixed-case email of an allowlisted user should authorize");
+
+    let not_allowed = Principal::User {
+        user_id: "u2".to_string(),
+        email: "someone-else@example.com".to_string(),
+        name: None,
+    };
+    let err = authorize(&state.pool, &not_allowed, &name)
+        .await
+        .expect_err("non-allowlisted user should be forbidden");
+    assert_eq!(err.code, ErrorCode::Forbidden);
 
     Ok(())
 }
