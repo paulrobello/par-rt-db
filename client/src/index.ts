@@ -15,3 +15,15 @@ export type {
   TableJson,
   TransactionJson,
 } from "./protocol.js";
+export { defineSchema, defineTable, SchemaDefinition, TableDefinition, t } from "./schema.js";
+export type {
+  Doc,
+  DocFields,
+  Id,
+  IndexNamesOf,
+  Infer,
+  SystemFields,
+  TableNames,
+  Validator,
+  WithoutSystemFields,
+} from "./schema.js";
