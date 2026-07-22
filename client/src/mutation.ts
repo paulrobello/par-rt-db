@@ -1,46 +1,59 @@
 import type { StepJson, TransactionJson } from "./protocol.js";
+import type { IndexNamesOf, SchemaDefinition, TableNames, WithoutSystemFields } from "./schema.js";
 
-/** Chainable builder for an atomic multi-step transaction. */
-export class TxnBuilder {
+/**
+ * Chainable builder for an atomic multi-step transaction. `S` is a phantom
+ * schema type used only to type-check table/field names — never read at
+ * runtime, the same pattern `RtQuery<Result>` uses for its result type.
+ */
+export class TxnBuilder<S extends SchemaDefinition<any> = SchemaDefinition<any>> {
   private readonly steps: StepJson[] = [];
 
-  insert(table: string, doc: Record<string, unknown>): this {
+  insert<T extends TableNames<S>>(table: T, doc: WithoutSystemFields<S, T>): this {
     this.steps.push({ op: "insert", table, doc });
     return this;
   }
 
-  patch(table: string, id: string, fields: Record<string, unknown>): this {
+  patch<T extends TableNames<S>>(
+    table: T,
+    id: string,
+    fields: Partial<WithoutSystemFields<S, T>>,
+  ): this {
     this.steps.push({ op: "patch", table, id, fields });
     return this;
   }
 
-  replace(table: string, id: string, doc: Record<string, unknown>): this {
+  replace<T extends TableNames<S>>(table: T, id: string, doc: WithoutSystemFields<S, T>): this {
     this.steps.push({ op: "replace", table, id, doc });
     return this;
   }
 
-  delete(table: string, id: string): this {
+  delete<T extends TableNames<S>>(table: T, id: string): this {
     this.steps.push({ op: "delete", table, id });
     return this;
   }
 
-  expectVersion(table: string, id: string, version: number): this {
+  expectVersion<T extends TableNames<S>>(table: T, id: string, version: number): this {
     this.steps.push({ op: "expectVersion", table, id, version });
     return this;
   }
 
-  expectAbsent(table: string, index: string, eq: unknown[]): this {
+  expectAbsent<T extends TableNames<S>>(
+    table: T,
+    index: IndexNamesOf<S, T>,
+    eq: unknown[],
+  ): this {
     this.steps.push({ op: "expectAbsent", table, index, eq });
     return this;
   }
 
-  upsert(
-    table: string,
+  upsert<T extends TableNames<S>>(
+    table: T,
     args: {
-      index: string;
+      index: IndexNamesOf<S, T>;
       eq: unknown[];
-      insert: Record<string, unknown>;
-      patch: Record<string, unknown>;
+      insert: WithoutSystemFields<S, T>;
+      patch: Partial<WithoutSystemFields<S, T>>;
     },
   ): this {
     this.steps.push({ op: "upsert", table, ...args });
@@ -52,6 +65,8 @@ export class TxnBuilder {
   }
 }
 
-export function mutation(): TxnBuilder {
-  return new TxnBuilder();
+export function mutation(): TxnBuilder<SchemaDefinition<any>>;
+export function mutation<S extends SchemaDefinition<any>>(schema: S): TxnBuilder<S>;
+export function mutation<S extends SchemaDefinition<any>>(_schema?: S): TxnBuilder<S> {
+  return new TxnBuilder<S>();
 }
