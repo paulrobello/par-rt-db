@@ -117,14 +117,22 @@ approximation of today's behavior — it is behaviorally identical.
     for `patch`), proving valid inserts/patches type-check, that an optional
     field may be omitted from `insert`, and that a single-field partial is
     accepted by `patch`.
-  - Negative: `// @ts-expect-error` immediately above a `toBeCallableWith`
-    call proving each of: a wrong field type, an unknown field (excess
-    properties on a literal argument trigger TS's excess-property check at
-    the call site), an invalid table name, and a required field omitted from
-    `insert` are all rejected. `expect-type` (the library backing vitest's
-    `expectTypeOf`) does not support `.not.toBeCallableWith(...)` — its own
-    README states `@ts-expect-error` is required for this — so this is not a
-    stylistic choice, it's the only mechanism available.
+  - Negative: `// @ts-expect-error` immediately above the failing call.
+    **Verified empirically before writing the plan** (staged the real
+    implementation as scratch `.probe.ts` files, ran the project's actual
+    `bun run typecheck`, then deleted the scratch files): `expectTypeOf(fn).
+    toBeCallableWith(...)` correctly rejects an invalid *first* argument
+    (e.g. an unknown table name) but is too permissive on a *second*
+    argument whose type depends on the first (e.g. `doc: WithoutSystemFields
+    <S, T>` where `T` is inferred from the table argument) — a known
+    `expect-type` limitation with dependent generic parameters, not a defect
+    in `insert`/`patch`'s typing (a direct, non-`toBeCallableWith` call with
+    `@ts-expect-error` correctly rejects the same invalid shapes). So: table-
+    name rejection uses `expectTypeOf(builder.insert).toBeCallableWith(...)`
+    with `@ts-expect-error`; wrong-field-type, unknown-field, missing-
+    required-field, and system-field-on-patch rejection use direct calls
+    (`builder.insert(...)` / `builder.patch(...)`) with `@ts-expect-error`
+    instead, since that is the mechanism confirmed to actually catch them.
 - `client/tests/mutation.test.ts` gets one new `it()` exercising the typed
   builder (`mutation(schema).insert(...).patch(...).build()`) against a
   schema fixture, asserting the produced `TransactionJson` is identical in
