@@ -1,6 +1,6 @@
 # Feature Matrix — Convex vs par-rt-db
 
-**Date:** 2026-07-21
+**Date:** 2026-07-21 (gap matrix last updated 2026-07-22)
 **Purpose:** Inventory Convex's feature surface against par-rt-db's, and rank every gap
 by utility and level of effort so parity work can be picked off in value order.
 **Perspective:** "Utility" is judged for the apps this instance actually serves (kanban
@@ -102,11 +102,11 @@ mistakes them for backlog.
 
 ## 5. Recommended order
 
-Work the gap matrix top-down; the natural first batch is **#1–#3 + #6** (range queries,
-`first`, `count`, `replace`) — one cohesive "query/txn surface parity" unit touching
-`query.rs`/`txn.rs`/`protocol.ts`/`query.ts`/`mutation.ts`, each individually small and
-testable in the existing integration binaries. Then **#4 (safe retry)** and **#5
-(pagination)** as the two medium builds with the highest app-facing payoff, with **#8**
-folded in whenever auth code is next open. **#9/#10 (scheduled/cron txns)** is the
-sleeper: it delivers most of what apps use Convex's scheduler+actions for, without
-compromising the no-server-code architecture.
+Tier-1's **#1–#3, #6, #7, #13** (range queries, `first`, `count`, `replace`, snapshot
+export/import, extra validators) and tier-2's **#8** (session-expiry enforcement) are done
+as of 2026-07-22 — see their rows above for what shipped. The next highest-value batch is
+**#4 (safe retry)** and **#5 (pagination)**, the two remaining medium builds with the
+highest app-facing payoff; #5's prerequisite (row 1's range support, for keyset pagination)
+is now in place. After that, **#9/#10 (scheduled/cron txns)** is the sleeper: it delivers
+most of what apps use Convex's scheduler+actions for, without compromising the
+no-server-code architecture.
