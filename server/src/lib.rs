@@ -7,6 +7,7 @@ pub mod ddl;
 pub mod error;
 pub mod http_api;
 pub mod mutation_log;
+pub mod pagination;
 pub mod protocol;
 pub mod query;
 pub mod schema;
