@@ -21,8 +21,12 @@ x86_64; do not `docker save` an arm64 image from a Mac).
 
 ```sh
 # from the repo root on the workstation:
+# .env/.env.* MUST be excluded — they are gitignored (don't exist in the
+# local checkout) but hold the live secrets on lenny2, so `--delete` without
+# these excludes would wipe them out.
 rsync -az --delete \
   --exclude target/ --exclude .git/ --exclude .superpowers/ --exclude node_modules/ \
+  --exclude .env --exclude '.env.*' \
   ./ root@lenny2.par-com.net:/docker/par-rt-db/
 
 # on lenny2 (the .env there holds the secrets, mode 600):
