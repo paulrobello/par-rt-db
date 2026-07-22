@@ -1,5 +1,7 @@
 use std::collections::{BTreeMap, HashSet};
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+
 use crate::error::RtDbError;
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -15,6 +17,10 @@ pub enum FieldType {
     Union { variants: Vec<FieldType> },
     Array { element: Box<FieldType> },
     Object { fields: BTreeMap<String, FieldType> },
+    Int64,
+    Bytes,
+    Any,
+    Record { value: Box<FieldType> },
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -65,7 +71,10 @@ fn validate_field_type(ty: &FieldType) -> Result<(), RtDbError> {
         | FieldType::Number
         | FieldType::Boolean
         | FieldType::Null
-        | FieldType::Id { .. } => Ok(()),
+        | FieldType::Id { .. }
+        | FieldType::Int64
+        | FieldType::Bytes
+        | FieldType::Any => Ok(()),
         FieldType::Literal { value } => {
             if value.is_string() || value.is_number() || value.is_boolean() {
                 Ok(())
@@ -99,6 +108,7 @@ fn validate_field_type(ty: &FieldType) -> Result<(), RtDbError> {
             }
             Ok(())
         }
+        FieldType::Record { value } => validate_field_type(value),
     }
 }
 
@@ -115,6 +125,10 @@ fn type_tag(ty: &FieldType) -> &'static str {
         FieldType::Union { .. } => "union",
         FieldType::Array { .. } => "array",
         FieldType::Object { .. } => "object",
+        FieldType::Int64 => "int64",
+        FieldType::Bytes => "bytes",
+        FieldType::Any => "any",
+        FieldType::Record { .. } => "record",
     }
 }
 
@@ -254,6 +268,20 @@ fn is_valid_id(value: &serde_json::Value) -> bool {
     }
 }
 
+fn is_valid_int64(value: &serde_json::Value) -> bool {
+    match value.as_str() {
+        Some(s) => s.parse::<i64>().is_ok(),
+        None => false,
+    }
+}
+
+fn is_valid_base64(value: &serde_json::Value) -> bool {
+    match value.as_str() {
+        Some(s) => STANDARD.decode(s).is_ok(),
+        None => false,
+    }
+}
+
 /// Validate a single value against a type (recursive; used by validate_doc and patch).
 pub fn validate_value(ty: &FieldType, value: &serde_json::Value) -> bool {
     match ty {
@@ -283,6 +311,13 @@ pub fn validate_value(ty: &FieldType, value: &serde_json::Value) -> bool {
                         None => matches!(field_type, FieldType::Optional { .. }),
                     })
             }
+            None => false,
+        },
+        FieldType::Int64 => is_valid_int64(value),
+        FieldType::Bytes => is_valid_base64(value),
+        FieldType::Any => true,
+        FieldType::Record { value: value_ty } => match value.as_object() {
+            Some(obj) => obj.values().all(|v| validate_value(value_ty, v)),
             None => false,
         },
     }
@@ -850,5 +885,140 @@ mod tests {
         let table = schema.table("projects").unwrap();
         assert!(table.index("by_name").is_ok());
         assert!(table.index("missing").is_err());
+    }
+
+    // Extra validators: record/int64/any/bytes wire tags, structural validation, and
+    // document/value validation (FEATURE_MATRIX rank 13).
+    #[test]
+    fn new_variants_serialize_with_expected_wire_tags() {
+        assert_eq!(
+            serde_json::to_value(FieldType::Int64).unwrap(),
+            serde_json::json!({"type": "int64"})
+        );
+        assert_eq!(
+            serde_json::to_value(FieldType::Bytes).unwrap(),
+            serde_json::json!({"type": "bytes"})
+        );
+        assert_eq!(
+            serde_json::to_value(FieldType::Any).unwrap(),
+            serde_json::json!({"type": "any"})
+        );
+        assert_eq!(
+            serde_json::to_value(FieldType::Record {
+                value: Box::new(FieldType::String)
+            })
+            .unwrap(),
+            serde_json::json!({"type": "record", "value": {"type": "string"}})
+        );
+    }
+
+    #[test]
+    fn record_field_validates_structurally_and_recurses() {
+        let table = TableDef {
+            fields: BTreeMap::from([(
+                "meta".to_string(),
+                FieldType::Record {
+                    value: Box::new(FieldType::Number),
+                },
+            )]),
+            indexes: vec![],
+        };
+        let schema = SchemaDef {
+            tables: BTreeMap::from([("items".to_string(), table)]),
+        };
+        assert!(schema.validate().is_ok());
+    }
+
+    #[test]
+    fn record_value_validates_every_entry() {
+        let ty = FieldType::Record {
+            value: Box::new(FieldType::String),
+        };
+        assert!(validate_value(
+            &ty,
+            &serde_json::json!({"a": "x", "b": "y"})
+        ));
+        assert!(validate_value(&ty, &serde_json::json!({})));
+        assert!(!validate_value(&ty, &serde_json::json!({"a": 1})));
+        assert!(!validate_value(&ty, &serde_json::json!(["a", "b"])));
+    }
+
+    #[test]
+    fn any_field_accepts_every_json_value() {
+        let ty = FieldType::Any;
+        assert!(validate_value(&ty, &serde_json::json!("x")));
+        assert!(validate_value(&ty, &serde_json::json!(42)));
+        assert!(validate_value(&ty, &serde_json::json!(true)));
+        assert!(validate_value(&ty, &serde_json::Value::Null));
+        assert!(validate_value(&ty, &serde_json::json!([1, "a", null])));
+        assert!(validate_value(
+            &ty,
+            &serde_json::json!({"nested": {"x": 1}})
+        ));
+    }
+
+    #[test]
+    fn bytes_field_validates_standard_padded_base64() {
+        let ty = FieldType::Bytes;
+        assert!(validate_value(&ty, &serde_json::json!("aGVsbG8gd29ybGQ=")));
+        assert!(!validate_value(&ty, &serde_json::json!("not base64!!!")));
+        // Missing required padding is rejected under STANDARD (not STANDARD_NO_PAD).
+        assert!(!validate_value(&ty, &serde_json::json!("aGVsbG8")));
+        assert!(!validate_value(&ty, &serde_json::json!(123)));
+    }
+
+    #[test]
+    fn int64_field_validates_decimal_string_in_i64_range() {
+        let ty = FieldType::Int64;
+        assert!(validate_value(&ty, &serde_json::json!("0")));
+        assert!(validate_value(&ty, &serde_json::json!("-42")));
+        assert!(validate_value(
+            &ty,
+            &serde_json::json!("9223372036854775807")
+        )); // i64::MAX
+        assert!(validate_value(
+            &ty,
+            &serde_json::json!("-9223372036854775808")
+        )); // i64::MIN
+        assert!(!validate_value(
+            &ty,
+            &serde_json::json!("9223372036854775808")
+        )); // overflow
+        assert!(!validate_value(&ty, &serde_json::json!("not a number")));
+        assert!(!validate_value(&ty, &serde_json::json!("1.5")));
+        assert!(!validate_value(&ty, &serde_json::json!(42))); // must be a string, not a JSON number
+    }
+
+    #[test]
+    fn indexed_column_type_rejects_new_non_indexable_types() {
+        assert!(indexed_column_type(&FieldType::Int64).is_err());
+        assert!(indexed_column_type(&FieldType::Bytes).is_err());
+        assert!(indexed_column_type(&FieldType::Any).is_err());
+        assert!(
+            indexed_column_type(&FieldType::Record {
+                value: Box::new(FieldType::String)
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_index_over_record_field() {
+        let table = TableDef {
+            fields: BTreeMap::from([(
+                "meta".to_string(),
+                FieldType::Record {
+                    value: Box::new(FieldType::String),
+                },
+            )]),
+            indexes: vec![IndexDef {
+                name: "by_meta".to_string(),
+                fields: vec!["meta".to_string()],
+            }],
+        };
+        let schema = SchemaDef {
+            tables: BTreeMap::from([("items".to_string(), table)]),
+        };
+        assert!(schema.validate().is_err());
     }
 }

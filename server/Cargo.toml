@@ -20,6 +20,7 @@ hex = "0.4"
 rand = "0.8"
 subtle = "2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+base64 = "0.22"
 
 [dev-dependencies]
 anyhow = "1"
