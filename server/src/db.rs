@@ -263,6 +263,15 @@ impl SchemaCache {
             .await
             .insert(db.to_string(), Arc::new(schema));
     }
+
+    /// Drops any cached schema for `db`, forcing the next `get` to reload from
+    /// Postgres. Used when a write to `db`'s schema may have partially applied
+    /// outside the cache's knowledge (e.g. `snapshot::import_database` failing
+    /// after its internal `push_schema` already committed) — safe to call even
+    /// when nothing is cached.
+    pub async fn invalidate(&self, db: &str) {
+        self.0.write().await.remove(db);
+    }
 }
 
 impl Default for SchemaCache {

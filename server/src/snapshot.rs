@@ -82,9 +82,9 @@ pub async fn export_database(
 /// tables/indexes when empty, or additively updates them like any other schema
 /// push); every following `doc` line is inserted with its original id, `doc`,
 /// `createdAt`, and `version` preserved exactly via `txn::insert_snapshot_row`.
-/// Blank lines are skipped. Malformed JSON, a doc line before the schema line, or
-/// a doc naming a table absent from the schema is a `BadRequest`. Returns the
-/// applied schema so the caller can refresh its schema cache.
+/// Blank lines are skipped. Malformed JSON or a doc line before the schema line is
+/// a `BadRequest`; a doc naming a table absent from the schema is a `NotFound`.
+/// Returns the applied schema so the caller can refresh its schema cache.
 pub async fn import_database(pool: &PgPool, db: &str, jsonl: &str) -> Result<SchemaDef, RtDbError> {
     validate_db_name(db)?;
     let mut lines = jsonl.lines().filter(|line| !line.trim().is_empty());

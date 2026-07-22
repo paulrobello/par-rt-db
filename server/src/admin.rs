@@ -237,9 +237,16 @@ async fn import_db(
     body: String,
 ) -> Result<Json<OkResponse>, RtDbError> {
     require_admin(&headers, &state.config.admin_key)?;
-    let applied = snapshot::import_database(&state.pool, &params.db, &body).await?;
-    state.schemas.put(&params.db, applied).await;
-    Ok(Json(OkResponse { ok: true }))
+    match snapshot::import_database(&state.pool, &params.db, &body).await {
+        Ok(applied) => {
+            state.schemas.put(&params.db, applied).await;
+            Ok(Json(OkResponse { ok: true }))
+        }
+        Err(err) => {
+            state.schemas.invalidate(&params.db).await;
+            Err(err)
+        }
+    }
 }
 
 /// Admin routes, all gated on `Authorization: Bearer <admin_key>` (constant-time

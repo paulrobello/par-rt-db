@@ -478,3 +478,89 @@ async fn import_db_into_unknown_database_is_not_found() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+// (n) B3: when import-db's doc-replay phase fails (id collision) after its
+// internal push_schema already committed the new schema to Postgres, the
+// stale pre-import schema cache entry must be invalidated rather than left
+// serving the old schema forever.
+#[tokio::test]
+async fn import_db_doc_replay_failure_after_schema_commit_refreshes_schema_cache()
+-> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let addr = spawn_app(state.clone()).await;
+    let target_db = fresh_db(&state).await;
+
+    // Warm the schema cache with the pre-import schema, as a running server would
+    // have it cached from ordinary traffic against `target_db`.
+    let old_schema = state.schemas.get(&pool, &target_db).await?;
+    assert!(
+        !old_schema.tables["projects"]
+            .fields
+            .contains_key("priority")
+    );
+
+    // Seed one document so its id can collide with an imported doc line, forcing
+    // the doc-replay phase to fail after `import_database`'s internal
+    // `push_schema` call has already committed.
+    let insert_outcome = execute_txn(
+        &pool,
+        &target_db,
+        &old_schema,
+        &Transaction {
+            steps: vec![Step::Insert {
+                table: "projects".to_string(),
+                doc: serde_json::json!({
+                    "name": "Existing",
+                    "status": "active",
+                    "tags": [],
+                    "updatedAt": 1
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+            }],
+        },
+    )
+    .await?;
+    let existing_id = insert_outcome.results[0]["id"]
+        .as_str()
+        .expect("project id")
+        .to_string();
+
+    let mut new_schema = kanban_schema_json();
+    new_schema["tables"]["projects"]["fields"]["priority"] =
+        serde_json::json!({"type": "optional", "inner": {"type": "number"}});
+
+    let jsonl = format!(
+        "{}\n{}\n",
+        serde_json::json!({"kind": "schema", "schema": new_schema}),
+        serde_json::json!({
+            "kind": "doc",
+            "table": "projects",
+            "id": existing_id,
+            "doc": {"name": "Colliding", "status": "active", "tags": [], "updatedAt": 2},
+            "createdAt": 2,
+            "version": 1
+        })
+    );
+
+    let import_resp =
+        admin_post_raw(addr, &format!("/admin/import-db?db={target_db}"), jsonl).await;
+    assert_eq!(
+        import_resp.status(),
+        reqwest::StatusCode::INTERNAL_SERVER_ERROR
+    );
+
+    // A stale cache entry would still report the pre-import schema here; the
+    // fix invalidates it on the failed import so this reload reflects what the
+    // committed `push_schema` actually wrote to Postgres.
+    let refreshed_schema = state.schemas.get(&pool, &target_db).await?;
+    assert!(
+        refreshed_schema.tables["projects"]
+            .fields
+            .contains_key("priority")
+    );
+
+    Ok(())
+}
