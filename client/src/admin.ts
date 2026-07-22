@@ -61,6 +61,41 @@ export class RtDbAdminClient {
     return (body as { emails: string[] }).emails;
   }
 
+  /** Fetches `db`'s schema and every document as JSONL text (see server `snapshot::export_database`). */
+  async exportDb(db: string): Promise<string> {
+    const response = await this.fetchImpl(`${this.url}/admin/export-db?db=${encodeURIComponent(db)}`, {
+      method: "GET",
+      headers: { Authorization: `Bearer ${this.adminKey}` },
+    });
+    if (!response.ok) {
+      await this.throwFromResponse(response);
+    }
+    return await response.text();
+  }
+
+  /** Loads a JSONL snapshot from `exportDb` into `db` (see server `snapshot::import_database`). */
+  async importDb(db: string, jsonl: string): Promise<void> {
+    const response = await this.fetchImpl(`${this.url}/admin/import-db?db=${encodeURIComponent(db)}`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${this.adminKey}`,
+        "content-type": "application/x-ndjson",
+      },
+      body: jsonl,
+    });
+    if (!response.ok) {
+      await this.throwFromResponse(response);
+    }
+  }
+
+  private async throwFromResponse(response: Response): Promise<never> {
+    const parsed: unknown = await response.json().catch(() => null);
+    if (RtDbError.isEnvelope(parsed)) {
+      throw RtDbError.fromEnvelope(parsed);
+    }
+    throw new RtDbError("INTERNAL", `admin request failed with status ${response.status}`);
+  }
+
   private async request(method: "GET" | "POST", path: string, payload?: unknown): Promise<unknown> {
     const response = await this.fetchImpl(`${this.url}${path}`, {
       method,
