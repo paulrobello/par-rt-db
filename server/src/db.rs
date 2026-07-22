@@ -140,6 +140,16 @@ pub async fn create_database(pool: &PgPool, name: &str) -> Result<(), RtDbError>
     .execute(&mut *tx)
     .await?;
 
+    sqlx::query(&format!(
+        "CREATE TABLE \"{schema_name}\".mutations (
+            mut_id text PRIMARY KEY,
+            result jsonb NOT NULL,
+            expires_at bigint NOT NULL
+        )"
+    ))
+    .execute(&mut *tx)
+    .await?;
+
     sqlx::query("INSERT INTO rtdb_auth.databases (name, created_at) VALUES ($1, $2)")
         .bind(name)
         .bind(now_ms())
