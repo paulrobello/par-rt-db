@@ -28,6 +28,13 @@ export class RtDbHttpClient {
     return (body as { result: R }).result;
   }
 
+  /**
+   * `opts.mutId` is an idempotency key, not a display/tracking id: supply the
+   * *same* value again to safely retry a mutation whose result you never
+   * received instead of double-applying it. The server does not fingerprint
+   * the transaction body, so reusing a key for a different mutation replays
+   * the first one's cached result. Omit it for ordinary one-shot calls.
+   */
   async mutate(txn: TransactionJson, opts?: { mutId?: string }): Promise<unknown[]> {
     const body = await this.post("/api/mutate", {
       db: this.db,

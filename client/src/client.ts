@@ -210,6 +210,14 @@ export class RtDbClient {
     };
   }
 
+  /**
+   * `opts.mutId` is an idempotency key, not a display/tracking id: supply the
+   * *same* value again to safely retry a mutation whose result you never
+   * received (e.g. after a dropped connection) instead of double-applying
+   * it. The server does not fingerprint the transaction body, so reusing a
+   * key for a different mutation replays the first one's cached result.
+   * Omit it for ordinary at-most-once calls (today's default behavior).
+   */
   mutate(txn: TransactionJson, opts?: { mutId?: string }): Promise<unknown[]> {
     const mutId = `mut-${++this.counter}`;
     return new Promise<unknown[]>((resolve, reject) => {

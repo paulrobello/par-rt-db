@@ -125,6 +125,38 @@ async fn no_mut_id_does_not_dedup() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn empty_string_idempotency_key_is_treated_as_absent() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let db = fresh_db(&state).await;
+
+    let txn = Transaction {
+        steps: vec![Step::Insert {
+            table: "projects".to_string(),
+            doc: valid_project_doc(),
+        }],
+    };
+
+    state
+        .committers
+        .mutate(&db, Some(String::new()), txn.clone())
+        .await?;
+    state
+        .committers
+        .mutate(&db, Some(String::new()), txn.clone())
+        .await?;
+
+    let pg_schema = format!("db_{db}");
+    let count: (i64,) = sqlx::query_as(&format!(
+        "SELECT COUNT(*) FROM \"{pg_schema}\".\"t_projects\""
+    ))
+    .fetch_one(&state.pool)
+    .await?;
+    assert_eq!(count.0, 2);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn expired_mut_id_re_executes() -> anyhow::Result<()> {
     let state = test_state().await;
     let db = fresh_db(&state).await;
