@@ -145,10 +145,10 @@ exposed). No change to `dispatchMutate`, `flushOnAuth`, `handleClose`, or
 calling `mutate()` again, never something the SDK does on its own.
 
 `http.ts`'s `mutate(txn, opts?: { mutId?: string })` forwards `opts.mutId` as
-the new `mutId` field on the HTTP request body when present.
-
-`protocol.ts`'s HTTP mutate request type gains the matching optional
-`mutId?: string` field.
+the new `mutId` field on the HTTP request body when present. Correction after
+checking the actual code: `protocol.ts` has no separate HTTP request type to
+update — `http.ts` builds the request body as an inline object literal, so
+the new field is added there directly, with no `protocol.ts` change needed.
 
 ## Testing
 
