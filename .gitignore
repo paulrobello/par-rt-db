@@ -23,6 +23,7 @@ Thumbs.db
 *.swo
 
 # Agent/tool local state
+.worktrees/
 .superpowers/
 .gemini/
 .gemini-clipboard/
