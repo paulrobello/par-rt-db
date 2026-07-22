@@ -14,6 +14,11 @@ export class TxnBuilder {
     return this;
   }
 
+  replace(table: string, id: string, doc: Record<string, unknown>): this {
+    this.steps.push({ op: "replace", table, id, doc });
+    return this;
+  }
+
   delete(table: string, id: string): this {
     this.steps.push({ op: "delete", table, id });
     return this;

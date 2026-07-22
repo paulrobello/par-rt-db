@@ -23,6 +23,7 @@ export interface QueryJson {
 export type StepJson =
   | { op: "insert"; table: string; doc: Record<string, unknown> }
   | { op: "patch"; table: string; id: string; fields: Record<string, unknown> }
+  | { op: "replace"; table: string; id: string; doc: Record<string, unknown> }
   | { op: "delete"; table: string; id: string }
   | { op: "expectVersion"; table: string; id: string; version: number }
   | { op: "expectAbsent"; table: string; index: string; eq: unknown[] }
