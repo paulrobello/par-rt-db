@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use sqlx::PgPool;
@@ -7,6 +7,7 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 
 use crate::db::{SchemaCache, database_exists};
 use crate::error::RtDbError;
+use crate::mutation_log;
 use crate::protocol::ServerMessage;
 use crate::query::{Query, canonical, execute_query};
 use crate::subs::{ConnId, SubscriptionManager};
@@ -17,6 +18,7 @@ const CHANNEL_BUFFER: usize = 64;
 
 pub enum CommitterRequest {
     Mutate {
+        mut_id: Option<String>,
         txn: Transaction,
         reply: oneshot::Sender<Result<TxnOutcome, RtDbError>>,
     },
@@ -115,10 +117,17 @@ impl Committers {
     }
 
     /// Executes `txn` on `db` and waits for the fan-out-then-reply cycle to
-    /// complete.
-    pub async fn mutate(&self, db: &str, txn: Transaction) -> Result<TxnOutcome, RtDbError> {
+    /// complete. `mut_id`, when present, is the idempotency key: a repeat
+    /// call with the same `db` + `mut_id` replays the first call's cached
+    /// results instead of re-executing.
+    pub async fn mutate(
+        &self,
+        db: &str,
+        mut_id: Option<String>,
+        txn: Transaction,
+    ) -> Result<TxnOutcome, RtDbError> {
         let (reply, reply_rx) = oneshot::channel();
-        self.submit(db, CommitterRequest::Mutate { txn, reply })
+        self.submit(db, CommitterRequest::Mutate { mut_id, txn, reply })
             .await?;
         reply_rx
             .await
@@ -181,6 +190,9 @@ async fn run_committer(
     schemas: SchemaCache,
     mut rx: mpsc::Receiver<CommitterRequest>,
 ) {
+    if let Err(err) = mutation_log::ensure_table(&pool, &db).await {
+        tracing::error!(db = %db, error = %err, "failed to ensure mutations dedup table");
+    }
     let ctx = CommitterCtx {
         pool,
         db,
@@ -189,8 +201,8 @@ async fn run_committer(
     };
     while let Some(req) = rx.recv().await {
         match req {
-            CommitterRequest::Mutate { txn, reply } => {
-                let outcome = handle_mutate(&ctx, txn).await;
+            CommitterRequest::Mutate { mut_id, txn, reply } => {
+                let outcome = handle_mutate(&ctx, mut_id, txn).await;
                 let _ = reply.send(outcome);
             }
             CommitterRequest::Subscribe {
@@ -207,12 +219,37 @@ async fn run_committer(
     }
 }
 
-async fn handle_mutate(ctx: &CommitterCtx, txn: Transaction) -> Result<TxnOutcome, RtDbError> {
+async fn handle_mutate(
+    ctx: &CommitterCtx,
+    mut_id: Option<String>,
+    txn: Transaction,
+) -> Result<TxnOutcome, RtDbError> {
+    if let Some(id) = &mut_id
+        && let Some(results) = mutation_log::check(&ctx.pool, &ctx.db, id).await?
+    {
+        return Ok(TxnOutcome {
+            results,
+            write_set: BTreeSet::new(),
+        });
+    }
+
     let schema = ctx.schemas.get(&ctx.pool, &ctx.db).await?;
     let outcome = execute_txn(&ctx.pool, &ctx.db, &schema, &txn).await?;
     ctx.subs
         .fan_out(&ctx.pool, &ctx.db, &schema, &outcome.write_set)
         .await;
+
+    if let Some(id) = &mut_id {
+        mutation_log::store(
+            &ctx.pool,
+            &ctx.db,
+            id,
+            &outcome.results,
+            mutation_log::DEDUP_TTL_MS,
+        )
+        .await?;
+    }
+
     Ok(outcome)
 }
 

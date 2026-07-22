@@ -73,11 +73,11 @@ async fn subscribe_sends_initial_query_update_with_seeded_rows() -> anyhow::Resu
 
     state
         .committers
-        .mutate(&db, insert_work_item("backlog", 1.0))
+        .mutate(&db, None, insert_work_item("backlog", 1.0))
         .await?;
     state
         .committers
-        .mutate(&db, insert_work_item("backlog", 2.0))
+        .mutate(&db, None, insert_work_item("backlog", 2.0))
         .await?;
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -107,11 +107,11 @@ async fn mutate_pushes_update_to_matching_subscription() -> anyhow::Result<()> {
 
     state
         .committers
-        .mutate(&db, insert_work_item("backlog", 1.0))
+        .mutate(&db, None, insert_work_item("backlog", 1.0))
         .await?;
     state
         .committers
-        .mutate(&db, insert_work_item("backlog", 2.0))
+        .mutate(&db, None, insert_work_item("backlog", 2.0))
         .await?;
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -124,7 +124,7 @@ async fn mutate_pushes_update_to_matching_subscription() -> anyhow::Result<()> {
 
     state
         .committers
-        .mutate(&db, insert_work_item("backlog", 3.0))
+        .mutate(&db, None, insert_work_item("backlog", 3.0))
         .await?;
 
     let msg = rx.try_recv().expect("update after mutate");
@@ -154,7 +154,7 @@ async fn mutate_on_unrelated_table_sends_no_update() -> anyhow::Result<()> {
         .await?;
     rx.try_recv().expect("initial query update");
 
-    state.committers.mutate(&db, insert_project()).await?;
+    state.committers.mutate(&db, None, insert_project()).await?;
 
     assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
 
@@ -169,7 +169,7 @@ async fn mutate_not_matching_eq_filter_sends_no_update() -> anyhow::Result<()> {
 
     state
         .committers
-        .mutate(&db, insert_work_item("backlog", 1.0))
+        .mutate(&db, None, insert_work_item("backlog", 1.0))
         .await?;
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -188,7 +188,7 @@ async fn mutate_not_matching_eq_filter_sends_no_update() -> anyhow::Result<()> {
 
     state
         .committers
-        .mutate(&db, insert_work_item("done", 2.0))
+        .mutate(&db, None, insert_work_item("done", 2.0))
         .await?;
 
     assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
@@ -220,7 +220,7 @@ async fn two_subscriptions_both_receive_updates_from_one_mutate() -> anyhow::Res
 
     state
         .committers
-        .mutate(&db, insert_work_item("backlog", 1.0))
+        .mutate(&db, None, insert_work_item("backlog", 1.0))
         .await?;
 
     let msg1 = rx1.try_recv().expect("q1 update");
@@ -249,7 +249,7 @@ async fn remove_conn_stops_further_updates() -> anyhow::Result<()> {
 
     state
         .committers
-        .mutate(&db, insert_work_item("backlog", 1.0))
+        .mutate(&db, None, insert_work_item("backlog", 1.0))
         .await?;
 
     // No QueryUpdate is delivered: either the channel is empty, or (as here,
@@ -268,7 +268,7 @@ async fn mutate_on_nonexistent_db_is_not_found() -> anyhow::Result<()> {
 
     let err = state
         .committers
-        .mutate("does_not_exist", insert_project())
+        .mutate("does_not_exist", None, insert_project())
         .await
         .expect_err("expected not found");
     assert_eq!(err.code, ErrorCode::NotFound);

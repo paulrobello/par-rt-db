@@ -311,7 +311,7 @@ async fn handle_text_frame(
         }
         ClientMessage::Mutate { mut_id, txn } => {
             match authorize(&state.pool, principal, db).await {
-                Ok(()) => match state.committers.mutate(db, txn).await {
+                Ok(()) => match state.committers.mutate(db, Some(mut_id.clone()), txn).await {
                     Ok(outcome) => {
                         let _ = out_tx.send(ServerMessage::MutateOk {
                             mut_id,

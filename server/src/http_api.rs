@@ -67,9 +67,12 @@ async fn query_handler(
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct MutateRequest {
     db: String,
     txn: Transaction,
+    #[serde(default)]
+    mut_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -86,7 +89,10 @@ async fn mutate_handler(
     let principal = resolve_bearer(&state.pool, token).await?;
     authorize(&state.pool, &principal, &body.db).await?;
 
-    let outcome = state.committers.mutate(&body.db, body.txn).await?;
+    let outcome = state
+        .committers
+        .mutate(&body.db, body.mut_id, body.txn)
+        .await?;
     Ok(Json(MutateResponse {
         results: outcome.results,
     }))
