@@ -111,7 +111,14 @@ fn docs_ids(result: &QueryResult) -> Vec<String> {
             .iter()
             .map(|d| d["_id"].as_str().expect("_id string").to_string())
             .collect(),
-        QueryResult::Doc(_) => panic!("expected Docs variant"),
+        other => panic!("expected Docs variant, got {other:?}"),
+    }
+}
+
+fn count_value(result: &QueryResult) -> i64 {
+    match result {
+        QueryResult::Count(n) => *n,
+        other => panic!("expected Count variant, got {other:?}"),
     }
 }
 
@@ -143,6 +150,7 @@ async fn get_by_id_returns_doc_with_system_fields() -> anyhow::Result<()> {
             take: None,
             unique: false,
             first: false,
+            count: false,
         },
     )
     .await?;
@@ -188,6 +196,7 @@ async fn get_missing_returns_null() -> anyhow::Result<()> {
             take: None,
             unique: false,
             first: false,
+            count: false,
         },
     )
     .await?;
@@ -224,6 +233,7 @@ async fn get_combined_with_index_is_bad_request() -> anyhow::Result<()> {
             take: None,
             unique: false,
             first: false,
+            count: false,
         },
     )
     .await
@@ -260,6 +270,7 @@ async fn unique_combined_with_take_is_bad_request() -> anyhow::Result<()> {
             take: Some(10),
             unique: true,
             first: false,
+            count: false,
         },
     )
     .await
@@ -297,6 +308,7 @@ async fn full_eq_compound_index_orders_by_created_at_asc() -> anyhow::Result<()>
             take: Some(10),
             unique: false,
             first: false,
+            count: false,
         },
     )
     .await?;
@@ -332,6 +344,7 @@ async fn full_eq_compound_index_order_desc_reverses() -> anyhow::Result<()> {
             take: Some(10),
             unique: false,
             first: false,
+            count: false,
         },
     )
     .await?;
@@ -369,6 +382,7 @@ async fn prefix_eq_on_compound_index_sorts_by_remaining_index_field_then_created
             take: None,
             unique: false,
             first: false,
+            count: false,
         },
     )
     .await?;
@@ -413,6 +427,7 @@ async fn unique_on_by_name_returns_single_doc() -> anyhow::Result<()> {
             take: None,
             unique: true,
             first: false,
+            count: false,
         },
     )
     .await?;
@@ -454,6 +469,7 @@ async fn unique_with_duplicate_name_is_precondition_failed() -> anyhow::Result<(
             take: None,
             unique: true,
             first: false,
+            count: false,
         },
     )
     .await
@@ -491,6 +507,7 @@ async fn no_index_collect_returns_all_docs_in_created_at_order() -> anyhow::Resu
             take: None,
             unique: false,
             first: false,
+            count: false,
         },
     )
     .await?;
@@ -526,6 +543,7 @@ async fn take_over_cap_is_bad_request() -> anyhow::Result<()> {
             take: Some(5000),
             unique: false,
             first: false,
+            count: false,
         },
     )
     .await
@@ -562,6 +580,7 @@ async fn unknown_index_is_bad_request() -> anyhow::Result<()> {
             take: None,
             unique: false,
             first: false,
+            count: false,
         },
     )
     .await
@@ -598,6 +617,7 @@ async fn eq_longer_than_index_fields_is_bad_request() -> anyhow::Result<()> {
             take: None,
             unique: false,
             first: false,
+            count: false,
         },
     )
     .await
@@ -632,6 +652,7 @@ async fn unknown_table_is_not_found() -> anyhow::Result<()> {
             take: None,
             unique: false,
             first: false,
+            count: false,
         },
     )
     .await
@@ -668,6 +689,7 @@ async fn take_zero_returns_empty_docs() -> anyhow::Result<()> {
             take: Some(0),
             unique: false,
             first: false,
+            count: false,
         },
     )
     .await?;
@@ -701,6 +723,7 @@ async fn unique_without_index_scans_whole_table() -> anyhow::Result<()> {
         take: None,
         unique: true,
         first: false,
+        count: false,
     };
 
     let result = execute_query(&pool, &db, &schema, &unique_query).await?;
@@ -745,6 +768,7 @@ async fn canonical_is_stable_for_identical_results() -> anyhow::Result<()> {
         take: None,
         unique: false,
         first: false,
+        count: false,
     };
 
     let first = execute_query(&pool, &db, &schema, &query).await?;
@@ -783,6 +807,7 @@ async fn range_gt_excludes_boundary_and_sorts_by_bound_field() -> anyhow::Result
             take: None,
             unique: false,
             first: false,
+            count: false,
         },
     )
     .await?;
@@ -821,6 +846,7 @@ async fn range_gte_includes_boundary() -> anyhow::Result<()> {
             take: None,
             unique: false,
             first: false,
+            count: false,
         },
     )
     .await?;
@@ -865,6 +891,7 @@ async fn range_gt_and_lt_bounded_numeric_range() -> anyhow::Result<()> {
             take: None,
             unique: false,
             first: false,
+            count: false,
         },
     )
     .await?;
@@ -903,6 +930,7 @@ async fn range_bounded_numeric_range_with_order_desc_and_take() -> anyhow::Resul
             take: Some(2),
             unique: false,
             first: false,
+            count: false,
         },
     )
     .await?;
@@ -938,6 +966,7 @@ async fn range_without_eq_prefix_applies_to_first_index_field() -> anyhow::Resul
             take: None,
             unique: false,
             first: false,
+            count: false,
         },
     )
     .await?;
@@ -976,6 +1005,7 @@ async fn range_gt_and_gte_both_set_is_bad_request() -> anyhow::Result<()> {
             take: None,
             unique: false,
             first: false,
+            count: false,
         },
     )
     .await
@@ -1012,6 +1042,7 @@ async fn range_lt_and_lte_both_set_is_bad_request() -> anyhow::Result<()> {
             take: None,
             unique: false,
             first: false,
+            count: false,
         },
     )
     .await
@@ -1048,6 +1079,7 @@ async fn range_without_index_is_bad_request() -> anyhow::Result<()> {
             take: None,
             unique: false,
             first: false,
+            count: false,
         },
     )
     .await
@@ -1084,6 +1116,7 @@ async fn range_with_no_remaining_index_field_is_bad_request() -> anyhow::Result<
             take: None,
             unique: false,
             first: false,
+            count: false,
         },
     )
     .await
@@ -1120,6 +1153,7 @@ async fn range_combined_with_get_is_bad_request() -> anyhow::Result<()> {
             take: None,
             unique: false,
             first: false,
+            count: false,
         },
     )
     .await
@@ -1156,6 +1190,7 @@ async fn range_value_wrong_type_is_bad_request() -> anyhow::Result<()> {
             take: None,
             unique: false,
             first: false,
+            count: false,
         },
     )
     .await
@@ -1192,6 +1227,7 @@ async fn range_lte_includes_boundary_value() -> anyhow::Result<()> {
             take: None,
             unique: false,
             first: false,
+            count: false,
         },
     )
     .await?;
@@ -1232,6 +1268,7 @@ async fn first_on_no_matching_docs_returns_null() -> anyhow::Result<()> {
             take: None,
             unique: false,
             first: true,
+            count: false,
         },
     )
     .await?;
@@ -1267,6 +1304,7 @@ async fn first_with_single_matching_doc_returns_it() -> anyhow::Result<()> {
             take: None,
             unique: false,
             first: true,
+            count: false,
         },
     )
     .await?;
@@ -1309,6 +1347,7 @@ async fn first_combined_with_range_bound_returns_smallest_in_ascending_order() -
             take: None,
             unique: false,
             first: true,
+            count: false,
         },
     )
     .await?;
@@ -1349,6 +1388,7 @@ async fn first_combined_with_range_bound_and_order_desc_returns_largest() -> any
             take: None,
             unique: false,
             first: true,
+            count: false,
         },
     )
     .await?;
@@ -1389,6 +1429,7 @@ async fn first_combined_with_take_is_bad_request() -> anyhow::Result<()> {
             take: Some(10),
             unique: false,
             first: true,
+            count: false,
         },
     )
     .await
@@ -1425,6 +1466,7 @@ async fn first_combined_with_unique_is_bad_request() -> anyhow::Result<()> {
             take: None,
             unique: true,
             first: true,
+            count: false,
         },
     )
     .await
@@ -1461,6 +1503,302 @@ async fn first_combined_with_get_is_bad_request() -> anyhow::Result<()> {
             take: None,
             unique: false,
             first: true,
+            count: false,
+        },
+    )
+    .await
+    .expect_err("expected bad request");
+    assert_eq!(err.code, ErrorCode::BadRequest);
+
+    Ok(())
+}
+
+// `.count()`: terminal running SELECT COUNT(*) over the same eq/range WHERE clause as every
+// other terminal, returning Count(n) instead of Docs/Doc; mutually exclusive with
+// get/take/unique/first/order.
+
+// (count-a) empty table -> Count(0).
+#[tokio::test]
+async fn count_on_empty_table_returns_zero() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+
+    let result = execute_query(
+        &pool,
+        &db,
+        &schema,
+        &Query {
+            table: "workItems".to_string(),
+            get: None,
+            index: None,
+            eq: vec![],
+            gt: None,
+            gte: None,
+            lt: None,
+            lte: None,
+            order: None,
+            take: None,
+            unique: false,
+            first: false,
+            count: true,
+        },
+    )
+    .await?;
+
+    assert_eq!(count_value(&result), 0);
+    Ok(())
+}
+
+// (count-b) filtered subset via an eq index prefix -> count of just the matching rows.
+#[tokio::test]
+async fn count_with_eq_prefix_counts_matching_subset() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+
+    let (project_id, _items) = seed_kanban(&pool, &db, &schema).await?;
+
+    let result = execute_query(
+        &pool,
+        &db,
+        &schema,
+        &Query {
+            table: "workItems".to_string(),
+            get: None,
+            index: Some("by_project_and_status".to_string()),
+            eq: vec![serde_json::json!(project_id), serde_json::json!("backlog")],
+            gt: None,
+            gte: None,
+            lt: None,
+            lte: None,
+            order: None,
+            take: None,
+            unique: false,
+            first: false,
+            count: true,
+        },
+    )
+    .await?;
+
+    assert_eq!(count_value(&result), 2);
+    Ok(())
+}
+
+// (count-c) filtered subset via a range bound after the eq prefix -> count of matching rows.
+#[tokio::test]
+async fn count_with_range_bound_counts_matching_subset() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+
+    let (project_id, _items) = seed_kanban(&pool, &db, &schema).await?;
+
+    let result = execute_query(
+        &pool,
+        &db,
+        &schema,
+        &Query {
+            table: "workItems".to_string(),
+            get: None,
+            index: Some("by_project_and_order".to_string()),
+            eq: vec![serde_json::json!(project_id)],
+            gt: Some(serde_json::json!(1.0)),
+            gte: None,
+            lt: Some(serde_json::json!(5.0)),
+            lte: None,
+            order: None,
+            take: None,
+            unique: false,
+            first: false,
+            count: true,
+        },
+    )
+    .await?;
+
+    assert_eq!(count_value(&result), 3);
+    Ok(())
+}
+
+// (count-d) count combined with order -> BadRequest (a count has no rows to order).
+#[tokio::test]
+async fn count_combined_with_order_is_bad_request() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+
+    seed_kanban(&pool, &db, &schema).await?;
+
+    let err = execute_query(
+        &pool,
+        &db,
+        &schema,
+        &Query {
+            table: "workItems".to_string(),
+            get: None,
+            index: None,
+            eq: vec![],
+            gt: None,
+            gte: None,
+            lt: None,
+            lte: None,
+            order: Some(Order::Desc),
+            take: None,
+            unique: false,
+            first: false,
+            count: true,
+        },
+    )
+    .await
+    .expect_err("expected bad request");
+    assert_eq!(err.code, ErrorCode::BadRequest);
+
+    Ok(())
+}
+
+// (count-e) count combined with take -> BadRequest.
+#[tokio::test]
+async fn count_combined_with_take_is_bad_request() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+
+    seed_kanban(&pool, &db, &schema).await?;
+
+    let err = execute_query(
+        &pool,
+        &db,
+        &schema,
+        &Query {
+            table: "workItems".to_string(),
+            get: None,
+            index: None,
+            eq: vec![],
+            gt: None,
+            gte: None,
+            lt: None,
+            lte: None,
+            order: None,
+            take: Some(10),
+            unique: false,
+            first: false,
+            count: true,
+        },
+    )
+    .await
+    .expect_err("expected bad request");
+    assert_eq!(err.code, ErrorCode::BadRequest);
+
+    Ok(())
+}
+
+// (count-f) count combined with unique -> BadRequest.
+#[tokio::test]
+async fn count_combined_with_unique_is_bad_request() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+
+    seed_kanban(&pool, &db, &schema).await?;
+
+    let err = execute_query(
+        &pool,
+        &db,
+        &schema,
+        &Query {
+            table: "workItems".to_string(),
+            get: None,
+            index: None,
+            eq: vec![],
+            gt: None,
+            gte: None,
+            lt: None,
+            lte: None,
+            order: None,
+            take: None,
+            unique: true,
+            first: false,
+            count: true,
+        },
+    )
+    .await
+    .expect_err("expected bad request");
+    assert_eq!(err.code, ErrorCode::BadRequest);
+
+    Ok(())
+}
+
+// (count-g) count combined with first -> BadRequest.
+#[tokio::test]
+async fn count_combined_with_first_is_bad_request() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+
+    seed_kanban(&pool, &db, &schema).await?;
+
+    let err = execute_query(
+        &pool,
+        &db,
+        &schema,
+        &Query {
+            table: "workItems".to_string(),
+            get: None,
+            index: None,
+            eq: vec![],
+            gt: None,
+            gte: None,
+            lt: None,
+            lte: None,
+            order: None,
+            take: None,
+            unique: false,
+            first: true,
+            count: true,
+        },
+    )
+    .await
+    .expect_err("expected bad request");
+    assert_eq!(err.code, ErrorCode::BadRequest);
+
+    Ok(())
+}
+
+// (count-h) count combined with get -> BadRequest.
+#[tokio::test]
+async fn count_combined_with_get_is_bad_request() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+
+    let (_project_id, items) = seed_kanban(&pool, &db, &schema).await?;
+
+    let err = execute_query(
+        &pool,
+        &db,
+        &schema,
+        &Query {
+            table: "workItems".to_string(),
+            get: Some(items[0].clone()),
+            index: None,
+            eq: vec![],
+            gt: None,
+            gte: None,
+            lt: None,
+            lte: None,
+            order: None,
+            take: None,
+            unique: false,
+            first: false,
+            count: true,
         },
     )
     .await

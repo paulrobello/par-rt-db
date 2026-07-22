@@ -43,6 +43,8 @@ pub struct Query {
     pub unique: bool, // with unique, take/order must be absent
     #[serde(default)]
     pub first: bool, // sugar over take(1); returns Doc(Some) or Doc(None); mutually exclusive with take/unique
+    #[serde(default)]
+    pub count: bool, // terminal: SELECT COUNT(*) over the same eq/range WHERE; mutually exclusive with get/take/unique/first/order
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -50,6 +52,7 @@ pub struct Query {
 pub enum QueryResult {
     Doc(Option<serde_json::Value>), // get / unique: doc or null
     Docs(Vec<serde_json::Value>),   // take / collect
+    Count(i64),                     // count: total matching rows, uncapped by MAX_TAKE
 }
 
 /// Result docs = stored doc merged with {"_id", "_creationTime", "_version"}.
@@ -65,8 +68,12 @@ pub enum QueryResult {
 /// `first` is sugar over `take(1)`: applies the same eq/range/order filters with LIMIT 1 and
 /// returns `Doc(Some)` (or `Doc(None)` if nothing matched) instead of `Docs`; mutually exclusive
 /// with `take` and `unique`.
+/// `count` is a terminal that runs `SELECT COUNT(*)` over the same eq/range WHERE clause as every
+/// other terminal (no index required, same as collect), skipping ORDER BY/LIMIT entirely and
+/// returning `Count(n)` uncapped by `MAX_TAKE`; mutually exclusive with `get`, `take`, `unique`,
+/// `first`, and `order` (a count has no rows to order).
 /// Unknown table -> NotFound; unknown index / eq too long / get+query mix / unique+take /
-/// first+take / first+unique -> BadRequest.
+/// first+take / first+unique / count+take / count+unique / count+first / count+order -> BadRequest.
 /// `take: 0` is valid and returns an empty `Docs([])`, not an error.
 /// `unique` without an `index` scans the whole table (LIMIT 2) and applies the same 0/1/>1 rule.
 pub async fn execute_query(
@@ -89,9 +96,10 @@ pub async fn execute_query(
             || q.take.is_some()
             || q.unique
             || q.first
+            || q.count
         {
             return Err(RtDbError::bad_request(
-                "get cannot be combined with index, eq, range bounds, order, take, unique, or first",
+                "get cannot be combined with index, eq, range bounds, order, take, unique, first, or count",
             ));
         }
         return point_read(pool, db, &q.table, id).await;
@@ -110,6 +118,25 @@ pub async fn execute_query(
     }
     if q.first && q.take.is_some() {
         return Err(RtDbError::bad_request("first cannot be combined with take"));
+    }
+
+    if q.count && q.unique {
+        return Err(RtDbError::bad_request(
+            "count cannot be combined with unique",
+        ));
+    }
+    if q.count && q.take.is_some() {
+        return Err(RtDbError::bad_request("count cannot be combined with take"));
+    }
+    if q.count && q.first {
+        return Err(RtDbError::bad_request(
+            "count cannot be combined with first",
+        ));
+    }
+    if q.count && q.order.is_some() {
+        return Err(RtDbError::bad_request(
+            "count cannot be combined with order",
+        ));
     }
 
     if q.gt.is_some() && q.gte.is_some() {
@@ -190,6 +217,33 @@ pub async fn execute_query(
         None => Vec::new(),
     };
     where_conditions.extend(range_where);
+
+    if q.count {
+        let pg_schema_name = pg_schema(db);
+        let table_ident = pg_table(&q.table);
+        let mut sql = format!("SELECT COUNT(*) FROM \"{pg_schema_name}\".\"{table_ident}\"");
+        if !where_conditions.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&where_conditions.join(" AND "));
+        }
+        let mut query = sqlx::query_scalar::<_, i64>(&sql);
+        for bind in binds {
+            query = match bind {
+                EqBind::Text(v) => query.bind(v),
+                EqBind::Num(v) => query.bind(v),
+                EqBind::Bool(v) => query.bind(v),
+            };
+        }
+        for bind in range_binds {
+            query = match bind {
+                EqBind::Text(v) => query.bind(v),
+                EqBind::Num(v) => query.bind(v),
+                EqBind::Bool(v) => query.bind(v),
+            };
+        }
+        let count = query.fetch_one(pool).await?;
+        return Ok(QueryResult::Count(count));
+    }
 
     let mut sort_cols: Vec<String> = match index_def {
         Some(idx) => idx.fields[eq_len..]

@@ -16,6 +16,7 @@ export interface QueryJson {
   take?: number;
   unique?: boolean;
   first?: boolean;
+  count?: boolean;
 }
 
 /** Mirrors server `txn::Step` (tag `op`, every step carries `table`). */

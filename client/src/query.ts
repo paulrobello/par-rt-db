@@ -47,6 +47,10 @@ export class TableQuery<DocT, Indexes extends string> {
     return { json: { ...this.json, first: true } };
   }
 
+  count(): RtQuery<number> {
+    return { json: { ...this.json, count: true } };
+  }
+
   collect(): RtQuery<DocT[]> {
     return { json: { ...this.json } };
   }
