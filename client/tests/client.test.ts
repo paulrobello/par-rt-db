@@ -145,6 +145,22 @@ describe("RtDbClient", () => {
     });
   });
 
+  it("uses an explicit opts.mutId as the wire mutId instead of an internal counter id", () => {
+    const { client, sockets } = newClient();
+    client.connect();
+    sockets[0].open();
+    sockets[0].deliver({ type: "authOk", user: { kind: "machine" } });
+
+    client.mutate(
+      { steps: [{ op: "insert", table: "items", doc: {} }] },
+      { mutId: "caller-key-1" },
+    );
+    const frame = frames(sockets[0]).find((m) => m.type === "mutate") as unknown as {
+      mutId: string;
+    };
+    expect(frame.mutId).toBe("caller-key-1");
+  });
+
   it("resubscribes all active queries after a reconnect", () => {
     const { client, sockets, runTimers } = newClient();
     client.connect();

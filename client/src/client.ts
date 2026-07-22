@@ -209,8 +209,8 @@ export class RtDbClient {
     };
   }
 
-  mutate(txn: TransactionJson): Promise<unknown[]> {
-    const mutId = `mut-${++this.counter}`;
+  mutate(txn: TransactionJson, opts?: { mutId?: string }): Promise<unknown[]> {
+    const mutId = opts?.mutId ?? `mut-${++this.counter}`;
     return new Promise<unknown[]>((resolve, reject) => {
       if (this.stopped) {
         reject(new RtDbError("INTERNAL", "client is closed"));
