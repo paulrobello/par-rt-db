@@ -10,13 +10,14 @@ The authoritative design lives in `docs/superpowers/specs/2026-07-21-par-rt-db-d
 
 ## Commands
 
-The Rust crate lives in `server/`, not the repo root. The Makefile `cd`s there for you; if you run `cargo` directly, do it from `server/`.
+This is a two-package workspace: the Rust server in `server/` and the TypeScript client SDK (`@par-rt-db/client`) in `client/`. The **root `Makefile` runs both** — every target (`build`, `fmt`, `fmt-check`, `lint`, `typecheck`, `test`, `checkall`) `cd`s into `server/` (cargo) *and* `client/` (bun). Run `cargo` from `server/` and `bun` from `client/` when invoking a tool directly.
 
 - `make checkall` — the full gate (fmt-check + clippy `-D warnings` + typecheck + tests). Must pass before any commit; this is the project's definition of done.
 - `make dev-db-up` — start the dev/test Postgres (loopback `127.0.0.1:55434`). **Required before any test run** — the integration tests hit a real database. `make dev-db-down` to stop it.
 - `make test` — runs `dev-db-up` then the whole suite.
 - Single test: `cd server && cargo test --test txn_test upsert_multiple_matches` (a test in a specific integration binary), or `cargo test upsert` to match by name across binaries. Integration binaries mirror the modules: `txn_test`, `query_test`, `subs_test`, `ws_test`, `http_api_test`, `oauth_test`, `admin_test`, `healthz_test`.
-- `make lint` / `make fmt` — clippy / rustfmt.
+- `make lint` / `make fmt` — clippy + biome / rustfmt + biome (both packages).
+- Client-only: `make client-install` (bun install). Single client test: `cd client && bunx vitest run tests/<file>.test.ts`. The client's `tests/integration/**` are **opt-in** and skip unless `RTDB_TEST_SERVER_URL` + `RTDB_TEST_ADMIN_KEY` point at a running server.
 
 Tests connect via `RTDB_TEST_DATABASE_URL` (defaults to the dev-db URL). They **share one Postgres instance and isolate by creating uniquely-named databases per test** (`t<uuid>`) — never assume exclusive access, and never drop a database or schema you didn't create.
 
@@ -37,6 +38,9 @@ Every database has one **committer task** that serializes all of its writes. A m
 
 ### Auth (`auth/`)
 Two schemes resolved by `resolve_bearer`: hashed per-database **machine tokens** (`auth/tokens.rs`) and **GitHub OAuth sessions** (`auth/github.rs`, `auth/session.rs`). `authorize` enforces a per-database email allowlist for users and db-match + live revocation for machines. The WS handler **re-runs `authorize` on every Subscribe and Mutate**, not just at connect, so revocation/allowlist changes take effect on open connections (session *expiry* mid-connection is a known deferred gap). Tokens are stored only as SHA-256 digests; the admin key is compared constant-time.
+
+### The TypeScript client SDK (`client/`)
+`@par-rt-db/client` — the browser/node SDK that speaks the wire protocol; no per-app server code exists, so this is how apps consume the DB. **No codegen:** a schema is a TypeScript object built with `defineSchema`/`t.*` (`schema.ts`) that is *both* pushed to the server *and* the source of inferred `Doc`/`Id` types. `query.ts`/`mutation.ts` build the typed query + transaction DSL; `client.ts` is the reconnecting WebSocket client (at-most-once mutations — **never auto-retried** — plus subscription dedup and a generation counter that aborts stale async/timer callbacks); `http.ts`/`admin.ts` are the one-shot HTTP + `/admin/*` control-plane clients; `react.tsx` (the `./react` export) exposes `RtDbProvider`/`useQuery`/`useMutation` + `Authenticated`/`Unauthenticated`/`AuthLoading` gates + `signInWithGitHub`. **`client/src/protocol.ts` must stay byte-identical to the server's `protocol.rs`** (same serde `camelCase` tags and field names) — they are the wire coupling, and a change on either side is a breaking change unless mirrored. The step-result shapes are part of that contract: `insert` → `{id}`, `upsert` → `{id, inserted}`, `patch`/`delete`/`expectVersion`/`expectAbsent` → `null`.
 
 ## Invariants you must preserve
 
