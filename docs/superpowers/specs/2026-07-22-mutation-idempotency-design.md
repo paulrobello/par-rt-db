@@ -177,3 +177,29 @@ typecheck + tests for both `server/` and `client/`) must be fully green.
 - Scheduled/background TTL sweep task (piggybacked on `check` instead).
 - Any change to `react.tsx`'s `useMutation` hook.
 - Idempotency for the admin snapshot import/export routes.
+
+## Post-review correction: `mutId` is not a safe dedup key
+
+The whole-branch review (after Tasks 1-4 implemented the design above) found
+a Critical flaw: WS's `mutId` was already mandatory on every mutation before
+this feature existed — a plain reply-correlation id — and this design reused
+it, unconditionally, as the persisted dedup key. The client's fallback id
+when a caller doesn't opt in is a resettable per-instance counter
+(`mut-1`, `mut-2`, ...), so two client instances on the same database (two
+browser tabs, a page reload creating a fresh client) can send the same id for
+their first mutation within the 5-minute TTL. The server then treats the
+second as a replay of the first: **its write never executes**, and it
+receives the first client's results instead of its own. Because WS always
+sends *some* `mutId`, this applied to every default mutation, not just
+opted-in ones — the opposite of "opt-in, not automatic."
+
+The fix (Task 5): a genuinely separate, optional `idempotencyKey` wire field
+on both transports. `mutId` remains pure reply-correlation, always sent,
+never touching `mutation_log`. Only a caller who explicitly passes
+`{mutId: "..."}` to the client's `mutate()` populates `idempotencyKey`, and
+only then does the server touch the dedup table at all — closing the
+collision risk and, as a side effect, removing the extra database round trip
+the review also flagged on every non-opted-in mutation. The public client API
+(`mutate(txn, opts?: {mutId?: string})`) is unchanged; only the wire
+representation underneath it split in two. See Task 5 in the implementation
+plan for the exact field/parameter renames.

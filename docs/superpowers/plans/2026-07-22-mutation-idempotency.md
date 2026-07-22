@@ -752,3 +752,578 @@ git commit -m "docs(plans): add implementation plan for mutation idempotency"
 
 Run: `make checkall` from the repo root (or, if another worktree already owns the fixed dev-db port, the per-package equivalent: `cd server && cargo fmt --check && cargo clippy --all-targets -- -D warnings && RTDB_TEST_DATABASE_URL="postgres://rtdb:rtdb@127.0.0.1:55434/rtdb" cargo test`, then `cd client && bun run fmt-check && bun run lint && bun run typecheck && bun run test`).
 Expected: fully green — this is the final gate before the kanban item is marked done.
+
+---
+
+### Task 5: Fix — separate `idempotencyKey` from the WS reply-correlation `mutId` (post-review correction)
+
+**Why this task exists:** The final whole-branch review (after Tasks 1-4 were each already implemented and task-reviewed as Approved) found a Critical bug: WS's `mutId` field was already mandatory on every mutation before this feature existed, used purely to correlate a reply with its request. Tasks 2-3 reused that same field as the server-side idempotency/dedup key. The client's fallback id when a caller doesn't opt in is a resettable per-instance counter (`mut-1`, `mut-2`, ...), so two client instances on the same database (two browser tabs, two users, a page reload creating a fresh client) can send the same id for their first mutation within the 5-minute dedup TTL — the second is silently treated as a replay of the first: **its write never executes**, and it receives the first client's results instead of its own. This is user-approved as the fix to take: split the wire vocabulary so the pre-existing `mutId` stays pure reply-correlation (always sent, never persisted) and a new, genuinely optional `idempotencyKey` field is the only thing that reaches the dedup table — so a default `mutate()` call with no `opts` never touches `mutation_log` at all, closing both the collision risk and the per-mutation overhead the review also flagged.
+
+This task also folds in two other findings the final review said to fix now: (3) `mutation_log::store` failing after a successful commit must not turn an already-committed mutation into a client-visible error (log-and-continue instead of propagating), and (6) an empty-string idempotency key should be treated as absent, not as a real (shared, collision-prone) key.
+
+**Files:**
+- Modify: `server/src/protocol.rs` (`ClientMessage::Mutate` gains `idempotency_key`, plus its 3 unit tests)
+- Modify: `server/src/committer.rs` (`CommitterRequest::Mutate`, `Committers::mutate`, `run_committer`, `handle_mutate` — rename `mut_id` to `idempotency_key`, add empty-string normalization, and log-and-continue on a `store` failure instead of propagating)
+- Modify: `server/src/ws.rs:312-330` (`ClientMessage::Mutate` arm — `mut_id` and `idempotency_key` are now independent bindings)
+- Modify: `server/src/http_api.rs:69-95` (`MutateRequest.mut_id` → `MutateRequest.idempotency_key`, wire field `mutId` → `idempotencyKey`)
+- Modify: `server/tests/ws_test.rs` (append one new test)
+- Modify: `server/tests/http_api_test.rs` (append one new test)
+- Modify: `server/tests/subs_test.rs` (append one new test — the 11 existing `None` call sites need no change, since the parameter stays `Option<String>` positionally)
+- Modify: `client/src/protocol.ts` (`ClientMessage`'s `mutate` variant gains `idempotencyKey?: string`)
+- Modify: `client/src/client.ts` (`QueuedMutate`, `mutate()`, `dispatchMutate()`)
+- Modify: `client/src/http.ts` (`mutate()`)
+- Modify: `client/tests/client.test.ts` (rewrite the one Task-3 test that is now wrong; it asserted `mutId` carried the caller's id — it must now assert `idempotencyKey` does, while `mutId` stays the internal counter shape)
+- Modify: `client/tests/http.test.ts` (rewrite the two Task-3 tests the same way, for the `idempotencyKey` request-body field)
+
+**Interfaces:**
+- Consumes: nothing new from earlier tasks — this corrects the wire-level plumbing Tasks 2-3 already built. `mutation_log::{check, store}` (from Task 1) are called exactly as before; only what gets passed to them as the key changes name/meaning at the call site (now explicitly opt-in only).
+- Produces: `Committers::mutate(&self, db: &str, idempotency_key: Option<String>, txn: Transaction) -> Result<TxnOutcome, RtDbError>` (renamed parameter, same type/position — no test call site needs updating beyond the new tests this task adds). The public client API (`mutate(txn, opts?: { mutId?: string })`) is **unchanged** — only the wire representation underneath it changes, so no consumer of the Task 3 API needs to change their calling code.
+
+- [ ] **Step 1: `server/src/protocol.rs` — split the wire fields**
+
+Replace the `Mutate` variant:
+
+```rust
+pub enum ClientMessage {
+    Auth { token: String, db: String },
+    Subscribe { query_id: String, query: Box<Query> },
+    Unsubscribe { query_id: String },
+    Mutate {
+        mut_id: String,
+        #[serde(default)]
+        idempotency_key: Option<String>,
+        txn: Transaction,
+    },
+    Ping,
+}
+```
+
+Update the test module's `client_message_wire_tags_and_fields` — replace the existing `ClientMessage::Mutate` assertion block with two assertions covering both the omitted and present cases:
+
+```rust
+        assert_eq!(
+            serde_json::to_value(ClientMessage::Mutate {
+                mut_id: "m1".to_string(),
+                idempotency_key: None,
+                txn: sample_txn()
+            })
+            .unwrap(),
+            serde_json::json!({"type": "mutate", "mutId": "m1", "txn": {"steps": []}})
+        );
+        assert_eq!(
+            serde_json::to_value(ClientMessage::Mutate {
+                mut_id: "m1".to_string(),
+                idempotency_key: Some("key1".to_string()),
+                txn: sample_txn()
+            })
+            .unwrap(),
+            serde_json::json!({
+                "type": "mutate",
+                "mutId": "m1",
+                "idempotencyKey": "key1",
+                "txn": {"steps": []}
+            })
+        );
+```
+
+- [ ] **Step 2: `server/src/committer.rs` — rename to `idempotency_key`, normalize empty string, log-and-continue on store failure**
+
+Replace the `CommitterRequest::Mutate` variant:
+
+```rust
+pub enum CommitterRequest {
+    Mutate {
+        idempotency_key: Option<String>,
+        txn: Transaction,
+        reply: oneshot::Sender<Result<TxnOutcome, RtDbError>>,
+    },
+    Subscribe {
+        conn: ConnId,
+        query_id: String,
+        query: Box<Query>,
+        tx: UnboundedSender<ServerMessage>,
+        reply: oneshot::Sender<Result<(), RtDbError>>,
+    },
+}
+```
+
+Replace `Committers::mutate`:
+
+```rust
+    /// Executes `txn` on `db` and waits for the fan-out-then-reply cycle to
+    /// complete. `idempotency_key`, when present, is the caller-opted-in
+    /// dedup key: a repeat call with the same `db` + key replays the first
+    /// call's cached results instead of re-executing. This is distinct from
+    /// any transport-level reply-correlation id (e.g. WS's `mutId`, which is
+    /// always sent and never reaches this layer) — dedup only ever applies
+    /// when a caller explicitly supplies this key.
+    pub async fn mutate(
+        &self,
+        db: &str,
+        idempotency_key: Option<String>,
+        txn: Transaction,
+    ) -> Result<TxnOutcome, RtDbError> {
+        let (reply, reply_rx) = oneshot::channel();
+        self.submit(
+            db,
+            CommitterRequest::Mutate {
+                idempotency_key,
+                txn,
+                reply,
+            },
+        )
+        .await?;
+        reply_rx
+            .await
+            .map_err(|_| RtDbError::internal("committer task dropped the reply"))?
+    }
+```
+
+Replace `run_committer`'s `Mutate` match arm (only this arm changes; `Subscribe`'s arm and the function's other lines are unchanged):
+
+```rust
+            CommitterRequest::Mutate {
+                idempotency_key,
+                txn,
+                reply,
+            } => {
+                let outcome = handle_mutate(&ctx, idempotency_key, txn).await;
+                let _ = reply.send(outcome);
+            }
+```
+
+Replace `handle_mutate` entirely:
+
+```rust
+async fn handle_mutate(
+    ctx: &CommitterCtx,
+    idempotency_key: Option<String>,
+    txn: Transaction,
+) -> Result<TxnOutcome, RtDbError> {
+    // An empty string is not a meaningful key (it would be one shared dedup
+    // slot for the whole db) — treat it the same as no key at all.
+    let idempotency_key = idempotency_key.filter(|key| !key.is_empty());
+
+    if let Some(key) = &idempotency_key
+        && let Some(results) = mutation_log::check(&ctx.pool, &ctx.db, key).await?
+    {
+        return Ok(TxnOutcome {
+            results,
+            write_set: BTreeSet::new(),
+        });
+    }
+
+    let schema = ctx.schemas.get(&ctx.pool, &ctx.db).await?;
+    let outcome = execute_txn(&ctx.pool, &ctx.db, &schema, &txn).await?;
+    ctx.subs
+        .fan_out(&ctx.pool, &ctx.db, &schema, &outcome.write_set)
+        .await;
+
+    if let Some(key) = &idempotency_key {
+        // The mutation already committed and fanned out by this point — a
+        // caching failure here must never turn a successful write into a
+        // client-visible error. Best-effort: log and move on. (A retry with
+        // this key will simply re-execute, same as if it had never cached.)
+        if let Err(err) = mutation_log::store(
+            &ctx.pool,
+            &ctx.db,
+            key,
+            &outcome.results,
+            mutation_log::DEDUP_TTL_MS,
+        )
+        .await
+        {
+            tracing::error!(
+                db = %ctx.db,
+                error = %err,
+                "failed to cache mutation result for idempotency key; a retry with this key will re-execute"
+            );
+        }
+    }
+
+    Ok(outcome)
+}
+```
+
+- [ ] **Step 3: `server/src/ws.rs` — decouple `mut_id` and `idempotency_key`**
+
+Replace the `Mutate` arm (lines 312-330):
+
+```rust
+        ClientMessage::Mutate {
+            mut_id,
+            idempotency_key,
+            txn,
+        } => {
+            match authorize(&state.pool, principal, db).await {
+                Ok(()) => match state.committers.mutate(db, idempotency_key, txn).await {
+                    Ok(outcome) => {
+                        let _ = out_tx.send(ServerMessage::MutateOk {
+                            mut_id,
+                            results: outcome.results,
+                        });
+                    }
+                    Err(error) => {
+                        let _ = out_tx.send(ServerMessage::MutateErr { mut_id, error });
+                    }
+                },
+                Err(error) => {
+                    let _ = out_tx.send(ServerMessage::MutateErr { mut_id, error });
+                }
+            }
+            false
+        }
+```
+
+- [ ] **Step 4: `server/src/http_api.rs` — rename the HTTP field**
+
+Replace `MutateRequest`:
+
+```rust
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MutateRequest {
+    db: String,
+    txn: Transaction,
+    #[serde(default)]
+    idempotency_key: Option<String>,
+}
+```
+
+Replace the call inside `mutate_handler`:
+
+```rust
+    let outcome = state
+        .committers
+        .mutate(&body.db, body.idempotency_key, body.txn)
+        .await?;
+```
+
+- [ ] **Step 5: Append a WS-level dedup test to `server/tests/ws_test.rs`**
+
+Add after `mutate_on_same_connection_returns_mutate_ok_and_query_update`:
+
+```rust
+// (new) two mutates with the same idempotencyKey dedupe: the second replays
+// the first's cached results and produces no queryUpdate (fan-out is
+// skipped on a cache hit). mutId stays distinct per call (m1, m2) — proving
+// it is independent of the dedup key, not the same value.
+#[tokio::test]
+async fn mutate_with_same_idempotency_key_dedupes_and_skips_fan_out() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let db = fresh_db(&state).await;
+    let token = mint_token(addr, &db).await;
+
+    let mut ws = ws_connect(addr).await;
+    auth(&mut ws, &token, &db).await;
+    send_json(
+        &mut ws,
+        json!({"type": "subscribe", "queryId": "q1", "query": {"table": "workItems"}}),
+    )
+    .await;
+    recv_json(&mut ws).await; // initial queryUpdate
+
+    send_json(
+        &mut ws,
+        json!({"type": "mutate", "mutId": "m1", "idempotencyKey": "retry-key", "txn": insert_work_item_txn()}),
+    )
+    .await;
+
+    let mut first_results = None;
+    for _ in 0..2 {
+        let msg = recv_json(&mut ws).await;
+        match msg["type"].as_str() {
+            Some("mutateOk") => {
+                assert_eq!(msg["mutId"], json!("m1"));
+                first_results = Some(msg["results"].clone());
+            }
+            Some("queryUpdate") => {
+                assert_eq!(msg["queryId"], json!("q1"));
+            }
+            other => panic!("unexpected message type {other:?}"),
+        }
+    }
+    let first_results = first_results.expect("first mutateOk");
+
+    send_json(
+        &mut ws,
+        json!({"type": "mutate", "mutId": "m2", "idempotencyKey": "retry-key", "txn": insert_work_item_txn()}),
+    )
+    .await;
+    let second = recv_json(&mut ws).await;
+    assert_eq!(second["type"], json!("mutateOk"));
+    assert_eq!(second["mutId"], json!("m2"));
+    assert_eq!(second["results"], first_results);
+
+    let drained = tokio::time::timeout(Duration::from_millis(300), ws.next()).await;
+    assert!(
+        drained.is_err(),
+        "expected no further message after deduped mutate, got {drained:?}"
+    );
+    Ok(())
+}
+```
+
+- [ ] **Step 6: Append an HTTP-level dedup test to `server/tests/http_api_test.rs`**
+
+Add after `mint_token_mutate_then_query_round_trips`:
+
+```rust
+// (new) two /api/mutate calls with the same idempotencyKey dedupe.
+#[tokio::test]
+async fn http_mutate_with_same_idempotency_key_dedupes() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let name = fresh_db(&state).await;
+    let (_, token) = mint_token(addr, &name).await;
+
+    let resp = api_post(
+        addr,
+        "/api/mutate",
+        &token,
+        json!({"db": name, "txn": insert_work_item_txn(), "idempotencyKey": "retry-key"}),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let first_body: serde_json::Value = resp.json().await?;
+
+    let resp = api_post(
+        addr,
+        "/api/mutate",
+        &token,
+        json!({"db": name, "txn": insert_work_item_txn(), "idempotencyKey": "retry-key"}),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let second_body: serde_json::Value = resp.json().await?;
+
+    assert_eq!(first_body, second_body);
+
+    let resp = api_post(
+        addr,
+        "/api/query",
+        &token,
+        json!({"db": name, "query": {"table": "workItems"}}),
+    )
+    .await;
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(body["result"].as_array().expect("results array").len(), 1);
+
+    Ok(())
+}
+```
+
+- [ ] **Step 7: Append a committer-level fan-out test to `server/tests/subs_test.rs`**
+
+Add after `mutate_on_unrelated_table_sends_no_update` (follow that test's exact harness style — `next_conn_id()`, `collect_work_items()`, `insert_work_item(status, order)`, `tokio::sync::mpsc::unbounded_channel`, `TryRecvError`, all already imported/defined in this file):
+
+```rust
+// (new) a repeated idempotency key dedupes and sends no second update.
+#[tokio::test]
+async fn mutate_with_same_idempotency_key_sends_no_second_update() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let db = fresh_db(&state).await;
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let conn = next_conn_id();
+    state
+        .committers
+        .subscribe(&db, conn, "q1".to_string(), collect_work_items(), tx)
+        .await?;
+    rx.try_recv().expect("initial query update");
+
+    let first = state
+        .committers
+        .mutate(
+            &db,
+            Some("retry-key".to_string()),
+            insert_work_item("backlog", 1.0),
+        )
+        .await?;
+    rx.try_recv().expect("update after first mutate");
+
+    let second = state
+        .committers
+        .mutate(
+            &db,
+            Some("retry-key".to_string()),
+            insert_work_item("backlog", 1.0),
+        )
+        .await?;
+    assert_eq!(first.results, second.results);
+    assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+
+    Ok(())
+}
+```
+
+- [ ] **Step 8: `client/src/protocol.ts` — add the new field**
+
+Replace the `mutate` arm of `ClientMessage`:
+
+```ts
+  | { type: "mutate"; mutId: string; idempotencyKey?: string; txn: TransactionJson }
+```
+
+- [ ] **Step 9: `client/src/client.ts` — carry the caller's id as `idempotencyKey`, keep `mutId` as the internal correlation id**
+
+Replace `QueuedMutate`:
+
+```ts
+interface QueuedMutate extends PendingMutate {
+  mutId: string;
+  idempotencyKey?: string;
+  txn: TransactionJson;
+}
+```
+
+Replace `mutate()`:
+
+```ts
+  mutate(txn: TransactionJson, opts?: { mutId?: string }): Promise<unknown[]> {
+    const mutId = `mut-${++this.counter}`;
+    return new Promise<unknown[]>((resolve, reject) => {
+      if (this.stopped) {
+        reject(new RtDbError("INTERNAL", "client is closed"));
+        return;
+      }
+      const entry: QueuedMutate = { mutId, idempotencyKey: opts?.mutId, txn, resolve, reject };
+      if (this.authState === "authenticated" && this.socket) {
+        this.dispatchMutate(entry);
+      } else {
+        // Never sent yet: flush once on the next authOk. Not a retry.
+        this.unsentMutates.push(entry);
+      }
+    });
+  }
+```
+
+Replace `dispatchMutate()`:
+
+```ts
+  private dispatchMutate(entry: QueuedMutate): void {
+    this.pendingMutates.set(entry.mutId, { resolve: entry.resolve, reject: entry.reject });
+    this.send({
+      type: "mutate",
+      mutId: entry.mutId,
+      idempotencyKey: entry.idempotencyKey,
+      txn: entry.txn,
+    });
+  }
+```
+
+- [ ] **Step 10: `client/src/http.ts` — send the caller's id as `idempotencyKey`**
+
+Replace `mutate()`:
+
+```ts
+  async mutate(txn: TransactionJson, opts?: { mutId?: string }): Promise<unknown[]> {
+    const body = await this.post("/api/mutate", {
+      db: this.db,
+      txn,
+      idempotencyKey: opts?.mutId,
+    });
+    return (body as { results: unknown[] }).results;
+  }
+```
+
+- [ ] **Step 11: Fix the two now-wrong tests from Task 3**
+
+In `client/tests/client.test.ts`, replace the test named `"uses an explicit opts.mutId as the wire mutId instead of an internal counter id"` entirely with:
+
+```ts
+  it("sends opts.mutId as idempotencyKey, keeping mutId as the internal correlation id", () => {
+    const { client, sockets } = newClient();
+    client.connect();
+    sockets[0].open();
+    sockets[0].deliver({ type: "authOk", user: { kind: "machine" } });
+
+    client.mutate(
+      { steps: [{ op: "insert", table: "items", doc: {} }] },
+      { mutId: "caller-key-1" },
+    );
+    const frame = frames(sockets[0]).find((m) => m.type === "mutate") as unknown as {
+      mutId: string;
+      idempotencyKey?: string;
+    };
+    expect(frame.idempotencyKey).toBe("caller-key-1");
+    expect(frame.mutId).toMatch(/^mut-\d+$/);
+  });
+
+  it("omits idempotencyKey from the wire frame when opts.mutId is not provided", () => {
+    const { client, sockets } = newClient();
+    client.connect();
+    sockets[0].open();
+    sockets[0].deliver({ type: "authOk", user: { kind: "machine" } });
+
+    client.mutate({ steps: [{ op: "insert", table: "items", doc: {} }] });
+    const frame = frames(sockets[0]).find((m) => m.type === "mutate") as unknown as {
+      idempotencyKey?: string;
+    };
+    expect(frame).not.toHaveProperty("idempotencyKey");
+  });
+```
+
+In `client/tests/http.test.ts`, replace both Task-3 tests (`"forwards opts.mutId in the request body when provided"` and `"omits mutId from the request body when not provided"`) with:
+
+```ts
+  it("forwards opts.mutId as idempotencyKey in the request body when provided", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ results: ["new-id"] }));
+    const client = new RtDbHttpClient({
+      url: "http://h:8300",
+      db: "kanban",
+      token: "tok",
+      fetch: fetchMock,
+    });
+
+    await client.mutate(mutation().insert("items", { title: "x" }).build(), {
+      mutId: "caller-key-1",
+    });
+
+    const [, init] = fetchMock.mock.calls[0];
+    expect(JSON.parse(init.body).idempotencyKey).toBe("caller-key-1");
+  });
+
+  it("omits idempotencyKey from the request body when not provided", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ results: ["new-id"] }));
+    const client = new RtDbHttpClient({
+      url: "http://h:8300",
+      db: "kanban",
+      token: "tok",
+      fetch: fetchMock,
+    });
+
+    await client.mutate(mutation().insert("items", { title: "x" }).build());
+
+    const [, init] = fetchMock.mock.calls[0];
+    expect(JSON.parse(init.body)).not.toHaveProperty("idempotencyKey");
+  });
+```
+
+- [ ] **Step 12: Run the full test suites**
+
+Run: `cd server && RTDB_TEST_DATABASE_URL="postgres://rtdb:rtdb@127.0.0.1:55434/rtdb" cargo test`
+Expected: all passing, including the 3 new tests (`mutate_with_same_idempotency_key_dedupes_and_skips_fan_out`, `http_mutate_with_same_idempotency_key_dedupes`, `mutate_with_same_idempotency_key_sends_no_second_update`) and `cargo test --lib` covering `protocol.rs`'s updated unit tests.
+
+Run: `cd server && cargo fmt --check && cargo clippy --all-targets -- -D warnings`
+Expected: clean.
+
+Run: `cd client && bun run test && bun run typecheck && bun run lint && bun run fmt-check`
+Expected: all passing/clean, including the 4 rewritten tests.
+
+- [ ] **Step 13: Commit**
+
+```bash
+git add server/src/protocol.rs server/src/committer.rs server/src/ws.rs server/src/http_api.rs server/tests/ws_test.rs server/tests/http_api_test.rs server/tests/subs_test.rs client/src/protocol.ts client/src/client.ts client/src/http.ts client/tests/client.test.ts client/tests/http.test.ts
+git commit -m "fix: separate idempotencyKey from the WS reply-correlation mutId
+
+Final review found that reusing the always-present WS mutId as the
+dedup key made every default mutation collision-prone across client
+instances (a resettable per-instance counter), silently dropping
+writes. idempotencyKey is now a genuinely separate, opt-in wire field
+on both transports; mutId stays pure reply-correlation. Also: a
+mutation_log::store failure after a successful commit now logs and
+continues instead of surfacing as MutateErr for an already-committed
+write, and an empty-string key is treated as absent."
+```
