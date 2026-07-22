@@ -245,6 +245,7 @@ async fn insert_strips_explicit_null_optional_field() -> anyhow::Result<()> {
             order: None,
             take: None,
             unique: false,
+            first: false,
         },
     )
     .await?;

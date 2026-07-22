@@ -41,6 +41,8 @@ pub struct Query {
     pub take: Option<u32>, // cap 4096; absent => collect (cap 4096)
     #[serde(default)]
     pub unique: bool, // with unique, take/order must be absent
+    #[serde(default)]
+    pub first: bool, // sugar over take(1); returns Doc(Some) or Doc(None); mutually exclusive with take/unique
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -60,7 +62,11 @@ pub enum QueryResult {
 /// `lt`/`lte` may be set, both may be set together for a bounded range, and the bound value is
 /// typed via the same `eq_binds`/`eq_bind_for` conversion `txn.rs` uses for `eq`. A range bound
 /// requires an index and a remaining (unconsumed by `eq`) index field -> BadRequest otherwise.
-/// Unknown table -> NotFound; unknown index / eq too long / get+query mix / unique+take -> BadRequest.
+/// `first` is sugar over `take(1)`: applies the same eq/range/order filters with LIMIT 1 and
+/// returns `Doc(Some)` (or `Doc(None)` if nothing matched) instead of `Docs`; mutually exclusive
+/// with `take` and `unique`.
+/// Unknown table -> NotFound; unknown index / eq too long / get+query mix / unique+take /
+/// first+take / first+unique -> BadRequest.
 /// `take: 0` is valid and returns an empty `Docs([])`, not an error.
 /// `unique` without an `index` scans the whole table (LIMIT 2) and applies the same 0/1/>1 rule.
 pub async fn execute_query(
@@ -82,9 +88,10 @@ pub async fn execute_query(
             || q.order.is_some()
             || q.take.is_some()
             || q.unique
+            || q.first
         {
             return Err(RtDbError::bad_request(
-                "get cannot be combined with index, eq, range bounds, order, take, or unique",
+                "get cannot be combined with index, eq, range bounds, order, take, unique, or first",
             ));
         }
         return point_read(pool, db, &q.table, id).await;
@@ -94,6 +101,15 @@ pub async fn execute_query(
         return Err(RtDbError::bad_request(
             "unique cannot be combined with take or order",
         ));
+    }
+
+    if q.first && q.unique {
+        return Err(RtDbError::bad_request(
+            "first cannot be combined with unique",
+        ));
+    }
+    if q.first && q.take.is_some() {
+        return Err(RtDbError::bad_request("first cannot be combined with take"));
     }
 
     if q.gt.is_some() && q.gte.is_some() {
@@ -197,6 +213,8 @@ pub async fn execute_query(
 
     let limit: u32 = if q.unique {
         2
+    } else if q.first {
+        1
     } else {
         q.take.unwrap_or(MAX_TAKE)
     };
@@ -238,6 +256,15 @@ pub async fn execute_query(
                 "unique query matched multiple documents",
             ));
         }
+        return match rows.pop() {
+            Some((id, doc, created_at, version)) => Ok(QueryResult::Doc(Some(merge_doc(
+                id, doc, created_at, version,
+            )?))),
+            None => Ok(QueryResult::Doc(None)),
+        };
+    }
+
+    if q.first {
         return match rows.pop() {
             Some((id, doc, created_at, version)) => Ok(QueryResult::Doc(Some(merge_doc(
                 id, doc, created_at, version,

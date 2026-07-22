@@ -43,6 +43,10 @@ export class TableQuery<DocT, Indexes extends string> {
     return { json: { ...this.json, unique: true } };
   }
 
+  first(): RtQuery<DocT | null> {
+    return { json: { ...this.json, first: true } };
+  }
+
   collect(): RtQuery<DocT[]> {
     return { json: { ...this.json } };
   }
