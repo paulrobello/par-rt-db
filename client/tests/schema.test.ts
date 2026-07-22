@@ -71,4 +71,30 @@ describe("schema builder", () => {
       refs: { type: "array", element: { type: "id", table: "t1" } },
     });
   });
+
+  it("serializes record/any/bytes/int64 field types", () => {
+    const s = defineSchema({
+      widgets: defineTable({
+        tags: t.record(t.string()),
+        payload: t.any(),
+        blob: t.bytes(),
+        big: t.int64(),
+      }),
+    });
+    expect(s.toJSON().tables.widgets.fields).toEqual({
+      tags: { type: "record", value: { type: "string" } },
+      payload: { type: "any" },
+      blob: { type: "bytes" },
+      big: { type: "int64" },
+    });
+  });
+
+  it("serializes a record of optional numbers", () => {
+    const s = defineSchema({
+      widgets: defineTable({ counts: t.record(t.optional(t.number())) }),
+    });
+    expect(s.toJSON().tables.widgets.fields).toEqual({
+      counts: { type: "record", value: { type: "optional", inner: { type: "number" } } },
+    });
+  });
 });
