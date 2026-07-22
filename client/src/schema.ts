@@ -4,6 +4,26 @@ import type { FieldTypeJson, IndexJson, SchemaJson, TableJson } from "./protocol
 export type Id<TableName extends string> = string & { readonly __idBrand: TableName };
 
 /**
+ * Branded decimal-string int64. The wire value is a JSON string of canonical
+ * decimal digits (whatever `i64::from_str` on the server accepts) — JSON has
+ * no 64-bit integer type, and a JS `number` cannot exactly represent the full
+ * `i64` range past `Number.MAX_SAFE_INTEGER`. Branded rather than a real
+ * `bigint` because this SDK is entirely schema-type-erased at runtime (see
+ * `t.int64` below): a `bigint` would need a `JSON.stringify` replacer on every
+ * write and schema-aware result marshaling on every read, which no other
+ * validator needs today. Use `toInt64`/`fromInt64` to convert at the edges.
+ */
+export type Int64 = string & { readonly __int64Brand: unique symbol };
+
+export function toInt64(value: bigint | number): Int64 {
+  return String(value) as Int64;
+}
+
+export function fromInt64(value: Int64): bigint {
+  return BigInt(value);
+}
+
+/**
  * A field validator: a runtime JSON serialization plus two phantom type params —
  * `T` (the inferred value type) and `Optional` (whether the field may be omitted).
  * `__out`/`__optional` are type-only; they never exist at runtime.
@@ -52,6 +72,11 @@ export const t = {
     fields: S,
   ): Validator<{ [K in keyof S]: Infer<S[K]> }> =>
     makeValidator({ type: "object", fields: fieldsToJson(fields) }),
+  record: <T>(value: Validator<T, boolean>): Validator<Record<string, T>> =>
+    makeValidator({ type: "record", value: value.json }),
+  any: (): Validator<unknown> => makeValidator({ type: "any" }),
+  bytes: (): Validator<string> => makeValidator({ type: "bytes" }),
+  int64: (): Validator<Int64> => makeValidator({ type: "int64" }),
 };
 
 export class TableDefinition<

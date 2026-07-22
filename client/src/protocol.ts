@@ -75,7 +75,11 @@ export type FieldTypeJson =
   | { type: "optional"; inner: FieldTypeJson }
   | { type: "union"; variants: FieldTypeJson[] }
   | { type: "array"; element: FieldTypeJson }
-  | { type: "object"; fields: Record<string, FieldTypeJson> };
+  | { type: "object"; fields: Record<string, FieldTypeJson> }
+  | { type: "int64" }
+  | { type: "bytes" }
+  | { type: "any" }
+  | { type: "record"; value: FieldTypeJson };
 
 export interface IndexJson {
   name: string;
