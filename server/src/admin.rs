@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
+use axum::body::Body;
 use axum::extract::{Query as QueryParams, State};
 use axum::http::HeaderMap;
+use axum::response::Response;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
@@ -10,7 +12,7 @@ use subtle::ConstantTimeEq;
 use crate::error::RtDbError;
 use crate::http_api::ApiJson;
 use crate::schema::SchemaDef;
-use crate::{AppState, auth, db, ddl};
+use crate::{AppState, auth, db, ddl, snapshot};
 
 fn require_admin(headers: &HeaderMap, expected: &str) -> Result<(), RtDbError> {
     let provided = headers
@@ -194,6 +196,52 @@ async fn allowlist_list(
     }))
 }
 
+#[derive(Deserialize)]
+struct ExportDbParams {
+    db: String,
+}
+
+/// Streams `db`'s current schema and every document in every table as JSONL (see
+/// `snapshot::export_database`); a plain app-level companion to host-level
+/// `pg_dump` for seed data and clone-to-dev workflows.
+async fn export_db(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    QueryParams(params): QueryParams<ExportDbParams>,
+) -> Result<Response, RtDbError> {
+    require_admin(&headers, &state.config.admin_key)?;
+    if !db::database_exists(&state.pool, &params.db).await? {
+        return Err(RtDbError::not_found("unknown database"));
+    }
+    let schema = state.schemas.get(&state.pool, &params.db).await?;
+    let body = snapshot::export_database(&state.pool, &params.db, &schema).await?;
+
+    Response::builder()
+        .header(axum::http::header::CONTENT_TYPE, "application/x-ndjson")
+        .body(Body::from(body))
+        .map_err(|err| RtDbError::internal(format!("failed to build export response: {err}")))
+}
+
+#[derive(Deserialize)]
+struct ImportDbParams {
+    db: String,
+}
+
+/// Loads a JSONL snapshot produced by `export_db` back into `db` (see
+/// `snapshot::import_database`), refreshing the schema cache with whatever schema
+/// the snapshot applied.
+async fn import_db(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    QueryParams(params): QueryParams<ImportDbParams>,
+    body: String,
+) -> Result<Json<OkResponse>, RtDbError> {
+    require_admin(&headers, &state.config.admin_key)?;
+    let applied = snapshot::import_database(&state.pool, &params.db, &body).await?;
+    state.schemas.put(&params.db, applied).await;
+    Ok(Json(OkResponse { ok: true }))
+}
+
 /// Admin routes, all gated on `Authorization: Bearer <admin_key>` (constant-time
 /// compare).
 pub fn admin_routes() -> Router<Arc<AppState>> {
@@ -207,4 +255,6 @@ pub fn admin_routes() -> Router<Arc<AppState>> {
             "/admin/allowlist",
             get(allowlist_list).post(allowlist_write),
         )
+        .route("/admin/export-db", get(export_db))
+        .route("/admin/import-db", post(import_db))
 }
