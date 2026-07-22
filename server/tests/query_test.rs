@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use common::{fresh_db, kanban_schema_json, test_state};
 use rtdb_server::error::ErrorCode;
-use rtdb_server::query::{Order, Query, QueryResult, canonical, execute_query};
+use rtdb_server::query::{Order, Paginate, Query, QueryResult, canonical, execute_query};
 use rtdb_server::schema::SchemaDef;
 use rtdb_server::txn::{Step, Transaction, execute_txn};
 use sqlx::PgPool;
@@ -237,6 +237,47 @@ async fn get_combined_with_index_is_bad_request() -> anyhow::Result<()> {
             first: false,
             count: false,
             paginate: None,
+        },
+    )
+    .await
+    .expect_err("expected bad request");
+    assert_eq!(err.code, ErrorCode::BadRequest);
+
+    Ok(())
+}
+
+// (b2b) get combined with paginate -> BadRequest.
+#[tokio::test]
+async fn get_combined_with_paginate_is_bad_request() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+
+    let (_project_id, items) = seed_kanban(&pool, &db, &schema).await?;
+
+    let err = execute_query(
+        &pool,
+        &db,
+        &schema,
+        &Query {
+            table: "workItems".to_string(),
+            get: Some(items[0].clone()),
+            index: None,
+            eq: vec![],
+            gt: None,
+            gte: None,
+            lt: None,
+            lte: None,
+            order: None,
+            take: None,
+            unique: false,
+            first: false,
+            count: false,
+            paginate: Some(Paginate {
+                cursor: None,
+                num_items: 10,
+            }),
         },
     )
     .await

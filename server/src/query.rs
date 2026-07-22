@@ -113,9 +113,10 @@ pub async fn execute_query(
             || q.unique
             || q.first
             || q.count
+            || q.paginate.is_some()
         {
             return Err(RtDbError::bad_request(
-                "get cannot be combined with index, eq, range bounds, order, take, unique, first, or count",
+                "get cannot be combined with index, eq, range bounds, order, take, unique, first, count, or paginate",
             ));
         }
         return point_read(pool, db, &q.table, id).await;
