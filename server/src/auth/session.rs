@@ -65,6 +65,7 @@ pub async fn resolve_session(pool: &PgPool, token: &str) -> Result<Option<Princi
         user_id,
         email,
         name: None,
+        expires_at,
     }))
 }
 

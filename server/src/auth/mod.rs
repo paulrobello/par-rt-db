@@ -4,7 +4,7 @@ pub mod tokens;
 
 use sqlx::PgPool;
 
-use crate::db::sha256_hex;
+use crate::db::{now_ms, sha256_hex};
 use crate::error::RtDbError;
 use crate::protocol::AuthedUser;
 
@@ -20,6 +20,7 @@ pub enum Principal {
         user_id: String,
         email: String,
         name: Option<String>,
+        expires_at: i64,
     },
 }
 
@@ -50,11 +51,14 @@ pub async fn resolve_bearer(pool: &PgPool, token: &str) -> Result<Principal, RtD
 /// Authorization for a database: a machine token must match `db` exactly and
 /// still be un-revoked — checked live against `rtdb_auth.machine_tokens` on
 /// every call, so a token revoked mid-session is denied on its very next
-/// operation rather than only at the next fresh connection; a user must be
-/// present in `rtdb_auth.allowlist` for `db`. Allowlist emails are stored
-/// lowercase (see `admin::allowlist_write`), so the principal's email is
-/// lowercased here before the lookup — the sole choke point for
-/// case-insensitive comparison.
+/// operation rather than only at the next fresh connection; a user must hold
+/// an unexpired session and be present in `rtdb_auth.allowlist` for `db`.
+/// Session expiry is checked against `expires_at`, captured once at session
+/// resolution — a session's expiry is immutable once minted, so this cached
+/// comparison is exactly as live as a fresh DB query, without costing one
+/// per operation. Allowlist emails are stored lowercase (see
+/// `admin::allowlist_write`), so the principal's email is lowercased here
+/// before the lookup — the sole choke point for case-insensitive comparison.
 pub async fn authorize(pool: &PgPool, principal: &Principal, db: &str) -> Result<(), RtDbError> {
     match principal {
         Principal::Machine {
@@ -76,7 +80,13 @@ pub async fn authorize(pool: &PgPool, principal: &Principal, db: &str) -> Result
                 Err(RtDbError::unauthorized("token revoked"))
             }
         }
-        Principal::User { email, .. } => {
+        Principal::User {
+            email, expires_at, ..
+        } => {
+            if *expires_at < now_ms() {
+                return Err(RtDbError::unauthorized("session expired"));
+            }
+
             let row: Option<(String,)> = sqlx::query_as(
                 "SELECT email FROM rtdb_auth.allowlist WHERE db_name = $1 AND email = $2",
             )
@@ -136,6 +146,7 @@ mod tests {
             user_id: "u".to_string(),
             email: "a@b.com".to_string(),
             name: Some("Alice".to_string()),
+            expires_at: i64::MAX,
         };
         let user = authed_user(&principal);
         assert_eq!(user.kind, "user");

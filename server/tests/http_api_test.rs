@@ -4,6 +4,7 @@ use std::net::SocketAddr;
 
 use common::{admin_post, fresh_db, spawn_app, test_state};
 use rtdb_server::auth::{Principal, authorize};
+use rtdb_server::db;
 use rtdb_server::error::ErrorCode;
 use rtdb_server::protocol::ServerMessage;
 use rtdb_server::query::Query;
@@ -309,6 +310,7 @@ async fn authorize_user_branch_matches_allowlist_case_insensitively() -> anyhow:
         user_id: "u1".to_string(),
         email: "Probello@Gmail.com".to_string(),
         name: None,
+        expires_at: i64::MAX,
     };
     authorize(&state.pool, &allowed, &name)
         .await
@@ -318,11 +320,43 @@ async fn authorize_user_branch_matches_allowlist_case_insensitively() -> anyhow:
         user_id: "u2".to_string(),
         email: "someone-else@example.com".to_string(),
         name: None,
+        expires_at: i64::MAX,
     };
     let err = authorize(&state.pool, &not_allowed, &name)
         .await
         .expect_err("non-allowlisted user should be forbidden");
     assert_eq!(err.code, ErrorCode::Forbidden);
+
+    Ok(())
+}
+
+// (j2) authorize's User branch rejects a session whose expiry has passed,
+// even for an allowlisted email — the email is added to the allowlist first
+// so expiry is the only possible reason for rejection.
+#[tokio::test]
+async fn authorize_user_branch_rejects_expired_session() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let name = fresh_db(&state).await;
+
+    let resp = admin_post(
+        addr,
+        "/admin/allowlist",
+        json!({"db": name, "action": "add", "email": "probello@gmail.com"}),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    let expired = Principal::User {
+        user_id: "u1".to_string(),
+        email: "probello@gmail.com".to_string(),
+        name: None,
+        expires_at: db::now_ms() - 1,
+    };
+    let err = authorize(&state.pool, &expired, &name)
+        .await
+        .expect_err("expired session should be unauthorized even when allowlisted");
+    assert_eq!(err.code, ErrorCode::Unauthorized);
 
     Ok(())
 }
