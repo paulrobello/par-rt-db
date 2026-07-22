@@ -96,7 +96,7 @@ mistakes them for backlog.
 - **SQL escape hatch** — anything the DSL can't express yet has a manual answer today.
 - **`_version` on every doc** — explicit optimistic-concurrency primitive
   (`expectVersion`) that Convex doesn't surface.
-- **Explicit at-most-once mutations** — no hidden auto-retry semantics (#4 would add
+- **Explicit at-most-once mutations** — no hidden auto-retry semantics (#4 adds
   opt-in safe retry without giving this up).
 - **One instance, many databases** — a new app is an admin call, not a new deployment.
 
