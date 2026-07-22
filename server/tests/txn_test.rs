@@ -313,6 +313,212 @@ async fn patch_unknown_field_is_schema_violation() -> anyhow::Result<()> {
     Ok(())
 }
 
+// (d2) replace fully overwrites doc, recomputes every typed column, bumps version.
+#[tokio::test]
+async fn replace_overwrites_doc_updates_typed_columns_and_bumps_version() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+
+    let insert_outcome = execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::Insert {
+                table: "projects".to_string(),
+                doc: valid_project_doc(),
+            }],
+        },
+    )
+    .await?;
+    let id = insert_outcome.results[0]["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+
+    let replacement = doc(serde_json::json!({
+        "name": "Beta",
+        "description": "new description",
+        "status": "paused",
+        "tags": ["z"],
+        "updatedAt": 9.0
+    }));
+
+    let outcome = execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::Replace {
+                table: "projects".to_string(),
+                id: id.clone(),
+                doc: replacement,
+            }],
+        },
+    )
+    .await?;
+    assert_eq!(outcome.results, vec![serde_json::Value::Null]);
+    assert_eq!(outcome.write_set, BTreeSet::from(["projects".to_string()]));
+
+    let pg_schema = format!("db_{db}");
+    let row: (String, String, i64, serde_json::Value) = sqlx::query_as(&format!(
+        "SELECT \"f_name\", \"f_status\", \"version\", \"doc\" FROM \"{pg_schema}\".\"t_projects\" WHERE \"id\" = $1"
+    ))
+    .bind(&id)
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(row.0, "Beta");
+    assert_eq!(row.1, "paused");
+    assert_eq!(row.2, 2);
+    assert_eq!(row.3["description"], serde_json::json!("new description"));
+
+    Ok(())
+}
+
+// (d3) replace on a missing id -> NotFound (404).
+#[tokio::test]
+async fn replace_missing_id_returns_not_found() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+
+    let err = execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::Replace {
+                table: "projects".to_string(),
+                id: "0".repeat(32),
+                doc: valid_project_doc(),
+            }],
+        },
+    )
+    .await
+    .expect_err("expected not found");
+    assert_eq!(err.code, ErrorCode::NotFound);
+
+    Ok(())
+}
+
+// (d4) replace with a doc violating the schema -> SchemaViolation (422).
+#[tokio::test]
+async fn replace_schema_violation_is_rejected() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+
+    let insert_outcome = execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::Insert {
+                table: "projects".to_string(),
+                doc: valid_project_doc(),
+            }],
+        },
+    )
+    .await?;
+    let id = insert_outcome.results[0]["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+
+    let bad_doc = doc(serde_json::json!({
+        "name": "Beta",
+        "description": null,
+        "status": "not-a-valid-status",
+        "tags": ["z"],
+        "updatedAt": 9.0
+    }));
+
+    let err = execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::Replace {
+                table: "projects".to_string(),
+                id,
+                doc: bad_doc,
+            }],
+        },
+    )
+    .await
+    .expect_err("expected schema violation");
+    assert_eq!(err.code, ErrorCode::SchemaViolation);
+
+    Ok(())
+}
+
+// (d5) replace inside a multi-step txn rolled back by a later failed step.
+#[tokio::test]
+async fn replace_rolled_back_by_later_failed_step() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+
+    let insert_outcome = execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::Insert {
+                table: "projects".to_string(),
+                doc: valid_project_doc(),
+            }],
+        },
+    )
+    .await?;
+    let id = insert_outcome.results[0]["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+
+    let replacement = doc(serde_json::json!({
+        "name": "Beta",
+        "description": null,
+        "status": "paused",
+        "tags": ["z"],
+        "updatedAt": 9.0
+    }));
+
+    let txn = Transaction {
+        steps: vec![
+            Step::Replace {
+                table: "projects".to_string(),
+                id: id.clone(),
+                doc: replacement,
+            },
+            Step::Delete {
+                table: "projects".to_string(),
+                id: "0".repeat(32),
+            },
+        ],
+    };
+
+    let result = execute_txn(&pool, &db, &schema, &txn).await;
+    assert!(result.is_err());
+
+    let pg_schema = format!("db_{db}");
+    let row: (String, i64) = sqlx::query_as(&format!(
+        "SELECT \"f_name\", \"version\" FROM \"{pg_schema}\".\"t_projects\" WHERE \"id\" = $1"
+    ))
+    .bind(&id)
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(row.0, "Alpha");
+    assert_eq!(row.1, 1);
+
+    Ok(())
+}
+
 // (e) delete.
 #[tokio::test]
 async fn delete_removes_row() -> anyhow::Result<()> {

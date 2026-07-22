@@ -23,6 +23,11 @@ pub enum Step {
         id: String,
         fields: serde_json::Map<String, serde_json::Value>,
     },
+    Replace {
+        table: String,
+        id: String,
+        doc: serde_json::Map<String, serde_json::Value>,
+    },
     Delete {
         table: String,
         id: String,
@@ -375,6 +380,32 @@ async fn do_patch(
     apply_update(conn, pg_schema_name, table_def, table_name, id, merged).await
 }
 
+/// Fetches to confirm the row exists (`NotFound` if missing), then fully
+/// replaces its `doc` with `new_doc` — validated as a complete document (like
+/// `Insert`), not merged like `Patch` — recomputing every indexed column and
+/// bumping `version` via the shared `apply_update`.
+async fn do_replace(
+    conn: &mut PgConnection,
+    pg_schema_name: &str,
+    table_def: &TableDef,
+    table_name: &str,
+    id: &str,
+    new_doc: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), RtDbError> {
+    let table_ident = pg_table(table_name);
+    let row: Option<(String,)> = sqlx::query_as(&format!(
+        "SELECT \"id\" FROM \"{pg_schema_name}\".\"{table_ident}\" WHERE \"id\" = $1"
+    ))
+    .bind(id)
+    .fetch_optional(&mut *conn)
+    .await?;
+    row.ok_or_else(|| RtDbError::not_found(format!("document '{id}' not found")))?;
+
+    validate_doc(table_def, new_doc)?;
+    let doc = strip_unset_optionals(table_def, new_doc.clone());
+    apply_update(conn, pg_schema_name, table_def, table_name, id, doc).await
+}
+
 async fn do_delete(
     conn: &mut PgConnection,
     pg_schema_name: &str,
@@ -501,6 +532,12 @@ pub async fn execute_txn(
             Step::Patch { table, id, fields } => {
                 let table_def = schema.table(table)?;
                 do_patch(&mut tx, &pg_schema_name, table_def, table, id, fields).await?;
+                write_set.insert(table.clone());
+                results.push(serde_json::Value::Null);
+            }
+            Step::Replace { table, id, doc } => {
+                let table_def = schema.table(table)?;
+                do_replace(&mut tx, &pg_schema_name, table_def, table, id, doc).await?;
                 write_set.insert(table.clone());
                 results.push(serde_json::Value::Null);
             }
