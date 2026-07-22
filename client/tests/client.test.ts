@@ -145,7 +145,7 @@ describe("RtDbClient", () => {
     });
   });
 
-  it("uses an explicit opts.mutId as the wire mutId instead of an internal counter id", () => {
+  it("sends opts.mutId as idempotencyKey, keeping mutId as the internal correlation id", () => {
     const { client, sockets } = newClient();
     client.connect();
     sockets[0].open();
@@ -157,8 +157,23 @@ describe("RtDbClient", () => {
     );
     const frame = frames(sockets[0]).find((m) => m.type === "mutate") as unknown as {
       mutId: string;
+      idempotencyKey?: string;
     };
-    expect(frame.mutId).toBe("caller-key-1");
+    expect(frame.idempotencyKey).toBe("caller-key-1");
+    expect(frame.mutId).toMatch(/^mut-\d+$/);
+  });
+
+  it("omits idempotencyKey from the wire frame when opts.mutId is not provided", () => {
+    const { client, sockets } = newClient();
+    client.connect();
+    sockets[0].open();
+    sockets[0].deliver({ type: "authOk", user: { kind: "machine" } });
+
+    client.mutate({ steps: [{ op: "insert", table: "items", doc: {} }] });
+    const frame = frames(sockets[0]).find((m) => m.type === "mutate") as unknown as {
+      idempotencyKey?: string;
+    };
+    expect(frame).not.toHaveProperty("idempotencyKey");
   });
 
   it("resubscribes all active queries after a reconnect", () => {

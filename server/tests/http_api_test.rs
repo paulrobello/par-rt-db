@@ -87,6 +87,49 @@ async fn mint_token_mutate_then_query_round_trips() -> anyhow::Result<()> {
     Ok(())
 }
 
+// (new) two /api/mutate calls with the same idempotencyKey dedupe.
+#[tokio::test]
+async fn http_mutate_with_same_idempotency_key_dedupes() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let name = fresh_db(&state).await;
+    let (_, token) = mint_token(addr, &name).await;
+
+    let resp = api_post(
+        addr,
+        "/api/mutate",
+        &token,
+        json!({"db": name, "txn": insert_work_item_txn(), "idempotencyKey": "retry-key"}),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let first_body: serde_json::Value = resp.json().await?;
+
+    let resp = api_post(
+        addr,
+        "/api/mutate",
+        &token,
+        json!({"db": name, "txn": insert_work_item_txn(), "idempotencyKey": "retry-key"}),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let second_body: serde_json::Value = resp.json().await?;
+
+    assert_eq!(first_body, second_body);
+
+    let resp = api_post(
+        addr,
+        "/api/query",
+        &token,
+        json!({"db": name, "query": {"table": "workItems"}}),
+    )
+    .await;
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(body["result"].as_array().expect("results array").len(), 1);
+
+    Ok(())
+}
+
 // (b) missing bearer -> 401.
 #[tokio::test]
 async fn missing_bearer_is_unauthorized() -> anyhow::Result<()> {

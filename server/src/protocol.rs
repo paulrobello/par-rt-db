@@ -12,10 +12,23 @@ use crate::txn::Transaction;
     deny_unknown_fields
 )]
 pub enum ClientMessage {
-    Auth { token: String, db: String },
-    Subscribe { query_id: String, query: Box<Query> },
-    Unsubscribe { query_id: String },
-    Mutate { mut_id: String, txn: Transaction },
+    Auth {
+        token: String,
+        db: String,
+    },
+    Subscribe {
+        query_id: String,
+        query: Box<Query>,
+    },
+    Unsubscribe {
+        query_id: String,
+    },
+    Mutate {
+        mut_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        idempotency_key: Option<String>,
+        txn: Transaction,
+    },
     Ping,
 }
 
@@ -101,10 +114,25 @@ mod tests {
         assert_eq!(
             serde_json::to_value(ClientMessage::Mutate {
                 mut_id: "m1".to_string(),
+                idempotency_key: None,
                 txn: sample_txn()
             })
-            .unwrap()["type"],
-            serde_json::json!("mutate")
+            .unwrap(),
+            serde_json::json!({"type": "mutate", "mutId": "m1", "txn": {"steps": []}})
+        );
+        assert_eq!(
+            serde_json::to_value(ClientMessage::Mutate {
+                mut_id: "m1".to_string(),
+                idempotency_key: Some("key1".to_string()),
+                txn: sample_txn()
+            })
+            .unwrap(),
+            serde_json::json!({
+                "type": "mutate",
+                "mutId": "m1",
+                "idempotencyKey": "key1",
+                "txn": {"steps": []}
+            })
         );
         assert_eq!(
             serde_json::to_value(ClientMessage::Ping).unwrap(),

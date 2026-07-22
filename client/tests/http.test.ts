@@ -47,7 +47,7 @@ describe("RtDbHttpClient", () => {
     expect(fetchMock.mock.calls[0][0]).toBe("http://h:8300/api/mutate");
   });
 
-  it("forwards opts.mutId in the request body when provided", async () => {
+  it("forwards opts.mutId as idempotencyKey in the request body when provided", async () => {
     const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ results: ["new-id"] }));
     const client = new RtDbHttpClient({
       url: "http://h:8300",
@@ -61,10 +61,10 @@ describe("RtDbHttpClient", () => {
     });
 
     const [, init] = fetchMock.mock.calls[0];
-    expect(JSON.parse(init.body).mutId).toBe("caller-key-1");
+    expect(JSON.parse(init.body).idempotencyKey).toBe("caller-key-1");
   });
 
-  it("omits mutId from the request body when not provided", async () => {
+  it("omits idempotencyKey from the request body when not provided", async () => {
     const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ results: ["new-id"] }));
     const client = new RtDbHttpClient({
       url: "http://h:8300",
@@ -76,7 +76,7 @@ describe("RtDbHttpClient", () => {
     await client.mutate(mutation().insert("items", { title: "x" }).build());
 
     const [, init] = fetchMock.mock.calls[0];
-    expect(JSON.parse(init.body)).not.toHaveProperty("mutId");
+    expect(JSON.parse(init.body)).not.toHaveProperty("idempotencyKey");
   });
 
   it("throws RtDbError from an error envelope on non-2xx", async () => {

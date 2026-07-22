@@ -72,7 +72,7 @@ struct MutateRequest {
     db: String,
     txn: Transaction,
     #[serde(default)]
-    mut_id: Option<String>,
+    idempotency_key: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -91,7 +91,7 @@ async fn mutate_handler(
 
     let outcome = state
         .committers
-        .mutate(&body.db, body.mut_id, body.txn)
+        .mutate(&body.db, body.idempotency_key, body.txn)
         .await?;
     Ok(Json(MutateResponse {
         results: outcome.results,

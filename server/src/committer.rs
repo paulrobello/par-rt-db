@@ -18,7 +18,7 @@ const CHANNEL_BUFFER: usize = 64;
 
 pub enum CommitterRequest {
     Mutate {
-        mut_id: Option<String>,
+        idempotency_key: Option<String>,
         txn: Transaction,
         reply: oneshot::Sender<Result<TxnOutcome, RtDbError>>,
     },
@@ -117,18 +117,28 @@ impl Committers {
     }
 
     /// Executes `txn` on `db` and waits for the fan-out-then-reply cycle to
-    /// complete. `mut_id`, when present, is the idempotency key: a repeat
-    /// call with the same `db` + `mut_id` replays the first call's cached
-    /// results instead of re-executing.
+    /// complete. `idempotency_key`, when present, is the caller-opted-in
+    /// dedup key: a repeat call with the same `db` + key replays the first
+    /// call's cached results instead of re-executing. This is distinct from
+    /// any transport-level reply-correlation id (e.g. WS's `mutId`, which is
+    /// always sent and never reaches this layer) — dedup only ever applies
+    /// when a caller explicitly supplies this key.
     pub async fn mutate(
         &self,
         db: &str,
-        mut_id: Option<String>,
+        idempotency_key: Option<String>,
         txn: Transaction,
     ) -> Result<TxnOutcome, RtDbError> {
         let (reply, reply_rx) = oneshot::channel();
-        self.submit(db, CommitterRequest::Mutate { mut_id, txn, reply })
-            .await?;
+        self.submit(
+            db,
+            CommitterRequest::Mutate {
+                idempotency_key,
+                txn,
+                reply,
+            },
+        )
+        .await?;
         reply_rx
             .await
             .map_err(|_| RtDbError::internal("committer task dropped the reply"))?
@@ -201,8 +211,12 @@ async fn run_committer(
     };
     while let Some(req) = rx.recv().await {
         match req {
-            CommitterRequest::Mutate { mut_id, txn, reply } => {
-                let outcome = handle_mutate(&ctx, mut_id, txn).await;
+            CommitterRequest::Mutate {
+                idempotency_key,
+                txn,
+                reply,
+            } => {
+                let outcome = handle_mutate(&ctx, idempotency_key, txn).await;
                 let _ = reply.send(outcome);
             }
             CommitterRequest::Subscribe {
@@ -221,11 +235,15 @@ async fn run_committer(
 
 async fn handle_mutate(
     ctx: &CommitterCtx,
-    mut_id: Option<String>,
+    idempotency_key: Option<String>,
     txn: Transaction,
 ) -> Result<TxnOutcome, RtDbError> {
-    if let Some(id) = &mut_id
-        && let Some(results) = mutation_log::check(&ctx.pool, &ctx.db, id).await?
+    // An empty string is not a meaningful key (it would be one shared dedup
+    // slot for the whole db) — treat it the same as no key at all.
+    let idempotency_key = idempotency_key.filter(|key| !key.is_empty());
+
+    if let Some(key) = &idempotency_key
+        && let Some(results) = mutation_log::check(&ctx.pool, &ctx.db, key).await?
     {
         return Ok(TxnOutcome {
             results,
@@ -239,15 +257,26 @@ async fn handle_mutate(
         .fan_out(&ctx.pool, &ctx.db, &schema, &outcome.write_set)
         .await;
 
-    if let Some(id) = &mut_id {
-        mutation_log::store(
+    if let Some(key) = &idempotency_key {
+        // The mutation already committed and fanned out by this point — a
+        // caching failure here must never turn a successful write into a
+        // client-visible error. Best-effort: log and move on. (A retry with
+        // this key will simply re-execute, same as if it had never cached.)
+        if let Err(err) = mutation_log::store(
             &ctx.pool,
             &ctx.db,
-            id,
+            key,
             &outcome.results,
             mutation_log::DEDUP_TTL_MS,
         )
-        .await?;
+        .await
+        {
+            tracing::error!(
+                db = %ctx.db,
+                error = %err,
+                "failed to cache mutation result for idempotency key; a retry with this key will re-execute"
+            );
+        }
     }
 
     Ok(outcome)

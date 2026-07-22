@@ -161,6 +161,44 @@ async fn mutate_on_unrelated_table_sends_no_update() -> anyhow::Result<()> {
     Ok(())
 }
 
+// (new) a repeated idempotency key dedupes and sends no second update.
+#[tokio::test]
+async fn mutate_with_same_idempotency_key_sends_no_second_update() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let db = fresh_db(&state).await;
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let conn = next_conn_id();
+    state
+        .committers
+        .subscribe(&db, conn, "q1".to_string(), collect_work_items(), tx)
+        .await?;
+    rx.try_recv().expect("initial query update");
+
+    let first = state
+        .committers
+        .mutate(
+            &db,
+            Some("retry-key".to_string()),
+            insert_work_item("backlog", 1.0),
+        )
+        .await?;
+    rx.try_recv().expect("update after first mutate");
+
+    let second = state
+        .committers
+        .mutate(
+            &db,
+            Some("retry-key".to_string()),
+            insert_work_item("backlog", 1.0),
+        )
+        .await?;
+    assert_eq!(first.results, second.results);
+    assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+
+    Ok(())
+}
+
 // (d) mutate inserting a workItem NOT matching the sub's eq -> no message (result unchanged).
 #[tokio::test]
 async fn mutate_not_matching_eq_filter_sends_no_update() -> anyhow::Result<()> {

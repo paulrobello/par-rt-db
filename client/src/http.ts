@@ -29,7 +29,11 @@ export class RtDbHttpClient {
   }
 
   async mutate(txn: TransactionJson, opts?: { mutId?: string }): Promise<unknown[]> {
-    const body = await this.post("/api/mutate", { db: this.db, txn, mutId: opts?.mutId });
+    const body = await this.post("/api/mutate", {
+      db: this.db,
+      txn,
+      idempotencyKey: opts?.mutId,
+    });
     return (body as { results: unknown[] }).results;
   }
 

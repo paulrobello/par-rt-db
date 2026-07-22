@@ -212,6 +212,66 @@ async fn mutate_on_same_connection_returns_mutate_ok_and_query_update() -> anyho
     Ok(())
 }
 
+// (new) two mutates with the same idempotencyKey dedupe: the second replays
+// the first's cached results and produces no queryUpdate (fan-out is
+// skipped on a cache hit). mutId stays distinct per call (m1, m2) — proving
+// it is independent of the dedup key, not the same value.
+#[tokio::test]
+async fn mutate_with_same_idempotency_key_dedupes_and_skips_fan_out() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let db = fresh_db(&state).await;
+    let token = mint_token(addr, &db).await;
+
+    let mut ws = ws_connect(addr).await;
+    auth(&mut ws, &token, &db).await;
+    send_json(
+        &mut ws,
+        json!({"type": "subscribe", "queryId": "q1", "query": {"table": "workItems"}}),
+    )
+    .await;
+    recv_json(&mut ws).await; // initial queryUpdate
+
+    send_json(
+        &mut ws,
+        json!({"type": "mutate", "mutId": "m1", "idempotencyKey": "retry-key", "txn": insert_work_item_txn()}),
+    )
+    .await;
+
+    let mut first_results = None;
+    for _ in 0..2 {
+        let msg = recv_json(&mut ws).await;
+        match msg["type"].as_str() {
+            Some("mutateOk") => {
+                assert_eq!(msg["mutId"], json!("m1"));
+                first_results = Some(msg["results"].clone());
+            }
+            Some("queryUpdate") => {
+                assert_eq!(msg["queryId"], json!("q1"));
+            }
+            other => panic!("unexpected message type {other:?}"),
+        }
+    }
+    let first_results = first_results.expect("first mutateOk");
+
+    send_json(
+        &mut ws,
+        json!({"type": "mutate", "mutId": "m2", "idempotencyKey": "retry-key", "txn": insert_work_item_txn()}),
+    )
+    .await;
+    let second = recv_json(&mut ws).await;
+    assert_eq!(second["type"], json!("mutateOk"));
+    assert_eq!(second["mutId"], json!("m2"));
+    assert_eq!(second["results"], first_results);
+
+    let drained = tokio::time::timeout(Duration::from_millis(300), ws.next()).await;
+    assert!(
+        drained.is_err(),
+        "expected no further message after deduped mutate, got {drained:?}"
+    );
+    Ok(())
+}
+
 // (f) mutate from a SECOND authed connection -> first connection receives queryUpdate.
 #[tokio::test]
 async fn mutate_from_second_connection_pushes_update_to_first() -> anyhow::Result<()> {

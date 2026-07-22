@@ -50,6 +50,7 @@ interface PendingMutate {
 
 interface QueuedMutate extends PendingMutate {
   mutId: string;
+  idempotencyKey?: string;
   txn: TransactionJson;
 }
 
@@ -210,13 +211,13 @@ export class RtDbClient {
   }
 
   mutate(txn: TransactionJson, opts?: { mutId?: string }): Promise<unknown[]> {
-    const mutId = opts?.mutId ?? `mut-${++this.counter}`;
+    const mutId = `mut-${++this.counter}`;
     return new Promise<unknown[]>((resolve, reject) => {
       if (this.stopped) {
         reject(new RtDbError("INTERNAL", "client is closed"));
         return;
       }
-      const entry: QueuedMutate = { mutId, txn, resolve, reject };
+      const entry: QueuedMutate = { mutId, idempotencyKey: opts?.mutId, txn, resolve, reject };
       if (this.authState === "authenticated" && this.socket) {
         this.dispatchMutate(entry);
       } else {
@@ -228,7 +229,12 @@ export class RtDbClient {
 
   private dispatchMutate(entry: QueuedMutate): void {
     this.pendingMutates.set(entry.mutId, { resolve: entry.resolve, reject: entry.reject });
-    this.send({ type: "mutate", mutId: entry.mutId, txn: entry.txn });
+    this.send({
+      type: "mutate",
+      mutId: entry.mutId,
+      idempotencyKey: entry.idempotencyKey,
+      txn: entry.txn,
+    });
   }
 
   private openSocket(): void {

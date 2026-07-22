@@ -51,7 +51,7 @@ export type ClientMessage =
   | { type: "auth"; token: string; db: string }
   | { type: "subscribe"; queryId: string; query: QueryJson }
   | { type: "unsubscribe"; queryId: string }
-  | { type: "mutate"; mutId: string; txn: TransactionJson }
+  | { type: "mutate"; mutId: string; idempotencyKey?: string; txn: TransactionJson }
   | { type: "ping" };
 
 /** Server -> client WS vocabulary. Tags/fields match server `protocol::ServerMessage`. */
