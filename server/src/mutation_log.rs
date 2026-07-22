@@ -1,7 +1,7 @@
 use serde_json::Value;
 use sqlx::PgPool;
 
-use crate::db::now_ms;
+use crate::db::{now_ms, validate_db_name};
 use crate::ddl::pg_schema;
 use crate::error::RtDbError;
 
@@ -12,6 +12,7 @@ pub const DEDUP_TTL_MS: i64 = 5 * 60 * 1000;
 /// once per committer task startup, covering databases created before this
 /// table existed (new databases get it from `db::create_database` instead).
 pub async fn ensure_table(pool: &PgPool, db: &str) -> Result<(), RtDbError> {
+    validate_db_name(db)?;
     let schema = pg_schema(db);
     sqlx::query(&format!(
         "CREATE TABLE IF NOT EXISTS \"{schema}\".mutations (
@@ -29,6 +30,7 @@ pub async fn ensure_table(pool: &PgPool, db: &str) -> Result<(), RtDbError> {
 /// this exact mutation already ran and its results should be replayed as-is,
 /// with no re-execution and no fan-out. `None` means it's safe to execute.
 pub async fn check(pool: &PgPool, db: &str, mut_id: &str) -> Result<Option<Vec<Value>>, RtDbError> {
+    validate_db_name(db)?;
     let schema = pg_schema(db);
     let now = now_ms();
 
@@ -69,6 +71,7 @@ pub async fn store(
     results: &[Value],
     ttl_ms: i64,
 ) -> Result<(), RtDbError> {
+    validate_db_name(db)?;
     let schema = pg_schema(db);
     let expires_at = now_ms() + ttl_ms;
     let value = serde_json::to_value(results).map_err(|err| {
