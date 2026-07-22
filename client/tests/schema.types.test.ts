@@ -54,7 +54,7 @@ describe("schema type inference", () => {
   });
 
   it("Int64 is a branded string convertible via toInt64/fromInt64", () => {
-    expectTypeOf<Int64>().toMatchTypeOf<string>();
+    expectTypeOf<Int64>().toExtend<string>();
     expectTypeOf(toInt64).returns.toEqualTypeOf<Int64>();
     expectTypeOf(fromInt64).parameter(0).toEqualTypeOf<Int64>();
     expectTypeOf(fromInt64).returns.toEqualTypeOf<bigint>();
