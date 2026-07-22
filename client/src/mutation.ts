@@ -38,11 +38,7 @@ export class TxnBuilder<S extends SchemaDefinition<any> = SchemaDefinition<any>>
     return this;
   }
 
-  expectAbsent<T extends TableNames<S>>(
-    table: T,
-    index: IndexNamesOf<S, T>,
-    eq: unknown[],
-  ): this {
+  expectAbsent<T extends TableNames<S>>(table: T, index: IndexNamesOf<S, T>, eq: unknown[]): this {
     this.steps.push({ op: "expectAbsent", table, index, eq });
     return this;
   }
