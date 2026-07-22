@@ -45,6 +45,15 @@ pub struct Query {
     pub first: bool, // sugar over take(1); returns Doc(Some) or Doc(None); mutually exclusive with take/unique
     #[serde(default)]
     pub count: bool, // terminal: SELECT COUNT(*) over the same eq/range WHERE; mutually exclusive with get/take/unique/first/order
+    #[serde(default)]
+    pub paginate: Option<Paginate>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Paginate {
+    pub cursor: Option<String>,
+    pub num_items: u32,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -53,6 +62,13 @@ pub enum QueryResult {
     Doc(Option<serde_json::Value>), // get / unique: doc or null
     Docs(Vec<serde_json::Value>),   // take / collect
     Count(i64),                     // count: total matching rows, uncapped by MAX_TAKE
+    Paginated(PaginatedResult),     // paginate: page of docs + optional next cursor
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PaginatedResult {
+    pub docs: Vec<serde_json::Value>,
+    pub next_cursor: Option<String>,
 }
 
 /// Result docs = stored doc merged with {"_id", "_creationTime", "_version"}.
@@ -137,6 +153,34 @@ pub async fn execute_query(
         return Err(RtDbError::bad_request(
             "count cannot be combined with order",
         ));
+    }
+
+    if q.paginate.is_some() {
+        if q.get.is_some() {
+            return Err(RtDbError::bad_request(
+                "paginate cannot be combined with get",
+            ));
+        }
+        if q.count {
+            return Err(RtDbError::bad_request(
+                "paginate cannot be combined with count",
+            ));
+        }
+        if q.unique {
+            return Err(RtDbError::bad_request(
+                "paginate cannot be combined with unique",
+            ));
+        }
+        if q.first {
+            return Err(RtDbError::bad_request(
+                "paginate cannot be combined with first",
+            ));
+        }
+        if q.take.is_some() {
+            return Err(RtDbError::bad_request(
+                "paginate cannot be combined with take",
+            ));
+        }
     }
 
     if q.gt.is_some() && q.gte.is_some() {
