@@ -8,6 +8,10 @@ export interface QueryJson {
   get?: string;
   index?: string;
   eq?: unknown[];
+  gt?: unknown;
+  gte?: unknown;
+  lt?: unknown;
+  lte?: unknown;
   order?: Order;
   take?: number;
   unique?: boolean;

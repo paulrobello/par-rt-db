@@ -4,7 +4,7 @@ use crate::db::validate_db_name;
 use crate::ddl::{pg_col, pg_schema, pg_table};
 use crate::error::RtDbError;
 use crate::schema::{IndexDef, SchemaDef};
-use crate::txn::{EqBind, eq_binds};
+use crate::txn::{EqBind, eq_bind_for, eq_binds};
 
 /// Hard cap on rows returned by a single query, whether via an explicit
 /// `take` or a `take`-less collect.
@@ -28,6 +28,14 @@ pub struct Query {
     #[serde(default)]
     pub eq: Vec<serde_json::Value>, // prefix binds on index fields
     #[serde(default)]
+    pub gt: Option<serde_json::Value>, // exclusive lower bound on the index field after the eq prefix
+    #[serde(default)]
+    pub gte: Option<serde_json::Value>, // inclusive lower bound; mutually exclusive with gt
+    #[serde(default)]
+    pub lt: Option<serde_json::Value>, // exclusive upper bound on the index field after the eq prefix
+    #[serde(default)]
+    pub lte: Option<serde_json::Value>, // inclusive upper bound; mutually exclusive with lt
+    #[serde(default)]
     pub order: Option<Order>, // default Asc
     #[serde(default)]
     pub take: Option<u32>, // cap 4096; absent => collect (cap 4096)
@@ -47,6 +55,11 @@ pub enum QueryResult {
 /// multiple documents" if >1 row, null if 0. eq len may be a PREFIX of index fields (0..=all),
 /// each typed like Task 5. Sort: unbound index fields in index order, then created_at, then id —
 /// all in `order` direction. No index => eq must be empty, sort by (created_at, id).
+/// `gt`/`gte`/`lt`/`lte` add an optional inequality bound on the single index field immediately
+/// after the `eq` prefix (`index.fields[eq.len()]`): at most one of `gt`/`gte` and at most one of
+/// `lt`/`lte` may be set, both may be set together for a bounded range, and the bound value is
+/// typed via the same `eq_binds`/`eq_bind_for` conversion `txn.rs` uses for `eq`. A range bound
+/// requires an index and a remaining (unconsumed by `eq`) index field -> BadRequest otherwise.
 /// Unknown table -> NotFound; unknown index / eq too long / get+query mix / unique+take -> BadRequest.
 /// `take: 0` is valid and returns an empty `Docs([])`, not an error.
 /// `unique` without an `index` scans the whole table (LIMIT 2) and applies the same 0/1/>1 rule.
@@ -62,12 +75,16 @@ pub async fn execute_query(
     if let Some(id) = &q.get {
         if q.index.is_some()
             || !q.eq.is_empty()
+            || q.gt.is_some()
+            || q.gte.is_some()
+            || q.lt.is_some()
+            || q.lte.is_some()
             || q.order.is_some()
             || q.take.is_some()
             || q.unique
         {
             return Err(RtDbError::bad_request(
-                "get cannot be combined with index, eq, order, take, or unique",
+                "get cannot be combined with index, eq, range bounds, order, take, or unique",
             ));
         }
         return point_read(pool, db, &q.table, id).await;
@@ -77,6 +94,13 @@ pub async fn execute_query(
         return Err(RtDbError::bad_request(
             "unique cannot be combined with take or order",
         ));
+    }
+
+    if q.gt.is_some() && q.gte.is_some() {
+        return Err(RtDbError::bad_request("gt and gte cannot both be set"));
+    }
+    if q.lt.is_some() && q.lte.is_some() {
+        return Err(RtDbError::bad_request("lt and lte cannot both be set"));
     }
 
     if let Some(take) = q.take
@@ -103,7 +127,45 @@ pub async fn execute_query(
     };
     let eq_len = binds.len();
 
-    let where_conditions: Vec<String> = match index_def {
+    let has_range_bound = q.gt.is_some() || q.gte.is_some() || q.lt.is_some() || q.lte.is_some();
+    let range_field_name: Option<&str> = if has_range_bound {
+        let idx =
+            index_def.ok_or_else(|| RtDbError::bad_request("range bound requires an index"))?;
+        if eq_len >= idx.fields.len() {
+            return Err(RtDbError::bad_request(
+                "range bound requires a remaining index field after eq",
+            ));
+        }
+        Some(idx.fields[eq_len].as_str())
+    } else {
+        None
+    };
+
+    let mut range_where: Vec<String> = Vec::new();
+    let mut range_binds: Vec<EqBind> = Vec::new();
+    if let Some(field_name) = range_field_name {
+        let field_type = table_def.fields.get(field_name).ok_or_else(|| {
+            RtDbError::internal(format!("index references unknown field '{field_name}'"))
+        })?;
+        let col = pg_col(field_name);
+        if let Some(v) = &q.gt {
+            range_where.push(format!("\"{col}\" > ${}", eq_len + range_binds.len() + 1));
+            range_binds.push(eq_bind_for(field_type, v)?);
+        } else if let Some(v) = &q.gte {
+            range_where.push(format!("\"{col}\" >= ${}", eq_len + range_binds.len() + 1));
+            range_binds.push(eq_bind_for(field_type, v)?);
+        }
+        if let Some(v) = &q.lt {
+            range_where.push(format!("\"{col}\" < ${}", eq_len + range_binds.len() + 1));
+            range_binds.push(eq_bind_for(field_type, v)?);
+        } else if let Some(v) = &q.lte {
+            range_where.push(format!("\"{col}\" <= ${}", eq_len + range_binds.len() + 1));
+            range_binds.push(eq_bind_for(field_type, v)?);
+        }
+    }
+    let limit_placeholder = eq_len + range_binds.len() + 1;
+
+    let mut where_conditions: Vec<String> = match index_def {
         Some(idx) => idx.fields[..eq_len]
             .iter()
             .enumerate()
@@ -111,6 +173,7 @@ pub async fn execute_query(
             .collect(),
         None => Vec::new(),
     };
+    where_conditions.extend(range_where);
 
     let mut sort_cols: Vec<String> = match index_def {
         Some(idx) => idx.fields[eq_len..]
@@ -149,10 +212,17 @@ pub async fn execute_query(
     }
     sql.push_str(" ORDER BY ");
     sql.push_str(&order_by);
-    sql.push_str(&format!(" LIMIT ${}", eq_len + 1));
+    sql.push_str(&format!(" LIMIT ${limit_placeholder}"));
 
     let mut query = sqlx::query_as::<_, (String, serde_json::Value, i64, i64)>(&sql);
     for bind in binds {
+        query = match bind {
+            EqBind::Text(v) => query.bind(v),
+            EqBind::Num(v) => query.bind(v),
+            EqBind::Bool(v) => query.bind(v),
+        };
+    }
+    for bind in range_binds {
         query = match bind {
             EqBind::Text(v) => query.bind(v),
             EqBind::Num(v) => query.bind(v),

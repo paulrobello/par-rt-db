@@ -13,7 +13,7 @@ use crate::txn::Transaction;
 )]
 pub enum ClientMessage {
     Auth { token: String, db: String },
-    Subscribe { query_id: String, query: Query },
+    Subscribe { query_id: String, query: Box<Query> },
     Unsubscribe { query_id: String },
     Mutate { mut_id: String, txn: Transaction },
     Ping,
@@ -86,7 +86,7 @@ mod tests {
         assert_eq!(
             serde_json::to_value(ClientMessage::Subscribe {
                 query_id: "q1".to_string(),
-                query: sample_query()
+                query: Box::new(sample_query())
             })
             .unwrap()["type"],
             serde_json::json!("subscribe")
@@ -177,7 +177,7 @@ mod tests {
     fn client_message_round_trips_through_json() {
         let msg = ClientMessage::Subscribe {
             query_id: "q1".to_string(),
-            query: sample_query(),
+            query: Box::new(sample_query()),
         };
         let value = serde_json::to_value(&msg).unwrap();
         let restored: ClientMessage = serde_json::from_value(value).unwrap();

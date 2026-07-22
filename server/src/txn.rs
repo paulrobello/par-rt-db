@@ -96,7 +96,9 @@ pub(crate) fn eq_binds(
         .collect()
 }
 
-fn eq_bind_for(ty: &FieldType, value: &serde_json::Value) -> Result<EqBind, RtDbError> {
+/// Shared with `query.rs`, which reuses this to type range-bound (`gt`/`gte`/`lt`/`lte`)
+/// values the same way `eq` values are typed here.
+pub(crate) fn eq_bind_for(ty: &FieldType, value: &serde_json::Value) -> Result<EqBind, RtDbError> {
     let (pg_type, _nullable) = indexed_column_type(ty)?;
     match pg_type {
         "text" => value

@@ -135,6 +135,10 @@ async fn get_by_id_returns_doc_with_system_fields() -> anyhow::Result<()> {
             get: Some(target.clone()),
             index: None,
             eq: vec![],
+            gt: None,
+            gte: None,
+            lt: None,
+            lte: None,
             order: None,
             take: None,
             unique: false,
@@ -175,6 +179,10 @@ async fn get_missing_returns_null() -> anyhow::Result<()> {
             get: Some("0".repeat(32)),
             index: None,
             eq: vec![],
+            gt: None,
+            gte: None,
+            lt: None,
+            lte: None,
             order: None,
             take: None,
             unique: false,
@@ -206,6 +214,10 @@ async fn get_combined_with_index_is_bad_request() -> anyhow::Result<()> {
             get: Some(items[0].clone()),
             index: Some("by_project".to_string()),
             eq: vec![],
+            gt: None,
+            gte: None,
+            lt: None,
+            lte: None,
             order: None,
             take: None,
             unique: false,
@@ -237,6 +249,10 @@ async fn unique_combined_with_take_is_bad_request() -> anyhow::Result<()> {
             get: None,
             index: Some("by_name".to_string()),
             eq: vec![serde_json::json!("Alpha")],
+            gt: None,
+            gte: None,
+            lt: None,
+            lte: None,
             order: None,
             take: Some(10),
             unique: true,
@@ -269,6 +285,10 @@ async fn full_eq_compound_index_orders_by_created_at_asc() -> anyhow::Result<()>
             get: None,
             index: Some("by_project_and_status".to_string()),
             eq: vec![serde_json::json!(project_id), serde_json::json!("backlog")],
+            gt: None,
+            gte: None,
+            lt: None,
+            lte: None,
             order: None,
             take: Some(10),
             unique: false,
@@ -299,6 +319,10 @@ async fn full_eq_compound_index_order_desc_reverses() -> anyhow::Result<()> {
             get: None,
             index: Some("by_project_and_status".to_string()),
             eq: vec![serde_json::json!(project_id), serde_json::json!("backlog")],
+            gt: None,
+            gte: None,
+            lt: None,
+            lte: None,
             order: Some(Order::Desc),
             take: Some(10),
             unique: false,
@@ -331,6 +355,10 @@ async fn prefix_eq_on_compound_index_sorts_by_remaining_index_field_then_created
             get: None,
             index: Some("by_project_and_status".to_string()),
             eq: vec![serde_json::json!(project_id)],
+            gt: None,
+            gte: None,
+            lt: None,
+            lte: None,
             order: None,
             take: None,
             unique: false,
@@ -370,6 +398,10 @@ async fn unique_on_by_name_returns_single_doc() -> anyhow::Result<()> {
             get: None,
             index: Some("by_name".to_string()),
             eq: vec![serde_json::json!("Alpha")],
+            gt: None,
+            gte: None,
+            lt: None,
+            lte: None,
             order: None,
             take: None,
             unique: true,
@@ -406,6 +438,10 @@ async fn unique_with_duplicate_name_is_precondition_failed() -> anyhow::Result<(
             get: None,
             index: Some("by_name".to_string()),
             eq: vec![serde_json::json!("Alpha")],
+            gt: None,
+            gte: None,
+            lt: None,
+            lte: None,
             order: None,
             take: None,
             unique: true,
@@ -438,6 +474,10 @@ async fn no_index_collect_returns_all_docs_in_created_at_order() -> anyhow::Resu
             get: None,
             index: None,
             eq: vec![],
+            gt: None,
+            gte: None,
+            lt: None,
+            lte: None,
             order: None,
             take: None,
             unique: false,
@@ -468,6 +508,10 @@ async fn take_over_cap_is_bad_request() -> anyhow::Result<()> {
             get: None,
             index: None,
             eq: vec![],
+            gt: None,
+            gte: None,
+            lt: None,
+            lte: None,
             order: None,
             take: Some(5000),
             unique: false,
@@ -499,6 +543,10 @@ async fn unknown_index_is_bad_request() -> anyhow::Result<()> {
             get: None,
             index: Some("no_such_index".to_string()),
             eq: vec![],
+            gt: None,
+            gte: None,
+            lt: None,
+            lte: None,
             order: None,
             take: None,
             unique: false,
@@ -530,6 +578,10 @@ async fn eq_longer_than_index_fields_is_bad_request() -> anyhow::Result<()> {
             get: None,
             index: Some("by_name".to_string()),
             eq: vec![serde_json::json!("Alpha"), serde_json::json!("extra")],
+            gt: None,
+            gte: None,
+            lt: None,
+            lte: None,
             order: None,
             take: None,
             unique: false,
@@ -559,6 +611,10 @@ async fn unknown_table_is_not_found() -> anyhow::Result<()> {
             get: None,
             index: None,
             eq: vec![],
+            gt: None,
+            gte: None,
+            lt: None,
+            lte: None,
             order: None,
             take: None,
             unique: false,
@@ -590,6 +646,10 @@ async fn take_zero_returns_empty_docs() -> anyhow::Result<()> {
             get: None,
             index: None,
             eq: vec![],
+            gt: None,
+            gte: None,
+            lt: None,
+            lte: None,
             order: None,
             take: Some(0),
             unique: false,
@@ -618,6 +678,10 @@ async fn unique_without_index_scans_whole_table() -> anyhow::Result<()> {
         get: None,
         index: None,
         eq: vec![],
+        gt: None,
+        gte: None,
+        lt: None,
+        lte: None,
         order: None,
         take: None,
         unique: true,
@@ -657,6 +721,10 @@ async fn canonical_is_stable_for_identical_results() -> anyhow::Result<()> {
         get: None,
         index: None,
         eq: vec![],
+        gt: None,
+        gte: None,
+        lt: None,
+        lte: None,
         order: None,
         take: None,
         unique: false,
@@ -666,5 +734,442 @@ async fn canonical_is_stable_for_identical_results() -> anyhow::Result<()> {
     let second = execute_query(&pool, &db, &schema, &query).await?;
     assert_eq!(canonical(&first), canonical(&second));
 
+    Ok(())
+}
+
+// Range queries: gt/gte/lt/lte after the eq prefix.
+
+// (range-a) gt excludes the boundary value; results still sorted by (status, created_at).
+#[tokio::test]
+async fn range_gt_excludes_boundary_and_sorts_by_bound_field() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+
+    let (project_id, items) = seed_kanban(&pool, &db, &schema).await?;
+
+    let result = execute_query(
+        &pool,
+        &db,
+        &schema,
+        &Query {
+            table: "workItems".to_string(),
+            get: None,
+            index: Some("by_project_and_status".to_string()),
+            eq: vec![serde_json::json!(project_id)],
+            gt: Some(serde_json::json!("backlog")),
+            gte: None,
+            lt: None,
+            lte: None,
+            order: None,
+            take: None,
+            unique: false,
+        },
+    )
+    .await?;
+
+    assert_eq!(
+        docs_ids(&result),
+        vec![items[3].clone(), items[1].clone(), items[4].clone()]
+    );
+    Ok(())
+}
+
+// (range-b) gte is inclusive: with the minimum status as the bound, every doc matches.
+#[tokio::test]
+async fn range_gte_includes_boundary() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+
+    let (project_id, items) = seed_kanban(&pool, &db, &schema).await?;
+
+    let result = execute_query(
+        &pool,
+        &db,
+        &schema,
+        &Query {
+            table: "workItems".to_string(),
+            get: None,
+            index: Some("by_project_and_status".to_string()),
+            eq: vec![serde_json::json!(project_id)],
+            gt: None,
+            gte: Some(serde_json::json!("backlog")),
+            lt: None,
+            lte: None,
+            order: None,
+            take: None,
+            unique: false,
+        },
+    )
+    .await?;
+
+    assert_eq!(
+        docs_ids(&result),
+        vec![
+            items[0].clone(),
+            items[2].clone(),
+            items[3].clone(),
+            items[1].clone(),
+            items[4].clone(),
+        ]
+    );
+    Ok(())
+}
+
+// (range-c) numeric gt+lt bounded range on `order`, combined with the eq prefix.
+#[tokio::test]
+async fn range_gt_and_lt_bounded_numeric_range() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+
+    let (project_id, items) = seed_kanban(&pool, &db, &schema).await?;
+
+    let result = execute_query(
+        &pool,
+        &db,
+        &schema,
+        &Query {
+            table: "workItems".to_string(),
+            get: None,
+            index: Some("by_project_and_order".to_string()),
+            eq: vec![serde_json::json!(project_id)],
+            gt: Some(serde_json::json!(1.0)),
+            gte: None,
+            lt: Some(serde_json::json!(5.0)),
+            lte: None,
+            order: None,
+            take: None,
+            unique: false,
+        },
+    )
+    .await?;
+
+    assert_eq!(
+        docs_ids(&result),
+        vec![items[1].clone(), items[2].clone(), items[3].clone()]
+    );
+    Ok(())
+}
+
+// (range-d) same bounded range with order: desc reverses, and take limits further.
+#[tokio::test]
+async fn range_bounded_numeric_range_with_order_desc_and_take() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+
+    let (project_id, items) = seed_kanban(&pool, &db, &schema).await?;
+
+    let result = execute_query(
+        &pool,
+        &db,
+        &schema,
+        &Query {
+            table: "workItems".to_string(),
+            get: None,
+            index: Some("by_project_and_order".to_string()),
+            eq: vec![serde_json::json!(project_id)],
+            gt: Some(serde_json::json!(1.0)),
+            gte: None,
+            lt: Some(serde_json::json!(5.0)),
+            lte: None,
+            order: Some(Order::Desc),
+            take: Some(2),
+            unique: false,
+        },
+    )
+    .await?;
+
+    assert_eq!(docs_ids(&result), vec![items[3].clone(), items[2].clone()]);
+    Ok(())
+}
+
+// (range-e) range bound with no eq prefix applies directly to the index's first field.
+#[tokio::test]
+async fn range_without_eq_prefix_applies_to_first_index_field() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+
+    let (_project_id, items) = seed_kanban(&pool, &db, &schema).await?;
+
+    let result = execute_query(
+        &pool,
+        &db,
+        &schema,
+        &Query {
+            table: "workItems".to_string(),
+            get: None,
+            index: Some("by_status".to_string()),
+            eq: vec![],
+            gt: Some(serde_json::json!("backlog")),
+            gte: None,
+            lt: None,
+            lte: None,
+            order: None,
+            take: None,
+            unique: false,
+        },
+    )
+    .await?;
+
+    assert_eq!(
+        docs_ids(&result),
+        vec![items[3].clone(), items[1].clone(), items[4].clone()]
+    );
+    Ok(())
+}
+
+// (range-f) gt and gte both set -> BadRequest.
+#[tokio::test]
+async fn range_gt_and_gte_both_set_is_bad_request() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+
+    seed_kanban(&pool, &db, &schema).await?;
+
+    let err = execute_query(
+        &pool,
+        &db,
+        &schema,
+        &Query {
+            table: "workItems".to_string(),
+            get: None,
+            index: Some("by_status".to_string()),
+            eq: vec![],
+            gt: Some(serde_json::json!("backlog")),
+            gte: Some(serde_json::json!("backlog")),
+            lt: None,
+            lte: None,
+            order: None,
+            take: None,
+            unique: false,
+        },
+    )
+    .await
+    .expect_err("expected bad request");
+    assert_eq!(err.code, ErrorCode::BadRequest);
+
+    Ok(())
+}
+
+// (range-g) lt and lte both set -> BadRequest.
+#[tokio::test]
+async fn range_lt_and_lte_both_set_is_bad_request() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+
+    seed_kanban(&pool, &db, &schema).await?;
+
+    let err = execute_query(
+        &pool,
+        &db,
+        &schema,
+        &Query {
+            table: "workItems".to_string(),
+            get: None,
+            index: Some("by_status".to_string()),
+            eq: vec![],
+            gt: None,
+            gte: None,
+            lt: Some(serde_json::json!("in_progress")),
+            lte: Some(serde_json::json!("in_progress")),
+            order: None,
+            take: None,
+            unique: false,
+        },
+    )
+    .await
+    .expect_err("expected bad request");
+    assert_eq!(err.code, ErrorCode::BadRequest);
+
+    Ok(())
+}
+
+// (range-h) range bound without an index -> BadRequest.
+#[tokio::test]
+async fn range_without_index_is_bad_request() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+
+    seed_kanban(&pool, &db, &schema).await?;
+
+    let err = execute_query(
+        &pool,
+        &db,
+        &schema,
+        &Query {
+            table: "workItems".to_string(),
+            get: None,
+            index: None,
+            eq: vec![],
+            gt: Some(serde_json::json!(1.0)),
+            gte: None,
+            lt: None,
+            lte: None,
+            order: None,
+            take: None,
+            unique: false,
+        },
+    )
+    .await
+    .expect_err("expected bad request");
+    assert_eq!(err.code, ErrorCode::BadRequest);
+
+    Ok(())
+}
+
+// (range-i) eq already consumes every index field -> no remaining field for the range bound.
+#[tokio::test]
+async fn range_with_no_remaining_index_field_is_bad_request() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+
+    let (project_id, _items) = seed_kanban(&pool, &db, &schema).await?;
+
+    let err = execute_query(
+        &pool,
+        &db,
+        &schema,
+        &Query {
+            table: "workItems".to_string(),
+            get: None,
+            index: Some("by_project_and_status".to_string()),
+            eq: vec![serde_json::json!(project_id), serde_json::json!("backlog")],
+            gt: Some(serde_json::json!("x")),
+            gte: None,
+            lt: None,
+            lte: None,
+            order: None,
+            take: None,
+            unique: false,
+        },
+    )
+    .await
+    .expect_err("expected bad request");
+    assert_eq!(err.code, ErrorCode::BadRequest);
+
+    Ok(())
+}
+
+// (range-j) get combined with a range bound -> BadRequest.
+#[tokio::test]
+async fn range_combined_with_get_is_bad_request() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+
+    let (_project_id, items) = seed_kanban(&pool, &db, &schema).await?;
+
+    let err = execute_query(
+        &pool,
+        &db,
+        &schema,
+        &Query {
+            table: "workItems".to_string(),
+            get: Some(items[0].clone()),
+            index: None,
+            eq: vec![],
+            gt: Some(serde_json::json!(1.0)),
+            gte: None,
+            lt: None,
+            lte: None,
+            order: None,
+            take: None,
+            unique: false,
+        },
+    )
+    .await
+    .expect_err("expected bad request");
+    assert_eq!(err.code, ErrorCode::BadRequest);
+
+    Ok(())
+}
+
+// (range-k) a range value of the wrong type for the field is BadRequest, same as eq typing.
+#[tokio::test]
+async fn range_value_wrong_type_is_bad_request() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+
+    let (project_id, _items) = seed_kanban(&pool, &db, &schema).await?;
+
+    let err = execute_query(
+        &pool,
+        &db,
+        &schema,
+        &Query {
+            table: "workItems".to_string(),
+            get: None,
+            index: Some("by_project_and_order".to_string()),
+            eq: vec![serde_json::json!(project_id)],
+            gt: Some(serde_json::json!("not-a-number")),
+            gte: None,
+            lt: None,
+            lte: None,
+            order: None,
+            take: None,
+            unique: false,
+        },
+    )
+    .await
+    .expect_err("expected bad request");
+    assert_eq!(err.code, ErrorCode::BadRequest);
+
+    Ok(())
+}
+
+// (range-l) lte is inclusive: the boundary value itself is included.
+#[tokio::test]
+async fn range_lte_includes_boundary_value() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+
+    let (project_id, items) = seed_kanban(&pool, &db, &schema).await?;
+
+    let result = execute_query(
+        &pool,
+        &db,
+        &schema,
+        &Query {
+            table: "workItems".to_string(),
+            get: None,
+            index: Some("by_project_and_order".to_string()),
+            eq: vec![serde_json::json!(project_id)],
+            gt: None,
+            gte: None,
+            lt: None,
+            lte: Some(serde_json::json!(3.0)),
+            order: None,
+            take: None,
+            unique: false,
+        },
+    )
+    .await?;
+
+    assert_eq!(
+        docs_ids(&result),
+        vec![items[0].clone(), items[1].clone(), items[2].clone()]
+    );
     Ok(())
 }

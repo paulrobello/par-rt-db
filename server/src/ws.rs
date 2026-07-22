@@ -293,7 +293,7 @@ async fn handle_text_frame(
                 Ok(()) => {
                     if let Err(error) = state
                         .committers
-                        .subscribe(db, conn_id, query_id.clone(), query, out_tx.clone())
+                        .subscribe(db, conn_id, query_id.clone(), *query, out_tx.clone())
                         .await
                     {
                         let _ = out_tx.send(ServerMessage::SubscribeErr { query_id, error });

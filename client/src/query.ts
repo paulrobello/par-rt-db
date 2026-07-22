@@ -15,6 +15,22 @@ export class TableQuery<DocT, Indexes extends string> {
     return new TableQuery({ ...this.json, index, eq });
   }
 
+  gt(value: unknown): TableQuery<DocT, Indexes> {
+    return new TableQuery({ ...this.json, gt: value });
+  }
+
+  gte(value: unknown): TableQuery<DocT, Indexes> {
+    return new TableQuery({ ...this.json, gte: value });
+  }
+
+  lt(value: unknown): TableQuery<DocT, Indexes> {
+    return new TableQuery({ ...this.json, lt: value });
+  }
+
+  lte(value: unknown): TableQuery<DocT, Indexes> {
+    return new TableQuery({ ...this.json, lte: value });
+  }
+
   order(order: Order): TableQuery<DocT, Indexes> {
     return new TableQuery({ ...this.json, order });
   }

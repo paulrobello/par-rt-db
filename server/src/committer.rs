@@ -23,7 +23,7 @@ pub enum CommitterRequest {
     Subscribe {
         conn: ConnId,
         query_id: String,
-        query: Query,
+        query: Box<Query>,
         tx: UnboundedSender<ServerMessage>,
         reply: oneshot::Sender<Result<(), RtDbError>>,
     },
@@ -141,7 +141,7 @@ impl Committers {
             CommitterRequest::Subscribe {
                 conn,
                 query_id,
-                query,
+                query: Box::new(query),
                 tx,
                 reply,
             },
@@ -200,7 +200,7 @@ async fn run_committer(
                 tx,
                 reply,
             } => {
-                let result = handle_subscribe(&ctx, conn, query_id, query, tx).await;
+                let result = handle_subscribe(&ctx, conn, query_id, *query, tx).await;
                 let _ = reply.send(result);
             }
         }

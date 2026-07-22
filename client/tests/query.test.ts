@@ -49,4 +49,26 @@ describe("query builder", () => {
     const q = api.items.get("abc123");
     expect(q.json).toEqual({ table: "items", get: "abc123" });
   });
+
+  it("builds a range query with gt and lt after an eq prefix", () => {
+    const q = api.items.query().withIndex("by_project", ["p1"]).gt(1).lt(5).collect();
+    expect(q.json).toEqual({ table: "items", index: "by_project", eq: ["p1"], gt: 1, lt: 5 });
+  });
+
+  it("builds a range query with gte and lte", () => {
+    const q = api.items.query().withIndex("by_project", ["p1"]).gte("a").lte("m").collect();
+    expect(q.json).toEqual({ table: "items", index: "by_project", eq: ["p1"], gte: "a", lte: "m" });
+  });
+
+  it("combines a range bound with order and take", () => {
+    const q = api.items.query().withIndex("by_project", ["p1"]).gt(1).order("desc").take(10);
+    expect(q.json).toEqual({
+      table: "items",
+      index: "by_project",
+      eq: ["p1"],
+      gt: 1,
+      order: "desc",
+      take: 10,
+    });
+  });
 });
