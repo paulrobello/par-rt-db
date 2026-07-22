@@ -39,6 +39,7 @@ pub async fn spawn_app(state: Arc<AppState>) -> SocketAddr {
     addr
 }
 
+#[allow(dead_code)]
 pub fn kanban_schema_json() -> serde_json::Value {
     serde_json::json!({"tables":{
       "projects":{
@@ -67,6 +68,7 @@ pub fn kanban_schema_json() -> serde_json::Value {
     }})
 }
 
+#[allow(dead_code)]
 pub async fn fresh_db(state: &Arc<AppState>) -> String {
     let name = format!("t{}", uuid::Uuid::now_v7().simple());
     db::create_database(&state.pool, &name)
