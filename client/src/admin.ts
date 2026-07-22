@@ -63,10 +63,13 @@ export class RtDbAdminClient {
 
   /** Fetches `db`'s schema and every document as JSONL text (see server `snapshot::export_database`). */
   async exportDb(db: string): Promise<string> {
-    const response = await this.fetchImpl(`${this.url}/admin/export-db?db=${encodeURIComponent(db)}`, {
-      method: "GET",
-      headers: { Authorization: `Bearer ${this.adminKey}` },
-    });
+    const response = await this.fetchImpl(
+      `${this.url}/admin/export-db?db=${encodeURIComponent(db)}`,
+      {
+        method: "GET",
+        headers: { Authorization: `Bearer ${this.adminKey}` },
+      },
+    );
     if (!response.ok) {
       await this.throwFromResponse(response);
     }
@@ -75,14 +78,17 @@ export class RtDbAdminClient {
 
   /** Loads a JSONL snapshot from `exportDb` into `db` (see server `snapshot::import_database`). */
   async importDb(db: string, jsonl: string): Promise<void> {
-    const response = await this.fetchImpl(`${this.url}/admin/import-db?db=${encodeURIComponent(db)}`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${this.adminKey}`,
-        "content-type": "application/x-ndjson",
+    const response = await this.fetchImpl(
+      `${this.url}/admin/import-db?db=${encodeURIComponent(db)}`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${this.adminKey}`,
+          "content-type": "application/x-ndjson",
+        },
+        body: jsonl,
       },
-      body: jsonl,
-    });
+    );
     if (!response.ok) {
       await this.throwFromResponse(response);
     }

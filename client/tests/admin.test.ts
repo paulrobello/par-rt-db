@@ -54,9 +54,11 @@ describe("RtDbAdminClient", () => {
 
   it("exports a database as JSONL text", async () => {
     const jsonl = '{"kind":"schema","schema":{"tables":{}}}\n';
-    const fetchMock = vi.fn().mockResolvedValue(
-      new Response(jsonl, { status: 200, headers: { "content-type": "application/x-ndjson" } }),
-    );
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(
+        new Response(jsonl, { status: 200, headers: { "content-type": "application/x-ndjson" } }),
+      );
     const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
 
     await expect(admin.exportDb("kanban")).resolves.toBe(jsonl);
@@ -82,9 +84,9 @@ describe("RtDbAdminClient", () => {
   });
 
   it("throws RtDbError when exportDb receives an error envelope", async () => {
-    const fetchMock = vi.fn().mockResolvedValue(
-      jsonResponse({ code: "NOT_FOUND", message: "unknown database" }, 404),
-    );
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(jsonResponse({ code: "NOT_FOUND", message: "unknown database" }, 404));
     const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
 
     await expect(admin.exportDb("missing")).rejects.toThrow("unknown database");
