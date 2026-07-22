@@ -78,7 +78,9 @@ pub async fn store(pool: &PgPool, db: &str, mut_id: &str, results: &[Value], ttl
 ```
 
 `check` first deletes expired rows for this db (`DELETE FROM mutations WHERE
-expires_at < $now`, a single indexed statement) then looks up `mut_id`. This
+expires_at < $now`, a single statement — a sequential scan, since `expires_at`
+has no index; harmless at the row counts a 5-minute TTL bounds this table to)
+then looks up `mut_id`. This
 piggybacks cleanup on the same round trip instead of needing a background
 sweep task — there is no periodic-task infrastructure in this codebase today
 (scheduled transactions, FEATURE_MATRIX #9, are a separate, later backlog

@@ -103,10 +103,11 @@ mistakes them for backlog.
 ## 5. Recommended order
 
 Tier-1's **#1–#3, #6, #7, #13** (range queries, `first`, `count`, `replace`, snapshot
-export/import, extra validators) and tier-2's **#8** (session-expiry enforcement) are done
-as of 2026-07-22 — see their rows above for what shipped. **#4 (safe retry)** is done as of 2026-07-22 — see its row above for what shipped. The next
-highest-value build is **#5 (pagination)**, the remaining medium build with the highest
-app-facing payoff; its prerequisite (row 1's range support, for keyset pagination) is
+export/import, extra validators), tier-2's **#8** (session-expiry enforcement), and
+**#4** (safe retry) are done as of 2026-07-22 — see their rows above for what shipped.
+The next highest-value build is **#5 (pagination)**, the remaining medium build with
+the highest app-facing payoff; its prerequisite (row 1's range support, for keyset
+pagination) is
 already in place. After that, **#9/#10 (scheduled/cron txns)** is the sleeper: it delivers
 most of what apps use Convex's scheduler+actions for, without compromising the
 no-server-code architecture.
