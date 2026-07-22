@@ -165,6 +165,10 @@ export function signInWithGitHub(baseUrl: string): Promise<string> {
       reject(new Error("popup blocked"));
       return;
     }
+    const cleanup = () => {
+      window.removeEventListener("message", onMessage);
+      clearInterval(closedPoll);
+    };
     const onMessage = (event: MessageEvent) => {
       if (event.origin !== origin) {
         return;
@@ -173,9 +177,15 @@ export function signInWithGitHub(baseUrl: string): Promise<string> {
       if (data?.type !== "rtdb-auth" || typeof data.token !== "string") {
         return;
       }
-      window.removeEventListener("message", onMessage);
+      cleanup();
       resolve(data.token);
     };
     window.addEventListener("message", onMessage);
+    const closedPoll = setInterval(() => {
+      if (popup.closed) {
+        cleanup();
+        reject(new Error("popup closed before completing sign-in"));
+      }
+    }, 500);
   });
 }

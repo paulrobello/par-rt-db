@@ -1,10 +1,11 @@
 import { act, render, screen } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { RtDbClient, type WebSocketLike } from "../src/client.js";
 import {
   Authenticated,
   AuthLoading,
   RtDbProvider,
+  signInWithGitHub,
   Unauthenticated,
   useQuery,
 } from "../src/react.js";
@@ -136,5 +137,68 @@ describe("react bindings", () => {
     });
     expect(screen.getByText("in")).toBeTruthy();
     localStorage.removeItem("rtdb-session-token");
+  });
+});
+
+describe("signInWithGitHub", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  function deliverAuthMessage(token: string) {
+    window.dispatchEvent(
+      new MessageEvent("message", {
+        origin: "http://h:8300",
+        data: { type: "rtdb-auth", token },
+      }),
+    );
+  }
+
+  it("resolves with the token from a valid rtdb-auth message", async () => {
+    const popup = { closed: false };
+    vi.spyOn(window, "open").mockReturnValue(popup as unknown as Window);
+
+    const promise = signInWithGitHub("http://h:8300");
+    deliverAuthMessage("tok-1");
+
+    await expect(promise).resolves.toBe("tok-1");
+  });
+
+  it("rejects immediately when the popup is blocked", async () => {
+    vi.spyOn(window, "open").mockReturnValue(null);
+
+    await expect(signInWithGitHub("http://h:8300")).rejects.toThrow("popup blocked");
+  });
+
+  it("rejects and cleans up the message listener when the popup closes before sign-in completes", async () => {
+    vi.useFakeTimers();
+    const popup = { closed: false };
+    vi.spyOn(window, "open").mockReturnValue(popup as unknown as Window);
+    const removeEventListenerSpy = vi.spyOn(window, "removeEventListener");
+
+    const promise = signInWithGitHub("http://h:8300");
+    const rejection = expect(promise).rejects.toThrow(/popup closed before completing sign-in/);
+
+    popup.closed = true;
+    await vi.advanceTimersByTimeAsync(1000);
+    await rejection;
+
+    expect(removeEventListenerSpy).toHaveBeenCalledWith("message", expect.any(Function));
+  });
+
+  it("does not reject if the popup closes after a valid message already resolved sign-in", async () => {
+    vi.useFakeTimers();
+    const popup = { closed: false };
+    vi.spyOn(window, "open").mockReturnValue(popup as unknown as Window);
+
+    const promise = signInWithGitHub("http://h:8300");
+    deliverAuthMessage("tok-2");
+    await expect(promise).resolves.toBe("tok-2");
+
+    popup.closed = true;
+    // Advancing well past the poll interval after resolution must not throw or
+    // produce an unhandled rejection — the interval must already be cleared.
+    await vi.advanceTimersByTimeAsync(5000);
   });
 });
