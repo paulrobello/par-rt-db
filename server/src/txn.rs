@@ -406,6 +406,64 @@ async fn do_replace(
     apply_update(conn, pg_schema_name, table_def, table_name, id, doc).await
 }
 
+/// Inserts a row with an explicit id/created_at/version, preserving a document's
+/// original identity and history instead of minting new ones like `do_insert`.
+/// Indexed columns are recomputed from `doc` the same way `do_insert` does. Used
+/// by `snapshot::import_database` to replay an exported row exactly.
+// Preserving id/doc/created_at/version explicitly (rather than minting new
+// ones like `do_insert`) pushes this past clippy's default 7-argument
+// threshold; every param is independently needed to replay a snapshot row.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn insert_snapshot_row(
+    conn: &mut PgConnection,
+    pg_schema_name: &str,
+    table_def: &TableDef,
+    table_name: &str,
+    id: &str,
+    doc: &serde_json::Map<String, serde_json::Value>,
+    created_at: i64,
+    version: i64,
+) -> Result<(), RtDbError> {
+    validate_doc(table_def, doc)?;
+    let doc = strip_unset_optionals(table_def, doc.clone());
+    let columns = table_columns(table_def)?;
+    let binds = column_binds(&columns, &doc)?;
+
+    let table_ident = pg_table(table_name);
+    let mut col_names = vec![
+        "\"id\"".to_string(),
+        "\"doc\"".to_string(),
+        "\"created_at\"".to_string(),
+        "\"version\"".to_string(),
+    ];
+    for (name, _) in &columns {
+        col_names.push(format!("\"{}\"", pg_col(name)));
+    }
+    let placeholders: Vec<String> = (1..=col_names.len()).map(|i| format!("${i}")).collect();
+
+    let sql = format!(
+        "INSERT INTO \"{pg_schema_name}\".\"{table_ident}\" ({}) VALUES ({})",
+        col_names.join(", "),
+        placeholders.join(", ")
+    );
+
+    let doc_value = serde_json::Value::Object(doc);
+    let mut query = sqlx::query(&sql)
+        .bind(id.to_string())
+        .bind(doc_value)
+        .bind(created_at)
+        .bind(version);
+    for bind in binds {
+        query = match bind {
+            ColBind::Text(v) => query.bind(v),
+            ColBind::Num(v) => query.bind(v),
+            ColBind::Bool(v) => query.bind(v),
+        };
+    }
+    query.execute(&mut *conn).await?;
+    Ok(())
+}
+
 async fn do_delete(
     conn: &mut PgConnection,
     pg_schema_name: &str,

@@ -9,6 +9,7 @@ pub mod http_api;
 pub mod protocol;
 pub mod query;
 pub mod schema;
+pub mod snapshot;
 pub mod subs;
 pub mod txn;
 pub mod ws;
