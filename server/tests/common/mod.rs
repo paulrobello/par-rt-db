@@ -96,3 +96,24 @@ pub async fn admin_post(
         .await
         .expect("send admin request")
 }
+
+#[allow(dead_code)]
+pub async fn admin_get(addr: SocketAddr, path: &str) -> reqwest::Response {
+    reqwest::Client::new()
+        .get(format!("http://{addr}{path}"))
+        .header("Authorization", "Bearer test-admin-key")
+        .send()
+        .await
+        .expect("send admin request")
+}
+
+#[allow(dead_code)]
+pub async fn admin_post_raw(addr: SocketAddr, path: &str, body: String) -> reqwest::Response {
+    reqwest::Client::new()
+        .post(format!("http://{addr}{path}"))
+        .header("Authorization", "Bearer test-admin-key")
+        .body(body)
+        .send()
+        .await
+        .expect("send admin request")
+}

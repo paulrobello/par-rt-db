@@ -1,6 +1,10 @@
 mod common;
 
-use common::{admin_post, fresh_db, kanban_schema_json, spawn_app, test_state};
+use common::{
+    admin_get, admin_post, admin_post_raw, fresh_db, kanban_schema_json, spawn_app, test_state,
+};
+use rtdb_server::db;
+use rtdb_server::txn::{Step, Transaction, execute_txn};
 
 fn fresh_name() -> String {
     format!("t{}", uuid::Uuid::now_v7().simple())
@@ -227,6 +231,250 @@ async fn list_dbs_includes_created_database() -> anyhow::Result<()> {
             .iter()
             .any(|value| value.as_str() == Some(name.as_str()))
     );
+
+    Ok(())
+}
+
+// (h) export then import into a fresh database round-trips docs, indexes, and schema.
+#[tokio::test]
+async fn export_then_import_round_trips_docs_indexes_and_schema() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let addr = spawn_app(state.clone()).await;
+    let source_db = fresh_db(&state).await;
+
+    let schema = state.schemas.get(&pool, &source_db).await?;
+    let insert_outcome = execute_txn(
+        &pool,
+        &source_db,
+        &schema,
+        &Transaction {
+            steps: vec![
+                Step::Insert {
+                    table: "projects".to_string(),
+                    doc: serde_json::json!({
+                        "name": "Roadmap",
+                        "status": "active",
+                        "tags": ["q3"],
+                        "updatedAt": 1
+                    })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                },
+                Step::Insert {
+                    table: "projects".to_string(),
+                    doc: serde_json::json!({
+                        "name": "Archive",
+                        "status": "archived",
+                        "tags": [],
+                        "updatedAt": 2
+                    })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                },
+            ],
+        },
+    )
+    .await?;
+    let project_id = insert_outcome.results[0]["id"]
+        .as_str()
+        .expect("project id")
+        .to_string();
+
+    execute_txn(
+        &pool,
+        &source_db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::Insert {
+                table: "workItems".to_string(),
+                doc: serde_json::json!({
+                    "projectId": project_id,
+                    "title": "Ship it",
+                    "status": "in_progress",
+                    "order": 1
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+            }],
+        },
+    )
+    .await?;
+
+    let export_resp = admin_get(addr, &format!("/admin/export-db?db={source_db}")).await;
+    assert_eq!(export_resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        export_resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok()),
+        Some("application/x-ndjson")
+    );
+    let jsonl = export_resp.text().await?;
+    let lines: Vec<&str> = jsonl.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert_eq!(lines.len(), 4); // 1 schema line + 2 projects + 1 workItem
+
+    let target_db = fresh_name();
+    let resp = admin_post(
+        addr,
+        "/admin/create-db",
+        serde_json::json!({"name": target_db}),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    let import_resp = admin_post_raw(
+        addr,
+        &format!("/admin/import-db?db={target_db}"),
+        jsonl.clone(),
+    )
+    .await;
+    assert_eq!(import_resp.status(), reqwest::StatusCode::OK);
+    let import_body: serde_json::Value = import_resp.json().await?;
+    assert_eq!(import_body["ok"], true);
+
+    let source_schema = db::load_schema(&pool, &source_db)
+        .await?
+        .expect("source schema");
+    let target_schema = db::load_schema(&pool, &target_db)
+        .await?
+        .expect("target schema");
+    assert_eq!(source_schema, target_schema);
+
+    let source_projects: Vec<(String, serde_json::Value, i64, i64)> = sqlx::query_as(&format!(
+        "SELECT \"id\", \"doc\", \"created_at\", \"version\" FROM \"db_{source_db}\".\"t_projects\" ORDER BY \"id\""
+    ))
+    .fetch_all(&pool)
+    .await?;
+    let target_projects: Vec<(String, serde_json::Value, i64, i64)> = sqlx::query_as(&format!(
+        "SELECT \"id\", \"doc\", \"created_at\", \"version\" FROM \"db_{target_db}\".\"t_projects\" ORDER BY \"id\""
+    ))
+    .fetch_all(&pool)
+    .await?;
+    assert_eq!(source_projects, target_projects);
+
+    let source_items: Vec<(String, serde_json::Value, i64, i64)> = sqlx::query_as(&format!(
+        "SELECT \"id\", \"doc\", \"created_at\", \"version\" FROM \"db_{source_db}\".\"t_workitems\" ORDER BY \"id\""
+    ))
+    .fetch_all(&pool)
+    .await?;
+    let target_items: Vec<(String, serde_json::Value, i64, i64)> = sqlx::query_as(&format!(
+        "SELECT \"id\", \"doc\", \"created_at\", \"version\" FROM \"db_{target_db}\".\"t_workitems\" ORDER BY \"id\""
+    ))
+    .fetch_all(&pool)
+    .await?;
+    assert_eq!(source_items, target_items);
+
+    let index_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_indexes WHERE schemaname = $1 AND indexname = $2",
+    )
+    .bind(format!("db_{target_db}"))
+    .bind("i_workitems_by_project_and_status")
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(index_count, 1);
+
+    Ok(())
+}
+
+// (i) export of an empty database (schema pushed, no docs) yields just the schema line.
+#[tokio::test]
+async fn export_of_empty_database_yields_only_schema_line() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let name = fresh_db(&state).await;
+
+    let resp = admin_get(addr, &format!("/admin/export-db?db={name}")).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let jsonl = resp.text().await?;
+    let lines: Vec<&str> = jsonl.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert_eq!(lines.len(), 1);
+
+    let line: serde_json::Value = serde_json::from_str(lines[0])?;
+    assert_eq!(line["kind"], "schema");
+    assert_eq!(line["schema"], kanban_schema_json());
+
+    Ok(())
+}
+
+// (j) wrong admin key on export-db -> 401 UNAUTHORIZED.
+#[tokio::test]
+async fn export_db_wrong_admin_key_is_unauthorized() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let name = fresh_db(&state).await;
+
+    let resp = reqwest::Client::new()
+        .get(format!("http://{addr}/admin/export-db?db={name}"))
+        .header("Authorization", "Bearer wrong-key")
+        .send()
+        .await?;
+    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(body["code"], "UNAUTHORIZED");
+
+    Ok(())
+}
+
+// (k) wrong admin key on import-db -> 401 UNAUTHORIZED.
+#[tokio::test]
+async fn import_db_wrong_admin_key_is_unauthorized() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/admin/import-db?db={}", fresh_name()))
+        .header("Authorization", "Bearer wrong-key")
+        .body("{}")
+        .send()
+        .await?;
+    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(body["code"], "UNAUTHORIZED");
+
+    Ok(())
+}
+
+// (l) export-db against an unknown database -> 404 NOT_FOUND.
+#[tokio::test]
+async fn export_db_of_unknown_database_is_not_found() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state).await;
+
+    let resp = admin_get(addr, &format!("/admin/export-db?db={}", fresh_name())).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(body["code"], "NOT_FOUND");
+
+    Ok(())
+}
+
+// (m) import-db into an unknown database -> 404 NOT_FOUND.
+#[tokio::test]
+async fn import_db_into_unknown_database_is_not_found() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state).await;
+
+    let jsonl = format!(
+        "{}\n",
+        serde_json::json!({"kind": "schema", "schema": kanban_schema_json()})
+    );
+    let resp = admin_post_raw(
+        addr,
+        &format!("/admin/import-db?db={}", fresh_name()),
+        jsonl,
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(body["code"], "NOT_FOUND");
 
     Ok(())
 }
