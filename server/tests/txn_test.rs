@@ -313,7 +313,10 @@ async fn patch_unknown_field_is_schema_violation() -> anyhow::Result<()> {
     Ok(())
 }
 
-// (d2) replace fully overwrites doc, recomputes every typed column, bumps version.
+// (d2) replace fully overwrites doc, recomputes every typed column, bumps version. The
+// replacement omits the optional `description` the original doc had, to prove this is a true
+// full-document overwrite and not a merge: a `patch`-style merge would leave an untouched field
+// alone, but `replace` must drop it since it isn't part of the new document.
 #[tokio::test]
 async fn replace_overwrites_doc_updates_typed_columns_and_bumps_version() -> anyhow::Result<()> {
     let state = test_state().await;
@@ -328,7 +331,13 @@ async fn replace_overwrites_doc_updates_typed_columns_and_bumps_version() -> any
         &Transaction {
             steps: vec![Step::Insert {
                 table: "projects".to_string(),
-                doc: valid_project_doc(),
+                doc: doc(serde_json::json!({
+                    "name": "Alpha",
+                    "description": "original description",
+                    "status": "active",
+                    "tags": ["a", "b"],
+                    "updatedAt": 1.0
+                })),
             }],
         },
     )
@@ -340,7 +349,6 @@ async fn replace_overwrites_doc_updates_typed_columns_and_bumps_version() -> any
 
     let replacement = doc(serde_json::json!({
         "name": "Beta",
-        "description": "new description",
         "status": "paused",
         "tags": ["z"],
         "updatedAt": 9.0
@@ -372,7 +380,12 @@ async fn replace_overwrites_doc_updates_typed_columns_and_bumps_version() -> any
     assert_eq!(row.0, "Beta");
     assert_eq!(row.1, "paused");
     assert_eq!(row.2, 2);
-    assert_eq!(row.3["description"], serde_json::json!("new description"));
+    assert!(
+        !row.3
+            .as_object()
+            .expect("doc obj")
+            .contains_key("description")
+    );
 
     Ok(())
 }

@@ -21,7 +21,7 @@ The server itself listens on `RTDB_PORT` (default `8300`); run it with `cargo ru
 | `GET /healthz`             | none               | Liveness check; returns the body `ok`.                                                                                                       |
 | `GET /sync`                | first WS frame     | Upgrades to WebSocket; speaks the realtime protocol below (auth, subscribe, mutate, ping).                                                   |
 | `POST /api/query`          | Bearer token       | One-shot query against a database; see [Query shape](#query-shape).                                                                          |
-| `POST /api/mutate`         | Bearer token       | One-shot transaction (insert/patch/delete/expectVersion/expectAbsent/upsert steps).                                                          |
+| `POST /api/mutate`         | Bearer token       | One-shot transaction (insert/patch/replace/delete/expectVersion/expectAbsent/upsert steps).                                                  |
 | `POST /admin/create-db`    | Bearer admin key   | Creates a new database.                                                                                                                      |
 | `POST /admin/push-schema`  | Bearer admin key   | Applies additive schema DDL to a database.                                                                                                   |
 | `GET /admin/dbs`           | Bearer admin key   | Lists all databases.                                                                                                                         |
@@ -90,7 +90,7 @@ Every error response — HTTP and WebSocket alike — is a JSON object:
 
 ### Transaction shape
 
-`{"steps": [...]}` where each step is tagged by `"op"`: `insert`, `patch`, `delete`,
+`{"steps": [...]}` where each step is tagged by `"op"`: `insert`, `patch`, `replace`, `delete`,
 `expectVersion`, `expectAbsent`, `upsert` — see `server/src/txn.rs`.
 
 ### WebSocket example: subscribe, then mutate
