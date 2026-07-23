@@ -1,4 +1,3 @@
-import { encodeCursor } from "./pagination.js";
 import type { Order, QueryJson } from "./protocol.js";
 import type { Doc, Id, IndexNamesOf, SchemaDefinition, TableNames } from "./schema.js";
 
