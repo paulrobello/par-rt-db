@@ -75,6 +75,69 @@ pub struct AuthedUser {
     pub name: Option<String>,
 }
 
+/// HTTP request/response bodies for `/admin/*`. These mirror the server's
+/// `admin.rs` handler structs (not the WS `protocol.rs`) field-for-field; the
+/// casing is load-bearing — `tokenId` is camelCase on the wire.
+#[cfg(feature = "admin")]
+pub mod admin {
+    use crate::schema::SchemaDef;
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Serialize)]
+    pub(crate) struct CreateDbRequest<'a> {
+        pub(crate) name: &'a str,
+    }
+
+    #[derive(Serialize)]
+    pub(crate) struct PushSchemaRequest<'a> {
+        pub(crate) db: &'a str,
+        pub(crate) schema: &'a SchemaDef,
+    }
+
+    #[derive(Serialize)]
+    pub(crate) struct MintTokenRequest<'a> {
+        pub(crate) db: &'a str,
+        pub(crate) name: &'a str,
+    }
+
+    #[derive(Serialize)]
+    pub(crate) struct RevokeTokenRequest<'a> {
+        #[serde(rename = "tokenId")]
+        pub(crate) token_id: &'a str,
+    }
+
+    #[derive(Serialize)]
+    pub(crate) struct AllowlistWriteRequest<'a> {
+        pub(crate) db: &'a str,
+        pub(crate) action: &'a str,
+        pub(crate) email: &'a str,
+    }
+
+    #[derive(Deserialize)]
+    pub(crate) struct OkResponse {
+        pub(crate) ok: bool,
+    }
+
+    #[derive(Deserialize)]
+    pub(crate) struct DatabasesResponse {
+        pub(crate) databases: Vec<String>,
+    }
+
+    /// Returned by `mint_token`: the server's `{tokenId, token}` shape, with the
+    /// wire `tokenId` exposed as `token_id`.
+    #[derive(Debug, Clone, Deserialize)]
+    pub struct MintedToken {
+        #[serde(rename = "tokenId")]
+        pub token_id: String,
+        pub token: String,
+    }
+
+    #[derive(Deserialize)]
+    pub(crate) struct AllowlistListResponse {
+        pub(crate) emails: Vec<String>,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

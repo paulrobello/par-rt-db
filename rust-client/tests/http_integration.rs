@@ -72,3 +72,47 @@ async fn http_round_trip() {
     let err = c.mutate(&bad, None).await.unwrap_err();
     assert_eq!(err.code, ErrorCode::PreconditionFailed);
 }
+
+/// Exercises the admin control-plane end-to-end against a live server. Creates a
+/// fresh `t<uuid>` database (never touches a db it didn't create), pushes a
+/// schema, mints a token, lists dbs/allowlist, exports, and revokes.
+#[cfg(feature = "admin")]
+#[tokio::test]
+#[ignore = "set RTDB_TEST_SERVER_URL + RTDB_TEST_ADMIN_KEY and run with --ignored"]
+async fn admin_control_plane() {
+    let Some((url, admin_key)) = env() else {
+        return;
+    };
+    let admin = RtDbHttpClient::new(&url, "", &admin_key);
+    let new_db = format!("t{}", common::uuid_v7());
+
+    admin.create_db(&new_db).await.unwrap();
+
+    let schema: par_rt_db_client::SchemaDef =
+        serde_json::from_value(json!({"tables":{"notes":{"fields":{"body":{"type":"string"}}}}}))
+            .unwrap();
+    admin.push_schema(&new_db, &schema).await.unwrap();
+
+    let minted = admin.mint_token(&new_db, "live").await.unwrap();
+    assert!(!minted.token.is_empty());
+    assert!(!minted.token_id.is_empty());
+
+    let dbs = admin.list_dbs().await.unwrap();
+    assert!(dbs.contains(&new_db), "list_dbs missing freshly created db");
+
+    admin.allowlist_add(&new_db, "x@y.com").await.unwrap();
+    let emails = admin.allowlist_list(&new_db).await.unwrap();
+    assert!(
+        emails.contains(&"x@y.com".to_string()),
+        "allowlist_list missing added email"
+    );
+
+    let jsonl = admin.export_db(&new_db).await.unwrap();
+    assert!(!jsonl.is_empty());
+    assert!(
+        jsonl.contains("\"kind\":\"schema\""),
+        "export_db should start with the schema line"
+    );
+
+    admin.revoke_token(&minted.token_id).await.unwrap();
+}

@@ -116,7 +116,7 @@ async fn post<B: Serialize, R: for<'de> Deserialize<'de>>(
 }
 
 // Minimal unique suffix without pulling `uuid` into the harness.
-fn uuid_v7() -> String {
+pub fn uuid_v7() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)

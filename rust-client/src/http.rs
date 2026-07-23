@@ -155,6 +155,197 @@ impl RtDbHttpClient {
     }
 }
 
+/// Admin control-plane methods (`/admin/*`). The client's bearer token must be
+/// the instance admin key for these to authorize (constant-time compared server
+/// side, same as every other bearer call). Gated on the `admin` feature, which
+/// implies `http`. Mirrors `ts-client`'s `RtDbAdminClient` one-to-one — paths,
+/// bodies, and return shapes are identical; only the method names are snake_cased.
+#[cfg(feature = "admin")]
+impl RtDbHttpClient {
+    /// `POST /admin/create-db` `{name}` → `{ok:true}`.
+    pub async fn create_db(&self, name: &str) -> Result<(), RtDbError> {
+        let resp = self
+            .post_json(
+                "/admin/create-db",
+                &crate::wire::admin::CreateDbRequest { name },
+            )
+            .await?;
+        self.expect_ok(resp).await
+    }
+
+    /// `POST /admin/push-schema` `{db, schema}` → `{ok:true}`.
+    pub async fn push_schema(
+        &self,
+        db: &str,
+        schema: &crate::schema::SchemaDef,
+    ) -> Result<(), RtDbError> {
+        let resp = self
+            .post_json(
+                "/admin/push-schema",
+                &crate::wire::admin::PushSchemaRequest { db, schema },
+            )
+            .await?;
+        self.expect_ok(resp).await
+    }
+
+    /// `GET /admin/dbs` → `{databases:[...]}`.
+    pub async fn list_dbs(&self) -> Result<Vec<String>, RtDbError> {
+        let parsed: crate::wire::admin::DatabasesResponse =
+            self.get_json("/admin/dbs", &[]).await?;
+        Ok(parsed.databases)
+    }
+
+    /// `POST /admin/mint-token` `{db, name}` → `{tokenId, token}`.
+    pub async fn mint_token(
+        &self,
+        db: &str,
+        name: &str,
+    ) -> Result<crate::wire::admin::MintedToken, RtDbError> {
+        let resp = self
+            .post_json(
+                "/admin/mint-token",
+                &crate::wire::admin::MintTokenRequest { db, name },
+            )
+            .await?;
+        self.deserialize::<crate::wire::admin::MintedToken>(resp)
+            .await
+    }
+
+    /// `POST /admin/revoke-token` `{tokenId}` → `{ok:true}`.
+    pub async fn revoke_token(&self, token_id: &str) -> Result<(), RtDbError> {
+        let resp = self
+            .post_json(
+                "/admin/revoke-token",
+                &crate::wire::admin::RevokeTokenRequest { token_id },
+            )
+            .await?;
+        self.expect_ok(resp).await
+    }
+
+    /// `POST /admin/allowlist` `{db, action:"add", email}` → `{ok:true}`.
+    pub async fn allowlist_add(&self, db: &str, email: &str) -> Result<(), RtDbError> {
+        let resp = self
+            .post_json(
+                "/admin/allowlist",
+                &crate::wire::admin::AllowlistWriteRequest {
+                    db,
+                    action: "add",
+                    email,
+                },
+            )
+            .await?;
+        self.expect_ok(resp).await
+    }
+
+    /// `POST /admin/allowlist` `{db, action:"remove", email}` → `{ok:true}`.
+    pub async fn allowlist_remove(&self, db: &str, email: &str) -> Result<(), RtDbError> {
+        let resp = self
+            .post_json(
+                "/admin/allowlist",
+                &crate::wire::admin::AllowlistWriteRequest {
+                    db,
+                    action: "remove",
+                    email,
+                },
+            )
+            .await?;
+        self.expect_ok(resp).await
+    }
+
+    /// `GET /admin/allowlist?db=<db>` → `{emails:[...]}`.
+    pub async fn allowlist_list(&self, db: &str) -> Result<Vec<String>, RtDbError> {
+        let parsed: crate::wire::admin::AllowlistListResponse =
+            self.get_json("/admin/allowlist", &[("db", db)]).await?;
+        Ok(parsed.emails)
+    }
+
+    /// `GET /admin/export-db?db=<db>` → the database's schema + every document as
+    /// JSONL text (see server `snapshot::export_database`).
+    pub async fn export_db(&self, db: &str) -> Result<String, RtDbError> {
+        let resp = self
+            .client
+            .get(format!("{}/admin/export-db", self.url))
+            .bearer_auth(&self.token)
+            .query(&[("db", db)])
+            .send()
+            .await
+            .map_err(|e| RtDbError::internal(format!("export_db request failed: {e}")))?;
+        let status = resp.status();
+        if status.is_success() {
+            return resp
+                .text()
+                .await
+                .map_err(|e| RtDbError::internal(format!("invalid export body: {e}")));
+        }
+        Err(self.error_response(resp).await)
+    }
+
+    /// `POST /admin/import-db?db=<db>` with an `application/x-ndjson` body of a
+    /// snapshot produced by [`export_db`](Self::export_db) (see server
+    /// `snapshot::import_database`).
+    pub async fn import_db(&self, db: &str, jsonl: &str) -> Result<(), RtDbError> {
+        let resp = self
+            .client
+            .post(format!("{}/admin/import-db", self.url))
+            .bearer_auth(&self.token)
+            .query(&[("db", db)])
+            .header(reqwest::header::CONTENT_TYPE, "application/x-ndjson")
+            .body(jsonl.to_string())
+            .send()
+            .await
+            .map_err(|e| RtDbError::internal(format!("import_db request failed: {e}")))?;
+        self.expect_ok(resp).await
+    }
+
+    async fn post_json<Req: Serialize>(
+        &self,
+        path: &str,
+        body: &Req,
+    ) -> Result<reqwest::Response, RtDbError> {
+        self.client
+            .post(format!("{}{}", self.url, path))
+            .bearer_auth(&self.token)
+            .json(body)
+            .send()
+            .await
+            .map_err(|e| RtDbError::internal(format!("admin request failed: {e}")))
+    }
+
+    async fn get_json<Resp: DeserializeOwned>(
+        &self,
+        path: &str,
+        query: &[(&str, &str)],
+    ) -> Result<Resp, RtDbError> {
+        let resp = self
+            .client
+            .get(format!("{}{}", self.url, path))
+            .bearer_auth(&self.token)
+            .query(query)
+            .send()
+            .await
+            .map_err(|e| RtDbError::internal(format!("admin request failed: {e}")))?;
+        self.deserialize::<Resp>(resp).await
+    }
+
+    async fn expect_ok(&self, resp: reqwest::Response) -> Result<(), RtDbError> {
+        let parsed: crate::wire::admin::OkResponse = self.deserialize(resp).await?;
+        if !parsed.ok {
+            return Err(RtDbError::internal("admin request returned ok=false"));
+        }
+        Ok(())
+    }
+
+    async fn error_response(&self, resp: reqwest::Response) -> RtDbError {
+        let status = resp.status();
+        match resp.json::<ErrorEnvelope>().await {
+            Ok(env) => RtDbError::from_envelope(env),
+            Err(_) => {
+                RtDbError::internal(format!("request failed with status {}", status.as_u16()))
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -300,5 +491,194 @@ mod tests {
         let user = client.auth_me().await.unwrap();
         assert_eq!(user.kind, "user");
         assert_eq!(user.email.as_deref(), Some("a@b.com"));
+    }
+}
+
+/// Mirrors `ts-client/tests/admin.test.ts`: each method posts/gets the right
+/// path with the admin-key bearer, the right body shape, and returns the right
+/// type. `wiremock` matchers assert the on-the-wire request; `#[ignore]`-free
+/// because they hit a mock, not a real server.
+#[cfg(all(test, feature = "admin"))]
+mod admin_tests {
+    use super::RtDbHttpClient;
+    use crate::error::ErrorCode;
+    use crate::schema::{FieldType, SchemaDef, Table};
+    use serde_json::json;
+    use wiremock::matchers::{
+        body_partial_json, body_string_contains, header, method, path, query_param,
+    };
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // Admin methods authorize via the bearer, so the token passed to the client
+    // is the instance admin key here — same field as every other call.
+    const BEARER: &str = "Bearer admin-key";
+
+    async fn setup() -> (MockServer, RtDbHttpClient) {
+        let server = MockServer::start().await;
+        let client = RtDbHttpClient::new(server.uri().as_str(), "kanban", "admin-key");
+        (server, client)
+    }
+
+    #[tokio::test]
+    async fn create_db_posts_name() {
+        let (server, client) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/admin/create-db"))
+            .and(header("authorization", BEARER))
+            .and(body_partial_json(json!({"name": "kanban"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+            .mount(&server)
+            .await;
+        client.create_db("kanban").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn push_schema_serializes_schema_json() {
+        let (server, client) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/admin/push-schema"))
+            .and(header("authorization", BEARER))
+            .and(body_partial_json(json!({
+                "db": "kanban",
+                "schema": {"tables": {"notes": {"fields": {"body": {"type": "string"}}}}}
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+            .mount(&server)
+            .await;
+        let schema = SchemaDef::builder()
+            .table("notes", Table::new().field("body", FieldType::String))
+            .build();
+        client.push_schema("kanban", &schema).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_dbs_returns_databases() {
+        let (server, client) = setup().await;
+        Mock::given(method("GET"))
+            .and(path("/admin/dbs"))
+            .and(header("authorization", BEARER))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"databases": ["kanban", "demo"]})),
+            )
+            .mount(&server)
+            .await;
+        let dbs = client.list_dbs().await.unwrap();
+        assert_eq!(dbs, vec!["kanban".to_string(), "demo".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn mint_token_returns_token_id_and_token() {
+        let (server, client) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/admin/mint-token"))
+            .and(body_partial_json(json!({"db": "kanban", "name": "cli"})))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"tokenId": "id1", "token": "secret"})),
+            )
+            .mount(&server)
+            .await;
+        let minted = client.mint_token("kanban", "cli").await.unwrap();
+        assert_eq!(minted.token_id, "id1");
+        assert_eq!(minted.token, "secret");
+    }
+
+    #[tokio::test]
+    async fn revoke_token_posts_token_id() {
+        let (server, client) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/admin/revoke-token"))
+            .and(body_partial_json(json!({"tokenId": "tid"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+            .mount(&server)
+            .await;
+        client.revoke_token("tid").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn allowlist_add_posts_action() {
+        let (server, client) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/admin/allowlist"))
+            .and(body_partial_json(
+                json!({"db": "kanban", "action": "add", "email": "a@b.com"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+            .mount(&server)
+            .await;
+        client.allowlist_add("kanban", "a@b.com").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn allowlist_remove_posts_action() {
+        let (server, client) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/admin/allowlist"))
+            .and(body_partial_json(
+                json!({"db": "kanban", "action": "remove", "email": "a@b.com"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+            .mount(&server)
+            .await;
+        client.allowlist_remove("kanban", "a@b.com").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn allowlist_list_uses_query_string() {
+        let (server, client) = setup().await;
+        Mock::given(method("GET"))
+            .and(path("/admin/allowlist"))
+            .and(query_param("db", "kanban"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"emails": ["a@b.com"]})))
+            .mount(&server)
+            .await;
+        let emails = client.allowlist_list("kanban").await.unwrap();
+        assert_eq!(emails, vec!["a@b.com".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn export_db_returns_jsonl_text() {
+        let (server, client) = setup().await;
+        let jsonl = "{\"kind\":\"schema\",\"schema\":{\"tables\":{}}}\n";
+        Mock::given(method("GET"))
+            .and(path("/admin/export-db"))
+            .and(query_param("db", "kanban"))
+            .and(header("authorization", BEARER))
+            .respond_with(ResponseTemplate::new(200).set_body_string(jsonl))
+            .mount(&server)
+            .await;
+        let got = client.export_db("kanban").await.unwrap();
+        assert_eq!(got, jsonl);
+    }
+
+    #[tokio::test]
+    async fn export_db_surfaces_error_envelope() {
+        let (server, client) = setup().await;
+        Mock::given(method("GET"))
+            .and(path("/admin/export-db"))
+            .respond_with(
+                ResponseTemplate::new(404)
+                    .set_body_json(json!({"code": "NOT_FOUND", "message": "unknown database"})),
+            )
+            .mount(&server)
+            .await;
+        let err = client.export_db("missing").await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::NotFound);
+        assert_eq!(err.message, "unknown database");
+    }
+
+    #[tokio::test]
+    async fn import_db_posts_ndjson_body() {
+        let (server, client) = setup().await;
+        let jsonl = "{\"kind\":\"schema\",\"schema\":{\"tables\":{}}}\n";
+        Mock::given(method("POST"))
+            .and(path("/admin/import-db"))
+            .and(query_param("db", "kanban"))
+            .and(header("content-type", "application/x-ndjson"))
+            .and(body_string_contains(jsonl))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+            .mount(&server)
+            .await;
+        client.import_db("kanban", jsonl).await.unwrap();
     }
 }

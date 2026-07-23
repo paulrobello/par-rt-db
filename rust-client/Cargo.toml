@@ -11,7 +11,7 @@ repository = "https://github.com/paulrobello/par-rt-db"
 default = ["http"]
 http = ["dep:reqwest"]
 ws = ["dep:tokio", "dep:tokio-tungstenite", "dep:futures-util"]
-admin = ["dep:reqwest"]
+admin = ["http"]
 
 [lints.rust]
 warnings = "deny"

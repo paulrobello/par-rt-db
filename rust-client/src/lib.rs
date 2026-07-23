@@ -18,3 +18,6 @@ pub use wire::{AuthedUser, ClientMessage, ServerMessage};
 
 #[cfg(feature = "http")]
 pub use http::RtDbHttpClient;
+
+#[cfg(feature = "admin")]
+pub use wire::admin::MintedToken;
