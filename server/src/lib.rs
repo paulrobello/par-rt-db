@@ -10,6 +10,7 @@ pub mod mutation_log;
 pub mod pagination;
 pub mod protocol;
 pub mod query;
+pub mod scheduler;
 pub mod schema;
 pub mod snapshot;
 pub mod subs;
