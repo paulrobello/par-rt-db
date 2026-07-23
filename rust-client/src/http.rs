@@ -1,7 +1,7 @@
 //! One-shot HTTP client for par-rt-db. `Authorization: Bearer <token>` on every call.
 
 use crate::error::{ErrorEnvelope, RtDbError, retry_on_precondition};
-use crate::mutation::{StepResult, Transaction};
+use crate::mutation::{Mutation, StepResult, Transaction};
 use crate::query::{TableQuery, parse_result};
 use crate::wire::AuthedUser;
 use serde::Serialize;
@@ -68,6 +68,24 @@ impl RtDbHttpClient {
         self.run(TableQuery::get(table, id)).await
     }
 
+    /// Find the single doc matching `value` on `index`, or `None` if no doc
+    /// matches. A thin wrapper over the indexed `eq` query path using the
+    /// `first` terminal (server runs `LIMIT 1`), so it returns at most one doc
+    /// and never errors on duplicate matches. On a unique index this is
+    /// exactly-one semantics; on a non-unique index it returns one of the
+    /// matches deterministically (by index order, then creation time, then id).
+    pub async fn find_one_by_index<T: DeserializeOwned>(
+        &self,
+        table: &str,
+        index: &str,
+        value: impl Into<serde_json::Value>,
+    ) -> Result<Option<T>, RtDbError> {
+        let query = TableQuery::new(table)
+            .with_index(index, &[value.into()])
+            .first();
+        self.run::<Option<T>>(query).await
+    }
+
     /// Run a transaction; returns one `StepResult` per step.
     pub async fn mutate(
         &self,
@@ -108,6 +126,32 @@ impl RtDbHttpClient {
                     .map_err(|e| RtDbError::internal(format!("invalid step result: {e}")))
             })
             .collect()
+    }
+
+    /// Upsert by index-field value: builds a one-step transaction that matches
+    /// `value` on `index` — match → patch the provided fields, no match → insert
+    /// — and runs it via [`mutate`](Self::mutate). Returns the resulting doc id
+    /// and whether it was inserted, as a [`StepResult::Upsert`].
+    ///
+    /// The server's upsert step requires the `eq` value to cover the index's
+    /// full arity (a single value fits a single-field index). If more than one
+    /// doc matches it rejects with `PRECONDITION_FAILED`; the helper surfaces
+    /// that error rather than retrying, since it is not a transient conflict.
+    pub async fn upsert_by_index(
+        &self,
+        table: &str,
+        index: &str,
+        value: impl Into<serde_json::Value>,
+        insert: serde_json::Value,
+        patch: serde_json::Value,
+    ) -> Result<StepResult, RtDbError> {
+        let txn = Mutation::new()
+            .upsert(table, index, &[value.into()], insert, patch)
+            .build();
+        let mut results = self.mutate(&txn, None).await?;
+        results
+            .pop()
+            .ok_or_else(|| RtDbError::internal("upsert returned no result"))
     }
 
     /// Read-modify-write a single document with optimistic-concurrency retry.
@@ -425,7 +469,7 @@ mod tests {
     use crate::mutation::Mutation;
     use crate::query::TableQuery;
     use serde_json::{Value, json};
-    use wiremock::matchers::{header, method, path};
+    use wiremock::matchers::{body_partial_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn doc(id: &str) -> Value {
@@ -762,6 +806,138 @@ mod tests {
         assert_eq!(err.message, "version mismatch");
         // `max_attempts = 3` → initial attempt plus 2 retries, then give up.
         assert_eq!(mutate_calls.load(Ordering::SeqCst), 3);
+    }
+
+    // `find_one_by_index` and `upsert_by_index` are thin wrappers over the
+    // query/mutate paths, so these tests assert both the on-the-wire request
+    // (the `first` terminal / the one-step upsert) and the parsed result.
+
+    #[tokio::test]
+    async fn find_one_by_index_hit_returns_doc() {
+        let (server, client) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/api/query"))
+            .and(body_partial_json(json!({
+                "query": {
+                    "table": "users",
+                    "index": "by_email",
+                    "eq": ["a@b.com"],
+                    "first": true
+                }
+            })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"result": {"_id": "u1", "email": "a@b.com", "n": 1}})),
+            )
+            .mount(&server)
+            .await;
+        let got: Option<Value> = client
+            .find_one_by_index("users", "by_email", "a@b.com")
+            .await
+            .unwrap();
+        let doc = got.expect("expected a matching doc");
+        assert_eq!(doc.get("email").and_then(Value::as_str), Some("a@b.com"));
+    }
+
+    #[tokio::test]
+    async fn find_one_by_index_miss_returns_none() {
+        let (server, client) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/api/query"))
+            .and(body_partial_json(json!({
+                "query": {
+                    "table": "users",
+                    "index": "by_email",
+                    "eq": ["none@x.com"],
+                    "first": true
+                }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"result": null})))
+            .mount(&server)
+            .await;
+        let got: Option<Value> = client
+            .find_one_by_index("users", "by_email", "none@x.com")
+            .await
+            .unwrap();
+        assert!(got.is_none());
+    }
+
+    #[tokio::test]
+    async fn upsert_by_index_inserts_when_no_match() {
+        let (server, client) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/api/mutate"))
+            .and(body_partial_json(json!({
+                "txn": {
+                    "steps": [{
+                        "op": "upsert",
+                        "table": "users",
+                        "index": "by_email",
+                        "eq": ["a@b.com"],
+                        "insert": {"email": "a@b.com"},
+                        "patch": {"n": 1}
+                    }]
+                }
+            })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"results": [{"id": "new1", "inserted": true}]})),
+            )
+            .mount(&server)
+            .await;
+        let res = client
+            .upsert_by_index(
+                "users",
+                "by_email",
+                "a@b.com",
+                json!({"email": "a@b.com"}),
+                json!({"n": 1}),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            res,
+            crate::mutation::StepResult::Upsert { ref id, inserted: true } if id == "new1"
+        ));
+    }
+
+    #[tokio::test]
+    async fn upsert_by_index_patches_when_match() {
+        let (server, client) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/api/mutate"))
+            .and(body_partial_json(json!({
+                "txn": {
+                    "steps": [{
+                        "op": "upsert",
+                        "table": "users",
+                        "index": "by_email",
+                        "eq": ["a@b.com"],
+                        "insert": {"email": "a@b.com"},
+                        "patch": {"n": 2}
+                    }]
+                }
+            })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"results": [{"id": "u1", "inserted": false}]})),
+            )
+            .mount(&server)
+            .await;
+        let res = client
+            .upsert_by_index(
+                "users",
+                "by_email",
+                "a@b.com",
+                json!({"email": "a@b.com"}),
+                json!({"n": 2}),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            res,
+            crate::mutation::StepResult::Upsert { ref id, inserted: false } if id == "u1"
+        ));
     }
 }
 
