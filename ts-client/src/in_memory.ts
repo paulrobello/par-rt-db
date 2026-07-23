@@ -7,6 +7,8 @@ import type {
   Paginate,
   PaginatedResultJson,
   QueryJson,
+  ScheduleInfo,
+  ScheduleWhen,
   SchemaJson,
   TableJson,
   TransactionJson,
@@ -62,6 +64,27 @@ interface Subscription {
   last: unknown;
   hasValue: boolean;
 }
+
+/** Mirrors server schedule status values. */
+type ScheduleStatus = "pending" | "running" | "paused" | "error";
+
+/** A stored scheduled job in the in-memory harness. `tick` fires due non-paused
+ * jobs by applying `txn` through the same atomic path as `mutate`. */
+interface ScheduledJob {
+  id: string;
+  kind: "oneshot" | "cron";
+  txn: TransactionJson;
+  dueAt: number;
+  cron?: string;
+  status: ScheduleStatus;
+  createdAt: number;
+  firedCount: number;
+  lastError?: string;
+}
+
+/** Approximate cron re-fire interval for the in-memory stub. Real 5-field cron
+ * parsing is deferred to the server; the harness only needs crons to re-arm. */
+const CRON_STEP_MS = 60_000;
 
 export interface InMemoryRtDbClientOptions {
   /** Injectable clock (epoch ms) for deterministic `_creationTime` and id minting. */
@@ -330,6 +353,7 @@ export class InMemoryRtDbClient {
   private readonly tables = new Map<string, Map<string, StoredRow>>();
   private readonly idempotency = new Map<string, unknown[]>();
   private readonly subs: Subscription[] = [];
+  private readonly schedules = new Map<string, ScheduledJob>();
 
   constructor(options: InMemoryRtDbClientOptions = {}) {
     this.now = options.now ?? (() => Date.now());
@@ -362,10 +386,20 @@ export class InMemoryRtDbClient {
         return clone(cached);
       }
     }
+    const results = this.executeTransaction(txn);
+    if (opts?.mutId) {
+      this.idempotency.set(opts.mutId, clone(results));
+    }
+    return results;
+  }
+
+  /** Synchronous atomic core shared by `mutate` and `tick`'s scheduled fires:
+   * enforces the step cap, snapshots, applies every step (rolling back the
+   * whole txn on any error), then notifies subscriptions. */
+  private executeTransaction(txn: TransactionJson): unknown[] {
     if (txn.steps.length > MAX_STEPS) {
       throw new RtDbError("BAD_REQUEST", `transaction exceeds maximum of ${MAX_STEPS} steps`);
     }
-
     const snapshot = this.snapshotTables();
     const results: unknown[] = [];
     const writeSet = new Set<string>();
@@ -381,10 +415,6 @@ export class InMemoryRtDbClient {
       // Atomicity: any step's error rolls back everything already applied.
       this.restoreTables(snapshot);
       throw error;
-    }
-
-    if (opts?.mutId) {
-      this.idempotency.set(opts.mutId, clone(results));
     }
     this.notifySubs(writeSet);
     return results;
@@ -415,6 +445,113 @@ export class InMemoryRtDbClient {
         this.subs.splice(index, 1);
       }
     };
+  }
+
+  // ---- schedules ------------------------------------------------------------
+
+  /** Stores `txn` scheduled for `when` and returns its id. Cron validation is
+   * deferred to the live server; the harness accepts any expression. */
+  async schedule(txn: TransactionJson, when: ScheduleWhen): Promise<{ id: string }> {
+    const id = this.newId();
+    const now = this.now();
+    const job: ScheduledJob = {
+      id,
+      kind: when.type === "cron" ? "cron" : "oneshot",
+      txn,
+      dueAt: this.dueAtFor(when, now),
+      status: "pending",
+      createdAt: now,
+      firedCount: 0,
+    };
+    if (when.type === "cron") {
+      job.cron = when.expr;
+    }
+    this.schedules.set(id, job);
+    return { id };
+  }
+
+  async cancelSchedule(id: string): Promise<void> {
+    if (!this.schedules.delete(id)) {
+      throw new RtDbError("NOT_FOUND", `schedule '${id}' not found`);
+    }
+  }
+
+  async pauseSchedule(id: string): Promise<void> {
+    this.requireSchedule(id).status = "paused";
+  }
+
+  async resumeSchedule(id: string): Promise<void> {
+    this.requireSchedule(id).status = "pending";
+  }
+
+  async listSchedules(): Promise<ScheduleInfo[]> {
+    return [...this.schedules.values()].map((job) => this.toScheduleInfo(job));
+  }
+
+  /** Fires every due non-paused job by applying its txn through the same atomic
+   * path as `mutate` (so reactive subscriptions see the write). One-shots are
+   * removed after a successful fire; crons are re-armed. Pass `nowMs` to drive
+   * the clock deterministically; omit it to use the client's injected clock. */
+  tick(nowMs?: number): void {
+    const now = nowMs ?? this.now();
+    for (const job of this.schedules.values()) {
+      if (job.status === "paused" || job.dueAt > now) {
+        continue;
+      }
+      try {
+        this.executeTransaction(job.txn);
+        job.firedCount++;
+        if (job.kind === "oneshot") {
+          this.schedules.delete(job.id);
+        } else {
+          job.dueAt = now + CRON_STEP_MS;
+          job.status = "pending";
+        }
+      } catch (e) {
+        job.status = "error";
+        job.lastError = e instanceof Error ? e.message : String(e);
+        if (job.kind === "cron") {
+          job.dueAt = now + CRON_STEP_MS;
+        }
+      }
+    }
+  }
+
+  private dueAtFor(when: ScheduleWhen, now: number): number {
+    switch (when.type) {
+      case "afterMs":
+        return now + when.ms;
+      case "runAt":
+        return when.ms;
+      case "cron":
+        return now + CRON_STEP_MS;
+    }
+  }
+
+  private requireSchedule(id: string): ScheduledJob {
+    const job = this.schedules.get(id);
+    if (!job) {
+      throw new RtDbError("NOT_FOUND", `schedule '${id}' not found`);
+    }
+    return job;
+  }
+
+  private toScheduleInfo(job: ScheduledJob): ScheduleInfo {
+    const info: ScheduleInfo = {
+      id: job.id,
+      kind: job.kind,
+      dueAt: job.dueAt,
+      status: job.status,
+      createdAt: job.createdAt,
+      firedCount: job.firedCount,
+    };
+    if (job.cron !== undefined) {
+      info.cron = job.cron;
+    }
+    if (job.lastError !== undefined) {
+      info.lastError = job.lastError;
+    }
+    return info;
   }
 
   // ---- transaction execution -------------------------------------------------

@@ -145,6 +145,113 @@ describe("RtDbClient", () => {
     });
   });
 
+  it("resolves schedule({id}) on scheduleOk and rejects on scheduleErr", async () => {
+    const { client, sockets } = newClient();
+    client.connect();
+    sockets[0].open();
+    sockets[0].deliver({ type: "authOk", user: { kind: "machine" } });
+
+    const okPromise = client.schedule(
+      { steps: [{ op: "insert", table: "items", doc: {} }] },
+      { type: "afterMs", ms: 1000 },
+    );
+    const okFrame = frames(sockets[0]).find((m) => m.type === "schedule") as unknown as {
+      scheduleId: string;
+      when: unknown;
+      txn: unknown;
+    };
+    expect(okFrame.when).toEqual({ type: "afterMs", ms: 1000 });
+    expect(okFrame.scheduleId).toMatch(/^sch-\d+$/);
+    sockets[0].deliver({ type: "scheduleOk", scheduleId: okFrame.scheduleId, id: "job-1" });
+    await expect(okPromise).resolves.toEqual({ id: "job-1" });
+
+    const errPromise = client.schedule(
+      { steps: [{ op: "insert", table: "items", doc: {} }] },
+      { type: "cron", expr: "not-valid" },
+    );
+    const errFrame = frames(sockets[0])
+      .filter((m) => m.type === "schedule")
+      .at(-1) as unknown as { scheduleId: string };
+    sockets[0].deliver({
+      type: "scheduleErr",
+      scheduleId: errFrame.scheduleId,
+      error: { code: "BAD_REQUEST", message: "bad cron" },
+    });
+    await expect(errPromise).rejects.toMatchObject({
+      name: "RtDbError",
+      code: "BAD_REQUEST",
+    });
+  });
+
+  it("resolves cancelSchedule on scheduleAck.ok:true and rejects on ok:false", async () => {
+    const { client, sockets } = newClient();
+    client.connect();
+    sockets[0].open();
+    sockets[0].deliver({ type: "authOk", user: { kind: "machine" } });
+
+    const okPromise = client.cancelSchedule("job-1");
+    const okFrame = frames(sockets[0]).find((m) => m.type === "cancelSchedule") as unknown as {
+      scheduleId: string;
+      id: string;
+    };
+    expect(okFrame.id).toBe("job-1");
+    sockets[0].deliver({ type: "scheduleAck", scheduleId: okFrame.scheduleId, ok: true });
+    await expect(okPromise).resolves.toBeUndefined();
+
+    const errPromise = client.pauseSchedule("job-missing");
+    const errFrame = frames(sockets[0]).find((m) => m.type === "pauseSchedule") as unknown as {
+      scheduleId: string;
+    };
+    sockets[0].deliver({
+      type: "scheduleAck",
+      scheduleId: errFrame.scheduleId,
+      ok: false,
+      error: { code: "NOT_FOUND", message: "no such schedule" },
+    });
+    await expect(errPromise).rejects.toMatchObject({ name: "RtDbError", code: "NOT_FOUND" });
+  });
+
+  it("resolves listSchedules with the schedules array on listSchedulesOk", async () => {
+    const { client, sockets } = newClient();
+    client.connect();
+    sockets[0].open();
+    sockets[0].deliver({ type: "authOk", user: { kind: "machine" } });
+
+    const listPromise = client.listSchedules();
+    const frame = frames(sockets[0]).find((m) => m.type === "listSchedules") as unknown as {
+      scheduleId: string;
+    };
+    const schedules = [
+      {
+        id: "job-1",
+        kind: "oneshot",
+        dueAt: 5,
+        status: "pending",
+        createdAt: 1,
+        firedCount: 0,
+      },
+    ];
+    sockets[0].deliver({ type: "listSchedulesOk", scheduleId: frame.scheduleId, schedules });
+    await expect(listPromise).resolves.toEqual(schedules);
+  });
+
+  it("rejects in-flight schedules on close() and schedule() issued after close()", async () => {
+    const { client, sockets } = newClient();
+    client.connect();
+    sockets[0].open();
+    sockets[0].deliver({ type: "authOk", user: { kind: "machine" } });
+
+    const inFlight = client.schedule(
+      { steps: [{ op: "insert", table: "items", doc: {} }] },
+      { type: "afterMs", ms: 1000 },
+    );
+    client.close();
+    await expect(inFlight).rejects.toMatchObject({ name: "RtDbError", code: "INTERNAL" });
+    await expect(
+      client.schedule({ steps: [] }, { type: "afterMs", ms: 1000 }),
+    ).rejects.toMatchObject({ code: "INTERNAL" });
+  });
+
   it("sends opts.mutId as idempotencyKey, keeping mutId as the internal correlation id", () => {
     const { client, sockets } = newClient();
     client.connect();

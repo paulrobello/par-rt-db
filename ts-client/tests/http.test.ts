@@ -47,6 +47,86 @@ describe("RtDbHttpClient", () => {
     expect(fetchMock.mock.calls[0][0]).toBe("http://h:8300/api/mutate");
   });
 
+  it("posts a schedule with db + when + txn and returns {id}", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ id: "job-1" }));
+    const client = new RtDbHttpClient({
+      url: "http://h:8300",
+      db: "kanban",
+      token: "tok",
+      fetch: fetchMock,
+    });
+
+    const txn = mutation().insert("items", { title: "x" }).build();
+    const result = await client.schedule(txn, { type: "afterMs", ms: 5000 });
+
+    expect(result).toEqual({ id: "job-1" });
+    const [calledUrl, init] = fetchMock.mock.calls[0];
+    expect(calledUrl).toBe("http://h:8300/api/schedule");
+    expect(init.method).toBe("POST");
+    expect(init.headers.Authorization).toBe("Bearer tok");
+    expect(JSON.parse(init.body)).toEqual({
+      db: "kanban",
+      when: { type: "afterMs", ms: 5000 },
+      txn,
+    });
+  });
+
+  it("posts cancel/pause/resume to the per-id routes and returns void on success", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(jsonResponse({ ok: true }))
+      .mockResolvedValueOnce(jsonResponse({ ok: true }))
+      .mockResolvedValueOnce(jsonResponse({ ok: true }))
+      .mockResolvedValueOnce(jsonResponse({ ok: true }));
+    const client = new RtDbHttpClient({
+      url: "http://h:8300",
+      db: "kanban",
+      token: "tok",
+      fetch: fetchMock,
+    });
+
+    await client.cancelSchedule("job-1");
+    await client.pauseSchedule("job-1");
+    await client.resumeSchedule("job-1");
+
+    const routes = fetchMock.mock.calls.map((c) => c[0]);
+    expect(routes).toEqual([
+      "http://h:8300/api/schedule/job-1/cancel",
+      "http://h:8300/api/schedule/job-1/pause",
+      "http://h:8300/api/schedule/job-1/resume",
+    ]);
+    for (const [, init] of fetchMock.mock.calls) {
+      expect(JSON.parse(init.body)).toEqual({ db: "kanban" });
+    }
+  });
+
+  it("posts listSchedules and returns the schedules array", async () => {
+    const schedules = [
+      {
+        id: "job-1",
+        kind: "oneshot",
+        dueAt: 5,
+        status: "pending",
+        createdAt: 1,
+        firedCount: 0,
+      },
+    ];
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ schedules }));
+    const client = new RtDbHttpClient({
+      url: "http://h:8300",
+      db: "kanban",
+      token: "tok",
+      fetch: fetchMock,
+    });
+
+    const result = await client.listSchedules();
+
+    expect(result).toEqual(schedules);
+    const [calledUrl, init] = fetchMock.mock.calls[0];
+    expect(calledUrl).toBe("http://h:8300/api/schedules");
+    expect(JSON.parse(init.body)).toEqual({ db: "kanban" });
+  });
+
   it("forwards opts.mutId as idempotencyKey in the request body when provided", async () => {
     const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ results: ["new-id"] }));
     const client = new RtDbHttpClient({

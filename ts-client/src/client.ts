@@ -4,6 +4,8 @@ import type {
   AuthedUser,
   ClientMessage,
   QueryJson,
+  ScheduleInfo,
+  ScheduleWhen,
   ServerMessage,
   TransactionJson,
 } from "./protocol.js";
@@ -67,6 +69,25 @@ interface QueuedMutate extends PendingMutate {
   txn: TransactionJson;
 }
 
+/** The ClientMessage a schedule call will send once authenticated, carried while
+ * queued so `flushOnAuth` can dispatch it verbatim. */
+type ScheduleMsg =
+  | { kind: "schedule"; when: ScheduleWhen; txn: TransactionJson }
+  | { kind: "cancel"; id: string }
+  | { kind: "pause"; id: string }
+  | { kind: "resume"; id: string }
+  | { kind: "list" };
+
+/** A schedule call awaiting its server reply (resolve/reject plus the message
+ * to send). Queued while unauthenticated; once dispatched, only the handlers
+ * remain tracked in `pendingSchedules` keyed by `scheduleId`. */
+interface QueuedSchedule {
+  scheduleId: string;
+  msg: ScheduleMsg;
+  resolve: (value: unknown) => void;
+  reject: (error: RtDbError) => void;
+}
+
 const DEFAULT_BACKOFF = { baseMs: 500, maxMs: 15_000 };
 const DEFAULT_HEARTBEAT_MS = 20_000;
 /**
@@ -111,6 +132,8 @@ export class RtDbClient {
   private readonly subsById = new Map<string, Subscription>();
   private readonly pendingMutates = new Map<string, PendingMutate>();
   private readonly unsentMutates: QueuedMutate[] = [];
+  private readonly pendingSchedules = new Map<string, QueuedSchedule>();
+  private readonly unsentSchedules: QueuedSchedule[] = [];
   private readonly authListeners = new Set<(state: AuthState, user: AuthedUser | null) => void>();
   /** mutId → subscriptions whose last result this mutation optimistically overlaid. */
   private readonly optimisticOverlays = new Map<string, Set<Subscription>>();
@@ -159,6 +182,7 @@ export class RtDbClient {
     this.connState = "closed";
     this.setAuthState("unauthenticated");
     this.rejectAllMutates("client is closed");
+    this.rejectAllSchedules("client is closed");
     // Drop any overlay left by mutations that already resolved but whose
     // reconciling queryUpdate will now never arrive (no notify — the client is
     // closing). The state is reset to the last authoritative value.
@@ -180,6 +204,7 @@ export class RtDbClient {
     // A fresh credential invalidates every in-flight mutation and any pending
     // reconnect; `openSocket` tears down the old socket without a reconnect.
     this.rejectAllMutates("connection reset for re-authentication");
+    this.rejectAllSchedules("connection reset for re-authentication");
     this.reconnectAttempt = 0;
     this.setAuthState("authenticating");
     this.openSocket();
@@ -267,6 +292,87 @@ export class RtDbClient {
         this.unsentMutates.push(entry);
       }
     });
+  }
+
+  /** Schedules `txn` for `when`. Resolves with the new schedule `{id}` on
+   * `scheduleOk`; rejects with `RtDbError` on `scheduleErr` (e.g. a bad cron
+   * expression — the server validates cron). While unauthenticated, the request
+   * queues and fires on the next `authOk`, mirroring `mutate`. */
+  schedule(txn: TransactionJson, when: ScheduleWhen): Promise<{ id: string }> {
+    return this.queueSchedule<{ id: string }>({ kind: "schedule", when, txn });
+  }
+
+  /** Cancels a scheduled job. Resolves on `scheduleAck.ok:true`; rejects with
+   * `RtDbError` when the server returns `ok:false` (e.g. unknown id). */
+  cancelSchedule(id: string): Promise<void> {
+    return this.queueSchedule<void>({ kind: "cancel", id });
+  }
+
+  /** Pauses a scheduled job until `resumeSchedule`. Same ack contract as
+   * `cancelSchedule`. */
+  pauseSchedule(id: string): Promise<void> {
+    return this.queueSchedule<void>({ kind: "pause", id });
+  }
+
+  /** Resumes a paused scheduled job. Same ack contract as `cancelSchedule`. */
+  resumeSchedule(id: string): Promise<void> {
+    return this.queueSchedule<void>({ kind: "resume", id });
+  }
+
+  /** Lists scheduled jobs. Resolves with the `schedules` array on
+   * `listSchedulesOk`. */
+  listSchedules(): Promise<ScheduleInfo[]> {
+    return this.queueSchedule<ScheduleInfo[]>({ kind: "list" });
+  }
+
+  /** Mints a `sch-${n}` correlation id and either dispatches (when authenticated)
+   * or queues the request for the next `authOk`, exactly like `mutate`. */
+  private queueSchedule<T>(msg: ScheduleMsg): Promise<T> {
+    const scheduleId = `sch-${++this.counter}`;
+    return new Promise<T>((resolve, reject) => {
+      if (this.stopped) {
+        reject(new RtDbError("INTERNAL", "client is closed"));
+        return;
+      }
+      const entry: QueuedSchedule = {
+        scheduleId,
+        msg,
+        resolve: resolve as (value: unknown) => void,
+        reject,
+      };
+      if (this.authState === "authenticated" && this.socket) {
+        this.dispatchSchedule(entry);
+      } else {
+        // Never sent yet: flush once on the next authOk. Not a retry.
+        this.unsentSchedules.push(entry);
+      }
+    });
+  }
+
+  private dispatchSchedule(entry: QueuedSchedule): void {
+    this.pendingSchedules.set(entry.scheduleId, entry);
+    switch (entry.msg.kind) {
+      case "schedule":
+        this.send({
+          type: "schedule",
+          scheduleId: entry.scheduleId,
+          when: entry.msg.when,
+          txn: entry.msg.txn,
+        });
+        break;
+      case "cancel":
+        this.send({ type: "cancelSchedule", scheduleId: entry.scheduleId, id: entry.msg.id });
+        break;
+      case "pause":
+        this.send({ type: "pauseSchedule", scheduleId: entry.scheduleId, id: entry.msg.id });
+        break;
+      case "resume":
+        this.send({ type: "resumeSchedule", scheduleId: entry.scheduleId, id: entry.msg.id });
+        break;
+      case "list":
+        this.send({ type: "listSchedules", scheduleId: entry.scheduleId });
+        break;
+    }
   }
 
   /** Projects `txn` onto each subscription's last result and notifies listeners
@@ -450,6 +556,36 @@ export class RtDbClient {
         pending?.reject(RtDbError.fromEnvelope(msg.error));
         break;
       }
+      case "scheduleOk": {
+        const pending = this.pendingSchedules.get(msg.scheduleId);
+        this.pendingSchedules.delete(msg.scheduleId);
+        pending?.resolve({ id: msg.id });
+        break;
+      }
+      case "scheduleErr": {
+        const pending = this.pendingSchedules.get(msg.scheduleId);
+        this.pendingSchedules.delete(msg.scheduleId);
+        pending?.reject(RtDbError.fromEnvelope(msg.error));
+        break;
+      }
+      case "scheduleAck": {
+        const pending = this.pendingSchedules.get(msg.scheduleId);
+        this.pendingSchedules.delete(msg.scheduleId);
+        if (msg.ok) {
+          pending?.resolve(undefined);
+        } else if (msg.error) {
+          pending?.reject(RtDbError.fromEnvelope(msg.error));
+        } else {
+          pending?.reject(new RtDbError("INTERNAL", "schedule operation failed"));
+        }
+        break;
+      }
+      case "listSchedulesOk": {
+        const pending = this.pendingSchedules.get(msg.scheduleId);
+        this.pendingSchedules.delete(msg.scheduleId);
+        pending?.resolve(msg.schedules);
+        break;
+      }
       case "pong":
         this.lastPongAt = this.now();
         break;
@@ -464,6 +600,10 @@ export class RtDbClient {
     for (const entry of queued) {
       this.dispatchMutate(entry);
     }
+    const queuedSchedules = this.unsentSchedules.splice(0);
+    for (const entry of queuedSchedules) {
+      this.dispatchSchedule(entry);
+    }
   }
 
   private handleClose(code: number): void {
@@ -471,6 +611,8 @@ export class RtDbClient {
     this.clearHeartbeat();
     // In-flight (already-sent) mutations are never auto-resent — reject them.
     this.rejectPendingMutates("connection closed before the mutation was acknowledged");
+    // Same for in-flight schedule requests: they are never auto-resent.
+    this.rejectPendingSchedules("connection closed before the schedule was acknowledged");
     if (code === 4401) {
       this.setAuthState("unauthenticated");
       this.connState = "idle"; // an explicit connect() (e.g. after re-login) may revive
@@ -506,6 +648,30 @@ export class RtDbClient {
     const error = new RtDbError("INTERNAL", reason);
     for (const entry of this.unsentMutates.splice(0)) {
       this.revertOptimistic(entry.mutId);
+      entry.reject(error);
+    }
+  }
+
+  /** Rejects only in-flight (sent, unacked) schedule requests; never-sent ones stay queued. */
+  private rejectPendingSchedules(reason: string): void {
+    if (this.pendingSchedules.size === 0) {
+      return;
+    }
+    const error = new RtDbError("INTERNAL", reason);
+    for (const entry of this.pendingSchedules.values()) {
+      entry.reject(error);
+    }
+    this.pendingSchedules.clear();
+  }
+
+  /** Rejects every schedule request — in-flight and never-sent. Used on terminal teardown. */
+  private rejectAllSchedules(reason: string): void {
+    this.rejectPendingSchedules(reason);
+    if (this.unsentSchedules.length === 0) {
+      return;
+    }
+    const error = new RtDbError("INTERNAL", reason);
+    for (const entry of this.unsentSchedules.splice(0)) {
       entry.reject(error);
     }
   }

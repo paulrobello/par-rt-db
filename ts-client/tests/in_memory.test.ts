@@ -3,7 +3,7 @@ import { RtDbError } from "../src/errors.js";
 import { InMemoryRtDbClient } from "../src/in_memory.js";
 import { mutation } from "../src/mutation.js";
 import { decodeCursor, encodeCursor } from "../src/pagination.js";
-import type { PaginatedResultJson } from "../src/protocol.js";
+import type { PaginatedResultJson, ScheduleInfo } from "../src/protocol.js";
 import { createApi, type RtQuery } from "../src/query.js";
 import { defineSchema, defineTable, t } from "../src/schema.js";
 
@@ -27,6 +27,14 @@ function newClient(): InMemoryRtDbClient {
   const client = new InMemoryRtDbClient({ now: () => ms++, random: () => 0 });
   client.pushSchema(schema);
   return client;
+}
+
+/** Fixed (non-incrementing) clock so schedule due-times are stable under `tick`. */
+function newClockClient(): { c: InMemoryRtDbClient; setNow: (t: number) => void } {
+  let ms = 1_700_000_000_000;
+  const c = new InMemoryRtDbClient({ now: () => ms, random: () => 0 });
+  c.pushSchema(schema);
+  return { c, setNow: (t) => (ms = t) };
 }
 
 const HEX_ID = /^[0-9a-f]{32}$/;
@@ -418,5 +426,112 @@ describe("InMemoryRtDbClient — paginate (cursor keyset)", () => {
         json: { table: "items", paginate: { numItems: 3 }, count: true },
       } as RtQuery<PaginatedResultJson>),
     ).rejects.toMatchObject({ name: "RtDbError", code: "BAD_REQUEST", message: /count/ });
+  });
+});
+
+describe("InMemoryRtDbClient — schedules", () => {
+  const insertTxn = mutation().insert("items", { name: "a", status: "todo", order: 1 }).build();
+  const BASE = 1_700_000_000_000;
+
+  it("schedule + tick fires a due one-shot and the write is visible via query", async () => {
+    const { c, setNow } = newClockClient();
+    setNow(BASE);
+    const { id } = await c.schedule(insertTxn, { type: "afterMs", ms: 1000 });
+    expect(id).toMatch(HEX_ID);
+
+    setNow(BASE + 2000); // past the due time
+    c.tick();
+
+    const docs = await c.query(api.items.query().collect());
+    expect(docs).toHaveLength(1);
+    expect((docs[0] as { name: string }).name).toBe("a");
+    // A fired one-shot is removed from the schedule registry.
+    const remaining = await c.listSchedules();
+    expect(remaining.find((s) => s.id === id)).toBeUndefined();
+  });
+
+  it("does not fire a not-yet-due one-shot on tick", async () => {
+    const { c, setNow } = newClockClient();
+    setNow(BASE);
+    await c.schedule(insertTxn, { type: "afterMs", ms: 5000 });
+
+    setNow(BASE + 1000); // before the due time
+    c.tick();
+
+    const docs = await c.query(api.items.query().collect());
+    expect(docs).toHaveLength(0);
+  });
+
+  it("a paused scheduled job does not fire on tick", async () => {
+    const { c, setNow } = newClockClient();
+    setNow(BASE);
+    const { id } = await c.schedule(insertTxn, { type: "afterMs", ms: 1000 });
+    await c.pauseSchedule(id);
+
+    setNow(BASE + 2000); // due, but paused
+    c.tick();
+
+    const docs = await c.query(api.items.query().collect());
+    expect(docs).toHaveLength(0);
+    const info = (await c.listSchedules()).find((s) => s.id === id) as ScheduleInfo;
+    expect(info.status).toBe("paused");
+  });
+
+  it("cancelSchedule removes the job so it does not fire on tick", async () => {
+    const { c, setNow } = newClockClient();
+    setNow(BASE);
+    const { id } = await c.schedule(insertTxn, { type: "afterMs", ms: 1000 });
+    await c.cancelSchedule(id);
+    expect((await c.listSchedules()).find((s) => s.id === id)).toBeUndefined();
+
+    setNow(BASE + 2000);
+    c.tick();
+
+    const docs = await c.query(api.items.query().collect());
+    expect(docs).toHaveLength(0);
+  });
+
+  it("pause then resume lets the job fire on a later tick", async () => {
+    const { c, setNow } = newClockClient();
+    setNow(BASE);
+    const { id } = await c.schedule(insertTxn, { type: "afterMs", ms: 1000 });
+    await c.pauseSchedule(id);
+    setNow(BASE + 2000);
+    c.tick();
+    expect(await c.query(api.items.query().collect())).toHaveLength(0);
+
+    await c.resumeSchedule(id);
+    expect(((await c.listSchedules()).find((s) => s.id === id) as ScheduleInfo).status).toBe(
+      "pending",
+    );
+    c.tick();
+    expect(await c.query(api.items.query().collect())).toHaveLength(1);
+  });
+
+  it("listSchedules returns schedule info with server-aligned status/kind names", async () => {
+    const { c, setNow } = newClockClient();
+    setNow(BASE);
+    const { id } = await c.schedule(insertTxn, { type: "cron", expr: "* * * * *" });
+
+    const list = await c.listSchedules();
+    expect(list).toHaveLength(1);
+    const info = list[0];
+    expect(info.id).toBe(id);
+    expect(info.kind).toBe("cron");
+    expect(info.status).toBe("pending");
+    expect(info.cron).toBe("* * * * *");
+    expect(info.firedCount).toBe(0);
+    expect(typeof info.dueAt).toBe("number");
+    expect(typeof info.createdAt).toBe("number");
+  });
+
+  it("cancel/pause/resume on an unknown id reject with NOT_FOUND", async () => {
+    const { c } = newClockClient();
+    await expect(c.cancelSchedule("nope")).rejects.toMatchObject({
+      name: "RtDbError",
+      code: "NOT_FOUND",
+    });
+    await expect(c.pauseSchedule("nope")).rejects.toMatchObject({ code: "NOT_FOUND" });
+    await expect(c.resumeSchedule("nope")).rejects.toMatchObject({ code: "NOT_FOUND" });
   });
 });

@@ -1,5 +1,5 @@
 import { RtDbError } from "./errors.js";
-import type { AuthedUser, TransactionJson } from "./protocol.js";
+import type { AuthedUser, ScheduleInfo, ScheduleWhen, TransactionJson } from "./protocol.js";
 import type { RtQuery } from "./query.js";
 
 export interface RtDbHttpClientOptions {
@@ -42,6 +42,29 @@ export class RtDbHttpClient {
       idempotencyKey: opts?.mutId,
     });
     return (body as { results: unknown[] }).results;
+  }
+
+  /** Schedules `txn` for `when`; the server validates cron expressions. */
+  async schedule(txn: TransactionJson, when: ScheduleWhen): Promise<{ id: string }> {
+    const body = await this.post("/api/schedule", { db: this.db, when, txn });
+    return { id: (body as { id: string }).id };
+  }
+
+  async cancelSchedule(id: string): Promise<void> {
+    await this.post(`/api/schedule/${encodeURIComponent(id)}/cancel`, { db: this.db });
+  }
+
+  async pauseSchedule(id: string): Promise<void> {
+    await this.post(`/api/schedule/${encodeURIComponent(id)}/pause`, { db: this.db });
+  }
+
+  async resumeSchedule(id: string): Promise<void> {
+    await this.post(`/api/schedule/${encodeURIComponent(id)}/resume`, { db: this.db });
+  }
+
+  async listSchedules(): Promise<ScheduleInfo[]> {
+    const body = await this.post("/api/schedules", { db: this.db });
+    return (body as { schedules: ScheduleInfo[] }).schedules;
   }
 
   /**
