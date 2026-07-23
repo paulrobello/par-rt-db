@@ -4,7 +4,7 @@ use crate::db::validate_db_name;
 use crate::ddl::{pg_col, pg_schema, pg_table};
 use crate::error::RtDbError;
 use crate::pagination::{decode_cursor, encode_cursor};
-use crate::schema::{FieldType, IndexDef, SchemaDef};
+use crate::schema::{FieldType, IndexDef, SchemaDef, TableDef};
 use crate::txn::{EqBind, eq_bind_for, eq_binds};
 
 /// Hard cap on rows returned by a single query, whether via an explicit
@@ -48,6 +48,8 @@ pub struct Query {
     pub count: bool, // terminal: SELECT COUNT(*) over the same eq/range WHERE; mutually exclusive with get/take/unique/first/order
     #[serde(default)]
     pub paginate: Option<Paginate>,
+    #[serde(default)]
+    pub filter: Option<FilterExpr>, // additional WHERE predicate over doc fields; composes with index/order/take/cursor
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -55,6 +57,52 @@ pub struct Query {
 pub struct Paginate {
     pub cursor: Option<String>,
     pub num_items: u32,
+}
+
+/// A db-side predicate appended to a query's WHERE clause. Leaves compare one
+/// declared field to a value (`in` to a non-empty list); `and`/`or` nest
+/// arbitrarily. Compilation: an *indexed* field compares against its typed
+/// column (value typed via the field's declared `FieldType`, exactly like `eq`);
+/// any other *declared* field uses jsonb extraction (`doc->>'field'`, cast for
+/// non-text value kinds). Field names are schema-validated identifiers, so they
+/// are safe to emit inside a quoted column name or a jsonb string literal.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "op", rename_all = "lowercase", deny_unknown_fields)]
+pub enum FilterExpr {
+    Eq {
+        field: String,
+        value: serde_json::Value,
+    },
+    Neq {
+        field: String,
+        value: serde_json::Value,
+    },
+    Gt {
+        field: String,
+        value: serde_json::Value,
+    },
+    Gte {
+        field: String,
+        value: serde_json::Value,
+    },
+    Lt {
+        field: String,
+        value: serde_json::Value,
+    },
+    Lte {
+        field: String,
+        value: serde_json::Value,
+    },
+    In {
+        field: String,
+        values: Vec<serde_json::Value>,
+    },
+    And {
+        exprs: Vec<FilterExpr>,
+    },
+    Or {
+        exprs: Vec<FilterExpr>,
+    },
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -117,9 +165,10 @@ pub async fn execute_query(
             || q.first
             || q.count
             || q.paginate.is_some()
+            || q.filter.is_some()
         {
             return Err(RtDbError::bad_request(
-                "get cannot be combined with index, eq, range bounds, order, take, unique, first, count, or paginate",
+                "get cannot be combined with index, eq, range bounds, order, take, unique, first, count, paginate, or filter",
             ));
         }
         return point_read(pool, db, &q.table, id).await;
@@ -254,8 +303,6 @@ pub async fn execute_query(
             range_binds.push(eq_bind_for(field_type, v)?);
         }
     }
-    let limit_placeholder = eq_len + range_binds.len() + 1;
-
     let mut where_conditions: Vec<String> = match index_def {
         Some(idx) => idx.fields[..eq_len]
             .iter()
@@ -265,6 +312,20 @@ pub async fn execute_query(
         None => Vec::new(),
     };
     where_conditions.extend(range_where);
+
+    // `filter` is an additional WHERE predicate composed after the eq/range
+    // conditions. It binds after the eq+range binds, so the LIMIT and cursor
+    // placeholder offsets below account for `filter_binds.len()`.
+    let filter_binds: Vec<EqBind> = match &q.filter {
+        Some(filter) => {
+            let (fragment, binds) =
+                compile_filter(filter, table_def, eq_len + range_binds.len() + 1)?;
+            where_conditions.push(fragment);
+            binds
+        }
+        None => Vec::new(),
+    };
+    let limit_placeholder = eq_len + range_binds.len() + filter_binds.len() + 1;
 
     if q.count {
         let pg_schema_name = pg_schema(db);
@@ -283,6 +344,13 @@ pub async fn execute_query(
             };
         }
         for bind in range_binds {
+            query = match bind {
+                EqBind::Text(v) => query.bind(v),
+                EqBind::Num(v) => query.bind(v),
+                EqBind::Bool(v) => query.bind(v),
+            };
+        }
+        for bind in &filter_binds {
             query = match bind {
                 EqBind::Text(v) => query.bind(v),
                 EqBind::Num(v) => query.bind(v),
@@ -337,7 +405,7 @@ pub async fn execute_query(
 
         // Decode the cursor (if any) and append the keyset resume predicate to
         // the eq/range WHERE already built for this query.
-        let cursor_start = eq_len + range_binds.len() + 1;
+        let cursor_start = eq_len + range_binds.len() + filter_binds.len() + 1;
         let cursor_binds: Vec<EqBind> = if let Some(cursor) = &paginate.cursor {
             let cursor_values = decode_cursor(cursor)?;
             if cursor_values.len() != sort_cols.len() {
@@ -383,6 +451,13 @@ pub async fn execute_query(
             };
         }
         for bind in range_binds {
+            query = match bind {
+                EqBind::Text(v) => query.bind(v),
+                EqBind::Num(v) => query.bind(v),
+                EqBind::Bool(v) => query.bind(v),
+            };
+        }
+        for bind in &filter_binds {
             query = match bind {
                 EqBind::Text(v) => query.bind(v),
                 EqBind::Num(v) => query.bind(v),
@@ -468,6 +543,13 @@ pub async fn execute_query(
         };
     }
     for bind in range_binds {
+        query = match bind {
+            EqBind::Text(v) => query.bind(v),
+            EqBind::Num(v) => query.bind(v),
+            EqBind::Bool(v) => query.bind(v),
+        };
+    }
+    for bind in &filter_binds {
         query = match bind {
             EqBind::Text(v) => query.bind(v),
             EqBind::Num(v) => query.bind(v),
@@ -587,6 +669,154 @@ fn build_cursor_conditions(
         branches.push(conjuncts.join(" AND "));
     }
     Ok((format!("({})", branches.join(" OR ")), binds))
+}
+
+/// Compiles a `filter` into a fully-parenthesized SQL predicate plus its typed
+/// binds, with `$n` placeholders numbered from 1-based `start_pos`. Every leaf
+/// emits at least one bind, so the fragment is never empty.
+fn compile_filter(
+    filter: &FilterExpr,
+    table: &TableDef,
+    start_pos: usize,
+) -> Result<(String, Vec<EqBind>), RtDbError> {
+    let mut binds: Vec<EqBind> = Vec::new();
+    let sql = compile_filter_node(filter, table, start_pos, &mut binds)?;
+    Ok((sql, binds))
+}
+
+fn compile_filter_node(
+    node: &FilterExpr,
+    table: &TableDef,
+    start_pos: usize,
+    binds: &mut Vec<EqBind>,
+) -> Result<String, RtDbError> {
+    match node {
+        FilterExpr::And { exprs } | FilterExpr::Or { exprs } => {
+            if exprs.is_empty() {
+                return Err(RtDbError::bad_request(format!(
+                    "{} filter requires at least one expr",
+                    if matches!(node, FilterExpr::And { .. }) {
+                        "and"
+                    } else {
+                        "or"
+                    }
+                )));
+            }
+            let joiner = if matches!(node, FilterExpr::And { .. }) {
+                " AND "
+            } else {
+                " OR "
+            };
+            let mut parts: Vec<String> = Vec::with_capacity(exprs.len());
+            for expr in exprs {
+                parts.push(compile_filter_node(expr, table, start_pos, binds)?);
+            }
+            Ok(format!("({})", parts.join(joiner)))
+        }
+        FilterExpr::Eq { field, value } => {
+            compile_comparison(field, "=", value, table, start_pos, binds)
+        }
+        FilterExpr::Neq { field, value } => {
+            compile_comparison(field, "<>", value, table, start_pos, binds)
+        }
+        FilterExpr::Gt { field, value } => {
+            compile_comparison(field, ">", value, table, start_pos, binds)
+        }
+        FilterExpr::Gte { field, value } => {
+            compile_comparison(field, ">=", value, table, start_pos, binds)
+        }
+        FilterExpr::Lt { field, value } => {
+            compile_comparison(field, "<", value, table, start_pos, binds)
+        }
+        FilterExpr::Lte { field, value } => {
+            compile_comparison(field, "<=", value, table, start_pos, binds)
+        }
+        FilterExpr::In { field, values } => {
+            if values.is_empty() {
+                return Err(RtDbError::bad_request(
+                    "in filter requires at least one value",
+                ));
+            }
+            let (lhs, first_bind) = field_lhs_and_bind(field, &values[0], table)?;
+            let mut placeholders: Vec<String> = vec![format!("${}", start_pos + binds.len())];
+            binds.push(first_bind);
+            for value in &values[1..] {
+                let (this_lhs, bind) = field_lhs_and_bind(field, value, table)?;
+                if this_lhs != lhs {
+                    return Err(RtDbError::bad_request(
+                        "in filter values must all be the same type",
+                    ));
+                }
+                placeholders.push(format!("${}", start_pos + binds.len()));
+                binds.push(bind);
+            }
+            Ok(format!("{lhs} IN ({})", placeholders.join(", ")))
+        }
+    }
+}
+
+/// Compiles a binary comparison leaf into `lhs OP $pos` and pushes one typed bind.
+fn compile_comparison(
+    field: &str,
+    op: &str,
+    value: &serde_json::Value,
+    table: &TableDef,
+    start_pos: usize,
+    binds: &mut Vec<EqBind>,
+) -> Result<String, RtDbError> {
+    let (lhs, bind) = field_lhs_and_bind(field, value, table)?;
+    let pos = start_pos + binds.len();
+    binds.push(bind);
+    Ok(format!("{lhs} {op} ${pos}"))
+}
+
+/// Resolves a filter field to its SQL left-hand side and types the comparison
+/// value into a bind. Indexed fields compare against their typed column (value
+/// typed via the field's declared `FieldType`, reusing the `eq` conversion);
+/// other declared fields fall back to jsonb extraction with a value-kind cast.
+fn field_lhs_and_bind(
+    field: &str,
+    value: &serde_json::Value,
+    table: &TableDef,
+) -> Result<(String, EqBind), RtDbError> {
+    let field_type = table.fields.get(field).ok_or_else(|| {
+        RtDbError::bad_request(format!("filter references unknown field '{field}'"))
+    })?;
+    let is_indexed = table
+        .indexes
+        .iter()
+        .any(|idx| idx.fields.iter().any(|f| f == field));
+    if is_indexed {
+        Ok((
+            format!("\"{}\"", pg_col(field)),
+            eq_bind_for(field_type, value)?,
+        ))
+    } else {
+        jsonb_lhs_and_bind(field, value)
+    }
+}
+
+/// jsonb-extraction path for a declared-but-not-indexed field: compare
+/// `doc->>'field'` directly for text, or cast to `float8`/`boolean` when the
+/// value is a number/boolean. The field name is a schema-validated identifier,
+/// so it is safe inside the jsonb string literal.
+fn jsonb_lhs_and_bind(
+    field: &str,
+    value: &serde_json::Value,
+) -> Result<(String, EqBind), RtDbError> {
+    match value {
+        serde_json::Value::String(s) => Ok((format!("(doc->>'{field}')"), EqBind::Text(s.clone()))),
+        serde_json::Value::Number(n) => {
+            let f = n.as_f64().ok_or_else(|| {
+                RtDbError::bad_request("filter number value is out of representable range")
+            })?;
+            Ok((format!("(doc->>'{field}')::float8"), EqBind::Num(f)))
+        }
+        serde_json::Value::Bool(b) => Ok((format!("(doc->>'{field}')::boolean"), EqBind::Bool(*b))),
+        _ => Err(RtDbError::bad_request(
+            "filter value must be a string, number, or boolean",
+        )),
+    }
 }
 
 async fn point_read(

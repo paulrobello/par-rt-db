@@ -153,6 +153,7 @@ async fn get_by_id_returns_doc_with_system_fields() -> anyhow::Result<()> {
             first: false,
             count: false,
             paginate: None,
+            filter: None,
         },
     )
     .await?;
@@ -200,6 +201,7 @@ async fn get_missing_returns_null() -> anyhow::Result<()> {
             first: false,
             count: false,
             paginate: None,
+            filter: None,
         },
     )
     .await?;
@@ -238,6 +240,7 @@ async fn get_combined_with_index_is_bad_request() -> anyhow::Result<()> {
             first: false,
             count: false,
             paginate: None,
+            filter: None,
         },
     )
     .await
@@ -279,6 +282,7 @@ async fn get_combined_with_paginate_is_bad_request() -> anyhow::Result<()> {
                 cursor: None,
                 num_items: 10,
             }),
+            filter: None,
         },
     )
     .await
@@ -317,6 +321,7 @@ async fn unique_combined_with_take_is_bad_request() -> anyhow::Result<()> {
             first: false,
             count: false,
             paginate: None,
+            filter: None,
         },
     )
     .await
@@ -356,6 +361,7 @@ async fn full_eq_compound_index_orders_by_created_at_asc() -> anyhow::Result<()>
             first: false,
             count: false,
             paginate: None,
+            filter: None,
         },
     )
     .await?;
@@ -393,6 +399,7 @@ async fn full_eq_compound_index_order_desc_reverses() -> anyhow::Result<()> {
             first: false,
             count: false,
             paginate: None,
+            filter: None,
         },
     )
     .await?;
@@ -432,6 +439,7 @@ async fn prefix_eq_on_compound_index_sorts_by_remaining_index_field_then_created
             first: false,
             count: false,
             paginate: None,
+            filter: None,
         },
     )
     .await?;
@@ -478,6 +486,7 @@ async fn unique_on_by_name_returns_single_doc() -> anyhow::Result<()> {
             first: false,
             count: false,
             paginate: None,
+            filter: None,
         },
     )
     .await?;
@@ -521,6 +530,7 @@ async fn unique_with_duplicate_name_is_precondition_failed() -> anyhow::Result<(
             first: false,
             count: false,
             paginate: None,
+            filter: None,
         },
     )
     .await
@@ -560,6 +570,7 @@ async fn no_index_collect_returns_all_docs_in_created_at_order() -> anyhow::Resu
             first: false,
             count: false,
             paginate: None,
+            filter: None,
         },
     )
     .await?;
@@ -597,6 +608,7 @@ async fn take_over_cap_is_bad_request() -> anyhow::Result<()> {
             first: false,
             count: false,
             paginate: None,
+            filter: None,
         },
     )
     .await
@@ -635,6 +647,7 @@ async fn unknown_index_is_bad_request() -> anyhow::Result<()> {
             first: false,
             count: false,
             paginate: None,
+            filter: None,
         },
     )
     .await
@@ -673,6 +686,7 @@ async fn eq_longer_than_index_fields_is_bad_request() -> anyhow::Result<()> {
             first: false,
             count: false,
             paginate: None,
+            filter: None,
         },
     )
     .await
@@ -709,6 +723,7 @@ async fn unknown_table_is_not_found() -> anyhow::Result<()> {
             first: false,
             count: false,
             paginate: None,
+            filter: None,
         },
     )
     .await
@@ -747,6 +762,7 @@ async fn take_zero_returns_empty_docs() -> anyhow::Result<()> {
             first: false,
             count: false,
             paginate: None,
+            filter: None,
         },
     )
     .await?;
@@ -782,6 +798,7 @@ async fn unique_without_index_scans_whole_table() -> anyhow::Result<()> {
         first: false,
         count: false,
         paginate: None,
+        filter: None,
     };
 
     let result = execute_query(&pool, &db, &schema, &unique_query).await?;
@@ -828,6 +845,7 @@ async fn canonical_is_stable_for_identical_results() -> anyhow::Result<()> {
         first: false,
         count: false,
         paginate: None,
+        filter: None,
     };
 
     let first = execute_query(&pool, &db, &schema, &query).await?;
@@ -868,6 +886,7 @@ async fn range_gt_excludes_boundary_and_sorts_by_bound_field() -> anyhow::Result
             first: false,
             count: false,
             paginate: None,
+            filter: None,
         },
     )
     .await?;
@@ -908,6 +927,7 @@ async fn range_gte_includes_boundary() -> anyhow::Result<()> {
             first: false,
             count: false,
             paginate: None,
+            filter: None,
         },
     )
     .await?;
@@ -954,6 +974,7 @@ async fn range_gt_and_lt_bounded_numeric_range() -> anyhow::Result<()> {
             first: false,
             count: false,
             paginate: None,
+            filter: None,
         },
     )
     .await?;
@@ -994,6 +1015,7 @@ async fn range_bounded_numeric_range_with_order_desc_and_take() -> anyhow::Resul
             first: false,
             count: false,
             paginate: None,
+            filter: None,
         },
     )
     .await?;
@@ -1031,6 +1053,7 @@ async fn range_without_eq_prefix_applies_to_first_index_field() -> anyhow::Resul
             first: false,
             count: false,
             paginate: None,
+            filter: None,
         },
     )
     .await?;
@@ -1071,6 +1094,7 @@ async fn range_gt_and_gte_both_set_is_bad_request() -> anyhow::Result<()> {
             first: false,
             count: false,
             paginate: None,
+            filter: None,
         },
     )
     .await
@@ -1109,6 +1133,7 @@ async fn range_lt_and_lte_both_set_is_bad_request() -> anyhow::Result<()> {
             first: false,
             count: false,
             paginate: None,
+            filter: None,
         },
     )
     .await
@@ -1147,6 +1172,7 @@ async fn range_without_index_is_bad_request() -> anyhow::Result<()> {
             first: false,
             count: false,
             paginate: None,
+            filter: None,
         },
     )
     .await
@@ -1185,6 +1211,7 @@ async fn range_with_no_remaining_index_field_is_bad_request() -> anyhow::Result<
             first: false,
             count: false,
             paginate: None,
+            filter: None,
         },
     )
     .await
@@ -1223,6 +1250,7 @@ async fn range_combined_with_get_is_bad_request() -> anyhow::Result<()> {
             first: false,
             count: false,
             paginate: None,
+            filter: None,
         },
     )
     .await
@@ -1261,6 +1289,7 @@ async fn range_value_wrong_type_is_bad_request() -> anyhow::Result<()> {
             first: false,
             count: false,
             paginate: None,
+            filter: None,
         },
     )
     .await
@@ -1299,6 +1328,7 @@ async fn range_lte_includes_boundary_value() -> anyhow::Result<()> {
             first: false,
             count: false,
             paginate: None,
+            filter: None,
         },
     )
     .await?;
@@ -1341,6 +1371,7 @@ async fn first_on_no_matching_docs_returns_null() -> anyhow::Result<()> {
             first: true,
             count: false,
             paginate: None,
+            filter: None,
         },
     )
     .await?;
@@ -1378,6 +1409,7 @@ async fn first_with_single_matching_doc_returns_it() -> anyhow::Result<()> {
             first: true,
             count: false,
             paginate: None,
+            filter: None,
         },
     )
     .await?;
@@ -1422,6 +1454,7 @@ async fn first_combined_with_range_bound_returns_smallest_in_ascending_order() -
             first: true,
             count: false,
             paginate: None,
+            filter: None,
         },
     )
     .await?;
@@ -1464,6 +1497,7 @@ async fn first_combined_with_range_bound_and_order_desc_returns_largest() -> any
             first: true,
             count: false,
             paginate: None,
+            filter: None,
         },
     )
     .await?;
@@ -1506,6 +1540,7 @@ async fn first_combined_with_take_is_bad_request() -> anyhow::Result<()> {
             first: true,
             count: false,
             paginate: None,
+            filter: None,
         },
     )
     .await
@@ -1544,6 +1579,7 @@ async fn first_combined_with_unique_is_bad_request() -> anyhow::Result<()> {
             first: true,
             count: false,
             paginate: None,
+            filter: None,
         },
     )
     .await
@@ -1582,6 +1618,7 @@ async fn first_combined_with_get_is_bad_request() -> anyhow::Result<()> {
             first: true,
             count: false,
             paginate: None,
+            filter: None,
         },
     )
     .await
@@ -1622,6 +1659,7 @@ async fn count_on_empty_table_returns_zero() -> anyhow::Result<()> {
             first: false,
             count: true,
             paginate: None,
+            filter: None,
         },
     )
     .await?;
@@ -1659,6 +1697,7 @@ async fn count_with_eq_prefix_counts_matching_subset() -> anyhow::Result<()> {
             first: false,
             count: true,
             paginate: None,
+            filter: None,
         },
     )
     .await?;
@@ -1696,6 +1735,7 @@ async fn count_with_range_bound_counts_matching_subset() -> anyhow::Result<()> {
             first: false,
             count: true,
             paginate: None,
+            filter: None,
         },
     )
     .await?;
@@ -1733,6 +1773,7 @@ async fn count_combined_with_order_is_bad_request() -> anyhow::Result<()> {
             first: false,
             count: true,
             paginate: None,
+            filter: None,
         },
     )
     .await
@@ -1771,6 +1812,7 @@ async fn count_combined_with_take_is_bad_request() -> anyhow::Result<()> {
             first: false,
             count: true,
             paginate: None,
+            filter: None,
         },
     )
     .await
@@ -1809,6 +1851,7 @@ async fn count_combined_with_unique_is_bad_request() -> anyhow::Result<()> {
             first: false,
             count: true,
             paginate: None,
+            filter: None,
         },
     )
     .await
@@ -1847,6 +1890,7 @@ async fn count_combined_with_first_is_bad_request() -> anyhow::Result<()> {
             first: true,
             count: true,
             paginate: None,
+            filter: None,
         },
     )
     .await
@@ -1885,6 +1929,7 @@ async fn count_combined_with_get_is_bad_request() -> anyhow::Result<()> {
             first: false,
             count: true,
             paginate: None,
+            filter: None,
         },
     )
     .await
@@ -1921,6 +1966,7 @@ fn paginate_query(
         first: false,
         count: false,
         paginate: Some(paginate),
+        filter: None,
     }
 }
 
@@ -2463,5 +2509,342 @@ async fn paginate_composes_with_gte_range_bound_across_pages() -> anyhow::Result
             items[4].clone(),
         ]
     );
+    Ok(())
+}
+
+// === db-side filter() expressions ===
+//
+// `seed_kanban` orders workItems by strictly-increasing created_at, so the
+// (created_at, id) tiebreak ordering is the insert order items[0..4]:
+//   items[0] backlog   order 1   "item 1"
+//   items[1] in_progress order 2 "item 2"
+//   items[2] backlog   order 3   "item 3"
+//   items[3] done      order 4   "item 4"
+//   items[4] in_progress order 5 "item 5"
+
+/// Parses a Query from JSON so filter tests also exercise the wire shape.
+fn filter_query(json: serde_json::Value) -> Query {
+    serde_json::from_value(json).expect("parse filter query")
+}
+
+// filter eq on a declared-but-not-indexed field (title) -> jsonb extraction path.
+#[tokio::test]
+async fn filter_eq_on_jsonb_field() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+
+    let (_project_id, items) = seed_kanban(&pool, &db, &schema).await?;
+
+    let result = execute_query(
+        &pool,
+        &db,
+        &schema,
+        &filter_query(serde_json::json!({
+            "table": "workItems",
+            "filter": {"op": "eq", "field": "title", "value": "item 3"}
+        })),
+    )
+    .await?;
+
+    assert_eq!(docs_ids(&result), vec![items[2].clone()]);
+    Ok(())
+}
+
+// filter range (gte) on a non-indexed numeric field -> jsonb `(doc->>'f')::float8` path.
+#[tokio::test]
+async fn filter_range_on_jsonb_numeric_field() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+
+    let project_id = insert_project(&pool, &db, &schema, "Alpha").await?;
+    // completedAt is optional<number> and not indexed; insert three with
+    // distinct values so a jsonb range selects a clear subset.
+    let mut inserted = Vec::new();
+    for (title, completed) in [("c10", 10.0_f64), ("c20", 20.0), ("c30", 30.0)] {
+        let outcome = execute_txn(
+            &pool,
+            &db,
+            &schema,
+            &Transaction {
+                steps: vec![Step::Insert {
+                    table: "workItems".to_string(),
+                    doc: doc(serde_json::json!({
+                        "projectId": project_id,
+                        "title": title,
+                        "status": "backlog",
+                        "order": completed,
+                        "completedAt": completed
+                    })),
+                }],
+            },
+        )
+        .await?;
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        inserted.push(
+            outcome.results[0]["id"]
+                .as_str()
+                .expect("id string")
+                .to_string(),
+        );
+    }
+
+    let result = execute_query(
+        &pool,
+        &db,
+        &schema,
+        &filter_query(serde_json::json!({
+            "table": "workItems",
+            "filter": {"op": "gte", "field": "completedAt", "value": 20}
+        })),
+    )
+    .await?;
+
+    assert_eq!(
+        docs_ids(&result),
+        vec![inserted[1].clone(), inserted[2].clone()]
+    );
+    Ok(())
+}
+
+// filter eq on an indexed field (status) -> typed column path.
+#[tokio::test]
+async fn filter_eq_on_typed_indexed_column() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+
+    let (_project_id, items) = seed_kanban(&pool, &db, &schema).await?;
+
+    let result = execute_query(
+        &pool,
+        &db,
+        &schema,
+        &filter_query(serde_json::json!({
+            "table": "workItems",
+            "filter": {"op": "eq", "field": "status", "value": "backlog"}
+        })),
+    )
+    .await?;
+
+    assert_eq!(docs_ids(&result), vec![items[0].clone(), items[2].clone()]);
+    Ok(())
+}
+
+// filter range (gt) on an indexed numeric field (order) -> typed column path.
+#[tokio::test]
+async fn filter_range_on_typed_indexed_column() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+
+    let (_project_id, items) = seed_kanban(&pool, &db, &schema).await?;
+
+    let result = execute_query(
+        &pool,
+        &db,
+        &schema,
+        &filter_query(serde_json::json!({
+            "table": "workItems",
+            "filter": {"op": "gt", "field": "order", "value": 3}
+        })),
+    )
+    .await?;
+
+    assert_eq!(docs_ids(&result), vec![items[3].clone(), items[4].clone()]);
+    Ok(())
+}
+
+// filter composes with order + take: orders > 2 (3 rows), desc, take 2.
+#[tokio::test]
+async fn filter_composes_with_order_and_take() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+
+    let (_project_id, items) = seed_kanban(&pool, &db, &schema).await?;
+
+    let result = execute_query(
+        &pool,
+        &db,
+        &schema,
+        &filter_query(serde_json::json!({
+            "table": "workItems",
+            "filter": {"op": "gt", "field": "order", "value": 2},
+            "order": "desc",
+            "take": 2
+        })),
+    )
+    .await?;
+
+    assert_eq!(docs_ids(&result), vec![items[4].clone(), items[3].clone()]);
+    Ok(())
+}
+
+// `in` on an indexed field selects a union of values.
+#[tokio::test]
+async fn filter_in_on_indexed_field() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+
+    let (_project_id, items) = seed_kanban(&pool, &db, &schema).await?;
+
+    let result = execute_query(
+        &pool,
+        &db,
+        &schema,
+        &filter_query(serde_json::json!({
+            "table": "workItems",
+            "filter": {"op": "in", "field": "status", "values": ["backlog", "done"]}
+        })),
+    )
+    .await?;
+
+    assert_eq!(
+        docs_ids(&result),
+        vec![items[0].clone(), items[2].clone(), items[3].clone()]
+    );
+    Ok(())
+}
+
+// `and` combinator nests two conditions; `or` is exercised the same way.
+#[tokio::test]
+async fn filter_and_combinator() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+
+    let (_project_id, items) = seed_kanban(&pool, &db, &schema).await?;
+
+    let result = execute_query(
+        &pool,
+        &db,
+        &schema,
+        &filter_query(serde_json::json!({
+            "table": "workItems",
+            "filter": {
+                "op": "and",
+                "exprs": [
+                    {"op": "eq", "field": "status", "value": "in_progress"},
+                    {"op": "gt", "field": "order", "value": 2}
+                ]
+            }
+        })),
+    )
+    .await?;
+
+    assert_eq!(docs_ids(&result), vec![items[4].clone()]);
+    Ok(())
+}
+
+// filter also composes with an index eq prefix.
+#[tokio::test]
+async fn filter_composes_with_index_eq() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+
+    let (project_id, items) = seed_kanban(&pool, &db, &schema).await?;
+
+    let result = execute_query(
+        &pool,
+        &db,
+        &schema,
+        &filter_query(serde_json::json!({
+            "table": "workItems",
+            "index": "by_project",
+            "eq": [project_id],
+            "filter": {"op": "eq", "field": "status", "value": "in_progress"}
+        })),
+    )
+    .await?;
+
+    assert_eq!(docs_ids(&result), vec![items[1].clone(), items[4].clone()]);
+    Ok(())
+}
+
+// malformed: unknown field -> BadRequest, never a 500 / raw SQL error.
+#[tokio::test]
+async fn filter_unknown_field_is_bad_request() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+
+    seed_kanban(&pool, &db, &schema).await?;
+
+    let err = execute_query(
+        &pool,
+        &db,
+        &schema,
+        &filter_query(serde_json::json!({
+            "table": "workItems",
+            "filter": {"op": "eq", "field": "bogus", "value": 1}
+        })),
+    )
+    .await
+    .expect_err("expected bad request");
+    assert_eq!(err.code, ErrorCode::BadRequest);
+    Ok(())
+}
+
+// malformed: get + filter -> BadRequest.
+#[tokio::test]
+async fn filter_with_get_is_bad_request() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+
+    let (_project_id, items) = seed_kanban(&pool, &db, &schema).await?;
+
+    let err = execute_query(
+        &pool,
+        &db,
+        &schema,
+        &filter_query(serde_json::json!({
+            "table": "workItems",
+            "get": items[0],
+            "filter": {"op": "eq", "field": "status", "value": "backlog"}
+        })),
+    )
+    .await
+    .expect_err("expected bad request");
+    assert_eq!(err.code, ErrorCode::BadRequest);
+    Ok(())
+}
+
+// malformed: a wrong-typed value against an indexed column -> BadRequest.
+#[tokio::test]
+async fn filter_wrong_typed_value_on_indexed_column_is_bad_request() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+
+    seed_kanban(&pool, &db, &schema).await?;
+
+    let err = execute_query(
+        &pool,
+        &db,
+        &schema,
+        &filter_query(serde_json::json!({
+            "table": "workItems",
+            "filter": {"op": "eq", "field": "order", "value": "not a number"}
+        })),
+    )
+    .await
+    .expect_err("expected bad request");
+    assert_eq!(err.code, ErrorCode::BadRequest);
     Ok(())
 }
