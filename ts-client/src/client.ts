@@ -1,4 +1,5 @@
 import { RtDbError } from "./errors.js";
+import { projectOptimisticUpdate } from "./optimistic.js";
 import type {
   AuthedUser,
   ClientMessage,
@@ -32,6 +33,14 @@ export interface RtDbClientOptions {
   random?: () => number;
   setTimeoutImpl?: (fn: () => void, ms: number) => ReturnType<typeof setTimeout>;
   clearTimeoutImpl?: (handle: ReturnType<typeof setTimeout>) => void;
+  /**
+   * When true, a locally-submitted mutation's projected effect is overlaid on
+   * each active subscription's last result (via `onUpdate`) before the
+   * authoritative server update arrives, then replaced by the server value on
+   * the next `queryUpdate`. Off by default; the subscribe/mutate contract is
+   * unchanged when disabled.
+   */
+  optimisticUpdates?: boolean;
 }
 
 interface Subscription {
@@ -41,6 +50,10 @@ interface Subscription {
   listeners: Set<(value: unknown) => void>;
   last?: unknown;
   hasValue: boolean;
+  /** The last authoritative server value — the base an optimistic overlay reverts to. */
+  serverLast?: unknown;
+  /** True while `last` includes an unconfirmed optimistic overlay. */
+  optimistic: boolean;
 }
 
 interface PendingMutate {
@@ -99,6 +112,9 @@ export class RtDbClient {
   private readonly pendingMutates = new Map<string, PendingMutate>();
   private readonly unsentMutates: QueuedMutate[] = [];
   private readonly authListeners = new Set<(state: AuthState, user: AuthedUser | null) => void>();
+  /** mutId → subscriptions whose last result this mutation optimistically overlaid. */
+  private readonly optimisticOverlays = new Map<string, Set<Subscription>>();
+  private readonly optimistic: boolean;
 
   private counter = 0;
   /**
@@ -124,6 +140,7 @@ export class RtDbClient {
     this.clearTimeoutImpl = options.clearTimeoutImpl ?? ((h) => clearTimeout(h));
     this.backoff = options.backoff ?? DEFAULT_BACKOFF;
     this.heartbeatMs = options.heartbeatMs ?? DEFAULT_HEARTBEAT_MS;
+    this.optimistic = options.optimisticUpdates ?? false;
   }
 
   connect(): void {
@@ -142,6 +159,16 @@ export class RtDbClient {
     this.connState = "closed";
     this.setAuthState("unauthenticated");
     this.rejectAllMutates("client is closed");
+    // Drop any overlay left by mutations that already resolved but whose
+    // reconciling queryUpdate will now never arrive (no notify — the client is
+    // closing). The state is reset to the last authoritative value.
+    this.optimisticOverlays.clear();
+    for (const sub of this.subsByKey.values()) {
+      if (sub.optimistic && sub.serverLast !== undefined) {
+        sub.optimistic = false;
+        sub.last = sub.serverLast;
+      }
+    }
   }
 
   setToken(token: string | null): void {
@@ -181,6 +208,7 @@ export class RtDbClient {
         key,
         listeners: new Set(),
         hasValue: false,
+        optimistic: false,
       };
       this.subsByKey.set(key, sub);
       this.subsById.set(sub.queryId, sub);
@@ -225,6 +253,12 @@ export class RtDbClient {
         reject(new RtDbError("INTERNAL", "client is closed"));
         return;
       }
+      // Overlay the projected effect on every active subscription before the
+      // round-trip. Computed synchronously so `onUpdate` fires before this
+      // promise even resolves; reconciled (server wins) on the next queryUpdate.
+      if (this.optimistic) {
+        this.applyOptimistic(mutId, txn);
+      }
       const entry: QueuedMutate = { mutId, idempotencyKey: opts?.mutId, txn, resolve, reject };
       if (this.authState === "authenticated" && this.socket) {
         this.dispatchMutate(entry);
@@ -233,6 +267,54 @@ export class RtDbClient {
         this.unsentMutates.push(entry);
       }
     });
+  }
+
+  /** Projects `txn` onto each subscription's last result and notifies listeners
+   * of the overlaid value. Records which subscriptions changed so a rejected
+   * mutation can roll them back to the authoritative `serverLast`. */
+  private applyOptimistic(mutId: string, txn: TransactionJson): void {
+    const overlaid = new Set<Subscription>();
+    for (const sub of this.subsByKey.values()) {
+      if (!sub.hasValue) {
+        continue;
+      }
+      const projection = projectOptimisticUpdate(sub.query, sub.last, txn, this.now);
+      if (projection.overlaid) {
+        sub.optimistic = true;
+        this.pushValue(sub, projection.value);
+        overlaid.add(sub);
+      }
+    }
+    if (overlaid.size > 0) {
+      this.optimisticOverlays.set(mutId, overlaid);
+    }
+  }
+
+  /** Restores every subscription overlaid by `mutId` to its authoritative server
+   * value, if it has not already been reconciled by a queryUpdate. Called on every
+   * rejection path (server error, dropped connection, teardown) so an optimistic
+   * overlay can never outlive the mutation that produced it. */
+  private revertOptimistic(mutId: string): void {
+    const subs = this.optimisticOverlays.get(mutId);
+    if (!subs) {
+      return;
+    }
+    this.optimisticOverlays.delete(mutId);
+    for (const sub of subs) {
+      if (sub.optimistic && sub.serverLast !== undefined) {
+        sub.optimistic = false;
+        this.pushValue(sub, sub.serverLast);
+      }
+    }
+  }
+
+  /** Sets a subscription's last value and notifies its listeners. */
+  private pushValue(sub: Subscription, value: unknown): void {
+    sub.last = value;
+    sub.hasValue = true;
+    for (const listener of sub.listeners) {
+      listener(value);
+    }
   }
 
   private dispatchMutate(entry: QueuedMutate): void {
@@ -333,11 +415,10 @@ export class RtDbClient {
       case "queryUpdate": {
         const sub = this.subsById.get(msg.queryId);
         if (sub) {
-          sub.last = msg.result;
-          sub.hasValue = true;
-          for (const listener of sub.listeners) {
-            listener(msg.result);
-          }
+          // Authoritative value: it wins over any optimistic overlay.
+          sub.serverLast = msg.result;
+          sub.optimistic = false;
+          this.pushValue(sub, msg.result);
         }
         break;
       }
@@ -355,12 +436,17 @@ export class RtDbClient {
       case "mutateOk": {
         const pending = this.pendingMutates.get(msg.mutId);
         this.pendingMutates.delete(msg.mutId);
+        // Succeeded: a queryUpdate will reconcile the overlay, so just drop the
+        // tracking — do not revert.
+        this.optimisticOverlays.delete(msg.mutId);
         pending?.resolve(msg.results);
         break;
       }
       case "mutateErr": {
         const pending = this.pendingMutates.get(msg.mutId);
         this.pendingMutates.delete(msg.mutId);
+        // Failed: the server never applied it, so roll the overlay back.
+        this.revertOptimistic(msg.mutId);
         pending?.reject(RtDbError.fromEnvelope(msg.error));
         break;
       }
@@ -404,7 +490,8 @@ export class RtDbClient {
       return;
     }
     const error = new RtDbError("INTERNAL", reason);
-    for (const pending of this.pendingMutates.values()) {
+    for (const [mutId, pending] of this.pendingMutates) {
+      this.revertOptimistic(mutId);
       pending.reject(error);
     }
     this.pendingMutates.clear();
@@ -418,6 +505,7 @@ export class RtDbClient {
     }
     const error = new RtDbError("INTERNAL", reason);
     for (const entry of this.unsentMutates.splice(0)) {
+      this.revertOptimistic(entry.mutId);
       entry.reject(error);
     }
   }

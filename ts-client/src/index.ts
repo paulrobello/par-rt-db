@@ -30,6 +30,8 @@ export type {
 export { createApi, TableQuery } from "./query.js";
 export type { ClientApi, RtQuery, TableApi } from "./query.js";
 export { mutation, TxnBuilder } from "./mutation.js";
+export { projectOptimisticUpdate } from "./optimistic.js";
+export type { OptimisticProjection } from "./optimistic.js";
 export { retryOnPrecondition } from "./retry.js";
 export { encodeCursor, decodeCursor } from "./pagination.js";
 export { RtDbHttpClient } from "./http.js";
