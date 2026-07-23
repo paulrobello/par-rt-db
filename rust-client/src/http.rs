@@ -1,11 +1,17 @@
 //! One-shot HTTP client for par-rt-db. `Authorization: Bearer <token>` on every call.
 
-use crate::error::{ErrorEnvelope, RtDbError};
+use crate::error::{ErrorEnvelope, RtDbError, retry_on_precondition};
 use crate::mutation::{StepResult, Transaction};
 use crate::query::{TableQuery, parse_result};
 use crate::wire::AuthedUser;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use std::future::Future;
+
+/// Maximum total attempts for [`RtDbHttpClient::mutate_with_retry`] when a
+/// caller wants the SDK's default bound. Matches `ts-client`'s
+/// `retryOnPrecondition` default of 4 retries (5 total attempts).
+pub const DEFAULT_MUTATE_MAX_ATTEMPTS: u32 = 5;
 
 pub struct RtDbHttpClient {
     url: String,
@@ -102,6 +108,51 @@ impl RtDbHttpClient {
                     .map_err(|e| RtDbError::internal(format!("invalid step result: {e}")))
             })
             .collect()
+    }
+
+    /// Read-modify-write a single document with optimistic-concurrency retry.
+    ///
+    /// Fetches the doc at `(table, id)` (as `Option<T>`, `None` if absent),
+    /// hands it to `rebuild`, and submits the returned [`Transaction`] through
+    /// [`mutate`](Self::mutate). If the server rejects with `PRECONDITION_FAILED`
+    /// (an `expectVersion` conflict from a concurrent write), it re-fetches and
+    /// retries — up to `max_attempts` total attempts — surfacing the final error
+    /// if it never succeeds. Pass [`DEFAULT_MUTATE_MAX_ATTEMPTS`] for the
+    /// recommended bound.
+    ///
+    /// Fold the fetched `_version` into a
+    /// [`Mutation::expect_version`](crate::mutation::Mutation::expect_version)
+    /// step so a concurrent write triggers a retry rather than silently
+    /// overwriting.
+    ///
+    /// This composes [`retry_on_precondition`] — it does not re-implement
+    /// conflict detection.
+    pub async fn mutate_with_retry<T, F, Fut>(
+        &self,
+        table: &str,
+        id: &str,
+        max_attempts: u32,
+        rebuild: F,
+    ) -> Result<Vec<StepResult>, RtDbError>
+    where
+        T: DeserializeOwned,
+        F: Fn(Option<T>) -> Fut,
+        Fut: Future<Output = Result<Transaction, RtDbError>>,
+    {
+        // Bind `rebuild` by shared ref so the per-attempt closure captures only
+        // `Copy` handles and can move them into each fresh future — required for
+        // `retry_on_precondition`'s `FnMut() -> Fut` bound (a single `Fut` type
+        // can't borrow from the closure's state across calls).
+        let rebuild = &rebuild;
+        retry_on_precondition(
+            move || async move {
+                let current = self.get::<T>(table, id).await?;
+                let txn = rebuild(current).await?;
+                self.mutate(&txn, None).await
+            },
+            max_attempts.saturating_sub(1),
+        )
+        .await
     }
 
     /// Validate the bearer (session) token via `GET /auth/me`. Machine tokens get 401.
@@ -491,6 +542,139 @@ mod tests {
         let user = client.auth_me().await.unwrap();
         assert_eq!(user.kind, "user");
         assert_eq!(user.email.as_deref(), Some("a@b.com"));
+    }
+
+    // `mutate_with_retry` reuses `retry_on_precondition`, so these tests focus on
+    // the read-modify-write composition: a conflict re-fetches and retries, and
+    // `max_attempts` bounds the loop. Rebuild folds the fetched `_version` into an
+    // `expectVersion` step, mirroring the common write-through pattern.
+    fn current_doc() -> Value {
+        json!({"_id": "i1", "_version": 3, "n": 1})
+    }
+
+    // Fetches the doc's `_version` and guards a patch with `expectVersion`.
+    fn write_through(current: Option<Value>) -> Result<Transaction, RtDbError> {
+        let version = current
+            .as_ref()
+            .and_then(|c| c.get("_version"))
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        Ok(Mutation::new()
+            .expect_version("items", "i1", version)
+            .patch("items", "i1", json!({"n": 2}))
+            .build())
+    }
+
+    #[tokio::test]
+    async fn mutate_with_retry_succeeds_on_first_attempt() {
+        let (server, client) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/api/query"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"result": current_doc()})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/mutate"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"results":[{"id":"i1"}]})),
+            )
+            .mount(&server)
+            .await;
+
+        let res = client
+            .mutate_with_retry::<Value, _, _>(
+                "items",
+                "i1",
+                DEFAULT_MUTATE_MAX_ATTEMPTS,
+                |current| async move { write_through(current) },
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.len(), 1);
+        assert!(matches!(res[0], crate::mutation::StepResult::Insert { ref id } if id == "i1"));
+    }
+
+    #[tokio::test]
+    async fn mutate_with_retry_retries_once_then_succeeds() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let (server, client) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/api/query"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"result": current_doc()})),
+            )
+            .mount(&server)
+            .await;
+        let mutate_calls = Arc::new(AtomicU32::new(0));
+        let calls = mutate_calls.clone();
+        Mock::given(method("POST"))
+            .and(path("/api/mutate"))
+            .respond_with(move |_: &wiremock::Request| {
+                let n = calls.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    ResponseTemplate::new(409).set_body_json(json!({
+                        "code": "PRECONDITION_FAILED",
+                        "message": "version mismatch: expected 3, actual 4"
+                    }))
+                } else {
+                    ResponseTemplate::new(200).set_body_json(json!({"results":[{"id":"i1"}]}))
+                }
+            })
+            .mount(&server)
+            .await;
+
+        let res = client
+            .mutate_with_retry::<Value, _, _>(
+                "items",
+                "i1",
+                DEFAULT_MUTATE_MAX_ATTEMPTS,
+                |current| async move { write_through(current) },
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.len(), 1);
+        // One initial attempt plus exactly one retry.
+        assert_eq!(mutate_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn mutate_with_retry_exhausts_attempts_and_surfaces_error() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let (server, client) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/api/query"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"result": current_doc()})),
+            )
+            .mount(&server)
+            .await;
+        let mutate_calls = Arc::new(AtomicU32::new(0));
+        let calls = mutate_calls.clone();
+        Mock::given(method("POST"))
+            .and(path("/api/mutate"))
+            .respond_with(move |_: &wiremock::Request| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                ResponseTemplate::new(409).set_body_json(
+                    json!({"code": "PRECONDITION_FAILED", "message": "version mismatch"}),
+                )
+            })
+            .mount(&server)
+            .await;
+
+        let err = client
+            .mutate_with_retry::<Value, _, _>("items", "i1", 3, |current| async move {
+                write_through(current)
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, crate::error::ErrorCode::PreconditionFailed);
+        assert_eq!(err.message, "version mismatch");
+        // `max_attempts = 3` → initial attempt plus 2 retries, then give up.
+        assert_eq!(mutate_calls.load(Ordering::SeqCst), 3);
     }
 }
 
