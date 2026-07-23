@@ -150,7 +150,7 @@ pub async fn list(pool: &PgPool, db: &str) -> Result<Vec<ScheduleInfo>, RtDbErro
     );
     let rows: Vec<ScheduleRow> = sqlx::query_as(&format!(
         "SELECT id, kind, due_at, cron, status, last_error, created_at, fired_count
-             FROM \"{schema}\".scheduled_txns ORDER BY due_at"
+             FROM \"{schema}\".scheduled_txns ORDER BY due_at, created_at"
     ))
     .fetch_all(pool)
     .await?;

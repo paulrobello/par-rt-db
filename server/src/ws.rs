@@ -247,11 +247,13 @@ async fn authenticate(
 /// Validates and dispatches one post-auth text frame. Returns whether the
 /// connection should now close (frame too large, rate limit exceeded,
 /// malformed JSON, or an out-of-order `auth`); every other message is
-/// handled and the connection stays open. `Subscribe` and `Mutate` each
-/// re-check authorization for `principal` on `db` first — authorization can
-/// be revoked mid-session (e.g. an allowlist removal) — and on failure the
-/// operation errors (`SubscribeErr`/`MutateErr`) without closing the
-/// connection.
+/// handled and the connection stays open. Every post-auth message arm —
+/// `Subscribe`, `Mutate`, and the schedule family (`Schedule`,
+/// `CancelSchedule`, `PauseSchedule`, `ResumeSchedule`, `ListSchedules`) —
+/// re-checks authorization for `principal` on `db` first — authorization
+/// can be revoked mid-session (e.g. an allowlist removal) — and on failure
+/// the operation errors (e.g. `SubscribeErr`/`MutateErr`) without closing
+/// the connection.
 // A3's `principal` param pushes this past clippy's default 7-argument
 // threshold; every param is independently needed by a different message
 // arm, so bundling them into a context struct would add indirection without
