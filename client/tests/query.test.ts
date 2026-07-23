@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { encodeCursor, decodeCursor } from "../src/pagination.js";
 import { createApi } from "../src/query.js";
 import { defineSchema, defineTable, t } from "../src/schema.js";
 
@@ -124,3 +125,61 @@ describe("query builder", () => {
     });
   });
 });
+
+describe("TableQuery.paginate", () => {
+  it("builds a paginate query without cursor", () => {
+    const q = api.items
+      .query()
+      .withIndex("by_project", ["p1"])
+      .paginate(undefined, 10);
+    expect(q.json).toEqual({
+      table: "items",
+      index: "by_project",
+      eq: ["p1"],
+      paginate: { numItems: 10 },
+    });
+  });
+
+  it("builds a paginate query with cursor", () => {
+    const q = api.items
+      .query()
+      .withIndex("by_project", ["p1"])
+      .paginate("Zm9vYmFy", 10);
+    expect(q.json).toEqual({
+      table: "items",
+      index: "by_project",
+      eq: ["p1"],
+      paginate: { cursor: "Zm9vYmFy", numItems: 10 },
+    });
+  });
+
+  it("combines paginate with order", () => {
+    const q = api.items
+      .query()
+      .withIndex("by_project", ["p1"])
+      .order("desc")
+      .paginate("cursor123", 20);
+    expect(q.json.order).toBe("desc");
+    expect(q.json.paginate).toEqual({ cursor: "cursor123", numItems: 20 });
+  });
+});
+
+describe("cursor utilities", () => {
+  it("round-trips an array of mixed values", () => {
+    const values = ["value1", 123, 456];
+    const cursor = encodeCursor(values);
+    const decoded = decodeCursor(cursor);
+    expect(decoded).toEqual(values);
+  });
+
+  it("round-trips an empty array", () => {
+    const cursor = encodeCursor([]);
+    const decoded = decodeCursor(cursor);
+    expect(decoded).toEqual([]);
+  });
+
+  it("throws on an invalid cursor string", () => {
+    expect(() => decodeCursor("not-valid-base64!!!")).toThrow("Invalid cursor");
+  });
+});
+
