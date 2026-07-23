@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use axum::extract::{FromRequest, Request, State};
+use axum::extract::{FromRequest, Path, Request, State};
 use axum::http::HeaderMap;
 use axum::routing::post;
 use axum::{Json, Router};
@@ -8,8 +8,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::AppState;
 use crate::auth::{authorize, resolve_bearer};
+use crate::db::now_ms;
 use crate::error::RtDbError;
+use crate::protocol::{ScheduleInfo, ScheduleWhen};
 use crate::query::{Query, QueryResult, execute_query};
+use crate::scheduler;
 use crate::txn::Transaction;
 
 fn bearer_token(headers: &HeaderMap) -> Result<&str, RtDbError> {
@@ -98,10 +101,136 @@ async fn mutate_handler(
     }))
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ScheduleRequest {
+    db: String,
+    when: ScheduleWhen,
+    txn: Transaction,
+}
+
+#[derive(Serialize)]
+struct ScheduleResponse {
+    id: String,
+}
+
+async fn schedule_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    ApiJson(body): ApiJson<ScheduleRequest>,
+) -> Result<Json<ScheduleResponse>, RtDbError> {
+    let token = bearer_token(&headers)?;
+    let principal = resolve_bearer(&state.pool, token).await?;
+    authorize(&state.pool, &principal, &body.db).await?;
+
+    let (kind, due_at, cron) = scheduler::resolve_when(body.when, now_ms())?;
+    let id = scheduler::insert(
+        &state.pool,
+        &body.db,
+        kind,
+        due_at,
+        &body.txn,
+        cron.as_deref(),
+    )
+    .await?;
+    Ok(Json(ScheduleResponse { id }))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ManageRequest {
+    db: String,
+}
+
+#[derive(Serialize)]
+struct ManageResponse {
+    ok: bool,
+}
+
+enum ManageOp {
+    Cancel,
+    Pause,
+    Resume,
+}
+
+/// Shared authorize-then-op body for the three boolean manage handlers.
+async fn run_manage_op(
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    db: &str,
+    id: &str,
+    op: ManageOp,
+) -> Result<Json<ManageResponse>, RtDbError> {
+    let token = bearer_token(headers)?;
+    let principal = resolve_bearer(&state.pool, token).await?;
+    authorize(&state.pool, &principal, db).await?;
+    let ok = match op {
+        ManageOp::Cancel => scheduler::cancel(&state.pool, db, id).await?,
+        ManageOp::Pause => scheduler::set_paused(&state.pool, db, id, true).await?,
+        ManageOp::Resume => scheduler::set_paused(&state.pool, db, id, false).await?,
+    };
+    Ok(Json(ManageResponse { ok }))
+}
+
+async fn cancel_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    ApiJson(body): ApiJson<ManageRequest>,
+) -> Result<Json<ManageResponse>, RtDbError> {
+    run_manage_op(&state, &headers, &body.db, &id, ManageOp::Cancel).await
+}
+
+async fn pause_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    ApiJson(body): ApiJson<ManageRequest>,
+) -> Result<Json<ManageResponse>, RtDbError> {
+    run_manage_op(&state, &headers, &body.db, &id, ManageOp::Pause).await
+}
+
+async fn resume_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    ApiJson(body): ApiJson<ManageRequest>,
+) -> Result<Json<ManageResponse>, RtDbError> {
+    run_manage_op(&state, &headers, &body.db, &id, ManageOp::Resume).await
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ListRequest {
+    db: String,
+}
+
+#[derive(Serialize)]
+struct ListResponse {
+    schedules: Vec<ScheduleInfo>,
+}
+
+async fn list_schedules_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    ApiJson(body): ApiJson<ListRequest>,
+) -> Result<Json<ListResponse>, RtDbError> {
+    let token = bearer_token(&headers)?;
+    let principal = resolve_bearer(&state.pool, token).await?;
+    authorize(&state.pool, &principal, &body.db).await?;
+    let schedules = scheduler::list(&state.pool, &body.db).await?;
+    Ok(Json(ListResponse { schedules }))
+}
+
 /// HTTP one-shot routes, authorized via `Authorization: Bearer <token>`
 /// (machine token or user session) resolved and checked per-request.
 pub fn http_api_routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/query", post(query_handler))
         .route("/api/mutate", post(mutate_handler))
+        .route("/api/schedule", post(schedule_handler))
+        .route("/api/schedule/{id}/cancel", post(cancel_handler))
+        .route("/api/schedule/{id}/pause", post(pause_handler))
+        .route("/api/schedule/{id}/resume", post(resume_handler))
+        .route("/api/schedules", post(list_schedules_handler))
 }

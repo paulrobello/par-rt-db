@@ -377,6 +377,103 @@ async fn authorize_user_branch_matches_allowlist_case_insensitively() -> anyhow:
     Ok(())
 }
 
+// (k) POST /api/schedule creates a job, /api/schedules lists it, and the
+// three :id manage routes (pause/resume/cancel) each return {ok:true}. Uses
+// a far-future afterMs so the row is never drained by the scheduler (which
+// isn't spawned for this db during the test).
+#[tokio::test]
+async fn schedule_and_manage_over_http() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let name = fresh_db(&state).await;
+    let (_, token) = mint_token(addr, &name).await;
+
+    let resp = api_post(
+        addr,
+        "/api/schedule",
+        &token,
+        json!({
+            "db": name,
+            "when": {"type": "afterMs", "ms": 3_600_000},
+            "txn": insert_work_item_txn(),
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await?;
+    let id = body["id"].as_str().expect("schedule id").to_string();
+
+    let resp = api_post(addr, "/api/schedules", &token, json!({"db": name})).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await?;
+    let listed = body["schedules"].as_array().expect("schedules array");
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0]["id"], json!(id));
+    assert_eq!(listed[0]["kind"], json!("oneshot"));
+    assert_eq!(listed[0]["status"], json!("pending"));
+
+    for op in &["pause", "resume", "cancel"] {
+        let resp = api_post(
+            addr,
+            &format!("/api/schedule/{id}/{op}"),
+            &token,
+            json!({"db": name}),
+        )
+        .await;
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let body: serde_json::Value = resp.json().await?;
+        assert_eq!(body["ok"], json!(true));
+    }
+
+    // Cancel deleted the row, so a subsequent list is empty.
+    let resp = api_post(addr, "/api/schedules", &token, json!({"db": name})).await;
+    let body: serde_json::Value = resp.json().await?;
+    assert!(
+        body["schedules"]
+            .as_array()
+            .expect("schedules array")
+            .is_empty()
+    );
+
+    Ok(())
+}
+
+// (l) negative afterMs is rejected before any row is written.
+#[tokio::test]
+async fn schedule_rejects_negative_after_ms_http() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let name = fresh_db(&state).await;
+    let (_, token) = mint_token(addr, &name).await;
+
+    let resp = api_post(
+        addr,
+        "/api/schedule",
+        &token,
+        json!({
+            "db": name,
+            "when": {"type": "afterMs", "ms": -1},
+            "txn": {"steps": []},
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(body["code"], "BAD_REQUEST");
+
+    // No row was written.
+    let resp = api_post(addr, "/api/schedules", &token, json!({"db": name})).await;
+    let body: serde_json::Value = resp.json().await?;
+    assert!(
+        body["schedules"]
+            .as_array()
+            .expect("schedules array")
+            .is_empty()
+    );
+
+    Ok(())
+}
+
 // (j2) authorize's User branch rejects a session whose expiry has passed,
 // even for an allowlisted email — the email is added to the allowlist first
 // so expiry is the only possible reason for rejection.
