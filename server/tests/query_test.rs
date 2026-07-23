@@ -2403,3 +2403,65 @@ async fn paginate_index_field_value_round_trips_in_cursor() -> anyhow::Result<()
     assert!(next2.is_some());
     Ok(())
 }
+
+// (p12) Paginate composed with a `gte` range bound: the cursor bind-offset
+// math must account for the range bind — cursor binds start AFTER eq + range
+// (`cursor_start = eq_len + range_binds.len() + 1`). Walks every page of
+// `by_project_and_order` with `order >= 2.0` and asserts every returned row
+// stays in range, in ascending (order, created_at, id) order, with no gaps or
+// duplicates — and that the below-range row (order 1.0) never appears.
+#[tokio::test]
+async fn paginate_composes_with_gte_range_bound_across_pages() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+
+    let (project_id, items) = seed_kanban(&pool, &db, &schema).await?;
+    // gte 2.0 drops items[0] (order 1.0); in-range rows are items[1..4] with
+    // distinct orders 2.0..5.0. num_items 2 forces two pages so the cursor
+    // resume predicate and the range bound are both applied on page 2.
+    let eq = vec![serde_json::json!(project_id)];
+
+    let mut seen: Vec<String> = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let mut q = paginate_query(
+            Some("by_project_and_order"),
+            eq.clone(),
+            None,
+            Paginate {
+                cursor,
+                num_items: 2,
+            },
+        );
+        q.gte = Some(serde_json::json!(2.0));
+        let (docs, next) = paginated(execute_query(&pool, &db, &schema, &q).await?);
+
+        for d in &docs {
+            let order = d["order"].as_f64().expect("order is a number");
+            assert!(
+                order >= 2.0,
+                "row below gte lower bound returned: order={order}"
+            );
+        }
+        seen.extend(ids_of(&docs));
+        match next {
+            Some(c) => cursor = Some(c),
+            None => break,
+        }
+    }
+
+    // Every in-range row returned exactly once, ascending, no gaps or dupes;
+    // items[0] (order 1.0) is excluded by the range bound on every page.
+    assert_eq!(
+        seen,
+        vec![
+            items[1].clone(),
+            items[2].clone(),
+            items[3].clone(),
+            items[4].clone(),
+        ]
+    );
+    Ok(())
+}
