@@ -109,6 +109,19 @@ async fn bootstrap_ddl(conn: &mut PgConnection) -> Result<(), RtDbError> {
     .execute(&mut *conn)
     .await?;
 
+    sqlx::query("CREATE SCHEMA IF NOT EXISTS rtdb")
+        .execute(&mut *conn)
+        .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS rtdb.storage_index (
+            id      text PRIMARY KEY,
+            db_name text NOT NULL
+        )",
+    )
+    .execute(&mut *conn)
+    .await?;
+
     Ok(())
 }
 
@@ -168,6 +181,19 @@ pub async fn create_database(pool: &PgPool, name: &str) -> Result<(), RtDbError>
     sqlx::query(&format!(
         "CREATE INDEX \"{schema_name}_scheduled_due_idx\"
          ON \"{schema_name}\".scheduled_txns (status, due_at)"
+    ))
+    .execute(&mut *tx)
+    .await?;
+
+    sqlx::query(&format!(
+        "CREATE TABLE \"{schema_name}\".storage (
+            id           text PRIMARY KEY,
+            sha256       text NOT NULL,
+            size         bigint NOT NULL,
+            content_type text,
+            bytes        bytea NOT NULL,
+            created_at   bigint NOT NULL
+        )"
     ))
     .execute(&mut *tx)
     .await?;

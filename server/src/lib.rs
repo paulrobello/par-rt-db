@@ -13,6 +13,7 @@ pub mod query;
 pub mod scheduler;
 pub mod schema;
 pub mod snapshot;
+pub mod storage;
 pub mod subs;
 pub mod txn;
 pub mod ws;

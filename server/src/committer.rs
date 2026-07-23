@@ -219,6 +219,9 @@ async fn run_committer(
     if let Err(err) = mutation_log::ensure_table(&pool, &db).await {
         tracing::error!(db = %db, error = %err, "failed to ensure mutations dedup table");
     }
+    if let Err(err) = crate::storage::ensure_table(&pool, &db).await {
+        tracing::error!(db = %db, error = %err, "committer: storage::ensure_table failed");
+    }
     let ctx = CommitterCtx {
         pool,
         db,
