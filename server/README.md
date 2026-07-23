@@ -21,8 +21,10 @@ guidance. Authoritative design:
 - **sqlx 0.8** + **Postgres 17** — storage: one typed column per indexed field,
   documents stored as `doc jsonb` (system fields merged in at read time).
 - **tracing** — structured logs.
-- Auth: GitHub OAuth (`auth/github.rs`) + hashed per-database machine tokens
-  (`auth/tokens.rs`); the admin key is compared constant-time.
+- Auth: multi-provider OAuth trait (`auth/provider.rs`) with GitHub
+  (`auth/github.rs`) and Google (`auth/google.rs`) providers — cross-provider
+  same-email logins link to one user by email — plus hashed per-database machine
+  tokens (`auth/tokens.rs`); the admin key is compared constant-time.
 
 ## Layout
 
@@ -34,7 +36,11 @@ guidance. Authoritative design:
 | Write / read paths | `src/txn.rs`, `src/query.rs` |
 | Wire messages | `src/protocol.rs` |
 | Transports | `src/ws.rs` (reactive), `src/http_api.rs` (one-shot) |
-| Auth | `src/auth/` (`tokens.rs`, `github.rs`, `session.rs`) |
+| Auth | `src/auth/` (`tokens.rs`, `provider.rs`, `github.rs`, `google.rs`, `session.rs`) |
+
+The read path compiles a db-side `filter()` predicate DSL to SQL, and a
+full-text `search` query terminal backed by a generated tsvector column + GIN
+index, ranked by `ts_rank`.
 
 ## Develop
 

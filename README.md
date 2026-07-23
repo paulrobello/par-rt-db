@@ -31,13 +31,16 @@ The server itself listens on `RTDB_PORT` (default `8300`); run it with `cargo ru
 | `POST /admin/allowlist`    | Bearer admin key   | Adds or removes an email from a database's allowlist.                                                                                        |
 | `GET /auth/github?origin=` | none               | Starts the GitHub OAuth flow; 302s to GitHub's authorize page. `origin` must be an exact member of `RTDB_ALLOWED_ORIGINS`.                   |
 | `GET /auth/callback`       | none (state token) | GitHub OAuth callback; exchanges the code, mints a session, and returns HTML that `postMessage`s the session token back to the popup opener. |
+| `GET /auth/google?origin=` | none               | Starts the Google OAuth flow; 302s to Google's authorize page. `origin` must be an exact member of `RTDB_ALLOWED_ORIGINS`.                   |
+| `GET /auth/google/callback` | none (state token) | Google OAuth callback; exchanges the code, mints a session, and returns HTML that `postMessage`s the session token back to the popup opener. |
 | `POST /auth/logout`        | Bearer session     | Deletes the session for the given bearer token. Idempotent: always 200 unless the delete query itself fails.                                 |
 | `GET /auth/me`             | Bearer session     | Returns the authenticated user. 401 for a machine token (session only).                                                                      |
+| `GET /auth/validate`       | Bearer token       | Validates a presented session or machine token; returns the `AuthedUser`. Used by backends to check a player-supplied token.                 |
 
 Bearer tokens are either a per-database **machine token** (minted via `/admin/mint-token`)
-or a **session token** (minted by completing the GitHub OAuth flow). Both resolve through
-the same `Authorization: Bearer <token>` header on `/api/*`, `/auth/*`, and the WS `auth`
-frame.
+or a **session token** (minted by completing the GitHub or Google OAuth flow). Both resolve
+through the same `Authorization: Bearer <token>` header on `/api/*`, `/auth/*`, and the WS
+`auth` frame.
 
 ## Configuration
 
@@ -54,13 +57,17 @@ The server reads its configuration from environment variables:
 | `RTDB_GITHUB_CLIENT_SECRET` | no       | none                         |
 | `RTDB_GITHUB_BASE_URL`      | no       | `https://github.com`         |
 | `RTDB_GITHUB_API_URL`       | no       | `https://api.github.com`     |
+| `RTDB_GOOGLE_CLIENT_ID`     | no       | none                         |
+| `RTDB_GOOGLE_CLIENT_SECRET` | no       | none                         |
 | `RTDB_SESSION_TTL_DAYS`     | no       | `30`                         |
 
 `RTDB_ALLOWED_ORIGINS` is also the exact-match CORS allowlist for `/api/*` and `/auth/*`
-(GET, POST, OPTIONS; `authorization` and `content-type` headers). GitHub OAuth is only
-active when both `RTDB_GITHUB_CLIENT_ID` and `RTDB_GITHUB_CLIENT_SECRET` are set — a
-half-configured pair (only one of the two) is treated the same as neither, and `GET
-/auth/github` returns `503` with an `INTERNAL` error envelope.
+(GET, POST, OPTIONS; `authorization` and `content-type` headers). Each OAuth provider is
+only active when both its client id and secret are set — GitHub needs
+`RTDB_GITHUB_CLIENT_ID` + `RTDB_GITHUB_CLIENT_SECRET`, Google needs
+`RTDB_GOOGLE_CLIENT_ID` + `RTDB_GOOGLE_CLIENT_SECRET`. A half-configured pair (only one
+of the two) is treated the same as neither, and `GET /auth/<provider>` returns `503` with
+an `INTERNAL` error envelope.
 
 ## Error envelope
 
@@ -283,7 +290,8 @@ that ultimately terminates a connection that never closes on its own.
   window is the backstop that ultimately terminates a connection that never closes (see
   [Graceful shutdown](#graceful-shutdown) above).
 - `AuthedUser.name` is always `null`: the `rtdb_auth.users` table has no `name` column, so
-  GitHub-authenticated users are only ever identified by `kind` and `email` on the wire.
+  users are identified on the wire by `kind`, `email`, and (for GitHub-linked accounts)
+  `githubLogin` / `githubId` — never by a free-form display name.
 - OAuth popup login has an accepted CSRF residual: the `state` token is bound to the
   initiating *origin* (so a malicious page can't receive the session token even if it can
   trigger the flow), but not to the initiating *browser* (no PKCE, no state cookie) — see

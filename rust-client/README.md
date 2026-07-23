@@ -3,9 +3,9 @@
 Rust client for [par-rt-db](../README.md) — a port of the TypeScript SDK
 ([`../ts-client/`](../ts-client)) for server-side apps (the par-hack game server
 depends on it). Speaks the server's declarative query/transaction DSL over
-one-shot HTTP. No codegen: you build a `Schema` that serializes to the exact
-server `SchemaDef`, and query/mutate results deserialize generically into your
-own serde structs.
+one-shot HTTP and reactive WebSocket, with an admin control-plane client. No
+codegen: you build a `Schema` that serializes to the exact server `SchemaDef`,
+and query/mutate results deserialize generically into your own serde structs.
 
 Crate name: `par-rt-db-client` → in Rust, `use par_rt_db_client::...`.
 
@@ -14,12 +14,18 @@ Crate name: `par-rt-db-client` → in Rust, `use par_rt_db_client::...`.
 | Feature | Default | Surface |
 | --- | --- | --- |
 | `http` | yes | `RtDbHttpClient` — typed query / mutate / `auth_me` |
-| `ws` | no | Reactive WebSocket client — **not yet implemented** (Plan 2) |
-| `admin` | no | `/admin/*` control-plane client — **not yet implemented** (Plan 3) |
+| `ws` | no | `RtDbClient` (`src/ws.rs`) — reactive WebSocket client (live query subscriptions + mutate) |
+| `admin` | no | `/admin/*` control-plane client — push-schema, create-db, mint-token, revoke-token, allowlist, export, import |
 
 `core` (wire types, schema/query/mutation builders, error model) compiles with
 no features. `[lints.rust] warnings = "deny"` — same zero-warning posture as the
 server.
+
+The `http` surface also carries `.filter()` / `.search()` query builders
+(predicate + full-text terminals), the `mutate_with_retry` precondition-conflict
+helper, `upsert_by_index` / `find_one_by_index` shortcuts, and
+`validate_session_token` for session validation. `search_index()` declares a
+full-text index in a `Schema`.
 
 ## Quick start (HTTP)
 

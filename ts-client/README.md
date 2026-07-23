@@ -78,6 +78,16 @@ const [{ id }] = (await db.mutate(
 )) as [{ id: string }];
 ```
 
+## In-memory test client
+
+`InMemoryRtDbClient` (`src/in_memory.ts`) is an in-memory implementation of the
+client surface for unit tests — no server, no Postgres. It mirrors the schema,
+query, and transaction semantics, including cursor pagination, so app code can
+exercise the full DSL against it directly.
+
+`RtDbClient` also accepts an opt-in `optimisticUpdates` option that applies
+mutations to local state before the server confirms them.
+
 ## Development
 
 ```sh
