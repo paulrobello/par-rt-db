@@ -1,125 +1,149 @@
 use std::sync::Arc;
 
-use axum::body::Body;
-use axum::extract::{Query as QueryParams, State};
-use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header::LOCATION};
-use axum::response::{Html, IntoResponse, Response};
-use axum::routing::{get, post};
-use axum::{Json, Router};
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::AppState;
-use crate::auth::{Principal, authed_user, resolve_bearer, session};
-use crate::db::{new_id, now_ms, random_token};
+use crate::auth::provider::OAuthProvider;
+use crate::auth::session;
+use crate::config::Config;
+use crate::db::{new_id, now_ms};
 use crate::error::RtDbError;
-use crate::protocol::AuthedUser;
 
-const STATE_TTL_MS: i64 = 10 * 60 * 1000;
-
-/// One pending `/auth/github` -> `/auth/callback` round trip: the origin the
-/// popup was opened from (echoed back into the callback HTML) and when this
-/// entry expires. Held in `AppState.oauth_states`, keyed by the state token;
-/// consumed (removed) exactly once by the callback, whichever request gets
-/// the lock first — see `consume_state`.
-pub struct OAuthStateEntry {
-    pub origin: String,
-    pub expires_at: i64,
+/// GitHub OAuth provider. One GitHub OAuth App serves the whole instance
+/// (see spec §"Users"); `client_id`/`client_secret` come from config, the
+/// base/API URLs are overridable for GitHub Enterprise.
+pub struct GithubProvider {
+    client_id: String,
+    client_secret: String,
+    base_url: String,
+    api_url: String,
 }
 
-fn bearer_token(headers: &HeaderMap) -> Option<&str> {
-    headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-}
-
-/// Builds a bare 302 redirect (axum's `Redirect::to` is a 303, which doesn't
-/// match the GitHub OAuth flow's contract of a 302 to the authorize page).
-fn redirect_found(url: &str) -> Response {
-    match Response::builder()
-        .status(StatusCode::FOUND)
-        .header(LOCATION, url)
-        .body(Body::empty())
-    {
-        Ok(response) => response,
-        Err(_) => RtDbError::internal("failed to build redirect").into_response(),
+impl GithubProvider {
+    fn redirect_uri(&self, public_url: &str) -> String {
+        format!("{public_url}/auth/callback")
     }
 }
 
-/// Removes and returns the origin for `state_token`, but only if it exists
-/// and has not expired — single-use by construction: a replayed token was
-/// already removed by the first successful call, so it resolves to `None`
-/// (see Step 1(e)). Concurrent callers race on the same `Mutex`; whichever
-/// acquires it first wins the entry.
-async fn consume_state(state: &Arc<AppState>, state_token: &str) -> Option<String> {
-    let mut states = state.oauth_states.lock().await;
-    match states.remove(state_token) {
-        Some(entry) if entry.expires_at > now_ms() => Some(entry.origin),
-        _ => None,
+#[async_trait]
+impl OAuthProvider for GithubProvider {
+    fn name() -> &'static str {
+        "github"
     }
-}
 
-#[derive(Deserialize)]
-struct GithubStartParams {
-    origin: String,
-}
+    fn from_config(config: &Config) -> Option<Self> {
+        let client_id = config.github_client_id.clone()?;
+        let client_secret = config.github_client_secret.clone()?;
+        Some(Self {
+            client_id,
+            client_secret,
+            base_url: config.github_base_url.clone(),
+            api_url: config.github_api_url.clone(),
+        })
+    }
 
-/// `GET /auth/github?origin=<url>`: redirects the browser to GitHub's OAuth
-/// authorize page. `origin` must be an exact member of
-/// `config.allowed_origins` (else 403) — it is never taken from the eventual
-/// callback request, only from this validated start step, so the popup can
-/// only ever be told to postMessage back to an origin we approved here.
-async fn github_start(
-    State(state): State<Arc<AppState>>,
-    QueryParams(params): QueryParams<GithubStartParams>,
-) -> Response {
-    let (Some(client_id), Some(_)) = (
-        state.config.github_client_id.as_deref(),
-        state.config.github_client_secret.as_deref(),
-    ) else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(RtDbError::internal("github oauth not configured")),
+    fn callback_path(&self) -> &'static str {
+        "/auth/callback"
+    }
+
+    fn authorize_url(&self, redirect_uri: &str, state: &str) -> String {
+        format!(
+            "{}/login/oauth/authorize?client_id={}&redirect_uri={redirect_uri}&scope=read:user%20user:email&state={state}",
+            self.base_url, self.client_id,
         )
-            .into_response();
-    };
-
-    if !state
-        .config
-        .allowed_origins
-        .iter()
-        .any(|allowed| allowed == &params.origin)
-    {
-        return RtDbError::forbidden("origin not allowed").into_response();
     }
 
-    let state_token = random_token();
-    let now = now_ms();
-    {
-        let mut states = state.oauth_states.lock().await;
-        states.retain(|_, entry| entry.expires_at > now);
-        states.insert(
-            state_token.clone(),
-            OAuthStateEntry {
-                origin: params.origin.clone(),
-                expires_at: now + STATE_TTL_MS,
-            },
-        );
+    async fn complete_login(&self, state: &Arc<AppState>, code: &str) -> Result<String, RtDbError> {
+        let client = reqwest::Client::new();
+        let redirect_uri = self.redirect_uri(&state.config.public_url);
+
+        let token_resp: serde_json::Value = client
+            .post(format!("{}/login/oauth/access_token", self.base_url))
+            .header(reqwest::header::ACCEPT, "application/json")
+            .form(&TokenExchangeRequest {
+                client_id: &self.client_id,
+                client_secret: &self.client_secret,
+                code,
+                redirect_uri: &redirect_uri,
+            })
+            .send()
+            .await
+            .map_err(|err| {
+                tracing::warn!(error = %err, "github token exchange request failed");
+                RtDbError::internal("github token exchange failed")
+            })?
+            .json()
+            .await
+            .map_err(|err| {
+                tracing::warn!(error = %err, "github token exchange response decode failed");
+                RtDbError::internal("github token exchange failed")
+            })?;
+
+        let access_token = parse_token_response(token_resp)?;
+
+        let user: GithubUser = client
+            .get(format!("{}/user", self.api_url))
+            .header(reqwest::header::USER_AGENT, "par-rt-db")
+            .header(
+                reqwest::header::AUTHORIZATION,
+                format!("Bearer {access_token}"),
+            )
+            .send()
+            .await
+            .map_err(|err| {
+                tracing::warn!(error = %err, "github user fetch request failed");
+                RtDbError::internal("github user fetch failed")
+            })?
+            .json()
+            .await
+            .map_err(|err| {
+                tracing::warn!(error = %err, "github user fetch response decode failed");
+                RtDbError::internal("github user fetch failed")
+            })?;
+
+        let emails: Vec<GithubEmail> = client
+            .get(format!("{}/user/emails", self.api_url))
+            .header(reqwest::header::USER_AGENT, "par-rt-db")
+            .header(
+                reqwest::header::AUTHORIZATION,
+                format!("Bearer {access_token}"),
+            )
+            .send()
+            .await
+            .map_err(|err| {
+                tracing::warn!(error = %err, "github email fetch request failed");
+                RtDbError::internal("github email fetch failed")
+            })?
+            .json()
+            .await
+            .map_err(|err| {
+                tracing::warn!(error = %err, "github email fetch response decode failed");
+                RtDbError::internal("github email fetch failed")
+            })?;
+
+        let email = select_email(&user.email, &emails)
+            .ok_or_else(|| RtDbError::forbidden("no verified email"))?
+            .to_lowercase();
+
+        let id = new_id();
+        let now = now_ms();
+        let (user_id,): (String,) = sqlx::query_as(
+            "INSERT INTO rtdb_auth.users (id, github_id, login, email, created_at) \
+             VALUES ($1, $2, $3, $4, $5) \
+             ON CONFLICT (github_id) DO UPDATE SET login = EXCLUDED.login, email = EXCLUDED.email \
+             RETURNING id",
+        )
+        .bind(&id)
+        .bind(user.id)
+        .bind(&user.login)
+        .bind(&email)
+        .bind(now)
+        .fetch_one(&state.pool)
+        .await?;
+
+        session::create_session(&state.pool, &user_id, state.config.session_ttl_days).await
     }
-
-    let redirect_uri = format!("{}/auth/callback", state.config.public_url);
-    let url = format!(
-        "{}/login/oauth/authorize?client_id={client_id}&redirect_uri={redirect_uri}&scope=read:user%20user:email&state={state_token}",
-        state.config.github_base_url,
-    );
-
-    redirect_found(&url)
-}
-
-#[derive(Deserialize)]
-struct GithubCallbackParams {
-    code: String,
-    state: String,
 }
 
 #[derive(Serialize)]
@@ -128,11 +152,6 @@ struct TokenExchangeRequest<'a> {
     client_secret: &'a str,
     code: &'a str,
     redirect_uri: &'a str,
-}
-
-#[derive(Deserialize)]
-struct TokenExchangeResponse {
-    access_token: String,
 }
 
 #[derive(Deserialize)]
@@ -149,207 +168,141 @@ struct GithubEmail {
     verified: bool,
 }
 
-/// Exchanges `code` for a GitHub access token, resolves the user's identity
-/// and best email, upserts `rtdb_auth.users`, and mints a session. Returns
-/// the plaintext session token.
-async fn complete_github_login(
-    state: &Arc<AppState>,
-    client_id: &str,
-    client_secret: &str,
-    code: &str,
-) -> Result<String, RtDbError> {
-    let client = reqwest::Client::new();
-    let redirect_uri = format!("{}/auth/callback", state.config.public_url);
+/// Extracts the access token from GitHub's token-exchange response. Happy
+/// path: `{"access_token": "...", ...}`. Error path: GitHub returns
+/// `{"error": "...", "error_description": "..."}` with no `access_token` —
+/// surfaced as a generic internal error so the OAuth error text never reaches
+/// the response body.
+fn parse_token_response(value: serde_json::Value) -> Result<String, RtDbError> {
+    match value.get("access_token").and_then(|v| v.as_str()) {
+        Some(token) => Ok(token.to_string()),
+        None => {
+            tracing::warn!(response = ?value, "github token exchange returned no access_token");
+            Err(RtDbError::internal("github token exchange failed"))
+        }
+    }
+}
 
-    let token_resp: TokenExchangeResponse = client
-        .post(format!(
-            "{}/login/oauth/access_token",
-            state.config.github_base_url
-        ))
-        .header(reqwest::header::ACCEPT, "application/json")
-        .form(&TokenExchangeRequest {
-            client_id,
-            client_secret,
-            code,
-            redirect_uri: &redirect_uri,
-        })
-        .send()
-        .await
-        .map_err(|err| {
-            tracing::warn!(error = %err, "github token exchange request failed");
-            RtDbError::internal("github token exchange failed")
-        })?
-        .json()
-        .await
-        .map_err(|err| {
-            tracing::warn!(error = %err, "github token exchange response decode failed");
-            RtDbError::internal("github token exchange failed")
-        })?;
-
-    let access_token = token_resp.access_token;
-
-    let user: GithubUser = client
-        .get(format!("{}/user", state.config.github_api_url))
-        .header(reqwest::header::USER_AGENT, "par-rt-db")
-        .header(
-            reqwest::header::AUTHORIZATION,
-            format!("Bearer {access_token}"),
-        )
-        .send()
-        .await
-        .map_err(|err| {
-            tracing::warn!(error = %err, "github user fetch request failed");
-            RtDbError::internal("github user fetch failed")
-        })?
-        .json()
-        .await
-        .map_err(|err| {
-            tracing::warn!(error = %err, "github user fetch response decode failed");
-            RtDbError::internal("github user fetch failed")
-        })?;
-
-    let emails: Vec<GithubEmail> = client
-        .get(format!("{}/user/emails", state.config.github_api_url))
-        .header(reqwest::header::USER_AGENT, "par-rt-db")
-        .header(
-            reqwest::header::AUTHORIZATION,
-            format!("Bearer {access_token}"),
-        )
-        .send()
-        .await
-        .map_err(|err| {
-            tracing::warn!(error = %err, "github email fetch request failed");
-            RtDbError::internal("github email fetch failed")
-        })?
-        .json()
-        .await
-        .map_err(|err| {
-            tracing::warn!(error = %err, "github email fetch response decode failed");
-            RtDbError::internal("github email fetch failed")
-        })?;
-
-    let email = emails
+/// Picks the best email from a GitHub profile: the primary verified address,
+/// falling back to any verified address, then to the profile-level email.
+/// Mirrors GitHub's own recommended selection order. Returns the address
+/// before lowercasing; the caller normalizes case.
+fn select_email(profile_email: &Option<String>, emails: &[GithubEmail]) -> Option<String> {
+    emails
         .iter()
         .find(|e| e.primary && e.verified)
         .or_else(|| emails.iter().find(|e| e.verified))
         .map(|e| e.email.clone())
-        .or(user.email.clone())
-        .ok_or_else(|| RtDbError::forbidden("no verified email"))?
-        .to_lowercase();
-
-    let id = new_id();
-    let now = now_ms();
-    let (user_id,): (String,) = sqlx::query_as(
-        "INSERT INTO rtdb_auth.users (id, github_id, login, email, created_at) \
-         VALUES ($1, $2, $3, $4, $5) \
-         ON CONFLICT (github_id) DO UPDATE SET login = EXCLUDED.login, email = EXCLUDED.email \
-         RETURNING id",
-    )
-    .bind(&id)
-    .bind(user.id)
-    .bind(&user.login)
-    .bind(&email)
-    .bind(now)
-    .fetch_one(&state.pool)
-    .await?;
-
-    session::create_session(&state.pool, &user_id, state.config.session_ttl_days).await
+        .or_else(|| profile_email.clone())
 }
 
-/// Renders the popup-closing HTML the callback returns on success. `token`
-/// is hex (from `random_token()`) and `origin` is copied verbatim from the
-/// validated `oauth_states` entry — never from the callback request itself —
-/// so both interpolations are injection-safe by construction: neither can
-/// contain `"`, `<`, or `>`.
-fn callback_html_response(token: &str, origin: &str) -> Response {
-    let html = format!(
-        "<script>window.opener.postMessage({{type:\"rtdb-auth\",token:\"{token}\"}},\"{origin}\");window.close();</script>"
-    );
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
 
-    let mut response = Html(html).into_response();
-    response.headers_mut().insert(
-        HeaderName::from_static("content-security-policy"),
-        HeaderValue::from_static("default-src 'none'; script-src 'unsafe-inline'"),
-    );
-    response
-}
-
-/// `GET /auth/callback?code=&state=`: verifies and consumes the state token,
-/// completes the GitHub exchange, and responds with HTML that posts the new
-/// session token back to the opener window.
-async fn github_callback(
-    State(state): State<Arc<AppState>>,
-    QueryParams(params): QueryParams<GithubCallbackParams>,
-) -> Response {
-    let Some(origin) = consume_state(&state, &params.state).await else {
-        return RtDbError::bad_request("invalid or expired state").into_response();
-    };
-
-    // A state entry only ever exists if `github_start` saw a configured
-    // client_id/secret, and config is immutable for the process lifetime.
-    let client_id = state.config.github_client_id.as_deref().unwrap_or_default();
-    let client_secret = state
-        .config
-        .github_client_secret
-        .as_deref()
-        .unwrap_or_default();
-
-    match complete_github_login(&state, client_id, client_secret, &params.code).await {
-        Ok(token) => callback_html_response(&token, &origin),
-        Err(err) => err.into_response(),
+    #[test]
+    fn parse_token_response_returns_access_token_on_success() {
+        let resp = json!({"access_token": "gho_abc", "token_type": "bearer", "scope": "user"});
+        assert_eq!(parse_token_response(resp).unwrap(), "gho_abc");
     }
-}
 
-#[derive(Serialize)]
-struct OkResponse {
-    ok: bool,
-}
-
-/// `POST /auth/logout`: idempotent regardless of whether the bearer token is
-/// present, valid, or already expired — a `DELETE` matching zero rows is not
-/// an error, so only a genuine query failure (not a merely-absent session)
-/// produces a 500 here.
-async fn logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    if let Some(token) = bearer_token(&headers)
-        && let Err(err) = session::delete_session(&state.pool, token).await
-    {
-        return err.into_response();
+    #[test]
+    fn parse_token_response_fails_on_error_body_without_access_token() {
+        let resp = json!({"error": "bad_verification_code", "error_description": "expired"});
+        assert!(parse_token_response(resp).is_err());
     }
-    Json(OkResponse { ok: true }).into_response()
-}
 
-#[derive(Serialize)]
-struct MeResponse {
-    user: AuthedUser,
-}
-
-/// `GET /auth/me`: session-only. A machine token resolves fine via
-/// `resolve_bearer` but is rejected here (401) since it isn't a user.
-async fn me(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    let Some(token) = bearer_token(&headers) else {
-        return RtDbError::unauthorized("missing bearer token").into_response();
-    };
-
-    let principal = match resolve_bearer(&state.pool, token).await {
-        Ok(principal) => principal,
-        Err(err) => return err.into_response(),
-    };
-
-    match principal {
-        Principal::User { .. } => Json(MeResponse {
-            user: authed_user(&principal),
-        })
-        .into_response(),
-        Principal::Machine { .. } => RtDbError::unauthorized("session required").into_response(),
+    #[test]
+    fn select_email_prefers_primary_verified() {
+        let emails = vec![
+            GithubEmail {
+                email: "secondary@example.com".into(),
+                primary: false,
+                verified: true,
+            },
+            GithubEmail {
+                email: "primary@example.com".into(),
+                primary: true,
+                verified: true,
+            },
+        ];
+        assert_eq!(
+            select_email(&None, &emails),
+            Some("primary@example.com".to_string())
+        );
     }
-}
 
-/// GitHub OAuth + session routes: `/auth/github`, `/auth/callback`,
-/// `/auth/logout`, `/auth/me`.
-pub fn auth_routes() -> Router<Arc<AppState>> {
-    Router::new()
-        .route("/auth/github", get(github_start))
-        .route("/auth/callback", get(github_callback))
-        .route("/auth/logout", post(logout))
-        .route("/auth/me", get(me))
+    #[test]
+    fn select_email_falls_back_to_any_verified() {
+        let emails = vec![GithubEmail {
+            email: "only@example.com".into(),
+            primary: false,
+            verified: true,
+        }];
+        assert_eq!(
+            select_email(&None, &emails),
+            Some("only@example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn select_email_falls_back_to_profile_email_when_none_verified() {
+        let emails = vec![GithubEmail {
+            email: "unverified@example.com".into(),
+            primary: true,
+            verified: false,
+        }];
+        assert_eq!(
+            select_email(&Some("profile@example.com".into()), &emails),
+            Some("profile@example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn select_email_returns_none_when_no_email_anywhere() {
+        assert_eq!(select_email(&None, &[]), None);
+    }
+
+    #[test]
+    fn authorize_url_contains_scope_and_state() {
+        let provider = GithubProvider {
+            client_id: "cid".into(),
+            client_secret: "secret".into(),
+            base_url: "https://github.example".into(),
+            api_url: "https://api.github.example".into(),
+        };
+        let url = provider.authorize_url("https://app.example/auth/callback", "xyz");
+        assert!(url.starts_with("https://github.example/login/oauth/authorize?"));
+        assert!(url.contains("client_id=cid"));
+        assert!(url.contains("scope=read:user%20user:email"));
+        assert!(url.contains("state=xyz"));
+        // redirect_uri is interpolated raw (not percent-encoded), matching the
+        // original GitHub handler — browsers and GitHub accept it as-is.
+        assert!(url.contains("redirect_uri=https://app.example/auth/callback"));
+    }
+
+    #[test]
+    fn from_config_returns_none_without_credentials() {
+        let mut cfg = Config {
+            port: 0,
+            database_url: "x".into(),
+            admin_key: "k".into(),
+            public_url: "http://localhost:0".into(),
+            allowed_origins: vec![],
+            github_client_id: None,
+            github_client_secret: None,
+            github_base_url: "https://github.com".into(),
+            github_api_url: "https://api.github.com".into(),
+            google_client_id: None,
+            google_client_secret: None,
+            session_ttl_days: 30,
+        };
+        assert!(GithubProvider::from_config(&cfg).is_none());
+        cfg.github_client_id = Some("id".into());
+        // still none: secret missing
+        assert!(GithubProvider::from_config(&cfg).is_none());
+        cfg.github_client_secret = Some("secret".into());
+        assert!(GithubProvider::from_config(&cfg).is_some());
+    }
 }

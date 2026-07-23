@@ -559,3 +559,91 @@ async fn expired_session_returns_unauthorized() -> anyhow::Result<()> {
     assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
     Ok(())
 }
+
+// --- Google provider (the provider abstraction's second implementation) ---
+//
+// These exercise the new `/auth/google` route wiring and the generic
+// `provider_start` handler end-to-end through the real router. The start
+// handler only *builds* an authorize URL and 302s — it makes no outbound call
+// to Google — so no mock is needed and no real Google endpoint is hit. The
+// token-exchange / userinfo *parsing* logic is covered by unit tests in
+// `auth/google.rs`; the shared callback/state/HTML/logout machinery is
+// covered by the GitHub tests above (same generic handlers).
+
+/// Spawns an app with Google OAuth configured. Endpoints stay at the real
+/// Google constants (not configurable, unlike GitHub's GHE-overrideable URLs).
+async fn google_configured_state() -> (Arc<AppState>, SocketAddr) {
+    let mut cfg = test_config();
+    cfg.google_client_id = Some("g-client".into());
+    cfg.google_client_secret = Some("g-secret".into());
+    let pool = sqlx::PgPool::connect(&cfg.database_url)
+        .await
+        .expect("connect to test postgres");
+    db::bootstrap(&pool).await.expect("bootstrap rtdb_auth");
+    let state = AppState::new(pool, cfg);
+    let addr = spawn_app(state.clone()).await;
+    (state, addr)
+}
+
+// (h) configured Google provider -> 302 to Google's authorize URL with the
+// expected OIDC params.
+#[tokio::test]
+async fn google_start_redirects_to_google_authorize_url() -> anyhow::Result<()> {
+    let (_state, addr) = google_configured_state().await;
+
+    let resp = no_redirect_client()
+        .get(format!(
+            "http://{addr}/auth/google?origin=http://localhost:5173"
+        ))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), reqwest::StatusCode::FOUND);
+    let location = resp
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .expect("location header")
+        .to_str()
+        .expect("utf8")
+        .to_string();
+    assert!(location.starts_with("https://accounts.google.com/o/oauth2/v2/auth?"));
+    assert!(location.contains("client_id=g-client"));
+    assert!(location.contains("response_type=code"));
+    assert!(location.contains("scope=openid%20email%20profile"));
+    assert!(location.contains("redirect_uri="));
+    assert!(!extract_query_param(&location, "state").is_empty());
+    Ok(())
+}
+
+// (i) disallowed origin -> 403 (origin check runs after the configured check).
+#[tokio::test]
+async fn google_start_with_disallowed_origin_returns_forbidden() -> anyhow::Result<()> {
+    let (_state, addr) = google_configured_state().await;
+
+    let resp = no_redirect_client()
+        .get(format!(
+            "http://{addr}/auth/google?origin=http://evil.example"
+        ))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), reqwest::StatusCode::FORBIDDEN);
+    let body: Value = resp.json().await?;
+    assert_eq!(body["code"], json!("FORBIDDEN"));
+    Ok(())
+}
+
+// (j) route mounted but provider unconfigured (no client_id/secret) -> 503.
+#[tokio::test]
+async fn google_start_unconfigured_returns_service_unavailable() -> anyhow::Result<()> {
+    // test_state() leaves google_client_id/secret as None.
+    let state = test_state().await;
+    let addr = spawn_app(state).await;
+
+    let resp = no_redirect_client()
+        .get(format!(
+            "http://{addr}/auth/google?origin=http://localhost:5173"
+        ))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    Ok(())
+}

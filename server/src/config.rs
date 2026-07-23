@@ -9,6 +9,8 @@ pub struct Config {
     pub github_client_secret: Option<String>, // RTDB_GITHUB_CLIENT_SECRET
     pub github_base_url: String,      // RTDB_GITHUB_BASE_URL, default https://github.com
     pub github_api_url: String,       // RTDB_GITHUB_API_URL, default https://api.github.com
+    pub google_client_id: Option<String>, // RTDB_GOOGLE_CLIENT_ID
+    pub google_client_secret: Option<String>, // RTDB_GOOGLE_CLIENT_SECRET
     pub session_ttl_days: i64,        // RTDB_SESSION_TTL_DAYS, default 30
 }
 
@@ -49,6 +51,9 @@ impl Config {
         let github_api_url = std::env::var("RTDB_GITHUB_API_URL")
             .unwrap_or_else(|_| "https://api.github.com".to_string());
 
+        let google_client_id = std::env::var("RTDB_GOOGLE_CLIENT_ID").ok();
+        let google_client_secret = std::env::var("RTDB_GOOGLE_CLIENT_SECRET").ok();
+
         let session_ttl_days = match std::env::var("RTDB_SESSION_TTL_DAYS") {
             Ok(v) => v
                 .parse::<i64>()
@@ -66,6 +71,8 @@ impl Config {
             github_client_secret,
             github_base_url,
             github_api_url,
+            google_client_id,
+            google_client_secret,
             session_ttl_days,
         })
     }

@@ -70,7 +70,7 @@ pub async fn resolve_session(pool: &PgPool, token: &str) -> Result<Option<Princi
 }
 
 /// Deletes a session by its plaintext token. Not an error if the token
-/// doesn't exist — logout is idempotent (see `auth::github::logout`).
+/// doesn't exist — logout is idempotent (see `auth::provider::logout`).
 pub async fn delete_session(pool: &PgPool, token: &str) -> Result<(), RtDbError> {
     let hash = sha256_hex(token);
     sqlx::query("DELETE FROM rtdb_auth.sessions WHERE token_hash = $1")

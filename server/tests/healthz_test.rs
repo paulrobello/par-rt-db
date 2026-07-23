@@ -12,6 +12,8 @@ fn test_config() -> Config {
         github_client_secret: None,
         github_base_url: "https://github.com".into(),
         github_api_url: "https://api.github.com".into(),
+        google_client_id: None,
+        google_client_secret: None,
         session_ttl_days: 30,
     }
 }

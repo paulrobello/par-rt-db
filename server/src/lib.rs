@@ -28,7 +28,7 @@ use subs::SubscriptionManager;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
-use auth::github::OAuthStateEntry;
+use auth::provider::OAuthStateEntry;
 
 pub struct AppState {
     pub pool: sqlx::PgPool,
@@ -58,7 +58,7 @@ impl AppState {
 /// Origins allowed to send bearer tokens over CORS to `/auth/*` and the HTTP
 /// one-shot API. Origins that fail `HeaderValue` parsing are skipped (and
 /// logged) rather than rejecting startup — WS is exempt from CORS (Origin is
-/// already enforced at OAuth start, see `auth::github::github_start`).
+/// already enforced at OAuth start, see `auth::provider::provider_start`).
 fn cors_layer(allowed_origins: &[String]) -> CorsLayer {
     let origins: Vec<HeaderValue> = allowed_origins
         .iter()
@@ -85,7 +85,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .merge(admin::admin_routes())
         .merge(http_api::http_api_routes())
         .merge(ws::ws_routes())
-        .merge(auth::github::auth_routes())
+        .merge(auth::provider::auth_routes())
         .layer(TraceLayer::new_for_http())
         .layer(cors)
         .with_state(state)
