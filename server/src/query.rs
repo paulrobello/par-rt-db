@@ -51,7 +51,7 @@ pub struct Query {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Paginate {
     pub cursor: Option<String>,
     pub num_items: u32,
@@ -67,6 +67,7 @@ pub enum QueryResult {
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PaginatedResult {
     pub docs: Vec<serde_json::Value>,
     pub next_cursor: Option<String>,
