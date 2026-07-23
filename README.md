@@ -147,8 +147,8 @@ curl -s -X POST http://localhost:8300/api/query \
 
 Keyset pagination over an index is supported via the `paginate` query terminal. A
 page request carries an opaque cursor (omitted for the first page) and a page
-size; the response is `{docs, nextCursor}`, where `nextCursor` is null when there
-is no next page. The cursor encodes the sort-column values of the last row on the
+size; the response is `{docs, nextCursor}`, where `nextCursor` is omitted when
+there is no next page. The cursor encodes the sort-column values of the last row on the
 page, so the server resumes strictly *after* it — stable under concurrent
 inserts/deletes unlike offset pagination.
 
@@ -171,7 +171,7 @@ The `paginate` terminal composes with `index`, `eq`, range bounds (`gt`/`gte`/
 // Response (HTTP `/api/query` wraps it as `{"result": {...}}`; WS `queryUpdate`
 // delivers the inner object directly)
 {"docs": [{"_id": "...", "_creationTime": 1732000000000, "_version": 1, "name": "item 1", "priority": 1}, /* ... */],
- "nextCursor": "<opaque-cursor>"}  // null on the last page
+ "nextCursor": "<opaque-cursor>"}  // omitted on the last page
 ```
 
 ### HTTP example: page through an index
@@ -242,8 +242,10 @@ Cursors are opaque base64-encoded JSON arrays of the index field values (plus th
 tie-breaker columns `created_at` and `id`) for the last row on the previous page.
 Clients should treat them as opaque and pass them back verbatim. A cursor is tied
 to the query shape — changing the `index`, `order`, or `eq` prefix invalidates it;
-restart from the first page (no cursor). Multi-column index cursors are currently
-keyed on the first sort column only (single-column indexes are fully supported).
+restart from the first page (no cursor). Compound (multi-column) indexes are
+fully supported: the cursor carries every sort-column value and the server resumes
+via a row-value comparison across all of them, with `id` as the globally unique
+final tie-breaker, so pages never skip or duplicate rows.
 
 ## Make targets
 
