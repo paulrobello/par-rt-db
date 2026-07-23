@@ -63,3 +63,54 @@ async fn ensure_table_is_idempotent_and_revives_dropped_table() -> anyhow::Resul
     assert!(exists, "ensure_table should recreate the storage table");
     Ok(())
 }
+
+use rtdb_server::storage;
+
+#[tokio::test]
+async fn put_get_meta_delete_round_trip() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let db = fresh_db(&state).await;
+    let bytes = b"hello file storage";
+    let sha = storage::sha256_hex_bytes(bytes);
+    let id = storage::put(
+        &state.pool,
+        &db,
+        &sha,
+        bytes.len() as i64,
+        Some("text/plain"),
+        bytes,
+    )
+    .await?;
+
+    let fetched = storage::get(&state.pool, &db, &id)
+        .await?
+        .expect("row present");
+    assert_eq!(fetched.0, bytes);
+    assert_eq!(fetched.1.as_deref(), Some("text/plain"));
+
+    let meta = storage::get_meta(&state.pool, &db, &id)
+        .await?
+        .expect("meta present");
+    assert_eq!(meta.id, id);
+    assert_eq!(meta.sha256, sha);
+    assert_eq!(meta.size, bytes.len() as i64);
+    assert_eq!(meta.content_type.as_deref(), Some("text/plain"));
+
+    assert!(storage::delete(&state.pool, &db, &id).await?);
+    assert!(storage::get(&state.pool, &db, &id).await?.is_none());
+    assert_eq!(
+        storage::resolve_db(&state.pool, &id).await?,
+        None,
+        "index row removed on delete"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn resolve_db_maps_id_to_owner() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let db = fresh_db(&state).await;
+    let id = storage::put(&state.pool, &db, "deadbeef", 1, None, b"x").await?;
+    assert_eq!(storage::resolve_db(&state.pool, &id).await?, Some(db));
+    Ok(())
+}
