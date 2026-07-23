@@ -803,7 +803,7 @@ mod tests {
     #[test]
     fn round_trip() {
         let values = vec![json!("p1"), json!("backlog"), json!(1_700_000_000_000_i64), json!("id1")];
-        let s = encode_cursor(&values);
+        let s = encode_cursor(&values).unwrap();
         // standard base64 (with padding) of the JSON array
         let raw = decode_cursor(&s).unwrap();
         assert_eq!(raw, values);
@@ -838,9 +838,10 @@ Expected: FAIL — functions undefined.
 use base64::Engine;
 use serde_json::Value;
 
-pub fn encode_cursor(values: &[Value]) -> String {
-    let json = serde_json::to_string(values).expect("cursor values serialize");
-    base64::engine::general_purpose::STANDARD.encode(json)
+pub fn encode_cursor(values: &[Value]) -> Result<String, crate::RtDbError> {
+    let json = serde_json::to_string(values)
+        .map_err(|e| crate::RtDbError::internal(format!("cursor encode failed: {e}")))?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(json))
 }
 
 pub fn decode_cursor(s: &str) -> Result<Vec<Value>, crate::RtDbError> {
@@ -852,8 +853,6 @@ pub fn decode_cursor(s: &str) -> Result<Vec<Value>, crate::RtDbError> {
     Ok(v)
 }
 ```
-
-Note: the single `.expect()` on `encode_cursor` is safe — `serde_json::to_string` on a `Vec<Value>` cannot fail.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
@@ -997,7 +996,9 @@ impl Mutation {
     fn obj(v: Value) -> Map<String, Value> {
         match v {
             Value::Object(m) => m,
-            _ => panic!("mutation doc/fields/insert/patch must be a JSON object"),
+            // Non-object input is a caller bug; send an empty object so the server
+            // rejects it with SCHEMA_VIOLATION rather than panicking client-side.
+            _ => Map::new(),
         }
     }
 
