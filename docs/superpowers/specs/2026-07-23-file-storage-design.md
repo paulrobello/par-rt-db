@@ -129,8 +129,11 @@ storage backend — uploads hit the same server, and the SPA already holds a
 db-scoped bearer token — so a **direct authenticated upload** is the natural,
 one-round-trip fit:
 
-- `POST /api/storage`, `Authorization: Bearer <token>`, request body = raw bytes,
-  `Content-Type` carried in the header.
+- `POST /api/storage/{db}`, `Authorization: Bearer <token>`, request body = raw
+  bytes, `Content-Type` carried in the header. The db is in the path because the
+  raw body cannot carry it and session principals are not db-scoped; `authorize`
+  confirms the principal may access that db (machine token must match it, session
+  user must be allowlisted for it).
 - The handler streams the body, updating a `Sha256` digest and a byte counter per
   chunk, and rejects with `BadRequest` the moment the running size exceeds
   `RTDB_MAX_FILE_SIZE` (so an oversized upload is not buffered in full before
@@ -163,19 +166,21 @@ upload omitted it.
   The id is an unguessable uuid v7 (122 bits of randomness), so the only exposure
   surface is ids the app intentionally puts in e.g. `<img src>`. This is the route
   the kanban SPA's `<img src={getUrl(id)}>` uses.
-- **Authenticated** — `GET /api/storage/{id}`, `Authorization: Bearer <token>`.
-  Resolve the caller's database from the token (`resolve_bearer`), then read
+- **Authenticated** — `GET /api/storage/{db}/{id}`, `Authorization: Bearer
+  <token>`. `authorize` confirms the principal may access `{db}`, then reads
   *that* db's `storage` row — a 404 if the id belongs to a different database.
-  For sensitive files the app does not want on a public bearer URL.
+  For sensitive files the app does not want on a public bearer URL. (The db is
+  in the path for the same reason as upload; the client injects its own db, so
+  the client API takes no db parameter.)
 
 ### Delete and metadata
 
-- `DELETE /api/storage/{id}`, bearer → deletes the `db_<db>.storage` row and the
-  `rtdb.storage_index` row → `{ ok: true }`. This revokes the public serve URL
-  immediately (the next `GET /storage/{id}` 404s).
-- `GET /api/storage/{id}/metadata`, bearer → `{ id, sha256, size, contentType,
-  creationTime }`. `contentType` is omitted on the wire when null, like other
-  optional fields (`github_login`, `cron`).
+- `DELETE /api/storage/{db}/{id}`, bearer → deletes the `db_<db>.storage` row and
+  the `rtdb.storage_index` row → `{ ok: true }`. This revokes the public serve
+  URL immediately (the next `GET /storage/{id}` 404s).
+- `GET /api/storage/{db}/{id}/metadata`, bearer → `{ id, sha256, size,
+  contentType, creationTime }`. `contentType` is omitted on the wire when null,
+  like other optional fields (`github_login`, `cron`).
 
 ### Authorization
 
@@ -184,9 +189,11 @@ Upload, delete, metadata, and the authenticated serve path reuse the existing
 `/api/mutate`. `authorize` is a single gate — a machine token must match the db
 and not be revoked; a session user must be unexpired and allowlisted — so all
 four authed routes pass it identically (there is no read/write level
-distinction to apply). **The public serve route `GET /storage/{id}` is the one
-unauthenticated route in the server, by design.** No new auth mechanism is
-introduced.
+distinction to apply). The db under test comes from the `{db}` path segment on
+the authed routes — the raw upload/serve bodies cannot carry it, and session
+principals are not db-scoped. **The public serve route `GET /storage/{id}` is
+the one unauthenticated route in the server, by design.** No new auth mechanism
+is introduced.
 
 ### Failure handling
 
@@ -212,16 +219,16 @@ HTTP routes (added to `http_api_routes()` in `http_api.rs`, except the public
 serve route which is unauthenticated):
 
 ```
-POST   /api/storage               bearer  body=raw bytes, Content-Type  → { id, sha256, size, contentType }
-GET    /api/storage/{id}          bearer                                  → bytes (authed serve)
-GET    /api/storage/{id}/metadata bearer                                  → { id, sha256, size, contentType, creationTime }
-DELETE /api/storage/{id}          bearer                                  → { ok: true }
-GET    /storage/{id}              (none)                                  → bytes (public serve)
+POST   /api/storage/{db}               bearer  body=raw bytes, Content-Type  → { id, sha256, size, contentType }
+GET    /api/storage/{db}/{id}          bearer                                  → bytes (authed serve)
+GET    /api/storage/{db}/{id}/metadata bearer                                  → { id, sha256, size, contentType, creationTime }
+DELETE /api/storage/{db}/{id}          bearer                                  → { ok: true }
+GET    /storage/{id}                   (none)                                  → bytes (public serve)
 ```
 
-`{id}` uses axum 0.8 path-param syntax (as `/api/schedule/{id}/cancel` already
-does). The public serve route is registered on the same router but with no auth
-extractor.
+`{db}` and `{id}` use axum 0.8 path-param syntax (as
+`/api/schedule/{id}/cancel` already does). The public serve route is registered
+on the same router but takes no auth extractor.
 
 ### Clients
 
