@@ -10,6 +10,8 @@ export type {
   IndexJson,
   Order,
   QueryJson,
+  ScheduleInfo,
+  ScheduleWhen,
   SchemaJson,
   SearchQuery,
   ServerMessage,

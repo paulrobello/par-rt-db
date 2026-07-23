@@ -49,6 +49,24 @@ export interface SearchQuery {
   query: string;
 }
 
+/** Mirrors server `protocol::ScheduleWhen` byte-for-byte (tag `type`, camelCase). */
+export type ScheduleWhen =
+  | { type: "afterMs"; ms: number }
+  | { type: "runAt"; ms: number }
+  | { type: "cron"; expr: string };
+
+/** Mirrors server `protocol::ScheduleInfo` (camelCase; `cron`/`lastError` omitted when absent). */
+export interface ScheduleInfo {
+  id: string;
+  kind: "oneshot" | "cron";
+  dueAt: number;
+  cron?: string;
+  status: "pending" | "running" | "paused" | "error";
+  lastError?: string;
+  createdAt: number;
+  firedCount: number;
+}
+
 /** Mirrors server `PaginatedResult` (cursor-based pagination). */
 export interface PaginatedResultJson {
   docs: unknown[];
@@ -98,6 +116,11 @@ export type ClientMessage =
   | { type: "subscribe"; queryId: string; query: QueryJson }
   | { type: "unsubscribe"; queryId: string }
   | { type: "mutate"; mutId: string; idempotencyKey?: string; txn: TransactionJson }
+  | { type: "schedule"; scheduleId: string; when: ScheduleWhen; txn: TransactionJson }
+  | { type: "cancelSchedule"; scheduleId: string; id: string }
+  | { type: "pauseSchedule"; scheduleId: string; id: string }
+  | { type: "resumeSchedule"; scheduleId: string; id: string }
+  | { type: "listSchedules"; scheduleId: string }
   | { type: "ping" };
 
 /** Server -> client WS vocabulary. Tags/fields match server `protocol::ServerMessage`. */
@@ -108,6 +131,10 @@ export type ServerMessage =
   | { type: "mutateOk"; mutId: string; results: unknown[] }
   | { type: "mutateErr"; mutId: string; error: RtDbErrorEnvelope }
   | { type: "subscribeErr"; queryId: string; error: RtDbErrorEnvelope }
+  | { type: "scheduleOk"; scheduleId: string; id: string }
+  | { type: "scheduleErr"; scheduleId: string; error: RtDbErrorEnvelope }
+  | { type: "scheduleAck"; scheduleId: string; ok: boolean; error?: RtDbErrorEnvelope }
+  | { type: "listSchedulesOk"; scheduleId: string; schedules: ScheduleInfo[] }
   | { type: "pong" };
 
 /** Mirrors server `schema::FieldType` (tag `type`). */
