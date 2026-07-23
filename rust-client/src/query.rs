@@ -1,5 +1,6 @@
 //! Query DSL: builds the exact `Query` JSON the server expects, and parses untagged results.
 
+use crate::wire::{FilterExpr, SearchQuery};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
@@ -48,6 +49,14 @@ pub struct Query {
     pub count: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub paginate: Option<Paginate>,
+    /// Additional db-side WHERE predicate over doc fields; composes with
+    /// index/order/take/cursor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter: Option<FilterExpr>,
+    /// Full-text search terminal: ranks by `ts_rank` over a search index's
+    /// tsvector; composes with `take`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search: Option<SearchQuery>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -111,6 +120,24 @@ impl TableQuery {
     }
     pub fn order(mut self, o: Order) -> Self {
         self.q.order = Some(o);
+        self
+    }
+
+    /// Append a db-side `filter` predicate. Composes with `with_index`/range
+    /// bounds/`order`/`take`; the server validates terminal combinations.
+    pub fn filter(mut self, expr: FilterExpr) -> Self {
+        self.q.filter = Some(expr);
+        self
+    }
+
+    /// Full-text `search` terminal over a declared search index. Composes only
+    /// with `take` (e.g. `.search("idx", "text").take(10)`); the server rejects
+    /// every other terminal alongside it.
+    pub fn search(mut self, index: &str, query: &str) -> Self {
+        self.q.search = Some(SearchQuery {
+            index: index.into(),
+            query: query.into(),
+        });
         self
     }
 
@@ -259,5 +286,79 @@ mod tests {
             parse_result(json!({"docs":[{"_id":"a"}],"nextCursor":"zzz"})).unwrap();
         assert_eq!(p.docs.len(), 1);
         assert_eq!(p.next_cursor.as_deref(), Some("zzz"));
+    }
+
+    #[test]
+    fn filter_builder_serializes_predicate() {
+        let q = TableQuery::new("items")
+            .filter(FilterExpr::Eq {
+                field: "status".into(),
+                value: json!("done"),
+            })
+            .collect();
+        assert_eq!(
+            serde_json::to_value(&q).unwrap(),
+            json!({"table":"items","filter":{"op":"eq","field":"status","value":"done"}})
+        );
+    }
+
+    #[test]
+    fn filter_composes_with_index_and_take() {
+        let q = TableQuery::new("items")
+            .with_index("by_project", &[json!("p1")])
+            .filter(FilterExpr::Gt {
+                field: "order".into(),
+                value: json!(0),
+            })
+            .take(10);
+        assert_eq!(
+            serde_json::to_value(&q).unwrap(),
+            json!({"table":"items","index":"by_project","eq":["p1"],"filter":{"op":"gt","field":"order","value":0},"take":10})
+        );
+    }
+
+    #[test]
+    fn filter_nests_combinators() {
+        let q = TableQuery::new("items")
+            .filter(FilterExpr::Or {
+                exprs: vec![
+                    FilterExpr::In {
+                        field: "status".into(),
+                        values: vec![json!("blocked"), json!("backlog")],
+                    },
+                    FilterExpr::Lte {
+                        field: "order".into(),
+                        value: json!(3),
+                    },
+                ],
+            })
+            .collect();
+        assert_eq!(
+            serde_json::to_value(&q).unwrap(),
+            json!({"table":"items","filter":{"op":"or","exprs":[
+                {"op":"in","field":"status","values":["blocked","backlog"]},
+                {"op":"lte","field":"order","value":3}
+            ]}})
+        );
+    }
+
+    #[test]
+    fn search_builder_serializes_terminal() {
+        let q = TableQuery::new("notes")
+            .search("search_content", "hello world")
+            .take(10);
+        assert_eq!(
+            serde_json::to_value(&q).unwrap(),
+            json!({"table":"notes","search":{"index":"search_content","query":"hello world"},"take":10})
+        );
+    }
+
+    #[test]
+    fn bare_query_omits_filter_and_search() {
+        // A query with neither filter nor search omits both keys (skip_serializing_if),
+        // so existing request shapes are unchanged.
+        let q = TableQuery::new("items").collect();
+        let v = serde_json::to_value(&q).unwrap();
+        assert_eq!(v, json!({"table":"items"}));
     }
 }

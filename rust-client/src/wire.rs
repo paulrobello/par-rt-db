@@ -83,6 +83,63 @@ pub struct AuthedUser {
     pub github_id: Option<i64>,
 }
 
+/// A full-text search terminal over a declared search index. `index` names a
+/// search index on the query's table; `query` is free-form user text. Mirrors
+/// `server/src/query.rs::SearchQuery` byte-for-byte (camelCase, deny_unknown_fields).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SearchQuery {
+    pub index: String,
+    pub query: String,
+}
+
+/// A db-side predicate appended to a query's WHERE clause. Mirrors
+/// `server/src/query.rs::FilterExpr` byte-for-byte: internally tagged by `op`
+/// (lowercase), `deny_unknown_fields`. Leaves compare one declared field to a
+/// value (`In` to a non-empty list); `And`/`Or` nest arbitrarily.
+///
+/// Construct variants directly (`FilterExpr::Eq { field, value }`) — inherent
+/// constructors named `eq`/`gt`/`lt` are avoided because they shadow
+/// `PartialEq`/`PartialOrd` trait methods (`clippy::should_implement_trait`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "lowercase", deny_unknown_fields)]
+pub enum FilterExpr {
+    Eq {
+        field: String,
+        value: serde_json::Value,
+    },
+    Neq {
+        field: String,
+        value: serde_json::Value,
+    },
+    Gt {
+        field: String,
+        value: serde_json::Value,
+    },
+    Gte {
+        field: String,
+        value: serde_json::Value,
+    },
+    Lt {
+        field: String,
+        value: serde_json::Value,
+    },
+    Lte {
+        field: String,
+        value: serde_json::Value,
+    },
+    In {
+        field: String,
+        values: Vec<serde_json::Value>,
+    },
+    And {
+        exprs: Vec<FilterExpr>,
+    },
+    Or {
+        exprs: Vec<FilterExpr>,
+    },
+}
+
 /// HTTP request/response bodies for `/admin/*`. These mirror the server's
 /// `admin.rs` handler structs (not the WS `protocol.rs`) field-for-field; the
 /// casing is load-bearing — `tokenId` is camelCase on the wire.
@@ -273,5 +330,139 @@ mod tests {
         let value = serde_json::to_value(&msg).unwrap();
         let restored: ClientMessage = serde_json::from_value(value).unwrap();
         assert!(matches!(restored, ClientMessage::Subscribe { query_id, .. } if query_id == "q1"));
+    }
+
+    // FilterExpr/SearchQuery wire shapes are byte-identical to server query.rs.
+    #[test]
+    fn search_query_wire_shape() {
+        let q = SearchQuery {
+            index: "search_content".into(),
+            query: "hello world".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(&q).unwrap(),
+            json!({"index":"search_content","query":"hello world"})
+        );
+        let back: SearchQuery =
+            serde_json::from_value(json!({"index":"search_content","query":"hello world"}))
+                .unwrap();
+        assert_eq!(back.index, "search_content");
+    }
+
+    #[test]
+    fn filter_expr_leaf_tags_and_fields() {
+        assert_eq!(
+            serde_json::to_value(FilterExpr::Eq {
+                field: "status".into(),
+                value: json!("done")
+            })
+            .unwrap(),
+            json!({"op":"eq","field":"status","value":"done"})
+        );
+        assert_eq!(
+            serde_json::to_value(FilterExpr::Neq {
+                field: "archived".into(),
+                value: json!(true)
+            })
+            .unwrap(),
+            json!({"op":"neq","field":"archived","value":true})
+        );
+        assert_eq!(
+            serde_json::to_value(FilterExpr::Gt {
+                field: "order".into(),
+                value: json!(5)
+            })
+            .unwrap(),
+            json!({"op":"gt","field":"order","value":5})
+        );
+        assert_eq!(
+            serde_json::to_value(FilterExpr::Gte {
+                field: "order".into(),
+                value: json!(5)
+            })
+            .unwrap(),
+            json!({"op":"gte","field":"order","value":5})
+        );
+        assert_eq!(
+            serde_json::to_value(FilterExpr::Lt {
+                field: "order".into(),
+                value: json!(5)
+            })
+            .unwrap(),
+            json!({"op":"lt","field":"order","value":5})
+        );
+        assert_eq!(
+            serde_json::to_value(FilterExpr::Lte {
+                field: "order".into(),
+                value: json!(5)
+            })
+            .unwrap(),
+            json!({"op":"lte","field":"order","value":5})
+        );
+        assert_eq!(
+            serde_json::to_value(FilterExpr::In {
+                field: "status".into(),
+                values: vec![json!("a"), json!("b")]
+            })
+            .unwrap(),
+            json!({"op":"in","field":"status","values":["a","b"]})
+        );
+    }
+
+    #[test]
+    fn filter_expr_combinators_nest() {
+        let and = FilterExpr::And {
+            exprs: vec![
+                FilterExpr::Eq {
+                    field: "status".into(),
+                    value: json!("done"),
+                },
+                FilterExpr::Gt {
+                    field: "order".into(),
+                    value: json!(0),
+                },
+            ],
+        };
+        assert_eq!(
+            serde_json::to_value(&and).unwrap(),
+            json!({"op":"and","exprs":[
+                {"op":"eq","field":"status","value":"done"},
+                {"op":"gt","field":"order","value":0}
+            ]})
+        );
+        let or = FilterExpr::Or {
+            exprs: vec![
+                FilterExpr::Eq {
+                    field: "status".into(),
+                    value: json!("backlog"),
+                },
+                FilterExpr::In {
+                    field: "status".into(),
+                    values: vec![json!("blocked")],
+                },
+            ],
+        };
+        assert_eq!(serde_json::to_value(&or).unwrap()["op"], json!("or"));
+    }
+
+    #[test]
+    fn filter_expr_round_trips_and_rejects_unknown_fields() {
+        let expr = FilterExpr::Or {
+            exprs: vec![FilterExpr::Eq {
+                field: "x".into(),
+                value: json!(1),
+            }],
+        };
+        let v = serde_json::to_value(&expr).unwrap();
+        let back: FilterExpr = serde_json::from_value(v).unwrap();
+        assert!(matches!(back, FilterExpr::Or { exprs } if exprs.len() == 1));
+        // deny_unknown_fields: an extra key is rejected.
+        let bad = json!({"op":"eq","field":"x","value":1,"bogus":true});
+        assert!(serde_json::from_value::<FilterExpr>(bad).is_err());
+        // Unknown op tag is rejected.
+        assert!(
+            serde_json::from_value::<FilterExpr>(json!({"op":"between","field":"x","value":1}))
+                .is_err()
+        );
     }
 }

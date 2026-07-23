@@ -54,6 +54,16 @@ impl FieldType {
 pub struct IndexDef {
     pub name: String,
     pub fields: Vec<String>,
+    /// `true` marks a full-text search index (mirrors server `schema.rs`: the
+    /// server tsvectorizes its text `fields` into a GIN-indexed generated column
+    /// ranked via the `search` query terminal). Omitted on the wire for ordinary
+    /// btree indexes, so existing schemas deserialize unchanged.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub search: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -91,6 +101,18 @@ impl TableBuilder {
         self.indexes.push(IndexDef {
             name: name.into(),
             fields: fields.iter().map(|s| (*s).into()).collect(),
+            search: false,
+        });
+        self
+    }
+
+    /// Declare a full-text search index. The server tsvectorizes the (text)
+    /// `fields` and ranks matches via the `search` query terminal.
+    pub fn search_index(mut self, name: &str, fields: &[&str]) -> Self {
+        self.indexes.push(IndexDef {
+            name: name.into(),
+            fields: fields.iter().map(|s| (*s).into()).collect(),
+            search: true,
         });
         self
     }
@@ -261,5 +283,44 @@ mod tests {
                 .expect("solo is an object")
                 .contains_key("indexes")
         );
+    }
+
+    #[test]
+    fn search_index_serializes_and_round_trips() {
+        // A btree index omits `search`; a search index carries `search: true`.
+        let schema = Schema::builder()
+            .table(
+                "notes",
+                Table::new()
+                    .field("title", FieldType::String)
+                    .field("body", FieldType::String)
+                    .index("by_title", &["title"])
+                    .search_index("search_content", &["title", "body"]),
+            )
+            .build();
+        let v = serde_json::to_value(&schema).unwrap();
+        assert_eq!(
+            v["tables"]["notes"]["indexes"],
+            json!([
+                {"name":"by_title","fields":["title"]},
+                {"name":"search_content","fields":["title","body"],"search":true}
+            ])
+        );
+        // Round-trips back: a `search: true` index is read, and a btree index
+        // absent the flag deserializes to `search: false`.
+        let back: SchemaDef = serde_json::from_value(v).unwrap();
+        let notes = back.tables.get("notes").expect("notes present");
+        let search = notes
+            .indexes
+            .as_ref()
+            .and_then(|idxs| idxs.iter().find(|i| i.name == "search_content"))
+            .expect("search index present");
+        assert!(search.search);
+        let by_title = notes
+            .indexes
+            .as_ref()
+            .and_then(|idxs| idxs.iter().find(|i| i.name == "by_title"))
+            .expect("btree index present");
+        assert!(!by_title.search);
     }
 }
