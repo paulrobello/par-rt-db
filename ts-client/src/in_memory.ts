@@ -1,8 +1,11 @@
 import { RtDbError } from "./errors.js";
+import { decodeCursor, encodeCursor } from "./pagination.js";
 import type {
   FieldTypeJson,
   IndexJson,
   Order,
+  Paginate,
+  PaginatedResultJson,
   QueryJson,
   SchemaJson,
   TableJson,
@@ -607,9 +610,21 @@ export class InMemoryRtDbClient {
       throw new RtDbError("BAD_REQUEST", "count cannot be combined with order");
     }
     if (q.paginate !== undefined) {
-      // TODO(in-memory): cursor keyset pagination is not implemented; defer to
-      // the live server. Throws rather than returning a wrong-shaped page.
-      throw new RtDbError("INTERNAL", "paginate is not supported by the in-memory client");
+      // Combination guards mirror server `validate_query`: paginate is one-shot
+      // paging, so it can't also narrow to count/unique/first/take. (`get` is
+      // rejected above; `order`, index, eq, and range bounds are allowed.)
+      if (q.count) {
+        throw new RtDbError("BAD_REQUEST", "paginate cannot be combined with count");
+      }
+      if (q.unique) {
+        throw new RtDbError("BAD_REQUEST", "paginate cannot be combined with unique");
+      }
+      if (q.first) {
+        throw new RtDbError("BAD_REQUEST", "paginate cannot be combined with first");
+      }
+      if (q.take !== undefined) {
+        throw new RtDbError("BAD_REQUEST", "paginate cannot be combined with take");
+      }
     }
     if (q.gt !== undefined && q.gte !== undefined) {
       throw new RtDbError("BAD_REQUEST", "gt and gte cannot both be set");
@@ -724,6 +739,10 @@ export class InMemoryRtDbClient {
       return 0;
     });
 
+    if (q.paginate !== undefined) {
+      return this.paginateResult(q.paginate, tableDef, filtered, sortKeys, dir);
+    }
+
     if (q.unique) {
       if (filtered.length > 1) {
         throw new RtDbError("PRECONDITION_FAILED", "unique query matched multiple documents");
@@ -741,6 +760,140 @@ export class InMemoryRtDbClient {
   /** Merges a stored row with its system fields — a port of server `merge_doc`. */
   private mergeDoc(row: StoredRow): Record<string, unknown> {
     return { ...row.doc, _id: row.id, _creationTime: row.createdAt, _version: row.version };
+  }
+
+  /** Cursor keyset pagination — a port of server `query.rs`'s paginate branch.
+   * `sorted` is already filtered (eq/range) and sorted over `sortKeys` (unbound
+   * index fields, then `__createdAt`, then `__id`) in direction `dir`. The
+   * cursor stores one value per sort column; the resume predicate is the
+   * standard OR-of-AND row-value comparison, so paging is stable (the unique
+   * `id` tiebreaker means no row is skipped or duplicated across pages). */
+  private paginateResult(
+    paginate: Paginate,
+    tableDef: TableJson,
+    sorted: StoredRow[],
+    sortKeys: string[],
+    dir: Order,
+  ): PaginatedResultJson {
+    const { numItems: requested, cursor } = paginate;
+    const numItems = Math.min(requested, MAX_TAKE);
+
+    let rows = sorted;
+    if (cursor) {
+      const cursorValues = this.decodePaginateCursor(cursor);
+      if (cursorValues.length !== sortKeys.length) {
+        throw new RtDbError(
+          "BAD_REQUEST",
+          `cursor has ${cursorValues.length} value(s) but this query sorts over ${sortKeys.length} column(s)`,
+        );
+      }
+      this.validateCursorValues(cursorValues, sortKeys, tableDef);
+      rows = sorted.filter((row) => this.isAfterCursor(row, cursorValues, sortKeys, dir));
+    }
+
+    // Fetch one past the page size so a next page is detectable without a second
+    // pass; the extra is discarded after the has-next check (server `LIMIT n+1`).
+    const fetched = rows.slice(0, numItems + 1);
+    const hasNext = fetched.length > numItems;
+    if (hasNext) {
+      fetched.pop();
+    }
+    const docs = fetched.map((row) => this.mergeDoc(row));
+    // The next cursor is built from the page's last row; absent when the page is
+    // empty or this was the final page.
+    const nextCursor =
+      hasNext && fetched.length > 0
+        ? encodeCursor(sortKeys.map((key) => this.sortValue(fetched[fetched.length - 1], key)))
+        : undefined;
+    return { docs, nextCursor };
+  }
+
+  /** Decodes a paginate cursor, rethrowing the live client's generic parse error
+   * as a server-shaped `BAD_REQUEST` (server `decode_cursor` → bad_request). */
+  private decodePaginateCursor(cursor: string): unknown[] {
+    let values: unknown;
+    try {
+      values = decodeCursor(cursor);
+    } catch (e) {
+      throw new RtDbError("BAD_REQUEST", `invalid cursor: ${(e as Error).message}`);
+    }
+    if (!Array.isArray(values)) {
+      throw new RtDbError("BAD_REQUEST", "invalid cursor: expected an array");
+    }
+    return values;
+  }
+
+  /** Type-checks decoded cursor values positionally against the sort columns —
+   * a port of server `SortCol::cursor_bind` (index fields via `eq_bind_for`,
+   * `created_at` as number, `id` as string). The final two columns are always
+   * `__createdAt` / `__id`; the rest are unbound indexed fields. */
+  private validateCursorValues(
+    cursorValues: unknown[],
+    sortKeys: string[],
+    tableDef: TableJson,
+  ): void {
+    for (let i = 0; i < sortKeys.length - 2; i++) {
+      const value = cursorValues[i];
+      // Null sorts (nulls-last) and is a legitimate value for an optional index
+      // field; only type-check present values, mirroring the server's typed bind.
+      if (value !== null) {
+        coerceIndexValue(tableDef, sortKeys[i], value);
+      }
+    }
+    const createdAt = cursorValues[sortKeys.length - 2];
+    if (typeof createdAt !== "number") {
+      throw new RtDbError("BAD_REQUEST", "cursor value for created_at must be a number");
+    }
+    const id = cursorValues[sortKeys.length - 1];
+    if (typeof id !== "string") {
+      throw new RtDbError("BAD_REQUEST", "cursor value for id must be a string");
+    }
+  }
+
+  /** The keyset resume predicate: true when `row` sorts strictly after the cursor
+   * row. This is the lexicographic "greater than" expanded to OR-of-AND —
+   *
+   *   (c0 OP v0) OR (c0 = v0 AND c1 OP v1) OR ... —
+   *
+   * where OP is `>` (asc) / `<` (desc). Evaluated with the same `null`-sorts-last
+   * comparator as the sort, so it agrees with the ordering that produced `sorted`. */
+  private isAfterCursor(
+    row: StoredRow,
+    cursorValues: unknown[],
+    sortKeys: string[],
+    dir: Order,
+  ): boolean {
+    for (let i = 0; i < sortKeys.length; i++) {
+      let prefixEqual = true;
+      for (let j = 0; j < i; j++) {
+        if (compareIndexValues(this.sortValue(row, sortKeys[j]), cursorValues[j]) !== 0) {
+          prefixEqual = false;
+          break;
+        }
+      }
+      if (!prefixEqual) {
+        continue;
+      }
+      const cmp = compareIndexValues(this.sortValue(row, sortKeys[i]), cursorValues[i]);
+      if (dir === "desc" ? cmp < 0 : cmp > 0) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /** Sort value for a synthetic sort key, normalizing an absent optional index
+   * field to `null` so cursor encoding and the resume predicate stay consistent
+   * with the `null`-sorts-last comparator. */
+  private sortValue(row: StoredRow, key: string): unknown {
+    if (key === "__createdAt") {
+      return row.createdAt;
+    }
+    if (key === "__id") {
+      return row.id;
+    }
+    const v = row.doc[key];
+    return v === undefined ? null : v;
   }
 
   // ---- subscriptions ---------------------------------------------------------

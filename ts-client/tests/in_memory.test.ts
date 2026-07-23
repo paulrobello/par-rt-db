@@ -2,7 +2,9 @@ import { describe, expect, it } from "vitest";
 import { RtDbError } from "../src/errors.js";
 import { InMemoryRtDbClient } from "../src/in_memory.js";
 import { mutation } from "../src/mutation.js";
-import { createApi } from "../src/query.js";
+import { decodeCursor, encodeCursor } from "../src/pagination.js";
+import type { PaginatedResultJson } from "../src/protocol.js";
+import { createApi, type RtQuery } from "../src/query.js";
 import { defineSchema, defineTable, t } from "../src/schema.js";
 
 const schema = defineSchema({
@@ -234,5 +236,187 @@ describe("InMemoryRtDbClient — subscribe", () => {
     unsub();
     await c.mutate(mutation().insert("items", { name: "c", status: "todo", order: 3 }).build());
     expect(updates).toEqual([0, 1]); // unsubscribed: no further updates
+  });
+});
+
+describe("InMemoryRtDbClient — paginate (cursor keyset)", () => {
+  /** Inserts `count` items with `order` = 1..count and `status` cycling through
+   * `statuses`. The deterministic clock/RNG make both `_creationTime` and `_id`
+   * rise with insertion order, so an ascending sort yields insertion order. */
+  async function seedItems(c: InMemoryRtDbClient, count: number, statuses: string[]) {
+    const ids: string[] = [];
+    for (let i = 1; i <= count; i++) {
+      const [res] = await c.mutate(
+        mutation()
+          .insert("items", {
+            name: `n${i}`,
+            status: statuses[(i - 1) % statuses.length],
+            order: i,
+          })
+          .build(),
+      );
+      ids.push((res as { id: string }).id);
+    }
+    return ids;
+  }
+
+  /** Walks the full cursor chain until `nextCursor` is absent. */
+  async function walkPages(
+    c: InMemoryRtDbClient,
+    build: (cursor: string | undefined) => RtQuery<PaginatedResultJson>,
+  ): Promise<{
+    pageSizes: number[];
+    cursors: (string | undefined)[];
+    docs: Record<string, unknown>[];
+  }> {
+    const pageSizes: number[] = [];
+    const cursors: (string | undefined)[] = [];
+    const docs: Record<string, unknown>[] = [];
+    let cursor: string | undefined;
+    for (let guard = 0; guard < 1000; guard++) {
+      const page: PaginatedResultJson = await c.query(build(cursor));
+      pageSizes.push(page.docs.length);
+      cursors.push(page.nextCursor);
+      docs.push(...(page.docs as Record<string, unknown>[]));
+      if (page.nextCursor === undefined) {
+        return { pageSizes, cursors, docs };
+      }
+      cursor = page.nextCursor;
+    }
+    throw new Error("pagination did not terminate");
+  }
+
+  it("returns an empty page with no nextCursor on an empty table", async () => {
+    const c = newClient();
+    const page = await c.query(api.items.query().paginate(undefined, 3));
+    expect(page).toEqual({ docs: [], nextCursor: undefined });
+  });
+
+  it("walks all pages in order, terminating on a short last page", async () => {
+    const c = newClient();
+    await seedItems(c, 7, ["todo"]);
+    const { pageSizes, cursors, docs } = await walkPages(c, (cursor) =>
+      api.items.query().paginate(cursor, 3),
+    );
+    // Page sizes 3, 3, 1; the walk must equal a plain collect() with no skips/dups.
+    expect(pageSizes).toEqual([3, 3, 1]);
+    expect(cursors.slice(0, -1).every((x) => x !== undefined)).toBe(true);
+    expect(cursors[cursors.length - 1]).toBeUndefined();
+
+    const collected = (await c.query(api.items.query().collect())) as unknown as Record<
+      string,
+      unknown
+    >[];
+    expect(docs.map((d) => d._id)).toEqual(collected.map((d) => d._id));
+    expect(new Set(docs.map((d) => d._id)).size).toBe(docs.length);
+  });
+
+  it("terminates on a full last page when the count is an exact multiple", async () => {
+    const c = newClient();
+    await seedItems(c, 6, ["todo"]);
+    const { pageSizes, cursors, docs } = await walkPages(c, (cursor) =>
+      api.items.query().paginate(cursor, 3),
+    );
+    expect(pageSizes).toEqual([3, 3]);
+    expect(cursors).toEqual([expect.any(String), undefined]);
+    expect(docs).toHaveLength(6);
+  });
+
+  it("paginates within an eq-prefixed multi-field index in index order", async () => {
+    const c = newClient();
+    // status cycles todo/done/todo ⇒ todos are orders 1,3,4,6,7,9.
+    await seedItems(c, 9, ["todo", "done", "todo"]);
+    const { pageSizes, docs } = await walkPages(c, (cursor) =>
+      api.items.query().withIndex("by_status_and_order", ["todo"]).paginate(cursor, 4),
+    );
+    expect(pageSizes).toEqual([4, 2]);
+    expect(docs.map((d) => d.order)).toEqual([1, 3, 4, 6, 7, 9]);
+    expect(docs.every((d) => d.status === "todo")).toBe(true);
+  });
+
+  it("walks descending pages in reverse index order", async () => {
+    const c = newClient();
+    await seedItems(c, 9, ["todo", "done", "todo"]); // todo orders 1,3,4,6,7,9
+    const { pageSizes, docs } = await walkPages(c, (cursor) =>
+      api.items
+        .query()
+        .withIndex("by_status_and_order", ["todo"])
+        .order("desc")
+        .paginate(cursor, 4),
+    );
+    expect(pageSizes).toEqual([4, 2]);
+    expect(docs.map((d) => d.order)).toEqual([9, 7, 6, 4, 3, 1]);
+  });
+
+  it("emits cursors decodable by the live client; resume continues the chain", async () => {
+    const c = newClient();
+    await seedItems(c, 5, ["todo"]); // todo orders 1..5
+    const first = await c.query(
+      api.items.query().withIndex("by_status_and_order", ["todo"]).paginate(undefined, 2),
+    );
+    expect((first.docs as Record<string, unknown>[]).map((d) => d.order)).toEqual([1, 2]);
+    expect(first.nextCursor).toBeDefined();
+
+    // The live client decodes the in-memory-produced cursor to the last row's
+    // key tuple [order, _creationTime, _id] — cursors are interchangeable.
+    const nextCursor = first.nextCursor;
+    if (nextCursor === undefined) {
+      throw new Error("expected a nextCursor on the first page");
+    }
+    const decoded = decodeCursor(nextCursor) as unknown[];
+    const last = first.docs[1] as Record<string, unknown>;
+    expect(decoded).toEqual([last.order, last._creationTime, last._id]);
+
+    const second = await c.query(
+      api.items.query().withIndex("by_status_and_order", ["todo"]).paginate(nextCursor, 2),
+    );
+    expect((second.docs as Record<string, unknown>[]).map((d) => d.order)).toEqual([3, 4]);
+  });
+
+  it("rejects a malformed (non-base64) cursor with BAD_REQUEST, not INTERNAL", async () => {
+    const c = newClient();
+    await seedItems(c, 3, ["todo"]);
+    await expect(
+      c.query(api.items.query().paginate("not-valid-base64!!!", 3)),
+    ).rejects.toMatchObject({ name: "RtDbError", code: "BAD_REQUEST" });
+  });
+
+  it("rejects a cursor whose arity mismatches the sort columns", async () => {
+    const c = newClient();
+    await seedItems(c, 3, ["todo"]);
+    // No-index query sorts over 2 columns (createdAt, id); 3 values mismatch.
+    const bad = encodeCursor([1, 2, 3]);
+    await expect(c.query(api.items.query().paginate(bad, 3))).rejects.toMatchObject({
+      name: "RtDbError",
+      code: "BAD_REQUEST",
+      message: /sorts over 2 column\(s\)/,
+    });
+  });
+
+  it("rejects a cursor whose created_at value is not a number", async () => {
+    const c = newClient();
+    await seedItems(c, 3, ["todo"]);
+    // No-index cursor = [createdAt, id]; a non-numeric createdAt fails type-check.
+    const bad = encodeCursor(["not-a-number", "0123456789abcdef0123456789abcdef"]);
+    await expect(c.query(api.items.query().paginate(bad, 3))).rejects.toMatchObject({
+      name: "RtDbError",
+      code: "BAD_REQUEST",
+      message: /created_at must be a number/,
+    });
+  });
+
+  it("rejects paginate combined with take or count", async () => {
+    const c = newClient();
+    await seedItems(c, 3, ["todo"]);
+    await expect(
+      c.query({
+        json: { table: "items", paginate: { numItems: 3 }, take: 3 },
+      } as RtQuery<PaginatedResultJson>),
+    ).rejects.toMatchObject({ name: "RtDbError", code: "BAD_REQUEST", message: /take/ });
+    await expect(
+      c.query({
+        json: { table: "items", paginate: { numItems: 3 }, count: true },
+      } as RtQuery<PaginatedResultJson>),
+    ).rejects.toMatchObject({ name: "RtDbError", code: "BAD_REQUEST", message: /count/ });
   });
 });
