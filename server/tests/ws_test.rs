@@ -578,3 +578,67 @@ async fn list_schedules_over_ws() -> anyhow::Result<()> {
     assert!(reply["schedules"].is_array());
     Ok(())
 }
+
+// F5: pause and resume round-trip over WS. Schedules a far-future one-shot,
+// pauses it (pending -> paused, ack ok:true), then resumes it (paused ->
+// pending, ack ok:true), then cancels to clean up. The large afterMs keeps the
+// scheduler from claiming/firing the job mid-test, mirroring F2's anti-flake
+// guard. Covers the reactive WS path directly — pause/resume were previously
+// exercised only at the scheduler (set_paused) and client layers.
+#[tokio::test]
+async fn pause_and_resume_over_ws() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let db = fresh_db(&state).await;
+    let token = mint_token(addr, &db).await;
+
+    let mut ws = ws_connect(addr).await;
+    auth(&mut ws, &token, &db).await;
+
+    // Schedule a one-shot far enough out that the scheduler cannot fire it first.
+    send_json(
+        &mut ws,
+        json!({
+            "type": "schedule", "scheduleId": "s1",
+            "when": {"type": "afterMs", "ms": 3_600_000},
+            "txn": {"steps": [{"op": "insert", "table": "items", "doc": {"n": 1}}]}
+        }),
+    )
+    .await;
+    let reply = recv_json(&mut ws).await;
+    assert_eq!(reply["type"], json!("scheduleOk"));
+    assert_eq!(reply["scheduleId"], json!("s1"));
+    let id = reply["id"].as_str().expect("id").to_string();
+
+    // Pause: pending -> paused.
+    send_json(
+        &mut ws,
+        json!({"type": "pauseSchedule", "scheduleId": "p1", "id": id}),
+    )
+    .await;
+    let ack = recv_json(&mut ws).await;
+    assert_eq!(ack["type"], json!("scheduleAck"));
+    assert_eq!(ack["scheduleId"], json!("p1"));
+    assert_eq!(ack["ok"], json!(true));
+
+    // Resume: paused -> pending.
+    send_json(
+        &mut ws,
+        json!({"type": "resumeSchedule", "scheduleId": "r1", "id": id}),
+    )
+    .await;
+    let ack = recv_json(&mut ws).await;
+    assert_eq!(ack["type"], json!("scheduleAck"));
+    assert_eq!(ack["scheduleId"], json!("r1"));
+    assert_eq!(ack["ok"], json!(true));
+
+    // Clean up so the far-future job does not linger.
+    send_json(
+        &mut ws,
+        json!({"type": "cancelSchedule", "scheduleId": "c1", "id": id}),
+    )
+    .await;
+    let ack = recv_json(&mut ws).await;
+    assert_eq!(ack["ok"], json!(true));
+    Ok(())
+}

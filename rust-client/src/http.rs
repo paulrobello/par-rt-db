@@ -13,6 +13,31 @@ use std::future::Future;
 /// `retryOnPrecondition` default of 4 retries (5 total attempts).
 pub const DEFAULT_MUTATE_MAX_ATTEMPTS: u32 = 5;
 
+/// Percent-encode `s` the way the browser's `encodeURIComponent` does, so a
+/// schedule id interpolated into a URL path segment is byte-identical to what
+/// the TS client sends (`encodeURIComponent(id)`). Today ids are server-
+/// generated uuid v7 (`[0-9a-f-]`, all unescaped), so this is a no-op in
+/// practice — it exists for cross-client consistency if that ever changes.
+fn encode_uri_component(s: &str) -> String {
+    const UNESCAPED: &str = "-_.!~*'()";
+    let mut out = String::with_capacity(s.len());
+    // Byte-wise iteration reproduces `encodeURIComponent`: ASCII chars are
+    // encoded one-for-one, and every byte of a multi-byte UTF-8 sequence is
+    // >= 0x80 (non-alphanumeric) so it is percent-encoded individually — which
+    // is exactly the UTF-8 percent-encoding the browser emits.
+    for &b in s.as_bytes() {
+        let c = b as char;
+        if c.is_ascii_alphanumeric() || UNESCAPED.contains(c) {
+            out.push(c);
+        } else {
+            out.push('%');
+            // uppercase hex, matching encodeURIComponent
+            out.push_str(&format!("{:02X}", b));
+        }
+    }
+    out
+}
+
 pub struct RtDbHttpClient {
     url: String,
     db: String,
@@ -264,7 +289,13 @@ impl RtDbHttpClient {
         let body = Body { db: &self.db };
         let resp = self
             .client
-            .post(format!("{}/api/schedule/{id}/{op}", self.url))
+            // `id` is caller-supplied, so percent-encode the path segment;
+            // `op` is always a hardcoded literal, never interpolated raw from input.
+            .post(format!(
+                "{}/api/schedule/{}/{op}",
+                self.url,
+                encode_uri_component(id)
+            ))
             .bearer_auth(&self.token)
             .json(&body)
             .send()
@@ -701,6 +732,38 @@ mod tests {
         client.cancel_schedule("job-1").await.unwrap();
         client.pause_schedule("job-1").await.unwrap();
         client.resume_schedule("job-1").await.unwrap();
+    }
+
+    #[test]
+    fn encode_uri_component_matches_browser() {
+        // The encodeURIComponent unescaped set: A-Za-z0-9 - _ . ! ~ * ' ( )
+        assert_eq!(encode_uri_component("aB3-_.!~*'()"), "aB3-_.!~*'()");
+        // Reserved chars get uppercase-hex percent-encoding.
+        assert_eq!(encode_uri_component("a/b"), "a%2Fb");
+        assert_eq!(encode_uri_component("a b"), "a%20b");
+        assert_eq!(encode_uri_component("a+b"), "a%2Bb");
+        // Multi-byte UTF-8 percent-encodes each byte (é = C3 A9), matching the browser.
+        assert_eq!(encode_uri_component("é"), "%C3%A9");
+        // Real schedule ids (uuid v7) are untouched.
+        assert_eq!(
+            encode_uri_component("019f9111-acf2-7803-9074-fc50505582d4"),
+            "019f9111-acf2-7803-9074-fc50505582d4"
+        );
+    }
+
+    #[tokio::test]
+    async fn schedule_manage_encodes_the_id_path_segment() {
+        let (server, client) = setup().await;
+        // An id with a reserved path char (`/`) and a space must be
+        // percent-encoded like encodeURIComponent, matching the TS client:
+        // `a b/c` -> `a%20b%2Fc`.
+        Mock::given(method("POST"))
+            .and(path("/api/schedule/a%20b%2Fc/cancel"))
+            .and(body_partial_json(json!({"db": "t<uuid>"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+            .mount(&server)
+            .await;
+        client.cancel_schedule("a b/c").await.unwrap();
     }
 
     #[tokio::test]
