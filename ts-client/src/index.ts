@@ -38,3 +38,5 @@ export { RtDbAdminClient } from "./admin.js";
 export type { RtDbAdminClientOptions } from "./admin.js";
 export { RtDbClient } from "./client.js";
 export type { AuthState, ConnectionState, RtDbClientOptions, WebSocketLike } from "./client.js";
+export { InMemoryRtDbClient } from "./in_memory.js";
+export type { InMemoryRtDbClientOptions } from "./in_memory.js";
