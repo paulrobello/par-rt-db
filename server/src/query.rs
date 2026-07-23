@@ -1,7 +1,7 @@
 use sqlx::PgPool;
 
 use crate::db::validate_db_name;
-use crate::ddl::{pg_col, pg_schema, pg_table};
+use crate::ddl::{pg_col, pg_schema, pg_search_col, pg_table};
 use crate::error::RtDbError;
 use crate::pagination::{decode_cursor, encode_cursor};
 use crate::schema::{FieldType, IndexDef, SchemaDef, TableDef};
@@ -50,6 +50,8 @@ pub struct Query {
     pub paginate: Option<Paginate>,
     #[serde(default)]
     pub filter: Option<FilterExpr>, // additional WHERE predicate over doc fields; composes with index/order/take/cursor
+    #[serde(default)]
+    pub search: Option<SearchQuery>, // full-text search terminal: ranks by ts_rank over a search index's tsvector; composes with take
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -57,6 +59,16 @@ pub struct Query {
 pub struct Paginate {
     pub cursor: Option<String>,
     pub num_items: u32,
+}
+
+/// A full-text search terminal over a declared search index. `index` names a
+/// search index on the query's table; `query` is free-form user text matched
+/// via `plainto_tsquery` so it can't inject tsquery syntax.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SearchQuery {
+    pub index: String,
+    pub query: String,
 }
 
 /// A db-side predicate appended to a query's WHERE clause. Leaves compare one
@@ -166,9 +178,10 @@ pub async fn execute_query(
             || q.count
             || q.paginate.is_some()
             || q.filter.is_some()
+            || q.search.is_some()
         {
             return Err(RtDbError::bad_request(
-                "get cannot be combined with index, eq, range bounds, order, take, unique, first, count, paginate, or filter",
+                "get cannot be combined with index, eq, range bounds, order, take, unique, first, count, paginate, filter, or search",
             ));
         }
         return point_read(pool, db, &q.table, id).await;
@@ -249,6 +262,30 @@ pub async fn execute_query(
         return Err(RtDbError::bad_request(format!(
             "take exceeds maximum of {MAX_TAKE}"
         )));
+    }
+
+    // Full-text search terminal. It ranks over a search index's tsvector and is
+    // incompatible with every index-based terminal; `take` (already capped) is
+    // the only field it composes with.
+    if let Some(search) = &q.search {
+        if q.index.is_some()
+            || !q.eq.is_empty()
+            || q.gt.is_some()
+            || q.gte.is_some()
+            || q.lt.is_some()
+            || q.lte.is_some()
+            || q.order.is_some()
+            || q.unique
+            || q.first
+            || q.count
+            || q.paginate.is_some()
+            || q.filter.is_some()
+        {
+            return Err(RtDbError::bad_request(
+                "search cannot be combined with index, eq, range bounds, order, unique, first, count, paginate, or filter",
+            ));
+        }
+        return execute_search(pool, db, table_def, &q.table, search, q.take).await;
     }
 
     let index_def: Option<&IndexDef> = match &q.index {
@@ -817,6 +854,55 @@ fn jsonb_lhs_and_bind(
             "filter value must be a string, number, or boolean",
         )),
     }
+}
+
+/// Full-text search terminal: matches a search index's generated tsvector
+/// against `plainto_tsquery(<query text>)` and ranks by `ts_rank` descending,
+/// with `(created_at, id)` tie-breakers. Composes with `take` (defaulting to
+/// `MAX_TAKE`); the caller has already rejected every other terminal. The query
+/// text is bound once via `$1` and reused in the `ORDER BY ts_rank`, so user
+/// text can never inject tsquery syntax. Unknown index / empty query →
+/// `BadRequest`, never a 500.
+async fn execute_search(
+    pool: &PgPool,
+    db: &str,
+    table_def: &TableDef,
+    table_name: &str,
+    search: &SearchQuery,
+    take: Option<u32>,
+) -> Result<QueryResult, RtDbError> {
+    if search.query.trim().is_empty() {
+        return Err(RtDbError::bad_request(
+            "search query text must not be empty",
+        ));
+    }
+    let index_def = table_def
+        .indexes
+        .iter()
+        .find(|index| index.name == search.index && index.search)
+        .ok_or_else(|| {
+            RtDbError::bad_request(format!("search index '{}' not found", search.index))
+        })?;
+    let sv_col = pg_search_col(&index_def.name);
+    let limit = take.unwrap_or(MAX_TAKE);
+    let pg_schema_name = pg_schema(db);
+    let table_ident = pg_table(table_name);
+    let sql = format!(
+        "SELECT \"id\", \"doc\", \"created_at\", \"version\" FROM \"{pg_schema_name}\".\"{table_ident}\" \
+         WHERE \"{sv_col}\" @@ plainto_tsquery($1) \
+         ORDER BY ts_rank(\"{sv_col}\", plainto_tsquery($1)) DESC, \"created_at\" DESC, \"id\" DESC \
+         LIMIT $2"
+    );
+    let rows = sqlx::query_as::<_, (String, serde_json::Value, i64, i64)>(&sql)
+        .bind(&search.query)
+        .bind(i64::from(limit))
+        .fetch_all(pool)
+        .await?;
+    let docs = rows
+        .into_iter()
+        .map(|(id, doc, created_at, version)| merge_doc(id, doc, created_at, version))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(QueryResult::Docs(docs))
 }
 
 async fn point_read(

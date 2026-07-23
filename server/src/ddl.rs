@@ -14,6 +14,13 @@ pub fn pg_col(field: &str) -> String {
     format!("f_{}", field.to_lowercase())
 }
 
+/// Physical name of a search index's generated `tsvector` column. Columns are
+/// table-scoped (no table prefix needed), so `s_` + the lowercased index name
+/// stays well within Postgres's 63-byte identifier limit.
+pub fn pg_search_col(index_name: &str) -> String {
+    format!("s_{}", index_name.to_lowercase())
+}
+
 pub fn pg_schema(db: &str) -> String {
     format!("db_{db}")
 }
@@ -86,6 +93,12 @@ fn detect_destructive_changes(old: &SchemaDef, new: &SchemaDef) -> Result<(), Rt
                 Some(new_index) if new_index.fields != old_index.fields => {
                     return Err(RtDbError::bad_request(format!(
                         "changed fields of index '{}'",
+                        old_index.name
+                    )));
+                }
+                Some(new_index) if new_index.search != old_index.search => {
+                    return Err(RtDbError::bad_request(format!(
+                        "changed kind of index '{}' (btree <-> search)",
                         old_index.name
                     )));
                 }
@@ -181,17 +194,46 @@ pub async fn push_schema(
                 table_name.to_lowercase(),
                 index.name.to_lowercase()
             );
-            let cols: Vec<String> = index
-                .fields
-                .iter()
-                .map(|field_name| format!("\"{}\"", pg_col(field_name)))
-                .collect();
-            sqlx::query(&format!(
-                "CREATE INDEX \"{index_ident}\" ON \"{pg_schema_name}\".\"{table_ident}\" ({}, \"created_at\")",
-                cols.join(", ")
-            ))
-            .execute(&mut *tx)
-            .await?;
+            if index.search {
+                // A full-text search index: a generated `tsvector` column over
+                // its text fields plus a GIN index on it. The referenced
+                // `f_<field>` typed columns are created with the table (new) or
+                // added and backfilled just above (existing), so they already
+                // exist by this point. `to_tsvector(regconfig, text)` is
+                // immutable, so it is allowed in a STORED generated column.
+                let sv_col = pg_search_col(&index.name);
+                let terms: Vec<String> = index
+                    .fields
+                    .iter()
+                    .map(|field_name| format!("coalesce(\"{}\", '')", pg_col(field_name)))
+                    .collect();
+                sqlx::query(&format!(
+                    "ALTER TABLE \"{pg_schema_name}\".\"{table_ident}\" \
+                     ADD COLUMN \"{sv_col}\" tsvector GENERATED ALWAYS AS \
+                     (to_tsvector('english', {})) STORED",
+                    terms.join(" || ' ' || ")
+                ))
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query(&format!(
+                    "CREATE INDEX \"{index_ident}\" ON \"{pg_schema_name}\".\"{table_ident}\" \
+                     USING GIN (\"{sv_col}\")"
+                ))
+                .execute(&mut *tx)
+                .await?;
+            } else {
+                let cols: Vec<String> = index
+                    .fields
+                    .iter()
+                    .map(|field_name| format!("\"{}\"", pg_col(field_name)))
+                    .collect();
+                sqlx::query(&format!(
+                    "CREATE INDEX \"{index_ident}\" ON \"{pg_schema_name}\".\"{table_ident}\" ({}, \"created_at\")",
+                    cols.join(", ")
+                ))
+                .execute(&mut *tx)
+                .await?;
+            }
         }
     }
 

@@ -27,6 +27,17 @@ pub enum FieldType {
 pub struct IndexDef {
     pub name: String,
     pub fields: Vec<String>,
+    /// `true` marks a full-text search index: its text `fields` are tsvectorized
+    /// into a generated column with a GIN index and ranked by `ts_rank` via the
+    /// `search` query terminal. Omitted on the wire for ordinary btree indexes,
+    /// so existing schemas (and client payloads carrying only `name`/`fields`)
+    /// deserialize unchanged.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub search: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !b
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -213,7 +224,13 @@ impl TableDef {
                         index.name
                     ))
                 })?;
-                indexed_column_type(field_type)?;
+                let (pg_type, _) = indexed_column_type(field_type)?;
+                if index.search && pg_type != "text" {
+                    return Err(RtDbError::schema(format!(
+                        "search index '{}' on table '{table_name}' has non-text field '{field_name}'",
+                        index.name
+                    )));
+                }
             }
         }
         Ok(())
@@ -499,6 +516,7 @@ mod tests {
             indexes: vec![IndexDef {
                 name: index_name,
                 fields: vec!["name".to_string()],
+                search: false,
             }],
         };
         let schema = SchemaDef {
@@ -515,6 +533,7 @@ mod tests {
             indexes: vec![IndexDef {
                 name: index_name,
                 fields: vec!["name".to_string()],
+                search: false,
             }],
         };
         let schema = SchemaDef {
@@ -546,10 +565,12 @@ mod tests {
                 IndexDef {
                     name: "by_x".to_string(),
                     fields: vec!["name".to_string()],
+                    search: false,
                 },
                 IndexDef {
                     name: "By_X".to_string(),
                     fields: vec!["name".to_string()],
+                    search: false,
                 },
             ],
         };
@@ -596,6 +617,7 @@ mod tests {
             indexes: vec![IndexDef {
                 name: "by_tags".to_string(),
                 fields: vec!["tags".to_string()],
+                search: false,
             }],
         };
         let schema = SchemaDef {
@@ -611,6 +633,7 @@ mod tests {
             indexes: vec![IndexDef {
                 name: "by_nothing".to_string(),
                 fields: vec![],
+                search: false,
             }],
         };
         let schema = SchemaDef {
@@ -626,6 +649,7 @@ mod tests {
             indexes: vec![IndexDef {
                 name: "by_name".to_string(),
                 fields: vec!["name".to_string(), "name".to_string()],
+                search: false,
             }],
         };
         let schema = SchemaDef {
@@ -642,10 +666,12 @@ mod tests {
                 IndexDef {
                     name: "by_name".to_string(),
                     fields: vec!["name".to_string()],
+                    search: false,
                 },
                 IndexDef {
                     name: "by_name".to_string(),
                     fields: vec!["name".to_string()],
+                    search: false,
                 },
             ],
         };
@@ -662,6 +688,7 @@ mod tests {
             indexes: vec![IndexDef {
                 name: "by-name".to_string(),
                 fields: vec!["name".to_string()],
+                search: false,
             }],
         };
         let schema = SchemaDef {
@@ -677,6 +704,7 @@ mod tests {
             indexes: vec![IndexDef {
                 name: "by_missing".to_string(),
                 fields: vec!["missing".to_string()],
+                search: false,
             }],
         };
         let schema = SchemaDef {
@@ -1014,11 +1042,84 @@ mod tests {
             indexes: vec![IndexDef {
                 name: "by_meta".to_string(),
                 fields: vec!["meta".to_string()],
+                search: false,
             }],
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
         };
         assert!(schema.validate().is_err());
+    }
+
+    // (h) full-text search index: additive `search: true` flag on IndexDef.
+    #[test]
+    fn search_index_round_trips_and_validates() {
+        // A search index is declared by carrying `search: true`; a btree index
+        // omits it. Both deserialize from existing wire, and the flag round-trips
+        // through serde (btree omits `search`, search keeps `search: true`).
+        let schema = serde_json::json!({"tables":{"notes":{
+            "fields":{"title":{"type":"string"},"body":{"type":"string"}},
+            "indexes":[
+                {"name":"by_title","fields":["title"]},
+                {"name":"search_content","fields":["title","body"],"search":true}
+            ]
+        }}});
+        let parsed: SchemaDef = serde_json::from_value(schema).unwrap();
+        assert!(parsed.validate().is_ok());
+        let notes = parsed.tables.get("notes").unwrap();
+        let by_title = notes.indexes.iter().find(|i| i.name == "by_title").unwrap();
+        let search = notes
+            .indexes
+            .iter()
+            .find(|i| i.name == "search_content")
+            .unwrap();
+        assert!(!by_title.search);
+        assert!(search.search);
+        // Btree omits `search` on the wire; the search index keeps it.
+        assert_eq!(
+            serde_json::to_value(by_title).unwrap(),
+            serde_json::json!({"name":"by_title","fields":["title"]})
+        );
+        assert_eq!(
+            serde_json::to_value(search).unwrap(),
+            serde_json::json!({"name":"search_content","fields":["title","body"],"search":true})
+        );
+    }
+
+    #[test]
+    fn rejects_search_index_over_non_text_field() {
+        let table = TableDef {
+            fields: BTreeMap::from([("count".to_string(), FieldType::Number)]),
+            indexes: vec![IndexDef {
+                name: "search_count".to_string(),
+                fields: vec!["count".to_string()],
+                search: true,
+            }],
+        };
+        let schema = SchemaDef {
+            tables: BTreeMap::from([("items".to_string(), table)]),
+        };
+        assert!(schema.validate().is_err());
+    }
+
+    #[test]
+    fn accepts_search_index_over_optional_text_field() {
+        let table = TableDef {
+            fields: BTreeMap::from([(
+                "body".to_string(),
+                FieldType::Optional {
+                    inner: Box::new(FieldType::String),
+                },
+            )]),
+            indexes: vec![IndexDef {
+                name: "search_body".to_string(),
+                fields: vec!["body".to_string()],
+                search: true,
+            }],
+        };
+        let schema = SchemaDef {
+            tables: BTreeMap::from([("items".to_string(), table)]),
+        };
+        assert!(schema.validate().is_ok());
     }
 }
