@@ -70,6 +70,7 @@ pub enum QueryResult {
 #[serde(rename_all = "camelCase")]
 pub struct PaginatedResult {
     pub docs: Vec<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
 }
 

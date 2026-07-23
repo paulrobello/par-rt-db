@@ -69,17 +69,15 @@ describe.skipIf(server === null)("pagination e2e against a running server", () =
       expect(second.docs[9]).toMatchObject({ priority: 20 });
       expect(typeof second.nextCursor).toBe("string");
 
-      // Page 3 of 3: final partial page — a null nextCursor signals "no more
-      // pages". The server serializes Option::None as JSON null (serde default
-      // for PaginatedResult.next_cursor); the client treats null and undefined
-      // interchangeably via `== null` checks, but the wire value is null.
+      // Page 3 of 3: final partial page — the server omits nextCursor when
+      // there is no next page, which surfaces as `undefined` in the parsed JSON.
       const third = (await http.query(
         api.items.query().withIndex("by_priority").order("asc").paginate(second.nextCursor, 10),
       )) as unknown as PaginatedResultJson;
       expect(third.docs).toHaveLength(5);
       expect(third.docs[0]).toMatchObject({ priority: 21 });
       expect(third.docs[4]).toMatchObject({ priority: 25 });
-      expect(third.nextCursor).toBeNull();
+      expect(third.nextCursor).toBeUndefined();
 
       // Every doc was returned exactly once across the three pages, with no
       // gaps or duplicates — the correctness property of keyset pagination.
@@ -100,12 +98,12 @@ describe.skipIf(server === null)("pagination e2e against a running server", () =
 
       // Page size larger than the table: every doc lands in the single page and
       // there is no second page — the canonical "no more data" wire shape. The
-      // server emits nextCursor: null (not omitted) when there is no next page.
+      // server omits nextCursor when there is no next page (undefined in JSON).
       const page = (await http.query(
         api.items.query().withIndex("by_priority").order("asc").paginate(undefined, 1000),
       )) as unknown as PaginatedResultJson;
       expect(page.docs).toHaveLength(25);
-      expect(page.nextCursor).toBeNull();
+      expect(page.nextCursor).toBeUndefined();
     },
     E2E_TEST_TIMEOUT_MS,
   );
