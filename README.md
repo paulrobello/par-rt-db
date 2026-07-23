@@ -143,6 +143,108 @@ curl -s -X POST http://localhost:8300/api/query \
 # {"result":[{"_id":"018f9a2b3c4d75e6a8b1c2d3e4f5a6b7","_creationTime":1732000000000,"_version":1,"title":"Buy milk","done":false}]}
 ```
 
+## Pagination
+
+Keyset pagination over an index is supported via the `paginate` query terminal. A
+page request carries an opaque cursor (omitted for the first page) and a page
+size; the response is `{docs, nextCursor}`, where `nextCursor` is null when there
+is no next page. The cursor encodes the sort-column values of the last row on the
+page, so the server resumes strictly *after* it — stable under concurrent
+inserts/deletes unlike offset pagination.
+
+The `paginate` terminal composes with `index`, `eq`, range bounds (`gt`/`gte`/
+`lt`/`lte`), and `order`, and is mutually exclusive with `get`, `take`, `unique`,
+`first`, and `count`. `numItems` is capped at 4096 (`MAX_TAKE`).
+
+### Query shape
+
+```jsonc
+// First page — cursor omitted
+{"table": "items", "index": "by_priority", "order": "asc", "paginate": {"numItems": 20}}
+
+// Subsequent page — pass the previously returned nextCursor
+{"table": "items", "index": "by_priority", "order": "asc",
+ "paginate": {"cursor": "<opaque-cursor>", "numItems": 20}}
+```
+
+```jsonc
+// Response (HTTP `/api/query` wraps it as `{"result": {...}}`; WS `queryUpdate`
+// delivers the inner object directly)
+{"docs": [{"_id": "...", "_creationTime": 1732000000000, "_version": 1, "name": "item 1", "priority": 1}, /* ... */],
+ "nextCursor": "<opaque-cursor>"}  // null on the last page
+```
+
+### HTTP example: page through an index
+
+```bash
+# Page 1
+curl -s -X POST http://localhost:8300/api/query \
+  -H "Authorization: Bearer <machine-token>" \
+  -H "Content-Type: application/json" \
+  -d '{"db": "myapp", "query": {"table": "items", "index": "by_priority", "order": "asc", "paginate": {"numItems": 10}}}'
+# {"result":{"docs":[/* 10 docs */],"nextCursor":"<opaque-cursor>"}}
+
+# Page 2 — feed nextCursor back into the request
+curl -s -X POST http://localhost:8300/api/query \
+  -H "Authorization: Bearer <machine-token>" \
+  -H "Content-Type: application/json" \
+  -d '{"db": "myapp", "query": {"table": "items", "index": "by_priority", "order": "asc", "paginate": {"cursor": "<opaque-cursor>", "numItems": 10}}}'
+```
+
+### TypeScript client
+
+The `TableQuery.paginate(cursor, numItems)` builder terminal produces a paginated
+query, and the `usePaginatedQuery` hook (from `@par-rt-db/client/react`) manages
+page state and live subscriptions across pages. See
+[`client/README.md`](client/README.md) for the full SDK surface.
+
+```ts
+import { createApi } from "@par-rt-db/client";
+import { schema } from "./schema";
+
+const api = createApi(schema);
+// Returns {docs, nextCursor} — the wire page shape.
+const page = await http.query(
+  api.items.query().withIndex("by_priority").order("asc").paginate(undefined, 20),
+);
+```
+
+```tsx
+import { usePaginatedQuery } from "@par-rt-db/client/react";
+
+function ItemList() {
+  // The factory returns the base query JSON (no `paginate`); the hook injects
+  // `paginate` per page. Each loaded page is a live subscription, docs stitch
+  // across pages, and `loadMore` advances the cursor from the last page.
+  const { data, loading, hasNextPage, loadMore } = usePaginatedQuery<{
+    _id: string;
+    name: string;
+  }>(() => ({ table: "items", index: "by_priority", order: "asc" }), { pageSize: 20 });
+
+  return (
+    <div>
+      {data.map((item) => (
+        <div key={item._id}>{item.name}</div>
+      ))}
+      {hasNextPage && (
+        <button type="button" onClick={() => void loadMore()} disabled={loading}>
+          Load more
+        </button>
+      )}
+    </div>
+  );
+}
+```
+
+### Cursor format
+
+Cursors are opaque base64-encoded JSON arrays of the index field values (plus the
+tie-breaker columns `created_at` and `id`) for the last row on the previous page.
+Clients should treat them as opaque and pass them back verbatim. A cursor is tied
+to the query shape — changing the `index`, `order`, or `eq` prefix invalidates it;
+restart from the first page (no cursor). Multi-column index cursors are currently
+keyed on the first sort column only (single-column indexes are fully supported).
+
 ## Make targets
 
 | Target                   | Purpose                                                                         |
