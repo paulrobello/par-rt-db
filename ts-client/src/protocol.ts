@@ -62,6 +62,10 @@ export interface AuthedUser {
   kind: string;
   email?: string | null;
   name?: string | null;
+  /** GitHub login. Absent on the wire for machine tokens / non-GitHub users. */
+  githubLogin?: string | null;
+  /** GitHub numeric id, paired with `githubLogin`. */
+  githubId?: number | null;
 }
 
 /** Client -> server WS vocabulary. Tags/fields match server `protocol::ClientMessage`. */

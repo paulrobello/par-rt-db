@@ -1,5 +1,5 @@
 import { RtDbError } from "./errors.js";
-import type { TransactionJson } from "./protocol.js";
+import type { AuthedUser, TransactionJson } from "./protocol.js";
 import type { RtQuery } from "./query.js";
 
 export interface RtDbHttpClientOptions {
@@ -44,6 +44,18 @@ export class RtDbHttpClient {
     return (body as { results: unknown[] }).results;
   }
 
+  /**
+   * Validate an arbitrary player-supplied session/machine token via
+   * `GET /auth/validate`, returning the authed user. Unlike the client's own
+   * configured token, the token to validate is passed as an argument and may
+   * be either a session or a machine token. An invalid/expired token surfaces
+   * as the standard `RtDbError` auth envelope.
+   */
+  async validateSessionToken(token: string): Promise<AuthedUser> {
+    const body = await this.get("/auth/validate", token);
+    return (body as { user: AuthedUser }).user;
+  }
+
   private async post(path: string, payload: unknown): Promise<unknown> {
     const response = await this.fetchImpl(`${this.url}${path}`, {
       method: "POST",
@@ -52,6 +64,23 @@ export class RtDbHttpClient {
         Authorization: `Bearer ${this.token}`,
       },
       body: JSON.stringify(payload),
+    });
+    const parsed: unknown = await response.json().catch(() => null);
+    if (!response.ok) {
+      if (RtDbError.isEnvelope(parsed)) {
+        throw RtDbError.fromEnvelope(parsed);
+      }
+      throw new RtDbError("INTERNAL", `request failed with status ${response.status}`);
+    }
+    return parsed;
+  }
+
+  private async get(path: string, bearer: string): Promise<unknown> {
+    const response = await this.fetchImpl(`${this.url}${path}`, {
+      method: "GET",
+      headers: {
+        Authorization: `Bearer ${bearer}`,
+      },
     });
     const parsed: unknown = await response.json().catch(() => null);
     if (!response.ok) {

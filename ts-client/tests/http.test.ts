@@ -97,4 +97,75 @@ describe("RtDbHttpClient", () => {
     });
     await expect(client.mutate(mutation().build())).rejects.toBeInstanceOf(RtDbError);
   });
+
+  it("validateSessionToken GETs /auth/validate with the presented bearer and returns the user", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      jsonResponse({
+        user: {
+          kind: "user",
+          email: "player@example.com",
+          name: null,
+          githubLogin: "player",
+          githubId: 42,
+        },
+      }),
+    );
+    const client = new RtDbHttpClient({
+      url: "http://h:8300",
+      db: "kanban",
+      token: "client-own-token",
+      fetch: fetchMock,
+    });
+
+    const user = await client.validateSessionToken("player-session-token");
+
+    expect(user).toEqual({
+      kind: "user",
+      email: "player@example.com",
+      name: null,
+      githubLogin: "player",
+      githubId: 42,
+    });
+    const [calledUrl, init] = fetchMock.mock.calls[0];
+    expect(calledUrl).toBe("http://h:8300/auth/validate");
+    expect(init.method).toBe("GET");
+    // The validated token is the argument, not the client's own token.
+    expect(init.headers.Authorization).toBe("Bearer player-session-token");
+  });
+
+  it("validateSessionToken surfaces a 401 as an RtDbError envelope", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(jsonResponse({ code: "UNAUTHORIZED", message: "invalid token" }, 401));
+    const client = new RtDbHttpClient({
+      url: "http://h:8300",
+      db: "kanban",
+      token: "tok",
+      fetch: fetchMock,
+    });
+
+    await expect(client.validateSessionToken("not-a-real-token")).rejects.toMatchObject({
+      name: "RtDbError",
+      code: "UNAUTHORIZED",
+      message: "invalid token",
+    });
+  });
+
+  it("validateSessionToken tolerates a response omitting the github fields", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(jsonResponse({ user: { kind: "machine", email: null, name: null } }));
+    const client = new RtDbHttpClient({
+      url: "http://h:8300",
+      db: "kanban",
+      token: "tok",
+      fetch: fetchMock,
+    });
+
+    const user = await client.validateSessionToken("mach-tok");
+
+    expect(user.kind).toBe("machine");
+    expect(user.githubLogin).toBeUndefined();
+    expect(user.githubId).toBeUndefined();
+  });
 });
