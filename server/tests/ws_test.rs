@@ -489,3 +489,92 @@ async fn rate_limit_exceeded_closes_connection() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+// F2: schedule a one-shot over WS -> scheduleOk with an id; cancel it over the
+// same connection -> scheduleAck ok:true. `afterMs` is set well into the
+// future so the scheduler loop cannot claim+fire the job before our cancel
+// arrives (a 0ms job races the scheduler and flakes).
+#[tokio::test]
+async fn schedule_one_shot_over_ws() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let db = fresh_db(&state).await;
+    let token = mint_token(addr, &db).await;
+
+    let mut ws = ws_connect(addr).await;
+    auth(&mut ws, &token, &db).await;
+
+    send_json(
+        &mut ws,
+        json!({
+            "type": "schedule", "scheduleId": "s1",
+            "when": {"type": "afterMs", "ms": 60_000},
+            "txn": {"steps": [{"op": "insert", "table": "items", "doc": {"n": 5}}]}
+        }),
+    )
+    .await;
+    let reply = recv_json(&mut ws).await;
+    assert_eq!(reply["type"], json!("scheduleOk"));
+    assert_eq!(reply["scheduleId"], json!("s1"));
+    let id = reply["id"].as_str().expect("id").to_string();
+
+    send_json(
+        &mut ws,
+        json!({"type": "cancelSchedule", "scheduleId": "s2", "id": id}),
+    )
+    .await;
+    let ack = recv_json(&mut ws).await;
+    assert_eq!(ack["type"], json!("scheduleAck"));
+    assert_eq!(ack["scheduleId"], json!("s2"));
+    assert_eq!(ack["ok"], json!(true));
+    Ok(())
+}
+
+// F3: a garbage cron expr is rejected at resolve_when time -> scheduleErr.
+#[tokio::test]
+async fn schedule_rejects_bad_cron() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let db = fresh_db(&state).await;
+    let token = mint_token(addr, &db).await;
+
+    let mut ws = ws_connect(addr).await;
+    auth(&mut ws, &token, &db).await;
+
+    send_json(
+        &mut ws,
+        json!({
+            "type": "schedule", "scheduleId": "s1",
+            "when": {"type": "cron", "expr": "garbage"},
+            "txn": {"steps": []}
+        }),
+    )
+    .await;
+    let reply = recv_json(&mut ws).await;
+    assert_eq!(reply["type"], json!("scheduleErr"));
+    assert_eq!(reply["scheduleId"], json!("s1"));
+    Ok(())
+}
+
+// F4: listSchedules -> listSchedulesOk echoing the caller's scheduleId.
+#[tokio::test]
+async fn list_schedules_over_ws() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let db = fresh_db(&state).await;
+    let token = mint_token(addr, &db).await;
+
+    let mut ws = ws_connect(addr).await;
+    auth(&mut ws, &token, &db).await;
+
+    send_json(
+        &mut ws,
+        json!({"type": "listSchedules", "scheduleId": "l1"}),
+    )
+    .await;
+    let reply = recv_json(&mut ws).await;
+    assert_eq!(reply["type"], json!("listSchedulesOk"));
+    assert_eq!(reply["scheduleId"], json!("l1"));
+    assert!(reply["schedules"].is_array());
+    Ok(())
+}

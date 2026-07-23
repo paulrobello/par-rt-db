@@ -6,6 +6,7 @@
 
 use crate::db::{new_id, now_ms, validate_db_name};
 use crate::error::RtDbError;
+use crate::protocol::ScheduleWhen;
 
 /// Computes the next fire time (UTC epoch ms) for a 5-field cron expression,
 /// strictly after `now_ms`. Also validates the expression: a parse failure or
@@ -25,6 +26,28 @@ pub fn next_fire(expr: &str, now_ms: i64) -> Result<i64, RtDbError> {
         .find_next_occurrence(&now, false)
         .map_err(|_| RtDbError::bad_request("cron expression has no future fire times"))?;
     Ok(next.timestamp_millis())
+}
+
+/// Resolves a `ScheduleWhen` to `(kind, due_at, cron)` row fields. Validates
+/// the cron expression and rejects negative `afterMs`. A past `runAt` is
+/// allowed — it fires immediately (the catch-up path). Shared by WS and HTTP.
+pub(crate) fn resolve_when(
+    when: ScheduleWhen,
+    now: i64,
+) -> Result<(&'static str, i64, Option<String>), RtDbError> {
+    match when {
+        ScheduleWhen::AfterMs { ms } => {
+            if ms < 0 {
+                return Err(RtDbError::bad_request("afterMs must be non-negative"));
+            }
+            Ok(("oneshot", now + ms, None))
+        }
+        ScheduleWhen::RunAt { ms } => Ok(("oneshot", ms, None)),
+        ScheduleWhen::Cron { expr } => {
+            let due = next_fire(&expr, now)?;
+            Ok(("cron", due, Some(expr)))
+        }
+    }
 }
 
 use sqlx::PgPool;

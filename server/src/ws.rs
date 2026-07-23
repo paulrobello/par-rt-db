@@ -12,8 +12,10 @@ use tokio::time::{Instant, interval};
 
 use crate::AppState;
 use crate::auth::{Principal, authed_user, authorize, resolve_bearer};
+use crate::db::now_ms;
 use crate::error::{ErrorCode, RtDbError};
 use crate::protocol::{ClientMessage, ServerMessage};
+use crate::scheduler;
 use crate::subs::{ConnId, next_conn_id};
 
 const AUTH_TIMEOUT: Duration = Duration::from_secs(10);
@@ -336,20 +338,93 @@ async fn handle_text_frame(
             let _ = out_tx.send(ServerMessage::Pong);
             false
         }
-        // Schedule/cancel/pause/resume/list wire types land in Task 4; the
-        // handler that actually executes them is Task 9. Until then the
-        // variants are valid on the wire but not yet served.
-        ClientMessage::Schedule { .. }
-        | ClientMessage::CancelSchedule { .. }
-        | ClientMessage::PauseSchedule { .. }
-        | ClientMessage::ResumeSchedule { .. }
-        | ClientMessage::ListSchedules { .. } => {
-            fail_and_close(
-                socket,
-                RtDbError::bad_request("scheduled transactions not yet supported"),
-            )
-            .await;
-            true
+        ClientMessage::Schedule {
+            schedule_id,
+            when,
+            txn,
+        } => {
+            let reply = match authorize(&state.pool, principal, db).await {
+                Ok(()) => match scheduler::resolve_when(when, now_ms()) {
+                    Ok((kind, due_at, cron)) => {
+                        match scheduler::insert(
+                            &state.pool,
+                            db,
+                            kind,
+                            due_at,
+                            &txn,
+                            cron.as_deref(),
+                        )
+                        .await
+                        {
+                            Ok(id) => ServerMessage::ScheduleOk { schedule_id, id },
+                            Err(error) => ServerMessage::ScheduleErr { schedule_id, error },
+                        }
+                    }
+                    Err(error) => ServerMessage::ScheduleErr { schedule_id, error },
+                },
+                Err(error) => ServerMessage::ScheduleErr { schedule_id, error },
+            };
+            let _ = out_tx.send(reply);
+            false
+        }
+        ClientMessage::CancelSchedule { schedule_id, id } => {
+            let (ok, error) = match authorize(&state.pool, principal, db).await {
+                Ok(()) => match scheduler::cancel(&state.pool, db, &id).await {
+                    Ok(ok) => (ok, None),
+                    Err(error) => (false, Some(error)),
+                },
+                Err(error) => (false, Some(error)),
+            };
+            let _ = out_tx.send(ServerMessage::ScheduleAck {
+                schedule_id,
+                ok,
+                error,
+            });
+            false
+        }
+        ClientMessage::PauseSchedule { schedule_id, id } => {
+            let (ok, error) = match authorize(&state.pool, principal, db).await {
+                Ok(()) => match scheduler::set_paused(&state.pool, db, &id, true).await {
+                    Ok(ok) => (ok, None),
+                    Err(error) => (false, Some(error)),
+                },
+                Err(error) => (false, Some(error)),
+            };
+            let _ = out_tx.send(ServerMessage::ScheduleAck {
+                schedule_id,
+                ok,
+                error,
+            });
+            false
+        }
+        ClientMessage::ResumeSchedule { schedule_id, id } => {
+            let (ok, error) = match authorize(&state.pool, principal, db).await {
+                Ok(()) => match scheduler::set_paused(&state.pool, db, &id, false).await {
+                    Ok(ok) => (ok, None),
+                    Err(error) => (false, Some(error)),
+                },
+                Err(error) => (false, Some(error)),
+            };
+            let _ = out_tx.send(ServerMessage::ScheduleAck {
+                schedule_id,
+                ok,
+                error,
+            });
+            false
+        }
+        ClientMessage::ListSchedules { schedule_id } => {
+            let reply = match authorize(&state.pool, principal, db).await {
+                Ok(()) => match scheduler::list(&state.pool, db).await {
+                    Ok(schedules) => ServerMessage::ListSchedulesOk {
+                        schedule_id,
+                        schedules,
+                    },
+                    Err(error) => ServerMessage::ScheduleErr { schedule_id, error },
+                },
+                Err(error) => ServerMessage::ScheduleErr { schedule_id, error },
+            };
+            let _ = out_tx.send(reply);
+            false
         }
     }
 }
