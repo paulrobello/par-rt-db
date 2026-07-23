@@ -12,6 +12,9 @@ import type { AuthState, RtDbClient } from "./client.js";
 import type { AuthedUser, TransactionJson } from "./protocol.js";
 import type { RtQuery } from "./query.js";
 
+export type { UsePaginatedQueryOptions, UsePaginatedQueryResult } from "./usePaginatedQuery.js";
+export { usePaginatedQuery } from "./usePaginatedQuery.js";
+
 const TOKEN_STORAGE_KEY = "rtdb-session-token";
 
 interface RtDbContextValue {

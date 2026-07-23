@@ -1,12 +1,14 @@
 import { act, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { RtDbClient, type WebSocketLike } from "../src/client.js";
+import type { QueryJson } from "../src/protocol.js";
 import {
   Authenticated,
   AuthLoading,
   RtDbProvider,
   signInWithGitHub,
   Unauthenticated,
+  usePaginatedQuery,
   useQuery,
 } from "../src/react.js";
 import type { RtQuery } from "../src/query.js";
@@ -200,5 +202,191 @@ describe("signInWithGitHub", () => {
     // Advancing well past the poll interval after resolution must not throw or
     // produce an unhandled rejection — the interval must already be cleared.
     await vi.advanceTimersByTimeAsync(5000);
+  });
+});
+
+describe("usePaginatedQuery", () => {
+  /** Returns the latest subscribe frame not yet responded to. */
+  function nextPendingSub(
+    socket: FakeSocket,
+    delivered: Set<string>,
+  ): { queryId: string; query: QueryJson } {
+    const frame = socket
+      .parsed()
+      .find(
+        (m) => m.type === "subscribe" && !delivered.has((m as { queryId: string }).queryId),
+      ) as {
+      queryId: string;
+      query: QueryJson;
+    };
+    if (!frame) {
+      throw new Error("no pending subscribe frame");
+    }
+    delivered.add(frame.queryId);
+    return frame;
+  }
+
+  it("loads the first page then stitches the next via loadMore", async () => {
+    const { client, sockets } = setup();
+    const delivered = new Set<string>();
+
+    function View() {
+      const r = usePaginatedQuery<{ _id: string }>(() => ({ table: "items" }), {
+        pageSize: 2,
+      });
+      return (
+        <div>
+          <span>count:{r.data.length}</span>
+          <span>loading:{String(r.loading)}</span>
+          <span>hasNext:{String(r.hasNextPage)}</span>
+          <button type="button" onClick={() => void r.loadMore()}>
+            more
+          </button>
+        </div>
+      );
+    }
+
+    render(
+      <RtDbProvider client={client} authBaseUrl="http://h:8300">
+        <View />
+      </RtDbProvider>,
+    );
+    // First page is pending before the socket authenticates.
+    expect(screen.getByText("loading:true")).toBeTruthy();
+
+    await act(async () => {
+      sockets[0].open();
+      sockets[0].deliver({ type: "authOk", user: { kind: "user" } });
+    });
+
+    const sub1 = nextPendingSub(sockets[0], delivered);
+    expect(sub1.query.paginate?.numItems).toBe(2);
+    expect(sub1.query.paginate?.cursor).toBeUndefined();
+
+    await act(async () => {
+      sockets[0].deliver({
+        type: "queryUpdate",
+        queryId: sub1.queryId,
+        result: { docs: [{ _id: "a" }, { _id: "b" }], nextCursor: "cur1" },
+      });
+    });
+    expect(screen.getByText("count:2")).toBeTruthy();
+    expect(screen.getByText("loading:false")).toBeTruthy();
+    expect(screen.getByText("hasNext:true")).toBeTruthy();
+
+    // loadMore subscribes page 2 at the returned cursor. The incremental
+    // manager must NOT re-subscribe page 1, so only one new frame appears.
+    await act(async () => {
+      screen.getByText("more").click();
+    });
+    const sub2 = nextPendingSub(sockets[0], delivered);
+    expect(sub2.query.paginate?.cursor).toBe("cur1");
+    expect(sub2.query.paginate?.numItems).toBe(2);
+
+    await act(async () => {
+      sockets[0].deliver({
+        type: "queryUpdate",
+        queryId: sub2.queryId,
+        result: { docs: [{ _id: "c" }] }, // no nextCursor -> last page
+      });
+    });
+    expect(screen.getByText("count:3")).toBeTruthy();
+    expect(screen.getByText("hasNext:false")).toBeTruthy();
+    expect(screen.getByText("loading:false")).toBeTruthy();
+
+    // loadMore on the last page is a no-op (no new subscribe).
+    const before = sockets[0].parsed().filter((m) => m.type === "subscribe").length;
+    await act(async () => {
+      screen.getByText("more").click();
+    });
+    const after = sockets[0].parsed().filter((m) => m.type === "subscribe").length;
+    expect(after).toBe(before);
+  });
+
+  it("does not subscribe when enabled is false", async () => {
+    const { client, sockets } = setup();
+    function View() {
+      const r = usePaginatedQuery<{ _id: string }>(() => ({ table: "items" }), {
+        enabled: false,
+      });
+      return <div>count:{r.data.length}</div>;
+    }
+    render(
+      <RtDbProvider client={client} authBaseUrl="http://h:8300">
+        <View />
+      </RtDbProvider>,
+    );
+    await act(async () => {
+      sockets[0].open();
+      sockets[0].deliver({ type: "authOk", user: { kind: "user" } });
+    });
+    expect(screen.getByText("count:0")).toBeTruthy();
+    expect(sockets[0].parsed().some((m) => m.type === "subscribe")).toBe(false);
+  });
+
+  it("refetch drops deeper pages and re-subscribes the first page", async () => {
+    const { client, sockets } = setup();
+    const delivered = new Set<string>();
+    function View() {
+      const r = usePaginatedQuery<{ _id: string }>(() => ({ table: "items" }), {
+        pageSize: 2,
+      });
+      return (
+        <div>
+          <span>count:{r.data.length}</span>
+          <button type="button" onClick={() => void r.loadMore()}>
+            more
+          </button>
+          <button type="button" onClick={() => void r.refetch()}>
+            refetch
+          </button>
+        </div>
+      );
+    }
+    render(
+      <RtDbProvider client={client} authBaseUrl="http://h:8300">
+        <View />
+      </RtDbProvider>,
+    );
+    await act(async () => {
+      sockets[0].open();
+      sockets[0].deliver({ type: "authOk", user: { kind: "user" } });
+    });
+
+    const sub1 = nextPendingSub(sockets[0], delivered);
+    await act(async () => {
+      sockets[0].deliver({
+        type: "queryUpdate",
+        queryId: sub1.queryId,
+        result: { docs: [{ _id: "a" }, { _id: "b" }], nextCursor: "cur1" },
+      });
+    });
+    await act(async () => {
+      screen.getByText("more").click();
+    });
+    const sub2 = nextPendingSub(sockets[0], delivered);
+    await act(async () => {
+      sockets[0].deliver({
+        type: "queryUpdate",
+        queryId: sub2.queryId,
+        result: { docs: [{ _id: "c" }] },
+      });
+    });
+    expect(screen.getByText("count:3")).toBeTruthy();
+
+    // refetch resets to the first page; deeper pages are dropped.
+    await act(async () => {
+      screen.getByText("refetch").click();
+    });
+    expect(screen.getByText("count:0")).toBeTruthy();
+    const subRefetch = nextPendingSub(sockets[0], delivered);
+    await act(async () => {
+      sockets[0].deliver({
+        type: "queryUpdate",
+        queryId: subRefetch.queryId,
+        result: { docs: [{ _id: "a2" }, { _id: "b2" }] },
+      });
+    });
+    expect(screen.getByText("count:2")).toBeTruthy();
   });
 });
