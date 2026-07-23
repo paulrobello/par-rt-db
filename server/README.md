@@ -31,6 +31,7 @@ guidance. Authoritative design:
 | Area | Files |
 | --- | --- |
 | Correctness core (serialized writes + subscription fan-out) | `src/committer.rs`, `src/subs.rs` |
+| Scheduled / cron transactions | `src/scheduler.rs` (+ the `RunScheduled` arm in `src/committer.rs`) |
 | Schema model + validation | `src/schema.rs` |
 | Schema → Postgres DDL | `src/ddl.rs` |
 | Write / read paths | `src/txn.rs`, `src/query.rs` |
@@ -41,6 +42,29 @@ guidance. Authoritative design:
 The read path compiles a db-side `filter()` predicate DSL to SQL, and a
 full-text `search` query terminal backed by a generated tsvector column + GIN
 index, ranked by `ts_rank`.
+
+## Scheduling
+
+Per-database scheduled/cron transactions live in `src/scheduler.rs`. Each
+database gets a `scheduled_txns` side table (sibling of `mutations`) holding
+`(due_at, txn)` rows of declarative `Transaction`s — not code — created in
+`db::create_database` and lazily by `scheduler::ensure_table`. A per-db timer
+task (`scheduler::run_scheduler`, spawned alongside the committer in
+`Committers::channel_for`) claims due rows and enqueues each as a
+`CommitterRequest::RunScheduled`; the committer's `RunScheduled` arm
+(`handle_scheduled`) executes it via the normal `execute_txn` + `subs.fan_out`
+path and finalizes the row, so the single-writer invariant is intact. The
+scheduler task only writes the side table (claim/reset) — it never executes
+transactions itself.
+
+`when` is one-shot (`afterMs`/`runAt`) or a 5-field cron expression (UTC,
+min-first, via the `croner` crate). Delivery is **at-least-once**: a crash
+between commit and finalize is recovered by `reset_running` on startup, so apps
+should write idempotent scheduled txns. A past-due one-shot fires immediately
+(catch-up); cron **skips** missed windows with no backfill. WS surface:
+`Schedule` / `CancelSchedule` / `PauseSchedule` / `ResumeSchedule` /
+`ListSchedules`. HTTP surface: `POST /api/schedule`,
+`POST /api/schedule/{id}/{cancel,pause,resume}`, `POST /api/schedules`.
 
 ## Develop
 

@@ -65,6 +65,20 @@ let _one: Option<Item> = db.get("items", "i1").await?;
 (`collect`/`take` → `Vec<T>`, `first`/`unique`/`get` → `Option<T>`,
 `count` → `i64`, `paginate` → `Paginated<T>`).
 
+## Scheduling
+
+`RtDbHttpClient` and the reactive `RtDbClient` (`ws` feature) both expose
+scheduled/cron transactions. `when` is `ScheduleWhen::AfterMs { ms }`,
+`RunAt { ms }`, or `Cron { expr }` (5-field, min-first, UTC; the server
+validates); wire shapes mirror the server byte-for-byte (see `src/wire.rs`).
+
+```rust
+use par_rt_db_client::{ScheduleWhen, ScheduleInfo};
+let id: String = db.schedule(&txn, ScheduleWhen::AfterMs { ms: 60_000 }).await?;
+db.cancel_schedule(&id).await?;      // …or pause_schedule / resume_schedule
+let jobs: Vec<ScheduleInfo> = db.list_schedules().await?;
+```
+
 ## Errors
 
 Every failure is `RtDbError { code, message }` with `ErrorCode` matching the

@@ -78,6 +78,27 @@ const [{ id }] = (await db.mutate(
 )) as [{ id: string }];
 ```
 
+## Scheduling
+
+Both the reactive `RtDbClient` (WS) and the one-shot `RtDbHttpClient` expose
+scheduled/cron transactions:
+
+```ts
+// Schedule a txn — `when` is afterMs / runAt (one-shot) or cron (5-field, UTC, min-first).
+const { id } = await db.schedule(
+  mutation().insert("tasks", { title: "deferred", done: false }).build(),
+  { type: "afterMs", ms: 60_000 },
+);
+await db.cancelSchedule(id);      // …or pauseSchedule(id) / resumeSchedule(id)
+const jobs = await db.listSchedules();   // ScheduleInfo[]
+```
+
+The server validates the `cron` expression and resolves `due_at`; the client
+does no schedule arithmetic. Delivery is at-least-once, so scheduled txns
+should be idempotent. The in-memory test client (`InMemoryRtDbClient`) mirrors
+the store and exposes a timer-less `tick(nowMs?)` that fires due jobs
+synchronously in unit tests.
+
 ## In-memory test client
 
 `InMemoryRtDbClient` (`src/in_memory.ts`) is an in-memory implementation of the

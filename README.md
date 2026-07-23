@@ -22,6 +22,9 @@ The server itself listens on `RTDB_PORT` (default `8300`); run it with `cargo ru
 | `GET /sync`                | first WS frame     | Upgrades to WebSocket; speaks the realtime protocol below (auth, subscribe, mutate, ping).                                                   |
 | `POST /api/query`          | Bearer token       | One-shot query against a database; see [Query shape](#query-shape).                                                                          |
 | `POST /api/mutate`         | Bearer token       | One-shot transaction (insert/patch/replace/delete/expectVersion/expectAbsent/upsert steps).                                                  |
+| `POST /api/schedule`       | Bearer token       | Schedules a transaction: `afterMs`/`runAt` one-shot or `cron` (5-field, UTC, min-first); returns `{id}`.                                      |
+| `POST /api/schedule/{id}/{cancel,pause,resume}` | Bearer token | Cancels, pauses, or resumes a scheduled job.                                                                                        |
+| `POST /api/schedules`      | Bearer token       | Lists scheduled jobs for a database (`ScheduleInfo[]`).                                                                                      |
 | `POST /admin/create-db`    | Bearer admin key   | Creates a new database.                                                                                                                      |
 | `POST /admin/push-schema`  | Bearer admin key   | Applies additive schema DDL to a database.                                                                                                   |
 | `GET /admin/dbs`           | Bearer admin key   | Lists all databases.                                                                                                                         |
@@ -253,6 +256,49 @@ restart from the first page (no cursor). Compound (multi-column) indexes are
 fully supported: the cursor carries every sort-column value and the server resumes
 via a row-value comparison across all of them, with `id` as the globally unique
 final tie-breaker, so pages never skip or duplicate rows.
+
+## Scheduling
+
+Transactions can be scheduled for later or recurring execution — declarative
+`Transaction`s stored as data in a per-database `scheduled_txns` side table, not
+server-side code. `when` is one of:
+
+- `{type: "afterMs", ms}` — fire `ms` milliseconds from now (one-shot).
+- `{type: "runAt", ms}` — fire at this UTC epoch-ms instant (one-shot; in the past
+  fires immediately).
+- `{type: "cron", expr}` — fire on a 5-field standard cron expression (UTC,
+  min-first, e.g. `"*/5 * * * *"` = every 5 minutes). The server validates `expr`.
+
+A per-database scheduler timer claims due rows and enqueues each through the
+single-writer committer, which executes it via the normal transaction path (so
+subscriptions fire on schedule-driven writes too). Delivery is **at-least-once**:
+apps should write idempotent scheduled transactions. A one-shot catches up if past
+due; a cron **skips** missed windows with no backfill. Each job's lifecycle is
+managed with `cancel` / `pause` / `resume` and listed via `listSchedules`.
+
+### HTTP example: schedule a one-shot, then list
+
+```bash
+curl -s -X POST http://localhost:8300/api/schedule \
+  -H "Authorization: Bearer <machine-token>" \
+  -H "Content-Type: application/json" \
+  -d '{"db": "myapp", "when": {"type": "afterMs", "ms": 60000},
+       "txn": {"steps": [{"op": "insert", "table": "tasks", "doc": {"title": "deferred", "done": false}}]}}'
+# {"id":"<schedule-id>"}
+
+curl -s -X POST http://localhost:8300/api/schedules \
+  -H "Authorization: Bearer <machine-token>" \
+  -H "Content-Type: application/json" \
+  -d '{"db": "myapp"}'
+# {"schedules":[{"id":"<schedule-id>","kind":"oneshot","dueAt":...,"status":"pending","createdAt":...,"firedCount":0}]}
+```
+
+### WebSocket
+
+The WS surface adds `schedule` / `cancelSchedule` / `pauseSchedule` /
+`resumeSchedule` / `listSchedules` messages (tagged by `"type"`), with replies
+`scheduleOk` / `scheduleErr` / `scheduleAck` / `listSchedulesOk`. Authorization is
+re-run on every op, not just at connect.
 
 ## Make targets
 
