@@ -336,6 +336,21 @@ async fn handle_text_frame(
             let _ = out_tx.send(ServerMessage::Pong);
             false
         }
+        // Schedule/cancel/pause/resume/list wire types land in Task 4; the
+        // handler that actually executes them is Task 9. Until then the
+        // variants are valid on the wire but not yet served.
+        ClientMessage::Schedule { .. }
+        | ClientMessage::CancelSchedule { .. }
+        | ClientMessage::PauseSchedule { .. }
+        | ClientMessage::ResumeSchedule { .. }
+        | ClientMessage::ListSchedules { .. } => {
+            fail_and_close(
+                socket,
+                RtDbError::bad_request("scheduled transactions not yet supported"),
+            )
+            .await;
+            true
+        }
     }
 }
 

@@ -47,22 +47,9 @@ pub struct ClaimedJob {
     pub cron: Option<String>,
 }
 
-/// Local mirror of the wire `ScheduleInfo` (Task 4 promotes this to the public
-/// protocol type; until then it is module-private so list has a return type).
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ScheduleInfo {
-    pub id: String,
-    pub kind: String,
-    pub due_at: i64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cron: Option<String>,
-    pub status: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_error: Option<String>,
-    pub created_at: i64,
-    pub fired_count: i64,
-}
+/// Canonical scheduled-job view. Promoted to the wire type in Task 4 and
+/// re-exported here so `list` and existing call sites resolve one struct.
+pub use crate::protocol::ScheduleInfo;
 
 /// `CREATE TABLE IF NOT EXISTS` for databases that predate this feature.
 /// Mirrors `mutation_log::ensure_table`; called once at committer startup.
