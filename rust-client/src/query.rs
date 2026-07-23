@@ -141,6 +141,15 @@ impl TableQuery {
     }
 }
 
+// `Query: From<TableQuery>` lets `run(impl Into<Query>)` accept a `TableQuery`
+// directly; `Query: From<Query>` is already provided by the standard library's
+// reflexive `impl<T> From<T> for T`, so it is not re-declared here.
+impl From<TableQuery> for Query {
+    fn from(b: TableQuery) -> Query {
+        b.q
+    }
+}
+
 /// Deserialize the server's untagged `QueryResult` payload into the caller's type.
 /// Shape is chosen by the terminal used: array → `Vec<T>`, object/null → `Option<T>`,
 /// number → `i64`, `{docs,nextCursor?}` → `Paginated<T>`. serde does the discrimination
