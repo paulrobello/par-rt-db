@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use common::{fresh_db, kanban_schema_json, test_state};
 use rtdb_server::error::ErrorCode;
+use rtdb_server::pagination::encode_cursor;
 use rtdb_server::query::{Order, Paginate, Query, QueryResult, canonical, execute_query};
 use rtdb_server::schema::SchemaDef;
 use rtdb_server::txn::{Step, Transaction, execute_txn};
@@ -1890,5 +1891,515 @@ async fn count_combined_with_get_is_bad_request() -> anyhow::Result<()> {
     .expect_err("expected bad request");
     assert_eq!(err.code, ErrorCode::BadRequest);
 
+    Ok(())
+}
+
+// =============================================================================
+// Cursor-based pagination (`paginate` terminal).
+// =============================================================================
+
+/// Base query builder for paginate tests: a `workItems` query with everything
+/// defaulted and only the paginate-relevant fields overridable.
+fn paginate_query(
+    index: Option<&str>,
+    eq: Vec<serde_json::Value>,
+    order: Option<Order>,
+    paginate: Paginate,
+) -> Query {
+    Query {
+        table: "workItems".to_string(),
+        get: None,
+        index: index.map(str::to_string),
+        eq,
+        gt: None,
+        gte: None,
+        lt: None,
+        lte: None,
+        order,
+        take: None,
+        unique: false,
+        first: false,
+        count: false,
+        paginate: Some(paginate),
+    }
+}
+
+fn paginated(result: QueryResult) -> (Vec<serde_json::Value>, Option<String>) {
+    match result {
+        QueryResult::Paginated(pr) => (pr.docs, pr.next_cursor),
+        other => panic!("expected Paginated variant, got {other:?}"),
+    }
+}
+
+fn ids_of(docs: &[serde_json::Value]) -> Vec<String> {
+    docs.iter()
+        .map(|d| d["_id"].as_str().expect("_id string").to_string())
+        .collect()
+}
+
+// (p1) First page without a cursor: returns the first `num_items` docs by
+// (created_at, id) ascending and a non-null cursor when more rows exist.
+#[tokio::test]
+async fn paginate_first_page_no_index() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+
+    let (_project_id, items) = seed_kanban(&pool, &db, &schema).await?;
+
+    let (docs, next_cursor) = paginated(
+        execute_query(
+            &pool,
+            &db,
+            &schema,
+            &paginate_query(
+                None,
+                vec![],
+                None,
+                Paginate {
+                    cursor: None,
+                    num_items: 2,
+                },
+            ),
+        )
+        .await?,
+    );
+
+    assert_eq!(ids_of(&docs), vec![items[0].clone(), items[1].clone()]);
+    assert!(next_cursor.is_some());
+    Ok(())
+}
+
+// (p2) Walking the cursor across all pages returns every doc exactly once, in
+// (created_at, id) order, and terminates with a null cursor.
+#[tokio::test]
+async fn paginate_walks_all_pages_without_gaps_or_dupes() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+
+    let (_project_id, items) = seed_kanban(&pool, &db, &schema).await?;
+
+    let mut seen: Vec<String> = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let (docs, next) = paginated(
+            execute_query(
+                &pool,
+                &db,
+                &schema,
+                &paginate_query(
+                    None,
+                    vec![],
+                    None,
+                    Paginate {
+                        cursor,
+                        num_items: 2,
+                    },
+                ),
+            )
+            .await?,
+        );
+        seen.extend(ids_of(&docs));
+        match next {
+            Some(c) => cursor = Some(c),
+            None => break,
+        }
+    }
+
+    assert_eq!(seen, items);
+    Ok(())
+}
+
+// (p3) The last page carries no next cursor. 5 items / num_items 2 -> last page
+// has 1 doc and a null cursor.
+#[tokio::test]
+async fn paginate_last_page_has_no_cursor() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+
+    let (_project_id, items) = seed_kanban(&pool, &db, &schema).await?;
+
+    let mut cursor: Option<String> = None;
+    let mut last_docs: Vec<serde_json::Value>;
+    loop {
+        let (docs, next) = paginated(
+            execute_query(
+                &pool,
+                &db,
+                &schema,
+                &paginate_query(
+                    None,
+                    vec![],
+                    None,
+                    Paginate {
+                        cursor,
+                        num_items: 2,
+                    },
+                ),
+            )
+            .await?,
+        );
+        last_docs = docs;
+        match next {
+            Some(c) => cursor = Some(c),
+            None => break,
+        }
+    }
+
+    assert_eq!(ids_of(&last_docs), vec![items[4].clone()]);
+    Ok(())
+}
+
+// (p4) paginate honors an index + eq prefix: page is scoped to the eq matches
+// and ordered by (unbound index fields, created_at, id).
+#[tokio::test]
+async fn paginate_with_index_and_eq_prefix() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+
+    let (project_id, items) = seed_kanban(&pool, &db, &schema).await?;
+
+    let (docs, next) = paginated(
+        execute_query(
+            &pool,
+            &db,
+            &schema,
+            &paginate_query(
+                Some("by_project"),
+                vec![serde_json::json!(project_id)],
+                None,
+                Paginate {
+                    cursor: None,
+                    num_items: 2,
+                },
+            ),
+        )
+        .await?,
+    );
+    assert_eq!(ids_of(&docs), vec![items[0].clone(), items[1].clone()]);
+    assert!(next.is_some());
+
+    let (docs2, next2) = paginated(
+        execute_query(
+            &pool,
+            &db,
+            &schema,
+            &paginate_query(
+                Some("by_project"),
+                vec![serde_json::json!(project_id)],
+                None,
+                Paginate {
+                    cursor: next,
+                    num_items: 2,
+                },
+            ),
+        )
+        .await?,
+    );
+    assert_eq!(ids_of(&docs2), vec![items[2].clone(), items[3].clone()]);
+    assert!(next2.is_some());
+    Ok(())
+}
+
+// (p5) DESC order paginates in reverse: first page is the two newest docs.
+#[tokio::test]
+async fn paginate_desc_reverses_order() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+
+    let (_project_id, items) = seed_kanban(&pool, &db, &schema).await?;
+
+    let (docs, next) = paginated(
+        execute_query(
+            &pool,
+            &db,
+            &schema,
+            &paginate_query(
+                None,
+                vec![],
+                Some(Order::Desc),
+                Paginate {
+                    cursor: None,
+                    num_items: 2,
+                },
+            ),
+        )
+        .await?,
+    );
+    assert_eq!(ids_of(&docs), vec![items[4].clone(), items[3].clone()]);
+    assert!(next.is_some());
+
+    let (docs2, _) = paginated(
+        execute_query(
+            &pool,
+            &db,
+            &schema,
+            &paginate_query(
+                None,
+                vec![],
+                Some(Order::Desc),
+                Paginate {
+                    cursor: next,
+                    num_items: 2,
+                },
+            ),
+        )
+        .await?,
+    );
+    assert_eq!(ids_of(&docs2), vec![items[2].clone(), items[1].clone()]);
+    Ok(())
+}
+
+// (p6) Compound index with a 2-field eq prefix leaves no unbound index field,
+// so the keyset runs over (created_at, id) only and still resumes correctly.
+#[tokio::test]
+async fn paginate_compound_index_eq_consumes_all_fields() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+
+    let (project_id, items) = seed_kanban(&pool, &db, &schema).await?;
+    // backlog items are items[0] and items[2].
+    let backlog_eq = vec![serde_json::json!(project_id), serde_json::json!("backlog")];
+
+    let (docs, next) = paginated(
+        execute_query(
+            &pool,
+            &db,
+            &schema,
+            &paginate_query(
+                Some("by_project_and_status"),
+                backlog_eq.clone(),
+                None,
+                Paginate {
+                    cursor: None,
+                    num_items: 1,
+                },
+            ),
+        )
+        .await?,
+    );
+    assert_eq!(ids_of(&docs), vec![items[0].clone()]);
+    assert!(next.is_some());
+
+    let (docs2, next2) = paginated(
+        execute_query(
+            &pool,
+            &db,
+            &schema,
+            &paginate_query(
+                Some("by_project_and_status"),
+                backlog_eq.clone(),
+                None,
+                Paginate {
+                    cursor: next,
+                    num_items: 1,
+                },
+            ),
+        )
+        .await?,
+    );
+    assert_eq!(ids_of(&docs2), vec![items[2].clone()]);
+    assert!(next2.is_none());
+    Ok(())
+}
+
+// (p7) A num_items larger than the matching set returns everything and no cursor.
+#[tokio::test]
+async fn paginate_num_items_exceeds_total() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+
+    let (_project_id, items) = seed_kanban(&pool, &db, &schema).await?;
+
+    let (docs, next) = paginated(
+        execute_query(
+            &pool,
+            &db,
+            &schema,
+            &paginate_query(
+                None,
+                vec![],
+                None,
+                Paginate {
+                    cursor: None,
+                    num_items: 100,
+                },
+            ),
+        )
+        .await?,
+    );
+    assert_eq!(ids_of(&docs), items);
+    assert!(next.is_none());
+    Ok(())
+}
+
+// (p8) num_items above MAX_TAKE is silently capped (per the brief) rather than
+// rejected like `take` is.
+#[tokio::test]
+async fn paginate_caps_num_items_at_max_take() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+
+    let (_project_id, items) = seed_kanban(&pool, &db, &schema).await?;
+
+    let (docs, next) = paginated(
+        execute_query(
+            &pool,
+            &db,
+            &schema,
+            &paginate_query(
+                None,
+                vec![],
+                None,
+                Paginate {
+                    cursor: None,
+                    num_items: 100_000,
+                },
+            ),
+        )
+        .await?,
+    );
+    assert_eq!(ids_of(&docs), items);
+    assert!(next.is_none());
+    Ok(())
+}
+
+// (p9) A cursor whose arity does not match the sort columns is a BadRequest.
+#[tokio::test]
+async fn paginate_bad_cursor_arity_is_bad_request() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+
+    seed_kanban(&pool, &db, &schema).await?;
+
+    // No index => sort cols are (created_at, id) => 2 values. Send 3.
+    let bad = encode_cursor(&[
+        serde_json::json!(0i64),
+        serde_json::json!("id"),
+        serde_json::json!("extra"),
+    ])?;
+
+    let err = execute_query(
+        &pool,
+        &db,
+        &schema,
+        &paginate_query(
+            None,
+            vec![],
+            None,
+            Paginate {
+                cursor: Some(bad),
+                num_items: 10,
+            },
+        ),
+    )
+    .await
+    .expect_err("expected bad request");
+    assert_eq!(err.code, ErrorCode::BadRequest);
+    Ok(())
+}
+
+// (p10) A cursor that is not valid base64/JSON is a BadRequest.
+#[tokio::test]
+async fn paginate_garbage_cursor_is_bad_request() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+
+    seed_kanban(&pool, &db, &schema).await?;
+
+    let err = execute_query(
+        &pool,
+        &db,
+        &schema,
+        &paginate_query(
+            None,
+            vec![],
+            None,
+            Paginate {
+                cursor: Some("!!!not-base64!!!".to_string()),
+                num_items: 10,
+            },
+        ),
+    )
+    .await
+    .expect_err("expected bad request");
+    assert_eq!(err.code, ErrorCode::BadRequest);
+    Ok(())
+}
+
+// (p11) A non-system sort column (the unbound `order` field of a compound
+// index) round-trips through the cursor: the keyset resumes correctly across
+// pages ordered by (order, created_at, id).
+#[tokio::test]
+async fn paginate_index_field_value_round_trips_in_cursor() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+
+    let (project_id, items) = seed_kanban(&pool, &db, &schema).await?;
+    // by_project_and_order leaves `order` unbound after the eq prefix; sort
+    // cols are (order, created_at, id). All 5 workItems have distinct `order`
+    // values 1.0..5.0, so ascending order is items[0..4].
+    let eq = vec![serde_json::json!(project_id)];
+
+    let (docs, next) = paginated(
+        execute_query(
+            &pool,
+            &db,
+            &schema,
+            &paginate_query(
+                Some("by_project_and_order"),
+                eq.clone(),
+                None,
+                Paginate {
+                    cursor: None,
+                    num_items: 2,
+                },
+            ),
+        )
+        .await?,
+    );
+    assert_eq!(ids_of(&docs), vec![items[0].clone(), items[1].clone()]);
+    assert!(next.is_some());
+
+    let (docs2, next2) = paginated(
+        execute_query(
+            &pool,
+            &db,
+            &schema,
+            &paginate_query(
+                Some("by_project_and_order"),
+                eq.clone(),
+                None,
+                Paginate {
+                    cursor: next,
+                    num_items: 2,
+                },
+            ),
+        )
+        .await?,
+    );
+    assert_eq!(ids_of(&docs2), vec![items[2].clone(), items[3].clone()]);
+    assert!(next2.is_some());
     Ok(())
 }

@@ -3,7 +3,8 @@ use sqlx::PgPool;
 use crate::db::validate_db_name;
 use crate::ddl::{pg_col, pg_schema, pg_table};
 use crate::error::RtDbError;
-use crate::schema::{IndexDef, SchemaDef};
+use crate::pagination::{decode_cursor, encode_cursor};
+use crate::schema::{FieldType, IndexDef, SchemaDef};
 use crate::txn::{EqBind, eq_bind_for, eq_binds};
 
 /// Hard cap on rows returned by a single query, whether via an explicit
@@ -310,6 +311,131 @@ pub async fn execute_query(
         .collect::<Vec<_>>()
         .join(", ");
 
+    if let Some(paginate) = &q.paginate {
+        let num_items = paginate.num_items.min(MAX_TAKE);
+
+        // Sort-column types parallel `sort_cols`, for cursor bind typing.
+        let sort_col_types: Vec<SortCol> = {
+            let mut v: Vec<SortCol> = match index_def {
+                Some(idx) => idx.fields[eq_len..]
+                    .iter()
+                    .map(|fname| {
+                        let ft = table_def.fields.get(fname).ok_or_else(|| {
+                            RtDbError::internal(format!("index references unknown field '{fname}'"))
+                        })?;
+                        Ok(SortCol::IndexField(ft))
+                    })
+                    .collect::<Result<Vec<_>, RtDbError>>()?,
+                None => Vec::new(),
+            };
+            v.push(SortCol::CreatedAt);
+            v.push(SortCol::Id);
+            v
+        };
+
+        // Decode the cursor (if any) and append the keyset resume predicate to
+        // the eq/range WHERE already built for this query.
+        let cursor_start = eq_len + range_binds.len() + 1;
+        let cursor_binds: Vec<EqBind> = if let Some(cursor) = &paginate.cursor {
+            let cursor_values = decode_cursor(cursor)?;
+            if cursor_values.len() != sort_cols.len() {
+                return Err(RtDbError::bad_request(format!(
+                    "cursor has {} value(s) but this query sorts over {} column(s)",
+                    cursor_values.len(),
+                    sort_cols.len()
+                )));
+            }
+            let (clause, binds) = build_cursor_conditions(
+                &cursor_values,
+                &sort_cols,
+                &sort_col_types,
+                dir,
+                cursor_start,
+            )?;
+            where_conditions.push(clause);
+            binds
+        } else {
+            Vec::new()
+        };
+
+        let limit_placeholder = cursor_start + cursor_binds.len();
+        let pg_schema_name = pg_schema(db);
+        let table_ident = pg_table(&q.table);
+        let mut sql = format!(
+            "SELECT \"id\", \"doc\", \"created_at\", \"version\" FROM \"{pg_schema_name}\".\"{table_ident}\""
+        );
+        if !where_conditions.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&where_conditions.join(" AND "));
+        }
+        sql.push_str(" ORDER BY ");
+        sql.push_str(&order_by);
+        sql.push_str(&format!(" LIMIT ${limit_placeholder}"));
+
+        let mut query = sqlx::query_as::<_, (String, serde_json::Value, i64, i64)>(&sql);
+        for bind in binds {
+            query = match bind {
+                EqBind::Text(v) => query.bind(v),
+                EqBind::Num(v) => query.bind(v),
+                EqBind::Bool(v) => query.bind(v),
+            };
+        }
+        for bind in range_binds {
+            query = match bind {
+                EqBind::Text(v) => query.bind(v),
+                EqBind::Num(v) => query.bind(v),
+                EqBind::Bool(v) => query.bind(v),
+            };
+        }
+        for bind in cursor_binds {
+            query = match bind {
+                EqBind::Text(v) => query.bind(v),
+                EqBind::Num(v) => query.bind(v),
+                EqBind::Bool(v) => query.bind(v),
+            };
+        }
+        // Fetch one extra row so a next page can be detected without a second
+        // round-trip; the extra is discarded after the has-next check.
+        query = query.bind(i64::from(num_items) + 1);
+        let mut rows = query.fetch_all(pool).await?;
+
+        let has_next = rows.len() > num_items as usize;
+        if has_next {
+            rows.pop();
+        }
+
+        // The next cursor is built from the last row of the page (after the
+        // extra is discarded); absent when the page is empty or last.
+        let next_cursor =
+            if has_next && let Some((last_id, last_doc, last_created_at, _)) = rows.last() {
+                let mut cursor_values: Vec<serde_json::Value> = Vec::new();
+                if let Some(idx) = index_def {
+                    for fname in &idx.fields[eq_len..] {
+                        let val = last_doc.get(fname).ok_or_else(|| {
+                            RtDbError::internal(format!(
+                                "stored doc is missing indexed field '{fname}'"
+                            ))
+                        })?;
+                        cursor_values.push(val.clone());
+                    }
+                }
+                cursor_values.push(serde_json::json!(*last_created_at));
+                cursor_values.push(serde_json::Value::String(last_id.clone()));
+                Some(encode_cursor(&cursor_values)?)
+            } else {
+                None
+            };
+
+        let docs = rows
+            .into_iter()
+            .map(|(id, doc, created_at, version)| merge_doc(id, doc, created_at, version))
+            .collect::<Result<Vec<_>, _>>()?;
+        return Ok(QueryResult::Paginated(PaginatedResult {
+            docs,
+            next_cursor,
+        }));
+    }
+
     let limit: u32 = if q.unique {
         2
     } else if q.first {
@@ -377,6 +503,88 @@ pub async fn execute_query(
         .map(|(id, doc, created_at, version)| merge_doc(id, doc, created_at, version))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(QueryResult::Docs(docs))
+}
+
+/// A sort column's nature, used to type cursor binds. The sort order is always
+/// the unbound index fields (those after the `eq` prefix) followed by
+/// `created_at` then `id`.
+enum SortCol<'a> {
+    /// An unbound indexed user field — typed via its declared `FieldType`, so
+    /// cursor binds reuse the same `eq_bind_for` path as `eq` prefixes.
+    IndexField(&'a FieldType),
+    /// `created_at` column — stored as `bigint`. The cursor value is bound as
+    /// float8 and cast to bigint in the SQL (`$n::bigint`) so the comparison
+    /// is integer-vs-integer regardless of the float8 wire type.
+    CreatedAt,
+    /// `id` column — stored as `text`.
+    Id,
+}
+
+impl SortCol<'_> {
+    /// Returns the SQL placeholder (with cast when needed) and the typed bind
+    /// for one cursor value at 1-based position `pos`.
+    fn cursor_bind(
+        &self,
+        value: &serde_json::Value,
+        pos: usize,
+    ) -> Result<(String, EqBind), RtDbError> {
+        match self {
+            SortCol::IndexField(ft) => Ok((format!("${pos}"), eq_bind_for(ft, value)?)),
+            SortCol::CreatedAt => {
+                let n = value.as_f64().ok_or_else(|| {
+                    RtDbError::bad_request("cursor value for created_at must be a number")
+                })?;
+                Ok((format!("${pos}::bigint"), EqBind::Num(n)))
+            }
+            SortCol::Id => {
+                let s = value.as_str().ok_or_else(|| {
+                    RtDbError::bad_request("cursor value for id must be a string")
+                })?;
+                Ok((format!("${pos}"), EqBind::Text(s.to_string())))
+            }
+        }
+    }
+}
+
+/// Builds the keyset-pagination resume predicate for a cursor over `sort_cols`
+/// in direction `dir` ("ASC"/"DESC"). The cursor stores one value per sort
+/// column, in order; the predicate is the standard row-value comparison
+/// expanded to OR-of-AND:
+///
+/// ```text
+/// (c0 OP v0)
+///   OR (c0 = v0 AND c1 OP v1)
+///   OR ...
+///   OR (c0 = v0 AND ... AND cN-1 = vN-1 AND cN OP vN)
+/// ```
+///
+/// where OP is `>` (ASC) or `<` (DESC). Because `id` is always the final sort
+/// column and is globally unique, this fully determines a stable order — no
+/// row is skipped or duplicated across pages. `next_bind_idx` is the 1-based
+/// position of the first new bind. Returns the fully parenthesized predicate
+/// and the binds in placeholder order.
+fn build_cursor_conditions(
+    cursor_values: &[serde_json::Value],
+    sort_cols: &[String],
+    sort_col_types: &[SortCol<'_>],
+    dir: &str,
+    next_bind_idx: usize,
+) -> Result<(String, Vec<EqBind>), RtDbError> {
+    let op = if dir == "DESC" { "<" } else { ">" };
+    let mut binds: Vec<EqBind> = Vec::new();
+    let mut branches: Vec<String> = Vec::new();
+    for i in 0..sort_cols.len() {
+        let mut conjuncts: Vec<String> = Vec::new();
+        for j in 0..=i {
+            let pos = next_bind_idx + binds.len();
+            let (placeholder, bind) = sort_col_types[j].cursor_bind(&cursor_values[j], pos)?;
+            let cmp = if j < i { "=" } else { op };
+            conjuncts.push(format!("{} {cmp} {placeholder}", sort_cols[j]));
+            binds.push(bind);
+        }
+        branches.push(conjuncts.join(" AND "));
+    }
+    Ok((format!("({})", branches.join(" OR ")), binds))
 }
 
 async fn point_read(
