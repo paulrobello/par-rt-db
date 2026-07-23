@@ -253,6 +253,13 @@ mod tests {
             .table("solo", Table::new().field("x", FieldType::Number))
             .build();
         let v = serde_json::to_value(&schema).unwrap();
-        assert!(v["tables"]["solo"]["indexes"].is_null());
+        // Indexing a missing key and a present-null key both yield `Value::Null`,
+        // so verify absence on the underlying object rather than `is_null()`.
+        assert!(
+            !v["tables"]["solo"]
+                .as_object()
+                .expect("solo is an object")
+                .contains_key("indexes")
+        );
     }
 }

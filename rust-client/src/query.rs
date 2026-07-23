@@ -76,6 +76,10 @@ impl TableQuery {
             },
         }
     }
+    /// Build a point-read for `id` in `table`. Unlike `new()` (which returns the
+    /// builder so further clauses can be chained), this returns the finished wire
+    /// `Query` directly — a point-read is already a complete query — so it can be
+    /// passed straight to `RtDbHttpClient::run(impl Into<Query>)`.
     pub fn get(table: &str, id: &str) -> Query {
         Query {
             table: table.into(),
