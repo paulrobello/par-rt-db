@@ -9,22 +9,27 @@ DEPLOY_PATH = /docker/par-rt-db
 build:
 	cd server && cargo build
 	cd client && bun run build
+	cd rust-client && cargo build --all-features
 
 fmt:
 	cd server && cargo fmt --all
 	cd client && bun run fmt
+	cd rust-client && cargo fmt --all
 
 fmt-check:
 	cd server && cargo fmt --all -- --check
 	cd client && bun run fmt-check
+	cd rust-client && cargo fmt --all -- --check
 
 lint:
 	cd server && cargo clippy --all-targets --all-features -- -D warnings
 	cd client && bun run lint
+	cd rust-client && cargo clippy --all-targets --all-features -- -D warnings
 
 typecheck:
 	cd server && cargo check --all-targets
 	cd client && bun run typecheck
+	cd rust-client && cargo check --all-targets --all-features
 
 dev-db-up:
 	$(COMPOSE_DEV) up -d --wait
@@ -35,6 +40,7 @@ dev-db-down:
 test: dev-db-up
 	cd server && cargo test
 	cd client && bun run test
+	cd rust-client && cargo test --all-features
 
 client-install:
 	cd client && bun install
