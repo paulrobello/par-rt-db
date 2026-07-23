@@ -1,1 +1,250 @@
-//! Typed query DSL for reading documents from par-rt-db.
+//! Query DSL: builds the exact `Query` JSON the server expects, and parses untagged results.
+
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Order {
+    Asc,
+    Desc,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Paginate {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    pub num_items: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct Query {
+    pub table: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub get: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub eq: Vec<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gt: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gte: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lt: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lte: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order: Option<Order>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub take: Option<u32>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub unique: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub first: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub count: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paginate: Option<Paginate>,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Paginated<T> {
+    pub docs: Vec<T>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+/// A built query is just the wire `Query` (terminals consume the builder).
+pub struct TableQuery {
+    q: Query,
+}
+
+impl TableQuery {
+    pub fn new(table: &str) -> Self {
+        Self {
+            q: Query {
+                table: table.into(),
+                ..Default::default()
+            },
+        }
+    }
+    pub fn get(table: &str, id: &str) -> Query {
+        Query {
+            table: table.into(),
+            get: Some(id.into()),
+            ..Default::default()
+        }
+    }
+
+    pub fn with_index(mut self, index: &str, eq: &[serde_json::Value]) -> Self {
+        self.q.index = Some(index.into());
+        self.q.eq = eq.to_vec();
+        self
+    }
+    pub fn gt(mut self, v: impl Into<serde_json::Value>) -> Self {
+        self.q.gt = Some(v.into());
+        self
+    }
+    pub fn gte(mut self, v: impl Into<serde_json::Value>) -> Self {
+        self.q.gte = Some(v.into());
+        self
+    }
+    pub fn lt(mut self, v: impl Into<serde_json::Value>) -> Self {
+        self.q.lt = Some(v.into());
+        self
+    }
+    pub fn lte(mut self, v: impl Into<serde_json::Value>) -> Self {
+        self.q.lte = Some(v.into());
+        self
+    }
+    pub fn order(mut self, o: Order) -> Self {
+        self.q.order = Some(o);
+        self
+    }
+
+    pub fn take(mut self, n: u32) -> Query {
+        self.q.take = Some(n);
+        self.q
+    }
+    pub fn collect(self) -> Query {
+        self.q
+    }
+    pub fn unique(mut self) -> Query {
+        self.q.unique = true;
+        self.q
+    }
+    pub fn first(mut self) -> Query {
+        self.q.first = true;
+        self.q
+    }
+    pub fn count(mut self) -> Query {
+        self.q.count = true;
+        self.q
+    }
+    pub fn paginate(mut self, cursor: Option<&str>, num_items: u32) -> Query {
+        self.q.paginate = Some(Paginate {
+            cursor: cursor.map(|c| c.into()),
+            num_items,
+        });
+        self.q
+    }
+    pub fn build(self) -> Query {
+        self.q
+    }
+}
+
+/// Deserialize the server's untagged `QueryResult` payload into the caller's type.
+/// Shape is chosen by the terminal used: array → `Vec<T>`, object/null → `Option<T>`,
+/// number → `i64`, `{docs,nextCursor?}` → `Paginated<T>`. serde does the discrimination
+/// from `T` directly, so one generic covers all four.
+pub fn parse_result<T: DeserializeOwned>(
+    value: serde_json::Value,
+) -> Result<T, crate::error::RtDbError> {
+    serde_json::from_value::<T>(value)
+        .map_err(|e| crate::error::RtDbError::internal(format!("invalid query result: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn bare_table_query() {
+        let q = TableQuery::new("items").collect();
+        assert_eq!(serde_json::to_value(&q).unwrap(), json!({"table":"items"}));
+    }
+
+    #[test]
+    fn point_get() {
+        let q = TableQuery::get("items", "abc");
+        assert_eq!(
+            serde_json::to_value(&q).unwrap(),
+            json!({"table":"items","get":"abc"})
+        );
+    }
+
+    #[test]
+    fn index_eq_unique() {
+        let q = TableQuery::new("items")
+            .with_index("by_project", &[json!("p1")])
+            .unique();
+        assert_eq!(
+            serde_json::to_value(&q).unwrap(),
+            json!({"table":"items","index":"by_project","eq":["p1"],"unique":true})
+        );
+    }
+
+    #[test]
+    fn range_order_take() {
+        let q = TableQuery::new("items")
+            .with_index("by_project", &[json!("p1")])
+            .gte("a")
+            .lte("m")
+            .order(Order::Desc)
+            .take(10);
+        assert_eq!(
+            serde_json::to_value(&q).unwrap(),
+            json!({"table":"items","index":"by_project","eq":["p1"],"gte":"a","lte":"m","order":"desc","take":10})
+        );
+    }
+
+    #[test]
+    fn count_terminal() {
+        let q = TableQuery::new("items")
+            .with_index("by_status", &[json!("backlog")])
+            .count();
+        assert_eq!(
+            serde_json::to_value(&q).unwrap(),
+            json!({"table":"items","index":"by_status","eq":["backlog"],"count":true})
+        );
+    }
+
+    #[test]
+    fn paginate_terminal() {
+        let q = TableQuery::new("items")
+            .with_index("by_status", &[json!("backlog")])
+            .paginate(None, 20);
+        assert_eq!(
+            serde_json::to_value(&q).unwrap(),
+            json!({"table":"items","index":"by_status","eq":["backlog"],"paginate":{"numItems":20}})
+        );
+    }
+
+    #[test]
+    fn parse_count_from_number() {
+        let n: i64 = parse_result(serde_json::json!(42)).unwrap();
+        assert_eq!(n, 42);
+    }
+
+    #[test]
+    fn parse_docs_from_array() {
+        let docs: Vec<serde_json::Value> =
+            parse_result(serde_json::json!([{"_id":"a"},{"_id":"b"}])).unwrap();
+        assert_eq!(docs.len(), 2);
+    }
+
+    #[test]
+    fn parse_doc_from_object_or_null() {
+        let some: Option<serde_json::Value> = parse_result(serde_json::json!({"_id":"a"})).unwrap();
+        assert!(some.is_some());
+        let none: Option<serde_json::Value> = parse_result(serde_json::Value::Null).unwrap();
+        assert!(none.is_none());
+    }
+
+    #[test]
+    fn parse_paginated() {
+        let p: Paginated<serde_json::Value> =
+            parse_result(json!({"docs":[{"_id":"a"}],"nextCursor":"zzz"})).unwrap();
+        assert_eq!(p.docs.len(), 1);
+        assert_eq!(p.next_cursor.as_deref(), Some("zzz"));
+    }
+}
