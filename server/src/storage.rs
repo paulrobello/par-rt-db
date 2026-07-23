@@ -64,6 +64,7 @@ pub async fn put(
     validate_db_name(db)?;
     let schema = pg_schema(db);
     let id = new_id();
+    let mut tx = pool.begin().await?;
     sqlx::query(&format!(
         "INSERT INTO \"{schema}\".storage (id, sha256, size, content_type, bytes, created_at)
          VALUES ($1, $2, $3, $4, $5, $6)"
@@ -74,13 +75,14 @@ pub async fn put(
     .bind(content_type)
     .bind(bytes)
     .bind(now_ms())
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
     sqlx::query("INSERT INTO rtdb.storage_index (id, db_name) VALUES ($1, $2)")
         .bind(&id)
         .bind(db)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
+    tx.commit().await?;
     Ok(id)
 }
 
