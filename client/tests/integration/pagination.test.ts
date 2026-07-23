@@ -4,7 +4,6 @@
 // React unit tests.
 import { beforeAll, describe, expect, it } from "vitest";
 import { mutation } from "../../src/mutation.js";
-import type { PaginatedResultJson } from "../../src/protocol.js";
 import { createApi } from "../../src/query.js";
 import { defineSchema, defineTable, t } from "../../src/schema.js";
 import { httpClient, provisionDb, testServer } from "./harness.js";
@@ -52,18 +51,18 @@ describe.skipIf(server === null)("pagination e2e against a running server", () =
       await http.mutate(seed.build());
 
       // Page 1 of 3: first 10 of 25 — no cursor, expect a nextCursor.
-      const first = (await http.query(
+      const first = await http.query(
         api.items.query().withIndex("by_priority").order("asc").paginate(undefined, 10),
-      )) as unknown as PaginatedResultJson;
+      );
       expect(first.docs).toHaveLength(10);
       expect(first.docs[0]).toMatchObject({ priority: 1 });
       expect(first.docs[9]).toMatchObject({ priority: 10 });
       expect(typeof first.nextCursor).toBe("string");
 
       // Page 2 of 3: next 10 — resume from the returned cursor.
-      const second = (await http.query(
+      const second = await http.query(
         api.items.query().withIndex("by_priority").order("asc").paginate(first.nextCursor, 10),
-      )) as unknown as PaginatedResultJson;
+      );
       expect(second.docs).toHaveLength(10);
       expect(second.docs[0]).toMatchObject({ priority: 11 });
       expect(second.docs[9]).toMatchObject({ priority: 20 });
@@ -71,9 +70,9 @@ describe.skipIf(server === null)("pagination e2e against a running server", () =
 
       // Page 3 of 3: final partial page — the server omits nextCursor when
       // there is no next page, which surfaces as `undefined` in the parsed JSON.
-      const third = (await http.query(
+      const third = await http.query(
         api.items.query().withIndex("by_priority").order("asc").paginate(second.nextCursor, 10),
-      )) as unknown as PaginatedResultJson;
+      );
       expect(third.docs).toHaveLength(5);
       expect(third.docs[0]).toMatchObject({ priority: 21 });
       expect(third.docs[4]).toMatchObject({ priority: 25 });
@@ -99,9 +98,9 @@ describe.skipIf(server === null)("pagination e2e against a running server", () =
       // Page size larger than the table: every doc lands in the single page and
       // there is no second page — the canonical "no more data" wire shape. The
       // server omits nextCursor when there is no next page (undefined in JSON).
-      const page = (await http.query(
+      const page = await http.query(
         api.items.query().withIndex("by_priority").order("asc").paginate(undefined, 1000),
-      )) as unknown as PaginatedResultJson;
+      );
       expect(page.docs).toHaveLength(25);
       expect(page.nextCursor).toBeUndefined();
     },

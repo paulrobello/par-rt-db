@@ -1,4 +1,4 @@
-import type { Order, QueryJson } from "./protocol.js";
+import type { Order, PaginatedResultJson, QueryJson } from "./protocol.js";
 import type { Doc, Id, IndexNamesOf, SchemaDefinition, TableNames } from "./schema.js";
 
 /** A finished query carrying a phantom `Result` type used by the client/hooks. */
@@ -51,7 +51,7 @@ export class TableQuery<DocT, Indexes extends string> {
     return { json: { ...this.json, count: true } };
   }
 
-  paginate(cursor: string | undefined, numItems: number): RtQuery<DocT[]> {
+  paginate(cursor: string | undefined, numItems: number): RtQuery<PaginatedResultJson> {
     return {
       json: {
         ...this.json,
