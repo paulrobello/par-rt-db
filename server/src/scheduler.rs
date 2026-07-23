@@ -4,6 +4,7 @@
 //! via the normal `execute_txn` path. See
 //! `docs/superpowers/specs/2026-07-23-scheduled-cron-transactions-design.md`.
 
+use crate::db::{new_id, now_ms, validate_db_name};
 use crate::error::RtDbError;
 
 /// Computes the next fire time (UTC epoch ms) for a 5-field cron expression,
@@ -26,10 +27,325 @@ pub fn next_fire(expr: &str, now_ms: i64) -> Result<i64, RtDbError> {
     Ok(next.timestamp_millis())
 }
 
+use sqlx::PgPool;
+
+use crate::ddl::pg_schema;
+use crate::txn::Transaction;
+
+/// Cap on how many due jobs one claim sweep takes. Bounded so a flood of
+/// past-due one-shots can't pin the committer channel indefinitely.
+pub const CLAIM_BATCH: i64 = 64;
+
+/// A row claimed for execution by `claim_due`. The scheduler hands the full
+/// payload to the committer so the committer never has to re-read the row to
+/// execute or finalize it.
+#[derive(Debug, Clone)]
+pub struct ClaimedJob {
+    pub id: String,
+    pub kind: String, // "oneshot" | "cron"
+    pub txn: Transaction,
+    pub cron: Option<String>,
+}
+
+/// Local mirror of the wire `ScheduleInfo` (Task 4 promotes this to the public
+/// protocol type; until then it is module-private so list has a return type).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScheduleInfo {
+    pub id: String,
+    pub kind: String,
+    pub due_at: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cron: Option<String>,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    pub created_at: i64,
+    pub fired_count: i64,
+}
+
+/// `CREATE TABLE IF NOT EXISTS` for databases that predate this feature.
+/// Mirrors `mutation_log::ensure_table`; called once at committer startup.
+pub async fn ensure_table(pool: &PgPool, db: &str) -> Result<(), RtDbError> {
+    validate_db_name(db)?;
+    let schema = pg_schema(db);
+    sqlx::query(&format!(
+        "CREATE TABLE IF NOT EXISTS \"{schema}\".scheduled_txns (
+            id          text PRIMARY KEY,
+            kind        text NOT NULL,
+            due_at      bigint NOT NULL,
+            txn         jsonb NOT NULL,
+            cron        text,
+            status      text NOT NULL,
+            last_error  text,
+            created_at  bigint NOT NULL,
+            fired_count bigint NOT NULL DEFAULT 0
+        )"
+    ))
+    .execute(pool)
+    .await?;
+    sqlx::query(&format!(
+        "CREATE INDEX IF NOT EXISTS \"{schema}_scheduled_due_idx\"
+         ON \"{schema}\".scheduled_txns (status, due_at)"
+    ))
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn insert(
+    pool: &PgPool,
+    db: &str,
+    kind: &str,
+    due_at: i64,
+    txn: &Transaction,
+    cron: Option<&str>,
+) -> Result<String, RtDbError> {
+    validate_db_name(db)?;
+    let schema = pg_schema(db);
+    let id = new_id();
+    let txn_json = serde_json::to_value(txn).map_err(|err| {
+        tracing::error!(error = %err, db, "failed to serialize scheduled txn");
+        RtDbError::internal("failed to schedule txn")
+    })?;
+    sqlx::query(&format!(
+        "INSERT INTO \"{schema}\".scheduled_txns
+            (id, kind, due_at, txn, cron, status, created_at)
+         VALUES ($1, $2, $3, $4, $5, 'pending', $6)"
+    ))
+    .bind(&id)
+    .bind(kind)
+    .bind(due_at)
+    .bind(txn_json)
+    .bind(cron)
+    .bind(now_ms())
+    .execute(pool)
+    .await?;
+    Ok(id)
+}
+
+pub async fn list(pool: &PgPool, db: &str) -> Result<Vec<ScheduleInfo>, RtDbError> {
+    validate_db_name(db)?;
+    let schema = pg_schema(db);
+    // Column order matches the SELECT list above.
+    type ScheduleRow = (
+        String,
+        String,
+        i64,
+        Option<String>,
+        String,
+        Option<String>,
+        i64,
+        i64,
+    );
+    let rows: Vec<ScheduleRow> = sqlx::query_as(&format!(
+        "SELECT id, kind, due_at, cron, status, last_error, created_at, fired_count
+             FROM \"{schema}\".scheduled_txns ORDER BY due_at"
+    ))
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(
+            |(id, kind, due_at, cron, status, last_error, created_at, fired_count)| ScheduleInfo {
+                id,
+                kind,
+                due_at,
+                cron,
+                status,
+                last_error,
+                created_at,
+                fired_count,
+            },
+        )
+        .collect())
+}
+
+pub async fn cancel(pool: &PgPool, db: &str, id: &str) -> Result<bool, RtDbError> {
+    validate_db_name(db)?;
+    let schema = pg_schema(db);
+    let res = sqlx::query(&format!(
+        "DELETE FROM \"{schema}\".scheduled_txns WHERE id = $1"
+    ))
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected() > 0)
+}
+
+/// Pause (`paused=true`) or resume (`paused=false`) a job. Resuming a cron job
+/// recomputes `due_at` to the next fire after now; resuming a one-shot leaves
+/// its `due_at` alone. Returns true if a row was updated.
+pub async fn set_paused(
+    pool: &PgPool,
+    db: &str,
+    id: &str,
+    paused: bool,
+) -> Result<bool, RtDbError> {
+    validate_db_name(db)?;
+    let schema = pg_schema(db);
+    let res = if paused {
+        sqlx::query(&format!(
+            "UPDATE \"{schema}\".scheduled_txns SET status = 'paused'
+             WHERE id = $1 AND status = 'pending'"
+        ))
+        .bind(id)
+        .execute(pool)
+        .await?
+    } else {
+        // Resume: recompute next fire for cron; one-shot keeps its due_at.
+        let row: Option<(String, Option<String>)> = sqlx::query_as(&format!(
+            "SELECT kind, cron FROM \"{schema}\".scheduled_txns
+             WHERE id = $1 AND status = 'paused'"
+        ))
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+        match row {
+            Some((kind, Some(expr))) if kind == "cron" => {
+                let next = next_fire(&expr, now_ms())?;
+                sqlx::query(&format!(
+                    "UPDATE \"{schema}\".scheduled_txns
+                     SET status = 'pending', due_at = $2, last_error = NULL
+                     WHERE id = $1"
+                ))
+                .bind(id)
+                .bind(next)
+                .execute(pool)
+                .await?
+            }
+            Some(_) => {
+                sqlx::query(&format!(
+                    "UPDATE \"{schema}\".scheduled_txns SET status = 'pending'
+                     WHERE id = $1"
+                ))
+                .bind(id)
+                .execute(pool)
+                .await?
+            }
+            None => return Ok(false),
+        }
+    };
+    Ok(res.rows_affected() > 0)
+}
+
+/// Crash recovery: any `running` row was orphaned by a task that died mid-fire.
+/// Reset to `pending` so it re-fires (at-least-once).
+pub async fn reset_running(pool: &PgPool, db: &str) -> Result<u64, RtDbError> {
+    validate_db_name(db)?;
+    let schema = pg_schema(db);
+    let res = sqlx::query(&format!(
+        "UPDATE \"{schema}\".scheduled_txns SET status = 'pending'
+         WHERE status = 'running'"
+    ))
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected())
+}
+
+/// Min `due_at` among `pending` rows, or `None` if the table has nothing due.
+/// `MIN(due_at)` is SQL `NULL` when no rows match, which sqlx deserializes as
+/// `Option<i64> = None`, so this naturally returns `None` for an empty table.
+pub async fn next_due(pool: &PgPool, db: &str) -> Result<Option<i64>, RtDbError> {
+    validate_db_name(db)?;
+    let schema = pg_schema(db);
+    let row: Option<(Option<i64>,)> = sqlx::query_as(&format!(
+        "SELECT MIN(due_at) FROM \"{schema}\".scheduled_txns WHERE status = 'pending'"
+    ))
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.and_then(|(m,)| m))
+}
+
+/// Atomically claims up to `batch` due rows: `pending`+`due_at <= now` →
+/// `running`. `FOR UPDATE SKIP LOCKED` makes the claim safe even if a second
+/// claimer ever exists (today there is exactly one scheduler per db).
+pub async fn claim_due(
+    pool: &PgPool,
+    db: &str,
+    now: i64,
+    batch: i64,
+) -> Result<Vec<ClaimedJob>, RtDbError> {
+    validate_db_name(db)?;
+    let schema = pg_schema(db);
+    let rows: Vec<(String, String, serde_json::Value, Option<String>)> = sqlx::query_as(&format!(
+        "UPDATE \"{schema}\".scheduled_txns SET status = 'running'
+             WHERE id IN (
+                 SELECT id FROM \"{schema}\".scheduled_txns
+                 WHERE status = 'pending' AND due_at <= $1
+                 ORDER BY due_at LIMIT $2
+                 FOR UPDATE SKIP LOCKED
+             )
+             RETURNING id, kind, txn, cron"
+    ))
+    .bind(now)
+    .bind(batch)
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter()
+        .map(|(id, kind, txn_json, cron)| {
+            let txn: Transaction = serde_json::from_value(txn_json).map_err(|err| {
+                tracing::error!(error = %err, db, %id, "failed to deserialize scheduled txn");
+                RtDbError::internal("failed to read scheduled txn")
+            })?;
+            Ok(ClaimedJob {
+                id,
+                kind,
+                txn,
+                cron,
+            })
+        })
+        .collect()
+}
+
+pub async fn finalize_one_shot_done(pool: &PgPool, db: &str, id: &str) -> Result<(), RtDbError> {
+    validate_db_name(db)?;
+    let schema = pg_schema(db);
+    sqlx::query(&format!(
+        "DELETE FROM \"{schema}\".scheduled_txns WHERE id = $1"
+    ))
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn finalize_cron_next(
+    pool: &PgPool,
+    db: &str,
+    id: &str,
+    next_due: i64,
+) -> Result<(), RtDbError> {
+    validate_db_name(db)?;
+    let schema = pg_schema(db);
+    sqlx::query(&format!(
+        "UPDATE \"{schema}\".scheduled_txns
+         SET status = 'pending', due_at = $2, fired_count = fired_count + 1, last_error = NULL
+         WHERE id = $1"
+    ))
+    .bind(id)
+    .bind(next_due)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn mark_error(pool: &PgPool, db: &str, id: &str, msg: &str) -> Result<(), RtDbError> {
+    validate_db_name(db)?;
+    let schema = pg_schema(db);
+    sqlx::query(&format!(
+        "UPDATE \"{schema}\".scheduled_txns SET status = 'error', last_error = $2 WHERE id = $1"
+    ))
+    .bind(id)
+    .bind(msg)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::now_ms;
 
     /// 2026-07-23T12:00:00Z = 1784808000000 ms (a Thursday). A fixed anchor so
     /// the minute/hour/day math is deterministic.

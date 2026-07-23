@@ -150,6 +150,28 @@ pub async fn create_database(pool: &PgPool, name: &str) -> Result<(), RtDbError>
     .execute(&mut *tx)
     .await?;
 
+    sqlx::query(&format!(
+        "CREATE TABLE \"{schema_name}\".scheduled_txns (
+            id          text PRIMARY KEY,
+            kind        text NOT NULL,
+            due_at      bigint NOT NULL,
+            txn         jsonb NOT NULL,
+            cron        text,
+            status      text NOT NULL,
+            last_error  text,
+            created_at  bigint NOT NULL,
+            fired_count bigint NOT NULL DEFAULT 0
+        )"
+    ))
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(&format!(
+        "CREATE INDEX \"{schema_name}_scheduled_due_idx\"
+         ON \"{schema_name}\".scheduled_txns (status, due_at)"
+    ))
+    .execute(&mut *tx)
+    .await?;
+
     sqlx::query("INSERT INTO rtdb_auth.databases (name, created_at) VALUES ($1, $2)")
         .bind(name)
         .bind(now_ms())
