@@ -3,7 +3,7 @@
 use crate::error::{ErrorEnvelope, RtDbError, retry_on_precondition};
 use crate::mutation::{Mutation, StepResult, Transaction};
 use crate::query::{TableQuery, parse_result};
-use crate::wire::AuthedUser;
+use crate::wire::{AuthedUser, ScheduleInfo, ScheduleWhen};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::future::Future;
@@ -197,6 +197,112 @@ impl RtDbHttpClient {
             max_attempts.saturating_sub(1),
         )
         .await
+    }
+
+    /// Schedule `txn` to fire at `when`. The server validates cron expressions
+    /// and resolves the due time; the client does no schedule arithmetic. Returns
+    /// the new schedule's id. Mirrors `ts-client`'s `schedule`.
+    pub async fn schedule(
+        &self,
+        txn: &Transaction,
+        when: ScheduleWhen,
+    ) -> Result<String, RtDbError> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Body<'a> {
+            db: &'a str,
+            when: ScheduleWhen,
+            txn: &'a Transaction,
+        }
+        let body = Body {
+            db: &self.db,
+            when,
+            txn,
+        };
+        let resp = self
+            .client
+            .post(format!("{}/api/schedule", self.url))
+            .bearer_auth(&self.token)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| RtDbError::internal(format!("schedule request failed: {e}")))?;
+        #[derive(serde::Deserialize)]
+        struct ScheduleResponse {
+            id: String,
+        }
+        let parsed = self.deserialize::<ScheduleResponse>(resp).await?;
+        Ok(parsed.id)
+    }
+
+    /// Cancel a scheduled job (`POST /api/schedule/{id}/cancel`). The server
+    /// returns `{ok:true}` on success.
+    pub async fn cancel_schedule(&self, id: &str) -> Result<(), RtDbError> {
+        self.manage_schedule(id, "cancel").await
+    }
+
+    /// Pause a scheduled job until [`resume_schedule`](Self::resume_schedule) is
+    /// called (`POST /api/schedule/{id}/pause`).
+    pub async fn pause_schedule(&self, id: &str) -> Result<(), RtDbError> {
+        self.manage_schedule(id, "pause").await
+    }
+
+    /// Resume a paused scheduled job (`POST /api/schedule/{id}/resume`).
+    pub async fn resume_schedule(&self, id: &str) -> Result<(), RtDbError> {
+        self.manage_schedule(id, "resume").await
+    }
+
+    /// Shared authorize-then-op body for the three boolean manage handlers. `op`
+    /// is always a hardcoded literal ("cancel" | "pause" | "resume"), never
+    /// caller-supplied, so interpolating it into the path is safe.
+    async fn manage_schedule(&self, id: &str, op: &str) -> Result<(), RtDbError> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Body<'a> {
+            db: &'a str,
+        }
+        let body = Body { db: &self.db };
+        let resp = self
+            .client
+            .post(format!("{}/api/schedule/{id}/{op}", self.url))
+            .bearer_auth(&self.token)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| RtDbError::internal(format!("schedule {op} request failed: {e}")))?;
+        #[derive(serde::Deserialize)]
+        struct ManageResponse {
+            ok: bool,
+        }
+        let parsed = self.deserialize::<ManageResponse>(resp).await?;
+        if !parsed.ok {
+            return Err(RtDbError::internal("schedule operation returned ok=false"));
+        }
+        Ok(())
+    }
+
+    /// List scheduled jobs for this client's database (`POST /api/schedules`).
+    pub async fn list_schedules(&self) -> Result<Vec<ScheduleInfo>, RtDbError> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Body<'a> {
+            db: &'a str,
+        }
+        #[derive(serde::Deserialize)]
+        struct ListResponse {
+            schedules: Vec<ScheduleInfo>,
+        }
+        let body = Body { db: &self.db };
+        let resp = self
+            .client
+            .post(format!("{}/api/schedules", self.url))
+            .bearer_auth(&self.token)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| RtDbError::internal(format!("list schedules request failed: {e}")))?;
+        let parsed = self.deserialize::<ListResponse>(resp).await?;
+        Ok(parsed.schedules)
     }
 
     /// Validate the bearer (session) token via `GET /auth/me`. Machine tokens get 401.
@@ -557,6 +663,69 @@ mod tests {
             .await;
         let txn = Mutation::new().delete("items", "i1").build();
         client.mutate(&txn, Some("k1")).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn schedule_posts_when_and_txn_and_returns_id() {
+        let (server, client) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/api/schedule"))
+            .and(header("authorization", "Bearer machine-token"))
+            .and(body_partial_json(json!({
+                "db": "t<uuid>",
+                "when": {"type": "afterMs", "ms": 5000},
+                "txn": {"steps": []}
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": "job-7"})))
+            .mount(&server)
+            .await;
+        let txn = Mutation::new().build();
+        let id = client
+            .schedule(&txn, crate::wire::ScheduleWhen::AfterMs { ms: 5000 })
+            .await
+            .unwrap();
+        assert_eq!(id, "job-7");
+    }
+
+    #[tokio::test]
+    async fn schedule_manage_ops_post_their_path_and_db_body() {
+        let (server, client) = setup().await;
+        for op in ["cancel", "pause", "resume"] {
+            Mock::given(method("POST"))
+                .and(path(format!("/api/schedule/job-1/{op}")))
+                .and(body_partial_json(json!({"db": "t<uuid>"})))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+                .mount(&server)
+                .await;
+        }
+        client.cancel_schedule("job-1").await.unwrap();
+        client.pause_schedule("job-1").await.unwrap();
+        client.resume_schedule("job-1").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_schedules_returns_schedule_info_vec() {
+        let (server, client) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/api/schedules"))
+            .and(header("authorization", "Bearer machine-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "schedules": [{
+                    "id": "job-1",
+                    "kind": "cron",
+                    "dueAt": 9000,
+                    "cron": "*/5 * * * *",
+                    "status": "pending",
+                    "createdAt": 1000,
+                    "firedCount": 0
+                }]
+            })))
+            .mount(&server)
+            .await;
+        let list = client.list_schedules().await.unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].id, "job-1");
+        assert_eq!(list[0].cron.as_deref(), Some("*/5 * * * *"));
     }
 
     #[tokio::test]

@@ -33,6 +33,26 @@ pub enum ClientMessage {
         idempotency_key: Option<String>,
         txn: Transaction,
     },
+    Schedule {
+        schedule_id: String,
+        when: ScheduleWhen,
+        txn: Transaction,
+    },
+    CancelSchedule {
+        schedule_id: String,
+        id: String,
+    },
+    PauseSchedule {
+        schedule_id: String,
+        id: String,
+    },
+    ResumeSchedule {
+        schedule_id: String,
+        id: String,
+    },
+    ListSchedules {
+        schedule_id: String,
+    },
     Ping,
 }
 
@@ -65,6 +85,25 @@ pub enum ServerMessage {
         query_id: String,
         error: RtDbError,
     },
+    ScheduleOk {
+        schedule_id: String,
+        id: String,
+    },
+    ScheduleErr {
+        schedule_id: String,
+        error: RtDbError,
+    },
+    /// Reply to cancel/pause/resume. `error` is omitted on the wire when `ok`.
+    ScheduleAck {
+        schedule_id: String,
+        ok: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<RtDbError>,
+    },
+    ListSchedulesOk {
+        schedule_id: String,
+        schedules: Vec<ScheduleInfo>,
+    },
     Pong,
 }
 
@@ -81,6 +120,38 @@ pub struct AuthedUser {
     pub github_login: Option<String>,
     #[serde(default)]
     pub github_id: Option<i64>,
+}
+
+/// How a caller wants a transaction scheduled. Mirrored byte-for-byte in
+/// `server/src/protocol.rs` and `ts-client/src/protocol.ts`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase", deny_unknown_fields)]
+pub enum ScheduleWhen {
+    /// Fire `ms` milliseconds from now.
+    AfterMs { ms: i64 },
+    /// Fire at this UTC epoch-ms instant (in the past = fire immediately).
+    RunAt { ms: i64 },
+    /// Fire on this 5-field cron schedule (UTC, min-first). The server validates
+    /// the expression; the client does no cron parsing.
+    Cron { expr: String },
+}
+
+/// A scheduled job's public view (returned by `listSchedules`). `cron` and
+/// `last_error` are omitted on the wire when absent. Mirrors
+/// `server/src/protocol.rs::ScheduleInfo`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScheduleInfo {
+    pub id: String,
+    pub kind: String, // "oneshot" | "cron"
+    pub due_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cron: Option<String>,
+    pub status: String, // "pending" | "running" | "paused" | "error"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    pub created_at: i64,
+    pub fired_count: i64,
 }
 
 /// A full-text search terminal over a declared search index. `index` names a
@@ -464,5 +535,197 @@ mod tests {
             serde_json::from_value::<FilterExpr>(json!({"op":"between","field":"x","value":1}))
                 .is_err()
         );
+    }
+
+    // Schedule wire shapes are byte-identical to server protocol.rs.
+    #[test]
+    fn schedule_when_wire_tags() {
+        assert_eq!(
+            serde_json::to_value(ScheduleWhen::AfterMs { ms: 5 }).unwrap(),
+            json!({"type": "afterMs", "ms": 5})
+        );
+        assert_eq!(
+            serde_json::to_value(ScheduleWhen::RunAt { ms: 9 }).unwrap(),
+            json!({"type": "runAt", "ms": 9})
+        );
+        assert_eq!(
+            serde_json::to_value(ScheduleWhen::Cron {
+                expr: "*/5 * * * *".into()
+            })
+            .unwrap(),
+            json!({"type": "cron", "expr": "*/5 * * * *"})
+        );
+        // deny_unknown_fields.
+        assert!(
+            serde_json::from_value::<ScheduleWhen>(json!({"type": "afterMs", "ms": 1, "x": 9}))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn schedule_client_message_variants() {
+        let s = serde_json::to_value(ClientMessage::Schedule {
+            schedule_id: "s1".into(),
+            when: ScheduleWhen::AfterMs { ms: 100 },
+            txn: empty_txn(),
+        })
+        .unwrap();
+        assert_eq!(
+            s,
+            json!({
+                "type": "schedule",
+                "scheduleId": "s1",
+                "when": {"type": "afterMs", "ms": 100},
+                "txn": {"steps": []}
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(ClientMessage::CancelSchedule {
+                schedule_id: "s1".into(),
+                id: "job-1".into(),
+            })
+            .unwrap(),
+            json!({"type": "cancelSchedule", "scheduleId": "s1", "id": "job-1"})
+        );
+        assert_eq!(
+            serde_json::to_value(ClientMessage::PauseSchedule {
+                schedule_id: "s1".into(),
+                id: "job-1".into(),
+            })
+            .unwrap(),
+            json!({"type": "pauseSchedule", "scheduleId": "s1", "id": "job-1"})
+        );
+        assert_eq!(
+            serde_json::to_value(ClientMessage::ResumeSchedule {
+                schedule_id: "s1".into(),
+                id: "job-1".into(),
+            })
+            .unwrap(),
+            json!({"type": "resumeSchedule", "scheduleId": "s1", "id": "job-1"})
+        );
+        assert_eq!(
+            serde_json::to_value(ClientMessage::ListSchedules {
+                schedule_id: "s1".into()
+            })
+            .unwrap(),
+            json!({"type": "listSchedules", "scheduleId": "s1"})
+        );
+    }
+
+    #[test]
+    fn schedule_server_message_variants() {
+        assert_eq!(
+            serde_json::to_value(ServerMessage::ScheduleOk {
+                schedule_id: "s1".into(),
+                id: "job-9".into(),
+            })
+            .unwrap(),
+            json!({"type": "scheduleOk", "scheduleId": "s1", "id": "job-9"})
+        );
+        let err = serde_json::to_value(ServerMessage::ScheduleErr {
+            schedule_id: "s1".into(),
+            error: crate::error::RtDbError::new(crate::error::ErrorCode::BadRequest, "bad cron"),
+        })
+        .unwrap();
+        assert_eq!(
+            err,
+            json!({
+                "type": "scheduleErr",
+                "scheduleId": "s1",
+                "error": {"code": "BAD_REQUEST", "message": "bad cron"}
+            })
+        );
+        // `error` is skipped on the wire when `None`.
+        let ack_ok = serde_json::to_value(ServerMessage::ScheduleAck {
+            schedule_id: "s1".into(),
+            ok: true,
+            error: None,
+        })
+        .unwrap();
+        assert_eq!(
+            ack_ok,
+            json!({"type": "scheduleAck", "scheduleId": "s1", "ok": true})
+        );
+        // An `ok:false` ack carries its error envelope.
+        let ack_err = serde_json::to_value(ServerMessage::ScheduleAck {
+            schedule_id: "s1".into(),
+            ok: false,
+            error: Some(crate::error::RtDbError::new(
+                crate::error::ErrorCode::NotFound,
+                "missing job",
+            )),
+        })
+        .unwrap();
+        assert_eq!(
+            ack_err,
+            json!({
+                "type": "scheduleAck",
+                "scheduleId": "s1",
+                "ok": false,
+                "error": {"code": "NOT_FOUND", "message": "missing job"}
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(ServerMessage::ListSchedulesOk {
+                schedule_id: "s1".into(),
+                schedules: vec![],
+            })
+            .unwrap(),
+            json!({"type": "listSchedulesOk", "scheduleId": "s1", "schedules": []})
+        );
+    }
+
+    #[test]
+    fn schedule_info_round_trip_omits_absent_optionals() {
+        let oneshot = ScheduleInfo {
+            id: "j1".into(),
+            kind: "oneshot".into(),
+            due_at: 1000,
+            cron: None,
+            status: "pending".into(),
+            last_error: None,
+            created_at: 500,
+            fired_count: 0,
+        };
+        let v = serde_json::to_value(&oneshot).unwrap();
+        assert_eq!(
+            v,
+            json!({
+                "id": "j1",
+                "kind": "oneshot",
+                "dueAt": 1000,
+                "status": "pending",
+                "createdAt": 500,
+                "firedCount": 0
+            })
+        );
+        let cron = ScheduleInfo {
+            id: "j2".into(),
+            kind: "cron".into(),
+            due_at: 2000,
+            cron: Some("*/5 * * * *".into()),
+            status: "error".into(),
+            last_error: Some("boom".into()),
+            created_at: 500,
+            fired_count: 3,
+        };
+        let v = serde_json::to_value(&cron).unwrap();
+        assert_eq!(
+            v,
+            json!({
+                "id": "j2",
+                "kind": "cron",
+                "dueAt": 2000,
+                "cron": "*/5 * * * *",
+                "status": "error",
+                "lastError": "boom",
+                "createdAt": 500,
+                "firedCount": 3
+            })
+        );
+        // Round-trips back.
+        let back: ScheduleInfo = serde_json::from_value(v).unwrap();
+        assert_eq!(back.cron.as_deref(), Some("*/5 * * * *"));
+        assert_eq!(back.last_error.as_deref(), Some("boom"));
     }
 }

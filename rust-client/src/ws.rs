@@ -19,7 +19,7 @@
 use crate::error::{ErrorCode, RtDbError};
 use crate::mutation::{StepResult, Transaction};
 use crate::query::Query;
-use crate::wire::{AuthedUser, ClientMessage, ServerMessage};
+use crate::wire::{AuthedUser, ClientMessage, ScheduleInfo, ScheduleWhen, ServerMessage};
 
 use futures_util::{Sink, SinkExt, StreamExt};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -142,6 +142,51 @@ struct QueuedMutate {
     reply: MutReply,
 }
 
+/// Reply channel for a schedule/list/manage call the caller is awaiting.
+type SchedReply = oneshot::Sender<Result<ScheduleOutcome, RtDbError>>;
+
+/// The typed success payload of a schedule-family reply. Each public method
+/// extracts the arm it expects and treats any other arm as an internal error
+/// (the server sends the reply matching the request kind).
+#[derive(Debug)]
+enum ScheduleOutcome {
+    /// `scheduleOk { id }` — the newly created schedule's id.
+    Id(String),
+    /// `scheduleAck { ok: true }` — cancel/pause/resume succeeded (no payload).
+    Ack,
+    /// `listSchedulesOk { schedules }`.
+    List(Vec<ScheduleInfo>),
+}
+
+/// The request kind a schedule call will send once authenticated, carried while
+/// queued so the driver can build the right `ClientMessage` frame on flush.
+/// Mirrors `ts-client`'s `ScheduleMsg`.
+enum ScheduleMsg {
+    Schedule {
+        when: ScheduleWhen,
+        txn: Transaction,
+    },
+    Cancel {
+        id: String,
+    },
+    Pause {
+        id: String,
+    },
+    Resume {
+        id: String,
+    },
+    List,
+}
+
+/// A schedule/list/manage call awaiting its turn to be sent. Like
+/// [`QueuedMutate`], it survives a reconnect: in-flight on a failed send it is
+/// re-queued and fired on the next `authOk`.
+struct QueuedSchedule {
+    schedule_id: String,
+    msg: ScheduleMsg,
+    reply: SchedReply,
+}
+
 /// Commands callers send to the driver task.
 enum Cmd {
     /// Nudge the driver to (re)connect / re-auth — `connect()` and token refresh.
@@ -154,6 +199,9 @@ enum Cmd {
     /// A caller-initiated mutation with its reply channel. Boxed so the small
     /// command variants don't inherit [`QueuedMutate`]'s size.
     Mutate(Box<QueuedMutate>),
+    /// A caller-initiated schedule/list/manage call with its reply channel.
+    /// Boxed for the same reason as [`Cmd::Mutate`].
+    Schedule(Box<QueuedSchedule>),
     /// Tear the driver down.
     Shutdown,
 }
@@ -199,6 +247,7 @@ struct ClientInner {
     closed: Arc<AtomicBool>,
     sub_counter: AtomicU64,
     mut_counter: AtomicU64,
+    sched_counter: AtomicU64,
 }
 
 /// A cloneable handle to the reactive client. Cloning shares one driver; dropping
@@ -324,6 +373,7 @@ impl RtDbClient {
             closed: Arc::new(AtomicBool::new(false)),
             sub_counter: AtomicU64::new(1),
             mut_counter: AtomicU64::new(1),
+            sched_counter: AtomicU64::new(1),
         });
 
         tokio::spawn(drive(Driver {
@@ -453,6 +503,92 @@ impl RtDbClient {
             .collect()
     }
 
+    /// Schedule `txn` to fire at `when`. Resolves with the new schedule's id on
+    /// `scheduleOk`; rejects with [`RtDbError`] on `scheduleErr` (e.g. a bad cron
+    /// expression — the server validates cron). While unauthenticated, the
+    /// request queues and fires on the next `authOk`, mirroring [`mutate`](Self::mutate).
+    pub async fn schedule(
+        &self,
+        txn: &Transaction,
+        when: ScheduleWhen,
+    ) -> Result<String, RtDbError> {
+        match self
+            .queue_schedule(ScheduleMsg::Schedule {
+                when,
+                txn: txn.clone(),
+            })
+            .await?
+        {
+            ScheduleOutcome::Id(id) => Ok(id),
+            _ => Err(RtDbError::internal("unexpected schedule reply")),
+        }
+    }
+
+    /// Cancel a scheduled job. Resolves on `scheduleAck.ok:true`; rejects with
+    /// [`RtDbError`] when the server returns `ok:false` (e.g. unknown id).
+    pub async fn cancel_schedule(&self, id: &str) -> Result<(), RtDbError> {
+        self.manage_schedule(ScheduleMsg::Cancel { id: id.to_string() })
+            .await
+    }
+
+    /// Pause a scheduled job until [`resume_schedule`](Self::resume_schedule).
+    /// Same ack contract as [`cancel_schedule`](Self::cancel_schedule).
+    pub async fn pause_schedule(&self, id: &str) -> Result<(), RtDbError> {
+        self.manage_schedule(ScheduleMsg::Pause { id: id.to_string() })
+            .await
+    }
+
+    /// Resume a paused scheduled job. Same ack contract as
+    /// [`cancel_schedule`](Self::cancel_schedule).
+    pub async fn resume_schedule(&self, id: &str) -> Result<(), RtDbError> {
+        self.manage_schedule(ScheduleMsg::Resume { id: id.to_string() })
+            .await
+    }
+
+    /// List scheduled jobs. Resolves with the `schedules` array on
+    /// `listSchedulesOk`.
+    pub async fn list_schedules(&self) -> Result<Vec<ScheduleInfo>, RtDbError> {
+        match self.queue_schedule(ScheduleMsg::List).await? {
+            ScheduleOutcome::List(schedules) => Ok(schedules),
+            _ => Err(RtDbError::internal("unexpected schedule reply")),
+        }
+    }
+
+    /// Shared body for cancel/pause/resume: await the ack and surface `ok:false`
+    /// as an error.
+    async fn manage_schedule(&self, msg: ScheduleMsg) -> Result<(), RtDbError> {
+        match self.queue_schedule(msg).await? {
+            ScheduleOutcome::Ack => Ok(()),
+            _ => Err(RtDbError::internal("unexpected schedule reply")),
+        }
+    }
+
+    /// Mint a `sch-${n}` correlation id and either dispatch the request (when
+    /// authenticated) or queue it for the next `authOk`, exactly like
+    /// [`mutate`](Self::mutate). The driver routes the matching `ServerMessage`
+    /// reply back through [`SchedReply`].
+    async fn queue_schedule(&self, msg: ScheduleMsg) -> Result<ScheduleOutcome, RtDbError> {
+        if self.is_closed() {
+            return Err(RtDbError::internal("client is closed"));
+        }
+        let schedule_id = format!(
+            "sch-{}",
+            self.inner.sched_counter.fetch_add(1, Ordering::Relaxed)
+        );
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let _ = self
+            .inner
+            .cmd_tx
+            .send(Cmd::Schedule(Box::new(QueuedSchedule {
+                schedule_id,
+                msg,
+                reply: reply_tx,
+            })));
+        reply_rx
+            .await
+            .map_err(|_| RtDbError::internal("client is closed"))?
+    }
+
     fn set_state(&self, state: ConnectionState) {
         let mut status = self.inner.status_tx.borrow().clone();
         status.state = state;
@@ -494,6 +630,8 @@ async fn drive(mut driver: Driver) {
     let mut attempt: u32 = 0;
     let mut pending: HashMap<String, MutReply> = HashMap::new();
     let mut unsent: VecDeque<QueuedMutate> = VecDeque::new();
+    let mut pending_schedules: HashMap<String, SchedReply> = HashMap::new();
+    let mut unsent_schedules: VecDeque<QueuedSchedule> = VecDeque::new();
 
     loop {
         if driver.inner.closed.load(Ordering::SeqCst) {
@@ -515,10 +653,25 @@ async fn drive(mut driver: Driver) {
         };
 
         driver.set_state(ConnectionState::Connecting);
-        match run_session(&mut driver, epoch, token, &mut pending, &mut unsent).await {
+        match run_session(
+            &mut driver,
+            epoch,
+            token,
+            &mut pending,
+            &mut unsent,
+            &mut pending_schedules,
+            &mut unsent_schedules,
+        )
+        .await
+        {
             SessionOutcome::AuthFailed => {
                 driver.set_state(ConnectionState::Idle);
                 reject_all(&mut pending, &mut unsent, "authentication failed");
+                reject_all_schedules(
+                    &mut pending_schedules,
+                    &mut unsent_schedules,
+                    "authentication failed",
+                );
                 if !wait_for_poke(&mut driver).await {
                     break;
                 }
@@ -526,6 +679,10 @@ async fn drive(mut driver: Driver) {
             SessionOutcome::Reconnect => {
                 driver.set_state(ConnectionState::Reconnecting);
                 reject_inflight(&mut pending, "connection closed before acknowledgment");
+                reject_inflight_schedules(
+                    &mut pending_schedules,
+                    "connection closed before acknowledgment",
+                );
                 match backoff_wait(&mut driver, attempt).await {
                     WaitResult::Shutdown => break,
                     WaitResult::Retry => {
@@ -539,6 +696,11 @@ async fn drive(mut driver: Driver) {
     }
 
     reject_all(&mut pending, &mut unsent, "client is closed");
+    reject_all_schedules(
+        &mut pending_schedules,
+        &mut unsent_schedules,
+        "client is closed",
+    );
     driver.set_state(ConnectionState::Closed);
 }
 
@@ -600,6 +762,8 @@ async fn run_session(
     token: String,
     pending: &mut HashMap<String, MutReply>,
     unsent: &mut VecDeque<QueuedMutate>,
+    pending_schedules: &mut HashMap<String, SchedReply>,
+    unsent_schedules: &mut VecDeque<QueuedSchedule>,
 ) -> SessionOutcome {
     if driver.inner.closed.load(Ordering::SeqCst)
         || driver.inner.generation.load(Ordering::SeqCst) != epoch
@@ -692,6 +856,17 @@ async fn run_session(
         }
     }
 
+    // Flush schedule/list/manage calls queued while disconnected.
+    while let Some(q) = unsent_schedules.pop_front() {
+        match deliver_schedule(&mut sink, q, pending_schedules).await {
+            Ok(()) => {}
+            Err(q) => {
+                unsent_schedules.push_back(q);
+                return SessionOutcome::Reconnect;
+            }
+        }
+    }
+
     let mut liveness = Liveness::new(driver.inner.config.heartbeat);
     let mut ticker = interval(driver.inner.config.heartbeat);
     ticker.tick().await; // skip the immediate tick
@@ -730,11 +905,20 @@ async fn run_session(
                         }
                     }
                 }
+                Some(Cmd::Schedule(q)) => {
+                    match deliver_schedule(&mut sink, *q, pending_schedules).await {
+                        Ok(()) => {}
+                        Err(q) => {
+                            unsent_schedules.push_back(q);
+                            return SessionOutcome::Reconnect;
+                        }
+                    }
+                }
             },
             incoming = stream.next() => match incoming {
                 Some(Ok(WsMessage::Text(t))) => {
                     if let Ok(msg) = serde_json::from_str::<ServerMessage>(t.as_str()) {
-                        apply_server_message(&driver.inner, msg, pending);
+                        apply_server_message(&driver.inner, msg, pending, pending_schedules);
                     }
                 }
                 Some(Ok(WsMessage::Ping(p))) => {
@@ -798,6 +982,47 @@ where
     Deliver::Sent
 }
 
+/// Serialize + send a schedule/list/manage frame, registering its reply on
+/// success. `Err(q)` means the send failed mid-session: the caller re-queues
+/// `q` so it fires on the next auth (same contract as [`deliver_mutate`]'s
+/// `Deliver::Reconnect`).
+async fn deliver_schedule<S>(
+    sink: &mut S,
+    q: QueuedSchedule,
+    pending: &mut HashMap<String, SchedReply>,
+) -> Result<(), QueuedSchedule>
+where
+    S: Sink<WsMessage> + Unpin,
+{
+    let frame = match &q.msg {
+        ScheduleMsg::Schedule { when, txn } => ClientMessage::Schedule {
+            schedule_id: q.schedule_id.clone(),
+            when: when.clone(),
+            txn: txn.clone(),
+        },
+        ScheduleMsg::Cancel { id } => ClientMessage::CancelSchedule {
+            schedule_id: q.schedule_id.clone(),
+            id: id.clone(),
+        },
+        ScheduleMsg::Pause { id } => ClientMessage::PauseSchedule {
+            schedule_id: q.schedule_id.clone(),
+            id: id.clone(),
+        },
+        ScheduleMsg::Resume { id } => ClientMessage::ResumeSchedule {
+            schedule_id: q.schedule_id.clone(),
+            id: id.clone(),
+        },
+        ScheduleMsg::List => ClientMessage::ListSchedules {
+            schedule_id: q.schedule_id.clone(),
+        },
+    };
+    if send_text(sink, &frame).await.is_err() {
+        return Err(q);
+    }
+    pending.insert(q.schedule_id, q.reply);
+    Ok(())
+}
+
 /// Serialize a client message and send it as a text frame. Generic over the sink
 /// so the concrete tungstenite type is never named (it would pull
 /// `tokio::net::TcpStream`, needing the `net` feature).
@@ -813,13 +1038,15 @@ where
 
 // ── pure routing ─────────────────────────────────────────────────────────────
 
-/// Route one inbound server message to its subscription / pending mutation.
-/// Pure with respect to the socket (no I/O) so it is unit-testable without a
-/// server. Pong freshness is tracked by the session's select arm, not here.
+/// Route one inbound server message to its subscription / pending mutation /
+/// pending schedule call. Pure with respect to the socket (no I/O) so it is
+/// unit-testable without a server. Pong freshness is tracked by the session's
+/// select arm, not here.
 fn apply_server_message(
     inner: &Arc<ClientInner>,
     msg: ServerMessage,
     pending: &mut HashMap<String, MutReply>,
+    pending_schedules: &mut HashMap<String, SchedReply>,
 ) {
     match msg {
         ServerMessage::QueryUpdate { query_id, result } => {
@@ -848,6 +1075,39 @@ fn apply_server_message(
         ServerMessage::MutateErr { mut_id, error } => {
             if let Some(reply) = pending.remove(&mut_id) {
                 let _ = reply.send(Err(error));
+            }
+        }
+        ServerMessage::ScheduleOk { schedule_id, id } => {
+            if let Some(reply) = pending_schedules.remove(&schedule_id) {
+                let _ = reply.send(Ok(ScheduleOutcome::Id(id)));
+            }
+        }
+        ServerMessage::ScheduleErr { schedule_id, error } => {
+            if let Some(reply) = pending_schedules.remove(&schedule_id) {
+                let _ = reply.send(Err(error));
+            }
+        }
+        ServerMessage::ScheduleAck {
+            schedule_id,
+            ok,
+            error,
+        } => {
+            if let Some(reply) = pending_schedules.remove(&schedule_id) {
+                if ok {
+                    let _ = reply.send(Ok(ScheduleOutcome::Ack));
+                } else {
+                    let err =
+                        error.unwrap_or_else(|| RtDbError::internal("schedule operation failed"));
+                    let _ = reply.send(Err(err));
+                }
+            }
+        }
+        ServerMessage::ListSchedulesOk {
+            schedule_id,
+            schedules,
+        } => {
+            if let Some(reply) = pending_schedules.remove(&schedule_id) {
+                let _ = reply.send(Ok(ScheduleOutcome::List(schedules)));
             }
         }
         // Pong is handled by the session loop; AuthOk/AuthErr arrive only at the
@@ -889,6 +1149,29 @@ fn reject_all(
     reason: &str,
 ) {
     reject_inflight(pending, reason);
+    let err = RtDbError::new(ErrorCode::Internal, reason);
+    for q in unsent.drain(..) {
+        let _ = q.reply.send(Err(err.clone()));
+    }
+}
+
+/// Reject every in-flight (sent, unacked) schedule call. Queued (never-sent)
+/// calls are left intact so they survive the reconnect — see
+/// [`reject_all_schedules`].
+fn reject_inflight_schedules(pending: &mut HashMap<String, SchedReply>, reason: &str) {
+    let err = RtDbError::new(ErrorCode::Internal, reason);
+    for (_, reply) in pending.drain() {
+        let _ = reply.send(Err(err.clone()));
+    }
+}
+
+/// Reject every schedule call, in-flight and queued. Used on terminal teardown.
+fn reject_all_schedules(
+    pending: &mut HashMap<String, SchedReply>,
+    unsent: &mut VecDeque<QueuedSchedule>,
+    reason: &str,
+) {
+    reject_inflight_schedules(pending, reason);
     let err = RtDbError::new(ErrorCode::Internal, reason);
     for q in unsent.drain(..) {
         let _ = q.reply.send(Err(err.clone()));
@@ -1029,12 +1312,53 @@ mod tests {
     }
 
     #[test]
+    fn schedule_client_frame_shapes() {
+        let s = serde_json::to_value(ClientMessage::Schedule {
+            schedule_id: "sch-1".into(),
+            when: ScheduleWhen::Cron {
+                expr: "*/5 * * * *".into(),
+            },
+            txn: Transaction { steps: vec![] },
+        })
+        .unwrap();
+        assert_eq!(
+            s,
+            json!({
+                "type":"schedule",
+                "scheduleId":"sch-1",
+                "when":{"type":"cron","expr":"*/5 * * * *"},
+                "txn":{"steps":[]}
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(ClientMessage::CancelSchedule {
+                schedule_id: "sch-1".into(),
+                id: "job-1".into(),
+            })
+            .unwrap(),
+            json!({"type":"cancelSchedule","scheduleId":"sch-1","id":"job-1"})
+        );
+        assert_eq!(
+            serde_json::to_value(ClientMessage::ListSchedules {
+                schedule_id: "sch-1".into()
+            })
+            .unwrap(),
+            json!({"type":"listSchedules","scheduleId":"sch-1"})
+        );
+    }
+
+    #[test]
     fn server_messages_round_trip() {
         let cases = vec![
             json!({"type":"queryUpdate","queryId":"sub-1","result":[{"_id":"a"}]}),
             json!({"type":"mutateOk","mutId":"mut-1","results":[]}),
             json!({"type":"mutateErr","mutId":"mut-2","error":{"code":"NOT_FOUND","message":"x"}}),
             json!({"type":"subscribeErr","queryId":"sub-1","error":{"code":"BAD_REQUEST","message":"bad index"}}),
+            json!({"type":"scheduleOk","scheduleId":"sch-1","id":"job-9"}),
+            json!({"type":"scheduleErr","scheduleId":"sch-1","error":{"code":"BAD_REQUEST","message":"bad cron"}}),
+            json!({"type":"scheduleAck","scheduleId":"sch-1","ok":true}),
+            json!({"type":"scheduleAck","scheduleId":"sch-1","ok":false,"error":{"code":"NOT_FOUND","message":"missing job"}}),
+            json!({"type":"listSchedulesOk","scheduleId":"sch-1","schedules":[]}),
             json!({"type":"pong"}),
         ];
         for raw in cases {
@@ -1064,6 +1388,7 @@ mod tests {
             closed: Arc::new(AtomicBool::new(false)),
             sub_counter: AtomicU64::new(1),
             mut_counter: AtomicU64::new(1),
+            sched_counter: AtomicU64::new(1),
         });
         let query = q("items");
         let (tx, rx) = watch::channel(Snapshot::Pending);
@@ -1085,6 +1410,7 @@ mod tests {
     fn query_update_delivers_value() {
         let (inner, rx) = rig_with_sub();
         let mut pending = HashMap::new();
+        let mut pending_schedules: HashMap<String, SchedReply> = HashMap::new();
         apply_server_message(
             &inner,
             ServerMessage::QueryUpdate {
@@ -1092,6 +1418,7 @@ mod tests {
                 result: json!([{"_id":"a"}]),
             },
             &mut pending,
+            &mut pending_schedules,
         );
         assert!(matches!(rx.borrow().clone(), Snapshot::Value(_)));
     }
@@ -1100,6 +1427,7 @@ mod tests {
     fn subscribe_err_routes_error_and_removes() {
         let (inner, rx) = rig_with_sub();
         let mut pending = HashMap::new();
+        let mut pending_schedules: HashMap<String, SchedReply> = HashMap::new();
         apply_server_message(
             &inner,
             ServerMessage::SubscribeErr {
@@ -1107,6 +1435,7 @@ mod tests {
                 error: RtDbError::new(ErrorCode::BadRequest, "bad index"),
             },
             &mut pending,
+            &mut pending_schedules,
         );
         assert!(matches!(rx.borrow().clone(), Snapshot::Error(_)));
         let maps = inner.subs.lock().unwrap();
@@ -1117,6 +1446,7 @@ mod tests {
     async fn mutate_ok_and_err_resolve_pending() {
         let (inner, _) = rig_with_sub();
         let mut pending: HashMap<String, MutReply> = HashMap::new();
+        let mut pending_schedules: HashMap<String, SchedReply> = HashMap::new();
         let (tx_ok, rx_ok) = oneshot::channel();
         let (tx_err, rx_err) = oneshot::channel();
         pending.insert("mut-1".into(), tx_ok);
@@ -1129,6 +1459,7 @@ mod tests {
                 results: vec![json!({"id":"a"})],
             },
             &mut pending,
+            &mut pending_schedules,
         );
         apply_server_message(
             &inner,
@@ -1137,12 +1468,111 @@ mod tests {
                 error: RtDbError::new(ErrorCode::NotFound, "x"),
             },
             &mut pending,
+            &mut pending_schedules,
         );
         let ok = rx_ok.await.unwrap().unwrap();
         assert_eq!(ok.len(), 1);
         let err = rx_err.await.unwrap().unwrap_err();
         assert_eq!(err.code, ErrorCode::NotFound);
         assert!(pending.is_empty());
+    }
+
+    // Mirror of `mutate_ok_and_err_resolve_pending` for the schedule track:
+    // `scheduleOk`/`scheduleErr` resolve the pending reply, and a `scheduleAck`
+    // with `ok:false` surfaces the server's error envelope.
+    #[tokio::test]
+    async fn schedule_replies_resolve_pending() {
+        let (inner, _) = rig_with_sub();
+        let mut pending: HashMap<String, MutReply> = HashMap::new();
+        let mut pending_schedules: HashMap<String, SchedReply> = HashMap::new();
+        let (tx_ok, rx_ok) = oneshot::channel();
+        let (tx_err, rx_err) = oneshot::channel();
+        let (tx_ack_ok, rx_ack_ok) = oneshot::channel();
+        let (tx_ack_err, rx_ack_err) = oneshot::channel();
+        let (tx_list, rx_list) = oneshot::channel();
+        pending_schedules.insert("sch-1".into(), tx_ok);
+        pending_schedules.insert("sch-2".into(), tx_err);
+        pending_schedules.insert("sch-3".into(), tx_ack_ok);
+        pending_schedules.insert("sch-4".into(), tx_ack_err);
+        pending_schedules.insert("sch-5".into(), tx_list);
+
+        apply_server_message(
+            &inner,
+            ServerMessage::ScheduleOk {
+                schedule_id: "sch-1".into(),
+                id: "job-9".into(),
+            },
+            &mut pending,
+            &mut pending_schedules,
+        );
+        apply_server_message(
+            &inner,
+            ServerMessage::ScheduleErr {
+                schedule_id: "sch-2".into(),
+                error: RtDbError::new(ErrorCode::BadRequest, "bad cron"),
+            },
+            &mut pending,
+            &mut pending_schedules,
+        );
+        apply_server_message(
+            &inner,
+            ServerMessage::ScheduleAck {
+                schedule_id: "sch-3".into(),
+                ok: true,
+                error: None,
+            },
+            &mut pending,
+            &mut pending_schedules,
+        );
+        apply_server_message(
+            &inner,
+            ServerMessage::ScheduleAck {
+                schedule_id: "sch-4".into(),
+                ok: false,
+                error: Some(RtDbError::new(ErrorCode::NotFound, "missing job")),
+            },
+            &mut pending,
+            &mut pending_schedules,
+        );
+        apply_server_message(
+            &inner,
+            ServerMessage::ListSchedulesOk {
+                schedule_id: "sch-5".into(),
+                schedules: vec![ScheduleInfo {
+                    id: "job-1".into(),
+                    kind: "cron".into(),
+                    due_at: 9000,
+                    cron: Some("*/5 * * * *".into()),
+                    status: "pending".into(),
+                    last_error: None,
+                    created_at: 1000,
+                    fired_count: 0,
+                }],
+            },
+            &mut pending,
+            &mut pending_schedules,
+        );
+
+        match rx_ok.await.unwrap().unwrap() {
+            ScheduleOutcome::Id(id) => assert_eq!(id, "job-9"),
+            other => panic!("expected Id, got {other:?}"),
+        }
+        let err = rx_err.await.unwrap().unwrap_err();
+        assert_eq!(err.code, ErrorCode::BadRequest);
+        assert!(matches!(
+            rx_ack_ok.await.unwrap().unwrap(),
+            ScheduleOutcome::Ack
+        ));
+        let ack_err = rx_ack_err.await.unwrap().unwrap_err();
+        assert_eq!(ack_err.code, ErrorCode::NotFound);
+        match rx_list.await.unwrap().unwrap() {
+            ScheduleOutcome::List(list) => {
+                assert_eq!(list.len(), 1);
+                assert_eq!(list[0].id, "job-1");
+            }
+            other => panic!("expected List, got {other:?}"),
+        }
+        assert!(pending_schedules.is_empty());
     }
 
     #[test]
