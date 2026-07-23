@@ -4,31 +4,31 @@ DEPLOY_HOST = root@lenny2.par-com.net
 DEPLOY_PATH = /docker/par-rt-db
 
 .PHONY: build test lint fmt fmt-check typecheck checkall dev-db-up dev-db-down \
-	pre-commit pre-commit-update client-install deploy
+	pre-commit pre-commit-update ts-client-install deploy
 
 build:
 	cd server && cargo build
-	cd client && bun run build
+	cd ts-client && bun run build
 	cd rust-client && cargo build --all-features
 
 fmt:
 	cd server && cargo fmt --all
-	cd client && bun run fmt
+	cd ts-client && bun run fmt
 	cd rust-client && cargo fmt --all
 
 fmt-check:
 	cd server && cargo fmt --all -- --check
-	cd client && bun run fmt-check
+	cd ts-client && bun run fmt-check
 	cd rust-client && cargo fmt --all -- --check
 
 lint:
 	cd server && cargo clippy --all-targets --all-features -- -D warnings
-	cd client && bun run lint
+	cd ts-client && bun run lint
 	cd rust-client && cargo clippy --all-targets --all-features -- -D warnings
 
 typecheck:
 	cd server && cargo check --all-targets
-	cd client && bun run typecheck
+	cd ts-client && bun run typecheck
 	cd rust-client && cargo check --all-targets --all-features
 
 dev-db-up:
@@ -39,11 +39,11 @@ dev-db-down:
 
 test: dev-db-up
 	cd server && cargo test
-	cd client && bun run test
+	cd ts-client && bun run test
 	cd rust-client && cargo test --all-features
 
-client-install:
-	cd client && bun install
+ts-client-install:
+	cd ts-client && bun install
 
 checkall: fmt-check lint typecheck test
 

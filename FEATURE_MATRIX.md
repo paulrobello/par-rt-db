@@ -6,7 +6,7 @@ by utility and level of effort so parity work can be picked off in value order.
 **Perspective:** "Utility" is judged for the apps this instance actually serves (kanban
 board, personal SPAs, CLI/agent tooling) — not for a hypothetical SaaS at scale.
 **Sources:** `docs/superpowers/specs/2026-07-21-par-rt-db-design.md`, the implemented
-server (`server/src/`), the client SDK (`client/src/`), and Convex's documented feature
+server (`server/src/`), the client SDK (`ts-client/src/`), and Convex's documented feature
 set (queries/mutations/actions, scheduling, storage, search, auth, components).
 
 ## Legend

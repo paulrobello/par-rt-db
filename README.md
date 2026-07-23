@@ -196,7 +196,7 @@ curl -s -X POST http://localhost:8300/api/query \
 The `TableQuery.paginate(cursor, numItems)` builder terminal produces a paginated
 query, and the `usePaginatedQuery` hook (from `@par-rt-db/client/react`) manages
 page state and live subscriptions across pages. See
-[`client/README.md`](client/README.md) for the full SDK surface.
+[`ts-client/README.md`](ts-client/README.md) for the full SDK surface.
 
 ```ts
 import { createApi } from "@par-rt-db/client";
@@ -291,6 +291,6 @@ that ultimately terminates a connection that never closes on its own.
 
 ## TypeScript client
 
-The `client/` package (`@par-rt-db/client`) is the browser/Node SDK: schema builder,
+The `ts-client/` package (`@par-rt-db/client`) is the browser/Node SDK: schema builder,
 reactive WebSocket client, React bindings, and HTTP/admin clients. See
-[`client/README.md`](client/README.md).
+[`ts-client/README.md`](ts-client/README.md).

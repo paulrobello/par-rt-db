@@ -81,6 +81,6 @@ const [{ id }] = (await db.mutate(
 ## Development
 
 ```sh
-make checkall          # from client/: fmt-check + lint + typecheck + test + build
+make checkall          # from the repo root: fmt-check + lint + typecheck + test (all 3 packages)
 make test-integration  # opt-in; needs RTDB_TEST_SERVER_URL + RTDB_TEST_ADMIN_KEY
 ```
