@@ -126,6 +126,107 @@ describe("query builder", () => {
   });
 });
 
+describe("TableQuery.filter", () => {
+  it("builds an eq filter (composable, not a terminal)", () => {
+    const q = api.items.query().filter({ op: "eq", field: "status", value: "done" }).collect();
+    expect(q.json).toEqual({
+      table: "items",
+      filter: { op: "eq", field: "status", value: "done" },
+    });
+  });
+
+  it("builds a neq filter", () => {
+    const q = api.items.query().filter({ op: "neq", field: "status", value: "done" }).collect();
+    expect(q.json).toEqual({
+      table: "items",
+      filter: { op: "neq", field: "status", value: "done" },
+    });
+  });
+
+  it("builds an in filter", () => {
+    const q = api.items
+      .query()
+      .filter({ op: "in", field: "status", values: ["blocked", "backlog"] })
+      .collect();
+    expect(q.json).toEqual({
+      table: "items",
+      filter: { op: "in", field: "status", values: ["blocked", "backlog"] },
+    });
+  });
+
+  it("nests range leaves under and (gte/lt)", () => {
+    const q = api.items
+      .query()
+      .filter({
+        op: "and",
+        exprs: [
+          { op: "gte", field: "order", value: 1 },
+          { op: "lt", field: "order", value: 10 },
+        ],
+      })
+      .collect();
+    expect(q.json).toEqual({
+      table: "items",
+      filter: {
+        op: "and",
+        exprs: [
+          { op: "gte", field: "order", value: 1 },
+          { op: "lt", field: "order", value: 10 },
+        ],
+      },
+    });
+  });
+
+  it("nests combinators under or (in + lte)", () => {
+    const q = api.items
+      .query()
+      .filter({
+        op: "or",
+        exprs: [
+          { op: "in", field: "status", values: ["blocked", "backlog"] },
+          { op: "lte", field: "order", value: 3 },
+        ],
+      })
+      .collect();
+    expect(q.json).toEqual({
+      table: "items",
+      filter: {
+        op: "or",
+        exprs: [
+          { op: "in", field: "status", values: ["blocked", "backlog"] },
+          { op: "lte", field: "order", value: 3 },
+        ],
+      },
+    });
+  });
+
+  it("composes with an index prefix, a gt filter, and take", () => {
+    const q = api.items
+      .query()
+      .withIndex("by_project", ["p1"])
+      .filter({ op: "gt", field: "order", value: 0 })
+      .take(10);
+    expect(q.json).toEqual({
+      table: "items",
+      index: "by_project",
+      eq: ["p1"],
+      filter: { op: "gt", field: "order", value: 0 },
+      take: 10,
+    });
+  });
+});
+
+describe("TableQuery.search", () => {
+  it("builds a search terminal and composes with take", () => {
+    const q = api.items.query().search("search_content", "hello world").take(10);
+    expect(q.json).toEqual({
+      table: "items",
+      search: { index: "search_content", query: "hello world" },
+      take: 10,
+    });
+  });
+});
+
 describe("TableQuery.paginate", () => {
   it("builds a paginate query without cursor", () => {
     const q = api.items.query().withIndex("by_project", ["p1"]).paginate(undefined, 10);

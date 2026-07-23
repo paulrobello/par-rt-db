@@ -18,11 +18,35 @@ export interface QueryJson {
   first?: boolean;
   count?: boolean;
   paginate?: Paginate;
+  filter?: FilterExpr;
+  search?: SearchQuery;
 }
 
 export interface Paginate {
   cursor?: string;
   numItems: number;
+}
+
+/**
+ * Mirrors server `query::FilterExpr` byte-for-byte: internally tagged by `op`
+ * (lowercase variant names), `deny_unknown_fields`. Leaves compare one declared
+ * field to a value (`in` to a non-empty list); `and`/`or` nest arbitrarily.
+ */
+export type FilterExpr =
+  | { op: "eq"; field: string; value: unknown }
+  | { op: "neq"; field: string; value: unknown }
+  | { op: "gt"; field: string; value: unknown }
+  | { op: "gte"; field: string; value: unknown }
+  | { op: "lt"; field: string; value: unknown }
+  | { op: "lte"; field: string; value: unknown }
+  | { op: "in"; field: string; values: unknown[] }
+  | { op: "and"; exprs: FilterExpr[] }
+  | { op: "or"; exprs: FilterExpr[] };
+
+/** Mirrors server `query::SearchQuery` byte-for-byte (camelCase, deny_unknown_fields). */
+export interface SearchQuery {
+  index: string;
+  query: string;
 }
 
 /** Mirrors server `PaginatedResult` (cursor-based pagination). */
@@ -106,6 +130,8 @@ export type FieldTypeJson =
 export interface IndexJson {
   name: string;
   fields: string[];
+  /** `true` marks a full-text search index; omitted on the wire for ordinary btree indexes. */
+  search?: boolean;
 }
 
 export interface TableJson {

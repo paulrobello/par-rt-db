@@ -5,11 +5,13 @@ export type { RtDbErrorCode, RtDbErrorEnvelope } from "./errors.js";
 export type {
   AuthedUser,
   ClientMessage,
+  FilterExpr,
   FieldTypeJson,
   IndexJson,
   Order,
   QueryJson,
   SchemaJson,
+  SearchQuery,
   ServerMessage,
   StepJson,
   TableJson,

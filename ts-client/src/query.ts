@@ -1,4 +1,4 @@
-import type { Order, PaginatedResultJson, QueryJson } from "./protocol.js";
+import type { FilterExpr, Order, PaginatedResultJson, QueryJson } from "./protocol.js";
 import type { Doc, Id, IndexNamesOf, SchemaDefinition, TableNames } from "./schema.js";
 
 /** A finished query carrying a phantom `Result` type used by the client/hooks. */
@@ -33,6 +33,19 @@ export class TableQuery<DocT, Indexes extends string> {
 
   order(order: Order): TableQuery<DocT, Indexes> {
     return new TableQuery({ ...this.json, order });
+  }
+
+  /** Append a db-side `filter` predicate. Composes with index/range/order/take;
+   * the server validates terminal combinations. Not a terminal. */
+  filter(expr: FilterExpr): TableQuery<DocT, Indexes> {
+    return new TableQuery({ ...this.json, filter: expr });
+  }
+
+  /** Full-text `search` over a declared search index. Composes only with `take`
+   * (e.g. `.search("idx", "text").take(10)`); the server rejects every other
+   * terminal alongside it. */
+  search(index: string, query: string): TableQuery<DocT, Indexes> {
+    return new TableQuery({ ...this.json, search: { index, query } });
   }
 
   take(n: number): RtQuery<DocT[]> {

@@ -98,3 +98,27 @@ describe("schema builder", () => {
     });
   });
 });
+
+describe("searchIndex builder", () => {
+  it("emits a search index with search:true alongside a btree index", () => {
+    const s = defineSchema({
+      notes: defineTable({
+        title: t.string(),
+        body: t.string(),
+      })
+        .index("by_title", ["title"])
+        .searchIndex("search_content", ["title", "body"]),
+    });
+    expect(s.toJSON().tables.notes.indexes).toEqual([
+      { name: "by_title", fields: ["title"] },
+      { name: "search_content", fields: ["title", "body"], search: true },
+    ]);
+  });
+
+  it("a btree index omits the search flag", () => {
+    const s = defineSchema({
+      notes: defineTable({ title: t.string() }).index("by_title", ["title"]),
+    });
+    expect(s.toJSON().tables.notes.indexes).toEqual([{ name: "by_title", fields: ["title"] }]);
+  });
+});

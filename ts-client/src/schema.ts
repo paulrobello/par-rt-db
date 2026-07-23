@@ -95,6 +95,19 @@ export class TableDefinition<
     return new TableDefinition(this.fields, [...this.indexes, { name, fields: [...fields] }]);
   }
 
+  /** Declare a full-text search index. The server tsvectorizes the (text)
+   * `fields` into a GIN-indexed generated column ranked via the `search` query
+   * terminal. Mirrors `index` but carries `search: true`. */
+  searchIndex<Name extends string>(
+    name: Name,
+    fields: [keyof Fields & string, ...(keyof Fields & string)[]],
+  ): TableDefinition<Fields, Indexes | Name> {
+    return new TableDefinition(this.fields, [
+      ...this.indexes,
+      { name, fields: [...fields], search: true },
+    ]);
+  }
+
   toJSON(): TableJson {
     const json: TableJson = { fields: fieldsToJson(this.fields) };
     if (this.indexes.length > 0) {
