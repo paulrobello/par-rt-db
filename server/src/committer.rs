@@ -5,11 +5,12 @@ use sqlx::PgPool;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::{Mutex, mpsc, oneshot};
 
-use crate::db::{SchemaCache, database_exists};
+use crate::db::{SchemaCache, database_exists, now_ms};
 use crate::error::RtDbError;
 use crate::mutation_log;
 use crate::protocol::ServerMessage;
 use crate::query::{Query, canonical, execute_query};
+use crate::scheduler;
 use crate::subs::{ConnId, SubscriptionManager};
 use crate::txn::{Transaction, TxnOutcome, execute_txn};
 
@@ -28,6 +29,16 @@ pub enum CommitterRequest {
         query: Box<Query>,
         tx: UnboundedSender<ServerMessage>,
         reply: oneshot::Sender<Result<(), RtDbError>>,
+    },
+    /// A scheduled/cron job whose `due_at` arrived. Fire-and-forget: the
+    /// scheduler does not wait for a reply (it would only stall the timer).
+    /// The committer executes the txn through the normal `execute_txn` path
+    /// and finalizes the row.
+    RunScheduled {
+        id: String,
+        kind: String,
+        txn: Box<Transaction>,
+        cron: Option<String>,
     },
 }
 
@@ -111,6 +122,11 @@ impl Committers {
             self.subs.clone(),
             self.schemas.clone(),
             rx,
+        ));
+        tokio::spawn(scheduler::run_scheduler(
+            self.pool.clone(),
+            db.to_string(),
+            tx.clone(),
         ));
         guard.insert(db.to_string(), tx.clone());
         Ok(tx)
@@ -229,6 +245,16 @@ async fn run_committer(
                 let result = handle_subscribe(&ctx, conn, query_id, *query, tx).await;
                 let _ = reply.send(result);
             }
+            CommitterRequest::RunScheduled {
+                id,
+                kind,
+                txn,
+                cron,
+            } => {
+                if let Err(err) = handle_scheduled(&ctx, id, kind, *txn, cron).await {
+                    tracing::error!(db = %ctx.db, error = %err, "scheduled job handling failed");
+                }
+            }
         }
     }
 }
@@ -280,6 +306,85 @@ async fn handle_mutate(
     }
 
     Ok(outcome)
+}
+
+/// Executes one claimed scheduled job through the normal write path and
+/// finalizes its row. Best-effort finalize: the txn has already committed +
+/// fanned out by the time we touch the row again, so a finalize failure is
+/// logged, not propagated. `at-least-once` recovery (the scheduler's
+/// `reset_running` on startup) handles the rare crash window between commit
+/// and finalize.
+async fn handle_scheduled(
+    ctx: &CommitterCtx,
+    id: String,
+    kind: String,
+    txn: Transaction,
+    cron: Option<String>,
+) -> Result<(), RtDbError> {
+    let schema = match ctx.schemas.get(&ctx.pool, &ctx.db).await {
+        Ok(schema) => schema,
+        Err(err) => {
+            let _ = scheduler::mark_error(&ctx.pool, &ctx.db, &id, "schema load failed").await;
+            return Err(err);
+        }
+    };
+    match execute_txn(&ctx.pool, &ctx.db, &schema, &txn).await {
+        Ok(outcome) => {
+            ctx.subs
+                .fan_out(&ctx.pool, &ctx.db, &schema, &outcome.write_set)
+                .await;
+            let finalize = match kind.as_str() {
+                "oneshot" => scheduler::finalize_one_shot_done(&ctx.pool, &ctx.db, &id).await,
+                "cron" => match cron.as_deref() {
+                    Some(expr) => match scheduler::next_fire(expr, now_ms()) {
+                        Ok(next) => {
+                            scheduler::finalize_cron_next(&ctx.pool, &ctx.db, &id, next).await
+                        }
+                        Err(err) => {
+                            scheduler::mark_error(&ctx.pool, &ctx.db, &id, &err.message).await
+                        }
+                    },
+                    None => {
+                        scheduler::mark_error(&ctx.pool, &ctx.db, &id, "cron job missing expr")
+                            .await
+                    }
+                },
+                other => {
+                    scheduler::mark_error(&ctx.pool, &ctx.db, &id, &format!("unknown kind {other}"))
+                        .await
+                }
+            };
+            if let Err(err) = finalize {
+                tracing::error!(db = %ctx.db, %id, error = %err, "scheduled job finalize failed");
+            }
+        }
+        Err(err) => {
+            // Execution failed (precondition/step error). No retry (see spec):
+            // one-shot records the error and stops; cron logs and reschedules.
+            let msg = err.message.clone();
+            match kind.as_str() {
+                "cron" => match cron.as_deref() {
+                    Some(expr) => match scheduler::next_fire(expr, now_ms()) {
+                        Ok(next) => {
+                            let _ =
+                                scheduler::finalize_cron_next(&ctx.pool, &ctx.db, &id, next).await;
+                            let _ = scheduler::mark_error(&ctx.pool, &ctx.db, &id, &msg).await;
+                        }
+                        Err(_) => {
+                            let _ = scheduler::mark_error(&ctx.pool, &ctx.db, &id, &msg).await;
+                        }
+                    },
+                    None => {
+                        let _ = scheduler::mark_error(&ctx.pool, &ctx.db, &id, &msg).await;
+                    }
+                },
+                _ => {
+                    let _ = scheduler::mark_error(&ctx.pool, &ctx.db, &id, &msg).await;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn handle_subscribe(

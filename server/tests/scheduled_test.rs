@@ -8,10 +8,18 @@
 
 mod common;
 
+use std::time::{Duration, Instant};
+
 use sqlx::PgPool;
 
+use rtdb_server::committer::Committers;
+use rtdb_server::db::SchemaCache;
+use rtdb_server::ddl;
+use rtdb_server::query::{Query, QueryResult, execute_query};
 use rtdb_server::scheduler;
-use rtdb_server::txn::Transaction;
+use rtdb_server::schema::SchemaDef;
+use rtdb_server::subs::SubscriptionManager;
+use rtdb_server::txn::{Step, Transaction};
 
 /// Mirrors `common::test_state()`'s pool setup: connect to the shared dev
 /// Postgres and bootstrap `rtdb_auth`. Each test gets its own connection so
@@ -190,4 +198,182 @@ async fn pause_resume_one_shot_keeps_due_at() {
 
     // Resuming a non-paused job is a no-op (returns false).
     assert!(!scheduler::set_paused(&pool, &db, &id, false).await.unwrap());
+}
+
+// --- Task 3: end-to-end firing tests -------------------------------------
+//
+// These exercise the full scheduler→committer path: the per-db scheduler timer
+// claims a due row and enqueues a fire-and-forget `RunScheduled`, the committer
+// runs the txn through `execute_txn` + `fan_out`, then finalizes the row. The
+// committer (and thus the scheduler) are lazily spawned on the first request to
+// a db, so each test warms the committer up with a no-op mutate before relying
+// on the scheduler having started.
+
+/// Pushes a one-table schema (`items` with an indexed number field `n`) so a
+/// firing job has an observable effect. Mirrors `common::fresh_db`'s push path.
+async fn push_simple_schema(pool: &PgPool, db: &str) -> SchemaDef {
+    let schema: SchemaDef = serde_json::from_value(serde_json::json!({"tables":{
+        "items":{
+            "fields":{"n":{"type":"number"}},
+            "indexes":[{"name":"by_n","fields":["n"]}]}
+    }}))
+    .expect("parse items schema");
+    ddl::push_schema(pool, db, schema)
+        .await
+        .expect("push items schema")
+}
+
+/// Triggers lazy spawn of `db`'s committer + scheduler tasks by submitting a
+/// no-op mutate. Both spawn inside `channel_for` on first use.
+async fn warm_up_committer(committers: &Committers, db: &str) {
+    committers
+        .mutate(db, None, Transaction { steps: vec![] })
+        .await
+        .expect("warm-up mutate");
+}
+
+/// Polls `items` by `n` until a doc with that value appears or `timeout`
+/// elapses. Returns true if observed. Used instead of a fixed sleep so the
+/// test is not timing-sensitive: due_at is already in the past, so the
+/// scheduler claims on its first wake (within MAX_SLEEP) and the committer
+/// executes immediately; 5s is far above the real latency.
+async fn poll_for_n(
+    pool: &PgPool,
+    db: &str,
+    schema: &SchemaDef,
+    n: i64,
+    timeout: Duration,
+) -> bool {
+    let query = Query {
+        table: "items".to_string(),
+        get: None,
+        index: Some("by_n".to_string()),
+        eq: vec![serde_json::json!(n)],
+        gt: None,
+        gte: None,
+        lt: None,
+        lte: None,
+        order: None,
+        take: None,
+        unique: false,
+        first: false,
+        count: false,
+        paginate: None,
+        filter: None,
+        search: None,
+    };
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Ok(QueryResult::Docs(docs)) = execute_query(pool, db, schema, &query).await
+            && !docs.is_empty()
+        {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Polls `scheduler::list` until `pred` returns `Some`, or `timeout`
+/// elapses. Used to wait for a job's finalized row state (deleted for a
+/// one-shot; pending+fired_count for a cron): finalize runs after `fan_out`,
+/// so observing the doc via `poll_for_n` then immediately reading the row
+/// would race the finalize step.
+async fn poll_list<T, F>(pool: &PgPool, db: &str, timeout: Duration, pred: F) -> Option<T>
+where
+    F: Fn(&[scheduler::ScheduleInfo]) -> Option<T>,
+{
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Ok(listed) = scheduler::list(pool, db).await
+            && let Some(t) = pred(&listed)
+        {
+            return Some(t);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn one_shot_fires_and_writes() {
+    let pool = test_pool().await;
+    let db = unique_db(&pool).await;
+    let schema = push_simple_schema(&pool, &db).await;
+    let committers = Committers::new(pool.clone(), SubscriptionManager::new(), SchemaCache::new());
+
+    // Schedule a one-shot due in the past so it fires on the scheduler's first
+    // wake. The txn inserts a doc the test can observe.
+    let txn = Transaction {
+        steps: vec![Step::Insert {
+            table: "items".to_string(),
+            doc: serde_json::json!({ "n": 42 }).as_object().unwrap().clone(),
+        }],
+    };
+    let _id = scheduler::insert(&pool, &db, "oneshot", 1, &txn, None)
+        .await
+        .unwrap();
+
+    // Spawn the committer + scheduler for this db.
+    warm_up_committer(&committers, &db).await;
+
+    // The doc appears once the scheduler claims and the committer executes.
+    let appeared = poll_for_n(&pool, &db, &schema, 42, Duration::from_secs(5)).await;
+    assert!(appeared, "scheduled one-shot never wrote its doc");
+
+    // A one-shot row is deleted after a successful fire. Poll for the delete:
+    // finalize (the DELETE) runs after `fan_out`, so reading the row the
+    // instant the doc appears would race it.
+    let deleted = poll_list(&pool, &db, Duration::from_secs(2), |l| {
+        if l.is_empty() { Some(()) } else { None }
+    })
+    .await;
+    assert!(
+        deleted.is_some(),
+        "one-shot row should be gone after firing"
+    );
+}
+
+#[tokio::test]
+async fn cron_fires_and_stays_pending() {
+    let pool = test_pool().await;
+    let db = unique_db(&pool).await;
+    let schema = push_simple_schema(&pool, &db).await;
+    let committers = Committers::new(pool.clone(), SubscriptionManager::new(), SchemaCache::new());
+
+    // `* * * * *` = every minute. Scheduled due in the past, so it fires once
+    // immediately, then `handle_scheduled` recomputes the next fire and sets
+    // the row back to pending with fired_count = 1.
+    let txn = Transaction {
+        steps: vec![Step::Insert {
+            table: "items".to_string(),
+            doc: serde_json::json!({ "n": 7 }).as_object().unwrap().clone(),
+        }],
+    };
+    let _id = scheduler::insert(&pool, &db, "cron", 1, &txn, Some("* * * * *"))
+        .await
+        .unwrap();
+
+    warm_up_committer(&committers, &db).await;
+
+    let appeared = poll_for_n(&pool, &db, &schema, 7, Duration::from_secs(5)).await;
+    assert!(appeared, "scheduled cron never wrote its doc");
+
+    // After firing, the cron row returns to pending with fired_count >= 1.
+    // Poll for that finalized state: finalize (status→pending, fired_count++)
+    // runs after `fan_out`, so reading the row the instant the doc appears
+    // would observe the intermediate 'running' row instead.
+    let info = poll_list(&pool, &db, Duration::from_secs(2), |l| {
+        l.iter()
+            .find(|i| i.kind == "cron" && i.status == "pending" && i.fired_count >= 1)
+            .cloned()
+    })
+    .await
+    .expect("cron row should be pending with fired_count >= 1");
+    assert_eq!(info.kind, "cron");
+    assert_eq!(info.status, "pending");
 }

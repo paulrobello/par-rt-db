@@ -343,6 +343,73 @@ pub async fn mark_error(pool: &PgPool, db: &str, id: &str, msg: &str) -> Result<
     Ok(())
 }
 
+use tokio::sync::mpsc::Sender;
+use tokio::time::{Duration, timeout};
+
+use crate::committer::CommitterRequest;
+
+/// Maximum sleep between wakes. Bounds the latency of a job inserted with a
+/// sooner `due_at` than the current sleep target (the loop re-reads the min
+/// `due_at` each wake, so this only costs an occasional early wake).
+const MAX_SLEEP: Duration = Duration::from_secs(2);
+
+/// The per-db scheduler loop. Owns recovery on start, then repeatedly: read
+/// the nearest due time, sleep until it (capped), claim due rows, and enqueue
+/// each as a fire-and-forget `RunScheduled` on the committer channel. Exits
+/// when the committer channel closes (its task died) — the next request to
+/// this db respawns both.
+pub async fn run_scheduler(pool: PgPool, db: String, committer_tx: Sender<CommitterRequest>) {
+    if let Err(err) = ensure_table(&pool, &db).await {
+        tracing::error!(db = %db, error = %err, "scheduler: ensure_table failed");
+    }
+    if let Err(err) = reset_running(&pool, &db).await {
+        tracing::error!(db = %db, error = %err, "scheduler: reset_running failed");
+    }
+    loop {
+        let sleep_target = match next_due(&pool, &db).await {
+            Ok(Some(due_at)) => {
+                let now = now_ms();
+                if due_at <= now {
+                    Duration::ZERO
+                } else {
+                    Duration::from_millis((due_at - now) as u64)
+                }
+            }
+            Ok(None) => MAX_SLEEP, // nothing pending
+            Err(err) => {
+                tracing::error!(db = %db, error = %err, "scheduler: next_due failed");
+                MAX_SLEEP
+            }
+        };
+        let sleep = sleep_target.min(MAX_SLEEP);
+        if !sleep.is_zero() {
+            // Bound the sleep so a shutdown/respawn can't hang the task.
+            let _ = timeout(MAX_SLEEP, tokio::time::sleep(sleep)).await;
+        }
+        let now = now_ms();
+        let claimed = match claim_due(&pool, &db, now, CLAIM_BATCH).await {
+            Ok(jobs) => jobs,
+            Err(err) => {
+                tracing::error!(db = %db, error = %err, "scheduler: claim_due failed");
+                continue;
+            }
+        };
+        for job in claimed {
+            let req = CommitterRequest::RunScheduled {
+                id: job.id,
+                kind: job.kind,
+                txn: Box::new(job.txn),
+                cron: job.cron,
+            };
+            if committer_tx.send(req).await.is_err() {
+                // Committer task is gone; this scheduler is now useless.
+                tracing::warn!(db = %db, "scheduler: committer channel closed, exiting");
+                return;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
