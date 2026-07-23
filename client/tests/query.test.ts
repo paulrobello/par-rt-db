@@ -128,10 +128,7 @@ describe("query builder", () => {
 
 describe("TableQuery.paginate", () => {
   it("builds a paginate query without cursor", () => {
-    const q = api.items
-      .query()
-      .withIndex("by_project", ["p1"])
-      .paginate(undefined, 10);
+    const q = api.items.query().withIndex("by_project", ["p1"]).paginate(undefined, 10);
     expect(q.json).toEqual({
       table: "items",
       index: "by_project",
@@ -141,10 +138,7 @@ describe("TableQuery.paginate", () => {
   });
 
   it("builds a paginate query with cursor", () => {
-    const q = api.items
-      .query()
-      .withIndex("by_project", ["p1"])
-      .paginate("Zm9vYmFy", 10);
+    const q = api.items.query().withIndex("by_project", ["p1"]).paginate("Zm9vYmFy", 10);
     expect(q.json).toEqual({
       table: "items",
       index: "by_project",
@@ -182,4 +176,3 @@ describe("cursor utilities", () => {
     expect(() => decodeCursor("not-valid-base64!!!")).toThrow("Invalid cursor");
   });
 });
-
