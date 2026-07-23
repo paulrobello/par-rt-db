@@ -377,3 +377,56 @@ async fn cron_fires_and_stays_pending() {
     assert_eq!(info.kind, "cron");
     assert_eq!(info.status, "pending");
 }
+
+#[tokio::test]
+async fn failing_cron_reschedules_anyway() {
+    let pool = test_pool().await;
+    let db = unique_db(&pool).await;
+    let _schema = push_simple_schema(&pool, &db).await;
+    let committers = Committers::new(pool.clone(), SubscriptionManager::new(), SchemaCache::new());
+
+    // A cron whose txn FAILS every fire: `ExpectVersion` against a document
+    // that does not exist returns NotFound, so `execute_txn` rejects the job.
+    // Per spec, a failing cron must log the error and reschedule (keep firing)
+    // rather than stick in `status='error'`. `fired_count` counts successful
+    // fires only, so it must stay 0.
+    let txn = Transaction {
+        steps: vec![Step::ExpectVersion {
+            table: "items".to_string(),
+            id: "no-such-doc".to_string(),
+            version: 999,
+        }],
+    };
+    let _id = scheduler::insert(&pool, &db, "cron", 1, &txn, Some("* * * * *"))
+        .await
+        .unwrap();
+
+    let before = rtdb_server::db::now_ms();
+    warm_up_committer(&committers, &db).await;
+
+    // The scheduler claims the due row and the committer runs the txn, which
+    // fails; `handle_scheduled`'s failure branch must reschedule rather than
+    // mark_error. Poll for the rescheduled state: status='pending' (NOT
+    // 'error'), last_error set, fired_count 0, due_at advanced beyond now.
+    let info = poll_list(&pool, &db, Duration::from_secs(5), |l| {
+        l.iter()
+            .find(|i| i.kind == "cron" && i.status == "pending" && i.last_error.is_some())
+            .cloned()
+    })
+    .await
+    .expect("failing cron should be rescheduled (pending with last_error)");
+
+    assert_eq!(info.status, "pending", "failing cron must keep firing");
+    assert!(
+        info.last_error.is_some(),
+        "failure must be recorded in last_error"
+    );
+    assert_eq!(
+        info.fired_count, 0,
+        "fired_count counts successful fires only"
+    );
+    assert!(
+        info.due_at > before,
+        "due_at must advance to the next fire, not stay in the past"
+    );
+}

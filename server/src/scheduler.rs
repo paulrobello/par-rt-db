@@ -343,6 +343,32 @@ pub async fn mark_error(pool: &PgPool, db: &str, id: &str, msg: &str) -> Result<
     Ok(())
 }
 
+/// Reschedules a cron job whose execution FAILED: advance `due_at` to the next
+/// fire and record `last_error`, but stay `pending` so the cron keeps firing
+/// (unlike `mark_error`, which stops it). `fired_count` is NOT bumped — it
+/// counts successful fires only.
+pub async fn reschedule_cron_error(
+    pool: &PgPool,
+    db: &str,
+    id: &str,
+    next_due: i64,
+    msg: &str,
+) -> Result<(), RtDbError> {
+    validate_db_name(db)?;
+    let schema = pg_schema(db);
+    sqlx::query(&format!(
+        "UPDATE \"{schema}\".scheduled_txns
+         SET status = 'pending', due_at = $2, last_error = $3
+         WHERE id = $1"
+    ))
+    .bind(id)
+    .bind(next_due)
+    .bind(msg)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 use tokio::sync::mpsc::Sender;
 use tokio::time::{Duration, timeout};
 

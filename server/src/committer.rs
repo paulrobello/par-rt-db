@@ -366,9 +366,10 @@ async fn handle_scheduled(
                 "cron" => match cron.as_deref() {
                     Some(expr) => match scheduler::next_fire(expr, now_ms()) {
                         Ok(next) => {
-                            let _ =
-                                scheduler::finalize_cron_next(&ctx.pool, &ctx.db, &id, next).await;
-                            let _ = scheduler::mark_error(&ctx.pool, &ctx.db, &id, &msg).await;
+                            let _ = scheduler::reschedule_cron_error(
+                                &ctx.pool, &ctx.db, &id, next, &msg,
+                            )
+                            .await;
                         }
                         Err(_) => {
                             let _ = scheduler::mark_error(&ctx.pool, &ctx.db, &id, &msg).await;
