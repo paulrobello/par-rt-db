@@ -215,7 +215,8 @@ async fn full_oauth_flow_returns_html_with_session_token() -> anyhow::Result<()>
     Ok(())
 }
 
-// (b) /auth/me with the session token -> email correct.
+// (b) /auth/me with the session token -> email correct, plus the GitHub
+// identity (login + id) surfaced from the resolved session's user row.
 #[tokio::test]
 async fn me_with_session_token_returns_email() -> anyhow::Result<()> {
     let mock = MockServer::start().await;
@@ -232,6 +233,65 @@ async fn me_with_session_token_returns_email() -> anyhow::Result<()> {
     let body: Value = resp.json().await?;
     assert_eq!(body["user"]["kind"], json!("user"));
     assert_eq!(body["user"]["email"], json!("probello@gmail.com"));
+    assert_eq!(body["user"]["githubLogin"], json!("paul"));
+    assert_eq!(body["user"]["githubId"], json!(42));
+    Ok(())
+}
+
+// (b2) /auth/validate with a real session token returns the authed user with
+// GitHub identity — same machinery as /auth/me, but available to a trusted
+// backend validating a player's token rather than the connection's own.
+#[tokio::test]
+async fn validate_with_session_token_returns_user() -> anyhow::Result<()> {
+    let mock = MockServer::start().await;
+    mount_github_mocks(&mock, verified_primary_email("probello@gmail.com")).await;
+    let (_state, addr) = oauth_state(&mock).await;
+    let token = login_flow(addr, "http://localhost:5173").await;
+
+    let resp = reqwest::Client::new()
+        .get(format!("http://{addr}/auth/validate"))
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: Value = resp.json().await?;
+    assert_eq!(body["user"]["kind"], json!("user"));
+    assert_eq!(body["user"]["email"], json!("probello@gmail.com"));
+    assert_eq!(body["user"]["githubLogin"], json!("paul"));
+    assert_eq!(body["user"]["githubId"], json!(42));
+    Ok(())
+}
+
+// (b3) /auth/validate rejects an invalid/expired token with the standard
+// Unauthorized envelope rather than a 500, keeping 500s generic. No OAuth
+// flow is exercised, so no GitHub mocks are mounted.
+#[tokio::test]
+async fn validate_rejects_invalid_token() -> anyhow::Result<()> {
+    let mock = MockServer::start().await;
+    let (_state, addr) = oauth_state(&mock).await;
+
+    let resp = reqwest::Client::new()
+        .get(format!("http://{addr}/auth/validate"))
+        .header("Authorization", "Bearer not-a-real-token")
+        .send()
+        .await?;
+    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let body: Value = resp.json().await?;
+    assert_eq!(body["code"], json!("UNAUTHORIZED"));
+    Ok(())
+}
+
+// (b4) /auth/validate requires a bearer token — missing header is a 401, not a 500.
+#[tokio::test]
+async fn validate_rejects_missing_token() -> anyhow::Result<()> {
+    let mock = MockServer::start().await;
+    let (_state, addr) = oauth_state(&mock).await;
+
+    let resp = reqwest::Client::new()
+        .get(format!("http://{addr}/auth/validate"))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
     Ok(())
 }
 

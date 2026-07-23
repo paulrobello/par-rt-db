@@ -37,11 +37,16 @@ pub async fn create_session(
 /// Resolves a session token to a `Principal::User`. `Ok(None)` if the token
 /// is absent or expired; an expired row is deleted lazily as part of this
 /// call so it never needs a separate sweep.
+///
+/// `u.github_id` and `u.login` are read alongside the session so the resolved
+/// principal carries GitHub identity. `login` is treated as a GitHub handle
+/// only when paired with a `github_id` — for a Google-only user `login` holds
+/// the display name, so `github_login` stays `None`.
 pub async fn resolve_session(pool: &PgPool, token: &str) -> Result<Option<Principal>, RtDbError> {
     let hash = sha256_hex(token);
 
-    let row: Option<(String, i64, String)> = sqlx::query_as(
-        "SELECT s.user_id, s.expires_at, u.email \
+    let row: Option<(String, i64, String, Option<i64>, String)> = sqlx::query_as(
+        "SELECT s.user_id, s.expires_at, u.email, u.github_id, u.login \
          FROM rtdb_auth.sessions s JOIN rtdb_auth.users u ON u.id = s.user_id \
          WHERE s.token_hash = $1",
     )
@@ -49,7 +54,7 @@ pub async fn resolve_session(pool: &PgPool, token: &str) -> Result<Option<Princi
     .fetch_optional(pool)
     .await?;
 
-    let Some((user_id, expires_at, email)) = row else {
+    let Some((user_id, expires_at, email, github_id, login)) = row else {
         return Ok(None);
     };
 
@@ -66,6 +71,8 @@ pub async fn resolve_session(pool: &PgPool, token: &str) -> Result<Option<Princi
         email,
         name: None,
         expires_at,
+        github_id,
+        github_login: github_id.is_some().then_some(login),
     }))
 }
 

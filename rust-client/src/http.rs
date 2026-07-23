@@ -172,6 +172,28 @@ impl RtDbHttpClient {
         Ok(parsed.user)
     }
 
+    /// Validate an arbitrary player-supplied session/machine token via
+    /// `GET /auth/validate`, returning the authed user. Unlike `auth_me`
+    /// (which validates this client's own token), this takes the token to
+    /// validate as an argument and accepts both session and machine tokens —
+    /// for a trusted backend validating a player's token. An invalid/expired
+    /// token surfaces as the standard `RtDbError` auth envelope.
+    pub async fn validate_session_token(&self, token: &str) -> Result<AuthedUser, RtDbError> {
+        let resp = self
+            .client
+            .get(format!("{}/auth/validate", self.url))
+            .bearer_auth(token)
+            .send()
+            .await
+            .map_err(|e| RtDbError::internal(format!("validate request failed: {e}")))?;
+        #[derive(serde::Deserialize)]
+        struct ValidateResponse {
+            user: AuthedUser,
+        }
+        let parsed = self.deserialize::<ValidateResponse>(resp).await?;
+        Ok(parsed.user)
+    }
+
     async fn json_result<T: DeserializeOwned>(
         &self,
         resp: reqwest::Response,
@@ -542,6 +564,71 @@ mod tests {
         let user = client.auth_me().await.unwrap();
         assert_eq!(user.kind, "user");
         assert_eq!(user.email.as_deref(), Some("a@b.com"));
+    }
+
+    #[tokio::test]
+    async fn validate_session_token_returns_user_and_github_identity() {
+        let (server, client) = setup().await;
+        // The validated token is the argument, not the client's own token —
+        // the mock asserts the request carries exactly the player's bearer.
+        Mock::given(method("GET"))
+            .and(path("/auth/validate"))
+            .and(header("authorization", "Bearer player-session-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "user": {
+                    "kind": "user",
+                    "email": "player@example.com",
+                    "name": null,
+                    "githubLogin": "player",
+                    "githubId": 42
+                }
+            })))
+            .mount(&server)
+            .await;
+        let user = client
+            .validate_session_token("player-session-token")
+            .await
+            .unwrap();
+        assert_eq!(user.kind, "user");
+        assert_eq!(user.email.as_deref(), Some("player@example.com"));
+        assert_eq!(user.github_login.as_deref(), Some("player"));
+        assert_eq!(user.github_id, Some(42));
+    }
+
+    #[tokio::test]
+    async fn validate_session_token_surfaces_auth_error_for_invalid_token() {
+        let (server, client) = setup().await;
+        Mock::given(method("GET"))
+            .and(path("/auth/validate"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(json!({
+                "code": "UNAUTHORIZED",
+                "message": "invalid token"
+            })))
+            .mount(&server)
+            .await;
+        let err = client
+            .validate_session_token("not-a-real-token")
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, crate::error::ErrorCode::Unauthorized);
+    }
+
+    #[tokio::test]
+    async fn validate_session_token_tolerates_response_without_github_fields() {
+        let (server, client) = setup().await;
+        // An older server omitting githubLogin/githubId must still parse,
+        // defaulting both to None (backward-compatible additive fields).
+        Mock::given(method("GET"))
+            .and(path("/auth/validate"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "user": {"kind": "machine", "email": null, "name": null}
+            })))
+            .mount(&server)
+            .await;
+        let user = client.validate_session_token("mach-tok").await.unwrap();
+        assert_eq!(user.kind, "machine");
+        assert_eq!(user.github_login, None);
+        assert_eq!(user.github_id, None);
     }
 
     // `mutate_with_retry` reuses `retry_on_precondition`, so these tests focus on

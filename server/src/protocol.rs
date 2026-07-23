@@ -66,10 +66,18 @@ pub enum ServerMessage {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AuthedUser {
     pub kind: String, // "user" | "machine"
     pub email: Option<String>,
     pub name: Option<String>,
+    /// GitHub login. Omitted entirely on the wire when absent (machine token
+    /// or a non-GitHub user) so existing clients keep parsing unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub github_login: Option<String>,
+    /// GitHub numeric id, paired with `github_login`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub github_id: Option<i64>,
 }
 
 #[cfg(test)]
@@ -153,7 +161,9 @@ mod tests {
                 user: AuthedUser {
                     kind: "user".to_string(),
                     email: Some("a@b.com".to_string()),
-                    name: None
+                    name: None,
+                    github_login: None,
+                    github_id: None
                 }
             })
             .unwrap()["type"],

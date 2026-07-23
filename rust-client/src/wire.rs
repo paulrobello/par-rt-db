@@ -69,10 +69,18 @@ pub enum ServerMessage {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AuthedUser {
     pub kind: String,
     pub email: Option<String>,
     pub name: Option<String>,
+    /// GitHub login. Absent on the wire for machine tokens / non-GitHub
+    /// users; serde defaults a missing field to `None` so this stays
+    /// backward-compatible with older servers that omit it.
+    #[serde(default)]
+    pub github_login: Option<String>,
+    #[serde(default)]
+    pub github_id: Option<i64>,
 }
 
 /// HTTP request/response bodies for `/admin/*`. These mirror the server's
@@ -213,6 +221,8 @@ mod tests {
                 kind: "user".into(),
                 email: Some("a@b.com".into()),
                 name: None,
+                github_login: None,
+                github_id: None,
             },
         })
         .unwrap();

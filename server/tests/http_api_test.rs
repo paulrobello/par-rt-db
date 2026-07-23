@@ -354,6 +354,8 @@ async fn authorize_user_branch_matches_allowlist_case_insensitively() -> anyhow:
         email: "Probello@Gmail.com".to_string(),
         name: None,
         expires_at: i64::MAX,
+        github_id: None,
+        github_login: None,
     };
     authorize(&state.pool, &allowed, &name)
         .await
@@ -364,6 +366,8 @@ async fn authorize_user_branch_matches_allowlist_case_insensitively() -> anyhow:
         email: "someone-else@example.com".to_string(),
         name: None,
         expires_at: i64::MAX,
+        github_id: None,
+        github_login: None,
     };
     let err = authorize(&state.pool, &not_allowed, &name)
         .await
@@ -395,6 +399,8 @@ async fn authorize_user_branch_rejects_expired_session() -> anyhow::Result<()> {
         email: "probello@gmail.com".to_string(),
         name: None,
         expires_at: db::now_ms() - 1,
+        github_id: None,
+        github_login: None,
     };
     let err = authorize(&state.pool, &expired, &name)
         .await

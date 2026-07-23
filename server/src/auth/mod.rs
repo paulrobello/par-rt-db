@@ -23,6 +23,13 @@ pub enum Principal {
         email: String,
         name: Option<String>,
         expires_at: i64,
+        /// GitHub numeric id; `None` for users who authenticated through a
+        /// non-GitHub provider (Google). Pairs with `github_login`.
+        github_id: Option<i64>,
+        /// GitHub login (`users.login`), but only when `github_id` is `Some` —
+        /// `login` also stores the display name for Google users, so it is a
+        /// genuine GitHub handle only when paired with a github id.
+        github_login: Option<String>,
     },
 }
 
@@ -117,11 +124,21 @@ pub fn authed_user(p: &Principal) -> AuthedUser {
             kind: "machine".to_string(),
             email: None,
             name: None,
+            github_login: None,
+            github_id: None,
         },
-        Principal::User { email, name, .. } => AuthedUser {
+        Principal::User {
+            email,
+            name,
+            github_id,
+            github_login,
+            ..
+        } => AuthedUser {
             kind: "user".to_string(),
             email: Some(email.clone()),
             name: name.clone(),
+            github_login: github_login.clone(),
+            github_id: *github_id,
         },
     }
 }
@@ -149,10 +166,29 @@ mod tests {
             email: "a@b.com".to_string(),
             name: Some("Alice".to_string()),
             expires_at: i64::MAX,
+            github_id: None,
+            github_login: None,
         };
         let user = authed_user(&principal);
         assert_eq!(user.kind, "user");
         assert_eq!(user.email, Some("a@b.com".to_string()));
         assert_eq!(user.name, Some("Alice".to_string()));
+        assert_eq!(user.github_id, None);
+        assert_eq!(user.github_login, None);
+    }
+
+    #[test]
+    fn authed_user_for_user_surfaces_github_identity() {
+        let principal = Principal::User {
+            user_id: "u".to_string(),
+            email: "a@b.com".to_string(),
+            name: Some("Alice".to_string()),
+            expires_at: i64::MAX,
+            github_id: Some(42),
+            github_login: Some("alice".to_string()),
+        };
+        let user = authed_user(&principal);
+        assert_eq!(user.github_id, Some(42));
+        assert_eq!(user.github_login, Some("alice".to_string()));
     }
 }

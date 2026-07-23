@@ -249,6 +249,28 @@ async fn me(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response 
     }
 }
 
+/// `GET /auth/validate`: validates an arbitrary presented session/machine
+/// token through the same machinery `/auth/me` uses — `resolve_bearer` checks
+/// machine-token revocation and session expiry live — and returns the
+/// `AuthedUser`. Unlike `/auth/me` (session-only, because it represents the
+/// caller's own connection), this also accepts a machine token, so a trusted
+/// backend can validate either kind of player token it is handed. The token
+/// is supplied by the player being validated, via the bearer header; an
+/// invalid/expired token surfaces as the standard `RtDbError` auth envelope.
+async fn validate(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    let Some(token) = bearer_token(&headers) else {
+        return RtDbError::unauthorized("missing bearer token").into_response();
+    };
+
+    match resolve_bearer(&state.pool, token).await {
+        Ok(principal) => Json(MeResponse {
+            user: authed_user(&principal),
+        })
+        .into_response(),
+        Err(err) => err.into_response(),
+    }
+}
+
 /// OAuth + session routes. GitHub keeps its original paths
 /// (`/auth/github`, `/auth/callback`) so deployed clients are unaffected;
 /// Google mounts at `/auth/google` + `/auth/google/callback`. `/auth/logout`
@@ -264,4 +286,5 @@ pub fn auth_routes() -> Router<Arc<AppState>> {
         )
         .route("/auth/logout", post(logout))
         .route("/auth/me", get(me))
+        .route("/auth/validate", get(validate))
 }
