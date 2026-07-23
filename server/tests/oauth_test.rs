@@ -39,6 +39,18 @@ async fn oauth_state(mock: &MockServer) -> (Arc<AppState>, SocketAddr) {
 /// re-fetches after a replay, `MockServer`'s drop-time verification fails
 /// the test.
 async fn mount_github_mocks(mock: &MockServer, email_body: Value) {
+    mount_github_user_mocks(mock, 42, "paul", email_body).await;
+}
+
+/// Parameterized variant of `mount_github_mocks` so cross-provider tests can
+/// use a distinct `github_id`/`login` (the default helper's fixed `id: 42`
+/// would collide in the shared `rtdb_auth.users` table across parallel tests).
+async fn mount_github_user_mocks(
+    mock: &MockServer,
+    github_id: i64,
+    login: &str,
+    email_body: Value,
+) {
     Mock::given(method("POST"))
         .and(path("/login/oauth/access_token"))
         .and(header("accept", "application/json"))
@@ -55,8 +67,8 @@ async fn mount_github_mocks(mock: &MockServer, email_body: Value) {
         .and(header("user-agent", "par-rt-db"))
         .and(header("authorization", "Bearer gh-access-token"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "id": 42,
-            "login": "paul",
+            "id": github_id,
+            "login": login,
             "name": "Paul"
         })))
         .expect(1)
@@ -191,6 +203,13 @@ async fn ws_auth(ws: &mut WsStream, token: &str, db: &str) -> Value {
 
 fn verified_primary_email(email: &str) -> Value {
     json!([{"email": email, "primary": true, "verified": true}])
+}
+
+/// A pseudo-random positive `i64` for `github_id`, unique across parallel tests
+/// sharing the `rtdb_auth.users` table (which enforces `github_id` uniqueness).
+/// 15 hex nibbles max out well under `i64::MAX`.
+fn unique_github_id() -> i64 {
+    i64::from_str_radix(&db::random_token()[..15], 16).expect("parse hex as i64")
 }
 
 fn insert_work_item_txn() -> Value {
@@ -705,5 +724,178 @@ async fn google_start_unconfigured_returns_service_unavailable() -> anyhow::Resu
         .send()
         .await?;
     assert_eq!(resp.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    Ok(())
+}
+
+// --- Cross-provider same-email resolution (no 500) ---
+//
+// GitHub upserts by `github_id` while Google upserts by `email`. A GitHub
+// login whose email already exists on a Google-created account (github_id
+// NULL) used to INSERT and hit the email UNIQUE constraint -> 500. It now
+// links the existing account in place.
+
+// (k) a Google-created account (github_id NULL) is linked when the same email
+// later signs in via GitHub — no 500, the row is reused, github_id is set.
+#[tokio::test]
+async fn github_login_links_existing_email_account_without_500() -> anyhow::Result<()> {
+    let email = format!("link-{}@example.com", db::new_id());
+    let github_id = unique_github_id();
+    let mock = MockServer::start().await;
+    mount_github_user_mocks(&mock, github_id, "alice", verified_primary_email(&email)).await;
+    let (state, addr) = oauth_state(&mock).await;
+
+    // Pre-existing account keyed by email with no GitHub link yet (as a Google
+    // login would leave it).
+    let existing_id = db::new_id();
+    sqlx::query(
+        "INSERT INTO rtdb_auth.users (id, github_id, login, email, created_at) \
+         VALUES ($1, NULL, $2, $3, $4)",
+    )
+    .bind(&existing_id)
+    .bind("Alice Google")
+    .bind(&email)
+    .bind(db::now_ms())
+    .execute(&state.pool)
+    .await?;
+
+    // No 500: login_flow asserts a 200 HTML callback and returns a session token.
+    let token = login_flow(addr, "http://localhost:5173").await;
+
+    // Linked in place: same id, github_id now set, still exactly one row.
+    let (id, gh): (String, Option<i64>) =
+        sqlx::query_as("SELECT id, github_id FROM rtdb_auth.users WHERE email = $1")
+            .bind(&email)
+            .fetch_one(&state.pool)
+            .await?;
+    assert_eq!(id, existing_id);
+    assert_eq!(gh, Some(github_id));
+    let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM rtdb_auth.users WHERE email = $1")
+        .bind(&email)
+        .fetch_one(&state.pool)
+        .await?;
+    assert_eq!(count, 1);
+
+    // The session resolves and now carries the linked GitHub identity.
+    let me = reqwest::Client::new()
+        .get(format!("http://{addr}/auth/me"))
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .await?;
+    assert_eq!(me.status(), reqwest::StatusCode::OK);
+    let body: Value = me.json().await?;
+    assert_eq!(body["user"]["githubId"], json!(github_id));
+    assert_eq!(body["user"]["email"], json!(email));
+    Ok(())
+}
+
+// (l) single-provider GitHub flow: a returning GitHub user reuses their account
+// and refreshes a changed email — no second row, no fork.
+#[tokio::test]
+async fn github_returning_user_reuses_account_and_refreshes_email() -> anyhow::Result<()> {
+    let github_id = unique_github_id();
+    let old_email = format!("ret-old-{}@example.com", db::new_id());
+    let new_email = format!("ret-new-{}@example.com", db::new_id());
+    let mock = MockServer::start().await;
+    mount_github_user_mocks(&mock, github_id, "bob", verified_primary_email(&new_email)).await;
+    let (state, addr) = oauth_state(&mock).await;
+
+    let existing_id = db::new_id();
+    sqlx::query(
+        "INSERT INTO rtdb_auth.users (id, github_id, login, email, created_at) \
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(&existing_id)
+    .bind(github_id)
+    .bind("bob-old")
+    .bind(&old_email)
+    .bind(db::now_ms())
+    .execute(&state.pool)
+    .await?;
+
+    let _token = login_flow(addr, "http://localhost:5173").await;
+
+    let (id, gh, em): (String, Option<i64>, String) =
+        sqlx::query_as("SELECT id, github_id, email FROM rtdb_auth.users WHERE github_id = $1")
+            .bind(github_id)
+            .fetch_one(&state.pool)
+            .await?;
+    assert_eq!(id, existing_id);
+    assert_eq!(gh, Some(github_id));
+    assert_eq!(em, new_email);
+    // The old email is gone (updated in place, not duplicated).
+    let (count_old,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM rtdb_auth.users WHERE email = $1")
+            .bind(&old_email)
+            .fetch_one(&state.pool)
+            .await?;
+    assert_eq!(count_old, 0);
+    Ok(())
+}
+
+// (m) single-provider GitHub flow: a brand-new user inserts exactly one row.
+#[tokio::test]
+async fn github_new_user_inserts_one_row() -> anyhow::Result<()> {
+    let github_id = unique_github_id();
+    let email = format!("new-{}@example.com", db::new_id());
+    let mock = MockServer::start().await;
+    mount_github_user_mocks(&mock, github_id, "carol", verified_primary_email(&email)).await;
+    let (state, addr) = oauth_state(&mock).await;
+
+    let _token = login_flow(addr, "http://localhost:5173").await;
+
+    let (count,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM rtdb_auth.users WHERE github_id = $1")
+            .bind(github_id)
+            .fetch_one(&state.pool)
+            .await?;
+    assert_eq!(count, 1);
+    Ok(())
+}
+
+// (n) the email is already linked to a *different* GitHub account -> a
+// deliberate 409 conflict, never a 500, and the existing account is untouched.
+#[tokio::test]
+async fn github_login_email_linked_elsewhere_returns_conflict_not_500() -> anyhow::Result<()> {
+    let email = format!("conflict-{}@example.com", db::new_id());
+    let other_github_id = unique_github_id();
+    let login_github_id = unique_github_id();
+    let mock = MockServer::start().await;
+    mount_github_user_mocks(
+        &mock,
+        login_github_id,
+        "dave",
+        verified_primary_email(&email),
+    )
+    .await;
+    let (state, addr) = oauth_state(&mock).await;
+
+    // Email already claimed by a different GitHub account.
+    sqlx::query(
+        "INSERT INTO rtdb_auth.users (id, github_id, login, email, created_at) \
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(db::new_id())
+    .bind(other_github_id)
+    .bind("other")
+    .bind(&email)
+    .bind(db::now_ms())
+    .execute(&state.pool)
+    .await?;
+
+    // Drive the callback directly — login_flow asserts 200, but we expect a 409.
+    let client = no_redirect_client();
+    let state_token = start_login(&client, addr, "http://localhost:5173").await;
+    let resp = callback(&client, addr, &state_token).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
+    let body: Value = resp.json().await?;
+    assert_eq!(body["code"], json!("PRECONDITION_FAILED"));
+
+    // The pre-existing account is untouched.
+    let (gh,): (Option<i64>,) =
+        sqlx::query_as("SELECT github_id FROM rtdb_auth.users WHERE email = $1")
+            .bind(&email)
+            .fetch_one(&state.pool)
+            .await?;
+    assert_eq!(gh, Some(other_github_id));
     Ok(())
 }
