@@ -430,3 +430,169 @@ async fn failing_cron_reschedules_anyway() {
         "due_at must advance to the next fire, not stay in the past"
     );
 }
+
+// --- Task 7: scheduler catch-up / no-backfill / one-shot failure semantics --
+
+#[tokio::test]
+async fn one_shot_catches_up_after_being_past_due() {
+    let pool = test_pool().await;
+    let db = unique_db(&pool).await;
+    let schema = push_simple_schema(&pool, &db).await;
+    let committers = Committers::new(pool.clone(), SubscriptionManager::new(), SchemaCache::new());
+
+    // Warm the committer+scheduler up FIRST so the per-db scheduler loop is
+    // already running, THEN insert a one-shot whose due_at is ~1 hour in the
+    // past. The running scheduler must catch the newly-past-due row on its
+    // next sweep (within MAX_SLEEP=2s) and fire it, not drop it. This is a
+    // distinct timing path from `one_shot_fires_and_writes`, which inserts
+    // before warming up (testing startup discovery of stale rows); this test
+    // catches the bug class where a running scheduler fails to re-read
+    // `next_due` and misses rows inserted after it started.
+    warm_up_committer(&committers, &db).await;
+
+    let txn = Transaction {
+        steps: vec![Step::Insert {
+            table: "items".to_string(),
+            doc: serde_json::json!({ "n": 5 }).as_object().unwrap().clone(),
+        }],
+    };
+    let one_hour_ago = rtdb_server::db::now_ms() - 3_600_000;
+    let _id = scheduler::insert(&pool, &db, "oneshot", one_hour_ago, &txn, None)
+        .await
+        .unwrap();
+
+    let appeared = poll_for_n(&pool, &db, &schema, 5, Duration::from_secs(5)).await;
+    assert!(
+        appeared,
+        "running scheduler must catch up a newly-inserted past-due one-shot"
+    );
+}
+
+#[tokio::test]
+async fn cron_skips_missed_windows() {
+    let pool = test_pool().await;
+    let db = unique_db(&pool).await;
+    let schema = push_simple_schema(&pool, &db).await;
+    let committers = Committers::new(pool.clone(), SubscriptionManager::new(), SchemaCache::new());
+
+    // `* * * * *` (every minute) with due_at ~1 hour in the past. A naive
+    // backfilling scheduler would fire ~60 times for the missed hour; the spec
+    // requires exactly ONE fire on the next sweep, after which `due_at` jumps
+    // to the next minute boundary after now (because `handle_scheduled`
+    // computes `next_fire(expr, now_ms())`, not `next_fire(prev_due_at)`).
+    let txn = Transaction {
+        steps: vec![Step::Insert {
+            table: "items".to_string(),
+            doc: serde_json::json!({ "n": 77 }).as_object().unwrap().clone(),
+        }],
+    };
+    let one_hour_ago = rtdb_server::db::now_ms() - 3_600_000;
+    let _id = scheduler::insert(&pool, &db, "cron", one_hour_ago, &txn, Some("* * * * *"))
+        .await
+        .unwrap();
+
+    let before = rtdb_server::db::now_ms();
+    warm_up_committer(&committers, &db).await;
+
+    // Poll for the finalized state after exactly one fire: status back to
+    // pending with fired_count == 1. If the scheduler were backfilling the
+    // missed hour, fired_count would jump past 1 within milliseconds and this
+    // predicate would never match (test times out -> fails).
+    let info = poll_list(&pool, &db, Duration::from_secs(10), |l| {
+        l.iter()
+            .find(|i| i.kind == "cron" && i.status == "pending" && i.fired_count == 1)
+            .cloned()
+    })
+    .await
+    .expect("cron should fire exactly once and return to pending");
+
+    assert_eq!(
+        info.fired_count, 1,
+        "cron must not backfill the ~60 missed minutes"
+    );
+    assert!(
+        info.due_at > before,
+        "due_at must advance past now (next minute boundary), not stay in the past"
+    );
+    // For `* * * * *`, next_fire(now) is at most 60s in the future. `before`
+    // was captured just before warmup, so allow margin for warmup + scheduler
+    // wake + fire latency.
+    assert!(
+        info.due_at - before < 75_000,
+        "due_at must be the next minute boundary after now, not far in the future"
+    );
+
+    // The doc was written exactly once (one fire, one insert).
+    let appeared = poll_for_n(&pool, &db, &schema, 77, Duration::from_secs(2)).await;
+    assert!(
+        appeared,
+        "cron should have written its doc on the single fire"
+    );
+}
+
+#[tokio::test]
+async fn failing_txn_marks_error_one_shot() {
+    let pool = test_pool().await;
+    let db = unique_db(&pool).await;
+    let schema = push_simple_schema(&pool, &db).await;
+    let committers = Committers::new(pool.clone(), SubscriptionManager::new(), SchemaCache::new());
+
+    // A one-shot whose txn is set up to FAIL: step 1 inserts a doc, step 2 is
+    // an ExpectVersion against a nonexistent row (NotFound). Because
+    // `execute_txn` runs all steps in one Postgres transaction, step 1's
+    // insert is rolled back when step 2 fails. Per spec, a failing one-shot
+    // records the error and STOPS — status='error', row kept (not deleted like
+    // a successful one-shot, not rescheduled like a failing cron). This is the
+    // one-shot counterpart of `failing_cron_reschedules_anyway`.
+    let txn = Transaction {
+        steps: vec![
+            Step::Insert {
+                table: "items".to_string(),
+                doc: serde_json::json!({ "n": 123 }).as_object().unwrap().clone(),
+            },
+            Step::ExpectVersion {
+                table: "items".to_string(),
+                id: "no-such-doc".to_string(),
+                version: 999,
+            },
+        ],
+    };
+    let _id = scheduler::insert(&pool, &db, "oneshot", 1, &txn, None)
+        .await
+        .unwrap();
+
+    warm_up_committer(&committers, &db).await;
+
+    // Poll for the error state: status='error' with last_error set (NOT
+    // deleted like a successful one-shot, NOT pending like a rescheduled
+    // cron). `mark_error` runs after `execute_txn` fails, so observing this
+    // state means the txn has already been attempted and rolled back.
+    let info = poll_list(&pool, &db, Duration::from_secs(5), |l| {
+        l.iter()
+            .find(|i| i.kind == "oneshot" && i.status == "error")
+            .cloned()
+    })
+    .await
+    .expect("failing one-shot should be marked error, not deleted or pending");
+
+    assert_eq!(info.status, "error");
+    assert!(
+        info.last_error.is_some(),
+        "failure must be recorded in last_error"
+    );
+    assert_eq!(
+        info.fired_count, 0,
+        "fired_count counts successful fires only"
+    );
+
+    // The (failing) write did NOT occur: `execute_txn`'s atomicity rolled back
+    // step 1's insert when step 2 failed. By the time we observe status
+    // ='error' the txn has already been attempted and failed, so the doc will
+    // never appear; the short poll confirms non-existence rather than asserting
+    // it instantaneously (which would race the mark_error UPDATE).
+    let appeared = poll_for_n(&pool, &db, &schema, 123, Duration::from_millis(300)).await;
+    assert!(
+        !appeared,
+        "failing txn's write must be rolled back — no doc with n=123 should exist"
+    );
+}
