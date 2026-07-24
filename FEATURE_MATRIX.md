@@ -1,6 +1,6 @@
 # Feature Matrix — Convex vs par-rt-db
 
-**Date:** 2026-07-21 (gap matrix last updated 2026-07-23)
+**Date:** 2026-07-21 (gap matrix last updated 2026-07-24)
 **Purpose:** Inventory Convex's feature surface against par-rt-db's, and rank every gap
 by utility and level of effort so parity work can be picked off in value order.
 **Perspective:** "Utility" is judged for the apps this instance actually serves (kanban
@@ -69,7 +69,7 @@ high leverage, Tier 3 = large projects.
 | 17 | 3 | **Vector search** | ✅ | ✅ | Med | M–L | Implemented — the pgvector extension (`CREATE EXTENSION IF NOT EXISTS vector` in `db::create_database` and as the first statement in `ddl::push_schema`, so existing databases get it idempotently) backs a new `Vector { dimensions }` field type (`schema.rs`), stored in the `doc` jsonb as a JSON array and validated for exact length + finite entries (not btree-indexable). A vector index on `IndexDef` via additive `vector: Option<VectorIndexSpec { dimensions, filter_fields }>` (`skip_serializing_if`-omitted when absent, so existing btree/search indexes deserialize unchanged) compiles in `ddl.rs` to a write-maintained `vector(N)` column `v_<index>` (populated on insert/patch/replace, not a generated column — pgvector has no jsonb→vector generated cast) plus an HNSW `vector_cosine_ops` index; declared `filterFields` get their typed `f_` columns. The `vectorSearch` query terminal (`{index, vector, limit, filter?}`, mutually exclusive with every other terminal) ranks by cosine distance `<=>` ASC, carries its own `limit` (capped at `VECTOR_SEARCH_MAX_LIMIT = 256`), and takes an optional eq-`filter` over the index's declared `filterFields`; the query vector is bound via `$n::vector` text cast so user-supplied arrays can never inject syntax. It rides the committer's existing table-level invalidation, so subscriptions re-run and push on any write to the table — no new committer code. **Two deliberate divergences from Convex:** (1) **reactive** (Convex's `vectorSearch` is a one-shot action; par-rt-db re-runs and pushes live), and (2) **client-supplied embeddings** (no server-side generation — the architecture has no JS runtime). Mirrored end-to-end: server + ts-client (`t.vector(n)`, `vectorIndex(...)`, `.vectorSearch(...)`) + rust-client (`FieldType::vector(n)`, `vector_index(...)`, `.vector_search(...)`); the dev and prod Postgres image is `pgvector/pgvector:pg17` (a prod redeploy is required for it to work live — the image change ships here but is inert until deployed). |
 | 18 | 3 | **Data browser dashboard** | ✅ full dashboard | ❌ | Med | L | Read/write table browser SPA over the admin API (could itself run on par-rt-db). Convex's dashboard is a real DX advantage; `psql` is the stopgap. |
 | 19 | 3 | **Client test harness** (in-memory fake) | ✅ `convex-test` | ✅ | Med | M | Implemented (ts-client) — `InMemoryRtDbClient` (`src/in_memory.ts`) mirrors the server's schema/query/txn/step-result semantics with no network and no Postgres: `pushSchema`, `query`, `mutate` (with `mutId` idempotency), `subscribe` (reactive), cursor keyset pagination, system fields merged at read time, atomic rollback on step failure. Reuses `protocol.ts` types. Deferred gaps (additive schema evolution) marked as TODOs. Pure coverage in `in_memory.test.ts`. |
-| 20 | 3 | **Per-row authorization rules** | ✅ arbitrary code in functions | ❌ allowlist = full access | Med–High | XL | Needs a declarative rule DSL (e.g. owner-field match) enforced on query, mutate, *and* subscription re-run. Only matters for multi-user apps where users must not see each other's rows — the kanban model doesn't. Deserves its own spec when needed. |
+| 20 | 3 | **Per-row authorization rules** | ✅ arbitrary code in functions | ✅ owner-field match | Med–High | XL | Implemented (v1: owner-field match) — a table opts in by declaring `ownerField` (names a declared, string-compatible field holding the owner's `user_id`); the declaration is additive/optional, so existing schemas deserialize unchanged, and it mirrors byte-identically across all three schema representations (server `TableDef.owner_field`, ts-client `defineTable(...).ownerField(...)`, rust-client `TableBuilder::owner_field(...)`) — wire key `ownerField`, `skip_serializing_if`-omitted when unset. Server-enforced and unforgeable on every terminal: `index`/`take`/`collect`/`count`/`paginate`/`unique`/`first` get an injected `FilterExpr::Eq` AND-ed with the client filter, `get(id)` returns a silent `Doc(None)` for unowned rows, and `search`/`vectorSearch` carry an owner predicate in their SQL; the owner value is `$n`-bound, never interpolated. Subscriptions capture the subscriber's owner at subscribe time and re-filter to it on every `fan_out`, so a write by user B never pushes into A's subscription. Writes: `insert` and `upsert`-insert auto-stamp the owner server-authoritatively (overwriting any client value), and `patch`/`replace`/`delete`/`upsert`-update run an ownership pre-check INSIDE the serialized transaction — mismatch returns `Forbidden` (HTTP 403) and aborts the whole txn atomically; `ownerField` is immutable post-insert (re-stamped on every write, so a user cannot transfer or orphan ownership). Machine tokens and scheduled jobs (no interactive principal) bypass per-row rules entirely — the db-level allowlist/token/session gate still runs first, and per-row is an additive second layer. Deliberately deferred: collaborator/role fields (model B), a general declarative predicate DSL (model C), and `ExpectVersion`/`ExpectAbsent` (an existence/version side-channel, not owner-checked in v1). |
 | 21 | 3 | **Fine-grained subscription invalidation** | ✅ read-set tracking | ✅ point reads (`get`) | Low (now) | L | v1: `get(id)` point reads skip re-runs when the write didn't touch their document (sound — a point read depends on exactly one doc); every other shape (take/collect/count/paginate/unique/first/search/vector) stays table-level. Server-only, no protocol change. Range/boundary tracking for ordered/eq/set shapes deferred — see `docs/superpowers/specs/2026-07-24-fine-grained-subscription-invalidation-design.md`. |
 
 ## 3. Deliberate non-goals (not gaps)
@@ -102,12 +102,12 @@ mistakes them for backlog.
 
 ## 5. Recommended order
 
-As of 2026-07-23, **done**: tier-1 **#1–#3, #6, #7, #13**; tier-2 **#4** (safe
+As of 2026-07-24, **done**: tier-1 **#1–#3, #6, #7, #13**; tier-2 **#4** (safe
 retry), **#5** (cursor pagination), **#8** (session-expiry enforcement), **#9**
 (scheduled txns), **#10** (cron jobs), **#11** (full-text search), **#12**
 (optimistic updates), **#14** (OAuth provider trait + Google), **#15** (db-side
 `filter()`); and tier-3 **#19** (in-memory client test harness), **#16** (file
-storage), **#17** (vector search). **#9/#10** landed as one per-db `scheduled_txns` side table drained
+storage), **#17** (vector search), **#20** (per-row auth). **#9/#10** landed as one per-db `scheduled_txns` side table drained
 through the committer by a per-db scheduler timer (`scheduler.rs` + the
 `RunScheduled` committer arm) — at-least-once delivery, one-shot catches up if
 past due, cron skips missed windows. **#16** is a per-db `bytea` `storage`
@@ -119,14 +119,24 @@ semantic search: a `Vector` field type + a vector index (write-maintained
 `vectorSearch` terminal ranking by cosine distance (`<=>`) with an optional
 eq-`filter` over declared `filterFields` (limit ≤256); embeddings are
 client-supplied (no server-side generation), and the Postgres image is now
-`pgvector/pgvector:pg17` (dev + prod). The Rust client is
+`pgvector/pgvector:pg17` (dev + prod). **#20** is per-row owner-field
+authorization: an opt-in `ownerField` declaration per table, enforced
+server-side and unforgeably on every read terminal (filtered `index`/`take`/
+`collect`/`count`/`paginate`/`unique`/`first`, silent-`None` `get(id)`,
+`search`/`vectorSearch`), on every `fan_out` re-run (subscriber's owner captured
+at subscribe time), and on every write (auto-stamp on insert + `upsert`-insert;
+ownership pre-check inside the serialized txn on `patch`/`replace`/`delete`/
+`upsert`-update, mismatch → `Forbidden`/403 aborting the whole txn atomically;
+immutable post-insert); machine tokens and scheduled jobs bypass it, and
+collaborator/role (model B), the general predicate DSL (model C), and
+`ExpectVersion`/`ExpectAbsent` are deferred. The Rust client is
 feature-complete (`http` + reactive `ws` + `admin` + index/`mutate_with_retry`
 helpers + `.filter()`/`.search()`/`.vector_search()` builders + storage), and the TS client mirrors
 it (`.filter()`/`.search()` + `.vectorSearch()` + `searchIndex` + `vectorIndex` + `t.vector` + storage) — all three clients share
 one wire contract for db-side `filter()`, full-text search, and vector search, and the storage
 HTTP surface.
 
-Remaining gaps, in value order: **#18 (data-browser dashboard)** and **#20 (per-row auth rules)**.
+Remaining gaps, in value order: **#18 (data-browser dashboard)**.
 
 Client parity for db-side `filter()`, full-text search, and vector search is complete: the
 TS `.filter()`/`.search()`/`.vectorSearch()` query builders + `searchIndex`/`vectorIndex` schema declarations

@@ -25,6 +25,10 @@ guidance. Authoritative design:
   (`auth/github.rs`) and Google (`auth/google.rs`) providers — cross-provider
   same-email logins link to one user by email — plus hashed per-database machine
   tokens (`auth/tokens.rs`); the admin key is compared constant-time.
+- Per-row authorization: a table may declare an opt-in `ownerField`, after which
+  an authenticated user reads/mutates only rows they own (enforced server-side
+  on query, mutate, and subscription re-run; machine tokens and scheduled jobs
+  bypass it). See FEATURE_MATRIX #20.
 
 ## Layout
 

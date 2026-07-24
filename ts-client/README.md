@@ -26,6 +26,11 @@ export const schema = defineSchema({
 });
 ```
 
+A table can declare an owner field for opt-in per-row authorization
+(server-enforced on read, mutate, and subscription re-run; machine tokens
+bypass): `.ownerField("userId")` names a declared, string-compatible field
+holding the owner's `user_id`.
+
 Push it with the admin client (admin key required):
 
 ```ts
