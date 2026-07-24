@@ -129,19 +129,23 @@ pub async fn get_meta(pool: &PgPool, db: &str, id: &str) -> Result<Option<FileMe
 pub async fn delete(pool: &PgPool, db: &str, id: &str) -> Result<bool, RtDbError> {
     validate_db_name(db)?;
     let schema = pg_schema(db);
+    // Atomic with `put`: the per-db blob delete and the global index delete are
+    // one transaction, so a failure between them can't leave an orphan index
+    // row pointing at a gone blob.
+    let mut tx = pool.begin().await?;
     let res = sqlx::query(&format!("DELETE FROM \"{schema}\".storage WHERE id = $1"))
         .bind(id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
-    if res.rows_affected() > 0 {
+    let removed = res.rows_affected() > 0;
+    if removed {
         sqlx::query("DELETE FROM rtdb.storage_index WHERE id = $1")
             .bind(id)
-            .execute(pool)
+            .execute(&mut *tx)
             .await?;
-        Ok(true)
-    } else {
-        Ok(false)
     }
+    tx.commit().await?;
+    Ok(removed)
 }
 
 /// Resolves an opaque public id to its owning database. `None` if unknown.
