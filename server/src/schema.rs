@@ -1348,8 +1348,8 @@ mod tests {
         assert!(table.validate_structure("docs").is_err());
     }
 
-    // pgvector rejects `vector(0)` at DDL time; rejecting it here gives a clear
-    // schema error instead of a DB failure.
+    // A 0-dimensional vector is meaningless and would produce a degenerate
+    // index; rejecting it here gives a clear schema error.
     #[test]
     fn vector_index_rejects_zero_dimensions() {
         let mut fields = BTreeMap::new();
@@ -1363,6 +1363,89 @@ mod tests {
                 vector: Some(VectorIndexSpec {
                     dimensions: 0,
                     filter_fields: vec![],
+                }),
+            }],
+        };
+        assert!(table.validate_structure("docs").is_err());
+    }
+
+    #[test]
+    fn vector_index_rejects_two_fields() {
+        let mut fields = BTreeMap::new();
+        fields.insert("a".to_string(), FieldType::Vector { dimensions: 4 });
+        fields.insert("b".to_string(), FieldType::Vector { dimensions: 4 });
+        let table = TableDef {
+            fields,
+            indexes: vec![IndexDef {
+                name: "by_emb".to_string(),
+                fields: vec!["a".to_string(), "b".to_string()],
+                search: false,
+                vector: Some(VectorIndexSpec {
+                    dimensions: 4,
+                    filter_fields: vec![],
+                }),
+            }],
+        };
+        assert!(table.validate_structure("docs").is_err());
+    }
+
+    #[test]
+    fn vector_index_rejects_non_vector_field() {
+        let mut fields = BTreeMap::new();
+        fields.insert("title".to_string(), FieldType::String);
+        let table = TableDef {
+            fields,
+            indexes: vec![IndexDef {
+                name: "by_title".to_string(),
+                fields: vec!["title".to_string()],
+                search: false,
+                vector: Some(VectorIndexSpec {
+                    dimensions: 4,
+                    filter_fields: vec![],
+                }),
+            }],
+        };
+        assert!(table.validate_structure("docs").is_err());
+    }
+
+    #[test]
+    fn vector_index_rejects_unknown_filter_field() {
+        let mut fields = BTreeMap::new();
+        fields.insert("embedding".to_string(), FieldType::Vector { dimensions: 4 });
+        let table = TableDef {
+            fields,
+            indexes: vec![IndexDef {
+                name: "by_emb".to_string(),
+                fields: vec!["embedding".to_string()],
+                search: false,
+                vector: Some(VectorIndexSpec {
+                    dimensions: 4,
+                    filter_fields: vec!["userId".to_string()],
+                }),
+            }],
+        };
+        assert!(table.validate_structure("docs").is_err());
+    }
+
+    #[test]
+    fn vector_index_rejects_non_scalar_filter_field() {
+        let mut fields = BTreeMap::new();
+        fields.insert("embedding".to_string(), FieldType::Vector { dimensions: 4 });
+        fields.insert(
+            "meta".to_string(),
+            FieldType::Object {
+                fields: BTreeMap::new(),
+            },
+        );
+        let table = TableDef {
+            fields,
+            indexes: vec![IndexDef {
+                name: "by_emb".to_string(),
+                fields: vec!["embedding".to_string()],
+                search: false,
+                vector: Some(VectorIndexSpec {
+                    dimensions: 4,
+                    filter_fields: vec!["meta".to_string()],
                 }),
             }],
         };
