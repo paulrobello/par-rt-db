@@ -21,6 +21,7 @@ pub enum FieldType {
     Bytes,
     Any,
     Record { value: Box<FieldType> },
+    Vector { dimensions: u32 },
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -120,6 +121,7 @@ fn validate_field_type(ty: &FieldType) -> Result<(), RtDbError> {
             Ok(())
         }
         FieldType::Record { value } => validate_field_type(value),
+        FieldType::Vector { .. } => Ok(()),
     }
 }
 
@@ -140,6 +142,7 @@ fn type_tag(ty: &FieldType) -> &'static str {
         FieldType::Bytes => "bytes",
         FieldType::Any => "any",
         FieldType::Record { .. } => "record",
+        FieldType::Vector { .. } => "vector",
     }
 }
 
@@ -335,6 +338,15 @@ pub fn validate_value(ty: &FieldType, value: &serde_json::Value) -> bool {
         FieldType::Any => true,
         FieldType::Record { value: value_ty } => match value.as_object() {
             Some(obj) => obj.values().all(|v| validate_value(value_ty, v)),
+            None => false,
+        },
+        FieldType::Vector { dimensions } => match value.as_array() {
+            Some(items) => {
+                items.len() == *dimensions as usize
+                    && items
+                        .iter()
+                        .all(|el| el.as_f64().is_some_and(|n| n.is_finite()))
+            }
             None => false,
         },
     }
@@ -1121,5 +1133,42 @@ mod tests {
             tables: BTreeMap::from([("items".to_string(), table)]),
         };
         assert!(schema.validate().is_ok());
+    }
+
+    // (i) Vector field type: wire round-trip, not btree-indexable, and value
+    // validation requires an array of exactly `dimensions` finite numbers.
+    #[test]
+    fn vector_field_type_round_trips() {
+        let v = FieldType::Vector { dimensions: 1536 };
+        let json = serde_json::to_value(&v).unwrap();
+        assert_eq!(json, serde_json::json!({"type":"vector","dimensions":1536}));
+        let back: FieldType = serde_json::from_value(json).unwrap();
+        assert_eq!(back, v);
+    }
+
+    #[test]
+    fn vector_is_not_btree_indexable() {
+        assert!(indexed_column_type(&FieldType::Vector { dimensions: 3 }).is_err());
+    }
+
+    #[test]
+    fn vector_validate_accepts_exact_length_finite() {
+        let ty = FieldType::Vector { dimensions: 3 };
+        assert!(validate_value(&ty, &serde_json::json!([1.0, -2.5, 0.0])));
+    }
+
+    #[test]
+    fn vector_validate_rejects_wrong_length() {
+        let ty = FieldType::Vector { dimensions: 3 };
+        assert!(!validate_value(&ty, &serde_json::json!([1.0, 2.0])));
+    }
+
+    #[test]
+    fn vector_validate_rejects_non_finite() {
+        let ty = FieldType::Vector { dimensions: 2 };
+        assert!(!validate_value(
+            &ty,
+            &serde_json::json!([1.0, serde_json::Value::from(f64::NAN)])
+        ));
     }
 }
