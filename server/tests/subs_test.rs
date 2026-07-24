@@ -84,7 +84,7 @@ async fn subscribe_sends_initial_query_update_with_seeded_rows() -> anyhow::Resu
     let conn = next_conn_id();
     state
         .committers
-        .subscribe(&db, conn, "q1".to_string(), collect_work_items(), tx)
+        .subscribe(&db, conn, "q1".to_string(), collect_work_items(), tx, None)
         .await?;
 
     let msg = rx.try_recv().expect("initial query update");
@@ -118,7 +118,7 @@ async fn mutate_pushes_update_to_matching_subscription() -> anyhow::Result<()> {
     let conn = next_conn_id();
     state
         .committers
-        .subscribe(&db, conn, "q1".to_string(), collect_work_items(), tx)
+        .subscribe(&db, conn, "q1".to_string(), collect_work_items(), tx, None)
         .await?;
     rx.try_recv().expect("initial query update");
 
@@ -150,7 +150,7 @@ async fn mutate_on_unrelated_table_sends_no_update() -> anyhow::Result<()> {
     let conn = next_conn_id();
     state
         .committers
-        .subscribe(&db, conn, "q1".to_string(), collect_work_items(), tx)
+        .subscribe(&db, conn, "q1".to_string(), collect_work_items(), tx, None)
         .await?;
     rx.try_recv().expect("initial query update");
 
@@ -171,7 +171,7 @@ async fn mutate_with_same_idempotency_key_sends_no_second_update() -> anyhow::Re
     let conn = next_conn_id();
     state
         .committers
-        .subscribe(&db, conn, "q1".to_string(), collect_work_items(), tx)
+        .subscribe(&db, conn, "q1".to_string(), collect_work_items(), tx, None)
         .await?;
     rx.try_recv().expect("initial query update");
 
@@ -220,6 +220,7 @@ async fn mutate_not_matching_eq_filter_sends_no_update() -> anyhow::Result<()> {
             "q1".to_string(),
             work_items_by_status("backlog"),
             tx,
+            None,
         )
         .await?;
     rx.try_recv().expect("initial query update");
@@ -244,7 +245,14 @@ async fn two_subscriptions_both_receive_updates_from_one_mutate() -> anyhow::Res
     let conn1 = next_conn_id();
     state
         .committers
-        .subscribe(&db, conn1, "q1".to_string(), collect_work_items(), tx1)
+        .subscribe(
+            &db,
+            conn1,
+            "q1".to_string(),
+            collect_work_items(),
+            tx1,
+            None,
+        )
         .await?;
     rx1.try_recv().expect("initial q1");
 
@@ -252,7 +260,14 @@ async fn two_subscriptions_both_receive_updates_from_one_mutate() -> anyhow::Res
     let conn2 = next_conn_id();
     state
         .committers
-        .subscribe(&db, conn2, "q2".to_string(), collect_work_items(), tx2)
+        .subscribe(
+            &db,
+            conn2,
+            "q2".to_string(),
+            collect_work_items(),
+            tx2,
+            None,
+        )
         .await?;
     rx2.try_recv().expect("initial q2");
 
@@ -279,7 +294,7 @@ async fn remove_conn_stops_further_updates() -> anyhow::Result<()> {
     let conn = next_conn_id();
     state
         .committers
-        .subscribe(&db, conn, "q1".to_string(), collect_work_items(), tx)
+        .subscribe(&db, conn, "q1".to_string(), collect_work_items(), tx, None)
         .await?;
     rx.try_recv().expect("initial query update");
 
@@ -391,7 +406,7 @@ async fn get_subscription_updates_when_its_doc_is_written() -> anyhow::Result<()
     let conn = next_conn_id();
     state
         .committers
-        .subscribe(&db, conn, "q1".to_string(), get_query, tx)
+        .subscribe(&db, conn, "q1".to_string(), get_query, tx, None)
         .await?;
     rx.try_recv().expect("initial query update");
 
@@ -454,7 +469,7 @@ async fn get_subscription_skips_update_for_unrelated_doc() -> anyhow::Result<()>
     let conn = next_conn_id();
     state
         .committers
-        .subscribe(&db, conn, "q1".to_string(), get_query, tx)
+        .subscribe(&db, conn, "q1".to_string(), get_query, tx, None)
         .await?;
     rx.try_recv().expect("initial query update");
 
@@ -479,7 +494,7 @@ async fn collect_subscription_still_reruns_on_table_write() -> anyhow::Result<()
     let conn = next_conn_id();
     state
         .committers
-        .subscribe(&db, conn, "q1".to_string(), collect_work_items(), tx)
+        .subscribe(&db, conn, "q1".to_string(), collect_work_items(), tx, None)
         .await?;
     rx.try_recv().expect("initial query update");
 
@@ -525,7 +540,7 @@ async fn get_subscription_updates_when_its_doc_is_deleted() -> anyhow::Result<()
     let conn = next_conn_id();
     state
         .committers
-        .subscribe(&db, conn, "q1".to_string(), get_query, tx)
+        .subscribe(&db, conn, "q1".to_string(), get_query, tx, None)
         .await?;
     rx.try_recv().expect("initial query update");
 

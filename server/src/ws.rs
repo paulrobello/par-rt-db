@@ -11,7 +11,7 @@ use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio::time::{Instant, interval};
 
 use crate::AppState;
-use crate::auth::{Principal, authed_user, authorize, resolve_bearer};
+use crate::auth::{Principal, authed_user, authorize, owner_of, resolve_bearer};
 use crate::db::now_ms;
 use crate::error::{ErrorCode, RtDbError};
 use crate::protocol::{ClientMessage, ServerMessage};
@@ -297,7 +297,14 @@ async fn handle_text_frame(
                 Ok(()) => {
                     if let Err(error) = state
                         .committers
-                        .subscribe(db, conn_id, query_id.clone(), *query, out_tx.clone())
+                        .subscribe(
+                            db,
+                            conn_id,
+                            query_id.clone(),
+                            *query,
+                            out_tx.clone(),
+                            owner_of(principal).map(|s| s.to_string()),
+                        )
                         .await
                     {
                         let _ = out_tx.send(ServerMessage::SubscribeErr { query_id, error });

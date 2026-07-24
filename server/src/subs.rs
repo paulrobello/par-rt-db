@@ -47,6 +47,10 @@ struct SubEntry {
     tx: UnboundedSender<ServerMessage>,
     last: String,
     read_set: ReadSet,
+    /// The subscriber's per-row auth identity, captured at subscribe time.
+    /// `None` = bypass (machine tokens / scheduled jobs); `Some(user_id)` =
+    /// re-run this subscription's query filtered to that user's rows.
+    owner: Option<String>,
 }
 
 /// One database's subscriptions, keyed by `(connection, queryId)`.
@@ -91,7 +95,12 @@ impl SubscriptionManager {
     /// Registers a subscription that has already sent its initial
     /// `QueryUpdate` with `last` as the canonical form of that initial result.
     /// Called only by the committer task, immediately after the initial send,
-    /// so no fan-out between execute and register can be missed.
+    /// so no fan-out between execute and register can be missed. `owner` is
+    /// the subscriber's per-row auth identity (see `SubEntry::owner`).
+    // Each arg is independently required by the committer's register path;
+    // bundling them into a context struct would add indirection without
+    // reducing coupling (same call as `ws::handle_text_frame`).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn register(
         &self,
         db: &str,
@@ -100,6 +109,7 @@ impl SubscriptionManager {
         query: Query,
         tx: UnboundedSender<ServerMessage>,
         last: String,
+        owner: Option<String>,
     ) {
         let read_set = ReadSet::from_query(&query);
         let mut guard = self.subs.lock().await;
@@ -110,6 +120,7 @@ impl SubscriptionManager {
                 tx,
                 last,
                 read_set,
+                owner,
             },
         );
     }
@@ -148,18 +159,19 @@ impl SubscriptionManager {
                 continue;
             }
 
-            let result = match execute_query(pool, db, schema, &entry.query, None).await {
-                Ok(result) => result,
-                Err(err) => {
-                    tracing::warn!(
-                        error = %err,
-                        db,
-                        query_id,
-                        "subscription re-run failed; skipping"
-                    );
-                    continue;
-                }
-            };
+            let result =
+                match execute_query(pool, db, schema, &entry.query, entry.owner.as_deref()).await {
+                    Ok(result) => result,
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            db,
+                            query_id,
+                            "subscription re-run failed; skipping"
+                        );
+                        continue;
+                    }
+                };
 
             let canon = canonical(&result);
             if canon == entry.last {

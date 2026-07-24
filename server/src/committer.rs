@@ -28,6 +28,7 @@ pub enum CommitterRequest {
         query_id: String,
         query: Box<Query>,
         tx: UnboundedSender<ServerMessage>,
+        owner: Option<String>,
         reply: oneshot::Sender<Result<(), RtDbError>>,
     },
     /// A scheduled/cron job whose `due_at` arrived. Fire-and-forget: the
@@ -161,7 +162,9 @@ impl Committers {
     }
 
     /// Runs `query` on `db`, sends the initial result on `tx`, and registers
-    /// the subscription for future push-on-change updates.
+    /// the subscription for future push-on-change updates. `owner` is the
+    /// subscriber's per-row auth identity (captured on the `SubEntry` and
+    /// applied to every re-run in `fan_out`); `None` = bypass.
     pub async fn subscribe(
         &self,
         db: &str,
@@ -169,6 +172,7 @@ impl Committers {
         query_id: String,
         query: Query,
         tx: UnboundedSender<ServerMessage>,
+        owner: Option<String>,
     ) -> Result<(), RtDbError> {
         let (reply, reply_rx) = oneshot::channel();
         self.submit(
@@ -178,6 +182,7 @@ impl Committers {
                 query_id,
                 query: Box::new(query),
                 tx,
+                owner,
                 reply,
             },
         )
@@ -243,9 +248,10 @@ async fn run_committer(
                 query_id,
                 query,
                 tx,
+                owner,
                 reply,
             } => {
-                let result = handle_subscribe(&ctx, conn, query_id, *query, tx).await;
+                let result = handle_subscribe(&ctx, conn, query_id, *query, tx, owner).await;
                 let _ = reply.send(result);
             }
             CommitterRequest::RunScheduled {
@@ -397,9 +403,10 @@ async fn handle_subscribe(
     query_id: String,
     query: Query,
     tx: UnboundedSender<ServerMessage>,
+    owner: Option<String>,
 ) -> Result<(), RtDbError> {
     let schema = ctx.schemas.get(&ctx.pool, &ctx.db).await?;
-    let result = execute_query(&ctx.pool, &ctx.db, &schema, &query, None).await?;
+    let result = execute_query(&ctx.pool, &ctx.db, &schema, &query, owner.as_deref()).await?;
     let last = canonical(&result);
     let value = serde_json::to_value(&result).unwrap_or_else(|err| {
         tracing::error!(error = %err, "failed to serialize initial query result");
@@ -422,7 +429,7 @@ async fn handle_subscribe(
     }
 
     ctx.subs
-        .register(&ctx.db, conn, query_id, query, tx, last)
+        .register(&ctx.db, conn, query_id, query, tx, last, owner)
         .await;
     Ok(())
 }
