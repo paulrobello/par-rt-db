@@ -61,7 +61,7 @@ export class TableQuery<DocT, Indexes extends string> {
       index,
       vector,
       limit: opts.limit,
-      ...(opts.filter ? { filter: opts.filter } : {}),
+      ...(opts.filter && Object.keys(opts.filter).length > 0 ? { filter: opts.filter } : {}),
     };
     return new TableQuery({ ...this.json, vectorSearch });
   }

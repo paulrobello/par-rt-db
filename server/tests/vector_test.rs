@@ -2,7 +2,8 @@ mod common;
 
 use common::test_state;
 use rtdb_server::ddl::push_schema;
-use rtdb_server::query::{Query, QueryResult, execute_query};
+use rtdb_server::error::ErrorCode;
+use rtdb_server::query::{Query, QueryResult, VectorSearchQuery, execute_query};
 use rtdb_server::schema::{FieldType, IndexDef, SchemaDef, TableDef, VectorIndexSpec};
 use rtdb_server::txn::{Step, Transaction, execute_txn};
 use sqlx::Row;
@@ -86,9 +87,9 @@ async fn push_schema_creates_vector_column_and_hnsw_index() {
     .expect("vector column row");
     assert_eq!(col.0, "vector(3)");
 
-    // An HNSW index exists on it.
-    let idx: (i64,) = sqlx::query_as(
-        "SELECT count(*) FROM pg_indexes \
+    // An HNSW index exists on it — assert both existence and access method.
+    let idx: (String,) = sqlx::query_as(
+        "SELECT indexdef FROM pg_indexes \
          WHERE schemaname = $1 AND tablename = $2 AND indexname = 'i_docs_by_embedding'",
     )
     .bind(format!("db_{db}"))
@@ -96,7 +97,11 @@ async fn push_schema_creates_vector_column_and_hnsw_index() {
     .fetch_one(&state.pool)
     .await
     .expect("index row");
-    assert_eq!(idx.0, 1);
+    assert!(
+        idx.0.contains("USING hnsw"),
+        "vector index should be HNSW, got indexdef: {}",
+        idx.0
+    );
 
     // A filterField (userId) gets a typed f_ column; the vector field does NOT.
     let filter_col: (i64,) = sqlx::query_as(
@@ -142,8 +147,25 @@ async fn changing_vector_dims_is_rejected() {
     push_schema(&state.pool, &db, vector_schema(3, false))
         .await
         .expect("push initial vector schema");
-    let err = push_schema(&state.pool, &db, vector_schema(4, false)).await;
-    assert!(err.is_err(), "changing dimensions must be rejected");
+    let err = push_schema(&state.pool, &db, vector_schema(4, false))
+        .await
+        .expect_err("changing dimensions must be rejected");
+    assert_eq!(
+        err.code,
+        ErrorCode::BadRequest,
+        "dimension change should be a BadRequest: {:?}",
+        err
+    );
+    // Changing dimensions changes both the `embedding` field type
+    // (`Vector{dimensions:N}`) and the index spec. The field-type guard in
+    // `detect_destructive_changes` fires first, so the message names the field
+    // — either way it's a clean BadRequest naming the offending change, not a 500.
+    assert!(
+        err.message.contains("changed type of field")
+            || err.message.contains("changed vector spec"),
+        "message names the dimension change: {}",
+        err.message
+    );
 }
 
 fn vec_doc(emb: Vec<f64>) -> serde_json::Map<String, serde_json::Value> {
@@ -321,6 +343,69 @@ async fn vector_search_rejects_length_mismatch() {
     );
 }
 
+/// A non-finite query vector (NaN / Infinity) must surface as a clean
+/// `BadRequest`, never a 500. serde_json can't carry NaN, so the query is
+/// constructed in Rust — the only path that puts a non-finite `f32` into
+/// `vs.vector`. The check runs before the vector is bound, so pgvector never
+/// sees the value.
+#[tokio::test]
+async fn vector_search_rejects_non_finite_query_vector() {
+    let state = test_state().await;
+    let db = vec_db(&state).await;
+    let schema = vector_schema(3, false);
+    for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        let q = Query {
+            table: "docs".to_string(),
+            vector_search: Some(VectorSearchQuery {
+                index: "by_embedding".to_string(),
+                vector: vec![1.0, bad, 0.0],
+                limit: 1,
+                filter: BTreeMap::new(),
+            }),
+            ..empty_query()
+        };
+        let err = execute_query(&state.pool, &db, &schema, &q)
+            .await
+            .expect_err("non-finite query vector should be rejected");
+        assert_eq!(
+            err.code,
+            ErrorCode::BadRequest,
+            "non-finite vector should be BadRequest, got {:?}: {}",
+            err.code,
+            err.message
+        );
+        assert!(
+            err.message.contains("finite"),
+            "message calls out finiteness: {}",
+            err.message
+        );
+    }
+}
+
+/// Minimal `Query` with only `table` set; used as a base for Rust-constructed
+/// vector queries so the test only spells out the vector terminal.
+fn empty_query() -> Query {
+    Query {
+        table: String::new(),
+        get: None,
+        index: None,
+        eq: Vec::new(),
+        gt: None,
+        gte: None,
+        lt: None,
+        lte: None,
+        order: None,
+        take: None,
+        unique: false,
+        first: false,
+        count: false,
+        paginate: None,
+        filter: None,
+        search: None,
+        vector_search: None,
+    }
+}
+
 /// Naming an unknown or non-vector index is a clear BadRequest, never a 500.
 #[tokio::test]
 async fn vector_search_rejects_unknown_index() {
@@ -354,7 +439,14 @@ async fn vector_search_rejects_out_of_range_limit() {
         "vectorSearch": {"index": "by_embedding", "vector": [1.0, 0.0, 0.0], "limit": 0}
     }))
     .expect("parse vectorSearch query");
-    assert!(execute_query(&state.pool, &db, &schema, &q).await.is_err());
+    let err = execute_query(&state.pool, &db, &schema, &q)
+        .await
+        .expect_err("limit < 1 should be rejected");
+    assert!(
+        err.message.contains("vectorSearch limit"),
+        "message names the limit cap: {}",
+        err.message
+    );
     let q_hi = serde_json::from_value::<Query>(serde_json::json!({
         "table": "docs",
         "vectorSearch": {"index": "by_embedding", "vector": [1.0, 0.0, 0.0], "limit": 257}

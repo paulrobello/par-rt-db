@@ -257,6 +257,17 @@ describe("TableQuery.vectorSearch", () => {
       vectorSearch: { index: "by_embedding", vector: [1, 0], limit: 3 },
     });
   });
+
+  it("omits an empty filter on the wire (parity with server skip_serializing_if = is_empty)", () => {
+    const q = api.docs
+      .query()
+      .vectorSearch("by_embedding", [1, 0], { limit: 3, filter: {} })
+      .collect();
+    expect(q.json).toEqual({
+      table: "docs",
+      vectorSearch: { index: "by_embedding", vector: [1, 0], limit: 3 },
+    });
+  });
 });
 
 describe("TableQuery.paginate", () => {

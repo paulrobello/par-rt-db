@@ -987,6 +987,14 @@ async fn execute_vector_search(
             vec_spec.dimensions
         )));
     }
+    // serde_json can't carry NaN/Infinity, but a Rust-constructed query can —
+    // reject before binding so pgvector never sees a non-finite value (which
+    // would surface as a 500 instead of a clean BadRequest).
+    if !vs.vector.iter().all(|v| v.is_finite()) {
+        return Err(RtDbError::bad_request(
+            "vectorSearch query vector must contain only finite numbers",
+        ));
+    }
     if !(1..=VECTOR_SEARCH_MAX_LIMIT).contains(&vs.limit) {
         return Err(RtDbError::bad_request(format!(
             "vectorSearch limit must be 1..={VECTOR_SEARCH_MAX_LIMIT}"

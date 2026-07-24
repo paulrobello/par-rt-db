@@ -410,4 +410,31 @@ mod tests {
             .expect("btree index present");
         assert!(by_title.vector.is_none());
     }
+
+    #[test]
+    fn vector_index_with_empty_filter_fields_omits_key() {
+        // `filter_fields: &[]` must serialize `vector` as `{"dimensions":N}` with
+        // no `filterFields` key, mirroring the server's `skip_serializing_if =
+        // "Vec::is_empty"` on the wire.
+        let schema = Schema::builder()
+            .table(
+                "notes",
+                Table::new()
+                    .field("embedding", FieldType::vector(8))
+                    .vector_index("by_embedding", "embedding", 8, &[]),
+            )
+            .build();
+        let v = serde_json::to_value(&schema).unwrap();
+        let idx = &v["tables"]["notes"]["indexes"][0];
+        assert_eq!(idx["name"], json!("by_embedding"));
+        assert_eq!(idx["vector"], json!({"dimensions": 8}));
+        assert!(
+            idx["vector"]
+                .as_object()
+                .expect("vector spec is object")
+                .get("filterFields")
+                .is_none(),
+            "empty filter_fields must omit filterFields on the wire"
+        );
+    }
 }
