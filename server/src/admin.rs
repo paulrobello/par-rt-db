@@ -1,7 +1,9 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::body::Body;
-use axum::extract::{Path, Query as QueryParams, State};
+use axum::extract::ws::{WebSocket, WebSocketUpgrade};
+use axum::extract::{FromRequest, Path, Query as QueryParams, Request, State};
 use axum::http::HeaderMap;
 use axum::response::Response;
 use axum::routing::{get, post};
@@ -523,6 +525,93 @@ async fn ops_recent(
     Ok(Json(OpsRecentResponse { ops }))
 }
 
+#[derive(Deserialize)]
+struct StreamParams {
+    db: Option<String>,
+    table: Option<String>,
+}
+
+/// `/admin/stream` WebSocket: admin-gated at the HTTP upgrade (a missing/invalid
+/// bearer is rejected before WS negotiation), then replays the filtered ring and
+/// streams live op events plus a ~1s gauge snapshot. `db`/`table` filter both the
+/// replay and the live broadcast.
+///
+/// `require_admin` runs as the first statement, BEFORE `WebSocketUpgrade` is
+/// extracted from the request — so a missing bearer on a plain GET (or a real
+/// upgrade attempt) yields 401/403 and never reaches WS negotiation. The WS
+/// extractor is invoked by hand after the gate clears.
+async fn admin_stream(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    QueryParams(params): QueryParams<StreamParams>,
+    req: Request,
+) -> Result<Response, RtDbError> {
+    require_admin(&state, &headers).await?;
+    let ws = WebSocketUpgrade::from_request(req, &state)
+        .await
+        .map_err(|_| RtDbError::bad_request("expected websocket upgrade request"))?;
+    Ok(ws.on_upgrade(move |socket| run_admin_stream(socket, state, params.db, params.table)))
+}
+
+async fn run_admin_stream(
+    mut socket: WebSocket,
+    state: Arc<AppState>,
+    db: Option<String>,
+    table: Option<String>,
+) {
+    for ev in state
+        .op_feed
+        .recent(db.as_deref(), table.as_deref(), 200)
+        .await
+    {
+        if send_stream_json(&mut socket, &serde_json::json!({"kind":"op","event":ev}))
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
+    let mut rx = state.op_feed.subscribe();
+    let mut gauge_tick = tokio::time::interval(Duration::from_secs(1));
+    gauge_tick.tick().await; // skip immediate
+    loop {
+        tokio::select! {
+            ev = rx.recv() => {
+                let Ok(ev) = ev else { break };
+                if db.as_deref().is_none_or(|d| ev.db == d)
+                    && table.as_deref().is_none_or(|t| ev.table == t)
+                    && send_stream_json(&mut socket, &serde_json::json!({"kind":"op","event":ev}))
+                        .await
+                        .is_err()
+                {
+                    break;
+                }
+            }
+            _ = gauge_tick.tick() => {
+                let snap = state
+                    .metrics
+                    .snapshot(&state.pool, &state.subs, state.started_at)
+                    .await;
+                if send_stream_json(&mut socket, &serde_json::json!({"kind":"gauges","gauges":snap}))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+async fn send_stream_json(
+    socket: &mut WebSocket,
+    value: &serde_json::Value,
+) -> Result<(), axum::Error> {
+    use axum::extract::ws::Message;
+    let text = serde_json::to_string(value).unwrap_or_else(|_| "{}".into());
+    socket.send(Message::Text(text.into())).await
+}
+
 /// Admin routes, all gated on `Authorization: Bearer <admin_key>` (constant-time
 /// compare).
 pub fn admin_routes() -> Router<Arc<AppState>> {
@@ -544,6 +633,7 @@ pub fn admin_routes() -> Router<Arc<AppState>> {
         .route("/admin/dbs/{db}/stats", get(db_stats))
         .route("/admin/metrics", get(metrics_handler))
         .route("/admin/ops/recent", get(ops_recent))
+        .route("/admin/stream", get(admin_stream))
         .route("/admin/tokens", get(list_tokens))
         .route("/admin/export-db", get(export_db))
         .route("/admin/import-db", post(import_db))

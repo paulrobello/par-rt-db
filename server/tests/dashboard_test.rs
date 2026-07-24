@@ -555,3 +555,20 @@ async fn op_feed_tapped_on_commit() -> anyhow::Result<()> {
     assert_eq!(ours["kind"], "insert", "kind should be 'insert': {ours}");
     Ok(())
 }
+
+// /admin/stream rejects a missing bearer at the upgrade (no 101).
+#[tokio::test]
+async fn admin_stream_requires_admin() -> anyhow::Result<()> {
+    let state = common::test_state().await;
+    let addr = common::spawn_app(state).await;
+    let resp = reqwest::Client::new()
+        .get(format!("http://{addr}/admin/stream"))
+        .send()
+        .await?;
+    let status = resp.status();
+    assert!(
+        status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN,
+        "missing bearer must be rejected, got {status}"
+    );
+    Ok(())
+}
