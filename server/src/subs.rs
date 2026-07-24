@@ -20,10 +20,33 @@ pub fn next_conn_id() -> ConnId {
     NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed)
 }
 
+/// What a subscription's result depends on, used to skip needless re-runs.
+/// Derived once from the (immutable) `Query` at registration.
+#[derive(Debug, Clone)]
+enum ReadSet {
+    /// A `get(id)` point read: the result is exactly this one document, so a
+    /// write to any other document cannot change it.
+    Point { id: String },
+    /// Every other shape (take / collect / count / paginate / unique / first /
+    /// search / vector): another document can enter the result, so re-run on
+    /// any write to the table (today's behavior).
+    Table,
+}
+
+impl ReadSet {
+    fn from_query(query: &Query) -> Self {
+        match &query.get {
+            Some(id) => ReadSet::Point { id: id.clone() },
+            None => ReadSet::Table,
+        }
+    }
+}
+
 struct SubEntry {
     query: Query,
     tx: UnboundedSender<ServerMessage>,
     last: String,
+    read_set: ReadSet,
 }
 
 /// One database's subscriptions, keyed by `(connection, queryId)`.
@@ -78,11 +101,17 @@ impl SubscriptionManager {
         tx: UnboundedSender<ServerMessage>,
         last: String,
     ) {
+        let read_set = ReadSet::from_query(&query);
         let mut guard = self.subs.lock().await;
-        guard
-            .entry(db.to_string())
-            .or_default()
-            .insert((conn, query_id), SubEntry { query, tx, last });
+        guard.entry(db.to_string()).or_default().insert(
+            (conn, query_id),
+            SubEntry {
+                query,
+                tx,
+                last,
+                read_set,
+            },
+        );
     }
 
     /// Re-runs every subscription on `db` whose query table is in
@@ -105,6 +134,17 @@ impl SubscriptionManager {
 
         for ((_, query_id), entry) in db_subs.iter_mut() {
             if !write_set.tables.contains(&entry.query.table) {
+                continue;
+            }
+
+            // A `get(id)` point read depends only on its one document, so a
+            // write that didn't touch it cannot change the result — skip the
+            // re-run. Every other shape stays table-level (re-runs below).
+            if let ReadSet::Point { id } = &entry.read_set
+                && !write_set
+                    .docs
+                    .contains(&(entry.query.table.clone(), id.clone()))
+            {
                 continue;
             }
 
@@ -144,6 +184,43 @@ impl SubscriptionManager {
                 query_id: query_id.clone(),
                 result: value,
             });
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn q(value: serde_json::Value) -> Query {
+        serde_json::from_value(value).expect("parse query")
+    }
+
+    #[test]
+    fn get_query_is_a_point_read() {
+        let query = q(serde_json::json!({ "table": "t", "get": "abc" }));
+        assert!(matches!(
+            ReadSet::from_query(&query),
+            ReadSet::Point { id } if id == "abc"
+        ));
+    }
+
+    #[test]
+    fn non_get_queries_are_table_level() {
+        let cases = [
+            serde_json::json!({ "table": "t" }),            // collect
+            serde_json::json!({ "table": "t", "take": 5 }), // take
+            serde_json::json!({ "table": "t", "index": "by_x", "eq": ["v"] }), // eq
+            serde_json::json!({ "table": "t", "index": "by_x", "eq": ["v"], "unique": true }), // unique
+            serde_json::json!({ "table": "t", "first": true }), // first
+            serde_json::json!({ "table": "t", "count": true }), // count
+        ];
+        for case in cases {
+            let query = q(case);
+            assert!(
+                matches!(ReadSet::from_query(&query), ReadSet::Table),
+                "non-get query must be Table-level"
+            );
         }
     }
 }

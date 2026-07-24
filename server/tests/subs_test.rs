@@ -364,3 +364,136 @@ async fn write_set_records_written_document_ids() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+// A get(id) subscription still receives an update when its own document is
+// written — the point-read skip must never drop a relevant update.
+#[tokio::test]
+async fn get_subscription_updates_when_its_doc_is_written() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let db = fresh_db(&state).await;
+
+    let insert = state
+        .committers
+        .mutate(&db, None, insert_work_item("backlog", 1.0))
+        .await?;
+    let id = insert.results[0]["id"]
+        .as_str()
+        .expect("insert id")
+        .to_string();
+
+    let get_query: Query = serde_json::from_value(serde_json::json!({
+        "table": "workItems",
+        "get": id,
+    }))
+    .expect("parse get query");
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let conn = next_conn_id();
+    state
+        .committers
+        .subscribe(&db, conn, "q1".to_string(), get_query, tx)
+        .await?;
+    rx.try_recv().expect("initial query update");
+
+    state
+        .committers
+        .mutate(
+            &db,
+            None,
+            Transaction {
+                steps: vec![Step::Patch {
+                    table: "workItems".to_string(),
+                    id: id.clone(),
+                    fields: serde_json::json!({ "status": "in_progress" })
+                        .as_object()
+                        .expect("object")
+                        .clone(),
+                }],
+            },
+        )
+        .await?;
+
+    let msg = rx
+        .try_recv()
+        .expect("update after patching the subscribed doc");
+    match msg {
+        ServerMessage::QueryUpdate { query_id, result } => {
+            assert_eq!(query_id, "q1");
+            assert_eq!(result["status"], "in_progress");
+        }
+        other => panic!("expected QueryUpdate, got {other:?}"),
+    }
+    assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+    Ok(())
+}
+
+// A get(id) subscription does NOT receive an update when an unrelated document
+// on the same table is written. (Regression guard; today's canonical diff would
+// also suppress this — the skip additionally avoids the re-run entirely.)
+#[tokio::test]
+async fn get_subscription_skips_update_for_unrelated_doc() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let db = fresh_db(&state).await;
+
+    let insert_a = state
+        .committers
+        .mutate(&db, None, insert_work_item("backlog", 1.0))
+        .await?;
+    let id_a = insert_a.results[0]["id"]
+        .as_str()
+        .expect("insert id")
+        .to_string();
+
+    let get_query: Query = serde_json::from_value(serde_json::json!({
+        "table": "workItems",
+        "get": id_a,
+    }))
+    .expect("parse get query");
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let conn = next_conn_id();
+    state
+        .committers
+        .subscribe(&db, conn, "q1".to_string(), get_query, tx)
+        .await?;
+    rx.try_recv().expect("initial query update");
+
+    // Write a different document on the same table.
+    state
+        .committers
+        .mutate(&db, None, insert_work_item("backlog", 2.0))
+        .await?;
+
+    assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+    Ok(())
+}
+
+// A non-get subscription (collect) still re-runs on any write to its table —
+// the fine-grained skip is scoped to point reads only.
+#[tokio::test]
+async fn collect_subscription_still_reruns_on_table_write() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let db = fresh_db(&state).await;
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let conn = next_conn_id();
+    state
+        .committers
+        .subscribe(&db, conn, "q1".to_string(), collect_work_items(), tx)
+        .await?;
+    rx.try_recv().expect("initial query update");
+
+    state
+        .committers
+        .mutate(&db, None, insert_work_item("backlog", 1.0))
+        .await?;
+
+    let msg = rx.try_recv().expect("collect sub re-ran on table write");
+    match msg {
+        ServerMessage::QueryUpdate { result, .. } => {
+            assert_eq!(docs_len(&result), 1);
+        }
+        other => panic!("expected QueryUpdate, got {other:?}"),
+    }
+    Ok(())
+}
