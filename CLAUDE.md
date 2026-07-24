@@ -38,6 +38,7 @@ Tests share one Postgres, isolating by creating uniquely-named databases per tes
 - No `unwrap()`/`expect()` outside `#[cfg(test)]`. Zero clippy warnings under `-D warnings`.
 - **Keep docs in sync**: when a feature lands or changes, update `FEATURE_MATRIX.md` (the Convex-parity contract — flip rows ❌→✅ and note client-mirror status), the relevant README(s)/docs, and any skill that documents par-rt-db's surface. A stale doc that contradicts the code is a bug.
 - **Op-feed tap**: durable document mutations publish through the committer's two tap sites (`handle_mutate`/`handle_scheduled` in `committer.rs`). Any future code path that commits a document txn must publish there too, or the op-feed (and `/admin/stream`) will silently miss those writes.
+- **Hot config & dynamic CORS** (`config.rs`, `lib.rs`): three settings — `allowed_origins`, `session_ttl_days`, `max_file_size` — are runtime-mutable, held on `AppState` as `Arc<ArcSwap<HotConfig>>` and persisted in a single-row `rtdb_config` table (boot seeds from env when no row exists; a malformed row warns and falls back to env rather than blocking startup). Every consumer reads `state.hot.load()`; `PATCH /admin/config` validates + persists + swaps live (no restart). The `CorsLayer` is built once but its origin check is an `AllowOrigin::predicate` that re-reads live `allowed_origins` per request. `GET /admin/config` is structurally redacted — `admin_key`, OAuth secrets, and `database_url` are configured-bools, never values.
 
 ## Deployment
 
