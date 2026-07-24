@@ -65,7 +65,7 @@ high leverage, Tier 3 = large projects.
 | 13 | 1 | Extra validators: `record`, `int64`, `any`, `bytes` | ✅ | ✅ | Low–Med | S–M | Implemented — four new `FieldType` variants (`schema.rs`): `record` (dynamic string-keyed map, each entry validated against its `value` validator), `any` (accepts and stores any JSON value with zero validation), `bytes` (a JSON string validated as standard base64 with required padding, RFC 4648 §4), and `int64` (a JSON string of canonical decimal digits validated via `i64::from_str` — chosen because JSON numbers are IEEE-754 doubles and cannot exactly represent the full `i64` range past `Number.MAX_SAFE_INTEGER`). None of the four get a DDL-indexed column — `record`/`any`/`bytes` aren't scalar-comparable, and `int64` is deliberately left non-indexable in this pass. Mirrored end-to-end: `protocol.ts`'s `FieldTypeJson` and the client's `t.record()/t.any()/t.bytes()/t.int64()` factories, with schema/DDL/round-trip coverage in `schema_validators_test.rs` and factory/type coverage in `schema.test.ts`/`schema.types.test.ts`. **`int64` wire convention:** decimal-string on the wire, typed as a branded `Int64` string (not a real `bigint`) on the TS client — the client is entirely schema-type-erased at runtime (no codegen, no marshaling for any existing validator), so a real `bigint` would need a `JSON.stringify` replacer on writes and schema-aware result marshaling on reads that no other type needs; `Int64` instead follows the same zero-runtime-cost branded-string pattern already used for `Id<TableName>`, with `toInt64()`/`fromInt64()` helpers for apps that want actual `bigint` arithmetic. |
 | 14 | 2 | **Additional OAuth providers** (Google, etc.) | ✅ many via integrations | 🟡 GitHub + Google | Med | M | Implemented — `OAuthProvider` trait (`auth/provider.rs`) with GitHub (refactored, routes byte-identical) and Google providers; each extra provider is now S. Identity is email-keyed with cross-provider same-email linking (both providers verified the email); Google requires a verified email. More providers (GitLab, Microsoft, …) are each a small `provider.rs` impl. |
 | 15 | 2 | **db-side `filter()`** expressions | ✅ (discouraged in favor of indexes) | ✅ | Med | M | Implemented (server + rust-client builder) — a tagged-enum predicate DSL (`eq`/`neq`/`gt`/`gte`/`lt`/`lte`/`in` + `and`/`or` combinators) compiled to a fully-parenthesized WHERE fragment with every identifier schema-validated + double-quoted and every value `$n`-bound; indexed fields use their typed column, others use jsonb extraction with a value-inferred cast. Composes with index/order/take/cursor/count; `get` rejects it; malformed → `BadRequest`, never a 500. Mirrored end-to-end across all three clients (server + rust-client + ts-client `.filter()` builders). Convex steers users to indexes, so this stays an opt-in terminal. |
-| 16 | 3 | **File storage** | ✅ upload URLs, serving, metadata | ❌ | Med–High | L | Per-db blob table (or disk/S3 backend), tokened upload endpoint, public serve URL, `_storage`-style metadata, GC for orphans. Needed the moment any app wants image upload. |
+| 16 | 3 | **File storage** | ✅ upload URLs, serving, metadata | ✅ | Med–High | L | Implemented — Postgres-native blobs (per the user's vendor-lock-to-Postgres steer: no disk/S3/object-store, no trait). A per-db `storage` table (`bytea`, TOAST-managed) holds each file's bytes + `{sha256, size, contentType, createdAt}`, and a global `rtdb.storage_index(id → db_name)` resolves the public serve URL to its owning database. Upload is `POST /api/storage/{db}` (bearer, raw body, `Content-Type`); the route disables axum's 2 MiB default and enforces `RTDB_MAX_FILE_SIZE` (default 50 MiB) via `axum::body::to_bytes`, rejecting overflow as `BadRequest`. Serve is both **public** `GET /storage/{id}` (no auth — anyone with the opaque uuid-v7 URL fetches it, Convex parity; revoke by delete) and **authed** `GET /api/storage/{db}/{id}` (caller-db-scoped). Plus `DELETE /api/storage/{db}/{id}` (idempotent, revokes the public URL) and `GET /api/storage/{db}/{id}/metadata`. Storage is **HTTP-only** (not reactive → no WS variants) and writes via `storage::put` directly, not the committer (blobs don't touch document tables or subscriptions). Mirrored on ts-client (`upload`/`deleteFile`/`getFileMetadata`/`getUrl`) and rust-client (`upload`/`delete_file`/`get_file_metadata`/`get_url`). |
 | 17 | 3 | **Vector search** | ✅ | ❌ | Med | M–L | `pgvector` extension + vector field type + index + `vectorSearch` terminal. Cheap infra-wise; ranked lower because current apps don't need it yet. |
 | 18 | 3 | **Data browser dashboard** | ✅ full dashboard | ❌ | Med | L | Read/write table browser SPA over the admin API (could itself run on par-rt-db). Convex's dashboard is a real DX advantage; `psql` is the stopgap. |
 | 19 | 3 | **Client test harness** (in-memory fake) | ✅ `convex-test` | ✅ | Med | M | Implemented (ts-client) — `InMemoryRtDbClient` (`src/in_memory.ts`) mirrors the server's schema/query/txn/step-result semantics with no network and no Postgres: `pushSchema`, `query`, `mutate` (with `mutId` idempotency), `subscribe` (reactive), cursor keyset pagination, system fields merged at read time, atomic rollback on step failure. Reuses `protocol.ts` types. Deferred gaps (additive schema evolution) marked as TODOs. Pure coverage in `in_memory.test.ts`. |
@@ -106,18 +106,22 @@ As of 2026-07-23, **done**: tier-1 **#1–#3, #6, #7, #13**; tier-2 **#4** (safe
 retry), **#5** (cursor pagination), **#8** (session-expiry enforcement), **#9**
 (scheduled txns), **#10** (cron jobs), **#11** (full-text search), **#12**
 (optimistic updates), **#14** (OAuth provider trait + Google), **#15** (db-side
-`filter()`); and tier-3 **#19** (in-memory client test harness). **#9/#10**
-landed as one per-db `scheduled_txns` side table drained through the committer
-by a per-db scheduler timer (`scheduler.rs` + the `RunScheduled` committer arm)
-— at-least-once delivery, one-shot catches up if past due, cron skips missed
-windows. The Rust client is feature-complete (`http` + reactive `ws` +
-`admin` + index/`mutate_with_retry` helpers + `.filter()`/`.search()` builders),
-and the TS client now mirrors it with `.filter()`/`.search()` + `searchIndex`
-(commit 4a66c87) — all three clients share one wire contract for db-side
-`filter()` and full-text search.
+`filter()`); and tier-3 **#19** (in-memory client test harness), **#16** (file
+storage). **#9/#10** landed as one per-db `scheduled_txns` side table drained
+through the committer by a per-db scheduler timer (`scheduler.rs` + the
+`RunScheduled` committer arm) — at-least-once delivery, one-shot catches up if
+past due, cron skips missed windows. **#16** is a per-db `bytea` `storage`
+table + global `storage_index` for opaque public-serve resolution — both public
+(`GET /storage/{id}`, no auth) and authed serve, plus upload/delete/metadata;
+HTTP-only (not reactive), Postgres-native by design. The Rust client is
+feature-complete (`http` + reactive `ws` + `admin` + index/`mutate_with_retry`
+helpers + `.filter()`/`.search()` builders + storage), and the TS client mirrors
+it (`.filter()`/`.search()` + `searchIndex` + storage) — all three clients share
+one wire contract for db-side `filter()` and full-text search, and the storage
+HTTP surface.
 
-Remaining gaps, in value order: **#16 (file storage)**, **#17 (vector
-search)**, **#18 (data-browser dashboard)**, and **#20 (per-row auth rules)**.
+Remaining gaps, in value order: **#17 (vector search)**, **#18 (data-browser
+dashboard)**, and **#20 (per-row auth rules)**.
 
 Client parity for db-side `filter()` and full-text search is now complete: the
 TS `.filter()`/`.search()` query builders + `searchIndex` schema declaration

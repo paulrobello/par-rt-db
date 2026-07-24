@@ -99,6 +99,22 @@ should be idempotent. The in-memory test client (`InMemoryRtDbClient`) mirrors
 the store and exposes a timer-less `tick(nowMs?)` that fires due jobs
 synchronously in unit tests.
 
+## File storage
+
+Both the one-shot `RtDbHttpClient` and the reactive `RtDbClient` (delegating to
+HTTP) expose file storage; `InMemoryRtDbClient` mirrors it in memory:
+
+```ts
+const { id } = await db.upload(bytes, "image/png");   // → { id, sha256, size, contentType }
+db.getUrl(id);                                         // public URL for <img src> — no fetch
+const meta = await db.getFileMetadata(id);             // { id, sha256, size, contentType?, creationTime }
+await db.deleteFile(id);                               // revokes the public URL
+```
+
+`upload` POSTs raw bytes to `POST /api/storage/{db}` (the client injects its own
+db); `getUrl` returns `${url}/storage/${id}` for the browser to fetch with no
+token. Storage is HTTP-only (no reactive updates).
+
 ## In-memory test client
 
 `InMemoryRtDbClient` (`src/in_memory.ts`) is an in-memory implementation of the

@@ -32,6 +32,7 @@ guidance. Authoritative design:
 | --- | --- |
 | Correctness core (serialized writes + subscription fan-out) | `src/committer.rs`, `src/subs.rs` |
 | Scheduled / cron transactions | `src/scheduler.rs` (+ the `RunScheduled` arm in `src/committer.rs`) |
+| File storage (blobs) | `src/storage.rs` (+ the storage routes in `src/http_api.rs`) |
 | Schema model + validation | `src/schema.rs` |
 | Schema → Postgres DDL | `src/ddl.rs` |
 | Write / read paths | `src/txn.rs`, `src/query.rs` |
@@ -65,6 +66,29 @@ should write idempotent scheduled txns. A past-due one-shot fires immediately
 `Schedule` / `CancelSchedule` / `PauseSchedule` / `ResumeSchedule` /
 `ListSchedules`. HTTP surface: `POST /api/schedule`,
 `POST /api/schedule/{id}/{cancel,pause,resume}`, `POST /api/schedules`.
+
+## File storage
+
+Per-database blob storage lives in `src/storage.rs`. Each database gets a
+`storage` side table (`bytea`, TOAST-managed) holding each file's bytes plus
+`{sha256, size, content_type, created_at}`; a global `rtdb.storage_index(id →
+db_name)` resolves the unauthenticated public serve URL to the owning database.
+
+Bytes are written via `storage::put` **directly, not through the committer** —
+blobs don't touch document tables or subscriptions, so the single-writer
+invariant is unaffected. Storage is not reactive, so there are **no WS
+variants** — the surface is HTTP only:
+
+- `POST /api/storage/{db}` — bearer, raw body, `Content-Type` → `{ id, sha256, size, contentType }`. The route disables axum's 2 MiB default and enforces `RTDB_MAX_FILE_SIZE` (default 50 MiB); overflow is `BadRequest`.
+- `GET /storage/{id}` — **unauthenticated** public serve (anyone with the opaque uuid-v7 URL; revoke by delete). Convex parity.
+- `GET /api/storage/{db}/{id}` — authed serve (caller-db-scoped).
+- `DELETE /api/storage/{db}/{id}` — bearer → `{ ok: true }` (idempotent; revokes the public URL).
+- `GET /api/storage/{db}/{id}/metadata` — bearer → `{ id, sha256, size, contentType?, creationTime }`.
+
+`{db}` is in the path because the raw upload/serve bodies can't carry it and
+session principals aren't db-scoped. The table is created eagerly in
+`db::create_database` and lazily via `storage::ensure_table` at committer
+startup (mirrors `mutations`/`scheduled_txns`).
 
 ## Develop
 

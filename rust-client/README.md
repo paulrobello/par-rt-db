@@ -79,6 +79,22 @@ db.cancel_schedule(&id).await?;      // …or pause_schedule / resume_schedule
 let jobs: Vec<ScheduleInfo> = db.list_schedules().await?;
 ```
 
+## File storage
+
+`RtDbHttpClient` exposes file storage (`upload` / `delete_file` /
+`get_file_metadata` / `get_url`):
+
+```rust
+use par_rt_db_client::UploadResult;
+let up: UploadResult = db.upload(b"file-bytes", Some("image/png")).await?;
+let url: String = db.get_url(&up.id);          // public URL — no request made
+let meta = db.get_file_metadata(&up.id).await?;
+db.delete_file(&up.id).await?;
+```
+
+`upload` POSTs raw bytes to `POST /api/storage/{db}` (the client injects its
+db); `get_url` returns `{url}/storage/{id}`. Storage is HTTP-only.
+
 ## Errors
 
 Every failure is `RtDbError { code, message }` with `ErrorCode` matching the
