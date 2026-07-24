@@ -105,6 +105,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
     let Some((principal, db)) = authenticate(&mut socket, &state).await else {
         return;
     };
+    state.metrics.ws_connect();
 
     let mut rate_limiter = RateLimiter::new();
     let mut last_activity = Instant::now();
@@ -169,6 +170,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
     }
 
     state.subs.remove_conn(&db, conn_id).await;
+    state.metrics.ws_disconnect();
 }
 
 /// Waits up to `AUTH_TIMEOUT` (in total, across any leading `Ping`/`Pong`
@@ -308,6 +310,8 @@ async fn handle_text_frame(
                         .await
                     {
                         let _ = out_tx.send(ServerMessage::SubscribeErr { query_id, error });
+                    } else {
+                        state.metrics.record_query();
                     }
                 }
                 Err(error) => {
@@ -337,6 +341,7 @@ async fn handle_text_frame(
                     .await
                 {
                     Ok(outcome) => {
+                        state.metrics.record_mutation();
                         let _ = out_tx.send(ServerMessage::MutateOk {
                             mut_id,
                             results: outcome.results,

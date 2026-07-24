@@ -429,3 +429,52 @@ async fn metrics_counters_and_subs_count() -> anyhow::Result<()> {
     assert!(snap.pool_size >= 0);
     Ok(())
 }
+
+// GET /admin/metrics returns the snapshot; a real mutation bumps mutationsTotal.
+#[tokio::test]
+async fn metrics_endpoint_reflects_a_mutation() -> anyhow::Result<()> {
+    let state = common::test_state().await;
+    let addr = common::spawn_app(state.clone()).await;
+    let db = common::fresh_db(&state).await;
+
+    let before: serde_json::Value = common::admin_get(addr, "/admin/metrics")
+        .await
+        .json()
+        .await?;
+    assert_eq!(
+        before["mutationsTotal"], 0,
+        "fresh state should have 0 mutations: {before}"
+    );
+
+    // Mint a token + run one insert via /api/mutate.
+    let mint: serde_json::Value = common::admin_post(
+        addr,
+        "/admin/mint-token",
+        serde_json::json!({"db": db, "name": "t"}),
+    )
+    .await
+    .json()
+    .await?;
+    let token = mint["token"].as_str().unwrap().to_string();
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/api/mutate"))
+        .header("Authorization", format!("Bearer {token}"))
+        .json(&serde_json::json!({
+            "db": db,
+            "txn": {"steps":[{"op":"insert","table":"projects","doc":{"name":"p","status":"active","tags":[],"updatedAt":0}}]}
+        }))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    let after: serde_json::Value = common::admin_get(addr, "/admin/metrics")
+        .await
+        .json()
+        .await?;
+    assert_eq!(
+        after["mutationsTotal"], 1,
+        "one mutation should be counted: {after}"
+    );
+    assert!(after["queriesTotal"].as_i64().unwrap_or(-1) >= 0);
+    Ok(())
+}

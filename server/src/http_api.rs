@@ -76,6 +76,7 @@ async fn query_handler(
         owner_of(&principal),
     )
     .await?;
+    state.metrics.record_query();
     Ok(Json(QueryResponse { result }))
 }
 
@@ -111,6 +112,7 @@ async fn mutate_handler(
             owner_of(&principal).map(|s| s.to_string()),
         )
         .await?;
+    state.metrics.record_mutation();
     Ok(Json(MutateResponse {
         results: outcome.results,
     }))
@@ -309,6 +311,7 @@ async fn upload_handler(
         &bytes,
     )
     .await?;
+    state.metrics.record_upload();
     Ok(Json(UploadResponse {
         id,
         sha256,

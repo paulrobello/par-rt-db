@@ -475,6 +475,19 @@ async fn db_stats(
     }))
 }
 
+async fn metrics_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<crate::metrics::MetricsSnapshot>, RtDbError> {
+    require_admin(&state, &headers).await?;
+    Ok(Json(
+        state
+            .metrics
+            .snapshot(&state.pool, &state.subs, state.started_at)
+            .await,
+    ))
+}
+
 /// Admin routes, all gated on `Authorization: Bearer <admin_key>` (constant-time
 /// compare).
 pub fn admin_routes() -> Router<Arc<AppState>> {
@@ -494,6 +507,7 @@ pub fn admin_routes() -> Router<Arc<AppState>> {
         )
         .route("/admin/dbs/{db}/schema", get(get_schema))
         .route("/admin/dbs/{db}/stats", get(db_stats))
+        .route("/admin/metrics", get(metrics_handler))
         .route("/admin/tokens", get(list_tokens))
         .route("/admin/export-db", get(export_db))
         .route("/admin/import-db", post(import_db))
