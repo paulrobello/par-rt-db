@@ -488,6 +488,41 @@ async fn metrics_handler(
     ))
 }
 
+#[derive(Deserialize)]
+struct OpsRecentParams {
+    db: Option<String>,
+    table: Option<String>,
+    #[serde(default = "default_ops_n")]
+    n: usize,
+}
+fn default_ops_n() -> usize {
+    100
+}
+
+#[derive(Serialize)]
+struct OpsRecentResponse {
+    ops: Vec<crate::op_feed::OpEvent>,
+}
+
+/// Recent document-op events from the in-memory ring, filtered by optional
+/// `db`/`table`, newest-first, capped at `n` (max 500).
+async fn ops_recent(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    QueryParams(params): QueryParams<OpsRecentParams>,
+) -> Result<Json<OpsRecentResponse>, RtDbError> {
+    require_admin(&state, &headers).await?;
+    let ops = state
+        .op_feed
+        .recent(
+            params.db.as_deref(),
+            params.table.as_deref(),
+            params.n.min(500),
+        )
+        .await;
+    Ok(Json(OpsRecentResponse { ops }))
+}
+
 /// Admin routes, all gated on `Authorization: Bearer <admin_key>` (constant-time
 /// compare).
 pub fn admin_routes() -> Router<Arc<AppState>> {
@@ -508,6 +543,7 @@ pub fn admin_routes() -> Router<Arc<AppState>> {
         .route("/admin/dbs/{db}/schema", get(get_schema))
         .route("/admin/dbs/{db}/stats", get(db_stats))
         .route("/admin/metrics", get(metrics_handler))
+        .route("/admin/ops/recent", get(ops_recent))
         .route("/admin/tokens", get(list_tokens))
         .route("/admin/export-db", get(export_db))
         .route("/admin/import-db", post(import_db))

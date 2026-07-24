@@ -519,3 +519,39 @@ async fn op_feed_publishes_and_replays() -> anyhow::Result<()> {
     assert_eq!(got, 2);
     Ok(())
 }
+
+// A committed insert publishes an op event WITH its kind; /admin/ops/recent returns it.
+#[tokio::test]
+async fn op_feed_tapped_on_commit() -> anyhow::Result<()> {
+    let state = common::test_state().await;
+    let addr = common::spawn_app(state.clone()).await;
+    let db = common::fresh_db(&state).await;
+
+    let mint: serde_json::Value = common::admin_post(
+        addr,
+        "/admin/mint-token",
+        serde_json::json!({"db": db, "name": "t"}),
+    )
+    .await
+    .json()
+    .await?;
+    let token = mint["token"].as_str().unwrap().to_string();
+    let resp = reqwest::Client::new().post(format!("http://{addr}/api/mutate"))
+        .header("Authorization", format!("Bearer {token}"))
+        .json(&serde_json::json!({"db": db, "txn": {"steps":[{"op":"insert","table":"projects","doc":{"name":"p","status":"active","tags":[],"updatedAt":0}}]}}))
+        .send().await?;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    let body: serde_json::Value =
+        common::admin_get(addr, &format!("/admin/ops/recent?db={db}&n=10"))
+            .await
+            .json()
+            .await?;
+    let ops = body["ops"].as_array().expect("ops array");
+    let ours = ops
+        .iter()
+        .find(|o| o["table"] == "projects")
+        .expect("projects op event missing");
+    assert_eq!(ours["kind"], "insert", "kind should be 'insert': {ours}");
+    Ok(())
+}

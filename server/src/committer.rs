@@ -212,8 +212,6 @@ struct CommitterCtx {
     db: String,
     subs: Arc<SubscriptionManager>,
     schemas: SchemaCache,
-    // Consumed in Task 3 (`ctx.op_feed.publish(...)`); remove the allow when that lands.
-    #[allow(dead_code)]
     op_feed: Arc<crate::op_feed::OpFeed>,
 }
 
@@ -309,6 +307,9 @@ async fn handle_mutate(
     ctx.subs
         .fan_out(&ctx.pool, &ctx.db, &schema, &outcome.write_set)
         .await;
+    ctx.op_feed
+        .publish(&ctx.db, owner.as_deref(), &outcome.write_set.ops)
+        .await;
 
     if let Some(key) = &idempotency_key {
         // The mutation already committed and fanned out by this point — a
@@ -359,6 +360,9 @@ async fn handle_scheduled(
         Ok(outcome) => {
             ctx.subs
                 .fan_out(&ctx.pool, &ctx.db, &schema, &outcome.write_set)
+                .await;
+            ctx.op_feed
+                .publish(&ctx.db, None, &outcome.write_set.ops)
                 .await;
             let finalize = match kind.as_str() {
                 "oneshot" => scheduler::finalize_one_shot_done(&ctx.pool, &ctx.db, &id).await,
