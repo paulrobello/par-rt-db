@@ -604,3 +604,149 @@ async fn hot_config_round_trips_through_rtdb_config() -> anyhow::Result<()> {
         .await?;
     Ok(())
 }
+
+// GET /admin/config redacts secrets (admin key, OAuth, database_url) into
+// configured-bools and shows hot values + version/commit + the allowlist.
+// PATCH updates a hot value, persists it, and rejects invalid/unknown fields.
+// The global rtdb_config row is cleaned up so other tests on the shared pool
+// are unaffected.
+#[tokio::test]
+async fn config_get_and_patch_round_trip() -> anyhow::Result<()> {
+    let state = common::test_state().await;
+    let addr = common::spawn_app(state.clone()).await;
+    let bearer = "Bearer test-admin-key";
+
+    sqlx::query("DELETE FROM rtdb_config WHERE id = 1")
+        .execute(&state.pool)
+        .await?;
+
+    // GET: secrets are configured-bools, never values; hot + version + admins present.
+    let resp = reqwest::Client::new()
+        .get(format!("http://{addr}/admin/config"))
+        .header("Authorization", bearer)
+        .send()
+        .await?;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(body["adminKeyConfigured"], true);
+    assert_eq!(body["databaseUrlConfigured"], true);
+    assert_eq!(body["githubConfigured"], false);
+    assert_eq!(body["googleConfigured"], false);
+    assert!(!body.to_string().contains("test-admin-key"));
+    assert!(body["hot"]["allowedOrigins"].is_array());
+    assert!(body["hot"]["sessionTtlDays"].is_i64());
+    assert!(body["version"].is_string());
+    assert!(body["gitCommit"].is_string());
+    assert!(body["admins"].is_array());
+
+    // PATCH a hot value; response reflects it and it persisted to the table.
+    let resp = reqwest::Client::new()
+        .request(
+            reqwest::Method::PATCH,
+            format!("http://{addr}/admin/config"),
+        )
+        .header("Authorization", bearer)
+        .json(&serde_json::json!({ "sessionTtlDays": 7 }))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        resp.json::<serde_json::Value>().await?["hot"]["sessionTtlDays"],
+        7
+    );
+    let loaded = rtdb_server::config::load_hot(&state.pool).await?.unwrap();
+    assert_eq!(loaded.session_ttl_days, 7);
+
+    // Invalid value -> 400.
+    let resp = reqwest::Client::new()
+        .request(
+            reqwest::Method::PATCH,
+            format!("http://{addr}/admin/config"),
+        )
+        .header("Authorization", bearer)
+        .json(&serde_json::json!({ "sessionTtlDays": 0 }))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    // Unknown (immutable) field -> 400 (deny_unknown_fields).
+    let resp = reqwest::Client::new()
+        .request(
+            reqwest::Method::PATCH,
+            format!("http://{addr}/admin/config"),
+        )
+        .header("Authorization", bearer)
+        .json(&serde_json::json!({ "port": 9999 }))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    // No auth -> 401/403.
+    let resp = reqwest::Client::new()
+        .get(format!("http://{addr}/admin/config"))
+        .send()
+        .await?;
+    assert!(
+        resp.status() == reqwest::StatusCode::UNAUTHORIZED
+            || resp.status() == reqwest::StatusCode::FORBIDDEN
+    );
+
+    sqlx::query("DELETE FROM rtdb_config WHERE id = 1")
+        .execute(&state.pool)
+        .await?;
+    Ok(())
+}
+
+// CORS `allowed_origins` hot-reloads: after PATCH adds an origin, a preflight
+// from that origin echoes access-control-allow-origin; a non-listed origin does
+// not. Proves the AllowOrigin::predicate reads live HotConfig, not a startup
+// snapshot.
+#[tokio::test]
+async fn config_cors_hot_reloads_allowed_origins() -> anyhow::Result<()> {
+    let state = common::test_state().await;
+    let addr = common::spawn_app(state.clone()).await;
+    let bearer = "Bearer test-admin-key";
+
+    // Add an origin via the hot-reload path (replaces the test_hot seed entirely).
+    let origin = "https://dashboard.example.com";
+    let resp = reqwest::Client::new()
+        .request(
+            reqwest::Method::PATCH,
+            format!("http://{addr}/admin/config"),
+        )
+        .header("Authorization", bearer)
+        .json(&serde_json::json!({ "allowedOrigins": [origin] }))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    // Preflight from the now-allowed origin echoes ACAO.
+    let resp = reqwest::Client::new()
+        .request(reqwest::Method::OPTIONS, format!("http://{addr}/admin/dbs"))
+        .header("Origin", origin)
+        .header("Access-Control-Request-Method", "GET")
+        .send()
+        .await?;
+    assert_eq!(
+        resp.headers()
+            .get("access-control-allow-origin")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        origin
+    );
+
+    // A non-listed origin receives no ACAO header.
+    let resp = reqwest::Client::new()
+        .request(reqwest::Method::OPTIONS, format!("http://{addr}/admin/dbs"))
+        .header("Origin", "https://evil.example")
+        .header("Access-Control-Request-Method", "GET")
+        .send()
+        .await?;
+    assert!(resp.headers().get("access-control-allow-origin").is_none());
+
+    sqlx::query("DELETE FROM rtdb_config WHERE id = 1")
+        .execute(&state.pool)
+        .await?;
+    Ok(())
+}
