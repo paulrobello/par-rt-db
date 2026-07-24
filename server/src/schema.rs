@@ -64,6 +64,17 @@ pub struct TableDef {
     pub fields: BTreeMap<String, FieldType>,
     #[serde(default)]
     pub indexes: Vec<IndexDef>,
+    /// Opt-in per-row authorization: names a declared, string-compatible
+    /// field whose value is the owning user's `user_id`. When set, an
+    /// authenticated user reads/mutates only their own rows on this table;
+    /// machine tokens and scheduled jobs bypass. Server-enforced; clients
+    /// only declare it. Additive — schemas without it deserialize unchanged.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "ownerField"
+    )]
+    pub owner_field: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -209,6 +220,27 @@ impl TableDef {
                 )));
             }
             validate_field_type(field_type)?;
+        }
+
+        if let Some(owner) = &self.owner_field {
+            if !is_valid_identifier(owner, MAX_FIELD_NAME_LEN) {
+                return Err(RtDbError::bad_request(format!(
+                    "ownerField '{owner}' is not a valid identifier"
+                )));
+            }
+            let field_type = self.fields.get(owner).ok_or_else(|| {
+                RtDbError::bad_request(format!("ownerField '{owner}' is not a declared field"))
+            })?;
+            // The owner value is a user_id (string); the field must be
+            // string-compatible so the equality predicate is sound and (if indexed)
+            // can back a typed text column. `indexed_column_type` admits Number/
+            // Boolean too, so require the resulting pg type to be "text".
+            let (pg_type, _) = indexed_column_type(field_type)?;
+            if pg_type != "text" {
+                return Err(RtDbError::bad_request(format!(
+                    "ownerField '{owner}' must be a string-compatible field (string/id/literal/union of strings)"
+                )));
+            }
         }
 
         let mut index_names = HashSet::new();
@@ -496,6 +528,7 @@ mod tests {
         TableDef {
             fields: BTreeMap::from([("name".to_string(), FieldType::String)]),
             indexes: vec![],
+            owner_field: None,
         }
     }
 
@@ -541,6 +574,7 @@ mod tests {
         let table = TableDef {
             fields: BTreeMap::from([("a-b".to_string(), FieldType::String)]),
             indexes: vec![],
+            owner_field: None,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -572,6 +606,7 @@ mod tests {
         let table = TableDef {
             fields: BTreeMap::from([(field_name, FieldType::String)]),
             indexes: vec![],
+            owner_field: None,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -585,6 +620,7 @@ mod tests {
         let table = TableDef {
             fields: BTreeMap::from([(field_name, FieldType::String)]),
             indexes: vec![],
+            owner_field: None,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -603,6 +639,7 @@ mod tests {
                 search: false,
                 vector: None,
             }],
+            owner_field: None,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -621,6 +658,7 @@ mod tests {
                 search: false,
                 vector: None,
             }],
+            owner_field: None,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -636,6 +674,7 @@ mod tests {
                 ("Status".to_string(), FieldType::String),
             ]),
             indexes: vec![],
+            owner_field: None,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -661,6 +700,7 @@ mod tests {
                     vector: None,
                 },
             ],
+            owner_field: None,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -673,6 +713,7 @@ mod tests {
         let table = TableDef {
             fields: BTreeMap::from([("_secret".to_string(), FieldType::String)]),
             indexes: vec![],
+            owner_field: None,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -708,6 +749,7 @@ mod tests {
                 search: false,
                 vector: None,
             }],
+            owner_field: None,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -725,6 +767,7 @@ mod tests {
                 search: false,
                 vector: None,
             }],
+            owner_field: None,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -742,6 +785,7 @@ mod tests {
                 search: false,
                 vector: None,
             }],
+            owner_field: None,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -767,6 +811,7 @@ mod tests {
                     vector: None,
                 },
             ],
+            owner_field: None,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -784,6 +829,7 @@ mod tests {
                 search: false,
                 vector: None,
             }],
+            owner_field: None,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -801,6 +847,7 @@ mod tests {
                 search: false,
                 vector: None,
             }],
+            owner_field: None,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -818,6 +865,7 @@ mod tests {
                 },
             )]),
             indexes: vec![],
+            owner_field: None,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -830,6 +878,7 @@ mod tests {
         let table = TableDef {
             fields: BTreeMap::from([("x".to_string(), FieldType::Union { variants: vec![] })]),
             indexes: vec![],
+            owner_field: None,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -849,6 +898,7 @@ mod tests {
                 },
             )]),
             indexes: vec![],
+            owner_field: None,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -1045,6 +1095,7 @@ mod tests {
                 },
             )]),
             indexes: vec![],
+            owner_field: None,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -1140,6 +1191,7 @@ mod tests {
                 search: false,
                 vector: None,
             }],
+            owner_field: None,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -1192,6 +1244,7 @@ mod tests {
                 search: true,
                 vector: None,
             }],
+            owner_field: None,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -1214,6 +1267,7 @@ mod tests {
                 search: true,
                 vector: None,
             }],
+            owner_field: None,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -1305,6 +1359,7 @@ mod tests {
                     filter_fields: vec![],
                 }),
             }],
+            owner_field: None,
         };
         assert!(table.validate_structure("docs").is_err());
     }
@@ -1325,6 +1380,7 @@ mod tests {
                     filter_fields: vec!["userId".to_string()],
                 }),
             }],
+            owner_field: None,
         };
         assert!(table.validate_structure("docs").is_ok());
     }
@@ -1344,6 +1400,7 @@ mod tests {
                     filter_fields: vec![],
                 }),
             }],
+            owner_field: None,
         };
         assert!(table.validate_structure("docs").is_err());
     }
@@ -1365,6 +1422,7 @@ mod tests {
                     filter_fields: vec![],
                 }),
             }],
+            owner_field: None,
         };
         assert!(table.validate_structure("docs").is_err());
     }
@@ -1385,6 +1443,7 @@ mod tests {
                     filter_fields: vec![],
                 }),
             }],
+            owner_field: None,
         };
         assert!(table.validate_structure("docs").is_err());
     }
@@ -1404,6 +1463,7 @@ mod tests {
                     filter_fields: vec![],
                 }),
             }],
+            owner_field: None,
         };
         assert!(table.validate_structure("docs").is_err());
     }
@@ -1423,6 +1483,7 @@ mod tests {
                     filter_fields: vec!["userId".to_string()],
                 }),
             }],
+            owner_field: None,
         };
         assert!(table.validate_structure("docs").is_err());
     }
@@ -1448,7 +1509,49 @@ mod tests {
                     filter_fields: vec!["meta".to_string()],
                 }),
             }],
+            owner_field: None,
         };
         assert!(table.validate_structure("docs").is_err());
+    }
+
+    #[test]
+    fn owner_field_round_trips_and_validates() {
+        let json = r#"{"fields":{"title":{"type":"string"},"userId":{"type":"string"}},"indexes":[{"name":"by_user","fields":["userId"]}],"ownerField":"userId"}"#;
+        let td: TableDef = serde_json::from_str(json).unwrap();
+        assert_eq!(td.owner_field.as_deref(), Some("userId"));
+        // camelCase wire key survives a round trip
+        let re = serde_json::to_value(&td).unwrap();
+        assert_eq!(re["ownerField"], "userId");
+
+        // validates as part of a schema
+        let mut tables = std::collections::BTreeMap::new();
+        tables.insert("notes".to_string(), td);
+        let schema = SchemaDef { tables };
+        schema.validate().unwrap();
+
+        // absent ownerField is omitted from the wire and deserializes as None
+        let none_json = r#"{"fields":{"title":{"type":"string"}}}"#;
+        let td2: TableDef = serde_json::from_str(none_json).unwrap();
+        assert!(td2.owner_field.is_none());
+        assert!(!serde_json::to_string(&td2).unwrap().contains("ownerField"));
+    }
+
+    #[test]
+    fn owner_field_validation_rejects_bad_declarations() {
+        fn validate_owner(owner_json: &str) -> Result<(), RtDbError> {
+            let json = format!(
+                r#"{{"fields":{{"title":{{"type":"string"}},"num":{{"type":"number"}}}},"ownerField":{owner_json}}}"#
+            );
+            let td: TableDef = serde_json::from_str(&json).unwrap();
+            let mut tables = std::collections::BTreeMap::new();
+            tables.insert("t".to_string(), td);
+            SchemaDef { tables }.validate()
+        }
+        // names an undeclared field
+        assert!(validate_owner(r#""missing""#).is_err());
+        // names a non-string field (number) — not string-compatible
+        assert!(validate_owner(r#""num""#).is_err());
+        // valid
+        assert!(validate_owner(r#""title""#).is_ok());
     }
 }

@@ -32,7 +32,14 @@ fn vector_schema(dim: u32, with_filter: bool) -> SchemaDef {
         }),
     }];
     let mut tables = BTreeMap::new();
-    tables.insert("docs".to_string(), TableDef { fields, indexes });
+    tables.insert(
+        "docs".to_string(),
+        TableDef {
+            fields,
+            indexes,
+            owner_field: None,
+        },
+    );
     SchemaDef { tables }
 }
 
