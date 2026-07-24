@@ -224,12 +224,12 @@ impl TableDef {
 
         if let Some(owner) = &self.owner_field {
             if !is_valid_identifier(owner, MAX_FIELD_NAME_LEN) {
-                return Err(RtDbError::bad_request(format!(
+                return Err(RtDbError::schema(format!(
                     "ownerField '{owner}' is not a valid identifier"
                 )));
             }
             let field_type = self.fields.get(owner).ok_or_else(|| {
-                RtDbError::bad_request(format!("ownerField '{owner}' is not a declared field"))
+                RtDbError::schema(format!("ownerField '{owner}' is not a declared field"))
             })?;
             // The owner value is a user_id (string); the field must be
             // string-compatible so the equality predicate is sound and (if indexed)
@@ -237,7 +237,7 @@ impl TableDef {
             // Boolean too, so require the resulting pg type to be "text".
             let (pg_type, _) = indexed_column_type(field_type)?;
             if pg_type != "text" {
-                return Err(RtDbError::bad_request(format!(
+                return Err(RtDbError::schema(format!(
                     "ownerField '{owner}' must be a string-compatible field (string/id/literal/union of strings)"
                 )));
             }
@@ -1538,20 +1538,43 @@ mod tests {
 
     #[test]
     fn owner_field_validation_rejects_bad_declarations() {
-        fn validate_owner(owner_json: &str) -> Result<(), RtDbError> {
-            let json = format!(
-                r#"{{"fields":{{"title":{{"type":"string"}},"num":{{"type":"number"}}}},"ownerField":{owner_json}}}"#
-            );
+        use crate::error::ErrorCode;
+
+        fn validate_owner(fields_json: &str, owner: &str) -> Result<(), RtDbError> {
+            let json = format!(r#"{{"fields":{fields_json},"ownerField":"{owner}"}}"#);
             let td: TableDef = serde_json::from_str(&json).unwrap();
             let mut tables = std::collections::BTreeMap::new();
             tables.insert("t".to_string(), td);
             SchemaDef { tables }.validate()
         }
-        // names an undeclared field
-        assert!(validate_owner(r#""missing""#).is_err());
+
+        // names an undeclared field — schema violation (422), not bad_request (400)
+        let err = validate_owner(r#"{"title":{"type":"string"}}"#, "missing").unwrap_err();
+        assert_eq!(err.code, ErrorCode::SchemaViolation);
+
         // names a non-string field (number) — not string-compatible
-        assert!(validate_owner(r#""num""#).is_err());
-        // valid
-        assert!(validate_owner(r#""title""#).is_ok());
+        let err = validate_owner(r#"{"num":{"type":"number"}}"#, "num").unwrap_err();
+        assert_eq!(err.code, ErrorCode::SchemaViolation);
+
+        // a plain string field is valid
+        validate_owner(r#"{"title":{"type":"string"}}"#, "title").unwrap();
+
+        // Accepted-types matrix: every field type that maps to Postgres "text".
+        validate_owner(r#"{"o":{"type":"id","table":"users"}}"#, "o").unwrap();
+        validate_owner(r#"{"o":{"type":"literal","value":"admin"}}"#, "o").unwrap();
+        validate_owner(
+            r#"{"o":{"type":"union","variants":[{"type":"literal","value":"a"},{"type":"literal","value":"b"}]}}"#,
+            "o",
+        )
+        .unwrap();
+        validate_owner(
+            r#"{"o":{"type":"optional","inner":{"type":"string"}}}"#,
+            "o",
+        )
+        .unwrap();
+
+        // Rejected-types matrix: non-text scalars.
+        let err = validate_owner(r#"{"o":{"type":"boolean"}}"#, "o").unwrap_err();
+        assert_eq!(err.code, ErrorCode::SchemaViolation);
     }
 }
