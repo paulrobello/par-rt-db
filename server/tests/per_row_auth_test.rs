@@ -4,7 +4,7 @@ use common::test_state;
 use rtdb_server::ddl::push_schema;
 use rtdb_server::protocol::ServerMessage;
 use rtdb_server::query::{Query, QueryResult, execute_query};
-use rtdb_server::schema::{FieldType, IndexDef, SchemaDef, TableDef};
+use rtdb_server::schema::{FieldType, IndexDef, SchemaDef, TableDef, VectorIndexSpec};
 use rtdb_server::subs::next_conn_id;
 use rtdb_server::txn::{Step, Transaction, execute_txn};
 use sqlx::PgPool;
@@ -356,5 +356,168 @@ async fn fan_out_does_not_push_cross_user_rows() -> anyhow::Result<()> {
         other => panic!("bob expected QueryUpdate, got {other:?}"),
     };
     assert_eq!(bob_titles, vec!["bob's note".to_string()]);
+    Ok(())
+}
+
+// (6) `search` on an owner-gated table must not surface cross-user rows: each
+// user sees only their own matching docs, while a bypass caller sees all. This
+// closes the gap left by Task 2's filter-injection (search rejects `q.filter`,
+// so the predicate must be added directly to its SQL).
+#[tokio::test]
+async fn search_filters_to_own_rows() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = format!("t{}", uuid::Uuid::now_v7().simple());
+    rtdb_server::db::create_database(&pool, &db).await?;
+    let mut notes_fields = BTreeMap::new();
+    notes_fields.insert("title".to_string(), FieldType::String);
+    notes_fields.insert("body".to_string(), FieldType::String);
+    notes_fields.insert("userId".to_string(), FieldType::String);
+    let notes_indexes = vec![IndexDef {
+        name: "search_content".into(),
+        fields: vec!["title".into(), "body".into()],
+        search: true,
+        vector: None,
+    }];
+    let mut tables = BTreeMap::new();
+    tables.insert(
+        "notes".to_string(),
+        TableDef {
+            fields: notes_fields,
+            indexes: notes_indexes,
+            owner_field: Some("userId".into()),
+        },
+    );
+    let schema = SchemaDef { tables };
+    push_schema(&pool, &db, schema.clone()).await?;
+
+    // Both users seed a doc whose title/body match the search term "database".
+    for (uid, title) in [("alice", "alice database"), ("bob", "bob database")] {
+        let mut doc = serde_json::Map::new();
+        doc.insert("title".into(), title.into());
+        doc.insert("body".into(), "database".into());
+        doc.insert("userId".into(), uid.into());
+        execute_txn(
+            &pool,
+            &db,
+            &schema,
+            &Transaction {
+                steps: vec![Step::Insert {
+                    table: "notes".into(),
+                    doc,
+                }],
+            },
+        )
+        .await?;
+    }
+
+    let q = Query {
+        table: "notes".to_string(),
+        search: Some(rtdb_server::query::SearchQuery {
+            index: "search_content".into(),
+            query: "database".into(),
+        }),
+        ..notes_query()
+    };
+
+    let alice_titles = titles(execute_query(&pool, &db, &schema, &q, Some("alice")).await?);
+    assert_eq!(alice_titles, vec!["alice database".to_string()]);
+
+    let bob_titles = titles(execute_query(&pool, &db, &schema, &q, Some("bob")).await?);
+    assert_eq!(bob_titles, vec!["bob database".to_string()]);
+
+    let mut bypass = titles(execute_query(&pool, &db, &schema, &q, None).await?);
+    bypass.sort();
+    assert_eq!(
+        bypass,
+        vec!["alice database".to_string(), "bob database".to_string()]
+    );
+    Ok(())
+}
+
+// (7) Same guarantee for `vectorSearch`: it also rejects `q.filter`, so the
+// owner predicate is threaded into its WHERE. Identical embeddings under two
+// users — each user's search returns only their own row, bypass returns both.
+#[tokio::test]
+async fn vector_search_filters_to_own_rows() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = format!("t{}", uuid::Uuid::now_v7().simple());
+    rtdb_server::db::create_database(&pool, &db).await?;
+    let mut docs_fields = BTreeMap::new();
+    docs_fields.insert("embedding".to_string(), FieldType::Vector { dimensions: 3 });
+    docs_fields.insert("userId".to_string(), FieldType::String);
+    let docs_indexes = vec![IndexDef {
+        name: "by_embedding".into(),
+        fields: vec!["embedding".into()],
+        search: false,
+        vector: Some(VectorIndexSpec {
+            dimensions: 3,
+            filter_fields: vec![],
+        }),
+    }];
+    let mut tables = BTreeMap::new();
+    tables.insert(
+        "docs".to_string(),
+        TableDef {
+            fields: docs_fields,
+            indexes: docs_indexes,
+            owner_field: Some("userId".into()),
+        },
+    );
+    let schema = SchemaDef { tables };
+    push_schema(&pool, &db, schema.clone()).await?;
+
+    // Identical embedding under each user; owner_field is the only distinguisher.
+    for uid in ["alice", "bob"] {
+        let mut doc = serde_json::Map::new();
+        doc.insert("embedding".into(), serde_json::json!([1.0, 0.0, 0.0]));
+        doc.insert("userId".into(), uid.into());
+        execute_txn(
+            &pool,
+            &db,
+            &schema,
+            &Transaction {
+                steps: vec![Step::Insert {
+                    table: "docs".into(),
+                    doc,
+                }],
+            },
+        )
+        .await?;
+    }
+
+    let q = Query {
+        table: "docs".to_string(),
+        vector_search: Some(rtdb_server::query::VectorSearchQuery {
+            index: "by_embedding".into(),
+            vector: vec![1.0, 0.0, 0.0],
+            limit: 10,
+            filter: BTreeMap::new(),
+        }),
+        ..notes_query()
+    };
+
+    let owners = |res: QueryResult| -> Vec<String> {
+        match res {
+            QueryResult::Docs(docs) => docs
+                .into_iter()
+                .map(|d| d["userId"].as_str().expect("userId").to_string())
+                .collect(),
+            other => panic!("expected Docs, got {other:?}"),
+        }
+    };
+
+    assert_eq!(
+        owners(execute_query(&pool, &db, &schema, &q.clone(), Some("alice")).await?),
+        vec!["alice".to_string()]
+    );
+    assert_eq!(
+        owners(execute_query(&pool, &db, &schema, &q.clone(), Some("bob")).await?),
+        vec!["bob".to_string()]
+    );
+    let mut bypass = owners(execute_query(&pool, &db, &schema, &q, None).await?);
+    bypass.sort();
+    assert_eq!(bypass, vec!["alice".to_string(), "bob".to_string()]);
     Ok(())
 }

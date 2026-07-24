@@ -311,7 +311,7 @@ pub async fn execute_query(
                 "vectorSearch cannot be combined with any other terminal",
             ));
         }
-        return execute_vector_search(pool, db, table_def, &q.table, vs).await;
+        return execute_vector_search(pool, db, table_def, &q.table, vs, owner_field, owner).await;
     }
 
     // Full-text search terminal. It ranks over a search index's tsvector and is
@@ -336,7 +336,17 @@ pub async fn execute_query(
                 "search cannot be combined with index, eq, range bounds, order, unique, first, count, paginate, filter, or vector search",
             ));
         }
-        return execute_search(pool, db, table_def, &q.table, search, q.take).await;
+        return execute_search(
+            pool,
+            db,
+            table_def,
+            &q.table,
+            search,
+            q.take,
+            owner_field,
+            owner,
+        )
+        .await;
     }
 
     let index_def: Option<&IndexDef> = match &q.index {
@@ -919,6 +929,7 @@ fn jsonb_lhs_and_bind(
 /// text is bound once via `$1` and reused in the `ORDER BY ts_rank`, so user
 /// text can never inject tsquery syntax. Unknown index / empty query →
 /// `BadRequest`, never a 500.
+#[allow(clippy::too_many_arguments)]
 async fn execute_search(
     pool: &PgPool,
     db: &str,
@@ -926,6 +937,8 @@ async fn execute_search(
     table_name: &str,
     search: &SearchQuery,
     take: Option<u32>,
+    owner_field: Option<&str>,
+    owner: Option<&str>,
 ) -> Result<QueryResult, RtDbError> {
     if search.query.trim().is_empty() {
         return Err(RtDbError::bad_request(
@@ -943,17 +956,32 @@ async fn execute_search(
     let limit = take.unwrap_or(MAX_TAKE);
     let pg_schema_name = pg_schema(db);
     let table_ident = pg_table(table_name);
+
+    // Owner predicate: when the table declares an `ownerField` and the caller is
+    // a user, restrict to rows whose `doc->>'<ownerField>'` equals the user id.
+    // `owner_field` is `is_valid_identifier`-validated at schema push, so it is
+    // safe to interpolate into the jsonb string-literal position; the user id is
+    // bound via `$n`. The owner bind occupies `$2`, pushing `LIMIT` to `$3`.
+    let owner_enforce: Option<(&str, &str)> = match (owner_field, owner) {
+        (Some(f), Some(u)) => Some((f, u)),
+        _ => None,
+    };
+    let (limit_ph, owner_clause) = match &owner_enforce {
+        Some((field, _)) => (3, format!(" AND (doc->>'{field}') = $2")),
+        None => (2, String::new()),
+    };
     let sql = format!(
         "SELECT \"id\", \"doc\", \"created_at\", \"version\" FROM \"{pg_schema_name}\".\"{table_ident}\" \
-         WHERE \"{sv_col}\" @@ plainto_tsquery($1) \
+         WHERE \"{sv_col}\" @@ plainto_tsquery($1){owner_clause} \
          ORDER BY ts_rank(\"{sv_col}\", plainto_tsquery($1)) DESC, \"created_at\" DESC, \"id\" DESC \
-         LIMIT $2"
+         LIMIT ${limit_ph}"
     );
-    let rows = sqlx::query_as::<_, (String, serde_json::Value, i64, i64)>(&sql)
-        .bind(&search.query)
-        .bind(i64::from(limit))
-        .fetch_all(pool)
-        .await?;
+    let mut query =
+        sqlx::query_as::<_, (String, serde_json::Value, i64, i64)>(&sql).bind(&search.query);
+    if let Some((_, uid)) = owner_enforce {
+        query = query.bind(uid);
+    }
+    let rows = query.bind(i64::from(limit)).fetch_all(pool).await?;
     let docs = rows
         .into_iter()
         .map(|(id, doc, created_at, version)| merge_doc(id, doc, created_at, version))
@@ -965,14 +993,17 @@ async fn execute_search(
 /// the index's `v_<index>` column and the query vector, ascending, limited to
 /// `limit`. Optional `filter` eq-binds over the index's declared `filterFields`.
 /// Unknown index / length mismatch / unknown filter key / out-of-range limit
-/// → `BadRequest`. Bind order: filter eq-binds occupy `$1..$k`, the query
-/// vector is `$(k+1)::vector`, and `limit` is `$(k+2)`.
+/// → `BadRequest`. Bind order: filter eq-binds occupy `$1..$k`, then (when the
+/// table is owner-gated and the caller is a user) the owner id occupies
+/// `$(k+1)`, then the query vector (`$n::vector`), then `limit`.
 async fn execute_vector_search(
     pool: &PgPool,
     db: &str,
     table_def: &TableDef,
     table_name: &str,
     vs: &VectorSearchQuery,
+    owner_field: Option<&str>,
+    owner: Option<&str>,
 ) -> Result<QueryResult, RtDbError> {
     let index_def = table_def
         .indexes
@@ -1041,16 +1072,31 @@ async fn execute_vector_search(
             .join(",")
     );
 
-    // Bind numbering: filter eq-binds first ($1..$k), then the query vector
-    // ($k+1, cast to `vector`), then `limit` ($k+2). The WHERE clause always
-    // excludes rows whose vector column is NULL, so undimensioned rows never
-    // surface as bogus nearest-neighbors.
+    // Bind numbering: filter eq-binds first ($1..$k), then the owner id bind
+    // ($k+1) when owner-enforced, then the query vector (cast to `vector`),
+    // then `limit`. The WHERE clause always excludes rows whose vector column
+    // is NULL, so undimensioned rows never surface as bogus nearest-neighbors.
+    // The owner predicate (`doc->>'<ownerField>'` = $n) mirrors the main query
+    // path: `owner_field` is `is_valid_identifier`-validated at schema push, so
+    // it is safe to interpolate into the jsonb string-literal position; the user
+    // id is `$n`-bound, never interpolated.
+    let owner_enforce: Option<(&str, &str)> = match (owner_field, owner) {
+        (Some(f), Some(u)) => Some((f, u)),
+        _ => None,
+    };
     let mut bind_idx = 1usize;
     let mut filter_placeholders: Vec<String> = Vec::with_capacity(filter_cols.len());
     for _ in &filter_cols {
         filter_placeholders.push(format!("${bind_idx}"));
         bind_idx += 1;
     }
+    let owner_ph: Option<usize> = if owner_enforce.is_some() {
+        let ph = bind_idx;
+        bind_idx += 1;
+        Some(ph)
+    } else {
+        None
+    };
     let qvec_ph = bind_idx;
     bind_idx += 1;
     let limit_ph = bind_idx;
@@ -1063,6 +1109,9 @@ async fn execute_vector_search(
             .map(|(col, ph)| format!("\"{col}\" = {ph}"))
             .collect();
         where_clause = format!("{where_clause} AND {}", conds.join(" AND "));
+    }
+    if let (Some(ph), Some((field, _))) = (owner_ph, owner_enforce) {
+        where_clause.push_str(&format!(" AND (doc->>'{field}') = ${ph}"));
     }
 
     let sql = format!(
@@ -1079,6 +1128,9 @@ async fn execute_vector_search(
             EqBind::Num(v) => query.bind(v),
             EqBind::Bool(v) => query.bind(v),
         };
+    }
+    if let Some((_, uid)) = owner_enforce {
+        query = query.bind(uid);
     }
     let rows = query
         .bind(qvec_text)
