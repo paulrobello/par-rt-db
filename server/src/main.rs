@@ -1,4 +1,4 @@
-use rtdb_server::{AppState, build_router, config::Config, db};
+use rtdb_server::{AppState, auth, build_router, config::Config, db};
 use sqlx::postgres::PgPoolOptions;
 use tracing_subscriber::EnvFilter;
 
@@ -26,6 +26,20 @@ async fn main() {
         eprintln!("failed to bootstrap database: {err}");
         std::process::exit(1);
     });
+
+    let admin_emails: Vec<String> = match std::env::var("RTDB_ADMIN_EMAILS") {
+        Ok(v) if !v.is_empty() => v
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect(),
+        _ => Vec::new(),
+    };
+    auth::seed_admin_emails(&pool, &admin_emails)
+        .await
+        .unwrap_or_else(|err| {
+            tracing::warn!(error = %err, "failed to seed admin emails");
+        });
 
     let port = config.port;
     let state = AppState::new(pool, config);

@@ -126,6 +126,28 @@ pub fn owner_of(principal: &Principal) -> Option<&str> {
     }
 }
 
+/// Idempotently seeds `RTDB_ADMIN_EMAILS` into `rtdb_auth.admins` at startup
+/// (see `main.rs`). Emails are lowercased and trimmed; blanks are skipped.
+/// Seeded rows carry a NULL `github_id` and are matched by email at login.
+pub async fn seed_admin_emails(pool: &PgPool, emails: &[String]) -> Result<(), RtDbError> {
+    let now = now_ms();
+    for raw in emails {
+        let email = raw.trim().to_lowercase();
+        if email.is_empty() {
+            continue;
+        }
+        sqlx::query(
+            "INSERT INTO rtdb_auth.admins (email, github_id, added_at) VALUES ($1, NULL, $2) \
+             ON CONFLICT (email) DO NOTHING",
+        )
+        .bind(&email)
+        .bind(now)
+        .execute(pool)
+        .await?;
+    }
+    Ok(())
+}
+
 /// Wire-facing identity for a resolved principal (see `protocol::AuthedUser`).
 /// A machine token's name is not an identity, so `name` is always `None` for
 /// `Machine`.

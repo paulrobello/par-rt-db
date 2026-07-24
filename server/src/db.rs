@@ -109,6 +109,16 @@ async fn bootstrap_ddl(conn: &mut PgConnection) -> Result<(), RtDbError> {
     .execute(&mut *conn)
     .await?;
 
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS rtdb_auth.admins (
+            email text PRIMARY KEY,
+            github_id bigint,
+            added_at bigint NOT NULL
+        )",
+    )
+    .execute(&mut *conn)
+    .await?;
+
     sqlx::query("CREATE SCHEMA IF NOT EXISTS rtdb")
         .execute(&mut *conn)
         .await?;
