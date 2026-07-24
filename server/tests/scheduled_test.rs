@@ -329,13 +329,13 @@ async fn one_shot_fires_and_writes() {
     warm_up_committer(&committers, &db).await;
 
     // The doc appears once the scheduler claims and the committer executes.
-    let appeared = poll_for_n(&pool, &db, &schema, 42, Duration::from_secs(5)).await;
+    let appeared = poll_for_n(&pool, &db, &schema, 42, Duration::from_secs(15)).await;
     assert!(appeared, "scheduled one-shot never wrote its doc");
 
     // A one-shot row is deleted after a successful fire. Poll for the delete:
     // finalize (the DELETE) runs after `fan_out`, so reading the row the
     // instant the doc appears would race it.
-    let deleted = poll_list(&pool, &db, Duration::from_secs(2), |l| {
+    let deleted = poll_list(&pool, &db, Duration::from_secs(8), |l| {
         if l.is_empty() { Some(()) } else { None }
     })
     .await;
@@ -372,14 +372,14 @@ async fn cron_fires_and_stays_pending() {
 
     warm_up_committer(&committers, &db).await;
 
-    let appeared = poll_for_n(&pool, &db, &schema, 7, Duration::from_secs(5)).await;
+    let appeared = poll_for_n(&pool, &db, &schema, 7, Duration::from_secs(15)).await;
     assert!(appeared, "scheduled cron never wrote its doc");
 
     // After firing, the cron row returns to pending with fired_count >= 1.
     // Poll for that finalized state: finalize (status→pending, fired_count++)
     // runs after `fan_out`, so reading the row the instant the doc appears
     // would observe the intermediate 'running' row instead.
-    let info = poll_list(&pool, &db, Duration::from_secs(2), |l| {
+    let info = poll_list(&pool, &db, Duration::from_secs(8), |l| {
         l.iter()
             .find(|i| i.kind == "cron" && i.status == "pending" && i.fired_count >= 1)
             .cloned()
@@ -425,7 +425,7 @@ async fn failing_cron_reschedules_anyway() {
     // fails; `handle_scheduled`'s failure branch must reschedule rather than
     // mark_error. Poll for the rescheduled state: status='pending' (NOT
     // 'error'), last_error set, fired_count 0, due_at advanced beyond now.
-    let info = poll_list(&pool, &db, Duration::from_secs(5), |l| {
+    let info = poll_list(&pool, &db, Duration::from_secs(15), |l| {
         l.iter()
             .find(|i| i.kind == "cron" && i.status == "pending" && i.last_error.is_some())
             .cloned()
@@ -483,7 +483,7 @@ async fn one_shot_catches_up_after_being_past_due() {
         .await
         .unwrap();
 
-    let appeared = poll_for_n(&pool, &db, &schema, 5, Duration::from_secs(5)).await;
+    let appeared = poll_for_n(&pool, &db, &schema, 5, Duration::from_secs(15)).await;
     assert!(
         appeared,
         "running scheduler must catch up a newly-inserted past-due one-shot"
@@ -550,7 +550,7 @@ async fn cron_skips_missed_windows() {
     );
 
     // The doc was written exactly once (one fire, one insert).
-    let appeared = poll_for_n(&pool, &db, &schema, 77, Duration::from_secs(2)).await;
+    let appeared = poll_for_n(&pool, &db, &schema, 77, Duration::from_secs(8)).await;
     assert!(
         appeared,
         "cron should have written its doc on the single fire"
@@ -599,7 +599,7 @@ async fn failing_txn_marks_error_one_shot() {
     // deleted like a successful one-shot, NOT pending like a rescheduled
     // cron). `mark_error` runs after `execute_txn` fails, so observing this
     // state means the txn has already been attempted and rolled back.
-    let info = poll_list(&pool, &db, Duration::from_secs(5), |l| {
+    let info = poll_list(&pool, &db, Duration::from_secs(15), |l| {
         l.iter()
             .find(|i| i.kind == "oneshot" && i.status == "error")
             .cloned()

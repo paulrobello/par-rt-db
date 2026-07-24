@@ -1,6 +1,11 @@
 services:
   postgres:
     image: pgvector/pgvector:pg17
+    # The parallel test suite opens many concurrent pools across ~20 test
+    # binaries; the default max_connections=100 is exhausted under full `cargo
+    # test` load, surfacing as transient create_database/insert failures (the
+    # scheduled_test timer-harness flake). 300 is a comfortable dev ceiling.
+    command: postgres -c max_connections=300
     ports:
       - "127.0.0.1:55434:5432"
     environment:
