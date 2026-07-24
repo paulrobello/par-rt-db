@@ -3,6 +3,7 @@ mod common;
 use common::test_state;
 use rtdb_server::ddl::push_schema;
 use rtdb_server::schema::{FieldType, IndexDef, SchemaDef, TableDef, VectorIndexSpec};
+use rtdb_server::txn::{Step, Transaction, execute_txn};
 use sqlx::Row;
 use std::collections::BTreeMap;
 
@@ -142,4 +143,53 @@ async fn changing_vector_dims_is_rejected() {
         .expect("push initial vector schema");
     let err = push_schema(&state.pool, &db, vector_schema(4, false)).await;
     assert!(err.is_err(), "changing dimensions must be rejected");
+}
+
+fn vec_doc(emb: Vec<f64>) -> serde_json::Map<String, serde_json::Value> {
+    serde_json::json!({ "embedding": emb })
+        .as_object()
+        .expect("vec_doc object")
+        .clone()
+}
+
+async fn vec_db(state: &std::sync::Arc<rtdb_server::AppState>) -> String {
+    let name = format!("t{}", uuid::Uuid::now_v7().simple());
+    rtdb_server::db::create_database(&state.pool, &name)
+        .await
+        .expect("create database");
+    push_schema(&state.pool, &name, vector_schema(3, false))
+        .await
+        .expect("push vector schema");
+    name
+}
+
+/// Task 5: an insert must maintain the `v_<index>` column — writing the doc's
+/// vector field into `v_by_embedding` cast as `vector`. The bound value is the
+/// JSON array's text form (`[1.0,2.0,3.0]`), which pgvector accepts and
+/// normalizes on output to `[1,2,3]` (integer-valued floats render without `.0`).
+#[tokio::test]
+async fn insert_maintains_vector_column() {
+    let state = test_state().await;
+    let db = vec_db(&state).await;
+    let schema = vector_schema(3, false);
+    execute_txn(
+        &state.pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::Insert {
+                table: "docs".into(),
+                doc: vec_doc(vec![1.0, 2.0, 3.0]),
+            }],
+        },
+    )
+    .await
+    .expect("insert vector doc");
+    let row: (Option<String>,) = sqlx::query_as(&format!(
+        "SELECT \"v_by_embedding\"::text FROM \"db_{db}\".\"t_docs\""
+    ))
+    .fetch_one(&state.pool)
+    .await
+    .expect("read vector column");
+    assert_eq!(row.0.as_deref(), Some("[1,2,3]"));
 }

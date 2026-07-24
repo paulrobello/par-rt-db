@@ -130,47 +130,121 @@ enum ColBind {
     Text(Option<String>),
     Num(Option<f64>),
     Bool(Option<bool>),
+    /// pgvector text form `[a,b,c]` (NULL when `None`). Bound against a
+    /// `$n::vector` placeholder whose column type is `vector(N)`.
+    Vector(Option<String>),
 }
 
-/// Every field referenced by any index on `table`, paired with its type, in
-/// a stable order. These are exactly the indexed-column values that must be
-/// extracted from a document on insert/patch/upsert.
-fn table_columns(table: &TableDef) -> Result<Vec<(String, FieldType)>, RtDbError> {
-    let mut names: BTreeSet<String> = BTreeSet::new();
+/// The kind of an indexed column: a scalar stored in an `f_<field>` column,
+/// or a vector stored in a `v_<index>` column.
+enum ColumnKind {
+    Scalar(FieldType),
+    Vector,
+}
+
+/// One physical indexed column: its physical name (`f_<field>` or `v_<index>`),
+/// the doc field its value is read from, and its kind.
+struct TableColumn {
+    col: String,
+    field: String,
+    kind: ColumnKind,
+}
+
+/// Every column a write must maintain beyond `id`/`doc`/`created_at`/`version`,
+/// in a stable order: the `f_<field>` scalar columns for every btree/search
+/// index field and every vector index's `filterFields`, plus one `v_<index>`
+/// vector column per vector index (whose value is read from the index's single
+/// vector field, not a typed `f_` column). Sorted by physical column name so
+/// `do_insert`/`apply_update`/`insert_snapshot_row` emit columns and binds in
+/// the same order.
+fn table_columns(table: &TableDef) -> Result<Vec<TableColumn>, RtDbError> {
+    use crate::ddl::pg_vector_col;
+
+    // Scalar `f_<field>` columns: btree/search index fields + vector-index
+    // filterFields. A vector index's own vector field is intentionally absent
+    // here — it lives on the `v_<index>` column below.
+    let mut scalar_fields: BTreeSet<String> = BTreeSet::new();
     for index in &table.indexes {
-        for field_name in &index.fields {
-            names.insert(field_name.clone());
+        if let Some(vec_spec) = &index.vector {
+            for ff in &vec_spec.filter_fields {
+                scalar_fields.insert(ff.clone());
+            }
+        } else {
+            for field_name in &index.fields {
+                scalar_fields.insert(field_name.clone());
+            }
+        }
+    }
+    let mut cols: Vec<TableColumn> = scalar_fields
+        .into_iter()
+        .map(|field| -> Result<TableColumn, RtDbError> {
+            let ty = table.fields.get(&field).cloned().ok_or_else(|| {
+                RtDbError::internal(format!("index references unknown field '{field}'"))
+            })?;
+            Ok(TableColumn {
+                col: pg_col(&field),
+                field: field.clone(),
+                kind: ColumnKind::Scalar(ty),
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // Vector `v_<index>` columns: one per vector index, reading its vector field.
+    for index in &table.indexes {
+        if let Some(_vec_spec) = &index.vector {
+            let field = index
+                .fields
+                .first()
+                .cloned()
+                .ok_or_else(|| RtDbError::internal("vector index missing its field"))?;
+            cols.push(TableColumn {
+                col: pg_vector_col(&index.name),
+                field,
+                kind: ColumnKind::Vector,
+            });
         }
     }
 
-    names
-        .into_iter()
-        .map(|name| {
-            let ty = table.fields.get(&name).cloned().ok_or_else(|| {
-                RtDbError::internal(format!("index references unknown field '{name}'"))
-            })?;
-            Ok((name, ty))
-        })
-        .collect()
+    cols.sort_by(|a, b| a.col.cmp(&b.col));
+    Ok(cols)
 }
 
 /// Extracts one SQL bind per `columns` entry from `doc`, shared by
 /// insert/patch/upsert so every indexed column is always recomputed the
 /// same way from the merged document.
 fn column_binds(
-    columns: &[(String, FieldType)],
+    columns: &[TableColumn],
     doc: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<Vec<ColBind>, RtDbError> {
     columns
         .iter()
-        .map(|(name, ty)| {
-            let value = doc.get(name).cloned().unwrap_or(serde_json::Value::Null);
-            column_bind_for(ty, &value)
+        .map(|c| {
+            let value = doc
+                .get(&c.field)
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            column_bind_for(&c.kind, &value)
         })
         .collect()
 }
 
-fn column_bind_for(ty: &FieldType, value: &serde_json::Value) -> Result<ColBind, RtDbError> {
+fn column_bind_for(kind: &ColumnKind, value: &serde_json::Value) -> Result<ColBind, RtDbError> {
+    match kind {
+        ColumnKind::Scalar(ty) => scalar_bind(ty, value),
+        ColumnKind::Vector => {
+            if value.is_null() {
+                return Ok(ColBind::Vector(None));
+            }
+            // Defensive only: schema validation already enforced exact length +
+            // finiteness. pgvector parses the JSON-array text form `[a,b,c]`.
+            Ok(ColBind::Vector(Some(value.to_string())))
+        }
+    }
+}
+
+/// Scalar bind for an `f_<field>` column, typed per `FieldType` (`Optional`
+/// unwrapped). `None` when the value is null (stored as SQL NULL).
+fn scalar_bind(ty: &FieldType, value: &serde_json::Value) -> Result<ColBind, RtDbError> {
     let (pg_type, _nullable) = indexed_column_type(ty)?;
     if value.is_null() {
         return match pg_type {
@@ -279,10 +353,17 @@ async fn do_insert(
         "\"doc\"".to_string(),
         "\"created_at\"".to_string(),
     ];
-    for (name, _) in &columns {
-        col_names.push(format!("\"{}\"", pg_col(name)));
+    let mut placeholders = vec!["$1".to_string(), "$2".to_string(), "$3".to_string()];
+    let mut idx = 3usize;
+    for c in &columns {
+        idx += 1;
+        col_names.push(format!("\"{}\"", c.col));
+        let ph = match c.kind {
+            ColumnKind::Vector => format!("${idx}::vector"),
+            ColumnKind::Scalar(_) => format!("${idx}"),
+        };
+        placeholders.push(ph);
     }
-    let placeholders: Vec<String> = (1..=col_names.len()).map(|i| format!("${i}")).collect();
 
     let sql = format!(
         "INSERT INTO \"{pg_schema_name}\".\"{table_ident}\" ({}) VALUES ({})",
@@ -300,6 +381,7 @@ async fn do_insert(
             ColBind::Text(v) => query.bind(v),
             ColBind::Num(v) => query.bind(v),
             ColBind::Bool(v) => query.bind(v),
+            ColBind::Vector(v) => query.bind(v),
         };
     }
     query.execute(&mut *conn).await?;
@@ -326,8 +408,12 @@ async fn apply_update(
         "\"version\" = \"version\" + 1".to_string(),
     ];
     let mut idx = 2usize;
-    for (name, _) in &columns {
-        set_clauses.push(format!("\"{}\" = ${idx}", pg_col(name)));
+    for c in &columns {
+        let cast = match c.kind {
+            ColumnKind::Vector => "::vector",
+            ColumnKind::Scalar(_) => "",
+        };
+        set_clauses.push(format!("\"{}\" = ${idx}{cast}", c.col));
         idx += 1;
     }
     let id_placeholder = idx;
@@ -344,6 +430,7 @@ async fn apply_update(
             ColBind::Text(v) => query.bind(v),
             ColBind::Num(v) => query.bind(v),
             ColBind::Bool(v) => query.bind(v),
+            ColBind::Vector(v) => query.bind(v),
         };
     }
     query = query.bind(id.to_string());
@@ -436,10 +523,22 @@ pub(crate) async fn insert_snapshot_row(
         "\"created_at\"".to_string(),
         "\"version\"".to_string(),
     ];
-    for (name, _) in &columns {
-        col_names.push(format!("\"{}\"", pg_col(name)));
+    let mut placeholders = vec![
+        "$1".to_string(),
+        "$2".to_string(),
+        "$3".to_string(),
+        "$4".to_string(),
+    ];
+    let mut idx = 4usize;
+    for c in &columns {
+        idx += 1;
+        col_names.push(format!("\"{}\"", c.col));
+        let ph = match c.kind {
+            ColumnKind::Vector => format!("${idx}::vector"),
+            ColumnKind::Scalar(_) => format!("${idx}"),
+        };
+        placeholders.push(ph);
     }
-    let placeholders: Vec<String> = (1..=col_names.len()).map(|i| format!("${i}")).collect();
 
     let sql = format!(
         "INSERT INTO \"{pg_schema_name}\".\"{table_ident}\" ({}) VALUES ({})",
@@ -458,6 +557,7 @@ pub(crate) async fn insert_snapshot_row(
             ColBind::Text(v) => query.bind(v),
             ColBind::Num(v) => query.bind(v),
             ColBind::Bool(v) => query.bind(v),
+            ColBind::Vector(v) => query.bind(v),
         };
     }
     query.execute(&mut *conn).await?;
