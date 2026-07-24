@@ -46,7 +46,10 @@ async fn insert_populates_typed_columns() -> anyhow::Result<()> {
     )
     .await?;
 
-    assert_eq!(outcome.write_set, BTreeSet::from(["projects".to_string()]));
+    assert_eq!(
+        outcome.write_set.tables,
+        BTreeSet::from(["projects".to_string()])
+    );
     let id = outcome.results[0]["id"]
         .as_str()
         .expect("id string")
@@ -372,7 +375,10 @@ async fn replace_overwrites_doc_updates_typed_columns_and_bumps_version() -> any
     )
     .await?;
     assert_eq!(outcome.results, vec![serde_json::Value::Null]);
-    assert_eq!(outcome.write_set, BTreeSet::from(["projects".to_string()]));
+    assert_eq!(
+        outcome.write_set.tables,
+        BTreeSet::from(["projects".to_string()])
+    );
 
     let pg_schema = format!("db_{db}");
     let row: (String, String, i64, serde_json::Value) = sqlx::query_as(&format!(
@@ -574,7 +580,10 @@ async fn delete_removes_row() -> anyhow::Result<()> {
     )
     .await?;
     assert_eq!(outcome.results, vec![serde_json::Value::Null]);
-    assert_eq!(outcome.write_set, BTreeSet::from(["projects".to_string()]));
+    assert_eq!(
+        outcome.write_set.tables,
+        BTreeSet::from(["projects".to_string()])
+    );
 
     let pg_schema = format!("db_{db}");
     let count: i64 = sqlx::query_scalar(&format!(
@@ -900,7 +909,7 @@ async fn write_set_reports_all_touched_tables() -> anyhow::Result<()> {
 
     let outcome = execute_txn(&pool, &db, &schema, &txn).await?;
     assert_eq!(
-        outcome.write_set,
+        outcome.write_set.tables,
         BTreeSet::from(["projects".to_string(), "workItems".to_string()])
     );
 

@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use sqlx::PgPool;
@@ -12,7 +12,7 @@ use crate::protocol::ServerMessage;
 use crate::query::{Query, canonical, execute_query};
 use crate::scheduler;
 use crate::subs::{ConnId, SubscriptionManager};
-use crate::txn::{Transaction, TxnOutcome, execute_txn};
+use crate::txn::{Transaction, TxnOutcome, WriteSet, execute_txn};
 
 /// Bound on each per-db committer task's inbox.
 const CHANNEL_BUFFER: usize = 64;
@@ -276,7 +276,7 @@ async fn handle_mutate(
     {
         return Ok(TxnOutcome {
             results,
-            write_set: BTreeSet::new(),
+            write_set: WriteSet::default(),
         });
     }
 

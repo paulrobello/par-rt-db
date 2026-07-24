@@ -313,3 +313,54 @@ async fn mutate_on_nonexistent_db_is_not_found() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+// Fine-grained invalidation plumbing: a committed txn's write_set records the
+// specific (table, id) of every written document — not just the table name —
+// so point-read subscriptions can later skip re-runs that don't touch their doc.
+#[tokio::test]
+async fn write_set_records_written_document_ids() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let db = fresh_db(&state).await;
+
+    let insert_a = state
+        .committers
+        .mutate(&db, None, insert_work_item("backlog", 1.0))
+        .await?;
+    let id_a = insert_a.results[0]["id"]
+        .as_str()
+        .expect("insert returns id")
+        .to_string();
+
+    let patch_a = state
+        .committers
+        .mutate(
+            &db,
+            None,
+            Transaction {
+                steps: vec![Step::Patch {
+                    table: "workItems".to_string(),
+                    id: id_a.clone(),
+                    fields: serde_json::json!({ "status": "in_progress" })
+                        .as_object()
+                        .expect("object")
+                        .clone(),
+                }],
+            },
+        )
+        .await?;
+
+    assert!(insert_a.write_set.tables.contains("workItems"));
+    assert!(
+        insert_a
+            .write_set
+            .docs
+            .contains(&("workItems".to_string(), id_a.clone()))
+    );
+    assert!(
+        patch_a
+            .write_set
+            .docs
+            .contains(&("workItems".to_string(), id_a))
+    );
+    Ok(())
+}

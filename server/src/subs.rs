@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -9,6 +9,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::protocol::ServerMessage;
 use crate::query::{Query, canonical, execute_query};
 use crate::schema::SchemaDef;
+use crate::txn::WriteSet;
 
 pub type ConnId = u64;
 
@@ -95,7 +96,7 @@ impl SubscriptionManager {
         pool: &PgPool,
         db: &str,
         schema: &SchemaDef,
-        write_set: &BTreeSet<String>,
+        write_set: &WriteSet,
     ) {
         let mut guard = self.subs.lock().await;
         let Some(db_subs) = guard.get_mut(db) else {
@@ -103,7 +104,7 @@ impl SubscriptionManager {
         };
 
         for ((_, query_id), entry) in db_subs.iter_mut() {
-            if !write_set.contains(&entry.query.table) {
+            if !write_set.tables.contains(&entry.query.table) {
                 continue;
             }
 

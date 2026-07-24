@@ -56,10 +56,29 @@ pub struct Transaction {
     pub steps: Vec<Step>,
 }
 
+/// The tables and documents a committed transaction wrote. `tables` drives
+/// table-level subscription invalidation; `docs` — the `(table, id)` of every
+/// written document — lets point-read subscriptions skip re-runs that don't
+/// touch their document (see `subs::ReadSet`). Server-internal: the wire
+/// transports send only `TxnOutcome.results`, never `write_set`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct WriteSet {
+    pub tables: BTreeSet<String>,
+    pub docs: BTreeSet<(String, String)>,
+}
+
+impl WriteSet {
+    /// Records that the transaction wrote document `id` in `table`.
+    fn touch(&mut self, table: &str, id: &str) {
+        self.tables.insert(table.to_string());
+        self.docs.insert((table.to_string(), id.to_string()));
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct TxnOutcome {
     pub results: Vec<serde_json::Value>,
-    pub write_set: BTreeSet<String>,
+    pub write_set: WriteSet,
 }
 
 /// SQL bind for an eq-lookup value, typed per the index field's `FieldType`
@@ -675,7 +694,7 @@ pub async fn execute_txn(
 
     let pg_schema_name = pg_schema(db);
     let mut results = Vec::with_capacity(txn.steps.len());
-    let mut write_set = BTreeSet::new();
+    let mut write_set = WriteSet::default();
 
     let mut tx = pool.begin().await?;
 
@@ -684,25 +703,25 @@ pub async fn execute_txn(
             Step::Insert { table, doc } => {
                 let table_def = schema.table(table)?;
                 let id = do_insert(&mut tx, &pg_schema_name, table_def, table, doc).await?;
-                write_set.insert(table.clone());
+                write_set.touch(table, &id);
                 results.push(serde_json::json!({ "id": id }));
             }
             Step::Patch { table, id, fields } => {
                 let table_def = schema.table(table)?;
                 do_patch(&mut tx, &pg_schema_name, table_def, table, id, fields).await?;
-                write_set.insert(table.clone());
+                write_set.touch(table, id);
                 results.push(serde_json::Value::Null);
             }
             Step::Replace { table, id, doc } => {
                 let table_def = schema.table(table)?;
                 do_replace(&mut tx, &pg_schema_name, table_def, table, id, doc).await?;
-                write_set.insert(table.clone());
+                write_set.touch(table, id);
                 results.push(serde_json::Value::Null);
             }
             Step::Delete { table, id } => {
                 schema.table(table)?;
                 do_delete(&mut tx, &pg_schema_name, table, id).await?;
-                write_set.insert(table.clone());
+                write_set.touch(table, id);
                 results.push(serde_json::Value::Null);
             }
             Step::ExpectVersion { table, id, version } => {
@@ -737,7 +756,7 @@ pub async fn execute_txn(
                     None => {
                         let id =
                             do_insert(&mut tx, &pg_schema_name, table_def, table, insert).await?;
-                        write_set.insert(table.clone());
+                        write_set.touch(table, &id);
                         results.push(serde_json::json!({ "id": id, "inserted": true }));
                     }
                     Some((id, doc_value)) => {
@@ -750,7 +769,7 @@ pub async fn execute_txn(
                         let merged = apply_patch(table_def, doc, patch)?;
                         apply_update(&mut tx, &pg_schema_name, table_def, table, &id, merged)
                             .await?;
-                        write_set.insert(table.clone());
+                        write_set.touch(table, &id);
                         results.push(serde_json::json!({ "id": id, "inserted": false }));
                     }
                 }
