@@ -56,22 +56,50 @@ pub struct Transaction {
     pub steps: Vec<Step>,
 }
 
+/// The kind of write a step performed on a document. Recorded in `WriteSet.ops`
+/// so downstream consumers (e.g. the activity feed) can stream what happened
+/// without re-deriving it from the step list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OpKind {
+    Insert,
+    Patch,
+    Replace,
+    Delete,
+    Upsert,
+}
+
+/// A single document write recorded by a transaction, with its op kind.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct DocOp {
+    pub table: String,
+    pub id: String,
+    pub kind: OpKind,
+}
+
 /// The tables and documents a committed transaction wrote. `tables` drives
 /// table-level subscription invalidation; `docs` — the `(table, id)` of every
 /// written document — lets point-read subscriptions skip re-runs that don't
-/// touch their document (see `subs::ReadSet`). Server-internal: the wire
-/// transports send only `TxnOutcome.results`, never `write_set`.
+/// touch their document (see `subs::ReadSet`). `ops` records each write's
+/// `OpKind` for the activity feed. Server-internal: the wire transports send
+/// only `TxnOutcome.results`, never `write_set`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub struct WriteSet {
     pub tables: BTreeSet<String>,
     pub docs: BTreeSet<(String, String)>,
+    pub ops: Vec<DocOp>,
 }
 
 impl WriteSet {
-    /// Records that the transaction wrote document `id` in `table`.
-    fn touch(&mut self, table: &str, id: &str) {
+    /// Records that the transaction wrote document `id` in `table` as `kind`.
+    fn touch(&mut self, table: &str, id: &str, kind: OpKind) {
         self.tables.insert(table.to_string());
         self.docs.insert((table.to_string(), id.to_string()));
+        self.ops.push(DocOp {
+            table: table.to_string(),
+            id: id.to_string(),
+            kind,
+        });
     }
 }
 
@@ -778,7 +806,7 @@ pub async fn execute_txn(
                 let table_def = schema.table(table)?;
                 let doc = stamp_owner(table_def, doc.clone(), owner);
                 let id = do_insert(&mut tx, &pg_schema_name, table_def, table, &doc).await?;
-                write_set.touch(table, &id);
+                write_set.touch(table, &id, OpKind::Insert);
                 results.push(serde_json::json!({ "id": id }));
             }
             Step::Patch { table, id, fields } => {
@@ -786,7 +814,7 @@ pub async fn execute_txn(
                 check_owner(&mut tx, &pg_schema_name, table_def, table, id, owner).await?;
                 let fields = stamp_owner(table_def, fields.clone(), owner);
                 do_patch(&mut tx, &pg_schema_name, table_def, table, id, &fields).await?;
-                write_set.touch(table, id);
+                write_set.touch(table, id, OpKind::Patch);
                 results.push(serde_json::Value::Null);
             }
             Step::Replace { table, id, doc } => {
@@ -794,14 +822,14 @@ pub async fn execute_txn(
                 check_owner(&mut tx, &pg_schema_name, table_def, table, id, owner).await?;
                 let doc = stamp_owner(table_def, doc.clone(), owner);
                 do_replace(&mut tx, &pg_schema_name, table_def, table, id, &doc).await?;
-                write_set.touch(table, id);
+                write_set.touch(table, id, OpKind::Replace);
                 results.push(serde_json::Value::Null);
             }
             Step::Delete { table, id } => {
                 let table_def = schema.table(table)?;
                 check_owner(&mut tx, &pg_schema_name, table_def, table, id, owner).await?;
                 do_delete(&mut tx, &pg_schema_name, table, id).await?;
-                write_set.touch(table, id);
+                write_set.touch(table, id, OpKind::Delete);
                 results.push(serde_json::Value::Null);
             }
             Step::ExpectVersion { table, id, version } => {
@@ -837,7 +865,7 @@ pub async fn execute_txn(
                         let insert = stamp_owner(table_def, insert.clone(), owner);
                         let id =
                             do_insert(&mut tx, &pg_schema_name, table_def, table, &insert).await?;
-                        write_set.touch(table, &id);
+                        write_set.touch(table, &id, OpKind::Upsert);
                         results.push(serde_json::json!({ "id": id, "inserted": true }));
                     }
                     Some((id, doc_value)) => {
@@ -852,7 +880,7 @@ pub async fn execute_txn(
                         let merged = apply_patch(table_def, doc, &patch)?;
                         apply_update(&mut tx, &pg_schema_name, table_def, table, &id, merged)
                             .await?;
-                        write_set.touch(table, &id);
+                        write_set.touch(table, &id, OpKind::Upsert);
                         results.push(serde_json::json!({ "id": id, "inserted": false }));
                     }
                 }
@@ -862,4 +890,34 @@ pub async fn execute_txn(
 
     tx.commit().await?;
     Ok(TxnOutcome { results, write_set })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn write_set_ops_records_kind() {
+        let mut ws = WriteSet::default();
+        ws.touch("projects", "id1", OpKind::Insert);
+        ws.touch("projects", "id2", OpKind::Patch);
+        ws.touch("tasks", "id3", OpKind::Delete);
+        assert_eq!(ws.docs.len(), 3);
+        assert_eq!(ws.ops.len(), 3);
+        assert!(
+            ws.ops
+                .iter()
+                .any(|o| o.id == "id1" && o.kind == OpKind::Insert)
+        );
+        assert!(
+            ws.ops
+                .iter()
+                .any(|o| o.id == "id2" && o.kind == OpKind::Patch)
+        );
+        assert!(
+            ws.ops
+                .iter()
+                .any(|o| o.table == "tasks" && o.kind == OpKind::Delete)
+        );
+    }
 }
