@@ -7,6 +7,7 @@ pub mod ddl;
 pub mod error;
 pub mod health;
 pub mod http_api;
+pub mod metrics;
 pub mod mutation_log;
 pub mod pagination;
 pub mod protocol;
@@ -42,6 +43,7 @@ pub struct AppState {
     pub committers: Committers,
     pub oauth_states: tokio::sync::Mutex<HashMap<String, OAuthStateEntry>>,
     pub started_at: SystemTime,
+    pub metrics: Arc<metrics::Metrics>,
 }
 
 impl AppState {
@@ -49,6 +51,7 @@ impl AppState {
         let schemas = SchemaCache::new();
         let subs = SubscriptionManager::new();
         let committers = Committers::new(pool.clone(), subs.clone(), schemas.clone());
+        let metrics = metrics::Metrics::new();
         Arc::new(Self {
             pool,
             config,
@@ -57,6 +60,7 @@ impl AppState {
             committers,
             oauth_states: tokio::sync::Mutex::new(HashMap::new()),
             started_at: SystemTime::now(),
+            metrics,
         })
     }
 }

@@ -92,6 +92,12 @@ impl SubscriptionManager {
         }
     }
 
+    /// Total active subscriptions across all databases (a dashboard gauge).
+    pub async fn count(&self) -> usize {
+        let guard = self.subs.lock().await;
+        guard.values().map(|db_subs| db_subs.len()).sum()
+    }
+
     /// Registers a subscription that has already sent its initial
     /// `QueryUpdate` with `last` as the canonical form of that initial result.
     /// Called only by the committer task, immediately after the initial send,
