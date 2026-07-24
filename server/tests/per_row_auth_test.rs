@@ -178,6 +178,35 @@ async fn user_reads_only_own_rows_on_owner_table() -> anyhow::Result<()> {
     Ok(())
 }
 
+// (1a) `owner_filter`'s `And`-composition branch: a query that supplies BOTH a
+// client `filter` AND is owner-gated must AND-compose the two predicates. This
+// is the one path that threads client-filter binds, then the owner bind, then
+// LIMIT — a bind-offset regression would error or surface the wrong rows. To
+// make the owner predicate load-bearing under the client filter, bob is seeded
+// with a row whose title ALSO equals "a-keep": dropping the owner filter would
+// then return bob's row too, failing the assert. "a-drop" is alice's own but
+// fails the client filter, proving the client predicate is also applied.
+#[tokio::test]
+async fn owner_filter_composes_with_client_filter() -> anyhow::Result<()> {
+    let (pool, db, schema) = setup().await;
+    seed_note(&pool, &db, &schema, "a-keep", "alice").await;
+    seed_note(&pool, &db, &schema, "a-drop", "alice").await;
+    seed_note(&pool, &db, &schema, "a-keep", "bob").await;
+
+    let mut q = notes_query();
+    q.take = Some(100);
+    q.filter = Some(rtdb_server::query::FilterExpr::Eq {
+        field: "title".into(),
+        value: serde_json::json!("a-keep"),
+    });
+    let res = execute_query(&pool, &db, &schema, &q, Some("alice")).await?;
+
+    let mut got = titles(res);
+    got.sort();
+    assert_eq!(got, vec!["a-keep".to_string()]);
+    Ok(())
+}
+
 // (2) A bypass caller (machine token / scheduled job — `owner = None`) sees
 // every row regardless of owner_field, preserving today's behavior.
 #[tokio::test]
@@ -550,6 +579,91 @@ async fn vector_search_filters_to_own_rows() -> anyhow::Result<()> {
     let mut bypass = owners(execute_query(&pool, &db, &schema, &q, None).await?);
     bypass.sort();
     assert_eq!(bypass, vec!["alice".to_string(), "bob".to_string()]);
+    Ok(())
+}
+
+// (7a) `vectorSearch` with a non-empty `filterField` eq-map AND owner-gated:
+// the vector path's bind numbering is filter eq-binds ($1..$k), then owner id
+// ($k+1), then qvec, then LIMIT — a non-empty filter combined with owner
+// enforcement exercises the full bind-offset accumulation. Uses a `category`
+// filterField distinct from the `userId` owner_field so the two predicates are
+// independent: alice owns a category="y" doc the filter excludes, and bob owns
+// a category="x" doc the owner filter excludes — only alice's category="x" doc
+// survives both. Identical embeddings so ranking is not a confounder.
+#[tokio::test]
+async fn vector_search_composes_filter_fields_with_owner() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = format!("t{}", uuid::Uuid::now_v7().simple());
+    rtdb_server::db::create_database(&pool, &db).await?;
+    let mut docs_fields = BTreeMap::new();
+    docs_fields.insert("embedding".to_string(), FieldType::Vector { dimensions: 3 });
+    docs_fields.insert("userId".to_string(), FieldType::String);
+    docs_fields.insert("category".to_string(), FieldType::String);
+    let docs_indexes = vec![IndexDef {
+        name: "by_embedding".into(),
+        fields: vec!["embedding".into()],
+        search: false,
+        vector: Some(VectorIndexSpec {
+            dimensions: 3,
+            filter_fields: vec!["category".into()],
+        }),
+    }];
+    let mut tables = BTreeMap::new();
+    tables.insert(
+        "docs".to_string(),
+        TableDef {
+            fields: docs_fields,
+            indexes: docs_indexes,
+            owner_field: Some("userId".into()),
+        },
+    );
+    let schema = SchemaDef { tables };
+    push_schema(&pool, &db, schema.clone()).await?;
+
+    // Identical embedding under each (user, category) combo; owner_field and
+    // category are the only distinguishers.
+    for (uid, cat) in [("alice", "x"), ("alice", "y"), ("bob", "x")] {
+        let mut doc = serde_json::Map::new();
+        doc.insert("embedding".into(), serde_json::json!([1.0, 0.0, 0.0]));
+        doc.insert("userId".into(), uid.into());
+        doc.insert("category".into(), cat.into());
+        execute_txn(
+            &pool,
+            &db,
+            &schema,
+            &Transaction {
+                steps: vec![Step::Insert {
+                    table: "docs".into(),
+                    doc,
+                }],
+            },
+            None,
+        )
+        .await?;
+    }
+
+    let mut filter = BTreeMap::new();
+    filter.insert("category".into(), serde_json::json!("x"));
+    let q = Query {
+        table: "docs".to_string(),
+        vector_search: Some(rtdb_server::query::VectorSearchQuery {
+            index: "by_embedding".into(),
+            vector: vec![1.0, 0.0, 0.0],
+            limit: 10,
+            filter,
+        }),
+        ..notes_query()
+    };
+
+    let res = execute_query(&pool, &db, &schema, &q, Some("alice")).await?;
+    let docs = match res {
+        QueryResult::Docs(d) => d,
+        other => panic!("expected Docs, got {other:?}"),
+    };
+    assert_eq!(docs.len(), 1, "owner + filterField compose to one row");
+    assert_eq!(docs[0]["userId"].as_str(), Some("alice"));
+    assert_eq!(docs[0]["category"].as_str(), Some("x"));
     Ok(())
 }
 
