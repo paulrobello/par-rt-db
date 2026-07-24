@@ -40,9 +40,13 @@ guidance. Authoritative design:
 | Transports | `src/ws.rs` (reactive), `src/http_api.rs` (one-shot) |
 | Auth | `src/auth/` (`tokens.rs`, `provider.rs`, `github.rs`, `google.rs`, `session.rs`) |
 
-The read path compiles a db-side `filter()` predicate DSL to SQL, and a
-full-text `search` query terminal backed by a generated tsvector column + GIN
-index, ranked by `ts_rank`.
+The read path compiles a db-side `filter()` predicate DSL to SQL, a full-text
+`search` query terminal backed by a generated tsvector column + GIN index,
+ranked by `ts_rank`, and a `vectorSearch` terminal backed by pgvector — a
+write-maintained `vector(N)` column + HNSW `vector_cosine_ops` index per vector
+index, ranked by cosine distance (`<=>`) with an optional eq-`filter` over
+declared `filterFields`. Embeddings are client-supplied (no server-side
+generation); the Postgres image is `pgvector/pgvector:pg17`.
 
 ## Scheduling
 

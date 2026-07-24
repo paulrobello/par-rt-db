@@ -66,7 +66,7 @@ high leverage, Tier 3 = large projects.
 | 14 | 2 | **Additional OAuth providers** (Google, etc.) | ✅ many via integrations | 🟡 GitHub + Google | Med | M | Implemented — `OAuthProvider` trait (`auth/provider.rs`) with GitHub (refactored, routes byte-identical) and Google providers; each extra provider is now S. Identity is email-keyed with cross-provider same-email linking (both providers verified the email); Google requires a verified email. More providers (GitLab, Microsoft, …) are each a small `provider.rs` impl. |
 | 15 | 2 | **db-side `filter()`** expressions | ✅ (discouraged in favor of indexes) | ✅ | Med | M | Implemented (server + rust-client builder) — a tagged-enum predicate DSL (`eq`/`neq`/`gt`/`gte`/`lt`/`lte`/`in` + `and`/`or` combinators) compiled to a fully-parenthesized WHERE fragment with every identifier schema-validated + double-quoted and every value `$n`-bound; indexed fields use their typed column, others use jsonb extraction with a value-inferred cast. Composes with index/order/take/cursor/count; `get` rejects it; malformed → `BadRequest`, never a 500. Mirrored end-to-end across all three clients (server + rust-client + ts-client `.filter()` builders). Convex steers users to indexes, so this stays an opt-in terminal. |
 | 16 | 3 | **File storage** | ✅ upload URLs, serving, metadata | ✅ | Med–High | L | Implemented — Postgres-native blobs (per the user's vendor-lock-to-Postgres steer: no disk/S3/object-store, no trait). A per-db `storage` table (`bytea`, TOAST-managed) holds each file's bytes + `{sha256, size, contentType, createdAt}`, and a global `rtdb.storage_index(id → db_name)` resolves the public serve URL to its owning database. Upload is `POST /api/storage/{db}` (bearer, raw body, `Content-Type`); the route disables axum's 2 MiB default and enforces `RTDB_MAX_FILE_SIZE` (default 50 MiB) via `axum::body::to_bytes`, rejecting overflow as `BadRequest`. Serve is both **public** `GET /storage/{id}` (no auth — anyone with the opaque uuid-v7 URL fetches it, Convex parity; revoke by delete) and **authed** `GET /api/storage/{db}/{id}` (caller-db-scoped). Plus `DELETE /api/storage/{db}/{id}` (idempotent, revokes the public URL) and `GET /api/storage/{db}/{id}/metadata`. Storage is **HTTP-only** (not reactive → no WS variants) and writes via `storage::put` directly, not the committer (blobs don't touch document tables or subscriptions). Mirrored on ts-client (`upload`/`deleteFile`/`getFileMetadata`/`getUrl`) and rust-client (`upload`/`delete_file`/`get_file_metadata`/`get_url`). |
-| 17 | 3 | **Vector search** | ✅ | ❌ | Med | M–L | `pgvector` extension + vector field type + index + `vectorSearch` terminal. Cheap infra-wise; ranked lower because current apps don't need it yet. |
+| 17 | 3 | **Vector search** | ✅ | ✅ | Med | M–L | Implemented — the pgvector extension (`CREATE EXTENSION IF NOT EXISTS vector` in `db::create_database` and as the first statement in `ddl::push_schema`, so existing databases get it idempotently) backs a new `Vector { dimensions }` field type (`schema.rs`), stored in the `doc` jsonb as a JSON array and validated for exact length + finite entries (not btree-indexable). A vector index on `IndexDef` via additive `vector: Option<VectorIndexSpec { dimensions, filter_fields }>` (`skip_serializing_if`-omitted when absent, so existing btree/search indexes deserialize unchanged) compiles in `ddl.rs` to a write-maintained `vector(N)` column `v_<index>` (populated on insert/patch/replace, not a generated column — pgvector has no jsonb→vector generated cast) plus an HNSW `vector_cosine_ops` index; declared `filterFields` get their typed `f_` columns. The `vectorSearch` query terminal (`{index, vector, limit, filter?}`, mutually exclusive with every other terminal) ranks by cosine distance `<=>` ASC, carries its own `limit` (capped at `VECTOR_SEARCH_MAX_LIMIT = 256`), and takes an optional eq-`filter` over the index's declared `filterFields`; the query vector is bound via `$n::vector` text cast so user-supplied arrays can never inject syntax. It rides the committer's existing table-level invalidation, so subscriptions re-run and push on any write to the table — no new committer code. **Two deliberate divergences from Convex:** (1) **reactive** (Convex's `vectorSearch` is a one-shot action; par-rt-db re-runs and pushes live), and (2) **client-supplied embeddings** (no server-side generation — the architecture has no JS runtime). Mirrored end-to-end: server + ts-client (`t.vector(n)`, `vectorIndex(...)`, `.vectorSearch(...)`) + rust-client (`FieldType::vector(n)`, `vector_index(...)`, `.vector_search(...)`); the dev and prod Postgres image is `pgvector/pgvector:pg17` (a prod redeploy is required for it to work live — the image change ships here but is inert until deployed). |
 | 18 | 3 | **Data browser dashboard** | ✅ full dashboard | ❌ | Med | L | Read/write table browser SPA over the admin API (could itself run on par-rt-db). Convex's dashboard is a real DX advantage; `psql` is the stopgap. |
 | 19 | 3 | **Client test harness** (in-memory fake) | ✅ `convex-test` | ✅ | Med | M | Implemented (ts-client) — `InMemoryRtDbClient` (`src/in_memory.ts`) mirrors the server's schema/query/txn/step-result semantics with no network and no Postgres: `pushSchema`, `query`, `mutate` (with `mutId` idempotency), `subscribe` (reactive), cursor keyset pagination, system fields merged at read time, atomic rollback on step failure. Reuses `protocol.ts` types. Deferred gaps (additive schema evolution) marked as TODOs. Pure coverage in `in_memory.test.ts`. |
 | 20 | 3 | **Per-row authorization rules** | ✅ arbitrary code in functions | ❌ allowlist = full access | Med–High | XL | Needs a declarative rule DSL (e.g. owner-field match) enforced on query, mutate, *and* subscription re-run. Only matters for multi-user apps where users must not see each other's rows — the kanban model doesn't. Deserves its own spec when needed. |
@@ -107,23 +107,28 @@ retry), **#5** (cursor pagination), **#8** (session-expiry enforcement), **#9**
 (scheduled txns), **#10** (cron jobs), **#11** (full-text search), **#12**
 (optimistic updates), **#14** (OAuth provider trait + Google), **#15** (db-side
 `filter()`); and tier-3 **#19** (in-memory client test harness), **#16** (file
-storage). **#9/#10** landed as one per-db `scheduled_txns` side table drained
+storage), **#17** (vector search). **#9/#10** landed as one per-db `scheduled_txns` side table drained
 through the committer by a per-db scheduler timer (`scheduler.rs` + the
 `RunScheduled` committer arm) — at-least-once delivery, one-shot catches up if
 past due, cron skips missed windows. **#16** is a per-db `bytea` `storage`
 table + global `storage_index` for opaque public-serve resolution — both public
 (`GET /storage/{id}`, no auth) and authed serve, plus upload/delete/metadata;
-HTTP-only (not reactive), Postgres-native by design. The Rust client is
+HTTP-only (not reactive), Postgres-native by design. **#17** is pgvector-backed
+semantic search: a `Vector` field type + a vector index (write-maintained
+`vector(N)` column `v_<index>` + HNSW `vector_cosine_ops`) + a reactive
+`vectorSearch` terminal ranking by cosine distance (`<=>`) with an optional
+eq-`filter` over declared `filterFields` (limit ≤256); embeddings are
+client-supplied (no server-side generation), and the Postgres image is now
+`pgvector/pgvector:pg17` (dev + prod). The Rust client is
 feature-complete (`http` + reactive `ws` + `admin` + index/`mutate_with_retry`
-helpers + `.filter()`/`.search()` builders + storage), and the TS client mirrors
-it (`.filter()`/`.search()` + `searchIndex` + storage) — all three clients share
-one wire contract for db-side `filter()` and full-text search, and the storage
+helpers + `.filter()`/`.search()`/`.vector_search()` builders + storage), and the TS client mirrors
+it (`.filter()`/`.search()` + `.vectorSearch()` + `searchIndex` + `vectorIndex` + `t.vector` + storage) — all three clients share
+one wire contract for db-side `filter()`, full-text search, and vector search, and the storage
 HTTP surface.
 
-Remaining gaps, in value order: **#17 (vector search)**, **#18 (data-browser
-dashboard)**, and **#20 (per-row auth rules)**.
+Remaining gaps, in value order: **#18 (data-browser dashboard)** and **#20 (per-row auth rules)**.
 
-Client parity for db-side `filter()` and full-text search is now complete: the
-TS `.filter()`/`.search()` query builders + `searchIndex` schema declaration
-landed in commit 4a66c87, so both the ts-client and rust-client mirror the
+Client parity for db-side `filter()`, full-text search, and vector search is complete: the
+TS `.filter()`/`.search()`/`.vectorSearch()` query builders + `searchIndex`/`vectorIndex` schema declarations
+landed (commit 4a66c87 for filter/search; #17 for vector), so both the ts-client and rust-client mirror the
 server wire contract. No open client-parity follow-ups remain on those surfaces.

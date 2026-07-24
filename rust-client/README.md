@@ -21,11 +21,13 @@ Crate name: `par-rt-db-client` → in Rust, `use par_rt_db_client::...`.
 no features. `[lints.rust] warnings = "deny"` — same zero-warning posture as the
 server.
 
-The `http` surface also carries `.filter()` / `.search()` query builders
-(predicate + full-text terminals), the `mutate_with_retry` precondition-conflict
-helper, `upsert_by_index` / `find_one_by_index` shortcuts, and
-`validate_session_token` for session validation. `search_index()` declares a
-full-text index in a `Schema`.
+The `http` surface also carries `.filter()` / `.search()` / `.vector_search()`
+query builders (predicate, full-text, and vector-similarity terminals), the
+`mutate_with_retry` precondition-conflict helper, `upsert_by_index` /
+`find_one_by_index` shortcuts, and `validate_session_token` for session
+validation. `search_index()` declares a full-text index in a `Schema`, and
+`vector_index()` declares a pgvector-backed vector index (write-maintained
+`vector(N)` column + HNSW cosine; embeddings are client-supplied).
 
 ## Quick start (HTTP)
 
