@@ -11,7 +11,7 @@ use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio::time::{Instant, interval};
 
 use crate::AppState;
-use crate::auth::{Principal, authed_user, authorize, owner_of, resolve_bearer};
+use crate::auth::{Principal, authed_user, authorize, is_admin, owner_of, resolve_bearer};
 use crate::db::now_ms;
 use crate::error::{ErrorCode, RtDbError};
 use crate::protocol::{ClientMessage, ServerMessage};
@@ -102,7 +102,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
     let conn_id = next_conn_id();
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<ServerMessage>();
 
-    let Some((principal, db)) = authenticate(&mut socket, &state).await else {
+    let Some((principal, db, admin)) = authenticate(&mut socket, &state).await else {
         return;
     };
     state.metrics.ws_connect();
@@ -135,6 +135,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                             &state,
                             &principal,
                             &db,
+                            admin,
                             conn_id,
                             &out_tx,
                             &mut rate_limiter,
@@ -177,11 +178,13 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
 /// frames — a client that opens with a keepalive isn't penalized) for the
 /// first data frame and requires it to be a valid `Auth` message; any other
 /// outcome (timeout, wrong message, bad frame) sends `AuthErr` and closes.
-/// Returns the resolved principal and authorized database name on success.
+/// Returns the resolved principal, authorized database name, and whether the
+/// principal is a server-wide dashboard admin (an admin bypasses the per-db
+/// `authorize` check on the handshake and on every Subscribe/Mutate).
 async fn authenticate(
     socket: &mut WebSocket,
     state: &Arc<AppState>,
-) -> Option<(Principal, String)> {
+) -> Option<(Principal, String, bool)> {
     let deadline = Instant::now() + AUTH_TIMEOUT;
     let text = loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -230,7 +233,12 @@ async fn authenticate(
             return None;
         }
     };
-    if let Err(err) = authorize(&state.pool, &principal, &db).await {
+    // Admin OAuth sessions are authorized for every database (dashboard live
+    // tables). `is_admin` is computed once here — the bearer is fixed for the
+    // connection — and threaded to every Subscribe/Mutate so each op re-applies
+    // the bypass without another lookup. Machine principals are never admin.
+    let admin = is_admin(&state.pool, &principal).await;
+    if !admin && let Err(err) = authorize(&state.pool, &principal, &db).await {
         fail_and_close(socket, err).await;
         return None;
     }
@@ -243,7 +251,7 @@ async fn authenticate(
         return None;
     }
 
-    Some((principal, db))
+    Some((principal, db, admin))
 }
 
 /// Validates and dispatches one post-auth text frame. Returns whether the
@@ -256,16 +264,17 @@ async fn authenticate(
 /// can be revoked mid-session (e.g. an allowlist removal) — and on failure
 /// the operation errors (e.g. `SubscribeErr`/`MutateErr`) without closing
 /// the connection.
-// A3's `principal` param pushes this past clippy's default 7-argument
-// threshold; every param is independently needed by a different message
-// arm, so bundling them into a context struct would add indirection without
-// reducing coupling.
+// A3's `principal` param (and the Phase 5 `admin` flag) push this past
+// clippy's default 7-argument threshold; every param is independently needed
+// by a different message arm, so bundling them into a context struct would
+// add indirection without reducing coupling.
 #[allow(clippy::too_many_arguments)]
 async fn handle_text_frame(
     socket: &mut WebSocket,
     state: &Arc<AppState>,
     principal: &Principal,
     db: &str,
+    admin: bool,
     conn_id: ConnId,
     out_tx: &UnboundedSender<ServerMessage>,
     rate_limiter: &mut RateLimiter,
@@ -295,18 +304,23 @@ async fn handle_text_frame(
             true
         }
         ClientMessage::Subscribe { query_id, query } => {
-            match authorize(&state.pool, principal, db).await {
+            let authed = if admin {
+                Ok(())
+            } else {
+                authorize(&state.pool, principal, db).await
+            };
+            match authed {
                 Ok(()) => {
+                    // Admins subscribe with owner=None (see every row); everyone
+                    // else is scoped to owner_of(principal).
+                    let owner = if admin {
+                        None
+                    } else {
+                        owner_of(principal).map(|s| s.to_string())
+                    };
                     if let Err(error) = state
                         .committers
-                        .subscribe(
-                            db,
-                            conn_id,
-                            query_id.clone(),
-                            *query,
-                            out_tx.clone(),
-                            owner_of(principal).map(|s| s.to_string()),
-                        )
+                        .subscribe(db, conn_id, query_id.clone(), *query, out_tx.clone(), owner)
                         .await
                     {
                         let _ = out_tx.send(ServerMessage::SubscribeErr { query_id, error });
@@ -329,28 +343,48 @@ async fn handle_text_frame(
             idempotency_key,
             txn,
         } => {
-            match authorize(&state.pool, principal, db).await {
-                Ok(()) => match state
-                    .committers
-                    .mutate(
-                        db,
-                        idempotency_key,
-                        txn,
-                        owner_of(principal).map(|s| s.to_string()),
-                    )
-                    .await
-                {
-                    Ok(outcome) => {
-                        state.metrics.record_mutation();
-                        let _ = out_tx.send(ServerMessage::MutateOk {
+            let authed = if admin {
+                Ok(())
+            } else {
+                authorize(&state.pool, principal, db).await
+            };
+            match authed {
+                Ok(()) => {
+                    // Same admin guardrail as the HTTP data-browser path: reject
+                    // an over-cap mutation before it reaches the committer.
+                    let cap = state.config.max_affected_docs;
+                    if admin && txn.steps.len() > cap {
+                        let _ = out_tx.send(ServerMessage::MutateErr {
                             mut_id,
-                            results: outcome.results,
+                            error: RtDbError::bad_request(format!(
+                                "mutation has {} step(s), exceeding the limit of {cap}",
+                                txn.steps.len()
+                            )),
                         });
+                        return false;
                     }
-                    Err(error) => {
-                        let _ = out_tx.send(ServerMessage::MutateErr { mut_id, error });
+                    let owner = if admin {
+                        None
+                    } else {
+                        owner_of(principal).map(|s| s.to_string())
+                    };
+                    match state
+                        .committers
+                        .mutate(db, idempotency_key, txn, owner)
+                        .await
+                    {
+                        Ok(outcome) => {
+                            state.metrics.record_mutation();
+                            let _ = out_tx.send(ServerMessage::MutateOk {
+                                mut_id,
+                                results: outcome.results,
+                            });
+                        }
+                        Err(error) => {
+                            let _ = out_tx.send(ServerMessage::MutateErr { mut_id, error });
+                        }
                     }
-                },
+                }
                 Err(error) => {
                     let _ = out_tx.send(ServerMessage::MutateErr { mut_id, error });
                 }

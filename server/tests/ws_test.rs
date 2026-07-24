@@ -3,7 +3,7 @@ mod common;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use common::{admin_post, fresh_db, spawn_app, test_state};
+use common::{admin_post, fresh_db, mint_user_session, spawn_app, test_state};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio::net::TcpStream;
@@ -640,5 +640,76 @@ async fn pause_and_resume_over_ws() -> anyhow::Result<()> {
     .await;
     let ack = recv_json(&mut ws).await;
     assert_eq!(ack["ok"], json!(true));
+    Ok(())
+}
+
+// --- Phase 5: /sync admin bypass -----------------------------------------
+
+// An admin OAuth session is admitted to a database it is NOT allowlisted for
+// (is_admin bypasses authorize at the handshake); a non-admin is rejected.
+#[tokio::test]
+async fn admin_ws_bypasses_authorize_for_any_db() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let suffix = uuid::Uuid::now_v7().simple();
+    let admin_email = format!("wsadmin-{suffix}@example.com");
+    let admin_tok = mint_user_session(&pool, &format!("u-wsadmin-{suffix}"), &admin_email).await;
+    sqlx::query("INSERT INTO rtdb_auth.admins (email, github_id, added_at) VALUES ($1, NULL, $2)")
+        .bind(&admin_email)
+        .bind(rtdb_server::db::now_ms())
+        .execute(&pool)
+        .await?;
+
+    // Admin: admitted even though not allowlisted for `db`.
+    let mut ws = ws_connect(addr).await;
+    let msg = auth(&mut ws, &admin_tok, &db).await;
+    assert_eq!(msg["type"], json!("authOk"));
+
+    // Non-admin (no admins row, not allowlisted): rejected + closed 4401.
+    let stranger_tok = mint_user_session(
+        &pool,
+        &format!("u-stranger-{suffix}"),
+        &format!("stranger-{suffix}@example.com"),
+    )
+    .await;
+    let mut ws2 = ws_connect(addr).await;
+    let msg = auth(&mut ws2, &stranger_tok, &db).await;
+    assert_eq!(msg["type"], json!("authErr"));
+    expect_close_with_code(&mut ws2, 4401).await;
+    Ok(())
+}
+
+// An admin can Subscribe over /sync to a database they're not allowlisted for
+// (the per-op authorize is bypassed): the subscription returns its initial
+// queryUpdate, not a subscribeErr.
+#[tokio::test]
+async fn admin_ws_subscribe_bypasses_authorize() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let suffix = uuid::Uuid::now_v7().simple();
+    let admin_email = format!("wssub-{suffix}@example.com");
+    let admin_tok = mint_user_session(&pool, &format!("u-wssub-{suffix}"), &admin_email).await;
+    sqlx::query("INSERT INTO rtdb_auth.admins (email, github_id, added_at) VALUES ($1, NULL, $2)")
+        .bind(&admin_email)
+        .bind(rtdb_server::db::now_ms())
+        .execute(&pool)
+        .await?;
+
+    let mut ws = ws_connect(addr).await;
+    let msg = auth(&mut ws, &admin_tok, &db).await;
+    assert_eq!(msg["type"], json!("authOk"));
+
+    send_json(
+        &mut ws,
+        json!({"type": "subscribe", "queryId": "q1", "query": {"table": "workItems"}}),
+    )
+    .await;
+    let msg = recv_json(&mut ws).await;
+    assert_eq!(msg["type"], json!("queryUpdate"));
+    assert_eq!(msg["queryId"], json!("q1"));
     Ok(())
 }
