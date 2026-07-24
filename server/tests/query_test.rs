@@ -155,6 +155,7 @@ async fn get_by_id_returns_doc_with_system_fields() -> anyhow::Result<()> {
             paginate: None,
             filter: None,
             search: None,
+            vector_search: None,
         },
     )
     .await?;
@@ -204,6 +205,7 @@ async fn get_missing_returns_null() -> anyhow::Result<()> {
             paginate: None,
             filter: None,
             search: None,
+            vector_search: None,
         },
     )
     .await?;
@@ -244,6 +246,7 @@ async fn get_combined_with_index_is_bad_request() -> anyhow::Result<()> {
             paginate: None,
             filter: None,
             search: None,
+            vector_search: None,
         },
     )
     .await
@@ -287,6 +290,7 @@ async fn get_combined_with_paginate_is_bad_request() -> anyhow::Result<()> {
             }),
             filter: None,
             search: None,
+            vector_search: None,
         },
     )
     .await
@@ -327,6 +331,7 @@ async fn unique_combined_with_take_is_bad_request() -> anyhow::Result<()> {
             paginate: None,
             filter: None,
             search: None,
+            vector_search: None,
         },
     )
     .await
@@ -368,6 +373,7 @@ async fn full_eq_compound_index_orders_by_created_at_asc() -> anyhow::Result<()>
             paginate: None,
             filter: None,
             search: None,
+            vector_search: None,
         },
     )
     .await?;
@@ -407,6 +413,7 @@ async fn full_eq_compound_index_order_desc_reverses() -> anyhow::Result<()> {
             paginate: None,
             filter: None,
             search: None,
+            vector_search: None,
         },
     )
     .await?;
@@ -448,6 +455,7 @@ async fn prefix_eq_on_compound_index_sorts_by_remaining_index_field_then_created
             paginate: None,
             filter: None,
             search: None,
+            vector_search: None,
         },
     )
     .await?;
@@ -496,6 +504,7 @@ async fn unique_on_by_name_returns_single_doc() -> anyhow::Result<()> {
             paginate: None,
             filter: None,
             search: None,
+            vector_search: None,
         },
     )
     .await?;
@@ -541,6 +550,7 @@ async fn unique_with_duplicate_name_is_precondition_failed() -> anyhow::Result<(
             paginate: None,
             filter: None,
             search: None,
+            vector_search: None,
         },
     )
     .await
@@ -582,6 +592,7 @@ async fn no_index_collect_returns_all_docs_in_created_at_order() -> anyhow::Resu
             paginate: None,
             filter: None,
             search: None,
+            vector_search: None,
         },
     )
     .await?;
@@ -621,6 +632,7 @@ async fn take_over_cap_is_bad_request() -> anyhow::Result<()> {
             paginate: None,
             filter: None,
             search: None,
+            vector_search: None,
         },
     )
     .await
@@ -661,6 +673,7 @@ async fn unknown_index_is_bad_request() -> anyhow::Result<()> {
             paginate: None,
             filter: None,
             search: None,
+            vector_search: None,
         },
     )
     .await
@@ -701,6 +714,7 @@ async fn eq_longer_than_index_fields_is_bad_request() -> anyhow::Result<()> {
             paginate: None,
             filter: None,
             search: None,
+            vector_search: None,
         },
     )
     .await
@@ -739,6 +753,7 @@ async fn unknown_table_is_not_found() -> anyhow::Result<()> {
             paginate: None,
             filter: None,
             search: None,
+            vector_search: None,
         },
     )
     .await
@@ -779,6 +794,7 @@ async fn take_zero_returns_empty_docs() -> anyhow::Result<()> {
             paginate: None,
             filter: None,
             search: None,
+            vector_search: None,
         },
     )
     .await?;
@@ -816,6 +832,7 @@ async fn unique_without_index_scans_whole_table() -> anyhow::Result<()> {
         paginate: None,
         filter: None,
         search: None,
+        vector_search: None,
     };
 
     let result = execute_query(&pool, &db, &schema, &unique_query).await?;
@@ -864,6 +881,7 @@ async fn canonical_is_stable_for_identical_results() -> anyhow::Result<()> {
         paginate: None,
         filter: None,
         search: None,
+        vector_search: None,
     };
 
     let first = execute_query(&pool, &db, &schema, &query).await?;
@@ -906,6 +924,7 @@ async fn range_gt_excludes_boundary_and_sorts_by_bound_field() -> anyhow::Result
             paginate: None,
             filter: None,
             search: None,
+            vector_search: None,
         },
     )
     .await?;
@@ -948,6 +967,7 @@ async fn range_gte_includes_boundary() -> anyhow::Result<()> {
             paginate: None,
             filter: None,
             search: None,
+            vector_search: None,
         },
     )
     .await?;
@@ -996,6 +1016,7 @@ async fn range_gt_and_lt_bounded_numeric_range() -> anyhow::Result<()> {
             paginate: None,
             filter: None,
             search: None,
+            vector_search: None,
         },
     )
     .await?;
@@ -1038,6 +1059,7 @@ async fn range_bounded_numeric_range_with_order_desc_and_take() -> anyhow::Resul
             paginate: None,
             filter: None,
             search: None,
+            vector_search: None,
         },
     )
     .await?;
@@ -1077,6 +1099,7 @@ async fn range_without_eq_prefix_applies_to_first_index_field() -> anyhow::Resul
             paginate: None,
             filter: None,
             search: None,
+            vector_search: None,
         },
     )
     .await?;
@@ -1119,6 +1142,7 @@ async fn range_gt_and_gte_both_set_is_bad_request() -> anyhow::Result<()> {
             paginate: None,
             filter: None,
             search: None,
+            vector_search: None,
         },
     )
     .await
@@ -1159,6 +1183,7 @@ async fn range_lt_and_lte_both_set_is_bad_request() -> anyhow::Result<()> {
             paginate: None,
             filter: None,
             search: None,
+            vector_search: None,
         },
     )
     .await
@@ -1199,6 +1224,7 @@ async fn range_without_index_is_bad_request() -> anyhow::Result<()> {
             paginate: None,
             filter: None,
             search: None,
+            vector_search: None,
         },
     )
     .await
@@ -1239,6 +1265,7 @@ async fn range_with_no_remaining_index_field_is_bad_request() -> anyhow::Result<
             paginate: None,
             filter: None,
             search: None,
+            vector_search: None,
         },
     )
     .await
@@ -1279,6 +1306,7 @@ async fn range_combined_with_get_is_bad_request() -> anyhow::Result<()> {
             paginate: None,
             filter: None,
             search: None,
+            vector_search: None,
         },
     )
     .await
@@ -1319,6 +1347,7 @@ async fn range_value_wrong_type_is_bad_request() -> anyhow::Result<()> {
             paginate: None,
             filter: None,
             search: None,
+            vector_search: None,
         },
     )
     .await
@@ -1359,6 +1388,7 @@ async fn range_lte_includes_boundary_value() -> anyhow::Result<()> {
             paginate: None,
             filter: None,
             search: None,
+            vector_search: None,
         },
     )
     .await?;
@@ -1403,6 +1433,7 @@ async fn first_on_no_matching_docs_returns_null() -> anyhow::Result<()> {
             paginate: None,
             filter: None,
             search: None,
+            vector_search: None,
         },
     )
     .await?;
@@ -1442,6 +1473,7 @@ async fn first_with_single_matching_doc_returns_it() -> anyhow::Result<()> {
             paginate: None,
             filter: None,
             search: None,
+            vector_search: None,
         },
     )
     .await?;
@@ -1488,6 +1520,7 @@ async fn first_combined_with_range_bound_returns_smallest_in_ascending_order() -
             paginate: None,
             filter: None,
             search: None,
+            vector_search: None,
         },
     )
     .await?;
@@ -1532,6 +1565,7 @@ async fn first_combined_with_range_bound_and_order_desc_returns_largest() -> any
             paginate: None,
             filter: None,
             search: None,
+            vector_search: None,
         },
     )
     .await?;
@@ -1576,6 +1610,7 @@ async fn first_combined_with_take_is_bad_request() -> anyhow::Result<()> {
             paginate: None,
             filter: None,
             search: None,
+            vector_search: None,
         },
     )
     .await
@@ -1616,6 +1651,7 @@ async fn first_combined_with_unique_is_bad_request() -> anyhow::Result<()> {
             paginate: None,
             filter: None,
             search: None,
+            vector_search: None,
         },
     )
     .await
@@ -1656,6 +1692,7 @@ async fn first_combined_with_get_is_bad_request() -> anyhow::Result<()> {
             paginate: None,
             filter: None,
             search: None,
+            vector_search: None,
         },
     )
     .await
@@ -1698,6 +1735,7 @@ async fn count_on_empty_table_returns_zero() -> anyhow::Result<()> {
             paginate: None,
             filter: None,
             search: None,
+            vector_search: None,
         },
     )
     .await?;
@@ -1737,6 +1775,7 @@ async fn count_with_eq_prefix_counts_matching_subset() -> anyhow::Result<()> {
             paginate: None,
             filter: None,
             search: None,
+            vector_search: None,
         },
     )
     .await?;
@@ -1776,6 +1815,7 @@ async fn count_with_range_bound_counts_matching_subset() -> anyhow::Result<()> {
             paginate: None,
             filter: None,
             search: None,
+            vector_search: None,
         },
     )
     .await?;
@@ -1815,6 +1855,7 @@ async fn count_combined_with_order_is_bad_request() -> anyhow::Result<()> {
             paginate: None,
             filter: None,
             search: None,
+            vector_search: None,
         },
     )
     .await
@@ -1855,6 +1896,7 @@ async fn count_combined_with_take_is_bad_request() -> anyhow::Result<()> {
             paginate: None,
             filter: None,
             search: None,
+            vector_search: None,
         },
     )
     .await
@@ -1895,6 +1937,7 @@ async fn count_combined_with_unique_is_bad_request() -> anyhow::Result<()> {
             paginate: None,
             filter: None,
             search: None,
+            vector_search: None,
         },
     )
     .await
@@ -1935,6 +1978,7 @@ async fn count_combined_with_first_is_bad_request() -> anyhow::Result<()> {
             paginate: None,
             filter: None,
             search: None,
+            vector_search: None,
         },
     )
     .await
@@ -1975,6 +2019,7 @@ async fn count_combined_with_get_is_bad_request() -> anyhow::Result<()> {
             paginate: None,
             filter: None,
             search: None,
+            vector_search: None,
         },
     )
     .await
@@ -2013,6 +2058,7 @@ fn paginate_query(
         paginate: Some(paginate),
         filter: None,
         search: None,
+        vector_search: None,
     }
 }
 

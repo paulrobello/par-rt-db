@@ -2,6 +2,7 @@ mod common;
 
 use common::test_state;
 use rtdb_server::ddl::push_schema;
+use rtdb_server::query::{Query, QueryResult, execute_query};
 use rtdb_server::schema::{FieldType, IndexDef, SchemaDef, TableDef, VectorIndexSpec};
 use rtdb_server::txn::{Step, Transaction, execute_txn};
 use sqlx::Row;
@@ -247,4 +248,229 @@ async fn patch_maintains_vector_column() {
     .await
     .expect("read vector column after patch");
     assert_eq!(row.0.as_deref(), Some("[4,5,6]"));
+}
+
+/// Task 6: vectorSearch ranks rows by cosine distance (`<=>`) ascending and
+/// honors `limit`. With query `[1,0,0]` and rows `[1,0,0]`/`[0,1,0]`/`[0.9,0.4,0]`,
+/// the closest two are `[1,0,0]` (distance 0) and `[0.9,0.4,0]` (~0.21); the
+/// omitted row is `[0,1,0]` (distance 1) — confirming ranking, not insertion.
+#[tokio::test]
+async fn vector_search_ranks_by_cosine_and_applies_limit() {
+    let state = test_state().await;
+    let db = vec_db(&state).await;
+    let schema = vector_schema(3, false);
+    for emb in [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.9, 0.4, 0.0]] {
+        execute_txn(
+            &state.pool,
+            &db,
+            &schema,
+            &Transaction {
+                steps: vec![Step::Insert {
+                    table: "docs".into(),
+                    doc: vec_doc(emb.to_vec()),
+                }],
+            },
+        )
+        .await
+        .expect("insert vector doc");
+    }
+    let q = serde_json::from_value::<Query>(serde_json::json!({
+        "table": "docs",
+        "vectorSearch": {"index": "by_embedding", "vector": [1.0, 0.0, 0.0], "limit": 2}
+    }))
+    .expect("parse vectorSearch query");
+    let res = execute_query(&state.pool, &db, &schema, &q)
+        .await
+        .expect("execute vectorSearch");
+    let docs = match res {
+        QueryResult::Docs(d) => d,
+        _ => panic!("expected Docs"),
+    };
+    assert_eq!(docs.len(), 2, "limit honored");
+    assert_eq!(
+        docs[0]["embedding"],
+        serde_json::json!([1.0, 0.0, 0.0]),
+        "identical vector ranks first"
+    );
+    assert_eq!(
+        docs[1]["embedding"],
+        serde_json::json!([0.9, 0.4, 0.0]),
+        "second-closest ranks next; the farthest ([0,1,0]) is omitted"
+    );
+}
+
+/// `vectorSearch` rejects a query vector whose length differs from the index's
+/// declared dimensions. Otherwise pgvector would 500 at query time.
+#[tokio::test]
+async fn vector_search_rejects_length_mismatch() {
+    let state = test_state().await;
+    let db = vec_db(&state).await;
+    let schema = vector_schema(3, false);
+    let q = serde_json::from_value::<Query>(serde_json::json!({
+        "table": "docs",
+        "vectorSearch": {"index": "by_embedding", "vector": [1.0, 0.0], "limit": 1}
+    }))
+    .expect("parse vectorSearch query");
+    let err = execute_query(&state.pool, &db, &schema, &q)
+        .await
+        .expect_err("length mismatch should be rejected");
+    assert!(
+        err.message.contains("dimensions"),
+        "message names dimensions: {}",
+        err.message
+    );
+}
+
+/// Naming an unknown or non-vector index is a clear BadRequest, never a 500.
+#[tokio::test]
+async fn vector_search_rejects_unknown_index() {
+    let state = test_state().await;
+    let db = vec_db(&state).await;
+    let schema = vector_schema(3, false);
+    let q = serde_json::from_value::<Query>(serde_json::json!({
+        "table": "docs",
+        "vectorSearch": {"index": "nope", "vector": [1.0, 0.0, 0.0], "limit": 1}
+    }))
+    .expect("parse vectorSearch query");
+    let err = execute_query(&state.pool, &db, &schema, &q)
+        .await
+        .expect_err("unknown index should be rejected");
+    assert!(
+        err.message.contains("vector index 'nope' not found"),
+        "message names the missing index: {}",
+        err.message
+    );
+}
+
+/// `limit` outside `1..=256` is a BadRequest — pin the constant so a future
+/// bump is a conscious decision, not silent drift.
+#[tokio::test]
+async fn vector_search_rejects_out_of_range_limit() {
+    let state = test_state().await;
+    let db = vec_db(&state).await;
+    let schema = vector_schema(3, false);
+    let q = serde_json::from_value::<Query>(serde_json::json!({
+        "table": "docs",
+        "vectorSearch": {"index": "by_embedding", "vector": [1.0, 0.0, 0.0], "limit": 0}
+    }))
+    .expect("parse vectorSearch query");
+    assert!(execute_query(&state.pool, &db, &schema, &q).await.is_err());
+    let q_hi = serde_json::from_value::<Query>(serde_json::json!({
+        "table": "docs",
+        "vectorSearch": {"index": "by_embedding", "vector": [1.0, 0.0, 0.0], "limit": 257}
+    }))
+    .expect("parse vectorSearch query");
+    let err = execute_query(&state.pool, &db, &schema, &q_hi)
+        .await
+        .expect_err("limit > 256 should be rejected");
+    assert!(
+        err.message.contains("vectorSearch limit"),
+        "message names the limit cap: {}",
+        err.message
+    );
+}
+
+/// `filter` restricts to rows matching the eq-map over the index's declared
+/// filterFields. Two identical embeddings under different `userId`s, filtered
+/// to one, must return exactly that one.
+#[tokio::test]
+async fn vector_search_applies_eq_filter() {
+    let state = test_state().await;
+    let db = format!("t{}", uuid::Uuid::now_v7().simple());
+    rtdb_server::db::create_database(&state.pool, &db)
+        .await
+        .expect("create database");
+    push_schema(&state.pool, &db, vector_schema(3, true))
+        .await
+        .expect("push vector schema with filterField");
+    let schema = vector_schema(3, true);
+    for (user_id, emb) in [("a", [1.0, 0.0, 0.0]), ("b", [1.0, 0.0, 0.0])] {
+        let mut doc = vec_doc(emb.to_vec());
+        doc.insert("userId".to_string(), serde_json::json!(user_id));
+        execute_txn(
+            &state.pool,
+            &db,
+            &schema,
+            &Transaction {
+                steps: vec![Step::Insert {
+                    table: "docs".into(),
+                    doc,
+                }],
+            },
+        )
+        .await
+        .expect("insert vector doc with userId");
+    }
+    let q = serde_json::from_value::<Query>(serde_json::json!({
+        "table": "docs",
+        "vectorSearch": {
+            "index": "by_embedding",
+            "vector": [1.0, 0.0, 0.0],
+            "limit": 10,
+            "filter": {"userId": "a"}
+        }
+    }))
+    .expect("parse vectorSearch query");
+    let res = execute_query(&state.pool, &db, &schema, &q)
+        .await
+        .expect("execute vectorSearch with filter");
+    let docs = match res {
+        QueryResult::Docs(d) => d,
+        _ => panic!("expected Docs"),
+    };
+    assert_eq!(docs.len(), 1, "filter restricts to userId=a");
+    assert_eq!(docs[0]["userId"], "a");
+}
+
+/// `vectorSearch` cannot be combined with any other terminal — the `take`
+/// combination is the subtle one (vectorSearch carries its own limit), so pin
+/// it explicitly.
+#[tokio::test]
+async fn vector_search_rejects_combination_with_take() {
+    let state = test_state().await;
+    let db = vec_db(&state).await;
+    let schema = vector_schema(3, false);
+    let q = serde_json::from_value::<Query>(serde_json::json!({
+        "table": "docs",
+        "vectorSearch": {"index": "by_embedding", "vector": [1.0, 0.0, 0.0], "limit": 1},
+        "take": 5
+    }))
+    .expect("parse vectorSearch query");
+    let err = execute_query(&state.pool, &db, &schema, &q)
+        .await
+        .expect_err("vectorSearch + take should be rejected");
+    assert!(
+        err.message.contains("cannot be combined"),
+        "message calls out the combination: {}",
+        err.message
+    );
+}
+
+/// Wire shape: `vectorSearch` (camelCase), `vector` as JSON array, optional
+/// `filter` map. Round-trips through serde and the snake_case form never
+/// appears on the wire.
+#[test]
+fn vector_search_wire_round_trips() {
+    let q = serde_json::from_value::<Query>(serde_json::json!({
+        "table": "docs",
+        "vectorSearch": {"index": "by_embedding", "vector": [0.1, 0.2], "limit": 5, "filter": {"userId": "u1"}}
+    }))
+    .expect("parse vectorSearch query");
+    let back = serde_json::to_value(&q).expect("serialize query");
+    assert_eq!(back["vectorSearch"]["index"], "by_embedding");
+    assert_eq!(back["vectorSearch"]["limit"], 5);
+    assert_eq!(back["vectorSearch"]["filter"]["userId"], "u1");
+    // camelCase on the wire; the snake_case Rust field never appears.
+    assert!(back.get("vector_search").is_none());
+    // Empty filter is skipped on serialize (default + skip_serializing_if).
+    let q_no_filter = serde_json::from_value::<Query>(serde_json::json!({
+        "table": "docs",
+        "vectorSearch": {"index": "by_embedding", "vector": [0.1, 0.2], "limit": 5}
+    }))
+    .expect("parse vectorSearch query without filter");
+    let back_nf = serde_json::to_value(&q_no_filter).expect("serialize query");
+    assert!(
+        back_nf["vectorSearch"].get("filter").is_none(),
+        "empty filter should be omitted on the wire"
+    );
 }

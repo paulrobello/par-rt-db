@@ -1,7 +1,9 @@
+use std::collections::BTreeMap;
+
 use sqlx::PgPool;
 
 use crate::db::validate_db_name;
-use crate::ddl::{pg_col, pg_schema, pg_search_col, pg_table};
+use crate::ddl::{pg_col, pg_schema, pg_search_col, pg_table, pg_vector_col};
 use crate::error::RtDbError;
 use crate::pagination::{decode_cursor, encode_cursor};
 use crate::schema::{FieldType, IndexDef, SchemaDef, TableDef};
@@ -10,6 +12,9 @@ use crate::txn::{EqBind, eq_bind_for, eq_binds};
 /// Hard cap on rows returned by a single query, whether via an explicit
 /// `take` or a `take`-less collect.
 const MAX_TAKE: u32 = 4096;
+
+/// Hard cap on `vectorSearch` `limit`.
+const VECTOR_SEARCH_MAX_LIMIT: u32 = 256;
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -52,6 +57,8 @@ pub struct Query {
     pub filter: Option<FilterExpr>, // additional WHERE predicate over doc fields; composes with index/order/take/cursor
     #[serde(default)]
     pub search: Option<SearchQuery>, // full-text search terminal: ranks by ts_rank over a search index's tsvector; composes with take
+    #[serde(default, rename = "vectorSearch")]
+    pub vector_search: Option<VectorSearchQuery>, // vector-similarity terminal: ranks by cosine distance over a vector index; carries its own limit
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -69,6 +76,20 @@ pub struct Paginate {
 pub struct SearchQuery {
     pub index: String,
     pub query: String,
+}
+
+/// A vector-similarity terminal over a declared vector index. `vector` is the
+/// caller-supplied query embedding (length must equal the index dimensions);
+/// ranked by cosine distance (`<=>`) ascending. `filter` is an optional eq-map
+/// over the index's declared `filterFields`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct VectorSearchQuery {
+    pub index: String,
+    pub vector: Vec<f32>,
+    pub limit: u32,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub filter: BTreeMap<String, serde_json::Value>,
 }
 
 /// A db-side predicate appended to a query's WHERE clause. Leaves compare one
@@ -179,9 +200,10 @@ pub async fn execute_query(
             || q.paginate.is_some()
             || q.filter.is_some()
             || q.search.is_some()
+            || q.vector_search.is_some()
         {
             return Err(RtDbError::bad_request(
-                "get cannot be combined with index, eq, range bounds, order, take, unique, first, count, paginate, filter, or search",
+                "get cannot be combined with index, eq, range bounds, order, take, unique, first, count, paginate, filter, search, or vector search",
             ));
         }
         return point_read(pool, db, &q.table, id).await;
@@ -264,6 +286,32 @@ pub async fn execute_query(
         )));
     }
 
+    // Vector-similarity terminal. Incompatible with every other terminal; it
+    // carries its own `limit` and does not compose with `take` (or anything
+    // else). Resolution and bind construction live in `execute_vector_search`.
+    if let Some(vs) = &q.vector_search {
+        if q.index.is_some()
+            || !q.eq.is_empty()
+            || q.gt.is_some()
+            || q.gte.is_some()
+            || q.lt.is_some()
+            || q.lte.is_some()
+            || q.order.is_some()
+            || q.unique
+            || q.first
+            || q.count
+            || q.paginate.is_some()
+            || q.filter.is_some()
+            || q.search.is_some()
+            || q.take.is_some()
+        {
+            return Err(RtDbError::bad_request(
+                "vectorSearch cannot be combined with any other terminal",
+            ));
+        }
+        return execute_vector_search(pool, db, table_def, &q.table, vs).await;
+    }
+
     // Full-text search terminal. It ranks over a search index's tsvector and is
     // incompatible with every index-based terminal; `take` (already capped) is
     // the only field it composes with.
@@ -280,9 +328,10 @@ pub async fn execute_query(
             || q.count
             || q.paginate.is_some()
             || q.filter.is_some()
+            || q.vector_search.is_some()
         {
             return Err(RtDbError::bad_request(
-                "search cannot be combined with index, eq, range bounds, order, unique, first, count, paginate, or filter",
+                "search cannot be combined with index, eq, range bounds, order, unique, first, count, paginate, filter, or vector search",
             ));
         }
         return execute_search(pool, db, table_def, &q.table, search, q.take).await;
@@ -896,6 +945,129 @@ async fn execute_search(
     let rows = sqlx::query_as::<_, (String, serde_json::Value, i64, i64)>(&sql)
         .bind(&search.query)
         .bind(i64::from(limit))
+        .fetch_all(pool)
+        .await?;
+    let docs = rows
+        .into_iter()
+        .map(|(id, doc, created_at, version)| merge_doc(id, doc, created_at, version))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(QueryResult::Docs(docs))
+}
+
+/// Vector-similarity terminal: ranks rows by cosine distance (`<=>`) between
+/// the index's `v_<index>` column and the query vector, ascending, limited to
+/// `limit`. Optional `filter` eq-binds over the index's declared `filterFields`.
+/// Unknown index / length mismatch / unknown filter key / out-of-range limit
+/// → `BadRequest`. Bind order: filter eq-binds occupy `$1..$k`, the query
+/// vector is `$(k+1)::vector`, and `limit` is `$(k+2)`.
+async fn execute_vector_search(
+    pool: &PgPool,
+    db: &str,
+    table_def: &TableDef,
+    table_name: &str,
+    vs: &VectorSearchQuery,
+) -> Result<QueryResult, RtDbError> {
+    let index_def = table_def
+        .indexes
+        .iter()
+        .find(|index| index.name == vs.index && index.vector.is_some())
+        .ok_or_else(|| RtDbError::bad_request(format!("vector index '{}' not found", vs.index)))?;
+    // Unreachable given the find predicate above, but keep the error path
+    // explicit instead of panicking on a future predicate change.
+    let vec_spec = index_def
+        .vector
+        .as_ref()
+        .ok_or_else(|| RtDbError::internal("matched vector index has no vector spec"))?;
+
+    if vs.vector.len() != vec_spec.dimensions as usize {
+        return Err(RtDbError::bad_request(format!(
+            "vectorSearch vector length {} != index '{}' dimensions {}",
+            vs.vector.len(),
+            vs.index,
+            vec_spec.dimensions
+        )));
+    }
+    if !(1..=VECTOR_SEARCH_MAX_LIMIT).contains(&vs.limit) {
+        return Err(RtDbError::bad_request(format!(
+            "vectorSearch limit must be 1..={VECTOR_SEARCH_MAX_LIMIT}"
+        )));
+    }
+
+    // Build eq-binds for any filter entries; each key must be a declared
+    // filterField of this index. The field's declared `FieldType` types the
+    // value the same way `eq` prefixes are typed in `txn::eq_bind_for`.
+    let mut filter_binds: Vec<EqBind> = Vec::new();
+    let mut filter_cols: Vec<String> = Vec::new();
+    for (key, value) in &vs.filter {
+        if !vec_spec.filter_fields.iter().any(|f| f == key) {
+            return Err(RtDbError::bad_request(format!(
+                "vectorSearch filter key '{key}' is not a declared filterField of index '{}'",
+                vs.index
+            )));
+        }
+        let field_type = table_def.fields.get(key).ok_or_else(|| {
+            RtDbError::internal(format!("filterField '{key}' missing from table fields"))
+        })?;
+        filter_binds.push(eq_bind_for(field_type, value)?);
+        filter_cols.push(pg_col(key));
+    }
+
+    let v_col = pg_vector_col(&index_def.name);
+    let pg_schema_name = pg_schema(db);
+    let table_ident = pg_table(table_name);
+
+    // pgvector accepts the text form `[a,b,c]` for a `::vector`-cast bind.
+    let qvec_text = format!(
+        "[{}]",
+        vs.vector
+            .iter()
+            .map(|f| f.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+
+    // Bind numbering: filter eq-binds first ($1..$k), then the query vector
+    // ($k+1, cast to `vector`), then `limit` ($k+2). The WHERE clause always
+    // excludes rows whose vector column is NULL, so undimensioned rows never
+    // surface as bogus nearest-neighbors.
+    let mut bind_idx = 1usize;
+    let mut filter_placeholders: Vec<String> = Vec::with_capacity(filter_cols.len());
+    for _ in &filter_cols {
+        filter_placeholders.push(format!("${bind_idx}"));
+        bind_idx += 1;
+    }
+    let qvec_ph = bind_idx;
+    bind_idx += 1;
+    let limit_ph = bind_idx;
+
+    let mut where_clause = format!("\"{v_col}\" IS NOT NULL");
+    if !filter_cols.is_empty() {
+        let conds: Vec<String> = filter_cols
+            .iter()
+            .zip(filter_placeholders.iter())
+            .map(|(col, ph)| format!("\"{col}\" = {ph}"))
+            .collect();
+        where_clause = format!("{where_clause} AND {}", conds.join(" AND "));
+    }
+
+    let sql = format!(
+        "SELECT \"id\", \"doc\", \"created_at\", \"version\" FROM \"{pg_schema_name}\".\"{table_ident}\" \
+         WHERE {where_clause} \
+         ORDER BY \"{v_col}\" <=> ${qvec_ph}::vector \
+         LIMIT ${limit_ph}"
+    );
+
+    let mut query = sqlx::query_as::<_, (String, serde_json::Value, i64, i64)>(&sql);
+    for bind in filter_binds {
+        query = match bind {
+            EqBind::Text(v) => query.bind(v),
+            EqBind::Num(v) => query.bind(v),
+            EqBind::Bool(v) => query.bind(v),
+        };
+    }
+    let rows = query
+        .bind(qvec_text)
+        .bind(i64::from(vs.limit))
         .fetch_all(pool)
         .await?;
     let docs = rows
