@@ -399,7 +399,7 @@ async fn handle_subscribe(
     tx: UnboundedSender<ServerMessage>,
 ) -> Result<(), RtDbError> {
     let schema = ctx.schemas.get(&ctx.pool, &ctx.db).await?;
-    let result = execute_query(&ctx.pool, &ctx.db, &schema, &query).await?;
+    let result = execute_query(&ctx.pool, &ctx.db, &schema, &query, None).await?;
     let last = canonical(&result);
     let value = serde_json::to_value(&result).unwrap_or_else(|err| {
         tracing::error!(error = %err, "failed to serialize initial query result");

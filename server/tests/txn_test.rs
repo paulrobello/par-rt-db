@@ -255,6 +255,7 @@ async fn insert_strips_explicit_null_optional_field() -> anyhow::Result<()> {
             search: None,
             vector_search: None,
         },
+        None,
     )
     .await?;
     match query_result {

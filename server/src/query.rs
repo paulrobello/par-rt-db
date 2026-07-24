@@ -181,9 +181,11 @@ pub async fn execute_query(
     db: &str,
     schema: &SchemaDef,
     q: &Query,
+    owner: Option<&str>,
 ) -> Result<QueryResult, RtDbError> {
     validate_db_name(db)?;
     let table_def = schema.table(&q.table)?;
+    let owner_field = table_def.owner_field.as_deref();
 
     if let Some(id) = &q.get {
         if q.index.is_some()
@@ -206,7 +208,7 @@ pub async fn execute_query(
                 "get cannot be combined with index, eq, range bounds, order, take, unique, first, count, paginate, filter, search, or vector search",
             ));
         }
-        return point_read(pool, db, &q.table, id).await;
+        return point_read(pool, db, &q.table, id, owner_field, owner).await;
     }
 
     if q.unique && (q.take.is_some() || q.order.is_some()) {
@@ -401,8 +403,13 @@ pub async fn execute_query(
 
     // `filter` is an additional WHERE predicate composed after the eq/range
     // conditions. It binds after the eq+range binds, so the LIMIT and cursor
-    // placeholder offsets below account for `filter_binds.len()`.
-    let filter_binds: Vec<EqBind> = match &q.filter {
+    // placeholder offsets below account for `filter_binds.len()`. When the
+    // caller is an authenticated user and the table declares an `ownerField`,
+    // `owner_filter` wraps the client filter with a server-side equality
+    // predicate so the user sees only their own rows; bypass callers (`None`)
+    // and tables without an `ownerField` get the original filter back unchanged.
+    let effective_filter = owner_filter(q.filter.as_ref(), owner_field, owner);
+    let filter_binds: Vec<EqBind> = match &effective_filter {
         Some(filter) => {
             let (fragment, binds) =
                 compile_filter(filter, table_def, eq_len + range_binds.len() + 1)?;
@@ -1090,6 +1097,8 @@ async fn point_read(
     db: &str,
     table_name: &str,
     id: &str,
+    owner_field: Option<&str>,
+    owner: Option<&str>,
 ) -> Result<QueryResult, RtDbError> {
     let pg_schema_name = pg_schema(db);
     let table_ident = pg_table(table_name);
@@ -1101,10 +1110,48 @@ async fn point_read(
     .await?;
 
     match row {
-        Some((id, doc, created_at, version)) => Ok(QueryResult::Doc(Some(merge_doc(
-            id, doc, created_at, version,
-        )?))),
+        Some((id, doc, created_at, version)) => {
+            // Per-row: a user may only point-read a doc they own. Silent
+            // filter (Convex-like) — unowned docs read as absent.
+            if let (Some(field), Some(uid)) = (owner_field, owner)
+                && doc.get(field).and_then(|v| v.as_str()) != Some(uid)
+            {
+                return Ok(QueryResult::Doc(None));
+            }
+            Ok(QueryResult::Doc(Some(merge_doc(
+                id, doc, created_at, version,
+            )?)))
+        }
         None => Ok(QueryResult::Doc(None)),
+    }
+}
+
+/// Wraps the client-supplied `filter` with the owner equality predicate when
+/// the table declares an `ownerField` and the caller is a user (`owner`).
+/// Bypass callers (`None`) and tables without an `ownerField` get the original
+/// filter back unchanged — no enforcement. The owner value is `$n`-bound by
+/// `compile_filter`, never interpolated into SQL.
+fn owner_filter(
+    client_filter: Option<&FilterExpr>,
+    owner_field: Option<&str>,
+    owner: Option<&str>,
+) -> Option<FilterExpr> {
+    match (client_filter, owner_field, owner) {
+        (Some(f), Some(field), Some(uid)) => Some(FilterExpr::And {
+            exprs: vec![
+                f.clone(),
+                FilterExpr::Eq {
+                    field: field.to_string(),
+                    value: serde_json::Value::String(uid.to_string()),
+                },
+            ],
+        }),
+        (None, Some(field), Some(uid)) => Some(FilterExpr::Eq {
+            field: field.to_string(),
+            value: serde_json::Value::String(uid.to_string()),
+        }),
+        (Some(f), _, _) => Some(f.clone()),
+        (None, _, _) => None,
     }
 }
 

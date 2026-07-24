@@ -265,7 +265,7 @@ async fn poll_for_n(
     };
     let deadline = Instant::now() + timeout;
     loop {
-        if let Ok(QueryResult::Docs(docs)) = execute_query(pool, db, schema, &query).await
+        if let Ok(QueryResult::Docs(docs)) = execute_query(pool, db, schema, &query, None).await
             && !docs.is_empty()
         {
             return true;

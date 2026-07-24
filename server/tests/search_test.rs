@@ -112,6 +112,7 @@ async fn search_returns_ranked_results() {
         &db,
         &schema,
         &search_query("search_content", "database"),
+        None,
     )
     .await
     .expect("search");
@@ -146,7 +147,9 @@ async fn search_with_take_limits_results() {
         "take": 1
     }))
     .expect("query");
-    let res = execute_query(pool, &db, &schema, &q).await.expect("search");
+    let res = execute_query(pool, &db, &schema, &q, None)
+        .await
+        .expect("search");
     let titles = titles(&res);
     assert_eq!(titles.len(), 1);
     assert_eq!(titles[0], "frequent hits");
@@ -165,6 +168,7 @@ async fn search_with_no_matches_returns_empty() {
         &db,
         &schema,
         &search_query("search_content", "supercalifragilistic"),
+        None,
     )
     .await
     .expect("search");
@@ -176,9 +180,15 @@ async fn search_with_no_matches_returns_empty() {
 async fn search_unknown_index_is_bad_request() {
     let state = test_state().await;
     let (db, schema) = fresh_search_db(&state).await;
-    let err = execute_query(&state.pool, &db, &schema, &search_query("nope", "database"))
-        .await
-        .expect_err("unknown index");
+    let err = execute_query(
+        &state.pool,
+        &db,
+        &schema,
+        &search_query("nope", "database"),
+        None,
+    )
+    .await
+    .expect_err("unknown index");
     assert_eq!(err.code, ErrorCode::BadRequest);
     assert!(err.message.contains("search index 'nope' not found"));
 }
@@ -194,6 +204,7 @@ async fn search_btree_index_is_bad_request() {
         &db,
         &schema,
         &search_query("by_title", "database"),
+        None,
     )
     .await
     .expect_err("btree used as search");
@@ -210,6 +221,7 @@ async fn search_empty_query_is_bad_request() {
         &db,
         &schema,
         &search_query("search_content", "   "),
+        None,
     )
     .await
     .expect_err("empty query");
@@ -228,7 +240,7 @@ async fn search_combined_with_index_is_bad_request() {
         "index": "by_title"
     }))
     .expect("query");
-    let err = execute_query(&state.pool, &db, &schema, &q)
+    let err = execute_query(&state.pool, &db, &schema, &q, None)
         .await
         .expect_err("search + index");
     assert_eq!(err.code, ErrorCode::BadRequest);
@@ -272,6 +284,7 @@ async fn adding_search_index_backfills_existing_rows() {
         &db,
         &search_schema(),
         &search_query("search_content", "database"),
+        None,
     )
     .await
     .expect("search");

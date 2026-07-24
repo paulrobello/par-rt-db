@@ -308,7 +308,7 @@ async fn vector_search_ranks_by_cosine_and_applies_limit() {
         "vectorSearch": {"index": "by_embedding", "vector": [1.0, 0.0, 0.0], "limit": 2}
     }))
     .expect("parse vectorSearch query");
-    let res = execute_query(&state.pool, &db, &schema, &q)
+    let res = execute_query(&state.pool, &db, &schema, &q, None)
         .await
         .expect("execute vectorSearch");
     let docs = match res {
@@ -340,7 +340,7 @@ async fn vector_search_rejects_length_mismatch() {
         "vectorSearch": {"index": "by_embedding", "vector": [1.0, 0.0], "limit": 1}
     }))
     .expect("parse vectorSearch query");
-    let err = execute_query(&state.pool, &db, &schema, &q)
+    let err = execute_query(&state.pool, &db, &schema, &q, None)
         .await
         .expect_err("length mismatch should be rejected");
     assert!(
@@ -371,7 +371,7 @@ async fn vector_search_rejects_non_finite_query_vector() {
             }),
             ..empty_query()
         };
-        let err = execute_query(&state.pool, &db, &schema, &q)
+        let err = execute_query(&state.pool, &db, &schema, &q, None)
             .await
             .expect_err("non-finite query vector should be rejected");
         assert_eq!(
@@ -424,7 +424,7 @@ async fn vector_search_rejects_unknown_index() {
         "vectorSearch": {"index": "nope", "vector": [1.0, 0.0, 0.0], "limit": 1}
     }))
     .expect("parse vectorSearch query");
-    let err = execute_query(&state.pool, &db, &schema, &q)
+    let err = execute_query(&state.pool, &db, &schema, &q, None)
         .await
         .expect_err("unknown index should be rejected");
     assert!(
@@ -446,7 +446,7 @@ async fn vector_search_rejects_out_of_range_limit() {
         "vectorSearch": {"index": "by_embedding", "vector": [1.0, 0.0, 0.0], "limit": 0}
     }))
     .expect("parse vectorSearch query");
-    let err = execute_query(&state.pool, &db, &schema, &q)
+    let err = execute_query(&state.pool, &db, &schema, &q, None)
         .await
         .expect_err("limit < 1 should be rejected");
     assert!(
@@ -459,7 +459,7 @@ async fn vector_search_rejects_out_of_range_limit() {
         "vectorSearch": {"index": "by_embedding", "vector": [1.0, 0.0, 0.0], "limit": 257}
     }))
     .expect("parse vectorSearch query");
-    let err = execute_query(&state.pool, &db, &schema, &q_hi)
+    let err = execute_query(&state.pool, &db, &schema, &q_hi, None)
         .await
         .expect_err("limit > 256 should be rejected");
     assert!(
@@ -510,7 +510,7 @@ async fn vector_search_applies_eq_filter() {
         }
     }))
     .expect("parse vectorSearch query");
-    let res = execute_query(&state.pool, &db, &schema, &q)
+    let res = execute_query(&state.pool, &db, &schema, &q, None)
         .await
         .expect("execute vectorSearch with filter");
     let docs = match res {
@@ -535,7 +535,7 @@ async fn vector_search_rejects_combination_with_take() {
         "take": 5
     }))
     .expect("parse vectorSearch query");
-    let err = execute_query(&state.pool, &db, &schema, &q)
+    let err = execute_query(&state.pool, &db, &schema, &q, None)
         .await
         .expect_err("vectorSearch + take should be rejected");
     assert!(

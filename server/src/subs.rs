@@ -148,7 +148,7 @@ impl SubscriptionManager {
                 continue;
             }
 
-            let result = match execute_query(pool, db, schema, &entry.query).await {
+            let result = match execute_query(pool, db, schema, &entry.query, None).await {
                 Ok(result) => result,
                 Err(err) => {
                     tracing::warn!(

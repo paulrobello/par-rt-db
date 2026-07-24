@@ -9,7 +9,7 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
 use crate::AppState;
-use crate::auth::{authorize, resolve_bearer};
+use crate::auth::{authorize, owner_of, resolve_bearer};
 use crate::db::now_ms;
 use crate::error::RtDbError;
 use crate::protocol::{ScheduleInfo, ScheduleWhen};
@@ -68,7 +68,14 @@ async fn query_handler(
     authorize(&state.pool, &principal, &body.db).await?;
 
     let schema = state.schemas.get(&state.pool, &body.db).await?;
-    let result = execute_query(&state.pool, &body.db, &schema, &body.query).await?;
+    let result = execute_query(
+        &state.pool,
+        &body.db,
+        &schema,
+        &body.query,
+        owner_of(&principal),
+    )
+    .await?;
     Ok(Json(QueryResponse { result }))
 }
 
