@@ -13,7 +13,9 @@ use subtle::ConstantTimeEq;
 
 use crate::error::RtDbError;
 use crate::http_api::ApiJson;
+use crate::query::{Query, QueryResult, execute_query};
 use crate::schema::SchemaDef;
+use crate::txn::Transaction;
 use crate::{AppState, auth, db, ddl, snapshot};
 
 /// Who an admin request was made as: the raw admin key (CLI/automation) or an
@@ -375,6 +377,79 @@ async fn get_schema(
     Ok(Json((*schema).clone()))
 }
 
+#[derive(Deserialize)]
+struct AdminQueryRequest {
+    query: Query,
+}
+
+#[derive(Serialize)]
+struct AdminQueryResponse {
+    result: QueryResult,
+}
+
+/// `POST /admin/db/{db}/query` — admin document read. `owner = None` bypasses
+/// per-row `ownerField`, so an admin sees every row in every table.
+async fn admin_query(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(db): Path<String>,
+    ApiJson(body): ApiJson<AdminQueryRequest>,
+) -> Result<Json<AdminQueryResponse>, RtDbError> {
+    require_admin(&state, &headers).await?;
+    if !db::database_exists(&state.pool, &db).await? {
+        return Err(RtDbError::not_found("unknown database"));
+    }
+    let schema = state.schemas.get(&state.pool, &db).await?;
+    let result = execute_query(&state.pool, &db, &schema, &body.query, None).await?;
+    state.metrics.record_query();
+    Ok(Json(AdminQueryResponse { result }))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AdminMutateRequest {
+    txn: Transaction,
+    #[serde(default)]
+    idempotency_key: Option<String>,
+}
+
+#[derive(Serialize)]
+struct AdminMutateResponse {
+    results: Vec<serde_json::Value>,
+}
+
+/// `POST /admin/db/{db}/mutate` — admin document write through the existing
+/// committer with `owner = None`. The step-count cap is the server-side
+/// guardrail: each step touches at most one document, so rejecting over-cap
+/// here guarantees an over-cap mutation never reaches the committer (never
+/// becomes durable).
+async fn admin_mutate(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(db): Path<String>,
+    ApiJson(body): ApiJson<AdminMutateRequest>,
+) -> Result<Json<AdminMutateResponse>, RtDbError> {
+    require_admin(&state, &headers).await?;
+    if !db::database_exists(&state.pool, &db).await? {
+        return Err(RtDbError::not_found("unknown database"));
+    }
+    let cap = state.config.max_affected_docs;
+    if body.txn.steps.len() > cap {
+        return Err(RtDbError::bad_request(format!(
+            "mutation has {} step(s), exceeding the limit of {cap}",
+            body.txn.steps.len()
+        )));
+    }
+    let outcome = state
+        .committers
+        .mutate(&db, body.idempotency_key, body.txn, None)
+        .await?;
+    state.metrics.record_mutation();
+    Ok(Json(AdminMutateResponse {
+        results: outcome.results,
+    }))
+}
+
 #[derive(Serialize)]
 struct TokenRow {
     id: String,
@@ -734,6 +809,8 @@ pub fn admin_routes() -> Router<Arc<AppState>> {
         )
         .route("/admin/dbs/{db}/schema", get(get_schema))
         .route("/admin/dbs/{db}/stats", get(db_stats))
+        .route("/admin/db/{db}/query", post(admin_query))
+        .route("/admin/db/{db}/mutate", post(admin_mutate))
         .route("/admin/metrics", get(metrics_handler))
         .route("/admin/config", get(get_config).patch(patch_config))
         .route("/admin/ops/recent", get(ops_recent))

@@ -281,6 +281,7 @@ mod tests {
             github_api_url: "https://api.github.com".into(),
             google_client_id: None,
             google_client_secret: None,
+            max_affected_docs: 100,
         };
         assert!(GoogleProvider::from_config(&cfg).is_none());
         cfg.google_client_id = Some("id".into());

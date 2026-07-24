@@ -750,3 +750,130 @@ async fn config_cors_hot_reloads_allowed_origins() -> anyhow::Result<()> {
         .await?;
     Ok(())
 }
+
+// --- Phase 5: admin document access --------------------------------------
+
+fn owner_schema_json() -> serde_json::Value {
+    serde_json::json!({"tables":{"notes":{"fields":{
+        "title":{"type":"string"},
+        "userId":{"type":"string"}
+    },"indexes":[{"name":"by_user","fields":["userId"]}],"ownerField":"userId"}}})
+}
+
+fn items_schema_json() -> serde_json::Value {
+    serde_json::json!({"tables":{"items":{"fields":{
+        "name":{"type":"string"}
+    },"indexes":[{"name":"by_name","fields":["name"]}]}}})
+}
+
+/// Seeds a `notes` row whose `userId` (the owner field) is `uid`, via the
+/// test-direct executor (owner=None; the field value carries the ownership).
+async fn seed_owned_note(
+    pool: &sqlx::PgPool,
+    db: &str,
+    schema: &rtdb_server::schema::SchemaDef,
+    title: &str,
+    uid: &str,
+) {
+    let mut doc = serde_json::Map::new();
+    doc.insert("title".into(), title.into());
+    doc.insert("userId".into(), uid.into());
+    rtdb_server::txn::execute_txn(
+        pool,
+        db,
+        schema,
+        &rtdb_server::txn::Transaction {
+            steps: vec![rtdb_server::txn::Step::Insert {
+                table: "notes".into(),
+                doc,
+            }],
+        },
+        None,
+    )
+    .await
+    .unwrap();
+}
+
+// Admin document read uses owner=None, so it sees every row on an ownerField
+// table regardless of owner (a scoped user query would see only their own).
+#[tokio::test]
+async fn admin_query_bypasses_per_row_owner() -> anyhow::Result<()> {
+    let state = common::test_state().await;
+    let addr = common::spawn_app(state.clone()).await;
+    let pool = state.pool.clone();
+    let db = format!("t{}", uuid::Uuid::now_v7().simple());
+    rtdb_server::db::create_database(&pool, &db).await?;
+    let schema =
+        rtdb_server::ddl::push_schema(&pool, &db, serde_json::from_value(owner_schema_json())?)
+            .await?;
+    seed_owned_note(&pool, &db, &schema, "alice's note", "alice").await;
+    seed_owned_note(&pool, &db, &schema, "bob's note", "bob").await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/admin/db/{db}/query"))
+        .header("Authorization", "Bearer test-admin-key")
+        .json(&serde_json::json!({"query":{"table":"notes"}}))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await?;
+    let mut titles: Vec<String> = body["result"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["title"].as_str().unwrap().to_string())
+        .collect();
+    titles.sort();
+    assert_eq!(
+        titles,
+        vec!["alice's note".to_string(), "bob's note".to_string()]
+    );
+    Ok(())
+}
+
+// Admin document write goes through the committer (owner=None); an over-cap
+// mutation (steps > RTDB_MAX_AFFECTED_DOCS, default 100) is rejected before it
+// reaches the committer, so it writes nothing.
+#[tokio::test]
+async fn admin_mutate_writes_and_cap_rejects() -> anyhow::Result<()> {
+    let state = common::test_state().await;
+    let addr = common::spawn_app(state.clone()).await;
+    let pool = state.pool.clone();
+    let db = format!("t{}", uuid::Uuid::now_v7().simple());
+    rtdb_server::db::create_database(&pool, &db).await?;
+    rtdb_server::ddl::push_schema(&pool, &db, serde_json::from_value(items_schema_json())?).await?;
+    let bearer = "Bearer test-admin-key";
+
+    // A single-step insert succeeds and is durable.
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/admin/db/{db}/mutate"))
+        .header("Authorization", bearer)
+        .json(&serde_json::json!({"txn":{"steps":[{"op":"insert","table":"items","doc":{"name":"first"}}]}}))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    // 101 insert steps > default cap 100 -> 400.
+    let steps: Vec<serde_json::Value> = (0..101)
+        .map(|i| serde_json::json!({"op":"insert","table":"items","doc":{"name":format!("n{i}")}}))
+        .collect();
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/admin/db/{db}/mutate"))
+        .header("Authorization", bearer)
+        .json(&serde_json::json!({"txn":{"steps":steps}}))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    // The over-cap batch wrote nothing: still exactly one item.
+    let q: serde_json::Value = reqwest::Client::new()
+        .post(format!("http://{addr}/admin/db/{db}/query"))
+        .header("Authorization", bearer)
+        .json(&serde_json::json!({"query":{"table":"items"}}))
+        .send()
+        .await?
+        .json()
+        .await?;
+    assert_eq!(q["result"].as_array().unwrap().len(), 1);
+    Ok(())
+}

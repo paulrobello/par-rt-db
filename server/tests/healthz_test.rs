@@ -14,6 +14,7 @@ fn test_config() -> Config {
         github_api_url: "https://api.github.com".into(),
         google_client_id: None,
         google_client_secret: None,
+        max_affected_docs: 100,
     }
 }
 

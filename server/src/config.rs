@@ -14,6 +14,7 @@ pub struct Config {
     pub github_api_url: String,               // RTDB_GITHUB_API_URL, default https://api.github.com
     pub google_client_id: Option<String>,     // RTDB_GOOGLE_CLIENT_ID
     pub google_client_secret: Option<String>, // RTDB_GOOGLE_CLIENT_SECRET
+    pub max_affected_docs: usize, // RTDB_MAX_AFFECTED_DOCS, default 100 (admin data-browser guardrail)
 }
 
 impl Config {
@@ -47,6 +48,11 @@ impl Config {
         let google_client_id = std::env::var("RTDB_GOOGLE_CLIENT_ID").ok();
         let google_client_secret = std::env::var("RTDB_GOOGLE_CLIENT_SECRET").ok();
 
+        let max_affected_docs = match std::env::var("RTDB_MAX_AFFECTED_DOCS") {
+            Ok(v) => v.parse::<usize>().unwrap_or(100),
+            Err(_) => 100,
+        };
+
         Ok(Self {
             port,
             database_url,
@@ -58,6 +64,7 @@ impl Config {
             github_api_url,
             google_client_id,
             google_client_secret,
+            max_affected_docs,
         })
     }
 }
