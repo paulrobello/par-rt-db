@@ -497,3 +497,62 @@ async fn collect_subscription_still_reruns_on_table_write() -> anyhow::Result<()
     }
     Ok(())
 }
+
+// Deleting the document a get(id) subscription reads must still push the
+// (now-absent) result — the point-read skip must never drop a delete of the
+// subscribed document. Locks in the soundness property directly.
+#[tokio::test]
+async fn get_subscription_updates_when_its_doc_is_deleted() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let db = fresh_db(&state).await;
+
+    let insert = state
+        .committers
+        .mutate(&db, None, insert_work_item("backlog", 1.0))
+        .await?;
+    let id = insert.results[0]["id"]
+        .as_str()
+        .expect("insert id")
+        .to_string();
+
+    let get_query: Query = serde_json::from_value(serde_json::json!({
+        "table": "workItems",
+        "get": id,
+    }))
+    .expect("parse get query");
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let conn = next_conn_id();
+    state
+        .committers
+        .subscribe(&db, conn, "q1".to_string(), get_query, tx)
+        .await?;
+    rx.try_recv().expect("initial query update");
+
+    state
+        .committers
+        .mutate(
+            &db,
+            None,
+            Transaction {
+                steps: vec![Step::Delete {
+                    table: "workItems".to_string(),
+                    id: id.clone(),
+                }],
+            },
+        )
+        .await?;
+
+    let msg = rx
+        .try_recv()
+        .expect("update after deleting the subscribed doc");
+    match msg {
+        ServerMessage::QueryUpdate { query_id, result } => {
+            assert_eq!(query_id, "q1");
+            assert!(result.is_null(), "get of a deleted doc is null");
+        }
+        other => panic!("expected QueryUpdate, got {other:?}"),
+    }
+    assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+    Ok(())
+}
