@@ -35,6 +35,24 @@ pub struct IndexDef {
     /// deserialize unchanged.
     #[serde(default, skip_serializing_if = "is_false")]
     pub search: bool,
+    /// When present, marks this as a vector index: `fields[0]` must name a
+    /// `Vector { dimensions }` field whose dimensions match `vector.dimensions`,
+    /// and `filter_fields` (if any) must be scalar-indexable columns used to
+    /// pre-filter nearest-neighbor queries. Omitted on the wire for btree/search
+    /// indexes, so existing schemas deserialize unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vector: Option<VectorIndexSpec>,
+}
+
+/// Declaration of a vector (approximate nearest-neighbor) index. Carried
+/// alongside the btree/search knobs on `IndexDef`. Wire shape is camelCase
+/// (`filterFields`) to match the rest of the protocol.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VectorIndexSpec {
+    pub dimensions: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub filter_fields: Vec<String>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -212,6 +230,60 @@ impl TableDef {
                     "index '{}' on table '{table_name}' has no fields",
                     index.name
                 )));
+            }
+            // An index is exactly one of: btree, search, or vector. A vector
+            // index is validated here and skips the btree per-field loop below
+            // (its `fields[0]` is a Vector column, which is not btree-indexable).
+            if index.search && index.vector.is_some() {
+                return Err(RtDbError::schema(format!(
+                    "index '{}' cannot be both search and vector",
+                    index.name
+                )));
+            }
+            if let Some(vec_spec) = &index.vector {
+                if vec_spec.dimensions == 0 {
+                    return Err(RtDbError::schema(format!(
+                        "vector index '{}' must declare a positive dimensions count",
+                        index.name
+                    )));
+                }
+                if index.fields.len() != 1 {
+                    return Err(RtDbError::schema(format!(
+                        "vector index '{}' must declare exactly one vector field",
+                        index.name
+                    )));
+                }
+                let vfield = &index.fields[0];
+                let fty = self.fields.get(vfield).ok_or_else(|| {
+                    RtDbError::schema(format!(
+                        "vector index '{}' references unknown field '{vfield}'",
+                        index.name
+                    ))
+                })?;
+                match fty {
+                    FieldType::Vector { dimensions } if *dimensions == vec_spec.dimensions => {}
+                    _ => {
+                        return Err(RtDbError::schema(format!(
+                            "vector index '{}' field '{vfield}' must be Vector{{dimensions:{}}}",
+                            index.name, vec_spec.dimensions
+                        )));
+                    }
+                }
+                for ff in &vec_spec.filter_fields {
+                    let fty = self.fields.get(ff).ok_or_else(|| {
+                        RtDbError::schema(format!(
+                            "vector index '{}' filterField '{ff}' is not a declared field",
+                            index.name
+                        ))
+                    })?;
+                    if indexed_column_type(fty).is_err() {
+                        return Err(RtDbError::schema(format!(
+                            "vector index '{}' filterField '{ff}' must be a scalar indexable type",
+                            index.name
+                        )));
+                    }
+                }
+                continue;
             }
             let mut seen_fields = HashSet::new();
             for field_name in &index.fields {
@@ -529,6 +601,7 @@ mod tests {
                 name: index_name,
                 fields: vec!["name".to_string()],
                 search: false,
+                vector: None,
             }],
         };
         let schema = SchemaDef {
@@ -546,6 +619,7 @@ mod tests {
                 name: index_name,
                 fields: vec!["name".to_string()],
                 search: false,
+                vector: None,
             }],
         };
         let schema = SchemaDef {
@@ -578,11 +652,13 @@ mod tests {
                     name: "by_x".to_string(),
                     fields: vec!["name".to_string()],
                     search: false,
+                    vector: None,
                 },
                 IndexDef {
                     name: "By_X".to_string(),
                     fields: vec!["name".to_string()],
                     search: false,
+                    vector: None,
                 },
             ],
         };
@@ -630,6 +706,7 @@ mod tests {
                 name: "by_tags".to_string(),
                 fields: vec!["tags".to_string()],
                 search: false,
+                vector: None,
             }],
         };
         let schema = SchemaDef {
@@ -646,6 +723,7 @@ mod tests {
                 name: "by_nothing".to_string(),
                 fields: vec![],
                 search: false,
+                vector: None,
             }],
         };
         let schema = SchemaDef {
@@ -662,6 +740,7 @@ mod tests {
                 name: "by_name".to_string(),
                 fields: vec!["name".to_string(), "name".to_string()],
                 search: false,
+                vector: None,
             }],
         };
         let schema = SchemaDef {
@@ -679,11 +758,13 @@ mod tests {
                     name: "by_name".to_string(),
                     fields: vec!["name".to_string()],
                     search: false,
+                    vector: None,
                 },
                 IndexDef {
                     name: "by_name".to_string(),
                     fields: vec!["name".to_string()],
                     search: false,
+                    vector: None,
                 },
             ],
         };
@@ -701,6 +782,7 @@ mod tests {
                 name: "by-name".to_string(),
                 fields: vec!["name".to_string()],
                 search: false,
+                vector: None,
             }],
         };
         let schema = SchemaDef {
@@ -717,6 +799,7 @@ mod tests {
                 name: "by_missing".to_string(),
                 fields: vec!["missing".to_string()],
                 search: false,
+                vector: None,
             }],
         };
         let schema = SchemaDef {
@@ -1055,6 +1138,7 @@ mod tests {
                 name: "by_meta".to_string(),
                 fields: vec!["meta".to_string()],
                 search: false,
+                vector: None,
             }],
         };
         let schema = SchemaDef {
@@ -1106,6 +1190,7 @@ mod tests {
                 name: "search_count".to_string(),
                 fields: vec!["count".to_string()],
                 search: true,
+                vector: None,
             }],
         };
         let schema = SchemaDef {
@@ -1127,6 +1212,7 @@ mod tests {
                 name: "search_body".to_string(),
                 fields: vec!["body".to_string()],
                 search: true,
+                vector: None,
             }],
         };
         let schema = SchemaDef {
@@ -1170,5 +1256,116 @@ mod tests {
             &ty,
             &serde_json::json!([1.0, serde_json::Value::from(f64::NAN)])
         ));
+    }
+
+    // (j) Vector index declaration: `IndexDef.vector` carries dimensions and
+    // optional scalar filterFields; an ordinary btree index omits `vector`
+    // entirely on the wire.
+    #[test]
+    fn vector_index_round_trips_and_btree_omits_it() {
+        let json = serde_json::json!({
+            "name": "by_embedding",
+            "fields": ["embedding"],
+            "vector": {"dimensions": 4, "filterFields": ["userId"]}
+        });
+        let idx: IndexDef = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(idx.vector.as_ref().unwrap().dimensions, 4);
+        assert_eq!(
+            idx.vector.as_ref().unwrap().filter_fields,
+            vec!["userId".to_string()]
+        );
+        // round-trips byte-identical
+        assert_eq!(serde_json::to_value(&idx).unwrap(), json);
+
+        // a btree index omits `vector` entirely
+        let btree: IndexDef =
+            serde_json::from_value(serde_json::json!({"name":"by_name","fields":["name"]}))
+                .unwrap();
+        assert!(btree.vector.is_none());
+        assert!(
+            serde_json::to_value(&btree)
+                .unwrap()
+                .get("vector")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn vector_index_rejects_dimension_mismatch() {
+        let mut fields = BTreeMap::new();
+        fields.insert("embedding".to_string(), FieldType::Vector { dimensions: 4 });
+        let table = TableDef {
+            fields,
+            indexes: vec![IndexDef {
+                name: "by_emb".to_string(),
+                fields: vec!["embedding".to_string()],
+                search: false,
+                vector: Some(VectorIndexSpec {
+                    dimensions: 8,
+                    filter_fields: vec![],
+                }),
+            }],
+        };
+        assert!(table.validate_structure("docs").is_err());
+    }
+
+    #[test]
+    fn vector_index_accepts_matching_dims_and_filter_fields() {
+        let mut fields = BTreeMap::new();
+        fields.insert("embedding".to_string(), FieldType::Vector { dimensions: 4 });
+        fields.insert("userId".to_string(), FieldType::String);
+        let table = TableDef {
+            fields,
+            indexes: vec![IndexDef {
+                name: "by_emb".to_string(),
+                fields: vec!["embedding".to_string()],
+                search: false,
+                vector: Some(VectorIndexSpec {
+                    dimensions: 4,
+                    filter_fields: vec!["userId".to_string()],
+                }),
+            }],
+        };
+        assert!(table.validate_structure("docs").is_ok());
+    }
+
+    #[test]
+    fn vector_index_rejects_search_and_vector_both_set() {
+        let mut fields = BTreeMap::new();
+        fields.insert("embedding".to_string(), FieldType::Vector { dimensions: 4 });
+        let table = TableDef {
+            fields,
+            indexes: vec![IndexDef {
+                name: "by_emb".to_string(),
+                fields: vec!["embedding".to_string()],
+                search: true,
+                vector: Some(VectorIndexSpec {
+                    dimensions: 4,
+                    filter_fields: vec![],
+                }),
+            }],
+        };
+        assert!(table.validate_structure("docs").is_err());
+    }
+
+    // pgvector rejects `vector(0)` at DDL time; rejecting it here gives a clear
+    // schema error instead of a DB failure.
+    #[test]
+    fn vector_index_rejects_zero_dimensions() {
+        let mut fields = BTreeMap::new();
+        fields.insert("embedding".to_string(), FieldType::Vector { dimensions: 0 });
+        let table = TableDef {
+            fields,
+            indexes: vec![IndexDef {
+                name: "by_emb".to_string(),
+                fields: vec!["embedding".to_string()],
+                search: false,
+                vector: Some(VectorIndexSpec {
+                    dimensions: 0,
+                    filter_fields: vec![],
+                }),
+            }],
+        };
+        assert!(table.validate_structure("docs").is_err());
     }
 }
