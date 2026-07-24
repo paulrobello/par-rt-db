@@ -276,6 +276,84 @@ async fn import_db(
     }
 }
 
+#[derive(Serialize)]
+struct AdminMember {
+    email: String,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "githubId")]
+    github_id: Option<i64>,
+}
+
+#[derive(Serialize)]
+struct AdminsResponse {
+    admins: Vec<AdminMember>,
+}
+
+async fn list_admins(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<AdminsResponse>, RtDbError> {
+    require_admin(&state, &headers).await?;
+    let rows: Vec<(String, Option<i64>)> =
+        sqlx::query_as("SELECT email, github_id FROM rtdb_auth.admins ORDER BY email")
+            .fetch_all(&state.pool)
+            .await?;
+    Ok(Json(AdminsResponse {
+        admins: rows
+            .into_iter()
+            .map(|(email, github_id)| AdminMember { email, github_id })
+            .collect(),
+    }))
+}
+
+#[derive(Deserialize)]
+struct AddAdminRequest {
+    email: String,
+    #[serde(rename = "githubId")]
+    github_id: Option<i64>,
+}
+
+async fn add_admin(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    ApiJson(body): ApiJson<AddAdminRequest>,
+) -> Result<Json<OkResponse>, RtDbError> {
+    require_admin(&state, &headers).await?;
+    let email = body.email.trim().to_lowercase();
+    if email.is_empty() {
+        return Err(RtDbError::bad_request("email is required"));
+    }
+    // ON CONFLICT merge: keep any existing github_id if the new one is absent.
+    sqlx::query(
+        "INSERT INTO rtdb_auth.admins (email, github_id, added_at) VALUES ($1, $2, $3) \
+         ON CONFLICT (email) DO UPDATE SET \
+            github_id = COALESCE(EXCLUDED.github_id, rtdb_auth.admins.github_id)",
+    )
+    .bind(&email)
+    .bind(body.github_id)
+    .bind(crate::db::now_ms())
+    .execute(&state.pool)
+    .await?;
+    Ok(Json(OkResponse { ok: true }))
+}
+
+#[derive(Deserialize)]
+struct RemoveAdminRequest {
+    email: String,
+}
+
+async fn remove_admin(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    ApiJson(body): ApiJson<RemoveAdminRequest>,
+) -> Result<Json<OkResponse>, RtDbError> {
+    require_admin(&state, &headers).await?;
+    sqlx::query("DELETE FROM rtdb_auth.admins WHERE email = $1")
+        .bind(body.email.trim().to_lowercase())
+        .execute(&state.pool)
+        .await?;
+    Ok(Json(OkResponse { ok: true }))
+}
+
 /// Admin routes, all gated on `Authorization: Bearer <admin_key>` (constant-time
 /// compare).
 pub fn admin_routes() -> Router<Arc<AppState>> {
@@ -288,6 +366,10 @@ pub fn admin_routes() -> Router<Arc<AppState>> {
         .route(
             "/admin/allowlist",
             get(allowlist_list).post(allowlist_write),
+        )
+        .route(
+            "/admin/admins",
+            get(list_admins).post(add_admin).delete(remove_admin),
         )
         .route("/admin/export-db", get(export_db))
         .route("/admin/import-db", post(import_db))

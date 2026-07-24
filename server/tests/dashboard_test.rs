@@ -36,6 +36,11 @@ async fn seed_admin_emails_lowercases_and_is_idempotent() -> anyhow::Result<()> 
             ("foo@bar.com".to_string(), None),
         ]
     );
+    let blank_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM rtdb_auth.admins WHERE email = '  '")
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(blank_count, 0);
     Ok(())
 }
 
@@ -135,5 +140,80 @@ async fn admin_key_path_still_authorizes() -> anyhow::Result<()> {
     // /admin/admins is added in Task 3; use an existing route to prove the key path.
     let resp = common::admin_get(addr, "/admin/dbs").await;
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    Ok(())
+}
+
+// DELETE with an admin-key bearer + JSON body.
+async fn admin_delete(
+    addr: std::net::SocketAddr,
+    path: &str,
+    body: serde_json::Value,
+) -> reqwest::Response {
+    reqwest::Client::new()
+        .delete(format!("http://{addr}{path}"))
+        .header("Authorization", "Bearer test-admin-key")
+        .json(&body)
+        .send()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn admins_crud_round_trip() -> anyhow::Result<()> {
+    let state = common::test_state().await;
+    let addr = common::spawn_app(state).await;
+
+    // Add by email.
+    let resp = common::admin_post(
+        addr,
+        "/admin/admins",
+        serde_json::json!({"email": "Crew@Example.com"}),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    // Listed, lowercased. (Other parallel tests may add rows; assert membership.)
+    let body: serde_json::Value = common::admin_get(addr, "/admin/admins")
+        .await
+        .json()
+        .await?;
+    let emails: Vec<String> = body["admins"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|m| m["email"].as_str().map(String::from))
+        .collect();
+    assert!(emails.iter().any(|e| e == "crew@example.com"));
+
+    // Remove.
+    let resp = admin_delete(
+        addr,
+        "/admin/admins",
+        serde_json::json!({"email": "crew@example.com"}),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    let body: serde_json::Value = common::admin_get(addr, "/admin/admins")
+        .await
+        .json()
+        .await?;
+    let emails: Vec<String> = body["admins"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|m| m["email"].as_str().map(String::from))
+        .collect();
+    assert!(!emails.iter().any(|e| e == "crew@example.com"));
+    Ok(())
+}
+
+// Adding an admin with a blank email is a 400, not a silent no-op.
+#[tokio::test]
+async fn add_admin_requires_email() -> anyhow::Result<()> {
+    let state = common::test_state().await;
+    let addr = common::spawn_app(state).await;
+    let resp = common::admin_post(addr, "/admin/admins", serde_json::json!({"email": "  "})).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
     Ok(())
 }
