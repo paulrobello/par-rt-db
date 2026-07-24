@@ -45,6 +45,33 @@ pub struct RtDbHttpClient {
     client: reqwest::Client,
 }
 
+/// Result of [`RtDbHttpClient::upload`] — the server-computed file identity,
+/// content hash, size in bytes, and (if the upload carried one) the stored
+/// `contentType`. `contentType` is `#[serde(default)]` so an older server
+/// omitting the field deserializes to `None`.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UploadResult {
+    pub id: String,
+    pub sha256: String,
+    pub size: i64,
+    #[serde(default)]
+    pub content_type: Option<String>,
+}
+
+/// File metadata returned by [`RtDbHttpClient::get_file_metadata`]. Mirrors
+/// `UploadResult` plus the server-recorded `creationTime`.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileMetadata {
+    pub id: String,
+    pub sha256: String,
+    pub size: i64,
+    #[serde(default)]
+    pub content_type: Option<String>,
+    pub creation_time: i64,
+}
+
 impl RtDbHttpClient {
     pub fn new(url: &str, db: &str, token: &str) -> Self {
         let url = url.trim_end_matches('/').to_string();
@@ -336,6 +363,66 @@ impl RtDbHttpClient {
         Ok(parsed.schedules)
     }
 
+    /// Upload raw bytes; `content_type` sets the Content-Type header and is
+    /// stored as the file's type. Returns the server-computed metadata.
+    pub async fn upload(
+        &self,
+        bytes: &[u8],
+        content_type: Option<&str>,
+    ) -> Result<UploadResult, RtDbError> {
+        let mut req = self
+            .client
+            .post(format!("{}/api/storage/{}", self.url, self.db))
+            .bearer_auth(&self.token)
+            .body(bytes.to_vec());
+        if let Some(ct) = content_type {
+            req = req.header(reqwest::header::CONTENT_TYPE, ct);
+        }
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| RtDbError::internal(format!("upload request failed: {e}")))?;
+        self.deserialize::<UploadResult>(resp).await
+    }
+
+    pub async fn delete_file(&self, id: &str) -> Result<(), RtDbError> {
+        let resp = self
+            .client
+            .delete(format!("{}/api/storage/{}/{id}", self.url, self.db))
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(|e| RtDbError::internal(format!("delete file request failed: {e}")))?;
+        #[derive(serde::Deserialize)]
+        struct OkResp {
+            ok: bool,
+        }
+        let parsed = self.deserialize::<OkResp>(resp).await?;
+        if !parsed.ok {
+            return Err(RtDbError::internal("delete file returned ok=false"));
+        }
+        Ok(())
+    }
+
+    pub async fn get_file_metadata(&self, id: &str) -> Result<FileMetadata, RtDbError> {
+        let resp = self
+            .client
+            .get(format!(
+                "{}/api/storage/{}/{id}/metadata",
+                self.url, self.db
+            ))
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(|e| RtDbError::internal(format!("file metadata request failed: {e}")))?;
+        self.deserialize::<FileMetadata>(resp).await
+    }
+
+    /// The public serve URL — no request is made.
+    pub fn get_url(&self, id: &str) -> String {
+        format!("{}/storage/{id}", self.url)
+    }
+
     /// Validate the bearer (session) token via `GET /auth/me`. Machine tokens get 401.
     pub async fn auth_me(&self) -> Result<AuthedUser, RtDbError> {
         let resp = self
@@ -606,7 +693,7 @@ mod tests {
     use crate::mutation::Mutation;
     use crate::query::TableQuery;
     use serde_json::{Value, json};
-    use wiremock::matchers::{body_partial_json, header, method, path};
+    use wiremock::matchers::{body_bytes, body_partial_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn doc(id: &str) -> Value {
@@ -1170,6 +1257,65 @@ mod tests {
             res,
             crate::mutation::StepResult::Upsert { ref id, inserted: false } if id == "u1"
         ));
+    }
+
+    // Storage surface (`POST /api/storage/{db}` raw-body upload, `DELETE`, `GET
+    // .../metadata`, and the no-request `get_url`). `body_bytes` (a function, not
+    // a macro, in wiremock 0.6) matches the exact raw request bytes.
+    //
+    // Unlike the schedule routes (where `db` rides in the JSON body), the storage
+    // routes put `db` in the URL path. The `setup()` fixture uses `db = "t<uuid>"`
+    // as a recognizable placeholder, and reqwest parses the URL via the `url`
+    // crate — which percent-encodes `<` and `>` (members of the URL path encode
+    // set) — so the actual path the server receives is `/api/storage/t%3Cuuid%3E`.
+    // Production db names never contain `<>`, so the matchers use the encoded
+    // form to reflect what the client really sends.
+
+    #[tokio::test]
+    async fn upload_posts_raw_bytes_and_returns_metadata() {
+        let (server, client) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/api/storage/t%3Cuuid%3E"))
+            .and(header("authorization", "Bearer machine-token"))
+            .and(header("content-type", "image/png"))
+            .and(body_bytes("raw-bytes"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "f1", "sha256": "abc", "size": 9, "contentType": "image/png"
+            })))
+            .mount(&server)
+            .await;
+        let up = client
+            .upload(b"raw-bytes", Some("image/png"))
+            .await
+            .unwrap();
+        assert_eq!(up.id, "f1");
+        assert_eq!(up.size, 9);
+        assert_eq!(up.content_type.as_deref(), Some("image/png"));
+    }
+
+    #[tokio::test]
+    async fn delete_file_and_metadata_and_get_url() {
+        let (server, client) = setup().await;
+        Mock::given(method("DELETE"))
+            .and(path("/api/storage/t%3Cuuid%3E/f1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/storage/t%3Cuuid%3E/f1/metadata"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "f1", "sha256": "abc", "size": 9, "creationTime": 5
+            })))
+            .mount(&server)
+            .await;
+        client.delete_file("f1").await.unwrap();
+        let meta = client.get_file_metadata("f1").await.unwrap();
+        assert_eq!(meta.size, 9);
+        assert_eq!(meta.creation_time, 5);
+        assert_eq!(meta.content_type, None);
+        // `mod tests` is a child of the `http` module, so it can read the private
+        // `url` field of `RtDbHttpClient`.
+        assert_eq!(client.get_url("f1"), format!("{}/storage/f1", client.url));
     }
 }
 
