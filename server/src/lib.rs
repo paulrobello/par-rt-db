@@ -52,7 +52,7 @@ impl AppState {
     pub fn new(pool: sqlx::PgPool, config: Config) -> Arc<Self> {
         let schemas = SchemaCache::new();
         let subs = SubscriptionManager::new();
-        let op_feed = op_feed::OpFeed::new(256, 500);
+        let op_feed = op_feed::OpFeed::new(1024, 500);
         let committers =
             Committers::new(pool.clone(), subs.clone(), schemas.clone(), op_feed.clone());
         let metrics = metrics::Metrics::new();

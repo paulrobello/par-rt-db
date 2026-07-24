@@ -307,6 +307,7 @@ async fn handle_mutate(
     ctx.subs
         .fan_out(&ctx.pool, &ctx.db, &schema, &outcome.write_set)
         .await;
+    // Op-feed completeness: every durable document write must publish here, in handle_scheduled, or a future third site.
     ctx.op_feed
         .publish(&ctx.db, owner.as_deref(), &outcome.write_set.ops)
         .await;
@@ -361,6 +362,7 @@ async fn handle_scheduled(
             ctx.subs
                 .fan_out(&ctx.pool, &ctx.db, &schema, &outcome.write_set)
                 .await;
+            // Op-feed completeness: every durable document write must publish here, in handle_mutate, or a future third site.
             ctx.op_feed
                 .publish(&ctx.db, None, &outcome.write_set.ops)
                 .await;

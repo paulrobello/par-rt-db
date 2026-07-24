@@ -37,6 +37,7 @@ Tests share one Postgres, isolating by creating uniquely-named databases per tes
 - **Clients mirror the core**: the server is the source of truth for the protocol, DSL, step-result shapes, and behavior. Any server change must be mirrored in **both** clients — wire types, DSL builders, and their tests. If the Rust client doesn't yet cover a changed surface, file the gap explicitly rather than letting it drift.
 - No `unwrap()`/`expect()` outside `#[cfg(test)]`. Zero clippy warnings under `-D warnings`.
 - **Keep docs in sync**: when a feature lands or changes, update `FEATURE_MATRIX.md` (the Convex-parity contract — flip rows ❌→✅ and note client-mirror status), the relevant README(s)/docs, and any skill that documents par-rt-db's surface. A stale doc that contradicts the code is a bug.
+- **Op-feed tap**: durable document mutations publish through the committer's two tap sites (`handle_mutate`/`handle_scheduled` in `committer.rs`). Any future code path that commits a document txn must publish there too, or the op-feed (and `/admin/stream`) will silently miss those writes.
 
 ## Deployment
 

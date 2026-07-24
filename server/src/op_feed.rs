@@ -37,8 +37,10 @@ impl OpFeed {
         })
     }
 
-    /// One `OpEvent` per `DocOp`. Ring is bounded (evicts oldest); `broadcast::send`
-    /// is a no-op with no subscribers. Never fails the commit.
+    /// One `OpEvent` per `DocOp`. The feed is best-effort and non-durable: the ring
+    /// is bounded (evicts oldest), and if a subscriber lags beyond the broadcast
+    /// capacity `broadcast::send` returns an error that we ignore here — lagged
+    /// events are dropped for that subscriber only. Never fails the commit.
     pub async fn publish(&self, db: &str, owner: Option<&str>, ops: &[DocOp]) {
         let ts = now_ms();
         let owner = owner.map(|s| s.to_string());
