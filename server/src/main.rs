@@ -42,12 +42,16 @@ async fn main() {
         });
 
     // Hot config: load the persisted row if present, else seed from env. A
-    // malformed row falls back to env defaults rather than blocking startup.
-    let hot = rtdb_server::config::load_hot(&pool)
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or_else(rtdb_server::config::HotConfig::from_env);
+    // missing row is normal (first boot); a malformed row or DB error is logged
+    // and falls back to env defaults rather than blocking startup.
+    let hot = match rtdb_server::config::load_hot(&pool).await {
+        Ok(Some(h)) => h,
+        Ok(None) => rtdb_server::config::HotConfig::from_env(),
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to load rtdb_config; falling back to env defaults");
+            rtdb_server::config::HotConfig::from_env()
+        }
+    };
 
     let port = config.port;
     let state = AppState::new(pool, config, hot);
