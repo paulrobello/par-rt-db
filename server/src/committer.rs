@@ -57,15 +57,22 @@ pub struct Committers {
     pool: PgPool,
     subs: Arc<SubscriptionManager>,
     schemas: SchemaCache,
+    op_feed: Arc<crate::op_feed::OpFeed>,
     channels: Mutex<HashMap<String, mpsc::Sender<CommitterRequest>>>,
 }
 
 impl Committers {
-    pub fn new(pool: PgPool, subs: Arc<SubscriptionManager>, schemas: SchemaCache) -> Self {
+    pub fn new(
+        pool: PgPool,
+        subs: Arc<SubscriptionManager>,
+        schemas: SchemaCache,
+        op_feed: Arc<crate::op_feed::OpFeed>,
+    ) -> Self {
         Self {
             pool,
             subs,
             schemas,
+            op_feed,
             channels: Mutex::new(HashMap::new()),
         }
     }
@@ -123,6 +130,7 @@ impl Committers {
             db.to_string(),
             self.subs.clone(),
             self.schemas.clone(),
+            self.op_feed.clone(),
             rx,
         ));
         tokio::spawn(scheduler::run_scheduler(
@@ -204,6 +212,9 @@ struct CommitterCtx {
     db: String,
     subs: Arc<SubscriptionManager>,
     schemas: SchemaCache,
+    // Consumed in Task 3 (`ctx.op_feed.publish(...)`); remove the allow when that lands.
+    #[allow(dead_code)]
+    op_feed: Arc<crate::op_feed::OpFeed>,
 }
 
 /// The per-db committer task loop: processes exactly one `CommitterRequest`
@@ -222,6 +233,7 @@ async fn run_committer(
     db: String,
     subs: Arc<SubscriptionManager>,
     schemas: SchemaCache,
+    op_feed: Arc<crate::op_feed::OpFeed>,
     mut rx: mpsc::Receiver<CommitterRequest>,
 ) {
     if let Err(err) = mutation_log::ensure_table(&pool, &db).await {
@@ -235,6 +247,7 @@ async fn run_committer(
         db,
         subs,
         schemas,
+        op_feed,
     };
     while let Some(req) = rx.recv().await {
         match req {

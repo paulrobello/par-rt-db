@@ -15,6 +15,7 @@ use sqlx::PgPool;
 use rtdb_server::committer::Committers;
 use rtdb_server::db::SchemaCache;
 use rtdb_server::ddl;
+use rtdb_server::op_feed::OpFeed;
 use rtdb_server::query::{Query, QueryResult, execute_query};
 use rtdb_server::scheduler;
 use rtdb_server::schema::SchemaDef;
@@ -305,7 +306,12 @@ async fn one_shot_fires_and_writes() {
     let pool = test_pool().await;
     let db = unique_db(&pool).await;
     let schema = push_simple_schema(&pool, &db).await;
-    let committers = Committers::new(pool.clone(), SubscriptionManager::new(), SchemaCache::new());
+    let committers = Committers::new(
+        pool.clone(),
+        SubscriptionManager::new(),
+        SchemaCache::new(),
+        OpFeed::new(64, 32),
+    );
 
     // Schedule a one-shot due in the past so it fires on the scheduler's first
     // wake. The txn inserts a doc the test can observe.
@@ -344,7 +350,12 @@ async fn cron_fires_and_stays_pending() {
     let pool = test_pool().await;
     let db = unique_db(&pool).await;
     let schema = push_simple_schema(&pool, &db).await;
-    let committers = Committers::new(pool.clone(), SubscriptionManager::new(), SchemaCache::new());
+    let committers = Committers::new(
+        pool.clone(),
+        SubscriptionManager::new(),
+        SchemaCache::new(),
+        OpFeed::new(64, 32),
+    );
 
     // `* * * * *` = every minute. Scheduled due in the past, so it fires once
     // immediately, then `handle_scheduled` recomputes the next fire and sets
@@ -384,7 +395,12 @@ async fn failing_cron_reschedules_anyway() {
     let pool = test_pool().await;
     let db = unique_db(&pool).await;
     let _schema = push_simple_schema(&pool, &db).await;
-    let committers = Committers::new(pool.clone(), SubscriptionManager::new(), SchemaCache::new());
+    let committers = Committers::new(
+        pool.clone(),
+        SubscriptionManager::new(),
+        SchemaCache::new(),
+        OpFeed::new(64, 32),
+    );
 
     // A cron whose txn FAILS every fire: `ExpectVersion` against a document
     // that does not exist returns NotFound, so `execute_txn` rejects the job.
@@ -439,7 +455,12 @@ async fn one_shot_catches_up_after_being_past_due() {
     let pool = test_pool().await;
     let db = unique_db(&pool).await;
     let schema = push_simple_schema(&pool, &db).await;
-    let committers = Committers::new(pool.clone(), SubscriptionManager::new(), SchemaCache::new());
+    let committers = Committers::new(
+        pool.clone(),
+        SubscriptionManager::new(),
+        SchemaCache::new(),
+        OpFeed::new(64, 32),
+    );
 
     // Warm the committer+scheduler up FIRST so the per-db scheduler loop is
     // already running, THEN insert a one-shot whose due_at is ~1 hour in the
@@ -474,7 +495,12 @@ async fn cron_skips_missed_windows() {
     let pool = test_pool().await;
     let db = unique_db(&pool).await;
     let schema = push_simple_schema(&pool, &db).await;
-    let committers = Committers::new(pool.clone(), SubscriptionManager::new(), SchemaCache::new());
+    let committers = Committers::new(
+        pool.clone(),
+        SubscriptionManager::new(),
+        SchemaCache::new(),
+        OpFeed::new(64, 32),
+    );
 
     // `* * * * *` (every minute) with due_at ~1 hour in the past. A naive
     // backfilling scheduler would fire ~60 times for the missed hour; the spec
@@ -536,7 +562,12 @@ async fn failing_txn_marks_error_one_shot() {
     let pool = test_pool().await;
     let db = unique_db(&pool).await;
     let schema = push_simple_schema(&pool, &db).await;
-    let committers = Committers::new(pool.clone(), SubscriptionManager::new(), SchemaCache::new());
+    let committers = Committers::new(
+        pool.clone(),
+        SubscriptionManager::new(),
+        SchemaCache::new(),
+        OpFeed::new(64, 32),
+    );
 
     // A one-shot whose txn is set up to FAIL: step 1 inserts a doc, step 2 is
     // an ExpectVersion against a nonexistent row (NotFound). Because

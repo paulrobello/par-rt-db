@@ -9,6 +9,7 @@ pub mod health;
 pub mod http_api;
 pub mod metrics;
 pub mod mutation_log;
+pub mod op_feed;
 pub mod pagination;
 pub mod protocol;
 pub mod query;
@@ -44,13 +45,16 @@ pub struct AppState {
     pub oauth_states: tokio::sync::Mutex<HashMap<String, OAuthStateEntry>>,
     pub started_at: SystemTime,
     pub metrics: Arc<metrics::Metrics>,
+    pub op_feed: Arc<op_feed::OpFeed>,
 }
 
 impl AppState {
     pub fn new(pool: sqlx::PgPool, config: Config) -> Arc<Self> {
         let schemas = SchemaCache::new();
         let subs = SubscriptionManager::new();
-        let committers = Committers::new(pool.clone(), subs.clone(), schemas.clone());
+        let op_feed = op_feed::OpFeed::new(256, 500);
+        let committers =
+            Committers::new(pool.clone(), subs.clone(), schemas.clone(), op_feed.clone());
         let metrics = metrics::Metrics::new();
         Arc::new(Self {
             pool,
@@ -61,6 +65,7 @@ impl AppState {
             oauth_states: tokio::sync::Mutex::new(HashMap::new()),
             started_at: SystemTime::now(),
             metrics,
+            op_feed,
         })
     }
 }

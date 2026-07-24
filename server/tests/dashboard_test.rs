@@ -478,3 +478,44 @@ async fn metrics_endpoint_reflects_a_mutation() -> anyhow::Result<()> {
     assert!(after["queriesTotal"].as_i64().unwrap_or(-1) >= 0);
     Ok(())
 }
+
+// OpFeed publishes one event per DocOp (with kind), replays from the ring, broadcasts live.
+#[tokio::test]
+async fn op_feed_publishes_and_replays() -> anyhow::Result<()> {
+    use rtdb_server::txn::{DocOp, OpKind};
+    let feed = rtdb_server::op_feed::OpFeed::new(64, 32);
+    let ops = vec![
+        DocOp {
+            table: "projects".into(),
+            id: "id1".into(),
+            kind: OpKind::Insert,
+        },
+        DocOp {
+            table: "projects".into(),
+            id: "id2".into(),
+            kind: OpKind::Patch,
+        },
+    ];
+    let mut rx = feed.subscribe();
+    feed.publish("dbA", Some("user-1"), &ops).await;
+
+    let recent = feed.recent(Some("dbA"), None, 10).await;
+    let ids: Vec<&str> = recent.iter().map(|e| e.doc_id.as_str()).collect();
+    assert!(
+        ids.contains(&"id1") && ids.contains(&"id2"),
+        "ring missing events: {recent:?}"
+    );
+    assert_eq!(
+        recent.iter().find(|e| e.doc_id == "id1").unwrap().kind,
+        OpKind::Insert
+    );
+    assert!(feed.recent(Some("dbB"), None, 10).await.is_empty());
+
+    let mut got = 0;
+    while let Ok(_ev) = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await
+    {
+        got += 1;
+    }
+    assert_eq!(got, 2);
+    Ok(())
+}
