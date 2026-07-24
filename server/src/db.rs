@@ -132,6 +132,17 @@ async fn bootstrap_ddl(conn: &mut PgConnection) -> Result<(), RtDbError> {
     .execute(&mut *conn)
     .await?;
 
+    // Single-row hot-config store. The CHECK + DEFAULT pin it to id = 1 so the
+    // upsert in `config::save_hot` is always `WHERE id = 1` / `VALUES (1, $1)`.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS rtdb_config (
+            id int PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+            hot jsonb NOT NULL
+        )",
+    )
+    .execute(&mut *conn)
+    .await?;
+
     Ok(())
 }
 

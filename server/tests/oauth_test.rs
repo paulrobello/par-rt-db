@@ -28,7 +28,7 @@ async fn oauth_state(mock: &MockServer) -> (Arc<AppState>, SocketAddr) {
         .expect("connect to test postgres");
     db::bootstrap(&pool).await.expect("bootstrap rtdb_auth");
 
-    let state = AppState::new(pool, cfg);
+    let state = AppState::new(pool, cfg, common::test_hot());
     let addr = spawn_app(state.clone()).await;
     (state, addr)
 }
@@ -659,7 +659,7 @@ async fn google_configured_state() -> (Arc<AppState>, SocketAddr) {
         .await
         .expect("connect to test postgres");
     db::bootstrap(&pool).await.expect("bootstrap rtdb_auth");
-    let state = AppState::new(pool, cfg);
+    let state = AppState::new(pool, cfg, common::test_hot());
     let addr = spawn_app(state.clone()).await;
     (state, addr)
 }

@@ -2,6 +2,7 @@ use std::future::IntoFuture;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use rtdb_server::config::HotConfig;
 use rtdb_server::schema::SchemaDef;
 use rtdb_server::{AppState, build_router, config::Config, db, ddl};
 
@@ -12,13 +13,22 @@ pub fn test_config() -> Config {
             .unwrap_or_else(|_| "postgres://rtdb:rtdb@127.0.0.1:55434/rtdb".into()),
         admin_key: "test-admin-key".into(),
         public_url: "http://localhost:0".into(),
-        allowed_origins: vec!["http://localhost:5173".into()],
         github_client_id: None,
         github_client_secret: None,
         github_base_url: "https://github.com".into(),
         github_api_url: "https://api.github.com".into(),
         google_client_id: None,
         google_client_secret: None,
+    }
+}
+
+/// Hot-config seed for tests: mirrors the pre-split `test_config` defaults, so
+/// the existing CORS/origin tests (which rely on `http://localhost:5173` being
+/// allowed) keep passing now that origins live behind `state.hot`.
+#[allow(dead_code)]
+pub fn test_hot() -> HotConfig {
+    HotConfig {
+        allowed_origins: vec!["http://localhost:5173".into()],
         session_ttl_days: 30,
         max_file_size: 50 * 1024 * 1024,
     }
@@ -29,7 +39,7 @@ pub async fn test_state() -> Arc<AppState> {
         .await
         .expect("connect to test postgres");
     db::bootstrap(&pool).await.expect("bootstrap rtdb_auth");
-    AppState::new(pool, test_config())
+    AppState::new(pool, test_config(), test_hot())
 }
 
 #[allow(dead_code)]

@@ -291,7 +291,7 @@ async fn upload_handler(
     authorize(&state.pool, &principal, &db).await?;
     storage::ensure_table(&state.pool, &db).await?; // revive storage for old dbs
 
-    let limit = state.config.max_file_size;
+    let limit = state.hot.load().max_file_size;
     let bytes = axum::body::to_bytes(request.into_body(), limit)
         .await
         .map_err(|_| RtDbError::bad_request("upload exceeds max file size"))?;

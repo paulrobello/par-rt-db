@@ -25,13 +25,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use axum::http::{HeaderValue, Method, header};
+use arc_swap::ArcSwap;
+use axum::http::{Method, header};
 use axum::{Router, routing::get};
 use committer::Committers;
-use config::Config;
+use config::{Config, HotConfig};
 use db::SchemaCache;
 use subs::SubscriptionManager;
-use tower_http::cors::CorsLayer;
+use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::trace::TraceLayer;
 
 use auth::provider::OAuthStateEntry;
@@ -39,6 +40,7 @@ use auth::provider::OAuthStateEntry;
 pub struct AppState {
     pub pool: sqlx::PgPool,
     pub config: Config,
+    pub hot: Arc<ArcSwap<HotConfig>>,
     pub schemas: SchemaCache,
     pub subs: Arc<SubscriptionManager>,
     pub committers: Committers,
@@ -49,7 +51,7 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(pool: sqlx::PgPool, config: Config) -> Arc<Self> {
+    pub fn new(pool: sqlx::PgPool, config: Config, hot: HotConfig) -> Arc<Self> {
         let schemas = SchemaCache::new();
         let subs = SubscriptionManager::new();
         let op_feed = op_feed::OpFeed::new(1024, 500);
@@ -59,6 +61,7 @@ impl AppState {
         Arc::new(Self {
             pool,
             config,
+            hot: Arc::new(ArcSwap::from_pointee(hot)),
             schemas,
             subs,
             committers,
@@ -70,30 +73,34 @@ impl AppState {
     }
 }
 
-/// Origins allowed to send bearer tokens over CORS to `/auth/*` and the HTTP
-/// one-shot API. Origins that fail `HeaderValue` parsing are skipped (and
-/// logged) rather than rejecting startup — WS is exempt from CORS (Origin is
-/// already enforced at OAuth start, see `auth::provider::provider_start`).
-fn cors_layer(allowed_origins: &[String]) -> CorsLayer {
-    let origins: Vec<HeaderValue> = allowed_origins
-        .iter()
-        .filter_map(|origin| match HeaderValue::from_str(origin) {
-            Ok(value) => Some(value),
-            Err(err) => {
-                tracing::warn!(origin = %origin, error = %err, "skipping invalid CORS origin");
-                None
-            }
-        })
-        .collect();
-
+/// Origins are decided per request from live `HotConfig`, so `PATCH /admin/config`
+/// can add an origin and have it take effect without a restart. The layer itself
+/// is still constructed once at router build time; only the origin decision is
+/// dynamic. WS is CORS-exempt (Origin is enforced at OAuth start, unchanged).
+fn cors_layer(hot: Arc<ArcSwap<HotConfig>>) -> CorsLayer {
     CorsLayer::new()
-        .allow_origin(origins)
-        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        .allow_origin(AllowOrigin::predicate(move |origin, _parts| {
+            let h = hot.load();
+            match origin.to_str() {
+                Ok(val) => h
+                    .allowed_origins
+                    .iter()
+                    .any(|allowed| allowed.as_str() == val),
+                Err(_) => false,
+            }
+        }))
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PATCH,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
         .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
 }
 
 pub fn build_router(state: Arc<AppState>) -> Router {
-    let cors = cors_layer(&state.config.allowed_origins);
+    let cors = cors_layer(state.hot.clone());
 
     Router::new()
         .route("/healthz", get(health::handler))

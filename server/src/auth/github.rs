@@ -128,7 +128,7 @@ impl OAuthProvider for GithubProvider {
             .to_lowercase();
 
         let user_id = upsert_user(&state.pool, user.id, &user.login, &email).await?;
-        session::create_session(&state.pool, &user_id, state.config.session_ttl_days).await
+        session::create_session(&state.pool, &user_id, state.hot.load().session_ttl_days).await
     }
 }
 
@@ -371,15 +371,12 @@ mod tests {
             database_url: "x".into(),
             admin_key: "k".into(),
             public_url: "http://localhost:0".into(),
-            allowed_origins: vec![],
             github_client_id: None,
             github_client_secret: None,
             github_base_url: "https://github.com".into(),
             github_api_url: "https://api.github.com".into(),
             google_client_id: None,
             google_client_secret: None,
-            session_ttl_days: 30,
-            max_file_size: 50 * 1024 * 1024,
         };
         assert!(GithubProvider::from_config(&cfg).is_none());
         cfg.github_client_id = Some("id".into());

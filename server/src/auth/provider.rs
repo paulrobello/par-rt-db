@@ -119,8 +119,8 @@ struct StartParams {
 }
 
 /// `GET /auth/{provider}?origin=<url>`: redirects the browser to the
-/// provider's OAuth authorize page. `origin` must be an exact member of
-/// `config.allowed_origins` (else 403) — it is never taken from the eventual
+/// provider's OAuth authorize page. `origin` must be an exact member of the
+/// live `hot.allowed_origins` (else 403) — it is never taken from the eventual
 /// callback request, only from this validated start step, so the popup can
 /// only ever be told to postMessage back to an origin we approved here.
 async fn provider_start<P: OAuthProvider>(
@@ -132,7 +132,8 @@ async fn provider_start<P: OAuthProvider>(
     };
 
     if !state
-        .config
+        .hot
+        .load()
         .allowed_origins
         .iter()
         .any(|allowed| allowed == &params.origin)

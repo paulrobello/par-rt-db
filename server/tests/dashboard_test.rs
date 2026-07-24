@@ -572,3 +572,35 @@ async fn admin_stream_requires_admin() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+// The persisted hot-config row round-trips through load_hot/save_hot, and a
+// missing row loads None. `rtdb_config` is a global table shared across tests on
+// the dev Postgres, so this test cleans up its row to avoid polluting others.
+#[tokio::test]
+async fn hot_config_round_trips_through_rtdb_config() -> anyhow::Result<()> {
+    let state = common::test_state().await;
+
+    sqlx::query("DELETE FROM rtdb_config WHERE id = 1")
+        .execute(&state.pool)
+        .await?;
+    assert!(rtdb_server::config::load_hot(&state.pool).await?.is_none());
+
+    let hot = rtdb_server::config::HotConfig {
+        allowed_origins: vec![
+            "https://one.example.com".into(),
+            "https://two.example.com".into(),
+        ],
+        session_ttl_days: 7,
+        max_file_size: 12345,
+    };
+    rtdb_server::config::save_hot(&state.pool, &hot).await?;
+    let loaded = rtdb_server::config::load_hot(&state.pool).await?.unwrap();
+    assert_eq!(loaded.allowed_origins, hot.allowed_origins);
+    assert_eq!(loaded.session_ttl_days, 7);
+    assert_eq!(loaded.max_file_size, 12345);
+
+    sqlx::query("DELETE FROM rtdb_config WHERE id = 1")
+        .execute(&state.pool)
+        .await?;
+    Ok(())
+}

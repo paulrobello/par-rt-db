@@ -41,8 +41,16 @@ async fn main() {
             tracing::warn!(error = %err, "failed to seed admin emails");
         });
 
+    // Hot config: load the persisted row if present, else seed from env. A
+    // malformed row falls back to env defaults rather than blocking startup.
+    let hot = rtdb_server::config::load_hot(&pool)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(rtdb_server::config::HotConfig::from_env);
+
     let port = config.port;
-    let state = AppState::new(pool, config);
+    let state = AppState::new(pool, config, hot);
     let router = build_router(state);
 
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port))
