@@ -46,7 +46,7 @@ Append to `server/tests/dashboard_test.rs` (fully-qualified, no `use` block):
 #[tokio::test]
 async fn get_schema_returns_pushed_schema() -> anyhow::Result<()> {
     let state = common::test_state().await;
-    let addr = common::spawn_app(state).await;
+    let addr = common::spawn_app(state.clone()).await;
     let db = common::fresh_db(&state).await;
 
     let resp = common::admin_get(addr, &format!("/admin/dbs/{db}/schema")).await;
@@ -65,7 +65,7 @@ async fn get_schema_returns_pushed_schema() -> anyhow::Result<()> {
 async fn list_tokens_omits_secret() -> anyhow::Result<()> {
     let state = common::test_state().await;
     let pool = state.pool.clone();
-    let addr = common::spawn_app(state).await;
+    let addr = common::spawn_app(state.clone()).await;
     let db = common::fresh_db(&state).await;
 
     let _resp = common::admin_post(addr, "/admin/mint-token", serde_json::json!({"db": db, "name": "ci"})).await;
@@ -215,7 +215,7 @@ Append to `server/tests/dashboard_test.rs`:
 #[tokio::test]
 async fn db_stats_reports_table_counts_and_sizes() -> anyhow::Result<()> {
     let state = common::test_state().await;
-    let addr = common::spawn_app(state).await;
+    let addr = common::spawn_app(state.clone()).await;
     let db = common::fresh_db(&state).await;
 
     let resp = common::admin_get(addr, &format!("/admin/dbs/{db}/stats")).await;
