@@ -1,6 +1,7 @@
 mod common;
 
-use common::test_state;
+use common::{admin_post, mint_user_session, spawn_app, test_state};
+use futures_util::{SinkExt, StreamExt};
 use rtdb_server::ddl::push_schema;
 use rtdb_server::error::ErrorCode;
 use rtdb_server::protocol::ServerMessage;
@@ -8,11 +9,16 @@ use rtdb_server::query::{Query, QueryResult, execute_query};
 use rtdb_server::schema::{FieldType, IndexDef, SchemaDef, TableDef, VectorIndexSpec};
 use rtdb_server::subs::next_conn_id;
 use rtdb_server::txn::{Step, Transaction, execute_txn};
+use serde_json::json;
 use sqlx::PgPool;
 use std::collections::BTreeMap;
+use std::net::SocketAddr;
 use std::time::Duration;
+use tokio::net::TcpStream;
 use tokio::sync::mpsc::{self, UnboundedReceiver};
 use tokio::time::timeout;
+use tokio_tungstenite::tungstenite::Message as WsMessage;
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 
 /// A schema with an owner-gated `notes` table (`ownerField: "userId"`) and a
 /// plain `open` table (no owner_field). Mirrors the field-by-field `Query`
@@ -1036,6 +1042,292 @@ async fn patch_owner_change_does_not_inject_into_other_users_feed() -> anyhow::R
         bob_inject.is_err(),
         "bob must not receive alice's patch owner-change, but got: {:?}",
         bob_inject.unwrap()
+    );
+    Ok(())
+}
+
+// ===========================================================================
+// End-to-end over the real wire (HTTP + WebSocket) — Task 7 capstone.
+//
+// These exercise the full property through `spawn_app`: two real OAuth-style
+// `Principal::User` sessions minted via `common::mint_user_session`, each
+// resolving to its own `user_id`, with allowlisting, schema push, and reads /
+// writes all going over HTTP / WS exactly as a client SDK would.
+// ===========================================================================
+
+type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+async fn ws_connect(addr: SocketAddr) -> WsStream {
+    let (ws, _) = connect_async(format!("ws://{addr}/sync"))
+        .await
+        .expect("connect websocket");
+    ws
+}
+
+async fn ws_send_json(ws: &mut WsStream, msg: serde_json::Value) {
+    ws.send(WsMessage::Text(msg.to_string().into()))
+        .await
+        .expect("send frame");
+}
+
+async fn ws_recv_json(ws: &mut WsStream) -> serde_json::Value {
+    match ws.next().await.expect("stream ended").expect("frame ok") {
+        WsMessage::Text(text) => serde_json::from_str(&text).expect("parse json"),
+        other => panic!("expected text frame, got {other:?}"),
+    }
+}
+
+async fn ws_auth(ws: &mut WsStream, token: &str, db: &str) -> serde_json::Value {
+    ws_send_json(ws, json!({"type": "auth", "token": token, "db": db})).await;
+    ws_recv_json(ws).await
+}
+
+/// Sends a bearer-token request body to an `/api/*` route.
+async fn api_post(
+    addr: SocketAddr,
+    path: &str,
+    token: &str,
+    body: serde_json::Value,
+) -> reqwest::Response {
+    reqwest::Client::new()
+        .post(format!("http://{addr}{path}"))
+        .header("Authorization", format!("Bearer {token}"))
+        .json(&body)
+        .send()
+        .await
+        .expect("send api request")
+}
+
+/// Sorts the `title` field out of a `/api/query` list result (`QueryResult::Docs`
+/// serializes to a bare JSON array of docs).
+fn titles_from_list(result: &serde_json::Value) -> Vec<String> {
+    let mut titles: Vec<String> = result
+        .as_array()
+        .expect("result is docs array")
+        .iter()
+        .map(|d| d["title"].as_str().expect("title").to_string())
+        .collect();
+    titles.sort();
+    titles
+}
+
+/// Shared setup for the wire tests: spawns the app, creates a fresh db, pushes
+/// the owner-gated `notes` schema via the admin route, mints two real user
+/// sessions (alice + bob), and allowlists both emails. Returns `(addr, db_name,
+/// alice_token, bob_token)`. Schema seeding is left to the caller.
+///
+/// `user_id`s are derived from `db_name` (not the bare strings "alice"/"bob")
+/// because `rtdb_auth.users.id` is a shared PRIMARY KEY and the three wire
+/// tests run concurrently — `alice_uid(db_name)` is the value that must also
+/// be written into a seeded doc's `userId` field so the owner filter matches.
+fn alice_uid(db_name: &str) -> String {
+    format!("alice-{db_name}")
+}
+fn bob_uid(db_name: &str) -> String {
+    format!("bob-{db_name}")
+}
+
+async fn wire_setup_two_users() -> (SocketAddr, String, String, String) {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let db_name = format!("t{}", uuid::Uuid::now_v7().simple());
+    rtdb_server::db::create_database(&state.pool, &db_name)
+        .await
+        .expect("create db");
+
+    let push = admin_post(
+        addr,
+        "/admin/push-schema",
+        json!({"db": db_name, "schema": serde_json::to_value(owner_schema()).expect("serialize schema")}),
+    )
+    .await;
+    assert_eq!(push.status(), reqwest::StatusCode::OK, "push-schema failed");
+
+    let alice_email = format!("alice-{db_name}@example.com");
+    let bob_email = format!("bob-{db_name}@example.com");
+    let alice_token = mint_user_session(&state.pool, &alice_uid(&db_name), &alice_email).await;
+    let bob_token = mint_user_session(&state.pool, &bob_uid(&db_name), &bob_email).await;
+    for email in [&alice_email, &bob_email] {
+        let r = admin_post(
+            addr,
+            "/admin/allowlist",
+            json!({"db": db_name, "action": "add", "email": email}),
+        )
+        .await;
+        assert_eq!(r.status(), reqwest::StatusCode::OK, "allowlist add failed");
+    }
+
+    (addr, db_name, alice_token, bob_token)
+}
+
+// (E1) Over the wire: an authenticated user's `POST /api/query` on an
+// owner-gated table returns only their own rows. Two real `Principal::User`
+// sessions carry the identity the read path filters on. Seeded via the bypass
+// (machine-token) caller so the writes are not themselves gated by this test.
+#[tokio::test]
+async fn http_query_filters_by_owner_over_the_wire() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let (addr, db_name, alice_token, bob_token) = wire_setup_two_users().await;
+
+    let schema = owner_schema();
+    seed_note(
+        &state.pool,
+        &db_name,
+        &schema,
+        "alice's note",
+        &alice_uid(&db_name),
+    )
+    .await;
+    seed_note(
+        &state.pool,
+        &db_name,
+        &schema,
+        "bob's note",
+        &bob_uid(&db_name),
+    )
+    .await;
+
+    // Alice sees only her row.
+    let resp = api_post(
+        addr,
+        "/api/query",
+        &alice_token,
+        json!({"db": db_name, "query": {"table": "notes"}}),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(
+        titles_from_list(&body["result"]),
+        vec!["alice's note".to_string()]
+    );
+
+    // Bob sees only his row.
+    let resp = api_post(
+        addr,
+        "/api/query",
+        &bob_token,
+        json!({"db": db_name, "query": {"table": "notes"}}),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(
+        titles_from_list(&body["result"]),
+        vec!["bob's note".to_string()]
+    );
+    Ok(())
+}
+
+// (E2) Over the wire: `POST /api/mutate` PATCHing a doc the caller doesn't own
+// returns 403 FORBIDDEN — the write enforcement tested in (10) now reachable
+// through the HTTP transport with a real `Principal::User` session.
+#[tokio::test]
+async fn http_mutate_forbidden_on_unowned_doc() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let (addr, db_name, alice_token, _) = wire_setup_two_users().await;
+
+    let schema = owner_schema();
+    let bob_id = seed_note(
+        &state.pool,
+        &db_name,
+        &schema,
+        "bob's note",
+        &bob_uid(&db_name),
+    )
+    .await;
+
+    let resp = api_post(
+        addr,
+        "/api/mutate",
+        &alice_token,
+        json!({"db": db_name, "txn": {"steps": [
+            {"op": "patch", "table": "notes", "id": bob_id, "fields": {"title": "hacked"}}
+        ]}}),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::FORBIDDEN);
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(body["code"], json!("FORBIDDEN"));
+    Ok(())
+}
+
+// (E3) CAPSTONE — over the reactive WebSocket wire: alice and bob each open a
+// WS, authenticate with their own session token, and subscribe to `notes`.
+// When bob inserts his own note over his WS, his feed receives it and alice's
+// does NOT. This proves owner-gating composes end-to-end: WS auth → principal
+// → owner injection on subscribe + mutate → committer fan-out's owner-filtered
+// re-run. `timeout` guards every receive so a missing push can't hang the test.
+#[tokio::test]
+async fn ws_subscription_no_cross_user_push() -> anyhow::Result<()> {
+    let (addr, db_name, alice_token, bob_token) = wire_setup_two_users().await;
+
+    // Both open a WS and authenticate with their own session token.
+    let mut alice_ws = ws_connect(addr).await;
+    let a_auth = ws_auth(&mut alice_ws, &alice_token, &db_name).await;
+    assert_eq!(a_auth["type"], json!("authOk"));
+    assert_eq!(a_auth["user"]["kind"], json!("user"));
+
+    let mut bob_ws = ws_connect(addr).await;
+    let b_auth = ws_auth(&mut bob_ws, &bob_token, &db_name).await;
+    assert_eq!(b_auth["type"], json!("authOk"));
+    assert_eq!(b_auth["user"]["kind"], json!("user"));
+
+    // Both subscribe to notes (empty table → one initial QueryUpdate each).
+    ws_send_json(
+        &mut alice_ws,
+        json!({"type": "subscribe", "queryId": "alice-q", "query": {"table": "notes"}}),
+    )
+    .await;
+    ws_send_json(
+        &mut bob_ws,
+        json!({"type": "subscribe", "queryId": "bob-q", "query": {"table": "notes"}}),
+    )
+    .await;
+    for ws in [&mut alice_ws, &mut bob_ws] {
+        let init = timeout(Duration::from_secs(2), ws_recv_json(ws))
+            .await
+            .expect("initial QueryUpdate should arrive");
+        assert_eq!(init["type"], json!("queryUpdate"));
+    }
+
+    // Bob inserts a note over his WS. `userId` is deliberately omitted — the
+    // server stamps it from bob's principal on the mutate path.
+    ws_send_json(
+        &mut bob_ws,
+        json!({"type": "mutate", "mutId": "m1", "txn": {"steps": [
+            {"op": "insert", "table": "notes", "doc": {"title": "bob's note"}}
+        ]}}),
+    )
+    .await;
+
+    // Bob must receive his note's QueryUpdate (mutateOk may interleave before
+    // it, so loop until we see it).
+    let mut saw_bob_note = false;
+    for _ in 0..4 {
+        let msg = timeout(Duration::from_secs(2), ws_recv_json(&mut bob_ws))
+            .await
+            .expect("bob should receive mutateOk/queryUpdate within 2s");
+        if msg["type"] == "queryUpdate" {
+            assert_eq!(msg["queryId"], json!("bob-q"));
+            assert_eq!(
+                titles_from_list(&msg["result"]),
+                vec!["bob's note".to_string()]
+            );
+            saw_bob_note = true;
+            break;
+        }
+    }
+    assert!(saw_bob_note, "bob never received his note's QueryUpdate");
+
+    // Alice must NOT receive bob's note: the owner-filtered re-run left her
+    // canonical result unchanged, so no push is emitted. A timeout here is
+    // success; a message is the failure (and is printed for diagnosis).
+    let alice_extra = timeout(Duration::from_millis(250), ws_recv_json(&mut alice_ws)).await;
+    assert!(
+        alice_extra.is_err(),
+        "alice must not receive bob's note, but got: {:?}",
+        alice_extra.unwrap()
     );
     Ok(())
 }

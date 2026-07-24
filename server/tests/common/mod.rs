@@ -122,3 +122,48 @@ pub async fn admin_post_raw(addr: SocketAddr, path: &str, body: String) -> reqwe
         .await
         .expect("send admin request")
 }
+
+/// Seeds a real `rtdb_auth.users` + `rtdb_auth.sessions` row for `user_id` /
+/// `email` and returns a bearer session token that `resolve_bearer` maps to
+/// `Principal::User { user_id, .. }`. Caller must allowlist `email` for the
+/// target db separately. Distinct `user_id`s produce distinct `github_id`s
+/// (the `users` table enforces uniqueness) via a stable hash of the id, so two
+/// calls with different ids never collide. Mirrors `oauth_test.rs`'s direct
+/// seed (column names / `sha256_hex` / `now_ms` / `random_token`).
+#[allow(dead_code)]
+pub async fn mint_user_session(pool: &sqlx::PgPool, user_id: &str, email: &str) -> String {
+    // Stable distinct github_id per user_id: sha256 of the id gives distinct
+    // bytes; 15 hex nibbles = 60 bits, always non-negative and under i64::MAX
+    // (same approach oauth_test uses with random_token, but deterministic).
+    let github_id: i64 =
+        i64::from_str_radix(&db::sha256_hex(user_id)[..15], 16).expect("parse hex as i64");
+    let now = db::now_ms();
+    sqlx::query(
+        "INSERT INTO rtdb_auth.users (id, github_id, login, email, created_at) \
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(user_id)
+    .bind(github_id)
+    .bind(email)
+    .bind(email)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert rtdb_auth.users row");
+
+    let token = db::random_token();
+    let hash = db::sha256_hex(&token);
+    sqlx::query(
+        "INSERT INTO rtdb_auth.sessions (token_hash, user_id, expires_at, created_at) \
+         VALUES ($1, $2, $3, $4)",
+    )
+    .bind(&hash)
+    .bind(user_id)
+    .bind(now + 31 * 86_400 * 1_000)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert rtdb_auth.sessions row");
+
+    token
+}
