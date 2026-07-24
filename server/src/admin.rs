@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use axum::body::Body;
-use axum::extract::{Query as QueryParams, State};
+use axum::extract::{Path, Query as QueryParams, State};
 use axum::http::HeaderMap;
 use axum::response::Response;
 use axum::routing::{get, post};
@@ -354,6 +354,67 @@ async fn remove_admin(
     Ok(Json(OkResponse { ok: true }))
 }
 
+async fn get_schema(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(db): Path<String>,
+) -> Result<Json<crate::schema::SchemaDef>, RtDbError> {
+    require_admin(&state, &headers).await?;
+    if !db::database_exists(&state.pool, &db).await? {
+        return Err(RtDbError::not_found("unknown database"));
+    }
+    let schema = state.schemas.get(&state.pool, &db).await?;
+    Ok(Json((*schema).clone()))
+}
+
+#[derive(Serialize)]
+struct TokenRow {
+    id: String,
+    name: String,
+    #[serde(rename = "createdAt")]
+    created_at: i64,
+    revoked: bool,
+}
+
+#[derive(Serialize)]
+struct TokensResponse {
+    tokens: Vec<TokenRow>,
+}
+
+#[derive(Deserialize)]
+struct TokensParams {
+    db: String,
+}
+
+async fn list_tokens(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    QueryParams(params): QueryParams<TokensParams>,
+) -> Result<Json<TokensResponse>, RtDbError> {
+    require_admin(&state, &headers).await?;
+    if !db::database_exists(&state.pool, &params.db).await? {
+        return Err(RtDbError::bad_request("unknown database"));
+    }
+    let rows: Vec<(String, String, i64, bool)> = sqlx::query_as(
+        "SELECT id, name, created_at, revoked FROM rtdb_auth.machine_tokens \
+         WHERE db_name = $1 ORDER BY created_at",
+    )
+    .bind(&params.db)
+    .fetch_all(&state.pool)
+    .await?;
+    Ok(Json(TokensResponse {
+        tokens: rows
+            .into_iter()
+            .map(|(id, name, created_at, revoked)| TokenRow {
+                id,
+                name,
+                created_at,
+                revoked,
+            })
+            .collect(),
+    }))
+}
+
 /// Admin routes, all gated on `Authorization: Bearer <admin_key>` (constant-time
 /// compare).
 pub fn admin_routes() -> Router<Arc<AppState>> {
@@ -371,6 +432,8 @@ pub fn admin_routes() -> Router<Arc<AppState>> {
             "/admin/admins",
             get(list_admins).post(add_admin).delete(remove_admin),
         )
+        .route("/admin/dbs/{db}/schema", get(get_schema))
+        .route("/admin/tokens", get(list_tokens))
         .route("/admin/export-db", get(export_db))
         .route("/admin/import-db", post(import_db))
 }

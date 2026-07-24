@@ -302,3 +302,66 @@ async fn machine_token_is_not_admin() -> anyhow::Result<()> {
     assert_eq!(resp.status(), reqwest::StatusCode::FORBIDDEN);
     Ok(())
 }
+
+// GET /admin/dbs/{db}/schema returns the pushed schema back.
+#[tokio::test]
+async fn get_schema_returns_pushed_schema() -> anyhow::Result<()> {
+    let state = common::test_state().await;
+    let addr = common::spawn_app(state.clone()).await;
+    let db = common::fresh_db(&state).await;
+
+    let resp = common::admin_get(addr, &format!("/admin/dbs/{db}/schema")).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await?;
+    // fresh_db pushes the kanban fixture, which has a `projects` table.
+    assert!(
+        body["tables"].get("projects").is_some(),
+        "schema missing projects table: {body}"
+    );
+    // Unknown db → 404 (NotFound), not 500.
+    let resp = common::admin_get(addr, "/admin/dbs/does-not-exist/schema").await;
+    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+    Ok(())
+}
+
+// GET /admin/tokens?db= lists tokens by id/name/revoked and never exposes the secret hash.
+#[tokio::test]
+async fn list_tokens_omits_secret() -> anyhow::Result<()> {
+    let state = common::test_state().await;
+    let pool = state.pool.clone();
+    let addr = common::spawn_app(state.clone()).await;
+    let db = common::fresh_db(&state).await;
+
+    let _resp = common::admin_post(
+        addr,
+        "/admin/mint-token",
+        serde_json::json!({"db": db, "name": "ci"}),
+    )
+    .await;
+
+    let resp = common::admin_get(addr, &format!("/admin/tokens?db={db}")).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await?;
+    let tokens = body["tokens"].as_array().expect("tokens array");
+    assert!(
+        tokens.iter().any(|t| t["name"] == "ci"),
+        "minted token missing: {body}"
+    );
+    // The response must never carry the secret or its hash.
+    let body_str = body.to_string();
+    assert!(
+        !body_str.contains("token_hash") && !body_str.contains("hash"),
+        "secret leaked: {body_str}"
+    );
+    // And the DB's stored hash is not equal to any field value in the response.
+    let (stored_hash,): (String,) =
+        sqlx::query_as("SELECT token_hash FROM rtdb_auth.machine_tokens WHERE db_name = $1")
+            .bind(&db)
+            .fetch_one(&pool)
+            .await?;
+    assert!(
+        !body_str.contains(&stored_hash),
+        "token hash leaked: {stored_hash}"
+    );
+    Ok(())
+}
