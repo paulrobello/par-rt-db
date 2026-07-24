@@ -1,8 +1,10 @@
 use std::sync::Arc;
 
+use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, FromRequest, Path, Request, State};
 use axum::http::{HeaderMap, header};
-use axum::routing::post;
+use axum::response::Response;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
@@ -240,6 +242,13 @@ pub fn http_api_routes() -> Router<Arc<AppState>> {
             "/api/storage/{db}",
             post(upload_handler).layer(DefaultBodyLimit::disable()),
         )
+        // Authed serve — bearer authorizes `{db}`; id must live in that db's
+        // table (404 otherwise, enforcing cross-db isolation).
+        .route("/api/storage/{db}/{id}", get(serve_authed_handler))
+        // Public, unauthenticated serve — the one unauthenticated route in the
+        // server, by design. The opaque id resolves to its owning db via the
+        // global index.
+        .route("/storage/{id}", get(serve_public_handler))
 }
 
 #[derive(Serialize)]
@@ -289,4 +298,40 @@ async fn upload_handler(
         size,
         content_type,
     }))
+}
+
+/// Public, unauthenticated serve: anyone with the URL fetches the bytes. The
+/// opaque id resolves to its owning db via the global index.
+async fn serve_public_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Response, RtDbError> {
+    let db = storage::resolve_db(&state.pool, &id)
+        .await?
+        .ok_or_else(|| RtDbError::not_found("unknown file"))?;
+    serve_bytes(&state, &db, &id).await
+}
+
+/// Authed serve: the caller's principal must be authorized for `{db}`; the id
+/// must live in that db's table (404 otherwise — cross-db isolation).
+async fn serve_authed_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((db, id)): Path<(String, String)>,
+) -> Result<Response, RtDbError> {
+    let token = bearer_token(&headers)?;
+    let principal = resolve_bearer(&state.pool, token).await?;
+    authorize(&state.pool, &principal, &db).await?;
+    serve_bytes(&state, &db, &id).await
+}
+
+async fn serve_bytes(state: &Arc<AppState>, db: &str, id: &str) -> Result<Response, RtDbError> {
+    let (bytes, content_type) = storage::get(&state.pool, db, id)
+        .await?
+        .ok_or_else(|| RtDbError::not_found("unknown file"))?;
+    let ct = content_type.unwrap_or_else(|| "application/octet-stream".to_string());
+    Response::builder()
+        .header(header::CONTENT_TYPE, ct)
+        .body(Body::from(bytes))
+        .map_err(|err| RtDbError::internal(format!("failed to build serve response: {err}")))
 }

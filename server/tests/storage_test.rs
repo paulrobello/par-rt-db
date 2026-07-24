@@ -185,3 +185,102 @@ async fn upload_rejects_oversized_body() -> anyhow::Result<()> {
     assert_eq!(body["code"], json!("BAD_REQUEST"));
     Ok(())
 }
+
+// --- HTTP serve routes (GET /storage/{id}, GET /api/storage/{db}/{id}) ---
+
+#[tokio::test]
+async fn public_and_authed_serve_return_bytes() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let db = fresh_db(&state).await;
+    let token = mint_token(addr, &db).await;
+
+    let payload = b"serve me";
+    let up = reqwest::Client::new()
+        .post(format!("http://{addr}/api/storage/{db}"))
+        .bearer_auth(&token)
+        .header("content-type", "image/png")
+        .body(payload.to_vec())
+        .send()
+        .await?;
+    let id = up.json::<serde_json::Value>().await?["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Public serve — no bearer.
+    let public = reqwest::get(format!("http://{addr}/storage/{id}")).await?;
+    assert_eq!(public.status(), StatusCode::OK);
+    assert_eq!(public.headers().get("content-type").unwrap(), "image/png");
+    assert_eq!(public.bytes().await?, &payload[..]);
+
+    // Authed serve — bearer + db in path.
+    let authed = reqwest::Client::new()
+        .get(format!("http://{addr}/api/storage/{db}/{id}"))
+        .bearer_auth(&token)
+        .send()
+        .await?;
+    assert_eq!(authed.status(), StatusCode::OK);
+    assert_eq!(authed.bytes().await?, &payload[..]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn content_type_defaults_to_octet_stream() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let db = fresh_db(&state).await;
+    let token = mint_token(addr, &db).await;
+
+    let up = reqwest::Client::new()
+        .post(format!("http://{addr}/api/storage/{db}"))
+        .bearer_auth(&token)
+        .body(b"no content type".to_vec())
+        .send()
+        .await?;
+    let id = up.json::<serde_json::Value>().await?["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let public = reqwest::get(format!("http://{addr}/storage/{id}")).await?;
+    assert_eq!(
+        public.headers().get("content-type").unwrap(),
+        "application/octet-stream"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn cross_db_authed_serve_is_404() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let db_a = fresh_db(&state).await;
+    let db_b = fresh_db(&state).await;
+    let tok_a = mint_token(addr, &db_a).await;
+
+    let up = reqwest::Client::new()
+        .post(format!("http://{addr}/api/storage/{db_a}"))
+        .bearer_auth(&tok_a)
+        .body(b"a's file".to_vec())
+        .send()
+        .await?;
+    let id = up.json::<serde_json::Value>().await?["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Public serve still resolves (id is global); authed serve from db_b 404s.
+    assert_eq!(
+        reqwest::get(format!("http://{addr}/storage/{id}"))
+            .await?
+            .status(),
+        StatusCode::OK
+    );
+    let resp = reqwest::Client::new()
+        .get(format!("http://{addr}/api/storage/{db_b}/{id}"))
+        .bearer_auth(mint_token(addr, &db_b).await)
+        .send()
+        .await?;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    Ok(())
+}
