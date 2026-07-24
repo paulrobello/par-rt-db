@@ -33,8 +33,8 @@ meaningful DX/reliability improvement. Low: rarely needed at this scale.
 | Query surface: `get`, index-prefix `eq`, `order`, `take`, `collect`, `unique` | ✅ | ✅ | Semantics mirror Convex exactly (`query.rs`) |
 | System fields | ✅ `_id`, `_creationTime` | ✅ + `_version` | `_version` is extra — it powers client-side OCC that Convex doesn't expose |
 | End-to-end TypeScript types | ✅ via codegen | ✅ **no codegen** | Schema is TS; `Doc`/`Id` inferred (`schema.ts`) |
-| React bindings | ✅ | ✅ | `RtDbProvider`, `useQuery` (undefined-until-first-result, `"skip"`), `useMutation`, auth gates |
-| Client resilience | ✅ | ✅ | Auto-reconnect, re-auth, resubscribe, heartbeat, stale-callback generation guard |
+| React bindings | ✅ | ✅ | `RtDbProvider`, `useQuery` (undefined-until-first-result, `"skip"`), `useMutation`, `useConnectionState`, auth gates |
+| Client resilience | ✅ | ✅ | Auto-reconnect, re-auth, resubscribe, heartbeat, stale-callback generation guard; connection state observable via `getConnectionState`/`onConnectionChange` (ts) and `status`/`status_receiver` (rust) |
 | One-shot HTTP for machines | ✅ (fetchQuery / HTTP client) | ✅ | `POST /api/query` / `/api/mutate` with machine tokens |
 | User auth | ✅ Clerk/Auth0/custom JWT/Convex Auth | 🟡 GitHub + Google OAuth + sessions | Provider trait (`auth/provider.rs`) — GitHub + Google today, each extra provider is small; cross-provider same-email logins link by email; per-database email allowlist replaces per-function auth checks |
 | Live permission revocation | ✅ | ✅ | `authorize` re-runs on every Subscribe/Mutate; machine-token revocation, allowlist removal, and session expiry are all checked live per op (row 8 below) |

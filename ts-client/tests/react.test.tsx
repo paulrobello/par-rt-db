@@ -8,6 +8,7 @@ import {
   RtDbProvider,
   signInWithGitHub,
   Unauthenticated,
+  useConnectionState,
   usePaginatedQuery,
   useQuery,
 } from "../src/react.js";
@@ -388,5 +389,27 @@ describe("usePaginatedQuery", () => {
       });
     });
     expect(screen.getByText("count:2")).toBeTruthy();
+  });
+});
+
+describe("useConnectionState", () => {
+  it("tracks the idle → connecting → connected transitions", async () => {
+    const { client, sockets } = setup();
+    function View() {
+      const conn = useConnectionState();
+      return <div>conn:{conn}</div>;
+    }
+    render(
+      <RtDbProvider client={client} authBaseUrl="http://h:8300">
+        <View />
+      </RtDbProvider>,
+    );
+    // Before the socket opens the client is not yet connected.
+    expect(screen.getByText(/^conn:/).textContent).not.toBe("conn:connected");
+    await act(async () => {
+      sockets[0].open();
+      sockets[0].deliver({ type: "authOk", user: { kind: "user" } });
+    });
+    expect(screen.getByText("conn:connected")).toBeTruthy();
   });
 });

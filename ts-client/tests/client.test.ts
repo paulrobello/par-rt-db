@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { RtDbClient, type WebSocketLike } from "../src/client.js";
+import { type ConnectionState, RtDbClient, type WebSocketLike } from "../src/client.js";
 import type { RtQuery } from "../src/query.js";
 
 /** A controllable fake socket. Records sent frames; lets the test drive open/message/close. */
@@ -459,5 +459,70 @@ describe("RtDbClient", () => {
     await Promise.resolve();
     expect(sockets.length).toBe(0); // never dialed
     expect(client.getAuthState()).toBe("unauthenticated");
+  });
+});
+
+describe("connection state observation", () => {
+  it("getConnectionState() is idle before connect", () => {
+    const { client } = newClient();
+    expect(client.getConnectionState()).toBe("idle");
+  });
+
+  it("onConnectionChange fires connecting then connected through the auth flow", () => {
+    const { client, sockets } = newClient();
+    const seen: ConnectionState[] = [];
+    client.onConnectionChange((s) => seen.push(s));
+    client.connect();
+    expect(client.getConnectionState()).toBe("connecting");
+    sockets[0].open();
+    sockets[0].deliver({ type: "authOk", user: { kind: "machine" } });
+    expect(client.getConnectionState()).toBe("connected");
+    expect(seen).toEqual(["connecting", "connected"]);
+  });
+
+  it("onConnectionChange returns an unsubscribe that stops further callbacks", () => {
+    const { client, sockets } = newClient();
+    const seen: ConnectionState[] = [];
+    const off = client.onConnectionChange((s) => seen.push(s));
+    client.connect(); // → connecting
+    off();
+    sockets[0].open();
+    sockets[0].deliver({ type: "authOk", user: { kind: "machine" } }); // → connected
+    expect(seen).toEqual(["connecting"]);
+  });
+
+  it("does not fire onConnectionChange for a no-op (idempotent connect)", () => {
+    const { client } = newClient();
+    const seen: ConnectionState[] = [];
+    client.onConnectionChange((s) => seen.push(s));
+    client.connect(); // → connecting
+    client.connect(); // already connecting → no-op
+    expect(seen).toEqual(["connecting"]);
+  });
+
+  it("close() transitions to closed and fires onConnectionChange", () => {
+    const { client, sockets } = newClient();
+    const seen: ConnectionState[] = [];
+    client.onConnectionChange((s) => seen.push(s));
+    client.connect();
+    sockets[0].open();
+    sockets[0].deliver({ type: "authOk", user: { kind: "machine" } });
+    client.close();
+    expect(client.getConnectionState()).toBe("closed");
+    expect(seen[seen.length - 1]).toBe("closed");
+  });
+
+  it("a 4401 auth failure transitions to idle", () => {
+    const { client, sockets } = newClient();
+    const seen: ConnectionState[] = [];
+    client.onConnectionChange((s) => seen.push(s));
+    client.connect();
+    sockets[0].open();
+    sockets[0].deliver({
+      type: "authErr",
+      error: { code: "UNAUTHENTICATED", message: "no" },
+    });
+    expect(client.getConnectionState()).toBe("idle");
+    expect(seen[seen.length - 1]).toBe("idle");
   });
 });

@@ -136,6 +136,7 @@ export class RtDbClient {
   private readonly pendingSchedules = new Map<string, QueuedSchedule>();
   private readonly unsentSchedules: QueuedSchedule[] = [];
   private readonly authListeners = new Set<(state: AuthState, user: AuthedUser | null) => void>();
+  private readonly connListeners = new Set<(state: ConnectionState) => void>();
   /** mutId → subscriptions whose last result this mutation optimistically overlaid. */
   private readonly optimisticOverlays = new Map<string, Set<Subscription>>();
   private readonly optimistic: boolean;
@@ -180,7 +181,7 @@ export class RtDbClient {
     this.generation++;
     this.clearTimers();
     this.detachSocket(1000, "client closed");
-    this.connState = "closed";
+    this.setConnState("closed");
     this.setAuthState("unauthenticated");
     this.rejectAllMutates("client is closed");
     this.rejectAllSchedules("client is closed");
@@ -222,6 +223,15 @@ export class RtDbClient {
   onAuthChange(cb: (state: AuthState, user: AuthedUser | null) => void): () => void {
     this.authListeners.add(cb);
     return () => this.authListeners.delete(cb);
+  }
+
+  getConnectionState(): ConnectionState {
+    return this.connState;
+  }
+
+  onConnectionChange(cb: (state: ConnectionState) => void): () => void {
+    this.connListeners.add(cb);
+    return () => this.connListeners.delete(cb);
   }
 
   subscribe<R>(query: RtQuery<R>, onUpdate: (value: R) => void): () => void {
@@ -472,7 +482,7 @@ export class RtDbClient {
     this.clearTimers();
     this.detachSocket(1000, "reopen");
     const gen = ++this.generation;
-    this.connState = this.reconnectAttempt === 0 ? "connecting" : "reconnecting";
+    this.setConnState(this.reconnectAttempt === 0 ? "connecting" : "reconnecting");
     const provided = this.hasToken ? this.token : this.options.getToken();
     if (isThenable(provided)) {
       // A rejected getToken() is treated as "no credential" rather than left
@@ -505,7 +515,7 @@ export class RtDbClient {
       // dial a socket — that would spin the reconnect loop forever. Land
       // unauthenticated/idle so an explicit connect() can revive later.
       this.setAuthState("unauthenticated");
-      this.connState = "idle";
+      this.setConnState("idle");
       return;
     }
     const socket = this.factory(`${httpToWs(this.options.url)}/sync`);
@@ -515,7 +525,7 @@ export class RtDbClient {
     socket.onopen = () => {
       if (this.token == null) {
         this.setAuthState("unauthenticated");
-        this.connState = "idle";
+        this.setConnState("idle");
         this.detachSocket(1000, "no token");
         return;
       }
@@ -537,7 +547,7 @@ export class RtDbClient {
     }
     switch (msg.type) {
       case "authOk":
-        this.connState = "connected";
+        this.setConnState("connected");
         this.reconnectAttempt = 0;
         this.user = msg.user;
         // Resubscribe + flush unsent BEFORE notifying auth listeners, so a
@@ -647,11 +657,11 @@ export class RtDbClient {
     this.rejectPendingSchedules("connection closed before the schedule was acknowledged");
     if (code === 4401) {
       this.setAuthState("unauthenticated");
-      this.connState = "idle"; // an explicit connect() (e.g. after re-login) may revive
+      this.setConnState("idle"); // an explicit connect() (e.g. after re-login) may revive
       return;
     }
     if (this.stopped) {
-      this.connState = "closed";
+      this.setConnState("closed");
       return;
     }
     this.setAuthState("authenticating");
@@ -785,6 +795,16 @@ export class RtDbClient {
     }
     for (const cb of this.authListeners) {
       cb(this.authState, this.user);
+    }
+  }
+
+  private setConnState(state: ConnectionState): void {
+    if (state === this.connState) {
+      return;
+    }
+    this.connState = state;
+    for (const cb of this.connListeners) {
+      cb(this.connState);
     }
   }
 

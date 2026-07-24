@@ -8,7 +8,7 @@ import {
   useMemo,
   useState,
 } from "react";
-import type { AuthState, RtDbClient } from "./client.js";
+import type { AuthState, ConnectionState, RtDbClient } from "./client.js";
 import type { AuthedUser, TransactionJson } from "./protocol.js";
 import type { RtQuery } from "./query.js";
 
@@ -105,6 +105,19 @@ export function useQuery<R>(query: RtQuery<R> | "skip"): R | undefined {
 export function useMutation(): (txn: TransactionJson) => Promise<unknown[]> {
   const { client } = useContextValue();
   return useCallback((txn: TransactionJson) => client.mutate(txn), [client]);
+}
+
+export function useConnectionState(): ConnectionState {
+  const { client } = useContextValue();
+  const [state, setState] = useState<ConnectionState>(() => client.getConnectionState());
+  useEffect(() => {
+    const off = client.onConnectionChange((next) => setState(next));
+    // Re-snapshot in case state advanced between the initial useState snapshot
+    // and wiring the listener (e.g. the provider's connect() fired first).
+    setState(client.getConnectionState());
+    return off;
+  }, [client]);
+  return state;
 }
 
 export function useRtDbAuth(): {
