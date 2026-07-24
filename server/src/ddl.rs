@@ -21,17 +21,34 @@ pub fn pg_search_col(index_name: &str) -> String {
     format!("s_{}", index_name.to_lowercase())
 }
 
+/// Physical name of a vector index's `vector(N)` column. Table-scoped, so `v_`
+/// + the lowercased index name stays within Postgres's 63-byte identifier limit.
+pub fn pg_vector_col(index_name: &str) -> String {
+    format!("v_{}", index_name.to_lowercase())
+}
+
 pub fn pg_schema(db: &str) -> String {
     format!("db_{db}")
 }
 
-/// Union of every field referenced by any index on `table`.
+/// Union of every field referenced by any index on `table` that should get a
+/// typed `f_` column. A btree or search index contributes all of its `fields`;
+/// a vector index contributes only its `filter_fields` — its single vector
+/// field is owned by the write-maintained `v_` column, not a typed column.
 fn indexed_fields(table: &TableDef) -> BTreeSet<String> {
-    table
-        .indexes
-        .iter()
-        .flat_map(|index| index.fields.iter().cloned())
-        .collect()
+    let mut names = BTreeSet::new();
+    for index in &table.indexes {
+        if let Some(vec_spec) = &index.vector {
+            for ff in &vec_spec.filter_fields {
+                names.insert(ff.clone());
+            }
+        } else {
+            for field_name in &index.fields {
+                names.insert(field_name.clone());
+            }
+        }
+    }
+    names
 }
 
 fn field_type<'a>(table: &'a TableDef, field_name: &str) -> Result<&'a FieldType, RtDbError> {
@@ -102,6 +119,12 @@ fn detect_destructive_changes(old: &SchemaDef, new: &SchemaDef) -> Result<(), Rt
                         old_index.name
                     )));
                 }
+                Some(new_index) if new_index.vector != old_index.vector => {
+                    return Err(RtDbError::bad_request(format!(
+                        "changed vector spec of index '{}'",
+                        old_index.name
+                    )));
+                }
                 _ => {}
             }
         }
@@ -132,6 +155,13 @@ pub async fn push_schema(
 
     let pg_schema_name = pg_schema(db);
     let mut tx = pool.begin().await?;
+
+    // Covers databases created before pgvector shipped: ensure the extension is
+    // present the first time a vector-index schema is pushed. No-op if already
+    // installed (Task 1 installs it at database creation).
+    sqlx::query("CREATE EXTENSION IF NOT EXISTS vector")
+        .execute(&mut *tx)
+        .await?;
 
     for (table_name, new_table) in &schema.tables {
         let old_table = previous.as_ref().and_then(|s| s.tables.get(table_name));
@@ -218,6 +248,39 @@ pub async fn push_schema(
                 sqlx::query(&format!(
                     "CREATE INDEX \"{index_ident}\" ON \"{pg_schema_name}\".\"{table_ident}\" \
                      USING GIN (\"{sv_col}\")"
+                ))
+                .execute(&mut *tx)
+                .await?;
+            } else if let Some(vec_spec) = &index.vector {
+                // Vector index: a plain `vector(N)` column (write-maintained by
+                // Task 5, not generated — pgvector has no jsonb->vector generated
+                // cast) plus an HNSW cosine index. The filterFields' `f_` columns
+                // already exist (created with the table / added+backfilled above).
+                let v_col = pg_vector_col(&index.name);
+                let dim = vec_spec.dimensions;
+                let vfield = index
+                    .fields
+                    .first()
+                    .ok_or_else(|| RtDbError::internal("vector index missing its field"))?;
+                sqlx::query(&format!(
+                    "ALTER TABLE \"{pg_schema_name}\".\"{table_ident}\" \
+                     ADD COLUMN \"{v_col}\" vector({dim})"
+                ))
+                .execute(&mut *tx)
+                .await?;
+                // Backfill from existing rows (no-op on a brand-new table).
+                // `vfield` is a doc field name validated by is_valid_identifier
+                // in Task 3, and lives in a string literal here, not an identifier.
+                sqlx::query(&format!(
+                    "UPDATE \"{pg_schema_name}\".\"{table_ident}\" \
+                     SET \"{v_col}\" = (doc->>'{vfield}')::vector \
+                     WHERE doc ? '{vfield}'"
+                ))
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query(&format!(
+                    "CREATE INDEX \"{index_ident}\" ON \"{pg_schema_name}\".\"{table_ident}\" \
+                     USING hnsw (\"{v_col}\" vector_cosine_ops)"
                 ))
                 .execute(&mut *tx)
                 .await?;
