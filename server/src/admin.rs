@@ -14,17 +14,44 @@ use crate::http_api::ApiJson;
 use crate::schema::SchemaDef;
 use crate::{AppState, auth, db, ddl, snapshot};
 
-fn require_admin(headers: &HeaderMap, expected: &str) -> Result<(), RtDbError> {
-    let provided = headers
+/// Who an admin request was made as: the raw admin key (CLI/automation) or an
+/// OAuth user on the server-wide admin allowlist (browser dashboard).
+#[allow(dead_code)] // `User`'s payload is consumed by Task 3's admin routes.
+pub(crate) enum AdminPrincipal {
+    Key,
+    User(auth::Principal),
+}
+
+fn bearer_value(headers: &HeaderMap) -> Result<&str, RtDbError> {
+    headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
-        .ok_or_else(|| RtDbError::unauthorized("missing admin bearer token"))?;
+        .ok_or_else(|| RtDbError::unauthorized("missing admin bearer token"))
+}
 
-    if bool::from(provided.as_bytes().ct_eq(expected.as_bytes())) {
-        Ok(())
+/// Admin gate. Tries the raw admin key first (constant-time compare), then a
+/// resolved session/machine principal — admitting only OAuth users present in
+/// `rtdb_auth.admins`. Machine tokens and non-allowlisted/expired users are
+/// rejected. The admin-key path returns before any DB lookup, so machine/CLI
+/// admin calls stay cheap; the session path costs one `resolve_bearer` + one
+/// `is_admin` query per request (acceptable for low-frequency dashboard traffic).
+pub(crate) async fn require_admin(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<AdminPrincipal, RtDbError> {
+    let provided = bearer_value(headers)?;
+    if bool::from(provided.as_bytes().ct_eq(state.config.admin_key.as_bytes())) {
+        return Ok(AdminPrincipal::Key);
+    }
+    let principal = match auth::resolve_bearer(&state.pool, provided).await {
+        Ok(principal) => principal,
+        Err(_) => return Err(RtDbError::unauthorized("invalid admin credential")),
+    };
+    if auth::is_admin(&state.pool, &principal).await {
+        Ok(AdminPrincipal::User(principal))
     } else {
-        Err(RtDbError::unauthorized("invalid admin key"))
+        Err(RtDbError::forbidden("not a dashboard admin"))
     }
 }
 
@@ -43,7 +70,7 @@ async fn create_db(
     headers: HeaderMap,
     ApiJson(body): ApiJson<CreateDbRequest>,
 ) -> Result<Json<OkResponse>, RtDbError> {
-    require_admin(&headers, &state.config.admin_key)?;
+    require_admin(&state, &headers).await?;
     db::create_database(&state.pool, &body.name).await?;
     Ok(Json(OkResponse { ok: true }))
 }
@@ -59,7 +86,7 @@ async fn push_schema(
     headers: HeaderMap,
     ApiJson(body): ApiJson<PushSchemaRequest>,
 ) -> Result<Json<OkResponse>, RtDbError> {
-    require_admin(&headers, &state.config.admin_key)?;
+    require_admin(&state, &headers).await?;
     let applied = ddl::push_schema(&state.pool, &body.db, body.schema).await?;
     state.schemas.put(&body.db, applied).await;
     Ok(Json(OkResponse { ok: true }))
@@ -74,7 +101,7 @@ async fn list_dbs(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<DatabasesResponse>, RtDbError> {
-    require_admin(&headers, &state.config.admin_key)?;
+    require_admin(&state, &headers).await?;
     let databases = db::list_databases(&state.pool).await?;
     Ok(Json(DatabasesResponse { databases }))
 }
@@ -97,7 +124,7 @@ async fn mint_token(
     headers: HeaderMap,
     ApiJson(body): ApiJson<MintTokenRequest>,
 ) -> Result<Json<MintTokenResponse>, RtDbError> {
-    require_admin(&headers, &state.config.admin_key)?;
+    require_admin(&state, &headers).await?;
     if !db::database_exists(&state.pool, &body.db).await? {
         return Err(RtDbError::bad_request("unknown database"));
     }
@@ -116,7 +143,7 @@ async fn revoke_token(
     headers: HeaderMap,
     ApiJson(body): ApiJson<RevokeTokenRequest>,
 ) -> Result<Json<OkResponse>, RtDbError> {
-    require_admin(&headers, &state.config.admin_key)?;
+    require_admin(&state, &headers).await?;
     auth::tokens::revoke_token(&state.pool, &body.token_id).await?;
     Ok(Json(OkResponse { ok: true }))
 }
@@ -133,7 +160,7 @@ async fn allowlist_write(
     headers: HeaderMap,
     ApiJson(body): ApiJson<AllowlistWriteRequest>,
 ) -> Result<Json<OkResponse>, RtDbError> {
-    require_admin(&headers, &state.config.admin_key)?;
+    require_admin(&state, &headers).await?;
     if !db::database_exists(&state.pool, &body.db).await? {
         return Err(RtDbError::bad_request("unknown database"));
     }
@@ -180,7 +207,7 @@ async fn allowlist_list(
     headers: HeaderMap,
     QueryParams(params): QueryParams<AllowlistListParams>,
 ) -> Result<Json<AllowlistListResponse>, RtDbError> {
-    require_admin(&headers, &state.config.admin_key)?;
+    require_admin(&state, &headers).await?;
     if !db::database_exists(&state.pool, &params.db).await? {
         return Err(RtDbError::bad_request("unknown database"));
     }
@@ -209,7 +236,7 @@ async fn export_db(
     headers: HeaderMap,
     QueryParams(params): QueryParams<ExportDbParams>,
 ) -> Result<Response, RtDbError> {
-    require_admin(&headers, &state.config.admin_key)?;
+    require_admin(&state, &headers).await?;
     if !db::database_exists(&state.pool, &params.db).await? {
         return Err(RtDbError::not_found("unknown database"));
     }
@@ -236,7 +263,7 @@ async fn import_db(
     QueryParams(params): QueryParams<ImportDbParams>,
     body: String,
 ) -> Result<Json<OkResponse>, RtDbError> {
-    require_admin(&headers, &state.config.admin_key)?;
+    require_admin(&state, &headers).await?;
     match snapshot::import_database(&state.pool, &params.db, &body).await {
         Ok(applied) => {
             state.schemas.put(&params.db, applied).await;

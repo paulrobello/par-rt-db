@@ -148,6 +148,32 @@ pub async fn seed_admin_emails(pool: &PgPool, emails: &[String]) -> Result<(), R
     Ok(())
 }
 
+/// Whether `principal` is a server-wide dashboard admin — present in
+/// `rtdb_auth.admins` by email (lowercased) or GitHub id. Machine principals are
+/// never admin. Used by the admin gate (`admin::require_admin`) and the dashboard
+/// WS bypass (Phase 5). Returns `false` on DB error rather than propagating, so a
+/// transient failure degrades to "not admin" (deny) without an error envelope.
+pub async fn is_admin(pool: &PgPool, principal: &Principal) -> bool {
+    let Principal::User {
+        email, github_id, ..
+    } = principal
+    else {
+        return false;
+    };
+    let email = email.to_lowercase();
+    let Ok(exists) = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM rtdb_auth.admins WHERE email = $1 OR github_id = $2)",
+    )
+    .bind(&email)
+    .bind(*github_id)
+    .fetch_one(pool)
+    .await
+    else {
+        return false;
+    };
+    exists
+}
+
 /// Wire-facing identity for a resolved principal (see `protocol::AuthedUser`).
 /// A machine token's name is not an identity, so `name` is always `None` for
 /// `Machine`.

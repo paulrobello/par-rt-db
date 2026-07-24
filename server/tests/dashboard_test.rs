@@ -18,10 +18,17 @@ async fn seed_admin_emails_lowercases_and_is_idempotent() -> anyhow::Result<()> 
     // Re-seed the same address: ON CONFLICT DO NOTHING keeps it a single row.
     rtdb_server::auth::seed_admin_emails(&pool, &["foo@bar.com".to_string()]).await?;
 
-    let rows: Vec<(String, Option<i64>)> =
-        sqlx::query_as("SELECT email, github_id FROM rtdb_auth.admins ORDER BY email")
-            .fetch_all(&pool)
-            .await?;
+    // Assert the two seeded rows exist with NULL github_id. `rtdb_auth.admins` is
+    // a shared global table (other tests insert their own rows), so we probe by
+    // email rather than asserting the whole table — matching the isolation
+    // convention in `per_row_auth_test` / `oauth_test`.
+    let rows: Vec<(String, Option<i64>)> = sqlx::query_as(
+        "SELECT email, github_id FROM rtdb_auth.admins WHERE email IN ($1, $2) ORDER BY email",
+    )
+    .bind("a@b.com")
+    .bind("foo@bar.com")
+    .fetch_all(&pool)
+    .await?;
     assert_eq!(
         rows,
         vec![
@@ -29,5 +36,104 @@ async fn seed_admin_emails_lowercases_and_is_idempotent() -> anyhow::Result<()> 
             ("foo@bar.com".to_string(), None),
         ]
     );
+    Ok(())
+}
+
+// Create an OAuth user + session and return the plaintext session bearer.
+async fn user_session(
+    state: &std::sync::Arc<rtdb_server::AppState>,
+    email: &str,
+    github_id: Option<i64>,
+) -> String {
+    let pool = &state.pool;
+    let user_id = format!("u{}", uuid::Uuid::now_v7().simple());
+    sqlx::query(
+        "INSERT INTO rtdb_auth.users (id, github_id, login, email, created_at) \
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(&user_id)
+    .bind(github_id)
+    .bind(email)
+    .bind(email)
+    .bind(rtdb_server::db::now_ms())
+    .execute(pool)
+    .await
+    .unwrap();
+    rtdb_server::auth::session::create_session(pool, &user_id, 30)
+        .await
+        .unwrap()
+}
+
+async fn resolve_principal(
+    state: &std::sync::Arc<rtdb_server::AppState>,
+    token: &str,
+) -> rtdb_server::auth::Principal {
+    rtdb_server::auth::resolve_bearer(&state.pool, token)
+        .await
+        .unwrap()
+}
+
+// is_admin is false with no admins; true when the user's email is allowlisted;
+// true when the user's github_id is allowlisted (independently of email).
+//
+// Emails + github_id are unique per run: `rtdb_auth.users` enforces UNIQUE on
+// both and `rtdb_auth.admins.email` is the PK, all shared across test runs
+// against the persistent dev Postgres (same convention as `per_row_auth_test` /
+// `oauth_test`, which suffix emails with a uuid).
+#[tokio::test]
+async fn is_admin_matches_email_or_github_id() -> anyhow::Result<()> {
+    let state = common::test_state().await;
+    let pool = state.pool.clone();
+    let uid = uuid::Uuid::now_v7().simple().to_string();
+    let gh_id: i64 = i64::from_str_radix(&uid[..15], 16).expect("parse hex as i64");
+    let email_addr = format!("owner-{uid}@example.com");
+    let gh_addr = format!("ghonly-{uid}@example.com");
+    let stranger_addr = format!("stranger-{uid}@example.com");
+
+    let email_tok = user_session(&state, &email_addr, None).await;
+    let gh_tok = user_session(&state, &gh_addr, Some(gh_id)).await;
+    let stranger_tok = user_session(&state, &stranger_addr, None).await;
+
+    // No admins yet → nobody is admin.
+    assert!(
+        !rtdb_server::auth::is_admin(&pool, &resolve_principal(&state, &email_tok).await).await
+    );
+
+    // Add owner by email.
+    sqlx::query("INSERT INTO rtdb_auth.admins (email, github_id, added_at) VALUES ($1, NULL, $2)")
+        .bind(&email_addr)
+        .bind(rtdb_server::db::now_ms())
+        .execute(&pool)
+        .await?;
+    assert!(rtdb_server::auth::is_admin(&pool, &resolve_principal(&state, &email_tok).await).await);
+
+    // gh user is not yet admin (no email match, github_id not listed).
+    assert!(!rtdb_server::auth::is_admin(&pool, &resolve_principal(&state, &gh_tok).await).await);
+
+    // Add an admin row keyed on gh_id under an unrelated email → gh user matches.
+    sqlx::query("INSERT INTO rtdb_auth.admins (email, github_id, added_at) VALUES ($1, $2, $3)")
+        .bind(format!("someone-else-{uid}@example.com"))
+        .bind(gh_id)
+        .bind(rtdb_server::db::now_ms())
+        .execute(&pool)
+        .await?;
+    assert!(rtdb_server::auth::is_admin(&pool, &resolve_principal(&state, &gh_tok).await).await);
+
+    // A user matched by neither is not admin.
+    assert!(
+        !rtdb_server::auth::is_admin(&pool, &resolve_principal(&state, &stranger_tok).await).await
+    );
+    Ok(())
+}
+
+// The admin-key path still authorizes after the require_admin rewrite.
+#[tokio::test]
+async fn admin_key_path_still_authorizes() -> anyhow::Result<()> {
+    let state = common::test_state().await;
+    let addr = common::spawn_app(state).await;
+
+    // /admin/admins is added in Task 3; use an existing route to prove the key path.
+    let resp = common::admin_get(addr, "/admin/dbs").await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
     Ok(())
 }
