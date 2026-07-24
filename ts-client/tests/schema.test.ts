@@ -165,3 +165,26 @@ describe("vectorIndex builder", () => {
     expect(s.toJSON().tables.docs.indexes).toEqual([{ name: "by_user", fields: ["userId"] }]);
   });
 });
+
+describe("ownerField builder", () => {
+  it("emits ownerField on the wire when set, alongside an index", () => {
+    const s = defineSchema({
+      notes: defineTable({ userId: t.string(), title: t.string() })
+        .index("by_user", ["userId"])
+        .ownerField("userId"),
+    });
+    expect(s.toJSON().tables.notes).toMatchObject({
+      fields: {
+        userId: { type: "string" },
+        title: { type: "string" },
+      },
+      indexes: [{ name: "by_user", fields: ["userId"] }],
+      ownerField: "userId",
+    });
+  });
+
+  it("omits ownerField on the wire when absent", () => {
+    const s = defineSchema({ notes: defineTable({ title: t.string() }) });
+    expect(s.toJSON().tables.notes).not.toHaveProperty("ownerField");
+  });
+});

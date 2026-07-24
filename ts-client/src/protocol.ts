@@ -184,6 +184,10 @@ export interface IndexJson {
 export interface TableJson {
   fields: Record<string, FieldTypeJson>;
   indexes?: IndexJson[];
+  /** Opt-in per-row authorization: names a declared string-compatible field
+   * whose value is the owning user's id. Server-enforced; clients only declare
+   * it. Omitted on the wire when unset. */
+  ownerField?: string;
 }
 
 export interface SchemaJson {

@@ -88,13 +88,18 @@ export class TableDefinition<
   constructor(
     readonly fields: Fields,
     readonly indexes: IndexJson[] = [],
+    readonly ownerFieldName?: string,
   ) {}
 
   index<Name extends string>(
     name: Name,
     fields: [keyof Fields & string, ...(keyof Fields & string)[]],
   ): TableDefinition<Fields, Indexes | Name> {
-    return new TableDefinition(this.fields, [...this.indexes, { name, fields: [...fields] }]);
+    return new TableDefinition(
+      this.fields,
+      [...this.indexes, { name, fields: [...fields] }],
+      this.ownerFieldName,
+    );
   }
 
   /** Declare a full-text search index. The server tsvectorizes the (text)
@@ -104,10 +109,11 @@ export class TableDefinition<
     name: Name,
     fields: [keyof Fields & string, ...(keyof Fields & string)[]],
   ): TableDefinition<Fields, Indexes | Name> {
-    return new TableDefinition(this.fields, [
-      ...this.indexes,
-      { name, fields: [...fields], search: true },
-    ]);
+    return new TableDefinition(
+      this.fields,
+      [...this.indexes, { name, fields: [...fields], search: true }],
+      this.ownerFieldName,
+    );
   }
 
   /** Declare a vector (approximate nearest-neighbor) index. `field` is a single
@@ -120,23 +126,37 @@ export class TableDefinition<
     dimensions: number,
     filterFields: (keyof Fields & string)[] = [],
   ): TableDefinition<Fields, Indexes | Name> {
-    return new TableDefinition(this.fields, [
-      ...this.indexes,
-      {
-        name,
-        fields: [field],
-        vector: {
-          dimensions,
-          ...(filterFields.length > 0 ? { filterFields: [...filterFields] } : {}),
+    return new TableDefinition(
+      this.fields,
+      [
+        ...this.indexes,
+        {
+          name,
+          fields: [field],
+          vector: {
+            dimensions,
+            ...(filterFields.length > 0 ? { filterFields: [...filterFields] } : {}),
+          },
         },
-      },
-    ]);
+      ],
+      this.ownerFieldName,
+    );
+  }
+
+  /** Declare the per-row owner field for authorization. `field` names a declared
+   * string-compatible field whose value is the owning user's id. Server-enforced;
+   * the client only declares it and round-trips it on the wire as `ownerField`. */
+  ownerField(field: string): TableDefinition<Fields, Indexes> {
+    return new TableDefinition(this.fields, this.indexes, field);
   }
 
   toJSON(): TableJson {
     const json: TableJson = { fields: fieldsToJson(this.fields) };
     if (this.indexes.length > 0) {
       json.indexes = this.indexes;
+    }
+    if (this.ownerFieldName) {
+      json.ownerField = this.ownerFieldName;
     }
     return json;
   }

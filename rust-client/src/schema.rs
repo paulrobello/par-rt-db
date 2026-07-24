@@ -93,6 +93,18 @@ pub struct TableDef {
     pub fields: BTreeMap<String, FieldType>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub indexes: Option<Vec<IndexDef>>,
+    /// Opt-in per-row authorization: names a declared, string-compatible field
+    /// whose value is the owning user's id. When set, an authenticated user
+    /// reads/mutates only their own rows on this table; machine tokens and
+    /// scheduled jobs bypass. Server-enforced; clients only declare it.
+    /// Mirrors `server/src/schema.rs::TableDef` byte-for-byte — the explicit
+    /// `rename` is required because this struct has no container `rename_all`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "ownerField"
+    )]
+    pub owner_field: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -106,6 +118,7 @@ pub type Schema = SchemaDef;
 pub struct TableBuilder {
     fields: BTreeMap<String, FieldType>,
     indexes: Vec<IndexDef>,
+    owner_field: Option<String>,
 }
 
 impl TableBuilder {
@@ -113,6 +126,7 @@ impl TableBuilder {
         Self {
             fields: BTreeMap::new(),
             indexes: Vec::new(),
+            owner_field: None,
         }
     }
     pub fn field(mut self, name: &str, ft: FieldType) -> Self {
@@ -162,6 +176,15 @@ impl TableBuilder {
         });
         self
     }
+
+    /// Declare the per-row owner field for authorization. `field` names a
+    /// declared string-compatible field whose value is the owning user's id.
+    /// Server-enforced; the client only declares it and round-trips it on the
+    /// wire as `ownerField`.
+    pub fn owner_field(mut self, field: &str) -> Self {
+        self.owner_field = Some(field.into());
+        self
+    }
     fn finish(self) -> TableDef {
         let indexes = if self.indexes.is_empty() {
             None
@@ -171,6 +194,7 @@ impl TableBuilder {
         TableDef {
             fields: self.fields,
             indexes,
+            owner_field: self.owner_field,
         }
     }
 }
@@ -435,6 +459,31 @@ mod tests {
                 .get("filterFields")
                 .is_none(),
             "empty filter_fields must omit filterFields on the wire"
+        );
+    }
+
+    #[test]
+    fn owner_field_serializes_and_round_trips() {
+        // `ownerField` is an opt-in, string-typed authorization hint: present on
+        // the wire (camelCase) when set, omitted entirely when absent, mirroring
+        // `server/src/schema.rs::TableDef` byte-for-byte. Enforcement is
+        // server-only; the client only declares and round-trips it.
+        let td = Table::new()
+            .field("userId", FieldType::String)
+            .field("title", FieldType::String)
+            .index("by_user", &["userId"])
+            .owner_field("userId")
+            .finish();
+        let json = serde_json::to_value(&td).unwrap();
+        assert_eq!(json["ownerField"], "userId");
+        // Round-trips back through the wire type.
+        let back: TableDef = serde_json::from_value(json).unwrap();
+        assert_eq!(back.owner_field.as_deref(), Some("userId"));
+        // Absent -> omitted entirely (not serialized as null).
+        let none = Table::new().field("title", FieldType::String).finish();
+        assert!(
+            !serde_json::to_string(&none).unwrap().contains("ownerField"),
+            "ownerField must be omitted on the wire when unset"
         );
     }
 }
