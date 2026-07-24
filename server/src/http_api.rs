@@ -244,7 +244,12 @@ pub fn http_api_routes() -> Router<Arc<AppState>> {
         )
         // Authed serve — bearer authorizes `{db}`; id must live in that db's
         // table (404 otherwise, enforcing cross-db isolation).
-        .route("/api/storage/{db}/{id}", get(serve_authed_handler))
+        .route(
+            "/api/storage/{db}/{id}",
+            get(serve_authed_handler).delete(delete_handler),
+        )
+        // Metadata — same auth + cross-db isolation as authed serve.
+        .route("/api/storage/{db}/{id}/metadata", get(metadata_handler))
         // Public, unauthenticated serve — the one unauthenticated route in the
         // server, by design. The opaque id resolves to its owning db via the
         // global index.
@@ -334,4 +339,40 @@ async fn serve_bytes(state: &Arc<AppState>, db: &str, id: &str) -> Result<Respon
         .header(header::CONTENT_TYPE, ct)
         .body(Body::from(bytes))
         .map_err(|err| RtDbError::internal(format!("failed to build serve response: {err}")))
+}
+
+#[derive(Serialize)]
+struct OkResponse {
+    ok: bool,
+}
+
+/// Delete a stored file. Idempotent: deleting a missing id still returns
+/// `{ ok: true }`. Both the per-db blob row and the global `storage_index`
+/// row are removed, so the public URL 404s afterward.
+async fn delete_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((db, id)): Path<(String, String)>,
+) -> Result<Json<OkResponse>, RtDbError> {
+    let token = bearer_token(&headers)?;
+    let principal = resolve_bearer(&state.pool, token).await?;
+    authorize(&state.pool, &principal, &db).await?;
+    storage::delete(&state.pool, &db, &id).await?;
+    Ok(Json(OkResponse { ok: true }))
+}
+
+/// Fetch a stored file's metadata. `contentType` is omitted from the response
+/// when the upload supplied no content-type. Unknown id → `NotFound`.
+async fn metadata_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((db, id)): Path<(String, String)>,
+) -> Result<Json<storage::FileMeta>, RtDbError> {
+    let token = bearer_token(&headers)?;
+    let principal = resolve_bearer(&state.pool, token).await?;
+    authorize(&state.pool, &principal, &db).await?;
+    let meta = storage::get_meta(&state.pool, &db, &id)
+        .await?
+        .ok_or_else(|| RtDbError::not_found("unknown file"))?;
+    Ok(Json(meta))
 }

@@ -121,6 +121,10 @@ use axum::http::StatusCode;
 use serde_json::json;
 use sha2::Digest;
 use std::net::SocketAddr;
+use std::sync::Arc;
+
+use rtdb_server::AppState;
+use rtdb_server::auth::{self, Principal};
 
 /// Mint a machine token for `db` via the admin route and return the bare token
 /// string. Mirrors the helper in `http_api_test.rs` (which is private per-file).
@@ -134,6 +138,61 @@ async fn mint_token(addr: SocketAddr, db: &str) -> String {
     assert_eq!(resp.status(), StatusCode::OK);
     let body: serde_json::Value = resp.json().await.expect("parse mint-token response");
     body["token"].as_str().expect("token").to_string()
+}
+
+/// Upload `body` bytes to `/api/storage/{db}` with a content-type header and
+/// return the server-assigned id. Shared by the delete/metadata tests below.
+async fn upload(addr: &SocketAddr, db: &str, token: &str, body: &[u8]) -> String {
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/api/storage/{db}"))
+        .bearer_auth(token)
+        .header("content-type", "application/octet-stream")
+        .body(body.to_vec())
+        .send()
+        .await
+        .expect("upload");
+    assert_eq!(resp.status(), StatusCode::OK);
+    resp.json::<serde_json::Value>().await.expect("json")["id"]
+        .as_str()
+        .expect("id")
+        .to_string()
+}
+
+/// Upload without a content-type header (exercises the null-contentType path).
+async fn upload_no_ct(addr: &SocketAddr, db: &str, token: &str, body: &[u8]) -> String {
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/api/storage/{db}"))
+        .bearer_auth(token)
+        .body(body.to_vec())
+        .send()
+        .await
+        .expect("upload");
+    assert_eq!(resp.status(), StatusCode::OK);
+    resp.json::<serde_json::Value>().await.expect("json")["id"]
+        .as_str()
+        .expect("id")
+        .to_string()
+}
+
+/// Revoke `token` via the admin surface. The admin endpoint keys on tokenId,
+/// so resolve the plaintext token to its id through the auth path first
+/// (mirroring http_api_test's mint-returns-(id, token) flow).
+async fn revoke_token(addr: &SocketAddr, state: &Arc<AppState>, db: &str, token: &str) {
+    let principal = auth::resolve_bearer(&state.pool, token)
+        .await
+        .expect("resolve token");
+    let token_id = match principal {
+        Principal::Machine {
+            token_id,
+            db: token_db,
+        } => {
+            assert_eq!(token_db, db, "token not minted for this db");
+            token_id
+        }
+        _ => panic!("expected machine principal"),
+    };
+    let resp = admin_post(*addr, "/admin/revoke-token", json!({"tokenId": token_id})).await;
+    assert_eq!(resp.status(), StatusCode::OK);
 }
 
 #[tokio::test]
@@ -282,5 +341,88 @@ async fn cross_db_authed_serve_is_404() -> anyhow::Result<()> {
         .send()
         .await?;
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    Ok(())
+}
+
+// --- HTTP delete + metadata routes (DELETE /api/storage/{db}/{id},
+//      GET /api/storage/{db}/{id}/metadata) ---
+
+#[tokio::test]
+async fn delete_revokes_public_url() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let db = fresh_db(&state).await;
+    let token = mint_token(addr, &db).await;
+
+    let id = upload(&addr, &db, &token, b"to delete").await;
+    assert_eq!(
+        reqwest::get(format!("http://{addr}/storage/{id}"))
+            .await?
+            .status(),
+        StatusCode::OK
+    );
+
+    let del = reqwest::Client::new()
+        .delete(format!("http://{addr}/api/storage/{db}/{id}"))
+        .bearer_auth(&token)
+        .send()
+        .await?;
+    assert_eq!(del.status(), StatusCode::OK);
+    assert_eq!(del.json::<serde_json::Value>().await?["ok"], json!(true));
+
+    // Public URL now 404s — the index row is gone.
+    assert_eq!(
+        reqwest::get(format!("http://{addr}/storage/{id}"))
+            .await?
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn metadata_returns_fields_and_omits_null_content_type() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let db = fresh_db(&state).await;
+    let token = mint_token(addr, &db).await;
+
+    // Upload with no content-type.
+    let id = upload_no_ct(&addr, &db, &token, b"meta").await;
+    let body: serde_json::Value = reqwest::Client::new()
+        .get(format!("http://{addr}/api/storage/{db}/{id}/metadata"))
+        .bearer_auth(&token)
+        .send()
+        .await?
+        .json()
+        .await?;
+    assert_eq!(body["id"], json!(id));
+    assert_eq!(body["size"], json!(4));
+    assert!(body["sha256"].is_string());
+    assert_eq!(
+        body.get("contentType"),
+        None,
+        "contentType omitted when null"
+    );
+    assert!(body["creationTime"].is_i64());
+    Ok(())
+}
+
+#[tokio::test]
+async fn revoked_token_cannot_delete() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let db = fresh_db(&state).await;
+    let token = mint_token(addr, &db).await;
+    let id = upload(&addr, &db, &token, b"x").await;
+
+    // Revoke via the admin surface, then retry the delete.
+    revoke_token(&addr, &state, &db, &token).await;
+    let resp = reqwest::Client::new()
+        .delete(format!("http://{addr}/api/storage/{db}/{id}"))
+        .bearer_auth(&token)
+        .send()
+        .await?;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     Ok(())
 }
