@@ -290,20 +290,26 @@ struct AdminsResponse {
     admins: Vec<AdminMember>,
 }
 
+/// All dashboard admins, email-ordered. Shared by `list_admins` and the config
+/// read-back so the dashboard can render the allowlist alongside hot config.
+async fn admin_members(pool: &sqlx::PgPool) -> Result<Vec<AdminMember>, RtDbError> {
+    let rows: Vec<(String, Option<i64>)> =
+        sqlx::query_as("SELECT email, github_id FROM rtdb_auth.admins ORDER BY email")
+            .fetch_all(pool)
+            .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(email, github_id)| AdminMember { email, github_id })
+        .collect())
+}
+
 async fn list_admins(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<AdminsResponse>, RtDbError> {
     require_admin(&state, &headers).await?;
-    let rows: Vec<(String, Option<i64>)> =
-        sqlx::query_as("SELECT email, github_id FROM rtdb_auth.admins ORDER BY email")
-            .fetch_all(&state.pool)
-            .await?;
     Ok(Json(AdminsResponse {
-        admins: rows
-            .into_iter()
-            .map(|(email, github_id)| AdminMember { email, github_id })
-            .collect(),
+        admins: admin_members(&state.pool).await?,
     }))
 }
 
@@ -490,6 +496,103 @@ async fn metrics_handler(
     ))
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ConfigResponse {
+    port: u16,
+    public_url: String,
+    github_base_url: String,
+    github_api_url: String,
+    database_url_configured: bool,
+    admin_key_configured: bool,
+    github_configured: bool,
+    google_configured: bool,
+    hot: crate::config::HotConfig,
+    version: &'static str,
+    git_commit: &'static str,
+    admins: Vec<AdminMember>,
+}
+
+/// Builds the redacted config view from current boot + hot state. Secrets never
+/// appear: `admin_key`, OAuth secrets, and `database_url` (which embeds DB
+/// credentials) collapse to configured-bools; hot values are shown in full.
+async fn build_config_response(state: &AppState) -> Result<ConfigResponse, RtDbError> {
+    let cfg = &state.config;
+    let hot = state.hot.load();
+    Ok(ConfigResponse {
+        port: cfg.port,
+        public_url: cfg.public_url.clone(),
+        github_base_url: cfg.github_base_url.clone(),
+        github_api_url: cfg.github_api_url.clone(),
+        database_url_configured: !cfg.database_url.is_empty(),
+        admin_key_configured: !cfg.admin_key.is_empty(),
+        github_configured: cfg.github_client_id.is_some() && cfg.github_client_secret.is_some(),
+        google_configured: cfg.google_client_id.is_some() && cfg.google_client_secret.is_some(),
+        hot: (**hot).clone(),
+        version: env!("CARGO_PKG_VERSION"),
+        git_commit: env!("BUILD_GIT_COMMIT"),
+        admins: admin_members(&state.pool).await?,
+    })
+}
+
+/// `GET /admin/config` — redacted running configuration (boot masked, hot shown
+/// in full) plus build identity and the admin allowlist.
+async fn get_config(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<ConfigResponse>, RtDbError> {
+    require_admin(&state, &headers).await?;
+    Ok(Json(build_config_response(&state).await?))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct HotConfigPatch {
+    allowed_origins: Option<Vec<String>>,
+    session_ttl_days: Option<i64>,
+    max_file_size: Option<usize>,
+}
+
+/// `PATCH /admin/config` — apply a subset patch to the hot config, validate,
+/// persist the merged row to `rtdb_config`, swap the `ArcSwap`, and return the
+/// new redacted config. Unknown fields (`deny_unknown_fields`) and invalid
+/// values are `BadRequest`; each provided field fully replaces the prior value.
+async fn patch_config(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    ApiJson(patch): ApiJson<HotConfigPatch>,
+) -> Result<Json<ConfigResponse>, RtDbError> {
+    require_admin(&state, &headers).await?;
+    let mut next: crate::config::HotConfig = (**state.hot.load()).clone();
+    if let Some(origins) = &patch.allowed_origins {
+        next.allowed_origins = origins
+            .iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+    }
+    if let Some(ttl) = patch.session_ttl_days {
+        if ttl < 1 {
+            return Err(RtDbError::bad_request("sessionTtlDays must be >= 1"));
+        }
+        next.session_ttl_days = ttl;
+    }
+    if let Some(size) = patch.max_file_size {
+        if size == 0 {
+            return Err(RtDbError::bad_request("maxFileSize must be > 0"));
+        }
+        next.max_file_size = size;
+    }
+    if !next.origins_valid() {
+        return Err(RtDbError::bad_request(
+            "allowedOrigins contains an invalid origin",
+        ));
+    }
+    crate::config::save_hot(&state.pool, &next).await?;
+    state.hot.store(Arc::new(next));
+    Ok(Json(build_config_response(&state).await?))
+}
+
 #[derive(Deserialize)]
 struct OpsRecentParams {
     db: Option<String>,
@@ -632,6 +735,7 @@ pub fn admin_routes() -> Router<Arc<AppState>> {
         .route("/admin/dbs/{db}/schema", get(get_schema))
         .route("/admin/dbs/{db}/stats", get(db_stats))
         .route("/admin/metrics", get(metrics_handler))
+        .route("/admin/config", get(get_config).patch(patch_config))
         .route("/admin/ops/recent", get(ops_recent))
         .route("/admin/stream", get(admin_stream))
         .route("/admin/tokens", get(list_tokens))
