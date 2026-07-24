@@ -212,6 +212,7 @@ async fn insert_maintains_vector_column() {
                 doc: vec_doc(vec![1.0, 2.0, 3.0]),
             }],
         },
+        None,
     )
     .await
     .expect("insert vector doc");
@@ -244,6 +245,7 @@ async fn patch_maintains_vector_column() {
                 doc: vec_doc(vec![1.0, 2.0, 3.0]),
             }],
         },
+        None,
     )
     .await
     .expect("insert vector doc");
@@ -266,6 +268,7 @@ async fn patch_maintains_vector_column() {
                 fields,
             }],
         },
+        None,
     )
     .await
     .expect("patch vector embedding");
@@ -299,6 +302,7 @@ async fn vector_search_ranks_by_cosine_and_applies_limit() {
                     doc: vec_doc(emb.to_vec()),
                 }],
             },
+            None,
         )
         .await
         .expect("insert vector doc");
@@ -496,6 +500,7 @@ async fn vector_search_applies_eq_filter() {
                     doc,
                 }],
             },
+            None,
         )
         .await
         .expect("insert vector doc with userId");

@@ -113,6 +113,7 @@ async fn insert_rejects_invalid_values_for_each_new_type() -> anyhow::Result<()>
                     doc: fields,
                 }],
             },
+            None,
         )
         .await
         .expect_err("invalid value must be a schema violation");
@@ -137,6 +138,7 @@ async fn document_round_trips_through_insert_patch_and_query() -> anyhow::Result
                 doc: valid_widget_doc(),
             }],
         },
+        None,
     )
     .await?;
     let id = outcome.results[0]["id"]
@@ -158,6 +160,7 @@ async fn document_round_trips_through_insert_patch_and_query() -> anyhow::Result
                 })),
             }],
         },
+        None,
     )
     .await?;
 

@@ -2,6 +2,7 @@ mod common;
 
 use common::test_state;
 use rtdb_server::ddl::push_schema;
+use rtdb_server::error::ErrorCode;
 use rtdb_server::protocol::ServerMessage;
 use rtdb_server::query::{Query, QueryResult, execute_query};
 use rtdb_server::schema::{FieldType, IndexDef, SchemaDef, TableDef, VectorIndexSpec};
@@ -89,6 +90,7 @@ async fn seed_note(pool: &PgPool, db: &str, schema: &SchemaDef, title: &str, uid
                 doc,
             }],
         },
+        None,
     )
     .await
     .expect("seed insert");
@@ -106,6 +108,25 @@ fn titles(res: QueryResult) -> Vec<String> {
             .map(|d| d["title"].as_str().expect("title").to_string())
             .collect(),
         other => panic!("expected Docs, got {other:?}"),
+    }
+}
+
+/// Fetches a single `notes` doc by id with a bypass caller (sees every row),
+/// decoupling write-enforcement tests from the read-path filtering tests.
+async fn fetch_doc(
+    pool: &PgPool,
+    db: &str,
+    schema: &SchemaDef,
+    id: &str,
+) -> Option<serde_json::Value> {
+    let mut q = notes_query();
+    q.get = Some(id.to_string());
+    match execute_query(pool, db, schema, &q, None)
+        .await
+        .expect("fetch_doc query")
+    {
+        QueryResult::Doc(v) => v,
+        other => panic!("expected Doc, got {other:?}"),
     }
 }
 
@@ -217,6 +238,7 @@ async fn non_owner_table_is_unaffected_by_owner() -> anyhow::Result<()> {
                     doc,
                 }],
             },
+            None,
         )
         .await?;
     }
@@ -325,6 +347,7 @@ async fn fan_out_does_not_push_cross_user_rows() -> anyhow::Result<()> {
                     doc,
                 }],
             },
+            None,
         )
         .await?;
 
@@ -407,6 +430,7 @@ async fn search_filters_to_own_rows() -> anyhow::Result<()> {
                     doc,
                 }],
             },
+            None,
         )
         .await?;
     }
@@ -483,6 +507,7 @@ async fn vector_search_filters_to_own_rows() -> anyhow::Result<()> {
                     doc,
                 }],
             },
+            None,
         )
         .await?;
     }
@@ -519,5 +544,310 @@ async fn vector_search_filters_to_own_rows() -> anyhow::Result<()> {
     let mut bypass = owners(execute_query(&pool, &db, &schema, &q, None).await?);
     bypass.sort();
     assert_eq!(bypass, vec!["alice".to_string(), "bob".to_string()]);
+    Ok(())
+}
+
+// (8) On insert into an owner-gated table, the server stamps the caller's
+// identity into `userId` even when the client omitted it — the stored doc is
+// owned by the caller, not by "nobody".
+#[tokio::test]
+async fn insert_auto_stamps_owner() -> anyhow::Result<()> {
+    let (pool, db, schema) = setup().await;
+    let mut doc = serde_json::Map::new();
+    doc.insert("title".into(), "untitled".into());
+    // userId deliberately omitted — server must stamp it.
+    let outcome = execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::Insert {
+                table: "notes".into(),
+                doc,
+            }],
+        },
+        Some("alice"),
+    )
+    .await
+    .expect("insert should succeed");
+    let id = outcome.results[0]["id"].as_str().expect("id").to_string();
+
+    let doc = fetch_doc(&pool, &db, &schema, &id)
+        .await
+        .expect("doc present");
+    assert_eq!(doc["userId"].as_str(), Some("alice"));
+    assert_eq!(doc["title"].as_str(), Some("untitled"));
+    Ok(())
+}
+
+// (9) A user cannot create a row owned by someone else: even with `userId`
+// explicitly set to "bob" in the insert doc, the server overwrites it with
+// the caller's identity ("alice"). The stamp is unforgeable.
+#[tokio::test]
+async fn insert_cannot_forge_another_users_owner() -> anyhow::Result<()> {
+    let (pool, db, schema) = setup().await;
+    let mut doc = serde_json::Map::new();
+    doc.insert("title".into(), "forgery".into());
+    doc.insert("userId".into(), "bob".into()); // attempted forgery
+    let outcome = execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::Insert {
+                table: "notes".into(),
+                doc,
+            }],
+        },
+        Some("alice"),
+    )
+    .await
+    .expect("insert should succeed");
+    let id = outcome.results[0]["id"].as_str().expect("id").to_string();
+
+    let doc = fetch_doc(&pool, &db, &schema, &id)
+        .await
+        .expect("doc present");
+    assert_eq!(
+        doc["userId"].as_str(),
+        Some("alice"),
+        "server must overwrite the client-supplied owner"
+    );
+    Ok(())
+}
+
+// (10) Patching a doc you don't own is Forbidden, AND the whole transaction
+// rolls back — including a preceding step that would have succeeded on its
+// own (here: alice inserting her own note, which the server stamps). This is
+// the security guarantee: the ownership check runs inside the sqlx txn, so a
+// `Forbidden` from any step returns via `?` before `tx.commit()` and reverts
+// every prior effect. No partial write, no TOCTOU window.
+#[tokio::test]
+async fn patch_on_unowned_doc_is_forbidden_and_atomic() -> anyhow::Result<()> {
+    let (pool, db, schema) = setup().await;
+    let bob_id = seed_note(&pool, &db, &schema, "bob's note", "bob").await;
+
+    // Step 1 would succeed on its own (alice inserts her own note; stamped).
+    // Step 2 is a Forbidden patch of bob's note. The combined txn must fail
+    // AND roll back step 1.
+    let mut alice_insert_doc = serde_json::Map::new();
+    alice_insert_doc.insert("title".into(), "alice temp".into());
+    let mut patch_fields = serde_json::Map::new();
+    patch_fields.insert("title".into(), "hacked".into());
+    let err = execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![
+                Step::Insert {
+                    table: "notes".into(),
+                    doc: alice_insert_doc,
+                },
+                Step::Patch {
+                    table: "notes".into(),
+                    id: bob_id.clone(),
+                    fields: patch_fields,
+                },
+            ],
+        },
+        Some("alice"),
+    )
+    .await
+    .expect_err("patch on unowned doc must fail");
+
+    assert_eq!(
+        err.code,
+        ErrorCode::Forbidden,
+        "expected FORBIDDEN, got {:?}: {}",
+        err.code,
+        err.message
+    );
+
+    // Atomicity: bob's note is unchanged...
+    let bob_doc = fetch_doc(&pool, &db, &schema, &bob_id)
+        .await
+        .expect("bob present");
+    assert_eq!(bob_doc["title"].as_str(), Some("bob's note"));
+
+    // ...and alice's preceding insert was rolled back (no "alice temp" row).
+    let mut q = notes_query();
+    q.take = Some(100);
+    let all = titles(execute_query(&pool, &db, &schema, &q, None).await?);
+    assert!(
+        !all.iter().any(|t| t == "alice temp"),
+        "preceding insert must be rolled back, got {all:?}"
+    );
+    assert_eq!(all, vec!["bob's note".to_string()]);
+    Ok(())
+}
+
+// (11) Delete and Replace on a doc you don't own are Forbidden, and the
+// target survives untouched.
+#[tokio::test]
+async fn delete_and_replace_on_unowned_doc_are_forbidden() -> anyhow::Result<()> {
+    let (pool, db, schema) = setup().await;
+    let bob_id = seed_note(&pool, &db, &schema, "bob's note", "bob").await;
+
+    // Delete by alice -> Forbidden.
+    let err = execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::Delete {
+                table: "notes".into(),
+                id: bob_id.clone(),
+            }],
+        },
+        Some("alice"),
+    )
+    .await
+    .expect_err("delete on unowned doc must fail");
+    assert_eq!(err.code, ErrorCode::Forbidden);
+
+    // Bob's note survived the delete attempt.
+    let bob_doc = fetch_doc(&pool, &db, &schema, &bob_id)
+        .await
+        .expect("bob present after delete attempt");
+    assert_eq!(bob_doc["title"].as_str(), Some("bob's note"));
+
+    // Replace by alice -> Forbidden.
+    let mut replace_doc = serde_json::Map::new();
+    replace_doc.insert("title".into(), "hacked".into());
+    replace_doc.insert("userId".into(), "alice".into());
+    let err = execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::Replace {
+                table: "notes".into(),
+                id: bob_id.clone(),
+                doc: replace_doc,
+            }],
+        },
+        Some("alice"),
+    )
+    .await
+    .expect_err("replace on unowned doc must fail");
+    assert_eq!(err.code, ErrorCode::Forbidden);
+
+    // Bob's note survived the replace attempt too.
+    let bob_doc = fetch_doc(&pool, &db, &schema, &bob_id)
+        .await
+        .expect("bob present after replace attempt");
+    assert_eq!(bob_doc["title"].as_str(), Some("bob's note"));
+    assert_eq!(bob_doc["userId"].as_str(), Some("bob"));
+    Ok(())
+}
+
+// (12) Upsert exercises both write-enforcement branches: the insert branch
+// (no match) stamps the caller as owner, and the update branch (match on an
+// existing doc) requires the caller to already own that doc.
+#[tokio::test]
+async fn upsert_insert_branch_stamps_and_update_branch_checks_owner() -> anyhow::Result<()> {
+    let (pool, db, schema) = setup().await;
+
+    // (a) No match -> insert branch stamps alice (overwriting the forged
+    // userId="bob" in the insert doc).
+    let mut insert_doc = serde_json::Map::new();
+    insert_doc.insert("title".into(), "alice's upsert".into());
+    insert_doc.insert("userId".into(), "bob".into()); // attempted forgery
+    let empty_patch = serde_json::Map::new();
+    let outcome = execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::Upsert {
+                table: "notes".into(),
+                index: "by_user".into(),
+                eq: vec!["alice".into()],
+                insert: insert_doc,
+                patch: empty_patch,
+            }],
+        },
+        Some("alice"),
+    )
+    .await
+    .expect("upsert insert should succeed");
+    assert_eq!(outcome.results[0]["inserted"].as_bool(), Some(true));
+    let alice_id = outcome.results[0]["id"].as_str().expect("id").to_string();
+    let doc = fetch_doc(&pool, &db, &schema, &alice_id)
+        .await
+        .expect("alice doc present");
+    assert_eq!(
+        doc["userId"].as_str(),
+        Some("alice"),
+        "insert branch must stamp caller"
+    );
+
+    // (b) Match on bob's doc by alice -> update branch -> Forbidden.
+    let bob_id = seed_note(&pool, &db, &schema, "bob's note", "bob").await;
+    let mut patch_fields = serde_json::Map::new();
+    patch_fields.insert("title".into(), "hacked".into());
+    let err = execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::Upsert {
+                table: "notes".into(),
+                index: "by_user".into(),
+                eq: vec!["bob".into()],
+                insert: serde_json::Map::new(),
+                patch: patch_fields,
+            }],
+        },
+        Some("alice"),
+    )
+    .await
+    .expect_err("upsert update on unowned doc must fail");
+    assert_eq!(err.code, ErrorCode::Forbidden);
+
+    // Bob's note is unchanged.
+    let bob_doc = fetch_doc(&pool, &db, &schema, &bob_id)
+        .await
+        .expect("bob present");
+    assert_eq!(bob_doc["title"].as_str(), Some("bob's note"));
+    Ok(())
+}
+
+// (13) A bypass caller (owner=None — machine token / scheduled job) is exempt
+// from ownership enforcement: it can patch a doc it doesn't "own" because it
+// owns everything. Preserves today's machine-token full-access behavior.
+#[tokio::test]
+async fn machine_bypass_ignores_ownership() -> anyhow::Result<()> {
+    let (pool, db, schema) = setup().await;
+    let bob_id = seed_note(&pool, &db, &schema, "bob's note", "bob").await;
+
+    let mut patch_fields = serde_json::Map::new();
+    patch_fields.insert("title".into(), "machine-changed".into());
+    execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::Patch {
+                table: "notes".into(),
+                id: bob_id.clone(),
+                fields: patch_fields,
+            }],
+        },
+        None, // bypass — machine token / scheduled job
+    )
+    .await
+    .expect("bypass patch should succeed");
+
+    let doc = fetch_doc(&pool, &db, &schema, &bob_id)
+        .await
+        .expect("doc present");
+    assert_eq!(doc["title"].as_str(), Some("machine-changed"));
+    assert_eq!(
+        doc["userId"].as_str(),
+        Some("bob"),
+        "bypass must not restamp"
+    );
     Ok(())
 }

@@ -227,7 +227,7 @@ async fn push_simple_schema(pool: &PgPool, db: &str) -> SchemaDef {
 /// no-op mutate. Both spawn inside `channel_for` on first use.
 async fn warm_up_committer(committers: &Committers, db: &str) {
     committers
-        .mutate(db, None, Transaction { steps: vec![] })
+        .mutate(db, None, Transaction { steps: vec![] }, None)
         .await
         .expect("warm-up mutate");
 }

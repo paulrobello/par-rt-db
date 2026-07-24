@@ -326,7 +326,16 @@ async fn handle_text_frame(
             txn,
         } => {
             match authorize(&state.pool, principal, db).await {
-                Ok(()) => match state.committers.mutate(db, idempotency_key, txn).await {
+                Ok(()) => match state
+                    .committers
+                    .mutate(
+                        db,
+                        idempotency_key,
+                        txn,
+                        owner_of(principal).map(|s| s.to_string()),
+                    )
+                    .await
+                {
                     Ok(outcome) => {
                         let _ = out_tx.send(ServerMessage::MutateOk {
                             mut_id,

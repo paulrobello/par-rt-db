@@ -276,6 +276,7 @@ async fn export_then_import_round_trips_docs_indexes_and_schema() -> anyhow::Res
                 },
             ],
         },
+        None,
     )
     .await?;
     let project_id = insert_outcome.results[0]["id"]
@@ -301,6 +302,7 @@ async fn export_then_import_round_trips_docs_indexes_and_schema() -> anyhow::Res
                 .clone(),
             }],
         },
+        None,
     )
     .await?;
 
@@ -521,6 +523,7 @@ async fn import_db_doc_replay_failure_after_schema_commit_refreshes_schema_cache
                 .clone(),
             }],
         },
+        None,
     )
     .await?;
     let existing_id = insert_outcome.results[0]["id"]

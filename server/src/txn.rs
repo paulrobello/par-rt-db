@@ -671,9 +671,82 @@ async fn eq_lookup(
     Ok(rows)
 }
 
+/// Forces `doc[owner_field] = owner` for owner-gated tables when the caller is
+/// a user, overwriting any client-supplied value. Bypass callers and
+/// non-owner tables leave `doc` unchanged.
+fn stamp_owner(
+    table_def: &TableDef,
+    mut doc: serde_json::Map<String, serde_json::Value>,
+    owner: Option<&str>,
+) -> serde_json::Map<String, serde_json::Value> {
+    if let (Some(field), Some(uid)) = (&table_def.owner_field, owner) {
+        doc.insert(field.clone(), serde_json::Value::String(uid.to_string()));
+    }
+    doc
+}
+
+/// Ownership pre-check for patch/replace/delete: fetches the doc and rejects
+/// `Forbidden` if a user caller doesn't own it. A missing doc returns `Ok`
+/// (the subsequent do_* step reports `NotFound`). Bypass/no-owner-table: no-op.
+async fn check_owner(
+    conn: &mut PgConnection,
+    pg_schema_name: &str,
+    table_def: &TableDef,
+    table_name: &str,
+    id: &str,
+    owner: Option<&str>,
+) -> Result<(), RtDbError> {
+    let (Some(field), Some(uid)) = (&table_def.owner_field, owner) else {
+        return Ok(());
+    };
+    let table_ident = pg_table(table_name);
+    let row: Option<(serde_json::Value,)> = sqlx::query_as(&format!(
+        "SELECT \"doc\" FROM \"{pg_schema_name}\".\"{table_ident}\" WHERE \"id\" = $1"
+    ))
+    .bind(id)
+    .fetch_optional(&mut *conn)
+    .await?;
+    match row {
+        None => Ok(()),
+        Some((doc,)) => {
+            if doc.get(field).and_then(|v| v.as_str()) != Some(uid) {
+                return Err(RtDbError::forbidden(format!(
+                    "document '{id}' is not owned by the caller"
+                )));
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Ownership check on a doc already in hand (upsert update branch).
+fn check_owner_doc(
+    table_def: &TableDef,
+    doc: &serde_json::Map<String, serde_json::Value>,
+    id: &str,
+    owner: Option<&str>,
+) -> Result<(), RtDbError> {
+    let (Some(field), Some(uid)) = (&table_def.owner_field, owner) else {
+        return Ok(());
+    };
+    if doc.get(field).and_then(|v| v.as_str()) != Some(uid) {
+        return Err(RtDbError::forbidden(format!(
+            "document '{id}' is not owned by the caller"
+        )));
+    }
+    Ok(())
+}
+
 /// Executes all of `txn`'s steps in one Postgres transaction; any step's
 /// error aborts and rolls back everything already applied. See module docs
 /// on `Step` for per-step semantics.
+///
+/// `owner` is the caller's per-row auth identity: `Some(uid)` stamps that user
+/// as the owner on inserts into owner-gated tables and rejects mutations of
+/// another user's docs with `Forbidden`; `None` bypasses both (machine tokens,
+/// scheduled jobs). The check runs inside the sqlx transaction, so a
+/// `Forbidden` from any step returns via `?` before `tx.commit()` and rolls
+/// back the whole transaction — no partial write, no TOCTOU window.
 ///
 /// Runs under READ COMMITTED with no row locking; correctness depends on all
 /// writes for a database being serialized through the per-db committer.
@@ -683,6 +756,7 @@ pub async fn execute_txn(
     db: &str,
     schema: &SchemaDef,
     txn: &Transaction,
+    owner: Option<&str>,
 ) -> Result<TxnOutcome, RtDbError> {
     validate_db_name(db)?;
 
@@ -702,24 +776,28 @@ pub async fn execute_txn(
         match step {
             Step::Insert { table, doc } => {
                 let table_def = schema.table(table)?;
-                let id = do_insert(&mut tx, &pg_schema_name, table_def, table, doc).await?;
+                let doc = stamp_owner(table_def, doc.clone(), owner);
+                let id = do_insert(&mut tx, &pg_schema_name, table_def, table, &doc).await?;
                 write_set.touch(table, &id);
                 results.push(serde_json::json!({ "id": id }));
             }
             Step::Patch { table, id, fields } => {
                 let table_def = schema.table(table)?;
+                check_owner(&mut tx, &pg_schema_name, table_def, table, id, owner).await?;
                 do_patch(&mut tx, &pg_schema_name, table_def, table, id, fields).await?;
                 write_set.touch(table, id);
                 results.push(serde_json::Value::Null);
             }
             Step::Replace { table, id, doc } => {
                 let table_def = schema.table(table)?;
+                check_owner(&mut tx, &pg_schema_name, table_def, table, id, owner).await?;
                 do_replace(&mut tx, &pg_schema_name, table_def, table, id, doc).await?;
                 write_set.touch(table, id);
                 results.push(serde_json::Value::Null);
             }
             Step::Delete { table, id } => {
-                schema.table(table)?;
+                let table_def = schema.table(table)?;
+                check_owner(&mut tx, &pg_schema_name, table_def, table, id, owner).await?;
                 do_delete(&mut tx, &pg_schema_name, table, id).await?;
                 write_set.touch(table, id);
                 results.push(serde_json::Value::Null);
@@ -754,8 +832,9 @@ pub async fn execute_txn(
                 }
                 match rows.pop() {
                     None => {
+                        let insert = stamp_owner(table_def, insert.clone(), owner);
                         let id =
-                            do_insert(&mut tx, &pg_schema_name, table_def, table, insert).await?;
+                            do_insert(&mut tx, &pg_schema_name, table_def, table, &insert).await?;
                         write_set.touch(table, &id);
                         results.push(serde_json::json!({ "id": id, "inserted": true }));
                     }
@@ -766,6 +845,7 @@ pub async fn execute_txn(
                                 return Err(RtDbError::internal("stored doc is not a JSON object"));
                             }
                         };
+                        check_owner_doc(table_def, &doc, &id, owner)?;
                         let merged = apply_patch(table_def, doc, patch)?;
                         apply_update(&mut tx, &pg_schema_name, table_def, table, &id, merged)
                             .await?;

@@ -78,11 +78,11 @@ async fn same_mut_id_dedups_and_replays_cached_result() -> anyhow::Result<()> {
 
     let first = state
         .committers
-        .mutate(&db, Some("retry-key-1".to_string()), txn.clone())
+        .mutate(&db, Some("retry-key-1".to_string()), txn.clone(), None)
         .await?;
     let second = state
         .committers
-        .mutate(&db, Some("retry-key-1".to_string()), txn.clone())
+        .mutate(&db, Some("retry-key-1".to_string()), txn.clone(), None)
         .await?;
 
     assert_eq!(first.results, second.results);
@@ -110,8 +110,14 @@ async fn no_mut_id_does_not_dedup() -> anyhow::Result<()> {
         }],
     };
 
-    state.committers.mutate(&db, None, txn.clone()).await?;
-    state.committers.mutate(&db, None, txn.clone()).await?;
+    state
+        .committers
+        .mutate(&db, None, txn.clone(), None)
+        .await?;
+    state
+        .committers
+        .mutate(&db, None, txn.clone(), None)
+        .await?;
 
     let pg_schema = format!("db_{db}");
     let count: (i64,) = sqlx::query_as(&format!(
@@ -138,11 +144,11 @@ async fn empty_string_idempotency_key_is_treated_as_absent() -> anyhow::Result<(
 
     state
         .committers
-        .mutate(&db, Some(String::new()), txn.clone())
+        .mutate(&db, Some(String::new()), txn.clone(), None)
         .await?;
     state
         .committers
-        .mutate(&db, Some(String::new()), txn.clone())
+        .mutate(&db, Some(String::new()), txn.clone(), None)
         .await?;
 
     let pg_schema = format!("db_{db}");
@@ -173,7 +179,7 @@ async fn expired_mut_id_re_executes() -> anyhow::Result<()> {
 
     state
         .committers
-        .mutate(&db, Some("retry-key-2".to_string()), txn.clone())
+        .mutate(&db, Some("retry-key-2".to_string()), txn.clone(), None)
         .await?;
 
     let pg_schema = format!("db_{db}");

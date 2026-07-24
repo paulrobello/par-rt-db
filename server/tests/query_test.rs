@@ -40,6 +40,7 @@ async fn insert_project(
                 })),
             }],
         },
+        None,
     )
     .await?;
     Ok(outcome.results[0]["id"]
@@ -72,6 +73,7 @@ async fn insert_work_item(
                 })),
             }],
         },
+        None,
     )
     .await?;
     // Guarantee strictly increasing `created_at` between inserts so
@@ -2732,6 +2734,7 @@ async fn filter_range_on_jsonb_numeric_field() -> anyhow::Result<()> {
                     })),
                 }],
             },
+            None,
         )
         .await?;
         tokio::time::sleep(Duration::from_millis(2)).await;

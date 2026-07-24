@@ -21,6 +21,7 @@ pub enum CommitterRequest {
     Mutate {
         idempotency_key: Option<String>,
         txn: Transaction,
+        owner: Option<String>,
         reply: oneshot::Sender<Result<TxnOutcome, RtDbError>>,
     },
     Subscribe {
@@ -145,6 +146,7 @@ impl Committers {
         db: &str,
         idempotency_key: Option<String>,
         txn: Transaction,
+        owner: Option<String>,
     ) -> Result<TxnOutcome, RtDbError> {
         let (reply, reply_rx) = oneshot::channel();
         self.submit(
@@ -152,6 +154,7 @@ impl Committers {
             CommitterRequest::Mutate {
                 idempotency_key,
                 txn,
+                owner,
                 reply,
             },
         )
@@ -238,9 +241,10 @@ async fn run_committer(
             CommitterRequest::Mutate {
                 idempotency_key,
                 txn,
+                owner,
                 reply,
             } => {
-                let outcome = handle_mutate(&ctx, idempotency_key, txn).await;
+                let outcome = handle_mutate(&ctx, idempotency_key, txn, owner).await;
                 let _ = reply.send(outcome);
             }
             CommitterRequest::Subscribe {
@@ -272,6 +276,7 @@ async fn handle_mutate(
     ctx: &CommitterCtx,
     idempotency_key: Option<String>,
     txn: Transaction,
+    owner: Option<String>,
 ) -> Result<TxnOutcome, RtDbError> {
     // An empty string is not a meaningful key (it would be one shared dedup
     // slot for the whole db) — treat it the same as no key at all.
@@ -287,7 +292,7 @@ async fn handle_mutate(
     }
 
     let schema = ctx.schemas.get(&ctx.pool, &ctx.db).await?;
-    let outcome = execute_txn(&ctx.pool, &ctx.db, &schema, &txn).await?;
+    let outcome = execute_txn(&ctx.pool, &ctx.db, &schema, &txn, owner.as_deref()).await?;
     ctx.subs
         .fan_out(&ctx.pool, &ctx.db, &schema, &outcome.write_set)
         .await;
@@ -337,7 +342,7 @@ async fn handle_scheduled(
             return Err(err);
         }
     };
-    match execute_txn(&ctx.pool, &ctx.db, &schema, &txn).await {
+    match execute_txn(&ctx.pool, &ctx.db, &schema, &txn, None).await {
         Ok(outcome) => {
             ctx.subs
                 .fan_out(&ctx.pool, &ctx.db, &schema, &outcome.write_set)

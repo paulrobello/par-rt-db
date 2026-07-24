@@ -73,11 +73,11 @@ async fn subscribe_sends_initial_query_update_with_seeded_rows() -> anyhow::Resu
 
     state
         .committers
-        .mutate(&db, None, insert_work_item("backlog", 1.0))
+        .mutate(&db, None, insert_work_item("backlog", 1.0), None)
         .await?;
     state
         .committers
-        .mutate(&db, None, insert_work_item("backlog", 2.0))
+        .mutate(&db, None, insert_work_item("backlog", 2.0), None)
         .await?;
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -107,11 +107,11 @@ async fn mutate_pushes_update_to_matching_subscription() -> anyhow::Result<()> {
 
     state
         .committers
-        .mutate(&db, None, insert_work_item("backlog", 1.0))
+        .mutate(&db, None, insert_work_item("backlog", 1.0), None)
         .await?;
     state
         .committers
-        .mutate(&db, None, insert_work_item("backlog", 2.0))
+        .mutate(&db, None, insert_work_item("backlog", 2.0), None)
         .await?;
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -124,7 +124,7 @@ async fn mutate_pushes_update_to_matching_subscription() -> anyhow::Result<()> {
 
     state
         .committers
-        .mutate(&db, None, insert_work_item("backlog", 3.0))
+        .mutate(&db, None, insert_work_item("backlog", 3.0), None)
         .await?;
 
     let msg = rx.try_recv().expect("update after mutate");
@@ -154,7 +154,10 @@ async fn mutate_on_unrelated_table_sends_no_update() -> anyhow::Result<()> {
         .await?;
     rx.try_recv().expect("initial query update");
 
-    state.committers.mutate(&db, None, insert_project()).await?;
+    state
+        .committers
+        .mutate(&db, None, insert_project(), None)
+        .await?;
 
     assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
 
@@ -181,6 +184,7 @@ async fn mutate_with_same_idempotency_key_sends_no_second_update() -> anyhow::Re
             &db,
             Some("retry-key".to_string()),
             insert_work_item("backlog", 1.0),
+            None,
         )
         .await?;
     rx.try_recv().expect("update after first mutate");
@@ -191,6 +195,7 @@ async fn mutate_with_same_idempotency_key_sends_no_second_update() -> anyhow::Re
             &db,
             Some("retry-key".to_string()),
             insert_work_item("backlog", 1.0),
+            None,
         )
         .await?;
     assert_eq!(first.results, second.results);
@@ -207,7 +212,7 @@ async fn mutate_not_matching_eq_filter_sends_no_update() -> anyhow::Result<()> {
 
     state
         .committers
-        .mutate(&db, None, insert_work_item("backlog", 1.0))
+        .mutate(&db, None, insert_work_item("backlog", 1.0), None)
         .await?;
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -227,7 +232,7 @@ async fn mutate_not_matching_eq_filter_sends_no_update() -> anyhow::Result<()> {
 
     state
         .committers
-        .mutate(&db, None, insert_work_item("done", 2.0))
+        .mutate(&db, None, insert_work_item("done", 2.0), None)
         .await?;
 
     assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
@@ -273,7 +278,7 @@ async fn two_subscriptions_both_receive_updates_from_one_mutate() -> anyhow::Res
 
     state
         .committers
-        .mutate(&db, None, insert_work_item("backlog", 1.0))
+        .mutate(&db, None, insert_work_item("backlog", 1.0), None)
         .await?;
 
     let msg1 = rx1.try_recv().expect("q1 update");
@@ -302,7 +307,7 @@ async fn remove_conn_stops_further_updates() -> anyhow::Result<()> {
 
     state
         .committers
-        .mutate(&db, None, insert_work_item("backlog", 1.0))
+        .mutate(&db, None, insert_work_item("backlog", 1.0), None)
         .await?;
 
     // No QueryUpdate is delivered: either the channel is empty, or (as here,
@@ -321,7 +326,7 @@ async fn mutate_on_nonexistent_db_is_not_found() -> anyhow::Result<()> {
 
     let err = state
         .committers
-        .mutate("does_not_exist", None, insert_project())
+        .mutate("does_not_exist", None, insert_project(), None)
         .await
         .expect_err("expected not found");
     assert_eq!(err.code, ErrorCode::NotFound);
@@ -339,7 +344,7 @@ async fn write_set_records_written_document_ids() -> anyhow::Result<()> {
 
     let insert_a = state
         .committers
-        .mutate(&db, None, insert_work_item("backlog", 1.0))
+        .mutate(&db, None, insert_work_item("backlog", 1.0), None)
         .await?;
     let id_a = insert_a.results[0]["id"]
         .as_str()
@@ -361,6 +366,7 @@ async fn write_set_records_written_document_ids() -> anyhow::Result<()> {
                         .clone(),
                 }],
             },
+            None,
         )
         .await?;
 
@@ -389,7 +395,7 @@ async fn get_subscription_updates_when_its_doc_is_written() -> anyhow::Result<()
 
     let insert = state
         .committers
-        .mutate(&db, None, insert_work_item("backlog", 1.0))
+        .mutate(&db, None, insert_work_item("backlog", 1.0), None)
         .await?;
     let id = insert.results[0]["id"]
         .as_str()
@@ -425,6 +431,7 @@ async fn get_subscription_updates_when_its_doc_is_written() -> anyhow::Result<()
                         .clone(),
                 }],
             },
+            None,
         )
         .await?;
 
@@ -452,7 +459,7 @@ async fn get_subscription_skips_update_for_unrelated_doc() -> anyhow::Result<()>
 
     let insert_a = state
         .committers
-        .mutate(&db, None, insert_work_item("backlog", 1.0))
+        .mutate(&db, None, insert_work_item("backlog", 1.0), None)
         .await?;
     let id_a = insert_a.results[0]["id"]
         .as_str()
@@ -476,7 +483,7 @@ async fn get_subscription_skips_update_for_unrelated_doc() -> anyhow::Result<()>
     // Write a different document on the same table.
     state
         .committers
-        .mutate(&db, None, insert_work_item("backlog", 2.0))
+        .mutate(&db, None, insert_work_item("backlog", 2.0), None)
         .await?;
 
     assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
@@ -500,7 +507,7 @@ async fn collect_subscription_still_reruns_on_table_write() -> anyhow::Result<()
 
     state
         .committers
-        .mutate(&db, None, insert_work_item("backlog", 1.0))
+        .mutate(&db, None, insert_work_item("backlog", 1.0), None)
         .await?;
 
     let msg = rx.try_recv().expect("collect sub re-ran on table write");
@@ -523,7 +530,7 @@ async fn get_subscription_updates_when_its_doc_is_deleted() -> anyhow::Result<()
 
     let insert = state
         .committers
-        .mutate(&db, None, insert_work_item("backlog", 1.0))
+        .mutate(&db, None, insert_work_item("backlog", 1.0), None)
         .await?;
     let id = insert.results[0]["id"]
         .as_str()
@@ -555,6 +562,7 @@ async fn get_subscription_updates_when_its_doc_is_deleted() -> anyhow::Result<()
                     id: id.clone(),
                 }],
             },
+            None,
         )
         .await?;
 

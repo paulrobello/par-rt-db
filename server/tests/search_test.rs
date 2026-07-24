@@ -61,6 +61,7 @@ async fn insert_note(
                 doc: doc(serde_json::json!({"title": title, "body": body})),
             }],
         },
+        None,
     )
     .await
     .expect("insert note");

@@ -104,7 +104,12 @@ async fn mutate_handler(
 
     let outcome = state
         .committers
-        .mutate(&body.db, body.idempotency_key, body.txn)
+        .mutate(
+            &body.db,
+            body.idempotency_key,
+            body.txn,
+            owner_of(&principal).map(|s| s.to_string()),
+        )
         .await?;
     Ok(Json(MutateResponse {
         results: outcome.results,
