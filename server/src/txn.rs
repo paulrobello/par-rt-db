@@ -784,14 +784,16 @@ pub async fn execute_txn(
             Step::Patch { table, id, fields } => {
                 let table_def = schema.table(table)?;
                 check_owner(&mut tx, &pg_schema_name, table_def, table, id, owner).await?;
-                do_patch(&mut tx, &pg_schema_name, table_def, table, id, fields).await?;
+                let fields = stamp_owner(table_def, fields.clone(), owner);
+                do_patch(&mut tx, &pg_schema_name, table_def, table, id, &fields).await?;
                 write_set.touch(table, id);
                 results.push(serde_json::Value::Null);
             }
             Step::Replace { table, id, doc } => {
                 let table_def = schema.table(table)?;
                 check_owner(&mut tx, &pg_schema_name, table_def, table, id, owner).await?;
-                do_replace(&mut tx, &pg_schema_name, table_def, table, id, doc).await?;
+                let doc = stamp_owner(table_def, doc.clone(), owner);
+                do_replace(&mut tx, &pg_schema_name, table_def, table, id, &doc).await?;
                 write_set.touch(table, id);
                 results.push(serde_json::Value::Null);
             }
@@ -846,7 +848,8 @@ pub async fn execute_txn(
                             }
                         };
                         check_owner_doc(table_def, &doc, &id, owner)?;
-                        let merged = apply_patch(table_def, doc, patch)?;
+                        let patch = stamp_owner(table_def, patch.clone(), owner);
+                        let merged = apply_patch(table_def, doc, &patch)?;
                         apply_update(&mut tx, &pg_schema_name, table_def, table, &id, merged)
                             .await?;
                         write_set.touch(table, &id);

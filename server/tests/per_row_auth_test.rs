@@ -851,3 +851,191 @@ async fn machine_bypass_ignores_ownership() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+// (14) Post-review fix: a `User` caller cannot transfer ownership of a doc they
+// own by Patching `userId` to another user. The Patch arm re-stamps the field
+// map with the caller's identity before writing, exactly as Insert does.
+#[tokio::test]
+async fn patch_cannot_transfer_ownership() -> anyhow::Result<()> {
+    let (pool, db, schema) = setup().await;
+    let alice_id = seed_note(&pool, &db, &schema, "alice's note", "alice").await;
+
+    // Alice tries to give her note to bob via a Patch carrying userId="bob".
+    let mut patch_fields = serde_json::Map::new();
+    patch_fields.insert("title".into(), "alice's note".into());
+    patch_fields.insert("userId".into(), "bob".into()); // attempted transfer
+    execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::Patch {
+                table: "notes".into(),
+                id: alice_id.clone(),
+                fields: patch_fields,
+            }],
+        },
+        Some("alice"),
+    )
+    .await
+    .expect("patch on owned doc should succeed");
+
+    // The stored doc is still owned by alice — the field was re-stamped.
+    let doc = fetch_doc(&pool, &db, &schema, &alice_id)
+        .await
+        .expect("doc present");
+    assert_eq!(
+        doc["userId"].as_str(),
+        Some("alice"),
+        "Patch must not let a user transfer ownership"
+    );
+
+    // And a query as bob does NOT return alice's doc.
+    let q = notes_query();
+    let bob_titles = titles(execute_query(&pool, &db, &schema, &q, Some("bob")).await?);
+    assert!(
+        !bob_titles.iter().any(|t| t == "alice's note"),
+        "bob must not see alice's note, got {bob_titles:?}"
+    );
+    Ok(())
+}
+
+// (15) Same guarantee for Replace: alice cannot replace her doc with one
+// carrying userId="bob"; the server re-stamps the incoming doc with alice.
+#[tokio::test]
+async fn replace_cannot_transfer_ownership() -> anyhow::Result<()> {
+    let (pool, db, schema) = setup().await;
+    let alice_id = seed_note(&pool, &db, &schema, "alice's note", "alice").await;
+
+    let mut replace_doc = serde_json::Map::new();
+    replace_doc.insert("title".into(), "replaced".into());
+    replace_doc.insert("userId".into(), "bob".into()); // attempted transfer
+    execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::Replace {
+                table: "notes".into(),
+                id: alice_id.clone(),
+                doc: replace_doc,
+            }],
+        },
+        Some("alice"),
+    )
+    .await
+    .expect("replace on owned doc should succeed");
+
+    let doc = fetch_doc(&pool, &db, &schema, &alice_id)
+        .await
+        .expect("doc present");
+    assert_eq!(
+        doc["userId"].as_str(),
+        Some("alice"),
+        "Replace must not let a user transfer ownership"
+    );
+    assert_eq!(doc["title"].as_str(), Some("replaced"));
+    Ok(())
+}
+
+// (16) Strongest end-to-end check: bob is subscribed with `owner: Some("bob")`,
+// alice inserts+stamps her note, then patches its `userId` to "bob". Without
+// the post-review re-stamp, bob's feed would receive alice's doc (the patch
+// moved the doc into his owner bucket). With the fix, the patch's owner-change
+// is stamped back to alice and bob's feed stays empty. Mirrors the public
+// `Committers` API pattern from `fan_out_does_not_push_cross_user_rows`.
+#[tokio::test]
+async fn patch_owner_change_does_not_inject_into_other_users_feed() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = format!("t{}", uuid::Uuid::now_v7().simple());
+    rtdb_server::db::create_database(&pool, &db).await?;
+    let schema = owner_schema();
+    push_schema(&pool, &db, schema.clone()).await?;
+
+    // Bob subscribes on `notes` carrying his owner identity.
+    let (bob_tx, mut bob_rx) = mpsc::unbounded_channel::<ServerMessage>();
+    state
+        .committers
+        .subscribe(
+            &db,
+            next_conn_id(),
+            "bob-q".into(),
+            notes_query(),
+            bob_tx,
+            Some("bob".into()),
+        )
+        .await?;
+    drain_initial(&mut bob_rx).await;
+
+    // Alice inserts her own note (server stamps userId=alice).
+    let mut insert_doc = serde_json::Map::new();
+    insert_doc.insert("title".into(), "alice's note".into());
+    insert_doc.insert("userId".into(), "alice".into());
+    let outcome = state
+        .committers
+        .mutate(
+            &db,
+            None,
+            Transaction {
+                steps: vec![Step::Insert {
+                    table: "notes".into(),
+                    doc: insert_doc,
+                }],
+            },
+            Some("alice".into()),
+        )
+        .await?;
+    let alice_id = outcome.results[0]["id"]
+        .as_str()
+        .expect("alice insert id")
+        .to_string();
+
+    // Bob should not have received alice's insert (cross-user).
+    let bob_extra = timeout(Duration::from_millis(150), bob_rx.recv()).await;
+    assert!(
+        bob_extra.is_err(),
+        "bob must not receive alice's insert, but got: {:?}",
+        bob_extra.unwrap()
+    );
+
+    // Alice now patches her doc trying to set userId="bob" — the re-stamp
+    // forces it back to "alice", so the canonical owner-filtered result for
+    // bob is unchanged and the committer must NOT push.
+    let mut patch_fields = serde_json::Map::new();
+    patch_fields.insert("userId".into(), "bob".into()); // attempted injection
+    state
+        .committers
+        .mutate(
+            &db,
+            None,
+            Transaction {
+                steps: vec![Step::Patch {
+                    table: "notes".into(),
+                    id: alice_id.clone(),
+                    fields: patch_fields,
+                }],
+            },
+            Some("alice".into()),
+        )
+        .await?;
+
+    // The patch was applied (title unchanged) but the doc is STILL alice's.
+    let stored = fetch_doc(&pool, &db, &schema, &alice_id)
+        .await
+        .expect("doc present");
+    assert_eq!(
+        stored["userId"].as_str(),
+        Some("alice"),
+        "patch owner-change must be re-stamped back to caller"
+    );
+
+    // And bob's feed stays empty: no QueryUpdate for the patch.
+    let bob_inject = timeout(Duration::from_millis(250), bob_rx.recv()).await;
+    assert!(
+        bob_inject.is_err(),
+        "bob must not receive alice's patch owner-change, but got: {:?}",
+        bob_inject.unwrap()
+    );
+    Ok(())
+}
