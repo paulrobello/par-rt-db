@@ -19,7 +19,11 @@ services:
       retries: 20
 
   server:
-    build: .
+    build:
+      context: .
+      args:
+        # Bake the live git sha into /healthz; "unknown" if unset. Set in .env.
+        RTDB_BUILD_COMMIT: ${RTDB_BUILD_COMMIT:-unknown}
     restart: unless-stopped
     depends_on:
       postgres:

@@ -33,10 +33,14 @@ rsync -az --delete \
 cd /docker/par-rt-db
 docker compose up -d --build
 docker compose ps
-curl -fsS http://127.0.0.1:8300/healthz     # -> ok
+curl -fsS http://127.0.0.1:8300/healthz | jq .
+# -> {"status":"ok","version":"0.1.0","git_commit":"<sha>","build_timestamp":..,
+#     "started_at":..,"uptime_seconds":..,"postgres":true}
+# A 503 with "status":"degraded"/"postgres":false means the server is up but
+# Postgres is not — `curl -f` exits non-zero so this surfaces in scripts.
 ```
 
-Then verify the public path: `curl -fsS https://rtdb.pardev.net/healthz`.
+Then verify the public path: `curl -fsS https://rtdb.pardev.net/healthz | jq .`.
 
 ## Postgres image
 
@@ -57,6 +61,11 @@ lenny2.
   (`RTDB_GITHUB_CLIENT_ID` / `RTDB_GITHUB_CLIENT_SECRET`).
 - `RTDB_ALLOWED_ORIGINS` — the SPA origin(s); adjust when the client's final
   origin is known, then `docker compose up -d` to apply.
+- `RTDB_BUILD_COMMIT` (optional) — git short sha baked into `/healthz`. Set it
+  to the deployed commit before `docker compose up -d --build`, e.g.
+  `RTDB_BUILD_COMMIT=$(git rev-parse --short HEAD)` (run on the workstation
+  that has `.git`, before rsync). If unset, `/healthz` reports
+  `git_commit: "unknown"`.
 
 ## Admin bootstrap (after first deploy)
 

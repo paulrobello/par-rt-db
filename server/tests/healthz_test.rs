@@ -5,7 +5,7 @@ fn test_config() -> Config {
         port: 0,
         database_url: std::env::var("RTDB_TEST_DATABASE_URL")
             .unwrap_or_else(|_| "postgres://rtdb:rtdb@127.0.0.1:55434/rtdb".into()),
-        admin_key: "test-admin-key".into(),
+        admin_key: "canary-secret-admin-key".into(),
         public_url: "http://localhost:0".into(),
         allowed_origins: vec!["http://localhost:5173".into()],
         github_client_id: None,
@@ -20,17 +20,30 @@ fn test_config() -> Config {
 }
 
 #[tokio::test]
-async fn healthz_returns_ok() -> anyhow::Result<()> {
+async fn healthz_returns_diagnostics() -> anyhow::Result<()> {
     let pool = sqlx::PgPool::connect(&test_config().database_url).await?;
     let state = AppState::new(pool, test_config());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     tokio::spawn(axum::serve(listener, build_router(state)).into_future());
-    let body = reqwest::get(format!("http://{addr}/healthz"))
-        .await?
-        .text()
-        .await?;
-    assert_eq!(body, "ok");
+
+    let resp = reqwest::get(format!("http://{addr}/healthz")).await?;
+    assert_eq!(resp.status(), 200);
+    let text = resp.text().await?;
+    // The route is unauthenticated: no configured secret may appear in the body.
+    assert!(!text.contains("canary"), "healthz leaked a secret: {text}");
+
+    let body: serde_json::Value = serde_json::from_str(&text)?;
+    assert_eq!(body["status"], "ok");
+    assert_eq!(body["postgres"], true);
+    assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
+    assert!(body["git_commit"].is_string());
+    assert!(body["build_timestamp"].is_string());
+    assert!(body["started_at"].is_string());
+    assert!(
+        body["uptime_seconds"].as_u64().unwrap() < 120,
+        "uptime should be near zero for a freshly spawned server"
+    );
     Ok(())
 }
 

@@ -5,6 +5,7 @@ pub mod config;
 pub mod db;
 pub mod ddl;
 pub mod error;
+pub mod health;
 pub mod http_api;
 pub mod mutation_log;
 pub mod pagination;
@@ -20,6 +21,7 @@ pub mod ws;
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use axum::http::{HeaderValue, Method, header};
 use axum::{Router, routing::get};
@@ -39,6 +41,7 @@ pub struct AppState {
     pub subs: Arc<SubscriptionManager>,
     pub committers: Committers,
     pub oauth_states: tokio::sync::Mutex<HashMap<String, OAuthStateEntry>>,
+    pub started_at: SystemTime,
 }
 
 impl AppState {
@@ -53,6 +56,7 @@ impl AppState {
             subs,
             committers,
             oauth_states: tokio::sync::Mutex::new(HashMap::new()),
+            started_at: SystemTime::now(),
         })
     }
 }
@@ -83,7 +87,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     let cors = cors_layer(&state.config.allowed_origins);
 
     Router::new()
-        .route("/healthz", get(|| async { "ok" }))
+        .route("/healthz", get(health::handler))
         .merge(admin::admin_routes())
         .merge(http_api::http_api_routes())
         .merge(ws::ws_routes())
