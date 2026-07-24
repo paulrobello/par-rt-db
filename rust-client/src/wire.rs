@@ -5,6 +5,7 @@ use crate::error::RtDbError;
 use crate::mutation::Transaction;
 use crate::query::Query;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 pub type QueryRef = Query;
 
@@ -162,6 +163,22 @@ pub struct ScheduleInfo {
 pub struct SearchQuery {
     pub index: String,
     pub query: String,
+}
+
+/// A vector-similarity terminal over a declared vector index. `vector` is the
+/// caller-supplied query embedding (length must equal the index dimensions);
+/// ranked by cosine distance ascending. `filter` is an optional eq-map over
+/// the index's declared `filterFields`. Mirrors
+/// `server/src/query.rs::VectorSearchQuery` byte-for-byte (camelCase,
+/// deny_unknown_fields).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct VectorSearchQuery {
+    pub index: String,
+    pub vector: Vec<f32>,
+    pub limit: u32,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub filter: BTreeMap<String, serde_json::Value>,
 }
 
 /// A db-side predicate appended to a query's WHERE clause. Mirrors
@@ -418,6 +435,54 @@ mod tests {
             serde_json::from_value(json!({"index":"search_content","query":"hello world"}))
                 .unwrap();
         assert_eq!(back.index, "search_content");
+    }
+
+    #[test]
+    fn vector_search_query_wire_shape() {
+        let q = VectorSearchQuery {
+            index: "by_embedding".into(),
+            vector: vec![1.0, 0.0, 0.0],
+            limit: 5,
+            filter: BTreeMap::new(),
+        };
+        // Empty `filter` is omitted on the wire (skip_serializing_if).
+        assert_eq!(
+            serde_json::to_value(&q).unwrap(),
+            json!({"index":"by_embedding","vector":[1.0,0.0,0.0],"limit":5})
+        );
+        // Round-trips; absent filter deserializes to empty.
+        let back: VectorSearchQuery = serde_json::from_value(json!({
+            "index": "by_embedding",
+            "vector": [1.0, 0.0, 0.0],
+            "limit": 5
+        }))
+        .unwrap();
+        assert_eq!(back.index, "by_embedding");
+        assert_eq!(back.limit, 5);
+        assert!(back.filter.is_empty());
+        // deny_unknown_fields: extra key rejected.
+        assert!(
+            serde_json::from_value::<VectorSearchQuery>(json!({
+                "index": "by_embedding",
+                "vector": [1.0],
+                "limit": 5,
+                "bogus": true
+            }))
+            .is_err()
+        );
+        // A non-empty filter round-trips through the wire.
+        let mut filter = BTreeMap::new();
+        filter.insert("userId".into(), json!("u1"));
+        let with_filter = VectorSearchQuery {
+            index: "by_embedding".into(),
+            vector: vec![1.0],
+            limit: 3,
+            filter,
+        };
+        assert_eq!(
+            serde_json::to_value(&with_filter).unwrap(),
+            json!({"index":"by_embedding","vector":[1.0],"limit":3,"filter":{"userId":"u1"}})
+        );
     }
 
     #[test]

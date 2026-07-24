@@ -20,6 +20,7 @@ pub enum FieldType {
     Bytes,
     Any,
     Record { value: Box<FieldType> },
+    Vector { dimensions: u32 },
 }
 
 impl FieldType {
@@ -48,6 +49,9 @@ impl FieldType {
             element: Box::new(element),
         }
     }
+    pub fn vector(dimensions: u32) -> Self {
+        FieldType::Vector { dimensions }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,6 +64,24 @@ pub struct IndexDef {
     /// btree indexes, so existing schemas deserialize unchanged.
     #[serde(default, skip_serializing_if = "is_false")]
     pub search: bool,
+    /// When present, marks this as a vector index: `fields[0]` must name a
+    /// `Vector { dimensions }` field whose dimensions match `vector.dimensions`,
+    /// and `filter_fields` (if any) names scalar columns used to pre-filter
+    /// nearest-neighbor queries. Omitted on the wire for btree/search indexes,
+    /// so existing schemas deserialize unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vector: Option<VectorIndexSpec>,
+}
+
+/// Declaration of a vector (approximate nearest-neighbor) index. Wire shape is
+/// camelCase (`filterFields`) to match the rest of the protocol. Mirrors
+/// `server/src/schema.rs::VectorIndexSpec` byte-for-byte.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VectorIndexSpec {
+    pub dimensions: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub filter_fields: Vec<String>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -102,6 +124,7 @@ impl TableBuilder {
             name: name.into(),
             fields: fields.iter().map(|s| (*s).into()).collect(),
             search: false,
+            vector: None,
         });
         self
     }
@@ -113,6 +136,29 @@ impl TableBuilder {
             name: name.into(),
             fields: fields.iter().map(|s| (*s).into()).collect(),
             search: true,
+            vector: None,
+        });
+        self
+    }
+
+    /// Declare a vector index over a `Vector`-typed `field`. The server stores a
+    /// pgvector column ranked by cosine distance via the `vectorSearch` terminal;
+    /// `filter_fields` names scalar fields usable as eq-filters there.
+    pub fn vector_index(
+        mut self,
+        name: &str,
+        field: &str,
+        dimensions: u32,
+        filter_fields: &[&str],
+    ) -> Self {
+        self.indexes.push(IndexDef {
+            name: name.into(),
+            fields: vec![field.into()],
+            search: false,
+            vector: Some(VectorIndexSpec {
+                dimensions,
+                filter_fields: filter_fields.iter().map(|s| (*s).into()).collect(),
+            }),
         });
         self
     }
@@ -322,5 +368,46 @@ mod tests {
             .and_then(|idxs| idxs.iter().find(|i| i.name == "by_title"))
             .expect("btree index present");
         assert!(!by_title.search);
+    }
+
+    #[test]
+    fn vector_index_serializes_and_round_trips() {
+        // A vector index carries `vector: {dimensions, filterFields}` (camelCase);
+        // a btree index in the same schema omits it (vector: None).
+        let schema = Schema::builder()
+            .table(
+                "notes",
+                Table::new()
+                    .field("title", FieldType::String)
+                    .field("embedding", FieldType::vector(4))
+                    .index("by_title", &["title"])
+                    .vector_index("by_embedding", "embedding", 4, &["userId"]),
+            )
+            .build();
+        let v = serde_json::to_value(&schema).unwrap();
+        assert_eq!(
+            v["tables"]["notes"]["indexes"],
+            json!([
+                {"name":"by_title","fields":["title"]},
+                {"name":"by_embedding","fields":["embedding"],"vector":{"dimensions":4,"filterFields":["userId"]}}
+            ])
+        );
+        // Round-trips: vector spec retained; btree index has vector: None.
+        let back: SchemaDef = serde_json::from_value(v).unwrap();
+        let notes = back.tables.get("notes").expect("notes present");
+        let by_embedding = notes
+            .indexes
+            .as_ref()
+            .and_then(|idxs| idxs.iter().find(|i| i.name == "by_embedding"))
+            .expect("vector index present");
+        let vspec = by_embedding.vector.as_ref().expect("vector spec present");
+        assert_eq!(vspec.dimensions, 4);
+        assert_eq!(vspec.filter_fields, vec!["userId"]);
+        let by_title = notes
+            .indexes
+            .as_ref()
+            .and_then(|idxs| idxs.iter().find(|i| i.name == "by_title"))
+            .expect("btree index present");
+        assert!(by_title.vector.is_none());
     }
 }

@@ -3,6 +3,7 @@
 use crate::wire::{FilterExpr, SearchQuery};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -57,6 +58,16 @@ pub struct Query {
     /// tsvector; composes with `take`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub search: Option<SearchQuery>,
+    /// Vector-similarity terminal: ranks by cosine distance over a vector index;
+    /// carries its own limit. The wire key is camelCase `vectorSearch` (matches
+    /// the server's explicit `#[serde(rename = "vectorSearch")]`; this struct
+    /// has no `rename_all`, so the rename must be explicit).
+    #[serde(
+        default,
+        rename = "vectorSearch",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub vector_search: Option<crate::wire::VectorSearchQuery>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -141,6 +152,26 @@ impl TableQuery {
         self
     }
 
+    /// Vector-similarity `vectorSearch` over a declared vector index. The server
+    /// ranks by cosine distance and applies `limit`; `filter` is an eq-map over
+    /// the index's declared `filterFields`. Terminal — composes only with the
+    /// trailing terminal (`take`/`collect`/etc.), like `search`.
+    pub fn vector_search(
+        mut self,
+        index: &str,
+        vector: Vec<f32>,
+        limit: u32,
+        filter: BTreeMap<String, serde_json::Value>,
+    ) -> Self {
+        self.q.vector_search = Some(crate::wire::VectorSearchQuery {
+            index: index.into(),
+            vector,
+            limit,
+            filter,
+        });
+        self
+    }
+
     pub fn take(mut self, n: u32) -> Query {
         self.q.take = Some(n);
         self.q
@@ -196,6 +227,7 @@ pub fn parse_result<T: DeserializeOwned>(
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::collections::BTreeMap;
 
     #[test]
     fn bare_table_query() {
@@ -354,11 +386,30 @@ mod tests {
     }
 
     #[test]
+    fn vector_builder_serializes_terminal() {
+        let q = TableQuery::new("docs")
+            .vector_search("by_embedding", vec![1.0, 0.0, 0.0], 5, BTreeMap::new())
+            .take(10);
+        // Wire key is camelCase `vectorSearch` (matches server); empty `filter`
+        // is skipped on the wire.
+        assert_eq!(
+            serde_json::to_value(&q).unwrap(),
+            json!({"table":"docs","vectorSearch":{"index":"by_embedding","vector":[1.0,0.0,0.0],"limit":5},"take":10})
+        );
+    }
+
+    #[test]
     fn bare_query_omits_filter_and_search() {
         // A query with neither filter nor search omits both keys (skip_serializing_if),
         // so existing request shapes are unchanged.
         let q = TableQuery::new("items").collect();
         let v = serde_json::to_value(&q).unwrap();
         assert_eq!(v, json!({"table":"items"}));
+        // The camelCase `vectorSearch` key is also absent on a bare query.
+        assert!(
+            !v.as_object()
+                .expect("query is object")
+                .contains_key("vectorSearch")
+        );
     }
 }
