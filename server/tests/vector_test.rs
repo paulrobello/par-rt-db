@@ -193,3 +193,58 @@ async fn insert_maintains_vector_column() {
     .expect("read vector column");
     assert_eq!(row.0.as_deref(), Some("[1,2,3]"));
 }
+
+/// Task 5 follow-up: patching a Vector field must also update the `v_<index>`
+/// column. If `apply_update`'s vector handling regressed, inserts would keep
+/// working (covered above) while embedding patches silently dropped — so this
+/// pins the patch path to the same `v_by_embedding` invariant.
+#[tokio::test]
+async fn patch_maintains_vector_column() {
+    let state = test_state().await;
+    let db = vec_db(&state).await;
+    let schema = vector_schema(3, false);
+
+    let insert_outcome = execute_txn(
+        &state.pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::Insert {
+                table: "docs".into(),
+                doc: vec_doc(vec![1.0, 2.0, 3.0]),
+            }],
+        },
+    )
+    .await
+    .expect("insert vector doc");
+    let id = insert_outcome.results[0]["id"]
+        .as_str()
+        .expect("inserted id")
+        .to_string();
+
+    let mut fields = serde_json::Map::new();
+    fields.insert("embedding".to_string(), serde_json::json!([4.0, 5.0, 6.0]));
+
+    execute_txn(
+        &state.pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::Patch {
+                table: "docs".into(),
+                id,
+                fields,
+            }],
+        },
+    )
+    .await
+    .expect("patch vector embedding");
+
+    let row: (Option<String>,) = sqlx::query_as(&format!(
+        "SELECT \"v_by_embedding\"::text FROM \"db_{db}\".\"t_docs\""
+    ))
+    .fetch_one(&state.pool)
+    .await
+    .expect("read vector column after patch");
+    assert_eq!(row.0.as_deref(), Some("[4,5,6]"));
+}
