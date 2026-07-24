@@ -82,7 +82,7 @@ async fn config_boot_loads_hot_from_db_row() {
         .await
         .unwrap();
 
-    let loaded = par_rtdb::config::load_hot(&state.pool).await.unwrap().unwrap();
+    let loaded = rtdb_server::config::load_hot(&state.pool).await.unwrap().unwrap();
     assert_eq!(loaded.allowed_origins, vec!["https://one.example.com", "https://two.example.com"]);
     assert_eq!(loaded.session_ttl_days, 7);
     assert_eq!(loaded.max_file_size, 12345);
@@ -361,7 +361,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
 
 - [ ] **Step 10: Pass a `HotConfig` seed at every `AppState::new` call site**
 
-- `server/src/main.rs`: after `db::bootstrap(&pool)` (and the existing `seed_admin_emails` call), load hot and pass it. Add `use par_rtdb::config::HotConfig;` (or the crate-relative path already used) and:
+- `server/src/main.rs`: after `db::bootstrap(&pool)` (and the existing `seed_admin_emails` call), load hot and pass it. Add `use rtdb_server::config::HotConfig;` (or the crate-relative path already used) and:
 
 ```rust
     let hot = config::load_hot(&pool)
@@ -373,7 +373,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
 
 then change the `AppState::new` call to `AppState::new(pool, config, hot)`. (Read `main.rs` first to match its exact variable names; the `load_hot` failure is intentionally lenient on boot — a malformed row falls back to env seed rather than preventing startup. If `main.rs` already maps startup errors to a hard exit, keep using `?`-style propagation is NOT required here; the `.ok().flatten().unwrap_or_else(...)` form is correct.)
 
-- `server/tests/common/mod.rs` `spawn_app` (or wherever `AppState::new` is called for tests): pass a hot seed, e.g. `AppState::new(pool, config, HotConfig::from_env())`. Add `use par_rtdb::config::HotConfig;` if not already imported (check how `common` refers to the crate — it may use `par_rtdb::config::Config` already; mirror that path).
+- `server/tests/common/mod.rs` `spawn_app` (or wherever `AppState::new` is called for tests): pass a hot seed, e.g. `AppState::new(pool, config, HotConfig::from_env())`. Add `use rtdb_server::config::HotConfig;` if not already imported (check how `common` refers to the crate — it may use `rtdb_server::config::Config` already; mirror that path).
 
 - [ ] **Step 11: Run the new test + full gate**
 
@@ -447,7 +447,7 @@ async fn config_get_patch_roundtrip() {
     assert_eq!(resp.json::<serde_json::Value>().await.unwrap()["hot"]["sessionTtlDays"], 7);
 
     // The change persisted to the table.
-    let loaded = par_rtdb::config::load_hot(&state.pool).await.unwrap().unwrap();
+    let loaded = rtdb_server::config::load_hot(&state.pool).await.unwrap().unwrap();
     assert_eq!(loaded.session_ttl_days, 7);
 
     // Invalid value -> 400.
