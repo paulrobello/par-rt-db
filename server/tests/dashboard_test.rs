@@ -365,3 +365,46 @@ async fn list_tokens_omits_secret() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+// GET /admin/dbs/{db}/stats returns one row per document table (logical names from the
+// schema) with an integer rowCount + integer sizeBytes, plus a positive total. COUNT(*)
+// correctness is inherent; this verifies the endpoint enumerates tables and queries each.
+#[tokio::test]
+async fn db_stats_reports_table_counts_and_sizes() -> anyhow::Result<()> {
+    let state = common::test_state().await;
+    let addr = common::spawn_app(state.clone()).await;
+    let db = common::fresh_db(&state).await;
+
+    let resp = common::admin_get(addr, &format!("/admin/dbs/{db}/stats")).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await?;
+    let tables = body["tables"].as_array().expect("tables array");
+    let names: Vec<String> = tables
+        .iter()
+        .filter_map(|t| t["name"].as_str().map(String::from))
+        .collect();
+    // The kanban fixture has exactly these two document tables (logical schema names).
+    assert!(
+        names.contains(&"projects".to_string()) && names.contains(&"workItems".to_string()),
+        "expected projects+workItems: {body}"
+    );
+    for t in tables {
+        assert!(
+            t["rowCount"].as_i64().is_some(),
+            "rowCount not an integer: {t}"
+        );
+        assert!(
+            t["sizeBytes"].as_i64().is_some(),
+            "sizeBytes not an integer: {t}"
+        );
+    }
+    assert!(
+        body["totalSizeBytes"].as_i64().unwrap_or(0) > 0,
+        "total size not positive: {body}"
+    );
+
+    // Unknown db → 404.
+    let resp = common::admin_get(addr, "/admin/dbs/does-not-exist/stats").await;
+    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+    Ok(())
+}

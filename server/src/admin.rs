@@ -415,6 +415,66 @@ async fn list_tokens(
     }))
 }
 
+#[derive(Serialize)]
+struct TableStat {
+    name: String,
+    #[serde(rename = "rowCount")]
+    row_count: i64,
+    #[serde(rename = "sizeBytes")]
+    size_bytes: i64,
+}
+
+#[derive(Serialize)]
+struct DbStatsResponse {
+    tables: Vec<TableStat>,
+    #[serde(rename = "totalSizeBytes")]
+    total_size_bytes: i64,
+}
+
+async fn db_stats(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(db): Path<String>,
+) -> Result<Json<DbStatsResponse>, RtDbError> {
+    require_admin(&state, &headers).await?;
+    if !db::database_exists(&state.pool, &db).await? {
+        return Err(RtDbError::not_found("unknown database"));
+    }
+    let schema_def = state.schemas.get(&state.pool, &db).await?;
+    let pg_schema = crate::ddl::pg_schema(&db);
+
+    let mut tables = Vec::with_capacity(schema_def.tables.len());
+    let mut total_size_bytes: i64 = 0;
+    for name in schema_def.tables.keys() {
+        let pg_table = crate::ddl::pg_table(name);
+        // Identifiers are system-generated from the validated db name + pushed (lowercased,
+        // length-capped) table name, so double-quoting via format! is safe — same pattern as
+        // mutation_log.rs. COUNT always returns exactly one row.
+        let count_sql = format!("SELECT COUNT(*) FROM \"{pg_schema}\".\"{pg_table}\"");
+        let row_count: i64 = sqlx::query_scalar(&count_sql)
+            .fetch_one(&state.pool)
+            .await?;
+        // Size via the injection-safe %I.%I regclass form, names $n-bound.
+        let size_bytes: i64 =
+            sqlx::query_scalar("SELECT pg_total_relation_size(format('%I.%I', $1, $2))::bigint")
+                .bind(&pg_schema)
+                .bind(&pg_table)
+                .fetch_one(&state.pool)
+                .await?;
+        total_size_bytes += size_bytes;
+        tables.push(TableStat {
+            name: name.clone(),
+            row_count,
+            size_bytes,
+        });
+    }
+    tables.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(Json(DbStatsResponse {
+        tables,
+        total_size_bytes,
+    }))
+}
+
 /// Admin routes, all gated on `Authorization: Bearer <admin_key>` (constant-time
 /// compare).
 pub fn admin_routes() -> Router<Arc<AppState>> {
@@ -433,6 +493,7 @@ pub fn admin_routes() -> Router<Arc<AppState>> {
             get(list_admins).post(add_admin).delete(remove_admin),
         )
         .route("/admin/dbs/{db}/schema", get(get_schema))
+        .route("/admin/dbs/{db}/stats", get(db_stats))
         .route("/admin/tokens", get(list_tokens))
         .route("/admin/export-db", get(export_db))
         .route("/admin/import-db", post(import_db))
