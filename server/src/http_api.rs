@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
-use axum::extract::{FromRequest, Path, Request, State};
-use axum::http::HeaderMap;
+use axum::extract::{DefaultBodyLimit, FromRequest, Path, Request, State};
+use axum::http::{HeaderMap, header};
 use axum::routing::post;
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
@@ -13,6 +13,7 @@ use crate::error::RtDbError;
 use crate::protocol::{ScheduleInfo, ScheduleWhen};
 use crate::query::{Query, QueryResult, execute_query};
 use crate::scheduler;
+use crate::storage;
 use crate::txn::Transaction;
 
 fn bearer_token(headers: &HeaderMap) -> Result<&str, RtDbError> {
@@ -233,4 +234,59 @@ pub fn http_api_routes() -> Router<Arc<AppState>> {
         .route("/api/schedule/{id}/pause", post(pause_handler))
         .route("/api/schedule/{id}/resume", post(resume_handler))
         .route("/api/schedules", post(list_schedules_handler))
+        // Upload bypasses axum's 2 MiB default body limit; `to_bytes` inside
+        // the handler enforces `RTDB_MAX_FILE_SIZE` as the sole ceiling.
+        .route(
+            "/api/storage/{db}",
+            post(upload_handler).layer(DefaultBodyLimit::disable()),
+        )
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UploadResponse {
+    id: String,
+    sha256: String,
+    size: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content_type: Option<String>,
+}
+
+async fn upload_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(db): Path<String>,
+    request: Request,
+) -> Result<Json<UploadResponse>, RtDbError> {
+    let token = bearer_token(&headers)?;
+    let principal = resolve_bearer(&state.pool, token).await?;
+    authorize(&state.pool, &principal, &db).await?;
+    storage::ensure_table(&state.pool, &db).await?; // revive storage for old dbs
+
+    let limit = state.config.max_file_size;
+    let bytes = axum::body::to_bytes(request.into_body(), limit)
+        .await
+        .map_err(|_| RtDbError::bad_request("upload exceeds max file size"))?;
+
+    let size = bytes.len() as i64;
+    let sha256 = storage::sha256_hex_bytes(&bytes);
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let id = storage::put(
+        &state.pool,
+        &db,
+        &sha256,
+        size,
+        content_type.as_deref(),
+        &bytes,
+    )
+    .await?;
+    Ok(Json(UploadResponse {
+        id,
+        sha256,
+        size,
+        content_type,
+    }))
 }

@@ -12,6 +12,7 @@ pub struct Config {
     pub google_client_id: Option<String>, // RTDB_GOOGLE_CLIENT_ID
     pub google_client_secret: Option<String>, // RTDB_GOOGLE_CLIENT_SECRET
     pub session_ttl_days: i64,        // RTDB_SESSION_TTL_DAYS, default 30
+    pub max_file_size: usize,         // RTDB_MAX_FILE_SIZE, default 50 MiB
 }
 
 impl Config {
@@ -61,6 +62,13 @@ impl Config {
             Err(_) => 30,
         };
 
+        let max_file_size = match std::env::var("RTDB_MAX_FILE_SIZE") {
+            Ok(v) => v
+                .parse::<usize>()
+                .map_err(|_| "RTDB_MAX_FILE_SIZE must be a valid usize".to_string())?,
+            Err(_) => 50 * 1024 * 1024,
+        };
+
         Ok(Self {
             port,
             database_url,
@@ -74,6 +82,7 @@ impl Config {
             google_client_id,
             google_client_secret,
             session_ttl_days,
+            max_file_size,
         })
     }
 }

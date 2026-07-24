@@ -8,7 +8,7 @@
 
 mod common;
 
-use common::{fresh_db, test_state};
+use common::{admin_post, fresh_db, spawn_app, test_state};
 
 #[tokio::test]
 async fn storage_table_created_with_database() -> anyhow::Result<()> {
@@ -112,5 +112,76 @@ async fn resolve_db_maps_id_to_owner() -> anyhow::Result<()> {
     let db = fresh_db(&state).await;
     let id = storage::put(&state.pool, &db, "deadbeef", 1, None, b"x").await?;
     assert_eq!(storage::resolve_db(&state.pool, &id).await?, Some(db));
+    Ok(())
+}
+
+// --- HTTP upload route (POST /api/storage/{db}) ---
+
+use axum::http::StatusCode;
+use serde_json::json;
+use sha2::Digest;
+use std::net::SocketAddr;
+
+/// Mint a machine token for `db` via the admin route and return the bare token
+/// string. Mirrors the helper in `http_api_test.rs` (which is private per-file).
+async fn mint_token(addr: SocketAddr, db: &str) -> String {
+    let resp = admin_post(
+        addr,
+        "/admin/mint-token",
+        json!({"db": db, "name": "test-token"}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = resp.json().await.expect("parse mint-token response");
+    body["token"].as_str().expect("token").to_string()
+}
+
+#[tokio::test]
+async fn upload_returns_id_sha_size_and_content_type() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let db = fresh_db(&state).await;
+    let token = mint_token(addr, &db).await;
+
+    let bytes = b"upload payload body";
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/api/storage/{db}"))
+        .bearer_auth(token)
+        .header("content-type", "text/plain")
+        .body(bytes.to_vec())
+        .send()
+        .await?;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = resp.json().await?;
+    assert!(body["id"].is_string());
+    assert_eq!(body["size"], json!(bytes.len() as i64));
+    assert_eq!(body["contentType"], json!("text/plain"));
+    // sha256 of the body, lowercase hex
+    let mut h = sha2::Sha256::new();
+    sha2::Digest::update(&mut h, bytes);
+    assert_eq!(
+        body["sha256"],
+        json!(hex::encode(sha2::Digest::finalize(h)))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn upload_rejects_oversized_body() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let db = fresh_db(&state).await;
+    let token = mint_token(addr, &db).await;
+
+    let too_big = vec![0u8; state.config.max_file_size + 1];
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/api/storage/{db}"))
+        .bearer_auth(token)
+        .body(too_big)
+        .send()
+        .await?;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(body["code"], json!("BAD_REQUEST"));
     Ok(())
 }

@@ -20,6 +20,7 @@ pub fn test_config() -> Config {
         google_client_id: None,
         google_client_secret: None,
         session_ttl_days: 30,
+        max_file_size: 50 * 1024 * 1024,
     }
 }
 
