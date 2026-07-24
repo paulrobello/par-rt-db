@@ -137,7 +137,6 @@ async fn admin_key_path_still_authorizes() -> anyhow::Result<()> {
     let state = common::test_state().await;
     let addr = common::spawn_app(state).await;
 
-    // /admin/admins is added in Task 3; use an existing route to prove the key path.
     let resp = common::admin_get(addr, "/admin/dbs").await;
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
     Ok(())
@@ -215,5 +214,91 @@ async fn add_admin_requires_email() -> anyhow::Result<()> {
     let addr = common::spawn_app(state).await;
     let resp = common::admin_post(addr, "/admin/admins", serde_json::json!({"email": "  "})).await;
     assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    Ok(())
+}
+
+// GET with an arbitrary bearer (for the session-path tests below).
+async fn bearer_get(addr: std::net::SocketAddr, path: &str, token: &str) -> reqwest::Response {
+    reqwest::Client::new()
+        .get(format!("http://{addr}{path}"))
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .await
+        .unwrap()
+}
+
+// An allowlisted OAuth session is admitted to an admin route.
+//
+// Email + admin row are UUID-suffixed: `rtdb_auth.users.email` is UNIQUE and
+// `rtdb_auth.admins.email` is the PK, both shared across test runs against the
+// persistent dev Postgres (same convention as `is_admin_matches_email_or_github_id`
+// above, and `per_row_auth_test` / `oauth_test`).
+#[tokio::test]
+async fn oauth_admin_session_is_admitted() -> anyhow::Result<()> {
+    let state = common::test_state().await;
+    let addr = common::spawn_app(state.clone()).await;
+    let pool = state.pool.clone();
+    let email = format!("dash-{}@example.com", uuid::Uuid::now_v7().simple());
+
+    let token = user_session(&state, &email, None).await;
+    sqlx::query("INSERT INTO rtdb_auth.admins (email, github_id, added_at) VALUES ($1, NULL, $2)")
+        .bind(&email)
+        .bind(rtdb_server::db::now_ms())
+        .execute(&pool)
+        .await?;
+
+    let resp = bearer_get(addr, "/admin/admins", &token).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    Ok(())
+}
+
+// A valid OAuth session NOT on the admin allowlist is rejected (403).
+#[tokio::test]
+async fn non_admin_session_is_forbidden() -> anyhow::Result<()> {
+    let state = common::test_state().await;
+    let addr = common::spawn_app(state.clone()).await;
+    let email = format!("nobody-{}@example.com", uuid::Uuid::now_v7().simple());
+
+    let token = user_session(&state, &email, None).await;
+    let resp = bearer_get(addr, "/admin/admins", &token).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::FORBIDDEN);
+    Ok(())
+}
+
+// A missing bearer is rejected (401).
+#[tokio::test]
+async fn missing_bearer_is_unauthorized() -> anyhow::Result<()> {
+    let state = common::test_state().await;
+    let addr = common::spawn_app(state).await;
+
+    let resp = reqwest::Client::new()
+        .get(format!("http://{addr}/admin/admins"))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+    Ok(())
+}
+
+// A machine token is never an admin, even if it reaches an admin route.
+#[tokio::test]
+async fn machine_token_is_not_admin() -> anyhow::Result<()> {
+    let state = common::test_state().await;
+    let addr = common::spawn_app(state).await;
+
+    // Create a db + mint a machine token through the admin API.
+    let name = format!("t{}", uuid::Uuid::now_v7().simple());
+    common::admin_post(addr, "/admin/create-db", serde_json::json!({"name": name})).await;
+    let resp: serde_json::Value = common::admin_post(
+        addr,
+        "/admin/mint-token",
+        serde_json::json!({"db": name, "name": "tok"}),
+    )
+    .await
+    .json()
+    .await?;
+    let token = resp["token"].as_str().unwrap().to_string();
+
+    let resp = bearer_get(addr, "/admin/admins", &token).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::FORBIDDEN);
     Ok(())
 }
