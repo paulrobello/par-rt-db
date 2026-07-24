@@ -1,84 +1,167 @@
-# Realtime Dashboard — Phase 3b: Op Feed + `/admin/stream` Implementation Plan
+# Realtime Dashboard — Phase 3b: Op Feed (with op kind) + `/admin/stream` Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development. Steps use checkbox (`- [ ]`) syntax.
+> **For agentic workers:** REQUIRED SUB-SKILL: superpowers:subagent-driven-development. Steps use checkbox (`- [ ]`).
 
-**Goal:** A realtime document-activity feed: every committed write publishes per-document events tapped at the committer's two commit sites, replayed from an in-memory ring on (re)connect and streamed live to an admin-gated WebSocket, with periodic gauge snapshots multiplexed in.
+**Goal:** A realtime document-activity feed carrying the full op kind — every committed write publishes per-document `OpEvent{table, docId, kind, owner, ts}` tapped at the committer's two commit sites, replayed from an in-memory ring on (re)connect and streamed live over an admin-gated WebSocket with periodic gauges.
 
-**Architecture:** A new `OpFeed` (`tokio::sync::broadcast` + a bounded `Mutex<VecDeque>` ring) on `AppState`. The `Committers`/`CommitterCtx`/`run_committer` threading gains an `Arc<OpFeed>` so `handle_mutate` and `handle_scheduled` can publish — once each, after a successful `execute_txn` — one `OpEvent` per `(table, id)` in `outcome.write_set.docs`. `GET /admin/ops/recent` reads the filtered ring; `WS /admin/stream` (admin-gated at upgrade) replays the filtered ring, then streams live broadcast events plus a ~1s gauge snapshot.
+**Architecture:** Enrich `WriteSet` with an `ops: Vec<DocOp{table,id,kind}>` field (alongside the existing `docs`, which `subs.rs` keeps using) by adding a `kind` arg to `touch()` and updating its 6 call sites in the step-dispatch. A new `OpFeed` (broadcast + ring) on `AppState`, threaded into `Committers`/`CommitterCtx`/`run_committer`, publishes one `OpEvent` per `DocOp` after each successful `execute_txn` (in `handle_mutate` + `handle_scheduled`). `GET /admin/ops/recent` reads the filtered ring; `WS /admin/stream` (admin-gated at upgrade) replays it, then streams live events + ~1s gauge snapshots.
 
-**Two deliberate simplifications vs spec §3 (flagged for the user):**
-1. **Op kind deferred.** `write_set.docs` carries `(table, id)` but not insert/patch/replace/delete. Adding the kind would require enriching `WriteSet` (a txn-core change that also risks `subs.rs`'s `docs.contains(...)` point-read check). 3b emits doc-change events without the kind; a fast-follow can add `WriteSet.ops` cleanly.
-2. **`principal` = the `owner` string.** The committer only sees `owner: Option<String>` (Some = a user's id, None = machine/scheduled), not a `Principal`, so `OpEvent.principal` is `Option<String>` (the owner id) rather than a `PrincipalKind`. Admin writes (Phase 5) will carry `None`.
+**One simplification vs spec §3:** `principal` = the `owner` string (`Option<String>`), since the committer only has `owner`, never a `Principal`.
 
 **Tech Stack:** Rust, axum (`WebSocketUpgrade`), tokio (`broadcast`, `select`), sqlx, Postgres 17.
 
 ## Global Constraints
-
 - No `unwrap()`/`expect()` outside `#[cfg(test)]`. Zero clippy warnings under `-D warnings`.
-- `require_admin(&state, &headers).await` gates `/admin/ops/recent` AND the `/admin/stream` WS upgrade (bearer read from the HTTP headers at upgrade).
-- `broadcast::send` errors when there are no receivers — ignore it (`.ok()`); the tap must never fail a commit. Ring push is best-effort.
-- The tap publishes AFTER `execute_txn` success and `fan_out` — never changes commit ordering or correctness. One publish per commit site (`handle_mutate`, `handle_scheduled`).
+- `require_admin(&state, &headers).await` gates `/admin/ops/recent` and the `/admin/stream` upgrade.
+- `broadcast::send` errors when there are no receivers — ignore (`.ok()`); the tap must never fail a commit. Publish is AFTER `execute_txn` + `fan_out`.
+- `subs.rs` reads only `write_set.docs` — do NOT change `docs`; ADD `ops`. Keep `touch` populating `tables` + `docs` exactly as today, plus `ops`.
 - `make checkall` is the gate; `make dev-db-up` required (if port-held, run legs directly). Tests share one Postgres; `dashboard_test.rs` uses only `mod common;` + fully-qualified paths.
 
 ## File Structure
-
-- `server/src/op_feed.rs` — **create**: `OpEvent`, `OpFeed` (broadcast + ring), `publish`/`recent`/`subscribe`, `new`.
+- `server/src/txn.rs` — `OpKind`, `DocOp`, `WriteSet.ops`, `touch(table,id,kind)`, 6 call-site updates.
+- `server/src/op_feed.rs` — **create**: `OpEvent{db,table,docId,kind,owner,ts}`, `OpFeed` (broadcast + ring), `publish`/`recent`/`subscribe`.
 - `server/src/committer.rs` — thread `Arc<OpFeed>` through `Committers`/`CommitterCtx`/`run_committer`/`channel_for`; publish in `handle_mutate` + `handle_scheduled`.
 - `server/src/lib.rs` — `pub mod op_feed;`, `pub op_feed: Arc<OpFeed>` on `AppState`, construct + pass to `Committers::new`.
-- `server/src/admin.rs` — `GET /admin/ops/recent` + `WS /admin/stream` (+ routes).
+- `server/src/admin.rs` — `GET /admin/ops/recent` + `WS /admin/stream`.
 - `server/tests/dashboard_test.rs` — tests.
 
 ---
 
-## Task 1: `OpFeed` module + wire through `AppState`/`Committers`
+## Task 1: Enrich `WriteSet` with op kind
+
+**Files:** `server/src/txn.rs`. Test: a unit test inside `txn.rs`'s `#[cfg(test)]` module (asserts `touch` records kinds into `ops`).
+
+- [ ] **Step 1: Failing unit test** — add to `txn.rs`'s test module:
+
+```rust
+    #[test]
+    fn write_set_ops_records_kind() {
+        let mut ws = WriteSet::default();
+        ws.touch("projects", "id1", OpKind::Insert);
+        ws.touch("projects", "id2", OpKind::Patch);
+        ws.touch("tasks", "id3", OpKind::Delete);
+        assert_eq!(ws.docs.len(), 3);
+        assert_eq!(ws.ops.len(), 3);
+        assert!(ws.ops.iter().any(|o| o.id == "id1" && o.kind == OpKind::Insert));
+        assert!(ws.ops.iter().any(|o| o.id == "id2" && o.kind == OpKind::Patch));
+        assert!(ws.ops.iter().any(|o| o.table == "tasks" && o.kind == OpKind::Delete));
+    }
+```
+
+- [ ] **Step 2: Verify it fails** — `cd server && cargo test -p rtdb-server write_set_ops_records_kind` → compile error (`OpKind`/`ops`/`touch` arity missing).
+
+- [ ] **Step 3: Add `OpKind`, `DocOp`, `ops`, and update `touch`** — in `txn.rs` near the `WriteSet` definition:
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OpKind {
+    Insert,
+    Patch,
+    Replace,
+    Delete,
+    Upsert,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct DocOp {
+    pub table: String,
+    pub id: String,
+    pub kind: OpKind,
+}
+```
+
+Change `WriteSet` to add the `ops` field:
+
+```rust
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct WriteSet {
+    pub tables: BTreeSet<String>,
+    pub docs: BTreeSet<(String, String)>,
+    pub ops: Vec<DocOp>,
+}
+```
+
+Change `touch` to record the kind:
+
+```rust
+    /// Records that the transaction wrote document `id` in `table` as `kind`.
+    fn touch(&mut self, table: &str, id: &str, kind: OpKind) {
+        self.tables.insert(table.to_string());
+        self.docs.insert((table.to_string(), id.to_string()));
+        self.ops.push(DocOp {
+            table: table.to_string(),
+            id: id.to_string(),
+            kind,
+        });
+    }
+```
+
+- [ ] **Step 4: Update the 6 call sites** in `execute_txn`'s step-dispatch (each `write_set.touch(table, id)` gains its kind):
+
+```rust
+    // Insert (line ~781):
+    write_set.touch(table, &id, OpKind::Insert);
+    // Patch (line ~789):
+    write_set.touch(table, id, OpKind::Patch);
+    // Replace (line ~797):
+    write_set.touch(table, id, OpKind::Replace);
+    // Delete (line ~804):
+    write_set.touch(table, id, OpKind::Delete);
+    // Upsert insert path (line ~840) and patch path (line ~855):
+    write_set.touch(table, &id, OpKind::Upsert);
+```
+
+- [ ] **Step 5: Verify it passes** — `cd server && cargo test -p rtdb-server write_set_ops_records_kind && cargo clippy --all-targets -- -D warnings` → PASS. (`subs.rs` still compiles — it uses `docs`, unchanged.) Then full gate + commit:
+
+```bash
+git add server/src/txn.rs
+git commit -m "feat(server): record op kind in WriteSet.ops at each write site (#18 phase 3b)"
+```
+
+---
+
+## Task 2: `OpFeed` module + wire through `AppState`/`Committers`
 
 **Files:** create `server/src/op_feed.rs`; modify `server/src/lib.rs`, `server/src/committer.rs`. Test: `dashboard_test.rs`.
 
-**Interfaces:**
-- Produces: `OpFeed::new(cap, ring_cap) -> Arc<Self>`, `publish(&self, db: &str, owner: Option<&str>, docs: &BTreeSet<(String,String)>)`, `recent(&self, db: Option<&str>, table: Option<&str>, n: usize) -> Vec<OpEvent>`, `subscribe(&self) -> broadcast::Receiver<OpEvent>`; `OpEvent { db, table, docId, ts, owner }` (camelCase Serialize); `Committers::new` gains an `op_feed` param threaded to `run_committer`/`CommitterCtx`.
-
-- [ ] **Step 1: Write the failing test** — append to `dashboard_test.rs`:
+- [ ] **Step 1: Failing test** — append to `dashboard_test.rs`:
 
 ```rust
 
-// OpFeed publishes per-(table,id) events, replays them from the ring, and broadcasts live.
+// OpFeed publishes one event per DocOp (with kind), replays from the ring, broadcasts live.
 #[tokio::test]
 async fn op_feed_publishes_and_replays() -> anyhow::Result<()> {
+    use rtdb_server::txn::{DocOp, OpKind};
     let feed = rtdb_server::op_feed::OpFeed::new(64, 32);
-    let mut docs = std::collections::BTreeSet::new();
-    docs.insert(("projects".to_string(), "id1".to_string()));
-    docs.insert(("projects".to_string(), "id2".to_string()));
-
-    // Subscribe BEFORE publish to also exercise the live receiver.
+    let ops = vec![
+        DocOp { table: "projects".into(), id: "id1".into(), kind: OpKind::Insert },
+        DocOp { table: "projects".into(), id: "id2".into(), kind: OpKind::Patch },
+    ];
     let mut rx = feed.subscribe();
-    feed.publish("dbA", Some("user-1"), &docs).await;
+    feed.publish("dbA", Some("user-1"), &ops).await;
 
-    // Ring replay returns both docs (newest first or stable order — assert membership).
     let recent = feed.recent(Some("dbA"), None, 10);
     let ids: Vec<&str> = recent.iter().map(|e| e.doc_id.as_str()).collect();
     assert!(ids.contains(&"id1") && ids.contains(&"id2"), "ring missing events: {recent:?}");
-    // A different db filter excludes them.
+    assert_eq!(recent.iter().find(|e| e.doc_id == "id1").unwrap().kind, OpKind::Insert);
     assert!(feed.recent(Some("dbB"), None, 10).is_empty());
 
-    // Live receiver got both events.
     let mut got = 0;
-    while let Ok(ev) = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await {
-        let _ = ev; got += 1;
-    }
+    while let Ok(_ev) = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await { got += 1; }
     assert_eq!(got, 2);
     Ok(())
 }
 ```
 
-- [ ] **Step 2: Verify it fails** — `cd server && cargo test --test dashboard_test op_feed_publishes_and_replays` → compile error (`op_feed` missing).
+- [ ] **Step 2: Verify it fails** → compile error (`op_feed` missing).
 
 - [ ] **Step 3: Create `server/src/op_feed.rs`**:
 
 ```rust
-//! Realtime document-activity feed for the dashboard. The committer publishes one
-//! `OpEvent` per written `(table, id)` after each successful commit (handle_mutate,
-//! handle_scheduled). A bounded ring keeps recent events for reconnect/initial replay;
-//! a `broadcast` channel fans live events to open `/admin/stream` sockets. Non-durable.
+//! Realtime document-activity feed. The committer publishes one `OpEvent` per
+//! `DocOp` after each successful commit. A bounded ring replays recent events on
+//! (re)connect; a `broadcast` channel fans live events to `/admin/stream`. Non-durable.
 use std::collections::VecDeque;
 use std::sync::Arc;
 
@@ -86,15 +169,16 @@ use serde::Serialize;
 use tokio::sync::{Mutex, broadcast};
 
 use crate::db::now_ms;
+use crate::txn::{DocOp, OpKind};
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct OpEvent {
     pub db: String,
     pub table: String,
     pub doc_id: String,
+    pub kind: OpKind,
     pub ts: i64,
-    /// The committing principal's owner id when known (Some = a user; None = machine/scheduled/admin).
     pub owner: Option<String>,
 }
 
@@ -107,105 +191,73 @@ pub struct OpFeed {
 impl OpFeed {
     pub fn new(broadcast_cap: usize, ring_cap: usize) -> Arc<Self> {
         let (tx, _rx) = broadcast::channel(broadcast_cap);
-        Arc::new(Self {
-            tx,
-            ring: Mutex::new(VecDeque::with_capacity(ring_cap)),
-            ring_cap,
-        })
+        Arc::new(Self { tx, ring: Mutex::new(VecDeque::with_capacity(ring_cap)), ring_cap })
     }
 
-    /// Publishes one `OpEvent` per `(table, id)` in `docs`. Ring push is bounded (evicts
-    /// oldest); `broadcast::send` is a no-op when there are no subscribers (error ignored).
-    /// `owner` is the committer's `owner` (Some user_id / None). Never fails the commit.
-    pub async fn publish(
-        &self,
-        db: &str,
-        owner: Option<&str>,
-        docs: &std::collections::BTreeSet<(String, String)>,
-    ) {
+    /// One `OpEvent` per `DocOp`. Ring is bounded (evicts oldest); `broadcast::send`
+    /// is a no-op with no subscribers. Never fails the commit.
+    pub async fn publish(&self, db: &str, owner: Option<&str>, ops: &[DocOp]) {
         let ts = now_ms();
         let owner = owner.map(|s| s.to_string());
         let mut ring = self.ring.lock().await;
-        for (table, doc_id) in docs {
+        for op in ops {
             let event = OpEvent {
                 db: db.to_string(),
-                table: table.clone(),
-                doc_id: doc_id.clone(),
+                table: op.table.clone(),
+                doc_id: op.id.clone(),
+                kind: op.kind,
                 ts,
                 owner: owner.clone(),
             };
-            if ring.len() >= self.ring_cap {
-                ring.pop_front();
-            }
+            if ring.len() >= self.ring_cap { ring.pop_front(); }
             ring.push_back(event.clone());
-            let _ = self.tx.send(event); // no subscribers → Err, ignored
+            let _ = self.tx.send(event);
         }
     }
 
-    /// Recent events (newest-last), filtered by optional db/table, capped at `n`.
-    pub async fn recent(
-        &self,
-        db: Option<&str>,
-        table: Option<&str>,
-        n: usize,
-    ) -> Vec<OpEvent> {
+    /// Recent events (oldest-first), filtered by optional db/table, capped at `n`.
+    pub async fn recent(&self, db: Option<&str>, table: Option<&str>, n: usize) -> Vec<OpEvent> {
         let ring = self.ring.lock().await;
-        ring.iter()
-            .rev()
+        ring.iter().rev()
             .filter(|e| db.map_or(true, |d| e.db == d))
             .filter(|e| table.map_or(true, |t| e.table == t))
-            .take(n)
-            .cloned()
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect()
+            .take(n).cloned().collect::<Vec<_>>().into_iter().rev().collect()
     }
 
-    /// A fresh live receiver for `/admin/stream`.
-    pub fn subscribe(&self) -> broadcast::Receiver<OpEvent> {
-        self.tx.subscribe()
-    }
+    pub fn subscribe(&self) -> broadcast::Receiver<OpEvent> { self.tx.subscribe() }
 }
 ```
 
-- [ ] **Step 4: Wire into `AppState`** — in `server/src/lib.rs`: add `pub mod op_feed;`; in `AppState` add `pub op_feed: Arc<op_feed::OpFeed>,`; in `AppState::new` add `let op_feed = op_feed::OpFeed::new(256, 500);` and pass `op_feed.clone()` to `Committers::new(...)`, and add `op_feed` to the struct literal.
+- [ ] **Step 4: Wire into `AppState`** — `lib.rs`: add `pub mod op_feed;`; `pub op_feed: Arc<op_feed::OpFeed>,` field; in `AppState::new` add `let op_feed = op_feed::OpFeed::new(256, 500);`, pass `op_feed.clone()` to `Committers::new`, add `op_feed` to the literal.
 
-- [ ] **Step 5: Thread through `Committers`** — in `server/src/committer.rs`:
-  - Add `op_feed: Arc<crate::op_feed::OpFeed>,` to the `Committers` struct + a param to `Committers::new`; store it.
-  - Add `op_feed: Arc<crate::op_feed::OpFeed>,` to `CommitterCtx`.
-  - Add an `op_feed: Arc<crate::op_feed::OpFeed>,` param to `run_committer` (after `schemas`) and include it in the `CommitterCtx { ... }` literal.
-  - In `channel_for`, pass `self.op_feed.clone()` into the `run_committer(...)` spawn.
-  - In `lib.rs`, update the `Committers::new(...)` call to pass `op_feed.clone()`.
+- [ ] **Step 5: Thread through `Committers`** — `committer.rs`: add `op_feed: Arc<crate::op_feed::OpFeed>` to `Committers` + `Committers::new` param; same field on `CommitterCtx`; add `op_feed` param to `run_committer` (after `schemas`) and to its `CommitterCtx { ... }` literal; in `channel_for` pass `self.op_feed.clone()` into the `run_committer(...)` spawn; update the `Committers::new(...)` call in `lib.rs`.
 
-- [ ] **Step 6: Verify Task 1 test passes** — `cd server && cargo test --test dashboard_test op_feed_publishes_and_replays` → PASS. Then full gate + commit:
+- [ ] **Step 6: Verify it passes + gate + commit**:
 
 ```bash
 git add server/src/op_feed.rs server/src/lib.rs server/src/committer.rs server/tests/dashboard_test.rs
-git commit -m "feat(server): OpFeed (broadcast + ring) + AppState/Committers wiring (#18 phase 3b)"
+git commit -m "feat(server): OpFeed (broadcast + ring, with kind) + AppState/Committers wiring (#18 phase 3b)"
 ```
 
 ---
 
-## Task 2: Tap at the two commit sites + `GET /admin/ops/recent`
+## Task 3: Tap at the two commit sites + `GET /admin/ops/recent`
 
-**Files:** modify `server/src/committer.rs` (tap), `server/src/admin.rs` (endpoint + route). Test: `dashboard_test.rs`.
+**Files:** `server/src/committer.rs` (tap), `server/src/admin.rs` (endpoint + route). Test: `dashboard_test.rs`.
 
 - [ ] **Step 1: Failing test** — append to `dashboard_test.rs`:
 
 ```rust
 
-// A committed mutation publishes an op event; /admin/ops/recent returns it (admin-gated).
+// A committed insert publishes an op event WITH its kind; /admin/ops/recent returns it.
 #[tokio::test]
 async fn op_feed_tapped_on_commit() -> anyhow::Result<()> {
     let state = common::test_state().await;
     let addr = common::spawn_app(state.clone()).await;
     let db = common::fresh_db(&state).await;
 
-    // Mint + insert one project doc via /api/mutate.
     let mint: serde_json::Value =
-        common::admin_post(addr, "/admin/mint-token", serde_json::json!({"db": db, "name": "t"}))
-            .await.json().await?;
+        common::admin_post(addr, "/admin/mint-token", serde_json::json!({"db": db, "name": "t"})).await.json().await?;
     let token = mint["token"].as_str().unwrap().to_string();
     let resp = reqwest::Client::new().post(format!("http://{addr}/api/mutate"))
         .header("Authorization", format!("Bearer {token}"))
@@ -213,32 +265,27 @@ async fn op_feed_tapped_on_commit() -> anyhow::Result<()> {
         .send().await?;
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
 
-    // recent lists the event for this db.
     let body: serde_json::Value =
         common::admin_get(addr, &format!("/admin/ops/recent?db={db}&n=10")).await.json().await?;
     let ops = body["ops"].as_array().expect("ops array");
-    assert!(ops.iter().any(|o| o["table"] == "projects"), "no projects op event: {body}");
-
-    // A different db filter excludes it.
-    let body: serde_json::Value =
-        common::admin_get(addr, "/admin/ops/recent?db=other&n=10").await.json().await?;
-    assert!(body["ops"].as_array().unwrap().iter().all(|o| o["table"] != "projects"));
+    let ours = ops.iter().find(|o| o["table"] == "projects").expect("projects op event missing");
+    assert_eq!(ours["kind"], "insert", "kind should be 'insert': {ours}");
     Ok(())
 }
 ```
 
-- [ ] **Step 2: Verify it fails** — route 404 / no events.
+- [ ] **Step 2: Verify it fails** → route 404 / no events.
 
-- [ ] **Step 3: Add the tap** — in `handle_mutate` (`committer.rs`), immediately after the `ctx.subs.fan_out(...).await;` line (after `execute_txn` success), add:
+- [ ] **Step 3: Add the tap** — in `handle_mutate` (`committer.rs`), after the `ctx.subs.fan_out(...).await;` line:
 
 ```rust
-    ctx.op_feed.publish(&ctx.db, owner.as_deref(), &outcome.write_set.docs).await;
+    ctx.op_feed.publish(&ctx.db, owner.as_deref(), &outcome.write_set.ops).await;
 ```
 
-In `handle_scheduled` (`committer.rs`), immediately after its `ctx.subs.fan_out(...).await;` (inside the `Ok(outcome) =>` arm), add:
+In `handle_scheduled` (`committer.rs`), after its `ctx.subs.fan_out(...).await;` (inside `Ok(outcome) =>`):
 
 ```rust
-            ctx.op_feed.publish(&ctx.db, None, &outcome.write_set.docs).await;
+            ctx.op_feed.publish(&ctx.db, None, &outcome.write_set.ops).await;
 ```
 
 - [ ] **Step 4: Add `GET /admin/ops/recent`** — in `server/src/admin.rs`:
@@ -262,17 +309,14 @@ async fn ops_recent(
     QueryParams(params): QueryParams<OpsRecentParams>,
 ) -> Result<Json<OpsRecentResponse>, RtDbError> {
     require_admin(&state, &headers).await?;
-    let ops = state
-        .op_feed
-        .recent(params.db.as_deref(), params.table.as_deref(), params.n.min(500))
-        .await;
+    let ops = state.op_feed.recent(params.db.as_deref(), params.table.as_deref(), params.n.min(500)).await;
     Ok(Json(OpsRecentResponse { ops }))
 }
 ```
 
 Register in `admin_routes()`: `.route("/admin/ops/recent", get(ops_recent))`.
 
-- [ ] **Step 5: Verify it passes** → full gate + commit:
+- [ ] **Step 5: Verify it passes + gate + commit**:
 
 ```bash
 git add server/src/committer.rs server/src/admin.rs server/tests/dashboard_test.rs
@@ -281,23 +325,20 @@ git commit -m "feat(server): op-feed tap at commit sites + GET /admin/ops/recent
 
 ---
 
-## Task 3: `WS /admin/stream` (replay + live + periodic gauges)
+## Task 4: `WS /admin/stream` (replay + live + periodic gauges)
 
-**Files:** modify `server/src/admin.rs` (upgrade handler + route), possibly a small helper. Test: `dashboard_test.rs`.
+**Files:** `server/src/admin.rs`. Test: `dashboard_test.rs`.
 
-- [ ] **Step 1: Failing test** — append a WS round-trip test that connects to `/admin/stream` with the admin-key bearer, sends nothing, mutates via HTTP, and asserts it receives a `{kind:"op",...}` frame. (Use `tokio-tungstenite` if already a dev-dep; otherwise assert via the HTTP `/admin/ops/recent` path already covered in Task 2 and make this test focus on the upgrade's admin gate: a missing bearer → 403/401 at upgrade, a valid admin key → 101 switching protocols.) Implement the upgrade-gate version first (no extra dep):
+- [ ] **Step 1: Failing test** — append to `dashboard_test.rs` (the admin-gate-at-upgrade check):
 
 ```rust
 
-// /admin/stream rejects a missing bearer at the WS upgrade (no 101).
+// /admin/stream rejects a missing bearer at the upgrade (no 101).
 #[tokio::test]
 async fn admin_stream_requires_admin() -> anyhow::Result<()> {
     let state = common::test_state().await;
     let addr = common::spawn_app(state).await;
-    // Missing bearer → rejected at the admin gate before any WS negotiation.
-    let resp = reqwest::Client::new()
-        .get(format!("http://{addr}/admin/stream"))
-        .send().await?;
+    let resp = reqwest::Client::new().get(format!("http://{addr}/admin/stream")).send().await?;
     let status = resp.status();
     assert!(status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN,
         "missing bearer must be rejected, got {status}");
@@ -305,20 +346,13 @@ async fn admin_stream_requires_admin() -> anyhow::Result<()> {
 }
 ```
 
-- [ ] **Step 2: Verify it fails** — route 404.
+- [ ] **Step 2: Verify it fails** → route 404.
 
-- [ ] **Step 3: Add the upgrade handler** — in `server/src/admin.rs`:
+- [ ] **Step 3: Add the upgrade handler** — in `server/src/admin.rs` (add imports `use axum::extract::ws::{WebSocket, WebSocketUpgrade};` and `use std::time::Duration;` — `Response` is already imported):
 
 ```rust
-use axum::extract::ws::{WebSocket, WebSocketUpgrade};
-use axum::response::Response;
-use std::time::Duration;
-
 #[derive(Deserialize)]
-struct StreamParams {
-    db: Option<String>,
-    table: Option<String>,
-}
+struct StreamParams { db: Option<String>, table: Option<String> }
 
 async fn admin_stream(
     State(state): State<Arc<AppState>>,
@@ -331,11 +365,9 @@ async fn admin_stream(
 }
 
 async fn run_admin_stream(mut socket: WebSocket, state: Arc<AppState>, db: Option<String>, table: Option<String>) {
-    // 1. Replay recent ring (filtered) as initial op messages.
     for ev in state.op_feed.recent(db.as_deref(), table.as_deref(), 200).await {
-        let _ = send_json(&mut socket, &serde_json::json!({"kind":"op","event":ev})).await;
+        if send_stream_json(&mut socket, &serde_json::json!({"kind":"op","event":ev})).await.is_err() { return; }
     }
-    // 2. Live broadcast + ~1s gauge snapshots.
     let mut rx = state.op_feed.subscribe();
     let mut gauge_tick = tokio::time::interval(Duration::from_secs(1));
     gauge_tick.tick().await; // skip immediate
@@ -343,21 +375,19 @@ async fn run_admin_stream(mut socket: WebSocket, state: Arc<AppState>, db: Optio
         tokio::select! {
             ev = rx.recv() => {
                 let Ok(ev) = ev else { break };
-                if db.as_deref().map_or(true, |d| ev.db == d)
-                    && table.as_deref().map_or(true, |t| ev.table == t)
-                {
-                    if send_json(&mut socket, &serde_json::json!({"kind":"op","event":ev})).await.is_err() { break; }
+                if db.as_deref().map_or(true, |d| ev.db == d) && table.as_deref().map_or(true, |t| ev.table == t) {
+                    if send_stream_json(&mut socket, &serde_json::json!({"kind":"op","event":ev})).await.is_err() { break; }
                 }
             }
             _ = gauge_tick.tick() => {
                 let snap = state.metrics.snapshot(&state.pool, &state.subs, state.started_at).await;
-                if send_json(&mut socket, &serde_json::json!({"kind":"gauges","gauges":snap})).await.is_err() { break; }
+                if send_stream_json(&mut socket, &serde_json::json!({"kind":"gauges","gauges":snap})).await.is_err() { break; }
             }
         }
     }
 }
 
-async fn send_json(socket: &mut WebSocket, value: &serde_json::Value) -> Result<(), axum::Error> {
+async fn send_stream_json(socket: &mut WebSocket, value: &serde_json::Value) -> Result<(), axum::Error> {
     use axum::extract::ws::Message;
     let text = serde_json::to_string(value).unwrap_or_else(|_| "{}".into());
     socket.send(Message::Text(text.into())).await
@@ -376,8 +406,7 @@ git commit -m "feat(server): WS /admin/stream — op-feed replay + live + gauge 
 ---
 
 ## Phase 3b Done — Definition of Done
-- Commits publish one `OpEvent` per written doc (handle_mutate + handle_scheduled); ring replays on connect; `/admin/stream` streams live events + 1s gauges, admin-gated; `GET /admin/ops/recent` reads the ring.
-- `make checkall` green; existing tests pass; the single-writer + commit ordering invariants intact (publish is after commit, non-fatal).
-- Op kind + `PrincipalKind` deferred (see simplifications).
+- `WriteSet.ops` records `OpKind` per write; commits publish one `OpEvent{table,docId,kind,owner,ts}` per doc (handle_mutate + handle_scheduled); ring replays on connect; `/admin/stream` streams live + 1s gauges, admin-gated; `GET /admin/ops/recent` reads the ring.
+- `make checkall` green; `subs.rs` point-read still works (docs unchanged); single-writer + commit ordering intact (publish after commit, non-fatal).
 
 ## Next: Phase 4 (config + dynamic CORS) — separate plan
