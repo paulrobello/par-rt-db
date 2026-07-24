@@ -1,4 +1,5 @@
 import { RtDbError } from "./errors.js";
+import { RtDbHttpClient } from "./http.js";
 import { projectOptimisticUpdate } from "./optimistic.js";
 import type {
   AuthedUser,
@@ -323,6 +324,37 @@ export class RtDbClient {
    * `listSchedulesOk`. */
   listSchedules(): Promise<ScheduleInfo[]> {
     return this.queueSchedule<ScheduleInfo[]>({ kind: "list" });
+  }
+
+  // ---- file storage ----------------------------------------------------------
+  //
+  // Storage is HTTP-only on the live server; the reactive WS client delegates
+  // each call to a transient RtDbHttpClient built from its current connection
+  // params. The http client is rebuilt per call rather than cached so a rotated
+  // token (setToken / re-auth) is always reflected.
+
+  upload(bytes: Uint8Array, contentType?: string) {
+    return this.httpForStorage().upload(bytes, contentType);
+  }
+
+  deleteFile(id: string) {
+    return this.httpForStorage().deleteFile(id);
+  }
+
+  getFileMetadata(id: string) {
+    return this.httpForStorage().getFileMetadata(id);
+  }
+
+  getUrl(id: string) {
+    return this.httpForStorage().getUrl(id);
+  }
+
+  private httpForStorage(): RtDbHttpClient {
+    return new RtDbHttpClient({
+      url: this.options.url,
+      db: this.options.db,
+      token: this.token ?? "",
+    });
   }
 
   /** Mints a `sch-${n}` correlation id and either dispatches (when authenticated)

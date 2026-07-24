@@ -1,4 +1,5 @@
 import { RtDbError } from "./errors.js";
+import type { FileMetadata, UploadResult } from "./http.js";
 import { decodeCursor, encodeCursor } from "./pagination.js";
 import type {
   FieldTypeJson,
@@ -354,6 +355,11 @@ export class InMemoryRtDbClient {
   private readonly idempotency = new Map<string, unknown[]>();
   private readonly subs: Subscription[] = [];
   private readonly schedules = new Map<string, ScheduledJob>();
+  private readonly files = new Map<
+    string,
+    { bytes: Uint8Array; contentType?: string; createdAt: number }
+  >();
+  private idCounter = 0;
 
   constructor(options: InMemoryRtDbClientOptions = {}) {
     this.now = options.now ?? (() => Date.now());
@@ -486,6 +492,48 @@ export class InMemoryRtDbClient {
 
   async listSchedules(): Promise<ScheduleInfo[]> {
     return [...this.schedules.values()].map((job) => this.toScheduleInfo(job));
+  }
+
+  // ---- file storage ----------------------------------------------------------
+  //
+  // Storage is HTTP-only on the live server; the in-memory harness mirrors the
+  // surface (upload/delete/getFileMetadata/getUrl) so unit tests can exercise
+  // app storage flows with no network. `getUrl` returns a synthetic
+  // `memory://` handle — there is no real byte stream to serve.
+
+  /** Stores `bytes` and returns a server-shaped UploadResult. The id is a
+   * short counter-prefixed token (distinct in shape from document ids). */
+  async upload(bytes: Uint8Array, contentType?: string): Promise<UploadResult> {
+    const id = `f${(++this.idCounter).toString(36)}`;
+    const digest = await crypto.subtle.digest("SHA-256", bytes as BufferSource);
+    const sha256 = [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+    this.files.set(id, { bytes, contentType, createdAt: this.now() });
+    return { id, sha256, size: bytes.length, contentType };
+  }
+
+  async deleteFile(id: string): Promise<void> {
+    if (!this.files.delete(id)) {
+      throw new RtDbError("NOT_FOUND", "unknown file");
+    }
+  }
+
+  async getFileMetadata(id: string): Promise<FileMetadata> {
+    const f = this.files.get(id);
+    if (!f) {
+      throw new RtDbError("NOT_FOUND", "unknown file");
+    }
+    return {
+      id,
+      sha256: "", // not tracked in-memory; only the http client computes it
+      size: f.bytes.length,
+      contentType: f.contentType,
+      creationTime: f.createdAt,
+    };
+  }
+
+  /** Synthetic handle — no real byte stream. */
+  getUrl(id: string): string {
+    return `memory://${id}`;
   }
 
   /** Fires every due non-paused job by applying its txn through the same atomic

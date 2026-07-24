@@ -9,6 +9,23 @@ export interface RtDbHttpClientOptions {
   fetch?: typeof fetch;
 }
 
+/** Result of an upload: the server-assigned id, content digest, and size. */
+export interface UploadResult {
+  id: string;
+  sha256: string;
+  size: number;
+  contentType?: string;
+}
+
+/** Metadata for a stored file. `creationTime` is epoch milliseconds. */
+export interface FileMetadata {
+  id: string;
+  sha256: string;
+  size: number;
+  contentType?: string;
+  creationTime: number;
+}
+
 /** One-shot HTTP client for machine callers (or any Bearer token). */
 export class RtDbHttpClient {
   private readonly url: string;
@@ -79,6 +96,41 @@ export class RtDbHttpClient {
     return (body as { user: AuthedUser }).user;
   }
 
+  /** Upload raw bytes; the db is this client's db (injected into the path). */
+  async upload(bytes: Uint8Array, contentType?: string): Promise<UploadResult> {
+    const headers: Record<string, string> = { Authorization: `Bearer ${this.token}` };
+    if (contentType) {
+      headers["content-type"] = contentType;
+    }
+    const response = await this.fetchImpl(
+      `${this.url}/api/storage/${encodeURIComponent(this.db)}`,
+      // `bytes` is a valid BodyInit at runtime; the cast works around the TS
+      // lib's `Uint8Array<ArrayBufferLike>` ↔ `BodyInit` variance.
+      { method: "POST", headers, body: bytes as BodyInit },
+    );
+    return (await this.parse(response)) as UploadResult;
+  }
+
+  async deleteFile(id: string): Promise<void> {
+    await this.fetchImpl(
+      `${this.url}/api/storage/${encodeURIComponent(this.db)}/${encodeURIComponent(id)}`,
+      { method: "DELETE", headers: { Authorization: `Bearer ${this.token}` } },
+    ).then((r) => this.requireOk(r));
+  }
+
+  async getFileMetadata(id: string): Promise<FileMetadata> {
+    const body = await this.get(
+      `/api/storage/${encodeURIComponent(this.db)}/${encodeURIComponent(id)}/metadata`,
+      this.token,
+    );
+    return body as FileMetadata;
+  }
+
+  /** The public serve URL for `id` — no fetch, the browser consumes it. */
+  getUrl(id: string): string {
+    return `${this.url}/storage/${encodeURIComponent(id)}`;
+  }
+
   private async post(path: string, payload: unknown): Promise<unknown> {
     const response = await this.fetchImpl(`${this.url}${path}`, {
       method: "POST",
@@ -88,14 +140,7 @@ export class RtDbHttpClient {
       },
       body: JSON.stringify(payload),
     });
-    const parsed: unknown = await response.json().catch(() => null);
-    if (!response.ok) {
-      if (RtDbError.isEnvelope(parsed)) {
-        throw RtDbError.fromEnvelope(parsed);
-      }
-      throw new RtDbError("INTERNAL", `request failed with status ${response.status}`);
-    }
-    return parsed;
+    return this.parse(response);
   }
 
   private async get(path: string, bearer: string): Promise<unknown> {
@@ -105,6 +150,23 @@ export class RtDbHttpClient {
         Authorization: `Bearer ${bearer}`,
       },
     });
+    return this.parse(response);
+  }
+
+  /** Throws on a non-2xx `response` (envelope-aware); resolves nothing on success. */
+  private async requireOk(response: Response): Promise<void> {
+    if (response.ok) {
+      return;
+    }
+    const parsed: unknown = await response.json().catch(() => null);
+    if (RtDbError.isEnvelope(parsed)) {
+      throw RtDbError.fromEnvelope(parsed);
+    }
+    throw new RtDbError("INTERNAL", `request failed with status ${response.status}`);
+  }
+
+  /** Parses `response.json()`, throwing an envelope-aware error on non-2xx. */
+  private async parse(response: Response): Promise<unknown> {
     const parsed: unknown = await response.json().catch(() => null);
     if (!response.ok) {
       if (RtDbError.isEnvelope(parsed)) {

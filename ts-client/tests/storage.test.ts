@@ -1,0 +1,31 @@
+import { describe, it, expect } from "vitest";
+import { InMemoryRtDbClient } from "../src/in_memory.js";
+
+describe("in-memory storage", () => {
+  it("uploads, serves-via-url-shape, deletes, and reports metadata", async () => {
+    const c = new InMemoryRtDbClient();
+    const bytes = new Uint8Array([1, 2, 3, 4]);
+    const up = await c.upload(bytes, "image/png");
+    expect(up.id).toBeTypeOf("string");
+    expect(up.size).toBe(4);
+    expect(up.contentType).toBe("image/png");
+    expect(up.sha256).toBeTypeOf("string");
+
+    expect(c.getUrl(up.id)).toBe(`memory://${up.id}`);
+
+    const meta = await c.getFileMetadata(up.id);
+    expect(meta.size).toBe(4);
+    expect(meta.contentType).toBe("image/png");
+
+    await c.deleteFile(up.id);
+    await expect(c.getFileMetadata(up.id)).rejects.toBeTruthy();
+  });
+
+  it("getUrl against the http client builds the public URL", async () => {
+    // Wiremock-free shape check: the http client constructs the public URL
+    // without a fetch. Full HTTP round trip is covered by the live-server E2E.
+    const { RtDbHttpClient } = await import("../src/http.js");
+    const http = new RtDbHttpClient({ url: "https://rtdb.example.com/", db: "kanban", token: "t" });
+    expect(http.getUrl("abc")).toBe("https://rtdb.example.com/storage/abc");
+  });
+});
