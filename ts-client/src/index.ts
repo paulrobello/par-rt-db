@@ -18,6 +18,8 @@ export type {
   StepJson,
   TableJson,
   TransactionJson,
+  VectorIndexSpec,
+  VectorQuery,
 } from "./protocol.js";
 export { defineSchema, defineTable, SchemaDefinition, TableDefinition, t } from "./schema.js";
 export type {

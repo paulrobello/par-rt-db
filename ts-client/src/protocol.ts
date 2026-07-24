@@ -20,6 +20,7 @@ export interface QueryJson {
   paginate?: Paginate;
   filter?: FilterExpr;
   search?: SearchQuery;
+  vectorSearch?: VectorQuery;
 }
 
 export interface Paginate {
@@ -47,6 +48,15 @@ export type FilterExpr =
 export interface SearchQuery {
   index: string;
   query: string;
+}
+
+/** Mirrors server `query::VectorSearchQuery` byte-for-byte (camelCase, deny_unknown_fields).
+ * `filter` is an eq-map over the index's declared `filterFields`; omitted on the wire when empty. */
+export interface VectorQuery {
+  index: string;
+  vector: number[];
+  limit: number;
+  filter?: Record<string, unknown>;
 }
 
 /** Mirrors server `protocol::ScheduleWhen` byte-for-byte (tag `type`, camelCase). */
@@ -152,13 +162,23 @@ export type FieldTypeJson =
   | { type: "int64" }
   | { type: "bytes" }
   | { type: "any" }
-  | { type: "record"; value: FieldTypeJson };
+  | { type: "record"; value: FieldTypeJson }
+  | { type: "vector"; dimensions: number };
+
+/** Mirrors server `schema::VectorIndexSpec` byte-for-byte (camelCase). `filterFields`
+ * is omitted on the wire when the index declares none. */
+export interface VectorIndexSpec {
+  dimensions: number;
+  filterFields?: string[];
+}
 
 export interface IndexJson {
   name: string;
   fields: string[];
   /** `true` marks a full-text search index; omitted on the wire for ordinary btree indexes. */
   search?: boolean;
+  /** Present marks a vector index; omitted otherwise. */
+  vector?: VectorIndexSpec;
 }
 
 export interface TableJson {

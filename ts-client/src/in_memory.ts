@@ -187,6 +187,12 @@ function validateValue(ty: FieldTypeJson, value: unknown): boolean {
       return true;
     case "record":
       return isPlainObject(value) && Object.values(value).every((v) => validateValue(ty.value, v));
+    case "vector":
+      return (
+        Array.isArray(value) &&
+        value.length === ty.dimensions &&
+        value.every((item) => typeof item === "number" && Number.isFinite(item))
+      );
   }
 }
 

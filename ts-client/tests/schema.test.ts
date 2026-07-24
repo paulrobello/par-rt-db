@@ -122,3 +122,46 @@ describe("searchIndex builder", () => {
     expect(s.toJSON().tables.notes.indexes).toEqual([{ name: "by_title", fields: ["title"] }]);
   });
 });
+
+describe("vectorIndex builder", () => {
+  it("emits a vector index with dimensions and filterFields alongside a btree index", () => {
+    const s = defineSchema({
+      docs: defineTable({
+        embedding: t.vector(4),
+        userId: t.string(),
+      })
+        .index("by_user", ["userId"])
+        .vectorIndex("by_embedding", "embedding", 4, ["userId"]),
+    });
+    expect(s.toJSON().tables.docs.fields).toEqual({
+      embedding: { type: "vector", dimensions: 4 },
+      userId: { type: "string" },
+    });
+    expect(s.toJSON().tables.docs.indexes).toEqual([
+      { name: "by_user", fields: ["userId"] },
+      {
+        name: "by_embedding",
+        fields: ["embedding"],
+        vector: { dimensions: 4, filterFields: ["userId"] },
+      },
+    ]);
+  });
+
+  it("omits filterFields on the wire when none are declared", () => {
+    const s = defineSchema({
+      docs: defineTable({ embedding: t.vector(8) }).vectorIndex("by_embedding", "embedding", 8),
+    });
+    expect(s.toJSON().tables.docs.indexes).toEqual([
+      { name: "by_embedding", fields: ["embedding"], vector: { dimensions: 8 } },
+    ]);
+  });
+
+  it("a btree index omits the vector key", () => {
+    const s = defineSchema({
+      docs: defineTable({ embedding: t.vector(4), userId: t.string() }).index("by_user", [
+        "userId",
+      ]),
+    });
+    expect(s.toJSON().tables.docs.indexes).toEqual([{ name: "by_user", fields: ["userId"] }]);
+  });
+});

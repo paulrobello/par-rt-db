@@ -1,4 +1,4 @@
-import type { FilterExpr, Order, PaginatedResultJson, QueryJson } from "./protocol.js";
+import type { FilterExpr, Order, PaginatedResultJson, QueryJson, VectorQuery } from "./protocol.js";
 import type { Doc, Id, IndexNamesOf, SchemaDefinition, TableNames } from "./schema.js";
 
 /** A finished query carrying a phantom `Result` type used by the client/hooks. */
@@ -46,6 +46,24 @@ export class TableQuery<DocT, Indexes extends string> {
    * terminal alongside it. */
   search(index: string, query: string): TableQuery<DocT, Indexes> {
     return new TableQuery({ ...this.json, search: { index, query } });
+  }
+
+  /** Vector-similarity `vectorSearch` over a declared vector index. The server
+   * ranks by cosine distance and applies `limit`; `filter` is an eq-map over the
+   * index's declared `filterFields`. Terminal — the server rejects other
+   * terminals alongside it. */
+  vectorSearch(
+    index: string,
+    vector: number[],
+    opts: { limit: number; filter?: Record<string, unknown> },
+  ): TableQuery<DocT, Indexes> {
+    const vectorSearch: VectorQuery = {
+      index,
+      vector,
+      limit: opts.limit,
+      ...(opts.filter ? { filter: opts.filter } : {}),
+    };
+    return new TableQuery({ ...this.json, vectorSearch });
   }
 
   take(n: number): RtQuery<DocT[]> {

@@ -11,6 +11,10 @@ const schema = defineSchema({
   })
     .index("by_project", ["projectId"])
     .index("by_project_and_status", ["projectId", "status"]),
+  docs: defineTable({
+    embedding: t.vector(4),
+    userId: t.string(),
+  }).vectorIndex("by_embedding", "embedding", 4, ["userId"]),
 });
 
 const api = createApi(schema);
@@ -223,6 +227,34 @@ describe("TableQuery.search", () => {
       table: "items",
       search: { index: "search_content", query: "hello world" },
       take: 10,
+    });
+  });
+});
+
+describe("TableQuery.vectorSearch", () => {
+  it("builds a vectorSearch terminal with limit and filter", () => {
+    // `.vectorSearch` returns a TableQuery (non-terminal, mirroring `.search`);
+    // read the built JSON directly via `.collect()`'s RtQuery.
+    const q = api.docs
+      .query()
+      .vectorSearch("by_embedding", [1, 0, 0], { limit: 5, filter: { userId: "u1" } })
+      .collect();
+    expect(q.json).toEqual({
+      table: "docs",
+      vectorSearch: {
+        index: "by_embedding",
+        vector: [1, 0, 0],
+        limit: 5,
+        filter: { userId: "u1" },
+      },
+    });
+  });
+
+  it("omits filter on the wire when not provided", () => {
+    const q = api.docs.query().vectorSearch("by_embedding", [1, 0], { limit: 3 }).collect();
+    expect(q.json).toEqual({
+      table: "docs",
+      vectorSearch: { index: "by_embedding", vector: [1, 0], limit: 3 },
     });
   });
 });

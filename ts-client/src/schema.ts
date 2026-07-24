@@ -77,6 +77,8 @@ export const t = {
   any: (): Validator<unknown> => makeValidator({ type: "any" }),
   bytes: (): Validator<string> => makeValidator({ type: "bytes" }),
   int64: (): Validator<Int64> => makeValidator({ type: "int64" }),
+  vector: (dimensions: number): Validator<number[]> =>
+    makeValidator({ type: "vector", dimensions }),
 };
 
 export class TableDefinition<
@@ -105,6 +107,29 @@ export class TableDefinition<
     return new TableDefinition(this.fields, [
       ...this.indexes,
       { name, fields: [...fields], search: true },
+    ]);
+  }
+
+  /** Declare a vector (approximate nearest-neighbor) index. `field` is a single
+   * `t.vector(dimensions)` field; the server stores a pgvector column ranked by
+   * cosine distance via the `vectorSearch` query terminal. `filterFields` are
+   * scalar fields usable as eq-filters in a `vectorSearch`. */
+  vectorIndex<Name extends string>(
+    name: Name,
+    field: keyof Fields & string,
+    dimensions: number,
+    filterFields: (keyof Fields & string)[] = [],
+  ): TableDefinition<Fields, Indexes | Name> {
+    return new TableDefinition(this.fields, [
+      ...this.indexes,
+      {
+        name,
+        fields: [field],
+        vector: {
+          dimensions,
+          ...(filterFields.length > 0 ? { filterFields: [...filterFields] } : {}),
+        },
+      },
     ]);
   }
 
