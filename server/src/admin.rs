@@ -34,21 +34,39 @@ fn bearer_value(headers: &HeaderMap) -> Result<&str, RtDbError> {
         .ok_or_else(|| RtDbError::unauthorized("missing admin bearer token"))
 }
 
-/// Admin gate. Tries the raw admin key first (constant-time compare), then a
-/// resolved session/machine principal — admitting only OAuth users present in
-/// `rtdb_auth.admins`. Machine tokens and non-allowlisted/expired users are
-/// rejected. The admin-key path returns before any DB lookup, so machine/CLI
-/// admin calls stay cheap; the session path costs one `resolve_bearer` + one
-/// `is_admin` query per request (acceptable for low-frequency dashboard traffic).
-pub(crate) async fn require_admin(
+/// Bearer credential carried in a WebSocket subprotocol. Browsers cannot set
+/// the `Authorization` header on a WS handshake, so the dashboard offers
+/// `Sec-WebSocket-Protocol: rtdb-admin.<token>` instead (a header browsers CAN
+/// set); this pulls the token back out. The subprotocol is an HTTP header during
+/// the handshake — it never enters the URL, so it is not captured by access logs
+/// the way a `?token=` query param would be.
+fn bearer_from_subprotocol(headers: &HeaderMap) -> Result<&str, RtDbError> {
+    let proto = headers
+        .get("sec-websocket-protocol")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| RtDbError::unauthorized("missing admin bearer token"))?;
+    for entry in proto.split(',') {
+        if let Some(rest) = entry.trim().strip_prefix("rtdb-admin.")
+            && !rest.is_empty()
+        {
+            return Ok(rest);
+        }
+    }
+    Err(RtDbError::unauthorized("missing admin bearer token"))
+}
+
+/// Authenticate a raw bearer credential as an admin: the admin key first
+/// (constant-time compare, no DB lookup), then a resolved session/machine
+/// principal admitted only if it is an OAuth user on `rtdb_auth.admins`. Shared
+/// by the header path and the WS-subprotocol path so both enforce identically.
+pub(crate) async fn authenticate_admin(
     state: &AppState,
-    headers: &HeaderMap,
+    token: &str,
 ) -> Result<AdminPrincipal, RtDbError> {
-    let provided = bearer_value(headers)?;
-    if bool::from(provided.as_bytes().ct_eq(state.config.admin_key.as_bytes())) {
+    if bool::from(token.as_bytes().ct_eq(state.config.admin_key.as_bytes())) {
         return Ok(AdminPrincipal::Key);
     }
-    let principal = match auth::resolve_bearer(&state.pool, provided).await {
+    let principal = match auth::resolve_bearer(&state.pool, token).await {
         Ok(principal) => principal,
         Err(_) => return Err(RtDbError::unauthorized("invalid admin credential")),
     };
@@ -57,6 +75,14 @@ pub(crate) async fn require_admin(
     } else {
         Err(RtDbError::forbidden("not a dashboard admin"))
     }
+}
+
+/// Admin gate for ordinary HTTP routes — reads `Authorization: Bearer <token>`.
+pub(crate) async fn require_admin(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<AdminPrincipal, RtDbError> {
+    authenticate_admin(state, bearer_value(headers)?).await
 }
 
 #[derive(Serialize)]
@@ -714,20 +740,39 @@ struct StreamParams {
 /// streams live op events plus a ~1s gauge snapshot. `db`/`table` filter both the
 /// replay and the live broadcast.
 ///
-/// `require_admin` runs as the first statement, BEFORE `WebSocketUpgrade` is
-/// extracted from the request — so a missing bearer on a plain GET (or a real
-/// upgrade attempt) yields 401/403 and never reaches WS negotiation. The WS
-/// extractor is invoked by hand after the gate clears.
+/// The gate runs BEFORE `WebSocketUpgrade` is extracted from the request, so a
+/// missing bearer on a plain GET (or a real upgrade attempt) yields 401/403 and
+/// never reaches WS negotiation; the WS extractor is invoked by hand after the
+/// gate clears. The bearer is taken from the `Authorization` header when present
+/// (CLI/automation), otherwise from the `Sec-WebSocket-Protocol: rtdb-admin.<token>`
+/// subprotocol — browsers cannot set request headers on a WS handshake, so the
+/// dashboard authenticates through that subprotocol instead.
 async fn admin_stream(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     QueryParams(params): QueryParams<StreamParams>,
     req: Request,
 ) -> Result<Response, RtDbError> {
-    require_admin(&state, &headers).await?;
-    let ws = WebSocketUpgrade::from_request(req, &state)
+    // Bearer from the Authorization header (CLI/automation) or, failing that,
+    // the `rtdb-admin.<token>` subprotocol (browser dashboard — browsers can't
+    // set headers on a WS handshake). When the subprotocol path is used we echo
+    // it back: a client that offered a subprotocol requires the server to
+    // negotiate one (tokio-tungstenite errors otherwise; browsers are lenient
+    // but the echo is the spec-correct 101 response).
+    let (token, offered_subprotocol) = match bearer_value(&headers) {
+        Ok(t) => (t, None),
+        Err(_) => {
+            let t = bearer_from_subprotocol(&headers)?;
+            (t, Some(format!("rtdb-admin.{t}")))
+        }
+    };
+    let _ = authenticate_admin(&state, token).await?;
+    let mut ws = WebSocketUpgrade::from_request(req, &state)
         .await
         .map_err(|_| RtDbError::bad_request("expected websocket upgrade request"))?;
+    if let Some(proto) = offered_subprotocol {
+        ws = ws.protocols([proto]);
+    }
     Ok(ws.on_upgrade(move |socket| run_admin_stream(socket, state, params.db, params.table)))
 }
 

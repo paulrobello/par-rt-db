@@ -573,6 +573,72 @@ async fn admin_stream_requires_admin() -> anyhow::Result<()> {
     Ok(())
 }
 
+// /admin/stream authenticates via the `rtdb-admin.<token>` WebSocket
+// subprotocol — the browser dashboard's path, since browsers cannot set the
+// Authorization header on a WS handshake. A valid admin key upgrades (101) and
+// the stream actually pushes a frame (ring replay or the ~1s gauge snapshot).
+#[tokio::test]
+async fn admin_stream_authenticates_via_subprotocol() -> anyhow::Result<()> {
+    use futures_util::StreamExt;
+    use std::time::Duration;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    let state = common::test_state().await;
+    let addr = common::spawn_app(state).await;
+
+    let mut req = format!("ws://{addr}/admin/stream").into_client_request()?;
+    req.headers_mut().insert(
+        "sec-websocket-protocol",
+        reqwest::header::HeaderValue::from_str("rtdb-admin.test-admin-key")?,
+    );
+    let (mut ws, resp) = tokio_tungstenite::connect_async(req).await?;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::SWITCHING_PROTOCOLS,
+        "a valid subprotocol bearer must upgrade to 101"
+    );
+
+    let frame = tokio::time::timeout(Duration::from_secs(3), ws.next())
+        .await
+        .expect("timed out waiting for a stream frame")
+        .expect("stream closed")
+        .expect("ws frame error");
+    match frame {
+        tokio_tungstenite::tungstenite::Message::Text(t) => {
+            let v: serde_json::Value = serde_json::from_str(&t)?;
+            assert!(
+                v["kind"] == "op" || v["kind"] == "gauges",
+                "expected an op|gauges frame, got {v}"
+            );
+        }
+        other => panic!("expected a text frame, got {other:?}"),
+    }
+    Ok(())
+}
+
+// /admin/stream rejects an invalid bearer offered via the subprotocol: the
+// server returns 401 before the upgrade, which tokio-tungstenite surfaces as a
+// connect error.
+#[tokio::test]
+async fn admin_stream_rejects_bad_subprotocol() -> anyhow::Result<()> {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    let state = common::test_state().await;
+    let addr = common::spawn_app(state).await;
+
+    let mut req = format!("ws://{addr}/admin/stream").into_client_request()?;
+    req.headers_mut().insert(
+        "sec-websocket-protocol",
+        reqwest::header::HeaderValue::from_str("rtdb-admin.not-the-real-key")?,
+    );
+    let result = tokio_tungstenite::connect_async(req).await;
+    assert!(
+        result.is_err(),
+        "an invalid subprotocol bearer must be rejected before the upgrade"
+    );
+    Ok(())
+}
+
 // The persisted hot-config row round-trips through load_hot/save_hot, and a
 // missing row loads None. `rtdb_config` is a global table shared across tests on
 // the dev Postgres, so this test cleans up its row to avoid polluting others.

@@ -159,12 +159,12 @@ export function useAdmin(): AdminValue {
 }
 
 /**
- * Holds the admin client and the live, polled rails (databases, op feed,
- * metrics). The op feed and metrics poll at ~1s because `/admin/stream` is
- * header-gated at the WS upgrade and browsers cannot set headers on a WebSocket
- * — true streaming needs a server-side browser-auth seam (query-param or
- * subprotocol token), flagged for later. The data browser still gets true
- * realtime via `/sync` (in-band auth).
+ * Holds the admin client and the live rails. The op feed and metrics stream over
+ * a single WebSocket to `/admin/stream` — the admin bearer rides in the
+ * `Sec-WebSocket-Protocol` subprotocol (`rtdb-admin.<token>`), since browsers
+ * cannot set the Authorization header on a WS handshake. Databases poll every
+ * 20s (the db list isn't part of the stream). The data browser gets its own
+ * realtime via `/sync`.
  */
 export function AdminProvider({ children }: { children: ReactNode }) {
   const { token } = useSession();
@@ -188,7 +188,9 @@ export function AdminProvider({ children }: { children: ReactNode }) {
       return;
     }
     let cancelled = false;
-    setConnection("connecting");
+    let ws: WebSocket | null = null;
+    let reconnect: ReturnType<typeof setTimeout> | null = null;
+    let backoff = 1000;
     const ok = () => {
       if (!cancelled) setConnection("connected");
     };
@@ -199,27 +201,50 @@ export function AdminProvider({ children }: { children: ReactNode }) {
     const loadDbs = async () => {
       try {
         setDatabases((await client.listDbs()).databases);
-        ok();
       } catch {
-        fail();
+        /* outages surface via the stream's connection state */
       }
     };
-    const loadOps = async () => {
-      try {
-        const { ops: fresh } = await client.getOpsRecent({ n: OPS_CAP });
-        if (!cancelled) setOps(fresh.slice().reverse());
+
+    const connect = () => {
+      if (cancelled) return;
+      setConnection((c) => (c === "connected" ? c : "connecting"));
+      const proto = window.location.protocol === "https:" ? "wss" : "ws";
+      // Browsers can't set Authorization on a WS handshake, so the admin bearer
+      // rides in the Sec-WebSocket-Protocol subprotocol; the server pulls it
+      // back out and authenticates at the upgrade.
+      ws = new WebSocket(`${proto}://${window.location.host}/admin/stream`, [
+        `rtdb-admin.${token}`,
+      ]);
+      ws.onopen = () => {
+        if (cancelled) return;
+        backoff = 1000;
         ok();
-      } catch {
+      };
+      ws.onmessage = (e) => {
+        if (cancelled) return;
+        let msg: { kind: string; event?: OpEvent; gauges?: MetricsSnapshot };
+        try {
+          msg = JSON.parse(e.data as string);
+        } catch {
+          return;
+        }
+        if (msg.kind === "op" && msg.event) {
+          const ev = msg.event;
+          setOps((prev) => [ev, ...prev].slice(0, OPS_CAP));
+        } else if (msg.kind === "gauges" && msg.gauges) {
+          setMetrics(msg.gauges);
+        }
+      };
+      ws.onclose = () => {
+        if (cancelled) return;
         fail();
-      }
-    };
-    const loadMetrics = async () => {
-      try {
-        const m = await client.getMetrics();
-        if (!cancelled) setMetrics(m);
-      } catch {
-        /* metrics are non-fatal for connection health */
-      }
+        reconnect = setTimeout(connect, backoff);
+        backoff = Math.min(backoff * 2, 5000);
+      };
+      ws.onerror = () => {
+        /* browsers hide the detail; onclose drives reconnect */
+      };
     };
 
     refreshDatabases.current = async () => {
@@ -237,16 +262,17 @@ export function AdminProvider({ children }: { children: ReactNode }) {
     };
 
     loadDbs();
-    loadOps();
-    loadMetrics();
+    client
+      .getMetrics()
+      .then(setMetrics)
+      .catch(() => {});
+    connect();
     const dbsTimer = setInterval(loadDbs, 20000);
-    const opsTimer = setInterval(loadOps, 1000);
-    const metricsTimer = setInterval(loadMetrics, 1000);
     return () => {
       cancelled = true;
+      if (reconnect) clearTimeout(reconnect);
+      ws?.close();
       clearInterval(dbsTimer);
-      clearInterval(opsTimer);
-      clearInterval(metricsTimer);
     };
   }, [token, client]);
 
