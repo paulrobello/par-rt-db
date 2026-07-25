@@ -1,7 +1,7 @@
 .PHONY: install test lint fmt typecheck checkall pre-commit
 
 install:
-	uv sync --extra dev
+	uv sync
 
 test:
 	uv run pytest -q

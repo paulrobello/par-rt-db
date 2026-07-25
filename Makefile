@@ -68,7 +68,7 @@ dashboard-install:
 	cd dashboard && bun install
 
 python-client-install:
-	cd python-client && uv sync --extra dev
+	cd python-client && uv sync
 
 python-client-test:
 	cd python-client && uv run pytest -q
