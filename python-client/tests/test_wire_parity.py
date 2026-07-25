@@ -19,6 +19,7 @@ from par_rt_db.wire import ClientMessage, ServerMessage
 # (wire_json_string) — every entry must round-trip identically.
 CLIENT_FIXTURES: list[str] = [
     '{"type": "auth", "token": "t", "db": "d"}',
+    '{"type": "subscribe", "queryId": "q1", "query": {"table": "t"}}',
     '{"type": "unsubscribe", "queryId": "q1"}',
     '{"type": "mutate", "mutId": "m1", "txn": {"steps": []}}',
     '{"type": "mutate", "mutId": "m1", "idempotencyKey": "key1", "txn": {"steps": []}}',

@@ -13,7 +13,7 @@ import json
 import pytest
 from pydantic import ValidationError
 
-from par_rt_db.schema import Schema, t
+from par_rt_db.schema import IndexDef, Schema, t
 
 
 def test_scalar_and_compound_fields_round_trip():
@@ -106,6 +106,18 @@ def test_plain_index_omits_search_and_vector_keys():
     assert idx == {"name": "by_name", "fields": ["name"]}
     assert "search" not in idx
     assert "vector" not in idx
+
+
+def test_indexdef_with_search_false_omits_search_key():
+    """The server uses ``skip_serializing_if = "is_false"`` for ``IndexDef.search``
+    (a ``bool``, not ``Option<bool>``), so an ``IndexDef`` carrying
+    ``search=False`` must omit ``search`` from the wire — not emit ``"search":
+    false``. Hand-construct the model to bypass the builder (which only ever
+    sets ``search=True``) and prove the falsy-drop branch directly."""
+    idx = IndexDef.model_validate({"name": "by_name", "fields": ["name"], "search": False})
+    wire = json.loads(idx.model_dump_json(by_alias=True))
+    assert wire == {"name": "by_name", "fields": ["name"]}
+    assert "search" not in wire
 
 
 def test_table_without_owner_field_omits_ownerField_key():

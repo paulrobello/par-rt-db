@@ -21,6 +21,7 @@ from __future__ import annotations
 from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_serializer
+from pydantic_core.core_schema import SerializerFunctionWrapHandler
 
 
 def to_camel(name: str) -> str:
@@ -54,7 +55,7 @@ class AuthedUser(_Camel):
     github_id: int | None = None
 
     @model_serializer(mode="wrap")
-    def _drop_none_github(self, handler):  # type: ignore[no-untyped-def]
+    def _drop_none_github(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
         out = handler(self)
         for alias in ("githubLogin", "githubId"):
             if out.get(alias) is None:
@@ -99,7 +100,7 @@ class ScheduleInfo(_Camel):
     fired_count: int
 
     @model_serializer(mode="wrap")
-    def _drop_none_optional(self, handler):  # type: ignore[no-untyped-def]
+    def _drop_none_optional(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
         out = handler(self)
         for alias in ("cron", "lastError"):
             if out.get(alias) is None:
@@ -196,7 +197,7 @@ class VectorSearchQuery(_Camel):
     filter: dict[str, Any] | None = None
 
     @model_serializer(mode="wrap")
-    def _drop_empty_filter(self, handler):  # type: ignore[no-untyped-def]
+    def _drop_empty_filter(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
         out = handler(self)
         if not out.get("filter"):
             out.pop("filter", None)
@@ -237,7 +238,7 @@ class _ClientMutate(_Camel):
     txn: dict[str, Any]  # TODO(tasks 9-10): tighten to Transaction
 
     @model_serializer(mode="wrap")
-    def _drop_idempotency_when_none(self, handler):  # type: ignore[no-untyped-def]
+    def _drop_idempotency_when_none(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
         out = handler(self)
         if out.get("idempotencyKey") is None:
             out.pop("idempotencyKey", None)
@@ -369,7 +370,7 @@ class _ServerScheduleAck(_Camel):
     error: _ErrorEnvelope | None = None
 
     @model_serializer(mode="wrap")
-    def _drop_error_when_none(self, handler):  # type: ignore[no-untyped-def]
+    def _drop_error_when_none(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
         out = handler(self)
         if out.get("error") is None:
             out.pop("error", None)

@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_serializer
+from pydantic_core.core_schema import SerializerFunctionWrapHandler
 
 from .wire import FilterExpr, SearchQuery, VectorSearchQuery, to_camel
 
@@ -43,7 +44,7 @@ class _Paginate(BaseModel):
     num_items: int
 
     @model_serializer(mode="wrap")
-    def _drop_none_cursor(self, handler):  # type: ignore[no-untyped-def]
+    def _drop_none_cursor(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
         out = handler(self)
         if out.get("cursor") is None:
             out.pop("cursor", None)

@@ -28,6 +28,7 @@ from types import SimpleNamespace
 from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_serializer
+from pydantic_core.core_schema import SerializerFunctionWrapHandler
 
 from .wire import to_camel
 
@@ -149,7 +150,7 @@ class VectorIndexSpec(_S):
     filter_fields: list[str] = Field(default_factory=list)
 
     @model_serializer(mode="wrap")
-    def _drop_empty_filter_fields(self, handler):  # type: ignore[no-untyped-def]
+    def _drop_empty_filter_fields(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
         out = handler(self)
         if not out.get("filterFields"):
             out.pop("filterFields", None)
@@ -167,9 +168,11 @@ class IndexDef(_S):
     vector: VectorIndexSpec | None = None
 
     @model_serializer(mode="wrap")
-    def _drop_absent_flags(self, handler):  # type: ignore[no-untyped-def]
+    def _drop_absent_flags(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
         out = handler(self)
-        if out.get("search") is None:
+        # Server uses `skip_serializing_if = "is_false"` for `search: bool`, so
+        # `search=False` (not just an absent/None flag) is omitted on the wire.
+        if not out.get("search"):
             out.pop("search", None)
         if out.get("vector") is None:
             out.pop("vector", None)
@@ -184,7 +187,7 @@ class TableDef(_S):
     owner_field: str | None = None
 
     @model_serializer(mode="wrap")
-    def _drop_absent_owner(self, handler):  # type: ignore[no-untyped-def]
+    def _drop_absent_owner(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
         out = handler(self)
         if out.get("ownerField") is None:
             out.pop("ownerField", None)
