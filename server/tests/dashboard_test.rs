@@ -1,5 +1,13 @@
 mod common;
 
+/// Serializes tests that touch the global single-row `rtdb_config` table
+/// (id = 1). That row is shared across the whole dev Postgres, so without this
+/// guard two such tests running in parallel race — one test's `DELETE` can be
+/// undone by another's `PATCH`/`save_hot` in the window between the `DELETE`
+/// and the following `load_hot` assertion, making the suite flaky. Per-db test
+/// isolation doesn't help here because `rtdb_config` is global (not per test db).
+static RTDB_CONFIG_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 // Seeding lowercases emails, is idempotent, and stores them with a NULL github_id.
 #[tokio::test]
 async fn seed_admin_emails_lowercases_and_is_idempotent() -> anyhow::Result<()> {
@@ -646,6 +654,7 @@ async fn admin_stream_rejects_bad_subprotocol() -> anyhow::Result<()> {
 // the dev Postgres, so this test cleans up its row to avoid polluting others.
 #[tokio::test]
 async fn hot_config_round_trips_through_rtdb_config() -> anyhow::Result<()> {
+    let _rtdb_config_guard = RTDB_CONFIG_GUARD.lock().await;
     let state = common::test_state().await;
 
     sqlx::query("DELETE FROM rtdb_config WHERE id = 1")
@@ -680,6 +689,7 @@ async fn hot_config_round_trips_through_rtdb_config() -> anyhow::Result<()> {
 // are unaffected.
 #[tokio::test]
 async fn config_get_and_patch_round_trip() -> anyhow::Result<()> {
+    let _rtdb_config_guard = RTDB_CONFIG_GUARD.lock().await;
     let state = common::test_state().await;
     let addr = common::spawn_app(state.clone()).await;
     let bearer = "Bearer test-admin-key";
@@ -771,6 +781,7 @@ async fn config_get_and_patch_round_trip() -> anyhow::Result<()> {
 // snapshot.
 #[tokio::test]
 async fn config_cors_hot_reloads_allowed_origins() -> anyhow::Result<()> {
+    let _rtdb_config_guard = RTDB_CONFIG_GUARD.lock().await;
     let state = common::test_state().await;
     let addr = common::spawn_app(state.clone()).await;
     let bearer = "Bearer test-admin-key";

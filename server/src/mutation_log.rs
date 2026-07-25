@@ -27,19 +27,22 @@ pub async fn ensure_table(pool: &PgPool, db: &str) -> Result<(), RtDbError> {
 }
 
 /// Looks up `mut_id` in `db`'s dedup table. `Some` means this exact mutation
-/// already ran and its results should be replayed as-is, with no re-execution
-/// and no fan-out. `None` means it's safe to execute. Pure SELECT — expiry of
-/// stale rows is owned by `run_cleanup`, spawned once per db by the committer
-/// (ARC-007), so the dedup-opted-in mutation hot path no longer pays a
-/// `DELETE` write-acquire on every call.
+/// already ran (and is still within its TTL) and its results should be replayed
+/// as-is, with no re-execution and no fan-out. `None` means it's safe to
+/// execute. Pure SELECT — no `DELETE` write-acquire on the hot path: ARC-007
+/// moved physical cleanup to `run_cleanup` (spawned once per db by the
+/// committer, sweeping at 60s). Expired rows are still filtered at read time
+/// (`expires_at > now`) so a stale entry is treated as absent even before the
+/// next cleanup sweep reclaims its space.
 pub async fn check(pool: &PgPool, db: &str, mut_id: &str) -> Result<Option<Vec<Value>>, RtDbError> {
     validate_db_name(db)?;
     let schema = pg_schema(db);
 
     let row: Option<(Value,)> = sqlx::query_as(&format!(
-        "SELECT result FROM \"{schema}\".mutations WHERE mut_id = $1"
+        "SELECT result FROM \"{schema}\".mutations WHERE mut_id = $1 AND expires_at > $2"
     ))
     .bind(mut_id)
+    .bind(now_ms())
     .fetch_optional(pool)
     .await?;
 

@@ -153,9 +153,9 @@ pub struct AuthedUser {
     /// GitHub login. Absent on the wire for machine tokens / non-GitHub
     /// users; serde defaults a missing field to `None` so this stays
     /// backward-compatible with older servers that omit it.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub github_login: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub github_id: Option<i64>,
 }
 

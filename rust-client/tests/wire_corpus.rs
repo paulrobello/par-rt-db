@@ -16,13 +16,11 @@ use par_rt_db_client::wire::{
 };
 use serde_json::{Value, json};
 
-/// Path from `rust-client/tests/` to the canonical corpus at the repo root.
-const CORPUS_PATH: &str = "../../wire-corpus/wire-corpus.json";
-
 fn load_corpus() -> Value {
-    let raw =
-        std::fs::read_to_string(CORPUS_PATH).unwrap_or_else(|e| panic!("read {CORPUS_PATH}: {e}"));
-    serde_json::from_str(&raw).unwrap_or_else(|e| panic!("parse {CORPUS_PATH}: {e}"))
+    // include_str! resolves relative to this source file (rust-client/tests/),
+    // so the test is independent of cargo test's runtime CWD (rust-client/).
+    serde_json::from_str(include_str!("../../wire-corpus/wire-corpus.json"))
+        .unwrap_or_else(|e| panic!("parse wire-corpus.json: {e}"))
 }
 
 fn section<'a>(corpus: &'a Value, name: &str) -> &'a Vec<Value> {

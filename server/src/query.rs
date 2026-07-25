@@ -27,43 +27,56 @@ pub enum Order {
 #[serde(deny_unknown_fields)]
 pub struct Query {
     pub table: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub get: Option<String>, // point read by id; excludes all below
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub index: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub eq: Vec<serde_json::Value>, // prefix binds on index fields
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gt: Option<serde_json::Value>, // exclusive lower bound on the index field after the eq prefix
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gte: Option<serde_json::Value>, // inclusive lower bound; mutually exclusive with gt
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lt: Option<serde_json::Value>, // exclusive upper bound on the index field after the eq prefix
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lte: Option<serde_json::Value>, // inclusive upper bound; mutually exclusive with lt
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub order: Option<Order>, // default Asc
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub take: Option<u32>, // cap 4096; absent => collect (cap 4096)
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub unique: bool, // with unique, take/order must be absent
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub first: bool, // sugar over take(1); returns Doc(Some) or Doc(None); mutually exclusive with take/unique
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub count: bool, // terminal: SELECT COUNT(*) over the same eq/range WHERE; mutually exclusive with get/take/unique/first/order
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub paginate: Option<Paginate>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filter: Option<FilterExpr>, // additional WHERE predicate over doc fields; composes with index/order/take/cursor
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub search: Option<SearchQuery>, // full-text search terminal: ranks by ts_rank over a search index's tsvector; composes with take
-    #[serde(default, rename = "vectorSearch")]
+    #[serde(
+        default,
+        rename = "vectorSearch",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub vector_search: Option<VectorSearchQuery>, // vector-similarity terminal: ranks by cosine distance over a vector index; carries its own limit
+}
+
+/// Serde skip predicate for `bool` fields whose default is `false`. Keeps the
+/// wire form minimal — `unique`/`first`/`count` are omitted unless `true`,
+/// matching the TS client's `JSON.stringify` (which drops `undefined`) and the
+/// rust-client's mirror struct (ARC-008 wire-parity).
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Paginate {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor: Option<String>,
     pub num_items: u32,
 }

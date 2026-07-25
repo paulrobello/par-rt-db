@@ -283,9 +283,9 @@ mod callback_tests {
     fn callback_html_neutralizes_payload_origin() {
         // Even if a strict-validator regression let this value reach
         // `callback_html_response`, the escaped output cannot break out of
-        // the JS string or close the <script>. The raw `"];alert(1);//`
+        // the JS string or close the <script>. The raw `";alert(1);//`
         // breakout becomes `\";alert(1);//` inside the literal.
-        let body = response_body_string(callback_html_response("deadbeef", "\"];alert(1);//"));
+        let body = response_body_string(callback_html_response("deadbeef", "\";alert(1);//"));
         // The full postMessage call with the ESCAPED origin. If escaping were
         // missing, the body would contain `},"";alert(1)` (raw quote-quote)
         // instead of `},"\";alert(1)` (backslash-quote) and this assertion
