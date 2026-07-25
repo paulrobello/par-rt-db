@@ -33,6 +33,9 @@ services:
       RTDB_DATABASE_URL: postgres://rtdb:${POSTGRES_PASSWORD}@postgres:5432/rtdb
       RTDB_ADMIN_KEY: ${RTDB_ADMIN_KEY:?set RTDB_ADMIN_KEY in .env}
       RTDB_PUBLIC_URL: ${RTDB_PUBLIC_URL:-https://rtdb.pardev.net}
+      # Serves the bundled operator console SPA same-origin (baked into the
+      # image at /app/dashboard-dist). Override to "" for an API-only deploy.
+      RTDB_STATIC_DIR: ${RTDB_STATIC_DIR:-/app/dashboard-dist}
       RTDB_ALLOWED_ORIGINS: ${RTDB_ALLOWED_ORIGINS:-https://projects.pardev.net}
       RTDB_GITHUB_CLIENT_ID: ${RTDB_GITHUB_CLIENT_ID:-}
       RTDB_GITHUB_CLIENT_SECRET: ${RTDB_GITHUB_CLIENT_SECRET:-}
