@@ -201,3 +201,95 @@ class VectorSearchQuery(_Camel):
         if not out.get("filter"):
             out.pop("filter", None)
         return out
+
+
+# --- ClientMessage (client -> server WS vocabulary; discriminator "type") ---
+#
+# Mirrors ``server/src/protocol.rs::ClientMessage`` (the ``#[serde(tag = "type",
+# rename_all = "camelCase", deny_unknown_fields)]`` enum). ``extra="forbid"`` is
+# inherited from ``_Camel``. ``query``/``txn`` reference the Query / Transaction
+# models (Tasks 9-10); they are typed as ``dict[str, Any]`` for now so wire
+# payloads pass through unchanged.
+# TODO(tasks 9-10): tighten to Query / Transaction models.
+
+
+class _ClientAuth(_Camel):
+    type: Literal["auth"] = "auth"
+    token: str
+    db: str
+
+
+class _ClientSubscribe(_Camel):
+    type: Literal["subscribe"] = "subscribe"
+    query_id: str
+    query: dict[str, Any]  # TODO(tasks 9-10): tighten to Query
+
+
+class _ClientUnsubscribe(_Camel):
+    type: Literal["unsubscribe"] = "unsubscribe"
+    query_id: str
+
+
+class _ClientMutate(_Camel):
+    type: Literal["mutate"] = "mutate"
+    mut_id: str
+    idempotency_key: str | None = None
+    txn: dict[str, Any]  # TODO(tasks 9-10): tighten to Transaction
+
+    @model_serializer(mode="wrap")
+    def _drop_idempotency_when_none(self, handler):  # type: ignore[no-untyped-def]
+        out = handler(self)
+        if out.get("idempotencyKey") is None:
+            out.pop("idempotencyKey", None)
+        return out
+
+
+class _ClientSchedule(_Camel):
+    type: Literal["schedule"] = "schedule"
+    schedule_id: str
+    when: ScheduleWhen
+    txn: dict[str, Any]  # TODO(tasks 9-10): tighten to Transaction
+
+
+class _ClientCancelSchedule(_Camel):
+    type: Literal["cancelSchedule"] = "cancelSchedule"
+    schedule_id: str
+    id: str
+
+
+class _ClientPauseSchedule(_Camel):
+    type: Literal["pauseSchedule"] = "pauseSchedule"
+    schedule_id: str
+    id: str
+
+
+class _ClientResumeSchedule(_Camel):
+    type: Literal["resumeSchedule"] = "resumeSchedule"
+    schedule_id: str
+    id: str
+
+
+class _ClientListSchedules(_Camel):
+    type: Literal["listSchedules"] = "listSchedules"
+    schedule_id: str
+
+
+class _ClientPing(_Camel):
+    type: Literal["ping"] = "ping"
+
+
+ClientMessage = Annotated[
+    (
+        _ClientAuth
+        | _ClientSubscribe
+        | _ClientUnsubscribe
+        | _ClientMutate
+        | _ClientSchedule
+        | _ClientCancelSchedule
+        | _ClientPauseSchedule
+        | _ClientResumeSchedule
+        | _ClientListSchedules
+        | _ClientPing
+    ),
+    Field(discriminator="type"),
+]

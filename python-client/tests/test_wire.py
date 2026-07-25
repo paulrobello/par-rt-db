@@ -15,6 +15,7 @@ from pydantic import TypeAdapter, ValidationError
 
 from par_rt_db.wire import (
     AuthedUser,
+    ClientMessage,
     FilterExpr,
     ScheduleInfo,
     ScheduleWhen,
@@ -139,3 +140,86 @@ def test_vector_search_query_keeps_filter_when_non_empty() -> None:
     )
     out = vq.model_dump(by_alias=True, mode="json")
     assert out["filter"] == {"status": "active"}
+
+
+# --- ClientMessage union (client -> server WS vocabulary) ---
+#
+# ClientMessage is an ``Annotated`` discriminated-union alias, so validation goes
+# through a ``TypeAdapter`` (same pattern as ScheduleWhen/FilterExpr above) — the
+# alias itself has no ``model_validate``.
+
+_client_adapter = TypeAdapter(ClientMessage)
+
+
+def _model(d):
+    return _client_adapter.validate_python(d).model_dump(
+        by_alias=True, mode="json", exclude_unset=False
+    )
+
+
+def test_client_auth():
+    assert _model({"type": "auth", "token": "t", "db": "d"}) == {
+        "type": "auth",
+        "token": "t",
+        "db": "d",
+    }
+
+
+def test_client_unsubscribe():
+    assert _model({"type": "unsubscribe", "queryId": "q1"}) == {
+        "type": "unsubscribe",
+        "queryId": "q1",
+    }
+
+
+def test_client_mutate_omits_idempotency_key_when_none():
+    m = _client_adapter.validate_python({"type": "mutate", "mutId": "m1", "txn": {"steps": []}})
+    dumped = m.model_dump(by_alias=True, mode="json")
+    assert dumped == {"type": "mutate", "mutId": "m1", "txn": {"steps": []}}
+    assert "idempotencyKey" not in dumped
+
+
+def test_client_mutate_with_idempotency_key():
+    dumped = _client_adapter.validate_python(
+        {"type": "mutate", "mutId": "m1", "idempotencyKey": "k1", "txn": {"steps": []}}
+    ).model_dump(by_alias=True, mode="json")
+    assert dumped == {"type": "mutate", "mutId": "m1", "idempotencyKey": "k1", "txn": {"steps": []}}
+
+
+def test_client_schedule():
+    dumped = _client_adapter.validate_python(
+        {
+            "type": "schedule",
+            "scheduleId": "s1",
+            "when": {"type": "afterMs", "ms": 100},
+            "txn": {"steps": []},
+        }
+    ).model_dump(by_alias=True, mode="json")
+    assert dumped == {
+        "type": "schedule",
+        "scheduleId": "s1",
+        "when": {"type": "afterMs", "ms": 100},
+        "txn": {"steps": []},
+    }
+
+
+def test_client_cancel_pause_resume_carry_id():
+    for tag in ("cancelSchedule", "pauseSchedule", "resumeSchedule"):
+        d = {"type": tag, "scheduleId": "s1", "id": "job-9"}
+        assert _model(d) == d
+
+
+def test_client_list_schedules():
+    assert _model({"type": "listSchedules", "scheduleId": "s1"}) == {
+        "type": "listSchedules",
+        "scheduleId": "s1",
+    }
+
+
+def test_client_ping():
+    assert _model({"type": "ping"}) == {"type": "ping"}
+
+
+def test_client_message_rejects_unknown_fields():
+    with pytest.raises(ValidationError):
+        _client_adapter.validate_python({"type": "auth", "token": "t", "db": "d", "bogus": True})
