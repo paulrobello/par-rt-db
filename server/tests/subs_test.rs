@@ -72,10 +72,12 @@ async fn subscribe_sends_initial_query_update_with_seeded_rows() -> anyhow::Resu
     let db = fresh_db(&state).await;
 
     state
+        .realtime
         .committers
         .mutate(&db, None, insert_work_item("backlog", 1.0), None)
         .await?;
     state
+        .realtime
         .committers
         .mutate(&db, None, insert_work_item("backlog", 2.0), None)
         .await?;
@@ -83,6 +85,7 @@ async fn subscribe_sends_initial_query_update_with_seeded_rows() -> anyhow::Resu
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let conn = next_conn_id();
     state
+        .realtime
         .committers
         .subscribe(&db, conn, "q1".to_string(), collect_work_items(), tx, None)
         .await?;
@@ -106,10 +109,12 @@ async fn mutate_pushes_update_to_matching_subscription() -> anyhow::Result<()> {
     let db = fresh_db(&state).await;
 
     state
+        .realtime
         .committers
         .mutate(&db, None, insert_work_item("backlog", 1.0), None)
         .await?;
     state
+        .realtime
         .committers
         .mutate(&db, None, insert_work_item("backlog", 2.0), None)
         .await?;
@@ -117,12 +122,14 @@ async fn mutate_pushes_update_to_matching_subscription() -> anyhow::Result<()> {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let conn = next_conn_id();
     state
+        .realtime
         .committers
         .subscribe(&db, conn, "q1".to_string(), collect_work_items(), tx, None)
         .await?;
     rx.try_recv().expect("initial query update");
 
     state
+        .realtime
         .committers
         .mutate(&db, None, insert_work_item("backlog", 3.0), None)
         .await?;
@@ -149,12 +156,14 @@ async fn mutate_on_unrelated_table_sends_no_update() -> anyhow::Result<()> {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let conn = next_conn_id();
     state
+        .realtime
         .committers
         .subscribe(&db, conn, "q1".to_string(), collect_work_items(), tx, None)
         .await?;
     rx.try_recv().expect("initial query update");
 
     state
+        .realtime
         .committers
         .mutate(&db, None, insert_project(), None)
         .await?;
@@ -173,12 +182,14 @@ async fn mutate_with_same_idempotency_key_sends_no_second_update() -> anyhow::Re
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let conn = next_conn_id();
     state
+        .realtime
         .committers
         .subscribe(&db, conn, "q1".to_string(), collect_work_items(), tx, None)
         .await?;
     rx.try_recv().expect("initial query update");
 
     let first = state
+        .realtime
         .committers
         .mutate(
             &db,
@@ -190,6 +201,7 @@ async fn mutate_with_same_idempotency_key_sends_no_second_update() -> anyhow::Re
     rx.try_recv().expect("update after first mutate");
 
     let second = state
+        .realtime
         .committers
         .mutate(
             &db,
@@ -211,6 +223,7 @@ async fn mutate_not_matching_eq_filter_sends_no_update() -> anyhow::Result<()> {
     let db = fresh_db(&state).await;
 
     state
+        .realtime
         .committers
         .mutate(&db, None, insert_work_item("backlog", 1.0), None)
         .await?;
@@ -218,6 +231,7 @@ async fn mutate_not_matching_eq_filter_sends_no_update() -> anyhow::Result<()> {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let conn = next_conn_id();
     state
+        .realtime
         .committers
         .subscribe(
             &db,
@@ -231,6 +245,7 @@ async fn mutate_not_matching_eq_filter_sends_no_update() -> anyhow::Result<()> {
     rx.try_recv().expect("initial query update");
 
     state
+        .realtime
         .committers
         .mutate(&db, None, insert_work_item("done", 2.0), None)
         .await?;
@@ -249,6 +264,7 @@ async fn two_subscriptions_both_receive_updates_from_one_mutate() -> anyhow::Res
     let (tx1, mut rx1) = tokio::sync::mpsc::unbounded_channel();
     let conn1 = next_conn_id();
     state
+        .realtime
         .committers
         .subscribe(
             &db,
@@ -264,6 +280,7 @@ async fn two_subscriptions_both_receive_updates_from_one_mutate() -> anyhow::Res
     let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
     let conn2 = next_conn_id();
     state
+        .realtime
         .committers
         .subscribe(
             &db,
@@ -277,6 +294,7 @@ async fn two_subscriptions_both_receive_updates_from_one_mutate() -> anyhow::Res
     rx2.try_recv().expect("initial q2");
 
     state
+        .realtime
         .committers
         .mutate(&db, None, insert_work_item("backlog", 1.0), None)
         .await?;
@@ -298,14 +316,16 @@ async fn remove_conn_stops_further_updates() -> anyhow::Result<()> {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let conn = next_conn_id();
     state
+        .realtime
         .committers
         .subscribe(&db, conn, "q1".to_string(), collect_work_items(), tx, None)
         .await?;
     rx.try_recv().expect("initial query update");
 
-    state.subs.remove_conn(&db, conn).await;
+    state.realtime.subs.remove_conn(&db, conn).await;
 
     state
+        .realtime
         .committers
         .mutate(&db, None, insert_work_item("backlog", 1.0), None)
         .await?;
@@ -325,6 +345,7 @@ async fn mutate_on_nonexistent_db_is_not_found() -> anyhow::Result<()> {
     let state = test_state().await;
 
     let err = state
+        .realtime
         .committers
         .mutate("does_not_exist", None, insert_project(), None)
         .await
@@ -343,6 +364,7 @@ async fn write_set_records_written_document_ids() -> anyhow::Result<()> {
     let db = fresh_db(&state).await;
 
     let insert_a = state
+        .realtime
         .committers
         .mutate(&db, None, insert_work_item("backlog", 1.0), None)
         .await?;
@@ -352,6 +374,7 @@ async fn write_set_records_written_document_ids() -> anyhow::Result<()> {
         .to_string();
 
     let patch_a = state
+        .realtime
         .committers
         .mutate(
             &db,
@@ -394,6 +417,7 @@ async fn get_subscription_updates_when_its_doc_is_written() -> anyhow::Result<()
     let db = fresh_db(&state).await;
 
     let insert = state
+        .realtime
         .committers
         .mutate(&db, None, insert_work_item("backlog", 1.0), None)
         .await?;
@@ -411,12 +435,14 @@ async fn get_subscription_updates_when_its_doc_is_written() -> anyhow::Result<()
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let conn = next_conn_id();
     state
+        .realtime
         .committers
         .subscribe(&db, conn, "q1".to_string(), get_query, tx, None)
         .await?;
     rx.try_recv().expect("initial query update");
 
     state
+        .realtime
         .committers
         .mutate(
             &db,
@@ -458,6 +484,7 @@ async fn get_subscription_skips_update_for_unrelated_doc() -> anyhow::Result<()>
     let db = fresh_db(&state).await;
 
     let insert_a = state
+        .realtime
         .committers
         .mutate(&db, None, insert_work_item("backlog", 1.0), None)
         .await?;
@@ -475,6 +502,7 @@ async fn get_subscription_skips_update_for_unrelated_doc() -> anyhow::Result<()>
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let conn = next_conn_id();
     state
+        .realtime
         .committers
         .subscribe(&db, conn, "q1".to_string(), get_query, tx, None)
         .await?;
@@ -482,6 +510,7 @@ async fn get_subscription_skips_update_for_unrelated_doc() -> anyhow::Result<()>
 
     // Write a different document on the same table.
     state
+        .realtime
         .committers
         .mutate(&db, None, insert_work_item("backlog", 2.0), None)
         .await?;
@@ -500,12 +529,14 @@ async fn collect_subscription_still_reruns_on_table_write() -> anyhow::Result<()
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let conn = next_conn_id();
     state
+        .realtime
         .committers
         .subscribe(&db, conn, "q1".to_string(), collect_work_items(), tx, None)
         .await?;
     rx.try_recv().expect("initial query update");
 
     state
+        .realtime
         .committers
         .mutate(&db, None, insert_work_item("backlog", 1.0), None)
         .await?;
@@ -529,6 +560,7 @@ async fn get_subscription_updates_when_its_doc_is_deleted() -> anyhow::Result<()
     let db = fresh_db(&state).await;
 
     let insert = state
+        .realtime
         .committers
         .mutate(&db, None, insert_work_item("backlog", 1.0), None)
         .await?;
@@ -546,12 +578,14 @@ async fn get_subscription_updates_when_its_doc_is_deleted() -> anyhow::Result<()
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let conn = next_conn_id();
     state
+        .realtime
         .committers
         .subscribe(&db, conn, "q1".to_string(), get_query, tx, None)
         .await?;
     rx.try_recv().expect("initial query update");
 
     state
+        .realtime
         .committers
         .mutate(
             &db,

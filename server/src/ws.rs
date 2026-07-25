@@ -105,7 +105,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
     let Some((principal, db)) = authenticate(&mut socket, &state).await else {
         return;
     };
-    state.metrics.ws_connect();
+    state.runtime.metrics.ws_connect();
 
     let mut rate_limiter = RateLimiter::new();
     let mut last_activity = Instant::now();
@@ -169,8 +169,8 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
         }
     }
 
-    state.subs.remove_conn(&db, conn_id).await;
-    state.metrics.ws_disconnect();
+    state.realtime.subs.remove_conn(&db, conn_id).await;
+    state.runtime.metrics.ws_disconnect();
 }
 
 /// Waits up to `AUTH_TIMEOUT` (in total, across any leading `Ping`/`Pong`
@@ -336,13 +336,14 @@ async fn handle_text_frame(
                         owner_of(principal).map(|s| s.to_string())
                     };
                     if let Err(error) = state
+                        .realtime
                         .committers
                         .subscribe(db, conn_id, query_id.clone(), *query, out_tx.clone(), owner)
                         .await
                     {
                         let _ = out_tx.send(ServerMessage::SubscribeErr { query_id, error });
                     } else {
-                        state.metrics.record_query();
+                        state.runtime.metrics.record_query();
                     }
                 }
                 Err(error) => {
@@ -352,7 +353,7 @@ async fn handle_text_frame(
             false
         }
         ClientMessage::Unsubscribe { query_id } => {
-            state.subs.remove(db, conn_id, &query_id).await;
+            state.realtime.subs.remove(db, conn_id, &query_id).await;
             false
         }
         ClientMessage::Mutate {
@@ -388,12 +389,13 @@ async fn handle_text_frame(
                         owner_of(principal).map(|s| s.to_string())
                     };
                     match state
+                        .realtime
                         .committers
                         .mutate(db, idempotency_key, txn, owner)
                         .await
                     {
                         Ok(outcome) => {
-                            state.metrics.record_mutation();
+                            state.runtime.metrics.record_mutation();
                             let _ = out_tx.send(ServerMessage::MutateOk {
                                 mut_id,
                                 results: outcome.results,

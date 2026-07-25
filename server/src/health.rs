@@ -45,7 +45,7 @@ pub async fn handler(State(state): State<Arc<AppState>>) -> Response {
     let postgres = postgres_reachable(&state.pool).await;
     let now = std::time::SystemTime::now();
     let uptime_seconds = now
-        .duration_since(state.started_at)
+        .duration_since(state.runtime.started_at)
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let build_secs: u64 = BUILD_TIMESTAMP_SECS.parse().unwrap_or(0);
@@ -55,7 +55,7 @@ pub async fn handler(State(state): State<Arc<AppState>>) -> Response {
         version: env!("CARGO_PKG_VERSION"),
         git_commit: GIT_COMMIT,
         build_timestamp: fmt_secs(build_secs),
-        started_at: DateTime::<Utc>::from(state.started_at).to_rfc3339(),
+        started_at: DateTime::<Utc>::from(state.runtime.started_at).to_rfc3339(),
         uptime_seconds,
         postgres,
     };

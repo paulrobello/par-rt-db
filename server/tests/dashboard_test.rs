@@ -419,9 +419,11 @@ async fn metrics_counters_and_subs_count() -> anyhow::Result<()> {
 
     let state = common::test_state().await;
     // count() is 0 before any subscribe on a fresh manager.
-    assert_eq!(state.subs.count().await, 0);
+    assert_eq!(state.realtime.subs.count().await, 0);
 
-    let snap = m.snapshot(&state.pool, &state.subs, state.started_at).await;
+    let snap = m
+        .snapshot(&state.pool, &state.realtime.subs, state.runtime.started_at)
+        .await;
     assert_eq!(snap.queries_total, 2);
     assert_eq!(snap.mutations_total, 1);
     assert_eq!(snap.uploads_total, 0);

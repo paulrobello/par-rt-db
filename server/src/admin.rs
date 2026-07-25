@@ -430,7 +430,7 @@ async fn admin_query(
     }
     let schema = state.schemas.get(&state.pool, &db).await?;
     let result = execute_query(&state.pool, &db, &schema, &body.query, None).await?;
-    state.metrics.record_query();
+    state.runtime.metrics.record_query();
     Ok(Json(AdminQueryResponse { result }))
 }
 
@@ -470,10 +470,11 @@ async fn admin_mutate(
         )));
     }
     let outcome = state
+        .realtime
         .committers
         .mutate(&db, body.idempotency_key, body.txn, None)
         .await?;
-    state.metrics.record_mutation();
+    state.runtime.metrics.record_mutation();
     Ok(Json(AdminMutateResponse {
         results: outcome.results,
     }))
@@ -594,8 +595,9 @@ async fn metrics_handler(
     require_admin(&state, &headers).await?;
     Ok(Json(
         state
+            .runtime
             .metrics
-            .snapshot(&state.pool, &state.subs, state.started_at)
+            .snapshot(&state.pool, &state.realtime.subs, state.runtime.started_at)
             .await,
     ))
 }
@@ -622,7 +624,7 @@ struct ConfigResponse {
 /// credentials) collapse to configured-bools; hot values are shown in full.
 async fn build_config_response(state: &AppState) -> Result<ConfigResponse, RtDbError> {
     let cfg = &state.config;
-    let hot = state.hot.load();
+    let hot = state.runtime.hot.load();
     Ok(ConfigResponse {
         port: cfg.port,
         public_url: cfg.public_url.clone(),
@@ -667,7 +669,7 @@ async fn patch_config(
     ApiJson(patch): ApiJson<HotConfigPatch>,
 ) -> Result<Json<ConfigResponse>, RtDbError> {
     require_admin(&state, &headers).await?;
-    let mut next: crate::config::HotConfig = (**state.hot.load()).clone();
+    let mut next: crate::config::HotConfig = (**state.runtime.hot.load()).clone();
     if let Some(origins) = &patch.allowed_origins {
         next.allowed_origins = origins
             .iter()
@@ -693,7 +695,7 @@ async fn patch_config(
         ));
     }
     crate::config::save_hot(&state.pool, &next).await?;
-    state.hot.store(Arc::new(next));
+    state.runtime.hot.store(Arc::new(next));
     Ok(Json(build_config_response(&state).await?))
 }
 
@@ -722,6 +724,7 @@ async fn ops_recent(
 ) -> Result<Json<OpsRecentResponse>, RtDbError> {
     require_admin(&state, &headers).await?;
     let ops = state
+        .realtime
         .op_feed
         .recent(
             params.db.as_deref(),
@@ -786,6 +789,7 @@ async fn run_admin_stream(
     table: Option<String>,
 ) {
     for ev in state
+        .realtime
         .op_feed
         .recent(db.as_deref(), table.as_deref(), 200)
         .await
@@ -797,7 +801,7 @@ async fn run_admin_stream(
             return;
         }
     }
-    let mut rx = state.op_feed.subscribe();
+    let mut rx = state.realtime.op_feed.subscribe();
     let mut gauge_tick = tokio::time::interval(Duration::from_secs(1));
     gauge_tick.tick().await; // skip immediate
     loop {
@@ -815,8 +819,9 @@ async fn run_admin_stream(
             }
             _ = gauge_tick.tick() => {
                 let snap = state
+                    .runtime
                     .metrics
-                    .snapshot(&state.pool, &state.subs, state.started_at)
+                    .snapshot(&state.pool, &state.realtime.subs, state.runtime.started_at)
                     .await;
                 if send_stream_json(&mut socket, &serde_json::json!({"kind":"gauges","gauges":snap}))
                     .await

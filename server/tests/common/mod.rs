@@ -27,7 +27,7 @@ pub fn test_config() -> Config {
 
 /// Hot-config seed for tests: mirrors the pre-split `test_config` defaults, so
 /// the existing CORS/origin tests (which rely on `http://localhost:5173` being
-/// allowed) keep passing now that origins live behind `state.hot`.
+/// allowed) keep passing now that origins live behind `state.runtime.hot`.
 #[allow(dead_code)]
 pub fn test_hot() -> HotConfig {
     HotConfig {

@@ -128,7 +128,12 @@ impl OAuthProvider for GithubProvider {
             .to_lowercase();
 
         let user_id = upsert_user(&state.pool, user.id, &user.login, &email).await?;
-        session::create_session(&state.pool, &user_id, state.hot.load().session_ttl_days).await
+        session::create_session(
+            &state.pool,
+            &user_id,
+            state.runtime.hot.load().session_ttl_days,
+        )
+        .await
     }
 }
 

@@ -76,7 +76,7 @@ async fn query_handler(
         owner_of(&principal),
     )
     .await?;
-    state.metrics.record_query();
+    state.runtime.metrics.record_query();
     Ok(Json(QueryResponse { result }))
 }
 
@@ -104,6 +104,7 @@ async fn mutate_handler(
     authorize(&state.pool, &principal, &body.db).await?;
 
     let outcome = state
+        .realtime
         .committers
         .mutate(
             &body.db,
@@ -112,7 +113,7 @@ async fn mutate_handler(
             owner_of(&principal).map(|s| s.to_string()),
         )
         .await?;
-    state.metrics.record_mutation();
+    state.runtime.metrics.record_mutation();
     Ok(Json(MutateResponse {
         results: outcome.results,
     }))
@@ -296,7 +297,7 @@ async fn upload_handler(
     // compromised admin token) cannot buffer arbitrarily large blobs into
     // Postgres bytea. The bearer is already authorized above; clamp ordering
     // preserves the auth-before-buffering invariant (SEC-008).
-    let limit = crate::config::HARD_MAX_FILE_SIZE.min(state.hot.load().max_file_size);
+    let limit = crate::config::HARD_MAX_FILE_SIZE.min(state.runtime.hot.load().max_file_size);
     let bytes = axum::body::to_bytes(request.into_body(), limit)
         .await
         .map_err(|_| RtDbError::bad_request("upload exceeds max file size"))?;
@@ -316,7 +317,7 @@ async fn upload_handler(
         &bytes,
     )
     .await?;
-    state.metrics.record_upload();
+    state.runtime.metrics.record_upload();
     Ok(Json(UploadResponse {
         id,
         sha256,

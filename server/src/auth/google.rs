@@ -133,7 +133,12 @@ impl OAuthProvider for GoogleProvider {
         .fetch_one(&state.pool)
         .await?;
 
-        session::create_session(&state.pool, &user_id, state.hot.load().session_ttl_days).await
+        session::create_session(
+            &state.pool,
+            &user_id,
+            state.runtime.hot.load().session_ttl_days,
+        )
+        .await
     }
 }
 

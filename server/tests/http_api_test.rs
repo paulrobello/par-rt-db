@@ -307,6 +307,7 @@ async fn http_mutate_triggers_registered_subscription() -> anyhow::Result<()> {
     let conn = next_conn_id();
     let query: Query = serde_json::from_value(json!({"table": "workItems"})).expect("parse query");
     state
+        .realtime
         .committers
         .subscribe(&name, conn, "q1".to_string(), query, tx, None)
         .await?;

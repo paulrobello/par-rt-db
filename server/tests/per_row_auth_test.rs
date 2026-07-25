@@ -340,6 +340,7 @@ async fn fan_out_does_not_push_cross_user_rows() -> anyhow::Result<()> {
     let (bob_tx, mut bob_rx) = mpsc::unbounded_channel::<ServerMessage>();
     let q = notes_query();
     state
+        .realtime
         .committers
         .subscribe(
             &db,
@@ -351,6 +352,7 @@ async fn fan_out_does_not_push_cross_user_rows() -> anyhow::Result<()> {
         )
         .await?;
     state
+        .realtime
         .committers
         .subscribe(
             &db,
@@ -372,6 +374,7 @@ async fn fan_out_does_not_push_cross_user_rows() -> anyhow::Result<()> {
     doc.insert("title".into(), "bob's note".into());
     doc.insert("userId".into(), "bob".into());
     state
+        .realtime
         .committers
         .mutate(
             &db,
@@ -1076,6 +1079,7 @@ async fn patch_owner_change_does_not_inject_into_other_users_feed() -> anyhow::R
     // Bob subscribes on `notes` carrying his owner identity.
     let (bob_tx, mut bob_rx) = mpsc::unbounded_channel::<ServerMessage>();
     state
+        .realtime
         .committers
         .subscribe(
             &db,
@@ -1093,6 +1097,7 @@ async fn patch_owner_change_does_not_inject_into_other_users_feed() -> anyhow::R
     insert_doc.insert("title".into(), "alice's note".into());
     insert_doc.insert("userId".into(), "alice".into());
     let outcome = state
+        .realtime
         .committers
         .mutate(
             &db,
@@ -1125,6 +1130,7 @@ async fn patch_owner_change_does_not_inject_into_other_users_feed() -> anyhow::R
     let mut patch_fields = serde_json::Map::new();
     patch_fields.insert("userId".into(), "bob".into()); // attempted injection
     state
+        .realtime
         .committers
         .mutate(
             &db,

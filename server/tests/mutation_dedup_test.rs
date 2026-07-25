@@ -77,10 +77,12 @@ async fn same_mut_id_dedups_and_replays_cached_result() -> anyhow::Result<()> {
     };
 
     let first = state
+        .realtime
         .committers
         .mutate(&db, Some("retry-key-1".to_string()), txn.clone(), None)
         .await?;
     let second = state
+        .realtime
         .committers
         .mutate(&db, Some("retry-key-1".to_string()), txn.clone(), None)
         .await?;
@@ -111,10 +113,12 @@ async fn no_mut_id_does_not_dedup() -> anyhow::Result<()> {
     };
 
     state
+        .realtime
         .committers
         .mutate(&db, None, txn.clone(), None)
         .await?;
     state
+        .realtime
         .committers
         .mutate(&db, None, txn.clone(), None)
         .await?;
@@ -143,10 +147,12 @@ async fn empty_string_idempotency_key_is_treated_as_absent() -> anyhow::Result<(
     };
 
     state
+        .realtime
         .committers
         .mutate(&db, Some(String::new()), txn.clone(), None)
         .await?;
     state
+        .realtime
         .committers
         .mutate(&db, Some(String::new()), txn.clone(), None)
         .await?;
@@ -178,6 +184,7 @@ async fn expired_mut_id_re_executes() -> anyhow::Result<()> {
     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
 
     state
+        .realtime
         .committers
         .mutate(&db, Some("retry-key-2".to_string()), txn.clone(), None)
         .await?;

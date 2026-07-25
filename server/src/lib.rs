@@ -43,17 +43,37 @@ use tower_http::trace::TraceLayer;
 
 use auth::provider::OAuthStateEntry;
 
+/// Realtime execution core: subscription state, the per-db committer tasks,
+/// and the live op-feed tap they publish to. Grouped so handlers that only
+/// need the reactive surface can reach for `state.realtime` as a unit.
+pub struct Realtime {
+    pub subs: Arc<SubscriptionManager>,
+    pub committers: Committers,
+    pub op_feed: Arc<op_feed::OpFeed>,
+}
+
+/// Runtime-wide mutable/process state: hot-reloaded config, metrics, and the
+/// server's boot timestamp. Grouped so the `/admin/*` and health surfaces can
+/// reach for `state.runtime` as a unit.
+pub struct Runtime {
+    pub hot: Arc<ArcSwap<HotConfig>>,
+    pub metrics: Arc<metrics::Metrics>,
+    pub started_at: SystemTime,
+}
+
+/// Per-instance auth bookkeeping that is neither a config value nor a realtime
+/// concern. Grouped so `state.auth` is the only OAuth-session seam.
+pub struct Auth {
+    pub oauth_states: tokio::sync::Mutex<HashMap<String, OAuthStateEntry>>,
+}
+
 pub struct AppState {
     pub pool: sqlx::PgPool,
     pub config: Config,
-    pub hot: Arc<ArcSwap<HotConfig>>,
     pub schemas: SchemaCache,
-    pub subs: Arc<SubscriptionManager>,
-    pub committers: Committers,
-    pub oauth_states: tokio::sync::Mutex<HashMap<String, OAuthStateEntry>>,
-    pub started_at: SystemTime,
-    pub metrics: Arc<metrics::Metrics>,
-    pub op_feed: Arc<op_feed::OpFeed>,
+    pub realtime: Realtime,
+    pub runtime: Runtime,
+    pub auth: Auth,
 }
 
 impl AppState {
@@ -67,14 +87,20 @@ impl AppState {
         Arc::new(Self {
             pool,
             config,
-            hot: Arc::new(ArcSwap::from_pointee(hot)),
             schemas,
-            subs,
-            committers,
-            oauth_states: tokio::sync::Mutex::new(HashMap::new()),
-            started_at: SystemTime::now(),
-            metrics,
-            op_feed,
+            realtime: Realtime {
+                subs,
+                committers,
+                op_feed,
+            },
+            runtime: Runtime {
+                hot: Arc::new(ArcSwap::from_pointee(hot)),
+                metrics,
+                started_at: SystemTime::now(),
+            },
+            auth: Auth {
+                oauth_states: tokio::sync::Mutex::new(HashMap::new()),
+            },
         })
     }
 }
@@ -130,7 +156,7 @@ async fn set_static_cache_headers(req: Request, next: Next) -> Response {
 }
 
 pub fn build_router(state: Arc<AppState>) -> Router {
-    let cors = cors_layer(state.hot.clone());
+    let cors = cors_layer(state.runtime.hot.clone());
 
     let mut router = Router::new()
         .route("/healthz", get(health::handler))

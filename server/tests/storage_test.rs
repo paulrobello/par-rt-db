@@ -232,7 +232,7 @@ async fn upload_rejects_oversized_body() -> anyhow::Result<()> {
     let db = fresh_db(&state).await;
     let token = mint_token(addr, &db).await;
 
-    let too_big = vec![0u8; state.hot.load().max_file_size + 1];
+    let too_big = vec![0u8; state.runtime.hot.load().max_file_size + 1];
     let resp = reqwest::Client::new()
         .post(format!("http://{addr}/api/storage/{db}"))
         .bearer_auth(token)

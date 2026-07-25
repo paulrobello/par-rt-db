@@ -24,7 +24,7 @@ const STATE_TTL_MS: i64 = 10 * 60 * 1000;
 
 /// One pending `/auth/{provider}` -> `/auth/{provider}/callback` round trip:
 /// the origin the popup was opened from (echoed back into the callback HTML)
-/// and when this entry expires. Held in `AppState.oauth_states`, keyed by the
+/// and when this entry expires. Held in `AppState.auth.oauth_states`, keyed by the
 /// state token; consumed (removed) exactly once by the callback, whichever
 /// request gets the lock first — see `consume_state`.
 pub struct OAuthStateEntry {
@@ -106,7 +106,7 @@ fn unconfigured_response(name: &str) -> Response {
 /// (see Step 1(e)). Concurrent callers race on the same `Mutex`; whichever
 /// acquires it first wins the entry.
 async fn consume_state(state: &Arc<AppState>, state_token: &str) -> Option<String> {
-    let mut states = state.oauth_states.lock().await;
+    let mut states = state.auth.oauth_states.lock().await;
     match states.remove(state_token) {
         Some(entry) if entry.expires_at > now_ms() => Some(entry.origin),
         _ => None,
@@ -132,6 +132,7 @@ async fn provider_start<P: OAuthProvider>(
     };
 
     if !state
+        .runtime
         .hot
         .load()
         .allowed_origins
@@ -144,7 +145,7 @@ async fn provider_start<P: OAuthProvider>(
     let state_token = random_token();
     let now = now_ms();
     {
-        let mut states = state.oauth_states.lock().await;
+        let mut states = state.auth.oauth_states.lock().await;
         states.retain(|_, entry| entry.expires_at > now);
         states.insert(
             state_token.clone(),
