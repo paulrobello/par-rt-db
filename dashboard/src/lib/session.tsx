@@ -1,4 +1,4 @@
-import { createContext, useContext, useEffect, useState, type ReactNode } from "react";
+import { createContext, useContext, useState, type ReactNode } from "react";
 import type { AuthedUser } from "@par-rt-db/client";
 
 export type AuthMethod = "oauth" | "adminkey";
@@ -14,9 +14,6 @@ export interface SessionValue {
   signOut: () => Promise<void>;
 }
 
-const TOKEN_KEY = "rtdb-dash:token";
-const METHOD_KEY = "rtdb-dash:method";
-
 const SessionContext = createContext<SessionValue | null>(null);
 
 export function useSession(): SessionValue {
@@ -25,48 +22,20 @@ export function useSession(): SessionValue {
   return v;
 }
 
-function readStored(): { token: string | null; method: AuthMethod | null } {
-  const token = localStorage.getItem(TOKEN_KEY);
-  const method = localStorage.getItem(METHOD_KEY) as AuthMethod | null;
-  return { token, method: token ? method : null };
-}
-
 export function SessionProvider({ children }: { children: ReactNode }) {
+  // SEC-001: the admin bearer token lives in React state ONLY — never written
+  // to `localStorage` — so an XSS / malicious extension can't lift a persisted
+  // admin key via `localStorage.getItem`. Tradeoff: a page reload clears the
+  // token and the operator re-authenticates. Long-term this should be replaced
+  // by an HttpOnly+Secure+SameSite=Strict cookie set by a server-issued
+  // admin-login endpoint (out of scope for this remediation).
   const [token, setToken] = useState<string | null>(null);
   const [method, setMethod] = useState<AuthMethod | null>(null);
   const [user, setUser] = useState<AuthedUser | null>(null);
-  const [loading, setLoading] = useState(true);
+  const [loading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  // Restore a stored session on mount.
-  useEffect(() => {
-    const { token: t, method: m } = readStored();
-    if (!t) {
-      setLoading(false);
-      return;
-    }
-    setToken(t);
-    setMethod(m);
-    if (m === "oauth") {
-      fetch("/auth/me", { headers: { authorization: `Bearer ${t}` } })
-        .then((r) => (r.ok ? r.json() : Promise.reject(new Error("expired"))))
-        .then((u: AuthedUser) => setUser(u))
-        .catch(() => {
-          localStorage.removeItem(TOKEN_KEY);
-          localStorage.removeItem(METHOD_KEY);
-          setToken(null);
-          setMethod(null);
-          setUser(null);
-        })
-        .finally(() => setLoading(false));
-    } else {
-      setLoading(false);
-    }
-  }, []);
-
   async function applyToken(t: string, m: AuthMethod): Promise<void> {
-    localStorage.setItem(TOKEN_KEY, t);
-    localStorage.setItem(METHOD_KEY, m);
     setToken(t);
     setMethod(m);
     setError(null);
@@ -139,8 +108,6 @@ export function SessionProvider({ children }: { children: ReactNode }) {
         /* best-effort */
       }
     }
-    localStorage.removeItem(TOKEN_KEY);
-    localStorage.removeItem(METHOD_KEY);
     setToken(null);
     setMethod(null);
     setUser(null);

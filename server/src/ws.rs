@@ -102,7 +102,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
     let conn_id = next_conn_id();
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<ServerMessage>();
 
-    let Some((principal, db, admin)) = authenticate(&mut socket, &state).await else {
+    let Some((principal, db)) = authenticate(&mut socket, &state).await else {
         return;
     };
     state.metrics.ws_connect();
@@ -135,7 +135,6 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                             &state,
                             &principal,
                             &db,
-                            admin,
                             conn_id,
                             &out_tx,
                             &mut rate_limiter,
@@ -178,13 +177,16 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
 /// frames — a client that opens with a keepalive isn't penalized) for the
 /// first data frame and requires it to be a valid `Auth` message; any other
 /// outcome (timeout, wrong message, bad frame) sends `AuthErr` and closes.
-/// Returns the resolved principal, authorized database name, and whether the
-/// principal is a server-wide dashboard admin (an admin bypasses the per-db
-/// `authorize` check on the handshake and on every Subscribe/Mutate).
+/// Returns the resolved principal and authorized database name. Whether the
+/// principal is a server-wide dashboard admin is computed here ONLY to decide
+/// whether the initial per-db `authorize` runs at the handshake; it is NOT
+/// returned — `handle_text_frame` re-runs `is_admin` on each Subscribe/Mutate
+/// so an admin removed from `rtdb_auth.admins` mid-connection loses the bypass
+/// on the next op (SEC-004).
 async fn authenticate(
     socket: &mut WebSocket,
     state: &Arc<AppState>,
-) -> Option<(Principal, String, bool)> {
+) -> Option<(Principal, String)> {
     let deadline = Instant::now() + AUTH_TIMEOUT;
     let text = loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -234,9 +236,10 @@ async fn authenticate(
         }
     };
     // Admin OAuth sessions are authorized for every database (dashboard live
-    // tables). `is_admin` is computed once here — the bearer is fixed for the
-    // connection — and threaded to every Subscribe/Mutate so each op re-applies
-    // the bypass without another lookup. Machine principals are never admin.
+    // tables). `is_admin` is consulted here ONLY to gate the handshake's
+    // per-db `authorize`; it is re-computed on each later Subscribe/Mutate
+    // (SEC-004) so revoking admin takes effect on open connections. Machine
+    // principals are never admin.
     let admin = is_admin(&state.pool, &principal).await;
     if !admin && let Err(err) = authorize(&state.pool, &principal, &db).await {
         fail_and_close(socket, err).await;
@@ -251,7 +254,7 @@ async fn authenticate(
         return None;
     }
 
-    Some((principal, db, admin))
+    Some((principal, db))
 }
 
 /// Validates and dispatches one post-auth text frame. Returns whether the
@@ -264,17 +267,25 @@ async fn authenticate(
 /// can be revoked mid-session (e.g. an allowlist removal) — and on failure
 /// the operation errors (e.g. `SubscribeErr`/`MutateErr`) without closing
 /// the connection.
-// A3's `principal` param (and the Phase 5 `admin` flag) push this past
-// clippy's default 7-argument threshold; every param is independently needed
-// by a different message arm, so bundling them into a context struct would
-// add indirection without reducing coupling.
+///
+/// `Subscribe` and `Mutate` additionally re-run `is_admin` per op (SEC-004):
+/// the admin bypass is re-justified against the live `rtdb_auth.admins` table
+/// on each message, so an OAuth user removed from the admin allowlist while
+/// holding an open `/sync` stops bypassing per-db `authorize` and stops
+/// mutating with `owner=None` on the next op. (The schedule family never
+/// carried the admin bypass, so it is unchanged.) `is_admin` returns false on
+/// DB error (`auth::is_admin`), so a transient Postgres outage fails safe:
+/// the bypass is withheld, not widened.
+// A3's `principal` param pushes this past clippy's default 7-argument
+// threshold; every param is independently needed by a different message arm,
+// so bundling them into a context struct would add indirection without
+// reducing coupling.
 #[allow(clippy::too_many_arguments)]
 async fn handle_text_frame(
     socket: &mut WebSocket,
     state: &Arc<AppState>,
     principal: &Principal,
     db: &str,
-    admin: bool,
     conn_id: ConnId,
     out_tx: &UnboundedSender<ServerMessage>,
     rate_limiter: &mut RateLimiter,
@@ -304,6 +315,12 @@ async fn handle_text_frame(
             true
         }
         ClientMessage::Subscribe { query_id, query } => {
+            // SEC-004: re-justify the admin bypass against the live admin
+            // allowlist on every op — a principal removed from
+            // `rtdb_auth.admins` mid-connection must not keep bypassing
+            // per-db `authorize`. `is_admin` fails safe (returns false on DB
+            // error).
+            let admin = is_admin(&state.pool, principal).await;
             let authed = if admin {
                 Ok(())
             } else {
@@ -343,6 +360,8 @@ async fn handle_text_frame(
             idempotency_key,
             txn,
         } => {
+            // SEC-004: re-justify the admin bypass on every op (see Subscribe).
+            let admin = is_admin(&state.pool, principal).await;
             let authed = if admin {
                 Ok(())
             } else {
