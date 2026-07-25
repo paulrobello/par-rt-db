@@ -15,6 +15,7 @@ pub struct Config {
     pub google_client_id: Option<String>,     // RTDB_GOOGLE_CLIENT_ID
     pub google_client_secret: Option<String>, // RTDB_GOOGLE_CLIENT_SECRET
     pub max_affected_docs: usize, // RTDB_MAX_AFFECTED_DOCS, default 100 (admin data-browser guardrail)
+    pub static_dir: Option<String>, // RTDB_STATIC_DIR — unset/empty ⇒ API-only (no SPA served)
 }
 
 impl Config {
@@ -53,6 +54,11 @@ impl Config {
             Err(_) => 100,
         };
 
+        let static_dir = std::env::var("RTDB_STATIC_DIR")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
         Ok(Self {
             port,
             database_url,
@@ -65,6 +71,7 @@ impl Config {
             google_client_id,
             google_client_secret,
             max_affected_docs,
+            static_dir,
         })
     }
 }

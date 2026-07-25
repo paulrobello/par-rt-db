@@ -22,17 +22,23 @@ pub mod txn;
 pub mod ws;
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::SystemTime;
 
 use arc_swap::ArcSwap;
-use axum::http::{Method, header};
+use axum::extract::Request;
+use axum::http::{HeaderValue, Method, header};
+use axum::middleware::{Next, from_fn};
+use axum::response::Response;
 use axum::{Router, routing::get};
 use committer::Committers;
 use config::{Config, HotConfig};
 use db::SchemaCache;
 use subs::SubscriptionManager;
+use tower::ServiceBuilder;
 use tower_http::cors::{AllowOrigin, CorsLayer};
+use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
 
 use auth::provider::OAuthStateEntry;
@@ -99,15 +105,57 @@ fn cors_layer(hot: Arc<ArcSwap<HotConfig>>) -> CorsLayer {
         .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
 }
 
+/// Sets `Cache-Control` on static responses from their Content-Type: the SPA
+/// shell (text/html — including the index served for unknown paths by the SPA
+/// fallback) is `no-cache` so a new deploy's index.html is always fetched (and
+/// then references the newest hashed assets); every other static asset is
+/// `immutable`. Wraps only the static `ServeDir`, never the API/admin/WS/auth
+/// routes.
+async fn set_static_cache_headers(req: Request, next: Next) -> Response {
+    let mut resp = next.run(req).await;
+    let no_cache = resp
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| ct.starts_with("text/html"));
+    let cc = if no_cache {
+        "no-cache, no-store, must-revalidate"
+    } else {
+        "public, max-age=31536000, immutable"
+    };
+    if let Ok(value) = HeaderValue::from_str(cc) {
+        resp.headers_mut().insert(header::CACHE_CONTROL, value);
+    }
+    resp
+}
+
 pub fn build_router(state: Arc<AppState>) -> Router {
     let cors = cors_layer(state.hot.clone());
 
-    Router::new()
+    let mut router = Router::new()
         .route("/healthz", get(health::handler))
         .merge(admin::admin_routes())
         .merge(http_api::http_api_routes())
         .merge(ws::ws_routes())
-        .merge(auth::provider::auth_routes())
+        .merge(auth::provider::auth_routes());
+
+    // Static SPA hosting, mounted LAST as the fallback so it can never shadow a
+    // real route. Only when RTDB_STATIC_DIR is set and the directory exists;
+    // otherwise the server is API-only (today's behavior). `static_dir` is
+    // cloned out so `state` can still move into `with_state` below.
+    if let Some(dir) = state.config.static_dir.clone()
+        && Path::new(&dir).is_dir()
+    {
+        let serve_dir =
+            ServeDir::new(dir.clone()).fallback(ServeFile::new(format!("{dir}/index.html")));
+        router = router.fallback_service(
+            ServiceBuilder::new()
+                .layer(from_fn(set_static_cache_headers))
+                .service(serve_dir),
+        );
+    }
+
+    router
         .layer(TraceLayer::new_for_http())
         .layer(cors)
         .with_state(state)

@@ -877,3 +877,82 @@ async fn admin_mutate_writes_and_cap_rejects() -> anyhow::Result<()> {
     assert_eq!(q["result"].as_array().unwrap().len(), 1);
     Ok(())
 }
+
+// --- Phase 6: static hosting -------------------------------------------------
+
+// ServeDir serves the SPA same-origin: index.html (no-cache), hashed assets
+// (immutable), and index.html again for unknown GET paths (SPA fallback).
+#[tokio::test]
+async fn static_dir_serves_index_and_assets() -> anyhow::Result<()> {
+    let dir = std::env::temp_dir().join(format!("rtdb-static-{}", uuid::Uuid::now_v7().simple()));
+    std::fs::create_dir_all(dir.join("assets"))?;
+    std::fs::write(
+        dir.join("index.html"),
+        "<html><body>dashboard</body></html>",
+    )?;
+    std::fs::write(dir.join("assets").join("app.js"), "console.log(1)")?;
+
+    let mut cfg = common::test_config();
+    cfg.static_dir = Some(dir.to_string_lossy().to_string());
+    let pool = sqlx::PgPool::connect(&cfg.database_url).await?;
+    rtdb_server::db::bootstrap(&pool).await?;
+    let state = rtdb_server::AppState::new(pool, cfg, common::test_hot());
+    let addr = common::spawn_app(state).await;
+
+    // GET / -> index.html, no-cache.
+    let resp = reqwest::get(format!("http://{addr}/")).await?;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        resp.headers()
+            .get("cache-control")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "no-cache, no-store, must-revalidate"
+    );
+    assert!(resp.text().await?.contains("dashboard"));
+
+    // GET /assets/app.js -> immutable.
+    let resp = reqwest::get(format!("http://{addr}/assets/app.js")).await?;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        resp.headers()
+            .get("cache-control")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "public, max-age=31536000, immutable"
+    );
+
+    // SPA fallback: an unknown GET path returns index.html (no-cache), not 404.
+    let resp = reqwest::get(format!("http://{addr}/dbs/some-db/tables")).await?;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        resp.headers()
+            .get("cache-control")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "no-cache, no-store, must-revalidate"
+    );
+    assert!(resp.text().await?.contains("dashboard"));
+
+    std::fs::remove_dir_all(&dir)?;
+    Ok(())
+}
+
+// With no RTDB_STATIC_DIR, the server is API-only: GET / is a 404 (not
+// index.html) and the API routes are unaffected.
+#[tokio::test]
+async fn no_static_dir_is_api_only() -> anyhow::Result<()> {
+    let state = common::test_state().await; // static_dir = None
+    let addr = common::spawn_app(state.clone()).await;
+
+    let resp = reqwest::get(format!("http://{addr}/")).await?;
+    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+
+    // API still works.
+    let resp = common::admin_get(addr, "/admin/dbs").await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    Ok(())
+}

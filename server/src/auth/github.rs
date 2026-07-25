@@ -378,6 +378,7 @@ mod tests {
             google_client_id: None,
             google_client_secret: None,
             max_affected_docs: 100,
+            static_dir: None,
         };
         assert!(GithubProvider::from_config(&cfg).is_none());
         cfg.github_client_id = Some("id".into());
