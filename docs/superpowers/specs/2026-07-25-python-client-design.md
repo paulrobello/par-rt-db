@@ -80,7 +80,7 @@ Query: { table, get?, index?, eq[]?, gt?|gte?, lt?|lte?, order?("asc"|"desc"),
          take?(int, max 4096), unique?(bool), first?(bool), count?(bool),
          filter?: FilterExpr,
          search?: { index, query },
-         vectorSearch?: { index, vector[], limit, filter? },     # camelCase key
+         vectorSearch?: { index, vector[], limit, filter? },     # camelCase key; `filter` is an eq-map {field: value} over the index's filterFields (NOT a FilterExpr)
          paginate?: { cursor?, numItems } }
 ```
 
@@ -105,9 +105,10 @@ insert{table, doc} | patch{table, id, fields} | replace{table, id, doc}
 `insert → {id}`, `upsert → {id, inserted}`, `patch/replace/delete/expectVersion/
 expectAbsent → None`.
 
-**FilterExpr** — predicate DSL, discriminator `"type"`: `eq|neq|gt|gte|lt|lte|in` (leaf,
-`{field, value}` / `in` `{field, values[]}`) + `and|or` (`{exprs[]}`). Composes with
-every terminal except `get`.
+**FilterExpr** — predicate DSL, internally tagged by `"op"` (variant names **lowercase**):
+`eq|neq|gt|gte|lt|lte|in` (leaf, `{field, value}` / `in` `{field, values[]}`) + `and|or`
+(`{exprs[]}`). Composes with every terminal except `get`. (Distinct from
+`VectorSearchQuery.filter`, which is an eq-map, not a FilterExpr.)
 
 **Schema** — `SchemaDef = { tables: { name: { fields: { name: FieldType },
 indexes?: [{ name, fields[], search?, vector? }], ownerField? } } }`. `FieldType` is
