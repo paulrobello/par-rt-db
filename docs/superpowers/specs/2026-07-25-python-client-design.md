@@ -56,20 +56,20 @@ Python name declare an explicit `alias`.
 ClientMessage (union, discriminator="type", extra=forbid):
   auth{token, db} | subscribe{queryId, query} | unsubscribe{queryId}
   | mutate{mutId, idempotencyKey?, txn}
-  | schedule{schedId, when, txn, paused?} | cancelSchedule{schedId}
-  | pauseSchedule{schedId} | resumeSchedule{schedId} | listSchedules
+  | schedule{scheduleId, when, txn} | cancelSchedule{scheduleId, id}
+  | pauseSchedule{scheduleId, id} | resumeSchedule{scheduleId, id} | listSchedules{scheduleId}
   | ping
 ServerMessage (union, discriminator="type"):
   authOk{user} | authErr{error}
   | queryUpdate{queryId, result}
   | mutateOk{mutId, results[]} | mutateErr{mutId, error}
   | subscribeErr{queryId, error}
-  | scheduleOk{schedId} | scheduleErr{schedId, error} | scheduleAck{schedId}
-  | listSchedulesOk{schedules[]}
+  | scheduleOk{scheduleId, id} | scheduleErr{scheduleId, error}
+  | scheduleAck{scheduleId, ok, error?} | listSchedulesOk{scheduleId, schedules[]}
   | pong
-AuthedUser: { kind: "user"|"machine", email?, name?, github_login?, github_id? }
-ScheduleWhen: AfterMs{afterMs} | RunAt{runAt} | Cron{cron}    # tag "type", camelCase
-ScheduleInfo: { id, kind, when, paused, firedCount, lastError?, nextAt? }
+AuthedUser: { kind: "user"|"machine", email?, name?, githubLogin?, githubId? }
+ScheduleWhen: AfterMs{ms} | RunAt{ms} | Cron{expr}    # tag "type"; values "afterMs"/"runAt"/"cron"
+ScheduleInfo: { id, kind, dueAt, cron?, status, lastError?, createdAt, firedCount }
 ```
 
 **Query** — plain model, wire field names **snake_case** (so Python names match the
