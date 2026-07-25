@@ -12,46 +12,6 @@ function Page({ placard, title, lede }: { placard: string; title: string; lede: 
   );
 }
 
-export function MetricsPage() {
-  return (
-    <Page
-      placard="Metrics"
-      title="Live instruments"
-      lede="Connections, subscriptions, the pool, throughput, and uptime — live."
-    />
-  );
-}
-
-export function OpsPage() {
-  return (
-    <Page
-      placard="Op feed"
-      title="Operation feed"
-      lede="Every durable document mutation as it commits."
-    />
-  );
-}
-
-export function ConfigPage() {
-  return (
-    <Page
-      placard="Config"
-      title="Hot configuration"
-      lede="Runtime-mutable knobs (allowed origins, session TTL, max file size) and the admin allowlist."
-    />
-  );
-}
-
-export function AdminsPage() {
-  return (
-    <Page
-      placard="Admins"
-      title="Admin allowlist"
-      lede="The server-wide admin allowlist — who can open this console."
-    />
-  );
-}
-
 export function NotFound() {
   return <Page placard="404" title="Not found" lede="That path is not a known surface." />;
 }

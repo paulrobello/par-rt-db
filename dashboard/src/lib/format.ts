@@ -49,3 +49,18 @@ export function formatNumber(n: number): string {
 export function formatTime(ms: number): string {
   return new Date(ms).toLocaleTimeString(undefined, { hour12: false });
 }
+
+/** Compact human duration from seconds: 1d 3h 4m 5s, trimming leading zero units. */
+export function formatDuration(seconds: number): string {
+  const sec = Math.max(0, Math.floor(seconds));
+  const d = Math.floor(sec / 86400);
+  const h = Math.floor((sec % 86400) / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  const s = sec % 60;
+  const parts: string[] = [];
+  if (d > 0) parts.push(`${d}d`);
+  if (h > 0 || parts.length > 0) parts.push(`${h}h`);
+  if (m > 0 || parts.length > 0) parts.push(`${m}m`);
+  parts.push(`${s}s`);
+  return parts.join(" ");
+}

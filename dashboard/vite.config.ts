@@ -13,8 +13,11 @@ export default defineConfig({
     strictPort: true,
     proxy: {
       "/sync": { target: backend, ws: true, changeOrigin: true },
-      // /admin covers HTTP admin routes AND the /admin/stream WebSocket.
-      "/admin": { target: backend, ws: true, changeOrigin: true },
+      // /admin/... is the control-plane API (+ the /admin/stream WebSocket).
+      // Anchored so it does NOT swallow client routes like /admins (which the
+      // same-origin SPA fallback serves in production; the dev server would
+      // otherwise forward it to the backend and 404).
+      "^/admin($|/)": { target: backend, ws: true, changeOrigin: true },
       "/api": backend,
       "/auth": { target: backend, changeOrigin: true },
       "/storage": backend,

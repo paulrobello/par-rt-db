@@ -6,8 +6,12 @@ import { SessionProvider, useSession } from "./lib/session";
 import { DbPage } from "./pages/DbPage";
 import { DatabasesPage } from "./pages/DatabasesPage";
 import { SchemaPage } from "./pages/SchemaPage";
+import { AdminsPage } from "./pages/AdminsPage";
+import { ConfigPage } from "./pages/ConfigPage";
 import { DataBrowserPage } from "./pages/DataBrowserPage";
-import { AdminsPage, ConfigPage, MetricsPage, NotFound, OpsPage } from "./routes";
+import { MetricsPage } from "./pages/MetricsPage";
+import { OpsPage } from "./pages/OpsPage";
+import { NotFound } from "./routes";
 import { AppShell } from "./shell/AppShell";
 
 function Root() {
