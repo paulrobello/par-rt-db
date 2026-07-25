@@ -48,10 +48,10 @@ The compose stack uses [`pgvector/pgvector:pg17`](https://hub.docker.com/r/pgvec
 (not bare `postgres:17`) — required for vector search (#17), which depends on
 the `pgvector` extension. The server creates the extension idempotently per
 database (`CREATE EXTENSION IF NOT EXISTS vector` in `db::create_database` and
-in `ddl::push_schema`), so the image is the only hard dependency. **A prod
-redeploy is required for vector search to work live**: the image change ships
-with this build but is inert until `docker compose up -d --build` runs on
-lenny2.
+in `ddl::push_schema`), so the image is the only hard dependency. Vector search
+has been live in prod since 2026-07-25 (vector 0.8.5); do not downgrade this
+image to bare `postgres:17`, or vector indexes will fail to compile on schema
+push.
 
 ## Secrets (`/docker/par-rt-db/.env`, not committed)
 
