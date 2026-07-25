@@ -10,7 +10,7 @@ Authoritative design: the spec (`docs/superpowers/specs/2026-07-21-par-rt-db-des
 
 ## Workspace & commands
 
-Three packages run from the root `Makefile`: Rust **server** (`server/`, cargo), **TypeScript client SDK** (`ts-client/`, npm `@par-rt-db/client`, bun), and **Rust client crate** (`rust-client/`, `par-rt-db-client`, cargo). Run `cargo` from `server/` or `rust-client/`, `bun` from `ts-client/`.
+Four packages run from the root `Makefile`: Rust **server** (`server/`, cargo), **TypeScript client SDK** (`ts-client/`, npm `@par-rt-db/client`, bun), **Rust client crate** (`rust-client/`, `par-rt-db-client`, cargo), and the **operator dashboard** (`dashboard/`, Vite + React + TS, bun; a bun workspace that links `@par-rt-db/client` live). Run `cargo` from `server/` or `rust-client/`, `bun` from `ts-client/` or `dashboard/`. The dashboard is the admin/operator console SPA — a dark, realtime "Instrument Manual" UI (databases, schema, live data browser, metrics, op feed, hot config, admin allowlist) served same-origin by the server from `RTDB_STATIC_DIR`; see `dashboard/README.md` and the binding design in `DESIGN.md` / `PRODUCT.md`.
 
 - `make checkall` — the full gate (fmt-check + clippy `-D warnings` + typecheck + tests). **Definition of done; must pass before commit.**
 - `make dev-db-up` / `dev-db-down` — start/stop the dev Postgres on `127.0.0.1:55434`. **Required for any test run** — integration tests hit a real DB.
