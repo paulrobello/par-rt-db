@@ -101,15 +101,7 @@ class _Upsert(_Step):
 #: Discriminated union of all 7 step ops. The ``op`` literal drives dispatch;
 #: ``deny_unknown_fields`` is per-variant via ``extra="forbid"`` on ``_Step``.
 Step = Annotated[
-    (
-        _Insert
-        | _Patch
-        | _Replace
-        | _Delete
-        | _ExpectVersion
-        | _ExpectAbsent
-        | _Upsert
-    ),
+    (_Insert | _Patch | _Replace | _Delete | _ExpectVersion | _ExpectAbsent | _Upsert),
     Field(discriminator="op"),
 ]
 
@@ -184,15 +176,11 @@ class _MutationBuilder:
         self._steps.append(_Insert(table=table, doc=doc))
         return self
 
-    def patch(
-        self, table: str, id: str, fields: dict[str, Any]
-    ) -> _MutationBuilder:
+    def patch(self, table: str, id: str, fields: dict[str, Any]) -> _MutationBuilder:
         self._steps.append(_Patch(table=table, id=id, fields=fields))
         return self
 
-    def replace(
-        self, table: str, id: str, doc: dict[str, Any]
-    ) -> _MutationBuilder:
+    def replace(self, table: str, id: str, doc: dict[str, Any]) -> _MutationBuilder:
         self._steps.append(_Replace(table=table, id=id, doc=doc))
         return self
 
@@ -200,15 +188,11 @@ class _MutationBuilder:
         self._steps.append(_Delete(table=table, id=id))
         return self
 
-    def expect_version(
-        self, table: str, id: str, version: int
-    ) -> _MutationBuilder:
+    def expect_version(self, table: str, id: str, version: int) -> _MutationBuilder:
         self._steps.append(_ExpectVersion(table=table, id=id, version=version))
         return self
 
-    def expect_absent(
-        self, table: str, index: str, eq: list[Any]
-    ) -> _MutationBuilder:
+    def expect_absent(self, table: str, index: str, eq: list[Any]) -> _MutationBuilder:
         self._steps.append(_ExpectAbsent(table=table, index=index, eq=eq))
         return self
 
@@ -233,9 +217,7 @@ class _MutationBuilder:
 
     def build(self) -> Transaction:
         if len(self._steps) > MAX_STEPS:
-            raise ValueError(
-                f"transaction exceeds max {MAX_STEPS} steps"
-            )
+            raise ValueError(f"transaction exceeds max {MAX_STEPS} steps")
         return Transaction(steps=self._steps)
 
 

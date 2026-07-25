@@ -237,9 +237,7 @@ class TableBuilder:
         spec: dict[str, Any] = {"dimensions": dimensions}
         if filter_fields:
             spec["filterFields"] = list(filter_fields)
-        self._indexes.append(
-            {"name": name, "fields": [field], "vector": spec}
-        )
+        self._indexes.append({"name": name, "fields": [field], "vector": spec})
         return self
 
     def owner_field(self, name: str) -> TableBuilder:

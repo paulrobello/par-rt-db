@@ -201,9 +201,7 @@ class TableQuery:
         return self
 
     def paginate(self, *, cursor: str | None = None, num_items: int) -> TableQuery:
-        self._paginate = _Paginate.model_validate(
-            {"cursor": cursor, "numItems": num_items}
-        )
+        self._paginate = _Paginate.model_validate({"cursor": cursor, "numItems": num_items})
         return self
 
     # --- build ---
@@ -217,9 +215,7 @@ class TableQuery:
             or self._count
             or self._paginate is not None
         ):
-            raise ValueError(
-                "get is mutually exclusive with take/unique/first/count/paginate"
-            )
+            raise ValueError("get is mutually exclusive with take/unique/first/count/paginate")
         payload: dict[str, Any] = {"table": self._table}
         if self._get is not None:
             payload["get"] = self._get

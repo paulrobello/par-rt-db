@@ -19,27 +19,43 @@ from par_rt_db.schema import Schema, t
 def test_scalar_and_compound_fields_round_trip():
     schema = (
         Schema.builder()
-        .table("players", lambda tb: tb
-            .field("email", t.string())
-            .field("age", t.number())
-            .field("alive", t.boolean())
-            .field("nick", t.null())
-            .field("ref", t.id("players"))
-            .field("role", t.literal("admin"))
-            .field("tags", t.array(t.string()))
-            .field("meta", t.optional(t.object({"x": t.number()})))
-            .field("mix", t.union([t.string(), t.number()]))
-            .field("kv", t.record(t.number()))
-            .field("raw", t.any())
-            .field("b", t.bytes())
-            .field("big", t.int64())
-            .field("emb", t.vector(8)))
+        .table(
+            "players",
+            lambda tb: (
+                tb.field("email", t.string())
+                .field("age", t.number())
+                .field("alive", t.boolean())
+                .field("nick", t.null())
+                .field("ref", t.id("players"))
+                .field("role", t.literal("admin"))
+                .field("tags", t.array(t.string()))
+                .field("meta", t.optional(t.object({"x": t.number()})))
+                .field("mix", t.union([t.string(), t.number()]))
+                .field("kv", t.record(t.number()))
+                .field("raw", t.any())
+                .field("b", t.bytes())
+                .field("big", t.int64())
+                .field("emb", t.vector(8))
+            ),
+        )
         .build()
     )
     wire = json.loads(schema.model_dump_json(by_alias=True))
     assert set(wire["tables"]["players"]["fields"].keys()) == {
-        "email", "age", "alive", "nick", "ref", "role", "tags",
-        "meta", "mix", "kv", "raw", "b", "big", "emb",
+        "email",
+        "age",
+        "alive",
+        "nick",
+        "ref",
+        "role",
+        "tags",
+        "meta",
+        "mix",
+        "kv",
+        "raw",
+        "b",
+        "big",
+        "emb",
     }
     assert wire["tables"]["players"]["fields"]["email"] == {"type": "string"}
     assert wire["tables"]["players"]["fields"]["ref"] == {"type": "id", "table": "players"}
@@ -50,14 +66,18 @@ def test_scalar_and_compound_fields_round_trip():
 def test_indexes_search_vector_owner_field():
     schema = (
         Schema.builder()
-        .table("boxes", lambda tb: tb
-            .field("status", t.string())
-            .field("owner_id", t.id("players"))
-            .field("embedding", t.vector(4))
-            .index("by_status", ["status"])
-            .search_index("text_idx", ["status"])
-            .vector_index("emb_idx", "embedding", 4, filter_fields=["owner_id"])
-            .owner_field("owner_id"))
+        .table(
+            "boxes",
+            lambda tb: (
+                tb.field("status", t.string())
+                .field("owner_id", t.id("players"))
+                .field("embedding", t.vector(4))
+                .index("by_status", ["status"])
+                .search_index("text_idx", ["status"])
+                .vector_index("emb_idx", "embedding", 4, filter_fields=["owner_id"])
+                .owner_field("owner_id")
+            ),
+        )
         .build()
     )
     wire = json.loads(schema.model_dump_json(by_alias=True))
@@ -78,9 +98,7 @@ def test_plain_index_omits_search_and_vector_keys():
     ``skip_serializing_if`` rules)."""
     schema = (
         Schema.builder()
-        .table("t", lambda tb: tb
-            .field("name", t.string())
-            .index("by_name", ["name"]))
+        .table("t", lambda tb: tb.field("name", t.string()).index("by_name", ["name"]))
         .build()
     )
     wire = json.loads(schema.model_dump_json(by_alias=True))
@@ -91,11 +109,7 @@ def test_plain_index_omits_search_and_vector_keys():
 
 
 def test_table_without_owner_field_omits_ownerField_key():
-    schema = (
-        Schema.builder()
-        .table("t", lambda tb: tb.field("name", t.string()))
-        .build()
-    )
+    schema = Schema.builder().table("t", lambda tb: tb.field("name", t.string())).build()
     wire = json.loads(schema.model_dump_json(by_alias=True))
     assert "ownerField" not in wire["tables"]["t"]
 
@@ -105,9 +119,10 @@ def test_vector_index_without_filter_fields_omits_filterFields():
     (mirrors server's ``Vec::is_empty`` skip rule)."""
     schema = (
         Schema.builder()
-        .table("docs", lambda tb: tb
-            .field("embedding", t.vector(8))
-            .vector_index("by_emb", "embedding", 8))
+        .table(
+            "docs",
+            lambda tb: tb.field("embedding", t.vector(8)).vector_index("by_emb", "embedding", 8),
+        )
         .build()
     )
     wire = json.loads(schema.model_dump_json(by_alias=True))
@@ -136,8 +151,7 @@ def test_nested_compound_field_round_trips():
     """Optional<Union<[string, number]>> survives a full wire round-trip."""
     schema = (
         Schema.builder()
-        .table("things", lambda tb: tb
-            .field("val", t.optional(t.union([t.string(), t.number()]))))
+        .table("things", lambda tb: tb.field("val", t.optional(t.union([t.string(), t.number()]))))
         .build()
     )
     wire = json.loads(schema.model_dump_json(by_alias=True))
@@ -151,12 +165,16 @@ def test_schema_round_trips_through_json_parse():
     """Build → dump_json → parse → model_validate is identity (accepts own output)."""
     schema = (
         Schema.builder()
-        .table("players", lambda tb: tb
-            .field("email", t.string())
-            .field("ref", t.id("players"))
-            .field("emb", t.vector(8))
-            .index("by_email", ["email"])
-            .owner_field("email"))
+        .table(
+            "players",
+            lambda tb: (
+                tb.field("email", t.string())
+                .field("ref", t.id("players"))
+                .field("emb", t.vector(8))
+                .index("by_email", ["email"])
+                .owner_field("email")
+            ),
+        )
         .build()
     )
     dumped = schema.model_dump_json(by_alias=True)

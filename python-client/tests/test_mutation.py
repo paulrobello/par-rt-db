@@ -109,9 +109,7 @@ def test_step_result_variants():
     # StepResult is a Union alias; validate via TypeAdapter.
     sr = TypeAdapter(StepResult)
     # Insert shape: {"id"} only.
-    assert sr.validate_python({"id": "x"}).model_dump(
-        by_alias=True, mode="json"
-    ) == {"id": "x"}
+    assert sr.validate_python({"id": "x"}).model_dump(by_alias=True, mode="json") == {"id": "x"}
     # Upsert shape: {"id", "inserted"} — must win over Insert (richer-first order).
     assert sr.validate_python({"id": "x", "inserted": True}).model_dump(
         by_alias=True, mode="json"

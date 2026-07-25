@@ -249,9 +249,11 @@ def test_server_auth_ok():
 
 
 def test_server_query_update():
-    assert _server_model(
-        {"type": "queryUpdate", "queryId": "q1", "result": []}
-    ) == {"type": "queryUpdate", "queryId": "q1", "result": []}
+    assert _server_model({"type": "queryUpdate", "queryId": "q1", "result": []}) == {
+        "type": "queryUpdate",
+        "queryId": "q1",
+        "result": [],
+    }
 
 
 def test_server_mutate_err_embeds_envelope():
@@ -269,9 +271,7 @@ def test_server_mutate_err_embeds_envelope():
 
 
 def test_server_schedule_ack_ok_omits_error():
-    dumped = _server_model(
-        {"type": "scheduleAck", "scheduleId": "s1", "ok": True}
-    )
+    dumped = _server_model({"type": "scheduleAck", "scheduleId": "s1", "ok": True})
     assert dumped == {"type": "scheduleAck", "scheduleId": "s1", "ok": True}
     assert "error" not in dumped
 
@@ -290,9 +290,11 @@ def test_server_schedule_ack_err_includes_error():
 
 
 def test_server_list_schedules_ok():
-    assert _server_model(
-        {"type": "listSchedulesOk", "scheduleId": "s1", "schedules": []}
-    ) == {"type": "listSchedulesOk", "scheduleId": "s1", "schedules": []}
+    assert _server_model({"type": "listSchedulesOk", "scheduleId": "s1", "schedules": []}) == {
+        "type": "listSchedulesOk",
+        "scheduleId": "s1",
+        "schedules": [],
+    }
 
 
 def test_server_pong():
@@ -301,9 +303,7 @@ def test_server_pong():
 
 def test_server_message_rejects_unknown_fields():
     with pytest.raises(ValidationError):
-        _server_adapter.validate_python(
-            {"type": "pong", "bogus": True}
-        )
+        _server_adapter.validate_python({"type": "pong", "bogus": True})
 
 
 def test_server_mutate_ok_results_passthrough():
@@ -348,9 +348,7 @@ def test_server_subscribe_err():
 
 
 def test_server_schedule_ok():
-    dumped = _server_model(
-        {"type": "scheduleOk", "scheduleId": "s1", "id": "job-9"}
-    )
+    dumped = _server_model({"type": "scheduleOk", "scheduleId": "s1", "id": "job-9"})
     assert dumped == {"type": "scheduleOk", "scheduleId": "s1", "id": "job-9"}
 
 

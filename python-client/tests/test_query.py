@@ -49,9 +49,10 @@ def test_query_index_eq_range_order_take_collect():
 
 
 def test_query_get():
-    assert TableQuery("boxes").get("0123").build().model_dump(
-        by_alias=True, mode="json"
-    ) == {"table": "boxes", "get": "0123"}
+    assert TableQuery("boxes").get("0123").build().model_dump(by_alias=True, mode="json") == {
+        "table": "boxes",
+        "get": "0123",
+    }
 
 
 def test_query_count_and_first_and_unique_terminals():
@@ -94,9 +95,7 @@ def test_query_paginate():
 
 def test_query_filter_uses_op_discriminator():
     # FilterExpr is tagged by `op` (lowercase), NOT `type`.
-    f = _filter_adapter.validate_python(
-        {"op": "eq", "field": "status", "value": "active"}
-    )
+    f = _filter_adapter.validate_python({"op": "eq", "field": "status", "value": "active"})
     q = TableQuery("t").with_index("i").eq("a").filter(f).take(10)
     assert q.build().model_dump(by_alias=True, mode="json")["filter"] == {
         "op": "eq",
@@ -124,16 +123,12 @@ def test_query_vector_search_without_filter():
 
 def test_query_vector_search_filter_is_eq_map():
     # vectorSearch.filter is an eq-map dict (NOT a FilterExpr); omitted when empty.
-    v = TableQuery("t").vector_search(
-        "vidx", [1.0, 2.0], limit=3, filter_={"owner_id": "p1"}
-    )
+    v = TableQuery("t").vector_search("vidx", [1.0, 2.0], limit=3, filter_={"owner_id": "p1"})
     out = v.build().model_dump(by_alias=True, mode="json")["vectorSearch"]
     assert out["filter"] == {"owner_id": "p1"}
     # Empty filter dict is dropped (server's BTreeMap::is_empty skip rule).
     v_empty = TableQuery("t").vector_search("vidx", [1.0], limit=1, filter_={})
-    assert "filter" not in v_empty.build().model_dump(by_alias=True, mode="json")[
-        "vectorSearch"
-    ]
+    assert "filter" not in v_empty.build().model_dump(by_alias=True, mode="json")["vectorSearch"]
 
 
 def test_query_drops_none_fields():
@@ -157,9 +152,7 @@ def test_parse_result_doc_docs_count_paginated():
     assert parse_result(Box, "count", 7) == 7
     first = parse_result(Box, "first", {"id": "9", "status": "a"})
     assert isinstance(first, Box) and first.id == "9"
-    page = parse_result(
-        Box, "paginate", {"docs": [{"id": "1", "status": "a"}], "nextCursor": "C"}
-    )
+    page = parse_result(Box, "paginate", {"docs": [{"id": "1", "status": "a"}], "nextCursor": "C"})
     assert isinstance(page, Paginated) and len(page.docs) == 1 and page.next_cursor == "C"
     page_end = parse_result(Box, "paginate", {"docs": []})
     assert page_end.next_cursor is None
