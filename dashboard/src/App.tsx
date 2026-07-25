@@ -3,15 +3,10 @@ import { Spinner } from "./components/ui";
 import { Login } from "./components/Login";
 import { AdminProvider } from "./lib/admin";
 import { SessionProvider, useSession } from "./lib/session";
-import {
-  AdminsPage,
-  ConfigPage,
-  DatabasesPage,
-  DbPage,
-  MetricsPage,
-  NotFound,
-  OpsPage,
-} from "./routes";
+import { DbPage } from "./pages/DbPage";
+import { DatabasesPage } from "./pages/DatabasesPage";
+import { SchemaPage } from "./pages/SchemaPage";
+import { AdminsPage, ConfigPage, MetricsPage, NotFound, OpsPage, TablePage } from "./routes";
 import { AppShell } from "./shell/AppShell";
 
 function Root() {
@@ -38,6 +33,8 @@ function Root() {
           <Route element={<AppShell />}>
             <Route index element={<DatabasesPage />} />
             <Route path="dbs/:db" element={<DbPage />} />
+            <Route path="dbs/:db/schema" element={<SchemaPage />} />
+            <Route path="dbs/:db/tables/:table" element={<TablePage />} />
             <Route path="metrics" element={<MetricsPage />} />
             <Route path="ops" element={<OpsPage />} />
             <Route path="config" element={<ConfigPage />} />

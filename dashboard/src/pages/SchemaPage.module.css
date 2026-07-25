@@ -1,0 +1,120 @@
+.page {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-4);
+  max-width: 880px;
+}
+
+.title {
+  margin: 0;
+  font-size: var(--t-display);
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+.back {
+  color: var(--accent);
+  font-family: var(--mono);
+  font-size: var(--t-mono-sm);
+}
+
+.tables {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-5);
+}
+
+.tableBlock {
+  border: 1px solid var(--rule);
+  background: var(--surface);
+  padding: var(--sp-4);
+}
+
+.tableHead {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-3);
+  margin-bottom: var(--sp-3);
+  padding-bottom: var(--sp-2);
+  border-bottom: 1px solid var(--rule);
+}
+
+.tableName {
+  margin: 0;
+  font-family: var(--mono);
+  font-size: var(--t-h2);
+  color: var(--ink);
+}
+
+.owner {
+  font-family: var(--mono);
+  font-size: var(--t-mono-sm);
+  color: var(--accent);
+}
+
+.fields {
+  width: 100%;
+  border-collapse: collapse;
+}
+.fields td {
+  padding: var(--sp-1) var(--sp-2);
+  border-bottom: 1px solid var(--rule);
+  font-family: var(--mono);
+  font-size: var(--t-mono-sm);
+  vertical-align: top;
+}
+.fieldName {
+  color: var(--ink);
+  white-space: nowrap;
+}
+.fieldType {
+  color: var(--ink-2);
+}
+
+.indexes {
+  margin-top: var(--sp-3);
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  align-items: center;
+}
+.indexLabel {
+  font-family: var(--mono);
+  font-size: var(--t-mono-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.16em;
+  color: var(--ink-3);
+}
+.index {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-1);
+  font-family: var(--mono);
+  font-size: var(--t-mono-sm);
+  color: var(--ink-2);
+}
+.indexTag {
+  padding: 0 4px;
+  border: 1px solid var(--rule-strong);
+  border-radius: var(--r-1);
+  color: var(--accent);
+  font-size: var(--t-mono-xs);
+}
+.indexName {
+  color: var(--ink);
+}
+.indexFields {
+  color: var(--ink-3);
+}
+
+.error {
+  color: var(--error);
+  font-family: var(--mono);
+  font-size: var(--t-mono-sm);
+}
+
+.empty {
+  color: var(--ink-3);
+  font-family: var(--mono);
+  font-size: var(--t-mono-sm);
+}

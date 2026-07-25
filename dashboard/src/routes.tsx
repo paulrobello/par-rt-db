@@ -12,22 +12,12 @@ function Page({ placard, title, lede }: { placard: string; title: string; lede: 
   );
 }
 
-export function DatabasesPage() {
+export function TablePage() {
   return (
     <Page
-      placard="Databases"
-      title="Databases"
-      lede="Every database on this instance, with its tables and row counts. The data browser loads next."
-    />
-  );
-}
-
-export function DbPage() {
-  return (
-    <Page
-      placard="Database"
-      title="Database"
-      lede="The data browser and schema for this database load next."
+      placard="Data browser"
+      title="Data browser"
+      lede="The live table view, query builder, and mutation composer load next."
     />
   );
 }

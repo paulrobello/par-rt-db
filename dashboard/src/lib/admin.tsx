@@ -7,7 +7,7 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import type { AuthedUser, QueryJson, TransactionJson } from "@par-rt-db/client";
+import type { AuthedUser, QueryJson, SchemaJson, TransactionJson } from "@par-rt-db/client";
 import type { ConnectionState } from "../components/ui";
 import { useSession } from "./session";
 import type {
@@ -73,7 +73,7 @@ export class AdminClient {
     });
   }
   getSchema(db: string) {
-    return this.req<unknown>(`/admin/dbs/${enc(db)}/schema`);
+    return this.req<SchemaJson>(`/admin/dbs/${enc(db)}/schema`);
   }
   getStats(db: string) {
     return this.req<DbStats>(`/admin/dbs/${enc(db)}/stats`);
