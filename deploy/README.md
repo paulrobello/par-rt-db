@@ -53,6 +53,21 @@ has been live in prod since 2026-07-25 (vector 0.8.5); do not downgrade this
 image to bare `postgres:17`, or vector indexes will fail to compile on schema
 push.
 
+## Collation
+
+The cluster initializes with a deterministic, versionless collation
+(`POSTGRES_INITDB_ARGS: "--lc-collate=C --lc-ctype=C.UTF-8"` in the compose files):
+`C` collate carries no libc version, so it cannot trigger the
+collation-version-mismatch warning that `en_US.utf8` raises whenever the image's
+glibc changes. ctype is `C.UTF-8` for UTF-8 charset handling. This applies only to
+a **fresh** (empty) data volume. The existing prod `rtdb-pg` volume was created
+`en_US.utf8`; it is kept warning-free with a one-time
+`ALTER DATABASE rtdb REFRESH COLLATION VERSION` (run 2026-07-25, syncing the
+recorded glibc 2.41 → 2.36). To migrate existing data to `C` proper — so a future
+image glibc bump can never reintroduce the warning — dump the `rtdb` database,
+`docker compose down -v`, `up`, and restore (downtime; not needed while the image
+stays on Debian bookworm / glibc 2.36).
+
 ## Secrets (`/docker/par-rt-db/.env`, not committed)
 
 - `POSTGRES_PASSWORD`, `RTDB_ADMIN_KEY` — `openssl rand -hex 32`. `RTDB_ADMIN_KEY`

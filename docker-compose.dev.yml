@@ -12,6 +12,12 @@ services:
       POSTGRES_USER: rtdb
       POSTGRES_PASSWORD: rtdb
       POSTGRES_DB: rtdb
+      # Deterministic, versionless collation: `C` collate never carries a libc
+      # version, so the cluster is immune to the collation-version-mismatch
+      # warning across image/base-OS glibc upgrades (en_US.utf8 drifts with
+      # glibc and warns). ctype=C.UTF-8 keeps UTF-8 charset handling. Applied
+      # only on a fresh (empty) data volume.
+      POSTGRES_INITDB_ARGS: "--lc-collate=C --lc-ctype=C.UTF-8"
     volumes:
       - rtdb-dev-pg:/var/lib/postgresql/data
     healthcheck:
