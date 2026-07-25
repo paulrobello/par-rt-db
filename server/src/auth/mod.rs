@@ -152,7 +152,9 @@ pub async fn seed_admin_emails(pool: &PgPool, emails: &[String]) -> Result<(), R
 /// `rtdb_auth.admins` by email (lowercased) or GitHub id. Machine principals are
 /// never admin. Used by the admin gate (`admin::require_admin`) and the dashboard
 /// WS bypass (Phase 5). Returns `false` on DB error rather than propagating, so a
-/// transient failure degrades to "not admin" (deny) without an error envelope.
+/// transient failure degrades to "not admin" (deny) without an error envelope —
+/// but the error is logged so a Postgres outage locking out admins is observable
+/// and not silently misdiagnosed as "user is not an admin".
 pub async fn is_admin(pool: &PgPool, principal: &Principal) -> bool {
     let Principal::User {
         email, github_id, ..
@@ -161,17 +163,24 @@ pub async fn is_admin(pool: &PgPool, principal: &Principal) -> bool {
         return false;
     };
     let email = email.to_lowercase();
-    let Ok(exists) = sqlx::query_scalar::<_, bool>(
+    match sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS(SELECT 1 FROM rtdb_auth.admins WHERE email = $1 OR github_id = $2)",
     )
     .bind(&email)
     .bind(*github_id)
     .fetch_one(pool)
     .await
-    else {
-        return false;
-    };
-    exists
+    {
+        Ok(exists) => exists,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                admin_email = %email,
+                "is_admin lookup failed; denying as not-admin (safe default)"
+            );
+            false
+        }
+    }
 }
 
 /// Wire-facing identity for a resolved principal (see `protocol::AuthedUser`).

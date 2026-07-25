@@ -189,13 +189,22 @@ async fn provider_callback<P: OAuthProvider>(
 }
 
 /// Renders the popup-closing HTML the callback returns on success. `token`
-/// is hex (from `random_token()`) and `origin` is copied verbatim from the
-/// validated `oauth_states` entry — never from the callback request itself —
-/// so both interpolations are injection-safe by construction: neither can
-/// contain `"`, `<`, or `>`.
+/// is hex (from `random_token()`) and `origin` was validated at the OAuth start
+/// step (`provider_start`) against the live `allowed_origins`. Both are now
+/// defense-in-depth escaped at this interpolation point, even though:
+///   - `token`'s hex alphabet is naturally string-safe, and
+///   - `origin` must additionally pass the strict `config::origin_is_valid`
+///     parser (ASCII `https?://host[:port]` only, no metacharacters) on every
+///     `PATCH /admin/config`, so an admin-controlled value containing `"`,
+///     `<`, `>`, backtick, or backslash is rejected at write time.
+///
+/// Escaping closes the residual self-XSS breakout (SEC-005) where the prior
+/// comment incorrectly claimed safety by construction.
 fn callback_html_response(token: &str, origin: &str) -> Response {
     let html = format!(
-        "<script>window.opener.postMessage({{type:\"rtdb-auth\",token:\"{token}\"}},\"{origin}\");window.close();</script>"
+        "<script>window.opener.postMessage({{type:\"rtdb-auth\",token:\"{token}\"}},\"{origin}\");window.close();</script>",
+        token = escape_js_string(token),
+        origin = escape_js_string(origin),
     );
 
     let mut response = Html(html).into_response();
@@ -204,6 +213,100 @@ fn callback_html_response(token: &str, origin: &str) -> Response {
         HeaderValue::from_static("default-src 'none'; script-src 'unsafe-inline'"),
     );
     response
+}
+
+/// Escapes `s` for safe interpolation inside a double-quoted JavaScript string
+/// literal within an inline `<script>` block. Covers JS string metacharacters
+/// (`\`, `"`, line terminators — including the U+2028/U+2029 line separators
+/// that break JS but not HTML parsers) and `</` (closes the `<script>` element
+/// even from inside a string literal in the HTML parser's eyes). Used by
+/// `callback_html_response` for the `token` and `origin` interpolations.
+fn escape_js_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{2028}' => out.push_str("\\u2028"),
+            '\u{2029}' => out.push_str("\\u2029"),
+            '<' => out.push_str("\\x3c"),
+            '>' => out.push_str("\\x3e"),
+            '`' => out.push_str("\\`"),
+            '$' => out.push_str("\\$"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod callback_tests {
+    use super::*;
+
+    #[test]
+    fn escape_js_string_passes_through_plain_ascii() {
+        assert_eq!(escape_js_string("abcdef0123"), "abcdef0123");
+    }
+
+    #[test]
+    fn escape_js_string_escapes_each_metacharacter() {
+        // JS string terminators / escape introducer.
+        assert_eq!(escape_js_string("\\"), "\\\\");
+        assert_eq!(escape_js_string("\""), "\\\"");
+        // Line terminators that break JS parsing inside a string literal.
+        assert_eq!(escape_js_string("\n"), "\\n");
+        assert_eq!(escape_js_string("\r"), "\\r");
+        assert_eq!(escape_js_string("\u{2028}"), "\\u2028");
+        assert_eq!(escape_js_string("\u{2029}"), "\\u2029");
+        // HTML `<` / `>` are escaped so a payload can't close the <script>
+        // element from inside a JS string.
+        assert_eq!(escape_js_string("<"), "\\x3c");
+        assert_eq!(escape_js_string(">"), "\\x3e");
+        // Template-literal introducers — harmless inside a double-quoted
+        // literal, but cheap to neutralize defensively.
+        assert_eq!(escape_js_string("`"), "\\`");
+        assert_eq!(escape_js_string("$"), "\\$");
+    }
+
+    #[test]
+    fn escape_js_string_neutralizes_script_breakout_sequence() {
+        // `</script>` inside a JS string still closes the script element in
+        // the HTML parser; escaping `<` and `>` neutralizes it.
+        assert_eq!(escape_js_string("</script>"), "\\x3c/script\\x3e");
+    }
+
+    #[test]
+    fn callback_html_neutralizes_payload_origin() {
+        // Even if a strict-validator regression let this value reach
+        // `callback_html_response`, the escaped output cannot break out of
+        // the JS string or close the <script>. The raw `"];alert(1);//`
+        // breakout becomes `\";alert(1);//` inside the literal.
+        let body = response_body_string(callback_html_response("deadbeef", "\"];alert(1);//"));
+        // The full postMessage call with the ESCAPED origin. If escaping were
+        // missing, the body would contain `},"";alert(1)` (raw quote-quote)
+        // instead of `},"\";alert(1)` (backslash-quote) and this assertion
+        // would fail. Locks down both the escape call and its output shape.
+        assert!(
+            body.contains(r#"},"\";alert(1);//");window.close();</script>"#),
+            "expected escaped payload in body, got: {body}"
+        );
+    }
+
+    fn response_body_string(resp: Response) -> String {
+        // `<script>...</script>` is short, well under axum's default body
+        // limit. Block on the async body collector via a one-shot runtime.
+        let rt = tokio::runtime::Runtime::new().expect("tokio rt for test");
+        let bytes = rt.block_on(async {
+            axum::body::to_bytes(resp.into_body(), 64 * 1024)
+                .await
+                .expect("body bytes")
+                .to_vec()
+        });
+        String::from_utf8(bytes).unwrap_or_default()
+    }
 }
 
 #[derive(serde::Serialize)]

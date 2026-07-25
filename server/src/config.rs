@@ -2,6 +2,16 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::RtDbError;
 
+/// Hard upper bound on `HotConfig::max_file_size`, enforced at boot seed
+/// (`HotConfig::from_env`) and at the upload buffering point
+/// (`http_api::upload_handler`). The hot-config value is admin-mutable via
+/// `PATCH /admin/config`, so without a compile-time ceiling an admin
+/// misconfiguration (or a compromised admin token) could buffer arbitrarily
+/// large blobs into Postgres `bytea`. 100 MiB is 2x the default (50 MiB),
+/// leaving legitimate operator headroom while bounding the worst case
+/// (SEC-008). Raising this is a code change, not a config knob.
+pub(crate) const HARD_MAX_FILE_SIZE: usize = 100 * 1024 * 1024;
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub port: u16,                            // RTDB_PORT, default 8300
@@ -16,6 +26,7 @@ pub struct Config {
     pub google_client_secret: Option<String>, // RTDB_GOOGLE_CLIENT_SECRET
     pub max_affected_docs: usize, // RTDB_MAX_AFFECTED_DOCS, default 100 (admin data-browser guardrail)
     pub static_dir: Option<String>, // RTDB_STATIC_DIR — unset/empty ⇒ API-only (no SPA served)
+    pub pool_max_connections: u32, // RTDB_POOL_MAX_CONNECTIONS, default 75 (multi-tenant; one committer task + N sub re-runs per db)
 }
 
 impl Config {
@@ -54,6 +65,19 @@ impl Config {
             Err(_) => 100,
         };
 
+        // Multi-tenant default (75): the committer-per-db model means each
+        // active database can hold a connection during fan-out re-runs, so
+        // the hardcoded 10 of the original code would saturate at ~11 active
+        // dbs. 75 sits in the 50-100 range the audit recommends, leaving
+        // headroom for concurrent subscription re-runs and HTTP reads
+        // without overcommitting a typical Postgres `max_connections=100`.
+        // A non-parseable or out-of-range value falls back to the default
+        // (matching the `max_affected_docs` parse style).
+        let pool_max_connections = match std::env::var("RTDB_POOL_MAX_CONNECTIONS") {
+            Ok(v) => v.parse::<u32>().unwrap_or(75),
+            Err(_) => 75,
+        };
+
         let static_dir = std::env::var("RTDB_STATIC_DIR")
             .ok()
             .map(|s| s.trim().to_string())
@@ -72,6 +96,7 @@ impl Config {
             google_client_secret,
             max_affected_docs,
             static_dir,
+            pool_max_connections,
         })
     }
 }
@@ -109,6 +134,14 @@ impl HotConfig {
             Ok(v) => v.parse::<usize>().unwrap_or(50 * 1024 * 1024),
             Err(_) => 50 * 1024 * 1024,
         };
+        // Clamp to the hard ceiling — protects against both an oversized
+        // `RTDB_MAX_FILE_SIZE` env seed and (defense-in-depth) any future code
+        // path that mutates `HotConfig` without going through `upload_handler`'s
+        // own clamp (SEC-008). The PATCH handler in admin.rs still accepts
+        // values above this ceiling into the persisted row; `upload_handler`
+        // re-clamps at the buffering point so the on-disk worst case is bounded
+        // regardless of what the persisted row says.
+        let max_file_size = max_file_size.min(HARD_MAX_FILE_SIZE);
         Self {
             allowed_origins,
             session_ttl_days,
@@ -116,13 +149,64 @@ impl HotConfig {
         }
     }
 
-    /// True when every origin parses as a valid `HeaderValue` (the CORS layer
-    /// would otherwise silently skip a malformed origin at request time).
+    /// True when every origin is a strict `scheme://host[:port]` URL with no
+    /// characters that could break out of the OAuth callback's JS string
+    /// interpolation (`"`, `<`, `>`, backtick, backslash). The CORS layer would
+    /// silently skip a malformed origin at request time, but the OAuth callback
+    /// HTML (`provider::callback_html_response`) interpolates each origin into a
+    /// JS string literal, so the validator must reject any metacharacter that
+    /// could escape that context — `HeaderValue::from_str` alone permits `"`,
+    /// `<`, `>`, which is insufficient (SEC-005). Defense in depth: even after
+    /// this check, `callback_html_response` JS-escapes its interpolations.
     pub fn origins_valid(&self) -> bool {
-        self.allowed_origins
-            .iter()
-            .all(|o| axum::http::HeaderValue::from_str(o).is_ok())
+        self.allowed_origins.iter().all(|o| origin_is_valid(o))
     }
+}
+
+/// Strict per-origin validation for `HotConfig::origins_valid`. Accepts only
+/// `http(s)://host[:port]` — ASCII host of letters/digits/dot/hyphen, optional
+/// `:`port of digits. Rejects any metacharacter (`"`, `<`, `>`, backtick,
+/// backslash) that could break out of the OAuth callback's JS string context,
+/// and any path/query/fragment (origins are authority-only by CORS contract).
+pub(crate) fn origin_is_valid(origin: &str) -> bool {
+    // Reject any byte that could break out of a JS string literal or HTML
+    // context, plus control bytes. This guard is load-bearing even when the
+    // structural parse below rejects the same input — defense in depth against
+    // future relaxations of the structural rule.
+    if origin
+        .bytes()
+        .any(|b| matches!(b, b'"' | b'<' | b'>' | b'`' | b'\\' | 0x00..=0x1f | 0x7f))
+    {
+        return false;
+    }
+    let rest = match origin
+        .strip_prefix("https://")
+        .or_else(|| origin.strip_prefix("http://"))
+    {
+        Some(rest) => rest,
+        None => return false,
+    };
+    if rest.is_empty() {
+        return false;
+    }
+    // Optional `:port`. Split on the last `:` if present; the host portion must
+    // not contain a colon either way.
+    let (host, port) = match rest.rfind(':') {
+        Some(idx) => (&rest[..idx], Some(&rest[idx + 1..])),
+        None => (rest, None),
+    };
+    if host.is_empty() || host.bytes().any(|b| !is_host_byte(b)) {
+        return false;
+    }
+    match port {
+        None => true,
+        Some(p) if p.bytes().all(|b| b.is_ascii_digit()) => !p.is_empty(),
+        Some(_) => false,
+    }
+}
+
+fn is_host_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'.' || b == b'-'
 }
 
 /// Loads the single persisted hot row, if any. A missing row is `Ok(None)`
@@ -154,4 +238,60 @@ pub async fn save_hot(pool: &sqlx::PgPool, hot: &HotConfig) -> Result<(), RtDbEr
     .await
     .map_err(|e| RtDbError::internal(format!("save rtdb_config: {e}")))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn origin_is_valid_accepts_https_and_http_with_and_without_port() {
+        assert!(origin_is_valid("https://example.com"));
+        assert!(origin_is_valid("http://localhost:3000"));
+        assert!(origin_is_valid("https://app.example.com:8443"));
+        assert!(origin_is_valid("http://127.0.0.1:8080"));
+    }
+
+    #[test]
+    fn origin_is_valid_rejects_metacharacters_that_break_js_strings() {
+        // Each of these is the SEC-005 self-XSS payload class.
+        assert!(!origin_is_valid(
+            "https://example.com\"];alert(document.domain);//"
+        ));
+        assert!(!origin_is_valid("https://example.com\""));
+        assert!(!origin_is_valid("https://example.com<"));
+        assert!(!origin_is_valid("https://example.com>"));
+        assert!(!origin_is_valid("https://example.com`"));
+        assert!(!origin_is_valid("https://example.com\\"));
+    }
+
+    #[test]
+    fn origin_is_valid_rejects_missing_scheme_and_paths() {
+        assert!(!origin_is_valid("example.com"));
+        assert!(!origin_is_valid("ftp://example.com"));
+        assert!(!origin_is_valid("https://example.com/"));
+        assert!(!origin_is_valid("https://example.com/path"));
+        assert!(!origin_is_valid("https://example.com?q=1"));
+        assert!(!origin_is_valid(""));
+    }
+
+    #[test]
+    fn origin_is_valid_rejects_invalid_host_and_port() {
+        assert!(!origin_is_valid("https://"));
+        assert!(!origin_is_valid("https://exa mple.com"));
+        assert!(!origin_is_valid("https://example.com:abc"));
+        assert!(!origin_is_valid("https://example.com:"));
+    }
+
+    #[test]
+    fn origins_valid_aggregates_per_origin() {
+        let mut hot = HotConfig {
+            allowed_origins: vec!["https://a.com".into(), "https://b.com".into()],
+            session_ttl_days: 30,
+            max_file_size: 1024,
+        };
+        assert!(hot.origins_valid());
+        hot.allowed_origins.push("https://c.com\"".into());
+        assert!(!hot.origins_valid());
+    }
 }

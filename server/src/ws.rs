@@ -444,49 +444,37 @@ async fn handle_text_frame(
             false
         }
         ClientMessage::CancelSchedule { schedule_id, id } => {
-            let (ok, error) = match authorize(&state.pool, principal, db).await {
-                Ok(()) => match scheduler::cancel(&state.pool, db, &id).await {
-                    Ok(ok) => (ok, None),
-                    Err(error) => (false, Some(error)),
-                },
-                Err(error) => (false, Some(error)),
-            };
-            let _ = out_tx.send(ServerMessage::ScheduleAck {
+            run_simple_schedule(
+                state,
+                principal,
+                db,
+                out_tx,
                 schedule_id,
-                ok,
-                error,
-            });
-            false
+                scheduler::cancel(&state.pool, db, &id),
+            )
+            .await
         }
         ClientMessage::PauseSchedule { schedule_id, id } => {
-            let (ok, error) = match authorize(&state.pool, principal, db).await {
-                Ok(()) => match scheduler::set_paused(&state.pool, db, &id, true).await {
-                    Ok(ok) => (ok, None),
-                    Err(error) => (false, Some(error)),
-                },
-                Err(error) => (false, Some(error)),
-            };
-            let _ = out_tx.send(ServerMessage::ScheduleAck {
+            run_simple_schedule(
+                state,
+                principal,
+                db,
+                out_tx,
                 schedule_id,
-                ok,
-                error,
-            });
-            false
+                scheduler::set_paused(&state.pool, db, &id, true),
+            )
+            .await
         }
         ClientMessage::ResumeSchedule { schedule_id, id } => {
-            let (ok, error) = match authorize(&state.pool, principal, db).await {
-                Ok(()) => match scheduler::set_paused(&state.pool, db, &id, false).await {
-                    Ok(ok) => (ok, None),
-                    Err(error) => (false, Some(error)),
-                },
-                Err(error) => (false, Some(error)),
-            };
-            let _ = out_tx.send(ServerMessage::ScheduleAck {
+            run_simple_schedule(
+                state,
+                principal,
+                db,
+                out_tx,
                 schedule_id,
-                ok,
-                error,
-            });
-            false
+                scheduler::set_paused(&state.pool, db, &id, false),
+            )
+            .await
         }
         ClientMessage::ListSchedules { schedule_id } => {
             let reply = match authorize(&state.pool, principal, db).await {
@@ -503,6 +491,38 @@ async fn handle_text_frame(
             false
         }
     }
+}
+
+/// Helper for the three structurally-identical WS schedule arms
+/// (CancelSchedule / PauseSchedule / ResumeSchedule): `authorize → call
+/// scheduler::{cancel|set_paused} → build ScheduleAck → send` (QA-005). The
+/// caller passes the un-awaited scheduler future (constructed at the call
+/// site); the helper awaits it only after `authorize` succeeds, matching the
+/// original per-arm control flow exactly. The schedule family never carried
+/// the admin bypass, so this helper preserves the existing `authorize`-only
+/// gate (no `is_admin`); SEC-004's per-op `is_admin` re-run stays in the
+/// Subscribe/Mutate arms above and is unaffected by this extraction.
+async fn run_simple_schedule<'a>(
+    state: &'a AppState,
+    principal: &'a Principal,
+    db: &'a str,
+    out_tx: &'a UnboundedSender<ServerMessage>,
+    schedule_id: String,
+    action: impl std::future::Future<Output = Result<bool, RtDbError>> + Send + 'a,
+) -> bool {
+    let (ok, error) = match authorize(&state.pool, principal, db).await {
+        Ok(()) => match action.await {
+            Ok(ok) => (ok, None),
+            Err(error) => (false, Some(error)),
+        },
+        Err(error) => (false, Some(error)),
+    };
+    let _ = out_tx.send(ServerMessage::ScheduleAck {
+        schedule_id,
+        ok,
+        error,
+    });
+    false
 }
 
 /// Sends `AuthErr { error }` (best-effort) then closes the socket with a

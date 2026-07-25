@@ -291,7 +291,12 @@ async fn upload_handler(
     authorize(&state.pool, &principal, &db).await?;
     storage::ensure_table(&state.pool, &db).await?; // revive storage for old dbs
 
-    let limit = state.hot.load().max_file_size;
+    // `max_file_size` is admin-mutable via PATCH /admin/config; clamp to the
+    // compile-time HARD_MAX_FILE_SIZE so a misconfigured persisted row (or a
+    // compromised admin token) cannot buffer arbitrarily large blobs into
+    // Postgres bytea. The bearer is already authorized above; clamp ordering
+    // preserves the auth-before-buffering invariant (SEC-008).
+    let limit = crate::config::HARD_MAX_FILE_SIZE.min(state.hot.load().max_file_size);
     let bytes = axum::body::to_bytes(request.into_body(), limit)
         .await
         .map_err(|_| RtDbError::bad_request("upload exceeds max file size"))?;

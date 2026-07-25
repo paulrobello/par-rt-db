@@ -138,6 +138,15 @@ impl Committers {
             db.to_string(),
             tx.clone(),
         ));
+        // Per-db dedup-row expiry sweep (ARC-007): owns `mutation_log`'s
+        // periodic DELETE so `mutation_log::check` is a pure SELECT on the
+        // hot path. Exits when the committer channel closes (same lifecycle
+        // signal the scheduler task uses).
+        tokio::spawn(mutation_log::run_cleanup(
+            self.pool.clone(),
+            db.to_string(),
+            tx.clone(),
+        ));
         guard.insert(db.to_string(), tx.clone());
         Ok(tx)
     }
@@ -432,10 +441,15 @@ async fn handle_subscribe(
     let schema = ctx.schemas.get(&ctx.pool, &ctx.db).await?;
     let result = execute_query(&ctx.pool, &ctx.db, &schema, &query, owner.as_deref()).await?;
     let last = canonical(&result);
-    let value = serde_json::to_value(&result).unwrap_or_else(|err| {
-        tracing::error!(error = %err, "failed to serialize initial query result");
-        serde_json::Value::Null
-    });
+    // Mirror `subs::fan_out`: a serialization failure is logged and surfaced
+    // as an internal error so the subscriber sees an explicit error rather
+    // than a silently-pushed `{"result": null}` (QA-004). In practice
+    // `QueryResult` has only serializable leaves, so this never fires today —
+    // but the failure shape is no longer silent.
+    let value = serde_json::to_value(&result).map_err(|err| {
+        tracing::error!(error = %err, db = %ctx.db, "failed to serialize initial query result");
+        RtDbError::internal("failed to serialize initial query result")
+    })?;
 
     if tx
         .send(ServerMessage::QueryUpdate {

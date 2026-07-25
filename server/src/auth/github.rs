@@ -123,7 +123,7 @@ impl OAuthProvider for GithubProvider {
                 RtDbError::internal("github email fetch failed")
             })?;
 
-        let email = select_email(&user.email, &emails)
+        let email = select_email(&emails)
             .ok_or_else(|| RtDbError::forbidden("no verified email"))?
             .to_lowercase();
 
@@ -240,7 +240,6 @@ struct TokenExchangeRequest<'a> {
 struct GithubUser {
     id: i64,
     login: String,
-    email: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -265,17 +264,20 @@ fn parse_token_response(value: serde_json::Value) -> Result<String, RtDbError> {
     }
 }
 
-/// Picks the best email from a GitHub profile: the primary verified address,
-/// falling back to any verified address, then to the profile-level email.
-/// Mirrors GitHub's own recommended selection order. Returns the address
-/// before lowercasing; the caller normalizes case.
-fn select_email(profile_email: &Option<String>, emails: &[GithubEmail]) -> Option<String> {
+/// Picks the best verified email from a GitHub profile: the primary verified
+/// address if any, otherwise any verified address. The unverified profile-level
+/// `email` field on the user object is deliberately NOT consulted — GitHub's
+/// `emails` endpoint is the verified source of truth and always returns one
+/// verified entry for a real account; falling back to the unverified profile
+/// email would let an attacker set a victim's address as their public profile
+/// email and be admitted if GitHub ever returned an empty `emails` array.
+/// Returns the address before lowercasing; the caller normalizes case.
+fn select_email(emails: &[GithubEmail]) -> Option<String> {
     emails
         .iter()
         .find(|e| e.primary && e.verified)
         .or_else(|| emails.iter().find(|e| e.verified))
         .map(|e| e.email.clone())
-        .or_else(|| profile_email.clone())
 }
 
 #[cfg(test)]
@@ -310,7 +312,7 @@ mod tests {
             },
         ];
         assert_eq!(
-            select_email(&None, &emails),
+            select_email(&emails),
             Some("primary@example.com".to_string())
         );
     }
@@ -322,28 +324,25 @@ mod tests {
             primary: false,
             verified: true,
         }];
-        assert_eq!(
-            select_email(&None, &emails),
-            Some("only@example.com".to_string())
-        );
+        assert_eq!(select_email(&emails), Some("only@example.com".to_string()));
     }
 
     #[test]
-    fn select_email_falls_back_to_profile_email_when_none_verified() {
+    fn select_email_returns_none_when_none_verified() {
+        // Security: unverified entries must never be admitted, even if the only
+        // candidate is the primary. Regression guard for the dropped
+        // profile-email fallback (SEC-006).
         let emails = vec![GithubEmail {
             email: "unverified@example.com".into(),
             primary: true,
             verified: false,
         }];
-        assert_eq!(
-            select_email(&Some("profile@example.com".into()), &emails),
-            Some("profile@example.com".to_string())
-        );
+        assert_eq!(select_email(&emails), None);
     }
 
     #[test]
     fn select_email_returns_none_when_no_email_anywhere() {
-        assert_eq!(select_email(&None, &[]), None);
+        assert_eq!(select_email(&[]), None);
     }
 
     #[test]
@@ -379,6 +378,7 @@ mod tests {
             google_client_secret: None,
             max_affected_docs: 100,
             static_dir: None,
+            pool_max_connections: 75,
         };
         assert!(GithubProvider::from_config(&cfg).is_none());
         cfg.github_client_id = Some("id".into());

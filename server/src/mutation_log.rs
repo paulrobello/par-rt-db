@@ -26,20 +26,15 @@ pub async fn ensure_table(pool: &PgPool, db: &str) -> Result<(), RtDbError> {
     Ok(())
 }
 
-/// Deletes `db`'s expired dedup entries, then looks up `mut_id`. `Some` means
-/// this exact mutation already ran and its results should be replayed as-is,
-/// with no re-execution and no fan-out. `None` means it's safe to execute.
+/// Looks up `mut_id` in `db`'s dedup table. `Some` means this exact mutation
+/// already ran and its results should be replayed as-is, with no re-execution
+/// and no fan-out. `None` means it's safe to execute. Pure SELECT — expiry of
+/// stale rows is owned by `run_cleanup`, spawned once per db by the committer
+/// (ARC-007), so the dedup-opted-in mutation hot path no longer pays a
+/// `DELETE` write-acquire on every call.
 pub async fn check(pool: &PgPool, db: &str, mut_id: &str) -> Result<Option<Vec<Value>>, RtDbError> {
     validate_db_name(db)?;
     let schema = pg_schema(db);
-    let now = now_ms();
-
-    sqlx::query(&format!(
-        "DELETE FROM \"{schema}\".mutations WHERE expires_at < $1"
-    ))
-    .bind(now)
-    .execute(pool)
-    .await?;
 
     let row: Option<(Value,)> = sqlx::query_as(&format!(
         "SELECT result FROM \"{schema}\".mutations WHERE mut_id = $1"
@@ -59,6 +54,61 @@ pub async fn check(pool: &PgPool, db: &str, mut_id: &str) -> Result<Option<Vec<V
         None => Ok(None),
     }
 }
+
+/// Deletes `db`'s expired dedup entries. Called only by the per-db background
+/// cleanup task spawned in `committer::Committers::channel_for` (ARC-007) —
+/// not on the mutation hot path. At-least-once semantics: a row may briefly
+/// outlive its `expires_at` until the next cleanup tick, which is harmless
+/// (a replay after TTL merely re-reads a slightly-still-cached result).
+pub async fn cleanup_expired(pool: &PgPool, db: &str) -> Result<(), RtDbError> {
+    validate_db_name(db)?;
+    let schema = pg_schema(db);
+    let now = now_ms();
+    sqlx::query(&format!(
+        "DELETE FROM \"{schema}\".mutations WHERE expires_at < $1"
+    ))
+    .bind(now)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Periodic background loop that drains expired dedup rows for one database.
+/// Spawns alongside `scheduler::run_scheduler` per db (see
+/// `committer::Committers::channel_for`). Exits when the committer channel
+/// closes — same lifecycle signal the scheduler uses (`committer_tx.closed()`
+/// resolves when the per-db committer task, the sole `Receiver` owner, dies)
+/// — so a dying committer task takes its cleanup task with it and the next
+/// request respawns both.
+pub async fn run_cleanup(
+    pool: PgPool,
+    db: String,
+    committer_tx: tokio::sync::mpsc::Sender<crate::committer::CommitterRequest>,
+) {
+    // Re-use the table-ensure idempotently so a database created before this
+    // table existed (or a schema where the table was dropped) is covered.
+    if let Err(err) = ensure_table(&pool, &db).await {
+        tracing::error!(db = %db, error = %err, "mutation_log cleanup: ensure_table failed");
+    }
+    let mut tick = tokio::time::interval(CLEANUP_INTERVAL);
+    tick.tick().await; // interval's first tick fires immediately; skip it
+    loop {
+        tokio::select! {
+            _ = tick.tick() => {
+                if let Err(err) = cleanup_expired(&pool, &db).await {
+                    tracing::warn!(db = %db, error = %err, "mutation_log cleanup failed");
+                }
+            }
+            _ = committer_tx.closed() => {
+                tracing::debug!(db = %db, "mutation_log cleanup: committer channel closed, exiting");
+                return;
+            }
+        }
+    }
+}
+
+/// How often `run_cleanup` sweeps expired dedup rows for one database.
+const CLEANUP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Caches `results` under `mut_id` for `ttl_ms`. Uses `ON CONFLICT DO NOTHING`
 /// as a safety net only — the per-db committer already serializes every

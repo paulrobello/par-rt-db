@@ -19,11 +19,14 @@ use crate::txn::Transaction;
 use crate::{AppState, auth, db, ddl, snapshot};
 
 /// Who an admin request was made as: the raw admin key (CLI/automation) or an
-/// OAuth user on the server-wide admin allowlist (browser dashboard).
-#[allow(dead_code)] // `User`'s payload is consumed by Task 3's admin routes.
+/// OAuth user on the server-wide admin allowlist (browser dashboard). The
+/// `User` variant is unit today — admin activity is currently attributed only
+/// through the op-feed's `owner` field (which is `None` for admin writes); if
+/// per-principal audit logging is added later, thread the resolved `Principal`
+/// back in here.
 pub(crate) enum AdminPrincipal {
     Key,
-    User(auth::Principal),
+    User,
 }
 
 fn bearer_value(headers: &HeaderMap) -> Result<&str, RtDbError> {
@@ -71,7 +74,7 @@ pub(crate) async fn authenticate_admin(
         Err(_) => return Err(RtDbError::unauthorized("invalid admin credential")),
     };
     if auth::is_admin(&state.pool, &principal).await {
-        Ok(AdminPrincipal::User(principal))
+        Ok(AdminPrincipal::User)
     } else {
         Err(RtDbError::forbidden("not a dashboard admin"))
     }

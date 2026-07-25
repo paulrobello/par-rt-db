@@ -155,6 +155,216 @@ pub struct PaginatedResult {
     pub next_cursor: Option<String>,
 }
 
+// ============ Validation cascade infrastructure (QA-002) ============
+//
+// The validation cascade in `execute_query` is a sequence of "if terminal X is
+// set AND peer Y is set → BadRequest" guards. Each terminal historically carried
+// its own hand-written if-chain, so adding a terminal meant adding 5–10 clauses
+// across server + TS — exactly the drift that produced QA-001 (the TS `get`
+// guard omitted `filter`/`search`/`vectorSearch`).
+//
+// The infrastructure below lets each terminal DECLARE its incompatible peers;
+// `execute_query` consults the active terminal's list once. Adding a terminal is
+// now a one-line addition to the relevant const table, and the cross-client
+// combination-matrix test (`server/tests/query_combinations.rs` and its TS
+// mirror `ts-client/tests/query_combinations.test.ts`) catches any drift.
+//
+// Behavior-preserving: same peers checked, same messages emitted, same
+// first-match-wins ordering as the pre-refactor inline cascade.
+
+/// A `Query` field that can participate in a combination-rejection rule. Each
+/// variant wraps the "is this field set?" predicate for one field, so peer lists
+/// read as data instead of being inlined as boolean chains.
+#[derive(Copy, Clone)]
+enum Peer {
+    Get,
+    Index,
+    Eq,
+    Gt,
+    Gte,
+    Lt,
+    Lte,
+    Order,
+    Take,
+    Unique,
+    First,
+    Count,
+    Paginate,
+    Filter,
+    Search,
+    VectorSearch,
+}
+
+impl Peer {
+    fn is_set(self, q: &Query) -> bool {
+        match self {
+            Self::Get => q.get.is_some(),
+            Self::Index => q.index.is_some(),
+            Self::Eq => !q.eq.is_empty(),
+            Self::Gt => q.gt.is_some(),
+            Self::Gte => q.gte.is_some(),
+            Self::Lt => q.lt.is_some(),
+            Self::Lte => q.lte.is_some(),
+            Self::Order => q.order.is_some(),
+            Self::Take => q.take.is_some(),
+            Self::Unique => q.unique,
+            Self::First => q.first,
+            Self::Count => q.count,
+            Self::Paginate => q.paginate.is_some(),
+            Self::Filter => q.filter.is_some(),
+            Self::Search => q.search.is_some(),
+            Self::VectorSearch => q.vector_search.is_some(),
+        }
+    }
+}
+
+/// A peer that conflicts with a terminal, plus the message to emit when it's
+/// set. Per-peer entries let a terminal emit different messages for different
+/// peers (matching the pre-refactor cascade's per-peer messages for
+/// `first`/`count`/`paginate`).
+struct Incompatible {
+    peer: Peer,
+    message: &'static str,
+}
+
+/// Aggregate-message helper: if ANY of `peers` is set on `q`, return
+/// `BadRequest(message)`. Used by terminals whose pre-refactor check emitted a
+/// single message regardless of which peer was set (`get`, `unique`,
+/// `vector_search`, `search`).
+fn reject_if_any_set(q: &Query, peers: &[Peer], message: &str) -> Result<(), RtDbError> {
+    if peers.iter().any(|p| p.is_set(q)) {
+        return Err(RtDbError::bad_request(message));
+    }
+    Ok(())
+}
+
+/// Per-peer helper: for each entry in `entries` (in declaration order), if its
+/// peer is set on `q`, return `BadRequest(entry.message)`. Used by terminals
+/// whose pre-refactor check emitted peer-specific messages (`first`, `count`,
+/// `paginate`). Declaration order preserves the original cascade's
+/// first-match-wins ordering, so the same combination produces the same message.
+fn reject_per_peer_set(q: &Query, entries: &[Incompatible]) -> Result<(), RtDbError> {
+    for entry in entries {
+        if entry.peer.is_set(q) {
+            return Err(RtDbError::bad_request(entry.message));
+        }
+    }
+    Ok(())
+}
+
+// Per-terminal incompatible-peer tables. Order within each table mirrors the
+// pre-refactor cascade's check order.
+
+const GET_PEERS: &[Peer] = &[
+    Peer::Index,
+    Peer::Eq,
+    Peer::Gt,
+    Peer::Gte,
+    Peer::Lt,
+    Peer::Lte,
+    Peer::Order,
+    Peer::Take,
+    Peer::Unique,
+    Peer::First,
+    Peer::Count,
+    Peer::Paginate,
+    Peer::Filter,
+    Peer::Search,
+    Peer::VectorSearch,
+];
+const GET_MESSAGE: &str = "get cannot be combined with index, eq, range bounds, order, take, unique, first, count, paginate, filter, search, or vector search";
+
+const UNIQUE_PEERS: &[Peer] = &[Peer::Take, Peer::Order];
+const UNIQUE_MESSAGE: &str = "unique cannot be combined with take or order";
+
+const FIRST_INCOMPATIBLES: &[Incompatible] = &[
+    Incompatible {
+        peer: Peer::Unique,
+        message: "first cannot be combined with unique",
+    },
+    Incompatible {
+        peer: Peer::Take,
+        message: "first cannot be combined with take",
+    },
+];
+
+const COUNT_INCOMPATIBLES: &[Incompatible] = &[
+    Incompatible {
+        peer: Peer::Unique,
+        message: "count cannot be combined with unique",
+    },
+    Incompatible {
+        peer: Peer::Take,
+        message: "count cannot be combined with take",
+    },
+    Incompatible {
+        peer: Peer::First,
+        message: "count cannot be combined with first",
+    },
+    Incompatible {
+        peer: Peer::Order,
+        message: "count cannot be combined with order",
+    },
+];
+
+const PAGINATE_INCOMPATIBLES: &[Incompatible] = &[
+    Incompatible {
+        peer: Peer::Get,
+        message: "paginate cannot be combined with get",
+    },
+    Incompatible {
+        peer: Peer::Count,
+        message: "paginate cannot be combined with count",
+    },
+    Incompatible {
+        peer: Peer::Unique,
+        message: "paginate cannot be combined with unique",
+    },
+    Incompatible {
+        peer: Peer::First,
+        message: "paginate cannot be combined with first",
+    },
+    Incompatible {
+        peer: Peer::Take,
+        message: "paginate cannot be combined with take",
+    },
+];
+
+const VECTOR_SEARCH_PEERS: &[Peer] = &[
+    Peer::Index,
+    Peer::Eq,
+    Peer::Gt,
+    Peer::Gte,
+    Peer::Lt,
+    Peer::Lte,
+    Peer::Order,
+    Peer::Unique,
+    Peer::First,
+    Peer::Count,
+    Peer::Paginate,
+    Peer::Filter,
+    Peer::Search,
+    Peer::Take,
+];
+const VECTOR_SEARCH_MESSAGE: &str = "vectorSearch cannot be combined with any other terminal";
+
+const SEARCH_PEERS: &[Peer] = &[
+    Peer::Index,
+    Peer::Eq,
+    Peer::Gt,
+    Peer::Gte,
+    Peer::Lt,
+    Peer::Lte,
+    Peer::Order,
+    Peer::Unique,
+    Peer::First,
+    Peer::Count,
+    Peer::Paginate,
+    Peer::Filter,
+    Peer::VectorSearch,
+];
+const SEARCH_MESSAGE: &str = "search cannot be combined with index, eq, range bounds, order, unique, first, count, paginate, filter, or vector search";
+
 /// Result docs = stored doc merged with {"_id", "_creationTime", "_version"}.
 /// get: point SELECT, null if missing. unique: error PreconditionFailed "unique query matched
 /// multiple documents" if >1 row, null if 0. eq len may be a PREFIX of index fields (0..=all),
@@ -188,89 +398,24 @@ pub async fn execute_query(
     let owner_field = table_def.owner_field.as_deref();
 
     if let Some(id) = &q.get {
-        if q.index.is_some()
-            || !q.eq.is_empty()
-            || q.gt.is_some()
-            || q.gte.is_some()
-            || q.lt.is_some()
-            || q.lte.is_some()
-            || q.order.is_some()
-            || q.take.is_some()
-            || q.unique
-            || q.first
-            || q.count
-            || q.paginate.is_some()
-            || q.filter.is_some()
-            || q.search.is_some()
-            || q.vector_search.is_some()
-        {
-            return Err(RtDbError::bad_request(
-                "get cannot be combined with index, eq, range bounds, order, take, unique, first, count, paginate, filter, search, or vector search",
-            ));
-        }
+        reject_if_any_set(q, GET_PEERS, GET_MESSAGE)?;
         return point_read(pool, db, &q.table, id, owner_field, owner).await;
     }
 
-    if q.unique && (q.take.is_some() || q.order.is_some()) {
-        return Err(RtDbError::bad_request(
-            "unique cannot be combined with take or order",
-        ));
+    if q.unique {
+        reject_if_any_set(q, UNIQUE_PEERS, UNIQUE_MESSAGE)?;
     }
 
-    if q.first && q.unique {
-        return Err(RtDbError::bad_request(
-            "first cannot be combined with unique",
-        ));
-    }
-    if q.first && q.take.is_some() {
-        return Err(RtDbError::bad_request("first cannot be combined with take"));
+    if q.first {
+        reject_per_peer_set(q, FIRST_INCOMPATIBLES)?;
     }
 
-    if q.count && q.unique {
-        return Err(RtDbError::bad_request(
-            "count cannot be combined with unique",
-        ));
-    }
-    if q.count && q.take.is_some() {
-        return Err(RtDbError::bad_request("count cannot be combined with take"));
-    }
-    if q.count && q.first {
-        return Err(RtDbError::bad_request(
-            "count cannot be combined with first",
-        ));
-    }
-    if q.count && q.order.is_some() {
-        return Err(RtDbError::bad_request(
-            "count cannot be combined with order",
-        ));
+    if q.count {
+        reject_per_peer_set(q, COUNT_INCOMPATIBLES)?;
     }
 
     if q.paginate.is_some() {
-        if q.get.is_some() {
-            return Err(RtDbError::bad_request(
-                "paginate cannot be combined with get",
-            ));
-        }
-        if q.count {
-            return Err(RtDbError::bad_request(
-                "paginate cannot be combined with count",
-            ));
-        }
-        if q.unique {
-            return Err(RtDbError::bad_request(
-                "paginate cannot be combined with unique",
-            ));
-        }
-        if q.first {
-            return Err(RtDbError::bad_request(
-                "paginate cannot be combined with first",
-            ));
-        }
-        if q.take.is_some() {
-            return Err(RtDbError::bad_request(
-                "paginate cannot be combined with take",
-            ));
-        }
+        reject_per_peer_set(q, PAGINATE_INCOMPATIBLES)?;
     }
 
     if q.gt.is_some() && q.gte.is_some() {
@@ -292,25 +437,7 @@ pub async fn execute_query(
     // carries its own `limit` and does not compose with `take` (or anything
     // else). Resolution and bind construction live in `execute_vector_search`.
     if let Some(vs) = &q.vector_search {
-        if q.index.is_some()
-            || !q.eq.is_empty()
-            || q.gt.is_some()
-            || q.gte.is_some()
-            || q.lt.is_some()
-            || q.lte.is_some()
-            || q.order.is_some()
-            || q.unique
-            || q.first
-            || q.count
-            || q.paginate.is_some()
-            || q.filter.is_some()
-            || q.search.is_some()
-            || q.take.is_some()
-        {
-            return Err(RtDbError::bad_request(
-                "vectorSearch cannot be combined with any other terminal",
-            ));
-        }
+        reject_if_any_set(q, VECTOR_SEARCH_PEERS, VECTOR_SEARCH_MESSAGE)?;
         return execute_vector_search(pool, db, table_def, &q.table, vs, owner_field, owner).await;
     }
 
@@ -318,24 +445,7 @@ pub async fn execute_query(
     // incompatible with every index-based terminal; `take` (already capped) is
     // the only field it composes with.
     if let Some(search) = &q.search {
-        if q.index.is_some()
-            || !q.eq.is_empty()
-            || q.gt.is_some()
-            || q.gte.is_some()
-            || q.lt.is_some()
-            || q.lte.is_some()
-            || q.order.is_some()
-            || q.unique
-            || q.first
-            || q.count
-            || q.paginate.is_some()
-            || q.filter.is_some()
-            || q.vector_search.is_some()
-        {
-            return Err(RtDbError::bad_request(
-                "search cannot be combined with index, eq, range bounds, order, unique, first, count, paginate, filter, or vector search",
-            ));
-        }
+        reject_if_any_set(q, SEARCH_PEERS, SEARCH_MESSAGE)?;
         return execute_search(
             pool,
             db,
@@ -774,6 +884,17 @@ fn build_cursor_conditions(
     Ok((format!("({})", branches.join(" OR ")), binds))
 }
 
+/// Pushes `bind` onto `binds` and returns its 1-based SQL placeholder (`$N`),
+/// where `N = start_pos + binds.len()` evaluated BEFORE the push. Every
+/// placeholder emission in `compile_filter`/`compile_filter_node` routes through
+/// here so the offset arithmetic has one source of truth instead of being
+/// inlined (with the "compute pos, then push" ordering) across each leaf.
+fn push_filter_bind(start_pos: usize, binds: &mut Vec<EqBind>, bind: EqBind) -> String {
+    let placeholder = format!("${}", start_pos + binds.len());
+    binds.push(bind);
+    placeholder
+}
+
 /// Compiles a `filter` into a fully-parenthesized SQL predicate plus its typed
 /// binds, with `$n` placeholders numbered from 1-based `start_pos`. Every leaf
 /// emits at least one bind, so the fragment is never empty.
@@ -841,8 +962,8 @@ fn compile_filter_node(
                 ));
             }
             let (lhs, first_bind) = field_lhs_and_bind(field, &values[0], table)?;
-            let mut placeholders: Vec<String> = vec![format!("${}", start_pos + binds.len())];
-            binds.push(first_bind);
+            let mut placeholders: Vec<String> =
+                vec![push_filter_bind(start_pos, binds, first_bind)];
             for value in &values[1..] {
                 let (this_lhs, bind) = field_lhs_and_bind(field, value, table)?;
                 if this_lhs != lhs {
@@ -850,8 +971,7 @@ fn compile_filter_node(
                         "in filter values must all be the same type",
                     ));
                 }
-                placeholders.push(format!("${}", start_pos + binds.len()));
-                binds.push(bind);
+                placeholders.push(push_filter_bind(start_pos, binds, bind));
             }
             Ok(format!("{lhs} IN ({})", placeholders.join(", ")))
         }
@@ -868,9 +988,8 @@ fn compile_comparison(
     binds: &mut Vec<EqBind>,
 ) -> Result<String, RtDbError> {
     let (lhs, bind) = field_lhs_and_bind(field, value, table)?;
-    let pos = start_pos + binds.len();
-    binds.push(bind);
-    Ok(format!("{lhs} {op} ${pos}"))
+    let placeholder = push_filter_bind(start_pos, binds, bind);
+    Ok(format!("{lhs} {op} {placeholder}"))
 }
 
 /// Resolves a filter field to its SQL left-hand side and types the comparison

@@ -14,7 +14,16 @@ async fn main() {
     });
 
     let pool = PgPoolOptions::new()
-        .max_connections(10)
+        .max_connections(config.pool_max_connections)
+        // A small warm pool keeps first-of-burst requests off the connect
+        // critical path; the committer-per-db model holds connections during
+        // fan-out re-runs so a non-zero floor reduces latency variance.
+        .min_connections(5)
+        // Fail fast under saturation (the sqlx default is 30s, which is a
+        // long stall before the eventual `PoolAcquireTimeout` surfaces). 10s
+        // is long enough to ride out a brief fan-out spike, short enough that
+        // a saturated pool surfaces a diagnosable error to the client.
+        .acquire_timeout(std::time::Duration::from_secs(10))
         .connect(&config.database_url)
         .await
         .unwrap_or_else(|err| {

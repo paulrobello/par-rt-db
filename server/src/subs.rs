@@ -56,13 +56,30 @@ struct SubEntry {
 /// One database's subscriptions, keyed by `(connection, queryId)`.
 type DbSubs = HashMap<(ConnId, String), SubEntry>;
 
-/// Registered live-query subscriptions, keyed by database then by
-/// `(connection, queryId)`. `register` and `fan_out` are called only from the
-/// per-db committer task (see `committer.rs`), which serializes them against
-/// every mutation; `remove`/`remove_conn` may be called from anywhere (e.g.
-/// connection teardown).
+/// Registered live-query subscriptions, sharded per database. Each database's
+/// subscriptions live behind its own `Arc<Mutex<DbSubs>>`, so a per-db
+/// committer's `fan_out` (a Postgres re-run per affected subscription) holds
+/// ONLY its own shard lock — it does not collide with other databases' writes,
+/// subscribes, or teardowns. The outer `Mutex<HashMap<..>>` is acquired only
+/// long enough to look up or insert the target shard's `Arc` (an in-memory
+/// op with no I/O), then dropped before any per-shard lock is taken.
+///
+/// `register` and `fan_out` are called only from the per-db committer task
+/// (see `committer.rs`), which serializes them against every mutation;
+/// `remove`/`remove_conn` may be called from anywhere (e.g. connection
+/// teardown).
+///
+/// Lock discipline: the outer lock is NEVER held while waiting on an inner
+/// shard lock — every path drops outer before taking inner, so there is no
+/// lock-ordering cycle. Empty shards are RETAINED (lazy) rather than evicted
+/// under a second lock acquire: evicting a now-empty shard would race a
+/// concurrent `register` that already cloned this same Arc (before the
+/// eviction) and would orphan its subscription — `fan_out` would no longer
+/// find the shard. Shard count is bounded by the number of databases (each
+/// persistent), and an empty shard is a single empty HashMap, so retaining
+/// them costs nothing measurable.
 pub struct SubscriptionManager {
-    subs: Mutex<HashMap<String, DbSubs>>,
+    subs: Mutex<HashMap<String, Arc<Mutex<DbSubs>>>>,
 }
 
 impl SubscriptionManager {
@@ -72,30 +89,59 @@ impl SubscriptionManager {
         })
     }
 
-    pub async fn remove(&self, db: &str, conn: ConnId, query_id: &str) {
+    /// Get-or-insert the shard for `db` (used by `register`). The outer lock
+    /// is held only across the entry API; the returned `Arc` clones out.
+    async fn shard_insert(&self, db: &str) -> Arc<Mutex<DbSubs>> {
         let mut guard = self.subs.lock().await;
-        if let Some(db_subs) = guard.get_mut(db) {
-            db_subs.remove(&(conn, query_id.to_string()));
-            if db_subs.is_empty() {
-                guard.remove(db);
-            }
-        }
+        guard
+            .entry(db.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(HashMap::new())))
+            .clone()
+    }
+
+    /// Clone the shard `Arc` for `db` if it exists (used by `remove`,
+    /// `remove_conn`, `fan_out`). The outer lock is held only across the get.
+    async fn shard_get(&self, db: &str) -> Option<Arc<Mutex<DbSubs>>> {
+        let guard = self.subs.lock().await;
+        guard.get(db).cloned()
+    }
+
+    pub async fn remove(&self, db: &str, conn: ConnId, query_id: &str) {
+        let Some(shard) = self.shard_get(db).await else {
+            return;
+        };
+        let mut db_subs = shard.lock().await;
+        db_subs.remove(&(conn, query_id.to_string()));
+        // Empty shard is retained (lazy) — see the struct doc. Evicting here
+        // would orphan a concurrently-registered subscription.
     }
 
     pub async fn remove_conn(&self, db: &str, conn: ConnId) {
-        let mut guard = self.subs.lock().await;
-        if let Some(db_subs) = guard.get_mut(db) {
-            db_subs.retain(|(c, _), _| *c != conn);
-            if db_subs.is_empty() {
-                guard.remove(db);
-            }
-        }
+        let Some(shard) = self.shard_get(db).await else {
+            return;
+        };
+        let mut db_subs = shard.lock().await;
+        db_subs.retain(|(c, _), _| *c != conn);
+        // Empty shard is retained (lazy) — see the struct doc.
     }
 
     /// Total active subscriptions across all databases (a dashboard gauge).
+    /// Approximate by design — each shard is locked individually after the
+    /// outer map is released, so a subscribe/unsubscribe racing this call can
+    /// shift the count by one. That is acceptable for a metrics gauge and
+    /// avoids holding the outer lock while waiting on every shard's inner
+    /// lock (which would re-introduce the global serialization ARC-001
+    /// removed).
     pub async fn count(&self) -> usize {
-        let guard = self.subs.lock().await;
-        guard.values().map(|db_subs| db_subs.len()).sum()
+        let shards: Vec<Arc<Mutex<DbSubs>>> = {
+            let guard = self.subs.lock().await;
+            guard.values().cloned().collect()
+        };
+        let mut total = 0;
+        for shard in shards {
+            total += shard.lock().await.len();
+        }
+        total
     }
 
     /// Registers a subscription that has already sent its initial
@@ -118,8 +164,9 @@ impl SubscriptionManager {
         owner: Option<String>,
     ) {
         let read_set = ReadSet::from_query(&query);
-        let mut guard = self.subs.lock().await;
-        guard.entry(db.to_string()).or_default().insert(
+        let shard = self.shard_insert(db).await;
+        let mut db_subs = shard.lock().await;
+        db_subs.insert(
             (conn, query_id),
             SubEntry {
                 query,
@@ -144,10 +191,15 @@ impl SubscriptionManager {
         schema: &SchemaDef,
         write_set: &WriteSet,
     ) {
-        let mut guard = self.subs.lock().await;
-        let Some(db_subs) = guard.get_mut(db) else {
+        // Clone the shard Arc out under the outer lock, then drop the outer
+        // guard before the per-subscription re-runs. This is the heart of
+        // ARC-001: the re-runs (each a Postgres round-trip) hold only this
+        // db's shard lock, never the global map lock, so a slow `fan_out` on
+        // db A cannot stall writes/subscribes/teardowns on db B.
+        let Some(shard) = self.shard_get(db).await else {
             return;
         };
+        let mut db_subs = shard.lock().await;
 
         for ((_, query_id), entry) in db_subs.iter_mut() {
             if !write_set.tables.contains(&entry.query.table) {

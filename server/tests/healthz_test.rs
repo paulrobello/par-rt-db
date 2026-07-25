@@ -16,6 +16,7 @@ fn test_config() -> Config {
         google_client_secret: None,
         max_affected_docs: 100,
         static_dir: None,
+        pool_max_connections: 75,
     }
 }
 

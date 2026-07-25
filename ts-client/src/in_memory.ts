@@ -768,11 +768,14 @@ export class InMemoryRtDbClient {
         q.unique ||
         q.first ||
         q.count ||
-        q.paginate !== undefined
+        q.paginate !== undefined ||
+        q.filter !== undefined ||
+        q.search !== undefined ||
+        q.vectorSearch !== undefined
       ) {
         throw new RtDbError(
           "BAD_REQUEST",
-          "get cannot be combined with index, eq, range bounds, order, take, unique, first, count, or paginate",
+          "get cannot be combined with index, eq, range bounds, order, take, unique, first, count, paginate, filter, search, or vector search",
         );
       }
       const row = this.rowsFor(q.table).get(q.get);
@@ -825,6 +828,63 @@ export class InMemoryRtDbClient {
     }
     if (q.take !== undefined && q.take > MAX_TAKE) {
       throw new RtDbError("BAD_REQUEST", `take exceeds maximum of ${MAX_TAKE}`);
+    }
+
+    // Vector-similarity terminal. Cascade mirror of server `execute_query`:
+    // `vectorSearch` carries its own `limit` and does not compose with any other
+    // terminal (including `take`). The in-memory replica does not rank by vector
+    // distance, but the guard exists so the cascade agrees with the server —
+    // callers learn about invalid combinations here instead of silently getting
+    // the wrong (unranked) result and then a 400 from the real server.
+    if (q.vectorSearch !== undefined) {
+      if (
+        q.index !== undefined ||
+        eq.length > 0 ||
+        hasRange ||
+        q.order !== undefined ||
+        q.unique ||
+        q.first ||
+        q.count ||
+        q.paginate !== undefined ||
+        q.filter !== undefined ||
+        q.search !== undefined ||
+        q.take !== undefined
+      ) {
+        throw new RtDbError(
+          "BAD_REQUEST",
+          "vectorSearch cannot be combined with any other terminal",
+        );
+      }
+      // No in-memory vector ranking; return an empty result rather than silently
+      // misranking by falling through to the collect path.
+      return [];
+    }
+
+    // Full-text search terminal. Cascade mirror of server `execute_query`:
+    // `search` composes only with `take`; every other terminal is rejected. The
+    // in-memory replica does not rank by ts_rank, but the guard exists so the
+    // cascade agrees with the server.
+    if (q.search !== undefined) {
+      if (
+        q.index !== undefined ||
+        eq.length > 0 ||
+        hasRange ||
+        q.order !== undefined ||
+        q.unique ||
+        q.first ||
+        q.count ||
+        q.paginate !== undefined ||
+        q.filter !== undefined ||
+        q.vectorSearch !== undefined
+      ) {
+        throw new RtDbError(
+          "BAD_REQUEST",
+          "search cannot be combined with index, eq, range bounds, order, unique, first, count, paginate, filter, or vector search",
+        );
+      }
+      // No in-memory full-text ranking; return an empty result rather than
+      // silently misranking by falling through to the collect path.
+      return [];
     }
 
     const indexDef: IndexJson | null = q.index
