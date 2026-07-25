@@ -45,3 +45,7 @@ export function formatBytes(n: number): string {
 export function formatNumber(n: number): string {
   return n.toLocaleString();
 }
+
+export function formatTime(ms: number): string {
+  return new Date(ms).toLocaleTimeString(undefined, { hour12: false });
+}

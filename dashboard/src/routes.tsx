@@ -12,16 +12,6 @@ function Page({ placard, title, lede }: { placard: string; title: string; lede: 
   );
 }
 
-export function TablePage() {
-  return (
-    <Page
-      placard="Data browser"
-      title="Data browser"
-      lede="The live table view, query builder, and mutation composer load next."
-    />
-  );
-}
-
 export function MetricsPage() {
   return (
     <Page
