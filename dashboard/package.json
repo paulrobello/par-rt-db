@@ -1,0 +1,33 @@
+{
+  "name": "@par-rt-db/dashboard",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --port 8310 --strictPort",
+    "dev:bg": "vite --port 8310 --strictPort &",
+    "build": "bun run build:sdk && vite build",
+    "build:sdk": "cd ../ts-client && bun run build",
+    "preview": "vite preview --port 8310 --strictPort",
+    "typecheck": "tsc --noEmit",
+    "lint": "biome lint src",
+    "fmt": "biome format --write src",
+    "fmt-check": "biome format src",
+    "test": "vitest run --passWithNoTests"
+  },
+  "dependencies": {
+    "@par-rt-db/client": "workspace:*",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "react-router-dom": "^6.28.0"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.5.4",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^4.3.4",
+    "typescript": "^5.7.0",
+    "vite": "^6.0.11",
+    "vitest": "^3.2.6"
+  }
+}

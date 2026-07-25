@@ -1,0 +1,67 @@
+/* Instrument Manual — design tokens. Authoritative description: /DESIGN.md */
+:root {
+  color-scheme: dark;
+
+  /* Panel surfaces */
+  --panel: #0d0e10;
+  --surface: #141619;
+  --inset: #0a0b0d;
+
+  /* Hairlines */
+  --rule: rgba(231, 233, 234, 0.1);
+  --rule-strong: rgba(231, 233, 234, 0.16);
+
+  /* Ink */
+  --ink: #e7e9ea;
+  --ink-2: #9aa0a6;
+  --ink-3: #5f656d;
+
+  /* Accent — the live / active register (phosphor green) */
+  --accent: #3dd68c;
+  --accent-dim: #2a9d68;
+  --accent-soft: rgba(61, 214, 140, 0.14);
+
+  /* Status — encoded meaning only */
+  --warn: #f5a524;
+  --error: #f4515e;
+  --ok: var(--accent);
+
+  /* Type families */
+  --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+
+  /* Spacing — 4px base */
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 24px;
+  --sp-6: 32px;
+  --sp-7: 48px;
+  --sp-8: 64px;
+
+  /* Radii — squared / micro only */
+  --r-1: 2px;
+  --r-2: 4px;
+
+  /* Type scale */
+  --t-mono-xs: 11px;
+  --t-mono-sm: 12px;
+  --t-mono-md: 13px;
+  --t-label: 12px;
+  --t-body: 14px;
+  --t-h3: 15px;
+  --t-h2: 16px;
+  --t-h1: 20px;
+  --t-display: 26px;
+
+  /* Motion (material, bounded) */
+  --tick: 400ms;
+  --pulse: 2.4s;
+  --ease: cubic-bezier(0.2, 0.7, 0.2, 1);
+
+  /* Z-layers */
+  --z-rail: 10;
+  --z-sticky: 20;
+  --z-overlay: 100;
+}
