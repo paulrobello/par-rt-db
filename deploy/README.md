@@ -59,14 +59,14 @@ The cluster initializes with a deterministic, versionless collation
 (`POSTGRES_INITDB_ARGS: "--lc-collate=C --lc-ctype=C.UTF-8"` in the compose files):
 `C` collate carries no libc version, so it cannot trigger the
 collation-version-mismatch warning that `en_US.utf8` raises whenever the image's
-glibc changes. ctype is `C.UTF-8` for UTF-8 charset handling. This applies only to
-a **fresh** (empty) data volume. The existing prod `rtdb-pg` volume was created
-`en_US.utf8`; it is kept warning-free with a one-time
-`ALTER DATABASE rtdb REFRESH COLLATION VERSION` (run 2026-07-25, syncing the
-recorded glibc 2.41 → 2.36). To migrate existing data to `C` proper — so a future
-image glibc bump can never reintroduce the warning — dump the `rtdb` database,
-`docker compose down -v`, `up`, and restore (downtime; not needed while the image
-stays on Debian bookworm / glibc 2.36).
+glibc changes. ctype is `C.UTF-8` for UTF-8 charset handling. This applies to a
+**fresh** (empty) data volume. **Prod was migrated to `C` on 2026-07-25**: the
+original `en_US.utf8` `rtdb-pg` volume was `pg_dump`ed, wiped
+(`docker compose down -v`), re-initialized, and `pg_restore`d — every schema
+(`kanban`, `hackzors`, `kanban_dev`, `vecsmoke`, `rtdb_auth`) round-tripped with
+matching row counts. To migrate any other existing `en_US.utf8` volume to `C`:
+`pg_dump -Fc` the `rtdb` database, `docker compose down -v`, `up`, `pg_restore`
+(downtime; keep the verified dump + a volume tarball as safety nets).
 
 ## Secrets (`/docker/par-rt-db/.env`, not committed)
 
