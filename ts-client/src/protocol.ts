@@ -110,8 +110,15 @@ export interface TransactionJson {
   steps: StepJson[];
 }
 
+/**
+ * Whether an `AuthedUser` resolved from an interactive OAuth session or a
+ * per-database machine token. Mirrors server `protocol::UserKind` (ARC-009):
+ * narrows the prior unbounded `string` so TS consumers get exhaustiveness.
+ */
+export type AuthedUserKind = "user" | "machine";
+
 export interface AuthedUser {
-  kind: string;
+  kind: AuthedUserKind;
   email?: string | null;
   name?: string | null;
   /** GitHub login. Absent on the wire for machine tokens / non-GitHub users. */

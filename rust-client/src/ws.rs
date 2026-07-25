@@ -21,6 +21,9 @@ use crate::mutation::{StepResult, Transaction};
 use crate::query::Query;
 use crate::wire::{AuthedUser, ClientMessage, ScheduleInfo, ScheduleWhen, ServerMessage};
 
+#[cfg(test)]
+use crate::wire::{ScheduleKind, ScheduleStatus};
+
 use futures_util::{Sink, SinkExt, StreamExt};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
@@ -1540,10 +1543,10 @@ mod tests {
                 schedule_id: "sch-5".into(),
                 schedules: vec![ScheduleInfo {
                     id: "job-1".into(),
-                    kind: "cron".into(),
+                    kind: ScheduleKind::Cron,
                     due_at: 9000,
                     cron: Some("*/5 * * * *".into()),
-                    status: "pending".into(),
+                    status: ScheduleStatus::Pending,
                     last_error: None,
                     created_at: 1000,
                     fired_count: 0,

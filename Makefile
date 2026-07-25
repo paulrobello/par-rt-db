@@ -5,6 +5,7 @@ DEPLOY_PATH = /docker/par-rt-db
 
 .PHONY: build test lint fmt fmt-check typecheck checkall dev-db-up dev-db-down \
 	pre-commit pre-commit-update ts-client-build ts-client-install dashboard-install \
+	dashboard-test \
 	python-client-install python-client-test python-client-lint python-client-fmt \
 	python-client-typecheck python-client-checkall deploy
 
@@ -66,6 +67,9 @@ ts-client-install:
 dashboard-install:
 	bun install
 	cd dashboard && bun install
+
+dashboard-test:
+	cd dashboard && bun run test
 
 python-client-install:
 	cd python-client && uv sync

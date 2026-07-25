@@ -8,7 +8,7 @@ use sqlx::PgPool;
 
 use crate::db::{now_ms, sha256_hex};
 use crate::error::RtDbError;
-use crate::protocol::AuthedUser;
+use crate::protocol::{AuthedUser, UserKind};
 
 /// Who is making a request: a per-database machine token, or a
 /// GitHub-authenticated user session.
@@ -180,7 +180,7 @@ pub async fn is_admin(pool: &PgPool, principal: &Principal) -> bool {
 pub fn authed_user(p: &Principal) -> AuthedUser {
     match p {
         Principal::Machine { .. } => AuthedUser {
-            kind: "machine".to_string(),
+            kind: UserKind::Machine,
             email: None,
             name: None,
             github_login: None,
@@ -193,7 +193,7 @@ pub fn authed_user(p: &Principal) -> AuthedUser {
             github_login,
             ..
         } => AuthedUser {
-            kind: "user".to_string(),
+            kind: UserKind::User,
             email: Some(email.clone()),
             name: name.clone(),
             github_login: github_login.clone(),
@@ -213,7 +213,7 @@ mod tests {
             token_id: "t".to_string(),
         };
         let user = authed_user(&principal);
-        assert_eq!(user.kind, "machine");
+        assert_eq!(user.kind, UserKind::Machine);
         assert_eq!(user.email, None);
         assert_eq!(user.name, None);
     }
@@ -229,7 +229,7 @@ mod tests {
             github_login: None,
         };
         let user = authed_user(&principal);
-        assert_eq!(user.kind, "user");
+        assert_eq!(user.kind, UserKind::User);
         assert_eq!(user.email, Some("a@b.com".to_string()));
         assert_eq!(user.name, Some("Alice".to_string()));
         assert_eq!(user.github_id, None);

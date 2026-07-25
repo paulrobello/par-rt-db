@@ -1,7 +1,7 @@
 # Vector Search (#17) — Design
 
 **Date:** 2026-07-23
-**Status:** Design (pre-implementation)
+**Status:** Implemented — live and verified in production on `rtdb.pardev.net` as of 2026-07-25 (FEATURE_MATRIX #17 ✅). `pgvector/pgvector:pg17` (vector 0.8.5) in both dev and prod. Mirrored end-to-end: server + `ts-client` + `rust-client` ship `t.vector(n)` / `vectorIndex(...)` / `.vector_search(...)`; `python-client` ships `t.vector(n)` / `vector_index(...)` / `TableQuery.vector_search(...)`. Current source of truth: `server/src/query.rs` (terminal), `server/src/schema.rs` (`FieldType::Vector`, `VectorIndexSpec`), `server/src/ddl.rs` (`vector(N)` column + HNSW index), and FEATURE_MATRIX #17.
 **Parent:** `docs/superpowers/specs/2026-07-21-par-rt-db-design.md`, `FEATURE_MATRIX.md` row #17
 **Precedent:** Full-text search (#11) — this feature mirrors its shape end to end.
 

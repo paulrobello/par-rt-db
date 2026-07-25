@@ -108,10 +108,46 @@ pub enum ServerMessage {
     Pong,
 }
 
+/// Whether an `AuthedUser` resolved from an OAuth session or a machine token.
+/// Mirrors `server/src/protocol.rs::UserKind` (ARC-004/QA-008): serializes as
+/// `"user"` / `"machine"`, byte-identical to the prior `String` form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UserKind {
+    User,
+    Machine,
+}
+
+impl UserKind {
+    pub fn as_wire_str(&self) -> &'static str {
+        match self {
+            UserKind::User => "user",
+            UserKind::Machine => "machine",
+        }
+    }
+}
+
+impl From<UserKind> for &'static str {
+    fn from(k: UserKind) -> &'static str {
+        k.as_wire_str()
+    }
+}
+
+impl std::str::FromStr for UserKind {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "user" => Ok(UserKind::User),
+            "machine" => Ok(UserKind::Machine),
+            other => Err(format!("unknown UserKind: {other}")),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AuthedUser {
-    pub kind: String,
+    pub kind: UserKind,
     pub email: Option<String>,
     pub name: Option<String>,
     /// GitHub login. Absent on the wire for machine tokens / non-GitHub
@@ -137,6 +173,85 @@ pub enum ScheduleWhen {
     Cron { expr: String },
 }
 
+/// Whether a scheduled job fires once or repeats on cron. Mirrors
+/// `server/src/protocol.rs::ScheduleKind` (ARC-004/QA-008): serializes as
+/// `"oneshot"` / `"cron"`, byte-identical to the prior `String` form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScheduleKind {
+    Oneshot,
+    Cron,
+}
+
+impl ScheduleKind {
+    pub fn as_wire_str(&self) -> &'static str {
+        match self {
+            ScheduleKind::Oneshot => "oneshot",
+            ScheduleKind::Cron => "cron",
+        }
+    }
+}
+
+impl From<ScheduleKind> for &'static str {
+    fn from(k: ScheduleKind) -> &'static str {
+        k.as_wire_str()
+    }
+}
+
+impl std::str::FromStr for ScheduleKind {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "oneshot" => Ok(ScheduleKind::Oneshot),
+            "cron" => Ok(ScheduleKind::Cron),
+            other => Err(format!("unknown ScheduleKind: {other}")),
+        }
+    }
+}
+
+/// Lifecycle state of a scheduled job. Mirrors
+/// `server/src/protocol.rs::ScheduleStatus` (ARC-004/QA-008): serializes as
+/// `"pending"` / `"running"` / `"paused"` / `"error"`, byte-identical to the
+/// prior `String` form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScheduleStatus {
+    Pending,
+    Running,
+    Paused,
+    Error,
+}
+
+impl ScheduleStatus {
+    pub fn as_wire_str(&self) -> &'static str {
+        match self {
+            ScheduleStatus::Pending => "pending",
+            ScheduleStatus::Running => "running",
+            ScheduleStatus::Paused => "paused",
+            ScheduleStatus::Error => "error",
+        }
+    }
+}
+
+impl From<ScheduleStatus> for &'static str {
+    fn from(s: ScheduleStatus) -> &'static str {
+        s.as_wire_str()
+    }
+}
+
+impl std::str::FromStr for ScheduleStatus {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "pending" => Ok(ScheduleStatus::Pending),
+            "running" => Ok(ScheduleStatus::Running),
+            "paused" => Ok(ScheduleStatus::Paused),
+            "error" => Ok(ScheduleStatus::Error),
+            other => Err(format!("unknown ScheduleStatus: {other}")),
+        }
+    }
+}
+
 /// A scheduled job's public view (returned by `listSchedules`). `cron` and
 /// `last_error` are omitted on the wire when absent. Mirrors
 /// `server/src/protocol.rs::ScheduleInfo`.
@@ -144,11 +259,11 @@ pub enum ScheduleWhen {
 #[serde(rename_all = "camelCase")]
 pub struct ScheduleInfo {
     pub id: String,
-    pub kind: String, // "oneshot" | "cron"
+    pub kind: ScheduleKind,
     pub due_at: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cron: Option<String>,
-    pub status: String, // "pending" | "running" | "paused" | "error"
+    pub status: ScheduleStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
     pub created_at: i64,
@@ -363,7 +478,7 @@ mod tests {
     fn server_message_tags_and_fields() {
         let ok = serde_json::to_value(ServerMessage::AuthOk {
             user: AuthedUser {
-                kind: "user".into(),
+                kind: UserKind::User,
                 email: Some("a@b.com".into()),
                 name: None,
                 github_login: None,
@@ -744,10 +859,10 @@ mod tests {
     fn schedule_info_round_trip_omits_absent_optionals() {
         let oneshot = ScheduleInfo {
             id: "j1".into(),
-            kind: "oneshot".into(),
+            kind: ScheduleKind::Oneshot,
             due_at: 1000,
             cron: None,
-            status: "pending".into(),
+            status: ScheduleStatus::Pending,
             last_error: None,
             created_at: 500,
             fired_count: 0,
@@ -766,10 +881,10 @@ mod tests {
         );
         let cron = ScheduleInfo {
             id: "j2".into(),
-            kind: "cron".into(),
+            kind: ScheduleKind::Cron,
             due_at: 2000,
             cron: Some("*/5 * * * *".into()),
-            status: "error".into(),
+            status: ScheduleStatus::Error,
             last_error: Some("boom".into()),
             created_at: 500,
             fired_count: 3,

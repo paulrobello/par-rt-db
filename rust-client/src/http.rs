@@ -692,6 +692,7 @@ mod tests {
     use super::*;
     use crate::mutation::Mutation;
     use crate::query::TableQuery;
+    use crate::wire::UserKind;
     use serde_json::{Value, json};
     use wiremock::matchers::{body_bytes, body_partial_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -925,7 +926,7 @@ mod tests {
             .mount(&server)
             .await;
         let user = client.auth_me().await.unwrap();
-        assert_eq!(user.kind, "user");
+        assert_eq!(user.kind, UserKind::User);
         assert_eq!(user.email.as_deref(), Some("a@b.com"));
     }
 
@@ -952,7 +953,7 @@ mod tests {
             .validate_session_token("player-session-token")
             .await
             .unwrap();
-        assert_eq!(user.kind, "user");
+        assert_eq!(user.kind, UserKind::User);
         assert_eq!(user.email.as_deref(), Some("player@example.com"));
         assert_eq!(user.github_login.as_deref(), Some("player"));
         assert_eq!(user.github_id, Some(42));
@@ -989,7 +990,7 @@ mod tests {
             .mount(&server)
             .await;
         let user = client.validate_session_token("mach-tok").await.unwrap();
-        assert_eq!(user.kind, "machine");
+        assert_eq!(user.kind, UserKind::Machine);
         assert_eq!(user.github_login, None);
         assert_eq!(user.github_id, None);
     }

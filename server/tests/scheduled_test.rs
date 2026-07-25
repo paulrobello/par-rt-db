@@ -16,6 +16,7 @@ use rtdb_server::committer::Committers;
 use rtdb_server::db::SchemaCache;
 use rtdb_server::ddl;
 use rtdb_server::op_feed::OpFeed;
+use rtdb_server::protocol::{ScheduleKind, ScheduleStatus};
 use rtdb_server::query::{Query, QueryResult, execute_query};
 use rtdb_server::scheduler;
 use rtdb_server::schema::SchemaDef;
@@ -57,8 +58,8 @@ async fn insert_list_cancel_roundtrip() {
     let listed = scheduler::list(&pool, &db).await.unwrap();
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].id, id);
-    assert_eq!(listed[0].kind, "oneshot");
-    assert_eq!(listed[0].status, "pending");
+    assert_eq!(listed[0].kind, ScheduleKind::Oneshot);
+    assert_eq!(listed[0].status, ScheduleStatus::Pending);
     assert_eq!(listed[0].due_at, 123);
 
     assert!(scheduler::cancel(&pool, &db, &id).await.unwrap());
@@ -78,7 +79,7 @@ async fn pause_resume_cron_recomputes_due() {
 
     assert!(scheduler::set_paused(&pool, &db, &id, true).await.unwrap());
     let info = &scheduler::list(&pool, &db).await.unwrap()[0];
-    assert_eq!(info.status, "paused");
+    assert_eq!(info.status, ScheduleStatus::Paused);
     // A paused job must not be claimed even if due_at is in the past.
     let claimed = scheduler::claim_due(&pool, &db, i64::MAX, scheduler::CLAIM_BATCH)
         .await
@@ -87,7 +88,7 @@ async fn pause_resume_cron_recomputes_due() {
 
     assert!(scheduler::set_paused(&pool, &db, &id, false).await.unwrap());
     let info = &scheduler::list(&pool, &db).await.unwrap()[0];
-    assert_eq!(info.status, "pending");
+    assert_eq!(info.status, ScheduleStatus::Pending);
     assert!(info.due_at > 1); // recomputed forward from now
 }
 
@@ -121,7 +122,7 @@ async fn claim_due_and_finalize() {
     assert_eq!(listed.len(), 1); // one-shot deleted, cron remains
     assert_eq!(listed[0].id, cron);
     assert_eq!(listed[0].fired_count, 1);
-    assert_eq!(listed[0].status, "pending");
+    assert_eq!(listed[0].status, ScheduleStatus::Pending);
 }
 
 #[tokio::test]
@@ -141,7 +142,7 @@ async fn reset_running_recovers_orphans() {
     assert_eq!(n, 1);
     assert_eq!(
         scheduler::list(&pool, &db).await.unwrap()[0].status,
-        "pending"
+        ScheduleStatus::Pending
     );
 }
 
@@ -176,7 +177,7 @@ async fn next_due_and_mark_error() {
         .into_iter()
         .find(|s| s.id == b)
         .unwrap();
-    assert_eq!(info.status, "error");
+    assert_eq!(info.status, ScheduleStatus::Error);
     assert_eq!(info.last_error.as_deref(), Some("boom"));
     assert_eq!(scheduler::next_due(&pool, &db).await.unwrap(), Some(50));
 }
@@ -194,7 +195,7 @@ async fn pause_resume_one_shot_keeps_due_at() {
     assert!(scheduler::set_paused(&pool, &db, &id, true).await.unwrap());
     assert!(scheduler::set_paused(&pool, &db, &id, false).await.unwrap());
     let info = &scheduler::list(&pool, &db).await.unwrap()[0];
-    assert_eq!(info.status, "pending");
+    assert_eq!(info.status, ScheduleStatus::Pending);
     assert_eq!(info.due_at, 42); // unchanged by resume
 
     // Resuming a non-paused job is a no-op (returns false).
@@ -381,13 +382,17 @@ async fn cron_fires_and_stays_pending() {
     // would observe the intermediate 'running' row instead.
     let info = poll_list(&pool, &db, Duration::from_secs(8), |l| {
         l.iter()
-            .find(|i| i.kind == "cron" && i.status == "pending" && i.fired_count >= 1)
+            .find(|i| {
+                i.kind == ScheduleKind::Cron
+                    && i.status == ScheduleStatus::Pending
+                    && i.fired_count >= 1
+            })
             .cloned()
     })
     .await
     .expect("cron row should be pending with fired_count >= 1");
-    assert_eq!(info.kind, "cron");
-    assert_eq!(info.status, "pending");
+    assert_eq!(info.kind, ScheduleKind::Cron);
+    assert_eq!(info.status, ScheduleStatus::Pending);
 }
 
 #[tokio::test]
@@ -427,13 +432,21 @@ async fn failing_cron_reschedules_anyway() {
     // 'error'), last_error set, fired_count 0, due_at advanced beyond now.
     let info = poll_list(&pool, &db, Duration::from_secs(15), |l| {
         l.iter()
-            .find(|i| i.kind == "cron" && i.status == "pending" && i.last_error.is_some())
+            .find(|i| {
+                i.kind == ScheduleKind::Cron
+                    && i.status == ScheduleStatus::Pending
+                    && i.last_error.is_some()
+            })
             .cloned()
     })
     .await
     .expect("failing cron should be rescheduled (pending with last_error)");
 
-    assert_eq!(info.status, "pending", "failing cron must keep firing");
+    assert_eq!(
+        info.status,
+        ScheduleStatus::Pending,
+        "failing cron must keep firing"
+    );
     assert!(
         info.last_error.is_some(),
         "failure must be recorded in last_error"
@@ -527,7 +540,11 @@ async fn cron_skips_missed_windows() {
     // predicate would never match (test times out -> fails).
     let info = poll_list(&pool, &db, Duration::from_secs(10), |l| {
         l.iter()
-            .find(|i| i.kind == "cron" && i.status == "pending" && i.fired_count == 1)
+            .find(|i| {
+                i.kind == ScheduleKind::Cron
+                    && i.status == ScheduleStatus::Pending
+                    && i.fired_count == 1
+            })
             .cloned()
     })
     .await
@@ -601,13 +618,13 @@ async fn failing_txn_marks_error_one_shot() {
     // state means the txn has already been attempted and rolled back.
     let info = poll_list(&pool, &db, Duration::from_secs(15), |l| {
         l.iter()
-            .find(|i| i.kind == "oneshot" && i.status == "error")
+            .find(|i| i.kind == ScheduleKind::Oneshot && i.status == ScheduleStatus::Error)
             .cloned()
     })
     .await
     .expect("failing one-shot should be marked error, not deleted or pending");
 
-    assert_eq!(info.status, "error");
+    assert_eq!(info.status, ScheduleStatus::Error);
     assert!(
         info.last_error.is_some(),
         "failure must be recorded in last_error"

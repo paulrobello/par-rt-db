@@ -1,7 +1,7 @@
 # par-rt-db — Self-Hosted Realtime Document DB (Design Spec)
 
 **Date:** 2026-07-21
-**Status:** Approved design, pre-implementation
+**Status:** Implemented — server is live at `rtdb.pardev.net`. See `FEATURE_MATRIX.md` §1 ("At parity today") and §2 (ranked gap matrix, all 21 rows ✅). Originally scoped as MVP-only; every "out of scope" item below has since shipped as a follow-on spec. Authoritative current source of truth: the code (`server/src/`, `ts-client/`, `rust-client/`, `python-client/`) and `FEATURE_MATRIX.md`, not this document.
 **Repo:** `~/Repos/par-rt-db`
 
 ## Purpose
@@ -40,9 +40,21 @@ This spec covers the server, the TypeScript client, and deployment.
 - Built-in GitHub OAuth, sessions, per-database email allowlist.
 - End-to-end TypeScript types with **no codegen** (schema is TS; types are inferred).
 
-**Explicitly out of scope (unused by the kanban app):** actions, file storage,
-scheduler, cron jobs, pagination, db-side `.filter()`, `.first()`, `.replace()`,
-text/vector search, optimistic updates, per-row authorization rules.
+**Explicitly out of scope at MVP time (unused by the kanban app):** actions,
+file storage, scheduler, cron jobs, pagination, db-side `.filter()`, `.first()`,
+`.replace()`, text/vector search, optimistic updates, per-row authorization
+rules. **All but "actions" and "optimistic updates" have since shipped** — see
+the follow-on specs indexed in `docs/superpowers/SPEC_STATUS.md`:
+
+- file storage → FEATURE_MATRIX #16 (spec `2026-07-23-file-storage-design.md`)
+- scheduler + cron → FEATURE_MATRIX #9 / #10 (spec `2026-07-23-scheduled-cron-transactions-design.md`)
+- pagination → FEATURE_MATRIX #5
+- db-side `.filter()` → FEATURE_MATRIX #15
+- `.first()` → FEATURE_MATRIX #2 · `.replace()` → FEATURE_MATRIX #6
+- text search → FEATURE_MATRIX #11 · vector search → FEATURE_MATRIX #17 (spec `2026-07-23-vector-search-design.md`)
+- per-row authorization → FEATURE_MATRIX #20 (spec `2026-07-24-per-row-authorization-design.md`)
+- optimistic updates → FEATURE_MATRIX #12 (TS-only; Rust/Python pending)
+- actions → 🚫 deliberate non-goal (no embedded JS runtime, no per-app server code; see FEATURE_MATRIX §3)
 
 Expected scale: low thousands of rows per database, a handful of concurrent
 subscriptions, sparse writes. Design choices below deliberately exploit this.
@@ -250,7 +262,13 @@ everywhere.
 3. Deployed on lenny2, reachable at `rtdb.pardev.net`, GitHub sign-in works, live
    updates propagate between two browser tabs and from an HTTP machine write.
 
-## Future (explicitly deferred)
+## Future (explicitly deferred at MVP time; current status marked inline)
 
-Fine-grained subscription invalidation; pagination; db-side filters; scheduler/crons;
-file storage; per-row authorization; additional OAuth providers; multi-node.
+- Fine-grained subscription invalidation → FEATURE_MATRIX #21 (v1 shipped: point-read skip; spec `2026-07-24-fine-grained-subscription-invalidation-design.md`)
+- pagination → **shipped** (FEATURE_MATRIX #5)
+- db-side filters → **shipped** (FEATURE_MATRIX #15)
+- scheduler/crons → **shipped** (FEATURE_MATRIX #9 / #10)
+- file storage → **shipped** (FEATURE_MATRIX #16)
+- per-row authorization → **shipped** (FEATURE_MATRIX #20)
+- additional OAuth providers → **shipped**: GitHub + Google (FEATURE_MATRIX #14)
+- multi-node → 🚫 deliberate non-goal (single-node Postgres; see FEATURE_MATRIX §3)

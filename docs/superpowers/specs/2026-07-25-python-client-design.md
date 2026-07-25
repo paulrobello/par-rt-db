@@ -1,8 +1,8 @@
 # par-rt-db Python Client — Design Spec
 
 **Date:** 2026-07-25
-**Status:** Approved approach (A), pre-implementation
-**Repo:** `~/Repos/par-rt-db` (package lives in new `python-client/`)
+**Status:** Implemented (core DSL layer) — `par-rt-db` v0.1.0 on PyPI: wire types (`wire.py`), schema DSL (`schema.py` — 15 `FieldType` variants + `t` constructors + `SchemaBuilder`), query DSL (`query.py` — `Query` + `TableQuery` + `Paginated` + `parse_result`), mutation DSL (`mutation.py` — all 7 step ops + `Mutation` builder + `StepResult`), cursor codec (`cursor.py`), and error model (`errors.py`). HTTP / reactive WebSocket / admin clients remain planned for the next plan. Public surface is re-exported from `par_rt_db/__init__.py`; see `python-client/README.md`. Mirrored across the FEATURE_MATRIX rows that name a fourth client (notably §1 "Admin control plane" and rows #1–#21 "Mirrored end-to-end"); a per-row "Mirrored across: ✅ts ✅rust ✅python" column tracks ongoing parity. Current source of truth: `python-client/src/par_rt_db/` and `tests/test_wire_parity.py` (the cross-client oracle).
+**Repo:** `~/Repos/par-rt-db` (package lives in `python-client/`)
 **End goal:** a general-purpose Python SDK at functional parity with the TypeScript and
 Rust clients (**minus React bindings and browser OAuth helpers**) — a fourth
 implementation of par-rt-db's JSON wire contract.

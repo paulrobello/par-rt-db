@@ -54,3 +54,60 @@ make typecheck && make lint && make fmt-check && make test
 ```
 
 The repo-wide gate is `make -C .. checkall`.
+
+## Operator guide
+
+The console is the operator UI for a running par-rt-db instance — same-origin
+when served by the server from `RTDB_STATIC_DIR`, or via the Vite dev proxy
+against any backend. Everything below is operator-facing; for dev/build see the
+sections above.
+
+### Logging in
+
+Two login methods, both funneled through `authenticate_admin` on the server:
+
+- **Admin key** — paste a value of `RTDB_ADMIN_KEY` (the boot env var set on
+  the server). Covers the control plane (databases, schema, metrics, op feed,
+  config, admins) via the HTTP `/admin/*` API. The raw key is **not** accepted
+  on `/sync`, so the **data browser falls back to ~2s polling** of
+  `POST /admin/db/{db}/query` rather than subscribing.
+- **OAuth (GitHub or Google)** — sign in with an account whose email is on the
+  `RTDB_ADMIN_EMAILS` allowlist (or has been added via the Admins page since
+  boot). The session token issued by `/auth/*` **is** accepted on `/sync`, so
+  the **data browser subscribes for true realtime**.
+
+The two methods differ only in how the data browser reads documents; the op
+feed, metrics, and database list stream over the same `/admin/stream`
+WebSocket either way (the admin bearer rides the `Sec-WebSocket-Protocol`
+subprotocol).
+
+Regardless of method, the admin bearer lives only in React state — reload the
+page and you re-authenticate (a deliberate trade-off against `localStorage`
+theft; see `SEC-001`). Sign out clears it from memory and, for OAuth,
+best-effort calls `POST /auth/logout`.
+
+### The dashboard surfaces
+
+Top-level nav (left rail) plus the per-table data browser reached by drilling
+into a database:
+
+| Surface | Path | What it does |
+| --- | --- | --- |
+| **Databases** | `/` | List and create databases; drill into one for stats, schema, and per-table data. |
+| **Schema** | `/dbs/:db/schema` | The pushed schema for one database. |
+| **Data browser** | `/dbs/:db/tables/:table` | Live documents in one table. OAuth = realtime over `/sync`; admin-key = ~2s poll. |
+| **Metrics** | `/metrics` | Server-wide gauges: queries, mutations, uploads, pool size/idle, uptime. |
+| **Op feed** | `/ops` | Newest-first document operations across all databases. Also streamed live into the right rail. |
+| **Config** | `/config` | Hot knobs (`allowed_origins`, `session_ttl_days`, `max_file_size`), server build info, and provider configuration status. |
+| **Admins** | `/admins` | Manage the OAuth admin allowlist (`RTDB_ADMIN_EMAILS` + any runtime additions). |
+
+### The mutation cap
+
+Mutations submitted from the data browser are bounded by `RTDB_MAX_AFFECTED_DOCS`
+(server boot config, default **100**). A transaction whose step count exceeds
+the cap is rejected **before** the committer — an over-cap write never becomes
+durable. Each DSL step touches at most one document, so the cap is effectively a
+per-transaction document-count limit. Non-admin mutations are bounded only by a
+separate `MAX_STEPS = 256` and are not affected by this knob. Raise
+`RTDB_MAX_AFFECTED_DOCS` only if a documented workflow legitimately needs a
+larger single-transaction footprint.

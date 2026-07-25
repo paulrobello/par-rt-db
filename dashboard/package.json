@@ -2,6 +2,7 @@
   "name": "@par-rt-db/dashboard",
   "private": true,
   "version": "0.1.0",
+  "license": "MIT",
   "type": "module",
   "scripts": {
     "dev": "vite --port 8310 --strictPort",
@@ -13,19 +14,24 @@
     "lint": "biome lint src",
     "fmt": "biome format --write src",
     "fmt-check": "biome format src",
-    "test": "vitest run --passWithNoTests"
+    "test": "vitest run --passWithNoTests",
+    "prepare": "bun run build:sdk"
   },
   "dependencies": {
     "@par-rt-db/client": "workspace:*",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
-    "react-router-dom": "^6.28.0"
+    "react-router-dom": "^7.18.0"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.5.4",
+    "@testing-library/jest-dom": "^6.6.3",
+    "@testing-library/react": "^16.1.0",
+    "@testing-library/user-event": "^14.5.2",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
     "@vitejs/plugin-react": "^4.3.4",
+    "jsdom": "^25.0.1",
     "typescript": "^5.7.0",
     "vite": "^6.0.11",
     "vitest": "^3.2.6"

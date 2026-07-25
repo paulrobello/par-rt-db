@@ -8,11 +8,14 @@ query updates on change. One instance hosts many named databases. There is no
 embedded JS runtime and no per-app server code — this one generic binary serves
 every app.
 
-This directory holds the `rtdb-server` binary. The two client SDKs live
-alongside it: [`../ts-client/`](../ts-client) (browser/Node) and
-[`../rust-client/`](../rust-client) (Rust). See the [root README](../README.md)
-for the project overview and [`../CLAUDE.md`](../CLAUDE.md) for contributor
-guidance. Authoritative design:
+This directory holds the `rtdb-server` binary. The three client SDKs live
+alongside it: [`../ts-client/`](../ts-client) (browser/Node),
+[`../rust-client/`](../rust-client) (Rust), and
+[`../python-client/`](../python-client) (Python — wire + DSL today; HTTP/WS/admin
+pending). An operator dashboard SPA ([`../dashboard/`](../dashboard)) is served
+same-origin by the server when `RTDB_STATIC_DIR` is set. See the
+[root README](../README.md) for the project overview and
+[`../CLAUDE.md`](../CLAUDE.md) for contributor guidance. Authoritative design:
 [`../docs/superpowers/specs/2026-07-21-par-rt-db-design.md`](../docs/superpowers/specs/2026-07-21-par-rt-db-design.md).
 
 ## Stack

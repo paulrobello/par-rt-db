@@ -1,8 +1,8 @@
 # par-rt-db Rust Client Crate — Design Spec
 
 **Date:** 2026-07-22
-**Status:** Approved design, pre-implementation
-**Repo:** `~/Repos/par-rt-db` (crate lives in new `rust-client/`)
+**Status:** Implemented — `par-rt-db-client` v0.1.0 published with full `http` + `ws` + `admin` surfaces, query/mutation DSL, scheduled/cron transactions, file storage, and the `.filter()` / `.search()` / `.vector_search()` builders. Mirrored across FEATURE_MATRIX rows #1–#21 wherever "Mirrored end-to-end" calls out `rust-client` (notably the "Admin control plane" row in §1 and rows #11 / #15 / #17 / #16 / #9 in §2). Current source of truth: `rust-client/src/` and `FEATURE_MATRIX.md`.
+**Repo:** `~/Repos/par-rt-db` (crate lives in `rust-client/`)
 **Kanban:** par-rt-db → "Build Rust client crate (for par-hack game server)" (high)
 **End goal:** functional parity with the TypeScript client (`client/`, `@par-rt-db/client`) **minus the React bindings**.
 

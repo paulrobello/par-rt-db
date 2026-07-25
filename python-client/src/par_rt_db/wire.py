@@ -46,9 +46,12 @@ class AuthedUser(_Camel):
     ``email``/``name`` serialize as JSON ``null`` when absent; ``githubLogin``/
     ``githubId`` are omitted entirely on the wire when ``None`` (mirrors the
     server's ``#[serde(skip_serializing_if = "Option::is_none")]``).
+
+    ``kind`` is narrowed to ``Literal["user", "machine"]`` (ARC-004/QA-008) so a
+    typo is rejected at parse time, mirroring the server's ``UserKind`` enum.
     """
 
-    kind: str
+    kind: Literal["user", "machine"]
     email: str | None = None
     name: str | None = None
     github_login: str | None = None
@@ -87,14 +90,16 @@ ScheduleWhen = Annotated[_AfterMs | _RunAt | _Cron, Field(discriminator="type")]
 class ScheduleInfo(_Camel):
     """A scheduled job's public view (returned by ``listSchedules``).
 
-    ``cron``/``lastError`` are omitted on the wire when ``None``.
+    ``cron``/``lastError`` are omitted on the wire when ``None``. ``kind`` and
+    ``status`` are narrowed to ``Literal`` unions (ARC-004/QA-008) mirroring the
+    server's ``ScheduleKind`` / ``ScheduleStatus`` enums.
     """
 
     id: str
-    kind: str
+    kind: Literal["oneshot", "cron"]
     due_at: int
     cron: str | None = None
-    status: str
+    status: Literal["pending", "running", "paused", "error"]
     last_error: str | None = None
     created_at: int
     fired_count: int

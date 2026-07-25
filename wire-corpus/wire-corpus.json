@@ -1,0 +1,112 @@
+{
+  "$comment": "Canonical cross-client wire-parity corpus (ARC-008). Every entry is the raw JSON object as it appears on the wire. Each client's parity test parses -> serializes -> deep-compares to the input. Bytes are authoritative; tag/field names are load-bearing (see server/src/protocol.rs header). Sections: 'client_messages', 'server_messages', 'authed_users', 'schedule_whens', 'schedule_infos', 'query_results', 'error_envelopes', 'queries' (embedded query shapes covering filter/search/vectorSearch/paginate), 'rejects_client_message_unknown_field' (must fail to parse where deny_unknown_fields / extra='forbid' applies).",
+  "client_messages": [
+    { "type": "auth", "token": "t", "db": "d" },
+    { "type": "subscribe", "queryId": "q1", "query": { "table": "workItems" } },
+    { "type": "subscribe", "queryId": "q-filter", "query": { "table": "workItems", "filter": { "op": "and", "exprs": [ { "op": "eq", "field": "status", "value": "done" }, { "op": "gt", "field": "order", "value": 0 } ] } } },
+    { "type": "subscribe", "queryId": "q-search", "query": { "table": "notes", "search": { "index": "search_body", "query": "hello world" } } },
+    { "type": "subscribe", "queryId": "q-vector", "query": { "table": "embeds", "vectorSearch": { "index": "by_embedding", "vector": [0.1, 0.2, 0.3], "limit": 5 } } },
+    { "type": "subscribe", "queryId": "q-vector-filter", "query": { "table": "embeds", "vectorSearch": { "index": "by_embedding", "vector": [0.1], "limit": 3, "filter": { "userId": "u1" } } } },
+    { "type": "subscribe", "queryId": "q-paginate", "query": { "table": "workItems", "paginate": { "numItems": 10 } } },
+    { "type": "subscribe", "queryId": "q-paginate-cursor", "query": { "table": "workItems", "paginate": { "cursor": "abc", "numItems": 10 } } },
+    { "type": "unsubscribe", "queryId": "q1" },
+    { "type": "mutate", "mutId": "m1", "txn": { "steps": [] } },
+    { "type": "mutate", "mutId": "m1", "idempotencyKey": "key1", "txn": { "steps": [] } },
+    { "type": "mutate", "mutId": "m1", "txn": { "steps": [ { "op": "insert", "table": "workItems", "doc": { "title": "x" } } ] } },
+    { "type": "schedule", "scheduleId": "s1", "when": { "type": "afterMs", "ms": 100 }, "txn": { "steps": [] } },
+    { "type": "schedule", "scheduleId": "s1", "when": { "type": "runAt", "ms": 1700000000000 }, "txn": { "steps": [] } },
+    { "type": "schedule", "scheduleId": "s1", "when": { "type": "cron", "expr": "*/5 * * * *" }, "txn": { "steps": [] } },
+    { "type": "cancelSchedule", "scheduleId": "s1", "id": "job-9" },
+    { "type": "pauseSchedule", "scheduleId": "s1", "id": "job-9" },
+    { "type": "resumeSchedule", "scheduleId": "s1", "id": "job-9" },
+    { "type": "listSchedules", "scheduleId": "s1" },
+    { "type": "ping" }
+  ],
+  "server_messages": [
+    { "type": "authOk", "user": { "kind": "user", "email": "a@b.com", "name": null, "githubLogin": "alice", "githubId": 12345 } },
+    { "type": "authOk", "user": { "kind": "machine", "email": null, "name": null } },
+    { "type": "authErr", "error": { "code": "UNAUTHORIZED", "message": "bad token" } },
+    { "type": "queryUpdate", "queryId": "q1", "result": null },
+    { "type": "queryUpdate", "queryId": "q1", "result": { "_id": "abc", "title": "first" } },
+    { "type": "queryUpdate", "queryId": "q1", "result": [] },
+    { "type": "queryUpdate", "queryId": "q1", "result": [ { "_id": "a" }, { "_id": "b" } ] },
+    { "type": "queryUpdate", "queryId": "q1", "result": 42 },
+    { "type": "queryUpdate", "queryId": "q1", "result": { "docs": [ { "_id": "a" } ], "nextCursor": "cur1" } },
+    { "type": "queryUpdate", "queryId": "q1", "result": { "docs": [ { "_id": "a" } ] } },
+    { "type": "mutateOk", "mutId": "m1", "results": [] },
+    { "type": "mutateOk", "mutId": "m1", "results": [ { "_id": "a", "title": "x" } ] },
+    { "type": "mutateErr", "mutId": "m1", "error": { "code": "NOT_FOUND", "message": "missing doc" } },
+    { "type": "subscribeErr", "queryId": "q1", "error": { "code": "BAD_REQUEST", "message": "bad index" } },
+    { "type": "scheduleOk", "scheduleId": "s1", "id": "job-9" },
+    { "type": "scheduleErr", "scheduleId": "s1", "error": { "code": "BAD_REQUEST", "message": "bad cron" } },
+    { "type": "scheduleAck", "scheduleId": "s1", "ok": true },
+    { "type": "scheduleAck", "scheduleId": "s1", "ok": false, "error": { "code": "NOT_FOUND", "message": "missing job" } },
+    { "type": "listSchedulesOk", "scheduleId": "s1", "schedules": [] },
+    { "type": "listSchedulesOk", "scheduleId": "s1", "schedules": [ { "id": "j1", "kind": "oneshot", "dueAt": 1000, "status": "pending", "createdAt": 500, "firedCount": 0 } ] },
+    { "type": "listSchedulesOk", "scheduleId": "s1", "schedules": [ { "id": "j2", "kind": "cron", "dueAt": 2000, "cron": "*/5 * * * *", "status": "error", "lastError": "boom", "createdAt": 500, "firedCount": 3 } ] },
+    { "type": "pong" }
+  ],
+  "authed_users": [
+    { "kind": "user", "email": "a@b.com", "name": null, "githubLogin": "alice", "githubId": 12345 },
+    { "kind": "user", "email": "a@b.com", "name": "Alice" },
+    { "kind": "machine", "email": null, "name": null },
+    { "kind": "machine", "email": null, "name": null, "githubLogin": "ci-bot", "githubId": 999 }
+  ],
+  "schedule_whens": [
+    { "type": "afterMs", "ms": 100 },
+    { "type": "runAt", "ms": 1700000000000 },
+    { "type": "cron", "expr": "*/5 * * * *" }
+  ],
+  "schedule_infos": [
+    { "id": "j1", "kind": "oneshot", "dueAt": 1000, "status": "pending", "createdAt": 500, "firedCount": 0 },
+    { "id": "j2", "kind": "oneshot", "dueAt": 1100, "status": "running", "createdAt": 500, "firedCount": 0 },
+    { "id": "j3", "kind": "oneshot", "dueAt": 1200, "status": "paused", "createdAt": 500, "firedCount": 0 },
+    { "id": "j4", "kind": "oneshot", "dueAt": 1300, "status": "error", "lastError": "boom", "createdAt": 500, "firedCount": 0 },
+    { "id": "j5", "kind": "cron", "dueAt": 2000, "cron": "*/5 * * * *", "status": "pending", "createdAt": 500, "firedCount": 0 },
+    { "id": "j6", "kind": "cron", "dueAt": 2100, "cron": "0 * * * *", "status": "running", "createdAt": 500, "firedCount": 4 },
+    { "id": "j7", "kind": "cron", "dueAt": 2200, "cron": "0 * * * *", "status": "paused", "createdAt": 500, "firedCount": 4 },
+    { "id": "j8", "kind": "cron", "dueAt": 2300, "cron": "0 * * * *", "status": "error", "lastError": "kaboom", "createdAt": 500, "firedCount": 7 }
+  ],
+  "query_results": [
+    null,
+    { "_id": "abc", "title": "first" },
+    [],
+    [ { "_id": "a" }, { "_id": "b" } ],
+    42,
+    { "docs": [ { "_id": "a" } ], "nextCursor": "cur1" },
+    { "docs": [ { "_id": "a" } ] }
+  ],
+  "error_envelopes": [
+    { "code": "BAD_REQUEST", "message": "bad index" },
+    { "code": "UNAUTHORIZED", "message": "bad token" },
+    { "code": "NOT_FOUND", "message": "missing doc" },
+    { "code": "PRECONDITION_FAILED", "message": "version conflict" },
+    { "code": "FORBIDDEN", "message": "not owner" }
+  ],
+  "queries": [
+    { "table": "workItems" },
+    { "table": "workItems", "filter": { "op": "eq", "field": "status", "value": "done" } },
+    { "table": "workItems", "filter": { "op": "or", "exprs": [ { "op": "in", "field": "status", "values": [ "a", "b" ] }, { "op": "lte", "field": "order", "value": 5 } ] } },
+    { "table": "notes", "search": { "index": "search_body", "query": "hello world" } },
+    { "table": "embeds", "vectorSearch": { "index": "by_embedding", "vector": [ 0.1, 0.2, 0.3 ], "limit": 5 } },
+    { "table": "embeds", "vectorSearch": { "index": "by_embedding", "vector": [ 0.1 ], "limit": 3, "filter": { "userId": "u1" } } },
+    { "table": "workItems", "paginate": { "numItems": 10 } },
+    { "table": "workItems", "paginate": { "cursor": "abc", "numItems": 10 } }
+  ],
+  "rejects_client_message_unknown_field": [
+    { "type": "auth", "token": "t", "db": "d", "bogus": true },
+    { "type": "unsubscribe", "queryId": "q1", "extra": 1 }
+  ],
+  "rejects_schedule_when_unknown_field": [
+    { "type": "afterMs", "ms": 1, "x": 9 }
+  ],
+  "rejects_authed_user_unknown_kind": [
+    { "kind": "robot", "email": null, "name": null }
+  ],
+  "rejects_schedule_info_unknown_kind": [
+    { "id": "j1", "kind": "interval", "dueAt": 1000, "status": "pending", "createdAt": 500, "firedCount": 0 }
+  ],
+  "rejects_schedule_info_unknown_status": [
+    { "id": "j1", "kind": "oneshot", "dueAt": 1000, "status": "queued", "createdAt": 500, "firedCount": 0 }
+  ]
+}

@@ -6,7 +6,7 @@
 
 use crate::db::{new_id, now_ms, validate_db_name};
 use crate::error::RtDbError;
-use crate::protocol::ScheduleWhen;
+use crate::protocol::{ScheduleKind, ScheduleStatus, ScheduleWhen};
 
 /// Computes the next fire time (UTC epoch ms) for a 5-field cron expression,
 /// strictly after `now_ms`. Also validates the expression: a parse failure or
@@ -154,21 +154,28 @@ pub async fn list(pool: &PgPool, db: &str) -> Result<Vec<ScheduleInfo>, RtDbErro
     ))
     .fetch_all(pool)
     .await?;
-    Ok(rows
-        .into_iter()
+    rows.into_iter()
         .map(
-            |(id, kind, due_at, cron, status, last_error, created_at, fired_count)| ScheduleInfo {
-                id,
-                kind,
-                due_at,
-                cron,
-                status,
-                last_error,
-                created_at,
-                fired_count,
+            |(id, kind, due_at, cron, status, last_error, created_at, fired_count)| {
+                let kind = kind.parse::<ScheduleKind>().map_err(|err| {
+                    RtDbError::internal(format!("invalid scheduled_txns.kind: {err}"))
+                })?;
+                let status = status.parse::<ScheduleStatus>().map_err(|err| {
+                    RtDbError::internal(format!("invalid scheduled_txns.status: {err}"))
+                })?;
+                Ok(ScheduleInfo {
+                    id,
+                    kind,
+                    due_at,
+                    cron,
+                    status,
+                    last_error,
+                    created_at,
+                    fired_count,
+                })
             },
         )
-        .collect())
+        .collect()
 }
 
 pub async fn cancel(pool: &PgPool, db: &str, id: &str) -> Result<bool, RtDbError> {

@@ -1,0 +1,92 @@
+name: CI
+
+# ARC-003: gate every change. `make checkall` is the single source of truth for
+# the project's definition-of-done (fmt-check + clippy -D warnings + typecheck +
+# tests across server, ts-client, rust-client, python-client, dashboard).
+on:
+  push:
+  pull_request:
+
+# Cancel superseded runs on the same ref; keep one in-flight job per branch/PR.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least-privilege: CI only reads the repo. Add write tokens only if a step needs them.
+permissions:
+  contents: read
+
+jobs:
+  checkall:
+    name: make checkall
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      # The server integration tests read RTDB_TEST_DATABASE_URL
+      # (server/tests/common/mod.rs, server/tests/healthz_test.rs). The Makefile
+      # exports this same default (line 2); we set it explicitly so the CI is
+      # self-documenting and independent of that Makefile default. The value
+      # matches what `make dev-db-up` brings up (pgvector on 127.0.0.1:55434).
+      RTDB_TEST_DATABASE_URL: postgres://rtdb:rtdb@127.0.0.1:55434/rtdb
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4.2.2
+
+      # --- Rust (server + rust-client) -------------------------------------
+      # edition = "2024" in both Cargo.tomls ⇒ requires stable ≥ 1.85.
+      # `@stable` is dtolnay/rust-toolchain's canonical selector for the Rust
+      # *release channel* named stable; it always resolves to a published tag.
+      - name: Set up Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Rust build cache
+        uses: Swatinem/rust-cache@v2.7.5
+
+      # --- Bun (ts-client + dashboard) -------------------------------------
+      - name: Set up Bun
+        uses: oven/setup-bun@v2
+
+      # --- Python + uv (python-client) -------------------------------------
+      # python-client requires Python >=3.12; uv resolves and installs it.
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      # --- First-time installs ---------------------------------------------
+      # A fresh CI checkout has no node_modules, no .venv, and no ts-client/dist.
+      # These three targets are NOT prerequisites of `make checkall` — the
+      # Makefile assumes they have already been run once (see CLAUDE.md).
+      - name: Install ts-client deps
+        run: make ts-client-install
+
+      - name: Install dashboard deps
+        run: make dashboard-install
+
+      - name: Install python-client deps
+        run: make python-client-install
+
+      # --- The gate ---------------------------------------------------------
+      # `make checkall` = fmt-check + lint + typecheck + test.
+      #
+      # Database strategy: we deliberately do NOT use a `services:` Postgres
+      # container. Instead `make checkall` → `make test` → `make dev-db-up`
+      # brings up `pgvector/pgvector:pg17` on 127.0.0.1:55434 via docker compose.
+      # Reasons:
+      #   1. The server uses pgvector for vector search; a plain `postgres:17`
+      #      service container would fail vector-search tests.
+      #   2. `make test` has `dev-db-up` as a hard Make prerequisite, so the DB
+      #      is started automatically and tuned (max_connections=300 for the
+      #      ~20 concurrent test binaries).
+      #   3. `docker compose` v2 is preinstalled on ubuntu-latest, and the
+      #      dev compose file's `--wait` flag blocks until the pg_isready
+      #      healthcheck passes.
+      # `make typecheck` (inside checkall) depends on `ts-client-build`, so the
+      # dashboard's `@par-rt-db/client` resolution from ts-client/dist is
+      # satisfied automatically (gate-needs-ts-client-dist-built gotcha).
+      - name: Run make checkall
+        run: make checkall
