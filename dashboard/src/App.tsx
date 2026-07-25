@@ -1,33 +1,59 @@
-/**
- * Scaffold shell — verifies the Instrument Manual token world renders and the
- * Vite/bun toolchain is wired. Replaced by the real app shell (routing, auth
- * gate, command/live rails) in the next task.
- */
+import { BrowserRouter, Route, Routes } from "react-router-dom";
+import { Spinner } from "./components/ui";
+import { Login } from "./components/Login";
+import { AdminProvider } from "./lib/admin";
+import { SessionProvider, useSession } from "./lib/session";
+import {
+  AdminsPage,
+  ConfigPage,
+  DatabasesPage,
+  DbPage,
+  MetricsPage,
+  NotFound,
+  OpsPage,
+} from "./routes";
+import { AppShell } from "./shell/AppShell";
+
+function Root() {
+  const { token, loading } = useSession();
+  if (loading) {
+    return (
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          height: "100dvh",
+        }}
+      >
+        <Spinner label="restoring session" />
+      </div>
+    );
+  }
+  if (!token) return <Login />;
+  return (
+    <AdminProvider>
+      <BrowserRouter>
+        <Routes>
+          <Route element={<AppShell />}>
+            <Route index element={<DatabasesPage />} />
+            <Route path="dbs/:db" element={<DbPage />} />
+            <Route path="metrics" element={<MetricsPage />} />
+            <Route path="ops" element={<OpsPage />} />
+            <Route path="config" element={<ConfigPage />} />
+            <Route path="admins" element={<AdminsPage />} />
+            <Route path="*" element={<NotFound />} />
+          </Route>
+        </Routes>
+      </BrowserRouter>
+    </AdminProvider>
+  );
+}
+
 export function App() {
   return (
-    <div className="console">
-      <header className="topbar">
-        <span className="brand mono">par-rt-db</span>
-        <span className="topbar__spacer" />
-        <span className="conn" title="connection status">
-          <span className="conn__dot" />
-          <span className="conn__label mono">offline</span>
-        </span>
-      </header>
-      <div className="console__body">
-        <aside className="rail">
-          <p className="placard">Databases</p>
-          <p className="rail__empty mono">— none loaded —</p>
-        </aside>
-        <main className="surface">
-          <p className="placard">Console</p>
-          <h1 className="surface__title">Instrument console</h1>
-          <p className="surface__lede">
-            Dashboard scaffolding is live. The data browser, schema, metrics, op feed, and config
-            surfaces arrive next, in the same language.
-          </p>
-        </main>
-      </div>
-    </div>
+    <SessionProvider>
+      <Root />
+    </SessionProvider>
   );
 }
