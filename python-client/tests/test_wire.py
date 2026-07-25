@@ -20,6 +20,7 @@ from par_rt_db.wire import (
     ScheduleInfo,
     ScheduleWhen,
     SearchQuery,
+    ServerMessage,
     VectorSearchQuery,
 )
 
@@ -223,3 +224,146 @@ def test_client_ping():
 def test_client_message_rejects_unknown_fields():
     with pytest.raises(ValidationError):
         _client_adapter.validate_python({"type": "auth", "token": "t", "db": "d", "bogus": True})
+
+
+# --- ServerMessage union (server -> client WS vocabulary) ---
+#
+# ServerMessage is an ``Annotated`` discriminated-union alias, so validation goes
+# through a ``TypeAdapter`` (same pattern as ClientMessage above) — the alias
+# itself has no ``model_validate``. Embedded errors are ``{code, message}``
+# envelopes (not RtDbError, which is an Exception).
+
+_server_adapter = TypeAdapter(ServerMessage)
+
+
+def _server_model(d):
+    return _server_adapter.validate_python(d).model_dump(
+        by_alias=True, mode="json", exclude_unset=False
+    )
+
+
+def test_server_auth_ok():
+    dumped = _server_model({"type": "authOk", "user": {"kind": "user"}})
+    assert dumped["type"] == "authOk"
+    assert dumped["user"] == {"kind": "user", "email": None, "name": None}
+
+
+def test_server_query_update():
+    assert _server_model(
+        {"type": "queryUpdate", "queryId": "q1", "result": []}
+    ) == {"type": "queryUpdate", "queryId": "q1", "result": []}
+
+
+def test_server_mutate_err_embeds_envelope():
+    assert _server_model(
+        {
+            "type": "mutateErr",
+            "mutId": "m1",
+            "error": {"code": "NOT_FOUND", "message": "x"},
+        }
+    ) == {
+        "type": "mutateErr",
+        "mutId": "m1",
+        "error": {"code": "NOT_FOUND", "message": "x"},
+    }
+
+
+def test_server_schedule_ack_ok_omits_error():
+    dumped = _server_model(
+        {"type": "scheduleAck", "scheduleId": "s1", "ok": True}
+    )
+    assert dumped == {"type": "scheduleAck", "scheduleId": "s1", "ok": True}
+    assert "error" not in dumped
+
+
+def test_server_schedule_ack_err_includes_error():
+    dumped = _server_model(
+        {
+            "type": "scheduleAck",
+            "scheduleId": "s1",
+            "ok": False,
+            "error": {"code": "NOT_FOUND", "message": "no job"},
+        }
+    )
+    assert dumped["ok"] is False
+    assert dumped["error"] == {"code": "NOT_FOUND", "message": "no job"}
+
+
+def test_server_list_schedules_ok():
+    assert _server_model(
+        {"type": "listSchedulesOk", "scheduleId": "s1", "schedules": []}
+    ) == {"type": "listSchedulesOk", "scheduleId": "s1", "schedules": []}
+
+
+def test_server_pong():
+    assert _server_model({"type": "pong"}) == {"type": "pong"}
+
+
+def test_server_message_rejects_unknown_fields():
+    with pytest.raises(ValidationError):
+        _server_adapter.validate_python(
+            {"type": "pong", "bogus": True}
+        )
+
+
+def test_server_mutate_ok_results_passthrough():
+    # ``results`` is opaque JSON until Task 9 wires the QueryResult parser.
+    dumped = _server_model(
+        {
+            "type": "mutateOk",
+            "mutId": "m1",
+            "results": [{"id": "a"}, {"id": "b"}],
+        }
+    )
+    assert dumped == {
+        "type": "mutateOk",
+        "mutId": "m1",
+        "results": [{"id": "a"}, {"id": "b"}],
+    }
+
+
+def test_server_auth_err():
+    dumped = _server_model(
+        {"type": "authErr", "error": {"code": "UNAUTHORIZED", "message": "bad token"}}
+    )
+    assert dumped == {
+        "type": "authErr",
+        "error": {"code": "UNAUTHORIZED", "message": "bad token"},
+    }
+
+
+def test_server_subscribe_err():
+    dumped = _server_model(
+        {
+            "type": "subscribeErr",
+            "queryId": "q1",
+            "error": {"code": "BAD_REQUEST", "message": "nope"},
+        }
+    )
+    assert dumped == {
+        "type": "subscribeErr",
+        "queryId": "q1",
+        "error": {"code": "BAD_REQUEST", "message": "nope"},
+    }
+
+
+def test_server_schedule_ok():
+    dumped = _server_model(
+        {"type": "scheduleOk", "scheduleId": "s1", "id": "job-9"}
+    )
+    assert dumped == {"type": "scheduleOk", "scheduleId": "s1", "id": "job-9"}
+
+
+def test_server_schedule_err():
+    dumped = _server_model(
+        {
+            "type": "scheduleErr",
+            "scheduleId": "s1",
+            "error": {"code": "NOT_FOUND", "message": "missing"},
+        }
+    )
+    assert dumped == {
+        "type": "scheduleErr",
+        "scheduleId": "s1",
+        "error": {"code": "NOT_FOUND", "message": "missing"},
+    }

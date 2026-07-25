@@ -293,3 +293,112 @@ ClientMessage = Annotated[
     ),
     Field(discriminator="type"),
 ]
+
+
+# --- ServerMessage (server -> client WS vocabulary; discriminator "type") ---
+#
+# Mirrors ``server/src/protocol.rs::ServerMessage`` (the ``#[serde(tag = "type",
+# rename_all = "camelCase", rename_all_fields = "camelCase")]`` enum). The Rust
+# enum does not set ``deny_unknown_fields`` at the top level, but each leaf
+# struct derives it, so inheriting ``extra="forbid"`` from ``_Camel`` keeps the
+# leaf shapes tight; validation routes through ``TypeAdapter(ServerMessage)``
+# because the alias itself has no ``model_validate``.
+# Embedded errors are the ``{code, message}`` envelope (a small
+# ``_ErrorEnvelope`` model), not ``RtDbError`` (which is an Exception).
+# ``queryUpdate.result`` and ``mutateOk.results[]`` are opaque JSON (``object`` /
+# ``list[object]``); the untagged ``QueryResult`` parsing happens in Task 9.
+
+
+class _ErrorEnvelope(_Camel):
+    """The ``{code, message}`` body embedded in WS error frames."""
+
+    code: str
+    message: str
+
+
+class _ServerAuthOk(_Camel):
+    type: Literal["authOk"] = "authOk"
+    user: AuthedUser
+
+
+class _ServerAuthErr(_Camel):
+    type: Literal["authErr"] = "authErr"
+    error: _ErrorEnvelope
+
+
+class _ServerQueryUpdate(_Camel):
+    type: Literal["queryUpdate"] = "queryUpdate"
+    query_id: str
+    result: object  # untagged QueryResult; parsed by query.py (Task 9)
+
+
+class _ServerMutateOk(_Camel):
+    type: Literal["mutateOk"] = "mutateOk"
+    mut_id: str
+    results: list[object]
+
+
+class _ServerMutateErr(_Camel):
+    type: Literal["mutateErr"] = "mutateErr"
+    mut_id: str
+    error: _ErrorEnvelope
+
+
+class _ServerSubscribeErr(_Camel):
+    type: Literal["subscribeErr"] = "subscribeErr"
+    query_id: str
+    error: _ErrorEnvelope
+
+
+class _ServerScheduleOk(_Camel):
+    type: Literal["scheduleOk"] = "scheduleOk"
+    schedule_id: str
+    id: str
+
+
+class _ServerScheduleErr(_Camel):
+    type: Literal["scheduleErr"] = "scheduleErr"
+    schedule_id: str
+    error: _ErrorEnvelope
+
+
+class _ServerScheduleAck(_Camel):
+    type: Literal["scheduleAck"] = "scheduleAck"
+    schedule_id: str
+    ok: bool
+    error: _ErrorEnvelope | None = None
+
+    @model_serializer(mode="wrap")
+    def _drop_error_when_none(self, handler):  # type: ignore[no-untyped-def]
+        out = handler(self)
+        if out.get("error") is None:
+            out.pop("error", None)
+        return out
+
+
+class _ServerListSchedulesOk(_Camel):
+    type: Literal["listSchedulesOk"] = "listSchedulesOk"
+    schedule_id: str
+    schedules: list[ScheduleInfo]
+
+
+class _ServerPong(_Camel):
+    type: Literal["pong"] = "pong"
+
+
+ServerMessage = Annotated[
+    (
+        _ServerAuthOk
+        | _ServerAuthErr
+        | _ServerQueryUpdate
+        | _ServerMutateOk
+        | _ServerMutateErr
+        | _ServerSubscribeErr
+        | _ServerScheduleOk
+        | _ServerScheduleErr
+        | _ServerScheduleAck
+        | _ServerListSchedulesOk
+        | _ServerPong
+    ),
+    Field(discriminator="type"),
+]
