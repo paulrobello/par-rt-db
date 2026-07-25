@@ -34,6 +34,7 @@ claude_scratch/
 .pi/extensions/discord-relay/state.json
 .pi/status-footer.json
 docs/playgrounds/
+.impeccable/
 
 # Language/build artifacts
 build/

@@ -1,0 +1,77 @@
+# Product
+
+<!-- impeccable:product-schema 1 -->
+
+## Platform
+
+web
+
+## Users
+
+The primary (and, for the foreseeable, sole) user is the operator who runs a par-rt-db instance — Paul, a developer/self-hoster managing personal infrastructure. They wear every hat: deploy the server, define and evolve database schemas, mint machine tokens, debug document data, watch live behavior, and tune operational config. They are technical, fluent in JSON/query semantics, and treat the dashboard as a fast, always-available control surface for a service they own end-to-end. Non-admin end-users have no dashboard (confirmed: admin/operator console only).
+
+## Product Purpose
+
+par-rt-db is a self-hosted, Convex-inspired realtime document database. One generic Rust server hosts many named databases; clients push a schema and send a declarative JSON DSL — typed queries, subscriptions, atomic multi-step transactions — over WebSocket (`/sync`) or one-shot HTTP, and receive live query updates as data changes. There is no embedded JS runtime and no per-app server code; one server serves every app.
+
+The dashboard is the single operator console for that server: authenticate, manage databases and their schemas, browse and mutate documents, observe realtime metrics and the live operation feed, and edit runtime configuration — without touching the CLI, SQL, or config files.
+
+Success means the operator can do every day-to-day management and debugging task from the browser, fast, against the live instance, with confidence about what changed.
+
+## Positioning
+
+A self-hosted realtime document DB the operator fully controls — Convex's developer model (declarative queries, realtime subscriptions, schema-as-source-of-truth) without a managed cloud, a vendor account, or per-app backend code. The dashboard is the proof that one generic, self-hosted server is a complete product, not just an engine.
+
+## Operating Context
+
+- Deployed live at `rtdb.pardev.net` (host lenny2, docker compose behind a Cloudflare tunnel); the dashboard is a same-origin SPA served by the server itself from `RTDB_STATIC_DIR`, so new build artifacts update with no recompile or restart.
+- The operator authenticates either with the admin key (machine) or as an OAuth'd admin (GitHub/Google, allowlisted as admin).
+- Every database is isolated and named; the operator juggles several (e.g. the projects board, app datastores). Documents are JSON; indexed fields become typed Postgres columns, the rest lives in a `doc` jsonb column merged in at read time.
+- Realtime is central: subscriptions re-run on every write, and the op feed surfaces durable mutations as they happen. The dashboard must feel live, not request/response.
+- Operational reality the console reflects and respects: one Postgres, one writer (the committer), hot config that applies without restart, optional per-row ownership auth on some tables.
+
+## Capabilities and Constraints
+
+Confirmed backend surfaces the dashboard consumes (all shipped, HTTP/WS):
+
+- **Auth & session** — admin-key or OAuth admin login; `/auth/*` flows; session TTL; logout.
+- **Databases** — list/create databases; per-db metadata (schema read-back, machine tokens, table + row counts).
+- **Data browser** — read/query and mutate documents per database/table via admin doc routes (`POST /admin/db/{db}/query|mutate`, `owner=None`); mutations capped at `RTDB_MAX_AFFECTED_DOCS` steps (default 100).
+- **Schema viewer** — the compiled schema for each database/table (typed indexed fields, `ownerField`, table stats).
+- **Metrics** — `GET /admin/metrics`, instance-wide counters and gauges.
+- **Live op feed** — `GET /admin/ops/recent` (recent) and `WS /admin/stream` (streaming) durable document mutations as they happen.
+- **Hot config** — `GET/PATCH /admin/config` for runtime-mutable `allowed_origins`, `session_ttl_days`, `max_file_size` (secrets structurally redacted); admin allowlist management.
+- **Realtime over WS** — the SPA may subscribe like any client (`/sync`) to watch data move.
+
+Constraints:
+
+- Solo operator; no multi-admin collaboration or per-actor audit UI is required (confirmed).
+- Same-origin: the SPA's API/WS calls need no CORS entry; it talks to the server that serves it.
+- No fabrication of stats, customers, or benchmarks — the dashboard shows only real, server-reported data.
+
+## Brand Commitments
+
+- Product name **par-rt-db**, under the **pardev.net** / **Parsidion** umbrella alongside other Paul Robello projects (e.g. the projects board at projects.pardev.net).
+- No existing visual identity, logo, or design system for par-rt-db has been declared binding — the visual world is established in this work.
+
+## Evidence on Hand
+
+- Authoritative design spec: `docs/superpowers/specs/2026-07-21-par-rt-db-design.md` (protocol, DSL, semantics).
+- Dashboard backend design: `docs/superpowers/specs/2026-07-24-realtime-dashboard-design.md` (the six-phase surface contract).
+- Server source: `server/src/` (`auth/`, `admin.rs`, `http_api.rs`, `ws.rs`, `committer.rs`, `schema.rs`, `query.rs`, `txn.rs`, `config.rs`, `storage.rs`).
+- Three client implementations of the wire contract: `server/src/protocol.rs`, `ts-client/src/protocol.ts`, `rust-client/src/wire.rs` (the SPA will speak this protocol via the ts-client SDK).
+- `FEATURE_MATRIX.md` (#18) — the parity/feature contract.
+- Live instance: rtdb.pardev.net.
+- Absences to respect: no real usage metrics, customers, or testimonials exist; the dashboard must not synthesize social proof.
+
+## Product Principles
+
+1. **Operator-first, always.** Every screen serves the person running the instance — speed, precision, and confidence over marketing or onboarding flourish.
+2. **Live by default.** Data, metrics, and the op feed reflect the running server in real time; staleness is a defect.
+3. **Reflect the model truthfully.** Databases, tables, schemas, ownership, and the single-writer reality are shown as they actually are, never abstracted into something misleading.
+4. **One coherent console.** Six backend surfaces are one product with consistent navigation, terminology, and interaction — not six glued-together tools.
+5. **Safe by construction.** Mutations are explicit and capped; destructive actions confirm; config edits validate before they apply.
+
+## Accessibility & Inclusion
+
+Standard web accessibility expected for a technical operator tool (keyboard navigation, sufficient contrast, readable type, focus states). No specialized standard mandated beyond that; refine during design.
