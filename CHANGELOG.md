@@ -19,17 +19,21 @@ Comprehensive remediation of the 2026-07-25 project audit (55 findings; 46
 resolved, 9 deferred/no-action per the audit's own verdicts). The full
 `make checkall` gate is green. Highlights:
 
-- **Security**: admin token moved out of `localStorage` (SEC-001, in-memory
-  stopgap — HttpOnly-cookie remedy tracked); `is_admin` re-run per WS op so
+- **Security**: dashboard credentials (admin key + OAuth session token) moved
+  into an HttpOnly `rtdb_session` cookie so no secret is ever held in JS
+  (SEC-001, both phases — `Auth.token` became optional across all four clients
+  so `/sync` can authenticate from the cookie); `is_admin` re-run per WS op so
   admin-role revocation takes effect on open connections (SEC-004); strict
   OAuth-callback origin validation + JS/HTML escaping (SEC-005);
   `react-router-dom` 6.30→7.18 clearing 3 CVEs (SEC-003); upload-size hard
-  ceiling (SEC-008); unverified-email fallback dropped (SEC-006).
+  ceiling + over-ceiling `maxFileSize` rejected at PATCH time (SEC-008);
+  unverified-email fallback dropped (SEC-006).
 - **Architecture**: `SubscriptionManager` sharded per-db (ARC-001); env-
   configurable pool size (ARC-002); CI on `make checkall` (ARC-003); typed
   protocol enums across all four clients + a cross-client wire-parity corpus
-  (ARC-004/008/009/QA-008); `AppState` regrouped into sub-structs (ARC-006);
-  `mutation_log` expiry moved to a background task (ARC-007).
+  (ARC-004/008/009/QA-008); rust-client vector `Vec<f32>`→`Vec<f64>` to match
+  the wire's f64 precision (ARC-008(a)); `AppState` regrouped into sub-structs
+  (ARC-006); `mutation_log` expiry moved to a background task (ARC-007).
 - **Quality**: `execute_query` validation cascade refactored to a dispatch
   table (QA-002); TS in-memory `get`-guard drift fixed + a cross-client
   combination matrix (QA-001); dashboard Vitest+RTL suite (QA-003).
@@ -37,8 +41,10 @@ resolved, 9 deferred/no-action per the audit's own verdicts). The full
   documented (DOC-002); `CHANGELOG`/`CONTRIBUTING`/`LICENSE` added; design-spec
   statuses flipped to Implemented + `SPEC_STATUS.md` index.
 
-See commit range `b0f7108..` on `main`. Manual follow-ups (SEC-001 cookie,
-SEC-008 PATCH-side check, ARC-008 f32-on-wire) are tracked separately.
+See commit range `b0f7108..` on `main`. The three items previously tracked as
+manual follow-ups — SEC-001 (HttpOnly cookie), SEC-008 (PATCH-side `maxFileSize`
+check), and ARC-008(a) (`Vec<f32>`→`Vec<f64>`) — are now implemented (CI fix
+`oven/setup-bun`→`oven-sh/setup-bun` landed too).
 
 ### Added
 
