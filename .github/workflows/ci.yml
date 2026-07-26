@@ -47,8 +47,10 @@ jobs:
         uses: Swatinem/rust-cache@v2.7.5
 
       # --- Bun (ts-client + dashboard) -------------------------------------
+      # `oven-sh` is the Bun team's org (the bare `oven/` org has no setup-bun
+      # repo — CI failed at action resolution until this was corrected).
       - name: Set up Bun
-        uses: oven/setup-bun@v2
+        uses: oven-sh/setup-bun@v2.2.0
 
       # --- Python + uv (python-client) -------------------------------------
       # python-client requires Python >=3.12; uv resolves and installs it.
