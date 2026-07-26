@@ -221,8 +221,19 @@ class VectorSearchQuery(_Camel):
 
 class _ClientAuth(_Camel):
     type: Literal["auth"] = "auth"
-    token: str
+    # SEC-001 phase 2: optional — a browser dashboard authenticates over `/sync`
+    # from the HttpOnly cookie, sending only `db`. CLI/SDK/machine tokens still
+    # send `token`; backward-compatible. Omitted on the wire when None, mirroring
+    # the server/rust `skip_serializing_if = "Option::is_none"`.
+    token: str | None = None
     db: str
+
+    @model_serializer(mode="wrap")
+    def _drop_none_token(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        out = handler(self)
+        if out.get("token") is None:
+            out.pop("token", None)
+        return out
 
 
 class _ClientSubscribe(_Camel):

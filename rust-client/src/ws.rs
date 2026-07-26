@@ -782,7 +782,7 @@ async fn run_session(
 
     // Auth must be the first frame.
     let auth = ClientMessage::Auth {
-        token,
+        token: Some(token),
         db: driver.inner.db.clone(),
     };
     let frame = serde_json::to_string(&auth).unwrap_or_default();
@@ -1293,7 +1293,7 @@ mod tests {
     #[test]
     fn auth_frame_shape() {
         let v = serde_json::to_value(ClientMessage::Auth {
-            token: "t".into(),
+            token: Some("t".into()),
             db: "d".into(),
         })
         .unwrap();

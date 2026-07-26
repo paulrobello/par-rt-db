@@ -13,7 +13,13 @@ use crate::txn::Transaction;
 )]
 pub enum ClientMessage {
     Auth {
-        token: String,
+        // SEC-001 phase 2: `token` is optional so a browser dashboard can
+        // authenticate over `/sync` from the HttpOnly `rtdb_session` cookie the
+        // browser sends on the WS upgrade — the Auth message then carries only
+        // `db`. CLI/SDK/machine tokens still send `token` (the prior wire form),
+        // so this is backward-compatible.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token: Option<String>,
         db: String,
     },
     Subscribe {
@@ -288,12 +294,31 @@ mod tests {
     fn client_message_wire_tags_and_fields() {
         assert_eq!(
             serde_json::to_value(ClientMessage::Auth {
-                token: "t".to_string(),
+                token: Some("t".to_string()),
                 db: "d".to_string()
             })
             .unwrap(),
             serde_json::json!({"type": "auth", "token": "t", "db": "d"})
         );
+        // SEC-001 phase 2: a tokenless Auth (cookie-mode) serializes without the
+        // `token` field and round-trips back to `None`.
+        assert_eq!(
+            serde_json::to_value(ClientMessage::Auth {
+                token: None,
+                db: "d".to_string()
+            })
+            .unwrap(),
+            serde_json::json!({"type": "auth", "db": "d"})
+        );
+        let parsed: ClientMessage =
+            serde_json::from_value(serde_json::json!({"type": "auth", "db": "d"})).unwrap();
+        match parsed {
+            ClientMessage::Auth { token, db } => {
+                assert!(token.is_none());
+                assert_eq!(db, "d");
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
         assert_eq!(
             serde_json::to_value(ClientMessage::Subscribe {
                 query_id: "q1".to_string(),

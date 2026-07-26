@@ -2,6 +2,7 @@
   "$comment": "Canonical cross-client wire-parity corpus (ARC-008). Every entry is the raw JSON object as it appears on the wire. Each client's parity test parses -> serializes -> deep-compares to the input. Bytes are authoritative; tag/field names are load-bearing (see server/src/protocol.rs header). Sections: 'client_messages', 'server_messages', 'authed_users', 'schedule_whens', 'schedule_infos', 'query_results', 'error_envelopes', 'queries' (embedded query shapes covering filter/search/vectorSearch/paginate), 'rejects_client_message_unknown_field' (must fail to parse where deny_unknown_fields / extra='forbid' applies).",
   "client_messages": [
     { "type": "auth", "token": "t", "db": "d" },
+    { "type": "auth", "db": "d" },
     { "type": "subscribe", "queryId": "q1", "query": { "table": "workItems" } },
     { "type": "subscribe", "queryId": "q-filter", "query": { "table": "workItems", "filter": { "op": "and", "exprs": [ { "op": "eq", "field": "status", "value": "done" }, { "op": "gt", "field": "order", "value": 0 } ] } } },
     { "type": "subscribe", "queryId": "q-search", "query": { "table": "notes", "search": { "index": "search_body", "query": "hello world" } } },

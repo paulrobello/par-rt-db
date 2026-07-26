@@ -167,8 +167,10 @@ export function useAdmin(): AdminValue {
  * realtime via `/sync`.
  */
 export function AdminProvider({ children }: { children: ReactNode }) {
-  const { token, method } = useSession();
-  const client = useMemo(() => new AdminClient(() => token), [token]);
+  const { method } = useSession();
+  // SEC-001: cookie-only — the HttpOnly `rtdb_session` authenticates `/admin/*`,
+  // so AdminClient sends no Bearer header (getToken -> null).
+  const client = useMemo(() => new AdminClient(() => null), []);
 
   const [databases, setDatabases] = useState<string[]>([]);
   const [databasesLoading, setDatabasesLoading] = useState(false);
@@ -212,10 +214,10 @@ export function AdminProvider({ children }: { children: ReactNode }) {
       const proto = window.location.protocol === "https:" ? "wss" : "ws";
       const streamUrl = `${proto}://${window.location.host}/admin/stream`;
       // SEC-001: the admin credential rides an HttpOnly cookie the browser sends
-      // on the WS upgrade — no JS-readable token. An OAuth session still holds a
-      // token in state and offers the `rtdb-admin.<token>` subprotocol; an
-      // admin-key session has no token and authenticates via the cookie alone.
-      ws = token ? new WebSocket(streamUrl, [`rtdb-admin.${token}`]) : new WebSocket(streamUrl);
+      // on the WS upgrade — no JS-readable token for either auth method, so no
+      // subprotocol is offered. (CLI/automation still uses the Authorization
+      // header or subprotocol; the dashboard is cookie-only.)
+      ws = new WebSocket(streamUrl);
       ws.onopen = () => {
         if (cancelled) return;
         backoff = 1000;
@@ -274,7 +276,7 @@ export function AdminProvider({ children }: { children: ReactNode }) {
       ws?.close();
       clearInterval(dbsTimer);
     };
-  }, [method, token, client]);
+  }, [method, client]);
 
   const value: AdminValue = {
     client,

@@ -2,17 +2,17 @@ import { act, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SessionProvider, useSession } from "./session";
 
-// SEC-001 invariant tests: the admin bearer must live in React state only,
-// never in localStorage. These tests guard that invariant against regressions
-// (e.g. someone re-adding localStorage persistence for reload-comfort) and
-// verify the OAuth postMessage handshake + signOut clear the token correctly.
+// SEC-001 invariant tests: no dashboard credential is ever held in JS — both
+// login paths set an HttpOnly `rtdb_session` cookie, so the provider exposes only
+// the auth method + user (never a token). These guard that invariant and verify
+// the OAuth postMessage handshake + signOut hit the right endpoints.
 
 function Probe() {
   const s = useSession();
   return (
     <div>
-      <span data-testid="token">{s.token ?? "(null)"}</span>
       <span data-testid="method">{s.method ?? "(null)"}</span>
+      <span data-testid="user">{s.user?.email ?? "(null)"}</span>
       <button type="button" onClick={() => void s.signInWithAdminKey("test-key")}>
         sign-in-admin
       </button>
@@ -71,20 +71,18 @@ describe("SessionProvider", () => {
         <Probe />
       </SessionProvider>,
     );
-    expect(screen.getByTestId("token").textContent).toBe("(null)");
+    expect(screen.getByTestId("method").textContent).toBe("(null)");
 
     await act(async () => {
       screen.getByText("sign-in-admin").click();
     });
-    // SEC-001: the admin key is never stored in JS — the server set an HttpOnly
-    // cookie. token stays null; method marks the dashboard authenticated.
-    expect(screen.getByTestId("token").textContent).toBe("(null)");
+    // SEC-001: no key in JS — only the method flips; the cookie authenticates.
     expect(screen.getByTestId("method").textContent).toBe("adminkey");
+    expect(screen.getByTestId("user").textContent).toBe("(null)");
 
     await act(async () => {
       screen.getByText("sign-out").click();
     });
-    expect(screen.getByTestId("token").textContent).toBe("(null)");
     expect(screen.getByTestId("method").textContent).toBe("(null)");
 
     // SEC-001 invariant: nothing token-like may ever be persisted.
@@ -95,8 +93,8 @@ describe("SessionProvider", () => {
     expect(persistedLooking).toHaveLength(0);
   });
 
-  it("OAuth onMessage handshake applies the token, signOut clears it and calls /auth/logout", async () => {
-    const fetchMock = buildFetch();
+  it("OAuth handshake loads the user via /auth/me (cookie), signOut hits /auth/logout", async () => {
+    const fetchMock = buildFetch({ meBody: { email: "oauth@example.com" } });
     globalThis.fetch = fetchMock;
     const popup = { closed: false, close: vi.fn() };
     vi.spyOn(window, "open").mockReturnValue(popup as unknown as Window);
@@ -111,24 +109,25 @@ describe("SessionProvider", () => {
       screen.getByText("sign-in-oauth").click();
     });
 
-    // Simulate the OAuth popup posting the admin bearer back to the opener.
+    // SEC-001 phase 2: the callback posts `{type:"rtdb-auth"}` with NO token;
+    // the provider loads the user via `/auth/me` (the cookie authenticates).
     await act(async () => {
       window.dispatchEvent(
         new MessageEvent("message", {
           origin: window.location.origin,
-          data: { type: "rtdb-auth", token: "oauth-tok" },
+          data: { type: "rtdb-auth" },
         }),
       );
     });
 
-    expect(screen.getByTestId("token").textContent).toBe("oauth-tok");
     expect(screen.getByTestId("method").textContent).toBe("oauth");
+    expect(screen.getByTestId("user").textContent).toBe("oauth@example.com");
     expect(popup.close).toHaveBeenCalled();
+    expect(fetchMock).toHaveBeenCalledWith("/auth/me");
 
     await act(async () => {
       screen.getByText("sign-out").click();
     });
-    expect(screen.getByTestId("token").textContent).toBe("(null)");
     expect(screen.getByTestId("method").textContent).toBe("(null)");
     expect(fetchMock).toHaveBeenCalledWith(
       "/auth/logout",
@@ -136,7 +135,7 @@ describe("SessionProvider", () => {
     );
   });
 
-  it("rejects an invalid admin key without applying a token", async () => {
+  it("rejects an invalid admin key without authenticating", async () => {
     globalThis.fetch = buildFetch({ loginStatus: 401 });
 
     let captured: unknown = null;

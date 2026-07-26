@@ -18,7 +18,11 @@ pub type QueryRef = Query;
 )]
 pub enum ClientMessage {
     Auth {
-        token: String,
+        // SEC-001 phase 2: optional — a browser dashboard authenticates over
+        // `/sync` from the HttpOnly cookie, sending only `db`. CLI/SDK/machine
+        // tokens still send `token` (the prior wire form); backward-compatible.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token: Option<String>,
         db: String,
     },
     Subscribe {
@@ -427,7 +431,7 @@ mod tests {
     fn client_message_tags_and_fields() {
         assert_eq!(
             serde_json::to_value(ClientMessage::Auth {
-                token: "t".into(),
+                token: Some("t".into()),
                 db: "d".into()
             })
             .unwrap(),

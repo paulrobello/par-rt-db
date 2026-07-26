@@ -5,7 +5,10 @@ use axum::Json;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{Query as QueryParams, State};
-use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header::LOCATION};
+use axum::http::{
+    HeaderMap, HeaderName, HeaderValue, StatusCode,
+    header::{LOCATION, SET_COOKIE},
+};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use serde::Deserialize;
@@ -70,10 +73,16 @@ pub trait OAuthProvider: Send + Sync {
 }
 
 fn bearer_token(headers: &HeaderMap) -> Option<&str> {
-    headers
+    if let Some(v) = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
+    {
+        return Some(v);
+    }
+    // SEC-001 phase 2: dashboard cookie path (HttpOnly `rtdb_session`) — used by
+    // `/auth/me` and `/auth/logout` when the OAuth session token is cookie-only.
+    crate::auth::cookie::session_cookie(headers)
 }
 
 /// Builds a bare 302 redirect (axum's `Redirect::to` is a 303, which doesn't
@@ -169,10 +178,12 @@ struct CallbackParams {
 }
 
 /// `GET /auth/{provider}/callback?code=&state=`: verifies and consumes the
-/// state token, completes the provider exchange, and responds with HTML that
-/// posts the new session token back to the opener window.
+/// state token, completes the provider exchange, sets the session token in an
+/// HttpOnly cookie (SEC-001 phase 2), and responds with HTML that signals the
+/// opener window (no token in the payload).
 async fn provider_callback<P: OAuthProvider>(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     QueryParams(params): QueryParams<CallbackParams>,
 ) -> Response {
     let Some(origin) = consume_state(&state, &params.state).await else {
@@ -183,28 +194,32 @@ async fn provider_callback<P: OAuthProvider>(
         return unconfigured_response(P::name());
     };
 
+    let secure = crate::auth::cookie::request_is_secure(&headers);
     match provider.complete_login(&state, &params.code).await {
-        Ok(token) => callback_html_response(&token, &origin),
+        Ok(token) => match callback_html_response(&token, &origin, secure) {
+            Ok(resp) => resp,
+            Err(err) => err.into_response(),
+        },
         Err(err) => err.into_response(),
     }
 }
 
-/// Renders the popup-closing HTML the callback returns on success. `token`
-/// is hex (from `random_token()`) and `origin` was validated at the OAuth start
-/// step (`provider_start`) against the live `allowed_origins`. Both are now
-/// defense-in-depth escaped at this interpolation point, even though:
-///   - `token`'s hex alphabet is naturally string-safe, and
-///   - `origin` must additionally pass the strict `config::origin_is_valid`
-///     parser (ASCII `https?://host[:port]` only, no metacharacters) on every
-///     `PATCH /admin/config`, so an admin-controlled value containing `"`,
-///     `<`, `>`, backtick, or backslash is rejected at write time.
+/// Renders the popup-closing HTML the callback returns on success. `origin` was
+/// validated at the OAuth start step (`provider_start`) against the live
+/// `allowed_origins` and is defense-in-depth escaped at this interpolation
+/// point: it must additionally pass the strict `config::origin_is_valid` parser
+/// (ASCII `https?://host[:port]` only, no metacharacters) on every
+/// `PATCH /admin/config`, so an admin-controlled value containing `"`, `<`, `>`,
+/// backtick, or backslash is rejected at write time. Escaping closes the
+/// residual self-XSS breakout (SEC-005).
 ///
-/// Escaping closes the residual self-XSS breakout (SEC-005) where the prior
-/// comment incorrectly claimed safety by construction.
-fn callback_html_response(token: &str, origin: &str) -> Response {
+/// SEC-001 phase 2: the session token travels in the HttpOnly `Set-Cookie`
+/// (added by the caller-facing response below), NOT in the HTML — the
+/// postMessage payload is `{type:"rtdb-auth"}` with no `token` field, so the
+/// opener never receives the secret.
+fn callback_html_response(token: &str, origin: &str, secure: bool) -> Result<Response, RtDbError> {
     let html = format!(
-        "<script>window.opener.postMessage({{type:\"rtdb-auth\",token:\"{token}\"}},\"{origin}\");window.close();</script>",
-        token = escape_js_string(token),
+        "<script>window.opener.postMessage({{type:\"rtdb-auth\"}},\"{origin}\");window.close();</script>",
         origin = escape_js_string(origin),
     );
 
@@ -213,7 +228,11 @@ fn callback_html_response(token: &str, origin: &str) -> Response {
         HeaderName::from_static("content-security-policy"),
         HeaderValue::from_static("default-src 'none'; script-src 'unsafe-inline'"),
     );
-    response
+    // `token` is hex (`random_token`), so it is always cookie-value-safe;
+    // `set_session_cookie` validates regardless and `?` handles the impossible case.
+    let cookie = crate::auth::cookie::set_session_cookie(token, secure)?;
+    response.headers_mut().insert(SET_COOKIE, cookie);
+    Ok(response)
 }
 
 /// Escapes `s` for safe interpolation inside a double-quoted JavaScript string
@@ -285,14 +304,32 @@ mod callback_tests {
         // `callback_html_response`, the escaped output cannot break out of
         // the JS string or close the <script>. The raw `";alert(1);//`
         // breakout becomes `\";alert(1);//` inside the literal.
-        let body = response_body_string(callback_html_response("deadbeef", "\";alert(1);//"));
-        // The full postMessage call with the ESCAPED origin. If escaping were
-        // missing, the body would contain `},"";alert(1)` (raw quote-quote)
-        // instead of `},"\";alert(1)` (backslash-quote) and this assertion
-        // would fail. Locks down both the escape call and its output shape.
+        let resp = callback_html_response("deadbeef", "\";alert(1);//", true).unwrap();
+        // SEC-001 phase 2: the session token rides the HttpOnly Set-Cookie, not
+        // the HTML body.
+        let cookie = resp
+            .headers()
+            .get(SET_COOKIE)
+            .expect("callback sets rtdb_session cookie")
+            .to_str()
+            .unwrap();
+        assert!(cookie.contains("rtdb_session=deadbeef"));
+        assert!(cookie.contains("HttpOnly"));
+        assert!(cookie.contains("Secure"));
+
+        let body = response_body_string(resp);
+        // The postMessage payload carries NO token (only `{type:"rtdb-auth"}`);
+        // the escaped origin follows. If escaping were missing, the body would
+        // contain `},"";alert(1)` (raw quote-quote) instead of `},"\";alert(1)`
+        // (backslash-quote) and this assertion would fail.
         assert!(
             body.contains(r#"},"\";alert(1);//");window.close();</script>"#),
             "expected escaped payload in body, got: {body}"
+        );
+        // The token must never appear in the HTML — it is cookie-only.
+        assert!(
+            !body.contains("deadbeef"),
+            "token leaked into the HTML: {body}"
         );
     }
 
@@ -325,7 +362,12 @@ async fn logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
     {
         return err.into_response();
     }
-    Json(OkResponse { ok: true }).into_response()
+    let mut resp = Json(OkResponse { ok: true }).into_response();
+    // SEC-001 phase 2: clear the HttpOnly session cookie alongside the
+    // server-side session row.
+    resp.headers_mut()
+        .insert(SET_COOKIE, crate::auth::cookie::clear_session_cookie());
+    resp
 }
 
 #[derive(serde::Serialize)]

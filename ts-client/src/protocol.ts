@@ -129,7 +129,7 @@ export interface AuthedUser {
 
 /** Client -> server WS vocabulary. Tags/fields match server `protocol::ClientMessage`. */
 export type ClientMessage =
-  | { type: "auth"; token: string; db: string }
+  | { type: "auth"; token?: string; db: string }
   | { type: "subscribe"; queryId: string; query: QueryJson }
   | { type: "unsubscribe"; queryId: string }
   | { type: "mutate"; mutId: string; idempotencyKey?: string; txn: TransactionJson }

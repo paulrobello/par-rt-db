@@ -31,7 +31,7 @@ export function useLiveTable(
   take: number,
 ): LiveTableValue {
   const { client: admin } = useAdmin();
-  const { token, method } = useSession();
+  const { method } = useSession();
   const [docs, setDocs] = useState<Doc[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -40,11 +40,12 @@ export function useLiveTable(
 
   useEffect(() => {
     const query = { table, order, take };
-    if (live && token) {
+    if (live) {
+      // SEC-001 phase 2: cookie mode — no `getToken`. The browser's HttpOnly
+      // `rtdb_session` cookie authenticates the /sync WS upgrade.
       const rtdb = new RtDbClient({
         url: window.location.origin,
         db,
-        getToken: () => token,
       });
       rtdb.connect();
       const unsub = rtdb.subscribe<Doc[]>({ json: query }, (value) => {
@@ -82,7 +83,7 @@ export function useLiveTable(
       cancelled = true;
       clearInterval(timer);
     };
-  }, [admin, db, table, order, take, live, token]);
+  }, [admin, db, table, order, take, live]);
 
   return { docs, loading, error, live, refresh: () => refresh.current() };
 }

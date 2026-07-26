@@ -4,7 +4,6 @@ import type { AuthedUser } from "@par-rt-db/client";
 export type AuthMethod = "oauth" | "adminkey";
 
 export interface SessionValue {
-  token: string | null;
   method: AuthMethod | null;
   user: AuthedUser | null;
   loading: boolean;
@@ -23,39 +22,21 @@ export function useSession(): SessionValue {
 }
 
 export function SessionProvider({ children }: { children: ReactNode }) {
-  // SEC-001: the admin key never lives in JS — `/admin/login` sets an HttpOnly
-  // `rtdb_session` cookie the browser sends on same-origin requests (including
-  // the `/admin/stream` WS upgrade), so XSS can't read it. `token` here is used
-  // ONLY by the OAuth path, which still holds the session token in React state
-  // until Phase 2 moves it into the same cookie; it is `null` for admin-key
-  // logins, so `token` is never a persisted admin key.
-  const [token, setToken] = useState<string | null>(null);
+  // SEC-001: no dashboard credential is ever held in JS. Both login paths
+  // (`/admin/login` for the admin key, the OAuth callback for a session token)
+  // set an HttpOnly `rtdb_session` cookie the browser sends on same-origin
+  // requests — including the `/admin/stream` and `/sync` WS upgrades — so XSS
+  // can't read it. This component tracks only the auth METHOD and the resolved
+  // user; it never sees the secret.
   const [method, setMethod] = useState<AuthMethod | null>(null);
   const [user, setUser] = useState<AuthedUser | null>(null);
   const [loading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  async function applyToken(t: string, m: AuthMethod): Promise<void> {
-    setToken(t);
-    setMethod(m);
-    setError(null);
-    if (m === "oauth") {
-      const resp = await fetch("/auth/me", {
-        headers: { authorization: `Bearer ${t}` },
-      });
-      if (!resp.ok) throw new Error("could not load session");
-      setUser(await resp.json());
-    } else {
-      setUser(null);
-    }
-  }
-
   async function signInWithAdminKey(key: string): Promise<void> {
     setError(null);
-    // SEC-001: validate via `/admin/login`, which sets an HttpOnly session
-    // cookie. The key itself never lives in JS state — the cookie (sent
-    // automatically on same-origin requests) authenticates `/admin/*` and
-    // `/admin/stream` from here on.
+    // SEC-001: validate via `/admin/login`, which sets the HttpOnly cookie. The
+    // key itself never lives in JS state.
     const resp = await fetch("/admin/login", {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -68,7 +49,6 @@ export function SessionProvider({ children }: { children: ReactNode }) {
           : `rejected (${resp.status})`,
       );
     }
-    setToken(null);
     setMethod("adminkey");
     setUser(null);
   }
@@ -88,11 +68,22 @@ export function SessionProvider({ children }: { children: ReactNode }) {
       };
       const onMessage = (e: MessageEvent) => {
         if (e.origin !== origin) return;
-        const data = e.data as { type?: string; token?: string } | null;
-        if (data?.type === "rtdb-auth" && typeof data.token === "string") {
+        // SEC-001 phase 2: the callback signals success only — `{type:"rtdb-auth"}`
+        // with NO token. The session token arrived as the HttpOnly cookie on the
+        // callback response; load the user via `/auth/me` (cookie sent same-origin).
+        const data = e.data as { type?: string } | null;
+        if (data?.type === "rtdb-auth") {
           cleanup();
           popup.close();
-          applyToken(data.token, "oauth").then(resolve, reject);
+          fetch("/auth/me")
+            .then((r) => (r.ok ? r.json() : Promise.reject(new Error("could not load session"))))
+            .then((u: AuthedUser) => {
+              setError(null);
+              setUser(u);
+              setMethod("oauth");
+              resolve();
+            })
+            .catch(reject);
         }
       };
       const poller = setInterval(() => {
@@ -106,30 +97,21 @@ export function SessionProvider({ children }: { children: ReactNode }) {
   }
 
   async function signOut(): Promise<void> {
-    if (method === "oauth" && token) {
+    // SEC-001: clear the HttpOnly cookie server-side — `/auth/logout` (OAuth)
+    // and `/admin/logout` (admin key) both send a Set-Cookie that expires it.
+    if (method) {
+      const endpoint = method === "oauth" ? "/auth/logout" : "/admin/logout";
       try {
-        await fetch("/auth/logout", {
-          method: "POST",
-          headers: { authorization: `Bearer ${token}` },
-        });
-      } catch {
-        /* best-effort */
-      }
-    } else if (method === "adminkey") {
-      // SEC-001: clear the HttpOnly session cookie server-side.
-      try {
-        await fetch("/admin/logout", { method: "POST" });
+        await fetch(endpoint, { method: "POST" });
       } catch {
         /* best-effort */
       }
     }
-    setToken(null);
     setMethod(null);
     setUser(null);
   }
 
   const value: SessionValue = {
-    token,
     method,
     user,
     loading,

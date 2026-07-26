@@ -97,11 +97,13 @@ fn extract_query_param(url: &str, key: &str) -> String {
     panic!("missing query param {key} in {url}");
 }
 
-fn extract_token_from_html(body: &str) -> String {
-    let marker = "token:\"";
-    let start = body.find(marker).expect("token marker in html") + marker.len();
-    let rest = &body[start..];
-    let end = rest.find('"').expect("closing quote after token");
+/// SEC-001 phase 2: the session token rides the `Set-Cookie: rtdb_session=...`
+/// header, not the callback HTML.
+fn extract_token_from_cookie(set_cookie: &str) -> String {
+    let prefix = "rtdb_session=";
+    let start = set_cookie.find(prefix).expect("rtdb_session in Set-Cookie") + prefix.len();
+    let rest = &set_cookie[start..];
+    let end = rest.find(';').unwrap_or(rest.len());
     rest[..end].to_string()
 }
 
@@ -143,9 +145,9 @@ async fn callback(
         .expect("send callback")
 }
 
-/// Drives a full `/auth/github` -> `/auth/callback` round trip, asserting
-/// the callback's content type, CSP header, and origin, and returns the
-/// session token embedded in the response HTML.
+/// Drives a full `/auth/github` -> `/auth/callback` round trip, asserting the
+/// callback's content type, CSP header, origin, and that the session token is
+/// delivered via the SEC-001 `Set-Cookie` (not the HTML body).
 async fn login_flow(addr: SocketAddr, origin: &str) -> String {
     let client = no_redirect_client();
     let state_token = start_login(&client, addr, origin).await;
@@ -168,10 +170,20 @@ async fn login_flow(addr: SocketAddr, origin: &str) -> String {
         "default-src 'none'; script-src 'unsafe-inline'"
     );
 
+    // SEC-001 phase 2: the token is in the Set-Cookie header, not the body.
+    let set_cookie = resp
+        .headers()
+        .get(reqwest::header::SET_COOKIE)
+        .expect("set-cookie header")
+        .to_str()
+        .expect("utf8");
+    let token = extract_token_from_cookie(set_cookie);
+
     let body = resp.text().await.expect("read callback body");
     assert!(body.contains(origin));
+    assert!(!body.contains(&token), "token leaked into callback HTML");
 
-    extract_token_from_html(&body)
+    token
 }
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -222,7 +234,7 @@ fn insert_work_item_txn() -> Value {
     }}]})
 }
 
-// (a) full flow: start -> callback -> 200 HTML containing the token and the exact origin.
+// (a) full flow: start -> callback -> 200 with the session token in Set-Cookie and the exact origin in the HTML.
 #[tokio::test]
 async fn full_oauth_flow_returns_html_with_session_token() -> anyhow::Result<()> {
     let mock = MockServer::start().await;

@@ -15,7 +15,7 @@ import { NotFound } from "./routes";
 import { AppShell } from "./shell/AppShell";
 
 function Root() {
-  const { token, loading } = useSession();
+  const { method, loading } = useSession();
   if (loading) {
     return (
       <div
@@ -30,7 +30,7 @@ function Root() {
       </div>
     );
   }
-  if (!token) return <Login />;
+  if (!method) return <Login />;
   return (
     <AdminProvider>
       <BrowserRouter>

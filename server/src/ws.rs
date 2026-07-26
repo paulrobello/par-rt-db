@@ -5,6 +5,7 @@ use axum::Router;
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::extract::ws::{CloseFrame, Message, Utf8Bytes, WebSocket, WebSocketUpgrade};
+use axum::http::HeaderMap;
 use axum::response::Response;
 use axum::routing::get;
 use tokio::sync::mpsc::{self, UnboundedSender};
@@ -50,13 +51,19 @@ pub fn ws_routes() -> Router<Arc<AppState>> {
     Router::new().route("/sync", get(ws_upgrade))
 }
 
-async fn ws_upgrade(State(state): State<Arc<AppState>>, ws: WebSocketUpgrade) -> Response {
+async fn ws_upgrade(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Response {
     // Enforced at the protocol layer (not just the app-level length checks
     // below) so an unauthenticated `/sync` connection can't run axum's
     // default 64 MiB max message size as a memory-DoS vector.
     ws.max_message_size(MAX_FRAME_BYTES)
         .max_frame_size(MAX_FRAME_BYTES)
-        .on_upgrade(move |socket| handle_socket(socket, state))
+        // `headers` are forwarded so SEC-001 phase 2 can authenticate a
+        // tokenless Auth message from the `rtdb_session` cookie.
+        .on_upgrade(move |socket| handle_socket(socket, state, headers))
 }
 
 /// Tracks a tumbling 10s message-count window per connection: >200 messages
@@ -98,11 +105,11 @@ impl RateLimiter {
 /// `subs.remove_conn` runs once auth has registered the connection (see the
 /// `let ... else { return }` above the loop: before that point nothing has
 /// been registered yet).
-async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
+async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, headers: HeaderMap) {
     let conn_id = next_conn_id();
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<ServerMessage>();
 
-    let Some((principal, db)) = authenticate(&mut socket, &state).await else {
+    let Some((principal, db)) = authenticate(&mut socket, &state, &headers).await else {
         return;
     };
     state.runtime.metrics.ws_connect();
@@ -186,6 +193,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
 async fn authenticate(
     socket: &mut WebSocket,
     state: &Arc<AppState>,
+    headers: &HeaderMap,
 ) -> Option<(Principal, String)> {
     let deadline = Instant::now() + AUTH_TIMEOUT;
     let text = loop {
@@ -228,7 +236,21 @@ async fn authenticate(
         }
     };
 
-    let principal = match resolve_bearer(&state.pool, &token).await {
+    // SEC-001 phase 2: a tokenless Auth authenticates from the HttpOnly
+    // `rtdb_session` cookie the browser sent on the WS upgrade; an explicit
+    // token (CLI/SDK/machine) resolves as before. Either credential runs
+    // through the same `resolve_bearer` path.
+    let credential: &str = match token.as_deref() {
+        Some(t) => t,
+        None => match crate::auth::cookie::session_cookie(headers) {
+            Some(c) => c,
+            None => {
+                fail_and_close(socket, RtDbError::unauthorized("authentication required")).await;
+                return None;
+            }
+        },
+    };
+    let principal = match resolve_bearer(&state.pool, credential).await {
         Ok(principal) => principal,
         Err(err) => {
             fail_and_close(socket, err).await;

@@ -28,7 +28,7 @@ export type AuthState = "unauthenticated" | "authenticating" | "authenticated";
 export interface RtDbClientOptions {
   url: string;
   db: string;
-  getToken: () => string | null | Promise<string | null>;
+  getToken?: () => string | null | Promise<string | null>;
   webSocketFactory?: (url: string) => WebSocketLike;
   backoff?: { baseMs: number; maxMs: number };
   heartbeatMs?: number;
@@ -154,9 +154,16 @@ export class RtDbClient {
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private heartbeatTimer: ReturnType<typeof setTimeout> | null = null;
   private lastPongAt = 0;
+  /**
+   * SEC-001 phase 2: true when no `getToken` was supplied — the browser's
+   * HttpOnly session cookie authenticates the WS upgrade, so the client dials
+   * with a tokenless `Auth` instead of landing idle.
+   */
+  private readonly cookieMode: boolean;
 
   constructor(options: RtDbClientOptions) {
     this.options = options;
+    this.cookieMode = options.getToken === undefined;
     this.factory =
       options.webSocketFactory ?? ((url) => new WebSocket(url) as unknown as WebSocketLike);
     this.now = options.now ?? (() => Date.now());
@@ -483,7 +490,14 @@ export class RtDbClient {
     this.detachSocket(1000, "reopen");
     const gen = ++this.generation;
     this.setConnState(this.reconnectAttempt === 0 ? "connecting" : "reconnecting");
-    const provided = this.hasToken ? this.token : this.options.getToken();
+    // SEC-001 phase 2: cookie mode (no `getToken`) — dial immediately and send a
+    // tokenless Auth; the browser's HttpOnly `rtdb_session` cookie authenticates
+    // the WS upgrade.
+    if (this.cookieMode) {
+      this.openWithToken(null);
+      return;
+    }
+    const provided = this.hasToken ? this.token : this.options.getToken!();
     if (isThenable(provided)) {
       // A rejected getToken() is treated as "no credential" rather than left
       // to hang in "connecting" (and to avoid an unhandled promise rejection).
@@ -510,10 +524,11 @@ export class RtDbClient {
     if (this.stopped) {
       return;
     }
-    if (token == null) {
+    if (token == null && !this.cookieMode) {
       // No credential (initial connect without a token, or sign-out): do not
       // dial a socket — that would spin the reconnect loop forever. Land
       // unauthenticated/idle so an explicit connect() can revive later.
+      // Cookie mode is exempt: it dials with a tokenless Auth.
       this.setAuthState("unauthenticated");
       this.setConnState("idle");
       return;
@@ -523,13 +538,19 @@ export class RtDbClient {
     this.setAuthState("authenticating");
 
     socket.onopen = () => {
-      if (this.token == null) {
+      if (this.token == null && !this.cookieMode) {
         this.setAuthState("unauthenticated");
         this.setConnState("idle");
         this.detachSocket(1000, "no token");
         return;
       }
-      this.send({ type: "auth", token: this.token, db: this.options.db });
+      // SEC-001 phase 2: cookie mode sends a tokenless Auth; the browser cookie
+      // authenticates the upgrade.
+      this.send(
+        this.token == null
+          ? { type: "auth", db: this.options.db }
+          : { type: "auth", token: this.token, db: this.options.db },
+      );
     };
     socket.onmessage = (ev) => this.handleMessage(ev.data);
     socket.onclose = (ev) => this.handleClose(ev.code);
