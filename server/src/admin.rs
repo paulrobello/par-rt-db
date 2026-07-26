@@ -687,6 +687,16 @@ async fn patch_config(
         if size == 0 {
             return Err(RtDbError::bad_request("maxFileSize must be > 0"));
         }
+        // SEC-008: reject an over-ceiling value at PATCH time so the persisted
+        // row can't advertise a limit `http_api` silently clamps back down to
+        // `HARD_MAX_FILE_SIZE` (100 MiB). Without this, the configured value
+        // and the enforced value disagree.
+        if size > crate::config::HARD_MAX_FILE_SIZE {
+            return Err(RtDbError::bad_request(format!(
+                "maxFileSize must be <= {} bytes (hard ceiling)",
+                crate::config::HARD_MAX_FILE_SIZE
+            )));
+        }
         next.max_file_size = size;
     }
     if !next.origins_valid() {
