@@ -96,6 +96,17 @@ export class RtDbHttpClient {
     return (body as { user: AuthedUser }).user;
   }
 
+  /**
+   * Resolve the principal the client is authenticated as, via `GET /auth/me`
+   * with the client's own bearer. Session-only — unlike `validateSessionToken`,
+   * which validates an arbitrary token passed as an argument. Machine tokens are
+   * rejected by the server (401) and surface as the standard `RtDbError` envelope.
+   */
+  async authMe(): Promise<AuthedUser> {
+    const body = await this.get("/auth/me", this.token);
+    return (body as { user: AuthedUser }).user;
+  }
+
   /** Upload raw bytes; the db is this client's db (injected into the path). */
   async upload(bytes: Uint8Array, contentType?: string): Promise<UploadResult> {
     const headers: Record<string, string> = { Authorization: `Bearer ${this.token}` };

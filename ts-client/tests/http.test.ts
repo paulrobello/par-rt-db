@@ -248,4 +248,57 @@ describe("RtDbHttpClient", () => {
     expect(user.githubLogin).toBeUndefined();
     expect(user.githubId).toBeUndefined();
   });
+
+  it("authMe GETs /auth/me with the client's own bearer and returns the user", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      jsonResponse({
+        user: {
+          kind: "user",
+          email: "player@example.com",
+          name: null,
+          githubLogin: "player",
+          githubId: 42,
+        },
+      }),
+    );
+    const client = new RtDbHttpClient({
+      url: "http://h:8300",
+      db: "kanban",
+      token: "client-own-token",
+      fetch: fetchMock,
+    });
+
+    const user = await client.authMe();
+
+    expect(user).toEqual({
+      kind: "user",
+      email: "player@example.com",
+      name: null,
+      githubLogin: "player",
+      githubId: 42,
+    });
+    const [calledUrl, init] = fetchMock.mock.calls[0];
+    expect(calledUrl).toBe("http://h:8300/auth/me");
+    expect(init.method).toBe("GET");
+    // authMe uses the client's own token, not an argument like validateSessionToken.
+    expect(init.headers.Authorization).toBe("Bearer client-own-token");
+  });
+
+  it("authMe surfaces a 401 as an RtDbError envelope", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(jsonResponse({ code: "UNAUTHORIZED", message: "machine token rejected" }, 401));
+    const client = new RtDbHttpClient({
+      url: "http://h:8300",
+      db: "kanban",
+      token: "tok",
+      fetch: fetchMock,
+    });
+
+    await expect(client.authMe()).rejects.toMatchObject({
+      name: "RtDbError",
+      code: "UNAUTHORIZED",
+      message: "machine token rejected",
+    });
+  });
 });
