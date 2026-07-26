@@ -1,4 +1,4 @@
-import { createContext, useContext, useState, type ReactNode } from "react";
+import { createContext, useContext, useEffect, useState, type ReactNode } from "react";
 import type { AuthedUser } from "@par-rt-db/client";
 
 export type AuthMethod = "oauth" | "adminkey";
@@ -30,8 +30,33 @@ export function SessionProvider({ children }: { children: ReactNode }) {
   // user; it never sees the secret.
   const [method, setMethod] = useState<AuthMethod | null>(null);
   const [user, setUser] = useState<AuthedUser | null>(null);
-  const [loading] = useState(false);
+  const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+
+  // SEC-001: the HttpOnly cookie survives a page reload, so on mount probe
+  // `/auth/me` (the browser sends the cookie) and restore an OAuth session.
+  // Admin-key sessions have no resolvable identity (the key isn't a user
+  // session), so a reload re-prompts for the key — acceptable for an
+  // operator-typed credential.
+  useEffect(() => {
+    let cancelled = false;
+    fetch("/auth/me")
+      .then((r) => (r.ok ? r.json() : null))
+      .then((u: AuthedUser | null) => {
+        if (cancelled) return;
+        if (u) {
+          setUser(u);
+          setMethod("oauth");
+        }
+        setLoading(false);
+      })
+      .catch(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   async function signInWithAdminKey(key: string): Promise<void> {
     setError(null);

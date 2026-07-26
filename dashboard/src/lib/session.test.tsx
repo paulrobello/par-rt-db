@@ -29,6 +29,9 @@ function Probe() {
 function buildFetch(opts: { loginStatus?: number; meBody?: unknown } = {}) {
   const loginStatus = opts.loginStatus ?? 204;
   const meBody = opts.meBody ?? { email: "ops@example.com" };
+  // The mount probe calls /auth/me first (no session yet -> 401); a later call
+  // after the OAuth callback resolves the user (200). The counter models that.
+  let meCalls = 0;
   return vi.fn(async (input: RequestInfo | URL, _init?: RequestInit) => {
     const url = typeof input === "string" ? input : input.toString();
     if (url === "/admin/login") {
@@ -38,6 +41,8 @@ function buildFetch(opts: { loginStatus?: number; meBody?: unknown } = {}) {
       return new Response(null, { status: 204 });
     }
     if (url === "/auth/me") {
+      meCalls += 1;
+      if (meCalls === 1) return new Response(null, { status: 401 });
       return new Response(JSON.stringify(meBody), {
         status: 200,
         headers: { "content-type": "application/json" },
