@@ -1,9 +1,9 @@
 import { describe, expect, it } from "vitest";
 import { RtDbError } from "../src/errors.js";
-import { InMemoryRtDbClient } from "../src/in_memory.js";
+import { evalFilterExpr, InMemoryRtDbClient, validateFilter } from "../src/in_memory.js";
 import { mutation } from "../src/mutation.js";
 import { decodeCursor, encodeCursor } from "../src/pagination.js";
-import type { PaginatedResultJson, ScheduleInfo } from "../src/protocol.js";
+import type { FilterExpr, PaginatedResultJson, ScheduleInfo } from "../src/protocol.js";
 import { createApi, type RtQuery } from "../src/query.js";
 import { defineSchema, defineTable, t } from "../src/schema.js";
 
@@ -533,5 +533,109 @@ describe("InMemoryRtDbClient — schedules", () => {
     });
     await expect(c.pauseSchedule("nope")).rejects.toMatchObject({ code: "NOT_FOUND" });
     await expect(c.resumeSchedule("nope")).rejects.toMatchObject({ code: "NOT_FOUND" });
+  });
+});
+
+describe("evalFilterExpr + validateFilter", () => {
+  const fields = new Set(["name", "age", "active", "score", "tags"]);
+
+  it("eq/neq on strings compare the doc field's text", () => {
+    expect(evalFilterExpr({ op: "eq", field: "name", value: "ada" }, { name: "ada" })).toBe(true);
+    expect(evalFilterExpr({ op: "eq", field: "name", value: "ada" }, { name: "bob" })).toBe(false);
+    expect(evalFilterExpr({ op: "neq", field: "name", value: "ada" }, { name: "bob" })).toBe(true);
+  });
+
+  it("number domain compares numerically (gt/gte/lt/lte)", () => {
+    expect(evalFilterExpr({ op: "gt", field: "age", value: 30 }, { age: 42 })).toBe(true);
+    expect(evalFilterExpr({ op: "gt", field: "age", value: 50 }, { age: 42 })).toBe(false);
+    expect(evalFilterExpr({ op: "lte", field: "age", value: 42 }, { age: 42 })).toBe(true);
+  });
+
+  it("string ordering is lexicographic", () => {
+    expect(evalFilterExpr({ op: "lt", field: "name", value: "b" }, { name: "ada" })).toBe(true);
+    expect(evalFilterExpr({ op: "gte", field: "name", value: "a" }, { name: "ada" })).toBe(true);
+  });
+
+  it("boolean domain compares booleans", () => {
+    expect(evalFilterExpr({ op: "eq", field: "active", value: true }, { active: true })).toBe(true);
+    expect(evalFilterExpr({ op: "eq", field: "active", value: true }, { active: false })).toBe(
+      false,
+    );
+  });
+
+  it("a number filter value matches a numeric string field (float8 cast)", () => {
+    expect(evalFilterExpr({ op: "eq", field: "score", value: 5 }, { score: "5" })).toBe(true);
+  });
+
+  it("null/absent doc field never matches (SQL NULL exclusion)", () => {
+    expect(evalFilterExpr({ op: "eq", field: "name", value: "ada" }, { name: null })).toBe(false);
+    expect(evalFilterExpr({ op: "eq", field: "name", value: "ada" }, {})).toBe(false);
+    expect(evalFilterExpr({ op: "neq", field: "name", value: "ada" }, {})).toBe(false);
+  });
+
+  it("and / or nest recursively", () => {
+    const expr: FilterExpr = {
+      op: "and",
+      exprs: [
+        { op: "gte", field: "age", value: 30 },
+        {
+          op: "or",
+          exprs: [
+            { op: "eq", field: "name", value: "ada" },
+            { op: "eq", field: "name", value: "bob" },
+          ],
+        },
+      ],
+    };
+    expect(evalFilterExpr(expr, { age: 42, name: "ada" })).toBe(true);
+    expect(evalFilterExpr(expr, { age: 42, name: "zed" })).toBe(false);
+    expect(evalFilterExpr(expr, { age: 10, name: "ada" })).toBe(false);
+  });
+
+  it("in matches membership", () => {
+    expect(
+      evalFilterExpr({ op: "in", field: "name", values: ["ada", "bob"] }, { name: "bob" }),
+    ).toBe(true);
+    expect(
+      evalFilterExpr({ op: "in", field: "name", values: ["ada", "bob"] }, { name: "zed" }),
+    ).toBe(false);
+  });
+
+  it("validateFilter rejects an unknown field", () => {
+    expect(() => validateFilter({ op: "eq", field: "missing", value: "x" }, fields)).toThrow(
+      /unknown field/,
+    );
+  });
+
+  it("validateFilter rejects empty and/or and empty in", () => {
+    expect(() => validateFilter({ op: "and", exprs: [] }, fields)).toThrow(/at least one expr/);
+    expect(() => validateFilter({ op: "or", exprs: [] }, fields)).toThrow(/at least one expr/);
+    expect(() => validateFilter({ op: "in", field: "name", values: [] }, fields)).toThrow(
+      /at least one value/,
+    );
+  });
+
+  it("validateFilter rejects a non-string/number/boolean value", () => {
+    expect(() => validateFilter({ op: "eq", field: "name", value: null }, fields)).toThrow(
+      /string, number, or boolean/,
+    );
+    expect(() => validateFilter({ op: "eq", field: "tags", value: ["a"] }, fields)).toThrow(
+      /string, number, or boolean/,
+    );
+  });
+
+  it("validateFilter accepts a well-formed nested filter", () => {
+    expect(() =>
+      validateFilter(
+        {
+          op: "and",
+          exprs: [
+            { op: "eq", field: "name", value: "ada" },
+            { op: "in", field: "age", values: [1, 2] },
+          ],
+        },
+        fields,
+      ),
+    ).not.toThrow();
   });
 });

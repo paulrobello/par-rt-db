@@ -3,6 +3,7 @@ import type { FileMetadata, UploadResult } from "./http.js";
 import { decodeCursor, encodeCursor } from "./pagination.js";
 import type {
   FieldTypeJson,
+  FilterExpr,
   IndexJson,
   Order,
   Paginate,
@@ -346,6 +347,126 @@ function compareIndexValues(a: unknown, b: unknown): number {
     return 1;
   }
   return 0;
+}
+
+type FilterLeafOp = "eq" | "neq" | "gt" | "gte" | "lt" | "lte";
+
+/**
+ * Structural validation of a `FilterExpr` against a table's declared fields,
+ * mirroring server `query::compile_filter_node` / `field_lhs_and_bind`
+ * (`query.rs`). Throws `BAD_REQUEST` for an unknown field, an empty `and`/`or`,
+ * an empty `in`, or a non-string/number/boolean leaf value. Call once before
+ * evaluating per row.
+ */
+export function validateFilter(node: FilterExpr, fields: ReadonlySet<string>): void {
+  switch (node.op) {
+    case "and":
+    case "or":
+      if (node.exprs.length === 0) {
+        throw new RtDbError("BAD_REQUEST", `${node.op} filter requires at least one expr`);
+      }
+      for (const e of node.exprs) validateFilter(e, fields);
+      return;
+    case "in":
+      if (node.values.length === 0) {
+        throw new RtDbError("BAD_REQUEST", "in filter requires at least one value");
+      }
+      for (const v of node.values) checkLeafValue(node.field, v, fields);
+      return;
+    default:
+      checkLeafValue(node.field, node.value, fields);
+  }
+}
+
+function checkLeafValue(field: string, value: unknown, fields: ReadonlySet<string>): void {
+  if (!fields.has(field)) {
+    throw new RtDbError("BAD_REQUEST", `filter references unknown field '${field}'`);
+  }
+  if (typeof value !== "string" && typeof value !== "number" && typeof value !== "boolean") {
+    throw new RtDbError("BAD_REQUEST", "filter value must be a string, number, or boolean");
+  }
+}
+
+/**
+ * Evaluate a `FilterExpr` predicate against a stored doc, mirroring server
+ * `query::jsonb_lhs_and_bind` (`query.rs`): the filter value's kind picks the
+ * comparison domain — string compares the doc field's `->>` text, number
+ * compares it as `float8`, boolean as `boolean`. A null/absent field never
+ * matches (SQL NULL exclusion). Assumes `validateFilter` already passed.
+ */
+export function evalFilterExpr(node: FilterExpr, doc: Record<string, unknown>): boolean {
+  switch (node.op) {
+    case "and":
+      return node.exprs.every((e) => evalFilterExpr(e, doc));
+    case "or":
+      return node.exprs.some((e) => evalFilterExpr(e, doc));
+    case "in":
+      return node.values.some((v) => compareLeaf("eq", node.field, v, doc));
+    default:
+      return compareLeaf(node.op, node.field, node.value, doc);
+  }
+}
+
+function compareLeaf(
+  op: FilterLeafOp,
+  field: string,
+  filterValue: unknown,
+  doc: Record<string, unknown>,
+): boolean {
+  const docVal = doc[field];
+  if (docVal === null || docVal === undefined) {
+    return false;
+  }
+  if (typeof filterValue === "string") {
+    return compareValues(op, docToText(docVal), filterValue);
+  }
+  if (typeof filterValue === "number") {
+    const lhs = docToNumber(docVal);
+    return lhs === null ? false : compareValues(op, lhs, filterValue);
+  }
+  if (typeof docVal === "boolean") {
+    return compareValues(op, docVal, filterValue as boolean);
+  }
+  return false;
+}
+
+/** Mirrors Postgres `doc->>'field'`: the JSON text of the value. */
+function docToText(docVal: unknown): string {
+  if (typeof docVal === "string") return docVal;
+  if (typeof docVal === "number") return JSON.stringify(docVal);
+  if (typeof docVal === "boolean") return docVal ? "true" : "false";
+  return JSON.stringify(docVal);
+}
+
+/** Mirrors Postgres `(doc->>'field')::float8`: a number, or a numeric string. */
+function docToNumber(docVal: unknown): number | null {
+  if (typeof docVal === "number") return Number.isFinite(docVal) ? docVal : null;
+  if (typeof docVal === "string" && docVal.trim() !== "") {
+    const n = Number(docVal);
+    return Number.isFinite(n) ? n : null;
+  }
+  return null;
+}
+
+function compareValues(
+  op: FilterLeafOp,
+  lhs: string | number | boolean,
+  rhs: string | number | boolean,
+): boolean {
+  switch (op) {
+    case "eq":
+      return lhs === rhs;
+    case "neq":
+      return lhs !== rhs;
+    case "gt":
+      return lhs > rhs;
+    case "gte":
+      return lhs >= rhs;
+    case "lt":
+      return lhs < rhs;
+    case "lte":
+      return lhs <= rhs;
+  }
 }
 
 /**
