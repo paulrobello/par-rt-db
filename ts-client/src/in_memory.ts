@@ -1048,6 +1048,11 @@ export class InMemoryRtDbClient {
     const lte =
       q.lte !== undefined && rangeField ? coerceIndexValue(tableDef, rangeField, q.lte) : null;
 
+    // Validate the filter against declared fields once (mirrors server compile_filter).
+    const fieldSet = new Set(Object.keys(tableDef.fields));
+    if (q.filter) {
+      validateFilter(q.filter, fieldSet);
+    }
     const filtered: StoredRow[] = [];
     for (const row of this.rowsFor(q.table).values()) {
       if (indexDef) {
@@ -1080,6 +1085,9 @@ export class InMemoryRtDbClient {
         if (lte !== null && compareIndexValues(v, lte) > 0) {
           continue;
         }
+      }
+      if (q.filter && !evalFilterExpr(q.filter, row.doc)) {
+        continue;
       }
       filtered.push(row);
     }

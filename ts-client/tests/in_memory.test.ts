@@ -639,3 +639,106 @@ describe("evalFilterExpr + validateFilter", () => {
     ).not.toThrow();
   });
 });
+
+describe("InMemoryRtDbClient filter", () => {
+  // Self-contained schema so this block doesn't perturb the shared `items`
+  // harness above. Uses the typed `api.users.query().filter(...)` builder, the
+  // same surface live app code uses.
+  const usersSchema = defineSchema({
+    users: defineTable({
+      name: t.string(),
+      age: t.number(),
+      active: t.boolean(),
+    }).index("by_name", ["name"]),
+  });
+  const usersApi = createApi(usersSchema);
+
+  function newClient(): InMemoryRtDbClient {
+    let ms = 1_700_000_000_000;
+    const c = new InMemoryRtDbClient({ now: () => ms++, random: () => 0 });
+    c.pushSchema(usersSchema);
+    return c;
+  }
+
+  async function seed(c: InMemoryRtDbClient): Promise<void> {
+    await c.mutate(
+      mutation()
+        .insert("users", { name: "ada", age: 42, active: true })
+        .insert("users", { name: "bob", age: 17, active: false })
+        .insert("users", { name: "cy", age: 65, active: true })
+        .build(),
+    );
+  }
+
+  it("a filter reduces the result set to matching docs", async () => {
+    const c = newClient();
+    await seed(c);
+    const rows = await c.query(
+      usersApi.users.query().filter({ op: "gt", field: "age", value: 20 }).collect(),
+    );
+    const names = (rows as Array<{ name: string }>).map((r) => r.name).sort();
+    expect(names).toEqual(["ada", "cy"]);
+  });
+
+  it("a filter composes with an index eq prefix and take", async () => {
+    const c = newClient();
+    await seed(c);
+    const rows = await c.query(
+      usersApi.users
+        .query()
+        .withIndex("by_name", ["ada"])
+        .filter({ op: "eq", field: "active", value: true })
+        .take(10),
+    );
+    expect(rows).toHaveLength(1);
+    expect((rows as Array<{ name: string }>)[0].name).toBe("ada");
+  });
+
+  it("an and/or/in filter evaluates correctly end-to-end", async () => {
+    const c = newClient();
+    await seed(c);
+    const rows = await c.query(
+      usersApi.users
+        .query()
+        .filter({
+          op: "or",
+          exprs: [
+            { op: "lt", field: "age", value: 18 },
+            { op: "gte", field: "age", value: 65 },
+          ],
+        })
+        .collect(),
+    );
+    expect((rows as Array<{ name: string }>).map((r) => r.name).sort()).toEqual(["bob", "cy"]);
+
+    const inRows = await c.query(
+      usersApi.users
+        .query()
+        .filter({ op: "in", field: "name", values: ["ada", "cy"] })
+        .collect(),
+    );
+    expect((inRows as Array<{ name: string }>).map((r) => r.name).sort()).toEqual(["ada", "cy"]);
+  });
+
+  it("an unknown filter field throws BAD_REQUEST", async () => {
+    const c = newClient();
+    await seed(c);
+    await expect(
+      c.query(usersApi.users.query().filter({ op: "eq", field: "nope", value: "x" }).collect()),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+  });
+
+  it("filter combined with get is rejected (mirrors server)", async () => {
+    const c = newClient();
+    await seed(c);
+    const [inserted] = await c.mutate(
+      mutation().insert("users", { name: "ada", age: 42, active: true }).build(),
+    );
+    const id = (inserted as { id: string }).id;
+    await expect(
+      c.query({
+        json: { table: "users", get: id, filter: { op: "eq", field: "age", value: 42 } },
+      } as RtQuery<unknown>),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+  });
+});
