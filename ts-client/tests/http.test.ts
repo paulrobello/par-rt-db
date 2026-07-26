@@ -287,7 +287,9 @@ describe("RtDbHttpClient", () => {
   it("authMe surfaces a 401 as an RtDbError envelope", async () => {
     const fetchMock = vi
       .fn()
-      .mockResolvedValue(jsonResponse({ code: "UNAUTHORIZED", message: "machine token rejected" }, 401));
+      .mockResolvedValue(
+        jsonResponse({ code: "UNAUTHORIZED", message: "machine token rejected" }, 401),
+      );
     const client = new RtDbHttpClient({
       url: "http://h:8300",
       db: "kanban",

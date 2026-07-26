@@ -2,6 +2,7 @@ import { act, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { RtDbClient, type WebSocketLike } from "../src/client.js";
 import type { QueryJson } from "../src/protocol.js";
+import type { RtQuery } from "../src/query.js";
 import {
   Authenticated,
   AuthLoading,
@@ -14,7 +15,6 @@ import {
   useQuery,
   useRtDbAuth,
 } from "../src/react.js";
-import type { RtQuery } from "../src/query.js";
 
 class FakeSocket implements WebSocketLike {
   onopen: (() => void) | null = null;
