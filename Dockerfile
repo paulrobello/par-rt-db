@@ -22,7 +22,11 @@ WORKDIR /build
 COPY package.json bun.lock ./
 COPY ts-client/package.json ts-client/package.json
 COPY dashboard/package.json dashboard/package.json
-RUN bun install --frozen-lockfile
+# `--ignore-scripts`: the dashboard's `prepare` runs `build:sdk`, which needs
+# ts-client source not copied until the next layer. The explicit
+# `bun run build` below already builds the SDK, so skipping lifecycle scripts
+# here keeps the layer-cached install independent of source.
+RUN bun install --frozen-lockfile --ignore-scripts
 COPY ts-client ./ts-client
 COPY dashboard ./dashboard
 RUN cd dashboard && bun run build
