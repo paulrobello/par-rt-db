@@ -123,18 +123,24 @@ export function useConnectionState(): ConnectionState {
 export function useRtDbAuth(): {
   state: AuthState;
   user: AuthedUser | null;
-  signIn: () => Promise<void>;
+  signIn: (provider?: "github" | "google") => Promise<void>;
   signOut: () => Promise<void>;
 } {
   const { client, authBaseUrl, state, user } = useContextValue();
 
-  const signIn = useCallback(async () => {
-    const token = await signInWithGitHub(authBaseUrl);
-    if (typeof localStorage !== "undefined") {
-      localStorage.setItem(TOKEN_STORAGE_KEY, token);
-    }
-    client.setToken(token);
-  }, [client, authBaseUrl]);
+  const signIn = useCallback(
+    async (provider: "github" | "google" = "github") => {
+      const token =
+        provider === "google"
+          ? await signInWithGoogle(authBaseUrl)
+          : await signInWithGitHub(authBaseUrl);
+      if (typeof localStorage !== "undefined") {
+        localStorage.setItem(TOKEN_STORAGE_KEY, token);
+      }
+      client.setToken(token);
+    },
+    [client, authBaseUrl],
+  );
 
   const signOut = useCallback(async () => {
     const token =

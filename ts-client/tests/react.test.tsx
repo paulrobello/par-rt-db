@@ -1,4 +1,4 @@
-import { act, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { RtDbClient, type WebSocketLike } from "../src/client.js";
 import type { QueryJson } from "../src/protocol.js";
@@ -12,6 +12,7 @@ import {
   useConnectionState,
   usePaginatedQuery,
   useQuery,
+  useRtDbAuth,
 } from "../src/react.js";
 import type { RtQuery } from "../src/query.js";
 
@@ -236,6 +237,74 @@ describe("signInWithGoogle", () => {
   it("rejects immediately when the popup is blocked", async () => {
     vi.spyOn(window, "open").mockReturnValue(null);
     await expect(signInWithGoogle("http://h:8300")).rejects.toThrow("popup blocked");
+  });
+});
+
+describe("useRtDbAuth signIn routing", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("signIn('google') opens the /auth/google popup", async () => {
+    const { client } = setup();
+    const popup = { closed: false };
+    const openSpy = vi.spyOn(window, "open").mockReturnValue(popup as unknown as Window);
+
+    function View() {
+      const { signIn } = useRtDbAuth();
+      return (
+        <button type="button" onClick={() => void signIn("google")}>
+          google
+        </button>
+      );
+    }
+
+    render(
+      <RtDbProvider client={client} authBaseUrl="http://h:8300">
+        <View />
+      </RtDbProvider>,
+    );
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("google"));
+    });
+
+    expect(openSpy).toHaveBeenCalledWith(
+      expect.stringContaining("/auth/google?origin="),
+      "rtdb-auth",
+      "width=600,height=700",
+    );
+  });
+
+  it("signIn() with no argument opens the /auth/github popup (default)", async () => {
+    const { client } = setup();
+    const popup = { closed: false };
+    const openSpy = vi.spyOn(window, "open").mockReturnValue(popup as unknown as Window);
+
+    function View() {
+      const { signIn } = useRtDbAuth();
+      return (
+        <button type="button" onClick={() => void signIn()}>
+          default
+        </button>
+      );
+    }
+
+    render(
+      <RtDbProvider client={client} authBaseUrl="http://h:8300">
+        <View />
+      </RtDbProvider>,
+    );
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("default"));
+    });
+
+    expect(openSpy).toHaveBeenCalledWith(
+      expect.stringContaining("/auth/github?origin="),
+      "rtdb-auth",
+      "width=600,height=700",
+    );
   });
 });
 
