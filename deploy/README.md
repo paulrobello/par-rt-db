@@ -82,6 +82,22 @@ matching row counts. To migrate any other existing `en_US.utf8` volume to `C`:
   that has `.git`, before rsync). If unset, `/healthz` reports
   `git_commit: "unknown"`.
 
+## Dashboard / SPA
+
+The operator dashboard (React SPA from `dashboard/`) is **baked into the server
+image**, not a live-mounted volume: the `dashboard` stage in `Dockerfile` runs
+the bun/vite build and copies `dist/` to `/app/dashboard-dist`, and
+`RTDB_STATIC_DIR=/app/dashboard-dist` tells the server to serve it same-origin
+(as the router's last-resort SPA fallback, so it never shadows `/healthz`,
+`/api/*`, `/admin/*`, `/sync`, or `/auth/*`). Consequences:
+
+- A **frontend-only change ships via the standard `docker compose up -d --build`**
+  (image rebuild + server container recreate) — it is NOT a hot volume you can
+  swap without a rebuild.
+- Same-origin serving means the dashboard needs **no `RTDB_ALLOWED_ORIGINS`
+  entry** of its own.
+- Unset/empty `RTDB_STATIC_DIR` (or a missing dir) ⇒ API-only, no SPA served.
+
 ## Admin bootstrap (after first deploy)
 
 ```sh
