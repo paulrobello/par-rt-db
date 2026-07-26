@@ -13,6 +13,33 @@ contract against Convex.
 
 ## [Unreleased]
 
+### Audit remediation (2026-07-25)
+
+Comprehensive remediation of the 2026-07-25 project audit (55 findings; 46
+resolved, 9 deferred/no-action per the audit's own verdicts). The full
+`make checkall` gate is green. Highlights:
+
+- **Security**: admin token moved out of `localStorage` (SEC-001, in-memory
+  stopgap — HttpOnly-cookie remedy tracked); `is_admin` re-run per WS op so
+  admin-role revocation takes effect on open connections (SEC-004); strict
+  OAuth-callback origin validation + JS/HTML escaping (SEC-005);
+  `react-router-dom` 6.30→7.18 clearing 3 CVEs (SEC-003); upload-size hard
+  ceiling (SEC-008); unverified-email fallback dropped (SEC-006).
+- **Architecture**: `SubscriptionManager` sharded per-db (ARC-001); env-
+  configurable pool size (ARC-002); CI on `make checkall` (ARC-003); typed
+  protocol enums across all four clients + a cross-client wire-parity corpus
+  (ARC-004/008/009/QA-008); `AppState` regrouped into sub-structs (ARC-006);
+  `mutation_log` expiry moved to a background task (ARC-007).
+- **Quality**: `execute_query` validation cascade refactored to a dispatch
+  table (QA-002); TS in-memory `get`-guard drift fixed + a cross-client
+  combination matrix (QA-001); dashboard Vitest+RTL suite (QA-003).
+- **Docs**: README session-expiry contradiction fixed (DOC-001); Python client
+  documented (DOC-002); `CHANGELOG`/`CONTRIBUTING`/`LICENSE` added; design-spec
+  statuses flipped to Implemented + `SPEC_STATUS.md` index.
+
+See commit range `b0f7108..` on `main`. Manual follow-ups (SEC-001 cookie,
+SEC-008 PATCH-side check, ARC-008 f32-on-wire) are tracked separately.
+
 ### Added
 
 #### Server
