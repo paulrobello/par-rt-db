@@ -19,10 +19,18 @@ use crate::storage;
 use crate::txn::Transaction;
 
 fn bearer_token(headers: &HeaderMap) -> Result<&str, RtDbError> {
-    headers
+    if let Some(v) = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
+    {
+        return Ok(v);
+    }
+    // SEC-001: dashboard cookie path (HttpOnly `rtdb_session`). Same-origin
+    // browser requests carry it automatically; CLI/SDK/machine tokens keep using
+    // the Authorization header. Only session tokens resolve via `resolve_bearer`
+    // (an admin-key cookie authenticates `/admin/*`, not these per-db routes).
+    crate::auth::cookie::session_cookie(headers)
         .ok_or_else(|| RtDbError::unauthorized("missing bearer token"))
 }
 

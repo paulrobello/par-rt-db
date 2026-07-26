@@ -167,7 +167,7 @@ export function useAdmin(): AdminValue {
  * realtime via `/sync`.
  */
 export function AdminProvider({ children }: { children: ReactNode }) {
-  const { token } = useSession();
+  const { token, method } = useSession();
   const client = useMemo(() => new AdminClient(() => token), [token]);
 
   const [databases, setDatabases] = useState<string[]>([]);
@@ -180,7 +180,7 @@ export function AdminProvider({ children }: { children: ReactNode }) {
   const refreshDatabases = useRef<() => Promise<void>>(async () => {});
 
   useEffect(() => {
-    if (!token) {
+    if (!method) {
       setDatabases([]);
       setOps([]);
       setMetrics(null);
@@ -210,12 +210,12 @@ export function AdminProvider({ children }: { children: ReactNode }) {
       if (cancelled) return;
       setConnection((c) => (c === "connected" ? c : "connecting"));
       const proto = window.location.protocol === "https:" ? "wss" : "ws";
-      // Browsers can't set Authorization on a WS handshake, so the admin bearer
-      // rides in the Sec-WebSocket-Protocol subprotocol; the server pulls it
-      // back out and authenticates at the upgrade.
-      ws = new WebSocket(`${proto}://${window.location.host}/admin/stream`, [
-        `rtdb-admin.${token}`,
-      ]);
+      const streamUrl = `${proto}://${window.location.host}/admin/stream`;
+      // SEC-001: the admin credential rides an HttpOnly cookie the browser sends
+      // on the WS upgrade — no JS-readable token. An OAuth session still holds a
+      // token in state and offers the `rtdb-admin.<token>` subprotocol; an
+      // admin-key session has no token and authenticates via the cookie alone.
+      ws = token ? new WebSocket(streamUrl, [`rtdb-admin.${token}`]) : new WebSocket(streamUrl);
       ws.onopen = () => {
         if (cancelled) return;
         backoff = 1000;
@@ -274,7 +274,7 @@ export function AdminProvider({ children }: { children: ReactNode }) {
       ws?.close();
       clearInterval(dbsTimer);
     };
-  }, [token, client]);
+  }, [method, token, client]);
 
   const value: AdminValue = {
     client,

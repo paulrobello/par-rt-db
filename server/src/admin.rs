@@ -4,8 +4,8 @@ use std::time::Duration;
 use axum::body::Body;
 use axum::extract::ws::{WebSocket, WebSocketUpgrade};
 use axum::extract::{FromRequest, Path, Query as QueryParams, Request, State};
-use axum::http::HeaderMap;
-use axum::response::Response;
+use axum::http::{HeaderMap, StatusCode, header::SET_COOKIE};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
@@ -30,10 +30,18 @@ pub(crate) enum AdminPrincipal {
 }
 
 fn bearer_value(headers: &HeaderMap) -> Result<&str, RtDbError> {
-    headers
+    if let Some(v) = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
+    {
+        return Ok(v);
+    }
+    // SEC-001: dashboard cookie path. The browser sends the HttpOnly
+    // `rtdb_session` cookie automatically on same-origin requests — including
+    // the `/admin/stream` WS upgrade — so JS never holds the admin key. Header
+    // still wins (CLI/automation/machine tokens).
+    auth::cookie::session_cookie(headers)
         .ok_or_else(|| RtDbError::unauthorized("missing admin bearer token"))
 }
 
@@ -86,6 +94,47 @@ pub(crate) async fn require_admin(
     headers: &HeaderMap,
 ) -> Result<AdminPrincipal, RtDbError> {
     authenticate_admin(state, bearer_value(headers)?).await
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AdminLoginRequest {
+    admin_key: String,
+}
+
+/// `POST /admin/login` — validates the admin key (constant-time, the same
+/// compare `authenticate_admin` runs) and, on success, issues the SEC-001
+/// HttpOnly session cookie. On a bad key we 401 without touching the cookie.
+/// The credential written is `state.config.admin_key` (the trusted configured
+/// value), never the raw request body, so a `;`-laden guess cannot inject cookie
+/// attributes — `set_session_cookie` validates regardless.
+async fn admin_login(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    ApiJson(body): ApiJson<AdminLoginRequest>,
+) -> Result<Response, RtDbError> {
+    let valid = body
+        .admin_key
+        .as_bytes()
+        .ct_eq(state.config.admin_key.as_bytes());
+    if !bool::from(valid) {
+        return Err(RtDbError::unauthorized("invalid admin key"));
+    }
+    let cookie = auth::cookie::set_session_cookie(
+        &state.config.admin_key,
+        auth::cookie::request_is_secure(&headers),
+    )?;
+    let mut resp = StatusCode::NO_CONTENT.into_response();
+    resp.headers_mut().insert(SET_COOKIE, cookie);
+    Ok(resp)
+}
+
+/// `POST /admin/logout` — clears the SEC-001 session cookie.
+async fn admin_logout() -> Response {
+    let mut resp = StatusCode::NO_CONTENT.into_response();
+    resp.headers_mut()
+        .insert(SET_COOKIE, auth::cookie::clear_session_cookie());
+    resp
 }
 
 #[derive(Serialize)]
@@ -857,6 +906,8 @@ async fn send_stream_json(
 /// compare).
 pub fn admin_routes() -> Router<Arc<AppState>> {
     Router::new()
+        .route("/admin/login", post(admin_login))
+        .route("/admin/logout", post(admin_logout))
         .route("/admin/create-db", post(create_db))
         .route("/admin/push-schema", post(push_schema))
         .route("/admin/dbs", get(list_dbs))

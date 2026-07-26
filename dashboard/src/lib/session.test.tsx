@@ -26,16 +26,16 @@ function Probe() {
   );
 }
 
-function buildFetch(opts: { dbsStatus?: number; meBody?: unknown } = {}) {
-  const dbsStatus = opts.dbsStatus ?? 200;
+function buildFetch(opts: { loginStatus?: number; meBody?: unknown } = {}) {
+  const loginStatus = opts.loginStatus ?? 204;
   const meBody = opts.meBody ?? { email: "ops@example.com" };
   return vi.fn(async (input: RequestInfo | URL, _init?: RequestInit) => {
     const url = typeof input === "string" ? input : input.toString();
-    if (url === "/admin/dbs") {
-      return new Response(JSON.stringify({ databases: [] }), {
-        status: dbsStatus,
-        headers: { "content-type": "application/json" },
-      });
+    if (url === "/admin/login") {
+      return new Response(null, { status: loginStatus });
+    }
+    if (url === "/admin/logout") {
+      return new Response(null, { status: 204 });
     }
     if (url === "/auth/me") {
       return new Response(JSON.stringify(meBody), {
@@ -62,7 +62,7 @@ describe("SessionProvider", () => {
     localStorage.clear();
   });
 
-  it("admin-key sign-in applies the token to state and signOut clears it (no localStorage write)", async () => {
+  it("admin-key sign-in authenticates WITHOUT storing the key (cookie set server-side); signOut clears it", async () => {
     const setItemSpy = vi.spyOn(Storage.prototype, "setItem");
     globalThis.fetch = buildFetch();
 
@@ -76,7 +76,9 @@ describe("SessionProvider", () => {
     await act(async () => {
       screen.getByText("sign-in-admin").click();
     });
-    expect(screen.getByTestId("token").textContent).toBe("test-key");
+    // SEC-001: the admin key is never stored in JS — the server set an HttpOnly
+    // cookie. token stays null; method marks the dashboard authenticated.
+    expect(screen.getByTestId("token").textContent).toBe("(null)");
     expect(screen.getByTestId("method").textContent).toBe("adminkey");
 
     await act(async () => {
@@ -135,7 +137,7 @@ describe("SessionProvider", () => {
   });
 
   it("rejects an invalid admin key without applying a token", async () => {
-    globalThis.fetch = buildFetch({ dbsStatus: 401 });
+    globalThis.fetch = buildFetch({ loginStatus: 401 });
 
     let captured: unknown = null;
     function ProbeErr() {

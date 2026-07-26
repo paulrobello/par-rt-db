@@ -23,12 +23,12 @@ export function useSession(): SessionValue {
 }
 
 export function SessionProvider({ children }: { children: ReactNode }) {
-  // SEC-001: the admin bearer token lives in React state ONLY — never written
-  // to `localStorage` — so an XSS / malicious extension can't lift a persisted
-  // admin key via `localStorage.getItem`. Tradeoff: a page reload clears the
-  // token and the operator re-authenticates. Long-term this should be replaced
-  // by an HttpOnly+Secure+SameSite=Strict cookie set by a server-issued
-  // admin-login endpoint (out of scope for this remediation).
+  // SEC-001: the admin key never lives in JS — `/admin/login` sets an HttpOnly
+  // `rtdb_session` cookie the browser sends on same-origin requests (including
+  // the `/admin/stream` WS upgrade), so XSS can't read it. `token` here is used
+  // ONLY by the OAuth path, which still holds the session token in React state
+  // until Phase 2 moves it into the same cookie; it is `null` for admin-key
+  // logins, so `token` is never a persisted admin key.
   const [token, setToken] = useState<string | null>(null);
   const [method, setMethod] = useState<AuthMethod | null>(null);
   const [user, setUser] = useState<AuthedUser | null>(null);
@@ -52,8 +52,14 @@ export function SessionProvider({ children }: { children: ReactNode }) {
 
   async function signInWithAdminKey(key: string): Promise<void> {
     setError(null);
-    const resp = await fetch("/admin/dbs", {
-      headers: { authorization: `Bearer ${key}` },
+    // SEC-001: validate via `/admin/login`, which sets an HttpOnly session
+    // cookie. The key itself never lives in JS state — the cookie (sent
+    // automatically on same-origin requests) authenticates `/admin/*` and
+    // `/admin/stream` from here on.
+    const resp = await fetch("/admin/login", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ adminKey: key }),
     });
     if (!resp.ok) {
       throw new Error(
@@ -62,7 +68,9 @@ export function SessionProvider({ children }: { children: ReactNode }) {
           : `rejected (${resp.status})`,
       );
     }
-    await applyToken(key, "adminkey");
+    setToken(null);
+    setMethod("adminkey");
+    setUser(null);
   }
 
   function signInWithOAuth(provider: "github" | "google"): Promise<void> {
@@ -104,6 +112,13 @@ export function SessionProvider({ children }: { children: ReactNode }) {
           method: "POST",
           headers: { authorization: `Bearer ${token}` },
         });
+      } catch {
+        /* best-effort */
+      }
+    } else if (method === "adminkey") {
+      // SEC-001: clear the HttpOnly session cookie server-side.
+      try {
+        await fetch("/admin/logout", { method: "POST" });
       } catch {
         /* best-effort */
       }
