@@ -159,7 +159,7 @@ impl TableQuery {
     pub fn vector_search(
         mut self,
         index: &str,
-        vector: Vec<f32>,
+        vector: Vec<f64>,
         limit: u32,
         filter: BTreeMap<String, serde_json::Value>,
     ) -> Self {

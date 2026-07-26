@@ -290,7 +290,10 @@ pub struct SearchQuery {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct VectorSearchQuery {
     pub index: String,
-    pub vector: Vec<f32>,
+    // ARC-008(a): f64 (not f32) — the server, TS, and Python clients all carry
+    // full JSON-number precision, so narrowing to f32 here was the lone path
+    // that silently dropped precision on a round-trip. f64 matches the wire.
+    pub vector: Vec<f64>,
     pub limit: u32,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub filter: BTreeMap<String, serde_json::Value>,
