@@ -367,12 +367,19 @@ export function validateFilter(node: FilterExpr, fields: ReadonlySet<string>): v
       }
       for (const e of node.exprs) validateFilter(e, fields);
       return;
-    case "in":
+    case "in": {
       if (node.values.length === 0) {
         throw new RtDbError("BAD_REQUEST", "in filter requires at least one value");
       }
       for (const v of node.values) checkLeafValue(node.field, v, fields);
+      const firstKind = inValueKind(node.values[0]);
+      for (const v of node.values.slice(1)) {
+        if (inValueKind(v) !== firstKind) {
+          throw new RtDbError("BAD_REQUEST", "in filter values must all be the same type");
+        }
+      }
       return;
+    }
     default:
       checkLeafValue(node.field, node.value, fields);
   }
@@ -385,6 +392,12 @@ function checkLeafValue(field: string, value: unknown, fields: ReadonlySet<strin
   if (typeof value !== "string" && typeof value !== "number" && typeof value !== "boolean") {
     throw new RtDbError("BAD_REQUEST", "filter value must be a string, number, or boolean");
   }
+}
+
+function inValueKind(value: unknown): "string" | "number" | "boolean" {
+  if (typeof value === "string") return "string";
+  if (typeof value === "number") return "number";
+  return "boolean";
 }
 
 /**

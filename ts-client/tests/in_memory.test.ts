@@ -638,6 +638,18 @@ describe("evalFilterExpr + validateFilter", () => {
       ),
     ).not.toThrow();
   });
+
+  it("validateFilter rejects mixed-type in values", () => {
+    expect(() => validateFilter({ op: "in", field: "age", values: [5, "ada"] }, fields)).toThrow(
+      /same type/,
+    );
+  });
+
+  it("validateFilter accepts same-type in values", () => {
+    expect(() =>
+      validateFilter({ op: "in", field: "age", values: [5, 6, 7] }, fields),
+    ).not.toThrow();
+  });
 });
 
 describe("InMemoryRtDbClient filter", () => {
