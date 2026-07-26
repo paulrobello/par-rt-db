@@ -166,12 +166,12 @@ export function AuthLoading(props: { children: ReactNode }): ReactNode {
   return useContextValue().state === "authenticating" ? props.children : null;
 }
 
-/** Opens the server's GitHub OAuth popup and resolves with the session token it posts back. */
-export function signInWithGitHub(baseUrl: string): Promise<string> {
+/** Opens the server's OAuth popup for `provider` and resolves with the session token it posts back. */
+function signInWithOAuth(baseUrl: string, provider: "github" | "google"): Promise<string> {
   const origin = new URL(baseUrl).origin;
   const spaOrigin = window.location.origin;
   const popup = window.open(
-    `${baseUrl.replace(/\/+$/, "")}/auth/github?origin=${encodeURIComponent(spaOrigin)}`,
+    `${baseUrl.replace(/\/+$/, "")}/auth/${provider}?origin=${encodeURIComponent(spaOrigin)}`,
     "rtdb-auth",
     "width=600,height=700",
   );
@@ -204,4 +204,14 @@ export function signInWithGitHub(baseUrl: string): Promise<string> {
       }
     }, 500);
   });
+}
+
+/** Opens the server's GitHub OAuth popup and resolves with the session token it posts back. */
+export function signInWithGitHub(baseUrl: string): Promise<string> {
+  return signInWithOAuth(baseUrl, "github");
+}
+
+/** Opens the server's Google OAuth popup and resolves with the session token it posts back. */
+export function signInWithGoogle(baseUrl: string): Promise<string> {
+  return signInWithOAuth(baseUrl, "google");
 }

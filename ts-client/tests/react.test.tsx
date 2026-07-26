@@ -7,6 +7,7 @@ import {
   AuthLoading,
   RtDbProvider,
   signInWithGitHub,
+  signInWithGoogle,
   Unauthenticated,
   useConnectionState,
   usePaginatedQuery,
@@ -203,6 +204,38 @@ describe("signInWithGitHub", () => {
     // Advancing well past the poll interval after resolution must not throw or
     // produce an unhandled rejection — the interval must already be cleared.
     await vi.advanceTimersByTimeAsync(5000);
+  });
+});
+
+describe("signInWithGoogle", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  it("opens the /auth/google popup and resolves with the token from a valid rtdb-auth message", async () => {
+    const popup = { closed: false };
+    const openSpy = vi.spyOn(window, "open").mockReturnValue(popup as unknown as Window);
+
+    const promise = signInWithGoogle("http://h:8300");
+    window.dispatchEvent(
+      new MessageEvent("message", {
+        origin: "http://h:8300",
+        data: { type: "rtdb-auth", token: "goog-tok" },
+      }),
+    );
+
+    await expect(promise).resolves.toBe("goog-tok");
+    expect(openSpy).toHaveBeenCalledWith(
+      expect.stringContaining("/auth/google?origin="),
+      "rtdb-auth",
+      "width=600,height=700",
+    );
+  });
+
+  it("rejects immediately when the popup is blocked", async () => {
+    vi.spyOn(window, "open").mockReturnValue(null);
+    await expect(signInWithGoogle("http://h:8300")).rejects.toThrow("popup blocked");
   });
 });
 
