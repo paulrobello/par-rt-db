@@ -74,6 +74,12 @@ matching row counts. To migrate any other existing `en_US.utf8` volume to `C`:
   is also stored in parvault for admin CLI use.
 - `RTDB_GITHUB_CLIENT_ID` / `RTDB_GITHUB_CLIENT_SECRET` — from parvault
   (`RTDB_GITHUB_CLIENT_ID` / `RTDB_GITHUB_CLIENT_SECRET`).
+- `RTDB_GOOGLE_CLIENT_ID` / `RTDB_GOOGLE_CLIENT_SECRET` — from parvault
+  (`RTDB_GOOGLE_CLIENT_ID` / `RTDB_GOOGLE_CLIENT_SECRET`); optional, leave blank
+  to disable Google login. **Both must be passed to the server in
+  `docker-compose.yml`'s `environment:` block** (they are, alongside the GitHub
+  pair) — the server reads them at boot, so a change needs `docker compose up -d`
+  to take effect.
 - `RTDB_ALLOWED_ORIGINS` — the SPA origin(s); adjust when the client's final
   origin is known, then `docker compose up -d` to apply.
 - `RTDB_BUILD_COMMIT` (optional) — git short sha baked into `/healthz`. Set it
