@@ -41,7 +41,7 @@ meaningful DX/reliability improvement. Low: rarely needed at this scale.
 | Multi-app hosting | ✅ projects/deployments | ✅ named databases | One instance, many DBs — lighter than Convex's per-deployment model |
 | Typed error envelope | ✅ | ✅ | `{code, message}`, seven codes, both transports |
 | Schema migration on push | ✅ | 🟡 additive-only | Destructive pushes rejected by design; Convex allows more (with backfill) |
-| Admin control plane | ✅ dashboard + CLI | ✅ HTTP + `admin.ts` (TS) + admin methods (Rust client) | create-db, push-schema, mint/revoke tokens, allowlist, export/import |
+| Admin control plane | ✅ dashboard + CLI | ✅ HTTP + `admin.ts` (TS) + admin methods (Rust client) | `RtDbAdminClient` (TS) covers the full server admin HTTP surface — 24 methods: db create/list/push-schema, schema/stats read-back, token mint/revoke/list, db + server-wide admin allowlist CRUD, admin-key login/logout session, metrics, hot config GET/PATCH, op-feed `recent`, owner-bypass query/mutate, snapshot export/import. Deferred: `/admin/stream` (WS — structurally distinct, dashboard covers it). |
 
 ## 2. Gap matrix — ranked by utility ÷ effort
 
