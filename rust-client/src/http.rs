@@ -737,7 +737,7 @@ impl RtDbHttpClient {
             .await
     }
 
-    /// `GET /admin/ops/recent?db=<db>&table=<t>?&n=<n>` → recent document-op
+    /// `GET /admin/ops/recent?db=<db>&table=<t>&n=<n>` → recent document-op
     /// events from the in-memory ring, newest-first. `table` and `n` optional.
     pub async fn ops_recent(
         &self,
@@ -761,6 +761,68 @@ impl RtDbHttpClient {
             q.push(("n", n_str.as_str()));
         }
         Ok(self.get_json::<Resp>("/admin/ops/recent", &q).await?.ops)
+    }
+
+    /// `POST /admin/db/{db}/query` `{query}` → `{result}`. Owner-bypass: an
+    /// admin reads documents across every database regardless of `ownerField`.
+    /// Mirrors [`run`](Self::run) but routes through the admin path with `db`
+    /// in the URL (singular `db`, not the plural `dbs` of `get_schema`), so the
+    /// body omits `db`. Deserialize `{result}` into `T` the same way `run` does.
+    pub async fn admin_query<T: DeserializeOwned>(
+        &self,
+        db: &str,
+        query: &crate::query::Query,
+    ) -> Result<T, RtDbError> {
+        #[derive(Serialize)]
+        struct Body<'a> {
+            query: &'a crate::query::Query,
+        }
+        let resp = self
+            .post_json(&format!("/admin/db/{}/query", db), &Body { query })
+            .await?;
+        self.json_result::<T>(resp).await
+    }
+
+    /// `POST /admin/db/{db}/mutate` `{txn, idempotencyKey?}` → `{results}`.
+    /// Owner-bypass: an admin writes documents across every database regardless
+    /// of `ownerField`. Mirrors [`mutate`](Self::mutate) but routes through the
+    /// admin path with `db` in the URL, so the body omits `db`. Returns one
+    /// [`StepResult`](crate::mutation::StepResult) per step.
+    pub async fn admin_mutate(
+        &self,
+        db: &str,
+        txn: &Transaction,
+        idempotency_key: Option<&str>,
+    ) -> Result<Vec<StepResult>, RtDbError> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Body<'a> {
+            txn: &'a Transaction,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            idempotency_key: Option<&'a str>,
+        }
+        let resp = self
+            .post_json(
+                &format!("/admin/db/{}/mutate", db),
+                &Body {
+                    txn,
+                    idempotency_key,
+                },
+            )
+            .await?;
+        #[derive(serde::Deserialize)]
+        struct Resp {
+            results: Vec<serde_json::Value>,
+        }
+        let parsed = self.deserialize::<Resp>(resp).await?;
+        parsed
+            .results
+            .into_iter()
+            .map(|v| {
+                serde_json::from_value::<StepResult>(v)
+                    .map_err(|e| RtDbError::internal(format!("invalid step result: {e}")))
+            })
+            .collect()
     }
 
     async fn post_json<Req: Serialize>(
@@ -1482,8 +1544,10 @@ mod tests {
 mod admin_tests {
     use super::RtDbHttpClient;
     use crate::error::ErrorCode;
+    use crate::mutation::Mutation;
+    use crate::query::TableQuery;
     use crate::schema::{FieldType, SchemaDef, Table};
-    use serde_json::json;
+    use serde_json::{Value, json};
     use wiremock::matchers::{
         body_partial_json, body_string_contains, header, method, path, query_param,
     };
@@ -1929,5 +1993,92 @@ mod admin_tests {
         assert_eq!(ops[0].ts, 1000);
         assert_eq!(ops[0].owner, None);
         assert_eq!(ops[1].owner, Some("u1".to_string()));
+    }
+
+    // Owner-bypass document endpoints (`POST /admin/db/{db}/query|mutate`).
+    // Unlike the non-admin `run`/`mutate`, `db` rides in the path (singular
+    // `db`, not the plural `dbs` used by `get_schema`/`db_stats`), so the body
+    // omits it. `idempotencyKey` is omitted when `None`.
+
+    #[tokio::test]
+    async fn admin_query_posts_to_admin_db_singular_path_and_unwraps_result() {
+        let (server, client) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/admin/db/kanban/query"))
+            .and(header("authorization", BEARER))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "result": [{"_id": "a"}, {"_id": "b"}]
+            })))
+            .mount(&server)
+            .await;
+        let q = TableQuery::new("items").take(2);
+        let got: Vec<Value> = client.admin_query("kanban", &q).await.unwrap();
+        assert_eq!(got.len(), 2);
+        // `db` rides in the path, not the body
+        let body: Value =
+            serde_json::from_slice(&server.received_requests().await.unwrap()[0].body).unwrap();
+        assert!(
+            body.get("db").is_none(),
+            "admin_query body must not carry db: {body}"
+        );
+        assert!(
+            body.get("query").is_some(),
+            "admin_query body must carry query: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_mutate_posts_to_admin_db_singular_path_and_unwraps_results() {
+        let (server, client) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/admin/db/kanban/mutate"))
+            .and(header("authorization", BEARER))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": [{"id": "new1"}, null]
+            })))
+            .mount(&server)
+            .await;
+        let txn = Mutation::new()
+            .insert("items", json!({"name": "x"}))
+            .patch("items", "i1", json!({"y": 1}))
+            .build();
+        let res = client.admin_mutate("kanban", &txn, None).await.unwrap();
+        assert_eq!(res.len(), 2);
+        assert!(matches!(
+            res[0],
+            crate::mutation::StepResult::Insert { ref id } if id == "new1"
+        ));
+        // omit-when-no-key: `idempotencyKey` is absent and `db` rides in the path
+        let body: Value =
+            serde_json::from_slice(&server.received_requests().await.unwrap()[0].body).unwrap();
+        assert!(
+            body.get("db").is_none(),
+            "admin_mutate body must not carry db: {body}"
+        );
+        assert!(
+            body.get("idempotencyKey").is_none(),
+            "admin_mutate must omit idempotencyKey when None: {body}"
+        );
+        assert!(
+            body.get("txn").is_some(),
+            "admin_mutate body must carry txn: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_mutate_includes_idempotency_key_when_some() {
+        let (server, client) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/admin/db/kanban/mutate"))
+            .and(header("authorization", BEARER))
+            .and(body_partial_json(json!({"idempotencyKey": "k1"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"results": []})))
+            .mount(&server)
+            .await;
+        let txn = Mutation::new().delete("items", "i1").build();
+        client
+            .admin_mutate("kanban", &txn, Some("k1"))
+            .await
+            .unwrap();
     }
 }
