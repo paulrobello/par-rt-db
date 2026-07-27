@@ -12,6 +12,7 @@ default = ["http"]
 http = ["dep:reqwest"]
 ws = ["dep:tokio", "dep:tokio-tungstenite", "dep:futures-util"]
 admin = ["http"]
+in_memory = []
 
 [lints.rust]
 warnings = "deny"

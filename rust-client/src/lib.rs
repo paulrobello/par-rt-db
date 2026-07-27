@@ -13,6 +13,7 @@
 //! | `http` | yes | `RtDbHttpClient` — typed query / mutate / `auth_me` |
 //! | `ws` | no | `RtDbClient` (`src/ws.rs`) — reactive WebSocket client (live query subscriptions + mutate) |
 //! | `admin` | no | `/admin/*` control-plane client — push-schema, create-db, mint-token, revoke-token, allowlist, export, import |
+//! | `in_memory` | no | `InMemoryRtDbClient` (`src/in_memory.rs`) — in-memory harness for unit tests (no network, no Postgres) |
 //!
 //! `core` (wire types, schema/query/mutation builders, error model) compiles with no
 //! features. `[lints.rust] warnings = "deny"` — same zero-warning posture as the server.
@@ -46,6 +47,9 @@ pub mod wire;
 #[cfg(feature = "http")]
 pub mod http;
 
+#[cfg(feature = "in_memory")]
+pub mod in_memory;
+
 #[cfg(feature = "ws")]
 pub mod ws;
 
@@ -60,6 +64,9 @@ pub use wire::{
 
 #[cfg(feature = "http")]
 pub use http::RtDbHttpClient;
+
+#[cfg(feature = "in_memory")]
+pub use in_memory::InMemoryRtDbClient;
 
 #[cfg(feature = "ws")]
 pub use ws::{ClientStatus, Config, ConnectionState, RtDbClient, Snapshot, Subscription};
