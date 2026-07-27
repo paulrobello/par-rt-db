@@ -18,6 +18,7 @@
 
 use crate::error::{ErrorCode, RtDbError};
 use crate::mutation::{StepResult, Transaction};
+use crate::optimistic::{OptimisticProjection, project_optimistic_update};
 use crate::query::Query;
 use crate::wire::{AuthedUser, ClientMessage, ScheduleInfo, ScheduleWhen, ServerMessage};
 
@@ -97,6 +98,12 @@ pub struct Config {
     /// How often to send a `{type:"ping"}` keepalive. Reconnect if no pong arrives
     /// within `2 × heartbeat`.
     pub heartbeat: Duration,
+    /// When true, a `mutate` overlays [`project_optimistic_update`]'s projected
+    /// effect on each matching subscription immediately (before the server
+    /// round-trip); the overlay is reconciled to the authoritative `queryUpdate`
+    /// and rolled back on `mutateErr`/reject/close. Off ⇒ byte-for-byte the
+    /// pre-optimistic behavior.
+    pub optimistic_updates: bool,
 }
 
 impl Default for Config {
@@ -105,11 +112,23 @@ impl Default for Config {
             backoff_base: Duration::from_millis(500),
             backoff_max: Duration::from_secs(15),
             heartbeat: Duration::from_secs(20),
+            optimistic_updates: false,
         }
     }
 }
 
 // ── Internal subscription / mutation state ───────────────────────────────────
+
+/// Per-subscription optimistic-overlay state. `server_last` is the projection
+/// base: the most recent authoritative result, updated on each `queryUpdate`.
+/// `active` is true while an overlay is currently covering the receiver (set on
+/// apply, cleared on reconcile/rollback). Guarded by its own mutex so it can be
+/// mutated through the shared `Arc<SubState>`; lock order is `subs` → `optimistic`.
+#[derive(Default)]
+struct OptimisticState {
+    active: bool,
+    server_last: Option<serde_json::Value>,
+}
 
 /// One server subscription, shared by every caller subscribed to the same query
 /// shape. The `watch::Sender` delivers [`Snapshot`]s; the `refcount` counts live
@@ -121,15 +140,21 @@ struct SubState {
     /// Live [`Subscription`] handles for this shape. Atomic so it can be bumped
     /// through the shared `Arc` without taking the maps lock.
     refcount: AtomicU64,
+    /// Optimistic-overlay bookkeeping; interior-mutable so the apply/reconcile/
+    /// rollback hooks can mutate it through the `Arc<SubState>`.
+    optimistic: Mutex<OptimisticState>,
 }
 
 /// Shared (caller ↔ driver) subscription tables, guarded by one mutex. `by_key`
 /// is authoritative (keyed by the canonical query shape); `by_id` routes incoming
-/// `queryUpdate`s back to the shape.
+/// `queryUpdate`s back to the shape. `overlays` is the reverse index
+/// (`mut_id → query_id`s) for rollback: when a `mutateErr`/reject drops a
+/// mutation, every subscription it overlaid is reverted.
 #[derive(Default)]
 struct SubMaps {
     by_key: HashMap<String, Arc<SubState>>,
     by_id: HashMap<String, String>,
+    overlays: HashMap<String, HashSet<String>>,
 }
 
 /// Reply channel for a mutation the caller is awaiting.
@@ -453,6 +478,7 @@ impl RtDbClient {
                     query: query.clone(),
                     tx,
                     refcount: AtomicU64::new(1),
+                    optimistic: Mutex::new(OptimisticState::default()),
                 });
                 maps.by_key.insert(key.clone(), sub);
                 maps.by_id.insert(query_id.clone(), key);
@@ -487,6 +513,9 @@ impl RtDbClient {
             "mut-{}",
             self.inner.mut_counter.fetch_add(1, Ordering::Relaxed)
         );
+        if self.inner.config.optimistic_updates {
+            apply_optimistic(&self.inner, &mut_id, txn);
+        }
         let (reply_tx, reply_rx) = oneshot::channel();
         let _ = self.inner.cmd_tx.send(Cmd::Mutate(Box::new(QueuedMutate {
             mut_id,
@@ -669,7 +698,12 @@ async fn drive(mut driver: Driver) {
         {
             SessionOutcome::AuthFailed => {
                 driver.set_state(ConnectionState::Idle);
-                reject_all(&mut pending, &mut unsent, "authentication failed");
+                reject_all(
+                    &driver.inner,
+                    &mut pending,
+                    &mut unsent,
+                    "authentication failed",
+                );
                 reject_all_schedules(
                     &mut pending_schedules,
                     &mut unsent_schedules,
@@ -681,7 +715,11 @@ async fn drive(mut driver: Driver) {
             }
             SessionOutcome::Reconnect => {
                 driver.set_state(ConnectionState::Reconnecting);
-                reject_inflight(&mut pending, "connection closed before acknowledgment");
+                reject_inflight(
+                    &driver.inner,
+                    &mut pending,
+                    "connection closed before acknowledgment",
+                );
                 reject_inflight_schedules(
                     &mut pending_schedules,
                     "connection closed before acknowledgment",
@@ -698,7 +736,7 @@ async fn drive(mut driver: Driver) {
         }
     }
 
-    reject_all(&mut pending, &mut unsent, "client is closed");
+    reject_all(&driver.inner, &mut pending, &mut unsent, "client is closed");
     reject_all_schedules(
         &mut pending_schedules,
         &mut unsent_schedules,
@@ -1059,6 +1097,13 @@ fn apply_server_message(
                 .get(&query_id)
                 .and_then(|key| maps.by_key.get(key))
             {
+                // Reconcile: the authoritative result supersedes any in-flight
+                // overlay; record it as the new projection base.
+                {
+                    let mut opt = sub.optimistic.lock().unwrap_or_else(|p| p.into_inner());
+                    opt.active = false;
+                    opt.server_last = Some(result.clone());
+                }
                 let _ = sub.tx.send(Snapshot::Value(Box::new(result)));
             }
         }
@@ -1074,11 +1119,18 @@ fn apply_server_message(
             if let Some(reply) = pending.remove(&mut_id) {
                 let _ = reply.send(Ok(results));
             }
+            // No revert: the reconciling `QueryUpdate`(s) arrive and supersede
+            // any overlay. Just drop the reverse index — the overlays are no
+            // longer rollback-eligible.
+            let mut maps = inner.subs.lock().unwrap_or_else(|p| p.into_inner());
+            maps.overlays.remove(&mut_id);
         }
         ServerMessage::MutateErr { mut_id, error } => {
             if let Some(reply) = pending.remove(&mut_id) {
                 let _ = reply.send(Err(error));
             }
+            let mut maps = inner.subs.lock().unwrap_or_else(|p| p.into_inner());
+            revert_overlays_for(&mut maps, &mut_id);
         }
         ServerMessage::ScheduleOk { schedule_id, id } => {
             if let Some(reply) = pending_schedules.remove(&schedule_id) {
@@ -1136,24 +1188,100 @@ fn maybe_unsubscribe(inner: &Arc<ClientInner>, query_id: &str) {
     }
 }
 
+/// Mirror ts's `applyOptimistic`: for each live subscription whose `server_last`
+/// base value is known, project `txn` onto it; for each non-`Skip` projection,
+/// push the overlaid value through the watch channel immediately (before the
+/// server round-trip) and record its `query_id` under `mut_id` in `overlays`
+/// so a later rollback can find it. Caller-side (in `RtDbClient::mutate`) so
+/// subscribers in other tasks see the overlay before the caller awaits.
+fn apply_optimistic(inner: &ClientInner, mut_id: &str, txn: &Transaction) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let mut maps = inner.subs.lock().unwrap_or_else(|p| p.into_inner());
+    let mut touched: Vec<String> = Vec::new();
+    for sub in maps.by_key.values() {
+        let mut opt = sub.optimistic.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(base) = opt.server_last.clone() else {
+            continue;
+        };
+        match project_optimistic_update(&sub.query, &base, txn, now) {
+            OptimisticProjection::Overlaid(v) => {
+                opt.active = true;
+                let _ = sub.tx.send(Snapshot::Value(Box::new(v)));
+                touched.push(sub.query_id.clone());
+            }
+            OptimisticProjection::Skip => {}
+        }
+    }
+    if !touched.is_empty() {
+        maps.overlays
+            .insert(mut_id.to_string(), touched.into_iter().collect());
+    }
+}
+
+/// Revert one subscription's overlay: if one is active and a `server_last` base
+/// exists, push the base back through the watch channel and clear `active`. No
+/// op when no overlay is active (e.g. a `QueryUpdate` already reconciled).
+fn revert_overlay(maps: &SubMaps, query_id: &str) {
+    if let Some(sub) = maps
+        .by_id
+        .get(query_id)
+        .and_then(|key| maps.by_key.get(key))
+    {
+        let mut opt = sub.optimistic.lock().unwrap_or_else(|p| p.into_inner());
+        if opt.active
+            && let Some(base) = opt.server_last.clone()
+        {
+            opt.active = false;
+            let _ = sub.tx.send(Snapshot::Value(Box::new(base)));
+        }
+    }
+}
+
+/// Reverse-index revert: drop `mut_id`'s entry from `overlays` and revert every
+/// subscription it had overlaid. Called from `MutateErr` and the reject paths.
+fn revert_overlays_for(maps: &mut SubMaps, mut_id: &str) {
+    if let Some(qids) = maps.overlays.remove(mut_id) {
+        for qid in qids {
+            revert_overlay(maps, &qid);
+        }
+    }
+}
+
 /// Reject every in-flight (sent, unacked) mutation. Queued (never-sent) mutations
-/// are left intact so they survive the reconnect — see [`reject_all`].
-fn reject_inflight(pending: &mut HashMap<String, MutReply>, reason: &str) {
+/// are left intact so they survive the reconnect — see [`reject_all`]. Each
+/// rejected mutation's overlays are reverted (a sent-but-unacked mutate never
+/// gets a `MutateOk`/`MutateErr`, so the rollback must happen here).
+fn reject_inflight(
+    inner: &Arc<ClientInner>,
+    pending: &mut HashMap<String, MutReply>,
+    reason: &str,
+) {
     let err = RtDbError::new(ErrorCode::Internal, reason);
-    for (_, reply) in pending.drain() {
+    let mut maps = inner.subs.lock().unwrap_or_else(|p| p.into_inner());
+    for (mut_id, reply) in pending.drain() {
+        revert_overlays_for(&mut maps, &mut_id);
         let _ = reply.send(Err(err.clone()));
     }
 }
 
 /// Reject every mutation, in-flight and queued. Used on terminal teardown.
 fn reject_all(
+    inner: &Arc<ClientInner>,
     pending: &mut HashMap<String, MutReply>,
     unsent: &mut VecDeque<QueuedMutate>,
     reason: &str,
 ) {
-    reject_inflight(pending, reason);
+    reject_inflight(inner, pending, reason);
     let err = RtDbError::new(ErrorCode::Internal, reason);
+    // Queued mutates also had overlays applied (the apply hook runs in
+    // `RtDbClient::mutate` before the driver even receives the command), so
+    // revert them too.
+    let mut maps = inner.subs.lock().unwrap_or_else(|p| p.into_inner());
     for q in unsent.drain(..) {
+        revert_overlays_for(&mut maps, &q.mut_id);
         let _ = q.reply.send(Err(err.clone()));
     }
 }
@@ -1377,12 +1505,16 @@ mod tests {
     // map; exercise it directly to cover QueryUpdate, SubscribeErr, MutateOk/Err.
 
     fn rig_with_sub() -> (Arc<ClientInner>, watch::Receiver<Snapshot>) {
+        rig_with_sub_and_config(Config::default())
+    }
+
+    fn rig_with_sub_and_config(config: Config) -> (Arc<ClientInner>, watch::Receiver<Snapshot>) {
         let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel::<Cmd>();
         let (status_tx, _status_rx) = watch::channel(ClientStatus::default());
         let inner = Arc::new(ClientInner {
             url: "ws://h".into(),
             db: "d".into(),
-            config: Config::default(),
+            config,
             get_token: Box::new(|| Box::pin(async { None })),
             cmd_tx,
             status_tx,
@@ -1400,6 +1532,7 @@ mod tests {
             query: query.clone(),
             tx,
             refcount: AtomicU64::new(1),
+            optimistic: Mutex::new(OptimisticState::default()),
         });
         {
             let mut maps = inner.subs.lock().unwrap();
@@ -1407,6 +1540,16 @@ mod tests {
             maps.by_id.insert("sub-1".into(), canonical_key(&query));
         }
         (inner, rx)
+    }
+
+    /// Lock the maps and grab the lone seeded sub's `Arc`. Helper for tests that
+    /// need to seed `optimistic` state before delivering a server message.
+    fn only_sub(maps: &SubMaps) -> Arc<SubState> {
+        maps.by_key
+            .values()
+            .next()
+            .expect("rig seeds one sub")
+            .clone()
     }
 
     #[test]
@@ -1443,6 +1586,7 @@ mod tests {
         assert!(matches!(rx.borrow().clone(), Snapshot::Error(_)));
         let maps = inner.subs.lock().unwrap();
         assert!(maps.by_id.is_empty() && maps.by_key.is_empty());
+        assert!(maps.overlays.is_empty());
     }
 
     #[tokio::test]
@@ -1478,6 +1622,208 @@ mod tests {
         let err = rx_err.await.unwrap().unwrap_err();
         assert_eq!(err.code, ErrorCode::NotFound);
         assert!(pending.is_empty());
+    }
+
+    // ── optimistic-update wiring ───────────────────────────────────────────
+    //
+    // With `optimistic_updates` off (the default) every preceding test is
+    // unchanged. The three tests below exercise the apply/reconcile/rollback
+    // hooks that light up only with the flag on.
+
+    /// Apply hook: an insert transaction overlays the projected insert on the
+    /// receiver immediately and records the reverse-index entry.
+    #[test]
+    fn apply_optimistic_pushes_overlay_when_enabled() {
+        let (inner, rx) = rig_with_sub_and_config(Config {
+            optimistic_updates: true,
+            ..Config::default()
+        });
+        // Seed the projection base (normally set by the first QueryUpdate).
+        {
+            let maps = inner.subs.lock().unwrap();
+            let sub = only_sub(&maps);
+            let mut opt = sub.optimistic.lock().unwrap();
+            opt.server_last = Some(json!([{"_id":"a","_creationTime":1,"_version":1,"n":1}]));
+        }
+        let txn = crate::mutation::Mutation::new()
+            .insert("items", json!({ "n": 2 }))
+            .build();
+        apply_optimistic(&inner, "mut-7", &txn);
+
+        match rx.borrow().clone() {
+            Snapshot::Value(v) => {
+                let arr = v.as_array().expect("overlaid is array");
+                assert_eq!(arr.len(), 2);
+                assert_eq!(arr[1]["n"], 2);
+                assert!(
+                    arr[1]["_id"]
+                        .as_str()
+                        .unwrap()
+                        .starts_with("__optimistic__")
+                );
+            }
+            other => panic!("expected overlaid Value, got {other:?}"),
+        }
+        let maps = inner.subs.lock().unwrap();
+        let qids = maps
+            .overlays
+            .get("mut-7")
+            .expect("overlay reverse-index entry recorded");
+        assert_eq!(qids.len(), 1);
+        let sub = only_sub(&maps);
+        let opt = sub.optimistic.lock().unwrap();
+        assert!(opt.active, "overlay marked active");
+    }
+
+    /// Reconcile hook: a `QueryUpdate` clears an active overlay, pushes the
+    /// authoritative value, and records it as the new projection base.
+    #[test]
+    fn query_update_reconcile_clears_active_and_records_base() {
+        let (inner, rx) = rig_with_sub();
+        // Seed an active overlay with a stale base.
+        {
+            let maps = inner.subs.lock().unwrap();
+            let sub = only_sub(&maps);
+            let mut opt = sub.optimistic.lock().unwrap();
+            opt.active = true;
+            opt.server_last = Some(json!([{"_id":"old"}]));
+        }
+        let mut pending = HashMap::new();
+        let mut pending_schedules: HashMap<String, SchedReply> = HashMap::new();
+        apply_server_message(
+            &inner,
+            ServerMessage::QueryUpdate {
+                query_id: "sub-1".into(),
+                result: json!([{"_id":"a"},{"_id":"b"}]),
+            },
+            &mut pending,
+            &mut pending_schedules,
+        );
+        match rx.borrow().clone() {
+            Snapshot::Value(v) => {
+                assert_eq!(v.as_array().unwrap().len(), 2);
+            }
+            other => panic!("expected reconciled Value, got {other:?}"),
+        }
+        let maps = inner.subs.lock().unwrap();
+        let sub = only_sub(&maps);
+        let opt = sub.optimistic.lock().unwrap();
+        assert!(!opt.active, "reconcile cleared active");
+        assert_eq!(
+            opt.server_last,
+            Some(json!([{"_id":"a"},{"_id":"b"}])),
+            "server_last updated to authoritative base"
+        );
+    }
+
+    /// Rollback hook: a `MutateErr` reverts every overlay indexed under its
+    /// `mut_id` back to `server_last` and drops the reverse-index entry.
+    #[tokio::test]
+    async fn mutate_err_rolls_back_overlay() {
+        let (inner, rx) = rig_with_sub();
+        let base = json!([{"_id":"a","_creationTime":1,"_version":1,"n":1}]);
+        // Seed: an overlay is active, server_last holds the pre-overlay base,
+        // and the overlay is reverse-indexed under mut-1.
+        {
+            let mut maps = inner.subs.lock().unwrap();
+            let sub = only_sub(&maps);
+            {
+                let mut opt = sub.optimistic.lock().unwrap();
+                opt.active = true;
+                opt.server_last = Some(base.clone());
+            }
+            // Simulate the in-flight overlaid value the receiver currently sees.
+            let _ = sub
+                .tx
+                .send(Snapshot::Value(Box::new(json!([{"_id":"a","n":2}]))));
+            let mut set = HashSet::new();
+            set.insert("sub-1".to_string());
+            maps.overlays.insert("mut-1".into(), set);
+        }
+        match rx.borrow().clone() {
+            Snapshot::Value(v) => assert_eq!(v[0]["n"], 2, "receiver shows overlaid value"),
+            other => panic!("expected overlaid Value pre-rollback, got {other:?}"),
+        }
+
+        let mut pending: HashMap<String, MutReply> = HashMap::new();
+        let mut pending_schedules: HashMap<String, SchedReply> = HashMap::new();
+        apply_server_message(
+            &inner,
+            ServerMessage::MutateErr {
+                mut_id: "mut-1".into(),
+                error: RtDbError::new(ErrorCode::Internal, "boom"),
+            },
+            &mut pending,
+            &mut pending_schedules,
+        );
+
+        match rx.borrow().clone() {
+            Snapshot::Value(v) => assert_eq!(*v, base, "receiver reverted to base"),
+            other => panic!("expected reverted base, got {other:?}"),
+        }
+        let maps = inner.subs.lock().unwrap();
+        assert!(maps.overlays.is_empty(), "reverse-index entry dropped");
+        let sub = only_sub(&maps);
+        let opt = sub.optimistic.lock().unwrap();
+        assert!(!opt.active, "overlay inactive after rollback");
+        assert_eq!(
+            opt.server_last,
+            Some(base),
+            "server_last preserved for next projection"
+        );
+    }
+
+    /// `MutateOk` drops the reverse-index entry without reverting: the
+    /// reconciling `QueryUpdate`(s) will supersede any overlay.
+    #[tokio::test]
+    async fn mutate_ok_drops_overlay_without_revert() {
+        let (inner, rx) = rig_with_sub();
+        let overlaid = json!([{"_id":"a","n":2}]);
+        {
+            let mut maps = inner.subs.lock().unwrap();
+            let sub = only_sub(&maps);
+            {
+                let mut opt = sub.optimistic.lock().unwrap();
+                opt.active = true;
+                opt.server_last = Some(json!([{"_id":"a","n":1}]));
+            }
+            let _ = sub.tx.send(Snapshot::Value(Box::new(overlaid.clone())));
+            let mut set = HashSet::new();
+            set.insert("sub-1".to_string());
+            maps.overlays.insert("mut-1".into(), set);
+        }
+
+        let mut pending: HashMap<String, MutReply> = HashMap::new();
+        let mut pending_schedules: HashMap<String, SchedReply> = HashMap::new();
+        let (reply_tx, _reply_rx) = oneshot::channel();
+        pending.insert("mut-1".into(), reply_tx);
+        apply_server_message(
+            &inner,
+            ServerMessage::MutateOk {
+                mut_id: "mut-1".into(),
+                results: vec![json!({"id":"a"})],
+            },
+            &mut pending,
+            &mut pending_schedules,
+        );
+
+        // Receiver is unchanged — the overlaid value stays until the QueryUpdate
+        // arrives to reconcile.
+        match rx.borrow().clone() {
+            Snapshot::Value(v) => assert_eq!(*v, overlaid, "MutateOk does not revert"),
+            other => panic!("expected overlaid value to persist, got {other:?}"),
+        }
+        let maps = inner.subs.lock().unwrap();
+        assert!(
+            maps.overlays.is_empty(),
+            "reverse-index dropped on MutateOk"
+        );
+        let sub = only_sub(&maps);
+        let opt = sub.optimistic.lock().unwrap();
+        assert!(
+            opt.active,
+            "overlay still active until QueryUpdate reconciles"
+        );
     }
 
     // Mirror of `mutate_ok_and_err_resolve_pending` for the schedule track:
