@@ -1068,9 +1068,11 @@ impl InMemoryRtDbClient {
         self.subscribers.push(sub.clone());
 
         // Initial value, delivered synchronously (server's first queryUpdate).
-        // Errors are suppressed on the initial fire too — a query that fails
-        // never fires the callback, matching TS `executeQuery` rethrowing into
-        // a silent skip on subsequent notifications.
+        // DIVERGENCE from TS: the TS harness has no try/catch here or in
+        // `notifySubs`, so a query error propagates out of `subscribe`/`mutate`/
+        // `tick`. This port suppresses such errors (a failing query simply never
+        // fires) to keep `subscribe`/`notify_subs` infallible — tests that need
+        // to assert on a failing query should call `run_query` directly.
         if let Ok(initial) = self.run_query(&query) {
             let initial_canon = canonical(&initial);
             *sub.last.lock().unwrap_or_else(|p| p.into_inner()) = Some(initial_canon);
@@ -1097,7 +1099,7 @@ impl InMemoryRtDbClient {
             }
             let next = match self.run_query(&sub.query) {
                 Ok(v) => v,
-                Err(_) => continue, // a query error suppresses the notification
+                Err(_) => continue, // DIVERGENCE from TS (which propagates): suppress so a bad subscriber query can't abort the write
             };
             let next_canon = canonical(&next);
             let mut last_lock = sub.last.lock().unwrap_or_else(|p| p.into_inner());
@@ -4991,7 +4993,7 @@ mod tests {
     }
 
     #[test]
-    fn delete_file_removes_the_blob_and_idempotent_on_unknown_id() {
+    fn delete_file_removes_the_blob_and_rejects_unknown_id_with_not_found() {
         let mut c = InMemoryRtDbClient::new(InMemoryRtDbClientOptions::default());
         let up = c.upload(b"x".to_vec(), None).expect("upload ok");
         c.delete_file(&up.id).expect("delete ok");
