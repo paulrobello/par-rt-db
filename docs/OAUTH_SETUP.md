@@ -156,7 +156,7 @@ curl -s https://rtdb.pardev.net/auth/me -H "Authorization: Bearer <session-token
 
 | Symptom | Cause / fix |
 |---|---|
-| `503 {… "oauth not configured"}` | Both `CLIENT_ID` and `CLIENT_SECRET` not set, or the container wasn't recreated after editing `.env`. |
+| `503 {… "oauth not configured"}` | `CLIENT_ID`/`CLIENT_SECRET` not set in the **container's** env. Three causes: blank in `.env`, the container wasn't recreated after editing `.env`, or `docker-compose.yml` doesn't pass that provider's vars into the server `environment:` block (so they sit in `.env` unused — the bug that blocked Google on first enable). |
 | `403 "origin not allowed"` | The `origin=` you passed to `/auth/{provider}` is not in `RTDB_ALLOWED_ORIGINS`. Add it (hot-reloadable via `PATCH /admin/config`). |
 | Provider error page: `redirect_uri_mismatch` | The callback URL registered at the provider doesn't exactly match `RTDB_PUBLIC_URL` + the callback path (see the [quick reference](#quick-reference)). Watch the scheme (`https://`) and trailing slash. |
 | `403 "no verified email"` | The account's email isn't verified at the provider. Verify it, or (Google) ensure the account is a *Test user* while the consent screen is in Testing. |
@@ -173,6 +173,12 @@ Each new provider is a small, self-contained implementation behind the
   verified-email fetch + `session::create_session`).
 - Add the two `Config` fields (env: `RTDB_<PROVIDER>_CLIENT_ID` /
   `_SECRET`) and the two routes in `auth_routes()`.
+- **Wire the env vars into the deploy** — add the two vars to the server
+  service's `environment:` block in `docker-compose.yml` (mirroring the
+  GitHub/Google pair) and to `.env.example`. Without the compose line the vars
+  sit in `.env` unused: the container never sees them, `from_config` returns
+  `None`, and the provider's routes return `503` even after a container
+  recreate.
 - Register an OAuth app with that provider; its callback is
   `RTDB_PUBLIC_URL` + the new `callback_path`.
 
