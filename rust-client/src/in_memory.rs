@@ -1458,12 +1458,12 @@ fn paginate_result(
     let page: Vec<&StoredRow> = rows.into_iter().take(num_items).collect();
     let docs: Vec<Value> = page.iter().map(|row| merge_doc(row)).collect();
 
-    let next_cursor = if has_next && !page.is_empty() {
-        let last = page.last().expect("non-empty checked above");
-        let keyset: Vec<Value> = sort_cols.iter().map(|c| sort_value(last, c)).collect();
-        Some(crate::cursor::encode_cursor(&keyset)?)
-    } else {
-        None
+    let next_cursor = match (has_next, page.last()) {
+        (true, Some(last)) => {
+            let keyset: Vec<Value> = sort_cols.iter().map(|c| sort_value(last, c)).collect();
+            Some(crate::cursor::encode_cursor(&keyset)?)
+        }
+        _ => None,
     };
 
     let mut out = Map::new();
