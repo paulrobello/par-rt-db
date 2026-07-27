@@ -15,7 +15,7 @@ Crate name: `par-rt-db-client` → in Rust, `use par_rt_db_client::...`.
 | --- | --- | --- |
 | `http` | yes | `RtDbHttpClient` — typed query / mutate / `auth_me` |
 | `ws` | no | `RtDbClient` (`src/ws.rs`) — reactive WebSocket client (live query subscriptions + mutate) |
-| `admin` | no | `/admin/*` control-plane client — push-schema, create-db, mint-token, revoke-token, allowlist, export, import |
+| `admin` | no | `/admin/*` control-plane client — db create/list/push-schema, schema/stats read-back, token mint/revoke/list, db + server-wide admin allowlist CRUD, metrics, hot config GET/PATCH, op-feed `recent`, owner-bypass query/mutate, snapshot export/import. Browser-only `login`/`logout`/`/admin/stream` are excluded (the Rust client is a machine client). |
 
 `core` (wire types, schema/query/mutation builders, error model) compiles with
 no features. `[lints.rust] warnings = "deny"` — same zero-warning posture as the
