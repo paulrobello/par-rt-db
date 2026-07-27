@@ -8,6 +8,11 @@ export interface RtDbAdminClientOptions {
   fetch?: typeof fetch;
 }
 
+export interface AdminMember {
+  email: string;
+  githubId?: number;
+}
+
 function toSchemaJson(schema: SchemaDefinition<any> | SchemaJson): SchemaJson {
   return "toJSON" in schema && typeof schema.toJSON === "function"
     ? schema.toJSON()
@@ -61,6 +66,38 @@ export class RtDbAdminClient {
     return (body as { emails: string[] }).emails;
   }
 
+  /** Cookie-session login (POST /admin/login). Sets the server's HttpOnly `rtdb_session`
+   *  cookie on 204. A browser auto-attaches the cookie thereafter; a Node caller must wire
+   *  its own cookie jar onto the injected `fetch` to reuse the session. */
+  async login(adminKey: string): Promise<void> {
+    await this.request("POST", "/admin/login", { adminKey });
+  }
+
+  /** Clear the admin session cookie (POST /admin/logout, always 204). */
+  async logout(): Promise<void> {
+    await this.request("POST", "/admin/logout");
+  }
+
+  /** List server-wide dashboard admin emails (GET /admin/admins). */
+  async adminsList(): Promise<AdminMember[]> {
+    const body = await this.request("GET", "/admin/admins");
+    return (body as { admins: AdminMember[] }).admins;
+  }
+
+  /** Add (or upsert) a dashboard admin (POST /admin/admins). */
+  async addAdmin(email: string, githubId?: number): Promise<void> {
+    await this.request(
+      "POST",
+      "/admin/admins",
+      githubId === undefined ? { email } : { email, githubId },
+    );
+  }
+
+  /** Remove a dashboard admin (DELETE /admin/admins, body-on-DELETE). */
+  async removeAdmin(email: string): Promise<void> {
+    await this.request("DELETE", "/admin/admins", { email });
+  }
+
   /** Fetches `db`'s schema and every document as JSONL text (see server `snapshot::export_database`). */
   async exportDb(db: string): Promise<string> {
     const response = await this.fetchImpl(
@@ -102,7 +139,11 @@ export class RtDbAdminClient {
     throw new RtDbError("INTERNAL", `admin request failed with status ${response.status}`);
   }
 
-  private async request(method: "GET" | "POST", path: string, payload?: unknown): Promise<unknown> {
+  private async request(
+    method: "GET" | "POST" | "PATCH" | "DELETE",
+    path: string,
+    payload?: unknown,
+  ): Promise<unknown> {
     const response = await this.fetchImpl(`${this.url}${path}`, {
       method,
       headers: {

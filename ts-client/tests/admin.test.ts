@@ -92,3 +92,67 @@ describe("RtDbAdminClient", () => {
     await expect(admin.exportDb("missing")).rejects.toThrow("unknown database");
   });
 });
+
+describe("RtDbAdminClient — new endpoints", () => {
+  it("login POSTs {adminKey} to /admin/login and resolves void on 204", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 204 }));
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+    await expect(admin.login("secret")).resolves.toBeUndefined();
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("http://h:8300/admin/login");
+    expect(init.method).toBe("POST");
+    expect(JSON.parse(init.body)).toEqual({ adminKey: "secret" });
+  });
+
+  it("logout POSTs /admin/logout with no body and resolves void on 204", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 204 }));
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+    await expect(admin.logout()).resolves.toBeUndefined();
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("http://h:8300/admin/logout");
+    expect(init.method).toBe("POST");
+  });
+
+  it("adminsList GETs /admin/admins and unwraps {admins}", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(
+        jsonResponse({ admins: [{ email: "a@x.com", githubId: 1 }, { email: "b@x.com" }] }),
+      );
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+    const rows = await admin.adminsList();
+    expect(rows).toEqual([{ email: "a@x.com", githubId: 1 }, { email: "b@x.com" }]);
+    expect(fetchMock.mock.calls[0][0]).toBe("http://h:8300/admin/admins");
+  });
+
+  it("addAdmin POSTs {email, githubId?} to /admin/admins", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ ok: true }));
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+    await admin.addAdmin("A@X.com", 7);
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("http://h:8300/admin/admins");
+    expect(JSON.parse(init.body)).toEqual({ email: "A@X.com", githubId: 7 });
+  });
+
+  it("removeAdmin DELETEs {email} to /admin/admins", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ ok: true }));
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+    await admin.removeAdmin("a@x.com");
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("http://h:8300/admin/admins");
+    expect(init.method).toBe("DELETE");
+    expect(JSON.parse(init.body)).toEqual({ email: "a@x.com" });
+  });
+
+  it("surfaces a 401 error envelope from login as RtDbError", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(jsonResponse({ code: "UNAUTHORIZED", message: "bad admin key" }, 401));
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+    await expect(admin.login("wrong")).rejects.toMatchObject({
+      name: "RtDbError",
+      code: "UNAUTHORIZED",
+      message: "bad admin key",
+    });
+  });
+});
