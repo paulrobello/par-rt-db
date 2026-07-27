@@ -38,6 +38,7 @@
 pub mod cursor;
 pub mod error;
 pub mod mutation;
+pub mod optimistic;
 pub mod query;
 pub mod schema;
 pub mod wire;
