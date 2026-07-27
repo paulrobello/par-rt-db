@@ -23,11 +23,12 @@
 //! idempotency-key caching, MAX_STEPS guard, and atomic rollback), and the
 //! query executor (Task 3: `run_query` — index-eq + range filtering, sort over
 //! unbound index fields with `_creationTime`/`_id` tiebreakers, and the
-//! `get`/`first`/`unique`/`count`/`take`/`collect` terminals; `filter` is a
-//! pass-through hook until Task 4, `paginate`/`search`/`vector_search` stub
-//! out). Subsequent tasks fill in subscriptions, scheduling, and storage.
+//! `get`/`first`/`unique`/`count`/`take`/`collect` terminals), and the
+//! `FilterExpr` evaluator (Task 4: `validate_filter` + `eval_filter_expr`,
+//! ported from the C-corrected TS logic). `paginate`/`search`/`vector_search`
+//! stub out. Subsequent tasks fill in subscriptions, scheduling, and storage.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -196,9 +197,11 @@ impl InMemoryRtDbClient {
     /// match on the [`Value`] directly or use [`run`](Self::run) for typed
     /// deserialization.
     ///
-    /// `filter` is wired through [`matches_filter`] but that hook is a
-    /// pass-through (returns `true`) for Task 3; Task 4 swaps in the real
-    /// `eval_filter_expr`. `paginate` is Task 5 and returns an `INTERNAL` error.
+    /// `filter` is structurally validated against the table's declared fields
+    /// once up front (via [`validate_filter`], mirroring the server's
+    /// compile-then-execute order), then evaluated per row via
+    /// [`eval_filter_expr`]. `paginate` is Task 5 and returns an `INTERNAL`
+    /// error.
     pub fn run_query(&self, q: &Query) -> Result<Value, RtDbError> {
         let table_def = self.require_table(&q.table)?.clone();
         let eq = &q.eq;
@@ -421,11 +424,16 @@ impl InMemoryRtDbClient {
             _ => None,
         };
 
+        // Compile the filter against the table's declared fields once up front,
+        // mirroring the server's compile-then-execute order. Surfaces the
+        // BAD_REQUEST cases (unknown field, empty and/or/in, mixed-type `in`
+        // values, wrong value-kind) before any row is touched.
+        if let Some(filter) = &q.filter {
+            let fields: BTreeSet<String> = table_def.fields.keys().cloned().collect();
+            validate_filter(filter, &fields)?;
+        }
+
         // Row fetch + filter (eq prefix → range → filter hook).
-        //
-        // `matches_filter` is a Task-3 pass-through; Task 4 swaps in
-        // `eval_filter_expr` (filter validation against the schema's field set
-        // also lands with Task 4).
         let mut filtered: Vec<StoredRow> = Vec::new();
         for ((t, _id), row) in &self.docs {
             if t != &q.table {
@@ -1333,16 +1341,231 @@ fn dir_order(o: std::cmp::Ordering, dir: Order) -> std::cmp::Ordering {
     }
 }
 
-/// Filter hook for [`InMemoryRtDbClient::run_query`]. Task 3 ships a
-/// pass-through so queries with a `filter` clause don't panic and behave
-/// consistently (the row reaches the terminal).
-//
-// TODO(task 4): replace this body with `eval_filter_expr(expr, doc)`, plus the
-// one-time schema validation that mirrors server `compile_filter`. The
-// signature already matches the planned `eval_filter_expr` swap so only the
-// body changes.
-fn matches_filter(_expr: &FilterExpr, _doc: &Value) -> bool {
-    true
+// ---------------------------------------------------------------------------
+// Filter evaluation — a port of `validateFilter`/`evalFilterExpr` and the leaf
+// helpers in `ts-client/src/in_memory.ts:361-488`. The server compiles a
+// `FilterExpr` once against the table's declared fields
+// (`query::compile_filter`), then evaluates the compiled predicate per row
+// (`query::jsonb_lhs_and_bind`). This harness mirrors that two-phase split:
+// [`validate_filter`] runs once in `run_query` before the row loop,
+// [`eval_filter_expr`] runs per row inside [`matches_filter`].
+// ---------------------------------------------------------------------------
+
+/// The six leaf comparison operators, mirroring `FilterLeafOp` in the TS
+/// source. Used as the dispatch key for [`compare_leaf`]/[`compare_values`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FilterOp {
+    Eq,
+    Neq,
+    Gt,
+    Gte,
+    Lt,
+    Lte,
+}
+
+/// Value-kind domain that picks the comparison semantics for a leaf, mirroring
+/// `inValueKind`'s three variants. Post-[`check_leaf_value`] the
+/// `Boolean` fallthrough is unreachable — every value is one of the three.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ValueKind {
+    String,
+    Number,
+    Boolean,
+}
+
+/// Structural validation of a [`FilterExpr`] against a table's declared fields,
+/// mirroring server `query::compile_filter` and the TS `validateFilter`
+/// (`ts-client/src/in_memory.ts:361-386`). Returns `BAD_REQUEST` for: an empty
+/// `and`/`or`, an empty `in`, an unknown field, a non-string/number/boolean
+/// leaf value, or mixed-type `in` values. Call once before evaluating per row.
+pub fn validate_filter(expr: &FilterExpr, fields: &BTreeSet<String>) -> Result<(), RtDbError> {
+    match expr {
+        FilterExpr::And { exprs } => {
+            if exprs.is_empty() {
+                return Err(RtDbError::new(
+                    ErrorCode::BadRequest,
+                    "and filter requires at least one expr",
+                ));
+            }
+            for e in exprs {
+                validate_filter(e, fields)?;
+            }
+            Ok(())
+        }
+        FilterExpr::Or { exprs } => {
+            if exprs.is_empty() {
+                return Err(RtDbError::new(
+                    ErrorCode::BadRequest,
+                    "or filter requires at least one expr",
+                ));
+            }
+            for e in exprs {
+                validate_filter(e, fields)?;
+            }
+            Ok(())
+        }
+        FilterExpr::In { field, values } => {
+            if values.is_empty() {
+                return Err(RtDbError::new(
+                    ErrorCode::BadRequest,
+                    "in filter requires at least one value",
+                ));
+            }
+            for v in values {
+                check_leaf_value(field, v, fields)?;
+            }
+            let first_kind = in_value_kind(&values[0]);
+            for v in &values[1..] {
+                if in_value_kind(v) != first_kind {
+                    return Err(RtDbError::new(
+                        ErrorCode::BadRequest,
+                        "in filter values must all be the same type",
+                    ));
+                }
+            }
+            Ok(())
+        }
+        FilterExpr::Eq { field, value }
+        | FilterExpr::Neq { field, value }
+        | FilterExpr::Gt { field, value }
+        | FilterExpr::Gte { field, value }
+        | FilterExpr::Lt { field, value }
+        | FilterExpr::Lte { field, value } => check_leaf_value(field, value, fields),
+    }
+}
+
+/// `BAD_REQUEST` if `field` is not in the table's declared fields or `value`
+/// is not a string/number/boolean. Mirrors `checkLeafValue`
+/// (`ts-client/src/in_memory.ts:388-395`).
+fn check_leaf_value(
+    field: &str,
+    value: &Value,
+    fields: &BTreeSet<String>,
+) -> Result<(), RtDbError> {
+    if !fields.contains(field) {
+        return Err(RtDbError::new(
+            ErrorCode::BadRequest,
+            format!("filter references unknown field '{field}'"),
+        ));
+    }
+    if !matches!(value, Value::String(_) | Value::Number(_) | Value::Bool(_)) {
+        return Err(RtDbError::new(
+            ErrorCode::BadRequest,
+            "filter value must be a string, number, or boolean",
+        ));
+    }
+    Ok(())
+}
+
+/// Value-kind domain for an `in` value, mirroring `inValueKind`
+/// (`ts-client/src/in_memory.ts:397-401`).
+fn in_value_kind(value: &Value) -> ValueKind {
+    match value {
+        Value::String(_) => ValueKind::String,
+        Value::Number(_) => ValueKind::Number,
+        _ => ValueKind::Boolean,
+    }
+}
+
+/// Evaluate a [`FilterExpr`] predicate against a stored doc, mirroring server
+/// `query::jsonb_lhs_and_bind` and the TS `evalFilterExpr`
+/// (`ts-client/src/in_memory.ts:410-421`): the filter value's kind picks the
+/// comparison domain — string compares the doc field's `->>` text, number
+/// compares it as `float8`, boolean as `boolean`. A null/absent field never
+/// matches (SQL NULL exclusion). Assumes [`validate_filter`] already passed.
+pub fn eval_filter_expr(expr: &FilterExpr, doc: &Value) -> bool {
+    match expr {
+        FilterExpr::And { exprs } => exprs.iter().all(|e| eval_filter_expr(e, doc)),
+        FilterExpr::Or { exprs } => exprs.iter().any(|e| eval_filter_expr(e, doc)),
+        FilterExpr::In { field, values } => values
+            .iter()
+            .any(|v| compare_leaf(FilterOp::Eq, field, v, doc)),
+        FilterExpr::Eq { field, value } => compare_leaf(FilterOp::Eq, field, value, doc),
+        FilterExpr::Neq { field, value } => compare_leaf(FilterOp::Neq, field, value, doc),
+        FilterExpr::Gt { field, value } => compare_leaf(FilterOp::Gt, field, value, doc),
+        FilterExpr::Gte { field, value } => compare_leaf(FilterOp::Gte, field, value, doc),
+        FilterExpr::Lt { field, value } => compare_leaf(FilterOp::Lt, field, value, doc),
+        FilterExpr::Lte { field, value } => compare_leaf(FilterOp::Lte, field, value, doc),
+    }
+}
+
+/// Per-leaf comparison, mirroring `compareLeaf`
+/// (`ts-client/src/in_memory.ts:423-444`). `doc[field]` null/absent → `false`
+/// (SQL NULL exclusion); the filter value's kind picks the comparison domain.
+fn compare_leaf(op: FilterOp, field: &str, filter_value: &Value, doc: &Value) -> bool {
+    let doc_val = match doc.get(field) {
+        Some(v) if !v.is_null() => v,
+        _ => return false,
+    };
+    match filter_value {
+        Value::String(s) => {
+            let lhs = doc_to_text(doc_val);
+            compare_values(op, &lhs, s)
+        }
+        Value::Number(_) => match doc_to_number(doc_val) {
+            Some(lhs) => match filter_value.as_f64() {
+                Some(rhs) => compare_values(op, &lhs, &rhs),
+                None => false,
+            },
+            None => false,
+        },
+        Value::Bool(b) => match doc_val {
+            Value::Bool(db) => compare_values(op, db, b),
+            _ => false,
+        },
+        // Unreachable post-validate (`check_leaf_value` rejects non-string/
+        // number/boolean values); defensively treat as no-match.
+        _ => false,
+    }
+}
+
+/// Mirrors Postgres `doc->>'field'`: the JSON text of the value. Ports
+/// `docToText` (`ts-client/src/in_memory.ts:447-452`) — string→as-is,
+/// number→`JSON.stringify(n)`, boolean→"true"/"false", else JSON text.
+fn doc_to_text(doc_val: &Value) -> String {
+    match doc_val {
+        Value::String(s) => s.clone(),
+        Value::Number(n) => Value::Number(n.clone()).to_string(),
+        Value::Bool(b) => b.to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Mirrors Postgres `(doc->>'field')::float8`: a finite number, or a parsed
+/// numeric string. Ports `docToNumber` (`ts-client/src/in_memory.ts:455-462`).
+fn doc_to_number(doc_val: &Value) -> Option<f64> {
+    match doc_val {
+        Value::Number(n) => n.as_f64().filter(|f| f.is_finite()),
+        Value::String(s) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            trimmed.parse::<f64>().ok().filter(|f| f.is_finite())
+        }
+        _ => None,
+    }
+}
+
+/// Op dispatch over a same-typed pair (string/number/boolean — the filter
+/// value's kind fixes the domain, so the operands never mix). Ports
+/// `compareValues` (`ts-client/src/in_memory.ts:464-483`).
+fn compare_values<T: PartialEq + PartialOrd>(op: FilterOp, lhs: &T, rhs: &T) -> bool {
+    match op {
+        FilterOp::Eq => lhs == rhs,
+        FilterOp::Neq => lhs != rhs,
+        FilterOp::Gt => lhs > rhs,
+        FilterOp::Gte => lhs >= rhs,
+        FilterOp::Lt => lhs < rhs,
+        FilterOp::Lte => lhs <= rhs,
+    }
+}
+
+/// Filter hook for [`InMemoryRtDbClient::run_query`]. Delegates to
+/// [`eval_filter_expr`]; validation runs once in `run_query` before the row
+/// loop, so by the time this runs the filter is structurally sound.
+fn matches_filter(expr: &FilterExpr, doc: &Value) -> bool {
+    eval_filter_expr(expr, doc)
 }
 
 /// Looks up an index by name (BAD_REQUEST if absent). Free function so it's
@@ -2724,28 +2947,507 @@ mod tests {
         );
     }
 
-    // ---- query: filter hook is a Task-3 pass-through ----------------
+    // ---- filter: eval_filter_expr + validate_filter ----------------
+    //
+    // Direct unit tests for the filter evaluator + validator, ported verbatim
+    // from `describe("evalFilterExpr + validateFilter")`
+    // (`ts-client/tests/in_memory.test.ts:539-653`). These are the cases item C
+    // fixed in the TS source — E must not regress them.
+
+    /// The field set used by the unit tests below — mirrors the TS
+    /// `new Set(["name", "age", "active", "score", "tags"])`.
+    fn filter_unit_fields() -> BTreeSet<String> {
+        ["name", "age", "active", "score", "tags"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn eval_filter_eq_neq_on_strings_compare_the_doc_field_text() {
+        let fields = filter_unit_fields();
+        validate_filter(
+            &FilterExpr::Eq {
+                field: "name".into(),
+                value: json!("ada"),
+            },
+            &fields,
+        )
+        .expect("valid");
+        assert!(eval_filter_expr(
+            &FilterExpr::Eq {
+                field: "name".into(),
+                value: json!("ada"),
+            },
+            &json!({"name": "ada"}),
+        ));
+        assert!(!eval_filter_expr(
+            &FilterExpr::Eq {
+                field: "name".into(),
+                value: json!("ada"),
+            },
+            &json!({"name": "bob"}),
+        ));
+        assert!(eval_filter_expr(
+            &FilterExpr::Neq {
+                field: "name".into(),
+                value: json!("ada"),
+            },
+            &json!({"name": "bob"}),
+        ));
+    }
+
+    #[test]
+    fn eval_filter_number_domain_compares_numerically() {
+        // gt/gte/lt/lte over a numeric doc field.
+        assert!(eval_filter_expr(
+            &FilterExpr::Gt {
+                field: "age".into(),
+                value: json!(30),
+            },
+            &json!({"age": 42}),
+        ));
+        assert!(!eval_filter_expr(
+            &FilterExpr::Gt {
+                field: "age".into(),
+                value: json!(50),
+            },
+            &json!({"age": 42}),
+        ));
+        assert!(eval_filter_expr(
+            &FilterExpr::Lte {
+                field: "age".into(),
+                value: json!(42),
+            },
+            &json!({"age": 42}),
+        ));
+    }
+
+    #[test]
+    fn eval_filter_string_ordering_is_lexicographic() {
+        assert!(eval_filter_expr(
+            &FilterExpr::Lt {
+                field: "name".into(),
+                value: json!("b"),
+            },
+            &json!({"name": "ada"}),
+        ));
+        assert!(eval_filter_expr(
+            &FilterExpr::Gte {
+                field: "name".into(),
+                value: json!("a"),
+            },
+            &json!({"name": "ada"}),
+        ));
+    }
+
+    #[test]
+    fn eval_filter_boolean_domain_compares_booleans() {
+        assert!(eval_filter_expr(
+            &FilterExpr::Eq {
+                field: "active".into(),
+                value: json!(true),
+            },
+            &json!({"active": true}),
+        ));
+        assert!(!eval_filter_expr(
+            &FilterExpr::Eq {
+                field: "active".into(),
+                value: json!(true),
+            },
+            &json!({"active": false}),
+        ));
+    }
+
+    #[test]
+    fn eval_filter_number_value_matches_a_numeric_string_field() {
+        // float8 cast: doc field is the string "5", filter value is the number
+        // 5 → match. Mirrors Postgres `(doc->>'field')::float8 = 5`.
+        assert!(eval_filter_expr(
+            &FilterExpr::Eq {
+                field: "score".into(),
+                value: json!(5),
+            },
+            &json!({"score": "5"}),
+        ));
+    }
+
+    #[test]
+    fn eval_filter_null_or_absent_doc_field_never_matches() {
+        // SQL NULL exclusion: null/absent never matches any op (even neq).
+        assert!(!eval_filter_expr(
+            &FilterExpr::Eq {
+                field: "name".into(),
+                value: json!("ada"),
+            },
+            &json!({"name": null}),
+        ));
+        assert!(!eval_filter_expr(
+            &FilterExpr::Eq {
+                field: "name".into(),
+                value: json!("ada"),
+            },
+            &json!({}),
+        ));
+        assert!(!eval_filter_expr(
+            &FilterExpr::Neq {
+                field: "name".into(),
+                value: json!("ada"),
+            },
+            &json!({}),
+        ));
+    }
+
+    #[test]
+    fn eval_filter_and_or_nest_recursively() {
+        let expr = FilterExpr::And {
+            exprs: vec![
+                FilterExpr::Gte {
+                    field: "age".into(),
+                    value: json!(30),
+                },
+                FilterExpr::Or {
+                    exprs: vec![
+                        FilterExpr::Eq {
+                            field: "name".into(),
+                            value: json!("ada"),
+                        },
+                        FilterExpr::Eq {
+                            field: "name".into(),
+                            value: json!("bob"),
+                        },
+                    ],
+                },
+            ],
+        };
+        assert!(eval_filter_expr(&expr, &json!({"age": 42, "name": "ada"})));
+        assert!(!eval_filter_expr(&expr, &json!({"age": 42, "name": "zed"})));
+        assert!(!eval_filter_expr(&expr, &json!({"age": 10, "name": "ada"})));
+    }
+
+    #[test]
+    fn eval_filter_in_matches_membership() {
+        assert!(eval_filter_expr(
+            &FilterExpr::In {
+                field: "name".into(),
+                values: vec![json!("ada"), json!("bob")],
+            },
+            &json!({"name": "bob"}),
+        ));
+        assert!(!eval_filter_expr(
+            &FilterExpr::In {
+                field: "name".into(),
+                values: vec![json!("ada"), json!("bob")],
+            },
+            &json!({"name": "zed"}),
+        ));
+    }
+
+    #[test]
+    fn validate_filter_rejects_an_unknown_field() {
+        let fields = filter_unit_fields();
+        let err = validate_filter(
+            &FilterExpr::Eq {
+                field: "missing".into(),
+                value: json!("x"),
+            },
+            &fields,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::BadRequest);
+        assert!(err.message.contains("unknown field"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_filter_rejects_empty_and_or_and_empty_in() {
+        let fields = filter_unit_fields();
+        let err = validate_filter(&FilterExpr::And { exprs: vec![] }, &fields).unwrap_err();
+        assert_eq!(err.code, ErrorCode::BadRequest);
+        assert!(err.message.contains("at least one expr"), "got: {err}");
+
+        let err = validate_filter(&FilterExpr::Or { exprs: vec![] }, &fields).unwrap_err();
+        assert_eq!(err.code, ErrorCode::BadRequest);
+        assert!(err.message.contains("at least one expr"), "got: {err}");
+
+        let err = validate_filter(
+            &FilterExpr::In {
+                field: "name".into(),
+                values: vec![],
+            },
+            &fields,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::BadRequest);
+        assert!(err.message.contains("at least one value"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_filter_rejects_a_non_string_number_boolean_value() {
+        let fields = filter_unit_fields();
+        let err = validate_filter(
+            &FilterExpr::Eq {
+                field: "name".into(),
+                value: Value::Null,
+            },
+            &fields,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::BadRequest);
+        assert!(
+            err.message.contains("string, number, or boolean"),
+            "got: {err}"
+        );
+
+        let err = validate_filter(
+            &FilterExpr::Eq {
+                field: "tags".into(),
+                value: json!(["a"]),
+            },
+            &fields,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::BadRequest);
+        assert!(
+            err.message.contains("string, number, or boolean"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_filter_accepts_a_well_formed_nested_filter() {
+        let fields = filter_unit_fields();
+        validate_filter(
+            &FilterExpr::And {
+                exprs: vec![
+                    FilterExpr::Eq {
+                        field: "name".into(),
+                        value: json!("ada"),
+                    },
+                    FilterExpr::In {
+                        field: "age".into(),
+                        values: vec![json!(1), json!(2)],
+                    },
+                ],
+            },
+            &fields,
+        )
+        .expect("well-formed nested filter");
+    }
+
+    #[test]
+    fn validate_filter_rejects_mixed_type_in_values() {
+        let fields = filter_unit_fields();
+        let err = validate_filter(
+            &FilterExpr::In {
+                field: "age".into(),
+                values: vec![json!(5), json!("ada")],
+            },
+            &fields,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::BadRequest);
+        assert!(err.message.contains("same type"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_filter_accepts_same_type_in_values() {
+        let fields = filter_unit_fields();
+        validate_filter(
+            &FilterExpr::In {
+                field: "age".into(),
+                values: vec![json!(5), json!(6), json!(7)],
+            },
+            &fields,
+        )
+        .expect("same-type in values");
+    }
+
+    // ---- query: filter end-to-end ----------------------------------
+    //
+    // Ports `describe("InMemoryRtDbClient filter")`
+    // (`ts-client/tests/in_memory.test.ts:655-756`) — exercises the typed
+    // `TableQuery.filter(...)` builder end-to-end through `run_query`, the
+    // same surface live app code uses.
+
+    /// Self-contained `users` schema so this block doesn't perturb the shared
+    /// `items` harness above. Mirrors the TS `usersSchema`.
+    fn users_schema() -> SchemaDef {
+        Schema::builder()
+            .table(
+                "users",
+                Table::new()
+                    .field("name", FieldType::String)
+                    .field("age", FieldType::Number)
+                    .field("active", FieldType::Boolean)
+                    .index("by_name", &["name"]),
+            )
+            .build()
+    }
+
+    fn new_users_client() -> InMemoryRtDbClient {
+        let counter = Arc::new(Mutex::new(1_700_000_000_000_i64));
+        let mut client = InMemoryRtDbClient::new(
+            InMemoryRtDbClientOptions::default()
+                .now(move || {
+                    let mut g = counter.lock().expect("counter not poisoned");
+                    let v = *g;
+                    *g += 1;
+                    v
+                })
+                .random(|| 0.0),
+        );
+        client.push_schema(&users_schema());
+        client
+    }
+
+    async fn seed_users(c: &mut InMemoryRtDbClient) {
+        for (name, age, active) in [("ada", 42_i64, true), ("bob", 17, false), ("cy", 65, true)] {
+            c.mutate(
+                &Mutation::new()
+                    .insert("users", json!({"name": name, "age": age, "active": active}))
+                    .build(),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+    }
 
     #[tokio::test]
-    async fn query_filter_pass_through_does_not_filter() {
-        // The Task-3 filter hook returns `true` for every row, so a `filter`
-        // clause that would otherwise narrow the set is a no-op. Proves the
-        // hook is wired (no panic) and that Task 4 has a clean swap target.
-        let mut c = new_client();
-        seed_query_rows(&mut c).await;
+    async fn query_filter_reduces_the_result_set_to_matching_docs() {
+        let mut c = new_users_client();
+        seed_users(&mut c).await;
         let docs = c
             .run::<Vec<Value>>(
-                &TableQuery::new("items")
-                    .with_index("by_status", &[json!("todo")])
-                    // A filter that would normally exclude every row (no row
-                    // has order==999); with the pass-through, all 3 stay.
-                    .filter(FilterExpr::Eq {
-                        field: "order".into(),
-                        value: json!(999),
+                &TableQuery::new("users")
+                    .filter(FilterExpr::Gt {
+                        field: "age".into(),
+                        value: json!(20),
                     })
                     .collect(),
             )
             .expect("filter query ok");
-        assert_eq!(docs.len(), 3, "pass-through hook keeps all rows");
+        let mut names: Vec<String> = docs
+            .iter()
+            .map(|d| d["name"].as_str().unwrap().to_string())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["ada".to_string(), "cy".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn query_filter_composes_with_an_index_eq_prefix_and_take() {
+        let mut c = new_users_client();
+        seed_users(&mut c).await;
+        let docs = c
+            .run::<Vec<Value>>(
+                &TableQuery::new("users")
+                    .with_index("by_name", &[json!("ada")])
+                    .filter(FilterExpr::Eq {
+                        field: "active".into(),
+                        value: json!(true),
+                    })
+                    .take(10),
+            )
+            .expect("filter+index ok");
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs[0]["name"], json!("ada"));
+    }
+
+    #[tokio::test]
+    async fn query_and_or_in_filter_evaluates_correctly_end_to_end() {
+        let mut c = new_users_client();
+        seed_users(&mut c).await;
+
+        let docs = c
+            .run::<Vec<Value>>(
+                &TableQuery::new("users")
+                    .filter(FilterExpr::Or {
+                        exprs: vec![
+                            FilterExpr::Lt {
+                                field: "age".into(),
+                                value: json!(18),
+                            },
+                            FilterExpr::Gte {
+                                field: "age".into(),
+                                value: json!(65),
+                            },
+                        ],
+                    })
+                    .collect(),
+            )
+            .expect("or filter ok");
+        let mut names: Vec<String> = docs
+            .iter()
+            .map(|d| d["name"].as_str().unwrap().to_string())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["bob".to_string(), "cy".to_string()]);
+
+        let in_docs = c
+            .run::<Vec<Value>>(
+                &TableQuery::new("users")
+                    .filter(FilterExpr::In {
+                        field: "name".into(),
+                        values: vec![json!("ada"), json!("cy")],
+                    })
+                    .collect(),
+            )
+            .expect("in filter ok");
+        let mut names: Vec<String> = in_docs
+            .iter()
+            .map(|d| d["name"].as_str().unwrap().to_string())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["ada".to_string(), "cy".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn query_filter_unknown_field_throws_bad_request() {
+        let mut c = new_users_client();
+        seed_users(&mut c).await;
+        let err = c
+            .run_query(
+                &TableQuery::new("users")
+                    .filter(FilterExpr::Eq {
+                        field: "nope".into(),
+                        value: json!("x"),
+                    })
+                    .collect(),
+            )
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::BadRequest);
+    }
+
+    #[tokio::test]
+    async fn query_filter_combined_with_get_is_rejected() {
+        // Mirrors the server: `get` is exclusive of `filter` (and everything
+        // else); the get-exclusivity guard fires before filter validation.
+        let mut c = new_users_client();
+        let r = c
+            .mutate(
+                &Mutation::new()
+                    .insert("users", json!({"name": "ada", "age": 42, "active": true}))
+                    .build(),
+                None,
+            )
+            .await
+            .unwrap();
+        let id = match &r[0] {
+            StepResult::Insert { id } => id.clone(),
+            _ => unreachable!(),
+        };
+        let err = c
+            .run_query(&Query {
+                table: "users".into(),
+                get: Some(id),
+                filter: Some(FilterExpr::Eq {
+                    field: "age".into(),
+                    value: json!(42),
+                }),
+                ..Default::default()
+            })
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::BadRequest);
     }
 }
