@@ -693,6 +693,76 @@ impl RtDbHttpClient {
         self.expect_ok(resp).await
     }
 
+    /// `GET /admin/dbs/{db}/schema` → the database's pushed `SchemaDef`.
+    pub async fn get_schema(&self, db: &str) -> Result<crate::schema::SchemaDef, RtDbError> {
+        self.get_json(&format!("/admin/dbs/{db}/schema"), &[]).await
+    }
+
+    /// `GET /admin/dbs/{db}/stats` → per-table row counts + sizes.
+    pub async fn db_stats(&self, db: &str) -> Result<crate::wire::admin::DbStats, RtDbError> {
+        self.get_json(&format!("/admin/dbs/{db}/stats"), &[]).await
+    }
+
+    /// `GET /admin/tokens?db=<db>` → machine tokens minted for this database.
+    pub async fn list_tokens(
+        &self,
+        db: &str,
+    ) -> Result<Vec<crate::wire::admin::TokenInfo>, RtDbError> {
+        #[derive(serde::Deserialize)]
+        struct Resp {
+            tokens: Vec<crate::wire::admin::TokenInfo>,
+        }
+        Ok(self
+            .get_json::<Resp>("/admin/tokens", &[("db", db)])
+            .await?
+            .tokens)
+    }
+
+    /// `GET /admin/metrics` → server-wide counters and gauges.
+    pub async fn metrics(&self) -> Result<crate::wire::admin::MetricsSnapshot, RtDbError> {
+        self.get_json("/admin/metrics", &[]).await
+    }
+
+    /// `GET /admin/config` → redacted running config + build identity + admins.
+    pub async fn get_config(&self) -> Result<crate::wire::admin::ConfigResponse, RtDbError> {
+        self.get_json("/admin/config", &[]).await
+    }
+
+    /// `PATCH /admin/config` with a partial hot-config body → updated config.
+    pub async fn patch_config(
+        &self,
+        patch: &crate::wire::admin::HotConfigPatch,
+    ) -> Result<crate::wire::admin::ConfigResponse, RtDbError> {
+        self.deserialize(self.patch_json("/admin/config", patch).await?)
+            .await
+    }
+
+    /// `GET /admin/ops/recent?db=<db>&table=<t>?&n=<n>` → recent document-op
+    /// events from the in-memory ring, newest-first. `table` and `n` optional.
+    pub async fn ops_recent(
+        &self,
+        db: &str,
+        table: Option<&str>,
+        n: Option<u32>,
+    ) -> Result<Vec<crate::wire::admin::OpEvent>, RtDbError> {
+        #[derive(serde::Deserialize)]
+        struct Resp {
+            ops: Vec<crate::wire::admin::OpEvent>,
+        }
+        let db_s = db.to_string();
+        let table_s = table.map(|t| t.to_string());
+        let n_s = n.map(|n| n.to_string());
+        let mut q: Vec<(&str, &str)> = Vec::with_capacity(3);
+        q.push(("db", db_s.as_str()));
+        if let Some(ref t) = table_s {
+            q.push(("table", t.as_str()));
+        }
+        if let Some(ref n_str) = n_s {
+            q.push(("n", n_str.as_str()));
+        }
+        Ok(self.get_json::<Resp>("/admin/ops/recent", &q).await?.ops)
+    }
+
     async fn post_json<Req: Serialize>(
         &self,
         path: &str,
@@ -721,9 +791,7 @@ impl RtDbHttpClient {
             .map_err(|e| RtDbError::internal(format!("admin request failed: {e}")))
     }
 
-    // PATCH helper for the admin sweep; consumed by a later task, kept here so
-    // all three JSON-verb helpers land together.
-    #[expect(dead_code, reason = "consumed by a later task in the admin-sweep plan")]
+    // PATCH helper for the admin sweep; consumed by `patch_config`.
     async fn patch_json<Req: Serialize>(
         &self,
         path: &str,
@@ -1639,5 +1707,227 @@ mod admin_tests {
             .mount(&server)
             .await;
         client.import_db("kanban", jsonl).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn get_schema_returns_schema_def() {
+        let (server, client) = setup().await;
+        Mock::given(method("GET"))
+            .and(path("/admin/dbs/kanban/schema"))
+            .and(header("authorization", BEARER))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "tables": {"notes": {"fields": {"body": {"type": "string"}}}}
+            })))
+            .mount(&server)
+            .await;
+        let schema = client.get_schema("kanban").await.unwrap();
+        assert_eq!(schema.tables.len(), 1);
+        assert!(schema.tables.contains_key("notes"));
+    }
+
+    #[tokio::test]
+    async fn db_stats_returns_table_stats() {
+        let (server, client) = setup().await;
+        Mock::given(method("GET"))
+            .and(path("/admin/dbs/kanban/stats"))
+            .and(header("authorization", BEARER))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "tables": [{"name":"notes","rowCount":5,"sizeBytes":100}],
+                "totalSizeBytes": 100
+            })))
+            .mount(&server)
+            .await;
+        let stats = client.db_stats("kanban").await.unwrap();
+        assert_eq!(stats.total_size_bytes, 100);
+        assert_eq!(stats.tables.len(), 1);
+        assert_eq!(stats.tables[0].name, "notes");
+        assert_eq!(stats.tables[0].row_count, 5);
+        assert_eq!(stats.tables[0].size_bytes, 100);
+    }
+
+    #[tokio::test]
+    async fn list_tokens_returns_token_info() {
+        let (server, client) = setup().await;
+        Mock::given(method("GET"))
+            .and(path("/admin/tokens"))
+            .and(query_param("db", "kanban"))
+            .and(header("authorization", BEARER))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "tokens": [
+                    {"id":"id1","name":"cli","createdAt":123,"revoked":false},
+                    {"id":"id2","name":"ci","createdAt":999,"revoked":true}
+                ]
+            })))
+            .mount(&server)
+            .await;
+        let tokens = client.list_tokens("kanban").await.unwrap();
+        assert_eq!(tokens.len(), 2);
+        assert_eq!(tokens[0].id, "id1");
+        assert_eq!(tokens[0].name, "cli");
+        assert_eq!(tokens[0].created_at, 123);
+        assert!(!tokens[0].revoked);
+        assert!(tokens[1].revoked);
+    }
+
+    #[tokio::test]
+    async fn metrics_returns_snapshot() {
+        let (server, client) = setup().await;
+        Mock::given(method("GET"))
+            .and(path("/admin/metrics"))
+            .and(header("authorization", BEARER))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "queriesTotal": 10,
+                "mutationsTotal": 20,
+                "uploadsTotal": 30,
+                "wsConnections": 40,
+                "activeSubscriptions": 50,
+                "poolSize": 60,
+                "poolIdle": 70,
+                "uptimeSeconds": 80
+            })))
+            .mount(&server)
+            .await;
+        let snap = client.metrics().await.unwrap();
+        assert_eq!(snap.queries_total, 10);
+        assert_eq!(snap.mutations_total, 20);
+        assert_eq!(snap.uploads_total, 30);
+        assert_eq!(snap.ws_connections, 40);
+        assert_eq!(snap.active_subscriptions, 50);
+        assert_eq!(snap.pool_size, 60);
+        assert_eq!(snap.pool_idle, 70);
+        assert_eq!(snap.uptime_seconds, 80);
+    }
+
+    #[tokio::test]
+    async fn get_config_returns_response() {
+        let (server, client) = setup().await;
+        Mock::given(method("GET"))
+            .and(path("/admin/config"))
+            .and(header("authorization", BEARER))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "port": 8080,
+                "publicUrl": "https://rtdb.example",
+                "githubBaseUrl": "https://github.com",
+                "githubApiUrl": "https://api.github.com",
+                "databaseUrlConfigured": true,
+                "adminKeyConfigured": true,
+                "githubConfigured": false,
+                "googleConfigured": false,
+                "hot": {
+                    "allowedOrigins": ["https://app.example"],
+                    "sessionTtlDays": 30,
+                    "maxFileSize": 5242880
+                },
+                "version": "0.1.0",
+                "gitCommit": "abc1234",
+                "admins": [{"email":"a@x.com","githubId":1}]
+            })))
+            .mount(&server)
+            .await;
+        let cfg = client.get_config().await.unwrap();
+        assert_eq!(cfg.port, 8080);
+        assert_eq!(cfg.public_url, "https://rtdb.example");
+        assert!(cfg.database_url_configured);
+        assert!(cfg.admin_key_configured);
+        assert!(!cfg.github_configured);
+        assert_eq!(
+            cfg.hot.allowed_origins,
+            vec!["https://app.example".to_string()]
+        );
+        assert_eq!(cfg.hot.session_ttl_days, 30);
+        assert_eq!(cfg.hot.max_file_size, 5242880);
+        assert_eq!(cfg.version, "0.1.0");
+        assert_eq!(cfg.git_commit, "abc1234");
+        assert_eq!(cfg.admins.len(), 1);
+        assert_eq!(cfg.admins[0].email, "a@x.com");
+        assert_eq!(cfg.admins[0].github_id, Some(1));
+    }
+
+    #[tokio::test]
+    async fn patch_config_patches_and_returns_config() {
+        let (server, client) = setup().await;
+        Mock::given(method("PATCH"))
+            .and(path("/admin/config"))
+            .and(header("authorization", BEARER))
+            .and(body_partial_json(json!({
+                "allowedOrigins": ["https://x.example"],
+                "sessionTtlDays": 60
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "port": 8080,
+                "publicUrl": "",
+                "githubBaseUrl": "",
+                "githubApiUrl": "",
+                "databaseUrlConfigured": false,
+                "adminKeyConfigured": false,
+                "githubConfigured": false,
+                "googleConfigured": false,
+                "hot": {
+                    "allowedOrigins": ["https://x.example"],
+                    "sessionTtlDays": 60,
+                    "maxFileSize": 5242880
+                },
+                "version": "",
+                "gitCommit": "",
+                "admins": []
+            })))
+            .mount(&server)
+            .await;
+        let patch = crate::wire::admin::HotConfigPatch {
+            allowed_origins: Some(vec!["https://x.example".to_string()]),
+            session_ttl_days: Some(60),
+            max_file_size: None,
+        };
+        let cfg = client.patch_config(&patch).await.unwrap();
+        assert_eq!(
+            cfg.hot.allowed_origins,
+            vec!["https://x.example".to_string()]
+        );
+        assert_eq!(cfg.hot.session_ttl_days, 60);
+    }
+
+    #[tokio::test]
+    async fn patch_config_surfaces_400_envelope() {
+        let (server, client) = setup().await;
+        Mock::given(method("PATCH"))
+            .and(path("/admin/config"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(
+                json!({"code": "BAD_REQUEST", "message": "sessionTtlDays must be >= 1"}),
+            ))
+            .mount(&server)
+            .await;
+        let err = client
+            .patch_config(&crate::wire::admin::HotConfigPatch::default())
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::BadRequest);
+        assert_eq!(err.message, "sessionTtlDays must be >= 1");
+    }
+
+    #[tokio::test]
+    async fn ops_recent_returns_events_and_query_params() {
+        let (server, client) = setup().await;
+        Mock::given(method("GET"))
+            .and(path("/admin/ops/recent"))
+            .and(query_param("db", "kanban"))
+            .and(query_param("n", "50"))
+            .and(header("authorization", BEARER))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ops": [
+                    {"db":"kanban","table":"notes","docId":"n1","kind":"insert","ts":1000,"owner":null},
+                    {"db":"kanban","table":"notes","docId":"n2","kind":"patch","ts":2000,"owner":"u1"}
+                ]
+            })))
+            .mount(&server)
+            .await;
+        let ops = client.ops_recent("kanban", None, Some(50)).await.unwrap();
+        assert_eq!(ops.len(), 2);
+        assert_eq!(ops[0].db, "kanban");
+        assert_eq!(ops[0].table, "notes");
+        assert_eq!(ops[0].doc_id, "n1");
+        assert_eq!(ops[0].kind, "insert");
+        assert_eq!(ops[0].ts, 1000);
+        assert_eq!(ops[0].owner, None);
+        assert_eq!(ops[1].owner, Some("u1".to_string()));
     }
 }

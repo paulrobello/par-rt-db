@@ -65,4 +65,7 @@ pub use http::RtDbHttpClient;
 pub use ws::{ClientStatus, Config, ConnectionState, RtDbClient, Snapshot, Subscription};
 
 #[cfg(feature = "admin")]
-pub use wire::admin::{AdminMember, MintedToken};
+pub use wire::admin::{
+    AdminMember, ConfigResponse, DbStats, HotConfig, HotConfigPatch, MetricsSnapshot, MintedToken,
+    OpEvent, TableStat, TokenInfo,
+};

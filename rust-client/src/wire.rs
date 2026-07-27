@@ -419,6 +419,104 @@ pub mod admin {
         pub email: String,
         pub github_id: Option<i64>,
     }
+
+    /// One row of `DbStats.tables` (`GET /admin/dbs/{db}/stats`).
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct TableStat {
+        pub name: String,
+        pub row_count: i64,
+        pub size_bytes: i64,
+    }
+
+    /// `GET /admin/dbs/{db}/stats` response.
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct DbStats {
+        pub tables: Vec<TableStat>,
+        pub total_size_bytes: i64,
+    }
+
+    /// One row of `TokenInfo` returned by `GET /admin/tokens?db=...`.
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct TokenInfo {
+        pub id: String,
+        pub name: String,
+        pub created_at: i64,
+        pub revoked: bool,
+    }
+
+    /// `GET /admin/metrics` snapshot — server counters and gauges.
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct MetricsSnapshot {
+        pub queries_total: i64,
+        pub mutations_total: i64,
+        pub uploads_total: i64,
+        pub ws_connections: i64,
+        pub active_subscriptions: i64,
+        pub pool_size: i64,
+        pub pool_idle: i64,
+        pub uptime_seconds: i64,
+    }
+
+    /// Runtime-mutable hot-config subset of `ConfigResponse`. Mirrors
+    /// `server/src/config::HotConfig` field-for-field.
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct HotConfig {
+        pub allowed_origins: Vec<String>,
+        pub session_ttl_days: i64,
+        pub max_file_size: i64,
+    }
+
+    /// `GET /admin/config` response — redacted boot config + hot config + build
+    /// identity + admin allowlist. Mirrors `server/src/admin::ConfigResponse`.
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct ConfigResponse {
+        pub port: i64,
+        pub public_url: String,
+        pub github_base_url: String,
+        pub github_api_url: String,
+        pub database_url_configured: bool,
+        pub admin_key_configured: bool,
+        pub github_configured: bool,
+        pub google_configured: bool,
+        pub hot: HotConfig,
+        pub version: String,
+        pub git_commit: String,
+        pub admins: Vec<AdminMember>,
+    }
+
+    /// `PATCH /admin/config` body — every field optional, omitted fields left
+    /// unchanged. Unknown fields rejected server-side (`deny_unknown_fields`).
+    /// `skip_serializing_if = "Option::is_none"` keeps the wire body minimal.
+    #[derive(Debug, Clone, Default, serde::Serialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct HotConfigPatch {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub allowed_origins: Option<Vec<String>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub session_ttl_days: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub max_file_size: Option<i64>,
+    }
+
+    /// One row of `OpEvent` returned by `GET /admin/ops/recent`. `kind` is a
+    /// `String` — the admin client passes it through; consumers match on it.
+    /// `owner` is `Option<String>` for the `string | null` wire.
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct OpEvent {
+        pub db: String,
+        pub table: String,
+        pub doc_id: String,
+        pub kind: String,
+        pub ts: i64,
+        pub owner: Option<String>,
+    }
 }
 
 #[cfg(test)]
