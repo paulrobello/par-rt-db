@@ -1212,9 +1212,11 @@ impl InMemoryRtDbClient {
     /// Fires every due non-paused job by applying its txn through the same
     /// atomic path as [`mutate`](Self::mutate) (so reactive subscriptions see
     /// the write). One-shots are removed after a successful fire; crons are
-    /// re-armed by `CRON_STEP_MS`. Pass `now_ms` to drive the clock
-    /// deterministically; omit it to use the client's injected clock. Ports
-    /// `tick` (`ts-client/src/in_memory.ts:683-706`).
+    /// re-armed by `CRON_STEP_MS`. A job whose txn fails is marked `Error` but
+    /// left in place (still due), so a subsequent `tick` retries it — matching
+    /// the TS harness, where only `Paused` jobs are skipped. Pass `now_ms` to
+    /// drive the clock deterministically; omit it to use the client's injected
+    /// clock. Ports `tick` (`ts-client/src/in_memory.ts:683-706`).
     pub fn tick(&mut self, now_ms: Option<i64>) {
         let now = now_ms.unwrap_or_else(|| (self.now)());
         // Iterate by index so we can mutate (`pause`/error) and remove in place
@@ -2226,11 +2228,30 @@ fn compare_leaf(op: FilterOp, field: &str, filter_value: &Value, doc: &Value) ->
 
 /// Mirrors Postgres `doc->>'field'`: the JSON text of the value. Ports
 /// `docToText` (`ts-client/src/in_memory.ts:447-452`) — string→as-is,
-/// number→`JSON.stringify(n)`, boolean→"true"/"false", else JSON text.
+/// number→`JSON.stringify(n)` (integer-valued numbers render without a decimal
+/// point, matching JS), boolean→"true"/"false", else JSON text.
 fn doc_to_text(doc_val: &Value) -> String {
     match doc_val {
         Value::String(s) => s.clone(),
-        Value::Number(n) => Value::Number(n.clone()).to_string(),
+        // JS `JSON.stringify` renders integer-valued numbers with no decimal
+        // (`5`, not `5.0`); serde_json emits `"5.0"` for a float-backed
+        // integer, so route integer-backed numbers to their exact form and
+        // canonicalize integer-valued floats within JS's safe-integer range.
+        Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                i.to_string()
+            } else if let Some(u) = n.as_u64() {
+                u.to_string()
+            } else if let Some(f) = n.as_f64() {
+                if f.is_finite() && f.fract() == 0.0 && f.abs() <= 9_007_199_254_740_992.0 {
+                    (f as i64).to_string()
+                } else {
+                    n.to_string()
+                }
+            } else {
+                n.to_string()
+            }
+        }
         Value::Bool(b) => b.to_string(),
         other => other.to_string(),
     }

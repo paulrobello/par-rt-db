@@ -153,9 +153,11 @@ impl TableQuery {
     }
 
     /// Vector-similarity `vectorSearch` over a declared vector index. The server
-    /// ranks by cosine distance and applies `limit`; `filter` is an eq-map over
-    /// the index's declared `filterFields`. Terminal — composes only with the
-    /// trailing terminal (`take`/`collect`/etc.), like `search`.
+    /// ranks by cosine distance and applies the carried `limit`; `filter` is an
+    /// eq-map over the index's declared `filterFields`. Standalone terminal —
+    /// unlike `search`, it carries its own `limit` and does NOT compose with
+    /// `take`/`collect` (the server rejects `vectorSearch` combined with any
+    /// other terminal).
     pub fn vector_search(
         mut self,
         index: &str,
