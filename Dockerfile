@@ -2,11 +2,19 @@
 # Compiles the release binary.
 FROM rust:1.90-bookworm AS builder
 WORKDIR /build/server
+# Dependency layer: compile the whole dependency tree once, cached unless
+# Cargo.toml or Cargo.lock change. A throwaway main.rs lets cargo resolve and
+# build the deps without the real source (which arrives in the next layer).
+COPY server/Cargo.toml server/Cargo.lock ./
+RUN mkdir src && echo 'fn main() {}' > src/main.rs \
+    && cargo build --release --locked --bin rtdb-server \
+    && rm -rf src
 # Bake the live git sha into /healthz. The build context has no .git (rsync
 # excludes it), so build.rs falls back to this arg; "unknown" if unset.
+# Declared AFTER the dependency layer so a per-deploy commit change only
+# recompiles the app crate, not the entire dependency tree.
 ARG RTDB_BUILD_COMMIT=unknown
 ENV RTDB_BUILD_COMMIT=${RTDB_BUILD_COMMIT}
-COPY server/Cargo.toml server/Cargo.lock ./
 COPY server/build.rs ./
 COPY server/src ./src
 COPY server/tests ./tests
