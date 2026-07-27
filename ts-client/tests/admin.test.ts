@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { RtDbAdminClient } from "../src/admin.js";
+import type { TransactionJson } from "../src/protocol.js";
 import { defineSchema, defineTable, t } from "../src/schema.js";
 
 function jsonResponse(body: unknown, status = 200): Response {
@@ -263,5 +264,37 @@ describe("RtDbAdminClient — new endpoints", () => {
       code: "BAD_REQUEST",
       message: "sessionTtlDays must be >= 1",
     });
+  });
+
+  it("adminQuery POSTs {query} to /admin/db/{db}/query and unwraps {result}", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ result: [{ _id: "a" }] }));
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+    const q = { json: { table: "items" } };
+    await expect(admin.adminQuery("kanban", q)).resolves.toEqual([{ _id: "a" }]);
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("http://h:8300/admin/db/kanban/query");
+    expect(JSON.parse(init.body)).toEqual({ query: { table: "items" } });
+  });
+
+  it("adminMutate POSTs {txn, idempotencyKey?} to /admin/db/{db}/mutate and unwraps {results}", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ results: ["new-id"] }));
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+    const txn: TransactionJson = {
+      steps: [{ op: "insert", table: "items", doc: { title: "x" } }],
+    };
+    await expect(admin.adminMutate("kanban", txn, { idempotencyKey: "k1" })).resolves.toEqual([
+      "new-id",
+    ]);
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("http://h:8300/admin/db/kanban/mutate");
+    expect(JSON.parse(init.body)).toEqual({ txn, idempotencyKey: "k1" });
+  });
+
+  it("adminMutate omits idempotencyKey when not provided", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ results: [] }));
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+    const txn = { steps: [] };
+    await admin.adminMutate("kanban", txn);
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({ txn });
   });
 });

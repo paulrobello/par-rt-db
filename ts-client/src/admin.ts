@@ -1,5 +1,6 @@
 import { RtDbError } from "./errors.js";
-import type { SchemaJson } from "./protocol.js";
+import type { SchemaJson, TransactionJson } from "./protocol.js";
+import type { RtQuery } from "./query.js";
 import type { SchemaDefinition } from "./schema.js";
 
 export interface RtDbAdminClientOptions {
@@ -231,6 +232,29 @@ export class RtDbAdminClient {
     const qs = params.toString();
     const body = await this.request("GET", `/admin/ops/recent${qs ? `?${qs}` : ""}`);
     return (body as { ops: OpEvent[] }).ops;
+  }
+
+  /** Owner-bypass document read (POST /admin/db/{db}/query). Admin sees every row regardless
+   *  of per-row ownerField. Body and result shapes match /api/query. */
+  async adminQuery<R>(db: string, query: RtQuery<R>): Promise<R> {
+    const body = await this.request("POST", `/admin/db/${encodeURIComponent(db)}/query`, {
+      query: query.json,
+    });
+    return (body as { result: R }).result;
+  }
+
+  /** Owner-bypass document write (POST /admin/db/{db}/mutate). Body shapes match /api/mutate;
+   *  `idempotencyKey` is the opt-in safe-retry key. Capped server-side by RTDB_MAX_AFFECTED_DOCS. */
+  async adminMutate(
+    db: string,
+    txn: TransactionJson,
+    opts?: { idempotencyKey?: string },
+  ): Promise<unknown[]> {
+    const body = await this.request("POST", `/admin/db/${encodeURIComponent(db)}/mutate`, {
+      txn,
+      idempotencyKey: opts?.idempotencyKey,
+    });
+    return (body as { results: unknown[] }).results;
   }
 
   private async throwFromResponse(response: Response): Promise<never> {
