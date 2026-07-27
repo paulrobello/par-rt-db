@@ -600,6 +600,61 @@ impl RtDbHttpClient {
         Ok(parsed.emails)
     }
 
+    /// `GET /admin/admins` → `{admins:[{email, githubId?}]}`.
+    pub async fn admins_list(
+        &self,
+        _db: &str,
+    ) -> Result<Vec<crate::wire::admin::AdminMember>, RtDbError> {
+        #[derive(serde::Deserialize)]
+        struct Resp {
+            admins: Vec<crate::wire::admin::AdminMember>,
+        }
+        Ok(self.get_json::<Resp>("/admin/admins", &[]).await?.admins)
+    }
+
+    /// `POST /admin/admins` `{email, githubId?}` → `{ok:true}`.
+    pub async fn admins_add(
+        &self,
+        _db: &str,
+        email: &str,
+        github_id: Option<i64>,
+    ) -> Result<(), RtDbError> {
+        #[derive(serde::Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Body {
+            email: String,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            github_id: Option<i64>,
+        }
+        let resp = self
+            .post_json(
+                "/admin/admins",
+                &Body {
+                    email: email.to_string(),
+                    github_id,
+                },
+            )
+            .await?;
+        self.expect_ok(resp).await
+    }
+
+    /// `DELETE /admin/admins` `{email}` → `{ok:true}`.
+    pub async fn admins_remove(&self, _db: &str, email: &str) -> Result<(), RtDbError> {
+        #[derive(serde::Serialize)]
+        struct Body {
+            email: String,
+        }
+        let resp = self
+            .delete_json(
+                "/admin/admins",
+                &Body {
+                    email: email.to_string(),
+                },
+            )
+            .await?;
+        self.expect_ok(resp).await
+    }
+
     /// `GET /admin/export-db?db=<db>` → the database's schema + every document as
     /// JSONL text (see server `snapshot::export_database`).
     pub async fn export_db(&self, db: &str) -> Result<String, RtDbError> {
@@ -645,6 +700,37 @@ impl RtDbHttpClient {
     ) -> Result<reqwest::Response, RtDbError> {
         self.client
             .post(format!("{}{}", self.url, path))
+            .bearer_auth(&self.token)
+            .json(body)
+            .send()
+            .await
+            .map_err(|e| RtDbError::internal(format!("admin request failed: {e}")))
+    }
+
+    async fn delete_json<Req: Serialize>(
+        &self,
+        path: &str,
+        body: &Req,
+    ) -> Result<reqwest::Response, RtDbError> {
+        self.client
+            .delete(format!("{}{}", self.url, path))
+            .bearer_auth(&self.token)
+            .json(body)
+            .send()
+            .await
+            .map_err(|e| RtDbError::internal(format!("admin request failed: {e}")))
+    }
+
+    // PATCH helper for the admin sweep; consumed by a later task, kept here so
+    // all three JSON-verb helpers land together.
+    #[expect(dead_code, reason = "consumed by a later task in the admin-sweep plan")]
+    async fn patch_json<Req: Serialize>(
+        &self,
+        path: &str,
+        body: &Req,
+    ) -> Result<reqwest::Response, RtDbError> {
+        self.client
+            .patch(format!("{}{}", self.url, path))
             .bearer_auth(&self.token)
             .json(body)
             .send()
@@ -1460,6 +1546,53 @@ mod admin_tests {
             .await;
         let emails = client.allowlist_list("kanban").await.unwrap();
         assert_eq!(emails, vec!["a@b.com".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn admins_list_unwraps_admins_array() {
+        let (server, client) = setup().await;
+        Mock::given(method("GET"))
+            .and(path("/admin/admins"))
+            .and(header("authorization", BEARER))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"admins":[{"email":"a@x.com","githubId":1},{"email":"b@x.com"}]}),
+            ))
+            .mount(&server)
+            .await;
+        let rows = client.admins_list("kanban").await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].email, "a@x.com");
+        assert_eq!(rows[0].github_id, Some(1));
+        assert_eq!(rows[1].github_id, None);
+    }
+
+    #[tokio::test]
+    async fn admins_add_posts_email_and_optional_github_id() {
+        let (server, client) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/admin/admins"))
+            .and(header("authorization", BEARER))
+            .and(body_partial_json(json!({"email":"a@x.com","githubId":7})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+            .mount(&server)
+            .await;
+        client
+            .admins_add("kanban", "a@x.com", Some(7))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn admins_remove_uses_delete_with_body() {
+        let (server, client) = setup().await;
+        Mock::given(method("DELETE"))
+            .and(path("/admin/admins"))
+            .and(header("authorization", BEARER))
+            .and(body_partial_json(json!({"email":"a@x.com"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+            .mount(&server)
+            .await;
+        client.admins_remove("kanban", "a@x.com").await.unwrap();
     }
 
     #[tokio::test]

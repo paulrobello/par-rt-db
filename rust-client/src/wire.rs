@@ -411,6 +411,14 @@ pub mod admin {
     pub(crate) struct AllowlistListResponse {
         pub(crate) emails: Vec<String>,
     }
+
+    /// One row of the admin allowlist returned by `GET /admin/admins`.
+    #[derive(Debug, Clone, serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct AdminMember {
+        pub email: String,
+        pub github_id: Option<i64>,
+    }
 }
 
 #[cfg(test)]
