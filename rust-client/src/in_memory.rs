@@ -23,10 +23,14 @@
 //! idempotency-key caching, MAX_STEPS guard, and atomic rollback), and the
 //! query executor (Task 3: `run_query` — index-eq + range filtering, sort over
 //! unbound index fields with `_creationTime`/`_id` tiebreakers, and the
-//! `get`/`first`/`unique`/`count`/`take`/`collect` terminals), and the
+//! `get`/`first`/`unique`/`count`/`take`/`collect` terminals), the
 //! `FilterExpr` evaluator (Task 4: `validate_filter` + `eval_filter_expr`,
-//! ported from the C-corrected TS logic). `paginate`/`search`/`vector_search`
-//! stub out. Subsequent tasks fill in subscriptions, scheduling, and storage.
+//! ported from the C-corrected TS logic), and the `paginate` terminal
+//! (Task 5: cursor-keyset paging over the sorted set). `search`/
+//! `vector_search` stub out — no in-memory ts_rank / vector ranking, but the
+//! combination guards still reject conflicting terminals so the cascade
+//! agrees with the server. Subsequent tasks fill in subscriptions,
+//! scheduling, and storage.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -200,8 +204,9 @@ impl InMemoryRtDbClient {
     /// `filter` is structurally validated against the table's declared fields
     /// once up front (via [`validate_filter`], mirroring the server's
     /// compile-then-execute order), then evaluated per row via
-    /// [`eval_filter_expr`]. `paginate` is Task 5 and returns an `INTERNAL`
-    /// error.
+    /// [`eval_filter_expr`]. `paginate` returns the wire `Paginated<T>` shape
+    /// (`{docs, nextCursor?}`) via keyset-cursor paging over the sorted set;
+    /// its combination guards reject `count`/`unique`/`first`/`take`.
     pub fn run_query(&self, q: &Query) -> Result<Value, RtDbError> {
         let table_def = self.require_table(&q.table)?.clone();
         let eq = &q.eq;
@@ -276,16 +281,34 @@ impl InMemoryRtDbClient {
                 "count cannot be combined with order",
             ));
         }
-        // Paginate is Task 5 — bail with a clear TODO so a caller knows the
-        // path isn't silent. The paginate-specific combination guards
-        // (count+paginate, take+paginate, …) are skipped: any paginate use
-        // returns the same TODO error regardless of accompanying clauses.
+        // Paginate combination guards (ports `:940-955`): paginate is one-shot
+        // paging, so it cannot also narrow to count/unique/first/take. (`get`
+        // is rejected above; `order`, index, eq, and range bounds are allowed.)
         if q.paginate.is_some() {
-            // TODO(task 5): port the keyset-cursor paginate branch.
-            return Err(RtDbError::new(
-                ErrorCode::Internal,
-                "paginate is not implemented in the in-memory harness (task 5)",
-            ));
+            if q.count {
+                return Err(RtDbError::new(
+                    ErrorCode::BadRequest,
+                    "paginate cannot be combined with count",
+                ));
+            }
+            if q.unique {
+                return Err(RtDbError::new(
+                    ErrorCode::BadRequest,
+                    "paginate cannot be combined with unique",
+                ));
+            }
+            if q.first {
+                return Err(RtDbError::new(
+                    ErrorCode::BadRequest,
+                    "paginate cannot be combined with first",
+                ));
+            }
+            if q.take.is_some() {
+                return Err(RtDbError::new(
+                    ErrorCode::BadRequest,
+                    "paginate cannot be combined with take",
+                ));
+            }
         }
         if q.gt.is_some() && q.gte.is_some() {
             return Err(RtDbError::new(
@@ -518,6 +541,23 @@ impl InMemoryRtDbClient {
             dir_order(a.id.cmp(&b.id), dir)
         });
 
+        // `paginate` terminal: keyset-cursor paging over the sorted set. Ports
+        // TS `executeQuery` :1135-1137 → `paginateResult` (`:1164-1202`). The
+        // sort columns mirror the sort above (unbound index fields after the
+        // eq prefix, then `_creationTime`, then `_id`); the cursor encodes one
+        // value per column.
+        if let Some(pag) = &q.paginate {
+            let mut sort_cols: Vec<SortCol> = Vec::new();
+            if let Some(idx) = &index_def {
+                for field in idx.fields[typed_eq.len()..].iter() {
+                    sort_cols.push(SortCol::Index(field.clone()));
+                }
+            }
+            sort_cols.push(SortCol::CreatedAt);
+            sort_cols.push(SortCol::Id);
+            return paginate_result(pag, &table_def, &filtered, &sort_cols, dir);
+        }
+
         if q.unique {
             if filtered.len() > 1 {
                 return Err(RtDbError::new(
@@ -544,7 +584,7 @@ impl InMemoryRtDbClient {
     /// the result into `T` via [`crate::query::parse_result`]. Pick `T` to
     /// match the terminal: `Vec<T>` for `take`/`collect`, `Option<T>` for
     /// `get`/`first`/`unique`, `i64` for `count`, `Paginated<T>` for
-    /// `paginate` (once Task 5 lands).
+    /// `paginate`.
     pub fn run<T: DeserializeOwned>(&self, q: &Query) -> Result<T, RtDbError> {
         let value = self.run_query(q)?;
         crate::query::parse_result(value)
@@ -1342,6 +1382,188 @@ fn dir_order(o: std::cmp::Ordering, dir: Order) -> std::cmp::Ordering {
 }
 
 // ---------------------------------------------------------------------------
+// Cursor-keyset pagination — a port of TS `paginateResult` and its helpers
+// (`ts-client/src/in_memory.ts:1164-1290`). The cursor stores one value per
+// sort column (unbound index fields, then `_creationTime`, then `_id`); the
+// resume predicate is the standard OR-of-AND row-value comparison, so paging
+// is stable — the unique `id` tiebreaker means no row is skipped or duplicated
+// across pages.
+// ---------------------------------------------------------------------------
+
+/// A sort column for keyset pagination — either an indexed field or one of the
+/// two synthetic tiebreakers. Mirrors the TS `sortKeys` sentinel strings
+/// `__createdAt` / `__id` (`ts-client/src/in_memory.ts:1119-1120`) without
+/// risking a collision with a real field name.
+enum SortCol {
+    Index(String),
+    CreatedAt,
+    Id,
+}
+
+/// Cursor keyset pagination. `sorted` is already filtered (eq/range) and
+/// sorted over `sort_cols` in direction `dir`. Returns a `Value` shaped as
+/// `{docs, nextCursor?}` — the wire `Paginated<T>` (camelCase field names match
+/// [`crate::query::Paginated`] and the TS `PaginatedResultJson`).
+///
+/// Fetch one past the page size so a next page is detectable without a second
+/// pass; the extra is discarded after the has-next check (server `LIMIT n+1`).
+/// The next cursor is built from the page's last row; absent when the page is
+/// empty or this was the final page.
+fn paginate_result(
+    paginate: &crate::query::Paginate,
+    table_def: &TableDef,
+    sorted: &[StoredRow],
+    sort_cols: &[SortCol],
+    dir: Order,
+) -> Result<Value, RtDbError> {
+    let num_items = std::cmp::min(paginate.num_items as usize, MAX_TAKE);
+
+    // Decode + structurally validate the cursor (BAD_REQUEST on any failure —
+    // the codec returns INTERNAL, so rewrap to match the live client's surface
+    // and the TS `decodePaginateCursor` rethrow at `:1206-1217`).
+    let cursor_values: Option<Vec<Value>> = match &paginate.cursor {
+        None => None,
+        Some(cursor) => {
+            let decoded = crate::cursor::decode_cursor(cursor).map_err(|e| {
+                RtDbError::new(
+                    ErrorCode::BadRequest,
+                    format!("invalid cursor: {}", e.message),
+                )
+            })?;
+            if decoded.len() != sort_cols.len() {
+                return Err(RtDbError::new(
+                    ErrorCode::BadRequest,
+                    format!(
+                        "cursor has {} value(s) but this query sorts over {} column(s)",
+                        decoded.len(),
+                        sort_cols.len()
+                    ),
+                ));
+            }
+            validate_cursor_values(&decoded, sort_cols, table_def)?;
+            Some(decoded)
+        }
+    };
+
+    // Apply the keyset resume predicate (strictly-after in the sort direction).
+    let rows: Vec<&StoredRow> = match &cursor_values {
+        Some(cv) => sorted
+            .iter()
+            .filter(|row| is_after_cursor(row, cv, sort_cols, dir))
+            .collect(),
+        None => sorted.iter().collect(),
+    };
+
+    let has_next = rows.len() > num_items;
+    let page: Vec<&StoredRow> = rows.into_iter().take(num_items).collect();
+    let docs: Vec<Value> = page.iter().map(|row| merge_doc(row)).collect();
+
+    let next_cursor = if has_next && !page.is_empty() {
+        let last = page.last().expect("non-empty checked above");
+        let keyset: Vec<Value> = sort_cols.iter().map(|c| sort_value(last, c)).collect();
+        Some(crate::cursor::encode_cursor(&keyset)?)
+    } else {
+        None
+    };
+
+    let mut out = Map::new();
+    out.insert("docs".to_string(), Value::Array(docs));
+    if let Some(nc) = next_cursor {
+        out.insert("nextCursor".to_string(), Value::String(nc));
+    }
+    Ok(Value::Object(out))
+}
+
+/// Type-checks decoded cursor values positionally against the sort columns —
+/// a port of TS `validateCursorValues`
+/// (`ts-client/src/in_memory.ts:1223-1244`). Index columns use
+/// [`coerce_index_value`] (null is a legitimate optional-field value, so only
+/// present values are type-checked); the final two columns are always
+/// `_creationTime` (number) and `_id` (string).
+fn validate_cursor_values(
+    cursor_values: &[Value],
+    sort_cols: &[SortCol],
+    table_def: &TableDef,
+) -> Result<(), RtDbError> {
+    for (i, col) in sort_cols.iter().enumerate() {
+        let value = &cursor_values[i];
+        match col {
+            SortCol::Index(field) => {
+                if !value.is_null() {
+                    coerce_index_value(table_def, field, value)?;
+                }
+            }
+            SortCol::CreatedAt => {
+                if !value.is_number() {
+                    return Err(RtDbError::new(
+                        ErrorCode::BadRequest,
+                        "cursor value for created_at must be a number",
+                    ));
+                }
+            }
+            SortCol::Id => {
+                if !value.is_string() {
+                    return Err(RtDbError::new(
+                        ErrorCode::BadRequest,
+                        "cursor value for id must be a string",
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The keyset resume predicate: true when `row` sorts strictly after the cursor
+/// row. This is the lexicographic "greater than" expanded to OR-of-AND —
+///
+///   (c0 OP v0) OR (c0 = v0 AND c1 OP v1) OR … —
+///
+/// where OP is `>` (asc) / `<` (desc). Evaluated with the same null-sorts-last
+/// comparator as the sort, so it agrees with the ordering that produced
+/// `sorted`. Ports `isAfterCursor` (`ts-client/src/in_memory.ts:1253-1276`).
+fn is_after_cursor(
+    row: &StoredRow,
+    cursor_values: &[Value],
+    sort_cols: &[SortCol],
+    dir: Order,
+) -> bool {
+    for i in 0..sort_cols.len() {
+        let mut prefix_equal = true;
+        for j in 0..i {
+            let row_v = sort_value(row, &sort_cols[j]);
+            if compare_index_values(&row_v, &cursor_values[j]) != std::cmp::Ordering::Equal {
+                prefix_equal = false;
+                break;
+            }
+        }
+        if !prefix_equal {
+            continue;
+        }
+        let row_v = sort_value(row, &sort_cols[i]);
+        let cmp = compare_index_values(&row_v, &cursor_values[i]);
+        let ahead = match dir {
+            Order::Asc => cmp == std::cmp::Ordering::Greater,
+            Order::Desc => cmp == std::cmp::Ordering::Less,
+        };
+        if ahead {
+            return true;
+        }
+    }
+    false
+}
+
+/// Sort value for a column, normalizing an absent optional index field to
+/// null. Ports TS `sortValue` (`ts-client/src/in_memory.ts:1281-1290`).
+fn sort_value(row: &StoredRow, col: &SortCol) -> Value {
+    match col {
+        SortCol::CreatedAt => Value::Number(serde_json::Number::from(row.created_at)),
+        SortCol::Id => Value::String(row.id.clone()),
+        SortCol::Index(field) => row.doc.get(field).cloned().unwrap_or(Value::Null),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Filter evaluation — a port of `validateFilter`/`evalFilterExpr` and the leaf
 // helpers in `ts-client/src/in_memory.ts:361-488`. The server compiles a
 // `FilterExpr` once against the table's declared fields
@@ -1585,7 +1807,7 @@ fn require_index<'a>(table_def: &'a TableDef, name: &str) -> Result<&'a IndexDef
 mod tests {
     use super::*;
     use crate::mutation::Mutation;
-    use crate::query::TableQuery;
+    use crate::query::{Paginate, Paginated, TableQuery};
     use crate::schema::{Schema, Table};
     use crate::wire::FilterExpr;
     use serde_json::json;
@@ -2849,25 +3071,343 @@ mod tests {
         }
     }
 
-    // ---- query: paginate / search / vector stubs --------------------
+    // ---- query: paginate (cursor keyset) -----------------------------
+    //
+    // Direct port of `describe("InMemoryRtDbClient — paginate (cursor keyset)")`
+    // (`ts-client/tests/in_memory.test.ts:250-431`). The deterministic clock +
+    // RNG make `_creationTime` and `_id` rise with insertion order, so an
+    // ascending sort yields insertion order and a descending sort reverses it.
+
+    /// Mirrors TS `seedItems` (`ts-client/tests/in_memory.test.ts:254-269`):
+    /// insert `count` items with `order` = 1..count and `status` cycling
+    /// through `statuses`. Returns the inserted ids in insertion order.
+    async fn seed_items(c: &mut InMemoryRtDbClient, count: i64, statuses: &[&str]) -> Vec<String> {
+        let mut ids = Vec::new();
+        for i in 1..=count {
+            let txn = Mutation::new()
+                .insert(
+                    "items",
+                    json!({
+                        "name": format!("n{i}"),
+                        "status": statuses[((i - 1) as usize) % statuses.len()],
+                        "order": i,
+                    }),
+                )
+                .build();
+            let results = c.mutate(&txn, None).await.expect("insert ok");
+            match &results[0] {
+                StepResult::Insert { id } => ids.push(id.clone()),
+                other => panic!("expected Insert, got {other:?}"),
+            }
+        }
+        ids
+    }
+
+    /// Walks the full cursor chain until `next_cursor` is absent — ports TS
+    /// `walkPages` (`ts-client/tests/in_memory.test.ts:272-295`). Returns the
+    /// observed page sizes, the per-page cursors (final one `None`), and all
+    /// docs concatenated in page order.
+    async fn walk_pages<F>(
+        c: &InMemoryRtDbClient,
+        build: F,
+    ) -> (Vec<usize>, Vec<Option<String>>, Vec<Value>)
+    where
+        F: Fn(Option<&str>) -> Query,
+    {
+        let mut page_sizes = Vec::new();
+        let mut cursors = Vec::new();
+        let mut docs = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..1000 {
+            let page: Paginated<Value> = c.run(&build(cursor.as_deref())).expect("paginate ok");
+            page_sizes.push(page.docs.len());
+            cursors.push(page.next_cursor.clone());
+            docs.extend(page.docs);
+            if page.next_cursor.is_none() {
+                return (page_sizes, cursors, docs);
+            }
+            cursor = page.next_cursor;
+        }
+        panic!("pagination did not terminate");
+    }
 
     #[tokio::test]
-    async fn query_paginate_returns_internal_error_task_5() {
-        // Task 5 will port the keyset-cursor paginate branch; until then the
-        // TODO returns INTERNAL so the path can't silently misbehave.
+    async fn paginate_returns_empty_page_with_no_cursor_on_empty_table() {
+        // Ports TS "returns an empty page with no nextCursor on an empty table".
         let c = new_client();
+        let page: Paginated<Value> = c
+            .run(&TableQuery::new("items").paginate(None, 3))
+            .expect("paginate ok");
+        assert!(page.docs.is_empty());
+        assert!(page.next_cursor.is_none());
+    }
+
+    #[tokio::test]
+    async fn paginate_walks_all_pages_terminating_on_short_last_page() {
+        // Ports TS "walks all pages in order, terminating on a short last page".
+        let mut c = new_client();
+        seed_items(&mut c, 7, &["todo"]).await;
+        let (page_sizes, cursors, docs) =
+            walk_pages(&c, |cursor| TableQuery::new("items").paginate(cursor, 3)).await;
+        // Page sizes 3, 3, 1; the walk must equal a plain collect() with no
+        // skips or duplicates.
+        assert_eq!(page_sizes, vec![3, 3, 1]);
+        assert!(cursors[..cursors.len() - 1].iter().all(|x| x.is_some()));
+        assert!(cursors.last().is_some_and(|x| x.is_none()));
+
+        let collected: Vec<Value> = c
+            .run::<Vec<Value>>(&TableQuery::new("items").collect())
+            .expect("collect ok");
+        let walked_ids: Vec<&str> = docs
+            .iter()
+            .map(|d| d["_id"].as_str().expect("id string"))
+            .collect();
+        let collected_ids: Vec<&str> = collected
+            .iter()
+            .map(|d| d["_id"].as_str().expect("id string"))
+            .collect();
+        assert_eq!(walked_ids, collected_ids);
+        let mut unique = walked_ids.to_vec();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), walked_ids.len(), "no duplicates across pages");
+    }
+
+    #[tokio::test]
+    async fn paginate_terminates_on_full_last_page_when_count_is_exact_multiple() {
+        // Ports TS "terminates on a full last page when the count is an exact
+        // multiple": the final page is full but `nextCursor` is None.
+        let mut c = new_client();
+        seed_items(&mut c, 6, &["todo"]).await;
+        let (page_sizes, cursors, _docs) =
+            walk_pages(&c, |cursor| TableQuery::new("items").paginate(cursor, 3)).await;
+        assert_eq!(page_sizes, vec![3, 3]);
+        assert!(cursors[0].is_some());
+        assert!(cursors[1].is_none());
+    }
+
+    #[tokio::test]
+    async fn paginate_within_eq_prefixed_index_in_index_order() {
+        // Ports TS "paginates within an eq-prefixed multi-field index in index
+        // order": status cycles todo/done/todo ⇒ todos are orders 1,3,4,6,7,9.
+        let mut c = new_client();
+        seed_items(&mut c, 9, &["todo", "done", "todo"]).await;
+        let (page_sizes, _cursors, docs) = walk_pages(&c, |cursor| {
+            TableQuery::new("items")
+                .with_index("by_status_and_order", &[json!("todo")])
+                .paginate(cursor, 4)
+        })
+        .await;
+        assert_eq!(page_sizes, vec![4, 2]);
+        let orders: Vec<i64> = docs
+            .iter()
+            .map(|d| d["order"].as_i64().expect("order number"))
+            .collect();
+        assert_eq!(orders, vec![1, 3, 4, 6, 7, 9]);
+        assert!(docs.iter().all(|d| d["status"] == json!("todo")));
+    }
+
+    #[tokio::test]
+    async fn paginate_descending_pages_in_reverse_index_order() {
+        // Ports TS "walks descending pages in reverse index order": same seed
+        // as the asc case, but order=desc ⇒ 9,7,6,4,3,1.
+        let mut c = new_client();
+        seed_items(&mut c, 9, &["todo", "done", "todo"]).await;
+        let (page_sizes, _cursors, docs) = walk_pages(&c, |cursor| {
+            TableQuery::new("items")
+                .with_index("by_status_and_order", &[json!("todo")])
+                .order(Order::Desc)
+                .paginate(cursor, 4)
+        })
+        .await;
+        assert_eq!(page_sizes, vec![4, 2]);
+        let orders: Vec<i64> = docs
+            .iter()
+            .map(|d| d["order"].as_i64().expect("order number"))
+            .collect();
+        assert_eq!(orders, vec![9, 7, 6, 4, 3, 1]);
+    }
+
+    #[tokio::test]
+    async fn paginate_cursor_round_trips_and_resumes_chain() {
+        // Ports TS "emits cursors decodable by the live client; resume
+        // continues the chain": the cursor decodes to the last row's
+        // [order, _creationTime, _id] tuple — cursors are interchangeable.
+        let mut c = new_client();
+        seed_items(&mut c, 5, &["todo"]).await; // todo orders 1..5
+        let first: Paginated<Value> = c
+            .run(
+                &TableQuery::new("items")
+                    .with_index("by_status_and_order", &[json!("todo")])
+                    .paginate(None, 2),
+            )
+            .expect("first page");
+        let orders: Vec<i64> = first
+            .docs
+            .iter()
+            .map(|d| d["order"].as_i64().expect("order number"))
+            .collect();
+        assert_eq!(orders, vec![1, 2]);
+        let next_cursor = first.next_cursor.expect("expected a nextCursor");
+
+        // Cursor decodes to [order, _creationTime, _id] of the page's last row.
+        let decoded = crate::cursor::decode_cursor(&next_cursor).expect("cursor decodes");
+        let last = &first.docs[1];
+        assert_eq!(decoded.len(), 3);
+        assert_eq!(decoded[0], last["order"]);
+        assert_eq!(decoded[1], last["_creationTime"]);
+        assert_eq!(decoded[2], last["_id"]);
+
+        let second: Paginated<Value> = c
+            .run(
+                &TableQuery::new("items")
+                    .with_index("by_status_and_order", &[json!("todo")])
+                    .paginate(Some(&next_cursor), 2),
+            )
+            .expect("second page");
+        let orders: Vec<i64> = second
+            .docs
+            .iter()
+            .map(|d| d["order"].as_i64().expect("order number"))
+            .collect();
+        assert_eq!(orders, vec![3, 4]);
+    }
+
+    #[tokio::test]
+    async fn paginate_rejects_malformed_cursor_as_bad_request() {
+        // Ports TS "rejects a malformed (non-base64) cursor with BAD_REQUEST,
+        // not INTERNAL" — the codec returns INTERNAL; the harness rewraps it.
+        let mut c = new_client();
+        seed_items(&mut c, 3, &["todo"]).await;
         let err = c
             .run_query(&Query {
                 table: "items".into(),
-                paginate: Some(crate::query::Paginate {
-                    cursor: None,
-                    num_items: 10,
+                paginate: Some(Paginate {
+                    cursor: Some("not-valid-base64!!!".into()),
+                    num_items: 3,
                 }),
                 ..Default::default()
             })
             .unwrap_err();
-        assert_eq!(err.code, ErrorCode::Internal);
-        assert!(err.message.contains("task 5"), "got: {err}");
+        assert_eq!(err.code, ErrorCode::BadRequest);
+    }
+
+    #[tokio::test]
+    async fn paginate_rejects_cursor_with_mismatched_arity() {
+        // Ports TS "rejects a cursor whose arity mismatches the sort columns":
+        // no-index query sorts over 2 columns (createdAt, id); 3 values
+        // mismatch.
+        let mut c = new_client();
+        seed_items(&mut c, 3, &["todo"]).await;
+        let bad = crate::cursor::encode_cursor(&[json!(1), json!(2), json!(3)]).expect("encode");
+        let err = c
+            .run_query(&Query {
+                table: "items".into(),
+                paginate: Some(Paginate {
+                    cursor: Some(bad),
+                    num_items: 3,
+                }),
+                ..Default::default()
+            })
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::BadRequest);
+        assert!(err.message.contains("sorts over 2 column(s)"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn paginate_rejects_cursor_whose_created_at_is_not_a_number() {
+        // Ports TS "rejects a cursor whose created_at value is not a number":
+        // no-index cursor = [createdAt, id]; a non-numeric createdAt fails
+        // type-check.
+        let mut c = new_client();
+        seed_items(&mut c, 3, &["todo"]).await;
+        let bad = crate::cursor::encode_cursor(&[
+            json!("not-a-number"),
+            json!("0123456789abcdef0123456789abcdef"),
+        ])
+        .expect("encode");
+        let err = c
+            .run_query(&Query {
+                table: "items".into(),
+                paginate: Some(Paginate {
+                    cursor: Some(bad),
+                    num_items: 3,
+                }),
+                ..Default::default()
+            })
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::BadRequest);
+        assert!(
+            err.message.contains("created_at must be a number"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn paginate_rejects_combination_with_take_count_unique_or_first() {
+        // Ports TS "rejects paginate combined with take or count" and extends
+        // to unique/first — the validation cascade Task 3 collapsed is now
+        // restored (TS :940-955).
+        let mut c = new_client();
+        seed_items(&mut c, 3, &["todo"]).await;
+        for (needle, q) in [
+            (
+                "take",
+                Query {
+                    table: "items".into(),
+                    paginate: Some(Paginate {
+                        cursor: None,
+                        num_items: 3,
+                    }),
+                    take: Some(3),
+                    ..Default::default()
+                },
+            ),
+            (
+                "count",
+                Query {
+                    table: "items".into(),
+                    paginate: Some(Paginate {
+                        cursor: None,
+                        num_items: 3,
+                    }),
+                    count: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "unique",
+                Query {
+                    table: "items".into(),
+                    paginate: Some(Paginate {
+                        cursor: None,
+                        num_items: 3,
+                    }),
+                    unique: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "first",
+                Query {
+                    table: "items".into(),
+                    paginate: Some(Paginate {
+                        cursor: None,
+                        num_items: 3,
+                    }),
+                    first: true,
+                    ..Default::default()
+                },
+            ),
+        ] {
+            let err = c.run_query(&q).unwrap_err();
+            assert_eq!(err.code, ErrorCode::BadRequest, "case '{needle}'");
+            assert!(
+                err.message.contains(needle),
+                "case '{needle}' missing needle: got {}",
+                err.message
+            );
+        }
     }
 
     #[tokio::test]
