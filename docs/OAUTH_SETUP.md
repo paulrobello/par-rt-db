@@ -88,8 +88,10 @@ Data access → Clients** — all scoped with `?project=par-rt-db`.
    only works inside a Google Workspace org, so for a personal account use
    External). This is the consent "who can sign in" gate.
 2. **Brand information** (`/auth/branding`) — **App name**, **User support
-   email**, and **Developer contact information** (all you). This is what users
-   see on the consent screen.
+   email**, and **Developer contact information** (all you). For the required
+   **Privacy link**, the server serves its own policy at `RTDB_PUBLIC_URL` +
+   `/privacy` (e.g. `https://rtdb.pardev.net/privacy`) — use that, or any
+   reachable HTTPS policy page.
 3. **Data access** (`/auth/data-access`) — add the three scopes par-rt-db
    requests (Google lists them under Google APIs as):
    - `.../auth/userinfo.email`

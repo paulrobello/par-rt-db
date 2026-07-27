@@ -11,6 +11,7 @@ pub mod metrics;
 pub mod mutation_log;
 pub mod op_feed;
 pub mod pagination;
+pub mod privacy;
 pub mod protocol;
 pub mod query;
 pub mod scheduler;
@@ -160,6 +161,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
 
     let mut router = Router::new()
         .route("/healthz", get(health::handler))
+        .route("/privacy", get(privacy::handler))
         .merge(admin::admin_routes())
         .merge(http_api::http_api_routes())
         .merge(ws::ws_routes())
