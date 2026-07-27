@@ -201,7 +201,7 @@ impl InMemoryRtDbClient {
     /// Synchronous atomic core shared by [`mutate`](Self::mutate) and (in Task
     /// 4) the scheduler's `tick`: enforces the [`MAX_STEPS`] cap, snapshots the
     /// docs store, applies every step (rolling back the whole txn on any error).
-    /// Subscription fan-out happens in Task 5; this is where the write-set
+    /// Subscription fan-out happens in Task 6; this is where the write-set
     /// notification will hook in.
     fn execute_transaction(&mut self, txn: &Transaction) -> Result<Vec<StepResult>, RtDbError> {
         if txn.steps.len() > MAX_STEPS {
@@ -356,17 +356,12 @@ impl InMemoryRtDbClient {
         doc: &Map<String, Value>,
     ) -> Result<(), RtDbError> {
         let key = (table_name.to_string(), id.to_string());
-        if !self.docs.contains_key(&key) {
-            return Err(RtDbError::new(
-                ErrorCode::NotFound,
-                format!("document '{id}' not found"),
-            ));
-        }
+        let row = self.docs.get_mut(&key).ok_or_else(|| {
+            RtDbError::new(ErrorCode::NotFound, format!("document '{id}' not found"))
+        })?;
         let doc_value = Value::Object(doc.clone());
         validate_doc(table_def, &doc_value)?;
-        let stripped = strip_unset_optionals(table_def, &doc_value);
-        let row = self.docs.get_mut(&key).expect("checked contains_key above");
-        row.doc = stripped;
+        row.doc = strip_unset_optionals(table_def, &doc_value);
         row.version += 1;
         Ok(())
     }
@@ -504,7 +499,7 @@ impl InMemoryRtDbClient {
             // `random` is documented as `[0, 1)`; the `& 0xF` is a defensive
             // guard against a stray `1.0` overflowing the digit range.
             let digit = ((self.random)() * 16.0).floor() as u32 & 0xF;
-            out.push(char::from_digit(digit, 16).expect("clamped to 0..=15"));
+            out.push(char::from_digit(digit, 16).unwrap_or('0'));
         }
         out
     }
