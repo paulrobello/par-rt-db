@@ -17,9 +17,11 @@
 //! reactive subscriptions). Gaps are marked with `TODO` and return an `INTERNAL`
 //! error rather than silently misbehaving.
 //!
-//! This module is the scaffold (Task 1): struct + options + `push_schema` + the
-//! validation/id/format helpers. Subsequent tasks fill in mutate, queries,
-//! subscriptions, scheduling, and storage.
+//! This module currently houses the scaffold (Task 1: struct + options +
+//! `push_schema` + the validation/id/format helpers) and the mutate executor
+//! (Task 2: insert/patch/replace/delete/expectVersion/expectAbsent/upsert with
+//! idempotency-key caching, MAX_STEPS guard, and atomic rollback). Subsequent
+//! tasks fill in queries, subscriptions, scheduling, and storage.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -28,7 +30,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::{Map, Value};
 
 use crate::error::{ErrorCode, RtDbError};
-use crate::schema::{FieldType, SchemaDef, TableDef};
+use crate::mutation::{Step, StepResult, Transaction};
+use crate::schema::{FieldType, IndexDef, SchemaDef, TableDef};
 
 /// Maximum number of steps in a single transaction (mirrors the server cap).
 pub const MAX_STEPS: usize = 256;
@@ -79,9 +82,7 @@ impl InMemoryRtDbClientOptions {
 /// In-memory par-rt-db client for unit tests. See the
 /// [module docs](crate::in_memory) for the parity scope and deferred gaps.
 pub struct InMemoryRtDbClient {
-    #[expect(dead_code, reason = "consumed by task 2 (insert/_creationTime)")]
     now: Arc<dyn Fn() -> i64 + Send + Sync>,
-    #[expect(dead_code, reason = "consumed by task 2 (id minting)")]
     random: Arc<dyn Fn() -> f64 + Send + Sync>,
     schema: Option<SchemaDef>,
     /// Per-table schema defs, keyed by table name. Separate from `schema` so
@@ -93,7 +94,9 @@ pub struct InMemoryRtDbClient {
     docs: HashMap<(String, String), StoredRow>,
     #[expect(dead_code, reason = "consumed by task 6 (storage id minting)")]
     id_counter: u64,
-    idempotency: HashMap<String, Vec<Value>>,
+    /// `mut_id` → cached results. `push_schema` clears this on every push
+    /// (matching TS); `mutate` reads/writes it for its idempotency short-circuit.
+    idempotency: HashMap<String, Vec<StepResult>>,
     #[expect(dead_code, reason = "consumed by task 4 (scheduling)")]
     schedules: Vec<Value>,
     #[expect(dead_code, reason = "consumed by task 5 (subscriptions)")]
@@ -149,6 +152,361 @@ impl InMemoryRtDbClient {
     /// `push_schema`). Returns a clone so callers can freely inspect/mutate.
     pub fn to_schema_json(&self) -> Option<SchemaDef> {
         self.schema.clone()
+    }
+
+    /// Minimal point read — returns the merged doc (system fields included) for
+    /// `(table, id)`, or `None` if absent. Mirrors the server's `get(id)` read
+    /// semantics. The full query DSL (`withIndex`, `order`, `take`, `filter`, …)
+    /// lands in Task 3; tests that need a quick read use this until then.
+    pub fn get(&self, table: &str, id: &str) -> Option<Value> {
+        self.docs
+            .get(&(table.to_string(), id.to_string()))
+            .map(merge_doc)
+    }
+
+    /// Test/debug helper — every merged doc in `table`, in unspecified order.
+    /// Not part of the query DSL; Task 3 replaces callers with proper queries.
+    pub fn collect_all(&self, table: &str) -> Vec<Value> {
+        self.docs
+            .iter()
+            .filter(|((t, _), _)| t == table)
+            .map(|(_, row)| merge_doc(row))
+            .collect()
+    }
+
+    /// Executes a transaction and returns one [`StepResult`] per step, in order.
+    /// Same shape (and `mut_id` idempotency-key semantics) as the live clients.
+    ///
+    /// Ports `mutate` in `ts-client/src/in_memory.ts:528-540`: a `mut_id` that
+    /// has been seen before short-circuits with the cached results; otherwise
+    /// the txn runs through [`execute_transaction`](Self::execute_transaction)
+    /// and, on success, the results are cached under `mut_id` for next time.
+    pub async fn mutate(
+        &mut self,
+        txn: &Transaction,
+        mut_id: Option<&str>,
+    ) -> Result<Vec<StepResult>, RtDbError> {
+        if let Some(mid) = mut_id
+            && let Some(cached) = self.idempotency.get(mid)
+        {
+            return Ok(cached.clone());
+        }
+        let results = self.execute_transaction(txn)?;
+        if let Some(mid) = mut_id {
+            self.idempotency.insert(mid.to_string(), results.clone());
+        }
+        Ok(results)
+    }
+
+    /// Synchronous atomic core shared by [`mutate`](Self::mutate) and (in Task
+    /// 4) the scheduler's `tick`: enforces the [`MAX_STEPS`] cap, snapshots the
+    /// docs store, applies every step (rolling back the whole txn on any error).
+    /// Subscription fan-out happens in Task 5; this is where the write-set
+    /// notification will hook in.
+    fn execute_transaction(&mut self, txn: &Transaction) -> Result<Vec<StepResult>, RtDbError> {
+        if txn.steps.len() > MAX_STEPS {
+            return Err(RtDbError::new(
+                ErrorCode::BadRequest,
+                format!("transaction exceeds maximum of {MAX_STEPS} steps"),
+            ));
+        }
+        let snapshot = self.snapshot_docs();
+        let mut results = Vec::with_capacity(txn.steps.len());
+        for step in &txn.steps {
+            match self.execute_step(step) {
+                Ok((result, _written_table)) => results.push(result),
+                Err(error) => {
+                    // Atomicity: any step's error rolls back everything already
+                    // applied, mirroring the server's single-transaction semantics.
+                    self.restore_docs(snapshot);
+                    return Err(error);
+                }
+            }
+        }
+        Ok(results)
+    }
+
+    /// Per-step executor — ports `executeStep` (`ts-client/src/in_memory.ts:747-805`).
+    /// Each step validates against the live schema, mutates `self.docs` (or, for
+    /// `Expect*`, just observes), and returns the [`StepResult`] plus the table
+    /// that was written (so the Task 5 notify path can fan out by table).
+    fn execute_step(&mut self, step: &Step) -> Result<(StepResult, Option<String>), RtDbError> {
+        match step {
+            Step::Insert { table, doc } => {
+                let table_def = self.require_table(table)?.clone();
+                let id = self.do_insert(table, &table_def, doc)?;
+                Ok((StepResult::Insert { id }, Some(table.clone())))
+            }
+            Step::Patch { table, id, fields } => {
+                let table_def = self.require_table(table)?.clone();
+                self.do_patch(&table_def, table, id, fields)?;
+                Ok((StepResult::Null, Some(table.clone())))
+            }
+            Step::Replace { table, id, doc } => {
+                let table_def = self.require_table(table)?.clone();
+                self.do_replace(&table_def, table, id, doc)?;
+                Ok((StepResult::Null, Some(table.clone())))
+            }
+            Step::Delete { table, id } => {
+                self.require_table(table)?;
+                self.do_delete(table, id)?;
+                Ok((StepResult::Null, Some(table.clone())))
+            }
+            Step::ExpectVersion { table, id, version } => {
+                self.require_table(table)?;
+                self.do_expect_version(table, id, *version)?;
+                Ok((StepResult::Null, None))
+            }
+            Step::ExpectAbsent { table, index, eq } => {
+                let table_def = self.require_table(table)?.clone();
+                let rows = self.eq_lookup(&table_def, table, index, eq)?;
+                if !rows.is_empty() {
+                    return Err(RtDbError::new(
+                        ErrorCode::PreconditionFailed,
+                        format!("index '{index}' already has a matching document"),
+                    ));
+                }
+                Ok((StepResult::Null, None))
+            }
+            Step::Upsert {
+                table,
+                index,
+                eq,
+                insert,
+                patch,
+            } => {
+                let table_def = self.require_table(table)?.clone();
+                let rows = self.eq_lookup(&table_def, table, index, eq)?;
+                if rows.len() > 1 {
+                    return Err(RtDbError::new(
+                        ErrorCode::PreconditionFailed,
+                        "upsert matched multiple documents",
+                    ));
+                }
+                if let Some(row) = rows.into_iter().next() {
+                    let merged = apply_patch(&table_def, &row.doc, patch)?;
+                    self.do_update(table, &row.id, merged);
+                    Ok((
+                        StepResult::Upsert {
+                            id: row.id.clone(),
+                            inserted: false,
+                        },
+                        Some(table.clone()),
+                    ))
+                } else {
+                    let id = self.do_insert(table, &table_def, insert)?;
+                    Ok((
+                        StepResult::Upsert { id, inserted: true },
+                        Some(table.clone()),
+                    ))
+                }
+            }
+        }
+    }
+
+    /// Inserts a new doc, minting the id and stamping `_creationTime` /
+    /// `_version = 1`. Ports `doInsert` (`ts-client/src/in_memory.ts:807-813`).
+    fn do_insert(
+        &mut self,
+        table_name: &str,
+        table_def: &TableDef,
+        doc: &Map<String, Value>,
+    ) -> Result<String, RtDbError> {
+        let doc_value = Value::Object(doc.clone());
+        validate_doc(table_def, &doc_value)?;
+        let stored = strip_unset_optionals(table_def, &doc_value);
+        let id = self.new_id();
+        self.docs.insert(
+            (table_name.to_string(), id.clone()),
+            StoredRow {
+                id: id.clone(),
+                doc: stored,
+                version: 1,
+                created_at: (self.now)(),
+            },
+        );
+        Ok(id)
+    }
+
+    /// Patches an existing doc with `fields`, bumping `_version`. Ports
+    /// `doPatch` (`ts-client/src/in_memory.ts:815-824`) — apply then update.
+    fn do_patch(
+        &mut self,
+        table_def: &TableDef,
+        table_name: &str,
+        id: &str,
+        fields: &Map<String, Value>,
+    ) -> Result<(), RtDbError> {
+        let key = (table_name.to_string(), id.to_string());
+        let row = self.docs.get(&key).cloned().ok_or_else(|| {
+            RtDbError::new(ErrorCode::NotFound, format!("document '{id}' not found"))
+        })?;
+        let merged = apply_patch(table_def, &row.doc, fields)?;
+        self.do_update(table_name, id, merged);
+        Ok(())
+    }
+
+    /// Replaces an existing doc whole, bumping `_version`. Ports `doReplace`
+    /// (`ts-client/src/in_memory.ts:826-836`).
+    fn do_replace(
+        &mut self,
+        table_def: &TableDef,
+        table_name: &str,
+        id: &str,
+        doc: &Map<String, Value>,
+    ) -> Result<(), RtDbError> {
+        let key = (table_name.to_string(), id.to_string());
+        if !self.docs.contains_key(&key) {
+            return Err(RtDbError::new(
+                ErrorCode::NotFound,
+                format!("document '{id}' not found"),
+            ));
+        }
+        let doc_value = Value::Object(doc.clone());
+        validate_doc(table_def, &doc_value)?;
+        let stripped = strip_unset_optionals(table_def, &doc_value);
+        let row = self.docs.get_mut(&key).expect("checked contains_key above");
+        row.doc = stripped;
+        row.version += 1;
+        Ok(())
+    }
+
+    /// Deletes a doc by id. Ports `doDelete` (`ts-client/src/in_memory.ts:838-842`).
+    fn do_delete(&mut self, table_name: &str, id: &str) -> Result<(), RtDbError> {
+        let key = (table_name.to_string(), id.to_string());
+        self.docs.remove(&key).ok_or_else(|| {
+            RtDbError::new(ErrorCode::NotFound, format!("document '{id}' not found"))
+        })?;
+        Ok(())
+    }
+
+    /// Asserts a doc's current `_version` matches `expected`. Ports
+    /// `doExpectVersion` (`ts-client/src/in_memory.ts:844-852`).
+    fn do_expect_version(
+        &self,
+        table_name: &str,
+        id: &str,
+        expected: i64,
+    ) -> Result<(), RtDbError> {
+        let key = (table_name.to_string(), id.to_string());
+        let row = self.docs.get(&key).ok_or_else(|| {
+            RtDbError::new(ErrorCode::NotFound, format!("document '{id}' not found"))
+        })?;
+        if row.version != expected {
+            return Err(RtDbError::new(
+                ErrorCode::PreconditionFailed,
+                format!(
+                    "version mismatch: expected {expected}, actual {}",
+                    row.version
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Shared write-back helper for patch/replace/upsert-patch: writes the
+    /// merged doc and bumps `_version`. Ports `doUpdate`
+    /// (`ts-client/src/in_memory.ts:856-860`).
+    fn do_update(&mut self, table_name: &str, id: &str, merged: Value) {
+        let key = (table_name.to_string(), id.to_string());
+        if let Some(row) = self.docs.get_mut(&key) {
+            row.doc = merged;
+            row.version += 1;
+        }
+    }
+
+    /// Full-arity index eq lookup — ports `eqLookup`
+    /// (`ts-client/src/in_memory.ts:864-885`), shared by `expectAbsent` and
+    /// `upsert`. Returns every stored row whose indexed fields equal `eq`
+    /// positionally (null/absent index fields never match, mirroring SQL NULL
+    /// exclusion).
+    fn eq_lookup(
+        &self,
+        table_def: &TableDef,
+        table_name: &str,
+        index_name: &str,
+        eq: &[Value],
+    ) -> Result<Vec<StoredRow>, RtDbError> {
+        let index = require_index(table_def, index_name)?;
+        if eq.len() != index.fields.len() {
+            return Err(RtDbError::new(
+                ErrorCode::BadRequest,
+                format!(
+                    "index '{}' expects {} eq value(s), got {}",
+                    index_name,
+                    index.fields.len(),
+                    eq.len()
+                ),
+            ));
+        }
+        let typed: Vec<Value> = index
+            .fields
+            .iter()
+            .zip(eq.iter())
+            .map(|(field, value)| coerce_index_value(table_def, field, value))
+            .collect::<Result<_, _>>()?;
+        let mut matches = Vec::new();
+        for ((t, _id), row) in &self.docs {
+            if t != table_name {
+                continue;
+            }
+            let all_match =
+                index
+                    .fields
+                    .iter()
+                    .zip(typed.iter())
+                    .all(|(field, tv)| match row.doc.get(field) {
+                        Some(v) => !v.is_null() && v == tv,
+                        None => false,
+                    });
+            if all_match {
+                matches.push(row.clone());
+            }
+        }
+        Ok(matches)
+    }
+
+    /// Looks up a table def by name (NOT_FOUND if the schema has no such table).
+    /// Ports `requireTable` (`ts-client/src/in_memory.ts:1320-1326`).
+    fn require_table(&self, name: &str) -> Result<&TableDef, RtDbError> {
+        self.tables
+            .get(name)
+            .ok_or_else(|| RtDbError::new(ErrorCode::NotFound, format!("table '{name}' not found")))
+    }
+
+    /// Snapshots the docs store for atomic rollback. Ports `snapshotTables`
+    /// (`ts-client/src/in_memory.ts:1368-1383`).
+    fn snapshot_docs(&self) -> HashMap<(String, String), StoredRow> {
+        self.docs.clone()
+    }
+
+    /// Restores a previously-taken snapshot, discarding any partial writes.
+    /// Ports `restoreTables` (`ts-client/src/in_memory.ts:1385-1390`).
+    fn restore_docs(&mut self, snapshot: HashMap<(String, String), StoredRow>) {
+        self.docs = snapshot;
+    }
+
+    /// UUIDv7-shaped id (timestamp-prefixed for sort stability), 32 hex chars.
+    /// Ports `newId` (`ts-client/src/in_memory.ts:1354-1358`): low 48 bits of
+    /// the epoch-millis timestamp (12 hex chars, the TS `.slice(-12)` of
+    /// `toString(16)`), a constant `7` version nibble, then 19 random hex chars.
+    fn new_id(&self) -> String {
+        let ts = (self.now)() as u64 & 0xFFFF_FFFF_FFFF;
+        let rand = self.random_hex(19);
+        format!("{ts:012x}7{rand}")
+    }
+
+    /// `count` lowercase hex chars drawn from the injected RNG. Ports
+    /// `randomHex` (`ts-client/src/in_memory.ts:1360-1366`).
+    fn random_hex(&self, count: usize) -> String {
+        let mut out = String::with_capacity(count);
+        for _ in 0..count {
+            // `random` is documented as `[0, 1)`; the `& 0xF` is a defensive
+            // guard against a stray `1.0` overflowing the digit range.
+            let digit = ((self.random)() * 16.0).floor() as u32 & 0xF;
+            out.push(char::from_digit(digit, 16).expect("clamped to 0..=15"));
+        }
+        out
     }
 }
 
@@ -362,11 +720,265 @@ pub fn strip_unset_optionals(table: &TableDef, doc: &Value) -> Value {
     Value::Object(out)
 }
 
+/// Applies a patch's `fields` onto `doc` — a port of server `txn::apply_patch`
+/// and the TS `applyPatch` (`ts-client/src/in_memory.ts:243-265`). A `null`
+/// onto an `Optional` field whose inner type doesn't itself accept `null`
+/// deletes the key (mirroring `strip_unset_optionals`'s single representation
+/// of an unset optional); the merged doc is then re-validated whole.
+pub fn apply_patch(
+    table: &TableDef,
+    doc: &Value,
+    fields: &Map<String, Value>,
+) -> Result<Value, RtDbError> {
+    let mut merged = match doc.as_object() {
+        Some(m) => m.clone(),
+        None => Map::new(),
+    };
+    for (field, value) in fields {
+        let field_ty = match table.fields.get(field) {
+            Some(t) => t,
+            None => {
+                return Err(RtDbError::new(
+                    ErrorCode::SchemaViolation,
+                    format!("unknown field '{field}'"),
+                ));
+            }
+        };
+        // null on an Optional<String> (or any Optional whose inner rejects null)
+        // deletes the key — the server's strip_unset_optionals semantics.
+        let strip = if let FieldType::Optional { inner } = field_ty {
+            value.is_null() && !validate_value(inner, value)
+        } else {
+            false
+        };
+        if strip {
+            merged.remove(field);
+            continue;
+        }
+        if !validate_value(field_ty, value) {
+            return Err(RtDbError::new(
+                ErrorCode::SchemaViolation,
+                format!("field '{field}' has an invalid value"),
+            ));
+        }
+        merged.insert(field.clone(), value.clone());
+    }
+    let merged_value = Value::Object(merged);
+    validate_doc(table, &merged_value)?;
+    Ok(merged_value)
+}
+
+/// Lowercase camelCase type tag for a [`FieldType`] — used in error messages
+/// (mirrors `typeTag` in `ts-client/src/in_memory.ts:267-269` and the serde tag
+/// on [`FieldType`]).
+pub fn type_tag(ty: &FieldType) -> &'static str {
+    match ty {
+        FieldType::String => "string",
+        FieldType::Number => "number",
+        FieldType::Boolean => "boolean",
+        FieldType::Null => "null",
+        FieldType::Id { .. } => "id",
+        FieldType::Literal { .. } => "literal",
+        FieldType::Optional { .. } => "optional",
+        FieldType::Union { .. } => "union",
+        FieldType::Array { .. } => "array",
+        FieldType::Object { .. } => "object",
+        FieldType::Int64 => "int64",
+        FieldType::Bytes => "bytes",
+        FieldType::Any => "any",
+        FieldType::Record { .. } => "record",
+        FieldType::Vector { .. } => "vector",
+    }
+}
+
+/// Indexed-column storage type, mirroring server `indexed_column_type` and the
+/// TS `IndexedType` (`ts-client/src/in_memory.ts:43-49`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PgType {
+    Text,
+    Number,
+    Boolean,
+}
+
+/// Shape returned by [`index_column_type`]: the storage type plus whether the
+/// source field was wrapped in `Optional` (so callers can let null sort).
+#[derive(Debug, Clone, Copy)]
+pub struct IndexedType {
+    pub pg: PgType,
+    pub nullable: bool,
+}
+
+/// Indexable column type — a port of server `schema::indexed_column_type` and
+/// the TS `indexColumnType` (`ts-client/src/in_memory.ts:271-298`). Returns
+/// SCHEMA_VIOLATION for non-indexable types.
+pub fn index_column_type(ty: &FieldType) -> Result<IndexedType, RtDbError> {
+    let pg = match ty {
+        FieldType::String | FieldType::Id { .. } => PgType::Text,
+        FieldType::Number => PgType::Number,
+        FieldType::Boolean => PgType::Boolean,
+        FieldType::Literal {
+            value: Value::String(_),
+        } => PgType::Text,
+        FieldType::Literal { .. } => {
+            return Err(RtDbError::new(
+                ErrorCode::SchemaViolation,
+                format!("field type '{}' is not indexable", type_tag(ty)),
+            ));
+        }
+        FieldType::Union { variants } => {
+            if variants.iter().all(|v| {
+                matches!(
+                    v,
+                    FieldType::Literal {
+                        value: Value::String(_)
+                    }
+                )
+            }) {
+                PgType::Text
+            } else {
+                return Err(RtDbError::new(
+                    ErrorCode::SchemaViolation,
+                    format!("field type '{}' is not indexable", type_tag(ty)),
+                ));
+            }
+        }
+        FieldType::Optional { inner } => {
+            let inner_ty = index_column_type(inner)?;
+            return Ok(IndexedType {
+                pg: inner_ty.pg,
+                nullable: true,
+            });
+        }
+        _ => {
+            return Err(RtDbError::new(
+                ErrorCode::SchemaViolation,
+                format!("field type '{}' is not indexable", type_tag(ty)),
+            ));
+        }
+    };
+    Ok(IndexedType {
+        pg,
+        nullable: false,
+    })
+}
+
+/// Type-checks an eq/range bind value, mirroring server `eq_bind_for` and the
+/// TS `coerceIndexValue` (`ts-client/src/in_memory.ts:301-324`). Returns the
+/// value unchanged on success.
+pub fn coerce_index_value(
+    table: &TableDef,
+    field_name: &str,
+    value: &Value,
+) -> Result<Value, RtDbError> {
+    let field_ty = table.fields.get(field_name).ok_or_else(|| {
+        RtDbError::new(
+            ErrorCode::Internal,
+            format!("index references unknown field '{field_name}'"),
+        )
+    })?;
+    let indexed = index_column_type(field_ty)?;
+    match indexed.pg {
+        PgType::Text => {
+            if !value.is_string() {
+                return Err(RtDbError::new(
+                    ErrorCode::BadRequest,
+                    "eq value must be a string",
+                ));
+            }
+        }
+        PgType::Number => {
+            if !value.is_number() {
+                return Err(RtDbError::new(
+                    ErrorCode::BadRequest,
+                    "eq value must be a number",
+                ));
+            }
+        }
+        PgType::Boolean => {
+            if !value.is_boolean() {
+                return Err(RtDbError::new(
+                    ErrorCode::BadRequest,
+                    "eq value must be a boolean",
+                ));
+            }
+        }
+    }
+    Ok(value.clone())
+}
+
+/// Null-sorting comparison for one index sort key. Mirrors `compareIndexValues`
+/// (`ts-client/src/in_memory.ts:329-350`): numbers compare numerically, strings
+/// lexicographically, booleans as `false < true`; nulls sort last (asc) / first
+/// (desc, via the caller flipping the result). Mixed types fall back to
+/// [`Ordering::Equal`] — indexed columns are single-type by schema, so this is
+/// unreachable in practice.
+pub fn compare_index_values(a: &Value, b: &Value) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let a_null = a.is_null();
+    let b_null = b.is_null();
+    if a_null && b_null {
+        return Ordering::Equal;
+    }
+    if a_null {
+        return Ordering::Greater;
+    }
+    if b_null {
+        return Ordering::Less;
+    }
+    match (a, b) {
+        (Value::Number(an), Value::Number(bn)) => {
+            let av = an.as_f64().unwrap_or(f64::NAN);
+            let bv = bn.as_f64().unwrap_or(f64::NAN);
+            av.partial_cmp(&bv).unwrap_or(Ordering::Equal)
+        }
+        (Value::String(as_), Value::String(bs_)) => as_.cmp(bs_),
+        (Value::Bool(ab), Value::Bool(bb)) => ab.cmp(bb),
+        _ => Ordering::Equal,
+    }
+}
+
+/// Merges a stored row with its system fields — a port of server `merge_doc`
+/// and the TS `mergeDoc` (`ts-client/src/in_memory.ts:1154-1156`). The stored
+/// `doc` is the user-written payload; system fields (`_id`/`_creationTime`/
+/// `_version`) are layered on top at read time so they always reflect the
+/// current `StoredRow` identity/history.
+pub fn merge_doc(row: &StoredRow) -> Value {
+    let mut out = match row.doc.as_object() {
+        Some(m) => m.clone(),
+        None => Map::new(),
+    };
+    out.insert("_id".to_string(), Value::String(row.id.clone()));
+    out.insert(
+        "_creationTime".to_string(),
+        Value::Number(serde_json::Number::from(row.created_at)),
+    );
+    out.insert(
+        "_version".to_string(),
+        Value::Number(serde_json::Number::from(row.version)),
+    );
+    Value::Object(out)
+}
+
+/// Looks up an index by name (BAD_REQUEST if absent). Free function so it's
+/// callable without `&self`. Ports `requireIndex`
+/// (`ts-client/src/in_memory.ts:1328-1334`).
+fn require_index<'a>(table_def: &'a TableDef, name: &str) -> Result<&'a IndexDef, RtDbError> {
+    let indexes = table_def.indexes.as_ref().ok_or_else(|| {
+        RtDbError::new(ErrorCode::BadRequest, format!("index '{name}' not found"))
+    })?;
+    indexes
+        .iter()
+        .find(|i| i.name == name)
+        .ok_or_else(|| RtDbError::new(ErrorCode::BadRequest, format!("index '{name}' not found")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mutation::Mutation;
     use crate::schema::{Schema, Table};
     use serde_json::json;
+    use std::sync::{Arc, Mutex};
 
     /// The test schema mirrored from `ts-client/tests/in_memory.test.ts:10-20`.
     fn test_schema() -> SchemaDef {
@@ -601,5 +1213,472 @@ mod tests {
         let a = json!({"b": 1, "a": 2});
         let b = json!({"a": 2, "b": 1});
         assert_eq!(canonical(&a), canonical(&b));
+    }
+
+    // ---- mutate: insert + read ---------------------------------------
+
+    /// Deterministic clock + RNG so ids, `_creationTime`, and `_version` are
+    /// stable. Mirrors TS `newClient` (`ts-client/tests/in_memory.test.ts:25-30`):
+    /// post-incrementing epoch-millis clock + a constant `0` RNG.
+    fn new_client() -> InMemoryRtDbClient {
+        let counter = Arc::new(Mutex::new(1_700_000_000_000_i64));
+        let mut client = InMemoryRtDbClient::new(
+            InMemoryRtDbClientOptions::default()
+                .now(move || {
+                    let mut g = counter.lock().expect("counter not poisoned");
+                    let v = *g;
+                    *g += 1;
+                    v
+                })
+                .random(|| 0.0),
+        );
+        client.push_schema(&test_schema());
+        client
+    }
+
+    #[tokio::test]
+    async fn insert_merges_system_fields_at_read_time() {
+        let mut c = new_client();
+        let txn = Mutation::new()
+            .insert("items", json!({"name": "a", "status": "todo", "order": 1}))
+            .build();
+        let results = c.mutate(&txn, None).await.expect("mutate ok");
+        assert_eq!(results.len(), 1);
+        let id = match &results[0] {
+            StepResult::Insert { id } => id.clone(),
+            other => panic!("expected Insert, got {other:?}"),
+        };
+        assert!(is_hex_id(&json!(id)), "id should be 32 hex chars: {id}");
+
+        let doc = c.get("items", &id).expect("doc present");
+        // System fields merged at read time:
+        assert_eq!(doc["_id"], json!(id));
+        assert_eq!(doc["_version"], 1);
+        assert!(doc["_creationTime"].is_number(), "creationTime is a number");
+        // User fields preserved:
+        assert_eq!(doc["name"], "a");
+        assert_eq!(doc["status"], "todo");
+        assert_eq!(doc["order"], 1);
+    }
+
+    #[tokio::test]
+    async fn insert_strips_optional_field_set_to_null() {
+        // Mirrors TS "strips an optional field set to null on insert".
+        let mut c = new_client();
+        let txn = Mutation::new()
+            .insert(
+                "items",
+                json!({"name": "a", "status": "todo", "order": 1, "note": null}),
+            )
+            .build();
+        let results = c.mutate(&txn, None).await.expect("mutate ok");
+        let id = match &results[0] {
+            StepResult::Insert { id } => id.clone(),
+            _ => unreachable!(),
+        };
+        let doc = c.get("items", &id).expect("doc present");
+        // `note: null` was stripped on insert — the server's single representation
+        // of an unset Optional<String> is "key absent", never "key present with null".
+        assert!(
+            doc.get("note").is_none(),
+            "optional-null should be stripped, got: {doc}"
+        );
+    }
+
+    #[tokio::test]
+    async fn insert_rejects_missing_required_field() {
+        // Mirrors TS "rejects an insert missing a required field".
+        let mut c = new_client();
+        let txn = Mutation::new()
+            .insert("items", json!({"status": "todo", "order": 1})) // missing required "name"
+            .build();
+        let err = c.mutate(&txn, None).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::SchemaViolation);
+        assert!(err.message.contains("name"), "got: {}", err.message);
+    }
+
+    // ---- mutate: upsert by index --------------------------------------
+
+    #[tokio::test]
+    async fn upsert_inserts_on_no_match_and_patches_on_match() {
+        // Mirrors TS "inserts on no match (inserted: true) and patches on match".
+        let mut c = new_client();
+        let upsert = |patch_order: i64| {
+            Mutation::new()
+                .upsert(
+                    "items",
+                    "by_name",
+                    &[json!("a")],
+                    json!({"name": "a", "status": "todo", "order": 1}),
+                    json!({"order": patch_order}),
+                )
+                .build()
+        };
+
+        let r1 = c.mutate(&upsert(2), None).await.expect("first upsert ok");
+        let (id, inserted) = match &r1[0] {
+            StepResult::Upsert { id, inserted } => (id.clone(), *inserted),
+            other => panic!("expected Upsert, got {other:?}"),
+        };
+        assert!(inserted, "first upsert should insert");
+        assert!(is_hex_id(&json!(id)));
+
+        let r2 = c.mutate(&upsert(3), None).await.expect("second upsert ok");
+        match &r2[0] {
+            StepResult::Upsert {
+                id: id2,
+                inserted: false,
+            } => {
+                assert_eq!(id2, &id, "second upsert patched the same doc");
+            }
+            other => panic!("expected Upsert inserted=false, got {other:?}"),
+        }
+
+        let doc = c.get("items", &id).expect("doc present");
+        assert_eq!(doc["order"], 3, "patch applied");
+        assert_eq!(doc["_version"], 2, "patch bumped version");
+    }
+
+    #[tokio::test]
+    async fn upsert_patch_visible_in_later_index_lookup() {
+        // Mirrors TS "patches a matched doc onto an index field and reflects it
+        // in a later query" — without the query DSL (Task 3), we exercise the
+        // lookup the same way `upsert` itself does: via `eq_lookup` on by_name.
+        let mut c = new_client();
+        let upsert = |patch_order: i64| {
+            Mutation::new()
+                .upsert(
+                    "items",
+                    "by_name",
+                    &[json!("a")],
+                    json!({"name": "a", "status": "todo", "order": 1}),
+                    json!({"order": patch_order}),
+                )
+                .build()
+        };
+        c.mutate(&upsert(2), None).await.unwrap();
+        let r2 = c.mutate(&upsert(3), None).await.unwrap();
+        let id = match &r2[0] {
+            StepResult::Upsert { id, .. } => id.clone(),
+            _ => unreachable!(),
+        };
+
+        let table_def = c.require_table("items").expect("items table");
+        let rows = c
+            .eq_lookup(table_def, "items", "by_name", &[json!("a")])
+            .expect("lookup ok");
+        assert_eq!(rows.len(), 1, "exactly one doc matches by_name=(a)");
+        assert_eq!(rows[0].id, id);
+    }
+
+    #[tokio::test]
+    async fn upsert_rejects_multiple_matches() {
+        // The brief calls out the multi-match rejection explicitly. Seed two
+        // docs with the same indexed value, then upsert by that index.
+        let mut c = new_client();
+        c.mutate(
+            &Mutation::new()
+                .insert(
+                    "items",
+                    json!({"name": "dup", "status": "todo", "order": 1}),
+                )
+                .build(),
+            None,
+        )
+        .await
+        .unwrap();
+        c.mutate(
+            &Mutation::new()
+                .insert(
+                    "items",
+                    json!({"name": "dup", "status": "todo", "order": 2}),
+                )
+                .build(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let txn = Mutation::new()
+            .upsert(
+                "items",
+                "by_name",
+                &[json!("dup")],
+                json!({"name": "dup", "status": "todo", "order": 1}),
+                json!({"order": 9}),
+            )
+            .build();
+        let err = c.mutate(&txn, None).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::PreconditionFailed);
+        assert!(err.message.contains("multiple"), "got: {}", err.message);
+    }
+
+    // ---- mutate: transactions ----------------------------------------
+
+    #[tokio::test]
+    async fn txn_runs_multi_steps_and_returns_one_result_per_step() {
+        // Mirrors TS "runs a multi-step txn and returns one result per step".
+        let mut c = new_client();
+        let txn = Mutation::new()
+            .insert("items", json!({"name": "a", "status": "todo", "order": 1}))
+            .insert("items", json!({"name": "b", "status": "todo", "order": 2}))
+            .build();
+        let results = c.mutate(&txn, None).await.expect("mutate ok");
+        assert_eq!(results.len(), 2, "one result per step");
+        for r in &results {
+            match r {
+                StepResult::Insert { id } => assert!(is_hex_id(&json!(id.clone()))),
+                other => panic!("expected Insert, got {other:?}"),
+            }
+        }
+        let docs = c.collect_all("items");
+        assert_eq!(docs.len(), 2, "both inserts landed");
+    }
+
+    #[tokio::test]
+    async fn txn_patch_inside_txn_bumps_version() {
+        // Mirrors TS "patches a doc inside a txn and bumps its version".
+        let mut c = new_client();
+        let r = c
+            .mutate(
+                &Mutation::new()
+                    .insert("items", json!({"name": "a", "status": "todo", "order": 1}))
+                    .build(),
+                None,
+            )
+            .await
+            .unwrap();
+        let id = match &r[0] {
+            StepResult::Insert { id } => id.clone(),
+            _ => unreachable!(),
+        };
+
+        // patch then expectVersion=2 (the patch bumps to 2 inside the same txn).
+        let patch_txn = Mutation::new()
+            .patch("items", &id, json!({"order": 9}))
+            .expect_version("items", &id, 2)
+            .build();
+        c.mutate(&patch_txn, None).await.expect("patch txn ok");
+
+        let doc = c.get("items", &id).expect("doc present");
+        assert_eq!(doc["order"], 9);
+        assert_eq!(doc["_version"], 2);
+    }
+
+    #[tokio::test]
+    async fn txn_rolls_back_on_later_step_failure() {
+        // Mirrors TS "rolls back the whole txn when a later step fails".
+        let mut c = new_client();
+        let r = c
+            .mutate(
+                &Mutation::new()
+                    .insert("items", json!({"name": "a", "status": "todo", "order": 1}))
+                    .build(),
+                None,
+            )
+            .await
+            .unwrap();
+        let id = match &r[0] {
+            StepResult::Insert { id } => id.clone(),
+            _ => unreachable!(),
+        };
+
+        let bad_txn = Mutation::new()
+            .insert("items", json!({"name": "b", "status": "todo", "order": 2}))
+            .expect_version("items", &id, 999) // mismatch → aborts the whole txn
+            .build();
+        let err = c.mutate(&bad_txn, None).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::PreconditionFailed);
+
+        // Atomicity: the second insert was rolled back; only the original "a"
+        // remains.
+        let docs = c.collect_all("items");
+        assert_eq!(docs.len(), 1, "rollback removed the second insert");
+        assert_eq!(docs[0]["name"], "a");
+    }
+
+    #[tokio::test]
+    async fn txn_rejects_more_than_max_steps() {
+        // MAX_STEPS guard (mirror `executeTransaction` :546-548).
+        let mut c = new_client();
+        let mut m = Mutation::new();
+        for _ in 0..(MAX_STEPS + 1) {
+            m = m.insert("items", json!({"name": "x", "status": "todo", "order": 1}));
+        }
+        let txn = m.build();
+        let err = c.mutate(&txn, None).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::BadRequest);
+        assert!(err.message.contains("maximum"), "got: {}", err.message);
+    }
+
+    #[tokio::test]
+    async fn mut_id_caches_results_and_short_circuits() {
+        // Brief: port the TS `mutId` idempotency-key semantics (mutate :40-47).
+        let mut c = new_client();
+        let txn = Mutation::new()
+            .insert("items", json!({"name": "a", "status": "todo", "order": 1}))
+            .build();
+
+        let r1 = c.mutate(&txn, Some("m1")).await.expect("first ok");
+        let r2 = c.mutate(&txn, Some("m1")).await.expect("cached ok");
+        assert_eq!(r1.len(), 1);
+        assert_eq!(r2.len(), 1);
+        // The cached result is byte-identical to the first call — same id.
+        let id1 = match &r1[0] {
+            StepResult::Insert { id } => id.clone(),
+            _ => unreachable!(),
+        };
+        let id2 = match &r2[0] {
+            StepResult::Insert { id } => id.clone(),
+            _ => unreachable!(),
+        };
+        assert_eq!(id1, id2, "cached mut_id returned the same id");
+        // The cache short-circuits execution, so only one doc was actually
+        // stored — the second `mutate` did not run the txn again.
+        assert_eq!(c.collect_all("items").len(), 1);
+    }
+
+    // ---- mutate: step helpers ----------------------------------------
+
+    #[test]
+    fn apply_patch_merges_fields_and_re_validates_whole_doc() {
+        let schema = test_schema();
+        let table = items_table(&schema);
+        let doc = json!({"name": "a", "status": "todo", "order": 1});
+        let fields = json!({"order": 9}).as_object().unwrap().clone();
+        let merged = apply_patch(table, &doc, &fields).expect("patch ok");
+        assert_eq!(merged["order"], 9);
+        assert_eq!(merged["name"], "a", "non-patched fields preserved");
+    }
+
+    #[test]
+    fn apply_patch_null_on_optional_inner_that_rejects_null_deletes_key() {
+        // `note: Optional<String>` + null → key is removed (mirrors
+        // strip_unset_optionals' single-representation rule).
+        let schema = test_schema();
+        let table = items_table(&schema);
+        let doc = json!({"name": "a", "status": "todo", "order": 1, "note": "hi"});
+        let fields = json!({"note": null}).as_object().unwrap().clone();
+        let merged = apply_patch(table, &doc, &fields).expect("patch ok");
+        assert!(merged.get("note").is_none(), "note key stripped: {merged}");
+    }
+
+    #[test]
+    fn apply_patch_rejects_unknown_field() {
+        let schema = test_schema();
+        let table = items_table(&schema);
+        let doc = json!({"name": "a", "status": "todo", "order": 1});
+        let fields = json!({"bogus": 1}).as_object().unwrap().clone();
+        let err = apply_patch(table, &doc, &fields).unwrap_err();
+        assert_eq!(err.code, ErrorCode::SchemaViolation);
+        assert!(err.message.contains("bogus"));
+    }
+
+    #[test]
+    fn index_column_type_maps_each_indexable_field_and_rejects_others() {
+        // Indexable shapes:
+        assert_eq!(
+            index_column_type(&FieldType::String).unwrap().pg,
+            PgType::Text
+        );
+        assert_eq!(
+            index_column_type(&FieldType::Number).unwrap().pg,
+            PgType::Number
+        );
+        assert_eq!(
+            index_column_type(&FieldType::Boolean).unwrap().pg,
+            PgType::Boolean
+        );
+        assert_eq!(
+            index_column_type(&FieldType::id("t")).unwrap().pg,
+            PgType::Text
+        );
+        assert_eq!(
+            index_column_type(&FieldType::literal("a")).unwrap().pg,
+            PgType::Text
+        );
+        assert_eq!(
+            index_column_type(&FieldType::optional(FieldType::Number))
+                .unwrap()
+                .pg,
+            PgType::Number
+        );
+        // Optional wraps and reports nullable=true.
+        let it = index_column_type(&FieldType::optional(FieldType::Number)).unwrap();
+        assert!(it.nullable);
+        // Non-indexable shapes:
+        let err = index_column_type(&FieldType::Array {
+            element: Box::new(FieldType::Number),
+        })
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::SchemaViolation);
+        let err = index_column_type(&FieldType::literal(7)).unwrap_err();
+        assert_eq!(err.code, ErrorCode::SchemaViolation);
+    }
+
+    #[test]
+    fn coerce_index_value_type_checks_against_index_column() {
+        let schema = test_schema();
+        let table = items_table(&schema);
+        // `name` is String → text column. Number is rejected.
+        coerce_index_value(table, "name", &json!("a")).expect("string ok");
+        let err = coerce_index_value(table, "name", &json!(7)).unwrap_err();
+        assert_eq!(err.code, ErrorCode::BadRequest);
+        // `order` is Number → number column. String is rejected.
+        coerce_index_value(table, "order", &json!(7)).expect("number ok");
+        let err = coerce_index_value(table, "order", &json!("7")).unwrap_err();
+        assert_eq!(err.code, ErrorCode::BadRequest);
+        // Unknown field is INTERNAL (schema-declared index references a missing
+        // field — a server-side programming error, not a client one).
+        let err = coerce_index_value(table, "bogus", &json!(7)).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Internal);
+    }
+
+    #[test]
+    fn compare_index_values_orders_nulls_last_and_compares_each_domain() {
+        use std::cmp::Ordering;
+        // Numbers:
+        assert_eq!(compare_index_values(&json!(1), &json!(2)), Ordering::Less);
+        assert_eq!(compare_index_values(&json!(2), &json!(2)), Ordering::Equal);
+        // Strings (lexicographic):
+        assert_eq!(
+            compare_index_values(&json!("a"), &json!("b")),
+            Ordering::Less
+        );
+        // Booleans (false < true):
+        assert_eq!(
+            compare_index_values(&json!(false), &json!(true)),
+            Ordering::Less
+        );
+        // Nulls sort last under asc — `null > anything`.
+        assert_eq!(
+            compare_index_values(&json!(null), &json!(1)),
+            Ordering::Greater
+        );
+        assert_eq!(
+            compare_index_values(&json!(1), &json!(null)),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_index_values(&json!(null), &json!(null)),
+            Ordering::Equal
+        );
+    }
+
+    #[test]
+    fn merge_doc_layers_system_fields_over_user_doc() {
+        let row = StoredRow {
+            id: "0018beacc10070000000000000000000".to_string(),
+            doc: json!({"name": "a", "status": "todo", "order": 1}),
+            version: 7,
+            created_at: 1_700_000_000_000,
+        };
+        let merged = merge_doc(&row);
+        assert_eq!(merged["_id"], json!("0018beacc10070000000000000000000"));
+        assert_eq!(merged["_version"], 7);
+        assert_eq!(merged["_creationTime"], 1_700_000_000_000_i64);
+        // User fields preserved.
+        assert_eq!(merged["name"], "a");
+        assert_eq!(merged["order"], 1);
     }
 }
