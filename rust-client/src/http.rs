@@ -601,10 +601,7 @@ impl RtDbHttpClient {
     }
 
     /// `GET /admin/admins` → `{admins:[{email, githubId?}]}`.
-    pub async fn admins_list(
-        &self,
-        _db: &str,
-    ) -> Result<Vec<crate::wire::admin::AdminMember>, RtDbError> {
+    pub async fn admins_list(&self) -> Result<Vec<crate::wire::admin::AdminMember>, RtDbError> {
         #[derive(serde::Deserialize)]
         struct Resp {
             admins: Vec<crate::wire::admin::AdminMember>,
@@ -613,12 +610,7 @@ impl RtDbHttpClient {
     }
 
     /// `POST /admin/admins` `{email, githubId?}` → `{ok:true}`.
-    pub async fn admins_add(
-        &self,
-        _db: &str,
-        email: &str,
-        github_id: Option<i64>,
-    ) -> Result<(), RtDbError> {
+    pub async fn admins_add(&self, email: &str, github_id: Option<i64>) -> Result<(), RtDbError> {
         #[derive(serde::Serialize)]
         #[serde(rename_all = "camelCase")]
         struct Body {
@@ -639,7 +631,7 @@ impl RtDbHttpClient {
     }
 
     /// `DELETE /admin/admins` `{email}` → `{ok:true}`.
-    pub async fn admins_remove(&self, _db: &str, email: &str) -> Result<(), RtDbError> {
+    pub async fn admins_remove(&self, email: &str) -> Result<(), RtDbError> {
         #[derive(serde::Serialize)]
         struct Body {
             email: String,
@@ -1691,7 +1683,7 @@ mod admin_tests {
             ))
             .mount(&server)
             .await;
-        let rows = client.admins_list("kanban").await.unwrap();
+        let rows = client.admins_list().await.unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].email, "a@x.com");
         assert_eq!(rows[0].github_id, Some(1));
@@ -1708,10 +1700,7 @@ mod admin_tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
             .mount(&server)
             .await;
-        client
-            .admins_add("kanban", "a@x.com", Some(7))
-            .await
-            .unwrap();
+        client.admins_add("a@x.com", Some(7)).await.unwrap();
     }
 
     #[tokio::test]
@@ -1724,7 +1713,7 @@ mod admin_tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
             .mount(&server)
             .await;
-        client.admins_remove("kanban", "a@x.com").await.unwrap();
+        client.admins_remove("a@x.com").await.unwrap();
     }
 
     #[tokio::test]

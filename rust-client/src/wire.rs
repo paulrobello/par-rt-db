@@ -413,7 +413,7 @@ pub mod admin {
     }
 
     /// One row of the admin allowlist returned by `GET /admin/admins`.
-    #[derive(Debug, Clone, serde::Deserialize)]
+    #[derive(Debug, Clone, Deserialize)]
     #[serde(rename_all = "camelCase")]
     pub struct AdminMember {
         pub email: String,
