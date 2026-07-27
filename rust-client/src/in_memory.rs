@@ -18,20 +18,27 @@
 //! error rather than silently misbehaving.
 //!
 //! This module currently houses the scaffold (Task 1: struct + options +
-//! `push_schema` + the validation/id/format helpers) and the mutate executor
+//! `push_schema` + the validation/id/format helpers), the mutate executor
 //! (Task 2: insert/patch/replace/delete/expectVersion/expectAbsent/upsert with
-//! idempotency-key caching, MAX_STEPS guard, and atomic rollback). Subsequent
-//! tasks fill in queries, subscriptions, scheduling, and storage.
+//! idempotency-key caching, MAX_STEPS guard, and atomic rollback), and the
+//! query executor (Task 3: `run_query` — index-eq + range filtering, sort over
+//! unbound index fields with `_creationTime`/`_id` tiebreakers, and the
+//! `get`/`first`/`unique`/`count`/`take`/`collect` terminals; `filter` is a
+//! pass-through hook until Task 4, `paginate`/`search`/`vector_search` stub
+//! out). Subsequent tasks fill in subscriptions, scheduling, and storage.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use serde::de::DeserializeOwned;
 use serde_json::{Map, Value};
 
 use crate::error::{ErrorCode, RtDbError};
 use crate::mutation::{Step, StepResult, Transaction};
+use crate::query::{Order, Query};
 use crate::schema::{FieldType, IndexDef, SchemaDef, TableDef};
+use crate::wire::FilterExpr;
 
 /// Maximum number of steps in a single transaction (mirrors the server cap).
 pub const MAX_STEPS: usize = 256;
@@ -172,6 +179,367 @@ impl InMemoryRtDbClient {
             .filter(|((t, _), _)| t == table)
             .map(|(_, row)| merge_doc(row))
             .collect()
+    }
+
+    /// One-shot query — ports `executeQuery` (`ts-client/src/in_memory.ts:889-1151`).
+    /// Returns the terminal result as a [`Value`]:
+    /// - `get(id)` / `first` → merged doc, or [`Value::Null`] when absent.
+    /// - `unique` → merged doc, or `PRECONDITION_FAILED` when more than one row
+    ///   matches (and [`Value::Null`] when zero match).
+    /// - `count` → number of matching rows.
+    /// - `take` / `collect` → array of merged docs.
+    /// - `search` / `vector_search` → empty array (no in-memory ranking; the
+    ///   guards still reject conflicting combinations so the cascade agrees with
+    ///   the server).
+    ///
+    /// The harness is in-process — no `{result}` wire envelope; callers either
+    /// match on the [`Value`] directly or use [`run`](Self::run) for typed
+    /// deserialization.
+    ///
+    /// `filter` is wired through [`matches_filter`] but that hook is a
+    /// pass-through (returns `true`) for Task 3; Task 4 swaps in the real
+    /// `eval_filter_expr`. `paginate` is Task 5 and returns an `INTERNAL` error.
+    pub fn run_query(&self, q: &Query) -> Result<Value, RtDbError> {
+        let table_def = self.require_table(&q.table)?.clone();
+        let eq = &q.eq;
+        let has_range = q.gt.is_some() || q.gte.is_some() || q.lt.is_some() || q.lte.is_some();
+
+        // `get` terminal — exclusive of every other clause.
+        if let Some(id) = &q.get {
+            if q.index.is_some()
+                || !eq.is_empty()
+                || has_range
+                || q.order.is_some()
+                || q.take.is_some()
+                || q.unique
+                || q.first
+                || q.count
+                || q.paginate.is_some()
+                || q.filter.is_some()
+                || q.search.is_some()
+                || q.vector_search.is_some()
+            {
+                return Err(RtDbError::new(
+                    ErrorCode::BadRequest,
+                    "get cannot be combined with index, eq, range bounds, order, take, \
+                     unique, first, count, paginate, filter, search, or vector search",
+                ));
+            }
+            // The DSL `get` terminal reuses the point-read primitive so the
+            // system-field merge path is shared with the Task 2 helper.
+            return Ok(self.get(&q.table, id).unwrap_or(Value::Null));
+        }
+
+        // Conflicting-terminal guards (ports :919-939).
+        if q.unique && (q.take.is_some() || q.order.is_some()) {
+            return Err(RtDbError::new(
+                ErrorCode::BadRequest,
+                "unique cannot be combined with take or order",
+            ));
+        }
+        if q.first && q.unique {
+            return Err(RtDbError::new(
+                ErrorCode::BadRequest,
+                "first cannot be combined with unique",
+            ));
+        }
+        if q.first && q.take.is_some() {
+            return Err(RtDbError::new(
+                ErrorCode::BadRequest,
+                "first cannot be combined with take",
+            ));
+        }
+        if q.count && q.unique {
+            return Err(RtDbError::new(
+                ErrorCode::BadRequest,
+                "count cannot be combined with unique",
+            ));
+        }
+        if q.count && q.take.is_some() {
+            return Err(RtDbError::new(
+                ErrorCode::BadRequest,
+                "count cannot be combined with take",
+            ));
+        }
+        if q.count && q.first {
+            return Err(RtDbError::new(
+                ErrorCode::BadRequest,
+                "count cannot be combined with first",
+            ));
+        }
+        if q.count && q.order.is_some() {
+            return Err(RtDbError::new(
+                ErrorCode::BadRequest,
+                "count cannot be combined with order",
+            ));
+        }
+        // Paginate is Task 5 — bail with a clear TODO so a caller knows the
+        // path isn't silent. The paginate-specific combination guards
+        // (count+paginate, take+paginate, …) are skipped: any paginate use
+        // returns the same TODO error regardless of accompanying clauses.
+        if q.paginate.is_some() {
+            // TODO(task 5): port the keyset-cursor paginate branch.
+            return Err(RtDbError::new(
+                ErrorCode::Internal,
+                "paginate is not implemented in the in-memory harness (task 5)",
+            ));
+        }
+        if q.gt.is_some() && q.gte.is_some() {
+            return Err(RtDbError::new(
+                ErrorCode::BadRequest,
+                "gt and gte cannot both be set",
+            ));
+        }
+        if q.lt.is_some() && q.lte.is_some() {
+            return Err(RtDbError::new(
+                ErrorCode::BadRequest,
+                "lt and lte cannot both be set",
+            ));
+        }
+        if q.take.is_some_and(|t| t as usize > MAX_TAKE) {
+            return Err(RtDbError::new(
+                ErrorCode::BadRequest,
+                format!("take exceeds maximum of {MAX_TAKE}"),
+            ));
+        }
+
+        // `vectorSearch` terminal — cascade mirror of server `execute_query`.
+        // No in-memory ranking; return an empty array so the cascade agrees
+        // with the server without silently misranking by falling through to
+        // the collect path.
+        if q.vector_search.is_some() {
+            if q.index.is_some()
+                || !eq.is_empty()
+                || has_range
+                || q.order.is_some()
+                || q.unique
+                || q.first
+                || q.count
+                || q.filter.is_some()
+                || q.search.is_some()
+                || q.take.is_some()
+            {
+                return Err(RtDbError::new(
+                    ErrorCode::BadRequest,
+                    "vectorSearch cannot be combined with any other terminal",
+                ));
+            }
+            return Ok(Value::Array(Vec::new()));
+        }
+
+        // `search` terminal — same reasoning as `vectorSearch`: no in-memory
+        // ts_rank, but the guard exists so invalid combinations fail here
+        // instead of silently returning an unranked result.
+        if q.search.is_some() {
+            if q.index.is_some()
+                || !eq.is_empty()
+                || has_range
+                || q.order.is_some()
+                || q.unique
+                || q.first
+                || q.count
+                || q.filter.is_some()
+                || q.vector_search.is_some()
+            {
+                return Err(RtDbError::new(
+                    ErrorCode::BadRequest,
+                    "search cannot be combined with index, eq, range bounds, order, \
+                     unique, first, count, filter, or vector search",
+                ));
+            }
+            return Ok(Value::Array(Vec::new()));
+        }
+
+        // Resolve index — required for `eq` and for any range bound.
+        let index_def: Option<IndexDef> = match &q.index {
+            Some(name) => Some(require_index(&table_def, name)?.clone()),
+            None if !eq.is_empty() => {
+                return Err(RtDbError::new(
+                    ErrorCode::BadRequest,
+                    "eq requires an index",
+                ));
+            }
+            _ => None,
+        };
+
+        // eq-arity check (server `eq_binds` length guard at :1033-1038).
+        if let Some(idx) = &index_def
+            && eq.len() > idx.fields.len()
+        {
+            return Err(RtDbError::new(
+                ErrorCode::BadRequest,
+                format!(
+                    "index '{}' expects at most {} eq value(s), got {}",
+                    idx.name,
+                    idx.fields.len(),
+                    eq.len()
+                ),
+            ));
+        }
+
+        // Type-check each eq prefix bind positionally.
+        let typed_eq: Vec<Value> = match &index_def {
+            Some(idx) => {
+                let mut out = Vec::with_capacity(eq.len());
+                for (i, value) in eq.iter().enumerate() {
+                    out.push(coerce_index_value(&table_def, &idx.fields[i], value)?);
+                }
+                out
+            }
+            None => Vec::new(),
+        };
+
+        // Range bounds apply to the next index field after the eq prefix.
+        let range_field: Option<&str> = if has_range {
+            let idx = index_def.as_ref().ok_or_else(|| {
+                RtDbError::new(ErrorCode::BadRequest, "range bound requires an index")
+            })?;
+            if eq.len() >= idx.fields.len() {
+                return Err(RtDbError::new(
+                    ErrorCode::BadRequest,
+                    "range bound requires a remaining index field after eq",
+                ));
+            }
+            Some(idx.fields[eq.len()].as_str())
+        } else {
+            None
+        };
+        let gt = match (&q.gt, range_field) {
+            (Some(v), Some(f)) => Some(coerce_index_value(&table_def, f, v)?),
+            _ => None,
+        };
+        let gte = match (&q.gte, range_field) {
+            (Some(v), Some(f)) => Some(coerce_index_value(&table_def, f, v)?),
+            _ => None,
+        };
+        let lt = match (&q.lt, range_field) {
+            (Some(v), Some(f)) => Some(coerce_index_value(&table_def, f, v)?),
+            _ => None,
+        };
+        let lte = match (&q.lte, range_field) {
+            (Some(v), Some(f)) => Some(coerce_index_value(&table_def, f, v)?),
+            _ => None,
+        };
+
+        // Row fetch + filter (eq prefix → range → filter hook).
+        //
+        // `matches_filter` is a Task-3 pass-through; Task 4 swaps in
+        // `eval_filter_expr` (filter validation against the schema's field set
+        // also lands with Task 4).
+        let mut filtered: Vec<StoredRow> = Vec::new();
+        for ((t, _id), row) in &self.docs {
+            if t != &q.table {
+                continue;
+            }
+            if let Some(idx) = &index_def {
+                let mut ok = true;
+                for (i, tv) in typed_eq.iter().enumerate() {
+                    match row.doc.get(&idx.fields[i]) {
+                        Some(v) if !v.is_null() && v == tv => {}
+                        _ => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if !ok {
+                    continue;
+                }
+            }
+            if let Some(field) = range_field {
+                let v = match row.doc.get(field) {
+                    Some(v) if !v.is_null() => v,
+                    _ => continue,
+                };
+                if let Some(bound) = &gt
+                    && compare_index_values(v, bound) != std::cmp::Ordering::Greater
+                {
+                    continue;
+                }
+                if let Some(bound) = &gte
+                    && compare_index_values(v, bound) == std::cmp::Ordering::Less
+                {
+                    continue;
+                }
+                if let Some(bound) = &lt
+                    && compare_index_values(v, bound) != std::cmp::Ordering::Less
+                {
+                    continue;
+                }
+                if let Some(bound) = &lte
+                    && compare_index_values(v, bound) == std::cmp::Ordering::Greater
+                {
+                    continue;
+                }
+            }
+            if let Some(expr) = &q.filter
+                && !matches_filter(expr, &row.doc)
+            {
+                continue;
+            }
+            filtered.push(row.clone());
+        }
+
+        // `count` short-circuits before the sort (the count is the cardinality
+        // of the filtered set, regardless of ordering).
+        if q.count {
+            return Ok(Value::Number(serde_json::Number::from(
+                filtered.len() as i64
+            )));
+        }
+
+        // Sort keys: unbound index fields (after the eq prefix), then
+        // `_creationTime`, then `_id`. The unique `id` tiebreaker means the
+        // order is total — no row is ambiguous relative to another.
+        let dir = q.order.unwrap_or(Order::Asc);
+        filtered.sort_by(|a, b| {
+            if let Some(idx) = &index_def {
+                for field in &idx.fields[typed_eq.len()..] {
+                    let av = a.doc.get(field).unwrap_or(&Value::Null);
+                    let bv = b.doc.get(field).unwrap_or(&Value::Null);
+                    let cmp = compare_index_values(av, bv);
+                    if cmp != std::cmp::Ordering::Equal {
+                        return dir_order(cmp, dir);
+                    }
+                }
+            }
+            let cmp = a.created_at.cmp(&b.created_at);
+            if cmp != std::cmp::Ordering::Equal {
+                return dir_order(cmp, dir);
+            }
+            dir_order(a.id.cmp(&b.id), dir)
+        });
+
+        if q.unique {
+            if filtered.len() > 1 {
+                return Err(RtDbError::new(
+                    ErrorCode::PreconditionFailed,
+                    "unique query matched multiple documents",
+                ));
+            }
+            return Ok(filtered.first().map(merge_doc).unwrap_or(Value::Null));
+        }
+        if q.first {
+            return Ok(filtered.first().map(merge_doc).unwrap_or(Value::Null));
+        }
+
+        let limit = q.take.map(|t| t as usize).unwrap_or(MAX_TAKE);
+        let out: Vec<Value> = filtered
+            .into_iter()
+            .take(limit)
+            .map(|row| merge_doc(&row))
+            .collect();
+        Ok(Value::Array(out))
+    }
+
+    /// Typed wrapper around [`run_query`](Self::run_query) that deserializes
+    /// the result into `T` via [`crate::query::parse_result`]. Pick `T` to
+    /// match the terminal: `Vec<T>` for `take`/`collect`, `Option<T>` for
+    /// `get`/`first`/`unique`, `i64` for `count`, `Paginated<T>` for
+    /// `paginate` (once Task 5 lands).
+    pub fn run<T: DeserializeOwned>(&self, q: &Query) -> Result<T, RtDbError> {
+        let value = self.run_query(q)?;
+        crate::query::parse_result(value)
     }
 
     /// Executes a transaction and returns one [`StepResult`] per step, in order.
@@ -954,6 +1322,29 @@ pub fn merge_doc(row: &StoredRow) -> Value {
     Value::Object(out)
 }
 
+/// Flip an [`std::cmp::Ordering`] by the query's sort direction: identity for
+/// `Asc`, reversed for `Desc`. Used by the sort comparator in
+/// [`InMemoryRtDbClient::run_query`] so the same comparison serves either
+/// direction. Inline in the TS source (`dir === "desc" ? -cmp : cmp`).
+fn dir_order(o: std::cmp::Ordering, dir: Order) -> std::cmp::Ordering {
+    match dir {
+        Order::Asc => o,
+        Order::Desc => o.reverse(),
+    }
+}
+
+/// Filter hook for [`InMemoryRtDbClient::run_query`]. Task 3 ships a
+/// pass-through so queries with a `filter` clause don't panic and behave
+/// consistently (the row reaches the terminal).
+//
+// TODO(task 4): replace this body with `eval_filter_expr(expr, doc)`, plus the
+// one-time schema validation that mirrors server `compile_filter`. The
+// signature already matches the planned `eval_filter_expr` swap so only the
+// body changes.
+fn matches_filter(_expr: &FilterExpr, _doc: &Value) -> bool {
+    true
+}
+
 /// Looks up an index by name (BAD_REQUEST if absent). Free function so it's
 /// callable without `&self`. Ports `requireIndex`
 /// (`ts-client/src/in_memory.ts:1328-1334`).
@@ -971,8 +1362,11 @@ fn require_index<'a>(table_def: &'a TableDef, name: &str) -> Result<&'a IndexDef
 mod tests {
     use super::*;
     use crate::mutation::Mutation;
+    use crate::query::TableQuery;
     use crate::schema::{Schema, Table};
+    use crate::wire::FilterExpr;
     use serde_json::json;
+    use std::collections::BTreeMap;
     use std::sync::{Arc, Mutex};
 
     /// The test schema mirrored from `ts-client/tests/in_memory.test.ts:10-20`.
@@ -1337,8 +1731,9 @@ mod tests {
     #[tokio::test]
     async fn upsert_patch_visible_in_later_index_lookup() {
         // Mirrors TS "patches a matched doc onto an index field and reflects it
-        // in a later query" — without the query DSL (Task 3), we exercise the
-        // lookup the same way `upsert` itself does: via `eq_lookup` on by_name.
+        // in a later query" — now via the real query DSL (Task 3), not the
+        // internal `eq_lookup` helper. The patched `order` value is observable
+        // through a `unique()` query on `by_name`.
         let mut c = new_client();
         let upsert = |patch_order: i64| {
             Mutation::new()
@@ -1358,12 +1753,15 @@ mod tests {
             _ => unreachable!(),
         };
 
-        let table_def = c.require_table("items").expect("items table");
-        let rows = c
-            .eq_lookup(table_def, "items", "by_name", &[json!("a")])
-            .expect("lookup ok");
-        assert_eq!(rows.len(), 1, "exactly one doc matches by_name=(a)");
-        assert_eq!(rows[0].id, id);
+        let matched: Value = c
+            .run_query(
+                &TableQuery::new("items")
+                    .with_index("by_name", &[json!("a")])
+                    .unique(),
+            )
+            .expect("unique query ok");
+        assert_eq!(matched["_id"], json!(id), "matched the patched doc");
+        assert_eq!(matched["order"], 3, "patch value visible through the DSL");
     }
 
     #[tokio::test]
@@ -1675,5 +2073,679 @@ mod tests {
         // User fields preserved.
         assert_eq!(merged["name"], "a");
         assert_eq!(merged["order"], 1);
+    }
+
+    // ---- query: get / collect ----------------------------------------
+
+    /// Mirrors TS `seed` (`ts-client/tests/in_memory.test.ts:134-142`): insert
+    /// three rows in `order` = 3, 1, 2 so an ascending sort differs from
+    /// insertion order (catches a fall-back-to-insertion-order bug).
+    async fn seed_query_rows(c: &mut InMemoryRtDbClient) {
+        for order in [3_i64, 1, 2] {
+            c.mutate(
+                &Mutation::new()
+                    .insert(
+                        "items",
+                        json!({"name": format!("n{order}"), "status": "todo", "order": order}),
+                    )
+                    .build(),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn query_collect_returns_empty_for_empty_table() {
+        // Mirrors TS "collects [] from an empty table after pushSchema".
+        let c = new_client();
+        let docs = c
+            .run::<Vec<Value>>(&TableQuery::new("items").collect())
+            .expect("collect ok");
+        assert!(docs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn query_get_returns_merged_doc() {
+        // Mirrors TS "inserts a doc and merges system fields at read time"
+        // (the read is now via the DSL `get` terminal, not the bare helper).
+        let mut c = new_client();
+        let r = c
+            .mutate(
+                &Mutation::new()
+                    .insert("items", json!({"name": "a", "status": "todo", "order": 1}))
+                    .build(),
+                None,
+            )
+            .await
+            .expect("insert ok");
+        let id = match &r[0] {
+            StepResult::Insert { id } => id.clone(),
+            other => panic!("expected Insert, got {other:?}"),
+        };
+
+        let doc = c
+            .run::<Value>(&TableQuery::get("items", &id))
+            .expect("get ok");
+        assert_eq!(doc["_id"], json!(id));
+        assert_eq!(doc["name"], "a");
+        assert_eq!(doc["status"], "todo");
+        assert_eq!(doc["order"], 1);
+        assert_eq!(doc["_version"], 1);
+        assert!(doc["_creationTime"].is_number());
+    }
+
+    #[tokio::test]
+    async fn query_get_returns_null_for_missing_id() {
+        // Mirrors TS "point-reads a missing id as null". The server returns
+        // JSON null for a missing point read (TS :916), not an error.
+        let c = new_client();
+        let v = c
+            .run::<Value>(&TableQuery::get(
+                "items",
+                "0123456789abcdef0123456789abcdef",
+            ))
+            .expect("get resolves");
+        assert!(v.is_null(), "missing get returns Value::Null, got: {v}");
+    }
+
+    #[tokio::test]
+    async fn query_get_rejects_combinations() {
+        // Ports the `get`-exclusivity guard at TS :895-914. `get` plus any
+        // narrowing clause is BAD_REQUEST.
+        let c = new_client();
+        let q = Query {
+            table: "items".into(),
+            get: Some("x".into()),
+            index: Some("by_name".into()),
+            ..Default::default()
+        };
+        let err = c.run_query(&q).unwrap_err();
+        assert_eq!(err.code, ErrorCode::BadRequest);
+        assert!(
+            err.message.contains("get cannot be combined"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    // ---- query: index eq + order + take ------------------------------
+
+    #[tokio::test]
+    async fn query_eq_prefix_with_order_asc_sorts_by_remaining_field() {
+        // Mirrors TS "filters by an eq index prefix and orders by the remaining
+        // index field" — the asc branch.
+        let mut c = new_client();
+        seed_query_rows(&mut c).await;
+
+        let asc = c
+            .run::<Vec<Value>>(
+                &TableQuery::new("items")
+                    .with_index("by_status_and_order", &[json!("todo")])
+                    .order(Order::Asc)
+                    .collect(),
+            )
+            .expect("asc ok");
+        let orders: Vec<i64> = asc
+            .iter()
+            .map(|d| d["order"].as_i64().unwrap_or_default())
+            .collect();
+        assert_eq!(orders, vec![1, 2, 3], "asc order");
+    }
+
+    #[tokio::test]
+    async fn query_eq_prefix_with_order_desc_and_take_n() {
+        // Mirrors TS "filters by an eq index prefix and orders by the remaining
+        // index field" — the desc+take(2) branch.
+        let mut c = new_client();
+        seed_query_rows(&mut c).await;
+
+        let desc = c
+            .run::<Vec<Value>>(
+                &TableQuery::new("items")
+                    .with_index("by_status_and_order", &[json!("todo")])
+                    .order(Order::Desc)
+                    .take(2),
+            )
+            .expect("desc+take ok");
+        let orders: Vec<i64> = desc
+            .iter()
+            .map(|d| d["order"].as_i64().unwrap_or_default())
+            .collect();
+        assert_eq!(orders, vec![3, 2], "desc order, take 2");
+    }
+
+    #[tokio::test]
+    async fn query_eq_on_single_field_index_returns_matching_rows() {
+        // The brief calls out single-field eq match explicitly; `by_name` is
+        // single-field. Two rows share `name="dup"`, the third doesn't.
+        let mut c = new_client();
+        for order in [1_i64, 2, 3] {
+            let name = if order <= 2 { "dup" } else { "uniq" };
+            c.mutate(
+                &Mutation::new()
+                    .insert(
+                        "items",
+                        json!({"name": name, "status": "todo", "order": order}),
+                    )
+                    .build(),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        let docs = c
+            .run::<Vec<Value>>(
+                &TableQuery::new("items")
+                    .with_index("by_name", &[json!("dup")])
+                    .collect(),
+            )
+            .expect("eq ok");
+        assert_eq!(docs.len(), 2, "both dup rows match");
+        for d in &docs {
+            assert_eq!(d["name"], "dup");
+        }
+    }
+
+    // ---- query: range bounds ----------------------------------------
+
+    #[tokio::test]
+    async fn query_range_filters_by_index_field() {
+        // gt / lt / gte / lte over the remaining index field. `by_status_and_order`
+        // has `status` then `order`; the eq prefix pins status, the range
+        // narrows order. Seed order values [3,1,2] and assert each bound.
+        let mut c = new_client();
+        seed_query_rows(&mut c).await;
+
+        let collect_range =
+            |gt: Option<i64>, gte: Option<i64>, lt: Option<i64>, lte: Option<i64>| {
+                let mut q =
+                    TableQuery::new("items").with_index("by_status_and_order", &[json!("todo")]);
+                if let Some(v) = gt {
+                    q = q.gt(v);
+                }
+                if let Some(v) = gte {
+                    q = q.gte(v);
+                }
+                if let Some(v) = lt {
+                    q = q.lt(v);
+                }
+                if let Some(v) = lte {
+                    q = q.lte(v);
+                }
+                c.run::<Vec<Value>>(&q.order(Order::Asc).collect())
+                    .expect("range ok")
+            };
+
+        let orders = |docs: Vec<Value>| -> Vec<i64> {
+            docs.iter()
+                .map(|d| d["order"].as_i64().unwrap_or_default())
+                .collect()
+        };
+
+        // gt=1 → {2,3}; gte=2 → {2,3}; lt=3 → {1,2}; lte=2 → {1,2}.
+        assert_eq!(orders(collect_range(Some(1), None, None, None)), vec![2, 3]);
+        assert_eq!(orders(collect_range(None, Some(2), None, None)), vec![2, 3]);
+        assert_eq!(orders(collect_range(None, None, Some(3), None)), vec![1, 2]);
+        assert_eq!(orders(collect_range(None, None, None, Some(2))), vec![1, 2]);
+    }
+
+    // ---- query: terminals -------------------------------------------
+
+    #[tokio::test]
+    async fn query_count_returns_number_of_matching_rows() {
+        // Mirrors TS "counts matching rows over an eq prefix".
+        let mut c = new_client();
+        seed_query_rows(&mut c).await;
+        let n = c
+            .run::<i64>(
+                &TableQuery::new("items")
+                    .with_index("by_status", &[json!("todo")])
+                    .count(),
+            )
+            .expect("count ok");
+        assert_eq!(n, 3);
+    }
+
+    #[tokio::test]
+    async fn query_unique_returns_doc_when_exactly_one_match() {
+        let mut c = new_client();
+        c.mutate(
+            &Mutation::new()
+                .insert(
+                    "items",
+                    json!({"name": "only", "status": "todo", "order": 1}),
+                )
+                .build(),
+            None,
+        )
+        .await
+        .unwrap();
+        let doc = c
+            .run::<Value>(
+                &TableQuery::new("items")
+                    .with_index("by_name", &[json!("only")])
+                    .unique(),
+            )
+            .expect("unique ok");
+        assert_eq!(doc["name"], "only");
+    }
+
+    #[tokio::test]
+    async fn query_unique_throws_precondition_failed_when_multiple_match() {
+        // Mirrors TS "unique throws PRECONDITION_FAILED when more than one doc
+        // matches".
+        let mut c = new_client();
+        for order in [1_i64, 2] {
+            c.mutate(
+                &Mutation::new()
+                    .insert(
+                        "items",
+                        json!({"name": "dup", "status": "todo", "order": order}),
+                    )
+                    .build(),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        let err = c
+            .run_query(
+                &TableQuery::new("items")
+                    .with_index("by_name", &[json!("dup")])
+                    .unique(),
+            )
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::PreconditionFailed);
+    }
+
+    #[tokio::test]
+    async fn query_unique_returns_null_when_zero_match() {
+        // TS :1143 — `unique` with zero matches returns null (no precondition
+        // to fail; only a multi-match is an error).
+        let c = new_client();
+        let v = c
+            .run::<Value>(
+                &TableQuery::new("items")
+                    .with_index("by_name", &[json!("ghost")])
+                    .unique(),
+            )
+            .expect("unique resolves");
+        assert!(v.is_null(), "zero-match unique returns null, got: {v}");
+    }
+
+    #[tokio::test]
+    async fn query_first_returns_first_or_null() {
+        // Mirrors TS `first` terminal: the first row of the filtered+sorted
+        // set, or null when empty.
+        let mut c = new_client();
+        // Empty table: first = null.
+        let v = c
+            .run::<Value>(
+                &TableQuery::new("items")
+                    .with_index("by_status", &[json!("todo")])
+                    .first(),
+            )
+            .expect("first on empty");
+        assert!(v.is_null(), "first on empty table is null");
+
+        seed_query_rows(&mut c).await;
+        // With rows sorted ascending, first is order=1.
+        let first = c
+            .run::<Value>(
+                &TableQuery::new("items")
+                    .with_index("by_status_and_order", &[json!("todo")])
+                    .order(Order::Asc)
+                    .first(),
+            )
+            .expect("first ok");
+        assert_eq!(first["order"], 1, "first asc is order=1");
+    }
+
+    #[tokio::test]
+    async fn query_take_caps_results_at_n() {
+        let mut c = new_client();
+        seed_query_rows(&mut c).await;
+        let docs = c
+            .run::<Vec<Value>>(
+                &TableQuery::new("items")
+                    .with_index("by_status", &[json!("todo")])
+                    .order(Order::Asc)
+                    .take(2),
+            )
+            .expect("take ok");
+        assert_eq!(docs.len(), 2, "take(2) on 3 rows caps at 2");
+    }
+
+    // ---- query: validation rejections -------------------------------
+
+    #[tokio::test]
+    async fn query_rejects_eq_without_index() {
+        let c = new_client();
+        let err = c
+            .run_query(&Query {
+                table: "items".into(),
+                eq: vec![json!("x")],
+                ..Default::default()
+            })
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::BadRequest);
+        assert!(err.message.contains("eq requires an index"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn query_rejects_range_without_index() {
+        let c = new_client();
+        let err = c
+            .run_query(&Query {
+                table: "items".into(),
+                gt: Some(json!(1)),
+                ..Default::default()
+            })
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::BadRequest);
+        assert!(
+            err.message.contains("range bound requires an index"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn query_rejects_range_without_remaining_field_after_eq() {
+        // `by_name` has one field — a full-arity eq leaves no field for a
+        // range bound.
+        let c = new_client();
+        let err = c
+            .run_query(&Query {
+                table: "items".into(),
+                index: Some("by_name".into()),
+                eq: vec![json!("a")],
+                gt: Some(json!("z")),
+                ..Default::default()
+            })
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::BadRequest);
+        assert!(
+            err.message.contains("remaining index field after eq"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn query_rejects_eq_arity_above_index_field_count() {
+        // `by_name` is single-field; two eq values is over-arity.
+        let c = new_client();
+        let err = c
+            .run_query(&Query {
+                table: "items".into(),
+                index: Some("by_name".into()),
+                eq: vec![json!("a"), json!("b")],
+                ..Default::default()
+            })
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::BadRequest);
+        assert!(err.message.contains("expects at most"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn query_rejects_gt_and_gte_together() {
+        let c = new_client();
+        let err = c
+            .run_query(&Query {
+                table: "items".into(),
+                index: Some("by_status_and_order".into()),
+                eq: vec![json!("todo")],
+                gt: Some(json!(1)),
+                gte: Some(json!(1)),
+                ..Default::default()
+            })
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::BadRequest);
+        assert!(err.message.contains("gt and gte"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn query_rejects_lt_and_lte_together() {
+        let c = new_client();
+        let err = c
+            .run_query(&Query {
+                table: "items".into(),
+                index: Some("by_status_and_order".into()),
+                eq: vec![json!("todo")],
+                lt: Some(json!(1)),
+                lte: Some(json!(1)),
+                ..Default::default()
+            })
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::BadRequest);
+        assert!(err.message.contains("lt and lte"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn query_rejects_take_over_max_take() {
+        // MAX_TAKE guard (TS :963-965).
+        let c = new_client();
+        let err = c
+            .run_query(&Query {
+                table: "items".into(),
+                take: Some((MAX_TAKE as u32) + 1),
+                ..Default::default()
+            })
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::BadRequest);
+        assert!(err.message.contains("maximum"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn query_accepts_take_at_max_take() {
+        // `take == MAX_TAKE` is the boundary — accepted.
+        let c = new_client();
+        let docs = c
+            .run::<Vec<Value>>(&Query {
+                table: "items".into(),
+                take: Some(MAX_TAKE as u32),
+                ..Default::default()
+            })
+            .expect("take=MAX_TAKE ok");
+        assert!(docs.is_empty(), "empty table → empty page");
+    }
+
+    /// One assertion per conflicting-terminal guard at TS :919-939. Each case
+    /// is BAD_REQUEST; the needle distinguishes which guard fired.
+    #[tokio::test]
+    async fn query_rejects_conflicting_terminals() {
+        let c = new_client();
+        let base_index_query =
+            |unique: bool, first: bool, count: bool, order: bool, take: Option<u32>| Query {
+                table: "items".into(),
+                index: Some("by_status".into()),
+                eq: vec![json!("todo")],
+                unique,
+                first,
+                count,
+                order: order.then_some(Order::Asc),
+                take,
+                ..Default::default()
+            };
+
+        let cases: &[(Query, &str)] = &[
+            // unique + take
+            (
+                base_index_query(true, false, false, false, Some(1)),
+                "unique cannot be combined with take",
+            ),
+            // unique + order
+            (
+                base_index_query(true, false, false, true, None),
+                "unique cannot be combined with take or order",
+            ),
+            // first + unique
+            (
+                base_index_query(true, true, false, false, None),
+                "first cannot be combined with unique",
+            ),
+            // first + take
+            (
+                base_index_query(false, true, false, false, Some(1)),
+                "first cannot be combined with take",
+            ),
+            // count + unique
+            (
+                base_index_query(true, false, true, false, None),
+                "count cannot be combined with unique",
+            ),
+            // count + take
+            (
+                base_index_query(false, false, true, false, Some(1)),
+                "count cannot be combined with take",
+            ),
+            // count + first
+            (
+                base_index_query(false, true, true, false, None),
+                "count cannot be combined with first",
+            ),
+            // count + order
+            (
+                base_index_query(false, false, true, true, None),
+                "count cannot be combined with order",
+            ),
+        ];
+        for (q, needle) in cases {
+            let err = c.run_query(q).unwrap_err();
+            assert_eq!(
+                err.code,
+                ErrorCode::BadRequest,
+                "case '{needle}': got {err:?}"
+            );
+            assert!(
+                err.message.contains(needle),
+                "case '{needle}' missing needle: got {}",
+                err.message
+            );
+        }
+    }
+
+    // ---- query: paginate / search / vector stubs --------------------
+
+    #[tokio::test]
+    async fn query_paginate_returns_internal_error_task_5() {
+        // Task 5 will port the keyset-cursor paginate branch; until then the
+        // TODO returns INTERNAL so the path can't silently misbehave.
+        let c = new_client();
+        let err = c
+            .run_query(&Query {
+                table: "items".into(),
+                paginate: Some(crate::query::Paginate {
+                    cursor: None,
+                    num_items: 10,
+                }),
+                ..Default::default()
+            })
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Internal);
+        assert!(err.message.contains("task 5"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn query_search_returns_empty_array_stub() {
+        // No in-memory ts_rank — the cascade agrees with the server by
+        // returning [] for a valid `search`, while still rejecting conflicting
+        // combinations.
+        let c = new_client();
+        let v = c
+            .run::<Vec<Value>>(
+                &TableQuery::new("items")
+                    .search("by_content", "hello")
+                    .take(5),
+            )
+            .expect("search stub");
+        assert!(v.is_empty(), "search stub returns []");
+    }
+
+    #[tokio::test]
+    async fn query_search_rejects_conflicting_terminals() {
+        let c = new_client();
+        let err = c
+            .run_query(&Query {
+                table: "items".into(),
+                search: Some(crate::wire::SearchQuery {
+                    index: "by_content".into(),
+                    query: "hello".into(),
+                }),
+                index: Some("by_name".into()),
+                ..Default::default()
+            })
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::BadRequest);
+        assert!(
+            err.message.contains("search cannot be combined"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn query_vector_search_returns_empty_array_stub() {
+        // The TS harness rejects `vectorSearch` combined with any other
+        // terminal (including `take`) — unlike `search`, vectorSearch carries
+        // its own `limit`. So the bare-stub path is exercised without a
+        // trailing terminal.
+        let c = new_client();
+        let v = c
+            .run::<Vec<Value>>(
+                &TableQuery::new("items")
+                    .vector_search("by_embedding", vec![1.0, 0.0, 0.0], 5, BTreeMap::new())
+                    .build(),
+            )
+            .expect("vector stub");
+        assert!(v.is_empty(), "vector stub returns []");
+    }
+
+    #[tokio::test]
+    async fn query_vector_search_rejects_conflicting_terminals() {
+        let c = new_client();
+        let err = c
+            .run_query(&Query {
+                table: "items".into(),
+                vector_search: Some(crate::wire::VectorSearchQuery {
+                    index: "by_embedding".into(),
+                    vector: vec![1.0],
+                    limit: 5,
+                    filter: BTreeMap::new(),
+                }),
+                index: Some("by_name".into()),
+                ..Default::default()
+            })
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::BadRequest);
+        assert!(
+            err.message.contains("vectorSearch cannot be combined"),
+            "got: {err}"
+        );
+    }
+
+    // ---- query: filter hook is a Task-3 pass-through ----------------
+
+    #[tokio::test]
+    async fn query_filter_pass_through_does_not_filter() {
+        // The Task-3 filter hook returns `true` for every row, so a `filter`
+        // clause that would otherwise narrow the set is a no-op. Proves the
+        // hook is wired (no panic) and that Task 4 has a clean swap target.
+        let mut c = new_client();
+        seed_query_rows(&mut c).await;
+        let docs = c
+            .run::<Vec<Value>>(
+                &TableQuery::new("items")
+                    .with_index("by_status", &[json!("todo")])
+                    // A filter that would normally exclude every row (no row
+                    // has order==999); with the pass-through, all 3 stay.
+                    .filter(FilterExpr::Eq {
+                        field: "order".into(),
+                        value: json!(999),
+                    })
+                    .collect(),
+            )
+            .expect("filter query ok");
+        assert_eq!(docs.len(), 3, "pass-through hook keeps all rows");
     }
 }
