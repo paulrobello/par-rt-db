@@ -16,6 +16,7 @@ Crate name: `par-rt-db-client` → in Rust, `use par_rt_db_client::...`.
 | `http` | yes | `RtDbHttpClient` — typed query / mutate / `auth_me` |
 | `ws` | no | `RtDbClient` (`src/ws.rs`) — reactive WebSocket client (live query subscriptions + mutate) |
 | `admin` | no | `/admin/*` control-plane client — db create/list/push-schema, schema/stats read-back, token mint/revoke/list, db + server-wide admin allowlist CRUD, metrics, hot config GET/PATCH, op-feed `recent`, owner-bypass query/mutate, snapshot export/import. Browser-only `login`/`logout`/`/admin/stream` are excluded (the Rust client is a machine client). |
+| `in_memory` | no | `InMemoryRtDbClient` (`src/in_memory.rs`) — in-memory test harness (no network, no Postgres). Ports `ts-client/src/in_memory.ts`: schema push, mutate (with `mut_id` idempotency), one-shot query DSL (`get`/`first`/`unique`/`count`/`take`/`collect` + index eq + range + `order` + cursor-keyset `paginate`), `filter()` predicate evaluation, reactive `subscribe` (re-runs and fires `on_update` on change), `schedule`/`cancel_schedule`/`pause_schedule`/`resume_schedule`/`list_schedules` + a timer-less `tick(now_ms)` (one-shot catches up if past due; cron re-arms by `CRON_STEP_MS = 60_000` and skips missed windows), and the `upload`/`delete_file`/`get_file_metadata`/`get_url` storage stubs. `search`/`vector_search` honestly stub out `[]` (no in-memory ranking; rejected combinations still throw). |
 
 `core` (wire types, schema/query/mutation builders, error model) compiles with
 no features. `[lints.rust] warnings = "deny"` — same zero-warning posture as the
@@ -30,6 +31,21 @@ validation. `search_index()` declares a full-text index in a `Schema`,
 `vector(N)` column + HNSW cosine; embeddings are client-supplied), and
 `owner_field()` opts a table into per-row authorization (server-enforced on
 read, mutate, and subscription re-run; machine tokens bypass).
+
+### In-memory test harness (feature `in_memory`)
+
+`InMemoryRtDbClient` mirrors the server's schema/query/txn/step-result semantics
+with no network and no Postgres — a direct port of `ts-client/src/in_memory.ts`.
+It exposes the same data surface as the live clients (`push_schema`,
+`run`/`run_query`, `mutate` with `mut_id` idempotency, and reactive `subscribe`)
+so a unit test can swap it in behind a shared interface. Atomic rollback on step
+failure, system-field merging at read time, and cursor-keyset pagination all
+behave like the server. The harness is opt-in (gates a `sha2` dependency for
+SHA-256 file digests); `search`/`vector_search` honestly return `[]` (no
+in-memory ts_rank / vector ranking), while storage (`upload`/`delete_file`/
+`get_file_metadata`/`get_url`) is a real in-memory `HashMap` stub — both match
+the TS harness's surface so app-level storage flows can be exercised with no
+network.
 
 ## Quick start (HTTP)
 
@@ -118,8 +134,8 @@ on any side is a breaking change unless mirrored on all three. See
 ## Develop
 
 ```sh
-cargo test --all-features          # full suite (wiremock mocks; no server needed)
-cargo build --all-features         # http + ws + admin surfaces compile
+cargo test --all-features          # full suite (wiremock mocks; in-memory harness; no server needed)
+cargo build --all-features         # http + ws + admin + in_memory surfaces compile
 cargo build --no-default-features  # core compiles with no features
 ```
 

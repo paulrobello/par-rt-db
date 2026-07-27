@@ -12,7 +12,7 @@ default = ["http"]
 http = ["dep:reqwest"]
 ws = ["dep:tokio", "dep:tokio-tungstenite", "dep:futures-util"]
 admin = ["http"]
-in_memory = []
+in_memory = ["dep:sha2"]
 
 [lints.rust]
 warnings = "deny"
@@ -29,6 +29,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 tokio = { version = "1", features = ["macros", "rt", "sync", "time"], optional = true }
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"], optional = true }
 futures-util = { version = "0.3", optional = true }
+sha2 = { version = "0.10", default-features = false, optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

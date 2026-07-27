@@ -25,25 +25,31 @@
 //! unbound index fields with `_creationTime`/`_id` tiebreakers, and the
 //! `get`/`first`/`unique`/`count`/`take`/`collect` terminals), the
 //! `FilterExpr` evaluator (Task 4: `validate_filter` + `eval_filter_expr`,
-//! ported from the C-corrected TS logic), and the `paginate` terminal
-//! (Task 5: cursor-keyset paging over the sorted set). `search`/
-//! `vector_search` stub out — no in-memory ts_rank / vector ranking, but the
-//! combination guards still reject conflicting terminals so the cascade
-//! agrees with the server. Subsequent tasks fill in subscriptions,
-//! scheduling, and storage.
+//! ported from the C-corrected TS logic), the `paginate` terminal
+//! (Task 5: cursor-keyset paging over the sorted set), and the reactive +
+//! scheduling + storage surfaces (Task 6: `subscribe` (re-runs the query and
+//! fires `on_update` on change), `schedule`/`cancel_schedule`/
+//! `pause_schedule`/`resume_schedule`/`list_schedules`/`tick` (one-shot
+//! catches up if past due; cron re-arms by `CRON_STEP_MS` and skips missed
+//! windows), and the `upload`/`delete_file`/`get_file_metadata`/`get_url`
+//! storage stubs). `search`/`vector_search` stub out — no in-memory ts_rank /
+//! vector ranking, but the combination guards still reject conflicting
+//! terminals so the cascade agrees with the server.
 
 use std::collections::{BTreeSet, HashMap};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 
 use crate::error::{ErrorCode, RtDbError};
 use crate::mutation::{Step, StepResult, Transaction};
 use crate::query::{Order, Query};
 use crate::schema::{FieldType, IndexDef, SchemaDef, TableDef};
-use crate::wire::FilterExpr;
+use crate::wire::{FilterExpr, ScheduleInfo, ScheduleKind, ScheduleStatus, ScheduleWhen};
 
 /// Maximum number of steps in a single transaction (mirrors the server cap).
 pub const MAX_STEPS: usize = 256;
@@ -63,6 +69,102 @@ pub struct StoredRow {
     pub doc: Value,
     pub version: i64,
     pub created_at: i64,
+}
+
+/// A stored scheduled job in the in-memory harness. `tick` fires due non-paused
+/// jobs by applying `txn` through the same atomic path as `mutate`. Ports the
+/// `ScheduledJob` interface at `ts-client/src/in_memory.ts:75-85`.
+#[derive(Debug, Clone)]
+pub struct ScheduledJob {
+    pub id: String,
+    pub kind: ScheduleKind,
+    pub txn: Transaction,
+    pub due_at: i64,
+    pub cron: Option<String>,
+    pub status: ScheduleStatus,
+    pub created_at: i64,
+    pub fired_count: i64,
+    pub last_error: Option<String>,
+}
+
+/// A stored file blob with its server-side metadata. Mirrors the TS
+/// `{ bytes, contentType?, createdAt }` record (`ts-client/src/in_memory.ts:498-501`).
+#[derive(Debug, Clone)]
+pub struct StoredBlob {
+    pub bytes: Vec<u8>,
+    pub content_type: Option<String>,
+    pub created_at: i64,
+    pub sha256: String,
+}
+
+/// Result of [`InMemoryRtDbClient::upload`] — the server-computed file
+/// identity, content hash, size in bytes, and (if the upload carried one) the
+/// stored `contentType`. Mirrors [`crate::http::UploadResult`] (`http.rs:54`)
+/// byte-for-byte but is defined locally so the `in_memory` feature does not
+/// depend on the `http` feature.
+#[derive(Debug, Clone)]
+pub struct UploadResult {
+    pub id: String,
+    pub sha256: String,
+    pub size: i64,
+    pub content_type: Option<String>,
+}
+
+/// File metadata returned by [`InMemoryRtDbClient::get_file_metadata`]. Mirrors
+/// [`crate::http::FileMetadata`] (`http.rs:66`) plus the server-recorded
+/// `creation_time`; defined locally for the same feature-isolation reason as
+/// [`UploadResult`].
+#[derive(Debug, Clone)]
+pub struct FileMetadata {
+    pub id: String,
+    pub sha256: String,
+    pub size: i64,
+    pub content_type: Option<String>,
+    pub creation_time: i64,
+}
+
+/// Inner state of one reactive subscription. The `callback` is wrapped in an
+/// [`Arc`] so the returned [`SubscriptionHandle`] can clear it via the shared
+/// `alive` flag without holding a borrow on the client. Ports the
+/// `Subscription` interface at `ts-client/src/in_memory.ts:62-68`.
+pub(crate) struct Subscription {
+    pub query: Query,
+    pub table: String,
+    /// Cleared by the [`SubscriptionHandle`]'s Drop. notify_subs skips dead
+    /// subscriptions (and lazily removes them from the vec).
+    pub alive: Arc<AtomicBool>,
+    pub callback: Arc<dyn Fn(Value) + Send + Sync>,
+    /// Last delivered value (canonicalized) — only re-fires on a real change.
+    /// Mutex is for interior mutability under `&self` notify; the harness is
+    /// driven synchronously by tests so contention is not a concern.
+    pub last: Mutex<Option<String>>,
+}
+
+/// Unsubscribe handle returned by [`InMemoryRtDbClient::subscribe`]. Dropping
+/// it (or calling [`SubscriptionHandle::unsubscribe`]) clears the listener, so
+/// no further updates fire — matching the TS `() => unsub()` contract.
+pub struct SubscriptionHandle {
+    alive: Arc<AtomicBool>,
+}
+
+/// Type alias for the subscriber callback — its raw form would otherwise trip
+/// clippy's `type_complexity` lint where it's used in a tuple inside
+/// [`InMemoryRtDbClient::notify_subs`].
+type Listener = Arc<dyn Fn(Value) + Send + Sync>;
+
+impl SubscriptionHandle {
+    /// Detach the listener; equivalent to dropping the handle.
+    pub fn unsubscribe(self) {
+        // Drop runs the same clear; this method exists for explicit parity
+        // with the TS `unsub()` call shape.
+        self.alive.store(false, Ordering::SeqCst);
+    }
+}
+
+impl Drop for SubscriptionHandle {
+    fn drop(&mut self) {
+        self.alive.store(false, Ordering::SeqCst);
+    }
 }
 
 /// Injectable clock and RNG for deterministic id minting and `_creationTime`.
@@ -104,17 +206,21 @@ pub struct InMemoryRtDbClient {
     /// Document store keyed by `(table_name, id)` — flat representation of the
     /// TS `Map<string, Map<string, StoredRow>>`.
     docs: HashMap<(String, String), StoredRow>,
-    #[expect(dead_code, reason = "consumed by task 6 (storage id minting)")]
+    /// Counter for storage-upload id minting (`f{++counter}` per
+    /// `ts-client/src/in_memory.ts:647`).
     id_counter: u64,
     /// `mut_id` → cached results. `push_schema` clears this on every push
     /// (matching TS); `mutate` reads/writes it for its idempotency short-circuit.
     idempotency: HashMap<String, Vec<StepResult>>,
-    #[expect(dead_code, reason = "consumed by task 4 (scheduling)")]
-    schedules: Vec<Value>,
-    #[expect(dead_code, reason = "consumed by task 5 (subscriptions)")]
-    subscribers: Vec<Value>,
-    #[expect(dead_code, reason = "consumed by task 6 (storage)")]
-    storage: HashMap<String, Value>,
+    /// Scheduled jobs (one-shot + cron). `tick` drains due non-paused entries
+    /// by re-running `txn` through `execute_transaction`.
+    schedules: Vec<ScheduledJob>,
+    /// Reactive subscriptions. notify_subs (called from `execute_transaction`)
+    /// re-runs each affected query and fires its callback on a real change.
+    subscribers: Vec<Arc<Subscription>>,
+    /// Storage stub: per-id blobs with their bytes, content-type, creation
+    /// time, and SHA-256. Mirrors the TS `files: Map<...>`.
+    storage: HashMap<String, StoredBlob>,
 }
 
 impl InMemoryRtDbClient {
@@ -614,11 +720,13 @@ impl InMemoryRtDbClient {
         Ok(results)
     }
 
-    /// Synchronous atomic core shared by [`mutate`](Self::mutate) and (in Task
-    /// 4) the scheduler's `tick`: enforces the [`MAX_STEPS`] cap, snapshots the
-    /// docs store, applies every step (rolling back the whole txn on any error).
-    /// Subscription fan-out happens in Task 6; this is where the write-set
-    /// notification will hook in.
+    /// Synchronous atomic core shared by [`mutate`](Self::mutate) and the
+    /// scheduler's [`tick`](Self::tick): enforces the [`MAX_STEPS`] cap,
+    /// snapshots the docs store, applies every step (rolling back the whole txn
+    /// on any error), then — on success — fans out subscription notifications
+    /// for the written tables. Ports `executeTransaction`
+    /// (`ts-client/src/in_memory.ts:545-567`); the notify seam lives here so
+    /// both mutate- and `tick`-driven writes fire subscription updates.
     fn execute_transaction(&mut self, txn: &Transaction) -> Result<Vec<StepResult>, RtDbError> {
         if txn.steps.len() > MAX_STEPS {
             return Err(RtDbError::new(
@@ -628,9 +736,15 @@ impl InMemoryRtDbClient {
         }
         let snapshot = self.snapshot_docs();
         let mut results = Vec::with_capacity(txn.steps.len());
+        let mut write_set: BTreeSet<String> = BTreeSet::new();
         for step in &txn.steps {
             match self.execute_step(step) {
-                Ok((result, _written_table)) => results.push(result),
+                Ok((result, written_table)) => {
+                    results.push(result);
+                    if let Some(table) = written_table {
+                        write_set.insert(table);
+                    }
+                }
                 Err(error) => {
                     // Atomicity: any step's error rolls back everything already
                     // applied, mirroring the server's single-transaction semantics.
@@ -639,6 +753,7 @@ impl InMemoryRtDbClient {
                 }
             }
         }
+        self.notify_subs(&write_set);
         Ok(results)
     }
 
@@ -919,6 +1034,372 @@ impl InMemoryRtDbClient {
         }
         out
     }
+
+    // ---- subscriptions -----------------------------------------------------
+    //
+    // Ports `subscribe` (`ts-client/src/in_memory.ts:572-594`) and `notifySubs`
+    // (`:1294-1309`). On a successful `execute_transaction`, each subscriber
+    // whose `table` is in the write-set re-runs its query and fires its
+    // callback iff the (canonicalized) result changed. The initial value is
+    // delivered synchronously inside `subscribe`, mirroring the server's first
+    // `queryUpdate` arriving right after subscribe.
+
+    /// Reactive subscription — fires `on_update` with the initial result
+    /// synchronously, then again whenever a mutation changes the result.
+    /// Dropping (or calling [`unsubscribe`](SubscriptionHandle::unsubscribe)
+    /// on) the returned handle stops further notifications. The callback runs
+    /// inline on the writing thread; never recursively mutate the same client
+    /// from inside a callback (the harness is single-threaded and a recursive
+    /// mutate would deadlock against the in-progress `execute_transaction`).
+    pub fn subscribe<F>(&mut self, query: Query, on_update: F) -> SubscriptionHandle
+    where
+        F: Fn(Value) + Send + Sync + 'static,
+    {
+        let alive = Arc::new(AtomicBool::new(true));
+        let callback: Listener = Arc::new(on_update);
+        let table = query.table.clone();
+        let sub = Arc::new(Subscription {
+            query: query.clone(),
+            table,
+            alive: alive.clone(),
+            callback: callback.clone(),
+            last: Mutex::new(None),
+        });
+        self.subscribers.push(sub.clone());
+
+        // Initial value, delivered synchronously (server's first queryUpdate).
+        // Errors are suppressed on the initial fire too — a query that fails
+        // never fires the callback, matching TS `executeQuery` rethrowing into
+        // a silent skip on subsequent notifications.
+        if let Ok(initial) = self.run_query(&query) {
+            let initial_canon = canonical(&initial);
+            *sub.last.lock().unwrap_or_else(|p| p.into_inner()) = Some(initial_canon);
+            callback(initial);
+        }
+
+        SubscriptionHandle { alive }
+    }
+
+    /// Re-runs each subscriber's query (only those whose `table` is in the
+    /// write-set) and fires its callback iff the result changed. Ports
+    /// `notifySubs` (`ts-client/src/in_memory.ts:1294-1309`). Dead subscriptions
+    /// (whose handle was dropped) are lazily compacted away.
+    fn notify_subs(&mut self, write_set: &BTreeSet<String>) {
+        // Collect the work to do (callback + value pairs) before any mutation,
+        // so callbacks run outside the iteration with no borrow on `self`.
+        let mut fires: Vec<(Listener, Value)> = Vec::new();
+        for sub in &self.subscribers {
+            if !sub.alive.load(Ordering::SeqCst) {
+                continue;
+            }
+            if !write_set.contains(&sub.table) {
+                continue;
+            }
+            let next = match self.run_query(&sub.query) {
+                Ok(v) => v,
+                Err(_) => continue, // a query error suppresses the notification
+            };
+            let next_canon = canonical(&next);
+            let mut last_lock = sub.last.lock().unwrap_or_else(|p| p.into_inner());
+            let changed = match &*last_lock {
+                None => true,
+                Some(prev) => prev != &next_canon,
+            };
+            if changed {
+                *last_lock = Some(next_canon);
+                drop(last_lock);
+                fires.push((sub.callback.clone(), next));
+            }
+        }
+        // Lazily compact dead subscriptions (handle dropped → alive=false).
+        self.subscribers.retain(|s| s.alive.load(Ordering::SeqCst));
+        // Fire outside the borrow — a callback that re-enters the client (e.g.
+        // a query) does not deadlock against the iteration we just finished.
+        for (callback, value) in fires {
+            callback(value);
+        }
+    }
+
+    // ---- schedules --------------------------------------------------------
+    //
+    // Ports `schedule`/`cancelSchedule`/`pauseSchedule`/`resumeSchedule`/
+    // `listSchedules`/`tick` (`ts-client/src/in_memory.ts:600-706`). Cron
+    // validation is deferred to the live server; the harness only needs the
+    // `dueAt`-driven re-arm cadence (`CRON_STEP_MS`). One-shots catch up if
+    // past due (fire once even if `due_at < now`); crons step by
+    // `CRON_STEP_MS` and skip missed windows (re-arm to the next interval,
+    // never fire N times for N missed windows).
+
+    /// Stores `txn` scheduled for `when` and returns its id. Cron validation
+    /// is deferred to the live server; the harness accepts any expression.
+    /// Ports `schedule` (`ts-client/src/in_memory.ts:600-617`).
+    pub fn schedule(&mut self, txn: Transaction, when: ScheduleWhen) -> Result<String, RtDbError> {
+        let id = self.new_id();
+        let now = (self.now)();
+        let kind = match &when {
+            ScheduleWhen::Cron { .. } => ScheduleKind::Cron,
+            _ => ScheduleKind::Oneshot,
+        };
+        let cron = match &when {
+            ScheduleWhen::Cron { expr } => Some(expr.clone()),
+            _ => None,
+        };
+        let job = ScheduledJob {
+            id: id.clone(),
+            kind,
+            txn,
+            due_at: self.due_at_for(&when, now),
+            cron,
+            status: ScheduleStatus::Pending,
+            created_at: now,
+            fired_count: 0,
+            last_error: None,
+        };
+        self.schedules.push(job);
+        Ok(id)
+    }
+
+    /// Removes the scheduled job. NOT_FOUND if no such id. Ports
+    /// `cancelSchedule` (`ts-client/src/in_memory.ts:619-623`).
+    pub fn cancel_schedule(&mut self, id: &str) -> Result<(), RtDbError> {
+        let before = self.schedules.len();
+        self.schedules.retain(|j| j.id != id);
+        if self.schedules.len() == before {
+            return Err(RtDbError::new(
+                ErrorCode::NotFound,
+                format!("schedule '{id}' not found"),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Sets the schedule's status to `Paused`. NOT_FOUND if no such id. Ports
+    /// `pauseSchedule` (`ts-client/src/in_memory.ts:625-627`).
+    pub fn pause_schedule(&mut self, id: &str) -> Result<(), RtDbError> {
+        let job = self
+            .schedules
+            .iter_mut()
+            .find(|j| j.id == id)
+            .ok_or_else(|| {
+                RtDbError::new(ErrorCode::NotFound, format!("schedule '{id}' not found"))
+            })?;
+        job.status = ScheduleStatus::Paused;
+        Ok(())
+    }
+
+    /// Sets a paused schedule's status back to `Pending`. NOT_FOUND if no such
+    /// id. Ports `resumeSchedule` (`ts-client/src/in_memory.ts:629-631`).
+    pub fn resume_schedule(&mut self, id: &str) -> Result<(), RtDbError> {
+        let job = self
+            .schedules
+            .iter_mut()
+            .find(|j| j.id == id)
+            .ok_or_else(|| {
+                RtDbError::new(ErrorCode::NotFound, format!("schedule '{id}' not found"))
+            })?;
+        job.status = ScheduleStatus::Pending;
+        Ok(())
+    }
+
+    /// Snapshot of every scheduled job's public view. Ports `listSchedules`
+    /// (`ts-client/src/in_memory.ts:633-635`).
+    pub fn list_schedules(&self) -> Vec<ScheduleInfo> {
+        self.schedules.iter().map(schedule_info).collect()
+    }
+
+    /// Fires every due non-paused job by applying its txn through the same
+    /// atomic path as [`mutate`](Self::mutate) (so reactive subscriptions see
+    /// the write). One-shots are removed after a successful fire; crons are
+    /// re-armed by `CRON_STEP_MS`. Pass `now_ms` to drive the clock
+    /// deterministically; omit it to use the client's injected clock. Ports
+    /// `tick` (`ts-client/src/in_memory.ts:683-706`).
+    pub fn tick(&mut self, now_ms: Option<i64>) {
+        let now = now_ms.unwrap_or_else(|| (self.now)());
+        // Iterate by index so we can mutate (`pause`/error) and remove in place
+        // without invalidating a borrow on `self.schedules`.
+        let mut i = 0;
+        while i < self.schedules.len() {
+            let job = &mut self.schedules[i];
+            if job.status == ScheduleStatus::Paused || job.due_at > now {
+                i += 1;
+                continue;
+            }
+            // Step out of the borrow so we can call execute_transaction (which
+            // needs &mut self) without holding &mut self.schedules.
+            let txn = job.txn.clone();
+            let job_id = job.id.clone();
+            let kind = job.kind;
+            match self.execute_transaction(&txn) {
+                Ok(_results) => {
+                    // Re-borrow the job (it may have moved if execute_transaction
+                    // triggered another tick path — it doesn't, but defensively
+                    // look up by id rather than holding the &mut).
+                    if let Some(j) = self.schedules.iter_mut().find(|j| j.id == job_id) {
+                        j.fired_count += 1;
+                        match kind {
+                            ScheduleKind::Oneshot => {
+                                // Remove after a successful fire.
+                                self.schedules.retain(|x| x.id != job_id);
+                                // Don't bump i — the next job shifted into this
+                                // index; the loop re-examines the same i.
+                                continue;
+                            }
+                            ScheduleKind::Cron => {
+                                j.due_at = now + CRON_STEP_MS;
+                                j.status = ScheduleStatus::Pending;
+                            }
+                        }
+                    }
+                }
+                Err(error) => {
+                    if let Some(j) = self.schedules.iter_mut().find(|j| j.id == job_id) {
+                        j.status = ScheduleStatus::Error;
+                        j.last_error = Some(error.message);
+                        if kind == ScheduleKind::Cron {
+                            j.due_at = now + CRON_STEP_MS;
+                        }
+                    }
+                }
+            }
+            i += 1;
+        }
+    }
+
+    /// Initial `due_at` for a schedule's `when`, mirroring `dueAtFor`
+    /// (`ts-client/src/in_memory.ts:708-717`). `afterMs` is relative to `now`,
+    /// `runAt` is absolute (in the past = fire on the next tick), and `cron`
+    /// steps by `CRON_STEP_MS` from `now` (real cron parsing is server-side).
+    fn due_at_for(&self, when: &ScheduleWhen, now: i64) -> i64 {
+        match when {
+            ScheduleWhen::AfterMs { ms } => now + ms,
+            ScheduleWhen::RunAt { ms } => *ms,
+            ScheduleWhen::Cron { .. } => now + CRON_STEP_MS,
+        }
+    }
+
+    // ---- file storage ------------------------------------------------------
+    //
+    // Ports `upload`/`deleteFile`/`getFileMetadata`/`getUrl`
+    // (`ts-client/src/in_memory.ts:644-677`). Storage is HTTP-only on the live
+    // server; the in-memory harness mirrors the surface so unit tests can
+    // exercise app storage flows with no network. `get_url` returns a
+    // synthetic `memory://` handle — there is no real byte stream to serve.
+
+    /// Stores `bytes` and returns a server-shaped [`UploadResult`]. The id is
+    /// a short counter-prefixed token (distinct in shape from document ids).
+    /// Ports `upload` (`ts-client/src/in_memory.ts:646-652`).
+    pub fn upload(
+        &mut self,
+        bytes: Vec<u8>,
+        content_type: Option<String>,
+    ) -> Result<UploadResult, RtDbError> {
+        self.id_counter += 1;
+        let id = format!("f{}", base36(self.id_counter));
+        let sha256 = sha256_hex(&bytes);
+        let size = bytes.len() as i64;
+        let created_at = (self.now)();
+        self.storage.insert(
+            id.clone(),
+            StoredBlob {
+                bytes,
+                content_type: content_type.clone(),
+                created_at,
+                sha256: sha256.clone(),
+            },
+        );
+        Ok(UploadResult {
+            id,
+            sha256,
+            size,
+            content_type,
+        })
+    }
+
+    /// Deletes a stored blob. NOT_FOUND if unknown. Ports `deleteFile`
+    /// (`ts-client/src/in_memory.ts:654-658`).
+    pub fn delete_file(&mut self, id: &str) -> Result<(), RtDbError> {
+        if self.storage.remove(id).is_none() {
+            return Err(RtDbError::new(
+                ErrorCode::NotFound,
+                "unknown file".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Reads back a stored blob's metadata. The returned `sha256` is the empty
+    /// string — only the upload result carries the real digest (the live HTTP
+    /// client does the same; tests that need the digest should keep the
+    /// [`UploadResult`]). Ports `getFileMetadata`
+    /// (`ts-client/src/in_memory.ts:660-672`).
+    pub fn get_file_metadata(&self, id: &str) -> Result<FileMetadata, RtDbError> {
+        let blob = self
+            .storage
+            .get(id)
+            .ok_or_else(|| RtDbError::new(ErrorCode::NotFound, "unknown file".to_string()))?;
+        Ok(FileMetadata {
+            id: id.to_string(),
+            sha256: String::new(),
+            size: blob.bytes.len() as i64,
+            content_type: blob.content_type.clone(),
+            creation_time: blob.created_at,
+        })
+    }
+
+    /// Synthetic handle — no real byte stream. Ports `getUrl`
+    /// (`ts-client/src/in_memory.ts:675-677`).
+    pub fn get_url(&self, id: &str) -> String {
+        format!("memory://{id}")
+    }
+}
+
+/// Builds the public [`ScheduleInfo`] view of an in-memory [`ScheduledJob`].
+/// Mirrors `toScheduleInfo` (`ts-client/src/in_memory.ts:727-743`): `cron` and
+/// `last_error` are present only when set.
+fn schedule_info(job: &ScheduledJob) -> ScheduleInfo {
+    ScheduleInfo {
+        id: job.id.clone(),
+        kind: job.kind,
+        due_at: job.due_at,
+        cron: job.cron.clone(),
+        status: job.status,
+        last_error: job.last_error.clone(),
+        created_at: job.created_at,
+        fired_count: job.fired_count,
+    }
+}
+
+/// Lowercase base-36 encoding of `n`, matching `Number.prototype.toString(36)`
+/// in the TS source (`ts-client/src/in_memory.ts:647`). Used for storage-id
+/// minting; grows wider only after `z`, `10`, `11`, …
+fn base36(n: u64) -> String {
+    if n == 0 {
+        return "0".to_string();
+    }
+    let mut out = Vec::new();
+    let mut m = n;
+    while m > 0 {
+        let digit = (m % 36) as u32;
+        let ch = char::from_digit(digit, 36).unwrap_or('0');
+        out.push(ch);
+        m /= 36;
+    }
+    out.iter().rev().collect()
+}
+
+/// SHA-256 hex digest of `bytes`. Mirrors `crypto.subtle.digest("SHA-256", …)`
+/// in the TS source (`ts-client/src/in_memory.ts:648-649`).
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let digest = hasher.finalize();
+    let mut out = String::with_capacity(64);
+    for b in digest {
+        use std::fmt::Write;
+        // Unwrap is sound: hex formatting never errors on a single byte.
+        let _ = write!(out, "{b:02x}");
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -3989,5 +4470,540 @@ mod tests {
             })
             .unwrap_err();
         assert_eq!(err.code, ErrorCode::BadRequest);
+    }
+
+    // ---- subscribe --------------------------------------------------------
+    //
+    // Ports `describe("InMemoryRtDbClient — subscribe")`
+    // (`ts-client/tests/in_memory.test.ts:229-248`). The harness re-runs each
+    // subscriber's query on a successful txn that touched its table, and fires
+    // its callback iff the canonicalized result changed. The initial value is
+    // delivered synchronously inside `subscribe`.
+
+    /// Mirror of the TS `subscribe` test: a `count()` over `by_status=todo`
+    /// starts at 0, goes to 1 on a todo insert, and stays at 1 on a done
+    /// insert (different table-write, but same table — done doesn't change the
+    /// todo count). Unsubscribing stops further updates.
+    #[tokio::test]
+    async fn subscribe_delivers_initial_value_and_recomputes_only_on_change() {
+        let mut c = new_client();
+        let updates: Arc<Mutex<Vec<i64>>> = Arc::new(Mutex::new(Vec::new()));
+        let updates_clone = updates.clone();
+        let _unsub = c.subscribe(
+            TableQuery::new("items")
+                .with_index("by_status", &[json!("todo")])
+                .count(),
+            move |v| {
+                if let Some(n) = v.as_i64() {
+                    updates_clone.lock().expect("not poisoned").push(n);
+                }
+            },
+        );
+        assert_eq!(
+            updates.lock().expect("not poisoned").as_slice(),
+            &[0],
+            "initial value delivered synchronously"
+        );
+
+        c.mutate(
+            &Mutation::new()
+                .insert("items", json!({"name": "a", "status": "todo", "order": 1}))
+                .build(),
+            None,
+        )
+        .await
+        .expect("insert todo");
+        assert_eq!(
+            updates.lock().expect("not poisoned").as_slice(),
+            &[0, 1],
+            "todo insert bumped the count"
+        );
+
+        // A write to a different status doesn't change the todo count, so the
+        // callback is not invoked.
+        c.mutate(
+            &Mutation::new()
+                .insert("items", json!({"name": "b", "status": "done", "order": 2}))
+                .build(),
+            None,
+        )
+        .await
+        .expect("insert done");
+        assert_eq!(
+            updates.lock().expect("not poisoned").as_slice(),
+            &[0, 1],
+            "done insert did not change the todo count"
+        );
+    }
+
+    #[tokio::test]
+    async fn subscribe_unsubscribe_stops_further_updates() {
+        let mut c = new_client();
+        let updates: Arc<Mutex<Vec<i64>>> = Arc::new(Mutex::new(Vec::new()));
+        let updates_clone = updates.clone();
+        let unsub = c.subscribe(
+            TableQuery::new("items")
+                .with_index("by_status", &[json!("todo")])
+                .count(),
+            move |v| {
+                if let Some(n) = v.as_i64() {
+                    updates_clone.lock().expect("not poisoned").push(n);
+                }
+            },
+        );
+        assert_eq!(updates.lock().expect("not poisoned").as_slice(), &[0]);
+
+        // Explicit unsubscribe (the Drop path is exercised by the next test).
+        unsub.unsubscribe();
+
+        c.mutate(
+            &Mutation::new()
+                .insert("items", json!({"name": "c", "status": "todo", "order": 3}))
+                .build(),
+            None,
+        )
+        .await
+        .expect("insert todo");
+        assert_eq!(
+            updates.lock().expect("not poisoned").as_slice(),
+            &[0],
+            "no further updates after unsubscribe"
+        );
+    }
+
+    #[tokio::test]
+    async fn subscribe_dropping_handle_unsubscribes() {
+        // The RAII guard path: dropping the handle clears the listener.
+        let mut c = new_client();
+        let updates: Arc<Mutex<Vec<i64>>> = Arc::new(Mutex::new(Vec::new()));
+        let updates_clone = updates.clone();
+        {
+            let _unsub = c.subscribe(
+                TableQuery::new("items")
+                    .with_index("by_status", &[json!("todo")])
+                    .count(),
+                move |v| {
+                    if let Some(n) = v.as_i64() {
+                        updates_clone.lock().expect("not poisoned").push(n);
+                    }
+                },
+            );
+            assert_eq!(updates.lock().expect("not poisoned").as_slice(), &[0]);
+        }
+        c.mutate(
+            &Mutation::new()
+                .insert("items", json!({"name": "d", "status": "todo", "order": 4}))
+                .build(),
+            None,
+        )
+        .await
+        .expect("insert todo");
+        assert_eq!(
+            updates.lock().expect("not poisoned").as_slice(),
+            &[0],
+            "drop(unsub) cleared the listener"
+        );
+    }
+
+    // ---- schedules --------------------------------------------------------
+    //
+    // Ports `describe("InMemoryRtDbClient — schedules")`
+    // (`ts-client/tests/in_memory.test.ts:432-537`). The harness mirrors the
+    // server semantics: one-shot catches up if past due (fires once even when
+    // `due_at < now`); cron steps by `CRON_STEP_MS` and skips missed windows.
+
+    /// The TS `insertTxn` shared by every schedules test (`:433`).
+    fn insert_todo_txn() -> Transaction {
+        Mutation::new()
+            .insert("items", json!({"name": "a", "status": "todo", "order": 1}))
+            .build()
+    }
+
+    /// Fixed-clock harness so schedule due-times are stable under `tick`
+    /// (mirrors TS `newClockClient` `:33-38`). Returns the client and a setter
+    /// for the clock.
+    fn new_clock_client() -> (InMemoryRtDbClient, Arc<Mutex<i64>>) {
+        let cell: Arc<Mutex<i64>> = Arc::new(Mutex::new(1_700_000_000_000_i64));
+        let cell_for_closure = cell.clone();
+        let mut client = InMemoryRtDbClient::new(
+            InMemoryRtDbClientOptions::default()
+                .now(move || *cell_for_closure.lock().expect("not poisoned"))
+                .random(|| 0.0),
+        );
+        client.push_schema(&test_schema());
+        (client, cell)
+    }
+
+    #[tokio::test]
+    async fn schedule_and_tick_fires_a_due_oneshot_and_write_is_visible() {
+        // Ports TS "schedule + tick fires a due one-shot and the write is
+        // visible via query".
+        let (mut c, clock) = new_clock_client();
+        let id = c
+            .schedule(insert_todo_txn(), ScheduleWhen::AfterMs { ms: 1000 })
+            .expect("schedule ok");
+        assert!(is_hex_id(&json!(id)), "id is 32 hex chars: {id}");
+
+        *clock.lock().expect("not poisoned") += 2000; // past the due time
+        c.tick(None);
+
+        let docs = c
+            .run::<Vec<Value>>(&TableQuery::new("items").collect())
+            .expect("collect ok");
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs[0]["name"], json!("a"));
+        // A fired one-shot is removed from the registry.
+        let remaining = c.list_schedules();
+        assert!(
+            remaining.iter().all(|s| s.id != id),
+            "fired oneshot removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn tick_does_not_fire_a_not_yet_due_oneshot() {
+        let (mut c, clock) = new_clock_client();
+        c.schedule(insert_todo_txn(), ScheduleWhen::AfterMs { ms: 5000 })
+            .expect("schedule ok");
+
+        *clock.lock().expect("not poisoned") += 1000; // before the due time
+        c.tick(None);
+
+        let docs = c
+            .run::<Vec<Value>>(&TableQuery::new("items").collect())
+            .expect("collect ok");
+        assert!(docs.is_empty(), "not yet due — no fire");
+    }
+
+    #[tokio::test]
+    async fn tick_does_not_fire_a_paused_job() {
+        // Ports TS "a paused scheduled job does not fire on tick".
+        let (mut c, clock) = new_clock_client();
+        let id = c
+            .schedule(insert_todo_txn(), ScheduleWhen::AfterMs { ms: 1000 })
+            .expect("schedule ok");
+        c.pause_schedule(&id).expect("pause ok");
+
+        *clock.lock().expect("not poisoned") += 2000; // due, but paused
+        c.tick(None);
+
+        let docs = c
+            .run::<Vec<Value>>(&TableQuery::new("items").collect())
+            .expect("collect ok");
+        assert!(docs.is_empty(), "paused — no fire");
+        let info = c
+            .list_schedules()
+            .into_iter()
+            .find(|s| s.id == id)
+            .expect("paused job still listed");
+        assert_eq!(info.status.as_wire_str(), "paused");
+    }
+
+    #[tokio::test]
+    async fn cancel_schedule_removes_the_job() {
+        // Ports TS "cancelSchedule removes the job so it does not fire on tick".
+        let (mut c, clock) = new_clock_client();
+        let id = c
+            .schedule(insert_todo_txn(), ScheduleWhen::AfterMs { ms: 1000 })
+            .expect("schedule ok");
+        c.cancel_schedule(&id).expect("cancel ok");
+        assert!(
+            c.list_schedules().iter().all(|s| s.id != id),
+            "cancelled id no longer listed"
+        );
+
+        *clock.lock().expect("not poisoned") += 2000;
+        c.tick(None);
+
+        let docs = c
+            .run::<Vec<Value>>(&TableQuery::new("items").collect())
+            .expect("collect ok");
+        assert!(docs.is_empty(), "cancelled — no fire");
+    }
+
+    #[tokio::test]
+    async fn pause_then_resume_lets_the_job_fire_on_a_later_tick() {
+        // Ports TS "pause then resume lets the job fire on a later tick".
+        let (mut c, clock) = new_clock_client();
+        let id = c
+            .schedule(insert_todo_txn(), ScheduleWhen::AfterMs { ms: 1000 })
+            .expect("schedule ok");
+        c.pause_schedule(&id).expect("pause ok");
+        *clock.lock().expect("not poisoned") += 2000;
+        c.tick(None);
+        assert_eq!(
+            c.run::<Vec<Value>>(&TableQuery::new("items").collect())
+                .expect("collect")
+                .len(),
+            0,
+            "still paused at the first tick"
+        );
+
+        c.resume_schedule(&id).expect("resume ok");
+        let info = c
+            .list_schedules()
+            .into_iter()
+            .find(|s| s.id == id)
+            .expect("resumed job listed");
+        assert_eq!(info.status.as_wire_str(), "pending");
+
+        c.tick(None);
+        let docs = c
+            .run::<Vec<Value>>(&TableQuery::new("items").collect())
+            .expect("collect");
+        assert_eq!(docs.len(), 1, "fired after resume");
+    }
+
+    #[tokio::test]
+    async fn list_schedules_returns_server_aligned_info() {
+        // Ports TS "listSchedules returns schedule info with server-aligned
+        // status/kind names".
+        let (mut c, _clock) = new_clock_client();
+        let id = c
+            .schedule(
+                insert_todo_txn(),
+                ScheduleWhen::Cron {
+                    expr: "* * * * *".to_string(),
+                },
+            )
+            .expect("schedule ok");
+
+        let list = c.list_schedules();
+        assert_eq!(list.len(), 1);
+        let info = &list[0];
+        assert_eq!(info.id, id);
+        assert_eq!(info.kind.as_wire_str(), "cron");
+        assert_eq!(info.status.as_wire_str(), "pending");
+        assert_eq!(info.cron.as_deref(), Some("* * * * *"));
+        assert_eq!(info.fired_count, 0);
+        // dueAt / createdAt are present (numbers).
+        let _ = info.due_at;
+        let _ = info.created_at;
+    }
+
+    #[tokio::test]
+    async fn cancel_pause_resume_on_unknown_id_returns_not_found() {
+        // Ports TS "cancel/pause/resume on an unknown id reject with
+        // NOT_FOUND".
+        let (mut c, _clock) = new_clock_client();
+        let err = c.cancel_schedule("nope").unwrap_err();
+        assert_eq!(err.code, ErrorCode::NotFound);
+        let err = c.pause_schedule("nope").unwrap_err();
+        assert_eq!(err.code, ErrorCode::NotFound);
+        let err = c.resume_schedule("nope").unwrap_err();
+        assert_eq!(err.code, ErrorCode::NotFound);
+    }
+
+    #[tokio::test]
+    async fn tick_cron_re_arms_and_fires_again_on_a_later_tick() {
+        // The TS suite does not cover cron re-arm directly, but the brief calls
+        // it out: cron steps by `CRON_STEP_MS` and fires again on a later tick.
+        // Skipping missed windows is verified separately.
+        let (mut c, clock) = new_clock_client();
+        // The cron's initial due_at is `now + CRON_STEP_MS` (per `dueAtFor`),
+        // so a tick at the schedule-time `now` does nothing. Advance one step
+        // before the first fire.
+        c.schedule(
+            insert_todo_txn(),
+            ScheduleWhen::Cron {
+                expr: "* * * * *".to_string(),
+            },
+        )
+        .expect("schedule ok");
+
+        // First fire: advance one CRON_STEP_MS.
+        *clock.lock().expect("not poisoned") += CRON_STEP_MS;
+        c.tick(None);
+        assert_eq!(
+            c.run::<Vec<Value>>(&TableQuery::new("items").collect())
+                .expect("collect")
+                .len(),
+            1,
+            "cron fired once"
+        );
+        // Immediately re-ticking without advancing the clock does nothing —
+        // the next due_at is now + CRON_STEP_MS.
+        c.tick(None);
+        assert_eq!(
+            c.list_schedules().len(),
+            1,
+            "cron still registered (not removed after fire)"
+        );
+        let fired_count = c.list_schedules()[0].fired_count;
+        assert_eq!(fired_count, 1, "fired_count tracks successful fires");
+
+        // Advance the clock one CRON_STEP_MS — the cron should fire again.
+        *clock.lock().expect("not poisoned") += CRON_STEP_MS;
+        c.tick(None);
+        assert_eq!(
+            c.run::<Vec<Value>>(&TableQuery::new("items").collect())
+                .expect("collect")
+                .len(),
+            2,
+            "cron fired a second time after re-arm"
+        );
+        let fired_count = c.list_schedules()[0].fired_count;
+        assert_eq!(fired_count, 2);
+    }
+
+    #[tokio::test]
+    async fn tick_cron_skips_missed_windows_does_not_backfill() {
+        // Brief: cron skips missed windows — no N-fires for N missed windows.
+        // Advance the clock many CRON_STEP_MS beyond the due_at; the cron fires
+        // exactly once and re-arms one step ahead of `now`.
+        let (mut c, _clock) = new_clock_client();
+        c.schedule(
+            insert_todo_txn(),
+            ScheduleWhen::Cron {
+                expr: "* * * * *".to_string(),
+            },
+        )
+        .expect("schedule ok");
+
+        // Jump 10 × CRON_STEP_MS past the due time and tick once.
+        let big_jump = CRON_STEP_MS * 10;
+        c.tick(Some(1_700_000_000_000_i64 + big_jump));
+
+        let docs = c
+            .run::<Vec<Value>>(&TableQuery::new("items").collect())
+            .expect("collect");
+        assert_eq!(docs.len(), 1, "missed windows are not backfilled");
+        let info = &c.list_schedules()[0];
+        assert_eq!(info.fired_count, 1, "fired exactly once");
+        // Re-armed to `now + CRON_STEP_MS` (not `due_at + N × CRON_STEP_MS`).
+        assert_eq!(info.due_at, 1_700_000_000_000_i64 + big_jump + CRON_STEP_MS);
+    }
+
+    #[tokio::test]
+    async fn tick_oneshot_in_the_past_fires_immediately_catch_up() {
+        // Brief: one-shot catches up if past due — a `RunAt` in the past fires
+        // once even when `due_at < now`.
+        let (mut c, _clock) = new_clock_client();
+        c.schedule(
+            insert_todo_txn(),
+            ScheduleWhen::RunAt {
+                ms: 1_600_000_000_000, // 100B ms before the clock's starting value
+            },
+        )
+        .expect("schedule ok");
+        c.tick(None);
+        let docs = c
+            .run::<Vec<Value>>(&TableQuery::new("items").collect())
+            .expect("collect");
+        assert_eq!(docs.len(), 1, "past-due oneshot catches up");
+        assert!(c.list_schedules().is_empty(), "oneshot removed after fire");
+    }
+
+    #[tokio::test]
+    async fn tick_oneshot_with_failing_txn_marks_error_and_keeps_it() {
+        // A failing txn records `last_error` and flips status to `Error`. The
+        // TS source keeps a failed oneshot in the registry (only crons re-arm).
+        let (mut c, _clock) = new_clock_client();
+        let id = c
+            .schedule(
+                // Reference an unknown table to force a NOT_FOUND.
+                Mutation::new().insert("missing", json!({"x": 1})).build(),
+                ScheduleWhen::AfterMs { ms: 0 },
+            )
+            .expect("schedule ok");
+        c.tick(None);
+        let info = c
+            .list_schedules()
+            .into_iter()
+            .find(|s| s.id == id)
+            .expect("failed oneshot kept in registry");
+        assert_eq!(info.status.as_wire_str(), "error");
+        assert!(
+            info.last_error.is_some(),
+            "last_error recorded: {:?}",
+            info.last_error
+        );
+    }
+
+    // ---- storage ----------------------------------------------------------
+    //
+    // The TS suite does not cover storage directly (the harness ships it as an
+    // honest stub); these exercise the surface so the wire shapes stay aligned
+    // with the live HTTP client (`crate::http::UploadResult` /
+    // `crate::http::FileMetadata`).
+
+    #[test]
+    fn upload_stores_bytes_and_returns_id_sha_size_and_content_type() {
+        let mut c = InMemoryRtDbClient::new(InMemoryRtDbClientOptions::default());
+        let bytes = b"hello world".to_vec();
+        let result = c
+            .upload(bytes.clone(), Some("text/plain".to_string()))
+            .expect("upload ok");
+        // Id is `f<base36>` — distinct in shape from a 32-hex-char doc id.
+        assert!(result.id.starts_with('f'), "id shape: {}", result.id);
+        assert_eq!(result.size, bytes.len() as i64);
+        assert_eq!(result.content_type.as_deref(), Some("text/plain"));
+        // SHA-256 of "hello world" is a known constant — verifies we computed
+        // it correctly (not just non-empty).
+        assert_eq!(
+            result.sha256,
+            "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+        );
+    }
+
+    #[test]
+    fn upload_without_content_type_returns_none() {
+        let mut c = InMemoryRtDbClient::new(InMemoryRtDbClientOptions::default());
+        let result = c.upload(b"x".to_vec(), None).expect("upload ok");
+        assert!(result.content_type.is_none());
+    }
+
+    #[test]
+    fn upload_mints_distinct_ids_for_distinct_uploads() {
+        let mut c = InMemoryRtDbClient::new(InMemoryRtDbClientOptions::default());
+        let a = c.upload(b"a".to_vec(), None).expect("upload ok");
+        let b = c.upload(b"b".to_vec(), None).expect("upload ok");
+        assert_ne!(a.id, b.id, "ids distinct");
+    }
+
+    #[test]
+    fn get_file_metadata_returns_size_and_creation_time() {
+        // Mirrors the TS harness: getFileMetadata's sha256 is "" (only the
+        // upload result carries the real digest).
+        let mut c = InMemoryRtDbClient::new(InMemoryRtDbClientOptions::default());
+        let up = c
+            .upload(
+                b"abc".to_vec(),
+                Some("application/octet-stream".to_string()),
+            )
+            .expect("upload ok");
+        let meta = c.get_file_metadata(&up.id).expect("metadata ok");
+        assert_eq!(meta.id, up.id);
+        assert_eq!(meta.size, 3);
+        assert_eq!(meta.sha256, "");
+        assert_eq!(
+            meta.content_type.as_deref(),
+            Some("application/octet-stream")
+        );
+        assert!(meta.creation_time > 0);
+    }
+
+    #[test]
+    fn get_file_metadata_unknown_id_is_not_found() {
+        let c = InMemoryRtDbClient::new(InMemoryRtDbClientOptions::default());
+        let err = c.get_file_metadata("f99").unwrap_err();
+        assert_eq!(err.code, ErrorCode::NotFound);
+    }
+
+    #[test]
+    fn delete_file_removes_the_blob_and_idempotent_on_unknown_id() {
+        let mut c = InMemoryRtDbClient::new(InMemoryRtDbClientOptions::default());
+        let up = c.upload(b"x".to_vec(), None).expect("upload ok");
+        c.delete_file(&up.id).expect("delete ok");
+        // Second delete fails — NOT_FOUND (idempotent on the live server, but
+        // the in-memory harness mirrors the TS surface which throws on miss).
+        let err = c.delete_file(&up.id).unwrap_err();
+        assert_eq!(err.code, ErrorCode::NotFound);
+    }
+
+    #[test]
+    fn get_url_returns_synthetic_memory_handle() {
+        let c = InMemoryRtDbClient::new(InMemoryRtDbClientOptions::default());
+        assert_eq!(c.get_url("f1"), "memory://f1");
     }
 }
