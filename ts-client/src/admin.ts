@@ -13,6 +13,65 @@ export interface AdminMember {
   githubId?: number;
 }
 
+export interface TableStat {
+  name: string;
+  rowCount: number;
+  sizeBytes: number;
+}
+export interface DbStats {
+  tables: TableStat[];
+  totalSizeBytes: number;
+}
+export interface TokenInfo {
+  id: string;
+  name: string;
+  createdAt: number;
+  revoked: boolean;
+}
+export interface MetricsSnapshot {
+  queriesTotal: number;
+  mutationsTotal: number;
+  uploadsTotal: number;
+  wsConnections: number;
+  activeSubscriptions: number;
+  poolSize: number;
+  poolIdle: number;
+  uptimeSeconds: number;
+}
+export interface HotConfig {
+  allowedOrigins: string[];
+  sessionTtlDays: number;
+  maxFileSize: number;
+}
+export interface ConfigResponse {
+  port: number;
+  publicUrl: string;
+  githubBaseUrl: string;
+  githubApiUrl: string;
+  databaseUrlConfigured: boolean;
+  adminKeyConfigured: boolean;
+  githubConfigured: boolean;
+  googleConfigured: boolean;
+  hot: HotConfig;
+  version: string;
+  gitCommit: string;
+  admins: AdminMember[];
+}
+export interface HotConfigPatch {
+  allowedOrigins?: string[];
+  sessionTtlDays?: number;
+  maxFileSize?: number;
+}
+export type OpEventKind = "insert" | "patch" | "replace" | "delete" | "upsert";
+export interface OpEvent {
+  db: string;
+  table: string;
+  docId: string;
+  kind: OpEventKind;
+  ts: number;
+  owner?: string | null;
+}
+
 function toSchemaJson(schema: SchemaDefinition<any> | SchemaJson): SchemaJson {
   return "toJSON" in schema && typeof schema.toJSON === "function"
     ? schema.toJSON()
@@ -129,6 +188,49 @@ export class RtDbAdminClient {
     if (!response.ok) {
       await this.throwFromResponse(response);
     }
+  }
+
+  /** Read a database's pushed schema (GET /admin/dbs/{db}/schema). */
+  async getSchema(db: string): Promise<SchemaJson> {
+    return (await this.request("GET", `/admin/dbs/${encodeURIComponent(db)}/schema`)) as SchemaJson;
+  }
+
+  /** Per-table row counts + storage sizes (GET /admin/dbs/{db}/stats). */
+  async dbStats(db: string): Promise<DbStats> {
+    return (await this.request("GET", `/admin/dbs/${encodeURIComponent(db)}/stats`)) as DbStats;
+  }
+
+  /** List tokens for a database, no secrets (GET /admin/tokens?db=). */
+  async listTokens(db: string): Promise<TokenInfo[]> {
+    const body = await this.request("GET", `/admin/tokens?db=${encodeURIComponent(db)}`);
+    return (body as { tokens: TokenInfo[] }).tokens;
+  }
+
+  /** Server metrics snapshot (GET /admin/metrics). */
+  async metrics(): Promise<MetricsSnapshot> {
+    return (await this.request("GET", "/admin/metrics")) as MetricsSnapshot;
+  }
+
+  /** Redacted server config (GET /admin/config). Secrets surface as configured-bools, not values. */
+  async getConfig(): Promise<ConfigResponse> {
+    return (await this.request("GET", "/admin/config")) as ConfigResponse;
+  }
+
+  /** Patch hot-reloadable config (PATCH /admin/config). Each present field fully replaces the
+   *  prior value; the server validates (sessionTtlDays>=1, maxFileSize within bounds, origin shape). */
+  async patchConfig(patch: HotConfigPatch): Promise<ConfigResponse> {
+    return (await this.request("PATCH", "/admin/config", patch)) as ConfigResponse;
+  }
+
+  /** Recent op-feed events, newest-first (GET /admin/ops/recent). All filter opts optional. */
+  async opsRecent(opts?: { db?: string; table?: string; n?: number }): Promise<OpEvent[]> {
+    const params = new URLSearchParams();
+    if (opts?.db) params.set("db", opts.db);
+    if (opts?.table) params.set("table", opts.table);
+    if (opts?.n !== undefined) params.set("n", String(opts.n));
+    const qs = params.toString();
+    const body = await this.request("GET", `/admin/ops/recent${qs ? `?${qs}` : ""}`);
+    return (body as { ops: OpEvent[] }).ops;
   }
 
   private async throwFromResponse(response: Response): Promise<never> {

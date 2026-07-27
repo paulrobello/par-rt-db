@@ -155,4 +155,113 @@ describe("RtDbAdminClient — new endpoints", () => {
       message: "bad admin key",
     });
   });
+
+  it("getSchema GETs /admin/dbs/{db}/schema and returns the bare SchemaJson", async () => {
+    const schema = { tables: { items: { fields: { title: { type: "string" } } } } };
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(schema));
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+    await expect(admin.getSchema("kanban")).resolves.toEqual(schema);
+    expect(fetchMock.mock.calls[0][0]).toBe("http://h:8300/admin/dbs/kanban/schema");
+  });
+
+  it("dbStats GETs /admin/dbs/{db}/stats and unwraps the stats object", async () => {
+    const stats = {
+      tables: [{ name: "items", rowCount: 3, sizeBytes: 4096 }],
+      totalSizeBytes: 4096,
+    };
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(stats));
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+    await expect(admin.dbStats("kanban")).resolves.toEqual(stats);
+    expect(fetchMock.mock.calls[0][0]).toBe("http://h:8300/admin/dbs/kanban/stats");
+  });
+
+  it("listTokens GETs /admin/tokens?db= and unwraps {tokens}", async () => {
+    const tokens = [{ id: "t1", name: "ci", createdAt: 1, revoked: false }];
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ tokens }));
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+    await expect(admin.listTokens("kanban")).resolves.toEqual(tokens);
+    expect(fetchMock.mock.calls[0][0]).toBe("http://h:8300/admin/tokens?db=kanban");
+  });
+
+  it("metrics GETs /admin/metrics and returns the bare snapshot", async () => {
+    const snap = {
+      queriesTotal: 5,
+      mutationsTotal: 2,
+      uploadsTotal: 0,
+      wsConnections: 1,
+      activeSubscriptions: 1,
+      poolSize: 4,
+      poolIdle: 3,
+      uptimeSeconds: 99,
+    };
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(snap));
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+    await expect(admin.metrics()).resolves.toEqual(snap);
+    expect(fetchMock.mock.calls[0][0]).toBe("http://h:8300/admin/metrics");
+  });
+
+  it("getConfig GETs /admin/config and returns the redacted response", async () => {
+    const cfg = {
+      port: 8300,
+      publicUrl: "http://h",
+      githubBaseUrl: "",
+      githubApiUrl: "",
+      databaseUrlConfigured: true,
+      adminKeyConfigured: true,
+      githubConfigured: false,
+      googleConfigured: false,
+      hot: { allowedOrigins: [], sessionTtlDays: 30, maxFileSize: 5242880 },
+      version: "0.1.0",
+      gitCommit: "abc",
+      admins: [],
+    };
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(cfg));
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+    await expect(admin.getConfig()).resolves.toEqual(cfg);
+  });
+
+  it("patchConfig PATCHes /admin/config and returns the new ConfigResponse", async () => {
+    const cfg = {
+      port: 8300,
+      publicUrl: "http://h",
+      githubBaseUrl: "",
+      githubApiUrl: "",
+      databaseUrlConfigured: true,
+      adminKeyConfigured: true,
+      githubConfigured: false,
+      googleConfigured: false,
+      hot: { allowedOrigins: ["https://app.x"], sessionTtlDays: 30, maxFileSize: 5242880 },
+      version: "0.1.0",
+      gitCommit: "abc",
+      admins: [],
+    };
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(cfg));
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+    await expect(admin.patchConfig({ allowedOrigins: ["https://app.x"] })).resolves.toEqual(cfg);
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("http://h:8300/admin/config");
+    expect(init.method).toBe("PATCH");
+    expect(JSON.parse(init.body)).toEqual({ allowedOrigins: ["https://app.x"] });
+  });
+
+  it("opsRecent GETs /admin/ops/recent with optional db/table/n and unwraps {ops}", async () => {
+    const ops = [{ db: "kanban", table: "items", docId: "x", kind: "insert", ts: 1 }];
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ ops }));
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+    await expect(admin.opsRecent({ db: "kanban", n: 50 })).resolves.toEqual(ops);
+    expect(fetchMock.mock.calls[0][0]).toBe("http://h:8300/admin/ops/recent?db=kanban&n=50");
+  });
+
+  it("patchConfig surfaces a 400 validation envelope as RtDbError", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(
+        jsonResponse({ code: "BAD_REQUEST", message: "sessionTtlDays must be >= 1" }, 400),
+      );
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+    await expect(admin.patchConfig({ sessionTtlDays: 0 })).rejects.toMatchObject({
+      code: "BAD_REQUEST",
+      message: "sessionTtlDays must be >= 1",
+    });
+  });
 });
