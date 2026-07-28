@@ -68,7 +68,7 @@ pub fn project_optimistic_update(
     }
 }
 
-/// `get`-point-read, `unique`/`first`/`count`/`paginate`, and the
+/// `get`-point-read, `unique`/`first`/`count`/`distinct`/`paginate`, and the
 /// `search`/`vector_search` terminals are non-array shapes (or rank-based)
 /// whose result we cannot project from cached documents alone. A `filter`
 /// predicate is NOT excluded here: a filtered collect is still an array read,
@@ -78,6 +78,7 @@ fn is_array_query(q: &Query) -> bool {
         && !q.unique
         && !q.first
         && !q.count
+        && !q.distinct
         && q.paginate.is_none()
         && q.search.is_none()
         && q.vector_search.is_none()

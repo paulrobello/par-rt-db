@@ -51,6 +51,8 @@ pub struct Query {
     pub first: bool, // sugar over take(1); returns Doc(Some) or Doc(None); mutually exclusive with take/unique
     #[serde(default, skip_serializing_if = "is_false")]
     pub count: bool, // terminal: SELECT COUNT(*) over the same eq/range WHERE; mutually exclusive with get/take/unique/first/order
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub distinct: bool, // terminal: SELECT DISTINCT of index.fields[eq.len()] over the same eq/range WHERE; mutually exclusive with every other terminal
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub paginate: Option<Paginate>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -154,10 +156,11 @@ pub enum FilterExpr {
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(untagged)]
 pub enum QueryResult {
-    Doc(Option<serde_json::Value>), // get / unique: doc or null
-    Docs(Vec<serde_json::Value>),   // take / collect
-    Count(i64),                     // count: total matching rows, uncapped by MAX_TAKE
-    Paginated(PaginatedResult),     // paginate: page of docs + optional next cursor
+    Doc(Option<serde_json::Value>),   // get / unique: doc or null
+    Docs(Vec<serde_json::Value>),     // take / collect
+    Count(i64),                       // count: total matching rows, uncapped by MAX_TAKE
+    Paginated(PaginatedResult),       // paginate: page of docs + optional next cursor
+    Distinct(Vec<serde_json::Value>), // distinct: unique values of index.fields[eq.len()] over the matching set
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -202,6 +205,7 @@ enum Peer {
     Unique,
     First,
     Count,
+    Distinct,
     Paginate,
     Filter,
     Search,
@@ -223,6 +227,7 @@ impl Peer {
             Self::Unique => q.unique,
             Self::First => q.first,
             Self::Count => q.count,
+            Self::Distinct => q.distinct,
             Self::Paginate => q.paginate.is_some(),
             Self::Filter => q.filter.is_some(),
             Self::Search => q.search.is_some(),
@@ -280,15 +285,16 @@ const GET_PEERS: &[Peer] = &[
     Peer::Unique,
     Peer::First,
     Peer::Count,
+    Peer::Distinct,
     Peer::Paginate,
     Peer::Filter,
     Peer::Search,
     Peer::VectorSearch,
 ];
-const GET_MESSAGE: &str = "get cannot be combined with index, eq, range bounds, order, take, unique, first, count, paginate, filter, search, or vector search";
+const GET_MESSAGE: &str = "get cannot be combined with index, eq, range bounds, order, take, unique, first, count, distinct, paginate, filter, search, or vector search";
 
-const UNIQUE_PEERS: &[Peer] = &[Peer::Take, Peer::Order];
-const UNIQUE_MESSAGE: &str = "unique cannot be combined with take or order";
+const UNIQUE_PEERS: &[Peer] = &[Peer::Take, Peer::Order, Peer::Distinct];
+const UNIQUE_MESSAGE: &str = "unique cannot be combined with take, order, or distinct";
 
 const FIRST_INCOMPATIBLES: &[Incompatible] = &[
     Incompatible {
@@ -298,6 +304,10 @@ const FIRST_INCOMPATIBLES: &[Incompatible] = &[
     Incompatible {
         peer: Peer::Take,
         message: "first cannot be combined with take",
+    },
+    Incompatible {
+        peer: Peer::Distinct,
+        message: "first cannot be combined with distinct",
     },
 ];
 
@@ -318,6 +328,49 @@ const COUNT_INCOMPATIBLES: &[Incompatible] = &[
         peer: Peer::Order,
         message: "count cannot be combined with order",
     },
+    Incompatible {
+        peer: Peer::Distinct,
+        message: "count cannot be combined with distinct",
+    },
+];
+
+const DISTINCT_INCOMPATIBLES: &[Incompatible] = &[
+    Incompatible {
+        peer: Peer::Get,
+        message: "distinct cannot be combined with get",
+    },
+    Incompatible {
+        peer: Peer::Take,
+        message: "distinct cannot be combined with take",
+    },
+    Incompatible {
+        peer: Peer::Unique,
+        message: "distinct cannot be combined with unique",
+    },
+    Incompatible {
+        peer: Peer::First,
+        message: "distinct cannot be combined with first",
+    },
+    Incompatible {
+        peer: Peer::Count,
+        message: "distinct cannot be combined with count",
+    },
+    Incompatible {
+        peer: Peer::Order,
+        message: "distinct cannot be combined with order",
+    },
+    Incompatible {
+        peer: Peer::Paginate,
+        message: "distinct cannot be combined with paginate",
+    },
+    Incompatible {
+        peer: Peer::Search,
+        message: "distinct cannot be combined with search",
+    },
+    Incompatible {
+        peer: Peer::VectorSearch,
+        message: "distinct cannot be combined with vector search",
+    },
 ];
 
 const PAGINATE_INCOMPATIBLES: &[Incompatible] = &[
@@ -328,6 +381,10 @@ const PAGINATE_INCOMPATIBLES: &[Incompatible] = &[
     Incompatible {
         peer: Peer::Count,
         message: "paginate cannot be combined with count",
+    },
+    Incompatible {
+        peer: Peer::Distinct,
+        message: "paginate cannot be combined with distinct",
     },
     Incompatible {
         peer: Peer::Unique,
@@ -354,6 +411,7 @@ const VECTOR_SEARCH_PEERS: &[Peer] = &[
     Peer::Unique,
     Peer::First,
     Peer::Count,
+    Peer::Distinct,
     Peer::Paginate,
     Peer::Filter,
     Peer::Search,
@@ -372,11 +430,12 @@ const SEARCH_PEERS: &[Peer] = &[
     Peer::Unique,
     Peer::First,
     Peer::Count,
+    Peer::Distinct,
     Peer::Paginate,
     Peer::Filter,
     Peer::VectorSearch,
 ];
-const SEARCH_MESSAGE: &str = "search cannot be combined with index, eq, range bounds, order, unique, first, count, paginate, filter, or vector search";
+const SEARCH_MESSAGE: &str = "search cannot be combined with index, eq, range bounds, order, unique, first, count, distinct, paginate, filter, or vector search";
 
 /// Result docs = stored doc merged with {"_id", "_creationTime", "_version"}.
 /// get: point SELECT, null if missing. unique: error PreconditionFailed "unique query matched
@@ -395,6 +454,13 @@ const SEARCH_MESSAGE: &str = "search cannot be combined with index, eq, range bo
 /// other terminal (no index required, same as collect), skipping ORDER BY/LIMIT entirely and
 /// returning `Count(n)` uncapped by `MAX_TAKE`; mutually exclusive with `get`, `take`, `unique`,
 /// `first`, and `order` (a count has no rows to order).
+/// `distinct` is a terminal that runs `SELECT DISTINCT` over the index field immediately after the
+/// `eq` prefix (`index.fields[eq.len()]`) using the same eq/range WHERE clause every other terminal
+/// builds, returning `Distinct(values)` — a JSON array of those scalar values, ordered ascending
+/// for deterministic output and capped by `MAX_TAKE`. Useful for autocomplete/facet UIs. Requires
+/// both an `index` and an index field beyond the eq prefix → BadRequest otherwise. Mutually
+/// exclusive with every other terminal except `eq`/range bounds/`filter` (which narrow the
+/// matching set the distinct values are drawn from).
 /// Unknown table -> NotFound; unknown index / eq too long / get+query mix / unique+take /
 /// first+take / first+unique / count+take / count+unique / count+first / count+order -> BadRequest.
 /// `take: 0` is valid and returns an empty `Docs([])`, not an error.
@@ -425,6 +491,10 @@ pub async fn execute_query(
 
     if q.count {
         reject_per_peer_set(q, COUNT_INCOMPATIBLES)?;
+    }
+
+    if q.distinct {
+        reject_per_peer_set(q, DISTINCT_INCOMPATIBLES)?;
     }
 
     if q.paginate.is_some() {
@@ -585,6 +655,68 @@ pub async fn execute_query(
         }
         let count = query.fetch_one(pool).await?;
         return Ok(QueryResult::Count(count));
+    }
+
+    // Distinct terminal: SELECT DISTINCT of the index field immediately after
+    // the eq prefix over the same eq/range WHERE clause every other terminal
+    // builds. The combination cascade already rejected every other terminal;
+    // `distinct` composes only with `index`/`eq`/range bounds. The preconditions
+    // below reject the no-index and no-remaining-field cases with the same
+    // BadRequest shape as a missing-index `eq` bind. Capped by `MAX_TAKE` for
+    // parity with `collect` (a distinct set bounded by the matching row count).
+    if q.distinct {
+        let idx = index_def.ok_or_else(|| {
+            RtDbError::bad_request("distinct requires an index field beyond the eq prefix")
+        })?;
+        if eq_len >= idx.fields.len() {
+            return Err(RtDbError::bad_request(
+                "distinct requires an index field beyond the eq prefix",
+            ));
+        }
+        let field_name = idx.fields[eq_len].as_str();
+        // The field's existence is guaranteed by the schema's index definition
+        // (validated at schema push), so no extra lookup is needed here.
+        let col = pg_col(field_name);
+        let pg_schema_name = pg_schema(db);
+        let table_ident = pg_table(&q.table);
+        // Project the column to jsonb so a single `serde_json::Value` decoder
+        // handles text/number/boolean columns uniformly. The physical column
+        // name and schema/table identifiers are schema-validated and double-
+        // quoted; only the LIMIT is `$n`-bound.
+        let mut sql = format!(
+            "SELECT DISTINCT to_jsonb(\"{col}\") AS v FROM \"{pg_schema_name}\".\"{table_ident}\""
+        );
+        if !where_conditions.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&where_conditions.join(" AND "));
+        }
+        sql.push_str(&format!(" ORDER BY v LIMIT ${limit_placeholder}"));
+        let mut query = sqlx::query_as::<_, (serde_json::Value,)>(sql.as_str());
+        for bind in binds {
+            query = match bind {
+                EqBind::Text(v) => query.bind(v),
+                EqBind::Num(v) => query.bind(v),
+                EqBind::Bool(v) => query.bind(v),
+            };
+        }
+        for bind in range_binds {
+            query = match bind {
+                EqBind::Text(v) => query.bind(v),
+                EqBind::Num(v) => query.bind(v),
+                EqBind::Bool(v) => query.bind(v),
+            };
+        }
+        for bind in &filter_binds {
+            query = match bind {
+                EqBind::Text(v) => query.bind(v),
+                EqBind::Num(v) => query.bind(v),
+                EqBind::Bool(v) => query.bind(v),
+            };
+        }
+        query = query.bind(i64::from(MAX_TAKE));
+        let rows = query.fetch_all(pool).await?;
+        let values: Vec<serde_json::Value> = rows.into_iter().map(|(v,)| v).collect();
+        return Ok(QueryResult::Distinct(values));
     }
 
     let mut sort_cols: Vec<String> = match index_def {

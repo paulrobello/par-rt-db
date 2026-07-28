@@ -182,6 +182,7 @@ async fn document_round_trips_through_insert_patch_and_query() -> anyhow::Result
             unique: false,
             first: false,
             count: false,
+            distinct: false,
             paginate: None,
             filter: None,
             search: None,

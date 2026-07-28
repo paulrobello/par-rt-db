@@ -17,6 +17,7 @@ export interface QueryJson {
   unique?: boolean;
   first?: boolean;
   count?: boolean;
+  distinct?: boolean;
   paginate?: Paginate;
   filter?: FilterExpr;
   search?: SearchQuery;
@@ -87,6 +88,7 @@ export type QueryResultJson =
   | { type: "doc"; value: unknown | null }
   | { type: "docs"; value: unknown[] }
   | { type: "count"; value: number }
+  | { type: "distinct"; value: unknown[] }
   | { type: "paginated"; value: PaginatedResultJson };
 
 /** Mirrors server `txn::Step` (tag `op`, every step carries `table`). */

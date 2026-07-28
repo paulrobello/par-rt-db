@@ -92,7 +92,8 @@
     { "table": "embeds", "vectorSearch": { "index": "by_embedding", "vector": [ 1.0, 0.5, -0.5 ], "limit": 5 } },
     { "table": "embeds", "vectorSearch": { "index": "by_embedding", "vector": [ 1.0 ], "limit": 3, "filter": { "userId": "u1" } } },
     { "table": "workItems", "paginate": { "numItems": 10 } },
-    { "table": "workItems", "paginate": { "cursor": "abc", "numItems": 10 } }
+    { "table": "workItems", "paginate": { "cursor": "abc", "numItems": 10 } },
+    { "table": "workItems", "index": "by_project_and_status", "eq": [ "p1" ], "distinct": true }
   ],
   "rejects_client_message_unknown_field": [
     { "type": "auth", "token": "t", "db": "d", "bogus": true },

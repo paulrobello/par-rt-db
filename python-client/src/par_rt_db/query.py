@@ -74,6 +74,7 @@ class Query(BaseModel):
     unique: bool | None = None
     first: bool | None = None
     count: bool | None = None
+    distinct: bool | None = None
     filter: FilterExpr | None = None
     search: SearchQuery | None = None
     vector_search: VectorSearchQuery | None = Field(default=None, alias="vectorSearch")
@@ -115,6 +116,7 @@ class TableQuery:
         self._unique: bool = False
         self._first: bool = False
         self._count: bool = False
+        self._distinct: bool = False
         self._get: str | None = None
         self._filter: FilterExpr | None = None
         self._search: SearchQuery | None = None
@@ -201,6 +203,10 @@ class TableQuery:
         self._count = True
         return self
 
+    def distinct(self) -> TableQuery:
+        self._distinct = True
+        return self
+
     def paginate(self, *, cursor: str | None = None, num_items: int) -> TableQuery:
         self._paginate = _Paginate.model_validate({"cursor": cursor, "numItems": num_items})
         return self
@@ -214,9 +220,12 @@ class TableQuery:
             or self._unique
             or self._first
             or self._count
+            or self._distinct
             or self._paginate is not None
         ):
-            raise ValueError("get is mutually exclusive with take/unique/first/count/paginate")
+            raise ValueError(
+                "get is mutually exclusive with take/unique/first/count/distinct/paginate"
+            )
         payload: dict[str, Any] = {"table": self._table}
         if self._get is not None:
             payload["get"] = self._get
@@ -242,6 +251,8 @@ class TableQuery:
             payload["first"] = True
         if self._count:
             payload["count"] = True
+        if self._distinct:
+            payload["distinct"] = True
         if self._filter is not None:
             payload["filter"] = self._filter
         if self._search is not None:
@@ -265,21 +276,29 @@ class TableQuery:
         self._unique = True
         return self.build()
 
+    def build_for_distinct(self) -> Query:
+        self._distinct = True
+        return self.build()
 
-def parse_result(model: type, terminal: str, value: Any) -> Any:
+
+def parse_result(model: type[Any], terminal: str, value: Any) -> Any:
     """Deserialize an untagged ``QueryResult`` by the terminal that produced it.
 
     Args:
         model: A Pydantic ``BaseModel`` subclass to validate each doc against,
-            or ``dict`` to return raw dicts (no per-doc validation).
+            or ``dict`` to return raw dicts (no per-doc validation), or one of
+            ``str``/``int``/``float``/``bool``/``Any`` for the scalar values
+            returned by ``distinct``.
         terminal: One of ``get``/``collect``/``first``/``unique``/``count``/
-            ``paginate``.
+            ``distinct``/``paginate``.
         value: The raw ``QueryResult`` payload from the server.
 
     Returns:
         ``get``/``first``/``unique`` → ``model | None``;
         ``collect`` → ``list[model]``;
         ``count`` → ``int``;
+        ``distinct`` → ``list[model]`` (typically ``list[Any]`` — the unique
+        scalar values of the index field after the eq prefix);
         ``paginate`` → ``Paginated[model]``.
 
     Raises:
@@ -293,6 +312,8 @@ def parse_result(model: type, terminal: str, value: Any) -> Any:
         return None if value is None else _coerce(model, value)
     if terminal == "count":
         return int(value)
+    if terminal == "distinct":
+        return [_coerce(model, v) for v in value]
     if terminal == "paginate":
         docs = [_coerce(model, v) for v in value.get("docs", [])]
         nxt = value.get("nextCursor")

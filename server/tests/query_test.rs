@@ -154,6 +154,7 @@ async fn get_by_id_returns_doc_with_system_fields() -> anyhow::Result<()> {
             unique: false,
             first: false,
             count: false,
+            distinct: false,
             paginate: None,
             filter: None,
             search: None,
@@ -205,6 +206,7 @@ async fn get_missing_returns_null() -> anyhow::Result<()> {
             unique: false,
             first: false,
             count: false,
+            distinct: false,
             paginate: None,
             filter: None,
             search: None,
@@ -247,6 +249,7 @@ async fn get_combined_with_index_is_bad_request() -> anyhow::Result<()> {
             unique: false,
             first: false,
             count: false,
+            distinct: false,
             paginate: None,
             filter: None,
             search: None,
@@ -289,6 +292,7 @@ async fn get_combined_with_paginate_is_bad_request() -> anyhow::Result<()> {
             unique: false,
             first: false,
             count: false,
+            distinct: false,
             paginate: Some(Paginate {
                 cursor: None,
                 num_items: 10,
@@ -334,6 +338,7 @@ async fn unique_combined_with_take_is_bad_request() -> anyhow::Result<()> {
             unique: true,
             first: false,
             count: false,
+            distinct: false,
             paginate: None,
             filter: None,
             search: None,
@@ -377,6 +382,7 @@ async fn full_eq_compound_index_orders_by_created_at_asc() -> anyhow::Result<()>
             unique: false,
             first: false,
             count: false,
+            distinct: false,
             paginate: None,
             filter: None,
             search: None,
@@ -418,6 +424,7 @@ async fn full_eq_compound_index_order_desc_reverses() -> anyhow::Result<()> {
             unique: false,
             first: false,
             count: false,
+            distinct: false,
             paginate: None,
             filter: None,
             search: None,
@@ -461,6 +468,7 @@ async fn prefix_eq_on_compound_index_sorts_by_remaining_index_field_then_created
             unique: false,
             first: false,
             count: false,
+            distinct: false,
             paginate: None,
             filter: None,
             search: None,
@@ -511,6 +519,7 @@ async fn unique_on_by_name_returns_single_doc() -> anyhow::Result<()> {
             unique: true,
             first: false,
             count: false,
+            distinct: false,
             paginate: None,
             filter: None,
             search: None,
@@ -558,6 +567,7 @@ async fn unique_with_duplicate_name_is_precondition_failed() -> anyhow::Result<(
             unique: true,
             first: false,
             count: false,
+            distinct: false,
             paginate: None,
             filter: None,
             search: None,
@@ -601,6 +611,7 @@ async fn no_index_collect_returns_all_docs_in_created_at_order() -> anyhow::Resu
             unique: false,
             first: false,
             count: false,
+            distinct: false,
             paginate: None,
             filter: None,
             search: None,
@@ -642,6 +653,7 @@ async fn take_over_cap_is_bad_request() -> anyhow::Result<()> {
             unique: false,
             first: false,
             count: false,
+            distinct: false,
             paginate: None,
             filter: None,
             search: None,
@@ -684,6 +696,7 @@ async fn unknown_index_is_bad_request() -> anyhow::Result<()> {
             unique: false,
             first: false,
             count: false,
+            distinct: false,
             paginate: None,
             filter: None,
             search: None,
@@ -726,6 +739,7 @@ async fn eq_longer_than_index_fields_is_bad_request() -> anyhow::Result<()> {
             unique: false,
             first: false,
             count: false,
+            distinct: false,
             paginate: None,
             filter: None,
             search: None,
@@ -766,6 +780,7 @@ async fn unknown_table_is_not_found() -> anyhow::Result<()> {
             unique: false,
             first: false,
             count: false,
+            distinct: false,
             paginate: None,
             filter: None,
             search: None,
@@ -808,6 +823,7 @@ async fn take_zero_returns_empty_docs() -> anyhow::Result<()> {
             unique: false,
             first: false,
             count: false,
+            distinct: false,
             paginate: None,
             filter: None,
             search: None,
@@ -847,6 +863,7 @@ async fn unique_without_index_scans_whole_table() -> anyhow::Result<()> {
         unique: true,
         first: false,
         count: false,
+        distinct: false,
         paginate: None,
         filter: None,
         search: None,
@@ -896,6 +913,7 @@ async fn canonical_is_stable_for_identical_results() -> anyhow::Result<()> {
         unique: false,
         first: false,
         count: false,
+        distinct: false,
         paginate: None,
         filter: None,
         search: None,
@@ -939,6 +957,7 @@ async fn range_gt_excludes_boundary_and_sorts_by_bound_field() -> anyhow::Result
             unique: false,
             first: false,
             count: false,
+            distinct: false,
             paginate: None,
             filter: None,
             search: None,
@@ -983,6 +1002,7 @@ async fn range_gte_includes_boundary() -> anyhow::Result<()> {
             unique: false,
             first: false,
             count: false,
+            distinct: false,
             paginate: None,
             filter: None,
             search: None,
@@ -1033,6 +1053,7 @@ async fn range_gt_and_lt_bounded_numeric_range() -> anyhow::Result<()> {
             unique: false,
             first: false,
             count: false,
+            distinct: false,
             paginate: None,
             filter: None,
             search: None,
@@ -1077,6 +1098,7 @@ async fn range_bounded_numeric_range_with_order_desc_and_take() -> anyhow::Resul
             unique: false,
             first: false,
             count: false,
+            distinct: false,
             paginate: None,
             filter: None,
             search: None,
@@ -1118,6 +1140,7 @@ async fn range_without_eq_prefix_applies_to_first_index_field() -> anyhow::Resul
             unique: false,
             first: false,
             count: false,
+            distinct: false,
             paginate: None,
             filter: None,
             search: None,
@@ -1162,6 +1185,7 @@ async fn range_gt_and_gte_both_set_is_bad_request() -> anyhow::Result<()> {
             unique: false,
             first: false,
             count: false,
+            distinct: false,
             paginate: None,
             filter: None,
             search: None,
@@ -1204,6 +1228,7 @@ async fn range_lt_and_lte_both_set_is_bad_request() -> anyhow::Result<()> {
             unique: false,
             first: false,
             count: false,
+            distinct: false,
             paginate: None,
             filter: None,
             search: None,
@@ -1246,6 +1271,7 @@ async fn range_without_index_is_bad_request() -> anyhow::Result<()> {
             unique: false,
             first: false,
             count: false,
+            distinct: false,
             paginate: None,
             filter: None,
             search: None,
@@ -1288,6 +1314,7 @@ async fn range_with_no_remaining_index_field_is_bad_request() -> anyhow::Result<
             unique: false,
             first: false,
             count: false,
+            distinct: false,
             paginate: None,
             filter: None,
             search: None,
@@ -1330,6 +1357,7 @@ async fn range_combined_with_get_is_bad_request() -> anyhow::Result<()> {
             unique: false,
             first: false,
             count: false,
+            distinct: false,
             paginate: None,
             filter: None,
             search: None,
@@ -1372,6 +1400,7 @@ async fn range_value_wrong_type_is_bad_request() -> anyhow::Result<()> {
             unique: false,
             first: false,
             count: false,
+            distinct: false,
             paginate: None,
             filter: None,
             search: None,
@@ -1414,6 +1443,7 @@ async fn range_lte_includes_boundary_value() -> anyhow::Result<()> {
             unique: false,
             first: false,
             count: false,
+            distinct: false,
             paginate: None,
             filter: None,
             search: None,
@@ -1460,6 +1490,7 @@ async fn first_on_no_matching_docs_returns_null() -> anyhow::Result<()> {
             unique: false,
             first: true,
             count: false,
+            distinct: false,
             paginate: None,
             filter: None,
             search: None,
@@ -1501,6 +1532,7 @@ async fn first_with_single_matching_doc_returns_it() -> anyhow::Result<()> {
             unique: false,
             first: true,
             count: false,
+            distinct: false,
             paginate: None,
             filter: None,
             search: None,
@@ -1549,6 +1581,7 @@ async fn first_combined_with_range_bound_returns_smallest_in_ascending_order() -
             unique: false,
             first: true,
             count: false,
+            distinct: false,
             paginate: None,
             filter: None,
             search: None,
@@ -1595,6 +1628,7 @@ async fn first_combined_with_range_bound_and_order_desc_returns_largest() -> any
             unique: false,
             first: true,
             count: false,
+            distinct: false,
             paginate: None,
             filter: None,
             search: None,
@@ -1641,6 +1675,7 @@ async fn first_combined_with_take_is_bad_request() -> anyhow::Result<()> {
             unique: false,
             first: true,
             count: false,
+            distinct: false,
             paginate: None,
             filter: None,
             search: None,
@@ -1683,6 +1718,7 @@ async fn first_combined_with_unique_is_bad_request() -> anyhow::Result<()> {
             unique: true,
             first: true,
             count: false,
+            distinct: false,
             paginate: None,
             filter: None,
             search: None,
@@ -1725,6 +1761,7 @@ async fn first_combined_with_get_is_bad_request() -> anyhow::Result<()> {
             unique: false,
             first: true,
             count: false,
+            distinct: false,
             paginate: None,
             filter: None,
             search: None,
@@ -1769,6 +1806,7 @@ async fn count_on_empty_table_returns_zero() -> anyhow::Result<()> {
             unique: false,
             first: false,
             count: true,
+            distinct: false,
             paginate: None,
             filter: None,
             search: None,
@@ -1810,6 +1848,7 @@ async fn count_with_eq_prefix_counts_matching_subset() -> anyhow::Result<()> {
             unique: false,
             first: false,
             count: true,
+            distinct: false,
             paginate: None,
             filter: None,
             search: None,
@@ -1851,6 +1890,7 @@ async fn count_with_range_bound_counts_matching_subset() -> anyhow::Result<()> {
             unique: false,
             first: false,
             count: true,
+            distinct: false,
             paginate: None,
             filter: None,
             search: None,
@@ -1892,6 +1932,7 @@ async fn count_combined_with_order_is_bad_request() -> anyhow::Result<()> {
             unique: false,
             first: false,
             count: true,
+            distinct: false,
             paginate: None,
             filter: None,
             search: None,
@@ -1934,6 +1975,7 @@ async fn count_combined_with_take_is_bad_request() -> anyhow::Result<()> {
             unique: false,
             first: false,
             count: true,
+            distinct: false,
             paginate: None,
             filter: None,
             search: None,
@@ -1976,6 +2018,7 @@ async fn count_combined_with_unique_is_bad_request() -> anyhow::Result<()> {
             unique: true,
             first: false,
             count: true,
+            distinct: false,
             paginate: None,
             filter: None,
             search: None,
@@ -2018,6 +2061,7 @@ async fn count_combined_with_first_is_bad_request() -> anyhow::Result<()> {
             unique: false,
             first: true,
             count: true,
+            distinct: false,
             paginate: None,
             filter: None,
             search: None,
@@ -2060,6 +2104,7 @@ async fn count_combined_with_get_is_bad_request() -> anyhow::Result<()> {
             unique: false,
             first: false,
             count: true,
+            distinct: false,
             paginate: None,
             filter: None,
             search: None,
@@ -2069,6 +2114,295 @@ async fn count_combined_with_get_is_bad_request() -> anyhow::Result<()> {
     )
     .await
     .expect_err("expected bad request");
+    assert_eq!(err.code, ErrorCode::BadRequest);
+
+    Ok(())
+}
+
+// =============================================================================
+// Distinct terminal (`distinct: bool`) — unique values of the index field
+// immediately after the eq prefix, over the same eq/range WHERE every other
+// terminal builds. Mirrors `count`'s terminal-style tests.
+// =============================================================================
+
+fn distinct_values(result: &QueryResult) -> Vec<serde_json::Value> {
+    match result {
+        QueryResult::Distinct(values) => values.clone(),
+        other => panic!("expected Distinct variant, got {other:?}"),
+    }
+}
+
+/// Base query builder for distinct tests: every field defaulted except the
+/// distinct-relevant ones.
+fn distinct_query(
+    index: Option<&str>,
+    eq: Vec<serde_json::Value>,
+    range: impl FnOnce(&mut Query),
+) -> Query {
+    let mut q = Query {
+        table: "workItems".to_string(),
+        get: None,
+        index: index.map(str::to_string),
+        eq,
+        gt: None,
+        gte: None,
+        lt: None,
+        lte: None,
+        order: None,
+        take: None,
+        unique: false,
+        first: false,
+        count: false,
+        distinct: true,
+        paginate: None,
+        filter: None,
+        search: None,
+        vector_search: None,
+    };
+    range(&mut q);
+    q
+}
+
+// (distinct-a) unique values of the next index field, sorted ascending.
+#[tokio::test]
+async fn distinct_returns_unique_values_of_next_index_field() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+
+    let (project_id, _items) = seed_kanban(&pool, &db, &schema).await?;
+
+    // by_project_and_status has [projectId, status]; consuming projectId in the
+    // eq prefix leaves `status` as the field to distinct on. The 5 seeded items
+    // cover backlog, in_progress, done — sorted ascending as JSON strings.
+    let result = execute_query(
+        &pool,
+        &db,
+        &schema,
+        &distinct_query(
+            Some("by_project_and_status"),
+            vec![serde_json::json!(project_id)],
+            |_| {},
+        ),
+        None,
+    )
+    .await?;
+
+    assert_eq!(
+        distinct_values(&result),
+        vec![
+            serde_json::json!("backlog"),
+            serde_json::json!("done"),
+            serde_json::json!("in_progress"),
+        ]
+    );
+    Ok(())
+}
+
+// (distinct-b) distinct over a numeric index field, with the eq prefix
+// narrowing to one project. The kanban schema has no 3-field index, so the
+// 1-element eq prefix on this 2-field index is the max we can consume while
+// still leaving a field to distinct on; this case still demonstrates the
+// numeric distinct path (vs. test (a)'s string distinct).
+#[tokio::test]
+async fn distinct_with_eq_prefix_narrows_distinct_set() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+
+    let (project_id, _items) = seed_kanban(&pool, &db, &schema).await?;
+
+    // by_project_and_order has [projectId, order]; consuming projectId in the
+    // eq prefix leaves `order` as the distinct field. Each of the 5 seeded
+    // items has a distinct order (1..5), so all 5 surface, ascending.
+    let result = execute_query(
+        &pool,
+        &db,
+        &schema,
+        &distinct_query(
+            Some("by_project_and_order"),
+            vec![serde_json::json!(project_id)],
+            |_| {},
+        ),
+        None,
+    )
+    .await?;
+
+    // Compare via as_f64 — JSONB numeric representation of an integral float8
+    // value is decoded by sqlx as an i64-backed serde_json::Number (canonical
+    // JSONB text drops the `.0`), and serde_json::Number equality is variant-
+    // strict (i64 ≠ f64 even when numerically equal).
+    let orders: Vec<f64> = distinct_values(&result)
+        .iter()
+        .map(|v| v.as_f64().expect("order is numeric"))
+        .collect();
+    assert_eq!(orders, vec![1.0, 2.0, 3.0, 4.0, 5.0]);
+    Ok(())
+}
+
+// (distinct-c) range bounds on the distinct field restrict the matching set.
+#[tokio::test]
+async fn distinct_with_range_bound_restricts_matching_set() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+
+    let (project_id, _items) = seed_kanban(&pool, &db, &schema).await?;
+
+    // by_project_and_order with eq=[projectId] leaves `order` as the distinct
+    // field; gt 1 / lt 5 narrow the matching set to orders 2, 3, 4.
+    let result = execute_query(
+        &pool,
+        &db,
+        &schema,
+        &distinct_query(
+            Some("by_project_and_order"),
+            vec![serde_json::json!(project_id)],
+            |q| {
+                q.gt = Some(serde_json::json!(1.0));
+                q.lt = Some(serde_json::json!(5.0));
+            },
+        ),
+        None,
+    )
+    .await?;
+
+    // Compare via as_f64; see test (b) for the JSONB-numeric rationale.
+    let orders: Vec<f64> = distinct_values(&result)
+        .iter()
+        .map(|v| v.as_f64().expect("order is numeric"))
+        .collect();
+    assert_eq!(orders, vec![2.0, 3.0, 4.0]);
+    Ok(())
+}
+
+// (distinct-d) honors MAX_TAKE: more distinct values than the cap yield at most
+// MAX_TAKE rows (the SQL LIMIT).
+#[tokio::test]
+async fn distinct_capped_by_max_take() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+
+    let project_id = insert_project(&pool, &db, &schema, "Alpha").await?;
+    // Insert MAX_TAKE + 10 distinct orders under one project; the by_project_and_order
+    // index has order as the post-prefix field, so distinct yields one row per order.
+    for i in 0..(4096 + 10) {
+        let order = i as f64;
+        insert_work_item(&pool, &db, &schema, &project_id, "backlog", order).await?;
+    }
+
+    let result = execute_query(
+        &pool,
+        &db,
+        &schema,
+        &distinct_query(
+            Some("by_project_and_order"),
+            vec![serde_json::json!(project_id)],
+            |_| {},
+        ),
+        None,
+    )
+    .await?;
+
+    let values = distinct_values(&result);
+    assert_eq!(values.len(), 4096);
+    Ok(())
+}
+
+// (distinct-e) no index → BadRequest.
+#[tokio::test]
+async fn distinct_without_index_is_bad_request() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+
+    seed_kanban(&pool, &db, &schema).await?;
+
+    let err = execute_query(
+        &pool,
+        &db,
+        &schema,
+        &distinct_query(None, vec![], |_| {}),
+        None,
+    )
+    .await
+    .expect_err("expected bad request");
+    assert_eq!(err.code, ErrorCode::BadRequest);
+
+    Ok(())
+}
+
+// (distinct-f) eq prefix consumes every index field (no field to distinct on)
+// → BadRequest.
+#[tokio::test]
+async fn distinct_with_no_field_beyond_eq_prefix_is_bad_request() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+
+    let (project_id, _items) = seed_kanban(&pool, &db, &schema).await?;
+
+    // by_project_and_status has exactly two fields; consuming both leaves none.
+    let err = execute_query(
+        &pool,
+        &db,
+        &schema,
+        &distinct_query(
+            Some("by_project_and_status"),
+            vec![serde_json::json!(project_id), serde_json::json!("backlog")],
+            |_| {},
+        ),
+        None,
+    )
+    .await
+    .expect_err("expected bad request");
+    assert_eq!(err.code, ErrorCode::BadRequest);
+
+    Ok(())
+}
+
+// (distinct-g) distinct combined with count → BadRequest.
+#[tokio::test]
+async fn distinct_combined_with_count_is_bad_request() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+
+    seed_kanban(&pool, &db, &schema).await?;
+
+    let mut q = distinct_query(Some("by_status"), vec![], |_| {});
+    q.count = true;
+    let err = execute_query(&pool, &db, &schema, &q, None)
+        .await
+        .expect_err("expected bad request");
+    assert_eq!(err.code, ErrorCode::BadRequest);
+
+    Ok(())
+}
+
+// (distinct-h) distinct combined with take → BadRequest.
+#[tokio::test]
+async fn distinct_combined_with_take_is_bad_request() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+
+    seed_kanban(&pool, &db, &schema).await?;
+
+    let mut q = distinct_query(Some("by_status"), vec![], |_| {});
+    q.take = Some(10);
+    let err = execute_query(&pool, &db, &schema, &q, None)
+        .await
+        .expect_err("expected bad request");
     assert_eq!(err.code, ErrorCode::BadRequest);
 
     Ok(())
@@ -2100,6 +2434,7 @@ fn paginate_query(
         unique: false,
         first: false,
         count: false,
+        distinct: false,
         paginate: Some(paginate),
         filter: None,
         search: None,

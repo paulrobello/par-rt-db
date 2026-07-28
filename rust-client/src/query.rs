@@ -48,6 +48,8 @@ pub struct Query {
     pub first: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub count: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub distinct: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub paginate: Option<Paginate>,
     /// Additional db-side WHERE predicate over doc fields; composes with
@@ -193,6 +195,17 @@ impl TableQuery {
         self.q.count = true;
         self.q
     }
+    /// Distinct-values terminal: returns the unique values of the index field
+    /// immediately after the `eq` prefix over the matching set (an array of
+    /// scalar values). Server rejects when no index is set or the eq prefix
+    /// consumes every index field; mutually exclusive with every other terminal
+    /// except `eq`/range bounds/`filter`. The caller passes the desired Vec
+    /// type to `parse_result` (typically `Vec<serde_json::Value>` or
+    /// `Vec<String>`/`Vec<f64>` for a homogeneous index field).
+    pub fn distinct(mut self) -> Query {
+        self.q.distinct = true;
+        self.q
+    }
     pub fn paginate(mut self, cursor: Option<&str>, num_items: u32) -> Query {
         self.q.paginate = Some(Paginate {
             cursor: cursor.map(|c| c.into()),
@@ -280,6 +293,27 @@ mod tests {
             serde_json::to_value(&q).unwrap(),
             json!({"table":"items","index":"by_status","eq":["backlog"],"count":true})
         );
+    }
+
+    #[test]
+    fn distinct_terminal() {
+        // `distinct` consumes one eq prefix value and distincts on the next
+        // index field. Wire shape: omitted unless true (skip_serializing_if).
+        let q = TableQuery::new("items")
+            .with_index("by_project_and_status", &[json!("p1")])
+            .distinct();
+        assert_eq!(
+            serde_json::to_value(&q).unwrap(),
+            json!({"table":"items","index":"by_project_and_status","eq":["p1"],"distinct":true})
+        );
+    }
+
+    #[test]
+    fn parse_distinct_from_array() {
+        // Distinct result is a JSON array of scalar values (server QueryResult::Distinct).
+        let values: Vec<serde_json::Value> =
+            parse_result(serde_json::json!(["alice", "bob", "carol"])).unwrap();
+        assert_eq!(values, vec![json!("alice"), json!("bob"), json!("carol")]);
     }
 
     #[test]

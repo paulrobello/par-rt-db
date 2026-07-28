@@ -163,6 +163,14 @@ const CASES: readonly Case[] = [
     expected: Outcome.Accept,
   },
   {
+    name: "solo: distinct",
+    build: (q) => {
+      q.distinct = true;
+      q.index = "by_title";
+    },
+    expected: Outcome.Accept,
+  },
+  {
     name: "solo: paginate",
     build: (q) => {
       q.paginate = paginateNum1();
@@ -345,7 +353,7 @@ const CASES: readonly Case[] = [
     },
     expected: Outcome.Reject,
   },
-  // ============ count rejects unique, take, first, order ============
+  // ============ count rejects unique, take, first, order, distinct ============
   {
     name: "count+unique",
     build: (q) => {
@@ -375,6 +383,97 @@ const CASES: readonly Case[] = [
     build: (q) => {
       q.count = true;
       q.order = "asc";
+    },
+    expected: Outcome.Reject,
+  },
+  {
+    name: "count+distinct",
+    build: (q) => {
+      q.count = true;
+      q.distinct = true;
+    },
+    expected: Outcome.Reject,
+  },
+  // ============ distinct rejects get, take, unique, first, count, order,
+  //              paginate, search, vectorSearch (standalone terminal like count) ============
+  {
+    name: "distinct+get",
+    build: (q) => {
+      q.distinct = true;
+      q.index = "by_title";
+      q.get = ID;
+    },
+    expected: Outcome.Reject,
+  },
+  {
+    name: "distinct+take",
+    build: (q) => {
+      q.distinct = true;
+      q.index = "by_title";
+      q.take = 1;
+    },
+    expected: Outcome.Reject,
+  },
+  {
+    name: "distinct+unique",
+    build: (q) => {
+      q.distinct = true;
+      q.index = "by_title";
+      q.unique = true;
+    },
+    expected: Outcome.Reject,
+  },
+  {
+    name: "distinct+first",
+    build: (q) => {
+      q.distinct = true;
+      q.index = "by_title";
+      q.first = true;
+    },
+    expected: Outcome.Reject,
+  },
+  {
+    name: "distinct+count",
+    build: (q) => {
+      q.distinct = true;
+      q.index = "by_title";
+      q.count = true;
+    },
+    expected: Outcome.Reject,
+  },
+  {
+    name: "distinct+order",
+    build: (q) => {
+      q.distinct = true;
+      q.index = "by_title";
+      q.order = "asc";
+    },
+    expected: Outcome.Reject,
+  },
+  {
+    name: "distinct+paginate",
+    build: (q) => {
+      q.distinct = true;
+      q.index = "by_title";
+      q.paginate = paginateNum1();
+    },
+    expected: Outcome.Reject,
+  },
+  {
+    name: "distinct+search",
+    build: (q) => {
+      q.distinct = true;
+      q.index = "by_title";
+      q.search = searchBodyX();
+    },
+    expected: Outcome.Reject,
+  },
+  {
+    name: "distinct+vectorSearch",
+    build: (q) => {
+      q.distinct = true;
+      q.index = "by_title";
+      q.vectorSearch = vectorEmbeddingLimit1();
     },
     expected: Outcome.Reject,
   },

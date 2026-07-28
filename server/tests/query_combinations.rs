@@ -75,6 +75,7 @@ fn base_query() -> Query {
         unique: false,
         first: false,
         count: false,
+        distinct: false,
         paginate: None,
         filter: None,
         search: None,
@@ -190,6 +191,11 @@ const CASES: &[Case] = &[
     Case {
         name: "solo: count",
         build: solo_count,
+        expected: Outcome::Accept,
+    },
+    Case {
+        name: "solo: distinct",
+        build: solo_distinct,
         expected: Outcome::Accept,
     },
     Case {
@@ -310,7 +316,7 @@ const CASES: &[Case] = &[
         build: first_take,
         expected: Outcome::Reject,
     },
-    // ============ count rejects unique, take, first, order ============
+    // ============ count rejects unique, take, first, order, distinct ============
     Case {
         name: "count+unique",
         build: count_unique,
@@ -329,6 +335,58 @@ const CASES: &[Case] = &[
     Case {
         name: "count+order",
         build: count_order,
+        expected: Outcome::Reject,
+    },
+    Case {
+        name: "count+distinct",
+        build: count_distinct,
+        expected: Outcome::Reject,
+    },
+    // ============ distinct rejects get, take, unique, first, count, order,
+    //              paginate, search, vectorSearch (standalone terminal like count) ============
+    Case {
+        name: "distinct+get",
+        build: distinct_get,
+        expected: Outcome::Reject,
+    },
+    Case {
+        name: "distinct+take",
+        build: distinct_take,
+        expected: Outcome::Reject,
+    },
+    Case {
+        name: "distinct+unique",
+        build: distinct_unique,
+        expected: Outcome::Reject,
+    },
+    Case {
+        name: "distinct+first",
+        build: distinct_first,
+        expected: Outcome::Reject,
+    },
+    Case {
+        name: "distinct+count",
+        build: distinct_count,
+        expected: Outcome::Reject,
+    },
+    Case {
+        name: "distinct+order",
+        build: distinct_order,
+        expected: Outcome::Reject,
+    },
+    Case {
+        name: "distinct+paginate",
+        build: distinct_paginate,
+        expected: Outcome::Reject,
+    },
+    Case {
+        name: "distinct+search",
+        build: distinct_search,
+        expected: Outcome::Reject,
+    },
+    Case {
+        name: "distinct+vectorSearch",
+        build: distinct_vector,
         expected: Outcome::Reject,
     },
     // ============ paginate rejects count, unique, first, take (get covered above) ============
@@ -578,6 +636,12 @@ fn solo_first(q: &mut Query) {
 fn solo_count(q: &mut Query) {
     q.count = true;
 }
+fn solo_distinct(q: &mut Query) {
+    // `distinct` requires an index with at least one field beyond the eq prefix;
+    // `by_title` has one field, so a no-eq prefix distinct over title is valid.
+    q.distinct = true;
+    q.index = Some("by_title".to_string());
+}
 fn solo_paginate(q: &mut Query) {
     q.paginate = Some(paginate_num_1());
 }
@@ -685,6 +749,58 @@ fn count_first(q: &mut Query) {
 fn count_order(q: &mut Query) {
     q.count = true;
     q.order = Some(Order::Asc);
+}
+fn count_distinct(q: &mut Query) {
+    q.count = true;
+    q.distinct = true;
+}
+
+// distinct + peer (rejects every other terminal; composes only with
+// index/eq/range/filter — filter is exercised under composition accepts below).
+fn distinct_get(q: &mut Query) {
+    q.distinct = true;
+    q.index = Some("by_title".to_string());
+    q.get = Some(ID.to_string());
+}
+fn distinct_take(q: &mut Query) {
+    q.distinct = true;
+    q.index = Some("by_title".to_string());
+    q.take = Some(1);
+}
+fn distinct_unique(q: &mut Query) {
+    q.distinct = true;
+    q.index = Some("by_title".to_string());
+    q.unique = true;
+}
+fn distinct_first(q: &mut Query) {
+    q.distinct = true;
+    q.index = Some("by_title".to_string());
+    q.first = true;
+}
+fn distinct_count(q: &mut Query) {
+    q.distinct = true;
+    q.index = Some("by_title".to_string());
+    q.count = true;
+}
+fn distinct_order(q: &mut Query) {
+    q.distinct = true;
+    q.index = Some("by_title".to_string());
+    q.order = Some(Order::Asc);
+}
+fn distinct_paginate(q: &mut Query) {
+    q.distinct = true;
+    q.index = Some("by_title".to_string());
+    q.paginate = Some(paginate_num_1());
+}
+fn distinct_search(q: &mut Query) {
+    q.distinct = true;
+    q.index = Some("by_title".to_string());
+    q.search = Some(search_body_x());
+}
+fn distinct_vector(q: &mut Query) {
+    q.distinct = true;
+    q.index = Some("by_title".to_string());
+    q.vector_search = Some(vector_embedding_limit_1());
 }
 fn paginate_count(q: &mut Query) {
     q.paginate = Some(paginate_num_1());

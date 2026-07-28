@@ -902,6 +902,7 @@ export class InMemoryRtDbClient {
         q.unique ||
         q.first ||
         q.count ||
+        q.distinct ||
         q.paginate !== undefined ||
         q.filter !== undefined ||
         q.search !== undefined ||
@@ -909,7 +910,7 @@ export class InMemoryRtDbClient {
       ) {
         throw new RtDbError(
           "BAD_REQUEST",
-          "get cannot be combined with index, eq, range bounds, order, take, unique, first, count, paginate, filter, search, or vector search",
+          "get cannot be combined with index, eq, range bounds, order, take, unique, first, count, distinct, paginate, filter, search, or vector search",
         );
       }
       const row = this.rowsFor(q.table).get(q.get);
@@ -917,13 +918,19 @@ export class InMemoryRtDbClient {
     }
 
     if (q.unique && (q.take !== undefined || q.order !== undefined)) {
-      throw new RtDbError("BAD_REQUEST", "unique cannot be combined with take or order");
+      throw new RtDbError("BAD_REQUEST", "unique cannot be combined with take, order, or distinct");
+    }
+    if (q.unique && q.distinct) {
+      throw new RtDbError("BAD_REQUEST", "unique cannot be combined with take, order, or distinct");
     }
     if (q.first && q.unique) {
       throw new RtDbError("BAD_REQUEST", "first cannot be combined with unique");
     }
     if (q.first && q.take !== undefined) {
       throw new RtDbError("BAD_REQUEST", "first cannot be combined with take");
+    }
+    if (q.first && q.distinct) {
+      throw new RtDbError("BAD_REQUEST", "first cannot be combined with distinct");
     }
     if (q.count && q.unique) {
       throw new RtDbError("BAD_REQUEST", "count cannot be combined with unique");
@@ -937,12 +944,39 @@ export class InMemoryRtDbClient {
     if (q.count && q.order !== undefined) {
       throw new RtDbError("BAD_REQUEST", "count cannot be combined with order");
     }
+    if (q.count && q.distinct) {
+      throw new RtDbError("BAD_REQUEST", "count cannot be combined with distinct");
+    }
+    // `distinct` is a standalone terminal like `count`: it rejects every other
+    // terminal except `index`/`eq`/range bounds/`filter` (which compose by
+    // narrowing the matching set). The `get`/`unique`/`first`/`count` peers
+    // above already throw on `+distinct`; this branch covers the rest.
+    if (q.distinct) {
+      if (q.take !== undefined) {
+        throw new RtDbError("BAD_REQUEST", "distinct cannot be combined with take");
+      }
+      if (q.order !== undefined) {
+        throw new RtDbError("BAD_REQUEST", "distinct cannot be combined with order");
+      }
+      if (q.paginate !== undefined) {
+        throw new RtDbError("BAD_REQUEST", "distinct cannot be combined with paginate");
+      }
+      if (q.search !== undefined) {
+        throw new RtDbError("BAD_REQUEST", "distinct cannot be combined with search");
+      }
+      if (q.vectorSearch !== undefined) {
+        throw new RtDbError("BAD_REQUEST", "distinct cannot be combined with vector search");
+      }
+    }
     if (q.paginate !== undefined) {
       // Combination guards mirror server `validate_query`: paginate is one-shot
       // paging, so it can't also narrow to count/unique/first/take. (`get` is
       // rejected above; `order`, index, eq, and range bounds are allowed.)
       if (q.count) {
         throw new RtDbError("BAD_REQUEST", "paginate cannot be combined with count");
+      }
+      if (q.distinct) {
+        throw new RtDbError("BAD_REQUEST", "paginate cannot be combined with distinct");
       }
       if (q.unique) {
         throw new RtDbError("BAD_REQUEST", "paginate cannot be combined with unique");
@@ -979,6 +1013,7 @@ export class InMemoryRtDbClient {
         q.unique ||
         q.first ||
         q.count ||
+        q.distinct ||
         q.paginate !== undefined ||
         q.filter !== undefined ||
         q.search !== undefined ||
@@ -1007,13 +1042,14 @@ export class InMemoryRtDbClient {
         q.unique ||
         q.first ||
         q.count ||
+        q.distinct ||
         q.paginate !== undefined ||
         q.filter !== undefined ||
         q.vectorSearch !== undefined
       ) {
         throw new RtDbError(
           "BAD_REQUEST",
-          "search cannot be combined with index, eq, range bounds, order, unique, first, count, paginate, filter, or vector search",
+          "search cannot be combined with index, eq, range bounds, order, unique, first, count, distinct, paginate, filter, or vector search",
         );
       }
       // No in-memory full-text ranking; return an empty result rather than
@@ -1107,6 +1143,38 @@ export class InMemoryRtDbClient {
 
     if (q.count) {
       return filtered.length;
+    }
+
+    // Distinct terminal: return the unique values of the index field immediately
+    // after the eq prefix over the matching set. Server-side preconditions
+    // (index set AND eqLen < fields.length) are mirrored here as BAD_REQUEST so
+    // the in-memory cascade agrees with the server's accept/reject decision.
+    if (q.distinct) {
+      if (!indexDef) {
+        throw new RtDbError("BAD_REQUEST", "distinct requires an index field beyond the eq prefix");
+      }
+      if (eqLen >= indexDef.fields.length) {
+        throw new RtDbError("BAD_REQUEST", "distinct requires an index field beyond the eq prefix");
+      }
+      const field = indexDef.fields[eqLen];
+      const seen = new Set<unknown>();
+      const values: unknown[] = [];
+      for (const row of filtered) {
+        const v = row.doc[field];
+        // Skip null/undefined index values — they cannot match a typed column
+        // on the server (NULL filtering mirrors `WHERE "<col>" IS NOT NULL`).
+        if (v === null || v === undefined) continue;
+        const key =
+          typeof v === "number" || typeof v === "string" || typeof v === "boolean"
+            ? v
+            : JSON.stringify(v);
+        if (!seen.has(key)) {
+          seen.add(key);
+          values.push(v);
+        }
+      }
+      values.sort((a, b) => compareIndexValues(a, b));
+      return values.slice(0, MAX_TAKE);
     }
 
     // Sort keys: unbound index fields (after the eq prefix), then createdAt, id.

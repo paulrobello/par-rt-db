@@ -82,6 +82,27 @@ def test_query_count_and_first_and_unique_terminals():
     )
 
 
+def test_query_distinct_terminal():
+    # `distinct` consumes one eq prefix value and distincts on the next index
+    # field. Wire shape: omitted unless true (mirrors count/first/unique).
+    wire = (
+        TableQuery("t")
+        .with_index("i")
+        .eq("a")
+        .build_for_distinct()
+        .model_dump(by_alias=True, mode="json")
+    )
+    assert wire["distinct"] is True
+    # A bare query with no terminal must NOT emit `distinct` (omit-when-false).
+    assert "distinct" not in TableQuery("t").build().model_dump(by_alias=True, mode="json")
+
+
+def test_query_get_rejects_distinct():
+    # `get` is mutually exclusive with `distinct`, same shape as count/first/unique.
+    with pytest.raises(ValueError):
+        TableQuery("t").get("x").distinct().build()
+
+
 def test_query_paginate():
     q = TableQuery("t").with_index("i").eq("a").order("desc").paginate(num_items=20)
     wire = q.build().model_dump(by_alias=True, mode="json")
@@ -156,6 +177,20 @@ def test_parse_result_doc_docs_count_paginated():
     assert isinstance(page, Paginated) and len(page.docs) == 1 and page.next_cursor == "C"
     page_end = parse_result(Box, "paginate", {"docs": []})
     assert page_end.next_cursor is None
+
+
+def test_parse_result_distinct_returns_scalar_list():
+    # Distinct result is a JSON array of scalar values from the server
+    # (QueryResult::Distinct). Use `object` for a heterogeneous set (the
+    # TypeAdapter path returns the raw value), or `str`/`float` for a
+    # homogeneous index field.
+    assert parse_result(object, "distinct", ["alice", "bob", "carol"]) == [
+        "alice",
+        "bob",
+        "carol",
+    ]
+    assert parse_result(float, "distinct", [1.0, 2.0, 3.0]) == [1.0, 2.0, 3.0]
+    assert parse_result(object, "distinct", []) == []
 
 
 def test_parse_result_dict_model_returns_raw_dicts():

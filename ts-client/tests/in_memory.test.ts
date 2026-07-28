@@ -163,6 +163,40 @@ describe("InMemoryRtDbClient — query by index", () => {
     expect(n).toBe(3);
   });
 
+  it("distinct returns the unique values of the next index field over the matching set", async () => {
+    const c = newClient();
+    await seed(c); // 3× todo (orders 3, 1, 2)
+    // by_status_and_order has [status, order]; consuming `status` leaves `order`
+    // as the distinct field. The set of unique orders within todo rows is
+    // {1, 2, 3}, returned ascending.
+    const values = await c.query(
+      api.items.query().withIndex("by_status_and_order", ["todo"]).distinct(),
+    );
+    expect(values).toEqual([1, 2, 3]);
+  });
+
+  it("distinct narrows to the matching set when given a range bound on the distinct field", async () => {
+    const c = newClient();
+    await seed(c);
+    const values = await c.query(
+      api.items.query().withIndex("by_status_and_order", ["todo"]).gt(1).distinct(),
+    );
+    // Orders > 1 within todo rows = {2, 3}.
+    expect(values).toEqual([2, 3]);
+  });
+
+  it("distinct rejects when the eq prefix consumes every index field", async () => {
+    const c = newClient();
+    await seed(c);
+    await expect(
+      c.query(api.items.query().withIndex("by_status_and_order", ["todo", 1]).distinct()),
+    ).rejects.toMatchObject({
+      name: "RtDbError",
+      code: "BAD_REQUEST",
+      message: /distinct requires an index field beyond the eq prefix/,
+    });
+  });
+
   it("unique throws PRECONDITION_FAILED when more than one doc matches", async () => {
     const c = newClient();
     await c.mutate(mutation().insert("items", { name: "dup", status: "todo", order: 1 }).build());

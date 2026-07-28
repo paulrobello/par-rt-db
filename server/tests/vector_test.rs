@@ -410,6 +410,7 @@ fn empty_query() -> Query {
         unique: false,
         first: false,
         count: false,
+        distinct: false,
         paginate: None,
         filter: None,
         search: None,

@@ -82,6 +82,15 @@ export class TableQuery<DocT, Indexes extends string> {
     return { json: { ...this.json, count: true } };
   }
 
+  /** Distinct-values terminal: returns the unique values of the index field
+   * immediately after the `eq` prefix over the matching set (an array of
+   * scalar values, e.g. `["alice","bob"]`). Server rejects when no index is
+   * set or the eq prefix consumes every index field; mutually exclusive with
+   * every other terminal except `eq`/range bounds/`filter`. */
+  distinct(): RtQuery<unknown[]> {
+    return { json: { ...this.json, distinct: true } };
+  }
+
   paginate(cursor: string | undefined, numItems: number): RtQuery<PaginatedResultJson> {
     return {
       json: {

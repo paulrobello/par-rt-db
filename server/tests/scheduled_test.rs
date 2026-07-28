@@ -262,6 +262,7 @@ async fn poll_for_n(
         unique: false,
         first: false,
         count: false,
+        distinct: false,
         paginate: None,
         filter: None,
         search: None,
