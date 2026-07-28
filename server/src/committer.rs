@@ -1,10 +1,12 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use sqlx::PgPool;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::{Mutex, mpsc, oneshot};
 
+use crate::config::HotConfig;
 use crate::db::{SchemaCache, database_exists, now_ms};
 use crate::error::RtDbError;
 use crate::mutation_log;
@@ -58,6 +60,7 @@ pub struct Committers {
     subs: Arc<SubscriptionManager>,
     schemas: SchemaCache,
     op_feed: Arc<crate::op_feed::OpFeed>,
+    hot: Arc<ArcSwap<HotConfig>>,
     channels: Mutex<HashMap<String, mpsc::Sender<CommitterRequest>>>,
 }
 
@@ -67,12 +70,14 @@ impl Committers {
         subs: Arc<SubscriptionManager>,
         schemas: SchemaCache,
         op_feed: Arc<crate::op_feed::OpFeed>,
+        hot: Arc<ArcSwap<HotConfig>>,
     ) -> Self {
         Self {
             pool,
             subs,
             schemas,
             op_feed,
+            hot,
             channels: Mutex::new(HashMap::new()),
         }
     }
@@ -131,6 +136,7 @@ impl Committers {
             self.subs.clone(),
             self.schemas.clone(),
             self.op_feed.clone(),
+            self.hot.clone(),
             rx,
         ));
         tokio::spawn(scheduler::run_scheduler(
@@ -214,14 +220,16 @@ impl Committers {
 }
 
 /// Shared, unchanging context for one per-db committer task: the pool, the
-/// database name, and the schema/subscription state, bundled to keep the
-/// per-request handlers' argument lists small.
+/// database name, the schema/subscription state, and the live hot config
+/// (read for the dedup TTL at `mutation_log::store` time), bundled to keep
+/// the per-request handlers' argument lists small.
 struct CommitterCtx {
     pool: PgPool,
     db: String,
     subs: Arc<SubscriptionManager>,
     schemas: SchemaCache,
     op_feed: Arc<crate::op_feed::OpFeed>,
+    hot: Arc<ArcSwap<HotConfig>>,
 }
 
 /// The per-db committer task loop: processes exactly one `CommitterRequest`
@@ -241,6 +249,7 @@ async fn run_committer(
     subs: Arc<SubscriptionManager>,
     schemas: SchemaCache,
     op_feed: Arc<crate::op_feed::OpFeed>,
+    hot: Arc<ArcSwap<HotConfig>>,
     mut rx: mpsc::Receiver<CommitterRequest>,
 ) {
     if let Err(err) = mutation_log::ensure_table(&pool, &db).await {
@@ -255,6 +264,7 @@ async fn run_committer(
         subs,
         schemas,
         op_feed,
+        hot,
     };
     while let Some(req) = rx.recv().await {
         match req {
@@ -322,18 +332,15 @@ async fn handle_mutate(
         .await;
 
     if let Some(key) = &idempotency_key {
+        // The dedup TTL is read live from hot config so a `PATCH /admin/config`
+        // to `idempotencyTtlMs` takes effect on the next mutate, no restart.
         // The mutation already committed and fanned out by this point — a
         // caching failure here must never turn a successful write into a
         // client-visible error. Best-effort: log and move on. (A retry with
         // this key will simply re-execute, same as if it had never cached.)
-        if let Err(err) = mutation_log::store(
-            &ctx.pool,
-            &ctx.db,
-            key,
-            &outcome.results,
-            mutation_log::DEDUP_TTL_MS,
-        )
-        .await
+        let ttl_ms = ctx.hot.load().idempotency_ttl_ms;
+        if let Err(err) =
+            mutation_log::store(&ctx.pool, &ctx.db, key, &outcome.results, ttl_ms).await
         {
             tracing::error!(
                 db = %ctx.db,

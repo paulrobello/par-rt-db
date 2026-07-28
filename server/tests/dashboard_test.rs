@@ -752,12 +752,17 @@ async fn hot_config_round_trips_through_rtdb_config() -> anyhow::Result<()> {
         ],
         session_ttl_days: 7,
         max_file_size: 12345,
+        idempotency_ttl_ms: rtdb_server::mutation_log::DEFAULT_DEDUP_TTL_MS,
     };
     rtdb_server::config::save_hot(&state.pool, &hot).await?;
     let loaded = rtdb_server::config::load_hot(&state.pool).await?.unwrap();
     assert_eq!(loaded.allowed_origins, hot.allowed_origins);
     assert_eq!(loaded.session_ttl_days, 7);
     assert_eq!(loaded.max_file_size, 12345);
+    assert_eq!(
+        loaded.idempotency_ttl_ms,
+        rtdb_server::mutation_log::DEFAULT_DEDUP_TTL_MS
+    );
 
     sqlx::query("DELETE FROM rtdb_config WHERE id = 1")
         .execute(&state.pool)
@@ -818,6 +823,35 @@ async fn config_get_and_patch_round_trip() -> anyhow::Result<()> {
     let loaded = rtdb_server::config::load_hot(&state.pool).await?.unwrap();
     assert_eq!(loaded.session_ttl_days, 7);
 
+    // PATCH idempotencyTtlMs; response reflects it, GET returns it, and it
+    // persisted to the table. Proves the dedup TTL is a hot-config value.
+    let resp = reqwest::Client::new()
+        .request(
+            reqwest::Method::PATCH,
+            format!("http://{addr}/admin/config"),
+        )
+        .header("Authorization", bearer)
+        .json(&serde_json::json!({ "idempotencyTtlMs": 60000 }))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        resp.json::<serde_json::Value>().await?["hot"]["idempotencyTtlMs"],
+        60000
+    );
+    let resp = reqwest::Client::new()
+        .get(format!("http://{addr}/admin/config"))
+        .header("Authorization", bearer)
+        .send()
+        .await?;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        resp.json::<serde_json::Value>().await?["hot"]["idempotencyTtlMs"],
+        60000
+    );
+    let loaded = rtdb_server::config::load_hot(&state.pool).await?.unwrap();
+    assert_eq!(loaded.idempotency_ttl_ms, 60000);
+
     // Invalid value -> 400.
     let resp = reqwest::Client::new()
         .request(
@@ -826,6 +860,18 @@ async fn config_get_and_patch_round_trip() -> anyhow::Result<()> {
         )
         .header("Authorization", bearer)
         .json(&serde_json::json!({ "sessionTtlDays": 0 }))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    // idempotencyTtlMs <= 0 -> 400 (must be positive).
+    let resp = reqwest::Client::new()
+        .request(
+            reqwest::Method::PATCH,
+            format!("http://{addr}/admin/config"),
+        )
+        .header("Authorization", bearer)
+        .json(&serde_json::json!({ "idempotencyTtlMs": 0 }))
         .send()
         .await?;
     assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);

@@ -19,7 +19,7 @@ explicitly-deferred sub-items. Effort is rough: `small` ≤1 day, `medium` 1–3
 - [ ] **Per-token and per-database rate limiting / quotas** — the only limiter today is a per-connection WS frame cap (200/10s); add configurable per-machine-token and per-db ceilings so one noisy app on a multi-db instance can't starve the others. (effort: medium)
 - [ ] **Database deletion + lifecycle management** — `create-db` and `list-dbs` exist but there is no `delete-db`; add an admin endpoint (with a typed confirmation/guard) and a confirmation-driven UI so stale databases can be retired without `psql`. (effort: small)
 - [ ] **WebSocket `permessage-deflate` compression** — enable axum/tungstenite's deflate negotiation to cut bandwidth for large result sets and high-frequency pushes. (effort: small)
-- [ ] **Configurable idempotency-key TTL** — the mutation dedup window is hard-coded to 5 minutes; make it a hot-config value (alongside `max_file_size` etc.) so long-running retry workflows can tune it. (effort: small)
+- [x] **Configurable idempotency-key TTL** — the mutation dedup window is hard-coded to 5 minutes; make it a hot-config value (alongside `max_file_size` etc.) so long-running retry workflows can tune it. (effort: small)
 
 ## Query DSL
 

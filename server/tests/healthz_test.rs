@@ -25,6 +25,7 @@ fn test_hot() -> HotConfig {
         allowed_origins: vec!["http://localhost:5173".into()],
         session_ttl_days: 30,
         max_file_size: 50 * 1024 * 1024,
+        idempotency_ttl_ms: rtdb_server::mutation_log::DEFAULT_DEDUP_TTL_MS,
     }
 }
 

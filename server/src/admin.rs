@@ -706,6 +706,7 @@ struct HotConfigPatch {
     allowed_origins: Option<Vec<String>>,
     session_ttl_days: Option<i64>,
     max_file_size: Option<usize>,
+    idempotency_ttl_ms: Option<i64>,
 }
 
 /// `PATCH /admin/config` — apply a subset patch to the hot config, validate,
@@ -747,6 +748,12 @@ async fn patch_config(
             )));
         }
         next.max_file_size = size;
+    }
+    if let Some(ttl) = patch.idempotency_ttl_ms {
+        if ttl <= 0 {
+            return Err(RtDbError::bad_request("idempotencyTtlMs must be > 0"));
+        }
+        next.idempotency_ttl_ms = ttl;
     }
     if !next.origins_valid() {
         return Err(RtDbError::bad_request(

@@ -111,6 +111,7 @@ pub struct HotConfig {
     pub allowed_origins: Vec<String>, // RTDB_ALLOWED_ORIGINS, comma-separated, default empty
     pub session_ttl_days: i64,        // RTDB_SESSION_TTL_DAYS, default 30
     pub max_file_size: usize,         // RTDB_MAX_FILE_SIZE, default 50 MiB
+    pub idempotency_ttl_ms: i64, // RTDB_IDEMPOTENCY_TTL_MS, default mutation_log::DEFAULT_DEDUP_TTL_MS (5 min)
 }
 
 impl HotConfig {
@@ -142,10 +143,17 @@ impl HotConfig {
         // re-clamps at the buffering point so the on-disk worst case is bounded
         // regardless of what the persisted row says.
         let max_file_size = max_file_size.min(HARD_MAX_FILE_SIZE);
+        let idempotency_ttl_ms = match std::env::var("RTDB_IDEMPOTENCY_TTL_MS") {
+            Ok(v) => v
+                .parse::<i64>()
+                .unwrap_or(crate::mutation_log::DEFAULT_DEDUP_TTL_MS),
+            Err(_) => crate::mutation_log::DEFAULT_DEDUP_TTL_MS,
+        };
         Self {
             allowed_origins,
             session_ttl_days,
             max_file_size,
+            idempotency_ttl_ms,
         }
     }
 
@@ -289,6 +297,7 @@ mod tests {
             allowed_origins: vec!["https://a.com".into(), "https://b.com".into()],
             session_ttl_days: 30,
             max_file_size: 1024,
+            idempotency_ttl_ms: crate::mutation_log::DEFAULT_DEDUP_TTL_MS,
         };
         assert!(hot.origins_valid());
         hot.allowed_origins.push("https://c.com\"".into());

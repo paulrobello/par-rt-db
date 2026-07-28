@@ -82,8 +82,14 @@ impl AppState {
         let schemas = SchemaCache::new();
         let subs = SubscriptionManager::new();
         let op_feed = op_feed::OpFeed::new(1024, 500);
-        let committers =
-            Committers::new(pool.clone(), subs.clone(), schemas.clone(), op_feed.clone());
+        let hot = Arc::new(ArcSwap::from_pointee(hot));
+        let committers = Committers::new(
+            pool.clone(),
+            subs.clone(),
+            schemas.clone(),
+            op_feed.clone(),
+            hot.clone(),
+        );
         let metrics = metrics::Metrics::new();
         Arc::new(Self {
             pool,
@@ -95,7 +101,7 @@ impl AppState {
                 op_feed,
             },
             runtime: Runtime {
-                hot: Arc::new(ArcSwap::from_pointee(hot)),
+                hot,
                 metrics,
                 started_at: SystemTime::now(),
             },

@@ -43,6 +43,7 @@ export interface HotConfig {
   allowedOrigins: string[];
   sessionTtlDays: number;
   maxFileSize: number;
+  idempotencyTtlMs: number;
 }
 export interface ConfigResponse {
   port: number;
@@ -62,6 +63,7 @@ export interface HotConfigPatch {
   allowedOrigins?: string[];
   sessionTtlDays?: number;
   maxFileSize?: number;
+  idempotencyTtlMs?: number;
 }
 export type OpEventKind = "insert" | "patch" | "replace" | "delete" | "upsert";
 export interface OpEvent {

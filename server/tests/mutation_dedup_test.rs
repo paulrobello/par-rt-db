@@ -39,7 +39,7 @@ async fn store_then_check_returns_cached_results() -> anyhow::Result<()> {
         &db,
         "mut-2",
         &results,
-        mutation_log::DEDUP_TTL_MS,
+        mutation_log::DEFAULT_DEDUP_TTL_MS,
     )
     .await?;
 

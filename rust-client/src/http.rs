@@ -1869,7 +1869,8 @@ mod admin_tests {
                 "hot": {
                     "allowedOrigins": ["https://app.example"],
                     "sessionTtlDays": 30,
-                    "maxFileSize": 5242880
+                    "maxFileSize": 5242880,
+                    "idempotencyTtlMs": 300000
                 },
                 "version": "0.1.0",
                 "gitCommit": "abc1234",
@@ -1889,6 +1890,7 @@ mod admin_tests {
         );
         assert_eq!(cfg.hot.session_ttl_days, 30);
         assert_eq!(cfg.hot.max_file_size, 5242880);
+        assert_eq!(cfg.hot.idempotency_ttl_ms, 300000);
         assert_eq!(cfg.version, "0.1.0");
         assert_eq!(cfg.git_commit, "abc1234");
         assert_eq!(cfg.admins.len(), 1);
@@ -1918,7 +1920,8 @@ mod admin_tests {
                 "hot": {
                     "allowedOrigins": ["https://x.example"],
                     "sessionTtlDays": 60,
-                    "maxFileSize": 5242880
+                    "maxFileSize": 5242880,
+                    "idempotencyTtlMs": 300000
                 },
                 "version": "",
                 "gitCommit": "",
@@ -1930,6 +1933,7 @@ mod admin_tests {
             allowed_origins: Some(vec!["https://x.example".to_string()]),
             session_ttl_days: Some(60),
             max_file_size: None,
+            idempotency_ttl_ms: None,
         };
         let cfg = client.patch_config(&patch).await.unwrap();
         assert_eq!(

@@ -31,6 +31,7 @@ const baseConfig: ConfigResponse = {
     allowedOrigins: ["https://app.example.com"],
     sessionTtlDays: 7,
     maxFileSize: 10_485_760,
+    idempotencyTtlMs: 300_000,
   },
   version: "0.1.0",
   gitCommit: "abcdef0123456789",
@@ -92,6 +93,7 @@ describe("ConfigPage form validation", () => {
       allowedOrigins: ["https://app.example.com"],
       sessionTtlDays: 7,
       maxFileSize: 10_485_760,
+      idempotencyTtlMs: 300_000,
     });
   });
 });

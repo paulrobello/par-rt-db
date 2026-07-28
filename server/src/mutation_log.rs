@@ -5,8 +5,11 @@ use crate::db::{now_ms, validate_db_name};
 use crate::ddl::pg_schema;
 use crate::error::RtDbError;
 
-/// How long a cached mutation result stays valid for dedup.
-pub const DEDUP_TTL_MS: i64 = 5 * 60 * 1000;
+/// Default dedup TTL (5 min) — the env-seed default for
+/// `HotConfig::idempotency_ttl_ms` (`RTDB_IDEMPOTENCY_TTL_MS`). The live value
+/// used at the `store()` call site is read from hot config
+/// (`ctx.hot.load().idempotency_ttl_ms`), not this constant.
+pub const DEFAULT_DEDUP_TTL_MS: i64 = 5 * 60 * 1000;
 
 /// Ensures the per-db mutation dedup table exists. Idempotent — safe to call
 /// once per committer task startup, covering databases created before this

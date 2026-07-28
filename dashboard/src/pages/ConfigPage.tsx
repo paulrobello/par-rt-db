@@ -14,6 +14,7 @@ export function ConfigPage() {
   const [origins, setOrigins] = useState("");
   const [ttl, setTtl] = useState("");
   const [maxSize, setMaxSize] = useState("");
+  const [dedupTtl, setDedupTtl] = useState("");
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [savedAt, setSavedAt] = useState(false);
@@ -30,6 +31,7 @@ export function ConfigPage() {
         setOrigins(c.hot.allowedOrigins.join("\n"));
         setTtl(String(c.hot.sessionTtlDays));
         setMaxSize(String(c.hot.maxFileSize));
+        setDedupTtl(String(c.hot.idempotencyTtlMs));
       })
       .catch((e) => {
         if (!cancelled) setError(e instanceof Error ? e.message : String(e));
@@ -48,6 +50,7 @@ export function ConfigPage() {
     setSavedAt(false);
     const sessionTtlDays = Number(ttl);
     const maxFileSize = Number(maxSize);
+    const idempotencyTtlMs = Number(dedupTtl);
     if (!Number.isFinite(sessionTtlDays) || sessionTtlDays < 0) {
       setSaveError("session TTL must be a non-negative number of days");
       setSaving(false);
@@ -55,6 +58,11 @@ export function ConfigPage() {
     }
     if (!Number.isFinite(maxFileSize) || maxFileSize < 0) {
       setSaveError("max file size must be a non-negative number of bytes");
+      setSaving(false);
+      return;
+    }
+    if (!Number.isFinite(idempotencyTtlMs) || idempotencyTtlMs <= 0) {
+      setSaveError("idempotency TTL must be a positive number of milliseconds");
       setSaving(false);
       return;
     }
@@ -66,11 +74,13 @@ export function ConfigPage() {
           .filter(Boolean),
         sessionTtlDays,
         maxFileSize,
+        idempotencyTtlMs,
       });
       setCfg(c);
       setOrigins(c.hot.allowedOrigins.join("\n"));
       setTtl(String(c.hot.sessionTtlDays));
       setMaxSize(String(c.hot.maxFileSize));
+      setDedupTtl(String(c.hot.idempotencyTtlMs));
       setSavedAt(true);
     } catch (e) {
       setSaveError(e instanceof Error ? e.message : String(e));
@@ -123,6 +133,18 @@ export function ConfigPage() {
               <span className={s.hint}>{formatBytes(Number(maxSize) || 0)}</span>
             </label>
           </div>
+          <label className={s.field}>
+            <span className={s.fieldLabel}>idempotency ttl (ms)</span>
+            <input
+              className={s.input}
+              value={dedupTtl}
+              onChange={(e) => setDedupTtl(e.target.value)}
+              spellCheck={false}
+            />
+            <span className={s.hint}>
+              mutation dedup window in milliseconds (default 300000 = 5 min)
+            </span>
+          </label>
           <div className={s.actions}>
             <Button variant="primary" onClick={save} disabled={saving}>
               {saving ? "saving…" : "save"}

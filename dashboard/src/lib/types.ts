@@ -47,6 +47,7 @@ export interface HotConfig {
   allowedOrigins: string[];
   sessionTtlDays: number;
   maxFileSize: number;
+  idempotencyTtlMs: number;
 }
 
 export interface ConfigResponse {
@@ -87,4 +88,5 @@ export interface HotConfigPatch {
   allowedOrigins?: string[];
   sessionTtlDays?: number;
   maxFileSize?: number;
+  idempotencyTtlMs?: number;
 }
