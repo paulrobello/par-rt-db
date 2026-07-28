@@ -56,6 +56,7 @@ export function Sparkline({
 
   const baseline = height;
   const linePoints = runs.map((run) => run.join(" "));
+  // `runs` holds only non-empty arrays: every push is guarded by a `cur.length` check.
   const areaPaths = runs.map((run) => {
     const first = run[0].split(",");
     const last = run[run.length - 1].split(",");
@@ -83,10 +84,8 @@ export function Sparkline({
   };
   const onLeave = () => setHover(null);
 
-  const hoverValue =
-    hover != null && values[hover] != null && Number.isFinite(values[hover] as number)
-      ? (values[hover] as number)
-      : null;
+  const candidate = hover != null ? values[hover] : null;
+  const hoverValue = candidate != null && Number.isFinite(candidate) ? candidate : null;
   const tipText =
     hoverValue != null ? (formatTip ? formatTip(hoverValue) : String(hoverValue)) : null;
 

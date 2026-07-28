@@ -38,7 +38,7 @@ describe("Sparkline hover", () => {
     const { container } = render(
       <Sparkline values={[10, 20, 30]} formatTip={(v) => `${v}/s`} ariaLabel="rates" />,
     );
-    const svg = container.querySelector("svg")!;
+    const svg = screen.getByRole("img");
     // jsdom returns a zero-size rect by default; give it a real width so the
     // pointer-fraction → index math resolves.
     vi.spyOn(svg, "getBoundingClientRect").mockReturnValue({
@@ -56,15 +56,15 @@ describe("Sparkline hover", () => {
     expect(container.querySelector("[data-spark-tip]")).toBeNull();
     fireEvent.mouseMove(svg, { clientX: 100 }); // far right -> last point (30)
     const tip = container.querySelector("[data-spark-tip]");
-    expect(tip).toBeTruthy();
-    expect(tip!.textContent).toContain("30/s");
+    expect(tip).not.toBeNull();
+    expect(tip?.textContent).toContain("30/s");
   });
 
   it("can be disabled via interactive={false}", () => {
     const { container } = render(
       <Sparkline values={[1, 2, 3]} interactive={false} ariaLabel="static" />,
     );
-    const svg = container.querySelector("svg")!;
+    const svg = screen.getByRole("img");
     fireEvent.mouseMove(svg, { clientX: 50 });
     expect(container.querySelector("[data-spark-tip]")).toBeNull();
   });
