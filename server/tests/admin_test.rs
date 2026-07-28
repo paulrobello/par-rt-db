@@ -806,3 +806,135 @@ async fn import_db_doc_replay_failure_after_schema_commit_refreshes_schema_cache
 
     Ok(())
 }
+
+// Admin schedule endpoints (GET /admin/db/{db}/schedules, POST .../schedules,
+// .../schedules/{id}/{cancel,pause,resume}) are thin admin-gated wrappers over
+// the same scheduler accessors as the per-db /api/schedule* routes. End-to-end:
+// create a one-shot (far-future afterMs so the scheduler, not spawned for this
+// db during the test, can't drain it), list it, pause → paused, resume →
+// pending, cancel → list empty. The scheduler task is not started for this db
+// (no mutate/subscribe touches it), so the row sits untouched between calls.
+#[tokio::test]
+async fn admin_schedule_endpoints_create_pause_resume_cancel_roundtrip() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let name = fresh_db(&state).await;
+
+    // Create: admin POST /admin/db/{db}/schedules.
+    let resp = admin_post(
+        addr,
+        &format!("/admin/db/{name}/schedules"),
+        serde_json::json!({
+            "when": {"type": "afterMs", "ms": 3_600_000},
+            "txn": {"steps": []},
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await?;
+    let id = body["id"].as_str().expect("schedule id").to_string();
+
+    // List: admin GET /admin/db/{db}/schedules shows the pending one-shot.
+    let resp = admin_get(addr, &format!("/admin/db/{name}/schedules")).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await?;
+    let listed = body["schedules"].as_array().expect("schedules array");
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0]["id"], serde_json::json!(id));
+    assert_eq!(listed[0]["kind"], serde_json::json!("oneshot"));
+    assert_eq!(listed[0]["status"], serde_json::json!("pending"));
+
+    // Pause → status paused.
+    let resp = admin_post(
+        addr,
+        &format!("/admin/db/{name}/schedules/{id}/pause"),
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        resp.json::<serde_json::Value>().await?["ok"],
+        serde_json::json!(true)
+    );
+    let body: serde_json::Value = admin_get(addr, &format!("/admin/db/{name}/schedules"))
+        .await
+        .json()
+        .await?;
+    assert_eq!(body["schedules"][0]["status"], serde_json::json!("paused"));
+
+    // Resume → status pending again.
+    let resp = admin_post(
+        addr,
+        &format!("/admin/db/{name}/schedules/{id}/resume"),
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        resp.json::<serde_json::Value>().await?["ok"],
+        serde_json::json!(true)
+    );
+    let body: serde_json::Value = admin_get(addr, &format!("/admin/db/{name}/schedules"))
+        .await
+        .json()
+        .await?;
+    assert_eq!(body["schedules"][0]["status"], serde_json::json!("pending"));
+
+    // Cancel → row deleted → list empty.
+    let resp = admin_post(
+        addr,
+        &format!("/admin/db/{name}/schedules/{id}/cancel"),
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        resp.json::<serde_json::Value>().await?["ok"],
+        serde_json::json!(true)
+    );
+    let body: serde_json::Value = admin_get(addr, &format!("/admin/db/{name}/schedules"))
+        .await
+        .json()
+        .await?;
+    assert!(
+        body["schedules"]
+            .as_array()
+            .expect("schedules array")
+            .is_empty()
+    );
+
+    Ok(())
+}
+
+// Admin schedule endpoints require the admin key — a non-admin bearer (here a
+// machine token for the db) is rejected. The token is valid for ordinary
+// per-db /api/schedule routes but must NOT gate onto /admin/*.
+#[tokio::test]
+async fn admin_schedule_endpoints_reject_non_admin_bearer() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let name = fresh_db(&state).await;
+
+    // A wrong admin bearer on the list route is 401.
+    let resp = reqwest::Client::new()
+        .get(format!("http://{addr}/admin/db/{name}/schedules"))
+        .header("Authorization", "Bearer not-the-admin-key")
+        .send()
+        .await?;
+    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    Ok(())
+}
+
+// Admin schedule routes 404 on an unknown database (mirrors /admin/db/{db}/query).
+#[tokio::test]
+async fn admin_schedule_list_unknown_db_is_404() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let bogus = fresh_name();
+
+    let resp = admin_get(addr, &format!("/admin/db/{bogus}/schedules")).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+
+    Ok(())
+}

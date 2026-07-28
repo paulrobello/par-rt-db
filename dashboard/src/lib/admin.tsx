@@ -19,6 +19,8 @@ import type {
   MetricsSnapshot,
   OpEvent,
   RtDbErrorEnvelope,
+  ScheduleInfo,
+  ScheduleWhen,
   TokenRow,
 } from "./types";
 
@@ -137,6 +139,32 @@ export class AdminClient {
     return this.req<AdminMutateResult>(`/admin/db/${enc(db)}/mutate`, {
       method: "POST",
       body: JSON.stringify({ txn, idempotencyKey }),
+    });
+  }
+  listSchedules(db: string): Promise<ScheduleInfo[]> {
+    return this.req<{ schedules: ScheduleInfo[] }>(`/admin/db/${enc(db)}/schedules`).then(
+      (r) => r.schedules,
+    );
+  }
+  createSchedule(db: string, when: ScheduleWhen, txn: TransactionJson): Promise<{ id: string }> {
+    return this.req<{ id: string }>(`/admin/db/${enc(db)}/schedules`, {
+      method: "POST",
+      body: JSON.stringify({ when, txn }),
+    });
+  }
+  cancelSchedule(db: string, id: string): Promise<{ ok: boolean }> {
+    return this.req<{ ok: boolean }>(`/admin/db/${enc(db)}/schedules/${enc(id)}/cancel`, {
+      method: "POST",
+    });
+  }
+  pauseSchedule(db: string, id: string): Promise<{ ok: boolean }> {
+    return this.req<{ ok: boolean }>(`/admin/db/${enc(db)}/schedules/${enc(id)}/pause`, {
+      method: "POST",
+    });
+  }
+  resumeSchedule(db: string, id: string): Promise<{ ok: boolean }> {
+    return this.req<{ ok: boolean }>(`/admin/db/${enc(db)}/schedules/${enc(id)}/resume`, {
+      method: "POST",
     });
   }
   me() {

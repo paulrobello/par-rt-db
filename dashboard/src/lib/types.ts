@@ -84,6 +84,29 @@ export interface AdminMutateResult {
   results: unknown[];
 }
 
+// Scheduled jobs — mirrors server/src/protocol.rs (ScheduleInfo, ScheduleWhen,
+// ScheduleKind, ScheduleStatus). Field names are camelCase on the wire.
+export type ScheduleKind = "oneshot" | "cron";
+export type ScheduleStatus = "pending" | "running" | "paused" | "error";
+
+export interface ScheduleInfo {
+  id: string;
+  kind: ScheduleKind;
+  dueAt: number;
+  cron?: string;
+  status: ScheduleStatus;
+  lastError?: string;
+  createdAt: number;
+  firedCount: number;
+}
+
+/** Wire shape for the `when` field of a create-schedule request. Mirrors the
+ *  server's `ScheduleWhen` (tagged union, `type` discriminator). */
+export type ScheduleWhen =
+  | { type: "afterMs"; ms: number }
+  | { type: "runAt"; ms: number }
+  | { type: "cron"; expr: string };
+
 export interface HotConfigPatch {
   allowedOrigins?: string[];
   sessionTtlDays?: number;

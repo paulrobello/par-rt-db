@@ -1,0 +1,247 @@
+.page {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+}
+
+.head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  flex-wrap: wrap;
+}
+
+.title {
+  margin: 0;
+  font-size: var(--t-display);
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  font-family: var(--mono);
+}
+
+.count {
+  margin-left: auto;
+  font-family: var(--mono);
+  font-size: var(--t-mono-sm);
+  color: var(--ink-3);
+}
+
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  flex-wrap: wrap;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+}
+
+.fieldLabel {
+  font-family: var(--mono);
+  font-size: var(--t-mono-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  color: var(--ink-3);
+}
+
+.select {
+  background: var(--inset);
+  color: var(--ink);
+  border: 1px solid var(--rule-strong);
+  border-radius: var(--r-1);
+  font-family: var(--mono);
+  font-size: var(--t-mono-sm);
+  padding: 6px var(--sp-2);
+  outline: none;
+  min-width: 200px;
+}
+
+.input {
+  background: var(--inset);
+  color: var(--ink);
+  border: 1px solid var(--rule-strong);
+  border-radius: var(--r-1);
+  font-family: var(--mono);
+  font-size: var(--t-mono-sm);
+  padding: 6px var(--sp-2);
+  outline: none;
+  min-width: 180px;
+}
+
+.segment {
+  display: inline-flex;
+  border: 1px solid var(--rule-strong);
+  border-radius: var(--r-1);
+  overflow: hidden;
+}
+.segBtn {
+  padding: 4px var(--sp-2);
+  background: var(--surface);
+  color: var(--ink-2);
+  font-family: var(--mono);
+  font-size: var(--t-mono-sm);
+  border: none;
+  cursor: pointer;
+  text-transform: uppercase;
+}
+.segBtn + .segBtn {
+  border-left: 1px solid var(--rule);
+}
+.segBtnActive {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.createBlock {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  max-width: 880px;
+}
+
+.editor {
+  background: var(--inset);
+  color: var(--ink);
+  border: 1px solid var(--rule-strong);
+  border-radius: var(--r-1);
+  font-family: var(--mono);
+  font-size: var(--t-mono-sm);
+  padding: var(--sp-2);
+  resize: vertical;
+  outline: none;
+  min-height: 140px;
+  width: 100%;
+  box-sizing: border-box;
+  line-height: 1.5;
+  tab-size: 2;
+}
+
+.actions {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  flex-wrap: wrap;
+}
+
+.warn {
+  font-family: var(--mono);
+  font-size: var(--t-mono-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--warn);
+}
+
+.hint {
+  font-family: var(--mono);
+  font-size: var(--t-mono-xs);
+  color: var(--ink-3);
+}
+
+.muted {
+  color: var(--ink-3);
+  font-family: var(--mono);
+  font-size: var(--t-mono-sm);
+}
+
+.error {
+  margin: 0;
+  font-family: var(--mono);
+  font-size: var(--t-mono-sm);
+  color: var(--error);
+}
+
+.tableWrap {
+  overflow: auto;
+  border: 1px solid var(--rule);
+  max-height: calc(100dvh - 360px);
+}
+
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--t-mono-sm);
+}
+.table th {
+  position: sticky;
+  top: 0;
+  text-align: left;
+  padding: var(--sp-2);
+  background: var(--inset);
+  border-bottom: 1px solid var(--rule-strong);
+  font-family: var(--mono);
+  font-size: var(--t-mono-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--ink-3);
+  font-weight: 400;
+  white-space: nowrap;
+}
+.table td {
+  padding: var(--sp-1) var(--sp-2);
+  border-bottom: 1px solid var(--rule);
+  vertical-align: top;
+  white-space: nowrap;
+}
+
+.idCell {
+  font-family: var(--mono);
+  color: var(--ink-3);
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.kind {
+  font-family: var(--mono);
+  color: var(--accent);
+}
+.kindCron {
+  color: var(--warn);
+}
+
+.status {
+  font-family: var(--mono);
+  color: var(--ink-2);
+}
+.statusPaused {
+  color: var(--warn);
+}
+.statusError {
+  color: var(--error);
+}
+.statusRunning {
+  color: var(--accent);
+}
+
+.cronExpr {
+  font-family: var(--mono);
+  color: var(--ink);
+}
+
+.errCell {
+  font-family: var(--mono);
+  color: var(--error);
+  max-width: 240px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.rowActions {
+  display: flex;
+  gap: var(--sp-1);
+  align-items: center;
+}
+
+.confirmInline {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-1);
+}
+.confirmLabel {
+  font-family: var(--mono);
+  font-size: var(--t-mono-xs);
+  color: var(--error);
+}
