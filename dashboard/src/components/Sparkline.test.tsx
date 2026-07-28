@@ -1,5 +1,5 @@
-import { render, screen } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import { fireEvent, render, screen } from "@testing-library/react";
+import { describe, expect, it, vi } from "vitest";
 import { Sparkline } from "./Sparkline";
 
 describe("Sparkline", () => {
@@ -30,5 +30,42 @@ describe("Sparkline", () => {
     );
     // the polyline exists; exact coords are covered by the geometry being deterministic
     expect(container.querySelector("polyline")).toBeTruthy();
+  });
+});
+
+describe("Sparkline hover", () => {
+  it("shows a tooltip with the hovered value on pointer move", () => {
+    const { container } = render(
+      <Sparkline values={[10, 20, 30]} formatTip={(v) => `${v}/s`} ariaLabel="rates" />,
+    );
+    const svg = container.querySelector("svg")!;
+    // jsdom returns a zero-size rect by default; give it a real width so the
+    // pointer-fraction → index math resolves.
+    vi.spyOn(svg, "getBoundingClientRect").mockReturnValue({
+      left: 0,
+      width: 100,
+      right: 100,
+      top: 0,
+      bottom: 40,
+      height: 40,
+      x: 0,
+      y: 0,
+      toJSON() {},
+    } as DOMRect);
+
+    expect(container.querySelector("[data-spark-tip]")).toBeNull();
+    fireEvent.mouseMove(svg, { clientX: 100 }); // far right -> last point (30)
+    const tip = container.querySelector("[data-spark-tip]");
+    expect(tip).toBeTruthy();
+    expect(tip!.textContent).toContain("30/s");
+  });
+
+  it("can be disabled via interactive={false}", () => {
+    const { container } = render(
+      <Sparkline values={[1, 2, 3]} interactive={false} ariaLabel="static" />,
+    );
+    const svg = container.querySelector("svg")!;
+    fireEvent.mouseMove(svg, { clientX: 50 });
+    expect(container.querySelector("[data-spark-tip]")).toBeNull();
   });
 });

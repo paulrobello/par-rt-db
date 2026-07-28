@@ -1,5 +1,5 @@
-import type { ReactNode } from "react";
-import type { Point } from "../lib/metrics-series";
+import { type ReactNode, useRef, useState } from "react";
+import { nearestIndex, type Point } from "../lib/metrics-series";
 
 const W = 100; // viewBox width; the svg stretches to its container via width:100%
 
@@ -11,6 +11,8 @@ export interface SparklineProps {
   min?: number; // optional fixed floor; else autoscale
   max?: number; // optional fixed ceiling; else autoscale
   ariaLabel: string;
+  interactive?: boolean; // default true — crosshair + tooltip
+  formatTip?: (v: number) => string; // default: String(value)
   children?: ReactNode; // overlay slot (hover crosshair — Task 4)
 }
 
@@ -22,6 +24,8 @@ export function Sparkline({
   min,
   max,
   ariaLabel,
+  interactive = true,
+  formatTip,
   children,
 }: SparklineProps) {
   const n = values.length;
@@ -68,33 +72,90 @@ export function Sparkline({
     }
   }
 
+  const svgRef = useRef<SVGSVGElement>(null);
+  const [hover, setHover] = useState<number | null>(null);
+  const onMove = (e: React.MouseEvent<SVGSVGElement>) => {
+    if (!interactive) return;
+    const rect = svgRef.current?.getBoundingClientRect();
+    if (!rect || rect.width === 0) return;
+    const fraction = (e.clientX - rect.left) / rect.width;
+    setHover(nearestIndex(fraction, n));
+  };
+  const onLeave = () => setHover(null);
+
+  const hoverValue =
+    hover != null && values[hover] != null && Number.isFinite(values[hover] as number)
+      ? (values[hover] as number)
+      : null;
+  const tipText =
+    hoverValue != null ? (formatTip ? formatTip(hoverValue) : String(hoverValue)) : null;
+
   return (
-    <svg
-      viewBox={`0 0 ${W} ${height}`}
-      preserveAspectRatio="none"
-      role="img"
-      aria-label={ariaLabel}
-      style={{ width: "100%", height, display: "block" }}
-    >
-      {fill !== "none" &&
-        areaPaths.map((d) => <path key={d} d={d} style={{ fill }} stroke="none" />)}
-      {linePoints.map((pts) => (
-        <polyline
-          key={pts}
-          points={pts}
-          fill="none"
-          style={{ stroke, strokeWidth: 2, vectorEffect: "non-scaling-stroke" }}
-        />
-      ))}
-      {last && (
-        <circle
-          cx={last.cx}
-          cy={last.cy}
-          r={2}
-          style={{ fill: stroke, vectorEffect: "non-scaling-stroke" }}
-        />
+    <div style={{ position: "relative", width: "100%" }}>
+      <svg
+        ref={svgRef}
+        viewBox={`0 0 ${W} ${height}`}
+        preserveAspectRatio="none"
+        role="img"
+        aria-label={ariaLabel}
+        onMouseMove={onMove}
+        onMouseLeave={onLeave}
+        style={{ width: "100%", height, display: "block" }}
+      >
+        {fill !== "none" &&
+          areaPaths.map((d) => <path key={d} d={d} style={{ fill }} stroke="none" />)}
+        {linePoints.map((pts) => (
+          <polyline
+            key={pts}
+            points={pts}
+            fill="none"
+            style={{ stroke, strokeWidth: 2, vectorEffect: "non-scaling-stroke" }}
+          />
+        ))}
+        {last && (
+          <circle
+            cx={last.cx}
+            cy={last.cy}
+            r={2}
+            style={{ fill: stroke, vectorEffect: "non-scaling-stroke" }}
+          />
+        )}
+        {hover != null && (
+          <line
+            x1={x(hover)}
+            y1={0}
+            x2={x(hover)}
+            y2={height}
+            style={{
+              stroke: "var(--rule-strong)",
+              strokeWidth: 1,
+              vectorEffect: "non-scaling-stroke",
+            }}
+          />
+        )}
+        {children}
+      </svg>
+      {tipText != null && hover != null && (
+        <span
+          data-spark-tip
+          style={{
+            position: "absolute",
+            left: `${(hover / Math.max(n - 1, 1)) * 100}%`,
+            top: 0,
+            transform: "translateX(-50%)",
+            padding: "1px 4px",
+            fontFamily: "var(--mono)",
+            fontSize: "var(--t-mono-xs)",
+            color: "var(--ink)",
+            background: "var(--inset)",
+            border: "1px solid var(--rule)",
+            whiteSpace: "nowrap",
+            pointerEvents: "none",
+          }}
+        >
+          {tipText}
+        </span>
       )}
-      {children}
-    </svg>
+    </div>
   );
 }
