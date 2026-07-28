@@ -133,8 +133,8 @@ interface SparklineProps {
 - The local `Instrument` helper gains an optional `sparkline?: ReactNode` slot
   rendered beneath the value/sub.
 - The page mounts `useMetricsHistory()` once and derives the series it needs.
-- A lightweight hover layer (see *Interaction*) is wired in the tile, not in
-  `Sparkline`, so the SVG stays pure.
+- A lightweight hover layer (see *Interaction*) lives inside `Sparkline`, with the
+  pointer→index math in a pure, tested helper so the SVG rendering stays deterministic.
 
 ## Visuals & layout
 
@@ -151,29 +151,22 @@ satisfied by giving each metric its own tile+sparkline.
 - **Live · levels** — the gauges keep their current headline value and add a
   `levelSeries` sparkline:
   - `wsConnections`, `activeSubscriptions`: single-series line + area.
-  - **Pool:** a two-series **stacked area** — busy (`poolSize − poolIdle`, filled
-    `--accent`) over idle (`poolIdle`, filled muted `--ink-3` @ low alpha) — so the
-    top edge == `poolSize` and the colored band shows utilization. Identity is
-    reinforced by the existing `6 busy · 4 idle` sub-line (not color-alone). This is
-    the only multi-series chart; it is rendered by extending `Sparkline` to accept an
-    optional second stacked series rather than a separate component.
+  - **Pool:** a single-series **busy area** — `levelSeries` of `poolSize − poolIdle`,
+    scaled with `min=0, max=poolSize` (current capacity) so the filled band shows
+    utilization against the unfilled capacity. Idle is conveyed by the existing
+    `6 busy · 4 idle` sub-line. (Matches the approved preview; single-series keeps the
+    chart one hue, so no legend or multi-hue palette work is needed.)
 - **System · uptime:** unchanged tile, **no sparkline** (monotonic, uninformative).
 
 Mark specs (dataviz): 2 px strokes, thin marks, no axes (sparkline convention), the
 current value direct-labeled in the tile. Grid/axes are recessive or absent.
 
-## Color (validated, not eyeballed)
+## Color
 
-Per the dataviz skill, color is validated with `scripts/validate_palette.js`:
-
-- Single-series sparklines use one hue (`--accent`); a single-series chart needs no
-  legend (the tile label names it).
-- The pool's two-series case (busy green vs idle gray) is run through the validator
-  against the dark surface (`--surface #141619`). Green-vs-gray is also redundantly
-  encoded by the `busy/idle` sub-line, so identity is never color-alone. If any pair
-  fails CVD separation we widen the gray toward a cooler neutral until it passes.
-- Text (values, labels, subs) stays in `--ink` / `--ink-2` / `--ink-3` — never the
-  series color.
+Every chart is single-series, so each uses one hue (`--accent`) and needs no legend
+(the tile label names the series — dataviz rule). Text (values, labels, subs) stays
+in `--ink` / `--ink-2` / `--ink-3` — never the series color. Because no chart plots
+two categorical hues, there is no categorical palette to CVD-validate.
 
 ## Interaction (hover layer)
 
@@ -221,7 +214,8 @@ Pure logic is the priority (R4 forced verification).
 3. **Eyeball:** run the dashboard dev server, load `/metrics`, confirm sparklines
    fill in over the first 60 s, the pool area stacks correctly, a reconnect
    introduces a visible gap, and reduced-motion disables the dot animation.
-4. **Palette:** `node scripts/validate_palette.js …` on the pool pair before ship.
+4. **A11y:** confirm each sparkline exposes `role="img"` + a descriptive `aria-label`,
+   and `prefers-reduced-motion` disables the last-dot animation.
 
 ## File manifest
 
