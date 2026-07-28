@@ -27,9 +27,17 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 croner = "2"
+# Used by the managed-backup task to parse `postgres://` connection strings
+# into PG* env vars (so credentials never appear in the child argv).
+url = "2"
+# Decodes percent-encoded user/password/database in the connection string
+# (`url::Url::username` etc. return encoded values); same crate `url` already
+# pulls in transitively.
+percent-encoding = "2"
 
 [dev-dependencies]
 anyhow = "1"
+tempfile = "3"
 tokio-tungstenite = "0.26"
 futures-util = "0.3"
 wiremock = "0.6"

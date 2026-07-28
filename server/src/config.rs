@@ -40,6 +40,15 @@ pub struct Config {
     // op-feed (`OpFeed`) is always on; this is its durable counterpart.
     // RTDB_AUDIT_LOG_ENABLED (accepts "true"/"1"/"yes", case-insensitive).
     pub audit_log_enabled: bool,
+    // Managed pg_dump backup scheduler. Off by default — when true, a
+    // background task runs `pg_dump` on `backup_cron` (5-field UTC cron, same
+    // format `scheduler::next_fire` already handles) into `backup_dir`,
+    // keeping the newest `backup_retention` dumps. RTDB_BACKUP_ENABLED /
+    // RTDB_BACKUP_CRON / RTDB_BACKUP_DIR / RTDB_BACKUP_RETENTION.
+    pub backup_enabled: bool,
+    pub backup_cron: String,
+    pub backup_dir: String,
+    pub backup_retention: u32,
 }
 
 impl Config {
@@ -116,6 +125,29 @@ impl Config {
             Err(_) => false,
         };
 
+        // Managed pg_dump backup scheduler. Default off; cron/dir/retention
+        // carry their own defaults so an operator can flip just
+        // RTDB_BACKUP_ENABLED=true to get daily 03:00 UTC dumps with 7-day
+        // retention. An empty RTDB_BACKUP_CRON falls back to the default
+        // (a blank cron would surface as `invalid cron expression` from
+        // `scheduler::next_fire` on every loop iteration, so clamp here).
+        let backup_enabled = match std::env::var("RTDB_BACKUP_ENABLED") {
+            Ok(v) => matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes"),
+            Err(_) => false,
+        };
+        let backup_cron = match std::env::var("RTDB_BACKUP_CRON") {
+            Ok(v) if !v.trim().is_empty() => v,
+            _ => "0 3 * * *".to_string(),
+        };
+        let backup_dir = match std::env::var("RTDB_BACKUP_DIR") {
+            Ok(v) if !v.trim().is_empty() => v,
+            _ => "./backups".to_string(),
+        };
+        let backup_retention = match std::env::var("RTDB_BACKUP_RETENTION") {
+            Ok(v) => v.parse::<u32>().unwrap_or(7),
+            Err(_) => 7,
+        };
+
         Ok(Self {
             port,
             database_url,
@@ -133,6 +165,10 @@ impl Config {
             rate_limit_per_token_rpm,
             rate_limit_per_db_rpm,
             audit_log_enabled,
+            backup_enabled,
+            backup_cron,
+            backup_dir,
+            backup_retention,
         })
     }
 }

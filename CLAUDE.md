@@ -45,4 +45,4 @@ Tests share one Postgres, isolating by creating uniquely-named databases per tes
 
 ## Deployment
 
-Deployed live at `rtdb.pardev.net` on host lenny2 (plain `docker compose`, via a Cloudflare tunnel). **Build on the x86_64 host, not from an arm64 Mac.** Secrets come from a mode-600 `.env` (`.env.example` is the template). Full runbook: `deploy/README.md`.
+Deployed live at `rtdb.pardev.net` on host lenny2 (plain `docker compose`, via a Cloudflare tunnel). **Build on the x86_64 host, not from an arm64 Mac.** Secrets come from a mode-600 `.env` (`.env.example` is the template). Full runbook: `deploy/README.md`. Optional managed `pg_dump` backups: set `RTDB_BACKUP_ENABLED=true` + `RTDB_BACKUP_CRON` (5-field UTC cron, default daily 03:00) + `RTDB_BACKUP_DIR` + `RTDB_BACKUP_RETENTION` (count, default 7); the docker image installs `postgresql-client` so `pg_dump` is present, and `GET /admin/backups` lists the dumps.

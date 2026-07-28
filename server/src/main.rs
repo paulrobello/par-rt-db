@@ -45,6 +45,21 @@ async fn main() {
         });
     }
 
+    // Managed pg_dump backup task: off by default. When on, a single
+    // background task runs `pg_dump` on the configured cron into `backup_dir`,
+    // retaining the newest `backup_retention` dumps. The task sleeps in bounded
+    // chunks and never aborts the server on a pg_dump/prune failure (logged +
+    // continued). The connection string is passed as PG* env vars, never argv.
+    if config.backup_enabled {
+        let db_url = config.database_url.clone();
+        let dir = config.backup_dir.clone();
+        let cron = config.backup_cron.clone();
+        let retention = config.backup_retention;
+        tokio::spawn(rtdb_server::backup::run_backup_task(
+            db_url, dir, cron, retention,
+        ));
+    }
+
     let admin_emails: Vec<String> = match std::env::var("RTDB_ADMIN_EMAILS") {
         Ok(v) if !v.is_empty() => v
             .split(',')

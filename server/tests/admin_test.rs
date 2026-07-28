@@ -1084,3 +1084,36 @@ async fn admin_storage_list_unknown_db_is_404() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+// `GET /admin/backups` lists the managed `pg_dump` files in
+// `config.backup_dir`. The default `test_config` points at `./backups`, which
+// does not exist in the test working directory — the endpoint must return 200
+// with an empty list (a missing dir is normal when no run has happened yet or
+// the scheduler is disabled at boot), never 500.
+#[tokio::test]
+async fn admin_list_backups_returns_empty_when_dir_missing() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state).await;
+
+    let resp = admin_get(addr, "/admin/backups").await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(body, serde_json::json!({"backups": []}));
+    Ok(())
+}
+
+// `GET /admin/backups` requires the admin key — a non-admin bearer is rejected
+// with 401, matching every other `/admin/*` route.
+#[tokio::test]
+async fn admin_list_backups_rejects_non_admin_bearer() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state).await;
+
+    let resp = reqwest::Client::new()
+        .get(format!("http://{addr}/admin/backups"))
+        .header("Authorization", "Bearer not-the-admin-key")
+        .send()
+        .await?;
+    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+    Ok(())
+}

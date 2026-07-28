@@ -292,6 +292,10 @@ mod tests {
             rate_limit_per_token_rpm: 0,
             rate_limit_per_db_rpm: 0,
             audit_log_enabled: false,
+            backup_enabled: false,
+            backup_cron: "0 3 * * *".into(),
+            backup_dir: "./backups".into(),
+            backup_retention: 7,
         };
         assert!(GoogleProvider::from_config(&cfg).is_none());
         cfg.google_client_id = Some("id".into());

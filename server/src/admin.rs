@@ -889,6 +889,26 @@ async fn metrics_handler(
 }
 
 #[derive(Serialize)]
+struct BackupsResponse {
+    backups: Vec<crate::backup::BackupFile>,
+}
+
+/// `GET /admin/backups` — lists the managed `pg_dump` files in
+/// `config.backup_dir` newest-first, with size and parsed created-time. A
+/// missing dir (no run yet, or backups disabled) returns an empty list rather
+/// than 404/500 — the endpoint describes what is on disk, not what is
+/// configured. Whether the scheduler is enabled at boot is already visible at
+/// `/admin/config`.
+async fn list_backups(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<BackupsResponse>, RtDbError> {
+    require_admin(&state, &headers).await?;
+    let backups = crate::backup::list_backups(&state.config.backup_dir).await?;
+    Ok(Json(BackupsResponse { backups }))
+}
+
+#[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ConfigResponse {
     port: u16,
@@ -1241,6 +1261,7 @@ pub fn admin_routes() -> Router<Arc<AppState>> {
         )
         .route("/admin/metrics", get(metrics_handler))
         .route("/admin/config", get(get_config).patch(patch_config))
+        .route("/admin/backups", get(list_backups))
         .route("/admin/ops/recent", get(ops_recent))
         .route("/admin/audit", get(audit_recent))
         .route("/admin/stream", get(admin_stream))

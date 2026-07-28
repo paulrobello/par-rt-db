@@ -40,10 +40,14 @@ COPY dashboard ./dashboard
 RUN cd dashboard && bun run build
 
 # ── Runtime stage ────────────────────────────────────────────────────────────
-# Minimal image: the release binary, CA roots (GitHub OAuth TLS), and the SPA.
+# Minimal image: the release binary, CA roots (GitHub OAuth TLS), the SPA, and
+# `pg_dump` (postgresql-client) for the optional managed-backup scheduler
+# (RTDB_BACKUP_ENABLED). The backup task self-logs and continues if pg_dump is
+# absent, but shipping it here means flipping the env flag is sufficient to
+# turn backups on — no image rebuild needed.
 FROM debian:bookworm-slim
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
+    && apt-get install -y --no-install-recommends ca-certificates postgresql-client \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /build/server/target/release/rtdb-server /usr/local/bin/rtdb-server
 COPY --from=dashboard /build/dashboard/dist /app/dashboard-dist
