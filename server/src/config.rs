@@ -27,6 +27,13 @@ pub struct Config {
     pub max_affected_docs: usize, // RTDB_MAX_AFFECTED_DOCS, default 100 (admin data-browser guardrail)
     pub static_dir: Option<String>, // RTDB_STATIC_DIR — unset/empty ⇒ API-only (no SPA served)
     pub pool_max_connections: u32, // RTDB_POOL_MAX_CONNECTIONS, default 75 (multi-tenant; one committer task + N sub re-runs per db)
+    // HTTP rate limiting (v1, fixed-window, in-memory): 0 = unlimited.
+    // RTDB_RATE_LIMIT_PER_TOKEN_RPM caps each machine token; OAuth sessions
+    // carry no token id and are rate-limited per-db only. Default 0 preserves
+    // today's unlimited behavior; one noisy app on a multi-db instance can
+    // otherwise starve the others.
+    pub rate_limit_per_token_rpm: u32,
+    pub rate_limit_per_db_rpm: u32, // RTDB_RATE_LIMIT_PER_DB_RPM, shared across all principals of one db
 }
 
 impl Config {
@@ -83,6 +90,18 @@ impl Config {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
 
+        // HTTP rate-limit ceilings: 0 = unlimited (the default), preserving
+        // today's behavior. Non-parseable values fall back to the default,
+        // matching the `max_affected_docs` parse style.
+        let rate_limit_per_token_rpm = match std::env::var("RTDB_RATE_LIMIT_PER_TOKEN_RPM") {
+            Ok(v) => v.parse::<u32>().unwrap_or(0),
+            Err(_) => 0,
+        };
+        let rate_limit_per_db_rpm = match std::env::var("RTDB_RATE_LIMIT_PER_DB_RPM") {
+            Ok(v) => v.parse::<u32>().unwrap_or(0),
+            Err(_) => 0,
+        };
+
         Ok(Self {
             port,
             database_url,
@@ -97,6 +116,8 @@ impl Config {
             max_affected_docs,
             static_dir,
             pool_max_connections,
+            rate_limit_per_token_rpm,
+            rate_limit_per_db_rpm,
         })
     }
 }

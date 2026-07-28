@@ -14,6 +14,7 @@ use crate::db::now_ms;
 use crate::error::RtDbError;
 use crate::protocol::{ScheduleInfo, ScheduleWhen};
 use crate::query::{Query, QueryResult, execute_query};
+use crate::rate_limit::check_http_rate_limits;
 use crate::scheduler;
 use crate::storage;
 use crate::txn::Transaction;
@@ -74,6 +75,7 @@ async fn query_handler(
     let token = bearer_token(&headers)?;
     let principal = resolve_bearer(&state.pool, token).await?;
     authorize(&state.pool, &principal, &body.db).await?;
+    check_http_rate_limits(&state, &principal, &body.db).await?;
 
     let schema = state.schemas.get(&state.pool, &body.db).await?;
     let result = execute_query(
@@ -131,6 +133,7 @@ async fn batch_query_handler(
     let token = bearer_token(&headers)?;
     let principal = resolve_bearer(&state.pool, token).await?;
     authorize(&state.pool, &principal, &body.db).await?;
+    check_http_rate_limits(&state, &principal, &body.db).await?;
 
     let schema = state.schemas.get(&state.pool, &body.db).await?;
     let owner = owner_of(&principal);
@@ -178,6 +181,7 @@ async fn mutate_handler(
     let token = bearer_token(&headers)?;
     let principal = resolve_bearer(&state.pool, token).await?;
     authorize(&state.pool, &principal, &body.db).await?;
+    check_http_rate_limits(&state, &principal, &body.db).await?;
 
     let outcome = state
         .realtime
@@ -216,6 +220,7 @@ async fn schedule_handler(
     let token = bearer_token(&headers)?;
     let principal = resolve_bearer(&state.pool, token).await?;
     authorize(&state.pool, &principal, &body.db).await?;
+    check_http_rate_limits(&state, &principal, &body.db).await?;
 
     let (kind, due_at, cron) = scheduler::resolve_when(body.when, now_ms())?;
     let id = scheduler::insert(
@@ -258,6 +263,7 @@ async fn run_manage_op(
     let token = bearer_token(headers)?;
     let principal = resolve_bearer(&state.pool, token).await?;
     authorize(&state.pool, &principal, db).await?;
+    check_http_rate_limits(state, &principal, db).await?;
     let ok = match op {
         ManageOp::Cancel => scheduler::cancel(&state.pool, db, id).await?,
         ManageOp::Pause => scheduler::set_paused(&state.pool, db, id, true).await?,
@@ -312,6 +318,7 @@ async fn list_schedules_handler(
     let token = bearer_token(&headers)?;
     let principal = resolve_bearer(&state.pool, token).await?;
     authorize(&state.pool, &principal, &body.db).await?;
+    check_http_rate_limits(&state, &principal, &body.db).await?;
     let schedules = scheduler::list(&state.pool, &body.db).await?;
     Ok(Json(ListResponse { schedules }))
 }
@@ -367,6 +374,7 @@ async fn upload_handler(
     let token = bearer_token(&headers)?;
     let principal = resolve_bearer(&state.pool, token).await?;
     authorize(&state.pool, &principal, &db).await?;
+    check_http_rate_limits(&state, &principal, &db).await?;
     storage::ensure_table(&state.pool, &db).await?; // revive storage for old dbs
 
     // `max_file_size` is admin-mutable via PATCH /admin/config; clamp to the
@@ -425,6 +433,7 @@ async fn serve_authed_handler(
     let token = bearer_token(&headers)?;
     let principal = resolve_bearer(&state.pool, token).await?;
     authorize(&state.pool, &principal, &db).await?;
+    check_http_rate_limits(&state, &principal, &db).await?;
     serve_bytes(&state, &db, &id).await
 }
 
@@ -455,6 +464,7 @@ async fn delete_handler(
     let token = bearer_token(&headers)?;
     let principal = resolve_bearer(&state.pool, token).await?;
     authorize(&state.pool, &principal, &db).await?;
+    check_http_rate_limits(&state, &principal, &db).await?;
     storage::delete(&state.pool, &db, &id).await?;
     Ok(Json(OkResponse { ok: true }))
 }
@@ -469,6 +479,7 @@ async fn metadata_handler(
     let token = bearer_token(&headers)?;
     let principal = resolve_bearer(&state.pool, token).await?;
     authorize(&state.pool, &principal, &db).await?;
+    check_http_rate_limits(&state, &principal, &db).await?;
     let meta = storage::get_meta(&state.pool, &db, &id)
         .await?
         .ok_or_else(|| RtDbError::not_found("unknown file"))?;

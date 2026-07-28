@@ -1,5 +1,5 @@
 use axum::Json;
-use axum::http::StatusCode;
+use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -12,13 +12,26 @@ pub enum ErrorCode {
     PreconditionFailed,
     BadRequest,
     Internal,
+    RateLimited,
 }
 
+/// Optional `Retry-After` hint, in seconds, attached to a `RateLimited` error.
+/// Only set when `code == RateLimited`; absent on every other code (and absent
+/// on the wire shape — `#[serde(skip_serializing_if)]` keeps existing error
+/// envelopes byte-identical). Parsed back in via `#[serde(default)]` so older
+/// clients/tests that produce an error envelope without this field still
+/// deserialize.
 #[derive(Debug, thiserror::Error, Clone, serde::Serialize, serde::Deserialize)]
 #[error("{code:?}: {message}")]
 pub struct RtDbError {
     pub code: ErrorCode,
     pub message: String,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "retryAfter"
+    )]
+    pub retry_after_secs: Option<u32>,
 }
 
 impl RtDbError {
@@ -26,6 +39,7 @@ impl RtDbError {
         Self {
             code,
             message: msg.into(),
+            retry_after_secs: None,
         }
     }
 
@@ -57,6 +71,17 @@ impl RtDbError {
         Self::new(ErrorCode::Internal, msg)
     }
 
+    /// Rate-limit denial. `retry_after_secs` is surfaced to the client via the
+    /// HTTP `Retry-After` header (seconds) and on the wire body's `retryAfter`
+    /// field — the rest of the error envelope is unchanged.
+    pub fn rate_limited(retry_after_secs: u32) -> Self {
+        Self {
+            code: ErrorCode::RateLimited,
+            message: "rate limit exceeded".to_string(),
+            retry_after_secs: Some(retry_after_secs),
+        }
+    }
+
     pub fn status(&self) -> StatusCode {
         match self.code {
             ErrorCode::Unauthorized => StatusCode::UNAUTHORIZED,
@@ -66,6 +91,7 @@ impl RtDbError {
             ErrorCode::PreconditionFailed => StatusCode::CONFLICT,
             ErrorCode::BadRequest => StatusCode::BAD_REQUEST,
             ErrorCode::Internal => StatusCode::INTERNAL_SERVER_ERROR,
+            ErrorCode::RateLimited => StatusCode::TOO_MANY_REQUESTS,
         }
     }
 }
@@ -82,7 +108,16 @@ impl From<sqlx::Error> for RtDbError {
 impl IntoResponse for RtDbError {
     fn into_response(self) -> Response {
         let status = self.status();
-        (status, Json(self)).into_response()
+        // `Retry-After` only on `RateLimited`; pull it out before `Json(self)`
+        // moves the error so the header and body stay consistent.
+        let retry_after = self.retry_after_secs;
+        let mut resp = (status, Json(self)).into_response();
+        if let Some(secs) = retry_after
+            && let Ok(value) = HeaderValue::from_str(&secs.to_string())
+        {
+            resp.headers_mut().insert(header::RETRY_AFTER, value);
+        }
+        resp
     }
 }
 
@@ -131,5 +166,35 @@ mod tests {
             RtDbError::internal("x").status(),
             StatusCode::INTERNAL_SERVER_ERROR
         );
+        assert_eq!(
+            RtDbError::rate_limited(30).status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+    }
+
+    #[test]
+    fn rate_limited_carries_retry_after_and_round_trips() {
+        let err = RtDbError::rate_limited(42);
+        assert_eq!(err.code, ErrorCode::RateLimited);
+        assert_eq!(err.retry_after_secs, Some(42));
+        // Wire shape: code + message + retryAfter (camelCase, present when set).
+        let v = serde_json::to_value(&err).unwrap();
+        assert_eq!(
+            v,
+            json!({"code": "RATE_LIMITED", "message": "rate limit exceeded", "retryAfter": 42})
+        );
+        // Round-trip preserves the field.
+        let restored: RtDbError = serde_json::from_value(v).unwrap();
+        assert_eq!(restored.code, ErrorCode::RateLimited);
+        assert_eq!(restored.retry_after_secs, Some(42));
+    }
+
+    #[test]
+    fn non_rate_limited_errors_omit_retry_after_on_the_wire() {
+        // Existing error envelope stays byte-identical for every other code:
+        // the new field is skipped when None, so this test guards a wire-shape
+        // regression on all pre-existing error responses.
+        let v = serde_json::to_value(RtDbError::bad_request("x")).unwrap();
+        assert_eq!(v, json!({"code": "BAD_REQUEST", "message": "x"}));
     }
 }

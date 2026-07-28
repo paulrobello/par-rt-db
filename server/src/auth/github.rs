@@ -384,6 +384,8 @@ mod tests {
             max_affected_docs: 100,
             static_dir: None,
             pool_max_connections: 75,
+            rate_limit_per_token_rpm: 0,
+            rate_limit_per_db_rpm: 0,
         };
         assert!(GithubProvider::from_config(&cfg).is_none());
         cfg.github_client_id = Some("id".into());

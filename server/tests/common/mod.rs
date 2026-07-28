@@ -22,6 +22,8 @@ pub fn test_config() -> Config {
         max_affected_docs: 100,
         static_dir: None,
         pool_max_connections: 75,
+        rate_limit_per_token_rpm: 0,
+        rate_limit_per_db_rpm: 0,
     }
 }
 
@@ -38,12 +40,31 @@ pub fn test_hot() -> HotConfig {
     }
 }
 
+#[allow(dead_code)]
 pub async fn test_state() -> Arc<AppState> {
     let pool = sqlx::PgPool::connect(&test_config().database_url)
         .await
         .expect("connect to test postgres");
     db::bootstrap(&pool).await.expect("bootstrap rtdb_auth");
     AppState::new(pool, test_config(), test_hot())
+}
+
+/// Like `test_state` but with non-zero HTTP rate-limit ceilings. Used by
+/// `tests/rate_limit_test.rs` to exercise the per-token and per-db fixed-window
+/// limiter without touching env vars: the limiter reads
+/// `state.config.rate_limit_per_{token,db}_rpm`, so we set them on the Config
+/// before constructing AppState. This is the cleanest override path the
+/// codebase exposes — `test_config()` is already a public helper.
+#[allow(dead_code)]
+pub async fn test_state_with_rate_limits(per_token_rpm: u32, per_db_rpm: u32) -> Arc<AppState> {
+    let mut config = test_config();
+    config.rate_limit_per_token_rpm = per_token_rpm;
+    config.rate_limit_per_db_rpm = per_db_rpm;
+    let pool = sqlx::PgPool::connect(&config.database_url)
+        .await
+        .expect("connect to test postgres");
+    db::bootstrap(&pool).await.expect("bootstrap rtdb_auth");
+    AppState::new(pool, config, test_hot())
 }
 
 #[allow(dead_code)]

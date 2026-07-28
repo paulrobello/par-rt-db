@@ -14,6 +14,7 @@ pub mod pagination;
 pub mod privacy;
 pub mod protocol;
 pub mod query;
+pub mod rate_limit;
 pub mod scheduler;
 pub mod schema;
 pub mod snapshot;
@@ -75,6 +76,7 @@ pub struct AppState {
     pub realtime: Realtime,
     pub runtime: Runtime,
     pub auth: Auth,
+    pub rate_limiter: Arc<rate_limit::RateLimiter>,
 }
 
 impl AppState {
@@ -108,6 +110,7 @@ impl AppState {
             auth: Auth {
                 oauth_states: tokio::sync::Mutex::new(HashMap::new()),
             },
+            rate_limiter: rate_limit::RateLimiter::new(),
         })
     }
 }
