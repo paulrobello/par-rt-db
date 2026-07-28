@@ -97,6 +97,40 @@ def test_query_distinct_terminal():
     assert "distinct" not in TableQuery("t").build().model_dump(by_alias=True, mode="json")
 
 
+def test_query_aggregate_terminal():
+    # `aggregate` (no groupBy): `{op}` wire shape (groupBy defaults False and is
+    # omitted on the wire by the python mirror; the server's `#[serde(default)]`
+    # accepts either form).
+    wire = (
+        TableQuery("t")
+        .with_index("i")
+        .eq("a")
+        .build_for_aggregate("sum")
+        .model_dump(by_alias=True, mode="json")
+    )
+    assert wire["aggregate"] == {"op": "sum"}
+    # A bare query with no terminal must NOT emit `aggregate`.
+    assert "aggregate" not in TableQuery("t").build().model_dump(by_alias=True, mode="json")
+
+
+def test_query_aggregate_terminal_group_by():
+    # groupBy=True emits the camelCase flag on the wire.
+    wire = (
+        TableQuery("t")
+        .with_index("i")
+        .eq("a")
+        .build_for_aggregate("sum", group_by=True)
+        .model_dump(by_alias=True, mode="json")
+    )
+    assert wire["aggregate"] == {"op": "sum", "groupBy": True}
+
+
+def test_query_get_rejects_aggregate():
+    # `get` is mutually exclusive with `aggregate`, same shape as count/distinct.
+    with pytest.raises(ValueError):
+        TableQuery("t").get("x").aggregate("sum").build()
+
+
 def test_query_get_rejects_distinct():
     # `get` is mutually exclusive with `distinct`, same shape as count/first/unique.
     with pytest.raises(ValueError):
@@ -191,6 +225,22 @@ def test_parse_result_distinct_returns_scalar_list():
     ]
     assert parse_result(float, "distinct", [1.0, 2.0, 3.0]) == [1.0, 2.0, 3.0]
     assert parse_result(object, "distinct", []) == []
+
+
+def test_parse_result_aggregate_scalar_and_groups():
+    # Aggregate scalar result is a bare JSON value (server QueryResult::Aggregate).
+    # null (over an empty matching set) round-trips as None.
+    assert parse_result(float, "aggregate", 42.0) == 42.0
+    assert parse_result(object, "aggregate", "backlog") == "backlog"
+    assert parse_result(object, "aggregate", None) is None
+    # AggregateGroups: always returns list[AggregateGroup] (the {key, value}
+    # shape is fixed; `model` is ignored for this terminal).
+    from par_rt_db.wire import AggregateGroup
+
+    rows = parse_result(dict, "aggregateGroups", [{"key": "backlog", "value": 4.0}])
+    assert rows == [AggregateGroup(key="backlog", value=4.0)]
+    assert rows[0].key == "backlog"
+    assert rows[0].value == 4.0
 
 
 def test_parse_result_dict_model_returns_raw_dicts():

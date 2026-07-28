@@ -16,14 +16,18 @@ import type { RtQuery } from "../src/query.js";
 import { defineSchema, defineTable, t } from "../src/schema.js";
 
 // Schema with btree + search + vector indexes on one table — enough to drive
-// every terminal in the matrix.
+// every terminal in the matrix. The 2-field `by_title_count` index covers
+// aggregate's `eq prefix + aggregate field` shape and the groupBy
+// 2-fields-beyond-prefix shape.
 const schema = defineSchema({
   items: defineTable({
     title: t.string(),
     body: t.string(),
+    count: t.number(),
     embedding: t.vector(3),
   })
     .index("by_title", ["title"])
+    .index("by_title_count", ["title", "count"])
     .searchIndex("search_body", ["title", "body"])
     .vectorIndex("by_embedding", "embedding", 3),
 });
@@ -476,6 +480,127 @@ const CASES: readonly Case[] = [
       q.vectorSearch = vectorEmbeddingLimit1();
     },
     expected: Outcome.Reject,
+  },
+  // ============ aggregate rejects get, take, unique, first, count, distinct,
+  //              order, paginate, search, vectorSearch (standalone terminal
+  //              like count/distinct); composes with index/eq/range/filter ============
+  {
+    name: "solo: aggregate",
+    build: (q) => {
+      q.aggregate = { op: "min" };
+      q.index = "by_title";
+    },
+    expected: Outcome.Accept,
+  },
+  {
+    name: "aggregate+get",
+    build: (q) => {
+      q.aggregate = { op: "min" };
+      q.index = "by_title";
+      q.get = ID;
+    },
+    expected: Outcome.Reject,
+  },
+  {
+    name: "aggregate+take",
+    build: (q) => {
+      q.aggregate = { op: "min" };
+      q.index = "by_title";
+      q.take = 1;
+    },
+    expected: Outcome.Reject,
+  },
+  {
+    name: "aggregate+unique",
+    build: (q) => {
+      q.aggregate = { op: "min" };
+      q.index = "by_title";
+      q.unique = true;
+    },
+    expected: Outcome.Reject,
+  },
+  {
+    name: "aggregate+first",
+    build: (q) => {
+      q.aggregate = { op: "min" };
+      q.index = "by_title";
+      q.first = true;
+    },
+    expected: Outcome.Reject,
+  },
+  {
+    name: "aggregate+count",
+    build: (q) => {
+      q.aggregate = { op: "min" };
+      q.index = "by_title";
+      q.count = true;
+    },
+    expected: Outcome.Reject,
+  },
+  {
+    name: "aggregate+distinct",
+    build: (q) => {
+      q.aggregate = { op: "min" };
+      q.index = "by_title";
+      q.distinct = true;
+    },
+    expected: Outcome.Reject,
+  },
+  {
+    name: "aggregate+order",
+    build: (q) => {
+      q.aggregate = { op: "min" };
+      q.index = "by_title";
+      q.order = "asc";
+    },
+    expected: Outcome.Reject,
+  },
+  {
+    name: "aggregate+paginate",
+    build: (q) => {
+      q.aggregate = { op: "min" };
+      q.index = "by_title";
+      q.paginate = paginateNum1();
+    },
+    expected: Outcome.Reject,
+  },
+  {
+    name: "aggregate+search",
+    build: (q) => {
+      q.aggregate = { op: "min" };
+      q.index = "by_title";
+      q.search = searchBodyX();
+    },
+    expected: Outcome.Reject,
+  },
+  {
+    name: "aggregate+vectorSearch",
+    build: (q) => {
+      q.aggregate = { op: "min" };
+      q.index = "by_title";
+      q.vectorSearch = vectorEmbeddingLimit1();
+    },
+    expected: Outcome.Reject,
+  },
+  {
+    name: "compose: aggregate+eq",
+    build: (q) => {
+      // by_title_count has [title, count]; consuming title leaves count (numeric)
+      // as the aggregate field, so SUM is valid.
+      q.aggregate = { op: "sum" };
+      q.index = "by_title_count";
+      q.eq = ["x"];
+    },
+    expected: Outcome.Accept,
+  },
+  {
+    name: "compose: aggregate+filter",
+    build: (q) => {
+      q.aggregate = { op: "min" };
+      q.index = "by_title";
+      q.filter = filterEqTitleX();
+    },
+    expected: Outcome.Accept,
   },
   // ============ paginate rejects count, unique, first, take (get covered above) ============
   {

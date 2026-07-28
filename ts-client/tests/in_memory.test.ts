@@ -197,6 +197,126 @@ describe("InMemoryRtDbClient — query by index", () => {
     });
   });
 
+  it("aggregate sums the next index field over the matching set", async () => {
+    const c = newClient();
+    await seed(c); // 3× todo with orders 3, 1, 2 → sum = 6
+    const v = await c.query(
+      api.items.query().withIndex("by_status_and_order", ["todo"]).aggregate("sum"),
+    );
+    expect(v).toBe(6);
+  });
+
+  it("aggregate avg / min / max over the matching set", async () => {
+    const c = newClient();
+    await seed(c); // orders {3,1,2}
+    const avg = await c.query(
+      api.items.query().withIndex("by_status_and_order", ["todo"]).aggregate("avg"),
+    );
+    expect(avg).toBe(2);
+    const min = await c.query(
+      api.items.query().withIndex("by_status_and_order", ["todo"]).aggregate("min"),
+    );
+    expect(min).toBe(1);
+    const max = await c.query(
+      api.items.query().withIndex("by_status_and_order", ["todo"]).aggregate("max"),
+    );
+    expect(max).toBe(3);
+  });
+
+  it("aggregate respects a range bound on the aggregate field", async () => {
+    const c = newClient();
+    await seed(c); // orders {3,1,2}; gt 1 → {3,2} → sum = 5
+    const v = await c.query(
+      api.items.query().withIndex("by_status_and_order", ["todo"]).gt(1).aggregate("sum"),
+    );
+    expect(v).toBe(5);
+  });
+
+  it("aggregate returns null when no rows match", async () => {
+    const c = newClient();
+    await seed(c); // 3× todo, no `done` rows
+    // by_status_and_order has [status, order]; eq=["done"] leaves `order` as
+    // the aggregate field. Zero matching rows → sum is null.
+    const v = await c.query(
+      api.items.query().withIndex("by_status_and_order", ["done"]).aggregate("sum"),
+    );
+    expect(v).toBeNull();
+  });
+
+  it("aggregate sum on a non-numeric index field is bad request", async () => {
+    const c = newClient();
+    await seed(c);
+    // by_name's only field is `name` (string); sum/avg require numeric.
+    await expect(
+      c.query(api.items.query().withIndex("by_name", ["a"]).aggregate("sum")),
+    ).rejects.toMatchObject({
+      name: "RtDbError",
+      code: "BAD_REQUEST",
+      message: /requires a numeric index field/,
+    });
+  });
+
+  it("aggregate without an index is bad request", async () => {
+    const c = newClient();
+    await seed(c);
+    await expect(c.query(api.items.query().aggregate("sum"))).rejects.toMatchObject({
+      name: "RtDbError",
+      code: "BAD_REQUEST",
+      message: /aggregate requires an index field beyond the eq prefix/,
+    });
+  });
+
+  it("aggregate groupBy returns one {key,value} per group, ordered by key", async () => {
+    const c = newClient();
+    // Seed three statuses; each `status` group sums its `order` values.
+    await c.mutate(mutation().insert("items", { name: "a", status: "todo", order: 1 }).build());
+    await c.mutate(mutation().insert("items", { name: "b", status: "todo", order: 2 }).build());
+    await c.mutate(mutation().insert("items", { name: "c", status: "done", order: 5 }).build());
+    // by_status_and_order has [status, order]; eq=[] leaves status as group key
+    // and order as the aggregate field.
+    const rows = (await c.query(
+      api.items.query().withIndex("by_status_and_order", []).aggregate("sum", true),
+    )) as { key: unknown; value: unknown }[];
+    expect(rows).toEqual([
+      { key: "done", value: 5 },
+      { key: "todo", value: 3 },
+    ]);
+  });
+
+  it("aggregate groupBy requires two index fields beyond the eq prefix", async () => {
+    const c = newClient();
+    await seed(c);
+    // by_status has only one field; groupBy needs two (one to group by, one to
+    // aggregate). Without an eq prefix, eqLen=0 so eqLen+1 >= fields.length (1).
+    await expect(
+      c.query(api.items.query().withIndex("by_status", []).aggregate("sum", true)),
+    ).rejects.toMatchObject({
+      name: "RtDbError",
+      code: "BAD_REQUEST",
+      message: /requires two index fields beyond the eq prefix/,
+    });
+  });
+
+  it("aggregate combined with take is bad request", async () => {
+    const c = newClient();
+    await seed(c);
+    await expect(
+      c.query({
+        json: {
+          table: "items",
+          index: "by_status_and_order",
+          eq: ["todo"],
+          aggregate: { op: "sum" },
+          take: 10,
+        },
+      } as RtQuery<unknown>),
+    ).rejects.toMatchObject({
+      name: "RtDbError",
+      code: "BAD_REQUEST",
+      message: /aggregate cannot be combined with take/,
+    });
+  });
+
   it("unique throws PRECONDITION_FAILED when more than one doc matches", async () => {
     const c = newClient();
     await c.mutate(mutation().insert("items", { name: "dup", status: "todo", order: 1 }).build());

@@ -54,6 +54,8 @@ pub struct Query {
     #[serde(default, skip_serializing_if = "is_false")]
     pub distinct: bool, // terminal: SELECT DISTINCT of index.fields[eq.len()] over the same eq/range WHERE; mutually exclusive with every other terminal
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aggregate: Option<AggregateSpec>, // terminal: <OP>("<col>") [GROUP BY "<groupcol>"] over the same eq/range WHERE; mutually exclusive with every other terminal
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub paginate: Option<Paginate>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filter: Option<FilterExpr>, // additional WHERE predicate over doc fields; composes with index/order/take/cursor
@@ -107,6 +109,54 @@ pub struct VectorSearchQuery {
     pub filter: BTreeMap<String, serde_json::Value>,
 }
 
+/// Aggregate operator for the `aggregate` terminal. Mirrors the SQL aggregate
+/// of the same name. `Sum`/`Avg` require a numeric index field; `Min`/`Max`
+/// work on any orderable indexed field. Serializes lowercase (`"sum"`/`"avg"`/
+/// `"min"`/`"max"`) — byte-identical to the TS/Rust/Python client mirrors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AggregateOp {
+    Sum,
+    Avg,
+    Min,
+    Max,
+}
+
+impl AggregateOp {
+    /// The SQL aggregate function name (uppercase, matching the SQL keyword).
+    fn sql_fn(self) -> &'static str {
+        match self {
+            AggregateOp::Sum => "SUM",
+            AggregateOp::Avg => "AVG",
+            AggregateOp::Min => "MIN",
+            AggregateOp::Max => "MAX",
+        }
+    }
+}
+
+/// `aggregate` terminal spec. `op` selects the SQL aggregate run over the index
+/// field after the eq prefix (`index.fields[eq.len()]`); `group_by` shifts the
+/// terminal to a grouped aggregate — groups by `index.fields[eq.len()]` and
+/// aggregates `index.fields[eq.len()+1]`, returning `{key, value}` rows. Wire
+/// shape is camelCase (`groupBy`) to match the rest of the protocol.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AggregateSpec {
+    pub op: AggregateOp,
+    #[serde(default)]
+    pub group_by: bool,
+}
+
+/// One `{key, value}` row from a grouped `aggregate` (`groupBy: true`) terminal.
+/// `key` is the group's value of the index field after the eq prefix; `value`
+/// is the aggregate over the field after that. Serializes camelCase.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AggregateGroup {
+    pub key: serde_json::Value,
+    pub value: serde_json::Value,
+}
+
 /// A db-side predicate appended to a query's WHERE clause. Leaves compare one
 /// declared field to a value (`in` to a non-empty list); `and`/`or` nest
 /// arbitrarily. Compilation: an *indexed* field compares against its typed
@@ -156,11 +206,13 @@ pub enum FilterExpr {
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(untagged)]
 pub enum QueryResult {
-    Doc(Option<serde_json::Value>),   // get / unique: doc or null
-    Docs(Vec<serde_json::Value>),     // take / collect
-    Count(i64),                       // count: total matching rows, uncapped by MAX_TAKE
-    Paginated(PaginatedResult),       // paginate: page of docs + optional next cursor
+    Doc(Option<serde_json::Value>),       // get / unique: doc or null
+    Docs(Vec<serde_json::Value>),         // take / collect
+    Count(i64),                           // count: total matching rows, uncapped by MAX_TAKE
+    Paginated(PaginatedResult),           // paginate: page of docs + optional next cursor
     Distinct(Vec<serde_json::Value>), // distinct: unique values of index.fields[eq.len()] over the matching set
+    Aggregate(serde_json::Value), // aggregate: bare scalar (null if no rows match), e.g. `42`, `"x"`, `null`
+    AggregateGroups(Vec<AggregateGroup>), // aggregate groupBy: array of `{key, value}` rows
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -206,6 +258,7 @@ enum Peer {
     First,
     Count,
     Distinct,
+    Aggregate,
     Paginate,
     Filter,
     Search,
@@ -228,6 +281,7 @@ impl Peer {
             Self::First => q.first,
             Self::Count => q.count,
             Self::Distinct => q.distinct,
+            Self::Aggregate => q.aggregate.is_some(),
             Self::Paginate => q.paginate.is_some(),
             Self::Filter => q.filter.is_some(),
             Self::Search => q.search.is_some(),
@@ -286,15 +340,16 @@ const GET_PEERS: &[Peer] = &[
     Peer::First,
     Peer::Count,
     Peer::Distinct,
+    Peer::Aggregate,
     Peer::Paginate,
     Peer::Filter,
     Peer::Search,
     Peer::VectorSearch,
 ];
-const GET_MESSAGE: &str = "get cannot be combined with index, eq, range bounds, order, take, unique, first, count, distinct, paginate, filter, search, or vector search";
+const GET_MESSAGE: &str = "get cannot be combined with index, eq, range bounds, order, take, unique, first, count, distinct, aggregate, paginate, filter, search, or vector search";
 
-const UNIQUE_PEERS: &[Peer] = &[Peer::Take, Peer::Order, Peer::Distinct];
-const UNIQUE_MESSAGE: &str = "unique cannot be combined with take, order, or distinct";
+const UNIQUE_PEERS: &[Peer] = &[Peer::Take, Peer::Order, Peer::Distinct, Peer::Aggregate];
+const UNIQUE_MESSAGE: &str = "unique cannot be combined with take, order, distinct, or aggregate";
 
 const FIRST_INCOMPATIBLES: &[Incompatible] = &[
     Incompatible {
@@ -308,6 +363,10 @@ const FIRST_INCOMPATIBLES: &[Incompatible] = &[
     Incompatible {
         peer: Peer::Distinct,
         message: "first cannot be combined with distinct",
+    },
+    Incompatible {
+        peer: Peer::Aggregate,
+        message: "first cannot be combined with aggregate",
     },
 ];
 
@@ -331,6 +390,10 @@ const COUNT_INCOMPATIBLES: &[Incompatible] = &[
     Incompatible {
         peer: Peer::Distinct,
         message: "count cannot be combined with distinct",
+    },
+    Incompatible {
+        peer: Peer::Aggregate,
+        message: "count cannot be combined with aggregate",
     },
 ];
 
@@ -356,6 +419,10 @@ const DISTINCT_INCOMPATIBLES: &[Incompatible] = &[
         message: "distinct cannot be combined with count",
     },
     Incompatible {
+        peer: Peer::Aggregate,
+        message: "distinct cannot be combined with aggregate",
+    },
+    Incompatible {
         peer: Peer::Order,
         message: "distinct cannot be combined with order",
     },
@@ -373,6 +440,55 @@ const DISTINCT_INCOMPATIBLES: &[Incompatible] = &[
     },
 ];
 
+/// `aggregate` is a standalone terminal like `distinct`/`count`: it rejects
+/// every other terminal except `index`/`eq`/range bounds/`filter` (which
+/// narrow the matching set the aggregate runs over). `take` is also rejected
+/// — groups are capped internally by `MAX_TAKE` instead, so the matrix stays
+/// simple (the alternative was a `take`-caps-groups carve-out that crossed
+/// two terminals).
+const AGGREGATE_INCOMPATIBLES: &[Incompatible] = &[
+    Incompatible {
+        peer: Peer::Get,
+        message: "aggregate cannot be combined with get",
+    },
+    Incompatible {
+        peer: Peer::Take,
+        message: "aggregate cannot be combined with take",
+    },
+    Incompatible {
+        peer: Peer::Unique,
+        message: "aggregate cannot be combined with unique",
+    },
+    Incompatible {
+        peer: Peer::First,
+        message: "aggregate cannot be combined with first",
+    },
+    Incompatible {
+        peer: Peer::Count,
+        message: "aggregate cannot be combined with count",
+    },
+    Incompatible {
+        peer: Peer::Distinct,
+        message: "aggregate cannot be combined with distinct",
+    },
+    Incompatible {
+        peer: Peer::Order,
+        message: "aggregate cannot be combined with order",
+    },
+    Incompatible {
+        peer: Peer::Paginate,
+        message: "aggregate cannot be combined with paginate",
+    },
+    Incompatible {
+        peer: Peer::Search,
+        message: "aggregate cannot be combined with search",
+    },
+    Incompatible {
+        peer: Peer::VectorSearch,
+        message: "aggregate cannot be combined with vector search",
+    },
+];
+
 const PAGINATE_INCOMPATIBLES: &[Incompatible] = &[
     Incompatible {
         peer: Peer::Get,
@@ -385,6 +501,10 @@ const PAGINATE_INCOMPATIBLES: &[Incompatible] = &[
     Incompatible {
         peer: Peer::Distinct,
         message: "paginate cannot be combined with distinct",
+    },
+    Incompatible {
+        peer: Peer::Aggregate,
+        message: "paginate cannot be combined with aggregate",
     },
     Incompatible {
         peer: Peer::Unique,
@@ -412,6 +532,7 @@ const VECTOR_SEARCH_PEERS: &[Peer] = &[
     Peer::First,
     Peer::Count,
     Peer::Distinct,
+    Peer::Aggregate,
     Peer::Paginate,
     Peer::Filter,
     Peer::Search,
@@ -431,11 +552,12 @@ const SEARCH_PEERS: &[Peer] = &[
     Peer::First,
     Peer::Count,
     Peer::Distinct,
+    Peer::Aggregate,
     Peer::Paginate,
     Peer::Filter,
     Peer::VectorSearch,
 ];
-const SEARCH_MESSAGE: &str = "search cannot be combined with index, eq, range bounds, order, unique, first, count, distinct, paginate, filter, or vector search";
+const SEARCH_MESSAGE: &str = "search cannot be combined with index, eq, range bounds, order, unique, first, count, distinct, aggregate, paginate, filter, or vector search";
 
 /// Result docs = stored doc merged with {"_id", "_creationTime", "_version"}.
 /// get: point SELECT, null if missing. unique: error PreconditionFailed "unique query matched
@@ -461,6 +583,15 @@ const SEARCH_MESSAGE: &str = "search cannot be combined with index, eq, range bo
 /// both an `index` and an index field beyond the eq prefix → BadRequest otherwise. Mutually
 /// exclusive with every other terminal except `eq`/range bounds/`filter` (which narrow the
 /// matching set the distinct values are drawn from).
+/// `aggregate` is a terminal that runs `SUM`/`AVG`/`MIN`/`MAX` over the index field immediately
+/// after the `eq` prefix using the same eq/range WHERE clause, returning `Aggregate(value)` — a
+/// bare scalar (null if no rows match). With `groupBy: true`, it groups by `index.fields[eq.len()]`
+/// and aggregates `index.fields[eq.len()+1]`, returning `AggregateGroups([{key,value},…])`
+/// ordered by group key and capped by `MAX_TAKE`. `sum`/`avg` require a numeric aggregate field
+/// (only `number` is numeric among indexable types) → BadRequest otherwise. Requires an index AND
+/// a field beyond the eq prefix (TWO fields beyond for `groupBy`) → BadRequest otherwise. Mutually
+/// exclusive with every other terminal except `eq`/range bounds/`filter` (which narrow the
+/// matching set); `take` is also rejected — group count is capped internally by `MAX_TAKE`.
 /// Unknown table -> NotFound; unknown index / eq too long / get+query mix / unique+take /
 /// first+take / first+unique / count+take / count+unique / count+first / count+order -> BadRequest.
 /// `take: 0` is valid and returns an empty `Docs([])`, not an error.
@@ -495,6 +626,10 @@ pub async fn execute_query(
 
     if q.distinct {
         reject_per_peer_set(q, DISTINCT_INCOMPATIBLES)?;
+    }
+
+    if q.aggregate.is_some() {
+        reject_per_peer_set(q, AGGREGATE_INCOMPATIBLES)?;
     }
 
     if q.paginate.is_some() {
@@ -717,6 +852,133 @@ pub async fn execute_query(
         let rows = query.fetch_all(pool).await?;
         let values: Vec<serde_json::Value> = rows.into_iter().map(|(v,)| v).collect();
         return Ok(QueryResult::Distinct(values));
+    }
+
+    // Aggregate terminal: runs `<OP>("<col>")` (SUM/AVG/MIN/MAX) over the same
+    // eq/range WHERE clause every other terminal builds, returning one scalar
+    // (`Aggregate(value)`). With `group_by: true`, it groups by the index field
+    // after the eq prefix and aggregates the one after that, returning
+    // `AggregateGroups([{key,value},…])`. The combination cascade already
+    // rejected every other terminal; `aggregate` composes only with `index`/
+    // `eq`/range bounds/`filter`. The preconditions below reject the no-index,
+    // no-remaining-field, and (for sum/avg) non-numeric-field cases. Group count
+    // is capped by `MAX_TAKE` for parity with `collect`.
+    if let Some(agg) = &q.aggregate {
+        let idx = index_def.ok_or_else(|| {
+            RtDbError::bad_request("aggregate requires an index field beyond the eq prefix")
+        })?;
+        // Resolve the aggregate field (the one after the eq prefix for plain
+        // aggregate, the one after that for groupBy) and validate the schema
+        // field type for sum/avg's numeric requirement. The groupcol for the
+        // groupBy case is the same field distinct would use.
+        let (group_col, agg_field_name) = if agg.group_by {
+            if eq_len + 1 >= idx.fields.len() {
+                return Err(RtDbError::bad_request(
+                    "aggregate groupBy requires two index fields beyond the eq prefix",
+                ));
+            }
+            let group_field = idx.fields[eq_len].as_str();
+            let agg_field = idx.fields[eq_len + 1].as_str();
+            (Some(pg_col(group_field)), agg_field)
+        } else {
+            if eq_len >= idx.fields.len() {
+                return Err(RtDbError::bad_request(
+                    "aggregate requires an index field beyond the eq prefix",
+                ));
+            }
+            (None, idx.fields[eq_len].as_str())
+        };
+        let agg_field_type = table_def.fields.get(agg_field_name).ok_or_else(|| {
+            RtDbError::internal(format!("index references unknown field '{agg_field_name}'"))
+        })?;
+        if matches!(agg.op, AggregateOp::Sum | AggregateOp::Avg)
+            && !is_numeric_index_field(agg_field_type)
+        {
+            return Err(RtDbError::bad_request(format!(
+                "aggregate op {} requires a numeric index field",
+                agg.op.sql_fn().to_lowercase()
+            )));
+        }
+        let agg_col = pg_col(agg_field_name);
+        let pg_schema_name = pg_schema(db);
+        let table_ident = pg_table(&q.table);
+        let op_sql = agg.op.sql_fn();
+        // Project via `to_jsonb` so a single `serde_json::Value` decoder handles
+        // text/number/boolean columns uniformly, exactly like `distinct`. A
+        // scalar SUM/AVG/MIN/MAX over zero matching rows yields one row with
+        // SQL NULL → `serde_json::Value::Null`.
+        if let Some(group_col) = group_col {
+            let mut sql = format!(
+                "SELECT to_jsonb(\"{group_col}\") AS k, to_jsonb({op_sql}(\"{agg_col}\")) AS v FROM \"{pg_schema_name}\".\"{table_ident}\""
+            );
+            if !where_conditions.is_empty() {
+                sql.push_str(" WHERE ");
+                sql.push_str(&where_conditions.join(" AND "));
+            }
+            sql.push_str(&format!(
+                " GROUP BY \"{group_col}\" ORDER BY k LIMIT ${limit_placeholder}"
+            ));
+            let mut query = sqlx::query_as::<_, (serde_json::Value, serde_json::Value)>(&sql);
+            for bind in binds {
+                query = match bind {
+                    EqBind::Text(v) => query.bind(v),
+                    EqBind::Num(v) => query.bind(v),
+                    EqBind::Bool(v) => query.bind(v),
+                };
+            }
+            for bind in range_binds {
+                query = match bind {
+                    EqBind::Text(v) => query.bind(v),
+                    EqBind::Num(v) => query.bind(v),
+                    EqBind::Bool(v) => query.bind(v),
+                };
+            }
+            for bind in &filter_binds {
+                query = match bind {
+                    EqBind::Text(v) => query.bind(v),
+                    EqBind::Num(v) => query.bind(v),
+                    EqBind::Bool(v) => query.bind(v),
+                };
+            }
+            query = query.bind(i64::from(MAX_TAKE));
+            let rows = query.fetch_all(pool).await?;
+            let groups: Vec<AggregateGroup> = rows
+                .into_iter()
+                .map(|(k, v)| AggregateGroup { key: k, value: v })
+                .collect();
+            return Ok(QueryResult::AggregateGroups(groups));
+        }
+        let mut sql = format!(
+            "SELECT COALESCE(to_jsonb({op_sql}(\"{agg_col}\")), 'null'::jsonb) AS v FROM \"{pg_schema_name}\".\"{table_ident}\""
+        );
+        if !where_conditions.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&where_conditions.join(" AND "));
+        }
+        let mut query = sqlx::query_as::<_, (serde_json::Value,)>(&sql);
+        for bind in binds {
+            query = match bind {
+                EqBind::Text(v) => query.bind(v),
+                EqBind::Num(v) => query.bind(v),
+                EqBind::Bool(v) => query.bind(v),
+            };
+        }
+        for bind in range_binds {
+            query = match bind {
+                EqBind::Text(v) => query.bind(v),
+                EqBind::Num(v) => query.bind(v),
+                EqBind::Bool(v) => query.bind(v),
+            };
+        }
+        for bind in &filter_binds {
+            query = match bind {
+                EqBind::Text(v) => query.bind(v),
+                EqBind::Num(v) => query.bind(v),
+                EqBind::Bool(v) => query.bind(v),
+            };
+        }
+        let (v,) = query.fetch_one(pool).await?;
+        return Ok(QueryResult::Aggregate(v));
     }
 
     let mut sort_cols: Vec<String> = match index_def {
@@ -1468,6 +1730,19 @@ fn owner_filter(
         }),
         (Some(f), _, _) => Some(f.clone()),
         (None, _, _) => None,
+    }
+}
+
+/// Whether an indexed field's declared type is numeric (the only numeric
+/// shape among indexable types is `Number`; `Int64` is not indexable, so it
+/// can't appear here). Used by the `aggregate` terminal to reject `sum`/`avg`
+/// over a non-numeric index field. Unwraps one layer of `Optional` so an
+/// `Optional<Number>` index field still qualifies.
+fn is_numeric_index_field(ty: &FieldType) -> bool {
+    match ty {
+        FieldType::Number => true,
+        FieldType::Optional { inner } => is_numeric_index_field(inner),
+        _ => false,
     }
 }
 

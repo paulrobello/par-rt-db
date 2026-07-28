@@ -188,6 +188,52 @@ class SearchQuery(_Camel):
     query: str
 
 
+class AggregateOp:
+    """Lowercase aggregate-op wire tags for the ``aggregate`` terminal.
+
+    Mirrors ``server/src/query.rs::AggregateOp`` (``#[serde(rename_all =
+    "lowercase")]``) — the four SQL aggregates this terminal can run. A plain
+    class because Python's ``Literal`` already gives us the closed domain; this
+    is just the canonical string constants.
+    """
+
+    SUM = "sum"
+    AVG = "avg"
+    MIN = "min"
+    MAX = "max"
+
+
+class AggregateSpec(_Camel):
+    """``aggregate`` terminal spec: ``{op, groupBy?}``.
+
+    ``op`` selects the SQL aggregate run over the index field after the eq
+    prefix; ``groupBy`` (camelCase on the wire) shifts the terminal to a grouped
+    aggregate. Mirrors ``server/src/query.rs::AggregateSpec`` byte-for-byte.
+    ``groupBy`` is omitted on the wire when ``False`` (mirrors the TS/Rust
+    clients' skip-when-false convention; the server accepts either form).
+    """
+
+    op: Literal["sum", "avg", "min", "max"]
+    group_by: bool = False
+
+    @model_serializer(mode="wrap")
+    def _drop_false_group_by(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        out = handler(self)
+        if out.get("groupBy") is False:
+            out.pop("groupBy", None)
+        return out
+
+
+class AggregateGroup(_Camel):
+    """One ``{key, value}`` row from a grouped ``aggregate`` terminal.
+
+    Mirrors ``server/src/query.rs::AggregateGroup`` byte-for-byte (camelCase).
+    """
+
+    key: Any
+    value: Any
+
+
 class VectorSearchQuery(_Camel):
     """Vector-similarity terminal: ``{index, vector, limit, filter?}``.
 

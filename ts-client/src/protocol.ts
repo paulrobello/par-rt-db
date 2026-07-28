@@ -18,6 +18,7 @@ export interface QueryJson {
   first?: boolean;
   count?: boolean;
   distinct?: boolean;
+  aggregate?: AggregateSpec;
   paginate?: Paginate;
   filter?: FilterExpr;
   search?: SearchQuery;
@@ -49,6 +50,26 @@ export type FilterExpr =
 export interface SearchQuery {
   index: string;
   query: string;
+}
+
+/** Mirrors server `query::AggregateOp` byte-for-byte (lowercase variants). */
+export type AggregateOp = "sum" | "avg" | "min" | "max";
+
+/** Mirrors server `query::AggregateSpec` byte-for-byte (camelCase, deny_unknown_fields).
+ * `groupBy` defaults false — the server emits `false` even when unset (it uses
+ * `#[serde(default)]`, not a skip predicate), but we omit it on the wire when
+ * false to match the SDK's omit-when-default convention; the server accepts
+ * either form (the field is `#[serde(default)]`). */
+export interface AggregateSpec {
+  op: AggregateOp;
+  groupBy?: boolean;
+}
+
+/** Mirrors server `query::AggregateGroup` byte-for-byte (camelCase). One row
+ * from a grouped `aggregate` (`groupBy: true`) terminal. */
+export interface AggregateGroup {
+  key: unknown;
+  value: unknown;
 }
 
 /** Mirrors server `query::VectorSearchQuery` byte-for-byte (camelCase, deny_unknown_fields).
@@ -89,6 +110,8 @@ export type QueryResultJson =
   | { type: "docs"; value: unknown[] }
   | { type: "count"; value: number }
   | { type: "distinct"; value: unknown[] }
+  | { type: "aggregate"; value: unknown }
+  | { type: "aggregateGroups"; value: AggregateGroup[] }
   | { type: "paginated"; value: PaginatedResultJson };
 
 /**

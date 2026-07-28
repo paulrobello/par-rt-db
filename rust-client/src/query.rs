@@ -1,6 +1,6 @@
 //! Query DSL: builds the exact `Query` JSON the server expects, and parses untagged results.
 
-use crate::wire::{FilterExpr, SearchQuery};
+use crate::wire::{AggregateOp, AggregateSpec, FilterExpr, SearchQuery};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -50,6 +50,11 @@ pub struct Query {
     pub count: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub distinct: bool,
+    /// Aggregate terminal: SUM/AVG/MIN/MAX over the index field after the eq
+    /// prefix; `group_by` shifts to a grouped aggregate. Mutually exclusive with
+    /// every other terminal except `eq`/range bounds/`filter`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aggregate: Option<AggregateSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub paginate: Option<Paginate>,
     /// Additional db-side WHERE predicate over doc fields; composes with
@@ -206,6 +211,19 @@ impl TableQuery {
         self.q.distinct = true;
         self.q
     }
+    /// Aggregate terminal: runs `<op>` (SUM/AVG/MIN/MAX) over the index field
+    /// immediately after the `eq` prefix. Without `group_by`, returns one scalar
+    /// (`null` if no rows match) — parse with `parse_result::<Option<serde_json::Value>>`
+    /// or `Option<f64>` for a numeric aggregate. With `group_by = true`, groups by
+    /// the index field after the eq prefix and aggregates the one after that,
+    /// returning `Vec<AggregateGroup>` (`{key, value}` rows ordered by group key).
+    /// `sum`/`avg` require a numeric aggregate field; the server rejects
+    /// non-numeric, no-index, or no-field-beyond-prefix cases. Mutually exclusive
+    /// with every other terminal except `eq`/range bounds/`filter`.
+    pub fn aggregate(mut self, op: AggregateOp, group_by: bool) -> Query {
+        self.q.aggregate = Some(AggregateSpec { op, group_by });
+        self.q
+    }
     pub fn paginate(mut self, cursor: Option<&str>, num_items: u32) -> Query {
         self.q.paginate = Some(Paginate {
             cursor: cursor.map(|c| c.into()),
@@ -241,6 +259,7 @@ pub fn parse_result<T: DeserializeOwned>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wire::AggregateGroup;
     use serde_json::json;
     use std::collections::BTreeMap;
 
@@ -306,6 +325,55 @@ mod tests {
             serde_json::to_value(&q).unwrap(),
             json!({"table":"items","index":"by_project_and_status","eq":["p1"],"distinct":true})
         );
+    }
+
+    #[test]
+    fn aggregate_terminal() {
+        // Aggregate without groupBy: bare `{op}` wire shape (groupBy defaults
+        // false and is omitted on the wire by the rust-client mirror, which
+        // round-trips back via `#[serde(default)]`).
+        let q = TableQuery::new("items")
+            .with_index("by_project_and_order", &[json!("p1")])
+            .aggregate(AggregateOp::Sum, false);
+        assert_eq!(
+            serde_json::to_value(&q).unwrap(),
+            json!({"table":"items","index":"by_project_and_order","eq":["p1"],"aggregate":{"op":"sum"}})
+        );
+    }
+
+    #[test]
+    fn aggregate_terminal_group_by() {
+        // groupBy=true emits the camelCase flag on the wire.
+        let q = TableQuery::new("items")
+            .with_index("by_project_status_order", &[json!("p1")])
+            .aggregate(AggregateOp::Sum, true);
+        assert_eq!(
+            serde_json::to_value(&q).unwrap(),
+            json!({"table":"items","index":"by_project_status_order","eq":["p1"],"aggregate":{"op":"sum","groupBy":true}})
+        );
+    }
+
+    #[test]
+    fn parse_aggregate_scalar_from_value() {
+        // Aggregate scalar result is a bare JSON value (number, string, or null
+        // when no rows match) — server QueryResult::Aggregate.
+        let n: serde_json::Value = parse_result(serde_json::json!(42)).unwrap();
+        assert_eq!(n, json!(42));
+        let null: serde_json::Value = parse_result(serde_json::Value::Null).unwrap();
+        assert_eq!(null, serde_json::Value::Null);
+    }
+
+    #[test]
+    fn parse_aggregate_groups_from_array() {
+        // AggregateGroups result is `[{key, value}, ...]` (server
+        // QueryResult::AggregateGroups). Decoded via `Vec<AggregateGroup>`.
+        let rows: Vec<AggregateGroup> =
+            parse_result(json!([{"key":"backlog","value":4}, {"key":"done","value":7}])).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].key, json!("backlog"));
+        assert_eq!(rows[0].value, json!(4));
+        assert_eq!(rows[1].key, json!("done"));
+        assert_eq!(rows[1].value, json!(7));
     }
 
     #[test]

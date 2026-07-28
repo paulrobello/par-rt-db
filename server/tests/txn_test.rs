@@ -261,6 +261,7 @@ async fn insert_strips_explicit_null_optional_field() -> anyhow::Result<()> {
             filter: None,
             search: None,
             vector_search: None,
+            aggregate: None,
         },
         None,
     )

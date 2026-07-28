@@ -2,6 +2,7 @@ import { RtDbError } from "./errors.js";
 import type { FileMetadata, UploadResult } from "./http.js";
 import { decodeCursor, encodeCursor } from "./pagination.js";
 import type {
+  AggregateOp,
   FieldTypeJson,
   FilterExpr,
   IndexJson,
@@ -347,6 +348,23 @@ function compareIndexValues(a: unknown, b: unknown): number {
     return 1;
   }
   return 0;
+}
+
+/** Applies one aggregate op over a non-empty `values` array. Mirrors the SQL
+ * semantics: SUM/AVG require all entries numeric; MIN/MAX pick the smallest/
+ * largest per `compareIndexValues` so a string field's MIN/MAX matches Postgres
+ * lexicographic ordering. AVG returns the arithmetic mean (no rounding). */
+function applyAggregate(op: AggregateOp, values: unknown[]): unknown {
+  switch (op) {
+    case "sum":
+      return values.reduce<number>((acc, v) => acc + (v as number), 0);
+    case "avg":
+      return values.reduce<number>((acc, v) => acc + (v as number), 0) / values.length;
+    case "min":
+      return values.reduce((best, v) => (compareIndexValues(best, v) <= 0 ? best : v));
+    case "max":
+      return values.reduce((best, v) => (compareIndexValues(best, v) >= 0 ? best : v));
+  }
 }
 
 type FilterLeafOp = "eq" | "neq" | "gt" | "gte" | "lt" | "lte";
@@ -903,6 +921,7 @@ export class InMemoryRtDbClient {
         q.first ||
         q.count ||
         q.distinct ||
+        q.aggregate !== undefined ||
         q.paginate !== undefined ||
         q.filter !== undefined ||
         q.search !== undefined ||
@@ -910,18 +929,21 @@ export class InMemoryRtDbClient {
       ) {
         throw new RtDbError(
           "BAD_REQUEST",
-          "get cannot be combined with index, eq, range bounds, order, take, unique, first, count, distinct, paginate, filter, search, or vector search",
+          "get cannot be combined with index, eq, range bounds, order, take, unique, first, count, distinct, aggregate, paginate, filter, search, or vector search",
         );
       }
       const row = this.rowsFor(q.table).get(q.get);
       return row ? this.mergeDoc(row) : null;
     }
 
-    if (q.unique && (q.take !== undefined || q.order !== undefined)) {
-      throw new RtDbError("BAD_REQUEST", "unique cannot be combined with take, order, or distinct");
-    }
-    if (q.unique && q.distinct) {
-      throw new RtDbError("BAD_REQUEST", "unique cannot be combined with take, order, or distinct");
+    if (
+      q.unique &&
+      (q.take !== undefined || q.order !== undefined || q.distinct || q.aggregate !== undefined)
+    ) {
+      throw new RtDbError(
+        "BAD_REQUEST",
+        "unique cannot be combined with take, order, distinct, or aggregate",
+      );
     }
     if (q.first && q.unique) {
       throw new RtDbError("BAD_REQUEST", "first cannot be combined with unique");
@@ -931,6 +953,9 @@ export class InMemoryRtDbClient {
     }
     if (q.first && q.distinct) {
       throw new RtDbError("BAD_REQUEST", "first cannot be combined with distinct");
+    }
+    if (q.first && q.aggregate !== undefined) {
+      throw new RtDbError("BAD_REQUEST", "first cannot be combined with aggregate");
     }
     if (q.count && q.unique) {
       throw new RtDbError("BAD_REQUEST", "count cannot be combined with unique");
@@ -946,6 +971,9 @@ export class InMemoryRtDbClient {
     }
     if (q.count && q.distinct) {
       throw new RtDbError("BAD_REQUEST", "count cannot be combined with distinct");
+    }
+    if (q.count && q.aggregate !== undefined) {
+      throw new RtDbError("BAD_REQUEST", "count cannot be combined with aggregate");
     }
     // `distinct` is a standalone terminal like `count`: it rejects every other
     // terminal except `index`/`eq`/range bounds/`filter` (which compose by
@@ -967,6 +995,30 @@ export class InMemoryRtDbClient {
       if (q.vectorSearch !== undefined) {
         throw new RtDbError("BAD_REQUEST", "distinct cannot be combined with vector search");
       }
+      if (q.aggregate !== undefined) {
+        throw new RtDbError("BAD_REQUEST", "distinct cannot be combined with aggregate");
+      }
+    }
+    // `aggregate` is a standalone terminal like `distinct`: it rejects every
+    // other terminal except `index`/`eq`/range bounds/`filter`. The
+    // `get`/`unique`/`first`/`count`/`distinct` peers above already throw on
+    // `+aggregate`; this branch covers the rest.
+    if (q.aggregate !== undefined) {
+      if (q.take !== undefined) {
+        throw new RtDbError("BAD_REQUEST", "aggregate cannot be combined with take");
+      }
+      if (q.order !== undefined) {
+        throw new RtDbError("BAD_REQUEST", "aggregate cannot be combined with order");
+      }
+      if (q.paginate !== undefined) {
+        throw new RtDbError("BAD_REQUEST", "aggregate cannot be combined with paginate");
+      }
+      if (q.search !== undefined) {
+        throw new RtDbError("BAD_REQUEST", "aggregate cannot be combined with search");
+      }
+      if (q.vectorSearch !== undefined) {
+        throw new RtDbError("BAD_REQUEST", "aggregate cannot be combined with vector search");
+      }
     }
     if (q.paginate !== undefined) {
       // Combination guards mirror server `validate_query`: paginate is one-shot
@@ -977,6 +1029,9 @@ export class InMemoryRtDbClient {
       }
       if (q.distinct) {
         throw new RtDbError("BAD_REQUEST", "paginate cannot be combined with distinct");
+      }
+      if (q.aggregate !== undefined) {
+        throw new RtDbError("BAD_REQUEST", "paginate cannot be combined with aggregate");
       }
       if (q.unique) {
         throw new RtDbError("BAD_REQUEST", "paginate cannot be combined with unique");
@@ -1014,6 +1069,7 @@ export class InMemoryRtDbClient {
         q.first ||
         q.count ||
         q.distinct ||
+        q.aggregate !== undefined ||
         q.paginate !== undefined ||
         q.filter !== undefined ||
         q.search !== undefined ||
@@ -1043,13 +1099,14 @@ export class InMemoryRtDbClient {
         q.first ||
         q.count ||
         q.distinct ||
+        q.aggregate !== undefined ||
         q.paginate !== undefined ||
         q.filter !== undefined ||
         q.vectorSearch !== undefined
       ) {
         throw new RtDbError(
           "BAD_REQUEST",
-          "search cannot be combined with index, eq, range bounds, order, unique, first, count, distinct, paginate, filter, or vector search",
+          "search cannot be combined with index, eq, range bounds, order, unique, first, count, distinct, aggregate, paginate, filter, or vector search",
         );
       }
       // No in-memory full-text ranking; return an empty result rather than
@@ -1175,6 +1232,83 @@ export class InMemoryRtDbClient {
       }
       values.sort((a, b) => compareIndexValues(a, b));
       return values.slice(0, MAX_TAKE);
+    }
+
+    // Aggregate terminal: run <OP> (SUM/AVG/MIN/MAX) over the index field
+    // after the eq prefix over the matching set. With `groupBy: true`, groups
+    // by that field and aggregates the next one. Server-side preconditions
+    // (index set, fields beyond prefix, sum/avg numeric) are mirrored here as
+    // BAD_REQUEST so the in-memory cascade agrees with the server. Group count
+    // is capped by MAX_TAKE. Empty matching set yields null for the scalar
+    // form (server `to_jsonb(SUM(empty))` → SQL NULL → JSON null).
+    if (q.aggregate !== undefined) {
+      if (!indexDef) {
+        throw new RtDbError(
+          "BAD_REQUEST",
+          "aggregate requires an index field beyond the eq prefix",
+        );
+      }
+      const isNumeric = (fieldName: string): boolean => {
+        const ft = tableDef.fields[fieldName];
+        // Only `number` is numeric among indexable types; `optional<number>`
+        // unwraps to its inner type. Anything else is non-numeric.
+        if (!ft) return false;
+        const tag = (ft as { type: string }).type;
+        if (tag === "number") return true;
+        if (tag === "optional") {
+          const inner = (ft as { inner: { type: string } }).inner;
+          return inner?.type === "number";
+        }
+        return false;
+      };
+      const { op, groupBy = false } = q.aggregate;
+      if (groupBy) {
+        if (eqLen + 1 >= indexDef.fields.length) {
+          throw new RtDbError(
+            "BAD_REQUEST",
+            "aggregate groupBy requires two index fields beyond the eq prefix",
+          );
+        }
+        const groupField = indexDef.fields[eqLen];
+        const aggField = indexDef.fields[eqLen + 1];
+        if ((op === "sum" || op === "avg") && !isNumeric(aggField)) {
+          throw new RtDbError("BAD_REQUEST", `aggregate op ${op} requires a numeric index field`);
+        }
+        // Group rows by `groupField` value (skip null/undefined group keys —
+        // the server's typed column excludes NULL), preserving first-seen order
+        // and then sorting by key ascending for parity with the server's ORDER BY k.
+        const groups = new Map<unknown, unknown[]>();
+        for (const row of filtered) {
+          const k = row.doc[groupField];
+          if (k === null || k === undefined) continue;
+          const existing = groups.get(k);
+          if (existing) {
+            existing.push(row.doc[aggField]);
+          } else {
+            groups.set(k, [row.doc[aggField]]);
+          }
+        }
+        const out = Array.from(groups.entries())
+          .map(([k, values]) => ({ key: k, value: applyAggregate(op, values) }))
+          .sort((a, b) => compareIndexValues(a.key, b.key))
+          .slice(0, MAX_TAKE);
+        return out;
+      }
+      if (eqLen >= indexDef.fields.length) {
+        throw new RtDbError(
+          "BAD_REQUEST",
+          "aggregate requires an index field beyond the eq prefix",
+        );
+      }
+      const aggField = indexDef.fields[eqLen];
+      if ((op === "sum" || op === "avg") && !isNumeric(aggField)) {
+        throw new RtDbError("BAD_REQUEST", `aggregate op ${op} requires a numeric index field`);
+      }
+      const values = filtered
+        .map((row) => row.doc[aggField])
+        .filter((v) => v !== null && v !== undefined);
+      // Empty set → null (matches server SUM/AVG/MIN/MAX over zero rows).
+      return values.length === 0 ? null : applyAggregate(op, values);
     }
 
     // Sort keys: unbound index fields (after the eq prefix), then createdAt, id.

@@ -81,7 +81,8 @@ pub fn kanban_schema_json() -> serde_json::Value {
         "indexes":[{"name":"by_project","fields":["projectId"]},
                    {"name":"by_status","fields":["status"]},
                    {"name":"by_project_and_status","fields":["projectId","status"]},
-                   {"name":"by_project_and_order","fields":["projectId","order"]}]}
+                   {"name":"by_project_and_order","fields":["projectId","order"]},
+                   {"name":"by_project_status_order","fields":["projectId","status","order"]}]}
     }})
 }
 

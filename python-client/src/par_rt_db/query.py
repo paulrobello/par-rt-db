@@ -17,7 +17,8 @@ Wire shapes (load-bearing — match the server exactly):
 
 ``QueryResult`` arrives untagged (the server's ``#[serde(untagged)]``); this
 module re-attaches a shape via the terminal (``get``/``collect``/``first``/
-``unique``/``count``/``paginate``) that produced it.
+``unique``/``count``/``distinct``/``aggregate``/``aggregateGroups``/``paginate``)
+that produced it.
 """
 
 from __future__ import annotations
@@ -28,7 +29,14 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_serializer
 from pydantic_core.core_schema import SerializerFunctionWrapHandler
 
-from .wire import FilterExpr, SearchQuery, VectorSearchQuery, to_camel
+from .wire import (
+    AggregateGroup,
+    AggregateSpec,
+    FilterExpr,
+    SearchQuery,
+    VectorSearchQuery,
+    to_camel,
+)
 
 
 class _Paginate(BaseModel):
@@ -75,6 +83,7 @@ class Query(BaseModel):
     first: bool | None = None
     count: bool | None = None
     distinct: bool | None = None
+    aggregate: AggregateSpec | None = None
     filter: FilterExpr | None = None
     search: SearchQuery | None = None
     vector_search: VectorSearchQuery | None = Field(default=None, alias="vectorSearch")
@@ -117,6 +126,7 @@ class TableQuery:
         self._first: bool = False
         self._count: bool = False
         self._distinct: bool = False
+        self._aggregate: AggregateSpec | None = None
         self._get: str | None = None
         self._filter: FilterExpr | None = None
         self._search: SearchQuery | None = None
@@ -207,6 +217,19 @@ class TableQuery:
         self._distinct = True
         return self
 
+    def aggregate(
+        self, op: Literal["sum", "avg", "min", "max"], *, group_by: bool = False
+    ) -> TableQuery:
+        """Aggregate terminal: runs ``<op>`` (SUM/AVG/MIN/MAX) over the index
+        field after the eq prefix. With ``group_by=True``, groups by that field
+        and aggregates the next one. ``sum``/``avg`` require a numeric aggregate
+        field; the server rejects non-numeric, no-index, or no-field-beyond-prefix
+        cases. Mutually exclusive with every other terminal except ``eq``/range
+        bounds/``filter``; ``take`` is also rejected — group count is capped
+        internally by MAX_TAKE."""
+        self._aggregate = AggregateSpec.model_validate({"op": op, "groupBy": bool(group_by)})
+        return self
+
     def paginate(self, *, cursor: str | None = None, num_items: int) -> TableQuery:
         self._paginate = _Paginate.model_validate({"cursor": cursor, "numItems": num_items})
         return self
@@ -221,10 +244,11 @@ class TableQuery:
             or self._first
             or self._count
             or self._distinct
+            or self._aggregate is not None
             or self._paginate is not None
         ):
             raise ValueError(
-                "get is mutually exclusive with take/unique/first/count/distinct/paginate"
+                "get is mutually exclusive with take/unique/first/count/distinct/aggregate/paginate"
             )
         payload: dict[str, Any] = {"table": self._table}
         if self._get is not None:
@@ -253,6 +277,8 @@ class TableQuery:
             payload["count"] = True
         if self._distinct:
             payload["distinct"] = True
+        if self._aggregate is not None:
+            payload["aggregate"] = self._aggregate
         if self._filter is not None:
             payload["filter"] = self._filter
         if self._search is not None:
@@ -280,6 +306,12 @@ class TableQuery:
         self._distinct = True
         return self.build()
 
+    def build_for_aggregate(
+        self, op: Literal["sum", "avg", "min", "max"], *, group_by: bool = False
+    ) -> Query:
+        self.aggregate(op, group_by=group_by)
+        return self.build()
+
 
 def parse_result(model: type[Any], terminal: str, value: Any) -> Any:
     """Deserialize an untagged ``QueryResult`` by the terminal that produced it.
@@ -288,9 +320,9 @@ def parse_result(model: type[Any], terminal: str, value: Any) -> Any:
         model: A Pydantic ``BaseModel`` subclass to validate each doc against,
             or ``dict`` to return raw dicts (no per-doc validation), or one of
             ``str``/``int``/``float``/``bool``/``Any`` for the scalar values
-            returned by ``distinct``.
+            returned by ``distinct``/``aggregate``.
         terminal: One of ``get``/``collect``/``first``/``unique``/``count``/
-            ``distinct``/``paginate``.
+            ``distinct``/``aggregate``/``aggregateGroups``/``paginate``.
         value: The raw ``QueryResult`` payload from the server.
 
     Returns:
@@ -299,6 +331,10 @@ def parse_result(model: type[Any], terminal: str, value: Any) -> Any:
         ``count`` → ``int``;
         ``distinct`` → ``list[model]`` (typically ``list[Any]`` — the unique
         scalar values of the index field after the eq prefix);
+        ``aggregate`` → ``model | None`` (the scalar aggregate value, or ``None``
+        when the server returned JSON null over an empty matching set);
+        ``aggregateGroups`` → ``list[AggregateGroup]`` (the ``{key, value}``
+        rows from a grouped aggregate);
         ``paginate`` → ``Paginated[model]``.
 
     Raises:
@@ -314,6 +350,13 @@ def parse_result(model: type[Any], terminal: str, value: Any) -> Any:
         return int(value)
     if terminal == "distinct":
         return [_coerce(model, v) for v in value]
+    if terminal == "aggregate":
+        # Server returns a bare scalar (number/string/bool) or JSON null when no
+        # rows match. Pass through `_coerce` so callers can request `float`,
+        # `str`, or `Any` for the scalar shape.
+        return None if value is None else _coerce(model, value)
+    if terminal == "aggregateGroups":
+        return [AggregateGroup.model_validate(v) for v in value]
     if terminal == "paginate":
         docs = [_coerce(model, v) for v in value.get("docs", [])]
         nxt = value.get("nextCursor")

@@ -1,4 +1,13 @@
-import type { FilterExpr, Order, PaginatedResultJson, QueryJson, VectorQuery } from "./protocol.js";
+import type {
+  AggregateGroup,
+  AggregateOp,
+  AggregateSpec,
+  FilterExpr,
+  Order,
+  PaginatedResultJson,
+  QueryJson,
+  VectorQuery,
+} from "./protocol.js";
 import type { Doc, Id, IndexNamesOf, SchemaDefinition, TableNames } from "./schema.js";
 
 /** A finished query carrying a phantom `Result` type used by the client/hooks. */
@@ -89,6 +98,23 @@ export class TableQuery<DocT, Indexes extends string> {
    * every other terminal except `eq`/range bounds/`filter`. */
   distinct(): RtQuery<unknown[]> {
     return { json: { ...this.json, distinct: true } };
+  }
+
+  /** Aggregate terminal: runs `<op>` (SUM/AVG/MIN/MAX) over the index field
+   * immediately after the `eq` prefix. Without `groupBy`, returns one scalar
+   * (`null` if no rows match). With `groupBy: true`, groups by the index field
+   * after the eq prefix and aggregates the one after that, returning
+   * `{key, value}[]` ordered by group key. `sum`/`avg` require a numeric
+   * aggregate field; the server rejects non-numeric, no-index, or
+   * no-field-beyond-prefix cases. Mutually exclusive with every other terminal
+   * except `eq`/range bounds/`filter` (which narrow the matching set); `take`
+   * is also rejected — group count is capped internally by MAX_TAKE. */
+  aggregate(
+    op: AggregateOp,
+    groupBy: boolean = false,
+  ): RtQuery<unknown> | RtQuery<AggregateGroup[]> {
+    const spec: AggregateSpec = groupBy ? { op, groupBy: true } : { op };
+    return { json: { ...this.json, aggregate: spec } };
   }
 
   paginate(cursor: string | undefined, numItems: number): RtQuery<PaginatedResultJson> {

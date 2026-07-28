@@ -5,7 +5,10 @@ use std::time::Duration;
 use common::{fresh_db, kanban_schema_json, test_state};
 use rtdb_server::error::ErrorCode;
 use rtdb_server::pagination::encode_cursor;
-use rtdb_server::query::{Order, Paginate, Query, QueryResult, canonical, execute_query};
+use rtdb_server::query::{
+    AggregateGroup, AggregateOp, AggregateSpec, Order, Paginate, Query, QueryResult, canonical,
+    execute_query,
+};
 use rtdb_server::schema::SchemaDef;
 use rtdb_server::txn::{Step, Transaction, execute_txn};
 use sqlx::PgPool;
@@ -159,6 +162,7 @@ async fn get_by_id_returns_doc_with_system_fields() -> anyhow::Result<()> {
             filter: None,
             search: None,
             vector_search: None,
+            aggregate: None,
         },
         None,
     )
@@ -211,6 +215,7 @@ async fn get_missing_returns_null() -> anyhow::Result<()> {
             filter: None,
             search: None,
             vector_search: None,
+            aggregate: None,
         },
         None,
     )
@@ -254,6 +259,7 @@ async fn get_combined_with_index_is_bad_request() -> anyhow::Result<()> {
             filter: None,
             search: None,
             vector_search: None,
+            aggregate: None,
         },
         None,
     )
@@ -300,6 +306,7 @@ async fn get_combined_with_paginate_is_bad_request() -> anyhow::Result<()> {
             filter: None,
             search: None,
             vector_search: None,
+            aggregate: None,
         },
         None,
     )
@@ -343,6 +350,7 @@ async fn unique_combined_with_take_is_bad_request() -> anyhow::Result<()> {
             filter: None,
             search: None,
             vector_search: None,
+            aggregate: None,
         },
         None,
     )
@@ -387,6 +395,7 @@ async fn full_eq_compound_index_orders_by_created_at_asc() -> anyhow::Result<()>
             filter: None,
             search: None,
             vector_search: None,
+            aggregate: None,
         },
         None,
     )
@@ -429,6 +438,7 @@ async fn full_eq_compound_index_order_desc_reverses() -> anyhow::Result<()> {
             filter: None,
             search: None,
             vector_search: None,
+            aggregate: None,
         },
         None,
     )
@@ -473,6 +483,7 @@ async fn prefix_eq_on_compound_index_sorts_by_remaining_index_field_then_created
             filter: None,
             search: None,
             vector_search: None,
+            aggregate: None,
         },
         None,
     )
@@ -524,6 +535,7 @@ async fn unique_on_by_name_returns_single_doc() -> anyhow::Result<()> {
             filter: None,
             search: None,
             vector_search: None,
+            aggregate: None,
         },
         None,
     )
@@ -572,6 +584,7 @@ async fn unique_with_duplicate_name_is_precondition_failed() -> anyhow::Result<(
             filter: None,
             search: None,
             vector_search: None,
+            aggregate: None,
         },
         None,
     )
@@ -616,6 +629,7 @@ async fn no_index_collect_returns_all_docs_in_created_at_order() -> anyhow::Resu
             filter: None,
             search: None,
             vector_search: None,
+            aggregate: None,
         },
         None,
     )
@@ -658,6 +672,7 @@ async fn take_over_cap_is_bad_request() -> anyhow::Result<()> {
             filter: None,
             search: None,
             vector_search: None,
+            aggregate: None,
         },
         None,
     )
@@ -701,6 +716,7 @@ async fn unknown_index_is_bad_request() -> anyhow::Result<()> {
             filter: None,
             search: None,
             vector_search: None,
+            aggregate: None,
         },
         None,
     )
@@ -744,6 +760,7 @@ async fn eq_longer_than_index_fields_is_bad_request() -> anyhow::Result<()> {
             filter: None,
             search: None,
             vector_search: None,
+            aggregate: None,
         },
         None,
     )
@@ -785,6 +802,7 @@ async fn unknown_table_is_not_found() -> anyhow::Result<()> {
             filter: None,
             search: None,
             vector_search: None,
+            aggregate: None,
         },
         None,
     )
@@ -828,6 +846,7 @@ async fn take_zero_returns_empty_docs() -> anyhow::Result<()> {
             filter: None,
             search: None,
             vector_search: None,
+            aggregate: None,
         },
         None,
     )
@@ -868,6 +887,7 @@ async fn unique_without_index_scans_whole_table() -> anyhow::Result<()> {
         filter: None,
         search: None,
         vector_search: None,
+        aggregate: None,
     };
 
     let result = execute_query(&pool, &db, &schema, &unique_query, None).await?;
@@ -918,6 +938,7 @@ async fn canonical_is_stable_for_identical_results() -> anyhow::Result<()> {
         filter: None,
         search: None,
         vector_search: None,
+        aggregate: None,
     };
 
     let first = execute_query(&pool, &db, &schema, &query, None).await?;
@@ -962,6 +983,7 @@ async fn range_gt_excludes_boundary_and_sorts_by_bound_field() -> anyhow::Result
             filter: None,
             search: None,
             vector_search: None,
+            aggregate: None,
         },
         None,
     )
@@ -1007,6 +1029,7 @@ async fn range_gte_includes_boundary() -> anyhow::Result<()> {
             filter: None,
             search: None,
             vector_search: None,
+            aggregate: None,
         },
         None,
     )
@@ -1058,6 +1081,7 @@ async fn range_gt_and_lt_bounded_numeric_range() -> anyhow::Result<()> {
             filter: None,
             search: None,
             vector_search: None,
+            aggregate: None,
         },
         None,
     )
@@ -1103,6 +1127,7 @@ async fn range_bounded_numeric_range_with_order_desc_and_take() -> anyhow::Resul
             filter: None,
             search: None,
             vector_search: None,
+            aggregate: None,
         },
         None,
     )
@@ -1145,6 +1170,7 @@ async fn range_without_eq_prefix_applies_to_first_index_field() -> anyhow::Resul
             filter: None,
             search: None,
             vector_search: None,
+            aggregate: None,
         },
         None,
     )
@@ -1190,6 +1216,7 @@ async fn range_gt_and_gte_both_set_is_bad_request() -> anyhow::Result<()> {
             filter: None,
             search: None,
             vector_search: None,
+            aggregate: None,
         },
         None,
     )
@@ -1233,6 +1260,7 @@ async fn range_lt_and_lte_both_set_is_bad_request() -> anyhow::Result<()> {
             filter: None,
             search: None,
             vector_search: None,
+            aggregate: None,
         },
         None,
     )
@@ -1276,6 +1304,7 @@ async fn range_without_index_is_bad_request() -> anyhow::Result<()> {
             filter: None,
             search: None,
             vector_search: None,
+            aggregate: None,
         },
         None,
     )
@@ -1319,6 +1348,7 @@ async fn range_with_no_remaining_index_field_is_bad_request() -> anyhow::Result<
             filter: None,
             search: None,
             vector_search: None,
+            aggregate: None,
         },
         None,
     )
@@ -1362,6 +1392,7 @@ async fn range_combined_with_get_is_bad_request() -> anyhow::Result<()> {
             filter: None,
             search: None,
             vector_search: None,
+            aggregate: None,
         },
         None,
     )
@@ -1405,6 +1436,7 @@ async fn range_value_wrong_type_is_bad_request() -> anyhow::Result<()> {
             filter: None,
             search: None,
             vector_search: None,
+            aggregate: None,
         },
         None,
     )
@@ -1448,6 +1480,7 @@ async fn range_lte_includes_boundary_value() -> anyhow::Result<()> {
             filter: None,
             search: None,
             vector_search: None,
+            aggregate: None,
         },
         None,
     )
@@ -1495,6 +1528,7 @@ async fn first_on_no_matching_docs_returns_null() -> anyhow::Result<()> {
             filter: None,
             search: None,
             vector_search: None,
+            aggregate: None,
         },
         None,
     )
@@ -1537,6 +1571,7 @@ async fn first_with_single_matching_doc_returns_it() -> anyhow::Result<()> {
             filter: None,
             search: None,
             vector_search: None,
+            aggregate: None,
         },
         None,
     )
@@ -1586,6 +1621,7 @@ async fn first_combined_with_range_bound_returns_smallest_in_ascending_order() -
             filter: None,
             search: None,
             vector_search: None,
+            aggregate: None,
         },
         None,
     )
@@ -1633,6 +1669,7 @@ async fn first_combined_with_range_bound_and_order_desc_returns_largest() -> any
             filter: None,
             search: None,
             vector_search: None,
+            aggregate: None,
         },
         None,
     )
@@ -1680,6 +1717,7 @@ async fn first_combined_with_take_is_bad_request() -> anyhow::Result<()> {
             filter: None,
             search: None,
             vector_search: None,
+            aggregate: None,
         },
         None,
     )
@@ -1723,6 +1761,7 @@ async fn first_combined_with_unique_is_bad_request() -> anyhow::Result<()> {
             filter: None,
             search: None,
             vector_search: None,
+            aggregate: None,
         },
         None,
     )
@@ -1766,6 +1805,7 @@ async fn first_combined_with_get_is_bad_request() -> anyhow::Result<()> {
             filter: None,
             search: None,
             vector_search: None,
+            aggregate: None,
         },
         None,
     )
@@ -1811,6 +1851,7 @@ async fn count_on_empty_table_returns_zero() -> anyhow::Result<()> {
             filter: None,
             search: None,
             vector_search: None,
+            aggregate: None,
         },
         None,
     )
@@ -1853,6 +1894,7 @@ async fn count_with_eq_prefix_counts_matching_subset() -> anyhow::Result<()> {
             filter: None,
             search: None,
             vector_search: None,
+            aggregate: None,
         },
         None,
     )
@@ -1895,6 +1937,7 @@ async fn count_with_range_bound_counts_matching_subset() -> anyhow::Result<()> {
             filter: None,
             search: None,
             vector_search: None,
+            aggregate: None,
         },
         None,
     )
@@ -1937,6 +1980,7 @@ async fn count_combined_with_order_is_bad_request() -> anyhow::Result<()> {
             filter: None,
             search: None,
             vector_search: None,
+            aggregate: None,
         },
         None,
     )
@@ -1980,6 +2024,7 @@ async fn count_combined_with_take_is_bad_request() -> anyhow::Result<()> {
             filter: None,
             search: None,
             vector_search: None,
+            aggregate: None,
         },
         None,
     )
@@ -2023,6 +2068,7 @@ async fn count_combined_with_unique_is_bad_request() -> anyhow::Result<()> {
             filter: None,
             search: None,
             vector_search: None,
+            aggregate: None,
         },
         None,
     )
@@ -2066,6 +2112,7 @@ async fn count_combined_with_first_is_bad_request() -> anyhow::Result<()> {
             filter: None,
             search: None,
             vector_search: None,
+            aggregate: None,
         },
         None,
     )
@@ -2109,6 +2156,7 @@ async fn count_combined_with_get_is_bad_request() -> anyhow::Result<()> {
             filter: None,
             search: None,
             vector_search: None,
+            aggregate: None,
         },
         None,
     )
@@ -2158,6 +2206,7 @@ fn distinct_query(
         filter: None,
         search: None,
         vector_search: None,
+        aggregate: None,
     };
     range(&mut q);
     q
@@ -2409,6 +2458,467 @@ async fn distinct_combined_with_take_is_bad_request() -> anyhow::Result<()> {
 }
 
 // =============================================================================
+// Aggregate terminal (`aggregate: {op, groupBy?}`) — SUM/AVG/MIN/MAX over the
+// index field after the eq prefix, optionally grouped by that field.
+// =============================================================================
+
+/// Aggregate spec without groupBy (most common shape in the tests below).
+fn agg(op: AggregateOp) -> AggregateSpec {
+    AggregateSpec {
+        op,
+        group_by: false,
+    }
+}
+
+/// Base query builder for aggregate tests: every field defaulted except the
+/// aggregate-relevant ones. `eq` consumes a prefix of the named index; the
+/// aggregate runs over the index field immediately after that prefix (or, with
+/// `groupBy`, groups by that field and aggregates the one after it).
+fn aggregate_query(
+    index: Option<&str>,
+    eq: Vec<serde_json::Value>,
+    spec: AggregateSpec,
+    range: impl FnOnce(&mut Query),
+) -> Query {
+    let mut q = Query {
+        table: "workItems".to_string(),
+        get: None,
+        index: index.map(str::to_string),
+        eq,
+        gt: None,
+        gte: None,
+        lt: None,
+        lte: None,
+        order: None,
+        take: None,
+        unique: false,
+        first: false,
+        count: false,
+        distinct: false,
+        aggregate: Some(spec),
+        paginate: None,
+        filter: None,
+        search: None,
+        vector_search: None,
+    };
+    range(&mut q);
+    q
+}
+
+/// Pulls the scalar out of an `Aggregate` result, panicking on any other variant.
+fn aggregate_scalar(result: &QueryResult) -> serde_json::Value {
+    match result {
+        QueryResult::Aggregate(v) => v.clone(),
+        other => panic!("expected Aggregate variant, got {other:?}"),
+    }
+}
+
+/// Pulls the `{key, value}` rows out of an `AggregateGroups` result.
+fn aggregate_groups(result: &QueryResult) -> Vec<AggregateGroup> {
+    match result {
+        QueryResult::AggregateGroups(groups) => groups.clone(),
+        other => panic!("expected AggregateGroups variant, got {other:?}"),
+    }
+}
+
+// (agg-a) SUM of the next index field over the matching set.
+#[tokio::test]
+async fn aggregate_sum_over_matching_set() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+
+    let (project_id, _items) = seed_kanban(&pool, &db, &schema).await?;
+
+    // by_project_and_order has [projectId, order]; consuming projectId in the eq
+    // prefix leaves `order` as the aggregate field. Seeded orders are 1+2+3+4+5 = 15.
+    let result = execute_query(
+        &pool,
+        &db,
+        &schema,
+        &aggregate_query(
+            Some("by_project_and_order"),
+            vec![serde_json::json!(project_id)],
+            agg(AggregateOp::Sum),
+            |_| {},
+        ),
+        None,
+    )
+    .await?;
+
+    assert_eq!(aggregate_scalar(&result).as_f64(), Some(15.0));
+    Ok(())
+}
+
+// (agg-b) AVG of the next index field over the matching set.
+#[tokio::test]
+async fn aggregate_avg_over_matching_set() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+
+    let (project_id, _items) = seed_kanban(&pool, &db, &schema).await?;
+
+    let result = execute_query(
+        &pool,
+        &db,
+        &schema,
+        &aggregate_query(
+            Some("by_project_and_order"),
+            vec![serde_json::json!(project_id)],
+            agg(AggregateOp::Avg),
+            |_| {},
+        ),
+        None,
+    )
+    .await?;
+    // AVG of orders 1..=5 = 3.0.
+    assert_eq!(aggregate_scalar(&result).as_f64(), Some(3.0));
+    Ok(())
+}
+
+// (agg-c) MIN and MAX over the matching set (numeric order field).
+#[tokio::test]
+async fn aggregate_min_max_over_matching_set() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+
+    let (project_id, _items) = seed_kanban(&pool, &db, &schema).await?;
+
+    let min = execute_query(
+        &pool,
+        &db,
+        &schema,
+        &aggregate_query(
+            Some("by_project_and_order"),
+            vec![serde_json::json!(project_id)],
+            agg(AggregateOp::Min),
+            |_| {},
+        ),
+        None,
+    )
+    .await?;
+    assert_eq!(aggregate_scalar(&min).as_f64(), Some(1.0));
+
+    let max = execute_query(
+        &pool,
+        &db,
+        &schema,
+        &aggregate_query(
+            Some("by_project_and_order"),
+            vec![serde_json::json!(project_id)],
+            agg(AggregateOp::Max),
+            |_| {},
+        ),
+        None,
+    )
+    .await?;
+    assert_eq!(aggregate_scalar(&max).as_f64(), Some(5.0));
+    Ok(())
+}
+
+// (agg-d) range bound on the aggregate field narrows the matching set.
+#[tokio::test]
+async fn aggregate_respects_range_bound() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+
+    let (project_id, _items) = seed_kanban(&pool, &db, &schema).await?;
+
+    // gt 1 / lt 5 narrows the matching set to orders 2, 3, 4 → SUM = 9.
+    let result = execute_query(
+        &pool,
+        &db,
+        &schema,
+        &aggregate_query(
+            Some("by_project_and_order"),
+            vec![serde_json::json!(project_id)],
+            agg(AggregateOp::Sum),
+            |q| {
+                q.gt = Some(serde_json::json!(1.0));
+                q.lt = Some(serde_json::json!(5.0));
+            },
+        ),
+        None,
+    )
+    .await?;
+    assert_eq!(aggregate_scalar(&result).as_f64(), Some(9.0));
+    Ok(())
+}
+
+// (agg-e) MIN over a string index field (status) — Min/Max work on any orderable field.
+#[tokio::test]
+async fn aggregate_min_over_string_field() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+
+    let (project_id, _items) = seed_kanban(&pool, &db, &schema).await?;
+
+    // by_project_and_status: [projectId, status]. Seeded statuses are
+    // {backlog, in_progress, done}; MIN lexicographically is "backlog".
+    let result = execute_query(
+        &pool,
+        &db,
+        &schema,
+        &aggregate_query(
+            Some("by_project_and_status"),
+            vec![serde_json::json!(project_id)],
+            agg(AggregateOp::Min),
+            |_| {},
+        ),
+        None,
+    )
+    .await?;
+    assert_eq!(aggregate_scalar(&result), serde_json::json!("backlog"));
+    Ok(())
+}
+
+// (agg-f) SUM on a non-numeric index field → BadRequest.
+#[tokio::test]
+async fn aggregate_sum_on_non_numeric_field_is_bad_request() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+
+    let (project_id, _items) = seed_kanban(&pool, &db, &schema).await?;
+
+    // by_project_and_status's post-prefix field is `status` (string); SUM/AVG
+    // require a numeric field.
+    let err = execute_query(
+        &pool,
+        &db,
+        &schema,
+        &aggregate_query(
+            Some("by_project_and_status"),
+            vec![serde_json::json!(project_id)],
+            agg(AggregateOp::Sum),
+            |_| {},
+        ),
+        None,
+    )
+    .await
+    .expect_err("expected bad request");
+    assert_eq!(err.code, ErrorCode::BadRequest);
+    assert!(
+        err.message.contains("requires a numeric index field"),
+        "unexpected message: {}",
+        err.message
+    );
+    Ok(())
+}
+
+// (agg-g) no index → BadRequest.
+#[tokio::test]
+async fn aggregate_without_index_is_bad_request() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+
+    seed_kanban(&pool, &db, &schema).await?;
+
+    let err = execute_query(
+        &pool,
+        &db,
+        &schema,
+        &aggregate_query(None, vec![], agg(AggregateOp::Sum), |_| {}),
+        None,
+    )
+    .await
+    .expect_err("expected bad request");
+    assert_eq!(err.code, ErrorCode::BadRequest);
+    Ok(())
+}
+
+// (agg-h) eq prefix consumes every index field (no field to aggregate over)
+// → BadRequest.
+#[tokio::test]
+async fn aggregate_with_no_field_beyond_eq_prefix_is_bad_request() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+
+    let (project_id, _items) = seed_kanban(&pool, &db, &schema).await?;
+
+    // by_project_and_status has exactly two fields; consuming both leaves none.
+    let err = execute_query(
+        &pool,
+        &db,
+        &schema,
+        &aggregate_query(
+            Some("by_project_and_status"),
+            vec![serde_json::json!(project_id), serde_json::json!("backlog")],
+            agg(AggregateOp::Sum),
+            |_| {},
+        ),
+        None,
+    )
+    .await
+    .expect_err("expected bad request");
+    assert_eq!(err.code, ErrorCode::BadRequest);
+    Ok(())
+}
+
+// (agg-i) NULL result when no rows match (SUM/AVG/MIN/MAX over zero rows is SQL NULL).
+#[tokio::test]
+async fn aggregate_over_empty_matching_set_returns_null() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+
+    let (project_id, _items) = seed_kanban(&pool, &db, &schema).await?;
+
+    // eq prefix narrows to a project that has no work items (32-hex id never seeded).
+    let unused_project_id = "f".repeat(32);
+    let _ = project_id; // suppress unused warning in case the binding is dropped
+    let err_or_value = execute_query(
+        &pool,
+        &db,
+        &schema,
+        &aggregate_query(
+            Some("by_project_and_order"),
+            vec![serde_json::json!(unused_project_id)],
+            agg(AggregateOp::Sum),
+            |_| {},
+        ),
+        None,
+    )
+    .await;
+    let result = err_or_value?;
+    assert_eq!(aggregate_scalar(&result), serde_json::Value::Null);
+    Ok(())
+}
+
+// (agg-j) aggregate combined with take → BadRequest (matrix: take is incompatible).
+#[tokio::test]
+async fn aggregate_combined_with_take_is_bad_request() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+
+    seed_kanban(&pool, &db, &schema).await?;
+
+    let mut q = aggregate_query(
+        Some("by_project_and_order"),
+        vec![serde_json::json!("0".repeat(32))],
+        agg(AggregateOp::Sum),
+        |_| {},
+    );
+    q.take = Some(10);
+    let err = execute_query(&pool, &db, &schema, &q, None)
+        .await
+        .expect_err("expected bad request");
+    assert_eq!(err.code, ErrorCode::BadRequest);
+    Ok(())
+}
+
+// (agg-k) groupBy: groups by `status`, sums `order` over a 3-field index.
+#[tokio::test]
+async fn aggregate_group_by_returns_one_row_per_group() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+
+    let (project_id, _items) = seed_kanban(&pool, &db, &schema).await?;
+
+    // by_project_status_order has [projectId, status, order]; consuming projectId
+    // in the eq prefix leaves `status` as the group key and `order` as the
+    // aggregate field. Seeded orders by status:
+    //   backlog     -> 1 + 3 = 4
+    //   in_progress -> 2 + 5 = 7
+    //   done        -> 4
+    let result = execute_query(
+        &pool,
+        &db,
+        &schema,
+        &aggregate_query(
+            Some("by_project_status_order"),
+            vec![serde_json::json!(project_id)],
+            AggregateSpec {
+                op: AggregateOp::Sum,
+                group_by: true,
+            },
+            |_| {},
+        ),
+        None,
+    )
+    .await?;
+
+    let groups = aggregate_groups(&result);
+    // Ordered by group key ascending — backlog, done, in_progress.
+    let pairs: Vec<(String, f64)> = groups
+        .iter()
+        .map(|g| {
+            (
+                g.key.as_str().expect("status string").to_string(),
+                g.value.as_f64().expect("sum is numeric"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        pairs,
+        vec![
+            ("backlog".to_string(), 4.0),
+            ("done".to_string(), 4.0),
+            ("in_progress".to_string(), 7.0),
+        ]
+    );
+    Ok(())
+}
+
+// (agg-l) groupBy requires two fields beyond the eq prefix → BadRequest otherwise.
+#[tokio::test]
+async fn aggregate_group_by_with_one_field_beyond_prefix_is_bad_request() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+
+    let (project_id, _items) = seed_kanban(&pool, &db, &schema).await?;
+
+    // by_project_and_status has exactly two fields; consuming one leaves one —
+    // groupBy needs two (one to group by, one to aggregate).
+    let err = execute_query(
+        &pool,
+        &db,
+        &schema,
+        &aggregate_query(
+            Some("by_project_and_status"),
+            vec![serde_json::json!(project_id)],
+            AggregateSpec {
+                op: AggregateOp::Sum,
+                group_by: true,
+            },
+            |_| {},
+        ),
+        None,
+    )
+    .await
+    .expect_err("expected bad request");
+    assert_eq!(err.code, ErrorCode::BadRequest);
+    assert!(
+        err.message
+            .contains("requires two index fields beyond the eq prefix"),
+        "unexpected message: {}",
+        err.message
+    );
+    Ok(())
+}
+
+// =============================================================================
 // Cursor-based pagination (`paginate` terminal).
 // =============================================================================
 
@@ -2439,6 +2949,7 @@ fn paginate_query(
         filter: None,
         search: None,
         vector_search: None,
+        aggregate: None,
     }
 }
 

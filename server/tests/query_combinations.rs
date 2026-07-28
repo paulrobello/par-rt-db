@@ -19,22 +19,27 @@ use rtdb_server::AppState;
 use rtdb_server::ddl::push_schema;
 use rtdb_server::error::ErrorCode;
 use rtdb_server::query::{
-    FilterExpr, Order, Paginate, Query, SearchQuery, VectorSearchQuery, execute_query,
+    AggregateOp, AggregateSpec, FilterExpr, Order, Paginate, Query, SearchQuery, VectorSearchQuery,
+    execute_query,
 };
 use rtdb_server::schema::SchemaDef;
 use serde_json::json;
 
 /// Schema with btree + search + vector indexes on one table — enough to drive
 /// every terminal in the matrix without separate schemas per terminal family.
+/// The 2-field `by_title_count` index covers aggregate's `eq prefix + aggregate
+/// field` shape and the groupBy 2-fields-beyond-prefix shape.
 fn matrix_schema_json() -> serde_json::Value {
     serde_json::json!({"tables":{"items":{
         "fields":{
             "title":{"type":"string"},
             "body":{"type":"string"},
+            "count":{"type":"number"},
             "embedding":{"type":"vector","dimensions":3}
         },
         "indexes":[
             {"name":"by_title","fields":["title"]},
+            {"name":"by_title_count","fields":["title","count"]},
             {"name":"search_body","fields":["title","body"],"search":true},
             {"name":"by_embedding","fields":["embedding"],"vector":{"dimensions":3}}
         ]
@@ -80,6 +85,7 @@ fn base_query() -> Query {
         filter: None,
         search: None,
         vector_search: None,
+        aggregate: None,
     }
 }
 
@@ -389,6 +395,75 @@ const CASES: &[Case] = &[
         build: distinct_vector,
         expected: Outcome::Reject,
     },
+    // ============ aggregate rejects get, take, unique, first, count, order,
+    //              paginate, search, vectorSearch (standalone terminal like
+    //              count/distinct); composes with index/eq/range/filter ============
+    Case {
+        name: "aggregate+get",
+        build: aggregate_get,
+        expected: Outcome::Reject,
+    },
+    Case {
+        name: "aggregate+take",
+        build: aggregate_take,
+        expected: Outcome::Reject,
+    },
+    Case {
+        name: "aggregate+unique",
+        build: aggregate_unique,
+        expected: Outcome::Reject,
+    },
+    Case {
+        name: "aggregate+first",
+        build: aggregate_first,
+        expected: Outcome::Reject,
+    },
+    Case {
+        name: "aggregate+count",
+        build: aggregate_count,
+        expected: Outcome::Reject,
+    },
+    Case {
+        name: "aggregate+distinct",
+        build: aggregate_distinct,
+        expected: Outcome::Reject,
+    },
+    Case {
+        name: "aggregate+order",
+        build: aggregate_order,
+        expected: Outcome::Reject,
+    },
+    Case {
+        name: "aggregate+paginate",
+        build: aggregate_paginate,
+        expected: Outcome::Reject,
+    },
+    Case {
+        name: "aggregate+search",
+        build: aggregate_search,
+        expected: Outcome::Reject,
+    },
+    Case {
+        name: "aggregate+vectorSearch",
+        build: aggregate_vector,
+        expected: Outcome::Reject,
+    },
+    // solo aggregate (no peers) and aggregate+eq/range/filter compositions accept.
+    Case {
+        name: "solo: aggregate",
+        build: solo_aggregate,
+        expected: Outcome::Accept,
+    },
+    Case {
+        name: "compose: aggregate+eq",
+        build: aggregate_eq,
+        expected: Outcome::Accept,
+    },
+    Case {
+        name: "compose: aggregate+filter",
+        build: aggregate_filter,
+        expected: Outcome::Accept,
+    },
     // ============ paginate rejects count, unique, first, take (get covered above) ============
     Case {
         name: "paginate+count",
@@ -654,6 +729,14 @@ fn solo_search(q: &mut Query) {
 fn solo_vector(q: &mut Query) {
     q.vector_search = Some(vector_embedding_limit_1());
 }
+fn solo_aggregate(q: &mut Query) {
+    // MIN over the post-prefix field of `by_title` (string field, orderable).
+    q.aggregate = Some(AggregateSpec {
+        op: AggregateOp::Min,
+        group_by: false,
+    });
+    q.index = Some("by_title".to_string());
+}
 
 // get + peer
 fn get_index(q: &mut Query) {
@@ -801,6 +884,75 @@ fn distinct_vector(q: &mut Query) {
     q.distinct = true;
     q.index = Some("by_title".to_string());
     q.vector_search = Some(vector_embedding_limit_1());
+}
+
+// aggregate + peer (rejects every other terminal; composes only with
+// index/eq/range/filter — exercised under composition accepts below).
+fn aggregate_min(q: &mut Query) {
+    q.aggregate = Some(AggregateSpec {
+        op: AggregateOp::Min,
+        group_by: false,
+    });
+    q.index = Some("by_title".to_string());
+}
+fn aggregate_get(q: &mut Query) {
+    aggregate_min(q);
+    q.get = Some(ID.to_string());
+}
+fn aggregate_take(q: &mut Query) {
+    aggregate_min(q);
+    q.take = Some(1);
+}
+fn aggregate_unique(q: &mut Query) {
+    aggregate_min(q);
+    q.unique = true;
+}
+fn aggregate_first(q: &mut Query) {
+    aggregate_min(q);
+    q.first = true;
+}
+fn aggregate_count(q: &mut Query) {
+    aggregate_min(q);
+    q.count = true;
+}
+fn aggregate_distinct(q: &mut Query) {
+    aggregate_min(q);
+    q.distinct = true;
+}
+fn aggregate_order(q: &mut Query) {
+    aggregate_min(q);
+    q.order = Some(Order::Asc);
+}
+fn aggregate_paginate(q: &mut Query) {
+    aggregate_min(q);
+    q.paginate = Some(paginate_num_1());
+}
+fn aggregate_search(q: &mut Query) {
+    aggregate_min(q);
+    q.search = Some(search_body_x());
+}
+fn aggregate_vector(q: &mut Query) {
+    aggregate_min(q);
+    q.vector_search = Some(vector_embedding_limit_1());
+}
+// aggregate compositions that must NOT false-reject.
+fn aggregate_eq(q: &mut Query) {
+    // by_title_count has [title, count]; consuming `title` in the eq prefix
+    // leaves `count` as the aggregate field — numeric, so SUM is valid.
+    q.aggregate = Some(AggregateSpec {
+        op: AggregateOp::Sum,
+        group_by: false,
+    });
+    q.index = Some("by_title_count".to_string());
+    q.eq.push(json!("x"));
+}
+fn aggregate_filter(q: &mut Query) {
+    q.aggregate = Some(AggregateSpec {
+        op: AggregateOp::Min,
+        group_by: false,
+    });
+    q.index = Some("by_title".to_string());
+    q.filter = Some(filter_eq_title_x());
 }
 fn paginate_count(q: &mut Query) {
     q.paginate = Some(paginate_num_1());

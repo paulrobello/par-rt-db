@@ -58,8 +58,9 @@ pub use mutation::{Mutation, StepResult, Transaction};
 pub use query::{Order, Paginate, Paginated, Query, TableQuery};
 pub use schema::{FieldType, IndexDef, SchemaDef, TableDef, VectorIndexSpec};
 pub use wire::{
-    AuthedUser, ClientMessage, FilterExpr, ScheduleInfo, ScheduleKind, ScheduleStatus,
-    ScheduleWhen, SearchQuery, ServerMessage, UserKind, VectorSearchQuery,
+    AggregateGroup, AggregateOp, AggregateSpec, AuthedUser, ClientMessage, FilterExpr,
+    ScheduleInfo, ScheduleKind, ScheduleStatus, ScheduleWhen, SearchQuery, ServerMessage, UserKind,
+    VectorSearchQuery,
 };
 
 #[cfg(feature = "http")]

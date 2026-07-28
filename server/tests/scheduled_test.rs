@@ -267,6 +267,7 @@ async fn poll_for_n(
         filter: None,
         search: None,
         vector_search: None,
+        aggregate: None,
     };
     let deadline = Instant::now() + timeout;
     loop {

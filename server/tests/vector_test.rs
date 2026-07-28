@@ -415,6 +415,7 @@ fn empty_query() -> Query {
         filter: None,
         search: None,
         vector_search: None,
+        aggregate: None,
     }
 }
 

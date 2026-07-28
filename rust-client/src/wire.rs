@@ -303,6 +303,48 @@ pub struct VectorSearchQuery {
     pub filter: BTreeMap<String, serde_json::Value>,
 }
 
+/// Aggregate operator for the `aggregate` terminal. Mirrors
+/// `server/src/query.rs::AggregateOp` byte-for-byte (lowercase variants).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AggregateOp {
+    Sum,
+    Avg,
+    Min,
+    Max,
+}
+
+/// `aggregate` terminal spec. `op` selects the SQL aggregate run over the index
+/// field after the eq prefix; `group_by` shifts the terminal to a grouped
+/// aggregate (groups by the index field after the eq prefix, aggregates the one
+/// after that). Mirrors `server/src/query.rs::AggregateSpec` byte-for-byte
+/// (camelCase, deny_unknown_fields). The server uses `#[serde(default)]` on
+/// `group_by` (always emits it); this client mirrors the rest of the SDK's
+/// bool convention and omits it on the wire when false, which the server
+/// accepts (the field is `#[serde(default)]`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AggregateSpec {
+    pub op: AggregateOp,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub group_by: bool,
+}
+
+/// Serde skip predicate for `bool` fields whose default is `false`. Lets the
+/// rust-client omit `groupBy` on the wire when false, matching the TS client.
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+/// One `{key, value}` row from a grouped `aggregate` (`groupBy: true`) terminal.
+/// Mirrors `server/src/query.rs::AggregateGroup` byte-for-byte (camelCase).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AggregateGroup {
+    pub key: serde_json::Value,
+    pub value: serde_json::Value,
+}
+
 /// A db-side predicate appended to a query's WHERE clause. Mirrors
 /// `server/src/query.rs::FilterExpr` byte-for-byte: internally tagged by `op`
 /// (lowercase), `deny_unknown_fields`. Leaves compare one declared field to a

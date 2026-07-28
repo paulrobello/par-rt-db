@@ -107,6 +107,26 @@ describe("query builder", () => {
     });
   });
 
+  it("builds an aggregate query (consumes one eq prefix value, aggregates the next index field)", () => {
+    const q = api.items.query().withIndex("by_project_and_status", ["p1"]).aggregate("sum");
+    expect(q.json).toEqual({
+      table: "items",
+      index: "by_project_and_status",
+      eq: ["p1"],
+      aggregate: { op: "sum" },
+    });
+  });
+
+  it("builds an aggregate groupBy query (groupBy flag emitted when true)", () => {
+    const q = api.items.query().withIndex("by_project_and_status", ["p1"]).aggregate("sum", true);
+    expect(q.json).toEqual({
+      table: "items",
+      index: "by_project_and_status",
+      eq: ["p1"],
+      aggregate: { op: "sum", groupBy: true },
+    });
+  });
+
   it("builds a full-table collect with no index", () => {
     const q = api.items.query().collect();
     expect(q.json).toEqual({ table: "items" });
