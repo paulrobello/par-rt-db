@@ -22,6 +22,9 @@ const snap = (over: Partial<MetricsSnapshot>): MetricsSnapshot => ({
   poolSize: 0,
   poolIdle: 0,
   uptimeSeconds: 0,
+  queryLatency: { p50: 0, p95: 0, p99: 0 },
+  mutateLatency: { p50: 0, p95: 0, p99: 0 },
+  subscribeLatency: { p50: 0, p95: 0, p99: 0 },
   ...over,
 });
 

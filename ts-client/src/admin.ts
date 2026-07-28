@@ -29,6 +29,11 @@ export interface TokenInfo {
   createdAt: number;
   revoked: boolean;
 }
+export interface LatencyStats {
+  p50: number;
+  p95: number;
+  p99: number;
+}
 export interface MetricsSnapshot {
   queriesTotal: number;
   mutationsTotal: number;
@@ -38,6 +43,9 @@ export interface MetricsSnapshot {
   poolSize: number;
   poolIdle: number;
   uptimeSeconds: number;
+  queryLatency: LatencyStats;
+  mutateLatency: LatencyStats;
+  subscribeLatency: LatencyStats;
 }
 export interface HotConfig {
   allowedOrigins: string[];

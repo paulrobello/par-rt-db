@@ -4,9 +4,14 @@ import { Placard, Spinner, StatusLamp } from "../components/ui";
 import { useAdmin } from "../lib/admin";
 import { formatDuration, formatNumber } from "../lib/format";
 import { formatRate, lastValue, levelSeries, type Point, rateSeries } from "../lib/metrics-series";
-import type { MetricsSnapshot } from "../lib/types";
+import type { LatencyStats, MetricsSnapshot } from "../lib/types";
 import { useMetricsHistory } from "../lib/useMetricsHistory";
 import s from "./MetricsPage.module.css";
+
+/** Format a micros latency as milliseconds with two decimals (e.g. 1230us -> "1.23ms"). */
+function formatMs(us: number): string {
+  return `${(us / 1000).toFixed(2)}ms`;
+}
 
 function Instrument({
   label,
@@ -122,6 +127,22 @@ export function MetricsPage() {
       <Panel title="System">
         <Instrument label="uptime" value={formatDuration(m.uptimeSeconds)} />
       </Panel>
+
+      <Panel title="Latency · p50 / p95 / p99">
+        <LatencyInstrument label="query latency" stats={m.queryLatency} />
+        <LatencyInstrument label="mutate latency" stats={m.mutateLatency} />
+        <LatencyInstrument label="subscribe latency" stats={m.subscribeLatency} />
+      </Panel>
     </section>
+  );
+}
+
+function LatencyInstrument({ label, stats }: { label: string; stats: LatencyStats }) {
+  return (
+    <Instrument
+      label={label}
+      value={formatMs(stats.p50)}
+      sub={`p95 ${formatMs(stats.p95)} · p99 ${formatMs(stats.p99)}`}
+    />
   );
 }

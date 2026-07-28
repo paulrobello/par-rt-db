@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Instant;
 
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, FromRequest, Path, Request, State};
@@ -78,6 +79,7 @@ async fn query_handler(
     check_http_rate_limits(&state, &principal, &body.db).await?;
 
     let schema = state.schemas.get(&state.pool, &body.db).await?;
+    let t = Instant::now();
     let result = execute_query(
         &state.pool,
         &body.db,
@@ -86,6 +88,10 @@ async fn query_handler(
         owner_of(&principal),
     )
     .await?;
+    state
+        .runtime
+        .metrics
+        .record_query_duration(t.elapsed().as_micros() as u64);
     state.runtime.metrics.record_query();
     Ok(Json(QueryResponse { result }))
 }
@@ -139,8 +145,15 @@ async fn batch_query_handler(
     let owner = owner_of(&principal);
     let mut results = Vec::with_capacity(body.queries.len());
     for query in &body.queries {
+        // Per-query timing: each successful execute_query feeds
+        // query_latency individually (mirrors the per-query counter bump).
+        let t = Instant::now();
         let outcome = match execute_query(&state.pool, &body.db, &schema, query, owner).await {
             Ok(result) => {
+                state
+                    .runtime
+                    .metrics
+                    .record_query_duration(t.elapsed().as_micros() as u64);
                 state.runtime.metrics.record_query();
                 BatchQueryOutcome {
                     ok: true,
@@ -183,6 +196,7 @@ async fn mutate_handler(
     authorize(&state.pool, &principal, &body.db).await?;
     check_http_rate_limits(&state, &principal, &body.db).await?;
 
+    let t = Instant::now();
     let outcome = state
         .realtime
         .committers
@@ -193,6 +207,10 @@ async fn mutate_handler(
             owner_of(&principal).map(|s| s.to_string()),
         )
         .await?;
+    state
+        .runtime
+        .metrics
+        .record_mutation_duration(t.elapsed().as_micros() as u64);
     state.runtime.metrics.record_mutation();
     Ok(Json(MutateResponse {
         results: outcome.results,

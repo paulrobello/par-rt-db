@@ -357,15 +357,28 @@ async fn handle_text_frame(
                     } else {
                         owner_of(principal).map(|s| s.to_string())
                     };
-                    if let Err(error) = state
+                    // Time the initial-query arm: committers.subscribe().await
+                    // resolves after the initial query has run, its result been
+                    // sent on `tx`, and the subscription registered (see
+                    // handle_subscribe). That covers the full first-eval cost
+                    // (channel + committer queue + execute_query + send +
+                    // register); subsequent push-on-change re-runs are NOT
+                    // included (they are fan_out work, not the initial query).
+                    let t = Instant::now();
+                    let sub_result = state
                         .realtime
                         .committers
                         .subscribe(db, conn_id, query_id.clone(), *query, out_tx.clone(), owner)
-                        .await
-                    {
-                        let _ = out_tx.send(ServerMessage::SubscribeErr { query_id, error });
-                    } else {
-                        state.runtime.metrics.record_query();
+                        .await;
+                    let elapsed_us = t.elapsed().as_micros() as u64;
+                    match sub_result {
+                        Ok(()) => {
+                            state.runtime.metrics.record_subscribe_duration(elapsed_us);
+                            state.runtime.metrics.record_query();
+                        }
+                        Err(error) => {
+                            let _ = out_tx.send(ServerMessage::SubscribeErr { query_id, error });
+                        }
                     }
                 }
                 Err(error) => {

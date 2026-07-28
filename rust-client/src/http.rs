@@ -1977,7 +1977,10 @@ mod admin_tests {
                 "activeSubscriptions": 50,
                 "poolSize": 60,
                 "poolIdle": 70,
-                "uptimeSeconds": 80
+                "uptimeSeconds": 80,
+                "queryLatency": {"p50": 110, "p95": 220, "p99": 330},
+                "mutateLatency": {"p50": 440, "p95": 550, "p99": 660},
+                "subscribeLatency": {"p50": 770, "p95": 880, "p99": 990}
             })))
             .mount(&server)
             .await;
@@ -1990,6 +1993,11 @@ mod admin_tests {
         assert_eq!(snap.pool_size, 60);
         assert_eq!(snap.pool_idle, 70);
         assert_eq!(snap.uptime_seconds, 80);
+        assert_eq!(snap.query_latency.p50, 110);
+        assert_eq!(snap.query_latency.p95, 220);
+        assert_eq!(snap.query_latency.p99, 330);
+        assert_eq!(snap.mutate_latency.p99, 660);
+        assert_eq!(snap.subscribe_latency.p50, 770);
     }
 
     #[tokio::test]

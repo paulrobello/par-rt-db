@@ -489,6 +489,93 @@ async fn metrics_endpoint_reflects_a_mutation() -> anyhow::Result<()> {
     Ok(())
 }
 
+// GET /admin/metrics exposes query/mutate/subscribe latency percentiles that
+// are well-formed (and non-zero at p50) once a real query has run. Exact
+// values are nondeterministic; assert structure + ordering + presence.
+#[tokio::test]
+async fn metrics_endpoint_reflects_query_latency() -> anyhow::Result<()> {
+    let state = common::test_state().await;
+    let addr = common::spawn_app(state.clone()).await;
+    let db = common::fresh_db(&state).await;
+
+    // Mint a token + insert one doc so a query has something to read.
+    let mint: serde_json::Value = common::admin_post(
+        addr,
+        "/admin/mint-token",
+        serde_json::json!({"db": db, "name": "t"}),
+    )
+    .await
+    .json()
+    .await?;
+    let token = mint["token"].as_str().unwrap().to_string();
+    let client = reqwest::Client::new();
+    let insert = client
+        .post(format!("http://{addr}/api/mutate"))
+        .header("Authorization", format!("Bearer {token}"))
+        .json(&serde_json::json!({
+            "db": db,
+            "txn": {"steps":[{"op":"insert","table":"projects","doc":{"name":"p","status":"active","tags":[],"updatedAt":0}}]}
+        }))
+        .send()
+        .await?;
+    assert_eq!(insert.status(), reqwest::StatusCode::OK);
+
+    // Run several queries so the latency ring has multiple samples.
+    for _ in 0..3 {
+        let q = client
+            .post(format!("http://{addr}/api/query"))
+            .header("Authorization", format!("Bearer {token}"))
+            .json(&serde_json::json!({"db": db, "query": {"table": "projects"}}))
+            .send()
+            .await?;
+        assert_eq!(q.status(), reqwest::StatusCode::OK);
+    }
+
+    let snap: serde_json::Value = common::admin_get(addr, "/admin/metrics")
+        .await
+        .json()
+        .await?;
+
+    // queryLatency: object with p50/p95/p99, monotonically ordered, non-zero
+    // after real queries (a real db round-trip takes measurable time).
+    let ql = &snap["queryLatency"];
+    assert!(ql.is_object(), "queryLatency missing/malformed: {snap}");
+    let p50 = ql["p50"].as_i64().unwrap_or(-1);
+    let p95 = ql["p95"].as_i64().unwrap_or(-1);
+    let p99 = ql["p99"].as_i64().unwrap_or(-1);
+    assert!(
+        p50 > 0,
+        "queryLatency.p50 should reflect a real query: {snap}"
+    );
+    assert!(p95 >= p50, "queryLatency.p95 >= p50: {snap}");
+    assert!(p99 >= p95, "queryLatency.p99 >= p95: {snap}");
+
+    // mutateLatency: present + well-formed (one mutation ran above).
+    let ml = &snap["mutateLatency"];
+    assert!(ml.is_object(), "mutateLatency missing/malformed: {snap}");
+    let m50 = ml["p50"].as_i64().unwrap_or(-1);
+    let m95 = ml["p95"].as_i64().unwrap_or(-1);
+    let m99 = ml["p99"].as_i64().unwrap_or(-1);
+    assert!(m50 >= 0, "mutateLatency.p50 should be non-negative: {snap}");
+    assert!(m95 >= m50, "mutateLatency.p95 >= p50: {snap}");
+    assert!(m99 >= m95, "mutateLatency.p99 >= p95: {snap}");
+
+    // subscribeLatency: present + well-formed (no WS sub here → all zeros is
+    // the expected empty-state; only assert the shape and ordering).
+    let sl = &snap["subscribeLatency"];
+    assert!(sl.is_object(), "subscribeLatency missing/malformed: {snap}");
+    let s50 = sl["p50"].as_i64().unwrap_or(-1);
+    let s95 = sl["p95"].as_i64().unwrap_or(-1);
+    let s99 = sl["p99"].as_i64().unwrap_or(-1);
+    assert!(
+        s50 >= 0,
+        "subscribeLatency.p50 should be non-negative: {snap}"
+    );
+    assert!(s95 >= s50, "subscribeLatency.p95 >= p50: {snap}");
+    assert!(s99 >= s95, "subscribeLatency.p99 >= p95: {snap}");
+    Ok(())
+}
+
 // GET /metrics returns Prometheus text-exposition (no Accept header → text
 // branch), and a prior /api/query is reflected in the rtdb_queries_total sample.
 #[tokio::test]

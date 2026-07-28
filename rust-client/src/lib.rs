@@ -74,6 +74,6 @@ pub use ws::{ClientStatus, Config, ConnectionState, RtDbClient, Snapshot, Subscr
 
 #[cfg(feature = "admin")]
 pub use wire::admin::{
-    AdminMember, ConfigResponse, DbStats, HotConfig, HotConfigPatch, MetricsSnapshot, MintedToken,
-    OpEvent, TableStat, TokenInfo,
+    AdminMember, ConfigResponse, DbStats, HotConfig, HotConfigPatch, LatencyStats, MetricsSnapshot,
+    MintedToken, OpEvent, TableStat, TokenInfo,
 };

@@ -535,6 +535,17 @@ pub mod admin {
         pub revoked: bool,
     }
 
+    /// p50/p95/p99 latency percentile triple (microseconds). Mirrors
+    /// `server::metrics::LatencyStats`. Field names are already lowercase, so
+    /// `rename_all = "camelCase"` leaves them as `p50`/`p95`/`p99` on the wire.
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct LatencyStats {
+        pub p50: i64,
+        pub p95: i64,
+        pub p99: i64,
+    }
+
     /// `GET /admin/metrics` snapshot — server counters and gauges.
     #[derive(Debug, Clone, Deserialize)]
     #[serde(rename_all = "camelCase")]
@@ -547,6 +558,9 @@ pub mod admin {
         pub pool_size: i64,
         pub pool_idle: i64,
         pub uptime_seconds: i64,
+        pub query_latency: LatencyStats,
+        pub mutate_latency: LatencyStats,
+        pub subscribe_latency: LatencyStats,
     }
 
     /// Runtime-mutable hot-config subset of `ConfigResponse`. Mirrors

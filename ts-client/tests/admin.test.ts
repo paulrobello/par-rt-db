@@ -194,6 +194,9 @@ describe("RtDbAdminClient — new endpoints", () => {
       poolSize: 4,
       poolIdle: 3,
       uptimeSeconds: 99,
+      queryLatency: { p50: 110, p95: 220, p99: 330 },
+      mutateLatency: { p50: 440, p95: 550, p99: 660 },
+      subscribeLatency: { p50: 770, p95: 880, p99: 990 },
     };
     const fetchMock = vi.fn().mockResolvedValue(jsonResponse(snap));
     const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
