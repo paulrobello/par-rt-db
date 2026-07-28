@@ -489,6 +489,89 @@ async fn metrics_endpoint_reflects_a_mutation() -> anyhow::Result<()> {
     Ok(())
 }
 
+// GET /metrics returns Prometheus text-exposition (no Accept header → text
+// branch), and a prior /api/query is reflected in the rtdb_queries_total sample.
+#[tokio::test]
+async fn metrics_prometheus_endpoint() -> anyhow::Result<()> {
+    let state = common::test_state().await;
+    let addr = common::spawn_app(state.clone()).await;
+    let db = common::fresh_db(&state).await;
+
+    // Mint a token, insert one doc, then run one query (bumps queries_total).
+    let mint: serde_json::Value = common::admin_post(
+        addr,
+        "/admin/mint-token",
+        serde_json::json!({"db": db, "name": "t"}),
+    )
+    .await
+    .json()
+    .await?;
+    let token = mint["token"].as_str().unwrap().to_string();
+    let client = reqwest::Client::new();
+    let insert = client
+        .post(format!("http://{addr}/api/mutate"))
+        .header("Authorization", format!("Bearer {token}"))
+        .json(&serde_json::json!({
+            "db": db,
+            "txn": {"steps":[{"op":"insert","table":"projects","doc":{"name":"p","status":"active","tags":[],"updatedAt":0}}]}
+        }))
+        .send()
+        .await?;
+    assert_eq!(insert.status(), reqwest::StatusCode::OK);
+    let query = client
+        .post(format!("http://{addr}/api/query"))
+        .header("Authorization", format!("Bearer {token}"))
+        .json(&serde_json::json!({"db": db, "query": {"table": "projects"}}))
+        .send()
+        .await?;
+    assert_eq!(query.status(), reqwest::StatusCode::OK);
+
+    // No Accept header → Prometheus text (API-only test mode, no RTDB_STATIC_DIR).
+    let resp = reqwest::Client::new()
+        .get(format!("http://{addr}/metrics"))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        content_type.starts_with("text/plain"),
+        "expected text/plain content-type, got: {content_type}"
+    );
+    let body = resp.text().await?;
+    assert!(
+        body.contains("# TYPE rtdb_queries_total counter"),
+        "missing counter TYPE line: {body}"
+    );
+    assert!(
+        body.contains("rtdb_queries_total "),
+        "missing rtdb_queries_total sample line: {body}"
+    );
+    assert!(
+        body.contains("# TYPE rtdb_ws_connections gauge"),
+        "missing gauge TYPE line: {body}"
+    );
+    assert!(
+        body.contains("rtdb_build_info{version="),
+        "missing build_info line: {body}"
+    );
+    // The query we ran must be reflected: sample value >= 1.
+    let qline = body
+        .lines()
+        .find(|l| l.starts_with("rtdb_queries_total "))
+        .unwrap_or("");
+    let val: u64 = qline
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    assert!(val >= 1, "rtdb_queries_total sample < 1: {qline}");
+    Ok(())
+}
+
 // OpFeed publishes one event per DocOp (with kind), replays from the ring, broadcasts live.
 #[tokio::test]
 async fn op_feed_publishes_and_replays() -> anyhow::Result<()> {

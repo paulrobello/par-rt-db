@@ -28,10 +28,10 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use arc_swap::ArcSwap;
-use axum::extract::Request;
-use axum::http::{HeaderValue, Method, header};
+use axum::extract::{Request, State};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::middleware::{Next, from_fn};
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use axum::{Router, routing::get};
 use committer::Committers;
 use config::{Config, HotConfig};
@@ -156,12 +156,67 @@ async fn set_static_cache_headers(req: Request, next: Next) -> Response {
     resp
 }
 
+/// `GET /metrics`: unauthenticated Prometheus text-exposition scrape endpoint.
+///
+/// Content-negotiates on `Accept` so the operator dashboard's browser route at
+/// `/metrics` (SPA) still works: a browser (`Accept: text/html,...`) is served
+/// the SPA's `index.html` when `RTDB_STATIC_DIR` is configured; everything else
+/// (Prometheus's scraper sends `application/openmetrics-text;...,text/plain;...`,
+/// curl, API-only deploys) gets Prometheus text. Safe to expose without auth —
+/// `MetricsSnapshot` is aggregate-only (no per-db, no principal data), same
+/// posture as `/healthz`. The existing admin JSON snapshot stays at
+/// `/admin/metrics` (admin-gated); this endpoint does not replace it.
+async fn prometheus_metrics_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Response {
+    let wants_html = headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|a| a.contains("text/html"));
+
+    if wants_html
+        && let Some(dir) = state.config.static_dir.as_deref()
+        && let Ok(index) = tokio::fs::read_to_string(format!("{dir}/index.html")).await
+    {
+        let mut h = HeaderMap::new();
+        h.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/html; charset=utf-8"),
+        );
+        h.insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("no-cache, no-store, must-revalidate"),
+        );
+        return (StatusCode::OK, h, index).into_response();
+    }
+
+    let snap = state
+        .runtime
+        .metrics
+        .snapshot(&state.pool, &state.realtime.subs, state.runtime.started_at)
+        .await;
+    let body =
+        metrics::render_prometheus(&snap, env!("CARGO_PKG_VERSION"), env!("BUILD_GIT_COMMIT"));
+    let mut h = HeaderMap::new();
+    h.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
+    );
+    h.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-cache, no-store, must-revalidate"),
+    );
+    (StatusCode::OK, h, body).into_response()
+}
+
 pub fn build_router(state: Arc<AppState>) -> Router {
     let cors = cors_layer(state.runtime.hot.clone());
 
     let mut router = Router::new()
         .route("/healthz", get(health::handler))
         .route("/privacy", get(privacy::handler))
+        .route("/metrics", get(prometheus_metrics_handler))
         .merge(admin::admin_routes())
         .merge(http_api::http_api_routes())
         .merge(ws::ws_routes())
