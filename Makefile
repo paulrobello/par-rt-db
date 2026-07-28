@@ -12,7 +12,7 @@ DEPLOY_COMMIT := $(shell git rev-parse --short HEAD)
 	pre-commit pre-commit-update ts-client-build ts-client-install dashboard-install \
 	dashboard-test \
 	python-client-install python-client-test python-client-lint python-client-fmt \
-	python-client-typecheck python-client-checkall deploy
+	python-client-typecheck python-client-checkall rtdb-cli deploy
 
 # The dashboard's typecheck/build resolve `@par-rt-db/client` from ts-client's
 # gitignored `dist/` (workspace link + exports.types). Build it first so the
@@ -23,12 +23,14 @@ ts-client-build:
 build: ts-client-build
 	cd server && cargo build
 	cd rust-client && cargo build --all-features
+	cd cli && cargo build --all-features
 	cd dashboard && bun run build
 
 fmt:
 	cd server && cargo fmt --all
 	cd ts-client && bun run fmt
 	cd rust-client && cargo fmt --all
+	cd cli && cargo fmt --all
 	cd dashboard && bun run fmt
 	cd python-client && uv run ruff format .
 
@@ -36,6 +38,7 @@ fmt-check:
 	cd server && cargo fmt --all -- --check
 	cd ts-client && bun run fmt-check
 	cd rust-client && cargo fmt --all -- --check
+	cd cli && cargo fmt --all -- --check
 	cd dashboard && bun run fmt-check
 	cd python-client && uv run ruff format --check .
 
@@ -43,6 +46,7 @@ lint:
 	cd server && cargo clippy --all-targets --all-features -- -D warnings
 	cd ts-client && bun run lint
 	cd rust-client && cargo clippy --all-targets --all-features -- -D warnings
+	cd cli && cargo clippy --all-targets --all-features -- -D warnings
 	cd dashboard && bun run lint
 	cd python-client && uv run ruff check .
 
@@ -50,6 +54,7 @@ typecheck: ts-client-build
 	cd server && cargo check --all-targets
 	cd ts-client && bun run typecheck
 	cd rust-client && cargo check --all-targets --all-features
+	cd cli && cargo check --all-targets --all-features
 	cd dashboard && bun run typecheck
 	cd python-client && uv run pyright
 
@@ -63,6 +68,7 @@ test: dev-db-up
 	cd server && cargo test
 	cd ts-client && bun run test
 	cd rust-client && cargo test --all-features
+	cd cli && cargo test --all-features
 	cd dashboard && bun run test
 	cd python-client && uv run pytest -q
 
@@ -92,6 +98,9 @@ python-client-typecheck:
 	cd python-client && uv run pyright
 
 python-client-checkall: python-client-fmt python-client-lint python-client-typecheck python-client-test
+
+rtdb-cli:
+	cd cli && cargo build --release
 
 checkall: fmt-check lint typecheck test
 

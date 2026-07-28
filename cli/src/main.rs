@@ -1,0 +1,374 @@
+//! `rtdb` — operator + CI CLI for [par-rt-db](https://github.com/paulrobello/par-rt-db).
+//!
+//! Thin wrapper over the `par-rt-db-client` rust-client. Covers operator
+//! workflows (schema push, db list/create, token mint/revoke) and CI seed
+//! scripts (one-shot query/mutate) without reaching for the dashboard or raw
+//! curl. The server URL and credentials may be supplied via flags or the
+//! `RTDB_URL` / `RTDB_DB` / `RTDB_TOKEN` / `RTDB_ADMIN_KEY` env vars.
+//!
+//! Admin subcommands (`list-dbs`, `create-db`, `push-schema`, `mint-token`,
+//! `revoke-token`) send the instance admin key as the bearer. Data-plane
+//! subcommands (`query`, `mutate`) send a machine token scoped to `--db`.
+
+use anyhow::{anyhow, Context, Result};
+use clap::{Parser, Subcommand};
+use par_rt_db_client::{Query, RtDbError, RtDbHttpClient, SchemaDef, Transaction};
+use std::path::PathBuf;
+
+#[derive(Parser, Debug)]
+#[command(name = "rtdb", version, about = "Operator + CI CLI for par-rt-db")]
+struct Cli {
+    /// Server base URL (e.g. https://rtdb.pardev.net). [env: RTDB_URL]
+    #[arg(long, env = "RTDB_URL")]
+    url: String,
+
+    /// Database name — used by `query`, `mutate`, and `push-schema`. [env: RTDB_DB]
+    #[arg(long, env = "RTDB_DB")]
+    db: Option<String>,
+
+    /// Machine token for `query` / `mutate`. [env: RTDB_TOKEN]
+    #[arg(long, env = "RTDB_TOKEN")]
+    token: Option<String>,
+
+    /// Instance admin key — bearer for every admin subcommand. [env: RTDB_ADMIN_KEY]
+    #[arg(long, env = "RTDB_ADMIN_KEY")]
+    admin_key: Option<String>,
+
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// List every database on the instance. (admin)
+    ListDbs,
+    /// Create a new database. (admin)
+    CreateDb {
+        /// Database name to create.
+        name: String,
+    },
+    /// Push a SchemaDef JSON file to `--db`. (admin)
+    PushSchema {
+        /// Path to a JSON file containing a `SchemaDef` (wire shape:
+        /// `{"tables": {<name>: {"fields": {..}}}}`).
+        file: PathBuf,
+    },
+    /// Mint a machine token for a database. (admin)
+    MintToken {
+        /// Database to mint the token for.
+        db: String,
+        /// Human-readable token name (e.g. "ci-seed").
+        name: String,
+    },
+    /// Revoke a machine token by id. (admin)
+    RevokeToken {
+        /// Token id (`tok_…`) to revoke.
+        id: String,
+    },
+    /// Run a Query JSON against `--db` and print the result. (machine token)
+    Query {
+        /// Query JSON, e.g. `{"table":"items","take":10}`. Prefix with `@` to
+        /// read from a file (`@query.json`).
+        query: String,
+    },
+    /// Run a Transaction JSON against `--db` and print step results. (machine token)
+    Mutate {
+        /// Transaction JSON (`{"steps":[..]}`). Prefix with `@` to read from a
+        /// file (`@seed.json`).
+        txn: String,
+    },
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let cli = Cli::parse();
+    match &cli.command {
+        Command::ListDbs => {
+            let c = admin_client(&cli)?;
+            for db in c.list_dbs().await.map_err(map_err)? {
+                println!("{db}");
+            }
+        }
+        Command::CreateDb { name } => {
+            let c = admin_client(&cli)?;
+            c.create_db(name).await.map_err(map_err)?;
+            eprintln!("created database {name}");
+        }
+        Command::PushSchema { file } => {
+            let db = require_db(&cli)?;
+            let json = std::fs::read_to_string(file)
+                .with_context(|| format!("reading {}", file.display()))?;
+            let schema: SchemaDef =
+                serde_json::from_str(&json).context("parsing SchemaDef JSON")?;
+            let c = admin_client(&cli)?;
+            c.push_schema(&db, &schema).await.map_err(map_err)?;
+            eprintln!("pushed schema to {db}");
+        }
+        Command::MintToken { db, name } => {
+            let c = admin_client(&cli)?;
+            let minted = c.mint_token(db, name).await.map_err(map_err)?;
+            // `MintedToken` is response-only (Deserialize), so rebuild the wire
+            // shape `{tokenId, token}` for output.
+            let out = serde_json::json!({ "tokenId": minted.token_id, "token": minted.token });
+            println!("{}", serde_json::to_string_pretty(&out)?);
+        }
+        Command::RevokeToken { id } => {
+            let c = admin_client(&cli)?;
+            c.revoke_token(id).await.map_err(map_err)?;
+            eprintln!("revoked token {id}");
+        }
+        Command::Query { query } => {
+            let db = require_db(&cli)?;
+            let token = require_token(&cli)?;
+            let json = read_json_arg(query)?;
+            let q: Query = serde_json::from_str(&json).context("parsing Query JSON")?;
+            let c = data_client(&cli, &db, &token);
+            let result: serde_json::Value = c.run(q).await.map_err(map_err)?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        Command::Mutate { txn } => {
+            let db = require_db(&cli)?;
+            let token = require_token(&cli)?;
+            let json = read_json_arg(txn)?;
+            let t: Transaction = serde_json::from_str(&json).context("parsing Transaction JSON")?;
+            let c = data_client(&cli, &db, &token);
+            let results = c.mutate(&t, None).await.map_err(map_err)?;
+            println!("{}", serde_json::to_string_pretty(&results)?);
+        }
+    }
+    Ok(())
+}
+
+/// Build a client for an admin subcommand. The admin key is the bearer; the
+/// per-db field is unused by every admin endpoint (`push_schema` / `mint_token`
+/// carry `db` as a method arg, and `list_dbs` / `create_db` / `revoke_token`
+/// ignore it), so it's left empty.
+fn admin_client(cli: &Cli) -> Result<RtDbHttpClient> {
+    let admin_key = require_admin(cli)?;
+    Ok(RtDbHttpClient::new(&cli.url, "", &admin_key))
+}
+
+/// Build a client for a data-plane subcommand (`query` / `mutate`): machine
+/// token + db, both required and validated by the caller before this is reached.
+fn data_client(cli: &Cli, db: &str, token: &str) -> RtDbHttpClient {
+    RtDbHttpClient::new(&cli.url, db, token)
+}
+
+fn require_db(cli: &Cli) -> Result<String> {
+    cli.db
+        .clone()
+        .ok_or_else(|| anyhow!("--db (or RTDB_DB) is required for this subcommand"))
+}
+
+fn require_token(cli: &Cli) -> Result<String> {
+    cli.token
+        .clone()
+        .ok_or_else(|| anyhow!("--token (or RTDB_TOKEN) is required for this subcommand"))
+}
+
+fn require_admin(cli: &Cli) -> Result<String> {
+    cli.admin_key
+        .clone()
+        .ok_or_else(|| anyhow!("--admin-key (or RTDB_ADMIN_KEY) is required for this subcommand"))
+}
+
+/// Read a JSON argument: `@path` reads from a file, everything else is treated
+/// as the literal JSON string. Used for the `query` / `mutate` positionals.
+fn read_json_arg(arg: &str) -> Result<String> {
+    if let Some(path) = arg.strip_prefix('@') {
+        std::fs::read_to_string(path).with_context(|| format!("reading {path}"))
+    } else {
+        Ok(arg.to_string())
+    }
+}
+
+/// Surface an `RtDbError` as `<CODE>: <message>`. `RtDbError`'s own Display
+/// (via thiserror) is just the message, so the wire code is recovered here by
+/// serializing `ErrorCode` (it carries `#[serde(rename_all = "SCREAMING_SNAKE_CASE")]`).
+fn map_err(e: RtDbError) -> anyhow::Error {
+    let code = serde_json::to_value(e.code)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_else(|| format!("{:?}", e.code));
+    anyhow!("{code}: {}", e.message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use par_rt_db_client::ErrorCode;
+
+    #[test]
+    fn parses_admin_subcommands() {
+        let cli =
+            Cli::try_parse_from(["rtdb", "--url", "http://x", "--admin-key", "k", "list-dbs"])
+                .unwrap();
+        assert!(matches!(cli.command, Command::ListDbs));
+        assert_eq!(cli.url, "http://x");
+        assert_eq!(cli.admin_key.as_deref(), Some("k"));
+
+        let cli = Cli::try_parse_from([
+            "rtdb",
+            "--url",
+            "http://x",
+            "--admin-key",
+            "k",
+            "create-db",
+            "mydb",
+        ])
+        .unwrap();
+        let Command::CreateDb { name } = cli.command else {
+            panic!("expected CreateDb");
+        };
+        assert_eq!(name, "mydb");
+
+        let cli = Cli::try_parse_from([
+            "rtdb",
+            "--url",
+            "http://x",
+            "--db",
+            "d",
+            "--admin-key",
+            "k",
+            "push-schema",
+            "schema.json",
+        ])
+        .unwrap();
+        let Command::PushSchema { file } = cli.command else {
+            panic!("expected PushSchema");
+        };
+        assert_eq!(file, PathBuf::from("schema.json"));
+
+        let cli = Cli::try_parse_from([
+            "rtdb",
+            "--url",
+            "http://x",
+            "--admin-key",
+            "k",
+            "mint-token",
+            "d",
+            "ci",
+        ])
+        .unwrap();
+        let Command::MintToken { db, name } = cli.command else {
+            panic!("expected MintToken");
+        };
+        assert_eq!(db, "d");
+        assert_eq!(name, "ci");
+
+        let cli = Cli::try_parse_from([
+            "rtdb",
+            "--url",
+            "http://x",
+            "--admin-key",
+            "k",
+            "revoke-token",
+            "tok_1",
+        ])
+        .unwrap();
+        let Command::RevokeToken { id } = cli.command else {
+            panic!("expected RevokeToken");
+        };
+        assert_eq!(id, "tok_1");
+    }
+
+    #[test]
+    fn parses_query_and_mutate() {
+        let q = r#"{"table":"items","take":5}"#;
+        let cli = Cli::try_parse_from([
+            "rtdb", "--url", "http://x", "--db", "d", "--token", "t", "query", q,
+        ])
+        .unwrap();
+        let Command::Query { query } = cli.command else {
+            panic!("expected Query");
+        };
+        assert_eq!(query, q);
+
+        let txn = r#"{"steps":[{"op":"insert","table":"items","doc":{}}]}"#;
+        let cli = Cli::try_parse_from([
+            "rtdb", "--url", "http://x", "--db", "d", "--token", "t", "mutate", txn,
+        ])
+        .unwrap();
+        let Command::Mutate { txn: t } = cli.command else {
+            panic!("expected Mutate");
+        };
+        assert_eq!(t, txn);
+    }
+
+    #[test]
+    fn read_json_arg_inline_returns_literal() {
+        let s = r#"{"table":"x"}"#;
+        assert_eq!(read_json_arg(s).unwrap(), s);
+    }
+
+    #[test]
+    fn read_json_arg_at_file_reads_path() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let path =
+            std::env::temp_dir().join(format!("rtdb-cli-test-{}-{nonce}.json", std::process::id()));
+        let body = r#"{"table":"x"}"#;
+        std::fs::write(&path, body).unwrap();
+        let arg = format!("@{}", path.display());
+        assert_eq!(read_json_arg(&arg).unwrap(), body);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn read_json_arg_at_missing_file_errors() {
+        assert!(read_json_arg("@/nonexistent/rtdb-cli-test-does-not-exist.json").is_err());
+    }
+
+    #[test]
+    fn require_helpers_return_value_or_error() {
+        let missing = Cli {
+            url: "http://x".into(),
+            db: None,
+            token: None,
+            admin_key: None,
+            command: Command::ListDbs,
+        };
+        assert!(require_db(&missing).is_err());
+        assert!(require_token(&missing).is_err());
+        assert!(require_admin(&missing).is_err());
+
+        let present = Cli {
+            url: "http://x".into(),
+            db: Some("d".into()),
+            token: Some("t".into()),
+            admin_key: Some("a".into()),
+            command: Command::ListDbs,
+        };
+        assert_eq!(require_db(&present).unwrap(), "d");
+        assert_eq!(require_token(&present).unwrap(), "t");
+        assert_eq!(require_admin(&present).unwrap(), "a");
+    }
+
+    #[test]
+    fn map_err_surfaces_code_and_message() {
+        let e = RtDbError::new(ErrorCode::NotFound, "missing thing");
+        assert_eq!(map_err(e).to_string(), "NOT_FOUND: missing thing");
+    }
+
+    #[test]
+    fn env_vars_supply_credentials_when_flags_absent() {
+        // clap only consults these env vars when the matching flag is absent
+        // from argv; every other test passes flags explicitly, so setting them
+        // here cannot flake the rest of the suite.
+        std::env::set_var("RTDB_URL", "http://env");
+        std::env::set_var("RTDB_ADMIN_KEY", "env-admin");
+        std::env::set_var("RTDB_DB", "envdb");
+        std::env::set_var("RTDB_TOKEN", "env-tok");
+        let cli = Cli::try_parse_from(["rtdb", "list-dbs"]).unwrap();
+        assert_eq!(cli.url, "http://env");
+        assert_eq!(cli.admin_key.as_deref(), Some("env-admin"));
+        assert_eq!(cli.db.as_deref(), Some("envdb"));
+        assert_eq!(cli.token.as_deref(), Some("env-tok"));
+        std::env::remove_var("RTDB_URL");
+        std::env::remove_var("RTDB_ADMIN_KEY");
+        std::env::remove_var("RTDB_DB");
+        std::env::remove_var("RTDB_TOKEN");
+    }
+}
