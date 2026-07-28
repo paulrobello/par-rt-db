@@ -146,6 +146,51 @@ async fn bootstrap_ddl(conn: &mut PgConnection) -> Result<(), RtDbError> {
     Ok(())
 }
 
+/// Creates the global `rtdb.audit_log` table idempotently. Called at boot only
+/// when `Config::audit_log_enabled` — the table is permitted to not exist when
+/// audit is off (and the admin endpoint then returns an empty list). One row
+/// per durable `DocOp`, written from the committer's two tap sites
+/// (`handle_mutate`/`handle_scheduled`); the durable counterpart to the
+/// ephemeral `OpFeed` ring. The `(db, ts_ms DESC)` index backs the
+/// `GET /admin/audit?db=...` newest-first scan without a full-table sort.
+pub async fn ensure_audit_table(pool: &PgPool) -> Result<(), RtDbError> {
+    let mut tx = pool.begin().await?;
+
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(BOOTSTRAP_LOCK_KEY)
+        .execute(&mut *tx)
+        .await?;
+
+    sqlx::query("CREATE SCHEMA IF NOT EXISTS rtdb")
+        .execute(&mut *tx)
+        .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS rtdb.audit_log (
+            id        BIGSERIAL PRIMARY KEY,
+            ts_ms     BIGINT NOT NULL,
+            db        TEXT NOT NULL,
+            tbl       TEXT NOT NULL,
+            op        TEXT,
+            doc_id    TEXT NOT NULL,
+            principal TEXT,
+            source    TEXT NOT NULL
+        )",
+    )
+    .execute(&mut *tx)
+    .await?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS audit_log_db_ts_idx \
+         ON rtdb.audit_log (db, ts_ms DESC)",
+    )
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    Ok(())
+}
+
 /// Registers a new tenant database: validates `name`, creates its Postgres schema
 /// and `meta` table, and records it in the `rtdb_auth.databases` registry, all in
 /// one transaction.

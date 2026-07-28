@@ -34,6 +34,12 @@ pub struct Config {
     // otherwise starve the others.
     pub rate_limit_per_token_rpm: u32,
     pub rate_limit_per_db_rpm: u32, // RTDB_RATE_LIMIT_PER_DB_RPM, shared across all principals of one db
+    // Durable audit log (global `rtdb.audit_log` table): when true, the
+    // committer writes one row per durable DocOp at both tap sites
+    // (`handle_mutate`/`handle_scheduled`). Off by default — the ephemeral
+    // op-feed (`OpFeed`) is always on; this is its durable counterpart.
+    // RTDB_AUDIT_LOG_ENABLED (accepts "true"/"1"/"yes", case-insensitive).
+    pub audit_log_enabled: bool,
 }
 
 impl Config {
@@ -102,6 +108,14 @@ impl Config {
             Err(_) => 0,
         };
 
+        // Audit log: default off. Accepts the common truthy spellings
+        // case-insensitively and falls back to false on anything else,
+        // matching the permissiveness of the other env parses above.
+        let audit_log_enabled = match std::env::var("RTDB_AUDIT_LOG_ENABLED") {
+            Ok(v) => matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes"),
+            Err(_) => false,
+        };
+
         Ok(Self {
             port,
             database_url,
@@ -118,6 +132,7 @@ impl Config {
             pool_max_connections,
             rate_limit_per_token_rpm,
             rate_limit_per_db_rpm,
+            audit_log_enabled,
         })
     }
 }

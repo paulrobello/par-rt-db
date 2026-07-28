@@ -24,6 +24,7 @@ pub fn test_config() -> Config {
         pool_max_connections: 75,
         rate_limit_per_token_rpm: 0,
         rate_limit_per_db_rpm: 0,
+        audit_log_enabled: false,
     }
 }
 
@@ -64,6 +65,24 @@ pub async fn test_state_with_rate_limits(per_token_rpm: u32, per_db_rpm: u32) ->
         .await
         .expect("connect to test postgres");
     db::bootstrap(&pool).await.expect("bootstrap rtdb_auth");
+    AppState::new(pool, config, test_hot())
+}
+
+/// Like `test_state` but with `audit_log_enabled = true` and the
+/// `rtdb.audit_log` table ensured. Used by `tests/audit_test.rs` to exercise
+/// the durable audit log end-to-end without touching env vars. Mirrors the
+/// `test_state_with_rate_limits` override pattern.
+#[allow(dead_code)]
+pub async fn test_state_with_audit() -> Arc<AppState> {
+    let mut config = test_config();
+    config.audit_log_enabled = true;
+    let pool = sqlx::PgPool::connect(&config.database_url)
+        .await
+        .expect("connect to test postgres");
+    db::bootstrap(&pool).await.expect("bootstrap rtdb_auth");
+    db::ensure_audit_table(&pool)
+        .await
+        .expect("ensure rtdb.audit_log");
     AppState::new(pool, config, test_hot())
 }
 

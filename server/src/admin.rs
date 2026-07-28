@@ -808,6 +808,52 @@ fn default_ops_n() -> usize {
     100
 }
 
+#[derive(Deserialize)]
+struct AuditParams {
+    db: Option<String>,
+    #[serde(default = "default_audit_limit")]
+    limit: i64,
+    #[serde(default = "default_audit_offset")]
+    offset: i64,
+}
+fn default_audit_limit() -> i64 {
+    100
+}
+fn default_audit_offset() -> i64 {
+    0
+}
+
+#[derive(Serialize)]
+struct AuditResponse {
+    entries: Vec<crate::audit::AuditEntry>,
+}
+
+/// `GET /admin/audit?db=<optional>&limit=<n>&offset=<m>` — durable audit log,
+/// newest-first. `limit` defaults to 100 and is capped at 1000; `offset`
+/// defaults to 0. When audit is disabled at boot (`!config.audit_log_enabled`)
+/// this short-circuits to an empty list — the `rtdb.audit_log` table may not
+/// exist, and an operator who turned audit off should not see stale rows from
+/// a previous enabled run either.
+async fn audit_recent(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    QueryParams(params): QueryParams<AuditParams>,
+) -> Result<Json<AuditResponse>, RtDbError> {
+    require_admin(&state, &headers).await?;
+    if !state.config.audit_log_enabled {
+        return Ok(Json(AuditResponse {
+            entries: Vec::new(),
+        }));
+    }
+    // Clamp to [1, 1000]; negative limits/offsets are nonsensical but
+    // otherwise accepted by Postgres, so guard at the API edge.
+    let limit = params.limit.clamp(1, 1000);
+    let offset = params.offset.max(0);
+    let entries =
+        crate::audit::fetch_audit_rows(&state.pool, params.db.as_deref(), limit, offset).await?;
+    Ok(Json(AuditResponse { entries }))
+}
+
 #[derive(Serialize)]
 struct OpsRecentResponse {
     ops: Vec<crate::op_feed::OpEvent>,
@@ -968,6 +1014,7 @@ pub fn admin_routes() -> Router<Arc<AppState>> {
         .route("/admin/metrics", get(metrics_handler))
         .route("/admin/config", get(get_config).patch(patch_config))
         .route("/admin/ops/recent", get(ops_recent))
+        .route("/admin/audit", get(audit_recent))
         .route("/admin/stream", get(admin_stream))
         .route("/admin/tokens", get(list_tokens))
         .route("/admin/export-db", get(export_db))

@@ -19,6 +19,7 @@ fn test_config() -> Config {
         pool_max_connections: 75,
         rate_limit_per_token_rpm: 0,
         rate_limit_per_db_rpm: 0,
+        audit_log_enabled: false,
     }
 }
 

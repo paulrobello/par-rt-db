@@ -46,4 +46,4 @@ explicitly-deferred sub-items. Effort is rough: `small` ≤1 day, `medium` 1–3
 ## Operations & reliability
 
 - [ ] **Managed `pg_dump` backup scheduling** — the docs reference manual nightly `pg_dump`; add an optional built-in scheduler (configurable cadence + retention to a chosen path) so backups are first-class instead of a cron-and-prayer external step. (effort: medium)
-- [ ] **Durable audit log** — the op-feed is ephemeral; add an opt-in durable audit trail (who mutated which table/row, when, from which principal) for multi-user OAuth apps that need accountability. (effort: medium)
+- [x] **Durable audit log** — the op-feed is ephemeral; add an opt-in durable audit trail (who mutated which table/row, when, from which principal) for multi-user OAuth apps that need accountability. (effort: medium)

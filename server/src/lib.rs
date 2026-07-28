@@ -1,4 +1,5 @@
 pub mod admin;
+pub mod audit;
 pub mod auth;
 pub mod committer;
 pub mod config;
@@ -91,6 +92,7 @@ impl AppState {
             schemas.clone(),
             op_feed.clone(),
             hot.clone(),
+            config.audit_log_enabled,
         );
         let metrics = metrics::Metrics::new();
         Arc::new(Self {

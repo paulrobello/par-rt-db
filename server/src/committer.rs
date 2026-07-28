@@ -61,6 +61,7 @@ pub struct Committers {
     schemas: SchemaCache,
     op_feed: Arc<crate::op_feed::OpFeed>,
     hot: Arc<ArcSwap<HotConfig>>,
+    audit_log_enabled: bool,
     channels: Mutex<HashMap<String, mpsc::Sender<CommitterRequest>>>,
 }
 
@@ -71,6 +72,7 @@ impl Committers {
         schemas: SchemaCache,
         op_feed: Arc<crate::op_feed::OpFeed>,
         hot: Arc<ArcSwap<HotConfig>>,
+        audit_log_enabled: bool,
     ) -> Self {
         Self {
             pool,
@@ -78,6 +80,7 @@ impl Committers {
             schemas,
             op_feed,
             hot,
+            audit_log_enabled,
             channels: Mutex::new(HashMap::new()),
         }
     }
@@ -158,6 +161,7 @@ impl Committers {
             self.schemas.clone(),
             self.op_feed.clone(),
             self.hot.clone(),
+            self.audit_log_enabled,
             rx,
         ));
         tokio::spawn(scheduler::run_scheduler(
@@ -251,6 +255,7 @@ struct CommitterCtx {
     schemas: SchemaCache,
     op_feed: Arc<crate::op_feed::OpFeed>,
     hot: Arc<ArcSwap<HotConfig>>,
+    audit_log_enabled: bool,
 }
 
 /// The per-db committer task loop: processes exactly one `CommitterRequest`
@@ -264,6 +269,7 @@ struct CommitterCtx {
 ///   only then is the subscription registered — both steps happen before any
 ///   other message (in particular, a concurrent `Mutate`) can be processed,
 ///   so no update between execute and register can be missed.
+#[allow(clippy::too_many_arguments)]
 async fn run_committer(
     pool: PgPool,
     db: String,
@@ -271,6 +277,7 @@ async fn run_committer(
     schemas: SchemaCache,
     op_feed: Arc<crate::op_feed::OpFeed>,
     hot: Arc<ArcSwap<HotConfig>>,
+    audit_log_enabled: bool,
     mut rx: mpsc::Receiver<CommitterRequest>,
 ) {
     if let Err(err) = mutation_log::ensure_table(&pool, &db).await {
@@ -286,6 +293,7 @@ async fn run_committer(
         schemas,
         op_feed,
         hot,
+        audit_log_enabled,
     };
     while let Some(req) = rx.recv().await {
         match req {
@@ -351,6 +359,21 @@ async fn handle_mutate(
     ctx.op_feed
         .publish(&ctx.db, owner.as_deref(), &outcome.write_set.ops)
         .await;
+    // Durable audit tap (the persistent counterpart to the op-feed above).
+    // Best-effort: a logging failure is warned, never surfaced to the client —
+    // the mutation has already committed and fanned out by this point.
+    if ctx.audit_log_enabled
+        && let Err(err) = crate::audit::write_audit_rows(
+            &ctx.pool,
+            &ctx.db,
+            owner.as_deref(),
+            "mutate",
+            &outcome.write_set.ops,
+        )
+        .await
+    {
+        tracing::warn!(db = %ctx.db, error = %err, "audit log write failed");
+    }
 
     if let Some(key) = &idempotency_key {
         // The dedup TTL is read live from hot config so a `PATCH /admin/config`
@@ -403,6 +426,21 @@ async fn handle_scheduled(
             ctx.op_feed
                 .publish(&ctx.db, None, &outcome.write_set.ops)
                 .await;
+            // Durable audit tap — scheduled jobs carry no interactive principal
+            // (the op-feed publish above also passes `None`), so `principal`
+            // is NULL and `source = "scheduled"`.
+            if ctx.audit_log_enabled
+                && let Err(err) = crate::audit::write_audit_rows(
+                    &ctx.pool,
+                    &ctx.db,
+                    None,
+                    "scheduled",
+                    &outcome.write_set.ops,
+                )
+                .await
+            {
+                tracing::warn!(db = %ctx.db, error = %err, "audit log write failed");
+            }
             let finalize = match kind.as_str() {
                 "oneshot" => scheduler::finalize_one_shot_done(&ctx.pool, &ctx.db, &id).await,
                 "cron" => match cron.as_deref() {

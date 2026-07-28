@@ -36,6 +36,15 @@ async fn main() {
         std::process::exit(1);
     });
 
+    // Durable audit log table: only ensured when the feature is enabled at
+    // boot. When off the table is permitted to not exist, and the
+    // `GET /admin/audit` endpoint returns an empty list.
+    if config.audit_log_enabled {
+        db::ensure_audit_table(&pool).await.unwrap_or_else(|err| {
+            tracing::warn!(error = %err, "failed to ensure rtdb.audit_log table");
+        });
+    }
+
     let admin_emails: Vec<String> = match std::env::var("RTDB_ADMIN_EMAILS") {
         Ok(v) if !v.is_empty() => v
             .split(',')
