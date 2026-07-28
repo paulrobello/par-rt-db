@@ -3,10 +3,10 @@ use std::time::Duration;
 
 use axum::body::Body;
 use axum::extract::ws::{WebSocket, WebSocketUpgrade};
-use axum::extract::{FromRequest, Path, Query as QueryParams, Request, State};
-use axum::http::{HeaderMap, StatusCode, header::SET_COOKIE};
+use axum::extract::{DefaultBodyLimit, FromRequest, Path, Query as QueryParams, Request, State};
+use axum::http::{HeaderMap, StatusCode, header::CONTENT_TYPE, header::SET_COOKIE};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
@@ -19,7 +19,7 @@ use crate::query::{Query, QueryResult, execute_query};
 use crate::scheduler;
 use crate::schema::SchemaDef;
 use crate::txn::Transaction;
-use crate::{AppState, auth, db, ddl, snapshot};
+use crate::{AppState, auth, db, ddl, snapshot, storage};
 
 /// Who an admin request was made as: the raw admin key (CLI/automation) or an
 /// OAuth user on the server-wide admin allowlist (browser dashboard). The
@@ -675,6 +675,97 @@ async fn admin_resume_schedule(
     admin_set_schedule_paused(&state, &headers, &db, &id, false).await
 }
 
+// --- File storage (admin) --------------------------------------------------
+//
+// Thin admin-gated wrappers over `storage` accessors, mirroring the per-db
+// machine-token handlers in `http_api` (`upload_handler`, `delete_handler`,
+// `metadata_handler`). Storage is not per-row — there is no `ownerField` on the
+// `storage` table — so (unlike `/admin/db/{db}/mutate`) there is no owner to
+// bypass; the admin gate alone guards these routes.
+
+#[derive(Serialize)]
+struct AdminStorageListResponse {
+    files: Vec<storage::FileMeta>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AdminStorageUploadResponse {
+    id: String,
+}
+
+/// `GET /admin/db/{db}/storage` — list stored files (metadata only), newest
+/// first. `ensure_table` first so a database that predates the storage feature
+/// (or had its table dropped) returns an empty list rather than erroring.
+async fn admin_storage_list(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(db): Path<String>,
+) -> Result<Json<AdminStorageListResponse>, RtDbError> {
+    require_admin(&state, &headers).await?;
+    if !db::database_exists(&state.pool, &db).await? {
+        return Err(RtDbError::not_found("unknown database"));
+    }
+    storage::ensure_table(&state.pool, &db).await?;
+    let files = storage::list(&state.pool, &db).await?;
+    Ok(Json(AdminStorageListResponse { files }))
+}
+
+/// `POST /admin/db/{db}/storage` — admin upload (raw body). Mirrors
+/// `http_api::upload_handler` exactly: ensure_table, the live `max_file_size`
+/// check (clamped to `HARD_MAX_FILE_SIZE`), sha256, `storage::put`, and
+/// `metrics.record_upload()`. The route carries `DefaultBodyLimit::disable` so
+/// `to_bytes` is the sole ceiling (SEC-008).
+async fn admin_storage_upload(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(db): Path<String>,
+    request: Request,
+) -> Result<Json<AdminStorageUploadResponse>, RtDbError> {
+    require_admin(&state, &headers).await?;
+    if !db::database_exists(&state.pool, &db).await? {
+        return Err(RtDbError::not_found("unknown database"));
+    }
+    storage::ensure_table(&state.pool, &db).await?;
+    let limit = crate::config::HARD_MAX_FILE_SIZE.min(state.runtime.hot.load().max_file_size);
+    let bytes = axum::body::to_bytes(request.into_body(), limit)
+        .await
+        .map_err(|_| RtDbError::bad_request("upload exceeds max file size"))?;
+    let size = bytes.len() as i64;
+    let sha256 = storage::sha256_hex_bytes(&bytes);
+    let content_type = headers
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let id = storage::put(
+        &state.pool,
+        &db,
+        &sha256,
+        size,
+        content_type.as_deref(),
+        &bytes,
+    )
+    .await?;
+    state.runtime.metrics.record_upload();
+    Ok(Json(AdminStorageUploadResponse { id }))
+}
+
+/// `DELETE /admin/db/{db}/storage/{id}` — idempotent delete. Both the per-db
+/// blob row and the global `storage_index` row are removed (atomic, in one tx
+/// inside `storage::delete`), so the public serve URL 404s afterward.
+async fn admin_storage_delete(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((db, id)): Path<(String, String)>,
+) -> Result<Json<OkResponse>, RtDbError> {
+    require_admin(&state, &headers).await?;
+    if !db::database_exists(&state.pool, &db).await? {
+        return Err(RtDbError::not_found("unknown database"));
+    }
+    storage::delete(&state.pool, &db, &id).await?;
+    Ok(Json(OkResponse { ok: true }))
+}
+
 #[derive(Serialize)]
 struct TokenRow {
     id: String,
@@ -1125,6 +1216,13 @@ pub fn admin_routes() -> Router<Arc<AppState>> {
         .route("/admin/dbs/{db}/stats", get(db_stats))
         .route("/admin/db/{db}/query", post(admin_query))
         .route("/admin/db/{db}/mutate", post(admin_mutate))
+        .route(
+            "/admin/db/{db}/storage",
+            get(admin_storage_list)
+                .post(admin_storage_upload)
+                .layer(DefaultBodyLimit::disable()),
+        )
+        .route("/admin/db/{db}/storage/{id}", delete(admin_storage_delete))
         .route(
             "/admin/db/{db}/schedules",
             get(admin_list_schedules).post(admin_create_schedule),

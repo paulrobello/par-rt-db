@@ -15,6 +15,7 @@ import type {
   AdminQueryResult,
   ConfigResponse,
   DbStats,
+  FileMeta,
   HotConfigPatch,
   MetricsSnapshot,
   OpEvent,
@@ -169,6 +170,25 @@ export class AdminClient {
   }
   me() {
     return this.req<AuthedUser>("/auth/me");
+  }
+  listFiles(db: string): Promise<FileMeta[]> {
+    return this.req<{ files: FileMeta[] }>(`/admin/db/${enc(db)}/storage`).then((r) => r.files);
+  }
+  /** Upload raw bytes (POST body is the file, not JSON). The content-type is
+   *  taken from the Blob's `.type` (a File keeps its MIME type) so the server
+   *  stores and serves it back. The server enforces `maxFileSize` (413/error). */
+  uploadFile(db: string, body: Blob | ArrayBuffer): Promise<{ id: string }> {
+    const blob = body instanceof Blob ? body : new Blob([body]);
+    return this.req<{ id: string }>(`/admin/db/${enc(db)}/storage`, {
+      method: "POST",
+      body: blob,
+      headers: { "content-type": blob.type || "application/octet-stream" },
+    });
+  }
+  deleteFile(db: string, id: string): Promise<{ ok: boolean }> {
+    return this.req<{ ok: boolean }>(`/admin/db/${enc(db)}/storage/${enc(id)}`, {
+      method: "DELETE",
+    });
   }
 }
 

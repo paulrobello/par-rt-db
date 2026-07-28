@@ -1,5 +1,7 @@
 mod common;
 
+use std::net::SocketAddr;
+
 use common::{
     admin_get, admin_post, admin_post_raw, fresh_db, kanban_schema_json, spawn_app, test_state,
 };
@@ -934,6 +936,150 @@ async fn admin_schedule_list_unknown_db_is_404() -> anyhow::Result<()> {
     let bogus = fresh_name();
 
     let resp = admin_get(addr, &format!("/admin/db/{bogus}/schedules")).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+
+    Ok(())
+}
+
+// --- File storage (admin) --------------------------------------------------
+//
+// Round-trip the three admin storage endpoints: upload (raw bytes) → list shows
+// the file with size + contentType → delete → list empty. Mirrors the per-db
+// `http_api` storage round-trip in `storage_test.rs`, minus the per-db bearer
+// gate (admin-gated instead). Asserts the global `storage_index` row is cleaned
+// on delete (the public serve URL must 404 afterward).
+
+/// Uploads `body` to `/admin/db/{db}/storage` with the admin bearer and a
+/// content-type header; returns the server-assigned id.
+async fn admin_upload(addr: SocketAddr, db: &str, body: &[u8]) -> String {
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/admin/db/{db}/storage"))
+        .header("Authorization", "Bearer test-admin-key")
+        .header("content-type", "text/plain")
+        .body(body.to_vec())
+        .send()
+        .await
+        .expect("admin upload");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    resp.json::<serde_json::Value>().await.expect("json")["id"]
+        .as_str()
+        .expect("id")
+        .to_string()
+}
+
+#[tokio::test]
+async fn admin_storage_upload_list_delete_round_trip() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let addr = spawn_app(state.clone()).await;
+    let name = fresh_db(&state).await;
+
+    // Upload raw bytes through the admin route.
+    let bytes = b"hello admin storage";
+    let id = admin_upload(addr, &name, bytes).await;
+
+    // The global index resolves the opaque id back to this db.
+    assert_eq!(
+        rtdb_server::storage::resolve_db(&pool, &id).await?,
+        Some(name.clone()),
+        "storage_index row should point at the owning db"
+    );
+
+    // List shows the file with size + contentType populated.
+    let body: serde_json::Value = admin_get(addr, &format!("/admin/db/{name}/storage"))
+        .await
+        .json()
+        .await?;
+    let files = body["files"].as_array().expect("files array");
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0]["id"].as_str(), Some(id.as_str()));
+    assert_eq!(files[0]["size"], serde_json::json!(bytes.len() as i64));
+    assert_eq!(files[0]["contentType"], serde_json::json!("text/plain"));
+    assert_eq!(
+        files[0]["sha256"],
+        serde_json::json!(rtdb_server::storage::sha256_hex_bytes(bytes))
+    );
+
+    // Delete via the admin route, then the list is empty and the index row is gone.
+    let resp = reqwest::Client::new()
+        .delete(format!("http://{addr}/admin/db/{name}/storage/{id}"))
+        .header("Authorization", "Bearer test-admin-key")
+        .send()
+        .await?;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        resp.json::<serde_json::Value>().await?["ok"],
+        serde_json::json!(true)
+    );
+
+    let body: serde_json::Value = admin_get(addr, &format!("/admin/db/{name}/storage"))
+        .await
+        .json()
+        .await?;
+    assert!(
+        body["files"].as_array().expect("files array").is_empty(),
+        "list should be empty after delete"
+    );
+    assert_eq!(
+        rtdb_server::storage::resolve_db(&pool, &id).await?,
+        None,
+        "storage_index row should be removed on delete"
+    );
+
+    Ok(())
+}
+
+// Admin storage endpoints require the admin key — a non-admin bearer is
+// rejected on all three (list, upload, delete). Mirrors the per-db schedule
+// rejection test above.
+#[tokio::test]
+async fn admin_storage_endpoints_reject_non_admin_bearer() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let name = fresh_db(&state).await;
+
+    // First upload a real file through the admin route so the delete target exists.
+    let id = admin_upload(addr, &name, b"x").await;
+
+    let client = reqwest::Client::new();
+
+    // List with a non-admin bearer → 401.
+    let resp = client
+        .get(format!("http://{addr}/admin/db/{name}/storage"))
+        .header("Authorization", "Bearer not-the-admin-key")
+        .send()
+        .await?;
+    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    // Upload with a non-admin bearer → 401.
+    let resp = client
+        .post(format!("http://{addr}/admin/db/{name}/storage"))
+        .header("Authorization", "Bearer not-the-admin-key")
+        .body(b"y".to_vec())
+        .send()
+        .await?;
+    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    // Delete with a non-admin bearer → 401.
+    let resp = client
+        .delete(format!("http://{addr}/admin/db/{name}/storage/{id}"))
+        .header("Authorization", "Bearer not-the-admin-key")
+        .send()
+        .await?;
+    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    Ok(())
+}
+
+// Admin storage list 404s on an unknown database (mirrors /admin/db/{db}/query
+// and /admin/db/{db}/schedules).
+#[tokio::test]
+async fn admin_storage_list_unknown_db_is_404() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let bogus = fresh_name();
+
+    let resp = admin_get(addr, &format!("/admin/db/{bogus}/storage")).await;
     assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
 
     Ok(())

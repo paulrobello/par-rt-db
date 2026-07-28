@@ -13,6 +13,7 @@ import { MetricsPage } from "./pages/MetricsPage";
 import { OpsPage } from "./pages/OpsPage";
 import { QueryConsolePage } from "./pages/QueryConsolePage";
 import { ScheduledJobsPage } from "./pages/ScheduledJobsPage";
+import { StoragePage } from "./pages/StoragePage";
 import { NotFound } from "./routes";
 import { AppShell } from "./shell/AppShell";
 
@@ -45,6 +46,7 @@ function Root() {
             <Route path="metrics" element={<MetricsPage />} />
             <Route path="ops" element={<OpsPage />} />
             <Route path="scheduled" element={<ScheduledJobsPage />} />
+            <Route path="storage" element={<StoragePage />} />
             <Route path="console" element={<QueryConsolePage />} />
             <Route path="config" element={<ConfigPage />} />
             <Route path="admins" element={<AdminsPage />} />

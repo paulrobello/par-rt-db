@@ -125,6 +125,33 @@ pub async fn get_meta(pool: &PgPool, db: &str, id: &str) -> Result<Option<FileMe
     )
 }
 
+/// Lists every file's metadata in a database, newest-first. Capped at 1000 so a
+/// huge store can't OOM the admin surface (operator listing, not a data path).
+/// Same column set as `get_meta`; identifiers are the validated schema + the
+/// fixed `storage` table name, so double-quoting via `format!` is safe.
+pub async fn list(pool: &PgPool, db: &str) -> Result<Vec<FileMeta>, RtDbError> {
+    validate_db_name(db)?;
+    let schema = pg_schema(db);
+    let rows: Vec<(String, String, i64, Option<String>, i64)> = sqlx::query_as(&format!(
+        "SELECT id, sha256, size, content_type, created_at
+         FROM \"{schema}\".storage
+         ORDER BY created_at DESC
+         LIMIT 1000"
+    ))
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, sha256, size, content_type, creation_time)| FileMeta {
+            id,
+            sha256,
+            size,
+            content_type,
+            creation_time,
+        })
+        .collect())
+}
+
 /// Deletes a blob and its index row. Returns true if a blob row was removed.
 pub async fn delete(pool: &PgPool, db: &str, id: &str) -> Result<bool, RtDbError> {
     validate_db_name(db)?;

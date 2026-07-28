@@ -72,6 +72,17 @@ export interface TokenRow {
   revoked: boolean;
 }
 
+// File storage — mirrors server/src/storage.rs `FileMeta`. Field names are
+// camelCase on the wire (serde `rename_all = "camelCase"`). `contentType` is
+// omitted by the server when the upload supplied no Content-Type header.
+export interface FileMeta {
+  id: string;
+  sha256: string;
+  size: number;
+  contentType?: string;
+  creationTime: number;
+}
+
 export interface RtDbErrorEnvelope {
   code: string;
   message: string;

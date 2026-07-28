@@ -38,7 +38,7 @@ explicitly-deferred sub-items. Effort is rough: `small` ≤1 day, `medium` 1–3
 ## Dashboard
 
 - [x] **Scheduled jobs page** — schedules and cron have a full WS/HTTP surface but no UI; add a page to list, create, pause/resume, and cancel scheduled transactions with their next-fire time and last error. (effort: medium)
-- [ ] **Storage / file browser** — file storage has upload/serve/delete/metadata APIs but no dashboard surface; add a per-db file list with size/type, public-URL copy, upload, and delete. (effort: medium)
+- [x] **Storage / file browser** — file storage has upload/serve/delete/metadata APIs but no dashboard surface; add a per-db file list with size/type, public-URL copy, upload, and delete. (effort: medium)
 - [x] **Query console** — an in-browser scratchpad to compose and run an ad-hoc query or mutation DSL against a chosen database and inspect the raw result, useful for debugging and schema exploration. (effort: medium)
 - [ ] **Schema diff / preview on push** — since schema pushes are additive-only, show the operator exactly which columns and indexes a pending push will add (and flag anything rejected) before it is applied. (effort: medium)
 - [ ] **Latency percentiles in metrics** — the `/metrics` page tracks gauges, throughput, and (newly) trend sparklines; add p50/p95/p99 latency histograms for query/mutate/subscribe so the dashboard tells a complete performance story. (effort: medium)
