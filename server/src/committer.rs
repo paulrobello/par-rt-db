@@ -62,6 +62,7 @@ pub struct Committers {
     op_feed: Arc<crate::op_feed::OpFeed>,
     hot: Arc<ArcSwap<HotConfig>>,
     audit_log_enabled: bool,
+    webhooks_enabled: bool,
     channels: Mutex<HashMap<String, mpsc::Sender<CommitterRequest>>>,
 }
 
@@ -73,6 +74,7 @@ impl Committers {
         op_feed: Arc<crate::op_feed::OpFeed>,
         hot: Arc<ArcSwap<HotConfig>>,
         audit_log_enabled: bool,
+        webhooks_enabled: bool,
     ) -> Self {
         Self {
             pool,
@@ -81,6 +83,7 @@ impl Committers {
             op_feed,
             hot,
             audit_log_enabled,
+            webhooks_enabled,
             channels: Mutex::new(HashMap::new()),
         }
     }
@@ -162,6 +165,7 @@ impl Committers {
             self.op_feed.clone(),
             self.hot.clone(),
             self.audit_log_enabled,
+            self.webhooks_enabled,
             rx,
         ));
         tokio::spawn(scheduler::run_scheduler(
@@ -256,6 +260,7 @@ struct CommitterCtx {
     op_feed: Arc<crate::op_feed::OpFeed>,
     hot: Arc<ArcSwap<HotConfig>>,
     audit_log_enabled: bool,
+    webhooks_enabled: bool,
 }
 
 /// The per-db committer task loop: processes exactly one `CommitterRequest`
@@ -278,6 +283,7 @@ async fn run_committer(
     op_feed: Arc<crate::op_feed::OpFeed>,
     hot: Arc<ArcSwap<HotConfig>>,
     audit_log_enabled: bool,
+    webhooks_enabled: bool,
     mut rx: mpsc::Receiver<CommitterRequest>,
 ) {
     if let Err(err) = mutation_log::ensure_table(&pool, &db).await {
@@ -294,6 +300,7 @@ async fn run_committer(
         op_feed,
         hot,
         audit_log_enabled,
+        webhooks_enabled,
     };
     while let Some(req) = rx.recv().await {
         match req {
@@ -374,6 +381,22 @@ async fn handle_mutate(
     {
         tracing::warn!(db = %ctx.db, error = %err, "audit log write failed");
     }
+    // Webhook enqueue tap — mirrors the audit tap above: best-effort, warned on
+    // failure, never surfaces to the client. The mutation has already committed
+    // and fanned out by this point. `source = "mutate"` distinguishes the
+    // interactive tap from the scheduled one below in delivered payloads.
+    if ctx.webhooks_enabled
+        && let Err(err) = crate::webhook::enqueue_for_ops(
+            &ctx.pool,
+            &ctx.db,
+            owner.as_deref(),
+            "mutate",
+            &outcome.write_set.ops,
+        )
+        .await
+    {
+        tracing::warn!(db = %ctx.db, error = %err, "webhook enqueue failed");
+    }
 
     if let Some(key) = &idempotency_key {
         // The dedup TTL is read live from hot config so a `PATCH /admin/config`
@@ -440,6 +463,21 @@ async fn handle_scheduled(
                 .await
             {
                 tracing::warn!(db = %ctx.db, error = %err, "audit log write failed");
+            }
+            // Webhook enqueue tap — scheduled jobs carry no interactive
+            // principal (the audit tap above also passes `None`), so the
+            // payload's `owner` is null and `source = "scheduled"`.
+            if ctx.webhooks_enabled
+                && let Err(err) = crate::webhook::enqueue_for_ops(
+                    &ctx.pool,
+                    &ctx.db,
+                    None,
+                    "scheduled",
+                    &outcome.write_set.ops,
+                )
+                .await
+            {
+                tracing::warn!(db = %ctx.db, error = %err, "webhook enqueue failed");
             }
             let finalize = match kind.as_str() {
                 "oneshot" => scheduler::finalize_one_shot_done(&ctx.pool, &ctx.db, &id).await,

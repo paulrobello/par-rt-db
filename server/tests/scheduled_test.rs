@@ -319,6 +319,7 @@ async fn one_shot_fires_and_writes() {
         OpFeed::new(64, 32),
         Arc::new(ArcSwap::from_pointee(common::test_hot())),
         false,
+        false,
     );
 
     // Schedule a one-shot due in the past so it fires on the scheduler's first
@@ -364,6 +365,7 @@ async fn cron_fires_and_stays_pending() {
         SchemaCache::new(),
         OpFeed::new(64, 32),
         Arc::new(ArcSwap::from_pointee(common::test_hot())),
+        false,
         false,
     );
 
@@ -415,6 +417,7 @@ async fn failing_cron_reschedules_anyway() {
         SchemaCache::new(),
         OpFeed::new(64, 32),
         Arc::new(ArcSwap::from_pointee(common::test_hot())),
+        false,
         false,
     );
 
@@ -486,6 +489,7 @@ async fn one_shot_catches_up_after_being_past_due() {
         OpFeed::new(64, 32),
         Arc::new(ArcSwap::from_pointee(common::test_hot())),
         false,
+        false,
     );
 
     // Warm the committer+scheduler up FIRST so the per-db scheduler loop is
@@ -527,6 +531,7 @@ async fn cron_skips_missed_windows() {
         SchemaCache::new(),
         OpFeed::new(64, 32),
         Arc::new(ArcSwap::from_pointee(common::test_hot())),
+        false,
         false,
     );
 
@@ -600,6 +605,7 @@ async fn failing_txn_marks_error_one_shot() {
         SchemaCache::new(),
         OpFeed::new(64, 32),
         Arc::new(ArcSwap::from_pointee(common::test_hot())),
+        false,
         false,
     );
 

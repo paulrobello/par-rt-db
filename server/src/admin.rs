@@ -767,6 +767,126 @@ async fn admin_storage_delete(
 }
 
 #[derive(Serialize)]
+struct WebhooksResponse {
+    webhooks: Vec<crate::webhook::Webhook>,
+}
+
+/// `GET /admin/db/{db}/webhooks` — list webhooks registered for `db`. When
+/// webhooks are disabled at boot the table is permitted to not exist, so this
+/// returns an empty list rather than erroring (mirrors `/admin/audit`).
+async fn admin_list_webhooks(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(db): Path<String>,
+) -> Result<Json<WebhooksResponse>, RtDbError> {
+    require_admin(&state, &headers).await?;
+    if !db::database_exists(&state.pool, &db).await? {
+        return Err(RtDbError::not_found("unknown database"));
+    }
+    if !state.config.webhooks_enabled {
+        return Ok(Json(WebhooksResponse {
+            webhooks: Vec::new(),
+        }));
+    }
+    let webhooks = crate::webhook::list_webhooks(&state.pool, &db).await?;
+    Ok(Json(WebhooksResponse { webhooks }))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AdminCreateWebhookRequest {
+    url: String,
+    #[serde(default)]
+    table: Option<String>,
+    #[serde(default)]
+    events: Option<Vec<String>>,
+}
+
+#[derive(Serialize)]
+struct AdminCreateWebhookResponse {
+    id: i64,
+}
+
+/// The closed set of event names a webhook may subscribe to: the five op kinds
+/// (matching `OpKind`'s lowercase serde form) plus `*` (all events). Used to
+/// reject typos at registration time so a misspelled event never silently fails
+/// to match.
+fn is_valid_event(name: &str) -> bool {
+    matches!(
+        name,
+        "*" | "insert" | "patch" | "replace" | "delete" | "upsert"
+    )
+}
+
+/// `POST /admin/db/{db}/webhooks` — register a webhook URL for delivery on
+/// matching document changes. `table` omitted/null = all tables; `events`
+/// omitted defaults to `["*"]` (all events). Rejected with a 400 when webhooks
+/// are disabled at boot or the events list contains an unknown name.
+async fn admin_create_webhook(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(db): Path<String>,
+    ApiJson(body): ApiJson<AdminCreateWebhookRequest>,
+) -> Result<Json<AdminCreateWebhookResponse>, RtDbError> {
+    require_admin(&state, &headers).await?;
+    if !db::database_exists(&state.pool, &db).await? {
+        return Err(RtDbError::not_found("unknown database"));
+    }
+    if !state.config.webhooks_enabled {
+        return Err(RtDbError::bad_request(
+            "webhooks are disabled on this server (set RTDB_WEBHOOKS_ENABLED=true at boot)",
+        ));
+    }
+    let url = body.url.trim();
+    if url.is_empty() {
+        return Err(RtDbError::bad_request("url is required"));
+    }
+    // An empty `table` string is treated as "all tables" (None), matching how
+    // NULL is interpreted by the enqueue matcher.
+    let table = body
+        .table
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let events = body.events.unwrap_or_else(|| vec!["*".to_string()]);
+    if events.is_empty() {
+        return Err(RtDbError::bad_request("events must not be empty"));
+    }
+    for ev in &events {
+        if !is_valid_event(ev) {
+            return Err(RtDbError::bad_request(format!(
+                "unknown event '{ev}'; expected one of insert, patch, replace, delete, upsert, or *"
+            )));
+        }
+    }
+    let webhook = crate::webhook::create_webhook(&state.pool, &db, table, url, &events).await?;
+    Ok(Json(AdminCreateWebhookResponse { id: webhook.id }))
+}
+
+/// `DELETE /admin/db/{db}/webhooks/{id}` — remove a webhook (cascading its
+/// pending deliveries via the FK). A non-numeric id is a 400; a missing id is a
+/// 404.
+async fn admin_delete_webhook(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((db, id)): Path<(String, String)>,
+) -> Result<Json<OkResponse>, RtDbError> {
+    require_admin(&state, &headers).await?;
+    if !db::database_exists(&state.pool, &db).await? {
+        return Err(RtDbError::not_found("unknown database"));
+    }
+    let id: i64 = id
+        .parse()
+        .map_err(|_| RtDbError::bad_request("webhook id must be an integer"))?;
+    if !state.config.webhooks_enabled {
+        // Table may not exist; treat as already-gone.
+        return Ok(Json(OkResponse { ok: false }));
+    }
+    let ok = crate::webhook::delete_webhook(&state.pool, id).await?;
+    Ok(Json(OkResponse { ok }))
+}
+
+#[derive(Serialize)]
 struct TokenRow {
     id: String,
     name: String,
@@ -1243,6 +1363,11 @@ pub fn admin_routes() -> Router<Arc<AppState>> {
                 .layer(DefaultBodyLimit::disable()),
         )
         .route("/admin/db/{db}/storage/{id}", delete(admin_storage_delete))
+        .route(
+            "/admin/db/{db}/webhooks",
+            get(admin_list_webhooks).post(admin_create_webhook),
+        )
+        .route("/admin/db/{db}/webhooks/{id}", delete(admin_delete_webhook))
         .route(
             "/admin/db/{db}/schedules",
             get(admin_list_schedules).post(admin_create_schedule),

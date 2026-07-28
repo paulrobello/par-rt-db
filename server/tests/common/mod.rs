@@ -25,6 +25,7 @@ pub fn test_config() -> Config {
         rate_limit_per_token_rpm: 0,
         rate_limit_per_db_rpm: 0,
         audit_log_enabled: false,
+        webhooks_enabled: false,
         backup_enabled: false,
         backup_cron: "0 3 * * *".into(),
         backup_dir: "./backups".into(),
@@ -88,6 +89,36 @@ pub async fn test_state_with_audit() -> Arc<AppState> {
         .await
         .expect("ensure rtdb.audit_log");
     AppState::new(pool, config, test_hot())
+}
+
+/// Like `test_state` but with `webhooks_enabled = true` and the
+/// `rtdb.webhooks` / `rtdb.webhook_deliveries` tables ensured. Used by
+/// `tests/webhook_test.rs` to exercise the registry end-to-end without touching
+/// env vars. Mirrors the `test_state_with_audit` override pattern.
+#[allow(dead_code)]
+pub async fn test_state_with_webhooks() -> Arc<AppState> {
+    let mut config = test_config();
+    config.webhooks_enabled = true;
+    let pool = sqlx::PgPool::connect(&config.database_url)
+        .await
+        .expect("connect to test postgres");
+    db::bootstrap(&pool).await.expect("bootstrap rtdb_auth");
+    db::ensure_webhooks_tables(&pool)
+        .await
+        .expect("ensure rtdb.webhooks tables");
+    AppState::new(pool, config, test_hot())
+}
+
+/// A DELETE helper, mirroring `admin_get`/`admin_post`. Used by webhook CRUD
+/// tests.
+#[allow(dead_code)]
+pub async fn admin_delete(addr: SocketAddr, path: &str) -> reqwest::Response {
+    reqwest::Client::new()
+        .delete(format!("http://{addr}{path}"))
+        .header("Authorization", "Bearer test-admin-key")
+        .send()
+        .await
+        .expect("send admin request")
 }
 
 #[allow(dead_code)]

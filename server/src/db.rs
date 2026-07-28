@@ -191,6 +191,69 @@ pub async fn ensure_audit_table(pool: &PgPool) -> Result<(), RtDbError> {
     Ok(())
 }
 
+/// Creates the webhook registry + delivery-outbox tables idempotently. Called
+/// at boot only when `Config::webhooks_enabled` — both tables are permitted to
+/// not exist when webhooks are off (the admin endpoints return empty lists and
+/// the committer tap is skipped). The committer's enqueue and the delivery
+/// worker both read/write here; the `(status, next_attempt)` index backs the
+/// worker's due-row scan without a full-table scan, and the `(db)` index backs
+/// the admin list-by-db lookup. `tbl` NULL means "all tables"; `events`
+/// contains op names (`insert`/`patch`/`replace`/`delete`/`upsert`) or the
+/// single element `*` to match every event.
+pub async fn ensure_webhooks_tables(pool: &PgPool) -> Result<(), RtDbError> {
+    let mut tx = pool.begin().await?;
+
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(BOOTSTRAP_LOCK_KEY)
+        .execute(&mut *tx)
+        .await?;
+
+    sqlx::query("CREATE SCHEMA IF NOT EXISTS rtdb")
+        .execute(&mut *tx)
+        .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS rtdb.webhooks (
+            id         BIGSERIAL PRIMARY KEY,
+            db         TEXT NOT NULL,
+            tbl        TEXT,
+            url        TEXT NOT NULL,
+            events     TEXT[] NOT NULL,
+            created_at BIGINT NOT NULL
+        )",
+    )
+    .execute(&mut *tx)
+    .await?;
+
+    sqlx::query("CREATE INDEX IF NOT EXISTS webhooks_db_idx ON rtdb.webhooks (db)")
+        .execute(&mut *tx)
+        .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS rtdb.webhook_deliveries (
+            id           BIGSERIAL PRIMARY KEY,
+            webhook_id   BIGINT NOT NULL REFERENCES rtdb.webhooks(id) ON DELETE CASCADE,
+            payload      JSONB NOT NULL,
+            attempts     INT NOT NULL DEFAULT 0,
+            next_attempt BIGINT NOT NULL,
+            status       TEXT NOT NULL,
+            last_error   TEXT
+        )",
+    )
+    .execute(&mut *tx)
+    .await?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS webhook_deliveries_due_idx \
+         ON rtdb.webhook_deliveries (status, next_attempt)",
+    )
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    Ok(())
+}
+
 /// Registers a new tenant database: validates `name`, creates its Postgres schema
 /// and `meta` table, and records it in the `rtdb_auth.databases` registry, all in
 /// one transaction.

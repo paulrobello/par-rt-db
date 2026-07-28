@@ -23,6 +23,7 @@ pub mod snapshot;
 pub mod storage;
 pub mod subs;
 pub mod txn;
+pub mod webhook;
 pub mod ws;
 
 use std::collections::HashMap;
@@ -94,6 +95,7 @@ impl AppState {
             op_feed.clone(),
             hot.clone(),
             config.audit_log_enabled,
+            config.webhooks_enabled,
         );
         let metrics = metrics::Metrics::new();
         Arc::new(Self {

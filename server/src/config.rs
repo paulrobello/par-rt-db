@@ -40,6 +40,13 @@ pub struct Config {
     // op-feed (`OpFeed`) is always on; this is its durable counterpart.
     // RTDB_AUDIT_LOG_ENABLED (accepts "true"/"1"/"yes", case-insensitive).
     pub audit_log_enabled: bool,
+    // Webhook delivery registry: when true, the committer enqueues one
+    // `rtdb.webhook_deliveries` row per matching webhook at both tap sites,
+    // and a background worker POSTs the payload (at-least-once) to each
+    // registered URL. Off by default — the native answer for triggering
+    // external work in this no-embedded-JS architecture.
+    // RTDB_WEBHOOKS_ENABLED (accepts "true"/"1"/"yes", case-insensitive).
+    pub webhooks_enabled: bool,
     // Managed pg_dump backup scheduler. Off by default — when true, a
     // background task runs `pg_dump` on `backup_cron` (5-field UTC cron, same
     // format `scheduler::next_fire` already handles) into `backup_dir`,
@@ -125,6 +132,12 @@ impl Config {
             Err(_) => false,
         };
 
+        // Webhook registry: default off, same truthy-spelling parse as audit.
+        let webhooks_enabled = match std::env::var("RTDB_WEBHOOKS_ENABLED") {
+            Ok(v) => matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes"),
+            Err(_) => false,
+        };
+
         // Managed pg_dump backup scheduler. Default off; cron/dir/retention
         // carry their own defaults so an operator can flip just
         // RTDB_BACKUP_ENABLED=true to get daily 03:00 UTC dumps with 7-day
@@ -165,6 +178,7 @@ impl Config {
             rate_limit_per_token_rpm,
             rate_limit_per_db_rpm,
             audit_log_enabled,
+            webhooks_enabled,
             backup_enabled,
             backup_cron,
             backup_dir,

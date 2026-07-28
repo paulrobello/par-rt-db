@@ -45,6 +45,19 @@ async fn main() {
         });
     }
 
+    // Webhook registry + delivery outbox: only ensured when the feature is
+    // enabled at boot. When on, also spawn the single delivery worker that
+    // drains the outbox. The worker is best-effort (never panics on transient
+    // errors) and runs until the process exits.
+    if config.webhooks_enabled {
+        db::ensure_webhooks_tables(&pool)
+            .await
+            .unwrap_or_else(|err| {
+                tracing::warn!(error = %err, "failed to ensure rtdb.webhooks tables");
+            });
+        tokio::spawn(rtdb_server::webhook::run_delivery_worker(pool.clone()));
+    }
+
     // Managed pg_dump backup task: off by default. When on, a single
     // background task runs `pg_dump` on the configured cron into `backup_dir`,
     // retaining the newest `backup_retention` dumps. The task sleeps in bounded
