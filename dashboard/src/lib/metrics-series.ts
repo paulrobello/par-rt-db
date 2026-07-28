@@ -31,7 +31,7 @@ export function rateSeries(samples: Sample[], counter: (s: MetricsSnapshot) => n
     const prev = counter(samples[i - 1].snap);
     const curr = counter(samples[i].snap);
     if (curr < prev) continue; // counter reset — leave null, resume next step
-    const clamped = Math.min(Math.max(dt, DT_MIN), DT_MAX);
+    const clamped = Math.max(dt, DT_MIN);
     out[i] = (curr - prev) / clamped;
   }
   return out;
