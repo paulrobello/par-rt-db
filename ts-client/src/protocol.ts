@@ -91,6 +91,19 @@ export type QueryResultJson =
   | { type: "distinct"; value: unknown[] }
   | { type: "paginated"; value: PaginatedResultJson };
 
+/**
+ * Mirrors server `http_api::BatchQueryOutcome`. `result` is the raw untagged
+ * `QueryResult` value (the server serializes `QueryResult` with
+ * `#[serde(untagged)]`, so the on-wire form is the bare value — `null`, a doc,
+ * an array of docs, a count number, a `{docs,nextCursor}`, etc. — matching how
+ * `RtDbHttpClient.query<R>` types its return as a caller-chosen `R`). A batch
+ * spans terminals, so the caller narrows each slot. `error` reuses the standard
+ * `{code, message}` envelope.
+ */
+export type BatchQueryOutcomeJson =
+  | { ok: true; result: unknown }
+  | { ok: false; error: { code: string; message: string } };
+
 /** Mirrors server `txn::Step` (tag `op`, every step carries `table`). */
 export type StepJson =
   | { op: "insert"; table: string; doc: Record<string, unknown> }

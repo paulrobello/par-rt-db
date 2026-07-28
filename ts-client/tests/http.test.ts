@@ -32,6 +32,36 @@ describe("RtDbHttpClient", () => {
     expect(JSON.parse(init.body)).toEqual({ db: "kanban", query: { table: "items" } });
   });
 
+  it("posts a query-batch with db + bearer + queries and returns aligned outcomes", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      jsonResponse({
+        results: [
+          { ok: true, result: [{ _id: "a" }] },
+          { ok: false, error: { code: "NOT_FOUND", message: "no such table" } },
+        ],
+      }),
+    );
+    const client = new RtDbHttpClient({
+      url: "http://h:8300",
+      db: "kanban",
+      token: "tok",
+      fetch: fetchMock,
+    });
+    const queries = [{ table: "items" }, { table: "noSuch" }];
+
+    const results = await client.batchQuery(queries);
+
+    expect(results).toEqual([
+      { ok: true, result: [{ _id: "a" }] },
+      { ok: false, error: { code: "NOT_FOUND", message: "no such table" } },
+    ]);
+    const [calledUrl, init] = fetchMock.mock.calls[0];
+    expect(calledUrl).toBe("http://h:8300/api/query-batch");
+    expect(init.method).toBe("POST");
+    expect(init.headers.Authorization).toBe("Bearer tok");
+    expect(JSON.parse(init.body)).toEqual({ db: "kanban", queries });
+  });
+
   it("posts a mutation and returns the results array", async () => {
     const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ results: ["new-id"] }));
     const client = new RtDbHttpClient({

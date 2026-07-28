@@ -26,7 +26,7 @@ explicitly-deferred sub-items. Effort is rough: `small` ≤1 day, `medium` 1–3
 - [ ] **Aggregations** (`sum` / `avg` / `min` / `max` / `groupBy`) — add aggregate terminals that compile to Postgres aggregate SQL over the same eq-prefix + range-bound WHERE clause every other terminal builds, the same way `count()` already exceeds Convex without an external component. (effort: medium)
 - [ ] **Hybrid search (BM25 + vector rerank)** — combine the existing `search` and `vectorSearch` terminals into one ranked-by-both query, the standard high-recall pattern; Postgres can fuse `ts_rank` and cosine `<=>` in a single statement. (effort: medium)
 - [x] **`distinct` terminal** — return unique values (or unique tuples) over an index, mirroring the index-prefix mechanics of the existing terminals; useful for autocomplete/facet UIs. (effort: small)
-- [ ] **Batch / multi-query round trip** — accept an array of queries in one HTTP or WS message and return aligned results, cutting client–server round trips for dashboards that fan out over many tables. (effort: medium)
+- [x] **Batch / multi-query round trip** — accept an array of queries in one HTTP or WS message and return aligned results, cutting client–server round trips for dashboards that fan out over many tables. (effort: medium)
 - [ ] **Fine-grained subscription invalidation: range/boundary tracking** — extend today's `get(id)` point-read skipping (FEATURE_MATRIX #21) to ordered/range/set shapes so subscriptions re-run only when a written doc actually falls in their bounds; spec already exists at `docs/superpowers/specs/2026-07-24-fine-grained-subscription-invalidation-design.md`. (effort: large)
 
 ## Clients & DX

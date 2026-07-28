@@ -1,7 +1,7 @@
 //! Wire vocabulary — the third implementation of the protocol contract
 //! (server `protocol.rs` first, TS `protocol.ts` second). Tags/fields are load-bearing.
 
-use crate::error::RtDbError;
+use crate::error::{ErrorEnvelope, RtDbError};
 use crate::mutation::Transaction;
 use crate::query::Query;
 use serde::{Deserialize, Serialize};
@@ -348,6 +348,25 @@ pub enum FilterExpr {
     Or {
         exprs: Vec<FilterExpr>,
     },
+}
+
+/// One slot of a `POST /api/query-batch` response. Mirrors server
+/// `http_api::BatchQueryOutcome` byte-for-byte (camelCase, omit-when-None). The
+/// `result` field is the raw untagged `QueryResult` value (the server serializes
+/// `QueryResult` with `#[serde(untagged)]`, so the on-wire form is the bare
+/// value — `null`, a doc, an array of docs, a count, a `{docs,nextCursor}`,
+/// etc. — matching how [`RtDbHttpClient::run`](crate::http::RtDbHttpClient::run)
+/// types its return as a caller-chosen `T`). A batch spans terminals, so the
+/// caller narrows each slot via [`serde_json::Value`] rather than a typed
+/// result. `error` reuses the standard `{code, message}` envelope.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchQueryOutcome {
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<ErrorEnvelope>,
 }
 
 /// HTTP request/response bodies for `/admin/*`. These mirror the server's

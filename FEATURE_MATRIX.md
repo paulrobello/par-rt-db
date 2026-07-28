@@ -35,7 +35,7 @@ meaningful DX/reliability improvement. Low: rarely needed at this scale.
 | End-to-end TypeScript types | ✅ via codegen | ✅ **no codegen** | Schema is TS; `Doc`/`Id` inferred (`schema.ts`) |
 | React bindings | ✅ | ✅ | `RtDbProvider`, `useQuery` (undefined-until-first-result, `"skip"`), `useMutation`, `useConnectionState`, auth gates |
 | Client resilience | ✅ | ✅ | Auto-reconnect, re-auth, resubscribe, heartbeat, stale-callback generation guard; connection state observable via `getConnectionState`/`onConnectionChange` (ts) and `status`/`status_receiver` (rust) |
-| One-shot HTTP for machines | ✅ (fetchQuery / HTTP client) | ✅ | `POST /api/query` / `/api/mutate` with machine tokens |
+| One-shot HTTP for machines | ✅ (fetchQuery / HTTP client) | ✅ | `POST /api/query` / `/api/mutate` with machine tokens; `POST /api/query-batch` fans out N queries in one round trip (per-query error isolation) |
 | User auth | ✅ Clerk/Auth0/custom JWT/Convex Auth | 🟡 GitHub + Google OAuth + sessions | Provider trait (`auth/provider.rs`) — GitHub + Google today, each extra provider is small; cross-provider same-email logins link by email; per-database email allowlist replaces per-function auth checks |
 | Live permission revocation | ✅ | ✅ | `authorize` re-runs on every Subscribe/Mutate; machine-token revocation, allowlist removal, and session expiry are all checked live per op (row 8 below) |
 | Multi-app hosting | ✅ projects/deployments | ✅ named databases | One instance, many DBs — lighter than Convex's per-deployment model |

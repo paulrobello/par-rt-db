@@ -2,7 +2,7 @@
 
 use crate::error::{ErrorEnvelope, RtDbError, retry_on_precondition};
 use crate::mutation::{Mutation, StepResult, Transaction};
-use crate::query::{TableQuery, parse_result};
+use crate::query::{Query, TableQuery, parse_result};
 use crate::wire::{AuthedUser, ScheduleInfo, ScheduleWhen};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -136,6 +136,47 @@ impl RtDbHttpClient {
             .with_index(index, &[value.into()])
             .first();
         self.run::<Option<T>>(query).await
+    }
+
+    /// Run a batch of independent queries against this client's db in one round
+    /// trip (`POST /api/query-batch`). Auth and owner resolution run once for
+    /// the whole request (same db, same principal); each query's outcome lands
+    /// in its own aligned slot. A per-query execution error becomes that slot's
+    /// `{ok:false,error}` (standard envelope) and never fails the call — only a
+    /// db-level auth failure, an empty `queries` array, or a transport error
+    /// surfaces as [`RtDbError`]. The returned vector is length-aligned with the
+    /// input order; the caller narrows each [`BatchQueryOutcome::result`] based
+    /// on the terminal it used for that query (the raw value is `serde_json::Value`
+    /// because a batch spans terminals, unlike the per-call `T` of [`run`]).
+    ///
+    /// [`run`]: Self::run
+    pub async fn batch_query(
+        &self,
+        queries: &[Query],
+    ) -> Result<Vec<crate::wire::BatchQueryOutcome>, RtDbError> {
+        #[derive(Serialize)]
+        struct Body<'a> {
+            db: &'a str,
+            queries: &'a [Query],
+        }
+        let body = Body {
+            db: &self.db,
+            queries,
+        };
+        let resp = self
+            .client
+            .post(format!("{}/api/query-batch", self.url))
+            .bearer_auth(&self.token)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| RtDbError::internal(format!("batch query request failed: {e}")))?;
+        #[derive(serde::Deserialize)]
+        struct BatchResponse {
+            results: Vec<crate::wire::BatchQueryOutcome>,
+        }
+        let parsed = self.deserialize::<BatchResponse>(resp).await?;
+        Ok(parsed.results)
     }
 
     /// Run a transaction; returns one `StepResult` per step.
@@ -958,6 +999,44 @@ mod tests {
             .await;
         let n: i64 = client.run(TableQuery::new("items").count()).await.unwrap();
         assert_eq!(n, 5);
+    }
+
+    #[tokio::test]
+    async fn batch_query_posts_queries_and_returns_aligned_outcomes() {
+        let (server, client) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/api/query-batch"))
+            .and(header("authorization", "Bearer machine-token"))
+            .and(body_partial_json(json!({
+                "db": "t<uuid>",
+                "queries": [{"table": "items"}]
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": [
+                    {"ok": true, "result": [{"_id": "a"}]},
+                    {"ok": false, "error": {"code": "NOT_FOUND", "message": "no such table"}}
+                ]
+            })))
+            .mount(&server)
+            .await;
+        let q = TableQuery::new("items").take(5);
+        let got = client.batch_query(&[q]).await.expect("batch query");
+        assert_eq!(got.len(), 2);
+        assert!(got[0].ok);
+        assert_eq!(
+            got[0]
+                .result
+                .as_ref()
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len),
+            Some(1)
+        );
+        assert!(got[0].error.is_none());
+        assert!(!got[1].ok);
+        let err = got[1].error.as_ref().expect("error envelope");
+        assert_eq!(err.code, crate::error::ErrorCode::NotFound);
+        assert_eq!(err.message, "no such table");
+        assert!(got[1].result.is_none());
     }
 
     #[tokio::test]

@@ -1,5 +1,12 @@
 import { RtDbError } from "./errors.js";
-import type { AuthedUser, ScheduleInfo, ScheduleWhen, TransactionJson } from "./protocol.js";
+import type {
+  AuthedUser,
+  BatchQueryOutcomeJson,
+  QueryJson,
+  ScheduleInfo,
+  ScheduleWhen,
+  TransactionJson,
+} from "./protocol.js";
 import type { RtQuery } from "./query.js";
 
 export interface RtDbHttpClientOptions {
@@ -43,6 +50,19 @@ export class RtDbHttpClient {
   async query<R>(query: RtQuery<R>): Promise<R> {
     const body = await this.post("/api/query", { db: this.db, query: query.json });
     return (body as { result: R }).result;
+  }
+
+  /**
+   * Fan out over many queries against this client's db in one round trip
+   * (`POST /api/query-batch`). Auth and owner resolution run once for the whole
+   * request; each query's outcome lands in its own aligned slot. A per-query
+   * execution error becomes that slot's `{ok:false,error}` (standard envelope)
+   * and never throws — only a db-level auth failure (or empty `queries`) throws
+   * `RtDbError`. The returned array is length-aligned with the input order.
+   */
+  async batchQuery(queries: QueryJson[]): Promise<BatchQueryOutcomeJson[]> {
+    const body = await this.post("/api/query-batch", { db: this.db, queries });
+    return (body as { results: BatchQueryOutcomeJson[] }).results;
   }
 
   /**

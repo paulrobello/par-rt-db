@@ -507,3 +507,130 @@ async fn authorize_user_branch_rejects_expired_session() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+// (m) POST /api/query-batch runs all queries against the same db as the same
+// principal and returns aligned per-slot outcomes. Per-query execution errors
+// land in their own slot (`ok:false` + envelope) and don't fail the batch; the
+// db-level bearer/authorize gate still returns the normal status for the whole
+// request.
+#[tokio::test]
+async fn batch_query_returns_aligned_results_and_isolates_per_query_errors() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let name = fresh_db(&state).await;
+    let (_, token) = mint_token(addr, &name).await;
+
+    // Seed one workItem + one project to read back.
+    let resp = api_post(
+        addr,
+        "/api/mutate",
+        &token,
+        json!({"db": name, "txn": {"steps": [
+            {"op": "insert", "table": "workItems", "doc": {
+                "projectId": "0".repeat(32), "title": "first", "status": "backlog",
+                "order": 1.0, "completedAt": null}},
+            {"op": "insert", "table": "projects", "doc": {
+                "name": "P1", "status": "active", "tags": [], "updatedAt": 0}}
+        ]}}),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    // Two valid queries → aligned ok slots with expected raw results.
+    let resp = api_post(
+        addr,
+        "/api/query-batch",
+        &token,
+        json!({"db": name, "queries": [
+            {"table": "workItems"},
+            {"table": "projects", "count": true}
+        ]}),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await?;
+    let results = body["results"].as_array().expect("results array");
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0]["ok"], json!(true));
+    assert_eq!(results[0]["result"].as_array().expect("docs").len(), 1);
+    assert_eq!(results[0]["result"][0]["title"], json!("first"));
+    assert_eq!(results[1]["ok"], json!(true));
+    assert_eq!(results[1]["result"], json!(1));
+    // omit-when-None: `error` is absent on an ok slot.
+    assert!(results[0].as_object().unwrap().get("error").is_none());
+
+    // Middle query references an unknown table → its slot is `ok:false` with the
+    // standard envelope, the surrounding slots are still `ok:true`, and the
+    // batch itself still returns 200.
+    let resp = api_post(
+        addr,
+        "/api/query-batch",
+        &token,
+        json!({"db": name, "queries": [
+            {"table": "workItems"},
+            {"table": "noSuchTable"},
+            {"table": "projects", "count": true}
+        ]}),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await?;
+    let results = body["results"].as_array().expect("results array");
+    assert_eq!(results.len(), 3);
+    assert_eq!(results[0]["ok"], json!(true));
+    assert_eq!(results[1]["ok"], json!(false));
+    let err = &results[1]["error"];
+    assert!(err["code"].is_string(), "error slot carries a code: {err}");
+    assert!(
+        err["message"].is_string(),
+        "error slot carries a message: {err}"
+    );
+    // omit-when-None: `result` is absent on an errored slot.
+    assert!(results[1].as_object().unwrap().get("result").is_none());
+    assert_eq!(results[2]["ok"], json!(true));
+    assert_eq!(results[2]["result"], json!(1));
+
+    Ok(())
+}
+
+// (m2) Empty `queries` is rejected with 400 before any query runs.
+#[tokio::test]
+async fn batch_query_rejects_empty_queries() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let name = fresh_db(&state).await;
+    let (_, token) = mint_token(addr, &name).await;
+
+    let resp = api_post(
+        addr,
+        "/api/query-batch",
+        &token,
+        json!({"db": name, "queries": []}),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(body["code"], "BAD_REQUEST");
+
+    Ok(())
+}
+
+// (m3) A bad bearer fails the whole batch with 401 — the db-level auth gate is
+// request-scoped (resolved once, before any query runs), not per-slot.
+#[tokio::test]
+async fn batch_query_bad_token_is_unauthorized() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let name = fresh_db(&state).await;
+
+    let resp = api_post(
+        addr,
+        "/api/query-batch",
+        "bogus-token",
+        json!({"db": name, "queries": [{"table": "workItems"}]}),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    Ok(())
+}

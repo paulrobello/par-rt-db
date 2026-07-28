@@ -89,6 +89,74 @@ async fn query_handler(
 }
 
 #[derive(Deserialize)]
+struct BatchQueryRequest {
+    db: String,
+    queries: Vec<Query>,
+}
+
+/// One slot of a `/api/query-batch` response. `ok` is always present; exactly
+/// one of `result` / `error` accompanies it. `error` reuses the `RtDbError`
+/// wire shape (`{code, message}`) verbatim — both fields are omitted from the
+/// JSON when `None`, so an `ok` slot is `{"ok":true,"result":...}` and an
+/// errored slot is `{"ok":false,"error":{"code":"...","message":"..."}}`.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BatchQueryOutcome {
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result: Option<QueryResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<RtDbError>,
+}
+
+#[derive(Serialize)]
+struct BatchQueryResponse {
+    results: Vec<BatchQueryOutcome>,
+}
+
+/// Fan out over many queries against one db in a single round trip. Auth and
+/// owner resolution run once for the whole request (same db, same principal —
+/// mirrors `query_handler`); each query's outcome lands in its own aligned slot.
+/// A per-query execution error becomes that slot's `{ok:false,error}` and never
+/// fails the batch — only the db-level bearer/authorize gate returns a non-200
+/// for the whole request.
+async fn batch_query_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    ApiJson(body): ApiJson<BatchQueryRequest>,
+) -> Result<Json<BatchQueryResponse>, RtDbError> {
+    if body.queries.is_empty() {
+        return Err(RtDbError::bad_request("queries must not be empty"));
+    }
+    let token = bearer_token(&headers)?;
+    let principal = resolve_bearer(&state.pool, token).await?;
+    authorize(&state.pool, &principal, &body.db).await?;
+
+    let schema = state.schemas.get(&state.pool, &body.db).await?;
+    let owner = owner_of(&principal);
+    let mut results = Vec::with_capacity(body.queries.len());
+    for query in &body.queries {
+        let outcome = match execute_query(&state.pool, &body.db, &schema, query, owner).await {
+            Ok(result) => {
+                state.runtime.metrics.record_query();
+                BatchQueryOutcome {
+                    ok: true,
+                    result: Some(result),
+                    error: None,
+                }
+            }
+            Err(err) => BatchQueryOutcome {
+                ok: false,
+                result: None,
+                error: Some(err),
+            },
+        };
+        results.push(outcome);
+    }
+    Ok(Json(BatchQueryResponse { results }))
+}
+
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct MutateRequest {
     db: String,
@@ -253,6 +321,7 @@ async fn list_schedules_handler(
 pub fn http_api_routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/query", post(query_handler))
+        .route("/api/query-batch", post(batch_query_handler))
         .route("/api/mutate", post(mutate_handler))
         .route("/api/schedule", post(schedule_handler))
         .route("/api/schedule/{id}/cancel", post(cancel_handler))
