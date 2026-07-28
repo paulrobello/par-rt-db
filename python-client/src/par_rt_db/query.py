@@ -33,6 +33,7 @@ from .wire import (
     AggregateGroup,
     AggregateSpec,
     FilterExpr,
+    HybridSearchQuery,
     SearchQuery,
     VectorSearchQuery,
     to_camel,
@@ -87,6 +88,7 @@ class Query(BaseModel):
     filter: FilterExpr | None = None
     search: SearchQuery | None = None
     vector_search: VectorSearchQuery | None = Field(default=None, alias="vectorSearch")
+    hybrid_search: HybridSearchQuery | None = Field(default=None, alias="hybridSearch")
     paginate: _Paginate | None = None
 
     def model_dump(self, **kw: Any) -> dict[str, Any]:  # type: ignore[override]
@@ -131,6 +133,7 @@ class TableQuery:
         self._filter: FilterExpr | None = None
         self._search: SearchQuery | None = None
         self._vector: VectorSearchQuery | None = None
+        self._hybrid: HybridSearchQuery | None = None
         self._paginate: _Paginate | None = None
 
     # --- builder methods (return self) ---
@@ -194,6 +197,31 @@ class TableQuery:
         if filter_:
             payload["filter"] = filter_
         self._vector = VectorSearchQuery.model_validate(payload)
+        return self
+
+    def hybrid_search(
+        self,
+        query: str,
+        vector: list[float],
+        *,
+        limit: int,
+        search_index: str | None = None,
+        vector_index: str | None = None,
+        k: int | None = None,
+    ) -> TableQuery:
+        """Hybrid search terminal: fuses full-text and vector ranking via
+        Reciprocal Rank Fusion. The table must declare BOTH a search index and a
+        vector index. ``search_index``/``vector_index`` optionally name the
+        indexes (auto-selected server-side when ``None``); ``k`` is the RRF
+        constant (default 60). Mutually exclusive with every other terminal."""
+        payload: dict[str, Any] = {"query": query, "vector": vector, "limit": limit}
+        if search_index is not None:
+            payload["searchIndex"] = search_index
+        if vector_index is not None:
+            payload["vectorIndex"] = vector_index
+        if k is not None:
+            payload["k"] = k
+        self._hybrid = HybridSearchQuery.model_validate(payload)
         return self
 
     # --- terminals ---
@@ -285,6 +313,8 @@ class TableQuery:
             payload["search"] = self._search
         if self._vector is not None:
             payload["vectorSearch"] = self._vector
+        if self._hybrid is not None:
+            payload["hybridSearch"] = self._hybrid
         if self._paginate is not None:
             payload["paginate"] = self._paginate
         return Query.model_validate(payload)

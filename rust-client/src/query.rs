@@ -75,6 +75,15 @@ pub struct Query {
         skip_serializing_if = "Option::is_none"
     )]
     pub vector_search: Option<crate::wire::VectorSearchQuery>,
+    /// Hybrid terminal: fuses full-text (`search`) and vector (`vectorSearch`)
+    /// ranking via Reciprocal Rank Fusion; carries its own limit. The wire key
+    /// is camelCase `hybridSearch` (explicit rename, matching `vector_search`).
+    #[serde(
+        default,
+        rename = "hybridSearch",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub hybrid_search: Option<crate::wire::HybridSearchQuery>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -177,6 +186,33 @@ impl TableQuery {
             vector,
             limit,
             filter,
+        });
+        self
+    }
+
+    /// Hybrid `hybridSearch` terminal: fuses full-text and vector ranking over
+    /// the same table via Reciprocal Rank Fusion. The table must declare BOTH a
+    /// search index and a vector index. `search_index`/`vector_index` optionally
+    /// name the indexes (auto-selected server-side when `None`); `k` is the RRF
+    /// constant (default 60). Standalone terminal — like `vector_search`, it
+    /// carries its own `limit` and does NOT compose with `take`/`collect` (the
+    /// server rejects `hybridSearch` combined with any other terminal).
+    pub fn hybrid_search(
+        mut self,
+        query: &str,
+        vector: Vec<f64>,
+        limit: u32,
+        search_index: Option<&str>,
+        vector_index: Option<&str>,
+        k: Option<u32>,
+    ) -> Self {
+        self.q.hybrid_search = Some(crate::wire::HybridSearchQuery {
+            query: query.into(),
+            vector,
+            limit,
+            search_index: search_index.map(|s| s.into()),
+            vector_index: vector_index.map(|s| s.into()),
+            k,
         });
         self
     }
@@ -499,6 +535,36 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&q).unwrap(),
             json!({"table":"docs","vectorSearch":{"index":"by_embedding","vector":[1.0,0.0,0.0],"limit":5},"take":10})
+        );
+    }
+
+    #[test]
+    fn hybrid_builder_serializes_terminal() {
+        // Required fields only — optionals omitted on the wire.
+        let q = TableQuery::new("docs")
+            .hybrid_search("hello world", vec![1.0, 0.0, 0.0], 5, None, None, None)
+            .take(10);
+        assert_eq!(
+            serde_json::to_value(&q).unwrap(),
+            json!({"table":"docs","hybridSearch":{"query":"hello world","vector":[1.0,0.0,0.0],"limit":5},"take":10})
+        );
+        // Explicit searchIndex/vectorIndex/k round-trip as camelCase keys.
+        let q_full = TableQuery::new("docs")
+            .hybrid_search(
+                "hello",
+                vec![1.0, 0.0, 0.0],
+                5,
+                Some("search_body"),
+                Some("by_embedding"),
+                Some(42),
+            )
+            .collect();
+        assert_eq!(
+            serde_json::to_value(&q_full).unwrap(),
+            json!({"table":"docs","hybridSearch":{
+                "query":"hello","vector":[1.0,0.0,0.0],"limit":5,
+                "searchIndex":"search_body","vectorIndex":"by_embedding","k":42
+            }})
         );
     }
 

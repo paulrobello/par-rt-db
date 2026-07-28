@@ -925,7 +925,8 @@ export class InMemoryRtDbClient {
         q.paginate !== undefined ||
         q.filter !== undefined ||
         q.search !== undefined ||
-        q.vectorSearch !== undefined
+        q.vectorSearch !== undefined ||
+        q.hybridSearch !== undefined
       ) {
         throw new RtDbError(
           "BAD_REQUEST",
@@ -995,6 +996,9 @@ export class InMemoryRtDbClient {
       if (q.vectorSearch !== undefined) {
         throw new RtDbError("BAD_REQUEST", "distinct cannot be combined with vector search");
       }
+      if (q.hybridSearch !== undefined) {
+        throw new RtDbError("BAD_REQUEST", "distinct cannot be combined with hybrid search");
+      }
       if (q.aggregate !== undefined) {
         throw new RtDbError("BAD_REQUEST", "distinct cannot be combined with aggregate");
       }
@@ -1018,6 +1022,9 @@ export class InMemoryRtDbClient {
       }
       if (q.vectorSearch !== undefined) {
         throw new RtDbError("BAD_REQUEST", "aggregate cannot be combined with vector search");
+      }
+      if (q.hybridSearch !== undefined) {
+        throw new RtDbError("BAD_REQUEST", "aggregate cannot be combined with hybrid search");
       }
     }
     if (q.paginate !== undefined) {
@@ -1073,7 +1080,8 @@ export class InMemoryRtDbClient {
         q.paginate !== undefined ||
         q.filter !== undefined ||
         q.search !== undefined ||
-        q.take !== undefined
+        q.take !== undefined ||
+        q.hybridSearch !== undefined
       ) {
         throw new RtDbError(
           "BAD_REQUEST",
@@ -1081,6 +1089,38 @@ export class InMemoryRtDbClient {
         );
       }
       // No in-memory vector ranking; return an empty result rather than silently
+      // misranking by falling through to the collect path.
+      return [];
+    }
+
+    // Hybrid search terminal. Cascade mirror of server `execute_query`:
+    // `hybridSearch` carries its own `limit` and does not compose with any other
+    // terminal (it IS the search+vector combination). The in-memory replica does
+    // not rank by ts_rank or vector distance, but the guard exists so the cascade
+    // agrees with the server.
+    if (q.hybridSearch !== undefined) {
+      if (
+        q.index !== undefined ||
+        eq.length > 0 ||
+        hasRange ||
+        q.order !== undefined ||
+        q.unique ||
+        q.first ||
+        q.count ||
+        q.distinct ||
+        q.aggregate !== undefined ||
+        q.paginate !== undefined ||
+        q.filter !== undefined ||
+        q.search !== undefined ||
+        q.vectorSearch !== undefined ||
+        q.take !== undefined
+      ) {
+        throw new RtDbError(
+          "BAD_REQUEST",
+          "hybridSearch cannot be combined with any other terminal",
+        );
+      }
+      // No in-memory hybrid ranking; return an empty result rather than silently
       // misranking by falling through to the collect path.
       return [];
     }
@@ -1102,7 +1142,8 @@ export class InMemoryRtDbClient {
         q.aggregate !== undefined ||
         q.paginate !== undefined ||
         q.filter !== undefined ||
-        q.vectorSearch !== undefined
+        q.vectorSearch !== undefined ||
+        q.hybridSearch !== undefined
       ) {
         throw new RtDbError(
           "BAD_REQUEST",

@@ -17,6 +17,7 @@ from par_rt_db.wire import (
     AuthedUser,
     ClientMessage,
     FilterExpr,
+    HybridSearchQuery,
     ScheduleInfo,
     ScheduleWhen,
     SearchQuery,
@@ -141,6 +142,36 @@ def test_vector_search_query_keeps_filter_when_non_empty() -> None:
     )
     out = vq.model_dump(by_alias=True, mode="json")
     assert out["filter"] == {"status": "active"}
+
+
+def test_hybrid_search_query_omits_optionals_when_absent() -> None:
+    hq = HybridSearchQuery.model_validate({"query": "hello", "vector": [0.1, 0.2], "limit": 5})
+    out = hq.model_dump(by_alias=True, mode="json")
+    assert out == {"query": "hello", "vector": [0.1, 0.2], "limit": 5}
+    # camelCase aliases never leak the snake_case Python names.
+    assert "search_index" not in out and "vector_index" not in out
+
+
+def test_hybrid_search_query_round_trips_optionals() -> None:
+    hq = HybridSearchQuery.model_validate(
+        {
+            "query": "hello",
+            "vector": [0.1],
+            "limit": 1,
+            "searchIndex": "search_body",
+            "vectorIndex": "by_embedding",
+            "k": 42,
+        }
+    )
+    out = hq.model_dump(by_alias=True, mode="json")
+    assert out == {
+        "query": "hello",
+        "vector": [0.1],
+        "limit": 1,
+        "searchIndex": "search_body",
+        "vectorIndex": "by_embedding",
+        "k": 42,
+    }
 
 
 # --- ClientMessage union (client -> server WS vocabulary) ---

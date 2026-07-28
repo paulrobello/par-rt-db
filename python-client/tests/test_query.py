@@ -186,6 +186,43 @@ def test_query_vector_search_filter_is_eq_map():
     assert "filter" not in v_empty.build().model_dump(by_alias=True, mode="json")["vectorSearch"]
 
 
+def test_query_hybrid_search_required_only():
+    h = TableQuery("t").hybrid_search("hello", [1.0, 0.0, 0.0], limit=5)
+    assert h.build().model_dump(by_alias=True, mode="json")["hybridSearch"] == {
+        "query": "hello",
+        "vector": [1.0, 0.0, 0.0],
+        "limit": 5,
+    }
+
+
+def test_query_hybrid_search_optional_fields_round_trip():
+    h = TableQuery("t").hybrid_search(
+        "hello",
+        [1.0, 0.0, 0.0],
+        limit=5,
+        search_index="search_body",
+        vector_index="by_embedding",
+        k=42,
+    )
+    out = h.build().model_dump(by_alias=True, mode="json")["hybridSearch"]
+    assert out == {
+        "query": "hello",
+        "vector": [1.0, 0.0, 0.0],
+        "limit": 5,
+        "searchIndex": "search_body",
+        "vectorIndex": "by_embedding",
+        "k": 42,
+    }
+
+
+def test_query_hybrid_search_omits_optional_when_absent():
+    h = TableQuery("t").hybrid_search("hello", [1.0], limit=3)
+    out = h.build().model_dump(by_alias=True, mode="json")["hybridSearch"]
+    assert "searchIndex" not in out
+    assert "vectorIndex" not in out
+    assert "k" not in out
+
+
 def test_query_drops_none_fields():
     # The server's query is all-optional; absent fields must be omitted, not null.
     wire = TableQuery("t").build().model_dump(by_alias=True, mode="json")

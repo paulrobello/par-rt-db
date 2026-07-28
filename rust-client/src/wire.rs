@@ -303,6 +303,27 @@ pub struct VectorSearchQuery {
     pub filter: BTreeMap<String, serde_json::Value>,
 }
 
+/// A hybrid search terminal that fuses full-text (`search`) and vector
+/// (`vectorSearch`) ranking via Reciprocal Rank Fusion (RRF). Mirrors
+/// `server/src/query.rs::HybridSearchQuery` byte-for-byte (camelCase,
+/// deny_unknown_fields). `search_index`/`vector_index` optionally name the
+/// indexes (auto-selected server-side when omitted); `k` is the RRF constant
+/// (default 60, omitted on the wire when `None`). The vector is f64 for
+/// wire-precision parity with the other clients (ARC-008(a)).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HybridSearchQuery {
+    pub query: String,
+    pub vector: Vec<f64>,
+    pub limit: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_index: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vector_index: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub k: Option<u32>,
+}
+
 /// Aggregate operator for the `aggregate` terminal. Mirrors
 /// `server/src/query.rs::AggregateOp` byte-for-byte (lowercase variants).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -780,6 +801,62 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&with_filter).unwrap(),
             json!({"index":"by_embedding","vector":[1.0],"limit":3,"filter":{"userId":"u1"}})
+        );
+    }
+
+    #[test]
+    fn hybrid_search_query_wire_shape() {
+        // Required fields only — optional searchIndex/vectorIndex/k are omitted.
+        let q = HybridSearchQuery {
+            query: "hello world".into(),
+            vector: vec![1.0, 0.0, 0.0],
+            limit: 5,
+            search_index: None,
+            vector_index: None,
+            k: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&q).unwrap(),
+            json!({"query":"hello world","vector":[1.0,0.0,0.0],"limit":5})
+        );
+        // Round-trips; absent optionals deserialize to None.
+        let back: HybridSearchQuery = serde_json::from_value(json!({
+            "query": "hello world",
+            "vector": [1.0, 0.0, 0.0],
+            "limit": 5
+        }))
+        .unwrap();
+        assert_eq!(back.query, "hello world");
+        assert_eq!(back.limit, 5);
+        assert!(back.search_index.is_none());
+        assert!(back.vector_index.is_none());
+        assert!(back.k.is_none());
+        // deny_unknown_fields: extra key rejected.
+        assert!(
+            serde_json::from_value::<HybridSearchQuery>(json!({
+                "query": "x", "vector": [1.0], "limit": 1, "bogus": true
+            }))
+            .is_err()
+        );
+        // Explicit optionals round-trip through the wire (camelCase keys).
+        let full = HybridSearchQuery {
+            query: "x".into(),
+            vector: vec![1.0],
+            limit: 1,
+            search_index: Some("search_body".into()),
+            vector_index: Some("by_embedding".into()),
+            k: Some(42),
+        };
+        assert_eq!(
+            serde_json::to_value(&full).unwrap(),
+            json!({
+                "query": "x",
+                "vector": [1.0],
+                "limit": 1,
+                "searchIndex": "search_body",
+                "vectorIndex": "by_embedding",
+                "k": 42
+            })
         );
     }
 

@@ -67,6 +67,12 @@ pub struct Query {
         skip_serializing_if = "Option::is_none"
     )]
     pub vector_search: Option<VectorSearchQuery>, // vector-similarity terminal: ranks by cosine distance over a vector index; carries its own limit
+    #[serde(
+        default,
+        rename = "hybridSearch",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub hybrid_search: Option<HybridSearchQuery>, // hybrid terminal: fuses full-text (ts_rank) and vector (cosine) ranking via Reciprocal Rank Fusion; carries its own limit
 }
 
 /// Serde skip predicate for `bool` fields whose default is `false`. Keeps the
@@ -107,6 +113,30 @@ pub struct VectorSearchQuery {
     pub limit: u32,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub filter: BTreeMap<String, serde_json::Value>,
+}
+
+/// A hybrid search terminal that fuses full-text (`search`) and vector
+/// (`vectorSearch`) ranking over the SAME table into one result list via
+/// Reciprocal Rank Fusion (RRF). The table must declare BOTH a search index
+/// (tsvector) and a vector index; if either is missing → `BadRequest`. `query`
+/// is the text (matched via `plainto_tsquery`, like `search`); `vector` is the
+/// query embedding (length must equal the chosen vector index's dimensions).
+/// `search_index`/`vector_index` optionally name the indexes to use; when
+/// `None`, the table's first search index / first vector index is auto-selected.
+/// `limit` is the result count (capped by `MAX_TAKE`); `k` is the RRF constant
+/// (default 60).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HybridSearchQuery {
+    pub query: String,
+    pub vector: Vec<f32>,
+    pub limit: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_index: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vector_index: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub k: Option<u32>,
 }
 
 /// Aggregate operator for the `aggregate` terminal. Mirrors the SQL aggregate
@@ -263,6 +293,7 @@ enum Peer {
     Filter,
     Search,
     VectorSearch,
+    HybridSearch,
 }
 
 impl Peer {
@@ -286,6 +317,7 @@ impl Peer {
             Self::Filter => q.filter.is_some(),
             Self::Search => q.search.is_some(),
             Self::VectorSearch => q.vector_search.is_some(),
+            Self::HybridSearch => q.hybrid_search.is_some(),
         }
     }
 }
@@ -345,6 +377,7 @@ const GET_PEERS: &[Peer] = &[
     Peer::Filter,
     Peer::Search,
     Peer::VectorSearch,
+    Peer::HybridSearch,
 ];
 const GET_MESSAGE: &str = "get cannot be combined with index, eq, range bounds, order, take, unique, first, count, distinct, aggregate, paginate, filter, search, or vector search";
 
@@ -438,6 +471,10 @@ const DISTINCT_INCOMPATIBLES: &[Incompatible] = &[
         peer: Peer::VectorSearch,
         message: "distinct cannot be combined with vector search",
     },
+    Incompatible {
+        peer: Peer::HybridSearch,
+        message: "distinct cannot be combined with hybrid search",
+    },
 ];
 
 /// `aggregate` is a standalone terminal like `distinct`/`count`: it rejects
@@ -486,6 +523,10 @@ const AGGREGATE_INCOMPATIBLES: &[Incompatible] = &[
     Incompatible {
         peer: Peer::VectorSearch,
         message: "aggregate cannot be combined with vector search",
+    },
+    Incompatible {
+        peer: Peer::HybridSearch,
+        message: "aggregate cannot be combined with hybrid search",
     },
 ];
 
@@ -537,6 +578,7 @@ const VECTOR_SEARCH_PEERS: &[Peer] = &[
     Peer::Filter,
     Peer::Search,
     Peer::Take,
+    Peer::HybridSearch,
 ];
 const VECTOR_SEARCH_MESSAGE: &str = "vectorSearch cannot be combined with any other terminal";
 
@@ -556,8 +598,30 @@ const SEARCH_PEERS: &[Peer] = &[
     Peer::Paginate,
     Peer::Filter,
     Peer::VectorSearch,
+    Peer::HybridSearch,
 ];
 const SEARCH_MESSAGE: &str = "search cannot be combined with index, eq, range bounds, order, unique, first, count, distinct, aggregate, paginate, filter, or vector search";
+
+const HYBRID_SEARCH_PEERS: &[Peer] = &[
+    Peer::Index,
+    Peer::Eq,
+    Peer::Gt,
+    Peer::Gte,
+    Peer::Lt,
+    Peer::Lte,
+    Peer::Order,
+    Peer::Take,
+    Peer::Unique,
+    Peer::First,
+    Peer::Count,
+    Peer::Distinct,
+    Peer::Aggregate,
+    Peer::Paginate,
+    Peer::Filter,
+    Peer::Search,
+    Peer::VectorSearch,
+];
+const HYBRID_SEARCH_MESSAGE: &str = "hybridSearch cannot be combined with any other terminal";
 
 /// Result docs = stored doc merged with {"_id", "_creationTime", "_version"}.
 /// get: point SELECT, null if missing. unique: error PreconditionFailed "unique query matched
@@ -657,6 +721,15 @@ pub async fn execute_query(
     if let Some(vs) = &q.vector_search {
         reject_if_any_set(q, VECTOR_SEARCH_PEERS, VECTOR_SEARCH_MESSAGE)?;
         return execute_vector_search(pool, db, table_def, &q.table, vs, owner_field, owner).await;
+    }
+
+    // Hybrid search terminal. Incompatible with every other terminal (including
+    // `search` and `vectorSearch` — hybrid IS their combination); it carries its
+    // own `limit` and fuses ts_rank + cosine distance via RRF. Resolution, bind
+    // construction, and the fused SQL live in `execute_hybrid_search`.
+    if let Some(hs) = &q.hybrid_search {
+        reject_if_any_set(q, HYBRID_SEARCH_PEERS, HYBRID_SEARCH_MESSAGE)?;
+        return execute_hybrid_search(pool, db, table_def, &q.table, hs, owner_field, owner).await;
     }
 
     // Full-text search terminal. It ranks over a search index's tsvector and is
@@ -1661,6 +1734,184 @@ async fn execute_vector_search(
     let rows = query
         .bind(qvec_text)
         .bind(i64::from(vs.limit))
+        .fetch_all(pool)
+        .await?;
+    let docs = rows
+        .into_iter()
+        .map(|(id, doc, created_at, version)| merge_doc(id, doc, created_at, version))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(QueryResult::Docs(docs))
+}
+
+/// Hybrid search terminal: fuses full-text (`ts_rank`) and vector (cosine
+/// `<=>`) ranking over the same table via Reciprocal Rank Fusion (RRF). The
+/// table must declare BOTH a search index (tsvector) AND a vector index; if
+/// either is missing → `BadRequest`. The candidate set is the UNION of rows
+/// matching `plainto_tsquery($text)` and rows with a non-null vector; both
+/// rankings are computed in a single statement with window functions and fused
+/// as `1/(k + r_text) + 1/(k + r_vec)` (default `k = 60`). Bind order: the text
+/// query (`$1`, referenced in WHERE/ts_rank), the owner id (`$2`) when
+/// owner-enforced, the query vector (`$n::vector`), the RRF constant `k`, then
+/// `limit`. Column names come from `pg_search_col`/`pg_vector_col` over the
+/// resolved indexes (auto-selected when not named); all identifiers are
+/// schema-validated and double-quoted; every value is `$n`-bound.
+#[allow(clippy::too_many_arguments)]
+async fn execute_hybrid_search(
+    pool: &PgPool,
+    db: &str,
+    table_def: &TableDef,
+    table_name: &str,
+    hs: &HybridSearchQuery,
+    owner_field: Option<&str>,
+    owner: Option<&str>,
+) -> Result<QueryResult, RtDbError> {
+    if hs.query.trim().is_empty() {
+        return Err(RtDbError::bad_request(
+            "hybrid search query text must not be empty",
+        ));
+    }
+
+    // Resolve the search index (named or first search index on the table).
+    let search_index = match &hs.search_index {
+        Some(name) => table_def
+            .indexes
+            .iter()
+            .find(|index| index.name == name.as_str() && index.search)
+            .ok_or_else(|| RtDbError::bad_request(format!("search index '{}' not found", name)))?,
+        None => table_def
+            .indexes
+            .iter()
+            .find(|index| index.search)
+            .ok_or_else(|| {
+                RtDbError::bad_request(
+                    "hybrid search requires both a search index and a vector index on the table",
+                )
+            })?,
+    };
+    // Resolve the vector index (named or first vector index on the table).
+    let vector_index = match &hs.vector_index {
+        Some(name) => table_def
+            .indexes
+            .iter()
+            .find(|index| index.name == name.as_str() && index.vector.is_some())
+            .ok_or_else(|| RtDbError::bad_request(format!("vector index '{}' not found", name)))?,
+        None => table_def
+            .indexes
+            .iter()
+            .find(|index| index.vector.is_some())
+            .ok_or_else(|| {
+                RtDbError::bad_request(
+                    "hybrid search requires both a search index and a vector index on the table",
+                )
+            })?,
+    };
+    let vec_spec = vector_index
+        .vector
+        .as_ref()
+        .ok_or_else(|| RtDbError::internal("matched vector index has no vector spec"))?;
+
+    // Validate the query vector against the index dimensions and finiteness
+    // (mirrors `execute_vector_search` so pgvector never sees a bad vector).
+    if hs.vector.len() != vec_spec.dimensions as usize {
+        return Err(RtDbError::bad_request(format!(
+            "hybridSearch vector length {} != vector index '{}' dimensions {}",
+            hs.vector.len(),
+            vector_index.name,
+            vec_spec.dimensions
+        )));
+    }
+    if !hs.vector.iter().all(|v| v.is_finite()) {
+        return Err(RtDbError::bad_request(
+            "hybridSearch query vector must contain only finite numbers",
+        ));
+    }
+    if hs.limit > MAX_TAKE {
+        return Err(RtDbError::bad_request(format!(
+            "hybridSearch limit exceeds maximum of {MAX_TAKE}"
+        )));
+    }
+
+    let sv_col = pg_search_col(&search_index.name);
+    let v_col = pg_vector_col(&vector_index.name);
+    let pg_schema_name = pg_schema(db);
+    let table_ident = pg_table(table_name);
+    // RRF constant (default 60). `k + r` never divides by zero because
+    // ROW_NUMBER starts at 1; k=0 is therefore safe but unusual.
+    let k = i64::from(hs.k.unwrap_or(60));
+
+    // pgvector accepts the text form `[a,b,c]` for a `::vector`-cast bind.
+    let qvec_text = format!(
+        "[{}]",
+        hs.vector
+            .iter()
+            .map(|f| f.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+
+    // Bind numbering: text query ($1, referenced in WHERE and ts_rank), owner id
+    // ($2) when owner-enforced, then the query vector (cast to `vector`), the
+    // RRF constant `k`, and `limit`. The owner predicate interpolates only the
+    // schema-validated `ownerField` into a jsonb string-literal position; the
+    // user id is `$n`-bound.
+    let owner_enforce: Option<(&str, &str)> = match (owner_field, owner) {
+        (Some(f), Some(u)) => Some((f, u)),
+        _ => None,
+    };
+    let text_ph = 1usize;
+    let mut bind_idx = 2usize;
+    let owner_ph: Option<usize> = if owner_enforce.is_some() {
+        let ph = bind_idx;
+        bind_idx += 1;
+        Some(ph)
+    } else {
+        None
+    };
+    let qvec_ph = bind_idx;
+    bind_idx += 1;
+    let k_ph = bind_idx;
+    bind_idx += 1;
+    let limit_ph = bind_idx;
+
+    let owner_clause = match (owner_ph, owner_enforce) {
+        (Some(ph), Some((field, _))) => {
+            format!(" AND (doc->>'{field}') = ${ph}")
+        }
+        _ => String::new(),
+    };
+
+    // RRF over the union of text matches and vector-bearing rows. Rows that
+    // don't match the text get ts_rank = 0 (ranked last on the text axis); rows
+    // with a null vector get dist NULL (ranked last on the vector axis via NULLS
+    // LAST). The final ORDER BY tie-breakers (created_at, id) keep output
+    // deterministic when RRF scores collide.
+    let sql = format!(
+        "WITH matched AS ( \
+           SELECT \"id\", \"doc\", \"created_at\", \"version\", \
+                  ts_rank(\"{sv_col}\", plainto_tsquery(${text_ph})) AS trank, \
+                  (\"{v_col}\" <=> ${qvec_ph}::vector) AS dist \
+           FROM \"{pg_schema_name}\".\"{table_ident}\" \
+           WHERE (\"{sv_col}\" @@ plainto_tsquery(${text_ph}) OR \"{v_col}\" IS NOT NULL){owner_clause} \
+         ), ranked AS ( \
+           SELECT \"id\", \"doc\", \"created_at\", \"version\", \
+                  ROW_NUMBER() OVER (ORDER BY trank DESC, \"created_at\" DESC, \"id\" DESC) AS r_text, \
+                  ROW_NUMBER() OVER (ORDER BY dist ASC NULLS LAST, \"created_at\" DESC, \"id\" DESC) AS r_vec \
+           FROM matched \
+         ) \
+         SELECT \"id\", \"doc\", \"created_at\", \"version\" FROM ranked \
+         ORDER BY (1.0/(${k_ph} + r_text) + 1.0/(${k_ph} + r_vec)) DESC, \"created_at\" DESC, \"id\" DESC \
+         LIMIT ${limit_ph}"
+    );
+
+    let mut query =
+        sqlx::query_as::<_, (String, serde_json::Value, i64, i64)>(&sql).bind(&hs.query);
+    if let Some((_, uid)) = owner_enforce {
+        query = query.bind(uid);
+    }
+    let rows = query
+        .bind(qvec_text)
+        .bind(k)
+        .bind(i64::from(hs.limit))
         .fetch_all(pool)
         .await?;
     let docs = rows

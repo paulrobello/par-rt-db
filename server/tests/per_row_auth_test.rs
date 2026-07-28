@@ -158,6 +158,7 @@ fn notes_query() -> Query {
         filter: None,
         search: None,
         vector_search: None,
+        hybrid_search: None,
         aggregate: None,
     }
 }
@@ -299,6 +300,7 @@ async fn non_owner_table_is_unaffected_by_owner() -> anyhow::Result<()> {
         filter: None,
         search: None,
         vector_search: None,
+        hybrid_search: None,
         aggregate: None,
     };
     let res = execute_query(&pool, &db, &schema, &q, Some("alice")).await?;

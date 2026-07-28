@@ -3,6 +3,7 @@ import type {
   AggregateOp,
   AggregateSpec,
   FilterExpr,
+  HybridSearchQuery,
   Order,
   PaginatedResultJson,
   QueryJson,
@@ -73,6 +74,28 @@ export class TableQuery<DocT, Indexes extends string> {
       ...(opts.filter && Object.keys(opts.filter).length > 0 ? { filter: opts.filter } : {}),
     };
     return new TableQuery({ ...this.json, vectorSearch });
+  }
+
+  /** Hybrid `hybridSearch` terminal: fuses full-text and vector ranking over the
+   * same table via Reciprocal Rank Fusion. The table must declare BOTH a search
+   * index and a vector index. `opts.searchIndex`/`opts.vectorIndex` optionally
+   * name the indexes (auto-selected when omitted); `opts.k` is the RRF constant
+   * (default 60). Terminal — the server rejects other terminals alongside it. */
+  hybridSearch(
+    query: string,
+    vector: number[],
+    limit: number,
+    opts?: { searchIndex?: string; vectorIndex?: string; k?: number },
+  ): TableQuery<DocT, Indexes> {
+    const hybridSearch: HybridSearchQuery = {
+      query,
+      vector,
+      limit,
+      ...(opts?.searchIndex ? { searchIndex: opts.searchIndex } : {}),
+      ...(opts?.vectorIndex ? { vectorIndex: opts.vectorIndex } : {}),
+      ...(opts?.k ? { k: opts.k } : {}),
+    };
+    return new TableQuery({ ...this.json, hybridSearch });
   }
 
   take(n: number): RtQuery<DocT[]> {

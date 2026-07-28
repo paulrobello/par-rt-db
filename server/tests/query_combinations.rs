@@ -19,8 +19,8 @@ use rtdb_server::AppState;
 use rtdb_server::ddl::push_schema;
 use rtdb_server::error::ErrorCode;
 use rtdb_server::query::{
-    AggregateOp, AggregateSpec, FilterExpr, Order, Paginate, Query, SearchQuery, VectorSearchQuery,
-    execute_query,
+    AggregateOp, AggregateSpec, FilterExpr, HybridSearchQuery, Order, Paginate, Query, SearchQuery,
+    VectorSearchQuery, execute_query,
 };
 use rtdb_server::schema::SchemaDef;
 use serde_json::json;
@@ -85,6 +85,7 @@ fn base_query() -> Query {
         filter: None,
         search: None,
         vector_search: None,
+        hybrid_search: None,
         aggregate: None,
     }
 }
@@ -109,6 +110,17 @@ fn vector_embedding_limit_1() -> VectorSearchQuery {
         vector: vec![0.0, 0.0, 0.0],
         limit: 1,
         filter: std::collections::BTreeMap::new(),
+    }
+}
+
+fn hybrid_query_database_x() -> HybridSearchQuery {
+    HybridSearchQuery {
+        query: "x".to_string(),
+        vector: vec![0.0, 0.0, 0.0],
+        limit: 1,
+        search_index: None,
+        vector_index: None,
+        k: None,
     }
 }
 
@@ -224,6 +236,11 @@ const CASES: &[Case] = &[
         build: solo_vector,
         expected: Outcome::Accept,
     },
+    Case {
+        name: "solo: hybridSearch",
+        build: solo_hybrid,
+        expected: Outcome::Accept,
+    },
     // ============ get rejects every peer (QA-001: last 3 are the drift) ============
     Case {
         name: "get+index",
@@ -298,6 +315,11 @@ const CASES: &[Case] = &[
     Case {
         name: "get+vectorSearch",
         build: get_vector,
+        expected: Outcome::Reject,
+    },
+    Case {
+        name: "get+hybridSearch",
+        build: get_hybrid,
         expected: Outcome::Reject,
     },
     // ============ unique rejects take, order ============
@@ -395,6 +417,11 @@ const CASES: &[Case] = &[
         build: distinct_vector,
         expected: Outcome::Reject,
     },
+    Case {
+        name: "distinct+hybridSearch",
+        build: distinct_hybrid,
+        expected: Outcome::Reject,
+    },
     // ============ aggregate rejects get, take, unique, first, count, order,
     //              paginate, search, vectorSearch (standalone terminal like
     //              count/distinct); composes with index/eq/range/filter ============
@@ -446,6 +473,11 @@ const CASES: &[Case] = &[
     Case {
         name: "aggregate+vectorSearch",
         build: aggregate_vector,
+        expected: Outcome::Reject,
+    },
+    Case {
+        name: "aggregate+hybridSearch",
+        build: aggregate_hybrid,
         expected: Outcome::Reject,
     },
     // solo aggregate (no peers) and aggregate+eq/range/filter compositions accept.
@@ -567,6 +599,11 @@ const CASES: &[Case] = &[
         build: vs_take,
         expected: Outcome::Reject,
     },
+    Case {
+        name: "vectorSearch+hybridSearch",
+        build: vs_hybrid,
+        expected: Outcome::Reject,
+    },
     // ============ search rejects every peer except take ============
     Case {
         name: "search+index",
@@ -631,6 +668,89 @@ const CASES: &[Case] = &[
     Case {
         name: "search+vectorSearch",
         build: sr_vector,
+        expected: Outcome::Reject,
+    },
+    Case {
+        name: "search+hybridSearch",
+        build: sr_hybrid,
+        expected: Outcome::Reject,
+    },
+    // ============ hybridSearch rejects every peer (standalone, like
+    //              vectorSearch — it carries its own limit and IS the search+
+    //              vector combination, so neither composes with it) ============
+    Case {
+        name: "hybridSearch+index",
+        build: hs_index,
+        expected: Outcome::Reject,
+    },
+    Case {
+        name: "hybridSearch+eq",
+        build: hs_eq,
+        expected: Outcome::Reject,
+    },
+    Case {
+        name: "hybridSearch+gt",
+        build: hs_gt,
+        expected: Outcome::Reject,
+    },
+    Case {
+        name: "hybridSearch+gte",
+        build: hs_gte,
+        expected: Outcome::Reject,
+    },
+    Case {
+        name: "hybridSearch+lt",
+        build: hs_lt,
+        expected: Outcome::Reject,
+    },
+    Case {
+        name: "hybridSearch+lte",
+        build: hs_lte,
+        expected: Outcome::Reject,
+    },
+    Case {
+        name: "hybridSearch+order",
+        build: hs_order,
+        expected: Outcome::Reject,
+    },
+    Case {
+        name: "hybridSearch+unique",
+        build: hs_unique,
+        expected: Outcome::Reject,
+    },
+    Case {
+        name: "hybridSearch+first",
+        build: hs_first,
+        expected: Outcome::Reject,
+    },
+    Case {
+        name: "hybridSearch+count",
+        build: hs_count,
+        expected: Outcome::Reject,
+    },
+    Case {
+        name: "hybridSearch+distinct",
+        build: hs_distinct,
+        expected: Outcome::Reject,
+    },
+    Case {
+        name: "hybridSearch+aggregate",
+        build: hs_aggregate,
+        expected: Outcome::Reject,
+    },
+    Case {
+        name: "hybridSearch+paginate",
+        build: hs_paginate,
+        expected: Outcome::Reject,
+    },
+    Case {
+        name: "hybridSearch+filter",
+        build: hs_filter,
+        expected: Outcome::Reject,
+    },
+    Case {
+        name: "hybridSearch+take",
+        build: hs_take,
         expected: Outcome::Reject,
     },
     // ============ composition accepts (smoke that valid combos don't false-reject) ============
@@ -729,6 +849,9 @@ fn solo_search(q: &mut Query) {
 fn solo_vector(q: &mut Query) {
     q.vector_search = Some(vector_embedding_limit_1());
 }
+fn solo_hybrid(q: &mut Query) {
+    q.hybrid_search = Some(hybrid_query_database_x());
+}
 fn solo_aggregate(q: &mut Query) {
     // MIN over the post-prefix field of `by_title` (string field, orderable).
     q.aggregate = Some(AggregateSpec {
@@ -798,6 +921,10 @@ fn get_search(q: &mut Query) {
 fn get_vector(q: &mut Query) {
     q.get = Some(ID.to_string());
     q.vector_search = Some(vector_embedding_limit_1());
+}
+fn get_hybrid(q: &mut Query) {
+    q.get = Some(ID.to_string());
+    q.hybrid_search = Some(hybrid_query_database_x());
 }
 
 // unique/first/count/paginate peers
@@ -885,6 +1012,11 @@ fn distinct_vector(q: &mut Query) {
     q.index = Some("by_title".to_string());
     q.vector_search = Some(vector_embedding_limit_1());
 }
+fn distinct_hybrid(q: &mut Query) {
+    q.distinct = true;
+    q.index = Some("by_title".to_string());
+    q.hybrid_search = Some(hybrid_query_database_x());
+}
 
 // aggregate + peer (rejects every other terminal; composes only with
 // index/eq/range/filter — exercised under composition accepts below).
@@ -934,6 +1066,10 @@ fn aggregate_search(q: &mut Query) {
 fn aggregate_vector(q: &mut Query) {
     aggregate_min(q);
     q.vector_search = Some(vector_embedding_limit_1());
+}
+fn aggregate_hybrid(q: &mut Query) {
+    aggregate_min(q);
+    q.hybrid_search = Some(hybrid_query_database_x());
 }
 // aggregate compositions that must NOT false-reject.
 fn aggregate_eq(q: &mut Query) {
@@ -1040,6 +1176,10 @@ fn vs_take(q: &mut Query) {
     q.vector_search = Some(vector_embedding_limit_1());
     q.take = Some(1);
 }
+fn vs_hybrid(q: &mut Query) {
+    q.vector_search = Some(vector_embedding_limit_1());
+    q.hybrid_search = Some(hybrid_query_database_x());
+}
 
 // search + peer (rejects all peers except take)
 fn sr_index(q: &mut Query) {
@@ -1093,6 +1233,76 @@ fn sr_filter(q: &mut Query) {
 fn sr_vector(q: &mut Query) {
     q.search = Some(search_body_x());
     q.vector_search = Some(vector_embedding_limit_1());
+}
+fn sr_hybrid(q: &mut Query) {
+    q.search = Some(search_body_x());
+    q.hybrid_search = Some(hybrid_query_database_x());
+}
+
+// hybridSearch + peer (rejects all peers including take — hybrid carries its
+// own limit and IS the search+vector combination, so neither composes with it)
+fn hs_index(q: &mut Query) {
+    q.hybrid_search = Some(hybrid_query_database_x());
+    q.index = Some("by_title".to_string());
+}
+fn hs_eq(q: &mut Query) {
+    q.hybrid_search = Some(hybrid_query_database_x());
+    q.eq.push(json!("x"));
+}
+fn hs_gt(q: &mut Query) {
+    q.hybrid_search = Some(hybrid_query_database_x());
+    q.gt = Some(json!("x"));
+}
+fn hs_gte(q: &mut Query) {
+    q.hybrid_search = Some(hybrid_query_database_x());
+    q.gte = Some(json!("x"));
+}
+fn hs_lt(q: &mut Query) {
+    q.hybrid_search = Some(hybrid_query_database_x());
+    q.lt = Some(json!("x"));
+}
+fn hs_lte(q: &mut Query) {
+    q.hybrid_search = Some(hybrid_query_database_x());
+    q.lte = Some(json!("x"));
+}
+fn hs_order(q: &mut Query) {
+    q.hybrid_search = Some(hybrid_query_database_x());
+    q.order = Some(Order::Asc);
+}
+fn hs_unique(q: &mut Query) {
+    q.hybrid_search = Some(hybrid_query_database_x());
+    q.unique = true;
+}
+fn hs_first(q: &mut Query) {
+    q.hybrid_search = Some(hybrid_query_database_x());
+    q.first = true;
+}
+fn hs_count(q: &mut Query) {
+    q.hybrid_search = Some(hybrid_query_database_x());
+    q.count = true;
+}
+fn hs_distinct(q: &mut Query) {
+    q.hybrid_search = Some(hybrid_query_database_x());
+    q.distinct = true;
+}
+fn hs_aggregate(q: &mut Query) {
+    q.hybrid_search = Some(hybrid_query_database_x());
+    q.aggregate = Some(AggregateSpec {
+        op: AggregateOp::Min,
+        group_by: false,
+    });
+}
+fn hs_paginate(q: &mut Query) {
+    q.hybrid_search = Some(hybrid_query_database_x());
+    q.paginate = Some(paginate_num_1());
+}
+fn hs_filter(q: &mut Query) {
+    q.hybrid_search = Some(hybrid_query_database_x());
+    q.filter = Some(filter_eq_title_x());
+}
+fn hs_take(q: &mut Query) {
+    q.hybrid_search = Some(hybrid_query_database_x());
+    q.take = Some(1);
 }
 
 // composition accepts (valid combos that must not false-reject)

@@ -53,6 +53,9 @@ function searchBodyX() {
 function vectorEmbeddingLimit1() {
   return { index: "by_embedding", vector: [0, 0, 0], limit: 1 };
 }
+function hybridQueryDatabaseX() {
+  return { query: "x", vector: [0, 0, 0], limit: 1 };
+}
 function paginateNum1() {
   return { numItems: 1 };
 }
@@ -202,6 +205,13 @@ const CASES: readonly Case[] = [
     },
     expected: Outcome.Accept,
   },
+  {
+    name: "solo: hybridSearch",
+    build: (q) => {
+      q.hybridSearch = hybridQueryDatabaseX();
+    },
+    expected: Outcome.Accept,
+  },
   // ============ get rejects every peer (QA-001: last 3 are the drift) ============
   {
     name: "get+index",
@@ -320,6 +330,14 @@ const CASES: readonly Case[] = [
     build: (q) => {
       q.get = ID;
       q.vectorSearch = vectorEmbeddingLimit1();
+    },
+    expected: Outcome.Reject,
+  },
+  {
+    name: "get+hybridSearch",
+    build: (q) => {
+      q.get = ID;
+      q.hybridSearch = hybridQueryDatabaseX();
     },
     expected: Outcome.Reject,
   },
@@ -481,6 +499,15 @@ const CASES: readonly Case[] = [
     },
     expected: Outcome.Reject,
   },
+  {
+    name: "distinct+hybridSearch",
+    build: (q) => {
+      q.distinct = true;
+      q.index = "by_title";
+      q.hybridSearch = hybridQueryDatabaseX();
+    },
+    expected: Outcome.Reject,
+  },
   // ============ aggregate rejects get, take, unique, first, count, distinct,
   //              order, paginate, search, vectorSearch (standalone terminal
   //              like count/distinct); composes with index/eq/range/filter ============
@@ -579,6 +606,15 @@ const CASES: readonly Case[] = [
       q.aggregate = { op: "min" };
       q.index = "by_title";
       q.vectorSearch = vectorEmbeddingLimit1();
+    },
+    expected: Outcome.Reject,
+  },
+  {
+    name: "aggregate+hybridSearch",
+    build: (q) => {
+      q.aggregate = { op: "min" };
+      q.index = "by_title";
+      q.hybridSearch = hybridQueryDatabaseX();
     },
     expected: Outcome.Reject,
   },
@@ -767,6 +803,14 @@ const CASES: readonly Case[] = [
     },
     expected: Outcome.Reject,
   },
+  {
+    name: "vectorSearch+hybridSearch",
+    build: (q) => {
+      q.vectorSearch = vectorEmbeddingLimit1();
+      q.hybridSearch = hybridQueryDatabaseX();
+    },
+    expected: Outcome.Reject,
+  },
   // ============ search rejects every peer except take ============
   {
     name: "search+index",
@@ -869,6 +913,135 @@ const CASES: readonly Case[] = [
     build: (q) => {
       q.search = searchBodyX();
       q.vectorSearch = vectorEmbeddingLimit1();
+    },
+    expected: Outcome.Reject,
+  },
+  {
+    name: "search+hybridSearch",
+    build: (q) => {
+      q.search = searchBodyX();
+      q.hybridSearch = hybridQueryDatabaseX();
+    },
+    expected: Outcome.Reject,
+  },
+  // ============ hybridSearch rejects every peer (standalone, like vectorSearch) ============
+  {
+    name: "hybridSearch+index",
+    build: (q) => {
+      q.hybridSearch = hybridQueryDatabaseX();
+      q.index = "by_title";
+    },
+    expected: Outcome.Reject,
+  },
+  {
+    name: "hybridSearch+eq",
+    build: (q) => {
+      q.hybridSearch = hybridQueryDatabaseX();
+      q.eq = ["x"];
+    },
+    expected: Outcome.Reject,
+  },
+  {
+    name: "hybridSearch+gt",
+    build: (q) => {
+      q.hybridSearch = hybridQueryDatabaseX();
+      q.gt = "x";
+    },
+    expected: Outcome.Reject,
+  },
+  {
+    name: "hybridSearch+gte",
+    build: (q) => {
+      q.hybridSearch = hybridQueryDatabaseX();
+      q.gte = "x";
+    },
+    expected: Outcome.Reject,
+  },
+  {
+    name: "hybridSearch+lt",
+    build: (q) => {
+      q.hybridSearch = hybridQueryDatabaseX();
+      q.lt = "x";
+    },
+    expected: Outcome.Reject,
+  },
+  {
+    name: "hybridSearch+lte",
+    build: (q) => {
+      q.hybridSearch = hybridQueryDatabaseX();
+      q.lte = "x";
+    },
+    expected: Outcome.Reject,
+  },
+  {
+    name: "hybridSearch+order",
+    build: (q) => {
+      q.hybridSearch = hybridQueryDatabaseX();
+      q.order = "asc";
+    },
+    expected: Outcome.Reject,
+  },
+  {
+    name: "hybridSearch+unique",
+    build: (q) => {
+      q.hybridSearch = hybridQueryDatabaseX();
+      q.unique = true;
+    },
+    expected: Outcome.Reject,
+  },
+  {
+    name: "hybridSearch+first",
+    build: (q) => {
+      q.hybridSearch = hybridQueryDatabaseX();
+      q.first = true;
+    },
+    expected: Outcome.Reject,
+  },
+  {
+    name: "hybridSearch+count",
+    build: (q) => {
+      q.hybridSearch = hybridQueryDatabaseX();
+      q.count = true;
+    },
+    expected: Outcome.Reject,
+  },
+  {
+    name: "hybridSearch+distinct",
+    build: (q) => {
+      q.hybridSearch = hybridQueryDatabaseX();
+      q.distinct = true;
+    },
+    expected: Outcome.Reject,
+  },
+  {
+    name: "hybridSearch+aggregate",
+    build: (q) => {
+      q.hybridSearch = hybridQueryDatabaseX();
+      q.aggregate = { op: "min" };
+    },
+    expected: Outcome.Reject,
+  },
+  {
+    name: "hybridSearch+paginate",
+    build: (q) => {
+      q.hybridSearch = hybridQueryDatabaseX();
+      q.paginate = paginateNum1();
+    },
+    expected: Outcome.Reject,
+  },
+  {
+    name: "hybridSearch+filter",
+    build: (q) => {
+      q.hybridSearch = hybridQueryDatabaseX();
+      q.filter = filterEqTitleX();
+    },
+    expected: Outcome.Reject,
+  },
+  {
+    name: "hybridSearch+take",
+    build: (q) => {
+      q.hybridSearch = hybridQueryDatabaseX();
+      q.take = 1;
     },
     expected: Outcome.Reject,
   },

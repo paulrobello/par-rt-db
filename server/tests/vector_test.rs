@@ -415,6 +415,7 @@ fn empty_query() -> Query {
         filter: None,
         search: None,
         vector_search: None,
+        hybrid_search: None,
         aggregate: None,
     }
 }
@@ -579,4 +580,327 @@ fn vector_search_wire_round_trips() {
         back_nf["vectorSearch"].get("filter").is_none(),
         "empty filter should be omitted on the wire"
     );
+}
+
+// ===================== hybridSearch (RRF fusion) =====================
+
+/// A schema with BOTH a full-text search index (`search_body` over title+body)
+/// and a vector index (`by_embedding` over the 3-dim embedding field). Required
+/// for the `hybridSearch` terminal — it fuses ts_rank and cosine distance.
+fn hybrid_schema_json() -> serde_json::Value {
+    serde_json::json!({"tables":{"docs":{
+        "fields":{
+            "title":{"type":"string"},
+            "body":{"type":"string"},
+            "embedding":{"type":"vector","dimensions":3}
+        },
+        "indexes":[
+            {"name":"search_body","fields":["title","body"],"search":true},
+            {"name":"by_embedding","fields":["embedding"],"vector":{"dimensions":3}}
+        ]
+    }}})
+}
+
+fn hybrid_schema() -> SchemaDef {
+    serde_json::from_value(hybrid_schema_json()).expect("parse hybrid schema")
+}
+
+async fn hybrid_db(state: &std::sync::Arc<rtdb_server::AppState>) -> (String, SchemaDef) {
+    let name = format!("t{}", uuid::Uuid::now_v7().simple());
+    rtdb_server::db::create_database(&state.pool, &name)
+        .await
+        .expect("create db");
+    let schema = hybrid_schema();
+    push_schema(&state.pool, &name, schema.clone())
+        .await
+        .expect("push hybrid schema");
+    (name, schema)
+}
+
+fn hybrid_doc(
+    title: &str,
+    body: &str,
+    emb: Vec<f64>,
+) -> serde_json::Map<String, serde_json::Value> {
+    serde_json::json!({ "title": title, "body": body, "embedding": emb })
+        .as_object()
+        .expect("hybrid doc object")
+        .clone()
+}
+
+/// Seed three docs: one that matches both the text query AND is vector-near
+/// (`[1,0,0]`-ish), one that matches only the text query, and one that is only
+/// vector-near (no text match). Under RRF the doc matching BOTH axes must rank
+/// above the two single-axis matches.
+#[tokio::test]
+async fn hybrid_search_fuses_text_and_vector_via_rrf() {
+    let state = test_state().await;
+    let (db, schema) = hybrid_db(&state).await;
+    let pool = &state.pool;
+    // Matches text "database" and is vector-close to [1,0,0].
+    execute_txn(
+        pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::Insert {
+                table: "docs".into(),
+                doc: hybrid_doc("database intro", "database database", vec![1.0, 0.0, 0.0]),
+            }],
+        },
+        None,
+    )
+    .await
+    .expect("insert both");
+    // Matches text only (vector-far from [1,0,0]).
+    execute_txn(
+        pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::Insert {
+                table: "docs".into(),
+                doc: hybrid_doc("database notes", "database", vec![0.0, 0.0, 0.0]),
+            }],
+        },
+        None,
+    )
+    .await
+    .expect("insert text-only");
+    // Vector-near only (no text match for "database").
+    execute_txn(
+        pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::Insert {
+                table: "docs".into(),
+                doc: hybrid_doc("cooking", "recipes", vec![0.9, 0.4, 0.0]),
+            }],
+        },
+        None,
+    )
+    .await
+    .expect("insert vector-only");
+
+    let q = serde_json::from_value::<Query>(serde_json::json!({
+        "table": "docs",
+        "hybridSearch": {
+            "query": "database",
+            "vector": [1.0, 0.0, 0.0],
+            "limit": 3
+        }
+    }))
+    .expect("parse hybridSearch query");
+    let res = execute_query(pool, &db, &schema, &q, None)
+        .await
+        .expect("execute hybridSearch");
+    let docs = match res {
+        QueryResult::Docs(d) => d,
+        other => panic!("expected Docs, got {other:?}"),
+    };
+    assert_eq!(docs.len(), 3, "all three candidates surface (union)");
+    // The doc matching BOTH text and vector ranks first under RRF.
+    assert_eq!(
+        docs[0]["title"].as_str(),
+        Some("database intro"),
+        "both-axis match ranks first: {:?}",
+        docs.iter().map(|d| d["title"].as_str()).collect::<Vec<_>>()
+    );
+}
+
+/// A named search index is honored; an unknown name surfaces as BadRequest.
+#[tokio::test]
+async fn hybrid_search_auto_selects_and_names_indexes() {
+    let state = test_state().await;
+    let (db, schema) = hybrid_db(&state).await;
+    let pool = &state.pool;
+    execute_txn(
+        pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::Insert {
+                table: "docs".into(),
+                doc: hybrid_doc("database", "body", vec![1.0, 0.0, 0.0]),
+            }],
+        },
+        None,
+    )
+    .await
+    .expect("insert");
+    // Auto-select both indexes (no names).
+    let q = serde_json::from_value::<Query>(serde_json::json!({
+        "table": "docs",
+        "hybridSearch": {"query": "database", "vector": [1.0, 0.0, 0.0], "limit": 5}
+    }))
+    .expect("parse auto hybridSearch");
+    let res = execute_query(pool, &db, &schema, &q, None)
+        .await
+        .expect("auto-select hybridSearch");
+    assert!(matches!(res, QueryResult::Docs(_)));
+    // Explicit names resolve the same indexes.
+    let q = serde_json::from_value::<Query>(serde_json::json!({
+        "table": "docs",
+        "hybridSearch": {
+            "query": "database",
+            "vector": [1.0, 0.0, 0.0],
+            "limit": 5,
+            "searchIndex": "search_body",
+            "vectorIndex": "by_embedding"
+        }
+    }))
+    .expect("parse named hybridSearch");
+    let res = execute_query(pool, &db, &schema, &q, None)
+        .await
+        .expect("named hybridSearch");
+    assert!(matches!(res, QueryResult::Docs(_)));
+
+    // Unknown search index → BadRequest.
+    let q = serde_json::from_value::<Query>(serde_json::json!({
+        "table": "docs",
+        "hybridSearch": {
+            "query": "database", "vector": [1.0, 0.0, 0.0], "limit": 5,
+            "searchIndex": "nope"
+        }
+    }))
+    .expect("parse bad-search-index hybridSearch");
+    let err = execute_query(pool, &db, &schema, &q, None)
+        .await
+        .expect_err("unknown search index rejected");
+    assert_eq!(err.code, ErrorCode::BadRequest);
+}
+
+/// A table with only a vector index (no search index) → BadRequest.
+#[tokio::test]
+async fn hybrid_search_requires_a_search_index() {
+    let state = test_state().await;
+    let db = vec_db(&state).await; // vector-only schema
+    let schema = vector_schema(3, false);
+    let q = serde_json::from_value::<Query>(serde_json::json!({
+        "table": "docs",
+        "hybridSearch": {"query": "database", "vector": [1.0, 0.0, 0.0], "limit": 5}
+    }))
+    .expect("parse hybridSearch");
+    let err = execute_query(&state.pool, &db, &schema, &q, None)
+        .await
+        .expect_err("missing search index rejected");
+    assert_eq!(err.code, ErrorCode::BadRequest);
+    assert!(
+        err.message.contains("search index"),
+        "message names the missing search index: {}",
+        err.message
+    );
+}
+
+/// A table with only a search index (no vector index) → BadRequest.
+#[tokio::test]
+async fn hybrid_search_requires_a_vector_index() {
+    let state = test_state().await;
+    // Reuse the search_test schema shape (btree + search index, no vector).
+    let schema: SchemaDef = serde_json::from_value(serde_json::json!({"tables":{"notes":{
+        "fields":{"title":{"type":"string"},"body":{"type":"string"}},
+        "indexes":[
+            {"name":"by_title","fields":["title"]},
+            {"name":"search_body","fields":["title","body"],"search":true}
+        ]
+    }}}))
+    .expect("parse search-only schema");
+    let name = format!("t{}", uuid::Uuid::now_v7().simple());
+    rtdb_server::db::create_database(&state.pool, &name)
+        .await
+        .expect("create db");
+    push_schema(&state.pool, &name, schema.clone())
+        .await
+        .expect("push schema");
+    let q = serde_json::from_value::<Query>(serde_json::json!({
+        "table": "notes",
+        "hybridSearch": {"query": "database", "vector": [1.0, 0.0, 0.0], "limit": 5}
+    }))
+    .expect("parse hybridSearch");
+    let err = execute_query(&state.pool, &name, &schema, &q, None)
+        .await
+        .expect_err("missing vector index rejected");
+    assert_eq!(err.code, ErrorCode::BadRequest);
+    assert!(
+        err.message.contains("vector index"),
+        "message names the missing vector index: {}",
+        err.message
+    );
+}
+
+/// `hybridSearch` + `search` → BadRequest (hybrid IS the combination).
+#[tokio::test]
+async fn hybrid_search_is_mutually_exclusive_with_search() {
+    let state = test_state().await;
+    let (db, schema) = hybrid_db(&state).await;
+    let q = serde_json::from_value::<Query>(serde_json::json!({
+        "table": "docs",
+        "hybridSearch": {"query": "database", "vector": [1.0, 0.0, 0.0], "limit": 5},
+        "search": {"index": "search_body", "query": "database"}
+    }))
+    .expect("parse hybrid+search query");
+    let err = execute_query(&state.pool, &db, &schema, &q, None)
+        .await
+        .expect_err("hybrid+search rejected");
+    assert_eq!(err.code, ErrorCode::BadRequest);
+}
+
+/// `hybridSearch` rejects a query vector whose length differs from the index
+/// dimensions (mirrors `vectorSearch` length-mismatch guard).
+#[tokio::test]
+async fn hybrid_search_rejects_length_mismatch() {
+    let state = test_state().await;
+    let (db, schema) = hybrid_db(&state).await;
+    let q = serde_json::from_value::<Query>(serde_json::json!({
+        "table": "docs",
+        "hybridSearch": {"query": "database", "vector": [1.0, 0.0], "limit": 5}
+    }))
+    .expect("parse mismatched hybridSearch");
+    let err = execute_query(&state.pool, &db, &schema, &q, None)
+        .await
+        .expect_err("length mismatch rejected");
+    assert_eq!(err.code, ErrorCode::BadRequest);
+}
+
+/// `hybridSearch` parses camelCase on the wire and round-trips; snake_case
+/// Rust field never appears and optional fields are omitted when absent.
+#[test]
+fn hybrid_search_wire_round_trips() {
+    let q = serde_json::from_value::<Query>(serde_json::json!({
+        "table": "docs",
+        "hybridSearch": {"query": "hello", "vector": [0.1, 0.2, 0.3], "limit": 10}
+    }))
+    .expect("parse hybridSearch query");
+    let back = serde_json::to_value(&q).expect("serialize query");
+    assert_eq!(back["hybridSearch"]["query"], "hello");
+    assert_eq!(back["hybridSearch"]["limit"], 10);
+    // Optional fields (searchIndex/vectorIndex/k) omitted when absent.
+    assert!(
+        back["hybridSearch"].get("searchIndex").is_none(),
+        "searchIndex omitted when absent"
+    );
+    assert!(
+        back["hybridSearch"].get("vectorIndex").is_none(),
+        "vectorIndex omitted when absent"
+    );
+    assert!(
+        back["hybridSearch"].get("k").is_none(),
+        "k omitted when absent (defaults to 60 server-side)"
+    );
+    // snake_case Rust field never appears on the wire.
+    assert!(back.get("hybrid_search").is_none());
+    // An explicit k/searchIndex/vectorIndex round-trips.
+    let q_full = serde_json::from_value::<Query>(serde_json::json!({
+        "table": "docs",
+        "hybridSearch": {
+            "query": "hello", "vector": [0.1, 0.2, 0.3], "limit": 10,
+            "searchIndex": "search_body", "vectorIndex": "by_embedding", "k": 42
+        }
+    }))
+    .expect("parse full hybridSearch");
+    let back_full = serde_json::to_value(&q_full).expect("serialize");
+    assert_eq!(back_full["hybridSearch"]["k"], 42);
+    assert_eq!(back_full["hybridSearch"]["searchIndex"], "search_body");
+    assert_eq!(back_full["hybridSearch"]["vectorIndex"], "by_embedding");
 }

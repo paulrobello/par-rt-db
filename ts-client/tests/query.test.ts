@@ -300,6 +300,47 @@ describe("TableQuery.vectorSearch", () => {
   });
 });
 
+describe("TableQuery.hybridSearch", () => {
+  it("builds a hybridSearch terminal with required fields only", () => {
+    const q = api.docs.query().hybridSearch("hello world", [1, 0, 0], 5).collect();
+    expect(q.json).toEqual({
+      table: "docs",
+      hybridSearch: { query: "hello world", vector: [1, 0, 0], limit: 5 },
+    });
+  });
+
+  it("includes searchIndex/vectorIndex/k when provided", () => {
+    const q = api.docs
+      .query()
+      .hybridSearch("hello", [1, 0, 0], 5, {
+        searchIndex: "search_body",
+        vectorIndex: "by_embedding",
+        k: 42,
+      })
+      .collect();
+    expect(q.json).toEqual({
+      table: "docs",
+      hybridSearch: {
+        query: "hello",
+        vector: [1, 0, 0],
+        limit: 5,
+        searchIndex: "search_body",
+        vectorIndex: "by_embedding",
+        k: 42,
+      },
+    });
+  });
+
+  it("omits optional fields when not provided", () => {
+    const q = api.docs.query().hybridSearch("hello", [1, 0, 0], 3).collect();
+    const hs = q.json.hybridSearch;
+    if (hs === undefined) throw new Error("hybridSearch should be set");
+    expect(hs.searchIndex).toBeUndefined();
+    expect(hs.vectorIndex).toBeUndefined();
+    expect(hs.k).toBeUndefined();
+  });
+});
+
 describe("TableQuery.paginate", () => {
   it("builds a paginate query without cursor", () => {
     const q = api.items.query().withIndex("by_project", ["p1"]).paginate(undefined, 10);

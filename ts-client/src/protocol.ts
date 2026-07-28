@@ -23,6 +23,7 @@ export interface QueryJson {
   filter?: FilterExpr;
   search?: SearchQuery;
   vectorSearch?: VectorQuery;
+  hybridSearch?: HybridSearchQuery;
 }
 
 export interface Paginate {
@@ -79,6 +80,21 @@ export interface VectorQuery {
   vector: number[];
   limit: number;
   filter?: Record<string, unknown>;
+}
+
+/** Mirrors server `query::HybridSearchQuery` byte-for-byte (camelCase,
+ * deny_unknown_fields). Fuses full-text (`search`) and vector (`vectorSearch`)
+ * ranking via Reciprocal Rank Fusion; the table must declare BOTH a search
+ * index and a vector index. `searchIndex`/`vectorIndex` optionally name the
+ * indexes (auto-selected when omitted); `k` is the RRF constant (default 60,
+ * omitted on the wire when absent). */
+export interface HybridSearchQuery {
+  query: string;
+  vector: number[];
+  limit: number;
+  searchIndex?: string;
+  vectorIndex?: string;
+  k?: number;
 }
 
 /** Mirrors server `protocol::ScheduleWhen` byte-for-byte (tag `type`, camelCase). */

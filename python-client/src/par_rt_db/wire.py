@@ -255,6 +255,35 @@ class VectorSearchQuery(_Camel):
         return out
 
 
+class HybridSearchQuery(_Camel):
+    """Hybrid search terminal: ``{query, vector, limit, searchIndex?, vectorIndex?, k?}``.
+
+    Fuses full-text (``search``) and vector (``vectorSearch``) ranking over the
+    same table via Reciprocal Rank Fusion (RRF). The table must declare BOTH a
+    search index (tsvector) and a vector index. ``search_index``/``vector_index``
+    optionally name the indexes (auto-selected server-side when ``None``); ``k``
+    is the RRF constant (default 60). Mirrors
+    ``server/src/query.rs::HybridSearchQuery`` byte-for-byte (camelCase,
+    ``extra='forbid'``). The optional fields are omitted on the wire when
+    ``None`` (mirrors the server's ``Option::is_none`` skip rule).
+    """
+
+    query: str
+    vector: list[float]
+    limit: int
+    search_index: str | None = None
+    vector_index: str | None = None
+    k: int | None = None
+
+    @model_serializer(mode="wrap")
+    def _drop_none_optionals(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        out = handler(self)
+        for alias in ("searchIndex", "vectorIndex", "k"):
+            if out.get(alias) is None:
+                out.pop(alias, None)
+        return out
+
+
 # --- ClientMessage (client -> server WS vocabulary; discriminator "type") ---
 #
 # Mirrors ``server/src/protocol.rs::ClientMessage`` (the ``#[serde(tag = "type",
