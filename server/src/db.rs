@@ -236,6 +236,62 @@ pub async fn create_database(pool: &PgPool, name: &str) -> Result<(), RtDbError>
     Ok(())
 }
 
+/// Drops a tenant database: validates `name`, requires it exists, then in one
+/// transaction `DROP SCHEMA ... CASCADE`s the per-db Postgres schema (removing
+/// `meta`, `mutations`, `scheduled_txns`, `storage`, and every document table
+/// `push_schema` created) and deletes its row in `rtdb_auth.databases` plus
+/// its per-db rows in `rtdb_auth.machine_tokens`, `rtdb_auth.allowlist`, and
+/// `rtdb.storage_index`. `IF EXISTS` on the schema drop keeps a partially-
+/// deleted db (schema already gone) recoverable — the DELETEs still run and
+/// the registry row is removed. In-memory eviction (schema cache,
+/// subscriptions, committer channel) is the caller's responsibility — see
+/// `admin::delete_db`. Durable cleanup only happens here.
+pub async fn drop_database(pool: &PgPool, name: &str) -> Result<(), RtDbError> {
+    validate_db_name(name)?;
+
+    let mut tx = pool.begin().await?;
+
+    let existing: Option<(String,)> =
+        sqlx::query_as("SELECT name FROM rtdb_auth.databases WHERE name = $1")
+            .bind(name)
+            .fetch_optional(&mut *tx)
+            .await?;
+    if existing.is_none() {
+        return Err(RtDbError::not_found("database not found"));
+    }
+
+    let schema_name = pg_schema(name);
+    // CASCADE drops the schema's tables (`meta`, `mutations`, `scheduled_txns`,
+    // `storage`, plus any document tables `push_schema` created) and any indexes
+    // or views depending on them, in one statement. The schema identifier is
+    // double-quoted because `pg_schema` produces a validated physical name that
+    // may contain characters requiring it; the name value itself is bound.
+    sqlx::query(&format!("DROP SCHEMA IF EXISTS \"{schema_name}\" CASCADE"))
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM rtdb_auth.databases WHERE name = $1")
+        .bind(name)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM rtdb_auth.machine_tokens WHERE db_name = $1")
+        .bind(name)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM rtdb_auth.allowlist WHERE db_name = $1")
+        .bind(name)
+        .execute(&mut *tx)
+        .await?;
+    // `rtdb.storage_index` is the global id→db map for the unauthenticated
+    // public-serve URL; the per-schema `storage` blob table was already dropped
+    // by `DROP SCHEMA CASCADE` above, so these rows are now orphans.
+    sqlx::query("DELETE FROM rtdb.storage_index WHERE db_name = $1")
+        .bind(name)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
 /// Maps a Postgres unique-violation (`23505`, the `rtdb_auth.databases` name
 /// primary key) or duplicate-schema (`42P06`, a concurrent `CREATE SCHEMA`)
 /// error to a `BadRequest` — both are symptoms of two concurrent

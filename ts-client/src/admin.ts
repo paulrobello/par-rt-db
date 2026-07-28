@@ -97,6 +97,12 @@ export class RtDbAdminClient {
     await this.request("POST", "/admin/create-db", { name });
   }
 
+  /** Delete a database (schema + all per-db state). `confirm` must equal `name`
+   *  exactly — the server's typed guard against accidental deletion. */
+  async deleteDb(name: string, confirm: string): Promise<void> {
+    await this.request("POST", "/admin/delete-db", { name, confirm });
+  }
+
   async pushSchema(db: string, schema: SchemaDefinition<any> | SchemaJson): Promise<void> {
     await this.request("POST", "/admin/push-schema", { db, schema: toSchemaJson(schema) });
   }

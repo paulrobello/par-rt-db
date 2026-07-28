@@ -125,6 +125,18 @@ impl SubscriptionManager {
         // Empty shard is retained (lazy) — see the struct doc.
     }
 
+    /// Drops every subscription for `db` and removes its shard, used by
+    /// `delete-db` to evict a deleted database's live-query state. Live
+    /// `/sync` connections to `db` will see errors on their next op (the
+    /// schema is gone), which is acceptable for a deleted database. Unlike
+    /// `remove`/`remove_conn`, this drops the shard Arc entirely — fine here
+    /// because no future `register` will target a deleted db (the next
+    /// `submit` for it 404s at `database_exists` before reaching the committer).
+    pub async fn drop_db(&self, db: &str) {
+        let mut guard = self.subs.lock().await;
+        guard.remove(db);
+    }
+
     /// Total active subscriptions across all databases (a dashboard gauge).
     /// Approximate by design — each shard is locked individually after the
     /// outer map is released, so a subscribe/unsubscribe racing this call can

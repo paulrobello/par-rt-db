@@ -102,6 +102,10 @@ pub async fn run_cleanup(
         tokio::select! {
             _ = tick.tick() => {
                 if let Err(err) = cleanup_expired(&pool, &db).await {
+                    if matches!(crate::db::database_exists(&pool, &db).await, Ok(false)) {
+                        tracing::info!(db = %db, "mutation_log cleanup: database removed, exiting");
+                        return;
+                    }
                     tracing::warn!(db = %db, error = %err, "mutation_log cleanup failed");
                 }
             }

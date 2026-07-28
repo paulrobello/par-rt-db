@@ -307,4 +307,44 @@ describe("RtDbAdminClient — new endpoints", () => {
     await admin.adminMutate("kanban", txn);
     expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({ txn });
   });
+
+  it("deleteDb POSTs {name, confirm} to /admin/delete-db", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ ok: true }));
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+    await admin.deleteDb("kanban", "kanban");
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("http://h:8300/admin/delete-db");
+    expect(init.method).toBe("POST");
+    expect(init.headers.Authorization).toBe("Bearer k");
+    expect(JSON.parse(init.body)).toEqual({ name: "kanban", confirm: "kanban" });
+  });
+
+  it("deleteDb surfaces a 400 confirmation-mismatch envelope as RtDbError", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(
+        jsonResponse(
+          { code: "BAD_REQUEST", message: "confirmation does not match database name" },
+          400,
+        ),
+      );
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+    await expect(admin.deleteDb("kanban", "wrong")).rejects.toMatchObject({
+      name: "RtDbError",
+      code: "BAD_REQUEST",
+      message: "confirmation does not match database name",
+    });
+  });
+
+  it("deleteDb surfaces a 404 unknown-database envelope as RtDbError", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(jsonResponse({ code: "NOT_FOUND", message: "database not found" }, 404));
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+    await expect(admin.deleteDb("missing", "missing")).rejects.toMatchObject({
+      name: "RtDbError",
+      code: "NOT_FOUND",
+      message: "database not found",
+    });
+  });
 });

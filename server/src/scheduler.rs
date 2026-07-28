@@ -420,6 +420,12 @@ pub async fn run_scheduler(pool: PgPool, db: String, committer_tx: Sender<Commit
             }
             Ok(None) => MAX_SLEEP, // nothing pending
             Err(err) => {
+                // The db may have been deleted (DROP SCHEMA) out from under this
+                // scheduler; if so, exit cleanly instead of erroring every 2s.
+                if matches!(crate::db::database_exists(&pool, &db).await, Ok(false)) {
+                    tracing::info!(db = %db, "scheduler: database removed, exiting");
+                    return;
+                }
                 tracing::error!(db = %db, error = %err, "scheduler: next_due failed");
                 MAX_SLEEP
             }
@@ -433,6 +439,10 @@ pub async fn run_scheduler(pool: PgPool, db: String, committer_tx: Sender<Commit
         let claimed = match claim_due(&pool, &db, now, CLAIM_BATCH).await {
             Ok(jobs) => jobs,
             Err(err) => {
+                if matches!(crate::db::database_exists(&pool, &db).await, Ok(false)) {
+                    tracing::info!(db = %db, "scheduler: database removed, exiting");
+                    return;
+                }
                 tracing::error!(db = %db, error = %err, "scheduler: claim_due failed");
                 continue;
             }

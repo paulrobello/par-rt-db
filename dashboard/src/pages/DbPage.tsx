@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
-import { Link, useParams } from "react-router-dom";
-import { Placard, Spinner } from "../components/ui";
+import { Link, useNavigate, useParams } from "react-router-dom";
+import { Button, Placard, Spinner } from "../components/ui";
 import { useAdmin } from "../lib/admin";
 import { formatBytes, formatNumber } from "../lib/format";
 import type { DbStats } from "../lib/types";
@@ -8,10 +8,15 @@ import s from "./DbPage.module.css";
 
 export function DbPage() {
   const { db = "" } = useParams();
-  const { client } = useAdmin();
+  const { client, refreshDatabases } = useAdmin();
+  const navigate = useNavigate();
   const [stats, setStats] = useState<DbStats | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [confirming, setConfirming] = useState(false);
+  const [confirmText, setConfirmText] = useState("");
+  const [deleting, setDeleting] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -33,6 +38,20 @@ export function DbPage() {
       cancelled = true;
     };
   }, [client, db]);
+
+  async function deleteDb() {
+    setDeleting(true);
+    setDeleteError(null);
+    try {
+      await client.deleteDb(db, db);
+      await refreshDatabases();
+      navigate("/databases");
+    } catch (e) {
+      setDeleteError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setDeleting(false);
+    }
+  }
 
   return (
     <section className={s.page}>
@@ -80,6 +99,49 @@ export function DbPage() {
           </tbody>
         </table>
       )}
+      <section className={s.danger}>
+        <h2 className={s.dangerTitle}>Delete database</h2>
+        <p className={s.dangerBody}>
+          Permanently deletes <span className={s.dangerName}>{db}</span>: its schema, every table
+          and document, minted tokens, the per-db allowlist, and storage blobs. This cannot be
+          undone.
+        </p>
+        {confirming ? (
+          <div className={s.confirm}>
+            <label className={s.confirmLabel}>
+              Type the database name to confirm
+              <input
+                className={s.confirmInput}
+                value={confirmText}
+                onChange={(e) => setConfirmText(e.target.value)}
+                placeholder={db}
+                spellCheck={false}
+                autoComplete="off"
+              />
+            </label>
+            <div className={s.confirmActions}>
+              <Button variant="danger" onClick={deleteDb} disabled={deleting || confirmText !== db}>
+                delete forever
+              </Button>
+              <Button
+                onClick={() => {
+                  setConfirming(false);
+                  setConfirmText("");
+                  setDeleteError(null);
+                }}
+                disabled={deleting}
+              >
+                cancel
+              </Button>
+            </div>
+            {deleteError && <p className={s.error}>{deleteError}</p>}
+          </div>
+        ) : (
+          <Button variant="danger" onClick={() => setConfirming(true)} disabled={deleting}>
+            Delete database
+          </Button>
+        )}
+      </section>
     </section>
   );
 }

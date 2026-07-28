@@ -60,6 +60,245 @@ async fn create_db_and_push_schema_via_http_creates_expected_columns_and_index()
     Ok(())
 }
 
+// delete-db happy path: confirm==name removes the schema, the registry row, the
+// per-db allowlist row, and CASCADE-drops every document table `push_schema`
+// created. After it, GET /admin/dbs no longer lists the db and the next
+// create-db for the same name succeeds (registry row is gone). Minted tokens
+// for the db are also purged.
+#[tokio::test]
+async fn delete_db_drops_schema_and_registry_row_and_cascades_document_tables() -> anyhow::Result<()>
+{
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let addr = spawn_app(state.clone()).await;
+    let name = fresh_name();
+
+    // Create + push a schema (so document tables exist) + mint a token + allow
+    // a user, to prove CASCADE/DELETE reaches every per-db surface.
+    admin_post(addr, "/admin/create-db", serde_json::json!({"name": name})).await;
+    admin_post(
+        addr,
+        "/admin/push-schema",
+        serde_json::json!({"db": name, "schema": kanban_schema_json()}),
+    )
+    .await;
+    let minted: serde_json::Value = admin_post(
+        addr,
+        "/admin/mint-token",
+        serde_json::json!({"db": name, "name": "ci"}),
+    )
+    .await
+    .json()
+    .await?;
+    let token_id = minted["tokenId"].as_str().unwrap().to_string();
+    admin_post(
+        addr,
+        "/admin/allowlist",
+        serde_json::json!({"db": name, "action": "add", "email": "a@b.com"}),
+    )
+    .await;
+
+    let resp = admin_post(
+        addr,
+        "/admin/delete-db",
+        serde_json::json!({"name": name, "confirm": name}),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(body, serde_json::json!({"ok": true}));
+
+    // Schema gone (CASCADE removed meta, mutations, scheduled_txns, storage, and
+    // the document tables push_schema created).
+    let pg_schema = format!("db_{name}");
+    let schema_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM information_schema.schemata WHERE schema_name = $1",
+    )
+    .bind(&pg_schema)
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(schema_count, 0, "schema {pg_schema} should be gone");
+
+    // Registry row gone.
+    let (in_registry,): (i64,) =
+        sqlx::query_as("SELECT count(*) FROM rtdb_auth.databases WHERE name = $1")
+            .bind(&name)
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(in_registry, 0, "registry row should be gone");
+
+    // Token row for this db purged.
+    let (tokens_for_db,): (i64,) =
+        sqlx::query_as("SELECT count(*) FROM rtdb_auth.machine_tokens WHERE db_name = $1")
+            .bind(&name)
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(tokens_for_db, 0, "tokens for db should be purged");
+    let (token_id_row,): (i64,) =
+        sqlx::query_as("SELECT count(*) FROM rtdb_auth.machine_tokens WHERE id = $1")
+            .bind(&token_id)
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(token_id_row, 0, "minted token row should be purged");
+
+    // Allowlist row for this db purged.
+    let (allowlist_for_db,): (i64,) =
+        sqlx::query_as("SELECT count(*) FROM rtdb_auth.allowlist WHERE db_name = $1")
+            .bind(&name)
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(
+        allowlist_for_db, 0,
+        "allowlist rows for db should be purged"
+    );
+
+    // GET /admin/dbs no longer lists it.
+    let resp = admin_get(addr, "/admin/dbs").await;
+    let body: serde_json::Value = resp.json().await?;
+    let listed = body["databases"]
+        .as_array()
+        .expect("databases array")
+        .iter()
+        .any(|d| d.as_str() == Some(&name));
+    assert!(
+        !listed,
+        "deleted db should not appear in /admin/dbs: {body}"
+    );
+
+    // The same name is reclaimable — registry row is gone, so create succeeds.
+    let resp = admin_post(addr, "/admin/create-db", serde_json::json!({"name": name})).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    // Clean up the reclaimed db to keep the suite's Postgres tidy.
+    admin_post(
+        addr,
+        "/admin/delete-db",
+        serde_json::json!({"name": name, "confirm": name}),
+    )
+    .await;
+    Ok(())
+}
+
+// delete-db requires confirm == name exactly; a mismatch yields 400 and changes
+// nothing.
+#[tokio::test]
+async fn delete_db_rejects_mismatched_confirm_with_400_and_changes_nothing() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let name = fresh_name();
+    admin_post(addr, "/admin/create-db", serde_json::json!({"name": name})).await;
+
+    let resp = admin_post(
+        addr,
+        "/admin/delete-db",
+        serde_json::json!({"name": name, "confirm": "not-the-name"}),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    // The db still exists.
+    let resp = admin_get(addr, "/admin/dbs").await;
+    let body: serde_json::Value = resp.json().await?;
+    let listed = body["databases"]
+        .as_array()
+        .expect("databases array")
+        .iter()
+        .any(|d| d.as_str() == Some(&name));
+    assert!(listed, "db should still be listed after a rejected delete");
+
+    // Clean up.
+    admin_post(
+        addr,
+        "/admin/delete-db",
+        serde_json::json!({"name": name, "confirm": name}),
+    )
+    .await;
+    Ok(())
+}
+
+// delete-db on a name that was never registered returns 404, not 500.
+#[tokio::test]
+async fn delete_db_on_unknown_name_returns_404() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let name = fresh_name();
+
+    let resp = admin_post(
+        addr,
+        "/admin/delete-db",
+        serde_json::json!({"name": name, "confirm": name}),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+    Ok(())
+}
+
+// delete-db is idempotent in the partial-deletion sense: after a successful
+// delete, a second delete 404s (it is no longer in the registry) rather than
+// 500ing. `DROP SCHEMA IF EXISTS` keeps the durable step safe even if the
+// schema was already gone.
+#[tokio::test]
+async fn delete_db_double_delete_returns_404_not_500() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let name = fresh_name();
+    admin_post(addr, "/admin/create-db", serde_json::json!({"name": name})).await;
+
+    let resp = admin_post(
+        addr,
+        "/admin/delete-db",
+        serde_json::json!({"name": name, "confirm": name}),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    let resp = admin_post(
+        addr,
+        "/admin/delete-db",
+        serde_json::json!({"name": name, "confirm": name}),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+    Ok(())
+}
+
+// delete-db is admin-gated: a missing bearer yields 401, not a deletion.
+#[tokio::test]
+async fn delete_db_requires_admin() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let name = fresh_name();
+    admin_post(addr, "/admin/create-db", serde_json::json!({"name": name})).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/admin/delete-db"))
+        .json(&serde_json::json!({"name": name, "confirm": name}))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    // The db still exists.
+    let resp = admin_get(addr, "/admin/dbs").await;
+    let body: serde_json::Value = resp.json().await?;
+    let listed = body["databases"]
+        .as_array()
+        .expect("databases array")
+        .iter()
+        .any(|d| d.as_str() == Some(&name));
+    assert!(
+        listed,
+        "db should still be listed after an unauthenticated delete"
+    );
+
+    // Clean up.
+    admin_post(
+        addr,
+        "/admin/delete-db",
+        serde_json::json!({"name": name, "confirm": name}),
+    )
+    .await;
+    Ok(())
+}
+
 // (b) re-pushing the identical schema succeeds (idempotent no-op).
 #[tokio::test]
 async fn repushing_identical_schema_is_idempotent() -> anyhow::Result<()> {

@@ -68,3 +68,65 @@
   font-family: var(--mono);
   font-size: var(--t-mono-sm);
 }
+
+.danger {
+  margin-top: var(--sp-4);
+  padding: var(--sp-3);
+  border: 1px solid var(--rule);
+  border-left: 2px solid var(--error);
+  background: var(--surface);
+  max-width: 720px;
+}
+
+.dangerTitle {
+  margin: 0 0 var(--sp-2);
+  font-size: var(--t-mono-md);
+  font-weight: 400;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--ink-2);
+  font-family: var(--mono);
+}
+
+.dangerBody {
+  margin: 0 0 var(--sp-3);
+  color: var(--ink-3);
+  font-size: var(--t-body);
+  line-height: 1.5;
+}
+
+.dangerName {
+  font-family: var(--mono);
+  color: var(--ink);
+}
+
+.confirm {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+
+.confirmLabel {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  color: var(--ink-3);
+  font-family: var(--mono);
+  font-size: var(--t-mono-sm);
+}
+
+.confirmInput {
+  background: var(--inset);
+  color: var(--ink);
+  border: 1px solid var(--rule-strong);
+  border-radius: var(--r-1);
+  font-family: var(--mono);
+  font-size: var(--t-mono-sm);
+  padding: 6px var(--sp-2);
+  outline: none;
+}
+
+.confirmActions {
+  display: flex;
+  gap: var(--sp-2);
+}

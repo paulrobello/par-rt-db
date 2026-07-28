@@ -158,6 +158,38 @@ async fn create_db(
 }
 
 #[derive(Deserialize)]
+struct DeleteDbRequest {
+    name: String,
+    confirm: String,
+}
+
+/// `POST /admin/delete-db` — admin-gated, typed-confirmation-guarded deletion
+/// of a database. `confirm` must equal `name` exactly (a typed guard against
+/// accidental deletion; the dashboard gates its delete button on the same
+/// match). Beyond `drop_database`'s durable cleanup (schema CASCADE + rows in
+/// `rtdb_auth.databases` / `machine_tokens` / `allowlist` / `rtdb.storage_index`),
+/// evicts the in-memory state too: cached schema, the subscription shard, and
+/// the committer channel mapping. Live `/sync` connections to the deleted db
+/// will fail on their next op — acceptable for a deleted database.
+async fn delete_db(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    ApiJson(body): ApiJson<DeleteDbRequest>,
+) -> Result<Json<OkResponse>, RtDbError> {
+    require_admin(&state, &headers).await?;
+    if body.confirm != body.name {
+        return Err(RtDbError::bad_request(
+            "confirmation does not match database name",
+        ));
+    }
+    db::drop_database(&state.pool, &body.name).await?;
+    state.schemas.invalidate(&body.name).await;
+    state.realtime.subs.drop_db(&body.name).await;
+    state.realtime.committers.drop_db(&body.name).await;
+    Ok(Json(OkResponse { ok: true }))
+}
+
+#[derive(Deserialize)]
 struct PushSchemaRequest {
     db: String,
     schema: SchemaDef,
@@ -916,6 +948,7 @@ pub fn admin_routes() -> Router<Arc<AppState>> {
         .route("/admin/login", post(admin_login))
         .route("/admin/logout", post(admin_logout))
         .route("/admin/create-db", post(create_db))
+        .route("/admin/delete-db", post(delete_db))
         .route("/admin/push-schema", post(push_schema))
         .route("/admin/dbs", get(list_dbs))
         .route("/admin/mint-token", post(mint_token))

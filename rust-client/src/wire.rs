@@ -364,6 +364,12 @@ pub mod admin {
     }
 
     #[derive(Serialize)]
+    pub(crate) struct DeleteDbRequest<'a> {
+        pub(crate) name: &'a str,
+        pub(crate) confirm: &'a str,
+    }
+
+    #[derive(Serialize)]
     pub(crate) struct PushSchemaRequest<'a> {
         pub(crate) db: &'a str,
         pub(crate) schema: &'a SchemaDef,

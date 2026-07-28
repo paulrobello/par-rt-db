@@ -514,6 +514,21 @@ impl RtDbHttpClient {
         self.expect_ok(resp).await
     }
 
+    /// `POST /admin/delete-db` `{name, confirm}` → `{ok:true}`. The server
+    /// rejects with `BAD_REQUEST` unless `confirm == name` exactly — the typed
+    /// confirmation guard against accidental deletion. Drops the db's Postgres
+    /// schema (CASCADE) and every per-db row (registry, tokens, allowlist,
+    /// storage_index).
+    pub async fn delete_db(&self, name: &str, confirm: &str) -> Result<(), RtDbError> {
+        let resp = self
+            .post_json(
+                "/admin/delete-db",
+                &crate::wire::admin::DeleteDbRequest { name, confirm },
+            )
+            .await?;
+        self.expect_ok(resp).await
+    }
+
     /// `POST /admin/push-schema` `{db, schema}` → `{ok:true}`.
     pub async fn push_schema(
         &self,
@@ -1566,6 +1581,53 @@ mod admin_tests {
             .mount(&server)
             .await;
         client.create_db("kanban").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn delete_db_posts_name_and_confirm() {
+        let (server, client) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/admin/delete-db"))
+            .and(header("authorization", BEARER))
+            .and(body_partial_json(
+                json!({"name": "kanban", "confirm": "kanban"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+            .mount(&server)
+            .await;
+        client.delete_db("kanban", "kanban").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn delete_db_surfaces_confirmation_mismatch_envelope() {
+        let (server, client) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/admin/delete-db"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "code": "BAD_REQUEST",
+                "message": "confirmation does not match database name"
+            })))
+            .mount(&server)
+            .await;
+        let err = client.delete_db("kanban", "wrong").await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::BadRequest);
+        assert_eq!(err.message, "confirmation does not match database name");
+    }
+
+    #[tokio::test]
+    async fn delete_db_surfaces_unknown_database_envelope() {
+        let (server, client) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/admin/delete-db"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+                "code": "NOT_FOUND",
+                "message": "database not found"
+            })))
+            .mount(&server)
+            .await;
+        let err = client.delete_db("missing", "missing").await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::NotFound);
+        assert_eq!(err.message, "database not found");
     }
 
     #[tokio::test]

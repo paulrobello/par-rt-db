@@ -82,6 +82,27 @@ impl Committers {
         }
     }
 
+    /// Removes `db`'s committer channel from the map so future mutate/subscribe
+    /// requests 404 (the next `submit` would fail `database_exists` first
+    /// anyway after `drop_database`). Used by `delete-db`.
+    ///
+    /// Does NOT cleanly stop the per-db committer, scheduler, or
+    /// mutation-log cleanup tasks: those tasks each hold their own clone of
+    /// the channel sender, so removing this map entry does not close the
+    /// channel. After `DROP SCHEMA CASCADE` removes `scheduled_txns` and
+    /// `mutations`, those tasks' next polls log best-effort errors and
+    /// continue until the process restarts. This preserves the single-writer
+    /// invariant — the channel itself stays single-consumer, and no new
+    /// requests can reach the orphan tasks — at the cost of short-lived
+    /// orphan tasks. A clean shutdown would require either a
+    /// `CommitterRequest::Shutdown` variant with an ACK round-trip or a
+    /// `JoinHandle` registry; both are invasive for a rare admin op, so the
+    /// map eviction is the documented minimum.
+    pub async fn drop_db(&self, db: &str) {
+        let mut guard = self.channels.lock().await;
+        guard.remove(db);
+    }
+
     /// Submits a request to `db`'s committer task, lazily spawning it on
     /// first use. Errors `NotFound` if `db` isn't a registered database. If
     /// the send fails because the committer task is gone (e.g. it panicked),

@@ -72,6 +72,14 @@ export class AdminClient {
       body: JSON.stringify({ name }),
     });
   }
+  /** Delete a database (schema + all per-db state). `confirm` must equal `name`
+   *  exactly — the server's typed guard against accidental deletion. */
+  deleteDb(name: string, confirm: string) {
+    return this.req<{ ok: boolean }>("/admin/delete-db", {
+      method: "POST",
+      body: JSON.stringify({ name, confirm }),
+    });
+  }
   getSchema(db: string) {
     return this.req<SchemaJson>(`/admin/dbs/${enc(db)}/schema`);
   }
