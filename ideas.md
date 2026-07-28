@@ -31,7 +31,7 @@ explicitly-deferred sub-items. Effort is rough: `small` ≤1 day, `medium` 1–3
 
 ## Clients & DX
 
-- [ ] **Python client HTTP / WS / admin / storage surfaces** — close the one explicitly-open client-parity gap: the python client ships wire + DSL only today; port the rust-client's staged rollout (http → reactive ws → admin → storage) so it reaches parity with the TS and Rust SDKs. (effort: large)
+- [x] **Python client HTTP / WS / admin / storage surfaces** — close the one explicitly-open client-parity gap: the python client ships wire + DSL only today; port the rust-client's staged rollout (http → reactive ws → admin → storage) so it reaches parity with the TS and Rust SDKs. (effort: large)
 - [x] **`rtdb` CLI** — a terminal tool (schema push, one-shot query/mutate, export/import, token mint) for CI seed scripts and operator workflows that don't want to reach for the dashboard or raw `curl`. (effort: medium)
 - [ ] **Per-row authorization model B: collaborator / role fields** — extend the `ownerField` system (FEATURE_MATRIX #20) from single-owner to a declared collaborator/role list, so multi-user apps can share rows without a full predicate DSL. (effort: large)
 
