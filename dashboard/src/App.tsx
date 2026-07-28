@@ -11,6 +11,7 @@ import { ConfigPage } from "./pages/ConfigPage";
 import { DataBrowserPage } from "./pages/DataBrowserPage";
 import { MetricsPage } from "./pages/MetricsPage";
 import { OpsPage } from "./pages/OpsPage";
+import { QueryConsolePage } from "./pages/QueryConsolePage";
 import { NotFound } from "./routes";
 import { AppShell } from "./shell/AppShell";
 
@@ -42,6 +43,7 @@ function Root() {
             <Route path="dbs/:db/tables/:table" element={<DataBrowserPage />} />
             <Route path="metrics" element={<MetricsPage />} />
             <Route path="ops" element={<OpsPage />} />
+            <Route path="console" element={<QueryConsolePage />} />
             <Route path="config" element={<ConfigPage />} />
             <Route path="admins" element={<AdminsPage />} />
             <Route path="*" element={<NotFound />} />
