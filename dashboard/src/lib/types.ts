@@ -103,6 +103,33 @@ export interface AdminMutateResult {
   results: unknown[];
 }
 
+// Schema preview diff — mirrors server/src/schema_diff.rs (camelCase wire).
+// `previewSchema` returns this; `added` lists new tables/columns/indexes the
+// additive-only push will create, `rejected` lists drops and type changes the
+// DDL layer will refuse.
+export interface ColumnAdd {
+  name: string;
+  fieldType: string;
+}
+export interface IndexAdd {
+  name: string;
+  fields: string[];
+}
+export interface TableAdd {
+  table: string;
+  columns: ColumnAdd[];
+  indexes: IndexAdd[];
+}
+export interface Rejection {
+  table: string;
+  item: string;
+  reason: string;
+}
+export interface SchemaDiff {
+  added: TableAdd[];
+  rejected: Rejection[];
+}
+
 // Scheduled jobs — mirrors server/src/protocol.rs (ScheduleInfo, ScheduleWhen,
 // ScheduleKind, ScheduleStatus). Field names are camelCase on the wire.
 export type ScheduleKind = "oneshot" | "cron";

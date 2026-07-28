@@ -20,6 +20,7 @@ import type {
   MetricsSnapshot,
   OpEvent,
   RtDbErrorEnvelope,
+  SchemaDiff,
   ScheduleInfo,
   ScheduleWhen,
   TokenRow,
@@ -85,6 +86,22 @@ export class AdminClient {
   }
   getSchema(db: string) {
     return this.req<SchemaJson>(`/admin/dbs/${enc(db)}/schema`);
+  }
+  /** Push a schema (additive-only; the server rejects drops/type-changes). */
+  pushSchema(db: string, schema: SchemaJson) {
+    return this.req<{ ok: boolean }>("/admin/push-schema", {
+      method: "POST",
+      body: JSON.stringify({ db, schema }),
+    });
+  }
+  /** Preview an additive-only schema diff against the currently-applied schema.
+   *  Pure/advisory — does NOT apply. Returns what the push would ADD and what
+   *  it would REJECT (drops, type changes). */
+  previewSchema(db: string, schema: SchemaJson): Promise<SchemaDiff> {
+    return this.req<SchemaDiff>(`/admin/db/${enc(db)}/schema/preview`, {
+      method: "POST",
+      body: JSON.stringify({ schema }),
+    });
   }
   getStats(db: string) {
     return this.req<DbStats>(`/admin/dbs/${enc(db)}/stats`);

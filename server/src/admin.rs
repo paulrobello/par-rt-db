@@ -491,6 +491,33 @@ async fn get_schema(
 }
 
 #[derive(Deserialize)]
+struct PreviewSchemaRequest {
+    schema: SchemaDef,
+}
+
+/// `POST /admin/db/{db}/schema/preview` — advisory diff of a pending schema
+/// against the database's currently-applied one. Validates the pending schema
+/// (invalid → 400) and reports what an additive-only push would ADD and what it
+/// would have to drop or change (and therefore would reject). Does NOT apply,
+/// does NOT touch `state.schemas` — `ddl::push_schema` remains the
+/// authoritative gate.
+async fn preview_schema(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(db): Path<String>,
+    ApiJson(body): ApiJson<PreviewSchemaRequest>,
+) -> Result<Json<crate::schema_diff::SchemaDiff>, RtDbError> {
+    require_admin(&state, &headers).await?;
+    if !db::database_exists(&state.pool, &db).await? {
+        return Err(RtDbError::not_found("unknown database"));
+    }
+    body.schema.validate()?;
+    let current = db::load_schema(&state.pool, &db).await?;
+    let diff = crate::schema_diff::diff(current.as_ref(), &body.schema);
+    Ok(Json(diff))
+}
+
+#[derive(Deserialize)]
 struct AdminQueryRequest {
     query: Query,
 }
@@ -1353,6 +1380,7 @@ pub fn admin_routes() -> Router<Arc<AppState>> {
             get(list_admins).post(add_admin).delete(remove_admin),
         )
         .route("/admin/dbs/{db}/schema", get(get_schema))
+        .route("/admin/db/{db}/schema/preview", post(preview_schema))
         .route("/admin/dbs/{db}/stats", get(db_stats))
         .route("/admin/db/{db}/query", post(admin_query))
         .route("/admin/db/{db}/mutate", post(admin_mutate))

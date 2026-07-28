@@ -1117,3 +1117,199 @@ async fn admin_list_backups_rejects_non_admin_bearer() -> anyhow::Result<()> {
     assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
     Ok(())
 }
+
+// --- Schema preview --------------------------------------------------------
+//
+// `/admin/db/{db}/schema/preview` is an advisory diff: it reports what an
+// additive-only push would ADD and what it would have to drop or change. It
+// does not apply, does not mutate `state.schemas`, and is admin-gated. These
+// cover the four operator-visible cases: fresh db, additive push, drop, and
+// type change — plus the admin gate and the 404 for an unknown database.
+
+async fn preview_schema(
+    addr: SocketAddr,
+    db: &str,
+    schema: serde_json::Value,
+) -> reqwest::Response {
+    admin_post(
+        addr,
+        &format!("/admin/db/{db}/schema/preview"),
+        serde_json::json!({"schema": schema}),
+    )
+    .await
+}
+
+// On a database with no schema pushed, every table/column/index in the pending
+// schema appears under `added`; `rejected` is empty.
+#[tokio::test]
+async fn schema_preview_on_fresh_db_lists_everything_added() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let name = fresh_name();
+    admin_post(addr, "/admin/create-db", serde_json::json!({"name": name})).await;
+
+    let resp = preview_schema(addr, &name, kanban_schema_json()).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(body["rejected"], serde_json::json!([]));
+    let added = body["added"].as_array().expect("added array");
+    let tables: Vec<&str> = added.iter().map(|t| t["table"].as_str().unwrap()).collect();
+    assert!(tables.contains(&"projects"), "projects should be added");
+    assert!(tables.contains(&"workItems"), "workItems should be added");
+
+    Ok(())
+}
+
+// Adding a column + index to an existing table: both appear under `added`, and
+// `rejected` stays empty.
+#[tokio::test]
+async fn schema_preview_adding_column_and_index_lists_them() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let name = fresh_db(&state).await;
+
+    let mut pending = kanban_schema_json();
+    pending["tables"]["projects"]["fields"]["archived"] =
+        serde_json::json!({"type":"optional","inner":{"type":"boolean"}});
+    pending["tables"]["projects"]["indexes"]
+        .as_array_mut()
+        .expect("indexes array")
+        .push(serde_json::json!({"name":"by_archived","fields":["archived"]}));
+
+    let resp = preview_schema(addr, &name, pending).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(body["rejected"], serde_json::json!([]));
+    let projects = body["added"]
+        .as_array()
+        .expect("added array")
+        .iter()
+        .find(|t| t["table"] == "projects")
+        .expect("projects in added");
+    assert_eq!(
+        projects["columns"][0]["name"],
+        serde_json::json!("archived")
+    );
+    assert_eq!(
+        projects["indexes"][0]["name"],
+        serde_json::json!("by_archived")
+    );
+
+    Ok(())
+}
+
+// Dropping a column is rejected: the column appears under `rejected` with a
+// reason mentioning "cannot be dropped".
+#[tokio::test]
+async fn schema_preview_dropping_a_column_is_rejected() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let name = fresh_db(&state).await;
+
+    let mut pending = kanban_schema_json();
+    pending["tables"]["workItems"]["fields"]
+        .as_object_mut()
+        .expect("fields object")
+        .remove("title");
+
+    let resp = preview_schema(addr, &name, pending).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(body["added"], serde_json::json!([]));
+    let rejected = body["rejected"].as_array().expect("rejected array");
+    assert_eq!(rejected.len(), 1);
+    assert_eq!(rejected[0]["table"], serde_json::json!("workItems"));
+    assert_eq!(rejected[0]["item"], serde_json::json!("title"));
+    assert!(
+        rejected[0]["reason"]
+            .as_str()
+            .expect("reason string")
+            .contains("cannot be dropped"),
+        "reason should mention the drop: {}",
+        rejected[0]["reason"]
+    );
+
+    Ok(())
+}
+
+// Changing a column's type is rejected: both old and new types appear in the
+// reason so the operator can see exactly what differs.
+#[tokio::test]
+async fn schema_preview_changing_column_type_is_rejected() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let name = fresh_db(&state).await;
+
+    let mut pending = kanban_schema_json();
+    pending["tables"]["workItems"]["fields"]["order"] = serde_json::json!({"type":"string"});
+
+    let resp = preview_schema(addr, &name, pending).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await?;
+    let rejected = body["rejected"].as_array().expect("rejected array");
+    assert_eq!(rejected.len(), 1);
+    assert_eq!(rejected[0]["item"], serde_json::json!("order"));
+    let reason = rejected[0]["reason"].as_str().expect("reason string");
+    assert!(reason.contains("cannot be changed"), "reason: {reason}");
+    assert!(reason.contains("number"), "reason names old type: {reason}");
+    assert!(reason.contains("string"), "reason names new type: {reason}");
+
+    Ok(())
+}
+
+// Preview is admin-gated: a non-admin bearer is rejected with 401, matching
+// every other /admin/* route.
+#[tokio::test]
+async fn schema_preview_rejects_non_admin_bearer() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state).await;
+    let name = fresh_name();
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/admin/db/{name}/schema/preview"))
+        .header("Authorization", "Bearer not-the-admin-key")
+        .json(&serde_json::json!({"schema": kanban_schema_json()}))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+    Ok(())
+}
+
+// Preview of an unknown database 404s (mirrors /admin/db/{db}/query and
+// friends), rather than 500ing on a missing schema.
+#[tokio::test]
+async fn schema_preview_unknown_db_is_404() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state).await;
+
+    let resp = preview_schema(addr, &fresh_name(), kanban_schema_json()).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(body["code"], "NOT_FOUND");
+    Ok(())
+}
+
+// Preview does NOT apply: after previewing an additive schema, GET schema
+// returns the unchanged (pre-preview) schema.
+#[tokio::test]
+async fn schema_preview_does_not_apply() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let name = fresh_db(&state).await;
+
+    let mut pending = kanban_schema_json();
+    pending["tables"]["projects"]["fields"]["archived"] =
+        serde_json::json!({"type":"optional","inner":{"type":"boolean"}});
+
+    let resp = preview_schema(addr, &name, pending).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    // The applied schema is unchanged — `archived` was NOT added.
+    let applied = state.schemas.get(&state.pool, &name).await?;
+    assert!(
+        !applied.tables["projects"].fields.contains_key("archived"),
+        "preview must not mutate the applied schema"
+    );
+
+    Ok(())
+}

@@ -19,6 +19,7 @@ pub mod query;
 pub mod rate_limit;
 pub mod scheduler;
 pub mod schema;
+pub mod schema_diff;
 pub mod snapshot;
 pub mod storage;
 pub mod subs;
