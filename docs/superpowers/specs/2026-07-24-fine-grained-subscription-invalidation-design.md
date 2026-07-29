@@ -175,7 +175,9 @@ than requiring a rewrite.
 
 # v2 (eq-prefix + range) — 2026-07-28
 
-- **Status:** Implementing.
+- **Status:** Shipped (2026-07-28). 15 integration tests + 17 unit tests green;
+  full server suite green; fmt + clippy `-D warnings` clean. Ordered top-N
+  boundary tracking remains deferred (future "C").
 - **Scope:** Server-only, no protocol/wire change (same as v1). Extends v1's
   `WriteSet` / `ReadSet` plumbing additively — `Point` is unchanged.
 
