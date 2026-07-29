@@ -536,6 +536,19 @@ impl InMemoryRtDbClient {
         } else {
             None
         };
+        // The range field's storage type selects the comparison domain for the
+        // bound checks below (int64 sorts numerically). `coerce_index_value`
+        // already validated indexability when binding each bound, so the lookup
+        // is guaranteed to succeed; the `Text` fallback is purely defensive.
+        let range_field_pg: PgType = match range_field {
+            Some(f) => table_def
+                .fields
+                .get(f)
+                .and_then(|ty| index_column_type(ty).ok())
+                .map(|it| it.pg)
+                .unwrap_or(PgType::Text),
+            None => PgType::Text,
+        };
         let gt = match (&q.gt, range_field) {
             (Some(v), Some(f)) => Some(coerce_index_value(&table_def, f, v)?),
             _ => None,
@@ -589,22 +602,22 @@ impl InMemoryRtDbClient {
                     _ => continue,
                 };
                 if let Some(bound) = &gt
-                    && compare_index_values(v, bound) != std::cmp::Ordering::Greater
+                    && compare_index_values(v, bound, range_field_pg) != std::cmp::Ordering::Greater
                 {
                     continue;
                 }
                 if let Some(bound) = &gte
-                    && compare_index_values(v, bound) == std::cmp::Ordering::Less
+                    && compare_index_values(v, bound, range_field_pg) == std::cmp::Ordering::Less
                 {
                     continue;
                 }
                 if let Some(bound) = &lt
-                    && compare_index_values(v, bound) != std::cmp::Ordering::Less
+                    && compare_index_values(v, bound, range_field_pg) != std::cmp::Ordering::Less
                 {
                     continue;
                 }
                 if let Some(bound) = &lte
-                    && compare_index_values(v, bound) == std::cmp::Ordering::Greater
+                    && compare_index_values(v, bound, range_field_pg) == std::cmp::Ordering::Greater
                 {
                     continue;
                 }
@@ -629,12 +642,32 @@ impl InMemoryRtDbClient {
         // `_creationTime`, then `_id`. The unique `id` tiebreaker means the
         // order is total — no row is ambiguous relative to another.
         let dir = q.order.unwrap_or(Order::Asc);
+        // Per-sort-column storage types — the comparator needs the domain to
+        // pick numeric vs lexicographic ordering (int64 indexes store decimal
+        // strings, which would otherwise sort lexicographically). The eq prefix
+        // and range field have already been validated as indexable by
+        // `coerce_index_value`; any remaining index field is schema-declared
+        // indexable, so the lookup is total — the `Text` fallback is defensive.
+        let sort_field_pgs: Vec<PgType> = match &index_def {
+            Some(idx) => idx.fields[typed_eq.len()..]
+                .iter()
+                .map(|f| {
+                    table_def
+                        .fields
+                        .get(f)
+                        .and_then(|ty| index_column_type(ty).ok())
+                        .map(|it| it.pg)
+                        .unwrap_or(PgType::Text)
+                })
+                .collect(),
+            None => Vec::new(),
+        };
         filtered.sort_by(|a, b| {
             if let Some(idx) = &index_def {
-                for field in &idx.fields[typed_eq.len()..] {
+                for (i, field) in idx.fields[typed_eq.len()..].iter().enumerate() {
                     let av = a.doc.get(field).unwrap_or(&Value::Null);
                     let bv = b.doc.get(field).unwrap_or(&Value::Null);
-                    let cmp = compare_index_values(av, bv);
+                    let cmp = compare_index_values(av, bv, sort_field_pgs[i]);
                     if cmp != std::cmp::Ordering::Equal {
                         return dir_order(cmp, dir);
                     }
@@ -661,7 +694,22 @@ impl InMemoryRtDbClient {
             }
             sort_cols.push(SortCol::CreatedAt);
             sort_cols.push(SortCol::Id);
-            return paginate_result(pag, &table_def, &filtered, &sort_cols, dir);
+            // Mirror the sort caller's per-column storage types so keyset
+            // resume agrees with the ordering that produced `filtered`.
+            let col_types: Vec<PgType> = sort_cols
+                .iter()
+                .map(|c| match c {
+                    SortCol::Index(field) => table_def
+                        .fields
+                        .get(field)
+                        .and_then(|ty| index_column_type(ty).ok())
+                        .map(|it| it.pg)
+                        .unwrap_or(PgType::Text),
+                    SortCol::CreatedAt => PgType::Number,
+                    SortCol::Id => PgType::Text,
+                })
+                .collect();
+            return paginate_result(pag, &table_def, &filtered, &sort_cols, &col_types, dir);
         }
 
         if q.unique {
@@ -1694,6 +1742,7 @@ pub enum PgType {
     Text,
     Number,
     Boolean,
+    Int64,
 }
 
 /// Shape returned by [`index_column_type`]: the storage type plus whether the
@@ -1712,6 +1761,7 @@ pub fn index_column_type(ty: &FieldType) -> Result<IndexedType, RtDbError> {
         FieldType::String | FieldType::Id { .. } => PgType::Text,
         FieldType::Number => PgType::Number,
         FieldType::Boolean => PgType::Boolean,
+        FieldType::Int64 => PgType::Int64,
         FieldType::Literal {
             value: Value::String(_),
         } => PgType::Text,
@@ -1798,6 +1848,20 @@ pub fn coerce_index_value(
                 ));
             }
         }
+        PgType::Int64 => {
+            // Int64 fields are stored as decimal strings; eq stays structural
+            // equality on the string, so the value is returned unchanged. We
+            // only validate that it parses as `i64` (mirrors `is_int64_string`).
+            match value.as_str().and_then(|s| s.parse::<i64>().ok()) {
+                Some(_) => {}
+                None => {
+                    return Err(RtDbError::new(
+                        ErrorCode::BadRequest,
+                        "eq value must be an int64 string",
+                    ));
+                }
+            }
+        }
     }
     Ok(value.clone())
 }
@@ -1808,7 +1872,12 @@ pub fn coerce_index_value(
 /// (desc, via the caller flipping the result). Mixed types fall back to
 /// [`Ordering::Equal`] — indexed columns are single-type by schema, so this is
 /// unreachable in practice.
-pub fn compare_index_values(a: &Value, b: &Value) -> std::cmp::Ordering {
+///
+/// `pg` selects the comparison domain. `PgType::Int64` parses the decimal
+/// string to `i64` so int64 index values sort/range numerically (3 < 20 < 100)
+/// rather than lexicographically (100 < 20 < 3); the on-the-wire representation
+/// stays a string, so eq remains structural equality on the `Value`.
+pub fn compare_index_values(a: &Value, b: &Value, pg: PgType) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     let a_null = a.is_null();
     let b_null = b.is_null();
@@ -1820,6 +1889,17 @@ pub fn compare_index_values(a: &Value, b: &Value) -> std::cmp::Ordering {
     }
     if b_null {
         return Ordering::Less;
+    }
+    if pg == PgType::Int64 {
+        let an = a
+            .as_str()
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(i64::MIN);
+        let bn = b
+            .as_str()
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(i64::MIN);
+        return an.cmp(&bn);
     }
     match (a, b) {
         (Value::Number(an), Value::Number(bn)) => {
@@ -1899,6 +1979,7 @@ fn paginate_result(
     table_def: &TableDef,
     sorted: &[StoredRow],
     sort_cols: &[SortCol],
+    col_types: &[PgType],
     dir: Order,
 ) -> Result<Value, RtDbError> {
     let num_items = std::cmp::min(paginate.num_items as usize, MAX_TAKE);
@@ -1934,7 +2015,7 @@ fn paginate_result(
     let rows: Vec<&StoredRow> = match &cursor_values {
         Some(cv) => sorted
             .iter()
-            .filter(|row| is_after_cursor(row, cv, sort_cols, dir))
+            .filter(|row| is_after_cursor(row, cv, sort_cols, col_types, dir))
             .collect(),
         None => sorted.iter().collect(),
     };
@@ -2007,17 +2088,23 @@ fn validate_cursor_values(
 /// where OP is `>` (asc) / `<` (desc). Evaluated with the same null-sorts-last
 /// comparator as the sort, so it agrees with the ordering that produced
 /// `sorted`. Ports `isAfterCursor` (`ts-client/src/in_memory.ts:1253-1276`).
+///
+/// `col_types` is the per-column storage type parallel to `sort_cols`, used to
+/// select the comparison domain (int64 needs numeric parsing).
 fn is_after_cursor(
     row: &StoredRow,
     cursor_values: &[Value],
     sort_cols: &[SortCol],
+    col_types: &[PgType],
     dir: Order,
 ) -> bool {
     for i in 0..sort_cols.len() {
         let mut prefix_equal = true;
         for j in 0..i {
             let row_v = sort_value(row, &sort_cols[j]);
-            if compare_index_values(&row_v, &cursor_values[j]) != std::cmp::Ordering::Equal {
+            if compare_index_values(&row_v, &cursor_values[j], col_types[j])
+                != std::cmp::Ordering::Equal
+            {
                 prefix_equal = false;
                 break;
             }
@@ -2026,7 +2113,7 @@ fn is_after_cursor(
             continue;
         }
         let row_v = sort_value(row, &sort_cols[i]);
-        let cmp = compare_index_values(&row_v, &cursor_values[i]);
+        let cmp = compare_index_values(&row_v, &cursor_values[i], col_types[i]);
         let ahead = match dir {
             Order::Asc => cmp == std::cmp::Ordering::Greater,
             Order::Desc => cmp == std::cmp::Ordering::Less,
@@ -2932,6 +3019,10 @@ mod tests {
             PgType::Boolean
         );
         assert_eq!(
+            index_column_type(&FieldType::Int64).unwrap().pg,
+            PgType::Int64
+        );
+        assert_eq!(
             index_column_type(&FieldType::id("t")).unwrap().pg,
             PgType::Text
         );
@@ -2980,29 +3071,49 @@ mod tests {
     fn compare_index_values_orders_nulls_last_and_compares_each_domain() {
         use std::cmp::Ordering;
         // Numbers:
-        assert_eq!(compare_index_values(&json!(1), &json!(2)), Ordering::Less);
-        assert_eq!(compare_index_values(&json!(2), &json!(2)), Ordering::Equal);
+        assert_eq!(
+            compare_index_values(&json!(1), &json!(2), PgType::Number),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_index_values(&json!(2), &json!(2), PgType::Number),
+            Ordering::Equal
+        );
         // Strings (lexicographic):
         assert_eq!(
-            compare_index_values(&json!("a"), &json!("b")),
+            compare_index_values(&json!("a"), &json!("b"), PgType::Text),
             Ordering::Less
         );
         // Booleans (false < true):
         assert_eq!(
-            compare_index_values(&json!(false), &json!(true)),
+            compare_index_values(&json!(false), &json!(true), PgType::Boolean),
             Ordering::Less
         );
-        // Nulls sort last under asc — `null > anything`.
+        // Int64 decimal strings compare numerically, not lexicographically:
         assert_eq!(
-            compare_index_values(&json!(null), &json!(1)),
+            compare_index_values(&json!("3"), &json!("20"), PgType::Int64),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_index_values(&json!("100"), &json!("20"), PgType::Int64),
             Ordering::Greater
         );
         assert_eq!(
-            compare_index_values(&json!(1), &json!(null)),
+            compare_index_values(&json!("-1"), &json!("0"), PgType::Int64),
+            Ordering::Less
+        );
+        // Nulls sort last under asc — `null > anything`. The `pg` domain is
+        // irrelevant once either side is null.
+        assert_eq!(
+            compare_index_values(&json!(null), &json!(1), PgType::Number),
+            Ordering::Greater
+        );
+        assert_eq!(
+            compare_index_values(&json!(1), &json!(null), PgType::Number),
             Ordering::Less
         );
         assert_eq!(
-            compare_index_values(&json!(null), &json!(null)),
+            compare_index_values(&json!(null), &json!(null), PgType::Number),
             Ordering::Equal
         );
     }
@@ -3238,6 +3349,98 @@ mod tests {
         assert_eq!(orders(collect_range(None, Some(2), None, None)), vec![2, 3]);
         assert_eq!(orders(collect_range(None, None, Some(3), None)), vec![1, 2]);
         assert_eq!(orders(collect_range(None, None, None, Some(2))), vec![1, 2]);
+    }
+
+    // ---- query: int64 index (numeric ordering + range) ----------------
+
+    /// Schema for int64-indexable coverage: a single `by_ts` index over an
+    /// `Int64` field, plus a string payload to identify rows in assertions.
+    fn int64_test_schema() -> SchemaDef {
+        Schema::builder()
+            .table(
+                "events",
+                Table::new()
+                    .field("ts", FieldType::Int64)
+                    .field("kind", FieldType::String)
+                    .index("by_ts", &["ts"]),
+            )
+            .build()
+    }
+
+    /// Client seeded with [`int64_test_schema`] and a deterministic incrementing
+    /// clock so each insert gets a distinct `_id` (the default constant-RNG id
+    /// collides within a single millisecond, which would make successive inserts
+    /// overwrite each other).
+    fn int64_client() -> InMemoryRtDbClient {
+        let counter = Arc::new(Mutex::new(1_700_000_000_000_i64));
+        let mut client = InMemoryRtDbClient::new(
+            InMemoryRtDbClientOptions::default()
+                .now(move || {
+                    let mut g = counter.lock().expect("counter not poisoned");
+                    let v = *g;
+                    *g += 1;
+                    v
+                })
+                .random(|| 0.0),
+        );
+        client.push_schema(&int64_test_schema());
+        client
+    }
+
+    #[tokio::test]
+    async fn int64_index_orders_and_ranges_numerically() {
+        // Int64 indexes store decimal strings, but the index order has to be
+        // numeric (3 < 20 < 100), not lexicographic (100 < 20 < 3). Seeds the
+        // rows out of numeric order to catch a lexicographic regression on
+        // both the sort path and the range-bound path.
+        let mut c = int64_client();
+        for (ts, kind) in [("100", "a"), ("20", "b"), ("3", "c")] {
+            c.mutate(
+                &Mutation::new()
+                    .insert("events", json!({ "ts": ts, "kind": kind }))
+                    .build(),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+
+        let kinds = |docs: Vec<Value>| -> Vec<String> {
+            docs.iter()
+                .map(|d| d["kind"].as_str().unwrap_or_default().to_string())
+                .collect()
+        };
+
+        // Ascending numeric sort over the by_ts index → 3, 20, 100.
+        let asc = c
+            .run::<Vec<Value>>(
+                &TableQuery::new("events")
+                    .with_index("by_ts", &[])
+                    .order(Order::Asc)
+                    .collect(),
+            )
+            .expect("asc ok");
+        assert_eq!(
+            kinds(asc),
+            vec!["c".to_string(), "b".to_string(), "a".to_string()],
+            "int64 index should sort numerically (3, 20, 100)"
+        );
+
+        // Range on the int64 field: gte=20 keeps {20, 100}, asc → [b, a].
+        let ranged = c
+            .run::<Vec<Value>>(
+                &TableQuery::new("events")
+                    .with_index("by_ts", &[])
+                    .gte(json!("20"))
+                    .order(Order::Asc)
+                    .collect(),
+            )
+            .expect("range ok");
+        assert_eq!(
+            kinds(ranged),
+            vec!["b".to_string(), "a".to_string()],
+            "int64 range bound should compare numerically (gte=20 keeps 20, 100)"
+        );
     }
 
     // ---- query: terminals -------------------------------------------
