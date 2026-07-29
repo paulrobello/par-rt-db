@@ -9,8 +9,19 @@ mutations, and schedule ops. Mirrors ``ts-client/src/client.ts`` and
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
-from typing import Any
+import random as _random
+import time
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+from enum import StrEnum
+from typing import Any, Protocol
+
+from pydantic import TypeAdapter
+
+from .wire import AuthedUser, ServerMessage
 
 
 def _sync_url(url: str) -> str:
@@ -32,3 +43,363 @@ def _backoff_delay(attempt: int, base: float, max_delay: float, rand: float) -> 
     """Jittered exponential backoff: ``min(max, base * 2**attempt) * (0.5 + rand*0.5)``."""
     raw = min(max_delay, base * (2**attempt))
     return raw * (0.5 + rand * 0.5)
+
+
+# --- Connection core: driver, handshake, reconnect, heartbeat -----------------
+
+_SERVER = TypeAdapter(ServerMessage)
+
+_AUTH_FAILED_CODE = 4401
+_AUTH_DEADLINE = 15.0
+
+
+class ConnectionState(StrEnum):
+    IDLE = "idle"
+    CONNECTING = "connecting"
+    CONNECTED = "connected"
+    RECONNECTING = "reconnecting"
+    CLOSED = "closed"
+
+
+@dataclass
+class ClientStatus:
+    state: ConnectionState
+    user: AuthedUser | None = None
+
+
+class Connection(Protocol):
+    """The socket surface the driver depends on. ``FakeConn`` in tests; ``_RealConn`` in prod."""
+
+    async def send(self, data: str) -> None: ...
+    async def recv(self) -> str: ...
+    async def close(self, code: int = 1000, reason: str = "") -> None: ...
+
+
+class _PeerClosed(Exception):
+    """Translated socket-close: carries the peer's close code."""
+
+    def __init__(self, code: int, reason: str) -> None:
+        super().__init__(f"peer closed: {code} {reason}")
+        self.code = code
+        self.reason = reason
+
+
+class RtDbClient:
+    """Reactive par-rt-db client.
+
+    One background task (``_drive``) owns the socket: it opens the connection,
+    handshakes, and runs a read loop + heartbeat per epoch. Reconnectable closes
+    back off and reopen; an auth-failure close (4401) is terminal. ``close()``
+    cancels the driver and sets state ``CLOSED``.
+    """
+
+    def __init__(
+        self,
+        url: str,
+        db: str,
+        get_token: Callable[[], Awaitable[str | None]],
+        *,
+        heartbeat: float = 20.0,
+        backoff_base: float = 0.5,
+        backoff_max: float = 15.0,
+        connect: Callable[[str], Awaitable[Connection]] | None = None,
+        now: Callable[[], float] = time.monotonic,
+        random: Callable[[], float] = _random.random,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    ) -> None:
+        self._url = _sync_url(url)
+        self._db = db
+        self._get_token = get_token
+        self._heartbeat = heartbeat
+        self._backoff_base = backoff_base
+        self._backoff_max = backoff_max
+        self._connect = connect or _default_connect
+        self._now = now
+        self._random = random
+        self._sleep = sleep
+
+        self._state = ConnectionState.IDLE
+        self._user: AuthedUser | None = None
+        self._generation = 0  # bumped on every (re)open and on close()
+        self._closed = False
+        self._attempt = 0
+        self._task: asyncio.Task[None] | None = None
+        self._send_lock = asyncio.Lock()
+        self._ws: Connection | None = None
+        self._last_pong = 0.0
+        # Populated by Tasks 3-4 (subscriptions, mutations, schedules):
+        self._subs_by_key: dict[str, Any] = {}
+        self._subs_by_id: dict[str, Any] = {}
+        self._counter = 0
+        self._pending_mut: dict[str, Any] = {}
+        self._pending_sched: dict[str, Any] = {}
+
+    def status(self) -> ClientStatus:
+        return ClientStatus(self._state, self._user)
+
+    async def connect(self) -> None:
+        """Start (or resume) the driver. Idempotent."""
+        if self._task is None:
+            self._closed = False
+            self._task = asyncio.create_task(self._drive())
+
+    async def close(self) -> None:
+        self._closed = True
+        self._generation += 1
+        self._ws = None
+        if self._task is not None:
+            self._task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._task
+            self._task = None
+        self._set_state(ConnectionState.CLOSED)
+        self._reject_all_pending("client closed")
+
+    # --- driver ---------------------------------------------------------
+
+    async def _drive(self) -> None:
+        while not self._closed:
+            token = await self._get_token()
+            if self._closed:
+                return
+            if token is None:
+                self._set_state(ConnectionState.IDLE)
+                await self._sleep(0)  # yield; caller reconnects via connect()
+                continue
+            gen = self._generation
+            await self._epoch(token, gen)
+
+    async def _epoch(self, token: str, gen: int) -> None:
+        self._set_state(ConnectionState.CONNECTING)
+        try:
+            ws = await self._connect(self._url)
+        except Exception:
+            await self._schedule_reconnect(gen)
+            return
+        if gen != self._generation or self._closed:
+            await _safe_close(ws)
+            return
+        try:
+            await self._send_raw(ws, _auth_frame(token, self._db))
+            outcome = await self._await_auth(ws, gen)
+            if outcome != "authOk":
+                await _safe_close(ws)
+                if outcome == "terminal":
+                    self._set_state(ConnectionState.IDLE)
+                    self._reject_all_pending("authentication failed")
+                    self._closed = True  # terminal: stop the loop
+                return
+            self._ws = ws
+            self._set_state(ConnectionState.CONNECTED)
+            self._attempt = 0
+            self._last_pong = self._now()
+            await self._flush_on_auth()
+            await self._run_session(ws, gen)
+        except _PeerClosed as e:
+            await self._on_peer_closed(e.code, gen)
+        except Exception:
+            await self._schedule_reconnect(gen)
+
+    async def _await_auth(self, ws: Connection, gen: int) -> str:
+        deadline = self._now() + _AUTH_DEADLINE
+        while True:
+            remaining = deadline - self._now()
+            if remaining <= 0:
+                return "reconnect"
+            try:
+                raw = await ws.recv()
+            except _PeerClosed as e:
+                return "terminal" if e.code == _AUTH_FAILED_CODE else "reconnect"
+            msg = _SERVER.validate_json(raw)
+            tag = _tag(msg)
+            if tag == "authOk":
+                self._user = msg.user
+                return "authOk"
+            if tag == "authErr":
+                return "terminal"
+            # Tolerate non-auth frames during the handshake window (e.g. pong).
+            self._dispatch(msg)
+
+    async def _run_session(self, ws: Connection, gen: int) -> None:
+        self._last_pong = self._now()
+        reader = asyncio.create_task(self._read_loop(ws, gen))
+        heartbeat = asyncio.create_task(self._heartbeat_loop(ws, gen))
+        code = 1000
+        try:
+            done, pending = await asyncio.wait(
+                {reader, heartbeat}, return_when=asyncio.FIRST_COMPLETED
+            )
+            for t in pending:
+                t.cancel()
+            for t in done:
+                code = t.result() if not t.cancelled() else code
+        finally:
+            # Guarantee no leaked subtasks on any exit, including close() cancellation.
+            for t in (reader, heartbeat):
+                if not t.done():
+                    t.cancel()
+            for t in (reader, heartbeat):
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await t
+            await _safe_close(ws)
+            self._ws = None
+        await self._on_peer_closed(code, gen)
+
+    async def _read_loop(self, ws: Connection, gen: int) -> int:
+        try:
+            while gen == self._generation and not self._closed:
+                raw = await ws.recv()
+                self._dispatch(_SERVER.validate_json(raw))
+        except _PeerClosed as e:
+            return e.code
+        return 1000
+
+    async def _heartbeat_loop(self, ws: Connection, gen: int) -> int:
+        if self._heartbeat <= 0:
+            return await asyncio.Future()  # sleeps forever (cancelled)
+        while gen == self._generation and not self._closed:
+            await self._sleep(self._heartbeat)
+            if self._now() - self._last_pong >= self._heartbeat * 2:
+                await _safe_close(ws, 4000)
+                return 4000
+            await self._send(_ping_frame())
+        return 1000
+
+    async def _schedule_reconnect(self, gen: int) -> None:
+        if self._closed or gen != self._generation:
+            return
+        self._set_state(ConnectionState.RECONNECTING)
+        delay = _backoff_delay(self._attempt, self._backoff_base, self._backoff_max, self._random())
+        self._attempt += 1
+        await self._sleep(delay)
+        # the outer _drive loop re-enters _epoch on the next iteration
+
+    async def _on_peer_closed(self, code: int, gen: int) -> None:
+        self._ws = None
+        self._reject_inflight("connection closed before acknowledgment")
+        if code == _AUTH_FAILED_CODE:
+            self._set_state(ConnectionState.IDLE)
+            self._closed = True  # terminal
+        else:
+            await self._schedule_reconnect(gen)
+
+    # --- sends ----------------------------------------------------------
+
+    async def _send(self, frame: str) -> None:
+        ws = self._ws
+        if ws is None:
+            return
+        await self._send_raw(ws, frame)
+
+    async def _send_raw(self, ws: Connection, frame: str) -> None:
+        async with self._send_lock:
+            with contextlib.suppress(_PeerClosed):
+                await ws.send(frame)  # the read loop drives reconnection
+
+    async def _flush_on_auth(self) -> None:
+        # Re-establish every active query, then flush queued mutations/schedules.
+        # Maps are empty in Task 2; the loops simply don't execute.
+        for sub in list(self._subs_by_id.values()):
+            await self._send(sub.frame)
+            sub.subscribed = True
+        for mp in list(self._pending_mut.values()):
+            if not mp.sent:
+                await self._send(mp.frame)
+                mp.sent = True
+        for sp in list(self._pending_sched.values()):
+            if not sp.sent:
+                await self._send(sp.frame)
+                sp.sent = True
+
+    # --- dispatch (forward-compatible; Tasks 3-4 fill the maps) --------
+
+    def _dispatch(self, msg: Any) -> None:
+        tag = _tag(msg)
+        if tag == "pong":
+            self._last_pong = self._now()
+        elif tag == "queryUpdate":
+            self._on_query_update(msg)
+        elif tag == "subscribeErr":
+            self._on_subscribe_err(msg)
+        elif tag == "mutateOk":
+            self._on_mutate_ok(msg)
+        elif tag == "mutateErr":
+            self._on_mutate_err(msg)
+        elif tag in ("scheduleOk", "scheduleErr", "scheduleAck", "listSchedulesOk"):
+            self._on_sched(msg)
+        # authOk/authErr are handled in _await_auth; unknown tags ignored.
+
+    # Populated in Task 3:
+    def _on_query_update(self, msg: Any) -> None: ...
+    def _on_subscribe_err(self, msg: Any) -> None: ...
+    # Populated in Task 4:
+    def _on_mutate_ok(self, msg: Any) -> None: ...
+    def _on_mutate_err(self, msg: Any) -> None: ...
+    def _on_sched(self, msg: Any) -> None: ...
+    def _reject_all_pending(self, reason: str) -> None: ...
+    def _reject_inflight(self, reason: str) -> None: ...
+
+    def _set_state(self, state: ConnectionState) -> None:
+        self._state = state
+
+
+def _tag(msg: Any) -> str:
+    return getattr(msg, "type", "")
+
+
+async def _safe_close(ws: Connection, code: int = 1000) -> None:
+    with contextlib.suppress(Exception):
+        await ws.close(code, "")
+
+
+def _auth_frame(token: str, db: str) -> str:
+    from .wire import _ClientAuth
+
+    return _ClientAuth(token=token, db=db).model_dump_json(by_alias=True)
+
+
+def _ping_frame() -> str:
+    from .wire import _ClientPing
+
+    return _ClientPing().model_dump_json(by_alias=True)
+
+
+async def _default_connect(url: str) -> Connection:
+    try:
+        import websockets
+        from websockets.exceptions import ConnectionClosed
+    except ImportError as e:  # pragma: no cover
+        raise ImportError(
+            "websockets is required for RtDbClient: install with `pip install par-rt-db[ws]`"
+        ) from e
+    raw = await websockets.connect(url)
+    return _RealConn(raw, ConnectionClosed)
+
+
+class _RealConn:
+    """Adapts a ``websockets`` connection to the ``Connection`` protocol,
+    translating ``ConnectionClosed`` into ``_PeerClosed``."""
+
+    def __init__(self, raw: Any, closed_exc: type[BaseException]) -> None:
+        self._raw = raw
+        self._closed = closed_exc
+
+    async def send(self, data: str) -> None:
+        try:
+            await self._raw.send(data)
+        except self._closed as e:
+            raise _PeerClosed(_ws_close_code(e), "") from e
+
+    async def recv(self) -> str:
+        try:
+            return await self._raw.recv()
+        except self._closed as e:
+            raise _PeerClosed(_ws_close_code(e), "") from e
+
+    async def close(self, code: int = 1000, reason: str = "") -> None:
+        with contextlib.suppress(self._closed):
+            await self._raw.close(code, reason)
+
+
+def _ws_close_code(exc: BaseException) -> int:
+    return int(getattr(exc, "code", 1000) or 1000)
