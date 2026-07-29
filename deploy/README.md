@@ -91,7 +91,12 @@ metrics exist for it on `/metrics` and `GET /admin/metrics`:
 
 `RTDB_SUBS_VERIFY_SKIP_EVERY=N` (default 0 = off) shadow-verifies 1 skip in
 every N: the query runs anyway and its result is compared against the last
-pushed one. A divergence logs at ERROR, increments the counter, and pushes the
+pushed one. **Setting it in `.env` is not enough on its own** — compose's
+`environment:` block is an explicit allowlist, so a new `RTDB_*` key must also
+be forwarded there (this one is, as of 0609012). After changing it, recreate the
+container (`docker compose up -d server`) and confirm
+`rtdb_subs_skip_verifications_total` starts climbing; if it stays 0 while skips
+accumulate, the variable isn't reaching the process. A divergence logs at ERROR, increments the counter, and pushes the
 corrected result (so it repairs, not just reports). Each verification costs the
 Postgres round-trip the skip avoided — after changing invalidation logic, set
 N=20 for a few days and confirm the counter stays 0, then set it back to 0.
