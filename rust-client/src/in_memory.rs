@@ -1653,9 +1653,8 @@ pub fn validate_doc(table: &TableDef, doc: &Value) -> Result<(), RtDbError> {
 /// push) pass through — `push_schema` then folds the new schema into
 /// `self.tables` without touching stored docs.
 ///
-/// `FieldType` and `IndexDef` don't derive `PartialEq` (the rust-client schema
-/// module deliberately keeps its derives minimal), so structural equality is
-/// computed here via [`field_type_eq`]/[`index_def_eq`] rather than `!=`.
+/// `FieldType`/`IndexDef`/`VectorIndexSpec` derive `PartialEq` (mirroring the
+/// server), so structural equality is a direct `!=`.
 fn detect_destructive_changes(old: &SchemaDef, new: &SchemaDef) -> Result<(), RtDbError> {
     for (table_name, old_table) in &old.tables {
         let new_table = new.tables.get(table_name).ok_or_else(|| {
@@ -1672,7 +1671,7 @@ fn detect_destructive_changes(old: &SchemaDef, new: &SchemaDef) -> Result<(), Rt
                         format!("removed field '{table_name}.{field_name}'"),
                     ));
                 }
-                Some(new_field_type) if !field_type_eq(old_field_type, new_field_type) => {
+                Some(new_field_type) if old_field_type != new_field_type => {
                     return Err(RtDbError::new(
                         ErrorCode::BadRequest,
                         format!("changed type of field '{table_name}.{field_name}'"),
@@ -1711,7 +1710,7 @@ fn detect_destructive_changes(old: &SchemaDef, new: &SchemaDef) -> Result<(), Rt
                     ),
                 ));
             }
-            if !option_vector_eq(&new_index.vector, &old_index.vector) {
+            if new_index.vector != old_index.vector {
                 return Err(RtDbError::new(
                     ErrorCode::BadRequest,
                     format!("changed vector spec of index '{}'", old_index.name),
@@ -1720,54 +1719,6 @@ fn detect_destructive_changes(old: &SchemaDef, new: &SchemaDef) -> Result<(), Rt
         }
     }
     Ok(())
-}
-
-/// Structural equality for [`FieldType`] (recursive over `Box`/`Vec`/`BTreeMap`
-/// interiors). Used by [`detect_destructive_changes`] since `FieldType` does
-/// not derive `PartialEq`.
-fn field_type_eq(a: &FieldType, b: &FieldType) -> bool {
-    use FieldType::*;
-    match (a, b) {
-        (String, String)
-        | (Number, Number)
-        | (Boolean, Boolean)
-        | (Null, Null)
-        | (Int64, Int64)
-        | (Bytes, Bytes)
-        | (Any, Any) => true,
-        (Id { table: ta }, Id { table: tb }) => ta == tb,
-        (Literal { value: va }, Literal { value: vb }) => va == vb,
-        (Optional { inner: ia }, Optional { inner: ib }) => field_type_eq(ia, ib),
-        (Union { variants: va }, Union { variants: vb }) => {
-            va.len() == vb.len() && va.iter().zip(vb.iter()).all(|(x, y)| field_type_eq(x, y))
-        }
-        (Array { element: ea }, Array { element: eb }) => field_type_eq(ea, eb),
-        (Object { fields: fa }, Object { fields: fb }) => {
-            // Both BTreeMaps iterate in sorted-key order, so a length-equal
-            // zip pairs identical keys iff the key sets match.
-            fa.len() == fb.len()
-                && fa
-                    .iter()
-                    .zip(fb.iter())
-                    .all(|((ka, va), (kb, vb))| ka == kb && field_type_eq(va, vb))
-        }
-        (Record { value: va }, Record { value: vb }) => field_type_eq(va, vb),
-        (Vector { dimensions: da }, Vector { dimensions: db }) => da == db,
-        _ => false,
-    }
-}
-
-/// Structural equality for `Option<&VectorIndexSpec>` — `None == None` and
-/// `Some == Some` iff both `dimensions` and `filter_fields` match.
-fn option_vector_eq(
-    a: &Option<crate::schema::VectorIndexSpec>,
-    b: &Option<crate::schema::VectorIndexSpec>,
-) -> bool {
-    match (a, b) {
-        (None, None) => true,
-        (Some(a), Some(b)) => a.dimensions == b.dimensions && a.filter_fields == b.filter_fields,
-        _ => false,
-    }
 }
 
 /// Removes keys whose value is `null` for an `Optional` field whose inner type

@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase", deny_unknown_fields)]
 pub enum FieldType {
     String,
@@ -54,7 +54,7 @@ impl FieldType {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IndexDef {
     pub name: String,
     pub fields: Vec<String>,
@@ -76,7 +76,7 @@ pub struct IndexDef {
 /// Declaration of a vector (approximate nearest-neighbor) index. Wire shape is
 /// camelCase (`filterFields`) to match the rest of the protocol. Mirrors
 /// `server/src/schema.rs::VectorIndexSpec` byte-for-byte.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VectorIndexSpec {
     pub dimensions: u32,
@@ -88,7 +88,7 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TableDef {
     pub fields: BTreeMap<String, FieldType>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -117,7 +117,7 @@ pub struct TableDef {
     pub collaborators_field: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SchemaDef {
     pub tables: BTreeMap<String, TableDef>,
 }
