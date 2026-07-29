@@ -170,3 +170,235 @@ Range/boundary tracking for `take(N)` ordered queries; eq-predicate evaluation f
 `unique` / `eq`; ranking-aware handling for `search` / `vectorSearch`. The
 `WriteSet.docs` and `ReadSet` shapes are designed so these extend additively rather
 than requiring a rewrite.
+
+---
+
+# v2 (eq-prefix + range) — 2026-07-28
+
+- **Status:** Implementing.
+- **Scope:** Server-only, no protocol/wire change (same as v1). Extends v1's
+  `WriteSet` / `ReadSet` plumbing additively — `Point` is unchanged.
+
+## Summary
+
+Extend sound skipping from `get(id)` point reads to **`count`, `collect`, and
+`unique` queries that filter on a btree index's eq-prefix (and an optional range
+bound on the next index field)**. A subscription of one of these shapes re-runs
+only when a written document may have crossed its window boundary; writes to
+unrelated documents are skipped, same as v1 does for `get(id)`.
+
+Every other shape stays table-level: `take(N)` / `first` / `paginate` (top-N or
+page window — a doc can enter/leave the truncated window even when its eq-prefix
+is unchanged), `distinct` / `aggregate` (value-sensitive over matching docs),
+and `search` / `vectorSearch` / `hybridSearch` (ranking). These remain `Table`.
+
+## Why only count / collect / unique, and the content-bearing split
+
+These three terminals return their **full** matching set (no truncation):
+
+- `count` → the number of matching docs. Pure **membership**: the result changes
+  iff a written doc's membership in the window changed.
+- `collect` (no terminal) → the matching doc **bodies** (capped at `MAX_TAKE`).
+  A cap only ever causes over-approximation (a matching insert beyond the cap is
+  re-run needlessly), never under-approximation. But because it returns bodies,
+  the result also changes when a **member's content** changes.
+- `unique` → the one matching doc (errors if >1). Same as collect: content-bearing.
+
+So a written doc `d` **affects** such a subscription iff:
+
+- **count:** `d`'s window-membership changed (`old_match != new_match`).
+- **collect / unique:** `d` is or was a member (`old_match || new_match`) — a
+  body change to a current member, or a doc entering/leaving, both count.
+
+(`take`/`first`/`paginate` are excluded because membership-unchanged does NOT
+imply the ordered window is unchanged; `distinct`/`aggregate` because they depend
+on the *values* of members, not just membership.)
+
+## Carrying written doc values
+
+`WriteSet` gains a `doc_values` map, **separate from `ops`** so the op-feed,
+audit-log, and webhook taps (which consume only `&ops`) are untouched:
+
+```rust
+pub struct WriteSet {
+    pub tables: BTreeSet<String>,
+    pub docs: BTreeSet<(String, String)>,
+    pub ops: Vec<DocOp>,                 // unchanged
+    /// Per written `(table, id)`: the doc as it stood at txn START (`before`,
+    /// `None` if created inside this txn) and at txn END (`after`, `None` if
+    /// deleted inside this txn). Used only by `fan_out`; never sent on the wire.
+    pub doc_values: BTreeMap<(String, String), DocValues>,
+}
+
+pub struct DocValues {
+    pub before: Option<serde_json::Map<String, serde_json::Value>>,
+    pub after: Option<serde_json::Map<String, serde_json::Value>>,
+}
+```
+
+`WriteSet` loses its `Eq` derive (a `Map` is not `Eq`); the derive is unused
+today (no `==` on `WriteSet` anywhere). `DocOp` keeps `Eq` — it is unchanged.
+
+`execute_txn` populates `doc_values` per step, keyed by `(table, id)`, recording
+the **net** effect across the whole txn (a doc touched by several steps collapses
+to one entry — earliest `before`, latest `after`):
+
+| Step | `before` | `after` |
+|---|---|---|
+| `Insert` | `None` (created) | the stamped doc |
+| `Patch` | the fetched pre-merge doc (first touch only) | the merged doc |
+| `Replace` | the existing doc (first touch only — `do_replace` fetches `doc`, not just `id`) | the new (stripped) doc |
+| `Upsert` insert branch | `None` | the stamped insert doc |
+| `Upsert` update branch | the matched doc (first touch only) | the merged doc |
+| `Delete` | unchanged | `None` (marks deleted) |
+
+The write helpers already hold these values: `do_patch` and the upsert-update
+branch fetch the old doc to merge; `do_replace` is widened to `SELECT "doc"` (it
+today selects only `"id"` to confirm existence). `Delete` records no values — its
+net effect is "after = None", which `fan_out` treats as always-affecting.
+
+## `ReadSet::Indexed`
+
+A new variant derived once at registration (needs the table def for field types —
+see Registration below):
+
+```rust
+enum ReadSet {
+    Point { id: String },                                     // get(id) — v1
+    Indexed(IndexedRead),                                     // NEW
+    Table,
+}
+
+struct IndexedRead {
+    /// The eq-prefix: index field name + its FieldType, and the typed bind.
+    eq: Vec<(String, FieldType, EqBind)>,
+    /// Optional range bound on `index.fields[eq.len()]`.
+    range: Option<RangeBound>,
+    /// collect / unique return doc bodies (a member's content change matters);
+    /// count does not.
+    content_bearing: bool,
+}
+
+struct RangeBound {
+    field: String,
+    field_type: FieldType,
+    lower: Option<(EqBind, bool)>,  // (gt, false) / (gte, true)
+    upper: Option<(EqBind, bool)>,  // (lt, false) / (lte, true)
+}
+```
+
+`from_query` yields `Indexed` iff **all** hold:
+- terminal is `count`, or no terminal (`collect`), or `unique`;
+- `index` is set **and** (`eq` non-empty **or** a range bound is present)
+  (otherwise the window is the whole table → no skip benefit → `Table`);
+- none of `take` / `first` / `paginate` / `distinct` / `aggregate` / `search` /
+  `vector_search` / `hybrid_search` is set.
+
+Otherwise `Table` (or `Point` for `get`). The query is immutable, so `Indexed`
+is computed once and never recomputed.
+
+### `in_window(doc)` — pure, total, over-approximating on any doubt
+
+```
+for (field, ty, want) in eq:
+    have = eq_bind_for(ty, doc[field])      // None/NULL/wrong-type ⇒ no-match
+    if have != Ok(want): return false        // eq is AND: one miss ⇒ outside
+match &range:
+    Some(r) ⇒ satisfy r.lower / r.upper against eq_bind_for(r.field_type, doc[r.field])
+              (NULL / typing failure ⇒ outside ⇒ false)
+    None ⇒ ()
+true
+```
+
+**Any typing failure, missing field, or comparison ambiguity ⇒ return `false`
+(outside the window)** for eq/range membership — this can only cause a re-run
+(over-approximation), never a missed one. (`eq_bind_for` is the existing shared
+typer in `txn.rs`, so doc values and query values are typed identically to the DB.)
+
+## `fan_out` per-`Indexed` subscription
+
+For each written `(table, id)` on the subscription's table, with its `DocValues`:
+
+```
+deleted   = after.is_none()
+created   = before.is_none() && after.is_some()
+// updated = before.is_some() && after.is_some()
+
+affects =
+    if deleted                 { true }                          // values gone ⇒ re-run
+    else if created            { in_window(after) }              // entered iff now in
+    else /* updated, both known */ {
+        let old_m = in_window(before), new_m = in_window(after);
+        if content_bearing { old_m || new_m }                    // collect / unique
+        else               { old_m != new_m }                    // count
+    }
+```
+
+Re-run the subscription iff **any** written doc on its table `affects`. Otherwise
+skip (every doc provably irrelevant). Owner filtering and `filter` are ignored in
+the skip decision — they can only narrow the real result, so ignoring them
+over-approximates (re-runs a matching-but-filtered-out or not-visible doc),
+never under-approximates.
+
+### Soundness argument
+
+- `get(id)` — unchanged from v1.
+- `Indexed` sub skipped ⟹ for every written doc `affects == false`:
+  - **created** with `!in_window(after)`: a brand-new doc outside the window can
+    never be in the result ⇒ sound.
+  - **updated** with `old_m == new_m == false` (collect/unique) or
+    `old_m == new_m` (count): the doc was never a member (collect/unique) or its
+    membership didn't change (count), so it neither entered, left, nor (for
+    count) altered the count ⇒ sound.
+  - deletes are never skipped (`affects == true`).
+- All other shapes (`Table`) and all uncertain cases re-run ⇒ over-approximation,
+  diff-suppressed.
+
+Under-invalidation is impossible: the only new skips are docs provably unable to
+change the result (created-outside, or membership-stable).
+
+## Registration threading
+
+`ReadSet::from_query` now needs the `TableDef` (for field types + index fields).
+`committer::handle_subscribe` already loads the schema; it resolves
+`schema.table(&query.table)` and passes `&TableDef` into `register`, which passes
+it to `from_query`. (`fan_out` already holds the schema but does not need to
+re-derive — `Indexed` is stored on `SubEntry`.) A schema that has evolved since
+registration can make a stored `Indexed` reference a field/type that no longer
+matches; `in_window`'s "any doubt ⇒ outside ⇒ re-run" rule keeps that sound (it
+biases toward re-running).
+
+## Testing (soundness matrix)
+
+New integration cases against the real dev Postgres, plus unit cases for
+`in_window` / `affects`:
+
+1. `count` / `collect` / `unique` with `eq=[x]`: insert a doc whose eq-prefix is
+   `y` ⇒ **no** `queryUpdate`. Insert/patch one to `x` ⇒ pushed.
+2. Range: `collect` with `eq=[x], gte=10`; insert eq=`x` value `5` ⇒ **no** push;
+   insert eq=`x` value `20` ⇒ pushed.
+3. Patch a **member** of a `collect` sub (eq unchanged, body changed) ⇒ pushed
+   (content-bearing). Same patch on a `count` sub (membership unchanged) ⇒ **no**
+   push.
+4. Patch a doc **out** of the window (`x`→`y`) on a `collect` sub ⇒ pushed
+   (it was a member). On a `count` sub ⇒ pushed (count decreased). Requires
+   `before` to be captured — this is the regression guard for the out-move case.
+5. Delete any doc on the table of a `count`/`collect` sub ⇒ pushed (always).
+6. `take` / `first` / `paginate` / `distinct` / `aggregate` / `search` subs still
+   re-run on any write to the table (table-level preserved).
+7. Owner-filtered + `filter`-bearing `collect` subs: a write to a not-visible /
+   filtered-out doc whose eq-prefix still matches ⇒ re-run (over-approximation,
+   sound); a write whose eq-prefix doesn't match ⇒ skip.
+8. Unit: `in_window` returns `false` on null/wrong-typed/missing field (no crash,
+   no false match).
+
+## Files
+
+- `server/src/txn.rs` — `WriteSet.doc_values` + `DocValues`; capture per step
+  (widen `do_replace` to fetch `doc`); drop `Eq` on `WriteSet`.
+- `server/src/subs.rs` — `ReadSet::Indexed` + `IndexedRead` / `RangeBound`;
+  `from_query(&Query, &TableDef)`; `in_window` + per-doc `affects`; consult in
+  `fan_out`.
+- `server/src/committer.rs` — `handle_subscribe` resolves `TableDef` and passes
+  it to `register`.
+- `server/tests/*` — the soundness matrix above.
