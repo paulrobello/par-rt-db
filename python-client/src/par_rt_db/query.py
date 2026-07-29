@@ -343,6 +343,31 @@ class TableQuery:
         return self.build()
 
 
+def _dump_query(q: Query | TableQuery) -> dict[str, Any]:
+    """Serialize a Query (or TableQuery) to its wire-shaped dict."""
+    built = q.build() if isinstance(q, TableQuery) else q
+    return built.model_dump(by_alias=True, mode="json")
+
+
+def _terminal_of(q: Query) -> str:
+    """Infer the parse_result terminal from a built Query."""
+    if q.get is not None:
+        return "get"
+    if q.count:
+        return "count"
+    if q.first:
+        return "first"
+    if q.unique:
+        return "unique"
+    if q.distinct:
+        return "distinct"
+    if q.aggregate is not None:
+        return "aggregateGroups" if q.aggregate.group_by else "aggregate"
+    if q.paginate is not None:
+        return "paginate"
+    return "collect"
+
+
 def parse_result(model: type[Any], terminal: str, value: Any) -> Any:
     """Deserialize an untagged ``QueryResult`` by the terminal that produced it.
 

@@ -15,7 +15,14 @@ Two shape corrections from the upstream brief (the plan predated a wire fix):
 import pytest
 from pydantic import BaseModel, TypeAdapter
 
-from par_rt_db.query import Paginated, TableQuery, parse_result
+from par_rt_db.query import (
+    Paginated,
+    Query,
+    TableQuery,
+    _dump_query,
+    _terminal_of,
+    parse_result,
+)
 from par_rt_db.wire import FilterExpr
 
 _filter_adapter = TypeAdapter(FilterExpr)
@@ -283,3 +290,18 @@ def test_parse_result_aggregate_scalar_and_groups():
 def test_parse_result_dict_model_returns_raw_dicts():
     out = parse_result(dict, "collect", [{"id": "1"}])
     assert out == [{"id": "1"}]
+
+
+def test_dump_query_serializes_tablequery_to_wire_dict():
+    q = TableQuery("items").with_index("by_x").eq(1).take(5)
+    d = _dump_query(q)
+    assert d["table"] == "items"
+    assert d["index"] == "by_x"
+    assert d["eq"] == [1]
+    assert d["take"] == 5
+
+
+def test_terminal_of_infers_collect_by_default():
+    assert _terminal_of(Query(table="items")) == "collect"
+    assert _terminal_of(Query(table="items", count=True)) == "count"
+    assert _terminal_of(Query(table="items", get="i1")) == "get"

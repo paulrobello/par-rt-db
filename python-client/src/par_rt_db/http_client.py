@@ -30,7 +30,7 @@ from pydantic import BaseModel, ConfigDict, TypeAdapter
 
 from .errors import ErrorCode, RtDbError
 from .mutation import StepResult, Transaction
-from .query import Query, TableQuery, parse_result
+from .query import Query, TableQuery, _terminal_of, parse_result
 from .schema import SchemaDef
 from .wire import to_camel
 
@@ -82,45 +82,6 @@ class FileMetadata(_Wire):
 # ``StepResult`` is a ``Union`` alias (no ``model_validate``); route through a
 # single ``TypeAdapter`` for the untagged per-step result, mirroring mutation.py.
 _STEP_RESULT_ADAPTER = TypeAdapter(StepResult)
-
-
-def _dump_query(q: Query | TableQuery) -> dict[str, Any]:
-    """Serialize a ``Query`` (or ``TableQuery``) to its wire-shaped dict.
-
-    ``by_alias=True`` keeps snake_case top-level Query keys (whose aliases equal
-    their field names) while emitting the camelCase aliases of nested models
-    (``vectorSearch``/``hybridSearch``/``AggregateSpec``/``_Paginate`` …).
-    ``mode="json"`` coerces bytes/decimal/etc. to JSON-safe primitives.
-    """
-    built = q.build() if isinstance(q, TableQuery) else q
-    return built.model_dump(by_alias=True, mode="json")
-
-
-def _terminal_of(q: Query) -> str:
-    """Infer the parse_result terminal from a built ``Query``.
-
-    The server's ``QueryResult`` is untagged, so ``parse_result`` re-attaches a
-    shape via the terminal that produced the value. Priority mirrors the order
-    in ``par_rt_db.query.parse_result``. A query with no explicit terminal
-    (just ``table`` + ``index`` + ``eq`` + ``take``) returns a doc list —
-    ``"collect"`` — which also covers ``search``/``vectorSearch``/``hybridSearch``
-    (those carry their own ranking spec but yield docs like collect).
-    """
-    if q.get is not None:
-        return "get"
-    if q.count:
-        return "count"
-    if q.first:
-        return "first"
-    if q.unique:
-        return "unique"
-    if q.distinct:
-        return "distinct"
-    if q.aggregate is not None:
-        return "aggregateGroups" if q.aggregate.group_by else "aggregate"
-    if q.paginate is not None:
-        return "paginate"
-    return "collect"
 
 
 class RtDbHttpClient:
