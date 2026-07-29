@@ -570,16 +570,19 @@ async fn handle_subscribe(
         return Ok(());
     }
 
-    // Resolve the table def so `register` can derive an `Indexed` ReadSet
-    // (fine-grained invalidation v2) for count / collect / unique queries on an
-    // eq-prefix window. `execute_query` above already resolved the same table
-    // successfully, so this lookup won't miss in practice; propagating its
-    // error (rather than falling back to `Table`) matches today's behavior — a
-    // subscription whose table has vanished between execute and register is
-    // already a transient error path.
+    // Resolve the table def so `register` can derive a fine-grained ReadSet —
+    // `Indexed` (count / collect / unique on an eq-prefix window) or `Ordered`
+    // (take / first / paginate, whose top-N boundary is seeded from `result`).
+    // `execute_query` above already resolved the same table successfully, so
+    // this lookup won't miss in practice; propagating its error (rather than
+    // falling back to `Table`) matches today's behavior — a subscription whose
+    // table has vanished between execute and register is already a transient
+    // error path.
     let table_def = schema.table(&query.table)?;
     ctx.subs
-        .register(&ctx.db, conn, query_id, query, tx, last, owner, table_def)
+        .register(
+            &ctx.db, conn, query_id, query, tx, last, owner, table_def, &result,
+        )
         .await;
     Ok(())
 }

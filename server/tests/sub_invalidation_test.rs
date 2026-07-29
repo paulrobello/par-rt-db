@@ -559,11 +559,10 @@ async fn delete_of_out_of_window_doc_still_pushes() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn take_sub_pushes_for_in_window_write() -> anyhow::Result<()> {
-    // A `take` sub is Table-level (never Indexed): it re-runs on every write
-    // to its table. An in-window insert changes the take result ⇒ push.
-    // (Out-of-window writes also re-run under Table, but the canonical diff
-    // suppresses the push — not distinguishable from an Indexed skip at the
-    // integration level. The Table-vs-Indexed derivation is unit-tested.)
+    // A `take` sub is `Ordered` (v3): it re-runs when a written doc is inside
+    // the eq window AND ranks at or before the last result's boundary. Here
+    // the sub starts empty (unfull ⇒ unbounded boundary), so any in-window
+    // insert affects it ⇒ push.
     let state = test_state().await;
     let db = fresh_db(&state).await;
 
@@ -987,6 +986,400 @@ async fn int64_range_count_patch_into_window_pushes() -> anyhow::Result<()> {
         .mutate(&db, None, patch_event_ts(&id, "50"), None)
         .await?;
     expect_update(&mut rx, "patch into int64 range").await;
+
+    Ok(())
+}
+
+// =====================================================================
+// 12. Ordered top-N boundary tracking (v3): take / first / paginate
+//
+//     These subs re-run only when a written doc is inside the eq window AND
+//     ranks at or before the last result's final row (the boundary). The
+//     dangerous direction is a MISSED push, so most cases below assert a push;
+//     the no-push cases assert the complementary consistency property (the
+//     result genuinely did not change). Which of "skipped" vs "re-ran and
+//     diff-suppressed" produced a no-push is not observable here by design —
+//     the skip decision itself is unit-tested in `src/subs.rs`.
+// =====================================================================
+
+/// `take(n)` over one project's items, ordered by the `order` index field
+/// (the field after the eq-prefix), so ranking is fully controlled by the
+/// test rather than by insertion timing.
+fn take_by_project_order(proj: &str, n: u32, desc: bool) -> Query {
+    let mut q = serde_json::json!({
+        "table": "workItems",
+        "index": "by_project_and_order",
+        "eq": [proj],
+        "take": n
+    });
+    if desc {
+        q["order"] = serde_json::json!("desc");
+    }
+    serde_json::from_value(q).expect("parse query")
+}
+
+fn first_by_project_order(proj: &str) -> Query {
+    serde_json::from_value(serde_json::json!({
+        "table": "workItems",
+        "index": "by_project_and_order",
+        "eq": [proj],
+        "first": true
+    }))
+    .expect("parse query")
+}
+
+fn paginate_by_project_order(proj: &str, num_items: u32) -> Query {
+    serde_json::from_value(serde_json::json!({
+        "table": "workItems",
+        "index": "by_project_and_order",
+        "eq": [proj],
+        "paginate": { "numItems": num_items }
+    }))
+    .expect("parse query")
+}
+
+/// Seeds `orders` as backlog items and returns their ids, in order.
+async fn seed(
+    state: &std::sync::Arc<rtdb_server::AppState>,
+    db: &str,
+    orders: &[f64],
+) -> anyhow::Result<Vec<String>> {
+    let mut ids = Vec::new();
+    for order in orders {
+        let outcome = state
+            .realtime
+            .committers
+            .mutate(db, None, insert("backlog", *order), None)
+            .await?;
+        ids.push(id_of(&outcome));
+    }
+    Ok(ids)
+}
+
+#[tokio::test]
+async fn take_skips_inserts_beyond_the_boundary() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let db = fresh_db(&state).await;
+    seed(&state, &db, &[10.0, 20.0]).await?;
+
+    // Top-2 ascending = [10, 20]; full ⇒ boundary = order 20.
+    let mut rx = sub(&state, &db, take_by_project_order(PROJ, 2, false)).await;
+
+    // Ranks after the boundary ⇒ cannot enter the top 2 ⇒ result unchanged.
+    state
+        .realtime
+        .committers
+        .mutate(&db, None, insert("backlog", 30.0), None)
+        .await?;
+    expect_no_update(&mut rx, "insert beyond boundary");
+
+    // Ranks ahead of the boundary ⇒ enters the top 2 ⇒ push.
+    state
+        .realtime
+        .committers
+        .mutate(&db, None, insert("backlog", 5.0), None)
+        .await?;
+    expect_update(&mut rx, "insert ahead of boundary").await;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn take_pushes_for_member_body_and_rank_changes() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let db = fresh_db(&state).await;
+    let ids = seed(&state, &db, &[10.0, 20.0, 30.0]).await?;
+
+    // Top-2 = [10, 20], boundary = order 20.
+    let mut rx = sub(&state, &db, take_by_project_order(PROJ, 2, false)).await;
+
+    // A member's body change: `take` returns doc bodies ⇒ push.
+    state
+        .realtime
+        .committers
+        .mutate(
+            &db,
+            None,
+            patch_field(
+                &ids[0],
+                "title",
+                serde_json::Value::String("renamed".into()),
+            ),
+            None,
+        )
+        .await?;
+    expect_update(&mut rx, "member body patch").await;
+
+    // A member moving OUT of the window pulls the beyond-boundary doc in.
+    // This is the regression guard for dropping the `before` state.
+    state
+        .realtime
+        .committers
+        .mutate(
+            &db,
+            None,
+            patch_field(&ids[1], "status", serde_json::Value::String("done".into())),
+            None,
+        )
+        .await?;
+    expect_update(&mut rx, "member leaves the window").await;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn take_pushes_when_a_beyond_boundary_doc_moves_ahead_of_it() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let db = fresh_db(&state).await;
+    let ids = seed(&state, &db, &[10.0, 20.0, 30.0]).await?;
+
+    // Top-2 = [10, 20], boundary = order 20.
+    let mut rx = sub(&state, &db, take_by_project_order(PROJ, 2, false)).await;
+
+    // The order-30 doc (beyond the boundary in its BEFORE state) moves to
+    // order 1 — its AFTER state ranks ahead of the boundary ⇒ push. A rule
+    // that only looked at the before-state would miss this.
+    state
+        .realtime
+        .committers
+        .mutate(
+            &db,
+            None,
+            patch_field(&ids[2], "order", serde_json::json!(1.0)),
+            None,
+        )
+        .await?;
+    expect_update(&mut rx, "beyond-boundary doc moves into the top-N").await;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn take_boundary_is_refreshed_after_the_result_shrinks() -> anyhow::Result<()> {
+    // The boundary must track EVERY re-run, not just the initial result. A
+    // stale boundary here would silently drop the final push.
+    let state = test_state().await;
+    let db = fresh_db(&state).await;
+    let ids = seed(&state, &db, &[10.0, 20.0]).await?;
+
+    // Top-2 = [10, 20], boundary = order 20.
+    let mut rx = sub(&state, &db, take_by_project_order(PROJ, 2, false)).await;
+
+    // Delete a member: the result shrinks to [20], which is no longer full,
+    // so the boundary must be cleared (unbounded).
+    state
+        .realtime
+        .committers
+        .mutate(&db, None, delete(&ids[0]), None)
+        .await?;
+    expect_update(&mut rx, "member delete").await;
+
+    // With the boundary cleared this in-window insert affects the sub ⇒ push.
+    // Against the STALE boundary (order 20) it would rank beyond and be
+    // skipped — a missed realtime update.
+    state
+        .realtime
+        .committers
+        .mutate(&db, None, insert("backlog", 50.0), None)
+        .await?;
+    expect_update(&mut rx, "insert after the boundary was cleared").await;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn take_desc_inverts_the_boundary() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let db = fresh_db(&state).await;
+    seed(&state, &db, &[10.0, 20.0, 30.0]).await?;
+
+    // Newest-first style feed: top-2 descending = [30, 20], boundary = 20.
+    let mut rx = sub(&state, &db, take_by_project_order(PROJ, 2, true)).await;
+
+    // Below the boundary in DESC order ⇒ beyond the window ⇒ unchanged.
+    state
+        .realtime
+        .committers
+        .mutate(&db, None, insert("backlog", 1.0), None)
+        .await?;
+    expect_no_update(&mut rx, "desc insert beyond boundary");
+
+    // Above the boundary in DESC order ⇒ enters the top 2 ⇒ push.
+    state
+        .realtime
+        .committers
+        .mutate(&db, None, insert("backlog", 99.0), None)
+        .await?;
+    expect_update(&mut rx, "desc insert ahead of boundary").await;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn take_ignores_writes_outside_the_eq_window() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let db = fresh_db(&state).await;
+    seed(&state, &db, &[10.0, 20.0]).await?;
+
+    let mut rx = sub(&state, &db, take_by_project_order(PROJ, 2, false)).await;
+
+    // Another project's item ranks ahead of the boundary but is outside the
+    // eq window ⇒ the result cannot change.
+    let mut other = work_item("backlog", 1.0);
+    other.insert(
+        "projectId".to_string(),
+        serde_json::Value::String(OTHER_PROJ.to_string()),
+    );
+    state
+        .realtime
+        .committers
+        .mutate(
+            &db,
+            None,
+            Transaction {
+                steps: vec![Step::Insert {
+                    table: "workItems".to_string(),
+                    doc: other,
+                }],
+            },
+            None,
+        )
+        .await?;
+    expect_no_update(&mut rx, "other project's insert");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn first_tracks_its_single_row_boundary() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let db = fresh_db(&state).await;
+    seed(&state, &db, &[10.0]).await?;
+
+    // `first` = take(1): boundary = the one returned doc (order 10).
+    let mut rx = sub(&state, &db, first_by_project_order(PROJ)).await;
+
+    // Ranks after it ⇒ still not first ⇒ unchanged.
+    state
+        .realtime
+        .committers
+        .mutate(&db, None, insert("backlog", 20.0), None)
+        .await?;
+    expect_no_update(&mut rx, "insert after the first row");
+
+    // Ranks ahead of it ⇒ becomes the new first ⇒ push.
+    state
+        .realtime
+        .committers
+        .mutate(&db, None, insert("backlog", 1.0), None)
+        .await?;
+    expect_update(&mut rx, "insert ahead of the first row").await;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn paginate_full_page_without_next_cursor_stays_unbounded() -> anyhow::Result<()> {
+    // A page holding exactly `numItems` docs but NO next cursor must NOT be
+    // treated as bounded: an insert beyond its last row flips `hasNext` on and
+    // mints a cursor, which changes the result even though the docs don't.
+    let state = test_state().await;
+    let db = fresh_db(&state).await;
+    seed(&state, &db, &[10.0, 20.0]).await?;
+
+    let mut rx = sub(&state, &db, paginate_by_project_order(PROJ, 2)).await;
+
+    state
+        .realtime
+        .committers
+        .mutate(&db, None, insert("backlog", 30.0), None)
+        .await?;
+    expect_update(&mut rx, "insert flips hasNext on a last page").await;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn paginate_skips_writes_beyond_a_bounded_page() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let db = fresh_db(&state).await;
+    let ids = seed(&state, &db, &[10.0, 20.0, 30.0]).await?;
+
+    // Page of 2 with a third doc behind it ⇒ next cursor issued ⇒ bounded by
+    // order 20.
+    let mut rx = sub(&state, &db, paginate_by_project_order(PROJ, 2)).await;
+
+    // Patching the beyond-boundary doc's body leaves page + cursor identical.
+    state
+        .realtime
+        .committers
+        .mutate(
+            &db,
+            None,
+            patch_field(
+                &ids[2],
+                "title",
+                serde_json::Value::String("renamed".into()),
+            ),
+            None,
+        )
+        .await?;
+    expect_no_update(&mut rx, "patch beyond the page boundary");
+
+    // A doc entering ahead of the boundary shifts the page ⇒ push.
+    state
+        .realtime
+        .committers
+        .mutate(&db, None, insert("backlog", 1.0), None)
+        .await?;
+    expect_update(&mut rx, "insert ahead of the page boundary").await;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn bare_take_without_an_index_ranks_on_creation_time() -> anyhow::Result<()> {
+    // No index: the sort order is `created_at, id` alone, so the boundary is
+    // purely temporal. An ascending take holds the OLDEST rows, which a fresh
+    // insert (newest created_at) can never join.
+    let state = test_state().await;
+    let db = fresh_db(&state).await;
+    seed(&state, &db, &[10.0, 20.0]).await?;
+
+    let query: Query = serde_json::from_value(serde_json::json!({
+        "table": "workItems",
+        "take": 2
+    }))
+    .expect("parse query");
+    let mut rx = sub(&state, &db, query).await;
+
+    state
+        .realtime
+        .committers
+        .mutate(&db, None, insert("backlog", 30.0), None)
+        .await?;
+    expect_no_update(&mut rx, "newer insert cannot join the oldest-2");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn take_pushes_on_any_delete() -> anyhow::Result<()> {
+    // `Delete` captures no doc values, so an ordered sub can neither
+    // window-check nor rank the deleted row — it always re-runs. Deleting a
+    // member changes the result, so the push is observable.
+    let state = test_state().await;
+    let db = fresh_db(&state).await;
+    let ids = seed(&state, &db, &[10.0, 20.0, 30.0]).await?;
+
+    let mut rx = sub(&state, &db, take_by_project_order(PROJ, 2, false)).await;
+
+    state
+        .realtime
+        .committers
+        .mutate(&db, None, delete(&ids[1]), None)
+        .await?;
+    expect_update(&mut rx, "delete of a member").await;
 
     Ok(())
 }

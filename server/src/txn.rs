@@ -107,12 +107,20 @@ pub struct WriteSet {
 /// Per written `(table, id)`: the doc as it stood at txn START (`before`,
 /// `None` when the doc was created inside this txn) and at txn END (`after`,
 /// `None` when the doc was deleted inside this txn). Consumed only by
-/// `subs::fan_out` to decide whether a written doc affects an `Indexed`
-/// subscription; never sent on the wire.
+/// `subs::fan_out` to decide whether a written doc affects an `Indexed` or
+/// `Ordered` subscription; never sent on the wire.
+///
+/// `created_at` is the row's creation timestamp — immutable after insert, and
+/// NOT part of the stored `doc` body (it is a system column merged in at read
+/// time). `subs::OrderedRead` needs it because every query's sort order ends
+/// in `created_at, id`, so ranking a written doc against a top-N boundary is
+/// impossible without it. `None` = not captured (e.g. a `Delete`, which
+/// records no values), which `subs` treats as "unrankable ⇒ re-run".
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct DocValues {
     pub before: Option<serde_json::Map<String, serde_json::Value>>,
     pub after: Option<serde_json::Map<String, serde_json::Value>>,
+    pub created_at: Option<i64>,
 }
 
 impl WriteSet {
@@ -150,12 +158,18 @@ impl WriteSet {
     ///   that, a stale `Some` after-state could make `fan_out` skip a `count`
     ///   subscription whose matching set shrank when the doc was removed — a
     ///   missed push.
+    ///
+    /// `created_at`: the row's (immutable) creation timestamp when this step
+    ///   knows it, for `subs::OrderedRead`'s sort-key ranking. Recorded on the
+    ///   first step that supplies it and never overwritten — every step that
+    ///   supplies it supplies the same value.
     fn capture_doc(
         &mut self,
         table: &str,
         id: &str,
         before: Option<Option<&serde_json::Map<String, serde_json::Value>>>,
         after: Option<Option<&serde_json::Map<String, serde_json::Value>>>,
+        created_at: Option<i64>,
     ) {
         let key = (table.to_string(), id.to_string());
         match self.doc_values.entry(key) {
@@ -165,12 +179,16 @@ impl WriteSet {
                 if let Some(after_opt) = after {
                     e.get_mut().after = after_opt.cloned();
                 }
+                if e.get().created_at.is_none() {
+                    e.get_mut().created_at = created_at;
+                }
             }
             // First touch: record both `before` and `after` as given.
             Entry::Vacant(e) => {
                 e.insert(DocValues {
                     before: before.and_then(|v| v.cloned()),
                     after: after.and_then(|v| v.cloned()),
+                    created_at,
                 });
             }
         }
@@ -472,16 +490,17 @@ fn strip_unset_optionals(
 
 /// Inserts a new row for `doc` (already validated by the caller's schema
 /// lookup): `doc` jsonb plus every indexed-field column, `created_at =
-/// now_ms()`, `version` defaulting to 1. Returns the generated id and the
-/// stamped+stripped doc as stored (the caller records the latter on
-/// `WriteSet.doc_values` so `fan_out` can window-check the after-state).
+/// now_ms()`, `version` defaulting to 1. Returns the generated id, the
+/// stamped+stripped doc as stored, and the stamped `created_at` (the caller
+/// records all three on `WriteSet.doc_values` so `fan_out` can window-check
+/// and rank the after-state).
 async fn do_insert(
     conn: &mut PgConnection,
     pg_schema_name: &str,
     table_def: &TableDef,
     table_name: &str,
     doc: &serde_json::Map<String, serde_json::Value>,
-) -> Result<(String, serde_json::Map<String, serde_json::Value>), RtDbError> {
+) -> Result<(String, serde_json::Map<String, serde_json::Value>, i64), RtDbError> {
     validate_doc(table_def, doc)?;
     let stripped = strip_unset_optionals(table_def, doc.clone());
 
@@ -529,7 +548,7 @@ async fn do_insert(
         };
     }
     query.execute(&mut *conn).await?;
-    Ok((id, stripped))
+    Ok((id, stripped, created_at))
 }
 
 /// Updates an existing row's `doc`, every indexed-field column recomputed
@@ -585,7 +604,8 @@ async fn apply_update(
 
 /// Fetches the current doc by id (`NotFound` if missing), merges `fields`
 /// onto it via `apply_patch`, and applies the update. Returns the pre-merge
-/// doc (for `WriteSet.doc_values`'s `before`) and the merged doc (for `after`).
+/// doc (for `WriteSet.doc_values`'s `before`), the merged doc (for `after`),
+/// and the row's `created_at` (for `subs::OrderedRead`'s sort-key ranking).
 async fn do_patch(
     conn: &mut PgConnection,
     pg_schema_name: &str,
@@ -597,18 +617,19 @@ async fn do_patch(
     (
         serde_json::Map<String, serde_json::Value>,
         serde_json::Map<String, serde_json::Value>,
+        i64,
     ),
     RtDbError,
 > {
     let table_ident = pg_table(table_name);
-    let row: Option<(serde_json::Value,)> = sqlx::query_as(&format!(
-        "SELECT \"doc\" FROM \"{pg_schema_name}\".\"{table_ident}\" WHERE \"id\" = $1"
+    let row: Option<(serde_json::Value, i64)> = sqlx::query_as(&format!(
+        "SELECT \"doc\", \"created_at\" FROM \"{pg_schema_name}\".\"{table_ident}\" WHERE \"id\" = $1"
     ))
     .bind(id)
     .fetch_optional(&mut *conn)
     .await?;
 
-    let (doc_value,) =
+    let (doc_value, created_at) =
         row.ok_or_else(|| RtDbError::not_found(format!("document '{id}' not found")))?;
     let doc = match doc_value {
         serde_json::Value::Object(map) => map,
@@ -621,16 +642,17 @@ async fn do_patch(
     let pre_doc = doc.clone();
     let merged = apply_patch(table_def, doc, fields)?;
     apply_update(conn, pg_schema_name, table_def, table_name, id, &merged).await?;
-    Ok((pre_doc, merged))
+    Ok((pre_doc, merged, created_at))
 }
 
 /// Fetches the current doc (`NotFound` if missing), then fully replaces its
 /// `doc` with `new_doc` — validated as a complete document (like `Insert`),
 /// not merged like `Patch` — recomputing every indexed column and bumping
 /// `version` via the shared `apply_update`. Widened from a bare existence
-/// `SELECT "id"` to `SELECT "doc"` so the pre-replace body is available for
-/// `WriteSet.doc_values`'s `before` capture. Returns the old doc (for
-/// `before`) and the new stripped doc (for `after`).
+/// `SELECT "id"` to `SELECT "doc", "created_at"` so the pre-replace body is
+/// available for `WriteSet.doc_values`'s `before` capture and the row is
+/// rankable for `subs::OrderedRead`. Returns the old doc (for `before`), the
+/// new stripped doc (for `after`), and `created_at`.
 async fn do_replace(
     conn: &mut PgConnection,
     pg_schema_name: &str,
@@ -642,17 +664,18 @@ async fn do_replace(
     (
         serde_json::Map<String, serde_json::Value>,
         serde_json::Map<String, serde_json::Value>,
+        i64,
     ),
     RtDbError,
 > {
     let table_ident = pg_table(table_name);
-    let row: Option<(serde_json::Value,)> = sqlx::query_as(&format!(
-        "SELECT \"doc\" FROM \"{pg_schema_name}\".\"{table_ident}\" WHERE \"id\" = $1"
+    let row: Option<(serde_json::Value, i64)> = sqlx::query_as(&format!(
+        "SELECT \"doc\", \"created_at\" FROM \"{pg_schema_name}\".\"{table_ident}\" WHERE \"id\" = $1"
     ))
     .bind(id)
     .fetch_optional(&mut *conn)
     .await?;
-    let (old_doc_value,) =
+    let (old_doc_value, created_at) =
         row.ok_or_else(|| RtDbError::not_found(format!("document '{id}' not found")))?;
     let old_doc = match old_doc_value {
         serde_json::Value::Object(map) => map,
@@ -662,7 +685,7 @@ async fn do_replace(
     validate_doc(table_def, new_doc)?;
     let new_doc = strip_unset_optionals(table_def, new_doc.clone());
     apply_update(conn, pg_schema_name, table_def, table_name, id, &new_doc).await?;
-    Ok((old_doc, new_doc))
+    Ok((old_doc, new_doc, created_at))
 }
 
 /// Inserts a row with an explicit id/created_at/version, preserving a document's
@@ -781,8 +804,9 @@ async fn do_expect_version(
 }
 
 /// Looks up rows matching `eq` on `index` (full arity required: a
-/// `BadRequest` otherwise), returning `(id, doc)` pairs. Shared by
-/// `ExpectAbsent` and `Upsert`.
+/// `BadRequest` otherwise), returning `(id, doc, created_at)` triples. Shared
+/// by `ExpectAbsent` (existence only) and `Upsert` (whose update branch
+/// records all three on `WriteSet.doc_values`).
 async fn eq_lookup(
     conn: &mut PgConnection,
     pg_schema_name: &str,
@@ -790,7 +814,7 @@ async fn eq_lookup(
     table_name: &str,
     index_name: &str,
     eq: &[serde_json::Value],
-) -> Result<Vec<(String, serde_json::Value)>, RtDbError> {
+) -> Result<Vec<(String, serde_json::Value, i64)>, RtDbError> {
     let index_def = table_def.index(index_name)?;
     if eq.len() != index_def.fields.len() {
         return Err(RtDbError::bad_request(format!(
@@ -809,11 +833,11 @@ async fn eq_lookup(
         .map(|(i, field_name)| format!("\"{}\" = ${}", pg_col(field_name), i + 1))
         .collect();
     let sql = format!(
-        "SELECT \"id\", \"doc\" FROM \"{pg_schema_name}\".\"{table_ident}\" WHERE {}",
+        "SELECT \"id\", \"doc\", \"created_at\" FROM \"{pg_schema_name}\".\"{table_ident}\" WHERE {}",
         where_clause.join(" AND ")
     );
 
-    let mut query = sqlx::query_as::<_, (String, serde_json::Value)>(&sql);
+    let mut query = sqlx::query_as::<_, (String, serde_json::Value, i64)>(&sql);
     for bind in binds {
         query = match bind {
             EqBind::Text(v) => query.bind(v),
@@ -981,34 +1005,52 @@ pub async fn execute_txn(
             Step::Insert { table, doc } => {
                 let table_def = schema.table(table)?;
                 let doc = stamp_owner(table_def, doc.clone(), owner);
-                let (id, stored) =
+                let (id, stored, created_at) =
                     do_insert(&mut tx, &pg_schema_name, table_def, table, &doc).await?;
                 write_set.touch(table, &id, OpKind::Insert);
                 // Created in this txn: before = None (created), after = stored doc.
-                write_set.capture_doc(table, &id, Some(None), Some(Some(&stored)));
+                write_set.capture_doc(
+                    table,
+                    &id,
+                    Some(None),
+                    Some(Some(&stored)),
+                    Some(created_at),
+                );
                 results.push(serde_json::json!({ "id": id }));
             }
             Step::Patch { table, id, fields } => {
                 let table_def = schema.table(table)?;
                 check_owner(&mut tx, &pg_schema_name, table_def, table, id, owner).await?;
                 let fields = stamp_owner(table_def, fields.clone(), owner);
-                let (pre_doc, merged) =
+                let (pre_doc, merged, created_at) =
                     do_patch(&mut tx, &pg_schema_name, table_def, table, id, &fields).await?;
                 write_set.touch(table, id, OpKind::Patch);
                 // `before` = pre-merge body (frozen on first touch by the helper
                 // so a doc inserted earlier this txn stays `before = None`);
                 // `after` = merged body.
-                write_set.capture_doc(table, id, Some(Some(&pre_doc)), Some(Some(&merged)));
+                write_set.capture_doc(
+                    table,
+                    id,
+                    Some(Some(&pre_doc)),
+                    Some(Some(&merged)),
+                    Some(created_at),
+                );
                 results.push(serde_json::Value::Null);
             }
             Step::Replace { table, id, doc } => {
                 let table_def = schema.table(table)?;
                 check_owner(&mut tx, &pg_schema_name, table_def, table, id, owner).await?;
                 let doc = stamp_owner(table_def, doc.clone(), owner);
-                let (old_doc, new_doc) =
+                let (old_doc, new_doc, created_at) =
                     do_replace(&mut tx, &pg_schema_name, table_def, table, id, &doc).await?;
                 write_set.touch(table, id, OpKind::Replace);
-                write_set.capture_doc(table, id, Some(Some(&old_doc)), Some(Some(&new_doc)));
+                write_set.capture_doc(
+                    table,
+                    id,
+                    Some(Some(&old_doc)),
+                    Some(Some(&new_doc)),
+                    Some(created_at),
+                );
                 results.push(serde_json::Value::Null);
             }
             Step::Delete { table, id } => {
@@ -1019,8 +1061,9 @@ pub async fn execute_txn(
                 // Delete records no value: `after = None` marks it deleted so
                 // `fan_out` always re-runs (deleted ⇒ affects). `before` is left
                 // for the helper to freeze at the earliest capture if this same
-                // id was touched earlier in the txn.
-                write_set.capture_doc(table, id, None, Some(None));
+                // id was touched earlier in the txn, and `created_at` likewise
+                // (a delete never fetches the row).
+                write_set.capture_doc(table, id, None, Some(None), None);
                 results.push(serde_json::Value::Null);
             }
             Step::ExpectVersion { table, id, version } => {
@@ -1054,14 +1097,20 @@ pub async fn execute_txn(
                 match rows.pop() {
                     None => {
                         let insert = stamp_owner(table_def, insert.clone(), owner);
-                        let (id, stored) =
+                        let (id, stored, created_at) =
                             do_insert(&mut tx, &pg_schema_name, table_def, table, &insert).await?;
                         write_set.touch(table, &id, OpKind::Upsert);
                         // Upsert-insert branch: same as Insert — created this txn.
-                        write_set.capture_doc(table, &id, Some(None), Some(Some(&stored)));
+                        write_set.capture_doc(
+                            table,
+                            &id,
+                            Some(None),
+                            Some(Some(&stored)),
+                            Some(created_at),
+                        );
                         results.push(serde_json::json!({ "id": id, "inserted": true }));
                     }
-                    Some((id, doc_value)) => {
+                    Some((id, doc_value, created_at)) => {
                         let doc = match doc_value {
                             serde_json::Value::Object(map) => map,
                             _ => {
@@ -1082,6 +1131,7 @@ pub async fn execute_txn(
                             &id,
                             Some(Some(&pre_doc)),
                             Some(Some(&merged)),
+                            Some(created_at),
                         );
                         results.push(serde_json::json!({ "id": id, "inserted": false }));
                     }
