@@ -989,6 +989,20 @@ describe("InMemoryRtDbClient — int64 index", () => {
     ).rejects.toMatchObject({ code: "BAD_REQUEST" });
   });
 
+  it("rejects a non-canonical int64 eq value (leading + / out of range) to match the server", async () => {
+    const c = newClient();
+    await seed(c);
+    // The server's `i64::from_str` rejects a leading `+`; the harness must too
+    // (the bind side now uses the same `isInt64String` validator as insert).
+    await expect(
+      c.query(int64Api.events.query().withIndex("by_ts", ["+20"]).take(10)),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    // 2^63 is one past the signed i64 max — also rejected.
+    await expect(
+      c.query(int64Api.events.query().withIndex("by_ts", ["9223372036854775808"]).take(10)),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+  });
+
   it("orders values beyond the 2^53 number-precision range", async () => {
     const c = newClient();
     // 2^63 - 1 is the int64 max; well outside Number.MAX_SAFE_INTEGER.
@@ -1093,6 +1107,19 @@ describe("InMemoryRtDbClient — additive schema push", () => {
     solo: defineTable({ x: t.number() }),
   });
 
+  /** items with `order` retyped number -> string — destructive. */
+  const itemsWithChangedFieldType = defineSchema({
+    items: defineTable({
+      name: t.string(),
+      status: t.string(),
+      order: t.string(),
+      note: t.optional(t.string()),
+    })
+      .index("by_name", ["name"])
+      .index("by_status", ["status"])
+      .index("by_status_and_order", ["status", "order"]),
+  });
+
   it("an additive second push preserves existing docs and they remain queryable", async () => {
     const c = new InMemoryRtDbClient();
     c.pushSchema(schema);
@@ -1105,19 +1132,26 @@ describe("InMemoryRtDbClient — additive schema push", () => {
     expect((docs[0] as { name: string }).name).toBe("a");
   });
 
-  it("a destructive second push missing a table throws BAD_REQUEST", () => {
+  it("a destructive second push missing a table throws BAD_REQUEST", async () => {
     const c = new InMemoryRtDbClient();
     c.pushSchema(schema);
     expect(() => c.pushSchema(soloSchema)).toThrow(/removed table 'items'/);
-    // Schema is unchanged on a rejected push, so `items` is still usable.
-    expect(() =>
+    // Schema is unchanged on a rejected push, so `items` is still usable — the
+    // query resolves (to []) rather than rejecting.
+    await expect(
       c.query(api.items.query().withIndex("by_status", ["todo"]).collect()),
-    ).not.toThrow();
+    ).resolves.toEqual([]);
   });
 
   it("removing a field is destructive", () => {
     const c = new InMemoryRtDbClient();
     c.pushSchema(schema);
     expect(() => c.pushSchema(itemsWithoutNote)).toThrow(/removed field 'items\./);
+  });
+
+  it("changing a field's type is destructive", () => {
+    const c = new InMemoryRtDbClient();
+    c.pushSchema(schema);
+    expect(() => c.pushSchema(itemsWithChangedFieldType)).toThrow(/changed type of field 'items\./);
   });
 });

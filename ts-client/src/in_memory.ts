@@ -362,9 +362,11 @@ function coerceIndexValue(table: TableJson, fieldName: string, value: unknown): 
       }
       return value;
     case "int64":
-      // Decimal-string canonical form; eq is string === string, so the value is
-      // returned as-is. Only the comparator parses to BigInt for ordering.
-      if (typeof value !== "string" || !/^[+-]?\d+$/.test(value)) {
+      // Canonical decimal string, validated exactly as on insert: `isInt64String`
+      // mirrors the server's `i64::from_str` (rejects a leading `+` and
+      // out-of-range values). eq is string === string, so the value is returned
+      // as-is; only the comparator parses to BigInt for ordering.
+      if (!isInt64String(value)) {
         throw new RtDbError("BAD_REQUEST", "eq value must be an int64 string");
       }
       return value;
