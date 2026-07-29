@@ -209,8 +209,8 @@ pub struct InMemoryRtDbClient {
     /// Counter for storage-upload id minting (`f{++counter}` per
     /// `ts-client/src/in_memory.ts:647`).
     id_counter: u64,
-    /// `mut_id` → cached results. `push_schema` clears this on every push
-    /// (matching TS); `mutate` reads/writes it for its idempotency short-circuit.
+    /// `mut_id` → cached results. `mutate` reads/writes it for its idempotency
+    /// short-circuit; `push_schema` merges additively and does not clear it.
     idempotency: HashMap<String, Vec<StepResult>>,
     /// Scheduled jobs (one-shot + cron). `tick` drains due non-paused entries
     /// by re-running `txn` through `execute_transaction`.
@@ -249,21 +249,26 @@ impl InMemoryRtDbClient {
         }
     }
 
-    /// Installs `schema` as this client's sole in-memory database schema. Clears
-    /// any previously-stored documents so each push starts from a clean slate.
-    /// (The live server is additive-only; full additive evolution is deferred.)
+    /// Installs `schema` as this client's sole in-memory database schema,
+    /// merging additively on subsequent pushes: existing docs and idempotency
+    /// entries are preserved, and `self.tables` is repopulated from the new
+    /// schema (folding in new fields/indexes/tables without touching rows).
+    /// Destructive changes — a removed/changed table, field, or index — return
+    /// [`ErrorCode::BadRequest`] with the same messages as the live server's
+    /// `ddl.rs::detect_destructive_changes`.
     ///
     /// Ports `pushSchema` in `ts-client/src/in_memory.ts:512-519`. The Rust
     /// signature takes the typed [`SchemaDef`] directly (no `toSchemaJson`
     /// conversion needed since the builder already produces the wire shape).
-    pub fn push_schema(&mut self, schema: &SchemaDef) {
+    pub fn push_schema(&mut self, schema: &SchemaDef) -> Result<(), RtDbError> {
+        if let Some(prev) = &self.schema {
+            detect_destructive_changes(prev, schema)?;
+        }
         self.schema = Some(schema.clone());
-        self.tables.clear();
-        self.docs.clear();
-        self.idempotency.clear();
         for (name, def) in &schema.tables {
             self.tables.insert(name.clone(), def.clone());
         }
+        Ok(())
     }
 
     /// Snapshot of the currently-installed schema (or `None` before
@@ -1641,6 +1646,130 @@ pub fn validate_doc(table: &TableDef, doc: &Value) -> Result<(), RtDbError> {
     Ok(())
 }
 
+/// Mirrors `server/src/ddl.rs::detect_destructive_changes`: walks `old` and
+/// rejects any removed table, removed/changed field, or removed/changed index
+/// with [`ErrorCode::BadRequest`]. Additive changes (new tables, new fields,
+/// new indexes, widening `Optional`/`Union`/`Any` inner types via a fresh
+/// push) pass through — `push_schema` then folds the new schema into
+/// `self.tables` without touching stored docs.
+///
+/// `FieldType` and `IndexDef` don't derive `PartialEq` (the rust-client schema
+/// module deliberately keeps its derives minimal), so structural equality is
+/// computed here via [`field_type_eq`]/[`index_def_eq`] rather than `!=`.
+fn detect_destructive_changes(old: &SchemaDef, new: &SchemaDef) -> Result<(), RtDbError> {
+    for (table_name, old_table) in &old.tables {
+        let new_table = new.tables.get(table_name).ok_or_else(|| {
+            RtDbError::new(
+                ErrorCode::BadRequest,
+                format!("removed table '{table_name}'"),
+            )
+        })?;
+        for (field_name, old_field_type) in &old_table.fields {
+            match new_table.fields.get(field_name) {
+                None => {
+                    return Err(RtDbError::new(
+                        ErrorCode::BadRequest,
+                        format!("removed field '{table_name}.{field_name}'"),
+                    ));
+                }
+                Some(new_field_type) if !field_type_eq(old_field_type, new_field_type) => {
+                    return Err(RtDbError::new(
+                        ErrorCode::BadRequest,
+                        format!("changed type of field '{table_name}.{field_name}'"),
+                    ));
+                }
+                _ => {}
+            }
+        }
+        for old_index in old_table.indexes.iter().flatten() {
+            let new_index = new_table
+                .indexes
+                .iter()
+                .flatten()
+                .find(|i| i.name == old_index.name);
+            let new_index = match new_index {
+                None => {
+                    return Err(RtDbError::new(
+                        ErrorCode::BadRequest,
+                        format!("removed index '{}'", old_index.name),
+                    ));
+                }
+                Some(i) => i,
+            };
+            if new_index.fields != old_index.fields {
+                return Err(RtDbError::new(
+                    ErrorCode::BadRequest,
+                    format!("changed fields of index '{}'", old_index.name),
+                ));
+            }
+            if new_index.search != old_index.search {
+                return Err(RtDbError::new(
+                    ErrorCode::BadRequest,
+                    format!(
+                        "changed kind of index '{}' (btree <-> search)",
+                        old_index.name
+                    ),
+                ));
+            }
+            if !option_vector_eq(&new_index.vector, &old_index.vector) {
+                return Err(RtDbError::new(
+                    ErrorCode::BadRequest,
+                    format!("changed vector spec of index '{}'", old_index.name),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Structural equality for [`FieldType`] (recursive over `Box`/`Vec`/`BTreeMap`
+/// interiors). Used by [`detect_destructive_changes`] since `FieldType` does
+/// not derive `PartialEq`.
+fn field_type_eq(a: &FieldType, b: &FieldType) -> bool {
+    use FieldType::*;
+    match (a, b) {
+        (String, String)
+        | (Number, Number)
+        | (Boolean, Boolean)
+        | (Null, Null)
+        | (Int64, Int64)
+        | (Bytes, Bytes)
+        | (Any, Any) => true,
+        (Id { table: ta }, Id { table: tb }) => ta == tb,
+        (Literal { value: va }, Literal { value: vb }) => va == vb,
+        (Optional { inner: ia }, Optional { inner: ib }) => field_type_eq(ia, ib),
+        (Union { variants: va }, Union { variants: vb }) => {
+            va.len() == vb.len() && va.iter().zip(vb.iter()).all(|(x, y)| field_type_eq(x, y))
+        }
+        (Array { element: ea }, Array { element: eb }) => field_type_eq(ea, eb),
+        (Object { fields: fa }, Object { fields: fb }) => {
+            // Both BTreeMaps iterate in sorted-key order, so a length-equal
+            // zip pairs identical keys iff the key sets match.
+            fa.len() == fb.len()
+                && fa
+                    .iter()
+                    .zip(fb.iter())
+                    .all(|((ka, va), (kb, vb))| ka == kb && field_type_eq(va, vb))
+        }
+        (Record { value: va }, Record { value: vb }) => field_type_eq(va, vb),
+        (Vector { dimensions: da }, Vector { dimensions: db }) => da == db,
+        _ => false,
+    }
+}
+
+/// Structural equality for `Option<&VectorIndexSpec>` — `None == None` and
+/// `Some == Some` iff both `dimensions` and `filter_fields` match.
+fn option_vector_eq(
+    a: &Option<crate::schema::VectorIndexSpec>,
+    b: &Option<crate::schema::VectorIndexSpec>,
+) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => a.dimensions == b.dimensions && a.filter_fields == b.filter_fields,
+        _ => false,
+    }
+}
+
 /// Removes keys whose value is `null` for an `Optional` field whose inner type
 /// does not itself accept `null` — a port of server `strip_unset_optionals` and
 /// the TS helper at `ts-client/src/in_memory.ts:225-240`. An
@@ -2436,27 +2565,90 @@ mod tests {
         // schema snapshot directly because query/collect land in task 3).
         let mut c = InMemoryRtDbClient::new(InMemoryRtDbClientOptions::default());
         let schema = test_schema();
-        c.push_schema(&schema);
+        c.push_schema(&schema).unwrap();
         let stored = c.to_schema_json().expect("schema installed");
         assert!(stored.tables.contains_key("items"));
         assert!(c.tables.contains_key("items"));
     }
 
     #[test]
-    fn push_schema_replaces_the_previous_schema() {
-        // The TS harness replaces (not additive-merges) on each push and clears
-        // stored docs/idempotency so each push starts from a clean slate. (The
-        // live server is additive-only; that evolution is deferred here.)
+    fn push_schema_rejects_a_destructive_second_push() {
+        // Server parity (ddl.rs::detect_destructive_changes): a second push
+        // missing a previously-declared table is rejected with BadRequest and
+        // the exact "removed table '<name>'" message; nothing is mutated.
         let mut c = InMemoryRtDbClient::new(InMemoryRtDbClientOptions::default());
-        c.push_schema(&test_schema());
+        c.push_schema(&test_schema()).unwrap();
         let only_other = Schema::builder()
             .table("solo", Table::new().field("x", FieldType::Number))
             .build();
-        c.push_schema(&only_other);
+        let err = c.push_schema(&only_other).unwrap_err();
+        assert!(
+            matches!(err.code, ErrorCode::BadRequest),
+            "got: {:?}",
+            err.code
+        );
+        assert!(err.message.contains("removed table 'items'"), "got: {err}");
+        // The rejected push left the prior schema in place.
+        let stored = c.to_schema_json().expect("schema still installed");
+        assert!(stored.tables.contains_key("items"));
+        assert!(c.tables.contains_key("items"));
+        assert!(!stored.tables.contains_key("solo"));
+    }
+
+    #[tokio::test]
+    async fn push_schema_additively_preserves_docs() {
+        // An additive second push (new optional field + new table) preserves
+        // previously-inserted docs and the prior idempotency cache.
+        let mut c = InMemoryRtDbClient::new(InMemoryRtDbClientOptions::default());
+        c.push_schema(&test_schema()).unwrap();
+        c.mutate(
+            &Mutation::new()
+                .insert("items", json!({"name": "a", "status": "todo", "order": 1}))
+                .build(),
+            Some("m1"),
+        )
+        .await
+        .unwrap();
+        // Add a new optional field on `items` and an entirely new `users` table.
+        let additive = Schema::builder()
+            .table(
+                "items",
+                Table::new()
+                    .field("name", FieldType::String)
+                    .field("status", FieldType::String)
+                    .field("order", FieldType::Number)
+                    .field("note", FieldType::optional(FieldType::String))
+                    .field("priority", FieldType::optional(FieldType::Number))
+                    .index("by_name", &["name"])
+                    .index("by_status", &["status"])
+                    .index("by_status_and_order", &["status", "order"]),
+            )
+            .table("users", Table::new().field("email", FieldType::String))
+            .build();
+        c.push_schema(&additive).unwrap();
+        // The new field/table are folded in…
         let stored = c.to_schema_json().expect("schema installed");
-        assert!(stored.tables.contains_key("solo"));
-        assert!(!stored.tables.contains_key("items"));
-        assert!(!c.tables.contains_key("items"));
+        assert!(stored.tables.contains_key("users"));
+        assert!(stored.tables["items"].fields.contains_key("priority"));
+        // …and the pre-existing row is still queryable.
+        let r = c
+            .run_query(&Query {
+                table: "items".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let docs = r.as_array().expect("collect returns an array");
+        assert_eq!(docs.len(), 1, "pre-existing row survived the additive push");
+        assert_eq!(docs[0]["name"], json!("a"));
+        // Idempotency cache is preserved across the additive push.
+        c.mutate(
+            &Mutation::new()
+                .insert("items", json!({"name": "a", "status": "todo", "order": 1}))
+                .build(),
+            Some("m1"),
+        )
+        .await
+        .expect("idempotency cache hit short-circuits with the cached results");
     }
 
     // ---- validate_doc --------------------------------------------------
@@ -2657,7 +2849,7 @@ mod tests {
                 })
                 .random(|| 0.0),
         );
-        client.push_schema(&test_schema());
+        client.push_schema(&test_schema()).unwrap();
         client
     }
 
@@ -3383,7 +3575,7 @@ mod tests {
                 })
                 .random(|| 0.0),
         );
-        client.push_schema(&int64_test_schema());
+        client.push_schema(&int64_test_schema()).unwrap();
         client
     }
 
@@ -4543,7 +4735,7 @@ mod tests {
                 })
                 .random(|| 0.0),
         );
-        client.push_schema(&users_schema());
+        client.push_schema(&users_schema()).unwrap();
         client
     }
 
@@ -4856,7 +5048,7 @@ mod tests {
                 .now(move || *cell_for_closure.lock().expect("not poisoned"))
                 .random(|| 0.0),
         );
-        client.push_schema(&test_schema());
+        client.push_schema(&test_schema()).unwrap();
         (client, cell)
     }
 
