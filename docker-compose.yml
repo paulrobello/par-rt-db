@@ -48,6 +48,12 @@ services:
       RTDB_GOOGLE_CLIENT_ID: ${RTDB_GOOGLE_CLIENT_ID:-}
       RTDB_GOOGLE_CLIENT_SECRET: ${RTDB_GOOGLE_CLIENT_SECRET:-}
       RTDB_SESSION_TTL_DAYS: ${RTDB_SESSION_TTL_DAYS:-30}
+      # Shadow-verify 1 subscription-invalidation skip in every N (0 = off).
+      # NOTE: this `environment:` block is an explicit ALLOWLIST — a key present
+      # in `.env` but absent here never reaches the container. Adding a new
+      # RTDB_* boot knob means adding a line here too, or it silently keeps its
+      # code default in the docker deploy.
+      RTDB_SUBS_VERIFY_SKIP_EVERY: ${RTDB_SUBS_VERIFY_SKIP_EVERY:-0}
       RUST_LOG: ${RUST_LOG:-info}
     ports:
       - "127.0.0.1:8300:8300"
