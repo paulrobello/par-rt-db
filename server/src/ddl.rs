@@ -62,6 +62,7 @@ fn backfill_expr(pg_type: &str, field_name: &str) -> Result<String, RtDbError> {
     match pg_type {
         "text" => Ok(format!("(doc->>'{field_name}')")),
         "double precision" => Ok(format!("(doc->>'{field_name}')::float8")),
+        "bigint" => Ok(format!("(doc->>'{field_name}')::bigint")),
         "boolean" => Ok(format!("(doc->>'{field_name}')::boolean")),
         other => Err(RtDbError::internal(format!(
             "unsupported backfill cast for pg type '{other}'"

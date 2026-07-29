@@ -897,6 +897,7 @@ pub async fn execute_query(
                 EqBind::Text(v) => query.bind(v),
                 EqBind::Num(v) => query.bind(v),
                 EqBind::Bool(v) => query.bind(v),
+                EqBind::I64(v) => query.bind(v),
             };
         }
         for bind in range_binds {
@@ -904,6 +905,7 @@ pub async fn execute_query(
                 EqBind::Text(v) => query.bind(v),
                 EqBind::Num(v) => query.bind(v),
                 EqBind::Bool(v) => query.bind(v),
+                EqBind::I64(v) => query.bind(v),
             };
         }
         for bind in &filter_binds {
@@ -911,6 +913,7 @@ pub async fn execute_query(
                 EqBind::Text(v) => query.bind(v),
                 EqBind::Num(v) => query.bind(v),
                 EqBind::Bool(v) => query.bind(v),
+                EqBind::I64(v) => query.bind(v),
             };
         }
         let count = query.fetch_one(pool).await?;
@@ -957,6 +960,7 @@ pub async fn execute_query(
                 EqBind::Text(v) => query.bind(v),
                 EqBind::Num(v) => query.bind(v),
                 EqBind::Bool(v) => query.bind(v),
+                EqBind::I64(v) => query.bind(v),
             };
         }
         for bind in range_binds {
@@ -964,6 +968,7 @@ pub async fn execute_query(
                 EqBind::Text(v) => query.bind(v),
                 EqBind::Num(v) => query.bind(v),
                 EqBind::Bool(v) => query.bind(v),
+                EqBind::I64(v) => query.bind(v),
             };
         }
         for bind in &filter_binds {
@@ -971,6 +976,7 @@ pub async fn execute_query(
                 EqBind::Text(v) => query.bind(v),
                 EqBind::Num(v) => query.bind(v),
                 EqBind::Bool(v) => query.bind(v),
+                EqBind::I64(v) => query.bind(v),
             };
         }
         query = query.bind(i64::from(MAX_TAKE));
@@ -1049,6 +1055,7 @@ pub async fn execute_query(
                     EqBind::Text(v) => query.bind(v),
                     EqBind::Num(v) => query.bind(v),
                     EqBind::Bool(v) => query.bind(v),
+                    EqBind::I64(v) => query.bind(v),
                 };
             }
             for bind in range_binds {
@@ -1056,6 +1063,7 @@ pub async fn execute_query(
                     EqBind::Text(v) => query.bind(v),
                     EqBind::Num(v) => query.bind(v),
                     EqBind::Bool(v) => query.bind(v),
+                    EqBind::I64(v) => query.bind(v),
                 };
             }
             for bind in &filter_binds {
@@ -1063,6 +1071,7 @@ pub async fn execute_query(
                     EqBind::Text(v) => query.bind(v),
                     EqBind::Num(v) => query.bind(v),
                     EqBind::Bool(v) => query.bind(v),
+                    EqBind::I64(v) => query.bind(v),
                 };
             }
             query = query.bind(i64::from(MAX_TAKE));
@@ -1086,6 +1095,7 @@ pub async fn execute_query(
                 EqBind::Text(v) => query.bind(v),
                 EqBind::Num(v) => query.bind(v),
                 EqBind::Bool(v) => query.bind(v),
+                EqBind::I64(v) => query.bind(v),
             };
         }
         for bind in range_binds {
@@ -1093,6 +1103,7 @@ pub async fn execute_query(
                 EqBind::Text(v) => query.bind(v),
                 EqBind::Num(v) => query.bind(v),
                 EqBind::Bool(v) => query.bind(v),
+                EqBind::I64(v) => query.bind(v),
             };
         }
         for bind in &filter_binds {
@@ -1100,6 +1111,7 @@ pub async fn execute_query(
                 EqBind::Text(v) => query.bind(v),
                 EqBind::Num(v) => query.bind(v),
                 EqBind::Bool(v) => query.bind(v),
+                EqBind::I64(v) => query.bind(v),
             };
         }
         let (v,) = query.fetch_one(pool).await?;
@@ -1193,6 +1205,7 @@ pub async fn execute_query(
                 EqBind::Text(v) => query.bind(v),
                 EqBind::Num(v) => query.bind(v),
                 EqBind::Bool(v) => query.bind(v),
+                EqBind::I64(v) => query.bind(v),
             };
         }
         for bind in range_binds {
@@ -1200,6 +1213,7 @@ pub async fn execute_query(
                 EqBind::Text(v) => query.bind(v),
                 EqBind::Num(v) => query.bind(v),
                 EqBind::Bool(v) => query.bind(v),
+                EqBind::I64(v) => query.bind(v),
             };
         }
         for bind in &filter_binds {
@@ -1207,6 +1221,7 @@ pub async fn execute_query(
                 EqBind::Text(v) => query.bind(v),
                 EqBind::Num(v) => query.bind(v),
                 EqBind::Bool(v) => query.bind(v),
+                EqBind::I64(v) => query.bind(v),
             };
         }
         for bind in cursor_binds {
@@ -1214,6 +1229,7 @@ pub async fn execute_query(
                 EqBind::Text(v) => query.bind(v),
                 EqBind::Num(v) => query.bind(v),
                 EqBind::Bool(v) => query.bind(v),
+                EqBind::I64(v) => query.bind(v),
             };
         }
         // Fetch one extra row so a next page can be detected without a second
@@ -1285,6 +1301,7 @@ pub async fn execute_query(
             EqBind::Text(v) => query.bind(v),
             EqBind::Num(v) => query.bind(v),
             EqBind::Bool(v) => query.bind(v),
+            EqBind::I64(v) => query.bind(v),
         };
     }
     for bind in range_binds {
@@ -1292,6 +1309,7 @@ pub async fn execute_query(
             EqBind::Text(v) => query.bind(v),
             EqBind::Num(v) => query.bind(v),
             EqBind::Bool(v) => query.bind(v),
+            EqBind::I64(v) => query.bind(v),
         };
     }
     for bind in &filter_binds {
@@ -1299,6 +1317,7 @@ pub async fn execute_query(
             EqBind::Text(v) => query.bind(v),
             EqBind::Num(v) => query.bind(v),
             EqBind::Bool(v) => query.bind(v),
+            EqBind::I64(v) => query.bind(v),
         };
     }
     query = query.bind(i64::from(limit));
@@ -1788,6 +1807,7 @@ async fn execute_vector_search(
             EqBind::Text(v) => query.bind(v),
             EqBind::Num(v) => query.bind(v),
             EqBind::Bool(v) => query.bind(v),
+            EqBind::I64(v) => query.bind(v),
         };
     }
     if let Some(uid) = enforced_uid {
@@ -2092,13 +2112,13 @@ fn row_auth_predicate_body(
 }
 
 /// Whether an indexed field's declared type is numeric (the only numeric
-/// shape among indexable types is `Number`; `Int64` is not indexable, so it
-/// can't appear here). Used by the `aggregate` terminal to reject `sum`/`avg`
-/// over a non-numeric index field. Unwraps one layer of `Optional` so an
-/// `Optional<Number>` index field still qualifies.
+/// Whether an indexed field's declared type is numeric enough for `sum`/`avg`.
+/// `Number` and `Int64` both qualify (`Optional<…>` unwraps one layer). Note:
+/// `SUM(bigint)`/`AVG(bigint)` return Postgres `numeric`, which serializes as a
+/// JSON number (f64) — precision is lost past 2^53; accepted trade-off.
 fn is_numeric_index_field(ty: &FieldType) -> bool {
     match ty {
-        FieldType::Number => true,
+        FieldType::Number | FieldType::Int64 => true,
         FieldType::Optional { inner } => is_numeric_index_field(inner),
         _ => false,
     }

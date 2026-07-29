@@ -1,8 +1,12 @@
 mod common;
 
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
 use common::{fresh_db, kanban_schema_json, test_state};
+use rtdb_server::AppState;
+use rtdb_server::db;
+use rtdb_server::ddl;
 use rtdb_server::error::ErrorCode;
 use rtdb_server::schema::SchemaDef;
 use rtdb_server::txn::{Step, Transaction, execute_txn};
@@ -1023,5 +1027,242 @@ async fn max_steps_boundary() -> anyhow::Result<()> {
         .expect_err("expected bad request");
     assert_eq!(err.code, ErrorCode::BadRequest);
 
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// int64 index column recomputation on patch/replace — mirrors the
+// Number→double precision path. Deviation from the brief: `fresh_db` always
+// pushes the kanban schema, and pushing int64-only on top would be rejected
+// as a destructive change, so we create the DB and push the int64 schema
+// directly (same pattern as `search_test.rs::fresh_search_db`).
+// ---------------------------------------------------------------------------
+
+fn int64_schema() -> SchemaDef {
+    serde_json::from_value(serde_json::json!({
+        "tables": {
+            "events": {
+                "fields": {
+                    "ts": { "type": "int64" },
+                    "kind": { "type": "string" }
+                },
+                "indexes": [{ "name": "by_ts", "fields": ["ts"] }]
+            }
+        }
+    }))
+    .expect("parse int64 schema")
+}
+
+async fn fresh_int64_db(state: &Arc<AppState>) -> String {
+    let name = format!("t{}", uuid::Uuid::now_v7().simple());
+    db::create_database(&state.pool, &name)
+        .await
+        .expect("create db");
+    ddl::push_schema(&state.pool, &name, int64_schema())
+        .await
+        .expect("push int64 schema");
+    name
+}
+
+// patch must recompute the bigint column: insert ts:"5" (outside the gte 20
+// window), patch to ts:"50" (inside), and a `gte("20")` query must then match.
+#[tokio::test]
+async fn patch_recomputes_int64_indexed_column() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_int64_db(&state).await;
+    let schema = int64_schema();
+
+    let insert_outcome = execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::Insert {
+                table: "events".to_string(),
+                doc: doc(serde_json::json!({ "ts": "5", "kind": "a" })),
+            }],
+        },
+        None,
+    )
+    .await?;
+    let id = insert_outcome.results[0]["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+
+    // Pre-patch: ts=5, below the gte 20 window -> no match.
+    let pre = rtdb_server::query::execute_query(
+        &pool,
+        &db,
+        &schema,
+        &rtdb_server::query::Query {
+            table: "events".to_string(),
+            get: None,
+            index: Some("by_ts".to_string()),
+            eq: vec![],
+            gt: None,
+            gte: Some(serde_json::json!("20")),
+            lt: None,
+            lte: None,
+            order: None,
+            take: Some(10),
+            unique: false,
+            first: false,
+            count: false,
+            distinct: false,
+            paginate: None,
+            filter: None,
+            search: None,
+            vector_search: None,
+            hybrid_search: None,
+            aggregate: None,
+        },
+        None,
+    )
+    .await?;
+    assert!(matches!(
+        pre,
+        rtdb_server::query::QueryResult::Docs(ref ds) if ds.is_empty()
+    ));
+
+    // Patch ts -> 50; the f_ts bigint column must be recomputed.
+    let mut fields = serde_json::Map::new();
+    fields.insert("ts".to_string(), serde_json::json!("50"));
+    execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::Patch {
+                table: "events".to_string(),
+                id: id.clone(),
+                fields,
+            }],
+        },
+        None,
+    )
+    .await?;
+
+    // Post-patch: ts=50, inside the gte 20 window -> match.
+    let post = rtdb_server::query::execute_query(
+        &pool,
+        &db,
+        &schema,
+        &rtdb_server::query::Query {
+            table: "events".to_string(),
+            get: None,
+            index: Some("by_ts".to_string()),
+            eq: vec![],
+            gt: None,
+            gte: Some(serde_json::json!("20")),
+            lt: None,
+            lte: None,
+            order: None,
+            take: Some(10),
+            unique: false,
+            first: false,
+            count: false,
+            distinct: false,
+            paginate: None,
+            filter: None,
+            search: None,
+            vector_search: None,
+            hybrid_search: None,
+            aggregate: None,
+        },
+        None,
+    )
+    .await?;
+    match post {
+        rtdb_server::query::QueryResult::Docs(ds) => {
+            assert_eq!(ds.len(), 1);
+            assert_eq!(ds[0]["kind"].as_str().expect("kind"), "a");
+            assert_eq!(ds[0]["ts"].as_str().expect("ts"), "50");
+        }
+        other => panic!("expected Docs, got {other:?}"),
+    }
+    Ok(())
+}
+
+// replace must recompute the bigint column from the new doc body.
+#[tokio::test]
+async fn replace_recomputes_int64_indexed_column() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_int64_db(&state).await;
+    let schema = int64_schema();
+
+    let insert_outcome = execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::Insert {
+                table: "events".to_string(),
+                doc: doc(serde_json::json!({ "ts": "5", "kind": "a" })),
+            }],
+        },
+        None,
+    )
+    .await?;
+    let id = insert_outcome.results[0]["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+
+    // Replace with ts=50; the f_ts bigint column must be recomputed.
+    execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::Replace {
+                table: "events".to_string(),
+                id: id.clone(),
+                doc: doc(serde_json::json!({ "ts": "50", "kind": "b" })),
+            }],
+        },
+        None,
+    )
+    .await?;
+
+    let post = rtdb_server::query::execute_query(
+        &pool,
+        &db,
+        &schema,
+        &rtdb_server::query::Query {
+            table: "events".to_string(),
+            get: None,
+            index: Some("by_ts".to_string()),
+            eq: vec![],
+            gt: None,
+            gte: Some(serde_json::json!("20")),
+            lt: None,
+            lte: None,
+            order: None,
+            take: Some(10),
+            unique: false,
+            first: false,
+            count: false,
+            distinct: false,
+            paginate: None,
+            filter: None,
+            search: None,
+            vector_search: None,
+            hybrid_search: None,
+            aggregate: None,
+        },
+        None,
+    )
+    .await?;
+    match post {
+        rtdb_server::query::QueryResult::Docs(ds) => {
+            assert_eq!(ds.len(), 1);
+            assert_eq!(ds[0]["kind"].as_str().expect("kind"), "b");
+            assert_eq!(ds[0]["ts"].as_str().expect("ts"), "50");
+        }
+        other => panic!("expected Docs, got {other:?}"),
+    }
     Ok(())
 }

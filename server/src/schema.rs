@@ -213,13 +213,15 @@ fn is_string_array_field(ty: &FieldType) -> bool {
 }
 
 /// Column type for an indexed field. Indexable types: `String`->"text",
-/// `Number`->"double precision", `Boolean`->"boolean", `Id`->"text",
-/// `Literal(string)`->"text", `Union` where every variant is `Literal(string)`->"text".
-/// `Optional<indexable>` -> (pg_type, nullable=true). Anything else is an error.
+/// `Number`->"double precision", `Int64`->"bigint", `Boolean`->"boolean",
+/// `Id`->"text", `Literal(string)`->"text", `Union` where every variant is
+/// `Literal(string)`->"text". `Optional<indexable>` -> (pg_type, nullable=true).
+/// Anything else is an error.
 pub fn indexed_column_type(ty: &FieldType) -> Result<(&'static str, bool), RtDbError> {
     match ty {
         FieldType::String => Ok(("text", false)),
         FieldType::Number => Ok(("double precision", false)),
+        FieldType::Int64 => Ok(("bigint", false)),
         FieldType::Boolean => Ok(("boolean", false)),
         FieldType::Id { .. } => Ok(("text", false)),
         FieldType::Literal { value } if value.is_string() => Ok(("text", false)),
@@ -988,6 +990,10 @@ mod tests {
             ("double precision", false)
         );
         assert_eq!(
+            indexed_column_type(&FieldType::Int64).unwrap(),
+            ("bigint", false)
+        );
+        assert_eq!(
             indexed_column_type(&FieldType::Boolean).unwrap(),
             ("boolean", false)
         );
@@ -1236,7 +1242,6 @@ mod tests {
 
     #[test]
     fn indexed_column_type_rejects_new_non_indexable_types() {
-        assert!(indexed_column_type(&FieldType::Int64).is_err());
         assert!(indexed_column_type(&FieldType::Bytes).is_err());
         assert!(indexed_column_type(&FieldType::Any).is_err());
         assert!(

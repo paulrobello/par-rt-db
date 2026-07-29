@@ -1,8 +1,12 @@
 mod common;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use common::{fresh_db, kanban_schema_json, test_state};
+use rtdb_server::AppState;
+use rtdb_server::db;
+use rtdb_server::ddl;
 use rtdb_server::error::ErrorCode;
 use rtdb_server::pagination::encode_cursor;
 use rtdb_server::query::{
@@ -3904,5 +3908,231 @@ async fn filter_wrong_typed_value_on_indexed_column_is_bad_request() -> anyhow::
     .await
     .expect_err("expected bad request");
     assert_eq!(err.code, ErrorCode::BadRequest);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// int64 indexable as bigint — mirrors the Number→double precision path.
+// Deviation from the task brief: the brief wrote `let db = fresh_db(&state).await`,
+// but `fresh_db` always pushes the kanban schema, and a subsequent `push_schema`
+// of the int64-only schema would be rejected as "removed table 'projects'".
+// Instead we mirror `search_test.rs`'s `fresh_search_db`: create the DB and
+// push the int64 schema directly.
+// ---------------------------------------------------------------------------
+
+fn int64_schema() -> SchemaDef {
+    serde_json::from_value(serde_json::json!({
+        "tables": {
+            "events": {
+                "fields": {
+                    "ts": { "type": "int64" },
+                    "kind": { "type": "string" }
+                },
+                "indexes": [{ "name": "by_ts", "fields": ["ts"] }]
+            }
+        }
+    }))
+    .expect("parse int64 schema")
+}
+
+async fn fresh_int64_db(state: &Arc<AppState>) -> String {
+    let name = format!("t{}", uuid::Uuid::now_v7().simple());
+    db::create_database(&state.pool, &name)
+        .await
+        .expect("create db");
+    ddl::push_schema(&state.pool, &name, int64_schema())
+        .await
+        .expect("push int64 schema");
+    name
+}
+
+async fn insert_event(
+    pool: &PgPool,
+    db: &str,
+    schema: &SchemaDef,
+    ts: &str,
+    kind: &str,
+) -> anyhow::Result<String> {
+    let outcome = execute_txn(
+        pool,
+        db,
+        schema,
+        &Transaction {
+            steps: vec![Step::Insert {
+                table: "events".to_string(),
+                doc: doc(serde_json::json!({ "ts": ts, "kind": kind })),
+            }],
+        },
+        None,
+    )
+    .await?;
+    Ok(outcome.results[0]["id"]
+        .as_str()
+        .expect("id string")
+        .to_string())
+}
+
+fn docs_kinds(result: QueryResult) -> Vec<String> {
+    match result {
+        QueryResult::Docs(docs) => docs
+            .iter()
+            .map(|d| d["kind"].as_str().expect("kind").to_string())
+            .collect(),
+        _ => panic!("expected Docs, got {result:?}"),
+    }
+}
+
+#[tokio::test]
+async fn int64_index_range_and_eq_compare_numerically() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_int64_db(&state).await;
+    let schema = int64_schema();
+    insert_event(&pool, &db, &schema, "100", "a").await?;
+    insert_event(&pool, &db, &schema, "20", "b").await?;
+    insert_event(&pool, &db, &schema, "3", "c").await?;
+
+    // Numeric range [20, +inf) asc -> ["b" (20), "a" (100)] — NOT lexicographic
+    // ("100" would sort before "20" as strings).
+    let r = execute_query(
+        &pool,
+        &db,
+        &schema,
+        &Query {
+            table: "events".to_string(),
+            get: None,
+            index: Some("by_ts".to_string()),
+            eq: vec![],
+            gt: None,
+            gte: Some(serde_json::json!("20")),
+            lt: None,
+            lte: None,
+            order: Some(Order::Asc),
+            take: Some(10),
+            unique: false,
+            first: false,
+            count: false,
+            distinct: false,
+            paginate: None,
+            filter: None,
+            search: None,
+            vector_search: None,
+            hybrid_search: None,
+            aggregate: None,
+        },
+        None,
+    )
+    .await?;
+    assert_eq!(docs_kinds(r), vec!["b".to_string(), "a".to_string()]);
+
+    // eq on the int64 field matches the decimal-string value.
+    let r = execute_query(
+        &pool,
+        &db,
+        &schema,
+        &Query {
+            table: "events".to_string(),
+            get: None,
+            index: Some("by_ts".to_string()),
+            eq: vec![serde_json::json!("100")],
+            gt: None,
+            gte: None,
+            lt: None,
+            lte: None,
+            order: None,
+            take: Some(10),
+            unique: false,
+            first: false,
+            count: false,
+            distinct: false,
+            paginate: None,
+            filter: None,
+            search: None,
+            vector_search: None,
+            hybrid_search: None,
+            aggregate: None,
+        },
+        None,
+    )
+    .await?;
+    assert_eq!(docs_kinds(r), vec!["a".to_string()]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn int64_index_count_and_aggregate() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_int64_db(&state).await;
+    let schema = int64_schema();
+    insert_event(&pool, &db, &schema, "10", "a").await?;
+    insert_event(&pool, &db, &schema, "20", "b").await?;
+    insert_event(&pool, &db, &schema, "30", "c").await?;
+
+    let r = execute_query(
+        &pool,
+        &db,
+        &schema,
+        &Query {
+            table: "events".to_string(),
+            get: None,
+            index: Some("by_ts".to_string()),
+            eq: vec![],
+            gt: None,
+            gte: None,
+            lt: None,
+            lte: None,
+            order: None,
+            take: None,
+            unique: false,
+            first: false,
+            count: true,
+            distinct: false,
+            paginate: None,
+            filter: None,
+            search: None,
+            vector_search: None,
+            hybrid_search: None,
+            aggregate: None,
+        },
+        None,
+    )
+    .await?;
+    assert!(matches!(r, QueryResult::Count(3)));
+
+    let r = execute_query(
+        &pool,
+        &db,
+        &schema,
+        &Query {
+            table: "events".to_string(),
+            get: None,
+            index: Some("by_ts".to_string()),
+            eq: vec![],
+            gt: None,
+            gte: None,
+            lt: None,
+            lte: None,
+            order: None,
+            take: None,
+            unique: false,
+            first: false,
+            count: false,
+            distinct: false,
+            paginate: None,
+            filter: None,
+            search: None,
+            vector_search: None,
+            hybrid_search: None,
+            aggregate: Some(AggregateSpec {
+                op: AggregateOp::Sum,
+                group_by: false,
+            }),
+        },
+        None,
+    )
+    .await?;
+    // SUM(bigint) projects via to_jsonb -> JSON number.
+    assert!(matches!(r, QueryResult::Aggregate(ref v) if v.as_f64() == Some(60.0)));
     Ok(())
 }

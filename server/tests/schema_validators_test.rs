@@ -70,9 +70,11 @@ async fn push_schema_creates_table_with_no_extra_typed_columns() -> anyhow::Resu
     Ok(())
 }
 
-// (b) Attempting to index any of the four new types is rejected at push_schema time.
+// (b) Indexing an int64 field is accepted at push_schema time and produces a
+// typed `bigint` column. (Until 2026-07-28 int64 was in the non-indexable
+// bucket alongside Bytes/Any/Record; the Int64→bigint path lifted it out.)
 #[tokio::test]
-async fn push_schema_rejects_index_over_int64_field() -> anyhow::Result<()> {
+async fn push_schema_accepts_index_over_int64_field() -> anyhow::Result<()> {
     let state = test_state().await;
     let name = format!("t{}", uuid::Uuid::now_v7().simple());
     db::create_database(&state.pool, &name).await?;
@@ -82,10 +84,22 @@ async fn push_schema_rejects_index_over_int64_field() -> anyhow::Result<()> {
         serde_json::json!([{"name": "by_big", "fields": ["big"]}]);
     let schema: SchemaDef = serde_json::from_value(json)?;
 
-    let err = ddl::push_schema(&state.pool, &name, schema)
+    ddl::push_schema(&state.pool, &name, schema)
         .await
-        .expect_err("indexing an int64 field must be rejected");
-    assert_eq!(err.code, ErrorCode::SchemaViolation);
+        .expect("indexing an int64 field must succeed");
+
+    // The bigint column for `big` exists alongside the base columns.
+    let pg_schema_name = ddl::pg_schema(&name);
+    let table_ident = ddl::pg_table("widgets");
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT column_name FROM information_schema.columns WHERE table_schema = $1 AND table_name = $2 ORDER BY column_name",
+    )
+    .bind(&pg_schema_name)
+    .bind(&table_ident)
+    .fetch_all(&state.pool)
+    .await?;
+    let columns: Vec<String> = rows.into_iter().map(|(c,)| c).collect();
+    assert_eq!(columns, vec!["created_at", "doc", "f_big", "id", "version"]);
     Ok(())
 }
 

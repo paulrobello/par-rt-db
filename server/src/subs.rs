@@ -71,9 +71,17 @@ struct RangeBound {
 
 impl IndexedRead {
     /// Whether `doc` falls inside this subscription's eq-prefix + range window.
-    /// Pure and total: any typing failure, missing field, or comparison doubt
-    /// returns `false` (outside), which biases `fan_out` toward RE-RUNNING
-    /// (over-approximation) — it can never cause a missed push. Never panics.
+    /// Pure and total: never panics. Returns `false` (outside) on a typing
+    /// failure, missing field, or comparison doubt.
+    ///
+    /// NOTE: `false` here means fan_out will SKIP this doc (`indexed_affects`
+    /// returns false), so a wrong `false` is UNDER-approximation — a missed
+    /// push. The comparison path therefore requires every `EqBind` variant to
+    /// have a real `cmp_binds` arm (see that function's doc); the eq-prefix
+    /// path's typing fallbacks are themselves under-approximate and only safe
+    /// insofar as they fire on truly untellable cases (e.g. a doc whose field
+    /// has the wrong JSON type — a schema violation that should already have
+    /// been rejected at write time).
     fn in_window(&self, doc: &serde_json::Map<String, serde_json::Value>) -> bool {
         // Eq prefix: AND of equalities. One miss ⇒ outside.
         for (field, ty, want) in &self.eq {
@@ -106,22 +114,34 @@ impl IndexedRead {
     }
 }
 
-/// Three-way comparison of two typed binds. Returns `None` when the variants
-/// differ (shouldn't happen — both come from the same `FieldType` — but
-/// defensive: treating a mismatch as unorderable biases `in_window` to return
-/// `false` ⇒ re-run). `Num` uses `partial_cmp` so a (theoretically impossible
-/// from JSON) NaN is treated as unorderable rather than panicking.
+/// Three-way comparison of two typed binds.
+///
+/// **Every `EqBind` variant MUST have an arm here.** Returns `None` only on a
+/// variant mismatch (e.g. `Text` vs `Num`), which shouldn't happen in practice
+/// — both binds derive from the same `FieldType` — but is defensive against a
+/// bug. `Num` uses `partial_cmp` so a (theoretically impossible from JSON) NaN
+/// is treated as unorderable rather than panicking.
+///
+/// The `_ => None` arm is NOT a soundness backstop. `None` propagates through
+/// `satisfies_lower`/`satisfies_upper` as `false`, which makes `in_window`
+/// return `false`, which makes `indexed_affects` return `false` for created/
+/// updated docs, which makes `fan_out` SKIP the re-run (`if !affects { continue; }`).
+/// That is UNDER-approximation — a missed push — and violates the committer's
+/// load-bearing "never under-approximate" invariant. So adding a new `EqBind`
+/// variant without a corresponding arm here is a correctness bug, not a
+/// conservative fallback.
 fn cmp_binds(a: &EqBind, b: &EqBind) -> Option<std::cmp::Ordering> {
     match (a, b) {
         (EqBind::Text(x), EqBind::Text(y)) => Some(x.cmp(y)),
         (EqBind::Num(x), EqBind::Num(y)) => x.partial_cmp(y),
         (EqBind::Bool(x), EqBind::Bool(y)) => Some(x.cmp(y)),
+        (EqBind::I64(x), EqBind::I64(y)) => Some(x.cmp(y)),
         _ => None,
     }
 }
 
 /// Whether `have >= bound` (inclusive) or `have > bound` (exclusive), per
-/// `inclusive`. Any comparison doubt ⇒ `false` (outside ⇒ over-approximate).
+/// `inclusive`. Comparison doubt ⇒ `false` (judged outside the bound — every `EqBind` variant must be orderable in `cmp_binds`, else a missed arm would under-approximate here).
 fn satisfies_lower(have: &EqBind, bound: &EqBind, inclusive: bool) -> bool {
     match cmp_binds(have, bound) {
         Some(std::cmp::Ordering::Greater) => true,
@@ -131,7 +151,7 @@ fn satisfies_lower(have: &EqBind, bound: &EqBind, inclusive: bool) -> bool {
 }
 
 /// Whether `have <= bound` (inclusive) or `have < bound` (exclusive), per
-/// `inclusive`. Any comparison doubt ⇒ `false` (outside ⇒ over-approximate).
+/// `inclusive`. Comparison doubt ⇒ `false` (judged outside the bound — every `EqBind` variant must be orderable in `cmp_binds`, else a missed arm would under-approximate here).
 fn satisfies_upper(have: &EqBind, bound: &EqBind, inclusive: bool) -> bool {
     match cmp_binds(have, bound) {
         Some(std::cmp::Ordering::Less) => true,
@@ -482,7 +502,10 @@ impl SubscriptionManager {
             // every written doc is provably irrelevant, skip the re-run. This
             // is the v2 win: writes to documents outside the window no longer
             // trigger a needless Postgres round-trip + canonical diff. Sound
-            // because `in_window` returns false on any doubt (over-approximate).
+            // only because every `EqBind` variant has a real `cmp_binds` arm —
+            // `in_window` returns false on comparison doubt, which would
+            // UNDER-approximate (skip a real push), so the typing layer must
+            // never return `false` on a value that's actually inside the window.
             if let ReadSet::Indexed(indexed) = &entry.read_set {
                 let table = &entry.query.table;
                 let mut affects = false;

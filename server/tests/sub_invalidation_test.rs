@@ -854,3 +854,139 @@ async fn patch_then_delete_same_doc_pushes_count() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+// =====================================================================
+// 9. Regression: int64 range subscription must re-run for in-window writes.
+//    Mirrors `range_collect_skips_below_range_pushes_in_range` but on an
+//    `Int64` index. Before the `cmp_binds` I64 arm was added, `cmp_binds`
+//    returned `None` for `(I64, I64)` (the `_` arm), which propagated as
+//    `satisfies_lower == false` → `in_window == false` → `indexed_affects ==
+//    false` → fan_out hit `if !affects { continue; }` and SKIPPED the in-range
+//    insert, silently dropping the push. That is under-approximation and
+//    violates the committer's load-bearing invariant.
+// =====================================================================
+
+fn int64_events_schema_json() -> serde_json::Value {
+    serde_json::json!({"tables":{
+      "events":{
+        "fields":{
+          "ts": { "type": "int64" },
+          "kind": { "type": "string" }
+        },
+        "indexes":[{"name":"by_ts","fields":["ts"]}]
+      }
+    }})
+}
+
+/// Creates a fresh DB and pushes the int64-events schema (mirrors
+/// `fresh_db`'s shape but with our custom schema, since `fresh_db` is
+/// hardcoded to push the kanban schema).
+async fn fresh_int64_db(state: &std::sync::Arc<rtdb_server::AppState>) -> String {
+    let name = format!("t{}", uuid::Uuid::now_v7().simple());
+    rtdb_server::db::create_database(&state.pool, &name)
+        .await
+        .expect("create db");
+    let schema: SchemaDef =
+        serde_json::from_value(int64_events_schema_json()).expect("parse int64 schema");
+    ddl::push_schema(&state.pool, &name, schema)
+        .await
+        .expect("push int64 schema");
+    name
+}
+
+fn insert_event(ts: &str, kind: &str) -> Transaction {
+    Transaction {
+        steps: vec![Step::Insert {
+            table: "events".to_string(),
+            doc: serde_json::json!({ "ts": ts, "kind": kind })
+                .as_object()
+                .expect("json object")
+                .clone(),
+        }],
+    }
+}
+
+fn patch_event_ts(id: &str, ts: &str) -> Transaction {
+    let mut fields = serde_json::Map::new();
+    fields.insert("ts".to_string(), serde_json::Value::String(ts.to_string()));
+    Transaction {
+        steps: vec![Step::Patch {
+            table: "events".to_string(),
+            id: id.to_string(),
+            fields,
+        }],
+    }
+}
+
+/// count on `by_ts` with `gte=N` — exercises the range path through cmp_binds.
+fn count_events_by_ts_gte(gte: &str) -> Query {
+    serde_json::from_value(serde_json::json!({
+        "table": "events",
+        "index": "by_ts",
+        "eq": [],
+        "gte": gte,
+        "count": true
+    }))
+    .expect("parse query")
+}
+
+#[tokio::test]
+async fn int64_range_count_skips_out_of_window_pushes_in_window() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let db = fresh_int64_db(&state).await;
+
+    // Sub: count events with ts >= 10.
+    let mut rx = sub(&state, &db, count_events_by_ts_gte("10")).await;
+
+    // Out-of-window insert (ts=5, below the gte=10 bound) — must SKIP.
+    state
+        .realtime
+        .committers
+        .mutate(&db, None, insert_event("5", "a"), None)
+        .await?;
+    expect_no_update(&mut rx, "below-range int64 insert");
+
+    // In-window insert (ts=20, >= 10) — must PUSH.
+    // REGRESSION: without the `(I64, I64)` arm in cmp_binds, this was skipped
+    // (None → satisfies_lower=false → in_window=false → fan_out `continue`),
+    // dropping the push.
+    state
+        .realtime
+        .committers
+        .mutate(&db, None, insert_event("20", "b"), None)
+        .await?;
+    expect_update(&mut rx, "in-range int64 insert").await;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn int64_range_count_patch_into_window_pushes() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let db = fresh_int64_db(&state).await;
+
+    // Seed one event below the window (ts=5).
+    let outcome = state
+        .realtime
+        .committers
+        .mutate(&db, None, insert_event("5", "a"), None)
+        .await?;
+    let id = id_of(&outcome);
+
+    // Sub: count events with ts >= 10.
+    let mut rx = sub(&state, &db, count_events_by_ts_gte("10")).await;
+
+    // Patch ts 5 → 50: crosses the lower bound from outside to inside.
+    // REGRESSION: without the I64 cmp_binds arm, the `after` state (ts=50)
+    // would evaluate `in_window == false`, the `before` state (ts=5) also
+    // `false`, so `count`'s `in_window(before) != in_window(after)` would be
+    // `false != false == false` → indexed_affects=false → skip → dropped push.
+    state
+        .realtime
+        .committers
+        .mutate(&db, None, patch_event_ts(&id, "50"), None)
+        .await?;
+    expect_update(&mut rx, "patch into int64 range").await;
+
+    Ok(())
+}

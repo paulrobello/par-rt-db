@@ -198,6 +198,7 @@ pub(crate) enum EqBind {
     Text(String),
     Num(f64),
     Bool(bool),
+    I64(i64),
 }
 
 /// Resolves `eq` (a prefix of `index`'s fields, 0..=all) into typed SQL binds.
@@ -243,6 +244,11 @@ pub(crate) fn eq_bind_for(ty: &FieldType, value: &serde_json::Value) -> Result<E
             .as_f64()
             .map(EqBind::Num)
             .ok_or_else(|| RtDbError::bad_request("eq value must be a number")),
+        "bigint" => value
+            .as_str()
+            .and_then(|s| s.parse::<i64>().ok())
+            .map(EqBind::I64)
+            .ok_or_else(|| RtDbError::bad_request("eq value must be an int64 string")),
         "boolean" => value
             .as_bool()
             .map(EqBind::Bool)
@@ -259,6 +265,7 @@ enum ColBind {
     Text(Option<String>),
     Num(Option<f64>),
     Bool(Option<bool>),
+    I64(Option<i64>),
     /// pgvector text form `[a,b,c]` (NULL when `None`). Bound against a
     /// `$n::vector` placeholder whose column type is `vector(N)`.
     Vector(Option<String>),
@@ -379,6 +386,7 @@ fn scalar_bind(ty: &FieldType, value: &serde_json::Value) -> Result<ColBind, RtD
         return match pg_type {
             "text" => Ok(ColBind::Text(None)),
             "double precision" => Ok(ColBind::Num(None)),
+            "bigint" => Ok(ColBind::I64(None)),
             "boolean" => Ok(ColBind::Bool(None)),
             other => Err(RtDbError::internal(format!("unexpected pg type '{other}'"))),
         };
@@ -392,6 +400,11 @@ fn scalar_bind(ty: &FieldType, value: &serde_json::Value) -> Result<ColBind, RtD
             .as_f64()
             .map(|n| ColBind::Num(Some(n)))
             .ok_or_else(|| RtDbError::internal("expected numeric value for indexed column")),
+        "bigint" => value
+            .as_str()
+            .and_then(|s| s.parse::<i64>().ok())
+            .map(|n| ColBind::I64(Some(n)))
+            .ok_or_else(|| RtDbError::internal("expected int64 string value for indexed column")),
         "boolean" => value
             .as_bool()
             .map(|b| ColBind::Bool(Some(b)))
@@ -511,6 +524,7 @@ async fn do_insert(
             ColBind::Text(v) => query.bind(v),
             ColBind::Num(v) => query.bind(v),
             ColBind::Bool(v) => query.bind(v),
+            ColBind::I64(v) => query.bind(v),
             ColBind::Vector(v) => query.bind(v),
         };
     }
@@ -560,6 +574,7 @@ async fn apply_update(
             ColBind::Text(v) => query.bind(v),
             ColBind::Num(v) => query.bind(v),
             ColBind::Bool(v) => query.bind(v),
+            ColBind::I64(v) => query.bind(v),
             ColBind::Vector(v) => query.bind(v),
         };
     }
@@ -714,6 +729,7 @@ pub(crate) async fn insert_snapshot_row(
             ColBind::Text(v) => query.bind(v),
             ColBind::Num(v) => query.bind(v),
             ColBind::Bool(v) => query.bind(v),
+            ColBind::I64(v) => query.bind(v),
             ColBind::Vector(v) => query.bind(v),
         };
     }
@@ -803,6 +819,7 @@ async fn eq_lookup(
             EqBind::Text(v) => query.bind(v),
             EqBind::Num(v) => query.bind(v),
             EqBind::Bool(v) => query.bind(v),
+            EqBind::I64(v) => query.bind(v),
         };
     }
     let rows = query.fetch_all(&mut *conn).await?;
