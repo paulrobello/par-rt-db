@@ -264,7 +264,7 @@ everywhere.
 
 ## Future (explicitly deferred at MVP time; current status marked inline)
 
-- Fine-grained subscription invalidation → FEATURE_MATRIX #21 (v1 shipped: point-read skip; spec `2026-07-24-fine-grained-subscription-invalidation-design.md`)
+- Fine-grained subscription invalidation → FEATURE_MATRIX #21 (**shipped** through v3: point-read skip, eq-prefix/range windows, and ordered top-N boundaries; spec `2026-07-24-fine-grained-subscription-invalidation-design.md`)
 - pagination → **shipped** (FEATURE_MATRIX #5)
 - db-side filters → **shipped** (FEATURE_MATRIX #15)
 - scheduler/crons → **shipped** (FEATURE_MATRIX #9 / #10)

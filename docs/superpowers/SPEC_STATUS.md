@@ -28,10 +28,10 @@ authoritative source of truth; the spec is a historical design record. Point at
 | `2026-07-23-file-storage-design.md` | Implemented | shipped | §2 #16 | — |
 | `2026-07-23-scheduled-cron-transactions-design.md` | Implemented | shipped | §2 #9 (scheduler) + #10 (cron) | — |
 | `2026-07-23-vector-search-design.md` | Implemented (verified live in prod) | 2026-07-25 | §2 #17 | — |
-| `2026-07-24-fine-grained-subscription-invalidation-design.md` | Implemented (v2: point reads + eq-prefix/range) | shipped (v2 2026-07-28) | §2 #21 | v3 (ordered top-N boundary) not yet specced |
+| `2026-07-24-fine-grained-subscription-invalidation-design.md` | Implemented (v3: point reads + eq-prefix/range + ordered top-N) | shipped (v3 2026-07-29) | §2 #21 | — |
 | `2026-07-24-per-row-authorization-design.md` | Implemented (v1: owner-field match) | shipped | §2 #20 | v2 (collaborator/role fields) and v3 (general declarative predicate DSL) not yet specced |
 | `2026-07-24-realtime-dashboard-design.md` | Implemented (backend phases 1–6 + frontend SPA) | shipped | §2 #18 | — |
-| `2026-07-25-python-client-design.md` | Implemented (core DSL); HTTP/WS/admin clients planned | 2026-07-25 | §1 (the "fourth client"; per-row "Mirrored across: ✅ts ✅rust ✅python" tracks parity) | follow-on plan TBD for HTTP/WS/admin |
+| `2026-07-25-python-client-design.md` | Implemented (core DSL + sync HTTP/admin/storage); reactive WS client pending | 2026-07-25 | §1 (the "fourth client"; per-row "Mirrored across: ✅ts ✅rust ✅python" tracks parity) | follow-on plan TBD for the reactive WS surface |
 
 ## Notes
 
@@ -41,16 +41,20 @@ authoritative source of truth; the spec is a historical design record. Point at
   search, per-row auth. Eight of the nine have since shipped; the list in the
   spec body now cross-references the FEATURE_MATRIX row and follow-on spec for
   each. "Actions" remains a deliberate non-goal (FEATURE_MATRIX §3).
-- **Per-row auth / fine-grained invalidation.** Both specs have shipped through
-  v2: per-row auth v2 (collaborator/role fields) and fine-grained invalidation v2
-  (count/collect/unique on eq-prefix + range, 2026-07-28). Remaining unspecced:
-  per-row auth v3 (general declarative predicate DSL) and invalidation v3
-  (ordered top-N boundary tracking — the dynamic-window case membership-only
-  skipping can't soundly cover).
-- **Python client.** The wire + schema + query + mutation DSL is the
-  implemented surface today; the HTTP, reactive WebSocket, and admin clients
-  ship in a follow-on plan. Until then, Python users build wire payloads with
-  the DSL and send them via their own HTTP/WS client (see `python-client/README.md`).
+- **Per-row auth / fine-grained invalidation.** Per-row auth has shipped through
+  v2 (collaborator/role fields); fine-grained invalidation has shipped through
+  v3 (count/collect/unique on eq-prefix + range, 2026-07-28; take/first/paginate
+  via top-N boundary tracking, 2026-07-29). Remaining unspecced: per-row auth v3
+  (general declarative predicate DSL). Invalidation's remaining deferrals are
+  documented in its own spec — cursor-aware page lower bounds, and the
+  value-sensitive / ranking shapes (distinct, aggregate, search, vector,
+  hybrid), which no window-plus-boundary reasoning can soundly cover.
+- **Python client.** The wire + schema + query + mutation DSL and a sync
+  `httpx` client (query/mutate, admin, storage — `pip install par-rt-db[http]`)
+  are the implemented surface today; the reactive WebSocket client is the one
+  remaining item and ships in a follow-on plan. Until then, Python users
+  subscribe by building wire payloads with the DSL and sending them over their
+  own WS client (see `python-client/README.md`).
 - **The code is the source of truth.** When a spec and the implementation
   disagree, the implementation (and `FEATURE_MATRIX.md`) wins. Specs are linked
   from READMEs as historical design context, not as authoritative behavior

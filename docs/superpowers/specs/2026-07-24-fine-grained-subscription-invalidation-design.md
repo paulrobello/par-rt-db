@@ -404,3 +404,167 @@ New integration cases against the real dev Postgres, plus unit cases for
 - `server/src/committer.rs` — `handle_subscribe` resolves `TableDef` and passes
   it to `register`.
 - `server/tests/*` — the soundness matrix above.
+
+---
+
+# v3 (ordered top-N boundary tracking) — 2026-07-29
+
+- **Status:** Shipped (2026-07-29). 32 unit tests + 28 integration tests green
+  (14 and 12 of them new); full server suite green; `make checkall` green.
+- **Scope:** Server-only, no protocol/wire change (same as v1/v2). Extends the
+  `WriteSet` / `ReadSet` plumbing additively — `Point` and `Indexed` are
+  unchanged.
+
+## Summary
+
+Extend sound skipping to the shapes v2 deliberately excluded: **`take(N)`,
+`first`, and `paginate`**. These have a dynamic, ordered window — a document
+can enter or leave the truncated result even when its eq-prefix is unchanged —
+so membership-only reasoning is unsound for them. v3 adds the missing
+ingredient: the **boundary**, the sort key of the last computed result's final
+row.
+
+Only `distinct` / `aggregate` / `search` / `vectorSearch` / `hybridSearch`
+remain `Table`. Their results depend on the VALUES of the matching set or on a
+ranking function, neither of which a membership predicate plus an order
+boundary can bound.
+
+## The decision rule
+
+A `take`/`first`/`paginate` result is the first N documents of the query's
+eq/range window in sort order (`filter` and per-row ownership only narrow it
+further). A written document therefore **affects** such a subscription iff, in
+its before- OR after-state, it is inside the window AND ranks at or before the
+boundary:
+
+```
+affects(d) =
+    if deleted(d)                      { true }        // Delete captures no values
+    else state_affects(before) || state_affects(after)
+
+state_affects(state) =
+    window.contains(state)
+    && match boundary {
+           None    => true,                            // last result was not full
+           Some(b) => ranks_at_or_before(sort_key(state), b, desc).unwrap_or(true),
+       }
+```
+
+Both states matter for the same reason `collect` is content-bearing: the result
+carries document bodies, so a member's body change is a result change, and a
+member leaving the window changes the result even though its after-state is
+outside it.
+
+### Soundness argument
+
+Suppose every written document is, in both states, outside the window or ranked
+strictly beyond the boundary `B`. Consider the prefix set `P` = the in-window
+documents ranking at or before `B`. By assumption no write added to `P`,
+removed from `P`, or altered a member of `P`. `P` is exactly the previous
+result (the result holds N documents, the last of which has key `B`, and the
+sort key is a total order in the DB because it ends in the unique `id`). An
+unwritten document cannot move into `P`. So the new result — the first N of the
+new ordered set — is the same N documents. The result is unchanged, and the
+skip is sound. Joint writes need no separate argument: the conclusion is about
+the set `P`, and each write independently leaves it untouched.
+
+With `filter` or per-row ownership present, `B` is the key of the Nth
+*qualifying* document, which sits at or beyond where it would be without them.
+A document ranked beyond `B` is therefore behind at least N qualifying
+documents even if its write makes it qualify — still not in the top N. Ignoring
+those predicates over-approximates, exactly as in v2.
+
+## Fullness — when a result bounds anything
+
+| Terminal | Full (⇒ boundary = last row's key) | Not full (⇒ unbounded) |
+|---|---|---|
+| `take(N)` | result holds exactly N docs | fewer than N |
+| `first` | a document was returned | `Doc(None)` |
+| `paginate` | a next cursor was issued | no next cursor |
+
+`paginate`'s rule is deliberately stricter than "the page is full": a page
+holding exactly `numItems` documents but no next cursor must stay unbounded,
+because an insert past its last row flips `hasNext` on and mints a cursor —
+a result change with the page's documents untouched.
+
+## Carrying `created_at`
+
+Every query's sort order ends in `created_at, id`, and `created_at` is a system
+column, not part of the stored `doc` body. `WriteSet.doc_values` therefore
+gains `created_at: Option<i64>`:
+
+| Step | Source |
+|---|---|
+| `Insert` / `Upsert` insert | the value `do_insert` stamps (returned to the caller) |
+| `Patch` / `Replace` | `do_patch` / `do_replace` widen their `SELECT "doc"` to `SELECT "doc", "created_at"` |
+| `Upsert` update | `eq_lookup` widens to `SELECT "id", "doc", "created_at"` |
+| `Delete` | none — `None`, which reads as "unrankable ⇒ re-run" |
+
+Because it is immutable after insert, the first step that supplies it wins and
+later steps in the same transaction never overwrite it.
+
+## `SortKey` and the `id` tie-break
+
+`SortKey` carries the index fields after the eq-prefix plus `created_at`. It
+deliberately does NOT carry `id`, the DB's final tie-breaker: Postgres orders
+text by the database collation while Rust compares byte-wise. A tie on every
+carried component is reported as doubt (`compare_keys` returns `None`) and the
+caller re-runs. That over-approximates only the handful of documents tying
+exactly with the boundary — including the boundary document itself, which is a
+member and must re-run anyway — and removes the last collation-sensitive
+comparison from the skip decision.
+
+Text *range* and *sort-field* comparisons remain collation-sensitive by
+construction (`cmp_binds`'s `Text` arm is byte-wise). This is sound under the
+`C` collation par-rt-db's clusters initialize with and prod was migrated to
+(`deploy/README.md`, "Collation"); under a linguistic collation a text bound or
+boundary could under-approximate. Documented at `cmp_binds`.
+
+## Boundary lifecycle
+
+- **Seeded** at registration from the initial result (`committer::handle_subscribe`
+  passes it to `register`). The committer serializes subscribe against every
+  mutation, so no write can slip between execute and register.
+- **Refreshed** in `fan_out` from every successful re-run, BEFORE the canonical
+  diff — the boundary describes the most recently COMPUTED result, which is the
+  baseline the next skip decision reasons against. A diff-suppressed re-run
+  recomputes the same boundary; a re-run that errored leaves the previous one,
+  still correct because the previous result is then still current.
+- Refreshing it is load-bearing, not bookkeeping: after a member is deleted the
+  result may stop being full, and a stale boundary would then skip a write that
+  genuinely enters the result. `take_boundary_is_refreshed_after_the_result_shrinks`
+  is the regression guard.
+
+## Cursored pages
+
+A cursor's keyset lower bound is NOT modeled: the window is treated as
+`(-∞, boundary]` rather than `(cursor, boundary]`, so writes to documents on
+earlier pages re-run needlessly. Sound (over-approximating) and it keeps the
+cursor encoding out of the invalidation path. Modeling it is a possible later
+refinement.
+
+## Files
+
+- `server/src/txn.rs` — `DocValues.created_at`; `do_insert` / `do_patch` /
+  `do_replace` / `eq_lookup` widened to supply it.
+- `server/src/subs.rs` — `Window` (the eq/range predicate, split out of
+  `IndexedRead` so both read sets share it); `ReadSet::Ordered` +
+  `OrderedRead` / `OrderedTerminal` / `SortKey`; `compare_keys` /
+  `ranks_at_or_before` / `ordered_affects`; `should_rerun` +
+  `any_written_affects` extracted from `fan_out`; boundary refresh in `fan_out`.
+- `server/src/committer.rs` — `handle_subscribe` passes the initial result to
+  `register`.
+- `server/tests/sub_invalidation_test.rs` — section 12, the ordered matrix.
+
+## Still deferred
+
+- Cursor-aware lower bounds for `paginate` (above).
+- `distinct` / `aggregate`: value-sensitive over the matching set. A
+  content-aware read set would have to track the projected values, not just
+  membership.
+- `search` / `vectorSearch` / `hybridSearch`: any insert can change the
+  ranking, and the rank function is not expressible as a window + boundary.
+- Capturing `before` on `Delete` (a `DELETE ... RETURNING "doc", "created_at"`)
+  so a delete outside the window can be skipped like any other write. Cheap and
+  additive; deletes are simply rarer than updates, so it was not worth widening
+  the delete path in this pass.
