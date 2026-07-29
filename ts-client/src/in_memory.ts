@@ -42,7 +42,7 @@ const MAX_STEPS = 256;
 const MAX_TAKE = 4096;
 
 /** Indexed-column storage type, mirroring server `indexed_column_type`. */
-type PgType = "text" | "number" | "boolean";
+type PgType = "text" | "number" | "boolean" | "int64";
 
 interface IndexedType {
   pg: PgType;
@@ -277,6 +277,8 @@ function indexColumnType(ty: FieldTypeJson): IndexedType {
       return { pg: "text", nullable: false };
     case "number":
       return { pg: "number", nullable: false };
+    case "int64":
+      return { pg: "int64", nullable: false };
     case "boolean":
       return { pg: "boolean", nullable: false };
     case "literal":
@@ -316,6 +318,13 @@ function coerceIndexValue(table: TableJson, fieldName: string, value: unknown): 
         throw new RtDbError("BAD_REQUEST", "eq value must be a number");
       }
       return value;
+    case "int64":
+      // Decimal-string canonical form; eq is string === string, so the value is
+      // returned as-is. Only the comparator parses to BigInt for ordering.
+      if (typeof value !== "string" || !/^[+-]?\d+$/.test(value)) {
+        throw new RtDbError("BAD_REQUEST", "eq value must be an int64 string");
+      }
+      return value;
     case "boolean":
       if (typeof value !== "boolean") {
         throw new RtDbError("BAD_REQUEST", "eq value must be a boolean");
@@ -326,8 +335,10 @@ function coerceIndexValue(table: TableJson, fieldName: string, value: unknown): 
 
 /** `null`-sorts-last comparison for one sort key. JS relational ops order
  * numbers and strings; booleans coerce too. Nulls sort last (asc) / first
- * (desc, via the caller negating the result) — Postgres's default. */
-function compareIndexValues(a: unknown, b: unknown): number {
+ * (desc, via the caller negating the result) — Postgres's default. When `pg`
+ * is `"int64"`, operands are parsed as `BigInt` so decimal-string values sort
+ * and range numerically (no 2^53 limit) instead of lexicographically. */
+function compareIndexValues(a: unknown, b: unknown, pg?: PgType): number {
   const aNull = a === null || a === undefined;
   const bNull = b === null || b === undefined;
   if (aNull && bNull) {
@@ -338,6 +349,20 @@ function compareIndexValues(a: unknown, b: unknown): number {
   }
   if (bNull) {
     return -1;
+  }
+  if (pg === "int64") {
+    // Both operands are decimal-string int64 values (validated by
+    // `coerceIndexValue` or stored as the canonical form on insert), so the
+    // `BigInt()` parse is total — no try/catch needed.
+    const an = BigInt(a as string);
+    const bn = BigInt(b as string);
+    if (an < bn) {
+      return -1;
+    }
+    if (an > bn) {
+      return 1;
+    }
+    return 0;
   }
   const av = a as number | string;
   const bv = b as number | string;
@@ -353,17 +378,27 @@ function compareIndexValues(a: unknown, b: unknown): number {
 /** Applies one aggregate op over a non-empty `values` array. Mirrors the SQL
  * semantics: SUM/AVG require all entries numeric; MIN/MAX pick the smallest/
  * largest per `compareIndexValues` so a string field's MIN/MAX matches Postgres
- * lexicographic ordering. AVG returns the arithmetic mean (no rounding). */
-function applyAggregate(op: AggregateOp, values: unknown[]): unknown {
+ * lexicographic ordering, unless `pg === "int64"` in which case both ordering
+ * and numeric reduction parse the decimal strings (server `SUM(bigint)`/
+ * `AVG(bigint)` return Postgres `numeric` → JSON number, so `Number()` is the
+ * correct projection — accepted precision loss past 2^53). AVG returns the
+ * arithmetic mean (no rounding). */
+function applyAggregate(op: AggregateOp, values: unknown[], pg?: PgType): unknown {
   switch (op) {
     case "sum":
+      if (pg === "int64") {
+        return values.reduce<number>((acc, v) => acc + Number(v), 0);
+      }
       return values.reduce<number>((acc, v) => acc + (v as number), 0);
     case "avg":
+      if (pg === "int64") {
+        return values.reduce<number>((acc, v) => acc + Number(v), 0) / values.length;
+      }
       return values.reduce<number>((acc, v) => acc + (v as number), 0) / values.length;
     case "min":
-      return values.reduce((best, v) => (compareIndexValues(best, v) <= 0 ? best : v));
+      return values.reduce((best, v) => (compareIndexValues(best, v, pg) <= 0 ? best : v));
     case "max":
-      return values.reduce((best, v) => (compareIndexValues(best, v) >= 0 ? best : v));
+      return values.reduce((best, v) => (compareIndexValues(best, v, pg) >= 0 ? best : v));
   }
 }
 
@@ -1176,6 +1211,7 @@ export class InMemoryRtDbClient {
       : [];
 
     let rangeField: string | null = null;
+    let rangeFieldPg: PgType | null = null;
     if (hasRange) {
       if (!indexDef) {
         throw new RtDbError("BAD_REQUEST", "range bound requires an index");
@@ -1184,6 +1220,7 @@ export class InMemoryRtDbClient {
         throw new RtDbError("BAD_REQUEST", "range bound requires a remaining index field after eq");
       }
       rangeField = indexDef.fields[eqLen];
+      rangeFieldPg = indexColumnType(tableDef.fields[rangeField]).pg;
     }
 
     const gt =
@@ -1220,16 +1257,16 @@ export class InMemoryRtDbClient {
         if (v === null || v === undefined) {
           continue;
         }
-        if (gt !== null && compareIndexValues(v, gt) <= 0) {
+        if (gt !== null && compareIndexValues(v, gt, rangeFieldPg ?? undefined) <= 0) {
           continue;
         }
-        if (gte !== null && compareIndexValues(v, gte) < 0) {
+        if (gte !== null && compareIndexValues(v, gte, rangeFieldPg ?? undefined) < 0) {
           continue;
         }
-        if (lt !== null && compareIndexValues(v, lt) >= 0) {
+        if (lt !== null && compareIndexValues(v, lt, rangeFieldPg ?? undefined) >= 0) {
           continue;
         }
-        if (lte !== null && compareIndexValues(v, lte) > 0) {
+        if (lte !== null && compareIndexValues(v, lte, rangeFieldPg ?? undefined) > 0) {
           continue;
         }
       }
@@ -1255,6 +1292,7 @@ export class InMemoryRtDbClient {
         throw new RtDbError("BAD_REQUEST", "distinct requires an index field beyond the eq prefix");
       }
       const field = indexDef.fields[eqLen];
+      const fieldPg = indexColumnType(tableDef.fields[field]).pg;
       const seen = new Set<unknown>();
       const values: unknown[] = [];
       for (const row of filtered) {
@@ -1271,7 +1309,7 @@ export class InMemoryRtDbClient {
           values.push(v);
         }
       }
-      values.sort((a, b) => compareIndexValues(a, b));
+      values.sort((a, b) => compareIndexValues(a, b, fieldPg));
       return values.slice(0, MAX_TAKE);
     }
 
@@ -1291,14 +1329,14 @@ export class InMemoryRtDbClient {
       }
       const isNumeric = (fieldName: string): boolean => {
         const ft = tableDef.fields[fieldName];
-        // Only `number` is numeric among indexable types; `optional<number>`
-        // unwraps to its inner type. Anything else is non-numeric.
+        // `number` and `int64` are the numeric indexable types; an optional
+        // wrapper unwraps to its inner type. Mirrors server `is_numeric_index_field`.
         if (!ft) return false;
         const tag = (ft as { type: string }).type;
-        if (tag === "number") return true;
+        if (tag === "number" || tag === "int64") return true;
         if (tag === "optional") {
           const inner = (ft as { inner: { type: string } }).inner;
-          return inner?.type === "number";
+          return inner?.type === "number" || inner?.type === "int64";
         }
         return false;
       };
@@ -1312,6 +1350,8 @@ export class InMemoryRtDbClient {
         }
         const groupField = indexDef.fields[eqLen];
         const aggField = indexDef.fields[eqLen + 1];
+        const groupFieldPg = indexColumnType(tableDef.fields[groupField]).pg;
+        const aggFieldPg = indexColumnType(tableDef.fields[aggField]).pg;
         if ((op === "sum" || op === "avg") && !isNumeric(aggField)) {
           throw new RtDbError("BAD_REQUEST", `aggregate op ${op} requires a numeric index field`);
         }
@@ -1330,8 +1370,8 @@ export class InMemoryRtDbClient {
           }
         }
         const out = Array.from(groups.entries())
-          .map(([k, values]) => ({ key: k, value: applyAggregate(op, values) }))
-          .sort((a, b) => compareIndexValues(a.key, b.key))
+          .map(([k, values]) => ({ key: k, value: applyAggregate(op, values, aggFieldPg) }))
+          .sort((a, b) => compareIndexValues(a.key, b.key, groupFieldPg))
           .slice(0, MAX_TAKE);
         return out;
       }
@@ -1342,6 +1382,7 @@ export class InMemoryRtDbClient {
         );
       }
       const aggField = indexDef.fields[eqLen];
+      const aggFieldPg = indexColumnType(tableDef.fields[aggField]).pg;
       if ((op === "sum" || op === "avg") && !isNumeric(aggField)) {
         throw new RtDbError("BAD_REQUEST", `aggregate op ${op} requires a numeric index field`);
       }
@@ -1349,25 +1390,33 @@ export class InMemoryRtDbClient {
         .map((row) => row.doc[aggField])
         .filter((v) => v !== null && v !== undefined);
       // Empty set → null (matches server SUM/AVG/MIN/MAX over zero rows).
-      return values.length === 0 ? null : applyAggregate(op, values);
+      return values.length === 0 ? null : applyAggregate(op, values, aggFieldPg);
     }
 
     // Sort keys: unbound index fields (after the eq prefix), then createdAt, id.
+    // `sortPgs[i]` is the storage type of `sortKeys[i]` so the comparator can
+    // pick the int64 numeric path for decimal-string fields. `__createdAt` is a
+    // number column; `__id` is a text column on the server.
     const sortKeys: string[] = [];
+    const sortPgs: PgType[] = [];
     if (indexDef) {
       for (const field of indexDef.fields.slice(eqLen)) {
         sortKeys.push(field);
+        sortPgs.push(indexColumnType(tableDef.fields[field]).pg);
       }
     }
     sortKeys.push("__createdAt");
+    sortPgs.push("number");
     sortKeys.push("__id");
+    sortPgs.push("text");
 
     const dir: Order = q.order ?? "asc";
     filtered.sort((a, b) => {
-      for (const field of sortKeys) {
+      for (let i = 0; i < sortKeys.length; i++) {
+        const field = sortKeys[i];
         const av = field === "__createdAt" ? a.createdAt : field === "__id" ? a.id : a.doc[field];
         const bv = field === "__createdAt" ? b.createdAt : field === "__id" ? b.id : b.doc[field];
-        const cmp = compareIndexValues(av, bv);
+        const cmp = compareIndexValues(av, bv, sortPgs[i]);
         if (cmp !== 0) {
           return dir === "desc" ? -cmp : cmp;
         }
@@ -1376,7 +1425,7 @@ export class InMemoryRtDbClient {
     });
 
     if (q.paginate !== undefined) {
-      return this.paginateResult(q.paginate, tableDef, filtered, sortKeys, dir);
+      return this.paginateResult(q.paginate, tableDef, filtered, sortKeys, sortPgs, dir);
     }
 
     if (q.unique) {
@@ -1403,12 +1452,15 @@ export class InMemoryRtDbClient {
    * index fields, then `__createdAt`, then `__id`) in direction `dir`. The
    * cursor stores one value per sort column; the resume predicate is the
    * standard OR-of-AND row-value comparison, so paging is stable (the unique
-   * `id` tiebreaker means no row is skipped or duplicated across pages). */
+   * `id` tiebreaker means no row is skipped or duplicated across pages).
+   * `sortPgs[i]` is the storage type of `sortKeys[i]` so the resume predicate
+   * uses the same int64-aware comparator as the producing sort. */
   private paginateResult(
     paginate: Paginate,
     tableDef: TableJson,
     sorted: StoredRow[],
     sortKeys: string[],
+    sortPgs: PgType[],
     dir: Order,
   ): PaginatedResultJson {
     const { numItems: requested, cursor } = paginate;
@@ -1424,7 +1476,7 @@ export class InMemoryRtDbClient {
         );
       }
       this.validateCursorValues(cursorValues, sortKeys, tableDef);
-      rows = sorted.filter((row) => this.isAfterCursor(row, cursorValues, sortKeys, dir));
+      rows = sorted.filter((row) => this.isAfterCursor(row, cursorValues, sortKeys, sortPgs, dir));
     }
 
     // Fetch one past the page size so a next page is detectable without a second
@@ -1497,12 +1549,15 @@ export class InMemoryRtDbClient {
     row: StoredRow,
     cursorValues: unknown[],
     sortKeys: string[],
+    sortPgs: PgType[],
     dir: Order,
   ): boolean {
     for (let i = 0; i < sortKeys.length; i++) {
       let prefixEqual = true;
       for (let j = 0; j < i; j++) {
-        if (compareIndexValues(this.sortValue(row, sortKeys[j]), cursorValues[j]) !== 0) {
+        if (
+          compareIndexValues(this.sortValue(row, sortKeys[j]), cursorValues[j], sortPgs[j]) !== 0
+        ) {
           prefixEqual = false;
           break;
         }
@@ -1510,7 +1565,7 @@ export class InMemoryRtDbClient {
       if (!prefixEqual) {
         continue;
       }
-      const cmp = compareIndexValues(this.sortValue(row, sortKeys[i]), cursorValues[i]);
+      const cmp = compareIndexValues(this.sortValue(row, sortKeys[i]), cursorValues[i], sortPgs[i]);
       if (dir === "desc" ? cmp < 0 : cmp > 0) {
         return true;
       }

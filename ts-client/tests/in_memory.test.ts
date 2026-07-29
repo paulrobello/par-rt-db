@@ -908,3 +908,147 @@ describe("InMemoryRtDbClient filter", () => {
     ).rejects.toMatchObject({ code: "BAD_REQUEST" });
   });
 });
+
+describe("InMemoryRtDbClient — int64 index", () => {
+  // Self-contained schema (mirrors the items/users pattern). `ts` is a
+  // decimal-string int64 — the comparator must parse it to BigInt so ordering
+  // and ranges are numeric, not lexicographic. eq stays string === string.
+  const int64Schema = defineSchema({
+    events: defineTable({
+      ts: t.int64(),
+      kind: t.string(),
+    }).index("by_ts", ["ts"]),
+  });
+  const int64Api = createApi(int64Schema);
+
+  function newClient(): InMemoryRtDbClient {
+    let ms = 1_700_000_000_000;
+    const c = new InMemoryRtDbClient({ now: () => ms++, random: () => 0 });
+    c.pushSchema(int64Schema);
+    return c;
+  }
+
+  async function seed(c: InMemoryRtDbClient): Promise<void> {
+    await c.mutate(mutation().insert("events", { ts: "100", kind: "a" }).build());
+    await c.mutate(mutation().insert("events", { ts: "20", kind: "b" }).build());
+    await c.mutate(mutation().insert("events", { ts: "3", kind: "c" }).build());
+  }
+
+  it("orders ascending by numeric value, not lexicographic string order", async () => {
+    const c = newClient();
+    await seed(c);
+
+    const asc = await c.query(int64Api.events.query().withIndex("by_ts").order("asc").take(10));
+    // Numeric: 3, 20, 100 — lexicographic would be "100","20","3".
+    expect((asc as Array<{ kind: string }>).map((d) => d.kind)).toEqual(["c", "b", "a"]);
+
+    const desc = await c.query(int64Api.events.query().withIndex("by_ts").order("desc").take(10));
+    expect((desc as Array<{ kind: string }>).map((d) => d.kind)).toEqual(["a", "b", "c"]);
+  });
+
+  it("ranges numerically (gte/gt/lt/lte bounds compare as BigInt)", async () => {
+    const c = newClient();
+    await seed(c);
+
+    const gte = await c.query(int64Api.events.query().withIndex("by_ts").gte("20").take(10));
+    expect((gte as Array<{ kind: string }>).map((d) => d.kind)).toEqual(["b", "a"]); // 20, 100
+
+    const gt = await c.query(int64Api.events.query().withIndex("by_ts").gt("20").take(10));
+    expect((gt as Array<{ kind: string }>).map((d) => d.kind)).toEqual(["a"]); // 100
+
+    const lte = await c.query(int64Api.events.query().withIndex("by_ts").lte("20").take(10));
+    expect((lte as Array<{ kind: string }>).map((d) => d.kind)).toEqual(["c", "b"]); // 3, 20
+
+    const lt = await c.query(int64Api.events.query().withIndex("by_ts").lt("20").take(10));
+    expect((lt as Array<{ kind: string }>).map((d) => d.kind)).toEqual(["c"]); // 3
+  });
+
+  it("distinct returns numeric-ordered unique int64 values", async () => {
+    const c = newClient();
+    await seed(c);
+    // Add a duplicate ts to confirm distinct collapses by string equality.
+    await c.mutate(mutation().insert("events", { ts: "20", kind: "d" }).build());
+
+    const values = await c.query(int64Api.events.query().withIndex("by_ts").distinct());
+    expect(values).toEqual(["3", "20", "100"]);
+  });
+
+  it("eq matches an int64 by decimal-string equality", async () => {
+    const c = newClient();
+    await seed(c);
+
+    const rows = await c.query(int64Api.events.query().withIndex("by_ts", ["20"]).take(10));
+    expect((rows as Array<{ kind: string }>).map((d) => d.kind)).toEqual(["b"]);
+  });
+
+  it("rejects a non-int64 eq value with BAD_REQUEST", async () => {
+    const c = newClient();
+    await seed(c);
+    await expect(
+      c.query(int64Api.events.query().withIndex("by_ts", ["not-an-int"]).take(10)),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+  });
+
+  it("orders values beyond the 2^53 number-precision range", async () => {
+    const c = newClient();
+    // 2^63 - 1 is the int64 max; well outside Number.MAX_SAFE_INTEGER.
+    await c.mutate(mutation().insert("events", { ts: "9223372036854775807", kind: "max" }).build());
+    await c.mutate(
+      mutation().insert("events", { ts: "9223372036854775806", kind: "prev" }).build(),
+    );
+    await c.mutate(mutation().insert("events", { ts: "0", kind: "zero" }).build());
+
+    const asc = await c.query(int64Api.events.query().withIndex("by_ts").order("asc").take(10));
+    expect((asc as Array<{ kind: string }>).map((d) => d.kind)).toEqual(["zero", "prev", "max"]);
+  });
+
+  it("aggregate sum/avg/min/max over an int64 index field are numeric", async () => {
+    const c = newClient();
+    // ts values: 3, 20, 100 — chosen so lexicographic order (100, 20, 3) differs
+    // from numeric order, and string concat ("3"+"20"+"100" = "320100") differs
+    // from numeric sum (123).
+    await seed(c);
+
+    const sum = await c.query(int64Api.events.query().withIndex("by_ts").aggregate("sum"));
+    expect(sum).toBe(123);
+
+    const avg = await c.query(int64Api.events.query().withIndex("by_ts").aggregate("avg"));
+    expect(avg).toBe(41);
+
+    const min = await c.query(int64Api.events.query().withIndex("by_ts").aggregate("min"));
+    expect(min).toBe("3");
+
+    const max = await c.query(int64Api.events.query().withIndex("by_ts").aggregate("max"));
+    expect(max).toBe("100");
+  });
+
+  it("paginates an int64 index in numeric order with no gaps or duplicates", async () => {
+    const c = newClient();
+    // Insert in an order where lexicographic vs numeric pagination would differ:
+    // ts strings "100", "3", "20", "100" again (dup ts, distinct id), "2".
+    await c.mutate(mutation().insert("events", { ts: "100", kind: "a" }).build());
+    await c.mutate(mutation().insert("events", { ts: "3", kind: "b" }).build());
+    await c.mutate(mutation().insert("events", { ts: "20", kind: "c" }).build());
+    await c.mutate(mutation().insert("events", { ts: "100", kind: "d" }).build());
+    await c.mutate(mutation().insert("events", { ts: "2", kind: "e" }).build());
+
+    const docs: Record<string, unknown>[] = [];
+    const pageSizes: number[] = [];
+    let cursor: string | undefined;
+    for (let guard = 0; guard < 100; guard++) {
+      const page = (await c.query(
+        int64Api.events.query().withIndex("by_ts").paginate(cursor, 2),
+      )) as PaginatedResultJson;
+      pageSizes.push(page.docs.length);
+      docs.push(...(page.docs as Record<string, unknown>[]));
+      if (page.nextCursor === undefined) break;
+      cursor = page.nextCursor;
+    }
+
+    // Page sizes 2, 2, 1 across 5 rows; numeric ts order is 2, 3, 20, 100, 100.
+    expect(pageSizes).toEqual([2, 2, 1]);
+    expect(docs.map((d) => d.kind)).toEqual(["e", "b", "c", "a", "d"]);
+    // No id duplicates across pages.
+    expect(new Set(docs.map((d) => d._id)).size).toBe(docs.length);
+  });
+});
