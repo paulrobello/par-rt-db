@@ -1,7 +1,7 @@
 # par-rt-db Python Client — Design Spec
 
 **Date:** 2026-07-25
-**Status:** Implemented (core DSL layer) — `par-rt-db` v0.1.0 on PyPI: wire types (`wire.py`), schema DSL (`schema.py` — 15 `FieldType` variants + `t` constructors + `SchemaBuilder`), query DSL (`query.py` — `Query` + `TableQuery` + `Paginated` + `parse_result`), mutation DSL (`mutation.py` — all 7 step ops + `Mutation` builder + `StepResult`), cursor codec (`cursor.py`), and error model (`errors.py`). HTTP / reactive WebSocket / admin clients remain planned for the next plan. Public surface is re-exported from `par_rt_db/__init__.py`; see `python-client/README.md`. Mirrored across the FEATURE_MATRIX rows that name a fourth client (notably §1 "Admin control plane" and rows #1–#21 "Mirrored end-to-end"); a per-row "Mirrored across: ✅ts ✅rust ✅python" column tracks ongoing parity. Current source of truth: `python-client/src/par_rt_db/` and `tests/test_wire_parity.py` (the cross-client oracle).
+**Status:** Implemented (core DSL layer) — `par-rt-db` v0.1.0 on PyPI: wire types (`wire.py`), schema DSL (`schema.py` — 15 `FieldType` variants + `t` constructors + `SchemaBuilder`), query DSL (`query.py` — `Query` + `TableQuery` + `Paginated` + `parse_result`), mutation DSL (`mutation.py` — all 7 step ops + `Mutation` builder + `StepResult`), cursor codec (`cursor.py`), and error model (`errors.py`). HTTP + admin clients shipped (`http_client.py`); the reactive WebSocket client (`ws_client.py`) is the current plan. Public surface is re-exported from `par_rt_db/__init__.py`; see `python-client/README.md`. Mirrored across the FEATURE_MATRIX rows that name a fourth client (notably §1 "Admin control plane" and rows #1–#21 "Mirrored end-to-end"); a per-row "Mirrored across: ✅ts ✅rust ✅python" column tracks ongoing parity. Current source of truth: `python-client/src/par_rt_db/` and `tests/test_wire_parity.py` (the cross-client oracle).
 **Repo:** `~/Repos/par-rt-db` (package lives in `python-client/`)
 **End goal:** a general-purpose Python SDK at functional parity with the TypeScript and
 Rust clients (**minus React bindings and browser OAuth helpers**) — a fourth
@@ -263,7 +263,9 @@ Lifecycle mirrors the TS/Rust clients exactly:
   serialized query (one wire `subscribe` per unique shape, many iterators); `queryId`
   from a per-client counter (`sub-{n}`). The first `queryUpdate` delivers the first value
   (iterator yields nothing until then; `current()` is `None`). `unsubscribe` on the last
-  iterator for a shape sends `{type:"unsubscribe"}`.
+  iterator for a shape sends `{type:"unsubscribe"}`. A `subscribeErr` (unknown index / bad
+  terminal) surfaces as `RtDbError` — `async for` raises it, `sub.error()` exposes it, and
+  the failed shape is removed so it is not resent on reconnect.
 - **Mutations — at-most-once**: `mutate(txn, *, idempotency_key=None) ->
   Awaitable[list[StepResult]]`. `mutId` is a per-client counter (`mut-{n}`), pure reply
   correlation (never persisted); the optional `idempotency_key` is the wire
