@@ -492,12 +492,15 @@ export class RtDbClient {
     this.setConnState(this.reconnectAttempt === 0 ? "connecting" : "reconnecting");
     // SEC-001 phase 2: cookie mode (no `getToken`) — dial immediately and send a
     // tokenless Auth; the browser's HttpOnly `rtdb_session` cookie authenticates
-    // the WS upgrade.
-    if (this.cookieMode) {
+    // the WS upgrade. Testing `getToken` here rather than the `cookieMode` field
+    // (which the constructor derives from this same immutable option) is what
+    // narrows it to defined below.
+    const getToken = this.options.getToken;
+    if (getToken === undefined) {
       this.openWithToken(null);
       return;
     }
-    const provided = this.hasToken ? this.token : this.options.getToken!();
+    const provided = this.hasToken ? this.token : getToken();
     if (isThenable(provided)) {
       // A rejected getToken() is treated as "no credential" rather than left
       // to hang in "connecting" (and to avoid an unhandled promise rejection).

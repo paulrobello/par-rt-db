@@ -60,7 +60,7 @@ function paginateNum1() {
   return { numItems: 1 };
 }
 
-const enum Outcome {
+enum Outcome {
   Accept,
   Reject,
 }
