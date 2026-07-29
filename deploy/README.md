@@ -68,6 +68,34 @@ matching row counts. To migrate any other existing `en_US.utf8` volume to `C`:
 `pg_dump -Fc` the `rtdb` database, `docker compose down -v`, `up`, `pg_restore`
 (downtime; keep the verified dump + a volume tarball as safety nets).
 
+**`C` is load-bearing beyond the version warning.** Subscription invalidation
+compares text range bounds and sort boundaries byte-wise in Rust
+(`server/src/subs.rs::cmp_binds`), which matches Postgres only under a `C`
+collation. On a linguistic collation (`en_US.utf8`) Postgres would order some
+text differently, and a text bound could judge an inside-the-window document to
+be outside — a dropped realtime update. Equality is byte-wise under any
+deterministic collation, so eq-prefix matching is safe either way; only ORDER
+comparisons are exposed. If a cluster must run non-`C`, enable
+`RTDB_SUBS_VERIFY_SKIP_EVERY` and watch `rtdb_subs_missed_pushes_total`.
+
+## Subscription-invalidation observability
+
+`fan_out` skips re-running subscriptions it can prove a write didn't affect. A
+wrong skip is silent (the subscriber just never hears about the change), so two
+metrics exist for it on `/metrics` and `GET /admin/metrics`:
+
+- `rtdb_subs_skips_total{class="point|indexed|ordered"}` + `rtdb_subs_reruns_total`
+  — effectiveness. Always on, no cost. Shown on the dashboard metrics page.
+- `rtdb_subs_missed_pushes_total` — **alert on any increase.** Non-zero means
+  invalidation under-approximated. Only populated when verification is on.
+
+`RTDB_SUBS_VERIFY_SKIP_EVERY=N` (default 0 = off) shadow-verifies 1 skip in
+every N: the query runs anyway and its result is compared against the last
+pushed one. A divergence logs at ERROR, increments the counter, and pushes the
+corrected result (so it repairs, not just reports). Each verification costs the
+Postgres round-trip the skip avoided — after changing invalidation logic, set
+N=20 for a few days and confirm the counter stays 0, then set it back to 0.
+
 ## Secrets (`/docker/par-rt-db/.env`, not committed)
 
 - `POSTGRES_PASSWORD`, `RTDB_ADMIN_KEY` — `openssl rand -hex 32`. `RTDB_ADMIN_KEY`

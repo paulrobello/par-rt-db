@@ -197,6 +197,12 @@ describe("RtDbAdminClient — new endpoints", () => {
       queryLatency: { p50: 110, p95: 220, p99: 330 },
       mutateLatency: { p50: 440, p95: 550, p99: 660 },
       subscribeLatency: { p50: 770, p95: 880, p99: 990 },
+      subsRerunsTotal: 12,
+      subsSkipsPointTotal: 3,
+      subsSkipsIndexedTotal: 4,
+      subsSkipsOrderedTotal: 5,
+      subsSkipVerificationsTotal: 0,
+      subsMissedPushesTotal: 0,
     };
     const fetchMock = vi.fn().mockResolvedValue(jsonResponse(snap));
     const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });

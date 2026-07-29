@@ -56,6 +56,18 @@ pub struct Config {
     pub backup_cron: String,
     pub backup_dir: String,
     pub backup_retention: u32,
+    // Shadow verification of subscription-invalidation skips: verify 1 skip in
+    // every N by re-running the query anyway and comparing its result against
+    // the last pushed one. A divergence means the read set under-approximated —
+    // a dropped realtime update — so it is logged at ERROR, counted in
+    // `rtdb_subs_missed_pushes_total`, and the corrected result is pushed.
+    //
+    // 0 = off (default). 1 = verify every skip (integration tests). 100 = 1%.
+    // Each verification costs exactly the Postgres round-trip the skip avoided,
+    // so this trades the optimization back for confidence — keep N large in
+    // production. Sampling is deterministic (every Nth skip), not random, so a
+    // test can pin it. RTDB_SUBS_VERIFY_SKIP_EVERY.
+    pub subs_verify_skip_every: u64,
 }
 
 impl Config {
@@ -161,6 +173,14 @@ impl Config {
             Err(_) => 7,
         };
 
+        // Skip verification: default off (0). An unparseable value falls back to
+        // off rather than to a costly rate, matching the permissiveness of the
+        // parses above while failing safe on the expensive side.
+        let subs_verify_skip_every = match std::env::var("RTDB_SUBS_VERIFY_SKIP_EVERY") {
+            Ok(v) => v.trim().parse::<u64>().unwrap_or(0),
+            Err(_) => 0,
+        };
+
         Ok(Self {
             port,
             database_url,
@@ -183,6 +203,7 @@ impl Config {
             backup_cron,
             backup_dir,
             backup_retention,
+            subs_verify_skip_every,
         })
     }
 }

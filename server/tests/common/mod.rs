@@ -30,6 +30,7 @@ pub fn test_config() -> Config {
         backup_cron: "0 3 * * *".into(),
         backup_dir: "./backups".into(),
         backup_retention: 7,
+        subs_verify_skip_every: 0,
     }
 }
 
@@ -106,6 +107,22 @@ pub async fn test_state_with_webhooks() -> Arc<AppState> {
     db::ensure_webhooks_tables(&pool)
         .await
         .expect("ensure rtdb.webhooks tables");
+    AppState::new(pool, config, test_hot())
+}
+
+/// Like `test_state` but with subscription skip-verification on at `every`
+/// (1 = verify EVERY skip). Used by `tests/sub_invalidation_test.rs` to run the
+/// invalidation soundness matrix in verified mode: every skip is shadow-checked
+/// against a real re-run, so `subsMissedPushesTotal` must stay 0. Mirrors the
+/// `test_state_with_audit` override pattern.
+#[allow(dead_code)]
+pub async fn test_state_with_skip_verification(every: u64) -> Arc<AppState> {
+    let mut config = test_config();
+    config.subs_verify_skip_every = every;
+    let pool = sqlx::PgPool::connect(&config.database_url)
+        .await
+        .expect("connect to test postgres");
+    db::bootstrap(&pool).await.expect("bootstrap rtdb_auth");
     AppState::new(pool, config, test_hot())
 }
 

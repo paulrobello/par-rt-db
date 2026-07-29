@@ -46,6 +46,26 @@ export interface MetricsSnapshot {
   queryLatency: LatencyStats;
   mutateLatency: LatencyStats;
   subscribeLatency: LatencyStats;
+  /**
+   * Subscription-invalidation effectiveness. Counted per subscription whose
+   * table was written, so `reruns + skips` is the number of read-set decisions
+   * made; a skip means the read set proved every written document irrelevant.
+   * Skips are split by the class that proved it: `point` = `get(id)` reads,
+   * `indexed` = count/collect/unique over an eq-prefix window, `ordered` =
+   * take/first/paginate bounded by a top-N sort boundary.
+   */
+  subsRerunsTotal: number;
+  subsSkipsPointTotal: number;
+  subsSkipsIndexedTotal: number;
+  subsSkipsOrderedTotal: number;
+  /**
+   * Sampled shadow verifications of skips (server-side `RTDB_SUBS_VERIFY_SKIP_EVERY`),
+   * and how many found the skip was WRONG. `subsMissedPushesTotal > 0` means
+   * invalidation under-approximated and a realtime update would have been
+   * dropped — a correctness defect, not a tuning signal.
+   */
+  subsSkipVerificationsTotal: number;
+  subsMissedPushesTotal: number;
 }
 export interface HotConfig {
   allowedOrigins: string[];

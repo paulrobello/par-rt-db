@@ -561,6 +561,31 @@ pub mod admin {
         pub query_latency: LatencyStats,
         pub mutate_latency: LatencyStats,
         pub subscribe_latency: LatencyStats,
+        /// Subscription-invalidation effectiveness: read-set decisions that
+        /// ended in a re-run vs. a proven skip, split by the class that proved
+        /// it (`point` = `get(id)`, `indexed` = count/collect/unique over an
+        /// eq-prefix window, `ordered` = take/first/paginate bounded by a top-N
+        /// sort boundary).
+        ///
+        /// `#[serde(default)]` on this group so a client built against a newer
+        /// server still deserializes an OLDER server's response (these counters
+        /// landed 2026-07-29); 0 is the correct "not reported" value for a
+        /// monotonic counter. The rest of the struct stays strict.
+        #[serde(default)]
+        pub subs_reruns_total: i64,
+        #[serde(default)]
+        pub subs_skips_point_total: i64,
+        #[serde(default)]
+        pub subs_skips_indexed_total: i64,
+        #[serde(default)]
+        pub subs_skips_ordered_total: i64,
+        /// Sampled shadow verifications of skips and the ones that found the
+        /// skip WRONG. `subs_missed_pushes_total > 0` means invalidation
+        /// under-approximated — a dropped realtime update.
+        #[serde(default)]
+        pub subs_skip_verifications_total: i64,
+        #[serde(default)]
+        pub subs_missed_pushes_total: i64,
     }
 
     /// Runtime-mutable hot-config subset of `ConfigResponse`. Mirrors

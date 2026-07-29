@@ -1,18 +1,22 @@
-//! Fine-grained subscription invalidation v2 — soundness matrix.
+//! Fine-grained subscription invalidation — soundness matrix.
 //!
-//! Integration tests for the `Indexed` (eq-prefix + range) skip in
-//! `subs::fan_out`. These exercise the real committer path
-//! (`state.realtime.committers.mutate`) so fan_out actually runs, and assert
-//! pushes / no-pushes by draining the subscription's `tx` receiver. The
-//! `mutate().await?` call returns only after the committer has fully processed
-//! the txn INCLUDING fan_out, so any push is already buffered (or the skip
-//! already decided) by the time we assert — `try_recv()` is reliable with no
-//! grace period. NEVER call `execute_txn` directly here: it bypasses the
-//! committer and won't fan out.
+//! Integration tests for every skip in `subs::fan_out`: the `Indexed`
+//! (eq-prefix + range) window, the `Ordered` (take/first/paginate top-N
+//! boundary) window, and the shadow verification that guards both. These
+//! exercise the real committer path (`state.realtime.committers.mutate`) so
+//! fan_out actually runs, and assert pushes / no-pushes by draining the
+//! subscription's `tx` receiver. The `mutate().await?` call returns only after
+//! the committer has fully processed the txn INCLUDING fan_out, so any push is
+//! already buffered (or the skip already decided) by the time we assert —
+//! `try_recv()` is reliable with no grace period. NEVER call `execute_txn`
+//! directly here: it bypasses the committer and won't fan out.
 //!
-//! Unit-level coverage (ReadSet derivation, `in_window` typing) lives in
-//! `src/subs.rs`'s `#[cfg(test)]` module. These integration tests cover the
-//! end-to-end push/no-push behavior against the real dev Postgres.
+//! A no-push assertion cannot distinguish "skipped" from "re-ran and the
+//! canonical diff suppressed it" — that is by design, since both are correct
+//! behavior. What the skip DECISION does is unit-tested in `src/subs.rs`
+//! (ReadSet derivation, window typing, key comparison, boundary extraction);
+//! section 13 below closes the loop by running the matrix with verification on,
+//! so an unsound skip fails the suite instead of reaching a client.
 
 mod common;
 
@@ -1380,6 +1384,169 @@ async fn take_pushes_on_any_delete() -> anyhow::Result<()> {
         .mutate(&db, None, delete(&ids[1]), None)
         .await?;
     expect_update(&mut rx, "delete of a member").await;
+
+    Ok(())
+}
+
+// =====================================================================
+// 13. Shadow verification of skips (the instrumentation that makes an
+//     under-approximation loud instead of silent).
+//
+//     With `subs_verify_skip_every = 1` every skip is re-run anyway and its
+//     result compared against the last pushed one. A divergence would mean the
+//     read set dropped a realtime update; the verifier counts it in
+//     `subsMissedPushesTotal` and pushes the corrected result. These tests
+//     assert the counter stays 0 across the shapes that skip, which is the
+//     canary: if a future change makes a skip unsound, these fail loudly
+//     instead of the bug reaching a client.
+// =====================================================================
+
+use common::test_state_with_skip_verification;
+
+/// Snapshot the invalidation counters. `active_subscriptions` needs the subs
+/// manager, so this goes through the same `Metrics::snapshot` the dashboard and
+/// `/admin/metrics` use.
+async fn invalidation_counters(
+    state: &std::sync::Arc<rtdb_server::AppState>,
+) -> (u64, u64, u64, u64, u64) {
+    let snap = state
+        .runtime
+        .metrics
+        .snapshot(&state.pool, &state.realtime.subs, state.runtime.started_at)
+        .await;
+    (
+        snap.subs_skips_point_total,
+        snap.subs_skips_indexed_total,
+        snap.subs_skips_ordered_total,
+        snap.subs_skip_verifications_total,
+        snap.subs_missed_pushes_total,
+    )
+}
+
+#[tokio::test]
+async fn verified_skips_record_no_missed_pushes_across_the_matrix() -> anyhow::Result<()> {
+    // Every skip verified. Drive one write of each kind past subscriptions of
+    // every skipping class and assert the verifier never finds a divergence.
+    let state = test_state_with_skip_verification(1).await;
+    let db = fresh_db(&state).await;
+    let ids = seed(&state, &db, &[10.0, 20.0, 30.0]).await?;
+
+    // One sub per skipping read-set class, all on workItems.
+    let mut rx_point = {
+        let query: Query = serde_json::from_value(serde_json::json!({
+            "table": "workItems",
+            "get": ids[0]
+        }))
+        .expect("parse query");
+        sub(&state, &db, query).await
+    };
+    let mut rx_indexed = sub(&state, &db, count_by_status("backlog")).await;
+    let mut rx_ordered = sub(&state, &db, take_by_project_order(PROJ, 2, false)).await;
+
+    // A battery of writes that ALL THREE subs must skip. Each is `status=done`
+    // (outside the count sub's window) with an `order` beyond the take sub's
+    // boundary (but inside its projectId window, so the boundary is what proves
+    // it irrelevant), and touches neither the point sub's document.
+    state
+        .realtime
+        .committers
+        .mutate(&db, None, insert("done", 500.0), None)
+        .await?;
+    state
+        .realtime
+        .committers
+        .mutate(&db, None, insert("done", 400.0), None)
+        .await?;
+    state
+        .realtime
+        .committers
+        .mutate(
+            &db,
+            None,
+            patch_field(&ids[2], "title", serde_json::Value::String("x".into())),
+            None,
+        )
+        .await?;
+
+    let (point, indexed, ordered, verifications, missed) = invalidation_counters(&state).await;
+
+    // Every class actually skipped at least once — otherwise this test would
+    // pass vacuously without exercising the verifier.
+    assert!(point > 0, "point-read skips should have fired");
+    assert!(indexed > 0, "indexed skips should have fired");
+    assert!(ordered > 0, "ordered skips should have fired");
+    // Verification ran for every one of them (every == 1).
+    assert_eq!(
+        verifications,
+        point + indexed + ordered,
+        "with every=1 each skip must be verified"
+    );
+    // THE assertion: no skip was wrong.
+    assert_eq!(
+        missed, 0,
+        "a verified skip diverged — invalidation is unsound"
+    );
+
+    // The subs themselves saw no spurious pushes either (results unchanged).
+    expect_no_update(&mut rx_point, "point sub after unrelated writes");
+    expect_no_update(&mut rx_indexed, "count sub after out-of-window writes");
+    expect_no_update(&mut rx_ordered, "take sub after beyond-boundary writes");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn verification_does_not_change_push_behavior() -> anyhow::Result<()> {
+    // Verification must be observationally transparent for correct skips: the
+    // same pushes happen, in the same places, as with it off.
+    let state = test_state_with_skip_verification(1).await;
+    let db = fresh_db(&state).await;
+    seed(&state, &db, &[10.0, 20.0]).await?;
+
+    let mut rx = sub(&state, &db, take_by_project_order(PROJ, 2, false)).await;
+
+    // Beyond the boundary ⇒ skipped (and verified) ⇒ still no push.
+    state
+        .realtime
+        .committers
+        .mutate(&db, None, insert("backlog", 30.0), None)
+        .await?;
+    expect_no_update(&mut rx, "verified skip must not push");
+
+    // Ahead of the boundary ⇒ re-run ⇒ push.
+    state
+        .realtime
+        .committers
+        .mutate(&db, None, insert("backlog", 5.0), None)
+        .await?;
+    expect_update(&mut rx, "real change still pushes under verification").await;
+
+    let (_, _, _, verifications, missed) = invalidation_counters(&state).await;
+    assert!(verifications > 0, "at least one skip was verified");
+    assert_eq!(missed, 0);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn sampling_off_by_default_records_skips_but_no_verifications() -> anyhow::Result<()> {
+    // The default (`subs_verify_skip_every = 0`) keeps the optimization intact:
+    // skips are counted for the dashboard, but nothing is re-run to check them.
+    let state = test_state().await;
+    let db = fresh_db(&state).await;
+
+    let mut rx = sub(&state, &db, count_by_status("backlog")).await;
+    state
+        .realtime
+        .committers
+        .mutate(&db, None, insert("done", 1.0), None)
+        .await?;
+    expect_no_update(&mut rx, "out-of-window insert");
+
+    let (_, indexed, _, verifications, missed) = invalidation_counters(&state).await;
+    assert!(indexed > 0, "the skip is still counted");
+    assert_eq!(verifications, 0, "verification is off by default");
+    assert_eq!(missed, 0);
 
     Ok(())
 }

@@ -6,6 +6,7 @@ use sqlx::PgPool;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc::UnboundedSender;
 
+use crate::metrics::{Metrics, SkipClass};
 use crate::protocol::ServerMessage;
 use crate::query::{Order, Query, QueryResult, canonical, execute_query};
 use crate::schema::{FieldType, IndexDef, SchemaDef, TableDef};
@@ -133,20 +134,27 @@ impl Window {
 
 /// Three-way comparison of two typed binds.
 ///
-/// **Every `EqBind` variant MUST have an arm here.** Returns `None` only on a
-/// variant mismatch (e.g. `Text` vs `Num`), which shouldn't happen in practice
-/// — both binds derive from the same `FieldType` — but is defensive against a
-/// bug. `Num` uses `partial_cmp` so a (theoretically impossible from JSON) NaN
-/// is treated as unorderable rather than panicking.
+/// **Every `EqBind` variant MUST be comparable here**, and the structure of
+/// this function is what enforces it: the OUTER match is exhaustive over
+/// `EqBind`, so adding a variant fails to compile here rather than silently
+/// falling into a catch-all. Do not collapse it back into a
+/// `match (a, b) { .., _ => None }` — that shape compiles fine with a new
+/// variant and is UNSOUND (see below). Only the inner mismatch arms are
+/// catch-alls, and a mismatch cannot occur in practice: both binds derive from
+/// the same `FieldType`.
 ///
-/// The `_ => None` arm is NOT a soundness backstop. `None` propagates through
-/// `satisfies_lower`/`satisfies_upper` as `false`, which makes `Window::contains`
-/// return `false`, which makes `indexed_affects` return `false` for created/
-/// updated docs, which makes `fan_out` SKIP the re-run (`if !affects { continue; }`).
-/// That is UNDER-approximation — a missed push — and violates the committer's
-/// load-bearing "never under-approximate" invariant. So adding a new `EqBind`
-/// variant without a corresponding arm here is a correctness bug, not a
-/// conservative fallback.
+/// Why a missing arm is a correctness bug and not a conservative fallback:
+/// `None` propagates through `satisfies_lower`/`satisfies_upper` as `false`,
+/// which makes `Window::contains` return `false`, which makes `indexed_affects`
+/// return `false` for created/updated docs, which makes `fan_out` SKIP the
+/// re-run. That is UNDER-approximation — a missed push — and violates the
+/// committer's load-bearing "never under-approximate" invariant. (In the
+/// `Ordered` path a `None` is handled the other way, resolving to "re-run", so
+/// only the window path is exposed; keeping every variant comparable removes
+/// the hazard from both.)
+///
+/// `Num` uses `partial_cmp` so a (theoretically impossible from JSON) NaN is
+/// treated as unorderable rather than panicking.
 ///
 /// COLLATION: the `Text` arm compares byte-wise (Rust `String::cmp`), which
 /// matches Postgres only under a `C` collation — the collation par-rt-db's
@@ -158,12 +166,24 @@ impl Window {
 /// byte-wise under any deterministic collation, so eq-prefix matching is safe
 /// either way.
 fn cmp_binds(a: &EqBind, b: &EqBind) -> Option<std::cmp::Ordering> {
-    match (a, b) {
-        (EqBind::Text(x), EqBind::Text(y)) => Some(x.cmp(y)),
-        (EqBind::Num(x), EqBind::Num(y)) => x.partial_cmp(y),
-        (EqBind::Bool(x), EqBind::Bool(y)) => Some(x.cmp(y)),
-        (EqBind::I64(x), EqBind::I64(y)) => Some(x.cmp(y)),
-        _ => None,
+    // Exhaustive on `a` by construction — see the doc comment above.
+    match a {
+        EqBind::Text(x) => match b {
+            EqBind::Text(y) => Some(x.cmp(y)),
+            _ => None,
+        },
+        EqBind::Num(x) => match b {
+            EqBind::Num(y) => x.partial_cmp(y),
+            _ => None,
+        },
+        EqBind::Bool(x) => match b {
+            EqBind::Bool(y) => Some(x.cmp(y)),
+            _ => None,
+        },
+        EqBind::I64(x) => match b {
+            EqBind::I64(y) => Some(x.cmp(y)),
+            _ => None,
+        },
     }
 }
 
@@ -643,31 +663,48 @@ impl ReadSet {
     }
 }
 
-/// Whether a subscription on `table` must re-run for this transaction. The
-/// caller has already established that `table` was written.
+/// What `fan_out` should do with one subscription whose table was written.
+enum Decision {
+    Rerun,
+    /// Skip: `class`'s read set proved every written document irrelevant.
+    Skip(SkipClass),
+}
+
+/// Decide whether a subscription on `table` must re-run for this transaction.
+/// The caller has already established that `table` was written.
 ///
 /// Over-approximation is always safe (a needless re-run is diff-suppressed);
 /// under-approximation is a missed realtime update, so every uncertain case
-/// answers `true`.
-fn should_rerun(read_set: &ReadSet, table: &str, write_set: &WriteSet) -> bool {
-    match read_set {
+/// answers `Rerun`.
+fn decide(read_set: &ReadSet, table: &str, write_set: &WriteSet) -> Decision {
+    let (class, irrelevant) = match read_set {
         // Today's coarse behavior: any write to the table re-runs.
-        ReadSet::Table => true,
+        ReadSet::Table => return Decision::Rerun,
         // A `get(id)` point read depends only on its one document, so a write
         // that didn't touch it cannot change the result.
-        ReadSet::Point { id } => write_set.docs.contains(&(table.to_string(), id.clone())),
+        ReadSet::Point { id } => (
+            SkipClass::Point,
+            !write_set.docs.contains(&(table.to_string(), id.clone())),
+        ),
         // count / collect / unique: re-run only if some written doc crossed
         // the eq-prefix/range window boundary. Sound only because every
-        // `EqBind` variant has a real `cmp_binds` arm — `Window::contains`
+        // `EqBind` variant is comparable in `cmp_binds` — `Window::contains`
         // returns false on comparison doubt, which would UNDER-approximate.
-        ReadSet::Indexed(indexed) => {
-            any_written_affects(write_set, table, |values| indexed_affects(indexed, values))
-        }
+        ReadSet::Indexed(indexed) => (
+            SkipClass::Indexed,
+            !any_written_affects(write_set, table, |values| indexed_affects(indexed, values)),
+        ),
         // take / first / paginate: re-run only if some written doc is inside
         // the window AND ranks at or before the last result's boundary.
-        ReadSet::Ordered(ordered) => {
-            any_written_affects(write_set, table, |values| ordered_affects(ordered, values))
-        }
+        ReadSet::Ordered(ordered) => (
+            SkipClass::Ordered,
+            !any_written_affects(write_set, table, |values| ordered_affects(ordered, values)),
+        ),
+    };
+    if irrelevant {
+        Decision::Skip(class)
+    } else {
+        Decision::Rerun
     }
 }
 
@@ -737,13 +774,48 @@ type DbSubs = HashMap<(ConnId, String), SubEntry>;
 /// them costs nothing measurable.
 pub struct SubscriptionManager {
     subs: Mutex<HashMap<String, Arc<Mutex<DbSubs>>>>,
+    /// Where `fan_out` records skip/re-run effectiveness and verification
+    /// outcomes. `None` = don't record (the bare `new()` used by tests that
+    /// assert nothing about instrumentation).
+    metrics: Option<Arc<Metrics>>,
+    /// Verify 1 skip in every N (0 = off). See `Config::subs_verify_skip_every`.
+    verify_skip_every: u64,
+    /// Monotonic skip counter driving the deterministic 1-in-N sampler. Only
+    /// read when `verify_skip_every > 0`.
+    skip_seq: AtomicU64,
 }
 
 impl SubscriptionManager {
+    /// Uninstrumented manager: no metrics recording, no skip verification.
     pub fn new() -> Arc<Self> {
+        Self::with_instrumentation(None, 0)
+    }
+
+    /// Manager wired to the process metrics and the skip-verification sampler
+    /// (`AppState::new` passes `Config::subs_verify_skip_every`).
+    pub fn with_instrumentation(
+        metrics: Option<Arc<Metrics>>,
+        verify_skip_every: u64,
+    ) -> Arc<Self> {
         Arc::new(Self {
             subs: Mutex::new(HashMap::new()),
+            metrics,
+            verify_skip_every,
+            skip_seq: AtomicU64::new(0),
         })
+    }
+
+    /// Whether this skip should be shadow-verified. Deterministic every-Nth
+    /// sampling rather than random, so a test can pin the rate and get exact
+    /// counts. Counts every skip so the stride is stable regardless of which
+    /// read-set class produced it.
+    fn sample_skip_verification(&self) -> bool {
+        let every = self.verify_skip_every;
+        if every == 0 {
+            return false;
+        }
+        let seq = self.skip_seq.fetch_add(1, Ordering::Relaxed);
+        seq.is_multiple_of(every)
     }
 
     /// Get-or-insert the shard for `db` (used by `register`). The outer lock
@@ -866,6 +938,16 @@ impl SubscriptionManager {
     /// logged and skipped, never fails the caller. Send errors (receiver
     /// dropped) are ignored; connection teardown is expected to call
     /// `remove_conn` separately.
+    ///
+    /// Records skip/re-run effectiveness on `self.metrics`, and — for 1 skip in
+    /// every `verify_skip_every` — SHADOW-VERIFIES the skip: the query runs
+    /// anyway and its result is compared against the last pushed one. A
+    /// divergence means the read set under-approximated (a realtime update
+    /// would have been dropped), so it is logged at ERROR, counted, and the
+    /// corrected result IS pushed — verification repairs as well as reports.
+    /// Only read-set skips are verified; the `write_set.tables` fast path above
+    /// it is trivially sound (a query reads exactly one table) and verifying it
+    /// would cost a round-trip per subscription per write.
     pub(crate) async fn fan_out(
         &self,
         pool: &PgPool,
@@ -887,9 +969,30 @@ impl SubscriptionManager {
             if !write_set.tables.contains(&entry.query.table) {
                 continue;
             }
-            if !should_rerun(&entry.read_set, &entry.query.table, write_set) {
-                continue;
-            }
+            // `Some(class)` once this iteration is a shadow verification of a
+            // skip rather than a real re-run: the decision said "skip", and the
+            // sampler picked it for checking. The class rides along so a
+            // divergence names which read set got it wrong.
+            let verifying = match decide(&entry.read_set, &entry.query.table, write_set) {
+                Decision::Rerun => {
+                    if let Some(metrics) = &self.metrics {
+                        metrics.record_subs_rerun();
+                    }
+                    None
+                }
+                Decision::Skip(class) => {
+                    if let Some(metrics) = &self.metrics {
+                        metrics.record_subs_skip(class);
+                    }
+                    if !self.sample_skip_verification() {
+                        continue;
+                    }
+                    if let Some(metrics) = &self.metrics {
+                        metrics.record_subs_skip_verification();
+                    }
+                    Some(class)
+                }
+            };
 
             let result =
                 match execute_query(pool, db, schema, &entry.query, entry.owner.as_deref()).await {
@@ -918,7 +1021,32 @@ impl SubscriptionManager {
 
             let canon = canonical(&result);
             if canon == entry.last {
+                // Unchanged. For a verification pass this is the expected
+                // outcome — the skip was correct, and it cost one round-trip to
+                // prove it.
                 continue;
+            }
+
+            if let Some(class) = verifying {
+                // The skip decision was WRONG: we had decided this write could
+                // not change the result, and it did. That is the one failure
+                // mode invalidation must never have, and it is silent without
+                // this check — so shout, count it, and fall through to push the
+                // corrected result so the subscriber is repaired rather than
+                // left stale.
+                if let Some(metrics) = &self.metrics {
+                    metrics.record_subs_missed_push();
+                }
+                tracing::error!(
+                    db,
+                    query_id,
+                    class = ?class,
+                    table = %entry.query.table,
+                    read_set = ?entry.read_set,
+                    "MISSED PUSH: subscription invalidation skipped a re-run whose result had \
+                     changed — this is an invalidation soundness bug. Pushing the corrected \
+                     result. Report the class + read_set + query shape."
+                );
             }
 
             let value = match serde_json::to_value(&result) {
@@ -1747,6 +1875,40 @@ mod tests {
             &ordered,
             &created(doc_at("backlog", 5.0), 50)
         ));
+    }
+
+    // ---- skip-verification sampler ----
+
+    #[test]
+    fn sampler_is_off_by_default_and_touches_no_state() {
+        let mgr = SubscriptionManager::new();
+        for _ in 0..10 {
+            assert!(!mgr.sample_skip_verification());
+        }
+        // Disabled means the counter is never even incremented, so a busy
+        // instance pays nothing for the knob being present.
+        assert_eq!(mgr.skip_seq.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn sampler_every_1_verifies_every_skip() {
+        let mgr = SubscriptionManager::with_instrumentation(None, 1);
+        for _ in 0..5 {
+            assert!(mgr.sample_skip_verification());
+        }
+    }
+
+    #[test]
+    fn sampler_every_n_verifies_one_in_n_deterministically() {
+        let mgr = SubscriptionManager::with_instrumentation(None, 3);
+        // Deterministic 1-in-3 starting with the first skip, so a test can pin
+        // the rate and assert exact counts.
+        let picks: Vec<bool> = (0..7).map(|_| mgr.sample_skip_verification()).collect();
+        assert_eq!(
+            picks,
+            vec![true, false, false, true, false, false, true],
+            "expected every 3rd skip to be verified"
+        );
     }
 
     #[test]

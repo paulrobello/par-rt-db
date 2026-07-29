@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   DT_MAX,
   DT_MIN,
+  formatPercent,
   formatRate,
   lastValue,
   levelSeries,
@@ -9,6 +10,7 @@ import {
   nearestIndex,
   rateSeries,
   type Sample,
+  subsSkipRate,
 } from "./metrics-series";
 import type { MetricsSnapshot } from "./types";
 
@@ -24,6 +26,12 @@ const snap = (over: Partial<MetricsSnapshot>): MetricsSnapshot => ({
   queryLatency: { p50: 0, p95: 0, p99: 0 },
   mutateLatency: { p50: 0, p95: 0, p99: 0 },
   subscribeLatency: { p50: 0, p95: 0, p99: 0 },
+  subsRerunsTotal: 0,
+  subsSkipsPointTotal: 0,
+  subsSkipsIndexedTotal: 0,
+  subsSkipsOrderedTotal: 0,
+  subsSkipVerificationsTotal: 0,
+  subsMissedPushesTotal: 0,
   ...over,
 });
 
@@ -115,5 +123,34 @@ describe("formatRate", () => {
 describe("constants", () => {
   it("MAX_SAMPLES holds 60s + the current point", () => {
     expect(MAX_SAMPLES).toBe(61);
+  });
+});
+
+describe("subsSkipRate", () => {
+  it("divides total skips by total decisions (skips + reruns)", () => {
+    const rate = subsSkipRate(
+      snap({
+        subsSkipsPointTotal: 60,
+        subsSkipsIndexedTotal: 30,
+        subsSkipsOrderedTotal: 0,
+        subsRerunsTotal: 10,
+      }),
+    );
+    expect(rate).toBe(0.9);
+  });
+
+  it("returns null when no decisions have been made yet (divide-by-zero guard)", () => {
+    expect(subsSkipRate(snap({}))).toBeNull();
+  });
+});
+
+describe("formatPercent", () => {
+  it("formats a 0..1 fraction to one decimal place", () => {
+    expect(formatPercent(0.9)).toBe("90.0%");
+    expect(formatPercent(0.1234)).toBe("12.3%");
+  });
+
+  it("returns an em dash for null", () => {
+    expect(formatPercent(null)).toBe("—");
   });
 });

@@ -66,3 +66,20 @@ export function formatRate(perSecond: number): string {
   const text = perSecond >= 100 ? String(Math.round(perSecond)) : perSecond.toFixed(1);
   return `${text}/s`;
 }
+
+/**
+ * Fraction of subscription-invalidation decisions resolved by a proven skip
+ * (point/indexed/ordered) rather than a fan-out re-run. Null when no decision
+ * has been made yet — never divide by zero.
+ */
+export function subsSkipRate(m: MetricsSnapshot): number | null {
+  const skips = m.subsSkipsPointTotal + m.subsSkipsIndexedTotal + m.subsSkipsOrderedTotal;
+  const decisions = skips + m.subsRerunsTotal;
+  return decisions > 0 ? skips / decisions : null;
+}
+
+/** Format a 0..1 fraction as a percentage; null renders as an em dash. */
+export function formatPercent(fraction: number | null): string {
+  if (fraction == null) return "—";
+  return `${(fraction * 100).toFixed(1)}%`;
+}

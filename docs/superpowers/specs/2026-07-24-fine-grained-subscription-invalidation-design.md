@@ -568,3 +568,91 @@ refinement.
   so a delete outside the window can be skipped like any other write. Cheap and
   additive; deletes are simply rarer than updates, so it was not worth widening
   the delete path in this pass.
+
+---
+
+# Instrumentation — making a wrong skip loud (2026-07-29)
+
+- **Status:** Shipped (2026-07-29), same day as v3.
+- **Why:** every version above argues soundness from the query shape, and the
+  test suite covers the cases we thought of. But the failure mode — a skip that
+  should have been a re-run — produces **no error**: the subscriber simply never
+  hears about a change. Nothing in production could distinguish "the
+  optimization is working" from "the optimization is dropping updates". These
+  three layers close that gap, cheapest first.
+
+## 1. Compile-time: an unorderable `EqBind` can't exist
+
+`cmp_binds` used to end in `_ => None`, and `None` resolves to "outside the
+window" ⇒ skip ⇒ under-approximation. So adding an `EqBind` variant without a
+comparison arm was a silent soundness bug — one that had already happened once
+(the `I64` arm; see the `int64_range_count_*` regression tests).
+
+It is now written as an outer `match a` (exhaustive over `EqBind`) dispatching
+to an inner match on `b`. A new variant fails to compile *in `subs.rs`*.
+Verified by adding a throwaway fifth variant: two `E0004: non-exhaustive
+patterns` errors. **Do not collapse it back to `match (a, b) { …, _ => None }`**
+— that shape compiles fine with a new variant, which is the whole hazard.
+
+## 2. Runtime: sampled shadow verification of skips
+
+`RTDB_SUBS_VERIFY_SKIP_EVERY` (boot `Config::subs_verify_skip_every`, 0 = off,
+1 = every skip, 100 = 1%) makes `fan_out` verify 1 skip in every N: it runs the
+query it just decided to skip, canonicalizes, and compares against
+`entry.last`. Outcomes:
+
+| Result | Meaning | Action |
+|---|---|---|
+| identical | the skip was correct | count the verification, push nothing |
+| different | **the read set under-approximated** | count `subs_missed_pushes_total`, log at ERROR with db / query_id / table / read_set, and PUSH the corrected result |
+
+Pushing on detection means verification *repairs* as well as reports: the
+subscriber that would have gone stale is brought current. Cost is exactly the
+round-trip the skip avoided, so this trades the optimization back for
+confidence — keep N large in production, use 1 in tests.
+
+Sampling is deterministic (every Nth skip via an `AtomicU64`), not random, so a
+test can pin the rate and assert exact counts. Only read-set skips are verified;
+the `write_set.tables` fast path is trivially sound (a query reads exactly one
+table) and verifying it would cost a round-trip per subscription per write.
+
+Validated by mutation: deliberately forcing `decide` to always skip `Ordered`
+made `subs_missed_pushes_total` go to 1 while the subscriber still received its
+update — detection and repair both confirmed — and reverting restored green.
+
+## 3. Effectiveness counters
+
+`fan_out` records, per subscription whose table was written, either a re-run or
+a skip tagged with the class that proved it. Exposed on `GET /admin/metrics`
+(camelCase) and `/metrics` (Prometheus):
+
+```
+rtdb_subs_skips_total{class="point"}     # get(id)
+rtdb_subs_skips_total{class="indexed"}   # count/collect/unique eq-prefix window
+rtdb_subs_skips_total{class="ordered"}   # take/first/paginate top-N boundary
+rtdb_subs_reruns_total
+rtdb_subs_skip_verifications_total
+rtdb_subs_missed_pushes_total            # ALERT ON ANY INCREASE
+```
+
+These measure benefit, not correctness — a wrong skip and a right skip both
+increment the same counter. Their diagnostic value is in the shape: a class
+stuck at zero means its derivation isn't firing, and a skip rate that jumps to
+~100% deserves a look. Subscriptions on untouched tables aren't counted, so
+`skips + reruns` is the number of read-set decisions actually made.
+
+Mirrored in `ts-client` (`MetricsSnapshot`), `rust-client`
+(`wire::admin::MetricsSnapshot`, with `#[serde(default)]` on the group so a
+newer client still parses an older server's response), and surfaced on the
+dashboard metrics page. `python-client` has no metrics method yet — pre-existing
+gap, unchanged here.
+
+## Operating it
+
+- Default (0) keeps the optimization intact; skip counters still populate, so
+  the dashboard shows effectiveness with no verification cost.
+- To gain confidence after an invalidation change: set N to something like 20
+  in prod for a few days and confirm `rtdb_subs_missed_pushes_total` stays 0.
+- Integration tests run the whole soundness matrix at N=1
+  (`test_state_with_skip_verification`), so any future unsound skip fails the
+  suite rather than reaching a client.

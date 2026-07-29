@@ -41,6 +41,10 @@
   min-height: 128px;
 }
 
+.instrument_alarm {
+  border-left: 2px solid var(--error);
+}
+
 .instrumentLabel {
   font-family: var(--mono);
   font-size: var(--t-mono-xs);
@@ -56,6 +60,14 @@
   color: var(--ink);
   font-weight: 500;
   line-height: 1.1;
+}
+
+.instrumentValue_alarm {
+  color: var(--error);
+}
+
+.instrumentValue_muted {
+  color: var(--ink-3);
 }
 
 .instrumentSub {

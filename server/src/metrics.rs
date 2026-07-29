@@ -72,6 +72,16 @@ impl LatencySamples {
     }
 }
 
+/// Which `subs::ReadSet` class decided a fan-out skip. Only the classes that
+/// CAN skip are represented — `Table` always re-runs, so it has no skip
+/// counter (its work shows up in `subs_reruns_total`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SkipClass {
+    Point,
+    Indexed,
+    Ordered,
+}
+
 #[derive(Default)]
 pub struct Metrics {
     queries_total: AtomicU64,
@@ -82,6 +92,24 @@ pub struct Metrics {
     query_latency: Mutex<LatencySamples>,
     mutate_latency: Mutex<LatencySamples>,
     subscribe_latency: Mutex<LatencySamples>,
+    // ---- Subscription invalidation (see `subs::fan_out`) ----
+    // Counted per subscription whose table WAS written; subscriptions on
+    // untouched tables are the trivial fast path and are not counted, so
+    // `skips + reruns` is the number of read-set decisions actually made.
+    /// Re-runs performed: the subscription's read set could not prove the write
+    /// irrelevant (includes every `Table`-class subscription).
+    subs_reruns_total: AtomicU64,
+    subs_skips_point_total: AtomicU64,
+    subs_skips_indexed_total: AtomicU64,
+    subs_skips_ordered_total: AtomicU64,
+    /// Skips that were shadow-verified (the query was re-run anyway and its
+    /// result compared against the last pushed one). Sampled — see
+    /// `Config::subs_verify_skip_every`.
+    subs_skip_verifications_total: AtomicU64,
+    /// **The alarm.** Verified skips whose result had actually changed: the
+    /// invalidation logic under-approximated and would have dropped a realtime
+    /// update. Any non-zero value is a correctness defect, not a tuning signal.
+    subs_missed_pushes_total: AtomicU64,
 }
 
 impl Metrics {
@@ -130,6 +158,36 @@ impl Metrics {
         }
     }
 
+    /// A subscription on a written table was re-run by `fan_out`.
+    pub fn record_subs_rerun(&self) {
+        self.subs_reruns_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A subscription on a written table was skipped: its read set proved every
+    /// written document irrelevant.
+    pub fn record_subs_skip(&self, class: SkipClass) {
+        let counter = match class {
+            SkipClass::Point => &self.subs_skips_point_total,
+            SkipClass::Indexed => &self.subs_skips_indexed_total,
+            SkipClass::Ordered => &self.subs_skips_ordered_total,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A skip was shadow-verified. Call once per verification regardless of the
+    /// outcome; `record_subs_missed_push` records the failures.
+    pub fn record_subs_skip_verification(&self) {
+        self.subs_skip_verifications_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A shadow-verified skip turned out to be wrong — the result HAD changed.
+    /// See `subs_missed_pushes_total`: non-zero means a correctness defect.
+    pub fn record_subs_missed_push(&self) {
+        self.subs_missed_pushes_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     pub async fn snapshot(
         &self,
         pool: &PgPool,
@@ -163,6 +221,14 @@ impl Metrics {
             query_latency,
             mutate_latency,
             subscribe_latency,
+            subs_reruns_total: self.subs_reruns_total.load(Ordering::Relaxed),
+            subs_skips_point_total: self.subs_skips_point_total.load(Ordering::Relaxed),
+            subs_skips_indexed_total: self.subs_skips_indexed_total.load(Ordering::Relaxed),
+            subs_skips_ordered_total: self.subs_skips_ordered_total.load(Ordering::Relaxed),
+            subs_skip_verifications_total: self
+                .subs_skip_verifications_total
+                .load(Ordering::Relaxed),
+            subs_missed_pushes_total: self.subs_missed_pushes_total.load(Ordering::Relaxed),
         }
     }
 }
@@ -181,6 +247,19 @@ pub struct MetricsSnapshot {
     pub query_latency: LatencyStats,
     pub mutate_latency: LatencyStats,
     pub subscribe_latency: LatencyStats,
+    /// Subscription-invalidation effectiveness: how many read-set decisions
+    /// ended in a re-run vs. a proven skip, split by the class that proved it.
+    /// A class stuck at zero while its subscriptions exist means its derivation
+    /// isn't firing.
+    pub subs_reruns_total: u64,
+    pub subs_skips_point_total: u64,
+    pub subs_skips_indexed_total: u64,
+    pub subs_skips_ordered_total: u64,
+    /// Sampled shadow verifications of skips, and the ones that found the skip
+    /// was wrong. `subsMissedPushesTotal > 0` is a correctness defect — see
+    /// `Metrics::subs_missed_pushes_total`.
+    pub subs_skip_verifications_total: u64,
+    pub subs_missed_pushes_total: u64,
 }
 
 /// Render the snapshot as Prometheus text-exposition format (version 0.0.4).
@@ -206,6 +285,53 @@ pub fn render_prometheus(snap: &MetricsSnapshot, version: &str, git_commit: &str
     s.push_str("# HELP rtdb_uploads_total Total file storage uploads (POST /api/storage/{db}).\n");
     s.push_str("# TYPE rtdb_uploads_total counter\n");
     s.push_str(&format!("rtdb_uploads_total {}\n", snap.uploads_total));
+
+    // Subscription invalidation. Skips carry a `class` label (the read set that
+    // proved the write irrelevant) so one metric covers every class and a new
+    // class is a new label rather than a new metric name.
+    s.push_str(
+        "# HELP rtdb_subs_skips_total Subscription re-runs skipped because the read set proved every written document irrelevant.\n",
+    );
+    s.push_str("# TYPE rtdb_subs_skips_total counter\n");
+    s.push_str(&format!(
+        "rtdb_subs_skips_total{{class=\"point\"}} {}\n",
+        snap.subs_skips_point_total
+    ));
+    s.push_str(&format!(
+        "rtdb_subs_skips_total{{class=\"indexed\"}} {}\n",
+        snap.subs_skips_indexed_total
+    ));
+    s.push_str(&format!(
+        "rtdb_subs_skips_total{{class=\"ordered\"}} {}\n",
+        snap.subs_skips_ordered_total
+    ));
+
+    s.push_str(
+        "# HELP rtdb_subs_reruns_total Subscriptions re-run by fan_out (read set could not prove irrelevance).\n",
+    );
+    s.push_str("# TYPE rtdb_subs_reruns_total counter\n");
+    s.push_str(&format!(
+        "rtdb_subs_reruns_total {}\n",
+        snap.subs_reruns_total
+    ));
+
+    s.push_str(
+        "# HELP rtdb_subs_skip_verifications_total Skips shadow-verified by re-running the query and comparing (sampled).\n",
+    );
+    s.push_str("# TYPE rtdb_subs_skip_verifications_total counter\n");
+    s.push_str(&format!(
+        "rtdb_subs_skip_verifications_total {}\n",
+        snap.subs_skip_verifications_total
+    ));
+
+    s.push_str(
+        "# HELP rtdb_subs_missed_pushes_total Verified skips whose result had changed — invalidation under-approximated. ALERT ON ANY INCREASE.\n",
+    );
+    s.push_str("# TYPE rtdb_subs_missed_pushes_total counter\n");
+    s.push_str(&format!(
+        "rtdb_subs_missed_pushes_total {}\n",
+        snap.subs_missed_pushes_total
+    ));
 
     // Gauges — point-in-time process/runtime state.
     s.push_str("# HELP rtdb_ws_connections Current open /sync WebSocket connections.\n");
@@ -258,6 +384,12 @@ mod tests {
             query_latency: LatencyStats::default(),
             mutate_latency: LatencyStats::default(),
             subscribe_latency: LatencyStats::default(),
+            subs_reruns_total: 11,
+            subs_skips_point_total: 12,
+            subs_skips_indexed_total: 13,
+            subs_skips_ordered_total: 14,
+            subs_skip_verifications_total: 15,
+            subs_missed_pushes_total: 0,
         };
         let body = render_prometheus(&snap, "0.0.0", "abc");
         assert!(
@@ -272,6 +404,71 @@ mod tests {
             body.contains("rtdb_build_info{version=\"0.0.0\",git_commit=\"abc\"} 1"),
             "missing build_info sample: {body}"
         );
+    }
+
+    #[test]
+    fn render_prometheus_includes_invalidation_counters_with_class_labels() {
+        let snap = MetricsSnapshot {
+            queries_total: 0,
+            mutations_total: 0,
+            uploads_total: 0,
+            ws_connections: 0,
+            active_subscriptions: 0,
+            pool_size: 0,
+            pool_idle: 0,
+            uptime_seconds: 0,
+            query_latency: LatencyStats::default(),
+            mutate_latency: LatencyStats::default(),
+            subscribe_latency: LatencyStats::default(),
+            subs_reruns_total: 4,
+            subs_skips_point_total: 1,
+            subs_skips_indexed_total: 2,
+            subs_skips_ordered_total: 3,
+            subs_skip_verifications_total: 7,
+            subs_missed_pushes_total: 9,
+        };
+        let body = render_prometheus(&snap, "0.0.0", "abc");
+        // One metric name, one sample per skip class.
+        assert!(
+            body.contains("# TYPE rtdb_subs_skips_total counter"),
+            "{body}"
+        );
+        assert!(
+            body.contains("rtdb_subs_skips_total{class=\"point\"} 1"),
+            "{body}"
+        );
+        assert!(
+            body.contains("rtdb_subs_skips_total{class=\"indexed\"} 2"),
+            "{body}"
+        );
+        assert!(
+            body.contains("rtdb_subs_skips_total{class=\"ordered\"} 3"),
+            "{body}"
+        );
+        assert!(body.contains("rtdb_subs_reruns_total 4"), "{body}");
+        assert!(
+            body.contains("rtdb_subs_skip_verifications_total 7"),
+            "{body}"
+        );
+        assert!(body.contains("rtdb_subs_missed_pushes_total 9"), "{body}");
+    }
+
+    #[test]
+    fn skip_and_verification_counters_land_in_the_snapshot() {
+        let m = Metrics::default();
+        m.record_subs_skip(SkipClass::Point);
+        m.record_subs_skip(SkipClass::Indexed);
+        m.record_subs_skip(SkipClass::Indexed);
+        m.record_subs_skip(SkipClass::Ordered);
+        m.record_subs_rerun();
+        m.record_subs_skip_verification();
+        m.record_subs_missed_push();
+        assert_eq!(m.subs_skips_point_total.load(Ordering::Relaxed), 1);
+        assert_eq!(m.subs_skips_indexed_total.load(Ordering::Relaxed), 2);
+        assert_eq!(m.subs_skips_ordered_total.load(Ordering::Relaxed), 1);
+        assert_eq!(m.subs_reruns_total.load(Ordering::Relaxed), 1);
+        assert_eq!(m.subs_skip_verifications_total.load(Ordering::Relaxed), 1);
+        assert_eq!(m.subs_missed_pushes_total.load(Ordering::Relaxed), 1);
     }
 
     #[test]

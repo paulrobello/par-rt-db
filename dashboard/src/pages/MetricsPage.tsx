@@ -3,7 +3,15 @@ import { Sparkline } from "../components/Sparkline";
 import { Placard, Spinner, StatusLamp } from "../components/ui";
 import { useAdmin } from "../lib/admin";
 import { formatDuration, formatNumber } from "../lib/format";
-import { formatRate, lastValue, levelSeries, type Point, rateSeries } from "../lib/metrics-series";
+import {
+  formatPercent,
+  formatRate,
+  lastValue,
+  levelSeries,
+  type Point,
+  rateSeries,
+  subsSkipRate,
+} from "../lib/metrics-series";
 import type { LatencyStats, MetricsSnapshot } from "../lib/types";
 import { useMetricsHistory } from "../lib/useMetricsHistory";
 import s from "./MetricsPage.module.css";
@@ -18,16 +26,28 @@ function Instrument({
   value,
   sub,
   sparkline,
+  alarm,
+  muted,
 }: {
   label: string;
   value: string;
   sub?: string;
   sparkline?: ReactNode;
+  /** Unmissable: red border + value, for a defect signal (e.g. a missed push). */
+  alarm?: boolean;
+  /** Quiet: dims the value, for "not currently measuring" rather than a zero result. */
+  muted?: boolean;
 }) {
   return (
-    <div className={s.instrument}>
+    <div className={`${s.instrument} ${alarm ? s.instrument_alarm : ""}`}>
       <span className={s.instrumentLabel}>{label}</span>
-      <span className={s.instrumentValue}>{value}</span>
+      <span
+        className={`${s.instrumentValue} ${alarm ? s.instrumentValue_alarm : ""} ${
+          muted ? s.instrumentValue_muted : ""
+        }`}
+      >
+        {value}
+      </span>
       {sub && <span className={s.instrumentSub}>{sub}</span>}
       {sparkline && <div className={s.spark}>{sparkline}</div>}
     </div>
@@ -56,6 +76,11 @@ export function MetricsPage() {
   const wsLevel: Point[] = levelSeries(samples, (s) => s.wsConnections);
   const subsLevel: Point[] = levelSeries(samples, (s) => s.activeSubscriptions);
   const poolBusy: Point[] = levelSeries(samples, (s) => s.poolSize - s.poolIdle);
+
+  const skipsTotal = m.subsSkipsPointTotal + m.subsSkipsIndexedTotal + m.subsSkipsOrderedTotal;
+  const skipRate = subsSkipRate(m);
+  const verifying = m.subsSkipVerificationsTotal > 0;
+  const missedPushes = m.subsMissedPushesTotal;
 
   return (
     <section className={s.page}>
@@ -121,6 +146,32 @@ export function MetricsPage() {
               ariaLabel="busy connections out of pool size over the last minute"
             />
           }
+        />
+      </Panel>
+
+      <Panel title="Subscription invalidation">
+        <Instrument
+          label="skip rate"
+          value={formatPercent(skipRate)}
+          sub={`${formatNumber(skipsTotal)} skipped · ${formatNumber(m.subsRerunsTotal)} rerun`}
+        />
+        <Instrument label="reruns" value={formatNumber(m.subsRerunsTotal)} />
+        <Instrument label="point skips" value={formatNumber(m.subsSkipsPointTotal)} />
+        <Instrument label="indexed skips" value={formatNumber(m.subsSkipsIndexedTotal)} />
+        <Instrument label="ordered skips" value={formatNumber(m.subsSkipsOrderedTotal)} />
+        <Instrument
+          label="skip verification"
+          value={verifying ? formatNumber(m.subsSkipVerificationsTotal) : "off"}
+          sub={verifying ? "sampled shadow checks" : "RTDB_SUBS_VERIFY_SKIP_EVERY unset"}
+          muted={!verifying}
+        />
+        <Instrument
+          label="missed pushes"
+          value={formatNumber(missedPushes)}
+          sub={
+            verifying ? `of ${formatNumber(m.subsSkipVerificationsTotal)} verified` : "sampling off"
+          }
+          alarm={missedPushes > 0}
         />
       </Panel>
 

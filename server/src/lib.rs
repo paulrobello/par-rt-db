@@ -86,7 +86,14 @@ pub struct AppState {
 impl AppState {
     pub fn new(pool: sqlx::PgPool, config: Config, hot: HotConfig) -> Arc<Self> {
         let schemas = SchemaCache::new();
-        let subs = SubscriptionManager::new();
+        let metrics = metrics::Metrics::new();
+        // The subscription manager records invalidation effectiveness on the
+        // same `Metrics` the dashboard reads, and owns the skip-verification
+        // sampler — so it is built after metrics and before the committers.
+        let subs = SubscriptionManager::with_instrumentation(
+            Some(metrics.clone()),
+            config.subs_verify_skip_every,
+        );
         let op_feed = op_feed::OpFeed::new(1024, 500);
         let hot = Arc::new(ArcSwap::from_pointee(hot));
         let committers = Committers::new(
@@ -98,7 +105,6 @@ impl AppState {
             config.audit_log_enabled,
             config.webhooks_enabled,
         );
-        let metrics = metrics::Metrics::new();
         Arc::new(Self {
             pool,
             config,

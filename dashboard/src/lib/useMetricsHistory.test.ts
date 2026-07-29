@@ -25,6 +25,12 @@ const snap = (over: Partial<MetricsSnapshot>): MetricsSnapshot => ({
   queryLatency: { p50: 0, p95: 0, p99: 0 },
   mutateLatency: { p50: 0, p95: 0, p99: 0 },
   subscribeLatency: { p50: 0, p95: 0, p99: 0 },
+  subsRerunsTotal: 0,
+  subsSkipsPointTotal: 0,
+  subsSkipsIndexedTotal: 0,
+  subsSkipsOrderedTotal: 0,
+  subsSkipVerificationsTotal: 0,
+  subsMissedPushesTotal: 0,
   ...over,
 });
 

@@ -25,6 +25,7 @@ fn test_config() -> Config {
         backup_cron: "0 3 * * *".into(),
         backup_dir: "./backups".into(),
         backup_retention: 7,
+        subs_verify_skip_every: 0,
     }
 }
 

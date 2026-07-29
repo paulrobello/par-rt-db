@@ -1998,6 +1998,48 @@ mod admin_tests {
         assert_eq!(snap.query_latency.p99, 330);
         assert_eq!(snap.mutate_latency.p99, 660);
         assert_eq!(snap.subscribe_latency.p50, 770);
+        // This mock body omits the invalidation counters entirely — i.e. it is
+        // an OLDER server's response. `#[serde(default)]` on that field group
+        // must keep the whole snapshot parseable rather than failing the call.
+        assert_eq!(snap.subs_reruns_total, 0);
+        assert_eq!(snap.subs_skips_ordered_total, 0);
+        assert_eq!(snap.subs_missed_pushes_total, 0);
+    }
+
+    #[tokio::test]
+    async fn get_metrics_parses_invalidation_counters() {
+        let (server, client) = setup().await;
+        Mock::given(method("GET"))
+            .and(path("/admin/metrics"))
+            .and(header("authorization", BEARER))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "queriesTotal": 0,
+                "mutationsTotal": 0,
+                "uploadsTotal": 0,
+                "wsConnections": 0,
+                "activeSubscriptions": 0,
+                "poolSize": 0,
+                "poolIdle": 0,
+                "uptimeSeconds": 0,
+                "queryLatency": {"p50": 0, "p95": 0, "p99": 0},
+                "mutateLatency": {"p50": 0, "p95": 0, "p99": 0},
+                "subscribeLatency": {"p50": 0, "p95": 0, "p99": 0},
+                "subsRerunsTotal": 4,
+                "subsSkipsPointTotal": 1,
+                "subsSkipsIndexedTotal": 2,
+                "subsSkipsOrderedTotal": 3,
+                "subsSkipVerificationsTotal": 6,
+                "subsMissedPushesTotal": 0
+            })))
+            .mount(&server)
+            .await;
+        let snap = client.metrics().await.unwrap();
+        assert_eq!(snap.subs_reruns_total, 4);
+        assert_eq!(snap.subs_skips_point_total, 1);
+        assert_eq!(snap.subs_skips_indexed_total, 2);
+        assert_eq!(snap.subs_skips_ordered_total, 3);
+        assert_eq!(snap.subs_skip_verifications_total, 6);
+        assert_eq!(snap.subs_missed_pushes_total, 0);
     }
 
     #[tokio::test]

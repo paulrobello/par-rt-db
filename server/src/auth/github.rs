@@ -392,6 +392,7 @@ mod tests {
             backup_cron: "0 3 * * *".into(),
             backup_dir: "./backups".into(),
             backup_retention: 7,
+            subs_verify_skip_every: 0,
         };
         assert!(GithubProvider::from_config(&cfg).is_none());
         cfg.github_client_id = Some("id".into());
