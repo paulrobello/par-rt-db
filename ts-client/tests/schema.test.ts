@@ -188,3 +188,33 @@ describe("ownerField builder", () => {
     expect(s.toJSON().tables.notes).not.toHaveProperty("ownerField");
   });
 });
+
+describe("collaboratorsField builder", () => {
+  it("emits collaboratorsField on the wire when set alongside ownerField", () => {
+    const s = defineSchema({
+      notes: defineTable({
+        userId: t.string(),
+        collaborators: t.array(t.string()),
+        title: t.string(),
+      })
+        .index("by_user", ["userId"])
+        .ownerField("userId")
+        .collaboratorsField("collaborators"),
+    });
+    expect(s.toJSON().tables.notes).toMatchObject({
+      fields: {
+        userId: { type: "string" },
+        collaborators: { type: "array", element: { type: "string" } },
+        title: { type: "string" },
+      },
+      indexes: [{ name: "by_user", fields: ["userId"] }],
+      ownerField: "userId",
+      collaboratorsField: "collaborators",
+    });
+  });
+
+  it("omits collaboratorsField on the wire when absent", () => {
+    const s = defineSchema({ notes: defineTable({ title: t.string() }) });
+    expect(s.toJSON().tables.notes).not.toHaveProperty("collaboratorsField");
+  });
+});

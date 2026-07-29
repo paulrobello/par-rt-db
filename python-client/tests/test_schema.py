@@ -126,6 +126,36 @@ def test_table_without_owner_field_omits_ownerField_key():
     assert "ownerField" not in wire["tables"]["t"]
 
 
+def test_collaborators_field_builder_round_trips():
+    """`collaboratorsField` mirrors `ownerField`'s opt-in camelCase wire shape:
+    present when set (alongside `ownerField`), omitted entirely when absent."""
+    schema = (
+        Schema.builder()
+        .table(
+            "notes",
+            lambda tb: (
+                tb.field("userId", t.string())
+                .field("collaborators", t.array(t.string()))
+                .field("title", t.string())
+                .index("by_user", ["userId"])
+                .owner_field("userId")
+                .collaborators_field("collaborators")
+            ),
+        )
+        .build()
+    )
+    wire = json.loads(schema.model_dump_json(by_alias=True))
+    tbl = wire["tables"]["notes"]
+    assert tbl["ownerField"] == "userId"
+    assert tbl["collaboratorsField"] == "collaborators"
+
+
+def test_table_without_collaborators_field_omits_collaboratorsField_key():
+    schema = Schema.builder().table("t", lambda tb: tb.field("name", t.string())).build()
+    wire = json.loads(schema.model_dump_json(by_alias=True))
+    assert "collaboratorsField" not in wire["tables"]["t"]
+
+
 def test_vector_index_without_filter_fields_omits_filterFields():
     """``VectorIndexSpec.filterFields`` is omitted on the wire when empty
     (mirrors server's ``Vec::is_empty`` skip rule)."""

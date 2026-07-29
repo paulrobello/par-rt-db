@@ -713,9 +713,34 @@ fn stamp_owner(
     doc
 }
 
+/// Whether `uid` may access a row given the table's declared `ownerField`
+/// and/or `collaboratorsField`: true when `uid` matches the doc's owner field
+/// OR appears in the doc's collaborators array. A missing/null owner field and
+/// a missing/null/empty/non-array collaborators array are treated as no-match.
+/// Shared by the read path's point-read filter and the write path's pre-check
+/// so OR-enforcement stays consistent across reads, writes, and subscriptions
+/// (subscriptions re-run `execute_query`, which carries the same semantics).
+pub fn row_visible_to(
+    doc: &serde_json::Value,
+    owner_field: Option<&str>,
+    collab_field: Option<&str>,
+    uid: &str,
+) -> bool {
+    let owner_match = owner_field
+        .and_then(|f| doc.get(f))
+        .and_then(|v| v.as_str())
+        .is_some_and(|s| s == uid);
+    let collab_match = collab_field
+        .and_then(|f| doc.get(f))
+        .and_then(|v| v.as_array())
+        .is_some_and(|arr| arr.iter().any(|v| v.as_str() == Some(uid)));
+    owner_match || collab_match
+}
+
 /// Ownership pre-check for patch/replace/delete: fetches the doc and rejects
-/// `Forbidden` if a user caller doesn't own it. A missing doc returns `Ok`
-/// (the subsequent do_* step reports `NotFound`). Bypass/no-owner-table: no-op.
+/// `Forbidden` if a user caller neither owns it nor is listed as a
+/// collaborator. A missing doc returns `Ok` (the subsequent do_* step reports
+/// `NotFound`). Bypass/no-owner-table: no-op.
 async fn check_owner(
     conn: &mut PgConnection,
     pg_schema_name: &str,
@@ -724,7 +749,8 @@ async fn check_owner(
     id: &str,
     owner: Option<&str>,
 ) -> Result<(), RtDbError> {
-    let (Some(field), Some(uid)) = (&table_def.owner_field, owner) else {
+    let enforced_uid = row_auth_enforced_uid(table_def, owner);
+    let Some(uid) = enforced_uid else {
         return Ok(());
     };
     let table_ident = pg_table(table_name);
@@ -737,9 +763,14 @@ async fn check_owner(
     match row {
         None => Ok(()),
         Some((doc,)) => {
-            if doc.get(field).and_then(|v| v.as_str()) != Some(uid) {
+            if !row_visible_to(
+                &doc,
+                table_def.owner_field.as_deref(),
+                table_def.collaborators_field.as_deref(),
+                uid,
+            ) {
                 return Err(RtDbError::forbidden(format!(
-                    "document '{id}' is not owned by the caller"
+                    "document '{id}' is not accessible to the caller"
                 )));
             }
             Ok(())
@@ -754,15 +785,33 @@ fn check_owner_doc(
     id: &str,
     owner: Option<&str>,
 ) -> Result<(), RtDbError> {
-    let (Some(field), Some(uid)) = (&table_def.owner_field, owner) else {
+    let Some(uid) = row_auth_enforced_uid(table_def, owner) else {
         return Ok(());
     };
-    if doc.get(field).and_then(|v| v.as_str()) != Some(uid) {
+    let doc_value = serde_json::Value::Object(doc.clone());
+    if !row_visible_to(
+        &doc_value,
+        table_def.owner_field.as_deref(),
+        table_def.collaborators_field.as_deref(),
+        uid,
+    ) {
         return Err(RtDbError::forbidden(format!(
-            "document '{id}' is not owned by the caller"
+            "document '{id}' is not accessible to the caller"
         )));
     }
     Ok(())
+}
+
+/// Returns the caller's uid when per-row authorization applies: the caller is a
+/// user (`owner` is `Some`) AND the table declares `ownerField` and/or
+/// `collaboratorsField`. Returns `None` for bypass callers (machine tokens,
+/// scheduled jobs, admin) and tables that declare neither field.
+fn row_auth_enforced_uid<'a>(table_def: &'a TableDef, owner: Option<&'a str>) -> Option<&'a str> {
+    if table_def.owner_field.is_some() || table_def.collaborators_field.is_some() {
+        owner
+    } else {
+        None
+    }
 }
 
 /// Executes all of `txn`'s steps in one Postgres transaction; any step's

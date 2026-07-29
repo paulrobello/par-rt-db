@@ -105,6 +105,16 @@ pub struct TableDef {
         rename = "ownerField"
     )]
     pub owner_field: Option<String>,
+    /// Opt-in extension of `owner_field`: names a declared array-of-strings (or
+    /// array-of-id) field whose values are additional user ids that may
+    /// read/mutate the row (owner OR collaborator). May be declared alone.
+    /// Mirrors `server/src/schema.rs::TableDef` byte-for-byte.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "collaboratorsField"
+    )]
+    pub collaborators_field: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -119,6 +129,7 @@ pub struct TableBuilder {
     fields: BTreeMap<String, FieldType>,
     indexes: Vec<IndexDef>,
     owner_field: Option<String>,
+    collaborators_field: Option<String>,
 }
 
 impl TableBuilder {
@@ -127,6 +138,7 @@ impl TableBuilder {
             fields: BTreeMap::new(),
             indexes: Vec::new(),
             owner_field: None,
+            collaborators_field: None,
         }
     }
     pub fn field(mut self, name: &str, ft: FieldType) -> Self {
@@ -185,6 +197,16 @@ impl TableBuilder {
         self.owner_field = Some(field.into());
         self
     }
+
+    /// Declare the per-row collaborators field for authorization. `field`
+    /// names a declared array-of-strings (or array-of-id) field whose values
+    /// are additional user ids that may read/mutate the row (owner OR
+    /// collaborator). Server-enforced; the client only declares it and
+    /// round-trips it on the wire as `collaboratorsField`.
+    pub fn collaborators_field(mut self, field: &str) -> Self {
+        self.collaborators_field = Some(field.into());
+        self
+    }
     fn finish(self) -> TableDef {
         let indexes = if self.indexes.is_empty() {
             None
@@ -195,6 +217,7 @@ impl TableBuilder {
             fields: self.fields,
             indexes,
             owner_field: self.owner_field,
+            collaborators_field: self.collaborators_field,
         }
     }
 }
@@ -484,6 +507,41 @@ mod tests {
         assert!(
             !serde_json::to_string(&none).unwrap().contains("ownerField"),
             "ownerField must be omitted on the wire when unset"
+        );
+    }
+
+    #[test]
+    fn collaborators_field_serializes_and_round_trips() {
+        // `collaboratorsField` mirrors `ownerField`'s opt-in, camelCase wire
+        // shape: present when set, omitted entirely when absent. Composes with
+        // `ownerField` (owner OR collaborator) and stands alone.
+        let td = Table::new()
+            .field("userId", FieldType::String)
+            .field(
+                "collaborators",
+                FieldType::Array {
+                    element: Box::new(FieldType::String),
+                },
+            )
+            .field("title", FieldType::String)
+            .index("by_user", &["userId"])
+            .owner_field("userId")
+            .collaborators_field("collaborators")
+            .finish();
+        let json = serde_json::to_value(&td).unwrap();
+        assert_eq!(json["ownerField"], "userId");
+        assert_eq!(json["collaboratorsField"], "collaborators");
+        // Round-trips back through the wire type.
+        let back: TableDef = serde_json::from_value(json).unwrap();
+        assert_eq!(back.owner_field.as_deref(), Some("userId"));
+        assert_eq!(back.collaborators_field.as_deref(), Some("collaborators"));
+        // Absent -> omitted entirely (not serialized as null).
+        let none = Table::new().field("title", FieldType::String).finish();
+        assert!(
+            !serde_json::to_string(&none)
+                .unwrap()
+                .contains("collaboratorsField"),
+            "collaboratorsField must be omitted on the wire when unset"
         );
     }
 }

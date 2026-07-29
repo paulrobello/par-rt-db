@@ -40,6 +40,7 @@ fn owner_schema() -> SchemaDef {
             fields: notes_fields,
             indexes: notes_indexes,
             owner_field: Some("userId".into()),
+            collaborators_field: None,
         },
     );
     let mut open_fields = BTreeMap::new();
@@ -50,6 +51,7 @@ fn owner_schema() -> SchemaDef {
             fields: open_fields,
             indexes: vec![],
             owner_field: None,
+            collaborators_field: None,
         },
     );
     SchemaDef { tables }
@@ -453,6 +455,7 @@ async fn search_filters_to_own_rows() -> anyhow::Result<()> {
             fields: notes_fields,
             indexes: notes_indexes,
             owner_field: Some("userId".into()),
+            collaborators_field: None,
         },
     );
     let schema = SchemaDef { tables };
@@ -531,6 +534,7 @@ async fn vector_search_filters_to_own_rows() -> anyhow::Result<()> {
             fields: docs_fields,
             indexes: docs_indexes,
             owner_field: Some("userId".into()),
+            collaborators_field: None,
         },
     );
     let schema = SchemaDef { tables };
@@ -625,6 +629,7 @@ async fn vector_search_composes_filter_fields_with_owner() -> anyhow::Result<()>
             fields: docs_fields,
             indexes: docs_indexes,
             owner_field: Some("userId".into()),
+            collaborators_field: None,
         },
     );
     let schema = SchemaDef { tables };
@@ -1455,5 +1460,491 @@ async fn ws_subscription_no_cross_user_push() -> anyhow::Result<()> {
         "alice must not receive bob's note, but got: {:?}",
         alice_extra.unwrap()
     );
+    Ok(())
+}
+
+// ===========================================================================
+// Collaborators (ownerField + collaboratorsField) — additive multi-user share.
+//
+// A table may declare both `ownerField: "userId"` and `collaboratorsField:
+// "collaborators"` (an array-of-strings field). A user may read/write a row if
+// they are the owner OR appear in the collaborators array. Machine tokens and
+// admin bypass as before. A table WITHOUT `collaboratorsField` behaves
+// exactly as in the owner-only tests above (the existing cases all pass
+// unchanged).
+// ===========================================================================
+
+/// Schema with a `notes` table declaring BOTH ownerField and collaboratorsField
+/// (an `Array<String>` of additional user ids admitted on the row).
+fn collab_schema() -> SchemaDef {
+    let mut notes_fields = BTreeMap::new();
+    notes_fields.insert("title".to_string(), FieldType::String);
+    notes_fields.insert("userId".to_string(), FieldType::String);
+    notes_fields.insert(
+        "collaborators".to_string(),
+        FieldType::Optional {
+            inner: Box::new(FieldType::Array {
+                element: Box::new(FieldType::String),
+            }),
+        },
+    );
+    let notes_indexes = vec![IndexDef {
+        name: "by_user".into(),
+        fields: vec!["userId".into()],
+        search: false,
+        vector: None,
+    }];
+    let mut tables = BTreeMap::new();
+    tables.insert(
+        "notes".to_string(),
+        TableDef {
+            fields: notes_fields,
+            indexes: notes_indexes,
+            owner_field: Some("userId".into()),
+            collaborators_field: Some("collaborators".into()),
+        },
+    );
+    SchemaDef { tables }
+}
+
+/// Creates a fresh uniquely-named database and pushes the collab schema.
+async fn setup_collab() -> (sqlx::PgPool, String, SchemaDef) {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = format!("t{}", uuid::Uuid::now_v7().simple());
+    rtdb_server::db::create_database(&pool, &db).await.unwrap();
+    let schema = collab_schema();
+    push_schema(&pool, &db, collab_schema()).await.unwrap();
+    (pool, db, schema)
+}
+
+/// Inserts a `notes` row owned by `uid` with the given collaborators list.
+async fn seed_collab_note(
+    pool: &PgPool,
+    db: &str,
+    schema: &SchemaDef,
+    title: &str,
+    uid: &str,
+    collaborators: &[&str],
+) -> String {
+    let mut doc = serde_json::Map::new();
+    doc.insert("title".into(), title.into());
+    doc.insert("userId".into(), uid.into());
+    doc.insert(
+        "collaborators".into(),
+        serde_json::Value::Array(
+            collaborators
+                .iter()
+                .map(|c| serde_json::Value::String((*c).to_string()))
+                .collect(),
+        ),
+    );
+    let outcome = execute_txn(
+        pool,
+        db,
+        schema,
+        &Transaction {
+            steps: vec![Step::Insert {
+                table: "notes".into(),
+                doc,
+            }],
+        },
+        None,
+    )
+    .await
+    .expect("seed insert");
+    outcome.results[0]["id"]
+        .as_str()
+        .expect("id string")
+        .to_string()
+}
+
+// (C1) Owner-only read filtering still applies on a collaborators table: alice
+// owns the row and bob is a collaborator — both may see it. carol (neither) is
+// filtered out (silent, Convex-like).
+#[tokio::test]
+async fn collab_owner_and_collaborator_both_read_shared_row() -> anyhow::Result<()> {
+    let (pool, db, schema) = setup_collab().await;
+    seed_collab_note(&pool, &db, &schema, "shared", "alice", &["bob"]).await;
+
+    let mut q = notes_query();
+    q.take = Some(100);
+
+    // Alice (owner) sees it.
+    let res = execute_query(&pool, &db, &schema, &q, Some("alice")).await?;
+    assert_eq!(titles(res), vec!["shared".to_string()]);
+
+    // Bob (collaborator) sees it.
+    let res = execute_query(&pool, &db, &schema, &q, Some("bob")).await?;
+    assert_eq!(titles(res), vec!["shared".to_string()]);
+
+    // Carol (neither) does not.
+    let res = execute_query(&pool, &db, &schema, &q, Some("carol")).await?;
+    assert!(titles(res).is_empty());
+
+    // Bypass caller sees everything (machine-token / admin path unchanged).
+    let res = execute_query(&pool, &db, &schema, &q, None).await?;
+    assert_eq!(titles(res), vec!["shared".to_string()]);
+    Ok(())
+}
+
+// (C2) A row with no collaborators list (missing/empty array) degrades to
+// owner-only — the OR predicate short-circuits to "owner matches". This
+// preserves the byte-identical-to-today semantics when no collaborators are
+// named, even on a table that DECLARES collaboratorsField.
+#[tokio::test]
+async fn collab_missing_array_degrades_to_owner_only() -> anyhow::Result<()> {
+    let (pool, db, schema) = setup_collab().await;
+    // Seed a row with NO collaborators array (just title + userId).
+    let mut doc = serde_json::Map::new();
+    doc.insert("title".into(), "alice-only".into());
+    doc.insert("userId".into(), "alice".into());
+    execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::Insert {
+                table: "notes".into(),
+                doc,
+            }],
+        },
+        None,
+    )
+    .await?;
+
+    let mut q = notes_query();
+    q.take = Some(100);
+
+    // Alice sees it; bob (would-be collaborator) does not — no array to be in.
+    assert_eq!(
+        titles(execute_query(&pool, &db, &schema, &q, Some("alice")).await?),
+        vec!["alice-only".to_string()]
+    );
+    assert!(titles(execute_query(&pool, &db, &schema, &q, Some("bob")).await?).is_empty());
+    Ok(())
+}
+
+// (C3) Point-read (get) honors the same OR semantics: alice (owner) and bob
+// (collaborator) each get Doc(Some); carol (neither) gets Doc(None). Silent
+// filter, Convex-like.
+#[tokio::test]
+async fn collab_point_read_filters_non_collaborator() -> anyhow::Result<()> {
+    let (pool, db, schema) = setup_collab().await;
+    let id = seed_collab_note(&pool, &db, &schema, "shared", "alice", &["bob"]).await;
+
+    let mut q = notes_query();
+    q.get = Some(id.clone());
+
+    for uid in ["alice", "bob"] {
+        match execute_query(&pool, &db, &schema, &q, Some(uid)).await? {
+            QueryResult::Doc(Some(v)) => assert_eq!(v["title"], "shared"),
+            other => panic!("{uid} get(shared): expected Doc(Some), got {other:?}"),
+        }
+    }
+    match execute_query(&pool, &db, &schema, &q, Some("carol")).await? {
+        QueryResult::Doc(None) => {}
+        other => panic!("carol get(shared): expected Doc(None), got {other:?}"),
+    }
+    Ok(())
+}
+
+// (C4) Write enforcement: a collaborator (bob) may patch/delete a row he is
+// listed in; a non-collaborator (carol) gets Forbidden. The ownership pre-check
+// runs inside the sqlx txn so a Forbidden from any step rolls back the rest.
+#[tokio::test]
+async fn collab_collaborator_can_write_non_collaborator_forbidden() -> anyhow::Result<()> {
+    let (pool, db, schema) = setup_collab().await;
+    let id = seed_collab_note(&pool, &db, &schema, "shared", "alice", &["bob"]).await;
+
+    // Carol (neither) patch -> Forbidden.
+    let mut patch_fields = serde_json::Map::new();
+    patch_fields.insert("title".into(), "carol-hacked".into());
+    let err = execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::Patch {
+                table: "notes".into(),
+                id: id.clone(),
+                fields: patch_fields,
+            }],
+        },
+        Some("carol"),
+    )
+    .await
+    .expect_err("non-collaborator patch must fail");
+    assert_eq!(err.code, ErrorCode::Forbidden);
+
+    // Bob (collaborator) patch -> Ok. The patch's stamp_owner re-stamps userId
+    // to "bob" on a patch (the field map carries userId for owner_field), so
+    // the stored doc remains owner-gated by the original author (alice) — only
+    // the title changes.
+    let mut patch_fields = serde_json::Map::new();
+    patch_fields.insert("title".into(), "bob-patched".into());
+    execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::Patch {
+                table: "notes".into(),
+                id: id.clone(),
+                fields: patch_fields,
+            }],
+        },
+        Some("bob"),
+    )
+    .await
+    .expect("collaborator patch should succeed");
+
+    let stored = fetch_doc(&pool, &db, &schema, &id)
+        .await
+        .expect("doc present");
+    assert_eq!(stored["title"].as_str(), Some("bob-patched"));
+    // The patch arm re-stamps owner to the caller (bob); this matches the
+    // existing per-row-auth guarantee that a user cannot transfer ownership.
+    assert_eq!(stored["userId"].as_str(), Some("bob"));
+
+    // Carol delete -> Forbidden.
+    let err = execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::Delete {
+                table: "notes".into(),
+                id: id.clone(),
+            }],
+        },
+        Some("carol"),
+    )
+    .await
+    .expect_err("non-collaborator delete must fail");
+    assert_eq!(err.code, ErrorCode::Forbidden);
+
+    // Bob (still a collaborator on the now-bob-owned doc) delete -> Ok.
+    execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::Delete {
+                table: "notes".into(),
+                id: id.clone(),
+            }],
+        },
+        Some("bob"),
+    )
+    .await
+    .expect("collaborator delete should succeed");
+    assert!(fetch_doc(&pool, &db, &schema, &id).await.is_none());
+    Ok(())
+}
+
+// (C5) Upsert update branch honors collaborator pre-check: bob (collaborator)
+// may upsert-update alice's doc; carol (neither) is Forbidden.
+#[tokio::test]
+async fn collab_upsert_update_branch_checks_collaborator() -> anyhow::Result<()> {
+    let (pool, db, schema) = setup_collab().await;
+    let _id = seed_collab_note(&pool, &db, &schema, "shared", "alice", &["bob"]).await;
+
+    let mut patch = serde_json::Map::new();
+    patch.insert("title".into(), "bob-upserted".into());
+
+    // Carol (neither) -> upsert-update is Forbidden.
+    let err = execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::Upsert {
+                table: "notes".into(),
+                index: "by_user".into(),
+                eq: vec!["alice".into()],
+                insert: serde_json::Map::new(),
+                patch: patch.clone(),
+            }],
+        },
+        Some("carol"),
+    )
+    .await
+    .expect_err("non-collaborator upsert-update must fail");
+    assert_eq!(err.code, ErrorCode::Forbidden);
+
+    // Bob (collaborator) -> upsert-update Ok.
+    let outcome = execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::Upsert {
+                table: "notes".into(),
+                index: "by_user".into(),
+                eq: vec!["alice".into()],
+                insert: serde_json::Map::new(),
+                patch,
+            }],
+        },
+        Some("bob"),
+    )
+    .await
+    .expect("collaborator upsert-update should succeed");
+    assert_eq!(outcome.results[0]["inserted"].as_bool(), Some(false));
+    Ok(())
+}
+
+// (C6) Subscriptions fan out to BOTH owner AND collaborator when a row is
+// shared, but NOT to an unrelated user. Drives the public Committers API; a
+// missing push can never hang the test (every receive is timeout-guarded).
+#[tokio::test]
+async fn collab_fan_out_reaches_owner_and_collaborator() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = format!("t{}", uuid::Uuid::now_v7().simple());
+    rtdb_server::db::create_database(&pool, &db).await?;
+    let schema = collab_schema();
+    push_schema(&pool, &db, schema.clone()).await?;
+
+    // Alice (the future owner), bob (the future collaborator), and carol
+    // (neither) each subscribe with their own owner identity.
+    let (alice_tx, mut alice_rx) = mpsc::unbounded_channel::<ServerMessage>();
+    let (bob_tx, mut bob_rx) = mpsc::unbounded_channel::<ServerMessage>();
+    let (carol_tx, mut carol_rx) = mpsc::unbounded_channel::<ServerMessage>();
+    let q = notes_query();
+    state
+        .realtime
+        .committers
+        .subscribe(
+            &db,
+            next_conn_id(),
+            "alice-q".into(),
+            q.clone(),
+            alice_tx,
+            Some("alice".into()),
+        )
+        .await?;
+    state
+        .realtime
+        .committers
+        .subscribe(
+            &db,
+            next_conn_id(),
+            "bob-q".into(),
+            q.clone(),
+            bob_tx,
+            Some("bob".into()),
+        )
+        .await?;
+    state
+        .realtime
+        .committers
+        .subscribe(
+            &db,
+            next_conn_id(),
+            "carol-q".into(),
+            q,
+            carol_tx,
+            Some("carol".into()),
+        )
+        .await?;
+
+    // Drain the three initial QueryUpdate messages (empty table).
+    drain_initial(&mut alice_rx).await;
+    drain_initial(&mut bob_rx).await;
+    drain_initial(&mut carol_rx).await;
+
+    // Insert via the committer (not execute_txn directly) so fan_out fires:
+    // alice owns it, bob is listed as a collaborator.
+    let mut shared = serde_json::Map::new();
+    shared.insert("title".into(), serde_json::Value::String("shared".into()));
+    shared.insert("userId".into(), serde_json::Value::String("alice".into()));
+    shared.insert(
+        "collaborators".into(),
+        serde_json::Value::Array(vec![serde_json::Value::String("bob".into())]),
+    );
+    state
+        .realtime
+        .committers
+        .mutate(
+            &db,
+            None,
+            Transaction {
+                steps: vec![Step::Insert {
+                    table: "notes".into(),
+                    doc: shared,
+                }],
+            },
+            None,
+        )
+        .await?;
+
+    // Alice and bob each receive exactly one QueryUpdate carrying the shared
+    // row; carol receives nothing (her owner/collab-filtered re-run matched
+    // nothing, so no push).
+    let alice_msg = timeout(Duration::from_secs(2), alice_rx.recv())
+        .await
+        .expect("alice (owner) should receive the shared row")
+        .expect("alice channel closed");
+    let bob_msg = timeout(Duration::from_secs(2), bob_rx.recv())
+        .await
+        .expect("bob (collaborator) should receive the shared row")
+        .expect("bob channel closed");
+    for (who, msg) in [("alice", alice_msg), ("bob", bob_msg)] {
+        let titles: Vec<String> = match msg {
+            ServerMessage::QueryUpdate { result, .. } => {
+                let docs: Vec<serde_json::Value> =
+                    serde_json::from_value(result).expect("push deserializes as Docs array");
+                docs.into_iter()
+                    .map(|d| d["title"].as_str().expect("title").to_string())
+                    .collect()
+            }
+            other => panic!("{who} expected QueryUpdate, got {other:?}"),
+        };
+        assert_eq!(titles, vec!["shared".to_string()], "{who} push");
+    }
+
+    let carol_extra = timeout(Duration::from_millis(200), carol_rx.recv()).await;
+    assert!(
+        carol_extra.is_err(),
+        "carol (neither owner nor collaborator) must not receive the shared row, but got: {:?}",
+        carol_extra.unwrap()
+    );
+    Ok(())
+}
+
+// (C7) `owner_filter`'s And-composition with a client `filter` still composes
+// on a collaborators table: alice's title="x" row is shared with bob; a query
+// for title="x" as bob returns it (the OR predicate is appended next to the
+// client filter), and a query for title="zz" returns nothing for either.
+#[tokio::test]
+async fn collab_or_predicate_composes_with_client_filter() -> anyhow::Result<()> {
+    let (pool, db, schema) = setup_collab().await;
+    seed_collab_note(&pool, &db, &schema, "x", "alice", &["bob"]).await;
+    seed_collab_note(&pool, &db, &schema, "y", "alice", &["bob"]).await;
+
+    let mut q = notes_query();
+    q.take = Some(100);
+    q.filter = Some(rtdb_server::query::FilterExpr::Eq {
+        field: "title".into(),
+        value: serde_json::json!("x"),
+    });
+
+    // Bob (collaborator): the OR predicate admits the row, AND the client
+    // filter narrows to title="x" → exactly one match.
+    let mut got = titles(execute_query(&pool, &db, &schema, &q, Some("bob")).await?);
+    got.sort();
+    assert_eq!(got, vec!["x".to_string()]);
+
+    // Same query for title="zz" → no rows for bob.
+    let mut q2 = notes_query();
+    q2.take = Some(100);
+    q2.filter = Some(rtdb_server::query::FilterExpr::Eq {
+        field: "title".into(),
+        value: serde_json::json!("zz"),
+    });
+    let got = titles(execute_query(&pool, &db, &schema, &q2, Some("bob")).await?);
+    assert!(got.is_empty());
     Ok(())
 }

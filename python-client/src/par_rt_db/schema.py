@@ -180,17 +180,21 @@ class IndexDef(_S):
 
 
 class TableDef(_S):
-    """One table: typed fields, indexes, optional per-row ``owner_field``."""
+    """One table: typed fields, indexes, optional per-row ``owner_field`` and
+    ``collaborators_field``."""
 
     fields: dict[str, FieldType]
     indexes: list[IndexDef] = Field(default_factory=list)
     owner_field: str | None = None
+    collaborators_field: str | None = None
 
     @model_serializer(mode="wrap")
     def _drop_absent_owner(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
         out = handler(self)
         if out.get("ownerField") is None:
             out.pop("ownerField", None)
+        if out.get("collaboratorsField") is None:
+            out.pop("collaboratorsField", None)
         return out
 
 
@@ -216,6 +220,7 @@ class TableBuilder:
         self._fields: dict[str, Any] = {}
         self._indexes: list[dict[str, Any]] = []
         self._owner: str | None = None
+        self._collaborators: str | None = None
 
     def field(self, name: str, ft: Any) -> TableBuilder:
         self._fields[name] = ft
@@ -247,10 +252,21 @@ class TableBuilder:
         self._owner = name
         return self
 
+    def collaborators_field(self, name: str) -> TableBuilder:
+        """Declare the per-row collaborators field. ``name`` must reference a
+        declared array-of-strings (or array-of-id) field whose values are
+        additional user ids that may read/mutate the row (owner OR
+        collaborator). Server-enforced; round-tripped on the wire as
+        ``collaboratorsField``."""
+        self._collaborators = name
+        return self
+
     def _build(self) -> dict[str, Any]:
         out: dict[str, Any] = {"fields": self._fields, "indexes": self._indexes}
         if self._owner is not None:
             out["ownerField"] = self._owner
+        if self._collaborators is not None:
+            out["collaboratorsField"] = self._collaborators
         return out
 
 

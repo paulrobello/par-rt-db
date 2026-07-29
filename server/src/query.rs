@@ -7,7 +7,7 @@ use crate::ddl::{pg_col, pg_schema, pg_search_col, pg_table, pg_vector_col};
 use crate::error::RtDbError;
 use crate::pagination::{decode_cursor, encode_cursor};
 use crate::schema::{FieldType, IndexDef, SchemaDef, TableDef};
-use crate::txn::{EqBind, eq_bind_for, eq_binds};
+use crate::txn::{EqBind, eq_bind_for, eq_binds, row_visible_to};
 
 /// Hard cap on rows returned by a single query, whether via an explicit
 /// `take` or a `take`-less collect.
@@ -670,10 +670,20 @@ pub async fn execute_query(
     validate_db_name(db)?;
     let table_def = schema.table(&q.table)?;
     let owner_field = table_def.owner_field.as_deref();
+    let collaborators_field = table_def.collaborators_field.as_deref();
 
     if let Some(id) = &q.get {
         reject_if_any_set(q, GET_PEERS, GET_MESSAGE)?;
-        return point_read(pool, db, &q.table, id, owner_field, owner).await;
+        return point_read(
+            pool,
+            db,
+            &q.table,
+            id,
+            owner_field,
+            collaborators_field,
+            owner,
+        )
+        .await;
     }
 
     if q.unique {
@@ -720,7 +730,17 @@ pub async fn execute_query(
     // else). Resolution and bind construction live in `execute_vector_search`.
     if let Some(vs) = &q.vector_search {
         reject_if_any_set(q, VECTOR_SEARCH_PEERS, VECTOR_SEARCH_MESSAGE)?;
-        return execute_vector_search(pool, db, table_def, &q.table, vs, owner_field, owner).await;
+        return execute_vector_search(
+            pool,
+            db,
+            table_def,
+            &q.table,
+            vs,
+            owner_field,
+            collaborators_field,
+            owner,
+        )
+        .await;
     }
 
     // Hybrid search terminal. Incompatible with every other terminal (including
@@ -729,7 +749,17 @@ pub async fn execute_query(
     // construction, and the fused SQL live in `execute_hybrid_search`.
     if let Some(hs) = &q.hybrid_search {
         reject_if_any_set(q, HYBRID_SEARCH_PEERS, HYBRID_SEARCH_MESSAGE)?;
-        return execute_hybrid_search(pool, db, table_def, &q.table, hs, owner_field, owner).await;
+        return execute_hybrid_search(
+            pool,
+            db,
+            table_def,
+            &q.table,
+            hs,
+            owner_field,
+            collaborators_field,
+            owner,
+        )
+        .await;
     }
 
     // Full-text search terminal. It ranks over a search index's tsvector and is
@@ -745,6 +775,7 @@ pub async fn execute_query(
             search,
             q.take,
             owner_field,
+            collaborators_field,
             owner,
         )
         .await;
@@ -815,12 +846,20 @@ pub async fn execute_query(
     // `filter` is an additional WHERE predicate composed after the eq/range
     // conditions. It binds after the eq+range binds, so the LIMIT and cursor
     // placeholder offsets below account for `filter_binds.len()`. When the
-    // caller is an authenticated user and the table declares an `ownerField`,
-    // `owner_filter` wraps the client filter with a server-side equality
-    // predicate so the user sees only their own rows; bypass callers (`None`)
-    // and tables without an `ownerField` get the original filter back unchanged.
-    let effective_filter = owner_filter(q.filter.as_ref(), owner_field, owner);
-    let filter_binds: Vec<EqBind> = match &effective_filter {
+    // caller is an authenticated user and the table declares an `ownerField`
+    // (and no `collaboratorsField`), `owner_filter` wraps the client filter
+    // with a server-side equality predicate so the user sees only their own
+    // rows; bypass callers (`None`) and tables without an `ownerField` get the
+    // original filter back unchanged. When `collaboratorsField` is also
+    // declared, the owner OR collaborator predicate is appended below as a
+    // separate where_condition (FilterExpr has no jsonb-array membership leaf).
+    let owner_only = owner_field.is_some() && collaborators_field.is_none();
+    let effective_filter = if owner_only {
+        owner_filter(q.filter.as_ref(), owner_field, owner)
+    } else {
+        q.filter.as_ref().cloned()
+    };
+    let mut filter_binds: Vec<EqBind> = match &effective_filter {
         Some(filter) => {
             let (fragment, binds) =
                 compile_filter(filter, table_def, eq_len + range_binds.len() + 1)?;
@@ -829,6 +868,19 @@ pub async fn execute_query(
         }
         None => Vec::new(),
     };
+    // Owner OR collaborator predicate appended after the client filter. The
+    // schema-validated identifiers are interpolated; the uid is `$n`-bound once
+    // and reused on both sides of the OR. Same single-bind shape as owner-only.
+    let row_auth_uid = row_auth_enforced_uid(owner_field, collaborators_field, owner);
+    if let Some(uid) = row_auth_uid {
+        let ph = eq_len + range_binds.len() + filter_binds.len() + 1;
+        where_conditions.push(row_auth_predicate_body(
+            owner_field,
+            collaborators_field,
+            ph,
+        ));
+        filter_binds.push(EqBind::Text(uid.to_string()));
+    }
     let limit_placeholder = eq_len + range_binds.len() + filter_binds.len() + 1;
 
     if q.count {
@@ -1537,6 +1589,7 @@ async fn execute_search(
     search: &SearchQuery,
     take: Option<u32>,
     owner_field: Option<&str>,
+    collaborators_field: Option<&str>,
     owner: Option<&str>,
 ) -> Result<QueryResult, RtDbError> {
     if search.query.trim().is_empty() {
@@ -1556,17 +1609,21 @@ async fn execute_search(
     let pg_schema_name = pg_schema(db);
     let table_ident = pg_table(table_name);
 
-    // Owner predicate: when the table declares an `ownerField` and the caller is
-    // a user, restrict to rows whose `doc->>'<ownerField>'` equals the user id.
-    // `owner_field` is `is_valid_identifier`-validated at schema push, so it is
-    // safe to interpolate into the jsonb string-literal position; the user id is
-    // bound via `$n`. The owner bind occupies `$2`, pushing `LIMIT` to `$3`.
-    let owner_enforce: Option<(&str, &str)> = match (owner_field, owner) {
-        (Some(f), Some(u)) => Some((f, u)),
-        _ => None,
-    };
-    let (limit_ph, owner_clause) = match &owner_enforce {
-        Some((field, _)) => (3, format!(" AND (doc->>'{field}') = $2")),
+    // Per-row auth predicate: when the caller is a user and the table declares
+    // `ownerField` and/or `collaboratorsField`, restrict to rows the caller
+    // owns OR appears in as a collaborator. The schema-validated identifiers
+    // are interpolated; the uid is `$2`-bound once and reused on both sides of
+    // the OR. Owner-only emits the single-predicate form byte-identical to the
+    // pre-collaborators SQL. The uid bind occupies `$2`, pushing `LIMIT` to $3.
+    let enforced_uid = row_auth_enforced_uid(owner_field, collaborators_field, owner);
+    let (limit_ph, owner_clause) = match enforced_uid {
+        Some(_) => (
+            3,
+            format!(
+                " AND {}",
+                row_auth_predicate_body(owner_field, collaborators_field, 2)
+            ),
+        ),
         None => (2, String::new()),
     };
     let sql = format!(
@@ -1577,7 +1634,7 @@ async fn execute_search(
     );
     let mut query =
         sqlx::query_as::<_, (String, serde_json::Value, i64, i64)>(&sql).bind(&search.query);
-    if let Some((_, uid)) = owner_enforce {
+    if let Some(uid) = enforced_uid {
         query = query.bind(uid);
     }
     let rows = query.bind(i64::from(limit)).fetch_all(pool).await?;
@@ -1595,6 +1652,7 @@ async fn execute_search(
 /// → `BadRequest`. Bind order: filter eq-binds occupy `$1..$k`, then (when the
 /// table is owner-gated and the caller is a user) the owner id occupies
 /// `$(k+1)`, then the query vector (`$n::vector`), then `limit`.
+#[allow(clippy::too_many_arguments)]
 async fn execute_vector_search(
     pool: &PgPool,
     db: &str,
@@ -1602,6 +1660,7 @@ async fn execute_vector_search(
     table_name: &str,
     vs: &VectorSearchQuery,
     owner_field: Option<&str>,
+    collaborators_field: Option<&str>,
     owner: Option<&str>,
 ) -> Result<QueryResult, RtDbError> {
     let index_def = table_def
@@ -1671,25 +1730,23 @@ async fn execute_vector_search(
             .join(",")
     );
 
-    // Bind numbering: filter eq-binds first ($1..$k), then the owner id bind
-    // ($k+1) when owner-enforced, then the query vector (cast to `vector`),
-    // then `limit`. The WHERE clause always excludes rows whose vector column
-    // is NULL, so undimensioned rows never surface as bogus nearest-neighbors.
-    // The owner predicate (`doc->>'<ownerField>'` = $n) mirrors the main query
-    // path: `owner_field` is `is_valid_identifier`-validated at schema push, so
-    // it is safe to interpolate into the jsonb string-literal position; the user
-    // id is `$n`-bound, never interpolated.
-    let owner_enforce: Option<(&str, &str)> = match (owner_field, owner) {
-        (Some(f), Some(u)) => Some((f, u)),
-        _ => None,
-    };
+    // Bind numbering: filter eq-binds first ($1..$k), then the per-row auth
+    // uid ($k+1) when owner/collaborators-enforced, then the query vector
+    // (cast to `vector`), then `limit`. The WHERE clause always excludes rows
+    // whose vector column is NULL, so undimensioned rows never surface as
+    // bogus nearest-neighbors. The per-row auth predicate (`doc->>'<field>'`
+    // = $n OR `doc->'<collabField>' ? $n) mirrors the main query path: both
+    // field names are `is_valid_identifier`-validated at schema push, so they
+    // are safe to interpolate into jsonb string-literal positions; the uid is
+    // `$n`-bound once, never interpolated.
+    let enforced_uid = row_auth_enforced_uid(owner_field, collaborators_field, owner);
     let mut bind_idx = 1usize;
     let mut filter_placeholders: Vec<String> = Vec::with_capacity(filter_cols.len());
     for _ in &filter_cols {
         filter_placeholders.push(format!("${bind_idx}"));
         bind_idx += 1;
     }
-    let owner_ph: Option<usize> = if owner_enforce.is_some() {
+    let owner_ph: Option<usize> = if enforced_uid.is_some() {
         let ph = bind_idx;
         bind_idx += 1;
         Some(ph)
@@ -1709,8 +1766,13 @@ async fn execute_vector_search(
             .collect();
         where_clause = format!("{where_clause} AND {}", conds.join(" AND "));
     }
-    if let (Some(ph), Some((field, _))) = (owner_ph, owner_enforce) {
-        where_clause.push_str(&format!(" AND (doc->>'{field}') = ${ph}"));
+    if let Some(ph) = owner_ph {
+        where_clause.push_str(" AND ");
+        where_clause.push_str(&row_auth_predicate_body(
+            owner_field,
+            collaborators_field,
+            ph,
+        ));
     }
 
     let sql = format!(
@@ -1728,7 +1790,7 @@ async fn execute_vector_search(
             EqBind::Bool(v) => query.bind(v),
         };
     }
-    if let Some((_, uid)) = owner_enforce {
+    if let Some(uid) = enforced_uid {
         query = query.bind(uid);
     }
     let rows = query
@@ -1763,6 +1825,7 @@ async fn execute_hybrid_search(
     table_name: &str,
     hs: &HybridSearchQuery,
     owner_field: Option<&str>,
+    collaborators_field: Option<&str>,
     owner: Option<&str>,
 ) -> Result<QueryResult, RtDbError> {
     if hs.query.trim().is_empty() {
@@ -1849,18 +1912,16 @@ async fn execute_hybrid_search(
             .join(",")
     );
 
-    // Bind numbering: text query ($1, referenced in WHERE and ts_rank), owner id
-    // ($2) when owner-enforced, then the query vector (cast to `vector`), the
-    // RRF constant `k`, and `limit`. The owner predicate interpolates only the
-    // schema-validated `ownerField` into a jsonb string-literal position; the
-    // user id is `$n`-bound.
-    let owner_enforce: Option<(&str, &str)> = match (owner_field, owner) {
-        (Some(f), Some(u)) => Some((f, u)),
-        _ => None,
-    };
+    // Bind numbering: text query ($1, referenced in WHERE and ts_rank), the
+    // per-row auth uid ($2) when owner/collaborators-enforced, then the query
+    // vector (cast to `vector`), the RRF constant `k`, and `limit`. The per-row
+    // auth predicate interpolates only the schema-validated `ownerField` /
+    // `collaboratorsField` into jsonb string-literal positions; the uid is
+    // `$n`-bound once.
+    let enforced_uid = row_auth_enforced_uid(owner_field, collaborators_field, owner);
     let text_ph = 1usize;
     let mut bind_idx = 2usize;
-    let owner_ph: Option<usize> = if owner_enforce.is_some() {
+    let owner_ph: Option<usize> = if enforced_uid.is_some() {
         let ph = bind_idx;
         bind_idx += 1;
         Some(ph)
@@ -1873,11 +1934,12 @@ async fn execute_hybrid_search(
     bind_idx += 1;
     let limit_ph = bind_idx;
 
-    let owner_clause = match (owner_ph, owner_enforce) {
-        (Some(ph), Some((field, _))) => {
-            format!(" AND (doc->>'{field}') = ${ph}")
-        }
-        _ => String::new(),
+    let owner_clause = match owner_ph {
+        Some(ph) => format!(
+            " AND {}",
+            row_auth_predicate_body(owner_field, collaborators_field, ph)
+        ),
+        None => String::new(),
     };
 
     // RRF over the union of text matches and vector-bearing rows. Rows that
@@ -1905,7 +1967,7 @@ async fn execute_hybrid_search(
 
     let mut query =
         sqlx::query_as::<_, (String, serde_json::Value, i64, i64)>(&sql).bind(&hs.query);
-    if let Some((_, uid)) = owner_enforce {
+    if let Some(uid) = enforced_uid {
         query = query.bind(uid);
     }
     let rows = query
@@ -1927,6 +1989,7 @@ async fn point_read(
     table_name: &str,
     id: &str,
     owner_field: Option<&str>,
+    collaborators_field: Option<&str>,
     owner: Option<&str>,
 ) -> Result<QueryResult, RtDbError> {
     let pg_schema_name = pg_schema(db);
@@ -1940,10 +2003,11 @@ async fn point_read(
 
     match row {
         Some((id, doc, created_at, version)) => {
-            // Per-row: a user may only point-read a doc they own. Silent
-            // filter (Convex-like) — unowned docs read as absent.
-            if let (Some(field), Some(uid)) = (owner_field, owner)
-                && doc.get(field).and_then(|v| v.as_str()) != Some(uid)
+            // Per-row: a user may only point-read a doc they own OR appear in
+            // the collaborators array of. Silent filter (Convex-like) — docs
+            // neither owned-by nor shared-with the caller read as absent.
+            if let Some(uid) = row_auth_enforced_uid(owner_field, collaborators_field, owner)
+                && !row_visible_to(&doc, owner_field, collaborators_field, uid)
             {
                 return Ok(QueryResult::Doc(None));
             }
@@ -1981,6 +2045,49 @@ fn owner_filter(
         }),
         (Some(f), _, _) => Some(f.clone()),
         (None, _, _) => None,
+    }
+}
+
+/// Returns the caller's uid when per-row authorization applies: the caller is a
+/// user (`owner` is `Some`) AND the table declares `ownerField` and/or
+/// `collaboratorsField`. Returns `None` for bypass callers (machine tokens,
+/// scheduled jobs, admin) and tables that declare neither field — those paths
+/// enforce nothing.
+fn row_auth_enforced_uid<'a>(
+    owner_field: Option<&'a str>,
+    collab_field: Option<&'a str>,
+    owner: Option<&'a str>,
+) -> Option<&'a str> {
+    if owner_field.is_some() || collab_field.is_some() {
+        owner
+    } else {
+        None
+    }
+}
+
+/// Per-row auth predicate body (no leading `AND`). The schema-validated
+/// `owner_field` and `collab_field` identifiers are interpolated into jsonb
+/// extraction positions; the uid is bound once via `${ph}` and reused on both
+/// sides of the OR when both fields are declared. Owner-only (no
+/// `collaboratorsField`) emits the single-predicate form byte-identical to the
+/// pre-collaborators SQL. The jsonb `?` operator tests whether the bound uid
+/// appears as a top-level element of the collaborators array (missing/null
+/// array → NULL → false).
+fn row_auth_predicate_body(
+    owner_field: Option<&str>,
+    collab_field: Option<&str>,
+    ph: usize,
+) -> String {
+    match (owner_field, collab_field) {
+        (Some(of), Some(cf)) => {
+            format!("((doc->>'{of}') = ${ph} OR (doc->'{cf}') ? ${ph})")
+        }
+        (Some(of), None) => format!("(doc->>'{of}') = ${ph}"),
+        (None, Some(cf)) => format!("(doc->'{cf}') ? ${ph}"),
+        // Unreachable when called via `row_auth_enforced_uid`; emit a `true`
+        // predicate so the call site's `where_conditions.push(...)` is a
+        // well-formed no-op if a future caller bypasses the gate.
+        (None, None) => "(TRUE)".to_string(),
     }
 }
 

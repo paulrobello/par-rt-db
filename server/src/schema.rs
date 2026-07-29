@@ -75,6 +75,18 @@ pub struct TableDef {
         rename = "ownerField"
     )]
     pub owner_field: Option<String>,
+    /// Opt-in extension of `owner_field` per-row authorization: names a declared
+    /// array-of-strings (or array-of-id) field whose values are additional user
+    /// ids that may read/mutate the row. When set alongside `owner_field`, a
+    /// user may access a row if they are the owner OR appear in the array. May
+    /// be declared alone (collaborators-only). Additive — schemas without it
+    /// deserialize unchanged and behave exactly as owner-only.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "collaboratorsField"
+    )]
+    pub collaborators_field: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -182,6 +194,24 @@ fn is_string_literal_union(variants: &[FieldType]) -> bool {
             .all(|variant| matches!(variant, FieldType::Literal { value } if value.is_string()))
 }
 
+/// Whether a field type is array-of-strings-compatible: `Array<T>` (or
+/// `Optional<Array<T>>`) where `T`'s `indexed_column_type` maps to Postgres
+/// `text`. Used by `collaboratorsField` validation — the jsonb `?` membership
+/// test is sound against a bound text uid only when the array elements are
+/// themselves string-compatible. Unwraps one layer of `Optional` to admit
+/// nullable collaborator arrays, mirroring `owner_field`'s Optional handling.
+fn is_string_array_field(ty: &FieldType) -> bool {
+    let inner = match ty {
+        FieldType::Optional { inner } => inner,
+        other => other,
+    };
+    if let FieldType::Array { element } = inner {
+        indexed_column_type(element).is_ok_and(|(pg_type, _)| pg_type == "text")
+    } else {
+        false
+    }
+}
+
 /// Column type for an indexed field. Indexable types: `String`->"text",
 /// `Number`->"double precision", `Boolean`->"boolean", `Id`->"text",
 /// `Literal(string)`->"text", `Union` where every variant is `Literal(string)`->"text".
@@ -239,6 +269,28 @@ impl TableDef {
             if pg_type != "text" {
                 return Err(RtDbError::schema(format!(
                     "ownerField '{owner}' must be a string-compatible field (string/id/literal/union of strings)"
+                )));
+            }
+        }
+
+        if let Some(collab) = &self.collaborators_field {
+            if !is_valid_identifier(collab, MAX_FIELD_NAME_LEN) {
+                return Err(RtDbError::schema(format!(
+                    "collaboratorsField '{collab}' is not a valid identifier"
+                )));
+            }
+            let field_type = self.fields.get(collab).ok_or_else(|| {
+                RtDbError::schema(format!(
+                    "collaboratorsField '{collab}' is not a declared field"
+                ))
+            })?;
+            // The collaborators value is a jsonb array of user_ids; the element
+            // type must be string-compatible so the jsonb `?` membership test is
+            // sound against the bound uid. Admit `Optional<Array<String>>` for
+            // the same reason `owner_field` admits `Optional<String>`.
+            if !is_string_array_field(field_type) {
+                return Err(RtDbError::schema(format!(
+                    "collaboratorsField '{collab}' must be an array-of-strings (or array-of-id) field"
                 )));
             }
         }
@@ -529,6 +581,7 @@ mod tests {
             fields: BTreeMap::from([("name".to_string(), FieldType::String)]),
             indexes: vec![],
             owner_field: None,
+            collaborators_field: None,
         }
     }
 
@@ -575,6 +628,7 @@ mod tests {
             fields: BTreeMap::from([("a-b".to_string(), FieldType::String)]),
             indexes: vec![],
             owner_field: None,
+            collaborators_field: None,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -607,6 +661,7 @@ mod tests {
             fields: BTreeMap::from([(field_name, FieldType::String)]),
             indexes: vec![],
             owner_field: None,
+            collaborators_field: None,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -621,6 +676,7 @@ mod tests {
             fields: BTreeMap::from([(field_name, FieldType::String)]),
             indexes: vec![],
             owner_field: None,
+            collaborators_field: None,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -640,6 +696,7 @@ mod tests {
                 vector: None,
             }],
             owner_field: None,
+            collaborators_field: None,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -659,6 +716,7 @@ mod tests {
                 vector: None,
             }],
             owner_field: None,
+            collaborators_field: None,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -675,6 +733,7 @@ mod tests {
             ]),
             indexes: vec![],
             owner_field: None,
+            collaborators_field: None,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -701,6 +760,7 @@ mod tests {
                 },
             ],
             owner_field: None,
+            collaborators_field: None,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -714,6 +774,7 @@ mod tests {
             fields: BTreeMap::from([("_secret".to_string(), FieldType::String)]),
             indexes: vec![],
             owner_field: None,
+            collaborators_field: None,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -750,6 +811,7 @@ mod tests {
                 vector: None,
             }],
             owner_field: None,
+            collaborators_field: None,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -768,6 +830,7 @@ mod tests {
                 vector: None,
             }],
             owner_field: None,
+            collaborators_field: None,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -786,6 +849,7 @@ mod tests {
                 vector: None,
             }],
             owner_field: None,
+            collaborators_field: None,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -812,6 +876,7 @@ mod tests {
                 },
             ],
             owner_field: None,
+            collaborators_field: None,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -830,6 +895,7 @@ mod tests {
                 vector: None,
             }],
             owner_field: None,
+            collaborators_field: None,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -848,6 +914,7 @@ mod tests {
                 vector: None,
             }],
             owner_field: None,
+            collaborators_field: None,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -866,6 +933,7 @@ mod tests {
             )]),
             indexes: vec![],
             owner_field: None,
+            collaborators_field: None,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -879,6 +947,7 @@ mod tests {
             fields: BTreeMap::from([("x".to_string(), FieldType::Union { variants: vec![] })]),
             indexes: vec![],
             owner_field: None,
+            collaborators_field: None,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -899,6 +968,7 @@ mod tests {
             )]),
             indexes: vec![],
             owner_field: None,
+            collaborators_field: None,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -1096,6 +1166,7 @@ mod tests {
             )]),
             indexes: vec![],
             owner_field: None,
+            collaborators_field: None,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -1192,6 +1263,7 @@ mod tests {
                 vector: None,
             }],
             owner_field: None,
+            collaborators_field: None,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -1245,6 +1317,7 @@ mod tests {
                 vector: None,
             }],
             owner_field: None,
+            collaborators_field: None,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -1268,6 +1341,7 @@ mod tests {
                 vector: None,
             }],
             owner_field: None,
+            collaborators_field: None,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -1360,6 +1434,7 @@ mod tests {
                 }),
             }],
             owner_field: None,
+            collaborators_field: None,
         };
         assert!(table.validate_structure("docs").is_err());
     }
@@ -1381,6 +1456,7 @@ mod tests {
                 }),
             }],
             owner_field: None,
+            collaborators_field: None,
         };
         assert!(table.validate_structure("docs").is_ok());
     }
@@ -1401,6 +1477,7 @@ mod tests {
                 }),
             }],
             owner_field: None,
+            collaborators_field: None,
         };
         assert!(table.validate_structure("docs").is_err());
     }
@@ -1423,6 +1500,7 @@ mod tests {
                 }),
             }],
             owner_field: None,
+            collaborators_field: None,
         };
         assert!(table.validate_structure("docs").is_err());
     }
@@ -1444,6 +1522,7 @@ mod tests {
                 }),
             }],
             owner_field: None,
+            collaborators_field: None,
         };
         assert!(table.validate_structure("docs").is_err());
     }
@@ -1464,6 +1543,7 @@ mod tests {
                 }),
             }],
             owner_field: None,
+            collaborators_field: None,
         };
         assert!(table.validate_structure("docs").is_err());
     }
@@ -1484,6 +1564,7 @@ mod tests {
                 }),
             }],
             owner_field: None,
+            collaborators_field: None,
         };
         assert!(table.validate_structure("docs").is_err());
     }
@@ -1510,6 +1591,7 @@ mod tests {
                 }),
             }],
             owner_field: None,
+            collaborators_field: None,
         };
         assert!(table.validate_structure("docs").is_err());
     }
@@ -1576,5 +1658,83 @@ mod tests {
         // Rejected-types matrix: non-text scalars.
         let err = validate_owner(r#"{"o":{"type":"boolean"}}"#, "o").unwrap_err();
         assert_eq!(err.code, ErrorCode::SchemaViolation);
+    }
+
+    #[test]
+    fn collaborators_field_round_trips_and_validates() {
+        // `collaboratorsField` is an opt-in, array-of-strings authorization hint:
+        // present on the wire (camelCase) when set, omitted entirely when absent,
+        // mirroring `owner_field` byte-for-byte. Round-trips alongside `owner_field`.
+        let json = r#"{"fields":{"title":{"type":"string"},"userId":{"type":"string"},"collaborators":{"type":"array","element":{"type":"string"}}},"indexes":[{"name":"by_user","fields":["userId"]}],"ownerField":"userId","collaboratorsField":"collaborators"}"#;
+        let td: TableDef = serde_json::from_str(json).unwrap();
+        assert_eq!(td.owner_field.as_deref(), Some("userId"));
+        assert_eq!(td.collaborators_field.as_deref(), Some("collaborators"));
+        let re = serde_json::to_value(&td).unwrap();
+        assert_eq!(re["ownerField"], "userId");
+        assert_eq!(re["collaboratorsField"], "collaborators");
+
+        let mut tables = std::collections::BTreeMap::new();
+        tables.insert("notes".to_string(), td);
+        SchemaDef { tables }.validate().unwrap();
+
+        // Absent collaboratorsField is omitted from the wire and deserializes as None.
+        let none_json = r#"{"fields":{"title":{"type":"string"}}}"#;
+        let td2: TableDef = serde_json::from_str(none_json).unwrap();
+        assert!(td2.collaborators_field.is_none());
+        assert!(
+            !serde_json::to_string(&td2)
+                .unwrap()
+                .contains("collaboratorsField")
+        );
+    }
+
+    #[test]
+    fn collaborators_field_validation_rejects_bad_declarations() {
+        use crate::error::ErrorCode;
+
+        fn validate_collab(fields_json: &str, collab: &str) -> Result<(), RtDbError> {
+            let json = format!(r#"{{"fields":{fields_json},"collaboratorsField":"{collab}"}}"#);
+            let td: TableDef = serde_json::from_str(&json).unwrap();
+            let mut tables = std::collections::BTreeMap::new();
+            tables.insert("t".to_string(), td);
+            SchemaDef { tables }.validate()
+        }
+
+        // names an undeclared field — schema violation (422).
+        let err = validate_collab(r#"{"title":{"type":"string"}}"#, "missing").unwrap_err();
+        assert_eq!(err.code, ErrorCode::SchemaViolation);
+
+        // names a non-array field (string) — not array-of-strings.
+        let err = validate_collab(r#"{"c":{"type":"string"}}"#, "c").unwrap_err();
+        assert_eq!(err.code, ErrorCode::SchemaViolation);
+
+        // names an array-of-numbers field — element type not string-compatible.
+        let err = validate_collab(r#"{"c":{"type":"array","element":{"type":"number"}}}"#, "c")
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::SchemaViolation);
+
+        // Accepted-types matrix: array of every string-compatible element type.
+        validate_collab(r#"{"c":{"type":"array","element":{"type":"string"}}}"#, "c").unwrap();
+        validate_collab(
+            r#"{"c":{"type":"array","element":{"type":"id","table":"users"}}}"#,
+            "c",
+        )
+        .unwrap();
+        validate_collab(
+            r#"{"c":{"type":"array","element":{"type":"literal","value":"admin"}}}"#,
+            "c",
+        )
+        .unwrap();
+        validate_collab(
+            r#"{"c":{"type":"array","element":{"type":"union","variants":[{"type":"literal","value":"a"},{"type":"literal","value":"b"}]}}}"#,
+            "c",
+        )
+        .unwrap();
+        // Optional<Array<String>> admits a nullable collaborators column.
+        validate_collab(
+            r#"{"c":{"type":"optional","inner":{"type":"array","element":{"type":"string"}}}}"#,
+            "c",
+        )
+        .unwrap();
     }
 }

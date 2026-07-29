@@ -249,6 +249,11 @@ export interface TableJson {
    * whose value is the owning user's id. Server-enforced; clients only declare
    * it. Omitted on the wire when unset. */
   ownerField?: string;
+  /** Opt-in extension of `ownerField`: names a declared array-of-strings (or
+   * array-of-id) field whose values are additional user ids that may
+   * read/mutate the row (owner OR collaborator). May be declared alone.
+   * Omitted on the wire when unset. */
+  collaboratorsField?: string;
 }
 
 export interface SchemaJson {

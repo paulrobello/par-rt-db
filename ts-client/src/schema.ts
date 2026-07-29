@@ -89,6 +89,7 @@ export class TableDefinition<
     readonly fields: Fields,
     readonly indexes: IndexJson[] = [],
     readonly ownerFieldName?: string,
+    readonly collaboratorsFieldName?: string,
   ) {}
 
   index<Name extends string>(
@@ -99,6 +100,7 @@ export class TableDefinition<
       this.fields,
       [...this.indexes, { name, fields: [...fields] }],
       this.ownerFieldName,
+      this.collaboratorsFieldName,
     );
   }
 
@@ -113,6 +115,7 @@ export class TableDefinition<
       this.fields,
       [...this.indexes, { name, fields: [...fields], search: true }],
       this.ownerFieldName,
+      this.collaboratorsFieldName,
     );
   }
 
@@ -140,6 +143,7 @@ export class TableDefinition<
         },
       ],
       this.ownerFieldName,
+      this.collaboratorsFieldName,
     );
   }
 
@@ -147,7 +151,15 @@ export class TableDefinition<
    * string-compatible field whose value is the owning user's id. Server-enforced;
    * the client only declares it and round-trips it on the wire as `ownerField`. */
   ownerField(field: string): TableDefinition<Fields, Indexes> {
-    return new TableDefinition(this.fields, this.indexes, field);
+    return new TableDefinition(this.fields, this.indexes, field, this.collaboratorsFieldName);
+  }
+
+  /** Declare the per-row collaborators field for authorization. `field` names a
+   * declared array-of-strings (or array-of-id) field whose values are additional
+   * user ids that may read/mutate the row (owner OR collaborator). Server-enforced;
+   * the client only declares it and round-trips it on the wire as `collaboratorsField`. */
+  collaboratorsField(field: string): TableDefinition<Fields, Indexes> {
+    return new TableDefinition(this.fields, this.indexes, this.ownerFieldName, field);
   }
 
   toJSON(): TableJson {
@@ -157,6 +169,9 @@ export class TableDefinition<
     }
     if (this.ownerFieldName) {
       json.ownerField = this.ownerFieldName;
+    }
+    if (this.collaboratorsFieldName) {
+      json.collaboratorsField = this.collaboratorsFieldName;
     }
     return json;
   }
