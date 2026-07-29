@@ -48,11 +48,20 @@ services:
       RTDB_GOOGLE_CLIENT_ID: ${RTDB_GOOGLE_CLIENT_ID:-}
       RTDB_GOOGLE_CLIENT_SECRET: ${RTDB_GOOGLE_CLIENT_SECRET:-}
       RTDB_SESSION_TTL_DAYS: ${RTDB_SESSION_TTL_DAYS:-30}
-      # Shadow-verify 1 subscription-invalidation skip in every N (0 = off).
       # NOTE: this `environment:` block is an explicit ALLOWLIST — a key present
       # in `.env` but absent here never reaches the container. Adding a new
       # RTDB_* boot knob means adding a line here too, or it silently keeps its
-      # code default in the docker deploy.
+      # code default in the docker deploy. `make env-drift-check` guards this.
+      #
+      # Every default below matches the server's own code default, so adding
+      # these lines changes nothing for a deploy that doesn't set them.
+      RTDB_ADMIN_EMAILS: ${RTDB_ADMIN_EMAILS:-}
+      RTDB_MAX_AFFECTED_DOCS: ${RTDB_MAX_AFFECTED_DOCS:-100}
+      RTDB_MAX_FILE_SIZE: ${RTDB_MAX_FILE_SIZE:-52428800}
+      RTDB_IDEMPOTENCY_TTL_MS: ${RTDB_IDEMPOTENCY_TTL_MS:-300000}
+      RTDB_GITHUB_BASE_URL: ${RTDB_GITHUB_BASE_URL:-https://github.com}
+      RTDB_GITHUB_API_URL: ${RTDB_GITHUB_API_URL:-https://api.github.com}
+      # Shadow-verify 1 subscription-invalidation skip in every N (0 = off).
       RTDB_SUBS_VERIFY_SKIP_EVERY: ${RTDB_SUBS_VERIFY_SKIP_EVERY:-0}
       RUST_LOG: ${RUST_LOG:-info}
     ports:

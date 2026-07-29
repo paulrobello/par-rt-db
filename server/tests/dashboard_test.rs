@@ -830,7 +830,11 @@ async fn hot_config_round_trips_through_rtdb_config() -> anyhow::Result<()> {
     sqlx::query("DELETE FROM rtdb_config WHERE id = 1")
         .execute(&state.pool)
         .await?;
-    assert!(rtdb_server::config::load_hot(&state.pool).await?.is_none());
+    assert!(
+        rtdb_server::config::load_hot(&state.pool, &common::test_hot())
+            .await?
+            .is_none()
+    );
 
     let hot = rtdb_server::config::HotConfig {
         allowed_origins: vec![
@@ -842,7 +846,9 @@ async fn hot_config_round_trips_through_rtdb_config() -> anyhow::Result<()> {
         idempotency_ttl_ms: rtdb_server::mutation_log::DEFAULT_DEDUP_TTL_MS,
     };
     rtdb_server::config::save_hot(&state.pool, &hot).await?;
-    let loaded = rtdb_server::config::load_hot(&state.pool).await?.unwrap();
+    let loaded = rtdb_server::config::load_hot(&state.pool, &common::test_hot())
+        .await?
+        .unwrap();
     assert_eq!(loaded.allowed_origins, hot.allowed_origins);
     assert_eq!(loaded.session_ttl_days, 7);
     assert_eq!(loaded.max_file_size, 12345);
@@ -850,6 +856,49 @@ async fn hot_config_round_trips_through_rtdb_config() -> anyhow::Result<()> {
         loaded.idempotency_ttl_ms,
         rtdb_server::mutation_log::DEFAULT_DEDUP_TTL_MS
     );
+
+    sqlx::query("DELETE FROM rtdb_config WHERE id = 1")
+        .execute(&state.pool)
+        .await?;
+    Ok(())
+}
+
+// A row persisted BEFORE a `HotConfig` field existed must still load, keeping
+// its own values and taking the env seed only for the absent field. This is the
+// regression guard for the prod defect found 2026-07-29: the strict decode
+// failed on `missing field idempotencyTtlMs`, so every boot silently threw the
+// operator's persisted PATCH away and reverted to env defaults.
+#[tokio::test]
+async fn hot_config_row_missing_a_newer_field_still_loads() -> anyhow::Result<()> {
+    let _rtdb_config_guard = RTDB_CONFIG_GUARD.lock().await;
+    let state = common::test_state().await;
+
+    // Write the row shape as it actually existed in prod: no idempotencyTtlMs.
+    sqlx::query("DELETE FROM rtdb_config WHERE id = 1")
+        .execute(&state.pool)
+        .await?;
+    sqlx::query("INSERT INTO rtdb_config (id, hot) VALUES (1, $1)")
+        .bind(serde_json::json!({
+            "allowedOrigins": ["https://persisted.example.com"],
+            "sessionTtlDays": 14,
+            "maxFileSize": 999
+        }))
+        .execute(&state.pool)
+        .await?;
+
+    let defaults = common::test_hot();
+    let loaded = rtdb_server::config::load_hot(&state.pool, &defaults)
+        .await?
+        .expect("an older row must load, not error");
+    // Persisted values survive...
+    assert_eq!(
+        loaded.allowed_origins,
+        vec!["https://persisted.example.com".to_string()]
+    );
+    assert_eq!(loaded.session_ttl_days, 14);
+    assert_eq!(loaded.max_file_size, 999);
+    // ...and only the absent field comes from the env seed.
+    assert_eq!(loaded.idempotency_ttl_ms, defaults.idempotency_ttl_ms);
 
     sqlx::query("DELETE FROM rtdb_config WHERE id = 1")
         .execute(&state.pool)
@@ -907,7 +956,9 @@ async fn config_get_and_patch_round_trip() -> anyhow::Result<()> {
         resp.json::<serde_json::Value>().await?["hot"]["sessionTtlDays"],
         7
     );
-    let loaded = rtdb_server::config::load_hot(&state.pool).await?.unwrap();
+    let loaded = rtdb_server::config::load_hot(&state.pool, &common::test_hot())
+        .await?
+        .unwrap();
     assert_eq!(loaded.session_ttl_days, 7);
 
     // PATCH idempotencyTtlMs; response reflects it, GET returns it, and it
@@ -936,7 +987,9 @@ async fn config_get_and_patch_round_trip() -> anyhow::Result<()> {
         resp.json::<serde_json::Value>().await?["hot"]["idempotencyTtlMs"],
         60000
     );
-    let loaded = rtdb_server::config::load_hot(&state.pool).await?.unwrap();
+    let loaded = rtdb_server::config::load_hot(&state.pool, &common::test_hot())
+        .await?
+        .unwrap();
     assert_eq!(loaded.idempotency_ttl_ms, 60000);
 
     // Invalid value -> 400.

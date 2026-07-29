@@ -12,7 +12,7 @@ DEPLOY_COMMIT := $(shell git rev-parse --short HEAD)
 	pre-commit pre-commit-update ts-client-build ts-client-install dashboard-install \
 	dashboard-test \
 	python-client-install python-client-test python-client-lint python-client-fmt \
-	python-client-typecheck python-client-checkall rtdb-cli deploy
+	python-client-typecheck python-client-checkall rtdb-cli deploy env-drift-check
 
 # The dashboard's typecheck/build resolve `@par-rt-db/client` from ts-client's
 # gitignored `dist/` (workspace link + exports.types). Build it first so the
@@ -105,7 +105,13 @@ python-client-checkall: python-client-fmt python-client-lint python-client-typec
 rtdb-cli:
 	cd cli && cargo build --release
 
-checkall: fmt-check lint typecheck test
+# Fails when a documented RTDB_* var isn't forwarded to the container by
+# docker-compose.yml (compose's `environment:` block is an explicit allowlist,
+# so a .env-only key silently does nothing).
+env-drift-check:
+	./scripts/env-drift-check.sh
+
+checkall: env-drift-check fmt-check lint typecheck test
 
 pre-commit:
 	pre-commit run --all-files

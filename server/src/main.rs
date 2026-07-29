@@ -88,14 +88,17 @@ async fn main() {
         });
 
     // Hot config: load the persisted row if present, else seed from env. A
-    // missing row is normal (first boot); a malformed row or DB error is logged
-    // and falls back to env defaults rather than blocking startup.
-    let hot = match rtdb_server::config::load_hot(&pool).await {
+    // missing row is normal (first boot). A row missing newer fields is NOT an
+    // error — `load_hot` overlays it onto the env seed field by field, so an
+    // operator's persisted PATCH survives a release that adds a setting. Only a
+    // DB error or a structurally invalid row falls back wholesale, logged.
+    let env_hot = rtdb_server::config::HotConfig::from_env();
+    let hot = match rtdb_server::config::load_hot(&pool, &env_hot).await {
         Ok(Some(h)) => h,
-        Ok(None) => rtdb_server::config::HotConfig::from_env(),
+        Ok(None) => env_hot,
         Err(e) => {
             tracing::warn!(error = %e, "failed to load rtdb_config; falling back to env defaults");
-            rtdb_server::config::HotConfig::from_env()
+            env_hot
         }
     };
 

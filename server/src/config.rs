@@ -324,17 +324,69 @@ fn is_host_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'.' || b == b'-'
 }
 
-/// Loads the single persisted hot row, if any. A missing row is `Ok(None)`
-/// (first boot); a sqlx or decode failure is an internal error.
-pub async fn load_hot(pool: &sqlx::PgPool) -> Result<Option<HotConfig>, RtDbError> {
+/// Lenient read form of the persisted `rtdb_config.hot` row: every field is
+/// optional, so a row written before a field existed still loads and the absent
+/// field falls back to its ENV-seeded value.
+///
+/// This is what makes adding a `HotConfig` field non-breaking, and it is not
+/// theoretical. `load_hot` used to `from_value::<HotConfig>` strictly, so ONE
+/// missing key failed the entire decode and boot fell back to env — silently
+/// discarding every operator `PATCH /admin/config` from then on. Found live in
+/// prod 2026-07-29 (`decode rtdb_config: missing field idempotencyTtlMs`),
+/// where the row had been unreadable since that field was introduced.
+///
+/// Falling back per-field to the env seed rather than to `Default` is
+/// deliberate: `session_ttl_days: 0` (every session instantly expired) and
+/// `max_file_size: 0` (every upload rejected) are actively harmful, so a
+/// blanket `#[serde(default)]` on `HotConfig` would trade one silent failure
+/// for a worse one.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PersistedHotConfig {
+    #[serde(default)]
+    allowed_origins: Option<Vec<String>>,
+    #[serde(default)]
+    session_ttl_days: Option<i64>,
+    #[serde(default)]
+    max_file_size: Option<usize>,
+    #[serde(default)]
+    idempotency_ttl_ms: Option<i64>,
+}
+
+impl PersistedHotConfig {
+    /// Overlays the persisted values onto `defaults` (the env seed), field by
+    /// field. Unknown keys in the row are ignored, so removing a `HotConfig`
+    /// field is non-breaking in the other direction too.
+    fn merge_onto(self, defaults: HotConfig) -> HotConfig {
+        HotConfig {
+            allowed_origins: self.allowed_origins.unwrap_or(defaults.allowed_origins),
+            session_ttl_days: self.session_ttl_days.unwrap_or(defaults.session_ttl_days),
+            max_file_size: self.max_file_size.unwrap_or(defaults.max_file_size),
+            idempotency_ttl_ms: self
+                .idempotency_ttl_ms
+                .unwrap_or(defaults.idempotency_ttl_ms),
+        }
+    }
+}
+
+/// Loads the single persisted hot row, if any, overlaying it onto `defaults`
+/// (normally `HotConfig::from_env()`) so a row missing newer fields still
+/// applies the ones it does carry. A missing row is `Ok(None)` (first boot); a
+/// sqlx error or a STRUCTURALLY invalid row (e.g. `allowedOrigins` holding a
+/// number) is still an internal error, which the caller logs before falling
+/// back to env.
+pub async fn load_hot(
+    pool: &sqlx::PgPool,
+    defaults: &HotConfig,
+) -> Result<Option<HotConfig>, RtDbError> {
     let row: Option<(serde_json::Value,)> =
         sqlx::query_as("SELECT hot FROM rtdb_config WHERE id = 1")
             .fetch_optional(pool)
             .await
             .map_err(|e| RtDbError::internal(format!("load rtdb_config: {e}")))?;
     match row {
-        Some((v,)) => serde_json::from_value::<HotConfig>(v)
-            .map(Some)
+        Some((v,)) => serde_json::from_value::<PersistedHotConfig>(v)
+            .map(|persisted| Some(persisted.merge_onto(defaults.clone())))
             .map_err(|e| RtDbError::internal(format!("decode rtdb_config: {e}"))),
         None => Ok(None),
     }
@@ -358,6 +410,84 @@ pub async fn save_hot(pool: &sqlx::PgPool, hot: &HotConfig) -> Result<(), RtDbEr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn env_seed() -> HotConfig {
+        HotConfig {
+            allowed_origins: vec!["https://env-origin.example".to_string()],
+            session_ttl_days: 30,
+            max_file_size: 50 * 1024 * 1024,
+            idempotency_ttl_ms: 300_000,
+        }
+    }
+
+    /// The exact prod row found on 2026-07-29: three origins, no
+    /// `idempotencyTtlMs`. It must load, keep its own values, and take the env
+    /// seed only for the absent field.
+    #[test]
+    fn persisted_row_missing_a_newer_field_still_applies_the_rest() {
+        let row = serde_json::json!({
+            "maxFileSize": 52428800,
+            "allowedOrigins": [
+                "https://projects.pardev.net",
+                "https://hack.pardev.net",
+                "https://rtdb.pardev.net"
+            ],
+            "sessionTtlDays": 30
+        });
+        let persisted: PersistedHotConfig =
+            serde_json::from_value(row).expect("a row missing a newer field must still decode");
+        let merged = persisted.merge_onto(env_seed());
+        assert_eq!(merged.allowed_origins.len(), 3, "persisted origins win");
+        assert!(
+            merged
+                .allowed_origins
+                .contains(&"https://hack.pardev.net".to_string())
+        );
+        assert_eq!(merged.max_file_size, 52428800);
+        assert_eq!(merged.session_ttl_days, 30);
+        // The one absent field falls back to the env seed...
+        assert_eq!(merged.idempotency_ttl_ms, 300_000);
+    }
+
+    /// ...and specifically NOT to the type default, which would be harmful.
+    #[test]
+    fn absent_fields_fall_back_to_env_not_to_zero() {
+        let persisted: PersistedHotConfig =
+            serde_json::from_value(serde_json::json!({})).expect("an empty row decodes");
+        let merged = persisted.merge_onto(env_seed());
+        assert_eq!(
+            merged.session_ttl_days, 30,
+            "0 would expire every session instantly"
+        );
+        assert_eq!(
+            merged.max_file_size,
+            50 * 1024 * 1024,
+            "0 would reject every upload"
+        );
+        assert_eq!(merged.idempotency_ttl_ms, 300_000);
+        assert_eq!(merged.allowed_origins, env_seed().allowed_origins);
+    }
+
+    /// A field the code no longer knows about must not fail the decode either —
+    /// removing a `HotConfig` field stays non-breaking.
+    #[test]
+    fn unknown_persisted_fields_are_ignored() {
+        let row = serde_json::json!({
+            "sessionTtlDays": 7,
+            "somethingRetired": "whatever"
+        });
+        let persisted: PersistedHotConfig = serde_json::from_value(row).expect("decodes");
+        assert_eq!(persisted.merge_onto(env_seed()).session_ttl_days, 7);
+    }
+
+    /// A structurally wrong value is still an error — the caller logs it and
+    /// falls back to env wholesale, which is the right response to a corrupt
+    /// row (as opposed to a merely older one).
+    #[test]
+    fn structurally_invalid_row_is_still_rejected() {
+        let row = serde_json::json!({ "allowedOrigins": 42 });
+        assert!(serde_json::from_value::<PersistedHotConfig>(row).is_err());
+    }
 
     #[test]
     fn origin_is_valid_accepts_https_and_http_with_and_without_port() {
