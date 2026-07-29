@@ -28,7 +28,7 @@ authoritative source of truth; the spec is a historical design record. Point at
 | `2026-07-23-file-storage-design.md` | Implemented | shipped | §2 #16 | — |
 | `2026-07-23-scheduled-cron-transactions-design.md` | Implemented | shipped | §2 #9 (scheduler) + #10 (cron) | — |
 | `2026-07-23-vector-search-design.md` | Implemented (verified live in prod) | 2026-07-25 | §2 #17 | — |
-| `2026-07-24-fine-grained-subscription-invalidation-design.md` | Implemented (v1: point reads) | shipped | §2 #21 | v2 (range/boundary) not yet specced |
+| `2026-07-24-fine-grained-subscription-invalidation-design.md` | Implemented (v2: point reads + eq-prefix/range) | shipped (v2 2026-07-28) | §2 #21 | v3 (ordered top-N boundary) not yet specced |
 | `2026-07-24-per-row-authorization-design.md` | Implemented (v1: owner-field match) | shipped | §2 #20 | v2 (collaborator/role fields) and v3 (general declarative predicate DSL) not yet specced |
 | `2026-07-24-realtime-dashboard-design.md` | Implemented (backend phases 1–6 + frontend SPA) | shipped | §2 #18 | — |
 | `2026-07-25-python-client-design.md` | Implemented (core DSL); HTTP/WS/admin clients planned | 2026-07-25 | §1 (the "fourth client"; per-row "Mirrored across: ✅ts ✅rust ✅python" tracks parity) | follow-on plan TBD for HTTP/WS/admin |
@@ -41,9 +41,12 @@ authoritative source of truth; the spec is a historical design record. Point at
   search, per-row auth. Eight of the nine have since shipped; the list in the
   spec body now cross-references the FEATURE_MATRIX row and follow-on spec for
   each. "Actions" remains a deliberate non-goal (FEATURE_MATRIX §3).
-- **Per-row auth / fine-grained invalidation.** Both specs shipped a v1
-  (owner-field match; point-read skip). Their v2/v3 successors
-  (collaborator/role fields; range/boundary invalidation) are not yet specced.
+- **Per-row auth / fine-grained invalidation.** Both specs have shipped through
+  v2: per-row auth v2 (collaborator/role fields) and fine-grained invalidation v2
+  (count/collect/unique on eq-prefix + range, 2026-07-28). Remaining unspecced:
+  per-row auth v3 (general declarative predicate DSL) and invalidation v3
+  (ordered top-N boundary tracking — the dynamic-window case membership-only
+  skipping can't soundly cover).
 - **Python client.** The wire + schema + query + mutation DSL is the
   implemented surface today; the HTTP, reactive WebSocket, and admin clients
   ship in a follow-on plan. Until then, Python users build wire payloads with
