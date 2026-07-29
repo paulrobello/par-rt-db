@@ -8,8 +8,8 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::protocol::ServerMessage;
 use crate::query::{Query, canonical, execute_query};
-use crate::schema::SchemaDef;
-use crate::txn::WriteSet;
+use crate::schema::{FieldType, SchemaDef, TableDef};
+use crate::txn::{DocValues, EqBind, WriteSet, eq_bind_for, eq_binds};
 
 pub type ConnId = u64;
 
@@ -21,24 +21,264 @@ pub fn next_conn_id() -> ConnId {
 }
 
 /// What a subscription's result depends on, used to skip needless re-runs.
-/// Derived once from the (immutable) `Query` at registration.
+/// Derived once from the (immutable) `Query` + the table def at registration.
 #[derive(Debug, Clone)]
 enum ReadSet {
     /// A `get(id)` point read: the result is exactly this one document, so a
     /// write to any other document cannot change it.
     Point { id: String },
-    /// Every other shape (take / collect / count / paginate / unique / first /
-    /// search / vector): another document can enter the result, so re-run on
-    /// any write to the table (today's behavior).
+    /// A `count`, `collect`, or `unique` query filtered on a btree index's
+    /// eq-prefix (and an optional range bound on the next index field). A write
+    /// to a document provably outside the window cannot change the result, so
+    /// `fan_out` can skip the re-run. See `IndexedRead` for the soundness model.
+    Indexed(IndexedRead),
+    /// Every other shape (take / first / paginate / distinct / aggregate /
+    /// search / vector / hybrid): another document can enter or leave the
+    /// ordered/truncated/value-sensitive window even when its eq-prefix is
+    /// unchanged, so re-run on any write to the table (today's behavior).
     Table,
 }
 
+/// The eq-prefix (+ optional range bound) window of an `Indexed`
+/// subscription. `fan_out` re-runs only when a written document may have
+/// crossed this window's boundary.
+///
+/// `eq` carries the index field name, its declared `FieldType` (so a written
+/// doc's field value is typed identically to the DB's stored column), and the
+/// typed bind the query pins it to. `range` is an optional inequality bound
+/// (`gt`/`gte`/`lt`/`lte`) on the index field immediately after the eq-prefix
+/// (`index.fields[eq.len()]`); present only when the eq-prefix is a strict
+/// prefix of the index (a full-arity eq has no remaining field to range on).
+///
+/// `content_bearing` is true for `collect` and `unique` (return doc bodies — a
+/// member's content change matters) and false for `count` (pure membership).
+#[derive(Debug, Clone)]
+struct IndexedRead {
+    eq: Vec<(String, FieldType, EqBind)>,
+    range: Option<RangeBound>,
+    content_bearing: bool,
+}
+
+#[derive(Debug, Clone)]
+struct RangeBound {
+    field: String,
+    field_type: FieldType,
+    /// (value, inclusive): a `gte` bound is `(v, true)`, a `gt` bound is `(v, false)`.
+    lower: Option<(EqBind, bool)>,
+    /// (value, inclusive): a `lte` bound is `(v, true)`, an `lt` bound is `(v, false)`.
+    upper: Option<(EqBind, bool)>,
+}
+
+impl IndexedRead {
+    /// Whether `doc` falls inside this subscription's eq-prefix + range window.
+    /// Pure and total: any typing failure, missing field, or comparison doubt
+    /// returns `false` (outside), which biases `fan_out` toward RE-RUNNING
+    /// (over-approximation) — it can never cause a missed push. Never panics.
+    fn in_window(&self, doc: &serde_json::Map<String, serde_json::Value>) -> bool {
+        // Eq prefix: AND of equalities. One miss ⇒ outside.
+        for (field, ty, want) in &self.eq {
+            let doc_val = doc.get(field).unwrap_or(&serde_json::Value::Null);
+            let Ok(have) = eq_bind_for(ty, doc_val) else {
+                return false;
+            };
+            if &have != want {
+                return false;
+            }
+        }
+        // Optional range bound on the field after the eq-prefix.
+        if let Some(r) = &self.range {
+            let doc_val = doc.get(&r.field).unwrap_or(&serde_json::Value::Null);
+            let Ok(have) = eq_bind_for(&r.field_type, doc_val) else {
+                return false;
+            };
+            if let Some((bound, inclusive)) = &r.lower
+                && !satisfies_lower(&have, bound, *inclusive)
+            {
+                return false;
+            }
+            if let Some((bound, inclusive)) = &r.upper
+                && !satisfies_upper(&have, bound, *inclusive)
+            {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// Three-way comparison of two typed binds. Returns `None` when the variants
+/// differ (shouldn't happen — both come from the same `FieldType` — but
+/// defensive: treating a mismatch as unorderable biases `in_window` to return
+/// `false` ⇒ re-run). `Num` uses `partial_cmp` so a (theoretically impossible
+/// from JSON) NaN is treated as unorderable rather than panicking.
+fn cmp_binds(a: &EqBind, b: &EqBind) -> Option<std::cmp::Ordering> {
+    match (a, b) {
+        (EqBind::Text(x), EqBind::Text(y)) => Some(x.cmp(y)),
+        (EqBind::Num(x), EqBind::Num(y)) => x.partial_cmp(y),
+        (EqBind::Bool(x), EqBind::Bool(y)) => Some(x.cmp(y)),
+        _ => None,
+    }
+}
+
+/// Whether `have >= bound` (inclusive) or `have > bound` (exclusive), per
+/// `inclusive`. Any comparison doubt ⇒ `false` (outside ⇒ over-approximate).
+fn satisfies_lower(have: &EqBind, bound: &EqBind, inclusive: bool) -> bool {
+    match cmp_binds(have, bound) {
+        Some(std::cmp::Ordering::Greater) => true,
+        Some(std::cmp::Ordering::Equal) => inclusive,
+        Some(std::cmp::Ordering::Less) | None => false,
+    }
+}
+
+/// Whether `have <= bound` (inclusive) or `have < bound` (exclusive), per
+/// `inclusive`. Any comparison doubt ⇒ `false` (outside ⇒ over-approximate).
+fn satisfies_upper(have: &EqBind, bound: &EqBind, inclusive: bool) -> bool {
+    match cmp_binds(have, bound) {
+        Some(std::cmp::Ordering::Less) => true,
+        Some(std::cmp::Ordering::Equal) => inclusive,
+        Some(std::cmp::Ordering::Greater) | None => false,
+    }
+}
+
+/// Whether a written doc's before/after affects an `Indexed` subscription, per
+/// the spec's per-doc decision:
+/// - deleted (after None) ⇒ `true` (values gone, must re-run).
+/// - created (before None, after Some) ⇒ `in_window(after)` (entered iff now in).
+/// - updated (both Some) ⇒ `content_bearing ? (in_window(before) || in_window(after))`
+///   `(collect/unique — a member's body change matters)` else
+///   `(in_window(before) != in_window(after))` `(count — only membership flips matter)`.
+///
+/// Owner filtering and `filter` are intentionally NOT consulted here: they can
+/// only narrow the real result, so ignoring them over-approximates (re-runs a
+/// matching-but-filtered-out or not-visible doc), never under-approximates.
+fn indexed_affects(indexed: &IndexedRead, values: &DocValues) -> bool {
+    match (&values.before, &values.after) {
+        // after None ⇒ deleted this txn. Always re-run.
+        (_, None) => true,
+        // Created this txn: entered iff the new state is in window.
+        (None, Some(after)) => indexed.in_window(after),
+        // Updated: both states known.
+        (Some(before), Some(after)) => {
+            if indexed.content_bearing {
+                // collect / unique: a body change to a current/past member matters.
+                indexed.in_window(before) || indexed.in_window(after)
+            } else {
+                // count: only a membership flip (in↔out) matters.
+                indexed.in_window(before) != indexed.in_window(after)
+            }
+        }
+    }
+}
+
 impl ReadSet {
-    fn from_query(query: &Query) -> Self {
-        match &query.get {
-            Some(id) => ReadSet::Point { id: id.clone() },
+    fn from_query(query: &Query, table_def: &TableDef) -> Self {
+        if let Some(id) = &query.get {
+            return ReadSet::Point { id: id.clone() };
+        }
+        match Self::try_indexed(query, table_def) {
+            Some(indexed) => ReadSet::Indexed(indexed),
             None => ReadSet::Table,
         }
+    }
+
+    /// Derive an `Indexed` window from the query + table def. Returns `None`
+    /// (⇒ fall back to `Table`, today's coarse behavior) when ANY of:
+    /// - the terminal is not one of `count` / `collect` (no terminal) / `unique`;
+    /// - a truncating/value-sensitive/ranking terminal is set
+    ///   (`take`/`first`/`paginate`/`distinct`/`aggregate`/`search`/`vector`/`hybrid`);
+    /// - no `index` is declared, or it has no eq bind AND no range bound
+    ///   (the window would be the whole table → no skip benefit);
+    /// - the index or any eq/range value fails to type (defensive: any doubt
+    ///   ⇒ `Table`, which can only over-approximate).
+    ///
+    /// `from_query` never panics.
+    fn try_indexed(query: &Query, table_def: &TableDef) -> Option<IndexedRead> {
+        // "No terminal" (collect) = none of the terminals below is set. `take`
+        // is checked here too: a `take`-less collect is the eligible shape.
+        let is_collect = !query.unique
+            && !query.count
+            && !query.first
+            && !query.distinct
+            && query.aggregate.is_none()
+            && query.paginate.is_none()
+            && query.search.is_none()
+            && query.vector_search.is_none()
+            && query.hybrid_search.is_none()
+            && query.take.is_none();
+        let eligible_terminal = query.count || query.unique || is_collect;
+        if !eligible_terminal {
+            return None;
+        }
+
+        // Need an index with at least one eq bind OR a range bound — otherwise
+        // the window is the whole table and there is no skip to be had.
+        let index_name = query.index.as_ref()?;
+        let index_def = table_def.index(index_name).ok()?;
+        let has_range =
+            query.gt.is_some() || query.gte.is_some() || query.lt.is_some() || query.lte.is_some();
+        if query.eq.is_empty() && !has_range {
+            return None;
+        }
+
+        // Type the eq-prefix via the shared typer (`eq_binds`); a type mismatch
+        // (e.g. a string value against a Number field) ⇒ fall back to `Table`.
+        let binds = eq_binds(table_def, index_def, &query.eq).ok()?;
+        let eq_len = binds.len();
+
+        // Zip the typed binds with their (field name, FieldType) from the table.
+        let mut eq: Vec<(String, FieldType, EqBind)> = Vec::with_capacity(eq_len);
+        for (field_name, bind) in index_def.fields[..eq_len].iter().zip(binds) {
+            let field_type = table_def.fields.get(field_name)?.clone();
+            eq.push((field_name.clone(), field_type, bind));
+        }
+
+        // Optional range bound on `index.fields[eq_len]` — present only when
+        // the eq-prefix is a strict prefix of the index. A full-arity eq has no
+        // remaining field to range on, which is fine (`range = None`).
+        let range = if eq_len < index_def.fields.len() {
+            let range_field = &index_def.fields[eq_len];
+            let field_type = table_def.fields.get(range_field)?.clone();
+            let lower = query
+                .gte
+                .as_ref()
+                .and_then(|v| eq_bind_for(&field_type, v).ok())
+                .map(|b| (b, true))
+                .or_else(|| {
+                    query
+                        .gt
+                        .as_ref()
+                        .and_then(|v| eq_bind_for(&field_type, v).ok())
+                        .map(|b| (b, false))
+                });
+            let upper = query
+                .lte
+                .as_ref()
+                .and_then(|v| eq_bind_for(&field_type, v).ok())
+                .map(|b| (b, true))
+                .or_else(|| {
+                    query
+                        .lt
+                        .as_ref()
+                        .and_then(|v| eq_bind_for(&field_type, v).ok())
+                        .map(|b| (b, false))
+                });
+            (lower.is_some() || upper.is_some()).then_some(RangeBound {
+                field: range_field.clone(),
+                field_type,
+                lower,
+                upper,
+            })
+        } else {
+            None
+        };
+
+        Some(IndexedRead {
+            eq,
+            range,
+            // collect / unique return doc bodies (a member's content change
+            // matters); count returns only a cardinality.
+            content_bearing: query.unique || is_collect,
+        })
     }
 }
 
@@ -161,6 +401,12 @@ impl SubscriptionManager {
     /// Called only by the committer task, immediately after the initial send,
     /// so no fan-out between execute and register can be missed. `owner` is
     /// the subscriber's per-row auth identity (see `SubEntry::owner`).
+    /// `table_def` resolves the query's index/field types so an `Indexed`
+    /// ReadSet can be derived for fine-grained invalidation (v2); a `get` query
+    /// ignores it. The def is borrowed only for derivation — the stored
+    /// `ReadSet` owns its binds, so the subscription survives a later schema
+    /// evolution (an `Indexed` referencing a since-changed field biases to
+    /// re-run via `in_window`'s "any doubt ⇒ outside" rule).
     // Each arg is independently required by the committer's register path;
     // bundling them into a context struct would add indirection without
     // reducing coupling (same call as `ws::handle_text_frame`).
@@ -174,8 +420,9 @@ impl SubscriptionManager {
         tx: UnboundedSender<ServerMessage>,
         last: String,
         owner: Option<String>,
+        table_def: &TableDef,
     ) {
-        let read_set = ReadSet::from_query(&query);
+        let read_set = ReadSet::from_query(&query, table_def);
         let shard = self.shard_insert(db).await;
         let mut db_subs = shard.lock().await;
         db_subs.insert(
@@ -220,13 +467,51 @@ impl SubscriptionManager {
 
             // A `get(id)` point read depends only on its one document, so a
             // write that didn't touch it cannot change the result — skip the
-            // re-run. Every other shape stays table-level (re-runs below).
+            // re-run.
             if let ReadSet::Point { id } = &entry.read_set
                 && !write_set
                     .docs
                     .contains(&(entry.query.table.clone(), id.clone()))
             {
                 continue;
+            }
+
+            // An `Indexed` (count / collect / unique on an eq-prefix window)
+            // subscription needs to re-run only when a written document on its
+            // table CROSSED the window boundary (per `indexed_affects`). If
+            // every written doc is provably irrelevant, skip the re-run. This
+            // is the v2 win: writes to documents outside the window no longer
+            // trigger a needless Postgres round-trip + canonical diff. Sound
+            // because `in_window` returns false on any doubt (over-approximate).
+            if let ReadSet::Indexed(indexed) = &entry.read_set {
+                let table = &entry.query.table;
+                let mut affects = false;
+                for (doc_table, doc_id) in &write_set.docs {
+                    if doc_table != table {
+                        continue;
+                    }
+                    match write_set
+                        .doc_values
+                        .get(&(doc_table.clone(), doc_id.clone()))
+                    {
+                        // A written `(table,id)` missing from `doc_values`
+                        // (shouldn't happen — every `touch` site also captures)
+                        // ⇒ treat as affecting so we never miss a push.
+                        None => {
+                            affects = true;
+                            break;
+                        }
+                        Some(values) => {
+                            if indexed_affects(indexed, values) {
+                                affects = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if !affects {
+                    continue;
+                }
             }
 
             let result =
@@ -273,36 +558,436 @@ impl SubscriptionManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::schema::{IndexDef, VectorIndexSpec};
+    use std::collections::BTreeMap;
 
     fn q(value: serde_json::Value) -> Query {
         serde_json::from_value(value).expect("parse query")
+    }
+
+    /// A table with string/number/boolean indexable fields and a couple of
+    /// multi-field indexes — enough to exercise eq-prefix + range derivation
+    /// and `in_window` typing across all three indexable scalar types.
+    fn test_table_def() -> TableDef {
+        TableDef {
+            fields: BTreeMap::from([
+                ("status".to_string(), FieldType::String),
+                ("order".to_string(), FieldType::Number),
+                ("flag".to_string(), FieldType::Boolean),
+                ("label".to_string(), FieldType::String),
+            ]),
+            indexes: vec![
+                IndexDef {
+                    name: "by_status".to_string(),
+                    fields: vec!["status".to_string()],
+                    search: false,
+                    vector: None,
+                },
+                IndexDef {
+                    name: "by_status_order".to_string(),
+                    fields: vec!["status".to_string(), "order".to_string()],
+                    search: false,
+                    vector: None,
+                },
+                IndexDef {
+                    name: "by_flag".to_string(),
+                    fields: vec!["flag".to_string()],
+                    search: false,
+                    vector: None,
+                },
+            ],
+            owner_field: None,
+            collaborators_field: None,
+        }
+    }
+
+    // Suppress the unused warning for VectorIndexSpec: it's part of IndexDef's
+    // construction shape (search/vector defaults) but the test table is btree-only.
+    #[allow(dead_code)]
+    fn _unused_vector_spec() -> VectorIndexSpec {
+        VectorIndexSpec {
+            dimensions: 1,
+            filter_fields: vec![],
+        }
     }
 
     #[test]
     fn get_query_is_a_point_read() {
         let query = q(serde_json::json!({ "table": "t", "get": "abc" }));
         assert!(matches!(
-            ReadSet::from_query(&query),
+            ReadSet::from_query(&query, &test_table_def()),
             ReadSet::Point { id } if id == "abc"
         ));
     }
 
     #[test]
-    fn non_get_queries_are_table_level() {
+    fn non_indexed_queries_are_table_level() {
+        let td = test_table_def();
+        // Truncating / value-sensitive / ranking terminals stay Table even with
+        // an index + eq — their result depends on more than window membership.
         let cases = [
-            serde_json::json!({ "table": "t" }),            // collect
             serde_json::json!({ "table": "t", "take": 5 }), // take
-            serde_json::json!({ "table": "t", "index": "by_x", "eq": ["v"] }), // eq
-            serde_json::json!({ "table": "t", "index": "by_x", "eq": ["v"], "unique": true }), // unique
-            serde_json::json!({ "table": "t", "first": true }), // first
-            serde_json::json!({ "table": "t", "count": true }), // count
+            serde_json::json!({ "table": "t", "index": "by_status", "eq": ["x"], "take": 5 }),
+            serde_json::json!({ "table": "t", "index": "by_status", "eq": ["x"], "first": true }),
+            serde_json::json!({ "table": "t", "index": "by_status", "eq": ["x"], "paginate": { "numItems": 10 } }),
+            serde_json::json!({ "table": "t", "index": "by_status", "eq": ["x"], "distinct": true }),
+            serde_json::json!({ "table": "t", "index": "by_status_order", "eq": ["x"], "aggregate": { "op": "sum" } }),
+            // No index + no eq ⇒ window is the whole table ⇒ no skip benefit.
+            serde_json::json!({ "table": "t" }),
+            serde_json::json!({ "table": "t", "count": true }),
+            // Index but no eq and no range ⇒ whole-table window again.
+            serde_json::json!({ "table": "t", "index": "by_status", "count": true }),
         ];
         for case in cases {
             let query = q(case);
             assert!(
-                matches!(ReadSet::from_query(&query), ReadSet::Table),
-                "non-get query must be Table-level"
+                matches!(ReadSet::from_query(&query, &td), ReadSet::Table),
+                "expected Table-level for {:?}",
+                query
             );
         }
+    }
+
+    #[test]
+    fn count_collect_unique_on_eq_prefix_derive_indexed() {
+        let td = test_table_def();
+        // count → Indexed, content_bearing=false
+        let query = q(
+            serde_json::json!({ "table": "t", "index": "by_status", "eq": ["backlog"], "count": true }),
+        );
+        match ReadSet::from_query(&query, &td) {
+            ReadSet::Indexed(idx) => {
+                assert_eq!(idx.eq.len(), 1);
+                assert_eq!(idx.eq[0].0, "status");
+                assert!(matches!(idx.eq[0].1, FieldType::String));
+                assert!(matches!(idx.eq[0].2, EqBind::Text(ref s) if s == "backlog"));
+                assert!(!idx.content_bearing);
+                assert!(idx.range.is_none());
+            }
+            other => panic!("count+eq should be Indexed, got {other:?}"),
+        }
+
+        // collect (no terminal) → Indexed, content_bearing=true
+        let query = q(serde_json::json!({ "table": "t", "index": "by_status", "eq": ["backlog"] }));
+        match ReadSet::from_query(&query, &td) {
+            ReadSet::Indexed(idx) => assert!(idx.content_bearing),
+            other => panic!("collect+eq should be Indexed, got {other:?}"),
+        }
+
+        // unique → Indexed, content_bearing=true
+        let query = q(
+            serde_json::json!({ "table": "t", "index": "by_status", "eq": ["backlog"], "unique": true }),
+        );
+        match ReadSet::from_query(&query, &td) {
+            ReadSet::Indexed(idx) => assert!(idx.content_bearing),
+            other => panic!("unique+eq should be Indexed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn range_bound_is_captured_when_present() {
+        let td = test_table_def();
+        // collect with eq=[status] + gte on order (the field after the eq prefix).
+        let query = q(
+            serde_json::json!({ "table": "t", "index": "by_status_order", "eq": ["backlog"], "gte": 10 }),
+        );
+        match ReadSet::from_query(&query, &td) {
+            ReadSet::Indexed(idx) => {
+                assert_eq!(idx.eq.len(), 1);
+                let r = idx.range.expect("range bound present");
+                assert_eq!(r.field, "order");
+                assert!(matches!(r.field_type, FieldType::Number));
+                // gte ⇒ lower inclusive
+                let (lower, inc) = r.lower.expect("lower bound");
+                assert!(matches!(lower, EqBind::Num(n) if n == 10.0));
+                assert!(inc);
+                assert!(r.upper.is_none());
+            }
+            other => panic!("collect+eq+range should be Indexed, got {other:?}"),
+        }
+
+        // lt ⇒ upper exclusive
+        let query = q(
+            serde_json::json!({ "table": "t", "index": "by_status_order", "eq": ["backlog"], "lt": 100 }),
+        );
+        match ReadSet::from_query(&query, &td) {
+            ReadSet::Indexed(idx) => {
+                let r = idx.range.expect("range");
+                let (upper, inc) = r.upper.expect("upper");
+                assert!(matches!(upper, EqBind::Num(n) if n == 100.0));
+                assert!(!inc);
+                assert!(r.lower.is_none());
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn range_only_no_eq_derives_indexed() {
+        let td = test_table_def();
+        // eq=[] + a range bound on index.fields[0]. Eligible per the spec
+        // ("eq non-empty OR a range bound present").
+        let query = q(serde_json::json!({ "table": "t", "index": "by_status_order", "gte": "m" }));
+        match ReadSet::from_query(&query, &td) {
+            ReadSet::Indexed(idx) => {
+                assert!(idx.eq.is_empty());
+                let r = idx.range.expect("range");
+                assert_eq!(r.field, "status");
+            }
+            other => panic!("range-only should be Indexed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn wrong_typed_eq_value_falls_back_to_table() {
+        let td = test_table_def();
+        // eq value "not-a-number" against a Number field — typing fails ⇒ Table.
+        let query = q(
+            serde_json::json!({ "table": "t", "index": "by_status_order", "eq": ["backlog", "oops"] }),
+        );
+        assert!(matches!(ReadSet::from_query(&query, &td), ReadSet::Table));
+    }
+
+    // ---- in_window unit cases (spec test #8: null/wrong-typed/missing ⇒ false) ----
+
+    fn indexed_status_eq(status: &str, content_bearing: bool) -> IndexedRead {
+        IndexedRead {
+            eq: vec![(
+                "status".to_string(),
+                FieldType::String,
+                EqBind::Text(status.to_string()),
+            )],
+            range: None,
+            content_bearing,
+        }
+    }
+
+    #[test]
+    fn in_window_matching_eq_returns_true() {
+        let idx = indexed_status_eq("backlog", true);
+        let doc = serde_json::json!({ "status": "backlog" })
+            .as_object()
+            .unwrap()
+            .clone();
+        assert!(idx.in_window(&doc));
+    }
+
+    #[test]
+    fn in_window_non_matching_eq_returns_false() {
+        let idx = indexed_status_eq("backlog", true);
+        let doc = serde_json::json!({ "status": "done" })
+            .as_object()
+            .unwrap()
+            .clone();
+        assert!(!idx.in_window(&doc));
+    }
+
+    #[test]
+    fn in_window_missing_field_returns_false() {
+        let idx = indexed_status_eq("backlog", true);
+        let doc = serde_json::json!({ "other": "x" })
+            .as_object()
+            .unwrap()
+            .clone();
+        assert!(!idx.in_window(&doc));
+    }
+
+    #[test]
+    fn in_window_null_field_returns_false() {
+        let idx = indexed_status_eq("backlog", true);
+        let doc = serde_json::json!({ "status": null })
+            .as_object()
+            .unwrap()
+            .clone();
+        assert!(!idx.in_window(&doc));
+    }
+
+    #[test]
+    fn in_window_wrong_typed_field_returns_false() {
+        let idx = indexed_status_eq("backlog", true);
+        // status declared String; doc carries a number ⇒ typing fails ⇒ outside.
+        let doc = serde_json::json!({ "status": 5 })
+            .as_object()
+            .unwrap()
+            .clone();
+        assert!(!idx.in_window(&doc));
+    }
+
+    #[test]
+    fn in_window_range_satisfied_and_not() {
+        let idx = IndexedRead {
+            eq: vec![(
+                "status".to_string(),
+                FieldType::String,
+                EqBind::Text("backlog".to_string()),
+            )],
+            range: Some(RangeBound {
+                field: "order".to_string(),
+                field_type: FieldType::Number,
+                lower: Some((EqBind::Num(10.0), true)), // gte 10
+                upper: Some((EqBind::Num(20.0), false)), // lt 20
+            }),
+            content_bearing: true,
+        };
+        // In range.
+        let doc = serde_json::json!({ "status": "backlog", "order": 15 })
+            .as_object()
+            .unwrap()
+            .clone();
+        assert!(idx.in_window(&doc));
+        // Below lower bound.
+        let doc = serde_json::json!({ "status": "backlog", "order": 5 })
+            .as_object()
+            .unwrap()
+            .clone();
+        assert!(!idx.in_window(&doc));
+        // At lower bound (inclusive) — in.
+        let doc = serde_json::json!({ "status": "backlog", "order": 10 })
+            .as_object()
+            .unwrap()
+            .clone();
+        assert!(idx.in_window(&doc));
+        // At upper bound (exclusive) — out.
+        let doc = serde_json::json!({ "status": "backlog", "order": 20 })
+            .as_object()
+            .unwrap()
+            .clone();
+        assert!(!idx.in_window(&doc));
+        // Above upper bound.
+        let doc = serde_json::json!({ "status": "backlog", "order": 25 })
+            .as_object()
+            .unwrap()
+            .clone();
+        assert!(!idx.in_window(&doc));
+    }
+
+    #[test]
+    fn in_window_range_null_order_field_returns_false() {
+        let idx = IndexedRead {
+            eq: vec![(
+                "status".to_string(),
+                FieldType::String,
+                EqBind::Text("backlog".to_string()),
+            )],
+            range: Some(RangeBound {
+                field: "order".to_string(),
+                field_type: FieldType::Number,
+                lower: Some((EqBind::Num(10.0), true)),
+                upper: None,
+            }),
+            content_bearing: true,
+        };
+        // order absent ⇒ doc.get returns Null ⇒ typing fails ⇒ outside.
+        let doc = serde_json::json!({ "status": "backlog" })
+            .as_object()
+            .unwrap()
+            .clone();
+        assert!(!idx.in_window(&doc));
+    }
+
+    #[test]
+    fn in_window_boolean_eq_matches() {
+        let idx = IndexedRead {
+            eq: vec![("flag".to_string(), FieldType::Boolean, EqBind::Bool(true))],
+            range: None,
+            content_bearing: false,
+        };
+        let doc = serde_json::json!({ "flag": true })
+            .as_object()
+            .unwrap()
+            .clone();
+        assert!(idx.in_window(&doc));
+        let doc = serde_json::json!({ "flag": false })
+            .as_object()
+            .unwrap()
+            .clone();
+        assert!(!idx.in_window(&doc));
+    }
+
+    // ---- indexed_affects per-doc decision (spec's fan_out table) ----
+
+    fn doc_with_status(status: &str) -> serde_json::Map<String, serde_json::Value> {
+        serde_json::json!({ "status": status })
+            .as_object()
+            .unwrap()
+            .clone()
+    }
+
+    #[test]
+    fn affects_deleted_is_always_true() {
+        let idx = indexed_status_eq("backlog", false);
+        let values = DocValues {
+            before: Some(doc_with_status("backlog")),
+            after: None,
+        };
+        assert!(indexed_affects(&idx, &values));
+        // Even a delete of a doc that was never in window still re-runs
+        // (values gone ⇒ conservative re-run).
+        let values = DocValues {
+            before: Some(doc_with_status("done")),
+            after: None,
+        };
+        assert!(indexed_affects(&idx, &values));
+    }
+
+    #[test]
+    fn affects_created_in_window_true_outside_false() {
+        let idx = indexed_status_eq("backlog", false);
+        let in_win = DocValues {
+            before: None,
+            after: Some(doc_with_status("backlog")),
+        };
+        assert!(indexed_affects(&idx, &in_win));
+        let out_win = DocValues {
+            before: None,
+            after: Some(doc_with_status("done")),
+        };
+        assert!(!indexed_affects(&idx, &out_win));
+    }
+
+    #[test]
+    fn affects_count_only_membership_flip() {
+        let idx = indexed_status_eq("backlog", false); // count
+        // stayed outside — no affect
+        let stayed_out = DocValues {
+            before: Some(doc_with_status("done")),
+            after: Some(doc_with_status("done")),
+        };
+        assert!(!indexed_affects(&idx, &stayed_out));
+        // body-only change to a member (eq unchanged) — count unaffected
+        let member_body_change = DocValues {
+            before: Some(doc_with_status("backlog")),
+            after: Some(doc_with_status("backlog")),
+        };
+        assert!(!indexed_affects(&idx, &member_body_change));
+        // entered (done → backlog) — count increased
+        let entered = DocValues {
+            before: Some(doc_with_status("done")),
+            after: Some(doc_with_status("backlog")),
+        };
+        assert!(indexed_affects(&idx, &entered));
+        // left (backlog → done) — count decreased (regression guard for `before`)
+        let left = DocValues {
+            before: Some(doc_with_status("backlog")),
+            after: Some(doc_with_status("done")),
+        };
+        assert!(indexed_affects(&idx, &left));
+    }
+
+    #[test]
+    fn affects_collect_is_content_bearing() {
+        let idx = indexed_status_eq("backlog", true); // collect
+        // body-only change to a member — collect re-runs (content matters)
+        let member_body_change = DocValues {
+            before: Some(doc_with_status("backlog")),
+            after: Some(doc_with_status("backlog")),
+        };
+        assert!(indexed_affects(&idx, &member_body_change));
+        // stayed outside — no affect
+        let stayed_out = DocValues {
+            before: Some(doc_with_status("done")),
+            after: Some(doc_with_status("done")),
+        };
+        assert!(!indexed_affects(&idx, &stayed_out));
     }
 }

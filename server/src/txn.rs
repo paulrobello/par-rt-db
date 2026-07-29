@@ -1,4 +1,5 @@
-use std::collections::BTreeSet;
+use std::collections::btree_map::Entry;
+use std::collections::{BTreeMap, BTreeSet};
 
 use sqlx::{PgConnection, PgPool};
 
@@ -81,13 +82,37 @@ pub struct DocOp {
 /// table-level subscription invalidation; `docs` — the `(table, id)` of every
 /// written document — lets point-read subscriptions skip re-runs that don't
 /// touch their document (see `subs::ReadSet`). `ops` records each write's
-/// `OpKind` for the activity feed. Server-internal: the wire transports send
-/// only `TxnOutcome.results`, never `write_set`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+/// `OpKind` for the activity feed. `doc_values` carries, per written
+/// `(table, id)`, the doc as it stood at txn START (`before`) and at txn END
+/// (`after`); this lets `fan_out` decide whether a written doc crossed an
+/// `Indexed` subscription's eq-prefix/range window, so a write to an
+/// unrelated document can be skipped (see `subs::IndexedRead`).
+///
+/// Server-internal: the wire transports send only `TxnOutcome.results`, never
+/// `write_set`. `doc_values` is `#[serde(skip)]` so it can never leak on the
+/// wire even if `WriteSet` is serialized for logging/diagnostics.
+///
+/// `WriteSet` does NOT derive `Eq`: `serde_json::Map` is not `Eq` (JSON values
+/// admit NaN-ish comparisons), and the derive is unused — no code compares
+/// `WriteSet` with structural equality. `PartialEq` stays (all fields impl it).
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
 pub struct WriteSet {
     pub tables: BTreeSet<String>,
     pub docs: BTreeSet<(String, String)>,
     pub ops: Vec<DocOp>,
+    #[serde(skip)]
+    pub doc_values: BTreeMap<(String, String), DocValues>,
+}
+
+/// Per written `(table, id)`: the doc as it stood at txn START (`before`,
+/// `None` when the doc was created inside this txn) and at txn END (`after`,
+/// `None` when the doc was deleted inside this txn). Consumed only by
+/// `subs::fan_out` to decide whether a written doc affects an `Indexed`
+/// subscription; never sent on the wire.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DocValues {
+    pub before: Option<serde_json::Map<String, serde_json::Value>>,
+    pub after: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 impl WriteSet {
@@ -101,6 +126,55 @@ impl WriteSet {
             kind,
         });
     }
+
+    /// Records the NET before/after state of `(table, id)` for `fan_out`'s
+    /// `Indexed` skip decision. The net effect collapses a doc touched by
+    /// several steps in one txn into one entry — the EARLIEST `before` (the
+    /// first touch's pre-state) and the LATEST `after` (the last touch's
+    /// post-state).
+    ///
+    /// `before`: `None` = this step records no before-state (used by `Delete`,
+    ///   which never captures a value); `Some(None)` = the doc was created in
+    ///   this txn (Insert / Upsert-insert); `Some(Some(map))` = the doc's
+    ///   pre-state (Patch / Replace / Upsert-update fetched body). Applied
+    ///   ONLY on the FIRST touch of `(table, id)` — the entry's `before` is
+    ///   frozen at first capture so a later step in the same txn cannot
+    ///   overwrite it (preserves the earliest pre-state, e.g. an Insert
+    ///   followed by a Patch stays `before = None` = created).
+    ///
+    /// `after`: symmetric to `before` — `None` = this step records no
+    ///   after-state; `Some(None)` = the doc was deleted (Delete); `Some(map)` =
+    ///   the post-state. On an existing entry a `Some(_)` ALWAYS overwrites
+    ///   (latest post-state wins), so a `Delete` following an earlier write of
+    ///   the same id in this txn reliably clears `after` to `None`. Without
+    ///   that, a stale `Some` after-state could make `fan_out` skip a `count`
+    ///   subscription whose matching set shrank when the doc was removed — a
+    ///   missed push.
+    fn capture_doc(
+        &mut self,
+        table: &str,
+        id: &str,
+        before: Option<Option<&serde_json::Map<String, serde_json::Value>>>,
+        after: Option<Option<&serde_json::Map<String, serde_json::Value>>>,
+    ) {
+        let key = (table.to_string(), id.to_string());
+        match self.doc_values.entry(key) {
+            // Already touched this txn: `before` is frozen (earliest capture
+            // wins per the spec); only `after` advances to the latest state.
+            Entry::Occupied(mut e) => {
+                if let Some(after_opt) = after {
+                    e.get_mut().after = after_opt.cloned();
+                }
+            }
+            // First touch: record both `before` and `after` as given.
+            Entry::Vacant(e) => {
+                e.insert(DocValues {
+                    before: before.and_then(|v| v.cloned()),
+                    after: after.and_then(|v| v.cloned()),
+                });
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -112,6 +186,14 @@ pub struct TxnOutcome {
 /// SQL bind for an eq-lookup value, typed per the index field's `FieldType`
 /// (`Optional` unwrapped). Prefix-friendly: callers may supply 0..=all of an
 /// index's fields; full-arity enforcement is the caller's responsibility.
+///
+/// `Clone` + `PartialEq` are derived so `subs::IndexedRead` can store typed
+/// binds (cloned from a query at registration) and compare a written doc's
+/// typed field value against the wanted bind in `in_window`. `Eq` is NOT
+/// derived: the `Num(f64)` arm admits NaN, which has no total order; the
+/// binds compared here always originate from JSON (which cannot carry NaN),
+/// so `PartialEq` is sound for the membership test.
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum EqBind {
     Text(String),
     Num(f64),
@@ -377,22 +459,23 @@ fn strip_unset_optionals(
 
 /// Inserts a new row for `doc` (already validated by the caller's schema
 /// lookup): `doc` jsonb plus every indexed-field column, `created_at =
-/// now_ms()`, `version` defaulting to 1. Returns the generated id.
+/// now_ms()`, `version` defaulting to 1. Returns the generated id and the
+/// stamped+stripped doc as stored (the caller records the latter on
+/// `WriteSet.doc_values` so `fan_out` can window-check the after-state).
 async fn do_insert(
     conn: &mut PgConnection,
     pg_schema_name: &str,
     table_def: &TableDef,
     table_name: &str,
     doc: &serde_json::Map<String, serde_json::Value>,
-) -> Result<String, RtDbError> {
+) -> Result<(String, serde_json::Map<String, serde_json::Value>), RtDbError> {
     validate_doc(table_def, doc)?;
-    let doc = strip_unset_optionals(table_def, doc.clone());
-    let doc = &doc;
+    let stripped = strip_unset_optionals(table_def, doc.clone());
 
     let id = new_id();
     let created_at = now_ms();
     let columns = table_columns(table_def)?;
-    let binds = column_binds(&columns, doc)?;
+    let binds = column_binds(&columns, &stripped)?;
 
     let table_ident = pg_table(table_name);
     let mut col_names = vec![
@@ -418,7 +501,7 @@ async fn do_insert(
         placeholders.join(", ")
     );
 
-    let doc_value = serde_json::Value::Object(doc.clone());
+    let doc_value = serde_json::Value::Object(stripped.clone());
     let mut query = sqlx::query(&sql)
         .bind(id.clone())
         .bind(doc_value)
@@ -432,7 +515,7 @@ async fn do_insert(
         };
     }
     query.execute(&mut *conn).await?;
-    Ok(id)
+    Ok((id, stripped))
 }
 
 /// Updates an existing row's `doc`, every indexed-field column recomputed
@@ -444,11 +527,11 @@ async fn apply_update(
     table_def: &TableDef,
     table_name: &str,
     id: &str,
-    merged: serde_json::Map<String, serde_json::Value>,
+    merged: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<(), RtDbError> {
     let table_ident = pg_table(table_name);
     let columns = table_columns(table_def)?;
-    let binds = column_binds(&columns, &merged)?;
+    let binds = column_binds(&columns, merged)?;
 
     let mut set_clauses = vec![
         "\"doc\" = $1".to_string(),
@@ -470,7 +553,7 @@ async fn apply_update(
         set_clauses.join(", ")
     );
 
-    let doc_value = serde_json::Value::Object(merged);
+    let doc_value = serde_json::Value::Object(merged.clone());
     let mut query = sqlx::query(&sql).bind(doc_value);
     for bind in binds {
         query = match bind {
@@ -486,7 +569,8 @@ async fn apply_update(
 }
 
 /// Fetches the current doc by id (`NotFound` if missing), merges `fields`
-/// onto it via `apply_patch`, and applies the update.
+/// onto it via `apply_patch`, and applies the update. Returns the pre-merge
+/// doc (for `WriteSet.doc_values`'s `before`) and the merged doc (for `after`).
 async fn do_patch(
     conn: &mut PgConnection,
     pg_schema_name: &str,
@@ -494,7 +578,13 @@ async fn do_patch(
     table_name: &str,
     id: &str,
     fields: &serde_json::Map<String, serde_json::Value>,
-) -> Result<(), RtDbError> {
+) -> Result<
+    (
+        serde_json::Map<String, serde_json::Value>,
+        serde_json::Map<String, serde_json::Value>,
+    ),
+    RtDbError,
+> {
     let table_ident = pg_table(table_name);
     let row: Option<(serde_json::Value,)> = sqlx::query_as(&format!(
         "SELECT \"doc\" FROM \"{pg_schema_name}\".\"{table_ident}\" WHERE \"id\" = $1"
@@ -510,14 +600,22 @@ async fn do_patch(
         _ => return Err(RtDbError::internal("stored doc is not a JSON object")),
     };
 
+    // Snapshot the pre-merge body for `fan_out`'s `before` capture: the merge
+    // below consumes `doc`, and the earliest pre-state across the txn is what
+    // determines whether an `Indexed` window-membership change occurred.
+    let pre_doc = doc.clone();
     let merged = apply_patch(table_def, doc, fields)?;
-    apply_update(conn, pg_schema_name, table_def, table_name, id, merged).await
+    apply_update(conn, pg_schema_name, table_def, table_name, id, &merged).await?;
+    Ok((pre_doc, merged))
 }
 
-/// Fetches to confirm the row exists (`NotFound` if missing), then fully
-/// replaces its `doc` with `new_doc` — validated as a complete document (like
-/// `Insert`), not merged like `Patch` — recomputing every indexed column and
-/// bumping `version` via the shared `apply_update`.
+/// Fetches the current doc (`NotFound` if missing), then fully replaces its
+/// `doc` with `new_doc` — validated as a complete document (like `Insert`),
+/// not merged like `Patch` — recomputing every indexed column and bumping
+/// `version` via the shared `apply_update`. Widened from a bare existence
+/// `SELECT "id"` to `SELECT "doc"` so the pre-replace body is available for
+/// `WriteSet.doc_values`'s `before` capture. Returns the old doc (for
+/// `before`) and the new stripped doc (for `after`).
 async fn do_replace(
     conn: &mut PgConnection,
     pg_schema_name: &str,
@@ -525,19 +623,31 @@ async fn do_replace(
     table_name: &str,
     id: &str,
     new_doc: &serde_json::Map<String, serde_json::Value>,
-) -> Result<(), RtDbError> {
+) -> Result<
+    (
+        serde_json::Map<String, serde_json::Value>,
+        serde_json::Map<String, serde_json::Value>,
+    ),
+    RtDbError,
+> {
     let table_ident = pg_table(table_name);
-    let row: Option<(String,)> = sqlx::query_as(&format!(
-        "SELECT \"id\" FROM \"{pg_schema_name}\".\"{table_ident}\" WHERE \"id\" = $1"
+    let row: Option<(serde_json::Value,)> = sqlx::query_as(&format!(
+        "SELECT \"doc\" FROM \"{pg_schema_name}\".\"{table_ident}\" WHERE \"id\" = $1"
     ))
     .bind(id)
     .fetch_optional(&mut *conn)
     .await?;
-    row.ok_or_else(|| RtDbError::not_found(format!("document '{id}' not found")))?;
+    let (old_doc_value,) =
+        row.ok_or_else(|| RtDbError::not_found(format!("document '{id}' not found")))?;
+    let old_doc = match old_doc_value {
+        serde_json::Value::Object(map) => map,
+        _ => return Err(RtDbError::internal("stored doc is not a JSON object")),
+    };
 
     validate_doc(table_def, new_doc)?;
-    let doc = strip_unset_optionals(table_def, new_doc.clone());
-    apply_update(conn, pg_schema_name, table_def, table_name, id, doc).await
+    let new_doc = strip_unset_optionals(table_def, new_doc.clone());
+    apply_update(conn, pg_schema_name, table_def, table_name, id, &new_doc).await?;
+    Ok((old_doc, new_doc))
 }
 
 /// Inserts a row with an explicit id/created_at/version, preserving a document's
@@ -854,24 +964,34 @@ pub async fn execute_txn(
             Step::Insert { table, doc } => {
                 let table_def = schema.table(table)?;
                 let doc = stamp_owner(table_def, doc.clone(), owner);
-                let id = do_insert(&mut tx, &pg_schema_name, table_def, table, &doc).await?;
+                let (id, stored) =
+                    do_insert(&mut tx, &pg_schema_name, table_def, table, &doc).await?;
                 write_set.touch(table, &id, OpKind::Insert);
+                // Created in this txn: before = None (created), after = stored doc.
+                write_set.capture_doc(table, &id, Some(None), Some(Some(&stored)));
                 results.push(serde_json::json!({ "id": id }));
             }
             Step::Patch { table, id, fields } => {
                 let table_def = schema.table(table)?;
                 check_owner(&mut tx, &pg_schema_name, table_def, table, id, owner).await?;
                 let fields = stamp_owner(table_def, fields.clone(), owner);
-                do_patch(&mut tx, &pg_schema_name, table_def, table, id, &fields).await?;
+                let (pre_doc, merged) =
+                    do_patch(&mut tx, &pg_schema_name, table_def, table, id, &fields).await?;
                 write_set.touch(table, id, OpKind::Patch);
+                // `before` = pre-merge body (frozen on first touch by the helper
+                // so a doc inserted earlier this txn stays `before = None`);
+                // `after` = merged body.
+                write_set.capture_doc(table, id, Some(Some(&pre_doc)), Some(Some(&merged)));
                 results.push(serde_json::Value::Null);
             }
             Step::Replace { table, id, doc } => {
                 let table_def = schema.table(table)?;
                 check_owner(&mut tx, &pg_schema_name, table_def, table, id, owner).await?;
                 let doc = stamp_owner(table_def, doc.clone(), owner);
-                do_replace(&mut tx, &pg_schema_name, table_def, table, id, &doc).await?;
+                let (old_doc, new_doc) =
+                    do_replace(&mut tx, &pg_schema_name, table_def, table, id, &doc).await?;
                 write_set.touch(table, id, OpKind::Replace);
+                write_set.capture_doc(table, id, Some(Some(&old_doc)), Some(Some(&new_doc)));
                 results.push(serde_json::Value::Null);
             }
             Step::Delete { table, id } => {
@@ -879,6 +999,11 @@ pub async fn execute_txn(
                 check_owner(&mut tx, &pg_schema_name, table_def, table, id, owner).await?;
                 do_delete(&mut tx, &pg_schema_name, table, id).await?;
                 write_set.touch(table, id, OpKind::Delete);
+                // Delete records no value: `after = None` marks it deleted so
+                // `fan_out` always re-runs (deleted ⇒ affects). `before` is left
+                // for the helper to freeze at the earliest capture if this same
+                // id was touched earlier in the txn.
+                write_set.capture_doc(table, id, None, Some(None));
                 results.push(serde_json::Value::Null);
             }
             Step::ExpectVersion { table, id, version } => {
@@ -912,9 +1037,11 @@ pub async fn execute_txn(
                 match rows.pop() {
                     None => {
                         let insert = stamp_owner(table_def, insert.clone(), owner);
-                        let id =
+                        let (id, stored) =
                             do_insert(&mut tx, &pg_schema_name, table_def, table, &insert).await?;
                         write_set.touch(table, &id, OpKind::Upsert);
+                        // Upsert-insert branch: same as Insert — created this txn.
+                        write_set.capture_doc(table, &id, Some(None), Some(Some(&stored)));
                         results.push(serde_json::json!({ "id": id, "inserted": true }));
                     }
                     Some((id, doc_value)) => {
@@ -926,10 +1053,19 @@ pub async fn execute_txn(
                         };
                         check_owner_doc(table_def, &doc, &id, owner)?;
                         let patch = stamp_owner(table_def, patch.clone(), owner);
+                        let pre_doc = doc.clone();
                         let merged = apply_patch(table_def, doc, &patch)?;
-                        apply_update(&mut tx, &pg_schema_name, table_def, table, &id, merged)
+                        apply_update(&mut tx, &pg_schema_name, table_def, table, &id, &merged)
                             .await?;
                         write_set.touch(table, &id, OpKind::Upsert);
+                        // Upsert-update branch: same as Patch — before = matched
+                        // body (first touch), after = merged.
+                        write_set.capture_doc(
+                            table,
+                            &id,
+                            Some(Some(&pre_doc)),
+                            Some(Some(&merged)),
+                        );
                         results.push(serde_json::json!({ "id": id, "inserted": false }));
                     }
                 }
