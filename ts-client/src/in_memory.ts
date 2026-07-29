@@ -102,6 +102,49 @@ function toSchemaJson(schema: SchemaDefinition<any> | SchemaJson): SchemaJson {
     : (schema as SchemaJson);
 }
 
+/** Rejects destructive schema changes — a port of server
+ * `ddl::detect_destructive_changes`. A second `pushSchema` may only ADD tables,
+ * fields, and indexes; removing or retyping any existing table/field/index is a
+ * `BAD_REQUEST` with the same message the live server returns. Additive changes
+ * (new tables, new fields, new indexes) pass through. Field types and index
+ * `fields`/`vector` are compared by `JSON.stringify` deep equality; index kind
+ * (btree vs search) by the presence/absence of `search`. */
+function detectDestructiveChanges(oldSchema: SchemaJson, newSchema: SchemaJson): void {
+  for (const [tableName, oldTable] of Object.entries(oldSchema.tables)) {
+    const newTable = newSchema.tables[tableName];
+    if (!newTable) {
+      throw new RtDbError("BAD_REQUEST", `removed table '${tableName}'`);
+    }
+    for (const [fieldName, oldFieldType] of Object.entries(oldTable.fields)) {
+      const newFieldType = newTable.fields[fieldName];
+      if (!newFieldType) {
+        throw new RtDbError("BAD_REQUEST", `removed field '${tableName}.${fieldName}'`);
+      }
+      if (JSON.stringify(newFieldType) !== JSON.stringify(oldFieldType)) {
+        throw new RtDbError("BAD_REQUEST", `changed type of field '${tableName}.${fieldName}'`);
+      }
+    }
+    for (const oldIndex of oldTable.indexes ?? []) {
+      const newIndex = (newTable.indexes ?? []).find((i) => i.name === oldIndex.name);
+      if (!newIndex) {
+        throw new RtDbError("BAD_REQUEST", `removed index '${oldIndex.name}'`);
+      }
+      if (JSON.stringify(newIndex.fields) !== JSON.stringify(oldIndex.fields)) {
+        throw new RtDbError("BAD_REQUEST", `changed fields of index '${oldIndex.name}'`);
+      }
+      if (!!newIndex.search !== !!oldIndex.search) {
+        throw new RtDbError(
+          "BAD_REQUEST",
+          `changed kind of index '${oldIndex.name}' (btree <-> search)`,
+        );
+      }
+      if (JSON.stringify(newIndex.vector ?? null) !== JSON.stringify(oldIndex.vector ?? null)) {
+        throw new RtDbError("BAD_REQUEST", `changed vector spec of index '${oldIndex.name}'`);
+      }
+    }
+  }
+}
+
 /** Deep clone of a JSON doc (docs are pure JSON — safe to round-trip). */
 function clone<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
@@ -559,16 +602,29 @@ export class InMemoryRtDbClient {
     this.random = options.random ?? Math.random;
   }
 
-  /** Installs `schema` as this client's sole in-memory database schema. Clears
-   * any previously-stored documents so each push starts from a clean slate.
-   * (The live server is additive-only; full additive evolution is deferred.) */
+  /** Installs `schema` as this client's sole in-memory database schema. The
+   * first push seeds an empty doc store per table. A subsequent push must be
+   * additive (server `ddl::detect_destructive_changes`): it throws BAD_REQUEST
+   * on a removed/retyped table, field, or index, and otherwise merges — keeping
+   * every existing table's rows and the idempotency cache intact, and seeding
+   * empty doc stores only for brand-new tables. */
   pushSchema(schema: SchemaDefinition<any> | SchemaJson): void {
-    this.schema = toSchemaJson(schema);
-    this.tables.clear();
-    this.idempotency.clear();
-    for (const tableName of Object.keys(this.schema.tables)) {
-      this.tables.set(tableName, new Map());
+    const next = toSchemaJson(schema);
+    if (this.schema) {
+      detectDestructiveChanges(this.schema, next);
+      // Additive: keep existing tables' rows and the idempotency cache; only
+      // seed empty doc stores for brand-new tables.
+      for (const tableName of Object.keys(next.tables)) {
+        if (!this.tables.has(tableName)) {
+          this.tables.set(tableName, new Map());
+        }
+      }
+    } else {
+      for (const tableName of Object.keys(next.tables)) {
+        this.tables.set(tableName, new Map());
+      }
     }
+    this.schema = next;
   }
 
   /** One-shot query — same shape as {@link RtDbHttpClient.query}. */

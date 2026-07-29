@@ -1052,3 +1052,72 @@ describe("InMemoryRtDbClient — int64 index", () => {
     expect(new Set(docs.map((d) => d._id)).size).toBe(docs.length);
   });
 });
+
+describe("InMemoryRtDbClient — additive schema push", () => {
+  // Variants of the shared `schema` fixture at the top of the file. The server
+  // (`ddl.rs::detect_destructive_changes`) only allows additive schema pushes:
+  // new tables, new fields, and new indexes; removing or retyping any existing
+  // table/field/index is rejected with BAD_REQUEST. The in-memory harness now
+  // mirrors that, so a second `pushSchema` preserves existing docs instead of
+  // wiping them.
+
+  /** items + a new optional field + a brand-new `tags` table (purely additive). */
+  const additiveSchema = defineSchema({
+    items: defineTable({
+      name: t.string(),
+      status: t.string(),
+      order: t.number(),
+      note: t.optional(t.string()),
+      priority: t.optional(t.string()),
+    })
+      .index("by_name", ["name"])
+      .index("by_status", ["status"])
+      .index("by_status_and_order", ["status", "order"]),
+    tags: defineTable({ label: t.string() }).index("by_label", ["label"]),
+  });
+
+  /** items with the `note` field dropped — destructive. */
+  const itemsWithoutNote = defineSchema({
+    items: defineTable({
+      name: t.string(),
+      status: t.string(),
+      order: t.number(),
+    })
+      .index("by_name", ["name"])
+      .index("by_status", ["status"])
+      .index("by_status_and_order", ["status", "order"]),
+  });
+
+  /** An unrelated single-table schema — pushing it removes the `items` table. */
+  const soloSchema = defineSchema({
+    solo: defineTable({ x: t.number() }),
+  });
+
+  it("an additive second push preserves existing docs and they remain queryable", async () => {
+    const c = new InMemoryRtDbClient();
+    c.pushSchema(schema);
+    await c.mutate(mutation().insert("items", { name: "a", status: "todo", order: 1 }).build());
+
+    c.pushSchema(additiveSchema); // additive: items.priority + tags
+
+    const docs = await c.query(api.items.query().withIndex("by_status", ["todo"]).collect());
+    expect(docs).toHaveLength(1);
+    expect((docs[0] as { name: string }).name).toBe("a");
+  });
+
+  it("a destructive second push missing a table throws BAD_REQUEST", () => {
+    const c = new InMemoryRtDbClient();
+    c.pushSchema(schema);
+    expect(() => c.pushSchema(soloSchema)).toThrow(/removed table 'items'/);
+    // Schema is unchanged on a rejected push, so `items` is still usable.
+    expect(() =>
+      c.query(api.items.query().withIndex("by_status", ["todo"]).collect()),
+    ).not.toThrow();
+  });
+
+  it("removing a field is destructive", () => {
+    const c = new InMemoryRtDbClient();
+    c.pushSchema(schema);
+    expect(() => c.pushSchema(itemsWithoutNote)).toThrow(/removed field 'items\./);
+  });
+});
