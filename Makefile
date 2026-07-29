@@ -83,7 +83,10 @@ dashboard-test:
 	cd dashboard && bun run test
 
 python-client-install:
-	cd python-client && uv sync
+	# `--all-extras` installs the optional `http` (httpx) and `ws` (websockets)
+	# dependencies alongside the default `dev` group, so pyright can resolve the
+	# imports those surfaces use during `make python-client-typecheck`.
+	cd python-client && uv sync --all-extras
 
 python-client-test:
 	cd python-client && uv run pytest -q
