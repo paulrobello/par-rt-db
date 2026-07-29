@@ -1,3 +1,11 @@
+//! Reactive `/sync` WebSocket handler.
+//!
+//! NOTE: `permessage-deflate` (RFC 7692) WS compression is NOT available here.
+//! axum 0.8's WebSocket is built on `tungstenite`, which does not implement
+//! permessage-deflate (no feature flag). Cutting WS bandwidth therefore
+//! requires a fronting proxy (e.g. nginx with WS compression) or swapping the
+//! WS library (yawc/fastwebsockets). See ideas.md.
+
 use std::sync::Arc;
 use std::time::Duration;
 
