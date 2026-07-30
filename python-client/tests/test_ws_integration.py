@@ -56,11 +56,13 @@ async def test_subscribe_and_live_update() -> None:
             await asyncio.wait_for(_first(sub), 10.0)
             assert sub.current() == []
             # Insert over WS and await the live update.
-            await client.mutate(Mutation.builder().insert("items", {"_id": "i1", "n": 1}).build())
+            # ``_id`` is a server-managed system field (reserved); insert user
+            # data only and let the server assign the id.
+            await client.mutate(Mutation.builder().insert("items", {"n": 1}).build())
             await asyncio.wait_for(_next_nonempty(sub), 10.0)
             docs = sub.current()
             assert docs is not None
-            assert any(d.get("_id") == "i1" for d in docs)
+            assert any(d.get("n") == 1 for d in docs)
         finally:
             await client.close()
     finally:
