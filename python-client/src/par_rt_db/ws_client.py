@@ -15,12 +15,14 @@ import json
 import random as _random
 import time
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, Protocol
 
 from pydantic import TypeAdapter
 
+from .errors import RtDbError
+from .query import _dump_query, _terminal_of, parse_result
 from .wire import AuthedUser, ServerMessage
 
 
@@ -84,6 +86,30 @@ class _PeerClosed(Exception):
         self.reason = reason
 
 
+@dataclass
+class _Sub:
+    """Internal per-shape subscription state, shared by all ``Subscription`` handles.
+
+    ``refcount`` tracks live handles; ``cond`` wakes the async iterator. ``value``/
+    ``error``/``version`` are mutated under ``cond`` by the inbound-message handlers
+    (which run inside the driver's read loop); the iterator re-checks ``version``
+    under the cond before awaiting so a wake between reads is never missed.
+    """
+
+    query_id: str
+    key: str
+    frame: str
+    terminal: str
+    model: type
+    refcount: int = 0
+    value: Any = None
+    error: RtDbError | None = None
+    version: int = 0
+    subscribed: bool = False
+    closed: bool = False
+    cond: asyncio.Condition = field(default_factory=asyncio.Condition)
+
+
 class RtDbClient:
     """Reactive par-rt-db client.
 
@@ -128,8 +154,8 @@ class RtDbClient:
         self._ws: Connection | None = None
         self._last_pong = 0.0
         # Populated by Tasks 3-4 (subscriptions, mutations, schedules):
-        self._subs_by_key: dict[str, Any] = {}
-        self._subs_by_id: dict[str, Any] = {}
+        self._subs_by_key: dict[str, _Sub] = {}
+        self._subs_by_id: dict[str, _Sub] = {}
         self._counter = 0
         self._pending_mut: dict[str, Any] = {}
         self._pending_sched: dict[str, Any] = {}
@@ -329,9 +355,90 @@ class RtDbClient:
             self._on_sched(msg)
         # authOk/authErr are handled in _await_auth; unknown tags ignored.
 
-    # Populated in Task 3:
-    def _on_query_update(self, msg: Any) -> None: ...
-    def _on_subscribe_err(self, msg: Any) -> None: ...
+    # --- subscriptions (Task 3) ----------------------------------------
+
+    def subscribe(self, query: Any, *, model: type = dict) -> Subscription:
+        """Register a live query and return a ``Subscription`` handle.
+
+        Identical query shapes (by canonical wire dict) dedup to a single
+        server-side subscription via refcount. When connected, the subscribe
+        frame is sent immediately (scheduled on the loop); otherwise it is
+        flushed on the next ``authOk`` via ``_flush_on_auth``.
+        """
+        from .query import TableQuery
+
+        built = query.build() if isinstance(query, TableQuery) else query
+        qd = _dump_query(built)
+        key = _canonical_key(qd)
+        terminal = _terminal_of(built)
+        sub = self._subs_by_key.get(key)
+        if sub is None:
+            self._counter += 1
+            qid = f"sub-{self._counter}"
+            from .wire import _ClientSubscribe
+
+            frame = _ClientSubscribe(query_id=qid, query=qd).model_dump_json(by_alias=True)
+            sub = _Sub(query_id=qid, key=key, frame=frame, terminal=terminal, model=model)
+            self._subs_by_key[key] = sub
+            self._subs_by_id[qid] = sub
+            if self._state is ConnectionState.CONNECTED:
+                sub.subscribed = True
+                asyncio.get_running_loop().create_task(self._send(frame))
+        sub.refcount += 1
+        return Subscription(self, sub)
+
+    def _decref(self, key: str) -> None:
+        """Drop one handle on a subscription; send ``unsubscribe`` when the last leaves."""
+        sub = self._subs_by_key.get(key)
+        if sub is None:
+            return
+        sub.refcount -= 1
+        if sub.refcount <= 0:
+            self._subs_by_key.pop(key, None)
+            self._subs_by_id.pop(sub.query_id, None)
+            sub.closed = True
+            self._notify(sub)
+            if sub.subscribed and self._state is ConnectionState.CONNECTED:
+                from .wire import _ClientUnsubscribe
+
+                frame = _ClientUnsubscribe(query_id=sub.query_id).model_dump_json(by_alias=True)
+                asyncio.get_running_loop().create_task(self._send(frame))
+
+    def _on_query_update(self, msg: Any) -> None:
+        sub = self._subs_by_id.get(msg.query_id)
+        if sub is None:
+            return
+        sub.value = parse_result(sub.model, sub.terminal, msg.result)
+        sub.version += 1
+        self._notify(sub)
+
+    def _on_subscribe_err(self, msg: Any) -> None:
+        sub = self._subs_by_id.get(msg.query_id)
+        if sub is None:
+            return
+        sub.error = RtDbError.from_envelope(msg.error.model_dump())
+        # The shape is dead: drop it so a reconnect never re-subscribes it.
+        self._subs_by_key.pop(sub.key, None)
+        self._subs_by_id.pop(sub.query_id, None)
+        self._notify(sub)
+
+    @staticmethod
+    def _notify(sub: _Sub) -> None:
+        """Wake any async iterator parked on ``sub.cond``.
+
+        Runs inside the driver's read loop (no iterator awaits there), so the
+        wake is scheduled as a task that acquires the cond and ``notify_all``s.
+        """
+
+        async def _wake() -> None:
+            async with sub.cond:
+                sub.cond.notify_all()
+
+        # No running loop (defensive): the iterator's version check still
+        # observes the new value/error on its next acquire.
+        with contextlib.suppress(RuntimeError):
+            asyncio.get_running_loop().create_task(_wake())
+
     # Populated in Task 4:
     def _on_mutate_ok(self, msg: Any) -> None: ...
     def _on_mutate_err(self, msg: Any) -> None: ...
@@ -341,6 +448,58 @@ class RtDbClient:
 
     def _set_state(self, state: ConnectionState) -> None:
         self._state = state
+
+
+class Subscription:
+    """A live query handle: latest value (``current()``), error (``error()``),
+    and an async iterator that yields each new value as it arrives.
+
+    Mirrors the TS/Rust clients' ``Subscription``. Unsubscribe via
+    ``.unsubscribe()`` or by closing the async context manager. Multiple
+    ``Subscription`` handles on the same query shape share one ``_Sub``; the
+    server-side subscription lives until the last handle unsubscribes.
+    """
+
+    def __init__(self, client: RtDbClient, sub: _Sub) -> None:
+        self._client = client
+        self._sub = sub
+        self._iter_version = 0
+
+    def current(self) -> Any | None:
+        """Most recently delivered value, or ``None`` before the first update."""
+        return self._sub.value
+
+    def error(self) -> RtDbError | None:
+        """The terminal error if ``subscribeErr`` arrived, else ``None``."""
+        return self._sub.error
+
+    def unsubscribe(self) -> None:
+        """Drop this handle; sends the server ``unsubscribe`` when the last one leaves."""
+        self._client._decref(self._sub.key)
+
+    async def __aenter__(self) -> Subscription:
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        self.unsubscribe()
+
+    def __aiter__(self) -> Subscription:
+        # Reset so the iterator yields the current value (if any) first, then
+        # each subsequent update.
+        self._iter_version = 0
+        return self
+
+    async def __anext__(self) -> Any:
+        sub = self._sub
+        async with sub.cond:
+            while sub.version <= self._iter_version and sub.error is None and not sub.closed:
+                await sub.cond.wait()
+        if sub.closed:
+            raise StopAsyncIteration
+        if sub.error is not None:
+            raise sub.error
+        self._iter_version = sub.version
+        return sub.value
 
 
 def _tag(msg: Any) -> str:

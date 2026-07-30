@@ -3,9 +3,13 @@
 import asyncio
 import json
 
+import pytest
+
+from par_rt_db import TableQuery
 from par_rt_db.ws_client import (
     ConnectionState,
     RtDbClient,
+    RtDbError,
     _backoff_delay,
     _canonical_key,
     _PeerClosed,
@@ -203,6 +207,152 @@ async def test_pong_resets_liveness():
         # the heartbeat loop would have closed the socket at 2*heartbeat.
         await conn.deliver('{"type":"pong"}')
         await _wait_until(lambda: sum('"type":"ping"' in f for f in conn.sent) >= 2)
+        assert client.status().state is ConnectionState.CONNECTED
+    finally:
+        await client.close()
+
+
+# --- Subscription tests (Task 3) ----------------------------------------
+#
+# Drive a connected client with ``await conn.deliver(frame)`` then ``_drain()``
+# so the read loop progresses, then assert on ``sub.current()``/``sub.error()``
+# or on frames recorded in ``conn.sent``.
+
+
+async def _connected(conn: FakeConn) -> RtDbClient:
+    """Make a client, connect, and complete the auth handshake."""
+    client, _ = make_client(conn)
+    await client.connect()
+    await _drain()
+    await conn.deliver('{"type":"authOk","user":{"kind":"machine"}}')
+    await _drain()
+    assert client.status().state is ConnectionState.CONNECTED
+    return client
+
+
+def _qid(conn: FakeConn, typ: str) -> str:
+    """Extract the queryId the client assigned from a recorded frame."""
+    for f in conn.sent:
+        d = json.loads(f)
+        if d.get("type") == typ:
+            return d["queryId"]
+    raise AssertionError(f"no frame of type {typ}")
+
+
+async def test_subscribe_sends_frame_and_delivers_first_value():
+    conn = FakeConn()
+    client = await _connected(conn)
+    try:
+        sub = client.subscribe(TableQuery("items").collect())
+        await _drain()
+        # (1) subscribe() while connected sends exactly one subscribe frame.
+        assert any('"type":"subscribe"' in f for f in conn.sent)
+        # current() is None until the first queryUpdate lands.
+        assert sub.current() is None
+
+        qid = _qid(conn, "subscribe")
+        await conn.deliver('{"type":"queryUpdate","queryId":"' + qid + '","result":[]}')
+        await _drain()
+        # An empty collect result parses to [].
+        assert sub.current() == []
+
+        # The async iterator yields that first value.
+        got = None
+        async for value in sub:
+            got = value
+            break
+        assert got == []
+    finally:
+        await client.close()
+
+
+async def test_subscribe_err_raises_from_iterator_and_exposes_error():
+    conn = FakeConn()
+    client = await _connected(conn)
+    try:
+        sub = client.subscribe(TableQuery("items").collect())
+        await _drain()
+        qid = _qid(conn, "subscribe")
+        await conn.deliver(
+            '{"type":"subscribeErr","queryId":"'
+            + qid
+            + '","error":{"code":"BAD_REQUEST","message":"bad index"}}'
+        )
+        await _drain()
+
+        # sub.error() is an RtDbError carrying the envelope.
+        err = sub.error()
+        assert isinstance(err, RtDbError)
+        assert err.message == "bad index"
+
+        # async-for over the sub raises RtDbError.
+        with pytest.raises(RtDbError):
+            async for _ in sub:
+                pass
+
+        # The shape is removed: a subsequent reconnect does NOT resend it.
+        conn2 = FakeConn()
+
+        async def _connect2(url: str) -> FakeConn:
+            return conn2
+
+        client._connect = _connect2
+        conn.close_code = 4000
+        await conn._inbox.put(None)
+        await _wait_until(lambda: any('"type":"auth"' in f for f in conn2.sent))
+        await conn2.deliver('{"type":"authOk","user":{"kind":"machine"}}')
+        await _wait_until(lambda: client.status().state is ConnectionState.CONNECTED)
+        await _drain(20)
+        assert not any('"type":"subscribe"' in f for f in conn2.sent)
+    finally:
+        await client.close()
+
+
+async def test_identical_queries_share_one_subscription():
+    conn = FakeConn()
+    client = await _connected(conn)
+    try:
+        s1 = client.subscribe(TableQuery("items").collect())
+        s2 = client.subscribe(TableQuery("items").collect())
+        await _drain()
+        # (3) Two identical shapes dedup to exactly one subscribe frame.
+        subscribe_frames = [f for f in conn.sent if '"type":"subscribe"' in f]
+        assert len(subscribe_frames) == 1
+
+        s1.unsubscribe()
+        await _drain()
+        # First unsubscribe still leaves one listener -> no frame yet.
+        assert not any('"type":"unsubscribe"' in f for f in conn.sent)
+
+        s2.unsubscribe()
+        await _drain()
+        # The last unsubscribe sends the unsubscribe frame.
+        assert any('"type":"unsubscribe"' in f for f in conn.sent)
+    finally:
+        await client.close()
+
+
+async def test_reconnect_resubscribes_active_queries():
+    conn = FakeConn()
+    client = await _connected(conn)
+    try:
+        client.subscribe(TableQuery("items").collect())
+        await _drain()
+        assert any('"type":"subscribe"' in f for f in conn.sent)
+
+        # (4) Force a reconnectable drop; the active query is re-subscribed on
+        # the new socket after the handshake completes.
+        conn2 = FakeConn()
+
+        async def _connect2(url: str) -> FakeConn:
+            return conn2
+
+        client._connect = _connect2
+        conn.close_code = 4000
+        await conn._inbox.put(None)
+        await _wait_until(lambda: any('"type":"auth"' in f for f in conn2.sent))
+        await conn2.deliver('{"type":"authOk","user":{"kind":"machine"}}')
+        await _wait_until(lambda: any('"type":"subscribe"' in f for f in conn2.sent))
         assert client.status().state is ConnectionState.CONNECTED
     finally:
         await client.close()
