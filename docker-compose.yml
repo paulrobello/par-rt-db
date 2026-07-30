@@ -47,6 +47,8 @@ services:
       RTDB_GITHUB_CLIENT_SECRET: ${RTDB_GITHUB_CLIENT_SECRET:-}
       RTDB_GOOGLE_CLIENT_ID: ${RTDB_GOOGLE_CLIENT_ID:-}
       RTDB_GOOGLE_CLIENT_SECRET: ${RTDB_GOOGLE_CLIENT_SECRET:-}
+      RTDB_GITLAB_CLIENT_ID: ${RTDB_GITLAB_CLIENT_ID:-}
+      RTDB_GITLAB_CLIENT_SECRET: ${RTDB_GITLAB_CLIENT_SECRET:-}
       RTDB_SESSION_TTL_DAYS: ${RTDB_SESSION_TTL_DAYS:-30}
       # NOTE: this `environment:` block is an explicit ALLOWLIST — a key present
       # in `.env` but absent here never reaches the container. Adding a new
@@ -61,6 +63,7 @@ services:
       RTDB_IDEMPOTENCY_TTL_MS: ${RTDB_IDEMPOTENCY_TTL_MS:-300000}
       RTDB_GITHUB_BASE_URL: ${RTDB_GITHUB_BASE_URL:-https://github.com}
       RTDB_GITHUB_API_URL: ${RTDB_GITHUB_API_URL:-https://api.github.com}
+      RTDB_GITLAB_BASE_URL: ${RTDB_GITLAB_BASE_URL:-https://gitlab.com}
       # Shadow-verify 1 subscription-invalidation skip in every N (0 = off).
       RTDB_SUBS_VERIFY_SKIP_EVERY: ${RTDB_SUBS_VERIFY_SKIP_EVERY:-0}
       RUST_LOG: ${RUST_LOG:-info}
