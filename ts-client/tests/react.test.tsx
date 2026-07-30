@@ -257,7 +257,12 @@ describe("useRtDbAuth signIn routing", () => {
     function View() {
       const { signIn } = useRtDbAuth();
       return (
-        <button type="button" onClick={() => { pending = signIn("google"); }}>
+        <button
+          type="button"
+          onClick={() => {
+            pending = signIn("google");
+          }}
+        >
           google
         </button>
       );
@@ -302,7 +307,12 @@ describe("useRtDbAuth signIn routing", () => {
     function View() {
       const { signIn } = useRtDbAuth();
       return (
-        <button type="button" onClick={() => { pending = signIn(); }}>
+        <button
+          type="button"
+          onClick={() => {
+            pending = signIn();
+          }}
+        >
           default
         </button>
       );
@@ -374,7 +384,12 @@ describe("useRtDbAuth cookie mode (SEC-002)", () => {
     function View() {
       const { signIn } = useRtDbAuth();
       return (
-        <button type="button" onClick={() => { pending = signIn(); }}>
+        <button
+          type="button"
+          onClick={() => {
+            pending = signIn();
+          }}
+        >
           in
         </button>
       );
