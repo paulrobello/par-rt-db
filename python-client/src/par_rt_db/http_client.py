@@ -24,6 +24,7 @@ machine token (or OAuth session token).
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, ConfigDict, TypeAdapter
@@ -77,6 +78,127 @@ class FileMetadata(_Wire):
     size: int
     content_type: str | None = None
     creation_time: int
+
+
+class AdminMember(_Wire):
+    """``GET /admin/admins`` row — ``{email, githubId?}``."""
+
+    email: str
+    github_id: int | None = None
+
+
+class TokenInfo(_Wire):
+    """``GET /admin/tokens`` row — ``{id, name, createdAt, revoked}``."""
+
+    id: str
+    name: str
+    created_at: int
+    revoked: bool
+
+
+class TableStat(_Wire):
+    """One row of ``DbStats.tables`` — ``{name, rowCount, sizeBytes}``."""
+
+    name: str
+    row_count: int
+    size_bytes: int
+
+
+class DbStats(_Wire):
+    """``GET /admin/dbs/{db}/stats`` response — per-table row counts + sizes."""
+
+    tables: list[TableStat]
+    total_size_bytes: int
+
+
+class LatencyStats(_Wire):
+    """p50/p95/p99 latency percentile triple (microseconds). Field names are
+    already lowercase, so ``to_camel`` leaves them as ``p50``/``p95``/``p99``."""
+
+    p50: int
+    p95: int
+    p99: int
+
+
+class MetricsSnapshot(_Wire):
+    """``GET /admin/metrics`` response — server-wide counters and gauges.
+
+    The ``subs_*`` fields default to 0 so a client built against a newer server
+    still deserializes an older server's response (these counters landed
+    2026-07-29); 0 is the correct "not reported" value for a monotonic counter.
+    """
+
+    queries_total: int
+    mutations_total: int
+    uploads_total: int
+    ws_connections: int
+    active_subscriptions: int
+    pool_size: int
+    pool_idle: int
+    uptime_seconds: int
+    query_latency: LatencyStats
+    mutate_latency: LatencyStats
+    subscribe_latency: LatencyStats
+    subs_reruns_total: int = 0
+    subs_skips_point_total: int = 0
+    subs_skips_indexed_total: int = 0
+    subs_skips_ordered_total: int = 0
+    subs_skip_verifications_total: int = 0
+    subs_missed_pushes_total: int = 0
+
+
+class HotConfig(_Wire):
+    """Runtime-mutable hot config — mirrors ``server::config::HotConfig``."""
+
+    allowed_origins: list[str]
+    session_ttl_days: int
+    max_file_size: int
+    idempotency_ttl_ms: int
+
+
+class ConfigResponse(_Wire):
+    """``GET /admin/config`` response — redacted boot config + hot config + build
+    identity + admin allowlist. Secrets surface as configured-bools, never values."""
+
+    port: int
+    public_url: str
+    github_base_url: str
+    github_api_url: str
+    database_url_configured: bool
+    admin_key_configured: bool
+    github_configured: bool
+    google_configured: bool
+    hot: HotConfig
+    version: str
+    git_commit: str
+    admins: list[AdminMember]
+
+
+class HotConfigPatch(_Wire):
+    """``PATCH /admin/config`` body — every field optional; omitted fields are
+    left unchanged. Serialize with ``exclude_none=True`` so the wire body carries
+    only the fields the caller sets (matches rust-client's
+    ``skip_serializing_if = "Option::is_none"``). Unknown fields are rejected
+    server-side (``deny_unknown_fields``).
+    """
+
+    allowed_origins: list[str] | None = None
+    session_ttl_days: int | None = None
+    max_file_size: int | None = None
+    idempotency_ttl_ms: int | None = None
+
+
+class OpEvent(_Wire):
+    """``GET /admin/ops/recent`` row — one document-op event from the in-memory
+    ring. ``kind`` is a lowercase string (``insert``/``patch``/``replace``/
+    ``delete``/``upsert``); ``owner`` is ``null`` for admin/machine writes."""
+
+    db: str
+    table: str
+    doc_id: str
+    kind: str
+    ts: int
+    owner: str | None = None
 
 
 # ``StepResult`` is a ``Union`` alias (no ``model_validate``); route through a
@@ -380,6 +502,118 @@ class RtDbHttpClient:
             headers={"Content-Type": "application/x-ndjson"},
         )
         self._expect_ok(resp)
+
+    def allowlist_add(self, db: str, email: str) -> None:
+        """``POST /admin/allowlist`` ``{db, action:"add", email}`` → ``{ok:true}``."""
+        resp = self._send(
+            "POST",
+            "/admin/allowlist",
+            json={"db": db, "action": "add", "email": email},
+        )
+        self._expect_ok(resp)
+
+    def allowlist_remove(self, db: str, email: str) -> None:
+        """``POST /admin/allowlist`` ``{db, action:"remove", email}`` → ``{ok:true}``."""
+        resp = self._send(
+            "POST",
+            "/admin/allowlist",
+            json={"db": db, "action": "remove", "email": email},
+        )
+        self._expect_ok(resp)
+
+    def allowlist_list(self, db: str) -> list[str]:
+        """``GET /admin/allowlist?db=<db>`` → ``{emails:[...]}``."""
+        resp = self._send("GET", "/admin/allowlist", params={"db": db})
+        return list(resp.json()["emails"])
+
+    def admins_list(self) -> list[AdminMember]:
+        """``GET /admin/admins`` → ``{admins:[{email, githubId?}]}``."""
+        resp = self._send("GET", "/admin/admins")
+        return [AdminMember.model_validate(m) for m in resp.json()["admins"]]
+
+    def admins_add(self, email: str, github_id: int | None = None) -> None:
+        """``POST /admin/admins`` ``{email, githubId?}`` → ``{ok:true}``.
+
+        ``githubId`` is omitted from the body when ``None`` (matches the
+        server's ``skip_serializing_if`` rule).
+        """
+        body: dict[str, Any] = {"email": email}
+        if github_id is not None:
+            body["githubId"] = github_id
+        resp = self._send("POST", "/admin/admins", json=body)
+        self._expect_ok(resp)
+
+    def admins_remove(self, email: str) -> None:
+        """``DELETE /admin/admins`` ``{email}`` → ``{ok:true}``.
+
+        Body-on-DELETE (axum reads it from the request body, not the URL) —
+        mirrors the rust-client's ``delete_json``.
+        """
+        resp = self._send("DELETE", "/admin/admins", json={"email": email})
+        self._expect_ok(resp)
+
+    def list_tokens(self, db: str) -> list[TokenInfo]:
+        """``GET /admin/tokens?db=<db>`` → ``{tokens:[{id,name,createdAt,revoked}]}``."""
+        resp = self._send("GET", "/admin/tokens", params={"db": db})
+        return [TokenInfo.model_validate(t) for t in resp.json()["tokens"]]
+
+    def get_schema(self, db: str) -> SchemaDef:
+        """``GET /admin/dbs/{db}/schema`` → the database's pushed ``SchemaDef``."""
+        resp = self._send("GET", f"/admin/dbs/{db}/schema")
+        return SchemaDef.model_validate(resp.json())
+
+    def db_stats(self, db: str) -> DbStats:
+        """``GET /admin/dbs/{db}/stats`` → per-table row counts + storage sizes."""
+        resp = self._send("GET", f"/admin/dbs/{db}/stats")
+        return DbStats.model_validate(resp.json())
+
+    def metrics(self) -> MetricsSnapshot:
+        """``GET /admin/metrics`` → server-wide counters and gauges."""
+        resp = self._send("GET", "/admin/metrics")
+        return MetricsSnapshot.model_validate(resp.json())
+
+    def get_config(self) -> ConfigResponse:
+        """``GET /admin/config`` → redacted running config + build identity + admins."""
+        resp = self._send("GET", "/admin/config")
+        return ConfigResponse.model_validate(resp.json())
+
+    def patch_config(self, patch: HotConfigPatch | Mapping[str, Any]) -> ConfigResponse:
+        """``PATCH /admin/config`` with a partial hot-config body → updated config.
+
+        Each present field fully replaces the prior value; the server validates
+        (``sessionTtlDays>=1``, ``maxFileSize`` within bounds, origin shape).
+        Accepts a ``HotConfigPatch`` model or a plain ``Mapping`` of wire camelCase
+        keys (e.g. ``{"sessionTtlDays": 60}``); ``None``-valued model fields are
+        omitted from the body (matches rust-client's ``skip_serializing_if``).
+        """
+        if isinstance(patch, Mapping):
+            body: dict[str, Any] = dict(patch)
+        else:
+            body = patch.model_dump(by_alias=True, mode="json", exclude_none=True)
+        resp = self._send("PATCH", "/admin/config", json=body)
+        return ConfigResponse.model_validate(resp.json())
+
+    def ops_recent(
+        self,
+        *,
+        db: str | None = None,
+        table: str | None = None,
+        n: int | None = None,
+    ) -> list[OpEvent]:
+        """``GET /admin/ops/recent`` → recent document-op events, newest-first.
+
+        All filter opts are optional; omitted filters are not sent. ``n`` caps
+        the result count (server-side max 500).
+        """
+        params: dict[str, Any] = {}
+        if db is not None:
+            params["db"] = db
+        if table is not None:
+            params["table"] = table
+        if n is not None:
+            params["n"] = n
+        resp = self._send("GET", "/admin/ops/recent", params=params)
+        return [OpEvent.model_validate(e) for e in resp.json()["ops"]]
 
     # --- admin data access: owner-bypass query/mutate (admin key) ---
 

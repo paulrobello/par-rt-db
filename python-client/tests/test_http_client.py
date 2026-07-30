@@ -563,6 +563,343 @@ def test_admin_import_db_posts_ndjson_body() -> None:
     assert captured["content_type"] == "application/x-ndjson"
 
 
+def test_admin_allowlist_add_posts_db_action_add_email() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"ok": True})
+
+    client = _admin_client(handler)
+    client.allowlist_add("kanban", "user@example.com")
+    assert captured["body"] == {
+        "db": "kanban",
+        "action": "add",
+        "email": "user@example.com",
+    }
+
+
+def test_admin_allowlist_remove_posts_db_action_remove_email() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"ok": True})
+
+    client = _admin_client(handler)
+    client.allowlist_remove("kanban", "user@example.com")
+    assert captured["body"] == {
+        "db": "kanban",
+        "action": "remove",
+        "email": "user@example.com",
+    }
+
+
+def test_admin_allowlist_list_returns_emails() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["query"] = dict(request.url.params)
+        return httpx.Response(200, json={"emails": ["a@b.com", "c@d.com"]})
+
+    client = _admin_client(handler)
+    assert client.allowlist_list("kanban") == ["a@b.com", "c@d.com"]
+    assert captured["query"] == {"db": "kanban"}
+
+
+def test_admin_admins_list_returns_members() -> None:
+    client = _admin_client(
+        _handler_map(
+            {
+                ("GET", "/admin/admins", ""): httpx.Response(
+                    200,
+                    json={
+                        "admins": [
+                            {"email": "a@b.com", "githubId": 123},
+                            {"email": "c@d.com"},
+                        ]
+                    },
+                )
+            }
+        )
+    )
+    from par_rt_db.http_client import AdminMember
+
+    members = client.admins_list()
+    assert len(members) == 2
+    assert isinstance(members[0], AdminMember)
+    assert members[0].email == "a@b.com"
+    assert members[0].github_id == 123
+    assert members[1].github_id is None
+
+
+def test_admin_admins_add_posts_email_and_optional_github_id() -> None:
+    captured: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(json.loads(request.content))
+        return httpx.Response(200, json={"ok": True})
+
+    client = _admin_client(handler)
+    client.admins_add("a@b.com", github_id=123)
+    client.admins_add("c@d.com")
+    assert captured[0] == {"email": "a@b.com", "githubId": 123}
+    # githubId omitted entirely when None
+    assert captured[1] == {"email": "c@d.com"}
+
+
+def test_admin_admins_remove_uses_delete_with_body() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["method"] = request.method
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"ok": True})
+
+    client = _admin_client(handler)
+    client.admins_remove("a@b.com")
+    assert captured["method"] == "DELETE"
+    assert captured["body"] == {"email": "a@b.com"}
+
+
+def test_admin_list_tokens_returns_token_info() -> None:
+    client = _admin_client(
+        _handler_map(
+            {
+                ("GET", "/admin/tokens", ""): httpx.Response(
+                    200,
+                    json={
+                        "tokens": [
+                            {"id": "t1", "name": "cli", "createdAt": 500, "revoked": False},
+                            {"id": "t2", "name": "ci", "createdAt": 600, "revoked": True},
+                        ]
+                    },
+                )
+            }
+        )
+    )
+    from par_rt_db.http_client import TokenInfo
+
+    tokens = client.list_tokens("kanban")
+    assert len(tokens) == 2
+    assert isinstance(tokens[0], TokenInfo)
+    assert tokens[0].id == "t1"
+    assert tokens[0].created_at == 500
+    assert tokens[1].revoked is True
+
+
+def test_admin_get_schema_returns_schema_def() -> None:
+    client = _admin_client(
+        _handler_map(
+            {
+                ("GET", "/admin/dbs/kanban/schema", ""): httpx.Response(
+                    200,
+                    json={"tables": {"notes": {"fields": {"body": {"type": "string"}}}}},
+                )
+            }
+        )
+    )
+    schema = client.get_schema("kanban")
+    assert "notes" in schema.tables
+
+
+def test_admin_db_stats_returns_table_stats() -> None:
+    client = _admin_client(
+        _handler_map(
+            {
+                ("GET", "/admin/dbs/kanban/stats", ""): httpx.Response(
+                    200,
+                    json={
+                        "tables": [{"name": "notes", "rowCount": 5, "sizeBytes": 4096}],
+                        "totalSizeBytes": 4096,
+                    },
+                )
+            }
+        )
+    )
+    from par_rt_db.http_client import DbStats
+
+    stats = client.db_stats("kanban")
+    assert isinstance(stats, DbStats)
+    assert stats.total_size_bytes == 4096
+    assert stats.tables[0].row_count == 5
+    assert stats.tables[0].size_bytes == 4096
+
+
+def test_admin_metrics_returns_snapshot_with_subs_counters() -> None:
+    client = _admin_client(
+        _handler_map(
+            {
+                ("GET", "/admin/metrics", ""): httpx.Response(
+                    200,
+                    json={
+                        "queriesTotal": 10,
+                        "mutationsTotal": 3,
+                        "uploadsTotal": 1,
+                        "wsConnections": 2,
+                        "activeSubscriptions": 5,
+                        "poolSize": 10,
+                        "poolIdle": 8,
+                        "uptimeSeconds": 99,
+                        "queryLatency": {"p50": 100, "p95": 200, "p99": 300},
+                        "mutateLatency": {"p50": 110, "p95": 210, "p99": 310},
+                        "subscribeLatency": {"p50": 120, "p95": 220, "p99": 320},
+                        "subsRerunsTotal": 7,
+                        "subsSkipsPointTotal": 1,
+                        "subsSkipsIndexedTotal": 2,
+                        "subsSkipsOrderedTotal": 3,
+                        "subsSkipVerificationsTotal": 4,
+                        "subsMissedPushesTotal": 0,
+                    },
+                )
+            }
+        )
+    )
+    from par_rt_db.http_client import MetricsSnapshot
+
+    snap = client.metrics()
+    assert isinstance(snap, MetricsSnapshot)
+    assert snap.queries_total == 10
+    assert snap.query_latency.p99 == 300
+    assert snap.subs_skips_ordered_total == 3
+    assert snap.subs_missed_pushes_total == 0
+
+
+def test_admin_metrics_defaults_subs_counters_when_omitted() -> None:
+    # An older server (pre-2026-07-29) omits the subs_* counters; they default to 0
+    # so a newer client still deserializes the response (mirrors rust-client serde(default)).
+    client = _admin_client(
+        _handler_map(
+            {
+                ("GET", "/admin/metrics", ""): httpx.Response(
+                    200,
+                    json={
+                        "queriesTotal": 1,
+                        "mutationsTotal": 0,
+                        "uploadsTotal": 0,
+                        "wsConnections": 0,
+                        "activeSubscriptions": 0,
+                        "poolSize": 1,
+                        "poolIdle": 1,
+                        "uptimeSeconds": 1,
+                        "queryLatency": {"p50": 0, "p95": 0, "p99": 0},
+                        "mutateLatency": {"p50": 0, "p95": 0, "p99": 0},
+                        "subscribeLatency": {"p50": 0, "p95": 0, "p99": 0},
+                    },
+                )
+            }
+        )
+    )
+    snap = client.metrics()
+    assert snap.subs_reruns_total == 0
+    assert snap.subs_missed_pushes_total == 0
+
+
+_CONFIG_RESPONSE_BODY: dict[str, Any] = {
+    "port": 8080,
+    "publicUrl": "https://rtdb.example",
+    "githubBaseUrl": "https://github.com",
+    "githubApiUrl": "https://api.github.com",
+    "databaseUrlConfigured": True,
+    "adminKeyConfigured": True,
+    "githubConfigured": False,
+    "googleConfigured": False,
+    "hot": {
+        "allowedOrigins": ["https://app.example"],
+        "sessionTtlDays": 30,
+        "maxFileSize": 52428800,
+        "idempotencyTtlMs": 300000,
+    },
+    "version": "0.1.0",
+    "gitCommit": "abc1234",
+    "admins": [{"email": "admin@example.com"}],
+}
+
+
+def test_admin_get_config_returns_config_response() -> None:
+    client = _admin_client(
+        _handler_map(
+            {("GET", "/admin/config", ""): httpx.Response(200, json=_CONFIG_RESPONSE_BODY)}
+        )
+    )
+    from par_rt_db.http_client import ConfigResponse
+
+    cfg = client.get_config()
+    assert isinstance(cfg, ConfigResponse)
+    assert cfg.admin_key_configured is True
+    assert cfg.github_configured is False
+    assert cfg.hot.session_ttl_days == 30
+    assert cfg.hot.allowed_origins == ["https://app.example"]
+    assert cfg.admins[0].email == "admin@example.com"
+
+
+def test_admin_patch_config_posts_camelcase_body_and_returns_config() -> None:
+    captured: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append({"method": request.method, "body": json.loads(request.content)})
+        # Echo back a config where sessionTtlDays reflects the patch.
+        body = dict(_CONFIG_RESPONSE_BODY)
+        ttl = json.loads(request.content).get("sessionTtlDays")
+        if ttl is not None:
+            body = {**body, "hot": {**body["hot"], "sessionTtlDays": ttl}}
+        return httpx.Response(200, json=body)
+
+    client = _admin_client(handler)
+    from par_rt_db.http_client import HotConfigPatch
+
+    # Model input: snake_case field → camelCase wire key, None fields omitted.
+    cfg = client.patch_config(HotConfigPatch(session_ttl_days=60))
+    assert cfg.hot.session_ttl_days == 60
+    assert captured[0]["method"] == "PATCH"
+    assert captured[0]["body"] == {"sessionTtlDays": 60}
+    # Dict input: passed through as-is (caller provides wire camelCase keys).
+    client.patch_config({"maxFileSize": 104857600})
+    assert captured[1]["body"] == {"maxFileSize": 104857600}
+
+
+def test_admin_ops_recent_returns_events_and_sends_filters() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["query"] = dict(request.url.params)
+        return httpx.Response(
+            200,
+            json={
+                "ops": [
+                    {
+                        "db": "kanban",
+                        "table": "items",
+                        "docId": "i1",
+                        "kind": "insert",
+                        "ts": 1000,
+                        "owner": "user@example.com",
+                    },
+                    {
+                        "db": "kanban",
+                        "table": "items",
+                        "docId": "i2",
+                        "kind": "delete",
+                        "ts": 2000,
+                        "owner": None,
+                    },
+                ]
+            },
+        )
+
+    client = _admin_client(handler)
+    from par_rt_db.http_client import OpEvent
+
+    ops = client.ops_recent(db="kanban", table="items", n=50)
+    assert captured["query"] == {"db": "kanban", "table": "items", "n": "50"}
+    assert len(ops) == 2
+    assert isinstance(ops[0], OpEvent)
+    assert ops[0].doc_id == "i1"
+    assert ops[0].kind == "insert"
+    assert ops[0].owner == "user@example.com"
+    assert ops[1].owner is None
+
+
 # --- admin data access (owner bypass) ---------------------------------------
 
 
