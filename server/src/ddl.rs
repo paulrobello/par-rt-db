@@ -4,7 +4,7 @@ use sqlx::PgPool;
 
 use crate::db::{database_exists, load_schema, validate_db_name};
 use crate::error::RtDbError;
-use crate::schema::{FieldType, SchemaDef, TableDef, indexed_column_type};
+use crate::schema::{FieldType, SchemaDef, TableDef, indexed_column_type, is_widening_of};
 
 pub fn pg_table(user_table: &str) -> String {
     format!("t_{}", user_table.to_lowercase())
@@ -70,9 +70,11 @@ fn backfill_expr(pg_type: &str, field_name: &str) -> Result<String, RtDbError> {
     }
 }
 
-/// Compares `old` to `new` and rejects any destructive change: a removed table, a
-/// removed field, a changed field type, a removed index, or a changed index field
-/// list. Errors name the offending table, `table.field`, or index.
+/// Compares `old` to `new` and rejects any destructive change: a removed table,
+/// a removed field, a changed field type (except a safe literal-union widening,
+/// which is additive and allowed — see `schema::is_widening_of`), a removed
+/// index, or a changed index field list. Errors name the offending table,
+/// `table.field`, or index.
 fn detect_destructive_changes(old: &SchemaDef, new: &SchemaDef) -> Result<(), RtDbError> {
     for (table_name, old_table) in &old.tables {
         let new_table = new
@@ -87,7 +89,10 @@ fn detect_destructive_changes(old: &SchemaDef, new: &SchemaDef) -> Result<(), Rt
                         "removed field '{table_name}.{field_name}'"
                     )));
                 }
-                Some(new_field_type) if new_field_type != old_field_type => {
+                Some(new_field_type)
+                    if new_field_type != old_field_type
+                        && !is_widening_of(old_field_type, new_field_type) =>
+                {
                     return Err(RtDbError::bad_request(format!(
                         "changed type of field '{table_name}.{field_name}'"
                     )));
@@ -315,4 +320,101 @@ pub async fn push_schema(
 
     tx.commit().await?;
     Ok(schema)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    fn lit(s: &str) -> FieldType {
+        FieldType::Literal {
+            value: serde_json::Value::String(s.to_string()),
+        }
+    }
+
+    fn union_of(vals: &[&str]) -> FieldType {
+        FieldType::Union {
+            variants: vals.iter().map(|v| lit(v)).collect(),
+        }
+    }
+
+    fn single_table(
+        table: &str,
+        fields: BTreeMap<String, FieldType>,
+    ) -> BTreeMap<String, TableDef> {
+        let mut tables = BTreeMap::new();
+        tables.insert(
+            table.to_string(),
+            TableDef {
+                fields,
+                indexes: vec![],
+                owner_field: None,
+                collaborators_field: None,
+            },
+        );
+        tables
+    }
+
+    fn one_field_schema(table: &str, field: &str, ty: FieldType) -> SchemaDef {
+        let mut fields = BTreeMap::new();
+        fields.insert(field.to_string(), ty);
+        SchemaDef {
+            tables: single_table(table, fields),
+        }
+    }
+
+    #[test]
+    fn detect_allows_widening_a_literal_union() {
+        let old = one_field_schema("items", "priority", union_of(&["low", "medium", "high"]));
+        let new = one_field_schema(
+            "items",
+            "priority",
+            union_of(&["low", "medium", "high", "critical"]),
+        );
+        assert!(detect_destructive_changes(&old, &new).is_ok());
+    }
+
+    #[test]
+    fn detect_rejects_narrowing_a_literal_union() {
+        let old = one_field_schema(
+            "items",
+            "priority",
+            union_of(&["low", "medium", "high", "critical"]),
+        );
+        let new = one_field_schema("items", "priority", union_of(&["low", "medium", "high"]));
+        let err = detect_destructive_changes(&old, &new).expect_err("narrowing rejected");
+        assert!(
+            err.message
+                .contains("changed type of field 'items.priority'"),
+            "{}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn detect_rejects_a_scalar_type_change() {
+        let old = one_field_schema("items", "qty", FieldType::Number);
+        let new = one_field_schema("items", "qty", FieldType::String);
+        let err = detect_destructive_changes(&old, &new).expect_err("scalar swap rejected");
+        assert!(
+            err.message.contains("changed type of field"),
+            "{}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn detect_still_rejects_a_removed_field() {
+        let old = one_field_schema("items", "qty", FieldType::Number);
+        let new = SchemaDef {
+            tables: single_table("items", BTreeMap::new()),
+        };
+        let err = detect_destructive_changes(&old, &new).expect_err("field removal rejected");
+        assert!(
+            err.message.contains("removed field 'items.qty'"),
+            "{}",
+            err.message
+        );
+    }
 }

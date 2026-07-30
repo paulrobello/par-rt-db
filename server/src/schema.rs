@@ -237,6 +237,50 @@ pub fn indexed_column_type(ty: &FieldType) -> Result<(&'static str, bool), RtDbE
     }
 }
 
+/// Returns `true` when changing a field's declared type from `old` to `new` is a
+/// safe widening — every value valid under `old` remains valid under `new`, so no
+/// existing row is orphaned and no data migration is required. The only widening
+/// currently recognized is over finite literal sets: a lone `Literal` or a `Union`
+/// whose variants are all `Literal`s, where the new literal set is a superset of
+/// the old one (e.g. adding a variant to an enum-like union). Every other type
+/// change — narrowing a union (drops a variant some rows may hold), `union <->
+/// scalar`, any scalar-type change, `Optional`, `Object`, and mixed-kind unions —
+/// is NOT a widening and stays rejected by `detect_destructive_changes`.
+pub fn is_widening_of(old: &FieldType, new: &FieldType) -> bool {
+    match (literal_set(old), literal_set(new)) {
+        (Some(old_vals), Some(new_vals)) => old_vals.iter().all(|old_v| new_vals.contains(old_v)),
+        _ => false,
+    }
+}
+
+/// Finite set of accepted values for a literal-only type: `Some` for a lone
+/// `Literal` or a `Union` whose variants are all `Literal`s; `None` for any other
+/// type (unions mixing in non-literal variants, scalars, `Optional`, `Object`).
+/// Variant order and duplicates are irrelevant — the result is used only for
+/// membership tests. `serde_json::Value` is `PartialEq` but not `Ord`/`Hash`, so
+/// this returns a `Vec<&Value>` for linear `.any()` checks rather than a set.
+fn literal_set(ty: &FieldType) -> Option<Vec<&serde_json::Value>> {
+    match ty {
+        FieldType::Literal { value } => Some(vec![value]),
+        FieldType::Union { variants } => {
+            let vals: Vec<&serde_json::Value> = variants
+                .iter()
+                .filter_map(|v| match v {
+                    FieldType::Literal { value } => Some(value),
+                    _ => None,
+                })
+                .collect();
+            // Finite only when every variant is a Literal.
+            if vals.len() == variants.len() {
+                Some(vals)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
 impl TableDef {
     fn validate_structure(&self, table_name: &str) -> Result<(), RtDbError> {
         let mut lower_field_names = HashSet::new();
@@ -1741,5 +1785,56 @@ mod tests {
             "c",
         )
         .unwrap();
+    }
+
+    fn union_of(vals: &[&str]) -> FieldType {
+        FieldType::Union {
+            variants: vals
+                .iter()
+                .map(|v| FieldType::Literal {
+                    value: serde_json::Value::String((*v).to_string()),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn is_widening_of_allows_adding_a_union_variant() {
+        let old = union_of(&["low", "medium", "high"]);
+        let new = union_of(&["low", "medium", "high", "critical"]);
+        assert!(is_widening_of(&old, &new));
+    }
+
+    #[test]
+    fn is_widening_of_rejects_narrowing_a_union() {
+        let old = union_of(&["low", "medium", "high", "critical"]);
+        let new = union_of(&["low", "medium", "high"]);
+        assert!(!is_widening_of(&old, &new));
+    }
+
+    #[test]
+    fn is_widening_of_allows_literal_to_union() {
+        let old = FieldType::Literal {
+            value: serde_json::Value::String("a".to_string()),
+        };
+        let new = union_of(&["a", "b"]);
+        assert!(is_widening_of(&old, &new));
+    }
+
+    #[test]
+    fn is_widening_of_rejects_scalar_swap_and_nonliteral_types() {
+        assert!(!is_widening_of(&FieldType::Number, &FieldType::String));
+        assert!(!is_widening_of(&FieldType::String, &union_of(&["a"])));
+        // A union mixing a Literal with a non-literal variant is an open type.
+        let mixed = FieldType::Union {
+            variants: vec![
+                FieldType::Literal {
+                    value: serde_json::Value::String("a".to_string()),
+                },
+                FieldType::String,
+            ],
+        };
+        assert!(!is_widening_of(&mixed, &union_of(&["a", "b"])));
+        assert!(!is_widening_of(&union_of(&["a", "b"]), &mixed));
     }
 }
