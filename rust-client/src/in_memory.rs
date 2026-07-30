@@ -49,7 +49,9 @@ use crate::error::{ErrorCode, RtDbError};
 use crate::mutation::{Step, StepResult, Transaction};
 use crate::query::{Order, Query};
 use crate::schema::{FieldType, IndexDef, SchemaDef, TableDef};
-use crate::wire::{FilterExpr, ScheduleInfo, ScheduleKind, ScheduleStatus, ScheduleWhen};
+use crate::wire::{
+    AggregateOp, FilterExpr, ScheduleInfo, ScheduleKind, ScheduleStatus, ScheduleWhen,
+};
 
 /// Maximum number of steps in a single transaction (mirrors the server cap).
 pub const MAX_STEPS: usize = 256;
@@ -333,6 +335,8 @@ impl InMemoryRtDbClient {
                 || q.unique
                 || q.first
                 || q.count
+                || q.distinct
+                || q.aggregate.is_some()
                 || q.paginate.is_some()
                 || q.filter.is_some()
                 || q.search.is_some()
@@ -341,7 +345,8 @@ impl InMemoryRtDbClient {
                 return Err(RtDbError::new(
                     ErrorCode::BadRequest,
                     "get cannot be combined with index, eq, range bounds, order, take, \
-                     unique, first, count, paginate, filter, search, or vector search",
+                     unique, first, count, distinct, aggregate, paginate, filter, search, \
+                     or vector search",
                 ));
             }
             // The DSL `get` terminal reuses the point-read primitive so the
@@ -350,10 +355,12 @@ impl InMemoryRtDbClient {
         }
 
         // Conflicting-terminal guards (ports :919-939).
-        if q.unique && (q.take.is_some() || q.order.is_some()) {
+        if q.unique
+            && (q.take.is_some() || q.order.is_some() || q.distinct || q.aggregate.is_some())
+        {
             return Err(RtDbError::new(
                 ErrorCode::BadRequest,
-                "unique cannot be combined with take or order",
+                "unique cannot be combined with take, order, distinct, or aggregate",
             ));
         }
         if q.first && q.unique {
@@ -366,6 +373,18 @@ impl InMemoryRtDbClient {
             return Err(RtDbError::new(
                 ErrorCode::BadRequest,
                 "first cannot be combined with take",
+            ));
+        }
+        if q.first && q.distinct {
+            return Err(RtDbError::new(
+                ErrorCode::BadRequest,
+                "first cannot be combined with distinct",
+            ));
+        }
+        if q.first && q.aggregate.is_some() {
+            return Err(RtDbError::new(
+                ErrorCode::BadRequest,
+                "first cannot be combined with aggregate",
             ));
         }
         if q.count && q.unique {
@@ -390,6 +409,18 @@ impl InMemoryRtDbClient {
             return Err(RtDbError::new(
                 ErrorCode::BadRequest,
                 "count cannot be combined with order",
+            ));
+        }
+        if q.count && q.distinct {
+            return Err(RtDbError::new(
+                ErrorCode::BadRequest,
+                "count cannot be combined with distinct",
+            ));
+        }
+        if q.count && q.aggregate.is_some() {
+            return Err(RtDbError::new(
+                ErrorCode::BadRequest,
+                "count cannot be combined with aggregate",
             ));
         }
         // Paginate combination guards (ports `:940-955`): paginate is one-shot
@@ -438,6 +469,95 @@ impl InMemoryRtDbClient {
                 ErrorCode::BadRequest,
                 format!("take exceeds maximum of {MAX_TAKE}"),
             ));
+        }
+
+        // `distinct`/`aggregate` are standalone terminals (like `count`): they
+        // compose only with index/eq/range/filter. `get`/`unique`/`first`/`count`
+        // rejected their own combinations above (validated first, matching the
+        // server's check order in query.rs), so these blocks only reject the
+        // remaining peers each terminal owns — mirroring the server's
+        // DISTINCT/AGGREGATE_INCOMPATIBLES tables.
+        if q.distinct {
+            if q.take.is_some() {
+                return Err(RtDbError::new(
+                    ErrorCode::BadRequest,
+                    "distinct cannot be combined with take",
+                ));
+            }
+            if q.order.is_some() {
+                return Err(RtDbError::new(
+                    ErrorCode::BadRequest,
+                    "distinct cannot be combined with order",
+                ));
+            }
+            if q.aggregate.is_some() {
+                return Err(RtDbError::new(
+                    ErrorCode::BadRequest,
+                    "distinct cannot be combined with aggregate",
+                ));
+            }
+            if q.paginate.is_some() {
+                return Err(RtDbError::new(
+                    ErrorCode::BadRequest,
+                    "distinct cannot be combined with paginate",
+                ));
+            }
+            if q.search.is_some() {
+                return Err(RtDbError::new(
+                    ErrorCode::BadRequest,
+                    "distinct cannot be combined with search",
+                ));
+            }
+            if q.vector_search.is_some() {
+                return Err(RtDbError::new(
+                    ErrorCode::BadRequest,
+                    "distinct cannot be combined with vector search",
+                ));
+            }
+            if q.hybrid_search.is_some() {
+                return Err(RtDbError::new(
+                    ErrorCode::BadRequest,
+                    "distinct cannot be combined with hybrid search",
+                ));
+            }
+        }
+        if q.aggregate.is_some() {
+            if q.take.is_some() {
+                return Err(RtDbError::new(
+                    ErrorCode::BadRequest,
+                    "aggregate cannot be combined with take",
+                ));
+            }
+            if q.order.is_some() {
+                return Err(RtDbError::new(
+                    ErrorCode::BadRequest,
+                    "aggregate cannot be combined with order",
+                ));
+            }
+            if q.paginate.is_some() {
+                return Err(RtDbError::new(
+                    ErrorCode::BadRequest,
+                    "aggregate cannot be combined with paginate",
+                ));
+            }
+            if q.search.is_some() {
+                return Err(RtDbError::new(
+                    ErrorCode::BadRequest,
+                    "aggregate cannot be combined with search",
+                ));
+            }
+            if q.vector_search.is_some() {
+                return Err(RtDbError::new(
+                    ErrorCode::BadRequest,
+                    "aggregate cannot be combined with vector search",
+                ));
+            }
+            if q.hybrid_search.is_some() {
+                return Err(RtDbError::new(
+                    ErrorCode::BadRequest,
+                    "aggregate cannot be combined with hybrid search",
+                ));
+            }
         }
 
         // `vectorSearch` terminal — cascade mirror of server `execute_query`.
@@ -641,6 +761,169 @@ impl InMemoryRtDbClient {
             return Ok(Value::Number(serde_json::Number::from(
                 filtered.len() as i64
             )));
+        }
+
+        // `distinct` terminal: unique values of the index field immediately
+        // after the eq prefix over the matching set, sorted ascending, capped by
+        // MAX_TAKE. Ports ts `executeQuery` :1355-1382 and the server's distinct
+        // arm. Null index values are skipped (mirror `WHERE "<col>" IS NOT NULL`).
+        if q.distinct {
+            let idx = index_def.as_ref().ok_or_else(|| {
+                RtDbError::new(
+                    ErrorCode::BadRequest,
+                    "distinct requires an index field beyond the eq prefix",
+                )
+            })?;
+            if typed_eq.len() >= idx.fields.len() {
+                return Err(RtDbError::new(
+                    ErrorCode::BadRequest,
+                    "distinct requires an index field beyond the eq prefix",
+                ));
+            }
+            let field = idx.fields[typed_eq.len()].as_str();
+            let field_pg = table_def
+                .fields
+                .get(field)
+                .and_then(|ty| index_column_type(ty).ok())
+                .map(|it| it.pg)
+                .unwrap_or(PgType::Text);
+            let mut seen: BTreeSet<String> = BTreeSet::new();
+            let mut values: Vec<Value> = Vec::new();
+            for row in &filtered {
+                let Some(v) = row.doc.get(field) else {
+                    continue;
+                };
+                if v.is_null() {
+                    continue;
+                }
+                // Canonical JSON key so equal scalars dedupe.
+                if seen.insert(v.to_string()) {
+                    values.push(v.clone());
+                }
+            }
+            values.sort_by(|a, b| compare_index_values(a, b, field_pg));
+            let out: Vec<Value> = values.into_iter().take(MAX_TAKE).collect();
+            return Ok(Value::Array(out));
+        }
+
+        // `aggregate` terminal: <OP> over the index field after the eq prefix
+        // (groupBy: group by that field, aggregate the next). Ports ts
+        // `executeQuery` :1391-1462 and the server's aggregate arm. Null agg
+        // values are skipped (SQL SUM/AVG/MIN/MAX ignore NULL); an empty scalar
+        // set yields null, an empty group yields a null `value`. Group count is
+        // capped by MAX_TAKE.
+        if let Some(agg) = &q.aggregate {
+            let idx = index_def.as_ref().ok_or_else(|| {
+                RtDbError::new(
+                    ErrorCode::BadRequest,
+                    "aggregate requires an index field beyond the eq prefix",
+                )
+            })?;
+            let eq_len = typed_eq.len();
+            let (group_field, agg_field) = if agg.group_by {
+                if eq_len + 1 >= idx.fields.len() {
+                    return Err(RtDbError::new(
+                        ErrorCode::BadRequest,
+                        "aggregate groupBy requires two index fields beyond the eq prefix",
+                    ));
+                }
+                (
+                    Some(idx.fields[eq_len].as_str()),
+                    idx.fields[eq_len + 1].as_str(),
+                )
+            } else {
+                if eq_len >= idx.fields.len() {
+                    return Err(RtDbError::new(
+                        ErrorCode::BadRequest,
+                        "aggregate requires an index field beyond the eq prefix",
+                    ));
+                }
+                (None, idx.fields[eq_len].as_str())
+            };
+            let agg_field_pg = table_def
+                .fields
+                .get(agg_field)
+                .and_then(|ty| index_column_type(ty).ok())
+                .map(|it| it.pg)
+                .unwrap_or(PgType::Text);
+            let op_name = match agg.op {
+                AggregateOp::Sum => "sum",
+                AggregateOp::Avg => "avg",
+                AggregateOp::Min => "min",
+                AggregateOp::Max => "max",
+            };
+            if matches!(agg.op, AggregateOp::Sum | AggregateOp::Avg)
+                && !matches!(agg_field_pg, PgType::Number | PgType::Int64)
+            {
+                return Err(RtDbError::new(
+                    ErrorCode::BadRequest,
+                    format!("aggregate op {op_name} requires a numeric index field"),
+                ));
+            }
+            if let Some(group_field) = group_field {
+                let group_field_pg = table_def
+                    .fields
+                    .get(group_field)
+                    .and_then(|ty| index_column_type(ty).ok())
+                    .map(|it| it.pg)
+                    .unwrap_or(PgType::Text);
+                // Group rows by `group_field` (skip null keys), preserving
+                // first-seen order; sort by key ascending after, for parity with
+                // the server's `ORDER BY k`.
+                let mut groups: Vec<(Value, Vec<Value>)> = Vec::new();
+                let mut group_index: HashMap<String, usize> = HashMap::new();
+                for row in &filtered {
+                    let Some(k) = row.doc.get(group_field) else {
+                        continue;
+                    };
+                    if k.is_null() {
+                        continue;
+                    }
+                    let key = k.to_string();
+                    let i = match group_index.get(&key).copied() {
+                        Some(i) => i,
+                        None => {
+                            let i = groups.len();
+                            group_index.insert(key, i);
+                            groups.push((k.clone(), Vec::new()));
+                            i
+                        }
+                    };
+                    if let Some(v) = row.doc.get(agg_field)
+                        && !v.is_null()
+                    {
+                        groups[i].1.push(v.clone());
+                    }
+                }
+                let mut out: Vec<Value> = groups
+                    .into_iter()
+                    .map(|(k, vs)| {
+                        let value = if vs.is_empty() {
+                            Value::Null
+                        } else {
+                            apply_aggregate(agg.op, &vs, agg_field_pg)
+                        };
+                        let mut obj = Map::new();
+                        obj.insert("key".to_string(), k);
+                        obj.insert("value".to_string(), value);
+                        Value::Object(obj)
+                    })
+                    .collect();
+                out.sort_by(|a, b| compare_index_values(&a["key"], &b["key"], group_field_pg));
+                let out: Vec<Value> = out.into_iter().take(MAX_TAKE).collect();
+                return Ok(Value::Array(out));
+            }
+            // Scalar aggregate.
+            let values: Vec<Value> = filtered
+                .iter()
+                .filter_map(|row| row.doc.get(agg_field))
+                .filter(|v| !v.is_null())
+                .cloned()
+                .collect();
+            if values.is_empty() {
+                return Ok(Value::Null);
+            }
+            return Ok(apply_aggregate(agg.op, &values, agg_field_pg));
         }
 
         // Sort keys: unbound index fields (after the eq prefix), then
@@ -1993,6 +2276,50 @@ pub fn compare_index_values(a: &Value, b: &Value, pg: PgType) -> std::cmp::Order
     }
 }
 
+/// Applies one aggregate op over a non-empty slice of values, mirroring the
+/// server's SQL semantics and ts `applyAggregate` (`in_memory.ts:432-449`).
+/// SUM/AVG reduce numerically (`int64` values are decimal strings → parsed);
+/// MIN/MAX pick the smallest/largest per [`compare_index_values`], so a string
+/// field's extremes match Postgres lexicographic ordering. Only called on
+/// non-empty input — the caller maps an empty set to JSON null.
+pub fn apply_aggregate(op: AggregateOp, values: &[Value], pg: PgType) -> Value {
+    match op {
+        AggregateOp::Sum | AggregateOp::Avg => {
+            let sum: f64 = values.iter().filter_map(|v| numeric_value(v, pg)).sum();
+            let result = if matches!(op, AggregateOp::Avg) {
+                sum / values.len() as f64
+            } else {
+                sum
+            };
+            serde_json::Number::from_f64(result)
+                .map(Value::Number)
+                .unwrap_or(Value::Null)
+        }
+        AggregateOp::Min | AggregateOp::Max => {
+            let want_less = matches!(op, AggregateOp::Min);
+            let mut best = &values[0];
+            for v in &values[1..] {
+                let cmp = compare_index_values(v, best, pg);
+                if (want_less && cmp == std::cmp::Ordering::Less)
+                    || (!want_less && cmp == std::cmp::Ordering::Greater)
+                {
+                    best = v;
+                }
+            }
+            best.clone()
+        }
+    }
+}
+
+/// Parses an index value to `f64` for SUM/AVG. `Number` columns are JSON
+/// numbers; `int64` columns are decimal strings on the wire and in this harness.
+fn numeric_value(v: &Value, pg: PgType) -> Option<f64> {
+    match pg {
+        PgType::Int64 => v.as_str().and_then(|s| s.parse::<f64>().ok()),
+        _ => v.as_f64(),
+    }
+}
+
 /// Merges a stored row with its system fields — a port of server `merge_doc`
 /// and the TS `mergeDoc` (`ts-client/src/in_memory.ts:1154-1156`). The stored
 /// `doc` is the user-written payload; system fields (`_id`/`_creationTime`/
@@ -2480,7 +2807,7 @@ mod tests {
     use crate::mutation::Mutation;
     use crate::query::{Paginate, Paginated, TableQuery};
     use crate::schema::{Schema, Table};
-    use crate::wire::FilterExpr;
+    use crate::wire::{AggregateOp, AggregateSpec, FilterExpr};
     use serde_json::json;
     use std::collections::BTreeMap;
     use std::sync::{Arc, Mutex};
@@ -3873,7 +4200,7 @@ mod tests {
             // unique + order
             (
                 base_index_query(true, false, false, true, None),
-                "unique cannot be combined with take or order",
+                "unique cannot be combined with take, order",
             ),
             // first + unique
             (
@@ -3916,6 +4243,467 @@ mod tests {
             assert!(
                 err.message.contains(needle),
                 "case '{needle}' missing needle: got {}",
+                err.message
+            );
+        }
+    }
+
+    // ---- query: distinct + aggregate terminals ---------------------
+    //
+    // Ports distinct/aggregate coverage from `ts-client/src/in_memory.ts`
+    // (`executeQuery` :1355-1462) and the server's `execute_query` arms. Both
+    // are standalone terminals over the index field immediately after the eq
+    // prefix; they compose only with index/eq/range/filter.
+
+    /// Seeds `items` with duplicated `order` values {3,1,2,1,2} (all "todo") so
+    /// distinct dedupe and asc sort are both observable.
+    async fn seed_dup_orders(c: &mut InMemoryRtDbClient) {
+        for order in [3_i64, 1, 2, 1, 2] {
+            c.mutate(
+                &Mutation::new()
+                    .insert(
+                        "items",
+                        json!({"name": format!("n{order}"), "status": "todo", "order": order}),
+                    )
+                    .build(),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+    }
+
+    /// Seeds `items` with two statuses so a `groupBy` over
+    /// `by_status_and_order` has multiple groups: todo {1,2}, done {3,4}.
+    async fn seed_group_rows(c: &mut InMemoryRtDbClient) {
+        for (status, order) in [("todo", 1_i64), ("todo", 2), ("done", 3), ("done", 4)] {
+            c.mutate(
+                &Mutation::new()
+                    .insert(
+                        "items",
+                        json!({"name": "n", "status": status, "order": order}),
+                    )
+                    .build(),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+    }
+
+    /// Seeds `items` with `status` values {charlie, alpha, bravo} so non-numeric
+    /// MIN/MAX pick lexicographic extremes.
+    async fn seed_status_rows(c: &mut InMemoryRtDbClient) {
+        for (i, status) in ["charlie", "alpha", "bravo"].iter().enumerate() {
+            c.mutate(
+                &Mutation::new()
+                    .insert(
+                        "items",
+                        json!({"name": "n", "status": status, "order": i as i64}),
+                    )
+                    .build(),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn distinct_returns_unique_index_field_values_sorted_asc() {
+        let mut c = new_client();
+        seed_query_rows(&mut c).await; // orders 3, 1, 2 — all "todo"
+        let v = c
+            .run_query(
+                &TableQuery::new("items")
+                    .with_index("by_status_and_order", &[json!("todo")])
+                    .distinct(),
+            )
+            .expect("distinct ok");
+        assert_eq!(v, json!([1, 2, 3]));
+    }
+
+    #[tokio::test]
+    async fn distinct_dedupes_repeated_values() {
+        let mut c = new_client();
+        seed_dup_orders(&mut c).await; // orders 3,1,2,1,2
+        let v = c
+            .run_query(
+                &TableQuery::new("items")
+                    .with_index("by_status_and_order", &[json!("todo")])
+                    .distinct(),
+            )
+            .expect("distinct ok");
+        assert_eq!(v, json!([1, 2, 3]));
+    }
+
+    #[tokio::test]
+    async fn distinct_composes_with_range_bound() {
+        let mut c = new_client();
+        seed_query_rows(&mut c).await; // orders 3, 1, 2
+        let v = c
+            .run_query(
+                &TableQuery::new("items")
+                    .with_index("by_status_and_order", &[json!("todo")])
+                    .gte(2)
+                    .distinct(),
+            )
+            .expect("distinct+range ok");
+        assert_eq!(v, json!([2, 3]));
+    }
+
+    #[tokio::test]
+    async fn distinct_empty_matching_set_returns_empty_array() {
+        let mut c = new_client();
+        seed_query_rows(&mut c).await;
+        let v = c
+            .run_query(
+                &TableQuery::new("items")
+                    .with_index("by_status_and_order", &[json!("missing")])
+                    .distinct(),
+            )
+            .expect("distinct ok");
+        assert_eq!(v, json!([]));
+    }
+
+    #[tokio::test]
+    async fn distinct_requires_an_index_field_beyond_eq_prefix() {
+        let c = new_client();
+        // eq prefix [todo, 1] consumes both index fields of by_status_and_order.
+        let err = c
+            .run_query(
+                &TableQuery::new("items")
+                    .with_index("by_status_and_order", &[json!("todo"), json!(1)])
+                    .distinct(),
+            )
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::BadRequest);
+        assert!(
+            err.message
+                .contains("distinct requires an index field beyond the eq prefix"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn distinct_rejects_conflicting_terminals() {
+        // Ownership mirrors the server's check order (query.rs :676-706): get,
+        // unique, first, count are validated before distinct, so distinct+
+        // {get,unique,first,count} surfaces *that* terminal's message; distinct
+        // owns only take/order/aggregate.
+        let c = new_client();
+        let base = || Query {
+            table: "items".into(),
+            index: Some("by_status_and_order".into()),
+            eq: vec![json!("todo")],
+            ..Default::default()
+        };
+        let cases: &[(Query, &str)] = &[
+            (
+                Query {
+                    distinct: true,
+                    take: Some(1),
+                    ..base()
+                },
+                "distinct cannot be combined with take",
+            ),
+            (
+                Query {
+                    distinct: true,
+                    order: Some(Order::Asc),
+                    ..base()
+                },
+                "distinct cannot be combined with order",
+            ),
+            (
+                Query {
+                    distinct: true,
+                    aggregate: Some(AggregateSpec {
+                        op: AggregateOp::Sum,
+                        group_by: false,
+                    }),
+                    ..base()
+                },
+                "distinct cannot be combined with aggregate",
+            ),
+            (
+                Query {
+                    distinct: true,
+                    unique: true,
+                    ..base()
+                },
+                "unique cannot be combined with take, order, distinct, or aggregate",
+            ),
+            (
+                Query {
+                    distinct: true,
+                    first: true,
+                    ..base()
+                },
+                "first cannot be combined with distinct",
+            ),
+            (
+                Query {
+                    distinct: true,
+                    count: true,
+                    ..base()
+                },
+                "count cannot be combined with distinct",
+            ),
+            (
+                Query {
+                    distinct: true,
+                    get: Some("x".into()),
+                    ..base()
+                },
+                "get cannot be combined with",
+            ),
+        ];
+        for (q, needle) in cases {
+            let err = c.run_query(q).unwrap_err();
+            assert_eq!(err.code, ErrorCode::BadRequest, "case '{needle}': {err:?}");
+            assert!(
+                err.message.contains(needle),
+                "case '{needle}': got {}",
+                err.message
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn aggregate_sum_avg_min_max_over_numeric_field() {
+        let mut c = new_client();
+        seed_query_rows(&mut c).await; // orders 3, 1, 2
+
+        let sum = c
+            .run_query(
+                &TableQuery::new("items")
+                    .with_index("by_status_and_order", &[json!("todo")])
+                    .aggregate(AggregateOp::Sum, false),
+            )
+            .expect("sum");
+        assert_eq!(sum.as_f64(), Some(6.0));
+        let avg = c
+            .run_query(
+                &TableQuery::new("items")
+                    .with_index("by_status_and_order", &[json!("todo")])
+                    .aggregate(AggregateOp::Avg, false),
+            )
+            .expect("avg");
+        assert_eq!(avg.as_f64(), Some(2.0));
+        let min = c
+            .run_query(
+                &TableQuery::new("items")
+                    .with_index("by_status_and_order", &[json!("todo")])
+                    .aggregate(AggregateOp::Min, false),
+            )
+            .expect("min");
+        assert_eq!(min.as_f64(), Some(1.0));
+        let max = c
+            .run_query(
+                &TableQuery::new("items")
+                    .with_index("by_status_and_order", &[json!("todo")])
+                    .aggregate(AggregateOp::Max, false),
+            )
+            .expect("max");
+        assert_eq!(max.as_f64(), Some(3.0));
+    }
+
+    #[tokio::test]
+    async fn aggregate_empty_matching_set_returns_null() {
+        let mut c = new_client();
+        seed_query_rows(&mut c).await;
+        let v = c
+            .run_query(
+                &TableQuery::new("items")
+                    .with_index("by_status_and_order", &[json!("missing")])
+                    .aggregate(AggregateOp::Sum, false),
+            )
+            .expect("aggregate ok");
+        assert!(v.is_null(), "empty aggregate is null, got: {v}");
+    }
+
+    #[tokio::test]
+    async fn aggregate_sum_requires_a_numeric_field() {
+        let mut c = new_client();
+        seed_status_rows(&mut c).await;
+        // by_status [status], empty eq → agg field is `status` (a string).
+        let err = c
+            .run_query(
+                &TableQuery::new("items")
+                    .with_index("by_status", &[])
+                    .aggregate(AggregateOp::Sum, false),
+            )
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::BadRequest);
+        assert!(
+            err.message
+                .contains("aggregate op sum requires a numeric index field"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn aggregate_min_max_over_string_field_are_lexicographic() {
+        let mut c = new_client();
+        seed_status_rows(&mut c).await; // statuses charlie, alpha, bravo
+        let min = c
+            .run_query(
+                &TableQuery::new("items")
+                    .with_index("by_status", &[])
+                    .aggregate(AggregateOp::Min, false),
+            )
+            .expect("min");
+        assert_eq!(min.as_str(), Some("alpha"));
+        let max = c
+            .run_query(
+                &TableQuery::new("items")
+                    .with_index("by_status", &[])
+                    .aggregate(AggregateOp::Max, false),
+            )
+            .expect("max");
+        assert_eq!(max.as_str(), Some("charlie"));
+    }
+
+    #[tokio::test]
+    async fn aggregate_group_by_groups_and_aggregates() {
+        let mut c = new_client();
+        seed_group_rows(&mut c).await; // todo{1,2}, done{3,4}
+        let v = c
+            .run_query(
+                &TableQuery::new("items")
+                    .with_index("by_status_and_order", &[])
+                    .aggregate(AggregateOp::Sum, true),
+            )
+            .expect("groupBy ok");
+        let arr = v.as_array().expect("array of {key,value}");
+        assert_eq!(arr.len(), 2);
+        // Groups are ordered by key ascending: "done" < "todo".
+        assert_eq!(arr[0]["key"].as_str(), Some("done"));
+        assert_eq!(arr[0]["value"].as_f64(), Some(7.0));
+        assert_eq!(arr[1]["key"].as_str(), Some("todo"));
+        assert_eq!(arr[1]["value"].as_f64(), Some(3.0));
+    }
+
+    #[tokio::test]
+    async fn aggregate_group_by_requires_two_index_fields_beyond_prefix() {
+        let c = new_client();
+        // by_status [status], empty eq → only one field beyond the prefix.
+        let err = c
+            .run_query(
+                &TableQuery::new("items")
+                    .with_index("by_status", &[])
+                    .aggregate(AggregateOp::Sum, true),
+            )
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::BadRequest);
+        assert!(
+            err.message
+                .contains("aggregate groupBy requires two index fields beyond the eq prefix"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn aggregate_requires_an_index_field_beyond_eq_prefix() {
+        let c = new_client();
+        // eq prefix [todo, 1] consumes both fields of by_status_and_order.
+        let err = c
+            .run_query(
+                &TableQuery::new("items")
+                    .with_index("by_status_and_order", &[json!("todo"), json!(1)])
+                    .aggregate(AggregateOp::Min, false),
+            )
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::BadRequest);
+        assert!(
+            err.message
+                .contains("aggregate requires an index field beyond the eq prefix"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn aggregate_rejects_conflicting_terminals() {
+        let c = new_client();
+        let base = || Query {
+            table: "items".into(),
+            index: Some("by_status_and_order".into()),
+            eq: vec![json!("todo")],
+            ..Default::default()
+        };
+        let sum = || AggregateSpec {
+            op: AggregateOp::Sum,
+            group_by: false,
+        };
+        let cases: &[(Query, &str)] = &[
+            (
+                Query {
+                    aggregate: Some(sum()),
+                    take: Some(1),
+                    ..base()
+                },
+                "aggregate cannot be combined with take",
+            ),
+            (
+                Query {
+                    aggregate: Some(sum()),
+                    order: Some(Order::Asc),
+                    ..base()
+                },
+                "aggregate cannot be combined with order",
+            ),
+            (
+                Query {
+                    aggregate: Some(sum()),
+                    unique: true,
+                    ..base()
+                },
+                "unique cannot be combined with take, order, distinct, or aggregate",
+            ),
+            (
+                Query {
+                    aggregate: Some(sum()),
+                    first: true,
+                    ..base()
+                },
+                "first cannot be combined with aggregate",
+            ),
+            (
+                Query {
+                    aggregate: Some(sum()),
+                    count: true,
+                    ..base()
+                },
+                "count cannot be combined with aggregate",
+            ),
+            (
+                Query {
+                    aggregate: Some(sum()),
+                    distinct: true,
+                    ..base()
+                },
+                "distinct cannot be combined with aggregate",
+            ),
+            (
+                Query {
+                    aggregate: Some(sum()),
+                    get: Some("x".into()),
+                    ..base()
+                },
+                "get cannot be combined with",
+            ),
+        ];
+        for (q, needle) in cases {
+            let err = c.run_query(q).unwrap_err();
+            assert_eq!(err.code, ErrorCode::BadRequest, "case '{needle}': {err:?}");
+            assert!(
+                err.message.contains(needle),
+                "case '{needle}': got {}",
                 err.message
             );
         }

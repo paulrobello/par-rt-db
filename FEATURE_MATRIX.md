@@ -307,9 +307,7 @@ test harness (`par_rt_db.in_memory` + `tick()`), and the full admin control plan
 (allowlist/admins/metrics/hot-config/ops-feed/tokens/schema/stats); ts-client `mutate()`
 returns a typed `StepResult` with an `idempotencyKey` option (`mutId` deprecated); rust-client
 `vector_search`/`hybrid_search` take opts structs. Minor residual (in-memory test harnesses only — the live server and all four
-clients' wire/DSL implement both): only the **ts-client** harness evaluates the
-`distinct`/`aggregate` terminals. The **rust-client** harness carries the `Query`
-fields (`query.rs`) but `run_query` never reads them, so a `distinct`/`aggregate`
-query silently returns the matching docs (collect) instead of the right shape — a
-correctness bug, not a clean rejection. The **python-client** harness cleanly
-rejects both with `BAD_REQUEST`. Backlog: bring rust + python to ts parity. Cross-language API-ergonomic differences (keyword args, casing) are intentional, not gaps.
+clients' wire/DSL implement both): the **ts-client** and **rust-client** harnesses
+evaluate the `distinct`/`aggregate` terminals; the **python-client** harness
+cleanly rejects both with `BAD_REQUEST`. Backlog: port the eval to the python
+harness for full parity. Cross-language API-ergonomic differences (keyword args, casing) are intentional, not gaps.
