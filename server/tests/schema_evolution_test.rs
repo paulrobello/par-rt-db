@@ -1,0 +1,97 @@
+mod common;
+
+use common::test_state;
+use rtdb_server::ddl::push_schema;
+use rtdb_server::error::ErrorCode;
+use rtdb_server::schema::{FieldType, IndexDef, SchemaDef, TableDef};
+use std::collections::BTreeMap;
+
+/// One table `items` whose `priority` is a string-literal union indexed by
+/// `by_priority` — mirrors the projects repo's `items.priority` field whose
+/// widening (low|medium|high -> +critical) blocked its deploy.
+fn priority_schema(variants: &[&str]) -> SchemaDef {
+    let union = FieldType::Union {
+        variants: variants
+            .iter()
+            .map(|v| FieldType::Literal {
+                value: serde_json::Value::String((*v).to_string()),
+            })
+            .collect(),
+    };
+    let mut fields = BTreeMap::new();
+    fields.insert("priority".to_string(), union);
+    let indexes = vec![IndexDef {
+        name: "by_priority".to_string(),
+        fields: vec!["priority".to_string()],
+        search: false,
+        vector: None,
+    }];
+    let mut tables = BTreeMap::new();
+    tables.insert(
+        "items".to_string(),
+        TableDef {
+            fields,
+            indexes,
+            owner_field: None,
+            collaborators_field: None,
+        },
+    );
+    SchemaDef { tables }
+}
+
+async fn fresh_empty_db(state: &std::sync::Arc<rtdb_server::AppState>) -> String {
+    let name = format!("t{}", uuid::Uuid::now_v7().simple());
+    rtdb_server::db::create_database(&state.pool, &name)
+        .await
+        .expect("create database");
+    name
+}
+
+#[tokio::test]
+async fn widening_a_literal_union_push_succeeds() {
+    let state = test_state().await;
+    let db = fresh_empty_db(&state).await;
+    push_schema(
+        &state.pool,
+        &db,
+        priority_schema(&["low", "medium", "high"]),
+    )
+    .await
+    .expect("initial push");
+    // Adding a variant is a safe widening: accepted additively, no migration,
+    // and the indexed f_priority text column is unchanged.
+    push_schema(
+        &state.pool,
+        &db,
+        priority_schema(&["low", "medium", "high", "critical"]),
+    )
+    .await
+    .expect("widened push");
+}
+
+#[tokio::test]
+async fn narrowing_a_literal_union_push_is_rejected() {
+    let state = test_state().await;
+    let db = fresh_empty_db(&state).await;
+    push_schema(
+        &state.pool,
+        &db,
+        priority_schema(&["low", "medium", "high", "critical"]),
+    )
+    .await
+    .expect("initial push");
+    let err = push_schema(
+        &state.pool,
+        &db,
+        priority_schema(&["low", "medium", "high"]),
+    )
+    .await
+    .expect_err("narrowing must be rejected");
+    assert_eq!(err.code, ErrorCode::BadRequest);
+    assert!(
+        err.message
+            .contains("changed type of field 'items.priority'"),
+        "{}",
+        err.message
+    );
+}
