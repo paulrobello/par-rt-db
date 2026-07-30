@@ -306,8 +306,6 @@ parity** (2026-07-29): python ships optimistic updates (port from rust), an in-m
 test harness (`par_rt_db.in_memory` + `tick()`), and the full admin control plane
 (allowlist/admins/metrics/hot-config/ops-feed/tokens/schema/stats); ts-client `mutate()`
 returns a typed `StepResult` with an `idempotencyKey` option (`mutId` deprecated); rust-client
-`vector_search`/`hybrid_search` take opts structs. Minor residual (in-memory test harnesses only — the live server and all four
-clients' wire/DSL implement both): the **ts-client** and **rust-client** harnesses
-evaluate the `distinct`/`aggregate` terminals; the **python-client** harness
-cleanly rejects both with `BAD_REQUEST`. Backlog: port the eval to the python
-harness for full parity. Cross-language API-ergonomic differences (keyword args, casing) are intentional, not gaps.
+`vector_search`/`hybrid_search` take opts structs. All four clients' in-memory test
+harnesses evaluate the `distinct`/`aggregate` terminals (the live server is the
+source of truth for both). Cross-language API-ergonomic differences (keyword args, casing) are intentional, not gaps.

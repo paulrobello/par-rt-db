@@ -86,6 +86,7 @@ from .schema import (
     _FVector,
 )
 from .wire import (
+    AggregateOp,
     FilterExpr,
     ScheduleInfo,
     ScheduleWhen,
@@ -350,6 +351,8 @@ class InMemoryRtDbClient:
                 or unique
                 or first
                 or count
+                or q.distinct
+                or q.aggregate is not None
                 or q.paginate is not None
                 or q.filter is not None
                 or q.search is not None
@@ -358,17 +361,27 @@ class InMemoryRtDbClient:
                 raise RtDbError(
                     ErrorCode.BAD_REQUEST,
                     "get cannot be combined with index, eq, range bounds, order, take, "
-                    "unique, first, count, paginate, filter, search, or vector search",
+                    "unique, first, count, distinct, aggregate, paginate, filter, search, "
+                    "or vector search",
                 )
             return self.get(q.table, q.get)
 
         # Conflicting-terminal guards.
-        if unique and (q.take is not None or q.order is not None):
-            raise RtDbError(ErrorCode.BAD_REQUEST, "unique cannot be combined with take or order")
+        if unique and (
+            q.take is not None or q.order is not None or q.distinct or q.aggregate is not None
+        ):
+            raise RtDbError(
+                ErrorCode.BAD_REQUEST,
+                "unique cannot be combined with take, order, distinct, or aggregate",
+            )
         if first and unique:
             raise RtDbError(ErrorCode.BAD_REQUEST, "first cannot be combined with unique")
         if first and q.take is not None:
             raise RtDbError(ErrorCode.BAD_REQUEST, "first cannot be combined with take")
+        if first and q.distinct:
+            raise RtDbError(ErrorCode.BAD_REQUEST, "first cannot be combined with distinct")
+        if first and q.aggregate is not None:
+            raise RtDbError(ErrorCode.BAD_REQUEST, "first cannot be combined with aggregate")
         if count and unique:
             raise RtDbError(ErrorCode.BAD_REQUEST, "count cannot be combined with unique")
         if count and q.take is not None:
@@ -377,6 +390,10 @@ class InMemoryRtDbClient:
             raise RtDbError(ErrorCode.BAD_REQUEST, "count cannot be combined with first")
         if count and q.order is not None:
             raise RtDbError(ErrorCode.BAD_REQUEST, "count cannot be combined with order")
+        if count and q.distinct:
+            raise RtDbError(ErrorCode.BAD_REQUEST, "count cannot be combined with distinct")
+        if count and q.aggregate is not None:
+            raise RtDbError(ErrorCode.BAD_REQUEST, "count cannot be combined with aggregate")
         if q.paginate is not None:
             if count:
                 raise RtDbError(ErrorCode.BAD_REQUEST, "paginate cannot be combined with count")
@@ -386,6 +403,10 @@ class InMemoryRtDbClient:
                 raise RtDbError(ErrorCode.BAD_REQUEST, "paginate cannot be combined with first")
             if q.take is not None:
                 raise RtDbError(ErrorCode.BAD_REQUEST, "paginate cannot be combined with take")
+            if q.distinct:
+                raise RtDbError(ErrorCode.BAD_REQUEST, "paginate cannot be combined with distinct")
+            if q.aggregate is not None:
+                raise RtDbError(ErrorCode.BAD_REQUEST, "paginate cannot be combined with aggregate")
         if q.gt is not None and q.gte is not None:
             raise RtDbError(ErrorCode.BAD_REQUEST, "gt and gte cannot both be set")
         if q.lt is not None and q.lte is not None:
@@ -393,18 +414,47 @@ class InMemoryRtDbClient:
         if q.take is not None and q.take > MAX_TAKE:
             raise RtDbError(ErrorCode.BAD_REQUEST, f"take exceeds maximum of {MAX_TAKE}")
 
-        # distinct/aggregate are not implemented in this harness — reject
-        # explicitly rather than silently falling through to collect.
+        # `distinct`/`aggregate` are standalone terminals (like `count`): they
+        # compose only with index/eq/range/filter. `get`/`unique`/`first`/`count`
+        # rejected their own combinations above (validated first, matching the
+        # server's check order), so these blocks reject the remaining peers each
+        # terminal owns — mirroring the server's DISTINCT/AGGREGATE_INCOMPATIBLES.
         if q.distinct:
-            raise RtDbError(
-                ErrorCode.BAD_REQUEST,
-                "distinct is not supported by the in-memory harness",
-            )
+            if q.take is not None:
+                raise RtDbError(ErrorCode.BAD_REQUEST, "distinct cannot be combined with take")
+            if q.order is not None:
+                raise RtDbError(ErrorCode.BAD_REQUEST, "distinct cannot be combined with order")
+            if q.aggregate is not None:
+                raise RtDbError(ErrorCode.BAD_REQUEST, "distinct cannot be combined with aggregate")
+            if q.paginate is not None:
+                raise RtDbError(ErrorCode.BAD_REQUEST, "distinct cannot be combined with paginate")
+            if q.search is not None:
+                raise RtDbError(ErrorCode.BAD_REQUEST, "distinct cannot be combined with search")
+            if q.vector_search is not None:
+                raise RtDbError(
+                    ErrorCode.BAD_REQUEST, "distinct cannot be combined with vector search"
+                )
+            if q.hybrid_search is not None:
+                raise RtDbError(
+                    ErrorCode.BAD_REQUEST, "distinct cannot be combined with hybrid search"
+                )
         if q.aggregate is not None:
-            raise RtDbError(
-                ErrorCode.BAD_REQUEST,
-                "aggregate is not supported by the in-memory harness",
-            )
+            if q.take is not None:
+                raise RtDbError(ErrorCode.BAD_REQUEST, "aggregate cannot be combined with take")
+            if q.order is not None:
+                raise RtDbError(ErrorCode.BAD_REQUEST, "aggregate cannot be combined with order")
+            if q.paginate is not None:
+                raise RtDbError(ErrorCode.BAD_REQUEST, "aggregate cannot be combined with paginate")
+            if q.search is not None:
+                raise RtDbError(ErrorCode.BAD_REQUEST, "aggregate cannot be combined with search")
+            if q.vector_search is not None:
+                raise RtDbError(
+                    ErrorCode.BAD_REQUEST, "aggregate cannot be combined with vector search"
+                )
+            if q.hybrid_search is not None:
+                raise RtDbError(
+                    ErrorCode.BAD_REQUEST, "aggregate cannot be combined with hybrid search"
+                )
 
         # `vectorSearch` terminal — no in-memory ranking; return an empty array
         # so the cascade agrees with the server without silently misranking.
@@ -542,6 +592,95 @@ class InMemoryRtDbClient:
 
         if count:
             return len(filtered)
+
+        # `distinct` terminal: unique values of the index field immediately
+        # after the eq prefix over the matching set, sorted ascending, capped by
+        # MAX_TAKE. Nulls are skipped (mirror WHERE "<col>" IS NOT NULL).
+        if q.distinct:
+            if index_def is None or len(typed_eq) >= len(index_def.fields):
+                raise RtDbError(
+                    ErrorCode.BAD_REQUEST,
+                    "distinct requires an index field beyond the eq prefix",
+                )
+            field = index_def.fields[len(typed_eq)]
+            field_pg = _pg_for_field(table_def, field)
+            seen: set[str] = set()
+            distinct_values: list[Any] = []
+            for row in filtered:
+                v = row.doc.get(field)
+                if v is None:
+                    continue
+                key = _dedupe_key(v)
+                if key not in seen:
+                    seen.add(key)
+                    distinct_values.append(v)
+            distinct_values.sort(key=cmp_to_key(lambda a, b: _compare_index_values(a, b, field_pg)))
+            return distinct_values[:MAX_TAKE]
+
+        # `aggregate` terminal: <OP> over the index field after the eq prefix
+        # (groupBy: group by that field, aggregate the next). Null agg values are
+        # skipped (SQL NULL semantics); an empty scalar set -> None; groups are
+        # ordered by key asc and capped by MAX_TAKE.
+        if q.aggregate is not None:
+            agg = q.aggregate
+            if index_def is None:
+                raise RtDbError(
+                    ErrorCode.BAD_REQUEST,
+                    "aggregate requires an index field beyond the eq prefix",
+                )
+            eq_len = len(typed_eq)
+            if agg.group_by:
+                if eq_len + 1 >= len(index_def.fields):
+                    raise RtDbError(
+                        ErrorCode.BAD_REQUEST,
+                        "aggregate groupBy requires two index fields beyond the eq prefix",
+                    )
+                group_field = index_def.fields[eq_len]
+                agg_field = index_def.fields[eq_len + 1]
+            else:
+                if eq_len >= len(index_def.fields):
+                    raise RtDbError(
+                        ErrorCode.BAD_REQUEST,
+                        "aggregate requires an index field beyond the eq prefix",
+                    )
+                group_field = None
+                agg_field = index_def.fields[eq_len]
+            agg_pg = _pg_for_field(table_def, agg_field)
+            if agg.op in (AggregateOp.SUM, AggregateOp.AVG) and agg_pg not in (_NUMBER, _INT64):
+                raise RtDbError(
+                    ErrorCode.BAD_REQUEST,
+                    f"aggregate op {agg.op} requires a numeric index field",
+                )
+            if group_field is not None:
+                group_pg = _pg_for_field(table_def, group_field)
+                groups: list[tuple[Any, list[Any]]] = []
+                group_index: dict[str, int] = {}
+                for row in filtered:
+                    k = row.doc.get(group_field)
+                    if k is None:
+                        continue
+                    key = _dedupe_key(k)
+                    i = group_index.get(key)
+                    if i is None:
+                        i = len(groups)
+                        group_index[key] = i
+                        groups.append((k, []))
+                    av = row.doc.get(agg_field)
+                    if av is not None:
+                        groups[i][1].append(av)
+                out: list[dict[str, Any]] = [
+                    {"key": k, "value": _apply_aggregate(agg.op, vs, agg_pg) if vs else None}
+                    for k, vs in groups
+                ]
+                out.sort(
+                    key=cmp_to_key(lambda a, b: _compare_index_values(a["key"], b["key"], group_pg))
+                )
+                return out[:MAX_TAKE]
+            agg_values = [row.doc.get(agg_field) for row in filtered]
+            agg_values = [v for v in agg_values if v is not None]
+            if not agg_values:
+                return None
+            return _apply_aggregate(agg.op, agg_values, agg_pg)
 
         # Sort keys: unbound index fields (after the eq prefix), then
         # _creationTime, then _id. The unique id tiebreaker makes the order total.
@@ -1345,6 +1484,41 @@ def _to_float(value: Any) -> float:
 def _is_number(value: Any) -> bool:
     """``True`` iff ``value`` is a JSON number (booleans excluded)."""
     return isinstance(value, float | int) and not isinstance(value, bool)
+
+
+def _apply_aggregate(op: str, values: list[Any], pg: _PgType) -> Any:
+    """Apply one aggregate op over a non-empty list of non-null values, mirroring
+    the server's SQL semantics and the TS/Rust harnesses. SUM/AVG reduce
+    numerically (int64 values are decimal strings -> parsed); MIN/MAX pick the
+    smallest/largest per :func:`_compare_index_values`, so a string field's
+    extremes match Postgres lexicographic ordering. Only called on non-empty
+    input — the caller maps an empty set to ``None``."""
+    if op in (AggregateOp.SUM, AggregateOp.AVG):
+        nums = [_to_numeric(v, pg) for v in values]
+        total = sum(nums)
+        return total / len(values) if op == AggregateOp.AVG else total
+    want_min = op == AggregateOp.MIN
+    best = values[0]
+    for v in values[1:]:
+        c = _compare_index_values(v, best, pg)
+        if c < 0 if want_min else c > 0:
+            best = v
+    return best
+
+
+def _to_numeric(v: Any, pg: _PgType) -> float | int:
+    """Reduce one index value to a number for SUM/AVG. ``_INT64`` values are
+    decimal strings on the wire -> parsed to int; ``_NUMBER`` values are floats."""
+    if pg == _INT64:
+        return _parse_i64(v)
+    return _to_float(v)
+
+
+def _dedupe_key(v: Any) -> str:
+    """Canonical JSON key so equal scalars (and equal compound values) share a
+    key. Distinct/group keys are always index fields (scalars), so this reduces
+    to the scalar's string form in practice."""
+    return json.dumps(v, sort_keys=True, separators=(",", ":"))
 
 
 def _dir_order(o: int, direction: str) -> int:

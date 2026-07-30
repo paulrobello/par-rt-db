@@ -10,7 +10,7 @@ and ``tick`` firing a due scheduled job (and skipping not-yet-due / paused jobs)
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 import pytest
 from pydantic import TypeAdapter
@@ -22,8 +22,9 @@ from par_rt_db.in_memory import (
     InMemoryRtDbClientOptions,
     is_hex_id,
 )
+from par_rt_db.query import Query
 from par_rt_db.schema import Schema, t
-from par_rt_db.wire import ScheduleWhen
+from par_rt_db.wire import AggregateSpec, ScheduleWhen
 
 _when = TypeAdapter(ScheduleWhen)
 
@@ -292,6 +293,206 @@ def test_run_returns_typed_results_via_parse_result() -> None:
     assert isinstance(page, Paginated)
     assert len(page.docs) == 2
     assert page.next_cursor is None
+
+
+# ---------------------------------------------------------------------------
+# queries: distinct / aggregate terminals
+# ---------------------------------------------------------------------------
+
+
+def _seed_orders(c: InMemoryRtDbClient, orders: list[int], status: str = "todo") -> None:
+    for order in orders:
+        c.mutate(
+            Mutation.builder()
+            .insert("items", {"name": f"n{order}", "status": status, "order": order})
+            .build()
+        )
+
+
+def test_distinct_returns_unique_index_field_values_sorted_asc() -> None:
+    c = _new_client()
+    _seed_orders(c, [3, 1, 2])
+    v = c.run_query(
+        TableQuery("items").with_index("by_status_and_order").eq("todo").distinct().build()
+    )
+    assert v == [1, 2, 3]
+
+
+def test_distinct_dedupes_repeated_values() -> None:
+    c = _new_client()
+    _seed_orders(c, [3, 1, 2, 1, 2])
+    v = c.run_query(
+        TableQuery("items").with_index("by_status_and_order").eq("todo").distinct().build()
+    )
+    assert v == [1, 2, 3]
+
+
+def test_distinct_composes_with_range_bound() -> None:
+    c = _new_client()
+    _seed_orders(c, [3, 1, 2])
+    v = c.run_query(
+        TableQuery("items").with_index("by_status_and_order").eq("todo").gte(2).distinct().build()
+    )
+    assert v == [2, 3]
+
+
+def test_distinct_empty_matching_set_returns_empty_list() -> None:
+    c = _new_client()
+    _seed_orders(c, [3, 1, 2])
+    v = c.run_query(
+        TableQuery("items").with_index("by_status_and_order").eq("missing").distinct().build()
+    )
+    assert v == []
+
+
+def test_distinct_requires_an_index_field_beyond_eq_prefix() -> None:
+    c = _new_client()
+    with pytest.raises(RtDbError) as ei:
+        c.run_query(
+            TableQuery("items").with_index("by_status_and_order").eq("todo", 1).distinct().build()
+        )
+    assert ei.value.code is ErrorCode.BAD_REQUEST
+    assert "distinct requires an index field beyond the eq prefix" in ei.value.message
+
+
+def test_distinct_rejects_conflicting_terminals() -> None:
+    # Ownership mirrors the server's check order: get/unique/first/count are
+    # validated before distinct, so distinct+{get,unique,first,count} surfaces
+    # that terminal's message; distinct owns take/order/aggregate.
+    c = _new_client()
+
+    def base(**kw: Any) -> Query:
+        return Query(table="items", index="by_status_and_order", eq=["todo"], **kw)
+
+    sum_spec = AggregateSpec(op="sum")
+    cases: list[tuple[Query, str]] = [
+        (base(distinct=True, take=1), "distinct cannot be combined with take"),
+        (base(distinct=True, order="asc"), "distinct cannot be combined with order"),
+        (base(distinct=True, aggregate=sum_spec), "distinct cannot be combined with aggregate"),
+        (
+            base(distinct=True, unique=True),
+            "unique cannot be combined with take, order, distinct, or aggregate",
+        ),
+        (base(distinct=True, first=True), "first cannot be combined with distinct"),
+        (base(distinct=True, count=True), "count cannot be combined with distinct"),
+        (base(distinct=True, get="x"), "get cannot be combined with"),
+    ]
+    for q, needle in cases:
+        with pytest.raises(RtDbError) as ei:
+            c.run_query(q)
+        assert ei.value.code is ErrorCode.BAD_REQUEST, f"case {needle!r}: {ei.value.message}"
+        assert needle in ei.value.message, f"case {needle!r}: got {ei.value.message}"
+
+
+def test_aggregate_sum_avg_min_max_over_numeric_field() -> None:
+    c = _new_client()
+    _seed_orders(c, [3, 1, 2])
+
+    def agg(op: Literal["sum", "avg", "min", "max"]) -> Any:
+        return c.run_query(
+            TableQuery("items").with_index("by_status_and_order").eq("todo").aggregate(op).build()
+        )
+
+    assert agg("sum") == 6
+    assert agg("avg") == 2.0
+    assert agg("min") == 1
+    assert agg("max") == 3
+
+
+def test_aggregate_empty_matching_set_returns_none() -> None:
+    c = _new_client()
+    _seed_orders(c, [3, 1, 2])
+    v = c.run_query(
+        TableQuery("items").with_index("by_status_and_order").eq("missing").aggregate("sum").build()
+    )
+    assert v is None
+
+
+def test_aggregate_sum_requires_a_numeric_field() -> None:
+    c = _new_client()
+    _seed_orders(c, [1])
+    with pytest.raises(RtDbError) as ei:
+        c.run_query(TableQuery("items").with_index("by_status").aggregate("sum").build())
+    assert ei.value.code is ErrorCode.BAD_REQUEST
+    assert "aggregate op sum requires a numeric index field" in ei.value.message
+
+
+def test_aggregate_min_max_over_string_field_are_lexicographic() -> None:
+    c = _new_client()
+    for i, status in enumerate(["charlie", "alpha", "bravo"]):
+        c.mutate(
+            Mutation.builder().insert("items", {"name": "n", "status": status, "order": i}).build()
+        )
+    idx = TableQuery("items").with_index("by_status")
+    assert c.run_query(idx.aggregate("min").build()) == "alpha"
+    assert c.run_query(idx.aggregate("max").build()) == "charlie"
+
+
+def test_aggregate_group_by_groups_and_aggregates() -> None:
+    c = _new_client()
+    for status, order in [("todo", 1), ("todo", 2), ("done", 3), ("done", 4)]:
+        c.mutate(
+            Mutation.builder()
+            .insert("items", {"name": "n", "status": status, "order": order})
+            .build()
+        )
+    v = c.run_query(
+        TableQuery("items")
+        .with_index("by_status_and_order")
+        .aggregate("sum", group_by=True)
+        .build()
+    )
+    assert v == [{"key": "done", "value": 7}, {"key": "todo", "value": 3}]
+
+
+def test_aggregate_group_by_requires_two_index_fields_beyond_prefix() -> None:
+    c = _new_client()
+    with pytest.raises(RtDbError) as ei:
+        c.run_query(
+            TableQuery("items").with_index("by_status").aggregate("sum", group_by=True).build()
+        )
+    assert ei.value.code is ErrorCode.BAD_REQUEST
+    assert "aggregate groupBy requires two index fields beyond the eq prefix" in ei.value.message
+
+
+def test_aggregate_requires_an_index_field_beyond_eq_prefix() -> None:
+    c = _new_client()
+    with pytest.raises(RtDbError) as ei:
+        c.run_query(
+            TableQuery("items")
+            .with_index("by_status_and_order")
+            .eq("todo", 1)
+            .aggregate("min")
+            .build()
+        )
+    assert ei.value.code is ErrorCode.BAD_REQUEST
+    assert "aggregate requires an index field beyond the eq prefix" in ei.value.message
+
+
+def test_aggregate_rejects_conflicting_terminals() -> None:
+    c = _new_client()
+
+    def base(**kw: Any) -> Query:
+        return Query(table="items", index="by_status_and_order", eq=["todo"], **kw)
+
+    sum_spec = AggregateSpec(op="sum")
+    cases: list[tuple[Query, str]] = [
+        (base(aggregate=sum_spec, take=1), "aggregate cannot be combined with take"),
+        (base(aggregate=sum_spec, order="asc"), "aggregate cannot be combined with order"),
+        (
+            base(aggregate=sum_spec, unique=True),
+            "unique cannot be combined with take, order, distinct, or aggregate",
+        ),
+        (base(aggregate=sum_spec, first=True), "first cannot be combined with aggregate"),
+        (base(aggregate=sum_spec, count=True), "count cannot be combined with aggregate"),
+        (base(aggregate=sum_spec, distinct=True), "distinct cannot be combined with aggregate"),
+        (base(aggregate=sum_spec, get="x"), "get cannot be combined with"),
+    ]
+    for q, needle in cases:
+        with pytest.raises(RtDbError) as ei:
+            c.run_query(q)
+        assert ei.value.code is ErrorCode.BAD_REQUEST, f"case {needle!r}: {ei.value.message}"
+        assert needle in ei.value.message, f"case {needle!r}: got {ei.value.message}"
 
 
 # ---------------------------------------------------------------------------
