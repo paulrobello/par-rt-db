@@ -48,7 +48,7 @@ use sha2::{Digest, Sha256};
 use crate::error::{ErrorCode, RtDbError};
 use crate::mutation::{Step, StepResult, Transaction};
 use crate::query::{Order, Query};
-use crate::schema::{FieldType, IndexDef, SchemaDef, TableDef};
+use crate::schema::{FieldType, IndexDef, SchemaDef, TableDef, is_widening_of};
 use crate::wire::{
     AggregateOp, FilterExpr, ScheduleInfo, ScheduleKind, ScheduleStatus, ScheduleWhen,
 };
@@ -1930,11 +1930,13 @@ pub fn validate_doc(table: &TableDef, doc: &Value) -> Result<(), RtDbError> {
 }
 
 /// Mirrors `server/src/ddl.rs::detect_destructive_changes`: walks `old` and
-/// rejects any removed table, removed/changed field, or removed/changed index
-/// with [`ErrorCode::BadRequest`]. Additive changes (new tables, new fields,
-/// new indexes, widening `Optional`/`Union`/`Any` inner types via a fresh
-/// push) pass through — `push_schema` then folds the new schema into
-/// `self.tables` without touching stored docs.
+/// rejects any removed table, removed field, changed field type (except a safe
+/// literal-union widening, which is additive and allowed — see
+/// `schema::is_widening_of`), or removed/changed index with
+/// [`ErrorCode::BadRequest`]. Additive changes (new tables, new fields, new
+/// indexes, widening `Optional`/`Union`/`Any` inner types via a fresh push) pass
+/// through — `push_schema` then folds the new schema into `self.tables` without
+/// touching stored docs.
 ///
 /// `FieldType`/`IndexDef`/`VectorIndexSpec` derive `PartialEq` (mirroring the
 /// server), so structural equality is a direct `!=`.
@@ -1954,7 +1956,10 @@ fn detect_destructive_changes(old: &SchemaDef, new: &SchemaDef) -> Result<(), Rt
                         format!("removed field '{table_name}.{field_name}'"),
                     ));
                 }
-                Some(new_field_type) if old_field_type != new_field_type => {
+                Some(new_field_type)
+                    if old_field_type != new_field_type
+                        && !is_widening_of(old_field_type, new_field_type) =>
+                {
                     return Err(RtDbError::new(
                         ErrorCode::BadRequest,
                         format!("changed type of field '{table_name}.{field_name}'"),
@@ -2927,6 +2932,102 @@ mod tests {
         )
         .await
         .expect("idempotency cache hit short-circuits with the cached results");
+    }
+
+    #[test]
+    fn push_schema_allows_widening_a_literal_union() {
+        // Server parity (schema::is_widening_of): a second push that widens a
+        // finite literal-union field — adding a variant — is additive and
+        // accepted, mirroring the live server's `pushSchema` behavior.
+        let union_field =
+            || FieldType::union([FieldType::literal("backlog"), FieldType::literal("done")]);
+        let mut c = InMemoryRtDbClient::new(InMemoryRtDbClientOptions::default());
+        let first = Schema::builder()
+            .table(
+                "items",
+                Table::new()
+                    .field("title", FieldType::String)
+                    .field("status", union_field()),
+            )
+            .build();
+        c.push_schema(&first).unwrap();
+        // Widen {backlog, done} -> {backlog, done, archived}.
+        let widened = Schema::builder()
+            .table(
+                "items",
+                Table::new().field("title", FieldType::String).field(
+                    "status",
+                    FieldType::union([
+                        FieldType::literal("backlog"),
+                        FieldType::literal("done"),
+                        FieldType::literal("archived"),
+                    ]),
+                ),
+            )
+            .build();
+        c.push_schema(&widened).expect("widening push succeeds");
+        // The widened field type is folded into the stored schema.
+        let stored = c.to_schema_json().expect("schema installed");
+        let status = stored.tables["items"]
+            .fields
+            .get("status")
+            .expect("status present");
+        match status {
+            FieldType::Union { variants } => assert_eq!(variants.len(), 3),
+            other => panic!("expected Union, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn push_schema_rejects_narrowing_a_literal_union() {
+        // Server parity: a second push that narrows a literal-union field —
+        // dropping a variant some rows may hold — is destructive and rejected
+        // with BadRequest and the "changed type of field" message.
+        let mut c = InMemoryRtDbClient::new(InMemoryRtDbClientOptions::default());
+        let first = Schema::builder()
+            .table(
+                "items",
+                Table::new().field("title", FieldType::String).field(
+                    "status",
+                    FieldType::union([
+                        FieldType::literal("backlog"),
+                        FieldType::literal("done"),
+                        FieldType::literal("archived"),
+                    ]),
+                ),
+            )
+            .build();
+        c.push_schema(&first).unwrap();
+        // Narrow {backlog, done, archived} -> {backlog, done}.
+        let narrowed = Schema::builder()
+            .table(
+                "items",
+                Table::new().field("title", FieldType::String).field(
+                    "status",
+                    FieldType::union([FieldType::literal("backlog"), FieldType::literal("done")]),
+                ),
+            )
+            .build();
+        let err = c.push_schema(&narrowed).unwrap_err();
+        assert!(
+            matches!(err.code, ErrorCode::BadRequest),
+            "got: {:?}",
+            err.code
+        );
+        assert!(
+            err.message.contains("changed type of field 'items.status'"),
+            "got: {err}"
+        );
+        // The rejected push left the prior (3-variant) schema in place.
+        let stored = c.to_schema_json().expect("schema still installed");
+        match stored.tables["items"]
+            .fields
+            .get("status")
+            .expect("status present")
+        {
+            FieldType::Union { variants } => assert_eq!(variants.len(), 3),
+            other => panic!("expected Union, got {other:?}"),
+        }
     }
 
     // ---- validate_doc --------------------------------------------------
