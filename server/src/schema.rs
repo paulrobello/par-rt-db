@@ -258,7 +258,7 @@ pub fn is_widening_of(old: &FieldType, new: &FieldType) -> bool {
 /// type (unions mixing in non-literal variants, scalars, `Optional`, `Object`).
 /// Variant order and duplicates are irrelevant — the result is used only for
 /// membership tests. `serde_json::Value` is `PartialEq` but not `Ord`/`Hash`, so
-/// this returns a `Vec<&Value>` for linear `.any()` checks rather than a set.
+/// this returns a `Vec<&Value>` for linear `.contains()` membership rather than a set.
 fn literal_set(ty: &FieldType) -> Option<Vec<&serde_json::Value>> {
     match ty {
         FieldType::Literal { value } => Some(vec![value]),
