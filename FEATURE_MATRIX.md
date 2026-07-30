@@ -306,6 +306,10 @@ parity** (2026-07-29): python ships optimistic updates (port from rust), an in-m
 test harness (`par_rt_db.in_memory` + `tick()`), and the full admin control plane
 (allowlist/admins/metrics/hot-config/ops-feed/tokens/schema/stats); ts-client `mutate()`
 returns a typed `StepResult` with an `idempotencyKey` option (`mutId` deprecated); rust-client
-`vector_search`/`hybrid_search` take opts structs. Minor residual: the python in-memory harness
-does not yet implement the `distinct`/`aggregate` query terminals (raises `BAD_REQUEST`); ts/rust
-do. Cross-language API-ergonomic differences (keyword args, casing) are intentional, not gaps.
+`vector_search`/`hybrid_search` take opts structs. Minor residual (in-memory test harnesses only — the live server and all four
+clients' wire/DSL implement both): only the **ts-client** harness evaluates the
+`distinct`/`aggregate` terminals. The **rust-client** harness carries the `Query`
+fields (`query.rs`) but `run_query` never reads them, so a `distinct`/`aggregate`
+query silently returns the matching docs (collect) instead of the right shape — a
+correctness bug, not a clean rejection. The **python-client** harness cleanly
+rejects both with `BAD_REQUEST`. Backlog: bring rust + python to ts parity. Cross-language API-ergonomic differences (keyword args, casing) are intentional, not gaps.
