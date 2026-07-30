@@ -129,6 +129,70 @@ def test_push_schema_additively_preserves_docs() -> None:
     assert len(docs) == 1
 
 
+def _field_schema(field_type: Any) -> Any:
+    """One-table, one-field schema used by the literal-widening parity tests."""
+    return Schema.builder().table("things", lambda tb: tb.field("val", field_type)).build()
+
+
+def test_push_schema_widens_literal_union_by_adding_a_variant() -> None:
+    c = InMemoryRtDbClient()
+    c.push_schema(_field_schema(t.union([t.literal("a"), t.literal("b")])))
+    # {a,b} -> {a,b,c} is additive widening, must succeed.
+    c.push_schema(_field_schema(t.union([t.literal("a"), t.literal("b"), t.literal("c")])))
+
+
+def test_push_schema_widens_single_literal_to_union() -> None:
+    c = InMemoryRtDbClient()
+    c.push_schema(_field_schema(t.literal("a")))
+    # "a" -> {a,b} is additive widening, must succeed.
+    c.push_schema(_field_schema(t.union([t.literal("a"), t.literal("b")])))
+
+
+def test_push_schema_rejects_narrowing_a_union() -> None:
+    c = InMemoryRtDbClient()
+    c.push_schema(_field_schema(t.union([t.literal("a"), t.literal("b"), t.literal("c")])))
+    with pytest.raises(RtDbError) as ei:
+        c.push_schema(_field_schema(t.union([t.literal("a"), t.literal("b")])))
+    assert ei.value.code is ErrorCode.BAD_REQUEST
+    assert "changed type of field 'things.val'" in ei.value.message
+
+
+def test_push_schema_rejects_replacing_one_literal_with_another() -> None:
+    c = InMemoryRtDbClient()
+    c.push_schema(_field_schema(t.literal("a")))
+    with pytest.raises(RtDbError) as ei:
+        c.push_schema(_field_schema(t.literal("b")))
+    assert ei.value.code is ErrorCode.BAD_REQUEST
+    assert "changed type of field 'things.val'" in ei.value.message
+
+
+def test_push_schema_rejects_collapsing_a_union_to_a_literal() -> None:
+    c = InMemoryRtDbClient()
+    c.push_schema(_field_schema(t.union([t.literal("a"), t.literal("b")])))
+    with pytest.raises(RtDbError) as ei:
+        c.push_schema(_field_schema(t.literal("a")))
+    assert ei.value.code is ErrorCode.BAD_REQUEST
+    assert "changed type of field 'things.val'" in ei.value.message
+
+
+def test_push_schema_rejects_a_non_literal_type_change() -> None:
+    c = InMemoryRtDbClient()
+    c.push_schema(_field_schema(t.string()))
+    with pytest.raises(RtDbError) as ei:
+        c.push_schema(_field_schema(t.number()))
+    assert ei.value.code is ErrorCode.BAD_REQUEST
+    assert "changed type of field 'things.val'" in ei.value.message
+
+
+def test_push_schema_rejects_widening_to_an_empty_union() -> None:
+    c = InMemoryRtDbClient()
+    c.push_schema(_field_schema(t.literal("a")))
+    with pytest.raises(RtDbError) as ei:
+        c.push_schema(_field_schema(t.union([])))
+    assert ei.value.code is ErrorCode.BAD_REQUEST
+    assert "changed type of field 'things.val'" in ei.value.message
+
+
 # ---------------------------------------------------------------------------
 # insert / collect / system fields
 # ---------------------------------------------------------------------------

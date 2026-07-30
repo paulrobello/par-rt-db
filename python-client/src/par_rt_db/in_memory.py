@@ -1331,7 +1331,9 @@ def _detect_destructive_changes(old: SchemaDef, new: SchemaDef) -> None:
             new_field_type = new_table.fields.get(field_name)
             if new_field_type is None:
                 raise RtDbError(ErrorCode.BAD_REQUEST, f"removed field '{table_name}.{field_name}'")
-            if _field_type_signature(old_field_type) != _field_type_signature(new_field_type):
+            if _field_type_signature(old_field_type) != _field_type_signature(
+                new_field_type
+            ) and not _is_widening_of(old_field_type, new_field_type):
                 raise RtDbError(
                     ErrorCode.BAD_REQUEST,
                     f"changed type of field '{table_name}.{field_name}'",
@@ -1361,6 +1363,42 @@ def _field_type_signature(ty: Any) -> Any:
     """Structural signature of a ``FieldType`` for destructive-change detection
     (the live server compares the parsed type tree directly)."""
     return ty.model_dump(mode="json")
+
+
+def _literal_set(ty: Any) -> list[Any] | None:
+    """Finite literal set carried by a ``_FLiteral`` or a ``_FUnion`` of pure
+    literals — a port of ``server/src/schema.rs::literal_set``. Returns ``None``
+    for anything that is not a finite literal set (scalars, optionals, objects,
+    arrays, mixed or empty unions)."""
+    match ty:
+        case _FLiteral(value=v):
+            return [v]
+        case _FUnion(variants=variants):
+            if not variants:
+                return None
+            out: list[Any] = []
+            for variant in variants:
+                match variant:
+                    case _FLiteral(value=v):
+                        out.append(v)
+                    case _:
+                        return None
+            return out
+        case _:
+            return None
+
+
+def _is_widening_of(old: Any, new: Any) -> bool:
+    """``True`` iff ``new`` carries a finite literal set that is a superset of
+    ``old``'s — a port of ``server/src/schema.rs::is_widening_of``. Lets
+    ``pushSchema`` accept additive widening of a literal-union field (e.g.
+    ``{a,b}`` -> ``{a,b,c}``, or ``"a"`` -> ``{a,b}``) as a non-destructive
+    change."""
+    old_vals = _literal_set(old)
+    new_vals = _literal_set(new)
+    if old_vals is None or new_vals is None:
+        return False
+    return all(any(o == n for n in new_vals) for o in old_vals)
 
 
 def _vector_signature(spec: Any) -> Any:
