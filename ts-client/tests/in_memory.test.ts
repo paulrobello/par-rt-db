@@ -1155,3 +1155,91 @@ describe("InMemoryRtDbClient — additive schema push", () => {
     expect(() => c.pushSchema(itemsWithChangedFieldType)).toThrow(/changed type of field 'items\./);
   });
 });
+
+describe("InMemoryRtDbClient — literal-union widening (pushSchema parity)", () => {
+  // Mirrors server `schema::is_widening_of` (server/src/schema.rs). A second
+  // `pushSchema` that widens a finite literal-union field (or a single literal
+  // into a union) is an additive, non-destructive change and must pass; every
+  // other field-type change (narrowing, swap, collapse, scalar swap) is still
+  // rejected with BAD_REQUEST "changed type of field".
+
+  it("widening a literal union by adding a variant succeeds", () => {
+    const base = defineSchema({
+      things: defineTable({ state: t.union(t.literal("a"), t.literal("b")) }),
+    });
+    const widened = defineSchema({
+      things: defineTable({
+        state: t.union(t.literal("a"), t.literal("b"), t.literal("c")),
+      }),
+    });
+    const c = new InMemoryRtDbClient();
+    c.pushSchema(base);
+    expect(() => c.pushSchema(widened)).not.toThrow();
+  });
+
+  it("widening a single literal to a union succeeds", () => {
+    const base = defineSchema({
+      things: defineTable({ state: t.literal("a") }),
+    });
+    const widened = defineSchema({
+      things: defineTable({
+        state: t.union(t.literal("a"), t.literal("b")),
+      }),
+    });
+    const c = new InMemoryRtDbClient();
+    c.pushSchema(base);
+    expect(() => c.pushSchema(widened)).not.toThrow();
+  });
+
+  it("narrowing a union is rejected with BAD_REQUEST", () => {
+    const base = defineSchema({
+      things: defineTable({
+        state: t.union(t.literal("a"), t.literal("b"), t.literal("c")),
+      }),
+    });
+    const narrowed = defineSchema({
+      things: defineTable({ state: t.union(t.literal("a"), t.literal("b")) }),
+    });
+    const c = new InMemoryRtDbClient();
+    c.pushSchema(base);
+    expect(() => c.pushSchema(narrowed)).toThrow(/changed type of field 'things\./);
+  });
+
+  it("replacing one literal with another is rejected", () => {
+    const base = defineSchema({
+      things: defineTable({ state: t.literal("a") }),
+    });
+    const swapped = defineSchema({
+      things: defineTable({ state: t.literal("b") }),
+    });
+    const c = new InMemoryRtDbClient();
+    c.pushSchema(base);
+    expect(() => c.pushSchema(swapped)).toThrow(/changed type of field 'things\./);
+  });
+
+  it("collapsing a union to a literal is rejected", () => {
+    const base = defineSchema({
+      things: defineTable({
+        state: t.union(t.literal("a"), t.literal("b")),
+      }),
+    });
+    const collapsed = defineSchema({
+      things: defineTable({ state: t.literal("a") }),
+    });
+    const c = new InMemoryRtDbClient();
+    c.pushSchema(base);
+    expect(() => c.pushSchema(collapsed)).toThrow(/changed type of field 'things\./);
+  });
+
+  it("a non-literal type change (string -> number) is still rejected", () => {
+    const base = defineSchema({
+      things: defineTable({ state: t.string() }),
+    });
+    const swapped = defineSchema({
+      things: defineTable({ state: t.number() }),
+    });
+    const c = new InMemoryRtDbClient();
+    c.pushSchema(base);
+    expect(() => c.pushSchema(swapped)).toThrow(/changed type of field 'things\./);
+  });
+});

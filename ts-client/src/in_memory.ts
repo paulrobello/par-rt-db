@@ -103,13 +103,57 @@ function toSchemaJson(schema: SchemaDefinition<any> | SchemaJson): SchemaJson {
     : (schema as SchemaJson);
 }
 
+/** Returns the values a finite literal-union (or lone literal) accepts, mirroring
+ * server `schema::literal_set`: a lone `literal` yields its single value, and a
+ * `union` yields its variants' literal values only when EVERY variant is a
+ * `literal` (and the union is non-empty). Returns `null` for any other type
+ * (scalar, optional, object, array, mixed/open union, empty union) — those are
+ * not finite sets and cannot widen. */
+function literalSet(ty: FieldTypeJson): unknown[] | null {
+  switch (ty.type) {
+    case "literal":
+      return [ty.value];
+    case "union": {
+      if (ty.variants.length === 0) {
+        return null;
+      }
+      const vals: unknown[] = [];
+      for (const variant of ty.variants) {
+        if (variant.type !== "literal") {
+          return null;
+        }
+        vals.push(variant.value);
+      }
+      return vals;
+    }
+    default:
+      return null;
+  }
+}
+
+/** True iff every value accepted by `old` is also accepted by `next` — a port
+ * of server `schema::is_widening_of`. Both sides must be finite literal sets
+ * (per {@link literalSet}); membership is compared by `===` since literal values
+ * are primitives (`string | number | boolean`). Linear scan, matching the
+ * Rust `Vec::contains` semantics over the new set. */
+function isWideningOf(old: FieldTypeJson, next: FieldTypeJson): boolean {
+  const oldVals = literalSet(old);
+  const newVals = literalSet(next);
+  if (oldVals === null || newVals === null) {
+    return false;
+  }
+  return oldVals.every((o) => newVals.some((n) => n === o));
+}
+
 /** Rejects destructive schema changes — a port of server
  * `ddl::detect_destructive_changes`. A second `pushSchema` may only ADD tables,
  * fields, and indexes; removing or retyping any existing table/field/index is a
  * `BAD_REQUEST` with the same message the live server returns. Additive changes
  * (new tables, new fields, new indexes) pass through. Field types and index
  * `fields`/`vector` are compared by `JSON.stringify` deep equality; index kind
- * (btree vs search) by the presence/absence of `search`. */
+ * (btree vs search) by the presence/absence of `search`. A field-type change is
+ * accepted when it is a safe widening (server `schema::is_widening_of`): a
+ * finite literal-union that grows, or a single literal that becomes a union. */
 function detectDestructiveChanges(oldSchema: SchemaJson, newSchema: SchemaJson): void {
   for (const [tableName, oldTable] of Object.entries(oldSchema.tables)) {
     const newTable = newSchema.tables[tableName];
@@ -121,7 +165,10 @@ function detectDestructiveChanges(oldSchema: SchemaJson, newSchema: SchemaJson):
       if (!newFieldType) {
         throw new RtDbError("BAD_REQUEST", `removed field '${tableName}.${fieldName}'`);
       }
-      if (JSON.stringify(newFieldType) !== JSON.stringify(oldFieldType)) {
+      if (
+        JSON.stringify(newFieldType) !== JSON.stringify(oldFieldType) &&
+        !isWideningOf(oldFieldType, newFieldType)
+      ) {
         throw new RtDbError("BAD_REQUEST", `changed type of field '${tableName}.${fieldName}'`);
       }
     }
