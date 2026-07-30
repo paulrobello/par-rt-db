@@ -1,6 +1,6 @@
 # Feature Matrix — Convex vs par-rt-db
 
-**Date:** 2026-07-21 (gap matrix last updated 2026-07-28)
+**Date:** 2026-07-21 (gap matrix last updated 2026-07-28; dimensional + divergence comparison added 2026-07-29)
 **Purpose:** Inventory Convex's feature surface against par-rt-db's, and rank every gap
 by utility and level of effort so parity work can be picked off in value order.
 **Perspective:** "Utility" is judged for the apps this instance actually serves (kanban
@@ -89,12 +89,177 @@ mistakes them for backlog.
 | Cloud platform features: preview deployments, env vars, log streams/integrations, streaming export (Fivetran/Airbyte) | Platform, not database | `docker compose` + `tracing` logs + direct Postgres access. |
 | Multi-region / horizontal scale-out | Single-writer committer is load-bearing for correctness | Out of scope at personal-project scale by design. |
 
-## 4. Where par-rt-db is ahead
+## 4. Dimensional comparison
+
+The parity table (§1) marks features present in both. This section compares the two systems
+across the dimensions a feature checklist hides — what each one *is*, not just what it *has*.
+Convex facts are from its current docs (sources at the end).
+
+### Data model & storage
+
+**Convex** stores documents in its own storage engine (Postgres/SQLite/MySQL on self-host),
+modeled by `schema.ts` validators, with separate subsystems for text search (`searchIndex`),
+vectors (`vectorSearch`, via a component), and files (a storage API).
+
+**par-rt-db** is one Postgres 17 database per app. Documents are a `doc` jsonb column with
+system fields merged at read time; each indexed field gets a real typed, btree-indexed Postgres
+column (index reads are index scans, not scan-then-filter). Text search is a generated
+`tsvector` + GIN, vectors are a pgvector write-maintained column + HNSW, and files are `bytea`
+blobs in a per-db storage table. Postgres is the only datastore — by design (user-approved
+vendor lock).
+
+**Tradeoff:** par-rt-db gets search/vector/count/files "for free" from Postgres where Convex
+wires components, and the `psql` escape hatch is always open. Convex offers engine choice on
+self-host and a more uniform managed experience in the cloud.
+
+### Consistency & transactions
+
+**Convex** is ACID with **serializable** isolation via **optimistic concurrency control**:
+transactions run without locks, are validated at commit, and are **automatically retried** on
+conflict. Every mutation function is a fully serializable transaction ([How Convex works][hcw],
+[Overview][ov], [OCC & atomicity][occ]).
+
+**par-rt-db** **serializes all writes through a single per-database committer task** (true
+serial execution — one mutation at a time, in arrival order), while reads run at **READ COMMITTED
+with no row locking**. There is no OCC retry: a mutation commits in its turn or is rejected (a
+failed `expectVersion`/`expectAbsent` aborts the whole txn). Retry is explicit and opt-in via an
+idempotency key (#4), never automatic. That same serialization is what makes live-query
+invalidation sound — the committer re-runs affected subscriptions between writes.
+
+**Tradeoff:** Convex offers the strictest stated guarantee and lets independent transactions run
+concurrently (auto-retry under contention); par-rt-db trades concurrency for simplicity and
+predictability — serial writes, zero surprise retries, but write throughput bounded by one
+serialized path per database (a non-goal to scale out — §3). Reads are READ COMMITTED snapshots,
+not serializable: a deliberate, documented choice.
+
+### Scaling & availability
+
+**Convex** (cloud) is horizontally scaled, multi-tenant, with managed replication and backups.
+**par-rt-db** is single-writer per database on one server instance hosting many databases, backed
+by one Postgres. Multi-region / horizontal scale-out is a deliberate non-goal (§3) — the
+single-writer committer is load-bearing for correctness. Availability is whatever your single
+Postgres + host provide (nightly `pg_dump`; single host today).
+
+**Tradeoff:** Convex scales for you; par-rt-db is intentionally single-node, tuned for
+personal/agent-scale apps where one box is plenty.
+
+### Deployment & operations
+
+**Convex** is `npx convex dev` / `npx convex deploy` to the cloud (zero-ops), or [self-host the
+open-source backend][sh] via Docker Compose (Postgres/SQLite/MySQL). Self-host runs the V8
+function runtime + storage engine + dashboard; you still host your frontend separately.
+
+**par-rt-db** is one Rust binary (axum/tokio) + one Postgres 17, deployed via plain
+`docker compose` behind a Cloudflare tunnel; the operator dashboard is a same-origin SPA baked
+into the image. No function runtime, no separate search/vector/file services — Postgres carries
+all of them. A new app is an admin call to create a database, not a new deployment.
+
+**Tradeoff:** par-rt-db is a smaller, Postgres-native stack with fewer moving parts and one
+datastore to back up; Convex gives a richer managed cloud if you want zero ops, and an
+open-source self-host if you don't (but it's a bigger system to run).
+
+### Cost model
+
+**Convex Cloud** is usage-based: free tier (1M function calls/mo, 0.5 GB storage), then
+pay-as-you-go (~$2.20/M function calls, ~$0.22/GB-month storage), per-project Professional +
+usage, custom Enterprise ([pricing][pr]). **par-rt-db** is self-hosted on your own hardware and
+Postgres — zero per-call, per-seat, or per-GB metering; cost is the box + Postgres you'd run
+anyway.
+
+**Tradeoff:** Convex Cloud bills on usage (cheap on the free tier, grows with scale); par-rt-db
+is a fixed-cost owned asset. Convex's open-source self-host removes the metering too — so the
+real differentiator is operational shape (single binary over Postgres vs a runtime+engine stack),
+not "SaaS vs owned."
+
+### Developer workflow
+
+**Convex** has you write TypeScript server functions (queries/mutations/actions); `npx convex
+dev` watches and **codegens** a typed API + data model into `_generated/`. Functions are the API;
+you deploy functions; a rich component ecosystem extends them.
+
+**par-rt-db** has **no codegen** — the schema object is the source of inferred types (`Doc`,
+`Id`), and there are **no server functions at all**: clients send a declarative JSON DSL (typed
+queries + atomic multi-step transactions). "Deploying" is pushing a schema; behavior lives in the
+client. Anything the DSL can't express goes to an external worker with a machine token (§3).
+
+**Tradeoff:** Convex's function model is more expressive (arbitrary server logic, side-effect
+actions, HTTP endpoints) but heavier (runtime, codegen, deploy cycle); par-rt-db is a thinner
+loop — schema push + client DSL, types inferred, no server deploys.
+
+### Security & auth model
+
+**Convex** does function-level auth — you check `ctx.auth` inside each function (Convex Auth,
+Clerk, Auth0, or custom JWT). **par-rt-db** authenticates per database (machine tokens + OAuth
+sessions + email allowlist) and authorizes **centrally**, re-running `authorize` on every
+Subscribe/Mutate over an open WS so revocation/allowlist/expiry take effect live — plus opt-in
+per-row `ownerField`/`collaboratorsField` enforced on every read, every `fan_out`, every write
+(#20).
+
+**Tradeoff:** Convex gives arbitrary auth logic in code (flexible, but you must apply it
+consistently everywhere); par-rt-db centralizes auth and per-row rules at the protocol layer so
+they can't be bypassed by a forgotten check.
+
+### Observability
+
+**Convex** offers a managed dashboard (logs, function traces, metrics), log streams/integrations,
+and streaming export. **par-rt-db** exposes Prometheus text on `/metrics` + JSON on
+`/admin/metrics` (throughput, p50/p95/p99, pool/WS/subscription gauges, `rtdb_build_info`), a
+realtime op feed + audit log + webhooks, self-checking invalidation counters
+(`rtdb_subs_skips_total` / `reruns` / `missed_pushes`, #21), and an operator dashboard.
+
+**Tradeoff:** Convex's cloud observability is richer and managed; par-rt-db gives standard
+Prometheus + an operator console you scrape yourself — fewer integrations out of the box, full
+raw access to your own Postgres.
+
+[hcw]: https://stack.convex.dev/how-convex-works
+[ov]: https://docs.convex.dev/understanding/overview
+[occ]: https://docs.convex.dev/database/advanced/occ
+[pr]: https://www.convex.dev/pricing
+[sh]: https://docs.convex.dev/self-hosting
+
+## 5. Same feature, different model
+
+Both systems have the rows in §1 — but "implemented" hides how differently each one works. This
+table surfaces the substantive model differences behind the ✅/✅, with the source row and which
+way it cuts (⬆ par-rt-db · ⬆ Convex · ⚖ tradeoff).
+
+| Source | Capability | Convex model | par-rt-db model | Edge |
+|---|---|---|---|---|
+| §1 (system fields) | Doc versioning | internal `_version`, not surfaced | `_version` on every doc → client-side OCC via `expectVersion` | ⬆ par-rt-db |
+| #4 | Mutation retry | automatic, exactly-once | explicit, opt-in idempotency key (5-min); default at-most-once | ⚖ |
+| §1, §4 | Read/write consistency | serializable + OCC + auto-retry | serial-writer committer + READ COMMITTED, no retries | ⚖ |
+| §1 (schema migration) | Schema changes | additive + migrate/backfill | additive-only; destructive push rejected | ⚖ |
+| #3, #3b | `count` / `distinct` | needs aggregate component / no native | native `SELECT COUNT(*)` / `SELECT DISTINCT` | ⬆ par-rt-db |
+| #11 | Full-text search | search index (built-in) | generated `tsvector` + GIN | ⚖ |
+| #17 | Vector search | one-shot action; embeddings via component/client | reactive, pushes live; client-supplied (no runtime) | ⚖ |
+| #15 | db-side filter | discouraged; steer to indexes | indexes **and** a `filter()` predicate DSL | ⬆ par-rt-db |
+| §1, #20 | Authorization | per-function `ctx.auth` checks | central `authorize` every op + per-row `ownerField`/`collaboratorsField` | ⚖ |
+| §1, #18 | Control plane | managed dashboard + CLI | self-hosted operator console + HTTP admin + `rtdb` CLI | ⚖ |
+| #16 | File storage | upload URLs + storage API; object store | per-db Postgres `bytea`; public opaque-UUID URL + authed serve | ⚖ |
+| §1, §4 | Types & deploy | TS server functions + codegen (`_generated/`) | declarative DSL, no codegen, types inferred from schema | ⚖ |
+| §3 | Server-side logic | actions / HTTP actions (V8) | none — external worker + machine token | ⬆ Convex |
+
+**Where par-rt-db pulls ahead.** Postgres makes the terminals Convex builds components for —
+`count`, `distinct`, full-text search, vector search, file storage — native and free; `_version`
+is exposed for client-side OCC; there's no codegen/deploy loop; and auth + per-row rules live at
+the protocol layer, so they can't be bypassed by a missed check.
+
+**Where Convex pulls ahead.** Arbitrary server-side logic (actions, custom HTTP endpoints), the
+strictest consistency guarantee (serializable), and managed horizontal scale — all consequences of
+running user code on managed infra, which par-rt-db deliberately doesn't do (§3).
+
+**Genuine tradeoffs.** Retry semantics (auto vs explicit), the read guarantee (serializable vs
+READ COMMITTED snapshots), and schema-change safety (backfill vs additive-only) are different
+operating points, not better-or-worse — a team should pick them deliberately.
+
+## 6. Where par-rt-db is ahead
 
 - **No codegen** — schema *is* the TS source of types; no `npx convex dev` watcher, no
   generated `_generated/` directory to keep in sync.
-- **Self-hosted and owned** — no vendor, no per-seat pricing, data in a Postgres you can
-  `psql` into; nightly `pg_dump` backups.
+- **Postgres-native and owned** — data in a Postgres you can `psql` into; nightly `pg_dump`
+  backups. (Convex is now self-hostable too via its open-source backend, but runs a V8 function
+  runtime + its own storage engine + dashboard; par-rt-db is a single Rust binary over one
+  Postgres, with no per-call / per-seat / per-GB metering.)
 - **SQL escape hatch** — anything the DSL can't express yet has a manual answer today.
 - **`_version` on every doc** — explicit optimistic-concurrency primitive
   (`expectVersion`) that Convex doesn't surface.
@@ -102,7 +267,7 @@ mistakes them for backlog.
   opt-in safe retry without giving this up).
 - **One instance, many databases** — a new app is an admin call, not a new deployment.
 
-## 5. Status
+## 7. Status
 
 As of 2026-07-28, **all 21 ranked gaps are shipped** — every row in §2 is ✅, including
 the #18 dashboard (backend + frontend). The per-row Notes are authoritative; the shape of
