@@ -55,7 +55,9 @@ pub mod ws;
 
 pub use error::{ErrorCode, ErrorEnvelope, RtDbError, retry_on_precondition};
 pub use mutation::{Mutation, StepResult, Transaction};
-pub use query::{Order, Paginate, Paginated, Query, TableQuery};
+pub use query::{
+    HybridSearchOpts, Order, Paginate, Paginated, Query, TableQuery, VectorSearchOpts,
+};
 pub use schema::{FieldType, IndexDef, SchemaDef, TableDef, VectorIndexSpec};
 pub use wire::{
     AggregateGroup, AggregateOp, AggregateSpec, AuthedUser, ClientMessage, FilterExpr,

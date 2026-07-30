@@ -98,6 +98,48 @@ pub struct Paginated<T> {
     pub next_cursor: Option<String>,
 }
 
+/// Optional arguments for [`TableQuery::vector_search`]. Carries the eq-map
+/// `filter` over the index's declared `filterFields`; defaults to empty (no
+/// filter on the wire). `From<BTreeMap<...>>` keeps the legacy positional call
+/// (`.vector_search(idx, vec, lim, filter_map)`) compiling unchanged; `From<()>`
+/// lets callers omit it (`.vector_search(idx, vec, lim, ())`) when they have no
+/// filter — matching the ts opts-bag / python keyword-only ergonomics.
+#[derive(Debug, Clone, Default)]
+pub struct VectorSearchOpts {
+    pub filter: BTreeMap<String, serde_json::Value>,
+}
+
+impl From<BTreeMap<String, serde_json::Value>> for VectorSearchOpts {
+    fn from(filter: BTreeMap<String, serde_json::Value>) -> Self {
+        Self { filter }
+    }
+}
+
+impl From<()> for VectorSearchOpts {
+    fn from(_: ()) -> Self {
+        Self::default()
+    }
+}
+
+/// Optional arguments for [`TableQuery::hybrid_search`]: `search_index`/
+/// `vector_index` optionally name the indexes (auto-selected server-side when
+/// `None`); `k` is the RRF constant (server-defaults when `None`). All default
+/// to `None`, so callers can write `.hybrid_search(query, vector, limit, ())`
+/// for the auto-select case, or name individual fields by struct literal
+/// without minding positional order.
+#[derive(Debug, Clone, Default)]
+pub struct HybridSearchOpts {
+    pub search_index: Option<String>,
+    pub vector_index: Option<String>,
+    pub k: Option<u32>,
+}
+
+impl From<()> for HybridSearchOpts {
+    fn from(_: ()) -> Self {
+        Self::default()
+    }
+}
+
 /// A built query is just the wire `Query` (terminals consume the builder).
 pub struct TableQuery {
     q: Query,
@@ -174,45 +216,57 @@ impl TableQuery {
     /// unlike `search`, it carries its own `limit` and does NOT compose with
     /// `take`/`collect` (the server rejects `vectorSearch` combined with any
     /// other terminal).
+    ///
+    /// `opts` accepts any `Into<VectorSearchOpts>`: pass a `BTreeMap` for the
+    /// legacy positional shape (`.vector_search(idx, vec, lim, filter_map)`),
+    /// `()` to omit the filter, or a `VectorSearchOpts { filter }` literal. An
+    /// empty filter is omitted on the wire, so all three forms serialize
+    /// identically when no filter is wanted.
     pub fn vector_search(
         mut self,
         index: &str,
         vector: Vec<f64>,
         limit: u32,
-        filter: BTreeMap<String, serde_json::Value>,
+        opts: impl Into<VectorSearchOpts>,
     ) -> Self {
+        let opts = opts.into();
         self.q.vector_search = Some(crate::wire::VectorSearchQuery {
             index: index.into(),
             vector,
             limit,
-            filter,
+            filter: opts.filter,
         });
         self
     }
 
     /// Hybrid `hybridSearch` terminal: fuses full-text and vector ranking over
     /// the same table via Reciprocal Rank Fusion. The table must declare BOTH a
-    /// search index and a vector index. `search_index`/`vector_index` optionally
-    /// name the indexes (auto-selected server-side when `None`); `k` is the RRF
-    /// constant (default 60). Standalone terminal — like `vector_search`, it
-    /// carries its own `limit` and does NOT compose with `take`/`collect` (the
-    /// server rejects `hybridSearch` combined with any other terminal).
+    /// search index and a vector index. Standalone terminal — like
+    /// `vector_search`, it carries its own `limit` and does NOT compose with
+    /// `take`/`collect` (the server rejects `hybridSearch` combined with any
+    /// other terminal).
+    ///
+    /// `opts` accepts any `Into<HybridSearchOpts>`: pass `()` for the
+    /// auto-select / server-default-`k` case
+    /// (`.hybrid_search(query, vector, limit, ())`), or a `HybridSearchOpts`
+    /// literal to name `search_index`/`vector_index`/`k` by field — no positional
+    /// `Option` ordering. All three fields default to `None` and are omitted on
+    /// the wire when absent.
     pub fn hybrid_search(
         mut self,
         query: &str,
         vector: Vec<f64>,
         limit: u32,
-        search_index: Option<&str>,
-        vector_index: Option<&str>,
-        k: Option<u32>,
+        opts: impl Into<HybridSearchOpts>,
     ) -> Self {
+        let opts = opts.into();
         self.q.hybrid_search = Some(crate::wire::HybridSearchQuery {
             query: query.into(),
             vector,
             limit,
-            search_index: search_index.map(|s| s.into()),
-            vector_index: vector_index.map(|s| s.into()),
-            k,
+            search_index: opts.search_index,
+            vector_index: opts.vector_index,
+            k: opts.k,
         });
         self
     }
@@ -527,11 +581,12 @@ mod tests {
 
     #[test]
     fn vector_builder_serializes_terminal() {
+        // Legacy positional form — `BTreeMap::new()` via `Into<VectorSearchOpts>`
+        // — still compiles unchanged. Wire key is camelCase `vectorSearch`
+        // (matches server); empty `filter` is skipped on the wire.
         let q = TableQuery::new("docs")
             .vector_search("by_embedding", vec![1.0, 0.0, 0.0], 5, BTreeMap::new())
             .take(10);
-        // Wire key is camelCase `vectorSearch` (matches server); empty `filter`
-        // is skipped on the wire.
         assert_eq!(
             serde_json::to_value(&q).unwrap(),
             json!({"table":"docs","vectorSearch":{"index":"by_embedding","vector":[1.0,0.0,0.0],"limit":5},"take":10})
@@ -539,24 +594,61 @@ mod tests {
     }
 
     #[test]
-    fn hybrid_builder_serializes_terminal() {
-        // Required fields only — optionals omitted on the wire.
+    fn vector_search_omits_filter_via_unit() {
+        // `()` → `VectorSearchOpts::default()` (empty filter) → omitted on the
+        // wire. Byte-identical to the legacy `BTreeMap::new()` form above.
         let q = TableQuery::new("docs")
-            .hybrid_search("hello world", vec![1.0, 0.0, 0.0], 5, None, None, None)
+            .vector_search("by_embedding", vec![1.0, 0.0, 0.0], 5, ())
+            .take(10);
+        assert_eq!(
+            serde_json::to_value(&q).unwrap(),
+            json!({"table":"docs","vectorSearch":{"index":"by_embedding","vector":[1.0,0.0,0.0],"limit":5},"take":10})
+        );
+    }
+
+    #[test]
+    fn vector_search_with_opts_struct_carries_filter() {
+        // Named-field opts bag — no `BTreeMap` to hand-build for the
+        // single-filter case. Non-empty filter is emitted on the wire.
+        let mut filter = BTreeMap::new();
+        filter.insert("userId".into(), json!("u1"));
+        let q = TableQuery::new("docs")
+            .vector_search(
+                "by_embedding",
+                vec![1.0, 0.0, 0.0],
+                5,
+                VectorSearchOpts { filter },
+            )
+            .take(10);
+        assert_eq!(
+            serde_json::to_value(&q).unwrap(),
+            json!({"table":"docs","vectorSearch":{"index":"by_embedding","vector":[1.0,0.0,0.0],"limit":5,"filter":{"userId":"u1"}},"take":10})
+        );
+    }
+
+    #[test]
+    fn hybrid_builder_serializes_terminal() {
+        // `()` → `HybridSearchOpts::default()` (all None) — optionals omitted on
+        // the wire. Replaces the legacy `None, None, None` positional tail.
+        let q = TableQuery::new("docs")
+            .hybrid_search("hello world", vec![1.0, 0.0, 0.0], 5, ())
             .take(10);
         assert_eq!(
             serde_json::to_value(&q).unwrap(),
             json!({"table":"docs","hybridSearch":{"query":"hello world","vector":[1.0,0.0,0.0],"limit":5},"take":10})
         );
-        // Explicit searchIndex/vectorIndex/k round-trip as camelCase keys.
+        // Named-field opts bag — `searchIndex`/`vectorIndex`/`k` set by field,
+        // no positional-`Option` mis-ordering. Round-trips as camelCase keys.
         let q_full = TableQuery::new("docs")
             .hybrid_search(
                 "hello",
                 vec![1.0, 0.0, 0.0],
                 5,
-                Some("search_body"),
-                Some("by_embedding"),
-                Some(42),
+                HybridSearchOpts {
+                    search_index: Some("search_body".into()),
+                    vector_index: Some("by_embedding".into()),
+                    k: Some(42),
+                },
             )
             .collect();
         assert_eq!(
@@ -565,6 +657,28 @@ mod tests {
                 "query":"hello","vector":[1.0,0.0,0.0],"limit":5,
                 "searchIndex":"search_body","vectorIndex":"by_embedding","k":42
             }})
+        );
+    }
+
+    #[test]
+    fn hybrid_search_opts_partial_defaults_to_none_on_wire() {
+        // Setting only `k` leaves the index names as `None` (auto-selected
+        // server-side) and omits them on the wire — the named-field shape makes
+        // the partial spec unambiguous, unlike the old positional tail.
+        let q = TableQuery::new("docs")
+            .hybrid_search(
+                "hi",
+                vec![1.0, 0.0, 0.0],
+                5,
+                HybridSearchOpts {
+                    k: Some(7),
+                    ..Default::default()
+                },
+            )
+            .collect();
+        assert_eq!(
+            serde_json::to_value(&q).unwrap(),
+            json!({"table":"docs","hybridSearch":{"query":"hi","vector":[1.0,0.0,0.0],"limit":5,"k":7}})
         );
     }
 
