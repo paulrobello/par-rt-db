@@ -243,17 +243,21 @@ describe("signInWithGoogle", () => {
 describe("useRtDbAuth signIn routing", () => {
   afterEach(() => {
     vi.restoreAllMocks();
+    // Token-mode signIn writes the session token to localStorage on completion
+    // (below); clear it so it cannot leak into later tests' assertions.
+    localStorage.removeItem("rtdb-session-token");
   });
 
   it("signIn('google') opens the /auth/google popup", async () => {
     const { client } = setup();
     const popup = { closed: false };
     const openSpy = vi.spyOn(window, "open").mockReturnValue(popup as unknown as Window);
+    let pending: Promise<void> | undefined;
 
     function View() {
       const { signIn } = useRtDbAuth();
       return (
-        <button type="button" onClick={() => void signIn("google")}>
+        <button type="button" onClick={() => { pending = signIn("google"); }}>
           google
         </button>
       );
@@ -274,17 +278,31 @@ describe("useRtDbAuth signIn routing", () => {
       "rtdb-auth",
       "width=600,height=700",
     );
+
+    // Complete the OAuth flow so signInWithOAuth removes its message listener
+    // (a pending, never-resolved signIn would otherwise leak the listener into
+    // later tests and fire on their auth messages).
+    await act(async () => {
+      window.dispatchEvent(
+        new MessageEvent("message", {
+          origin: "http://h:8300",
+          data: { type: "rtdb-auth", token: "tok" },
+        }),
+      );
+      await pending;
+    });
   });
 
   it("signIn() with no argument opens the /auth/github popup (default)", async () => {
     const { client } = setup();
     const popup = { closed: false };
     const openSpy = vi.spyOn(window, "open").mockReturnValue(popup as unknown as Window);
+    let pending: Promise<void> | undefined;
 
     function View() {
       const { signIn } = useRtDbAuth();
       return (
-        <button type="button" onClick={() => void signIn()}>
+        <button type="button" onClick={() => { pending = signIn(); }}>
           default
         </button>
       );
@@ -305,6 +323,85 @@ describe("useRtDbAuth signIn routing", () => {
       "rtdb-auth",
       "width=600,height=700",
     );
+
+    await act(async () => {
+      window.dispatchEvent(
+        new MessageEvent("message", {
+          origin: "http://h:8300",
+          data: { type: "rtdb-auth", token: "tok" },
+        }),
+      );
+      await pending;
+    });
+  });
+});
+
+describe("useRtDbAuth cookie mode (SEC-002)", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    localStorage.removeItem("rtdb-session-token");
+  });
+
+  // No `getToken` -> cookie mode: the HttpOnly `rtdb_session` cookie authenticates.
+  function setupCookie() {
+    const sockets: FakeSocket[] = [];
+    const client = new RtDbClient({
+      url: "ws://h:8300",
+      db: "kanban",
+      webSocketFactory: () => {
+        const s = new FakeSocket();
+        sockets.push(s);
+        return s;
+      },
+      setTimeoutImpl: () => 0 as unknown as ReturnType<typeof setTimeout>,
+      clearTimeoutImpl: () => {},
+    });
+    return { client, sockets };
+  }
+
+  it("cookieMode is true when no getToken is supplied", () => {
+    const { client } = setupCookie();
+    expect(client.cookieMode).toBe(true);
+  });
+
+  it("signIn does not persist the session token to localStorage", async () => {
+    const { client } = setupCookie();
+    expect(client.cookieMode).toBe(true);
+    const popup = { closed: false };
+    vi.spyOn(window, "open").mockReturnValue(popup as unknown as Window);
+
+    let pending: Promise<void> | undefined;
+    function View() {
+      const { signIn } = useRtDbAuth();
+      return (
+        <button type="button" onClick={() => { pending = signIn(); }}>
+          in
+        </button>
+      );
+    }
+    render(
+      <RtDbProvider client={client} authBaseUrl="http://h:8300">
+        <View />
+      </RtDbProvider>,
+    );
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("in"));
+    });
+    // Resolve the OAuth popup (the server has now set the HttpOnly cookie), then
+    // await signIn's continuation so the assertion observes its final state.
+    await act(async () => {
+      window.dispatchEvent(
+        new MessageEvent("message", {
+          origin: "http://h:8300",
+          data: { type: "rtdb-auth", token: "session-tok" },
+        }),
+      );
+      await pending;
+    });
+
+    // SEC-002: the credential must NOT land in script-readable storage.
+    expect(localStorage.getItem("rtdb-session-token")).toBeNull();
   });
 });
 

@@ -53,10 +53,15 @@ export function RtDbProvider(props: {
       setState(nextState);
       setUser(nextUser);
     });
-    const stored =
-      typeof localStorage !== "undefined" ? localStorage.getItem(TOKEN_STORAGE_KEY) : null;
-    if (stored) {
-      client.setToken(stored);
+    // Token mode hydrates from localStorage; cookie mode (no `getToken`) connects
+    // tokenless and lets the browser's HttpOnly session cookie authenticate the
+    // upgrade — it must never read script-readable storage (SEC-002).
+    if (!client.cookieMode) {
+      const stored =
+        typeof localStorage !== "undefined" ? localStorage.getItem(TOKEN_STORAGE_KEY) : null;
+      if (stored) {
+        client.setToken(stored);
+      }
     }
     client.connect();
     setState(client.getAuthState());
@@ -131,31 +136,49 @@ export function useRtDbAuth(): {
 
   const signIn = useCallback(
     async (provider: "github" | "google" = "github") => {
+      // The OAuth popup runs in both modes; the server sets the HttpOnly
+      // session cookie on its callback regardless. Token mode persists the
+      // posted-back token; cookie mode ignores it and re-dials tokenless so the
+      // now-set cookie authenticates — no script-readable credential (SEC-002).
       const token =
         provider === "google"
           ? await signInWithGoogle(authBaseUrl)
           : await signInWithGitHub(authBaseUrl);
-      if (typeof localStorage !== "undefined") {
-        localStorage.setItem(TOKEN_STORAGE_KEY, token);
+      if (client.cookieMode) {
+        client.setToken(null);
+      } else {
+        if (typeof localStorage !== "undefined") {
+          localStorage.setItem(TOKEN_STORAGE_KEY, token);
+        }
+        client.setToken(token);
       }
-      client.setToken(token);
     },
     [client, authBaseUrl],
   );
 
   const signOut = useCallback(async () => {
-    const token =
-      typeof localStorage !== "undefined" ? localStorage.getItem(TOKEN_STORAGE_KEY) : null;
-    if (token) {
+    if (client.cookieMode) {
+      // Cookie mode: the browser sends the HttpOnly cookie, the server clears
+      // it, then re-dial tokenless (no cookie -> unauthenticated). No localStorage.
       await fetch(`${authBaseUrl.replace(/\/+$/, "")}/auth/logout`, {
         method: "POST",
-        headers: { Authorization: `Bearer ${token}` },
+        credentials: "include",
       }).catch(() => undefined);
+      client.setToken(null);
+    } else {
+      const token =
+        typeof localStorage !== "undefined" ? localStorage.getItem(TOKEN_STORAGE_KEY) : null;
+      if (token) {
+        await fetch(`${authBaseUrl.replace(/\/+$/, "")}/auth/logout`, {
+          method: "POST",
+          headers: { Authorization: `Bearer ${token}` },
+        }).catch(() => undefined);
+      }
+      if (typeof localStorage !== "undefined") {
+        localStorage.removeItem(TOKEN_STORAGE_KEY);
+      }
+      client.setToken(null);
     }
-    if (typeof localStorage !== "undefined") {
-      localStorage.removeItem(TOKEN_STORAGE_KEY);
-    }
-    client.setToken(null);
   }, [client, authBaseUrl]);
 
   return { state, user, signIn, signOut };

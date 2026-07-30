@@ -158,9 +158,11 @@ export class RtDbClient {
   /**
    * SEC-001 phase 2: true when no `getToken` was supplied — the browser's
    * HttpOnly session cookie authenticates the WS upgrade, so the client dials
-   * with a tokenless `Auth` instead of landing idle.
+   * with a tokenless `Auth` instead of landing idle. Exposed (readonly) so the
+   * React provider can branch: in cookie mode it never touches `localStorage`
+   * and re-dials via `setToken(null)` after sign-in/sign-out (SEC-002).
    */
-  private readonly cookieMode: boolean;
+  readonly cookieMode: boolean;
 
   constructor(options: RtDbClientOptions) {
     this.options = options;
