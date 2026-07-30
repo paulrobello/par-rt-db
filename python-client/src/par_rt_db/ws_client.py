@@ -23,6 +23,7 @@ from pydantic import TypeAdapter
 
 from .errors import ErrorCode, RtDbError
 from .mutation import StepResult, Transaction
+from .optimistic import project as _project_optimistic
 from .query import _dump_query, _terminal_of, parse_result
 from .wire import (
     AuthedUser,
@@ -121,6 +122,14 @@ class _Sub:
     subscribed: bool = False
     closed: bool = False
     cond: asyncio.Condition = field(default_factory=asyncio.Condition)
+    # Optimistic-overlay bookkeeping (only read when the client is constructed
+    # with ``optimistic_updates=True``). ``query`` is the wire dict (the
+    # projection input); ``server_last`` is the raw authoritative result (the
+    # projection base, updated on each ``queryUpdate``); ``optimistic_active`` is
+    # true while an overlay is currently covering ``value``.
+    query: dict[str, Any] = field(default_factory=dict)
+    server_last: Any = None
+    optimistic_active: bool = False
 
 
 @dataclass
@@ -166,6 +175,7 @@ class RtDbClient:
         now: Callable[[], float] = time.monotonic,
         random: Callable[[], float] = _random.random,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        optimistic_updates: bool = False,
     ) -> None:
         self._url = _sync_url(url)
         self._db = db
@@ -177,6 +187,7 @@ class RtDbClient:
         self._now = now
         self._random = random
         self._sleep = sleep
+        self._optimistic = optimistic_updates
 
         self._state = ConnectionState.IDLE
         self._user: AuthedUser | None = None
@@ -193,6 +204,9 @@ class RtDbClient:
         self._counter = 0
         self._pending_mut: dict[str, Any] = {}
         self._pending_sched: dict[str, Any] = {}
+        # Reverse index (mut_id -> query_ids) for optimistic-overlay rollback;
+        # only populated when ``optimistic_updates`` is on.
+        self._overlays: dict[str, set[str]] = {}
 
     def status(self) -> ClientStatus:
         return ClientStatus(self._state, self._user)
@@ -412,7 +426,7 @@ class RtDbClient:
             from .wire import _ClientSubscribe
 
             frame = _ClientSubscribe(query_id=qid, query=qd).model_dump_json(by_alias=True)
-            sub = _Sub(query_id=qid, key=key, frame=frame, terminal=terminal, model=model)
+            sub = _Sub(query_id=qid, key=key, frame=frame, terminal=terminal, model=model, query=qd)
             self._subs_by_key[key] = sub
             self._subs_by_id[qid] = sub
             if self._state is ConnectionState.CONNECTED:
@@ -442,6 +456,10 @@ class RtDbClient:
         sub = self._subs_by_id.get(msg.query_id)
         if sub is None:
             return
+        # Reconcile: the authoritative result supersedes any in-flight overlay;
+        # record it as the new projection base (raw — pre-model-validation).
+        sub.server_last = msg.result
+        sub.optimistic_active = False
         sub.value = parse_result(sub.model, sub.terminal, msg.result)
         sub.version += 1
         self._notify(sub)
@@ -487,11 +505,14 @@ class RtDbClient:
     ) -> list[StepResult]:
         self._counter += 1
         mid = f"mut-{self._counter}"
+        txn_dict = txn.model_dump(by_alias=True, mode="json")
         frame = _ClientMutate(
             mut_id=mid,
             idempotency_key=idempotency_key,
-            txn=txn.model_dump(by_alias=True, mode="json"),
+            txn=txn_dict,
         ).model_dump_json(by_alias=True)
+        if self._optimistic:
+            self._apply_optimistic(mid, txn_dict)
         fut = asyncio.get_running_loop().create_future()
         self._pending_mut[mid] = _MutPending(fut, frame, id=mid)
         await self._dispatch_send(mid, self._pending_mut)
@@ -532,11 +553,16 @@ class RtDbClient:
         mp = self._pending_mut.pop(msg.mut_id, None)
         if mp is not None and not mp.future.done():
             mp.future.set_result([_STEP_RESULT_ADAPTER.validate_python(r) for r in msg.results])
+        # No revert: the reconciling queryUpdate(s) arrive and supersede any
+        # overlay. Just drop the reverse-index entry — those overlays are no
+        # longer rollback-eligible.
+        self._overlays.pop(msg.mut_id, None)
 
     def _on_mutate_err(self, msg: Any) -> None:
         mp = self._pending_mut.pop(msg.mut_id, None)
         if mp is not None and not mp.future.done():
             mp.future.set_exception(RtDbError.from_envelope(msg.error.model_dump()))
+        self._revert_overlays_for(msg.mut_id)
 
     def _on_sched(self, msg: Any) -> None:
         sp = self._pending_sched.pop(msg.schedule_id, None)
@@ -563,9 +589,13 @@ class RtDbClient:
     def _reject_inflight(self, reason: str) -> None:
         # Only in-flight (sent) entries die on a reconnectable drop; queued
         # entries survive so ``_flush_on_auth`` can resend them on reconnect.
+        # Each rejected mutation's overlays are reverted too (a sent-but-unacked
+        # mutate never gets a mutateOk/mutateErr, so the rollback must happen
+        # here).
         for mp in list(self._pending_mut.values()):
             if mp.sent and not mp.future.done():
                 self._pending_mut.pop(mp.id, None)
+                self._revert_overlays_for(mp.id)
                 mp.future.set_exception(RtDbError(ErrorCode.INTERNAL, reason))
         for sp in list(self._pending_sched.values()):
             if sp.sent and not sp.future.done():
@@ -575,12 +605,71 @@ class RtDbClient:
     def _reject_all_pending(self, reason: str) -> None:
         for mp in list(self._pending_mut.values()):
             if not mp.future.done():
+                # Queued mutates also had overlays applied (the apply hook runs
+                # in ``mutate`` before the entry is dispatched), so revert them.
+                self._revert_overlays_for(mp.id)
                 mp.future.set_exception(RtDbError(ErrorCode.INTERNAL, reason))
         self._pending_mut.clear()
         for sp in list(self._pending_sched.values()):
             if not sp.future.done():
                 sp.future.set_exception(RtDbError(ErrorCode.INTERNAL, reason))
         self._pending_sched.clear()
+
+    # --- optimistic updates -------------------------------------------
+    #
+    # When ``optimistic_updates=True``, a ``mutate`` overlays each matching
+    # subscription's cached value BEFORE the frame is dispatched (caller-side,
+    # so subscribers in other tasks see it before the caller awaits). The next
+    # authoritative ``queryUpdate`` reconciles (server-wins, overlay cleared);
+    # ``mutateErr`` / a reconnectable drop / ``close()`` roll the overlay back to
+    # ``server_last``. Off (the default) ⇒ byte-for-byte the pre-optimistic
+    # behavior: none of these hooks mutate ``_Sub`` in a way a caller can observe.
+
+    def _apply_optimistic(self, mut_id: str, txn_dict: dict[str, Any]) -> None:
+        """For each live subscription whose projection base is known, project
+        ``txn_dict`` onto it; for each non-decline projection, push the overlaid
+        value through the sub immediately and record its ``query_id`` under
+        ``mut_id`` in ``_overlays`` so a later rollback can find it."""
+        now_ms = int(time.time() * 1000)
+        steps = txn_dict.get("steps") or []
+        touched: set[str] = set()
+        for sub in self._subs_by_id.values():
+            base = sub.server_last
+            if base is None:
+                continue
+            overlaid, did = _project_optimistic(sub.query, base, steps, now_ms)
+            if not did:
+                continue
+            sub.optimistic_active = True
+            sub.value = _reproject(sub, overlaid)
+            sub.version += 1
+            self._notify(sub)
+            touched.add(sub.query_id)
+        if touched:
+            self._overlays[mut_id] = touched
+
+    def _revert_overlay(self, query_id: str) -> None:
+        """Revert one subscription's overlay: if one is active and a projection
+        base exists, push the base back through the sub and clear the flag. No-op
+        when no overlay is active (e.g. a ``queryUpdate`` already reconciled)."""
+        sub = self._subs_by_id.get(query_id)
+        if sub is None:
+            return
+        if sub.optimistic_active and sub.server_last is not None:
+            sub.optimistic_active = False
+            sub.value = _reproject(sub, sub.server_last)
+            sub.version += 1
+            self._notify(sub)
+
+    def _revert_overlays_for(self, mut_id: str) -> None:
+        """Reverse-index revert: drop ``mut_id``'s entry from ``_overlays`` and
+        revert every subscription it had overlaid. Called from ``mutateErr`` and
+        the reject paths."""
+        qids = self._overlays.pop(mut_id, None)
+        if not qids:
+            return
+        for qid in qids:
+            self._revert_overlay(qid)
 
     def _set_state(self, state: ConnectionState) -> None:
         self._state = state
@@ -640,6 +729,20 @@ class Subscription:
 
 def _tag(msg: Any) -> str:
     return getattr(msg, "type", "")
+
+
+def _reproject(sub: _Sub, overlaid: Any) -> Any:
+    """Re-validate a raw overlaid value through the sub's ``model`` / ``terminal``
+    so the overlay matches what ``_on_query_update`` would produce — typed model
+    instances for a custom model, fresh dict copies for the default ``model=dict``
+    (so a caller mutating ``sub.current()`` cannot corrupt the projection base).
+    The try/except falls back to the raw value if a custom model rejects the
+    overlaid doc (shouldn't happen, since the overlay derives from the same base
+    the server validated)."""
+    try:
+        return parse_result(sub.model, sub.terminal, overlaid)
+    except Exception:
+        return overlaid
 
 
 async def _safe_close(ws: Connection, code: int = 1000) -> None:
