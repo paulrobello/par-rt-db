@@ -137,9 +137,10 @@ async def main() -> None:
     client = RtDbClient("wss://rtdb.pardev.net", "mydb", get_token=get_token)
     await client.connect()
     async with client.subscribe(TableQuery("items").collect()) as sub:
-        await client.mutate(Mutation.builder().insert("items", {"_id": "i1"}).build())
+        # ``_id`` is server-managed (reserved); insert user fields only.
+        await client.mutate(Mutation.builder().insert("items", {"name": "widget", "n": 1}).build())
         async for value in sub:
-            print(value)  # initial [] then [{"_id": "i1", ...}]
+            print(value)  # initial [] then [{"_id": "<server-assigned>", "name": "widget", "n": 1}]
     await client.close()
 
 
