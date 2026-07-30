@@ -21,6 +21,7 @@ use crate::error::RtDbError;
 use crate::protocol::AuthedUser;
 
 use super::github::GithubProvider;
+use super::gitlab::GitlabProvider;
 use super::google::GoogleProvider;
 
 const STATE_TTL_MS: i64 = 10 * 60 * 1000;
@@ -430,6 +431,11 @@ pub fn auth_routes() -> Router<Arc<AppState>> {
         .route(
             "/auth/google/callback",
             get(provider_callback::<GoogleProvider>),
+        )
+        .route("/auth/gitlab", get(provider_start::<GitlabProvider>))
+        .route(
+            "/auth/gitlab/callback",
+            get(provider_callback::<GitlabProvider>),
         )
         .route("/auth/logout", post(logout))
         .route("/auth/me", get(me))

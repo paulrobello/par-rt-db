@@ -1,5 +1,6 @@
 pub mod cookie;
 pub mod github;
+pub mod gitlab;
 pub mod google;
 pub mod provider;
 pub mod session;
