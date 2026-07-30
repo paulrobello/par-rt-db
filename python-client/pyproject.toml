@@ -35,6 +35,9 @@ select = ["E", "F", "I", "UP", "B", "SIM"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = [
+    "live: opt-in live-server integration tests (set RTDB_TEST_SERVER_URL + RTDB_TEST_ADMIN_KEY)",
+]
 
 [tool.pyright]
 include = ["src", "tests"]

@@ -22,7 +22,8 @@ Package name: `par-rt-db` → in Python, `import par_rt_db`.
 | Mutation DSL (`Mutation` builder, `Transaction`, `StepResult`, 7 step ops) | shipped | `par_rt_db.mutation` |
 | Cursor codec (`encode_cursor` / `decode_cursor`) | shipped | `par_rt_db.cursor` |
 | Error model (`RtDbError`, `ErrorCode`, `retry_on_precondition`) | shipped | `par_rt_db.errors` |
-| HTTP / reactive WebSocket / admin clients | planned (follow-on plan) | — |
+| HTTP / admin / storage client (`RtDbHttpClient`, sync `httpx`) | shipped | `par_rt_db.http_client` (`[http]` extra) |
+| Reactive WebSocket client (`RtDbClient`, `Subscription`) | shipped | `par_rt_db.ws_client` (`[ws]` extra) |
 
 The DSL layer is feature-complete: every server query terminal
 (`get`/`index`+`eq`/`gt`/`gte`/`lt`/`lte`/`order`/`take`/`unique`/`first`/`count`/
@@ -44,9 +45,14 @@ uv add par-rt-db
 ```
 
 Requires Python ≥ 3.12 and `pydantic>=2.7`. The optional HTTP and WebSocket
-client extras (`httpx`, `websockets`) will land with the client implementations
-in a follow-on plan — the DSL layer has no third-party dependency beyond
-pydantic.
+client extras pull in `httpx` and `websockets` respectively:
+
+```bash
+pip install par-rt-db[http]    # sync HTTP client + admin control plane + storage
+pip install par-rt-db[ws]      # reactive WebSocket client (live queries, WS mutations)
+```
+
+The DSL layer has no third-party dependency beyond pydantic.
 
 Editable install for development:
 
@@ -115,6 +121,37 @@ serialized query; the server pushes a `queryUpdate` on every committed write
 that touches the table. Use `parse_result(model, terminal, payload)` from
 `par_rt_db.query` to deserialize the untagged `QueryResult` into a typed
 `list[model]`, `model | None`, `int`, or `Paginated[model]`.
+
+### Reactive WebSocket (`[ws]` extra)
+
+```python
+import asyncio
+from par_rt_db import Mutation, TableQuery
+from par_rt_db.ws_client import RtDbClient
+
+
+async def main() -> None:
+    async def get_token() -> str | None:
+        return _token()  # your per-db machine token or OAuth session token
+
+    client = RtDbClient("wss://rtdb.pardev.net", "mydb", get_token=get_token)
+    await client.connect()
+    async with client.subscribe(TableQuery("items").collect()) as sub:
+        await client.mutate(Mutation.builder().insert("items", {"_id": "i1"}).build())
+        async for value in sub:
+            print(value)  # initial [] then [{"_id": "i1", ...}]
+    await client.close()
+
+
+asyncio.run(main())
+```
+
+`RtDbClient` multiplexes live subscriptions, at-most-once mutations, and
+schedule ops over one `/sync` connection with auto-reconnect, re-auth, and
+resubscribe. `get_token` is an async callable (it may refresh an OAuth token);
+return `None` to pause reconnects. Each `subscribe()` returns a `Subscription`
+that is both an async iterator (yields each new value) and exposes the latest
+value via `.current()`. Install with `pip install par-rt-db[ws]`.
 
 ### Schemas and cursors
 

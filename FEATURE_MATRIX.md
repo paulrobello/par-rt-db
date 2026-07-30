@@ -128,10 +128,13 @@ the larger builds:
 
 The four clients share one wire contract across db-side `filter()`, full-text search,
 and vector search: server (`protocol.rs`), ts-client, rust-client, and python-client.
-The python-client ships the wire contract, the schema/mutation/query DSL, **and the
+The python-client ships the wire contract, the schema/mutation/query DSL, **the
 HTTP/admin/storage surfaces** (`pip install par-rt-db[http]` — a sync `httpx` client; admin
 client + storage helpers; schema `FieldType(15)`/indexes/`ownerField`, `TableQuery`
-builders, `Mutation`/`Transaction`, `FilterExpr`, `RtDbError`). **Remaining work is additive
-and non-blocking** — the open python client-parity items are the **reactive WS** surface and
-optimistic updates (the rust-client shipped optimistic updates in #12, matching the
-ts-client).
+builders, `Mutation`/`Transaction`, `FilterExpr`, `RtDbError`), **and the reactive WS
+surface** (`pip install par-rt-db[ws]` — `RtDbClient` with live `subscribe`, at-most-once
+`mutate`, and schedule ops over `/sync`; `Subscription` async iterator with `.current()`).
+Reactive WS / live queries / WS mutations / schedule ops are now mirrored across all four
+clients: ✅ts ✅rust ✅python. **Remaining work is additive and non-blocking** — the only
+open python client-parity item is optimistic updates (the rust-client shipped optimistic
+updates in #12, matching the ts-client).
