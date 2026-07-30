@@ -135,9 +135,12 @@ builders, `Mutation`/`Transaction`, `FilterExpr`, `RtDbError`), **and the reacti
 surface** (`pip install par-rt-db[ws]` — `RtDbClient` with live `subscribe`, at-most-once
 `mutate`, and schedule ops over `/sync`; `Subscription` async iterator with `.current()`).
 Reactive WS / live queries / WS mutations / schedule ops are mirrored across all four
-clients: ✅ts ✅rust ✅python. The HTTP one-shot schedule ops (`POST /api/schedule*`) and
-`/api/query-batch` are in the python HTTP client too (matching ts/rust). **Remaining python
-client-parity work is additive and non-blocking**: optimistic updates (ts + rust ship them),
-an in-memory/offline test harness (`in_memory` + `tick()`, as ts/rust have), and an expanded
-admin control plane (allowlist/admins/metrics/hot-config/ops-feed/list-tokens/get-schema/
-db-stats — python ships ~10 of the ~25 `/admin/*` routes today).
+clients: ✅ts ✅rust ✅python; the HTTP one-shot schedule ops (`POST /api/schedule*`) and
+`/api/query-batch` are in the python HTTP client too. **The four clients are now at feature
+parity** (2026-07-29): python ships optimistic updates (port from rust), an in-memory/offline
+test harness (`par_rt_db.in_memory` + `tick()`), and the full admin control plane
+(allowlist/admins/metrics/hot-config/ops-feed/tokens/schema/stats); ts-client `mutate()`
+returns a typed `StepResult` with an `idempotencyKey` option (`mutId` deprecated); rust-client
+`vector_search`/`hybrid_search` take opts structs. Minor residual: the python in-memory harness
+does not yet implement the `distinct`/`aggregate` query terminals (raises `BAD_REQUEST`); ts/rust
+do. Cross-language API-ergonomic differences (keyword args, casing) are intentional, not gaps.
