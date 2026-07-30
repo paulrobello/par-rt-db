@@ -63,7 +63,7 @@ describe("RtDbHttpClient", () => {
   });
 
   it("posts a mutation and returns the results array", async () => {
-    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ results: ["new-id"] }));
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ results: [{ id: "new-id" }] }));
     const client = new RtDbHttpClient({
       url: "http://h:8300",
       db: "kanban",
@@ -73,7 +73,7 @@ describe("RtDbHttpClient", () => {
 
     const results = await client.mutate(mutation().insert("items", { title: "x" }).build());
 
-    expect(results).toEqual(["new-id"]);
+    expect(results).toEqual([{ id: "new-id" }]);
     expect(fetchMock.mock.calls[0][0]).toBe("http://h:8300/api/mutate");
   });
 
@@ -158,7 +158,7 @@ describe("RtDbHttpClient", () => {
   });
 
   it("forwards opts.mutId as idempotencyKey in the request body when provided", async () => {
-    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ results: ["new-id"] }));
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ results: [{ id: "new-id" }] }));
     const client = new RtDbHttpClient({
       url: "http://h:8300",
       db: "kanban",
@@ -174,8 +174,43 @@ describe("RtDbHttpClient", () => {
     expect(JSON.parse(init.body).idempotencyKey).toBe("caller-key-1");
   });
 
+  it("forwards opts.idempotencyKey in the request body (preferred alias for mutId)", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ results: [{ id: "new-id" }] }));
+    const client = new RtDbHttpClient({
+      url: "http://h:8300",
+      db: "kanban",
+      token: "tok",
+      fetch: fetchMock,
+    });
+
+    await client.mutate(mutation().insert("items", { title: "x" }).build(), {
+      idempotencyKey: "caller-key-2",
+    });
+
+    const [, init] = fetchMock.mock.calls[0];
+    expect(JSON.parse(init.body).idempotencyKey).toBe("caller-key-2");
+  });
+
+  it("prefers opts.idempotencyKey over opts.mutId when both are supplied", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ results: [{ id: "new-id" }] }));
+    const client = new RtDbHttpClient({
+      url: "http://h:8300",
+      db: "kanban",
+      token: "tok",
+      fetch: fetchMock,
+    });
+
+    await client.mutate(mutation().insert("items", { title: "x" }).build(), {
+      idempotencyKey: "preferred",
+      mutId: "alias",
+    });
+
+    const [, init] = fetchMock.mock.calls[0];
+    expect(JSON.parse(init.body).idempotencyKey).toBe("preferred");
+  });
+
   it("omits idempotencyKey from the request body when not provided", async () => {
-    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ results: ["new-id"] }));
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ results: [{ id: "new-id" }] }));
     const client = new RtDbHttpClient({
       url: "http://h:8300",
       db: "kanban",

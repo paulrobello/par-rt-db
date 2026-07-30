@@ -35,7 +35,8 @@ export type {
 } from "./schema.js";
 export { createApi, TableQuery } from "./query.js";
 export type { ClientApi, RtQuery, TableApi } from "./query.js";
-export { mutation, TxnBuilder } from "./mutation.js";
+export { mutation, parseStepResults, TxnBuilder } from "./mutation.js";
+export type { StepInsertResult, StepResult, StepUpsertResult } from "./mutation.js";
 export { projectOptimisticUpdate } from "./optimistic.js";
 export type { OptimisticProjection } from "./optimistic.js";
 export { retryOnPrecondition } from "./retry.js";

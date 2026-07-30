@@ -125,8 +125,8 @@ describe("RtDbClient", () => {
     const okFrame = frames(sockets[0]).find((m) => m.type === "mutate") as unknown as {
       mutId: string;
     };
-    sockets[0].deliver({ type: "mutateOk", mutId: okFrame.mutId, results: ["id-1"] });
-    await expect(okPromise).resolves.toEqual(["id-1"]);
+    sockets[0].deliver({ type: "mutateOk", mutId: okFrame.mutId, results: [{ id: "id-1" }] });
+    await expect(okPromise).resolves.toEqual([{ id: "id-1" }]);
 
     const errPromise = client.mutate({ steps: [] });
     const errFrame = frames(sockets[0])
@@ -268,6 +268,41 @@ describe("RtDbClient", () => {
     };
     expect(frame.idempotencyKey).toBe("caller-key-1");
     expect(frame.mutId).toMatch(/^mut-\d+$/);
+  });
+
+  it("sends opts.idempotencyKey on the wire (preferred alias for mutId)", () => {
+    const { client, sockets } = newClient();
+    client.connect();
+    sockets[0].open();
+    sockets[0].deliver({ type: "authOk", user: { kind: "machine" } });
+
+    client.mutate(
+      { steps: [{ op: "insert", table: "items", doc: {} }] },
+      { idempotencyKey: "caller-key-2" },
+    );
+    const frame = frames(sockets[0]).find((m) => m.type === "mutate") as unknown as {
+      mutId: string;
+      idempotencyKey?: string;
+    };
+    expect(frame.idempotencyKey).toBe("caller-key-2");
+    // mutId stays the internal reply-correlation id (mut-<n>), unaffected.
+    expect(frame.mutId).toMatch(/^mut-\d+$/);
+  });
+
+  it("prefers opts.idempotencyKey over opts.mutId when both are supplied", () => {
+    const { client, sockets } = newClient();
+    client.connect();
+    sockets[0].open();
+    sockets[0].deliver({ type: "authOk", user: { kind: "machine" } });
+
+    client.mutate(
+      { steps: [{ op: "insert", table: "items", doc: {} }] },
+      { idempotencyKey: "preferred", mutId: "alias" },
+    );
+    const frame = frames(sockets[0]).find((m) => m.type === "mutate") as unknown as {
+      idempotencyKey?: string;
+    };
+    expect(frame.idempotencyKey).toBe("preferred");
   });
 
   it("omits idempotencyKey from the wire frame when opts.mutId is not provided", () => {

@@ -1,5 +1,6 @@
 import { RtDbError } from "./errors.js";
 import { RtDbHttpClient } from "./http.js";
+import { parseStepResults, type StepResult } from "./mutation.js";
 import { projectOptimisticUpdate } from "./optimistic.js";
 import type {
   AuthedUser,
@@ -60,7 +61,7 @@ interface Subscription {
 }
 
 interface PendingMutate {
-  resolve: (results: unknown[]) => void;
+  resolve: (results: StepResult[]) => void;
   reject: (error: RtDbError) => void;
 }
 
@@ -282,16 +283,27 @@ export class RtDbClient {
   }
 
   /**
-   * `opts.mutId` is an idempotency key, not a display/tracking id: supply the
-   * *same* value again to safely retry a mutation whose result you never
-   * received (e.g. after a dropped connection) instead of double-applying
-   * it. The server does not fingerprint the transaction body, so reusing a
-   * key for a different mutation replays the first one's cached result.
-   * Omit it for ordinary at-most-once calls (today's default behavior).
+   * `opts.idempotencyKey` is an idempotency key, not a display/tracking id:
+   * supply the *same* value again to safely retry a mutation whose result you
+   * never received (e.g. after a dropped connection) instead of double-applying
+   * it. The server does not fingerprint the transaction body, so reusing a key
+   * for a different mutation replays the first one's cached result. Omit it for
+   * ordinary at-most-once calls (today's default behavior).
+   *
+   * `opts.mutId` is a deprecated alias for `opts.idempotencyKey` and remains
+   * accepted for backwards compatibility; it is unrelated to the wire-only
+   * `mutId` reply-correlation field.
    */
-  mutate(txn: TransactionJson, opts?: { mutId?: string }): Promise<unknown[]> {
+  mutate(
+    txn: TransactionJson,
+    opts?: {
+      idempotencyKey?: string;
+      /** @deprecated use `idempotencyKey`. Unrelated to the wire reply-correlation field. */
+      mutId?: string;
+    },
+  ): Promise<StepResult[]> {
     const mutId = `mut-${++this.counter}`;
-    return new Promise<unknown[]>((resolve, reject) => {
+    return new Promise<StepResult[]>((resolve, reject) => {
       if (this.stopped) {
         reject(new RtDbError("INTERNAL", "client is closed"));
         return;
@@ -302,7 +314,13 @@ export class RtDbClient {
       if (this.optimistic) {
         this.applyOptimistic(mutId, txn);
       }
-      const entry: QueuedMutate = { mutId, idempotencyKey: opts?.mutId, txn, resolve, reject };
+      const entry: QueuedMutate = {
+        mutId,
+        idempotencyKey: opts?.idempotencyKey ?? opts?.mutId,
+        txn,
+        resolve,
+        reject,
+      };
       if (this.authState === "authenticated" && this.socket) {
         this.dispatchMutate(entry);
       } else {
@@ -611,7 +629,7 @@ export class RtDbClient {
         // Succeeded: a queryUpdate will reconcile the overlay, so just drop the
         // tracking — do not revert.
         this.optimisticOverlays.delete(msg.mutId);
-        pending?.resolve(msg.results);
+        pending?.resolve(parseStepResults(msg.results));
         break;
       }
       case "mutateErr": {

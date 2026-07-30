@@ -1,4 +1,5 @@
 import { RtDbError } from "./errors.js";
+import { parseStepResults, type StepResult } from "./mutation.js";
 import type {
   AuthedUser,
   BatchQueryOutcomeJson,
@@ -66,19 +67,31 @@ export class RtDbHttpClient {
   }
 
   /**
-   * `opts.mutId` is an idempotency key, not a display/tracking id: supply the
-   * *same* value again to safely retry a mutation whose result you never
-   * received instead of double-applying it. The server does not fingerprint
-   * the transaction body, so reusing a key for a different mutation replays
-   * the first one's cached result. Omit it for ordinary one-shot calls.
+   * `opts.idempotencyKey` is an idempotency key, not a display/tracking id:
+   * supply the *same* value again to safely retry a mutation whose result you
+   * never received instead of double-applying it. The server does not
+   * fingerprint the transaction body, so reusing a key for a different
+   * mutation replays the first one's cached result. Omit it for ordinary
+   * one-shot calls.
+   *
+   * `opts.mutId` is a deprecated alias for `opts.idempotencyKey` and remains
+   * accepted for backwards compatibility; it is unrelated to the wire-only
+   * `mutId` reply-correlation field used on the WS transport.
    */
-  async mutate(txn: TransactionJson, opts?: { mutId?: string }): Promise<unknown[]> {
+  async mutate(
+    txn: TransactionJson,
+    opts?: {
+      idempotencyKey?: string;
+      /** @deprecated use `idempotencyKey`. Unrelated to the WS reply-correlation field. */
+      mutId?: string;
+    },
+  ): Promise<StepResult[]> {
     const body = await this.post("/api/mutate", {
       db: this.db,
       txn,
-      idempotencyKey: opts?.mutId,
+      idempotencyKey: opts?.idempotencyKey ?? opts?.mutId,
     });
-    return (body as { results: unknown[] }).results;
+    return parseStepResults((body as { results: unknown[] }).results);
   }
 
   /** Schedules `txn` for `when`; the server validates cron expressions. */

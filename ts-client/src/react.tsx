@@ -9,6 +9,7 @@ import {
   useState,
 } from "react";
 import type { AuthState, ConnectionState, RtDbClient } from "./client.js";
+import type { StepResult } from "./mutation.js";
 import type { AuthedUser, TransactionJson } from "./protocol.js";
 import type { RtQuery } from "./query.js";
 
@@ -102,7 +103,7 @@ export function useQuery<R>(query: RtQuery<R> | "skip"): R | undefined {
   return value;
 }
 
-export function useMutation(): (txn: TransactionJson) => Promise<unknown[]> {
+export function useMutation(): (txn: TransactionJson) => Promise<StepResult[]> {
   const { client } = useContextValue();
   return useCallback((txn: TransactionJson) => client.mutate(txn), [client]);
 }

@@ -1,5 +1,6 @@
 import { RtDbError } from "./errors.js";
 import type { FileMetadata, UploadResult } from "./http.js";
+import { parseStepResults, type StepResult } from "./mutation.js";
 import { decodeCursor, encodeCursor } from "./pagination.js";
 import type {
   AggregateOp,
@@ -635,19 +636,28 @@ export class InMemoryRtDbClient {
   }
 
   /** Executes a transaction and returns one result per step, in order. Same
-   * shape (and `mutId` idempotency-key semantics) as the live clients. */
-  async mutate(txn: TransactionJson, opts?: { mutId?: string }): Promise<unknown[]> {
-    if (opts?.mutId) {
-      const cached = this.idempotency.get(opts.mutId);
+   * shape (and `idempotencyKey` semantics) as the live clients; `mutId` is a
+   * deprecated alias for `idempotencyKey`. */
+  async mutate(
+    txn: TransactionJson,
+    opts?: {
+      idempotencyKey?: string;
+      /** @deprecated use `idempotencyKey`. */
+      mutId?: string;
+    },
+  ): Promise<StepResult[]> {
+    const idempotencyKey = opts?.idempotencyKey ?? opts?.mutId;
+    if (idempotencyKey) {
+      const cached = this.idempotency.get(idempotencyKey);
       if (cached) {
-        return clone(cached);
+        return parseStepResults(clone(cached));
       }
     }
     const results = this.executeTransaction(txn);
-    if (opts?.mutId) {
-      this.idempotency.set(opts.mutId, clone(results));
+    if (idempotencyKey) {
+      this.idempotency.set(idempotencyKey, clone(results));
     }
-    return results;
+    return parseStepResults(results);
   }
 
   /** Synchronous atomic core shared by `mutate` and `tick`'s scheduled fires:
