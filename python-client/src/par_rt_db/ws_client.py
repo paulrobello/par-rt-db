@@ -21,9 +21,21 @@ from typing import Any, Protocol
 
 from pydantic import TypeAdapter
 
-from .errors import RtDbError
+from .errors import ErrorCode, RtDbError
+from .mutation import StepResult, Transaction
 from .query import _dump_query, _terminal_of, parse_result
-from .wire import AuthedUser, ServerMessage
+from .wire import (
+    AuthedUser,
+    ScheduleInfo,
+    ScheduleWhen,
+    ServerMessage,
+    _ClientCancelSchedule,
+    _ClientListSchedules,
+    _ClientMutate,
+    _ClientPauseSchedule,
+    _ClientResumeSchedule,
+    _ClientSchedule,
+)
 
 
 def _sync_url(url: str) -> str:
@@ -50,6 +62,7 @@ def _backoff_delay(attempt: int, base: float, max_delay: float, rand: float) -> 
 # --- Connection core: driver, handshake, reconnect, heartbeat -----------------
 
 _SERVER = TypeAdapter(ServerMessage)
+_STEP_RESULT_ADAPTER = TypeAdapter(StepResult)
 
 _AUTH_FAILED_CODE = 4401
 _AUTH_DEADLINE = 15.0
@@ -108,6 +121,27 @@ class _Sub:
     subscribed: bool = False
     closed: bool = False
     cond: asyncio.Condition = field(default_factory=asyncio.Condition)
+
+
+@dataclass
+class _MutPending:
+    """One in-flight or queued mutation, keyed by its correlation id (``mut-{n}``)."""
+
+    future: asyncio.Future
+    frame: str
+    id: str = ""  # the mutId correlation key; ``_reject_inflight`` pops by this
+    sent: bool = False  # True once the frame is on the wire (in-flight)
+
+
+@dataclass
+class _SchedPending:
+    """One in-flight or queued schedule op, keyed by its correlation id (``sch-{n}``)."""
+
+    future: asyncio.Future
+    frame: str
+    id: str = ""  # the scheduleId correlation key; popped by this on drop
+    kind: str = ""  # "schedule" | "cancel" | "pause" | "resume" | "list"
+    sent: bool = False
 
 
 class RtDbClient:
@@ -439,12 +473,114 @@ class RtDbClient:
         with contextlib.suppress(RuntimeError):
             asyncio.get_running_loop().create_task(_wake())
 
-    # Populated in Task 4:
-    def _on_mutate_ok(self, msg: Any) -> None: ...
-    def _on_mutate_err(self, msg: Any) -> None: ...
-    def _on_sched(self, msg: Any) -> None: ...
-    def _reject_all_pending(self, reason: str) -> None: ...
-    def _reject_inflight(self, reason: str) -> None: ...
+    # --- mutations + schedule ops (Task 4) -----------------------------
+    #
+    # At-most-once: each call registers a future keyed by its correlation id
+    # (``mut-{n}`` / ``sch-{n}``). When CONNECTED the frame is sent immediately
+    # and the entry is marked ``sent=True`` (in-flight); when not connected the
+    # entry stays ``sent=False`` (queued) and ``_flush_on_auth`` sends it on the
+    # next ``authOk``. A reconnectable drop rejects only in-flight entries; a
+    # ``close()`` rejects all of them.
+
+    async def mutate(
+        self, txn: Transaction, *, idempotency_key: str | None = None
+    ) -> list[StepResult]:
+        self._counter += 1
+        mid = f"mut-{self._counter}"
+        frame = _ClientMutate(
+            mut_id=mid,
+            idempotency_key=idempotency_key,
+            txn=txn.model_dump(by_alias=True, mode="json"),
+        ).model_dump_json(by_alias=True)
+        fut = asyncio.get_running_loop().create_future()
+        self._pending_mut[mid] = _MutPending(fut, frame, id=mid)
+        await self._dispatch_send(mid, self._pending_mut)
+        return await fut
+
+    async def _dispatch_send(self, key: str, table: dict[str, Any]) -> None:
+        entry = table[key]
+        if self._state is ConnectionState.CONNECTED:
+            await self._send(entry.frame)
+            entry.sent = True
+        # else: queued; ``_flush_on_auth`` sends it on the next authOk.
+
+    async def schedule(self, txn: Transaction, when: ScheduleWhen) -> str:
+        return await self._sched_op("schedule", txn=txn, when=when)  # type: ignore[return-value]
+
+    async def cancel_schedule(self, id: str) -> None:
+        await self._sched_op("cancel", id=id)
+
+    async def pause_schedule(self, id: str) -> None:
+        await self._sched_op("pause", id=id)
+
+    async def resume_schedule(self, id: str) -> None:
+        await self._sched_op("resume", id=id)
+
+    async def list_schedules(self) -> list[ScheduleInfo]:
+        return await self._sched_op("list")  # type: ignore[return-value]
+
+    async def _sched_op(self, kind: str, **fields: Any) -> Any:
+        self._counter += 1
+        sid = f"sch-{self._counter}"
+        frame = _build_sched_frame(kind, sid, fields)
+        fut = asyncio.get_running_loop().create_future()
+        self._pending_sched[sid] = _SchedPending(fut, frame, id=sid, kind=kind)
+        await self._dispatch_send(sid, self._pending_sched)
+        return await fut
+
+    def _on_mutate_ok(self, msg: Any) -> None:
+        mp = self._pending_mut.pop(msg.mut_id, None)
+        if mp is not None and not mp.future.done():
+            mp.future.set_result([_STEP_RESULT_ADAPTER.validate_python(r) for r in msg.results])
+
+    def _on_mutate_err(self, msg: Any) -> None:
+        mp = self._pending_mut.pop(msg.mut_id, None)
+        if mp is not None and not mp.future.done():
+            mp.future.set_exception(RtDbError.from_envelope(msg.error.model_dump()))
+
+    def _on_sched(self, msg: Any) -> None:
+        sp = self._pending_sched.pop(msg.schedule_id, None)
+        if sp is None or sp.future.done():
+            return
+        tag = _tag(msg)
+        if tag == "scheduleOk":
+            sp.future.set_result(msg.id)
+        elif tag == "listSchedulesOk":
+            sp.future.set_result(list(msg.schedules))
+        elif tag == "scheduleErr":
+            sp.future.set_exception(RtDbError.from_envelope(msg.error.model_dump()))
+        elif tag == "scheduleAck":
+            if msg.ok:
+                sp.future.set_result(None)
+            else:
+                env = (
+                    msg.error.model_dump()
+                    if msg.error is not None
+                    else {"code": "INTERNAL", "message": "schedule ack failed"}
+                )
+                sp.future.set_exception(RtDbError.from_envelope(env))
+
+    def _reject_inflight(self, reason: str) -> None:
+        # Only in-flight (sent) entries die on a reconnectable drop; queued
+        # entries survive so ``_flush_on_auth`` can resend them on reconnect.
+        for mp in list(self._pending_mut.values()):
+            if mp.sent and not mp.future.done():
+                self._pending_mut.pop(mp.id, None)
+                mp.future.set_exception(RtDbError(ErrorCode.INTERNAL, reason))
+        for sp in list(self._pending_sched.values()):
+            if sp.sent and not sp.future.done():
+                self._pending_sched.pop(sp.id, None)
+                sp.future.set_exception(RtDbError(ErrorCode.INTERNAL, reason))
+
+    def _reject_all_pending(self, reason: str) -> None:
+        for mp in list(self._pending_mut.values()):
+            if not mp.future.done():
+                mp.future.set_exception(RtDbError(ErrorCode.INTERNAL, reason))
+        self._pending_mut.clear()
+        for sp in list(self._pending_sched.values()):
+            if not sp.future.done():
+                sp.future.set_exception(RtDbError(ErrorCode.INTERNAL, reason))
+        self._pending_sched.clear()
 
     def _set_state(self, state: ConnectionState) -> None:
         self._state = state
@@ -521,6 +657,27 @@ def _ping_frame() -> str:
     from .wire import _ClientPing
 
     return _ClientPing().model_dump_json(by_alias=True)
+
+
+def _build_sched_frame(kind: str, sid: str, fields: dict[str, Any]) -> str:
+    """Serialize a schedule-op frame for correlation id ``sid`` (``sch-{n}``)."""
+    if kind == "schedule":
+        return _ClientSchedule(
+            schedule_id=sid,
+            when=fields["when"],
+            txn=fields["txn"].model_dump(by_alias=True, mode="json"),
+        ).model_dump_json(by_alias=True)
+    if kind == "cancel":
+        return _ClientCancelSchedule(schedule_id=sid, id=fields["id"]).model_dump_json(
+            by_alias=True
+        )
+    if kind == "pause":
+        return _ClientPauseSchedule(schedule_id=sid, id=fields["id"]).model_dump_json(by_alias=True)
+    if kind == "resume":
+        return _ClientResumeSchedule(schedule_id=sid, id=fields["id"]).model_dump_json(
+            by_alias=True
+        )
+    return _ClientListSchedules(schedule_id=sid).model_dump_json(by_alias=True)
 
 
 async def _default_connect(url: str) -> Connection:

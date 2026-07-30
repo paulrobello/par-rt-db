@@ -5,7 +5,8 @@ import json
 
 import pytest
 
-from par_rt_db import TableQuery
+from par_rt_db import Mutation, TableQuery, Transaction
+from par_rt_db.wire import _AfterMs
 from par_rt_db.ws_client import (
     ConnectionState,
     RtDbClient,
@@ -354,5 +355,146 @@ async def test_reconnect_resubscribes_active_queries():
         await conn2.deliver('{"type":"authOk","user":{"kind":"machine"}}')
         await _wait_until(lambda: any('"type":"subscribe"' in f for f in conn2.sent))
         assert client.status().state is ConnectionState.CONNECTED
+    finally:
+        await client.close()
+
+
+# --- Mutate + schedule ops (Task 4) -------------------------------------
+#
+# At-most-once contract: a mutate/schedule frame is sent once when connected
+# (marked in-flight) and resolved by the matching server ack/ok/err. On a
+# reconnectable drop only in-flight entries are rejected; queued entries
+# (created while disconnected) survive and flush on the next authOk.
+
+
+def _insert_txn() -> Transaction:
+    """A trivial one-step insert transaction used across the mutate tests."""
+    return Mutation.builder().insert("items", {"_id": "i1", "n": 1}).build()
+
+
+def _id(conn: FakeConn, typ: str) -> str:
+    """Read the correlation id (mutId / scheduleId) the client assigned."""
+    key = {"mutate": "mutId", "schedule": "scheduleId", "cancelSchedule": "scheduleId"}[typ]
+    for f in conn.sent:
+        d = json.loads(f)
+        if d.get("type") == typ:
+            return d[key]
+    raise AssertionError(f"no frame of type {typ}")
+
+
+async def test_mutate_resolves_on_mutate_ok():
+    conn = FakeConn()
+    client = await _connected(conn)
+    try:
+        task = asyncio.create_task(client.mutate(_insert_txn()))
+        await _drain()
+        mid = _id(conn, "mutate")
+        # StepResult insert shape is ``{"id"}`` (no ``op`` — see http_client tests).
+        await conn.deliver('{"type":"mutateOk","mutId":"' + mid + '","results":[{"id":"i1"}]}')
+        await _drain()
+        results = await asyncio.wait_for(task, 1.0)
+        assert results[0] is not None
+        assert results[0].id == "i1"
+    finally:
+        await client.close()
+
+
+async def test_mutate_rejects_on_mutate_err():
+    conn = FakeConn()
+    client = await _connected(conn)
+    try:
+        task = asyncio.create_task(client.mutate(_insert_txn()))
+        await _drain()
+        mid = _id(conn, "mutate")
+        await conn.deliver(
+            '{"type":"mutateErr","mutId":"'
+            + mid
+            + '","error":{"code":"NOT_FOUND","message":"no table"}}'
+        )
+        await _drain()
+        with pytest.raises(RtDbError):
+            await asyncio.wait_for(task, 1.0)
+    finally:
+        await client.close()
+
+
+async def test_inflight_mutate_rejected_on_drop():
+    conn = FakeConn()
+    client = await _connected(conn)
+    try:
+        # One in-flight mutate (sent), then a reconnectable drop.
+        inflight = asyncio.create_task(client.mutate(_insert_txn()))
+        await _drain()
+        conn.close_code = 4000
+        await conn._inbox.put(None)
+        await _drain()
+        with pytest.raises(RtDbError):
+            await asyncio.wait_for(inflight, 1.0)
+    finally:
+        await client.close()
+
+
+async def test_queued_mutate_survives_drop_flushes_on_reconnect():
+    conn1 = FakeConn()
+    client, _ = make_client(conn1)
+    try:
+        await client.connect()
+        await _drain()
+        await conn1.deliver('{"type":"authOk","user":{"kind":"machine"}}')
+        await _drain()
+        assert client.status().state is ConnectionState.CONNECTED
+
+        # Swap to a gated connect so the reconnect parks inside _connect (state
+        # CONNECTING) while we queue a mutate from a disconnected state.
+        conn2 = FakeConn()
+        gate = asyncio.Event()
+
+        async def _gated_connect2(url: str) -> FakeConn:
+            await gate.wait()
+            return conn2
+
+        client._connect = _gated_connect2
+        conn1.close_code = 4000
+        await conn1._inbox.put(None)
+        await _wait_until(lambda: client.status().state is ConnectionState.CONNECTING)
+
+        queued = asyncio.create_task(client.mutate(_insert_txn()))
+        await _drain()
+        # Not sent yet — the entry is queued (sent=False).
+        assert not any('"type":"mutate"' in f for f in conn2.sent)
+
+        # Release the reconnect; the queued frame flushes right after authOk.
+        gate.set()
+        await _wait_until(lambda: any('"type":"auth"' in f for f in conn2.sent))
+        await conn2.deliver('{"type":"authOk","user":{"kind":"machine"}}')
+        await _wait_until(lambda: any('"type":"mutate"' in f for f in conn2.sent))
+        mid = _id(conn2, "mutate")
+        await conn2.deliver('{"type":"mutateOk","mutId":"' + mid + '","results":[{"id":"i1"}]}')
+        results = await asyncio.wait_for(queued, 1.0)
+        assert results[0] is not None
+        assert results[0].id == "i1"
+        assert client.status().state is ConnectionState.CONNECTED
+    finally:
+        await client.close()
+
+
+async def test_schedule_lifecycle():
+    conn = FakeConn()
+    client = await _connected(conn)
+    try:
+        # ScheduleWhen is a pydantic discriminated union (tagged on "type"),
+        # not a tuple — build the afterMs variant directly.
+        sch = asyncio.create_task(client.schedule(_insert_txn(), _AfterMs(ms=100)))
+        await _drain()
+        sid = _id(conn, "schedule")
+        await conn.deliver('{"type":"scheduleOk","scheduleId":"' + sid + '","id":"job-1"}')
+        job_id = await asyncio.wait_for(sch, 1.0)
+        assert job_id == "job-1"
+
+        cancel = asyncio.create_task(client.cancel_schedule("job-1"))
+        await _drain()
+        ack_sid = _id(conn, "cancelSchedule")
+        await conn.deliver('{"type":"scheduleAck","scheduleId":"' + ack_sid + '","ok":true}')
+        await asyncio.wait_for(cancel, 1.0)  # resolves without error
     finally:
         await client.close()
