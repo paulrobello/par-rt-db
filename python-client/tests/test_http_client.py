@@ -220,6 +220,108 @@ def test_upsert_by_index_inserts_when_no_match() -> None:
     assert step["eq"] == ["a@b.com"]
 
 
+# --- data plane: scheduling + batch query -----------------------------------
+
+
+def test_schedule_posts_when_and_txn_returns_id() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"id": "sch-1"})
+
+    from par_rt_db.wire import _AfterMs
+
+    client = _client(handler)
+    txn = Mutation.builder().insert("items", {"name": "x"}).build()
+    sid = client.schedule(txn, _AfterMs(ms=5000))
+    assert sid == "sch-1"
+    assert captured["body"]["db"] == DB
+    assert captured["body"]["when"] == {"type": "afterMs", "ms": 5000}
+    assert captured["body"]["txn"]["steps"][0]["op"] == "insert"
+
+
+def test_schedule_manage_ops_post_to_id_paths() -> None:
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.path)
+        return httpx.Response(200, json={"ok": True})
+
+    client = _client(handler)
+    client.cancel_schedule("sch-1")
+    client.pause_schedule("sch-1")
+    client.resume_schedule("sch-1")
+    assert seen == [
+        "/api/schedule/sch-1/cancel",
+        "/api/schedule/sch-1/pause",
+        "/api/schedule/sch-1/resume",
+    ]
+
+
+def test_list_schedules_returns_schedule_info_list() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert json.loads(request.content) == {"db": DB}
+        return httpx.Response(
+            200,
+            json={
+                "schedules": [
+                    {
+                        "id": "sch-1",
+                        "kind": "oneshot",
+                        "dueAt": 1000,
+                        "status": "pending",
+                        "createdAt": 500,
+                        "firedCount": 0,
+                    },
+                    {
+                        "id": "sch-2",
+                        "kind": "cron",
+                        "dueAt": 2000,
+                        "status": "running",
+                        "cron": "0 9 * * *",
+                        "createdAt": 500,
+                        "firedCount": 3,
+                    },
+                ]
+            },
+        )
+
+    client = _client(handler)
+    schedules = client.list_schedules()
+    assert [s.id for s in schedules] == ["sch-1", "sch-2"]
+    assert schedules[0].kind == "oneshot"
+    assert schedules[0].fired_count == 0
+    assert schedules[1].cron == "0 9 * * *"
+
+
+def test_batch_query_returns_one_outcome_per_input() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "results": [
+                    {"ok": True, "result": [{"_id": "i1"}]},
+                    {"ok": False, "error": {"code": "NOT_FOUND", "message": "no index"}},
+                ]
+            },
+        )
+
+    client = _client(handler)
+    outcomes = client.batch_query([TableQuery("items").collect(), TableQuery("items").first()])
+    assert captured["body"]["db"] == DB
+    assert len(captured["body"]["queries"]) == 2
+    assert len(outcomes) == 2
+    assert outcomes[0].ok is True
+    assert outcomes[0].result == [{"_id": "i1"}]
+    assert outcomes[1].ok is False
+    assert outcomes[1].error is not None
+    assert outcomes[1].error.code == "NOT_FOUND"
+
+
 # --- error envelope ---------------------------------------------------------
 
 

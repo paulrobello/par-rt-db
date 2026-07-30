@@ -32,7 +32,7 @@ from .errors import ErrorCode, RtDbError
 from .mutation import StepResult, Transaction
 from .query import Query, TableQuery, _terminal_of, parse_result
 from .schema import SchemaDef
-from .wire import to_camel
+from .wire import BatchQueryOutcome, ScheduleInfo, ScheduleWhen, to_camel
 
 if TYPE_CHECKING:
     import httpx
@@ -82,6 +82,9 @@ class FileMetadata(_Wire):
 # ``StepResult`` is a ``Union`` alias (no ``model_validate``); route through a
 # single ``TypeAdapter`` for the untagged per-step result, mirroring mutation.py.
 _STEP_RESULT_ADAPTER = TypeAdapter(StepResult)
+# ``list[...]`` aliases likewise need a TypeAdapter to validate at runtime.
+_SCHEDULES_ADAPTER = TypeAdapter(list[ScheduleInfo])
+_BATCH_ADAPTER = TypeAdapter(list[BatchQueryOutcome])
 
 
 class RtDbHttpClient:
@@ -224,6 +227,66 @@ class RtDbHttpClient:
         if not results:
             raise RtDbError(ErrorCode.INTERNAL, "upsert returned no result")
         return results[0]
+
+    # --- data plane: scheduling (POST /api/schedule*) ---
+
+    def schedule(self, txn: Transaction, when: ScheduleWhen) -> str:
+        """``POST /api/schedule`` → the new schedule's id.
+
+        ``when`` is a ``ScheduleWhen`` (``_AfterMs``/``_RunAt``/``_Cron`` from
+        ``par_rt_db.wire``). One-shot jobs past due run immediately; cron jobs
+        skip missed windows (server-side semantics).
+        """
+        body = {
+            "db": self._db,
+            "when": when.model_dump(by_alias=True, mode="json"),
+            "txn": txn.model_dump(by_alias=True, mode="json"),
+        }
+        resp = self._send("POST", "/api/schedule", json=body)
+        return str(resp.json()["id"])
+
+    def cancel_schedule(self, id: str) -> None:
+        """``POST /api/schedule/{id}/cancel``."""
+        self._manage_schedule(id, "cancel")
+
+    def pause_schedule(self, id: str) -> None:
+        """``POST /api/schedule/{id}/pause``."""
+        self._manage_schedule(id, "pause")
+
+    def resume_schedule(self, id: str) -> None:
+        """``POST /api/schedule/{id}/resume``."""
+        self._manage_schedule(id, "resume")
+
+    def _manage_schedule(self, id: str, op: str) -> None:
+        """Shared authorize-then-op for cancel/pause/resume (``{db}`` body → ``{ok}``)."""
+        resp = self._send("POST", f"/api/schedule/{id}/{op}", json={"db": self._db})
+        self._expect_ok(resp)
+
+    def list_schedules(self) -> list[ScheduleInfo]:
+        """``POST /api/schedules`` → every schedule for this db."""
+        resp = self._send("POST", "/api/schedules", json={"db": self._db})
+        return _SCHEDULES_ADAPTER.validate_python(resp.json()["schedules"])
+
+    # --- data plane: batch query (POST /api/query-batch) ---
+
+    def batch_query(self, queries: list[Query | TableQuery]) -> list[BatchQueryOutcome]:
+        """Fan out over many queries in one round trip → one outcome per input.
+
+        ``POST /api/query-batch`` runs auth/owner resolution once for the whole
+        request; each query's outcome lands in its own aligned slot. An errored
+        query becomes that slot's ``{ok: false, error}`` and never fails the
+        batch — only the db-level bearer/authorize gate returns non-200. Each
+        ``BatchQueryOutcome.result`` is the raw untagged ``QueryResult``; decode
+        with ``query.parse_result(model, terminal, outcome.result)`` per query.
+        """
+        wire_queries = [
+            (q.build() if isinstance(q, TableQuery) else q).model_dump(by_alias=True, mode="json")
+            for q in queries
+        ]
+        resp = self._send(
+            "POST", "/api/query-batch", json={"db": self._db, "queries": wire_queries}
+        )
+        return _BATCH_ADAPTER.validate_python(resp.json()["results"])
 
     # --- storage (machine token; HTTP-only, bypasses the committer) ---
 

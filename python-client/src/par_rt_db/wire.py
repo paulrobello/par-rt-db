@@ -408,6 +408,22 @@ class _ErrorEnvelope(_Camel):
     message: str
 
 
+class BatchQueryOutcome(_Camel):
+    """One slot of a ``POST /api/query-batch`` response.
+
+    Exactly one of ``result`` / ``error`` accompanies ``ok``: an ok slot is
+    ``{ok: true, result: ...}``; an errored slot is ``{ok: false, error: {...}}``
+    (``result``/``error`` are omitted on the wire when ``None``). ``result`` is
+    the untagged ``QueryResult`` — decode it per-query with
+    ``query.parse_result(model, terminal, outcome.result)``. Mirrors
+    ``server/src/http_api.rs::BatchQueryOutcome`` and ``rust-client``'s wire type.
+    """
+
+    ok: bool
+    result: object | None = None
+    error: _ErrorEnvelope | None = None
+
+
 class _ServerAuthOk(_Camel):
     type: Literal["authOk"] = "authOk"
     user: AuthedUser
