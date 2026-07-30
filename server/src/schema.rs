@@ -270,8 +270,10 @@ fn literal_set(ty: &FieldType) -> Option<Vec<&serde_json::Value>> {
                     _ => None,
                 })
                 .collect();
-            // Finite only when every variant is a Literal.
-            if vals.len() == variants.len() {
+            // Finite only when every variant is a Literal. An empty union is
+            // refused so is_widening_of never returns a vacuous true for it
+            // (empty unions are also rejected at validation time).
+            if vals.len() == variants.len() && !variants.is_empty() {
                 Some(vals)
             } else {
                 None
@@ -1798,6 +1800,12 @@ mod tests {
         }
     }
 
+    fn lit(s: &str) -> FieldType {
+        FieldType::Literal {
+            value: serde_json::Value::String(s.to_string()),
+        }
+    }
+
     #[test]
     fn is_widening_of_allows_adding_a_union_variant() {
         let old = union_of(&["low", "medium", "high"]);
@@ -1836,5 +1844,26 @@ mod tests {
         };
         assert!(!is_widening_of(&mixed, &union_of(&["a", "b"])));
         assert!(!is_widening_of(&union_of(&["a", "b"]), &mixed));
+    }
+
+    #[test]
+    fn is_widening_of_rejects_replacing_a_single_literal() {
+        // Lit("a") -> Lit("b"): "a" is not in {"b"} -> narrowing, rejected.
+        assert!(!is_widening_of(&lit("a"), &lit("b")));
+    }
+
+    #[test]
+    fn is_widening_of_rejects_collapsing_union_to_literal() {
+        // Union{a,b} -> Lit(a): "b" is dropped -> rejected.
+        assert!(!is_widening_of(&union_of(&["a", "b"]), &lit("a")));
+    }
+
+    #[test]
+    fn is_widening_of_rejects_empty_union() {
+        // An empty union accepts no values; refuse it outright rather than
+        // returning a vacuous superset `true`.
+        let empty = FieldType::Union { variants: vec![] };
+        assert!(!is_widening_of(&empty, &union_of(&["a", "b"])));
+        assert!(!is_widening_of(&union_of(&["a", "b"]), &empty));
     }
 }
