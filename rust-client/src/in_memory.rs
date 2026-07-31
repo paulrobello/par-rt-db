@@ -273,6 +273,376 @@ impl InMemoryRtDbClient {
         Ok(())
     }
 
+    /// Applies (or previews) a declarative schema migration — a port of server
+    /// `migrate::plan_migration` (validation + structural schema fold) and
+    /// `migrate::apply_migration` (data effects). Structural directives fold
+    /// into a working copy of the schema; data directives rewrite the in-memory
+    /// doc map to match so subsequent reads stay consistent.
+    ///
+    /// A failed directive is atomic: every earlier structural and data effect
+    /// rolls back via snapshot/restore (the working schema copy was never
+    /// installed, and the doc store is restored wholesale). With `dry_run`, the
+    /// full plan is validated and `affected_rows` reported against the derived
+    /// schema, but nothing is committed (`applied: false`).
+    ///
+    /// `evalExpr` has no in-memory SQL engine and returns
+    /// `BAD_REQUEST` — same convention as the search/vector stubs.
+    /// Affected-rows counts mirror the server and the ts-client harness:
+    /// `renameField`/`setDefault` count the rows whose docs actually changed;
+    /// `changeType`/`dropField`/`dropTable` count every row in the table;
+    /// `renameTable`/`dropIndex` report zero.
+    #[cfg(feature = "admin")]
+    pub fn migrate_schema(
+        &mut self,
+        directives: &[crate::wire::admin::Directive],
+        dry_run: bool,
+    ) -> Result<crate::wire::admin::MigrateResult, RtDbError> {
+        use crate::wire::admin::{DirectiveReport, MigrateResult};
+
+        let old = self.schema.clone().ok_or_else(|| {
+            RtDbError::new(ErrorCode::BadRequest, "no schema pushed for migration")
+        })?;
+        let mut planned = old;
+        let mut touched: BTreeSet<String> = BTreeSet::new();
+        let mut reports: Vec<DirectiveReport> = Vec::with_capacity(directives.len());
+        let snapshot = self.snapshot_docs();
+
+        // Apply each directive against the working `planned` schema (structural)
+        // and `self.docs` (data). On the first failure, restore the doc store
+        // and surface the error — `self.schema`/`self.tables` were never touched
+        // (the fold lived in `planned`), so nothing else needs rolling back.
+        for d in directives {
+            match self.apply_migration_directive(&mut planned, d) {
+                Ok((report, table)) => {
+                    reports.push(report);
+                    if let Some(t) = table {
+                        touched.insert(t);
+                    }
+                }
+                Err(e) => {
+                    self.restore_docs(snapshot);
+                    return Err(e);
+                }
+            }
+        }
+
+        if dry_run {
+            // Preview only: discard the data effects, return the derived schema.
+            self.restore_docs(snapshot);
+            return Ok(MigrateResult {
+                applied: false,
+                schema: planned,
+                directives: reports,
+            });
+        }
+
+        // Commit the folded schema and rebuild the denormalized table map so
+        // subsequent reads see the new shape (mirrors `push_schema`).
+        self.schema = Some(planned.clone());
+        self.tables.clear();
+        for (name, def) in &planned.tables {
+            self.tables.insert(name.clone(), def.clone());
+        }
+        self.notify_subs(&touched);
+        Ok(MigrateResult {
+            applied: true,
+            schema: planned,
+            directives: reports,
+        })
+    }
+
+    #[cfg(feature = "admin")]
+    fn apply_migration_directive(
+        &mut self,
+        planned: &mut SchemaDef,
+        d: &crate::wire::admin::Directive,
+    ) -> Result<(crate::wire::admin::DirectiveReport, Option<String>), RtDbError> {
+        use crate::wire::admin::{Directive, DirectiveReport};
+        match d {
+            Directive::RenameField { table, from, to } => {
+                let t = migrate_table_mut(planned, table)?;
+                if t.fields.contains_key(to) {
+                    return Err(RtDbError::new(
+                        ErrorCode::BadRequest,
+                        format!("rename target '{table}.{to}' already exists"),
+                    ));
+                }
+                let ft = t.fields.remove(from).ok_or_else(|| {
+                    RtDbError::new(
+                        ErrorCode::BadRequest,
+                        format!("renamed field '{table}.{from}' does not exist"),
+                    )
+                })?;
+                t.fields.insert(to.clone(), ft);
+                if let Some(indexes) = t.indexes.as_mut() {
+                    for ix in indexes.iter_mut() {
+                        for f in ix.fields.iter_mut() {
+                            if f == from {
+                                *f = to.clone();
+                            }
+                        }
+                    }
+                }
+                if t.owner_field.as_deref() == Some(from.as_str()) {
+                    t.owner_field = Some(to.clone());
+                }
+                if t.collaborators_field.as_deref() == Some(from.as_str()) {
+                    t.collaborators_field = Some(to.clone());
+                }
+                let mut affected = 0i64;
+                for ((tname, _), row) in self.docs.iter_mut() {
+                    if tname != table {
+                        continue;
+                    }
+                    if let Some(obj) = row.doc.as_object_mut()
+                        && let Some(v) = obj.remove(from)
+                    {
+                        obj.insert(to.clone(), v);
+                        affected += 1;
+                    }
+                }
+                Ok((
+                    DirectiveReport {
+                        op: "renameField".into(),
+                        affected_rows: affected,
+                        ..Default::default()
+                    },
+                    Some(table.clone()),
+                ))
+            }
+            Directive::RenameTable { from, to } => {
+                if planned.tables.contains_key(to) {
+                    return Err(RtDbError::new(
+                        ErrorCode::BadRequest,
+                        format!("rename target table '{to}' already exists"),
+                    ));
+                }
+                let def = planned.tables.remove(from).ok_or_else(|| {
+                    RtDbError::new(
+                        ErrorCode::BadRequest,
+                        format!("renamed table '{from}' does not exist"),
+                    )
+                })?;
+                // Id references to `from` in other tables follow the rename.
+                for other in planned.tables.values_mut() {
+                    for ft in other.fields.values_mut() {
+                        if let FieldType::Id { table } = ft
+                            && table == from
+                        {
+                            *table = to.clone();
+                        }
+                    }
+                }
+                planned.tables.insert(to.clone(), def);
+                // Rename the live doc keys `(from, id)` → `(to, id)`.
+                let ids: Vec<String> = self
+                    .docs
+                    .keys()
+                    .filter_map(|(t, id)| if t == from { Some(id.clone()) } else { None })
+                    .collect();
+                for id in ids {
+                    if let Some(row) = self.docs.remove(&(from.clone(), id.clone())) {
+                        self.docs.insert((to.clone(), id), row);
+                    }
+                }
+                Ok((
+                    DirectiveReport {
+                        op: "renameTable".into(),
+                        affected_rows: 0,
+                        ..Default::default()
+                    },
+                    Some(to.clone()),
+                ))
+            }
+            Directive::ChangeType {
+                table,
+                field,
+                to,
+                cast,
+                default,
+            } => {
+                let t = migrate_table_mut(planned, table)?;
+                let old_ty = t.fields.get(field).ok_or_else(|| {
+                    RtDbError::new(
+                        ErrorCode::BadRequest,
+                        format!("changed field '{table}.{field}' does not exist"),
+                    )
+                })?;
+                if !cast_valid_for(*cast, old_ty) {
+                    return Err(RtDbError::new(
+                        ErrorCode::BadRequest,
+                        format!("cast {cast:?} is not valid for {table}.{field}"),
+                    ));
+                }
+                // Drop the immutable borrow of `old_ty` before mutating `self.docs`.
+                let field_owned = field.clone();
+                let mut affected = 0i64;
+                for ((tname, _), row) in self.docs.iter_mut() {
+                    if tname != table {
+                        continue;
+                    }
+                    affected += 1;
+                    let Some(obj) = row.doc.as_object_mut() else {
+                        continue;
+                    };
+                    let Some(val) = obj.get(&field_owned).cloned() else {
+                        continue;
+                    };
+                    if let Some(coerced) = coerce_value(*cast, &val) {
+                        obj.insert(field_owned.clone(), coerced);
+                    } else if let Some(d) = default {
+                        let dv = coerce_value(*cast, d).unwrap_or_else(|| d.clone());
+                        obj.insert(field_owned.clone(), dv);
+                    } else {
+                        return Err(RtDbError::new(
+                            ErrorCode::BadRequest,
+                            format!(
+                                "changeType cannot coerce value in {table}.{} ({val}) and no default given",
+                                row.id
+                            ),
+                        ));
+                    }
+                }
+                // Fold the new type into the planned schema (field is guaranteed
+                // present by the lookup above).
+                t.fields.insert(field_owned, to.clone());
+                Ok((
+                    DirectiveReport {
+                        op: "changeType".into(),
+                        affected_rows: affected,
+                        ..Default::default()
+                    },
+                    Some(table.clone()),
+                ))
+            }
+            Directive::DropField { table, field } => {
+                let t = migrate_table_mut(planned, table)?;
+                if t.fields.remove(field).is_none() {
+                    return Err(RtDbError::new(
+                        ErrorCode::BadRequest,
+                        format!("dropped field '{table}.{field}' does not exist"),
+                    ));
+                }
+                if let Some(indexes) = t.indexes.as_mut() {
+                    for ix in indexes.iter_mut() {
+                        ix.fields.retain(|f| f != field);
+                    }
+                }
+                if t.owner_field.as_deref() == Some(field.as_str()) {
+                    t.owner_field = None;
+                }
+                if t.collaborators_field.as_deref() == Some(field.as_str()) {
+                    t.collaborators_field = None;
+                }
+                let mut affected = 0i64;
+                for ((tname, _), row) in self.docs.iter_mut() {
+                    if tname != table {
+                        continue;
+                    }
+                    if let Some(obj) = row.doc.as_object_mut()
+                        && obj.remove(field).is_some()
+                    {
+                        affected += 1;
+                    }
+                }
+                Ok((
+                    DirectiveReport {
+                        op: "dropField".into(),
+                        affected_rows: affected,
+                        ..Default::default()
+                    },
+                    Some(table.clone()),
+                ))
+            }
+            Directive::DropTable { name } => {
+                if planned.tables.remove(name).is_none() {
+                    return Err(RtDbError::new(
+                        ErrorCode::BadRequest,
+                        format!("dropped table '{name}' does not exist"),
+                    ));
+                }
+                let to_remove: Vec<String> = self
+                    .docs
+                    .keys()
+                    .filter_map(|(t, id)| if t == name { Some(id.clone()) } else { None })
+                    .collect();
+                let affected = to_remove.len() as i64;
+                for id in to_remove {
+                    self.docs.remove(&(name.clone(), id));
+                }
+                Ok((
+                    DirectiveReport {
+                        op: "dropTable".into(),
+                        affected_rows: affected,
+                        ..Default::default()
+                    },
+                    Some(name.clone()),
+                ))
+            }
+            Directive::DropIndex { table, name } => {
+                let t = migrate_table_mut(planned, table)?;
+                let indexes = t.indexes.as_mut().ok_or_else(|| {
+                    RtDbError::new(
+                        ErrorCode::BadRequest,
+                        format!("dropped index '{table}.{name}' does not exist"),
+                    )
+                })?;
+                if !indexes.iter().any(|ix| &ix.name == name) {
+                    return Err(RtDbError::new(
+                        ErrorCode::BadRequest,
+                        format!("dropped index '{table}.{name}' does not exist"),
+                    ));
+                }
+                indexes.retain(|ix| &ix.name != name);
+                Ok((
+                    DirectiveReport {
+                        op: "dropIndex".into(),
+                        affected_rows: 0,
+                        ..Default::default()
+                    },
+                    Some(table.clone()),
+                ))
+            }
+            Directive::SetDefault {
+                table,
+                field,
+                value,
+            } => {
+                let t = migrate_table_mut(planned, table)?;
+                if !t.fields.contains_key(field) {
+                    return Err(RtDbError::new(
+                        ErrorCode::BadRequest,
+                        format!("setDefault target '{table}.{field}' does not exist"),
+                    ));
+                }
+                let mut affected = 0i64;
+                for ((tname, _), row) in self.docs.iter_mut() {
+                    if tname != table {
+                        continue;
+                    }
+                    if let Some(obj) = row.doc.as_object_mut()
+                        && !obj.contains_key(field)
+                    {
+                        obj.insert(field.clone(), value.clone());
+                        affected += 1;
+                    }
+                }
+                Ok((
+                    DirectiveReport {
+                        op: "setDefault".into(),
+                        affected_rows: affected,
+                        ..Default::default()
+                    },
+                    Some(table.clone()),
+                ))
+            }
+            Directive::EvalExpr { table, .. } => Err(RtDbError::new(
+                ErrorCode::BadRequest,
+                format!("evalExpr unsupported in-memory (table '{table}')"),
+            )),
+        }
+    }
+
     /// Snapshot of the currently-installed schema (or `None` before
     /// `push_schema`). Returns a clone so callers can freely inspect/mutate.
     pub fn to_schema_json(&self) -> Option<SchemaDef> {
@@ -1929,6 +2299,78 @@ pub fn validate_doc(table: &TableDef, doc: &Value) -> Result<(), RtDbError> {
     Ok(())
 }
 
+/// Resolves a mutable table definition from a working schema, returning the
+/// server-shaped `BAD_REQUEST` when the table is absent. Ports
+/// `migrateTable` (`ts-client/src/in_memory.ts:965-971`) and mirrors server
+/// `migrate::table_mut`.
+#[cfg(feature = "admin")]
+fn migrate_table_mut<'a>(
+    schema: &'a mut SchemaDef,
+    table: &str,
+) -> Result<&'a mut TableDef, RtDbError> {
+    schema.tables.get_mut(table).ok_or_else(|| {
+        RtDbError::new(
+            ErrorCode::BadRequest,
+            format!("table '{table}' does not exist"),
+        )
+    })
+}
+
+/// True iff `cast` can coerce from `old` — a port of server
+/// `migrate::cast_valid_for` and ts-client `castValidFor`. Locks the same
+/// coercion matrix as the server (the closed set of sound source types per
+/// cast).
+#[cfg(feature = "admin")]
+fn cast_valid_for(cast: crate::wire::admin::Cast, old: &FieldType) -> bool {
+    use crate::wire::admin::Cast;
+    use FieldType::*;
+    matches!(
+        (cast, old),
+        (Cast::ToString, String | Number | Boolean | Int64)
+            | (Cast::ToNumber, String | Boolean | Int64)
+            | (Cast::ToInt64, String | Number)
+            | (Cast::ToBoolean, String | Number)
+    )
+}
+
+/// Pure Rust coercion mirroring server `migrate::coerce_value` and ts-client
+/// `coerceValue`. Returns `None` if the value cannot be coerced under this cast;
+/// the caller then substitutes `default` if supplied or raises a row-named
+/// `BadRequest`. `ToInt64` emits a decimal-string JSON value (int64 travels as
+/// a canonical decimal string on this wire — see `FEATURE_MATRIX.md` #13);
+/// `ToNumber` emits a JSON number. The other casts produce the natural JSON
+/// representation.
+#[cfg(feature = "admin")]
+fn coerce_value(cast: crate::wire::admin::Cast, v: &Value) -> Option<Value> {
+    use crate::wire::admin::Cast;
+    use serde_json::json;
+    match (cast, v) {
+        (Cast::ToString, Value::String(_)) => Some(v.clone()),
+        (Cast::ToString, Value::Number(n)) => Some(Value::String(n.to_string())),
+        (Cast::ToString, Value::Bool(b)) => Some(Value::String(b.to_string())),
+        (Cast::ToString, _) => None,
+        (Cast::ToNumber, Value::String(s)) => match s.parse::<f64>() {
+            Ok(n) if n.is_finite() => Some(json!(n)),
+            _ => None,
+        },
+        (Cast::ToNumber, Value::Number(_)) => Some(v.clone()),
+        (Cast::ToNumber, Value::Bool(b)) => Some(json!(if *b { 1.0 } else { 0.0 })),
+        (Cast::ToNumber, _) => None,
+        (Cast::ToInt64, Value::String(s)) => s.parse::<i64>().ok().map(|i| json!(i.to_string())),
+        (Cast::ToInt64, Value::Number(n)) => n.as_i64().map(|i| json!(i.to_string())),
+        (Cast::ToInt64, _) => None,
+        (Cast::ToBoolean, Value::String(s)) => match s.as_str() {
+            "true" | "1" => Some(Value::Bool(true)),
+            "false" | "0" => Some(Value::Bool(false)),
+            _ => None,
+        },
+        (Cast::ToBoolean, Value::Number(n)) => {
+            Some(Value::Bool(n.as_f64().map(|f| f != 0.0).unwrap_or(true)))
+        }
+        (Cast::ToBoolean, _) => None,
+    }
+}
+
 /// Mirrors `server/src/ddl.rs::detect_destructive_changes`: walks `old` and
 /// rejects any removed table, removed field, changed field type (except a safe
 /// literal-union widening, which is additive and allowed — see
@@ -3028,6 +3470,185 @@ mod tests {
             FieldType::Union { variants } => assert_eq!(variants.len(), 3),
             other => panic!("expected Union, got {other:?}"),
         }
+    }
+
+    // ---- migrate -------------------------------------------------------
+    //
+    // The harness `migrate_schema` ports the server's `plan_migration` (schema
+    // fold) + `apply_migration` (data effects). Structural directives update
+    // the installed schema; data directives rewrite the in-memory doc map;
+    // `evalExpr` is unsupported (no SQL engine).
+
+    #[cfg(feature = "admin")]
+    async fn migrate_schema_with_rows() -> InMemoryRtDbClient {
+        // Schema: items { name: string, status: string, order: number }, two rows.
+        // Inject an incrementing clock + constant RNG (the `new_client` pattern)
+        // so the two server-minted ids differ — the default RNG/now collide.
+        let counter = Arc::new(Mutex::new(1_700_000_000_000_i64));
+        let mut c = InMemoryRtDbClient::new(
+            InMemoryRtDbClientOptions::default()
+                .now(move || {
+                    let mut g = counter.lock().expect("counter not poisoned");
+                    let v = *g;
+                    *g += 1;
+                    v
+                })
+                .random(|| 0.0),
+        );
+        c.push_schema(&test_schema()).unwrap();
+        c.mutate(
+            &Mutation::new()
+                .insert("items", json!({"name": "a", "status": "todo", "order": 1}))
+                .insert("items", json!({"name": "b", "status": "done", "order": 2}))
+                .build(),
+            Some("m1"),
+        )
+        .await
+        .unwrap();
+        c
+    }
+
+    #[cfg(feature = "admin")]
+    #[tokio::test]
+    async fn migrate_rename_field_moves_doc_key() {
+        let mut c = migrate_schema_with_rows().await;
+        let directives = vec![crate::wire::admin::Directive::RenameField {
+            table: "items".into(),
+            from: "name".into(),
+            to: "title".into(),
+        }];
+        let result = c.migrate_schema(&directives, false).unwrap();
+        assert!(result.applied);
+        assert_eq!(result.directives.len(), 1);
+        assert_eq!(result.directives[0].op, "renameField");
+        assert_eq!(result.directives[0].affected_rows, 2);
+        // The folded schema carries the renamed field.
+        assert!(result.schema.tables["items"].fields.contains_key("title"));
+        assert!(!result.schema.tables["items"].fields.contains_key("name"));
+        // And the stored docs were rewritten to match.
+        let docs = c.collect_all("items");
+        assert_eq!(docs.len(), 2);
+        assert!(
+            docs.iter()
+                .all(|d| d.get("title").is_some() && d.get("name").is_none())
+        );
+    }
+
+    #[cfg(feature = "admin")]
+    #[tokio::test]
+    async fn migrate_drop_table_clears_rows() {
+        let mut c = migrate_schema_with_rows().await;
+        let directives = vec![crate::wire::admin::Directive::DropTable {
+            name: "items".into(),
+        }];
+        let result = c.migrate_schema(&directives, false).unwrap();
+        assert_eq!(result.directives[0].op, "dropTable");
+        assert_eq!(result.directives[0].affected_rows, 2);
+        assert!(result.schema.tables.is_empty());
+        assert!(c.collect_all("items").is_empty());
+    }
+
+    #[cfg(feature = "admin")]
+    #[tokio::test]
+    async fn migrate_change_type_coerces_with_default() {
+        let mut c = migrate_schema_with_rows().await;
+        // String -> Int64 via ToInt64. "1"/"2" parse; the server coerces per row.
+        let directives = vec![crate::wire::admin::Directive::ChangeType {
+            table: "items".into(),
+            field: "name".into(),
+            to: FieldType::Int64,
+            cast: crate::wire::admin::Cast::ToInt64,
+            default: None,
+        }];
+        // All rows have non-numeric `name` values → coercion fails with no default.
+        let err = c.migrate_schema(&directives, false).unwrap_err();
+        assert!(matches!(err.code, ErrorCode::BadRequest));
+        // Rollback: schema and docs unchanged.
+        let stored = c.to_schema_json().unwrap();
+        assert_eq!(
+            stored.tables["items"].fields.get("name"),
+            Some(&FieldType::String)
+        );
+        assert_eq!(c.collect_all("items").len(), 2);
+    }
+
+    #[cfg(feature = "admin")]
+    #[tokio::test]
+    async fn migrate_set_default_populates_missing_field() {
+        let mut c = migrate_schema_with_rows().await;
+        let directives = vec![crate::wire::admin::Directive::SetDefault {
+            table: "items".into(),
+            field: "note".into(),
+            value: json!("untagged"),
+        }];
+        let result = c.migrate_schema(&directives, false).unwrap();
+        assert_eq!(result.directives[0].op, "setDefault");
+        assert_eq!(result.directives[0].affected_rows, 2);
+        let docs = c.collect_all("items");
+        assert!(
+            docs.iter()
+                .all(|d| d.get("note") == Some(&json!("untagged")))
+        );
+    }
+
+    #[cfg(feature = "admin")]
+    #[tokio::test]
+    async fn migrate_dry_run_leaves_state_unchanged() {
+        let mut c = migrate_schema_with_rows().await;
+        let directives = vec![crate::wire::admin::Directive::DropTable {
+            name: "items".into(),
+        }];
+        let result = c.migrate_schema(&directives, true).unwrap();
+        assert!(!result.applied);
+        // Preview reports the dropped table, but nothing was committed.
+        assert!(result.schema.tables.is_empty());
+        assert!(c.to_schema_json().unwrap().tables.contains_key("items"));
+        assert_eq!(c.collect_all("items").len(), 2);
+    }
+
+    #[cfg(feature = "admin")]
+    #[tokio::test]
+    async fn migrate_eval_expr_unsupported() {
+        let mut c = migrate_schema_with_rows().await;
+        let directives = vec![crate::wire::admin::Directive::EvalExpr {
+            table: "items".into(),
+            set: "upper".into(),
+            expr: "upper(doc->>'name')".into(),
+            where_clause: None,
+        }];
+        let err = c.migrate_schema(&directives, false).unwrap_err();
+        assert!(matches!(err.code, ErrorCode::BadRequest));
+        assert!(err.message.contains("evalExpr unsupported in-memory"));
+    }
+
+    #[cfg(feature = "admin")]
+    #[tokio::test]
+    async fn migrate_failed_directive_is_atomic() {
+        let mut c = migrate_schema_with_rows().await;
+        // renameField succeeds (folds into planned + docs), then DropTable on a
+        // missing table fails. The earlier rename must roll back.
+        let directives = vec![
+            crate::wire::admin::Directive::RenameField {
+                table: "items".into(),
+                from: "name".into(),
+                to: "title".into(),
+            },
+            crate::wire::admin::Directive::DropTable {
+                name: "nope".into(),
+            },
+        ];
+        let err = c.migrate_schema(&directives, false).unwrap_err();
+        assert!(matches!(err.code, ErrorCode::BadRequest));
+        // Schema untouched: `name` still present, `title` absent.
+        let stored = c.to_schema_json().unwrap();
+        assert!(stored.tables["items"].fields.contains_key("name"));
+        assert!(!stored.tables["items"].fields.contains_key("title"));
+        // Docs untouched: `name` key still present on every row.
+        assert!(
+            c.collect_all("items")
+                .iter()
+                .all(|d| d.get("name").is_some())
+        );
     }
 
     // ---- validate_doc --------------------------------------------------

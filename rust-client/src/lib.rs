@@ -44,6 +44,9 @@ pub mod query;
 pub mod schema;
 pub mod wire;
 
+#[cfg(feature = "admin")]
+pub mod migration;
+
 #[cfg(feature = "http")]
 pub mod http;
 
@@ -76,6 +79,10 @@ pub use ws::{ClientStatus, Config, ConnectionState, RtDbClient, Snapshot, Subscr
 
 #[cfg(feature = "admin")]
 pub use wire::admin::{
-    AdminMember, ConfigResponse, DbStats, HotConfig, HotConfigPatch, LatencyStats, MetricsSnapshot,
-    MintedToken, OpEvent, TableStat, TokenInfo,
+    AdminMember, Cast, CastFailure, ConfigResponse, DbStats, Directive, DirectiveReport, HotConfig,
+    HotConfigPatch, LatencyStats, MetricsSnapshot, MigrateRequest, MigrateRequestOwned,
+    MigrateResult, MintedToken, OpEvent, SampleChange, TableStat, TokenInfo,
 };
+
+#[cfg(feature = "admin")]
+pub use migration::Migration;

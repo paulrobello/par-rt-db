@@ -585,6 +585,31 @@ impl RtDbHttpClient {
         self.expect_ok(resp).await
     }
 
+    /// `POST /admin/db/{db}/migrate` `{directives, dryRun}` → `MigrateResult`.
+    /// Apply (when `dry_run` is false) or preview (when `dry_run` is true) a
+    /// declarative schema migration. The server validates and folds the
+    /// directives transactionally; on `dry_run` nothing is committed and the
+    /// returned `schema` is the derived preview. Mirrors `ts-client`'s
+    /// `RtDbAdminClient.migrate` one-to-one.
+    pub async fn migrate_schema(
+        &self,
+        db: &str,
+        directives: &[crate::wire::admin::Directive],
+        dry_run: bool,
+    ) -> Result<crate::wire::admin::MigrateResult, RtDbError> {
+        let resp = self
+            .post_json(
+                &format!("/admin/db/{}/migrate", db),
+                &crate::wire::admin::MigrateRequest {
+                    directives,
+                    dry_run,
+                },
+            )
+            .await?;
+        self.deserialize::<crate::wire::admin::MigrateResult>(resp)
+            .await
+    }
+
     /// `GET /admin/dbs` → `{databases:[...]}`.
     pub async fn list_dbs(&self) -> Result<Vec<String>, RtDbError> {
         let parsed: crate::wire::admin::DatabasesResponse =
@@ -2266,5 +2291,50 @@ mod admin_tests {
             .admin_mutate("kanban", &txn, Some("k1"))
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn migrate_schema_posts_directives_and_dry_run() {
+        // Mirrors `push_schema_serializes_schema_json`: the body carries the
+        // `directives` array (tagged by `op`, camelCase) plus `dryRun`, and the
+        // parsed `MigrateResult` preserves `applied` / derived `schema` /
+        // per-directive `affectedRows`.
+        let (server, client) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/admin/db/kanban/migrate"))
+            .and(header("authorization", BEARER))
+            .and(body_partial_json(json!({
+                "directives": [
+                    {"op": "renameField", "table": "items", "from": "name", "to": "title"},
+                    {"op": "dropIndex", "table": "items", "name": "by_name"}
+                ],
+                "dryRun": true
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "applied": false,
+                "schema": {"tables": {"items": {"fields": {"title": {"type": "string"}}}}},
+                "directives": [
+                    {"op": "renameField", "affectedRows": 2},
+                    {"op": "dropIndex", "affectedRows": 0}
+                ]
+            })))
+            .mount(&server)
+            .await;
+        let directives = crate::migration::Migration::new()
+            .rename_field("items", "name", "title")
+            .drop_index("items", "by_name")
+            .build();
+        let result = client
+            .migrate_schema("kanban", &directives, true)
+            .await
+            .unwrap();
+        assert!(!result.applied);
+        assert_eq!(result.directives.len(), 2);
+        assert_eq!(result.directives[0].op, "renameField");
+        assert_eq!(result.directives[0].affected_rows, 2);
+        assert_eq!(result.directives[1].op, "dropIndex");
+        assert_eq!(result.directives[1].affected_rows, 0);
+        assert!(result.schema.tables.contains_key("items"));
+        assert!(result.schema.tables["items"].fields.contains_key("title"));
     }
 }

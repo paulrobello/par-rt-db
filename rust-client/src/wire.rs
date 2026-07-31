@@ -648,6 +648,145 @@ pub mod admin {
         pub ts: i64,
         pub owner: Option<String>,
     }
+
+    // ---- schema migration (POST /admin/db/{db}/migrate) -------------------
+    //
+    // Mirror server `migrate::*` byte-for-byte: the `Directive` enum (tag `op`,
+    // camelCase, `deny_unknown_fields` — the same shape contract as
+    // `mutation::Step`), `Cast`, `MigrateRequest`, `MigrateResult`,
+    // `DirectiveReport`, `CastFailure`, `SampleChange`. See
+    // `server/src/migrate.rs` for the authoritative shapes; `ts-client`'s
+    // `protocol.ts` carries the parity-checked TS view.
+
+    /// One schema-migration step. Wire shape mirrors server `migrate::Directive`:
+    /// `tag = "op"`, `rename_all = "camelCase"`, `deny_unknown_fields` (the same
+    /// shape contract as [`crate::mutation::Step`]). `evalExpr.where_clause` is
+    /// renamed to the wire alias `where`.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(tag = "op", rename_all = "camelCase", deny_unknown_fields)]
+    pub enum Directive {
+        RenameField {
+            table: String,
+            from: String,
+            to: String,
+        },
+        RenameTable {
+            from: String,
+            to: String,
+        },
+        ChangeType {
+            table: String,
+            field: String,
+            to: crate::schema::FieldType,
+            cast: Cast,
+            #[serde(default)]
+            default: Option<serde_json::Value>,
+        },
+        DropField {
+            table: String,
+            field: String,
+        },
+        DropTable {
+            name: String,
+        },
+        DropIndex {
+            table: String,
+            name: String,
+        },
+        SetDefault {
+            table: String,
+            field: String,
+            value: serde_json::Value,
+        },
+        EvalExpr {
+            table: String,
+            set: String,
+            expr: String,
+            #[serde(default, rename = "where")]
+            where_clause: Option<String>,
+        },
+    }
+
+    /// Closed set of sound coercions for [`Directive::ChangeType`]. Mirrors
+    /// server `migrate::Cast` (camelCase on the wire).
+    #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub enum Cast {
+        ToString,
+        ToNumber,
+        ToInt64,
+        ToBoolean,
+    }
+
+    /// Borrowed HTTP body for `POST /admin/db/{db}/migrate`. Mirrors server
+    /// `migrate::MigrateRequest` (camelCase; `dryRun` is `#[serde(default)]`
+    /// false). The borrowed lifetime lets [`crate::http::RtDbHttpClient`]
+    /// serialize a caller-owned `&[Directive]` without copying.
+    #[derive(Debug, Clone, Serialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct MigrateRequest<'a> {
+        pub directives: &'a [Directive],
+        #[serde(default)]
+        pub dry_run: bool,
+    }
+
+    /// Owned counterpart of [`MigrateRequest`] — needed by the CLI and any
+    /// caller that builds a request from a [`crate::migration::Migration`] and
+    /// holds it past the borrow. Mirrors the same wire shape.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct MigrateRequestOwned {
+        pub directives: Vec<Directive>,
+        #[serde(default)]
+        pub dry_run: bool,
+    }
+
+    /// `POST /admin/db/{db}/migrate` response. `schema` is the post-migration
+    /// derived schema — returned even on `dryRun` (with `applied: false`), so a
+    /// caller can preview the resulting shape. Mirrors server
+    /// `migrate::MigrateResult`.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct MigrateResult {
+        pub applied: bool,
+        pub schema: crate::schema::SchemaDef,
+        pub directives: Vec<DirectiveReport>,
+    }
+
+    /// Per-directive outcome. `castFailures` and `sampleChanges` are
+    /// `skip_serializing_if = "Vec::is_empty"` on the server, so they surface as
+    /// optional on the wire (absent when empty). Mirrors server
+    /// `migrate::DirectiveReport`. `Default` is derived so the in-memory harness
+    /// and later tasks can build it incrementally with `..Default::default()`.
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct DirectiveReport {
+        pub op: String,
+        pub affected_rows: i64,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub cast_failures: Vec<CastFailure>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub sample_changes: Vec<SampleChange>,
+    }
+
+    /// One row of [`DirectiveReport::cast_failures`]. Mirrors server
+    /// `migrate::CastFailure`.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct CastFailure {
+        pub id: String,
+        pub value: serde_json::Value,
+    }
+
+    /// One row of [`DirectiveReport::sample_changes`]. Mirrors server
+    /// `migrate::SampleChange`.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct SampleChange {
+        pub id: String,
+        pub before: serde_json::Value,
+        pub after: serde_json::Value,
+    }
 }
 
 #[cfg(test)]
@@ -1207,5 +1346,103 @@ mod tests {
         let back: ScheduleInfo = serde_json::from_value(v).unwrap();
         assert_eq!(back.cron.as_deref(), Some("*/5 * * * *"));
         assert_eq!(back.last_error.as_deref(), Some("boom"));
+    }
+
+    // ---- admin migrate wire (tag `op`, camelCase, `where` alias) -----------
+    #[cfg(feature = "admin")]
+    #[test]
+    fn migrate_directive_round_trip() {
+        use crate::schema::FieldType;
+        use crate::wire::admin::{Cast, Directive, MigrateRequest, MigrateResult};
+
+        let req = MigrateRequest {
+            directives: &[
+                Directive::RenameField {
+                    table: "users".into(),
+                    from: "name".into(),
+                    to: "fullName".into(),
+                },
+                Directive::ChangeType {
+                    table: "users".into(),
+                    field: "age".into(),
+                    to: FieldType::String,
+                    cast: Cast::ToString,
+                    default: None,
+                },
+                Directive::EvalExpr {
+                    table: "users".into(),
+                    set: "upper".into(),
+                    expr: "upper(doc->>'fullName')".into(),
+                    where_clause: Some("doc ? 'fullName'".into()),
+                },
+            ],
+            dry_run: true,
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        // tag is "op", camelCase keys, `where` alias.
+        assert_eq!(json["directives"][0]["op"], "renameField");
+        assert_eq!(json["directives"][1]["op"], "changeType");
+        assert_eq!(json["directives"][1]["cast"], "toString");
+        assert_eq!(json["directives"][2]["op"], "evalExpr");
+        assert_eq!(json["directives"][2]["where"], "doc ? 'fullName'");
+        // `where_clause` must not appear under its snake-case name.
+        assert!(json["directives"][2].get("where_clause").is_none());
+        assert_eq!(json["dryRun"], true);
+
+        // Borrowed request round-trips into the owned variants; `MigrateRequest`
+        // itself is Serialize-only (borrowed slice), so deserialize via
+        // `MigrateRequestOwned`'s shape by re-serializing each directive.
+        let ops_json = json["directives"].as_array().unwrap().clone();
+        for (i, d) in [
+            Directive::RenameField {
+                table: "users".into(),
+                from: "name".into(),
+                to: "fullName".into(),
+            },
+            Directive::ChangeType {
+                table: "users".into(),
+                field: "age".into(),
+                to: FieldType::String,
+                cast: Cast::ToString,
+                default: None,
+            },
+            Directive::EvalExpr {
+                table: "users".into(),
+                set: "upper".into(),
+                expr: "upper(doc->>'fullName')".into(),
+                where_clause: Some("doc ? 'fullName'".into()),
+            },
+        ]
+        .iter()
+        .enumerate()
+        {
+            let dumped = serde_json::to_value(d).unwrap();
+            assert_eq!(dumped, ops_json[i], "directive {i} drifted");
+            // Each directive round-trips through Deserialize.
+            let _: &Directive = &serde_json::from_value::<Directive>(dumped).unwrap();
+        }
+
+        // MigrateResult deserializes the server shape (camelCase, nested
+        // reports carry `affectedRows`).
+        let resp = json!({
+            "applied": true,
+            "schema": {"tables": {"users": {"fields": {"fullName": {"type": "string"}}}}},
+            "directives": [
+                {"op": "renameField", "affectedRows": 3},
+                {"op": "changeType", "affectedRows": 3, "castFailures": [{"id": "u1", "value": null}]}
+            ]
+        });
+        let parsed: MigrateResult = serde_json::from_value(resp).unwrap();
+        assert!(parsed.applied);
+        assert_eq!(parsed.directives.len(), 2);
+        assert_eq!(parsed.directives[0].op, "renameField");
+        assert_eq!(parsed.directives[0].affected_rows, 3);
+        assert_eq!(parsed.directives[1].cast_failures.len(), 1);
+        assert_eq!(parsed.directives[1].cast_failures[0].id, "u1");
+        // Re-serialize drops empty `cast_failures`/`sampleChanges` (skip_if_empty)
+        // but keeps the populated one.
+        let back = serde_json::to_value(&parsed).unwrap();
+        assert!(back["directives"][0].get("castFailures").is_none());
+        assert_eq!(back["directives"][1]["castFailures"][0]["id"], "u1");
     }
 }
