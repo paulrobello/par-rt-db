@@ -5,6 +5,7 @@ import { AdminProvider } from "./lib/admin";
 import { SessionProvider, useSession } from "./lib/session";
 import { DbPage } from "./pages/DbPage";
 import { DatabasesPage } from "./pages/DatabasesPage";
+import { MigratePage } from "./pages/MigratePage";
 import { SchemaPage } from "./pages/SchemaPage";
 import { AdminsPage } from "./pages/AdminsPage";
 import { ConfigPage } from "./pages/ConfigPage";
@@ -42,6 +43,7 @@ function Root() {
             <Route index element={<DatabasesPage />} />
             <Route path="dbs/:db" element={<DbPage />} />
             <Route path="dbs/:db/schema" element={<SchemaPage />} />
+            <Route path="dbs/:db/migrate" element={<MigratePage />} />
             <Route path="dbs/:db/tables/:table" element={<DataBrowserPage />} />
             <Route path="metrics" element={<MetricsPage />} />
             <Route path="ops" element={<OpsPage />} />

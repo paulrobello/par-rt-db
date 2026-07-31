@@ -61,6 +61,9 @@ export function DbPage() {
         <Link to={`/dbs/${db}/schema`} className={s.link}>
           Schema →
         </Link>
+        <Link to={`/dbs/${db}/migrate`} className={s.link}>
+          Migrate →
+        </Link>
         {stats && (
           <span className={s.total}>
             {formatBytes(stats.totalSizeBytes)} · {formatNumber(stats.tables.length)} tables

@@ -1,0 +1,166 @@
+.page {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-4);
+  max-width: 880px;
+}
+
+.title {
+  margin: 0;
+  font-size: var(--t-display);
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+.back {
+  color: var(--accent);
+  font-family: var(--mono);
+  font-size: var(--t-mono-sm);
+}
+
+.editor {
+  background: var(--inset);
+  color: var(--ink);
+  border: 1px solid var(--rule-strong);
+  border-radius: var(--r-1);
+  font-family: var(--mono);
+  font-size: var(--t-mono-sm);
+  padding: var(--sp-2);
+  resize: vertical;
+  outline: none;
+  min-height: 220px;
+  width: 100%;
+  box-sizing: border-box;
+  line-height: 1.5;
+  tab-size: 2;
+}
+
+.actions {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  flex-wrap: wrap;
+}
+
+.hint {
+  font-family: var(--mono);
+  font-size: var(--t-mono-xs);
+  color: var(--ink-3);
+}
+
+.resultPanel {
+  background: var(--inset);
+  border: 1px solid var(--rule);
+  border-radius: var(--r-1);
+  padding: var(--sp-2);
+  min-height: 120px;
+  max-height: 560px;
+  overflow: auto;
+}
+
+.resultEmpty {
+  margin: 0;
+  font-family: var(--mono);
+  font-size: var(--t-mono-sm);
+  color: var(--ink-3);
+}
+
+.applied {
+  margin: 0 0 var(--sp-3);
+  padding-bottom: var(--sp-2);
+  border-bottom: 1px solid var(--rule);
+  font-family: var(--mono);
+  font-size: var(--t-mono-sm);
+  color: var(--signal);
+}
+
+.errorHead {
+  font-family: var(--mono);
+  font-size: var(--t-mono-sm);
+  color: var(--error);
+  margin: 0 0 var(--sp-1);
+}
+
+.errorBody {
+  margin: 0;
+  white-space: pre-wrap;
+  font-family: var(--mono);
+  font-size: var(--t-mono-sm);
+  color: var(--ink-2);
+  line-height: 1.5;
+}
+
+/* --- Per-directive report ---------------------------------------------- */
+
+.directive {
+  padding: var(--sp-2) 0;
+  border-bottom: 1px solid var(--rule);
+}
+.directive:last-child {
+  border-bottom: none;
+}
+
+.directiveHead {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-3);
+  margin: 0 0 var(--sp-1);
+  font-family: var(--mono);
+  font-size: var(--t-mono-sm);
+}
+
+.op {
+  color: var(--accent);
+}
+
+.affected {
+  color: var(--ink-3);
+}
+
+.subSection {
+  padding-left: var(--sp-2);
+  margin-top: var(--sp-1);
+}
+
+.subHead {
+  display: block;
+  font-family: var(--mono);
+  font-size: var(--t-mono-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  color: var(--ink-3);
+  margin-bottom: var(--sp-1);
+}
+
+.subRow {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-2);
+  font-family: var(--mono);
+  font-size: var(--t-mono-sm);
+  padding-left: var(--sp-2);
+}
+
+.cellId {
+  color: var(--ink);
+  white-space: nowrap;
+}
+
+.cellVal {
+  color: var(--warn);
+  word-break: break-word;
+}
+
+.cellBefore {
+  color: var(--ink-3);
+  word-break: break-word;
+}
+
+.arrow {
+  color: var(--accent);
+}
+
+.cellAfter {
+  color: var(--ink);
+  word-break: break-word;
+}

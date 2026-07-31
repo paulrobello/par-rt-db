@@ -7,7 +7,14 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import type { AuthedUser, QueryJson, SchemaJson, TransactionJson } from "@par-rt-db/client";
+import type {
+  AuthedUser,
+  MigrateRequestJson,
+  MigrateResultJson,
+  QueryJson,
+  SchemaJson,
+  TransactionJson,
+} from "@par-rt-db/client";
 import type { ConnectionState } from "../components/ui";
 import { useSession } from "./session";
 import type {
@@ -101,6 +108,16 @@ export class AdminClient {
     return this.req<SchemaDiff>(`/admin/db/${enc(db)}/schema/preview`, {
       method: "POST",
       body: JSON.stringify({ schema }),
+    });
+  }
+  /** Apply (or preview) a declarative schema migration
+   *  (POST /admin/db/{db}/migrate). `req.dryRun` reports `affectedRows` and the
+   *  derived `schema` without committing; a real run returns `applied: true`
+   *  with the installed schema. */
+  migrate(db: string, req: MigrateRequestJson): Promise<MigrateResultJson> {
+    return this.req<MigrateResultJson>(`/admin/db/${enc(db)}/migrate`, {
+      method: "POST",
+      body: JSON.stringify(req),
     });
   }
   getStats(db: string) {
