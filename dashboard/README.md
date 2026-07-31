@@ -101,6 +101,27 @@ into a database:
 | **Config** | `/config` | Hot knobs (`allowed_origins`, `session_ttl_days`, `max_file_size`), server build info, and provider configuration status. |
 | **Admins** | `/admins` | Manage the OAuth admin allowlist (`RTDB_ADMIN_EMAILS` + any runtime additions). |
 
+### Schema migration (guided)
+
+Destructive/type-changing schema transformations (rename, type coercion, removal,
+default backfill) are a deliberate admin operation separate from the additive
+schema push. The dashboard's migrate flow is **dry-run-first**: you compose a
+directives list, preview the per-directive report (affected rows, cast failures,
+sample before/after) and the derived resulting schema, then apply the same bytes
+once you've reviewed them.
+
+The flow lives beside the schema viewer on a database. Directives cover
+`renameField`/`renameTable` (no data loss), `changeType` (closed cast matrix +
+optional `default` for atomic-fail-vs-substitute), `dropField`/`dropTable`/
+`dropIndex`, `setDefault` (one-time backfill), and `evalExpr` (a scoped raw-SQL
+doc-rewrite escape — one table's `doc` jsonb, no joins/DDL verbs). Because the
+server runs the migrate inside the committer's serialized turn, live queries
+re-run and push, and the op feed / audit log / webhook outbox all fire on the
+rewrite — the same guarantees as a regular mutation. A snapshot of the reviewed
+directives is locked at preview time so Apply can't send unpreviewed bytes. See
+the design spec at
+[`../docs/superpowers/specs/2026-07-31-schema-migration-backfill-design.md`](../docs/superpowers/specs/2026-07-31-schema-migration-backfill-design.md).
+
 ### The mutation cap
 
 Mutations submitted from the data browser are bounded by `RTDB_MAX_AFFECTED_DOCS`

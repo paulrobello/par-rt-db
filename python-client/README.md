@@ -194,6 +194,40 @@ sort_tuple = decode_cursor(cursor)  # round-trips back to the list
 / `t.union([...])` / `t.object({...})` are the field constructors; see
 `par_rt_db/schema.py` for the full set of 15 variants.
 
+### Schema migration (`[http]` extra)
+
+Destructive/type-changing schema transformations are a deliberate admin operation,
+separate from the additive schema push. Build a `Migration` and apply (or preview)
+it via the HTTP admin client — `POST /admin/db/{db}/migrate` runs the directives
+transactionally inside the server's committer, so live queries, the op feed,
+audit, and webhooks all fire.
+
+```python
+from par_rt_db import Cast, Migration
+from par_rt_db.schema import t
+from par_rt_db.http_client import RtDbHttpClient
+
+admin = RtDbHttpClient("https://rtdb.pardev.net", admin_key=ADMIN_KEY)
+result = admin.migrate_schema(
+    "kanban",
+    Migration.builder()
+    .rename_field("items", "title", "summary")
+    .change_type("items", "order", t.string(), Cast.TO_STRING, default="0")
+    .set_default("items", "status", "backlog")
+    .dry_run()  # preview first — returns the report + derived schema
+    .build()
+    .directives,
+    dry_run=True,
+)
+# re-run with dry_run=False to apply
+```
+
+`change_type` takes a closed `Cast` (`TO_STRING`/`TO_NUMBER`/`TO_INT64`/
+`TO_BOOLEAN`); the optional `default` substitutes for un-coercible rows (without
+it a single bad value rolls the whole migrate back atomically). `eval_expr` is the
+scoped raw-SQL escape hatch (one table's `doc` jsonb, no joins/DDL). See
+[`docs/superpowers/specs/2026-07-31-schema-migration-backfill-design.md`](../docs/superpowers/specs/2026-07-31-schema-migration-backfill-design.md).
+
 ## Errors
 
 Every failure is `RtDbError { code, message }` with `ErrorCode` matching the

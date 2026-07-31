@@ -104,6 +104,32 @@ should be idempotent. The in-memory test client (`InMemoryRtDbClient`) mirrors
 the store and exposes a timer-less `tick(nowMs?)` that fires due jobs
 synchronously in unit tests.
 
+## Schema migration
+
+Destructive/type-changing schema transformations (rename, type coercion, removal,
+default backfill) are a deliberate admin operation separate from the additive
+`pushSchema`. Build a `Migration` and apply it (or dry-run first) via the admin
+client — `POST /admin/db/{db}/migrate` runs the directives transactionally inside
+the committer, so live queries, the op feed, audit, and webhooks all fire.
+
+```ts
+import { Migration } from "@par-rt-db/client";
+
+const result = await admin.migrate("kanban", new Migration()
+  .renameField("items", "title", "summary")
+  .changeType("items", "order", { type: "string" }, "toString", "0")
+  .setDefault("items", "status", "backlog")
+  .dryRun()                       // preview first — returns the report + derived schema
+  .build());
+if (result.applied) { /* … */ }   // re-run without .dryRun() to apply
+```
+
+`changeType` takes a closed `cast` (`toString`/`toNumber`/`toInt64`/`toBoolean`);
+the optional `default` substitutes for un-coercible rows (without it a single bad
+value rolls the whole migrate back atomically). `evalExpr` is the scoped raw-SQL
+escape hatch (one table's `doc` jsonb, no joins/DDL). See
+[`docs/superpowers/specs/2026-07-31-schema-migration-backfill-design.md`](../docs/superpowers/specs/2026-07-31-schema-migration-backfill-design.md).
+
 ## File storage
 
 Both the one-shot `RtDbHttpClient` and the reactive `RtDbClient` (delegating to

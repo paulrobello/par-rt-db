@@ -99,6 +99,33 @@ db.cancel_schedule(&id).await?;      // …or pause_schedule / resume_schedule
 let jobs: Vec<ScheduleInfo> = db.list_schedules().await?;
 ```
 
+## Schema migration
+
+Destructive/type-changing schema transformations are a deliberate admin operation,
+separate from the additive `push_schema`. Build a `Migration` (feature `admin`)
+and apply it via `RtDbHttpClient::migrate_schema` — `POST /admin/db/{db}/migrate`
+runs the directives transactionally inside the committer, so live queries, the op
+feed, audit, and webhooks all fire.
+
+```rust
+use par_rt_db_client::{Migration, Cast};
+
+let result = db.migrate_schema("kanban", &Migration::new()
+    .rename_field("items", "title", "summary")
+    .change_type("items", "order", FieldType::String, Cast::ToString, Some("0"))
+    .set_default("items", "status", "backlog")
+    .dry_run(true)   // preview first — returns the report + derived schema
+    .build_request()
+    .directives, true).await?;
+// re-run with dry_run = false to apply
+```
+
+`change_type` takes a closed `Cast` (`ToString`/`ToNumber`/`ToInt64`/`ToBoolean`);
+the optional `default` substitutes for un-coercible rows (without it a single bad
+value rolls the whole migrate back atomically). `eval_expr` is the scoped raw-SQL
+escape hatch (one table's `doc` jsonb, no joins/DDL). See
+[`docs/superpowers/specs/2026-07-31-schema-migration-backfill-design.md`](../docs/superpowers/specs/2026-07-31-schema-migration-backfill-design.md).
+
 ## File storage
 
 `RtDbHttpClient` exposes file storage (`upload` / `delete_file` /

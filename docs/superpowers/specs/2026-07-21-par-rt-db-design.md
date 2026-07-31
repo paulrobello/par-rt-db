@@ -96,9 +96,12 @@ subscription invalidation. Reads (queries) go straight to Postgres concurrently.
 - A global `rtdb_auth` schema holds `users`, `sessions`, and per-database
   `allowlist` + `machine_tokens` tables.
 
-Schema migration policy (MVP): additive changes (new tables, new optional fields, new
-indexes) apply automatically on push. Destructive/type-changing pushes are rejected
-with a clear error — handled manually if ever needed.
+Schema migration policy: additive changes (new tables, new optional fields, new
+indexes) apply automatically on push. Destructive/type-changing transformations
+(rename, type coercion, removal, default backfill, and a scoped arbitrary-transform
+escape) are applied via the declarative migrate operation
+(`POST /admin/db/{db}/migrate`) — see
+`docs/superpowers/specs/2026-07-31-schema-migration-backfill-design.md`.
 
 ## Wire protocol
 
