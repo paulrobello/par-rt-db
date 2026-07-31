@@ -534,15 +534,17 @@ impl InMemoryRtDbClient {
                 if t.collaborators_field.as_deref() == Some(field.as_str()) {
                     t.collaborators_field = None;
                 }
+                // Server parity: `affected_rows` is every row in the table
+                // (server `all_ids(...).len()`), not just rows that had the
+                // field. The field is still removed from rows that carry it.
                 let mut affected = 0i64;
                 for ((tname, _), row) in self.docs.iter_mut() {
                     if tname != table {
                         continue;
                     }
-                    if let Some(obj) = row.doc.as_object_mut()
-                        && obj.remove(field).is_some()
-                    {
-                        affected += 1;
+                    affected += 1;
+                    if let Some(obj) = row.doc.as_object_mut() {
+                        obj.remove(field);
                     }
                 }
                 Ok((
@@ -3649,6 +3651,54 @@ mod tests {
                 .iter()
                 .all(|d| d.get("name").is_some())
         );
+    }
+
+    #[cfg(feature = "admin")]
+    #[tokio::test]
+    async fn migrate_drop_field_affected_rows_counts_every_row() {
+        // Server parity: DropField reports `affected_rows` as every row in the
+        // table (server `all_ids(...).len()`), not just rows that carried the
+        // field. Build a table where most rows LACK the optional `note` field,
+        // drop it, and assert the count is the TOTAL row count.
+        let mut c = migrate_schema_with_rows().await;
+        // Third row that DOES carry the optional `note` field (the fixture's
+        // two rows omit it).
+        c.mutate(
+            &Mutation::new()
+                .insert(
+                    "items",
+                    json!({"name": "c", "status": "todo", "order": 3, "note": "tagged"}),
+                )
+                .build(),
+            Some("m-note"),
+        )
+        .await
+        .unwrap();
+        let before = c.collect_all("items");
+        assert_eq!(before.len(), 3);
+        assert_eq!(
+            before.iter().filter(|d| d.get("note").is_some()).count(),
+            1,
+            "precondition: exactly one row carries `note`"
+        );
+
+        let directives = vec![crate::wire::admin::Directive::DropField {
+            table: "items".into(),
+            field: "note".into(),
+        }];
+        let result = c.migrate_schema(&directives, false).unwrap();
+        assert!(result.applied);
+        assert_eq!(result.directives[0].op, "dropField");
+        // Counts every row in the table (server `ids.len()`), NOT just the
+        // single row that had the field.
+        assert_eq!(result.directives[0].affected_rows, 3);
+
+        // The field is nonetheless removed from the row that carried it, and
+        // the derived schema no longer declares it.
+        let after = c.collect_all("items");
+        assert_eq!(after.len(), 3);
+        assert!(after.iter().all(|d| d.get("note").is_none()));
+        assert!(!result.schema.tables["items"].fields.contains_key("note"));
     }
 
     // ---- validate_doc --------------------------------------------------
