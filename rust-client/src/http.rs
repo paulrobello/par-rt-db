@@ -2057,6 +2057,7 @@ mod admin_tests {
                 "adminKeyConfigured": true,
                 "githubConfigured": false,
                 "googleConfigured": false,
+                "gitlabConfigured": false,
                 "hot": {
                     "allowedOrigins": ["https://app.example"],
                     "sessionTtlDays": 30,
@@ -2108,6 +2109,7 @@ mod admin_tests {
                 "adminKeyConfigured": false,
                 "githubConfigured": false,
                 "googleConfigured": false,
+                "gitlabConfigured": false,
                 "hot": {
                     "allowedOrigins": ["https://x.example"],
                     "sessionTtlDays": 60,

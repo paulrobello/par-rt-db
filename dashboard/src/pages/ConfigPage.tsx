@@ -173,6 +173,7 @@ export function ConfigPage() {
           <ProviderRow label="admin key" on={cfg.adminKeyConfigured} />
           <ProviderRow label="github oauth" on={cfg.githubConfigured} />
           <ProviderRow label="google oauth" on={cfg.googleConfigured} />
+          <ProviderRow label="gitlab oauth" on={cfg.gitlabConfigured} />
         </div>
       </section>
     </section>

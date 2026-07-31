@@ -220,6 +220,7 @@ describe("RtDbAdminClient — new endpoints", () => {
       adminKeyConfigured: true,
       githubConfigured: false,
       googleConfigured: false,
+      gitlabConfigured: false,
       hot: {
         allowedOrigins: [],
         sessionTtlDays: 30,
@@ -245,6 +246,7 @@ describe("RtDbAdminClient — new endpoints", () => {
       adminKeyConfigured: true,
       githubConfigured: false,
       googleConfigured: false,
+      gitlabConfigured: false,
       hot: {
         allowedOrigins: ["https://app.x"],
         sessionTtlDays: 30,

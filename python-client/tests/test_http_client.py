@@ -804,6 +804,7 @@ _CONFIG_RESPONSE_BODY: dict[str, Any] = {
     "adminKeyConfigured": True,
     "githubConfigured": False,
     "googleConfigured": False,
+    "gitlabConfigured": False,
     "hot": {
         "allowedOrigins": ["https://app.example"],
         "sessionTtlDays": 30,

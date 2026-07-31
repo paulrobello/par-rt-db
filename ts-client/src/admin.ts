@@ -82,6 +82,7 @@ export interface ConfigResponse {
   adminKeyConfigured: boolean;
   githubConfigured: boolean;
   googleConfigured: boolean;
+  gitlabConfigured: boolean;
   hot: HotConfig;
   version: string;
   gitCommit: string;

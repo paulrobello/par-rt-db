@@ -168,6 +168,7 @@ class ConfigResponse(_Wire):
     admin_key_configured: bool
     github_configured: bool
     google_configured: bool
+    gitlab_configured: bool
     hot: HotConfig
     version: str
     git_commit: str

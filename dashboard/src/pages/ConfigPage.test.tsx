@@ -27,6 +27,7 @@ const baseConfig: ConfigResponse = {
   adminKeyConfigured: true,
   githubConfigured: false,
   googleConfigured: false,
+  gitlabConfigured: false,
   hot: {
     allowedOrigins: ["https://app.example.com"],
     sessionTtlDays: 7,
