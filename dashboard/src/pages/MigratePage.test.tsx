@@ -133,6 +133,42 @@ describe("MigratePage", () => {
     expect(screen.getByRole("button", { name: "apply" })).toBeDisabled();
   });
 
+  it("apply stays disabled when the editor drifts during an in-flight dry-run (race)", async () => {
+    // The race: while a dry-run request is pending (busy, result still null),
+    // the user types more. Those keystrokes can't reset the gate (result isn't
+    // a dryRun yet), so when the response lands the gate must still catch the
+    // drift via the reviewed-text snapshot — apply stays disabled until a fresh
+    // dry-run on the current text.
+    const user = userEvent.setup();
+    let resolveDryRun!: (v: MigrateResultJson) => void;
+    adminClientMock.migrate.mockReturnValueOnce(
+      new Promise<MigrateResultJson>((r) => {
+        resolveDryRun = r;
+      }),
+    );
+    render(<MigratePage />);
+
+    const editor = screen.getByRole("textbox", { name: "directives JSON" });
+
+    // Start the dry-run; it is now in flight.
+    await user.click(screen.getByRole("button", { name: "dry-run" }));
+
+    // Drift the editor while the request is pending.
+    await user.type(editor, " ");
+
+    // Resolve the dry-run with the (stale-text) report.
+    resolveDryRun(REPORT);
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "apply" })).toBeDisabled();
+    });
+
+    // A fresh dry-run on the drifted text re-arms apply.
+    adminClientMock.migrate.mockResolvedValueOnce(REPORT);
+    await user.click(screen.getByRole("button", { name: "dry-run" }));
+    await screen.findByText("renameField");
+    expect(screen.getByRole("button", { name: "apply" })).toBeEnabled();
+  });
+
   it("surfaces a server error envelope from a dry-run", async () => {
     const user = userEvent.setup();
     adminClientMock.migrate.mockRejectedValue(

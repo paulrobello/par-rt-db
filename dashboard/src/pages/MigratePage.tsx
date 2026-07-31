@@ -11,7 +11,7 @@ import { RtDbRequestError, useAdmin } from "../lib/admin";
 import s from "./MigratePage.module.css";
 
 type Result =
-  | { kind: "dryRun"; report: MigrateResultJson }
+  | { kind: "dryRun"; report: MigrateResultJson; reviewedText: string }
   | { kind: "applied"; report: MigrateResultJson }
   | { kind: "error"; code: string; status: number | null; message: string }
   | null;
@@ -70,7 +70,10 @@ export function MigratePage() {
     setBusy(true);
     try {
       const report = await client.migrate(db, req);
-      setResult({ kind: "dryRun", report });
+      // Snapshot the editor text at the moment of the request so apply can be
+      // gated on an exact match — defends against drift during and after the
+      // dry-run (a keystroke that lands while this await is pending, or after).
+      setResult({ kind: "dryRun", report, reviewedText: text });
     } catch (e) {
       setResult(toError(e));
     } finally {
@@ -96,9 +99,10 @@ export function MigratePage() {
     }
   }
 
-  // Apply is gated on a reviewed dry-run: the editor hasn't changed since the
-  // last preview, and that preview succeeded.
-  const reviewed = result?.kind === "dryRun";
+  // Apply is gated on a reviewed dry-run whose previewed text exactly matches
+  // the current editor contents. Any drift — during or after the dry-run —
+  // forces a re-preview before apply can fire.
+  const reviewed = result?.kind === "dryRun" && result.reviewedText === text;
 
   return (
     <section className={s.page}>
