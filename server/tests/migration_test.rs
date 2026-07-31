@@ -10,7 +10,7 @@ mod common;
 
 use std::sync::Arc;
 
-use common::{test_state, test_state_with_audit};
+use common::{admin_post, spawn_app, test_state, test_state_with_audit};
 use rtdb_server::AppState;
 use rtdb_server::db;
 use rtdb_server::ddl::push_schema;
@@ -964,6 +964,117 @@ async fn migrate_and_concurrent_mutate_both_land_same_db() {
         docs.iter()
             .any(|d| d.get("flag").and_then(|v| v.as_bool()) == Some(true)),
         "migrate's setDefault landed: {docs:?}"
+    );
+    drop_db(&db).await;
+}
+
+// ---------------------------------------------------------------------------
+// Task 7: HTTP route `POST /admin/db/{db}/migrate`.
+//
+// The admin-gated public surface over the committer's migrate arm. Mirrors the
+// admin-auth pattern in tests/admin_test.rs: admin bearer applies; a missing
+// bearer -> 401; an unknown db -> 404. The route runs `require_admin` before
+// `database_exists`, so the auth gate rejects without touching migration state.
+// ---------------------------------------------------------------------------
+
+// (T7-a) admin bearer applies a setDefault directive through the HTTP route;
+// the doc is rewritten through the committer (with fan-out + taps) and the
+// response reports `applied: true` plus the per-directive affected-row count.
+#[tokio::test]
+async fn http_migrate_applies_with_admin_key() {
+    let db = setup_db_with_schema(
+        r#"{"tables":{"u":{"fields":{"n":{"type":"number"},"flag":{"type":"optional","inner":{"type":"boolean"}}},"indexes":[]}}}"#,
+    )
+    .await;
+    let id = insert_doc(&db, "u", r#"{"n":1}"#).await;
+    let addr = spawn_app(db.state.clone()).await;
+
+    let resp = admin_post(
+        addr,
+        &format!("/admin/db/{}/migrate", db.name),
+        serde_json::json!({"directives":[{"op":"setDefault","table":"u","field":"flag","value":true}]}),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await.expect("json body");
+    assert_eq!(body["applied"], true, "applied: {body:?}");
+    assert_eq!(
+        body["directives"][0]["affectedRows"], 1,
+        "one row affected: {body:?}"
+    );
+
+    // The doc was rewritten through the committer (fan-out + taps fire).
+    let doc = get_doc(&db, "u", &id).await;
+    assert_eq!(doc["flag"], serde_json::json!(true));
+    drop_db(&db).await;
+}
+
+// (T7-b) missing admin bearer -> 401 UNAUTHORIZED. The db exists, so the only
+// reason for 401 is the auth gate (`require_admin` runs before `database_exists`).
+#[tokio::test]
+async fn http_migrate_rejects_missing_admin() {
+    let db =
+        setup_db_with_schema(r#"{"tables":{"u":{"fields":{"n":{"type":"number"}},"indexes":[]}}}"#)
+            .await;
+    let addr = spawn_app(db.state.clone()).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/admin/db/{}/migrate", db.name))
+        .json(&serde_json::json!({"directives":[]}))
+        .send()
+        .await
+        .expect("send migrate request");
+    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let body: serde_json::Value = resp.json().await.expect("json body");
+    assert_eq!(body["code"], "UNAUTHORIZED");
+    drop_db(&db).await;
+}
+
+// (T7-c) migrate against a database that was never created -> 404 NOT_FOUND
+// (mirrors /admin/db/{db}/query and /admin/db/{db}/mutate).
+#[tokio::test]
+async fn http_migrate_unknown_db_404() {
+    let state = test_state().await;
+    let addr = spawn_app(state).await;
+    let bogus = format!("t{}", uuid::Uuid::now_v7().simple());
+
+    let resp = admin_post(
+        addr,
+        &format!("/admin/db/{bogus}/migrate"),
+        serde_json::json!({"directives":[]}),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+    let body: serde_json::Value = resp.json().await.expect("json body");
+    assert_eq!(body["code"], "NOT_FOUND");
+}
+
+// (T7-d) dryRun commits nothing and reports `applied: false`. The doc is
+// unchanged — confirms the route threads `dryRun` through to the committer,
+// which rolls the migration tx back and publishes through no tap site.
+#[tokio::test]
+async fn http_migrate_dry_run() {
+    let db = setup_db_with_schema(
+        r#"{"tables":{"u":{"fields":{"n":{"type":"number"},"flag":{"type":"optional","inner":{"type":"boolean"}}},"indexes":[]}}}"#,
+    )
+    .await;
+    let id = insert_doc(&db, "u", r#"{"n":1}"#).await;
+    let addr = spawn_app(db.state.clone()).await;
+
+    let resp = admin_post(
+        addr,
+        &format!("/admin/db/{}/migrate", db.name),
+        serde_json::json!({"directives":[{"op":"setDefault","table":"u","field":"flag","value":true}],"dryRun":true}),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await.expect("json body");
+    assert_eq!(body["applied"], false, "dryRun not applied: {body:?}");
+
+    let doc = get_doc(&db, "u", &id).await;
+    assert!(
+        doc.get("flag").is_none(),
+        "dryRun committed nothing, doc unchanged: {doc:?}"
     );
     drop_db(&db).await;
 }

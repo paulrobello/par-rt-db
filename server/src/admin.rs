@@ -591,6 +591,25 @@ async fn admin_mutate(
     }))
 }
 
+/// `POST /admin/db/{db}/migrate` — admin schema migration through the committer
+/// (serialized with concurrent writes; runs the subs/op-feed/audit/webhook taps
+/// on the durable result). `dryRun` rolls back and publishes nothing. Reuses
+/// `migrate::MigrateRequest` directly: it already carries `rename_all =
+/// "camelCase"`, so the wire body is `{directives, dryRun}`.
+async fn admin_migrate(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(db): Path<String>,
+    ApiJson(body): ApiJson<crate::migrate::MigrateRequest>,
+) -> Result<Json<crate::migrate::MigrateResult>, RtDbError> {
+    require_admin(&state, &headers).await?;
+    if !db::database_exists(&state.pool, &db).await? {
+        return Err(RtDbError::not_found("unknown database"));
+    }
+    let result = state.realtime.committers.migrate(&db, body).await?;
+    Ok(Json(result))
+}
+
 // --- Scheduled jobs (admin) ------------------------------------------------
 //
 // Thin admin-gated wrappers over the same `scheduler` accessors the per-db
@@ -1386,6 +1405,7 @@ pub fn admin_routes() -> Router<Arc<AppState>> {
         .route("/admin/dbs/{db}/stats", get(db_stats))
         .route("/admin/db/{db}/query", post(admin_query))
         .route("/admin/db/{db}/mutate", post(admin_mutate))
+        .route("/admin/db/{db}/migrate", post(admin_migrate))
         .route(
             "/admin/db/{db}/storage",
             get(admin_storage_list)
