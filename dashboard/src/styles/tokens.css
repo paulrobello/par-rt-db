@@ -13,10 +13,6 @@
   --rule: rgba(129, 156, 204, 0.15);
   --rule-strong: rgba(129, 156, 204, 0.28);
 
-  /* Atmosphere grid — faint, masked (par-mem ground texture) */
-  --grid-line: rgba(129, 156, 204, 0.05);
-  --grid-line-strong: rgba(129, 156, 204, 0.08);
-
   /* Ink */
   --ink: #f2f6ff;
   --ink-2: #95a4bf;

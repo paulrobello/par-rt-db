@@ -32,21 +32,6 @@ body {
   text-rendering: optimizeLegibility;
 }
 
-/* Faint masked engineering grid — the ground texture. Sits behind #root. */
-body::before {
-  content: "";
-  position: fixed;
-  inset: 0;
-  pointer-events: none;
-  opacity: 0.55;
-  background-image:
-    linear-gradient(var(--grid-line) 1px, transparent 1px),
-    linear-gradient(90deg, var(--grid-line) 1px, transparent 1px);
-  background-size: 54px 54px;
-  -webkit-mask-image: linear-gradient(to bottom, black, transparent 80%);
-  mask-image: linear-gradient(to bottom, black, transparent 80%);
-}
-
 :where(button, input, textarea, select) {
   font: inherit;
   color: inherit;
