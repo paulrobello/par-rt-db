@@ -1,5 +1,10 @@
 import { RtDbError } from "./errors.js";
-import type { SchemaJson, TransactionJson } from "./protocol.js";
+import type {
+  MigrateRequestJson,
+  MigrateResultJson,
+  SchemaJson,
+  TransactionJson,
+} from "./protocol.js";
 import type { RtQuery } from "./query.js";
 import type { SchemaDefinition } from "./schema.js";
 
@@ -292,6 +297,17 @@ export class RtDbAdminClient {
       idempotencyKey: opts?.idempotencyKey,
     });
     return (body as { results: unknown[] }).results;
+  }
+
+  /** Apply (or preview) a declarative schema migration (POST /admin/db/{db}/migrate).
+   *  `req.dryRun` reports `affectedRows` and the derived `schema` without committing;
+   *  a real run returns `applied: true` with the new installed schema. */
+  async migrate(db: string, req: MigrateRequestJson): Promise<MigrateResultJson> {
+    return (await this.request(
+      "POST",
+      `/admin/db/${encodeURIComponent(db)}/migrate`,
+      req,
+    )) as MigrateResultJson;
   }
 
   private async throwFromResponse(response: Response): Promise<never> {

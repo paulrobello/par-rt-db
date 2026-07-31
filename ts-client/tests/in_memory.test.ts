@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { RtDbError } from "../src/errors.js";
 import { evalFilterExpr, InMemoryRtDbClient, validateFilter } from "../src/in_memory.js";
+import { Migration } from "../src/migration.js";
 import { mutation } from "../src/mutation.js";
 import { decodeCursor, encodeCursor } from "../src/pagination.js";
 import type { FilterExpr, PaginatedResultJson, ScheduleInfo } from "../src/protocol.js";
@@ -1241,5 +1242,199 @@ describe("InMemoryRtDbClient — literal-union widening (pushSchema parity)", ()
     const c = new InMemoryRtDbClient();
     c.pushSchema(base);
     expect(() => c.pushSchema(swapped)).toThrow(/changed type of field 'things\./);
+  });
+});
+
+describe("InMemoryRtDbClient — migrate", () => {
+  it("renameField rewrites the doc key and updates the installed schema", async () => {
+    const c = newClient();
+    await c.mutate(mutation().insert("items", { name: "a", status: "todo", order: 1 }).build());
+
+    const res = c.migrate(new Migration().renameField("items", "name", "title").build());
+    expect(res.applied).toBe(true);
+    expect(res.directives).toEqual([{ op: "renameField", affectedRows: 1 }]);
+    expect(res.schema.tables.items.fields.title).toEqual({ type: "string" });
+    expect(res.schema.tables.items.fields).not.toHaveProperty("name");
+
+    const docs = await c.query(api.items.query().collect());
+    const first = docs[0] as unknown as Record<string, unknown>;
+    expect(first.title).toBe("a");
+    expect(first).not.toHaveProperty("name");
+  });
+
+  it("renameField only counts rows that carry the renamed key", () => {
+    const c = newClient();
+    // `note` is optional; only the second row carries it.
+    c.mutate(
+      mutation()
+        .insert("items", { name: "a", status: "todo", order: 1 })
+        .insert("items", { name: "b", status: "done", order: 2, note: "x" })
+        .build(),
+    );
+    const res = c.migrate(new Migration().renameField("items", "note", "memo").build());
+    expect(res.directives[0].affectedRows).toBe(1);
+  });
+
+  it("renameTable relabels the table in the schema and the doc map", async () => {
+    const c = newClient();
+    await c.mutate(mutation().insert("items", { name: "a", status: "todo", order: 1 }).build());
+
+    const res = c.migrate(new Migration().renameTable("items", "tasks").build());
+    expect(res.directives).toEqual([{ op: "renameTable", affectedRows: 0 }]);
+    expect(res.schema.tables).toHaveProperty("tasks");
+    expect(res.schema.tables).not.toHaveProperty("items");
+
+    // The doc map follows the rename: the row is reachable under the new table.
+    const docs = await c.query<unknown[]>({ json: { table: "tasks" } } as unknown as RtQuery<
+      unknown[]
+    >);
+    expect(docs).toHaveLength(1);
+  });
+
+  it("setDefault fills the field on rows that lack it", async () => {
+    const c = newClient();
+    await c.mutate(mutation().insert("items", { name: "a", status: "todo", order: 1 }).build());
+
+    const res = c.migrate(new Migration().setDefault("items", "note", "none").build());
+    expect(res.directives).toEqual([{ op: "setDefault", affectedRows: 1 }]);
+
+    const docs = await c.query(api.items.query().collect());
+    expect(docs[0].note).toBe("none");
+  });
+
+  it("setDefault leaves rows that already have the field untouched", () => {
+    const c = newClient();
+    c.mutate(
+      mutation()
+        .insert("items", { name: "a", status: "todo", order: 1 })
+        .insert("items", { name: "b", status: "done", order: 2, note: "keep" })
+        .build(),
+    );
+    const res = c.migrate(new Migration().setDefault("items", "note", "none").build());
+    expect(res.directives[0].affectedRows).toBe(1);
+  });
+
+  it("changeType coerces a number to a string via toString", async () => {
+    const c = newClient();
+    await c.mutate(mutation().insert("items", { name: "a", status: "todo", order: 42 }).build());
+
+    const res = c.migrate(
+      new Migration().changeType("items", "order", { type: "string" }, "toString").build(),
+    );
+    expect(res.directives).toEqual([{ op: "changeType", affectedRows: 1 }]);
+    expect(res.schema.tables.items.fields.order).toEqual({ type: "string" });
+
+    const docs = await c.query(api.items.query().collect());
+    expect(docs[0].order).toBe("42");
+  });
+
+  it("changeType coerces a numeric string to a number via toNumber", async () => {
+    const c = newClient();
+    await c.mutate(mutation().insert("items", { name: "21", status: "todo", order: 1 }).build());
+
+    c.migrate(new Migration().changeType("items", "name", { type: "number" }, "toNumber").build());
+    const docs = await c.query(api.items.query().collect());
+    expect(docs[0].name).toBe(21);
+  });
+
+  it("changeType falls back to a coerced default when a value cannot be coerced", async () => {
+    const c = newClient();
+    await c.mutate(mutation().insert("items", { name: "a", status: "todo", order: 1 }).build());
+
+    c.migrate(
+      new Migration().changeType("items", "name", { type: "number" }, "toNumber", 0).build(),
+    );
+    const docs = await c.query(api.items.query().collect());
+    expect(docs[0].name).toBe(0);
+  });
+
+  it("changeType throws BAD_REQUEST when a value cannot be coerced and no default is given", () => {
+    const c = newClient();
+    c.mutate(mutation().insert("items", { name: "a", status: "todo", order: 1 }).build());
+    expect(() =>
+      c.migrate(new Migration().changeType("items", "name", { type: "number" }, "toNumber").build()),
+    ).toThrow(RtDbError);
+  });
+
+  it("changeType rejects a cast the source type does not admit", () => {
+    const c = newClient();
+    c.mutate(mutation().insert("items", { name: "a", status: "todo", order: 1 }).build());
+    // `order` is a number; ToNumber admits only String|Boolean|Int64 (not Number),
+    // so this cast is outside the matrix and must be rejected.
+    expect(() =>
+      c.migrate(
+        new Migration().changeType("items", "order", { type: "number" }, "toNumber").build(),
+      ),
+    ).toThrow(RtDbError);
+  });
+
+  it("dropField removes the key from every doc and the field from the schema", async () => {
+    const c = newClient();
+    await c.mutate(mutation().insert("items", { name: "a", status: "todo", order: 1 }).build());
+
+    const res = c.migrate(new Migration().dropField("items", "status").build());
+    expect(res.directives).toEqual([{ op: "dropField", affectedRows: 1 }]);
+    expect(res.schema.tables.items.fields).not.toHaveProperty("status");
+
+    const docs = await c.query(api.items.query().collect());
+    expect(docs[0]).not.toHaveProperty("status");
+  });
+
+  it("dropTable removes the table from the schema and the doc map", () => {
+    const c = newClient();
+    c.mutate(mutation().insert("items", { name: "a", status: "todo", order: 1 }).build());
+    const res = c.migrate(new Migration().dropTable("items").build());
+    expect(res.directives).toEqual([{ op: "dropTable", affectedRows: 1 }]);
+    expect(res.schema.tables).not.toHaveProperty("items");
+  });
+
+  it("dropIndex removes the index from the schema", () => {
+    const c = newClient();
+    const res = c.migrate(new Migration().dropIndex("items", "by_name").build());
+    expect(res.directives).toEqual([{ op: "dropIndex", affectedRows: 0 }]);
+    const remaining = res.schema.tables.items.indexes?.map((i) => i.name) ?? [];
+    expect(remaining).not.toContain("by_name");
+  });
+
+  it("evalExpr throws BAD_REQUEST (no SQL engine in-memory)", () => {
+    const c = newClient();
+    expect(() => c.migrate(new Migration().evalExpr("items", "x", "1 = 1").build())).toThrow(
+      "evalExpr unsupported in-memory",
+    );
+  });
+
+  it("dryRun validates and reports affectedRows without committing", async () => {
+    const c = newClient();
+    await c.mutate(mutation().insert("items", { name: "a", status: "todo", order: 1 }).build());
+
+    const res = c.migrate(
+      new Migration().renameField("items", "name", "title").dryRun().build(),
+    );
+    expect(res.applied).toBe(false);
+    expect(res.directives).toEqual([{ op: "renameField", affectedRows: 1 }]);
+    expect(res.schema.tables.items.fields).toHaveProperty("title");
+
+    // Nothing committed — the doc still carries the old key.
+    const docs = await c.query(api.items.query().collect());
+    expect(docs[0]).toHaveProperty("name", "a");
+    expect(docs[0]).not.toHaveProperty("title");
+  });
+
+  it("rolls back every prior effect when a later directive fails (atomic)", async () => {
+    const c = newClient();
+    await c.mutate(mutation().insert("items", { name: "a", status: "todo", order: 1 }).build());
+
+    expect(() =>
+      c.migrate(
+        new Migration()
+          .renameField("items", "name", "title") // would apply
+          .renameField("items", "nope", "x") // fails — should roll back the first
+          .build(),
+      ),
+    ).toThrow(RtDbError);
+
+    const docs = await c.query(api.items.query().collect());
+    expect(docs[0]).toHaveProperty("name", "a");
+    expect(docs[0]).not.toHaveProperty("title");
   });
 });

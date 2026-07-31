@@ -4,9 +4,14 @@ import { parseStepResults, type StepResult } from "./mutation.js";
 import { decodeCursor, encodeCursor } from "./pagination.js";
 import type {
   AggregateOp,
+  Cast,
+  DirectiveJson,
+  DirectiveReportJson,
   FieldTypeJson,
   FilterExpr,
   IndexJson,
+  MigrateRequestJson,
+  MigrateResultJson,
   Order,
   Paginate,
   PaginatedResultJson,
@@ -189,6 +194,74 @@ function detectDestructiveChanges(oldSchema: SchemaJson, newSchema: SchemaJson):
       if (JSON.stringify(newIndex.vector ?? null) !== JSON.stringify(oldIndex.vector ?? null)) {
         throw new RtDbError("BAD_REQUEST", `changed vector spec of index '${oldIndex.name}'`);
       }
+    }
+  }
+}
+
+/** True iff `cast` can coerce from `old` — a port of server `migrate::cast_valid_for`.
+ * Mirrors the spec's coercion matrix: only the listed scalar source types are
+ * accepted; an `optional`/`object`/`array`/etc. source has no sound coercion. */
+function castValidFor(cast: Cast, old: FieldTypeJson): boolean {
+  const t = old.type;
+  switch (cast) {
+    case "toString":
+      return t === "string" || t === "number" || t === "boolean" || t === "int64";
+    case "toNumber":
+      return t === "string" || t === "boolean" || t === "int64";
+    case "toInt64":
+      return t === "string" || t === "number";
+    case "toBoolean":
+      return t === "string" || t === "number";
+  }
+}
+
+/** Pure TS coercion mirroring server `migrate::coerce_value`. Returns the
+ * coerced JSON value, or `undefined` when the value cannot be coerced under
+ * `cast` — the caller then substitutes a (coerced) default or raises a
+ * row-named `BAD_REQUEST`, matching the server's per-row decision.
+ *
+ * `toInt64` emits a decimal-string JSON value (int64 travels as a canonical
+ * decimal string on this wire — see `schema::is_valid_int64` and
+ * `FEATURE_MATRIX.md` #13); `toNumber` emits a JSON number. The other casts
+ * produce the natural JSON representation. */
+function coerceValue(cast: Cast, v: unknown): unknown {
+  switch (cast) {
+    case "toString":
+      if (typeof v === "string") return v;
+      if (typeof v === "number") return String(v);
+      if (typeof v === "boolean") return v ? "true" : "false";
+      return undefined;
+    case "toNumber": {
+      if (typeof v === "string") {
+        const n = Number(v);
+        return Number.isFinite(n) ? n : undefined;
+      }
+      if (typeof v === "number") return v;
+      if (typeof v === "boolean") return v ? 1 : 0;
+      return undefined;
+    }
+    case "toInt64": {
+      if (typeof v === "string") {
+        // `isInt64String` validates the canonical decimal-string form and the
+        // i64 range; the value passes through unchanged.
+        return isInt64String(v) ? v : undefined;
+      }
+      if (typeof v === "number") {
+        if (!Number.isInteger(v)) return undefined;
+        const bi = BigInt(v);
+        if (bi < -(2n ** 63n) || bi > 2n ** 63n - 1n) return undefined;
+        return String(v);
+      }
+      return undefined;
+    }
+    case "toBoolean": {
+      if (typeof v === "string") {
+        if (v === "true" || v === "1") return true;
+        if (v === "false" || v === "0") return false;
+        return undefined;
+      }
+      if (typeof v === "number") return v !== 0;
+      return undefined;
     }
   }
 }
@@ -675,6 +748,226 @@ export class InMemoryRtDbClient {
       }
     }
     this.schema = next;
+  }
+
+  /** Applies (or previews) a declarative schema migration — a port of server
+   * `migrate::plan_migration` (validation + structural schema fold) and
+   * `migrate::apply_migration` (data effects). Structural directives update the
+   * installed schema; data directives rewrite the in-memory doc map to match so
+   * subsequent reads stay consistent with the new schema.
+   *
+   * A failed directive is atomic: every structural and data effect from earlier
+   * directives rolls back (snapshot/restore, like `executeTransaction`). With
+   * `req.dryRun`, the full plan is validated and `affectedRows` reported against
+   * the derived schema, but nothing is committed (`applied: false`).
+   *
+   * `evalExpr` has no in-memory SQL engine and throws `BAD_REQUEST` — same
+   * convention as the search/vector stubs. Affected-rows counts mirror the
+   * server: `renameField`/`setDefault` count the rows whose docs actually
+   * changed; `changeType`/`dropField`/`dropTable` count every row in the table;
+   * `renameTable`/`dropIndex` report zero. */
+  migrate(req: MigrateRequestJson): MigrateResultJson {
+    const old = this.requireSchema();
+    const planned: SchemaJson = clone(old);
+    const touched = new Set<string>();
+    const tableSnap = this.snapshotTables();
+    const reports: DirectiveReportJson[] = [];
+    try {
+      for (const d of req.directives) {
+        const { report, table } = this.applyMigrationDirective(planned, d);
+        reports.push(report);
+        if (table) touched.add(table);
+      }
+    } catch (err) {
+      // Atomicity: a failed directive rolls back every earlier structural+data effect.
+      this.restoreTables(tableSnap);
+      throw err;
+    }
+    if (req.dryRun) {
+      this.restoreTables(tableSnap);
+      return { applied: false, schema: planned, directives: reports };
+    }
+    this.schema = planned;
+    this.notifySubs(touched);
+    return { applied: true, schema: planned, directives: reports };
+  }
+
+  /** Validates and applies one directive: folds the structural effect into
+   * `planned` (the working schema copy) and rewrites the in-memory doc map. */
+  private applyMigrationDirective(
+    planned: SchemaJson,
+    d: DirectiveJson,
+  ): { report: DirectiveReportJson; table?: string } {
+    switch (d.op) {
+      case "renameField": {
+        const t = this.migrateTable(planned, d.table);
+        if (d.to in t.fields) {
+          throw new RtDbError(
+            "BAD_REQUEST",
+            `rename target '${d.table}.${d.to}' already exists`,
+          );
+        }
+        const ftype = t.fields[d.from];
+        if (!ftype) {
+          throw new RtDbError(
+            "BAD_REQUEST",
+            `renamed field '${d.table}.${d.from}' does not exist`,
+          );
+        }
+        delete t.fields[d.from];
+        t.fields[d.to] = ftype;
+        for (const ix of t.indexes ?? []) {
+          for (let i = 0; i < ix.fields.length; i++) {
+            if (ix.fields[i] === d.from) ix.fields[i] = d.to;
+          }
+        }
+        if (t.ownerField === d.from) t.ownerField = d.to;
+        if (t.collaboratorsField === d.from) t.collaboratorsField = d.to;
+        let affected = 0;
+        for (const row of this.rowsFor(d.table).values()) {
+          if (d.from in row.doc) {
+            row.doc[d.to] = row.doc[d.from];
+            delete row.doc[d.from];
+            affected++;
+          }
+        }
+        return { report: { op: "renameField", affectedRows: affected }, table: d.table };
+      }
+      case "renameTable": {
+        if (d.to in planned.tables) {
+          throw new RtDbError("BAD_REQUEST", `rename target table '${d.to}' already exists`);
+        }
+        const def = planned.tables[d.from];
+        if (!def) {
+          throw new RtDbError("BAD_REQUEST", `renamed table '${d.from}' does not exist`);
+        }
+        delete planned.tables[d.from];
+        // Id references to `from` in other tables follow the rename.
+        for (const other of Object.values(planned.tables)) {
+          for (const [fname, ftype] of Object.entries(other.fields)) {
+            if (ftype.type === "id" && ftype.table === d.from) {
+              other.fields[fname] = { type: "id", table: d.to };
+            }
+          }
+        }
+        planned.tables[d.to] = def;
+        const rows = this.tables.get(d.from);
+        if (rows) {
+          this.tables.delete(d.from);
+          this.tables.set(d.to, rows);
+        }
+        return { report: { op: "renameTable", affectedRows: 0 }, table: d.to };
+      }
+      case "changeType": {
+        const t = this.migrateTable(planned, d.table);
+        const oldTy = t.fields[d.field];
+        if (!oldTy) {
+          throw new RtDbError(
+            "BAD_REQUEST",
+            `changed field '${d.table}.${d.field}' does not exist`,
+          );
+        }
+        if (!castValidFor(d.cast, oldTy)) {
+          throw new RtDbError(
+            "BAD_REQUEST",
+            `cast ${d.cast} is not valid for ${d.table}.${d.field}`,
+          );
+        }
+        const rows = [...this.rowsFor(d.table).values()];
+        for (const row of rows) {
+          if (!(d.field in row.doc)) continue;
+          const coerced = coerceValue(d.cast, row.doc[d.field]);
+          if (coerced !== undefined) {
+            row.doc[d.field] = coerced;
+            continue;
+          }
+          if (d.default !== undefined) {
+            const dv = coerceValue(d.cast, d.default);
+            row.doc[d.field] = dv ?? d.default;
+            continue;
+          }
+          throw new RtDbError(
+            "BAD_REQUEST",
+            `changeType cannot coerce value in ${d.table}.${row.id} (${row.doc[d.field]}) and no default given`,
+          );
+        }
+        t.fields[d.field] = d.to;
+        return { report: { op: "changeType", affectedRows: rows.length }, table: d.table };
+      }
+      case "dropField": {
+        const t = this.migrateTable(planned, d.table);
+        if (!(d.field in t.fields)) {
+          throw new RtDbError(
+            "BAD_REQUEST",
+            `dropped field '${d.table}.${d.field}' does not exist`,
+          );
+        }
+        delete t.fields[d.field];
+        for (const ix of t.indexes ?? []) {
+          ix.fields = ix.fields.filter((f) => f !== d.field);
+        }
+        if (t.ownerField === d.field) t.ownerField = undefined;
+        if (t.collaboratorsField === d.field) t.collaboratorsField = undefined;
+        const rows = this.rowsFor(d.table);
+        for (const row of rows.values()) {
+          delete row.doc[d.field];
+        }
+        return { report: { op: "dropField", affectedRows: rows.size }, table: d.table };
+      }
+      case "dropTable": {
+        const def = planned.tables[d.name];
+        if (!def) {
+          throw new RtDbError("BAD_REQUEST", `dropped table '${d.name}' does not exist`);
+        }
+        const count = this.rowsFor(d.name).size;
+        delete planned.tables[d.name];
+        this.tables.delete(d.name);
+        return { report: { op: "dropTable", affectedRows: count }, table: d.name };
+      }
+      case "dropIndex": {
+        const t = this.migrateTable(planned, d.table);
+        const ix = (t.indexes ?? []).find((i) => i.name === d.name);
+        if (!ix) {
+          throw new RtDbError(
+            "BAD_REQUEST",
+            `dropped index '${d.table}.${d.name}' does not exist`,
+          );
+        }
+        t.indexes = (t.indexes ?? []).filter((i) => i.name !== d.name);
+        return { report: { op: "dropIndex", affectedRows: 0 }, table: d.table };
+      }
+      case "setDefault": {
+        const t = this.migrateTable(planned, d.table);
+        if (!(d.field in t.fields)) {
+          throw new RtDbError(
+            "BAD_REQUEST",
+            `setDefault target '${d.table}.${d.field}' does not exist`,
+          );
+        }
+        let affected = 0;
+        for (const row of this.rowsFor(d.table).values()) {
+          if (!(d.field in row.doc)) {
+            row.doc[d.field] = clone(d.value);
+            affected++;
+          }
+        }
+        return { report: { op: "setDefault", affectedRows: affected }, table: d.table };
+      }
+      case "evalExpr": {
+        // No SQL engine in the harness — throw rather than silently misbehave.
+        throw new RtDbError("BAD_REQUEST", "evalExpr unsupported in-memory");
+      }
+    }
+  }
+
+  /** Resolves a mutable table definition from the working schema, throwing the
+   * server-shaped `BAD_REQUEST` when the table is absent. */
+  private migrateTable(schema: SchemaJson, name: string): TableJson {
+    const t = schema.tables[name];
+    if (!t) {
+      throw new RtDbError("BAD_REQUEST", `table '${name}' does not exist`);
+    }
+    return t;
   }
 
   /** One-shot query — same shape as {@link RtDbHttpClient.query}. */

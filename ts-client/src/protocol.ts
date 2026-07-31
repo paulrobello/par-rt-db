@@ -164,6 +164,76 @@ export interface TransactionJson {
   steps: StepJson[];
 }
 
+// ---- Migration wire types ---------------------------------------------------
+//
+// Mirror server `migrate::*` byte-for-byte: the `Directive` enum (tag `op`,
+// camelCase, `deny_unknown_fields` — the same shape contract as `StepJson`),
+// `Cast`, `MigrateRequest`, `MigrateResult`, `DirectiveReport`, `CastFailure`,
+// `SampleChange`. See `server/src/migrate.rs` for the authoritative shapes.
+
+/** Mirrors server `migrate::Cast` (camelCase): the closed set of sound coercions
+ * accepted by `Directive::ChangeType`. */
+export type Cast = "toString" | "toNumber" | "toInt64" | "toBoolean";
+
+/** Mirrors server `migrate::Directive` byte-for-byte (tag `op`, camelCase,
+ * `deny_unknown_fields`). `evalExpr.where` is the wire alias for the server's
+ * `where_clause` field (serde `rename = "where"`). */
+export type DirectiveJson =
+  | { op: "renameField"; table: string; from: string; to: string }
+  | { op: "renameTable"; from: string; to: string }
+  | {
+      op: "changeType";
+      table: string;
+      field: string;
+      to: FieldTypeJson;
+      cast: Cast;
+      default?: unknown;
+    }
+  | { op: "dropField"; table: string; field: string }
+  | { op: "dropTable"; name: string }
+  | { op: "dropIndex"; table: string; name: string }
+  | { op: "setDefault"; table: string; field: string; value: unknown }
+  | { op: "evalExpr"; table: string; set: string; expr: string; where?: string };
+
+/** Mirrors server `migrate::MigrateRequest` (camelCase; `dryRun` is
+ * `#[serde(default)]` false). */
+export interface MigrateRequestJson {
+  directives: DirectiveJson[];
+  dryRun?: boolean;
+}
+
+/** Mirrors server `migrate::CastFailure` (camelCase). */
+export interface CastFailureJson {
+  id: string;
+  value: unknown;
+}
+
+/** Mirrors server `migrate::SampleChange` (camelCase). */
+export interface SampleChangeJson {
+  id: string;
+  before: unknown;
+  after: unknown;
+}
+
+/** Mirrors server `migrate::DirectiveReport` (camelCase). `castFailures` and
+ * `sampleChanges` are `skip_serializing_if = "Vec::is_empty"` on the server, so
+ * they surface as optional on the wire (absent when empty). */
+export interface DirectiveReportJson {
+  op: string;
+  affectedRows: number;
+  castFailures?: CastFailureJson[];
+  sampleChanges?: SampleChangeJson[];
+}
+
+/** Mirrors server `migrate::MigrateResult` (camelCase). `schema` is the
+ * post-migration derived schema — returned even on `dryRun` (with
+ * `applied: false`), so a caller can preview the resulting shape. */
+export interface MigrateResultJson {
+  applied: boolean;
+  schema: SchemaJson;
+  directives: DirectiveReportJson[];
+}
+
 /**
  * Whether an `AuthedUser` resolved from an interactive OAuth session or a
  * per-database machine token. Mirrors server `protocol::UserKind` (ARC-009):

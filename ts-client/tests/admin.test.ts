@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { RtDbAdminClient } from "../src/admin.js";
+import { Migration } from "../src/migration.js";
 import type { TransactionJson } from "../src/protocol.js";
 import { defineSchema, defineTable, t } from "../src/schema.js";
 
@@ -356,6 +357,43 @@ describe("RtDbAdminClient — new endpoints", () => {
       name: "RtDbError",
       code: "NOT_FOUND",
       message: "database not found",
+    });
+  });
+
+  it("migrate POSTs {directives, dryRun} to /admin/db/{db}/migrate and decodes MigrateResultJson", async () => {
+    const result = {
+      applied: true,
+      schema: { tables: {} },
+      directives: [{ op: "renameField", affectedRows: 2 }],
+    };
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(result));
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+    const req = new Migration().renameField("users", "name", "fullName").dryRun().build();
+    await expect(admin.migrate("kanban", req)).resolves.toEqual(result);
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("http://h:8300/admin/db/kanban/migrate");
+    expect(init.method).toBe("POST");
+    expect(init.headers.Authorization).toBe("Bearer k");
+    expect(JSON.parse(init.body)).toEqual({
+      directives: [{ op: "renameField", table: "users", from: "name", to: "fullName" }],
+      dryRun: true,
+    });
+  });
+
+  it("migrate surfaces a 400 validation envelope as RtDbError", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      jsonResponse(
+        { code: "BAD_REQUEST", message: "renamed field 'users.nope' does not exist" },
+        400,
+      ),
+    );
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+    await expect(
+      admin.migrate("kanban", new Migration().renameField("users", "nope", "x").build()),
+    ).rejects.toMatchObject({
+      name: "RtDbError",
+      code: "BAD_REQUEST",
+      message: "renamed field 'users.nope' does not exist",
     });
   });
 });
