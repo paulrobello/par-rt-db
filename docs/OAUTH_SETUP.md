@@ -6,7 +6,8 @@ How to register OAuth apps and wire them into par-rt-db. Each provider is
 working with zero providers configured.
 
 > **Source of truth:** the provider implementations in `server/src/auth/`
-> (`provider.rs` for the shared trait/plumbing, `github.rs`, `google.rs`). This
+> (`provider.rs` for the shared trait/plumbing, `github.rs`, `gitlab.rs`,
+> `google.rs`). This
 > guide mirrors those files — if the code and this doc disagree, the code wins;
 > fix this doc.
 
@@ -22,9 +23,10 @@ working with zero providers configured.
 - Identity is **email-keyed with cross-provider linking**: a user who first
   logs in via GitHub and later via Google (same verified email) resolves to the
   same account. Enabling more providers is additive, not fragmenting.
-- Both providers **require a verified email**. Google requires `email_verified`;
+- All providers **require a verified email**. Google requires `email_verified`;
   GitHub picks the primary verified address (falling back to any verified one)
-  and never trusts the unverified profile-level email.
+  and never trusts the unverified profile-level email; GitLab requires a
+  confirmed email (`confirmed_at` set on `/api/v4/user`).
 - A provider is "configured" only when **both** its `CLIENT_ID` and
   `CLIENT_SECRET` are non-empty (`from_config` returns `None` otherwise).
 
@@ -44,6 +46,7 @@ working with zero providers configured.
 |---|---|---|---|
 | GitHub | `RTDB_GITHUB_CLIENT_ID` / `RTDB_GITHUB_CLIENT_SECRET` | `RTDB_PUBLIC_URL` + `/auth/callback` | `read:user user:email` |
 | Google | `RTDB_GOOGLE_CLIENT_ID` / `RTDB_GOOGLE_CLIENT_SECRET` | `RTDB_PUBLIC_URL` + `/auth/google/callback` | `openid email profile` |
+| GitLab | `RTDB_GITLAB_CLIENT_ID` / `RTDB_GITLAB_CLIENT_SECRET` | `RTDB_PUBLIC_URL` + `/auth/gitlab/callback` | `read_user email` |
 
 ---
 
@@ -117,6 +120,42 @@ immediate — no review.
 
 ---
 
+## GitLab
+
+par-rt-db uses GitLab's standard authorization-code flow: `/oauth/authorize` →
+`/oauth/token` → `/api/v4/user`. It works against gitlab.com or any self-hosted
+GitLab.
+
+One application serves the whole instance (create it under the account that owns
+the deploy, or a dedicated service account):
+
+1. In GitLab go to **User settings → Applications** (or **Admin Area →
+   Applications** for an instance-wide app on a self-hosted server):
+   `https://gitlab.com/-/user_settings/applications`.
+2. Fill in:
+   - **Name:** your choice (e.g. `par-rt-db`).
+   - **Redirect URI:** `RTDB_PUBLIC_URL` + `/auth/gitlab/callback`
+     (e.g. `https://rtdb.pardev.net/auth/gitlab/callback`). Must match
+     byte-for-byte, including `https://`.
+   - **Confidential:** leave checked (the secret stays server-side).
+   - **Scopes:** select **`read_user`** and **`email`** — the `email` scope is
+     required for `/api/v4/user` to return the primary email address.
+3. **Save application**, then copy the **Application ID** (client id) and
+   **Secret**. GitLab shows the secret only once.
+4. Set `RTDB_GITLAB_CLIENT_ID` and `RTDB_GITLAB_CLIENT_SECRET`
+   (see [Applying changes](#applying-changes)).
+
+GitLab's `/api/v4/user` exposes `confirmed_at` (a timestamp when the address is
+confirmed, `null` otherwise). par-rt-db admits only users whose email is
+confirmed — an unconfirmed GitLab email is rejected with
+`403 "no verified email"`, so have users confirm their address first.
+
+**Self-hosted GitLab:** set `RTDB_GITLAB_BASE_URL` (default `https://gitlab.com`)
+to your instance root, e.g. `https://gitlab.example.com`. par-rt-db then uses
+`{base_url}/oauth/authorize`, `/oauth/token`, and `/api/v4/user`.
+
+---
+
 ## Applying changes
 
 OAuth client IDs/secrets are **boot-time config** (held on the server's `Config`,
@@ -162,17 +201,19 @@ curl -s https://rtdb.pardev.net/auth/me -H "Authorization: Bearer <session-token
 | `403 "no verified email"` | The account's email isn't verified at the provider. Verify it, or (Google) ensure the account is a *Test user* while the consent screen is in Testing. |
 | Google login works only for one account | Consent screen still in *Testing*. **Publish app** → *In production*. |
 
-## Adding a new provider (GitLab, Microsoft, …)
+## Adding a new provider (Microsoft, Apple, …)
 
 Each new provider is a small, self-contained implementation behind the
 `OAuthProvider` trait (`server/src/auth/provider.rs`):
 
 - Implement `OAuthProvider` in a new module under `server/src/auth/`
-  (`name`, `from_config` reading two new `Config` fields, `callback_path`,
+  (`name`, `from_config` reading the provider's `Config` fields, `callback_path`,
   `authorize_url`, and `complete_login` doing the code-for-token exchange +
-  verified-email fetch + `session::create_session`).
-- Add the two `Config` fields (env: `RTDB_<PROVIDER>_CLIENT_ID` /
-  `_SECRET`) and the two routes in `auth_routes()`.
+  verified-email fetch + `session::create_session`). `gitlab.rs` is the most
+  recent worked example.
+- Add the `Config` fields — at minimum `RTDB_<PROVIDER>_CLIENT_ID` /
+  `_SECRET`, plus a base/API URL field when the provider is self-hostable
+  (`gitlab.rs`/`github.rs`) — and the two routes in `auth_routes()`.
 - **Wire the env vars into the deploy** — add the two vars to the server
   service's `environment:` block in `docker-compose.yml` (mirroring the
   GitHub/Google pair) and to `.env.example`. Without the compose line the vars
