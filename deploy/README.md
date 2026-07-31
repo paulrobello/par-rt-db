@@ -98,8 +98,11 @@ container (`docker compose up -d server`) and confirm
 `rtdb_subs_skip_verifications_total` starts climbing; if it stays 0 while skips
 accumulate, the variable isn't reaching the process. A divergence logs at ERROR, increments the counter, and pushes the
 corrected result (so it repairs, not just reports). Each verification costs the
-Postgres round-trip the skip avoided — after changing invalidation logic, set
-N=20 for a few days and confirm the counter stays 0, then set it back to 0.
+Postgres round-trip the skip avoided. **Prod runs a permanent standing canary at
+`RTDB_SUBS_VERIFY_SKIP_EVERY=200` (set 2026-07-30)** — a skipped update is
+silent, so the verifier stays on as a detector rather than being toggled off.
+After changing invalidation logic, temporarily lower it to N=20 for a few days
+and confirm `rtdb_subs_missed_pushes_total` stays 0, then return it to 200.
 
 ## Secrets (`/docker/par-rt-db/.env`, not committed)
 
