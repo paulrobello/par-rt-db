@@ -1,9 +1,4 @@
-import type {
-  Cast,
-  DirectiveJson,
-  FieldTypeJson,
-  MigrateRequestJson,
-} from "./protocol.js";
+import type { Cast, DirectiveJson, FieldTypeJson, MigrateRequestJson } from "./protocol.js";
 
 /**
  * Chainable builder for a declarative schema migration. Mirrors `TxnBuilder`:
@@ -31,13 +26,7 @@ export class Migration {
     return this;
   }
 
-  changeType(
-    table: string,
-    field: string,
-    to: FieldTypeJson,
-    cast: Cast,
-    def?: unknown,
-  ): this {
+  changeType(table: string, field: string, to: FieldTypeJson, cast: Cast, def?: unknown): this {
     this.directives.push({
       op: "changeType",
       table,

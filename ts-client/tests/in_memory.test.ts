@@ -1352,7 +1352,9 @@ describe("InMemoryRtDbClient — migrate", () => {
     const c = newClient();
     c.mutate(mutation().insert("items", { name: "a", status: "todo", order: 1 }).build());
     expect(() =>
-      c.migrate(new Migration().changeType("items", "name", { type: "number" }, "toNumber").build()),
+      c.migrate(
+        new Migration().changeType("items", "name", { type: "number" }, "toNumber").build(),
+      ),
     ).toThrow(RtDbError);
   });
 
@@ -1407,9 +1409,7 @@ describe("InMemoryRtDbClient — migrate", () => {
     const c = newClient();
     await c.mutate(mutation().insert("items", { name: "a", status: "todo", order: 1 }).build());
 
-    const res = c.migrate(
-      new Migration().renameField("items", "name", "title").dryRun().build(),
-    );
+    const res = c.migrate(new Migration().renameField("items", "name", "title").dryRun().build());
     expect(res.applied).toBe(false);
     expect(res.directives).toEqual([{ op: "renameField", affectedRows: 1 }]);
     expect(res.schema.tables.items.fields).toHaveProperty("title");

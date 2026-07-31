@@ -381,12 +381,14 @@ describe("RtDbAdminClient — new endpoints", () => {
   });
 
   it("migrate surfaces a 400 validation envelope as RtDbError", async () => {
-    const fetchMock = vi.fn().mockResolvedValue(
-      jsonResponse(
-        { code: "BAD_REQUEST", message: "renamed field 'users.nope' does not exist" },
-        400,
-      ),
-    );
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(
+        jsonResponse(
+          { code: "BAD_REQUEST", message: "renamed field 'users.nope' does not exist" },
+          400,
+        ),
+      );
     const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
     await expect(
       admin.migrate("kanban", new Migration().renameField("users", "nope", "x").build()),

@@ -802,17 +802,11 @@ export class InMemoryRtDbClient {
       case "renameField": {
         const t = this.migrateTable(planned, d.table);
         if (d.to in t.fields) {
-          throw new RtDbError(
-            "BAD_REQUEST",
-            `rename target '${d.table}.${d.to}' already exists`,
-          );
+          throw new RtDbError("BAD_REQUEST", `rename target '${d.table}.${d.to}' already exists`);
         }
         const ftype = t.fields[d.from];
         if (!ftype) {
-          throw new RtDbError(
-            "BAD_REQUEST",
-            `renamed field '${d.table}.${d.from}' does not exist`,
-          );
+          throw new RtDbError("BAD_REQUEST", `renamed field '${d.table}.${d.from}' does not exist`);
         }
         delete t.fields[d.from];
         t.fields[d.to] = ftype;
@@ -928,10 +922,7 @@ export class InMemoryRtDbClient {
         const t = this.migrateTable(planned, d.table);
         const ix = (t.indexes ?? []).find((i) => i.name === d.name);
         if (!ix) {
-          throw new RtDbError(
-            "BAD_REQUEST",
-            `dropped index '${d.table}.${d.name}' does not exist`,
-          );
+          throw new RtDbError("BAD_REQUEST", `dropped index '${d.table}.${d.name}' does not exist`);
         }
         t.indexes = (t.indexes ?? []).filter((i) => i.name !== d.name);
         return { report: { op: "dropIndex", affectedRows: 0 }, table: d.table };

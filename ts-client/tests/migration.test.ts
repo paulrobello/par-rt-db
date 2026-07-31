@@ -76,8 +76,7 @@ describe("Migration builder", () => {
   it("emits the camelCase cast literals verbatim", () => {
     const casts = ["toString", "toNumber", "toInt64", "toBoolean"] as const;
     for (const cast of casts) {
-      const [d] = new Migration().changeType("t", "f", { type: "string" }, cast).build()
-        .directives;
+      const [d] = new Migration().changeType("t", "f", { type: "string" }, cast).build().directives;
       expect(d).toMatchObject({ cast });
     }
   });
