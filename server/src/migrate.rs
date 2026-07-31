@@ -399,7 +399,13 @@ async fn apply_one(
             let blocking: Vec<&str> = old_table
                 .indexes
                 .iter()
-                .filter(|ix| ix.fields.iter().any(|f| f == field))
+                .filter(|ix| {
+                    ix.fields.iter().any(|f| f == field)
+                        || ix
+                            .vector
+                            .as_ref()
+                            .is_some_and(|v| v.filter_fields.iter().any(|f| f == field))
+                })
                 .map(|ix| ix.name.as_str())
                 .collect();
             if !blocking.is_empty() {

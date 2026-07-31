@@ -252,6 +252,70 @@ async fn drop_field_rejects_when_indexed() {
     drop_db(&db).await;
 }
 
+// (e2) dropField on a vector index's `filterFields` entry is rejected with a
+// bad_request naming the index — a vector index's filter field carries a real
+// `f_` column (see `ddl::indexed_fields`), so dropping it would desync the
+// physical state from the derived schema the same way a btree index field would.
+#[tokio::test]
+async fn drop_field_rejects_when_vector_filter_field() {
+    let db = setup_db_with_schema(
+        r#"{"tables":{"docs":{"fields":{
+            "embedding":{"type":"vector","dimensions":3},
+            "userId":{"type":"string"},
+            "note":{"type":"string"}
+        },"indexes":[
+            {"name":"by_embedding","fields":["embedding"],"vector":{"dimensions":3,"filterFields":["userId"]}}
+        ]}}}"#,
+    )
+    .await;
+    insert_doc(
+        &db,
+        "docs",
+        r#"{"embedding":[0.0,0.0,0.0],"userId":"u1","note":"x"}"#,
+    )
+    .await;
+
+    // Dropping the vector index's filterField is blocked and names the index.
+    let request: MigrateRequest = serde_json::from_str(
+        r#"{"directives":[{"op":"dropField","table":"docs","field":"userId"}]}"#,
+    )
+    .expect("parse request");
+    let derived = plan_migration(&db.schema, &request.directives).expect("plan");
+    let mut tx = db.state.pool.begin().await.expect("begin tx");
+    let err = apply_migration(&mut tx, &db.name, &request.directives, &derived, false)
+        .await
+        .expect_err("vector filterField drop should be rejected");
+    tx.rollback().await.ok();
+    assert_eq!(err.code, rtdb_server::error::ErrorCode::BadRequest);
+    assert!(
+        err.message.contains("by_embedding"),
+        "error should name the blocking vector index: {}",
+        err.message
+    );
+    assert!(
+        err.message.contains("docs.userId"),
+        "error should name the field: {}",
+        err.message
+    );
+
+    // Sanity: dropping a non-indexed field on the same table still succeeds.
+    let id2 = insert_doc(
+        &db,
+        "docs",
+        r#"{"embedding":[1.0,0.0,0.0],"userId":"u2","note":"keep-me"}"#,
+    )
+    .await;
+    migrate(
+        &db,
+        r#"{"directives":[{"op":"dropField","table":"docs","field":"note"}]}"#,
+    )
+    .await;
+    let doc = get_doc(&db, "docs", &id2).await;
+    assert!(doc.get("note").is_none(), "non-indexed field dropped");
+    assert_eq!(doc["userId"], "u2", "filterField untouched");
+    drop_db(&db).await;
+}
+
 // (f) dropTable removes the physical table and reports the deleted ids.
 #[tokio::test]
 async fn drop_table_removes_physical_table() {
