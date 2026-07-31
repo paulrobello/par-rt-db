@@ -1,9 +1,9 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import type { SchemaJson, TransactionJson } from "@par-rt-db/client";
-import { Button, Placard, Spinner, StatusLamp } from "../components/ui";
+import { Button, LiveValue, Placard, Spinner, StatusLamp } from "../components/ui";
 import { useAdmin } from "../lib/admin";
-import { formatTime } from "../lib/format";
+import { formatNumber, formatTime } from "../lib/format";
 import { useLiveTable } from "../lib/useLiveTable";
 import s from "./DataBrowserPage.module.css";
 
@@ -27,6 +27,21 @@ export function DataBrowserPage() {
     const t = schema?.tables[table];
     return t ? Object.keys(t.fields) : [];
   }, [schema, table]);
+
+  // Newest-row settle: flash the head row when a realtime insert lands at the
+  // top (desc order). Skips the initial load, like the op feed does.
+  const prevTopId = useRef<string | null>(null);
+  const [freshId, setFreshId] = useState<string | null>(null);
+  useEffect(() => {
+    const topId = docs[0]?._id ?? null;
+    if (topId && prevTopId.current !== null && prevTopId.current !== topId) {
+      setFreshId(topId);
+      const t = setTimeout(() => setFreshId((id) => (id === topId ? null : id)), 700);
+      prevTopId.current = topId;
+      return () => clearTimeout(t);
+    }
+    if (topId) prevTopId.current = topId;
+  }, [docs]);
 
   useEffect(() => {
     let cancelled = false;
@@ -140,7 +155,9 @@ export function DataBrowserPage() {
           </select>
         </label>
         <StatusLamp status={live ? "ok" : "warn"} label={live ? "live · /sync" : "polling · 2s"} />
-        <span className={s.count}>showing {docs.length}</span>
+        <span className={s.count}>
+          showing <LiveValue value={formatNumber(docs.length)} />
+        </span>
         <span className={s.spacer} />
         <Button
           onClick={() => {
@@ -220,7 +237,7 @@ export function DataBrowserPage() {
             </thead>
             <tbody>
               {docs.map((doc) => (
-                <tr key={doc._id}>
+                <tr key={doc._id} className={doc._id === freshId ? s.rowFresh : undefined}>
                   {cols.map((c) => (
                     <td
                       key={c}

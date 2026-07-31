@@ -1,3 +1,4 @@
+import { useEffect, useRef, useState } from "react";
 import { NavLink, Outlet } from "react-router-dom";
 import { Button, ConnectionPulse, Placard } from "../components/ui";
 import { useAdmin } from "../lib/admin";
@@ -29,9 +30,9 @@ function clock(ms: number): string {
   return `${hhmmss}.${String(d.getMilliseconds()).padStart(3, "0")}`;
 }
 
-function OpLine({ op }: { op: OpEvent }) {
+function OpLine({ op, fresh }: { op: OpEvent; fresh?: boolean }) {
   return (
-    <div className={s.opLine}>
+    <div className={`${s.opLine} ${fresh ? s.opLineFresh : ""}`}>
       <span className={`${s.opKind} ${KIND_TONE[op.kind]}`}>{op.kind[0].toUpperCase()}</span>
       <span className={s.opWhere}>
         {op.db}
@@ -49,6 +50,24 @@ export function AppShell() {
   const { user, method, signOut } = useSession();
   const email = (user as { email?: string } | null)?.email;
   const identity = email ?? (method === "adminkey" ? "admin key" : "—");
+
+  // Op-feed settle: flash the newest event as it lands. prevTopKey starts null
+  // so the initial batch (page load / reconnect backfill) does NOT animate —
+  // only a genuinely new top event does, never an orchestrated entrance.
+  const opKey = (op: OpEvent) => `${op.ts}-${op.docId}-${op.kind}`;
+  const topKey = ops[0] ? opKey(ops[0]) : null;
+  const prevTopKey = useRef<string | null>(null);
+  const [freshKey, setFreshKey] = useState<string | null>(null);
+  useEffect(() => {
+    if (!topKey) return;
+    if (prevTopKey.current !== null && prevTopKey.current !== topKey) {
+      setFreshKey(topKey);
+      const t = setTimeout(() => setFreshKey((k) => (k === topKey ? null : k)), 720);
+      prevTopKey.current = topKey;
+      return () => clearTimeout(t);
+    }
+    prevTopKey.current = topKey;
+  }, [topKey]);
 
   return (
     <div className={s.shell}>
@@ -112,9 +131,10 @@ export function AppShell() {
             <p className={s.liveEmpty}>— idle —</p>
           ) : (
             <div className={s.opList}>
-              {ops.map((op) => (
-                <OpLine key={`${op.ts}-${op.docId}-${op.kind}`} op={op} />
-              ))}
+              {ops.map((op) => {
+                const key = opKey(op);
+                return <OpLine key={key} op={op} fresh={key === freshKey} />;
+              })}
             </div>
           )}
         </aside>

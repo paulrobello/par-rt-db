@@ -55,20 +55,44 @@
 }
 
 .row {
-  display: block;
-  padding: var(--sp-1) var(--sp-2);
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-3);
   border: 1px solid var(--rule);
   background: var(--surface);
-  color: var(--ink-2);
+  transition:
+    background 140ms var(--ease),
+    border-color 140ms var(--ease);
+}
+.row:hover {
+  background: var(--accent-soft);
+  border-color: var(--rule-strong);
+}
+.rowMark {
+  width: 8px;
+  height: 8px;
+  flex: none;
+  border: 1px solid var(--ink-3);
+  background: transparent;
+  transition:
+    background 140ms var(--ease),
+    border-color 140ms var(--ease);
+}
+.row:hover .rowMark {
+  border-color: var(--accent);
+  background: var(--accent);
+}
+.rowName {
   font-family: var(--mono);
   font-size: var(--t-mono-sm);
+  color: var(--ink);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.row:hover {
+.row:hover .rowName {
   color: var(--accent);
-  border-color: var(--accent-dim);
 }
 
 .more {

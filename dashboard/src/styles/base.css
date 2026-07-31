@@ -12,7 +12,22 @@ body,
 
 body {
   margin: 0;
-  background: var(--panel);
+  background-color: var(--panel);
+  /* Hairline engineering grid — the instrument-manual ground. Two layers: a
+     fine 24px mesh plus a stronger 120px major grid, the way engineering paper
+     reads. Kept very low-alpha so it is texture, not noise, and never competes
+     with ink. */
+  background-image:
+    linear-gradient(var(--grid-line-strong) 1px, transparent 1px),
+    linear-gradient(90deg, var(--grid-line-strong) 1px, transparent 1px),
+    linear-gradient(var(--grid-line) 1px, transparent 1px),
+    linear-gradient(90deg, var(--grid-line) 1px, transparent 1px);
+  background-size:
+    120px 120px,
+    120px 120px,
+    24px 24px,
+    24px 24px;
+  background-position: -1px -1px;
   color: var(--ink);
   font-family: var(--sans);
   font-size: var(--t-body);
@@ -51,6 +66,34 @@ a:hover {
   text-transform: uppercase;
   letter-spacing: 0.22em;
   color: var(--ink-3);
+}
+
+/* Liveness — value tick-flash + op-feed settle. Material and bounded: they
+   prove the link is alive, they are not ambient decoration. The global
+   prefers-reduced-motion rule below neuters them for users who opt out. */
+@keyframes tickFlash {
+  0% {
+    background-color: var(--accent-soft);
+  }
+  100% {
+    background-color: transparent;
+  }
+}
+/* Negative margin mirrors the padding so the flash wash never shifts layout. */
+.tickFlash {
+  display: inline-block;
+  padding: 0 0.25em;
+  margin: 0 -0.25em;
+  border-radius: var(--r-1);
+  animation: tickFlash 480ms var(--ease);
+}
+@keyframes opSettle {
+  0% {
+    background-color: var(--accent-soft);
+  }
+  100% {
+    background-color: transparent;
+  }
 }
 
 /* prefers-reduced-motion must override every animation regardless of source

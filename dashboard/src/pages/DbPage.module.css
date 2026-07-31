@@ -51,6 +51,12 @@
   padding: var(--sp-2);
   border-bottom: 1px solid var(--rule);
 }
+.table tbody tr {
+  transition: background 140ms var(--ease);
+}
+.table tbody tr:hover {
+  background: rgba(231, 233, 234, 0.035);
+}
 
 .name {
   font-family: var(--mono);

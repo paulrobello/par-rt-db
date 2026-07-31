@@ -1,6 +1,6 @@
 import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
-import { Button, Field, Placard } from "../components/ui";
+import { Button, Field, LiveValue, Placard } from "../components/ui";
 import { useAdmin } from "../lib/admin";
 import { formatNumber } from "../lib/format";
 import s from "./DatabasesPage.module.css";
@@ -43,7 +43,7 @@ export function DatabasesPage() {
     <section className={s.page}>
       <Placard>Databases</Placard>
       <h1 className={s.title}>
-        Databases <span className={s.count}>{formatNumber(databases.length)}</span>
+        Databases <LiveValue className={s.count} value={formatNumber(databases.length)} />
       </h1>
       <div className={s.toolbar}>
         <Field label="Search" value={q} onChange={setQ} placeholder="filter by name" mono />
@@ -64,7 +64,8 @@ export function DatabasesPage() {
           {rows.map((db) => (
             <li key={db}>
               <Link to={`/dbs/${db}`} className={s.row}>
-                {db}
+                <span className={s.rowMark} aria-hidden />
+                <span className={s.rowName}>{db}</span>
               </Link>
             </li>
           ))}

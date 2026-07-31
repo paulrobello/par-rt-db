@@ -11,6 +11,10 @@
   --rule: rgba(231, 233, 234, 0.1);
   --rule-strong: rgba(231, 233, 234, 0.16);
 
+  /* Engineering grid — the instrument-panel ground texture (own-world) */
+  --grid-line: rgba(231, 233, 234, 0.022);
+  --grid-line-strong: rgba(231, 233, 234, 0.045);
+
   /* Ink */
   --ink: #e7e9ea;
   --ink-2: #9aa0a6;

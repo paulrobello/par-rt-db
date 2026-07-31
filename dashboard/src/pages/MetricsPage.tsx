@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
 import { Sparkline } from "../components/Sparkline";
-import { Placard, Spinner, StatusLamp } from "../components/ui";
+import { LiveValue, Placard, Spinner, StatusLamp } from "../components/ui";
 import { useAdmin } from "../lib/admin";
 import { formatDuration, formatNumber } from "../lib/format";
 import {
@@ -41,13 +41,12 @@ function Instrument({
   return (
     <div className={`${s.instrument} ${alarm ? s.instrument_alarm : ""}`}>
       <span className={s.instrumentLabel}>{label}</span>
-      <span
+      <LiveValue
         className={`${s.instrumentValue} ${alarm ? s.instrumentValue_alarm : ""} ${
           muted ? s.instrumentValue_muted : ""
         }`}
-      >
-        {value}
-      </span>
+        value={value}
+      />
       {sub && <span className={s.instrumentSub}>{sub}</span>}
       {sparkline && <div className={s.spark}>{sparkline}</div>}
     </div>
