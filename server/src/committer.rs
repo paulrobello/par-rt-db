@@ -44,6 +44,15 @@ pub enum CommitterRequest {
         txn: Box<Transaction>,
         cron: Option<String>,
     },
+    /// Apply a declarative schema migration on this database. Serialized through
+    /// the per-db committer like `Mutate`, so the migration's DDL+DML and the
+    /// four downstream taps (fan-out / op-feed / audit / webhook) all observe
+    /// the same single-writer ordering a mutate does. `reply` carries the
+    /// `MigrateResult` (post-migration schema + per-directive reports).
+    RunMigrate {
+        request: crate::migrate::MigrateRequest,
+        reply: oneshot::Sender<Result<crate::migrate::MigrateResult, RtDbError>>,
+    },
 }
 
 /// Owns one serialized committer task per database. Every mutation and every
@@ -216,6 +225,26 @@ impl Committers {
             .map_err(|_| RtDbError::internal("committer task dropped the reply"))?
     }
 
+    /// Applies `request`'s directives on `db` and waits for the commit-then-
+    /// fan-out cycle to complete. Like `mutate`, this funnels through the per-db
+    /// committer so the migration is serialized with concurrent writes, runs the
+    /// four downstream taps (subscription fan-out, op-feed, audit, webhook) on
+    /// the durable result, and — when `request.dry_run` is false — persists the
+    /// derived schema. `dry_run` rolls the migration tx back and publishes
+    /// nothing. See `handle_migrate` for the load-bearing tap-site contract.
+    pub async fn migrate(
+        &self,
+        db: &str,
+        request: crate::migrate::MigrateRequest,
+    ) -> Result<crate::migrate::MigrateResult, RtDbError> {
+        let (reply, reply_rx) = oneshot::channel();
+        self.submit(db, CommitterRequest::RunMigrate { request, reply })
+            .await?;
+        reply_rx
+            .await
+            .map_err(|_| RtDbError::internal("committer task dropped the reply"))?
+    }
+
     /// Runs `query` on `db`, sends the initial result on `tx`, and registers
     /// the subscription for future push-on-change updates. `owner` is the
     /// subscriber's per-row auth identity (captured on the `SubEntry` and
@@ -333,6 +362,10 @@ async fn run_committer(
                 if let Err(err) = handle_scheduled(&ctx, id, kind, *txn, cron).await {
                     tracing::error!(db = %ctx.db, error = %err, "scheduled job handling failed");
                 }
+            }
+            CommitterRequest::RunMigrate { request, reply } => {
+                let result = handle_migrate(&ctx, request).await;
+                let _ = reply.send(result);
             }
         }
     }
@@ -532,6 +565,118 @@ async fn handle_scheduled(
         }
     }
     Ok(())
+}
+
+/// Applies a declarative migration through the committer, mirroring
+/// `handle_mutate`'s post-commit tap-site block so the same four downstream
+/// surfaces (subscription fan-out, op-feed, audit, webhook) observe the writes.
+///
+/// Single-writer invariant: this runs in the committer task's turn and opens its
+/// own `pool.begin()` inside that task (the only writer). It never calls
+/// `execute_txn`. The pre-migration schema is read from `meta` (NOT the cache)
+/// so `plan_migration` operates on authoritative state; `apply_migration` re-reads
+/// `meta` inside the tx for its DDL decisions. The derived schema is validated
+/// before any DML because directive targets (rename `to`, changeType `to`,
+/// evalExpr `set`) are new user input interpolated into SQL.
+///
+/// `dry_run` runs the DDL+DML to collect the preview but rolls the tx back and
+/// publishes through no tap site. On commit, the derived schema is persisted to
+/// `meta` (same shape as `ddl::push_schema`'s tail), the cache is refreshed, and
+/// the four taps fire with `owner = None` and `source = "migrate"` (no
+/// interactive principal, like `handle_scheduled`).
+async fn handle_migrate(
+    ctx: &CommitterCtx,
+    request: crate::migrate::MigrateRequest,
+) -> Result<crate::migrate::MigrateResult, RtDbError> {
+    let schema = crate::db::load_schema(&ctx.pool, &ctx.db)
+        .await?
+        .ok_or_else(|| RtDbError::not_found("database has no schema"))?;
+    let derived = crate::migrate::plan_migration(&schema, &request.directives)?;
+    // The directive targets (rename `to`, changeType `to`, evalExpr `set`) are
+    // new user input that ends up interpolated into SQL; validating the derived
+    // schema catches invalid identifiers/types before any DML runs.
+    // `plan_migration` folds structurally but does not call `validate`.
+    derived.validate()?;
+
+    let mut tx = ctx.pool.begin().await?;
+    let fx = crate::migrate::apply_migration(
+        &mut tx,
+        &ctx.db,
+        &request.directives,
+        &derived,
+        request.dry_run,
+    )
+    .await?;
+
+    if request.dry_run {
+        // Preview only: the DDL+DML ran inside the tx to produce `fx.reports`,
+        // but nothing is committed and no tap site fires.
+        tx.rollback().await?;
+        return Ok(crate::migrate::MigrateResult {
+            applied: false,
+            schema: derived,
+            directives: fx.reports,
+        });
+    }
+
+    // Persist the derived schema (single jsonb blob in "{db_<db>}".meta — same
+    // shape as `ddl::push_schema`'s tail upsert). The committer is the only
+    // writer for this db, so the read-modify-write under the committer turn is
+    // safe. `pg_schema(db)` is already validated/lowercased by `db::create`.
+    let schema_json = serde_json::to_value(&derived)
+        .map_err(|e| RtDbError::internal(format!("failed to serialize schema: {e}")))?;
+    let schema_name = crate::ddl::pg_schema(&ctx.db);
+    sqlx::query(&format!(
+        "INSERT INTO \"{schema_name}\".meta (key, value) VALUES ('schema', $1) \
+         ON CONFLICT (key) DO UPDATE SET value = excluded.value"
+    ))
+    .bind(schema_json)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    ctx.schemas.put(&ctx.db, derived.clone()).await;
+
+    // Four tap sites — same contract as `handle_mutate`. The hand-built
+    // `WriteSet` carries the touched tables (the subscription re-run gate) and
+    // the per-doc ops; `docs`/`doc_values` empty ⇒ table-level re-run, the safe
+    // over-approximation for a migration (some ops may touch docs whose ids
+    // weren't recorded at the fine-grained (table, id) level — re-running is
+    // always sound, never under-approximates).
+    let write_set = WriteSet {
+        tables: fx.touched,
+        ops: fx.ops.clone(),
+        ..Default::default()
+    };
+    ctx.subs
+        .fan_out(&ctx.pool, &ctx.db, &derived, &write_set)
+        .await;
+    // Op-feed completeness: every durable document write must publish here, in
+    // handle_mutate / handle_scheduled, or (now) here.
+    ctx.op_feed.publish(&ctx.db, None, &write_set.ops).await;
+    // Durable audit tap — `source = "migrate"` distinguishes schema-migration
+    // writes from interactive (`mutate`) and scheduled (`scheduled`) ones.
+    if ctx.audit_log_enabled
+        && let Err(err) =
+            crate::audit::write_audit_rows(&ctx.pool, &ctx.db, None, "migrate", &write_set.ops)
+                .await
+    {
+        tracing::warn!(db = %ctx.db, error = %err, "audit log write failed");
+    }
+    // Webhook enqueue tap — mirrors the audit tap above: best-effort, warned on
+    // failure, never surfaces to the client.
+    if ctx.webhooks_enabled
+        && let Err(err) =
+            crate::webhook::enqueue_for_ops(&ctx.pool, &ctx.db, None, "migrate", &write_set.ops)
+                .await
+    {
+        tracing::warn!(db = %ctx.db, error = %err, "webhook enqueue failed");
+    }
+
+    Ok(crate::migrate::MigrateResult {
+        applied: true,
+        schema: derived,
+        directives: fx.reports,
+    })
 }
 
 async fn handle_subscribe(

@@ -10,13 +10,16 @@ mod common;
 
 use std::sync::Arc;
 
-use common::test_state;
+use common::{test_state, test_state_with_audit};
 use rtdb_server::AppState;
 use rtdb_server::db;
 use rtdb_server::ddl::push_schema;
-use rtdb_server::migrate::{MigrateRequest, apply_migration, plan_migration};
+use rtdb_server::migrate::{MigrateRequest, MigrateResult, apply_migration, plan_migration};
+use rtdb_server::protocol::ServerMessage;
+use rtdb_server::query::Query;
 use rtdb_server::schema::SchemaDef;
-use rtdb_server::txn::{Step, Transaction, execute_txn};
+use rtdb_server::subs::next_conn_id;
+use rtdb_server::txn::{OpKind, Step, Transaction, execute_txn};
 
 /// Owns the freshly-created db and the schema that was pushed to it. Each test
 /// builds one via `setup_db_with_schema` and drops it at the end.
@@ -28,6 +31,13 @@ struct Db {
 
 async fn setup_db_with_schema(schema_json: &str) -> Db {
     let state = test_state().await;
+    setup_db_with_schema_in(state, schema_json).await
+}
+
+/// Like `setup_db_with_schema` but the caller supplies the `AppState`. Used by
+/// the committer-arm tests that need a non-default state — e.g. audit-enabled
+/// (`test_state_with_audit`) so the migrate tap writes `rtdb.audit_log` rows.
+async fn setup_db_with_schema_in(state: Arc<AppState>, schema_json: &str) -> Db {
     let name = format!("t{}", uuid::Uuid::now_v7().simple());
     db::create_database(&state.pool, &name)
         .await
@@ -692,5 +702,258 @@ async fn eval_expr_recomputes_indexed_column() {
     .await
     .expect("fetch f_upper");
     assert_eq!(typed, "ADA");
+    drop_db(&db).await;
+}
+
+// ---------------------------------------------------------------------------
+// Task 6: committer `RunMigrate` arm — the four tap sites + dry-run.
+//
+// The tests above exercise `apply_migration` directly (manual tx, no committer).
+// These tests drive the PUBLIC `Committers::migrate` path so the per-db
+// committer task runs the migration and fires the same tap sites a mutate does:
+// subscription fan-out, the op-feed, the durable audit log, and (structurally)
+// webhook enqueue. Each test asserts the invariant directly.
+// ---------------------------------------------------------------------------
+
+/// Drives a migration through the public `Committers::migrate` path (the
+/// committer task, with its tap sites), returning the `MigrateResult`. Mirror of
+/// the direct `migrate` helper above, but exercises the real committer arm.
+async fn migrate_via_committer(db: &Db, request_json: &str) -> MigrateResult {
+    let request: MigrateRequest =
+        serde_json::from_str(request_json).expect("parse migrate request");
+    db.state
+        .realtime
+        .committers
+        .migrate(&db.name, request)
+        .await
+        .expect("committer migrate")
+}
+
+// (T6-a) A migration through the committer fires subscription fan-out: a live
+// `collect` query on the migrated table sees the rewritten doc and is re-pushed.
+// This is the load-bearing subscription invariant — a migrate that didn't tap
+// `subs.fan_out` would silently leave live queries stale.
+#[tokio::test]
+async fn migrate_fires_subscription_fanout() {
+    let db = setup_db_with_schema(
+        r#"{"tables":{"u":{"fields":{"n":{"type":"number"},"flag":{"type":"optional","inner":{"type":"boolean"}}},"indexes":[]}}}"#,
+    )
+    .await;
+    insert_doc(&db, "u", r#"{"n":1}"#).await; // no `flag` key yet
+
+    // Subscribe collecting all docs on table `u`. The initial push carries the
+    // pre-migration doc (no `flag`).
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let conn = next_conn_id();
+    let query: Query =
+        serde_json::from_value(serde_json::json!({"table":"u"})).expect("parse query");
+    db.state
+        .realtime
+        .committers
+        .subscribe(&db.name, conn, "q1".to_string(), query, tx, None)
+        .await
+        .expect("subscribe");
+    let _initial = rx.try_recv().expect("initial query update");
+
+    // setDefault populates `flag` on rows lacking it; fan_out must re-run the
+    // subscription, the result changes, and a push follows.
+    let res = migrate_via_committer(
+        &db,
+        r#"{"directives":[{"op":"setDefault","table":"u","field":"flag","value":true}]}"#,
+    )
+    .await;
+    assert!(res.applied, "migrate committed");
+
+    let msg = rx.try_recv().expect("subscription push after migrate");
+    match msg {
+        ServerMessage::QueryUpdate { query_id, result } => {
+            assert_eq!(query_id, "q1");
+            let docs = result.as_array().expect("docs array");
+            assert_eq!(docs.len(), 1, "one doc in the live result: {docs:?}");
+            assert_eq!(docs[0]["n"], 1, "same doc, identified by n");
+            assert_eq!(
+                docs[0]["flag"],
+                serde_json::json!(true),
+                "migrate's setDefault landed and fanned out: {docs:?}"
+            );
+        }
+        other => panic!("expected QueryUpdate, got {other:?}"),
+    }
+    assert!(
+        rx.try_recv().is_err(),
+        "no further pushes expected after the migrate fan-out"
+    );
+    drop_db(&db).await;
+}
+
+// (T6-b) A migration through the committer publishes its DocOps to the op-feed
+// (the live activity ring `/admin/stream` and `/admin/ops/recent` read). The
+// op-feed event carries db/table/kind but no `source` field, so we assert on
+// kind=Patch — the `source = "migrate"` distinction lives in audit/webhooks.
+#[tokio::test]
+async fn migrate_publishes_to_op_feed() {
+    let db = setup_db_with_schema(
+        r#"{"tables":{"u":{"fields":{"n":{"type":"number"},"flag":{"type":"optional","inner":{"type":"boolean"}}},"indexes":[]}}}"#,
+    )
+    .await;
+    insert_doc(&db, "u", r#"{"n":1}"#).await;
+
+    migrate_via_committer(
+        &db,
+        r#"{"directives":[{"op":"setDefault","table":"u","field":"flag","value":true}]}"#,
+    )
+    .await;
+
+    let events = db
+        .state
+        .realtime
+        .op_feed
+        .recent(Some(&db.name), Some("u"), 16)
+        .await;
+    assert!(
+        events.iter().any(|e| e.kind == OpKind::Patch),
+        "op-feed should carry a Patch DocOp from the migrate: {events:?}"
+    );
+    drop_db(&db).await;
+}
+
+// (T6-c) With audit enabled, a migration through the committer writes one
+// `rtdb.audit_log` row per migrated DocOp with `source = 'migrate'` and a NULL
+// principal (migrate carries no interactive principal, like a scheduled job).
+// Mirrors the audit assertions in `audit_test.rs` but for the migrate tap.
+#[tokio::test]
+async fn migrate_writes_audit_row_when_enabled() {
+    let state = test_state_with_audit().await;
+    let db = setup_db_with_schema_in(
+        state,
+        r#"{"tables":{"u":{"fields":{"n":{"type":"number"},"flag":{"type":"optional","inner":{"type":"boolean"}}},"indexes":[]}}}"#,
+    )
+    .await;
+    insert_doc(&db, "u", r#"{"n":1}"#).await;
+
+    migrate_via_committer(
+        &db,
+        r#"{"directives":[{"op":"setDefault","table":"u","field":"flag","value":true}]}"#,
+    )
+    .await;
+
+    // The physical column is `tbl` (renamed to `table` only in the serialized
+    // AuditEntry). Filter by db so the shared global audit_log stays deterministic.
+    let rows: Vec<(String, String, Option<String>, String)> = sqlx::query_as(
+        "SELECT db, tbl, principal, source \
+         FROM rtdb.audit_log WHERE db = $1 ORDER BY id ASC",
+    )
+    .bind(&db.name)
+    .fetch_all(&db.state.pool)
+    .await
+    .expect("fetch audit rows");
+
+    assert_eq!(rows.len(), 1, "one audit row per migrated doc: {rows:?}");
+    assert_eq!(rows[0].0, db.name, "db");
+    assert_eq!(rows[0].1, "u", "tbl");
+    assert!(
+        rows[0].2.is_none(),
+        "principal null (migrate owner=None): {:?}",
+        rows[0]
+    );
+    assert_eq!(rows[0].3, "migrate", "source is migrate");
+    drop_db(&db).await;
+}
+
+// (T6-d) dry_run runs the DDL+DML only to collect a preview; it commits nothing
+// and publishes through no tap site. The doc is unchanged and `applied` is false.
+#[tokio::test]
+async fn migrate_dry_run_commits_nothing() {
+    let db = setup_db_with_schema(
+        r#"{"tables":{"u":{"fields":{"n":{"type":"number"},"flag":{"type":"optional","inner":{"type":"boolean"}}},"indexes":[]}}}"#,
+    )
+    .await;
+    let id = insert_doc(&db, "u", r#"{"n":1}"#).await;
+
+    let res = migrate_via_committer(
+        &db,
+        r#"{"directives":[{"op":"setDefault","table":"u","field":"flag","value":true}],"dryRun":true}"#,
+    )
+    .await;
+    assert!(!res.applied, "dry_run must not mark applied");
+    // The preview still reports what WOULD have happened: one row affected.
+    assert_eq!(
+        res.directives[0].affected_rows, 1,
+        "dry-run preview reports the would-be affected row"
+    );
+
+    // The tx was rolled back: the doc has no `flag` key.
+    let doc = get_doc(&db, "u", &id).await;
+    assert!(
+        doc.get("flag").is_none(),
+        "dry-run committed nothing, doc unchanged: {doc:?}"
+    );
+    drop_db(&db).await;
+}
+
+// (T6-e) Concurrency: the per-db committer channel serializes a migrate with a
+// concurrent mutate on the SAME database — neither write is lost. Both ops are
+// fired concurrently via `tokio::join!`; regardless of which the committer
+// dequeues first, the final table reflects BOTH effects. (The cross-db case — a
+// mutate on dbB is NOT blocked by a migrate on dbA — is structurally guaranteed
+// by `Committers::channel_for` spawning one task per db, the same property
+// every existing mutate test relies on; a timing-based assertion would be flaky
+// and the brief explicitly forbids committing flaky tests.)
+#[tokio::test]
+async fn migrate_serializes_with_concurrent_mutate_same_db() {
+    let db = setup_db_with_schema(
+        r#"{"tables":{"u":{"fields":{"n":{"type":"number"},"flag":{"type":"optional","inner":{"type":"boolean"}}},"indexes":[]}}}"#,
+    )
+    .await;
+    insert_doc(&db, "u", r#"{"n":1}"#).await;
+
+    let migrate_fut = migrate_via_committer(
+        &db,
+        r#"{"directives":[{"op":"setDefault","table":"u","field":"flag","value":true}]}"#,
+    );
+    let mutate_doc: serde_json::Map<String, serde_json::Value> = serde_json::json!({"n":2})
+        .as_object()
+        .expect("object")
+        .clone();
+    let mutate_fut = async {
+        db.state
+            .realtime
+            .committers
+            .mutate(
+                &db.name,
+                None,
+                Transaction {
+                    steps: vec![Step::Insert {
+                        table: "u".into(),
+                        doc: mutate_doc,
+                    }],
+                },
+                None,
+            )
+            .await
+            .expect("concurrent mutate")
+    };
+
+    // Both go through db.name's single channel; the committer runs one to
+    // completion (including fan-out) before dequeuing the next.
+    let (migrate_res, _outcome) = tokio::join!(migrate_fut, mutate_fut);
+    assert!(migrate_res.applied, "migrate committed");
+
+    // Serialization didn't drop either write. Order-independent: if the migrate
+    // runs first it sets `flag` only on the pre-existing doc; if the mutate
+    // runs first the migrate then sets `flag` on both. Either way the table
+    // holds both an n=2 row (the insert) and a flagged row (the setDefault).
+    let docs = query_docs(&db, "u").await;
+    assert_eq!(docs.len(), 2, "both writes landed: {docs:?}");
+    assert!(
+        docs.iter()
+            .any(|d| d.get("n").and_then(|v| v.as_f64()) == Some(2.0)),
+        "concurrent mutate's insert landed: {docs:?}"
+    );
+    assert!(
+        docs.iter()
+            .any(|d| d.get("flag").and_then(|v| v.as_bool()) == Some(true)),
+        "migrate's setDefault landed: {docs:?}"
+    );
     drop_db(&db).await;
 }
