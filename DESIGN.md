@@ -9,8 +9,8 @@
 > liveness. Adopted from the **par-mem** dashboard (`../par-mem/web`) — that
 > aesthetic is the pinned reference; this is its visual language on par-rt-db's
 > own layout and content.
-> **OWN-WORLD** — Deep-navy ground lit by teal + violet radial glows and a faint
-> masked grid; rounded gradient panels with a teal→violet top hairline and soft
+> **OWN-WORLD** — Deep-navy ground lit by teal + violet radial glows; rounded
+> gradient panels with a teal→violet top hairline and soft
 > shadow; cool off-white ink over blue-tinted hairlines; teal is the live/active
 > register, signal-green marks positive/ok, violet and amber/red encode kind and
 > state. Monospace carries data, numerics, and identifiers; a humanist sans
@@ -44,7 +44,7 @@ earns its place by encoding meaning; glows reinforce live/active state only.
 - Accent (live / active) `#45e6d3` teal; accent-dim `#2bb8a8`; accent-soft `rgba(69,230,211,0.14)`.
 - Signal (ok / positive) `#79f2ad`. Violet `#a998ff`.
 - Status warn `#ffc66d` amber. Status error `#ff766c` alert. Status ok = signal.
-- Atmosphere: teal radial glow top-right + violet radial glow mid-left over a vertical navy gradient; a faint masked 54px grid underneath.
+- Atmosphere: teal radial glow top-right + violet radial glow mid-left over a vertical navy gradient.
 - Card material: `linear-gradient(145deg, rgba(15,23,42,.96), rgba(7,12,24,.96))`, `box-shadow: 0 18px 48px rgba(0,0,0,.18), inset 0 1px 0 rgba(255,255,255,.025)`, teal→violet top hairline.
 
 Dark is primary (physical scene: dim, dev-workflow, long sessions). A light theme is out of scope.
