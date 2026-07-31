@@ -1,7 +1,7 @@
 .page {
   display: flex;
   flex-direction: column;
-  gap: var(--sp-4);
+  gap: var(--sp-5);
 }
 
 .head {
@@ -12,42 +12,66 @@
 
 .title {
   margin: 0;
+  font-family: var(--sans);
   font-size: var(--t-display);
-  font-weight: 600;
-  letter-spacing: -0.01em;
-  font-family: var(--mono);
+  font-weight: 700;
+  letter-spacing: -0.02em;
 }
 
 .panel {
   display: flex;
   flex-direction: column;
-  gap: var(--sp-2);
+  gap: var(--sp-3);
 }
 
 .grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
-  gap: 1px;
-  background: var(--rule);
-  border: 1px solid var(--rule);
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: var(--sp-3);
 }
 
+/* Instrument = par-mem card: rounded gradient, glow, teal→violet top hairline */
 .instrument {
-  background: var(--surface);
-  padding: var(--sp-3);
+  position: relative;
+  overflow: hidden;
+  background: var(--card-grad);
+  border: 1px solid var(--rule);
+  border-radius: var(--r-card);
+  box-shadow: var(--shadow-card), var(--shadow-card-inset);
+  padding: var(--sp-4);
   display: flex;
   flex-direction: column;
   gap: var(--sp-1);
   min-height: 128px;
+  transition:
+    border-color var(--tick) var(--ease),
+    box-shadow var(--tick) var(--ease);
 }
-
+.instrument::before {
+  content: "";
+  position: absolute;
+  inset: 0 0 auto;
+  height: 1px;
+  background: var(--card-hairline);
+  opacity: 0.6;
+}
+.instrument:hover {
+  border-color: var(--rule-strong);
+  box-shadow:
+    0 22px 58px rgba(0, 0, 0, 0.25),
+    0 0 44px rgba(69, 230, 211, 0.03);
+}
 .instrument_alarm {
-  border-left: 2px solid var(--error);
+  border-color: rgba(255, 118, 108, 0.5);
+  box-shadow:
+    var(--shadow-card),
+    0 0 0 1px rgba(255, 118, 108, 0.15);
 }
 
 .instrumentLabel {
   font-family: var(--mono);
-  font-size: var(--t-mono-xs);
+  font-weight: 650;
+  font-size: 9px;
   text-transform: uppercase;
   letter-spacing: 0.16em;
   color: var(--ink-3);
@@ -56,16 +80,15 @@
 .instrumentValue {
   font-family: var(--mono);
   font-variant-numeric: tabular-nums;
-  font-size: 1.6rem;
+  font-size: 30px;
+  font-weight: 650;
+  letter-spacing: -0.045em;
   color: var(--ink);
-  font-weight: 500;
   line-height: 1.1;
 }
-
 .instrumentValue_alarm {
   color: var(--error);
 }
-
 .instrumentValue_muted {
   color: var(--ink-3);
 }

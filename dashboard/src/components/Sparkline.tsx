@@ -108,15 +108,24 @@ export function Sparkline({
             key={pts}
             points={pts}
             fill="none"
-            style={{ stroke, strokeWidth: 2, vectorEffect: "non-scaling-stroke" }}
+            style={{
+              stroke,
+              strokeWidth: 2,
+              vectorEffect: "non-scaling-stroke",
+              filter: "drop-shadow(0 0 4px rgba(69, 230, 211, 0.42))",
+            }}
           />
         ))}
         {last && (
           <circle
             cx={last.cx}
             cy={last.cy}
-            r={2}
-            style={{ fill: stroke, vectorEffect: "non-scaling-stroke" }}
+            r={2.5}
+            style={{
+              fill: "var(--signal)",
+              vectorEffect: "non-scaling-stroke",
+              filter: "drop-shadow(0 0 5px rgba(121, 242, 173, 0.6))",
+            }}
           />
         )}
         {hover != null && (

@@ -2,73 +2,102 @@
 
 <!-- impeccable:design 1 -->
 
-> **Direction contract (chosen: Instrument Manual)**
+> **Direction contract (chosen: par-mem ops cockpit)**
 >
-> **THESIS** — A dark instrument console that treats the database as a live machine, refusing the generic stat-card admin. Precision plus committed motion are the proof it is alive.
-> **OWN-WORLD** — Matte near-black panel, hairline engineering grid, off-white ink, one phosphor-green accent, amber/red reserved strictly for state. Monospace carries data, numerics, and identifiers; a grotesk carries navigation and labels. Hairline-ruled tables; spec-sheet calm for schema and config.
-> **STORY** — The operator opens a live database and immediately sees documents moving, counts ticking, operations streaming in the rail — then reaches schema, metrics, or config in the same disciplined language.
-> **FIRST VIEWPORT** — command rail left, dense document table center with a ticking count, live op-feed trace right, the connection pulse lit. Primary action: open a table.
-> **FORM** — Technical-publication instrument manual; grounded candidate #5; staging = data browser on a live database; concept-seed key `45f0c85a`.
+> **THESIS** — A deep-navy operations cockpit that treats the database as a live
+> machine: rounded glowing cards, a glassy masthead, big mono readouts, and teal
+> liveness. Adopted from the **par-mem** dashboard (`../par-mem/web`) — that
+> aesthetic is the pinned reference; this is its visual language on par-rt-db's
+> own layout and content.
+> **OWN-WORLD** — Deep-navy ground lit by teal + violet radial glows and a faint
+> masked grid; rounded gradient panels with a teal→violet top hairline and soft
+> shadow; cool off-white ink over blue-tinted hairlines; teal is the live/active
+> register, signal-green marks positive/ok, violet and amber/red encode kind and
+> state. Monospace carries data, numerics, and identifiers; a humanist sans
+> carries navigation, headings, and labels.
+> **STORY** — The operator opens the console to a glassy masthead and floating
+> rounded rails: databases and nav on the left, the live op-feed glowing on the
+> right, and the work center stage — instruments as big numeric cards, document
+> tables as rounded shells, values flashing as they change.
+> **FIRST VIEWPORT** — glassy masthead top, rounded command rail left, dense
+> rounded document table center with a live count, live op-feed rail right, the
+> connection dot glowing. Primary action: open a table.
+> **FORM** — par-mem ops cockpit (pinned reference: `pm-*` dashboard CSS in
+> `../par-mem/web/src/dashboard/index.ts` and `APP_CSS` in
+> `../par-mem/web/src/app/theme.ts`). Layout and content are par-rt-db's own.
 
 ## Mode
-Operate. Scanability, consistency, and the real usage scene outrank expression. Energy is permitted where it proves liveness, never as decoration.
+Operate. Scanability, consistency, and the real usage scene outrank expression.
+Energy is permitted where it proves liveness (glow, flash, pulse), never as
+ambient decoration.
 
 ## Color strategy
-Restrained. Neutrals carry the surface; one accent (phosphor green) marks the live/active register; amber and red encode state only (warn / error). Color commits at field/region scale, never as scattered accents on a neutral ground.
+Restrained but warmer than a flat admin. Navy neutrals carry the surface; teal
+(`--accent` / `--flux`) marks the live/active register; signal-green marks
+ok/positive; violet and amber/red encode kind and state (warn / error). Color
+earns its place by encoding meaning; glows reinforce live/active state only.
 
-## Palette (provisional until the first build settles them)
-- Panel ground `#0d0e10` (matte near-black). Raised surface `#141619`. Recessed / inset `#0a0b0d`.
-- Hairline rule / grid `rgba(231,233,234,0.10)`. Stronger divider `rgba(231,233,234,0.16)`.
-- Ink primary `#e7e9ea`. Ink secondary `#9aa0a6`. Ink muted `#5f656d`.
-- Accent (live / active) `#3dd68c` phosphor green; accent-dim `#2a9d68`.
-- Status warn `#f5a524` amber. Status error `#f4515e` red. Status ok = accent.
-- Focus / selection ring: accent at ~0.5 alpha.
+## Palette
+- Panel ground `#0a0f1e` (deep navy). Raised surface `#0e1628`. Recessed `#09101f`.
+- Hairline `rgba(129,156,204,0.15)`. Stronger divider `rgba(129,156,204,0.28)`.
+- Ink primary `#f2f6ff`. Ink secondary `#95a4bf`. Ink muted `#61708d`.
+- Accent (live / active) `#45e6d3` teal; accent-dim `#2bb8a8`; accent-soft `rgba(69,230,211,0.14)`.
+- Signal (ok / positive) `#79f2ad`. Violet `#a998ff`.
+- Status warn `#ffc66d` amber. Status error `#ff766c` alert. Status ok = signal.
+- Atmosphere: teal radial glow top-right + violet radial glow mid-left over a vertical navy gradient; a faint masked 54px grid underneath.
+- Card material: `linear-gradient(145deg, rgba(15,23,42,.96), rgba(7,12,24,.96))`, `box-shadow: 0 18px 48px rgba(0,0,0,.18), inset 0 1px 0 rgba(255,255,255,.025)`, teal→violet top hairline.
 
-Dark is primary (physical scene: dim, dev-workflow, long sessions). A light theme is out of scope for v1.
+Dark is primary (physical scene: dim, dev-workflow, long sessions). A light theme is out of scope.
 
 ## Typography
-- Data, numerics, identifiers, code, op-feed lines, tokens → monospace (`ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace`).
-- Navigation, labels, headings, prose → grotesk (`-apple-system, "Segoe UI", Roboto, Helvetica, Arial`).
+- Data, numerics, identifiers, code, op-feed lines, tokens → monospace (`"JetBrains Mono", "SF Mono", ui-monospace, Menlo, Consolas, monospace`).
+- Navigation, labels, headings, prose → humanist sans (`"Avenir Next", "IBM Plex Sans", "Helvetica Neue", -apple-system, "Segoe UI", Roboto, sans-serif`); display weight for page titles.
+- Big readout numerics at `pm-num` scale (`~30–34px`, weight 650, `letter-spacing: -0.045em`).
 - Tabular figures (`font-variant-numeric: tabular-nums`) on every numeric readout so live-ticking values don't jitter.
-- Hierarchy by size / weight / color, never decoration. Mono uppercase tracked micro-labels caption sections like spec-sheet placards.
+- Eyebrow labels: mono, ~9px, weight 650, uppercase, tracked ~0.16em, muted — caption sections (was "placards").
 
 ## Grid & spacing
-- 4px base unit. 1px hairline rules on the engineering grid. More space above a heading than below it.
-- Dense surfaces (data browser, op feed, metrics): tight 8–12px rhythm, many rows in view. Calm surfaces (schema, config): 16–24px rhythm, generous margins, document-like.
+- 4px base unit. Floating rounded panels separated by a ~14px gutter (masthead + body padding). More space above a heading than below it.
+- Dense surfaces (data browser, op feed, metrics, databases list): card grids, tight rhythm, many rows in view. Calm surfaces (schema, config): rounded panels, generous margins, document-like.
 
 ## Density rule (by surface)
-- Dense + live: data browser, op feed, metrics, databases list. Multi-pane; the live rail visible.
-- Calm + precise: schema viewer, hot config, admin management. Focused, documented, hairline-ruled.
+- Dense + live: data browser, op feed, metrics, databases list. Rounded cards/rows; the live rail visible.
+- Calm + precise: schema viewer, hot config, admin management. Rounded panels, focused, hairline-ruled.
 
-## Components (rebuilt in the form's vocabulary — never stock)
-- **Command rail** — slim left rail, mono database list, nav labels, active item marked with accent.
-- **Live rail** — right column; op-feed trace + activity pulse. Collapses on calm surfaces.
-- **Data table** — hairline-ruled rows, mono cells, sticky header, no zebra, hover reveals row actions, live cells tick (damped) on change.
-- **Instrument readout (metrics)** — value + trend + status lamp; damped spring motion, never snap.
-- **Op-feed trace** — scrolling telemetry log; monochrome with accent for the active event; severity tinted (amber/red).
-- **Status lamp** — small dot/chip; ok = accent, warn = amber, error = red, idle = muted.
-- **Buttons / inputs / links** — squared or micro-radius, hairline-bordered, mono labels for data actions; accent only on the single primary action per view.
-- **Placards** — mono uppercase tracked micro-labels captioning sections like a spec sheet.
+## Components (in the par-mem vocabulary)
+- **Masthead** — glassy sticky top bar: translucent navy, `backdrop-filter: blur(22px) saturate(140%)`, bottom hairline + shadow, brand mark with a teal glyph.
+- **Command rail** — rounded floating panel; nav items active = accent-soft fill + accent left border.
+- **Live rail** — rounded floating panel; op-feed rows with glowing kind-colored glyphs; the newest event settles with a teal wash.
+- **Cards** — rounded (15px) gradient panels with soft shadow + teal→violet top hairline; hover lifts and adds a faint teal wash.
+- **Data table** — rounded shell, blue-tinted hairline rows, sticky header, mono cells, teal hover tint, live count flashes on change.
+- **Instrument readout (metrics)** — big mono value + eyebrow label + sub + sparkline; alarm state = alert border/glow.
+- **Sparkline** — teal line with a drop-shadow glow, teal area, signal-green "now" dot with glow.
+- **Status lamp / connection pulse** — glowing dot; ok/signal, warn/amber, error/alert, idle/muted; the live link breathes.
+- **Buttons / inputs** — rounded (9px), hairline-bordered; hover lifts + teal border; the single primary action per view is solid teal with a soft glow.
+- **Eyebrows** — mono uppercase tracked micro-labels captioning sections.
 
 ## Motion (material, bounded)
-- Values tick / flash briefly on change (accent, ~400ms fade).
-- Connection pulse — a slow, subtle accent breath indicating the live link is up; warn / red on lag, muted on disconnect.
-- Op feed scrolls a live trace; entries settle with a brief accent, never bounce.
-- Damped springs on instruments; `prefers-reduced-motion` disables non-essential motion.
-- Motion proves liveness; it is never ambient decoration.
+- Values flash signal-green on change (`~800ms`, returns to the class color so alarms keep their meaning).
+- Connection dot glows and breathes when live; warn on lag, muted on disconnect.
+- Op feed's newest entry settles with a brief teal wash; the data browser's newest row does the same.
+- `prefers-reduced-motion` disables non-essential motion. Motion proves liveness; it is never ambient decoration.
 
 ## Iconography
-Icons drawn in the world's own grammar — thin-stroke, geometric, instrument-panel symbology. No emoji, no rounded filled icon tiles.
+Minimal, geometric, drawn in the world's own grammar. No emoji, no decorative
+rounded filled icon tiles; a small diamond/◆ brand glyph and dot/orbit markers carry identity and state.
 
 ## Responsive
 Desktop-first (operator on a monitor). Degrade gracefully to tablet / phone: rails collapse, tables become card-lists, instruments stack by criticality. Core actions stay reachable.
 
 ## Bans (this world refuses)
-- The generic SaaS admin: rounded stat-cards with up/down arrows over a pastel ground, avatar top-bar.
-- Skeuomorphic 3D, glossy gradients, glassmorphism, neon glow halos.
-- The faux "hacker terminal" (green-on-black scanlines, CRT, Matrix rain) — the world is precise, not theatrical.
+- The generic SaaS admin over a pastel ground with an avatar top-bar.
+- Skeuomorphic 3D and the faux "hacker terminal" (scanlines, CRT, Matrix rain).
 - Scattered accent color; color earns its place by encoding meaning.
 - Stock component chrome inside committed surfaces.
 
-## What is not literalized from the concept render
-The render is a north star for palette, density, and mood — not a pixel spec. Exact layout, real data shapes, interaction states, accessibility, and responsive behavior are implementation responsibilities resolved against the backend contract, not copied from the render.
+## What is not literalized from par-mem
+par-mem's layout (graph workspace stage, reorderable card canvas, repo/worktree
+selectors) is **not** adopted — par-rt-db keeps its own routes, content, and
+information architecture. Only par-mem's visual language is ported. Exact layout,
+real data shapes, interaction states, accessibility, and responsive behavior are
+implementation responsibilities resolved against par-rt-db's backend contract.

@@ -4,19 +4,35 @@
   height: 100dvh;
 }
 
+/* Masthead — glassy, sticky-feeling top bar (par-mem .pm-masthead) */
 .topbar {
   display: flex;
   align-items: center;
   gap: var(--sp-3);
-  height: 44px;
-  padding: 0 var(--sp-4);
+  height: 50px;
+  padding: 0 clamp(16px, 2vw, 28px);
   border-bottom: 1px solid var(--rule);
-  background: var(--inset);
+  background: rgba(6, 10, 20, 0.78);
+  backdrop-filter: blur(22px) saturate(140%);
+  -webkit-backdrop-filter: blur(22px) saturate(140%);
+  box-shadow: var(--shadow-masthead);
+  position: relative;
+  z-index: var(--z-sticky);
 }
 
 .brand {
-  font-weight: 600;
-  letter-spacing: 0.02em;
+  font-family: var(--sans);
+  font-weight: 700;
+  font-size: 15px;
+  letter-spacing: -0.01em;
+  color: var(--ink);
+}
+.brand::before {
+  content: "◆";
+  margin-right: 9px;
+  color: var(--accent);
+  font-size: 13px;
+  text-shadow: 0 0 10px rgba(69, 230, 211, 0.6);
 }
 
 .topbarRight {
@@ -32,16 +48,20 @@
   color: var(--ink-2);
 }
 
+/* Body — floating rounded panels with a gutter (par-mem .pm-body) */
 .body {
   flex: 1;
   display: grid;
-  grid-template-columns: 220px 1fr 320px;
+  grid-template-columns: 224px minmax(0, 1fr) 320px;
+  gap: 14px;
+  padding: 14px;
   min-height: 0;
 }
 
 .rail {
-  border-right: 1px solid var(--rule);
-  background: var(--surface);
+  border: 1px solid var(--rule);
+  border-radius: var(--r-card);
+  background: var(--panel);
   padding: var(--sp-4);
   overflow: auto;
   display: flex;
@@ -57,22 +77,28 @@
 
 .railLink {
   display: block;
-  padding: var(--sp-1) var(--sp-2);
-  border-radius: var(--r-1);
+  padding: 8px 11px;
+  border-radius: var(--r-2);
+  border-left: 2px solid transparent;
   color: var(--ink-2);
   font-family: var(--mono);
   font-size: var(--t-mono-md);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  transition:
+    background var(--tick) var(--ease),
+    color var(--tick) var(--ease),
+    border-color var(--tick) var(--ease);
 }
 .railLink:hover {
-  background: var(--inset);
+  background: rgba(255, 255, 255, 0.02);
   color: var(--ink);
 }
 .railLinkActive {
   color: var(--accent);
   background: var(--accent-soft);
+  border-left-color: var(--accent);
 }
 
 .railEmpty {
@@ -91,14 +117,15 @@
 }
 
 .main {
-  padding: var(--sp-6);
+  min-width: 0;
   overflow: auto;
 }
 
 .liveRail {
-  border-left: 1px solid var(--rule);
-  background: var(--surface);
-  padding: var(--sp-3) var(--sp-4);
+  border: 1px solid var(--rule);
+  border-radius: var(--r-card);
+  background: var(--panel);
+  padding: var(--sp-4);
   overflow: auto;
 }
 
@@ -120,7 +147,8 @@
   grid-template-columns: 14px 1fr auto auto;
   align-items: center;
   gap: var(--sp-2);
-  padding: 2px 0;
+  padding: 3px 2px;
+  border-radius: var(--r-sm);
   font-family: var(--mono);
   font-size: var(--t-mono-xs);
   color: var(--ink-2);
@@ -135,16 +163,19 @@
   color: var(--ink-3);
 }
 .kindInsert {
-  color: var(--accent);
+  color: var(--signal);
+  text-shadow: 0 0 8px rgba(121, 242, 173, 0.5);
 }
 .kindPatch {
   color: var(--ink-2);
 }
 .kindReplace {
   color: var(--warn);
+  text-shadow: 0 0 8px rgba(255, 198, 109, 0.4);
 }
 .kindDelete {
   color: var(--error);
+  text-shadow: 0 0 8px rgba(255, 118, 108, 0.5);
 }
 .opWhere {
   overflow: hidden;
@@ -171,7 +202,7 @@
 
 @media (max-width: 1100px) {
   .body {
-    grid-template-columns: 200px 1fr;
+    grid-template-columns: 208px minmax(0, 1fr);
   }
   .liveRail {
     display: none;
@@ -181,6 +212,7 @@
 @media (max-width: 760px) {
   .body {
     grid-template-columns: 1fr;
+    padding: 8px;
   }
   .rail {
     display: none;

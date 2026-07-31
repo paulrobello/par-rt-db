@@ -132,6 +132,7 @@
 .tableWrap {
   overflow: auto;
   border: 1px solid var(--rule);
+  border-radius: var(--r-card);
   max-height: calc(100dvh - 280px);
 }
 
@@ -164,7 +165,7 @@
   transition: background 140ms var(--ease);
 }
 .table tbody tr:hover {
-  background: rgba(231, 233, 234, 0.035);
+  background: rgba(69, 230, 211, 0.045);
 }
 /* Newest row washes accent when a realtime insert lands at the head. */
 .rowFresh {

@@ -9,31 +9,42 @@ body,
 #root {
   height: 100%;
 }
+#root {
+  position: relative;
+  z-index: 1;
+}
 
 body {
   margin: 0;
-  background-color: var(--panel);
-  /* Hairline engineering grid — the instrument-manual ground. Two layers: a
-     fine 24px mesh plus a stronger 120px major grid, the way engineering paper
-     reads. Kept very low-alpha so it is texture, not noise, and never competes
-     with ink. */
-  background-image:
-    linear-gradient(var(--grid-line-strong) 1px, transparent 1px),
-    linear-gradient(90deg, var(--grid-line-strong) 1px, transparent 1px),
-    linear-gradient(var(--grid-line) 1px, transparent 1px),
-    linear-gradient(90deg, var(--grid-line) 1px, transparent 1px);
-  background-size:
-    120px 120px,
-    120px 120px,
-    24px 24px,
-    24px 24px;
-  background-position: -1px -1px;
+  /* Layered atmosphere — teal + violet radial glows over a vertical navy
+     gradient. Adopted from par-mem's `.pm-dash` ground. fixed so it does not
+     scroll out from under the sticky masthead. */
+  background:
+    radial-gradient(1100px 640px at 82% -10%, rgba(69, 230, 211, 0.1), transparent 64%),
+    radial-gradient(900px 620px at 7% 35%, rgba(169, 152, 255, 0.08), transparent 62%),
+    linear-gradient(180deg, #070b16 0%, var(--panel) 38%, #04060d 100%);
+  background-attachment: fixed;
   color: var(--ink);
   font-family: var(--sans);
   font-size: var(--t-body);
-  line-height: 1.45;
+  line-height: 1.5;
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
+}
+
+/* Faint masked engineering grid — the ground texture. Sits behind #root. */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  opacity: 0.55;
+  background-image:
+    linear-gradient(var(--grid-line) 1px, transparent 1px),
+    linear-gradient(90deg, var(--grid-line) 1px, transparent 1px);
+  background-size: 54px 54px;
+  -webkit-mask-image: linear-gradient(to bottom, black, transparent 80%);
+  mask-image: linear-gradient(to bottom, black, transparent 80%);
 }
 
 :where(button, input, textarea, select) {
@@ -47,6 +58,7 @@ a {
 }
 a:hover {
   text-decoration: underline;
+  text-underline-offset: 3px;
 }
 
 ::selection {
@@ -60,32 +72,29 @@ a:hover {
 .tnum {
   font-variant-numeric: tabular-nums;
 }
+/* Eyebrow label — par-mem's tracked mono caption (was "placard"). */
 .placard {
   font-family: var(--mono);
-  font-size: var(--t-mono-xs);
+  font-weight: 650;
+  font-size: 9px;
   text-transform: uppercase;
-  letter-spacing: 0.22em;
+  letter-spacing: 0.16em;
   color: var(--ink-3);
 }
 
-/* Liveness — value tick-flash + op-feed settle. Material and bounded: they
-   prove the link is alive, they are not ambient decoration. The global
+/* Liveness — value color-flash + op-feed settle. Material and bounded: they
+   prove the link is alive, not ambient decoration. The global
    prefers-reduced-motion rule below neuters them for users who opt out. */
+/* `from` only: the value flashes signal-green and returns to whatever its class
+   sets (ink, alarm-red, …), so colored readouts keep their meaning after the
+   flash. Adopted from par-mem's `pm-flash`. */
 @keyframes tickFlash {
-  0% {
-    background-color: var(--accent-soft);
-  }
-  100% {
-    background-color: transparent;
+  from {
+    color: var(--signal);
   }
 }
-/* Negative margin mirrors the padding so the flash wash never shifts layout. */
 .tickFlash {
-  display: inline-block;
-  padding: 0 0.25em;
-  margin: 0 -0.25em;
-  border-radius: var(--r-1);
-  animation: tickFlash 480ms var(--ease);
+  animation: tickFlash var(--flash) var(--ease);
 }
 @keyframes opSettle {
   0% {

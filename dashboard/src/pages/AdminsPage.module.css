@@ -84,7 +84,7 @@
   transition: background 140ms var(--ease);
 }
 .table tbody tr:hover {
-  background: rgba(231, 233, 234, 0.035);
+  background: rgba(69, 230, 211, 0.045);
 }
 
 .email {

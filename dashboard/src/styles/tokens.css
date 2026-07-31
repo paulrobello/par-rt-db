@@ -1,38 +1,61 @@
-/* Instrument Manual — design tokens. Authoritative description: /DESIGN.md */
+/* par-mem ops-cockpit — design tokens. Adopted from par-mem's `pm-*` dashboard
+   (../par-mem/web/src/dashboard/index.ts + ../par-mem/web/src/app/theme.ts).
+   Authoritative description: /DESIGN.md */
 :root {
   color-scheme: dark;
 
-  /* Panel surfaces */
-  --panel: #0d0e10;
-  --surface: #141619;
-  --inset: #0a0b0d;
+  /* Panel surfaces — deep navy */
+  --panel: #0a0f1e;
+  --surface: #0e1628;
+  --inset: #09101f;
 
-  /* Hairlines */
-  --rule: rgba(231, 233, 234, 0.1);
-  --rule-strong: rgba(231, 233, 234, 0.16);
+  /* Hairlines — blue-tinted */
+  --rule: rgba(129, 156, 204, 0.15);
+  --rule-strong: rgba(129, 156, 204, 0.28);
 
-  /* Engineering grid — the instrument-panel ground texture (own-world) */
-  --grid-line: rgba(231, 233, 234, 0.022);
-  --grid-line-strong: rgba(231, 233, 234, 0.045);
+  /* Atmosphere grid — faint, masked (par-mem ground texture) */
+  --grid-line: rgba(129, 156, 204, 0.05);
+  --grid-line-strong: rgba(129, 156, 204, 0.08);
 
   /* Ink */
-  --ink: #e7e9ea;
-  --ink-2: #9aa0a6;
-  --ink-3: #5f656d;
+  --ink: #f2f6ff;
+  --ink-2: #95a4bf;
+  --ink-3: #61708d;
 
-  /* Accent — the live / active register (phosphor green) */
-  --accent: #3dd68c;
-  --accent-dim: #2a9d68;
-  --accent-soft: rgba(61, 214, 140, 0.14);
+  /* Accent — the live / active register (teal) */
+  --accent: #45e6d3;
+  --accent-dim: #2bb8a8;
+  --accent-soft: rgba(69, 230, 211, 0.14);
+  --flux: var(--accent); /* par-mem alias */
 
-  /* Status — encoded meaning only */
-  --warn: #f5a524;
-  --error: #f4515e;
-  --ok: var(--accent);
+  /* Semantic signal colors */
+  --signal: #79f2ad; /* ok / positive */
+  --violet: #a998ff;
+  --warn: #ffc66d;
+  --error: #ff766c;
+  --ok: var(--signal);
 
-  /* Type families */
-  --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
-  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  /* Card material (par-mem) */
+  --card-grad: linear-gradient(145deg, rgba(15, 23, 42, 0.96), rgba(7, 12, 24, 0.96));
+  --card-hairline: linear-gradient(
+    90deg,
+    transparent,
+    rgba(69, 230, 211, 0.48),
+    rgba(169, 152, 255, 0.32),
+    transparent
+  );
+  --shadow-card: 0 18px 48px rgba(0, 0, 0, 0.18);
+  --shadow-card-inset: inset 0 1px 0 rgba(255, 255, 255, 0.025);
+  --shadow-masthead: 0 12px 35px rgba(0, 0, 0, 0.18);
+  --glow-accent: 0 0 12px rgba(69, 230, 211, 0.4);
+  --glow-signal: 0 0 12px rgba(121, 242, 173, 0.4);
+
+  /* Type families (preferred w/ fallbacks — no web fonts, like par-mem) */
+  --mono: "JetBrains Mono", "SF Mono", ui-monospace, Menlo, Consolas, monospace;
+  --sans:
+    "Avenir Next", "IBM Plex Sans", "Helvetica Neue", -apple-system, BlinkMacSystemFont, "Segoe UI",
+    Roboto, sans-serif;
+  --display: "Avenir Next Condensed", "Avenir Next", "IBM Plex Sans", sans-serif;
 
   /* Spacing — 4px base */
   --sp-1: 4px;
@@ -44,24 +67,29 @@
   --sp-7: 48px;
   --sp-8: 64px;
 
-  /* Radii — squared / micro only */
-  --r-1: 2px;
-  --r-2: 4px;
+  /* Radii — rounded (par-mem) */
+  --r-1: 9px; /* inputs / buttons */
+  --r-2: 11px; /* pills / stat tiles */
+  --r-sm: 5px; /* badges */
+  --r-card: 15px;
+  --r-pill: 11px;
 
   /* Type scale */
   --t-mono-xs: 11px;
   --t-mono-sm: 12px;
   --t-mono-md: 13px;
   --t-label: 12px;
-  --t-body: 14px;
+  --t-body: 13px;
   --t-h3: 15px;
   --t-h2: 16px;
   --t-h1: 20px;
   --t-display: 26px;
+  --t-num: 34px; /* big readout numerics (pm-num scale) */
 
   /* Motion (material, bounded) */
   --tick: 400ms;
   --pulse: 2.4s;
+  --flash: 800ms;
   --ease: cubic-bezier(0.2, 0.7, 0.2, 1);
 
   /* Z-layers */
