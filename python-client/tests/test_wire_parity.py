@@ -164,6 +164,40 @@ def test_corpus_schedule_infos_round_trip(entry: dict[str, Any]) -> None:
     assert dumped == entry, f"ScheduleInfo wire drift: {dumped} != {entry}"
 
 
+# --- corpus: admin migrate wire (Directive list + MigrateResult) -------------
+#
+# The migrate types are part of the four-client wire contract (op tag, camelCase,
+# ``where``/``from`` aliases, cast literals). These sections extend the shared
+# corpus so the python client asserts byte-identical serialization alongside the
+# server, rust-client, and ts-client.
+
+
+@pytest.mark.parametrize(
+    "entry",
+    _corpus_section("migrate_requests"),
+    ids=lambda e: f"dryRun={e.get('dryRun')},{len(e.get('directives', []))}ds",
+)
+def test_corpus_migrate_requests_round_trip(entry: dict[str, Any]) -> None:
+    from par_rt_db.migration import MigrateRequest
+
+    msg = MigrateRequest.model_validate(entry)
+    dumped = msg.model_dump(by_alias=True, mode="json")
+    assert dumped == entry, f"MigrateRequest wire drift: {dumped} != {entry}"
+
+
+@pytest.mark.parametrize(
+    "entry",
+    _corpus_section("migrate_results"),
+    ids=lambda e: f"applied={e.get('applied')},{len(e.get('directives', []))}ds",
+)
+def test_corpus_migrate_results_round_trip(entry: dict[str, Any]) -> None:
+    from par_rt_db.http_client import MigrateResult
+
+    msg = MigrateResult.model_validate(entry)
+    dumped = json.loads(msg.model_dump_json(by_alias=True))
+    assert dumped == entry, f"MigrateResult wire drift: {dumped} != {entry}"
+
+
 @pytest.mark.parametrize(
     "entry",
     _corpus_section("rejects_client_message_unknown_field"),

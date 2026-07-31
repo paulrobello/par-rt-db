@@ -95,6 +95,59 @@ fn schedule_infos_round_trip() {
     }
 }
 
+/// Admin migrate wire shapes — `Directive` list + `MigrateResult`. The migrate
+/// types live under `wire::admin` (feature `admin`); the directive enum carries
+/// the load-bearing `op` tag, camelCase, `where`/`from` aliases, and the cast
+/// literals, so this is the drift net for the fourth implementation of that
+/// contract. `MigrateRequestOwned` is the owned, deserialize-able counterpart of
+/// the borrowed `MigrateRequest` (same wire shape).
+#[cfg(feature = "admin")]
+#[test]
+fn migrate_requests_round_trip() {
+    use par_rt_db_client::wire::admin::{Directive, MigrateRequestOwned};
+    // `Directive` is a serde tagged enum; `MigrateRequestOwned` wraps
+    // `Vec<Directive>`. Both round-trip through the corpus entry.
+    for (i, entry) in section(&load_corpus(), "migrate_requests")
+        .iter()
+        .enumerate()
+    {
+        let parsed: MigrateRequestOwned =
+            serde_json::from_value(entry.clone()).unwrap_or_else(|e| {
+                panic!("parse failure [migrate_requests #{i}]: {e}\n  input: {entry}")
+            });
+        let dumped = serde_json::to_value(&parsed).unwrap_or_else(|e| {
+            panic!("serialize failure [migrate_requests #{i}]: {e}\n  input: {entry}")
+        });
+        assert_eq!(
+            dumped, *entry,
+            "wire drift [migrate_requests #{i}]:\n  parsed-then-serialized: {dumped}\n  corpus input:         {entry}"
+        );
+        // Also round-trip each directive through the enum directly, catching a
+        // variant-level drift even if the wrapper happened to mask it.
+        for (j, d) in parsed.directives.iter().enumerate() {
+            let dv = serde_json::to_value(d).unwrap_or_else(|e| {
+                panic!("directive serialize failure [migrate_requests #{i}.{j}]: {e}")
+            });
+            let _: &Directive =
+                &serde_json::from_value::<Directive>(dv.clone()).unwrap_or_else(|e| {
+                    panic!("directive parse failure [migrate_requests #{i}.{j}]: {e}")
+                });
+        }
+    }
+}
+
+#[cfg(feature = "admin")]
+#[test]
+fn migrate_results_round_trip() {
+    use par_rt_db_client::wire::admin::MigrateResult;
+    for (i, entry) in section(&load_corpus(), "migrate_results")
+        .iter()
+        .enumerate()
+    {
+        round_trip::<MigrateResult>("migrate_results", i, entry);
+    }
+}
+
 #[test]
 fn rejects_unknown_fields() {
     let corpus = load_corpus();

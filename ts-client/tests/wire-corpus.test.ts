@@ -24,6 +24,8 @@ import type {
   AuthedUser,
   AuthedUserKind,
   ClientMessage,
+  MigrateRequestJson,
+  MigrateResultJson,
   ScheduleInfo,
   ScheduleWhen,
   ServerMessage,
@@ -42,6 +44,10 @@ interface Corpus {
   query_results: unknown[];
   error_envelopes: unknown[];
   queries: unknown[];
+  // Admin migrate shapes — type-checked against MigrateRequestJson /
+  // MigrateResultJson (op tag, camelCase, `where`/`from` aliases, cast literals).
+  migrate_requests: MigrateRequestJson[];
+  migrate_results: MigrateResultJson[];
   rejects_client_message_unknown_field: unknown[];
   rejects_schedule_when_unknown_field: unknown[];
   rejects_authed_user_unknown_kind: unknown[];
@@ -123,6 +129,28 @@ describe("wire-corpus: schedule_infos (ARC-004 enums)", () => {
     const _typeCheck: ScheduleInfo = entry; // narrows `kind`/`status` to literals
     void _typeCheck;
     it(`schedule_infos #${idx} (kind=${entry.kind}, status=${entry.status}) round-trips`, () => {
+      assertJsonRoundTrip(entry);
+    });
+  }
+});
+
+describe("wire-corpus: migrate_requests (admin Directive list)", () => {
+  const corpus = loadCorpus();
+  for (const [idx, entry] of corpus.migrate_requests.entries()) {
+    const _typeCheck: MigrateRequestJson = entry; // compile-time shape check
+    void _typeCheck;
+    it(`migrate_requests #${idx} round-trips`, () => {
+      assertJsonRoundTrip(entry);
+    });
+  }
+});
+
+describe("wire-corpus: migrate_results (admin MigrateResult)", () => {
+  const corpus = loadCorpus();
+  for (const [idx, entry] of corpus.migrate_results.entries()) {
+    const _typeCheck: MigrateResultJson = entry; // compile-time shape check
+    void _typeCheck;
+    it(`migrate_results #${idx} round-trips`, () => {
       assertJsonRoundTrip(entry);
     });
   }

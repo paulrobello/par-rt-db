@@ -12,6 +12,7 @@
 //! This is the server's view; the TS, Rust, and Python clients each have an
 //! equivalent test reading the same corpus.
 
+use rtdb_server::migrate::{MigrateRequest, MigrateResult};
 use rtdb_server::protocol::{
     AuthedUser, ClientMessage, ScheduleInfo, ScheduleWhen, ServerMessage, UserKind,
 };
@@ -97,6 +98,25 @@ fn schedule_infos_round_trip() {
     let corpus = load_corpus();
     for (i, entry) in section(&corpus, "schedule_infos").iter().enumerate() {
         round_trip::<ScheduleInfo>("schedule_infos", i, entry);
+    }
+}
+
+/// Admin migrate wire shapes (tag `op`, camelCase, `where`/`from` aliases, cast
+/// literals). The `Directive` list + `MigrateResult` are part of the four-client
+/// wire contract; this is the server's view.
+#[test]
+fn migrate_requests_round_trip() {
+    let corpus = load_corpus();
+    for (i, entry) in section(&corpus, "migrate_requests").iter().enumerate() {
+        round_trip::<MigrateRequest>("migrate_requests", i, entry);
+    }
+}
+
+#[test]
+fn migrate_results_round_trip() {
+    let corpus = load_corpus();
+    for (i, entry) in section(&corpus, "migrate_results").iter().enumerate() {
+        round_trip::<MigrateResult>("migrate_results", i, entry);
     }
 }
 

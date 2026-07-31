@@ -1,5 +1,5 @@
 {
-  "$comment": "Canonical cross-client wire-parity corpus (ARC-008). Every entry is the raw JSON object as it appears on the wire. Each client's parity test parses -> serializes -> deep-compares to the input. Bytes are authoritative; tag/field names are load-bearing (see server/src/protocol.rs header). Sections: 'client_messages', 'server_messages', 'authed_users', 'schedule_whens', 'schedule_infos', 'query_results', 'error_envelopes', 'queries' (embedded query shapes covering filter/search/vectorSearch/paginate), 'rejects_client_message_unknown_field' (must fail to parse where deny_unknown_fields / extra='forbid' applies).",
+  "$comment": "Canonical cross-client wire-parity corpus (ARC-008). Every entry is the raw JSON object as it appears on the wire. Each client's parity test parses -> serializes -> deep-compares to the input. Bytes are authoritative; tag/field names are load-bearing (see server/src/protocol.rs header). Sections: 'client_messages', 'server_messages', 'authed_users', 'schedule_whens', 'schedule_infos', 'query_results', 'error_envelopes', 'queries' (embedded query shapes covering filter/search/vectorSearch/paginate), 'migrate_requests' / 'migrate_results' (admin migrate Directive list + response — op tag, camelCase, `where`/`from` aliases, cast literals), 'rejects_client_message_unknown_field' (must fail to parse where deny_unknown_fields / extra='forbid' applies).",
   "client_messages": [
     { "type": "auth", "token": "t", "db": "d" },
     { "type": "auth", "db": "d" },
@@ -94,6 +94,46 @@
     { "table": "workItems", "paginate": { "numItems": 10 } },
     { "table": "workItems", "paginate": { "cursor": "abc", "numItems": 10 } },
     { "table": "workItems", "index": "by_project_and_status", "eq": [ "p1" ], "distinct": true }
+  ],
+  "migrate_requests": [
+    {
+      "directives": [
+        { "op": "renameField", "table": "users", "from": "name", "to": "fullName" },
+        { "op": "renameTable", "from": "old_users", "to": "users" },
+        { "op": "dropField", "table": "users", "field": "legacy" },
+        { "op": "dropTable", "name": "gone" },
+        { "op": "dropIndex", "table": "users", "name": "by_email" },
+        { "op": "setDefault", "table": "users", "field": "role", "value": "member" }
+      ],
+      "dryRun": false
+    },
+    {
+      "directives": [
+        { "op": "changeType", "table": "users", "field": "age", "to": { "type": "string" }, "cast": "toString", "default": "0" },
+        { "op": "changeType", "table": "users", "field": "active", "to": { "type": "boolean" }, "cast": "toBoolean", "default": false },
+        { "op": "changeType", "table": "events", "field": "ts", "to": { "type": "int64" }, "cast": "toInt64", "default": "0" },
+        { "op": "changeType", "table": "events", "field": "score", "to": { "type": "number" }, "cast": "toNumber", "default": 0 },
+        { "op": "evalExpr", "table": "users", "set": "upper", "expr": "upper(doc->>'fullName')", "where": "doc ? 'fullName'" }
+      ],
+      "dryRun": true
+    }
+  ],
+  "migrate_results": [
+    {
+      "applied": true,
+      "schema": { "tables": { "users": { "fields": { "fullName": { "type": "string" }, "age": { "type": "string" } }, "indexes": [] } } },
+      "directives": [
+        { "op": "renameField", "affectedRows": 3, "castFailures": [ { "id": "u1", "value": null } ], "sampleChanges": [ { "id": "u1", "before": { "name": "x" }, "after": { "fullName": "x" } } ] },
+        { "op": "changeType", "affectedRows": 3, "castFailures": [ { "id": "u2", "value": "abc" } ], "sampleChanges": [ { "id": "u3", "before": { "age": 42 }, "after": { "age": "42" } } ] }
+      ]
+    },
+    {
+      "applied": false,
+      "schema": { "tables": { "items": { "fields": { "title": { "type": "string" }, "order": { "type": "string" } }, "indexes": [] } } },
+      "directives": [
+        { "op": "dropField", "affectedRows": 5, "castFailures": [ { "id": "i1", "value": null } ], "sampleChanges": [ { "id": "i1", "before": { "legacy": true }, "after": {} } ] }
+      ]
+    }
   ],
   "rejects_client_message_unknown_field": [
     { "type": "auth", "token": "t", "db": "d", "bogus": true },
