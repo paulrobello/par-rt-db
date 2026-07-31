@@ -12,7 +12,9 @@
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
-use par_rt_db_client::{Query, RtDbError, RtDbHttpClient, SchemaDef, Transaction};
+use par_rt_db_client::{
+    MigrateRequestOwned, Query, RtDbError, RtDbHttpClient, SchemaDef, Transaction,
+};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -77,6 +79,17 @@ enum Command {
         /// file (`@seed.json`).
         txn: String,
     },
+    /// Apply (or preview with `--dry-run`) a migration directives JSON file to
+    /// `--db`. (admin)
+    Migrate {
+        /// Path to a JSON file containing a `MigrateRequestOwned` body (wire
+        /// shape: `{"directives":[...], "dryRun"?: bool}`).
+        file: PathBuf,
+        /// Preview only — nothing is applied. The request's `dryRun` field is
+        /// also honored; this flag forces it on.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[tokio::main]
@@ -134,6 +147,25 @@ async fn main() -> Result<()> {
             let c = data_client(&cli, &db, &token);
             let results = c.mutate(&t, None).await.map_err(map_err)?;
             println!("{}", serde_json::to_string_pretty(&results)?);
+        }
+        Command::Migrate { file, dry_run } => {
+            let db = require_db(&cli)?;
+            let json = std::fs::read_to_string(file)
+                .with_context(|| format!("reading {}", file.display()))?;
+            let req: MigrateRequestOwned =
+                serde_json::from_str(&json).context("parsing migrate JSON")?;
+            // CLI flag forces dry-run on; a `dryRun: true` in the file is also
+            // honored so a checked-in preview request can't be silently applied.
+            let dry_run = *dry_run || req.dry_run;
+            let c = admin_client(&cli)?;
+            let result = c
+                .migrate_schema(&db, &req.directives, dry_run)
+                .await
+                .map_err(map_err)?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+            if !result.applied {
+                eprintln!("dry-run only — nothing applied (re-run without --dry-run to apply)");
+            }
         }
     }
     Ok(())
@@ -293,6 +325,44 @@ mod tests {
             panic!("expected Mutate");
         };
         assert_eq!(t, txn);
+    }
+
+    #[test]
+    fn parses_migrate_dry_run_flag() {
+        let cli = Cli::try_parse_from([
+            "rtdb",
+            "--url",
+            "http://x",
+            "--db",
+            "d",
+            "--admin-key",
+            "k",
+            "migrate",
+            "mig.json",
+            "--dry-run",
+        ])
+        .unwrap();
+        let Command::Migrate { file, dry_run } = cli.command else {
+            panic!("expected Migrate");
+        };
+        assert_eq!(file, PathBuf::from("mig.json"));
+        assert!(dry_run);
+
+        let cli = Cli::try_parse_from([
+            "rtdb",
+            "--url",
+            "http://x",
+            "--db",
+            "d",
+            "--admin-key",
+            "k",
+            "migrate",
+            "mig.json",
+        ])
+        .unwrap();
+        let Command::Migrate { dry_run: false, .. } = cli.command else {
+            panic!("expected Migrate");
+        };
     }
 
     #[test]
