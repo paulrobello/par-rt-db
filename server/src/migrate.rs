@@ -1,8 +1,11 @@
 //! Declarative schema migration: an ordered list of directives the server
 //! applies transactionally to transform a database's schema and documents.
 //! See docs/superpowers/specs/2026-07-31-schema-migration-backfill-design.md.
+use crate::ddl::{backfill_expr, indexed_fields, pg_col, pg_schema, pg_table};
 use crate::error::RtDbError;
-use crate::schema::{FieldType, SchemaDef, TableDef};
+use crate::schema::{FieldType, SchemaDef, TableDef, indexed_column_type};
+use crate::txn::{DocOp, OpKind};
+use std::collections::BTreeSet;
 
 /// One migration step. Wire shape mirrors `txn::Step`: `tag = "op"`,
 /// camelCase, `deny_unknown_fields`.
@@ -286,6 +289,329 @@ fn has_sql_violation(sql: &str) -> bool {
         "REVOKE ",
     ];
     FORBIDDEN.iter().any(|kw| upper.contains(kw))
+}
+
+// ---- DB applier (Task 3) ---------------------------------------------------
+//
+// `apply_migration` runs each directive's DDL+DML inside a caller-supplied
+// transaction. The invariant it upholds: every typed `f_<field>` column stays
+// consistent with the `doc` jsonb after each directive. The pre-migration
+// schema (for "is the source field indexed?") is read from the db's `meta` row
+// inside the tx — the caller has not updated `meta` yet, so it reflects the
+// pre-migration state. `derived` (from `plan_migration`) supplies each arm's
+// post-migration field type/column. `changeType`/`evalExpr` arms land in later
+// tasks and stay `Err(internal)` placeholders here.
+
+/// Per-directive outcome of applying a migration: per-directive `reports`, the
+/// set of tables `touched` (drives subscription re-run in Task 6), and the
+/// document `ops` (feed the op-feed / activity stream via Task 6's committer
+/// arm). `Default` so future tasks can extend it incrementally.
+#[derive(Default, Debug)]
+pub struct MigrationEffects {
+    pub reports: Vec<DirectiveReport>,
+    pub touched: BTreeSet<String>,
+    pub ops: Vec<DocOp>,
+}
+
+/// Applies already-validated `directives` inside `tx` against `db`'s physical
+/// tables. `derived` is the post-migration schema (from `plan_migration`).
+/// Bulk casts mirror `ddl::backfill_expr`. Does NOT commit; on `dry_run` the
+/// caller rolls the tx back, and effects are still collected for the preview.
+pub async fn apply_migration(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    db: &str,
+    directives: &[Directive],
+    derived: &SchemaDef,
+    dry_run: bool,
+) -> Result<MigrationEffects, RtDbError> {
+    let schema_name = pg_schema(db);
+    let old = load_schema_in_tx(tx, &schema_name)
+        .await?
+        .ok_or_else(|| RtDbError::internal("no schema stored for database"))?;
+    let mut fx = MigrationEffects::default();
+    for d in directives {
+        let report = apply_one(tx, &schema_name, &old, derived, d, &mut fx).await?;
+        fx.reports.push(report);
+    }
+    let _ = dry_run; // dry_run only governs commit/rollback in the caller
+    Ok(fx)
+}
+
+async fn apply_one(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    schema_name: &str,
+    old: &SchemaDef,
+    derived: &SchemaDef,
+    d: &Directive,
+    fx: &mut MigrationEffects,
+) -> Result<DirectiveReport, RtDbError> {
+    match d {
+        Directive::RenameField { table, from, to } => {
+            let t = pg_table(table);
+            // Rename the typed column only if the source field is indexed
+            // (checked on the pre-migration table — the column still bears the
+            // old name). RENAME COLUMN preserves the column's type and values,
+            // and Postgres rewrites index column references to follow it, so
+            // the index keeps working. Do NOT recompute the column as text.
+            let old_table = table_def(old, table)?;
+            if indexed_fields(old_table).contains(from) {
+                sqlx::query(&format!(
+                    "ALTER TABLE \"{schema_name}\".\"{t}\" RENAME COLUMN \"{}\" TO \"{}\"",
+                    pg_col(from),
+                    pg_col(to)
+                ))
+                .execute(&mut **tx)
+                .await?;
+            }
+            let ids = ids_where(tx, schema_name, &t, &format!("doc ? '{from}'")).await?;
+            let n = rewrite_doc_key(tx, schema_name, &t, from, to).await?;
+            fx.touched.insert(table.clone());
+            push_ops(&mut fx.ops, table, &ids, OpKind::Patch);
+            Ok(DirectiveReport {
+                op: "renameField".into(),
+                affected_rows: n,
+                ..Default::default()
+            })
+        }
+        Directive::RenameTable { from, to } => {
+            // Physical table rename; docs are untouched -> no DocOps, but the
+            // table is recorded as touched so subscriptions re-run.
+            sqlx::query(&format!(
+                "ALTER TABLE \"{schema_name}\".\"{}\" RENAME TO \"{}\"",
+                pg_table(from),
+                pg_table(to)
+            ))
+            .execute(&mut **tx)
+            .await?;
+            fx.touched.insert(to.clone());
+            Ok(DirectiveReport {
+                op: "renameTable".into(),
+                affected_rows: 0,
+                ..Default::default()
+            })
+        }
+        Directive::DropField { table, field } => {
+            let t = pg_table(table);
+            // Reject dropping a field still referenced by an index — dropping
+            // its typed column would desync the physical index from the derived
+            // schema. Name the offending index(es) so the caller drops them first.
+            let old_table = table_def(old, table)?;
+            let blocking: Vec<&str> = old_table
+                .indexes
+                .iter()
+                .filter(|ix| ix.fields.iter().any(|f| f == field))
+                .map(|ix| ix.name.as_str())
+                .collect();
+            if !blocking.is_empty() {
+                return Err(RtDbError::bad_request(format!(
+                    "drop index '{}' before dropping field '{table}.{field}'",
+                    blocking.join("', '")
+                )));
+            }
+            let ids = all_ids(tx, schema_name, &t).await?;
+            // Remove the jsonb key first, then drop the typed column (no-op if
+            // the field was never indexed).
+            sqlx::query(&format!(
+                "UPDATE \"{schema_name}\".\"{t}\" SET doc = doc - '{field}'"
+            ))
+            .execute(&mut **tx)
+            .await?;
+            sqlx::query(&format!(
+                "ALTER TABLE \"{schema_name}\".\"{t}\" DROP COLUMN IF EXISTS \"{}\"",
+                pg_col(field)
+            ))
+            .execute(&mut **tx)
+            .await?;
+            fx.touched.insert(table.clone());
+            push_ops(&mut fx.ops, table, &ids, OpKind::Patch);
+            Ok(DirectiveReport {
+                op: "dropField".into(),
+                affected_rows: ids.len() as i64,
+                ..Default::default()
+            })
+        }
+        Directive::DropTable { name } => {
+            let t = pg_table(name);
+            let ids = all_ids(tx, schema_name, &t).await?;
+            sqlx::query(&format!("DROP TABLE \"{schema_name}\".\"{t}\""))
+                .execute(&mut **tx)
+                .await?;
+            fx.touched.insert(name.clone());
+            push_ops(&mut fx.ops, name, &ids, OpKind::Delete);
+            Ok(DirectiveReport {
+                op: "dropTable".into(),
+                affected_rows: ids.len() as i64,
+                ..Default::default()
+            })
+        }
+        Directive::DropIndex { table, name } => {
+            // Index ident mirrors ddl::push_schema's `i_{table}_{name}` (both
+            // lowercased). No DocOps; the table is touched so subscriptions re-run.
+            let idx = format!("i_{}_{}", table.to_lowercase(), name.to_lowercase());
+            sqlx::query(&format!("DROP INDEX IF EXISTS \"{schema_name}\".\"{idx}\""))
+                .execute(&mut **tx)
+                .await?;
+            fx.touched.insert(table.clone());
+            Ok(DirectiveReport {
+                op: "dropIndex".into(),
+                affected_rows: 0,
+                ..Default::default()
+            })
+        }
+        Directive::SetDefault {
+            table,
+            field,
+            value,
+        } => {
+            let t = pg_table(table);
+            let value_json =
+                serde_json::to_string(value).map_err(|e| RtDbError::internal(e.to_string()))?;
+            // Capture the rows lacking the field BEFORE the update — after the
+            // update they have it, so the `WHERE NOT doc ? '{field}'` predicate
+            // would no longer match them.
+            let ids = ids_where(tx, schema_name, &t, &format!("NOT doc ? '{field}'")).await?;
+            sqlx::query(&format!(
+                "UPDATE \"{schema_name}\".\"{t}\" \
+                 SET doc = jsonb_set(doc, '{{\"{field}\"}}', $1::jsonb, true) \
+                 WHERE NOT doc ? '{field}'"
+            ))
+            .bind(&value_json)
+            .execute(&mut **tx)
+            .await?;
+            // If the field is indexed, recompute its typed `f_` column for the
+            // affected rows (they now carry the default). `derived` carries the
+            // field's post-migration type.
+            let derived_table = table_def(derived, table)?;
+            if indexed_fields(derived_table).contains(field) {
+                let fty = derived_table.fields.get(field).ok_or_else(|| {
+                    RtDbError::internal(format!(
+                        "setDefault targets absent field '{table}.{field}'"
+                    ))
+                })?;
+                let (pg_type, _) = indexed_column_type(fty)?;
+                let col = pg_col(field);
+                let expr = backfill_expr(pg_type, field)?;
+                recompute_columns_for_ids(tx, schema_name, &t, &col, &expr, &ids).await?;
+            }
+            let n = ids.len() as i64;
+            fx.touched.insert(table.clone());
+            push_ops(&mut fx.ops, table, &ids, OpKind::Patch);
+            Ok(DirectiveReport {
+                op: "setDefault".into(),
+                affected_rows: n,
+                ..Default::default()
+            })
+        }
+        Directive::ChangeType { .. } | Directive::EvalExpr { .. } => {
+            // Implemented in Tasks 4 and 5.
+            Err(RtDbError::internal("directive not yet implemented"))
+        }
+    }
+}
+
+fn table_def<'a>(schema: &'a SchemaDef, table: &str) -> Result<&'a TableDef, RtDbError> {
+    schema
+        .tables
+        .get(table)
+        .ok_or_else(|| RtDbError::internal(format!("table '{table}' missing from schema")))
+}
+
+/// Reads the stored schema from the db's `meta` row inside `tx`. Before Task 6's
+/// committer arm updates `meta`, this is the authoritative pre-migration schema.
+async fn load_schema_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    schema_name: &str,
+) -> Result<Option<SchemaDef>, RtDbError> {
+    let row: Option<(serde_json::Value,)> = sqlx::query_as(&format!(
+        "SELECT value FROM \"{schema_name}\".meta WHERE key = 'schema'"
+    ))
+    .fetch_optional(&mut **tx)
+    .await?;
+    match row {
+        Some((value,)) => {
+            let schema = serde_json::from_value(value).map_err(|err| {
+                tracing::error!(error = %err, "failed to deserialize stored schema");
+                RtDbError::internal("failed to read stored schema")
+            })?;
+            Ok(Some(schema))
+        }
+        None => Ok(None),
+    }
+}
+
+async fn rewrite_doc_key(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    schema_name: &str,
+    table: &str,
+    from: &str,
+    to: &str,
+) -> Result<i64, RtDbError> {
+    let res = sqlx::query(&format!(
+        "UPDATE \"{schema_name}\".\"{table}\" \
+         SET doc = jsonb_set(doc - '{from}', '{{\"{to}\"}}', doc->'{from}', true) \
+         WHERE doc ? '{from}'"
+    ))
+    .execute(&mut **tx)
+    .await?;
+    Ok(res.rows_affected() as i64)
+}
+
+/// Recomputes a typed `f_` column for `ids` using `cast_expr` (the
+/// `ddl::backfill_expr` pattern), scoped to exactly the rows that just received
+/// a default. `cast_expr` reads `doc->>'{field}'`, which is now populated.
+async fn recompute_columns_for_ids(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    schema_name: &str,
+    table: &str,
+    col: &str,
+    cast_expr: &str,
+    ids: &[String],
+) -> Result<(), RtDbError> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    sqlx::query(&format!(
+        "UPDATE \"{schema_name}\".\"{table}\" SET \"{col}\" = {cast_expr} WHERE id = ANY($1)"
+    ))
+    .bind(ids)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+async fn all_ids(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    schema_name: &str,
+    table: &str,
+) -> Result<Vec<String>, RtDbError> {
+    ids_where(tx, schema_name, table, "true").await
+}
+
+/// Selects `id` for rows matching `cond`. `cond` is composed from validated
+/// field identifiers (regex-clean per the schema layer), never user data — the
+/// same pattern `ddl::push_schema` uses for its `WHERE doc ? '{field}'` backfill.
+async fn ids_where(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    schema_name: &str,
+    table: &str,
+    cond: &str,
+) -> Result<Vec<String>, RtDbError> {
+    let rows: Vec<(String,)> = sqlx::query_as(&format!(
+        "SELECT id FROM \"{schema_name}\".\"{table}\" WHERE {cond}"
+    ))
+    .fetch_all(&mut **tx)
+    .await?;
+    Ok(rows.into_iter().map(|r| r.0).collect())
+}
+
+fn push_ops(ops: &mut Vec<DocOp>, table: &str, ids: &[String], kind: OpKind) {
+    for id in ids {
+        ops.push(DocOp {
+            table: table.into(),
+            id: id.clone(),
+            kind,
+        });
+    }
 }
 
 #[cfg(test)]

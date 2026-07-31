@@ -35,7 +35,7 @@ pub fn pg_schema(db: &str) -> String {
 /// typed `f_` column. A btree or search index contributes all of its `fields`;
 /// a vector index contributes only its `filter_fields` — its single vector
 /// field is owned by the write-maintained `v_` column, not a typed column.
-fn indexed_fields(table: &TableDef) -> BTreeSet<String> {
+pub(crate) fn indexed_fields(table: &TableDef) -> BTreeSet<String> {
     let mut names = BTreeSet::new();
     for index in &table.indexes {
         if let Some(vec_spec) = &index.vector {
@@ -58,7 +58,7 @@ fn field_type<'a>(table: &'a TableDef, field_name: &str) -> Result<&'a FieldType
 }
 
 /// Backfill expression casting the document's JSON value for `field_name` to `pg_type`.
-fn backfill_expr(pg_type: &str, field_name: &str) -> Result<String, RtDbError> {
+pub(crate) fn backfill_expr(pg_type: &str, field_name: &str) -> Result<String, RtDbError> {
     match pg_type {
         "text" => Ok(format!("(doc->>'{field_name}')")),
         "double precision" => Ok(format!("(doc->>'{field_name}')::float8")),
