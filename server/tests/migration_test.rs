@@ -78,6 +78,20 @@ async fn get_doc(db: &Db, table: &str, id: &str) -> serde_json::Value {
     doc
 }
 
+/// Returns every doc row for `table`. Used by evalExpr tests that need to scan
+/// across rows to assert which ones a `where`-scoped rewrite touched.
+async fn query_docs(db: &Db, table: &str) -> Vec<serde_json::Value> {
+    let schema_name = format!("db_{}", db.name);
+    let table_ident = format!("t_{}", table.to_lowercase());
+    let rows: Vec<(serde_json::Value,)> = sqlx::query_as(&format!(
+        "SELECT doc FROM \"{schema_name}\".\"{table_ident}\""
+    ))
+    .fetch_all(&db.state.pool)
+    .await
+    .expect("fetch docs");
+    rows.into_iter().map(|r| r.0).collect()
+}
+
 /// Runs the directives in `request_json` against `db` inside a single tx:
 /// `plan_migration` derives the post-migration schema, then `apply_migration`
 /// executes the DDL+DML and commits.
@@ -599,29 +613,84 @@ async fn change_type_indexed_default_bool_recasts_cleanly_to_number() {
     drop_db(&db).await;
 }
 
-// (k) evalExpr is a placeholder until Task 5 -> internal error.
+// (k) evalExpr rewrites a doc field via a scoped SQL expression. The expr is
+// interpolated as SQL text over the row's `doc`; the new value is written back
+// under the `set` key.
 #[tokio::test]
-async fn eval_expr_returns_unimplemented() {
+async fn eval_expr_rewrites_doc_field() {
     let db = setup_db_with_schema(
-        r#"{"tables":{"users":{"fields":{"name":{"type":"string"}},"indexes":[]}}}"#,
+        r#"{"tables":{"u":{"fields":{"name":{"type":"string"},"upper":{"type":"optional","inner":{"type":"string"}}},"indexes":[]}}}"#,
     )
     .await;
-    insert_doc(&db, "users", r#"{"name":"Ada"}"#).await;
-
-    let request: MigrateRequest = serde_json::from_str(
-        r#"{"directives":[{"op":"evalExpr","table":"users","set":"upper","expr":"upper(doc->>'name')"}]}"#,
+    let id = insert_doc(&db, "u", r#"{"name":"ada"}"#).await;
+    migrate(
+        &db,
+        r#"{"directives":[{"op":"evalExpr","table":"u","set":"upper","expr":"upper(doc->>'name')"}]}"#,
     )
-    .expect("parse request");
-    let derived = plan_migration(&db.schema, &request.directives).expect("plan");
-    let mut tx = db.state.pool.begin().await.expect("begin tx");
-    let err = apply_migration(&mut tx, &db.name, &request.directives, &derived, false)
-        .await
-        .expect_err("evalExpr should be unimplemented");
-    tx.rollback().await.ok();
+    .await;
+    assert_eq!(get_doc(&db, "u", &id).await["upper"], "ADA");
+    drop_db(&db).await;
+}
+
+// (l) evalExpr `where` scopes the rewrite to matching rows only.
+#[tokio::test]
+async fn eval_expr_where_filters() {
+    let db = setup_db_with_schema(
+        r#"{"tables":{"u":{"fields":{"n":{"type":"number"},"doubled":{"type":"optional","inner":{"type":"number"}}},"indexes":[]}}}"#,
+    )
+    .await;
+    insert_doc(&db, "u", r#"{"n":1}"#).await;
+    insert_doc(&db, "u", r#"{"n":2}"#).await;
+    migrate(
+        &db,
+        r#"{"directives":[{"op":"evalExpr","table":"u","set":"doubled","expr":"(doc->>'n')::float8 * 2","where":"(doc->>'n')::float8 >= 2"}]}"#,
+    )
+    .await;
+    let docs = query_docs(&db, "u").await;
+    // only the n=2 row gets `doubled` set to 4 ...
     assert!(
-        err.message.contains("not yet implemented"),
-        "{}",
-        err.message
+        docs.iter()
+            .any(|d| d.get("doubled").and_then(|v| v.as_f64()) == Some(4.0)),
+        "n=2 row should have doubled=4, got {docs:?}"
     );
+    // ... and the n=1 row is untouched (no `doubled` key).
+    let untouched = docs
+        .iter()
+        .filter_map(|d| d.as_object())
+        .any(|o| !o.contains_key("doubled"));
+    assert!(
+        untouched,
+        "n=1 row should not carry `doubled`, got {docs:?}"
+    );
+    drop_db(&db).await;
+}
+
+// (m) evalExpr recomputes the indexed `f_` column when its source field is the
+// `set` target. `upper` is indexed by `by_upper`, so `f_upper` must track the
+// new doc value after the rewrite (not stay NULL).
+#[tokio::test]
+async fn eval_expr_recomputes_indexed_column() {
+    let db = setup_db_with_schema(
+        r#"{"tables":{"u":{"fields":{"name":{"type":"string"},"upper":{"type":"optional","inner":{"type":"string"}}},"indexes":[{"name":"by_upper","fields":["upper"]}]}}}"#,
+    )
+    .await;
+    let id = insert_doc(&db, "u", r#"{"name":"ada"}"#).await;
+    migrate(
+        &db,
+        r#"{"directives":[{"op":"evalExpr","table":"u","set":"upper","expr":"upper(doc->>'name')"}]}"#,
+    )
+    .await;
+    // The doc carries the new value ...
+    assert_eq!(get_doc(&db, "u", &id).await["upper"], "ADA");
+    // ... and so does the typed `f_upper` column.
+    let schema_name = format!("db_{}", db.name);
+    let (typed,): (String,) = sqlx::query_as(&format!(
+        "SELECT \"f_upper\" FROM \"{schema_name}\".\"t_u\" WHERE id = $1"
+    ))
+    .bind(&id)
+    .fetch_one(&db.state.pool)
+    .await
+    .expect("fetch f_upper");
+    assert_eq!(typed, "ADA");
     drop_db(&db).await;
 }

@@ -240,7 +240,14 @@ fn validate_one(schema: &mut SchemaDef, d: &Directive) -> Result<(), RtDbError> 
         } => {
             let _ = table_mut(schema, table)?; // table must exist
             // `set` is a field path; the field need not exist (evalExpr may populate a
-            // new key the caller adds via a later additive push), but the table must.
+            // new key the caller adds via a later additive push), but the name must be
+            // a valid identifier. It is interpolated into the `jsonb_set` key literal,
+            // so a stray quote or backslash would otherwise break the SQL string.
+            if !crate::schema::is_valid_identifier(set, crate::schema::MAX_FIELD_NAME_LEN) {
+                return Err(RtDbError::bad_request(format!(
+                    "evalExpr 'set' must be a valid field name, got '{set}'"
+                )));
+            }
             if has_sql_violation(expr) || where_clause.as_deref().is_some_and(has_sql_violation) {
                 return Err(RtDbError::bad_request(format!(
                     "evalExpr for '{table}.{set}' is out of scope (no FROM/joins or DDL verbs)"
@@ -598,9 +605,44 @@ async fn apply_one(
                 ..Default::default()
             })
         }
-        Directive::EvalExpr { .. } => {
-            // Implemented in Task 5.
-            Err(RtDbError::internal("directive not yet implemented"))
+        Directive::EvalExpr {
+            table,
+            set,
+            expr,
+            where_clause,
+        } => {
+            // Scope was already validated by `plan_migration`: `expr`/`where`
+            // carry no `FROM`/`JOIN`/DDL verbs, and `set` is a regex-clean field
+            // name. This is the scoped raw-SQL escape — the admin authors `expr`
+            // and `where` as SQL text bounded to this one table's `doc`. Capture
+            // the affected ids BEFORE the rewrite using the same `cond` so DocOps
+            // cover exactly the rows about to change.
+            let t = pg_table(table);
+            let cond = where_clause.clone().unwrap_or_else(|| "true".to_string());
+            let ids = ids_where(tx, schema_name, &t, &cond).await?;
+            sqlx::query(&format!(
+                "UPDATE \"{schema_name}\".\"{t}\" \
+                 SET doc = jsonb_set(doc, '{{\"{set}\"}}', to_jsonb(({expr})), true) \
+                 WHERE {cond}"
+            ))
+            .execute(&mut **tx)
+            .await?;
+            // Recompute every indexed `f_` column from the just-rewritten `doc`
+            // for exactly the rows that were rewritten. Scoping by the captured
+            // ids (rather than re-evaluating `cond`) is strictly correct even
+            // when `expr` modifies a field that `cond` tests — a `cond`-scoped
+            // recompute could otherwise miss an updated row whose new doc no
+            // longer matches `cond`, leaving its `f_` column stale. Mirrors the
+            // `setDefault` arm's `recompute_columns_for_ids` pattern.
+            recompute_all_indexed(tx, schema_name, &t, table, derived, &ids).await?;
+            let n = ids.len() as i64;
+            fx.touched.insert(table.clone());
+            push_ops(&mut fx.ops, table, &ids, OpKind::Patch);
+            Ok(DirectiveReport {
+                op: "evalExpr".into(),
+                affected_rows: n,
+                ..Default::default()
+            })
         }
     }
 }
@@ -668,6 +710,59 @@ async fn recompute_columns_for_ids(
     }
     sqlx::query(&format!(
         "UPDATE \"{schema_name}\".\"{table}\" SET \"{col}\" = {cast_expr} WHERE id = ANY($1)"
+    ))
+    .bind(ids)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Recomputes EVERY indexed `f_` column on `table` from the current `doc`, for
+/// exactly the rows in `ids`. Used by `evalExpr`, whose SQL expression may
+/// populate a key that drives a typed column; rather than track which column
+/// `set` maps to (it may not even be indexed, or may populate a not-yet-schemad
+/// key the caller adds via a later push), recompute them all. Scoping by `ids`
+/// (captured before the doc rewrite from the same `cond`) — not by re-evaluating
+/// `cond` — is strictly correct when `expr` modifies a field that `cond` tests:
+/// a `cond`-scoped recompute could otherwise miss an updated row whose new doc
+/// no longer matches `cond`, leaving its `f_` column stale. No-op when the
+/// table has no indexed fields or `ids` is empty. Field types come from the
+/// `derived` (post-migration) schema — the authoritative source for each
+/// column's current type.
+async fn recompute_all_indexed(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    schema_name: &str,
+    table_pg: &str,
+    table_logical: &str,
+    derived: &SchemaDef,
+    ids: &[String],
+) -> Result<(), RtDbError> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let derived_table = table_def(derived, table_logical)?;
+    let indexed_set = indexed_fields(derived_table);
+    let indexed: Vec<&String> = indexed_set.iter().collect();
+    if indexed.is_empty() {
+        return Ok(());
+    }
+    // One UPDATE setting every indexed column; each column's cast mirrors
+    // `ddl::backfill_expr` reading the just-rewritten doc.
+    let mut sets: Vec<String> = Vec::with_capacity(indexed.len());
+    for field in &indexed {
+        let fty = derived_table.fields.get(*field).ok_or_else(|| {
+            RtDbError::internal(format!(
+                "indexed field '{table_logical}.{field}' missing from derived schema"
+            ))
+        })?;
+        let (pg_type, _) = indexed_column_type(fty)?;
+        let col = pg_col(field);
+        let cast_expr = backfill_expr(pg_type, field)?;
+        sets.push(format!("\"{col}\" = {cast_expr}"));
+    }
+    let sets_clause = sets.join(", ");
+    sqlx::query(&format!(
+        "UPDATE \"{schema_name}\".\"{table_pg}\" SET {sets_clause} WHERE id = ANY($1)"
     ))
     .bind(ids)
     .execute(&mut **tx)

@@ -100,10 +100,10 @@ pub struct SchemaDef {
 /// worst case `i_` + 30 + `_` + 30 = 63, exactly at the limit.
 const MAX_TABLE_NAME_LEN: usize = 30;
 const MAX_INDEX_NAME_LEN: usize = 30;
-const MAX_FIELD_NAME_LEN: usize = 60;
+pub(crate) const MAX_FIELD_NAME_LEN: usize = 60;
 
 /// Identifier regex `^[a-zA-Z][a-zA-Z0-9_]*$` bounded to `max_len` total chars.
-fn is_valid_identifier(s: &str, max_len: usize) -> bool {
+pub(crate) fn is_valid_identifier(s: &str, max_len: usize) -> bool {
     if s.is_empty() || s.len() > max_len {
         return false;
     }
