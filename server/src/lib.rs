@@ -10,6 +10,7 @@ pub mod error;
 pub mod health;
 pub mod http_api;
 pub mod metrics;
+pub mod migrate;
 pub mod mutation_log;
 pub mod op_feed;
 pub mod pagination;
