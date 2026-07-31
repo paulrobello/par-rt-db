@@ -552,6 +552,53 @@ async fn change_type_indexed_column_recompute_with_default() {
     drop_db(&db).await;
 }
 
+// (j5) Regression: when the default's JSON form differs from the target type's
+// natural form (e.g. `default: true` under `toNumber` — coercible to 1.0, but
+// its JSON text "true" is not a valid float8 literal), the doc must hold the
+// **coerced** default so the `ALTER ... USING (doc->>'v')::float8` re-cast on
+// the indexed column cannot reject it. Before the fix this 500'd: the doc held
+// the uncoerced `true`, and `'true'::float8` is a Postgres error.
+#[tokio::test]
+async fn change_type_indexed_default_bool_recasts_cleanly_to_number() {
+    let db = setup_db_with_schema(
+        r#"{"tables":{"u":{"fields":{"v":{"type":"string"}},"indexes":[{"name":"by_v","fields":["v"]}]}}}"#,
+    )
+    .await;
+    let good = insert_doc(&db, "u", r#"{"v":"42"}"#).await;
+    let bad = insert_doc(&db, "u", r#"{"v":"oops"}"#).await;
+
+    migrate(
+        &db,
+        r#"{"directives":[{"op":"changeType","table":"u","field":"v","to":{"type":"number"},"cast":"toNumber","default":true}]}"#,
+    )
+    .await;
+
+    // The uncoercible row took the default and now holds the coerced 1.0, not
+    // the boolean `true`.
+    assert_eq!(get_doc(&db, "u", &bad).await["v"], 1.0);
+    // The coercible row's numeric value is unchanged.
+    assert_eq!(get_doc(&db, "u", &good).await["v"], 42.0);
+    // The indexed column recast cleanly under the coerced default.
+    let schema_name = format!("db_{}", db.name);
+    let (good_col,): (f64,) = sqlx::query_as(&format!(
+        "SELECT \"f_v\" FROM \"{schema_name}\".\"t_u\" WHERE id = $1"
+    ))
+    .bind(&good)
+    .fetch_one(&db.state.pool)
+    .await
+    .expect("fetch f_v good");
+    assert_eq!(good_col, 42.0);
+    let (bad_col,): (f64,) = sqlx::query_as(&format!(
+        "SELECT \"f_v\" FROM \"{schema_name}\".\"t_u\" WHERE id = $1"
+    ))
+    .bind(&bad)
+    .fetch_one(&db.state.pool)
+    .await
+    .expect("fetch f_v bad");
+    assert_eq!(bad_col, 1.0);
+    drop_db(&db).await;
+}
+
 // (k) evalExpr is a placeholder until Task 5 -> internal error.
 #[tokio::test]
 async fn eval_expr_returns_unimplemented() {

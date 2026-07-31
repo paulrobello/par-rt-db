@@ -550,7 +550,13 @@ async fn apply_one(
                 let coerced = coerce_value(*cast, &val);
                 let new_val = match (coerced, default) {
                     (Some(v), _) => v,
-                    (None, Some(d)) => d.clone(),
+                    // Up-front validation guarantees `coerce_value(*cast, d)` is
+                    // `Some`, so store the coerced form — otherwise the doc would
+                    // carry the default's original JSON type (e.g. bool `true`
+                    // under `ToNumber`) and the `ALTER ... USING (doc->>'field')
+                    // ::<pg>` re-cast below would reject it (e.g. `'true'::float8`
+                    // errors in Postgres), turning a clean `BadRequest` into a 500.
+                    (None, Some(d)) => coerce_value(*cast, d).unwrap_or_else(|| d.clone()),
                     (None, None) => {
                         return Err(RtDbError::bad_request(format!(
                             "changeType cannot coerce value in {table}.{id} ({val}) and no default given"
