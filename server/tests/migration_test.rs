@@ -99,6 +99,28 @@ async fn migrate(db: &Db, request_json: &str) -> rtdb_server::migrate::Migration
     fx
 }
 
+/// Like `migrate` but expects `apply_migration` to fail; rolls the tx back and
+/// returns the error so the caller can assert on `code`/`message`. The doc
+/// state is what it was before the tx began (the rollback undoes any partial
+/// per-row writes).
+async fn migrate_err(db: &Db, request_json: &str) -> rtdb_server::error::RtDbError {
+    let request: MigrateRequest =
+        serde_json::from_str(request_json).expect("parse migrate request");
+    let derived = plan_migration(&db.schema, &request.directives).expect("plan migration");
+    let mut tx = db.state.pool.begin().await.expect("begin tx");
+    let err = apply_migration(
+        &mut tx,
+        &db.name,
+        &request.directives,
+        &derived,
+        request.dry_run,
+    )
+    .await
+    .expect_err("expected migrate error");
+    tx.rollback().await.ok();
+    err
+}
+
 /// `to_regclass` returns NULL when the relation does not exist.
 async fn relation_exists(db: &Db, qualified_name: &str) -> bool {
     let (exists,): (Option<String>,) = sqlx::query_as("SELECT to_regclass($1)::text")
@@ -409,30 +431,124 @@ async fn set_default_recomputes_indexed_column() {
     drop_db(&db).await;
 }
 
-// (j) changeType is a placeholder until Task 4 -> internal error.
+// (j) changeType: number→string coerces the jsonb value (and the typed column
+// when the field is indexed). `age` is indexed by `by_age`, so the `f_age`
+// column is recast from double precision to text and its value recomputed from
+// the just-updated doc.
 #[tokio::test]
-async fn change_type_returns_unimplemented() {
+async fn change_type_number_to_string_coerces() {
     let db = setup_db_with_schema(
-        r#"{"tables":{"users":{"fields":{"age":{"type":"number"}},"indexes":[]}}}"#,
+        r#"{"tables":{"users":{"fields":{"age":{"type":"number"}},"indexes":[{"name":"by_age","fields":["age"]}]}}}"#,
     )
     .await;
-    insert_doc(&db, "users", r#"{"age":36}"#).await;
+    let id = insert_doc(&db, "users", r#"{"age":42}"#).await;
 
-    let request: MigrateRequest = serde_json::from_str(
+    migrate(
+        &db,
         r#"{"directives":[{"op":"changeType","table":"users","field":"age","to":{"type":"string"},"cast":"toString"}]}"#,
     )
-    .expect("parse request");
-    let derived = plan_migration(&db.schema, &request.directives).expect("plan");
-    let mut tx = db.state.pool.begin().await.expect("begin tx");
-    let err = apply_migration(&mut tx, &db.name, &request.directives, &derived, false)
-        .await
-        .expect_err("changeType should be unimplemented");
-    tx.rollback().await.ok();
+    .await;
+
+    let doc = get_doc(&db, "users", &id).await;
+    assert_eq!(doc["age"], "42");
+    // The typed column followed the cast: f_age is now text holding "42".
+    let schema_name = format!("db_{}", db.name);
+    let (col,): (String,) = sqlx::query_as(&format!(
+        "SELECT \"f_age\" FROM \"{schema_name}\".\"t_users\" WHERE id = $1"
+    ))
+    .bind(&id)
+    .fetch_one(&db.state.pool)
+    .await
+    .expect("fetch f_age");
+    assert_eq!(col, "42");
+    drop_db(&db).await;
+}
+
+// (j2) changeType to number with an uncoercible row and no default fails
+// atomically with a BadRequest naming the offending row, and leaves the doc
+// unchanged (the tx rolls back the partial per-row rewrite). Non-indexed field,
+// so only the `doc` jsonb value is in play.
+#[tokio::test]
+async fn change_type_to_number_atomic_fail_names_row() {
+    let db =
+        setup_db_with_schema(r#"{"tables":{"u":{"fields":{"v":{"type":"string"}},"indexes":[]}}}"#)
+            .await;
+    let id = insert_doc(&db, "u", r#"{"v":"not-a-number"}"#).await;
+    let err = migrate_err(
+        &db,
+        r#"{"directives":[{"op":"changeType","table":"u","field":"v","to":{"type":"number"},"cast":"toNumber"}]}"#,
+    )
+    .await;
     assert!(
-        err.message.contains("not yet implemented"),
-        "{}",
-        err.message
+        err.message.contains(&id),
+        "error should name the offending row id: {err:?}"
     );
+    assert!(
+        err.message.contains("not-a-number"),
+        "error should name the offending value: {err:?}"
+    );
+    // atomic: doc unchanged
+    assert_eq!(get_doc(&db, "u", &id).await["v"], "not-a-number");
+    drop_db(&db).await;
+}
+
+// (j3) changeType with a default substitutes the default for uncoercible rows
+// instead of failing. The default is representable in the target type (0 is a
+// valid number), so the cast succeeds and the doc reflects the default.
+#[tokio::test]
+async fn change_type_default_substitutes_uncoercible() {
+    let db =
+        setup_db_with_schema(r#"{"tables":{"u":{"fields":{"v":{"type":"string"}},"indexes":[]}}}"#)
+            .await;
+    let id = insert_doc(&db, "u", r#"{"v":"oops"}"#).await;
+    migrate(
+        &db,
+        r#"{"directives":[{"op":"changeType","table":"u","field":"v","to":{"type":"number"},"cast":"toNumber","default":0}]}"#,
+    )
+    .await;
+    assert_eq!(get_doc(&db, "u", &id).await["v"], 0);
+    drop_db(&db).await;
+}
+
+// (j4) changeType on an indexed field recomputes the typed column for every row
+// from the already-updated doc, including rows that took the default. Mixes one
+// coercible row ("42") with one uncoercible row ("NaN") under a ToNumber cast
+// with default 0; both `doc` and `f_v` must end up consistent.
+#[tokio::test]
+async fn change_type_indexed_column_recompute_with_default() {
+    let db = setup_db_with_schema(
+        r#"{"tables":{"u":{"fields":{"v":{"type":"string"}},"indexes":[{"name":"by_v","fields":["v"]}]}}}"#,
+    )
+    .await;
+    let good = insert_doc(&db, "u", r#"{"v":"42"}"#).await;
+    let bad = insert_doc(&db, "u", r#"{"v":"NaN"}"#).await;
+
+    migrate(
+        &db,
+        r#"{"directives":[{"op":"changeType","table":"u","field":"v","to":{"type":"number"},"cast":"toNumber","default":0}]}"#,
+    )
+    .await;
+
+    assert_eq!(get_doc(&db, "u", &good).await["v"], 42.0);
+    assert_eq!(get_doc(&db, "u", &bad).await["v"], 0);
+    // The typed column was recast double precision and recomputed from doc.
+    let schema_name = format!("db_{}", db.name);
+    let (good_col,): (f64,) = sqlx::query_as(&format!(
+        "SELECT \"f_v\" FROM \"{schema_name}\".\"t_u\" WHERE id = $1"
+    ))
+    .bind(&good)
+    .fetch_one(&db.state.pool)
+    .await
+    .expect("fetch f_v good");
+    assert_eq!(good_col, 42.0);
+    let (bad_col,): (f64,) = sqlx::query_as(&format!(
+        "SELECT \"f_v\" FROM \"{schema_name}\".\"t_u\" WHERE id = $1"
+    ))
+    .bind(&bad)
+    .fetch_one(&db.state.pool)
+    .await
+    .expect("fetch f_v bad");
+    assert_eq!(bad_col, 0.0);
     drop_db(&db).await;
 }
 

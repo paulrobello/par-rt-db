@@ -508,8 +508,92 @@ async fn apply_one(
                 ..Default::default()
             })
         }
-        Directive::ChangeType { .. } | Directive::EvalExpr { .. } => {
-            // Implemented in Tasks 4 and 5.
+        Directive::ChangeType {
+            table,
+            field,
+            to,
+            cast,
+            default,
+        } => {
+            let t = pg_table(table);
+            let (pg_type, _nullable) = indexed_column_type(to).map_err(|_| {
+                RtDbError::bad_request(format!(
+                    "changeType target for {table}.{field} is not indexable"
+                ))
+            })?;
+            // Validate any supplied default is representable in the target type
+            // before we touch a row. The column recompute below reads the doc we
+            // just wrote; an unrepresentable default would otherwise break the
+            // `ALTER ... USING` cast on the defaulted rows with a Postgres error
+            // instead of a clean BadRequest naming the misconfiguration.
+            if let Some(d) = default
+                && coerce_value(*cast, d).is_none()
+            {
+                return Err(RtDbError::bad_request(format!(
+                    "changeType default for {table}.{field} is not representable under cast {cast:?}"
+                )));
+            }
+            // The typed `f_` column exists iff the source field was indexed on
+            // the pre-migration table. Non-indexed fields carry their value
+            // only in `doc` jsonb, so the ALTER below is gated on this.
+            let old_table = table_def(old, table)?;
+            let field_indexed = indexed_fields(old_table).contains(field);
+            let ids = all_ids(tx, schema_name, &t).await?;
+            for id in &ids {
+                let row: Option<(Option<serde_json::Value>,)> = sqlx::query_as(&format!(
+                    "SELECT doc->'{field}' FROM \"{schema_name}\".\"{t}\" WHERE id = $1"
+                ))
+                .bind(id)
+                .fetch_optional(&mut **tx)
+                .await?;
+                let Some((Some(val),)) = row else { continue };
+                let coerced = coerce_value(*cast, &val);
+                let new_val = match (coerced, default) {
+                    (Some(v), _) => v,
+                    (None, Some(d)) => d.clone(),
+                    (None, None) => {
+                        return Err(RtDbError::bad_request(format!(
+                            "changeType cannot coerce value in {table}.{id} ({val}) and no default given"
+                        )));
+                    }
+                };
+                let s = serde_json::to_string(&new_val)
+                    .map_err(|e| RtDbError::internal(e.to_string()))?;
+                sqlx::query(&format!(
+                    "UPDATE \"{schema_name}\".\"{t}\" \
+                     SET doc = jsonb_set(doc, '{{\"{field}\"}}', $1::jsonb, true) \
+                     WHERE id = $2"
+                ))
+                .bind(&s)
+                .bind(id)
+                .execute(&mut **tx)
+                .await?;
+            }
+            // Recast the typed column to the new pg type. The recompute reads
+            // the already-updated `doc`, which per the loop above holds a value
+            // that is coercible under the cast (or the default, validated up
+            // front to be representable), so the `USING` cast cannot fail. A
+            // non-indexed field has no `f_` column to alter.
+            if field_indexed {
+                let col = pg_col(field);
+                let using_expr = backfill_expr(pg_type, field)?;
+                sqlx::query(&format!(
+                    "ALTER TABLE \"{schema_name}\".\"{t}\" \
+                     ALTER COLUMN \"{col}\" TYPE {pg_type} USING ({using_expr})"
+                ))
+                .execute(&mut **tx)
+                .await?;
+            }
+            fx.touched.insert(table.clone());
+            push_ops(&mut fx.ops, table, &ids, OpKind::Patch);
+            Ok(DirectiveReport {
+                op: "changeType".into(),
+                affected_rows: ids.len() as i64,
+                ..Default::default()
+            })
+        }
+        Directive::EvalExpr { .. } => {
+            // Implemented in Task 5.
             Err(RtDbError::internal("directive not yet implemented"))
         }
     }
@@ -617,6 +701,47 @@ fn push_ops(ops: &mut Vec<DocOp>, table: &str, ids: &[String], kind: OpKind) {
             id: id.clone(),
             kind,
         });
+    }
+}
+
+/// Pure Rust coercion mirroring the SQL cast, used to decide default-vs-fail
+/// per row without relying on a Postgres exception. Returns `None` if the
+/// value cannot be coerced under this cast; the caller then substitutes
+/// `default` if supplied or raises a row-named `BadRequest`.
+///
+/// `ToInt64` emits a decimal-string JSON value (int64 travels as a canonical
+/// decimal string on this wire — see `schema::is_valid_int64` and
+/// `FEATURE_MATRIX.md` #13); `ToNumber` emits a JSON number. The other casts
+/// produce the natural JSON representation.
+fn coerce_value(cast: Cast, v: &serde_json::Value) -> Option<serde_json::Value> {
+    use serde_json::Value;
+    match (cast, v) {
+        (Cast::ToString, Value::String(_)) => Some(v.clone()),
+        (Cast::ToString, Value::Number(n)) => Some(Value::String(n.to_string())),
+        (Cast::ToString, Value::Bool(b)) => Some(Value::String(b.to_string())),
+        (Cast::ToString, _) => None,
+        (Cast::ToNumber, Value::String(s)) => match s.parse::<f64>() {
+            Ok(n) if n.is_finite() => Some(serde_json::json!(n)),
+            _ => None,
+        },
+        (Cast::ToNumber, Value::Number(_)) => Some(v.clone()),
+        (Cast::ToNumber, Value::Bool(b)) => Some(serde_json::json!(if *b { 1.0 } else { 0.0 })),
+        (Cast::ToNumber, _) => None,
+        (Cast::ToInt64, Value::String(s)) => s
+            .parse::<i64>()
+            .ok()
+            .map(|i| serde_json::json!(i.to_string())),
+        (Cast::ToInt64, Value::Number(n)) => n.as_i64().map(|i| serde_json::json!(i.to_string())),
+        (Cast::ToInt64, _) => None,
+        (Cast::ToBoolean, Value::String(s)) => match s.as_str() {
+            "true" | "1" => Some(Value::Bool(true)),
+            "false" | "0" => Some(Value::Bool(false)),
+            _ => None,
+        },
+        (Cast::ToBoolean, Value::Number(n)) => {
+            Some(Value::Bool(n.as_f64().map(|f| f != 0.0).unwrap_or(true)))
+        }
+        (Cast::ToBoolean, _) => None,
     }
 }
 
@@ -821,5 +946,59 @@ mod tests {
         }];
         let got = plan_migration(&old, &d).unwrap();
         assert!(got.tables.is_empty());
+    }
+
+    #[test]
+    fn coerce_value_emits_target_forms() {
+        use serde_json::json;
+        // ToNumber emits a JSON number (f64). NaN/inf strings parse as f64 but
+        // are rejected by the `is_finite()` guard rather than collapsing to
+        // Value::Null via serde_json's f64→Number path.
+        assert_eq!(
+            coerce_value(Cast::ToNumber, &json!("42")),
+            Some(json!(42.0))
+        );
+        assert_eq!(coerce_value(Cast::ToNumber, &json!(true)), Some(json!(1.0)));
+        assert_eq!(
+            coerce_value(Cast::ToNumber, &json!(false)),
+            Some(json!(0.0))
+        );
+        assert!(coerce_value(Cast::ToNumber, &json!("NaN")).is_none());
+        assert!(coerce_value(Cast::ToNumber, &json!("inf")).is_none());
+        assert!(coerce_value(Cast::ToNumber, &json!("not-a-number")).is_none());
+        // ToInt64 emits a decimal-string JSON value (int64 wire convention —
+        // see schema::is_valid_int64 and FEATURE_MATRIX.md #13).
+        assert_eq!(
+            coerce_value(Cast::ToInt64, &json!("123")),
+            Some(json!("123"))
+        );
+        assert_eq!(coerce_value(Cast::ToInt64, &json!(456)), Some(json!("456")));
+        // A float-valued JSON number with a fractional part does not fit i64.
+        assert!(coerce_value(Cast::ToInt64, &json!(456.5)).is_none());
+        assert!(coerce_value(Cast::ToInt64, &json!("not-an-int")).is_none());
+        // ToString / ToBoolean round out the matrix.
+        assert_eq!(coerce_value(Cast::ToString, &json!(42)), Some(json!("42")));
+        assert_eq!(
+            coerce_value(Cast::ToString, &json!(true)),
+            Some(json!("true"))
+        );
+        assert_eq!(
+            coerce_value(Cast::ToBoolean, &json!("true")),
+            Some(json!(true))
+        );
+        assert_eq!(
+            coerce_value(Cast::ToBoolean, &json!("0")),
+            Some(json!(false))
+        );
+        assert_eq!(
+            coerce_value(Cast::ToBoolean, &json!(0.0)),
+            Some(json!(false))
+        );
+        assert_eq!(coerce_value(Cast::ToBoolean, &json!(3)), Some(json!(true)));
+        assert!(coerce_value(Cast::ToBoolean, &json!("maybe")).is_none());
+        // Objects/arrays/null have no coercion under any cast.
+        assert!(coerce_value(Cast::ToString, &json!({"a":1})).is_none());
+        assert!(coerce_value(Cast::ToNumber, &json!([1])).is_none());
+        assert!(coerce_value(Cast::ToInt64, &json!(null)).is_none());
     }
 }
