@@ -891,16 +891,26 @@ async fn migrate_dry_run_commits_nothing() {
     drop_db(&db).await;
 }
 
-// (T6-e) Concurrency: the per-db committer channel serializes a migrate with a
-// concurrent mutate on the SAME database — neither write is lost. Both ops are
-// fired concurrently via `tokio::join!`; regardless of which the committer
-// dequeues first, the final table reflects BOTH effects. (The cross-db case — a
-// mutate on dbB is NOT blocked by a migrate on dbA — is structurally guaranteed
-// by `Committers::channel_for` spawning one task per db, the same property
-// every existing mutate test relies on; a timing-based assertion would be flaky
-// and the brief explicitly forbids committing flaky tests.)
+// (T6-e) Concurrency durability: a migrate and a concurrent mutate submitted
+// against the SAME database both land — neither write is lost. The two futures
+// are fired via `tokio::join!` and the assertions below are order-independent
+// (`any`), so this proves no-lost-write DURABILITY under concurrent same-db
+// submit, NOT strict per-operation ordering. The assertions would pass under
+// any execution that doesn't drop a write; that is exactly the property under
+// test.
+//
+// Serialization — that the committer in fact runs one op to completion (with
+// fan-out) before dequeuing the next — is STRUCTURALLY guaranteed by the per-db
+// single committer task: `Committers::channel_for` spawns one mpsc channel plus
+// one committer task per database (committer.rs ~lines 151-196), the same
+// invariant every existing mutate relies on. It is not asserted here by timing
+// because a deterministic ordering probe would require a slow-migrate hook that
+// doesn't exist, and the project forbids committing flaky timing assertions.
+//
+// (The cross-db case — a mutate on dbB is NOT blocked by a migrate on dbA — is
+// structurally guaranteed the same way: independent channels/tasks per db.)
 #[tokio::test]
-async fn migrate_serializes_with_concurrent_mutate_same_db() {
+async fn migrate_and_concurrent_mutate_both_land_same_db() {
     let db = setup_db_with_schema(
         r#"{"tables":{"u":{"fields":{"n":{"type":"number"},"flag":{"type":"optional","inner":{"type":"boolean"}}},"indexes":[]}}}"#,
     )
