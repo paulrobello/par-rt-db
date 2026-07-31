@@ -44,6 +44,7 @@ import json
 import math
 import time
 from collections.abc import Callable
+from copy import deepcopy
 from dataclasses import dataclass
 from functools import cmp_to_key
 from typing import Any
@@ -52,6 +53,18 @@ from pydantic import TypeAdapter
 
 from .cursor import decode_cursor, encode_cursor
 from .errors import ErrorCode, RtDbError
+from .migration import (
+    Cast,
+    Directive,
+    _ChangeType,
+    _DropField,
+    _DropIndex,
+    _DropTable,
+    _EvalExpr,
+    _RenameField,
+    _RenameTable,
+    _SetDefault,
+)
 from .mutation import (
     Step,
     StepResult,
@@ -304,6 +317,289 @@ class InMemoryRtDbClient:
         """Snapshot of the currently-installed schema (or ``None`` before
         :meth:`push_schema`)."""
         return self._schema
+
+    def migrate_schema(
+        self,
+        directives: list[Directive],
+        *,
+        dry_run: bool = False,
+    ) -> Any:
+        """Apply (or preview) a declarative schema migration in-memory.
+
+        Ports ``rust-client::InMemoryRtDbClient::migrate_schema`` and through it
+        ``server::migrate::plan_migration`` + ``apply_migration``. Each directive
+        is validated against the working schema fold and applied to the doc
+        store. On the first failure the doc store is restored (``self._schema``
+        was never touched — the fold lives in a local ``planned`` copy) and the
+        error surfaces. On ``dry_run`` the full plan is validated and
+        ``affected_rows`` reported against the derived schema, but nothing is
+        committed (``applied: False``).
+
+        ``evalExpr`` has no in-memory SQL engine and raises
+        :class:`RtDbError` ``BAD_REQUEST`` — same convention as the
+        search/vector stubs. Affected-rows counts mirror the server:
+        ``renameField`` / ``setDefault`` count the rows whose docs actually
+        changed; ``changeType`` / ``dropField`` / ``dropTable`` count every row
+        in the table; ``renameTable`` / ``dropIndex`` report zero.
+
+        Returns a :class:`par_rt_db.http_client.MigrateResult` (imported lazily
+        to avoid a circular dependency at module load time).
+        """
+        from .http_client import DirectiveReport, MigrateResult
+
+        if self._schema is None:
+            raise RtDbError(ErrorCode.BAD_REQUEST, "no schema pushed for migration")
+
+        planned = deepcopy(self._schema)
+        snapshot = deepcopy(self._docs)
+        touched: set[str] = set()
+        reports: list[DirectiveReport] = []
+
+        for d in directives:
+            try:
+                report, table = self._apply_migration_directive(planned, d)
+            except RtDbError:
+                self._docs = snapshot
+                raise
+            reports.append(report)
+            if table is not None:
+                touched.add(table)
+
+        if dry_run:
+            self._docs = snapshot
+            return MigrateResult(applied=False, schema=planned, directives=reports)
+
+        self._schema = planned
+        self._tables.clear()
+        for name, def_ in planned.tables.items():
+            self._tables[name] = def_
+        self._notify_subs(touched)
+        return MigrateResult(applied=True, schema=planned, directives=reports)
+
+    def _apply_migration_directive(
+        self,
+        planned: SchemaDef,
+        d: Directive,
+    ) -> tuple[Any, str | None]:
+        """Apply one directive to the working ``planned`` schema and ``self._docs``.
+
+        Returns ``(DirectiveReport, Optional[table_name])`` where the table name
+        marks the directive's touched table for subscription re-run. Mirrors
+        ``rust-client::InMemoryRtDbClient::apply_migration_directive``.
+        """
+
+        if isinstance(d, _RenameField):
+            return self._migrate_rename_field(planned, d), d.table
+        if isinstance(d, _RenameTable):
+            return self._migrate_rename_table(planned, d), d.to
+        if isinstance(d, _ChangeType):
+            return self._migrate_change_type(planned, d), d.table
+        if isinstance(d, _DropField):
+            return self._migrate_drop_field(planned, d), d.table
+        if isinstance(d, _DropTable):
+            return self._migrate_drop_table(planned, d), d.name
+        if isinstance(d, _DropIndex):
+            return self._migrate_drop_index(planned, d), d.table
+        if isinstance(d, _SetDefault):
+            return self._migrate_set_default(planned, d), d.table
+        if isinstance(d, _EvalExpr):
+            raise RtDbError(
+                ErrorCode.BAD_REQUEST,
+                f"evalExpr unsupported in-memory (table '{d.table}')",
+            )
+        # Exhaustive over the Directive union — if a new variant is added,
+        # pyright flags this fallback as unreachable. Do not collapse.
+        raise RtDbError(ErrorCode.INTERNAL, f"unknown migration directive: {d!r}")
+
+    def _migrate_rename_field(
+        self,
+        planned: SchemaDef,
+        d: _RenameField,
+    ) -> Any:
+        from .http_client import DirectiveReport
+
+        t = _migrate_table_mut(planned, d.table)
+        if d.to in t.fields:
+            raise RtDbError(
+                ErrorCode.BAD_REQUEST,
+                f"rename target '{d.table}.{d.to}' already exists",
+            )
+        ft = t.fields.pop(d.from_, None)
+        if ft is None:
+            raise RtDbError(
+                ErrorCode.BAD_REQUEST,
+                f"renamed field '{d.table}.{d.from_}' does not exist",
+            )
+        t.fields[d.to] = ft
+        for ix in t.indexes:
+            ix.fields = [d.to if f == d.from_ else f for f in ix.fields]
+        if t.owner_field == d.from_:
+            t.owner_field = d.to
+        if t.collaborators_field == d.from_:
+            t.collaborators_field = d.to
+        affected = 0
+        for (tname, _), row in self._docs.items():
+            if tname != d.table:
+                continue
+            if d.from_ in row.doc:
+                row.doc[d.to] = row.doc.pop(d.from_)
+                affected += 1
+        return DirectiveReport(op="renameField", affected_rows=affected)
+
+    def _migrate_rename_table(
+        self,
+        planned: SchemaDef,
+        d: _RenameTable,
+    ) -> Any:
+        from .http_client import DirectiveReport
+
+        if d.to in planned.tables:
+            raise RtDbError(
+                ErrorCode.BAD_REQUEST,
+                f"rename target table '{d.to}' already exists",
+            )
+        def_ = planned.tables.pop(d.from_, None)
+        if def_ is None:
+            raise RtDbError(
+                ErrorCode.BAD_REQUEST,
+                f"renamed table '{d.from_}' does not exist",
+            )
+        # Id references to `from_` in other tables follow the rename.
+        for other in planned.tables.values():
+            for ft in other.fields.values():
+                if isinstance(ft, _FId) and ft.table == d.from_:
+                    ft.table = d.to
+        planned.tables[d.to] = def_
+        # Re-key the live doc store: (from_, id) → (to, id).
+        keys_to_move = [k for k in self._docs if k[0] == d.from_]
+        for k in keys_to_move:
+            row = self._docs.pop(k)
+            self._docs[(d.to, k[1])] = row
+        return DirectiveReport(op="renameTable", affected_rows=0)
+
+    def _migrate_change_type(
+        self,
+        planned: SchemaDef,
+        d: _ChangeType,
+    ) -> Any:
+        from .http_client import DirectiveReport
+
+        t = _migrate_table_mut(planned, d.table)
+        old_ty = t.fields.get(d.field)
+        if old_ty is None:
+            raise RtDbError(
+                ErrorCode.BAD_REQUEST,
+                f"changed field '{d.table}.{d.field}' does not exist",
+            )
+        if not _cast_valid_for(d.cast, old_ty):
+            raise RtDbError(
+                ErrorCode.BAD_REQUEST,
+                f"cast {d.cast.value} is not valid for {d.table}.{d.field}",
+            )
+        affected = 0
+        for (tname, row_id), row in self._docs.items():
+            if tname != d.table:
+                continue
+            affected += 1
+            val = row.doc.get(d.field)
+            if val is None:
+                continue
+            coerced = _coerce_value(d.cast, val)
+            if coerced is not None:
+                row.doc[d.field] = coerced
+            elif d.default is not None:
+                dv = _coerce_value(d.cast, d.default)
+                row.doc[d.field] = dv if dv is not None else d.default
+            else:
+                raise RtDbError(
+                    ErrorCode.BAD_REQUEST,
+                    f"changeType cannot coerce value in {d.table}.{row_id} ({val}) "
+                    "and no default given",
+                )
+        t.fields[d.field] = d.to
+        return DirectiveReport(op="changeType", affected_rows=affected)
+
+    def _migrate_drop_field(
+        self,
+        planned: SchemaDef,
+        d: _DropField,
+    ) -> Any:
+        from .http_client import DirectiveReport
+
+        t = _migrate_table_mut(planned, d.table)
+        if t.fields.pop(d.field, None) is None:
+            raise RtDbError(
+                ErrorCode.BAD_REQUEST,
+                f"dropped field '{d.table}.{d.field}' does not exist",
+            )
+        for ix in t.indexes:
+            ix.fields = [f for f in ix.fields if f != d.field]
+        if t.owner_field == d.field:
+            t.owner_field = None
+        if t.collaborators_field == d.field:
+            t.collaborators_field = None
+        affected = 0
+        for (tname, _), row in self._docs.items():
+            if tname != d.table:
+                continue
+            affected += 1
+            row.doc.pop(d.field, None)
+        return DirectiveReport(op="dropField", affected_rows=affected)
+
+    def _migrate_drop_table(
+        self,
+        planned: SchemaDef,
+        d: _DropTable,
+    ) -> Any:
+        from .http_client import DirectiveReport
+
+        if planned.tables.pop(d.name, None) is None:
+            raise RtDbError(
+                ErrorCode.BAD_REQUEST,
+                f"dropped table '{d.name}' does not exist",
+            )
+        keys_to_remove = [k for k in self._docs if k[0] == d.name]
+        for k in keys_to_remove:
+            del self._docs[k]
+        return DirectiveReport(op="dropTable", affected_rows=len(keys_to_remove))
+
+    def _migrate_drop_index(
+        self,
+        planned: SchemaDef,
+        d: _DropIndex,
+    ) -> Any:
+        from .http_client import DirectiveReport
+
+        t = _migrate_table_mut(planned, d.table)
+        if not any(ix.name == d.name for ix in t.indexes):
+            raise RtDbError(
+                ErrorCode.BAD_REQUEST,
+                f"dropped index '{d.table}.{d.name}' does not exist",
+            )
+        t.indexes = [ix for ix in t.indexes if ix.name != d.name]
+        return DirectiveReport(op="dropIndex", affected_rows=0)
+
+    def _migrate_set_default(
+        self,
+        planned: SchemaDef,
+        d: _SetDefault,
+    ) -> Any:
+        from .http_client import DirectiveReport
+
+        t = _migrate_table_mut(planned, d.table)
+        if d.field not in t.fields:
+            raise RtDbError(
+                ErrorCode.BAD_REQUEST,
+                f"setDefault target '{d.table}.{d.field}' does not exist",
+            )
+        affected = 0
+        for (tname, _), row in self._docs.items():
+            if tname != d.table:
+                continue
+            if d.field not in row.doc:
+                row.doc[d.field] = d.value
+                affected += 1
+        return DirectiveReport(op="setDefault", affected_rows=affected)
 
     def get(self, table: str, id: str) -> dict[str, Any] | None:
         """Minimal point read — the merged doc (system fields included) for
@@ -1317,6 +1613,96 @@ def apply_patch(table: TableDef, doc: dict[str, Any], fields: dict[str, Any]) ->
         merged[fld] = value
     validate_doc(table, merged)
     return merged
+
+
+def _migrate_table_mut(schema: SchemaDef, table: str) -> TableDef:
+    """Return a mutable reference to ``table`` within ``schema``, or raise
+    ``BAD_REQUEST`` if the table does not exist. Mirrors the server's
+    ``migrate::table_mut``."""
+    t = schema.tables.get(table)
+    if t is None:
+        raise RtDbError(ErrorCode.BAD_REQUEST, f"table '{table}' does not exist")
+    return t
+
+
+def _cast_valid_for(cast: Cast, old_ty: Any) -> bool:
+    """Mirror of ``server::migrate::cast_valid_for`` — true if ``cast`` can
+    coerce from the ``old_ty`` field type."""
+    if cast == Cast.TO_STRING:
+        return isinstance(old_ty, (_FString, _FNumber, _FBoolean, _FInt64))
+    if cast == Cast.TO_NUMBER:
+        return isinstance(old_ty, (_FString, _FBoolean, _FInt64))
+    if cast == Cast.TO_INT64:
+        return isinstance(old_ty, (_FString, _FNumber))
+    if cast == Cast.TO_BOOLEAN:
+        return isinstance(old_ty, (_FString, _FNumber))
+    return False
+
+
+def _coerce_value(cast: Cast, v: Any) -> Any:
+    """Pure-Python coercion mirroring ``server::migrate::coerce_value`` (and
+    ``rust-client::in_memory::coerce_value``). Returns the coerced value or
+    ``None`` if the value cannot be coerced under this cast.
+
+    ``ToInt64`` emits a decimal-string (int64 travels as a canonical decimal
+    string on the wire — see ``schema::is_valid_int64`` and
+    ``FEATURE_MATRIX.md`` #13); ``ToNumber`` emits a ``float``; the others
+    produce the natural Python representation.
+    """
+    if cast == Cast.TO_STRING:
+        if isinstance(v, str):
+            return v
+        if isinstance(v, bool):
+            return "true" if v else "false"
+        if isinstance(v, (int, float)):
+            return str(v)
+        return None
+    if cast == Cast.TO_NUMBER:
+        if isinstance(v, bool):
+            return 1.0 if v else 0.0
+        if isinstance(v, (int, float)):
+            return float(v)
+        if isinstance(v, str):
+            try:
+                f = float(v)
+            except ValueError:
+                return None
+            if not math.isfinite(f):
+                return None
+            return f
+        return None
+    if cast == Cast.TO_INT64:
+        # ``bool`` is a subclass of ``int`` — check it first and reject (mirrors
+        # Rust's ``Value::Bool`` falling through to ``_ => None``).
+        if isinstance(v, bool):
+            return None
+        if isinstance(v, int):
+            return str(v)
+        if isinstance(v, float):
+            if not v.is_integer():
+                return None
+            return str(int(v))
+        if isinstance(v, str):
+            try:
+                return str(int(v))
+            except ValueError:
+                return None
+        return None
+    if cast == Cast.TO_BOOLEAN:
+        if isinstance(v, str):
+            if v in ("true", "1"):
+                return True
+            if v in ("false", "0"):
+                return False
+            return None
+        # ``bool`` is a subclass of ``int`` — check it first and reject
+        # (``ToBoolean`` only accepts String and Number source types).
+        if isinstance(v, bool):
+            return None
+        if isinstance(v, (int, float)):
+            return v != 0.0
+        return None
+    return None
 
 
 def _detect_destructive_changes(old: SchemaDef, new: SchemaDef) -> None:

@@ -218,3 +218,57 @@ def test_corpus_schedule_info_rejects_unknown_status(entry: dict[str, Any]) -> N
     "running","paused","error"]``."""
     with pytest.raises(ValidationError):
         ScheduleInfo.model_validate(entry)
+
+
+# ---------------------------------------------------------------------------
+# Migration wire parity (tag "op", camelCase — mirrors server::migrate)
+# ---------------------------------------------------------------------------
+
+# (wire_json_string) — every entry must round-trip identically through
+# MigrateRequest. Fixtures mirror ``server/src/migrate.rs``'s ``directive_round_trip``
+# test: tag ``op``, camelCase keys, ``where`` alias, ``cast`` camelCase literals.
+MIGRATE_FIXTURES: list[str] = [
+    # renameField with `from` alias.
+    '{"directives": [{"op": "renameField", "table": "users", '
+    '"from": "name", "to": "fullName"}], "dryRun": false}',
+    # changeType with cast literal and explicit default.
+    '{"directives": [{"op": "changeType", "table": "users", "field": "age", '
+    '"to": {"type": "string"}, "cast": "toString", "default": "0"}], "dryRun": false}',
+    # evalExpr with `where` alias.
+    '{"directives": [{"op": "evalExpr", "table": "users", "set": "upper", '
+    '"expr": "upper(doc->>\'fullName\')", "where": "doc ? \'fullName\'"}], "dryRun": true}',
+    # dropTable / dropField / dropIndex / setDefault / renameTable.
+    '{"directives": [{"op": "dropTable", "name": "gone"}], "dryRun": false}',
+    '{"directives": [{"op": "dropField", "table": "users", "field": "legacy"}], "dryRun": false}',
+    '{"directives": [{"op": "dropIndex", "table": "users", "name": "by_email"}], "dryRun": false}',
+    '{"directives": [{"op": "setDefault", "table": "users", "field": "role", '
+    '"value": "member"}], "dryRun": false}',
+    '{"directives": [{"op": "renameTable", "from": "old", "to": "new"}], "dryRun": false}',
+]
+
+
+@pytest.mark.parametrize("fixture", MIGRATE_FIXTURES)
+def test_migrate_request_round_trip(fixture: str) -> None:
+    """Each migration fixture must round-trip through ``MigrateRequest``
+    byte-identically (alias-preserving, discriminator-stable). A failure means
+    a wire model drifted from the server contract."""
+    from par_rt_db.migration import MigrateRequest
+
+    original = json.loads(fixture)
+    parsed = MigrateRequest.model_validate(original)
+    dumped = parsed.model_dump(by_alias=True, mode="json")
+    assert dumped == original
+
+
+def test_migrate_request_parses_server_default_null() -> None:
+    """The server serializes ``changeType.default`` as ``null`` (via
+    ``#[serde(default)]`` with no ``skip_serializing_if``). Our model must accept
+    that form (filling in ``None``), even though we omit it when serializing."""
+    from par_rt_db.migration import MigrateRequest
+
+    fixture = json.loads(
+        '{"directives": [{"op": "changeType", "table": "users", "field": "age", '
+        '"to": {"type": "string"}, "cast": "toString", "default": null}], "dryRun": false}'
+    )
+    parsed = MigrateRequest.model_validate(fixture)
+    assert parsed.directives[0].default is None  # type: ignore[union-attr]

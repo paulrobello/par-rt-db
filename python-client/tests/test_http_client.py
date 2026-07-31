@@ -953,6 +953,82 @@ def test_admin_mutate_includes_idempotency_key_when_some() -> None:
     assert captured["body"]["idempotencyKey"] == "k1"
 
 
+def test_admin_migrate_schema_posts_directives_and_dry_run() -> None:
+    """``POST /admin/db/{db}/migrate`` sends ``{directives, dryRun}`` and parses
+    the ``MigrateResult`` response (``applied``, derived ``schema``, per-directive
+    ``reports``). Mirrors ``rust-client``'s ``migrate_schema_posts_directives_and_dry_run``.
+    """
+    from par_rt_db import Migration
+    from par_rt_db.http_client import MigrateResult
+
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        captured["path"] = request.url.path
+        return httpx.Response(
+            200,
+            json={
+                "applied": True,
+                "schema": {
+                    "tables": {
+                        "users": {
+                            "fields": {"fullName": {"type": "string"}},
+                            "indexes": [],
+                        }
+                    }
+                },
+                "directives": [{"op": "renameField", "affectedRows": 3}],
+            },
+        )
+
+    client = _admin_client(handler)
+    directives = (
+        Migration.builder().rename_field("users", "name", "fullName").dry_run().build().directives
+    )
+    result = client.migrate_schema("kanban", directives, dry_run=True)
+
+    assert captured["path"] == "/admin/db/kanban/migrate"
+    assert captured["body"]["dryRun"] is True
+    assert captured["body"]["directives"][0] == {
+        "op": "renameField",
+        "table": "users",
+        "from": "name",
+        "to": "fullName",
+    }
+    # MigrateResult parsed correctly.
+    assert isinstance(result, MigrateResult)
+    assert result.applied is True
+    assert "fullName" in result.schema_.tables["users"].fields
+    assert len(result.directives) == 1
+    assert result.directives[0].op == "renameField"
+    assert result.directives[0].affected_rows == 3
+
+
+def test_admin_migrate_schema_accepts_migrate_request() -> None:
+    """``migrate_schema`` also accepts a full ``MigrateRequest``."""
+    from par_rt_db import Migration
+
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "applied": False,
+                "schema": {"tables": {}},
+                "directives": [],
+            },
+        )
+
+    client = _admin_client(handler)
+    req = Migration.builder().drop_table("gone").build()
+    result = client.migrate_schema("kanban", req)
+    assert captured["body"]["directives"][0]["op"] == "dropTable"
+    assert result.applied is False
+
+
 # --- lifecycle --------------------------------------------------------------
 
 

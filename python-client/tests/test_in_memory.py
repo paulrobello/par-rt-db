@@ -843,3 +843,199 @@ def test_delete_file_removes_the_blob() -> None:
     with pytest.raises(RtDbError) as ei:
         c.get_file_metadata(res.id)
     assert ei.value.code is ErrorCode.NOT_FOUND
+
+
+# ---------------------------------------------------------------------------
+# schema migration (migrate_schema)
+# ---------------------------------------------------------------------------
+
+
+def _migrate_client() -> InMemoryRtDbClient:
+    """A client with a ``users`` table and two rows for migration tests."""
+    from par_rt_db import Mutation
+
+    schema = (
+        Schema.builder()
+        .table(
+            "users",
+            lambda tb: (
+                tb.field("name", t.string())
+                .field("age", t.number())
+                .field("status", t.optional(t.string()))
+                .index("by_name", ["name"])
+            ),
+        )
+        .build()
+    )
+    # Post-incrementing epoch-millis clock so each insert mints a distinct `_id`
+    # (the default constant-RNG client would collide within the same millisecond).
+    counter = [1_700_000_000_000]
+
+    def now() -> int:
+        v = counter[0]
+        counter[0] += 1
+        return v
+
+    c = InMemoryRtDbClient(InMemoryRtDbClientOptions(now=now, random=lambda: 0.0))
+    c.push_schema(schema)
+    c.mutate(Mutation.builder().insert("users", {"name": "alice", "age": 30}).build())
+    c.mutate(Mutation.builder().insert("users", {"name": "bob", "age": 25}).build())
+    return c
+
+
+def test_migrate_rename_field_moves_doc_key_and_schema() -> None:
+    from par_rt_db import Migration
+
+    c = _migrate_client()
+    directives = Migration.builder().rename_field("users", "name", "fullName").build().directives
+    result = c.migrate_schema(directives)
+
+    assert result.applied is True
+    assert result.directives[0].op == "renameField"
+    assert result.directives[0].affected_rows == 2  # both rows had `name`
+    # Schema folded: `fullName` in, `name` out.
+    table = result.schema_.tables["users"]
+    assert "fullName" in table.fields
+    assert "name" not in table.fields
+    # Doc keys renamed.
+    docs = c.collect_all("users")
+    assert all("fullName" in d and "name" not in d for d in docs)
+
+
+def test_migrate_set_default_populates_missing_field() -> None:
+    from par_rt_db import Migration
+
+    c = _migrate_client()
+    directives = Migration.builder().set_default("users", "status", "active").build().directives
+    result = c.migrate_schema(directives)
+
+    assert result.applied is True
+    assert result.directives[0].op == "setDefault"
+    assert result.directives[0].affected_rows == 2  # both rows lacked `status`
+    docs = c.collect_all("users")
+    assert all(d["status"] == "active" for d in docs)
+
+
+def test_migrate_change_type_coerces_values() -> None:
+    from par_rt_db import Cast, Migration
+
+    c = _migrate_client()
+    directives = (
+        Migration.builder()
+        .change_type("users", "age", {"type": "string"}, Cast.TO_STRING)
+        .build()
+        .directives
+    )
+    result = c.migrate_schema(directives)
+
+    assert result.applied is True
+    assert result.directives[0].op == "changeType"
+    assert result.directives[0].affected_rows == 2
+    # Values coerced from number to string.
+    docs = c.collect_all("users")
+    assert all(isinstance(d["age"], str) for d in docs)
+    # Schema updated.
+    assert result.schema_.tables["users"].fields["age"].type == "string"
+
+
+def test_migrate_change_type_uses_default_when_value_not_coercible() -> None:
+    # Insert a row with a string value that can't coerce under ToNumber.
+    from par_rt_db import Cast, Migration, Mutation
+
+    schema = Schema.builder().table("items", lambda tb: tb.field("val", t.string())).build()
+    c = InMemoryRtDbClient()
+    c.push_schema(schema)
+    c.mutate(Mutation.builder().insert("items", {"val": "not-a-number"}).build())
+
+    directives = (
+        Migration.builder()
+        .change_type("items", "val", {"type": "number"}, Cast.TO_NUMBER, 0)
+        .build()
+        .directives
+    )
+    result = c.migrate_schema(directives)
+    assert result.applied is True
+    docs = c.collect_all("items")
+    # The uncoercible string was replaced by the default (0 → 0.0).
+    assert docs[0]["val"] == 0.0
+
+
+def test_migrate_change_type_fails_without_default_when_not_coercible() -> None:
+    from par_rt_db import Cast, Migration, Mutation
+
+    schema = Schema.builder().table("items", lambda tb: tb.field("val", t.string())).build()
+    c = InMemoryRtDbClient()
+    c.push_schema(schema)
+    c.mutate(Mutation.builder().insert("items", {"val": "abc"}).build())
+
+    directives = (
+        Migration.builder()
+        .change_type("items", "val", {"type": "number"}, Cast.TO_NUMBER)
+        .build()
+        .directives
+    )
+    with pytest.raises(RtDbError) as ei:
+        c.migrate_schema(directives)
+    assert ei.value.code is ErrorCode.BAD_REQUEST
+    assert "no default given" in ei.value.message
+    # Docs restored on failure.
+    assert c.collect_all("items")[0]["val"] == "abc"
+
+
+def test_migrate_drop_table_clears_rows_and_schema() -> None:
+    from par_rt_db import Migration
+
+    c = _migrate_client()
+    directives = Migration.builder().drop_table("users").build().directives
+    result = c.migrate_schema(directives)
+
+    assert result.applied is True
+    assert result.directives[0].op == "dropTable"
+    assert result.directives[0].affected_rows == 2
+    assert "users" not in result.schema_.tables
+    assert c.collect_all("users") == []
+
+
+def test_migrate_eval_expr_raises_bad_request() -> None:
+    from par_rt_db import Migration
+
+    c = _migrate_client()
+    directives = (
+        Migration.builder().eval_expr("users", "upper", "upper(doc->>'name')").build().directives
+    )
+    with pytest.raises(RtDbError) as ei:
+        c.migrate_schema(directives)
+    assert ei.value.code is ErrorCode.BAD_REQUEST
+    assert "evalExpr unsupported" in ei.value.message
+
+
+def test_migrate_dry_run_leaves_state_unchanged() -> None:
+    from par_rt_db import Migration
+
+    c = _migrate_client()
+    original_docs = c.collect_all("users")
+    directives = (
+        Migration.builder().rename_field("users", "name", "fullName").dry_run().build().directives
+    )
+    result = c.migrate_schema(directives, dry_run=True)
+
+    assert result.applied is False
+    # Derived schema shows the rename.
+    assert "fullName" in result.schema_.tables["users"].fields
+    # But live state is unchanged.
+    assert c.collect_all("users") == original_docs
+    live_schema = c.to_schema_json()
+    assert live_schema is not None
+    assert "name" in live_schema.tables["users"].fields
+    assert "fullName" not in live_schema.tables["users"].fields
+
+
+def test_migrate_rejects_missing_source_field() -> None:
+    from par_rt_db import Migration
+
+    c = _migrate_client()
+    directives = Migration.builder().rename_field("users", "nonexistent", "x").build().directives
+    with pytest.raises(RtDbError) as ei:
+        c.migrate_schema(directives)
+    assert ei.value.code is ErrorCode.BAD_REQUEST
+    assert "does not exist" in ei.value.message

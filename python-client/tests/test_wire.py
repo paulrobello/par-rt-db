@@ -396,3 +396,100 @@ def test_server_schedule_err():
         "scheduleId": "s1",
         "error": {"code": "NOT_FOUND", "message": "missing"},
     }
+
+
+# --- Migration wire shapes (tag "op", camelCase) ---
+
+
+def test_migration_directive_round_trip() -> None:
+    """Every directive variant round-trips with the correct ``op`` discriminator
+    and camelCase wire keys. Mirrors ``server/src/migrate.rs`` tests."""
+    from par_rt_db import Cast, Migration
+    from par_rt_db.migration import MigrateRequest
+
+    req = (
+        Migration.builder()
+        .rename_field("users", "name", "fullName")
+        .rename_table("old", "new")
+        .change_type("users", "age", {"type": "string"}, Cast.TO_STRING, "0")
+        .drop_field("users", "legacy")
+        .drop_table("gone")
+        .drop_index("users", "by_email")
+        .set_default("users", "role", "member")
+        .eval_expr("users", "upper", "upper(doc->>'fullName')", "doc ? 'fullName'")
+        .dry_run()
+        .build()
+    )
+    dumped = req.model_dump(by_alias=True, mode="json")
+    ops = [d["op"] for d in dumped["directives"]]
+    assert ops == [
+        "renameField",
+        "renameTable",
+        "changeType",
+        "dropField",
+        "dropTable",
+        "dropIndex",
+        "setDefault",
+        "evalExpr",
+    ]
+    # `from` is a Python keyword; wire alias is `from`.
+    assert dumped["directives"][0]["from"] == "name"
+    assert dumped["directives"][1]["from"] == "old"
+    # `where` is a Python keyword; wire alias is `where`.
+    assert dumped["directives"][7]["where"] == "doc ? 'fullName'"
+    # `cast` serializes as the camelCase literal.
+    assert dumped["directives"][2]["cast"] == "toString"
+    # `default` is present when set.
+    assert dumped["directives"][2]["default"] == "0"
+    # `dryRun` is camelCase.
+    assert dumped["dryRun"] is True
+
+    # Round-trip back through the model.
+    parsed = MigrateRequest.model_validate(dumped)
+    assert parsed.dry_run is True
+    assert len(parsed.directives) == 8
+    re_dumped = parsed.model_dump(by_alias=True, mode="json")
+    assert re_dumped == dumped
+
+
+def test_migration_directive_omits_unset_default_and_where() -> None:
+    """``changeType.default`` and ``evalExpr.where`` are omitted when unset,
+    matching the ts-client's omit convention."""
+    from par_rt_db import Cast, Migration
+
+    req = (
+        Migration.builder()
+        .change_type("users", "age", {"type": "string"}, Cast.TO_STRING)
+        .eval_expr("users", "upper", "upper(doc->>'name')")
+        .build()
+    )
+    dumped = req.model_dump(by_alias=True, mode="json")
+    assert "default" not in dumped["directives"][0]
+    assert "where" not in dumped["directives"][1]
+
+
+def test_migration_cast_literals() -> None:
+    """``Cast`` serializes as the four camelCase wire literals."""
+    from par_rt_db import Cast, Migration
+
+    for cast, wire in [
+        (Cast.TO_STRING, "toString"),
+        (Cast.TO_NUMBER, "toNumber"),
+        (Cast.TO_INT64, "toInt64"),
+        (Cast.TO_BOOLEAN, "toBoolean"),
+    ]:
+        req = Migration.builder().change_type("t", "f", {"type": "string"}, cast).build()
+        dumped = req.model_dump(by_alias=True, mode="json")
+        assert dumped["directives"][0]["cast"] == wire
+
+
+def test_migration_rejects_unknown_directive_fields() -> None:
+    """``extra='forbid'`` on every directive variant rejects unknown fields."""
+    from pydantic import ValidationError
+
+    from par_rt_db.migration import _RenameField
+
+    with pytest.raises(ValidationError):
+        _RenameField.model_validate(
+            {"op": "renameField", "table": "t", "from": "a", "to": "b", "bogus": 1}
+        )

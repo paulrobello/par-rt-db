@@ -27,9 +27,10 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
-from pydantic import BaseModel, ConfigDict, TypeAdapter
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
 from .errors import ErrorCode, RtDbError
+from .migration import Directive, MigrateRequest
 from .mutation import StepResult, Transaction
 from .query import Query, TableQuery, _terminal_of, parse_result
 from .schema import SchemaDef
@@ -200,6 +201,51 @@ class OpEvent(_Wire):
     kind: str
     ts: int
     owner: str | None = None
+
+
+class CastFailure(_Wire):
+    """One row of ``DirectiveReport.cast_failures`` — a value that could not be
+    coerced under ``changeType.cast``. Mirrors ``server::migrate::CastFailure``."""
+
+    id: str
+    value: Any
+
+
+class SampleChange(_Wire):
+    """One row of ``DirectiveReport.sample_changes`` — a before/after pair for a
+    row touched by a migration directive. Mirrors ``server::migrate::SampleChange``."""
+
+    id: str
+    before: Any
+    after: Any
+
+
+class DirectiveReport(_Wire):
+    """Per-directive outcome. ``castFailures`` and ``sampleChanges`` are
+    ``skip_serializing_if = "Vec::is_empty"`` on the server, so they surface as
+    optional on the wire (absent when empty). Mirrors
+    ``server::migrate::DirectiveReport``."""
+
+    op: str
+    affected_rows: int
+    cast_failures: list[CastFailure] = Field(default_factory=list)
+    sample_changes: list[SampleChange] = Field(default_factory=list)
+
+
+class MigrateResult(_Wire):
+    """``POST /admin/db/{db}/migrate`` response. ``schema`` is the post-migration
+    derived schema — returned even on ``dryRun`` (with ``applied: false``), so a
+    caller can preview the resulting shape. Mirrors ``server::migrate::MigrateResult``.
+
+    The Python attribute is ``schema_`` (trailing underscore) because pydantic v2's
+    ``BaseModel`` still carries the deprecated v1 ``.schema()`` method, and a field
+    literally named ``schema`` shadows it (pydantic emits a ``UserWarning``). The
+    wire alias is the server-contract ``"schema"``.
+    """
+
+    applied: bool
+    schema_: SchemaDef = Field(alias="schema")
+    directives: list[DirectiveReport]
 
 
 # ``StepResult`` is a ``Union`` alias (no ``model_validate``); route through a
@@ -650,6 +696,37 @@ class RtDbHttpClient:
         resp = self._send("POST", f"/admin/db/{db}/mutate", json=body)
         results = resp.json()["results"]
         return [_STEP_RESULT_ADAPTER.validate_python(r) for r in results]
+
+    def migrate_schema(
+        self,
+        db: str,
+        directives: list[Directive] | MigrateRequest,
+        *,
+        dry_run: bool = False,
+    ) -> MigrateResult:
+        """``POST /admin/db/{db}/migrate`` ``{directives, dryRun}`` → ``MigrateResult``.
+
+        Apply (when ``dry_run`` is ``False``) or preview (when ``True``) a
+        declarative schema migration. The server validates and folds the
+        directives transactionally; on ``dry_run`` nothing is committed and the
+        returned ``schema`` is the derived preview (``applied: False``).
+
+        Accepts a list of ``Directive`` model instances (from the ``Migration``
+        builder's directives or hand-built) or a full :class:`MigrateRequest`.
+        When passing a ``MigrateRequest``, the request's own ``dry_run`` flag is
+        overridden by the ``dry_run`` keyword argument (mirrors the rust-client's
+        signature: directives + a separate ``dry_run`` bool).
+        """
+        if isinstance(directives, MigrateRequest):
+            wire_directives = directives.directives
+        else:
+            wire_directives = directives
+        body = {
+            "directives": [d.model_dump(by_alias=True, mode="json") for d in wire_directives],
+            "dryRun": dry_run,
+        }
+        resp = self._send("POST", f"/admin/db/{db}/migrate", json=body)
+        return MigrateResult.model_validate(resp.json())
 
     # --- request plumbing ---
 
