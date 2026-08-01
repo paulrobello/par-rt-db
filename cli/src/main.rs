@@ -360,9 +360,13 @@ mod tests {
             "mig.json",
         ])
         .unwrap();
-        let Command::Migrate { dry_run: false, .. } = cli.command else {
-            panic!("expected Migrate");
+        let Command::Migrate { dry_run, .. } = cli.command else {
+            panic!("expected Migrate variant");
         };
+        assert!(
+            !dry_run,
+            "migrate without --dry-run should set dry_run=false"
+        );
     }
 
     #[test]
