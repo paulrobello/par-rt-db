@@ -157,10 +157,20 @@ fn validate_one(schema: &mut SchemaDef, d: &Directive) -> Result<(), RtDbError> 
                     "rename target table '{to}' already exists"
                 )));
             }
-            let def = schema.tables.remove(from).ok_or_else(|| {
+            let mut def = schema.tables.remove(from).ok_or_else(|| {
                 RtDbError::bad_request(format!("renamed table '{from}' does not exist"))
             })?;
-            // Id references to `from` in other tables follow the rename.
+            // Id references to `from` follow the rename. The renamed table was
+            // just removed from the map, so the loop over the remaining tables
+            // would skip its own self-referential `Id { table: from }` fields —
+            // rewrite those here first, lest the rename leave a dangling ref.
+            for ft in def.fields.values_mut() {
+                if let FieldType::Id { table } = ft
+                    && table == from
+                {
+                    *table = to.clone();
+                }
+            }
             for t in schema.tables.values_mut() {
                 for ft in t.fields.values_mut() {
                     if let FieldType::Id { table } = ft
@@ -305,9 +315,10 @@ fn has_sql_violation(sql: &str) -> bool {
 // consistent with the `doc` jsonb after each directive. The pre-migration
 // schema (for "is the source field indexed?") is read from the db's `meta` row
 // inside the tx — the caller has not updated `meta` yet, so it reflects the
-// pre-migration state. `derived` (from `plan_migration`) supplies each arm's
-// post-migration field type/column. `changeType`/`evalExpr` arms land in later
-// tasks and stay `Err(internal)` placeholders here.
+// pre-migration state — then advanced per directive into a `working` copy, so
+// a later directive resolves an entity an earlier one renamed/changed by its
+// current name. `derived` (from `plan_migration`) is the full post-batch schema
+// and supplies each arm's final field type/column.
 
 /// Per-directive outcome of applying a migration: per-directive `reports`, the
 /// set of tables `touched` (drives subscription re-run in Task 6), and the
@@ -335,9 +346,20 @@ pub async fn apply_migration(
     let old = load_schema_in_tx(tx, &schema_name)
         .await?
         .ok_or_else(|| RtDbError::internal("no schema stored for database"))?;
+    // `working` is the schema as it stands before each directive — advanced
+    // past every applied directive so a later directive resolves an entity an
+    // earlier one renamed/changed by its current name. `old` alone (the
+    // pre-batch snapshot) would miss that: a rename→modify-on-renamed-entity
+    // batch passes `plan_migration` (which folds sequentially) but would fail
+    // at apply time looking the renamed table up under its new name. `derived`
+    // stays the post-batch schema for arms needing each field's final type.
+    let mut working = old.clone();
     let mut fx = MigrationEffects::default();
     for d in directives {
-        let report = apply_one(tx, &schema_name, &old, derived, d, &mut fx).await?;
+        let report = apply_one(tx, &schema_name, &working, derived, d, &mut fx).await?;
+        // Advance `working` past this directive. `plan_migration` already proved
+        // the whole sequence folds cleanly on `old`, so this cannot error here.
+        validate_one(&mut working, d)?;
         fx.reports.push(report);
     }
     let _ = dry_run; // dry_run only governs commit/rollback in the caller
@@ -1047,6 +1069,201 @@ mod tests {
         }];
         let got = plan_migration(&old, &d).unwrap();
         assert!(got.tables.is_empty());
+    }
+
+    /// Table with an index, ownerField, and collaboratorsField so the rename/drop
+    /// fixup arms have something to rewrite. `by_owner` indexes `ownerId` so a
+    /// rename of `ownerId` must follow it in `index.fields`.
+    fn schema_with_auth_and_index() -> SchemaDef {
+        let mut fields = BTreeMap::new();
+        fields.insert("email".into(), FieldType::String);
+        fields.insert("ownerId".into(), FieldType::String);
+        fields.insert(
+            "collabs".into(),
+            FieldType::Array {
+                element: Box::new(FieldType::String),
+            },
+        );
+        let mut tables = BTreeMap::new();
+        tables.insert(
+            "users".into(),
+            TableDef {
+                fields,
+                indexes: vec![crate::schema::IndexDef {
+                    name: "by_owner".into(),
+                    fields: vec!["ownerId".into()],
+                    search: false,
+                    vector: None,
+                }],
+                owner_field: Some("ownerId".into()),
+                collaborators_field: Some("collabs".into()),
+            },
+        );
+        SchemaDef { tables }
+    }
+
+    // plan fixup: renameField rewrites index.fields + ownerField +
+    // collaboratorsField that referenced the old name.
+    #[test]
+    fn plan_rename_field_fixes_index_owner_and_collab_refs() {
+        let old = schema_with_auth_and_index();
+        let d = vec![
+            Directive::RenameField {
+                table: "users".into(),
+                from: "ownerId".into(),
+                to: "uid".into(),
+            },
+            Directive::RenameField {
+                table: "users".into(),
+                from: "collabs".into(),
+                to: "members".into(),
+            },
+        ];
+        let got = plan_migration(&old, &d).unwrap();
+        let t = &got.tables["users"];
+        // index reference followed the rename.
+        assert_eq!(t.indexes[0].fields, vec!["uid".to_string()]);
+        // ownerField + collaboratorsField followed their respective renames.
+        assert_eq!(t.owner_field.as_deref(), Some("uid"));
+        assert_eq!(t.collaborators_field.as_deref(), Some("members"));
+        // old field names are gone.
+        assert!(!t.fields.contains_key("ownerId"));
+        assert!(!t.fields.contains_key("collabs"));
+    }
+
+    // plan fixup: dropField prunes index.fields and clears ownerField /
+    // collaboratorsField that named the dropped field.
+    #[test]
+    fn plan_drop_field_clears_index_owner_and_collab_refs() {
+        let old = schema_with_auth_and_index();
+        let d = vec![
+            Directive::DropField {
+                table: "users".into(),
+                field: "ownerId".into(),
+            },
+            Directive::DropField {
+                table: "users".into(),
+                field: "collabs".into(),
+            },
+        ];
+        let got = plan_migration(&old, &d).unwrap();
+        let t = &got.tables["users"];
+        assert!(
+            t.indexes[0].fields.is_empty(),
+            "index pruned of dropped field"
+        );
+        assert!(t.owner_field.is_none(), "ownerField cleared");
+        assert!(
+            t.collaborators_field.is_none(),
+            "collaboratorsField cleared"
+        );
+    }
+
+    // evalExpr `set` is interpolated into the jsonb_set key literal, so a stray
+    // quote (the classic injection shape) must be rejected as BAD_REQUEST at plan
+    // time — not reach the scoped-raw-SQL applier. Locks `is_valid_identifier`.
+    #[test]
+    fn plan_rejects_evalexpr_set_with_stray_quote() {
+        let old = one_table_schema();
+        let d = vec![Directive::EvalExpr {
+            table: "users".into(),
+            set: "name' WHERE 1=1".into(),
+            expr: "'x'".into(),
+            where_clause: None,
+        }];
+        let err = plan_migration(&old, &d).unwrap_err();
+        assert_eq!(err.code, crate::error::ErrorCode::BadRequest);
+        assert!(
+            err.message.contains("valid field name"),
+            "should explain the set-name rejection: {}",
+            err.message
+        );
+    }
+
+    // renameTable rewrites a self-referential `Id { table: <old self> }` inside
+    // the renamed table itself — the renamed table is removed from the map before
+    // the cross-table fixup loop, so without the self-ref pass it would dangle.
+    #[test]
+    fn plan_rename_table_rewrites_self_referential_id() {
+        let mut fields = BTreeMap::new();
+        fields.insert("name".into(), FieldType::String);
+        fields.insert(
+            "parent".into(),
+            FieldType::Id {
+                table: "node".into(),
+            },
+        );
+        let mut tables = BTreeMap::new();
+        tables.insert(
+            "node".into(),
+            TableDef {
+                fields,
+                indexes: vec![],
+                owner_field: None,
+                collaborators_field: None,
+            },
+        );
+        let old = SchemaDef { tables };
+        let d = vec![Directive::RenameTable {
+            from: "node".into(),
+            to: "nodes".into(),
+        }];
+        let got = plan_migration(&old, &d).unwrap();
+        assert!(got.tables.contains_key("nodes"));
+        assert_eq!(
+            got.tables["nodes"].fields["parent"],
+            FieldType::Id {
+                table: "nodes".into()
+            },
+            "self-referential Id must follow the rename"
+        );
+    }
+
+    // renameTable rewrites Id references in OTHER tables (companion to the
+    // self-ref case above); locks the pre-existing cross-table behavior.
+    #[test]
+    fn plan_rename_table_rewrites_cross_table_id_refs() {
+        let mut user_fields = BTreeMap::new();
+        user_fields.insert("name".into(), FieldType::String);
+        let mut account_fields = BTreeMap::new();
+        account_fields.insert(
+            "owner".into(),
+            FieldType::Id {
+                table: "user".into(),
+            },
+        );
+        let mut tables = BTreeMap::new();
+        tables.insert(
+            "user".into(),
+            TableDef {
+                fields: user_fields,
+                indexes: vec![],
+                owner_field: None,
+                collaborators_field: None,
+            },
+        );
+        tables.insert(
+            "account".into(),
+            TableDef {
+                fields: account_fields,
+                indexes: vec![],
+                owner_field: None,
+                collaborators_field: None,
+            },
+        );
+        let old = SchemaDef { tables };
+        let d = vec![Directive::RenameTable {
+            from: "user".into(),
+            to: "users".into(),
+        }];
+        let got = plan_migration(&old, &d).unwrap();
+        assert_eq!(
+            got.tables["account"].fields["owner"],
+            FieldType::Id {
+                table: "users".into()
+            },
+            "cross-table Id must follow the rename"
+        );
     }
 
     #[test]

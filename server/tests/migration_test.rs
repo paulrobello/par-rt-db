@@ -705,6 +705,43 @@ async fn eval_expr_recomputes_indexed_column() {
     drop_db(&db).await;
 }
 
+// (m2) Dependent multi-directive batch: a later directive operates on an entity
+// an earlier directive renamed, addressing it by its NEW name. `apply_migration`
+// advances a per-directive working schema (mirroring `plan_migration`'s
+// sequential fold) so the renameField resolves `accounts`; the pre-batch
+// snapshot alone (`users`) would miss it and the batch would fail at apply time
+// despite passing plan — a "passes dry-run, fails apply" footgun.
+#[tokio::test]
+async fn dependent_batch_operates_on_renamed_table() {
+    let db = setup_db_with_schema(
+        r#"{"tables":{"users":{"fields":{"name":{"type":"string"}},"indexes":[]}}}"#,
+    )
+    .await;
+    let id = insert_doc(&db, "users", r#"{"name":"Ada"}"#).await;
+
+    migrate(
+        &db,
+        r#"{"directives":[
+            {"op":"renameTable","from":"users","to":"accounts"},
+            {"op":"renameField","table":"accounts","from":"name","to":"fullName"}
+        ]}"#,
+    )
+    .await;
+
+    // The table was renamed, then the field renamed on the renamed table.
+    let schema_name = format!("db_{}", db.name);
+    let (doc,): (serde_json::Value,) = sqlx::query_as(&format!(
+        "SELECT doc FROM \"{schema_name}\".\"t_accounts\" WHERE id = $1"
+    ))
+    .bind(&id)
+    .fetch_one(&db.state.pool)
+    .await
+    .expect("fetch doc from renamed table");
+    assert_eq!(doc["fullName"], "Ada");
+    assert!(doc.get("name").is_none());
+    drop_db(&db).await;
+}
+
 // ---------------------------------------------------------------------------
 // Task 6: committer `RunMigrate` arm — the four tap sites + dry-run.
 //
@@ -888,6 +925,49 @@ async fn migrate_dry_run_commits_nothing() {
         doc.get("flag").is_none(),
         "dry-run committed nothing, doc unchanged: {doc:?}"
     );
+    drop_db(&db).await;
+}
+
+// (T6-d2) dry_run fires NO tap site: not the op-feed, not the audit log.
+// `migrate_dry_run_commits_nothing` above asserts the doc is unchanged; this
+// asserts the tap sites themselves stay empty — the load-bearing "every durable
+// write publishes here" guarantee must not fire on a rolled-back preview.
+#[tokio::test]
+async fn migrate_dry_run_fires_no_tap_sites() {
+    let state = test_state_with_audit().await;
+    let db = setup_db_with_schema_in(
+        state,
+        r#"{"tables":{"u":{"fields":{"n":{"type":"number"},"flag":{"type":"optional","inner":{"type":"boolean"}}},"indexes":[]}}}"#,
+    )
+    .await;
+    insert_doc(&db, "u", r#"{"n":1}"#).await;
+
+    let res = migrate_via_committer(
+        &db,
+        r#"{"directives":[{"op":"setDefault","table":"u","field":"flag","value":true}],"dryRun":true}"#,
+    )
+    .await;
+    assert!(!res.applied);
+
+    // Op-feed carries nothing for this db/table.
+    let feed = db
+        .state
+        .realtime
+        .op_feed
+        .recent(Some(&db.name), Some("u"), 16)
+        .await;
+    assert!(
+        feed.is_empty(),
+        "dry-run must not publish to op-feed: {feed:?}"
+    );
+
+    // Audit log (enabled here) carries no migrate row.
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM rtdb.audit_log WHERE db = $1")
+        .bind(&db.name)
+        .fetch_one(&db.state.pool)
+        .await
+        .expect("count audit rows");
+    assert_eq!(count, 0, "dry-run must not write an audit row");
     drop_db(&db).await;
 }
 
