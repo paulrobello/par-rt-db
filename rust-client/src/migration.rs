@@ -119,7 +119,7 @@ impl Migration {
     }
 
     /// Stash the `dryRun` flag for [`build_request`](Self::build_request).
-    /// `build`](Self::build) discards it — the HTTP method takes `dry_run` as a
+    /// [`build`](Self::build) discards it — the HTTP method takes `dry_run` as a
     /// separate argument.
     pub fn dry_run(mut self, dry_run: bool) -> Self {
         self.dry_run = dry_run;

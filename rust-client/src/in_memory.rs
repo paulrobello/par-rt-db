@@ -3552,7 +3552,7 @@ mod tests {
 
     #[cfg(feature = "admin")]
     #[tokio::test]
-    async fn migrate_change_type_coerces_with_default() {
+    async fn migrate_change_type_without_default_rolls_back() {
         let mut c = migrate_schema_with_rows().await;
         // String -> Int64 via ToInt64. "1"/"2" parse; the server coerces per row.
         let directives = vec![crate::wire::admin::Directive::ChangeType {
