@@ -19,6 +19,7 @@ class ErrorCode(StrEnum):
     SCHEMA_VIOLATION = "SCHEMA_VIOLATION"
     BAD_REQUEST = "BAD_REQUEST"
     INTERNAL = "INTERNAL"
+    RATE_LIMITED = "RATE_LIMITED"
 
 
 _STATUS: dict[ErrorCode, int] = {
@@ -30,6 +31,7 @@ _STATUS: dict[ErrorCode, int] = {
     ErrorCode.CONFLICT: 409,
     ErrorCode.SCHEMA_VIOLATION: 422,
     ErrorCode.INTERNAL: 500,
+    ErrorCode.RATE_LIMITED: 429,
 }
 
 
