@@ -108,12 +108,13 @@ runs the directives transactionally inside the committer, so live queries, the o
 feed, audit, and webhooks all fire.
 
 ```rust
-use par_rt_db_client::{Migration, Cast};
+use par_rt_db_client::{Cast, FieldType, Migration};
+use serde_json::json;
 
 let result = db.migrate_schema("kanban", &Migration::new()
     .rename_field("items", "title", "summary")
-    .change_type("items", "order", FieldType::String, Cast::ToString, Some("0"))
-    .set_default("items", "status", "backlog")
+    .change_type("items", "order", FieldType::String, Cast::ToString, Some(json!("0")))
+    .set_default("items", "status", json!("backlog"))
     .dry_run(true)   // preview first — returns the report + derived schema
     .build_request()
     .directives, true).await?;
