@@ -310,6 +310,15 @@ export interface IndexJson {
   search?: boolean;
   /** Present marks a vector index; omitted otherwise. */
   vector?: VectorIndexSpec;
+  /** `true` compiles to `CREATE UNIQUE INDEX` over the declared `fields` (no
+   * trailing tiebreaker column — uniqueness is on `fields` only). Omitted when
+   * false so existing schemas deserialize unchanged. Btree-only (rejected
+   * alongside `search`/`vector` by the server). */
+  unique?: boolean;
+  /** Optional partial-index predicate (`CREATE INDEX … WHERE`). Same `FilterExpr`
+   * type as the query-time `filter()` terminal. Omitted when absent. Wire key is
+   * `where` (Rust keyword ⇒ raw identifier on the server). */
+  where?: FilterExpr;
 }
 
 export interface TableJson {

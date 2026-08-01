@@ -1255,7 +1255,7 @@ export class InMemoryRtDbClient {
         }
         const row = rows[0];
         const merged = applyPatch(tableDef, row.doc, step.patch);
-        this.doUpdate(table, row, merged);
+        this.doUpdate(table, tableDef, row, merged);
         return { result: { id: row.id, inserted: false }, table };
       }
     }
@@ -1264,6 +1264,7 @@ export class InMemoryRtDbClient {
   private doInsert(tableName: string, tableDef: TableJson, doc: Record<string, unknown>): string {
     validateDoc(tableDef, doc);
     const stored = stripUnsetOptionals(tableDef, doc);
+    this.checkUniqueIndexes(tableName, tableDef, stored);
     const id = this.newId();
     this.rowsFor(tableName).set(id, { id, doc: stored, createdAt: this.now(), version: 1 });
     return id;
@@ -1277,7 +1278,7 @@ export class InMemoryRtDbClient {
   ): void {
     const row = this.requireRow(tableName, id);
     const merged = applyPatch(tableDef, row.doc, fields);
-    this.doUpdate(tableName, row, merged);
+    this.doUpdate(tableName, tableDef, row, merged);
   }
 
   private doReplace(
@@ -1288,7 +1289,9 @@ export class InMemoryRtDbClient {
   ): void {
     const row = this.requireRow(tableName, id);
     validateDoc(tableDef, doc);
-    row.doc = stripUnsetOptionals(tableDef, doc);
+    const stored = stripUnsetOptionals(tableDef, doc);
+    this.checkUniqueIndexes(tableName, tableDef, stored, row.id);
+    row.doc = stored;
     row.version += 1;
   }
 
@@ -1310,10 +1313,59 @@ export class InMemoryRtDbClient {
 
   /** Shared by `patch`, `replace`, and `upsert`'s patch path: writes the merged
    * doc and bumps `version` (server `apply_update`). */
-  private doUpdate(tableName: string, row: StoredRow, merged: Record<string, unknown>): void {
-    void tableName;
+  private doUpdate(
+    tableName: string,
+    tableDef: TableJson,
+    row: StoredRow,
+    merged: Record<string, unknown>,
+  ): void {
+    this.checkUniqueIndexes(tableName, tableDef, merged, row.id);
     row.doc = merged;
     row.version += 1;
+  }
+
+  /** Enforce `unique` indexes on a candidate write (mirrors server
+   * `CREATE UNIQUE INDEX`): for each unique index on `tableName`, no OTHER row
+   * (excluding `excludeId` when given) that satisfies the index's `where`
+   * predicate may share the candidate's key values on the index's declared
+   * `fields`. NULL/absent key fields disable the constraint for that row
+   * (Postgres UNIQUE treats NULLs as distinct). Throws `CONFLICT` on collision;
+   * `executeTransaction` then rolls back the whole txn via the same
+   * snapshot/restore path as the `PRECONDITION_FAILED` checks. Uniqueness is on
+   * `fields` only — never `id` or `created_at` (a trailing tiebreaker column
+   * would defeat uniqueness, as it does on the server). */
+  private checkUniqueIndexes(
+    tableName: string,
+    tableDef: TableJson,
+    candidateDoc: Record<string, unknown>,
+    excludeId?: string,
+  ): void {
+    const indexes = tableDef.indexes;
+    if (!indexes || indexes.length === 0) return;
+    for (const index of indexes) {
+      if (!index.unique) continue;
+      const pred = index.where;
+      // A partial unique index constrains only rows matching its predicate.
+      if (pred && !evalFilterExpr(pred, candidateDoc)) continue;
+      const candidateKey = index.fields.map((f) => candidateDoc[f]);
+      // NULLs are distinct under Postgres UNIQUE — skip when any key field is null/absent.
+      if (candidateKey.some((v) => v === null || v === undefined)) continue;
+      for (const row of this.rowsFor(tableName).values()) {
+        if (excludeId !== undefined && row.id === excludeId) continue;
+        if (pred && !evalFilterExpr(pred, row.doc)) continue;
+        let collision = true;
+        for (let i = 0; i < index.fields.length; i++) {
+          const rowVal = row.doc[index.fields[i]];
+          if (rowVal === null || rowVal === undefined || rowVal !== candidateKey[i]) {
+            collision = false;
+            break;
+          }
+        }
+        if (collision) {
+          throw new RtDbError("CONFLICT", `unique index '${index.name}' violated`);
+        }
+      }
+    }
   }
 
   /** Full-arity index lookup — a port of server `txn::eq_lookup` (shared by

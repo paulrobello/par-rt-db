@@ -1,4 +1,4 @@
-import type { FieldTypeJson, IndexJson, SchemaJson, TableJson } from "./protocol.js";
+import type { FieldTypeJson, FilterExpr, IndexJson, SchemaJson, TableJson } from "./protocol.js";
 
 /** Branded id string. `Id<"projects">` is assignable to `string` but distinct across tables. */
 export type Id<TableName extends string> = string & { readonly __idBrand: TableName };
@@ -99,6 +99,40 @@ export class TableDefinition<
     return new TableDefinition(
       this.fields,
       [...this.indexes, { name, fields: [...fields] }],
+      this.ownerFieldName,
+      this.collaboratorsFieldName,
+    );
+  }
+
+  /** Mark the most-recently appended btree index as `UNIQUE`. The server
+   * compiles this to `CREATE UNIQUE INDEX` over the index's declared `fields`
+   * (no trailing tiebreaker — uniqueness is on `fields` only). Btree-only: do
+   * not chain after `searchIndex`/`vectorIndex` (the server rejects the combo). */
+  unique(): TableDefinition<Fields, Indexes> {
+    return this.amendLastIndex((last) => ({ ...last, unique: true }));
+  }
+
+  /** Attach a partial-index predicate to the most-recently appended btree index.
+   * The server bakes the predicate into `CREATE INDEX … WHERE` (literal SQL — no
+   * bind params at DDL time). Same `FilterExpr` shape as the query-time
+   * `.filter()` terminal. Btree-only. */
+  where(predicate: FilterExpr): TableDefinition<Fields, Indexes> {
+    return this.amendLastIndex((last) => ({ ...last, where: predicate }));
+  }
+
+  /** Returns a new `TableDefinition` with the last-appended index replaced by
+   * `amend(last)`. Throws if no index has been declared yet. The index object is
+   * copied rather than mutated, so earlier `TableDefinition` instances stay
+   * intact (matching the immutable style of `index`/`searchIndex`/`vectorIndex`). */
+  private amendLastIndex(amend: (last: IndexJson) => IndexJson): TableDefinition<Fields, Indexes> {
+    if (this.indexes.length === 0) {
+      throw new Error("unique()/where() require a preceding index() call");
+    }
+    const indexes = [...this.indexes];
+    indexes[indexes.length - 1] = amend(indexes[indexes.length - 1]);
+    return new TableDefinition(
+      this.fields,
+      indexes,
       this.ownerFieldName,
       this.collaboratorsFieldName,
     );

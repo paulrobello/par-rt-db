@@ -1456,3 +1456,151 @@ describe("InMemoryRtDbClient — migrate", () => {
     expect(docs[0]).not.toHaveProperty("title");
   });
 });
+
+describe("InMemoryRtDbClient — unique index enforcement", () => {
+  const uniqueSchema = defineSchema({
+    users: defineTable({
+      email: t.string(),
+      verified: t.boolean(),
+    })
+      .index("by_email", ["email"])
+      .unique(),
+  });
+  const uniqueApi = createApi(uniqueSchema);
+
+  function uniqueClient(): InMemoryRtDbClient {
+    let ms = 1_700_000_000_000;
+    const c = new InMemoryRtDbClient({ now: () => ms++, random: () => 0 });
+    c.pushSchema(uniqueSchema);
+    return c;
+  }
+
+  it("rejects a colliding insert with CONFLICT and rolls the txn back", async () => {
+    const c = uniqueClient();
+    await c.mutate(mutation().insert("users", { email: "a@x", verified: true }).build());
+    await expect(
+      c.mutate(mutation().insert("users", { email: "a@x", verified: false }).build()),
+    ).rejects.toMatchObject({
+      name: "RtDbError",
+      code: "CONFLICT",
+      message: /unique index 'by_email' violated/,
+    });
+    // Rollback: the second (colliding) insert never became durable.
+    const docs = await c.query(uniqueApi.users.query().collect());
+    expect(docs).toHaveLength(1);
+  });
+
+  it("allows non-colliding inserts under a unique index", async () => {
+    const c = uniqueClient();
+    await c.mutate(mutation().insert("users", { email: "a@x", verified: true }).build());
+    await c.mutate(mutation().insert("users", { email: "b@x", verified: true }).build());
+    const docs = await c.query(uniqueApi.users.query().collect());
+    expect(docs.map((d) => (d as { email: string }).email).sort()).toEqual(["a@x", "b@x"]);
+  });
+
+  it("rejects a collision caused by a patch onto an indexed field", async () => {
+    const c = uniqueClient();
+    const [a] = await c.mutate(
+      mutation().insert("users", { email: "a@x", verified: true }).build(),
+    );
+    await c.mutate(mutation().insert("users", { email: "b@x", verified: true }).build());
+    const aId = (a as { id: string }).id;
+    await expect(
+      c.mutate(mutation().patch("users", aId, { email: "b@x" }).build()),
+    ).rejects.toMatchObject({ name: "RtDbError", code: "CONFLICT" });
+  });
+
+  it("rejects a collision caused by a replace", async () => {
+    const c = uniqueClient();
+    const [a] = await c.mutate(
+      mutation().insert("users", { email: "a@x", verified: true }).build(),
+    );
+    await c.mutate(mutation().insert("users", { email: "b@x", verified: true }).build());
+    const aId = (a as { id: string }).id;
+    await expect(
+      c.mutate(mutation().replace("users", aId, { email: "b@x", verified: false }).build()),
+    ).rejects.toMatchObject({ name: "RtDbError", code: "CONFLICT" });
+  });
+
+  it("allows a row to patch itself to the same indexed value (self is excluded)", async () => {
+    const c = uniqueClient();
+    const [a] = await c.mutate(
+      mutation().insert("users", { email: "a@x", verified: true }).build(),
+    );
+    const aId = (a as { id: string }).id;
+    await expect(
+      c.mutate(mutation().patch("users", aId, { verified: false }).build()),
+    ).resolves.toBeTruthy();
+  });
+
+  it("rolls back the whole txn when a later insert collides (atomicity)", async () => {
+    const c = uniqueClient();
+    await c.mutate(mutation().insert("users", { email: "a@x", verified: true }).build());
+    await expect(
+      c.mutate(
+        mutation()
+          .insert("users", { email: "b@x", verified: true })
+          .insert("users", { email: "a@x", verified: false }) // collides → aborts
+          .build(),
+      ),
+    ).rejects.toMatchObject({ name: "RtDbError", code: "CONFLICT" });
+    const docs = await c.query(uniqueApi.users.query().collect());
+    expect(docs).toHaveLength(1);
+  });
+});
+
+describe("InMemoryRtDbClient — partial unique index (where predicate)", () => {
+  const partialSchema = defineSchema({
+    users: defineTable({
+      email: t.string(),
+      verified: t.boolean(),
+    })
+      .index("by_email_verified", ["email"])
+      .unique()
+      .where({ op: "eq", field: "verified", value: true }),
+  });
+  const partialApi = createApi(partialSchema);
+
+  function partialClient(): InMemoryRtDbClient {
+    let ms = 1_700_000_000_000;
+    const c = new InMemoryRtDbClient({ now: () => ms++, random: () => 0 });
+    c.pushSchema(partialSchema);
+    return c;
+  }
+
+  it("allows duplicate emails among predicate-excluded (unverified) rows", async () => {
+    const c = partialClient();
+    await c.mutate(mutation().insert("users", { email: "a@x", verified: false }).build());
+    await c.mutate(mutation().insert("users", { email: "a@x", verified: false }).build());
+    const docs = await c.query(partialApi.users.query().collect());
+    expect(docs).toHaveLength(2);
+  });
+
+  it("rejects a duplicate among predicate-matching (verified) rows", async () => {
+    const c = partialClient();
+    await c.mutate(mutation().insert("users", { email: "a@x", verified: true }).build());
+    await expect(
+      c.mutate(mutation().insert("users", { email: "a@x", verified: true }).build()),
+    ).rejects.toMatchObject({ name: "RtDbError", code: "CONFLICT" });
+  });
+
+  it("allows a verified row to share an email with an unverified row", async () => {
+    const c = partialClient();
+    await c.mutate(mutation().insert("users", { email: "a@x", verified: false }).build());
+    await c.mutate(mutation().insert("users", { email: "a@x", verified: true }).build());
+    const docs = await c.query(partialApi.users.query().collect());
+    expect(docs).toHaveLength(2);
+  });
+
+  it("rejects when a patch flips an unverified duplicate into the predicate", async () => {
+    const c = partialClient();
+    await c.mutate(mutation().insert("users", { email: "a@x", verified: true }).build());
+    const [b] = await c.mutate(
+      mutation().insert("users", { email: "a@x", verified: false }).build(),
+    );
+    const bId = (b as { id: string }).id;
+    await expect(
+      c.mutate(mutation().patch("users", bId, { verified: true }).build()),
+    ).rejects.toMatchObject({ name: "RtDbError", code: "CONFLICT" });
+  });
+});

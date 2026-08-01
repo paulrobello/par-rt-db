@@ -218,3 +218,59 @@ describe("collaboratorsField builder", () => {
     expect(s.toJSON().tables.notes).not.toHaveProperty("collaboratorsField");
   });
 });
+
+describe("unique / where index builder", () => {
+  it(".unique() emits unique:true on the wire alongside the btree fields", () => {
+    const s = defineSchema({
+      users: defineTable({ email: t.string() }).index("by_email", ["email"]).unique(),
+    });
+    expect(s.toJSON().tables.users.indexes).toEqual([
+      { name: "by_email", fields: ["email"], unique: true },
+    ]);
+  });
+
+  it(".where(pred) emits the partial-index predicate on the wire", () => {
+    const pred = { op: "eq", field: "verified", value: true } as const;
+    const s = defineSchema({
+      users: defineTable({ email: t.string(), verified: t.boolean() })
+        .index("by_email", ["email"])
+        .where(pred),
+    });
+    expect(s.toJSON().tables.users.indexes).toEqual([
+      { name: "by_email", fields: ["email"], where: pred },
+    ]);
+  });
+
+  it(".unique().where(pred) emits a partial unique index", () => {
+    const pred = { op: "eq", field: "verified", value: true } as const;
+    const s = defineSchema({
+      users: defineTable({ email: t.string(), verified: t.boolean() })
+        .index("by_email_verified", ["email"])
+        .unique()
+        .where(pred),
+    });
+    expect(s.toJSON().tables.users.indexes).toEqual([
+      { name: "by_email_verified", fields: ["email"], unique: true, where: pred },
+    ]);
+  });
+
+  it("omits unique/where on the wire for a plain btree index", () => {
+    const s = defineSchema({
+      users: defineTable({ email: t.string() }).index("by_email", ["email"]),
+    });
+    expect(s.toJSON().tables.users.indexes).toEqual([{ name: "by_email", fields: ["email"] }]);
+  });
+
+  it(".unique() composes with a sibling plain index without bleeding into it", () => {
+    const s = defineSchema({
+      users: defineTable({ email: t.string(), name: t.string() })
+        .index("by_email", ["email"])
+        .unique()
+        .index("by_name", ["name"]),
+    });
+    expect(s.toJSON().tables.users.indexes).toEqual([
+      { name: "by_email", fields: ["email"], unique: true },
+      { name: "by_name", fields: ["name"] },
+    ]);
+  });
+});

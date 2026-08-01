@@ -4,6 +4,7 @@ export type RtDbErrorCode =
   | "NOT_FOUND"
   | "SCHEMA_VIOLATION"
   | "PRECONDITION_FAILED"
+  | "CONFLICT"
   | "BAD_REQUEST"
   | "INTERNAL";
 
@@ -13,6 +14,7 @@ const CODES: ReadonlySet<string> = new Set<RtDbErrorCode>([
   "NOT_FOUND",
   "SCHEMA_VIOLATION",
   "PRECONDITION_FAILED",
+  "CONFLICT",
   "BAD_REQUEST",
   "INTERNAL",
 ]);
