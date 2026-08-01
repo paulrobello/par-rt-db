@@ -173,6 +173,99 @@ def test_vector_index_without_filter_fields_omits_filterFields():
     assert "filterFields" not in vec
 
 
+def test_unique_index_builder_emits_unique_true():
+    """``.index(...).unique()`` marks the most recently declared index as
+    unique; on the wire ``unique: true`` is emitted and ``where`` stays omitted
+    (mirrors server ``schema.rs`` and the TS/Rust clients). A plain btree index
+    declared alongside stays unaffected."""
+    schema = (
+        Schema.builder()
+        .table(
+            "users",
+            lambda tb: (
+                tb.field("email", t.string())
+                .field("org", t.string())
+                .index("by_email", ["email"])
+                .unique()
+                .index("by_org", ["org"])
+            ),
+        )
+        .build()
+    )
+    wire = json.loads(schema.model_dump_json(by_alias=True))
+    indexes = wire["tables"]["users"]["indexes"]
+    by_email = next(i for i in indexes if i["name"] == "by_email")
+    by_org = next(i for i in indexes if i["name"] == "by_org")
+    assert by_email == {"name": "by_email", "fields": ["email"], "unique": True}
+    assert "where" not in by_email
+    # The plain btree index is untouched.
+    assert by_org == {"name": "by_org", "fields": ["org"]}
+    assert "unique" not in by_org
+    assert "where" not in by_org
+
+
+def test_plain_index_omits_unique_and_where_keys():
+    """A plain btree index must serialize as ``{name, fields}`` only — ``unique``
+    and ``where`` are omitted on the wire when absent (mirrors the server's
+    ``skip_serializing_if`` rules)."""
+    schema = (
+        Schema.builder()
+        .table("t", lambda tb: tb.field("name", t.string()).index("by_name", ["name"]))
+        .build()
+    )
+    wire = json.loads(schema.model_dump_json(by_alias=True))
+    idx = wire["tables"]["t"]["indexes"][0]
+    assert idx == {"name": "by_name", "fields": ["name"]}
+    assert "unique" not in idx
+    assert "where" not in idx
+
+
+def test_indexdef_with_unique_false_omits_unique_key():
+    """The server uses ``skip_serializing_if = "is_false"`` for ``IndexDef.unique``
+    (a ``bool``), so an ``IndexDef`` carrying ``unique=False`` must omit
+    ``unique`` from the wire — not emit ``"unique": false``. Hand-construct the
+    model to bypass the builder (which only ever sets ``unique=True``) and prove
+    the falsy-drop branch directly."""
+    idx = IndexDef.model_validate({"name": "by_name", "fields": ["name"], "unique": False})
+    wire = json.loads(idx.model_dump_json(by_alias=True))
+    assert wire == {"name": "by_name", "fields": ["name"]}
+    assert "unique" not in wire
+    assert "where" not in wire
+
+
+def test_partial_unique_index_builder_emits_where_and_unique():
+    """``.index(...).unique().where(pred)`` emits both ``unique: true`` and the
+    ``where`` predicate on the wire; ``where`` reuses the ``FilterExpr`` shape the
+    query-time ``.filter()`` terminal uses."""
+    from pydantic import TypeAdapter
+
+    from par_rt_db.wire import FilterExpr
+
+    pred = TypeAdapter(FilterExpr).validate_python(
+        {"op": "eq", "field": "status", "value": "active"}
+    )
+    schema = (
+        Schema.builder()
+        .table(
+            "users",
+            lambda tb: (
+                tb.field("email", t.string())
+                .field("status", t.string())
+                .index("by_email", ["email"])
+                .unique()
+                .where(pred)
+            ),
+        )
+        .build()
+    )
+    wire = json.loads(schema.model_dump_json(by_alias=True))
+    idx = wire["tables"]["users"]["indexes"][0]
+    assert idx["name"] == "by_email"
+    assert idx["fields"] == ["email"]
+    assert idx["unique"] is True
+    assert idx["where"] == {"op": "eq", "field": "status", "value": "active"}
+
+
 def test_field_type_rejects_unknown():
     with pytest.raises(ValidationError):
         t._validate({"type": "bogus"})

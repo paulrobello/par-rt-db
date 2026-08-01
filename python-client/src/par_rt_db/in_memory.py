@@ -1128,7 +1128,7 @@ class InMemoryRtDbClient:
                 if rows:
                     row = rows[0]
                     merged = apply_patch(table_def, row.doc, patch_fields)
-                    self._do_update(table, row.id, merged)
+                    self._do_update(table_def, table, row.id, merged)
                     return _upsert_result(row.id, False), table
                 new_id = self._do_insert(table, table_def, insert_doc)
                 return _upsert_result(new_id, True), table
@@ -1138,6 +1138,7 @@ class InMemoryRtDbClient:
     def _do_insert(self, table_name: str, table_def: TableDef, doc: dict[str, Any]) -> str:
         validate_doc(table_def, doc)
         stored = _strip_unset_optionals(table_def, doc)
+        self._check_unique_indexes(table_def, table_name, stored, None)
         new_id = self._new_id()
         self._docs[(table_name, new_id)] = StoredRow(
             id=new_id, doc=stored, version=1, created_at=self._now()
@@ -1156,7 +1157,7 @@ class InMemoryRtDbClient:
         if row is None:
             raise RtDbError(ErrorCode.NOT_FOUND, f"document '{sid}' not found")
         merged = apply_patch(table_def, row.doc, fields)
-        self._do_update(table_name, sid, merged)
+        self._do_update(table_def, table_name, sid, merged)
 
     def _do_replace(
         self,
@@ -1170,7 +1171,9 @@ class InMemoryRtDbClient:
         if row is None:
             raise RtDbError(ErrorCode.NOT_FOUND, f"document '{sid}' not found")
         validate_doc(table_def, doc)
-        row.doc = _strip_unset_optionals(table_def, doc)
+        stored = _strip_unset_optionals(table_def, doc)
+        self._check_unique_indexes(table_def, table_name, stored, sid)
+        row.doc = stored
         row.version += 1
 
     def _do_delete(self, table_name: str, sid: str) -> None:
@@ -1188,11 +1191,65 @@ class InMemoryRtDbClient:
                 f"version mismatch: expected {expected}, actual {row.version}",
             )
 
-    def _do_update(self, table_name: str, sid: str, merged: dict[str, Any]) -> None:
+    def _do_update(
+        self,
+        table_def: TableDef,
+        table_name: str,
+        sid: str,
+        merged: dict[str, Any],
+    ) -> None:
         row = self._docs.get((table_name, sid))
         if row is not None:
+            self._check_unique_indexes(table_def, table_name, merged, sid)
             row.doc = merged
             row.version += 1
+
+    def _check_unique_indexes(
+        self,
+        table_def: TableDef,
+        table_name: str,
+        candidate_doc: dict[str, Any],
+        exclude_id: str | None,
+    ) -> None:
+        """Enforce ``unique`` indexes on a candidate write (mirrors server
+        ``CREATE UNIQUE INDEX`` and the TS/Rust ``checkUniqueIndexes``): for each
+        unique index on ``table_name``, no OTHER row (excluding ``exclude_id``
+        when given) that satisfies the index's ``where`` predicate may share the
+        candidate's key values on the index's declared ``fields``. NULL/absent
+        key fields disable the constraint for that row (Postgres ``UNIQUE`` treats
+        NULLs as distinct). Raises ``CONFLICT`` on collision;
+        :meth:`_execute_transaction` then rolls back the whole txn via the same
+        snapshot/restore path as the ``PRECONDITION_FAILED`` checks. Uniqueness is
+        on ``fields`` only — never ``id`` or ``created_at`` (a trailing
+        tiebreaker column would defeat uniqueness, as it does on the server)."""
+        for index in table_def.indexes:
+            if not index.unique:
+                continue
+            pred = index.where
+            # A partial unique index constrains only rows matching its predicate.
+            if pred is not None and not _eval_filter_expr(pred, candidate_doc):
+                continue
+            # Build the collision key from declared `fields` only. NULL/absent key
+            # fields disable the constraint for this row (Postgres UNIQUE treats
+            # NULLs as distinct) — skip the index for this candidate.
+            candidate_key = _collect_index_key(index.fields, candidate_doc)
+            if candidate_key is None:
+                continue
+            for (t, _row_id), row in self._docs.items():
+                if t != table_name:
+                    continue
+                if exclude_id is not None and row.id == exclude_id:
+                    continue
+                if pred is not None and not _eval_filter_expr(pred, row.doc):
+                    continue
+                row_key = _collect_index_key(index.fields, row.doc)
+                if row_key is None:
+                    continue
+                if row_key == candidate_key:
+                    raise RtDbError(
+                        ErrorCode.CONFLICT,
+                        f"unique index '{index.name}' violated",
+                    )
 
     def _eq_lookup(
         self,
@@ -1757,6 +1814,16 @@ def _detect_destructive_changes(old: SchemaDef, new: SchemaDef) -> None:
                     ErrorCode.BAD_REQUEST,
                     f"changed vector spec of index '{old_index.name}'",
                 )
+            if bool(new_index.unique) != bool(old_index.unique):
+                raise RtDbError(
+                    ErrorCode.BAD_REQUEST,
+                    f"changed uniqueness of index '{old_index.name}'",
+                )
+            if _where_signature(new_index.where) != _where_signature(old_index.where):
+                raise RtDbError(
+                    ErrorCode.BAD_REQUEST,
+                    f"changed partial predicate of index '{old_index.name}'",
+                )
 
 
 def _field_type_signature(ty: Any) -> Any:
@@ -1805,6 +1872,15 @@ def _vector_signature(spec: Any) -> Any:
     if spec is None:
         return None
     return spec.model_dump(mode="json")
+
+
+def _where_signature(pred: Any) -> Any:
+    """Structural signature of an ``IndexDef.where`` predicate (a
+    ``FilterExpr``) for destructive-change detection — the live server compares
+    the parsed ``FilterExpr`` tree directly."""
+    if pred is None:
+        return None
+    return pred.model_dump(mode="json")
 
 
 @dataclass
@@ -1968,6 +2044,21 @@ def _require_index(table_def: TableDef, name: str) -> IndexDef:
         if index.name == name:
             return index
     raise RtDbError(ErrorCode.BAD_REQUEST, f"index '{name}' not found")
+
+
+def _collect_index_key(fields: list[str], doc: dict[str, Any]) -> tuple[Any, ...] | None:
+    """Build the collision key for a unique-index lookup over ``fields`` from a
+    stored doc. Returns ``None`` if any key field is null/absent — Postgres
+    ``UNIQUE`` treats NULLs as distinct, so such a row is exempt from the
+    constraint (mirrors server ``schema.rs`` and the TS/Rust harnesses). The key
+    is the declared ``fields`` only — never ``id`` or ``created_at``."""
+    key: list[Any] = []
+    for f in fields:
+        v = doc.get(f)
+        if v is None:
+            return None
+        key.append(v)
+    return tuple(key)
 
 
 def _base36(n: int) -> str:

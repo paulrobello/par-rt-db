@@ -30,7 +30,7 @@ from typing import Annotated, Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_serializer
 from pydantic_core.core_schema import SerializerFunctionWrapHandler
 
-from .wire import to_camel
+from .wire import FilterExpr, to_camel
 
 
 class _S(BaseModel):
@@ -159,13 +159,16 @@ class VectorIndexSpec(_S):
 
 class IndexDef(_S):
     """Index declaration: btree, full-text search (``search=True``), or vector
-    (``vector=...``). ``search``/``vector`` are omitted on the wire when absent,
-    so a plain btree index serializes as ``{"name", "fields"}`` only."""
+    (``vector=...``). ``search``/``vector``/``unique``/``where`` are omitted on
+    the wire when absent, so a plain btree index serializes as
+    ``{"name", "fields"}`` only."""
 
     name: str
     fields: list[str]
     search: bool | None = None
     vector: VectorIndexSpec | None = None
+    unique: bool | None = None
+    where: FilterExpr | None = None
 
     @model_serializer(mode="wrap")
     def _drop_absent_flags(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
@@ -176,6 +179,12 @@ class IndexDef(_S):
             out.pop("search", None)
         if out.get("vector") is None:
             out.pop("vector", None)
+        # Same falsy-drop for `unique: bool`; `where` is Option<FilterExpr> so it
+        # drops only when None (a present predicate always serializes).
+        if not out.get("unique"):
+            out.pop("unique", None)
+        if out.get("where") is None:
+            out.pop("where", None)
         return out
 
 
@@ -228,6 +237,25 @@ class TableBuilder:
 
     def index(self, name: str, fields: list[str]) -> TableBuilder:
         self._indexes.append({"name": name, "fields": fields})
+        return self
+
+    def unique(self) -> TableBuilder:
+        """Mark the most recently declared index as unique
+        (``.index(...).unique()``), mirroring the TS/Rust chainable. The server
+        emits ``CREATE UNIQUE INDEX`` over the index's declared ``fields`` (never
+        ``id``/``created_at``). No-op if no index has been declared yet."""
+        if self._indexes:
+            self._indexes[-1]["unique"] = True
+        return self
+
+    def where(self, predicate: FilterExpr) -> TableBuilder:
+        """Attach a partial-index predicate to the most recently declared index
+        (``.index(...).where(pred)``), mirroring the TS client. Serialized as the
+        wire key ``where`` — byte-identical to the server/Rust/TS clients. The
+        predicate reuses the query-time ``FilterExpr`` type (compiled to literal
+        SQL at DDL time on the server). No-op if no index has been declared yet."""
+        if self._indexes:
+            self._indexes[-1]["where"] = predicate
         return self
 
     def search_index(self, name: str, fields: list[str]) -> TableBuilder:

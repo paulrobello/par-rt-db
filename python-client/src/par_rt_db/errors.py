@@ -9,12 +9,13 @@ from typing import Any
 
 
 class ErrorCode(StrEnum):
-    """The seven wire error codes (SCREAMING_SNAKE_CASE), each mapped to an HTTP status."""
+    """Wire error codes (SCREAMING_SNAKE_CASE), each mapped to an HTTP status."""
 
     UNAUTHORIZED = "UNAUTHORIZED"
     FORBIDDEN = "FORBIDDEN"
     NOT_FOUND = "NOT_FOUND"
     PRECONDITION_FAILED = "PRECONDITION_FAILED"
+    CONFLICT = "CONFLICT"
     SCHEMA_VIOLATION = "SCHEMA_VIOLATION"
     BAD_REQUEST = "BAD_REQUEST"
     INTERNAL = "INTERNAL"
@@ -26,6 +27,7 @@ _STATUS: dict[ErrorCode, int] = {
     ErrorCode.FORBIDDEN: 403,
     ErrorCode.NOT_FOUND: 404,
     ErrorCode.PRECONDITION_FAILED: 409,
+    ErrorCode.CONFLICT: 409,
     ErrorCode.SCHEMA_VIOLATION: 422,
     ErrorCode.INTERNAL: 500,
 }

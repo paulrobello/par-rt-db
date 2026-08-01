@@ -17,6 +17,16 @@ def test_envelope_unknown_code_falls_back_to_internal():
     assert err.status_code == 500
 
 
+def test_conflict_code_is_string_CONFLICT_and_maps_to_409():
+    """``CONFLICT`` is the wire string ``"CONFLICT"`` (byte-for-byte with the
+    server/TS/Rust clients) and maps to HTTP 409 — same status as
+    ``PRECONDITION_FAILED`` but a distinct code."""
+    assert ErrorCode.CONFLICT.value == "CONFLICT"
+    err = RtDbError.from_envelope({"code": "CONFLICT", "message": "unique index 'i' violated"})
+    assert err.code is ErrorCode.CONFLICT
+    assert err.status_code == 409
+
+
 def test_from_http_parses_body():
     err = RtDbError.from_http(422, b'{"code":"SCHEMA_VIOLATION","message":"bad"}')
     assert err.code is ErrorCode.SCHEMA_VIOLATION

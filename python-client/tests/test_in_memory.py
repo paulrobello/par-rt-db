@@ -235,6 +235,225 @@ def test_insert_rejects_missing_required_field() -> None:
 
 
 # ---------------------------------------------------------------------------
+# unique-index enforcement (CONFLICT) — mirrors server CREATE UNIQUE INDEX
+# ---------------------------------------------------------------------------
+
+
+def _unique_schema() -> Any:
+    """A ``users`` table with a unique btree index on ``email``."""
+    return (
+        Schema.builder()
+        .table(
+            "users",
+            lambda tb: (
+                tb.field("email", t.string())
+                .field("status", t.string())
+                .index("by_email", ["email"])
+                .unique()
+            ),
+        )
+        .build()
+    )
+
+
+def _partial_unique_schema() -> Any:
+    """A ``users`` table with a partial unique index on ``email`` whose predicate
+    is ``status == "active"`` — only active rows are constrained."""
+    from pydantic import TypeAdapter
+
+    from par_rt_db.wire import FilterExpr
+
+    pred = TypeAdapter(FilterExpr).validate_python(
+        {"op": "eq", "field": "status", "value": "active"}
+    )
+    return (
+        Schema.builder()
+        .table(
+            "users",
+            lambda tb: (
+                tb.field("email", t.string())
+                .field("status", t.string())
+                .index("by_email", ["email"])
+                .unique()
+                .where(pred)
+            ),
+        )
+        .build()
+    )
+
+
+def _unique_client(schema: Any) -> InMemoryRtDbClient:
+    counter = [1_700_000_000_000]
+
+    def now() -> int:
+        v = counter[0]
+        counter[0] += 1
+        return v
+
+    c = InMemoryRtDbClient(InMemoryRtDbClientOptions(now=now, random=lambda: 0.0))
+    c.push_schema(schema)
+    return c
+
+
+def test_unique_index_insert_collision_raises_conflict() -> None:
+    c = _unique_client(_unique_schema())
+    c.mutate(Mutation.builder().insert("users", {"email": "a@x", "status": "on"}).build())
+    with pytest.raises(RtDbError) as ei:
+        c.mutate(Mutation.builder().insert("users", {"email": "a@x", "status": "off"}).build())
+    assert ei.value.code is ErrorCode.CONFLICT
+    assert "unique index 'by_email'" in ei.value.message
+    # The rolled-back insert left only the first row.
+    docs = c.collect_all("users")
+    assert len(docs) == 1
+    assert docs[0]["status"] == "on"
+
+
+def test_unique_index_insert_collision_rolls_back_whole_txn() -> None:
+    c = _unique_client(_unique_schema())
+    c.mutate(Mutation.builder().insert("users", {"email": "a@x", "status": "on"}).build())
+    # A second step in the same txn must also roll back when the later step
+    # collides — atomicity mirrors the PRECONDITION_FAILED rollback path.
+    with pytest.raises(RtDbError):
+        c.mutate(
+            Mutation.builder()
+            .insert("users", {"email": "b@x", "status": "on"})
+            .insert("users", {"email": "a@x", "status": "off"})
+            .build()
+        )
+    docs = c.collect_all("users")
+    assert {d["email"] for d in docs} == {"a@x"}  # b@x rolled back too
+
+
+def test_unique_index_patch_collision_raises_conflict() -> None:
+    c = _unique_client(_unique_schema())
+    [r1] = c.mutate(Mutation.builder().insert("users", {"email": "a@x", "status": "on"}).build())
+    [r2] = c.mutate(Mutation.builder().insert("users", {"email": "b@x", "status": "on"}).build())
+    assert r1 is not None and r2 is not None
+    with pytest.raises(RtDbError) as ei:
+        c.mutate(Mutation.builder().patch("users", r2.id, {"email": "a@x"}).build())
+    assert ei.value.code is ErrorCode.CONFLICT
+    # r2 kept its original email (write rolled back).
+    patched = c.get("users", r2.id)
+    assert patched is not None and patched["email"] == "b@x"
+
+
+def test_unique_index_replace_collision_raises_conflict() -> None:
+    c = _unique_client(_unique_schema())
+    [r1] = c.mutate(Mutation.builder().insert("users", {"email": "a@x", "status": "on"}).build())
+    [r2] = c.mutate(Mutation.builder().insert("users", {"email": "b@x", "status": "on"}).build())
+    assert r1 is not None and r2 is not None
+    with pytest.raises(RtDbError) as ei:
+        c.mutate(
+            Mutation.builder().replace("users", r2.id, {"email": "a@x", "status": "off"}).build()
+        )
+    assert ei.value.code is ErrorCode.CONFLICT
+    replaced = c.get("users", r2.id)
+    assert replaced is not None and replaced["email"] == "b@x"
+
+
+def test_unique_index_upsert_insert_collision_raises_conflict() -> None:
+    """Upsert's INSERT path (eq lookup misses) still runs the unique check: an
+    insert doc whose ``email`` duplicates an existing row raises ``CONFLICT``.
+    The lookup index (``by_status``) is distinct from the unique index
+    (``by_email``) — an upsert on a unique index can never collide on its own
+    insert path (its eq lookup is authoritative for that key)."""
+    from par_rt_db.schema import Schema, t
+
+    schema = (
+        Schema.builder()
+        .table(
+            "users",
+            lambda tb: (
+                tb.field("email", t.string())
+                .field("status", t.string())
+                .index("by_email", ["email"])
+                .unique()
+                .index("by_status", ["status"])
+            ),
+        )
+        .build()
+    )
+    c = _unique_client(schema)
+    c.mutate(Mutation.builder().insert("users", {"email": "a@x", "status": "on"}).build())
+    with pytest.raises(RtDbError) as ei:
+        c.mutate(
+            Mutation.builder()
+            .upsert(
+                "users",
+                "by_status",
+                ["missing"],
+                insert={"email": "a@x", "status": "archived"},
+                patch={"status": "archived"},
+            )
+            .build()
+        )
+    assert ei.value.code is ErrorCode.CONFLICT
+    # The rolled-back insert left only the original row.
+    docs = c.collect_all("users")
+    assert len(docs) == 1
+    assert docs[0]["status"] == "on"
+
+
+def test_unique_index_null_key_is_distinct() -> None:
+    """A null/absent key field disables the constraint for that row (Postgres
+    ``UNIQUE`` treats NULLs as distinct) — two rows with a missing ``email``
+    may coexist."""
+    from par_rt_db.schema import Schema, t
+
+    schema = (
+        Schema.builder()
+        .table(
+            "users",
+            lambda tb: (
+                tb.field("email", t.optional(t.string()))
+                .field("status", t.string())
+                .index("by_email", ["email"])
+                .unique()
+            ),
+        )
+        .build()
+    )
+    c = _unique_client(schema)
+    c.mutate(Mutation.builder().insert("users", {"email": None, "status": "on"}).build())
+    c.mutate(Mutation.builder().insert("users", {"email": None, "status": "off"}).build())
+    docs = c.collect_all("users")
+    assert len(docs) == 2  # both null-key rows coexist
+
+
+def test_partial_unique_index_allows_excluded_duplicate() -> None:
+    """A partial unique index whose predicate is ``status == "active"`` does NOT
+    constrain rows with a different status — two inactive rows may share an
+    email."""
+    c = _unique_client(_partial_unique_schema())
+    c.mutate(Mutation.builder().insert("users", {"email": "a@x", "status": "inactive"}).build())
+    c.mutate(Mutation.builder().insert("users", {"email": "a@x", "status": "inactive"}).build())
+    docs = c.collect_all("users")
+    assert len(docs) == 2  # predicate-excluded duplicates are allowed
+
+
+def test_partial_unique_index_matching_duplicate_raises_conflict() -> None:
+    """The same partial index DOES constrain active rows — a second active row
+    sharing the email raises ``CONFLICT``."""
+    c = _unique_client(_partial_unique_schema())
+    c.mutate(Mutation.builder().insert("users", {"email": "a@x", "status": "active"}).build())
+    with pytest.raises(RtDbError) as ei:
+        c.mutate(Mutation.builder().insert("users", {"email": "a@x", "status": "active"}).build())
+    assert ei.value.code is ErrorCode.CONFLICT
+    assert "unique index 'by_email'" in ei.value.message
+
+
+def test_partial_unique_index_candidate_excluded_skips_check() -> None:
+    """When the CANDIDATE row does not match the predicate, the constraint is
+    skipped for it — an inactive candidate may be inserted even if an active row
+    owns the same email (the candidate is outside the constrained set)."""
+    c = _unique_client(_partial_unique_schema())
+    c.mutate(Mutation.builder().insert("users", {"email": "a@x", "status": "active"}).build())
+    c.mutate(Mutation.builder().insert("users", {"email": "a@x", "status": "archived"}).build())
+    docs = c.collect_all("users")
+    assert {d["status"] for d in docs} == {"active", "archived"}
+
+
+# ---------------------------------------------------------------------------
 # queries: index eq / range / order / take / count / unique
 # ---------------------------------------------------------------------------
 
