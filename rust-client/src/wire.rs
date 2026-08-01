@@ -374,7 +374,7 @@ pub struct AggregateGroup {
 /// Construct variants directly (`FilterExpr::Eq { field, value }`) — inherent
 /// constructors named `eq`/`gt`/`lt` are avoided because they shadow
 /// `PartialEq`/`PartialOrd` trait methods (`clippy::should_implement_trait`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "lowercase", deny_unknown_fields)]
 pub enum FilterExpr {
     Eq {

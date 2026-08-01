@@ -13,6 +13,9 @@ pub enum ErrorCode {
     PreconditionFailed,
     BadRequest,
     Internal,
+    /// Unique-index violation (mirrors server `error::ErrorCode::Conflict`,
+    /// HTTP 409). Serialized as `"CONFLICT"` by the container `rename_all`.
+    Conflict,
 }
 
 /// Raw `{code, message}` as it appears on the wire (HTTP body / WS error frame).
@@ -95,12 +98,27 @@ mod tests {
             ErrorCode::PreconditionFailed,
             ErrorCode::BadRequest,
             ErrorCode::Internal,
+            ErrorCode::Conflict,
         ];
         for c in all {
             let v = serde_json::to_value(c).unwrap();
             let back: ErrorCode = serde_json::from_value(v).unwrap();
             assert_eq!(c, back);
         }
+    }
+
+    #[test]
+    fn conflict_serializes_as_conflict() {
+        // Mirrors server `error::ErrorCode::Conflict` (HTTP 409): the container
+        // `rename_all = "SCREAMING_SNAKE_CASE"` maps the `Conflict` variant to
+        // the wire string `"CONFLICT"` — byte-for-byte with the server/TS/Python
+        // clients, so a unique-index violation round-trips through all four.
+        assert_eq!(
+            serde_json::to_value(ErrorCode::Conflict).unwrap(),
+            serde_json::json!("CONFLICT")
+        );
+        let back: ErrorCode = serde_json::from_value(serde_json::json!("CONFLICT")).unwrap();
+        assert_eq!(back, ErrorCode::Conflict);
     }
 
     #[test]
