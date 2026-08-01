@@ -158,9 +158,9 @@ export function MigratePage() {
                 )}
                 {result.report.directives.map((d, i) => (
                   // DirectiveReportJson carries no unique id — one report per
-                  // directive, in positional order — so the index is the stable
-                  // key for this immutable per-result list.
-                  // biome-ignore lint/suspicious/noArrayIndexKey: see above
+                  // directive, in positional order — so `op` plus the positional
+                  // index is the stable key for this immutable per-result list.
+                  // biome-ignore lint/suspicious/noArrayIndexKey: index is combined with `op`, not used alone
                   <DirectiveReportView key={`${d.op}-${i}`} d={d} />
                 ))}
               </>
