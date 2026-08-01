@@ -1676,17 +1676,29 @@ def _coerce_value(cast: Cast, v: Any) -> Any:
         # Rust's ``Value::Bool`` falling through to ``_ => None``).
         if isinstance(v, bool):
             return None
+        # i64 range: the server's ``i64::from_str`` / ``Number::as_i64`` reject
+        # outside [-(2**63), 2**63), but Python ints are arbitrary-precision, so
+        # bound explicitly to keep parity (else a huge int silently "coerces").
+        i64_min, i64_max = -(2**63), 2**63 - 1
         if isinstance(v, int):
+            if not i64_min <= v <= i64_max:
+                return None
             return str(v)
         if isinstance(v, float):
             if not v.is_integer():
                 return None
-            return str(int(v))
+            iv = int(v)
+            if not i64_min <= iv <= i64_max:
+                return None
+            return str(iv)
         if isinstance(v, str):
             try:
-                return str(int(v))
+                iv = int(v)
             except ValueError:
                 return None
+            if not i64_min <= iv <= i64_max:
+                return None
+            return str(iv)
         return None
     if cast == Cast.TO_BOOLEAN:
         if isinstance(v, str):

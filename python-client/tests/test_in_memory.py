@@ -982,6 +982,32 @@ def test_migrate_change_type_fails_without_default_when_not_coercible() -> None:
     assert c.collect_all("items")[0]["val"] == "abc"
 
 
+def test_coerce_value_to_int64_bounds_i64_range() -> None:
+    # ``_coerce_value`` mirrors ``server::migrate::coerce_value``, which rejects
+    # values outside i64 range (``i64::from_str`` / ``Number::as_i64``). Python
+    # ints are arbitrary-precision, so the bound must be enforced explicitly or a
+    # huge value silently "coerces" and the in-memory harness diverges from the
+    # wire/HTTP path (which uses the real server).
+    from par_rt_db import Cast
+    from par_rt_db.in_memory import _coerce_value
+
+    too_big = 2**63  # one past i64 max
+    too_small = -(2**63) - 1  # one below i64 min
+    # In-range int/float/str coerce to their decimal-string wire form ...
+    assert _coerce_value(Cast.TO_INT64, 0) == "0"
+    assert _coerce_value(Cast.TO_INT64, 2**63 - 1) == str(2**63 - 1)
+    assert _coerce_value(Cast.TO_INT64, -(2**63)) == str(-(2**63))
+    assert _coerce_value(Cast.TO_INT64, 42.0) == "42"
+    assert _coerce_value(Cast.TO_INT64, "42") == "42"
+    # ... out-of-range int / float / str all reject (parity with the server).
+    assert _coerce_value(Cast.TO_INT64, too_big) is None
+    assert _coerce_value(Cast.TO_INT64, too_small) is None
+    assert _coerce_value(Cast.TO_INT64, float(too_big)) is None
+    assert _coerce_value(Cast.TO_INT64, str(too_big)) is None
+    # Non-integer floats still reject (unchanged behavior).
+    assert _coerce_value(Cast.TO_INT64, 1.5) is None
+
+
 def test_migrate_drop_table_clears_rows_and_schema() -> None:
     from par_rt_db import Migration
 
