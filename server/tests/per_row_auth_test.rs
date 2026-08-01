@@ -32,6 +32,8 @@ fn owner_schema() -> SchemaDef {
         fields: vec!["userId".into()],
         search: false,
         vector: None,
+        unique: false,
+        r#where: None,
     }];
     let mut tables = BTreeMap::new();
     tables.insert(
@@ -447,6 +449,8 @@ async fn search_filters_to_own_rows() -> anyhow::Result<()> {
         fields: vec!["title".into(), "body".into()],
         search: true,
         vector: None,
+        unique: false,
+        r#where: None,
     }];
     let mut tables = BTreeMap::new();
     tables.insert(
@@ -526,6 +530,8 @@ async fn vector_search_filters_to_own_rows() -> anyhow::Result<()> {
             dimensions: 3,
             filter_fields: vec![],
         }),
+        unique: false,
+        r#where: None,
     }];
     let mut tables = BTreeMap::new();
     tables.insert(
@@ -621,6 +627,8 @@ async fn vector_search_composes_filter_fields_with_owner() -> anyhow::Result<()>
             dimensions: 3,
             filter_fields: vec!["category".into()],
         }),
+        unique: false,
+        r#where: None,
     }];
     let mut tables = BTreeMap::new();
     tables.insert(
@@ -1493,6 +1501,8 @@ fn collab_schema() -> SchemaDef {
         fields: vec!["userId".into()],
         search: false,
         vector: None,
+        unique: false,
+        r#where: None,
     }];
     let mut tables = BTreeMap::new();
     tables.insert(

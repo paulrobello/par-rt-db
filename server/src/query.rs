@@ -194,7 +194,7 @@ pub struct AggregateGroup {
 /// any other *declared* field uses jsonb extraction (`doc->>'field'`, cast for
 /// non-text value kinds). Field names are schema-validated identifiers, so they
 /// are safe to emit inside a quoted column name or a jsonb string literal.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "op", rename_all = "lowercase", deny_unknown_fields)]
 pub enum FilterExpr {
     Eq {

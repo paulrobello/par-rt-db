@@ -218,3 +218,61 @@ async fn document_round_trips_through_insert_patch_and_query() -> anyhow::Result
     assert_eq!(found["payload"], serde_json::json!({"changed": true}));
     Ok(())
 }
+
+// (k) unique + where (partial) index flags: additive declarations that
+// round-trip on the wire and are validated as btree-only.
+#[tokio::test]
+async fn unique_index_round_trips_and_omits_when_absent() {
+    // A plain unique index carries `unique` but not `where`; absent `where` is
+    // omitted so a non-unique, non-partial index still round-trips as {"name","fields"} only.
+    let json = serde_json::json!({
+        "tables": {
+            "t": {
+                "fields": { "email": { "type": "string" } },
+                "indexes": [{ "name": "by_email", "fields": ["email"], "unique": true }]
+            }
+        }
+    });
+    let schema: SchemaDef = serde_json::from_value(json.clone()).unwrap();
+    let idx = schema.tables["t"].indexes[0].clone();
+    assert!(idx.unique);
+    assert!(idx.r#where.is_none());
+    // Round-trip keeps `unique` and omits the absent `where`.
+    let re = serde_json::to_value(&schema).unwrap();
+    assert_eq!(re["tables"]["t"]["indexes"][0]["unique"], true);
+    assert!(re["tables"]["t"]["indexes"][0].get("where").is_none());
+}
+
+#[tokio::test]
+async fn partial_unique_index_round_trips() {
+    let json = serde_json::json!({
+        "tables": {
+            "t": {
+                "fields": { "slug": { "type": "string" }, "deleted": { "type": "boolean" } },
+                "indexes": [{
+                    "name": "by_slug", "fields": ["slug"], "unique": true,
+                    "where": { "op": "eq", "field": "deleted", "value": false }
+                }]
+            }
+        }
+    });
+    let schema: SchemaDef = serde_json::from_value(json).unwrap();
+    let idx = &schema.tables["t"].indexes[0];
+    assert!(idx.unique);
+    assert!(idx.r#where.is_some());
+}
+
+#[tokio::test]
+async fn unique_where_rejected_on_search_index() {
+    let json = serde_json::json!({
+        "tables": {
+            "t": {
+                "fields": { "body": { "type": "string" } },
+                "indexes": [{ "name": "body", "fields": ["body"], "search": true, "unique": true }]
+            }
+        }
+    });
+    let schema: SchemaDef = serde_json::from_value(json).unwrap();
+    let err = schema.validate().unwrap_err();
+    assert_eq!(err.code, ErrorCode::SchemaViolation);
+}

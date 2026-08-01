@@ -30,6 +30,8 @@ fn vector_schema(dim: u32, with_filter: bool) -> SchemaDef {
                 vec![]
             },
         }),
+        unique: false,
+        r#where: None,
     }];
     let mut tables = BTreeMap::new();
     tables.insert(

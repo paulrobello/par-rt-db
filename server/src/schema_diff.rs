@@ -248,6 +248,8 @@ mod tests {
             fields: fields.iter().map(|s| s.to_string()).collect(),
             search: false,
             vector: None,
+            unique: false,
+            r#where: None,
         }
     }
 

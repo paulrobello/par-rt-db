@@ -25,6 +25,8 @@ fn priority_schema(variants: &[&str]) -> SchemaDef {
         fields: vec!["priority".to_string()],
         search: false,
         vector: None,
+        unique: false,
+        r#where: None,
     }];
     let mut tables = BTreeMap::new();
     tables.insert(

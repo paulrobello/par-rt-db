@@ -1102,6 +1102,8 @@ mod tests {
                     fields: vec!["ownerId".into()],
                     search: false,
                     vector: None,
+                    unique: false,
+                    r#where: None,
                 }],
                 owner_field: Some("ownerId".into()),
                 collaborators_field: Some("collabs".into()),

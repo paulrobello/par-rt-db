@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, HashSet};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 
 use crate::error::RtDbError;
+use crate::query::FilterExpr;
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase", deny_unknown_fields)]
@@ -42,6 +43,17 @@ pub struct IndexDef {
     /// indexes, so existing schemas deserialize unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vector: Option<VectorIndexSpec>,
+    /// `true` compiles to `CREATE UNIQUE INDEX`. Legal only on a plain btree
+    /// index (rejected alongside `search`/`vector`). Omitted on the wire when
+    /// false, so existing schemas deserialize unchanged.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub unique: bool,
+    /// Optional partial-index predicate baked into `CREATE INDEX … WHERE`. Same
+    /// `FilterExpr` type as the query-time `filter()` terminal, but compiled to
+    /// literal SQL at DDL time (Postgres forbids bind params here). Omitted on
+    /// the wire when `None`. Wire key is `where` (Rust keyword ⇒ raw identifier).
+    #[serde(default, rename = "where", skip_serializing_if = "Option::is_none")]
+    pub r#where: Option<FilterExpr>,
 }
 
 /// Declaration of a vector (approximate nearest-neighbor) index. Carried
@@ -371,6 +383,24 @@ impl TableDef {
                     "index '{}' cannot be both search and vector",
                     index.name
                 )));
+            }
+            // `unique` and `where` are btree-only knobs: a unique partial index
+            // compiles to `CREATE UNIQUE INDEX … WHERE`, which is meaningless on
+            // a GIN tsvector (search) or HNSW vector index. Reject them here so
+            // a DDL-time failure never reaches `ddl.rs`.
+            if index.unique || index.r#where.is_some() {
+                if index.search {
+                    return Err(RtDbError::schema(format!(
+                        "index '{}' cannot combine unique/where with search",
+                        index.name
+                    )));
+                }
+                if index.vector.is_some() {
+                    return Err(RtDbError::schema(format!(
+                        "index '{}' cannot combine unique/where with a vector index",
+                        index.name
+                    )));
+                }
             }
             if let Some(vec_spec) = &index.vector {
                 if vec_spec.dimensions == 0 {
@@ -742,6 +772,8 @@ mod tests {
                 fields: vec!["name".to_string()],
                 search: false,
                 vector: None,
+                unique: false,
+                r#where: None,
             }],
             owner_field: None,
             collaborators_field: None,
@@ -762,6 +794,8 @@ mod tests {
                 fields: vec!["name".to_string()],
                 search: false,
                 vector: None,
+                unique: false,
+                r#where: None,
             }],
             owner_field: None,
             collaborators_field: None,
@@ -799,12 +833,16 @@ mod tests {
                     fields: vec!["name".to_string()],
                     search: false,
                     vector: None,
+                    unique: false,
+                    r#where: None,
                 },
                 IndexDef {
                     name: "By_X".to_string(),
                     fields: vec!["name".to_string()],
                     search: false,
                     vector: None,
+                    unique: false,
+                    r#where: None,
                 },
             ],
             owner_field: None,
@@ -857,6 +895,8 @@ mod tests {
                 fields: vec!["tags".to_string()],
                 search: false,
                 vector: None,
+                unique: false,
+                r#where: None,
             }],
             owner_field: None,
             collaborators_field: None,
@@ -876,6 +916,8 @@ mod tests {
                 fields: vec![],
                 search: false,
                 vector: None,
+                unique: false,
+                r#where: None,
             }],
             owner_field: None,
             collaborators_field: None,
@@ -895,6 +937,8 @@ mod tests {
                 fields: vec!["name".to_string(), "name".to_string()],
                 search: false,
                 vector: None,
+                unique: false,
+                r#where: None,
             }],
             owner_field: None,
             collaborators_field: None,
@@ -915,12 +959,16 @@ mod tests {
                     fields: vec!["name".to_string()],
                     search: false,
                     vector: None,
+                    unique: false,
+                    r#where: None,
                 },
                 IndexDef {
                     name: "by_name".to_string(),
                     fields: vec!["name".to_string()],
                     search: false,
                     vector: None,
+                    unique: false,
+                    r#where: None,
                 },
             ],
             owner_field: None,
@@ -941,6 +989,8 @@ mod tests {
                 fields: vec!["name".to_string()],
                 search: false,
                 vector: None,
+                unique: false,
+                r#where: None,
             }],
             owner_field: None,
             collaborators_field: None,
@@ -960,6 +1010,8 @@ mod tests {
                 fields: vec!["missing".to_string()],
                 search: false,
                 vector: None,
+                unique: false,
+                r#where: None,
             }],
             owner_field: None,
             collaborators_field: None,
@@ -1312,6 +1364,8 @@ mod tests {
                 fields: vec!["meta".to_string()],
                 search: false,
                 vector: None,
+                unique: false,
+                r#where: None,
             }],
             owner_field: None,
             collaborators_field: None,
@@ -1366,6 +1420,8 @@ mod tests {
                 fields: vec!["count".to_string()],
                 search: true,
                 vector: None,
+                unique: false,
+                r#where: None,
             }],
             owner_field: None,
             collaborators_field: None,
@@ -1390,6 +1446,8 @@ mod tests {
                 fields: vec!["body".to_string()],
                 search: true,
                 vector: None,
+                unique: false,
+                r#where: None,
             }],
             owner_field: None,
             collaborators_field: None,
@@ -1483,6 +1541,8 @@ mod tests {
                     dimensions: 8,
                     filter_fields: vec![],
                 }),
+                unique: false,
+                r#where: None,
             }],
             owner_field: None,
             collaborators_field: None,
@@ -1505,6 +1565,8 @@ mod tests {
                     dimensions: 4,
                     filter_fields: vec!["userId".to_string()],
                 }),
+                unique: false,
+                r#where: None,
             }],
             owner_field: None,
             collaborators_field: None,
@@ -1526,6 +1588,8 @@ mod tests {
                     dimensions: 4,
                     filter_fields: vec![],
                 }),
+                unique: false,
+                r#where: None,
             }],
             owner_field: None,
             collaborators_field: None,
@@ -1549,6 +1613,8 @@ mod tests {
                     dimensions: 0,
                     filter_fields: vec![],
                 }),
+                unique: false,
+                r#where: None,
             }],
             owner_field: None,
             collaborators_field: None,
@@ -1571,6 +1637,8 @@ mod tests {
                     dimensions: 4,
                     filter_fields: vec![],
                 }),
+                unique: false,
+                r#where: None,
             }],
             owner_field: None,
             collaborators_field: None,
@@ -1592,6 +1660,8 @@ mod tests {
                     dimensions: 4,
                     filter_fields: vec![],
                 }),
+                unique: false,
+                r#where: None,
             }],
             owner_field: None,
             collaborators_field: None,
@@ -1613,6 +1683,8 @@ mod tests {
                     dimensions: 4,
                     filter_fields: vec!["userId".to_string()],
                 }),
+                unique: false,
+                r#where: None,
             }],
             owner_field: None,
             collaborators_field: None,
@@ -1640,6 +1712,8 @@ mod tests {
                     dimensions: 4,
                     filter_fields: vec!["meta".to_string()],
                 }),
+                unique: false,
+                r#where: None,
             }],
             owner_field: None,
             collaborators_field: None,
