@@ -443,14 +443,19 @@ async fn apply_one(
                     blocking.join("', '")
                 )));
             }
-            let ids = all_ids(tx, schema_name, &t).await?;
-            // Remove the jsonb key first, then drop the typed column (no-op if
-            // the field was never indexed).
+            // Only rows that carry the field have their `doc` change (key
+            // removal is a no-op on rows without it), so scope the rewrite, the
+            // reported `affected_rows`, and the DocOps to those carriers —
+            // matching the spec's "DocOps for the affected rows" and the other
+            // data-bearing directives. The typed-column drop below is table-wide.
+            let ids = ids_where(tx, schema_name, &t, &format!("doc ? '{field}'")).await?;
             sqlx::query(&format!(
-                "UPDATE \"{schema_name}\".\"{t}\" SET doc = doc - '{field}'"
+                "UPDATE \"{schema_name}\".\"{t}\" SET doc = doc - '{field}' \
+                 WHERE doc ? '{field}'"
             ))
             .execute(&mut **tx)
             .await?;
+            // Drop the typed column (no-op if the field was never indexed).
             sqlx::query(&format!(
                 "ALTER TABLE \"{schema_name}\".\"{t}\" DROP COLUMN IF EXISTS \"{}\"",
                 pg_col(field)
@@ -567,7 +572,10 @@ async fn apply_one(
             // only in `doc` jsonb, so the ALTER below is gated on this.
             let old_table = table_def(old, table)?;
             let field_indexed = indexed_fields(old_table).contains(field);
-            let ids = all_ids(tx, schema_name, &t).await?;
+            // Only rows that carry the field have a value to cast, so scan just
+            // those — `affected_rows` and the DocOps cover exactly the carriers,
+            // matching the spec's "DocOps for the affected rows".
+            let ids = ids_where(tx, schema_name, &t, &format!("doc ? '{field}'")).await?;
             for id in &ids {
                 let row: Option<(Option<serde_json::Value>,)> = sqlx::query_as(&format!(
                     "SELECT doc->'{field}' FROM \"{schema_name}\".\"{t}\" WHERE id = $1"

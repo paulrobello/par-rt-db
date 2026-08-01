@@ -742,6 +742,69 @@ async fn dependent_batch_operates_on_renamed_table() {
     drop_db(&db).await;
 }
 
+// (n2) dropField and changeType report `affected_rows` and emit DocOps only for
+// rows that carry the touched field (rows whose `doc` actually changed) — not
+// every row in the table. Aligns with the spec's "DocOps for the affected rows"
+// and the precise counting the other data-bearing directives already do.
+#[tokio::test]
+async fn drop_field_and_change_type_count_only_field_carriers() {
+    // --- dropField targets an optional field; two of three rows carry `tag`. ---
+    let db = setup_db_with_schema(
+        r#"{"tables":{"u":{"fields":{"v":{"type":"string"},"tag":{"type":"optional","inner":{"type":"string"}}},"indexes":[]}}}"#,
+    )
+    .await;
+    let c1 = insert_doc(&db, "u", r#"{"v":"1","tag":"a"}"#).await;
+    let c2 = insert_doc(&db, "u", r#"{"v":"2","tag":"b"}"#).await;
+    insert_doc(&db, "u", r#"{"v":"3"}"#).await; // lacks `tag`
+    let fx = migrate(
+        &db,
+        r#"{"directives":[{"op":"dropField","table":"u","field":"tag"}]}"#,
+    )
+    .await;
+    assert_eq!(fx.reports[0].affected_rows, 2, "dropField counts carriers");
+    let ids: Vec<String> = fx.ops.iter().map(|o| o.id.clone()).collect();
+    assert_eq!(ids.len(), 2, "one DocOp per carrier");
+    assert!(
+        ids.contains(&c1) && ids.contains(&c2),
+        "DocOps cover carriers: {ids:?}"
+    );
+    drop_db(&db).await;
+
+    // --- changeType: a required field added to the schema AFTER a row was
+    // inserted leaves that older row without the key (additive push doesn't
+    // backfill). Only rows carrying `w` are cast; the pre-existing row is
+    // skipped. (changeType can't target an Optional field — no cast is valid for
+    // one — so this additive-schema path is the way a carrier/non-carrier split
+    // arises.) ---
+    let mut db = setup_db_with_schema(
+        r#"{"tables":{"u":{"fields":{"name":{"type":"string"}},"indexes":[]}}}"#,
+    )
+    .await;
+    insert_doc(&db, "u", r#"{"name":"old"}"#).await; // inserted before `w` existed
+    let expanded = serde_json::from_str::<SchemaDef>(
+        r#"{"tables":{"u":{"fields":{"name":{"type":"string"},"w":{"type":"string"}},"indexes":[]}}}"#,
+    )
+    .unwrap();
+    db.schema = push_schema(&db.state.pool, &db.name, expanded)
+        .await
+        .expect("additive push adds `w`");
+    let c1 = insert_doc(&db, "u", r#"{"name":"a","w":"1"}"#).await;
+    let c2 = insert_doc(&db, "u", r#"{"name":"b","w":"2"}"#).await;
+    let fx = migrate(
+        &db,
+        r#"{"directives":[{"op":"changeType","table":"u","field":"w","to":{"type":"number"},"cast":"toNumber"}]}"#,
+    )
+    .await;
+    assert_eq!(fx.reports[0].affected_rows, 2, "changeType counts carriers");
+    let ids: Vec<String> = fx.ops.iter().map(|o| o.id.clone()).collect();
+    assert_eq!(ids.len(), 2, "one DocOp per carrier");
+    assert!(
+        ids.contains(&c1) && ids.contains(&c2),
+        "DocOps cover carriers: {ids:?}"
+    );
+    drop_db(&db).await;
+}
+
 // ---------------------------------------------------------------------------
 // Task 6: committer `RunMigrate` arm — the four tap sites + dry-run.
 //
