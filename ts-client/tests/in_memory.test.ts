@@ -1400,9 +1400,15 @@ describe("InMemoryRtDbClient — migrate", () => {
 
   it("evalExpr throws BAD_REQUEST (no SQL engine in-memory)", () => {
     const c = newClient();
-    expect(() => c.migrate(new Migration().evalExpr("items", "x", "1 = 1").build())).toThrow(
-      "evalExpr unsupported in-memory",
-    );
+    let caught: unknown;
+    try {
+      c.migrate(new Migration().evalExpr("items", "x", "1 = 1").build());
+    } catch (e) {
+      caught = e;
+    }
+    // Assert the code, not just the message — the harness rejects evalExpr with
+    // BAD_REQUEST (not INTERNAL), matching how the live server rejects it.
+    expect(caught).toMatchObject({ code: "BAD_REQUEST", message: /evalExpr/i });
   });
 
   it("dryRun validates and reports affectedRows without committing", async () => {
