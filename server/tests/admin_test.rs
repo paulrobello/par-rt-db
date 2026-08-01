@@ -791,10 +791,13 @@ async fn import_db_doc_replay_failure_after_schema_commit_refreshes_schema_cache
 
     let import_resp =
         admin_post_raw(addr, &format!("/admin/import-db?db={target_db}"), jsonl).await;
-    assert_eq!(
-        import_resp.status(),
-        reqwest::StatusCode::INTERNAL_SERVER_ERROR
-    );
+    // The doc-replay id collision is a Postgres primary-key violation (SQLSTATE
+    // 23505), which the blanket `From<sqlx::Error>` maps to CONFLICT (409) — a
+    // more accurate status than the former generic 500. The point of this test
+    // is the cache invalidation below, not the exact failure code.
+    assert_eq!(import_resp.status(), reqwest::StatusCode::CONFLICT);
+    let body: serde_json::Value = import_resp.json().await?;
+    assert_eq!(body["code"], "CONFLICT");
 
     // A stale cache entry would still report the pre-import schema here; the
     // fix invalidates it on the failed import so this reload reflects what the
