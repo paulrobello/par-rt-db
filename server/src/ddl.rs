@@ -348,9 +348,18 @@ pub async fn push_schema(
                 }
 
                 let unique_kw = if index.unique { "UNIQUE " } else { "" };
-                sqlx::query(&format!(
-                    "CREATE {unique_kw}INDEX \"{index_ident}\" ON \"{pg_schema_name}\".\"{table_ident}\" ({}, \"created_at\"){where_sql}",
+                // A UNIQUE index covers exactly its declared fields — appending a
+                // per-row-distinct column like `created_at` would make every key
+                // distinct and silently defeat the uniqueness guarantee. Non-
+                // unique btree indexes keep the trailing `created_at` tiebreaker
+                // so take/first/paginate scans get a deterministic physical order.
+                let index_cols = if index.unique {
                     cols.join(", ")
+                } else {
+                    format!("{}, \"created_at\"", cols.join(", "))
+                };
+                sqlx::query(&format!(
+                    "CREATE {unique_kw}INDEX \"{index_ident}\" ON \"{pg_schema_name}\".\"{table_ident}\" ({index_cols}){where_sql}"
                 ))
                 .execute(&mut *tx)
                 .await?;

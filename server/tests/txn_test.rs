@@ -1266,3 +1266,265 @@ async fn replace_recomputes_int64_indexed_column() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// unique + partial-unique index enforcement (Task 5): proves a uniqueness
+// violation on a runtime write (insert/patch against an already-created
+// UNIQUE index) surfaces as CONFLICT (409) via the blanket `From<sqlx::Error>`
+// 23505 mapping, and atomically rolls back the whole transaction. Mirrors the
+// `fresh_int64_db` pattern (custom schema pushed directly — `fresh_db` always
+// pushes the kanban schema). Task 4 already covered DDL-time introspection,
+// the destructive-flip rejection, and the push-time dup pre-check; these target
+// the runtime write path exclusively.
+// ---------------------------------------------------------------------------
+
+/// `email` + `n` fields with a UNIQUE btree index on `email`. Used by the
+/// duplicate-insert and patch-collision tests.
+fn unique_email_schema() -> SchemaDef {
+    serde_json::from_value(serde_json::json!({
+        "tables": {
+            "t": {
+                "fields": {
+                    "email": { "type": "string" },
+                    "n": { "type": "number" }
+                },
+                "indexes": [{ "name": "by_email", "fields": ["email"], "unique": true }]
+            }
+        }
+    }))
+    .expect("parse unique_email schema")
+}
+
+async fn fresh_unique_email_db(state: &Arc<AppState>) -> String {
+    let name = format!("t{}", uuid::Uuid::now_v7().simple());
+    db::create_database(&state.pool, &name)
+        .await
+        .expect("create db");
+    ddl::push_schema(&state.pool, &name, unique_email_schema())
+        .await
+        .expect("push unique_email schema");
+    name
+}
+
+/// `slug` + `deleted` fields with a UNIQUE partial index: uniqueness holds on
+/// `(slug, deleted)` only among rows where `deleted = false` (the partial
+/// predicate). Since every indexed row has `deleted = false`, this reduces to
+/// "at most one non-deleted row per slug." Matches the shape Task 4's
+/// introspection test used (`deleted` indexed so the predicate compiles to the
+/// typed `f_deleted` column).
+fn partial_unique_schema() -> SchemaDef {
+    serde_json::from_value(serde_json::json!({
+        "tables": {
+            "t": {
+                "fields": {
+                    "slug": { "type": "string" },
+                    "deleted": { "type": "boolean" }
+                },
+                "indexes": [{
+                    "name": "by_slug",
+                    "fields": ["slug", "deleted"],
+                    "unique": true,
+                    "where": { "op": "eq", "field": "deleted", "value": false }
+                }]
+            }
+        }
+    }))
+    .expect("parse partial_unique schema")
+}
+
+async fn fresh_partial_unique_db(state: &Arc<AppState>) -> String {
+    let name = format!("t{}", uuid::Uuid::now_v7().simple());
+    db::create_database(&state.pool, &name)
+        .await
+        .expect("create db");
+    ddl::push_schema(&state.pool, &name, partial_unique_schema())
+        .await
+        .expect("push partial_unique schema");
+    name
+}
+
+// (o) duplicate insert on a unique index → CONFLICT (409), and the whole txn
+// aborts. Rollback is proven by a direct `SELECT count(*)` afterwards: the
+// table still holds exactly the one pre-collision row — the failed insert left
+// no partial row behind.
+#[tokio::test]
+async fn duplicate_insert_on_unique_index_is_conflict_and_rolls_back() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_unique_email_db(&state).await;
+    let schema = unique_email_schema();
+
+    execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::Insert {
+                table: "t".to_string(),
+                doc: doc(serde_json::json!({ "email": "a@x", "n": 1 })),
+            }],
+        },
+        None,
+    )
+    .await?;
+
+    // Second insert with the same email -> CONFLICT, and the whole txn aborts.
+    let err = execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::Insert {
+                table: "t".to_string(),
+                doc: doc(serde_json::json!({ "email": "a@x", "n": 2 })),
+            }],
+        },
+        None,
+    )
+    .await
+    .expect_err("expected conflict");
+    assert_eq!(err.code, ErrorCode::Conflict);
+
+    // Rollback proof: the table still has exactly 1 row.
+    let pg_schema = format!("db_{db}");
+    let count: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM \"{pg_schema}\".\"t_t\""))
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(count, 1);
+
+    Ok(())
+}
+
+// (p) partial unique: two excluded (predicate-failing) rows with the same key
+// are allowed, but two predicate-matching rows collide → CONFLICT.
+#[tokio::test]
+async fn partial_unique_allows_excluded_duplicate() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_partial_unique_db(&state).await;
+    let schema = partial_unique_schema();
+
+    // Two rows, same slug, BOTH deleted (excluded by the predicate) -> allowed.
+    execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::Insert {
+                table: "t".to_string(),
+                doc: doc(serde_json::json!({ "slug": "x", "deleted": true })),
+            }],
+        },
+        None,
+    )
+    .await?;
+    execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::Insert {
+                table: "t".to_string(),
+                doc: doc(serde_json::json!({ "slug": "x", "deleted": true })),
+            }],
+        },
+        None,
+    )
+    .await?;
+
+    // A non-deleted row with the same slug is fine on its own.
+    execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::Insert {
+                table: "t".to_string(),
+                doc: doc(serde_json::json!({ "slug": "x", "deleted": false })),
+            }],
+        },
+        None,
+    )
+    .await?;
+
+    // A second non-deleted row with the same slug -> CONFLICT.
+    let err = execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::Insert {
+                table: "t".to_string(),
+                doc: doc(serde_json::json!({ "slug": "x", "deleted": false })),
+            }],
+        },
+        None,
+    )
+    .await
+    .expect_err("expected conflict");
+    assert_eq!(err.code, ErrorCode::Conflict);
+
+    Ok(())
+}
+
+// (q) patch that would create a collision → CONFLICT (409).
+#[tokio::test]
+async fn patch_creating_collision_is_conflict() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_unique_email_db(&state).await;
+    let schema = unique_email_schema();
+
+    let outcome_a = execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::Insert {
+                table: "t".to_string(),
+                doc: doc(serde_json::json!({ "email": "a@x", "n": 1 })),
+            }],
+        },
+        None,
+    )
+    .await?;
+
+    let outcome_b = execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::Insert {
+                table: "t".to_string(),
+                doc: doc(serde_json::json!({ "email": "b@x", "n": 2 })),
+            }],
+        },
+        None,
+    )
+    .await?;
+    let id_b = outcome_b.results[0]["id"].as_str().expect("id").to_string();
+    let _ = outcome_a; // row a is the collision target; its id is not needed.
+
+    // Patch b's email to collide with a's -> CONFLICT.
+    let mut fields = serde_json::Map::new();
+    fields.insert("email".to_string(), serde_json::json!("a@x"));
+
+    let err = execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::Patch {
+                table: "t".to_string(),
+                id: id_b,
+                fields,
+            }],
+        },
+        None,
+    )
+    .await
+    .expect_err("expected conflict");
+    assert_eq!(err.code, ErrorCode::Conflict);
+
+    Ok(())
+}
