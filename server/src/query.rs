@@ -1529,6 +1529,100 @@ fn compile_filter_node(
     }
 }
 
+/// Inlines a typed `EqBind` as a SQL literal (DDL-only — partial-index
+/// predicates cannot use `$n` binds). Strings use SQL-standard `''` doubling.
+fn render_literal(bind: &EqBind) -> String {
+    match bind {
+        EqBind::Text(s) => format!("'{}'", s.replace('\'', "''")),
+        EqBind::Bool(b) => {
+            if *b {
+                "true".into()
+            } else {
+                "false".into()
+            }
+        }
+        EqBind::Num(n) => n.to_string(),
+        EqBind::I64(n) => n.to_string(),
+    }
+}
+
+/// Like `compile_filter`, but emits **literal** values instead of `$n` binds.
+/// Used only at DDL time to bake a partial-index predicate into
+/// `CREATE INDEX … WHERE <sql>`. Reuses `field_lhs_and_bind` for identifier
+/// validation/double-quoting and value typing, so the predicate is as tightly
+/// validated as a query-time `filter()`.
+#[allow(dead_code)] // wired by Task 4 (push_schema partial-index WHERE)
+pub(crate) fn compile_filter_literal(
+    filter: &FilterExpr,
+    table: &TableDef,
+) -> Result<String, RtDbError> {
+    render_filter_literal_node(filter, table)
+}
+
+fn render_filter_literal_node(node: &FilterExpr, table: &TableDef) -> Result<String, RtDbError> {
+    match node {
+        FilterExpr::And { exprs } | FilterExpr::Or { exprs } => {
+            if exprs.is_empty() {
+                return Err(RtDbError::bad_request(format!(
+                    "{} filter requires at least one expr",
+                    if matches!(node, FilterExpr::And { .. }) {
+                        "and"
+                    } else {
+                        "or"
+                    }
+                )));
+            }
+            let joiner = if matches!(node, FilterExpr::And { .. }) {
+                " AND "
+            } else {
+                " OR "
+            };
+            let parts: Vec<String> = exprs
+                .iter()
+                .map(|e| render_filter_literal_node(e, table))
+                .collect::<Result<_, _>>()?;
+            Ok(format!("({})", parts.join(joiner)))
+        }
+        FilterExpr::Eq { field, value }
+        | FilterExpr::Neq { field, value }
+        | FilterExpr::Gt { field, value }
+        | FilterExpr::Gte { field, value }
+        | FilterExpr::Lt { field, value }
+        | FilterExpr::Lte { field, value } => {
+            let op = match node {
+                FilterExpr::Eq { .. } => "=",
+                FilterExpr::Neq { .. } => "<>",
+                FilterExpr::Gt { .. } => ">",
+                FilterExpr::Gte { .. } => ">=",
+                FilterExpr::Lt { .. } => "<",
+                FilterExpr::Lte { .. } => "<=",
+                _ => unreachable!(),
+            };
+            let (lhs, bind) = field_lhs_and_bind(field, value, table)?;
+            Ok(format!("{lhs} {op} {}", render_literal(&bind)))
+        }
+        FilterExpr::In { field, values } => {
+            if values.is_empty() {
+                return Err(RtDbError::bad_request(
+                    "in filter requires at least one value",
+                ));
+            }
+            let (lhs, first) = field_lhs_and_bind(field, &values[0], table)?;
+            let mut lits = vec![render_literal(&first)];
+            for value in &values[1..] {
+                let (this_lhs, bind) = field_lhs_and_bind(field, value, table)?;
+                if this_lhs != lhs {
+                    return Err(RtDbError::bad_request(
+                        "in filter values must all be the same type",
+                    ));
+                }
+                lits.push(render_literal(&bind));
+            }
+            Ok(format!("{lhs} IN ({})", lits.join(", ")))
+        }
+    }
+}
+
 /// Compiles a binary comparison leaf into `lhs OP $pos` and pushes one typed bind.
 fn compile_comparison(
     field: &str,
@@ -2148,4 +2242,57 @@ pub fn canonical(result: &QueryResult) -> String {
         tracing::error!(error = %err, "failed to serialize query result");
         String::new()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::{FilterExpr, compile_filter_literal};
+    use crate::schema::{FieldType, IndexDef, TableDef};
+
+    /// Builds a one-field `TableDef` whose single field is indexed, so
+    /// `field_lhs_and_bind` takes its typed-column path (`"f_<field>"`) rather
+    /// than the jsonb-extraction fallback. The exact rendered column name is
+    /// part of what these tests lock down.
+    fn one_indexed_field_table(field: &str, ft: FieldType) -> TableDef {
+        let mut fields = BTreeMap::new();
+        fields.insert(field.to_string(), ft);
+        TableDef {
+            fields,
+            indexes: vec![IndexDef {
+                name: format!("by_{field}"),
+                fields: vec![field.to_string()],
+                search: false,
+                vector: None,
+                unique: false,
+                r#where: None,
+            }],
+            owner_field: None,
+            collaborators_field: None,
+        }
+    }
+
+    #[test]
+    fn compile_filter_literal_emits_typed_literals_not_binds() {
+        // eq on an indexed boolean column -> literal `false`, not `$1`.
+        let table = one_indexed_field_table("deleted", FieldType::Boolean);
+        let pred = FilterExpr::Eq {
+            field: "deleted".into(),
+            value: serde_json::json!(false),
+        };
+        let sql = compile_filter_literal(&pred, &table).unwrap();
+        assert_eq!(sql, "\"f_deleted\" = false");
+    }
+
+    #[test]
+    fn compile_filter_literal_escapes_string_literals() {
+        let table = one_indexed_field_table("name", FieldType::String);
+        let pred = FilterExpr::Eq {
+            field: "name".into(),
+            value: serde_json::json!("O'Brien"),
+        };
+        let sql = compile_filter_literal(&pred, &table).unwrap();
+        assert_eq!(sql, "\"f_name\" = 'O''Brien'");
+    }
 }
