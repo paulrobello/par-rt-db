@@ -276,3 +276,145 @@ async fn unique_where_rejected_on_search_index() {
     let err = schema.validate().unwrap_err();
     assert_eq!(err.code, ErrorCode::SchemaViolation);
 }
+
+// (l) DDL emission: a `unique` btree index compiles to a real Postgres
+// `CREATE UNIQUE INDEX`, verified by introspecting `pg_indexes.indexdef` (the
+// robust string form — no fragile `pg_index`/regclass joins).
+#[tokio::test]
+async fn unique_index_is_created_as_unique_on_postgres() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let name = format!("t{}", uuid::Uuid::now_v7().simple());
+    db::create_database(&state.pool, &name).await?;
+
+    let schema: SchemaDef = serde_json::from_value(serde_json::json!({
+        "tables": {
+            "t": {
+                "fields": { "email": { "type": "string" } },
+                "indexes": [{ "name": "by_email", "fields": ["email"], "unique": true }]
+            }
+        }
+    }))?;
+    ddl::push_schema(&state.pool, &name, schema).await?;
+
+    let pg_schema_name = ddl::pg_schema(&name);
+    let row: (String,) =
+        sqlx::query_as("SELECT indexdef FROM pg_indexes WHERE schemaname = $1 AND indexname = $2")
+            .bind(&pg_schema_name)
+            .bind("i_t_by_email")
+            .fetch_one(&state.pool)
+            .await?;
+    assert!(
+        row.0.to_uppercase().contains("CREATE UNIQUE INDEX"),
+        "got: {}",
+        row.0
+    );
+    Ok(())
+}
+
+// (m) DDL emission: a partial unique index (`where` predicate over an indexed
+// boolean column) compiles to `CREATE UNIQUE INDEX … WHERE`, with the
+// predicate baked in as a literal (no `$n` binds allowed in a partial index).
+#[tokio::test]
+async fn partial_unique_index_emits_where_clause() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let name = format!("t{}", uuid::Uuid::now_v7().simple());
+    db::create_database(&state.pool, &name).await?;
+
+    // `deleted` is declared indexed so the predicate uses the typed `f_deleted`
+    // boolean column (cleaner + matches how a real partial unique index is
+    // declared alongside the indexed column).
+    let schema: SchemaDef = serde_json::from_value(serde_json::json!({
+        "tables": {
+            "t": {
+                "fields": {
+                    "slug": { "type": "string" },
+                    "deleted": { "type": "boolean" }
+                },
+                "indexes": [{
+                    "name": "by_slug", "fields": ["slug", "deleted"], "unique": true,
+                    "where": { "op": "eq", "field": "deleted", "value": false }
+                }]
+            }
+        }
+    }))?;
+    ddl::push_schema(&state.pool, &name, schema).await?;
+
+    let pg_schema_name = ddl::pg_schema(&name);
+    let row: (String,) =
+        sqlx::query_as("SELECT indexdef FROM pg_indexes WHERE schemaname = $1 AND indexname = $2")
+            .bind(&pg_schema_name)
+            .bind("i_t_by_slug")
+            .fetch_one(&state.pool)
+            .await?;
+    let def = row.0.to_uppercase();
+    assert!(
+        def.contains("CREATE UNIQUE INDEX"),
+        "expected UNIQUE, got: {}",
+        row.0
+    );
+    assert!(
+        def.contains("WHERE") && def.contains("F_DELETED"),
+        "expected WHERE over f_deleted, got: {}",
+        row.0
+    );
+    Ok(())
+}
+
+// (n) Dup pre-check: adding a unique index to an existing table that already
+// has duplicate keys returns a friendly CONFLICT (from the pre-check SELECT,
+// before the CREATE UNIQUE INDEX ever runs).
+#[tokio::test]
+async fn unique_index_dup_pre_check_returns_conflict() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let name = format!("t{}", uuid::Uuid::now_v7().simple());
+    db::create_database(&state.pool, &name).await?;
+
+    // First push: table with the email field but no indexes yet.
+    let base: SchemaDef = serde_json::from_value(serde_json::json!({
+        "tables": {
+            "users": {
+                "fields": { "email": { "type": "string" } },
+                "indexes": []
+            }
+        }
+    }))?;
+    let schema = ddl::push_schema(&state.pool, &name, base).await?;
+
+    // Insert two rows that collide on the would-be-unique key.
+    for _ in 0..2 {
+        execute_txn(
+            &state.pool,
+            &name,
+            &schema,
+            &Transaction {
+                steps: vec![Step::Insert {
+                    table: "users".to_string(),
+                    doc: doc(serde_json::json!({ "email": "dup@example.com" })),
+                }],
+            },
+            None,
+        )
+        .await?;
+    }
+
+    // Second push: add a unique index — the pre-check SELECT must detect the
+    // duplicate and return CONFLICT before CREATE UNIQUE INDEX runs.
+    let with_unique: SchemaDef = serde_json::from_value(serde_json::json!({
+        "tables": {
+            "users": {
+                "fields": { "email": { "type": "string" } },
+                "indexes": [{ "name": "by_email", "fields": ["email"], "unique": true }]
+            }
+        }
+    }))?;
+    let err = ddl::push_schema(&state.pool, &name, with_unique)
+        .await
+        .expect_err("duplicate rows must block CREATE UNIQUE INDEX");
+    assert_eq!(err.code, ErrorCode::Conflict);
+    assert!(
+        err.message.contains("unique index") && err.message.contains("duplicate"),
+        "got: {}",
+        err.message
+    );
+    Ok(())
+}

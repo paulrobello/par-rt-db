@@ -3,6 +3,7 @@ mod common;
 use common::test_state;
 use rtdb_server::ddl::push_schema;
 use rtdb_server::error::ErrorCode;
+use rtdb_server::query::FilterExpr;
 use rtdb_server::schema::{FieldType, IndexDef, SchemaDef, TableDef};
 use std::collections::BTreeMap;
 
@@ -94,6 +95,70 @@ async fn narrowing_a_literal_union_push_is_rejected() {
         err.message
             .contains("changed type of field 'items.priority'"),
         "{}",
+        err.message
+    );
+}
+
+/// A `users` table with an `email` index whose `unique` and `where` flags are
+/// parameterized — exercises the destructive-change arms for the new partial /
+/// unique index knobs.
+fn email_index_schema(unique: bool, where_clause: Option<FilterExpr>) -> SchemaDef {
+    let mut fields = BTreeMap::new();
+    fields.insert("email".to_string(), FieldType::String);
+    fields.insert("deleted".to_string(), FieldType::Boolean);
+    let indexes = vec![IndexDef {
+        name: "by_email".to_string(),
+        fields: vec!["email".to_string()],
+        search: false,
+        vector: None,
+        unique,
+        r#where: where_clause,
+    }];
+    let mut tables = BTreeMap::new();
+    tables.insert(
+        "users".to_string(),
+        TableDef {
+            fields,
+            indexes,
+            owner_field: None,
+            collaborators_field: None,
+        },
+    );
+    SchemaDef { tables }
+}
+
+#[tokio::test]
+async fn flipping_unique_on_existing_index_is_destructive() {
+    let state = test_state().await;
+    let db = fresh_empty_db(&state).await;
+    push_schema(&state.pool, &db, email_index_schema(false, None))
+        .await
+        .expect("initial non-unique push");
+    let err = push_schema(&state.pool, &db, email_index_schema(true, None))
+        .await
+        .expect_err("flipping unique must be rejected");
+    assert_eq!(err.code, ErrorCode::BadRequest);
+    assert!(err.message.contains("uniqueness"), "got: {}", err.message);
+}
+
+#[tokio::test]
+async fn flipping_where_on_existing_index_is_destructive() {
+    let state = test_state().await;
+    let db = fresh_empty_db(&state).await;
+    let pred = FilterExpr::Eq {
+        field: "deleted".to_string(),
+        value: serde_json::Value::Bool(false),
+    };
+    push_schema(&state.pool, &db, email_index_schema(true, None))
+        .await
+        .expect("initial unique push with no predicate");
+    let err = push_schema(&state.pool, &db, email_index_schema(true, Some(pred)))
+        .await
+        .expect_err("flipping where must be rejected");
+    assert_eq!(err.code, ErrorCode::BadRequest);
+    assert!(
+        err.message.contains("partial predicate"),
+        "got: {}",
         err.message
     );
 }

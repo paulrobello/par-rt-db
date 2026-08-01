@@ -4,6 +4,7 @@ use sqlx::PgPool;
 
 use crate::db::{database_exists, load_schema, validate_db_name};
 use crate::error::RtDbError;
+use crate::query::compile_filter_literal;
 use crate::schema::{FieldType, SchemaDef, TableDef, indexed_column_type, is_widening_of};
 
 pub fn pg_table(user_table: &str) -> String {
@@ -128,6 +129,18 @@ fn detect_destructive_changes(old: &SchemaDef, new: &SchemaDef) -> Result<(), Rt
                 Some(new_index) if new_index.vector != old_index.vector => {
                     return Err(RtDbError::bad_request(format!(
                         "changed vector spec of index '{}'",
+                        old_index.name
+                    )));
+                }
+                Some(new_index) if new_index.unique != old_index.unique => {
+                    return Err(RtDbError::bad_request(format!(
+                        "changed uniqueness of index '{}'",
+                        old_index.name
+                    )));
+                }
+                Some(new_index) if new_index.r#where != old_index.r#where => {
+                    return Err(RtDbError::bad_request(format!(
+                        "changed partial predicate of index '{}'",
                         old_index.name
                     )));
                 }
@@ -296,8 +309,47 @@ pub async fn push_schema(
                     .iter()
                     .map(|field_name| format!("\"{}\"", pg_col(field_name)))
                     .collect();
+
+                // Partial-index predicate (literal SQL — see
+                // `compile_filter_literal`). `Option<String>` already carries a
+                // leading " WHERE " when present; shadow-bind a `&str` for
+                // interpolation (`Option` has no `Display` impl).
+                let where_sql: Option<String> = match &index.r#where {
+                    Some(pred) => {
+                        let frag = compile_filter_literal(pred, new_table)?;
+                        Some(format!(" WHERE {frag}"))
+                    }
+                    None => None,
+                };
+                let where_sql = where_sql.as_deref().unwrap_or("");
+
+                // Pre-check for a clear CONFLICT before CREATE UNIQUE INDEX (the
+                // CREATE itself remains the authoritative, race-free guarantee).
+                if index.unique {
+                    let grouped = cols.join(", ");
+                    let sql = format!(
+                        "SELECT {grouped} FROM \"{pg_schema_name}\".\"{table_ident}\"{where_sql} \
+                         GROUP BY {grouped} HAVING count(*) > 1 LIMIT 5"
+                    );
+                    let dupes: Result<Vec<sqlx::postgres::PgRow>, _> =
+                        sqlx::query(&sql).fetch_all(&mut *tx).await;
+                    if let Ok(rows) = dupes
+                        && !rows.is_empty()
+                    {
+                        return Err(RtDbError::conflict(format!(
+                            "unique index '{}' cannot be created: {} existing row(s) duplicate its key",
+                            index.name,
+                            rows.len()
+                        )));
+                    }
+                    // A fetch error is unexpected (cols is non-empty for an
+                    // index, and the table exists in the tx); fall through and
+                    // let CREATE UNIQUE INDEX decide authoritatively.
+                }
+
+                let unique_kw = if index.unique { "UNIQUE " } else { "" };
                 sqlx::query(&format!(
-                    "CREATE INDEX \"{index_ident}\" ON \"{pg_schema_name}\".\"{table_ident}\" ({}, \"created_at\")",
+                    "CREATE {unique_kw}INDEX \"{index_ident}\" ON \"{pg_schema_name}\".\"{table_ident}\" ({}, \"created_at\"){where_sql}",
                     cols.join(", ")
                 ))
                 .execute(&mut *tx)

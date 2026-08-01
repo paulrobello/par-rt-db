@@ -1551,7 +1551,6 @@ fn render_literal(bind: &EqBind) -> String {
 /// `CREATE INDEX … WHERE <sql>`. Reuses `field_lhs_and_bind` for identifier
 /// validation/double-quoting and value typing, so the predicate is as tightly
 /// validated as a query-time `filter()`.
-#[allow(dead_code)] // wired by Task 4 (push_schema partial-index WHERE)
 pub(crate) fn compile_filter_literal(
     filter: &FilterExpr,
     table: &TableDef,
