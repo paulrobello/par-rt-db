@@ -1382,6 +1382,18 @@ describe("InMemoryRtDbClient — migrate", () => {
     expect(docs[0]).not.toHaveProperty("status");
   });
 
+  it("dropField affectedRows counts only rows carrying the field", () => {
+    const c = newClient();
+    c.mutate(
+      mutation().insert("items", { name: "a", status: "todo", order: 1, note: "x" }).build(),
+    );
+    c.mutate(mutation().insert("items", { name: "b", status: "todo", order: 2 }).build()); // no `note`
+    const res = c.migrate(new Migration().dropField("items", "note").build());
+    // `note` is optional; only the first row carries it, so affectedRows is the
+    // carrier count, not the total row count (server parity).
+    expect(res.directives[0].affectedRows).toBe(1);
+  });
+
   it("dropTable removes the table from the schema and the doc map", () => {
     const c = newClient();
     c.mutate(mutation().insert("items", { name: "a", status: "todo", order: 1 }).build());

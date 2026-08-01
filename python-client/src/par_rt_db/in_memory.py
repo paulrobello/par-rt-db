@@ -338,9 +338,9 @@ class InMemoryRtDbClient:
         ``evalExpr`` has no in-memory SQL engine and raises
         :class:`RtDbError` ``BAD_REQUEST`` — same convention as the
         search/vector stubs. Affected-rows counts mirror the server:
-        ``renameField`` / ``setDefault`` count the rows whose docs actually
-        changed; ``changeType`` / ``dropField`` / ``dropTable`` count every row
-        in the table; ``renameTable`` / ``dropIndex`` report zero.
+        ``renameField`` / ``setDefault`` / ``changeType`` / ``dropField`` count
+        the rows whose docs actually changed; ``dropTable`` counts every row
+        (all deleted); ``renameTable`` / ``dropIndex`` report zero.
 
         Returns a :class:`par_rt_db.http_client.MigrateResult` (imported lazily
         to avoid a circular dependency at module load time).
@@ -500,10 +500,10 @@ class InMemoryRtDbClient:
         for (tname, row_id), row in self._docs.items():
             if tname != d.table:
                 continue
-            affected += 1
             val = row.doc.get(d.field)
             if val is None:
                 continue
+            affected += 1
             coerced = _coerce_value(d.cast, val)
             if coerced is not None:
                 row.doc[d.field] = coerced
@@ -542,8 +542,10 @@ class InMemoryRtDbClient:
         for (tname, _), row in self._docs.items():
             if tname != d.table:
                 continue
-            affected += 1
+            if d.field not in row.doc:
+                continue
             row.doc.pop(d.field, None)
+            affected += 1
         return DirectiveReport(op="dropField", affected_rows=affected)
 
     def _migrate_drop_table(

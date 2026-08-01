@@ -763,8 +763,8 @@ export class InMemoryRtDbClient {
    *
    * `evalExpr` has no in-memory SQL engine and throws `BAD_REQUEST` — same
    * convention as the search/vector stubs. Affected-rows counts mirror the
-   * server: `renameField`/`setDefault` count the rows whose docs actually
-   * changed; `changeType`/`dropField`/`dropTable` count every row in the table;
+   * server: `renameField`/`setDefault`/`changeType`/`dropField` count the rows
+   * whose docs actually changed; `dropTable` counts every row (all deleted);
    * `renameTable`/`dropIndex` report zero. */
   migrate(req: MigrateRequestJson): MigrateResultJson {
     const old = this.requireSchema();
@@ -868,8 +868,10 @@ export class InMemoryRtDbClient {
           );
         }
         const rows = [...this.rowsFor(d.table).values()];
+        let affected = 0;
         for (const row of rows) {
           if (!(d.field in row.doc)) continue;
+          affected++;
           const coerced = coerceValue(d.cast, row.doc[d.field]);
           if (coerced !== undefined) {
             row.doc[d.field] = coerced;
@@ -886,7 +888,7 @@ export class InMemoryRtDbClient {
           );
         }
         t.fields[d.field] = d.to;
-        return { report: { op: "changeType", affectedRows: rows.length }, table: d.table };
+        return { report: { op: "changeType", affectedRows: affected }, table: d.table };
       }
       case "dropField": {
         const t = this.migrateTable(planned, d.table);
@@ -903,10 +905,13 @@ export class InMemoryRtDbClient {
         if (t.ownerField === d.field) t.ownerField = undefined;
         if (t.collaboratorsField === d.field) t.collaboratorsField = undefined;
         const rows = this.rowsFor(d.table);
+        let affected = 0;
         for (const row of rows.values()) {
+          if (!(d.field in row.doc)) continue;
           delete row.doc[d.field];
+          affected++;
         }
-        return { report: { op: "dropField", affectedRows: rows.size }, table: d.table };
+        return { report: { op: "dropField", affectedRows: affected }, table: d.table };
       }
       case "dropTable": {
         const def = planned.tables[d.name];

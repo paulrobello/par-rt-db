@@ -938,6 +938,21 @@ def test_migrate_change_type_coerces_values() -> None:
     assert result.schema_.tables["users"].fields["age"].type == "string"
 
 
+def test_migrate_drop_field_counts_only_carriers() -> None:
+    # `users.status` is optional; the _migrate_client fixture's two rows omit
+    # it. Insert a third row that carries it, drop the field, and assert
+    # affected_rows is the carrier count (1), not the total row count (3) —
+    # server parity.
+    from par_rt_db import Migration, Mutation
+
+    c = _migrate_client()
+    c.mutate(Mutation.builder().insert("users", {"name": "carol", "age": 1, "status": "x"}).build())
+    assert len(c.collect_all("users")) == 3
+    directives = Migration.builder().drop_field("users", "status").build().directives
+    result = c.migrate_schema(directives)
+    assert result.directives[0].affected_rows == 1
+
+
 def test_migrate_change_type_uses_default_when_value_not_coercible() -> None:
     # Insert a row with a string value that can't coerce under ToNumber.
     from par_rt_db import Cast, Migration, Mutation

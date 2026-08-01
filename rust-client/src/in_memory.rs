@@ -288,8 +288,8 @@ impl InMemoryRtDbClient {
     /// `evalExpr` has no in-memory SQL engine and returns
     /// `BAD_REQUEST` — same convention as the search/vector stubs.
     /// Affected-rows counts mirror the server and the ts-client harness:
-    /// `renameField`/`setDefault` count the rows whose docs actually changed;
-    /// `changeType`/`dropField`/`dropTable` count every row in the table;
+    /// `renameField`/`setDefault`/`changeType`/`dropField` count the rows whose
+    /// docs actually changed; `dropTable` counts every row (all deleted);
     /// `renameTable`/`dropIndex` report zero.
     #[cfg(feature = "admin")]
     pub fn migrate_schema(
@@ -481,13 +481,13 @@ impl InMemoryRtDbClient {
                     if tname != table {
                         continue;
                     }
-                    affected += 1;
                     let Some(obj) = row.doc.as_object_mut() else {
                         continue;
                     };
                     let Some(val) = obj.get(&field_owned).cloned() else {
                         continue;
                     };
+                    affected += 1;
                     if let Some(coerced) = coerce_value(*cast, &val) {
                         obj.insert(field_owned.clone(), coerced);
                     } else if let Some(d) = default {
@@ -534,17 +534,18 @@ impl InMemoryRtDbClient {
                 if t.collaborators_field.as_deref() == Some(field.as_str()) {
                     t.collaborators_field = None;
                 }
-                // Server parity: `affected_rows` is every row in the table
-                // (server `all_ids(...).len()`), not just rows that had the
-                // field. The field is still removed from rows that carry it.
+                // `affected_rows` counts only rows whose `doc` actually changes
+                // (rows carrying the field) — server parity. `obj.remove` returns
+                // the removed value, so count the row iff the key was present.
                 let mut affected = 0i64;
                 for ((tname, _), row) in self.docs.iter_mut() {
                     if tname != table {
                         continue;
                     }
-                    affected += 1;
-                    if let Some(obj) = row.doc.as_object_mut() {
-                        obj.remove(field);
+                    if let Some(obj) = row.doc.as_object_mut()
+                        && obj.remove(field).is_some()
+                    {
+                        affected += 1;
                     }
                 }
                 Ok((
@@ -3655,11 +3656,12 @@ mod tests {
 
     #[cfg(feature = "admin")]
     #[tokio::test]
-    async fn migrate_drop_field_affected_rows_counts_every_row() {
-        // Server parity: DropField reports `affected_rows` as every row in the
-        // table (server `all_ids(...).len()`), not just rows that carried the
-        // field. Build a table where most rows LACK the optional `note` field,
-        // drop it, and assert the count is the TOTAL row count.
+    async fn migrate_drop_field_affected_rows_counts_only_carriers() {
+        // dropField reports `affected_rows` as only the rows whose `doc`
+        // actually changed — rows that carried the field — not every row in the
+        // table (server parity). Build a table where most rows LACK the
+        // optional `note` field, drop it, and assert the count is the CARRIER
+        // count.
         let mut c = migrate_schema_with_rows().await;
         // Third row that DOES carry the optional `note` field (the fixture's
         // two rows omit it).
@@ -3689,9 +3691,8 @@ mod tests {
         let result = c.migrate_schema(&directives, false).unwrap();
         assert!(result.applied);
         assert_eq!(result.directives[0].op, "dropField");
-        // Counts every row in the table (server `ids.len()`), NOT just the
-        // single row that had the field.
-        assert_eq!(result.directives[0].affected_rows, 3);
+        // Counts only the single row that carried the field, not all 3 rows.
+        assert_eq!(result.directives[0].affected_rows, 1);
 
         // The field is nonetheless removed from the row that carried it, and
         // the derived schema no longer declares it.
