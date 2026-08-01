@@ -117,8 +117,10 @@ impl From<sqlx::Error> for RtDbError {
             return Self::conflict(format!("unique constraint{constraint} violated"));
         }
         tracing::error!(error = %err, "sqlx error");
-        // Never leak Postgres error text (relation/column/constraint names);
-        // the full error is already logged above.
+        // For non-conflict errors, never leak Postgres error text
+        // (relation/column names); the CONFLICT branch above intentionally
+        // surfaces the constraint name as a schema identifier. The full
+        // error is already logged above.
         Self::internal("internal error")
     }
 }
