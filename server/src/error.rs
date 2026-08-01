@@ -13,6 +13,7 @@ pub enum ErrorCode {
     BadRequest,
     Internal,
     RateLimited,
+    Conflict,
 }
 
 /// Optional `Retry-After` hint, in seconds, attached to a `RateLimited` error.
@@ -82,6 +83,13 @@ impl RtDbError {
         }
     }
 
+    /// A uniqueness / conflict violation (HTTP 409). Used for a Postgres
+    /// `unique_violation` (SQLSTATE 23505) on a `UNIQUE` index, both at
+    /// `CREATE UNIQUE INDEX` time and on a colliding write inside `execute_txn`.
+    pub fn conflict(msg: impl Into<String>) -> Self {
+        Self::new(ErrorCode::Conflict, msg)
+    }
+
     pub fn status(&self) -> StatusCode {
         match self.code {
             ErrorCode::Unauthorized => StatusCode::UNAUTHORIZED,
@@ -92,15 +100,25 @@ impl RtDbError {
             ErrorCode::BadRequest => StatusCode::BAD_REQUEST,
             ErrorCode::Internal => StatusCode::INTERNAL_SERVER_ERROR,
             ErrorCode::RateLimited => StatusCode::TOO_MANY_REQUESTS,
+            ErrorCode::Conflict => StatusCode::CONFLICT,
         }
     }
 }
 
 impl From<sqlx::Error> for RtDbError {
     fn from(err: sqlx::Error) -> Self {
+        if let Some(db) = err.as_database_error()
+            && db.code().as_deref() == Some("23505")
+        {
+            let constraint = db
+                .constraint()
+                .map(|c| format!(" '{c}'"))
+                .unwrap_or_default();
+            return Self::conflict(format!("unique constraint{constraint} violated"));
+        }
         tracing::error!(error = %err, "sqlx error");
-        // Never leak Postgres error text (relation/column names, constraint
-        // details) to clients; the full error is already logged above.
+        // Never leak Postgres error text (relation/column/constraint names);
+        // the full error is already logged above.
         Self::internal("internal error")
     }
 }
@@ -170,6 +188,7 @@ mod tests {
             RtDbError::rate_limited(30).status(),
             StatusCode::TOO_MANY_REQUESTS
         );
+        assert_eq!(RtDbError::conflict("x").status(), StatusCode::CONFLICT);
     }
 
     #[test]
@@ -196,5 +215,19 @@ mod tests {
         // regression on all pre-existing error responses.
         let v = serde_json::to_value(RtDbError::bad_request("x")).unwrap();
         assert_eq!(v, json!({"code": "BAD_REQUEST", "message": "x"}));
+    }
+
+    #[test]
+    fn conflict_error_maps_to_http_409() {
+        assert_eq!(RtDbError::conflict("dup").status(), StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn conflict_error_serializes_to_wire_envelope() {
+        let err = RtDbError::conflict("unique index 'i_t_by_email' violated");
+        assert_eq!(
+            serde_json::to_value(&err).unwrap(),
+            json!({"code": "CONFLICT", "message": "unique index 'i_t_by_email' violated"})
+        );
     }
 }
