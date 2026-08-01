@@ -253,7 +253,7 @@ MigrateResult {
 }
 DirectiveReport {
   type:          <op>,
-  affectedRows:  i64,
+  affectedRows:  i64,   // rows whose stored document changed (field-carriers), not every row
   castFailures:  [{ id, value }],   // changeType only; empty otherwise
   sampleChanges: [{ id, before, after }]   // capped (e.g. 10), data ops only
 }
