@@ -1409,7 +1409,7 @@ impl InMemoryRtDbClient {
     ///
     /// Ports `mutate` in `ts-client/src/in_memory.ts:528-540`: a `mut_id` that
     /// has been seen before short-circuits with the cached results; otherwise
-    /// the txn runs through [`execute_transaction`](Self::execute_transaction)
+    /// the txn runs through `execute_transaction`
     /// and, on success, the results are cached under `mut_id` for next time.
     pub async fn mutate(
         &mut self,
@@ -2682,7 +2682,7 @@ pub fn coerce_index_value(
 /// (`ts-client/src/in_memory.ts:329-350`): numbers compare numerically, strings
 /// lexicographically, booleans as `false < true`; nulls sort last (asc) / first
 /// (desc, via the caller flipping the result). Mixed types fall back to
-/// [`Ordering::Equal`] — indexed columns are single-type by schema, so this is
+/// [`Ordering::Equal`](std::cmp::Ordering) — indexed columns are single-type by schema, so this is
 /// unreachable in practice.
 ///
 /// `pg` selects the comparison domain. `PgType::Int64` parses the decimal

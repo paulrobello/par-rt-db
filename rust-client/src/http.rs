@@ -145,7 +145,7 @@ impl RtDbHttpClient {
     /// `{ok:false,error}` (standard envelope) and never fails the call — only a
     /// db-level auth failure, an empty `queries` array, or a transport error
     /// surfaces as [`RtDbError`]. The returned vector is length-aligned with the
-    /// input order; the caller narrows each [`BatchQueryOutcome::result`] based
+    /// input order; the caller narrows each [`BatchQueryOutcome::result`](crate::wire::BatchQueryOutcome) based
     /// on the terminal it used for that query (the raw value is `serde_json::Value`
     /// because a batch spans terminals, unlike the per-call `T` of [`run`]).
     ///
@@ -860,7 +860,7 @@ impl RtDbHttpClient {
     /// Owner-bypass: an admin writes documents across every database regardless
     /// of `ownerField`. Mirrors [`mutate`](Self::mutate) but routes through the
     /// admin path with `db` in the URL, so the body omits `db`. Returns one
-    /// [`StepResult`](crate::mutation::StepResult) per step.
+    /// [`StepResult`] per step.
     pub async fn admin_mutate(
         &self,
         db: &str,
