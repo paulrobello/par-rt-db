@@ -331,20 +331,24 @@ pub async fn push_schema(
                         "SELECT {grouped} FROM \"{pg_schema_name}\".\"{table_ident}\"{where_sql} \
                          GROUP BY {grouped} HAVING count(*) > 1 LIMIT 5"
                     );
-                    let dupes: Result<Vec<sqlx::postgres::PgRow>, _> =
-                        sqlx::query(&sql).fetch_all(&mut *tx).await;
-                    if let Ok(rows) = dupes
-                        && !rows.is_empty()
-                    {
-                        return Err(RtDbError::conflict(format!(
-                            "unique index '{}' cannot be created: {} existing row(s) duplicate its key",
-                            index.name,
-                            rows.len()
-                        )));
+                    match sqlx::query(&sql).fetch_all(&mut *tx).await {
+                        Ok(rows) if !rows.is_empty() => {
+                            return Err(RtDbError::conflict(format!(
+                                "unique index '{}' cannot be created: {} existing row(s) duplicate its key",
+                                index.name,
+                                rows.len()
+                            )));
+                        }
+                        // A pre-check fetch error is unexpected (cols is
+                        // non-empty and the table exists in the tx); warn and
+                        // fall through — CREATE UNIQUE INDEX remains the
+                        // authoritative, race-free check either way.
+                        Err(e) => tracing::warn!(
+                            error = %e,
+                            "unique-index dup pre-check failed; deferring to CREATE UNIQUE INDEX",
+                        ),
+                        Ok(_) => {}
                     }
-                    // A fetch error is unexpected (cols is non-empty for an
-                    // index, and the table exists in the tx); fall through and
-                    // let CREATE UNIQUE INDEX decide authoritatively.
                 }
 
                 let unique_kw = if index.unique { "UNIQUE " } else { "" };
