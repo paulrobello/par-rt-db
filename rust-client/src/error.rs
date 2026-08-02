@@ -16,13 +16,23 @@ pub enum ErrorCode {
     /// Unique-index violation (mirrors server `error::ErrorCode::Conflict`,
     /// HTTP 409). Serialized as `"CONFLICT"` by the container `rename_all`.
     Conflict,
+    /// Mirrors server `error::ErrorCode::RateLimited` (HTTP 429). Serialized
+    /// `"RATE_LIMITED"`; the carrying envelope includes `retryAfter` when set.
+    RateLimited,
 }
 
-/// Raw `{code, message}` as it appears on the wire (HTTP body / WS error frame).
+/// Raw `{code, message, retryAfter?}` as it appears on the wire (HTTP body /
+/// WS error frame). `retry_after` is present only on `RATE_LIMITED`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ErrorEnvelope {
     pub code: ErrorCode,
     pub message: String,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "retryAfter"
+    )]
+    pub retry_after: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, thiserror::Error)]
@@ -30,6 +40,12 @@ pub struct ErrorEnvelope {
 pub struct RtDbError {
     pub code: ErrorCode,
     pub message: String,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "retryAfter"
+    )]
+    pub retry_after: Option<u32>,
 }
 
 impl RtDbError {
@@ -37,6 +53,7 @@ impl RtDbError {
         Self {
             code,
             message: message.into(),
+            retry_after: None,
         }
     }
 
@@ -44,11 +61,22 @@ impl RtDbError {
         Self {
             code: env.code,
             message: env.message,
+            retry_after: env.retry_after,
         }
     }
 
     pub fn internal(message: impl Into<String>) -> Self {
         Self::new(ErrorCode::Internal, message)
+    }
+
+    /// Rate-limit denial mirroring the server's `RtDbError::rate_limited`
+    /// (`code: RATE_LIMITED`, `retryAfter: retry_after_secs`).
+    pub fn rate_limited(retry_after_secs: u32) -> Self {
+        Self {
+            code: ErrorCode::RateLimited,
+            message: "rate limit exceeded".to_string(),
+            retry_after: Some(retry_after_secs),
+        }
     }
 }
 
@@ -99,6 +127,7 @@ mod tests {
             ErrorCode::BadRequest,
             ErrorCode::Internal,
             ErrorCode::Conflict,
+            ErrorCode::RateLimited,
         ];
         for c in all {
             let v = serde_json::to_value(c).unwrap();
@@ -169,5 +198,26 @@ mod tests {
         let err = retry_on_precondition::<_, _, i64>(f, 5).await.unwrap_err();
         assert_eq!(err.code, ErrorCode::NotFound);
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn rate_limited_round_trips_with_retry_after() {
+        let err = RtDbError::rate_limited(42);
+        let v = serde_json::to_value(&err).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({"code":"RATE_LIMITED","message":"rate limit exceeded","retryAfter":42})
+        );
+        let back: RtDbError = serde_json::from_value(v).unwrap();
+        assert_eq!(back.code, ErrorCode::RateLimited);
+        assert_eq!(back.retry_after, Some(42));
+    }
+
+    #[test]
+    fn non_rate_limited_error_omits_retry_after() {
+        // Wire shape stays {code, message} for every non-rate error — the field
+        // is skip-serialized when None, guarding a wire-shape regression.
+        let v = serde_json::to_value(RtDbError::new(ErrorCode::BadRequest, "x")).unwrap();
+        assert_eq!(v, serde_json::json!({"code":"BAD_REQUEST","message":"x"}));
     }
 }
