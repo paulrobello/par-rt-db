@@ -1004,6 +1004,110 @@ kanban item done --id 019fbe205cf57302af1f72f8c1e9ea8b
 
 ---
 
+---
+
+## Task 9: BUG 1 — pushSchema fails after migrate dropIndex (orphan `f_` column)
+
+**Kanban:** `019fc00b9f817a93a8331461a63da5bb` (HIGH, prod-hit). Folded into this branch per user direction.
+
+**Files:**
+- Modify: `server/src/ddl.rs` (line ~218: `ADD COLUMN` → `ADD COLUMN IF NOT EXISTS`)
+- Modify: `server/src/migrate.rs` (line ~487, `Directive::DropIndex` arm: drop orphan backing columns)
+- Test: `server/tests/migration_test.rs` (append)
+
+**Root cause:** migrate `dropIndex` drops the index + its schema-metadata entry but NOT the Postgres backing `f_<field>` column. The next `push_schema` treats the field as newly-indexed and runs `ALTER TABLE ADD COLUMN f_<field>` (no `IF NOT EXISTS`); Postgres rejects "column already exists" → 500 INTERNAL.
+
+**Interfaces:**
+- Consumes: `ddl::pg_col`/`pg_table`/`pg_schema`, `schema::indexed_fields`. `apply_one(tx, schema_name, old, derived, d, fx)` has `old: &SchemaDef` (pre-migration) and `derived: &SchemaDef` (post-migration) in scope at the DropIndex arm.
+- Produces: a clean `dropIndex` that leaves no orphan column; a tolerant `ADD COLUMN`.
+
+- [ ] **Step 1: ddl.rs — tolerant ADD COLUMN (one line)**
+
+At `server/src/ddl.rs` ~line 218, change `ADD COLUMN` to `ADD COLUMN IF NOT EXISTS`:
+
+```rust
+                    sqlx::query(&format!(
+                        "ALTER TABLE \"{pg_schema_name}\".\"{table_ident}\" ADD COLUMN IF NOT EXISTS \"{col}\" {pg_type}"
+                    ))
+```
+
+(The trailing backfill `UPDATE … SET col = expr WHERE doc ? 'field'` is already idempotent, so no other change is needed there.)
+
+- [ ] **Step 2: migrate.rs — drop orphan backing columns in `Directive::DropIndex`**
+
+In the `Directive::DropIndex { table, name }` arm of `apply_one` (`server/src/migrate.rs` ~line 487), after the existing `DROP INDEX IF EXISTS`, drop the backing column(s) that no remaining index uses. The dropped index's fields come from `old` (pre-migration); `derived` (post-migration, with the index removed) tells us which fields are still indexed:
+
+```rust
+        Directive::DropIndex { table, name } => {
+            let idx = format!("i_{}_{}", table.to_lowercase(), name.to_lowercase());
+            sqlx::query(&format!("DROP INDEX IF EXISTS \"{schema_name}\".\"{idx}\""))
+                .execute(&mut **tx)
+                .await?;
+            // Drop backing f_ columns that the dropped index owned and NO
+            // remaining index still uses — otherwise the orphan column makes a
+            // later push_schema's ADD COLUMN fail with "column already exists".
+            let old_table = old.tables.get(table);
+            let derived_table = derived.tables.get(table);
+            let still_indexed: HashSet<String> = derived_table
+                .map(|t| indexed_fields(t).into_iter().collect())
+                .unwrap_or_default();
+            let dropped_fields: Vec<String> = old_table
+                .and_then(|t| t.indexes.iter().find(|i| i.name == *name))
+                .map(|i| i.fields.clone())
+                .unwrap_or_default();
+            let t_ident = pg_table(table);
+            for field_name in dropped_fields {
+                if still_indexed.contains(&field_name) {
+                    continue;
+                }
+                let col = pg_col(&field_name);
+                sqlx::query(&format!(
+                    "ALTER TABLE \"{schema_name}\".\"{t_ident}\" DROP COLUMN IF EXISTS \"{col}\""
+                ))
+                .execute(&mut **tx)
+                .await?;
+            }
+            fx.touched.insert(table.clone());
+            Ok(DirectiveReport {
+                op: "dropIndex".into(),
+                affected_rows: 0,
+                ..Default::default()
+            })
+        }
+```
+
+(Ensure `indexed_fields`, `pg_col`, `pg_table`, `HashSet` are imported in `migrate.rs` — add to the existing imports if missing.)
+
+- [ ] **Step 3: Write the failing regression test**
+
+Append to `server/tests/migration_test.rs` (mirror its existing create-db / push-schema / migrate helpers):
+
+```rust
+#[tokio::test]
+async fn drop_index_then_re_push_does_not_collide() {
+    // 1. Push a table with a field + a single-field btree index on it; insert a row.
+    // 2. migrate dropIndex that index.
+    // 3. push_schema again with the SAME index (re-add) → must succeed, not INTERNAL.
+    // 4. Assert the re-added index works (insert + query by the indexed field),
+    //    proving the orphan column was cleaned up and ADD COLUMN IF NOT EXISTS tolerated it.
+}
+```
+
+> **Implementer:** open `server/tests/migration_test.rs` and copy its exact create-db / `ddl::push_schema` / migrate (`Committers::migrate` or direct `migrate::apply_migration`) / drop-db helpers. The load-bearing assertion is step 3: before the fix it returns a 500 `INTERNAL` ("column f_<field> already exists"); after the fix it succeeds.
+
+- [ ] **Step 4: Run the test (fails before fix, passes after)** — `cd server && cargo test --test migration_test drop_index_then_re_push_does_not_collide`.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add server/src/ddl.rs server/src/migrate.rs server/tests/migration_test.rs
+git commit -m "fix(server): dropIndex drops orphan f_ columns; ADD COLUMN IF NOT EXISTS"
+```
+
+- [ ] **Step 6: Kanban** — `kanban item done --id 019fc00b9f817a93a8331461a63da5bb`.
+
+---
+
 ## Self-Review (completed)
 
 **Spec coverage:**
