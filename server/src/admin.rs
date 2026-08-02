@@ -540,7 +540,14 @@ async fn admin_query(
         return Err(RtDbError::not_found("unknown database"));
     }
     let schema = state.schemas.get(&state.pool, &db).await?;
-    let result = execute_query(&state.pool, &db, &schema, &body.query, None).await?;
+    let result = execute_query(
+        &state.pool,
+        &db,
+        &schema,
+        &body.query,
+        &crate::auth::PrincipalCtx::bypass(),
+    )
+    .await?;
     state.runtime.metrics.record_query();
     Ok(Json(AdminQueryResponse { result }))
 }
@@ -583,7 +590,12 @@ async fn admin_mutate(
     let outcome = state
         .realtime
         .committers
-        .mutate(&db, body.idempotency_key, body.txn, None)
+        .mutate(
+            &db,
+            body.idempotency_key,
+            body.txn,
+            crate::auth::PrincipalCtx::bypass(),
+        )
         .await?;
     state.runtime.metrics.record_mutation();
     Ok(Json(AdminMutateResponse {

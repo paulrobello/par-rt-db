@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use common::test_state;
 use rtdb_server::AppState;
+use rtdb_server::auth::PrincipalCtx;
 use rtdb_server::db;
 use rtdb_server::ddl;
 use rtdb_server::error::ErrorCode;
@@ -61,7 +62,7 @@ async fn insert_note(
                 doc: doc(serde_json::json!({"title": title, "body": body})),
             }],
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await
     .expect("insert note");
@@ -113,7 +114,7 @@ async fn search_returns_ranked_results() {
         &db,
         &schema,
         &search_query("search_content", "database"),
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await
     .expect("search");
@@ -148,7 +149,7 @@ async fn search_with_take_limits_results() {
         "take": 1
     }))
     .expect("query");
-    let res = execute_query(pool, &db, &schema, &q, None)
+    let res = execute_query(pool, &db, &schema, &q, &PrincipalCtx::bypass())
         .await
         .expect("search");
     let titles = titles(&res);
@@ -169,7 +170,7 @@ async fn search_with_no_matches_returns_empty() {
         &db,
         &schema,
         &search_query("search_content", "supercalifragilistic"),
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await
     .expect("search");
@@ -186,7 +187,7 @@ async fn search_unknown_index_is_bad_request() {
         &db,
         &schema,
         &search_query("nope", "database"),
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await
     .expect_err("unknown index");
@@ -205,7 +206,7 @@ async fn search_btree_index_is_bad_request() {
         &db,
         &schema,
         &search_query("by_title", "database"),
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await
     .expect_err("btree used as search");
@@ -222,7 +223,7 @@ async fn search_empty_query_is_bad_request() {
         &db,
         &schema,
         &search_query("search_content", "   "),
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await
     .expect_err("empty query");
@@ -241,7 +242,7 @@ async fn search_combined_with_index_is_bad_request() {
         "index": "by_title"
     }))
     .expect("query");
-    let err = execute_query(&state.pool, &db, &schema, &q, None)
+    let err = execute_query(&state.pool, &db, &schema, &q, &PrincipalCtx::bypass())
         .await
         .expect_err("search + index");
     assert_eq!(err.code, ErrorCode::BadRequest);
@@ -285,7 +286,7 @@ async fn adding_search_index_backfills_existing_rows() {
         &db,
         &search_schema(),
         &search_query("search_content", "database"),
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await
     .expect("search");

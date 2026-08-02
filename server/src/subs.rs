@@ -6,6 +6,7 @@ use sqlx::PgPool;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc::UnboundedSender;
 
+use crate::auth::PrincipalCtx;
 use crate::metrics::{Metrics, SkipClass};
 use crate::protocol::ServerMessage;
 use crate::query::{Order, Query, QueryResult, canonical, execute_query};
@@ -741,10 +742,11 @@ struct SubEntry {
     tx: UnboundedSender<ServerMessage>,
     last: String,
     read_set: ReadSet,
-    /// The subscriber's per-row auth identity, captured at subscribe time.
-    /// `None` = bypass (machine tokens / scheduled jobs); `Some(user_id)` =
-    /// re-run this subscription's query filtered to that user's rows.
-    owner: Option<String>,
+    /// The subscriber's per-row auth context, captured at subscribe time.
+    /// `user_id = None` = bypass (machine tokens / scheduled jobs / admin);
+    /// `Some` = re-run this subscription's query filtered to that user's rows,
+    /// and (Task 6+) resolve `$email` markers against this identity.
+    principal_ctx: PrincipalCtx,
 }
 
 /// One database's subscriptions, keyed by `(connection, queryId)`.
@@ -910,7 +912,7 @@ impl SubscriptionManager {
         query: Query,
         tx: UnboundedSender<ServerMessage>,
         last: String,
-        owner: Option<String>,
+        principal_ctx: PrincipalCtx,
         table_def: &TableDef,
         initial: &QueryResult,
     ) {
@@ -927,7 +929,7 @@ impl SubscriptionManager {
                 tx,
                 last,
                 read_set,
-                owner,
+                principal_ctx,
             },
         );
     }
@@ -995,7 +997,7 @@ impl SubscriptionManager {
             };
 
             let result =
-                match execute_query(pool, db, schema, &entry.query, entry.owner.as_deref()).await {
+                match execute_query(pool, db, schema, &entry.query, &entry.principal_ctx).await {
                     Ok(result) => result,
                     Err(err) => {
                         tracing::warn!(

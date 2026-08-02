@@ -1136,7 +1136,7 @@ async fn seed_owned_note(
                 doc,
             }],
         },
-        None,
+        &rtdb_server::auth::PrincipalCtx::bypass(),
     )
     .await
     .unwrap();

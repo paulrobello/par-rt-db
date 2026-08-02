@@ -5,6 +5,7 @@ use std::net::SocketAddr;
 use common::{
     admin_get, admin_post, admin_post_raw, fresh_db, kanban_schema_json, spawn_app, test_state,
 };
+use rtdb_server::auth::PrincipalCtx;
 use rtdb_server::db;
 use rtdb_server::txn::{Step, Transaction, execute_txn};
 
@@ -517,7 +518,7 @@ async fn export_then_import_round_trips_docs_indexes_and_schema() -> anyhow::Res
                 },
             ],
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await?;
     let project_id = insert_outcome.results[0]["id"]
@@ -543,7 +544,7 @@ async fn export_then_import_round_trips_docs_indexes_and_schema() -> anyhow::Res
                 .clone(),
             }],
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await?;
 
@@ -764,7 +765,7 @@ async fn import_db_doc_replay_failure_after_schema_commit_refreshes_schema_cache
                 .clone(),
             }],
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await?;
     let existing_id = insert_outcome.results[0]["id"]

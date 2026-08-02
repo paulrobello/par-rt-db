@@ -1,6 +1,7 @@
 mod common;
 
 use common::test_state;
+use rtdb_server::auth::PrincipalCtx;
 use rtdb_server::db;
 use rtdb_server::ddl;
 use rtdb_server::error::ErrorCode;
@@ -127,7 +128,7 @@ async fn insert_rejects_invalid_values_for_each_new_type() -> anyhow::Result<()>
                     doc: fields,
                 }],
             },
-            None,
+            &PrincipalCtx::bypass(),
         )
         .await
         .expect_err("invalid value must be a schema violation");
@@ -152,7 +153,7 @@ async fn document_round_trips_through_insert_patch_and_query() -> anyhow::Result
                 doc: valid_widget_doc(),
             }],
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await?;
     let id = outcome.results[0]["id"]
@@ -174,7 +175,7 @@ async fn document_round_trips_through_insert_patch_and_query() -> anyhow::Result
                 })),
             }],
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await?;
 
@@ -204,7 +205,7 @@ async fn document_round_trips_through_insert_patch_and_query() -> anyhow::Result
             hybrid_search: None,
             aggregate: None,
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await?;
 
@@ -392,7 +393,7 @@ async fn unique_index_dup_pre_check_returns_conflict() -> anyhow::Result<()> {
                     doc: doc(serde_json::json!({ "email": "dup@example.com" })),
                 }],
             },
-            None,
+            &PrincipalCtx::bypass(),
         )
         .await?;
     }

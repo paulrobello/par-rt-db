@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use sqlx::{PgConnection, PgPool};
 
+use crate::auth::PrincipalCtx;
 use crate::db::{new_id, now_ms, validate_db_name};
 use crate::ddl::{pg_col, pg_schema, pg_table};
 use crate::error::RtDbError;
@@ -1002,9 +1003,13 @@ pub async fn execute_txn(
     db: &str,
     schema: &SchemaDef,
     txn: &Transaction,
-    owner: Option<&str>,
+    ctx: &PrincipalCtx,
 ) -> Result<TxnOutcome, RtDbError> {
     validate_db_name(db)?;
+    // Task 5: `ctx` carries `user_id` + `email`; the row-auth helpers below use
+    // only the uid, so derive the legacy `owner: Option<&str>` view once and
+    // thread it unchanged — byte-identical ownerField/collaboratorsField behavior.
+    let owner = ctx.user_id.as_deref();
 
     if txn.steps.len() > MAX_STEPS {
         return Err(RtDbError::bad_request(format!(

@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use common::{fresh_db, kanban_schema_json, test_state};
 use rtdb_server::AppState;
+use rtdb_server::auth::PrincipalCtx;
 use rtdb_server::db;
 use rtdb_server::ddl;
 use rtdb_server::error::ErrorCode;
@@ -47,7 +48,7 @@ async fn insert_populates_typed_columns() -> anyhow::Result<()> {
                 doc: valid_project_doc(),
             }],
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await?;
 
@@ -92,7 +93,7 @@ async fn patch_merges_bumps_version_and_updates_indexed_column() -> anyhow::Resu
                 doc: valid_project_doc(),
             }],
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await?;
     let id = insert_outcome.results[0]["id"]
@@ -115,7 +116,7 @@ async fn patch_merges_bumps_version_and_updates_indexed_column() -> anyhow::Resu
                 fields,
             }],
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await?;
     assert_eq!(outcome.results, vec![serde_json::Value::Null]);
@@ -157,7 +158,7 @@ async fn patch_null_clears_optional_field() -> anyhow::Result<()> {
                 })),
             }],
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await?;
     let id = insert_outcome.results[0]["id"]
@@ -179,7 +180,7 @@ async fn patch_null_clears_optional_field() -> anyhow::Result<()> {
                 fields,
             }],
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await?;
 
@@ -220,7 +221,7 @@ async fn insert_strips_explicit_null_optional_field() -> anyhow::Result<()> {
                 doc: valid_project_doc(), // "description": null
             }],
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await?;
     let id = insert_outcome.results[0]["id"]
@@ -268,7 +269,7 @@ async fn insert_strips_explicit_null_optional_field() -> anyhow::Result<()> {
             hybrid_search: None,
             aggregate: None,
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await?;
     match query_result {
@@ -305,7 +306,7 @@ async fn patch_unknown_field_is_schema_violation() -> anyhow::Result<()> {
                 doc: valid_project_doc(),
             }],
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await?;
     let id = insert_outcome.results[0]["id"]
@@ -327,7 +328,7 @@ async fn patch_unknown_field_is_schema_violation() -> anyhow::Result<()> {
                 fields,
             }],
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await
     .expect_err("expected schema violation");
@@ -363,7 +364,7 @@ async fn replace_overwrites_doc_updates_typed_columns_and_bumps_version() -> any
                 })),
             }],
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await?;
     let id = insert_outcome.results[0]["id"]
@@ -389,7 +390,7 @@ async fn replace_overwrites_doc_updates_typed_columns_and_bumps_version() -> any
                 doc: replacement,
             }],
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await?;
     assert_eq!(outcome.results, vec![serde_json::Value::Null]);
@@ -437,7 +438,7 @@ async fn replace_missing_id_returns_not_found() -> anyhow::Result<()> {
                 doc: valid_project_doc(),
             }],
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await
     .expect_err("expected not found");
@@ -464,7 +465,7 @@ async fn replace_schema_violation_is_rejected() -> anyhow::Result<()> {
                 doc: valid_project_doc(),
             }],
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await?;
     let id = insert_outcome.results[0]["id"]
@@ -491,7 +492,7 @@ async fn replace_schema_violation_is_rejected() -> anyhow::Result<()> {
                 doc: bad_doc,
             }],
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await
     .expect_err("expected schema violation");
@@ -518,7 +519,7 @@ async fn replace_rolled_back_by_later_failed_step() -> anyhow::Result<()> {
                 doc: valid_project_doc(),
             }],
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await?;
     let id = insert_outcome.results[0]["id"]
@@ -548,7 +549,7 @@ async fn replace_rolled_back_by_later_failed_step() -> anyhow::Result<()> {
         ],
     };
 
-    let result = execute_txn(&pool, &db, &schema, &txn, None).await;
+    let result = execute_txn(&pool, &db, &schema, &txn, &PrincipalCtx::bypass()).await;
     assert!(result.is_err());
 
     let pg_schema = format!("db_{db}");
@@ -582,7 +583,7 @@ async fn delete_removes_row() -> anyhow::Result<()> {
                 doc: valid_project_doc(),
             }],
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await?;
     let id = insert_outcome.results[0]["id"]
@@ -600,7 +601,7 @@ async fn delete_removes_row() -> anyhow::Result<()> {
                 id: id.clone(),
             }],
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await?;
     assert_eq!(outcome.results, vec![serde_json::Value::Null]);
@@ -639,7 +640,7 @@ async fn delete_missing_returns_not_found() -> anyhow::Result<()> {
                 id: "0".repeat(32),
             }],
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await
     .expect_err("expected not found");
@@ -670,7 +671,7 @@ async fn failed_step_rolls_back_earlier_steps_in_same_txn() -> anyhow::Result<()
         ],
     };
 
-    let result = execute_txn(&pool, &db, &schema, &txn, None).await;
+    let result = execute_txn(&pool, &db, &schema, &txn, &PrincipalCtx::bypass()).await;
     assert!(result.is_err());
 
     let pg_schema = format!("db_{db}");
@@ -702,7 +703,7 @@ async fn expect_version_ok_and_mismatch() -> anyhow::Result<()> {
                 doc: valid_project_doc(),
             }],
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await?;
     let id = insert_outcome.results[0]["id"]
@@ -721,7 +722,7 @@ async fn expect_version_ok_and_mismatch() -> anyhow::Result<()> {
                 version: 1,
             }],
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await?;
 
@@ -736,7 +737,7 @@ async fn expect_version_ok_and_mismatch() -> anyhow::Result<()> {
                 version: 2,
             }],
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await
     .expect_err("expected precondition failed");
@@ -764,7 +765,7 @@ async fn expect_absent_free_then_occupied() -> anyhow::Result<()> {
                 eq: vec![serde_json::json!("Alpha")],
             }],
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await?;
 
@@ -778,7 +779,7 @@ async fn expect_absent_free_then_occupied() -> anyhow::Result<()> {
                 doc: valid_project_doc(),
             }],
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await?;
 
@@ -793,7 +794,7 @@ async fn expect_absent_free_then_occupied() -> anyhow::Result<()> {
                 eq: vec![serde_json::json!("Alpha")],
             }],
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await
     .expect_err("expected precondition failed");
@@ -825,7 +826,7 @@ async fn upsert_inserts_then_patches_on_by_name() -> anyhow::Result<()> {
                 patch: serde_json::Map::new(),
             }],
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await?;
     assert_eq!(outcome1.results[0]["inserted"], serde_json::json!(true));
@@ -847,7 +848,7 @@ async fn upsert_inserts_then_patches_on_by_name() -> anyhow::Result<()> {
                 patch: patch_fields,
             }],
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await?;
     assert_eq!(outcome2.results[0]["inserted"], serde_json::json!(false));
@@ -884,7 +885,7 @@ async fn eq_arity_mismatch_is_bad_request() -> anyhow::Result<()> {
                 eq: vec![serde_json::json!("0".repeat(32))],
             }],
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await
     .expect_err("expected bad request");
@@ -911,7 +912,7 @@ async fn write_set_reports_all_touched_tables() -> anyhow::Result<()> {
                 doc: valid_project_doc(),
             }],
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await?;
     let project_id = insert_project.results[0]["id"]
@@ -942,7 +943,7 @@ async fn write_set_reports_all_touched_tables() -> anyhow::Result<()> {
         ],
     };
 
-    let outcome = execute_txn(&pool, &db, &schema, &txn, None).await?;
+    let outcome = execute_txn(&pool, &db, &schema, &txn, &PrincipalCtx::bypass()).await?;
     assert_eq!(
         outcome.write_set.tables,
         BTreeSet::from(["projects".to_string(), "workItems".to_string()])
@@ -971,7 +972,7 @@ async fn upsert_multiple_matches_is_precondition_failed() -> anyhow::Result<()> 
                     doc: valid_project_doc(),
                 }],
             },
-            None,
+            &PrincipalCtx::bypass(),
         )
         .await?;
     }
@@ -989,7 +990,7 @@ async fn upsert_multiple_matches_is_precondition_failed() -> anyhow::Result<()> 
                 patch: serde_json::Map::new(),
             }],
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await
     .expect_err("expected precondition failed");
@@ -1013,7 +1014,14 @@ async fn max_steps_boundary() -> anyhow::Result<()> {
             doc: valid_project_doc(),
         })
         .collect();
-    let outcome = execute_txn(&pool, &db, &schema, &Transaction { steps: steps_256 }, None).await?;
+    let outcome = execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction { steps: steps_256 },
+        &PrincipalCtx::bypass(),
+    )
+    .await?;
     assert_eq!(outcome.results.len(), 256);
 
     let steps_257: Vec<Step> = (0..257)
@@ -1022,9 +1030,15 @@ async fn max_steps_boundary() -> anyhow::Result<()> {
             doc: valid_project_doc(),
         })
         .collect();
-    let err = execute_txn(&pool, &db, &schema, &Transaction { steps: steps_257 }, None)
-        .await
-        .expect_err("expected bad request");
+    let err = execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction { steps: steps_257 },
+        &PrincipalCtx::bypass(),
+    )
+    .await
+    .expect_err("expected bad request");
     assert_eq!(err.code, ErrorCode::BadRequest);
 
     Ok(())
@@ -1083,7 +1097,7 @@ async fn patch_recomputes_int64_indexed_column() -> anyhow::Result<()> {
                 doc: doc(serde_json::json!({ "ts": "5", "kind": "a" })),
             }],
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await?;
     let id = insert_outcome.results[0]["id"]
@@ -1118,7 +1132,7 @@ async fn patch_recomputes_int64_indexed_column() -> anyhow::Result<()> {
             hybrid_search: None,
             aggregate: None,
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await?;
     assert!(matches!(
@@ -1140,7 +1154,7 @@ async fn patch_recomputes_int64_indexed_column() -> anyhow::Result<()> {
                 fields,
             }],
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await?;
 
@@ -1171,7 +1185,7 @@ async fn patch_recomputes_int64_indexed_column() -> anyhow::Result<()> {
             hybrid_search: None,
             aggregate: None,
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await?;
     match post {
@@ -1203,7 +1217,7 @@ async fn replace_recomputes_int64_indexed_column() -> anyhow::Result<()> {
                 doc: doc(serde_json::json!({ "ts": "5", "kind": "a" })),
             }],
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await?;
     let id = insert_outcome.results[0]["id"]
@@ -1223,7 +1237,7 @@ async fn replace_recomputes_int64_indexed_column() -> anyhow::Result<()> {
                 doc: doc(serde_json::json!({ "ts": "50", "kind": "b" })),
             }],
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await?;
 
@@ -1253,7 +1267,7 @@ async fn replace_recomputes_int64_indexed_column() -> anyhow::Result<()> {
             hybrid_search: None,
             aggregate: None,
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await?;
     match post {
@@ -1364,7 +1378,7 @@ async fn duplicate_insert_on_unique_index_is_conflict_and_rolls_back() -> anyhow
                 doc: doc(serde_json::json!({ "email": "a@x", "n": 1 })),
             }],
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await?;
 
@@ -1379,7 +1393,7 @@ async fn duplicate_insert_on_unique_index_is_conflict_and_rolls_back() -> anyhow
                 doc: doc(serde_json::json!({ "email": "a@x", "n": 2 })),
             }],
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await
     .expect_err("expected conflict");
@@ -1415,7 +1429,7 @@ async fn partial_unique_allows_excluded_duplicate() -> anyhow::Result<()> {
                 doc: doc(serde_json::json!({ "slug": "x", "deleted": true })),
             }],
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await?;
     execute_txn(
@@ -1428,7 +1442,7 @@ async fn partial_unique_allows_excluded_duplicate() -> anyhow::Result<()> {
                 doc: doc(serde_json::json!({ "slug": "x", "deleted": true })),
             }],
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await?;
 
@@ -1443,7 +1457,7 @@ async fn partial_unique_allows_excluded_duplicate() -> anyhow::Result<()> {
                 doc: doc(serde_json::json!({ "slug": "x", "deleted": false })),
             }],
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await?;
 
@@ -1458,7 +1472,7 @@ async fn partial_unique_allows_excluded_duplicate() -> anyhow::Result<()> {
                 doc: doc(serde_json::json!({ "slug": "x", "deleted": false })),
             }],
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await
     .expect_err("expected conflict");
@@ -1485,7 +1499,7 @@ async fn patch_creating_collision_is_conflict() -> anyhow::Result<()> {
                 doc: doc(serde_json::json!({ "email": "a@x", "n": 1 })),
             }],
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await?;
 
@@ -1499,7 +1513,7 @@ async fn patch_creating_collision_is_conflict() -> anyhow::Result<()> {
                 doc: doc(serde_json::json!({ "email": "b@x", "n": 2 })),
             }],
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await?;
     let id_b = outcome_b.results[0]["id"].as_str().expect("id").to_string();
@@ -1520,7 +1534,7 @@ async fn patch_creating_collision_is_conflict() -> anyhow::Result<()> {
                 fields,
             }],
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await
     .expect_err("expected conflict");

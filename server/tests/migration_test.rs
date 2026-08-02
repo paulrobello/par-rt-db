@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use common::{admin_post, spawn_app, test_state, test_state_with_audit};
 use rtdb_server::AppState;
+use rtdb_server::auth::PrincipalCtx;
 use rtdb_server::db;
 use rtdb_server::ddl::push_schema;
 use rtdb_server::migrate::{MigrateRequest, MigrateResult, apply_migration, plan_migration};
@@ -65,7 +66,7 @@ async fn insert_doc(db: &Db, table: &str, doc_json: &str) -> String {
                 doc: value.as_object().expect("doc is an object").clone(),
             }],
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await
     .expect("insert doc");
@@ -850,7 +851,14 @@ async fn migrate_fires_subscription_fanout() {
     db.state
         .realtime
         .committers
-        .subscribe(&db.name, conn, "q1".to_string(), query, tx, None)
+        .subscribe(
+            &db.name,
+            conn,
+            "q1".to_string(),
+            query,
+            tx,
+            PrincipalCtx::bypass(),
+        )
         .await
         .expect("subscribe");
     let _initial = rx.try_recv().expect("initial query update");
@@ -1081,7 +1089,7 @@ async fn migrate_and_concurrent_mutate_both_land_same_db() {
                         doc: mutate_doc,
                     }],
                 },
-                None,
+                PrincipalCtx::bypass(),
             )
             .await
             .expect("concurrent mutate")

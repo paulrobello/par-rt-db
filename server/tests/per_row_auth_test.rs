@@ -2,6 +2,7 @@ mod common;
 
 use common::{admin_post, mint_user_session, spawn_app, test_state};
 use futures_util::{SinkExt, StreamExt};
+use rtdb_server::auth::PrincipalCtx;
 use rtdb_server::ddl::push_schema;
 use rtdb_server::error::ErrorCode;
 use rtdb_server::protocol::ServerMessage;
@@ -104,7 +105,7 @@ async fn seed_note(pool: &PgPool, db: &str, schema: &SchemaDef, title: &str, uid
                 doc,
             }],
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await
     .expect("seed insert");
@@ -135,7 +136,7 @@ async fn fetch_doc(
 ) -> Option<serde_json::Value> {
     let mut q = notes_query();
     q.get = Some(id.to_string());
-    match execute_query(pool, db, schema, &q, None)
+    match execute_query(pool, db, schema, &q, &PrincipalCtx::bypass())
         .await
         .expect("fetch_doc query")
     {
@@ -181,7 +182,17 @@ async fn user_reads_only_own_rows_on_owner_table() -> anyhow::Result<()> {
 
     let mut q = notes_query();
     q.take = Some(100);
-    let res = execute_query(&pool, &db, &schema, &q, Some("alice")).await?;
+    let res = execute_query(
+        &pool,
+        &db,
+        &schema,
+        &q,
+        &PrincipalCtx {
+            user_id: Some("alice".to_string()),
+            email: None,
+        },
+    )
+    .await?;
 
     let mut got = titles(res);
     got.sort();
@@ -210,7 +221,17 @@ async fn owner_filter_composes_with_client_filter() -> anyhow::Result<()> {
         field: "title".into(),
         value: serde_json::json!("a-keep"),
     });
-    let res = execute_query(&pool, &db, &schema, &q, Some("alice")).await?;
+    let res = execute_query(
+        &pool,
+        &db,
+        &schema,
+        &q,
+        &PrincipalCtx {
+            user_id: Some("alice".to_string()),
+            email: None,
+        },
+    )
+    .await?;
 
     let mut got = titles(res);
     got.sort();
@@ -229,7 +250,7 @@ async fn bypass_owner_reads_all_rows() -> anyhow::Result<()> {
 
     let mut q = notes_query();
     q.take = Some(100);
-    let res = execute_query(&pool, &db, &schema, &q, None).await?;
+    let res = execute_query(&pool, &db, &schema, &q, &PrincipalCtx::bypass()).await?;
 
     let mut got = titles(res);
     got.sort();
@@ -250,13 +271,33 @@ async fn get_point_read_filters_unowned() -> anyhow::Result<()> {
     let mut q = notes_query();
     q.get = Some(id.clone());
 
-    let bob_res = execute_query(&pool, &db, &schema, &q, Some("bob")).await?;
+    let bob_res = execute_query(
+        &pool,
+        &db,
+        &schema,
+        &q,
+        &PrincipalCtx {
+            user_id: Some("bob".to_string()),
+            email: None,
+        },
+    )
+    .await?;
     match bob_res {
         QueryResult::Doc(None) => {}
         other => panic!("bob get(alice's doc): expected Doc(None), got {other:?}"),
     }
 
-    let alice_res = execute_query(&pool, &db, &schema, &q, Some("alice")).await?;
+    let alice_res = execute_query(
+        &pool,
+        &db,
+        &schema,
+        &q,
+        &PrincipalCtx {
+            user_id: Some("alice".to_string()),
+            email: None,
+        },
+    )
+    .await?;
     match alice_res {
         QueryResult::Doc(Some(v)) => assert_eq!(v["title"], "alice's note"),
         other => panic!("alice get(own doc): expected Doc(Some), got {other:?}"),
@@ -284,7 +325,7 @@ async fn non_owner_table_is_unaffected_by_owner() -> anyhow::Result<()> {
                     doc,
                 }],
             },
-            None,
+            &PrincipalCtx::bypass(),
         )
         .await?;
     }
@@ -311,7 +352,17 @@ async fn non_owner_table_is_unaffected_by_owner() -> anyhow::Result<()> {
         hybrid_search: None,
         aggregate: None,
     };
-    let res = execute_query(&pool, &db, &schema, &q, Some("alice")).await?;
+    let res = execute_query(
+        &pool,
+        &db,
+        &schema,
+        &q,
+        &PrincipalCtx {
+            user_id: Some("alice".to_string()),
+            email: None,
+        },
+    )
+    .await?;
     let mut got: Vec<String> = match res {
         QueryResult::Docs(docs) => docs
             .into_iter()
@@ -362,7 +413,10 @@ async fn fan_out_does_not_push_cross_user_rows() -> anyhow::Result<()> {
             "alice-q".into(),
             q.clone(),
             alice_tx,
-            Some("alice".into()),
+            PrincipalCtx {
+                user_id: Some("alice".to_string()),
+                email: None,
+            },
         )
         .await?;
     state
@@ -374,7 +428,10 @@ async fn fan_out_does_not_push_cross_user_rows() -> anyhow::Result<()> {
             "bob-q".into(),
             q.clone(),
             bob_tx,
-            Some("bob".into()),
+            PrincipalCtx {
+                user_id: Some("bob".to_string()),
+                email: None,
+            },
         )
         .await?;
 
@@ -399,7 +456,7 @@ async fn fan_out_does_not_push_cross_user_rows() -> anyhow::Result<()> {
                     doc,
                 }],
             },
-            None,
+            PrincipalCtx::bypass(),
         )
         .await?;
 
@@ -487,7 +544,7 @@ async fn search_filters_to_own_rows() -> anyhow::Result<()> {
                     doc,
                 }],
             },
-            None,
+            &PrincipalCtx::bypass(),
         )
         .await?;
     }
@@ -501,13 +558,37 @@ async fn search_filters_to_own_rows() -> anyhow::Result<()> {
         ..notes_query()
     };
 
-    let alice_titles = titles(execute_query(&pool, &db, &schema, &q, Some("alice")).await?);
+    let alice_titles = titles(
+        execute_query(
+            &pool,
+            &db,
+            &schema,
+            &q,
+            &PrincipalCtx {
+                user_id: Some("alice".to_string()),
+                email: None,
+            },
+        )
+        .await?,
+    );
     assert_eq!(alice_titles, vec!["alice database".to_string()]);
 
-    let bob_titles = titles(execute_query(&pool, &db, &schema, &q, Some("bob")).await?);
+    let bob_titles = titles(
+        execute_query(
+            &pool,
+            &db,
+            &schema,
+            &q,
+            &PrincipalCtx {
+                user_id: Some("bob".to_string()),
+                email: None,
+            },
+        )
+        .await?,
+    );
     assert_eq!(bob_titles, vec!["bob database".to_string()]);
 
-    let mut bypass = titles(execute_query(&pool, &db, &schema, &q, None).await?);
+    let mut bypass = titles(execute_query(&pool, &db, &schema, &q, &PrincipalCtx::bypass()).await?);
     bypass.sort();
     assert_eq!(
         bypass,
@@ -569,7 +650,7 @@ async fn vector_search_filters_to_own_rows() -> anyhow::Result<()> {
                     doc,
                 }],
             },
-            None,
+            &PrincipalCtx::bypass(),
         )
         .await?;
     }
@@ -596,14 +677,38 @@ async fn vector_search_filters_to_own_rows() -> anyhow::Result<()> {
     };
 
     assert_eq!(
-        owners(execute_query(&pool, &db, &schema, &q.clone(), Some("alice")).await?),
+        owners(
+            execute_query(
+                &pool,
+                &db,
+                &schema,
+                &q.clone(),
+                &PrincipalCtx {
+                    user_id: Some("alice".to_string()),
+                    email: None
+                }
+            )
+            .await?
+        ),
         vec!["alice".to_string()]
     );
     assert_eq!(
-        owners(execute_query(&pool, &db, &schema, &q.clone(), Some("bob")).await?),
+        owners(
+            execute_query(
+                &pool,
+                &db,
+                &schema,
+                &q.clone(),
+                &PrincipalCtx {
+                    user_id: Some("bob".to_string()),
+                    email: None
+                }
+            )
+            .await?
+        ),
         vec!["bob".to_string()]
     );
-    let mut bypass = owners(execute_query(&pool, &db, &schema, &q, None).await?);
+    let mut bypass = owners(execute_query(&pool, &db, &schema, &q, &PrincipalCtx::bypass()).await?);
     bypass.sort();
     assert_eq!(bypass, vec!["alice".to_string(), "bob".to_string()]);
     Ok(())
@@ -670,7 +775,7 @@ async fn vector_search_composes_filter_fields_with_owner() -> anyhow::Result<()>
                     doc,
                 }],
             },
-            None,
+            &PrincipalCtx::bypass(),
         )
         .await?;
     }
@@ -688,7 +793,17 @@ async fn vector_search_composes_filter_fields_with_owner() -> anyhow::Result<()>
         ..notes_query()
     };
 
-    let res = execute_query(&pool, &db, &schema, &q, Some("alice")).await?;
+    let res = execute_query(
+        &pool,
+        &db,
+        &schema,
+        &q,
+        &PrincipalCtx {
+            user_id: Some("alice".to_string()),
+            email: None,
+        },
+    )
+    .await?;
     let docs = match res {
         QueryResult::Docs(d) => d,
         other => panic!("expected Docs, got {other:?}"),
@@ -718,7 +833,10 @@ async fn insert_auto_stamps_owner() -> anyhow::Result<()> {
                 doc,
             }],
         },
-        Some("alice"),
+        &PrincipalCtx {
+            user_id: Some("alice".to_string()),
+            email: None,
+        },
     )
     .await
     .expect("insert should succeed");
@@ -751,7 +869,10 @@ async fn insert_cannot_forge_another_users_owner() -> anyhow::Result<()> {
                 doc,
             }],
         },
-        Some("alice"),
+        &PrincipalCtx {
+            user_id: Some("alice".to_string()),
+            email: None,
+        },
     )
     .await
     .expect("insert should succeed");
@@ -803,7 +924,10 @@ async fn patch_on_unowned_doc_is_forbidden_and_atomic() -> anyhow::Result<()> {
                 },
             ],
         },
-        Some("alice"),
+        &PrincipalCtx {
+            user_id: Some("alice".to_string()),
+            email: None,
+        },
     )
     .await
     .expect_err("patch on unowned doc must fail");
@@ -825,7 +949,7 @@ async fn patch_on_unowned_doc_is_forbidden_and_atomic() -> anyhow::Result<()> {
     // ...and alice's preceding insert was rolled back (no "alice temp" row).
     let mut q = notes_query();
     q.take = Some(100);
-    let all = titles(execute_query(&pool, &db, &schema, &q, None).await?);
+    let all = titles(execute_query(&pool, &db, &schema, &q, &PrincipalCtx::bypass()).await?);
     assert!(
         !all.iter().any(|t| t == "alice temp"),
         "preceding insert must be rolled back, got {all:?}"
@@ -852,7 +976,10 @@ async fn delete_and_replace_on_unowned_doc_are_forbidden() -> anyhow::Result<()>
                 id: bob_id.clone(),
             }],
         },
-        Some("alice"),
+        &PrincipalCtx {
+            user_id: Some("alice".to_string()),
+            email: None,
+        },
     )
     .await
     .expect_err("delete on unowned doc must fail");
@@ -879,7 +1006,10 @@ async fn delete_and_replace_on_unowned_doc_are_forbidden() -> anyhow::Result<()>
                 doc: replace_doc,
             }],
         },
-        Some("alice"),
+        &PrincipalCtx {
+            user_id: Some("alice".to_string()),
+            email: None,
+        },
     )
     .await
     .expect_err("replace on unowned doc must fail");
@@ -920,7 +1050,10 @@ async fn upsert_insert_branch_stamps_and_update_branch_checks_owner() -> anyhow:
                 patch: empty_patch,
             }],
         },
-        Some("alice"),
+        &PrincipalCtx {
+            user_id: Some("alice".to_string()),
+            email: None,
+        },
     )
     .await
     .expect("upsert insert should succeed");
@@ -952,7 +1085,10 @@ async fn upsert_insert_branch_stamps_and_update_branch_checks_owner() -> anyhow:
                 patch: patch_fields,
             }],
         },
-        Some("alice"),
+        &PrincipalCtx {
+            user_id: Some("alice".to_string()),
+            email: None,
+        },
     )
     .await
     .expect_err("upsert update on unowned doc must fail");
@@ -987,7 +1123,7 @@ async fn machine_bypass_ignores_ownership() -> anyhow::Result<()> {
                 fields: patch_fields,
             }],
         },
-        None, // bypass — machine token / scheduled job
+        &PrincipalCtx::bypass(), // bypass — machine token / scheduled job
     )
     .await
     .expect("bypass patch should succeed");
@@ -1027,7 +1163,10 @@ async fn patch_cannot_transfer_ownership() -> anyhow::Result<()> {
                 fields: patch_fields,
             }],
         },
-        Some("alice"),
+        &PrincipalCtx {
+            user_id: Some("alice".to_string()),
+            email: None,
+        },
     )
     .await
     .expect("patch on owned doc should succeed");
@@ -1044,7 +1183,19 @@ async fn patch_cannot_transfer_ownership() -> anyhow::Result<()> {
 
     // And a query as bob does NOT return alice's doc.
     let q = notes_query();
-    let bob_titles = titles(execute_query(&pool, &db, &schema, &q, Some("bob")).await?);
+    let bob_titles = titles(
+        execute_query(
+            &pool,
+            &db,
+            &schema,
+            &q,
+            &PrincipalCtx {
+                user_id: Some("bob".to_string()),
+                email: None,
+            },
+        )
+        .await?,
+    );
     assert!(
         !bob_titles.iter().any(|t| t == "alice's note"),
         "bob must not see alice's note, got {bob_titles:?}"
@@ -1073,7 +1224,10 @@ async fn replace_cannot_transfer_ownership() -> anyhow::Result<()> {
                 doc: replace_doc,
             }],
         },
-        Some("alice"),
+        &PrincipalCtx {
+            user_id: Some("alice".to_string()),
+            email: None,
+        },
     )
     .await
     .expect("replace on owned doc should succeed");
@@ -1116,7 +1270,10 @@ async fn patch_owner_change_does_not_inject_into_other_users_feed() -> anyhow::R
             "bob-q".into(),
             notes_query(),
             bob_tx,
-            Some("bob".into()),
+            PrincipalCtx {
+                user_id: Some("bob".to_string()),
+                email: None,
+            },
         )
         .await?;
     drain_initial(&mut bob_rx).await;
@@ -1137,7 +1294,10 @@ async fn patch_owner_change_does_not_inject_into_other_users_feed() -> anyhow::R
                     doc: insert_doc,
                 }],
             },
-            Some("alice".into()),
+            PrincipalCtx {
+                user_id: Some("alice".to_string()),
+                email: None,
+            },
         )
         .await?;
     let alice_id = outcome.results[0]["id"]
@@ -1171,7 +1331,10 @@ async fn patch_owner_change_does_not_inject_into_other_users_feed() -> anyhow::R
                     fields: patch_fields,
                 }],
             },
-            Some("alice".into()),
+            PrincipalCtx {
+                user_id: Some("alice".to_string()),
+                email: None,
+            },
         )
         .await?;
 
@@ -1571,7 +1734,7 @@ async fn seed_collab_note(
                 doc,
             }],
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await
     .expect("seed insert");
@@ -1593,19 +1756,49 @@ async fn collab_owner_and_collaborator_both_read_shared_row() -> anyhow::Result<
     q.take = Some(100);
 
     // Alice (owner) sees it.
-    let res = execute_query(&pool, &db, &schema, &q, Some("alice")).await?;
+    let res = execute_query(
+        &pool,
+        &db,
+        &schema,
+        &q,
+        &PrincipalCtx {
+            user_id: Some("alice".to_string()),
+            email: None,
+        },
+    )
+    .await?;
     assert_eq!(titles(res), vec!["shared".to_string()]);
 
     // Bob (collaborator) sees it.
-    let res = execute_query(&pool, &db, &schema, &q, Some("bob")).await?;
+    let res = execute_query(
+        &pool,
+        &db,
+        &schema,
+        &q,
+        &PrincipalCtx {
+            user_id: Some("bob".to_string()),
+            email: None,
+        },
+    )
+    .await?;
     assert_eq!(titles(res), vec!["shared".to_string()]);
 
     // Carol (neither) does not.
-    let res = execute_query(&pool, &db, &schema, &q, Some("carol")).await?;
+    let res = execute_query(
+        &pool,
+        &db,
+        &schema,
+        &q,
+        &PrincipalCtx {
+            user_id: Some("carol".to_string()),
+            email: None,
+        },
+    )
+    .await?;
     assert!(titles(res).is_empty());
 
     // Bypass caller sees everything (machine-token / admin path unchanged).
-    let res = execute_query(&pool, &db, &schema, &q, None).await?;
+    let res = execute_query(&pool, &db, &schema, &q, &PrincipalCtx::bypass()).await?;
     assert_eq!(titles(res), vec!["shared".to_string()]);
     Ok(())
 }
@@ -1631,7 +1824,7 @@ async fn collab_missing_array_degrades_to_owner_only() -> anyhow::Result<()> {
                 doc,
             }],
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await?;
 
@@ -1640,10 +1833,37 @@ async fn collab_missing_array_degrades_to_owner_only() -> anyhow::Result<()> {
 
     // Alice sees it; bob (would-be collaborator) does not — no array to be in.
     assert_eq!(
-        titles(execute_query(&pool, &db, &schema, &q, Some("alice")).await?),
+        titles(
+            execute_query(
+                &pool,
+                &db,
+                &schema,
+                &q,
+                &PrincipalCtx {
+                    user_id: Some("alice".to_string()),
+                    email: None
+                }
+            )
+            .await?
+        ),
         vec!["alice-only".to_string()]
     );
-    assert!(titles(execute_query(&pool, &db, &schema, &q, Some("bob")).await?).is_empty());
+    assert!(
+        titles(
+            execute_query(
+                &pool,
+                &db,
+                &schema,
+                &q,
+                &PrincipalCtx {
+                    user_id: Some("bob".to_string()),
+                    email: None
+                }
+            )
+            .await?
+        )
+        .is_empty()
+    );
     Ok(())
 }
 
@@ -1659,12 +1879,34 @@ async fn collab_point_read_filters_non_collaborator() -> anyhow::Result<()> {
     q.get = Some(id.clone());
 
     for uid in ["alice", "bob"] {
-        match execute_query(&pool, &db, &schema, &q, Some(uid)).await? {
+        match execute_query(
+            &pool,
+            &db,
+            &schema,
+            &q,
+            &PrincipalCtx {
+                user_id: Some(uid.to_string()),
+                email: None,
+            },
+        )
+        .await?
+        {
             QueryResult::Doc(Some(v)) => assert_eq!(v["title"], "shared"),
             other => panic!("{uid} get(shared): expected Doc(Some), got {other:?}"),
         }
     }
-    match execute_query(&pool, &db, &schema, &q, Some("carol")).await? {
+    match execute_query(
+        &pool,
+        &db,
+        &schema,
+        &q,
+        &PrincipalCtx {
+            user_id: Some("carol".to_string()),
+            email: None,
+        },
+    )
+    .await?
+    {
         QueryResult::Doc(None) => {}
         other => panic!("carol get(shared): expected Doc(None), got {other:?}"),
     }
@@ -1693,7 +1935,10 @@ async fn collab_collaborator_can_write_non_collaborator_forbidden() -> anyhow::R
                 fields: patch_fields,
             }],
         },
-        Some("carol"),
+        &PrincipalCtx {
+            user_id: Some("carol".to_string()),
+            email: None,
+        },
     )
     .await
     .expect_err("non-collaborator patch must fail");
@@ -1716,7 +1961,10 @@ async fn collab_collaborator_can_write_non_collaborator_forbidden() -> anyhow::R
                 fields: patch_fields,
             }],
         },
-        Some("bob"),
+        &PrincipalCtx {
+            user_id: Some("bob".to_string()),
+            email: None,
+        },
     )
     .await
     .expect("collaborator patch should succeed");
@@ -1740,7 +1988,10 @@ async fn collab_collaborator_can_write_non_collaborator_forbidden() -> anyhow::R
                 id: id.clone(),
             }],
         },
-        Some("carol"),
+        &PrincipalCtx {
+            user_id: Some("carol".to_string()),
+            email: None,
+        },
     )
     .await
     .expect_err("non-collaborator delete must fail");
@@ -1757,7 +2008,10 @@ async fn collab_collaborator_can_write_non_collaborator_forbidden() -> anyhow::R
                 id: id.clone(),
             }],
         },
-        Some("bob"),
+        &PrincipalCtx {
+            user_id: Some("bob".to_string()),
+            email: None,
+        },
     )
     .await
     .expect("collaborator delete should succeed");
@@ -1789,7 +2043,10 @@ async fn collab_upsert_update_branch_checks_collaborator() -> anyhow::Result<()>
                 patch: patch.clone(),
             }],
         },
-        Some("carol"),
+        &PrincipalCtx {
+            user_id: Some("carol".to_string()),
+            email: None,
+        },
     )
     .await
     .expect_err("non-collaborator upsert-update must fail");
@@ -1809,7 +2066,10 @@ async fn collab_upsert_update_branch_checks_collaborator() -> anyhow::Result<()>
                 patch,
             }],
         },
-        Some("bob"),
+        &PrincipalCtx {
+            user_id: Some("bob".to_string()),
+            email: None,
+        },
     )
     .await
     .expect("collaborator upsert-update should succeed");
@@ -1844,7 +2104,10 @@ async fn collab_fan_out_reaches_owner_and_collaborator() -> anyhow::Result<()> {
             "alice-q".into(),
             q.clone(),
             alice_tx,
-            Some("alice".into()),
+            PrincipalCtx {
+                user_id: Some("alice".to_string()),
+                email: None,
+            },
         )
         .await?;
     state
@@ -1856,7 +2119,10 @@ async fn collab_fan_out_reaches_owner_and_collaborator() -> anyhow::Result<()> {
             "bob-q".into(),
             q.clone(),
             bob_tx,
-            Some("bob".into()),
+            PrincipalCtx {
+                user_id: Some("bob".to_string()),
+                email: None,
+            },
         )
         .await?;
     state
@@ -1868,7 +2134,10 @@ async fn collab_fan_out_reaches_owner_and_collaborator() -> anyhow::Result<()> {
             "carol-q".into(),
             q,
             carol_tx,
-            Some("carol".into()),
+            PrincipalCtx {
+                user_id: Some("carol".to_string()),
+                email: None,
+            },
         )
         .await?;
 
@@ -1898,7 +2167,7 @@ async fn collab_fan_out_reaches_owner_and_collaborator() -> anyhow::Result<()> {
                     doc: shared,
                 }],
             },
-            None,
+            PrincipalCtx::bypass(),
         )
         .await?;
 
@@ -1955,7 +2224,19 @@ async fn collab_or_predicate_composes_with_client_filter() -> anyhow::Result<()>
 
     // Bob (collaborator): the OR predicate admits the row, AND the client
     // filter narrows to title="x" → exactly one match.
-    let mut got = titles(execute_query(&pool, &db, &schema, &q, Some("bob")).await?);
+    let mut got = titles(
+        execute_query(
+            &pool,
+            &db,
+            &schema,
+            &q,
+            &PrincipalCtx {
+                user_id: Some("bob".to_string()),
+                email: None,
+            },
+        )
+        .await?,
+    );
     got.sort();
     assert_eq!(got, vec!["x".to_string()]);
 
@@ -1966,7 +2247,19 @@ async fn collab_or_predicate_composes_with_client_filter() -> anyhow::Result<()>
         field: "title".into(),
         value: serde_json::json!("zz"),
     });
-    let got = titles(execute_query(&pool, &db, &schema, &q2, Some("bob")).await?);
+    let got = titles(
+        execute_query(
+            &pool,
+            &db,
+            &schema,
+            &q2,
+            &PrincipalCtx {
+                user_id: Some("bob".to_string()),
+                email: None,
+            },
+        )
+        .await?,
+    );
     assert!(got.is_empty());
     Ok(())
 }

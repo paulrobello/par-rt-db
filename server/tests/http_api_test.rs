@@ -3,7 +3,7 @@ mod common;
 use std::net::SocketAddr;
 
 use common::{admin_post, fresh_db, spawn_app, test_state};
-use rtdb_server::auth::{Principal, authorize};
+use rtdb_server::auth::{Principal, PrincipalCtx, authorize};
 use rtdb_server::db;
 use rtdb_server::error::ErrorCode;
 use rtdb_server::protocol::ServerMessage;
@@ -309,7 +309,14 @@ async fn http_mutate_triggers_registered_subscription() -> anyhow::Result<()> {
     state
         .realtime
         .committers
-        .subscribe(&name, conn, "q1".to_string(), query, tx, None)
+        .subscribe(
+            &name,
+            conn,
+            "q1".to_string(),
+            query,
+            tx,
+            PrincipalCtx::bypass(),
+        )
         .await?;
     rx.try_recv().expect("initial query update");
 

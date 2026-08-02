@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 use common::test_state;
 use rtdb_server::AppState;
+use rtdb_server::auth::PrincipalCtx;
 use rtdb_server::ddl::push_schema;
 use rtdb_server::error::ErrorCode;
 use rtdb_server::query::{
@@ -1343,7 +1344,7 @@ async fn combination_matrix_cascade_outcomes_match_expectations() -> anyhow::Res
     for case in CASES {
         let mut q = base_query();
         (case.build)(&mut q);
-        let result = execute_query(&state.pool, &db, &schema, &q, None).await;
+        let result = execute_query(&state.pool, &db, &schema, &q, &PrincipalCtx::bypass()).await;
         let actual = match result {
             Ok(_) => Outcome::Accept,
             Err(e) if e.code == ErrorCode::BadRequest => Outcome::Reject,

@@ -20,7 +20,7 @@ use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio::time::{Instant, interval};
 
 use crate::AppState;
-use crate::auth::{Principal, authed_user, authorize, is_admin, owner_of, resolve_bearer};
+use crate::auth::{Principal, PrincipalCtx, authed_user, authorize, is_admin, resolve_bearer};
 use crate::db::now_ms;
 use crate::error::{ErrorCode, RtDbError};
 use crate::protocol::{ClientMessage, ServerMessage};
@@ -368,12 +368,13 @@ async fn handle_text_frame(
                         });
                         return false;
                     }
-                    // Admins subscribe with owner=None (see every row); everyone
-                    // else is scoped to owner_of(principal).
-                    let owner = if admin {
-                        None
+                    // Admins subscribe with a bypass ctx (user_id None — they
+                    // see every row); everyone else is scoped to their own
+                    // identity via `principal.row_ctx()`.
+                    let principal_ctx = if admin {
+                        PrincipalCtx::bypass()
                     } else {
-                        owner_of(principal).map(|s| s.to_string())
+                        principal.row_ctx()
                     };
                     // Time the initial-query arm: committers.subscribe().await
                     // resolves after the initial query has run, its result been
@@ -386,7 +387,14 @@ async fn handle_text_frame(
                     let sub_result = state
                         .realtime
                         .committers
-                        .subscribe(db, conn_id, query_id.clone(), *query, out_tx.clone(), owner)
+                        .subscribe(
+                            db,
+                            conn_id,
+                            query_id.clone(),
+                            *query,
+                            out_tx.clone(),
+                            principal_ctx,
+                        )
                         .await;
                     let elapsed_us = t.elapsed().as_micros() as u64;
                     match sub_result {
@@ -445,15 +453,15 @@ async fn handle_text_frame(
                         });
                         return false;
                     }
-                    let owner = if admin {
-                        None
+                    let principal_ctx = if admin {
+                        PrincipalCtx::bypass()
                     } else {
-                        owner_of(principal).map(|s| s.to_string())
+                        principal.row_ctx()
                     };
                     match state
                         .realtime
                         .committers
-                        .mutate(db, idempotency_key, txn, owner)
+                        .mutate(db, idempotency_key, txn, principal_ctx)
                         .await
                     {
                         Ok(outcome) => {

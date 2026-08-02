@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use common::{fresh_db, kanban_schema_json, test_state};
 use rtdb_server::AppState;
+use rtdb_server::auth::PrincipalCtx;
 use rtdb_server::db;
 use rtdb_server::ddl;
 use rtdb_server::error::ErrorCode;
@@ -47,7 +48,7 @@ async fn insert_project(
                 })),
             }],
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await?;
     Ok(outcome.results[0]["id"]
@@ -80,7 +81,7 @@ async fn insert_work_item(
                 })),
             }],
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await?;
     // Guarantee strictly increasing `created_at` between inserts so
@@ -169,7 +170,7 @@ async fn get_by_id_returns_doc_with_system_fields() -> anyhow::Result<()> {
             hybrid_search: None,
             aggregate: None,
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await?;
 
@@ -223,7 +224,7 @@ async fn get_missing_returns_null() -> anyhow::Result<()> {
             hybrid_search: None,
             aggregate: None,
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await?;
 
@@ -268,7 +269,7 @@ async fn get_combined_with_index_is_bad_request() -> anyhow::Result<()> {
             hybrid_search: None,
             aggregate: None,
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await
     .expect_err("expected bad request");
@@ -316,7 +317,7 @@ async fn get_combined_with_paginate_is_bad_request() -> anyhow::Result<()> {
             hybrid_search: None,
             aggregate: None,
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await
     .expect_err("expected bad request");
@@ -361,7 +362,7 @@ async fn unique_combined_with_take_is_bad_request() -> anyhow::Result<()> {
             hybrid_search: None,
             aggregate: None,
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await
     .expect_err("expected bad request");
@@ -407,7 +408,7 @@ async fn full_eq_compound_index_orders_by_created_at_asc() -> anyhow::Result<()>
             hybrid_search: None,
             aggregate: None,
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await?;
 
@@ -451,7 +452,7 @@ async fn full_eq_compound_index_order_desc_reverses() -> anyhow::Result<()> {
             hybrid_search: None,
             aggregate: None,
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await?;
 
@@ -497,7 +498,7 @@ async fn prefix_eq_on_compound_index_sorts_by_remaining_index_field_then_created
             hybrid_search: None,
             aggregate: None,
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await?;
 
@@ -550,7 +551,7 @@ async fn unique_on_by_name_returns_single_doc() -> anyhow::Result<()> {
             hybrid_search: None,
             aggregate: None,
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await?;
 
@@ -600,7 +601,7 @@ async fn unique_with_duplicate_name_is_precondition_failed() -> anyhow::Result<(
             hybrid_search: None,
             aggregate: None,
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await
     .expect_err("expected precondition failed");
@@ -646,7 +647,7 @@ async fn no_index_collect_returns_all_docs_in_created_at_order() -> anyhow::Resu
             hybrid_search: None,
             aggregate: None,
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await?;
 
@@ -690,7 +691,7 @@ async fn take_over_cap_is_bad_request() -> anyhow::Result<()> {
             hybrid_search: None,
             aggregate: None,
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await
     .expect_err("expected bad request");
@@ -735,7 +736,7 @@ async fn unknown_index_is_bad_request() -> anyhow::Result<()> {
             hybrid_search: None,
             aggregate: None,
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await
     .expect_err("expected bad request");
@@ -780,7 +781,7 @@ async fn eq_longer_than_index_fields_is_bad_request() -> anyhow::Result<()> {
             hybrid_search: None,
             aggregate: None,
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await
     .expect_err("expected bad request");
@@ -823,7 +824,7 @@ async fn unknown_table_is_not_found() -> anyhow::Result<()> {
             hybrid_search: None,
             aggregate: None,
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await
     .expect_err("expected not found");
@@ -868,7 +869,7 @@ async fn take_zero_returns_empty_docs() -> anyhow::Result<()> {
             hybrid_search: None,
             aggregate: None,
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await?;
 
@@ -911,18 +912,18 @@ async fn unique_without_index_scans_whole_table() -> anyhow::Result<()> {
         aggregate: None,
     };
 
-    let result = execute_query(&pool, &db, &schema, &unique_query, None).await?;
+    let result = execute_query(&pool, &db, &schema, &unique_query, &PrincipalCtx::bypass()).await?;
     assert!(matches!(result, QueryResult::Doc(None)));
 
     let project_id = insert_project(&pool, &db, &schema, "Alpha").await?;
-    let result = execute_query(&pool, &db, &schema, &unique_query, None).await?;
+    let result = execute_query(&pool, &db, &schema, &unique_query, &PrincipalCtx::bypass()).await?;
     match result {
         QueryResult::Doc(Some(value)) => assert_eq!(value["_id"], serde_json::json!(project_id)),
         other => panic!("expected Doc(Some(_)), got {other:?}"),
     }
 
     insert_project(&pool, &db, &schema, "Beta").await?;
-    let err = execute_query(&pool, &db, &schema, &unique_query, None)
+    let err = execute_query(&pool, &db, &schema, &unique_query, &PrincipalCtx::bypass())
         .await
         .expect_err("expected precondition failed");
     assert_eq!(err.code, ErrorCode::PreconditionFailed);
@@ -963,8 +964,8 @@ async fn canonical_is_stable_for_identical_results() -> anyhow::Result<()> {
         aggregate: None,
     };
 
-    let first = execute_query(&pool, &db, &schema, &query, None).await?;
-    let second = execute_query(&pool, &db, &schema, &query, None).await?;
+    let first = execute_query(&pool, &db, &schema, &query, &PrincipalCtx::bypass()).await?;
+    let second = execute_query(&pool, &db, &schema, &query, &PrincipalCtx::bypass()).await?;
     assert_eq!(canonical(&first), canonical(&second));
 
     Ok(())
@@ -1008,7 +1009,7 @@ async fn range_gt_excludes_boundary_and_sorts_by_bound_field() -> anyhow::Result
             hybrid_search: None,
             aggregate: None,
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await?;
 
@@ -1055,7 +1056,7 @@ async fn range_gte_includes_boundary() -> anyhow::Result<()> {
             hybrid_search: None,
             aggregate: None,
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await?;
 
@@ -1108,7 +1109,7 @@ async fn range_gt_and_lt_bounded_numeric_range() -> anyhow::Result<()> {
             hybrid_search: None,
             aggregate: None,
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await?;
 
@@ -1155,7 +1156,7 @@ async fn range_bounded_numeric_range_with_order_desc_and_take() -> anyhow::Resul
             hybrid_search: None,
             aggregate: None,
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await?;
 
@@ -1199,7 +1200,7 @@ async fn range_without_eq_prefix_applies_to_first_index_field() -> anyhow::Resul
             hybrid_search: None,
             aggregate: None,
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await?;
 
@@ -1246,7 +1247,7 @@ async fn range_gt_and_gte_both_set_is_bad_request() -> anyhow::Result<()> {
             hybrid_search: None,
             aggregate: None,
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await
     .expect_err("expected bad request");
@@ -1291,7 +1292,7 @@ async fn range_lt_and_lte_both_set_is_bad_request() -> anyhow::Result<()> {
             hybrid_search: None,
             aggregate: None,
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await
     .expect_err("expected bad request");
@@ -1336,7 +1337,7 @@ async fn range_without_index_is_bad_request() -> anyhow::Result<()> {
             hybrid_search: None,
             aggregate: None,
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await
     .expect_err("expected bad request");
@@ -1381,7 +1382,7 @@ async fn range_with_no_remaining_index_field_is_bad_request() -> anyhow::Result<
             hybrid_search: None,
             aggregate: None,
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await
     .expect_err("expected bad request");
@@ -1426,7 +1427,7 @@ async fn range_combined_with_get_is_bad_request() -> anyhow::Result<()> {
             hybrid_search: None,
             aggregate: None,
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await
     .expect_err("expected bad request");
@@ -1471,7 +1472,7 @@ async fn range_value_wrong_type_is_bad_request() -> anyhow::Result<()> {
             hybrid_search: None,
             aggregate: None,
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await
     .expect_err("expected bad request");
@@ -1516,7 +1517,7 @@ async fn range_lte_includes_boundary_value() -> anyhow::Result<()> {
             hybrid_search: None,
             aggregate: None,
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await?;
 
@@ -1565,7 +1566,7 @@ async fn first_on_no_matching_docs_returns_null() -> anyhow::Result<()> {
             hybrid_search: None,
             aggregate: None,
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await?;
 
@@ -1609,7 +1610,7 @@ async fn first_with_single_matching_doc_returns_it() -> anyhow::Result<()> {
             hybrid_search: None,
             aggregate: None,
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await?;
 
@@ -1660,7 +1661,7 @@ async fn first_combined_with_range_bound_returns_smallest_in_ascending_order() -
             hybrid_search: None,
             aggregate: None,
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await?;
 
@@ -1709,7 +1710,7 @@ async fn first_combined_with_range_bound_and_order_desc_returns_largest() -> any
             hybrid_search: None,
             aggregate: None,
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await?;
 
@@ -1758,7 +1759,7 @@ async fn first_combined_with_take_is_bad_request() -> anyhow::Result<()> {
             hybrid_search: None,
             aggregate: None,
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await
     .expect_err("expected bad request");
@@ -1803,7 +1804,7 @@ async fn first_combined_with_unique_is_bad_request() -> anyhow::Result<()> {
             hybrid_search: None,
             aggregate: None,
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await
     .expect_err("expected bad request");
@@ -1848,7 +1849,7 @@ async fn first_combined_with_get_is_bad_request() -> anyhow::Result<()> {
             hybrid_search: None,
             aggregate: None,
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await
     .expect_err("expected bad request");
@@ -1895,7 +1896,7 @@ async fn count_on_empty_table_returns_zero() -> anyhow::Result<()> {
             hybrid_search: None,
             aggregate: None,
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await?;
 
@@ -1939,7 +1940,7 @@ async fn count_with_eq_prefix_counts_matching_subset() -> anyhow::Result<()> {
             hybrid_search: None,
             aggregate: None,
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await?;
 
@@ -1983,7 +1984,7 @@ async fn count_with_range_bound_counts_matching_subset() -> anyhow::Result<()> {
             hybrid_search: None,
             aggregate: None,
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await?;
 
@@ -2027,7 +2028,7 @@ async fn count_combined_with_order_is_bad_request() -> anyhow::Result<()> {
             hybrid_search: None,
             aggregate: None,
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await
     .expect_err("expected bad request");
@@ -2072,7 +2073,7 @@ async fn count_combined_with_take_is_bad_request() -> anyhow::Result<()> {
             hybrid_search: None,
             aggregate: None,
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await
     .expect_err("expected bad request");
@@ -2117,7 +2118,7 @@ async fn count_combined_with_unique_is_bad_request() -> anyhow::Result<()> {
             hybrid_search: None,
             aggregate: None,
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await
     .expect_err("expected bad request");
@@ -2162,7 +2163,7 @@ async fn count_combined_with_first_is_bad_request() -> anyhow::Result<()> {
             hybrid_search: None,
             aggregate: None,
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await
     .expect_err("expected bad request");
@@ -2207,7 +2208,7 @@ async fn count_combined_with_get_is_bad_request() -> anyhow::Result<()> {
             hybrid_search: None,
             aggregate: None,
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await
     .expect_err("expected bad request");
@@ -2284,7 +2285,7 @@ async fn distinct_returns_unique_values_of_next_index_field() -> anyhow::Result<
             vec![serde_json::json!(project_id)],
             |_| {},
         ),
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await?;
 
@@ -2325,7 +2326,7 @@ async fn distinct_with_eq_prefix_narrows_distinct_set() -> anyhow::Result<()> {
             vec![serde_json::json!(project_id)],
             |_| {},
         ),
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await?;
 
@@ -2365,7 +2366,7 @@ async fn distinct_with_range_bound_restricts_matching_set() -> anyhow::Result<()
                 q.lt = Some(serde_json::json!(5.0));
             },
         ),
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await?;
 
@@ -2404,7 +2405,7 @@ async fn distinct_capped_by_max_take() -> anyhow::Result<()> {
             vec![serde_json::json!(project_id)],
             |_| {},
         ),
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await?;
 
@@ -2428,7 +2429,7 @@ async fn distinct_without_index_is_bad_request() -> anyhow::Result<()> {
         &db,
         &schema,
         &distinct_query(None, vec![], |_| {}),
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await
     .expect_err("expected bad request");
@@ -2458,7 +2459,7 @@ async fn distinct_with_no_field_beyond_eq_prefix_is_bad_request() -> anyhow::Res
             vec![serde_json::json!(project_id), serde_json::json!("backlog")],
             |_| {},
         ),
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await
     .expect_err("expected bad request");
@@ -2479,7 +2480,7 @@ async fn distinct_combined_with_count_is_bad_request() -> anyhow::Result<()> {
 
     let mut q = distinct_query(Some("by_status"), vec![], |_| {});
     q.count = true;
-    let err = execute_query(&pool, &db, &schema, &q, None)
+    let err = execute_query(&pool, &db, &schema, &q, &PrincipalCtx::bypass())
         .await
         .expect_err("expected bad request");
     assert_eq!(err.code, ErrorCode::BadRequest);
@@ -2499,7 +2500,7 @@ async fn distinct_combined_with_take_is_bad_request() -> anyhow::Result<()> {
 
     let mut q = distinct_query(Some("by_status"), vec![], |_| {});
     q.take = Some(10);
-    let err = execute_query(&pool, &db, &schema, &q, None)
+    let err = execute_query(&pool, &db, &schema, &q, &PrincipalCtx::bypass())
         .await
         .expect_err("expected bad request");
     assert_eq!(err.code, ErrorCode::BadRequest);
@@ -2594,7 +2595,7 @@ async fn aggregate_sum_over_matching_set() -> anyhow::Result<()> {
             agg(AggregateOp::Sum),
             |_| {},
         ),
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await?;
 
@@ -2622,7 +2623,7 @@ async fn aggregate_avg_over_matching_set() -> anyhow::Result<()> {
             agg(AggregateOp::Avg),
             |_| {},
         ),
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await?;
     // AVG of orders 1..=5 = 3.0.
@@ -2650,7 +2651,7 @@ async fn aggregate_min_max_over_matching_set() -> anyhow::Result<()> {
             agg(AggregateOp::Min),
             |_| {},
         ),
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await?;
     assert_eq!(aggregate_scalar(&min).as_f64(), Some(1.0));
@@ -2665,7 +2666,7 @@ async fn aggregate_min_max_over_matching_set() -> anyhow::Result<()> {
             agg(AggregateOp::Max),
             |_| {},
         ),
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await?;
     assert_eq!(aggregate_scalar(&max).as_f64(), Some(5.0));
@@ -2696,7 +2697,7 @@ async fn aggregate_respects_range_bound() -> anyhow::Result<()> {
                 q.lt = Some(serde_json::json!(5.0));
             },
         ),
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await?;
     assert_eq!(aggregate_scalar(&result).as_f64(), Some(9.0));
@@ -2725,7 +2726,7 @@ async fn aggregate_min_over_string_field() -> anyhow::Result<()> {
             agg(AggregateOp::Min),
             |_| {},
         ),
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await?;
     assert_eq!(aggregate_scalar(&result), serde_json::json!("backlog"));
@@ -2754,7 +2755,7 @@ async fn aggregate_sum_on_non_numeric_field_is_bad_request() -> anyhow::Result<(
             agg(AggregateOp::Sum),
             |_| {},
         ),
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await
     .expect_err("expected bad request");
@@ -2782,7 +2783,7 @@ async fn aggregate_without_index_is_bad_request() -> anyhow::Result<()> {
         &db,
         &schema,
         &aggregate_query(None, vec![], agg(AggregateOp::Sum), |_| {}),
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await
     .expect_err("expected bad request");
@@ -2812,7 +2813,7 @@ async fn aggregate_with_no_field_beyond_eq_prefix_is_bad_request() -> anyhow::Re
             agg(AggregateOp::Sum),
             |_| {},
         ),
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await
     .expect_err("expected bad request");
@@ -2843,7 +2844,7 @@ async fn aggregate_over_empty_matching_set_returns_null() -> anyhow::Result<()> 
             agg(AggregateOp::Sum),
             |_| {},
         ),
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await;
     let result = err_or_value?;
@@ -2868,7 +2869,7 @@ async fn aggregate_combined_with_take_is_bad_request() -> anyhow::Result<()> {
         |_| {},
     );
     q.take = Some(10);
-    let err = execute_query(&pool, &db, &schema, &q, None)
+    let err = execute_query(&pool, &db, &schema, &q, &PrincipalCtx::bypass())
         .await
         .expect_err("expected bad request");
     assert_eq!(err.code, ErrorCode::BadRequest);
@@ -2904,7 +2905,7 @@ async fn aggregate_group_by_returns_one_row_per_group() -> anyhow::Result<()> {
             },
             |_| {},
         ),
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await?;
 
@@ -2955,7 +2956,7 @@ async fn aggregate_group_by_with_one_field_beyond_prefix_is_bad_request() -> any
             },
             |_| {},
         ),
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await
     .expect_err("expected bad request");
@@ -3043,7 +3044,7 @@ async fn paginate_first_page_no_index() -> anyhow::Result<()> {
                     num_items: 2,
                 },
             ),
-            None,
+            &PrincipalCtx::bypass(),
         )
         .await?,
     );
@@ -3081,7 +3082,7 @@ async fn paginate_walks_all_pages_without_gaps_or_dupes() -> anyhow::Result<()> 
                         num_items: 2,
                     },
                 ),
-                None,
+                &PrincipalCtx::bypass(),
             )
             .await?,
         );
@@ -3124,7 +3125,7 @@ async fn paginate_last_page_has_no_cursor() -> anyhow::Result<()> {
                         num_items: 2,
                     },
                 ),
-                None,
+                &PrincipalCtx::bypass(),
             )
             .await?,
         );
@@ -3164,7 +3165,7 @@ async fn paginate_with_index_and_eq_prefix() -> anyhow::Result<()> {
                     num_items: 2,
                 },
             ),
-            None,
+            &PrincipalCtx::bypass(),
         )
         .await?,
     );
@@ -3185,7 +3186,7 @@ async fn paginate_with_index_and_eq_prefix() -> anyhow::Result<()> {
                     num_items: 2,
                 },
             ),
-            None,
+            &PrincipalCtx::bypass(),
         )
         .await?,
     );
@@ -3218,7 +3219,7 @@ async fn paginate_desc_reverses_order() -> anyhow::Result<()> {
                     num_items: 2,
                 },
             ),
-            None,
+            &PrincipalCtx::bypass(),
         )
         .await?,
     );
@@ -3239,7 +3240,7 @@ async fn paginate_desc_reverses_order() -> anyhow::Result<()> {
                     num_items: 2,
                 },
             ),
-            None,
+            &PrincipalCtx::bypass(),
         )
         .await?,
     );
@@ -3274,7 +3275,7 @@ async fn paginate_compound_index_eq_consumes_all_fields() -> anyhow::Result<()> 
                     num_items: 1,
                 },
             ),
-            None,
+            &PrincipalCtx::bypass(),
         )
         .await?,
     );
@@ -3295,7 +3296,7 @@ async fn paginate_compound_index_eq_consumes_all_fields() -> anyhow::Result<()> 
                     num_items: 1,
                 },
             ),
-            None,
+            &PrincipalCtx::bypass(),
         )
         .await?,
     );
@@ -3328,7 +3329,7 @@ async fn paginate_num_items_exceeds_total() -> anyhow::Result<()> {
                     num_items: 100,
                 },
             ),
-            None,
+            &PrincipalCtx::bypass(),
         )
         .await?,
     );
@@ -3362,7 +3363,7 @@ async fn paginate_caps_num_items_at_max_take() -> anyhow::Result<()> {
                     num_items: 100_000,
                 },
             ),
-            None,
+            &PrincipalCtx::bypass(),
         )
         .await?,
     );
@@ -3401,7 +3402,7 @@ async fn paginate_bad_cursor_arity_is_bad_request() -> anyhow::Result<()> {
                 num_items: 10,
             },
         ),
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await
     .expect_err("expected bad request");
@@ -3432,7 +3433,7 @@ async fn paginate_garbage_cursor_is_bad_request() -> anyhow::Result<()> {
                 num_items: 10,
             },
         ),
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await
     .expect_err("expected bad request");
@@ -3470,7 +3471,7 @@ async fn paginate_index_field_value_round_trips_in_cursor() -> anyhow::Result<()
                     num_items: 2,
                 },
             ),
-            None,
+            &PrincipalCtx::bypass(),
         )
         .await?,
     );
@@ -3491,7 +3492,7 @@ async fn paginate_index_field_value_round_trips_in_cursor() -> anyhow::Result<()
                     num_items: 2,
                 },
             ),
-            None,
+            &PrincipalCtx::bypass(),
         )
         .await?,
     );
@@ -3532,7 +3533,8 @@ async fn paginate_composes_with_gte_range_bound_across_pages() -> anyhow::Result
             },
         );
         q.gte = Some(serde_json::json!(2.0));
-        let (docs, next) = paginated(execute_query(&pool, &db, &schema, &q, None).await?);
+        let (docs, next) =
+            paginated(execute_query(&pool, &db, &schema, &q, &PrincipalCtx::bypass()).await?);
 
         for d in &docs {
             let order = d["order"].as_f64().expect("order is a number");
@@ -3595,7 +3597,7 @@ async fn filter_eq_on_jsonb_field() -> anyhow::Result<()> {
             "table": "workItems",
             "filter": {"op": "eq", "field": "title", "value": "item 3"}
         })),
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await?;
 
@@ -3632,7 +3634,7 @@ async fn filter_range_on_jsonb_numeric_field() -> anyhow::Result<()> {
                     })),
                 }],
             },
-            None,
+            &PrincipalCtx::bypass(),
         )
         .await?;
         tokio::time::sleep(Duration::from_millis(2)).await;
@@ -3652,7 +3654,7 @@ async fn filter_range_on_jsonb_numeric_field() -> anyhow::Result<()> {
             "table": "workItems",
             "filter": {"op": "gte", "field": "completedAt", "value": 20}
         })),
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await?;
 
@@ -3681,7 +3683,7 @@ async fn filter_eq_on_typed_indexed_column() -> anyhow::Result<()> {
             "table": "workItems",
             "filter": {"op": "eq", "field": "status", "value": "backlog"}
         })),
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await?;
 
@@ -3707,7 +3709,7 @@ async fn filter_range_on_typed_indexed_column() -> anyhow::Result<()> {
             "table": "workItems",
             "filter": {"op": "gt", "field": "order", "value": 3}
         })),
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await?;
 
@@ -3735,7 +3737,7 @@ async fn filter_composes_with_order_and_take() -> anyhow::Result<()> {
             "order": "desc",
             "take": 2
         })),
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await?;
 
@@ -3761,7 +3763,7 @@ async fn filter_in_on_indexed_field() -> anyhow::Result<()> {
             "table": "workItems",
             "filter": {"op": "in", "field": "status", "values": ["backlog", "done"]}
         })),
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await?;
 
@@ -3796,7 +3798,7 @@ async fn filter_and_combinator() -> anyhow::Result<()> {
                 ]
             }
         })),
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await?;
 
@@ -3824,7 +3826,7 @@ async fn filter_composes_with_index_eq() -> anyhow::Result<()> {
             "eq": [project_id],
             "filter": {"op": "eq", "field": "status", "value": "in_progress"}
         })),
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await?;
 
@@ -3850,7 +3852,7 @@ async fn filter_unknown_field_is_bad_request() -> anyhow::Result<()> {
             "table": "workItems",
             "filter": {"op": "eq", "field": "bogus", "value": 1}
         })),
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await
     .expect_err("expected bad request");
@@ -3877,7 +3879,7 @@ async fn filter_with_get_is_bad_request() -> anyhow::Result<()> {
             "get": items[0],
             "filter": {"op": "eq", "field": "status", "value": "backlog"}
         })),
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await
     .expect_err("expected bad request");
@@ -3903,7 +3905,7 @@ async fn filter_wrong_typed_value_on_indexed_column_is_bad_request() -> anyhow::
             "table": "workItems",
             "filter": {"op": "eq", "field": "order", "value": "not a number"}
         })),
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await
     .expect_err("expected bad request");
@@ -3963,7 +3965,7 @@ async fn insert_event(
                 doc: doc(serde_json::json!({ "ts": ts, "kind": kind })),
             }],
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await?;
     Ok(outcome.results[0]["id"]
@@ -4020,7 +4022,7 @@ async fn int64_index_range_and_eq_compare_numerically() -> anyhow::Result<()> {
             hybrid_search: None,
             aggregate: None,
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await?;
     assert_eq!(docs_kinds(r), vec!["b".to_string(), "a".to_string()]);
@@ -4052,7 +4054,7 @@ async fn int64_index_range_and_eq_compare_numerically() -> anyhow::Result<()> {
             hybrid_search: None,
             aggregate: None,
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await?;
     assert_eq!(docs_kinds(r), vec!["a".to_string()]);
@@ -4095,7 +4097,7 @@ async fn int64_index_count_and_aggregate() -> anyhow::Result<()> {
             hybrid_search: None,
             aggregate: None,
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await?;
     assert!(matches!(r, QueryResult::Count(3)));
@@ -4129,7 +4131,7 @@ async fn int64_index_count_and_aggregate() -> anyhow::Result<()> {
                 group_by: false,
             }),
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await?;
     // SUM(bigint) projects via to_jsonb -> JSON number.

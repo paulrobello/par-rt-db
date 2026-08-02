@@ -6,6 +6,7 @@ use sqlx::PgPool;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::{Mutex, mpsc, oneshot};
 
+use crate::auth::PrincipalCtx;
 use crate::config::HotConfig;
 use crate::db::{SchemaCache, database_exists, now_ms};
 use crate::error::RtDbError;
@@ -24,7 +25,7 @@ pub enum CommitterRequest {
     Mutate {
         idempotency_key: Option<String>,
         txn: Transaction,
-        owner: Option<String>,
+        principal_ctx: PrincipalCtx,
         reply: oneshot::Sender<Result<TxnOutcome, RtDbError>>,
     },
     Subscribe {
@@ -32,7 +33,7 @@ pub enum CommitterRequest {
         query_id: String,
         query: Box<Query>,
         tx: UnboundedSender<ServerMessage>,
-        owner: Option<String>,
+        principal_ctx: PrincipalCtx,
         reply: oneshot::Sender<Result<(), RtDbError>>,
     },
     /// A scheduled/cron job whose `due_at` arrived. Fire-and-forget: the
@@ -235,7 +236,7 @@ impl Committers {
         db: &str,
         idempotency_key: Option<String>,
         txn: Transaction,
-        owner: Option<String>,
+        principal_ctx: PrincipalCtx,
     ) -> Result<TxnOutcome, RtDbError> {
         let (reply, reply_rx) = oneshot::channel();
         self.submit(
@@ -243,7 +244,7 @@ impl Committers {
             CommitterRequest::Mutate {
                 idempotency_key,
                 txn,
-                owner,
+                principal_ctx,
                 reply,
             },
         )
@@ -274,9 +275,9 @@ impl Committers {
     }
 
     /// Runs `query` on `db`, sends the initial result on `tx`, and registers
-    /// the subscription for future push-on-change updates. `owner` is the
-    /// subscriber's per-row auth identity (captured on the `SubEntry` and
-    /// applied to every re-run in `fan_out`); `None` = bypass.
+    /// the subscription for future push-on-change updates. `principal_ctx` is
+    /// the subscriber's per-row auth identity (captured on the `SubEntry` and
+    /// applied to every re-run in `fan_out`); `user_id = None` = bypass.
     pub async fn subscribe(
         &self,
         db: &str,
@@ -284,7 +285,7 @@ impl Committers {
         query_id: String,
         query: Query,
         tx: UnboundedSender<ServerMessage>,
-        owner: Option<String>,
+        principal_ctx: PrincipalCtx,
     ) -> Result<(), RtDbError> {
         let (reply, reply_rx) = oneshot::channel();
         self.submit(
@@ -294,7 +295,7 @@ impl Committers {
                 query_id,
                 query: Box::new(query),
                 tx,
-                owner,
+                principal_ctx,
                 reply,
             },
         )
@@ -370,10 +371,10 @@ async fn run_committer(
             CommitterRequest::Mutate {
                 idempotency_key,
                 txn,
-                owner,
+                principal_ctx,
                 reply,
             } => {
-                let outcome = handle_mutate(&ctx, idempotency_key, txn, owner).await;
+                let outcome = handle_mutate(&ctx, idempotency_key, txn, principal_ctx).await;
                 let _ = reply.send(outcome);
             }
             CommitterRequest::Subscribe {
@@ -381,10 +382,11 @@ async fn run_committer(
                 query_id,
                 query,
                 tx,
-                owner,
+                principal_ctx,
                 reply,
             } => {
-                let result = handle_subscribe(&ctx, conn, query_id, *query, tx, owner).await;
+                let result =
+                    handle_subscribe(&ctx, conn, query_id, *query, tx, principal_ctx).await;
                 let _ = reply.send(result);
             }
             CommitterRequest::RunScheduled {
@@ -414,8 +416,11 @@ async fn handle_mutate(
     ctx: &CommitterCtx,
     idempotency_key: Option<String>,
     txn: Transaction,
-    owner: Option<String>,
+    principal_ctx: PrincipalCtx,
 ) -> Result<TxnOutcome, RtDbError> {
+    // The op-feed / audit / webhook tap sites carry the caller's uid as the
+    // write's `principal` — same value the pre-Task-5 `owner` carried.
+    let owner = principal_ctx.user_id.as_deref();
     // An empty string is not a meaningful key (it would be one shared dedup
     // slot for the whole db) — treat it the same as no key at all.
     let idempotency_key = idempotency_key.filter(|key| !key.is_empty());
@@ -430,13 +435,13 @@ async fn handle_mutate(
     }
 
     let schema = ctx.schemas.get(&ctx.pool, &ctx.db).await?;
-    let outcome = execute_txn(&ctx.pool, &ctx.db, &schema, &txn, owner.as_deref()).await?;
+    let outcome = execute_txn(&ctx.pool, &ctx.db, &schema, &txn, &principal_ctx).await?;
     ctx.subs
         .fan_out(&ctx.pool, &ctx.db, &schema, &outcome.write_set)
         .await;
     // Op-feed completeness: every durable document write must publish here, in handle_scheduled, or in handle_migrate.
     ctx.op_feed
-        .publish(&ctx.db, owner.as_deref(), &outcome.write_set.ops)
+        .publish(&ctx.db, owner, &outcome.write_set.ops)
         .await;
     // Durable audit tap (the persistent counterpart to the op-feed above).
     // Best-effort: a logging failure is warned, never surfaced to the client —
@@ -445,7 +450,7 @@ async fn handle_mutate(
         && let Err(err) = crate::audit::write_audit_rows(
             &ctx.pool,
             &ctx.db,
-            owner.as_deref(),
+            owner,
             "mutate",
             &outcome.write_set.ops,
         )
@@ -461,7 +466,7 @@ async fn handle_mutate(
         && let Err(err) = crate::webhook::enqueue_for_ops(
             &ctx.pool,
             &ctx.db,
-            owner.as_deref(),
+            owner,
             "mutate",
             &outcome.write_set.ops,
         )
@@ -512,7 +517,7 @@ async fn handle_scheduled(
             return Err(err);
         }
     };
-    match execute_txn(&ctx.pool, &ctx.db, &schema, &txn, None).await {
+    match execute_txn(&ctx.pool, &ctx.db, &schema, &txn, &PrincipalCtx::bypass()).await {
         Ok(outcome) => {
             ctx.subs
                 .fan_out(&ctx.pool, &ctx.db, &schema, &outcome.write_set)
@@ -829,10 +834,10 @@ async fn handle_subscribe(
     query_id: String,
     query: Query,
     tx: UnboundedSender<ServerMessage>,
-    owner: Option<String>,
+    principal_ctx: PrincipalCtx,
 ) -> Result<(), RtDbError> {
     let schema = ctx.schemas.get(&ctx.pool, &ctx.db).await?;
-    let result = execute_query(&ctx.pool, &ctx.db, &schema, &query, owner.as_deref()).await?;
+    let result = execute_query(&ctx.pool, &ctx.db, &schema, &query, &principal_ctx).await?;
     let last = canonical(&result);
     // Mirror `subs::fan_out`: a serialization failure is logged and surfaced
     // as an internal error so the subscriber sees an explicit error rather
@@ -870,7 +875,15 @@ async fn handle_subscribe(
     let table_def = schema.table(&query.table)?;
     ctx.subs
         .register(
-            &ctx.db, conn, query_id, query, tx, last, owner, table_def, &result,
+            &ctx.db,
+            conn,
+            query_id,
+            query,
+            tx,
+            last,
+            principal_ctx,
+            table_def,
+            &result,
         )
         .await;
     Ok(())

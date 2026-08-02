@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 use arc_swap::ArcSwap;
 use sqlx::PgPool;
 
+use rtdb_server::auth::PrincipalCtx;
 use rtdb_server::committer::Committers;
 use rtdb_server::db::SchemaCache;
 use rtdb_server::ddl;
@@ -232,7 +233,12 @@ async fn push_simple_schema(pool: &PgPool, db: &str) -> SchemaDef {
 /// no-op mutate. Both spawn inside `channel_for` on first use.
 async fn warm_up_committer(committers: &Committers, db: &str) {
     committers
-        .mutate(db, None, Transaction { steps: vec![] }, None)
+        .mutate(
+            db,
+            None,
+            Transaction { steps: vec![] },
+            PrincipalCtx::bypass(),
+        )
         .await
         .expect("warm-up mutate");
 }
@@ -273,7 +279,8 @@ async fn poll_for_n(
     };
     let deadline = Instant::now() + timeout;
     loop {
-        if let Ok(QueryResult::Docs(docs)) = execute_query(pool, db, schema, &query, None).await
+        if let Ok(QueryResult::Docs(docs)) =
+            execute_query(pool, db, schema, &query, &PrincipalCtx::bypass()).await
             && !docs.is_empty()
         {
             return true;

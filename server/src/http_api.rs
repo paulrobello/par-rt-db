@@ -10,7 +10,7 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
 use crate::AppState;
-use crate::auth::{authorize, owner_of, resolve_bearer};
+use crate::auth::{authorize, resolve_bearer};
 use crate::db::now_ms;
 use crate::error::RtDbError;
 use crate::protocol::{ScheduleInfo, ScheduleWhen};
@@ -79,15 +79,9 @@ async fn query_handler(
     check_http_rate_limits(&state, &principal, &body.db).await?;
 
     let schema = state.schemas.get(&state.pool, &body.db).await?;
+    let principal_ctx = principal.row_ctx();
     let t = Instant::now();
-    let result = execute_query(
-        &state.pool,
-        &body.db,
-        &schema,
-        &body.query,
-        owner_of(&principal),
-    )
-    .await?;
+    let result = execute_query(&state.pool, &body.db, &schema, &body.query, &principal_ctx).await?;
     state
         .runtime
         .metrics
@@ -142,31 +136,32 @@ async fn batch_query_handler(
     check_http_rate_limits(&state, &principal, &body.db).await?;
 
     let schema = state.schemas.get(&state.pool, &body.db).await?;
-    let owner = owner_of(&principal);
+    let principal_ctx = principal.row_ctx();
     let mut results = Vec::with_capacity(body.queries.len());
     for query in &body.queries {
         // Per-query timing: each successful execute_query feeds
         // query_latency individually (mirrors the per-query counter bump).
         let t = Instant::now();
-        let outcome = match execute_query(&state.pool, &body.db, &schema, query, owner).await {
-            Ok(result) => {
-                state
-                    .runtime
-                    .metrics
-                    .record_query_duration(t.elapsed().as_micros() as u64);
-                state.runtime.metrics.record_query();
-                BatchQueryOutcome {
-                    ok: true,
-                    result: Some(result),
-                    error: None,
+        let outcome =
+            match execute_query(&state.pool, &body.db, &schema, query, &principal_ctx).await {
+                Ok(result) => {
+                    state
+                        .runtime
+                        .metrics
+                        .record_query_duration(t.elapsed().as_micros() as u64);
+                    state.runtime.metrics.record_query();
+                    BatchQueryOutcome {
+                        ok: true,
+                        result: Some(result),
+                        error: None,
+                    }
                 }
-            }
-            Err(err) => BatchQueryOutcome {
-                ok: false,
-                result: None,
-                error: Some(err),
-            },
-        };
+                Err(err) => BatchQueryOutcome {
+                    ok: false,
+                    result: None,
+                    error: Some(err),
+                },
+            };
         results.push(outcome);
     }
     Ok(Json(BatchQueryResponse { results }))
@@ -204,7 +199,7 @@ async fn mutate_handler(
             &body.db,
             body.idempotency_key,
             body.txn,
-            owner_of(&principal).map(|s| s.to_string()),
+            principal.row_ctx(),
         )
         .await?;
     state

@@ -1,6 +1,7 @@
 mod common;
 
 use common::{fresh_db, test_state};
+use rtdb_server::auth::PrincipalCtx;
 use rtdb_server::error::ErrorCode;
 use rtdb_server::protocol::ServerMessage;
 use rtdb_server::query::Query;
@@ -74,12 +75,22 @@ async fn subscribe_sends_initial_query_update_with_seeded_rows() -> anyhow::Resu
     state
         .realtime
         .committers
-        .mutate(&db, None, insert_work_item("backlog", 1.0), None)
+        .mutate(
+            &db,
+            None,
+            insert_work_item("backlog", 1.0),
+            PrincipalCtx::bypass(),
+        )
         .await?;
     state
         .realtime
         .committers
-        .mutate(&db, None, insert_work_item("backlog", 2.0), None)
+        .mutate(
+            &db,
+            None,
+            insert_work_item("backlog", 2.0),
+            PrincipalCtx::bypass(),
+        )
         .await?;
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -87,7 +98,14 @@ async fn subscribe_sends_initial_query_update_with_seeded_rows() -> anyhow::Resu
     state
         .realtime
         .committers
-        .subscribe(&db, conn, "q1".to_string(), collect_work_items(), tx, None)
+        .subscribe(
+            &db,
+            conn,
+            "q1".to_string(),
+            collect_work_items(),
+            tx,
+            PrincipalCtx::bypass(),
+        )
         .await?;
 
     let msg = rx.try_recv().expect("initial query update");
@@ -111,12 +129,22 @@ async fn mutate_pushes_update_to_matching_subscription() -> anyhow::Result<()> {
     state
         .realtime
         .committers
-        .mutate(&db, None, insert_work_item("backlog", 1.0), None)
+        .mutate(
+            &db,
+            None,
+            insert_work_item("backlog", 1.0),
+            PrincipalCtx::bypass(),
+        )
         .await?;
     state
         .realtime
         .committers
-        .mutate(&db, None, insert_work_item("backlog", 2.0), None)
+        .mutate(
+            &db,
+            None,
+            insert_work_item("backlog", 2.0),
+            PrincipalCtx::bypass(),
+        )
         .await?;
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -124,14 +152,26 @@ async fn mutate_pushes_update_to_matching_subscription() -> anyhow::Result<()> {
     state
         .realtime
         .committers
-        .subscribe(&db, conn, "q1".to_string(), collect_work_items(), tx, None)
+        .subscribe(
+            &db,
+            conn,
+            "q1".to_string(),
+            collect_work_items(),
+            tx,
+            PrincipalCtx::bypass(),
+        )
         .await?;
     rx.try_recv().expect("initial query update");
 
     state
         .realtime
         .committers
-        .mutate(&db, None, insert_work_item("backlog", 3.0), None)
+        .mutate(
+            &db,
+            None,
+            insert_work_item("backlog", 3.0),
+            PrincipalCtx::bypass(),
+        )
         .await?;
 
     let msg = rx.try_recv().expect("update after mutate");
@@ -158,14 +198,21 @@ async fn mutate_on_unrelated_table_sends_no_update() -> anyhow::Result<()> {
     state
         .realtime
         .committers
-        .subscribe(&db, conn, "q1".to_string(), collect_work_items(), tx, None)
+        .subscribe(
+            &db,
+            conn,
+            "q1".to_string(),
+            collect_work_items(),
+            tx,
+            PrincipalCtx::bypass(),
+        )
         .await?;
     rx.try_recv().expect("initial query update");
 
     state
         .realtime
         .committers
-        .mutate(&db, None, insert_project(), None)
+        .mutate(&db, None, insert_project(), PrincipalCtx::bypass())
         .await?;
 
     assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
@@ -184,7 +231,14 @@ async fn mutate_with_same_idempotency_key_sends_no_second_update() -> anyhow::Re
     state
         .realtime
         .committers
-        .subscribe(&db, conn, "q1".to_string(), collect_work_items(), tx, None)
+        .subscribe(
+            &db,
+            conn,
+            "q1".to_string(),
+            collect_work_items(),
+            tx,
+            PrincipalCtx::bypass(),
+        )
         .await?;
     rx.try_recv().expect("initial query update");
 
@@ -195,7 +249,7 @@ async fn mutate_with_same_idempotency_key_sends_no_second_update() -> anyhow::Re
             &db,
             Some("retry-key".to_string()),
             insert_work_item("backlog", 1.0),
-            None,
+            PrincipalCtx::bypass(),
         )
         .await?;
     rx.try_recv().expect("update after first mutate");
@@ -207,7 +261,7 @@ async fn mutate_with_same_idempotency_key_sends_no_second_update() -> anyhow::Re
             &db,
             Some("retry-key".to_string()),
             insert_work_item("backlog", 1.0),
-            None,
+            PrincipalCtx::bypass(),
         )
         .await?;
     assert_eq!(first.results, second.results);
@@ -225,7 +279,12 @@ async fn mutate_not_matching_eq_filter_sends_no_update() -> anyhow::Result<()> {
     state
         .realtime
         .committers
-        .mutate(&db, None, insert_work_item("backlog", 1.0), None)
+        .mutate(
+            &db,
+            None,
+            insert_work_item("backlog", 1.0),
+            PrincipalCtx::bypass(),
+        )
         .await?;
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -239,7 +298,7 @@ async fn mutate_not_matching_eq_filter_sends_no_update() -> anyhow::Result<()> {
             "q1".to_string(),
             work_items_by_status("backlog"),
             tx,
-            None,
+            PrincipalCtx::bypass(),
         )
         .await?;
     rx.try_recv().expect("initial query update");
@@ -247,7 +306,12 @@ async fn mutate_not_matching_eq_filter_sends_no_update() -> anyhow::Result<()> {
     state
         .realtime
         .committers
-        .mutate(&db, None, insert_work_item("done", 2.0), None)
+        .mutate(
+            &db,
+            None,
+            insert_work_item("done", 2.0),
+            PrincipalCtx::bypass(),
+        )
         .await?;
 
     assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
@@ -272,7 +336,7 @@ async fn two_subscriptions_both_receive_updates_from_one_mutate() -> anyhow::Res
             "q1".to_string(),
             collect_work_items(),
             tx1,
-            None,
+            PrincipalCtx::bypass(),
         )
         .await?;
     rx1.try_recv().expect("initial q1");
@@ -288,7 +352,7 @@ async fn two_subscriptions_both_receive_updates_from_one_mutate() -> anyhow::Res
             "q2".to_string(),
             collect_work_items(),
             tx2,
-            None,
+            PrincipalCtx::bypass(),
         )
         .await?;
     rx2.try_recv().expect("initial q2");
@@ -296,7 +360,12 @@ async fn two_subscriptions_both_receive_updates_from_one_mutate() -> anyhow::Res
     state
         .realtime
         .committers
-        .mutate(&db, None, insert_work_item("backlog", 1.0), None)
+        .mutate(
+            &db,
+            None,
+            insert_work_item("backlog", 1.0),
+            PrincipalCtx::bypass(),
+        )
         .await?;
 
     let msg1 = rx1.try_recv().expect("q1 update");
@@ -318,7 +387,14 @@ async fn remove_conn_stops_further_updates() -> anyhow::Result<()> {
     state
         .realtime
         .committers
-        .subscribe(&db, conn, "q1".to_string(), collect_work_items(), tx, None)
+        .subscribe(
+            &db,
+            conn,
+            "q1".to_string(),
+            collect_work_items(),
+            tx,
+            PrincipalCtx::bypass(),
+        )
         .await?;
     rx.try_recv().expect("initial query update");
 
@@ -327,7 +403,12 @@ async fn remove_conn_stops_further_updates() -> anyhow::Result<()> {
     state
         .realtime
         .committers
-        .mutate(&db, None, insert_work_item("backlog", 1.0), None)
+        .mutate(
+            &db,
+            None,
+            insert_work_item("backlog", 1.0),
+            PrincipalCtx::bypass(),
+        )
         .await?;
 
     // No QueryUpdate is delivered: either the channel is empty, or (as here,
@@ -347,7 +428,12 @@ async fn mutate_on_nonexistent_db_is_not_found() -> anyhow::Result<()> {
     let err = state
         .realtime
         .committers
-        .mutate("does_not_exist", None, insert_project(), None)
+        .mutate(
+            "does_not_exist",
+            None,
+            insert_project(),
+            PrincipalCtx::bypass(),
+        )
         .await
         .expect_err("expected not found");
     assert_eq!(err.code, ErrorCode::NotFound);
@@ -366,7 +452,12 @@ async fn write_set_records_written_document_ids() -> anyhow::Result<()> {
     let insert_a = state
         .realtime
         .committers
-        .mutate(&db, None, insert_work_item("backlog", 1.0), None)
+        .mutate(
+            &db,
+            None,
+            insert_work_item("backlog", 1.0),
+            PrincipalCtx::bypass(),
+        )
         .await?;
     let id_a = insert_a.results[0]["id"]
         .as_str()
@@ -389,7 +480,7 @@ async fn write_set_records_written_document_ids() -> anyhow::Result<()> {
                         .clone(),
                 }],
             },
-            None,
+            PrincipalCtx::bypass(),
         )
         .await?;
 
@@ -419,7 +510,12 @@ async fn get_subscription_updates_when_its_doc_is_written() -> anyhow::Result<()
     let insert = state
         .realtime
         .committers
-        .mutate(&db, None, insert_work_item("backlog", 1.0), None)
+        .mutate(
+            &db,
+            None,
+            insert_work_item("backlog", 1.0),
+            PrincipalCtx::bypass(),
+        )
         .await?;
     let id = insert.results[0]["id"]
         .as_str()
@@ -437,7 +533,14 @@ async fn get_subscription_updates_when_its_doc_is_written() -> anyhow::Result<()
     state
         .realtime
         .committers
-        .subscribe(&db, conn, "q1".to_string(), get_query, tx, None)
+        .subscribe(
+            &db,
+            conn,
+            "q1".to_string(),
+            get_query,
+            tx,
+            PrincipalCtx::bypass(),
+        )
         .await?;
     rx.try_recv().expect("initial query update");
 
@@ -457,7 +560,7 @@ async fn get_subscription_updates_when_its_doc_is_written() -> anyhow::Result<()
                         .clone(),
                 }],
             },
-            None,
+            PrincipalCtx::bypass(),
         )
         .await?;
 
@@ -486,7 +589,12 @@ async fn get_subscription_skips_update_for_unrelated_doc() -> anyhow::Result<()>
     let insert_a = state
         .realtime
         .committers
-        .mutate(&db, None, insert_work_item("backlog", 1.0), None)
+        .mutate(
+            &db,
+            None,
+            insert_work_item("backlog", 1.0),
+            PrincipalCtx::bypass(),
+        )
         .await?;
     let id_a = insert_a.results[0]["id"]
         .as_str()
@@ -504,7 +612,14 @@ async fn get_subscription_skips_update_for_unrelated_doc() -> anyhow::Result<()>
     state
         .realtime
         .committers
-        .subscribe(&db, conn, "q1".to_string(), get_query, tx, None)
+        .subscribe(
+            &db,
+            conn,
+            "q1".to_string(),
+            get_query,
+            tx,
+            PrincipalCtx::bypass(),
+        )
         .await?;
     rx.try_recv().expect("initial query update");
 
@@ -512,7 +627,12 @@ async fn get_subscription_skips_update_for_unrelated_doc() -> anyhow::Result<()>
     state
         .realtime
         .committers
-        .mutate(&db, None, insert_work_item("backlog", 2.0), None)
+        .mutate(
+            &db,
+            None,
+            insert_work_item("backlog", 2.0),
+            PrincipalCtx::bypass(),
+        )
         .await?;
 
     assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
@@ -531,14 +651,26 @@ async fn collect_subscription_still_reruns_on_table_write() -> anyhow::Result<()
     state
         .realtime
         .committers
-        .subscribe(&db, conn, "q1".to_string(), collect_work_items(), tx, None)
+        .subscribe(
+            &db,
+            conn,
+            "q1".to_string(),
+            collect_work_items(),
+            tx,
+            PrincipalCtx::bypass(),
+        )
         .await?;
     rx.try_recv().expect("initial query update");
 
     state
         .realtime
         .committers
-        .mutate(&db, None, insert_work_item("backlog", 1.0), None)
+        .mutate(
+            &db,
+            None,
+            insert_work_item("backlog", 1.0),
+            PrincipalCtx::bypass(),
+        )
         .await?;
 
     let msg = rx.try_recv().expect("collect sub re-ran on table write");
@@ -562,7 +694,12 @@ async fn get_subscription_updates_when_its_doc_is_deleted() -> anyhow::Result<()
     let insert = state
         .realtime
         .committers
-        .mutate(&db, None, insert_work_item("backlog", 1.0), None)
+        .mutate(
+            &db,
+            None,
+            insert_work_item("backlog", 1.0),
+            PrincipalCtx::bypass(),
+        )
         .await?;
     let id = insert.results[0]["id"]
         .as_str()
@@ -580,7 +717,14 @@ async fn get_subscription_updates_when_its_doc_is_deleted() -> anyhow::Result<()
     state
         .realtime
         .committers
-        .subscribe(&db, conn, "q1".to_string(), get_query, tx, None)
+        .subscribe(
+            &db,
+            conn,
+            "q1".to_string(),
+            get_query,
+            tx,
+            PrincipalCtx::bypass(),
+        )
         .await?;
     rx.try_recv().expect("initial query update");
 
@@ -596,7 +740,7 @@ async fn get_subscription_updates_when_its_doc_is_deleted() -> anyhow::Result<()
                     id: id.clone(),
                 }],
             },
-            None,
+            PrincipalCtx::bypass(),
         )
         .await?;
 

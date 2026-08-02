@@ -677,9 +677,14 @@ pub async fn execute_query(
     db: &str,
     schema: &SchemaDef,
     q: &Query,
-    owner: Option<&str>,
+    ctx: &PrincipalCtx,
 ) -> Result<QueryResult, RtDbError> {
     validate_db_name(db)?;
+    // Task 5: `ctx` carries `user_id` + `email` so Task 6+ can resolve `$email`
+    // markers. The SQL row-auth paths here only need the uid, so derive the
+    // legacy `owner: Option<&str>` view once and thread it unchanged —
+    // byte-identical behavior for ownerField/collaboratorsField.
+    let owner = ctx.user_id.as_deref();
     let table_def = schema.table(&q.table)?;
     let owner_field = table_def.owner_field.as_deref();
     let collaborators_field = table_def.collaborators_field.as_deref();

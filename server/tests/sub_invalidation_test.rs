@@ -23,6 +23,7 @@ mod common;
 use std::time::Duration;
 
 use common::{fresh_db, test_state};
+use rtdb_server::auth::PrincipalCtx;
 use rtdb_server::ddl;
 use rtdb_server::protocol::ServerMessage;
 use rtdb_server::query::Query;
@@ -182,7 +183,14 @@ async fn sub(
     state
         .realtime
         .committers
-        .subscribe(db, next_conn_id(), "q".to_string(), query, tx, None)
+        .subscribe(
+            db,
+            next_conn_id(),
+            "q".to_string(),
+            query,
+            tx,
+            PrincipalCtx::bypass(),
+        )
         .await
         .expect("subscribe");
     let mut rx = rx;
@@ -205,7 +213,7 @@ async fn count_skips_out_of_window_pushes_in_window() -> anyhow::Result<()> {
     state
         .realtime
         .committers
-        .mutate(&db, None, insert("done", 1.0), None)
+        .mutate(&db, None, insert("done", 1.0), PrincipalCtx::bypass())
         .await?;
     expect_no_update(&mut rx, "out-of-window insert");
 
@@ -213,7 +221,7 @@ async fn count_skips_out_of_window_pushes_in_window() -> anyhow::Result<()> {
     state
         .realtime
         .committers
-        .mutate(&db, None, insert("backlog", 2.0), None)
+        .mutate(&db, None, insert("backlog", 2.0), PrincipalCtx::bypass())
         .await?;
     expect_update(&mut rx, "in-window insert").await;
 
@@ -230,14 +238,14 @@ async fn collect_skips_out_of_window_pushes_in_window() -> anyhow::Result<()> {
     state
         .realtime
         .committers
-        .mutate(&db, None, insert("done", 1.0), None)
+        .mutate(&db, None, insert("done", 1.0), PrincipalCtx::bypass())
         .await?;
     expect_no_update(&mut rx, "out-of-window insert");
 
     state
         .realtime
         .committers
-        .mutate(&db, None, insert("backlog", 2.0), None)
+        .mutate(&db, None, insert("backlog", 2.0), PrincipalCtx::bypass())
         .await?;
     expect_update(&mut rx, "in-window insert").await;
 
@@ -255,7 +263,7 @@ async fn unique_skips_out_of_window_pushes_in_window() -> anyhow::Result<()> {
     state
         .realtime
         .committers
-        .mutate(&db, None, insert("done", 1.0), None)
+        .mutate(&db, None, insert("done", 1.0), PrincipalCtx::bypass())
         .await?;
     expect_no_update(&mut rx, "wrong-status insert");
 
@@ -277,7 +285,7 @@ async fn unique_skips_out_of_window_pushes_in_window() -> anyhow::Result<()> {
                     doc: other,
                 }],
             },
-            None,
+            PrincipalCtx::bypass(),
         )
         .await?;
     expect_no_update(&mut rx, "wrong-project insert");
@@ -286,7 +294,7 @@ async fn unique_skips_out_of_window_pushes_in_window() -> anyhow::Result<()> {
     state
         .realtime
         .committers
-        .mutate(&db, None, insert("backlog", 3.0), None)
+        .mutate(&db, None, insert("backlog", 3.0), PrincipalCtx::bypass())
         .await?;
     expect_update(&mut rx, "matching insert").await;
 
@@ -308,7 +316,7 @@ async fn range_collect_skips_below_range_pushes_in_range() -> anyhow::Result<()>
     state
         .realtime
         .committers
-        .mutate(&db, None, insert("backlog", 5.0), None)
+        .mutate(&db, None, insert("backlog", 5.0), PrincipalCtx::bypass())
         .await?;
     expect_no_update(&mut rx, "below-range insert");
 
@@ -316,7 +324,7 @@ async fn range_collect_skips_below_range_pushes_in_range() -> anyhow::Result<()>
     state
         .realtime
         .committers
-        .mutate(&db, None, insert("backlog", 20.0), None)
+        .mutate(&db, None, insert("backlog", 20.0), PrincipalCtx::bypass())
         .await?;
     expect_update(&mut rx, "in-range insert").await;
 
@@ -338,7 +346,7 @@ async fn range_collect_skips_below_range_pushes_in_range() -> anyhow::Result<()>
                     doc: other,
                 }],
             },
-            None,
+            PrincipalCtx::bypass(),
         )
         .await?;
     expect_no_update(&mut rx, "wrong-project insert");
@@ -359,7 +367,7 @@ async fn body_patch_pushes_collect_not_count() -> anyhow::Result<()> {
     let outcome = state
         .realtime
         .committers
-        .mutate(&db, None, insert("backlog", 1.0), None)
+        .mutate(&db, None, insert("backlog", 1.0), PrincipalCtx::bypass())
         .await?;
     let id = id_of(&outcome);
 
@@ -375,7 +383,7 @@ async fn body_patch_pushes_collect_not_count() -> anyhow::Result<()> {
             &db,
             None,
             patch_field(&id, "title", serde_json::Value::String("renamed".into())),
-            None,
+            PrincipalCtx::bypass(),
         )
         .await?;
 
@@ -402,7 +410,7 @@ async fn patch_out_of_window_pushes_collect() -> anyhow::Result<()> {
     let outcome = state
         .realtime
         .committers
-        .mutate(&db, None, insert("backlog", 1.0), None)
+        .mutate(&db, None, insert("backlog", 1.0), PrincipalCtx::bypass())
         .await?;
     let id = id_of(&outcome);
 
@@ -417,7 +425,7 @@ async fn patch_out_of_window_pushes_collect() -> anyhow::Result<()> {
             &db,
             None,
             patch_field(&id, "status", serde_json::Value::String("done".into())),
-            None,
+            PrincipalCtx::bypass(),
         )
         .await?;
     expect_update(&mut rx, "collect patch-out-of-window").await;
@@ -433,7 +441,7 @@ async fn patch_out_of_window_pushes_count() -> anyhow::Result<()> {
     let outcome = state
         .realtime
         .committers
-        .mutate(&db, None, insert("backlog", 1.0), None)
+        .mutate(&db, None, insert("backlog", 1.0), PrincipalCtx::bypass())
         .await?;
     let id = id_of(&outcome);
 
@@ -447,7 +455,7 @@ async fn patch_out_of_window_pushes_count() -> anyhow::Result<()> {
             &db,
             None,
             patch_field(&id, "status", serde_json::Value::String("done".into())),
-            None,
+            PrincipalCtx::bypass(),
         )
         .await?;
     expect_update(&mut rx, "count patch-out-of-window").await;
@@ -464,7 +472,7 @@ async fn patch_into_window_pushes_count_and_collect() -> anyhow::Result<()> {
     let outcome = state
         .realtime
         .committers
-        .mutate(&db, None, insert("done", 1.0), None)
+        .mutate(&db, None, insert("done", 1.0), PrincipalCtx::bypass())
         .await?;
     let id = id_of(&outcome);
 
@@ -479,7 +487,7 @@ async fn patch_into_window_pushes_count_and_collect() -> anyhow::Result<()> {
             &db,
             None,
             patch_field(&id, "status", serde_json::Value::String("backlog".into())),
-            None,
+            PrincipalCtx::bypass(),
         )
         .await?;
     expect_update(&mut rx_collect, "collect patch-into-window").await;
@@ -500,7 +508,7 @@ async fn delete_always_pushes() -> anyhow::Result<()> {
     let outcome = state
         .realtime
         .committers
-        .mutate(&db, None, insert("backlog", 1.0), None)
+        .mutate(&db, None, insert("backlog", 1.0), PrincipalCtx::bypass())
         .await?;
     let id = id_of(&outcome);
 
@@ -511,7 +519,7 @@ async fn delete_always_pushes() -> anyhow::Result<()> {
     state
         .realtime
         .committers
-        .mutate(&db, None, delete(&id), None)
+        .mutate(&db, None, delete(&id), PrincipalCtx::bypass())
         .await?;
     expect_update(&mut rx_collect, "collect delete").await;
     expect_update(&mut rx_count, "count delete").await;
@@ -534,7 +542,7 @@ async fn delete_of_out_of_window_doc_still_pushes() -> anyhow::Result<()> {
     let outcome = state
         .realtime
         .committers
-        .mutate(&db, None, insert("done", 1.0), None)
+        .mutate(&db, None, insert("done", 1.0), PrincipalCtx::bypass())
         .await?;
     let id = id_of(&outcome);
 
@@ -543,7 +551,7 @@ async fn delete_of_out_of_window_doc_still_pushes() -> anyhow::Result<()> {
     state
         .realtime
         .committers
-        .mutate(&db, None, delete(&id), None)
+        .mutate(&db, None, delete(&id), PrincipalCtx::bypass())
         .await?;
     // Re-run happens (affects=true) but result unchanged (count stays 0) ⇒
     // diff suppresses the push ⇒ no observable push.
@@ -575,7 +583,7 @@ async fn take_sub_pushes_for_in_window_write() -> anyhow::Result<()> {
     state
         .realtime
         .committers
-        .mutate(&db, None, insert("backlog", 1.0), None)
+        .mutate(&db, None, insert("backlog", 1.0), PrincipalCtx::bypass())
         .await?;
     expect_update(&mut rx, "take in-window insert").await;
 
@@ -659,7 +667,10 @@ async fn owner_filtered_collect_over_approximates_for_other_users_doc() -> anyho
             "q".to_string(),
             collect_notes_by_category("work"),
             tx,
-            Some("userA".to_string()),
+            PrincipalCtx {
+                user_id: Some("userA".to_string()),
+                email: None,
+            },
         )
         .await?;
     drain_initial(&mut rx);
@@ -672,7 +683,10 @@ async fn owner_filtered_collect_over_approximates_for_other_users_doc() -> anyho
             &db,
             None,
             insert_note("work", "a"),
-            Some("userA".to_string()),
+            PrincipalCtx {
+                user_id: Some("userA".to_string()),
+                email: None,
+            },
         )
         .await?;
     expect_update(&mut rx, "userA matching insert").await;
@@ -687,7 +701,10 @@ async fn owner_filtered_collect_over_approximates_for_other_users_doc() -> anyho
             &db,
             None,
             insert_note("work", "b-secret"),
-            Some("userB".to_string()),
+            PrincipalCtx {
+                user_id: Some("userB".to_string()),
+                email: None,
+            },
         )
         .await?;
     expect_no_update(
@@ -704,7 +721,10 @@ async fn owner_filtered_collect_over_approximates_for_other_users_doc() -> anyho
             &db,
             None,
             insert_note("personal", "c"),
-            Some("userB".to_string()),
+            PrincipalCtx {
+                user_id: Some("userB".to_string()),
+                email: None,
+            },
         )
         .await?;
     expect_no_update(&mut rx, "userB non-matching insert (skip)");
@@ -735,7 +755,7 @@ async fn filter_bearing_collect_ignores_filter_in_skip_decision() -> anyhow::Res
     state
         .realtime
         .committers
-        .mutate(&db, None, insert("backlog", 2.0), None)
+        .mutate(&db, None, insert("backlog", 2.0), PrincipalCtx::bypass())
         .await?;
     expect_no_update(
         &mut rx,
@@ -746,7 +766,7 @@ async fn filter_bearing_collect_ignores_filter_in_skip_decision() -> anyhow::Res
     state
         .realtime
         .committers
-        .mutate(&db, None, insert("backlog", 1.0), None)
+        .mutate(&db, None, insert("backlog", 1.0), PrincipalCtx::bypass())
         .await?;
     expect_update(&mut rx, "matches-eq-and-filter").await;
 
@@ -772,7 +792,7 @@ async fn multi_step_txn_insert_and_delete_fans_out_correctly() -> anyhow::Result
     let seed = state
         .realtime
         .committers
-        .mutate(&db, None, insert("backlog", 1.0), None)
+        .mutate(&db, None, insert("backlog", 1.0), PrincipalCtx::bypass())
         .await?;
     let seed_id = id_of(&seed);
 
@@ -797,7 +817,7 @@ async fn multi_step_txn_insert_and_delete_fans_out_correctly() -> anyhow::Result
     state
         .realtime
         .committers
-        .mutate(&db, None, txn, None)
+        .mutate(&db, None, txn, PrincipalCtx::bypass())
         .await?;
     expect_update(&mut rx, "multi-step insert+delete").await;
 
@@ -821,7 +841,7 @@ async fn patch_then_delete_same_doc_pushes_count() -> anyhow::Result<()> {
     let outcome = state
         .realtime
         .committers
-        .mutate(&db, None, insert("backlog", 1.0), None)
+        .mutate(&db, None, insert("backlog", 1.0), PrincipalCtx::bypass())
         .await?;
     let id = id_of(&outcome);
 
@@ -851,7 +871,7 @@ async fn patch_then_delete_same_doc_pushes_count() -> anyhow::Result<()> {
     state
         .realtime
         .committers
-        .mutate(&db, None, txn, None)
+        .mutate(&db, None, txn, PrincipalCtx::bypass())
         .await?;
     expect_update(&mut rx, "patch-then-delete same doc (count must drop)").await;
 
@@ -945,7 +965,7 @@ async fn int64_range_count_skips_out_of_window_pushes_in_window() -> anyhow::Res
     state
         .realtime
         .committers
-        .mutate(&db, None, insert_event("5", "a"), None)
+        .mutate(&db, None, insert_event("5", "a"), PrincipalCtx::bypass())
         .await?;
     expect_no_update(&mut rx, "below-range int64 insert");
 
@@ -956,7 +976,7 @@ async fn int64_range_count_skips_out_of_window_pushes_in_window() -> anyhow::Res
     state
         .realtime
         .committers
-        .mutate(&db, None, insert_event("20", "b"), None)
+        .mutate(&db, None, insert_event("20", "b"), PrincipalCtx::bypass())
         .await?;
     expect_update(&mut rx, "in-range int64 insert").await;
 
@@ -972,7 +992,7 @@ async fn int64_range_count_patch_into_window_pushes() -> anyhow::Result<()> {
     let outcome = state
         .realtime
         .committers
-        .mutate(&db, None, insert_event("5", "a"), None)
+        .mutate(&db, None, insert_event("5", "a"), PrincipalCtx::bypass())
         .await?;
     let id = id_of(&outcome);
 
@@ -987,7 +1007,7 @@ async fn int64_range_count_patch_into_window_pushes() -> anyhow::Result<()> {
     state
         .realtime
         .committers
-        .mutate(&db, None, patch_event_ts(&id, "50"), None)
+        .mutate(&db, None, patch_event_ts(&id, "50"), PrincipalCtx::bypass())
         .await?;
     expect_update(&mut rx, "patch into int64 range").await;
 
@@ -1053,7 +1073,7 @@ async fn seed(
         let outcome = state
             .realtime
             .committers
-            .mutate(db, None, insert("backlog", *order), None)
+            .mutate(db, None, insert("backlog", *order), PrincipalCtx::bypass())
             .await?;
         ids.push(id_of(&outcome));
     }
@@ -1073,7 +1093,7 @@ async fn take_skips_inserts_beyond_the_boundary() -> anyhow::Result<()> {
     state
         .realtime
         .committers
-        .mutate(&db, None, insert("backlog", 30.0), None)
+        .mutate(&db, None, insert("backlog", 30.0), PrincipalCtx::bypass())
         .await?;
     expect_no_update(&mut rx, "insert beyond boundary");
 
@@ -1081,7 +1101,7 @@ async fn take_skips_inserts_beyond_the_boundary() -> anyhow::Result<()> {
     state
         .realtime
         .committers
-        .mutate(&db, None, insert("backlog", 5.0), None)
+        .mutate(&db, None, insert("backlog", 5.0), PrincipalCtx::bypass())
         .await?;
     expect_update(&mut rx, "insert ahead of boundary").await;
 
@@ -1109,7 +1129,7 @@ async fn take_pushes_for_member_body_and_rank_changes() -> anyhow::Result<()> {
                 "title",
                 serde_json::Value::String("renamed".into()),
             ),
-            None,
+            PrincipalCtx::bypass(),
         )
         .await?;
     expect_update(&mut rx, "member body patch").await;
@@ -1123,7 +1143,7 @@ async fn take_pushes_for_member_body_and_rank_changes() -> anyhow::Result<()> {
             &db,
             None,
             patch_field(&ids[1], "status", serde_json::Value::String("done".into())),
-            None,
+            PrincipalCtx::bypass(),
         )
         .await?;
     expect_update(&mut rx, "member leaves the window").await;
@@ -1150,7 +1170,7 @@ async fn take_pushes_when_a_beyond_boundary_doc_moves_ahead_of_it() -> anyhow::R
             &db,
             None,
             patch_field(&ids[2], "order", serde_json::json!(1.0)),
-            None,
+            PrincipalCtx::bypass(),
         )
         .await?;
     expect_update(&mut rx, "beyond-boundary doc moves into the top-N").await;
@@ -1174,7 +1194,7 @@ async fn take_boundary_is_refreshed_after_the_result_shrinks() -> anyhow::Result
     state
         .realtime
         .committers
-        .mutate(&db, None, delete(&ids[0]), None)
+        .mutate(&db, None, delete(&ids[0]), PrincipalCtx::bypass())
         .await?;
     expect_update(&mut rx, "member delete").await;
 
@@ -1184,7 +1204,7 @@ async fn take_boundary_is_refreshed_after_the_result_shrinks() -> anyhow::Result
     state
         .realtime
         .committers
-        .mutate(&db, None, insert("backlog", 50.0), None)
+        .mutate(&db, None, insert("backlog", 50.0), PrincipalCtx::bypass())
         .await?;
     expect_update(&mut rx, "insert after the boundary was cleared").await;
 
@@ -1204,7 +1224,7 @@ async fn take_desc_inverts_the_boundary() -> anyhow::Result<()> {
     state
         .realtime
         .committers
-        .mutate(&db, None, insert("backlog", 1.0), None)
+        .mutate(&db, None, insert("backlog", 1.0), PrincipalCtx::bypass())
         .await?;
     expect_no_update(&mut rx, "desc insert beyond boundary");
 
@@ -1212,7 +1232,7 @@ async fn take_desc_inverts_the_boundary() -> anyhow::Result<()> {
     state
         .realtime
         .committers
-        .mutate(&db, None, insert("backlog", 99.0), None)
+        .mutate(&db, None, insert("backlog", 99.0), PrincipalCtx::bypass())
         .await?;
     expect_update(&mut rx, "desc insert ahead of boundary").await;
 
@@ -1246,7 +1266,7 @@ async fn take_ignores_writes_outside_the_eq_window() -> anyhow::Result<()> {
                     doc: other,
                 }],
             },
-            None,
+            PrincipalCtx::bypass(),
         )
         .await?;
     expect_no_update(&mut rx, "other project's insert");
@@ -1267,7 +1287,7 @@ async fn first_tracks_its_single_row_boundary() -> anyhow::Result<()> {
     state
         .realtime
         .committers
-        .mutate(&db, None, insert("backlog", 20.0), None)
+        .mutate(&db, None, insert("backlog", 20.0), PrincipalCtx::bypass())
         .await?;
     expect_no_update(&mut rx, "insert after the first row");
 
@@ -1275,7 +1295,7 @@ async fn first_tracks_its_single_row_boundary() -> anyhow::Result<()> {
     state
         .realtime
         .committers
-        .mutate(&db, None, insert("backlog", 1.0), None)
+        .mutate(&db, None, insert("backlog", 1.0), PrincipalCtx::bypass())
         .await?;
     expect_update(&mut rx, "insert ahead of the first row").await;
 
@@ -1296,7 +1316,7 @@ async fn paginate_full_page_without_next_cursor_stays_unbounded() -> anyhow::Res
     state
         .realtime
         .committers
-        .mutate(&db, None, insert("backlog", 30.0), None)
+        .mutate(&db, None, insert("backlog", 30.0), PrincipalCtx::bypass())
         .await?;
     expect_update(&mut rx, "insert flips hasNext on a last page").await;
 
@@ -1325,7 +1345,7 @@ async fn paginate_skips_writes_beyond_a_bounded_page() -> anyhow::Result<()> {
                 "title",
                 serde_json::Value::String("renamed".into()),
             ),
-            None,
+            PrincipalCtx::bypass(),
         )
         .await?;
     expect_no_update(&mut rx, "patch beyond the page boundary");
@@ -1334,7 +1354,7 @@ async fn paginate_skips_writes_beyond_a_bounded_page() -> anyhow::Result<()> {
     state
         .realtime
         .committers
-        .mutate(&db, None, insert("backlog", 1.0), None)
+        .mutate(&db, None, insert("backlog", 1.0), PrincipalCtx::bypass())
         .await?;
     expect_update(&mut rx, "insert ahead of the page boundary").await;
 
@@ -1360,7 +1380,7 @@ async fn bare_take_without_an_index_ranks_on_creation_time() -> anyhow::Result<(
     state
         .realtime
         .committers
-        .mutate(&db, None, insert("backlog", 30.0), None)
+        .mutate(&db, None, insert("backlog", 30.0), PrincipalCtx::bypass())
         .await?;
     expect_no_update(&mut rx, "newer insert cannot join the oldest-2");
 
@@ -1381,7 +1401,7 @@ async fn take_pushes_on_any_delete() -> anyhow::Result<()> {
     state
         .realtime
         .committers
-        .mutate(&db, None, delete(&ids[1]), None)
+        .mutate(&db, None, delete(&ids[1]), PrincipalCtx::bypass())
         .await?;
     expect_update(&mut rx, "delete of a member").await;
 
@@ -1450,12 +1470,12 @@ async fn verified_skips_record_no_missed_pushes_across_the_matrix() -> anyhow::R
     state
         .realtime
         .committers
-        .mutate(&db, None, insert("done", 500.0), None)
+        .mutate(&db, None, insert("done", 500.0), PrincipalCtx::bypass())
         .await?;
     state
         .realtime
         .committers
-        .mutate(&db, None, insert("done", 400.0), None)
+        .mutate(&db, None, insert("done", 400.0), PrincipalCtx::bypass())
         .await?;
     state
         .realtime
@@ -1464,7 +1484,7 @@ async fn verified_skips_record_no_missed_pushes_across_the_matrix() -> anyhow::R
             &db,
             None,
             patch_field(&ids[2], "title", serde_json::Value::String("x".into())),
-            None,
+            PrincipalCtx::bypass(),
         )
         .await?;
 
@@ -1509,7 +1529,7 @@ async fn verification_does_not_change_push_behavior() -> anyhow::Result<()> {
     state
         .realtime
         .committers
-        .mutate(&db, None, insert("backlog", 30.0), None)
+        .mutate(&db, None, insert("backlog", 30.0), PrincipalCtx::bypass())
         .await?;
     expect_no_update(&mut rx, "verified skip must not push");
 
@@ -1517,7 +1537,7 @@ async fn verification_does_not_change_push_behavior() -> anyhow::Result<()> {
     state
         .realtime
         .committers
-        .mutate(&db, None, insert("backlog", 5.0), None)
+        .mutate(&db, None, insert("backlog", 5.0), PrincipalCtx::bypass())
         .await?;
     expect_update(&mut rx, "real change still pushes under verification").await;
 
@@ -1539,7 +1559,7 @@ async fn sampling_off_by_default_records_skips_but_no_verifications() -> anyhow:
     state
         .realtime
         .committers
-        .mutate(&db, None, insert("done", 1.0), None)
+        .mutate(&db, None, insert("done", 1.0), PrincipalCtx::bypass())
         .await?;
     expect_no_update(&mut rx, "out-of-window insert");
 

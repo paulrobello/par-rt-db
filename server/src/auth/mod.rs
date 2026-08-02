@@ -140,6 +140,20 @@ pub struct PrincipalCtx {
     pub email: Option<String>,
 }
 
+impl PrincipalCtx {
+    /// Bypass context: no user identity. Used for machine tokens, scheduled
+    /// jobs, the TTL reaper, schema migrations, and the WS admin bypass — every
+    /// path that must NOT enforce per-row ownership (ownerField /
+    /// collaboratorsField) or resolve `$user`/`$email` markers. Equivalent to
+    /// the pre-Task-5 `owner = None`.
+    pub fn bypass() -> Self {
+        PrincipalCtx {
+            user_id: None,
+            email: None,
+        }
+    }
+}
+
 impl Principal {
     /// Builds the per-row auth view. `Machine` ⇒ bypass (`user_id = None`).
     /// `User` ⇒ `Some(user_id)` and `Some(email)` so `$email` predicates resolve.

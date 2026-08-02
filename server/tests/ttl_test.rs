@@ -7,6 +7,7 @@
 
 mod common;
 
+use rtdb_server::auth::PrincipalCtx;
 use rtdb_server::db;
 use rtdb_server::ddl;
 use rtdb_server::query::{Query, QueryResult, execute_query};
@@ -100,7 +101,7 @@ async fn get_doc(
         hybrid_search: None,
         aggregate: None,
     };
-    match execute_query(pool, db, schema, &query, None).await {
+    match execute_query(pool, db, schema, &query, &PrincipalCtx::bypass()).await {
         Ok(QueryResult::Doc(Some(doc))) => doc,
         other => panic!("expected Doc(Some(..)) for id {id}, got {other:?}"),
     }
@@ -129,7 +130,7 @@ async fn insert_stamps_ttl_default_when_field_absent() {
                     .clone(),
             }],
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await
     .expect("insert txn");
@@ -184,7 +185,7 @@ async fn insert_keeps_caller_expires_at_when_field_present() {
                     .clone(),
             }],
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await
     .expect("insert txn");
@@ -243,7 +244,7 @@ async fn adding_ttl_backfills_existing_rows() {
                     .clone(),
             }],
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await
     .expect("insert row A under v1");
@@ -285,7 +286,7 @@ async fn adding_ttl_backfills_existing_rows() {
                     .clone(),
             }],
         },
-        None,
+        &PrincipalCtx::bypass(),
     )
     .await
     .expect("insert row B under v2");
@@ -378,7 +379,7 @@ async fn doc_present(
         aggregate: None,
     };
     matches!(
-        execute_query(pool, db, schema, &query, None).await,
+        execute_query(pool, db, schema, &query, &PrincipalCtx::bypass()).await,
         Ok(QueryResult::Doc(Some(_)))
     )
 }
@@ -406,7 +407,7 @@ async fn insert_session_via_committer(
                     doc,
                 }],
             },
-            None,
+            PrincipalCtx::bypass(),
         )
         .await
         .expect("insert via committer");
@@ -679,7 +680,10 @@ async fn reaper_bypasses_per_row_owner_auth() {
                     doc,
                 }],
             },
-            Some("alice".into()),
+            PrincipalCtx {
+                user_id: Some("alice".to_string()),
+                email: None,
+            },
         )
         .await
         .expect("insert via committer");
@@ -762,7 +766,7 @@ async fn reaper_ignores_tables_without_ttl() {
                         .clone(),
                 }],
             },
-            None,
+            PrincipalCtx::bypass(),
         )
         .await
         .expect("insert with_ttl");
@@ -785,7 +789,7 @@ async fn reaper_ignores_tables_without_ttl() {
                         .clone(),
                 }],
             },
-            None,
+            PrincipalCtx::bypass(),
         )
         .await
         .expect("insert plain");
