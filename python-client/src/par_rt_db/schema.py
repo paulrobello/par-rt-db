@@ -188,14 +188,34 @@ class IndexDef(_S):
         return out
 
 
+class TtlDef(_S):
+    """Per-table TTL policy: a declared numeric ``field`` whose value is the
+    document's expiry epoch-millis, plus an optional ``default_duration_ms``
+    stamped onto inserts that omit the field (after insert it is an ordinary
+    field). Mirrors ``server/src/schema.rs::TtlDef``; serializes as
+    ``{"field": ..., "defaultDurationMs": ...}`` with ``defaultDurationMs`` omitted
+    when ``None`` (server ``skip_serializing_if = "Option::is_none"``)."""
+
+    field: str
+    default_duration_ms: int | None = None
+
+    @model_serializer(mode="wrap")
+    def _drop_absent_default(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        out = handler(self)
+        if out.get("defaultDurationMs") is None:
+            out.pop("defaultDurationMs", None)
+        return out
+
+
 class TableDef(_S):
     """One table: typed fields, indexes, optional per-row ``owner_field`` and
-    ``collaborators_field``."""
+    ``collaborators_field``, and an optional ``ttl`` policy."""
 
     fields: dict[str, FieldType]
     indexes: list[IndexDef] = Field(default_factory=list)
     owner_field: str | None = None
     collaborators_field: str | None = None
+    ttl: TtlDef | None = None
 
     @model_serializer(mode="wrap")
     def _drop_absent_owner(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
@@ -204,6 +224,9 @@ class TableDef(_S):
             out.pop("ownerField", None)
         if out.get("collaboratorsField") is None:
             out.pop("collaboratorsField", None)
+        # `ttl` is a behavior toggle (server skip_serializing_if = "Option::is_none").
+        if out.get("ttl") is None:
+            out.pop("ttl", None)
         return out
 
 

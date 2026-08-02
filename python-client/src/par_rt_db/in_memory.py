@@ -1136,6 +1136,18 @@ class InMemoryRtDbClient:
                 raise RtDbError(ErrorCode.INTERNAL, "unknown step op")
 
     def _do_insert(self, table_name: str, table_def: TableDef, doc: dict[str, Any]) -> str:
+        # TTL default: stamp the declared field at insert only when the caller
+        # omitted it and a default duration is declared (mirrors server
+        # `committer::execute_txn`). After insert the field is ordinary —
+        # patch/replace/delete treat it like any other field. Runs before
+        # validation so a required TTL field is populated.
+        ttl = table_def.ttl
+        if (
+            ttl is not None
+            and ttl.default_duration_ms is not None
+            and ttl.field not in doc
+        ):
+            doc[ttl.field] = self._now() + ttl.default_duration_ms
         validate_doc(table_def, doc)
         stored = _strip_unset_optionals(table_def, doc)
         self._check_unique_indexes(table_def, table_name, stored, None)
@@ -1392,15 +1404,38 @@ class InMemoryRtDbClient:
         """Snapshot of every scheduled job's public view."""
         return [_schedule_info(job) for job in self._schedules]
 
+    def _reap_ttl(self, now: int) -> int:
+        """Remove docs whose declared TTL ``field`` (a number) is ``< now`` — the
+        in-memory mirror of the server's per-tick TTL reaper. Fires only on
+        tables that declare ``ttl``; non-numeric or absent values are left alone.
+        Notifies subscribers on each touched table so reactive subscriptions see
+        the expiry as a delete. Returns the count of removed docs."""
+        touched: set[str] = set()
+        removed = 0
+        # Snapshot the items — popping mid-iteration would skip rows.
+        for (table, doc_id), row in list(self._docs.items()):
+            tdef = self._tables.get(table)
+            if tdef is None or tdef.ttl is None:
+                continue
+            value = row.doc.get(tdef.ttl.field)
+            if isinstance(value, (int, float)) and value < now:
+                self._docs.pop((table, doc_id), None)
+                removed += 1
+                touched.add(table)
+        if touched:
+            self._notify_subs(touched)
+        return removed
+
     def tick(self, now_ms: int | None = None) -> None:
-        """Fire every due non-paused job by applying its txn through the same
+        """Advance the harness clock to ``now_ms`` (or the client clock when
+        omitted), then (1) reap docs whose TTL field is in the past and (2) fire
+        every due non-paused scheduled job by applying its txn through the same
         atomic path as :meth:`mutate` (so reactive subscriptions see the write).
         One-shots are removed after a successful fire; crons re-arm by
         :data:`CRON_STEP_MS`. A job whose txn fails is marked ``error`` but left
-        in place (still due), so a subsequent ``tick`` retries it. Pass
-        ``now_ms`` to drive the clock deterministically; omit to use the client's
-        clock."""
+        in place (still due), so a subsequent ``tick`` retries it."""
         now = now_ms if now_ms is not None else self._now()
+        self._reap_ttl(now)
         i = 0
         while i < len(self._schedules):
             job = self._schedules[i]
