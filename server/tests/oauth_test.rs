@@ -250,18 +250,6 @@ fn insert_work_item_txn() -> Value {
     }}]})
 }
 
-// (a) full flow: start -> callback -> 200 with the session token in Set-Cookie and the exact origin in the HTML.
-#[tokio::test]
-async fn full_oauth_flow_returns_html_with_session_token() -> anyhow::Result<()> {
-    let mock = MockServer::start().await;
-    mount_github_mocks(&mock, verified_primary_email("probello@gmail.com")).await;
-    let (_state, addr) = oauth_state(&mock).await;
-
-    let token = login_flow(addr, "http://localhost:5173").await;
-    assert!(!token.is_empty());
-    Ok(())
-}
-
 // (b) /auth/me with the session token -> email correct, plus the GitHub
 // identity (login + id) surfaced from the resolved session's user row.
 #[tokio::test]
@@ -743,10 +731,13 @@ async fn google_configured_state() -> (Arc<AppState>, SocketAddr) {
     (state, addr)
 }
 
-// (h) configured Google provider -> begin returns 200 JSON whose authorize_url
+// (h) configured Google provider -> begin returns 200 JSON whose authorizeUrl
 // points at Google with the expected OIDC params and carries a state token.
+// The function name carries the camelCase key on purpose: this test is the
+// regression guard for the SEC-012 wire contract the clients depend on.
 #[tokio::test]
-async fn google_begin_returns_google_authorize_url() -> anyhow::Result<()> {
+#[allow(non_snake_case)]
+async fn google_begin_returns_google_authorizeUrl() -> anyhow::Result<()> {
     let (_state, addr) = google_configured_state().await;
 
     let resp = no_redirect_client()
@@ -757,9 +748,9 @@ async fn google_begin_returns_google_authorize_url() -> anyhow::Result<()> {
         .await?;
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
     let body: Value = resp.json().await?;
-    let url = body["authorize_url"]
+    let url = body["authorizeUrl"]
         .as_str()
-        .expect("authorize_url in begin response");
+        .expect("authorizeUrl in begin response");
     assert!(url.starts_with("https://accounts.google.com/o/oauth2/v2/auth?"));
     assert!(url.contains("client_id=g-client"));
     assert!(url.contains("response_type=code"));

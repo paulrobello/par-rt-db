@@ -173,6 +173,7 @@ struct BeginParams {
 }
 
 #[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 struct BeginResponse {
     authorize_url: String,
     state: String,
@@ -399,10 +400,11 @@ async fn validate(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Res
 }
 
 /// OAuth + session routes. SEC-012: each provider mounts a `begin` endpoint
-/// that returns `{authorize_url, state}` (the parent opens it in a `noopener`
-/// popup and polls `/auth/state`); the callback is shared at `/auth/callback`
-/// (GitHub keeps its original path for deployed clients). `/auth/state`,
-/// `/auth/logout`, and `/auth/me` are provider-agnostic.
+/// that returns `{authorizeUrl, state}` (the parent opens it in a `noopener`
+/// popup and polls `/auth/state`); the callback handler is generic over the
+/// provider, mounted per-provider — GitHub keeps `/auth/callback`, Google and
+/// GitLab use `/<provider>/callback`. `/auth/state`, `/auth/logout`, and
+/// `/auth/me` are provider-agnostic.
 pub fn auth_routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/auth/github/begin", get(provider_begin::<GithubProvider>))
