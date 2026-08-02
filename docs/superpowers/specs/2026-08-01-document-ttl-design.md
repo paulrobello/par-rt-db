@@ -122,11 +122,21 @@ the document.
   column), so the `f_<field>` column is created with the table (new table) or
   added + backfilled from `doc` (existing table) by the existing code path.
 - **Backfill on add** (decided: stamp from `createdAt + default`): if
-  `default_duration_ms` is `Some`, in the same migration tx run
-  `UPDATE "{schema}"."{table}" SET "f_<field>" = created_at + $default
-   WHERE "f_<field>" IS NULL`. Rows whose `created_at + default` is already in
-  the past get reaped on the next sweep (intentional — a retro-active TTL).
-  If `default_duration_ms` is `None`, existing rows are untouched (only future
+  `default_duration_ms` is `Some`, in the same migration tx stamp existing rows
+  lacking the field. Because the read path (`merge_doc`) returns the jsonb `doc`
+  and never the typed column, the backfill must update **both** the typed column
+  (for the reaper/index scan) and the `doc` (for reads), gated on the column
+  being NULL so a caller-set value is preserved:
+  ```sql
+  UPDATE "{schema}"."{table}"
+  SET "f_<field>" = created_at + $default,
+      doc = doc || jsonb_build_object('<field>', created_at + $default)
+  WHERE "f_<field>" IS NULL
+  ```
+  This matches insert-time stamping (Task 2 writes the `doc`; the column is
+  derived). Rows whose `created_at + default` is already in the past get reaped
+  on the next sweep (intentional — a retro-active TTL). If
+  `default_duration_ms` is `None`, existing rows are untouched (only future
   inserts that omit the field are affected, and only if a default exists —
   otherwise the client must set the field on every write).
 
