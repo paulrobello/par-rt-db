@@ -239,6 +239,7 @@ mod tests {
             indexes: indexes.to_vec(),
             owner_field: None,
             collaborators_field: None,
+            ttl: None,
         }
     }
 

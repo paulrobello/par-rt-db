@@ -945,6 +945,7 @@ mod tests {
                 indexes: vec![],
                 owner_field: None,
                 collaborators_field: None,
+                ttl: None,
             },
         );
         SchemaDef { tables }
@@ -1044,6 +1045,7 @@ mod tests {
                 indexes: vec![],
                 owner_field: None,
                 collaborators_field: None,
+                ttl: None,
             },
         );
         let schema = SchemaDef { tables };
@@ -1107,6 +1109,7 @@ mod tests {
                 }],
                 owner_field: Some("ownerId".into()),
                 collaborators_field: Some("collabs".into()),
+                ttl: None,
             },
         );
         SchemaDef { tables }
@@ -1211,6 +1214,7 @@ mod tests {
                 indexes: vec![],
                 owner_field: None,
                 collaborators_field: None,
+                ttl: None,
             },
         );
         let old = SchemaDef { tables };
@@ -1250,6 +1254,7 @@ mod tests {
                 indexes: vec![],
                 owner_field: None,
                 collaborators_field: None,
+                ttl: None,
             },
         );
         tables.insert(
@@ -1259,6 +1264,7 @@ mod tests {
                 indexes: vec![],
                 owner_field: None,
                 collaborators_field: None,
+                ttl: None,
             },
         );
         let old = SchemaDef { tables };

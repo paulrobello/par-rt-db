@@ -37,6 +37,7 @@ fn priority_schema(variants: &[&str]) -> SchemaDef {
             indexes,
             owner_field: None,
             collaborators_field: None,
+            ttl: None,
         },
     );
     SchemaDef { tables }
@@ -122,6 +123,7 @@ fn email_index_schema(unique: bool, where_clause: Option<FilterExpr>) -> SchemaD
             indexes,
             owner_field: None,
             collaborators_field: None,
+            ttl: None,
         },
     );
     SchemaDef { tables }

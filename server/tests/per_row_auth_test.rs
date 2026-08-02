@@ -43,6 +43,7 @@ fn owner_schema() -> SchemaDef {
             indexes: notes_indexes,
             owner_field: Some("userId".into()),
             collaborators_field: None,
+            ttl: None,
         },
     );
     let mut open_fields = BTreeMap::new();
@@ -54,6 +55,7 @@ fn owner_schema() -> SchemaDef {
             indexes: vec![],
             owner_field: None,
             collaborators_field: None,
+            ttl: None,
         },
     );
     SchemaDef { tables }
@@ -460,6 +462,7 @@ async fn search_filters_to_own_rows() -> anyhow::Result<()> {
             indexes: notes_indexes,
             owner_field: Some("userId".into()),
             collaborators_field: None,
+            ttl: None,
         },
     );
     let schema = SchemaDef { tables };
@@ -541,6 +544,7 @@ async fn vector_search_filters_to_own_rows() -> anyhow::Result<()> {
             indexes: docs_indexes,
             owner_field: Some("userId".into()),
             collaborators_field: None,
+            ttl: None,
         },
     );
     let schema = SchemaDef { tables };
@@ -638,6 +642,7 @@ async fn vector_search_composes_filter_fields_with_owner() -> anyhow::Result<()>
             indexes: docs_indexes,
             owner_field: Some("userId".into()),
             collaborators_field: None,
+            ttl: None,
         },
     );
     let schema = SchemaDef { tables };
@@ -1512,6 +1517,7 @@ fn collab_schema() -> SchemaDef {
             indexes: notes_indexes,
             owner_field: Some("userId".into()),
             collaborators_field: Some("collaborators".into()),
+            ttl: None,
         },
     );
     SchemaDef { tables }

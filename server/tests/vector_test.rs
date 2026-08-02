@@ -41,6 +41,7 @@ fn vector_schema(dim: u32, with_filter: bool) -> SchemaDef {
             indexes,
             owner_field: None,
             collaborators_field: None,
+            ttl: None,
         },
     );
     SchemaDef { tables }

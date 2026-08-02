@@ -71,6 +71,18 @@ fn is_false(b: &bool) -> bool {
     !b
 }
 
+/// Declarative document TTL (auto-expiry). `field` names a declared numeric
+/// field whose value is each document's absolute epoch-ms expiry; a per-db
+/// reaper deletes rows whose value is in the past. `default_duration_ms`
+/// stamps the field at insert time when the client omits it. See
+/// `docs/superpowers/specs/2026-08-01-document-ttl-design.md`.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct TtlDef {
+    pub field: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_duration_ms: Option<i64>,
+}
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TableDef {
     pub fields: BTreeMap<String, FieldType>,
@@ -99,9 +111,14 @@ pub struct TableDef {
         rename = "collaboratorsField"
     )]
     pub collaborators_field: Option<String>,
+    /// Declarative document TTL. When `Some`, a per-db reaper deletes rows
+    /// whose `ttl.field` value is in the past. Additive — schemas without it
+    /// deserialize unchanged. See `TtlDef`.
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "ttl")]
+    pub ttl: Option<TtlDef>,
 }
 
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct SchemaDef {
     pub tables: BTreeMap<String, TableDef>,
 }
@@ -470,6 +487,45 @@ impl TableDef {
                 }
             }
         }
+
+        if let Some(ttl) = &self.ttl {
+            if !is_valid_identifier(&ttl.field, MAX_FIELD_NAME_LEN) {
+                return Err(RtDbError::schema(format!(
+                    "ttl.field '{}' is not a valid identifier",
+                    ttl.field
+                )));
+            }
+            let fty = self.fields.get(&ttl.field).ok_or_else(|| {
+                RtDbError::schema(format!("ttl.field '{}' is not a declared field", ttl.field))
+            })?;
+            if !matches!(fty, FieldType::Number | FieldType::Int64) {
+                return Err(RtDbError::schema(format!(
+                    "ttl.field '{}' must be a number or bigint field",
+                    ttl.field
+                )));
+            }
+            let has_ttl_index = self.indexes.iter().any(|idx| {
+                !idx.search
+                    && idx.vector.is_none()
+                    && !idx.unique
+                    && idx.r#where.is_none()
+                    && idx.fields.len() == 1
+                    && idx.fields[0] == ttl.field
+            });
+            if !has_ttl_index {
+                return Err(RtDbError::schema(format!(
+                    "ttl.field '{}' requires a single-field, non-unique, non-partial btree index on it",
+                    ttl.field
+                )));
+            }
+            if let Some(d) = ttl.default_duration_ms
+                && d <= 0
+            {
+                return Err(RtDbError::schema(
+                    "ttl.defaultDurationMs must be greater than 0".to_string(),
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -660,6 +716,7 @@ mod tests {
             indexes: vec![],
             owner_field: None,
             collaborators_field: None,
+            ttl: None,
         }
     }
 
@@ -707,6 +764,7 @@ mod tests {
             indexes: vec![],
             owner_field: None,
             collaborators_field: None,
+            ttl: None,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -740,6 +798,7 @@ mod tests {
             indexes: vec![],
             owner_field: None,
             collaborators_field: None,
+            ttl: None,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -755,6 +814,7 @@ mod tests {
             indexes: vec![],
             owner_field: None,
             collaborators_field: None,
+            ttl: None,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -777,6 +837,7 @@ mod tests {
             }],
             owner_field: None,
             collaborators_field: None,
+            ttl: None,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -799,6 +860,7 @@ mod tests {
             }],
             owner_field: None,
             collaborators_field: None,
+            ttl: None,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -816,6 +878,7 @@ mod tests {
             indexes: vec![],
             owner_field: None,
             collaborators_field: None,
+            ttl: None,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -847,6 +910,7 @@ mod tests {
             ],
             owner_field: None,
             collaborators_field: None,
+            ttl: None,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -861,6 +925,7 @@ mod tests {
             indexes: vec![],
             owner_field: None,
             collaborators_field: None,
+            ttl: None,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -900,6 +965,7 @@ mod tests {
             }],
             owner_field: None,
             collaborators_field: None,
+            ttl: None,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -921,6 +987,7 @@ mod tests {
             }],
             owner_field: None,
             collaborators_field: None,
+            ttl: None,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -942,6 +1009,7 @@ mod tests {
             }],
             owner_field: None,
             collaborators_field: None,
+            ttl: None,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -973,6 +1041,7 @@ mod tests {
             ],
             owner_field: None,
             collaborators_field: None,
+            ttl: None,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -994,6 +1063,7 @@ mod tests {
             }],
             owner_field: None,
             collaborators_field: None,
+            ttl: None,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -1015,6 +1085,7 @@ mod tests {
             }],
             owner_field: None,
             collaborators_field: None,
+            ttl: None,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -1034,6 +1105,7 @@ mod tests {
             indexes: vec![],
             owner_field: None,
             collaborators_field: None,
+            ttl: None,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -1048,6 +1120,7 @@ mod tests {
             indexes: vec![],
             owner_field: None,
             collaborators_field: None,
+            ttl: None,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -1069,6 +1142,7 @@ mod tests {
             indexes: vec![],
             owner_field: None,
             collaborators_field: None,
+            ttl: None,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -1271,6 +1345,7 @@ mod tests {
             indexes: vec![],
             owner_field: None,
             collaborators_field: None,
+            ttl: None,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -1369,6 +1444,7 @@ mod tests {
             }],
             owner_field: None,
             collaborators_field: None,
+            ttl: None,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -1425,6 +1501,7 @@ mod tests {
             }],
             owner_field: None,
             collaborators_field: None,
+            ttl: None,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -1451,6 +1528,7 @@ mod tests {
             }],
             owner_field: None,
             collaborators_field: None,
+            ttl: None,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -1546,6 +1624,7 @@ mod tests {
             }],
             owner_field: None,
             collaborators_field: None,
+            ttl: None,
         };
         assert!(table.validate_structure("docs").is_err());
     }
@@ -1570,6 +1649,7 @@ mod tests {
             }],
             owner_field: None,
             collaborators_field: None,
+            ttl: None,
         };
         assert!(table.validate_structure("docs").is_ok());
     }
@@ -1593,6 +1673,7 @@ mod tests {
             }],
             owner_field: None,
             collaborators_field: None,
+            ttl: None,
         };
         assert!(table.validate_structure("docs").is_err());
     }
@@ -1618,6 +1699,7 @@ mod tests {
             }],
             owner_field: None,
             collaborators_field: None,
+            ttl: None,
         };
         assert!(table.validate_structure("docs").is_err());
     }
@@ -1642,6 +1724,7 @@ mod tests {
             }],
             owner_field: None,
             collaborators_field: None,
+            ttl: None,
         };
         assert!(table.validate_structure("docs").is_err());
     }
@@ -1665,6 +1748,7 @@ mod tests {
             }],
             owner_field: None,
             collaborators_field: None,
+            ttl: None,
         };
         assert!(table.validate_structure("docs").is_err());
     }
@@ -1688,6 +1772,7 @@ mod tests {
             }],
             owner_field: None,
             collaborators_field: None,
+            ttl: None,
         };
         assert!(table.validate_structure("docs").is_err());
     }
@@ -1717,6 +1802,7 @@ mod tests {
             }],
             owner_field: None,
             collaborators_field: None,
+            ttl: None,
         };
         assert!(table.validate_structure("docs").is_err());
     }
@@ -1939,5 +2025,125 @@ mod tests {
         let empty = FieldType::Union { variants: vec![] };
         assert!(!is_widening_of(&empty, &union_of(&["a", "b"])));
         assert!(!is_widening_of(&union_of(&["a", "b"]), &empty));
+    }
+
+    fn table_with_ttl(ttl: Option<TtlDef>) -> TableDef {
+        let mut fields = BTreeMap::new();
+        fields.insert("expiresAt".to_string(), FieldType::Number);
+        TableDef {
+            fields,
+            indexes: vec![IndexDef {
+                name: "by_expiresAt".to_string(),
+                fields: vec!["expiresAt".to_string()],
+                unique: false,
+                search: false,
+                vector: None,
+                r#where: None,
+            }],
+            owner_field: None,
+            collaborators_field: None,
+            ttl,
+        }
+    }
+
+    #[test]
+    fn ttl_accepts_numeric_field_with_single_btree_index() {
+        let mut schema = SchemaDef::default();
+        schema.tables.insert(
+            "t".to_string(),
+            table_with_ttl(Some(TtlDef {
+                field: "expiresAt".to_string(),
+                default_duration_ms: Some(86_400_000),
+            })),
+        );
+        assert!(schema.validate().is_ok());
+    }
+
+    #[test]
+    fn ttl_rejects_missing_index() {
+        let mut table = table_with_ttl(Some(TtlDef {
+            field: "expiresAt".to_string(),
+            default_duration_ms: None,
+        }));
+        table.indexes.clear();
+        let mut schema = SchemaDef::default();
+        schema.tables.insert("t".to_string(), table);
+        let err = schema.validate().unwrap_err();
+        assert!(
+            err.message
+                .contains("requires a single-field, non-unique, non-partial btree index"),
+            "{}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn ttl_rejects_non_numeric_field() {
+        let mut table = table_with_ttl(Some(TtlDef {
+            field: "name".to_string(),
+            default_duration_ms: None,
+        }));
+        table.fields.insert("name".to_string(), FieldType::String);
+        let mut schema = SchemaDef::default();
+        schema.tables.insert("t".to_string(), table);
+        assert!(schema.validate().is_err());
+    }
+
+    #[test]
+    fn ttl_rejects_unique_or_partial_or_multifield_index() {
+        for bad in [
+            IndexDef {
+                name: "x".to_string(),
+                fields: vec!["expiresAt".to_string()],
+                unique: true,
+                search: false,
+                vector: None,
+                r#where: None,
+            },
+            IndexDef {
+                name: "x".to_string(),
+                fields: vec!["expiresAt".to_string()],
+                unique: false,
+                search: false,
+                vector: None,
+                r#where: Some(FilterExpr::Gt {
+                    field: "expiresAt".to_string(),
+                    value: serde_json::json!(0),
+                }),
+            },
+            IndexDef {
+                name: "x".to_string(),
+                fields: vec!["expiresAt".to_string(), "expiresAt".to_string()],
+                unique: false,
+                search: false,
+                vector: None,
+                r#where: None,
+            },
+        ] {
+            let mut table = table_with_ttl(Some(TtlDef {
+                field: "expiresAt".to_string(),
+                default_duration_ms: None,
+            }));
+            table.indexes = vec![bad];
+            let mut schema = SchemaDef::default();
+            schema.tables.insert("t".to_string(), table);
+            assert!(
+                schema.validate().is_err(),
+                "should reject this index variant"
+            );
+        }
+    }
+
+    #[test]
+    fn ttl_rejects_non_positive_default_duration() {
+        let mut schema = SchemaDef::default();
+        schema.tables.insert(
+            "t".to_string(),
+            table_with_ttl(Some(TtlDef {
+                field: "expiresAt".to_string(),
+                default_duration_ms: Some(0),
+            })),
+        );
+        assert!(schema.validate().is_err());
     }
 }

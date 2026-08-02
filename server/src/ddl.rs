@@ -416,6 +416,7 @@ mod tests {
                 indexes: vec![],
                 owner_field: None,
                 collaborators_field: None,
+                ttl: None,
             },
         );
         tables
