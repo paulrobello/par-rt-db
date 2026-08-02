@@ -404,6 +404,26 @@ function stripUnsetOptionals(
   return out;
 }
 
+/** Stamps the TTL field at insert when the table declares a
+ * `defaultDurationMs` and the document omits the field. After this, the TTL
+ * field is ordinary (patch/replace manipulate it normally). Mirrors server
+ * `txn::stamp_ttl_default`; runs BEFORE validation so the stamped value
+ * satisfies a required numeric field. Returns the same `doc` reference when no
+ * stamp is needed, otherwise a shallow copy with the field set. */
+function stampTtlDefault(
+  table: TableJson,
+  doc: Record<string, unknown>,
+  now: number,
+): Record<string, unknown> {
+  const ttl = table.ttl;
+  if (ttl?.defaultDurationMs != null && !(ttl.field in doc)) {
+    const out: Record<string, unknown> = { ...doc };
+    out[ttl.field] = now + ttl.defaultDurationMs;
+    return out;
+  }
+  return doc;
+}
+
 /** Applies a patch's fields onto `doc` — a port of server `txn::apply_patch`. */
 function applyPatch(
   table: TableJson,
@@ -1136,8 +1156,14 @@ export class InMemoryRtDbClient {
   /** Fires every due non-paused job by applying its txn through the same atomic
    * path as `mutate` (so reactive subscriptions see the write). One-shots are
    * removed after a successful fire; crons are re-armed. Pass `nowMs` to drive
-   * the clock deterministically; omit it to use the client's injected clock. */
-  tick(nowMs?: number): void {
+   * the clock deterministically; omit it to use the client's injected clock.
+   *
+   * Also reaps expired documents: any table that declares a `ttl` has rows
+   * removed whose TTL field value is a number strictly less than `now` (a no-op
+   * for tables without TTL). Returns the count of documents reaped. The live
+   * server's per-db reaper is the real expiry; this is best-effort, for
+   * tests/local workflows. */
+  tick(nowMs?: number): number {
     const now = nowMs ?? this.now();
     for (const job of this.schedules.values()) {
       if (job.status === "paused" || job.dueAt > now) {
@@ -1160,6 +1186,38 @@ export class InMemoryRtDbClient {
         }
       }
     }
+    return this.reapTtl(now);
+  }
+
+  /** Removes documents whose TTL field value is a number strictly less than
+   * `now`, for every table that declares a `ttl`. Fires subscription fan-out
+   * for touched tables (mirroring `executeTransaction`). Returns the count
+   * removed. */
+  private reapTtl(now: number): number {
+    const tables = this.schema?.tables;
+    if (!tables) {
+      return 0;
+    }
+    let removed = 0;
+    const touched = new Set<string>();
+    for (const [tableName, rows] of this.tables) {
+      const ttl = tables[tableName]?.ttl;
+      if (!ttl) {
+        continue;
+      }
+      for (const [id, row] of rows) {
+        const v = row.doc[ttl.field];
+        if (typeof v === "number" && v < now) {
+          rows.delete(id);
+          removed++;
+          touched.add(tableName);
+        }
+      }
+    }
+    if (touched.size > 0) {
+      this.notifySubs(touched);
+    }
+    return removed;
   }
 
   private dueAtFor(when: ScheduleWhen, now: number): number {
@@ -1262,8 +1320,9 @@ export class InMemoryRtDbClient {
   }
 
   private doInsert(tableName: string, tableDef: TableJson, doc: Record<string, unknown>): string {
-    validateDoc(tableDef, doc);
-    const stored = stripUnsetOptionals(tableDef, doc);
+    const stamped = stampTtlDefault(tableDef, doc, this.now());
+    validateDoc(tableDef, stamped);
+    const stored = stripUnsetOptionals(tableDef, stamped);
     this.checkUniqueIndexes(tableName, tableDef, stored);
     const id = this.newId();
     this.rowsFor(tableName).set(id, { id, doc: stored, createdAt: this.now(), version: 1 });

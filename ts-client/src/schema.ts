@@ -1,4 +1,11 @@
-import type { FieldTypeJson, FilterExpr, IndexJson, SchemaJson, TableJson } from "./protocol.js";
+import type {
+  FieldTypeJson,
+  FilterExpr,
+  IndexJson,
+  SchemaJson,
+  TableJson,
+  TtlDef,
+} from "./protocol.js";
 
 /** Branded id string. `Id<"projects">` is assignable to `string` but distinct across tables. */
 export type Id<TableName extends string> = string & { readonly __idBrand: TableName };
@@ -90,6 +97,7 @@ export class TableDefinition<
     readonly indexes: IndexJson[] = [],
     readonly ownerFieldName?: string,
     readonly collaboratorsFieldName?: string,
+    readonly ttlDef?: TtlDef,
   ) {}
 
   index<Name extends string>(
@@ -101,6 +109,7 @@ export class TableDefinition<
       [...this.indexes, { name, fields: [...fields] }],
       this.ownerFieldName,
       this.collaboratorsFieldName,
+      this.ttlDef,
     );
   }
 
@@ -135,6 +144,7 @@ export class TableDefinition<
       indexes,
       this.ownerFieldName,
       this.collaboratorsFieldName,
+      this.ttlDef,
     );
   }
 
@@ -150,6 +160,7 @@ export class TableDefinition<
       [...this.indexes, { name, fields: [...fields], search: true }],
       this.ownerFieldName,
       this.collaboratorsFieldName,
+      this.ttlDef,
     );
   }
 
@@ -178,6 +189,7 @@ export class TableDefinition<
       ],
       this.ownerFieldName,
       this.collaboratorsFieldName,
+      this.ttlDef,
     );
   }
 
@@ -185,7 +197,13 @@ export class TableDefinition<
    * string-compatible field whose value is the owning user's id. Server-enforced;
    * the client only declares it and round-trips it on the wire as `ownerField`. */
   ownerField(field: string): TableDefinition<Fields, Indexes> {
-    return new TableDefinition(this.fields, this.indexes, field, this.collaboratorsFieldName);
+    return new TableDefinition(
+      this.fields,
+      this.indexes,
+      field,
+      this.collaboratorsFieldName,
+      this.ttlDef,
+    );
   }
 
   /** Declare the per-row collaborators field for authorization. `field` names a
@@ -193,7 +211,26 @@ export class TableDefinition<
    * user ids that may read/mutate the row (owner OR collaborator). Server-enforced;
    * the client only declares it and round-trips it on the wire as `collaboratorsField`. */
   collaboratorsField(field: string): TableDefinition<Fields, Indexes> {
-    return new TableDefinition(this.fields, this.indexes, this.ownerFieldName, field);
+    return new TableDefinition(this.fields, this.indexes, this.ownerFieldName, field, this.ttlDef);
+  }
+
+  /** Declare this table's document-TTL field. `field` names a declared numeric
+   * field whose value is each document's absolute epoch-ms expiry; the server's
+   * per-db reaper deletes rows whose value is in the past. `defaultDurationMs`
+   * stamps `field` at insert time when the document omits it (after insert the
+   * field is ordinary). Server-enforced; the client only declares it and
+   * round-trips it on the wire as `ttl`. The server requires a single-field,
+   * non-unique, non-partial btree index on `field` (declare one with `index()`
+   * before/after this call). */
+  ttl(field: string, defaultDurationMs?: number): TableDefinition<Fields, Indexes> {
+    const ttlDef: TtlDef = defaultDurationMs != null ? { field, defaultDurationMs } : { field };
+    return new TableDefinition(
+      this.fields,
+      this.indexes,
+      this.ownerFieldName,
+      this.collaboratorsFieldName,
+      ttlDef,
+    );
   }
 
   toJSON(): TableJson {
@@ -206,6 +243,9 @@ export class TableDefinition<
     }
     if (this.collaboratorsFieldName) {
       json.collaboratorsField = this.collaboratorsFieldName;
+    }
+    if (this.ttlDef) {
+      json.ttl = this.ttlDef;
     }
     return json;
   }

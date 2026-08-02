@@ -321,6 +321,16 @@ export interface IndexJson {
   where?: FilterExpr;
 }
 
+/** Declarative document TTL (auto-expiry). `field` names a declared numeric
+ * field whose value is each document's absolute epoch-ms expiry;
+ * `defaultDurationMs` stamps the field at insert time when the document omits
+ * it. Mirrors the server `TtlDef` (camelCase wire keys). Omitted on the wire
+ * when the table has no TTL. */
+export interface TtlDef {
+  field: string;
+  defaultDurationMs?: number;
+}
+
 export interface TableJson {
   fields: Record<string, FieldTypeJson>;
   indexes?: IndexJson[];
@@ -333,6 +343,11 @@ export interface TableJson {
    * read/mutate the row (owner OR collaborator). May be declared alone.
    * Omitted on the wire when unset. */
   collaboratorsField?: string;
+  /** Opt-in document TTL: names a declared numeric field whose value is each
+   * document's absolute epoch-ms expiry. `defaultDurationMs` stamps the field
+   * at insert time when the document omits it. Server-enforced; clients only
+   * declare it. Omitted on the wire when unset. */
+  ttl?: TtlDef;
 }
 
 export interface SchemaJson {
