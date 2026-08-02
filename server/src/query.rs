@@ -705,11 +705,13 @@ pub async fn execute_query(
         return point_read(
             pool,
             db,
+            table_def,
             &q.table,
             id,
             owner_field,
             collaborators_field,
             owner,
+            ctx,
         )
         .await;
     }
@@ -2318,14 +2320,17 @@ async fn execute_hybrid_search(
     Ok(QueryResult::Docs(docs))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn point_read(
     pool: &PgPool,
     db: &str,
+    table_def: &TableDef,
     table_name: &str,
     id: &str,
     owner_field: Option<&str>,
     collaborators_field: Option<&str>,
     owner: Option<&str>,
+    ctx: &PrincipalCtx,
 ) -> Result<QueryResult, RtDbError> {
     let pg_schema_name = pg_schema(db);
     let table_ident = pg_table(table_name);
@@ -2343,6 +2348,17 @@ async fn point_read(
             // neither owned-by nor shared-with the caller read as absent.
             if let Some(uid) = row_auth_enforced_uid(owner_field, collaborators_field, owner)
                 && !row_visible_to(&doc, owner_field, collaborators_field, uid)
+            {
+                return Ok(QueryResult::Doc(None));
+            }
+            // `authorize` predicate gate (user-only; bypass callers and
+            // owner/collab-only tables are unaffected). Composes with the
+            // owner/collab check above — both must pass when a table declares
+            // both. Silent on a false predicate (Doc(None)), matching the
+            // Convex-style point-read filtering above.
+            if let Some(expr) = &table_def.authorize
+                && ctx.user_id.is_some()
+                && !filter_matches(&doc, expr, ctx)
             {
                 return Ok(QueryResult::Doc(None));
             }

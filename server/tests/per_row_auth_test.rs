@@ -2530,3 +2530,100 @@ async fn client_filter_rejects_principal_marker() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+// ============================================================================
+// Task 7: `authorize` predicate enforcement on the point-read (`get`) path.
+// ----------------------------------------------------------------------------
+
+// (T7-1) User A `get(B-private-id)` → `null` (silent, Convex-style); user A
+// `get(A-private-id)` → the doc; machine/bypass `get(B-private-id)` → the doc.
+// Seeds the four ownership/visibility combinations and exercises each principal
+// against a private row's id (the case that distinguishes authorize-on-get from
+// the prior behavior, where point-read only consulted ownerField/collaborators
+// — both absent here, so A could previously fetch B's private doc by id).
+#[tokio::test]
+async fn authorize_get_filters_unauthorized_user() -> anyhow::Result<()> {
+    let (pool, db, schema) = setup_authorize().await;
+    let a_priv_id = seed_post(&pool, &db, &schema, "a-priv", "alice", "private").await;
+    let _a_pub_id = seed_post(&pool, &db, &schema, "a-pub", "alice", "public").await;
+    let b_priv_id = seed_post(&pool, &db, &schema, "b-priv", "bob", "private").await;
+    let _b_pub_id = seed_post(&pool, &db, &schema, "b-pub", "bob", "public").await;
+
+    // User A reads B's private doc by id → filtered away (silent Doc(None)).
+    let mut q = posts_query();
+    q.get = Some(b_priv_id.clone());
+    let res = execute_query(
+        &pool,
+        &db,
+        &schema,
+        &q,
+        &PrincipalCtx {
+            user_id: Some("alice".to_string()),
+            email: None,
+        },
+    )
+    .await?;
+    match res {
+        QueryResult::Doc(None) => {}
+        other => panic!("user A get(B-private) should be silent None, got {other:?}"),
+    }
+
+    // User A reads their own private doc by id → returned.
+    let mut q = posts_query();
+    q.get = Some(a_priv_id.clone());
+    let res = execute_query(
+        &pool,
+        &db,
+        &schema,
+        &q,
+        &PrincipalCtx {
+            user_id: Some("alice".to_string()),
+            email: None,
+        },
+    )
+    .await?;
+    match res {
+        QueryResult::Doc(Some(d)) => assert_eq!(d["body"].as_str(), Some("a-priv")),
+        other => panic!("user A get(A-private) should return the doc, got {other:?}"),
+    }
+
+    // Bypass caller reads B's private doc by id → returned (authorize is
+    // user-only; machine/admin/scheduled paths enforce nothing here).
+    let mut q = posts_query();
+    q.get = Some(b_priv_id.clone());
+    let res = execute_query(&pool, &db, &schema, &q, &PrincipalCtx::bypass()).await?;
+    match res {
+        QueryResult::Doc(Some(d)) => assert_eq!(d["body"].as_str(), Some("b-priv")),
+        other => panic!("bypass get(B-private) should return the doc, got {other:?}"),
+    }
+
+    Ok(())
+}
+
+// (T7-2) A user may read another user's PUBLIC doc by id (the `Or` branch of
+// the authorize predicate). Confirms the predicate is evaluated, not blanket
+// owner-only filtering — public rows are shared with everyone.
+#[tokio::test]
+async fn authorize_get_allows_other_users_public() -> anyhow::Result<()> {
+    let (pool, db, schema) = setup_authorize().await;
+    let b_pub_id = seed_post(&pool, &db, &schema, "b-pub", "bob", "public").await;
+
+    let mut q = posts_query();
+    q.get = Some(b_pub_id);
+    let res = execute_query(
+        &pool,
+        &db,
+        &schema,
+        &q,
+        &PrincipalCtx {
+            user_id: Some("alice".to_string()),
+            email: None,
+        },
+    )
+    .await?;
+    match res {
+        QueryResult::Doc(Some(d)) => assert_eq!(d["body"].as_str(), Some("b-pub")),
+        other => panic!("user A get(B-public) should return the doc, got {other:?}"),
+    }
+    Ok(())
+}
