@@ -5,7 +5,7 @@ import { SessionProvider, useSession } from "./session";
 // SEC-001 invariant tests: no dashboard credential is ever held in JS — both
 // login paths set an HttpOnly `rtdb_session` cookie, so the provider exposes only
 // the auth method + user (never a token). These guard that invariant and verify
-// the OAuth postMessage handshake + signOut hit the right endpoints.
+// the OAuth begin/poll relay + signOut hit the right endpoints.
 
 function Probe() {
   const s = useSession();
@@ -30,7 +30,8 @@ function buildFetch(opts: { loginStatus?: number; meBody?: unknown } = {}) {
   const loginStatus = opts.loginStatus ?? 204;
   const meBody = opts.meBody ?? { email: "ops@example.com" };
   // The mount probe calls /auth/me first (no session yet -> 401); a later call
-  // after the OAuth callback resolves the user (200). The counter models that.
+  // once the OAuth begin/poll flow completes resolves the user (200). The counter
+  // models that.
   let meCalls = 0;
   return vi.fn(async (input: RequestInfo | URL, _init?: RequestInit) => {
     const url = typeof input === "string" ? input : input.toString();
@@ -44,6 +45,22 @@ function buildFetch(opts: { loginStatus?: number; meBody?: unknown } = {}) {
       meCalls += 1;
       if (meCalls === 1) return new Response(null, { status: 401 });
       return new Response(JSON.stringify(meBody), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    if (
+      url.includes("/auth/github/begin") ||
+      url.includes("/auth/google/begin") ||
+      url.includes("/auth/gitlab/begin")
+    ) {
+      return new Response(JSON.stringify({ authorizeUrl: "about:blank", state: "s1" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    if (url.includes("/auth/state")) {
+      return new Response(JSON.stringify({ status: "complete" }), {
         status: 200,
         headers: { "content-type": "application/json" },
       });
@@ -98,11 +115,12 @@ describe("SessionProvider", () => {
     expect(persistedLooking).toHaveLength(0);
   });
 
-  it("OAuth handshake loads the user via /auth/me (cookie), signOut hits /auth/logout", async () => {
+  it("OAuth begin+poll loads the user via /auth/me (cookie), signOut hits /auth/logout", async () => {
     const fetchMock = buildFetch({ meBody: { email: "oauth@example.com" } });
     globalThis.fetch = fetchMock;
-    const popup = { closed: false, close: vi.fn() };
-    vi.spyOn(window, "open").mockReturnValue(popup as unknown as Window);
+    // noopener popup: window.open returns null (no popup handle) — the polling
+    // timeout covers blocked/closed/abandoned, so no popup mock is needed.
+    vi.spyOn(window, "open").mockReturnValue(null);
 
     render(
       <SessionProvider>
@@ -114,21 +132,12 @@ describe("SessionProvider", () => {
       screen.getByText("sign-in-oauth").click();
     });
 
-    // SEC-001 phase 2: the callback posts `{type:"rtdb-auth"}` with NO token;
-    // the provider loads the user via `/auth/me` (the cookie authenticates).
-    await act(async () => {
-      window.dispatchEvent(
-        new MessageEvent("message", {
-          origin: window.location.origin,
-          data: { type: "rtdb-auth" },
-        }),
-      );
-    });
-
+    // SEC-001: the begin callback sets an HttpOnly cookie (no token in JS); the
+    // provider polls /auth/state, then loads the user via `/auth/me`.
     expect(screen.getByTestId("method").textContent).toBe("oauth");
     expect(screen.getByTestId("user").textContent).toBe("oauth@example.com");
-    expect(popup.close).toHaveBeenCalled();
-    expect(fetchMock).toHaveBeenCalledWith("/auth/me");
+    expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining("/auth/github/begin?origin="));
+    expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining("/auth/state?state=s1"));
 
     await act(async () => {
       screen.getByText("sign-out").click();

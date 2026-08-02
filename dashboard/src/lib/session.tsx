@@ -1,5 +1,5 @@
-import { createContext, useContext, useEffect, useState, type ReactNode } from "react";
 import type { AuthedUser } from "@par-rt-db/client";
+import { createContext, type ReactNode, useContext, useEffect, useState } from "react";
 
 export type AuthMethod = "oauth" | "adminkey";
 
@@ -80,44 +80,53 @@ export function SessionProvider({ children }: { children: ReactNode }) {
 
   function signInWithOAuth(provider: "github" | "google" | "gitlab"): Promise<void> {
     const origin = window.location.origin;
-    const url = `${origin}/auth/${provider}?origin=${encodeURIComponent(origin)}`;
-    return new Promise<void>((resolve, reject) => {
-      const popup = window.open(url, "rtdb-oauth", "popup,width=560,height=720");
-      if (!popup) {
-        reject(new Error("popup blocked — allow popups for this site"));
+    const beginUrl = `${origin}/auth/${provider}/begin?origin=${encodeURIComponent(origin)}`;
+    const poll = (
+      state: string,
+      deadline: number,
+      resolve: () => void,
+      reject: (e: Error) => void,
+    ) => {
+      if (Date.now() > deadline) {
+        reject(new Error("sign-in timed out"));
         return;
       }
-      const cleanup = () => {
-        window.removeEventListener("message", onMessage);
-        clearInterval(poller);
-      };
-      const onMessage = (e: MessageEvent) => {
-        if (e.origin !== origin) return;
-        // SEC-001 phase 2: the callback signals success only — `{type:"rtdb-auth"}`
-        // with NO token. The session token arrived as the HttpOnly cookie on the
-        // callback response; load the user via `/auth/me` (cookie sent same-origin).
-        const data = e.data as { type?: string } | null;
-        if (data?.type === "rtdb-auth") {
-          cleanup();
-          popup.close();
-          fetch("/auth/me")
-            .then((r) => (r.ok ? r.json() : Promise.reject(new Error("could not load session"))))
-            .then((u: AuthedUser) => {
-              setError(null);
-              setUser(u);
-              setMethod("oauth");
-              resolve();
-            })
-            .catch(reject);
-        }
-      };
-      const poller = setInterval(() => {
-        if (popup.closed) {
-          cleanup();
-          reject(new Error("sign-in cancelled"));
-        }
-      }, 500);
-      window.addEventListener("message", onMessage);
+      fetch(`${origin}/auth/state?state=${encodeURIComponent(state)}`)
+        .then((r) => (r.ok ? r.json() : null))
+        .then((data: { status?: string } | null) => {
+          if (data?.status === "complete") {
+            // The HttpOnly cookie was set by the callback; load the user.
+            fetch("/auth/me")
+              .then((r) => (r.ok ? r.json() : Promise.reject(new Error("could not load session"))))
+              .then((u: AuthedUser) => {
+                setError(null);
+                setUser(u);
+                setMethod("oauth");
+                resolve();
+              })
+              .catch(reject);
+          } else if (data?.status === "expired" || data?.status === "error") {
+            reject(new Error(`sign-in ${data.status}`));
+          } else {
+            setTimeout(() => poll(state, deadline, resolve, reject), 800);
+          }
+        })
+        .catch(() => setTimeout(() => poll(state, deadline, resolve, reject), 800));
+    };
+    return new Promise<void>((resolve, reject) => {
+      fetch(beginUrl)
+        .then((r) => (r.ok ? r.json() : Promise.reject(new Error("could not start sign-in"))))
+        .then((b: { authorizeUrl: string; state: string }) => {
+          // noopener: window.open returns null — no blocked-popup detect, no
+          // closed-poll; the polling timeout covers blocked/closed/abandoned.
+          window.open(
+            b.authorizeUrl,
+            "rtdb-oauth",
+            "noopener,noreferrer,popup,width=560,height=720",
+          );
+          poll(b.state, Date.now() + 180_000, resolve, reject);
+        })
+        .catch(reject);
     });
   }
 
