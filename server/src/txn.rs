@@ -7,7 +7,7 @@ use crate::auth::PrincipalCtx;
 use crate::db::{new_id, now_ms, validate_db_name};
 use crate::ddl::{pg_col, pg_schema, pg_table};
 use crate::error::RtDbError;
-use crate::query::filter_matches;
+use crate::query::{FilterExpr, filter_matches};
 use crate::schema::{
     FieldType, IndexDef, SchemaDef, TableDef, indexed_column_type, validate_doc, validate_value,
 };
@@ -866,6 +866,96 @@ fn stamp_owner(
     doc
 }
 
+/// Walks `expr` collecting the `field` of every `Eq { field, value: {"$user": true} }`
+/// leaf reachable through `And`/`Or`. `Not` is intentionally NOT descended: a
+/// negated equality (`Not(Eq{owner,$user})`) is a prohibition, not a stampable
+/// ownership, and stamping it would invert the predicate's meaning. `Contains`,
+/// `Exists`, `In`, the comparison operators, `Neq`, `{"$email":true}`, and any
+/// non-marker `Eq` value contribute nothing — only an exact `Eq{field,$user}`
+/// asserts "this field IS the caller" and is therefore stampable. De-dups
+/// preserving first occurrence. Empty when `expr` has no stampable leaf, in
+/// which case `stamp_authorize` is a no-op and the inserted doc must satisfy
+/// the predicate from client values alone (else `verify_authorize_insert`
+/// rejects with `Forbidden`).
+fn user_eq_fields(expr: &FilterExpr) -> Vec<String> {
+    /// `true` only for the exact principal marker `{"$user": true}` — the sole
+    /// value form that makes an `Eq` leaf stampable. Mirrors `resolve_value`'s
+    /// marker test in `query.rs` so the two paths agree on what `$user` is.
+    fn is_user_marker(v: &serde_json::Value) -> bool {
+        if let serde_json::Value::Object(map) = v
+            && map.len() == 1
+        {
+            return map.get("$user").and_then(|x| x.as_bool()) == Some(true);
+        }
+        false
+    }
+    fn walk(expr: &FilterExpr, out: &mut Vec<String>) {
+        match expr {
+            FilterExpr::Eq { field, value } if is_user_marker(value) => {
+                if !out.iter().any(|f| f == field) {
+                    out.push(field.clone());
+                }
+            }
+            FilterExpr::And { exprs } | FilterExpr::Or { exprs } => {
+                for e in exprs {
+                    walk(e, out);
+                }
+            }
+            // `Not` is NOT descended — see the doc comment. Every other leaf
+            // variant is non-stampable by construction.
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    walk(expr, &mut out);
+    out
+}
+
+/// For each `Eq { field, value: {"$user": true} }` leaf reachable through
+/// `And`/`Or` in `table.authorize`, force `doc[field] = ctx.user_id`,
+/// overwriting any client value — unforgeable, exactly like `stamp_owner`.
+/// `Not`, `Contains`, `Exists`, and non-`$user` leaves are not stampable; a
+/// table without `authorize` or a bypass caller (`user_id = None`) is a no-op.
+/// Call AFTER `stamp_owner`; then call `verify_authorize_insert` to reject
+/// predicates the stamp could not satisfy (no `$user` leaf, or an unsatisfied
+/// `And`/literal branch).
+fn stamp_authorize(
+    table_def: &TableDef,
+    mut doc: serde_json::Map<String, serde_json::Value>,
+    ctx: &PrincipalCtx,
+) -> serde_json::Map<String, serde_json::Value> {
+    if let (Some(expr), Some(uid)) = (&table_def.authorize, &ctx.user_id) {
+        for field in user_eq_fields(expr) {
+            doc.insert(field, serde_json::Value::String(uid.clone()));
+        }
+    }
+    doc
+}
+
+/// Post-stamp verification for inserts: a user caller on an `authorize`-gated
+/// table must produce a doc that satisfies the predicate. The stamp above
+/// satisfies every `Eq{field,$user}` leaf, but a predicate with no stampable
+/// leaf (e.g. `Eq{visibility,"public"}` or `Contains{editors,$user}`) stamps
+/// nothing — the client must satisfy it from supplied values, else `Forbidden`.
+/// Bypass callers (`user_id = None`) and tables without `authorize` are no-ops.
+/// Runs inside the serialized txn so a `Forbidden` rolls back the whole
+/// transaction (same atomicity guarantee as the patch/replace/delete pre-check).
+fn verify_authorize_insert(
+    table_def: &TableDef,
+    doc: &serde_json::Map<String, serde_json::Value>,
+    ctx: &PrincipalCtx,
+) -> Result<(), RtDbError> {
+    if let Some(authorize) = &table_def.authorize
+        && ctx.user_id.is_some()
+        && !filter_matches(&serde_json::Value::Object(doc.clone()), authorize, ctx)
+    {
+        return Err(RtDbError::forbidden(
+            "insert conflicts with the table's authorize predicate",
+        ));
+    }
+    Ok(())
+}
+
 /// Stamps the TTL field at insert time when the table declares a
 /// `default_duration_ms` and the document omits the field. After this, the TTL
 /// field is ordinary (patch/replace manipulate it normally). See
@@ -1060,6 +1150,8 @@ pub async fn execute_txn(
                 let table_def = schema.table(table)?;
                 let doc = stamp_ttl_default(table_def, doc.clone(), now_ms());
                 let doc = stamp_owner(table_def, doc, owner);
+                let doc = stamp_authorize(table_def, doc, ctx);
+                verify_authorize_insert(table_def, &doc, ctx)?;
                 let (id, stored, created_at) =
                     do_insert(&mut tx, &pg_schema_name, table_def, table, &doc).await?;
                 write_set.touch(table, &id, OpKind::Insert);
@@ -1152,6 +1244,8 @@ pub async fn execute_txn(
                 match rows.pop() {
                     None => {
                         let insert = stamp_owner(table_def, insert.clone(), owner);
+                        let insert = stamp_authorize(table_def, insert, ctx);
+                        verify_authorize_insert(table_def, &insert, ctx)?;
                         let (id, stored, created_at) =
                             do_insert(&mut tx, &pg_schema_name, table_def, table, &insert).await?;
                         write_set.touch(table, &id, OpKind::Upsert);

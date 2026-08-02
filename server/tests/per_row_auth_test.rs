@@ -2942,3 +2942,461 @@ async fn authorize_bypass_write_ignores_predicate() -> anyhow::Result<()> {
     assert_eq!(doc["owner"].as_str(), Some("bob"));
     Ok(())
 }
+
+// ===========================================================================
+// Task 9 — insert auto-stamp + verify against `authorize`
+//
+// `authorize` inserts are stamped for every `Eq { field, $user }` leaf
+// reachable through `And`/`Or` (the caller's user_id is forced, overwriting any
+// client value — unforgeable, like `stamp_owner`), then verified: a predicate
+// with no stampable leaf (e.g. `Eq{visibility,"public"}` or
+// `Contains{editors,$user}`) stamps nothing and the inserted doc must satisfy
+// it from client values alone, else `Forbidden`. These four tests pin the four
+// cases of the brief.
+// ===========================================================================
+
+/// Schema for the T9 insert-stamp tests: four tables, one per case.
+/// - `owned` — `Eq{owner,$user}` (stampable, single leaf).
+/// - `or_posts` — `Or[Eq{owner,$user}, Eq{visibility,"public"}]` (stampable via the Or arm).
+/// - `public_only` — `Eq{visibility,"public"}` (no `$user` leaf, not stampable).
+/// - `edited` — `Contains{editors,$user}` (array-only, not stampable).
+fn insert_stamp_schema() -> SchemaDef {
+    use rtdb_server::query::FilterExpr;
+    let mk_table = |fields: Vec<(String, FieldType)>, authorize: Option<FilterExpr>| -> TableDef {
+        let fields: BTreeMap<String, FieldType> = fields.into_iter().collect();
+        TableDef {
+            fields,
+            indexes: vec![],
+            owner_field: None,
+            collaborators_field: None,
+            ttl: None,
+            authorize,
+        }
+    };
+    let mut tables = BTreeMap::new();
+    // (a) Eq{owner,$user} — `by_owner` declared so the Upsert-insert test
+    // (T9-upsert-insert) can target a (non-)match via `eq_lookup`; the other
+    // owned-table tests do not reference it.
+    let mut owned = mk_table(
+        vec![
+            ("body".into(), FieldType::String),
+            ("owner".into(), FieldType::String),
+        ],
+        Some(FilterExpr::Eq {
+            field: "owner".into(),
+            value: json!({"$user": true}),
+        }),
+    );
+    owned.indexes.push(IndexDef {
+        name: "by_owner".into(),
+        fields: vec!["owner".into()],
+        search: false,
+        vector: None,
+        unique: false,
+        r#where: None,
+    });
+    tables.insert("owned".to_string(), owned);
+    // (b) Or[Eq{owner,$user}, Eq{visibility,"public"}]
+    tables.insert(
+        "or_posts".to_string(),
+        mk_table(
+            vec![
+                ("body".into(), FieldType::String),
+                ("owner".into(), FieldType::String),
+                ("visibility".into(), FieldType::String),
+            ],
+            Some(FilterExpr::Or {
+                exprs: vec![
+                    FilterExpr::Eq {
+                        field: "owner".into(),
+                        value: json!({"$user": true}),
+                    },
+                    FilterExpr::Eq {
+                        field: "visibility".into(),
+                        value: json!("public"),
+                    },
+                ],
+            }),
+        ),
+    );
+    // (c) Eq{visibility,"public"} — no $user leaf, not stampable
+    tables.insert(
+        "public_only".to_string(),
+        mk_table(
+            vec![
+                ("body".into(), FieldType::String),
+                ("visibility".into(), FieldType::String),
+            ],
+            Some(FilterExpr::Eq {
+                field: "visibility".into(),
+                value: json!("public"),
+            }),
+        ),
+    );
+    // (d) Contains{editors,$user} — array-only, not stampable
+    tables.insert(
+        "edited".to_string(),
+        mk_table(
+            vec![
+                ("body".into(), FieldType::String),
+                (
+                    "editors".into(),
+                    FieldType::Array {
+                        element: Box::new(FieldType::String),
+                    },
+                ),
+            ],
+            Some(FilterExpr::Contains {
+                field: "editors".into(),
+                value: json!({"$user": true}),
+            }),
+        ),
+    );
+    SchemaDef { tables }
+}
+
+/// Creates a fresh uniquely-named database and pushes the insert-stamp schema.
+async fn setup_insert_stamp() -> (sqlx::PgPool, String, SchemaDef) {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = format!("t{}", uuid::Uuid::now_v7().simple());
+    rtdb_server::db::create_database(&pool, &db).await.unwrap();
+    let schema = insert_stamp_schema();
+    push_schema(&pool, &db, schema.clone()).await.unwrap();
+    (pool, db, schema)
+}
+
+/// Fetches a single doc by id with a bypass caller (sees every row), on an
+/// arbitrary table. Decouples the post-insert persisted-state assertion from
+/// the read-path filtering.
+async fn fetch_doc_bypass(
+    pool: &PgPool,
+    db: &str,
+    schema: &SchemaDef,
+    table: &str,
+    id: &str,
+) -> Option<serde_json::Value> {
+    let q = Query {
+        table: table.to_string(),
+        get: Some(id.to_string()),
+        index: None,
+        eq: vec![],
+        gt: None,
+        gte: None,
+        lt: None,
+        lte: None,
+        order: None,
+        take: None,
+        unique: false,
+        first: false,
+        count: false,
+        distinct: false,
+        paginate: None,
+        filter: None,
+        search: None,
+        vector_search: None,
+        hybrid_search: None,
+        aggregate: None,
+    };
+    match execute_query(pool, db, schema, &q, &PrincipalCtx::bypass()).await {
+        Ok(QueryResult::Doc(d)) => d,
+        other => panic!("expected Doc, got {other:?}"),
+    }
+}
+
+/// The caller's principal for these tests (a fixed user).
+fn alice_ctx() -> PrincipalCtx {
+    PrincipalCtx {
+        user_id: Some("alice".to_string()),
+        email: None,
+    }
+}
+
+// (T9-a) `authorize: Eq{owner,$user}` — client sends `owner="someoneElse"`; the
+// server stamps `owner=caller` over it (unforgeable), the predicate now passes,
+// and the insert succeeds. Asserting the persisted owner equals the caller
+// proves the stamp actually ran; a missing stamp would either reject the insert
+// (predicate fails on `owner="someoneElse"`) or, worse, persist the lie.
+#[tokio::test]
+async fn authorize_insert_stamps_eq_user_leaf_to_caller() -> anyhow::Result<()> {
+    let (pool, db, schema) = setup_insert_stamp().await;
+
+    let mut doc = serde_json::Map::new();
+    doc.insert("body".into(), "x".into());
+    doc.insert("owner".into(), "someoneElse".into());
+    let outcome = execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::Insert {
+                table: "owned".into(),
+                doc,
+            }],
+        },
+        &alice_ctx(),
+    )
+    .await
+    .expect("insert should succeed: owner is stamped to caller");
+    let id = outcome.results[0]["id"]
+        .as_str()
+        .expect("id string")
+        .to_string();
+
+    let persisted = fetch_doc_bypass(&pool, &db, &schema, "owned", &id)
+        .await
+        .expect("row present");
+    assert_eq!(persisted["owner"].as_str(), Some("alice"));
+    assert_eq!(persisted["body"].as_str(), Some("x"));
+    Ok(())
+}
+
+// (T9-b) `Or[owner==$user, visibility=="public"]` — the client sends a doc that
+// fails BOTH arms pre-stamp (`owner="bob"`, `visibility="private"`); the server
+// stamps `owner=caller`, so the first arm passes and the insert always
+// succeeds. This is the common "public OR owned" rule.
+#[tokio::test]
+async fn authorize_insert_or_with_user_leaf_always_succeeds() -> anyhow::Result<()> {
+    let (pool, db, schema) = setup_insert_stamp().await;
+
+    let mut doc = serde_json::Map::new();
+    doc.insert("body".into(), "x".into());
+    doc.insert("owner".into(), "bob".into());
+    doc.insert("visibility".into(), "private".into());
+    let outcome = execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::Insert {
+                table: "or_posts".into(),
+                doc,
+            }],
+        },
+        &alice_ctx(),
+    )
+    .await
+    .expect("insert should succeed: owner arm is stamped to caller");
+    let id = outcome.results[0]["id"]
+        .as_str()
+        .expect("id string")
+        .to_string();
+
+    let persisted = fetch_doc_bypass(&pool, &db, &schema, "or_posts", &id)
+        .await
+        .expect("row present");
+    assert_eq!(persisted["owner"].as_str(), Some("alice"));
+    assert_eq!(persisted["visibility"].as_str(), Some("private"));
+    Ok(())
+}
+
+// (T9-c) `authorize: Eq{visibility,"public"}` — no `$user` leaf, so the server
+// stamps nothing. The client sends `visibility="private"`, the predicate fails
+// on the post-stamp (unchanged) doc, and the insert is `Forbidden`. Proves a
+// non-$user predicate is enforceable on inserts without any stamping escape.
+#[tokio::test]
+async fn authorize_insert_without_user_leaf_forbidden_when_predicate_fails() -> anyhow::Result<()> {
+    let (pool, db, schema) = setup_insert_stamp().await;
+
+    let mut doc = serde_json::Map::new();
+    doc.insert("body".into(), "x".into());
+    doc.insert("visibility".into(), "private".into());
+    let err = execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::Insert {
+                table: "public_only".into(),
+                doc,
+            }],
+        },
+        &alice_ctx(),
+    )
+    .await
+    .expect_err("insert must fail: visibility=private fails the predicate");
+    assert_eq!(err.code, ErrorCode::Forbidden);
+
+    // Nothing was persisted (Forbidden rolled back the txn). A bypass count
+    // sees every row, so 0 confirms the insert never landed.
+    let q = Query {
+        table: "public_only".to_string(),
+        get: None,
+        index: None,
+        eq: vec![],
+        gt: None,
+        gte: None,
+        lt: None,
+        lte: None,
+        order: None,
+        take: None,
+        unique: false,
+        first: false,
+        count: true,
+        distinct: false,
+        paginate: None,
+        filter: None,
+        search: None,
+        vector_search: None,
+        hybrid_search: None,
+        aggregate: None,
+    };
+    let res = execute_query(&pool, &db, &schema, &q, &PrincipalCtx::bypass()).await?;
+    match res {
+        QueryResult::Count(n) => assert_eq!(n, 0, "no row should be persisted"),
+        other => panic!("expected Count, got {other:?}"),
+    }
+    Ok(())
+}
+
+// (T9-d) `authorize: Contains{editors,$user}` — array-only, not stampable (no
+// `Eq{field,$user}` leaf). The client omits itself from the array; the
+// predicate fails on the post-stamp (unchanged) doc, and the insert is
+// `Forbidden`. Proves an array-membership predicate cannot be bypassed by an
+// insert that forgets to include the caller.
+#[tokio::test]
+async fn authorize_insert_with_array_only_predicate_forbidden_when_self_omitted()
+-> anyhow::Result<()> {
+    let (pool, db, schema) = setup_insert_stamp().await;
+
+    let mut doc = serde_json::Map::new();
+    doc.insert("body".into(), "x".into());
+    doc.insert("editors".into(), json!(["bob"]));
+    let err = execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::Insert {
+                table: "edited".into(),
+                doc,
+            }],
+        },
+        &alice_ctx(),
+    )
+    .await
+    .expect_err("insert must fail: alice is not in editors");
+    assert_eq!(err.code, ErrorCode::Forbidden);
+    Ok(())
+}
+
+// (T9-d-positive) The same `Contains{editors,$user}` predicate ALLOWS an insert
+// when the client includes itself in the array — proves the predicate is
+// satisfiable from client values alone (case (d)'s "not stampable" does not
+// mean "always rejected"). Belt-and-suspenders for the negative case above.
+#[tokio::test]
+async fn authorize_insert_with_array_only_predicate_succeeds_when_self_included()
+-> anyhow::Result<()> {
+    let (pool, db, schema) = setup_insert_stamp().await;
+
+    let mut doc = serde_json::Map::new();
+    doc.insert("body".into(), "x".into());
+    doc.insert("editors".into(), json!(["alice", "bob"]));
+    let outcome = execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::Insert {
+                table: "edited".into(),
+                doc,
+            }],
+        },
+        &alice_ctx(),
+    )
+    .await
+    .expect("insert should succeed: alice is in editors");
+    let id = outcome.results[0]["id"]
+        .as_str()
+        .expect("id string")
+        .to_string();
+
+    let persisted = fetch_doc_bypass(&pool, &db, &schema, "edited", &id)
+        .await
+        .expect("row present");
+    assert_eq!(persisted["body"].as_str(), Some("x"));
+    Ok(())
+}
+
+// (T9-bypass) Bypass callers (machine tokens, admin, scheduled jobs) are NOT
+// subject to insert stamp/verify — they can insert any doc on an
+// `authorize`-gated table, even one that would fail the predicate for a user.
+// Preserves machine-token full-access behavior on the insert path (mirrors the
+// T8-5 bypass guarantee for patch/replace/delete).
+#[tokio::test]
+async fn authorize_insert_bypass_skips_stamp_and_verify() -> anyhow::Result<()> {
+    let (pool, db, schema) = setup_insert_stamp().await;
+
+    // Bypass inserts a `public_only` row with visibility="private" — a user
+    // caller would be Forbidden; bypass must succeed.
+    let mut doc = serde_json::Map::new();
+    doc.insert("body".into(), "machine".into());
+    doc.insert("visibility".into(), "private".into());
+    let outcome = execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::Insert {
+                table: "public_only".into(),
+                doc,
+            }],
+        },
+        &PrincipalCtx::bypass(),
+    )
+    .await
+    .expect("bypass insert should skip authorize verify");
+    let id = outcome.results[0]["id"]
+        .as_str()
+        .expect("id string")
+        .to_string();
+
+    let persisted = fetch_doc_bypass(&pool, &db, &schema, "public_only", &id)
+        .await
+        .expect("row present");
+    assert_eq!(persisted["visibility"].as_str(), Some("private"));
+    Ok(())
+}
+
+// (T9-upsert-insert) The Upsert insert branch (no match) goes through the same
+// stamp+verify as Insert. Asserts the second call site (txn.rs ~:1154) is wired:
+// client `owner="someoneElse"` → stamped to caller → predicate passes → upsert
+// reports `inserted: true` with the persisted owner equal to the caller.
+#[tokio::test]
+async fn authorize_upsert_insert_stamps_eq_user_leaf_to_caller() -> anyhow::Result<()> {
+    let (pool, db, schema) = setup_insert_stamp().await;
+
+    let mut insert = serde_json::Map::new();
+    insert.insert("body".into(), "x".into());
+    insert.insert("owner".into(), "someoneElse".into());
+    let mut patch = serde_json::Map::new();
+    patch.insert("body".into(), "ignored".into());
+    let outcome = execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::Upsert {
+                table: "owned".into(),
+                index: "by_owner".into(),
+                eq: vec!["alice".into()],
+                insert,
+                patch,
+            }],
+        },
+        &alice_ctx(),
+    )
+    .await
+    .expect("upsert-insert should succeed: owner is stamped to caller");
+    assert_eq!(outcome.results[0]["inserted"].as_bool(), Some(true));
+    let id = outcome.results[0]["id"]
+        .as_str()
+        .expect("id string")
+        .to_string();
+
+    let persisted = fetch_doc_bypass(&pool, &db, &schema, "owned", &id)
+        .await
+        .expect("row present");
+    assert_eq!(persisted["owner"].as_str(), Some("alice"));
+    Ok(())
+}
