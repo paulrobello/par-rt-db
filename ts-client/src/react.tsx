@@ -200,10 +200,10 @@ export const OAUTH_POLL_INTERVAL_MS = 800;
 export const OAUTH_POLL_TIMEOUT_MS = 180_000;
 
 /** One poll of `/auth/state`; resolves with the token on `complete`. */
-async function pollOAuthState(apiBase: string, state: string): Promise<
-  | { done: true; token: string }
-  | { done: false }
-> {
+async function pollOAuthState(
+  apiBase: string,
+  state: string,
+): Promise<{ done: true; token: string } | { done: false }> {
   const resp = await fetch(`${apiBase}/auth/state?state=${encodeURIComponent(state)}`);
   if (!resp.ok) return { done: false };
   const data = (await resp.json()) as { status?: string; token?: string };
