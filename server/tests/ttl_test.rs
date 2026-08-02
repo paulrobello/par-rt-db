@@ -44,6 +44,18 @@ fn sessions_schema() -> SchemaDef {
     serde_json::from_value(sessions_schema_json()).expect("parse sessions schema")
 }
 
+/// Minimal `sessions` schema (no `expiresAt` field, no index, no ttl) used by
+/// the backfill test to seed rows before `expiresAt` + `ttl` are added on a
+/// re-push — the realistic migration path the backfill UPDATE targets.
+fn sessions_minimal_schema() -> SchemaDef {
+    serde_json::from_value(serde_json::json!({
+        "tables": {
+            "sessions": { "fields": { "userId": { "type": "string" } } }
+        }
+    }))
+    .expect("parse minimal sessions schema")
+}
+
 /// Creates a uniquely-named database and pushes the TTL fixture schema.
 /// Returns the db name.
 async fn setup_ttl_db(pool: &sqlx::PgPool) -> String {
@@ -186,6 +198,140 @@ async fn insert_keeps_caller_expires_at_when_field_present() {
         doc["expiresAt"].as_i64(),
         Some(CALLER_EXPIRES_AT),
         "caller-supplied expiresAt must be preserved, not overwritten by the default stamp"
+    );
+
+    let _ = db::drop_database(&pool, &db).await;
+}
+
+// (c) Adding `ttl` with a `defaultDurationMs` to a table that already has rows
+// backfills the existing rows' `expiresAt` to `created_at + default` — but only
+// rows where the field is still NULL; a pre-existing app-set value is preserved
+// by the `WHERE col IS NULL` guard. The backfill runs inside `push_schema`'s
+// migration transaction when the ttl block is added on a re-push.
+//
+// Push sequence (the realistic migration path the backfill targets):
+//   v1: minimal `sessions` (userId only) — seed row A, which has no `expiresAt`
+//       field, so the typed column is NULL once the field is added.
+//   v2: add `expiresAt` + its index (still no ttl) — seed row B WITH a caller-
+//       supplied `expiresAt`; row A's column stays NULL.
+//   v3: add `ttl` + `defaultDurationMs` — backfill stamps row A (NULL→stamped),
+//       leaves row B untouched (non-NULL, `IS NULL` guard).
+#[tokio::test]
+async fn adding_ttl_backfills_existing_rows() {
+    let state = common::test_state().await;
+    let pool = state.pool.clone();
+    let db = format!("t{}", uuid::Uuid::now_v7().simple());
+    db::create_database(&pool, &db)
+        .await
+        .expect("create fresh database");
+
+    // v1: minimal sessions table. Insert row A — it has no `expiresAt` field.
+    let schema_v1 = sessions_minimal_schema();
+    ddl::push_schema(&pool, &db, schema_v1.clone())
+        .await
+        .expect("push v1 minimal schema");
+    let outcome = execute_txn(
+        &pool,
+        &db,
+        &schema_v1,
+        &Transaction {
+            steps: vec![Step::Insert {
+                table: "sessions".to_string(),
+                doc: serde_json::json!({ "userId": "u1" })
+                    .as_object()
+                    .expect("object")
+                    .clone(),
+            }],
+        },
+        None,
+    )
+    .await
+    .expect("insert row A under v1");
+    let id_backfill = outcome.results[0]["id"]
+        .as_str()
+        .expect("id string")
+        .to_string();
+
+    // v2: add the `expiresAt` field + its index, but no ttl yet. Insert row B
+    // WITH a caller-supplied `expiresAt` far from anything the backfill would
+    // produce — it must survive the v3 backfill. Row A's `expiresAt` column is
+    // NULL after this push (added, absent from its doc).
+    const CALLER_EXPIRES_AT: i64 = 7_000_000_000_000;
+    let schema_v2: SchemaDef = serde_json::from_value(serde_json::json!({
+        "tables": {
+            "sessions": {
+                "fields": {
+                    "expiresAt": { "type": "number" },
+                    "userId": { "type": "string" }
+                },
+                "indexes": [{ "name": "by_expiresAt", "fields": ["expiresAt"] }]
+            }
+        }
+    }))
+    .expect("parse v2 schema");
+    ddl::push_schema(&pool, &db, schema_v2.clone())
+        .await
+        .expect("push v2 field+index schema");
+    let outcome = execute_txn(
+        &pool,
+        &db,
+        &schema_v2,
+        &Transaction {
+            steps: vec![Step::Insert {
+                table: "sessions".to_string(),
+                doc: serde_json::json!({ "userId": "u2", "expiresAt": CALLER_EXPIRES_AT })
+                    .as_object()
+                    .expect("object")
+                    .clone(),
+            }],
+        },
+        None,
+    )
+    .await
+    .expect("insert row B under v2");
+    let id_keep = outcome.results[0]["id"]
+        .as_str()
+        .expect("id string")
+        .to_string();
+
+    // Capture row A's state before the ttl re-push. `expiresAt` is NULL; the
+    // backfill anchors on the physical `created_at`, which `_creationTime`
+    // mirrors in epoch-ms.
+    let doc_a_before = get_doc(&pool, &db, &schema_v2, "sessions", &id_backfill).await;
+    assert!(
+        doc_a_before["expiresAt"].is_null(),
+        "row A expiresAt must be NULL before the ttl backfill"
+    );
+    let creation_time = doc_a_before["_creationTime"]
+        .as_i64()
+        .expect("_creationTime present");
+
+    // v3: add `ttl` + `defaultDurationMs` (index and field already exist). The
+    // backfill UPDATE in `push_schema` stamps row A and skips row B.
+    let schema_v3 = sessions_schema();
+    ddl::push_schema(&pool, &db, schema_v3.clone())
+        .await
+        .expect("push v3 ttl schema");
+
+    // Row A: `expiresAt` is now `_creationTime + default` within slack.
+    let doc_a = get_doc(&pool, &db, &schema_v3, "sessions", &id_backfill).await;
+    let expires_at = doc_a["expiresAt"]
+        .as_i64()
+        .expect("expiresAt backfilled as a number");
+    let lower = creation_time + DEFAULT_DURATION_MS - SLACK_MS;
+    let upper = creation_time + DEFAULT_DURATION_MS + SLACK_MS;
+    assert!(
+        expires_at >= lower && expires_at <= upper,
+        "backfilled expiresAt={expires_at} not within [{lower}, {upper}] \
+         (_creationTime={creation_time} + defaultDurationMs={DEFAULT_DURATION_MS} ± {SLACK_MS})"
+    );
+
+    // Row B: the caller's value survives the backfill untouched.
+    let doc_b = get_doc(&pool, &db, &schema_v3, "sessions", &id_keep).await;
+    assert_eq!(
+        doc_b["expiresAt"].as_i64(),
+        Some(CALLER_EXPIRES_AT),
+        "pre-existing expiresAt must be preserved by the WHERE-col-IS-NULL guard"
     );
 
     let _ = db::drop_database(&pool, &db).await;

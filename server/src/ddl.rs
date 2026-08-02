@@ -369,6 +369,33 @@ pub async fn push_schema(
                 .await?;
             }
         }
+
+        // Backfill the TTL field on existing rows when a `default_duration_ms`
+        // is declared: stamp `f_<field> = created_at + default` for rows that
+        // lack the field. Runs for both new and existing tables (no NULL rows
+        // ⇒ no-op) and preserves any caller-set value via the `IS NULL` guard.
+        // The typed column is updated alongside the jsonb `doc` because reads
+        // (merge_doc) return the doc, not the column — updating only the column
+        // would make the backfill invisible to queries. Identifiers are
+        // validated/lowercased via `pg_*`; only the duration is bound, never
+        // interpolated. The field name baked into `jsonb_build_object` is a
+        // validated identifier (same literal-interpolation pattern as
+        // `backfill_expr` above).
+        if let Some(ttl) = &new_table.ttl
+            && let Some(d) = ttl.default_duration_ms
+        {
+            let col = pg_col(&ttl.field);
+            let field = &ttl.field;
+            sqlx::query(&format!(
+                "UPDATE \"{pg_schema_name}\".\"{table_ident}\" \
+                 SET \"{col}\" = created_at + $1, \
+                     doc = doc || jsonb_build_object('{field}', created_at + $1) \
+                 WHERE \"{col}\" IS NULL"
+            ))
+            .bind(d)
+            .execute(&mut *tx)
+            .await?;
+        }
     }
 
     let schema_json = serde_json::to_value(&schema).map_err(|err| {
