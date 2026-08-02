@@ -34,7 +34,7 @@ ownerField/collaboratorsField already occupy.
   (`$user` / `$email`), array-membership (`Contains`), negation (`Not`), and a null/exists
   test (`Exists`) — available to both the auth predicate and client `.filter()` queries.
 - Enforce the predicate on reads (scan terminals + point-read), writes (pre-check +
-  insert stamp/verify), and subscription re-runs — the same four seams ownerField uses.
+  all-writes stamp/verify), and subscription re-runs — the same four seams ownerField uses.
 - Mirror the new declaration and `FilterExpr` variants across all four clients
   (server, ts-client, rust-client, python-client).
 
@@ -58,9 +58,10 @@ ownerField/collaboratorsField already occupy.
 - **Expressiveness:** full — extend `FilterExpr` with `Not`, `Contains`, `Exists`, and
   principal-binding value markers. One predicate language subsumes owner + collaborator
   rules (ownerField/collaboratorsField remain as convenience shortcuts).
-- **Insert authorization:** auto-stamp from the predicate — on insert, stamp every
+- **Write authorization:** auto-stamp from the predicate — on every write, stamp every
   `Eq { field, $user }` leaf's field with the caller's `user_id`, then verify the
-  predicate on the final doc (`Forbidden` on failure).
+  predicate on the resulting doc (`Forbidden` on failure). Extended from insert-only to
+  all writes after a security review (ownerField parity; see §7/§8).
 - **Coexistence:** additive — `authorize` coexists with `ownerField`/`collaboratorsField`.
 - **DSL locus:** extend the shared `FilterExpr` enum (one language for query filters and
   auth), not a separate `AuthPredicate` enum.
@@ -80,8 +81,8 @@ Three things must be built that do not exist today:
    a server-declared `authorize` predicate.
 2. **A Rust doc-level evaluator** `filter_matches(doc, expr, principal)` — `FilterExpr` is
    SQL-compiled only today; point-reads and write pre-checks need an in-memory eval.
-3. **Auto-stamp on insert** — introspect the predicate for `Eq { field, $user }` leaves
-   and stamp them, then verify.
+3. **Auto-stamp on every write** — introspect the predicate for `Eq { field, $user }`
+   leaves and stamp them on the resulting doc, then verify (all five write paths).
 
 ## Detailed design
 
@@ -208,32 +209,56 @@ the caller")` (403), aborting the whole txn atomically (single-writer, no TOCTOU
 doc → `Ok(())` so the subsequent op reports `NotFound`. ownerField/collaboratorsField
 tables keep their existing `check_owner` path.
 
-### 8. Write enforcement — insert / upsert-insert (auto-stamp + verify)
+**Stamp + post-write verify on every write (Task 8.5, security-review extension):**
+pre-check is not the whole story. On **all five** write paths — Insert, Upsert-insert,
+Patch, Replace, Upsert-update — the server also runs `stamp_authorize` (after `stamp_owner`:
+re-stamp every `Eq { field, $user }` leaf to the caller's `user_id`) and
+`verify_authorize_doc` (`filter_matches` on the resulting doc → `Forbidden`/403, atomic
+rollback) before the write commits. (Delete is pre-check only — there is no resulting doc
+to stamp or verify.) This achieves `ownerField` parity — `ownerField` re-stamps its owner
+field on every write, and now `authorize` does the same for its stampable leaves — and
+closes a patch-injection vector: without an all-writes stamp, a `patch` could flip an
+owner-ish field to another user and pass a pre-check evaluated against the pre-patch
+state. The post-write verify is the authoritative gate; the pre-check is an early
+fast-fail. The mechanism is §8.
 
-For `Step::Insert` and the insert branch of `Step::Upsert`, when the table declares
+### 8. Write enforcement — auto-stamp + verify on every write
+
+For every write step — `Step::Insert`, the insert branch of `Step::Upsert`, `Step::Patch`,
+`Step::Replace`, and the update branch of `Step::Upsert` — when the table declares
 `authorize` and the caller is a `User`:
 
 1. **Auto-stamp.** Walk the `authorize` predicate (recurse `And`/`Or`; `Not` does not
    stamp — a negated equality is not a stampable ownership). For each leaf
    `Eq { field: F, value: {"$user": true} }`, force `doc[F] = principal.user_id`,
    overwriting any client value (unforgeable — identical guarantee to `stamp_owner`,
-   `txn.rs:856`). This subsumes ownerField's stamping: a table with
-   `authorize: {op:"eq", field:"owner", value:{"$user":true}}` gets the same insert
-   behavior, derived from its predicate.
-2. **Verify.** Evaluate `filter_matches(doc, authorize, principal)` on the final doc. If
-   it still fails (a non-stampable requirement the client didn't satisfy, e.g.
-   `visibility == "public"` not set), reject with `RtDbError::forbidden(...)` (403).
+   `txn.rs:856`). On non-insert writes this re-asserts the field against the post-write
+   doc, so a `patch`/`replace`/`upsert`-update that tries to flip an owner-ish field to
+   another user is stamped back to the caller. This runs after `stamp_owner`, subsuming
+   ownerField's stamping: a table with
+   `authorize: {op:"eq", field:"owner", value:{"$user":true}}` gets the same behavior on
+   every write, derived from its predicate.
+2. **Verify.** Evaluate `filter_matches(doc, authorize, principal)` on the resulting doc.
+   If it fails (a non-stampable requirement the client didn't satisfy, e.g.
+   `visibility == "public"` not set, or an attempted flip of a field the predicate
+   requires), reject with `RtDbError::forbidden(...)` (403) and roll the txn back
+   atomically.
 
-Edge cases (well-defined):
-- An `Or` containing an `owner == $user` arm always passes on insert (owner stamped) —
-  the common "public OR owned" rule inserts freely.
-- A predicate with no `Eq { field, $user }` leaf stamps nothing; the inserted doc must
-  satisfy the predicate from client-provided values alone.
+Edge cases (well-defined — apply per-write, not insert-only):
+- An `Or` containing an `owner == $user` arm always passes (owner stamped) — the common
+  "public OR owned" rule writes freely.
+- A predicate with no `Eq { field, $user }` leaf stamps nothing; the doc must satisfy the
+  predicate from client-provided values alone.
 - Array-membership-only rules (`Contains { editors, $user }`) are not stampable; the
   client must include its own `user_id` in the array (the SDK exposes the caller's id) or
-  the insert fails verification.
+  the write fails verification.
 - If the table also declares `ownerField`, `stamp_owner` still runs first (owner stamped),
   then `authorize` auto-stamp + verify compose on top.
+
+> **Note (post-design extension).** The original design scoped auto-stamp + verify to
+> insert and upsert-insert only. A security review (Task 8.5) extended it to all five
+> write paths to achieve `ownerField` parity (`ownerField` re-stamps its owner field on
+> every write) and to close the patch-injection vector described in §7.
 
 ### 9. Subscription re-filter — automatic
 
@@ -315,10 +340,11 @@ gate still runs first on every operation.
   correctly.
 - **Writes:** patch/replace/delete on a non-matching doc → `Forbidden`, txn aborts
   atomically; upsert-update on a non-matching matched doc → `Forbidden`.
-- **Insert auto-stamp + verify:** `Eq{owner,$user}` stamped on insert (client value
-  overwritten); `Or[owner==$user, visibility=="public"]` inserts freely; a predicate with
-  an unsatisfied non-stampable requirement → insert `Forbidden`; array-membership-only
-  predicate requires the client to supply the value.
+- **All-writes auto-stamp + verify:** `Eq{owner,$user}` stamped on insert (client value
+  overwritten) and re-stamped on `patch`/`replace`/`upsert`-update (an attempted flip to
+  another user is reverted); `Or[owner==$user, visibility=="public"]` writes freely; a
+  predicate with an unsatisfied non-stampable requirement → write `Forbidden`;
+  array-membership-only predicate requires the client to supply the value.
 - **Bypass:** machine token, admin, and scheduled job get full access on an `authorize`
   table.
 - **Subscription no-leak:** cross-principal writes do not push rows the subscriber's
@@ -334,7 +360,7 @@ gate still runs first on every operation.
 - `server/src/query.rs` — new `FilterExpr` variants + principal markers; SQL compilation;
   `filter_matches` Rust evaluator; `authorize` branch in `execute_query` scan terminals +
   `point_read`.
-- `server/src/txn.rs` — `authorize` pre-check (check_owner path) + insert auto-stamp/verify.
+- `server/src/txn.rs` — `authorize` pre-check (check_owner path) + all-writes auto-stamp/verify.
 - `server/src/protocol.rs` (+ `ts-client`, `rust-client`, `python-client` protocol files) —
   new `FilterExpr` variants + markers.
 - `server/tests/*` — the cases above.

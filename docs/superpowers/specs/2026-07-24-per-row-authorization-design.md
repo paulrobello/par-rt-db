@@ -211,10 +211,15 @@ query/txn executors.
   `OwnerAuth` view) to the executors; scheduled txns run as bypass.
 - `server/tests/*` — the cases above.
 
-## Future (explicitly deferred — models B / C)
+## Future (models B / C) — shipped
 
-- **B:** owner + collaborator/role fields (e.g. `editors: [userId]`, a roles field) for
-  shared rows.
-- **C:** a general declarative predicate DSL (per-table read/write rules as predicates
-  over doc fields + principal). The `ownerField` declaration is the seed; B/C extend it
-  additively (e.g. an `authorize` block) rather than replacing it.
+- **B (shipped 2026-07-28 as `collaboratorsField`):** owner + collaborator/role fields
+  (e.g. `editors: [userId]`, a roles field) for shared rows — owner OR collaborator.
+- **C (shipped 2026-08-02 as `authorize`):** a general declarative predicate DSL — see
+  `2026-08-02-per-row-auth-predicate-dsl-design.md`. A table declares an `authorize`
+  `FilterExpr` over doc fields + `$user`/`$email` principal markers; enforced on reads
+  (silent filter), writes (pre-check + auto-stamp of `$user` fields + post-write verify
+  → `Forbidden`/403, atomic), and subscription re-runs. Stamp + verify run on **all five
+  write paths** (Insert, Upsert-insert, Patch, Replace, Upsert-update) — not insert-only —
+  achieving `ownerField` parity (an owner-ish field cannot be patched to another user).
+  `FilterExpr` gains `Not`/`Contains`/`Exists`; mirrored across all four clients.
