@@ -77,6 +77,7 @@ fn is_false(b: &bool) -> bool {
 /// stamps the field at insert time when the client omits it. See
 /// `docs/superpowers/specs/2026-08-01-document-ttl-design.md`.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TtlDef {
     pub field: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]

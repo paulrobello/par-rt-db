@@ -864,6 +864,24 @@ fn stamp_owner(
     doc
 }
 
+/// Stamps the TTL field at insert time when the table declares a
+/// `default_duration_ms` and the document omits the field. After this, the TTL
+/// field is ordinary (patch/replace manipulate it normally). See
+/// `docs/superpowers/specs/2026-08-01-document-ttl-design.md`.
+fn stamp_ttl_default(
+    table_def: &TableDef,
+    mut doc: serde_json::Map<String, serde_json::Value>,
+    now: i64,
+) -> serde_json::Map<String, serde_json::Value> {
+    if let Some(ttl) = &table_def.ttl
+        && let Some(duration) = ttl.default_duration_ms
+        && !doc.contains_key(&ttl.field)
+    {
+        doc.insert(ttl.field.clone(), serde_json::Value::from(now + duration));
+    }
+    doc
+}
+
 /// Whether `uid` may access a row given the table's declared `ownerField`
 /// and/or `collaboratorsField`: true when `uid` matches the doc's owner field
 /// OR appears in the doc's collaborators array. A missing/null owner field and
@@ -1004,7 +1022,8 @@ pub async fn execute_txn(
         match step {
             Step::Insert { table, doc } => {
                 let table_def = schema.table(table)?;
-                let doc = stamp_owner(table_def, doc.clone(), owner);
+                let doc = stamp_ttl_default(table_def, doc.clone(), now_ms());
+                let doc = stamp_owner(table_def, doc, owner);
                 let (id, stored, created_at) =
                     do_insert(&mut tx, &pg_schema_name, table_def, table, &doc).await?;
                 write_set.touch(table, &id, OpKind::Insert);
