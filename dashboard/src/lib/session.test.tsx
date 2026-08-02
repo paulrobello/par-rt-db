@@ -119,7 +119,7 @@ describe("SessionProvider", () => {
     const fetchMock = buildFetch({ meBody: { email: "oauth@example.com" } });
     globalThis.fetch = fetchMock;
     // noopener popup: window.open returns null (no popup handle) — the polling
-    // timeout covers blocked/closed/abandoned, so no popup mock is needed.
+    // timeout covers blocked/closed/abandoned. The spy lets us assert the call.
     vi.spyOn(window, "open").mockReturnValue(null);
 
     render(
@@ -138,6 +138,18 @@ describe("SessionProvider", () => {
     expect(screen.getByTestId("user").textContent).toBe("oauth@example.com");
     expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining("/auth/github/begin?origin="));
     expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining("/auth/state?state=s1"));
+    // SEC-012: the popup must open the begin-returned authorizeUrl with
+    // noopener,noreferrer so the relay page can't reach back into this window.
+    expect(window.open).toHaveBeenCalledWith(
+      "about:blank",
+      "rtdb-oauth",
+      expect.stringContaining("noopener"),
+    );
+    expect(window.open).toHaveBeenCalledWith(
+      "about:blank",
+      "rtdb-oauth",
+      expect.stringContaining("noreferrer"),
+    );
 
     await act(async () => {
       screen.getByText("sign-out").click();
