@@ -454,3 +454,364 @@ async fn reaper_deletes_expired_document() {
 
     let _ = db::drop_database(&pool, &db).await;
 }
+
+// ===========================================================================
+// Coverage: audit + webhook publish with source="ttl", per-row-auth bypass,
+// and non-ttl tables left untouched. Mirrors audit_test.rs / webhook_test.rs
+// / per_row_auth_test.rs helper shapes.
+// ===========================================================================
+
+use common::{admin_post, spawn_app, test_state_with_ttl_audit_webhooks};
+use rtdb_server::ddl::pg_schema;
+
+/// Polls until `expired_id` is gone from `db`'s `sessions` table, bounded to
+/// ~10s. Shared by the coverage tests so each can wait for the reaper without
+/// re-deriving the poll loop. `table` is the LOGICAL table name (translated to
+/// its physical `pg_table` name internally).
+async fn poll_until_reaped(pool: &sqlx::PgPool, db: &str, table: &str, expired_id: &str) {
+    let schema_name = pg_schema(db);
+    let table_ident = ddl::pg_table(table);
+    for _ in 0..100 {
+        let count: i64 = sqlx::query_scalar(&format!(
+            "SELECT COUNT(*) FROM \"{schema_name}\".\"{table_ident}\" WHERE id = $1"
+        ))
+        .bind(expired_id)
+        .fetch_one(pool)
+        .await
+        .unwrap_or_else(|e| panic!("count {table_ident} row in {schema_name}: {e}"));
+        if count == 0 {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    panic!("expired doc {expired_id} was not reaped within the poll window");
+}
+
+// A reaped row publishes to BOTH the durable audit log (op="delete",
+// source="ttl", principal=null) and the webhook outbox (payload source="ttl",
+// kind="delete"). Drives the insert over the admin mutate route so the
+// committer (and the reaper task it lazily spawns) are exercised through the
+// real handler stack — mirroring audit_test.rs / webhook_test.rs.
+#[tokio::test]
+async fn reaper_delete_publishes_to_audit_and_webhooks() -> anyhow::Result<()> {
+    let state = test_state_with_ttl_audit_webhooks(1).await;
+    let pool = state.pool.clone();
+    let addr = spawn_app(state.clone()).await;
+    let db = format!("t{}", uuid::Uuid::now_v7().simple());
+    db::create_database(&pool, &db).await?;
+
+    // Push the sessions ttl schema via the admin route (same wire shape the
+    // dashboard uses), then register a webhook matching sessions/delete.
+    let push = admin_post(
+        addr,
+        "/admin/push-schema",
+        serde_json::json!({ "db": db, "schema": sessions_schema_json() }),
+    )
+    .await;
+    assert_eq!(push.status(), reqwest::StatusCode::OK, "push-schema failed");
+    let webhook_id: i64 = admin_post(
+        addr,
+        &format!("/admin/db/{db}/webhooks"),
+        serde_json::json!({"url": "http://example.com/hook", "table": "sessions", "events": ["delete"]}),
+    )
+    .await
+    .json::<serde_json::Value>()
+    .await?["id"]
+        .as_i64()
+        .expect("webhook id");
+
+    // Insert an expired doc via admin mutate — this spawns the committer +
+    // reaper for this db. The committer's audit/webhook taps fire for the
+    // INSERT with source="mutate"; the reaper's later DELETE fires them with
+    // source="ttl", which is what we assert below.
+    let past = db::now_ms() - 1_000_000;
+    let results = admin_post(
+        addr,
+        &format!("/admin/db/{db}/mutate"),
+        serde_json::json!({"txn": {"steps": [
+            {"op": "insert", "table": "sessions", "doc": {"userId": "u1", "expiresAt": past}}
+        ]}}),
+    )
+    .await
+    .json::<serde_json::Value>()
+    .await?["results"]
+        .clone();
+    let expired_id = results[0]["id"].as_str().expect("id").to_string();
+
+    poll_until_reaped(&pool, &db, "sessions", &expired_id).await;
+
+    // The DELETE auto-commits inside `handle_reaper` and is visible to this poll
+    // BEFORE the tap-site writes (fan_out / op_feed / audit / webhook) finish —
+    // they run in the same committer turn AFTER the DELETE, each on its own
+    // await. So poll for the audit row to land before asserting its content.
+    let mut audit_landed = false;
+    for _ in 0..100 {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM rtdb.audit_log WHERE db = $1 AND source = 'ttl'",
+        )
+        .bind(&db)
+        .fetch_one(&pool)
+        .await?;
+        if count > 0 {
+            audit_landed = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(audit_landed, "ttl audit row never landed after reap");
+
+    // Audit: exactly one row for this db with source="ttl" — the reaped delete.
+    // (The insert row carries source="mutate", filtered out by source="ttl".)
+    type AuditProbe = (String, Option<String>, String);
+    let rows: Vec<AuditProbe> = sqlx::query_as(
+        "SELECT tbl, principal, source FROM rtdb.audit_log \
+         WHERE db = $1 AND source = 'ttl' ORDER BY id ASC",
+    )
+    .bind(&db)
+    .fetch_all(&pool)
+    .await?;
+    assert_eq!(rows.len(), 1, "one ttl audit row: {rows:?}");
+    assert_eq!(rows[0].0, "sessions", "audit tbl");
+    assert!(rows[0].1.is_none(), "audit principal null (system)");
+    assert_eq!(rows[0].2, "ttl", "audit source");
+
+    // Also confirm the reaped op was recorded as a delete (separate query so
+    // the assertion is unambiguous about op + source together).
+    let deleted: Option<(String,)> = sqlx::query_as(
+        "SELECT op FROM rtdb.audit_log WHERE db = $1 AND source = 'ttl' AND op = 'delete'",
+    )
+    .bind(&db)
+    .fetch_optional(&pool)
+    .await?;
+    assert!(deleted.is_some(), "audit row op=delete source=ttl");
+
+    // Webhook: one delivery for the registered webhook, payload carries
+    // source="ttl" and kind="delete". The enqueue runs in the same committer
+    // turn as the audit write, so poll for it to land too.
+    let mut payload = None;
+    for _ in 0..100 {
+        if let Some((p,)) = sqlx::query_as::<_, (serde_json::Value,)>(
+            "SELECT payload FROM rtdb.webhook_deliveries WHERE webhook_id = $1 \
+             ORDER BY id DESC LIMIT 1",
+        )
+        .bind(webhook_id)
+        .fetch_optional(&pool)
+        .await?
+        {
+            payload = Some(p);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let payload = payload.expect("webhook delivery never landed after reap");
+    assert_eq!(
+        payload["source"],
+        serde_json::json!("ttl"),
+        "webhook source"
+    );
+    assert_eq!(payload["kind"], serde_json::json!("delete"), "webhook kind");
+    assert_eq!(
+        payload["table"],
+        serde_json::json!("sessions"),
+        "webhook table"
+    );
+    assert_eq!(
+        payload["docId"],
+        serde_json::json!(expired_id),
+        "webhook docId"
+    );
+    assert!(payload["owner"].is_null(), "webhook owner null (system)");
+
+    let _ = db::drop_database(&pool, &db).await;
+    Ok(())
+}
+
+// The reaper is a system principal (owner=None) and bypasses per-row owner
+// enforcement: it deletes an expired row on an owner-gated table even though
+// no interactive caller initiated the delete. Mirrors per_row_auth_test.rs's
+// owner-scoped insert + bypass-query shape.
+#[tokio::test]
+async fn reaper_bypasses_per_row_owner_auth() {
+    let state = test_state_with_ttl_sweep(1).await;
+    let pool = state.pool.clone();
+    let db = format!("t{}", uuid::Uuid::now_v7().simple());
+    db::create_database(&pool, &db).await.expect("create db");
+    // notes table with ownerField=userId AND ttl on expiresAt. The ttl field
+    // must carry its own single-field btree index (schema-validator requirement).
+    let schema: SchemaDef = serde_json::from_value(serde_json::json!({
+        "tables": {
+            "notes": {
+                "fields": {
+                    "title": { "type": "string" },
+                    "userId": { "type": "string" },
+                    "expiresAt": { "type": "number" }
+                },
+                "indexes": [
+                    { "name": "by_user", "fields": ["userId"] },
+                    { "name": "by_expiresAt", "fields": ["expiresAt"] }
+                ],
+                "ownerField": "userId",
+                "ttl": { "field": "expiresAt" }
+            }
+        }
+    }))
+    .expect("parse notes+ttl schema");
+    ddl::push_schema(&pool, &db, schema.clone())
+        .await
+        .expect("push schema");
+
+    // Insert as alice a note with a past expiresAt. The server stamps
+    // userId=alice (ownerField), so the row is owner-gated to alice. A user
+    // other than alice could neither read nor delete it — but the reaper can.
+    let past = db::now_ms() - 1_000_000;
+    let mut doc = serde_json::Map::new();
+    doc.insert("title".into(), serde_json::json!("expires soon"));
+    doc.insert("expiresAt".into(), serde_json::json!(past));
+    let outcome = state
+        .realtime
+        .committers
+        .mutate(
+            &db,
+            None,
+            Transaction {
+                steps: vec![Step::Insert {
+                    table: "notes".into(),
+                    doc,
+                }],
+            },
+            Some("alice".into()),
+        )
+        .await
+        .expect("insert via committer");
+    let id = outcome.results[0]["id"].as_str().expect("id").to_string();
+
+    // Poll until reaped (bypass query, owner=None, sees the row until deleted).
+    let schema_name = pg_schema(&db);
+    let notes_table = ddl::pg_table("notes");
+    for _ in 0..100 {
+        let count: i64 = sqlx::query_scalar(&format!(
+            "SELECT COUNT(*) FROM \"{schema_name}\".\"{notes_table}\" WHERE id = $1"
+        ))
+        .bind(&id)
+        .fetch_one(&pool)
+        .await
+        .expect("count notes");
+        if count == 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    // Confirm the owner-gated row is gone — the reaper deleted it despite
+    // ownerField enforcement that would block any non-owner interactive caller.
+    let count: i64 = sqlx::query_scalar(&format!(
+        "SELECT COUNT(*) FROM \"{schema_name}\".\"{notes_table}\" WHERE id = $1"
+    ))
+    .bind(&id)
+    .fetch_one(&pool)
+    .await
+    .expect("final count");
+    assert_eq!(count, 0, "owner-gated expired row must be reaped");
+
+    let _ = db::drop_database(&pool, &db).await;
+}
+
+// A table WITHOUT a ttl block is untouched by the reaper even if it has a
+// field named `expiresAt` with a past value — only tables that declare `ttl`
+// are swept. Two tables in one db; the reaper reaps the ttl one and leaves the
+// plain one alone.
+#[tokio::test]
+async fn reaper_ignores_tables_without_ttl() {
+    let state = test_state_with_ttl_sweep(1).await;
+    let pool = state.pool.clone();
+    let db = format!("t{}", uuid::Uuid::now_v7().simple());
+    db::create_database(&pool, &db).await.expect("create db");
+    // `with_ttl` declares ttl; `plain` has the same expiresAt field shape but
+    // NO ttl block — the reaper must never touch it.
+    let schema: SchemaDef = serde_json::from_value(serde_json::json!({
+        "tables": {
+            "with_ttl": {
+                "fields": { "expiresAt": { "type": "number" } },
+                "indexes": [{ "name": "by_expiresAt", "fields": ["expiresAt"] }],
+                "ttl": { "field": "expiresAt" }
+            },
+            "plain": {
+                "fields": { "expiresAt": { "type": "number" } }
+            }
+        }
+    }))
+    .expect("parse two-table schema");
+    ddl::push_schema(&pool, &db, schema.clone())
+        .await
+        .expect("push schema");
+
+    let past = db::now_ms() - 1_000_000;
+    // Insert an expired doc into each table through the committer (spawns the
+    // reaper). Both carry a past expiresAt; only `with_ttl` should be reaped.
+    let outcome_ttl = state
+        .realtime
+        .committers
+        .mutate(
+            &db,
+            None,
+            Transaction {
+                steps: vec![Step::Insert {
+                    table: "with_ttl".into(),
+                    doc: serde_json::json!({ "expiresAt": past })
+                        .as_object()
+                        .expect("object")
+                        .clone(),
+                }],
+            },
+            None,
+        )
+        .await
+        .expect("insert with_ttl");
+    let id_ttl = outcome_ttl.results[0]["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+    let outcome_plain = state
+        .realtime
+        .committers
+        .mutate(
+            &db,
+            None,
+            Transaction {
+                steps: vec![Step::Insert {
+                    table: "plain".into(),
+                    doc: serde_json::json!({ "expiresAt": past })
+                        .as_object()
+                        .expect("object")
+                        .clone(),
+                }],
+            },
+            None,
+        )
+        .await
+        .expect("insert plain");
+    let id_plain = outcome_plain.results[0]["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+
+    // Wait for the ttl table's row to be reaped.
+    poll_until_reaped(&pool, &db, "with_ttl", &id_ttl).await;
+
+    // The non-ttl table's row is still present — same expired shape, but no
+    // `ttl` block means the reaper never considered it.
+    let schema_name = pg_schema(&db);
+    let plain_table = ddl::pg_table("plain");
+    let plain_count: i64 = sqlx::query_scalar(&format!(
+        "SELECT COUNT(*) FROM \"{schema_name}\".\"{plain_table}\" WHERE id = $1"
+    ))
+    .bind(&id_plain)
+    .fetch_one(&pool)
+    .await
+    .expect("count plain");
+    assert_eq!(
+        plain_count, 1,
+        "non-ttl table row must NOT be reaped despite a past expiresAt"
+    );
+
+    let _ = db::drop_database(&pool, &db).await;
+}
