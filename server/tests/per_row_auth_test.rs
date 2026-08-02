@@ -3774,3 +3774,200 @@ async fn authorize_upsert_update_re_stamps_eq_user_leaf() -> anyhow::Result<()> 
     );
     Ok(())
 }
+
+// ============================================================================
+// Composition: a table declaring BOTH `ownerField` and `authorize`.
+// ----------------------------------------------------------------------------
+// The two gates AND — a row must pass the owner/collaborator gate AND the
+// `authorize` predicate. `check_owner` runs both in sequence (txn.rs), the scan
+// path ANDs both fragments into the WHERE clause (query.rs:
+// `where_conditions.join(" AND ")`), and the point-read re-checks both. Every
+// other test declares at most one gate; this pins the conjunction on a single
+// table so a future change that ORs them (or silently drops one gate) fails
+// loudly. The predicate is a pure `Eq{visibility,"public"}` with no `$user`
+// marker, so the two gates are independent — passing one cannot implicitly
+// satisfy the other.
+
+/// `docs` table declaring BOTH `ownerField: "owner"` and
+/// `authorize: Eq{visibility,"public"}`: a row is visible to a user only when
+/// they own it AND it is public.
+fn composed_schema() -> SchemaDef {
+    use rtdb_server::query::FilterExpr;
+    let mut fields = BTreeMap::new();
+    fields.insert("body".to_string(), FieldType::String);
+    fields.insert("owner".to_string(), FieldType::String);
+    fields.insert("visibility".to_string(), FieldType::String);
+    let mut tables = BTreeMap::new();
+    tables.insert(
+        "docs".to_string(),
+        TableDef {
+            fields,
+            indexes: vec![],
+            owner_field: Some("owner".into()),
+            collaborators_field: None,
+            ttl: None,
+            authorize: Some(FilterExpr::Eq {
+                field: "visibility".into(),
+                value: json!("public"),
+            }),
+        },
+    );
+    SchemaDef { tables }
+}
+
+async fn setup_composed() -> (sqlx::PgPool, String, SchemaDef) {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = format!("t{}", uuid::Uuid::now_v7().simple());
+    rtdb_server::db::create_database(&pool, &db).await.unwrap();
+    let schema = composed_schema();
+    push_schema(&pool, &db, schema.clone()).await.unwrap();
+    (pool, db, schema)
+}
+
+/// Seeds a `docs` row (bypass caller) with explicit owner/visibility; returns id.
+async fn seed_doc(
+    pool: &PgPool,
+    db: &str,
+    schema: &SchemaDef,
+    body: &str,
+    owner: &str,
+    visibility: &str,
+) -> String {
+    let mut doc = serde_json::Map::new();
+    doc.insert("body".into(), body.into());
+    doc.insert("owner".into(), owner.into());
+    doc.insert("visibility".into(), visibility.into());
+    let outcome = execute_txn(
+        pool,
+        db,
+        schema,
+        &Transaction {
+            steps: vec![Step::Insert {
+                table: "docs".into(),
+                doc,
+            }],
+        },
+        &PrincipalCtx::bypass(),
+    )
+    .await
+    .expect("seed doc insert");
+    outcome.results[0]["id"]
+        .as_str()
+        .expect("id string")
+        .to_string()
+}
+
+fn docs_query() -> Query {
+    Query {
+        table: "docs".to_string(),
+        get: None,
+        index: None,
+        eq: vec![],
+        gt: None,
+        gte: None,
+        lt: None,
+        lte: None,
+        order: None,
+        take: None,
+        unique: false,
+        first: false,
+        count: false,
+        distinct: false,
+        paginate: None,
+        filter: None,
+        search: None,
+        vector_search: None,
+        hybrid_search: None,
+        aggregate: None,
+    }
+}
+
+// A row passing only ONE gate is denied on scan, point-read, and patch. Seeds
+// the four owner×visibility combinations; alice owns the "alice" rows yet sees
+// only the single row she owns AND that is public.
+#[tokio::test]
+async fn owner_and_authorize_both_gates_must_pass() -> anyhow::Result<()> {
+    let (pool, db, schema) = setup_composed().await;
+    // both pass        owner pass / auth fail   auth pass / owner fail   both fail
+    let both = seed_doc(&pool, &db, &schema, "alice-pub", "alice", "public").await;
+    let owner_only = seed_doc(&pool, &db, &schema, "alice-priv", "alice", "private").await;
+    let auth_only = seed_doc(&pool, &db, &schema, "bob-pub", "bob", "public").await;
+    let _neither = seed_doc(&pool, &db, &schema, "bob-priv", "bob", "private").await;
+
+    let alice = PrincipalCtx {
+        user_id: Some("alice".to_string()),
+        email: None,
+    };
+
+    // (1) Scan: alice sees only the row she owns AND that is public.
+    let mut q = docs_query();
+    q.take = Some(100);
+    let mut got = bodies(execute_query(&pool, &db, &schema, &q, &alice).await?);
+    got.sort();
+    assert_eq!(got, vec!["alice-pub".to_string()]);
+
+    // (2) Point-read: owning a row is not enough when `authorize` denies it.
+    let mut q = docs_query();
+    q.get = Some(owner_only.clone());
+    match execute_query(&pool, &db, &schema, &q, &alice).await? {
+        QueryResult::Doc(None) => {}
+        other => panic!("get(owner-pass/auth-fail) must be None, got {other:?}"),
+    }
+    // (3) Point-read: a public row is not enough when the caller doesn't own it.
+    let mut q = docs_query();
+    q.get = Some(auth_only.clone());
+    match execute_query(&pool, &db, &schema, &q, &alice).await? {
+        QueryResult::Doc(None) => {}
+        other => panic!("get(auth-pass/owner-fail) must be None, got {other:?}"),
+    }
+    // (4) Point-read: both gates pass → returned.
+    let mut q = docs_query();
+    q.get = Some(both.clone());
+    match execute_query(&pool, &db, &schema, &q, &alice).await? {
+        QueryResult::Doc(Some(d)) => assert_eq!(d["body"].as_str(), Some("alice-pub")),
+        other => panic!("get(both-pass) must return the doc, got {other:?}"),
+    }
+
+    // (5) Patch: owning a row is not enough when `authorize` denies it.
+    let mut patch = serde_json::Map::new();
+    patch.insert("body".into(), "hacked".into());
+    let err = execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::Patch {
+                table: "docs".into(),
+                id: owner_only.clone(),
+                fields: patch,
+            }],
+        },
+        &alice,
+    )
+    .await
+    .expect_err("patch on owner-pass/auth-fail must be forbidden");
+    assert_eq!(err.code, ErrorCode::Forbidden);
+
+    // (6) Patch: a public row is not enough when the caller doesn't own it.
+    let mut patch = serde_json::Map::new();
+    patch.insert("body".into(), "hacked".into());
+    let err = execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::Patch {
+                table: "docs".into(),
+                id: auth_only.clone(),
+                fields: patch,
+            }],
+        },
+        &alice,
+    )
+    .await
+    .expect_err("patch on auth-pass/owner-fail must be forbidden");
+    assert_eq!(err.code, ErrorCode::Forbidden);
+
+    Ok(())
+}

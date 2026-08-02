@@ -117,17 +117,6 @@ pub async fn authorize(pool: &PgPool, principal: &Principal, db: &str) -> Result
     }
 }
 
-/// Per-row authorization identity for `principal`. `Some(user_id)` means
-/// "enforce owner-field equality against this user" on any table that
-/// declares an `ownerField`; `None` means bypass (machine tokens). Scheduled
-/// jobs pass `None` directly — they have no caller.
-pub fn owner_of(principal: &Principal) -> Option<&str> {
-    match principal {
-        Principal::User { user_id, .. } => Some(user_id.as_str()),
-        Principal::Machine { .. } => None,
-    }
-}
-
 /// Per-row auth view threaded into the executors for model C's `authorize`
 /// predicate evaluation. `user_id == None` ⇒ bypass (`Machine`/admin/scheduled);
 /// `Some` ⇒ `$user`/`$email` markers in a `FilterExpr` resolve to this identity.
