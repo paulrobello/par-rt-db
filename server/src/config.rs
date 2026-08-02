@@ -300,14 +300,14 @@ impl HotConfig {
     }
 
     /// True when every origin is a strict `scheme://host[:port]` URL with no
-    /// characters that could break out of the OAuth callback's JS string
-    /// interpolation (`"`, `<`, `>`, backtick, backslash). The CORS layer would
-    /// silently skip a malformed origin at request time, but the OAuth callback
-    /// HTML (`provider::callback_html_response`) interpolates each origin into a
-    /// JS string literal, so the validator must reject any metacharacter that
-    /// could escape that context — `HeaderValue::from_str` alone permits `"`,
-    /// `<`, `>`, which is insufficient (SEC-005). Defense in depth: even after
-    /// this check, `callback_html_response` JS-escapes its interpolations.
+    /// metacharacters (`"`, `<`, `>`, backtick, backslash). The CORS layer
+    /// (`lib::cors_layer`) checks each request's `Origin` against this list by
+    /// exact membership, so a malformed entry would never match a real browser
+    /// `Origin` — silently broken CORS, caught here at config time instead.
+    /// Origins are also the OAuth `begin` allowlist, so the same gate bounds
+    /// which parents may start a popup login. Defense in depth:
+    /// `HeaderValue::from_str` alone permits `"`, `<`, `>`, which is
+    /// insufficient, so the validator rejects them regardless.
     pub fn origins_valid(&self) -> bool {
         self.allowed_origins.iter().all(|o| origin_is_valid(o))
     }
@@ -316,13 +316,14 @@ impl HotConfig {
 /// Strict per-origin validation for `HotConfig::origins_valid`. Accepts only
 /// `http(s)://host[:port]` — ASCII host of letters/digits/dot/hyphen, optional
 /// `:`port of digits. Rejects any metacharacter (`"`, `<`, `>`, backtick,
-/// backslash) that could break out of the OAuth callback's JS string context,
-/// and any path/query/fragment (origins are authority-only by CORS contract).
+/// backslash) — defense in depth, since `HeaderValue::from_str` permits several
+/// of them — and any path/query/fragment (origins are authority-only by CORS
+/// contract).
 pub(crate) fn origin_is_valid(origin: &str) -> bool {
-    // Reject any byte that could break out of a JS string literal or HTML
-    // context, plus control bytes. This guard is load-bearing even when the
-    // structural parse below rejects the same input — defense in depth against
-    // future relaxations of the structural rule.
+    // Reject any byte that is unsafe in an `Origin` header value or could
+    // corrupt header construction, plus control bytes. This guard is
+    // load-bearing even when the structural parse below rejects the same input
+    // — defense in depth against future relaxations of the structural rule.
     if origin
         .bytes()
         .any(|b| matches!(b, b'"' | b'<' | b'>' | b'`' | b'\\' | 0x00..=0x1f | 0x7f))
