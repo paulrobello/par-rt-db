@@ -23,4 +23,24 @@ describe("RtDbError", () => {
     expect(RtDbError.isEnvelope({ message: "x" })).toBe(false);
     expect(RtDbError.isEnvelope("nope")).toBe(false);
   });
+
+  it("recognizes a RATE_LIMITED envelope with retryAfter", () => {
+    const raw: unknown = {
+      code: "RATE_LIMITED",
+      message: "rate limit exceeded",
+      retryAfter: 42,
+    };
+    expect(RtDbError.isEnvelope(raw)).toBe(true);
+    const e = RtDbError.fromEnvelope(
+      raw as { code: "RATE_LIMITED"; message: string; retryAfter: number },
+    );
+    expect(e.code).toBe("RATE_LIMITED");
+    expect(e.retryAfter).toBe(42);
+  });
+
+  it("retryAfter is optional on the envelope", () => {
+    const raw: unknown = { code: "NOT_FOUND", message: "x" };
+    const e = RtDbError.fromEnvelope(raw as { code: "NOT_FOUND"; message: string });
+    expect(e.retryAfter).toBeUndefined();
+  });
 });
