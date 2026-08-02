@@ -29,6 +29,8 @@ fn test_config() -> Config {
         backup_dir: "./backups".into(),
         backup_retention: 7,
         subs_verify_skip_every: 0,
+        ttl_sweep_interval_secs: 60,
+        ttl_batch: 5000,
     }
 }
 

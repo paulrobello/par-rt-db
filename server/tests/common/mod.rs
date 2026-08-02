@@ -34,6 +34,8 @@ pub fn test_config() -> Config {
         backup_dir: "./backups".into(),
         backup_retention: 7,
         subs_verify_skip_every: 0,
+        ttl_sweep_interval_secs: 60,
+        ttl_batch: 5000,
     }
 }
 
@@ -126,6 +128,46 @@ pub async fn test_state_with_skip_verification(every: u64) -> Arc<AppState> {
         .await
         .expect("connect to test postgres");
     db::bootstrap(&pool).await.expect("bootstrap rtdb_auth");
+    AppState::new(pool, config, test_hot())
+}
+
+/// Like `test_state` but with the TTL reaper's per-db sweep interval overridden
+/// to `secs` (default is 60s). Used by `tests/ttl_test.rs` reaper tests so a
+/// sweep lands within the test's poll window. The reaper only acts on tables
+/// that declare `ttl`, so the shorter cadence is harmless for other tables.
+/// Mirrors the `test_state_with_rate_limits` override pattern.
+#[allow(dead_code)]
+pub async fn test_state_with_ttl_sweep(secs: u64) -> Arc<AppState> {
+    let mut config = test_config();
+    config.ttl_sweep_interval_secs = secs;
+    let pool = sqlx::PgPool::connect(&config.database_url)
+        .await
+        .expect("connect to test postgres");
+    db::bootstrap(&pool).await.expect("bootstrap rtdb_auth");
+    AppState::new(pool, config, test_hot())
+}
+
+/// Like `test_state_with_ttl_sweep` but ALSO enables the durable audit log and
+/// webhook registry (ensuring their tables), so a reaper delete can be asserted
+/// to publish through all four tap sites with `source = "ttl"`. Combines
+/// `test_state_with_audit` + `test_state_with_webhooks` + the sweep override.
+/// Used by `tests/ttl_test.rs`'s audit/webhook coverage test.
+#[allow(dead_code)]
+pub async fn test_state_with_ttl_audit_webhooks(secs: u64) -> Arc<AppState> {
+    let mut config = test_config();
+    config.ttl_sweep_interval_secs = secs;
+    config.audit_log_enabled = true;
+    config.webhooks_enabled = true;
+    let pool = sqlx::PgPool::connect(&config.database_url)
+        .await
+        .expect("connect to test postgres");
+    db::bootstrap(&pool).await.expect("bootstrap rtdb_auth");
+    db::ensure_audit_table(&pool)
+        .await
+        .expect("ensure rtdb.audit_log");
+    db::ensure_webhooks_tables(&pool)
+        .await
+        .expect("ensure rtdb.webhooks tables");
     AppState::new(pool, config, test_hot())
 }
 

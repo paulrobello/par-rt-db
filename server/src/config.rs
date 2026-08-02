@@ -71,6 +71,11 @@ pub struct Config {
     // production. Sampling is deterministic (every Nth skip), not random, so a
     // test can pin it. RTDB_SUBS_VERIFY_SKIP_EVERY.
     pub subs_verify_skip_every: u64,
+    // Document TTL reaper. RTDB_TTL_SWEEP_INTERVAL_SECS (default 60) is the
+    // per-db cadence; RTDB_TTL_BATCH (default 5000) bounds rows deleted per
+    // table per sweep. TTL is best-effort, so these are boot-only (not hot).
+    pub ttl_sweep_interval_secs: u64,
+    pub ttl_batch: i64,
 }
 
 impl Config {
@@ -189,6 +194,17 @@ impl Config {
             Err(_) => 0,
         };
 
+        // Document TTL reaper. Best-effort expiry, so boot-only (not hot). An
+        // unparseable value falls back to the default, matching the parses above.
+        let ttl_sweep_interval_secs = match std::env::var("RTDB_TTL_SWEEP_INTERVAL_SECS") {
+            Ok(v) => v.parse::<u64>().unwrap_or(60),
+            Err(_) => 60,
+        };
+        let ttl_batch = match std::env::var("RTDB_TTL_BATCH") {
+            Ok(v) => v.parse::<i64>().unwrap_or(5000),
+            Err(_) => 5000,
+        };
+
         Ok(Self {
             port,
             database_url,
@@ -215,6 +231,8 @@ impl Config {
             backup_dir,
             backup_retention,
             subs_verify_skip_every,
+            ttl_sweep_interval_secs,
+            ttl_batch,
         })
     }
 }

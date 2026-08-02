@@ -110,6 +110,10 @@ pub struct Metrics {
     /// invalidation logic under-approximated and would have dropped a realtime
     /// update. Any non-zero value is a correctness defect, not a tuning signal.
     subs_missed_pushes_total: AtomicU64,
+    // ---- TTL reaper ----
+    /// Total expired documents deleted by the per-db TTL reaper across all
+    /// dbs/tables. Global (no db/table labels) to match the neighboring counters.
+    ttl_expired_total: AtomicU64,
 }
 
 impl Metrics {
@@ -188,6 +192,11 @@ impl Metrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// A TTL reaper sweep deleted an expired document. Call once per deleted doc.
+    pub fn record_ttl_expired(&self) {
+        self.ttl_expired_total.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub async fn snapshot(
         &self,
         pool: &PgPool,
@@ -229,6 +238,7 @@ impl Metrics {
                 .subs_skip_verifications_total
                 .load(Ordering::Relaxed),
             subs_missed_pushes_total: self.subs_missed_pushes_total.load(Ordering::Relaxed),
+            ttl_expired_total: self.ttl_expired_total.load(Ordering::Relaxed),
         }
     }
 }
@@ -260,6 +270,8 @@ pub struct MetricsSnapshot {
     /// `Metrics::subs_missed_pushes_total`.
     pub subs_skip_verifications_total: u64,
     pub subs_missed_pushes_total: u64,
+    /// Total expired documents deleted by the TTL reaper (all dbs/tables).
+    pub ttl_expired_total: u64,
 }
 
 /// Render the snapshot as Prometheus text-exposition format (version 0.0.4).
@@ -333,6 +345,15 @@ pub fn render_prometheus(snap: &MetricsSnapshot, version: &str, git_commit: &str
         snap.subs_missed_pushes_total
     ));
 
+    s.push_str(
+        "# HELP rtdb_ttl_expired_total Total expired documents deleted by the TTL reaper across all dbs/tables.\n",
+    );
+    s.push_str("# TYPE rtdb_ttl_expired_total counter\n");
+    s.push_str(&format!(
+        "rtdb_ttl_expired_total {}\n",
+        snap.ttl_expired_total
+    ));
+
     // Gauges — point-in-time process/runtime state.
     s.push_str("# HELP rtdb_ws_connections Current open /sync WebSocket connections.\n");
     s.push_str("# TYPE rtdb_ws_connections gauge\n");
@@ -390,6 +411,7 @@ mod tests {
             subs_skips_ordered_total: 14,
             subs_skip_verifications_total: 15,
             subs_missed_pushes_total: 0,
+            ttl_expired_total: 0,
         };
         let body = render_prometheus(&snap, "0.0.0", "abc");
         assert!(
@@ -426,6 +448,7 @@ mod tests {
             subs_skips_ordered_total: 3,
             subs_skip_verifications_total: 7,
             subs_missed_pushes_total: 9,
+            ttl_expired_total: 0,
         };
         let body = render_prometheus(&snap, "0.0.0", "abc");
         // One metric name, one sample per skip class.

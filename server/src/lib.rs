@@ -18,6 +18,7 @@ pub mod privacy;
 pub mod protocol;
 pub mod query;
 pub mod rate_limit;
+pub mod reaper;
 pub mod scheduler;
 pub mod schema;
 pub mod schema_diff;
@@ -105,6 +106,9 @@ impl AppState {
             hot.clone(),
             config.audit_log_enabled,
             config.webhooks_enabled,
+            config.ttl_sweep_interval_secs,
+            config.ttl_batch,
+            metrics.clone(),
         );
         Arc::new(Self {
             pool,

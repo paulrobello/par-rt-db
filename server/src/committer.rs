@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -9,12 +9,13 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use crate::config::HotConfig;
 use crate::db::{SchemaCache, database_exists, now_ms};
 use crate::error::RtDbError;
+use crate::metrics::Metrics;
 use crate::mutation_log;
 use crate::protocol::ServerMessage;
 use crate::query::{Query, canonical, execute_query};
 use crate::scheduler;
 use crate::subs::{ConnId, SubscriptionManager};
-use crate::txn::{Transaction, TxnOutcome, WriteSet, execute_txn};
+use crate::txn::{DocOp, OpKind, Transaction, TxnOutcome, WriteSet, execute_txn};
 
 /// Bound on each per-db committer task's inbox.
 const CHANNEL_BUFFER: usize = 64;
@@ -53,6 +54,11 @@ pub enum CommitterRequest {
         request: crate::migrate::MigrateRequest,
         reply: oneshot::Sender<Result<crate::migrate::MigrateResult, RtDbError>>,
     },
+    /// A TTL reaper sweep is due. Fire-and-forget like `RunScheduled`: the
+    /// reaper task does not wait for a reply. The committer runs the batch
+    /// delete inside its serialized turn and publishes through the four tap
+    /// sites with `source = "ttl"`.
+    RunReaper,
 }
 
 /// Owns one serialized committer task per database. Every mutation and every
@@ -72,10 +78,14 @@ pub struct Committers {
     hot: Arc<ArcSwap<HotConfig>>,
     audit_log_enabled: bool,
     webhooks_enabled: bool,
+    ttl_sweep_interval: std::time::Duration,
+    ttl_batch: i64,
+    metrics: Arc<Metrics>,
     channels: Mutex<HashMap<String, mpsc::Sender<CommitterRequest>>>,
 }
 
 impl Committers {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         pool: PgPool,
         subs: Arc<SubscriptionManager>,
@@ -84,6 +94,9 @@ impl Committers {
         hot: Arc<ArcSwap<HotConfig>>,
         audit_log_enabled: bool,
         webhooks_enabled: bool,
+        ttl_sweep_interval_secs: u64,
+        ttl_batch: i64,
+        metrics: Arc<Metrics>,
     ) -> Self {
         Self {
             pool,
@@ -93,6 +106,9 @@ impl Committers {
             hot,
             audit_log_enabled,
             webhooks_enabled,
+            ttl_sweep_interval: std::time::Duration::from_secs(ttl_sweep_interval_secs),
+            ttl_batch,
+            metrics,
             channels: Mutex::new(HashMap::new()),
         }
     }
@@ -175,6 +191,8 @@ impl Committers {
             self.hot.clone(),
             self.audit_log_enabled,
             self.webhooks_enabled,
+            self.ttl_batch,
+            self.metrics.clone(),
             rx,
         ));
         tokio::spawn(scheduler::run_scheduler(
@@ -190,6 +208,16 @@ impl Committers {
             self.pool.clone(),
             db.to_string(),
             tx.clone(),
+        ));
+        // Per-db TTL reaper: enqueues a fire-and-forget `RunReaper` every
+        // `ttl_sweep_interval`; the committer's `handle_reaper` performs the
+        // batch delete inside its serialized turn. Same lifecycle as the
+        // scheduler/cleanup tasks (exits on channel close or db removal).
+        tokio::spawn(crate::reaper::run_reaper(
+            self.pool.clone(),
+            db.to_string(),
+            tx.clone(),
+            self.ttl_sweep_interval,
         ));
         guard.insert(db.to_string(), tx.clone());
         Ok(tx)
@@ -290,6 +318,8 @@ struct CommitterCtx {
     hot: Arc<ArcSwap<HotConfig>>,
     audit_log_enabled: bool,
     webhooks_enabled: bool,
+    ttl_batch: i64,
+    metrics: Arc<Metrics>,
 }
 
 /// The per-db committer task loop: processes exactly one `CommitterRequest`
@@ -313,6 +343,8 @@ async fn run_committer(
     hot: Arc<ArcSwap<HotConfig>>,
     audit_log_enabled: bool,
     webhooks_enabled: bool,
+    ttl_batch: i64,
+    metrics: Arc<Metrics>,
     mut rx: mpsc::Receiver<CommitterRequest>,
 ) {
     if let Err(err) = mutation_log::ensure_table(&pool, &db).await {
@@ -330,6 +362,8 @@ async fn run_committer(
         hot,
         audit_log_enabled,
         webhooks_enabled,
+        ttl_batch,
+        metrics,
     };
     while let Some(req) = rx.recv().await {
         match req {
@@ -366,6 +400,11 @@ async fn run_committer(
             CommitterRequest::RunMigrate { request, reply } => {
                 let result = handle_migrate(&ctx, request).await;
                 let _ = reply.send(result);
+            }
+            CommitterRequest::RunReaper => {
+                if let Err(err) = handle_reaper(&ctx).await {
+                    tracing::error!(db = %ctx.db, error = %err, "ttl reaper handling failed");
+                }
             }
         }
     }
@@ -563,6 +602,111 @@ async fn handle_scheduled(
                 }
             }
         }
+    }
+    Ok(())
+}
+
+/// Runs one TTL reaper sweep. For each table with `ttl`, batch-deletes expired
+/// rows and publishes through the four tap sites with `source = "ttl"`. TTL
+/// deletes are system-initiated (`owner = None`), bypassing per-row auth like
+/// scheduled jobs. Fire-and-forget — errors are logged, not surfaced; a failed
+/// delete retries on the next sweep. Each table's delete is an independent
+/// statement so one table's failure does not abort the others.
+///
+/// Single-writer invariant: this runs inside the committer task's serialized
+/// turn. It issues the DELETE directly (not via `execute_txn`) because TTL
+/// expiry is not a client mutation — there is no idempotency key, no owner
+/// pre-check, and no per-step result to return. A delete captures no
+/// `doc_values`, so `fan_out` table-level re-runs (sound over-approximation).
+async fn handle_reaper(ctx: &CommitterCtx) -> Result<(), RtDbError> {
+    let schema = ctx.schemas.get(&ctx.pool, &ctx.db).await?;
+    let now = now_ms();
+    let mut tables: BTreeSet<String> = BTreeSet::new();
+    let mut docs: BTreeSet<(String, String)> = BTreeSet::new();
+    let mut ops: Vec<DocOp> = Vec::new();
+    for (table_name, table_def) in &schema.tables {
+        let Some(ttl) = &table_def.ttl else {
+            continue;
+        };
+        let pg_schema_name = crate::ddl::pg_schema(&ctx.db);
+        let table_ident = crate::ddl::pg_table(table_name);
+        let col = crate::ddl::pg_col(&ttl.field);
+        let rows: Vec<(String,)> = match sqlx::query_as(&format!(
+            "DELETE FROM \"{pg_schema_name}\".\"{table_ident}\" WHERE id IN (
+                 SELECT id FROM \"{pg_schema_name}\".\"{table_ident}\"
+                 WHERE \"{col}\" IS NOT NULL AND \"{col}\" < $1
+                 ORDER BY \"{col}\" LIMIT $2
+             ) RETURNING id"
+        ))
+        .bind(now)
+        .bind(ctx.ttl_batch)
+        .fetch_all(&ctx.pool)
+        .await
+        {
+            Ok(rows) => rows,
+            Err(e) => {
+                // A dropped db removes the schema mid-sweep; treat as a no-op
+                // exit like the scheduler/cleanup tasks do.
+                if matches!(
+                    crate::db::database_exists(&ctx.pool, &ctx.db).await,
+                    Ok(false)
+                ) {
+                    return Ok(());
+                }
+                tracing::warn!(
+                    db = %ctx.db, table = %table_name, error = %e,
+                    "ttl reaper delete failed"
+                );
+                continue;
+            }
+        };
+        if rows.is_empty() {
+            continue;
+        }
+        tables.insert(table_name.clone());
+        for (id,) in rows {
+            docs.insert((table_name.clone(), id.clone()));
+            ops.push(DocOp {
+                table: table_name.clone(),
+                id,
+                kind: OpKind::Delete,
+            });
+        }
+    }
+    if ops.is_empty() {
+        return Ok(());
+    }
+    let write_set = WriteSet {
+        tables,
+        docs,
+        ops: ops.clone(),
+        doc_values: BTreeMap::new(),
+    };
+    ctx.subs
+        .fan_out(&ctx.pool, &ctx.db, &schema, &write_set)
+        .await;
+    // Op-feed completeness: every durable document write must publish here, in
+    // handle_mutate / handle_scheduled / handle_migrate, or (now) here.
+    ctx.op_feed.publish(&ctx.db, None, &write_set.ops).await;
+    // Durable audit tap — `source = "ttl"` distinguishes system-initiated
+    // expiry from interactive (`mutate`), scheduled (`scheduled`), and
+    // schema-migration (`migrate`) writes. `owner = None` (system principal).
+    if ctx.audit_log_enabled
+        && let Err(err) =
+            crate::audit::write_audit_rows(&ctx.pool, &ctx.db, None, "ttl", &write_set.ops).await
+    {
+        tracing::warn!(db = %ctx.db, error = %err, "audit log write failed (ttl)");
+    }
+    // Webhook enqueue tap — mirrors the audit tap above: best-effort, warned
+    // on failure, never surfaces to the client.
+    if ctx.webhooks_enabled
+        && let Err(err) =
+            crate::webhook::enqueue_for_ops(&ctx.pool, &ctx.db, None, "ttl", &write_set.ops).await
+    {
+        tracing::warn!(db = %ctx.db, error = %err, "webhook enqueue failed (ttl)");
+    }
+    for _ in 0..ops.len() {
+        ctx.metrics.record_ttl_expired();
     }
     Ok(())
 }

@@ -17,6 +17,7 @@ use sqlx::PgPool;
 use rtdb_server::committer::Committers;
 use rtdb_server::db::SchemaCache;
 use rtdb_server::ddl;
+use rtdb_server::metrics::Metrics;
 use rtdb_server::op_feed::OpFeed;
 use rtdb_server::protocol::{ScheduleKind, ScheduleStatus};
 use rtdb_server::query::{Query, QueryResult, execute_query};
@@ -320,6 +321,9 @@ async fn one_shot_fires_and_writes() {
         Arc::new(ArcSwap::from_pointee(common::test_hot())),
         false,
         false,
+        60,
+        5000,
+        Metrics::new(),
     );
 
     // Schedule a one-shot due in the past so it fires on the scheduler's first
@@ -367,6 +371,9 @@ async fn cron_fires_and_stays_pending() {
         Arc::new(ArcSwap::from_pointee(common::test_hot())),
         false,
         false,
+        60,
+        5000,
+        Metrics::new(),
     );
 
     // `* * * * *` = every minute. Scheduled due in the past, so it fires once
@@ -419,6 +426,9 @@ async fn failing_cron_reschedules_anyway() {
         Arc::new(ArcSwap::from_pointee(common::test_hot())),
         false,
         false,
+        60,
+        5000,
+        Metrics::new(),
     );
 
     // A cron whose txn FAILS every fire: `ExpectVersion` against a document
@@ -490,6 +500,9 @@ async fn one_shot_catches_up_after_being_past_due() {
         Arc::new(ArcSwap::from_pointee(common::test_hot())),
         false,
         false,
+        60,
+        5000,
+        Metrics::new(),
     );
 
     // Warm the committer+scheduler up FIRST so the per-db scheduler loop is
@@ -533,6 +546,9 @@ async fn cron_skips_missed_windows() {
         Arc::new(ArcSwap::from_pointee(common::test_hot())),
         false,
         false,
+        60,
+        5000,
+        Metrics::new(),
     );
 
     // `* * * * *` (every minute) with due_at ~1 hour in the past. A naive
@@ -607,6 +623,9 @@ async fn failing_txn_marks_error_one_shot() {
         Arc::new(ArcSwap::from_pointee(common::test_hot())),
         false,
         false,
+        60,
+        5000,
+        Metrics::new(),
     );
 
     // A one-shot whose txn is set up to FAIL: step 1 inserts a doc, step 2 is

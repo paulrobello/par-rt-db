@@ -336,3 +336,121 @@ async fn adding_ttl_backfills_existing_rows() {
 
     let _ = db::drop_database(&pool, &db).await;
 }
+
+// ===========================================================================
+// Task 4 — the reaper. Drives writes through `state.realtime.committers`
+// (NOT `execute_txn` directly) so the per-db committer task is lazily spawned
+// via `channel_for`, which also spawns the reaper task. Then polls until the
+// expired row is reaped.
+// ===========================================================================
+
+use common::test_state_with_ttl_sweep;
+
+/// Point-read by id, returning `true` while the doc is still present. Used by
+/// the reaper poll loop (the existing `get_doc` helper panics on `Doc(None)`).
+async fn doc_present(
+    pool: &sqlx::PgPool,
+    db: &str,
+    schema: &SchemaDef,
+    table: &str,
+    id: &str,
+) -> bool {
+    let query = Query {
+        table: table.to_string(),
+        get: Some(id.to_string()),
+        index: None,
+        eq: vec![],
+        gt: None,
+        gte: None,
+        lt: None,
+        lte: None,
+        order: None,
+        take: None,
+        unique: false,
+        first: false,
+        count: false,
+        distinct: false,
+        paginate: None,
+        filter: None,
+        search: None,
+        vector_search: None,
+        hybrid_search: None,
+        aggregate: None,
+    };
+    matches!(
+        execute_query(pool, db, schema, &query, None).await,
+        Ok(QueryResult::Doc(Some(_)))
+    )
+}
+
+/// Inserts one `sessions` doc with an explicit `expiresAt` (no default
+/// stamping) through the committer — this both spawns the committer + reaper
+/// tasks for `db` and writes the row. Returns the new doc id.
+async fn insert_session_via_committer(
+    state: &std::sync::Arc<rtdb_server::AppState>,
+    db: &str,
+    expires_at: i64,
+) -> String {
+    let mut doc = serde_json::Map::new();
+    doc.insert("userId".into(), serde_json::json!("u1"));
+    doc.insert("expiresAt".into(), serde_json::json!(expires_at));
+    let outcome = state
+        .realtime
+        .committers
+        .mutate(
+            db,
+            None,
+            Transaction {
+                steps: vec![Step::Insert {
+                    table: "sessions".into(),
+                    doc,
+                }],
+            },
+            None,
+        )
+        .await
+        .expect("insert via committer");
+    outcome.results[0]["id"]
+        .as_str()
+        .expect("id string")
+        .to_string()
+}
+
+// The reaper deletes a row whose `expiresAt` is in the past, and leaves a
+// not-yet-due row untouched. Sweep cadence is 1s (test_state_with_ttl_sweep);
+// the poll loop bounds the wait to ~10s.
+#[tokio::test]
+async fn reaper_deletes_expired_document() {
+    let state = test_state_with_ttl_sweep(1).await;
+    let pool = state.pool.clone();
+    let db = setup_ttl_db(&pool).await;
+    let schema = sessions_schema();
+
+    // Insert one expired and one live doc through the committer. The first
+    // mutate spawns the per-db committer task, which lazily spawns the reaper
+    // alongside the scheduler and mutation-log cleanup.
+    let past = db::now_ms() - 1_000_000;
+    let future = db::now_ms() + 1_000_000;
+    let expired_id = insert_session_via_committer(&state, &db, past).await;
+    let live_id = insert_session_via_committer(&state, &db, future).await;
+
+    // Poll until the reaper sweeps (interval=1s in this test state). Bound to
+    // ~10s so a missing reap fails loudly rather than hanging.
+    let mut gone = false;
+    for _ in 0..100 {
+        if !doc_present(&pool, &db, &schema, "sessions", &expired_id).await {
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(gone, "expired doc was not reaped within the poll window");
+
+    // The not-yet-due doc is untouched.
+    assert!(
+        doc_present(&pool, &db, &schema, "sessions", &live_id).await,
+        "live doc must not be reaped"
+    );
+
+    let _ = db::drop_database(&pool, &db).await;
+}
