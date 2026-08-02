@@ -5,8 +5,12 @@
 //! OAuth sessions, which carry no machine-token identity, are rate-limited per-db
 //! only.
 //!
-//! HTTP-only for v1: the WebSocket handler keeps its existing per-connection
-//! frame cap (`ws.rs`); message-level WS limiting is a documented follow-up.
+//! Shared by HTTP (`check_http_rate_limits`) and the reactive WS handler: the
+//! `Mutate` and `Subscribe` arms call `evaluate` after re-authorizing and, on a
+//! denial, reply with a typed `RATE_LIMITED` error (`MutateErr`/`SubscribeErr`)
+//! carrying `retryAfter` — the connection stays open. The WS handler's separate
+//! per-connection frame cap (`ws.rs::ConnRateLimiter`, 200 msgs/10s) is a coarse
+//! flood valve that closes the socket and is independent of this limiter.
 //!
 //! Algorithm: a fixed window per `RateKey` keyed by the wall-clock minute
 //! (`secs_since_epoch / 60`). A burst at the minute boundary can momentarily
