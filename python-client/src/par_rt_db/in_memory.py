@@ -1142,11 +1142,7 @@ class InMemoryRtDbClient:
         # patch/replace/delete treat it like any other field. Runs before
         # validation so a required TTL field is populated.
         ttl = table_def.ttl
-        if (
-            ttl is not None
-            and ttl.default_duration_ms is not None
-            and ttl.field not in doc
-        ):
+        if ttl is not None and ttl.default_duration_ms is not None and ttl.field not in doc:
             doc[ttl.field] = self._now() + ttl.default_duration_ms
         validate_doc(table_def, doc)
         stored = _strip_unset_optionals(table_def, doc)

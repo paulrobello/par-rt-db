@@ -21,11 +21,17 @@ _TABLE = "sessions"
 def _ttl_schema() -> Any:
     """``sessions`` table with a required numeric ``expiresAt`` TTL field and a
     1000ms default duration."""
-    return Schema.model_validate({"tables": {_TABLE: {
-        "fields": {"expiresAt": {"type": "number"}},
-        "indexes": [{"name": "by_expires", "fields": ["expiresAt"]}],
-        "ttl": {"field": "expiresAt", "defaultDurationMs": 1000},
-    }}})
+    return Schema.model_validate(
+        {
+            "tables": {
+                _TABLE: {
+                    "fields": {"expiresAt": {"type": "number"}},
+                    "indexes": [{"name": "by_expires", "fields": ["expiresAt"]}],
+                    "ttl": {"field": "expiresAt", "defaultDurationMs": 1000},
+                }
+            }
+        }
+    )
 
 
 def _new_client() -> InMemoryRtDbClient:
@@ -62,9 +68,7 @@ def test_ttl_serializes_with_camel_alias_and_omits_none() -> None:
     assert no_default["ttl"] == {"field": "expiresAt"}
 
     # A TableDef that does not declare ttl never emits the key.
-    bare = TableDef.model_validate({"fields": {"a": {"type": "string"}}}).model_dump(
-        by_alias=True
-    )
+    bare = TableDef.model_validate({"fields": {"a": {"type": "string"}}}).model_dump(by_alias=True)
     assert "ttl" not in bare
 
 
@@ -117,13 +121,17 @@ def test_tick_reaps_explicit_caller_value() -> None:
 def test_absent_ttl_field_is_left_alone() -> None:
     """A doc that omits the TTL field (optional field, no default declared) is
     never reaped - the reaper only removes docs whose field is a number < now."""
-    schema = Schema.model_validate({"tables": {_TABLE: {
-        "fields": {"expiresAt": {"type": "optional", "inner": {"type": "number"}}},
-        "ttl": {"field": "expiresAt"},  # no defaultDurationMs
-    }}})
-    c = InMemoryRtDbClient(
-        InMemoryRtDbClientOptions(now=lambda: 10_000, random=lambda: 0.5)
+    schema = Schema.model_validate(
+        {
+            "tables": {
+                _TABLE: {
+                    "fields": {"expiresAt": {"type": "optional", "inner": {"type": "number"}}},
+                    "ttl": {"field": "expiresAt"},  # no defaultDurationMs
+                }
+            }
+        }
     )
+    c = InMemoryRtDbClient(InMemoryRtDbClientOptions(now=lambda: 10_000, random=lambda: 0.5))
     c.push_schema(schema)
     doc_id = _insert(c, {})
     # No default -> expiresAt stays absent; ticking far into the future keeps it.
@@ -133,13 +141,17 @@ def test_absent_ttl_field_is_left_alone() -> None:
 
 def test_non_numeric_ttl_value_is_left_alone() -> None:
     """A non-numeric TTL value is never reaped (the reaper's isinstance guard)."""
-    schema = Schema.model_validate({"tables": {_TABLE: {
-        "fields": {"expiresAt": {"type": "any"}},
-        "ttl": {"field": "expiresAt"},
-    }}})
-    c = InMemoryRtDbClient(
-        InMemoryRtDbClientOptions(now=lambda: 10_000, random=lambda: 0.5)
+    schema = Schema.model_validate(
+        {
+            "tables": {
+                _TABLE: {
+                    "fields": {"expiresAt": {"type": "any"}},
+                    "ttl": {"field": "expiresAt"},
+                }
+            }
+        }
     )
+    c = InMemoryRtDbClient(InMemoryRtDbClientOptions(now=lambda: 10_000, random=lambda: 0.5))
     c.push_schema(schema)
     doc_id = _insert(c, {"expiresAt": "not-a-number"})
     c.tick(now_ms=1_000_000)
@@ -166,23 +178,33 @@ def test_ttl_toggle_is_non_destructive() -> None:
     it is a behavior toggle, not a structural (field/index) change. Mirrors
     ``ddl::detect_destructive_changes``, which inspects fields/indexes only."""
     c = _new_client()
-    without_ttl = Schema.model_validate({"tables": {_TABLE: {
-        "fields": {"expiresAt": {"type": "number"}},
-        "indexes": [{"name": "by_expires", "fields": ["expiresAt"]}],
-    }}})
+    without_ttl = Schema.model_validate(
+        {
+            "tables": {
+                _TABLE: {
+                    "fields": {"expiresAt": {"type": "number"}},
+                    "indexes": [{"name": "by_expires", "fields": ["expiresAt"]}],
+                }
+            }
+        }
+    )
     c.push_schema(without_ttl)  # removing ttl - non-destructive
     c.push_schema(_ttl_schema())  # re-adding ttl - also non-destructive
 
 
 def test_tick_without_ttl_does_nothing() -> None:
     """A table without a ``ttl`` policy is untouched by ``tick`` reaping."""
-    schema = Schema.model_validate({"tables": {_TABLE: {
-        "fields": {"expiresAt": {"type": "number"}},
-        "indexes": [{"name": "by_expires", "fields": ["expiresAt"]}],
-    }}})  # no ttl
-    c = InMemoryRtDbClient(
-        InMemoryRtDbClientOptions(now=lambda: 10_000, random=lambda: 0.5)
-    )
+    schema = Schema.model_validate(
+        {
+            "tables": {
+                _TABLE: {
+                    "fields": {"expiresAt": {"type": "number"}},
+                    "indexes": [{"name": "by_expires", "fields": ["expiresAt"]}],
+                }
+            }
+        }
+    )  # no ttl
+    c = InMemoryRtDbClient(InMemoryRtDbClientOptions(now=lambda: 10_000, random=lambda: 0.5))
     c.push_schema(schema)
     doc_id = _insert(c, {"expiresAt": 1})  # would be "expired" if a ttl existed
     c.tick(now_ms=1_000_000)
