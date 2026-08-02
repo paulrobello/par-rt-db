@@ -1221,3 +1221,90 @@ async fn http_migrate_dry_run() {
     );
     drop_db(&db).await;
 }
+
+// Regression for BUG 1: `dropIndex` used to drop the Postgres index but leave
+// its backing `f_<field>` column orphaned. The next `push_schema` then treated
+// the field as newly-indexed and ran `ALTER TABLE ADD COLUMN f_<field>` (no
+// `IF NOT EXISTS`), so Postgres rejected "column already exists" → 500
+// INTERNAL. The fix both drops the orphan column in `dropIndex` AND makes
+// `ADD COLUMN` tolerant. This test reproduces the full sequence.
+#[tokio::test]
+async fn drop_index_then_re_push_does_not_collide() {
+    // 1. Push a table with an indexed field and insert a row so the backing
+    //    `f_name` column is real (not just schema metadata).
+    let mut db = setup_db_with_schema(
+        r#"{"tables":{"users":{"fields":{"name":{"type":"string"}},"indexes":[{"name":"by_name","fields":["name"]}]}}}"#,
+    )
+    .await;
+    let id = insert_doc(&db, "users", r#"{"name":"Ada"}"#).await;
+    let schema_name = format!("db_{}", db.name);
+
+    // 2. migrate dropIndex. Done inline (rather than via the `migrate` helper)
+    //    so we also persist the derived schema to the `meta` table, mirroring
+    //    production `committer::handle_migrate` — otherwise a later push_schema
+    //    would still see the pre-migration schema and the test would not
+    //    reproduce the real bug. Should drop the index AND its orphan `f_name`
+    //    column (the fix); before the fix the column was left behind.
+    let request: MigrateRequest = serde_json::from_str(
+        r#"{"directives":[{"op":"dropIndex","table":"users","name":"by_name"}]}"#,
+    )
+    .expect("parse migrate request");
+    let derived = plan_migration(&db.schema, &request.directives).expect("plan migration");
+    let mut tx = db.state.pool.begin().await.expect("begin tx");
+    apply_migration(
+        &mut tx,
+        &db.name,
+        &request.directives,
+        &derived,
+        request.dry_run,
+    )
+    .await
+    .expect("apply migration");
+    // Persist derived schema (same upsert handle_migrate uses).
+    let schema_json = serde_json::to_value(&derived).expect("serialize derived schema");
+    sqlx::query(&format!(
+        "INSERT INTO \"{schema_name}\".meta (key, value) VALUES ('schema', $1) \
+         ON CONFLICT (key) DO UPDATE SET value = excluded.value"
+    ))
+    .bind(schema_json)
+    .execute(&mut *tx)
+    .await
+    .expect("persist derived schema");
+    tx.commit().await.expect("commit migration tx");
+    db.schema = derived;
+    assert!(
+        !relation_exists(&db, &format!("\"{schema_name}\".\"i_users_by_name\"")).await,
+        "index dropped"
+    );
+
+    // 3. push_schema again with the SAME index re-added. Before the fix this
+    //    500'd with "column f_name already exists"; after the fix it succeeds.
+    db.schema = serde_json::from_str(
+        r#"{"tables":{"users":{"fields":{"name":{"type":"string"}},"indexes":[{"name":"by_name","fields":["name"]}]}}}"#,
+    )
+    .expect("parse re-push schema");
+    push_schema(&db.state.pool, &db.name, db.schema.clone())
+        .await
+        .expect("re-push schema after dropIndex must not collide");
+
+    // 4. The re-added index works: insert + query by the indexed field, proving
+    //    the column is healthy (present, typed, and populated by backfill).
+    let id2 = insert_doc(&db, "users", r#"{"name":"Grace"}"#).await;
+    let (col,): (String,) = sqlx::query_as(&format!(
+        "SELECT \"f_name\" FROM \"{schema_name}\".\"t_users\" WHERE id = $1"
+    ))
+    .bind(&id)
+    .fetch_one(&db.state.pool)
+    .await
+    .expect("fetch f_name for pre-migration row (backfilled)");
+    assert_eq!(col, "Ada");
+    let (col2,): (String,) = sqlx::query_as(&format!(
+        "SELECT \"f_name\" FROM \"{schema_name}\".\"t_users\" WHERE id = $1"
+    ))
+    .bind(&id2)
+    .fetch_one(&db.state.pool)
+    .await
+    .expect("fetch f_name for new row");
+    assert_eq!(col2, "Grace");
+    drop_db(&db).await;
+}

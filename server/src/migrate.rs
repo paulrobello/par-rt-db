@@ -491,6 +491,36 @@ async fn apply_one(
             sqlx::query(&format!("DROP INDEX IF EXISTS \"{schema_name}\".\"{idx}\""))
                 .execute(&mut **tx)
                 .await?;
+            // Drop backing `f_` columns that the dropped index owned and NO
+            // remaining index still uses. `old` is the pre-migration schema
+            // (still has the dropped index's `.fields`); `derived` is
+            // post-migration (the index is gone). Without this, an orphan
+            // column makes a later push_schema's ADD COLUMN fail with
+            // "column already exists" (the next push treats the field as
+            // newly-indexed again).
+            let still_indexed: BTreeSet<String> = derived
+                .tables
+                .get(table)
+                .map(indexed_fields)
+                .unwrap_or_default();
+            let dropped_fields: Vec<String> = old
+                .tables
+                .get(table)
+                .and_then(|t| t.indexes.iter().find(|i| i.name == *name))
+                .map(|i| i.fields.clone())
+                .unwrap_or_default();
+            let t_ident = pg_table(table);
+            for field_name in dropped_fields {
+                if still_indexed.contains(&field_name) {
+                    continue;
+                }
+                let col = pg_col(&field_name);
+                sqlx::query(&format!(
+                    "ALTER TABLE \"{schema_name}\".\"{t_ident}\" DROP COLUMN IF EXISTS \"{col}\""
+                ))
+                .execute(&mut **tx)
+                .await?;
+            }
             fx.touched.insert(table.clone());
             Ok(DirectiveReport {
                 op: "dropIndex".into(),

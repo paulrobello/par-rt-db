@@ -216,7 +216,7 @@ pub async fn push_schema(
                     let col = pg_col(field_name);
 
                     sqlx::query(&format!(
-                        "ALTER TABLE \"{pg_schema_name}\".\"{table_ident}\" ADD COLUMN \"{col}\" {pg_type}"
+                        "ALTER TABLE \"{pg_schema_name}\".\"{table_ident}\" ADD COLUMN IF NOT EXISTS \"{col}\" {pg_type}"
                     ))
                     .execute(&mut *tx)
                     .await?;
