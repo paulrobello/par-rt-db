@@ -156,6 +156,35 @@ def test_table_without_collaborators_field_omits_collaboratorsField_key():
     assert "collaboratorsField" not in wire["tables"]["t"]
 
 
+def test_authorize_builder_round_trips():
+    """`authorize` is the Model C opt-in predicate: present on the wire when set
+    (with the predicate, including principal markers, byte-identical), omitted
+    entirely when absent."""
+    predicate = {
+        "op": "or",
+        "exprs": [
+            {"op": "eq", "field": "owner", "value": {"$user": True}},
+            {"op": "eq", "field": "visibility", "value": "public"},
+        ],
+    }
+    schema = (
+        Schema.builder()
+        .table(
+            "posts",
+            lambda tb: (
+                tb.field("owner", t.string()).field("visibility", t.string()).authorize(predicate)
+            ),
+        )
+        .build()
+    )
+    wire = json.loads(schema.model_dump_json(by_alias=True))
+    assert wire["tables"]["posts"]["authorize"] == predicate
+    # absent authorize is omitted entirely.
+    schema2 = Schema.builder().table("t", lambda tb: tb.field("name", t.string())).build()
+    wire2 = json.loads(schema2.model_dump_json(by_alias=True))
+    assert "authorize" not in wire2["tables"]["t"]
+
+
 def test_vector_index_without_filter_fields_omits_filterFields():
     """``VectorIndexSpec.filterFields`` is omitted on the wire when empty
     (mirrors server's ``Vec::is_empty`` skip rule)."""

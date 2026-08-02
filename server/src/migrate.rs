@@ -150,6 +150,9 @@ fn validate_one(schema: &mut SchemaDef, d: &Directive) -> Result<(), RtDbError> 
             if t.collaborators_field.as_deref() == Some(from.as_str()) {
                 t.collaborators_field = Some(to.clone());
             }
+            if let Some(expr) = t.authorize.as_mut() {
+                rename_filter_fields(expr, from, to);
+            }
         }
         Directive::RenameTable { from, to } => {
             if schema.tables.contains_key(to) {
@@ -202,6 +205,17 @@ fn validate_one(schema: &mut SchemaDef, d: &Directive) -> Result<(), RtDbError> 
         }
         Directive::DropField { table, field } => {
             let t = table_mut(schema, table)?;
+            // `authorize` is load-bearing for auth: silently clearing it (as
+            // ownerField/collaboratorsField are below) would widen access. A
+            // field the predicate still references must be untied explicitly —
+            // reject the migration so the caller amends `authorize` first.
+            if let Some(expr) = &t.authorize
+                && filter_expr_references_field(expr, field)
+            {
+                return Err(RtDbError::bad_request(format!(
+                    "cannot drop field '{table}.{field}': still referenced by the authorize predicate (amend authorize first)"
+                )));
+            }
             if t.fields.remove(field).is_none() {
                 return Err(RtDbError::bad_request(format!(
                     "dropped field '{table}.{field}' does not exist"
@@ -273,6 +287,56 @@ fn table_mut<'a>(schema: &'a mut SchemaDef, table: &str) -> Result<&'a mut Table
         .tables
         .get_mut(table)
         .ok_or_else(|| RtDbError::bad_request(format!("table '{table}' does not exist")))
+}
+
+/// Rewrite every `field` reference in `expr` that equals `from` to `to`, in
+/// place. Used by `RenameField` to carry an `authorize` predicate across a
+/// field rename (mirroring the ownerField/collaboratorsField rewrite). Recurses
+/// through `And`/`Or`/`Not`.
+fn rename_filter_fields(expr: &mut crate::query::FilterExpr, from: &str, to: &str) {
+    use crate::query::FilterExpr;
+    match expr {
+        FilterExpr::Eq { field, .. }
+        | FilterExpr::Neq { field, .. }
+        | FilterExpr::Gt { field, .. }
+        | FilterExpr::Gte { field, .. }
+        | FilterExpr::Lt { field, .. }
+        | FilterExpr::Lte { field, .. }
+        | FilterExpr::In { field, .. }
+        | FilterExpr::Contains { field, .. }
+        | FilterExpr::Exists { field } => {
+            if field == from {
+                *field = to.to_string();
+            }
+        }
+        FilterExpr::And { exprs } | FilterExpr::Or { exprs } => {
+            for e in exprs {
+                rename_filter_fields(e, from, to);
+            }
+        }
+        FilterExpr::Not { expr } => rename_filter_fields(expr, from, to),
+    }
+}
+
+/// True if any `field` reference in `expr` equals `field`. Used by `DropField`
+/// to reject dropping a field the `authorize` predicate still depends on.
+fn filter_expr_references_field(expr: &crate::query::FilterExpr, field: &str) -> bool {
+    use crate::query::FilterExpr;
+    match expr {
+        FilterExpr::Eq { field: f, .. }
+        | FilterExpr::Neq { field: f, .. }
+        | FilterExpr::Gt { field: f, .. }
+        | FilterExpr::Gte { field: f, .. }
+        | FilterExpr::Lt { field: f, .. }
+        | FilterExpr::Lte { field: f, .. }
+        | FilterExpr::In { field: f, .. }
+        | FilterExpr::Contains { field: f, .. }
+        | FilterExpr::Exists { field: f } => f == field,
+        FilterExpr::And { exprs } | FilterExpr::Or { exprs } => {
+            exprs.iter().any(|e| filter_expr_references_field(e, field))
+        }
+        FilterExpr::Not { expr } => filter_expr_references_field(expr, field),
+    }
 }
 
 /// True if `cast` can coerce from `old`. Mirrors the matrix in the spec.
@@ -976,6 +1040,7 @@ mod tests {
                 owner_field: None,
                 collaborators_field: None,
                 ttl: None,
+                authorize: None,
             },
         );
         SchemaDef { tables }
@@ -1076,6 +1141,7 @@ mod tests {
                 owner_field: None,
                 collaborators_field: None,
                 ttl: None,
+                authorize: None,
             },
         );
         let schema = SchemaDef { tables };
@@ -1140,6 +1206,7 @@ mod tests {
                 owner_field: Some("ownerId".into()),
                 collaborators_field: Some("collabs".into()),
                 ttl: None,
+                authorize: None,
             },
         );
         SchemaDef { tables }
@@ -1202,6 +1269,87 @@ mod tests {
         );
     }
 
+    // `authorize` carries across a field rename: every `field` reference inside
+    // the predicate follows the rename (mirrors ownerField/collaboratorsField).
+    #[test]
+    fn plan_rename_field_carries_authorize_predicate() {
+        use crate::query::FilterExpr;
+        let mut old = schema_with_auth_and_index();
+        // visibility OR owner==caller — references renamed field `ownerId`.
+        old.tables
+            .get_mut("users")
+            .unwrap()
+            .fields
+            .insert("visibility".into(), FieldType::String);
+        old.tables.get_mut("users").unwrap().authorize = Some(FilterExpr::Or {
+            exprs: vec![
+                FilterExpr::Eq {
+                    field: "ownerId".into(),
+                    value: serde_json::json!({"$user": true}),
+                },
+                FilterExpr::Eq {
+                    field: "visibility".into(),
+                    value: serde_json::json!("public"),
+                },
+            ],
+        });
+        let d = vec![Directive::RenameField {
+            table: "users".into(),
+            from: "ownerId".into(),
+            to: "uid".into(),
+        }];
+        let got = plan_migration(&old, &d).unwrap();
+        let t = &got.tables["users"];
+        // The predicate now references `uid`, not `ownerId`, and the unrelated
+        // `visibility` leaf is untouched.
+        let expr = t.authorize.as_ref().expect("authorize preserved");
+        match expr {
+            FilterExpr::Or { exprs } => match (&exprs[0], &exprs[1]) {
+                (FilterExpr::Eq { field: f0, .. }, FilterExpr::Eq { field: f1, .. }) => {
+                    assert_eq!(f0, "uid");
+                    assert_eq!(f1, "visibility");
+                }
+                other => panic!("expected two Eq leaves, got {other:?}"),
+            },
+            other => panic!("expected Or, got {other:?}"),
+        }
+    }
+
+    // Dropping a field the `authorize` predicate still references is rejected:
+    // silently clearing the predicate would widen access (load-bearing for auth).
+    #[test]
+    fn plan_drop_field_rejects_when_authorize_references_it() {
+        use crate::error::ErrorCode;
+        use crate::query::FilterExpr;
+        let mut old = schema_with_auth_and_index();
+        old.tables
+            .get_mut("users")
+            .unwrap()
+            .fields
+            .insert("visibility".into(), FieldType::String);
+        old.tables.get_mut("users").unwrap().authorize = Some(FilterExpr::Eq {
+            field: "visibility".into(),
+            value: serde_json::json!("public"),
+        });
+        let d = vec![Directive::DropField {
+            table: "users".into(),
+            field: "visibility".into(),
+        }];
+        let err = plan_migration(&old, &d).unwrap_err();
+        assert_eq!(err.code, ErrorCode::BadRequest);
+        assert!(
+            err.message.contains("authorize"),
+            "should explain the authorize conflict: {}",
+            err.message
+        );
+        // Dropping an unrelated field is unaffected.
+        let d2 = vec![Directive::DropField {
+            table: "users".into(),
+            field: "email".into(),
+        }];
+        assert!(plan_migration(&old, &d2).is_ok());
+    }
+
     // evalExpr `set` is interpolated into the jsonb_set key literal, so a stray
     // quote (the classic injection shape) must be rejected as BAD_REQUEST at plan
     // time — not reach the scoped-raw-SQL applier. Locks `is_valid_identifier`.
@@ -1245,6 +1393,7 @@ mod tests {
                 owner_field: None,
                 collaborators_field: None,
                 ttl: None,
+                authorize: None,
             },
         );
         let old = SchemaDef { tables };
@@ -1285,6 +1434,7 @@ mod tests {
                 owner_field: None,
                 collaborators_field: None,
                 ttl: None,
+                authorize: None,
             },
         );
         tables.insert(
@@ -1295,6 +1445,7 @@ mod tests {
                 owner_field: None,
                 collaborators_field: None,
                 ttl: None,
+                authorize: None,
             },
         );
         let old = SchemaDef { tables };

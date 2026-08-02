@@ -117,6 +117,16 @@ pub struct TableDef {
     /// deserialize unchanged. See `TtlDef`.
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "ttl")]
     pub ttl: Option<TtlDef>,
+    /// Opt-in per-row authorization predicate (Model C). A general
+    /// `FilterExpr` over this table's declared doc fields and the principal's
+    /// markers (`{"$user":true}` / `{"$email":true}`). Enforced on the same
+    /// read/write/subscription seams as `owner_field`; additive to it. When
+    /// unset, behavior is unchanged. Marker values are valid only here —
+    /// client `.filter()` queries reject them (Task 6, via
+    /// `validate_filter_expr_fields` with `allow_principal_markers = false`).
+    /// Server-validated at schema-push and migrate time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorize: Option<FilterExpr>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
@@ -222,6 +232,117 @@ fn is_string_literal_union(variants: &[FieldType]) -> bool {
         && variants
             .iter()
             .all(|variant| matches!(variant, FieldType::Literal { value } if value.is_string()))
+}
+
+/// True if `v` is a principal marker: `{"$user": true}` or `{"$email": true}`.
+/// Markers are valid only in a server-declared `authorize` predicate; the query
+/// boundary (Task 6) rejects them in client `.filter()` expressions via
+/// `validate_filter_expr_fields(_, _, allow_principal_markers = false)`.
+fn is_principal_marker(v: &serde_json::Value) -> bool {
+    if let serde_json::Value::Object(map) = v
+        && map.len() == 1
+    {
+        return matches!(map.get("$user").and_then(|x| x.as_bool()), Some(true))
+            || matches!(map.get("$email").and_then(|x| x.as_bool()), Some(true));
+    }
+    false
+}
+
+fn check_field_declared(field: &str, table: &TableDef) -> Result<(), RtDbError> {
+    if !table.fields.contains_key(field) {
+        return Err(RtDbError::schema(format!(
+            "filter references undeclared field '{field}'"
+        )));
+    }
+    Ok(())
+}
+
+/// Walk `expr` validating its field references against `table`'s declared
+/// fields. Reused by `validate_structure` (for the server-declared `authorize`
+/// predicate, `allow_principal_markers = true`) and by the query boundary in
+/// Task 6 (for client `.filter()` expressions, `allow_principal_markers = false`).
+///
+/// - Every `field` (eq/neq/in/gt/gte/lt/lte/contains/exists) must name a
+///   declared field.
+/// - `Contains` requires an array-of-strings field (`is_string_array_field`),
+///   since it compiles to a jsonb membership test against a bound text uid.
+/// - Comparison fields (gt/gte/lt/lte) must be scalar-indexable
+///   (`indexed_column_type` ok) so the SQL and doc evaluators can order them.
+/// - When `allow_principal_markers` is false, any principal marker appearing in
+///   a value position is rejected (Task 6's client-filter guard).
+/// - `And`/`Or`/`Not` recurse.
+pub fn validate_filter_expr_fields(
+    expr: &FilterExpr,
+    table: &TableDef,
+    allow_principal_markers: bool,
+) -> Result<(), RtDbError> {
+    match expr {
+        FilterExpr::Eq { field, value }
+        | FilterExpr::Neq { field, value }
+        | FilterExpr::Gt { field, value }
+        | FilterExpr::Gte { field, value }
+        | FilterExpr::Lt { field, value }
+        | FilterExpr::Lte { field, value } => {
+            check_field_declared(field, table)?;
+            if !allow_principal_markers && is_principal_marker(value) {
+                return Err(RtDbError::schema(format!(
+                    "principal markers ({{\"$user\":true}}/{{\"$email\":true}}) are not allowed in client filters (field '{field}')"
+                )));
+            }
+            if matches!(
+                expr,
+                FilterExpr::Gt { .. }
+                    | FilterExpr::Gte { .. }
+                    | FilterExpr::Lt { .. }
+                    | FilterExpr::Lte { .. }
+            ) {
+                let fty = &table.fields[field];
+                if indexed_column_type(fty).is_err() {
+                    return Err(RtDbError::schema(format!(
+                        "field '{field}' must be a scalar indexable type for comparison"
+                    )));
+                }
+            }
+        }
+        FilterExpr::In { field, values } => {
+            check_field_declared(field, table)?;
+            if !allow_principal_markers {
+                for v in values {
+                    if is_principal_marker(v) {
+                        return Err(RtDbError::schema(format!(
+                            "principal markers ({{\"$user\":true}}/{{\"$email\":true}}) are not allowed in client filters (field '{field}')"
+                        )));
+                    }
+                }
+            }
+        }
+        FilterExpr::Contains { field, value } => {
+            check_field_declared(field, table)?;
+            let fty = &table.fields[field];
+            if !is_string_array_field(fty) {
+                return Err(RtDbError::schema(format!(
+                    "field '{field}' must be an array-of-strings (or array-of-id) field for contains"
+                )));
+            }
+            if !allow_principal_markers && is_principal_marker(value) {
+                return Err(RtDbError::schema(format!(
+                    "principal markers ({{\"$user\":true}}/{{\"$email\":true}}) are not allowed in client filters (field '{field}')"
+                )));
+            }
+        }
+        FilterExpr::Exists { field } => {
+            check_field_declared(field, table)?;
+        }
+        FilterExpr::And { exprs } | FilterExpr::Or { exprs } => {
+            for e in exprs {
+                validate_filter_expr_fields(e, table, allow_principal_markers)?;
+            }
+        }
+        FilterExpr::Not { expr } => {
+            validate_filter_expr_fields(expr, table, allow_principal_markers)?;
+        }
+    }
+    Ok(())
 }
 
 /// Whether a field type is array-of-strings-compatible: `Array<T>` (or
@@ -371,6 +492,12 @@ impl TableDef {
                     "collaboratorsField '{collab}' must be an array-of-strings (or array-of-id) field"
                 )));
             }
+        }
+
+        if let Some(authorize) = &self.authorize {
+            // Principal markers are valid here (rejected in client filters by
+            // Task 6 at the query boundary via the same walker with `false`).
+            validate_filter_expr_fields(authorize, self, true)?;
         }
 
         let mut index_names = HashSet::new();
@@ -718,6 +845,7 @@ mod tests {
             owner_field: None,
             collaborators_field: None,
             ttl: None,
+            authorize: None,
         }
     }
 
@@ -766,6 +894,7 @@ mod tests {
             owner_field: None,
             collaborators_field: None,
             ttl: None,
+            authorize: None,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -800,6 +929,7 @@ mod tests {
             owner_field: None,
             collaborators_field: None,
             ttl: None,
+            authorize: None,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -816,6 +946,7 @@ mod tests {
             owner_field: None,
             collaborators_field: None,
             ttl: None,
+            authorize: None,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -839,6 +970,7 @@ mod tests {
             owner_field: None,
             collaborators_field: None,
             ttl: None,
+            authorize: None,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -862,6 +994,7 @@ mod tests {
             owner_field: None,
             collaborators_field: None,
             ttl: None,
+            authorize: None,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -880,6 +1013,7 @@ mod tests {
             owner_field: None,
             collaborators_field: None,
             ttl: None,
+            authorize: None,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -912,6 +1046,7 @@ mod tests {
             owner_field: None,
             collaborators_field: None,
             ttl: None,
+            authorize: None,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -927,6 +1062,7 @@ mod tests {
             owner_field: None,
             collaborators_field: None,
             ttl: None,
+            authorize: None,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -967,6 +1103,7 @@ mod tests {
             owner_field: None,
             collaborators_field: None,
             ttl: None,
+            authorize: None,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -989,6 +1126,7 @@ mod tests {
             owner_field: None,
             collaborators_field: None,
             ttl: None,
+            authorize: None,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -1011,6 +1149,7 @@ mod tests {
             owner_field: None,
             collaborators_field: None,
             ttl: None,
+            authorize: None,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -1043,6 +1182,7 @@ mod tests {
             owner_field: None,
             collaborators_field: None,
             ttl: None,
+            authorize: None,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -1065,6 +1205,7 @@ mod tests {
             owner_field: None,
             collaborators_field: None,
             ttl: None,
+            authorize: None,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -1087,6 +1228,7 @@ mod tests {
             owner_field: None,
             collaborators_field: None,
             ttl: None,
+            authorize: None,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -1107,6 +1249,7 @@ mod tests {
             owner_field: None,
             collaborators_field: None,
             ttl: None,
+            authorize: None,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -1122,6 +1265,7 @@ mod tests {
             owner_field: None,
             collaborators_field: None,
             ttl: None,
+            authorize: None,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -1144,6 +1288,7 @@ mod tests {
             owner_field: None,
             collaborators_field: None,
             ttl: None,
+            authorize: None,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -1347,6 +1492,7 @@ mod tests {
             owner_field: None,
             collaborators_field: None,
             ttl: None,
+            authorize: None,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -1446,6 +1592,7 @@ mod tests {
             owner_field: None,
             collaborators_field: None,
             ttl: None,
+            authorize: None,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -1503,6 +1650,7 @@ mod tests {
             owner_field: None,
             collaborators_field: None,
             ttl: None,
+            authorize: None,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -1530,6 +1678,7 @@ mod tests {
             owner_field: None,
             collaborators_field: None,
             ttl: None,
+            authorize: None,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -1626,6 +1775,7 @@ mod tests {
             owner_field: None,
             collaborators_field: None,
             ttl: None,
+            authorize: None,
         };
         assert!(table.validate_structure("docs").is_err());
     }
@@ -1651,6 +1801,7 @@ mod tests {
             owner_field: None,
             collaborators_field: None,
             ttl: None,
+            authorize: None,
         };
         assert!(table.validate_structure("docs").is_ok());
     }
@@ -1675,6 +1826,7 @@ mod tests {
             owner_field: None,
             collaborators_field: None,
             ttl: None,
+            authorize: None,
         };
         assert!(table.validate_structure("docs").is_err());
     }
@@ -1701,6 +1853,7 @@ mod tests {
             owner_field: None,
             collaborators_field: None,
             ttl: None,
+            authorize: None,
         };
         assert!(table.validate_structure("docs").is_err());
     }
@@ -1726,6 +1879,7 @@ mod tests {
             owner_field: None,
             collaborators_field: None,
             ttl: None,
+            authorize: None,
         };
         assert!(table.validate_structure("docs").is_err());
     }
@@ -1750,6 +1904,7 @@ mod tests {
             owner_field: None,
             collaborators_field: None,
             ttl: None,
+            authorize: None,
         };
         assert!(table.validate_structure("docs").is_err());
     }
@@ -1774,6 +1929,7 @@ mod tests {
             owner_field: None,
             collaborators_field: None,
             ttl: None,
+            authorize: None,
         };
         assert!(table.validate_structure("docs").is_err());
     }
@@ -1804,6 +1960,7 @@ mod tests {
             owner_field: None,
             collaborators_field: None,
             ttl: None,
+            authorize: None,
         };
         assert!(table.validate_structure("docs").is_err());
     }
@@ -2044,6 +2201,7 @@ mod tests {
             owner_field: None,
             collaborators_field: None,
             ttl,
+            authorize: None,
         }
     }
 
@@ -2146,5 +2304,174 @@ mod tests {
             })),
         );
         assert!(schema.validate().is_err());
+    }
+
+    // ---- TableDef.authorize: per-row predicate declaration (Model C) ----
+
+    /// Helper: a TableDef with the named string fields plus `editors`
+    /// (array-of-strings) and `count` (number), so every authorize-validation
+    /// branch has a field of the right shape to target.
+    fn table_with_string_fields(field_names: &[&str]) -> TableDef {
+        let mut fields = BTreeMap::new();
+        for f in field_names {
+            fields.insert((*f).to_string(), FieldType::String);
+        }
+        fields.insert(
+            "editors".to_string(),
+            FieldType::Array {
+                element: Box::new(FieldType::String),
+            },
+        );
+        fields.insert("count".to_string(), FieldType::Number);
+        TableDef {
+            fields,
+            indexes: vec![],
+            owner_field: None,
+            collaborators_field: None,
+            ttl: None,
+            authorize: None,
+        }
+    }
+
+    #[test]
+    fn authorize_validates_fields_and_markers() {
+        let mut t = table_with_string_fields(&["owner", "visibility"]);
+        // valid: public OR owned (principal marker allowed in authorize)
+        t.authorize = Some(FilterExpr::Or {
+            exprs: vec![
+                FilterExpr::Eq {
+                    field: "owner".into(),
+                    value: serde_json::json!({"$user": true}),
+                },
+                FilterExpr::Eq {
+                    field: "visibility".into(),
+                    value: serde_json::json!("public"),
+                },
+            ],
+        });
+        assert!(t.validate_structure("posts").is_ok());
+
+        // invalid: unknown field
+        let mut bad = t.clone();
+        bad.authorize = Some(FilterExpr::Eq {
+            field: "nope".into(),
+            value: serde_json::json!(1),
+        });
+        assert!(bad.validate_structure("posts").is_err());
+
+        // invalid: Contains on a non-array field
+        let mut bad2 = t.clone();
+        bad2.authorize = Some(FilterExpr::Contains {
+            field: "visibility".into(),
+            value: serde_json::json!("x"),
+        });
+        assert!(bad2.validate_structure("posts").is_err());
+
+        // valid: Contains on an array-of-strings field
+        let mut good = t.clone();
+        good.authorize = Some(FilterExpr::Contains {
+            field: "editors".into(),
+            value: serde_json::json!({"$user": true}),
+        });
+        assert!(good.validate_structure("posts").is_ok());
+
+        // valid: And/Not recurse; principal markers resolve in any leaf
+        let mut nested = t.clone();
+        nested.authorize = Some(FilterExpr::And {
+            exprs: vec![
+                FilterExpr::Not {
+                    expr: Box::new(FilterExpr::Exists {
+                        field: "count".into(),
+                    }),
+                },
+                FilterExpr::Eq {
+                    field: "owner".into(),
+                    value: serde_json::json!({"$email": true}),
+                },
+            ],
+        });
+        assert!(nested.validate_structure("posts").is_ok());
+
+        // invalid: comparison against a non-scalar (array) field — not type-compatible
+        let mut bad3 = t.clone();
+        bad3.authorize = Some(FilterExpr::Gt {
+            field: "editors".into(),
+            value: serde_json::json!(1),
+        });
+        assert!(bad3.validate_structure("posts").is_err());
+    }
+
+    #[test]
+    fn authorize_round_trips_and_absent_is_unchanged() {
+        // present: wire key `authorize` survives a round trip. (Server TableDef
+        // always serializes `indexes`, so the expected JSON includes it.)
+        let json = serde_json::json!({
+            "fields": {
+                "owner": {"type":"string"},
+                "visibility": {"type":"string"}
+            },
+            "indexes": [],
+            "authorize": {"op":"or","exprs":[
+                {"op":"eq","field":"owner","value":{"$user":true}},
+                {"op":"eq","field":"visibility","value":"public"}
+            ]}
+        });
+        let td: TableDef = serde_json::from_value(json.clone()).unwrap();
+        assert!(td.authorize.is_some());
+        assert_eq!(serde_json::to_value(&td).unwrap(), json);
+
+        // validates as part of a schema
+        let mut tables = BTreeMap::new();
+        tables.insert("posts".to_string(), td);
+        SchemaDef { tables }.validate().unwrap();
+
+        // absent authorize is omitted from the wire and deserializes as None
+        let none_json = r#"{"fields":{"title":{"type":"string"}}}"#;
+        let td2: TableDef = serde_json::from_str(none_json).unwrap();
+        assert!(td2.authorize.is_none());
+        assert!(
+            !serde_json::to_string(&td2).unwrap().contains("authorize"),
+            "authorize must be omitted on the wire when unset"
+        );
+    }
+
+    #[test]
+    fn validate_filter_expr_fields_rejects_principal_markers_when_disallowed() {
+        // The walker is reused by Task 6 to reject principal markers in client
+        // .filter() queries. Here we lock the flag's behavior directly.
+        let table = table_with_string_fields(&["owner", "visibility"]);
+        let with_marker = FilterExpr::Eq {
+            field: "owner".into(),
+            value: serde_json::json!({"$user": true}),
+        };
+        assert!(validate_filter_expr_fields(&with_marker, &table, true).is_ok());
+        assert!(validate_filter_expr_fields(&with_marker, &table, false).is_err());
+        let email_marker = FilterExpr::Eq {
+            field: "owner".into(),
+            value: serde_json::json!({"$email": true}),
+        };
+        assert!(validate_filter_expr_fields(&email_marker, &table, true).is_ok());
+        assert!(validate_filter_expr_fields(&email_marker, &table, false).is_err());
+        // a marker nested under And is still rejected
+        let nested = FilterExpr::And {
+            exprs: vec![
+                FilterExpr::Eq {
+                    field: "visibility".into(),
+                    value: serde_json::json!("public"),
+                },
+                FilterExpr::Contains {
+                    field: "editors".into(),
+                    value: serde_json::json!({"$user": true}),
+                },
+            ],
+        };
+        assert!(validate_filter_expr_fields(&nested, &table, false).is_err());
+        // a non-marker value passes regardless of the flag
+        let plain = FilterExpr::Eq {
+            field: "visibility".into(),
+            value: serde_json::json!("public"),
+        };
+        assert!(validate_filter_expr_fields(&plain, &table, true).is_ok());
+        assert!(validate_filter_expr_fields(&plain, &table, false).is_ok());
     }
 }

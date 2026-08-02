@@ -196,6 +196,15 @@ pub struct TableDef {
     /// byte-for-byte (wire key `ttl`).
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "ttl")]
     pub ttl: Option<TtlDef>,
+    /// Opt-in per-row authorization predicate (Model C). A general `FilterExpr`
+    /// over this table's declared doc fields and the principal's markers
+    /// (`{"$user":true}` / `{"$email":true}`). Enforced on the same
+    /// read/write/subscription seams as `owner_field`; additive to it. Marker
+    /// values are valid only here — client `.filter()` queries reject them.
+    /// Server-enforced; the client only declares it. Mirrors
+    /// `server/src/schema.rs::TableDef` byte-for-byte (wire key `authorize`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorize: Option<FilterExpr>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -212,6 +221,7 @@ pub struct TableBuilder {
     owner_field: Option<String>,
     collaborators_field: Option<String>,
     ttl: Option<TtlDef>,
+    authorize: Option<FilterExpr>,
     /// Index of the most recently pushed [`IndexDef`] in [`Self::indexes`], so
     /// the chainable `.unique()` / `.where_clause()` setters can configure it
     /// after `index`/`search_index`/`vector_index` returned `self`. `None`
@@ -227,6 +237,7 @@ impl TableBuilder {
             owner_field: None,
             collaborators_field: None,
             ttl: None,
+            authorize: None,
             last_index: None,
         }
     }
@@ -345,6 +356,18 @@ impl TableBuilder {
         });
         self
     }
+
+    /// Declare the per-row authorization predicate (Model C). `predicate` is a
+    /// `FilterExpr` over this table's declared doc fields and the principal's
+    /// markers (`{"$user":true}` / `{"$email":true}`). Enforced on the same
+    /// read/write/subscription seams as `owner_field`; additive to it. Marker
+    /// values are valid only here — client `.filter()` queries reject them.
+    /// Server-enforced; the client only declares it and round-trips it on the
+    /// wire as `authorize`.
+    pub fn authorize(mut self, predicate: FilterExpr) -> Self {
+        self.authorize = Some(predicate);
+        self
+    }
     fn finish(self) -> TableDef {
         let indexes = if self.indexes.is_empty() {
             None
@@ -357,6 +380,7 @@ impl TableBuilder {
             owner_field: self.owner_field,
             collaborators_field: self.collaborators_field,
             ttl: self.ttl,
+            authorize: self.authorize,
         }
     }
 }
@@ -646,6 +670,50 @@ mod tests {
         assert!(
             !serde_json::to_string(&none).unwrap().contains("ownerField"),
             "ownerField must be omitted on the wire when unset"
+        );
+    }
+
+    #[test]
+    fn authorize_serializes_and_round_trips() {
+        // `authorize` is the Model C opt-in predicate: present on the wire when
+        // set, omitted entirely when absent, mirroring `server/src/schema.rs`
+        // byte-for-byte. The predicate (with principal markers) survives a round
+        // trip unchanged.
+        let td = Table::new()
+            .field("owner", FieldType::String)
+            .field("visibility", FieldType::String)
+            .authorize(FilterExpr::Or {
+                exprs: vec![
+                    FilterExpr::Eq {
+                        field: "owner".into(),
+                        value: json!({"$user": true}),
+                    },
+                    FilterExpr::Eq {
+                        field: "visibility".into(),
+                        value: json!("public"),
+                    },
+                ],
+            })
+            .finish();
+        let json = serde_json::to_value(&td).unwrap();
+        assert_eq!(
+            json["authorize"],
+            json!({
+                "op": "or",
+                "exprs": [
+                    {"op":"eq","field":"owner","value":{"$user":true}},
+                    {"op":"eq","field":"visibility","value":"public"}
+                ]
+            })
+        );
+        // Round-trips back through the wire type.
+        let back: TableDef = serde_json::from_value(json).unwrap();
+        assert!(back.authorize.is_some());
+        // Absent -> omitted entirely (not serialized as null).
+        let none = Table::new().field("title", FieldType::String).finish();
+        assert!(
+            !serde_json::to_string(&none).unwrap().contains("authorize"),
+            "authorize must be omitted on the wire when unset"
         );
     }
 

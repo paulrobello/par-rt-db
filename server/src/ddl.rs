@@ -444,6 +444,7 @@ mod tests {
                 owner_field: None,
                 collaborators_field: None,
                 ttl: None,
+                authorize: None,
             },
         );
         tables

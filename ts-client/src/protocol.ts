@@ -354,6 +354,13 @@ export interface TableJson {
    * at insert time when the document omits it. Server-enforced; clients only
    * declare it. Omitted on the wire when unset. */
   ttl?: TtlDef;
+  /** Opt-in per-row authorization predicate (Model C). A general `FilterExpr`
+   * over this table's declared doc fields and the principal's markers
+   * (`{"$user":true}` / `{"$email":true}`). Enforced on the same
+   * read/write/subscription seams as `ownerField`; additive to it. Marker
+   * values are valid only here — client `.filter()` queries reject them.
+   * Server-enforced; clients only declare it. Omitted on the wire when unset. */
+  authorize?: FilterExpr;
 }
 
 export interface SchemaJson {

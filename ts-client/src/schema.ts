@@ -98,6 +98,7 @@ export class TableDefinition<
     readonly ownerFieldName?: string,
     readonly collaboratorsFieldName?: string,
     readonly ttlDef?: TtlDef,
+    readonly authorizeDef?: FilterExpr,
   ) {}
 
   index<Name extends string>(
@@ -110,6 +111,7 @@ export class TableDefinition<
       this.ownerFieldName,
       this.collaboratorsFieldName,
       this.ttlDef,
+      this.authorizeDef,
     );
   }
 
@@ -145,6 +147,7 @@ export class TableDefinition<
       this.ownerFieldName,
       this.collaboratorsFieldName,
       this.ttlDef,
+      this.authorizeDef,
     );
   }
 
@@ -161,6 +164,7 @@ export class TableDefinition<
       this.ownerFieldName,
       this.collaboratorsFieldName,
       this.ttlDef,
+      this.authorizeDef,
     );
   }
 
@@ -190,6 +194,7 @@ export class TableDefinition<
       this.ownerFieldName,
       this.collaboratorsFieldName,
       this.ttlDef,
+      this.authorizeDef,
     );
   }
 
@@ -203,6 +208,7 @@ export class TableDefinition<
       field,
       this.collaboratorsFieldName,
       this.ttlDef,
+      this.authorizeDef,
     );
   }
 
@@ -211,7 +217,14 @@ export class TableDefinition<
    * user ids that may read/mutate the row (owner OR collaborator). Server-enforced;
    * the client only declares it and round-trips it on the wire as `collaboratorsField`. */
   collaboratorsField(field: string): TableDefinition<Fields, Indexes> {
-    return new TableDefinition(this.fields, this.indexes, this.ownerFieldName, field, this.ttlDef);
+    return new TableDefinition(
+      this.fields,
+      this.indexes,
+      this.ownerFieldName,
+      field,
+      this.ttlDef,
+      this.authorizeDef,
+    );
   }
 
   /** Declare this table's document-TTL field. `field` names a declared numeric
@@ -230,6 +243,25 @@ export class TableDefinition<
       this.ownerFieldName,
       this.collaboratorsFieldName,
       ttlDef,
+      this.authorizeDef,
+    );
+  }
+
+  /** Declare the per-row authorization predicate (Model C). `predicate` is a
+   * `FilterExpr` over this table's declared doc fields and the principal's
+   * markers (`{"$user":true}` / `{"$email":true}`). Enforced on the same
+   * read/write/subscription seams as `ownerField`; additive to it. Marker
+   * values are valid only here — client `.filter()` queries reject them.
+   * Server-enforced; the client only declares it and round-trips it on the wire
+   * as `authorize`. */
+  authorize(predicate: FilterExpr): TableDefinition<Fields, Indexes> {
+    return new TableDefinition(
+      this.fields,
+      this.indexes,
+      this.ownerFieldName,
+      this.collaboratorsFieldName,
+      this.ttlDef,
+      predicate,
     );
   }
 
@@ -246,6 +278,9 @@ export class TableDefinition<
     }
     if (this.ttlDef) {
       json.ttl = this.ttlDef;
+    }
+    if (this.authorizeDef) {
+      json.authorize = this.authorizeDef;
     }
     return json;
   }

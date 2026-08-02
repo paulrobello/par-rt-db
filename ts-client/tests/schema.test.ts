@@ -219,6 +219,34 @@ describe("collaboratorsField builder", () => {
   });
 });
 
+describe("authorize builder", () => {
+  it("emits authorize on the wire when set, with the predicate byte-identical", () => {
+    const s = defineSchema({
+      posts: defineTable({ owner: t.string(), visibility: t.string() }).authorize({
+        op: "or",
+        exprs: [
+          { op: "eq", field: "owner", value: { $user: true } },
+          { op: "eq", field: "visibility", value: "public" },
+        ],
+      }),
+    });
+    expect(s.toJSON().tables.posts).toMatchObject({
+      authorize: {
+        op: "or",
+        exprs: [
+          { op: "eq", field: "owner", value: { $user: true } },
+          { op: "eq", field: "visibility", value: "public" },
+        ],
+      },
+    });
+  });
+
+  it("omits authorize on the wire when absent", () => {
+    const s = defineSchema({ notes: defineTable({ title: t.string() }) });
+    expect(s.toJSON().tables.notes).not.toHaveProperty("authorize");
+  });
+});
+
 describe("unique / where index builder", () => {
   it(".unique() emits unique:true on the wire alongside the btree fields", () => {
     const s = defineSchema({

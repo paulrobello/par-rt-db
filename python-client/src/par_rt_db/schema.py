@@ -209,13 +209,15 @@ class TtlDef(_S):
 
 class TableDef(_S):
     """One table: typed fields, indexes, optional per-row ``owner_field`` and
-    ``collaborators_field``, and an optional ``ttl`` policy."""
+    ``collaborators_field``, an optional ``ttl`` policy, and an optional
+    ``authorize`` per-row predicate (Model C)."""
 
     fields: dict[str, FieldType]
     indexes: list[IndexDef] = Field(default_factory=list)
     owner_field: str | None = None
     collaborators_field: str | None = None
     ttl: TtlDef | None = None
+    authorize: FilterExpr | None = None
 
     @model_serializer(mode="wrap")
     def _drop_absent_owner(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
@@ -227,6 +229,10 @@ class TableDef(_S):
         # `ttl` is a behavior toggle (server skip_serializing_if = "Option::is_none").
         if out.get("ttl") is None:
             out.pop("ttl", None)
+        # `authorize` is an opt-in predicate (server skip_serializing_if =
+        # "Option::is_none"); omit it on the wire when unset.
+        if out.get("authorize") is None:
+            out.pop("authorize", None)
         return out
 
 
@@ -253,6 +259,7 @@ class TableBuilder:
         self._indexes: list[dict[str, Any]] = []
         self._owner: str | None = None
         self._collaborators: str | None = None
+        self._authorize: FilterExpr | None = None
 
     def field(self, name: str, ft: Any) -> TableBuilder:
         self._fields[name] = ft
@@ -312,12 +319,25 @@ class TableBuilder:
         self._collaborators = name
         return self
 
+    def authorize(self, predicate: FilterExpr) -> TableBuilder:
+        """Declare the per-row authorization predicate (Model C). ``predicate``
+        is a ``FilterExpr`` over this table's declared doc fields and the
+        principal's markers (``{"$user": true}`` / ``{"$email": true}``).
+        Enforced on the same read/write/subscription seams as ``ownerField``;
+        additive to it. Marker values are valid only here — client ``.filter()``
+        queries reject them. Server-enforced; round-tripped on the wire as
+        ``authorize``."""
+        self._authorize = predicate
+        return self
+
     def _build(self) -> dict[str, Any]:
         out: dict[str, Any] = {"fields": self._fields, "indexes": self._indexes}
         if self._owner is not None:
             out["ownerField"] = self._owner
         if self._collaborators is not None:
             out["collaboratorsField"] = self._collaborators
+        if self._authorize is not None:
+            out["authorize"] = self._authorize
         return out
 
 
