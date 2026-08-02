@@ -19,6 +19,7 @@ use crate::protocol::AuthedUser;
 use super::github::GithubProvider;
 use super::gitlab::GitlabProvider;
 use super::google::GoogleProvider;
+use super::oidc::OidcProvider;
 
 const STATE_TTL_MS: i64 = 10 * 60 * 1000;
 
@@ -418,6 +419,11 @@ pub fn auth_routes() -> Router<Arc<AppState>> {
         .route(
             "/auth/gitlab/callback",
             get(provider_callback::<GitlabProvider>),
+        )
+        .route("/auth/oidc/begin", get(provider_begin::<OidcProvider>))
+        .route(
+            "/auth/oidc/callback",
+            get(provider_callback::<OidcProvider>),
         )
         .route("/auth/state", get(auth_state))
         .route("/auth/logout", post(logout))

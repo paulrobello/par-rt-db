@@ -9,7 +9,7 @@ export interface SessionValue {
   loading: boolean;
   error: string | null;
   signInWithAdminKey: (key: string) => Promise<void>;
-  signInWithOAuth: (provider: "github" | "google" | "gitlab") => Promise<void>;
+  signInWithOAuth: (provider: "github" | "google" | "gitlab" | "oidc") => Promise<void>;
   signOut: () => Promise<void>;
 }
 
@@ -78,7 +78,7 @@ export function SessionProvider({ children }: { children: ReactNode }) {
     setUser(null);
   }
 
-  function signInWithOAuth(provider: "github" | "google" | "gitlab"): Promise<void> {
+  function signInWithOAuth(provider: "github" | "google" | "gitlab" | "oidc"): Promise<void> {
     const origin = window.location.origin;
     const beginUrl = `${origin}/auth/${provider}/begin?origin=${encodeURIComponent(origin)}`;
     const poll = (

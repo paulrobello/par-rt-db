@@ -625,6 +625,7 @@ pub mod admin {
         pub github_configured: bool,
         pub google_configured: bool,
         pub gitlab_configured: bool,
+        pub oidc_configured: bool,
         pub hot: HotConfig,
         pub version: String,
         pub git_commit: String,

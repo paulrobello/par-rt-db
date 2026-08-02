@@ -88,6 +88,7 @@ export interface ConfigResponse {
   githubConfigured: boolean;
   googleConfigured: boolean;
   gitlabConfigured: boolean;
+  oidcConfigured: boolean;
   hot: HotConfig;
   version: string;
   gitCommit: string;

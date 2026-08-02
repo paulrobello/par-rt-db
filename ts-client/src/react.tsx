@@ -129,21 +129,19 @@ export function useConnectionState(): ConnectionState {
 export function useRtDbAuth(): {
   state: AuthState;
   user: AuthedUser | null;
-  signIn: (provider?: "github" | "google") => Promise<void>;
+  signIn: (provider?: "github" | "google" | "oidc") => Promise<void>;
   signOut: () => Promise<void>;
 } {
   const { client, authBaseUrl, state, user } = useContextValue();
 
   const signIn = useCallback(
-    async (provider: "github" | "google" = "github") => {
+    async (provider: "github" | "google" | "oidc" = "github") => {
       // The OAuth popup runs in both modes; the server sets the HttpOnly
       // session cookie on its callback regardless. Token mode persists the
       // posted-back token; cookie mode ignores it and re-dials tokenless so the
       // now-set cookie authenticates — no script-readable credential (SEC-002).
-      const token =
-        provider === "google"
-          ? await signInWithGoogle(authBaseUrl)
-          : await signInWithGitHub(authBaseUrl);
+      // All providers share one `/auth/{provider}/begin` + `/auth/state` flow.
+      const token = await signInWithOAuth(authBaseUrl, provider);
       if (client.cookieMode) {
         client.setToken(null);
       } else {
@@ -236,7 +234,7 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
  * session token is ready. `noopener` means `window.open` returns null, so the
  * old postMessage/closed-poll relay is replaced by this poll.
  */
-function signInWithOAuth(baseUrl: string, provider: "github" | "google"): Promise<string> {
+function signInWithOAuth(baseUrl: string, provider: "github" | "google" | "oidc"): Promise<string> {
   const api = baseUrl.replace(/\/+$/, "");
   const spaOrigin = window.location.origin;
   return (async () => {
@@ -266,4 +264,10 @@ export function signInWithGitHub(baseUrl: string): Promise<string> {
 /** Begins the Google OAuth flow and resolves with the session token polled from `/auth/state`. */
 export function signInWithGoogle(baseUrl: string): Promise<string> {
   return signInWithOAuth(baseUrl, "google");
+}
+
+/** Begins the generic OIDC flow and resolves with the session token polled from `/auth/state`.
+ *  Active only when the server has `RTDB_OIDC_*` configured (any standards-compliant IdP). */
+export function signInWithOidc(baseUrl: string): Promise<string> {
+  return signInWithOAuth(baseUrl, "oidc");
 }

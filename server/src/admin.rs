@@ -1098,6 +1098,7 @@ struct ConfigResponse {
     github_configured: bool,
     google_configured: bool,
     gitlab_configured: bool,
+    oidc_configured: bool,
     hot: crate::config::HotConfig,
     version: &'static str,
     git_commit: &'static str,
@@ -1120,6 +1121,11 @@ async fn build_config_response(state: &AppState) -> Result<ConfigResponse, RtDbE
         github_configured: cfg.github_client_id.is_some() && cfg.github_client_secret.is_some(),
         google_configured: cfg.google_client_id.is_some() && cfg.google_client_secret.is_some(),
         gitlab_configured: cfg.gitlab_client_id.is_some() && cfg.gitlab_client_secret.is_some(),
+        oidc_configured: cfg.oidc_client_id.is_some()
+            && cfg.oidc_client_secret.is_some()
+            && cfg.oidc_authorize_url.is_some()
+            && cfg.oidc_token_url.is_some()
+            && cfg.oidc_userinfo_url.is_some(),
         hot: (**hot).clone(),
         version: env!("CARGO_PKG_VERSION"),
         git_commit: env!("BUILD_GIT_COMMIT"),

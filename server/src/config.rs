@@ -27,6 +27,16 @@ pub struct Config {
     pub gitlab_client_id: Option<String>,     // RTDB_GITLAB_CLIENT_ID
     pub gitlab_client_secret: Option<String>, // RTDB_GITLAB_CLIENT_SECRET
     pub gitlab_base_url: String,              // RTDB_GITLAB_BASE_URL, default https://gitlab.com
+    // Generic OpenID Connect provider (one impl for any standards-compliant
+    // IdP: Azure AD, Keycloak, Auth0, Okta, self-hosted). The authorize/token/
+    // userinfo URLs come from the IdP's /.well-known/openid-configuration — the
+    // trait's sync authorize_url can't do live discovery, so endpoints are
+    // configuration. Active only when all five are set; else routes return 503.
+    pub oidc_client_id: Option<String>,     // RTDB_OIDC_CLIENT_ID
+    pub oidc_client_secret: Option<String>, // RTDB_OIDC_CLIENT_SECRET
+    pub oidc_authorize_url: Option<String>, // RTDB_OIDC_AUTHORIZE_URL
+    pub oidc_token_url: Option<String>,     // RTDB_OIDC_TOKEN_URL
+    pub oidc_userinfo_url: Option<String>,  // RTDB_OIDC_USERINFO_URL
     pub max_affected_docs: usize, // RTDB_MAX_AFFECTED_DOCS, default 100 (admin data-browser guardrail)
     pub static_dir: Option<String>, // RTDB_STATIC_DIR — unset/empty ⇒ API-only (no SPA served)
     pub pool_max_connections: u32, // RTDB_POOL_MAX_CONNECTIONS, default 75 (multi-tenant; one committer task + N sub re-runs per db)
@@ -113,6 +123,12 @@ impl Config {
         let gitlab_client_secret = std::env::var("RTDB_GITLAB_CLIENT_SECRET").ok();
         let gitlab_base_url = std::env::var("RTDB_GITLAB_BASE_URL")
             .unwrap_or_else(|_| "https://gitlab.com".to_string());
+
+        let oidc_client_id = std::env::var("RTDB_OIDC_CLIENT_ID").ok();
+        let oidc_client_secret = std::env::var("RTDB_OIDC_CLIENT_SECRET").ok();
+        let oidc_authorize_url = std::env::var("RTDB_OIDC_AUTHORIZE_URL").ok();
+        let oidc_token_url = std::env::var("RTDB_OIDC_TOKEN_URL").ok();
+        let oidc_userinfo_url = std::env::var("RTDB_OIDC_USERINFO_URL").ok();
 
         let max_affected_docs = match std::env::var("RTDB_MAX_AFFECTED_DOCS") {
             Ok(v) => v.parse::<usize>().unwrap_or(100),
@@ -225,6 +241,11 @@ impl Config {
             gitlab_client_id,
             gitlab_client_secret,
             gitlab_base_url,
+            oidc_client_id,
+            oidc_client_secret,
+            oidc_authorize_url,
+            oidc_token_url,
+            oidc_userinfo_url,
             max_affected_docs,
             static_dir,
             pool_max_connections,

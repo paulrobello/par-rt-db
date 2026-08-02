@@ -22,7 +22,7 @@ export function Login() {
     }
   }
 
-  async function oauth(provider: "github" | "google" | "gitlab") {
+  async function oauth(provider: "github" | "google" | "gitlab" | "oidc") {
     setBusy(true);
     setLocalError(null);
     try {
@@ -69,6 +69,9 @@ export function Login() {
         </Button>
         <Button onClick={() => oauth("gitlab")} disabled={busy}>
           Sign in with GitLab
+        </Button>
+        <Button onClick={() => oauth("oidc")} disabled={busy}>
+          Sign in with OIDC
         </Button>
         {shownError && <p className={s.error}>{shownError}</p>}
         <p className={s.note}>
