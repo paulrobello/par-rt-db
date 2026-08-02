@@ -106,13 +106,16 @@ from .wire import (
     _AfterMs,
     _Cron,
     _FilterAnd,
+    _FilterContains,
     _FilterEq,
+    _FilterExists,
     _FilterGt,
     _FilterGte,
     _FilterIn,
     _FilterLt,
     _FilterLte,
     _FilterNeq,
+    _FilterNot,
     _FilterOr,
     _RunAt,
 )
@@ -2262,6 +2265,13 @@ def _validate_filter(expr: FilterExpr, fields: set[str]) -> None:
             | _FilterLte(field=fld, value=val)
         ):
             _check_leaf_value(fld, val, fields)
+        case _FilterNot(expr=inner):
+            _validate_filter(inner, fields)
+        case _FilterContains(field=fld, value=val):
+            _check_leaf_value(fld, val, fields)
+        case _FilterExists(field=fld):
+            if fld not in fields:
+                raise RtDbError(ErrorCode.BAD_REQUEST, f"filter references unknown field '{fld}'")
         case _:
             raise RtDbError(ErrorCode.INTERNAL, "unknown filter op")
 
@@ -2303,6 +2313,14 @@ def _eval_filter_expr(expr: FilterExpr, doc: dict[str, Any]) -> bool:
             | _FilterLte(field=fld, value=val)
         ):
             return _compare_leaf(expr.op, fld, val, doc)
+        case _FilterNot(expr=inner):
+            return not _eval_filter_expr(inner, doc)
+        case _FilterContains(field=fld, value=val):
+            arr = doc.get(fld)
+            want = json.dumps(val, sort_keys=True)
+            return isinstance(arr, list) and any(json.dumps(v, sort_keys=True) == want for v in arr)
+        case _FilterExists(field=fld):
+            return doc.get(fld) is not None
         case _:
             return False
 

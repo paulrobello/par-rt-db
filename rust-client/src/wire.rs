@@ -369,7 +369,9 @@ pub struct AggregateGroup {
 /// A db-side predicate appended to a query's WHERE clause. Mirrors
 /// `server/src/query.rs::FilterExpr` byte-for-byte: internally tagged by `op`
 /// (lowercase), `deny_unknown_fields`. Leaves compare one declared field to a
-/// value (`In` to a non-empty list); `And`/`Or` nest arbitrarily.
+/// value (`In` to a non-empty list); `And`/`Or` nest arbitrarily; `Not` wraps
+/// a nested expr; `Contains` tests membership of `value` in `doc.field[]`
+/// (reverse of `In`); `Exists` tests the field is present and non-null.
 ///
 /// Construct variants directly (`FilterExpr::Eq { field, value }`) — inherent
 /// constructors named `eq`/`gt`/`lt` are avoided because they shadow
@@ -410,6 +412,16 @@ pub enum FilterExpr {
     },
     Or {
         exprs: Vec<FilterExpr>,
+    },
+    Not {
+        expr: Box<FilterExpr>,
+    },
+    Contains {
+        field: String,
+        value: serde_json::Value,
+    },
+    Exists {
+        field: String,
     },
 }
 
@@ -1152,6 +1164,62 @@ mod tests {
         // Unknown op tag is rejected.
         assert!(
             serde_json::from_value::<FilterExpr>(json!({"op":"between","field":"x","value":1}))
+                .is_err()
+        );
+    }
+
+    // New variants mirroring server FilterExpr (Task 1, commit b6b6c2a):
+    // `not` / `contains` / `exists` — wire shapes must match the server byte-for-byte.
+    #[test]
+    fn filter_expr_not_contains_exists_variants() {
+        // `Not` wraps a nested FilterExpr (Box) — {"op":"not","expr":{...}}
+        let not = FilterExpr::Not {
+            expr: Box::new(FilterExpr::Eq {
+                field: "status".into(),
+                value: json!("done"),
+            }),
+        };
+        assert_eq!(
+            serde_json::to_value(&not).unwrap(),
+            json!({"op":"not","expr":{"op":"eq","field":"status","value":"done"}})
+        );
+        let back: FilterExpr = serde_json::from_value(serde_json::to_value(&not).unwrap()).unwrap();
+        assert!(matches!(back, FilterExpr::Not { .. }));
+
+        // `Contains`: value ∈ doc.field[] — {"op":"contains","field","value"}
+        let contains = FilterExpr::Contains {
+            field: "tags".into(),
+            value: json!("red"),
+        };
+        assert_eq!(
+            serde_json::to_value(&contains).unwrap(),
+            json!({"op":"contains","field":"tags","value":"red"})
+        );
+
+        // `Exists`: field present and non-null — {"op":"exists","field"}
+        let exists = FilterExpr::Exists {
+            field: "dueAt".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(&exists).unwrap(),
+            json!({"op":"exists","field":"dueAt"})
+        );
+
+        // deny_unknown_fields applies to the new variants too.
+        assert!(
+            serde_json::from_value::<FilterExpr>(
+                json!({"op":"not","expr":{"op":"eq","field":"x","value":1},"bogus":true})
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<FilterExpr>(
+                json!({"op":"contains","field":"x","value":1,"bogus":true})
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<FilterExpr>(json!({"op":"exists","field":"x","bogus":true}))
                 .is_err()
         );
     }

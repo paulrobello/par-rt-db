@@ -619,6 +619,17 @@ export function validateFilter(node: FilterExpr, fields: ReadonlySet<string>): v
       }
       return;
     }
+    case "not":
+      validateFilter(node.expr, fields);
+      return;
+    case "contains":
+      checkLeafValue(node.field, node.value, fields);
+      return;
+    case "exists":
+      if (!fields.has(node.field)) {
+        throw new RtDbError("BAD_REQUEST", `filter references unknown field '${node.field}'`);
+      }
+      return;
     default:
       checkLeafValue(node.field, node.value, fields);
   }
@@ -654,6 +665,17 @@ export function evalFilterExpr(node: FilterExpr, doc: Record<string, unknown>): 
       return node.exprs.some((e) => evalFilterExpr(e, doc));
     case "in":
       return node.values.some((v) => compareLeaf("eq", node.field, v, doc));
+    case "not":
+      return !evalFilterExpr(node.expr, doc);
+    case "contains": {
+      const arr = doc[node.field];
+      const want = JSON.stringify(node.value);
+      return Array.isArray(arr) && arr.some((v) => JSON.stringify(v) === want);
+    }
+    case "exists": {
+      const v = doc[node.field];
+      return v !== undefined && v !== null;
+    }
     default:
       return compareLeaf(node.op, node.field, node.value, doc);
   }

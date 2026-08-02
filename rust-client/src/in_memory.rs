@@ -3259,6 +3259,17 @@ pub fn validate_filter(expr: &FilterExpr, fields: &BTreeSet<String>) -> Result<(
         | FilterExpr::Gte { field, value }
         | FilterExpr::Lt { field, value }
         | FilterExpr::Lte { field, value } => check_leaf_value(field, value, fields),
+        FilterExpr::Not { expr } => validate_filter(expr, fields),
+        FilterExpr::Contains { field, value } => check_leaf_value(field, value, fields),
+        FilterExpr::Exists { field } => {
+            if !fields.contains(field) {
+                return Err(RtDbError::new(
+                    ErrorCode::BadRequest,
+                    format!("filter references unknown field '{field}'"),
+                ));
+            }
+            Ok(())
+        }
     }
 }
 
@@ -3314,6 +3325,12 @@ pub fn eval_filter_expr(expr: &FilterExpr, doc: &Value) -> bool {
         FilterExpr::Gte { field, value } => compare_leaf(FilterOp::Gte, field, value, doc),
         FilterExpr::Lt { field, value } => compare_leaf(FilterOp::Lt, field, value, doc),
         FilterExpr::Lte { field, value } => compare_leaf(FilterOp::Lte, field, value, doc),
+        FilterExpr::Not { expr } => !eval_filter_expr(expr, doc),
+        FilterExpr::Contains { field, value } => match doc.get(field) {
+            Some(Value::Array(arr)) => arr.iter().any(|v| v == value),
+            _ => false,
+        },
+        FilterExpr::Exists { field } => matches!(doc.get(field), Some(v) if !v.is_null()),
     }
 }
 

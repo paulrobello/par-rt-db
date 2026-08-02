@@ -248,6 +248,35 @@ describe("TableQuery.filter", () => {
       take: 10,
     });
   });
+
+  // New variants mirroring server FilterExpr (Task 1, commit b6b6c2a):
+  // `not` / `contains` / `exists` — wire shapes must match the server byte-for-byte.
+  it("builds a not filter wrapping a nested expr", () => {
+    const q = api.items
+      .query()
+      .filter({ op: "not", expr: { op: "eq", field: "status", value: "done" } })
+      .collect();
+    expect(q.json).toEqual({
+      table: "items",
+      filter: { op: "not", expr: { op: "eq", field: "status", value: "done" } },
+    });
+  });
+
+  it("builds a contains filter (value in doc.field[])", () => {
+    const q = api.items.query().filter({ op: "contains", field: "tags", value: "red" }).collect();
+    expect(q.json).toEqual({
+      table: "items",
+      filter: { op: "contains", field: "tags", value: "red" },
+    });
+  });
+
+  it("builds an exists filter (field present and non-null)", () => {
+    const q = api.items.query().filter({ op: "exists", field: "dueAt" }).collect();
+    expect(q.json).toEqual({
+      table: "items",
+      filter: { op: "exists", field: "dueAt" },
+    });
+  });
 });
 
 describe("TableQuery.search", () => {

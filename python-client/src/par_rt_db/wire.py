@@ -6,7 +6,7 @@ Discriminator unions:
 
 * ``ScheduleWhen`` is tagged by ``type`` (camelCase variants: ``afterMs``/``runAt``/``cron``).
 * ``FilterExpr`` is tagged by ``op`` (lowercase variants: ``eq``/``neq``/``gt``/``gte``/
-  ``lt``/``lte``/``in``/``and``/``or``).
+  ``lt``/``lte``/``in``/``and``/``or``/``not``/``contains``/``exists``).
 
 Message and Schema families (``ClientMessage``/``ServerMessage``) are appended in
 later tasks; the leaf types below are placed so that append is clean.
@@ -165,6 +165,20 @@ class _FilterOr(_Camel):
     exprs: list[FilterExpr]
 
 
+class _FilterNot(_Camel):
+    op: Literal["not"] = "not"
+    expr: FilterExpr
+
+
+class _FilterContains(_FilterLeaf):
+    op: Literal["contains"] = "contains"
+    value: Any
+
+
+class _FilterExists(_FilterLeaf):
+    op: Literal["exists"] = "exists"
+
+
 FilterExpr = Annotated[
     (
         _FilterEq
@@ -176,6 +190,9 @@ FilterExpr = Annotated[
         | _FilterIn
         | _FilterAnd
         | _FilterOr
+        | _FilterNot
+        | _FilterContains
+        | _FilterExists
     ),
     Field(discriminator="op"),
 ]

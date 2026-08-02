@@ -34,7 +34,10 @@ export interface Paginate {
 /**
  * Mirrors server `query::FilterExpr` byte-for-byte: internally tagged by `op`
  * (lowercase variant names), `deny_unknown_fields`. Leaves compare one declared
- * field to a value (`in` to a non-empty list); `and`/`or` nest arbitrarily.
+ * field to a value (`in` to a non-empty list); `and`/`or` nest arbitrarily;
+ * `not` wraps a nested expr; `contains` tests membership of `value` in
+ * `doc.field[]` (reverse of `in`); `exists` tests the field is present and
+ * non-null.
  */
 export type FilterExpr =
   | { op: "eq"; field: string; value: unknown }
@@ -45,7 +48,10 @@ export type FilterExpr =
   | { op: "lte"; field: string; value: unknown }
   | { op: "in"; field: string; values: unknown[] }
   | { op: "and"; exprs: FilterExpr[] }
-  | { op: "or"; exprs: FilterExpr[] };
+  | { op: "or"; exprs: FilterExpr[] }
+  | { op: "not"; expr: FilterExpr }
+  | { op: "contains"; field: string; value: unknown }
+  | { op: "exists"; field: string };
 
 /** Mirrors server `query::SearchQuery` byte-for-byte (camelCase, deny_unknown_fields). */
 export interface SearchQuery {

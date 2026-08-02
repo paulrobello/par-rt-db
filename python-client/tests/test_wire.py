@@ -118,6 +118,49 @@ def test_filter_expr_leaves_and_combinators() -> None:
     assert dumped["exprs"][1] == {"op": "or", "exprs": []}
 
 
+def test_filter_expr_not_contains_exists_variants() -> None:
+    """New variants mirroring server FilterExpr (Task 1, commit b6b6c2a).
+
+    Wire shapes must match byte-for-byte: ``{"op":"not","expr":{...}}``,
+    ``{"op":"contains","field","value"}``, ``{"op":"exists","field"}``.
+    """
+    adapter = TypeAdapter(FilterExpr)
+
+    # `not` wraps a nested FilterExpr.
+    not_expr = adapter.validate_python(
+        {"op": "not", "expr": {"op": "eq", "field": "status", "value": "done"}}
+    )
+    assert not_expr.model_dump(by_alias=True, mode="json") == {
+        "op": "not",
+        "expr": {"op": "eq", "field": "status", "value": "done"},
+    }
+
+    # `contains`: value ∈ doc.field[] (reverse of `in`).
+    contains = adapter.validate_python({"op": "contains", "field": "tags", "value": "red"})
+    assert contains.model_dump(by_alias=True, mode="json") == {
+        "op": "contains",
+        "field": "tags",
+        "value": "red",
+    }
+
+    # `exists`: field present and non-null.
+    exists = adapter.validate_python({"op": "exists", "field": "dueAt"})
+    assert exists.model_dump(by_alias=True, mode="json") == {
+        "op": "exists",
+        "field": "dueAt",
+    }
+
+    # Unknown fields are rejected (mirrors Rust deny_unknown_fields).
+    with pytest.raises(ValidationError):
+        adapter.validate_python(
+            {"op": "not", "expr": {"op": "eq", "field": "x", "value": 1}, "bogus": True}
+        )
+    with pytest.raises(ValidationError):
+        adapter.validate_python({"op": "contains", "field": "x", "value": 1, "bogus": True})
+    with pytest.raises(ValidationError):
+        adapter.validate_python({"op": "exists", "field": "x", "bogus": True})
+
+
 def test_search_query_shape() -> None:
     sq = SearchQuery.model_validate({"index": "idx", "query": "hello"})
     assert sq.model_dump(by_alias=True, mode="json") == {"index": "idx", "query": "hello"}
