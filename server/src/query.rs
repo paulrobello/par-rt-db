@@ -231,6 +231,16 @@ pub enum FilterExpr {
     Or {
         exprs: Vec<FilterExpr>,
     },
+    Not {
+        expr: Box<FilterExpr>,
+    },
+    Contains {
+        field: String,
+        value: serde_json::Value,
+    },
+    Exists {
+        field: String,
+    },
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -1526,6 +1536,20 @@ fn compile_filter_node(
             }
             Ok(format!("{lhs} IN ({})", placeholders.join(", ")))
         }
+        FilterExpr::Not { expr } => Ok(format!(
+            "NOT ({})",
+            compile_filter_node(expr, table, start_pos, binds)?
+        )),
+        FilterExpr::Contains { field, value } => {
+            let lhs = jsonb_field_lhs(field, table)?;
+            let (_, bind) = field_lhs_and_bind(field, value, table)?;
+            let ph = push_filter_bind(start_pos, binds, bind);
+            Ok(format!("{lhs} ? {ph}"))
+        }
+        FilterExpr::Exists { field } => {
+            jsonb_field_lhs(field, table)?;
+            Ok(format!("(doc ? '{field}' AND doc->>'{field}' IS NOT NULL)"))
+        }
     }
 }
 
@@ -1619,6 +1643,19 @@ fn render_filter_literal_node(node: &FilterExpr, table: &TableDef) -> Result<Str
             }
             Ok(format!("{lhs} IN ({})", lits.join(", ")))
         }
+        FilterExpr::Not { expr } => Ok(format!(
+            "NOT ({})",
+            render_filter_literal_node(expr, table)?
+        )),
+        FilterExpr::Contains { field, value } => {
+            let lhs = jsonb_field_lhs(field, table)?;
+            let (_, bind) = field_lhs_and_bind(field, value, table)?;
+            Ok(format!("{lhs} ? {}", render_literal(&bind)))
+        }
+        FilterExpr::Exists { field } => {
+            jsonb_field_lhs(field, table)?;
+            Ok(format!("(doc ? '{field}' AND doc->>'{field}' IS NOT NULL)"))
+        }
     }
 }
 
@@ -1634,6 +1671,21 @@ fn compile_comparison(
     let (lhs, bind) = field_lhs_and_bind(field, value, table)?;
     let placeholder = push_filter_bind(start_pos, binds, bind);
     Ok(format!("{lhs} {op} {placeholder}"))
+}
+
+/// Resolves a filter field to its jsonb-extraction LHS `(doc->'<field>')` after
+/// the same unknown-field check `field_lhs_and_bind` performs. Used by
+/// `Contains`/`Exists`, which need the raw jsonb value (for the `?` membership
+/// operator and key presence) rather than the text extraction (`doc->>'field'`)
+/// that `jsonb_lhs_and_bind` produces for scalar comparisons. The field name is
+/// schema-validated, so it is safe inside the jsonb string literal.
+fn jsonb_field_lhs(field: &str, table: &TableDef) -> Result<String, RtDbError> {
+    if !table.fields.contains_key(field) {
+        return Err(RtDbError::bad_request(format!(
+            "filter references unknown field '{field}'"
+        )));
+    }
+    Ok(format!("(doc->'{field}')"))
 }
 
 /// Resolves a filter field to its SQL left-hand side and types the comparison
@@ -2247,7 +2299,7 @@ pub fn canonical(result: &QueryResult) -> String {
 mod tests {
     use std::collections::BTreeMap;
 
-    use super::{FilterExpr, compile_filter_literal};
+    use super::{FilterExpr, compile_filter, compile_filter_literal};
     use crate::schema::{FieldType, IndexDef, TableDef};
 
     /// Builds a one-field `TableDef` whose single field is indexed, so
@@ -2267,6 +2319,22 @@ mod tests {
                 unique: false,
                 r#where: None,
             }],
+            owner_field: None,
+            collaborators_field: None,
+            ttl: None,
+        }
+    }
+
+    /// Builds a `TableDef` with the named `String` fields and no indexes, so
+    /// filter compilation takes the jsonb-extraction path (`doc->>'field'`).
+    fn test_table_with_fields(fields: &[&str]) -> TableDef {
+        let mut fields_map = BTreeMap::new();
+        for field in fields {
+            fields_map.insert(field.to_string(), FieldType::String);
+        }
+        TableDef {
+            fields: fields_map,
+            indexes: vec![],
             owner_field: None,
             collaborators_field: None,
             ttl: None,
@@ -2294,5 +2362,48 @@ mod tests {
         };
         let sql = compile_filter_literal(&pred, &table).unwrap();
         assert_eq!(sql, "\"f_name\" = 'O''Brien'");
+    }
+
+    #[test]
+    fn compile_not_contains_exists() {
+        let table = test_table_with_fields(&["owner", "editors", "archivedat"]);
+        // Not
+        let (sql, binds) = compile_filter(
+            &FilterExpr::Not {
+                expr: Box::new(FilterExpr::Eq {
+                    field: "owner".into(),
+                    value: serde_json::json!("a"),
+                }),
+            },
+            &table,
+            1,
+        )
+        .unwrap();
+        assert_eq!(sql, "NOT ((doc->>'owner') = $1)");
+        assert_eq!(binds.len(), 1);
+        // Contains: value in doc.editors[] -> jsonb membership
+        let (sql, _) = compile_filter(
+            &FilterExpr::Contains {
+                field: "editors".into(),
+                value: serde_json::json!("a"),
+            },
+            &table,
+            1,
+        )
+        .unwrap();
+        assert_eq!(sql, "(doc->'editors') ? $1");
+        // Exists: field present and non-null
+        let (sql, _) = compile_filter(
+            &FilterExpr::Exists {
+                field: "archivedat".into(),
+            },
+            &table,
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            sql,
+            "(doc ? 'archivedat' AND doc->>'archivedat' IS NOT NULL)"
+        );
     }
 }
