@@ -8,7 +8,7 @@ use crate::db::validate_db_name;
 use crate::ddl::{pg_col, pg_schema, pg_search_col, pg_table, pg_vector_col};
 use crate::error::RtDbError;
 use crate::pagination::{decode_cursor, encode_cursor};
-use crate::schema::{FieldType, IndexDef, SchemaDef, TableDef};
+use crate::schema::{FieldType, IndexDef, SchemaDef, TableDef, validate_filter_expr_fields};
 use crate::txn::{EqBind, eq_bind_for, eq_binds, row_visible_to};
 
 /// Hard cap on rows returned by a single query, whether via an explicit
@@ -689,6 +689,17 @@ pub async fn execute_query(
     let owner_field = table_def.owner_field.as_deref();
     let collaborators_field = table_def.collaborators_field.as_deref();
 
+    // Principal markers (`{"$user":true}` / `{"$email":true}`) are valid only in
+    // a server-declared `authorize` predicate; a client-supplied `.filter()` is
+    // schema-validated at push time but a marker could still arrive over the
+    // wire, so reject it here at the query boundary (WS `Subscribe` + HTTP
+    // `/api/query`) before compilation. Field references are re-validated too;
+    // any failure surfaces as `BadRequest` (a malformed client query).
+    if let Some(filter) = &q.filter {
+        validate_filter_expr_fields(filter, table_def, false)
+            .map_err(|e| RtDbError::bad_request(e.message))?;
+    }
+
     if let Some(id) = &q.get {
         reject_if_any_set(q, GET_PEERS, GET_MESSAGE)?;
         return point_read(
@@ -755,7 +766,7 @@ pub async fn execute_query(
             vs,
             owner_field,
             collaborators_field,
-            owner,
+            ctx,
         )
         .await;
     }
@@ -774,7 +785,7 @@ pub async fn execute_query(
             hs,
             owner_field,
             collaborators_field,
-            owner,
+            ctx,
         )
         .await;
     }
@@ -793,7 +804,7 @@ pub async fn execute_query(
             q.take,
             owner_field,
             collaborators_field,
-            owner,
+            ctx,
         )
         .await;
     }
@@ -876,10 +887,15 @@ pub async fn execute_query(
     } else {
         q.filter.as_ref().cloned()
     };
+    // Absolute 1-based position of the first client-filter bind; shared by the
+    // client filter, the owner/collab uid bind, and the `authorize` predicate
+    // fragment below. Each appends to `filter_binds`, so `start_pos +
+    // binds.len()` (via `compile_filter_node` / `push_filter_bind`) keeps every
+    // placeholder correctly numbered.
+    let filter_start = eq_len + range_binds.len() + 1;
     let mut filter_binds: Vec<EqBind> = match &effective_filter {
         Some(filter) => {
-            let (fragment, binds) =
-                compile_filter(filter, table_def, eq_len + range_binds.len() + 1)?;
+            let (fragment, binds) = compile_filter(filter, table_def, filter_start)?;
             where_conditions.push(fragment);
             binds
         }
@@ -890,7 +906,7 @@ pub async fn execute_query(
     // and reused on both sides of the OR. Same single-bind shape as owner-only.
     let row_auth_uid = row_auth_enforced_uid(owner_field, collaborators_field, owner);
     if let Some(uid) = row_auth_uid {
-        let ph = eq_len + range_binds.len() + filter_binds.len() + 1;
+        let ph = filter_start + filter_binds.len();
         where_conditions.push(row_auth_predicate_body(
             owner_field,
             collaborators_field,
@@ -898,7 +914,15 @@ pub async fn execute_query(
         ));
         filter_binds.push(EqBind::Text(uid.to_string()));
     }
-    let limit_placeholder = eq_len + range_binds.len() + filter_binds.len() + 1;
+    // `authorize` predicate (model C): when the table declares `authorize` and
+    // the caller is a user, AND the resolved predicate into the scan. Composes
+    // with owner/collab above (both must pass) — a table may declare both.
+    // Bypass callers (`user_id = None`) and tables without `authorize` get no
+    // fragment. Shares `filter_binds` so placeholders stay correctly numbered.
+    if let Some(frag) = authorize_predicate_body(table_def, ctx, filter_start, &mut filter_binds)? {
+        where_conditions.push(frag);
+    }
+    let limit_placeholder = filter_start + filter_binds.len();
 
     if q.count {
         let pg_schema_name = pg_schema(db);
@@ -1866,13 +1890,14 @@ async fn execute_search(
     take: Option<u32>,
     owner_field: Option<&str>,
     collaborators_field: Option<&str>,
-    owner: Option<&str>,
+    ctx: &PrincipalCtx,
 ) -> Result<QueryResult, RtDbError> {
     if search.query.trim().is_empty() {
         return Err(RtDbError::bad_request(
             "search query text must not be empty",
         ));
     }
+    let owner = ctx.user_id.as_deref();
     let index_def = table_def
         .indexes
         .iter()
@@ -1885,33 +1910,48 @@ async fn execute_search(
     let pg_schema_name = pg_schema(db);
     let table_ident = pg_table(table_name);
 
-    // Per-row auth predicate: when the caller is a user and the table declares
-    // `ownerField` and/or `collaboratorsField`, restrict to rows the caller
-    // owns OR appears in as a collaborator. The schema-validated identifiers
-    // are interpolated; the uid is `$2`-bound once and reused on both sides of
-    // the OR. Owner-only emits the single-predicate form byte-identical to the
-    // pre-collaborators SQL. The uid bind occupies `$2`, pushing `LIMIT` to $3.
+    // Per-row auth: `$1` is the search query text. The owner/collaborator uid
+    // bind (when enforced) and the `authorize` predicate's binds (when declared
+    // + user caller) follow in one shared accumulator so `compile_filter_node`'s
+    // `start_pos + binds.len()` placeholders stay correctly numbered; `LIMIT`
+    // occupies the next free slot after them. Schema-validated identifiers are
+    // interpolated; the uid is `$n`-bound once and reused on both sides of the
+    // OR. Owner-only emits the single-predicate form byte-identical to the
+    // pre-collaborators SQL.
     let enforced_uid = row_auth_enforced_uid(owner_field, collaborators_field, owner);
-    let (limit_ph, owner_clause) = match enforced_uid {
-        Some(_) => (
-            3,
-            format!(
-                " AND {}",
-                row_auth_predicate_body(owner_field, collaborators_field, 2)
-            ),
-        ),
-        None => (2, String::new()),
-    };
+    let mut auth_binds: Vec<EqBind> = Vec::new();
+    let mut auth_clause = String::new();
+    let auth_start = 2usize;
+    if let Some(uid) = enforced_uid {
+        let ph = auth_start + auth_binds.len();
+        auth_clause.push_str(" AND ");
+        auth_clause.push_str(&row_auth_predicate_body(
+            owner_field,
+            collaborators_field,
+            ph,
+        ));
+        auth_binds.push(EqBind::Text(uid.to_string()));
+    }
+    if let Some(frag) = authorize_predicate_body(table_def, ctx, auth_start, &mut auth_binds)? {
+        auth_clause.push_str(" AND ");
+        auth_clause.push_str(&frag);
+    }
+    let limit_ph = auth_start + auth_binds.len();
     let sql = format!(
         "SELECT \"id\", \"doc\", \"created_at\", \"version\" FROM \"{pg_schema_name}\".\"{table_ident}\" \
-         WHERE \"{sv_col}\" @@ plainto_tsquery($1){owner_clause} \
+         WHERE \"{sv_col}\" @@ plainto_tsquery($1){auth_clause} \
          ORDER BY ts_rank(\"{sv_col}\", plainto_tsquery($1)) DESC, \"created_at\" DESC, \"id\" DESC \
          LIMIT ${limit_ph}"
     );
     let mut query =
         sqlx::query_as::<_, (String, serde_json::Value, i64, i64)>(&sql).bind(&search.query);
-    if let Some(uid) = enforced_uid {
-        query = query.bind(uid);
+    for bind in &auth_binds {
+        query = match bind {
+            EqBind::Text(v) => query.bind(v),
+            EqBind::Num(v) => query.bind(v),
+            EqBind::Bool(v) => query.bind(v),
+            EqBind::I64(v) => query.bind(v),
+        };
     }
     let rows = query.bind(i64::from(limit)).fetch_all(pool).await?;
     let docs = rows
@@ -1937,7 +1977,7 @@ async fn execute_vector_search(
     vs: &VectorSearchQuery,
     owner_field: Option<&str>,
     collaborators_field: Option<&str>,
-    owner: Option<&str>,
+    ctx: &PrincipalCtx,
 ) -> Result<QueryResult, RtDbError> {
     let index_def = table_def
         .indexes
@@ -2007,7 +2047,8 @@ async fn execute_vector_search(
     );
 
     // Bind numbering: filter eq-binds first ($1..$k), then the per-row auth
-    // uid ($k+1) when owner/collaborators-enforced, then the query vector
+    // uid ($k+1) when owner/collaborators-enforced, then the `authorize`
+    // predicate's binds (when declared + user caller), then the query vector
     // (cast to `vector`), then `limit`. The WHERE clause always excludes rows
     // whose vector column is NULL, so undimensioned rows never surface as
     // bogus nearest-neighbors. The per-row auth predicate (`doc->>'<field>'`
@@ -2015,23 +2056,34 @@ async fn execute_vector_search(
     // field names are `is_valid_identifier`-validated at schema push, so they
     // are safe to interpolate into jsonb string-literal positions; the uid is
     // `$n`-bound once, never interpolated.
+    let owner = ctx.user_id.as_deref();
     let enforced_uid = row_auth_enforced_uid(owner_field, collaborators_field, owner);
-    let mut bind_idx = 1usize;
-    let mut filter_placeholders: Vec<String> = Vec::with_capacity(filter_cols.len());
-    for _ in &filter_cols {
-        filter_placeholders.push(format!("${bind_idx}"));
-        bind_idx += 1;
+    let filter_count = filter_cols.len();
+    let filter_placeholders: Vec<String> = (1..=filter_count)
+        .map(|i| format!("${i}"))
+        .collect::<Vec<_>>();
+    // Owner/collaborator uid and `authorize` binds share one accumulator
+    // numbered from `auth_start` (= first post-filter position); `compile_filter_node`'s
+    // `start_pos + binds.len()` rule keeps placeholders correct as each is appended.
+    let mut auth_binds: Vec<EqBind> = Vec::new();
+    let mut auth_clause = String::new();
+    let auth_start = filter_count + 1;
+    if let Some(uid) = enforced_uid {
+        let ph = auth_start + auth_binds.len();
+        auth_clause.push_str(" AND ");
+        auth_clause.push_str(&row_auth_predicate_body(
+            owner_field,
+            collaborators_field,
+            ph,
+        ));
+        auth_binds.push(EqBind::Text(uid.to_string()));
     }
-    let owner_ph: Option<usize> = if enforced_uid.is_some() {
-        let ph = bind_idx;
-        bind_idx += 1;
-        Some(ph)
-    } else {
-        None
-    };
-    let qvec_ph = bind_idx;
-    bind_idx += 1;
-    let limit_ph = bind_idx;
+    if let Some(frag) = authorize_predicate_body(table_def, ctx, auth_start, &mut auth_binds)? {
+        auth_clause.push_str(" AND ");
+        auth_clause.push_str(&frag);
+    }
+    let qvec_ph = auth_start + auth_binds.len();
+    let limit_ph = qvec_ph + 1;
 
     let mut where_clause = format!("\"{v_col}\" IS NOT NULL");
     if !filter_cols.is_empty() {
@@ -2042,14 +2094,7 @@ async fn execute_vector_search(
             .collect();
         where_clause = format!("{where_clause} AND {}", conds.join(" AND "));
     }
-    if let Some(ph) = owner_ph {
-        where_clause.push_str(" AND ");
-        where_clause.push_str(&row_auth_predicate_body(
-            owner_field,
-            collaborators_field,
-            ph,
-        ));
-    }
+    where_clause.push_str(&auth_clause);
 
     let sql = format!(
         "SELECT \"id\", \"doc\", \"created_at\", \"version\" FROM \"{pg_schema_name}\".\"{table_ident}\" \
@@ -2067,8 +2112,13 @@ async fn execute_vector_search(
             EqBind::I64(v) => query.bind(v),
         };
     }
-    if let Some(uid) = enforced_uid {
-        query = query.bind(uid);
+    for bind in auth_binds {
+        query = match bind {
+            EqBind::Text(v) => query.bind(v),
+            EqBind::Num(v) => query.bind(v),
+            EqBind::Bool(v) => query.bind(v),
+            EqBind::I64(v) => query.bind(v),
+        };
     }
     let rows = query
         .bind(qvec_text)
@@ -2103,7 +2153,7 @@ async fn execute_hybrid_search(
     hs: &HybridSearchQuery,
     owner_field: Option<&str>,
     collaborators_field: Option<&str>,
-    owner: Option<&str>,
+    ctx: &PrincipalCtx,
 ) -> Result<QueryResult, RtDbError> {
     if hs.query.trim().is_empty() {
         return Err(RtDbError::bad_request(
@@ -2190,34 +2240,37 @@ async fn execute_hybrid_search(
     );
 
     // Bind numbering: text query ($1, referenced in WHERE and ts_rank), the
-    // per-row auth uid ($2) when owner/collaborators-enforced, then the query
-    // vector (cast to `vector`), the RRF constant `k`, and `limit`. The per-row
-    // auth predicate interpolates only the schema-validated `ownerField` /
+    // per-row auth uid ($2) when owner/collaborators-enforced, the `authorize`
+    // predicate's binds (when declared + user caller), then the query vector
+    // (cast to `vector`), the RRF constant `k`, and `limit`. The per-row auth
+    // predicate interpolates only the schema-validated `ownerField` /
     // `collaboratorsField` into jsonb string-literal positions; the uid is
-    // `$n`-bound once.
+    // `$n`-bound once. Owner uid and `authorize` binds share one accumulator
+    // numbered from `auth_start` so `compile_filter_node`'s `start_pos +
+    // binds.len()` rule keeps placeholders correct.
+    let owner = ctx.user_id.as_deref();
     let enforced_uid = row_auth_enforced_uid(owner_field, collaborators_field, owner);
     let text_ph = 1usize;
-    let mut bind_idx = 2usize;
-    let owner_ph: Option<usize> = if enforced_uid.is_some() {
-        let ph = bind_idx;
-        bind_idx += 1;
-        Some(ph)
-    } else {
-        None
-    };
-    let qvec_ph = bind_idx;
-    bind_idx += 1;
-    let k_ph = bind_idx;
-    bind_idx += 1;
-    let limit_ph = bind_idx;
-
-    let owner_clause = match owner_ph {
-        Some(ph) => format!(
-            " AND {}",
-            row_auth_predicate_body(owner_field, collaborators_field, ph)
-        ),
-        None => String::new(),
-    };
+    let mut auth_binds: Vec<EqBind> = Vec::new();
+    let mut auth_clause = String::new();
+    let auth_start = 2usize;
+    if let Some(uid) = enforced_uid {
+        let ph = auth_start + auth_binds.len();
+        auth_clause.push_str(" AND ");
+        auth_clause.push_str(&row_auth_predicate_body(
+            owner_field,
+            collaborators_field,
+            ph,
+        ));
+        auth_binds.push(EqBind::Text(uid.to_string()));
+    }
+    if let Some(frag) = authorize_predicate_body(table_def, ctx, auth_start, &mut auth_binds)? {
+        auth_clause.push_str(" AND ");
+        auth_clause.push_str(&frag);
+    }
+    let qvec_ph = auth_start + auth_binds.len();
+    let k_ph = qvec_ph + 1;
+    let limit_ph = k_ph + 1;
 
     // RRF over the union of text matches and vector-bearing rows. Rows that
     // don't match the text get ts_rank = 0 (ranked last on the text axis); rows
@@ -2230,7 +2283,7 @@ async fn execute_hybrid_search(
                   ts_rank(\"{sv_col}\", plainto_tsquery(${text_ph})) AS trank, \
                   (\"{v_col}\" <=> ${qvec_ph}::vector) AS dist \
            FROM \"{pg_schema_name}\".\"{table_ident}\" \
-           WHERE (\"{sv_col}\" @@ plainto_tsquery(${text_ph}) OR \"{v_col}\" IS NOT NULL){owner_clause} \
+           WHERE (\"{sv_col}\" @@ plainto_tsquery(${text_ph}) OR \"{v_col}\" IS NOT NULL){auth_clause} \
          ), ranked AS ( \
            SELECT \"id\", \"doc\", \"created_at\", \"version\", \
                   ROW_NUMBER() OVER (ORDER BY trank DESC, \"created_at\" DESC, \"id\" DESC) AS r_text, \
@@ -2244,8 +2297,13 @@ async fn execute_hybrid_search(
 
     let mut query =
         sqlx::query_as::<_, (String, serde_json::Value, i64, i64)>(&sql).bind(&hs.query);
-    if let Some(uid) = enforced_uid {
-        query = query.bind(uid);
+    for bind in auth_binds {
+        query = match bind {
+            EqBind::Text(v) => query.bind(v),
+            EqBind::Num(v) => query.bind(v),
+            EqBind::Bool(v) => query.bind(v),
+            EqBind::I64(v) => query.bind(v),
+        };
     }
     let rows = query
         .bind(qvec_text)
@@ -2366,6 +2424,98 @@ fn row_auth_predicate_body(
         // well-formed no-op if a future caller bypasses the gate.
         (None, None) => "(TRUE)".to_string(),
     }
+}
+
+/// Clones `expr`, resolving principal markers (`{"$user":true}` → the caller's
+/// uid, `{"$email":true}` → the caller's email) at every value position via
+/// `resolve_value`. Turns a server-declared `authorize` predicate into a
+/// concrete `FilterExpr` whose markers are replaced by bound literals, so
+/// `compile_filter` can `$n`-bind them like any other value. A marker whose
+/// principal field is `None` resolves to `Null` — the safe no-match
+/// over-approximation (a predicate can never match erroneously on a missing
+/// identity; it simply fails to match).
+fn resolve_predicate_markers(expr: &FilterExpr, ctx: &PrincipalCtx) -> FilterExpr {
+    match expr {
+        FilterExpr::Eq { field, value } => FilterExpr::Eq {
+            field: field.clone(),
+            value: resolve_value(value, ctx),
+        },
+        FilterExpr::Neq { field, value } => FilterExpr::Neq {
+            field: field.clone(),
+            value: resolve_value(value, ctx),
+        },
+        FilterExpr::Gt { field, value } => FilterExpr::Gt {
+            field: field.clone(),
+            value: resolve_value(value, ctx),
+        },
+        FilterExpr::Gte { field, value } => FilterExpr::Gte {
+            field: field.clone(),
+            value: resolve_value(value, ctx),
+        },
+        FilterExpr::Lt { field, value } => FilterExpr::Lt {
+            field: field.clone(),
+            value: resolve_value(value, ctx),
+        },
+        FilterExpr::Lte { field, value } => FilterExpr::Lte {
+            field: field.clone(),
+            value: resolve_value(value, ctx),
+        },
+        FilterExpr::In { field, values } => FilterExpr::In {
+            field: field.clone(),
+            values: values.iter().map(|v| resolve_value(v, ctx)).collect(),
+        },
+        FilterExpr::Contains { field, value } => FilterExpr::Contains {
+            field: field.clone(),
+            value: resolve_value(value, ctx),
+        },
+        FilterExpr::Exists { field } => FilterExpr::Exists {
+            field: field.clone(),
+        },
+        FilterExpr::And { exprs } => FilterExpr::And {
+            exprs: exprs
+                .iter()
+                .map(|e| resolve_predicate_markers(e, ctx))
+                .collect(),
+        },
+        FilterExpr::Or { exprs } => FilterExpr::Or {
+            exprs: exprs
+                .iter()
+                .map(|e| resolve_predicate_markers(e, ctx))
+                .collect(),
+        },
+        FilterExpr::Not { expr } => FilterExpr::Not {
+            expr: Box::new(resolve_predicate_markers(expr, ctx)),
+        },
+    }
+}
+
+/// Compiles `table.authorize` into a SQL fragment (no leading `AND`) suitable
+/// for appending to `where_conditions`. Returns `Some(fragment)` only when the
+/// table declares an `authorize` predicate AND the caller is a user
+/// (`ctx.user_id.is_some()`): principal markers are resolved against `ctx` and
+/// the predicate compiled with the same `$n`-bind discipline as a client
+/// filter. Returns `None` for bypass callers (`Machine`/admin/scheduled,
+/// `user_id = None`) and tables without `authorize` — those paths enforce
+/// nothing (the db-level gate still ran first). Appends the fragment's typed
+/// binds to `binds`; `start_pos` is the absolute 1-based position of the
+/// fragment's first bind, and `compile_filter_node`'s `start_pos + binds.len()`
+/// rule numbers each placeholder, so the caller must pass the SAME shared bind
+/// accumulator it uses for the preceding predicates.
+fn authorize_predicate_body(
+    table: &TableDef,
+    ctx: &PrincipalCtx,
+    start_pos: usize,
+    binds: &mut Vec<EqBind>,
+) -> Result<Option<String>, RtDbError> {
+    let Some(expr) = &table.authorize else {
+        return Ok(None);
+    };
+    if ctx.user_id.is_none() {
+        return Ok(None);
+    }
+    let resolved = resolve_predicate_markers(expr, ctx);
+    let fragment = compile_filter_node(&resolved, table, start_pos, binds)?;
+    Ok(Some(fragment))
 }
 
 /// Whether an indexed field's declared type is numeric (the only numeric

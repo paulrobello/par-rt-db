@@ -2263,3 +2263,270 @@ async fn collab_or_predicate_composes_with_client_filter() -> anyhow::Result<()>
     assert!(got.is_empty());
     Ok(())
 }
+
+// ============================================================================
+// Task 6: `authorize` predicate enforcement on the read scan path.
+// ============================================================================
+
+/// Schema with a `posts` table declaring `authorize: Or[Eq{owner,$user},
+/// Eq{visibility,"public"}]` — a row is visible to a user when they own it OR
+/// it is public. No `ownerField`/`collaboratorsField`, so owner/collab
+/// enforcement is inert; the `authorize` predicate is the sole gate.
+fn authorize_schema() -> SchemaDef {
+    use rtdb_server::query::FilterExpr;
+    let mut posts_fields = BTreeMap::new();
+    posts_fields.insert("body".to_string(), FieldType::String);
+    posts_fields.insert("owner".to_string(), FieldType::String);
+    posts_fields.insert("visibility".to_string(), FieldType::String);
+    let authorize = Some(FilterExpr::Or {
+        exprs: vec![
+            FilterExpr::Eq {
+                field: "owner".into(),
+                value: json!({"$user": true}),
+            },
+            FilterExpr::Eq {
+                field: "visibility".into(),
+                value: json!("public"),
+            },
+        ],
+    });
+    let mut tables = BTreeMap::new();
+    tables.insert(
+        "posts".to_string(),
+        TableDef {
+            fields: posts_fields,
+            indexes: vec![],
+            owner_field: None,
+            collaborators_field: None,
+            ttl: None,
+            authorize,
+        },
+    );
+    SchemaDef { tables }
+}
+
+/// Creates a fresh uniquely-named database and pushes the authorize schema.
+async fn setup_authorize() -> (sqlx::PgPool, String, SchemaDef) {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = format!("t{}", uuid::Uuid::now_v7().simple());
+    rtdb_server::db::create_database(&pool, &db).await.unwrap();
+    let schema = authorize_schema();
+    push_schema(&pool, &db, schema.clone()).await.unwrap();
+    (pool, db, schema)
+}
+
+/// Inserts a `posts` row with the given owner/visibility; returns its doc id.
+async fn seed_post(
+    pool: &PgPool,
+    db: &str,
+    schema: &SchemaDef,
+    body: &str,
+    owner: &str,
+    visibility: &str,
+) -> String {
+    let mut doc = serde_json::Map::new();
+    doc.insert("body".into(), body.into());
+    doc.insert("owner".into(), owner.into());
+    doc.insert("visibility".into(), visibility.into());
+    let outcome = execute_txn(
+        pool,
+        db,
+        schema,
+        &Transaction {
+            steps: vec![Step::Insert {
+                table: "posts".into(),
+                doc,
+            }],
+        },
+        &PrincipalCtx::bypass(),
+    )
+    .await
+    .expect("seed post insert");
+    outcome.results[0]["id"]
+        .as_str()
+        .expect("id string")
+        .to_string()
+}
+
+/// A `posts` query with every field spelled out (mirrors `notes_query`).
+fn posts_query() -> Query {
+    Query {
+        table: "posts".to_string(),
+        get: None,
+        index: None,
+        eq: vec![],
+        gt: None,
+        gte: None,
+        lt: None,
+        lte: None,
+        order: None,
+        take: None,
+        unique: false,
+        first: false,
+        count: false,
+        distinct: false,
+        paginate: None,
+        filter: None,
+        search: None,
+        vector_search: None,
+        hybrid_search: None,
+        aggregate: None,
+    }
+}
+
+/// Collects the `body` of each doc in a `QueryResult::Docs`.
+fn bodies(res: QueryResult) -> Vec<String> {
+    match res {
+        QueryResult::Docs(docs) => docs
+            .into_iter()
+            .map(|d| d["body"].as_str().expect("body").to_string())
+            .collect(),
+        other => panic!("expected Docs, got {other:?}"),
+    }
+}
+
+// (T6-1) A user querying an `authorize`-gated table sees their own rows (any
+// visibility) PLUS every public row (regardless of owner), and never sees
+// another user's private rows. Seed the four ownership/visibility combinations
+// and assert user A sees exactly {A-private, A-public, B-public}.
+#[tokio::test]
+async fn authorize_user_sees_own_and_public_not_others_private() -> anyhow::Result<()> {
+    let (pool, db, schema) = setup_authorize().await;
+    seed_post(&pool, &db, &schema, "a-priv", "alice", "private").await;
+    seed_post(&pool, &db, &schema, "a-pub", "alice", "public").await;
+    seed_post(&pool, &db, &schema, "b-priv", "bob", "private").await;
+    seed_post(&pool, &db, &schema, "b-pub", "bob", "public").await;
+
+    let mut q = posts_query();
+    q.take = Some(100);
+    let res = execute_query(
+        &pool,
+        &db,
+        &schema,
+        &q,
+        &PrincipalCtx {
+            user_id: Some("alice".to_string()),
+            email: None,
+        },
+    )
+    .await?;
+
+    let mut got = bodies(res);
+    got.sort();
+    assert_eq!(
+        got,
+        vec![
+            "a-priv".to_string(),
+            "a-pub".to_string(),
+            "b-pub".to_string()
+        ]
+    );
+    Ok(())
+}
+
+// (T6-2) Bypass callers (machine tokens, admin, scheduled jobs) are NOT subject
+// to `authorize` — they see every row. This is the security-default bypass.
+#[tokio::test]
+async fn authorize_bypass_sees_all_rows() -> anyhow::Result<()> {
+    let (pool, db, schema) = setup_authorize().await;
+    seed_post(&pool, &db, &schema, "a-priv", "alice", "private").await;
+    seed_post(&pool, &db, &schema, "a-pub", "alice", "public").await;
+    seed_post(&pool, &db, &schema, "b-priv", "bob", "private").await;
+    seed_post(&pool, &db, &schema, "b-pub", "bob", "public").await;
+
+    let mut q = posts_query();
+    q.take = Some(100);
+    let res = execute_query(&pool, &db, &schema, &q, &PrincipalCtx::bypass()).await?;
+
+    let mut got = bodies(res);
+    got.sort();
+    assert_eq!(
+        got,
+        vec![
+            "a-priv".to_string(),
+            "a-pub".to_string(),
+            "b-priv".to_string(),
+            "b-pub".to_string(),
+        ]
+    );
+    Ok(())
+}
+
+// (T6-3) `count` terminal also honors `authorize` — user A counts 3 (own two
+// plus the one public), not 4.
+#[tokio::test]
+async fn authorize_count_filters_user() -> anyhow::Result<()> {
+    let (pool, db, schema) = setup_authorize().await;
+    seed_post(&pool, &db, &schema, "a-priv", "alice", "private").await;
+    seed_post(&pool, &db, &schema, "a-pub", "alice", "public").await;
+    seed_post(&pool, &db, &schema, "b-priv", "bob", "private").await;
+    seed_post(&pool, &db, &schema, "b-pub", "bob", "public").await;
+
+    let mut q = posts_query();
+    q.count = true;
+    let res = execute_query(
+        &pool,
+        &db,
+        &schema,
+        &q,
+        &PrincipalCtx {
+            user_id: Some("alice".to_string()),
+            email: None,
+        },
+    )
+    .await?;
+    match res {
+        QueryResult::Count(n) => assert_eq!(n, 3),
+        other => panic!("expected Count, got {other:?}"),
+    }
+
+    // Bypass count sees all 4.
+    let res = execute_query(&pool, &db, &schema, &q, &PrincipalCtx::bypass()).await?;
+    match res {
+        QueryResult::Count(n) => assert_eq!(n, 4),
+        other => panic!("expected Count, got {other:?}"),
+    }
+    Ok(())
+}
+
+// (T6-4) Principal markers (`{"$user":true}` / `{"$email":true}`) are valid
+// only in a server-declared `authorize`; a client-supplied `.filter()` carrying
+// one is rejected at the query boundary with `BadRequest`.
+#[tokio::test]
+async fn client_filter_rejects_principal_marker() -> anyhow::Result<()> {
+    let (pool, db, schema) = setup_authorize().await;
+    seed_post(&pool, &db, &schema, "a-pub", "alice", "public").await;
+
+    let mut q = posts_query();
+    q.take = Some(100);
+    q.filter = Some(rtdb_server::query::FilterExpr::Eq {
+        field: "owner".into(),
+        value: json!({"$user": true}),
+    });
+    let err = execute_query(
+        &pool,
+        &db,
+        &schema,
+        &q,
+        &PrincipalCtx {
+            user_id: Some("alice".to_string()),
+            email: None,
+        },
+    )
+    .await
+    .expect_err("client filter with $user marker must be rejected");
+    assert_eq!(
+        err.code,
+        rtdb_server::error::ErrorCode::BadRequest,
+        "expected BadRequest, got {err:?}"
+    );
+    // Explicit marker-rejection message (not the incidental "value must be a
+    // string/number/boolean" the jsonb path would emit).
+    assert!(
+        err.message.contains("principal markers"),
+        "expected marker-specific message, got: {}",
+        err.message
+    );
+    Ok(())
+}
