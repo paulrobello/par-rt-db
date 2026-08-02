@@ -3400,3 +3400,377 @@ async fn authorize_upsert_insert_stamps_eq_user_leaf_to_caller() -> anyhow::Resu
     assert_eq!(persisted["owner"].as_str(), Some("alice"));
     Ok(())
 }
+
+// ===========================================================================
+// Task 8.5 — patch/replace/upsert-update re-stamp + verify against `authorize`
+//
+// Task 9 stamped+verified only the Insert and Upsert-INSERT paths. A review
+// found that `stamp_owner` ALSO runs on Patch/Replace/Upsert-update (making
+// `ownerField` immutable-by-patch), but `stamp_authorize` did not — so on an
+// `authorize` table a user could `patch` an `Eq{owner,$user}` field to ANOTHER
+// user's id, injecting a doc into that user's read view. The spec's "authorize
+// subsumes ownerField" claim failed on patch. These tests pin the closed gap:
+// re-stamp every `$user` leaf on each write path (like `stamp_owner`), then
+// post-write-verify the resulting doc (catches no-`$user`-arm predicates the
+// re-stamp alone cannot satisfy).
+// ===========================================================================
+
+/// Builds a `get(id)` query on `table` (avoids retyping the 20-field `Query`
+/// literal when checking another user's read view).
+fn get_query(table: &str, id: &str) -> Query {
+    Query {
+        table: table.to_string(),
+        get: Some(id.to_string()),
+        index: None,
+        eq: vec![],
+        gt: None,
+        gte: None,
+        lt: None,
+        lte: None,
+        order: None,
+        take: None,
+        unique: false,
+        first: false,
+        count: false,
+        distinct: false,
+        paginate: None,
+        filter: None,
+        search: None,
+        vector_search: None,
+        hybrid_search: None,
+        aggregate: None,
+    }
+}
+
+// (T8.5-a) Injection closed: `or_posts` = `Or[Eq{owner,$user}, Eq{visibility,"public"}]`.
+// Alice creates a private doc (owner stamped alice by the insert path), then
+// `patch`es it setting `owner="bob"`. The patch is applied but `owner` is
+// RE-STAMPED to alice, so the persisted owner is alice (NOT bob) and bob does
+// not gain a read view of the doc. Before the fix owner became bob and bob
+// could read alice's private doc — the patch-injection gap.
+#[tokio::test]
+async fn authorize_patch_re_stamps_eq_user_leaf_closing_injection() -> anyhow::Result<()> {
+    let (pool, db, schema) = setup_insert_stamp().await;
+
+    // Alice creates a private doc (the insert path stamps owner=alice).
+    let mut insert = serde_json::Map::new();
+    insert.insert("body".into(), "a-secret".into());
+    insert.insert("owner".into(), "alice".into());
+    insert.insert("visibility".into(), "private".into());
+    let outcome = execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::Insert {
+                table: "or_posts".into(),
+                doc: insert,
+            }],
+        },
+        &alice_ctx(),
+    )
+    .await
+    .expect("insert ok");
+    let id = outcome.results[0]["id"]
+        .as_str()
+        .expect("id string")
+        .to_string();
+
+    // Alice attempts to inject the doc into bob's read view by patching owner=bob.
+    let mut patch = serde_json::Map::new();
+    patch.insert("owner".into(), "bob".into());
+    execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::Patch {
+                table: "or_posts".into(),
+                id: id.clone(),
+                fields: patch,
+            }],
+        },
+        &alice_ctx(),
+    )
+    .await
+    .expect("patch ok (owner re-stamped to alice)");
+
+    // Persisted owner == alice (NOT bob): the re-stamp overwrote the client value.
+    let persisted = fetch_doc_bypass(&pool, &db, &schema, "or_posts", &id)
+        .await
+        .expect("row present");
+    assert_eq!(
+        persisted["owner"].as_str(),
+        Some("alice"),
+        "patch must re-stamp owner to the caller, not bob"
+    );
+
+    // Bob does NOT gain visibility: get(id) as bob is filtered to Doc(None).
+    let res = execute_query(
+        &pool,
+        &db,
+        &schema,
+        &get_query("or_posts", &id),
+        &PrincipalCtx {
+            user_id: Some("bob".to_string()),
+            email: None,
+        },
+    )
+    .await?;
+    match res {
+        QueryResult::Doc(None) => {}
+        other => panic!("bob must not see alice's private doc, got {other:?}"),
+    }
+    Ok(())
+}
+
+// (T8.5-b) Replace re-stamp: Alice `replace`s the doc with `owner="bob"` — the
+// persisted owner is alice (re-stamped). Parity with the patch path and with
+// `stamp_owner` on Replace.
+#[tokio::test]
+async fn authorize_replace_re_stamps_eq_user_leaf() -> anyhow::Result<()> {
+    let (pool, db, schema) = setup_insert_stamp().await;
+
+    let mut insert = serde_json::Map::new();
+    insert.insert("body".into(), "a-original".into());
+    insert.insert("owner".into(), "alice".into());
+    insert.insert("visibility".into(), "private".into());
+    let outcome = execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::Insert {
+                table: "or_posts".into(),
+                doc: insert,
+            }],
+        },
+        &alice_ctx(),
+    )
+    .await
+    .expect("insert ok");
+    let id = outcome.results[0]["id"]
+        .as_str()
+        .expect("id string")
+        .to_string();
+
+    // Replace attempts to set owner=bob; the re-stamp overwrites it to alice.
+    let mut replace = serde_json::Map::new();
+    replace.insert("body".into(), "a-replaced".into());
+    replace.insert("owner".into(), "bob".into());
+    replace.insert("visibility".into(), "private".into());
+    execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::Replace {
+                table: "or_posts".into(),
+                id: id.clone(),
+                doc: replace,
+            }],
+        },
+        &alice_ctx(),
+    )
+    .await
+    .expect("replace ok (owner re-stamped to alice)");
+
+    let persisted = fetch_doc_bypass(&pool, &db, &schema, "or_posts", &id)
+        .await
+        .expect("row present");
+    assert_eq!(
+        persisted["owner"].as_str(),
+        Some("alice"),
+        "replace must re-stamp owner to the caller"
+    );
+    assert_eq!(persisted["body"].as_str(), Some("a-replaced"));
+    Ok(())
+}
+
+// (T8.5-c) No-`$user`-arm verify: `public_only` = `Eq{visibility,"public"}` (no
+// stampable leaf). Alice creates a public doc, then `patch`es visibility=private.
+// The re-stamp is a no-op (no $user leaf), and the post-write verify fails on
+// the resulting doc (visibility=private fails the predicate) → Forbidden, and
+// the txn rolls back atomically (the doc stays public). Guards predicates the
+// re-stamp alone cannot satisfy.
+#[tokio::test]
+async fn authorize_patch_no_user_leaf_forbidden_when_predicate_fails() -> anyhow::Result<()> {
+    let (pool, db, schema) = setup_insert_stamp().await;
+
+    let mut insert = serde_json::Map::new();
+    insert.insert("body".into(), "x".into());
+    insert.insert("visibility".into(), "public".into());
+    let outcome = execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::Insert {
+                table: "public_only".into(),
+                doc: insert,
+            }],
+        },
+        &alice_ctx(),
+    )
+    .await
+    .expect("insert ok (visibility=public satisfies the predicate)");
+    let id = outcome.results[0]["id"]
+        .as_str()
+        .expect("id string")
+        .to_string();
+
+    // Patch visibility=private → the merged doc fails Eq{visibility,"public"}.
+    let mut patch = serde_json::Map::new();
+    patch.insert("visibility".into(), "private".into());
+    let err = execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::Patch {
+                table: "public_only".into(),
+                id: id.clone(),
+                fields: patch,
+            }],
+        },
+        &alice_ctx(),
+    )
+    .await
+    .expect_err("patch must fail: visibility=private fails the predicate");
+    assert_eq!(err.code, ErrorCode::Forbidden);
+
+    // Atomic: the doc survived untouched (still public).
+    let persisted = fetch_doc_bypass(&pool, &db, &schema, "public_only", &id)
+        .await
+        .expect("row present");
+    assert_eq!(persisted["visibility"].as_str(), Some("public"));
+    Ok(())
+}
+
+// (T8.5-d) Bypass unchanged: a bypass caller (machine/admin/scheduled) patching
+// owner is NOT re-stamped nor verified — it can write any value. Confirms the
+// stamp/verify is user-only (ctx.user_id None ⇒ no-op), preserving machine-token
+// full access on the patch path.
+#[tokio::test]
+async fn authorize_bypass_patch_skips_stamp_and_verify() -> anyhow::Result<()> {
+    let (pool, db, schema) = setup_insert_stamp().await;
+
+    let mut insert = serde_json::Map::new();
+    insert.insert("body".into(), "x".into());
+    insert.insert("owner".into(), "alice".into());
+    insert.insert("visibility".into(), "private".into());
+    let outcome = execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::Insert {
+                table: "or_posts".into(),
+                doc: insert,
+            }],
+        },
+        &PrincipalCtx::bypass(),
+    )
+    .await
+    .expect("bypass insert ok");
+    let id = outcome.results[0]["id"]
+        .as_str()
+        .expect("id string")
+        .to_string();
+
+    // Bypass patches owner=bob — no re-stamp, persisted owner is exactly as sent.
+    let mut patch = serde_json::Map::new();
+    patch.insert("owner".into(), "bob".into());
+    execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::Patch {
+                table: "or_posts".into(),
+                id: id.clone(),
+                fields: patch,
+            }],
+        },
+        &PrincipalCtx::bypass(),
+    )
+    .await
+    .expect("bypass patch ok");
+
+    let persisted = fetch_doc_bypass(&pool, &db, &schema, "or_posts", &id)
+        .await
+        .expect("row present");
+    assert_eq!(
+        persisted["owner"].as_str(),
+        Some("bob"),
+        "bypass must not re-stamp owner"
+    );
+    Ok(())
+}
+
+// (T8.5-e) Upsert-update re-stamp: the third write path. `owned` =
+// `Eq{owner,$user}` with the `by_owner` index. Alice inserts (owner=alice), then
+// an upsert matches her doc (eq=["alice"]) whose update patch sets owner=bob.
+// The patch is re-stamped (owner=alice), so the persisted owner stays alice.
+// Before the fix the upsert-update branch re-stamped nothing and owner became bob.
+#[tokio::test]
+async fn authorize_upsert_update_re_stamps_eq_user_leaf() -> anyhow::Result<()> {
+    let (pool, db, schema) = setup_insert_stamp().await;
+
+    let mut insert = serde_json::Map::new();
+    insert.insert("body".into(), "x".into());
+    insert.insert("owner".into(), "alice".into());
+    let outcome = execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::Insert {
+                table: "owned".into(),
+                doc: insert,
+            }],
+        },
+        &alice_ctx(),
+    )
+    .await
+    .expect("insert ok");
+    let id = outcome.results[0]["id"]
+        .as_str()
+        .expect("id string")
+        .to_string();
+
+    // Upsert matches alice's doc via by_owner; the update patch sets owner=bob.
+    let mut insert_doc = serde_json::Map::new();
+    insert_doc.insert("body".into(), "ignored".into());
+    insert_doc.insert("owner".into(), "alice".into());
+    let mut patch = serde_json::Map::new();
+    patch.insert("owner".into(), "bob".into());
+    let outcome = execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::Upsert {
+                table: "owned".into(),
+                index: "by_owner".into(),
+                eq: vec!["alice".into()],
+                insert: insert_doc,
+                patch,
+            }],
+        },
+        &alice_ctx(),
+    )
+    .await
+    .expect("upsert-update ok (owner re-stamped to alice)");
+    assert_eq!(outcome.results[0]["inserted"].as_bool(), Some(false));
+
+    let persisted = fetch_doc_bypass(&pool, &db, &schema, "owned", &id)
+        .await
+        .expect("row present");
+    assert_eq!(
+        persisted["owner"].as_str(),
+        Some("alice"),
+        "upsert-update must re-stamp owner to the caller"
+    );
+    Ok(())
+}

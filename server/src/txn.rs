@@ -875,7 +875,7 @@ fn stamp_owner(
 /// asserts "this field IS the caller" and is therefore stampable. De-dups
 /// preserving first occurrence. Empty when `expr` has no stampable leaf, in
 /// which case `stamp_authorize` is a no-op and the inserted doc must satisfy
-/// the predicate from client values alone (else `verify_authorize_insert`
+/// the predicate from client values alone (else `verify_authorize_doc`
 /// rejects with `Forbidden`).
 fn user_eq_fields(expr: &FilterExpr) -> Vec<String> {
     /// `true` only for the exact principal marker `{"$user": true}` — the sole
@@ -916,7 +916,7 @@ fn user_eq_fields(expr: &FilterExpr) -> Vec<String> {
 /// overwriting any client value — unforgeable, exactly like `stamp_owner`.
 /// `Not`, `Contains`, `Exists`, and non-`$user` leaves are not stampable; a
 /// table without `authorize` or a bypass caller (`user_id = None`) is a no-op.
-/// Call AFTER `stamp_owner`; then call `verify_authorize_insert` to reject
+/// Call AFTER `stamp_owner`; then call `verify_authorize_doc` to reject
 /// predicates the stamp could not satisfy (no `$user` leaf, or an unsatisfied
 /// `And`/literal branch).
 fn stamp_authorize(
@@ -932,15 +932,18 @@ fn stamp_authorize(
     doc
 }
 
-/// Post-stamp verification for inserts: a user caller on an `authorize`-gated
-/// table must produce a doc that satisfies the predicate. The stamp above
+/// Post-write verification for every write path on an `authorize`-gated table:
+/// a user caller must leave the doc satisfying the predicate. The stamp
 /// satisfies every `Eq{field,$user}` leaf, but a predicate with no stampable
 /// leaf (e.g. `Eq{visibility,"public"}` or `Contains{editors,$user}`) stamps
 /// nothing — the client must satisfy it from supplied values, else `Forbidden`.
-/// Bypass callers (`user_id = None`) and tables without `authorize` are no-ops.
-/// Runs inside the serialized txn so a `Forbidden` rolls back the whole
-/// transaction (same atomicity guarantee as the patch/replace/delete pre-check).
-fn verify_authorize_insert(
+/// On Patch/Replace/Upsert-update the stamp re-stamps `$user` leaves (parity
+/// with `stamp_owner`), and this verify catches the residual cases (e.g. patching
+/// a no-`$user`-arm `Eq{visibility,"public"}` to `"private"`). Bypass callers
+/// (`user_id = None`) and tables without `authorize` are no-ops. Runs inside the
+/// serialized txn so a `Forbidden` rolls back the whole transaction (same
+/// atomicity guarantee as the patch/replace/delete pre-check).
+fn verify_authorize_doc(
     table_def: &TableDef,
     doc: &serde_json::Map<String, serde_json::Value>,
     ctx: &PrincipalCtx,
@@ -950,7 +953,7 @@ fn verify_authorize_insert(
         && !filter_matches(&serde_json::Value::Object(doc.clone()), authorize, ctx)
     {
         return Err(RtDbError::forbidden(
-            "insert conflicts with the table's authorize predicate",
+            "write conflicts with the table's authorize predicate",
         ));
     }
     Ok(())
@@ -1151,7 +1154,7 @@ pub async fn execute_txn(
                 let doc = stamp_ttl_default(table_def, doc.clone(), now_ms());
                 let doc = stamp_owner(table_def, doc, owner);
                 let doc = stamp_authorize(table_def, doc, ctx);
-                verify_authorize_insert(table_def, &doc, ctx)?;
+                verify_authorize_doc(table_def, &doc, ctx)?;
                 let (id, stored, created_at) =
                     do_insert(&mut tx, &pg_schema_name, table_def, table, &doc).await?;
                 write_set.touch(table, &id, OpKind::Insert);
@@ -1169,8 +1172,10 @@ pub async fn execute_txn(
                 let table_def = schema.table(table)?;
                 check_owner(&mut tx, &pg_schema_name, table_def, table, id, ctx).await?;
                 let fields = stamp_owner(table_def, fields.clone(), owner);
+                let fields = stamp_authorize(table_def, fields, ctx);
                 let (pre_doc, merged, created_at) =
                     do_patch(&mut tx, &pg_schema_name, table_def, table, id, &fields).await?;
+                verify_authorize_doc(table_def, &merged, ctx)?;
                 write_set.touch(table, id, OpKind::Patch);
                 // `before` = pre-merge body (frozen on first touch by the helper
                 // so a doc inserted earlier this txn stays `before = None`);
@@ -1188,8 +1193,10 @@ pub async fn execute_txn(
                 let table_def = schema.table(table)?;
                 check_owner(&mut tx, &pg_schema_name, table_def, table, id, ctx).await?;
                 let doc = stamp_owner(table_def, doc.clone(), owner);
+                let doc = stamp_authorize(table_def, doc, ctx);
                 let (old_doc, new_doc, created_at) =
                     do_replace(&mut tx, &pg_schema_name, table_def, table, id, &doc).await?;
+                verify_authorize_doc(table_def, &new_doc, ctx)?;
                 write_set.touch(table, id, OpKind::Replace);
                 write_set.capture_doc(
                     table,
@@ -1245,7 +1252,7 @@ pub async fn execute_txn(
                     None => {
                         let insert = stamp_owner(table_def, insert.clone(), owner);
                         let insert = stamp_authorize(table_def, insert, ctx);
-                        verify_authorize_insert(table_def, &insert, ctx)?;
+                        verify_authorize_doc(table_def, &insert, ctx)?;
                         let (id, stored, created_at) =
                             do_insert(&mut tx, &pg_schema_name, table_def, table, &insert).await?;
                         write_set.touch(table, &id, OpKind::Upsert);
@@ -1268,10 +1275,12 @@ pub async fn execute_txn(
                         };
                         check_owner_doc(table_def, &doc, &id, ctx)?;
                         let patch = stamp_owner(table_def, patch.clone(), owner);
+                        let patch = stamp_authorize(table_def, patch, ctx);
                         let pre_doc = doc.clone();
                         let merged = apply_patch(table_def, doc, &patch)?;
                         apply_update(&mut tx, &pg_schema_name, table_def, table, &id, &merged)
                             .await?;
+                        verify_authorize_doc(table_def, &merged, ctx)?;
                         write_set.touch(table, &id, OpKind::Upsert);
                         // Upsert-update branch: same as Patch — before = matched
                         // body (first touch), after = merged.
