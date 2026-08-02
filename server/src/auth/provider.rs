@@ -3,12 +3,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use axum::Json;
 use axum::Router;
-use axum::body::Body;
 use axum::extract::{Query as QueryParams, State};
-use axum::http::{
-    HeaderMap, HeaderName, HeaderValue, StatusCode,
-    header::{LOCATION, SET_COOKIE},
-};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header::SET_COOKIE};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use serde::Deserialize;
@@ -26,14 +22,24 @@ use super::google::GoogleProvider;
 
 const STATE_TTL_MS: i64 = 10 * 60 * 1000;
 
-/// One pending `/auth/{provider}` -> `/auth/{provider}/callback` round trip:
-/// the origin the popup was opened from (echoed back into the callback HTML)
-/// and when this entry expires. Held in `AppState.auth.oauth_states`, keyed by the
-/// state token; consumed (removed) exactly once by the callback, whichever
-/// request gets the lock first — see `consume_state`.
+/// Outcome of a pending OAuth login, driven by the callback. `Pending` →
+/// `Claiming` (first callback wins) → `Completed` | `Failed`.
+pub enum LoginOutcome {
+    Pending,
+    Claiming,
+    Completed(String),
+    Failed,
+}
+
+/// One pending `/auth/{provider}/begin` -> `/auth/callback` round trip: the
+/// expiry and the current `LoginOutcome`. Held in `AppState.auth.oauth_states`,
+/// keyed by the single-use state token minted at `begin`. The first callback
+/// flips `Pending` → `Claiming` (see `claim_pending`); after `complete_login`
+/// resolves it sets the terminal `Completed` | `Failed`. The poll endpoint
+/// removes the entry on a terminal outcome (one-shot retrieval).
 pub struct OAuthStateEntry {
-    pub origin: String,
     pub expires_at: i64,
+    pub outcome: LoginOutcome,
 }
 
 /// A pluggable OAuth provider. Each implementation owns its authorize URL,
@@ -86,19 +92,6 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
     crate::auth::cookie::session_cookie(headers)
 }
 
-/// Builds a bare 302 redirect (axum's `Redirect::to` is a 303, which doesn't
-/// match the OAuth flow's contract of a 302 to the authorize page).
-fn redirect_found(url: &str) -> Response {
-    match Response::builder()
-        .status(StatusCode::FOUND)
-        .header(LOCATION, url)
-        .body(Body::empty())
-    {
-        Ok(response) => response,
-        Err(_) => RtDbError::internal("failed to build redirect").into_response(),
-    }
-}
-
 /// The 503 body returned when a route is hit for a provider that has no
 /// `client_id`/`client_secret` configured — matches the original GitHub
 /// handler's status + envelope.
@@ -110,32 +103,90 @@ fn unconfigured_response(name: &str) -> Response {
         .into_response()
 }
 
-/// Removes and returns the origin for `state_token`, but only if it exists
-/// and has not expired — single-use by construction: a replayed token was
-/// already removed by the first successful call, so it resolves to `None`
-/// (see Step 1(e)). Concurrent callers race on the same `Mutex`; whichever
-/// acquires it first wins the entry.
-async fn consume_state(state: &Arc<AppState>, state_token: &str) -> Option<String> {
+/// `Pending → Claiming` for the first caller; `false` for a replay or an
+/// already-terminal/expired entry. This is the single-use claim that makes a
+/// replayed callback reject.
+async fn claim_pending(state: &Arc<AppState>, state_token: &str) -> bool {
     let mut states = state.auth.oauth_states.lock().await;
-    match states.remove(state_token) {
-        Some(entry) if entry.expires_at > now_ms() => Some(entry.origin),
-        _ => None,
+    let now = now_ms();
+    match states.get_mut(state_token) {
+        Some(entry) if entry.expires_at > now && matches!(entry.outcome, LoginOutcome::Pending) => {
+            entry.outcome = LoginOutcome::Claiming;
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Sets the terminal outcome after `complete_login` (`Claiming → Completed | Failed`).
+async fn set_outcome(state: &Arc<AppState>, state_token: &str, outcome: LoginOutcome) {
+    let mut states = state.auth.oauth_states.lock().await;
+    if let Some(entry) = states.get_mut(state_token) {
+        entry.outcome = outcome;
+    }
+}
+
+enum PollResult {
+    Pending,
+    Complete { token: String, user: AuthedUser },
+    Failed,
+    Expired,
+}
+
+/// One-shot retrieval for the `/auth/state` polling endpoint. Removes the
+/// entry on a terminal outcome; leaves it in place while pending. The
+/// `resolve_bearer` call happens after the lock is released so no Mutex is
+/// held across the await.
+async fn poll_login(state: &Arc<AppState>, state_token: &str) -> PollResult {
+    let taken: Option<Result<String, ()>> = {
+        let mut states = state.auth.oauth_states.lock().await;
+        let now = now_ms();
+        states.retain(|_, e| e.expires_at > now);
+        match states.remove(state_token) {
+            None => None,
+            Some(entry) => match entry.outcome {
+                LoginOutcome::Pending | LoginOutcome::Claiming => {
+                    states.insert(state_token.to_string(), entry); // not ready — put back
+                    return PollResult::Pending;
+                }
+                LoginOutcome::Completed(t) => Some(Ok(t)),
+                LoginOutcome::Failed => Some(Err(())),
+            },
+        }
+    };
+    match taken {
+        None => PollResult::Expired,
+        Some(Err(())) => PollResult::Failed,
+        Some(Ok(token)) => match resolve_bearer(&state.pool, &token).await {
+            Ok(principal @ Principal::User { .. }) => PollResult::Complete {
+                token,
+                user: authed_user(&principal),
+            },
+            _ => PollResult::Expired, // token did not resolve — treat as gone
+        },
     }
 }
 
 #[derive(Deserialize)]
-struct StartParams {
+struct BeginParams {
     origin: String,
 }
 
-/// `GET /auth/{provider}?origin=<url>`: redirects the browser to the
-/// provider's OAuth authorize page. `origin` must be an exact member of the
-/// live `hot.allowed_origins` (else 403) — it is never taken from the eventual
-/// callback request, only from this validated start step, so the popup can
-/// only ever be told to postMessage back to an origin we approved here.
-async fn provider_start<P: OAuthProvider>(
+#[derive(serde::Serialize)]
+struct BeginResponse {
+    authorize_url: String,
+    state: String,
+}
+
+/// `GET /auth/{provider}/begin?origin=<parent origin>`: validates the origin
+/// against the live allowlist, mints a single-use state token, and returns the
+/// provider authorize URL + the state. The parent opens the authorize URL in a
+/// `noopener` popup and polls `/auth/state`. SEC-012 replaces the prior
+/// `window.opener` postMessage relay — `origin` is validated here and discarded
+/// (never interpolated anywhere), retiring the SEC-005 self-XSS surface.
+async fn provider_begin<P: OAuthProvider>(
     State(state): State<Arc<AppState>>,
-    QueryParams(params): QueryParams<StartParams>,
+    QueryParams(params): QueryParams<BeginParams>,
 ) -> Response {
     let Some(provider) = P::from_config(&state.config) else {
         return unconfigured_response(P::name());
@@ -160,16 +211,19 @@ async fn provider_start<P: OAuthProvider>(
         states.insert(
             state_token.clone(),
             OAuthStateEntry {
-                origin: params.origin.clone(),
                 expires_at: now + STATE_TTL_MS,
+                outcome: LoginOutcome::Pending,
             },
         );
     }
 
     let redirect_uri = format!("{}{}", state.config.public_url, provider.callback_path());
-    let url = provider.authorize_url(&redirect_uri, &state_token);
-
-    redirect_found(&url)
+    let authorize_url = provider.authorize_url(&redirect_uri, &state_token);
+    Json(BeginResponse {
+        authorize_url,
+        state: state_token,
+    })
+    .into_response()
 }
 
 #[derive(Deserialize)]
@@ -178,173 +232,98 @@ struct CallbackParams {
     state: String,
 }
 
-/// `GET /auth/{provider}/callback?code=&state=`: verifies and consumes the
-/// state token, completes the provider exchange, sets the session token in an
-/// HttpOnly cookie (SEC-001 phase 2), and responds with HTML that signals the
-/// opener window (no token in the payload).
+/// `GET /auth/callback?code=&state=`: claims the state entry (Pending →
+/// Claiming; replays reject 400), runs the provider exchange, and on success
+/// sets the session cookie and returns the popup-closing HTML. The terminal
+/// outcome (`Completed` | `Failed`) is set before returning so the polling
+/// parent sees the result — the token itself is delivered via the HttpOnly
+/// cookie AND via the one-shot `/auth/state` poll.
 async fn provider_callback<P: OAuthProvider>(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     QueryParams(params): QueryParams<CallbackParams>,
 ) -> Response {
-    let Some(origin) = consume_state(&state, &params.state).await else {
+    if !claim_pending(&state, &params.state).await {
         return RtDbError::bad_request("invalid or expired state").into_response();
-    };
+    }
 
     let Some(provider) = P::from_config(&state.config) else {
+        set_outcome(&state, &params.state, LoginOutcome::Failed).await;
         return unconfigured_response(P::name());
     };
 
     let secure = crate::auth::cookie::request_is_secure(&headers);
     match provider.complete_login(&state, &params.code).await {
-        Ok(token) => match callback_html_response(&token, &origin, secure) {
-            Ok(resp) => resp,
-            Err(err) => err.into_response(),
-        },
-        Err(err) => err.into_response(),
+        Ok(token) => {
+            set_outcome(
+                &state,
+                &params.state,
+                LoginOutcome::Completed(token.clone()),
+            )
+            .await;
+            callback_close_response(&token, secure)
+        }
+        Err(err) => {
+            set_outcome(&state, &params.state, LoginOutcome::Failed).await;
+            err.into_response()
+        }
     }
 }
 
-/// Renders the popup-closing HTML the callback returns on success. `origin` was
-/// validated at the OAuth start step (`provider_start`) against the live
-/// `allowed_origins` and is defense-in-depth escaped at this interpolation
-/// point: it must additionally pass the strict `config::origin_is_valid` parser
-/// (ASCII `https?://host[:port]` only, no metacharacters) on every
-/// `PATCH /admin/config`, so an admin-controlled value containing `"`, `<`, `>`,
-/// backtick, or backslash is rejected at write time. Escaping closes the
-/// residual self-XSS breakout (SEC-005).
-///
-/// SEC-001 phase 2: the session token travels in the HttpOnly `Set-Cookie`
-/// (added by the caller-facing response below), NOT in the HTML — the
-/// postMessage payload is `{type:"rtdb-auth"}` with no `token` field, so the
-/// opener never receives the secret.
-fn callback_html_response(token: &str, origin: &str, secure: bool) -> Result<Response, RtDbError> {
-    let html = format!(
-        "<script>window.opener.postMessage({{type:\"rtdb-auth\"}},\"{origin}\");window.close();</script>",
-        origin = escape_js_string(origin),
-    );
-
+/// The popup-closing HTML the callback returns on success. Nothing is
+/// interpolated (no `origin`, no token) — the token rides the HttpOnly
+/// `Set-Cookie`, so there is no self-XSS surface (SEC-005 fully retired by
+/// SEC-012) and the parent learns of completion by polling `/auth/state`, not
+/// via `window.opener` postMessage.
+fn callback_close_response(token: &str, secure: bool) -> Response {
+    let html = "<!doctype html><html><head><meta charset=\"utf-8\"><title>Signed in</title>\
+                </head><body><script>window.close();</script>\
+                <p style=\"font-family:sans-serif\">Sign-in complete. You may close this window.</p>\
+                </body></html>";
     let mut response = Html(html).into_response();
     response.headers_mut().insert(
         HeaderName::from_static("content-security-policy"),
         HeaderValue::from_static("default-src 'none'; script-src 'unsafe-inline'"),
     );
-    // `token` is hex (`random_token`), so it is always cookie-value-safe;
-    // `set_session_cookie` validates regardless and `?` handles the impossible case.
-    let cookie = crate::auth::cookie::set_session_cookie(token, secure)?;
-    response.headers_mut().insert(SET_COOKIE, cookie);
-    Ok(response)
-}
-
-/// Escapes `s` for safe interpolation inside a double-quoted JavaScript string
-/// literal within an inline `<script>` block. Covers JS string metacharacters
-/// (`\`, `"`, line terminators — including the U+2028/U+2029 line separators
-/// that break JS but not HTML parsers) and `</` (closes the `<script>` element
-/// even from inside a string literal in the HTML parser's eyes). Used by
-/// `callback_html_response` for the `token` and `origin` interpolations.
-fn escape_js_string(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            '\u{2028}' => out.push_str("\\u2028"),
-            '\u{2029}' => out.push_str("\\u2029"),
-            '<' => out.push_str("\\x3c"),
-            '>' => out.push_str("\\x3e"),
-            '`' => out.push_str("\\`"),
-            '$' => out.push_str("\\$"),
-            _ => out.push(c),
+    match crate::auth::cookie::set_session_cookie(token, secure) {
+        Ok(cookie) => {
+            response.headers_mut().insert(SET_COOKIE, cookie);
+            response
         }
+        Err(err) => err.into_response(),
     }
-    out
 }
 
-#[cfg(test)]
-mod callback_tests {
-    use super::*;
+#[derive(Deserialize)]
+struct StateQuery {
+    state: String,
+}
 
-    #[test]
-    fn escape_js_string_passes_through_plain_ascii() {
-        assert_eq!(escape_js_string("abcdef0123"), "abcdef0123");
-    }
+#[derive(serde::Serialize)]
+#[serde(tag = "status", rename_all = "lowercase")]
+enum StateResponse {
+    Pending,
+    Complete { token: String, user: AuthedUser },
+    Expired,
+    Error,
+}
 
-    #[test]
-    fn escape_js_string_escapes_each_metacharacter() {
-        // JS string terminators / escape introducer.
-        assert_eq!(escape_js_string("\\"), "\\\\");
-        assert_eq!(escape_js_string("\""), "\\\"");
-        // Line terminators that break JS parsing inside a string literal.
-        assert_eq!(escape_js_string("\n"), "\\n");
-        assert_eq!(escape_js_string("\r"), "\\r");
-        assert_eq!(escape_js_string("\u{2028}"), "\\u2028");
-        assert_eq!(escape_js_string("\u{2029}"), "\\u2029");
-        // HTML `<` / `>` are escaped so a payload can't close the <script>
-        // element from inside a JS string.
-        assert_eq!(escape_js_string("<"), "\\x3c");
-        assert_eq!(escape_js_string(">"), "\\x3e");
-        // Template-literal introducers — harmless inside a double-quoted
-        // literal, but cheap to neutralize defensively.
-        assert_eq!(escape_js_string("`"), "\\`");
-        assert_eq!(escape_js_string("$"), "\\$");
-    }
-
-    #[test]
-    fn escape_js_string_neutralizes_script_breakout_sequence() {
-        // `</script>` inside a JS string still closes the script element in
-        // the HTML parser; escaping `<` and `>` neutralizes it.
-        assert_eq!(escape_js_string("</script>"), "\\x3c/script\\x3e");
-    }
-
-    #[test]
-    fn callback_html_neutralizes_payload_origin() {
-        // Even if a strict-validator regression let this value reach
-        // `callback_html_response`, the escaped output cannot break out of
-        // the JS string or close the <script>. The raw `";alert(1);//`
-        // breakout becomes `\";alert(1);//` inside the literal.
-        let resp = callback_html_response("deadbeef", "\";alert(1);//", true).unwrap();
-        // SEC-001 phase 2: the session token rides the HttpOnly Set-Cookie, not
-        // the HTML body.
-        let cookie = resp
-            .headers()
-            .get(SET_COOKIE)
-            .expect("callback sets rtdb_session cookie")
-            .to_str()
-            .unwrap();
-        assert!(cookie.contains("rtdb_session=deadbeef"));
-        assert!(cookie.contains("HttpOnly"));
-        assert!(cookie.contains("Secure"));
-
-        let body = response_body_string(resp);
-        // The postMessage payload carries NO token (only `{type:"rtdb-auth"}`);
-        // the escaped origin follows. If escaping were missing, the body would
-        // contain `},"";alert(1)` (raw quote-quote) instead of `},"\";alert(1)`
-        // (backslash-quote) and this assertion would fail.
-        assert!(
-            body.contains(r#"},"\";alert(1);//");window.close();</script>"#),
-            "expected escaped payload in body, got: {body}"
-        );
-        // The token must never appear in the HTML — it is cookie-only.
-        assert!(
-            !body.contains("deadbeef"),
-            "token leaked into the HTML: {body}"
-        );
-    }
-
-    fn response_body_string(resp: Response) -> String {
-        // `<script>...</script>` is short, well under axum's default body
-        // limit. Block on the async body collector via a one-shot runtime.
-        let rt = tokio::runtime::Runtime::new().expect("tokio rt for test");
-        let bytes = rt.block_on(async {
-            axum::body::to_bytes(resp.into_body(), 64 * 1024)
-                .await
-                .expect("body bytes")
-                .to_vec()
-        });
-        String::from_utf8(bytes).unwrap_or_default()
+/// `GET /auth/state?state=`: provider-agnostic polling endpoint. The `state`
+/// token (minted at `/auth/{provider}/begin`) is the capability — no cookie
+/// required, so this works cross-origin (the SDK on a different origin) where
+/// the `SameSite=Lax` session cookie would not be sent. Returns
+/// `pending | complete | expired | error`.
+async fn auth_state(
+    State(state): State<Arc<AppState>>,
+    QueryParams(params): QueryParams<StateQuery>,
+) -> Response {
+    match poll_login(&state, &params.state).await {
+        PollResult::Pending => Json(StateResponse::Pending).into_response(),
+        PollResult::Complete { token, user } => {
+            Json(StateResponse::Complete { token, user }).into_response()
+        }
+        PollResult::Failed => Json(StateResponse::Error).into_response(),
+        PollResult::Expired => Json(StateResponse::Expired).into_response(),
     }
 }
 
@@ -419,24 +398,26 @@ async fn validate(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Res
     }
 }
 
-/// OAuth + session routes. GitHub keeps its original paths
-/// (`/auth/github`, `/auth/callback`) so deployed clients are unaffected;
-/// Google mounts at `/auth/google` + `/auth/google/callback`. `/auth/logout`
-/// and `/auth/me` are provider-agnostic.
+/// OAuth + session routes. SEC-012: each provider mounts a `begin` endpoint
+/// that returns `{authorize_url, state}` (the parent opens it in a `noopener`
+/// popup and polls `/auth/state`); the callback is shared at `/auth/callback`
+/// (GitHub keeps its original path for deployed clients). `/auth/state`,
+/// `/auth/logout`, and `/auth/me` are provider-agnostic.
 pub fn auth_routes() -> Router<Arc<AppState>> {
     Router::new()
-        .route("/auth/github", get(provider_start::<GithubProvider>))
+        .route("/auth/github/begin", get(provider_begin::<GithubProvider>))
         .route("/auth/callback", get(provider_callback::<GithubProvider>))
-        .route("/auth/google", get(provider_start::<GoogleProvider>))
+        .route("/auth/google/begin", get(provider_begin::<GoogleProvider>))
         .route(
             "/auth/google/callback",
             get(provider_callback::<GoogleProvider>),
         )
-        .route("/auth/gitlab", get(provider_start::<GitlabProvider>))
+        .route("/auth/gitlab/begin", get(provider_begin::<GitlabProvider>))
         .route(
             "/auth/gitlab/callback",
             get(provider_callback::<GitlabProvider>),
         )
+        .route("/auth/state", get(auth_state))
         .route("/auth/logout", post(logout))
         .route("/auth/me", get(me))
         .route("/auth/validate", get(validate))

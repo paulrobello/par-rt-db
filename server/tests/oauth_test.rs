@@ -114,21 +114,33 @@ fn no_redirect_client() -> reqwest::Client {
         .expect("build client")
 }
 
-async fn start_login(client: &reqwest::Client, addr: SocketAddr, origin: &str) -> String {
+async fn begin_login(client: &reqwest::Client, addr: SocketAddr, origin: &str) -> String {
     let resp = client
-        .get(format!("http://{addr}/auth/github?origin={origin}"))
+        .get(format!("http://{addr}/auth/github/begin?origin={origin}"))
         .send()
         .await
-        .expect("send github start");
-    assert_eq!(resp.status(), reqwest::StatusCode::FOUND);
-    let location = resp
-        .headers()
-        .get(reqwest::header::LOCATION)
-        .expect("location header")
-        .to_str()
-        .expect("location header is valid utf8")
-        .to_string();
-    extract_query_param(&location, "state")
+        .expect("send github begin");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await.expect("begin json");
+    body["state"]
+        .as_str()
+        .expect("state field in begin response")
+        .to_string()
+}
+
+async fn callback_with(
+    client: &reqwest::Client,
+    addr: SocketAddr,
+    state: &str,
+    code: &str,
+) -> reqwest::Response {
+    client
+        .get(format!(
+            "http://{addr}/auth/callback?code={code}&state={state}"
+        ))
+        .send()
+        .await
+        .expect("send callback")
 }
 
 async fn callback(
@@ -136,21 +148,15 @@ async fn callback(
     addr: SocketAddr,
     state_token: &str,
 ) -> reqwest::Response {
-    client
-        .get(format!(
-            "http://{addr}/auth/callback?code=abc&state={state_token}"
-        ))
-        .send()
-        .await
-        .expect("send callback")
+    callback_with(client, addr, state_token, "abc").await
 }
 
-/// Drives a full `/auth/github` -> `/auth/callback` round trip, asserting the
-/// callback's content type, CSP header, origin, and that the session token is
-/// delivered via the SEC-001 `Set-Cookie` (not the HTML body).
+/// Drives a full `begin -> callback -> poll` round trip. The callback returns
+/// the SEC-001 close HTML + `Set-Cookie` (no token in the body), and the poll
+/// returns `complete` with the one-shot token (the entry is then gone).
 async fn login_flow(addr: SocketAddr, origin: &str) -> String {
     let client = no_redirect_client();
-    let state_token = start_login(&client, addr, origin).await;
+    let state_token = begin_login(&client, addr, origin).await;
     let resp = callback(&client, addr, &state_token).await;
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
     assert!(
@@ -180,8 +186,18 @@ async fn login_flow(addr: SocketAddr, origin: &str) -> String {
     let token = extract_token_from_cookie(set_cookie);
 
     let body = resp.text().await.expect("read callback body");
-    assert!(body.contains(origin));
     assert!(!body.contains(&token), "token leaked into callback HTML");
+
+    // SEC-012: the poll returns the token (one-shot) and the entry is then gone.
+    let poll = client
+        .get(format!("http://{addr}/auth/state?state={state_token}"))
+        .send()
+        .await
+        .expect("poll");
+    let pv: Value = poll.json().await.expect("poll json");
+    assert_eq!(pv["status"], "complete");
+    assert_eq!(pv["token"].as_str(), Some(token.as_str()));
+    assert!(pv["user"]["email"].as_str().is_some());
 
     token
 }
@@ -545,13 +561,13 @@ async fn session_expiry_mid_connection_denies_operations_but_keeps_connection_us
 
 // (d) disallowed origin -> 403.
 #[tokio::test]
-async fn github_start_with_disallowed_origin_returns_forbidden() -> anyhow::Result<()> {
+async fn github_begin_with_disallowed_origin_returns_forbidden() -> anyhow::Result<()> {
     let mock = MockServer::start().await;
     let (_state, addr) = oauth_state(&mock).await;
 
     let resp = no_redirect_client()
         .get(format!(
-            "http://{addr}/auth/github?origin=http://evil.example"
+            "http://{addr}/auth/github/begin?origin=http://evil.example"
         ))
         .send()
         .await?;
@@ -562,7 +578,8 @@ async fn github_start_with_disallowed_origin_returns_forbidden() -> anyhow::Resu
     Ok(())
 }
 
-// (e) replayed state -> 400.
+// (e) replayed state -> 400 (begin mints a single-use state token; the second
+// callback finds the entry already claimed and rejects).
 #[tokio::test]
 async fn replayed_state_returns_bad_request() -> anyhow::Result<()> {
     let mock = MockServer::start().await;
@@ -570,7 +587,7 @@ async fn replayed_state_returns_bad_request() -> anyhow::Result<()> {
     let (_state, addr) = oauth_state(&mock).await;
 
     let client = no_redirect_client();
-    let state_token = start_login(&client, addr, "http://localhost:5173").await;
+    let state_token = begin_login(&client, addr, "http://localhost:5173").await;
 
     let first = callback(&client, addr, &state_token).await;
     assert_eq!(first.status(), reqwest::StatusCode::OK);
@@ -579,6 +596,56 @@ async fn replayed_state_returns_bad_request() -> anyhow::Result<()> {
     assert_eq!(second.status(), reqwest::StatusCode::BAD_REQUEST);
     let body: Value = second.json().await?;
     assert_eq!(body["code"], json!("BAD_REQUEST"));
+    Ok(())
+}
+
+// SEC-012: polling before the callback returns `pending` — the popup's parent
+// polls /auth/state between begin and callback while the user is at the IdP.
+#[tokio::test]
+async fn state_poll_returns_pending_before_callback() -> anyhow::Result<()> {
+    let mock = MockServer::start().await;
+    let (_state, addr) = oauth_state(&mock).await;
+
+    let client = no_redirect_client();
+    let state_token = begin_login(&client, addr, "http://localhost:5173").await;
+
+    let resp = client
+        .get(format!("http://{addr}/auth/state?state={state_token}"))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: Value = resp.json().await?;
+    assert_eq!(body["status"], "pending");
+    Ok(())
+}
+
+// SEC-012: when complete_login fails (the IdP rejects the code), the callback
+// marks the entry Failed and the poll returns `error`.
+#[tokio::test]
+async fn state_poll_returns_error_after_failed_login() -> anyhow::Result<()> {
+    let mock = MockServer::start().await;
+    // Token exchange returns an error body -> parse_token_response errors ->
+    // complete_login returns Err -> entry marked Failed.
+    Mock::given(method("POST"))
+        .and(path("/login/oauth/access_token"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"error": "bad_verification_code"})),
+        )
+        .mount(&mock)
+        .await;
+    let (_state, addr) = oauth_state(&mock).await;
+
+    let client = no_redirect_client();
+    let state_token = begin_login(&client, addr, "http://localhost:5173").await;
+    let resp = callback_with(&client, addr, &state_token, "bad").await;
+    assert_eq!(resp.status(), reqwest::StatusCode::INTERNAL_SERVER_ERROR);
+
+    let poll = client
+        .get(format!("http://{addr}/auth/state?state={state_token}"))
+        .send()
+        .await?;
+    let body: Value = poll.json().await?;
+    assert_eq!(body["status"], "error");
     Ok(())
 }
 
@@ -653,12 +720,12 @@ async fn expired_session_returns_unauthorized() -> anyhow::Result<()> {
 
 // --- Google provider (the provider abstraction's second implementation) ---
 //
-// These exercise the new `/auth/google` route wiring and the generic
-// `provider_start` handler end-to-end through the real router. The start
-// handler only *builds* an authorize URL and 302s — it makes no outbound call
-// to Google — so no mock is needed and no real Google endpoint is hit. The
-// token-exchange / userinfo *parsing* logic is covered by unit tests in
-// `auth/google.rs`; the shared callback/state/HTML/logout machinery is
+// These exercise the `/auth/google/begin` route wiring and the generic
+// `provider_begin` handler end-to-end through the real router. The begin
+// handler only *builds* an authorize URL and returns it as JSON — it makes no
+// outbound call to Google — so no mock is needed and no real Google endpoint
+// is hit. The token-exchange / userinfo *parsing* logic is covered by unit
+// tests in `auth/google.rs`; the shared callback/state/poll machinery is
 // covered by the GitHub tests above (same generic handlers).
 
 /// Spawns an app with Google OAuth configured. Endpoints stay at the real
@@ -676,43 +743,41 @@ async fn google_configured_state() -> (Arc<AppState>, SocketAddr) {
     (state, addr)
 }
 
-// (h) configured Google provider -> 302 to Google's authorize URL with the
-// expected OIDC params.
+// (h) configured Google provider -> begin returns 200 JSON whose authorize_url
+// points at Google with the expected OIDC params and carries a state token.
 #[tokio::test]
-async fn google_start_redirects_to_google_authorize_url() -> anyhow::Result<()> {
+async fn google_begin_returns_google_authorize_url() -> anyhow::Result<()> {
     let (_state, addr) = google_configured_state().await;
 
     let resp = no_redirect_client()
         .get(format!(
-            "http://{addr}/auth/google?origin=http://localhost:5173"
+            "http://{addr}/auth/google/begin?origin=http://localhost:5173"
         ))
         .send()
         .await?;
-    assert_eq!(resp.status(), reqwest::StatusCode::FOUND);
-    let location = resp
-        .headers()
-        .get(reqwest::header::LOCATION)
-        .expect("location header")
-        .to_str()
-        .expect("utf8")
-        .to_string();
-    assert!(location.starts_with("https://accounts.google.com/o/oauth2/v2/auth?"));
-    assert!(location.contains("client_id=g-client"));
-    assert!(location.contains("response_type=code"));
-    assert!(location.contains("scope=openid%20email%20profile"));
-    assert!(location.contains("redirect_uri="));
-    assert!(!extract_query_param(&location, "state").is_empty());
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: Value = resp.json().await?;
+    let url = body["authorize_url"]
+        .as_str()
+        .expect("authorize_url in begin response");
+    assert!(url.starts_with("https://accounts.google.com/o/oauth2/v2/auth?"));
+    assert!(url.contains("client_id=g-client"));
+    assert!(url.contains("response_type=code"));
+    assert!(url.contains("scope=openid%20email%20profile"));
+    assert!(url.contains("redirect_uri="));
+    assert!(!extract_query_param(url, "state").is_empty());
+    assert!(!body["state"].as_str().unwrap_or("").is_empty());
     Ok(())
 }
 
 // (i) disallowed origin -> 403 (origin check runs after the configured check).
 #[tokio::test]
-async fn google_start_with_disallowed_origin_returns_forbidden() -> anyhow::Result<()> {
+async fn google_begin_with_disallowed_origin_returns_forbidden() -> anyhow::Result<()> {
     let (_state, addr) = google_configured_state().await;
 
     let resp = no_redirect_client()
         .get(format!(
-            "http://{addr}/auth/google?origin=http://evil.example"
+            "http://{addr}/auth/google/begin?origin=http://evil.example"
         ))
         .send()
         .await?;
@@ -724,14 +789,14 @@ async fn google_start_with_disallowed_origin_returns_forbidden() -> anyhow::Resu
 
 // (j) route mounted but provider unconfigured (no client_id/secret) -> 503.
 #[tokio::test]
-async fn google_start_unconfigured_returns_service_unavailable() -> anyhow::Result<()> {
+async fn google_begin_unconfigured_returns_service_unavailable() -> anyhow::Result<()> {
     // test_state() leaves google_client_id/secret as None.
     let state = test_state().await;
     let addr = spawn_app(state).await;
 
     let resp = no_redirect_client()
         .get(format!(
-            "http://{addr}/auth/google?origin=http://localhost:5173"
+            "http://{addr}/auth/google/begin?origin=http://localhost:5173"
         ))
         .send()
         .await?;
@@ -896,7 +961,7 @@ async fn github_login_email_linked_elsewhere_returns_conflict_not_500() -> anyho
 
     // Drive the callback directly — login_flow asserts 200, but we expect a 409.
     let client = no_redirect_client();
-    let state_token = start_login(&client, addr, "http://localhost:5173").await;
+    let state_token = begin_login(&client, addr, "http://localhost:5173").await;
     let resp = callback(&client, addr, &state_token).await;
     assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
     let body: Value = resp.json().await?;
