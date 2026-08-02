@@ -2518,16 +2518,17 @@ mod tests {
     }
 
     /// Exercises every `FilterExpr` variant plus the two principal markers
-    /// (`$user`, `$email`) for the Rust-level doc evaluator. This is the
-    /// RED-GREEN gate for Task 3 of the per-row-auth-predicate SDD.
+    /// (`$user`, `$email`) for the Rust-level doc evaluator. Variant happy-paths
+    /// live here; the security-critical over-approximation property (missing
+    /// field / type mismatch NEVER matches) lives in the companion
+    /// `filter_matches_overapproximates_safely`.
     #[test]
     fn filter_matches_all_variants_and_principal() {
         let ctx = PrincipalCtx {
             user_id: Some("u1".to_string()),
             email: Some("e@x".to_string()),
         };
-        let doc =
-            json!({"owner":"u1","editors":["u1","u2"],"visibility":"public","archivedat":null});
+        let doc = json!({"owner":"u1","editors":["u1","u2"],"visibility":"public","archivedat":null,"n":5});
 
         // Eq with `$user` marker resolves to ctx.user_id ("u1") -> matches doc.owner.
         assert!(filter_matches(
@@ -2550,12 +2551,128 @@ mod tests {
                 email: None,
             },
         ));
+        // Neq: a present-and-unequal field matches; present-and-equal does not.
+        assert!(filter_matches(
+            &doc,
+            &FilterExpr::Neq {
+                field: "owner".into(),
+                value: json!("u9"),
+            },
+            &ctx,
+        ));
+        assert!(!filter_matches(
+            &doc,
+            &FilterExpr::Neq {
+                field: "owner".into(),
+                value: json!("u1"),
+            },
+            &ctx,
+        ));
+        // Gt/Gte/Lt/Lte over a numeric field (doc.n == 5).
+        assert!(filter_matches(
+            &doc,
+            &FilterExpr::Gt {
+                field: "n".into(),
+                value: json!(3),
+            },
+            &ctx,
+        ));
+        assert!(!filter_matches(
+            &doc,
+            &FilterExpr::Gt {
+                field: "n".into(),
+                value: json!(7),
+            },
+            &ctx,
+        ));
+        assert!(filter_matches(
+            &doc,
+            &FilterExpr::Gte {
+                field: "n".into(),
+                value: json!(5),
+            },
+            &ctx,
+        ));
+        assert!(filter_matches(
+            &doc,
+            &FilterExpr::Lt {
+                field: "n".into(),
+                value: json!(7),
+            },
+            &ctx,
+        ));
+        assert!(filter_matches(
+            &doc,
+            &FilterExpr::Lte {
+                field: "n".into(),
+                value: json!(5),
+            },
+            &ctx,
+        ));
+        assert!(!filter_matches(
+            &doc,
+            &FilterExpr::Lte {
+                field: "n".into(),
+                value: json!(3),
+            },
+            &ctx,
+        ));
+        // In: member present -> true; absent -> false.
+        assert!(filter_matches(
+            &doc,
+            &FilterExpr::In {
+                field: "owner".into(),
+                values: vec![json!("u1"), json!("u3")],
+            },
+            &ctx,
+        ));
+        assert!(!filter_matches(
+            &doc,
+            &FilterExpr::In {
+                field: "owner".into(),
+                values: vec![json!("u9")],
+            },
+            &ctx,
+        ));
         // Contains with `$user` marker against editors[] (deep-equality semantics).
         assert!(filter_matches(
             &doc,
             &FilterExpr::Contains {
                 field: "editors".into(),
                 value: json!({"$user": true}),
+            },
+            &ctx,
+        ));
+        // And: both children true -> true; one false -> false.
+        assert!(filter_matches(
+            &doc,
+            &FilterExpr::And {
+                exprs: vec![
+                    FilterExpr::Eq {
+                        field: "owner".into(),
+                        value: json!({"$user": true}),
+                    },
+                    FilterExpr::Eq {
+                        field: "visibility".into(),
+                        value: json!("public"),
+                    },
+                ],
+            },
+            &ctx,
+        ));
+        assert!(!filter_matches(
+            &doc,
+            &FilterExpr::And {
+                exprs: vec![
+                    FilterExpr::Eq {
+                        field: "owner".into(),
+                        value: json!({"$user": true}),
+                    },
+                    FilterExpr::Eq {
+                        field: "visibility".into(),
+                        value: json!("private"),
+                    },
+                ],
             },
             &ctx,
         ));
@@ -2576,7 +2693,8 @@ mod tests {
             },
             &ctx,
         ));
-        // Not(Exists{archivedat}) -> Exists is false (null) -> Not is true.
+        // Not(Exists{archivedat}) -> Exists is false (field present but null) -> Not is true.
+        // The absent-field case is covered in the over-approximation companion.
         assert!(filter_matches(
             &doc,
             &FilterExpr::Not {
@@ -2597,6 +2715,104 @@ mod tests {
                 user_id: Some("u1".to_string()),
                 email: Some("u1".to_string()),
             },
+        ));
+    }
+
+    /// Security-critical property: the over-approximation rule. A missing field
+    /// or type mismatch NEVER matches — `cmp_json` returns `None` on doubt, so
+    /// the comparison arms yield `false`. This is what makes `filter_matches`
+    /// safe to use as the read/write auth predicate: it can never over-allow on
+    /// ambiguous data. Also pins the absent-vs-present-null distinction for
+    /// `Not(Exists)` and the permissive `Not(Eq)` over an absent field.
+    #[test]
+    fn filter_matches_overapproximates_safely() {
+        let ctx = PrincipalCtx {
+            user_id: Some("u1".to_string()),
+            email: Some("e@x".to_string()),
+        };
+        let doc = json!({"owner":"u1","archivedat":null,"n":5});
+
+        // 1. Missing field on a comparison leaf -> false (no match), for every
+        //    comparison kind. This is the core over-approximation guarantee:
+        //    `Gt` over an absent field cannot accidentally pass.
+        assert!(!filter_matches(
+            &doc,
+            &FilterExpr::Gt {
+                field: "nosuchfield".into(),
+                value: json!(1),
+            },
+            &ctx,
+        ));
+        // `Neq` over a missing field is ALSO false: `is_some_and` means "absent"
+        // is treated as "not a match" rather than "trivially unequal". This is
+        // the conservative direction — a row with a missing field does NOT get
+        // included by a `Neq` predicate.
+        assert!(!filter_matches(
+            &doc,
+            &FilterExpr::Neq {
+                field: "nosuchfield".into(),
+                value: json!("x"),
+            },
+            &ctx,
+        ));
+        // Eq over a missing field is likewise false.
+        assert!(!filter_matches(
+            &doc,
+            &FilterExpr::Eq {
+                field: "nosuchfield".into(),
+                value: json!("x"),
+            },
+            &ctx,
+        ));
+
+        // 2. Type mismatch on a comparison leaf -> false. `doc.owner` is a
+        //    string; comparing it numerically yields `cmp_json == None`, so
+        //    every ordering arm is false rather than coercing or erroring.
+        assert!(!filter_matches(
+            &doc,
+            &FilterExpr::Gt {
+                field: "owner".into(),
+                value: json!(1),
+            },
+            &ctx,
+        ));
+        assert!(!filter_matches(
+            &doc,
+            &FilterExpr::Lt {
+                field: "owner".into(),
+                value: json!(1),
+            },
+            &ctx,
+        ));
+
+        // 3. Not(Exists) over an ABSENT field -> true. Distinct from the
+        //    present-null case (Exists{null} is also false); here the field is
+        //    genuinely missing. Both reduce to `Not(false) == true`, but this
+        //    pins the absent-field behavior explicitly.
+        assert!(filter_matches(
+            &doc,
+            &FilterExpr::Not {
+                expr: Box::new(FilterExpr::Exists {
+                    field: "absentfield".into(),
+                }),
+            },
+            &ctx,
+        ));
+
+        // 4. Not(Eq) over an absent field -> true (the permissive direction
+        //    called out in the implementation doc comment). The inner Eq is
+        //    false (field missing), so Not yields true. Acceptable for a
+        //    server-declared/validated authorize predicate; pinned here so the
+        //    behavior is explicit and visible to reviewers of Tasks 7-9.
+        assert!(filter_matches(
+            &doc,
+            &FilterExpr::Not {
+                expr: Box::new(FilterExpr::Eq {
+                    field: "nosuchfield".into(),
+                    value: json!("anything"),
+                }),
+            },
+            &ctx,
         ));
     }
 }
