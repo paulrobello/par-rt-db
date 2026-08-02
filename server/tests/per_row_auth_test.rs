@@ -2278,6 +2278,16 @@ fn authorize_schema() -> SchemaDef {
     posts_fields.insert("body".to_string(), FieldType::String);
     posts_fields.insert("owner".to_string(), FieldType::String);
     posts_fields.insert("visibility".to_string(), FieldType::String);
+    // `by_owner` lets the upsert-update test (T8-4) target a matched doc via the
+    // declared index; additive — the T6/T7 read tests do not reference indexes.
+    let posts_indexes = vec![IndexDef {
+        name: "by_owner".into(),
+        fields: vec!["owner".into()],
+        search: false,
+        vector: None,
+        unique: false,
+        r#where: None,
+    }];
     let authorize = Some(FilterExpr::Or {
         exprs: vec![
             FilterExpr::Eq {
@@ -2295,7 +2305,7 @@ fn authorize_schema() -> SchemaDef {
         "posts".to_string(),
         TableDef {
             fields: posts_fields,
-            indexes: vec![],
+            indexes: posts_indexes,
             owner_field: None,
             collaborators_field: None,
             ttl: None,
@@ -2625,5 +2635,310 @@ async fn authorize_get_allows_other_users_public() -> anyhow::Result<()> {
         QueryResult::Doc(Some(d)) => assert_eq!(d["body"].as_str(), Some("b-pub")),
         other => panic!("user A get(B-public) should return the doc, got {other:?}"),
     }
+    Ok(())
+}
+
+// ============================================================================
+// Task 8: `authorize` predicate enforcement on the write pre-check
+// (patch/replace/delete/upsert-update → Forbidden).
+// ----------------------------------------------------------------------------
+// `check_owner`/`check_owner_doc` now also evaluate `table.authorize` against
+// the fetched doc when the caller is a user. The `posts` schema declares
+// `authorize: Or[Eq{owner,$user}, Eq{visibility,"public"}]` and NO ownerField,
+// so the owner/collab check is inert here — this isolates authorize-on-writes
+// from the pre-existing ownerField enforcement (covered by tests 10–13).
+
+/// Fetches a single `posts` doc by id with a bypass caller (so the read-path
+/// authorize filter doesn't hide it), mirroring `fetch_doc` for `notes`.
+async fn fetch_post(
+    pool: &PgPool,
+    db: &str,
+    schema: &SchemaDef,
+    id: &str,
+) -> Option<serde_json::Value> {
+    let mut q = posts_query();
+    q.get = Some(id.to_string());
+    match execute_query(pool, db, schema, &q, &PrincipalCtx::bypass()).await {
+        Ok(QueryResult::Doc(d)) => d,
+        other => panic!("expected Doc, got {other:?}"),
+    }
+}
+
+// (T8-1) User A `patch(B-private)` → Forbidden AND the txn aborts atomically:
+// a preceding insert by A is rolled back, and B-private is left unchanged.
+// The predicate makes B-private invisible to A (A neither owns it nor is it
+// public), so the write pre-check rejects before `do_patch` runs.
+#[tokio::test]
+async fn authorize_patch_on_unauthorized_doc_is_forbidden_and_atomic() -> anyhow::Result<()> {
+    let (pool, db, schema) = setup_authorize().await;
+    let b_priv_id = seed_post(&pool, &db, &schema, "b-priv", "bob", "private").await;
+
+    // Step 1 would succeed on its own (A inserts own private post). Step 2 is a
+    // Forbidden patch of B's private post. The combined txn must fail AND roll
+    // back step 1.
+    let mut a_insert = serde_json::Map::new();
+    a_insert.insert("body".into(), "a-temp".into());
+    a_insert.insert("owner".into(), "alice".into());
+    a_insert.insert("visibility".into(), "private".into());
+    let mut patch_fields = serde_json::Map::new();
+    patch_fields.insert("body".into(), "hacked".into());
+    let err = execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![
+                Step::Insert {
+                    table: "posts".into(),
+                    doc: a_insert,
+                },
+                Step::Patch {
+                    table: "posts".into(),
+                    id: b_priv_id.clone(),
+                    fields: patch_fields,
+                },
+            ],
+        },
+        &PrincipalCtx {
+            user_id: Some("alice".to_string()),
+            email: None,
+        },
+    )
+    .await
+    .expect_err("patch on unauthorized doc must fail");
+    assert_eq!(
+        err.code,
+        ErrorCode::Forbidden,
+        "expected FORBIDDEN, got {:?}: {}",
+        err.code,
+        err.message
+    );
+
+    // Atomicity: B-private is unchanged...
+    let b_doc = fetch_post(&pool, &db, &schema, &b_priv_id)
+        .await
+        .expect("b-private present");
+    assert_eq!(b_doc["body"].as_str(), Some("b-priv"));
+
+    // ...and A's preceding insert was rolled back (no "a-temp" row).
+    let mut q = posts_query();
+    q.take = Some(100);
+    let all = bodies(execute_query(&pool, &db, &schema, &q, &PrincipalCtx::bypass()).await?);
+    assert!(
+        !all.iter().any(|b| b == "a-temp"),
+        "preceding insert must be rolled back, got {all:?}"
+    );
+    assert_eq!(all, vec!["b-priv".to_string()]);
+    Ok(())
+}
+
+// (T8-2) User A `patch(own private)` → ok (owns it). User A `delete(B-public)`
+// → ok (public is authorized under the `Or` branch — anyone may mutate a
+// public row). Confirms the predicate is evaluated, not blanket owner-only.
+#[tokio::test]
+async fn authorize_patch_own_and_delete_other_public_succeed() -> anyhow::Result<()> {
+    let (pool, db, schema) = setup_authorize().await;
+    let a_priv_id = seed_post(&pool, &db, &schema, "a-priv", "alice", "private").await;
+    let b_pub_id = seed_post(&pool, &db, &schema, "b-pub", "bob", "public").await;
+
+    // A patches own private doc -> ok.
+    let mut patch_fields = serde_json::Map::new();
+    patch_fields.insert("body".into(), "a-edited".into());
+    execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::Patch {
+                table: "posts".into(),
+                id: a_priv_id.clone(),
+                fields: patch_fields,
+            }],
+        },
+        &PrincipalCtx {
+            user_id: Some("alice".to_string()),
+            email: None,
+        },
+    )
+    .await
+    .expect("patch own doc should succeed");
+    let a_doc = fetch_post(&pool, &db, &schema, &a_priv_id)
+        .await
+        .expect("a-priv present");
+    assert_eq!(a_doc["body"].as_str(), Some("a-edited"));
+
+    // A deletes B's public doc -> ok (public branch of authorize predicate).
+    execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::Delete {
+                table: "posts".into(),
+                id: b_pub_id.clone(),
+            }],
+        },
+        &PrincipalCtx {
+            user_id: Some("alice".to_string()),
+            email: None,
+        },
+    )
+    .await
+    .expect("delete other user's public doc should succeed");
+    assert!(
+        fetch_post(&pool, &db, &schema, &b_pub_id).await.is_none(),
+        "b-public should be deleted"
+    );
+    Ok(())
+}
+
+// (T8-3) Replace and Delete on a doc the user is NOT authorized for (B-private)
+// are both Forbidden, and the target survives untouched. Mirrors the ownerField
+// test (test 11) for the authorize path.
+#[tokio::test]
+async fn authorize_replace_and_delete_on_unauthorized_doc_are_forbidden() -> anyhow::Result<()> {
+    let (pool, db, schema) = setup_authorize().await;
+    let b_priv_id = seed_post(&pool, &db, &schema, "b-priv", "bob", "private").await;
+
+    // Delete by alice on B-private -> Forbidden.
+    let err = execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::Delete {
+                table: "posts".into(),
+                id: b_priv_id.clone(),
+            }],
+        },
+        &PrincipalCtx {
+            user_id: Some("alice".to_string()),
+            email: None,
+        },
+    )
+    .await
+    .expect_err("delete on unauthorized doc must fail");
+    assert_eq!(err.code, ErrorCode::Forbidden);
+
+    // B-private survived the delete attempt.
+    let b_doc = fetch_post(&pool, &db, &schema, &b_priv_id)
+        .await
+        .expect("b-private present after delete attempt");
+    assert_eq!(b_doc["body"].as_str(), Some("b-priv"));
+
+    // Replace by alice on B-private -> Forbidden.
+    let mut replace_doc = serde_json::Map::new();
+    replace_doc.insert("body".into(), "hacked".into());
+    replace_doc.insert("owner".into(), "alice".into());
+    replace_doc.insert("visibility".into(), "private".into());
+    let err = execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::Replace {
+                table: "posts".into(),
+                id: b_priv_id.clone(),
+                doc: replace_doc,
+            }],
+        },
+        &PrincipalCtx {
+            user_id: Some("alice".to_string()),
+            email: None,
+        },
+    )
+    .await
+    .expect_err("replace on unauthorized doc must fail");
+    assert_eq!(err.code, ErrorCode::Forbidden);
+
+    // B-private survived the replace attempt too.
+    let b_doc = fetch_post(&pool, &db, &schema, &b_priv_id)
+        .await
+        .expect("b-private present after replace attempt");
+    assert_eq!(b_doc["body"].as_str(), Some("b-priv"));
+    assert_eq!(b_doc["owner"].as_str(), Some("bob"));
+    Ok(())
+}
+
+// (T8-4) Upsert-update branch: when the matched doc is one the caller is not
+// authorized for (B-private), the update is Forbidden — `check_owner_doc`
+// evaluates the predicate on the in-hand doc. The insert branch (no match) is
+// unaffected (insert enforcement is T9).
+#[tokio::test]
+async fn authorize_upsert_update_on_unauthorized_doc_is_forbidden() -> anyhow::Result<()> {
+    let (pool, db, schema) = setup_authorize().await;
+    let b_priv_id = seed_post(&pool, &db, &schema, "b-priv", "bob", "private").await;
+
+    // Match B-private via the `by_owner` index (eq=["bob"]). The update branch
+    // hits check_owner_doc, which must reject alice (B-private is not hers and
+    // not public).
+    let mut insert_doc = serde_json::Map::new();
+    insert_doc.insert("body".into(), "ignored".into());
+    insert_doc.insert("owner".into(), "bob".into());
+    insert_doc.insert("visibility".into(), "private".into());
+    let mut patch_fields = serde_json::Map::new();
+    patch_fields.insert("body".into(), "hacked".into());
+    let err = execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::Upsert {
+                table: "posts".into(),
+                index: "by_owner".into(),
+                eq: vec!["bob".into()],
+                insert: insert_doc,
+                patch: patch_fields,
+            }],
+        },
+        &PrincipalCtx {
+            user_id: Some("alice".to_string()),
+            email: None,
+        },
+    )
+    .await
+    .expect_err("upsert update on unauthorized doc must fail");
+    assert_eq!(err.code, ErrorCode::Forbidden);
+
+    // B-private survived untouched.
+    let b_doc = fetch_post(&pool, &db, &schema, &b_priv_id)
+        .await
+        .expect("b-private present");
+    assert_eq!(b_doc["body"].as_str(), Some("b-priv"));
+    Ok(())
+}
+
+// (T8-5) Bypass callers (machine tokens, admin, scheduled jobs) are NOT subject
+// to `authorize` on the write path either — they can patch/delete/replace any
+// row. Preserves machine-token full-access behavior on authorize-only tables.
+#[tokio::test]
+async fn authorize_bypass_write_ignores_predicate() -> anyhow::Result<()> {
+    let (pool, db, schema) = setup_authorize().await;
+    let b_priv_id = seed_post(&pool, &db, &schema, "b-priv", "bob", "private").await;
+
+    // Bypass patches B-private -> ok.
+    let mut patch_fields = serde_json::Map::new();
+    patch_fields.insert("body".into(), "machine-changed".into());
+    execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::Patch {
+                table: "posts".into(),
+                id: b_priv_id.clone(),
+                fields: patch_fields,
+            }],
+        },
+        &PrincipalCtx::bypass(),
+    )
+    .await
+    .expect("bypass patch should succeed");
+
+    let doc = fetch_post(&pool, &db, &schema, &b_priv_id)
+        .await
+        .expect("doc present");
+    assert_eq!(doc["body"].as_str(), Some("machine-changed"));
+    assert_eq!(doc["owner"].as_str(), Some("bob"));
     Ok(())
 }

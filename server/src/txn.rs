@@ -7,6 +7,7 @@ use crate::auth::PrincipalCtx;
 use crate::db::{new_id, now_ms, validate_db_name};
 use crate::ddl::{pg_col, pg_schema, pg_table};
 use crate::error::RtDbError;
+use crate::query::filter_matches;
 use crate::schema::{
     FieldType, IndexDef, SchemaDef, TableDef, indexed_column_type, validate_doc, validate_value,
 };
@@ -907,22 +908,28 @@ pub fn row_visible_to(
     owner_match || collab_match
 }
 
-/// Ownership pre-check for patch/replace/delete: fetches the doc and rejects
-/// `Forbidden` if a user caller neither owns it nor is listed as a
-/// collaborator. A missing doc returns `Ok` (the subsequent do_* step reports
-/// `NotFound`). Bypass/no-owner-table: no-op.
+/// Ownership + authorize pre-check for patch/replace/delete: fetches the doc
+/// and rejects `Forbidden` when a user caller fails EITHER gate the table
+/// declares — `ownerField`/`collaboratorsField` (OR-enforced by `row_visible_to`)
+/// OR the `authorize` predicate (`filter_matches`). A table may declare both;
+/// both must pass. A missing doc returns `Ok` (the subsequent do_* step reports
+/// `NotFound`). Bypass caller (`ctx.user_id` None — machine/admin/scheduled) and
+/// tables declaring neither gate: no-op.
 async fn check_owner(
     conn: &mut PgConnection,
     pg_schema_name: &str,
     table_def: &TableDef,
     table_name: &str,
     id: &str,
-    owner: Option<&str>,
+    ctx: &PrincipalCtx,
 ) -> Result<(), RtDbError> {
-    let enforced_uid = row_auth_enforced_uid(table_def, owner);
-    let Some(uid) = enforced_uid else {
+    let owner_uid = row_auth_enforced_uid(table_def, ctx.user_id.as_deref());
+    let authorize = table_def.authorize.as_ref();
+    let user_is_some = ctx.user_id.is_some();
+    // Neither gate applies (bypass caller, or table declares nothing) → no-op.
+    if owner_uid.is_none() && !(authorize.is_some() && user_is_some) {
         return Ok(());
-    };
+    }
     let table_ident = pg_table(table_name);
     let row: Option<(serde_json::Value,)> = sqlx::query_as(&format!(
         "SELECT \"doc\" FROM \"{pg_schema_name}\".\"{table_ident}\" WHERE \"id\" = $1"
@@ -930,41 +937,65 @@ async fn check_owner(
     .bind(id)
     .fetch_optional(&mut *conn)
     .await?;
-    match row {
-        None => Ok(()),
-        Some((doc,)) => {
-            if !row_visible_to(
-                &doc,
-                table_def.owner_field.as_deref(),
-                table_def.collaborators_field.as_deref(),
-                uid,
-            ) {
-                return Err(RtDbError::forbidden(format!(
-                    "document '{id}' is not accessible to the caller"
-                )));
-            }
-            Ok(())
-        }
+    let Some((doc,)) = row else {
+        return Ok(());
+    };
+    if let Some(uid) = owner_uid
+        && !row_visible_to(
+            &doc,
+            table_def.owner_field.as_deref(),
+            table_def.collaborators_field.as_deref(),
+            uid,
+        )
+    {
+        return Err(RtDbError::forbidden(format!(
+            "document '{id}' is not accessible to the caller"
+        )));
     }
+    if let Some(authorize) = authorize
+        && user_is_some
+        && !filter_matches(&doc, authorize, ctx)
+    {
+        return Err(RtDbError::forbidden(format!(
+            "document '{id}' is not accessible to the caller"
+        )));
+    }
+    Ok(())
 }
 
-/// Ownership check on a doc already in hand (upsert update branch).
+/// Ownership + authorize check on a doc already in hand (upsert update branch).
+/// Same composition as `check_owner`: a user caller must pass both the
+/// `ownerField`/`collaboratorsField` gate and the `authorize` predicate when
+/// the table declares them. Bypass/no-gate: no-op.
 fn check_owner_doc(
     table_def: &TableDef,
     doc: &serde_json::Map<String, serde_json::Value>,
     id: &str,
-    owner: Option<&str>,
+    ctx: &PrincipalCtx,
 ) -> Result<(), RtDbError> {
-    let Some(uid) = row_auth_enforced_uid(table_def, owner) else {
+    let owner_uid = row_auth_enforced_uid(table_def, ctx.user_id.as_deref());
+    let authorize = table_def.authorize.as_ref();
+    let user_is_some = ctx.user_id.is_some();
+    if owner_uid.is_none() && !(authorize.is_some() && user_is_some) {
         return Ok(());
-    };
+    }
     let doc_value = serde_json::Value::Object(doc.clone());
-    if !row_visible_to(
-        &doc_value,
-        table_def.owner_field.as_deref(),
-        table_def.collaborators_field.as_deref(),
-        uid,
-    ) {
+    if let Some(uid) = owner_uid
+        && !row_visible_to(
+            &doc_value,
+            table_def.owner_field.as_deref(),
+            table_def.collaborators_field.as_deref(),
+            uid,
+        )
+    {
+        return Err(RtDbError::forbidden(format!(
+            "document '{id}' is not accessible to the caller"
+        )));
+    }
+    if let Some(authorize) = authorize
+        && user_is_some
+        && !filter_matches(&doc_value, authorize, ctx)
+    {
         return Err(RtDbError::forbidden(format!(
             "document '{id}' is not accessible to the caller"
         )));
@@ -1044,7 +1075,7 @@ pub async fn execute_txn(
             }
             Step::Patch { table, id, fields } => {
                 let table_def = schema.table(table)?;
-                check_owner(&mut tx, &pg_schema_name, table_def, table, id, owner).await?;
+                check_owner(&mut tx, &pg_schema_name, table_def, table, id, ctx).await?;
                 let fields = stamp_owner(table_def, fields.clone(), owner);
                 let (pre_doc, merged, created_at) =
                     do_patch(&mut tx, &pg_schema_name, table_def, table, id, &fields).await?;
@@ -1063,7 +1094,7 @@ pub async fn execute_txn(
             }
             Step::Replace { table, id, doc } => {
                 let table_def = schema.table(table)?;
-                check_owner(&mut tx, &pg_schema_name, table_def, table, id, owner).await?;
+                check_owner(&mut tx, &pg_schema_name, table_def, table, id, ctx).await?;
                 let doc = stamp_owner(table_def, doc.clone(), owner);
                 let (old_doc, new_doc, created_at) =
                     do_replace(&mut tx, &pg_schema_name, table_def, table, id, &doc).await?;
@@ -1079,7 +1110,7 @@ pub async fn execute_txn(
             }
             Step::Delete { table, id } => {
                 let table_def = schema.table(table)?;
-                check_owner(&mut tx, &pg_schema_name, table_def, table, id, owner).await?;
+                check_owner(&mut tx, &pg_schema_name, table_def, table, id, ctx).await?;
                 do_delete(&mut tx, &pg_schema_name, table, id).await?;
                 write_set.touch(table, id, OpKind::Delete);
                 // Delete records no value: `after = None` marks it deleted so
@@ -1141,7 +1172,7 @@ pub async fn execute_txn(
                                 return Err(RtDbError::internal("stored doc is not a JSON object"));
                             }
                         };
-                        check_owner_doc(table_def, &doc, &id, owner)?;
+                        check_owner_doc(table_def, &doc, &id, ctx)?;
                         let patch = stamp_owner(table_def, patch.clone(), owner);
                         let pre_doc = doc.clone();
                         let merged = apply_patch(table_def, doc, &patch)?;
