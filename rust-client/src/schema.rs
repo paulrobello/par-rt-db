@@ -149,6 +149,20 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
+/// Declarative document TTL (auto-expiry). `field` names a declared numeric
+/// field whose value is each document's absolute epoch-ms expiry; the in-memory
+/// harness's [`crate::in_memory::InMemoryRtDbClient::tick`] reaps rows whose
+/// value is in the past (mirroring the live server's per-db reaper).
+/// `default_duration_ms` stamps the field at insert time when the caller omits
+/// it. Mirrors `server/src/schema.rs::TtlDef` byte-for-byte (camelCase wire).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TtlDef {
+    pub field: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_duration_ms: Option<i64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TableDef {
     pub fields: BTreeMap<String, FieldType>,
@@ -176,6 +190,12 @@ pub struct TableDef {
         rename = "collaboratorsField"
     )]
     pub collaborators_field: Option<String>,
+    /// Declarative document TTL. When `Some`, the in-memory harness's `tick`
+    /// reaps rows whose `ttl.field` value is in the past. Additive — schemas
+    /// without it deserialize unchanged. Mirrors `server/src/schema.rs::TableDef`
+    /// byte-for-byte (wire key `ttl`).
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "ttl")]
+    pub ttl: Option<TtlDef>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -191,6 +211,7 @@ pub struct TableBuilder {
     indexes: Vec<IndexDef>,
     owner_field: Option<String>,
     collaborators_field: Option<String>,
+    ttl: Option<TtlDef>,
     /// Index of the most recently pushed [`IndexDef`] in [`Self::indexes`], so
     /// the chainable `.unique()` / `.where_clause()` setters can configure it
     /// after `index`/`search_index`/`vector_index` returned `self`. `None`
@@ -205,6 +226,7 @@ impl TableBuilder {
             indexes: Vec::new(),
             owner_field: None,
             collaborators_field: None,
+            ttl: None,
             last_index: None,
         }
     }
@@ -308,6 +330,21 @@ impl TableBuilder {
         self.collaborators_field = Some(field.into());
         self
     }
+
+    /// Declare document TTL (auto-expiry). `field` names a declared numeric
+    /// field whose value is each document's absolute epoch-ms expiry; the
+    /// in-memory harness's `tick` reaps rows whose value is in the past.
+    /// `default_duration_ms` stamps the field at insert time when the caller
+    /// omits it. Server-enforced on the live server; the client only declares
+    /// it and round-trips it on the wire as `ttl`. Mirrors the TS client's
+    /// chainable `.ttl(field, defaultDurationMs?)`.
+    pub fn ttl(mut self, field: &str, default_duration_ms: Option<i64>) -> Self {
+        self.ttl = Some(TtlDef {
+            field: field.into(),
+            default_duration_ms,
+        });
+        self
+    }
     fn finish(self) -> TableDef {
         let indexes = if self.indexes.is_empty() {
             None
@@ -319,6 +356,7 @@ impl TableBuilder {
             indexes,
             owner_field: self.owner_field,
             collaborators_field: self.collaborators_field,
+            ttl: self.ttl,
         }
     }
 }

@@ -1553,7 +1553,8 @@ impl InMemoryRtDbClient {
         table_def: &TableDef,
         doc: &Map<String, Value>,
     ) -> Result<String, RtDbError> {
-        let doc_value = Value::Object(doc.clone());
+        let stamped = stamp_ttl_default(table_def, doc, (self.now)());
+        let doc_value = Value::Object(stamped);
         validate_doc(table_def, &doc_value)?;
         let stored = strip_unset_optionals(table_def, &doc_value);
         self.check_unique_indexes(table_def, table_name, &stored, None)?;
@@ -2012,7 +2013,13 @@ impl InMemoryRtDbClient {
     /// the TS harness, where only `Paused` jobs are skipped. Pass `now_ms` to
     /// drive the clock deterministically; omit it to use the client's injected
     /// clock. Ports `tick` (`ts-client/src/in_memory.ts:683-706`).
-    pub fn tick(&mut self, now_ms: Option<i64>) {
+    ///
+    /// Also reaps expired documents: any table that declares a `ttl` has rows
+    /// removed whose TTL field value is a number strictly less than `now` (a
+    /// no-op for tables without TTL). Returns the count of documents reaped.
+    /// The live server's per-db reaper is the real expiry; this is best-effort,
+    /// for tests/local workflows. Mirrors TS `tick` (`ts-client/src/in_memory.ts:1156-1190`).
+    pub fn tick(&mut self, now_ms: Option<i64>) -> usize {
         let now = now_ms.unwrap_or_else(|| (self.now)());
         // Iterate by index so we can mutate (`pause`/error) and remove in place
         // without invalidating a borrow on `self.schedules`.
@@ -2062,6 +2069,47 @@ impl InMemoryRtDbClient {
             }
             i += 1;
         }
+        self.reap_ttl(now)
+    }
+
+    /// Removes documents whose TTL field value is a number strictly less than
+    /// `now`, for every table that declares a `ttl`. Fires subscription fan-out
+    /// for touched tables (mirroring `execute_transaction`). Returns the count
+    /// removed. Ports TS `reapTtl` (`ts-client/src/in_memory.ts:1196-1221`).
+    fn reap_ttl(&mut self, now: i64) -> usize {
+        // Collect the (table, id) keys to remove — we can't mutate `self.docs`
+        // while iterating it, so gather first then drain. A doc qualifies only
+        // when its TTL field is a JSON number strictly less than `now`; a
+        // missing or non-numeric TTL field is left alone (over-approximate
+        // safely: never reap a doc that might still be live).
+        let mut to_remove: Vec<(String, String)> = Vec::new();
+        for (table_name, table_def) in &self.tables {
+            let Some(ttl) = &table_def.ttl else {
+                continue;
+            };
+            for ((t, id), row) in &self.docs {
+                if t != table_name {
+                    continue;
+                }
+                let reap = matches!(row.doc.get(&ttl.field),
+                    Some(Value::Number(n)) if n.as_f64().is_some_and(|v| v < now as f64));
+                if reap {
+                    to_remove.push((table_name.clone(), id.clone()));
+                }
+            }
+        }
+        let mut removed = 0usize;
+        let mut touched: BTreeSet<String> = BTreeSet::new();
+        for key in &to_remove {
+            if self.docs.remove(key).is_some() {
+                removed += 1;
+                touched.insert(key.0.clone());
+            }
+        }
+        if !touched.is_empty() {
+            self.notify_subs(&touched);
+        }
+        removed
     }
 
     /// Initial `due_at` for a schedule's `when`, mirroring `dueAtFor`
@@ -2561,6 +2609,31 @@ pub fn strip_unset_optionals(table: &TableDef, doc: &Value) -> Value {
         out.insert(key.clone(), value.clone());
     }
     Value::Object(out)
+}
+
+/// Stamps the TTL field at insert when the table declares a
+/// `default_duration_ms` and the document omits the field. After this, the TTL
+/// field is ordinary (patch/replace manipulate it normally). Mirrors server
+/// `txn::stamp_ttl_default` and the TS `stampTtlDefault`
+/// (`ts-client/src/in_memory.ts:407-425`); runs BEFORE validation so the
+/// stamped value satisfies a required numeric field. Returns a cloned map with
+/// the field set when a stamp is applied, otherwise the original doc cloned
+/// unchanged.
+fn stamp_ttl_default(
+    table_def: &TableDef,
+    doc: &Map<String, Value>,
+    now: i64,
+) -> Map<String, Value> {
+    if let Some(ttl) = &table_def.ttl
+        && let Some(d) = ttl.default_duration_ms
+        && !doc.contains_key(&ttl.field)
+    {
+        let mut out = doc.clone();
+        out.insert(ttl.field.clone(), Value::from(now + d));
+        out
+    } else {
+        doc.clone()
+    }
 }
 
 /// Applies a patch's `fields` onto `doc` — a port of server `txn::apply_patch`
