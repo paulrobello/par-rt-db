@@ -806,9 +806,12 @@ async fn ws_subscribe_rate_limited_keeps_connection_open() -> anyhow::Result<()>
     assert_eq!(msg["type"], json!("subscribeErr"));
     assert_eq!(msg["queryId"], json!("qlim"));
     assert_eq!(msg["error"]["code"], json!("RATE_LIMITED"));
+    let retry_after = msg["error"]["retryAfter"]
+        .as_u64()
+        .expect("retryAfter present");
     assert!(
-        msg["error"]["retryAfter"].as_u64().is_some(),
-        "retryAfter present"
+        (1..=60).contains(&retry_after),
+        "retryAfter within one fixed-window minute: got {retry_after}"
     );
 
     send_json(&mut ws, json!({"type": "ping"})).await;
