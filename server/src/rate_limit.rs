@@ -99,11 +99,12 @@ impl RateLimiter {
 /// `Machine` principals — OAuth sessions have no machine-token identity and are
 /// rate-limited per-db only, by design. Order is per-token then per-db: a
 /// request that would blow either budget is denied with `RateLimited`.
-pub async fn check_http_rate_limits(
-    state: &AppState,
-    principal: &Principal,
-    db: &str,
-) -> Result<(), RtDbError> {
+/// Runs the per-token then per-db fixed-window checks in order, returning the
+/// first denial (with its `retry_after_secs` hint) or `Allowed`. The per-token
+/// check applies only to `Principal::Machine` (OAuth sessions have no
+/// machine-token identity and skip straight to per-db). Shared by the HTTP
+/// gate (`check_http_rate_limits`) and the WS `Mutate`/`Subscribe` arms.
+pub async fn evaluate(state: &AppState, principal: &Principal, db: &str) -> RateDecision {
     let token_limit = state.config.rate_limit_per_token_rpm;
     if token_limit > 0
         && let Principal::Machine { token_id, .. } = principal
@@ -112,7 +113,7 @@ pub async fn check_http_rate_limits(
             .check(RateKey::Token(token_id.clone()), token_limit)
             .await
     {
-        return Err(RtDbError::rate_limited(retry_after_secs));
+        return RateDecision::Denied { retry_after_secs };
     }
 
     let db_limit = state.config.rate_limit_per_db_rpm;
@@ -122,10 +123,27 @@ pub async fn check_http_rate_limits(
             .check(RateKey::Db(db.to_string()), db_limit)
             .await
     {
-        return Err(RtDbError::rate_limited(retry_after_secs));
+        return RateDecision::Denied { retry_after_secs };
     }
 
-    Ok(())
+    RateDecision::Allowed
+}
+
+/// Per-request HTTP rate-limit gate. Runs after `authorize` so an unauthorized
+/// request never consumes rate-limit budget (a revoked token / wrong-db attempt
+/// fails at `authorize` and never reaches this). Per-token applies only to
+/// `Machine` principals — OAuth sessions have no machine-token identity and are
+/// rate-limited per-db only, by design. Order is per-token then per-db: a
+/// request that would blow either budget is denied with `RateLimited`.
+pub async fn check_http_rate_limits(
+    state: &AppState,
+    principal: &Principal,
+    db: &str,
+) -> Result<(), RtDbError> {
+    match evaluate(state, principal, db).await {
+        RateDecision::Denied { retry_after_secs } => Err(RtDbError::rate_limited(retry_after_secs)),
+        RateDecision::Allowed => Ok(()),
+    }
 }
 
 #[cfg(test)]
