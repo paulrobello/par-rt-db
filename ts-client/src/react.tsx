@@ -199,14 +199,26 @@ export function AuthLoading(props: { children: ReactNode }): ReactNode {
 export const OAUTH_POLL_INTERVAL_MS = 800;
 export const OAUTH_POLL_TIMEOUT_MS = 180_000;
 
-/** One poll of `/auth/state`; resolves with the token on `complete`. */
+/** One poll of `/auth/state`; resolves with the token on `complete`.
+ *  A transient fetch failure or malformed body keeps polling (returns
+ *  `{ done: false }`); only a terminal `expired`/`error` status rejects. */
 async function pollOAuthState(
   apiBase: string,
   state: string,
 ): Promise<{ done: true; token: string } | { done: false }> {
-  const resp = await fetch(`${apiBase}/auth/state?state=${encodeURIComponent(state)}`);
+  let resp: Response;
+  try {
+    resp = await fetch(`${apiBase}/auth/state?state=${encodeURIComponent(state)}`);
+  } catch {
+    return { done: false };
+  }
   if (!resp.ok) return { done: false };
-  const data = (await resp.json()) as { status?: string; token?: string };
+  let data: { status?: string; token?: string };
+  try {
+    data = (await resp.json()) as { status?: string; token?: string };
+  } catch {
+    return { done: false };
+  }
   if (data.status === "complete" && typeof data.token === "string") {
     return { done: true, token: data.token };
   }
