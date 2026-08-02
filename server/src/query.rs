@@ -1,7 +1,9 @@
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
 use sqlx::PgPool;
 
+use crate::auth::PrincipalCtx;
 use crate::db::validate_db_name;
 use crate::ddl::{pg_col, pg_schema, pg_search_col, pg_table, pg_vector_col};
 use crate::error::RtDbError;
@@ -1659,6 +1661,111 @@ fn render_filter_literal_node(node: &FilterExpr, table: &TableDef) -> Result<Str
     }
 }
 
+// ============ Doc-level filter evaluator (model C `authorize`) ============
+
+/// Resolves a principal marker to its `Value`: `{"$user": true}` → the caller's
+/// `user_id`, `{"$email": true}` → the caller's `email`. A marker whose
+/// principal field is `None` (a `Machine`/admin/scheduled caller) resolves to
+/// `Null`, which cannot equal any non-null doc field — i.e. the predicate
+/// silently fails to match, the safe over-approximation. Non-marker values pass
+/// through unchanged.
+fn resolve_value(v: &serde_json::Value, ctx: &PrincipalCtx) -> serde_json::Value {
+    if let serde_json::Value::Object(map) = v
+        && map.len() == 1
+    {
+        if let Some(true) = map.get("$user").and_then(|x| x.as_bool()) {
+            return ctx
+                .user_id
+                .clone()
+                .map(serde_json::Value::String)
+                .unwrap_or(serde_json::Value::Null);
+        }
+        if let Some(true) = map.get("$email").and_then(|x| x.as_bool()) {
+            return ctx
+                .email
+                .clone()
+                .map(serde_json::Value::String)
+                .unwrap_or(serde_json::Value::Null);
+        }
+    }
+    v.clone()
+}
+
+/// Typed comparison between a doc field value (`a`, `None` when the field is
+/// absent) and a resolved predicate value (`b`). Numbers compare as `f64`,
+/// strings compare as `str`, booleans compare as `bool`. Returns `None` on any
+/// type-mismatch or missing field — the over-approximation that ensures a
+/// `Gt`/`Gte`/`Lt`/`Lte` leaf with doubt can never match erroneously (the
+/// comparison arms in `filter_matches` treat `None` as "no match").
+fn cmp_json(a: Option<&serde_json::Value>, b: &serde_json::Value) -> Option<Ordering> {
+    let a = a?;
+    // Numbers compare as f64 regardless of integer/float width.
+    if let (Some(an), Some(bn)) = (a.as_f64(), b.as_f64()) {
+        return an.partial_cmp(&bn);
+    }
+    if let (Some(as_), Some(bs)) = (a.as_str(), b.as_str()) {
+        return Some(as_.cmp(bs));
+    }
+    if let (Some(ab), Some(bb)) = (a.as_bool(), b.as_bool()) {
+        return Some(ab.cmp(&bb));
+    }
+    None
+}
+
+/// Evaluates `expr` against an in-memory `doc` with principal markers resolved
+/// against `ctx`. This is the Rust-level counterpart to the SQL `compile_filter`
+/// path, used where a doc is already materialized: point-reads, write
+/// pre-checks, and insert verification (Tasks 7-9).
+///
+/// Over-approximation rule: any missing-field or type-mismatch doubt in a
+/// comparison yields "no match" (`cmp_json` returns `None` ⇒ the comparison
+/// arms are `false`), so `filter_matches` never matches erroneously. It is a
+/// pure boolean; the caller decides the security default on a `false` result
+/// (Forbidden for writes, excluded for reads) — `filter_matches` does NOT
+/// decide Forbidden vs. filter.
+///
+/// `Contains` uses deep equality (`Value ==`) to match the three clients'
+/// in-memory evaluators (Task 2). The server's SQL path compiles to jsonb `?`,
+/// a text-level containment test; the two agree for scalar/string array
+/// elements — the only realistic auth case (e.g. `$user ∈ doc.editors[]`).
+///
+/// `Not` note: `Not(Eq { field, value })` when `field` is absent evaluates the
+/// inner `Eq` to `false`, so `Not` yields `true`. For a server-declared
+/// `authorize` predicate this is acceptable — the predicate is validated and
+/// inserts are stamped/verified — but a `Not(Eq)` over an absent field is
+/// permissive by construction. Reviewers should be aware.
+pub fn filter_matches(doc: &serde_json::Value, expr: &FilterExpr, ctx: &PrincipalCtx) -> bool {
+    match expr {
+        FilterExpr::Eq { field, value } => doc
+            .get(field)
+            .is_some_and(|d| d == &resolve_value(value, ctx)),
+        FilterExpr::Neq { field, value } => doc
+            .get(field)
+            .is_some_and(|d| d != &resolve_value(value, ctx)),
+        FilterExpr::Gt { field, value } => cmp_json(doc.get(field), &resolve_value(value, ctx))
+            .is_some_and(|o| o == Ordering::Greater),
+        FilterExpr::Gte { field, value } => cmp_json(doc.get(field), &resolve_value(value, ctx))
+            .is_some_and(|o| o != Ordering::Less),
+        FilterExpr::Lt { field, value } => cmp_json(doc.get(field), &resolve_value(value, ctx))
+            .is_some_and(|o| o == Ordering::Less),
+        FilterExpr::Lte { field, value } => cmp_json(doc.get(field), &resolve_value(value, ctx))
+            .is_some_and(|o| o != Ordering::Greater),
+        FilterExpr::In { field, values } => doc
+            .get(field)
+            .is_some_and(|d| values.iter().any(|v| d == &resolve_value(v, ctx))),
+        FilterExpr::And { exprs } => exprs.iter().all(|e| filter_matches(doc, e, ctx)),
+        FilterExpr::Or { exprs } => exprs.iter().any(|e| filter_matches(doc, e, ctx)),
+        // `Not` inverts the inner boolean; see the doc comment for the
+        // absent-field-permissive subtlety.
+        FilterExpr::Not { expr } => !filter_matches(doc, expr, ctx),
+        FilterExpr::Contains { field, value } => doc
+            .get(field)
+            .and_then(|v| v.as_array())
+            .is_some_and(|arr| arr.iter().any(|v| v == &resolve_value(value, ctx))),
+        FilterExpr::Exists { field } => doc.get(field).is_some_and(|v| !v.is_null()),
+    }
+}
+
 /// Compiles a binary comparison leaf into `lhs OP $pos` and pushes one typed bind.
 fn compile_comparison(
     field: &str,
@@ -2299,7 +2406,10 @@ pub fn canonical(result: &QueryResult) -> String {
 mod tests {
     use std::collections::BTreeMap;
 
-    use super::{FilterExpr, compile_filter, compile_filter_literal};
+    use serde_json::json;
+
+    use super::{FilterExpr, compile_filter, compile_filter_literal, filter_matches};
+    use crate::auth::PrincipalCtx;
     use crate::schema::{FieldType, IndexDef, TableDef};
 
     /// Builds a one-field `TableDef` whose single field is indexed, so
@@ -2405,5 +2515,88 @@ mod tests {
             sql,
             "(doc ? 'archivedat' AND doc->>'archivedat' IS NOT NULL)"
         );
+    }
+
+    /// Exercises every `FilterExpr` variant plus the two principal markers
+    /// (`$user`, `$email`) for the Rust-level doc evaluator. This is the
+    /// RED-GREEN gate for Task 3 of the per-row-auth-predicate SDD.
+    #[test]
+    fn filter_matches_all_variants_and_principal() {
+        let ctx = PrincipalCtx {
+            user_id: Some("u1".to_string()),
+            email: Some("e@x".to_string()),
+        };
+        let doc =
+            json!({"owner":"u1","editors":["u1","u2"],"visibility":"public","archivedat":null});
+
+        // Eq with `$user` marker resolves to ctx.user_id ("u1") -> matches doc.owner.
+        assert!(filter_matches(
+            &doc,
+            &FilterExpr::Eq {
+                field: "owner".into(),
+                value: json!({"$user": true}),
+            },
+            &ctx,
+        ));
+        // Different principal -> no match.
+        assert!(!filter_matches(
+            &doc,
+            &FilterExpr::Eq {
+                field: "owner".into(),
+                value: json!({"$user": true}),
+            },
+            &PrincipalCtx {
+                user_id: Some("u9".to_string()),
+                email: None,
+            },
+        ));
+        // Contains with `$user` marker against editors[] (deep-equality semantics).
+        assert!(filter_matches(
+            &doc,
+            &FilterExpr::Contains {
+                field: "editors".into(),
+                value: json!({"$user": true}),
+            },
+            &ctx,
+        ));
+        // Or: visibility public OR owner is caller.
+        assert!(filter_matches(
+            &doc,
+            &FilterExpr::Or {
+                exprs: vec![
+                    FilterExpr::Eq {
+                        field: "visibility".into(),
+                        value: json!("public"),
+                    },
+                    FilterExpr::Eq {
+                        field: "owner".into(),
+                        value: json!({"$user": true}),
+                    },
+                ],
+            },
+            &ctx,
+        ));
+        // Not(Exists{archivedat}) -> Exists is false (null) -> Not is true.
+        assert!(filter_matches(
+            &doc,
+            &FilterExpr::Not {
+                expr: Box::new(FilterExpr::Exists {
+                    field: "archivedat".into(),
+                }),
+            },
+            &ctx,
+        ));
+        // `$email` marker resolves to ctx.email. Here ctx.email == "u1" matches owner.
+        assert!(filter_matches(
+            &doc,
+            &FilterExpr::Eq {
+                field: "owner".into(),
+                value: json!({"$email": true}),
+            },
+            &PrincipalCtx {
+                user_id: Some("u1".to_string()),
+                email: Some("u1".to_string()),
+            },
+        ));
     }
 }

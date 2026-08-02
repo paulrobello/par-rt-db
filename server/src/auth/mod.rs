@@ -128,6 +128,35 @@ pub fn owner_of(principal: &Principal) -> Option<&str> {
     }
 }
 
+/// Per-row auth view threaded into the executors for model C's `authorize`
+/// predicate evaluation. `user_id == None` ⇒ bypass (`Machine`/admin/scheduled);
+/// `Some` ⇒ `$user`/`$email` markers in a `FilterExpr` resolve to this identity.
+///
+/// Held as owned `Option<String>` (rather than the brief's `&'a str` sketch) so
+/// Task 5 can thread it through the executors without lifetime gymnastics.
+#[derive(Debug, Clone)]
+pub struct PrincipalCtx {
+    pub user_id: Option<String>,
+    pub email: Option<String>,
+}
+
+impl Principal {
+    /// Builds the per-row auth view. `Machine` ⇒ bypass (`user_id = None`).
+    /// `User` ⇒ `Some(user_id)` and `Some(email)` so `$email` predicates resolve.
+    pub fn row_ctx(&self) -> PrincipalCtx {
+        match self {
+            Principal::User { user_id, email, .. } => PrincipalCtx {
+                user_id: Some(user_id.clone()),
+                email: Some(email.clone()),
+            },
+            Principal::Machine { .. } => PrincipalCtx {
+                user_id: None,
+                email: None,
+            },
+        }
+    }
+}
+
 /// Idempotently seeds `RTDB_ADMIN_EMAILS` into `rtdb_auth.admins` at startup
 /// (see `main.rs`). Emails are lowercased and trimmed; blanks are skipped.
 /// Seeded rows carry a NULL `github_id` and are matched by email at login.
