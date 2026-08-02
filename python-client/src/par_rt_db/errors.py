@@ -36,14 +36,22 @@ _STATUS: dict[ErrorCode, int] = {
 
 
 class RtDbError(Exception):
-    """The single client error type. Mirrors the server's ``{code, message}`` envelope."""
+    """The single client error type. Mirrors the server's ``{code, message,
+    retryAfter?}`` envelope."""
 
     code: ErrorCode
     message: str
+    retry_after: int | None
 
-    def __init__(self, code: ErrorCode, message: str) -> None:
+    def __init__(
+        self,
+        code: ErrorCode | str,
+        message: str,
+        retry_after: int | None = None,
+    ) -> None:
         self.code = code if isinstance(code, ErrorCode) else ErrorCode(code)
         self.message = message
+        self.retry_after = retry_after
         super().__init__(f"{self.code.value}: {message}")
 
     @property
@@ -53,12 +61,14 @@ class RtDbError(Exception):
 
     @classmethod
     def from_envelope(cls, envelope: dict[str, Any]) -> RtDbError:
-        """Build from a parsed ``{code, message}`` body."""
+        """Build from a parsed ``{code, message, retryAfter?}`` body."""
         try:
             code = ErrorCode(envelope.get("code", "INTERNAL"))
         except ValueError:
             code = ErrorCode.INTERNAL
-        return cls(code, str(envelope.get("message", "")))
+        raw_retry = envelope.get("retryAfter")
+        retry_after = raw_retry if isinstance(raw_retry, int) else None
+        return cls(code, str(envelope.get("message", "")), retry_after)
 
     @classmethod
     def from_http(cls, status: int, body: bytes | str | None) -> RtDbError:

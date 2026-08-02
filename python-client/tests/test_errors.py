@@ -81,3 +81,17 @@ async def test_retry_on_precondition_exhausts_attempts():
     with pytest.raises(RtDbError) as ei:
         await retry_on_precondition(fn, max_attempts=3)
     assert ei.value.code is ErrorCode.PRECONDITION_FAILED
+
+
+def test_rate_limited_envelope_carries_retry_after():
+    err = RtDbError.from_envelope(
+        {"code": "RATE_LIMITED", "message": "rate limit exceeded", "retryAfter": 42}
+    )
+    assert err.code is ErrorCode.RATE_LIMITED
+    assert err.status_code == 429
+    assert err.retry_after == 42
+
+
+def test_envelope_without_retry_after_leaves_it_none():
+    err = RtDbError.from_envelope({"code": "NOT_FOUND", "message": "x"})
+    assert err.retry_after is None
