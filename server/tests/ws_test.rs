@@ -3,7 +3,9 @@ mod common;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use common::{admin_post, fresh_db, mint_user_session, spawn_app, test_state};
+use common::{
+    admin_post, fresh_db, mint_user_session, spawn_app, test_state, test_state_with_rate_limits,
+};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio::net::TcpStream;
@@ -711,5 +713,105 @@ async fn admin_ws_subscribe_bypasses_authorize() -> anyhow::Result<()> {
     let msg = recv_json(&mut ws).await;
     assert_eq!(msg["type"], json!("queryUpdate"));
     assert_eq!(msg["queryId"], json!("q1"));
+    Ok(())
+}
+
+// Per-token/per-db rate limiting (shared with HTTP via rate_limit::evaluate):
+// with per_token_rpm = 3, the first 3 mutates succeed and the 4th in the same
+// minute returns a mutateErr RATE_LIMITED with a positive retryAfter — and the
+// connection stays open (a subsequent ping still pongs). Mirrors the HTTP
+// assertions in rate_limit_test over the WS transport.
+#[tokio::test]
+async fn ws_mutate_rate_limited_keeps_connection_open() -> anyhow::Result<()> {
+    let state = test_state_with_rate_limits(3, 0).await;
+    let addr = spawn_app(state.clone()).await;
+    let db = fresh_db(&state).await;
+    let token = mint_token(addr, &db).await;
+
+    let mut ws = ws_connect(addr).await;
+    auth(&mut ws, &token, &db).await;
+
+    let txn = insert_work_item_txn();
+    for i in 1..=3 {
+        send_json(
+            &mut ws,
+            json!({"type": "mutate", "mutId": format!("ok-{i}"), "txn": txn.clone()}),
+        )
+        .await;
+        let msg = recv_json(&mut ws).await;
+        assert_eq!(
+            msg["type"],
+            json!("mutateOk"),
+            "mutate {i} under the per-token limit should succeed: {msg}"
+        );
+    }
+
+    // 4th in the same minute → mutateErr RATE_LIMITED with a retryAfter hint.
+    send_json(
+        &mut ws,
+        json!({"type": "mutate", "mutId": "limited", "txn": txn}),
+    )
+    .await;
+    let msg = recv_json(&mut ws).await;
+    assert_eq!(msg["type"], json!("mutateErr"));
+    assert_eq!(msg["mutId"], json!("limited"));
+    assert_eq!(msg["error"]["code"], json!("RATE_LIMITED"));
+    let retry_after = msg["error"]["retryAfter"]
+        .as_u64()
+        .expect("retryAfter present");
+    assert!(
+        (1..=60).contains(&retry_after),
+        "retryAfter within one fixed-window minute: got {retry_after}"
+    );
+
+    // Connection stays open: a ping on the same socket still pongs.
+    send_json(&mut ws, json!({"type": "ping"})).await;
+    let msg = recv_json(&mut ws).await;
+    assert_eq!(msg["type"], json!("pong"));
+    Ok(())
+}
+
+// Same gate on Subscribe: 3 subscribes return their initial queryUpdate, the
+// 4th returns subscribeErr RATE_LIMITED, and the connection stays open.
+#[tokio::test]
+async fn ws_subscribe_rate_limited_keeps_connection_open() -> anyhow::Result<()> {
+    let state = test_state_with_rate_limits(3, 0).await;
+    let addr = spawn_app(state.clone()).await;
+    let db = fresh_db(&state).await;
+    let token = mint_token(addr, &db).await;
+
+    let mut ws = ws_connect(addr).await;
+    auth(&mut ws, &token, &db).await;
+
+    for i in 1..=3 {
+        send_json(
+            &mut ws,
+            json!({"type": "subscribe", "queryId": format!("q{i}"), "query": {"table": "workItems"}}),
+        )
+        .await;
+        let msg = recv_json(&mut ws).await;
+        assert_eq!(
+            msg["type"],
+            json!("queryUpdate"),
+            "subscribe {i} should return its initial queryUpdate: {msg}"
+        );
+    }
+
+    send_json(
+        &mut ws,
+        json!({"type": "subscribe", "queryId": "qlim", "query": {"table": "workItems"}}),
+    )
+    .await;
+    let msg = recv_json(&mut ws).await;
+    assert_eq!(msg["type"], json!("subscribeErr"));
+    assert_eq!(msg["queryId"], json!("qlim"));
+    assert_eq!(msg["error"]["code"], json!("RATE_LIMITED"));
+    assert!(
+        msg["error"]["retryAfter"].as_u64().is_some(),
+        "retryAfter present"
+    );
+
+    send_json(&mut ws, json!({"type": "ping"})).await;
+    assert_eq!(recv_json(&mut ws).await["type"], json!("pong"));
     Ok(())
 }

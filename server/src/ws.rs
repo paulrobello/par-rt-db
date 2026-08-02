@@ -24,6 +24,7 @@ use crate::auth::{Principal, authed_user, authorize, is_admin, owner_of, resolve
 use crate::db::now_ms;
 use crate::error::{ErrorCode, RtDbError};
 use crate::protocol::{ClientMessage, ServerMessage};
+use crate::rate_limit::{RateDecision, evaluate};
 use crate::scheduler;
 use crate::subs::{ConnId, next_conn_id};
 
@@ -79,12 +80,12 @@ async fn ws_upgrade(
 /// (not rolling) means a burst spanning a window boundary can briefly see up
 /// to ~2x the nominal rate before the reset; acceptable at this
 /// connection-level granularity.
-struct RateLimiter {
+struct ConnRateLimiter {
     window_start: Instant,
     count: u32,
 }
 
-impl RateLimiter {
+impl ConnRateLimiter {
     fn new() -> Self {
         Self {
             window_start: Instant::now(),
@@ -122,7 +123,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, headers: Hea
     };
     state.runtime.metrics.ws_connect();
 
-    let mut rate_limiter = RateLimiter::new();
+    let mut rate_limiter = ConnRateLimiter::new();
     let mut last_activity = Instant::now();
     let mut ping_timer = interval(PING_INTERVAL);
     ping_timer.tick().await; // interval's first tick fires immediately; skip it
@@ -318,7 +319,7 @@ async fn handle_text_frame(
     db: &str,
     conn_id: ConnId,
     out_tx: &UnboundedSender<ServerMessage>,
-    rate_limiter: &mut RateLimiter,
+    rate_limiter: &mut ConnRateLimiter,
     text: &str,
 ) -> bool {
     if text.len() > MAX_FRAME_BYTES {
@@ -358,6 +359,15 @@ async fn handle_text_frame(
             };
             match authed {
                 Ok(()) => {
+                    if let RateDecision::Denied { retry_after_secs } =
+                        evaluate(state, principal, db).await
+                    {
+                        let _ = out_tx.send(ServerMessage::SubscribeErr {
+                            query_id,
+                            error: RtDbError::rate_limited(retry_after_secs),
+                        });
+                        return false;
+                    }
                     // Admins subscribe with owner=None (see every row); everyone
                     // else is scoped to owner_of(principal).
                     let owner = if admin {
@@ -413,6 +423,15 @@ async fn handle_text_frame(
             };
             match authed {
                 Ok(()) => {
+                    if let RateDecision::Denied { retry_after_secs } =
+                        evaluate(state, principal, db).await
+                    {
+                        let _ = out_tx.send(ServerMessage::MutateErr {
+                            mut_id,
+                            error: RtDbError::rate_limited(retry_after_secs),
+                        });
+                        return false;
+                    }
                     // Same admin guardrail as the HTTP data-browser path: reject
                     // an over-cap mutation before it reaches the committer.
                     let cap = state.config.max_affected_docs;
