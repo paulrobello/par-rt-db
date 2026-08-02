@@ -196,52 +196,62 @@ export function AuthLoading(props: { children: ReactNode }): ReactNode {
   return useContextValue().state === "authenticating" ? props.children : null;
 }
 
-/** Opens the server's OAuth popup for `provider` and resolves with the session token it posts back. */
-function signInWithOAuth(baseUrl: string, provider: "github" | "google"): Promise<string> {
-  const origin = new URL(baseUrl).origin;
-  const spaOrigin = window.location.origin;
-  const popup = window.open(
-    `${baseUrl.replace(/\/+$/, "")}/auth/${provider}?origin=${encodeURIComponent(spaOrigin)}`,
-    "rtdb-auth",
-    "width=600,height=700",
-  );
+export const OAUTH_POLL_INTERVAL_MS = 800;
+export const OAUTH_POLL_TIMEOUT_MS = 180_000;
 
-  return new Promise<string>((resolve, reject) => {
-    if (!popup) {
-      reject(new Error("popup blocked"));
-      return;
-    }
-    const cleanup = () => {
-      window.removeEventListener("message", onMessage);
-      clearInterval(closedPoll);
-    };
-    const onMessage = (event: MessageEvent) => {
-      if (event.origin !== origin) {
-        return;
-      }
-      const data = event.data as { type?: string; token?: string };
-      if (data?.type !== "rtdb-auth" || typeof data.token !== "string") {
-        return;
-      }
-      cleanup();
-      resolve(data.token);
-    };
-    window.addEventListener("message", onMessage);
-    const closedPoll = setInterval(() => {
-      if (popup.closed) {
-        cleanup();
-        reject(new Error("popup closed before completing sign-in"));
-      }
-    }, 500);
-  });
+/** One poll of `/auth/state`; resolves with the token on `complete`. */
+async function pollOAuthState(apiBase: string, state: string): Promise<
+  | { done: true; token: string }
+  | { done: false }
+> {
+  const resp = await fetch(`${apiBase}/auth/state?state=${encodeURIComponent(state)}`);
+  if (!resp.ok) return { done: false };
+  const data = (await resp.json()) as { status?: string; token?: string };
+  if (data.status === "complete" && typeof data.token === "string") {
+    return { done: true, token: data.token };
+  }
+  if (data.status === "expired" || data.status === "error") {
+    throw new Error(data.status === "expired" ? "sign-in expired" : "sign-in failed");
+  }
+  return { done: false };
 }
 
-/** Opens the server's GitHub OAuth popup and resolves with the session token it posts back. */
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Begins a provider OAuth flow, opens the authorize URL in a `noopener`
+ * popup (SEC-012 tabnabbing hardening), and polls `/auth/state` until the
+ * session token is ready. `noopener` means `window.open` returns null, so the
+ * old postMessage/closed-poll relay is replaced by this poll.
+ */
+function signInWithOAuth(baseUrl: string, provider: "github" | "google"): Promise<string> {
+  const api = baseUrl.replace(/\/+$/, "");
+  const spaOrigin = window.location.origin;
+  return (async () => {
+    const beginResp = await fetch(
+      `${api}/auth/${provider}/begin?origin=${encodeURIComponent(spaOrigin)}`,
+    );
+    if (!beginResp.ok) {
+      throw new Error(`could not start sign-in (${beginResp.status})`);
+    }
+    const began = (await beginResp.json()) as { authorizeUrl: string; state: string };
+    window.open(began.authorizeUrl, "rtdb-auth", "noopener,noreferrer,width=600,height=700");
+    const deadline = Date.now() + OAUTH_POLL_TIMEOUT_MS;
+    while (Date.now() < deadline) {
+      const r = await pollOAuthState(api, began.state);
+      if (r.done) return r.token;
+      await sleep(OAUTH_POLL_INTERVAL_MS);
+    }
+    throw new Error("sign-in timed out");
+  })();
+}
+
+/** Begins the GitHub OAuth flow and resolves with the session token polled from `/auth/state`. */
 export function signInWithGitHub(baseUrl: string): Promise<string> {
   return signInWithOAuth(baseUrl, "github");
 }
 
-/** Opens the server's Google OAuth popup and resolves with the session token it posts back. */
+/** Begins the Google OAuth flow and resolves with the session token polled from `/auth/state`. */
 export function signInWithGoogle(baseUrl: string): Promise<string> {
   return signInWithOAuth(baseUrl, "google");
 }

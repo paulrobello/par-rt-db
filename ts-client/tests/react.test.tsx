@@ -6,6 +6,8 @@ import type { RtQuery } from "../src/query.js";
 import {
   Authenticated,
   AuthLoading,
+  OAUTH_POLL_INTERVAL_MS,
+  OAUTH_POLL_TIMEOUT_MS,
   RtDbProvider,
   signInWithGitHub,
   signInWithGoogle,
@@ -15,6 +17,11 @@ import {
   useQuery,
   useRtDbAuth,
 } from "../src/react.js";
+
+/** Minimal Response stub for fetch-mocking the OAuth begin/state endpoints. */
+function oauthResp(body: unknown, ok = true): Response {
+  return { ok, json: async () => body } as unknown as Response;
+}
 
 class FakeSocket implements WebSocketLike {
   onopen: (() => void) | null = null;
@@ -145,113 +152,121 @@ describe("react bindings", () => {
   });
 });
 
-describe("signInWithGitHub", () => {
+describe("signInWithGitHub (begin + poll relay)", () => {
   afterEach(() => {
     vi.useRealTimers();
     vi.restoreAllMocks();
   });
 
-  function deliverAuthMessage(token: string) {
-    window.dispatchEvent(
-      new MessageEvent("message", {
-        origin: "http://h:8300",
-        data: { type: "rtdb-auth", token },
-      }),
+  it("begins the flow, opens the authorize URL with noopener, and resolves with the polled token", async () => {
+    vi.useFakeTimers();
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+    fetchSpy.mockResolvedValueOnce(oauthResp({ authorizeUrl: "about:blank", state: "s1" }));
+    fetchSpy.mockResolvedValueOnce(oauthResp({ status: "pending" }));
+    fetchSpy.mockResolvedValueOnce(
+      oauthResp({ status: "complete", token: "tok-1", user: { kind: "user" } }),
     );
-  }
-
-  it("resolves with the token from a valid rtdb-auth message", async () => {
-    const popup = { closed: false };
-    vi.spyOn(window, "open").mockReturnValue(popup as unknown as Window);
+    const openSpy = vi.spyOn(window, "open").mockReturnValue(null);
 
     const promise = signInWithGitHub("http://h:8300");
-    deliverAuthMessage("tok-1");
+    // Drives the begin fetch → first poll (pending) → 800ms sleep → second poll (complete).
+    await vi.advanceTimersByTimeAsync(OAUTH_POLL_INTERVAL_MS);
 
     await expect(promise).resolves.toBe("tok-1");
+    expect(fetchSpy).toHaveBeenCalledWith(expect.stringContaining("/auth/github/begin?origin="));
+    expect(fetchSpy).toHaveBeenCalledWith(expect.stringContaining("/auth/state?state=s1"));
+    expect(openSpy).toHaveBeenCalledWith(
+      "about:blank",
+      "rtdb-auth",
+      "noopener,noreferrer,width=600,height=700",
+    );
   });
 
-  it("rejects immediately when the popup is blocked", async () => {
-    vi.spyOn(window, "open").mockReturnValue(null);
-
-    await expect(signInWithGitHub("http://h:8300")).rejects.toThrow("popup blocked");
-  });
-
-  it("rejects and cleans up the message listener when the popup closes before sign-in completes", async () => {
+  it("rejects when a poll returns expired", async () => {
     vi.useFakeTimers();
-    const popup = { closed: false };
-    vi.spyOn(window, "open").mockReturnValue(popup as unknown as Window);
-    const removeEventListenerSpy = vi.spyOn(window, "removeEventListener");
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+    fetchSpy.mockResolvedValueOnce(oauthResp({ authorizeUrl: "about:blank", state: "s1" }));
+    fetchSpy.mockResolvedValueOnce(oauthResp({ status: "expired" }));
 
     const promise = signInWithGitHub("http://h:8300");
-    const rejection = expect(promise).rejects.toThrow(/popup closed before completing sign-in/);
-
-    popup.closed = true;
-    await vi.advanceTimersByTimeAsync(1000);
+    // Attach the rejection handler before driving the poll so the rejection
+    // doesn't surface as an unhandled rejection when the expired status lands.
+    const rejection = expect(promise).rejects.toThrow("sign-in expired");
+    await vi.advanceTimersByTimeAsync(OAUTH_POLL_INTERVAL_MS);
     await rejection;
-
-    expect(removeEventListenerSpy).toHaveBeenCalledWith("message", expect.any(Function));
   });
 
-  it("does not reject if the popup closes after a valid message already resolved sign-in", async () => {
-    vi.useFakeTimers();
-    const popup = { closed: false };
-    vi.spyOn(window, "open").mockReturnValue(popup as unknown as Window);
+  it("rejects with 'sign-in timed out' after the timeout elapses", async () => {
+    // Fake only setTimeout (used by `sleep`); leave Date.now real so we can
+    // trip the deadline directly. Advancing the full 180s of fake time would
+    // fire happy-dom's internal navigation timeout and emit noisy network
+    // errors unrelated to the SDK.
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+    fetchSpy.mockResolvedValueOnce(oauthResp({ authorizeUrl: "about:blank", state: "s1" }));
+    // Every /auth/state poll stays pending until the deadline trips.
+    fetchSpy.mockResolvedValue(oauthResp({ status: "pending" }));
+    vi.spyOn(window, "open").mockReturnValue(null);
+    // deadline = 0 + OAUTH_POLL_TIMEOUT_MS; the first loop check passes (0);
+    // the check after one pending poll + sleep trips past the deadline.
+    vi.spyOn(Date, "now")
+      .mockReturnValueOnce(0)
+      .mockReturnValueOnce(0)
+      .mockReturnValue(OAUTH_POLL_TIMEOUT_MS + 1);
 
     const promise = signInWithGitHub("http://h:8300");
-    deliverAuthMessage("tok-2");
-    await expect(promise).resolves.toBe("tok-2");
-
-    popup.closed = true;
-    // Advancing well past the poll interval after resolution must not throw or
-    // produce an unhandled rejection — the interval must already be cleared.
-    await vi.advanceTimersByTimeAsync(5000);
+    const rejection = expect(promise).rejects.toThrow("sign-in timed out");
+    await vi.advanceTimersByTimeAsync(OAUTH_POLL_INTERVAL_MS);
+    await rejection;
   });
 });
 
-describe("signInWithGoogle", () => {
+describe("signInWithGoogle (begin + poll relay)", () => {
   afterEach(() => {
     vi.useRealTimers();
     vi.restoreAllMocks();
   });
 
-  it("opens the /auth/google popup and resolves with the token from a valid rtdb-auth message", async () => {
-    const popup = { closed: false };
-    const openSpy = vi.spyOn(window, "open").mockReturnValue(popup as unknown as Window);
+  it("begins the google flow, opens the authorize URL with noopener, and resolves with the polled token", async () => {
+    vi.useFakeTimers();
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+    fetchSpy.mockResolvedValueOnce(oauthResp({ authorizeUrl: "about:blank", state: "s1" }));
+    fetchSpy.mockResolvedValueOnce(
+      oauthResp({ status: "complete", token: "goog-tok", user: { kind: "user" } }),
+    );
+    const openSpy = vi.spyOn(window, "open").mockReturnValue(null);
 
     const promise = signInWithGoogle("http://h:8300");
-    window.dispatchEvent(
-      new MessageEvent("message", {
-        origin: "http://h:8300",
-        data: { type: "rtdb-auth", token: "goog-tok" },
-      }),
-    );
+    await vi.advanceTimersByTimeAsync(OAUTH_POLL_INTERVAL_MS);
 
     await expect(promise).resolves.toBe("goog-tok");
+    expect(fetchSpy).toHaveBeenCalledWith(expect.stringContaining("/auth/google/begin?origin="));
     expect(openSpy).toHaveBeenCalledWith(
-      expect.stringContaining("/auth/google?origin="),
+      "about:blank",
       "rtdb-auth",
-      "width=600,height=700",
+      "noopener,noreferrer,width=600,height=700",
     );
-  });
-
-  it("rejects immediately when the popup is blocked", async () => {
-    vi.spyOn(window, "open").mockReturnValue(null);
-    await expect(signInWithGoogle("http://h:8300")).rejects.toThrow("popup blocked");
   });
 });
 
 describe("useRtDbAuth signIn routing", () => {
   afterEach(() => {
+    vi.useRealTimers();
     vi.restoreAllMocks();
     // Token-mode signIn writes the session token to localStorage on completion
     // (below); clear it so it cannot leak into later tests' assertions.
     localStorage.removeItem("rtdb-session-token");
   });
 
-  it("signIn('google') opens the /auth/google popup", async () => {
+  it("signIn('google') begins the google flow and persists the token in token mode", async () => {
+    vi.useFakeTimers();
     const { client } = setup();
-    const popup = { closed: false };
-    const openSpy = vi.spyOn(window, "open").mockReturnValue(popup as unknown as Window);
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+    fetchSpy.mockResolvedValueOnce(oauthResp({ authorizeUrl: "about:blank", state: "s1" }));
+    fetchSpy.mockResolvedValueOnce(
+      oauthResp({ status: "complete", token: "goog-tok", user: { kind: "user" } }),
+    );
+    const openSpy = vi.spyOn(window, "open").mockReturnValue(null);
     let pending: Promise<void> | undefined;
 
     function View() {
@@ -277,31 +292,30 @@ describe("useRtDbAuth signIn routing", () => {
     await act(async () => {
       fireEvent.click(screen.getByText("google"));
     });
-
-    expect(openSpy).toHaveBeenCalledWith(
-      expect.stringContaining("/auth/google?origin="),
-      "rtdb-auth",
-      "width=600,height=700",
-    );
-
-    // Complete the OAuth flow so signInWithOAuth removes its message listener
-    // (a pending, never-resolved signIn would otherwise leak the listener into
-    // later tests and fire on their auth messages).
     await act(async () => {
-      window.dispatchEvent(
-        new MessageEvent("message", {
-          origin: "http://h:8300",
-          data: { type: "rtdb-auth", token: "tok" },
-        }),
-      );
+      await vi.advanceTimersByTimeAsync(OAUTH_POLL_INTERVAL_MS);
       await pending;
     });
+
+    expect(fetchSpy).toHaveBeenCalledWith(expect.stringContaining("/auth/google/begin?origin="));
+    expect(openSpy).toHaveBeenCalledWith(
+      "about:blank",
+      "rtdb-auth",
+      "noopener,noreferrer,width=600,height=700",
+    );
+    // Token mode: the credential persists to localStorage for reconnect hydration.
+    expect(localStorage.getItem("rtdb-session-token")).toBe("goog-tok");
   });
 
-  it("signIn() with no argument opens the /auth/github popup (default)", async () => {
+  it("signIn() with no argument begins the github flow (default)", async () => {
+    vi.useFakeTimers();
     const { client } = setup();
-    const popup = { closed: false };
-    const openSpy = vi.spyOn(window, "open").mockReturnValue(popup as unknown as Window);
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+    fetchSpy.mockResolvedValueOnce(oauthResp({ authorizeUrl: "about:blank", state: "s1" }));
+    fetchSpy.mockResolvedValueOnce(
+      oauthResp({ status: "complete", token: "gh-tok", user: { kind: "user" } }),
+    );
+    vi.spyOn(window, "open").mockReturnValue(null);
     let pending: Promise<void> | undefined;
 
     function View() {
@@ -327,27 +341,19 @@ describe("useRtDbAuth signIn routing", () => {
     await act(async () => {
       fireEvent.click(screen.getByText("default"));
     });
-
-    expect(openSpy).toHaveBeenCalledWith(
-      expect.stringContaining("/auth/github?origin="),
-      "rtdb-auth",
-      "width=600,height=700",
-    );
-
     await act(async () => {
-      window.dispatchEvent(
-        new MessageEvent("message", {
-          origin: "http://h:8300",
-          data: { type: "rtdb-auth", token: "tok" },
-        }),
-      );
+      await vi.advanceTimersByTimeAsync(OAUTH_POLL_INTERVAL_MS);
       await pending;
     });
+
+    expect(fetchSpy).toHaveBeenCalledWith(expect.stringContaining("/auth/github/begin?origin="));
+    expect(localStorage.getItem("rtdb-session-token")).toBe("gh-tok");
   });
 });
 
 describe("useRtDbAuth cookie mode (SEC-002)", () => {
   afterEach(() => {
+    vi.useRealTimers();
     vi.restoreAllMocks();
     localStorage.removeItem("rtdb-session-token");
   });
@@ -375,10 +381,15 @@ describe("useRtDbAuth cookie mode (SEC-002)", () => {
   });
 
   it("signIn does not persist the session token to localStorage", async () => {
+    vi.useFakeTimers();
     const { client } = setupCookie();
     expect(client.cookieMode).toBe(true);
-    const popup = { closed: false };
-    vi.spyOn(window, "open").mockReturnValue(popup as unknown as Window);
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+    fetchSpy.mockResolvedValueOnce(oauthResp({ authorizeUrl: "about:blank", state: "s1" }));
+    fetchSpy.mockResolvedValueOnce(
+      oauthResp({ status: "complete", token: "session-tok", user: { kind: "user" } }),
+    );
+    vi.spyOn(window, "open").mockReturnValue(null);
 
     let pending: Promise<void> | undefined;
     function View() {
@@ -403,15 +414,10 @@ describe("useRtDbAuth cookie mode (SEC-002)", () => {
     await act(async () => {
       fireEvent.click(screen.getByText("in"));
     });
-    // Resolve the OAuth popup (the server has now set the HttpOnly cookie), then
+    // Resolve the OAuth poll (the server has now set the HttpOnly cookie), then
     // await signIn's continuation so the assertion observes its final state.
     await act(async () => {
-      window.dispatchEvent(
-        new MessageEvent("message", {
-          origin: "http://h:8300",
-          data: { type: "rtdb-auth", token: "session-tok" },
-        }),
-      );
+      await vi.advanceTimersByTimeAsync(OAUTH_POLL_INTERVAL_MS);
       await pending;
     });
 
