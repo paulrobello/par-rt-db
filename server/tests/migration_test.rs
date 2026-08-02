@@ -1308,3 +1308,134 @@ async fn drop_index_then_re_push_does_not_collide() {
     assert_eq!(col2, "Grace");
     drop_db(&db).await;
 }
+
+// Proves the `still_indexed` guard in `Directive::DropIndex`'s orphan-column
+// cleanup: when TWO btree indexes SHARE a field, dropping ONE must NOT drop the
+// shared `f_` column, because the SURVIVING index still depends on it. The
+// existing `drop_index_then_re_push_does_not_collide` test only exercises the
+// single-index-owns-the-field case, so it would pass even if the guard
+// (`!still_indexed.contains(field)`) were broken — this test makes the guard
+// load-bearing. A broken guard would (a) drop `f_name`, (b) cascade-drop the
+// surviving `i_users_by_name_owner` index (Postgres drops indexes that reference
+// a dropped column), and (c) leave the column missing from
+// `information_schema.columns`, all of which the assertions below catch.
+#[tokio::test]
+async fn drop_index_keeps_shared_column_when_another_index_uses_it() {
+    // 1. Two btree indexes that share `name`; `owner` is the second field of
+    //    the composite index.
+    let mut db = setup_db_with_schema(
+        r#"{"tables":{"users":{"fields":{
+            "name":{"type":"string"},
+            "owner":{"type":"string"}
+        },"indexes":[
+            {"name":"by_name","fields":["name"]},
+            {"name":"by_name_owner","fields":["name","owner"]}
+        ]}}}"#,
+    )
+    .await;
+    let id = insert_doc(&db, "users", r#"{"name":"Ada","owner":"u1"}"#).await;
+    let schema_name = format!("db_{}", db.name);
+
+    // 2. migrate dropIndex ONE of the shared-column indexes (`by_name`).
+    //    Inline (not via the `migrate` helper) so the derived schema is persisted
+    //    to the `meta` table, mirroring production `committer::handle_migrate` —
+    //    otherwise a later push_schema would see the pre-migration schema.
+    let request: MigrateRequest = serde_json::from_str(
+        r#"{"directives":[{"op":"dropIndex","table":"users","name":"by_name"}]}"#,
+    )
+    .expect("parse migrate request");
+    let derived = plan_migration(&db.schema, &request.directives).expect("plan migration");
+    let mut tx = db.state.pool.begin().await.expect("begin tx");
+    apply_migration(
+        &mut tx,
+        &db.name,
+        &request.directives,
+        &derived,
+        request.dry_run,
+    )
+    .await
+    .expect("apply migration");
+    let schema_json = serde_json::to_value(&derived).expect("serialize derived schema");
+    sqlx::query(&format!(
+        "INSERT INTO \"{schema_name}\".meta (key, value) VALUES ('schema', $1) \
+         ON CONFLICT (key) DO UPDATE SET value = excluded.value"
+    ))
+    .bind(schema_json)
+    .execute(&mut *tx)
+    .await
+    .expect("persist derived schema");
+    tx.commit().await.expect("commit migration tx");
+    db.schema = derived;
+
+    // 3. The dropped index is gone.
+    assert!(
+        !relation_exists(&db, &format!("\"{schema_name}\".\"i_users_by_name\"")).await,
+        "dropped index is gone"
+    );
+    // 4. THE LOAD-BEARING ASSERTION: the shared `f_name` column SURVIVES because
+    //    `by_name_owner` still uses `name`. A broken guard would have dropped it.
+    let (f_name_count,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM information_schema.columns \
+         WHERE table_schema = $1 AND table_name = 't_users' AND column_name = 'f_name'",
+    )
+    .bind(&schema_name)
+    .fetch_one(&db.state.pool)
+    .await
+    .expect("information_schema lookup for f_name");
+    assert_eq!(
+        f_name_count, 1,
+        "f_name must survive dropIndex: the surviving by_name_owner index still uses it"
+    );
+    // The pre-migration row's `f_name` value was preserved through the dropIndex
+    // (the column was not dropped, so its data is intact).
+    let (name1,): (String,) = sqlx::query_as(&format!(
+        "SELECT \"f_name\" FROM \"{schema_name}\".\"t_users\" WHERE id = $1"
+    ))
+    .bind(&id)
+    .fetch_one(&db.state.pool)
+    .await
+    .expect("fetch f_name for pre-migration row");
+    assert_eq!(name1, "Ada");
+    // 5. The surviving composite index is intact (Postgres would have
+    //    cascade-dropped it had `f_name` been dropped).
+    assert!(
+        relation_exists(&db, &format!("\"{schema_name}\".\"i_users_by_name_owner\"")).await,
+        "surviving index i_users_by_name_owner still exists"
+    );
+    // 6. The surviving index still WORKS: insert a new row and confirm its
+    //    backing typed columns (`f_name`, `f_owner`) are populated by backfill.
+    let id2 = insert_doc(&db, "users", r#"{"name":"Grace","owner":"u2"}"#).await;
+    let (name2,): (String,) = sqlx::query_as(&format!(
+        "SELECT \"f_name\" FROM \"{schema_name}\".\"t_users\" WHERE id = $1"
+    ))
+    .bind(&id2)
+    .fetch_one(&db.state.pool)
+    .await
+    .expect("fetch f_name for new row (surviving index column)");
+    assert_eq!(name2, "Grace");
+    let (owner2,): (String,) = sqlx::query_as(&format!(
+        "SELECT \"f_owner\" FROM \"{schema_name}\".\"t_users\" WHERE id = $1"
+    ))
+    .bind(&id2)
+    .fetch_one(&db.state.pool)
+    .await
+    .expect("fetch f_owner for new row (surviving index column)");
+    assert_eq!(owner2, "u2");
+    // 7. Re-adding the dropped index via push_schema succeeds — the surviving
+    //    `f_name` column is already present and push_schema's tolerant ADD COLUMN
+    //    handles it. (Confirms no orphan-related collision either way.)
+    db.schema = serde_json::from_str(
+        r#"{"tables":{"users":{"fields":{
+            "name":{"type":"string"},
+            "owner":{"type":"string"}
+        },"indexes":[
+            {"name":"by_name","fields":["name"]},
+            {"name":"by_name_owner","fields":["name","owner"]}
+        ]}}}"#,
+    )
+    .expect("parse re-push schema");
+    push_schema(&db.state.pool, &db.name, db.schema.clone())
+        .await
+        .expect("re-adding by_name must not collide with the surviving f_name column");
+    drop_db(&db).await;
+}

@@ -200,10 +200,16 @@ impl Config {
             Ok(v) => v.parse::<u64>().unwrap_or(60),
             Err(_) => 60,
         };
+        // `tokio::time::interval` panics on a zero duration, so an explicit 0
+        // would crash every db's reaper task on its first poll.
+        let ttl_sweep_interval_secs = ttl_sweep_interval_secs.max(1);
         let ttl_batch = match std::env::var("RTDB_TTL_BATCH") {
             Ok(v) => v.parse::<i64>().unwrap_or(5000),
             Err(_) => 5000,
         };
+        // `DELETE ... LIMIT 0` is a silent no-op (disables reaping) and a
+        // negative batch errors per sweep, so clamp both to at least 1.
+        let ttl_batch = ttl_batch.max(1);
 
         Ok(Self {
             port,

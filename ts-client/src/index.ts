@@ -18,6 +18,7 @@ export type {
   StepJson,
   TableJson,
   TransactionJson,
+  TtlDef,
   VectorIndexSpec,
   VectorQuery,
 } from "./protocol.js";
