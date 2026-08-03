@@ -55,6 +55,8 @@ services:
       RTDB_OIDC_TOKEN_URL: ${RTDB_OIDC_TOKEN_URL:-}
       RTDB_OIDC_USERINFO_URL: ${RTDB_OIDC_USERINFO_URL:-}
       RTDB_SESSION_TTL_DAYS: ${RTDB_SESSION_TTL_DAYS:-30}
+      # Login-CSRF defense (double-submit nonce cookie at OAuth /begin + /callback).
+      RTDB_OAUTH_LOGIN_CSRF: ${RTDB_OAUTH_LOGIN_CSRF:-true}
       # NOTE: this `environment:` block is an explicit ALLOWLIST — a key present
       # in `.env` but absent here never reaches the container. Adding a new
       # RTDB_* boot knob means adding a line here too, or it silently keeps its
