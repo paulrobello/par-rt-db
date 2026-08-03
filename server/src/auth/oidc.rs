@@ -337,6 +337,7 @@ mod tests {
             rate_limit_per_token_rpm: 0,
             rate_limit_per_db_rpm: 0,
             audit_log_enabled: false,
+            oauth_login_csrf: true,
             webhooks_enabled: false,
             backup_enabled: false,
             backup_cron: "0 3 * * *".into(),

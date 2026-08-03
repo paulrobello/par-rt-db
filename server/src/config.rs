@@ -53,6 +53,11 @@ pub struct Config {
     // op-feed (`OpFeed`) is always on; this is its durable counterpart.
     // RTDB_AUDIT_LOG_ENABLED (accepts "true"/"1"/"yes", case-insensitive).
     pub audit_log_enabled: bool,
+    // Login-CSRF defense: bind the OAuth `state` to the initiating browser via a
+    // double-submit nonce cookie set at /begin and verified at /callback. On by
+    // default — only "false"/"0"/"no" (case-insensitive) disables it (break-glass,
+    // restores pre-hardening behavior). RTDB_OAUTH_LOGIN_CSRF.
+    pub oauth_login_csrf: bool,
     // Webhook delivery registry: when true, the committer enqueues one
     // `rtdb.webhook_deliveries` row per matching webhook at both tap sites,
     // and a background worker POSTs the payload (at-least-once) to each
@@ -173,6 +178,13 @@ impl Config {
             Err(_) => false,
         };
 
+        // Login-CSRF: default ON (security). Only an explicit falsy spelling
+        // disables it (break-glass). Anything else, including unset, stays on.
+        let oauth_login_csrf = match std::env::var("RTDB_OAUTH_LOGIN_CSRF") {
+            Ok(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "false" | "0" | "no"),
+            Err(_) => true,
+        };
+
         // Webhook registry: default off, same truthy-spelling parse as audit.
         let webhooks_enabled = match std::env::var("RTDB_WEBHOOKS_ENABLED") {
             Ok(v) => matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes"),
@@ -252,6 +264,7 @@ impl Config {
             rate_limit_per_token_rpm,
             rate_limit_per_db_rpm,
             audit_log_enabled,
+            oauth_login_csrf,
             webhooks_enabled,
             backup_enabled,
             backup_cron,
