@@ -136,7 +136,10 @@ describe("SessionProvider", () => {
     // provider polls /auth/state, then loads the user via `/auth/me`.
     expect(screen.getByTestId("method").textContent).toBe("oauth");
     expect(screen.getByTestId("user").textContent).toBe("oauth@example.com");
-    expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining("/auth/github/begin?origin="));
+    expect(fetchMock).toHaveBeenCalledWith(
+      expect.stringContaining("/auth/github/begin?origin="),
+      expect.objectContaining({ credentials: "include" }),
+    );
     expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining("/auth/state?state=s1"));
     // SEC-012: the popup must open the begin-returned authorizeUrl with
     // noopener,noreferrer so the relay page can't reach back into this window.

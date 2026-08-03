@@ -114,7 +114,7 @@ export function SessionProvider({ children }: { children: ReactNode }) {
         .catch(() => setTimeout(() => poll(state, deadline, resolve, reject), 800));
     };
     return new Promise<void>((resolve, reject) => {
-      fetch(beginUrl)
+      fetch(beginUrl, { credentials: "include" })
         .then((r) => (r.ok ? r.json() : Promise.reject(new Error("could not start sign-in"))))
         .then((b: { authorizeUrl: string; state: string }) => {
           // noopener: window.open returns null — no blocked-popup detect, no

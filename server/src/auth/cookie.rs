@@ -221,6 +221,7 @@ mod tests {
         assert!(plain.contains("HttpOnly"));
         assert!(plain.contains("SameSite=None"));
         assert!(plain.contains("Max-Age=600"));
+        assert!(plain.contains("Path=/"));
         assert!(!plain.contains("Secure"));
 
         let secure = set_oauth_csrf_cookie("deadbeef", true)
