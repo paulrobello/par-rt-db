@@ -69,6 +69,63 @@ pub(crate) fn clear_session_cookie() -> HeaderValue {
     .expect("static clear-cookie template is a valid header value")
 }
 
+// The CSRF nonce helpers below are wired up in the Task 3 `/begin` + `/callback`
+// OAuth handlers; `allow(dead_code)` keeps the clippy gate green until then and is
+// removed once those handlers consume them.
+/// Cookie name carrying the login-CSRF double-submit nonce. Its value is the
+/// OAuth `state` token minted at `/begin`; `/callback` requires it to match.
+#[allow(dead_code)]
+pub(crate) const OAUTH_CSRF_COOKIE: &str = "rtdb-oauth-csrf";
+
+/// `Max-Age` (seconds) for the CSRF nonce — matches `STATE_TTL_MS` (10 min).
+#[allow(dead_code)]
+const CSRF_MAX_AGE_SECS: u64 = 600;
+
+/// Reads the `rtdb-oauth-csrf` cookie value from the `Cookie:` header, if present.
+#[allow(dead_code)]
+pub(crate) fn oauth_csrf_cookie(headers: &HeaderMap) -> Option<&str> {
+    let raw = headers.get(axum::http::header::COOKIE)?.to_str().ok()?;
+    raw.split(';').find_map(|pair| {
+        let (name, value) = pair.split_once('=')?;
+        (name.trim() == OAUTH_CSRF_COOKIE).then_some(value.trim())
+    })
+}
+
+/// Builds the `Set-Cookie` for the CSRF nonce. `SameSite=None` is required: the
+/// provider → callback redirect is a top-level cross-site navigation, so `Lax`
+/// would not attach the cookie and the defense would never fire. `Secure` mirrors
+/// the session cookie (omitted for local http dev). Same injection-char guard as
+/// `set_session_cookie` (fails closed).
+#[allow(dead_code)]
+pub(crate) fn set_oauth_csrf_cookie(value: &str, secure: bool) -> Result<HeaderValue, RtDbError> {
+    if value.is_empty()
+        || value
+            .bytes()
+            .any(|b| matches!(b, b';' | b',' | b' ' | b'\t' | b'\r' | b'\n') || b < 0x20)
+    {
+        return Err(RtDbError::internal(
+            "oauth csrf cookie value contains illegal characters",
+        ));
+    }
+    let mut s = format!(
+        "{OAUTH_CSRF_COOKIE}={value}; HttpOnly; SameSite=None; Path=/; Max-Age={CSRF_MAX_AGE_SECS}"
+    );
+    if secure {
+        s.push_str("; Secure");
+    }
+    HeaderValue::from_str(&s).map_err(|_| RtDbError::internal("invalid oauth csrf cookie value"))
+}
+
+/// Builds the `Set-Cookie` that deletes the CSRF nonce (single-use hygiene on a
+/// successful callback).
+#[allow(dead_code)]
+pub(crate) fn clear_oauth_csrf_cookie() -> HeaderValue {
+    HeaderValue::from_str(&format!(
+        "{OAUTH_CSRF_COOKIE}=; HttpOnly; SameSite=None; Path=/; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT"
+    ))
+    .expect("static clear-cookie template is a valid header value")
+}
+
 /// True when the request arrived over HTTPS. The Cloudflare tunnel sets
 /// `X-Forwarded-Proto: https`; a same-origin dashboard request carries it. Local
 /// http dev has no such header → `false` → `Secure` is omitted so the cookie is
@@ -140,5 +197,54 @@ mod tests {
         assert!(set_session_cookie("", false).is_err());
         // A sane admin key / hex session token is accepted.
         assert!(set_session_cookie("deadbeef-0123", false).is_ok());
+    }
+
+    #[test]
+    fn oauth_csrf_cookie_reads_among_pairs() {
+        let mut h = HeaderMap::new();
+        h.insert(
+            "cookie",
+            "rtdb_session=abc; rtdb-oauth-csrf=xyz-state; lang=en"
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(oauth_csrf_cookie(&h), Some("xyz-state"));
+    }
+
+    #[test]
+    fn oauth_csrf_cookie_missing_is_none() {
+        let mut h = HeaderMap::new();
+        h.insert("cookie", "rtdb_session=abc".parse().unwrap());
+        assert_eq!(oauth_csrf_cookie(&h), None);
+    }
+
+    #[test]
+    fn set_oauth_csrf_cookie_includes_attributes() {
+        let plain = set_oauth_csrf_cookie("deadbeef", false)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(plain.contains("rtdb-oauth-csrf=deadbeef"));
+        assert!(plain.contains("HttpOnly"));
+        assert!(plain.contains("SameSite=None"));
+        assert!(plain.contains("Max-Age=600"));
+        assert!(!plain.contains("Secure"));
+
+        let secure = set_oauth_csrf_cookie("deadbeef", true)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(secure.contains("Secure"));
+    }
+
+    #[test]
+    fn set_oauth_csrf_cookie_rejects_injection_chars() {
+        assert!(set_oauth_csrf_cookie("a;b", true).is_err());
+        assert!(set_oauth_csrf_cookie("a,b", true).is_err());
+        assert!(set_oauth_csrf_cookie("a b", true).is_err());
+        assert!(set_oauth_csrf_cookie("", true).is_err());
+        assert!(set_oauth_csrf_cookie("deadbeef-0123", true).is_ok());
     }
 }
