@@ -240,6 +240,7 @@ function signInWithOAuth(baseUrl: string, provider: "github" | "google" | "oidc"
   return (async () => {
     const beginResp = await fetch(
       `${api}/auth/${provider}/begin?origin=${encodeURIComponent(spaOrigin)}`,
+      { credentials: "include" },
     );
     if (!beginResp.ok) {
       throw new Error(`could not start sign-in (${beginResp.status})`);
