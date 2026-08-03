@@ -197,7 +197,7 @@ Client semantics match Convex: `useQuery` returns `undefined` until the first
 - **Admin:** single `RTDB_ADMIN_KEY` env var gates `/admin/*`.
 - Never auto-generate or rotate secrets silently; all key material is created explicitly
   via admin commands and surfaced once.
-- **Accepted residual risk (login CSRF):** the OAuth `state` token is bound to the
+- **Login CSRF (resolved 2026-08-02; see `2026-08-02-login-csrf-hardening-design.md`):** the OAuth `state` token is bound to the
   initiating *origin* — the callback page's `postMessage` target-origin is pinned to the
   origin validated at `/auth/github?origin=`, so a malicious page cannot receive the
   session token even if it can trigger the flow — but it is not bound to the initiating
@@ -205,8 +205,11 @@ Client semantics match Convex: `useQuery` returns `undefined` until the first
   exchange and then gets a victim's browser to load the resulting callback at an allowed
   origin could have the victim's SPA receive and store the attacker's session token via
   `postMessage` — logging the victim in as the attacker, not compromising the victim's
-  own account. Accepted as an MVP risk for a personal, allowlisted deployment;
-  PKCE/cookie-binding is deferred to Plan 2's auth-client work.
+  own account. **Resolved 2026-08-02:** a double-submit nonce cookie (`rtdb-oauth-csrf`,
+  value = `state`) now binds `state` to the initiating browser — set at `/begin`,
+  constant-time-verified at `/callback`, default-on with break-glass
+  `RTDB_OAUTH_LOGIN_CSRF=false`. The text above is retained as the pre-hardening
+  historical record.
 
 ## TypeScript client (`client/` package)
 
