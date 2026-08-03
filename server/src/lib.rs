@@ -156,6 +156,7 @@ fn cors_layer(hot: Arc<ArcSwap<HotConfig>>) -> CorsLayer {
             Method::OPTIONS,
         ])
         .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
+        .allow_credentials(true)
 }
 
 /// Sets `Cache-Control` on static responses from their Content-Type: the SPA
