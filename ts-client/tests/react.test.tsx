@@ -173,10 +173,9 @@ describe("signInWithGitHub (begin + poll relay)", () => {
     await vi.advanceTimersByTimeAsync(OAUTH_POLL_INTERVAL_MS);
 
     await expect(promise).resolves.toBe("tok-1");
-    expect(fetchSpy).toHaveBeenCalledWith(
-      expect.stringContaining("/auth/github/begin?origin="),
-      { credentials: "include" },
-    );
+    expect(fetchSpy).toHaveBeenCalledWith(expect.stringContaining("/auth/github/begin?origin="), {
+      credentials: "include",
+    });
     expect(fetchSpy).toHaveBeenCalledWith(expect.stringContaining("/auth/state?state=s1"));
     expect(openSpy).toHaveBeenCalledWith(
       "about:blank",
@@ -243,10 +242,9 @@ describe("signInWithGoogle (begin + poll relay)", () => {
     await vi.advanceTimersByTimeAsync(OAUTH_POLL_INTERVAL_MS);
 
     await expect(promise).resolves.toBe("goog-tok");
-    expect(fetchSpy).toHaveBeenCalledWith(
-      expect.stringContaining("/auth/google/begin?origin="),
-      { credentials: "include" },
-    );
+    expect(fetchSpy).toHaveBeenCalledWith(expect.stringContaining("/auth/google/begin?origin="), {
+      credentials: "include",
+    });
     expect(openSpy).toHaveBeenCalledWith(
       "about:blank",
       "rtdb-auth",
@@ -303,10 +301,9 @@ describe("useRtDbAuth signIn routing", () => {
       await pending;
     });
 
-    expect(fetchSpy).toHaveBeenCalledWith(
-      expect.stringContaining("/auth/google/begin?origin="),
-      { credentials: "include" },
-    );
+    expect(fetchSpy).toHaveBeenCalledWith(expect.stringContaining("/auth/google/begin?origin="), {
+      credentials: "include",
+    });
     expect(openSpy).toHaveBeenCalledWith(
       "about:blank",
       "rtdb-auth",
@@ -355,10 +352,9 @@ describe("useRtDbAuth signIn routing", () => {
       await pending;
     });
 
-    expect(fetchSpy).toHaveBeenCalledWith(
-      expect.stringContaining("/auth/github/begin?origin="),
-      { credentials: "include" },
-    );
+    expect(fetchSpy).toHaveBeenCalledWith(expect.stringContaining("/auth/github/begin?origin="), {
+      credentials: "include",
+    });
     expect(localStorage.getItem("rtdb-session-token")).toBe("gh-tok");
   });
 });
