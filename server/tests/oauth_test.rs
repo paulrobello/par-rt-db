@@ -13,15 +13,14 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-/// Builds an `AppState` whose GitHub URLs point at `mock`, with OAuth
-/// credentials configured, and spawns it. Bootstrap runs on a fresh
-/// connection to the shared test Postgres, matching `test_state()`'s setup.
-async fn oauth_state(mock: &MockServer) -> (Arc<AppState>, SocketAddr) {
+/// Like `oauth_state`, but lets a test disable the login-CSRF check (kill-switch).
+async fn oauth_state_with_csrf(mock: &MockServer, csrf: bool) -> (Arc<AppState>, SocketAddr) {
     let mut cfg = test_config();
     cfg.github_base_url = mock.uri();
     cfg.github_api_url = mock.uri();
     cfg.github_client_id = Some("test-client".into());
     cfg.github_client_secret = Some("test-secret".into());
+    cfg.oauth_login_csrf = csrf;
 
     let pool = sqlx::PgPool::connect(&cfg.database_url)
         .await
@@ -31,6 +30,13 @@ async fn oauth_state(mock: &MockServer) -> (Arc<AppState>, SocketAddr) {
     let state = AppState::new(pool, cfg, common::test_hot());
     let addr = spawn_app(state.clone()).await;
     (state, addr)
+}
+
+/// Builds an `AppState` whose GitHub URLs point at `mock`, with OAuth
+/// credentials configured, and spawns it. Bootstrap runs on a fresh
+/// connection to the shared test Postgres, matching `test_state()`'s setup.
+async fn oauth_state(mock: &MockServer) -> (Arc<AppState>, SocketAddr) {
+    oauth_state_with_csrf(mock, true).await
 }
 
 /// Mounts the three GitHub endpoints the callback hits, each asserting the
@@ -110,6 +116,7 @@ fn extract_token_from_cookie(set_cookie: &str) -> String {
 fn no_redirect_client() -> reqwest::Client {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
+        .cookie_store(true)
         .build()
         .expect("build client")
 }
@@ -965,5 +972,70 @@ async fn github_login_email_linked_elsewhere_returns_conflict_not_500() -> anyho
             .fetch_one(&state.pool)
             .await?;
     assert_eq!(gh, Some(other_github_id));
+    Ok(())
+}
+
+/// Login-CSRF: a callback from a different browser (no matching nonce cookie)
+/// is rejected 400, even with a valid begun state — the attacker-induced-callback
+/// scenario. The state entry stays Pending (not claimed). No provider mocks are
+/// mounted: the CSRF gate fires before `complete_login`, so no IdP call happens.
+#[tokio::test]
+async fn login_csrf_rejected_without_cookie() -> anyhow::Result<()> {
+    let mock = MockServer::start().await;
+    let (_state, addr) = oauth_state(&mock).await;
+
+    // begin on a cookie-storing client (it stores the nonce)…
+    let begin_client = no_redirect_client();
+    let state_token = begin_login(&begin_client, addr, "http://localhost:5173").await;
+    // …but the callback comes from a different, cookie-less client.
+    let callback_client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
+    let resp = callback(&callback_client, addr, &state_token).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    Ok(())
+}
+
+/// Login-CSRF: a callback whose cookie value does not match `state` is rejected.
+/// No provider mocks: the CSRF gate fires before `complete_login`.
+#[tokio::test]
+async fn login_csrf_rejected_with_wrong_cookie() -> anyhow::Result<()> {
+    let mock = MockServer::start().await;
+    let (_state, addr) = oauth_state(&mock).await;
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?; // no cookie store → no auto-replay
+    let state_token = begin_login(&client, addr, "http://localhost:5173").await;
+    let resp = client
+        .get(format!(
+            "http://{addr}/auth/callback?code=abc&state={state_token}"
+        ))
+        .header("cookie", "rtdb-oauth-csrf=not-the-real-state")
+        .send()
+        .await?;
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    Ok(())
+}
+
+/// Kill-switch: with RTDB_OAUTH_LOGIN_CSRF=false, a cookie-less callback succeeds
+/// (today's pre-hardening behavior).
+#[tokio::test]
+async fn login_csrf_kill_switch_off_allows_cookieless_callback() -> anyhow::Result<()> {
+    let mock = MockServer::start().await;
+    // distinct github_id/login so it never collides with other parallel tests.
+    mount_github_user_mocks(
+        &mock,
+        4242,
+        "csrfkill",
+        json!([{"email": "csrf-kill@example.com", "verified": true, "primary": true}]),
+    )
+    .await;
+    let (_state, addr) = oauth_state_with_csrf(&mock, false).await;
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?; // no cookie store → no nonce sent
+    let state_token = begin_login(&client, addr, "http://localhost:5173").await;
+    let resp = callback(&client, addr, &state_token).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
     Ok(())
 }

@@ -8,6 +8,7 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header::SET_COO
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use serde::Deserialize;
+use subtle::ConstantTimeEq;
 
 use crate::AppState;
 use crate::auth::{Principal, authed_user, resolve_bearer, session};
@@ -188,6 +189,7 @@ struct BeginResponse {
 /// (never interpolated anywhere), retiring the SEC-005 self-XSS surface.
 async fn provider_begin<P: OAuthProvider>(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     QueryParams(params): QueryParams<BeginParams>,
 ) -> Response {
     let Some(provider) = P::from_config(&state.config) else {
@@ -221,11 +223,20 @@ async fn provider_begin<P: OAuthProvider>(
 
     let redirect_uri = format!("{}{}", state.config.public_url, provider.callback_path());
     let authorize_url = provider.authorize_url(&redirect_uri, &state_token);
-    Json(BeginResponse {
+    let mut response = Json(BeginResponse {
         authorize_url,
-        state: state_token,
+        state: state_token.clone(),
     })
-    .into_response()
+    .into_response();
+    // Login-CSRF: bind this `state` to the initiating browser so a callback the
+    // attacker induced the victim to load (the attacker's own exchange) carries no
+    // matching cookie and is rejected at `provider_callback`. SameSite=None so it
+    // survives the provider → callback cross-site redirect.
+    let secure = crate::auth::cookie::request_is_secure(&headers);
+    if let Ok(csrf) = crate::auth::cookie::set_oauth_csrf_cookie(&state_token, secure) {
+        response.headers_mut().append(SET_COOKIE, csrf);
+    }
+    response
 }
 
 #[derive(Deserialize)]
@@ -245,6 +256,18 @@ async fn provider_callback<P: OAuthProvider>(
     headers: HeaderMap,
     QueryParams(params): QueryParams<CallbackParams>,
 ) -> Response {
+    // Login-CSRF gate: the browser that hits the callback must be the one that hit
+    // begin (it carries the matching nonce cookie). Checked before the entry is
+    // claimed, so a rejected callback leaves the state Pending and a legit retry
+    // still works. Constant-time compare for hygiene.
+    if state.config.oauth_login_csrf {
+        let ok = crate::auth::cookie::oauth_csrf_cookie(&headers)
+            .is_some_and(|c| bool::from(c.as_bytes().ct_eq(params.state.as_bytes())));
+        if !ok {
+            return RtDbError::bad_request("login CSRF check failed").into_response();
+        }
+    }
+
     if !claim_pending(&state, &params.state).await {
         return RtDbError::bad_request("invalid or expired state").into_response();
     }
@@ -289,7 +312,10 @@ fn callback_close_response(token: &str, secure: bool) -> Response {
     );
     match crate::auth::cookie::set_session_cookie(token, secure) {
         Ok(cookie) => {
-            response.headers_mut().insert(SET_COOKIE, cookie);
+            response.headers_mut().append(SET_COOKIE, cookie);
+            response
+                .headers_mut()
+                .append(SET_COOKIE, crate::auth::cookie::clear_oauth_csrf_cookie());
             response
         }
         Err(err) => err.into_response(),
