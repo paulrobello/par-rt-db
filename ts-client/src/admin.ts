@@ -5,6 +5,7 @@ import type {
   SchemaJson,
   TransactionJson,
 } from "./protocol.js";
+import type { WebSocketLike } from "./client.js";
 import type { RtQuery } from "./query.js";
 import type { SchemaDefinition } from "./schema.js";
 
@@ -12,6 +13,10 @@ export interface RtDbAdminClientOptions {
   url: string;
   adminKey: string;
   fetch?: typeof fetch;
+  /** Injectable WebSocket constructor (browser/Node/bun). Defaults to the global
+   *  `WebSocket`. The second arg carries the WS subprotocol(s) — `/admin/stream`
+   *  authenticates via the `rtdb-admin.<token>` subprotocol. */
+  webSocketFactory?: (url: string, protocols?: string | string[]) => WebSocketLike;
 }
 
 export interface AdminMember {
@@ -109,6 +114,11 @@ export interface OpEvent {
   ts: number;
   owner?: string | null;
 }
+/** A frame on the `/admin/stream` op-feed: a document op event (replay then live),
+ *  or a ~1s server metrics snapshot. */
+export type AdminStreamFrame =
+  | { kind: "op"; event: OpEvent }
+  | { kind: "gauges"; gauges: MetricsSnapshot };
 
 function toSchemaJson(schema: SchemaDefinition<any> | SchemaJson): SchemaJson {
   return "toJSON" in schema && typeof schema.toJSON === "function"
@@ -116,16 +126,39 @@ function toSchemaJson(schema: SchemaDefinition<any> | SchemaJson): SchemaJson {
     : (schema as SchemaJson);
 }
 
+/** Parse one `/admin/stream` text frame into a typed `AdminStreamFrame`, or `null`
+ *  for a malformed/non-string message (ignored, never breaks the stream). */
+function parseAdminStreamFrame(data: unknown): AdminStreamFrame | null {
+  if (typeof data !== "string") return null;
+  let parsed: { kind?: string; event?: OpEvent; gauges?: MetricsSnapshot };
+  try {
+    parsed = JSON.parse(data);
+  } catch {
+    return null;
+  }
+  if (parsed.kind === "op" && parsed.event) {
+    return { kind: "op", event: parsed.event };
+  }
+  if (parsed.kind === "gauges" && parsed.gauges) {
+    return { kind: "gauges", gauges: parsed.gauges };
+  }
+  return null;
+}
+
 /** Control-plane client for `/admin/*`, authorized with the instance admin key. */
 export class RtDbAdminClient {
   private readonly url: string;
   private readonly adminKey: string;
   private readonly fetchImpl: typeof fetch;
+  private readonly webSocketFactory: (url: string, protocols?: string | string[]) => WebSocketLike;
 
   constructor(options: RtDbAdminClientOptions) {
     this.url = options.url.replace(/\/+$/, "");
     this.adminKey = options.adminKey;
     this.fetchImpl = options.fetch ?? globalThis.fetch;
+    this.webSocketFactory =
+      options.webSocketFactory ??
+      ((url, protocols) => new WebSocket(url, protocols) as unknown as WebSocketLike);
   }
 
   async createDb(name: string): Promise<void> {
@@ -309,6 +342,85 @@ export class RtDbAdminClient {
       `/admin/db/${encodeURIComponent(db)}/migrate`,
       req,
     )) as MigrateResultJson;
+  }
+
+  /** Open the realtime op-feed over the `/admin/stream` WebSocket and yield frames
+   *  as they arrive: document op events (a 200-row replay, then live) interleaved
+   *  with ~1s server metrics snapshots. `db`/`table` filter both the replay and the
+   *  live stream. The admin key is carried in the `rtdb-admin.<token>` WS subprotocol
+   *  (the path browsers must use, since they cannot set headers on a WS handshake; the
+   *  server echoes it back to complete the 101). Break out of `for await`, abort
+   *  `signal`, or call `.return()` on the generator to close the socket. */
+  async *streamAdmin(opts?: {
+    db?: string;
+    table?: string;
+    signal?: AbortSignal;
+  }): AsyncGenerator<AdminStreamFrame> {
+    const params = new URLSearchParams();
+    if (opts?.db) params.set("db", opts.db);
+    if (opts?.table) params.set("table", opts.table);
+    const qs = params.toString();
+    const wsUrl = `${this.url.replace(/^http/, "ws")}/admin/stream${qs ? `?${qs}` : ""}`;
+
+    const socket = this.webSocketFactory(wsUrl, `rtdb-admin.${this.adminKey}`);
+
+    const queue: AdminStreamFrame[] = [];
+    let resolveWaiter: (() => void) | null = null;
+    let done = false;
+    let streamError: Error | null = null;
+    const wake = () => {
+      const r = resolveWaiter;
+      resolveWaiter = null;
+      r?.();
+    };
+
+    socket.onmessage = (ev: { data: unknown }) => {
+      const frame = parseAdminStreamFrame(ev.data);
+      if (frame) {
+        queue.push(frame);
+        wake();
+      }
+    };
+    socket.onerror = () => {
+      streamError = new RtDbError("INTERNAL", "admin stream socket error");
+      done = true;
+      wake();
+    };
+    socket.onclose = () => {
+      done = true;
+      wake();
+    };
+
+    const onAbort = () => {
+      done = true;
+      try {
+        socket.close(1000, "abort");
+      } catch {
+        /* socket may already be closed */
+      }
+      wake();
+    };
+    opts?.signal?.addEventListener("abort", onAbort);
+
+    try {
+      while (!done || queue.length > 0) {
+        if (queue.length > 0) {
+          yield queue.shift() as AdminStreamFrame;
+        } else {
+          await new Promise<void>((resolve) => {
+            resolveWaiter = resolve;
+          });
+        }
+      }
+      if (streamError) throw streamError;
+    } finally {
+      opts?.signal?.removeEventListener("abort", onAbort);
+      try {
+        socket.close(1000, "cleanup");
+      } catch {
+        /* already closed */
+      }
+    }
   }
 
   private async throwFromResponse(response: Response): Promise<never> {

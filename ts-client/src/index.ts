@@ -55,7 +55,7 @@ export { encodeCursor, decodeCursor } from "./pagination.js";
 export { RtDbHttpClient } from "./http.js";
 export type { RtDbHttpClientOptions, UploadResult, FileMetadata } from "./http.js";
 export { RtDbAdminClient } from "./admin.js";
-export type { RtDbAdminClientOptions } from "./admin.js";
+export type { AdminStreamFrame, RtDbAdminClientOptions } from "./admin.js";
 export { RtDbClient } from "./client.js";
 export type { AuthState, ConnectionState, RtDbClientOptions, WebSocketLike } from "./client.js";
 export { InMemoryRtDbClient } from "./in_memory.js";

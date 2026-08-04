@@ -400,4 +400,148 @@ describe("RtDbAdminClient — new endpoints", () => {
       message: "renamed field 'users.nope' does not exist",
     });
   });
+
+  describe("streamAdmin", () => {
+    /** Minimal `WebSocketLike` stand-in: records the URL/protocols it was opened with
+     *  and lets a test push frames or simulate a server-side close. */
+    class FakeSocket {
+      onopen: (() => void) | null = null;
+      onmessage: ((ev: { data: unknown }) => void) | null = null;
+      onclose: ((ev: { code: number; reason: string }) => void) | null = null;
+      onerror: (() => void) | null = null;
+      closed = false;
+      emit(data: unknown) {
+        this.onmessage?.({ data: typeof data === "string" ? data : JSON.stringify(data) });
+      }
+      serverClose(code = 1006, reason = "") {
+        this.closed = true;
+        this.onclose?.({ code, reason });
+      }
+      send(): void {}
+      close(): void {
+        this.closed = true;
+      }
+    }
+
+    const gauges = {
+      queriesTotal: 5,
+      mutationsTotal: 3,
+      uploadsTotal: 0,
+      wsConnections: 1,
+      activeSubscriptions: 2,
+      poolSize: 10,
+      poolIdle: 8,
+      uptimeSeconds: 99,
+      queryLatency: { p50: 1, p95: 2, p99: 3 },
+      mutateLatency: { p50: 1, p95: 2, p99: 3 },
+      subscribeLatency: { p50: 1, p95: 2, p99: 3 },
+      subsRerunsTotal: 0,
+      subsSkipsPointTotal: 0,
+      subsSkipsIndexedTotal: 0,
+      subsSkipsOrderedTotal: 0,
+      subsSkipVerificationsTotal: 0,
+      subsMissedPushesTotal: 0,
+    };
+
+    it("opens a ws:// URL and carries the admin key in the rtdb-admin subprotocol", async () => {
+      let openedUrl = "";
+      let protocols: string | string[] | undefined;
+      const socket = new FakeSocket();
+      const admin = new RtDbAdminClient({
+        url: "http://h:8300",
+        adminKey: "secret",
+        webSocketFactory: (url, protos) => {
+          openedUrl = url;
+          protocols = protos;
+          return socket;
+        },
+      });
+
+      const iter = admin.streamAdmin({ db: "kanban", table: "notes" });
+      const pending = iter.next();
+      socket.emit({
+        kind: "op",
+        event: { db: "kanban", table: "notes", docId: "d1", kind: "insert", ts: 7 },
+      });
+      const { value } = await pending;
+      await iter.return(undefined);
+
+      expect(openedUrl).toBe("ws://h:8300/admin/stream?db=kanban&table=notes");
+      expect(protocols).toBe("rtdb-admin.secret");
+      expect(value).toEqual({
+        kind: "op",
+        event: { db: "kanban", table: "notes", docId: "d1", kind: "insert", ts: 7 },
+      });
+    });
+
+    it("yields op and gauges frames in arrival order", async () => {
+      const socket = new FakeSocket();
+      const admin = new RtDbAdminClient({
+        url: "https://h:8300",
+        adminKey: "k",
+        webSocketFactory: () => socket,
+      });
+
+      const iter = admin.streamAdmin();
+      const a = iter.next();
+      socket.emit({ kind: "op", event: { db: "d", table: "t", docId: "1", kind: "patch", ts: 1 } });
+      const first = await a;
+      const b = iter.next();
+      socket.emit({ kind: "gauges", gauges });
+      const second = await b;
+      await iter.return(undefined);
+
+      expect(first.value).toEqual({
+        kind: "op",
+        event: { db: "d", table: "t", docId: "1", kind: "patch", ts: 1 },
+      });
+      expect(second.value).toEqual({ kind: "gauges", gauges });
+    });
+
+    it("ends the iterator when the server closes the socket", async () => {
+      const socket = new FakeSocket();
+      const admin = new RtDbAdminClient({
+        url: "http://h:8300",
+        adminKey: "k",
+        webSocketFactory: () => socket,
+      });
+
+      const iter = admin.streamAdmin();
+      const pending = iter.next();
+      socket.serverClose(1006, "");
+      await expect(pending).resolves.toEqual({ done: true, value: undefined });
+      expect(socket.closed).toBe(true);
+    });
+
+    it("ignores malformed frames and closes the socket on AbortSignal", async () => {
+      const socket = new FakeSocket();
+      const ctrl = new AbortController();
+      const admin = new RtDbAdminClient({
+        url: "http://h:8300",
+        adminKey: "k",
+        webSocketFactory: () => socket,
+      });
+
+      const collected: unknown[] = [];
+      const consume = (async () => {
+        for await (const frame of admin.streamAdmin({ signal: ctrl.signal })) {
+          collected.push(frame);
+        }
+      })();
+
+      socket.emit("not-json"); // malformed — ignored
+      socket.emit({
+        kind: "op",
+        event: { db: "d", table: "t", docId: "9", kind: "delete", ts: 2 },
+      });
+      // let the microtask queue drain so the frame is consumed
+      await Promise.resolve();
+      await Promise.resolve();
+      ctrl.abort();
+      await consume;
+
+      expect(collected).toHaveLength(1);
+      expect(socket.closed).toBe(true);
+    });
+  });
 });
