@@ -1,0 +1,46 @@
+# Enhancements — par-rt-db
+
+<instructions>
+Each enhancement has a checkbox that can be marked done.
+Work each on its own feature branch: /enhancement-next for one at a time with a confirmation
+prompt, /enhancement-all to work the whole list unattended.
+An item is marked [x] only after the project's verification passes — /enhancement-done closes
+out a single item; /enhancement-next and /enhancement-all gate each one themselves.
+Mark items done rather than deleting them — this file is a standing record.
+Ids are never renumbered: they are referenced by kanban cards and plan filenames.
+</instructions>
+
+These are hand-authored candidates beyond the Convex-parity matrix — every ranked gap in
+`FEATURE_MATRIX.md` §2 is already shipped (2026-08-01), so this list extends par-rt-db's native
+strengths and fills operational / DX gaps a self-hoster actually hits. Each is grounded in the
+real code surface cited in the paragraph.
+
+- [ ] **ENH-001 — Microsoft + Apple OAuth providers** — The `OAuthProvider` trait (`server/src/auth/provider.rs`) ships GitHub, Google, GitLab, and generic OIDC; FEATURE_MATRIX #14 flags Microsoft and Apple as the two remaining per-IdP impls, each a small `provider.rs` file. Adding them completes the provider set for operators whose org standardizes on Entra ID (Microsoft) or Sign in with Apple. (impact: medium, effort: small, plan: none)
+
+- [ ] **ENH-002 — Backups dashboard: view, trigger, and restore** — `backup.rs` already runs scheduled `pg_dump` and exposes `GET /admin/backups`, but there is no `BackupsPage.tsx`, no manual "back up now" trigger, and no restore path — an operator who needs to recover must drop to the shell. Add a dashboard page listing dumps newest-first (timestamp, size), a manual-trigger endpoint, and an opt-in restore flow (server-side restore with a typed `confirm` guard, since restoring over the live DB the server is using needs care), so the console covers the full backup lifecycle rather than listing alone. (impact: high, effort: medium-large, plan: none)
+
+- [ ] **ENH-003 — Webhook management dashboard page** — `webhook.rs` ships full admin CRUD at `/admin/db/{db}/webhooks` plus an outbox delivery worker, but the only client today is the API — there is no `WebhooksPage.tsx`. Add a per-db page to create/list/edit/delete webhook subscriptions (db, table, events, URL) and surface delivery status, mirroring existing admin surfaces like tokens and the admin allowlist. (impact: medium, effort: small, plan: none)
+
+- [ ] **ENH-004 — Audit-log dashboard page** — When `RTDB_AUDIT_LOG_ENABLED` is set, `audit.rs` writes one `rtdb.audit_log` row per durable `DocOp` and exposes `GET /admin/audit?db=&limit=&offset=`, but there is no UI to read it. Add an `AuditPage.tsx` — a filterable, paginated table (by db/table/op/principal/source/time) over the existing endpoint — so the audit trail is reviewable from the console instead of via curl. (impact: medium, effort: small, plan: none)
+
+- [ ] **ENH-005 — Scoped & time-limited machine tokens** — Tokens minted by `auth/tokens.rs` are per-database, full-access, and never expire (there are no `expires`/`scope`/`read_only` fields). Add an optional expiry (`expiresAt`) and a read-only capability flag so operators can mint least-privilege tokens for external workers, scrapers, and shared read-only dashboards — enforced at `authorize` alongside the existing live revocation checks, with the dashboard token-mint form extended to set them. (impact: medium-high, effort: medium, plan: none)
+
+- [ ] **ENH-006 — Configurable full-text search language** — Search indexes compile to `to_tsvector('english', …)` hardcoded (`ddl.rs:262`), so non-English corpora get poor tokenization. Let a search index declare an optional `language` (a Postgres `regconfig` name, validated against `pg_ts_config`) compiled into the generated tsvector column, so multilingual apps get correct stemming and stop-words per index. (impact: medium, effort: small, plan: none)
+
+- [ ] **ENH-007 — Vector distance metric options (L2 / inner-product)** — Vector indexes are hardcoded to HNSW `vector_cosine_ops` with cosine `<=>` distance (`ddl.rs:302`, `query.rs`). Some embeddings score better under a different metric — normalized vectors under inner-product, or L2-based image models. Let a vector index declare its metric (`cosine` default | `l2` | `ip`), compiling to the matching `vector_l2_ops` / `vector_ip_ops` opclass and the corresponding distance operator. (impact: medium, effort: medium, plan: none)
+
+- [ ] **ENH-008 — Content-addressed storage dedup** — `storage.rs` already computes and stores a `sha256` per blob but inserts unconditionally, so re-uploading identical bytes stores a duplicate. Add a per-db uniqueness constraint and lookup on `sha256` so a re-upload of known content returns the existing id/URL instead of storing a second copy — meaningful space savings for apps that re-upload the same asset (avatars, generated images, fixtures). (impact: low-medium, effort: small, plan: none)
+
+- [ ] **ENH-009 — One-shot database clone** — Snapshot export (`GET /admin/export-db`) and import (`POST /admin/import-db`) already give app-level portability (#7), but cloning a database is a two-step manual dance. Add a `POST /admin/clone-db?from=&to=` that streams export→import server-side into a freshly created database (schema plus all documents, preserving ids), useful for dev/preview seeds and safe experimentation off a live db. (impact: low-medium, effort: small, plan: none)
+
+- [ ] **ENH-010 — Live subscription inspector** — The metrics page shows subscription *counts* (gauges) but not *what* is subscribed, so an operator debugging "why does this table re-run so often" cannot see the live query set. Add an admin view (and dashboard surface) enumerating active subscriptions per database — table, terminal, read-set class, subscriber count — surfacing the per-class skip/re-run counters (`rtdb_subs_skips_total` / `reruns`) already tracked in `subs.rs` so invalidation behavior is observable per query, not just aggregated. (impact: medium, effort: medium, plan: none)
+
+- [ ] **ENH-011 — Per-database resource quotas** — One instance hosts many named databases, and today nothing stops one db's tables, storage, or subscriptions from crowding the rest. Add optional per-db quotas (max tables, max storage bytes, max concurrent subscriptions) enforced at create / push-schema / mutate / subscribe, configurable via hot config, so multi-tenant self-hosting stays fair without per-db deployment. (impact: medium, effort: medium-large, plan: none)
+
+- [ ] **ENH-012 — Async Python HTTP / admin / storage client** — The Python client's reactive WS surface is async (`pip install par-rt-db[ws]`), but its HTTP/admin/storage surface is sync `httpx` only (`[http]`), forcing async apps to wrap every one-shot call in a thread. Add an async variant (`par-rt-db[aio]` over `httpx.AsyncClient`) mirroring the sync method set, bringing the Python client to full async parity for modern async frameworks. (impact: medium, effort: medium, plan: none)
+
+- [ ] **ENH-013 — Schema change history** — Schema pushes and migrate directives mutate the live schema in place; there is no versioned record of what the schema *was* over time and no easy revert beyond re-pushing. Capture a schema snapshot on every push and migrate (alongside the existing committer tap sites), expose a history view in the dashboard, and allow restoring a prior schema version — making destructive migrations reversible from the console. (impact: medium, effort: medium-large, plan: none)
+
+- [ ] **ENH-014 — On-the-fly image transforms on storage serve** — `GET /storage/{id}` serves the raw bytes, so apps that need thumbnails or resized variants either store N copies or transform client-side. Add optional query-param transforms (`?w=` / `?h=` / `?fit=` / `?q=`) on the public serve route, processed server-side with a cache, so a single stored image yields any derived size — a feature Convex ships natively. (impact: medium, effort: medium-large, plan: none)
+
+- [ ] **ENH-015 — Realtime presence primitive** — Realtime queries cover durable data, but "who is online right now" forces a docs-plus-TTL workaround. Add a transient presence layer — a per-db channel of ephemeral heartbeats, not committer-bound and not durable, pushed to subscribers — for online-indicator and cursor features that Convex provides via components. Opt-in, no document tables, no persistence. (impact: medium, effort: large, plan: none)
