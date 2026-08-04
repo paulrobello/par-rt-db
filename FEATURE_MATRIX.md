@@ -308,7 +308,9 @@ and vector search: server (`protocol.rs`), ts-client, rust-client, and python-cl
 The python-client ships the wire contract, the schema/mutation/query DSL, **the
 HTTP/admin/storage surfaces** (`pip install par-rt-db[http]` — a sync `httpx` client; admin
 client + storage helpers; schema `FieldType(15)`/indexes/`ownerField`, `TableQuery`
-builders, `Mutation`/`Transaction`, `FilterExpr`, `RtDbError`), **and the reactive WS
+builders, `Mutation`/`Transaction`, `FilterExpr`, `RtDbError`; an async twin
+`RtDbAsyncHttpClient` over `httpx.AsyncClient` under `pip install par-rt-db[aio]`
+(ENH-012, 2026-08-04) mirrors the same method set), **and the reactive WS
 surface** (`pip install par-rt-db[ws]` — `RtDbClient` with live `subscribe`, at-most-once
 `mutate`, and schedule ops over `/sync`; `Subscription` async iterator with `.current()`).
 Reactive WS / live queries / WS mutations / schedule ops are mirrored across all four

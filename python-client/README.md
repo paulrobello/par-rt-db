@@ -23,6 +23,7 @@ Package name: `par-rt-db` → in Python, `import par_rt_db`.
 | Cursor codec (`encode_cursor` / `decode_cursor`) | shipped | `par_rt_db.cursor` |
 | Error model (`RtDbError`, `ErrorCode`, `retry_on_precondition`) | shipped | `par_rt_db.errors` |
 | HTTP / admin / storage client (`RtDbHttpClient`, sync `httpx`) | shipped | `par_rt_db.http_client` (`[http]` extra) |
+| Async HTTP / admin / storage client (`RtDbAsyncHttpClient`, `httpx.AsyncClient`) | shipped | `par_rt_db.aio_http_client` (`[aio]` extra) |
 | Reactive WebSocket client (`RtDbClient`, `Subscription`) | shipped | `par_rt_db.ws_client` (`[ws]` extra) |
 
 The DSL layer is feature-complete: every server query terminal
@@ -49,6 +50,7 @@ client extras pull in `httpx` and `websockets` respectively:
 
 ```bash
 pip install par-rt-db[http]    # sync HTTP client + admin control plane + storage
+pip install par-rt-db[aio]     # async HTTP/admin/storage client (httpx.AsyncClient)
 pip install par-rt-db[ws]      # reactive WebSocket client (live queries, WS mutations)
 ```
 
@@ -153,6 +155,33 @@ resubscribe. `get_token` is an async callable (it may refresh an OAuth token);
 return `None` to pause reconnects. Each `subscribe()` returns a `Subscription`
 that is both an async iterator (yields each new value) and exposes the latest
 value via `.current()`. Install with `pip install par-rt-db[ws]`.
+
+### Async HTTP / admin / storage (`[aio]` extra)
+
+`RtDbAsyncHttpClient` is a one-to-one async mirror of `RtDbHttpClient` over
+`httpx.AsyncClient` — every public method is a coroutine with the same name,
+arguments, and return types as the sync client. Use it from async frameworks
+(FastAPI, asyncio apps) instead of thread-wrapping the sync client.
+
+```python
+import asyncio
+
+from par_rt_db import Mutation, RtDbAsyncHttpClient, TableQuery
+
+
+async def main() -> None:
+    # Same `(url, db, token)` shape as the sync client; `async with` closes it.
+    async with RtDbAsyncHttpClient("https://rtdb.pardev.net", "mydb", "<machine-token>") as client:
+        rows = await client.run(TableQuery("items").collect())
+        await client.mutate(
+            Mutation.builder().insert("items", {"_id": "i1", "name": "widget", "n": 1}).build()
+        )
+
+
+asyncio.run(main())
+```
+
+Install with `pip install par-rt-db[aio]` (same `httpx>=0.27` pin as `[http]`).
 
 ### Schemas and cursors
 
