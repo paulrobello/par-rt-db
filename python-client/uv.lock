@@ -124,6 +124,9 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+aio = [
+    { name = "httpx" },
+]
 http = [
     { name = "httpx" },
 ]
@@ -141,11 +144,12 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "httpx", marker = "extra == 'aio'", specifier = ">=0.27" },
     { name = "httpx", marker = "extra == 'http'", specifier = ">=0.27" },
     { name = "pydantic", specifier = ">=2.7" },
     { name = "websockets", marker = "extra == 'ws'", specifier = ">=13" },
 ]
-provides-extras = ["ws", "http"]
+provides-extras = ["ws", "http", "aio"]
 
 [package.metadata.requires-dev]
 dev = [
