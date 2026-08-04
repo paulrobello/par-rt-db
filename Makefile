@@ -8,7 +8,7 @@ DEPLOY_PATH = /docker/par-rt-db
 # the commit being deployed, without touching lenny2's .env.
 DEPLOY_COMMIT := $(shell git rev-parse --short HEAD)
 
-.PHONY: build test lint fmt fmt-check typecheck checkall dev-db-up dev-db-down \
+.PHONY: build test lint fmt fmt-check typecheck checkall dev-db-up dev-db-down dev-db-clean \
 	pre-commit pre-commit-update ts-client-build ts-client-install dashboard-install \
 	dashboard-test \
 	python-client-install python-client-test python-client-lint python-client-fmt \
@@ -63,6 +63,12 @@ dev-db-up:
 
 dev-db-down:
 	$(COMPOSE_DEV) down
+
+# Drop leaked test schemas (db_t<uuid-v7>) from the dev rtdb DB. Tests create a
+# database per test and don't drop it, so the dev DB bloats over time; run this
+# periodically. Requires psql on PATH and the dev Postgres up (make dev-db-up).
+dev-db-clean:
+	psql "$(RTDB_TEST_DATABASE_URL)" -f scripts/dev-db-clean.sql
 
 test: dev-db-up
 	cd server && cargo test

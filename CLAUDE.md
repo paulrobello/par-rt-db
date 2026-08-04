@@ -14,6 +14,7 @@ Six packages run from the root `Makefile`: Rust **server** (`server/`, cargo), *
 
 - `make checkall` — the full gate (fmt-check + clippy `-D warnings` + typecheck + tests). **Definition of done; must pass before commit.**
 - `make dev-db-up` / `dev-db-down` — start/stop the dev Postgres on `127.0.0.1:55434`. **Required for any test run** — integration tests hit a real DB.
+- `make dev-db-clean` — drop leaked test schemas from the dev `rtdb` DB. Tests create a `t<uuid-v7>` database per test and don't drop it (fast isolation), so the dev DB accumulates `db_t<uuid-v7>` schemas that bloat `pg_dump`; run this periodically (scoped to the test pattern — never touches `rtdb`/`rtdb_auth`/real DBs).
 - `make test` — `dev-db-up` then the whole suite. First-time setup: `make ts-client-install`, `make dashboard-install`, `make python-client-install`.
 - Single test: `cargo test --test txn_test upsert_multiple_matches` (one integration binary), `cargo test upsert` (by name across binaries; binaries mirror the modules — `txn_test`, `query_test`, `subs_test`, …), `cd ts-client && bunx vitest run tests/<file>.test.ts`, or `cd python-client && uv run pytest -q tests/<file>.py`.
 - Live-server tests are opt-in: `ts-client/tests/integration/**` and `rust-client/tests/http_integration.rs` (`#[ignore]`, needs `RTDB_TEST_SERVER_URL` + `RTDB_TEST_ADMIN_KEY`, run with `--ignored`). The rust-client one needs no dev Postgres.

@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use axum::body::Body;
@@ -1093,9 +1093,19 @@ async fn list_backups(
     Ok(Json(BackupsResponse { running, backups }))
 }
 
+/// RAII guard that clears `AppState::backup_running` on drop, so the flag
+/// releases even if the spawned backup task panics (Drop runs during unwind) —
+/// a panic in the backup path can't lock out manual triggers until restart.
+struct BackupRunningGuard(Arc<AtomicBool>);
+impl Drop for BackupRunningGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 /// `POST /admin/backup` — trigger one `pg_dump` now. Returns 202 immediately;
 /// the dump runs in a detached task and the in-progress flag is cleared on
-/// completion (success or failure). A second call while one is running → 409.
+/// completion (success, failure, or panic). A second call while one is running → 409.
 /// Runs outside the committer (pg_dump is a read), exactly like the cron backup
 /// task — no document tables or subscriptions are touched.
 async fn create_backup(
@@ -1112,11 +1122,11 @@ async fn create_backup(
     let dir = state.config.backup_dir.clone();
     let flag = state.backup_running.clone();
     tokio::spawn(async move {
+        let _guard = BackupRunningGuard(flag);
         match crate::backup::perform_backup(&url, &dir).await {
             Ok(p) => tracing::info!(path = %p.display(), "manual backup completed"),
             Err(e) => tracing::error!(error = %e, "manual backup failed"),
         }
-        flag.store(false, Ordering::Release);
     });
     Ok((StatusCode::ACCEPTED, Json(OkResponse { ok: true })))
 }
