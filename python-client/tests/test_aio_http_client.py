@@ -19,11 +19,14 @@ from par_rt_db import (
     Mutation,
     RtDbError,
     TableQuery,
+    t,
 )
 from par_rt_db.aio_http_client import RtDbAsyncHttpClient
-from par_rt_db.http_client import FileMetadata, UploadResult
+from par_rt_db.http_client import FileMetadata, MintedToken, UploadResult
+from par_rt_db.schema import Schema
 
 BEARER = "Bearer machine-token"
+ADMIN_BEARER = "Bearer admin-key"
 DB = "t<uuid>"
 
 RouteResponse = httpx.Response | Callable[[httpx.Request], httpx.Response]
@@ -430,3 +433,728 @@ def test_get_url_is_base_plus_storage_id_no_request() -> None:
     # No mock handler installed → any request would fail; get_url makes none.
     client = _client(lambda r: httpx.Response(500))
     assert client.get_url("f1") == "https://rtdb.example/storage/f1"
+
+
+# --- admin control plane ----------------------------------------------------
+
+
+def _admin_client(handler: Any) -> RtDbAsyncHttpClient:
+    return _client(handler, token="admin-key")
+
+
+async def test_admin_create_db_posts_name() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        captured["auth"] = request.headers["authorization"]
+        return httpx.Response(200, json={"ok": True})
+
+    async with _admin_client(handler) as c:
+        await c.create_db("kanban")
+    assert captured["body"] == {"name": "kanban"}
+    assert captured["auth"] == ADMIN_BEARER
+
+
+async def test_admin_delete_db_posts_name_and_confirm() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"ok": True})
+
+    async with _admin_client(handler) as c:
+        await c.delete_db("kanban", "kanban")
+    assert captured["body"] == {"name": "kanban", "confirm": "kanban"}
+
+
+async def test_admin_delete_db_surfaces_confirmation_mismatch_envelope() -> None:
+    async with _admin_client(
+        _handler_map(
+            {
+                ("POST", "/admin/delete-db", ""): httpx.Response(
+                    400,
+                    json={
+                        "code": "BAD_REQUEST",
+                        "message": "confirmation does not match database name",
+                    },
+                )
+            }
+        )
+    ) as c:
+        with pytest.raises(RtDbError) as ei:
+            await c.delete_db("kanban", "wrong")
+    assert ei.value.code.value == "BAD_REQUEST"
+    assert ei.value.message == "confirmation does not match database name"
+
+
+async def test_admin_push_schema_serializes_schema_json() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"ok": True})
+
+    async with _admin_client(handler) as c:
+        schema = Schema.builder().table("notes", lambda tb: tb.field("body", t.string())).build()
+        await c.push_schema("kanban", schema)
+    assert captured["body"]["db"] == "kanban"
+    assert captured["body"]["schema"]["tables"]["notes"]["fields"]["body"] == {"type": "string"}
+
+
+async def test_admin_list_dbs_returns_databases() -> None:
+    async with _admin_client(
+        _handler_map(
+            {("GET", "/admin/dbs", ""): httpx.Response(200, json={"databases": ["kanban", "demo"]})}
+        )
+    ) as c:
+        assert await c.list_dbs() == ["kanban", "demo"]
+
+
+async def test_admin_mint_token_returns_token_id_and_token() -> None:
+    async with _admin_client(
+        _handler_map(
+            {
+                ("POST", "/admin/mint-token", ""): httpx.Response(
+                    200, json={"tokenId": "id1", "token": "secret"}
+                )
+            }
+        )
+    ) as c:
+        minted = await c.mint_token("kanban", "cli")
+    assert isinstance(minted, MintedToken)
+    assert minted.token_id == "id1"
+    assert minted.token == "secret"
+
+
+async def test_admin_revoke_token_posts_token_id() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"ok": True})
+
+    async with _admin_client(handler) as c:
+        await c.revoke_token("tid")
+    assert captured["body"] == {"tokenId": "tid"}
+
+
+async def test_admin_export_db_returns_jsonl_text() -> None:
+    jsonl = '{"kind":"schema","schema":{"tables":{}}}\n'
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["query"] = dict(request.url.params)
+        return httpx.Response(200, text=jsonl)
+
+    async with _admin_client(handler) as c:
+        assert await c.export_db("kanban") == jsonl
+    assert captured["query"] == {"db": "kanban"}
+
+
+async def test_admin_import_db_posts_ndjson_body() -> None:
+    jsonl = '{"kind":"schema","schema":{"tables":{}}}\n'
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["query"] = dict(request.url.params)
+        captured["content"] = request.content.decode("utf-8")
+        captured["content_type"] = request.headers["content-type"]
+        return httpx.Response(200, json={"ok": True})
+
+    async with _admin_client(handler) as c:
+        await c.import_db("kanban", jsonl)
+    assert captured["query"] == {"db": "kanban"}
+    assert captured["content"] == jsonl
+    assert captured["content_type"] == "application/x-ndjson"
+
+
+async def test_admin_allowlist_add_posts_db_action_add_email() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"ok": True})
+
+    async with _admin_client(handler) as c:
+        await c.allowlist_add("kanban", "user@example.com")
+    assert captured["body"] == {
+        "db": "kanban",
+        "action": "add",
+        "email": "user@example.com",
+    }
+
+
+async def test_admin_allowlist_remove_posts_db_action_remove_email() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"ok": True})
+
+    async with _admin_client(handler) as c:
+        await c.allowlist_remove("kanban", "user@example.com")
+    assert captured["body"] == {
+        "db": "kanban",
+        "action": "remove",
+        "email": "user@example.com",
+    }
+
+
+async def test_admin_allowlist_list_returns_emails() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["query"] = dict(request.url.params)
+        return httpx.Response(200, json={"emails": ["a@b.com", "c@d.com"]})
+
+    async with _admin_client(handler) as c:
+        assert await c.allowlist_list("kanban") == ["a@b.com", "c@d.com"]
+    assert captured["query"] == {"db": "kanban"}
+
+
+async def test_admin_admins_list_returns_members() -> None:
+    async with _admin_client(
+        _handler_map(
+            {
+                ("GET", "/admin/admins", ""): httpx.Response(
+                    200,
+                    json={
+                        "admins": [
+                            {"email": "a@b.com", "githubId": 123},
+                            {"email": "c@d.com"},
+                        ]
+                    },
+                )
+            }
+        )
+    ) as c:
+        members = await c.admins_list()
+    from par_rt_db.http_client import AdminMember
+
+    assert len(members) == 2
+    assert isinstance(members[0], AdminMember)
+    assert members[0].email == "a@b.com"
+    assert members[0].github_id == 123
+    assert members[1].github_id is None
+
+
+async def test_admin_admins_add_posts_email_and_optional_github_id() -> None:
+    captured: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(json.loads(request.content))
+        return httpx.Response(200, json={"ok": True})
+
+    async with _admin_client(handler) as c:
+        await c.admins_add("a@b.com", github_id=123)
+        await c.admins_add("c@d.com")
+    assert captured[0] == {"email": "a@b.com", "githubId": 123}
+    # githubId omitted entirely when None
+    assert captured[1] == {"email": "c@d.com"}
+
+
+async def test_admin_admins_remove_uses_delete_with_body() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["method"] = request.method
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"ok": True})
+
+    async with _admin_client(handler) as c:
+        await c.admins_remove("a@b.com")
+    assert captured["method"] == "DELETE"
+    assert captured["body"] == {"email": "a@b.com"}
+
+
+async def test_admin_list_tokens_returns_token_info() -> None:
+    async with _admin_client(
+        _handler_map(
+            {
+                ("GET", "/admin/tokens", ""): httpx.Response(
+                    200,
+                    json={
+                        "tokens": [
+                            {"id": "t1", "name": "cli", "createdAt": 500, "revoked": False},
+                            {"id": "t2", "name": "ci", "createdAt": 600, "revoked": True},
+                        ]
+                    },
+                )
+            }
+        )
+    ) as c:
+        tokens = await c.list_tokens("kanban")
+    from par_rt_db.http_client import TokenInfo
+
+    assert len(tokens) == 2
+    assert isinstance(tokens[0], TokenInfo)
+    assert tokens[0].id == "t1"
+    assert tokens[0].created_at == 500
+    assert tokens[1].revoked is True
+
+
+async def test_admin_get_schema_returns_schema_def() -> None:
+    async with _admin_client(
+        _handler_map(
+            {
+                ("GET", "/admin/dbs/kanban/schema", ""): httpx.Response(
+                    200,
+                    json={"tables": {"notes": {"fields": {"body": {"type": "string"}}}}},
+                )
+            }
+        )
+    ) as c:
+        schema = await c.get_schema("kanban")
+    assert "notes" in schema.tables
+
+
+async def test_admin_db_stats_returns_table_stats() -> None:
+    async with _admin_client(
+        _handler_map(
+            {
+                ("GET", "/admin/dbs/kanban/stats", ""): httpx.Response(
+                    200,
+                    json={
+                        "tables": [{"name": "notes", "rowCount": 5, "sizeBytes": 4096}],
+                        "totalSizeBytes": 4096,
+                    },
+                )
+            }
+        )
+    ) as c:
+        stats = await c.db_stats("kanban")
+    from par_rt_db.http_client import DbStats
+
+    assert isinstance(stats, DbStats)
+    assert stats.total_size_bytes == 4096
+    assert stats.tables[0].row_count == 5
+    assert stats.tables[0].size_bytes == 4096
+
+
+async def test_admin_metrics_returns_snapshot_with_subs_counters() -> None:
+    async with _admin_client(
+        _handler_map(
+            {
+                ("GET", "/admin/metrics", ""): httpx.Response(
+                    200,
+                    json={
+                        "queriesTotal": 10,
+                        "mutationsTotal": 3,
+                        "uploadsTotal": 1,
+                        "wsConnections": 2,
+                        "activeSubscriptions": 5,
+                        "poolSize": 10,
+                        "poolIdle": 8,
+                        "uptimeSeconds": 99,
+                        "queryLatency": {"p50": 100, "p95": 200, "p99": 300},
+                        "mutateLatency": {"p50": 110, "p95": 210, "p99": 310},
+                        "subscribeLatency": {"p50": 120, "p95": 220, "p99": 320},
+                        "subsRerunsTotal": 7,
+                        "subsSkipsPointTotal": 1,
+                        "subsSkipsIndexedTotal": 2,
+                        "subsSkipsOrderedTotal": 3,
+                        "subsSkipVerificationsTotal": 4,
+                        "subsMissedPushesTotal": 0,
+                    },
+                )
+            }
+        )
+    ) as c:
+        snap = await c.metrics()
+    from par_rt_db.http_client import MetricsSnapshot
+
+    assert isinstance(snap, MetricsSnapshot)
+    assert snap.queries_total == 10
+    assert snap.query_latency.p99 == 300
+    assert snap.subs_skips_ordered_total == 3
+    assert snap.subs_missed_pushes_total == 0
+
+
+async def test_admin_metrics_defaults_subs_counters_when_omitted() -> None:
+    # An older server (pre-2026-07-29) omits the subs_* counters; they default to 0
+    # so a newer client still deserializes the response (mirrors rust-client serde(default)).
+    async with _admin_client(
+        _handler_map(
+            {
+                ("GET", "/admin/metrics", ""): httpx.Response(
+                    200,
+                    json={
+                        "queriesTotal": 1,
+                        "mutationsTotal": 0,
+                        "uploadsTotal": 0,
+                        "wsConnections": 0,
+                        "activeSubscriptions": 0,
+                        "poolSize": 1,
+                        "poolIdle": 1,
+                        "uptimeSeconds": 1,
+                        "queryLatency": {"p50": 0, "p95": 0, "p99": 0},
+                        "mutateLatency": {"p50": 0, "p95": 0, "p99": 0},
+                        "subscribeLatency": {"p50": 0, "p95": 0, "p99": 0},
+                    },
+                )
+            }
+        )
+    ) as c:
+        snap = await c.metrics()
+    assert snap.subs_reruns_total == 0
+    assert snap.subs_missed_pushes_total == 0
+
+
+_CONFIG_RESPONSE_BODY: dict[str, Any] = {
+    "port": 8080,
+    "publicUrl": "https://rtdb.example",
+    "githubBaseUrl": "https://github.com",
+    "githubApiUrl": "https://api.github.com",
+    "databaseUrlConfigured": True,
+    "adminKeyConfigured": True,
+    "githubConfigured": False,
+    "googleConfigured": False,
+    "gitlabConfigured": False,
+    "oidcConfigured": False,
+    "hot": {
+        "allowedOrigins": ["https://app.example"],
+        "sessionTtlDays": 30,
+        "maxFileSize": 52428800,
+        "idempotencyTtlMs": 300000,
+    },
+    "version": "0.1.0",
+    "gitCommit": "abc1234",
+    "admins": [{"email": "admin@example.com"}],
+}
+
+
+async def test_admin_get_config_returns_config_response() -> None:
+    async with _admin_client(
+        _handler_map(
+            {("GET", "/admin/config", ""): httpx.Response(200, json=_CONFIG_RESPONSE_BODY)}
+        )
+    ) as c:
+        cfg = await c.get_config()
+    from par_rt_db.http_client import ConfigResponse
+
+    assert isinstance(cfg, ConfigResponse)
+    assert cfg.admin_key_configured is True
+    assert cfg.github_configured is False
+    assert cfg.hot.session_ttl_days == 30
+    assert cfg.hot.allowed_origins == ["https://app.example"]
+    assert cfg.admins[0].email == "admin@example.com"
+
+
+async def test_admin_patch_config_posts_camelcase_body_and_returns_config() -> None:
+    captured: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append({"method": request.method, "body": json.loads(request.content)})
+        # Echo back a config where sessionTtlDays reflects the patch.
+        body = dict(_CONFIG_RESPONSE_BODY)
+        ttl = json.loads(request.content).get("sessionTtlDays")
+        if ttl is not None:
+            body = {**body, "hot": {**body["hot"], "sessionTtlDays": ttl}}
+        return httpx.Response(200, json=body)
+
+    from par_rt_db.http_client import HotConfigPatch
+
+    async with _admin_client(handler) as c:
+        # Model input: snake_case field → camelCase wire key, None fields omitted.
+        cfg = await c.patch_config(HotConfigPatch(session_ttl_days=60))
+        assert cfg.hot.session_ttl_days == 60
+        assert captured[0]["method"] == "PATCH"
+        assert captured[0]["body"] == {"sessionTtlDays": 60}
+        # Dict input: passed through as-is (caller provides wire camelCase keys).
+        await c.patch_config({"maxFileSize": 104857600})
+    assert captured[1]["body"] == {"maxFileSize": 104857600}
+
+
+async def test_admin_ops_recent_returns_events_and_sends_filters() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["query"] = dict(request.url.params)
+        return httpx.Response(
+            200,
+            json={
+                "ops": [
+                    {
+                        "db": "kanban",
+                        "table": "items",
+                        "docId": "i1",
+                        "kind": "insert",
+                        "ts": 1000,
+                        "owner": "user@example.com",
+                    },
+                    {
+                        "db": "kanban",
+                        "table": "items",
+                        "docId": "i2",
+                        "kind": "delete",
+                        "ts": 2000,
+                        "owner": None,
+                    },
+                ]
+            },
+        )
+
+    async with _admin_client(handler) as c:
+        ops = await c.ops_recent(db="kanban", table="items", n=50)
+    from par_rt_db.http_client import OpEvent
+
+    assert captured["query"] == {"db": "kanban", "table": "items", "n": "50"}
+    assert len(ops) == 2
+    assert isinstance(ops[0], OpEvent)
+    assert ops[0].doc_id == "i1"
+    assert ops[0].kind == "insert"
+    assert ops[0].owner == "user@example.com"
+    assert ops[1].owner is None
+
+
+# --- admin data access (owner bypass) ---------------------------------------
+
+
+async def test_admin_query_posts_to_singular_db_path_and_parses_result() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["path"] = request.url.path
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"result": [{"_id": "a"}, {"_id": "b"}]})
+
+    async with _admin_client(handler) as c:
+        got: list[dict[str, Any]] = await c.admin_query("kanban", TableQuery("items").take(2))
+    assert len(got) == 2
+    # db rides in the path (singular ``db``), NOT in the body
+    assert captured["path"] == "/admin/db/kanban/query"
+    assert "db" not in captured["body"]
+    assert "query" in captured["body"]
+
+
+async def test_admin_mutate_posts_to_singular_db_path_and_returns_step_results() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["path"] = request.url.path
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"results": [{"id": "new1"}, None]})
+
+    async with _admin_client(handler) as c:
+        txn = (
+            Mutation.builder().insert("items", {"name": "x"}).patch("items", "i1", {"y": 1}).build()
+        )
+        res = await c.admin_mutate("kanban", txn)
+    assert len(res) == 2
+    assert captured["path"] == "/admin/db/kanban/mutate"
+    # db rides in the path; idempotencyKey omitted when None
+    assert "db" not in captured["body"]
+    assert "idempotencyKey" not in captured["body"]
+    assert "txn" in captured["body"]
+
+
+async def test_admin_mutate_includes_idempotency_key_when_some() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"results": []})
+
+    async with _admin_client(handler) as c:
+        txn = Mutation.builder().delete("items", "i1").build()
+        await c.admin_mutate("kanban", txn, idempotency_key="k1")
+    assert captured["body"]["idempotencyKey"] == "k1"
+
+
+async def test_admin_migrate_schema_posts_directives_and_dry_run() -> None:
+    """``POST /admin/db/{db}/migrate`` sends ``{directives, dryRun}`` and parses
+    the ``MigrateResult`` response (``applied``, derived ``schema``, per-directive
+    ``reports``). Mirrors ``rust-client``'s ``migrate_schema_posts_directives_and_dry_run``.
+    """
+    from par_rt_db import Migration
+    from par_rt_db.http_client import MigrateResult
+
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        captured["path"] = request.url.path
+        return httpx.Response(
+            200,
+            json={
+                "applied": True,
+                "schema": {
+                    "tables": {
+                        "users": {
+                            "fields": {"fullName": {"type": "string"}},
+                            "indexes": [],
+                        }
+                    }
+                },
+                "directives": [{"op": "renameField", "affectedRows": 3}],
+            },
+        )
+
+    async with _admin_client(handler) as c:
+        directives = (
+            Migration.builder()
+            .rename_field("users", "name", "fullName")
+            .dry_run()
+            .build()
+            .directives
+        )
+        result = await c.migrate_schema("kanban", directives, dry_run=True)
+
+    assert captured["path"] == "/admin/db/kanban/migrate"
+    assert captured["body"]["dryRun"] is True
+    assert captured["body"]["directives"][0] == {
+        "op": "renameField",
+        "table": "users",
+        "from": "name",
+        "to": "fullName",
+    }
+    # MigrateResult parsed correctly.
+    assert isinstance(result, MigrateResult)
+    assert result.applied is True
+    assert "fullName" in result.schema_.tables["users"].fields
+    assert len(result.directives) == 1
+    assert result.directives[0].op == "renameField"
+    assert result.directives[0].affected_rows == 3
+
+
+async def test_admin_migrate_schema_accepts_migrate_request() -> None:
+    """``migrate_schema`` also accepts a full ``MigrateRequest``."""
+    from par_rt_db import Migration
+
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "applied": False,
+                "schema": {"tables": {}},
+                "directives": [],
+            },
+        )
+
+    async with _admin_client(handler) as c:
+        req = Migration.builder().drop_table("gone").build()
+        result = await c.migrate_schema("kanban", req)
+    assert captured["body"]["directives"][0]["op"] == "dropTable"
+    assert result.applied is False
+
+
+# --- admin control plane: backups ------------------------------------------
+
+
+async def test_admin_backup_now_posts_to_admin_backup() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["method"] = request.method
+        captured["path"] = request.url.path
+        captured["auth"] = request.headers["authorization"]
+        return httpx.Response(202, json={"ok": True})
+
+    async with _admin_client(handler) as c:
+        await c.backup_now()
+    assert captured["method"] == "POST"
+    assert captured["path"] == "/admin/backup"
+    assert captured["auth"] == ADMIN_BEARER
+
+
+async def test_admin_list_backups_returns_running_flag_and_entries() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["method"] = request.method
+        captured["path"] = request.url.path
+        return httpx.Response(
+            200,
+            json={
+                "running": False,
+                "backups": [
+                    {
+                        "name": "rtdb-20260728T143045Z.dump",
+                        "sizeBytes": 4096,
+                        "createdMs": 1753713045000,
+                    }
+                ],
+            },
+        )
+
+    async with _admin_client(handler) as c:
+        res = await c.list_backups()
+    assert captured["method"] == "GET"
+    assert captured["path"] == "/admin/backups"
+    assert res["running"] is False
+    assert len(res["backups"]) == 1
+    entry = res["backups"][0]
+    assert entry["name"] == "rtdb-20260728T143045Z.dump"
+    assert entry["sizeBytes"] == 4096
+    assert entry["createdMs"] == 1753713045000
+
+
+async def test_admin_download_backup_returns_raw_bytes() -> None:
+    captured: dict[str, Any] = {}
+    payload = b"\x1f\x8b\x08\x00binary-dump-bytes"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["method"] = request.method
+        captured["path"] = request.url.path
+        return httpx.Response(
+            200,
+            content=payload,
+            headers={"Content-Type": "application/octet-stream"},
+        )
+
+    async with _admin_client(handler) as c:
+        data = await c.download_backup("rtdb-20260728T143045Z.dump")
+    assert captured["method"] == "GET"
+    assert captured["path"] == "/admin/backups/rtdb-20260728T143045Z.dump"
+    assert isinstance(data, bytes)
+    assert data == payload
+
+
+async def test_admin_delete_backup_uses_delete_with_name_in_path() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["method"] = request.method
+        captured["path"] = request.url.path
+        return httpx.Response(204)
+
+    async with _admin_client(handler) as c:
+        await c.delete_backup("rtdb-20260728T143045Z.dump")
+    assert captured["method"] == "DELETE"
+    assert captured["path"] == "/admin/backups/rtdb-20260728T143045Z.dump"
+
+
+async def test_admin_restore_backup_posts_name_and_confirm() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["method"] = request.method
+        captured["path"] = request.url.path
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "target": "rtdb_restored_20260728T143045Z",
+                "instructions": (
+                    "Restore complete into database "
+                    "'rtdb_restored_20260728T143045Z'. To cut over: set "
+                    "RTDB_DATABASE_URL to connect to "
+                    "'rtdb_restored_20260728T143045Z', then restart the server."
+                ),
+            },
+        )
+
+    async with _admin_client(handler) as c:
+        res = await c.restore_backup("rtdb-20260728T143045Z.dump")
+    assert captured["method"] == "POST"
+    assert captured["path"] == "/admin/restore"
+    assert captured["body"] == {
+        "name": "rtdb-20260728T143045Z.dump",
+        "confirm": "rtdb-20260728T143045Z.dump",
+    }
+    assert res["target"] == "rtdb_restored_20260728T143045Z"
+    assert "rtdb_restored_20260728T143045Z" in res["instructions"]

@@ -10,22 +10,33 @@ imports without the ``[aio]`` extra installed.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
 from .errors import ErrorCode, RtDbError
+from .migration import Directive, MigrateRequest
 from .mutation import StepResult, Transaction
 from .query import Query, TableQuery, _terminal_of, parse_result
+from .schema import SchemaDef
 
 if TYPE_CHECKING:
     import httpx
 
 # Re-import the shared response models + adapters this module references.
-# Add to this block as later tasks add methods that return more models.
 from .http_client import (
     _BATCH_ADAPTER,
     _SCHEDULES_ADAPTER,
     _STEP_RESULT_ADAPTER,
+    AdminMember,
+    ConfigResponse,
+    DbStats,
     FileMetadata,
+    HotConfigPatch,
+    MetricsSnapshot,
+    MigrateResult,
+    MintedToken,
+    OpEvent,
+    TokenInfo,
     UploadResult,
 )
 from .wire import BatchQueryOutcome, ScheduleInfo, ScheduleWhen
@@ -253,6 +264,298 @@ class RtDbAsyncHttpClient:
     def get_url(self, id: str) -> str:
         """The public serve URL (``GET /storage/{id}``) — no request is made."""
         return f"{self._base}/storage/{id}"
+
+    # --- admin control plane (admin key as the token) ---
+
+    async def create_db(self, name: str) -> None:
+        """``POST /admin/create-db`` ``{name}`` → ``{ok:true}``."""
+        resp = await self._send("POST", "/admin/create-db", json={"name": name})
+        self._expect_ok(resp)
+
+    async def delete_db(self, name: str, confirm: str) -> None:
+        """``POST /admin/delete-db`` ``{name, confirm}`` → ``{ok:true}``.
+
+        The server rejects with ``BAD_REQUEST`` unless ``confirm == name``
+        exactly — the typed confirmation guard against accidental deletion.
+        """
+        resp = await self._send(
+            "POST",
+            "/admin/delete-db",
+            json={"name": name, "confirm": confirm},
+        )
+        self._expect_ok(resp)
+
+    async def push_schema(self, db: str, schema: SchemaDef) -> None:
+        """``POST /admin/push-schema`` ``{db, schema}`` → ``{ok:true}``."""
+        resp = await self._send(
+            "POST",
+            "/admin/push-schema",
+            json={"db": db, "schema": schema.model_dump(by_alias=True, mode="json")},
+        )
+        self._expect_ok(resp)
+
+    async def list_dbs(self) -> list[str]:
+        """``GET /admin/dbs`` → ``{databases:[...]}``."""
+        resp = await self._send("GET", "/admin/dbs")
+        return list(resp.json()["databases"])
+
+    async def mint_token(self, db: str, name: str) -> MintedToken:
+        """``POST /admin/mint-token`` ``{db, name}`` → ``{tokenId, token}``."""
+        resp = await self._send("POST", "/admin/mint-token", json={"db": db, "name": name})
+        return MintedToken.model_validate(resp.json())
+
+    async def revoke_token(self, token_id: str) -> None:
+        """``POST /admin/revoke-token`` ``{tokenId}`` → ``{ok:true}``."""
+        resp = await self._send("POST", "/admin/revoke-token", json={"tokenId": token_id})
+        self._expect_ok(resp)
+
+    async def export_db(self, db: str) -> str:
+        """``GET /admin/export-db?db=<db>`` → the database snapshot as JSONL text."""
+        return (await self._send("GET", "/admin/export-db", params={"db": db})).text
+
+    async def import_db(self, db: str, jsonl: str) -> None:
+        """``POST /admin/import-db?db=<db>`` with an ``application/x-ndjson`` body."""
+        resp = await self._send(
+            "POST",
+            "/admin/import-db",
+            params={"db": db},
+            content=jsonl,
+            headers={"Content-Type": "application/x-ndjson"},
+        )
+        self._expect_ok(resp)
+
+    async def allowlist_add(self, db: str, email: str) -> None:
+        """``POST /admin/allowlist`` ``{db, action:"add", email}`` → ``{ok:true}``."""
+        resp = await self._send(
+            "POST",
+            "/admin/allowlist",
+            json={"db": db, "action": "add", "email": email},
+        )
+        self._expect_ok(resp)
+
+    async def allowlist_remove(self, db: str, email: str) -> None:
+        """``POST /admin/allowlist`` ``{db, action:"remove", email}`` → ``{ok:true}``."""
+        resp = await self._send(
+            "POST",
+            "/admin/allowlist",
+            json={"db": db, "action": "remove", "email": email},
+        )
+        self._expect_ok(resp)
+
+    async def allowlist_list(self, db: str) -> list[str]:
+        """``GET /admin/allowlist?db=<db>`` → ``{emails:[...]}``."""
+        resp = await self._send("GET", "/admin/allowlist", params={"db": db})
+        return list(resp.json()["emails"])
+
+    async def admins_list(self) -> list[AdminMember]:
+        """``GET /admin/admins`` → ``{admins:[{email, githubId?}]}``."""
+        resp = await self._send("GET", "/admin/admins")
+        return [AdminMember.model_validate(m) for m in resp.json()["admins"]]
+
+    async def admins_add(self, email: str, github_id: int | None = None) -> None:
+        """``POST /admin/admins`` ``{email, githubId?}`` → ``{ok:true}``.
+
+        ``githubId`` is omitted from the body when ``None`` (matches the
+        server's ``skip_serializing_if`` rule).
+        """
+        body: dict[str, Any] = {"email": email}
+        if github_id is not None:
+            body["githubId"] = github_id
+        resp = await self._send("POST", "/admin/admins", json=body)
+        self._expect_ok(resp)
+
+    async def admins_remove(self, email: str) -> None:
+        """``DELETE /admin/admins`` ``{email}`` → ``{ok:true}``.
+
+        Body-on-DELETE (axum reads it from the request body, not the URL) —
+        mirrors the rust-client's ``delete_json``.
+        """
+        resp = await self._send("DELETE", "/admin/admins", json={"email": email})
+        self._expect_ok(resp)
+
+    async def list_tokens(self, db: str) -> list[TokenInfo]:
+        """``GET /admin/tokens?db=<db>`` → ``{tokens:[{id,name,createdAt,revoked}]}``."""
+        resp = await self._send("GET", "/admin/tokens", params={"db": db})
+        return [TokenInfo.model_validate(t) for t in resp.json()["tokens"]]
+
+    async def get_schema(self, db: str) -> SchemaDef:
+        """``GET /admin/dbs/{db}/schema`` → the database's pushed ``SchemaDef``."""
+        resp = await self._send("GET", f"/admin/dbs/{db}/schema")
+        return SchemaDef.model_validate(resp.json())
+
+    async def db_stats(self, db: str) -> DbStats:
+        """``GET /admin/dbs/{db}/stats`` → per-table row counts + storage sizes."""
+        resp = await self._send("GET", f"/admin/dbs/{db}/stats")
+        return DbStats.model_validate(resp.json())
+
+    async def metrics(self) -> MetricsSnapshot:
+        """``GET /admin/metrics`` → server-wide counters and gauges."""
+        resp = await self._send("GET", "/admin/metrics")
+        return MetricsSnapshot.model_validate(resp.json())
+
+    async def get_config(self) -> ConfigResponse:
+        """``GET /admin/config`` → redacted running config + build identity + admins."""
+        resp = await self._send("GET", "/admin/config")
+        return ConfigResponse.model_validate(resp.json())
+
+    async def patch_config(self, patch: HotConfigPatch | Mapping[str, Any]) -> ConfigResponse:
+        """``PATCH /admin/config`` with a partial hot-config body → updated config.
+
+        Each present field fully replaces the prior value; the server validates
+        (``sessionTtlDays>=1``, ``maxFileSize`` within bounds, origin shape).
+        Accepts a ``HotConfigPatch`` model or a plain ``Mapping`` of wire camelCase
+        keys (e.g. ``{"sessionTtlDays": 60}``); ``None``-valued model fields are
+        omitted from the body (matches rust-client's ``skip_serializing_if``).
+        """
+        if isinstance(patch, Mapping):
+            body: dict[str, Any] = dict(patch)
+        else:
+            body = patch.model_dump(by_alias=True, mode="json", exclude_none=True)
+        resp = await self._send("PATCH", "/admin/config", json=body)
+        return ConfigResponse.model_validate(resp.json())
+
+    async def ops_recent(
+        self,
+        *,
+        db: str | None = None,
+        table: str | None = None,
+        n: int | None = None,
+    ) -> list[OpEvent]:
+        """``GET /admin/ops/recent`` → recent document-op events, newest-first.
+
+        All filter opts are optional; omitted filters are not sent. ``n`` caps
+        the result count (server-side max 500).
+        """
+        params: dict[str, Any] = {}
+        if db is not None:
+            params["db"] = db
+        if table is not None:
+            params["table"] = table
+        if n is not None:
+            params["n"] = n
+        resp = await self._send("GET", "/admin/ops/recent", params=params)
+        return [OpEvent.model_validate(e) for e in resp.json()["ops"]]
+
+    # --- admin data access: owner-bypass query/mutate (admin key) ---
+
+    async def admin_query(self, db: str, query: Query | TableQuery, *, model: type = dict) -> Any:
+        """``POST /admin/db/{db}/query`` ``{query}`` → parsed ``{result}``.
+
+        Owner-bypass: an admin reads documents across every database regardless
+        of ``ownerField``. ``db`` rides in the URL (singular ``db``), so the body
+        omits it. Result parsing mirrors ``run``.
+        """
+        built = query.build() if isinstance(query, TableQuery) else query
+        body = {"query": built.model_dump(by_alias=True, mode="json")}
+        resp = await self._send("POST", f"/admin/db/{db}/query", json=body)
+        result = resp.json()["result"]
+        return parse_result(model, _terminal_of(built), result)
+
+    async def admin_mutate(
+        self,
+        db: str,
+        txn: Transaction,
+        *,
+        idempotency_key: str | None = None,
+    ) -> list[StepResult]:
+        """``POST /admin/db/{db}/mutate`` ``{txn, idempotencyKey?}`` → ``{results}``.
+
+        Owner-bypass: an admin writes documents across every database. ``db``
+        rides in the URL, so the body omits it. ``idempotencyKey`` is omitted
+        when ``None``.
+        """
+        body: dict[str, Any] = {"txn": txn.model_dump(by_alias=True, mode="json")}
+        if idempotency_key is not None:
+            body["idempotencyKey"] = idempotency_key
+        resp = await self._send("POST", f"/admin/db/{db}/mutate", json=body)
+        results = resp.json()["results"]
+        return [_STEP_RESULT_ADAPTER.validate_python(r) for r in results]
+
+    async def migrate_schema(
+        self,
+        db: str,
+        directives: list[Directive] | MigrateRequest,
+        *,
+        dry_run: bool = False,
+    ) -> MigrateResult:
+        """``POST /admin/db/{db}/migrate`` ``{directives, dryRun}`` → ``MigrateResult``.
+
+        Apply (when ``dry_run`` is ``False``) or preview (when ``True``) a
+        declarative schema migration. The server validates and folds the
+        directives transactionally; on ``dry_run`` nothing is committed and the
+        returned ``schema`` is the derived preview (``applied: False``).
+
+        Accepts a list of ``Directive`` model instances (from the ``Migration``
+        builder's directives or hand-built) or a full :class:`MigrateRequest`.
+        When passing a ``MigrateRequest``, the request's own ``dry_run`` flag is
+        overridden by the ``dry_run`` keyword argument (mirrors the rust-client's
+        signature: directives + a separate ``dry_run`` bool).
+        """
+        if isinstance(directives, MigrateRequest):
+            wire_directives = directives.directives
+        else:
+            wire_directives = directives
+        body = {
+            "directives": [d.model_dump(by_alias=True, mode="json") for d in wire_directives],
+            "dryRun": dry_run,
+        }
+        resp = await self._send("POST", f"/admin/db/{db}/migrate", json=body)
+        return MigrateResult.model_validate(resp.json())
+
+    # --- admin control plane: managed backups (admin key) ---
+
+    async def backup_now(self) -> None:
+        """``POST /admin/backup`` → 202; one ``pg_dump`` runs in the background.
+
+        Idempotent trigger guard: a second call while one is running → 409
+        ``CONFLICT``. The dump runs outside the committer (``pg_dump`` is a
+        read), so no document tables or subscriptions are touched.
+        """
+        resp = await self._send("POST", "/admin/backup", json={})
+        self._expect_ok(resp)
+
+    async def list_backups(self) -> dict[str, Any]:
+        """``GET /admin/backups`` → ``{running: bool, backups: [{name, sizeBytes, createdMs}]}``.
+
+        Newest-first. A missing backup dir returns an empty list rather than
+        erroring — the endpoint describes what is on disk. ``running`` is the
+        in-progress flag for the manual ``POST /admin/backup`` trigger.
+        """
+        resp = await self._send("GET", "/admin/backups")
+        return dict(resp.json())
+
+    async def download_backup(self, name: str) -> bytes:
+        """``GET /admin/backups/{name}`` → the dump file's raw bytes.
+
+        The response body is ``application/octet-stream``; do not JSON-decode.
+        The server validates ``name`` (``rtdb-<stamp>.dump`` shape) before any
+        filesystem access, so a traversal-shaped name is rejected at the edge.
+        """
+        resp = await self._send("GET", f"/admin/backups/{name}")
+        return resp.content
+
+    async def delete_backup(self, name: str) -> None:
+        """``DELETE /admin/backups/{name}`` → 204; removes one dump file.
+
+        Same ``validate_dump_name`` short-circuit as download; 404 if the file
+        is already gone.
+        """
+        await self._send("DELETE", f"/admin/backups/{name}")
+
+    async def restore_backup(self, name: str) -> dict[str, Any]:
+        """``POST /admin/restore`` ``{name, confirm}`` → ``{target, instructions}``.
+
+        ``confirm`` is sent equal to ``name`` (typed guard, mirroring
+        ``delete_db``). The live DB is never touched: restore creates a fresh
+        ``rtdb_restored_<stamp>`` DB and ``pg_restore``s into it. The response
+        carries the target DB name and cutover instructions.
+        """
+        resp = await self._send(
+            "POST",
+            "/admin/restore",
+            json={"name": name, "confirm": name},
+        )
+        return dict(resp.json())
 
     # --- request plumbing ---
 
