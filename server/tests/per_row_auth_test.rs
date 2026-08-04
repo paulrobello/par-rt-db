@@ -4181,3 +4181,165 @@ async fn expect_version_authorize_hides_invisible_doc() -> anyhow::Result<()> {
     assert_eq!(err.code, ErrorCode::PreconditionFailed);
     Ok(())
 }
+
+// ============================================================================
+// Task 2: `ExpectAbsent` existence side-channel closure.
+//
+// `ExpectAbsent { table, index, eq }` is a read-only precondition that was not
+// visibility-checked, so a user could learn whether another user's doc exists
+// by probing its indexed key. The fix filters the `eq_lookup` matched rows
+// through `doc_visible_to`: only a *visible* match fails the precondition. A
+// matched doc the caller cannot see is "absent" from their view, so probing
+// another user's key succeeds (Ok) instead of leaking existence via
+// `PreconditionFailed`. Bypass callers and own-row probes are unchanged.
+// ============================================================================
+
+// ExpectAbsent must not leak another user's doc existence: a match on an
+// unowned doc is invisible to the caller, so the precondition succeeds (Ok).
+#[tokio::test]
+async fn expect_absent_does_not_leak_unowned_doc() -> anyhow::Result<()> {
+    let (pool, db, schema) = setup().await;
+    seed_note(&pool, &db, &schema, "bob's note", "bob").await;
+    let alice = PrincipalCtx {
+        user_id: Some("alice".into()),
+        email: None,
+    };
+
+    // bob owns the userId="bob" row; alice probing that key sees "absent" -> Ok.
+    execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::ExpectAbsent {
+                table: "notes".into(),
+                index: "by_user".into(),
+                eq: vec![json!("bob")],
+            }],
+        },
+        &alice,
+    )
+    .await
+    .expect("alice sees bob's key as absent");
+
+    // an unused key is also absent -> Ok (control: same outcome, no leak).
+    execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::ExpectAbsent {
+                table: "notes".into(),
+                index: "by_user".into(),
+                eq: vec![json!("nobody")],
+            }],
+        },
+        &alice,
+    )
+    .await
+    .expect("unused key is absent");
+    Ok(())
+}
+
+// Own-doc ExpectAbsent is unchanged: a match on the caller's own row fails.
+#[tokio::test]
+async fn expect_absent_own_doc_behaves_as_before() -> anyhow::Result<()> {
+    let (pool, db, schema) = setup().await;
+    seed_note(&pool, &db, &schema, "alice's note", "alice").await;
+    let alice = PrincipalCtx {
+        user_id: Some("alice".into()),
+        email: None,
+    };
+
+    let err = execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::ExpectAbsent {
+                table: "notes".into(),
+                index: "by_user".into(),
+                eq: vec![json!("alice")],
+            }],
+        },
+        &alice,
+    )
+    .await
+    .expect_err("own row must be present");
+    assert_eq!(err.code, ErrorCode::PreconditionFailed);
+    Ok(())
+}
+
+// Bypass caller sees every match: ExpectAbsent fails on bob's row.
+#[tokio::test]
+async fn expect_absent_bypass_is_unaffected() -> anyhow::Result<()> {
+    let (pool, db, schema) = setup().await;
+    seed_note(&pool, &db, &schema, "bob's note", "bob").await;
+
+    let err = execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::ExpectAbsent {
+                table: "notes".into(),
+                index: "by_user".into(),
+                eq: vec![json!("bob")],
+            }],
+        },
+        &PrincipalCtx::bypass(),
+    )
+    .await
+    .expect_err("bypass sees bob's row as present");
+    assert_eq!(err.code, ErrorCode::PreconditionFailed);
+    Ok(())
+}
+
+// collaboratorsField: a non-member sees the owner's key as absent (Ok); a
+// declared collaborator sees it as present (PreconditionFailed).
+#[tokio::test]
+async fn expect_absent_collaborators_visibility() -> anyhow::Result<()> {
+    let (pool, db, schema) = setup_collab().await;
+    // bob owns; alice is a collaborator; carol is neither.
+    seed_collab_note(&pool, &db, &schema, "shared", "bob", &["alice"]).await;
+
+    execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::ExpectAbsent {
+                table: "notes".into(),
+                index: "by_user".into(),
+                eq: vec![json!("bob")],
+            }],
+        },
+        &PrincipalCtx {
+            user_id: Some("carol".into()),
+            email: None,
+        },
+    )
+    .await
+    .expect("non-collaborator sees the key as absent");
+
+    let err = execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::ExpectAbsent {
+                table: "notes".into(),
+                index: "by_user".into(),
+                eq: vec![json!("bob")],
+            }],
+        },
+        &PrincipalCtx {
+            user_id: Some("alice".into()),
+            email: None,
+        },
+    )
+    .await
+    .expect_err("collaborator sees the row as present");
+    assert_eq!(err.code, ErrorCode::PreconditionFailed);
+    Ok(())
+}

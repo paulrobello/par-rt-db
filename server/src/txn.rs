@@ -1281,7 +1281,13 @@ pub async fn execute_txn(
             Step::ExpectAbsent { table, index, eq } => {
                 let table_def = schema.table(table)?;
                 let rows = eq_lookup(&mut tx, &pg_schema_name, table_def, table, index, eq).await?;
-                if !rows.is_empty() {
+                // Side-channel closure: only a matched doc the caller can see
+                // counts as "present". A matched-but-invisible doc is "absent"
+                // from the caller's view, so it does not fail the precondition.
+                let present = rows
+                    .iter()
+                    .any(|(_id, doc, _created_at)| doc_visible_to(doc, table_def, ctx));
+                if present {
                     return Err(RtDbError::precondition(format!(
                         "index '{index}' already has a matching document"
                     )));
