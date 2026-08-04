@@ -364,7 +364,7 @@ async fn list_tokens_omits_secret() -> anyhow::Result<()> {
     // And the DB's stored hash is not equal to any field value in the response.
     let (stored_hash,): (String,) =
         sqlx::query_as("SELECT token_hash FROM rtdb_auth.machine_tokens WHERE db_name = $1")
-            .bind(&db)
+            .bind(db.as_str())
             .fetch_one(&pool)
             .await?;
     assert!(
@@ -1151,6 +1151,7 @@ async fn admin_query_bypasses_per_row_owner() -> anyhow::Result<()> {
     let pool = state.pool.clone();
     let db = format!("t{}", uuid::Uuid::now_v7().simple());
     rtdb_server::db::create_database(&pool, &db).await?;
+    let db = common::wrap_test_db(db);
     let schema =
         rtdb_server::ddl::push_schema(&pool, &db, serde_json::from_value(owner_schema_json())?)
             .await?;
@@ -1189,6 +1190,7 @@ async fn admin_mutate_writes_and_cap_rejects() -> anyhow::Result<()> {
     let pool = state.pool.clone();
     let db = format!("t{}", uuid::Uuid::now_v7().simple());
     rtdb_server::db::create_database(&pool, &db).await?;
+    let db = common::wrap_test_db(db);
     rtdb_server::ddl::push_schema(&pool, &db, serde_json::from_value(items_schema_json())?).await?;
     let bearer = "Bearer test-admin-key";
 

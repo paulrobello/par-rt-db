@@ -37,12 +37,12 @@ async fn test_pool() -> PgPool {
 
 /// Mirrors `common::fresh_db()`'s naming + creation path, minus the schema
 /// push (these tests never query user tables, so no schema is needed).
-async fn unique_db(pool: &PgPool) -> String {
+async fn unique_db(pool: &PgPool) -> common::TestDb {
     let name = format!("t{}", uuid::Uuid::now_v7().simple());
     rtdb_server::db::create_database(pool, &name)
         .await
         .expect("create fresh database");
-    name
+    common::wrap_test_db(name)
 }
 
 fn empty_txn() -> Transaction {

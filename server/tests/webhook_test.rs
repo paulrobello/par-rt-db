@@ -150,7 +150,7 @@ async fn webhook_enqueue_matches_table_and_event_filters() -> anyhow::Result<()>
 
     // Payload shape for the matching webhook: camelCase OpEvent + source.
     let payload = newest_payload(&pool, a).await;
-    assert_eq!(payload["db"], name);
+    assert_eq!(payload["db"], name.as_str());
     assert_eq!(payload["table"], "projects");
     assert_eq!(payload["kind"], "insert");
     assert_eq!(payload["source"], "mutate");
@@ -243,7 +243,7 @@ async fn webhook_delivery_end_to_end_posts_payload() -> anyhow::Result<()> {
     let got = received.lock().await.clone();
     assert_eq!(got.len(), 1, "receiver got exactly one POST");
     let body = &got[0];
-    assert_eq!(body["db"], name);
+    assert_eq!(body["db"], name.as_str());
     assert_eq!(body["table"], "projects");
     assert_eq!(body["kind"], "insert");
     assert_eq!(body["docId"], doc_id);

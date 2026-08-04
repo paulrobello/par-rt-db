@@ -111,7 +111,10 @@ async fn resolve_db_maps_id_to_owner() -> anyhow::Result<()> {
     let state = test_state().await;
     let db = fresh_db(&state).await;
     let id = storage::put(&state.pool, &db, "deadbeef", 1, None, b"x").await?;
-    assert_eq!(storage::resolve_db(&state.pool, &id).await?, Some(db));
+    assert_eq!(
+        storage::resolve_db(&state.pool, &id).await?,
+        Some(db.to_string())
+    );
     Ok(())
 }
 

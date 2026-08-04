@@ -37,7 +37,9 @@ fn valid_widget_doc() -> serde_json::Map<String, serde_json::Value> {
     }))
 }
 
-async fn fresh_widgets_db(state: &std::sync::Arc<rtdb_server::AppState>) -> (String, SchemaDef) {
+async fn fresh_widgets_db(
+    state: &std::sync::Arc<rtdb_server::AppState>,
+) -> (common::TestDb, SchemaDef) {
     let name = format!("t{}", uuid::Uuid::now_v7().simple());
     db::create_database(&state.pool, &name)
         .await
@@ -47,7 +49,7 @@ async fn fresh_widgets_db(state: &std::sync::Arc<rtdb_server::AppState>) -> (Str
     let applied = ddl::push_schema(&state.pool, &name, schema)
         .await
         .expect("push widgets schema");
-    (name, applied)
+    (common::wrap_test_db(name), applied)
 }
 
 // (a) DDL generation: none of the four new types get an indexed/typed column.
@@ -79,6 +81,7 @@ async fn push_schema_accepts_index_over_int64_field() -> anyhow::Result<()> {
     let state = test_state().await;
     let name = format!("t{}", uuid::Uuid::now_v7().simple());
     db::create_database(&state.pool, &name).await?;
+    let name = common::wrap_test_db(name);
 
     let mut json = widgets_schema_json();
     json["tables"]["widgets"]["indexes"] =
@@ -286,6 +289,7 @@ async fn unique_index_is_created_as_unique_on_postgres() -> anyhow::Result<()> {
     let state = test_state().await;
     let name = format!("t{}", uuid::Uuid::now_v7().simple());
     db::create_database(&state.pool, &name).await?;
+    let name = common::wrap_test_db(name);
 
     let schema: SchemaDef = serde_json::from_value(serde_json::json!({
         "tables": {
@@ -320,6 +324,7 @@ async fn partial_unique_index_emits_where_clause() -> anyhow::Result<()> {
     let state = test_state().await;
     let name = format!("t{}", uuid::Uuid::now_v7().simple());
     db::create_database(&state.pool, &name).await?;
+    let name = common::wrap_test_db(name);
 
     // `deleted` is declared indexed so the predicate uses the typed `f_deleted`
     // boolean column (cleaner + matches how a real partial unique index is
@@ -369,6 +374,7 @@ async fn unique_index_dup_pre_check_returns_conflict() -> anyhow::Result<()> {
     let state = test_state().await;
     let name = format!("t{}", uuid::Uuid::now_v7().simple());
     db::create_database(&state.pool, &name).await?;
+    let name = common::wrap_test_db(name);
 
     // First push: table with the email field but no indexes yet.
     let base: SchemaDef = serde_json::from_value(serde_json::json!({

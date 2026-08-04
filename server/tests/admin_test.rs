@@ -986,7 +986,7 @@ async fn admin_storage_upload_list_delete_round_trip() -> anyhow::Result<()> {
     // The global index resolves the opaque id back to this db.
     assert_eq!(
         rtdb_server::storage::resolve_db(&pool, &id).await?,
-        Some(name.clone()),
+        Some(name.to_string()),
         "storage_index row should point at the owning db"
     );
 

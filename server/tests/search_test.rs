@@ -29,7 +29,7 @@ fn search_schema() -> SchemaDef {
     serde_json::from_value(search_schema_json()).expect("parse search schema")
 }
 
-async fn fresh_search_db(state: &Arc<AppState>) -> (String, SchemaDef) {
+async fn fresh_search_db(state: &Arc<AppState>) -> (common::TestDb, SchemaDef) {
     let name = format!("t{}", uuid::Uuid::now_v7().simple());
     db::create_database(&state.pool, &name)
         .await
@@ -38,7 +38,7 @@ async fn fresh_search_db(state: &Arc<AppState>) -> (String, SchemaDef) {
     ddl::push_schema(&state.pool, &name, schema.clone())
         .await
         .expect("push schema");
-    (name, schema)
+    (common::wrap_test_db(name), schema)
 }
 
 fn doc(value: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
@@ -258,6 +258,7 @@ async fn adding_search_index_backfills_existing_rows() {
     db::create_database(&state.pool, &db)
         .await
         .expect("create db");
+    let db = common::wrap_test_db(db);
 
     let v1: SchemaDef = serde_json::from_value(serde_json::json!({"tables":{"notes":{
         "fields":{"title":{"type":"string"},"body":{"type":"string"}},

@@ -3937,7 +3937,7 @@ fn int64_schema() -> SchemaDef {
     .expect("parse int64 schema")
 }
 
-async fn fresh_int64_db(state: &Arc<AppState>) -> String {
+async fn fresh_int64_db(state: &Arc<AppState>) -> common::TestDb {
     let name = format!("t{}", uuid::Uuid::now_v7().simple());
     db::create_database(&state.pool, &name)
         .await
@@ -3945,7 +3945,7 @@ async fn fresh_int64_db(state: &Arc<AppState>) -> String {
     ddl::push_schema(&state.pool, &name, int64_schema())
         .await
         .expect("push int64 schema");
-    name
+    common::wrap_test_db(name)
 }
 
 async fn insert_event(

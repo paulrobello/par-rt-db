@@ -26,7 +26,7 @@ use rtdb_server::txn::{OpKind, Step, Transaction, execute_txn};
 /// builds one via `setup_db_with_schema` and drops it at the end.
 struct Db {
     state: Arc<AppState>,
-    name: String,
+    name: common::TestDb,
     schema: SchemaDef,
 }
 
@@ -47,6 +47,7 @@ async fn setup_db_with_schema_in(state: Arc<AppState>, schema_json: &str) -> Db 
     push_schema(&state.pool, &name, schema.clone())
         .await
         .expect("push schema");
+    let name = common::wrap_test_db(name);
     Db {
         state,
         name,
@@ -916,7 +917,7 @@ async fn migrate_publishes_to_op_feed() {
         .state
         .realtime
         .op_feed
-        .recent(Some(&db.name), Some("u"), 16)
+        .recent(Some(db.name.as_str()), Some("u"), 16)
         .await;
     assert!(
         events.iter().any(|e| e.kind == OpKind::Patch),
@@ -951,13 +952,13 @@ async fn migrate_writes_audit_row_when_enabled() {
         "SELECT db, tbl, principal, source \
          FROM rtdb.audit_log WHERE db = $1 ORDER BY id ASC",
     )
-    .bind(&db.name)
+    .bind(db.name.as_str())
     .fetch_all(&db.state.pool)
     .await
     .expect("fetch audit rows");
 
     assert_eq!(rows.len(), 1, "one audit row per migrated doc: {rows:?}");
-    assert_eq!(rows[0].0, db.name, "db");
+    assert_eq!(rows[0].0, db.name.as_str(), "db");
     assert_eq!(rows[0].1, "u", "tbl");
     assert!(
         rows[0].2.is_none(),
@@ -1025,7 +1026,7 @@ async fn migrate_dry_run_fires_no_tap_sites() {
         .state
         .realtime
         .op_feed
-        .recent(Some(&db.name), Some("u"), 16)
+        .recent(Some(db.name.as_str()), Some("u"), 16)
         .await;
     assert!(
         feed.is_empty(),
@@ -1034,7 +1035,7 @@ async fn migrate_dry_run_fires_no_tap_sites() {
 
     // Audit log (enabled here) carries no migrate row.
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM rtdb.audit_log WHERE db = $1")
-        .bind(&db.name)
+        .bind(db.name.as_str())
         .fetch_one(&db.state.pool)
         .await
         .expect("count audit rows");

@@ -51,7 +51,7 @@ fn matrix_schema() -> SchemaDef {
     serde_json::from_value(matrix_schema_json()).expect("parse matrix schema")
 }
 
-async fn matrix_db(state: &Arc<AppState>) -> (String, SchemaDef) {
+async fn matrix_db(state: &Arc<AppState>) -> (common::TestDb, SchemaDef) {
     let name = format!("t{}", uuid::Uuid::now_v7().simple());
     rtdb_server::db::create_database(&state.pool, &name)
         .await
@@ -60,7 +60,7 @@ async fn matrix_db(state: &Arc<AppState>) -> (String, SchemaDef) {
     push_schema(&state.pool, &name, schema.clone())
         .await
         .expect("push matrix-test schema");
-    (name, schema)
+    (common::wrap_test_db(name), schema)
 }
 
 const ID: &str = "0123456789abcdef0123456789abcdef";

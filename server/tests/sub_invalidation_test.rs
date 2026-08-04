@@ -612,7 +612,7 @@ fn owner_schema_json() -> serde_json::Value {
     }})
 }
 
-async fn fresh_owner_db(state: &std::sync::Arc<rtdb_server::AppState>) -> String {
+async fn fresh_owner_db(state: &std::sync::Arc<rtdb_server::AppState>) -> common::TestDb {
     let name = format!("t{}", uuid::Uuid::now_v7().simple());
     rtdb_server::db::create_database(&state.pool, &name)
         .await
@@ -622,7 +622,7 @@ async fn fresh_owner_db(state: &std::sync::Arc<rtdb_server::AppState>) -> String
     ddl::push_schema(&state.pool, &name, schema)
         .await
         .expect("push owner schema");
-    name
+    common::wrap_test_db(name)
 }
 
 fn note(category: &str, body: &str) -> serde_json::Map<String, serde_json::Value> {
@@ -904,7 +904,7 @@ fn int64_events_schema_json() -> serde_json::Value {
 /// Creates a fresh DB and pushes the int64-events schema (mirrors
 /// `fresh_db`'s shape but with our custom schema, since `fresh_db` is
 /// hardcoded to push the kanban schema).
-async fn fresh_int64_db(state: &std::sync::Arc<rtdb_server::AppState>) -> String {
+async fn fresh_int64_db(state: &std::sync::Arc<rtdb_server::AppState>) -> common::TestDb {
     let name = format!("t{}", uuid::Uuid::now_v7().simple());
     rtdb_server::db::create_database(&state.pool, &name)
         .await
@@ -914,7 +914,7 @@ async fn fresh_int64_db(state: &std::sync::Arc<rtdb_server::AppState>) -> String
     ddl::push_schema(&state.pool, &name, schema)
         .await
         .expect("push int64 schema");
-    name
+    common::wrap_test_db(name)
 }
 
 fn insert_event(ts: &str, kind: &str) -> Transaction {

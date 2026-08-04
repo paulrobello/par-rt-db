@@ -44,12 +44,12 @@ fn priority_schema(variants: &[&str]) -> SchemaDef {
     SchemaDef { tables }
 }
 
-async fn fresh_empty_db(state: &std::sync::Arc<rtdb_server::AppState>) -> String {
+async fn fresh_empty_db(state: &std::sync::Arc<rtdb_server::AppState>) -> common::TestDb {
     let name = format!("t{}", uuid::Uuid::now_v7().simple());
     rtdb_server::db::create_database(&state.pool, &name)
         .await
         .expect("create database");
-    name
+    common::wrap_test_db(name)
 }
 
 #[tokio::test]

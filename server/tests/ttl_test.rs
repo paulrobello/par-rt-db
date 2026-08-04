@@ -59,7 +59,7 @@ fn sessions_minimal_schema() -> SchemaDef {
 
 /// Creates a uniquely-named database and pushes the TTL fixture schema.
 /// Returns the db name.
-async fn setup_ttl_db(pool: &sqlx::PgPool) -> String {
+async fn setup_ttl_db(pool: &sqlx::PgPool) -> common::TestDb {
     let name = format!("t{}", uuid::Uuid::now_v7().simple());
     db::create_database(pool, &name)
         .await
@@ -67,7 +67,7 @@ async fn setup_ttl_db(pool: &sqlx::PgPool) -> String {
     ddl::push_schema(pool, &name, sessions_schema())
         .await
         .expect("push sessions schema");
-    name
+    common::wrap_test_db(name)
 }
 
 /// Point-read by id. Mirrors the `Query { get: Some(..), .. }` shape used
@@ -225,6 +225,7 @@ async fn adding_ttl_backfills_existing_rows() {
     db::create_database(&pool, &db)
         .await
         .expect("create fresh database");
+    let db = common::wrap_test_db(db);
 
     // v1: minimal sessions table. Insert row A — it has no `expiresAt` field.
     let schema_v1 = sessions_minimal_schema();
@@ -500,6 +501,7 @@ async fn reaper_delete_publishes_to_audit_and_webhooks() -> anyhow::Result<()> {
     let addr = spawn_app(state.clone()).await;
     let db = format!("t{}", uuid::Uuid::now_v7().simple());
     db::create_database(&pool, &db).await?;
+    let db = common::wrap_test_db(db);
 
     // Push the sessions ttl schema via the admin route (same wire shape the
     // dashboard uses), then register a webhook matching sessions/delete.
@@ -550,7 +552,7 @@ async fn reaper_delete_publishes_to_audit_and_webhooks() -> anyhow::Result<()> {
         let count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM rtdb.audit_log WHERE db = $1 AND source = 'ttl'",
         )
-        .bind(&db)
+        .bind(db.as_str())
         .fetch_one(&pool)
         .await?;
         if count > 0 {
@@ -568,7 +570,7 @@ async fn reaper_delete_publishes_to_audit_and_webhooks() -> anyhow::Result<()> {
         "SELECT tbl, principal, source FROM rtdb.audit_log \
          WHERE db = $1 AND source = 'ttl' ORDER BY id ASC",
     )
-    .bind(&db)
+    .bind(db.as_str())
     .fetch_all(&pool)
     .await?;
     assert_eq!(rows.len(), 1, "one ttl audit row: {rows:?}");
@@ -581,7 +583,7 @@ async fn reaper_delete_publishes_to_audit_and_webhooks() -> anyhow::Result<()> {
     let deleted: Option<(String,)> = sqlx::query_as(
         "SELECT op FROM rtdb.audit_log WHERE db = $1 AND source = 'ttl' AND op = 'delete'",
     )
-    .bind(&db)
+    .bind(db.as_str())
     .fetch_optional(&pool)
     .await?;
     assert!(deleted.is_some(), "audit row op=delete source=ttl");
@@ -637,6 +639,7 @@ async fn reaper_bypasses_per_row_owner_auth() {
     let pool = state.pool.clone();
     let db = format!("t{}", uuid::Uuid::now_v7().simple());
     db::create_database(&pool, &db).await.expect("create db");
+    let db = common::wrap_test_db(db);
     // notes table with ownerField=userId AND ttl on expiresAt. The ttl field
     // must carry its own single-field btree index (schema-validator requirement).
     let schema: SchemaDef = serde_json::from_value(serde_json::json!({
@@ -729,6 +732,7 @@ async fn reaper_ignores_tables_without_ttl() {
     let pool = state.pool.clone();
     let db = format!("t{}", uuid::Uuid::now_v7().simple());
     db::create_database(&pool, &db).await.expect("create db");
+    let db = common::wrap_test_db(db);
     // `with_ttl` declares ttl; `plain` has the same expiresAt field shape but
     // NO ttl block — the reaper must never touch it.
     let schema: SchemaDef = serde_json::from_value(serde_json::json!({

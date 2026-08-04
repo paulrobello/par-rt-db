@@ -82,6 +82,7 @@ async fn push_schema_creates_vector_column_and_hnsw_index() {
     rtdb_server::db::create_database(&state.pool, &db)
         .await
         .expect("create database");
+    let db = common::wrap_test_db(db);
     push_schema(&state.pool, &db, vector_schema(3, true))
         .await
         .expect("push vector schema");
@@ -157,6 +158,7 @@ async fn changing_vector_dims_is_rejected() {
     rtdb_server::db::create_database(&state.pool, &db)
         .await
         .expect("create database");
+    let db = common::wrap_test_db(db);
     push_schema(&state.pool, &db, vector_schema(3, false))
         .await
         .expect("push initial vector schema");
@@ -188,7 +190,7 @@ fn vec_doc(emb: Vec<f64>) -> serde_json::Map<String, serde_json::Value> {
         .clone()
 }
 
-async fn vec_db(state: &std::sync::Arc<rtdb_server::AppState>) -> String {
+async fn vec_db(state: &std::sync::Arc<rtdb_server::AppState>) -> common::TestDb {
     let name = format!("t{}", uuid::Uuid::now_v7().simple());
     rtdb_server::db::create_database(&state.pool, &name)
         .await
@@ -196,7 +198,7 @@ async fn vec_db(state: &std::sync::Arc<rtdb_server::AppState>) -> String {
     push_schema(&state.pool, &name, vector_schema(3, false))
         .await
         .expect("push vector schema");
-    name
+    common::wrap_test_db(name)
 }
 
 /// Task 5: an insert must maintain the `v_<index>` column — writing the doc's
@@ -492,6 +494,7 @@ async fn vector_search_applies_eq_filter() {
     rtdb_server::db::create_database(&state.pool, &db)
         .await
         .expect("create database");
+    let db = common::wrap_test_db(db);
     push_schema(&state.pool, &db, vector_schema(3, true))
         .await
         .expect("push vector schema with filterField");
@@ -611,7 +614,7 @@ fn hybrid_schema() -> SchemaDef {
     serde_json::from_value(hybrid_schema_json()).expect("parse hybrid schema")
 }
 
-async fn hybrid_db(state: &std::sync::Arc<rtdb_server::AppState>) -> (String, SchemaDef) {
+async fn hybrid_db(state: &std::sync::Arc<rtdb_server::AppState>) -> (common::TestDb, SchemaDef) {
     let name = format!("t{}", uuid::Uuid::now_v7().simple());
     rtdb_server::db::create_database(&state.pool, &name)
         .await
@@ -620,7 +623,7 @@ async fn hybrid_db(state: &std::sync::Arc<rtdb_server::AppState>) -> (String, Sc
     push_schema(&state.pool, &name, schema.clone())
         .await
         .expect("push hybrid schema");
-    (name, schema)
+    (common::wrap_test_db(name), schema)
 }
 
 fn hybrid_doc(
@@ -816,6 +819,7 @@ async fn hybrid_search_requires_a_vector_index() {
     rtdb_server::db::create_database(&state.pool, &name)
         .await
         .expect("create db");
+    let name = common::wrap_test_db(name);
     push_schema(&state.pool, &name, schema.clone())
         .await
         .expect("push schema");

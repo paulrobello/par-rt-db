@@ -1067,7 +1067,7 @@ fn int64_schema() -> SchemaDef {
     .expect("parse int64 schema")
 }
 
-async fn fresh_int64_db(state: &Arc<AppState>) -> String {
+async fn fresh_int64_db(state: &Arc<AppState>) -> common::TestDb {
     let name = format!("t{}", uuid::Uuid::now_v7().simple());
     db::create_database(&state.pool, &name)
         .await
@@ -1075,7 +1075,7 @@ async fn fresh_int64_db(state: &Arc<AppState>) -> String {
     ddl::push_schema(&state.pool, &name, int64_schema())
         .await
         .expect("push int64 schema");
-    name
+    common::wrap_test_db(name)
 }
 
 // patch must recompute the bigint column: insert ts:"5" (outside the gte 20
@@ -1309,7 +1309,7 @@ fn unique_email_schema() -> SchemaDef {
     .expect("parse unique_email schema")
 }
 
-async fn fresh_unique_email_db(state: &Arc<AppState>) -> String {
+async fn fresh_unique_email_db(state: &Arc<AppState>) -> common::TestDb {
     let name = format!("t{}", uuid::Uuid::now_v7().simple());
     db::create_database(&state.pool, &name)
         .await
@@ -1317,7 +1317,7 @@ async fn fresh_unique_email_db(state: &Arc<AppState>) -> String {
     ddl::push_schema(&state.pool, &name, unique_email_schema())
         .await
         .expect("push unique_email schema");
-    name
+    common::wrap_test_db(name)
 }
 
 /// `slug` + `deleted` fields with a UNIQUE partial index: uniqueness holds on
@@ -1346,7 +1346,7 @@ fn partial_unique_schema() -> SchemaDef {
     .expect("parse partial_unique schema")
 }
 
-async fn fresh_partial_unique_db(state: &Arc<AppState>) -> String {
+async fn fresh_partial_unique_db(state: &Arc<AppState>) -> common::TestDb {
     let name = format!("t{}", uuid::Uuid::now_v7().simple());
     db::create_database(&state.pool, &name)
         .await
@@ -1354,7 +1354,7 @@ async fn fresh_partial_unique_db(state: &Arc<AppState>) -> String {
     ddl::push_schema(&state.pool, &name, partial_unique_schema())
         .await
         .expect("push partial_unique schema");
-    name
+    common::wrap_test_db(name)
 }
 
 // (o) duplicate insert on a unique index → CONFLICT (409), and the whole txn

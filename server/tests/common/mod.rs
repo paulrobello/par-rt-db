@@ -1,10 +1,12 @@
 use std::future::IntoFuture;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 use rtdb_server::config::HotConfig;
 use rtdb_server::schema::SchemaDef;
 use rtdb_server::{AppState, build_router, config::Config, db, ddl};
+use tokio::sync::mpsc::{self, UnboundedSender};
 
 pub fn test_config() -> Config {
     Config {
@@ -247,7 +249,7 @@ pub fn kanban_schema_json() -> serde_json::Value {
 }
 
 #[allow(dead_code)]
-pub async fn fresh_db(state: &Arc<AppState>) -> String {
+pub async fn fresh_db(state: &Arc<AppState>) -> TestDb {
     let name = format!("t{}", uuid::Uuid::now_v7().simple());
     db::create_database(&state.pool, &name)
         .await
@@ -259,7 +261,135 @@ pub async fn fresh_db(state: &Arc<AppState>) -> String {
         .await
         .expect("push kanban schema");
 
-    name
+    ensure_cleanup_worker(&state.config.database_url);
+    TestDb(name)
+}
+
+/// Channel handle minted once per process by `ensure_cleanup_worker`; `TestDb`'s
+/// `Drop` sends the database name here. Held in a `OnceLock` so the worker is
+/// lazily, idempotently spawned on first use.
+static CLEANUP_TX: OnceLock<UnboundedSender<String>> = OnceLock::new();
+
+/// A par-rt-db database created for a test. `Drop` schedules best-effort
+/// teardown (DROP SCHEMA + registry deletes via `db::drop_database`) on a
+/// dedicated worker thread that owns its own runtime + pool — independent of
+/// the test's current-thread runtime, so cleanup runs after the test returns.
+/// Behaves like a string via `Deref`/`AsRef`/`Display`.
+#[derive(Debug)]
+pub struct TestDb(pub String);
+
+impl TestDb {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Serialize as a string so `serde_json::json!({"db": db, ...})` works without
+/// an explicit `.as_str()` at every call site — consistent with "behaves like a
+/// string". RAII is unaffected: the `TestDb` retains its name and still drops.
+impl serde::Serialize for TestDb {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&self.0)
+    }
+}
+
+impl std::ops::Deref for TestDb {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl AsRef<str> for TestDb {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for TestDb {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl Clone for TestDb {
+    fn clone(&self) -> Self {
+        TestDb(self.0.clone())
+    }
+}
+
+impl From<TestDb> for String {
+    fn from(mut t: TestDb) -> String {
+        std::mem::take(&mut t.0)
+    }
+}
+
+impl Drop for TestDb {
+    fn drop(&mut self) {
+        if let Some(tx) = CLEANUP_TX.get() {
+            let name = std::mem::take(&mut self.0);
+            // Skip when the name was already extracted (e.g. via `String::from`):
+            // sending "" would queue a pointless `drop_database("")` that logs an error.
+            if !name.is_empty() {
+                let _ = tx.send(name);
+            }
+        }
+    }
+}
+
+/// Wrap a database name created outside `fresh_db` (e.g. an inline
+/// `db::create_database` call that pushes a custom schema instead of the kanban
+/// fixture) in a `TestDb` so its `Drop` schedules cleanup. Ensures the worker
+/// is running first — idempotent, so safe to call even if `fresh_db` or
+/// `test_state` already initialized it. Use when a test cannot use `fresh_db`
+/// because it needs a non-kanban schema or a bare (schema-less) database.
+#[allow(dead_code)]
+pub fn wrap_test_db(name: String) -> TestDb {
+    ensure_cleanup_worker(&test_config().database_url);
+    TestDb(name)
+}
+
+/// Lazily spawn the cleanup worker once per process on its own OS thread, with
+/// its own runtime + pool built from `database_url`. Idempotent: the second and
+/// later calls are no-ops. The worker owns its own `tokio::runtime::Runtime`
+/// and `PgPool` so it survives the test's current-thread runtime shutting down
+/// at return — cleanup proceeds after the test.
+pub fn ensure_cleanup_worker(database_url: &str) {
+    CLEANUP_TX.get_or_init(|| {
+        let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+        let url = database_url.to_string();
+        std::thread::spawn(move || {
+            let rt = match tokio::runtime::Runtime::new() {
+                Ok(rt) => rt,
+                Err(e) => {
+                    eprintln!("test-db cleanup worker: runtime build failed: {e}");
+                    return;
+                }
+            };
+            rt.block_on(async move {
+                let pool = match sqlx::postgres::PgPoolOptions::new()
+                    .max_connections(4)
+                    .connect(&url)
+                    .await
+                {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("test-db cleanup worker: connect failed: {e}");
+                        return;
+                    }
+                };
+                while let Some(name) = rx.recv().await {
+                    let pool = pool.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = db::drop_database(&pool, &name).await {
+                            eprintln!("test-db cleanup: drop {name} failed: {e}");
+                        }
+                    });
+                }
+            });
+        });
+        tx
+    });
 }
 
 #[allow(dead_code)]

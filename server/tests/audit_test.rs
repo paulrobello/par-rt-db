@@ -102,7 +102,7 @@ async fn audit_enabled_records_each_doc_op_newest_first() -> anyhow::Result<()> 
         "SELECT db, tbl, op, doc_id, principal, source \
          FROM rtdb.audit_log WHERE db = $1 ORDER BY id ASC",
     )
-    .bind(&name)
+    .bind(name.as_str())
     .fetch_all(&pool)
     .await?;
     assert_eq!(rows.len(), 5, "five durable writes: {rows:?}");
@@ -114,7 +114,7 @@ async fn audit_enabled_records_each_doc_op_newest_first() -> anyhow::Result<()> 
         ("projects", &beta_id, "delete"),
     ];
     for (i, (tbl, doc_id, op)) in expected.iter().enumerate() {
-        assert_eq!(rows[i].0, name, "row {i} db");
+        assert_eq!(rows[i].0, name.as_str(), "row {i} db");
         assert_eq!(rows[i].1, *tbl, "row {i} table");
         assert_eq!(rows[i].2.as_deref(), Some(*op), "row {i} op");
         assert_eq!(rows[i].3, *doc_id, "row {i} doc_id");
@@ -216,7 +216,7 @@ async fn audit_disabled_writes_nothing_and_endpoint_returns_empty() -> anyhow::R
     .await;
 
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM rtdb.audit_log WHERE db = $1")
-        .bind(&name)
+        .bind(name.as_str())
         .fetch_one(&pool)
         .await
         .expect("audit_log query (table exists from concurrent enabled tests; filtered by db)");
