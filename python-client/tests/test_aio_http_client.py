@@ -21,6 +21,7 @@ from par_rt_db import (
     TableQuery,
 )
 from par_rt_db.aio_http_client import RtDbAsyncHttpClient
+from par_rt_db.http_client import FileMetadata, UploadResult
 
 BEARER = "Bearer machine-token"
 DB = "t<uuid>"
@@ -360,3 +361,72 @@ async def test_context_manager_closes_client() -> None:
     # After exit the underlying httpx.AsyncClient is closed; further requests raise.
     with pytest.raises(RuntimeError):
         await client.run(TableQuery("items").count())
+
+
+# --- storage ----------------------------------------------------------------
+
+
+async def test_upload_posts_raw_bytes_and_returns_metadata() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["content"] = request.content
+        captured["headers"] = dict(request.headers)
+        return httpx.Response(
+            200,
+            json={"id": "f1", "sha256": "abc", "size": 9, "contentType": "image/png"},
+        )
+
+    async with _client(handler) as c:
+        up = await c.upload(b"raw-bytes", content_type="image/png")
+    assert isinstance(up, UploadResult)
+    assert up.id == "f1"
+    assert up.size == 9
+    assert up.content_type == "image/png"
+    # raw body (NOT json-wrapped)
+    assert captured["content"] == b"raw-bytes"
+    assert captured["headers"]["content-type"] == "image/png"
+    assert captured["headers"]["authorization"] == BEARER
+
+
+async def test_delete_file_posts_to_storage_path() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["method"] = request.method
+        captured["path"] = request.url.path
+        return httpx.Response(200, json={"ok": True})
+
+    async with _client(handler) as c:
+        await c.delete_file("f1")
+    assert captured["method"] == "DELETE"
+    assert captured["path"] == f"/api/storage/{DB}/f1"
+
+
+async def test_get_file_metadata_returns_file_metadata_model() -> None:
+    async with _client(
+        _handler_map(
+            {
+                ("GET", f"/api/storage/{DB}/f1/metadata", ""): httpx.Response(
+                    200,
+                    json={
+                        "id": "f1",
+                        "sha256": "abc",
+                        "size": 9,
+                        "creationTime": 5,
+                    },
+                )
+            }
+        )
+    ) as c:
+        meta = await c.get_file_metadata("f1")
+    assert isinstance(meta, FileMetadata)
+    assert meta.size == 9
+    assert meta.creation_time == 5
+    assert meta.content_type is None  # omitted by the server → default
+
+
+def test_get_url_is_base_plus_storage_id_no_request() -> None:
+    # No mock handler installed → any request would fail; get_url makes none.
+    client = _client(lambda r: httpx.Response(500))
+    assert client.get_url("f1") == "https://rtdb.example/storage/f1"

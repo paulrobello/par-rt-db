@@ -21,7 +21,13 @@ if TYPE_CHECKING:
 
 # Re-import the shared response models + adapters this module references.
 # Add to this block as later tasks add methods that return more models.
-from .http_client import _BATCH_ADAPTER, _SCHEDULES_ADAPTER, _STEP_RESULT_ADAPTER
+from .http_client import (
+    _BATCH_ADAPTER,
+    _SCHEDULES_ADAPTER,
+    _STEP_RESULT_ADAPTER,
+    FileMetadata,
+    UploadResult,
+)
 from .wire import BatchQueryOutcome, ScheduleInfo, ScheduleWhen
 
 
@@ -213,6 +219,40 @@ class RtDbAsyncHttpClient:
             "POST", "/api/query-batch", json={"db": self._db, "queries": wire_queries}
         )
         return _BATCH_ADAPTER.validate_python(resp.json()["results"])
+
+    # --- storage (machine token; HTTP-only, bypasses the committer) ---
+
+    async def upload(self, data: bytes, *, content_type: str | None = None) -> UploadResult:
+        """``POST /api/storage/{db}`` with a raw body → server-computed metadata.
+
+        ``content_type`` sets the ``Content-Type`` header AND is stored as the
+        file's type; when ``None`` the header is left unset (httpx defaults to
+        ``application/octet-stream``). Unlike every other method the body is NOT
+        JSON.
+        """
+        headers = {"Content-Type": content_type} if content_type is not None else None
+        resp = await self._send(
+            "POST",
+            f"/api/storage/{self._db}",
+            content=data,
+            headers=headers,
+        )
+        return UploadResult.model_validate(resp.json())
+
+    async def delete_file(self, id: str) -> None:
+        """``DELETE /api/storage/{db}/{id}``. Raises ``RtDbError`` on non-2xx."""
+        resp = await self._send("DELETE", f"/api/storage/{self._db}/{id}")
+        if not resp.json().get("ok"):
+            raise RtDbError(ErrorCode.INTERNAL, "delete file returned ok=false")
+
+    async def get_file_metadata(self, id: str) -> FileMetadata:
+        """``GET /api/storage/{db}/{id}/metadata`` → stored file metadata."""
+        resp = await self._send("GET", f"/api/storage/{self._db}/{id}/metadata")
+        return FileMetadata.model_validate(resp.json())
+
+    def get_url(self, id: str) -> str:
+        """The public serve URL (``GET /storage/{id}``) — no request is made."""
+        return f"{self._base}/storage/{id}"
 
     # --- request plumbing ---
 
