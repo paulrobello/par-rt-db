@@ -800,6 +800,42 @@ pub mod admin {
         pub before: serde_json::Value,
         pub after: serde_json::Value,
     }
+
+    /// One managed-backup file as returned by `GET /admin/backups`. Mirrors
+    /// server `backup::BackupFile` (camelCase on the wire).
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct BackupFile {
+        pub name: String,
+        pub size_bytes: u64,
+        pub created_ms: i64,
+    }
+
+    /// `GET /admin/backups` response: the in-progress flag plus the on-disk
+    /// dump list, newest-first.
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct BackupsListResponse {
+        pub running: bool,
+        pub backups: Vec<BackupFile>,
+    }
+
+    /// `POST /admin/restore` body. `confirm` must equal `name` — the typed
+    /// confirmation guard mirrors `delete_db`.
+    #[derive(Serialize)]
+    pub(crate) struct RestoreRequest<'a> {
+        pub(crate) name: &'a str,
+        pub(crate) confirm: &'a str,
+    }
+
+    /// `POST /admin/restore` response: the freshly-created target DB name and
+    /// cutover instructions.
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct RestoreResult {
+        pub target: String,
+        pub instructions: String,
+    }
 }
 
 #[cfg(test)]

@@ -32,6 +32,7 @@ pub mod ws;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::SystemTime;
 
 use arc_swap::ArcSwap;
@@ -83,6 +84,15 @@ pub struct AppState {
     pub runtime: Runtime,
     pub auth: Auth,
     pub rate_limiter: Arc<rate_limit::RateLimiter>,
+    /// In-progress flag for the manual `/admin/backup` trigger. Set
+    /// synchronously in the handler before the spawned `pg_dump` task and
+    /// cleared on completion (success or failure). Read by `GET /admin/backups`
+    /// to populate `running`, and checked-and-set by the trigger to enforce
+    /// "one manual backup at a time" (409 on conflict). Atomic because the
+    /// trigger handler, the spawned dump task, and the listing handler all
+    /// touch it without serialization — the same way the cron backup task
+    /// (which never touches this flag) runs alongside them.
+    pub backup_running: Arc<AtomicBool>,
 }
 
 impl AppState {
@@ -128,6 +138,7 @@ impl AppState {
                 oauth_states: tokio::sync::Mutex::new(HashMap::new()),
             },
             rate_limiter: rate_limit::RateLimiter::new(),
+            backup_running: Arc::new(AtomicBool::new(false)),
         })
     }
 }

@@ -153,6 +153,23 @@ pub async fn test_state_with_ttl_sweep(secs: u64) -> Arc<AppState> {
     AppState::new(pool, config, test_hot())
 }
 
+/// Like `test_state` but with `backup_dir` overridden. Used by ENH-002 Task 3's
+/// `/admin/backup` trigger test to point at a tempdir — so the spawned `pg_dump`
+/// (which calls `tokio::fs::create_dir_all` on `backup_dir` before running) does
+/// not pollute the default `./backups` and break the parallel
+/// `admin_list_backups_returns_empty_when_dir_missing` test, which asserts that
+/// dir does not exist. Mirrors the `test_state_with_*` override pattern.
+#[allow(dead_code)]
+pub async fn test_state_with_backup_dir(dir: String) -> Arc<AppState> {
+    let mut config = test_config();
+    config.backup_dir = dir;
+    let pool = sqlx::PgPool::connect(&config.database_url)
+        .await
+        .expect("connect to test postgres");
+    db::bootstrap(&pool).await.expect("bootstrap rtdb_auth");
+    AppState::new(pool, config, test_hot())
+}
+
 /// Like `test_state_with_ttl_sweep` but ALSO enables the durable audit log and
 /// webhook registry (ensuring their tables), so a reaper delete can be asserted
 /// to publish through all four tap sites with `source = "ttl"`. Combines

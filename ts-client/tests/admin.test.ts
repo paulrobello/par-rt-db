@@ -545,3 +545,92 @@ describe("RtDbAdminClient — new endpoints", () => {
     });
   });
 });
+
+describe("RtDbAdminClient backups", () => {
+  it("backupNow POSTs {} to /admin/backup and resolves void on 202", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 202 }));
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+    await expect(admin.backupNow()).resolves.toBeUndefined();
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("http://h:8300/admin/backup");
+    expect(init.method).toBe("POST");
+    expect(init.headers.Authorization).toBe("Bearer k");
+    expect(JSON.parse(init.body)).toEqual({});
+  });
+
+  it("listBackups GETs /admin/backups and returns {running, backups}", async () => {
+    const payload = {
+      running: false,
+      backups: [{ name: "rtdb-20260728T143045Z.dump", sizeBytes: 1024, createdMs: 1234567890 }],
+    };
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(payload));
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+    await expect(admin.listBackups()).resolves.toEqual(payload);
+    expect(fetchMock.mock.calls[0][0]).toBe("http://h:8300/admin/backups");
+  });
+
+  it("downloadBackup GETs /admin/backups/{name} and returns the raw binary Response", async () => {
+    const blob = new Response(new Uint8Array([1, 2, 3]), {
+      status: 200,
+      headers: { "content-type": "application/octet-stream" },
+    });
+    const fetchMock = vi.fn().mockResolvedValue(blob);
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+    const res = await admin.downloadBackup("rtdb-20260728T143045Z.dump");
+    expect(res).toBe(blob);
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("http://h:8300/admin/backups/rtdb-20260728T143045Z.dump");
+    expect(init.method).toBe("GET");
+    expect(init.headers.Authorization).toBe("Bearer k");
+  });
+
+  it("downloadBackup throws RtDbError on a non-OK status", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(jsonResponse({ code: "NOT_FOUND", message: "backup not found" }, 404));
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+    await expect(admin.downloadBackup("missing.dump")).rejects.toMatchObject({
+      name: "RtDbError",
+      code: "NOT_FOUND",
+      message: "backup not found",
+    });
+  });
+
+  it("deleteBackup DELETEs /admin/backups/{name} and resolves void on 204", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 204 }));
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+    await expect(admin.deleteBackup("rtdb-20260728T143045Z.dump")).resolves.toBeUndefined();
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("http://h:8300/admin/backups/rtdb-20260728T143045Z.dump");
+    expect(init.method).toBe("DELETE");
+    expect(init.headers.Authorization).toBe("Bearer k");
+  });
+
+  it("restoreBackup POSTs {name, confirm === name} to /admin/restore and unwraps the result", async () => {
+    const result = { target: "rtdb_restored_20260804", instructions: "review then promote" };
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(result));
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+    await expect(admin.restoreBackup("rtdb-20260728T143045Z.dump")).resolves.toEqual(result);
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("http://h:8300/admin/restore");
+    expect(init.method).toBe("POST");
+    expect(JSON.parse(init.body)).toEqual({
+      name: "rtdb-20260728T143045Z.dump",
+      confirm: "rtdb-20260728T143045Z.dump",
+    });
+  });
+
+  it("restoreBackup surfaces a 400 confirmation-mismatch envelope as RtDbError", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(
+        jsonResponse({ code: "BAD_REQUEST", message: "confirm must match backup name" }, 400),
+      );
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+    await expect(admin.restoreBackup("x")).rejects.toMatchObject({
+      name: "RtDbError",
+      code: "BAD_REQUEST",
+      message: "confirm must match backup name",
+    });
+  });
+});

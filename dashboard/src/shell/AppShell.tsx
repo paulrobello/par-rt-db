@@ -15,6 +15,7 @@ const NAV = [
   { to: "/console", label: "Console" },
   { to: "/config", label: "Config" },
   { to: "/admins", label: "Admins" },
+  { to: "/backups", label: "Backups" },
 ];
 
 const KIND_TONE: Record<OpKind, string> = {

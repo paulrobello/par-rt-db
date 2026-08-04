@@ -3,7 +3,8 @@ mod common;
 use std::net::SocketAddr;
 
 use common::{
-    admin_get, admin_post, admin_post_raw, fresh_db, kanban_schema_json, spawn_app, test_state,
+    admin_delete, admin_get, admin_post, admin_post_raw, fresh_db, kanban_schema_json, spawn_app,
+    test_state, test_state_with_backup_dir,
 };
 use rtdb_server::auth::PrincipalCtx;
 use rtdb_server::db;
@@ -1093,7 +1094,8 @@ async fn admin_storage_list_unknown_db_is_404() -> anyhow::Result<()> {
 // `config.backup_dir`. The default `test_config` points at `./backups`, which
 // does not exist in the test working directory — the endpoint must return 200
 // with an empty list (a missing dir is normal when no run has happened yet or
-// the scheduler is disabled at boot), never 500.
+// the scheduler is disabled at boot), never 500. The response now also carries
+// the `running` flag (ENH-002 Task 3), which is `false` on a fresh AppState.
 #[tokio::test]
 async fn admin_list_backups_returns_empty_when_dir_missing() -> anyhow::Result<()> {
     let state = test_state().await;
@@ -1102,7 +1104,7 @@ async fn admin_list_backups_returns_empty_when_dir_missing() -> anyhow::Result<(
     let resp = admin_get(addr, "/admin/backups").await;
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
     let body: serde_json::Value = resp.json().await?;
-    assert_eq!(body, serde_json::json!({"backups": []}));
+    assert_eq!(body, serde_json::json!({"running": false, "backups": []}));
     Ok(())
 }
 
@@ -1315,5 +1317,124 @@ async fn schema_preview_does_not_apply() -> anyhow::Result<()> {
         "preview must not mutate the applied schema"
     );
 
+    Ok(())
+}
+
+// --- Backups (ENH-002 Task 3) ---------------------------------------------
+//
+// `POST /admin/backup` triggers a `pg_dump` of `config.database_url` outside
+// the committer (pg_dump is a read). The handler sets `state.backup_running`
+// synchronously before spawning the dump task, then returns 202 immediately.
+// The flag is cleared on completion (success or failure). A second POST while
+// the flag is set returns 409. `GET /admin/backups` reports the flag as
+// `running` alongside the listing. The trigger test uses a tempdir for
+// `backup_dir` so the spawned `pg_dump` (which `create_dir_all`s the dir before
+// running) does not pollute the default `./backups` and break the parallel
+// `admin_list_backups_returns_empty_when_dir_missing` test. It does NOT assert
+// a dump file appears — the dev `rtdb` DB is heavily polluted and pg_dump may
+// fail; that is fine, the flag still flips. The assertions below depend only on
+// the in-memory flag, which is set before the spawn and read synchronously by
+// the next request's handler.
+
+// POST /admin/backup → 202; the in-progress flag is set synchronously in the
+// handler before the spawned pg_dump task, so an immediate GET /admin/backups
+// observes `running: true`. A second POST while the flag is still set returns
+// 409 Conflict.
+#[tokio::test]
+async fn backup_trigger_returns_accepted_then_conflict() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir().expect("temp backup dir");
+    let dir_path = dir.path().to_str().unwrap().to_string();
+    let state = test_state_with_backup_dir(dir_path).await;
+    let addr = spawn_app(state).await;
+
+    // First trigger → 202 Accepted.
+    let r1 = admin_post(addr, "/admin/backup", serde_json::Value::Null).await;
+    assert_eq!(r1.status(), reqwest::StatusCode::ACCEPTED);
+
+    // The flag is set synchronously in the handler before the spawn, so an
+    // immediate GET observes it.
+    let listing: serde_json::Value = admin_get(addr, "/admin/backups").await.json().await?;
+    assert_eq!(listing["running"], serde_json::json!(true));
+
+    // Second trigger while the flag is set → 409 Conflict.
+    let r2 = admin_post(addr, "/admin/backup", serde_json::Value::Null).await;
+    assert_eq!(r2.status(), reqwest::StatusCode::CONFLICT);
+    let body: serde_json::Value = r2.json().await?;
+    assert_eq!(body["code"], "CONFLICT");
+    Ok(())
+}
+
+// `GET /admin/backups` always includes the `running` flag (added in ENH-002
+// Task 3), even when no backup has been triggered. The flag is `false` on a
+// fresh AppState.
+#[tokio::test]
+async fn list_backups_reports_running_flag() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state).await;
+
+    let resp = admin_get(addr, "/admin/backups").await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await?;
+    assert!(
+        body.get("running").is_some(),
+        "response must include running, got: {body}"
+    );
+    assert_eq!(body["running"], serde_json::json!(false));
+    assert!(body["backups"].is_array());
+    Ok(())
+}
+
+// `POST /admin/restore` requires `confirm == name` (typed guard, mirroring
+// `delete-db`). A mismatch short-circuits to 400 BEFORE any pg tool runs, so
+// this test is fully deterministic — no live dump required.
+#[tokio::test]
+async fn restore_requires_matching_confirm() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state).await;
+
+    let body = serde_json::json!({
+        "name": "rtdb-20260728T143045Z.dump",
+        "confirm": "wrong"
+    });
+    let resp = admin_post(addr, "/admin/restore", body).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(body["code"], "BAD_REQUEST");
+    Ok(())
+}
+
+// `GET /admin/backups/{name}` runs `validate_dump_name` before touching the
+// filesystem, so a traversal-shaped name is rejected at the API edge. Accept
+// either 400 (handler rejected) or 404 (router normalized the path) — both
+// prove the file was not served. No live dump required.
+#[tokio::test]
+async fn download_rejects_bad_dump_name() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state).await;
+
+    let resp = admin_get(addr, "/admin/backups/..%2Fetc%2Fpasswd").await;
+    let status = resp.status().as_u16();
+    assert!(
+        status == 400 || status == 404,
+        "traversal name must be rejected, got {status}"
+    );
+    Ok(())
+}
+
+// `DELETE /admin/backups/{name}` runs `validate_dump_name` first; a malformed
+// name is rejected with 400 before the filesystem is touched. Also covers the
+// 404 path on a well-formed name that does not exist on disk.
+#[tokio::test]
+async fn delete_backup_rejects_bad_name_and_404s_when_missing() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state).await;
+
+    // Bad name → 400 (validate_dump_name short-circuits).
+    let resp = admin_delete(addr, "/admin/backups/not-a-dump-file").await;
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    // Well-formed name that does not exist → 404.
+    let resp = admin_delete(addr, "/admin/backups/rtdb-20260728T143045Z.dump").await;
+    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
     Ok(())
 }

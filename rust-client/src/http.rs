@@ -898,6 +898,87 @@ impl RtDbHttpClient {
             .collect()
     }
 
+    /// `POST /admin/backup` (empty body) → 202 `{ok:true}`. Triggers one
+    /// `pg_dump` immediately; the dump runs detached and the in-progress flag
+    /// is observable via [`list_backups`](Self::list_backups). A second call
+    /// while one is running → 409 `CONFLICT`. Runs outside the committer.
+    pub async fn backup_now(&self) -> Result<(), RtDbError> {
+        let resp = self
+            .post_json("/admin/backup", &serde_json::json!({}))
+            .await?;
+        self.expect_ok(resp).await
+    }
+
+    /// `GET /admin/backups` → `{running, backups:[{name, sizeBytes, createdMs}]}`.
+    /// A missing backup dir returns an empty list (the endpoint describes what
+    /// is on disk, not what is configured).
+    pub async fn list_backups(&self) -> Result<crate::wire::admin::BackupsListResponse, RtDbError> {
+        self.get_json("/admin/backups", &[]).await
+    }
+
+    /// `GET /admin/backups/{name}` → the raw dump bytes
+    /// (`application/octet-stream`). The response is NOT JSON-decoded — binary
+    /// pg_dump output is returned verbatim as `Vec<u8>`.
+    pub async fn download_backup(&self, name: &str) -> Result<Vec<u8>, RtDbError> {
+        let resp = self
+            .client
+            .get(format!("{}/admin/backups/{name}", self.url))
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(|e| RtDbError::internal(format!("download_backup request failed: {e}")))?;
+        let status = resp.status();
+        if status.is_success() {
+            return resp
+                .bytes()
+                .await
+                .map(|b| b.to_vec())
+                .map_err(|e| RtDbError::internal(format!("invalid backup body: {e}")));
+        }
+        Err(self.error_response(resp).await)
+    }
+
+    /// `DELETE /admin/backups/{name}` → 204. Returns 404 if the file is
+    /// already gone. Same `validate_dump_name` short-circuit as download runs
+    /// server-side first.
+    pub async fn delete_backup(&self, name: &str) -> Result<(), RtDbError> {
+        let resp = self
+            .client
+            .delete(format!("{}/admin/backups/{name}", self.url))
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(|e| RtDbError::internal(format!("delete_backup request failed: {e}")))?;
+        let status = resp.status();
+        if status.is_success() {
+            // 204 No Content (or any other 2xx the server returns) — nothing
+            // to parse.
+            return Ok(());
+        }
+        Err(self.error_response(resp).await)
+    }
+
+    /// `POST /admin/restore` `{name, confirm}` → `{target, instructions}`.
+    /// The SDK sends `confirm == name` (the typed confirmation guard mirrors
+    /// [`delete_db`](Self::delete_db)). Restores into a fresh
+    /// `rtdb_restored_<stamp>` DB; the live DB is never touched.
+    pub async fn restore_backup(
+        &self,
+        name: &str,
+    ) -> Result<crate::wire::admin::RestoreResult, RtDbError> {
+        let resp = self
+            .post_json(
+                "/admin/restore",
+                &crate::wire::admin::RestoreRequest {
+                    name,
+                    confirm: name,
+                },
+            )
+            .await?;
+        self.deserialize::<crate::wire::admin::RestoreResult>(resp)
+            .await
+    }
+
     async fn post_json<Req: Serialize>(
         &self,
         path: &str,
@@ -2338,5 +2419,119 @@ mod admin_tests {
         assert_eq!(result.directives[1].affected_rows, 0);
         assert!(result.schema.tables.contains_key("items"));
         assert!(result.schema.tables["items"].fields.contains_key("title"));
+    }
+
+    // ── Admin backup methods (trigger / list / download / delete / restore) ──
+
+    #[tokio::test]
+    async fn backup_now_posts_empty_body_to_admin_backup() {
+        let (server, client) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/admin/backup"))
+            .and(header("authorization", BEARER))
+            .respond_with(ResponseTemplate::new(202).set_body_json(json!({"ok": true})))
+            .mount(&server)
+            .await;
+        client.backup_now().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_backups_parses_running_and_backup_entries() {
+        let (server, client) = setup().await;
+        Mock::given(method("GET"))
+            .and(path("/admin/backups"))
+            .and(header("authorization", BEARER))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "running": true,
+                "backups": [
+                    {"name": "rtdb-20260728T143045Z.dump", "sizeBytes": 12345, "createdMs": 1753713045000_i64},
+                    {"name": "rtdb-20260727T010000Z.dump", "sizeBytes": 999,   "createdMs": 1753574400000_i64}
+                ]
+            })))
+            .mount(&server)
+            .await;
+        let res = client.list_backups().await.unwrap();
+        assert!(res.running);
+        assert_eq!(res.backups.len(), 2);
+        assert_eq!(res.backups[0].name, "rtdb-20260728T143045Z.dump");
+        assert_eq!(res.backups[0].size_bytes, 12345);
+        assert_eq!(res.backups[0].created_ms, 1753713045000_i64);
+        assert_eq!(res.backups[1].size_bytes, 999);
+    }
+
+    #[tokio::test]
+    async fn download_backup_returns_raw_bytes_without_json_decoding() {
+        let (server, client) = setup().await;
+        let payload = b"PG_DUMP binary payload \x00\x01\x02 here";
+        Mock::given(method("GET"))
+            .and(path("/admin/backups/rtdb-20260728T143045Z.dump"))
+            .and(header("authorization", BEARER))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/octet-stream")
+                    .set_body_bytes(payload.to_vec()),
+            )
+            .mount(&server)
+            .await;
+        let bytes = client
+            .download_backup("rtdb-20260728T143045Z.dump")
+            .await
+            .unwrap();
+        assert_eq!(bytes, payload);
+    }
+
+    #[tokio::test]
+    async fn download_backup_surfaces_not_found_envelope() {
+        let (server, client) = setup().await;
+        Mock::given(method("GET"))
+            .and(path("/admin/backups/missing.dump"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+                "code": "NOT_FOUND",
+                "message": "backup file not found"
+            })))
+            .mount(&server)
+            .await;
+        let err = client.download_backup("missing.dump").await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::NotFound);
+        assert_eq!(err.message, "backup file not found");
+    }
+
+    #[tokio::test]
+    async fn delete_backup_returns_no_content_on_success() {
+        let (server, client) = setup().await;
+        Mock::given(method("DELETE"))
+            .and(path("/admin/backups/rtdb-20260728T143045Z.dump"))
+            .and(header("authorization", BEARER))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        client
+            .delete_backup("rtdb-20260728T143045Z.dump")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn restore_backup_sends_confirm_equal_to_name_and_parses_target() {
+        let (server, client) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/admin/restore"))
+            .and(header("authorization", BEARER))
+            .and(body_partial_json(json!({
+                "name": "rtdb-20260728T143045Z.dump",
+                "confirm": "rtdb-20260728T143045Z.dump"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "target": "rtdb_restored_20260728T143045Z",
+                "instructions": "Restore complete into database 'rtdb_restored_20260728T143045Z'."
+            })))
+            .mount(&server)
+            .await;
+        let r = client
+            .restore_backup("rtdb-20260728T143045Z.dump")
+            .await
+            .unwrap();
+        assert_eq!(r.target, "rtdb_restored_20260728T143045Z");
+        assert!(r.instructions.starts_with("Restore complete"));
     }
 }

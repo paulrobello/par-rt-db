@@ -120,6 +120,23 @@ export type AdminStreamFrame =
   | { kind: "op"; event: OpEvent }
   | { kind: "gauges"; gauges: MetricsSnapshot };
 
+/** One managed pg_dump file on disk (GET /admin/backups). */
+export interface BackupFile {
+  name: string;
+  sizeBytes: number;
+  createdMs: number;
+}
+/** Response from GET /admin/backups: existing dumps and whether one is running. */
+export interface BackupsListResponse {
+  running: boolean;
+  backups: BackupFile[];
+}
+/** Response from POST /admin/restore: the fresh rtdb_restored_<stamp> DB and follow-up. */
+export interface RestoreResult {
+  target: string;
+  instructions: string;
+}
+
 function toSchemaJson(schema: SchemaDefinition<any> | SchemaJson): SchemaJson {
   return "toJSON" in schema && typeof schema.toJSON === "function"
     ? schema.toJSON()
@@ -342,6 +359,46 @@ export class RtDbAdminClient {
       `/admin/db/${encodeURIComponent(db)}/migrate`,
       req,
     )) as MigrateResultJson;
+  }
+
+  /** Trigger one pg_dump now (POST /admin/backup, 202 Accepted). Runs async server-side;
+   *  poll `listBackups()` to see the result. */
+  async backupNow(): Promise<void> {
+    await this.request("POST", "/admin/backup", {});
+  }
+
+  /** List existing backups and whether one is currently running (GET /admin/backups). */
+  async listBackups(): Promise<BackupsListResponse> {
+    return (await this.request("GET", "/admin/backups")) as BackupsListResponse;
+  }
+
+  /** Download a dump as a raw binary `Response` (caller streams to a file). Bypasses the
+   *  JSON `request` helper because the body is `application/octet-stream`. Error envelopes
+   *  on non-OK still surface as `RtDbError` via `throwFromResponse`. */
+  async downloadBackup(name: string): Promise<Response> {
+    const response = await this.fetchImpl(`${this.url}/admin/backups/${encodeURIComponent(name)}`, {
+      method: "GET",
+      headers: { Authorization: `Bearer ${this.adminKey}` },
+    });
+    if (!response.ok) {
+      await this.throwFromResponse(response);
+    }
+    return response;
+  }
+
+  /** Delete a backup file (DELETE /admin/backups/{name}, 204 No Content). */
+  async deleteBackup(name: string): Promise<void> {
+    await this.request("DELETE", `/admin/backups/${encodeURIComponent(name)}`);
+  }
+
+  /** Restore a dump into a fresh `rtdb_restored_<stamp>` DB (POST /admin/restore).
+   *  `confirm` is sent equal to `name` — the server's typed guard against accidental
+   *  restores. Returns the restored DB name and follow-up instructions. */
+  async restoreBackup(name: string): Promise<RestoreResult> {
+    return (await this.request("POST", "/admin/restore", {
+      name,
+      confirm: name,
+    })) as RestoreResult;
   }
 
   /** Open the realtime op-feed over the `/admin/stream` WebSocket and yield frames

@@ -1,19 +1,20 @@
 import { BrowserRouter, Route, Routes } from "react-router-dom";
-import { Spinner } from "./components/ui";
 import { Login } from "./components/Login";
+import { Spinner } from "./components/ui";
 import { AdminProvider } from "./lib/admin";
 import { SessionProvider, useSession } from "./lib/session";
-import { DbPage } from "./pages/DbPage";
-import { DatabasesPage } from "./pages/DatabasesPage";
-import { MigratePage } from "./pages/MigratePage";
-import { SchemaPage } from "./pages/SchemaPage";
 import { AdminsPage } from "./pages/AdminsPage";
+import { BackupsPage } from "./pages/BackupsPage";
 import { ConfigPage } from "./pages/ConfigPage";
 import { DataBrowserPage } from "./pages/DataBrowserPage";
+import { DatabasesPage } from "./pages/DatabasesPage";
+import { DbPage } from "./pages/DbPage";
 import { MetricsPage } from "./pages/MetricsPage";
+import { MigratePage } from "./pages/MigratePage";
 import { OpsPage } from "./pages/OpsPage";
 import { QueryConsolePage } from "./pages/QueryConsolePage";
 import { ScheduledJobsPage } from "./pages/ScheduledJobsPage";
+import { SchemaPage } from "./pages/SchemaPage";
 import { StoragePage } from "./pages/StoragePage";
 import { NotFound } from "./routes";
 import { AppShell } from "./shell/AppShell";
@@ -52,6 +53,7 @@ function Root() {
             <Route path="console" element={<QueryConsolePage />} />
             <Route path="config" element={<ConfigPage />} />
             <Route path="admins" element={<AdminsPage />} />
+            <Route path="backups" element={<BackupsPage />} />
             <Route path="*" element={<NotFound />} />
           </Route>
         </Routes>

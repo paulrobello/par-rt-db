@@ -1030,6 +1030,124 @@ def test_admin_migrate_schema_accepts_migrate_request() -> None:
     assert result.applied is False
 
 
+# --- admin control plane: backups ------------------------------------------
+
+
+def test_admin_backup_now_posts_to_admin_backup() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["method"] = request.method
+        captured["path"] = request.url.path
+        captured["auth"] = request.headers["authorization"]
+        return httpx.Response(202, json={"ok": True})
+
+    client = _admin_client(handler)
+    client.backup_now()
+    assert captured["method"] == "POST"
+    assert captured["path"] == "/admin/backup"
+    assert captured["auth"] == ADMIN_BEARER
+
+
+def test_admin_list_backups_returns_running_flag_and_entries() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["method"] = request.method
+        captured["path"] = request.url.path
+        return httpx.Response(
+            200,
+            json={
+                "running": False,
+                "backups": [
+                    {
+                        "name": "rtdb-20260728T143045Z.dump",
+                        "sizeBytes": 4096,
+                        "createdMs": 1753713045000,
+                    }
+                ],
+            },
+        )
+
+    client = _admin_client(handler)
+    res = client.list_backups()
+    assert captured["method"] == "GET"
+    assert captured["path"] == "/admin/backups"
+    assert res["running"] is False
+    assert len(res["backups"]) == 1
+    entry = res["backups"][0]
+    assert entry["name"] == "rtdb-20260728T143045Z.dump"
+    assert entry["sizeBytes"] == 4096
+    assert entry["createdMs"] == 1753713045000
+
+
+def test_admin_download_backup_returns_raw_bytes() -> None:
+    captured: dict[str, Any] = {}
+    payload = b"\x1f\x8b\x08\x00binary-dump-bytes"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["method"] = request.method
+        captured["path"] = request.url.path
+        return httpx.Response(
+            200,
+            content=payload,
+            headers={"Content-Type": "application/octet-stream"},
+        )
+
+    client = _admin_client(handler)
+    data = client.download_backup("rtdb-20260728T143045Z.dump")
+    assert captured["method"] == "GET"
+    assert captured["path"] == "/admin/backups/rtdb-20260728T143045Z.dump"
+    assert isinstance(data, bytes)
+    assert data == payload
+
+
+def test_admin_delete_backup_uses_delete_with_name_in_path() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["method"] = request.method
+        captured["path"] = request.url.path
+        return httpx.Response(204)
+
+    client = _admin_client(handler)
+    client.delete_backup("rtdb-20260728T143045Z.dump")
+    assert captured["method"] == "DELETE"
+    assert captured["path"] == "/admin/backups/rtdb-20260728T143045Z.dump"
+
+
+def test_admin_restore_backup_posts_name_and_confirm() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["method"] = request.method
+        captured["path"] = request.url.path
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "target": "rtdb_restored_20260728T143045Z",
+                "instructions": (
+                    "Restore complete into database "
+                    "'rtdb_restored_20260728T143045Z'. To cut over: set "
+                    "RTDB_DATABASE_URL to connect to "
+                    "'rtdb_restored_20260728T143045Z', then restart the server."
+                ),
+            },
+        )
+
+    client = _admin_client(handler)
+    res = client.restore_backup("rtdb-20260728T143045Z.dump")
+    assert captured["method"] == "POST"
+    assert captured["path"] == "/admin/restore"
+    assert captured["body"] == {
+        "name": "rtdb-20260728T143045Z.dump",
+        "confirm": "rtdb-20260728T143045Z.dump",
+    }
+    assert res["target"] == "rtdb_restored_20260728T143045Z"
+    assert "rtdb_restored_20260728T143045Z" in res["instructions"]
+
+
 # --- lifecycle --------------------------------------------------------------
 
 

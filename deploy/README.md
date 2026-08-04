@@ -154,10 +154,58 @@ curl -s -X POST https://rtdb.pardev.net/admin/allowlist \
   -H "Authorization: Bearer $RTDB_ADMIN_KEY" -d '{"db":"kanban","action":"add","email":"you@example.com"}'
 ```
 
-## Backups
+## Backups & restore
 
-Nightly `pg_dump` of the `rtdb` database from the `postgres` service to the host
-backup path (add to cron); data also persists in the `rtdb-pg` named volume.
+The server ships a full backup lifecycle: scheduled `pg_dump`, a manual async
+trigger, list/download/delete, and restore into a fresh database. The operator
+console surfaces all of it; the same routes are available directly as admin API
+calls and are mirrored in the ts/rust/python admin clients.
+
+### Scheduled backups
+
+Enable the built-in managed backup loop with `RTDB_BACKUP_ENABLED=true` plus
+`RTDB_BACKUP_CRON` (5-field UTC cron, default daily 03:00), `RTDB_BACKUP_DIR`,
+and `RTDB_BACKUP_RETENTION` (count, default 7) — the Deployment section of
+`CLAUDE.md` has the full semantics. The docker image installs `postgresql-client`
+so `pg_dump` is present, and `GET /admin/backups` lists the dumps. Data also
+persists in the `rtdb-pg` named volume.
+
+### Manual trigger, download, delete
+
+- `POST /admin/backup` → `202 Accepted` — spawns one `pg_dump` **outside the
+  committer** (a read; same as the cron task). Gated by an in-progress flag: a
+  second call while a dump is running returns `409`.
+- `GET /admin/backups` — lists existing dumps.
+- `GET /admin/backups/{name}` — downloads a dump.
+- `DELETE /admin/backups/{name}` → `204` — deletes a dump.
+
+All name-bearing routes pass a path-traversal guard (`backup::validate_dump_name`).
+
+### Restore
+
+`POST /admin/restore` (typed body: `confirm == "<dump-name>"`) restores a dump
+into a **fresh `rtdb_restored_<stamp>` Postgres database** via `createdb` +
+`pg_restore --no-owner --no-privileges`. The live `rtdb` database is never
+touched, so there are no locks or races with the writer.
+
+**`CREATEDB` privilege is required on the DB role** (new — the server previously
+only ran `CREATE SCHEMA`/`CREATE EXTENSION`). For the docker-compose deploy the
+`POSTGRES_USER` role is a superuser and already has it; on a managed Postgres,
+grant it explicitly (`ALTER ROLE "<role>" CREATEDB;`).
+
+### Cutover runbook
+
+Restore produces a verified `rtdb_restored_<stamp>` database alongside the live
+`rtdb` one. To cut over:
+
+1. Trigger the restore from the console (or `POST /admin/restore` with
+   `confirm == "<name>"`); verify row counts in the restored DB.
+2. Point `RTDB_DATABASE_URL` at `rtdb_restored_<stamp>` in `.env`.
+3. Restart the server (`docker compose up -d`).
+4. Once stable, drop the old database at your discretion.
+
+Credentials for `createdb`/`pg_restore` travel via the `PG*` env vars, never on
+the argv.
 
 ## Rollback
 

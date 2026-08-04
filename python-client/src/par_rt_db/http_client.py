@@ -729,6 +729,61 @@ class RtDbHttpClient:
         resp = self._send("POST", f"/admin/db/{db}/migrate", json=body)
         return MigrateResult.model_validate(resp.json())
 
+    # --- admin control plane: managed backups (admin key) ---
+
+    def backup_now(self) -> None:
+        """``POST /admin/backup`` → 202; one ``pg_dump`` runs in the background.
+
+        Idempotent trigger guard: a second call while one is running → 409
+        ``CONFLICT``. The dump runs outside the committer (``pg_dump`` is a
+        read), so no document tables or subscriptions are touched.
+        """
+        resp = self._send("POST", "/admin/backup", json={})
+        self._expect_ok(resp)
+
+    def list_backups(self) -> dict[str, Any]:
+        """``GET /admin/backups`` → ``{running: bool, backups: [{name, sizeBytes, createdMs}]}``.
+
+        Newest-first. A missing backup dir returns an empty list rather than
+        erroring — the endpoint describes what is on disk. ``running`` is the
+        in-progress flag for the manual ``POST /admin/backup`` trigger.
+        """
+        resp = self._send("GET", "/admin/backups")
+        return dict(resp.json())
+
+    def download_backup(self, name: str) -> bytes:
+        """``GET /admin/backups/{name}`` → the dump file's raw bytes.
+
+        The response body is ``application/octet-stream``; do not JSON-decode.
+        The server validates ``name`` (``rtdb-<stamp>.dump`` shape) before any
+        filesystem access, so a traversal-shaped name is rejected at the edge.
+        """
+        resp = self._send("GET", f"/admin/backups/{name}")
+        return resp.content
+
+    def delete_backup(self, name: str) -> None:
+        """``DELETE /admin/backups/{name}`` → 204; removes one dump file.
+
+        Same ``validate_dump_name`` short-circuit as download; 404 if the file
+        is already gone.
+        """
+        self._send("DELETE", f"/admin/backups/{name}")
+
+    def restore_backup(self, name: str) -> dict[str, Any]:
+        """``POST /admin/restore`` ``{name, confirm}`` → ``{target, instructions}``.
+
+        ``confirm`` is sent equal to ``name`` (typed guard, mirroring
+        ``delete_db``). The live DB is never touched: restore creates a fresh
+        ``rtdb_restored_<stamp>`` DB and ``pg_restore``s into it. The response
+        carries the target DB name and cutover instructions.
+        """
+        resp = self._send(
+            "POST",
+            "/admin/restore",
+            json={"name": name, "confirm": name},
+        )
+        return dict(resp.json())
+
     # --- request plumbing ---
 
     def _send(self, method: str, path: str, **kwargs: Any) -> httpx.Response:

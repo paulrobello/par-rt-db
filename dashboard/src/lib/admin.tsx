@@ -1,12 +1,3 @@
-import {
-  createContext,
-  useContext,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-  type ReactNode,
-} from "react";
 import type {
   AuthedUser,
   MigrateRequestJson,
@@ -15,6 +6,15 @@ import type {
   SchemaJson,
   TransactionJson,
 } from "@par-rt-db/client";
+import {
+  createContext,
+  type ReactNode,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import type { ConnectionState } from "../components/ui";
 import { useSession } from "./session";
 import type {
@@ -27,9 +27,9 @@ import type {
   MetricsSnapshot,
   OpEvent,
   RtDbErrorEnvelope,
-  SchemaDiff,
   ScheduleInfo,
   ScheduleWhen,
+  SchemaDiff,
   TokenRow,
 } from "./types";
 
@@ -44,6 +44,20 @@ export class RtDbRequestError extends Error {
     this.code = code;
     this.status = status;
   }
+}
+
+export interface BackupFile {
+  name: string;
+  sizeBytes: number;
+  createdMs: number;
+}
+export interface BackupsListResponse {
+  running: boolean;
+  backups: BackupFile[];
+}
+export interface RestoreResult {
+  target: string;
+  instructions: string;
 }
 
 /** Admin/control-plane client. Same-origin; bearer read from the session. */
@@ -72,6 +86,13 @@ export class AdminClient {
     }
     if (resp.status === 204) return undefined as T;
     return (await resp.json()) as T;
+  }
+
+  /** Bearer header for non-JSON fetches (e.g. blob downloads) — null token
+   *  yields {} so the same-origin HttpOnly session cookie authenticates. */
+  private authHeader(): Record<string, string> {
+    const token = this.getToken();
+    return token ? { authorization: `Bearer ${token}` } : {};
   }
 
   listDbs() {
@@ -222,6 +243,39 @@ export class AdminClient {
   deleteFile(db: string, id: string): Promise<{ ok: boolean }> {
     return this.req<{ ok: boolean }>(`/admin/db/${enc(db)}/storage/${enc(id)}`, {
       method: "DELETE",
+    });
+  }
+  /** Trigger an on-demand backup (POST /admin/backup → 202). */
+  backupNow(): Promise<void> {
+    return this.req("/admin/backup", { method: "POST", body: "{}" });
+  }
+  /** List existing backup files + whether a backup is currently running. */
+  listBackups(): Promise<BackupsListResponse> {
+    return this.req<BackupsListResponse>("/admin/backups");
+  }
+  /** Download a backup as a binary blob and trigger a browser download. */
+  async downloadBackup(name: string): Promise<void> {
+    const resp = await fetch(`/admin/backups/${enc(name)}`, {
+      headers: this.authHeader(),
+    });
+    if (!resp.ok) throw new Error(`download failed (${resp.status})`);
+    const blob = await resp.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = name;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+  deleteBackup(name: string): Promise<void> {
+    return this.req(`/admin/backups/${enc(name)}`, { method: "DELETE" });
+  }
+  /** Restore a backup by exact name (confirm must equal name). Returns the
+   *  cutover instructions; the server writes nothing — restore is offline. */
+  restoreBackup(name: string): Promise<RestoreResult> {
+    return this.req<RestoreResult>("/admin/restore", {
+      method: "POST",
+      body: JSON.stringify({ name, confirm: name }),
     });
   }
 }
