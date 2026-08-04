@@ -326,9 +326,11 @@ gate still runs first on every operation.
 6. **Type-mismatch / missing-field doubt on a write defaults to `Forbidden`** (never a
    silent allow); on a read it defaults to "row not visible" (over-approximate filtering,
    never under-approximate) — same posture as ownerField.
-7. **Side-channel (carried forward from v1, accepted):** `ExpectVersion`/`ExpectAbsent`
-   preconditions are not predicate-checked; the existence/version oracle remains. The write
-   target itself is still predicate-gated. Closing the oracle is a separate future concern.
+7. **Side-channel — RESOLVED (2026-08-03):** `ExpectVersion`/`ExpectAbsent`
+   preconditions are now predicate-checked; the existence/version oracle is closed. The write
+   target itself is still predicate-gated. Closed per
+   `docs/superpowers/specs/2026-08-03-close-expect-version-absent-side-channel-design.md`:
+   both steps now apply the visibility gate; a non-visible doc maps to the absent outcome.
 
 ## Testing
 
