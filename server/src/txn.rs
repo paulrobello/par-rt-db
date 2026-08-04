@@ -784,19 +784,27 @@ async fn do_delete(
 async fn do_expect_version(
     conn: &mut PgConnection,
     pg_schema_name: &str,
+    table_def: &TableDef,
     table_name: &str,
     id: &str,
     expected: i64,
+    ctx: &PrincipalCtx,
 ) -> Result<(), RtDbError> {
     let table_ident = pg_table(table_name);
-    let row: Option<(i64,)> = sqlx::query_as(&format!(
-        "SELECT \"version\" FROM \"{pg_schema_name}\".\"{table_ident}\" WHERE \"id\" = $1"
+    let row: Option<(i64, serde_json::Value)> = sqlx::query_as(&format!(
+        "SELECT \"version\", \"doc\" FROM \"{pg_schema_name}\".\"{table_ident}\" WHERE \"id\" = $1"
     ))
     .bind(id)
     .fetch_optional(&mut *conn)
     .await?;
-    let (actual,) =
-        row.ok_or_else(|| RtDbError::not_found(format!("document '{id}' not found")))?;
+    let Some((actual, doc)) = row else {
+        return Err(RtDbError::not_found(format!("document '{id}' not found")));
+    };
+    // Side-channel closure: a doc the caller cannot see is indistinguishable
+    // from absent — same not_found outcome, so no version is ever leaked.
+    if !doc_visible_to(&doc, table_def, ctx) {
+        return Err(RtDbError::not_found(format!("document '{id}' not found")));
+    }
     if actual != expected {
         return Err(RtDbError::precondition(format!(
             "version mismatch: expected {expected}, actual {actual}"
@@ -1096,6 +1104,42 @@ fn check_owner_doc(
     Ok(())
 }
 
+/// Boolean twin of [`check_owner_doc`]: `true` iff `doc` is visible to `ctx`
+/// under the table's per-row gates (`ownerField`/`collaboratorsField` and/or
+/// `authorize`). Used by the read-only `ExpectVersion`/`ExpectAbsent`
+/// preconditions to close the existence/version side-channel — a non-visible
+/// doc is treated as absent rather than rejected with `Forbidden`, because a
+/// `Forbidden` would itself be a louder oracle ("exists, but not yours").
+///
+/// Keep in lockstep with `check_owner_doc`: any new per-row gate must be added
+/// in both places.
+fn doc_visible_to(doc: &serde_json::Value, table_def: &TableDef, ctx: &PrincipalCtx) -> bool {
+    let owner_uid = row_auth_enforced_uid(table_def, ctx.user_id.as_deref());
+    let authorize = table_def.authorize.as_ref();
+    let user_is_some = ctx.user_id.is_some();
+    if owner_uid.is_none() && !(authorize.is_some() && user_is_some) {
+        return true; // no gate applies (bypass caller, or table declares nothing)
+    }
+    let mut visible = true;
+    if let Some(uid) = owner_uid
+        && !row_visible_to(
+            doc,
+            table_def.owner_field.as_deref(),
+            table_def.collaborators_field.as_deref(),
+            uid,
+        )
+    {
+        visible = false;
+    }
+    if let Some(authorize) = authorize
+        && user_is_some
+        && !filter_matches(doc, authorize, ctx)
+    {
+        visible = false;
+    }
+    visible
+}
+
 /// Returns the caller's uid when per-row authorization applies: the caller is a
 /// user (`owner` is `Some`) AND the table declares `ownerField` and/or
 /// `collaboratorsField`. Returns `None` for bypass callers (machine tokens,
@@ -1221,8 +1265,17 @@ pub async fn execute_txn(
                 results.push(serde_json::Value::Null);
             }
             Step::ExpectVersion { table, id, version } => {
-                schema.table(table)?;
-                do_expect_version(&mut tx, &pg_schema_name, table, id, *version).await?;
+                let table_def = schema.table(table)?;
+                do_expect_version(
+                    &mut tx,
+                    &pg_schema_name,
+                    table_def,
+                    table,
+                    id,
+                    *version,
+                    ctx,
+                )
+                .await?;
                 results.push(serde_json::Value::Null);
             }
             Step::ExpectAbsent { table, index, eq } => {

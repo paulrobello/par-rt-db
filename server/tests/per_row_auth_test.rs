@@ -3971,3 +3971,213 @@ async fn owner_and_authorize_both_gates_must_pass() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+// ExpectVersion must not leak another user's doc version: every probe of an
+// unowned doc returns NotFound (the absent outcome), never Ok or PreconditionFailed.
+#[tokio::test]
+async fn expect_version_does_not_leak_unowned_doc() -> anyhow::Result<()> {
+    let (pool, db, schema) = setup().await;
+    let bob_id = seed_note(&pool, &db, &schema, "bob's note", "bob").await;
+    let alice = PrincipalCtx {
+        user_id: Some("alice".into()),
+        email: None,
+    };
+
+    for probe in [0_i64, 1, 2, 99] {
+        let err = execute_txn(
+            &pool,
+            &db,
+            &schema,
+            &Transaction {
+                steps: vec![Step::ExpectVersion {
+                    table: "notes".into(),
+                    id: bob_id.clone(),
+                    version: probe,
+                }],
+            },
+            &alice,
+        )
+        .await
+        .expect_err("expectVersion on unowned doc must not succeed");
+        assert_eq!(
+            err.code,
+            ErrorCode::NotFound,
+            "probe version {probe} leaked existence/version: {err:?}"
+        );
+    }
+    Ok(())
+}
+
+// Own-doc optimistic concurrency is preserved: NotFound / PreconditionFailed / Ok.
+#[tokio::test]
+async fn expect_version_own_doc_behaves_as_before() -> anyhow::Result<()> {
+    let (pool, db, schema) = setup().await;
+    let id = seed_note(&pool, &db, &schema, "alice's note", "alice").await;
+    let real_version = fetch_doc(&pool, &db, &schema, &id).await.expect("seeded")["_version"]
+        .as_i64()
+        .expect("version");
+    let alice = PrincipalCtx {
+        user_id: Some("alice".into()),
+        email: None,
+    };
+
+    let err = execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::ExpectVersion {
+                table: "notes".into(),
+                id: id.clone(),
+                version: real_version + 1,
+            }],
+        },
+        &alice,
+    )
+    .await
+    .expect_err("wrong version must fail");
+    assert_eq!(err.code, ErrorCode::PreconditionFailed);
+
+    execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::ExpectVersion {
+                table: "notes".into(),
+                id: id.clone(),
+                version: real_version,
+            }],
+        },
+        &alice,
+    )
+    .await
+    .expect("matching version succeeds");
+
+    let err = execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::ExpectVersion {
+                table: "notes".into(),
+                id: "does-not-exist".into(),
+                version: real_version,
+            }],
+        },
+        &alice,
+    )
+    .await
+    .expect_err("absent doc must fail");
+    assert_eq!(err.code, ErrorCode::NotFound);
+    Ok(())
+}
+
+// Bypass caller (machine/admin/scheduled) is unaffected: version compare still runs.
+#[tokio::test]
+async fn expect_version_bypass_is_unaffected() -> anyhow::Result<()> {
+    let (pool, db, schema) = setup().await;
+    let bob_id = seed_note(&pool, &db, &schema, "bob's note", "bob").await;
+    let real_version = fetch_doc(&pool, &db, &schema, &bob_id)
+        .await
+        .expect("seeded")["_version"]
+        .as_i64()
+        .expect("version");
+
+    execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::ExpectVersion {
+                table: "notes".into(),
+                id: bob_id.clone(),
+                version: real_version,
+            }],
+        },
+        &PrincipalCtx::bypass(),
+    )
+    .await
+    .expect("bypass sees the doc");
+
+    let err = execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::ExpectVersion {
+                table: "notes".into(),
+                id: bob_id,
+                version: real_version + 1,
+            }],
+        },
+        &PrincipalCtx::bypass(),
+    )
+    .await
+    .expect_err("wrong version must fail for bypass too");
+    assert_eq!(err.code, ErrorCode::PreconditionFailed);
+    Ok(())
+}
+
+// authorize-only table: a doc the predicate hides from the caller yields NotFound
+// even on the correct version; the owning user sees PreconditionFailed/Ok normally.
+#[tokio::test]
+async fn expect_version_authorize_hides_invisible_doc() -> anyhow::Result<()> {
+    let (pool, db, schema) = setup_authorize().await;
+    // bob's PRIVATE post: predicate = owner==$user OR visibility=="public".
+    // alice (owner!=alice, visibility!=public) cannot see it.
+    let bob_id = seed_post(&pool, &db, &schema, "bob private", "bob", "private").await;
+    let mut q = posts_query();
+    q.get = Some(bob_id.clone());
+    let real_version = match execute_query(&pool, &db, &schema, &q, &PrincipalCtx::bypass())
+        .await
+        .expect("fetch bob's post")
+    {
+        QueryResult::Doc(Some(d)) => d["_version"].as_i64().expect("version"),
+        other => panic!("expected Doc(Some), got {other:?}"),
+    };
+    let alice = PrincipalCtx {
+        user_id: Some("alice".into()),
+        email: None,
+    };
+
+    // alice cannot see bob's private post -> NotFound even on the real version.
+    let err = execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::ExpectVersion {
+                table: "posts".into(),
+                id: bob_id.clone(),
+                version: real_version,
+            }],
+        },
+        &alice,
+    )
+    .await
+    .expect_err("invisible doc must not be probeable");
+    assert_eq!(err.code, ErrorCode::NotFound);
+
+    // bob owns it -> wrong version is PreconditionFailed (predicate lets him see it).
+    let err = execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::ExpectVersion {
+                table: "posts".into(),
+                id: bob_id.clone(),
+                version: real_version + 1,
+            }],
+        },
+        &PrincipalCtx {
+            user_id: Some("bob".into()),
+            email: None,
+        },
+    )
+    .await
+    .expect_err("owner sees a wrong version");
+    assert_eq!(err.code, ErrorCode::PreconditionFailed);
+    Ok(())
+}
