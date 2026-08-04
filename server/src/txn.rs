@@ -1111,8 +1111,11 @@ fn check_owner_doc(
 /// doc is treated as absent rather than rejected with `Forbidden`, because a
 /// `Forbidden` would itself be a louder oracle ("exists, but not yours").
 ///
-/// Keep in lockstep with `check_owner_doc`: any new per-row gate must be added
-/// in both places.
+/// Keep in lockstep with all three txn.rs per-row gate sites: `check_owner`
+/// (the async DB-fetching variant), `check_owner_doc`, and this function. Any
+/// new per-row gate must land in all three. The read-scan path in `query.rs`
+/// inlines the same `owner_field`/`collaborators_field`/`authorize` composition
+/// (no shared helper is extracted today).
 fn doc_visible_to(doc: &serde_json::Value, table_def: &TableDef, ctx: &PrincipalCtx) -> bool {
     let owner_uid = row_auth_enforced_uid(table_def, ctx.user_id.as_deref());
     let authorize = table_def.authorize.as_ref();

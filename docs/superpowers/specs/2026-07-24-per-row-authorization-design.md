@@ -177,13 +177,14 @@ query/txn executors.
    field, nor does it provide field-level or role-based access — those are models B/C,
    out of scope. Mutual **row** isolation between users is the guarantee.
 7. **Side-channel — RESOLVED (2026-08-03):** `ExpectVersion` / `ExpectAbsent`
-   step preconditions are **not** owner-checked, so a user can probe whether
-   another user's doc exists or learn its current version from a precondition
-   outcome (`NotFound` when the doc is absent vs `PreconditionFailed` when the
-   version mismatches vs `Ok` when it matches). This is an existence/version
-   oracle only — no cross-user read or write of doc **bodies**, and the write
-   target itself remains owner-gated (a precondition that succeeds still cannot
-   apply a patch/replace/delete to a doc the caller does not own). Closed per
+   step preconditions **were** not owner-checked, so a user **could** probe
+   whether another user's doc exists or learn its current version from a
+   precondition outcome (`NotFound` when the doc was absent vs
+   `PreconditionFailed` when the version mismatched vs `Ok` when it matched).
+   This was an existence/version oracle only — no cross-user read or write of
+   doc **bodies**, and the write target itself remained owner-gated (a
+   precondition that succeeded still could not apply a patch/replace/delete to
+   a doc the caller did not own). Closed per
    `docs/superpowers/specs/2026-08-03-close-expect-version-absent-side-channel-design.md`:
    both steps now apply the visibility gate; a non-visible doc maps to the
    absent outcome.

@@ -4343,3 +4343,59 @@ async fn expect_absent_collaborators_visibility() -> anyhow::Result<()> {
     assert_eq!(err.code, ErrorCode::PreconditionFailed);
     Ok(())
 }
+
+// authorize-only table: a doc the `authorize` predicate hides from the caller
+// makes ExpectAbsent succeed (Ok); the owning user sees the row as present
+// (PreconditionFailed). Mirrors `expect_absent_collaborators_visibility` but
+// with `setup_authorize()` + `seed_post(...)` — the discriminative test for the
+// closure: carol's case flips from leak (PreconditionFailed) to Ok precisely
+// because `doc_visible_to` applies the `authorize` predicate.
+#[tokio::test]
+async fn expect_absent_authorize_hides_invisible_doc() -> anyhow::Result<()> {
+    let (pool, db, schema) = setup_authorize().await;
+    // bob's PRIVATE post: predicate = owner==$user OR visibility=="public".
+    // carol (owner!="carol" AND visibility!="public") cannot see it; bob can.
+    seed_post(&pool, &db, &schema, "bob private", "bob", "private").await;
+
+    // carol cannot see bob's private post -> the match is invisible -> Ok.
+    execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::ExpectAbsent {
+                table: "posts".into(),
+                index: "by_owner".into(),
+                eq: vec![json!("bob")],
+            }],
+        },
+        &PrincipalCtx {
+            user_id: Some("carol".into()),
+            email: None,
+        },
+    )
+    .await
+    .expect("non-matching user sees bob's key as absent");
+
+    // bob owns it -> predicate matches -> the row is visible -> PreconditionFailed.
+    let err = execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::ExpectAbsent {
+                table: "posts".into(),
+                index: "by_owner".into(),
+                eq: vec![json!("bob")],
+            }],
+        },
+        &PrincipalCtx {
+            user_id: Some("bob".into()),
+            email: None,
+        },
+    )
+    .await
+    .expect_err("owner sees his own row as present");
+    assert_eq!(err.code, ErrorCode::PreconditionFailed);
+    Ok(())
+}
