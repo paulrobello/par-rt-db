@@ -224,7 +224,7 @@ class RtDbAsyncHttpClient:
         per-request kwargs (``json``/``content``/``headers``/``params``).
         """
         resp = await self._client.request(method, path, **kwargs)
-        if resp.status_code >= 400:
+        if not resp.is_success:
             raise RtDbError.from_http(resp.status_code, resp.content)
         return resp
 
