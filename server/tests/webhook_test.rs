@@ -20,7 +20,9 @@ use std::sync::Arc;
 use axum::extract::State;
 use axum::response::IntoResponse;
 use axum::{Json, Router};
-use common::{admin_delete, admin_get, admin_post, fresh_db, spawn_app, test_state_with_webhooks};
+use common::{
+    admin_delete, admin_get, admin_post, admin_put, fresh_db, spawn_app, test_state_with_webhooks,
+};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
@@ -171,6 +173,102 @@ async fn webhook_enqueue_matches_table_and_event_filters() -> anyhow::Result<()>
     Ok(())
 }
 
+// (a.2) Disabled webhooks do not enqueue deliveries; enabled ones on the same
+// db/table/event still do. The `enabled` flag round-trips on create + list.
+#[tokio::test]
+async fn webhook_disabled_does_not_enqueue() -> anyhow::Result<()> {
+    let state = test_state_with_webhooks().await;
+    let pool = state.pool.clone();
+    let addr = spawn_app(state.clone()).await;
+    let name = fresh_db(&state).await;
+
+    // Two webhooks with identical (table, event) filters; one is created
+    // disabled, the other is created enabled (the default when omitted).
+    let disabled_id = create_webhook(
+        addr,
+        &name,
+        json!({
+            "url": "http://example.com/disabled",
+            "table": "projects",
+            "events": ["insert"],
+            "enabled": false
+        }),
+    )
+    .await;
+    let enabled_id = create_webhook(
+        addr,
+        &name,
+        json!({
+            "url": "http://example.com/enabled",
+            "table": "projects",
+            "events": ["insert"]
+        }),
+    )
+    .await;
+
+    // The `enabled` flag round-trips on list.
+    let list_body: Value = admin_get(addr, &format!("/admin/db/{name}/webhooks"))
+        .await
+        .json()
+        .await
+        .expect("parse list");
+    let webhooks = list_body["webhooks"].as_array().expect("webhooks array");
+    let by_id = |id: i64| -> &Value {
+        webhooks
+            .iter()
+            .find(|w| w["id"].as_i64() == Some(id))
+            .unwrap_or_else(|| panic!("webhook {id} missing from list"))
+    };
+    assert_eq!(by_id(disabled_id)["enabled"], json!(false));
+    assert_eq!(by_id(enabled_id)["enabled"], json!(true));
+
+    // Insert one project — fires the enabled webhook only.
+    mutate(
+        addr,
+        &name,
+        json!([{"op": "insert", "table": "projects", "doc": {
+            "name": "alpha", "status": "active", "tags": [], "updatedAt": 0
+        }}]),
+    )
+    .await;
+
+    assert_eq!(
+        delivery_count(&pool, disabled_id).await,
+        0,
+        "disabled webhook enqueues no delivery"
+    );
+    assert_eq!(
+        delivery_count(&pool, enabled_id).await,
+        1,
+        "enabled webhook still enqueues on the same op"
+    );
+
+    // Flipping the disabled webhook back on (directly, since the PUT edit
+    // endpoint lands in Task 2) lets subsequent ops enqueue for it too — this
+    // guards against the regression where the enqueue filter reads the wrong
+    // column or the column defaulted incorrectly.
+    sqlx::query("UPDATE rtdb.webhooks SET enabled = true WHERE id = $1")
+        .bind(disabled_id)
+        .execute(&pool)
+        .await
+        .expect("re-enable webhook");
+    mutate(
+        addr,
+        &name,
+        json!([{"op": "insert", "table": "projects", "doc": {
+            "name": "beta", "status": "active", "tags": [], "updatedAt": 0
+        }}]),
+    )
+    .await;
+    assert_eq!(
+        delivery_count(&pool, disabled_id).await,
+        1,
+        "re-enabled webhook enqueues on a fresh matching op"
+    );
+
+    Ok(())
+}
+
 // (b) Delivery end-to-end: a real axum receiver on an ephemeral port records
 // POSTed bodies; registering it as a webhook, mutating, and calling
 // `webhook::drain_once` proves the worker path delivers exactly one POST whose
@@ -289,6 +387,8 @@ async fn webhook_admin_crud_and_non_admin_forbidden() -> anyhow::Result<()> {
     assert_eq!(webhooks[0]["url"], "http://example.com/hook");
     assert_eq!(webhooks[0]["table"], "projects");
     assert_eq!(webhooks[0]["events"], json!(["*"]));
+    // `enabled` defaults to true when omitted on create and round-trips on list.
+    assert_eq!(webhooks[0]["enabled"], json!(true));
 
     // Delete.
     let resp = admin_delete(addr, &format!("/admin/db/{name}/webhooks/{id}")).await;
@@ -344,6 +444,311 @@ async fn webhook_admin_crud_and_non_admin_forbidden() -> anyhow::Result<()> {
         reqwest::StatusCode::UNAUTHORIZED,
         "missing bearer is unauthorized"
     );
+
+    Ok(())
+}
+
+// (d) PUT edit round-trip: present fields are updated, absent fields are left
+// alone, `table: null` clears the table filter to all-tables, and a PUT on a
+// non-existent id is a 404. Covers both the dynamic-SET path (multiple fields)
+// and the nested `Option<Option<String>>` table semantics.
+async fn list_webhook_by_id(addr: SocketAddr, db: &str, id: i64) -> Value {
+    let body: Value = admin_get(addr, &format!("/admin/db/{db}/webhooks"))
+        .await
+        .json()
+        .await
+        .expect("parse list");
+    body["webhooks"]
+        .as_array()
+        .expect("webhooks array")
+        .iter()
+        .find(|w| w["id"].as_i64() == Some(id))
+        .cloned()
+        .unwrap_or_else(|| panic!("webhook {id} missing from list"))
+}
+
+#[tokio::test]
+async fn webhook_put_edits_fields_and_clears_table() -> anyhow::Result<()> {
+    let state = test_state_with_webhooks().await;
+    let addr = spawn_app(state.clone()).await;
+    let name = fresh_db(&state).await;
+
+    // Start: all-tables, events ["*"], enabled (default).
+    let id = create_webhook(
+        addr,
+        &name,
+        json!({"url": "http://example.com/hook", "events": ["insert"]}),
+    )
+    .await;
+    let before = list_webhook_by_id(addr, &name, id).await;
+    assert_eq!(before["url"], "http://example.com/hook");
+    assert_eq!(before["table"], json!(null), "table omitted → all-tables");
+    assert_eq!(before["events"], json!(["insert"]));
+    assert_eq!(before["enabled"], json!(true));
+
+    // PUT: change url + events + toggle enabled false. table absent → unchanged.
+    let resp = admin_put(
+        addr,
+        &format!("/admin/db/{name}/webhooks/{id}"),
+        json!({
+            "url": "http://example.com/updated",
+            "events": ["insert", "patch"],
+            "enabled": false
+        }),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "edit should succeed"
+    );
+    let updated: Value = resp.json().await.expect("parse edit response");
+    assert_eq!(updated["id"], id);
+    assert_eq!(updated["url"], "http://example.com/updated");
+    assert_eq!(updated["events"], json!(["insert", "patch"]));
+    assert_eq!(updated["enabled"], json!(false));
+    assert_eq!(updated["table"], json!(null), "table absent → unchanged");
+
+    // The list view agrees with the returned row.
+    let listed = list_webhook_by_id(addr, &name, id).await;
+    assert_eq!(listed["url"], updated["url"]);
+    assert_eq!(listed["events"], updated["events"]);
+    assert_eq!(listed["enabled"], updated["enabled"]);
+
+    // PUT: set table to a specific table.
+    let resp = admin_put(
+        addr,
+        &format!("/admin/db/{name}/webhooks/{id}"),
+        json!({"table": "projects"}),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let updated: Value = resp.json().await.expect("parse edit response");
+    assert_eq!(updated["table"], "projects");
+
+    // PUT: `table: null` clears the filter back to all-tables.
+    let resp = admin_put(
+        addr,
+        &format!("/admin/db/{name}/webhooks/{id}"),
+        json!({"table": null}),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let updated: Value = resp.json().await.expect("parse edit response");
+    assert_eq!(updated["table"], json!(null), "table:null → all-tables");
+
+    // PUT with an empty body is a no-op edit that returns the current row
+    // (the helper short-circuits to a SELECT rather than synthesizing empty
+    // SET SQL).
+    let resp = admin_put(addr, &format!("/admin/db/{name}/webhooks/{id}"), json!({})).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let updated: Value = resp.json().await.expect("parse edit response");
+    assert_eq!(updated["id"], id);
+    assert_eq!(updated["url"], "http://example.com/updated");
+
+    // PUT on a non-existent id → 404 (the WHERE id AND db scope matches no row).
+    let resp = admin_put(
+        addr,
+        &format!("/admin/db/{name}/webhooks/999999"),
+        json!({"url": "http://example.com/x"}),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+
+    // PUT with an unknown event name → 400 (validation runs before the update).
+    let resp = admin_put(
+        addr,
+        &format!("/admin/db/{name}/webhooks/{id}"),
+        json!({"events": ["bogus"]}),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    // PUT scoping is per-db: the same id on a different db is a 404, proving
+    // the `WHERE id AND db` clause prevents a cross-db edit.
+    let other = fresh_db(&state).await;
+    let resp = admin_put(
+        addr,
+        &format!("/admin/db/{other}/webhooks/{id}"),
+        json!({"url": "http://example.com/cross"}),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::NOT_FOUND,
+        "webhook id scoped to its db"
+    );
+
+    Ok(())
+}
+
+// (e) GET deliveries: seeded outbox rows are returned newest-first, the
+// `status` filter excludes non-matching rows, and limit/offset page. The row
+// shape is camelCase (`nextAttempt`/`lastError`) with the raw payload passed
+// through. Seeds rows directly to avoid coupling this endpoint test to the
+// enqueue/drain machinery exercised above.
+#[tokio::test]
+async fn webhook_deliveries_filter_sort_and_paginate() -> anyhow::Result<()> {
+    let state = test_state_with_webhooks().await;
+    let pool = state.pool.clone();
+    let addr = spawn_app(state.clone()).await;
+    let name = fresh_db(&state).await;
+
+    let id = create_webhook(
+        addr,
+        &name,
+        json!({"url": "http://example.com/hook", "events": ["*"]}),
+    )
+    .await;
+
+    // Seed three deliveries with distinct statuses and staggered next_attempt
+    // so the ORDER BY (next_attempt DESC, id DESC) is observable. ids ascend
+    // with insertion order; next_attempt ascends so the newest (largest ts)
+    // is first.
+    let payload = json!({"db": name, "docId": "d1", "kind": "insert"});
+    let mut next = 1_700_000_000_000_i64;
+    for (status, attempts, last_err) in [
+        ("pending", 0_i32, None::<&str>),
+        ("retrying", 2, Some("HTTP 503")),
+        ("delivered", 1, None),
+    ] {
+        sqlx::query(
+            "INSERT INTO rtdb.webhook_deliveries \
+             (webhook_id, payload, attempts, next_attempt, status, last_error) \
+             VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind(id)
+        .bind(&payload)
+        .bind(attempts)
+        .bind(next)
+        .bind(status)
+        .bind(last_err)
+        .execute(&pool)
+        .await
+        .expect("seed delivery");
+        next += 5_000;
+    }
+
+    // No filter: all three rows, newest next_attempt first.
+    let body: Value = admin_get(addr, &format!("/admin/db/{name}/webhooks/{id}/deliveries"))
+        .await
+        .json()
+        .await
+        .expect("parse deliveries");
+    let deliveries = body["deliveries"].as_array().expect("deliveries array");
+    assert_eq!(deliveries.len(), 3);
+    // Ordering: descending next_attempt (third-seeded "delivered" has the
+    // largest ts).
+    assert_eq!(deliveries[0]["status"], "delivered");
+    assert_eq!(deliveries[1]["status"], "retrying");
+    assert_eq!(deliveries[2]["status"], "pending");
+    // Row shape: camelCase keys, raw payload passed through.
+    let retrying = &deliveries[1];
+    assert_eq!(retrying["attempts"], 2);
+    assert_eq!(retrying["status"], "retrying");
+    assert!(
+        retrying["nextAttempt"].as_i64().is_some(),
+        "camelCase nextAttempt"
+    );
+    assert_eq!(retrying["lastError"], "HTTP 503");
+    assert_eq!(retrying["payload"]["docId"], "d1", "payload passed through");
+    // No snake_case leakage.
+    assert!(retrying.get("next_attempt").is_none());
+    assert!(retrying.get("last_error").is_none());
+
+    // Status filter: only retrying rows.
+    let body: Value = admin_get(
+        addr,
+        &format!("/admin/db/{name}/webhooks/{id}/deliveries?status=retrying"),
+    )
+    .await
+    .json()
+    .await
+    .expect("parse filtered deliveries");
+    let deliveries = body["deliveries"].as_array().unwrap();
+    assert_eq!(deliveries.len(), 1, "status filter excludes non-matching");
+    assert_eq!(deliveries[0]["status"], "retrying");
+
+    // Status filter matching nothing → empty list (not an error).
+    let body: Value = admin_get(
+        addr,
+        &format!("/admin/db/{name}/webhooks/{id}/deliveries?status=failed"),
+    )
+    .await
+    .json()
+    .await
+    .expect("parse empty deliveries");
+    assert!(
+        body["deliveries"].as_array().unwrap().is_empty(),
+        "no matching status → empty"
+    );
+
+    // Pagination: limit=1 offset=0 → newest one; offset=1 → next; offset=3 →
+    // empty. Proves LIMIT/OFFSET apply after the ORDER BY.
+    let body: Value = admin_get(
+        addr,
+        &format!("/admin/db/{name}/webhooks/{id}/deliveries?limit=1&offset=0"),
+    )
+    .await
+    .json()
+    .await
+    .expect("parse page 1");
+    let page1 = body["deliveries"].as_array().unwrap();
+    assert_eq!(page1.len(), 1);
+    assert_eq!(page1[0]["status"], "delivered");
+
+    let body: Value = admin_get(
+        addr,
+        &format!("/admin/db/{name}/webhooks/{id}/deliveries?limit=1&offset=1"),
+    )
+    .await
+    .json()
+    .await
+    .expect("parse page 2");
+    let page2 = body["deliveries"].as_array().unwrap();
+    assert_eq!(page2.len(), 1);
+    assert_eq!(page2[0]["status"], "retrying");
+
+    let body: Value = admin_get(
+        addr,
+        &format!("/admin/db/{name}/webhooks/{id}/deliveries?limit=1&offset=3"),
+    )
+    .await
+    .json()
+    .await
+    .expect("parse past-end page");
+    assert!(
+        body["deliveries"].as_array().unwrap().is_empty(),
+        "offset past end → empty"
+    );
+
+    // Deliveries are scoped by webhook_id: a different webhook sees none.
+    let other = create_webhook(
+        addr,
+        &name,
+        json!({"url": "http://example.com/other", "events": ["*"]}),
+    )
+    .await;
+    let body: Value = admin_get(
+        addr,
+        &format!("/admin/db/{name}/webhooks/{other}/deliveries"),
+    )
+    .await
+    .json()
+    .await
+    .expect("parse other deliveries");
+    assert!(
+        body["deliveries"].as_array().unwrap().is_empty(),
+        "deliveries scoped by webhook_id"
+    );
+
+    // Non-numeric id → 400.
+    let resp = admin_get(
+        addr,
+        &format!("/admin/db/{name}/webhooks/notanint/deliveries"),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
 
     Ok(())
 }

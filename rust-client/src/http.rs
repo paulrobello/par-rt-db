@@ -1003,6 +1003,102 @@ impl RtDbHttpClient {
             .await
     }
 
+    // ── Webhook management (GET/POST/PUT/DELETE /admin/db/{db}/webhooks[...]) ──
+    //
+    // Mirror `ts-client`'s `listWebhooks`/`createWebhook`/`editWebhook`/
+    // `deleteWebhook`/`listDeliveries` one-to-one — paths, bodies, and return
+    // shapes are identical; only the method names are snake_cased. Each call
+    // carries the admin-key bearer like every other admin method.
+
+    /// `GET /admin/db/{db}/webhooks` → `{webhooks:[...]}`. Returns an empty
+    /// list when webhooks are disabled at boot (the table may not exist).
+    pub async fn list_webhooks(
+        &self,
+        db: &str,
+    ) -> Result<Vec<crate::wire::admin::Webhook>, RtDbError> {
+        let parsed: crate::wire::admin::WebhooksResponse = self
+            .get_json(&format!("/admin/db/{db}/webhooks"), &[])
+            .await?;
+        Ok(parsed.webhooks)
+    }
+
+    /// `POST /admin/db/{db}/webhooks` `{url, table?, events?, enabled?}` →
+    /// `{id}`. Only the provided option keys are sent; the server defaults
+    /// `table` to all-tables, `events` to `["*"]`, and `enabled` to `true` when
+    /// their keys are absent. Returns the new webhook's server-assigned id.
+    pub async fn create_webhook(
+        &self,
+        db: &str,
+        opts: &crate::wire::admin::CreateWebhookOptions,
+    ) -> Result<i64, RtDbError> {
+        let resp = self
+            .post_json(&format!("/admin/db/{db}/webhooks"), opts)
+            .await?;
+        let parsed: crate::wire::admin::CreateWebhookResponse = self.deserialize(resp).await?;
+        Ok(parsed.id)
+    }
+
+    /// `PUT /admin/db/{db}/webhooks/{id}` `{url?, table?, events?, enabled?}` →
+    /// the updated [`Webhook`](crate::wire::admin::Webhook). Each present field
+    /// overwrites the stored value; absent fields are unchanged. The `table`
+    /// field is a tri-state on the wire: omitted (`opts.table = None`) leaves
+    /// the filter alone, JSON `null` (`opts.table = Some(None)`) clears it to
+    /// all-tables, and a string (`opts.table = Some(Some("x"))`) sets it.
+    pub async fn edit_webhook(
+        &self,
+        db: &str,
+        id: i64,
+        opts: &crate::wire::admin::WebhookEditOptions,
+    ) -> Result<crate::wire::admin::Webhook, RtDbError> {
+        let resp = self
+            .put_json(&format!("/admin/db/{db}/webhooks/{id}"), opts)
+            .await?;
+        self.deserialize::<crate::wire::admin::Webhook>(resp).await
+    }
+
+    /// `DELETE /admin/db/{db}/webhooks/{id}` → `{ok:true}`. Cascades the
+    /// webhook's pending deliveries via the foreign key.
+    pub async fn delete_webhook(&self, db: &str, id: i64) -> Result<(), RtDbError> {
+        let resp = self
+            .client
+            .delete(format!("{}/admin/db/{db}/webhooks/{id}", self.url))
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(|e| RtDbError::internal(format!("delete_webhook request failed: {e}")))?;
+        self.expect_ok(resp).await
+    }
+
+    /// `GET /admin/db/{db}/webhooks/{id}/deliveries?status=&limit=&offset=` →
+    /// `{deliveries:[...]}`, newest `next_attempt` first. `opts` may be `None`
+    /// for the server-default first page (limit=50, no status filter, offset=0).
+    pub async fn list_deliveries(
+        &self,
+        db: &str,
+        id: i64,
+        opts: Option<&crate::wire::admin::ListDeliveriesOptions>,
+    ) -> Result<Vec<crate::wire::admin::WebhookDelivery>, RtDbError> {
+        // Borrowed query-string assembly mirrors `ops_recent`: own the strings
+        // on this stack, then hand `get_json` a slice of `(&str, &str)` refs.
+        let status_s = opts.and_then(|o| o.status.clone());
+        let limit_s = opts.and_then(|o| o.limit).map(|n| n.to_string());
+        let offset_s = opts.and_then(|o| o.offset).map(|n| n.to_string());
+        let mut q: Vec<(&str, &str)> = Vec::with_capacity(3);
+        if let Some(ref s) = status_s {
+            q.push(("status", s.as_str()));
+        }
+        if let Some(ref n) = limit_s {
+            q.push(("limit", n.as_str()));
+        }
+        if let Some(ref n) = offset_s {
+            q.push(("offset", n.as_str()));
+        }
+        let parsed: crate::wire::admin::DeliveriesResponse = self
+            .get_json(&format!("/admin/db/{db}/webhooks/{id}/deliveries"), &q)
+            .await?;
+        Ok(parsed.deliveries)
+    }
+
     async fn post_json<Req: Serialize>(
         &self,
         path: &str,
@@ -1010,6 +1106,22 @@ impl RtDbHttpClient {
     ) -> Result<reqwest::Response, RtDbError> {
         self.client
             .post(format!("{}{}", self.url, path))
+            .bearer_auth(&self.token)
+            .json(body)
+            .send()
+            .await
+            .map_err(|e| RtDbError::internal(format!("admin request failed: {e}")))
+    }
+
+    // PUT helper for `edit_webhook` (the one admin method that PUTs rather than
+    // POSTs/PATCHes). Same shape as `post_json`/`patch_json`.
+    async fn put_json<Req: Serialize>(
+        &self,
+        path: &str,
+        body: &Req,
+    ) -> Result<reqwest::Response, RtDbError> {
+        self.client
+            .put(format!("{}{}", self.url, path))
             .bearer_auth(&self.token)
             .json(body)
             .send()
@@ -2784,5 +2896,514 @@ mod admin_tests {
             .unwrap();
         assert_eq!(r.target, "rtdb_restored_20260728T143045Z");
         assert!(r.instructions.starts_with("Restore complete"));
+    }
+
+    // ── Webhook management (mirror ts-client admin.test.ts webhook suite) ─────
+
+    #[tokio::test]
+    async fn list_webhooks_returns_rows() {
+        let (server, client) = setup().await;
+        Mock::given(method("GET"))
+            .and(path("/admin/db/kanban/webhooks"))
+            .and(header("authorization", BEARER))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "webhooks": [
+                    {"id":1,"db":"kanban","table":null,"url":"https://a.example/hook","events":["*"],"createdAt":1000,"enabled":true},
+                    {"id":2,"db":"kanban","table":"notes","url":"https://b.example/hook","events":["insert","patch"],"createdAt":2000,"enabled":false}
+                ]
+            })))
+            .mount(&server)
+            .await;
+        let rows = client.list_webhooks("kanban").await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].id, 1);
+        assert_eq!(rows[0].db, "kanban");
+        assert_eq!(rows[0].table, None);
+        assert_eq!(rows[0].url, "https://a.example/hook");
+        assert_eq!(rows[0].events, vec!["*".to_string()]);
+        assert_eq!(rows[0].created_at, 1000);
+        assert!(rows[0].enabled);
+        assert_eq!(rows[1].table.as_deref(), Some("notes"));
+        assert_eq!(
+            rows[1].events,
+            vec!["insert".to_string(), "patch".to_string()]
+        );
+        assert!(!rows[1].enabled);
+    }
+
+    #[tokio::test]
+    async fn list_webhooks_deserializes_legacy_fixture_omitting_enabled() {
+        // Older server (pre-ENH-003 `enabled` flag) must still parse via
+        // `#[serde(default)]` on Webhook.enabled — defaulting to false.
+        let (server, client) = setup().await;
+        Mock::given(method("GET"))
+            .and(path("/admin/db/kanban/webhooks"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "webhooks": [
+                    {"id":1,"db":"kanban","table":null,"url":"https://a.example/hook","events":["*"],"createdAt":1000}
+                ]
+            })))
+            .mount(&server)
+            .await;
+        let rows = client.list_webhooks("kanban").await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, 1);
+        assert_eq!(rows[0].table, None);
+        assert!(!rows[0].enabled);
+    }
+
+    #[tokio::test]
+    async fn create_webhook_posts_options_and_returns_id() {
+        let (server, client) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/admin/db/kanban/webhooks"))
+            .and(header("authorization", BEARER))
+            .and(body_partial_json(json!({
+                "url": "https://hook.example/cb",
+                "table": "notes",
+                "events": ["insert", "patch"],
+                "enabled": false
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": 7})))
+            .mount(&server)
+            .await;
+        let id = client
+            .create_webhook(
+                "kanban",
+                &crate::wire::admin::CreateWebhookOptions {
+                    url: "https://hook.example/cb".to_string(),
+                    table: Some("notes".to_string()),
+                    events: Some(vec!["insert".to_string(), "patch".to_string()]),
+                    enabled: Some(false),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(id, 7);
+    }
+
+    #[tokio::test]
+    async fn create_webhook_omits_unset_options() {
+        // Backward compat: only `url` is required — an unset `table`/`events`/
+        // `enabled` must each stay off the wire (skip_serializing_if), so the
+        // server applies its defaults (all-tables, ["*"], enabled=true).
+        let (server, client) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/admin/db/kanban/webhooks"))
+            .and(body_partial_json(json!({"url": "https://hook.example/cb"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": 1})))
+            .mount(&server)
+            .await;
+        let id = client
+            .create_webhook(
+                "kanban",
+                &crate::wire::admin::CreateWebhookOptions {
+                    url: "https://hook.example/cb".to_string(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(id, 1);
+        // Assert nothing else leaked onto the wire.
+        let body: Value =
+            serde_json::from_slice(&server.received_requests().await.unwrap()[0].body).unwrap();
+        assert!(body.get("table").is_none(), "table leaked: {body}");
+        assert!(body.get("events").is_none(), "events leaked: {body}");
+        assert!(body.get("enabled").is_none(), "enabled leaked: {body}");
+    }
+
+    #[tokio::test]
+    async fn edit_webhook_puts_options_and_returns_webhook() {
+        let (server, client) = setup().await;
+        Mock::given(method("PUT"))
+            .and(path("/admin/db/kanban/webhooks/3"))
+            .and(header("authorization", BEARER))
+            .and(body_partial_json(json!({
+                "url": "https://new.example/cb",
+                "enabled": false
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id":3,"db":"kanban","table":null,"url":"https://new.example/cb","events":["*"],"createdAt":1000,"enabled":false
+            })))
+            .mount(&server)
+            .await;
+        let updated = client
+            .edit_webhook(
+                "kanban",
+                3,
+                &crate::wire::admin::WebhookEditOptions {
+                    url: Some("https://new.example/cb".to_string()),
+                    enabled: Some(false),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated.id, 3);
+        assert_eq!(updated.url, "https://new.example/cb");
+        assert!(!updated.enabled);
+        // `opts.table = None` → field must be ABSENT from the body (leave alone).
+        let body: Value =
+            serde_json::from_slice(&server.received_requests().await.unwrap()[0].body).unwrap();
+        assert!(
+            body.get("table").is_none(),
+            "edit_webhook must omit table when None: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_webhook_clears_table_with_some_none() {
+        // `opts.table = Some(None)` → serialized as JSON `null` → server clears
+        // to all-tables. The body must contain `"table": null` (NOT omit it).
+        let (server, client) = setup().await;
+        Mock::given(method("PUT"))
+            .and(path("/admin/db/kanban/webhooks/3"))
+            .and(body_partial_json(json!({"table": null})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id":3,"db":"kanban","table":null,"url":"https://x/cb","events":["*"],"createdAt":1,"enabled":true
+            })))
+            .mount(&server)
+            .await;
+        client
+            .edit_webhook(
+                "kanban",
+                3,
+                &crate::wire::admin::WebhookEditOptions {
+                    table: Some(None),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn edit_webhook_sets_table_with_some_some() {
+        // `opts.table = Some(Some("notes"))` → serialized as `"notes"` → server
+        // sets the filter.
+        let (server, client) = setup().await;
+        Mock::given(method("PUT"))
+            .and(path("/admin/db/kanban/webhooks/3"))
+            .and(body_partial_json(json!({"table": "notes"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id":3,"db":"kanban","table":"notes","url":"https://x/cb","events":["*"],"createdAt":1,"enabled":true
+            })))
+            .mount(&server)
+            .await;
+        client
+            .edit_webhook(
+                "kanban",
+                3,
+                &crate::wire::admin::WebhookEditOptions {
+                    table: Some(Some("notes".to_string())),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn delete_webhook_deletes_and_returns_ok() {
+        let (server, client) = setup().await;
+        Mock::given(method("DELETE"))
+            .and(path("/admin/db/kanban/webhooks/4"))
+            .and(header("authorization", BEARER))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+            .mount(&server)
+            .await;
+        client.delete_webhook("kanban", 4).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn delete_webhook_surfaces_not_found_envelope() {
+        let (server, client) = setup().await;
+        Mock::given(method("DELETE"))
+            .and(path("/admin/db/kanban/webhooks/99"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+                "code": "NOT_FOUND",
+                "message": "webhook not found for this database"
+            })))
+            .mount(&server)
+            .await;
+        let err = client.delete_webhook("kanban", 99).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::NotFound);
+    }
+
+    #[tokio::test]
+    async fn list_deliveries_returns_rows_with_query_params() {
+        let (server, client) = setup().await;
+        Mock::given(method("GET"))
+            .and(path("/admin/db/kanban/webhooks/3/deliveries"))
+            .and(query_param("status", "retrying"))
+            .and(query_param("limit", "10"))
+            .and(query_param("offset", "20"))
+            .and(header("authorization", BEARER))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "deliveries": [
+                    {"id":1,"attempts":2,"status":"retrying","nextAttempt":5000,"lastError":"boom","payload":{"db":"kanban","table":"notes","docId":"n1","kind":"insert","ts":1000,"owner":null,"source":"mutate"}},
+                    {"id":2,"attempts":0,"status":"retrying","nextAttempt":6000,"lastError":null,"payload":{"db":"kanban","table":"notes","docId":"n2","kind":"patch","ts":2000,"owner":"u1","source":"scheduled"}}
+                ]
+            })))
+            .mount(&server)
+            .await;
+        let rows = client
+            .list_deliveries(
+                "kanban",
+                3,
+                Some(&crate::wire::admin::ListDeliveriesOptions {
+                    status: Some("retrying".to_string()),
+                    limit: Some(10),
+                    offset: Some(20),
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].id, 1);
+        assert_eq!(rows[0].attempts, 2);
+        assert_eq!(rows[0].status, "retrying");
+        assert_eq!(rows[0].next_attempt, 5000);
+        assert_eq!(rows[0].last_error.as_deref(), Some("boom"));
+        assert_eq!(
+            rows[0].payload.get("docId").and_then(Value::as_str),
+            Some("n1")
+        );
+        assert_eq!(rows[1].last_error, None);
+        assert_eq!(
+            rows[1].payload.get("owner").and_then(Value::as_str),
+            Some("u1")
+        );
+    }
+
+    #[tokio::test]
+    async fn list_deliveries_none_opts_sends_no_query_params() {
+        // `opts = None` ⇒ first page, no filter — no `status`/`limit`/`offset`
+        // query params may appear on the wire.
+        let (server, client) = setup().await;
+        Mock::given(method("GET"))
+            .and(path("/admin/db/kanban/webhooks/3/deliveries"))
+            .and(header("authorization", BEARER))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"deliveries": []})))
+            .mount(&server)
+            .await;
+        let rows = client.list_deliveries("kanban", 3, None).await.unwrap();
+        assert!(rows.is_empty());
+        let reqs = server.received_requests().await.unwrap();
+        assert_eq!(reqs.len(), 1);
+        assert!(
+            reqs[0].url.query().is_none(),
+            "query leaked: {}",
+            reqs[0].url
+        );
+    }
+
+    /// Wire-shape parity for `Webhook`: every field camelCase on the wire,
+    /// `null` table deserializes to `None`, and a missing `enabled`/`table`
+    /// (legacy fixture) still parses via `#[serde(default)]`.
+    #[test]
+    fn webhook_deserializes_wire_shapes() {
+        use crate::wire::admin::Webhook;
+
+        let full: Webhook = serde_json::from_value(json!({
+            "id": 1,
+            "db": "kanban",
+            "table": null,
+            "url": "https://a.example/hook",
+            "events": ["*"],
+            "createdAt": 1000,
+            "enabled": true
+        }))
+        .unwrap();
+        assert_eq!(full.id, 1);
+        assert_eq!(full.table, None);
+        assert!(full.enabled);
+
+        let scoped: Webhook = serde_json::from_value(json!({
+            "id": 2,
+            "db": "kanban",
+            "table": "notes",
+            "url": "https://b.example/hook",
+            "events": ["insert", "patch"],
+            "createdAt": 2000,
+            "enabled": false
+        }))
+        .unwrap();
+        assert_eq!(scoped.table.as_deref(), Some("notes"));
+        assert_eq!(
+            scoped.events,
+            vec!["insert".to_string(), "patch".to_string()]
+        );
+        assert!(!scoped.enabled);
+
+        // Legacy server omitting `enabled` (and, defensively, `table`) must
+        // still deserialize. `enabled` defaults to false; `table` to None.
+        let legacy: Webhook = serde_json::from_value(json!({
+            "id": 3,
+            "db": "kanban",
+            "url": "https://c.example/hook",
+            "events": ["*"],
+            "createdAt": 3000
+        }))
+        .unwrap();
+        assert_eq!(legacy.table, None);
+        assert!(!legacy.enabled);
+    }
+
+    /// Wire-shape parity for `WebhookDelivery`: camelCase keys, optional
+    /// `lastError` (`null` and absent both deserialize to `None`), and `payload`
+    /// is the verbatim JSON body the worker will/did POST.
+    #[test]
+    fn webhook_delivery_deserializes_wire_shapes() {
+        use crate::wire::admin::WebhookDelivery;
+
+        let with_err: WebhookDelivery = serde_json::from_value(json!({
+            "id": 1,
+            "attempts": 2,
+            "status": "retrying",
+            "nextAttempt": 5000,
+            "lastError": "connection refused",
+            "payload": {"db":"kanban","table":"notes","docId":"n1","kind":"insert","ts":1000,"owner":null,"source":"mutate"}
+        }))
+        .unwrap();
+        assert_eq!(with_err.attempts, 2);
+        assert_eq!(with_err.next_attempt, 5000);
+        assert_eq!(with_err.last_error.as_deref(), Some("connection refused"));
+        assert_eq!(
+            with_err.payload.get("kind").and_then(Value::as_str),
+            Some("insert")
+        );
+
+        // No error yet (queued, not yet attempted): `null` lastError.
+        let no_err: WebhookDelivery = serde_json::from_value(json!({
+            "id": 2,
+            "attempts": 0,
+            "status": "pending",
+            "nextAttempt": 1000,
+            "lastError": null,
+            "payload": {"db":"kanban","table":"notes","docId":"n2","kind":"patch","ts":2000,"owner":"u1","source":"scheduled"}
+        }))
+        .unwrap();
+        assert_eq!(no_err.last_error, None);
+        assert_eq!(
+            no_err.payload.get("source").and_then(Value::as_str),
+            Some("scheduled")
+        );
+
+        // Defensive legacy: a server omitting `lastError` entirely must still
+        // parse (defaults to None via Option's implicit default).
+        let missing_err: WebhookDelivery = serde_json::from_value(json!({
+            "id": 3,
+            "attempts": 0,
+            "status": "pending",
+            "nextAttempt": 1000,
+            "payload": {}
+        }))
+        .unwrap();
+        assert_eq!(missing_err.last_error, None);
+    }
+
+    /// The load-bearing tri-state on `WebhookEditOptions.table`. Outer `None`
+    /// omits the field entirely (leave alone); `Some(None)` emits JSON `null`
+    /// (clear to all-tables); `Some(Some("x"))` emits `"x"` (set). The other
+    /// fields follow the standard `Option::is_none` skip pattern. Mirrors
+    /// `mint_token_request_serializes_wire_shape`'s body-shape assertion.
+    #[test]
+    fn webhook_edit_options_table_tri_state() {
+        use crate::wire::admin::WebhookEditOptions;
+
+        // 1) Every field None → empty body (nothing on the wire → server
+        //    changes nothing).
+        let all_none = WebhookEditOptions::default();
+        assert_eq!(serde_json::to_value(&all_none).unwrap(), json!({}),);
+
+        // 2) `table = None` (outer) → field ABSENT from body, even though the
+        //    inner is also None. This is the "leave the filter alone" path.
+        let table_omitted = WebhookEditOptions {
+            enabled: Some(false),
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_value(&table_omitted).unwrap(),
+            json!({"enabled": false}),
+        );
+
+        // 3) `table = Some(None)` → serialized as JSON `null` → server clears
+        //    to all-tables. This is the case that distinguishes the double
+        //    Option from a flat Option.
+        let table_cleared = WebhookEditOptions {
+            table: Some(None),
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_value(&table_cleared).unwrap(),
+            json!({"table": null}),
+        );
+
+        // 4) `table = Some(Some("notes"))` → serialized as the string → server
+        //    sets the filter.
+        let table_set = WebhookEditOptions {
+            table: Some(Some("notes".to_string())),
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_value(&table_set).unwrap(),
+            json!({"table": "notes"}),
+        );
+
+        // 5) Full body: every field set exercises the camelCase wire names.
+        let events = vec!["insert".to_string(), "patch".to_string()];
+        let full = WebhookEditOptions {
+            url: Some("https://new.example/cb".to_string()),
+            table: Some(Some("notes".to_string())),
+            events: Some(events.clone()),
+            enabled: Some(false),
+        };
+        assert_eq!(
+            serde_json::to_value(&full).unwrap(),
+            json!({
+                "url": "https://new.example/cb",
+                "table": "notes",
+                "events": ["insert", "patch"],
+                "enabled": false
+            }),
+        );
+    }
+
+    /// Wire-shape parity for `CreateWebhookOptions`: camelCase keys, and `None`
+    /// fields are omitted entirely so server defaults apply (the same contract
+    /// as `MintTokenOptions`).
+    #[test]
+    fn create_webhook_options_serializes_wire_shape() {
+        use crate::wire::admin::CreateWebhookOptions;
+
+        // Bare minimum: only `url` is required → body is exactly `{url}`.
+        let bare = CreateWebhookOptions {
+            url: "https://hook.example/cb".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_value(&bare).unwrap(),
+            json!({"url": "https://hook.example/cb"}),
+        );
+
+        // Fully-specified → camelCase keys for every option.
+        let events = vec!["insert".to_string(), "patch".to_string()];
+        let full = CreateWebhookOptions {
+            url: "https://hook.example/cb".to_string(),
+            table: Some("notes".to_string()),
+            events: Some(events.clone()),
+            enabled: Some(false),
+        };
+        assert_eq!(
+            serde_json::to_value(&full).unwrap(),
+            json!({
+                "url": "https://hook.example/cb",
+                "table": "notes",
+                "events": ["insert", "patch"],
+                "enabled": false
+            }),
+        );
     }
 }

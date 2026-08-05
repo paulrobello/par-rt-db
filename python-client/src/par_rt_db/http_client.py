@@ -260,6 +260,44 @@ class MigrateResult(_Wire):
     directives: list[DirectiveReport]
 
 
+class Webhook(_Wire):
+    """``GET /admin/db/{db}/webhooks`` row — one registered webhook.
+
+    Mirrors ``server::webhook::Webhook``. ``table`` is ``None`` for an
+    all-tables webhook (the server's ``tbl = None``); ``events`` is the
+    matched op-name list (``["*"]`` for all events). ``created_at`` is
+    epoch-millis.
+    """
+
+    id: int
+    db: str
+    table: str | None = None
+    url: str
+    events: list[str]
+    created_at: int
+    enabled: bool
+
+
+class WebhookDelivery(_Wire):
+    """``GET /admin/db/{db}/webhooks/{id}/deliveries`` row — one delivery from
+    the outbox.
+
+    Mirrors ``server::webhook::DeliveryRow``. ``status`` is ``pending`` /
+    ``retrying`` / ``delivered`` / ``failed``. ``next_attempt`` is epoch-millis
+    (the due time of the next retry, monotonic under backoff). ``last_error``
+    is ``None`` once a delivery succeeds (or before any attempt). ``payload`` is
+    the opaque queued JSONB body — passed through verbatim so callers can
+    inspect the exact event the worker will/did POST.
+    """
+
+    id: int
+    attempts: int
+    status: str
+    next_attempt: int
+    last_error: str | None = None
+    payload: Any
+
+
 # ``StepResult`` is a ``Union`` alias (no ``model_validate``); route through a
 # single ``TypeAdapter`` for the untagged per-step result, mirroring mutation.py.
 _STEP_RESULT_ADAPTER = TypeAdapter(StepResult)

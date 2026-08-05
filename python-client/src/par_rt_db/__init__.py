@@ -36,7 +36,14 @@ from .schema import SchemaDef, TableDef, t
 from .wire import FilterExpr
 
 if TYPE_CHECKING:
-    from .admin import AsyncRtDbAdminClient, MintedToken, RtDbAdminClient, TokenInfo
+    from .admin import (
+        AsyncRtDbAdminClient,
+        MintedToken,
+        RtDbAdminClient,
+        TokenInfo,
+        Webhook,
+        WebhookDelivery,
+    )
     from .aio_http_client import RtDbAsyncHttpClient
     from .http_client import RtDbHttpClient
     from .ws_client import RtDbClient, Subscription
@@ -66,6 +73,8 @@ __all__ = [
     "AsyncRtDbAdminClient",
     "MintedToken",
     "TokenInfo",
+    "Webhook",
+    "WebhookDelivery",
 ]
 
 
@@ -87,7 +96,14 @@ def __getattr__(name: str) -> Any:
         from . import ws_client
 
         return getattr(ws_client, name)
-    if name in ("RtDbAdminClient", "AsyncRtDbAdminClient", "MintedToken", "TokenInfo"):
+    if name in (
+        "RtDbAdminClient",
+        "AsyncRtDbAdminClient",
+        "MintedToken",
+        "TokenInfo",
+        "Webhook",
+        "WebhookDelivery",
+    ):
         from . import admin
 
         return getattr(admin, name)

@@ -208,6 +208,19 @@ pub async fn admin_delete(addr: SocketAddr, path: &str) -> reqwest::Response {
         .expect("send admin request")
 }
 
+/// A PUT helper, mirroring `admin_post`/`admin_delete`. Used by webhook edit
+/// tests.
+#[allow(dead_code)]
+pub async fn admin_put(addr: SocketAddr, path: &str, body: serde_json::Value) -> reqwest::Response {
+    reqwest::Client::new()
+        .put(format!("http://{addr}{path}"))
+        .header("Authorization", "Bearer test-admin-key")
+        .json(&body)
+        .send()
+        .await
+        .expect("send admin request")
+}
+
 #[allow(dead_code)]
 pub async fn spawn_app(state: Arc<AppState>) -> SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")

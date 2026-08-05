@@ -79,9 +79,10 @@ pub use ws::{ClientStatus, Config, ConnectionState, RtDbClient, Snapshot, Subscr
 
 #[cfg(feature = "admin")]
 pub use wire::admin::{
-    AdminMember, Cast, CastFailure, ConfigResponse, DbStats, Directive, DirectiveReport, HotConfig,
-    HotConfigPatch, LatencyStats, MetricsSnapshot, MigrateRequest, MigrateRequestOwned,
-    MigrateResult, MintTokenOptions, MintedToken, OpEvent, SampleChange, TableStat, TokenInfo,
+    AdminMember, Cast, CastFailure, ConfigResponse, CreateWebhookOptions, DbStats, Directive,
+    DirectiveReport, HotConfig, HotConfigPatch, LatencyStats, ListDeliveriesOptions,
+    MigrateRequest, MigrateRequestOwned, MigrateResult, MintTokenOptions, MintedToken, OpEvent,
+    SampleChange, TableStat, TokenInfo, Webhook, WebhookDelivery, WebhookEditOptions,
 };
 
 #[cfg(feature = "admin")]

@@ -148,10 +148,77 @@ export interface RestoreResult {
   instructions: string;
 }
 
+/** One registered webhook. `table: null` means "all tables"; `events` carries op
+ *  names (`insert`/`patch`/`replace`/`delete`/`upsert`) or the single element
+ *  `["*"]` to match every event. */
+export interface Webhook {
+  id: number;
+  db: string;
+  table: string | null;
+  url: string;
+  events: string[];
+  createdAt: number;
+  enabled: boolean;
+}
+
+/** One delivery row from a webhook's outbox (`GET .../webhooks/{id}/deliveries`).
+ *  `payload` is the raw JSON body the worker POSTed (or will POST) — typed
+ *  `unknown` because the server passes it through verbatim. */
+export interface WebhookDelivery {
+  id: number;
+  attempts: number;
+  status: string;
+  nextAttempt: number;
+  lastError: string | null;
+  payload: unknown;
+}
+
+/** Options for `createWebhook`. `url` is required; the rest fall back to server
+ *  defaults (all tables, `["*"]` events, enabled). */
+export interface CreateWebhookOptions {
+  url: string;
+  table?: string | null;
+  events?: string[];
+  enabled?: boolean;
+}
+
+/** Options for `editWebhook`. Every field is optional: omitted = unchanged.
+ *  `table` is a tri-state — omit to leave the filter alone, `null` to clear it
+ *  to all-tables, or a string to set it. */
+export interface EditWebhookOptions {
+  url?: string;
+  table?: string | null;
+  events?: string[];
+  enabled?: boolean;
+}
+
+/** Options for `listDeliveries`. All optional; omitted filters/limits mean: no
+ *  status filter, server default limit, offset 0. */
+export interface ListDeliveriesOptions {
+  status?: string;
+  limit?: number;
+  offset?: number;
+}
+
 function toSchemaJson(schema: SchemaDefinition<any> | SchemaJson): SchemaJson {
   return "toJSON" in schema && typeof schema.toJSON === "function"
     ? schema.toJSON()
     : (schema as SchemaJson);
+}
+
+/** Build a request body from only the keys present on `opts` whose value is not
+ *  `undefined`. Used by webhook create/edit so omitted fields are absent on the
+ *  wire (server default applies) while an explicit `null` (e.g. clearing a
+ *  webhook's `table`) is preserved as JSON `null`. */
+function pickDefined<T extends object>(opts: T): Partial<T> {
+  const out: { [K in keyof T]: T[K] } = {} as Partial<T> as { [K in keyof T]: T[K] };
+  for (const key of Object.keys(opts) as (keyof T)[]) {
+    const v = opts[key];
+    if (v !== undefined) {
+      out[key] = v;
+    }
+  }
+  return out;
 }
 
 /** Parse one `/admin/stream` text frame into a typed `AdminStreamFrame`, or `null`
@@ -416,6 +483,66 @@ export class RtDbAdminClient {
     })) as RestoreResult;
   }
 
+  /** List webhooks registered for `db` (GET /admin/db/{db}/webhooks). Returns an
+   *  empty array when webhooks are disabled at boot — the table may not exist. */
+  async listWebhooks(db: string): Promise<Webhook[]> {
+    const body = await this.request("GET", `/admin/db/${encodeURIComponent(db)}/webhooks`);
+    return (body as { webhooks: Webhook[] }).webhooks;
+  }
+
+  /** Register a webhook for `db` (POST /admin/db/{db}/webhooks). Only the provided
+   *  option keys are sent; the server defaults `table` to all-tables, `events` to
+   *  `["*"]`, and `enabled` to true when their keys are absent. Returns the new id. */
+  async createWebhook(db: string, opts: CreateWebhookOptions): Promise<{ id: number }> {
+    const body = await this.request(
+      "POST",
+      `/admin/db/${encodeURIComponent(db)}/webhooks`,
+      pickDefined(opts),
+    );
+    return body as { id: number };
+  }
+
+  /** Partial-edit a webhook (PUT /admin/db/{db}/webhooks/{id}). Each present field
+   *  overwrites the stored value; absent fields are unchanged. The `table` field
+   *  is a tri-state on the wire: omitted leaves the filter alone, JSON `null`
+   *  clears it to all-tables, a string sets it. Returns the updated webhook. */
+  async editWebhook(db: string, id: number, opts: EditWebhookOptions): Promise<Webhook> {
+    const body = await this.request(
+      "PUT",
+      `/admin/db/${encodeURIComponent(db)}/webhooks/${encodeURIComponent(id)}`,
+      pickDefined(opts),
+    );
+    return body as Webhook;
+  }
+
+  /** Delete a webhook and cascade its pending deliveries (DELETE /admin/db/{db}/webhooks/{id}). */
+  async deleteWebhook(db: string, id: number): Promise<void> {
+    await this.request(
+      "DELETE",
+      `/admin/db/${encodeURIComponent(db)}/webhooks/${encodeURIComponent(id)}`,
+    );
+  }
+
+  /** List a webhook's delivery outbox newest-first
+   *  (GET /admin/db/{db}/webhooks/{id}/deliveries?status=&limit=&offset=). `status`
+   *  filters by `pending|retrying|delivered|failed`; `limit`/`offset` page. */
+  async listDeliveries(
+    db: string,
+    id: number,
+    opts: ListDeliveriesOptions = {},
+  ): Promise<WebhookDelivery[]> {
+    const params = new URLSearchParams();
+    if (opts.status) params.set("status", opts.status);
+    if (opts.limit !== undefined) params.set("limit", String(opts.limit));
+    if (opts.offset !== undefined) params.set("offset", String(opts.offset));
+    const qs = params.toString();
+    const body = await this.request(
+      "GET",
+      `/admin/db/${encodeURIComponent(db)}/webhooks/${encodeURIComponent(id)}/deliveries${qs ? `?${qs}` : ""}`,
+    );
+    return (body as { deliveries: WebhookDelivery[] }).deliveries;
+  }
+
   /** Open the realtime op-feed over the `/admin/stream` WebSocket and yield frames
    *  as they arrive: document op events (a 200-row replay, then live) interleaved
    *  with ~1s server metrics snapshots. `db`/`table` filter both the replay and the
@@ -504,7 +631,7 @@ export class RtDbAdminClient {
   }
 
   private async request(
-    method: "GET" | "POST" | "PATCH" | "DELETE",
+    method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE",
     path: string,
     payload?: unknown,
   ): Promise<unknown> {

@@ -32,6 +32,8 @@ from par_rt_db.admin import (
     OpEvent,
     RtDbAdminClient,
     TokenInfo,
+    Webhook,
+    WebhookDelivery,
 )
 from par_rt_db.errors import ErrorCode, RtDbError
 from par_rt_db.schema import Schema
@@ -710,3 +712,415 @@ async def test_async_backup_now_posts_empty_body() -> None:
         await c.backup_now()
     assert captured["path"] == "/admin/backup"
     assert captured["body"] == {}
+
+
+# --- webhook surface (ENH-003) -------------------------------------------
+#
+# ``MockTransport`` tests mirroring ``ts-client``'s admin.test.ts webhook
+# suite. Asserts method/path/body for each of the five methods, especially
+# the ``edit_webhook`` ``table`` tri-state (omit / null / string), and the
+# ``list_deliveries`` query-string build. Parses both ``Webhook`` rows
+# (``table:null`` and ``table:"x"``) and ``WebhookDelivery`` fixture rows
+# (including ``lastError:null`` and opaque ``payload``).
+
+
+_WEBHOOK_ROW_ALL_TABLES = {
+    "id": 7,
+    "db": "kanban",
+    "table": None,
+    "url": "https://hooks.example/all",
+    "events": ["*"],
+    "createdAt": 1700000000000,
+    "enabled": True,
+}
+_WEBHOOK_ROW_TABLED = {
+    "id": 11,
+    "db": "kanban",
+    "table": "items",
+    "url": "https://hooks.example/items",
+    "events": ["insert", "patch"],
+    "createdAt": 1700000000001,
+    "enabled": False,
+}
+_DELIVERY_ROW_OK = {
+    "id": 201,
+    "attempts": 1,
+    "status": "delivered",
+    "nextAttempt": 1700000005000,
+    "lastError": None,
+    "payload": {
+        "db": "kanban",
+        "table": "items",
+        "docId": "i1",
+        "kind": "insert",
+        "ts": 1700000004000,
+        "owner": "u@e.com",
+    },
+}
+_DELIVERY_ROW_FAILED = {
+    "id": 202,
+    "attempts": 5,
+    "status": "failed",
+    "nextAttempt": 1700000010000,
+    "lastError": "HTTP 503",
+    "payload": {"arbitrary": ["nested", {"obj": True}]},
+}
+
+
+def test_webhook_model_validate_table_null_means_all_tables() -> None:
+    wh = Webhook.model_validate(_WEBHOOK_ROW_ALL_TABLES)
+    assert isinstance(wh, Webhook)
+    assert wh.id == 7
+    assert wh.table is None  # all-tables
+    assert wh.events == ["*"]
+    assert wh.enabled is True
+    assert wh.created_at == 1700000000000
+
+
+def test_webhook_model_validate_table_string_is_tabled() -> None:
+    wh = Webhook.model_validate(_WEBHOOK_ROW_TABLED)
+    assert wh.table == "items"
+    assert wh.events == ["insert", "patch"]
+    assert wh.enabled is False
+
+
+def test_webhook_delivery_model_validate_last_error_null() -> None:
+    d = WebhookDelivery.model_validate(_DELIVERY_ROW_OK)
+    assert isinstance(d, WebhookDelivery)
+    assert d.id == 201
+    assert d.attempts == 1
+    assert d.status == "delivered"
+    assert d.last_error is None
+    assert d.payload["docId"] == "i1"  # type: ignore[index]
+
+
+def test_webhook_delivery_model_validate_failed_with_error_and_opaque_payload() -> None:
+    d = WebhookDelivery.model_validate(_DELIVERY_ROW_FAILED)
+    assert d.status == "failed"
+    assert d.attempts == 5
+    assert d.last_error == "HTTP 503"
+    assert d.payload == {"arbitrary": ["nested", {"obj": True}]}
+
+
+def test_list_webhooks_parses_mixed_rows() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["method"] = request.method
+        captured["path"] = request.url.path
+        return httpx.Response(
+            200,
+            json={"webhooks": [_WEBHOOK_ROW_ALL_TABLES, _WEBHOOK_ROW_TABLED]},
+        )
+
+    with _sync_client(handler) as c:
+        rows = c.list_webhooks("kanban")
+    assert captured["method"] == "GET"
+    assert captured["path"] == "/admin/db/kanban/webhooks"
+    assert len(rows) == 2
+    assert all(isinstance(r, Webhook) for r in rows)
+    assert rows[0].table is None
+    assert rows[1].table == "items"
+    assert rows[1].enabled is False
+
+
+def test_list_webhooks_empty_when_disabled_or_none() -> None:
+    with _sync_client(
+        _handler_map(
+            {("GET", "/admin/db/kanban/webhooks", ""): httpx.Response(200, json={"webhooks": []})}
+        )
+    ) as c:
+        rows = c.list_webhooks("kanban")
+    assert rows == []
+
+
+def test_create_webhook_posts_only_url_when_no_optionals() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["method"] = request.method
+        captured["path"] = request.url.path
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"id": 42})
+
+    with _sync_client(handler) as c:
+        new_id = c.create_webhook("kanban", url="https://hooks.example/x")
+    assert new_id == 42
+    assert captured["method"] == "POST"
+    assert captured["path"] == "/admin/db/kanban/webhooks"
+    assert captured["body"] == {"url": "https://hooks.example/x"}
+    assert "table" not in captured["body"]
+    assert "events" not in captured["body"]
+    assert "enabled" not in captured["body"]
+
+
+def test_create_webhook_posts_table_events_enabled_when_set() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"id": 99})
+
+    with _sync_client(handler) as c:
+        new_id = c.create_webhook(
+            "kanban",
+            url="https://hooks.example/y",
+            table="items",
+            events=["insert", "patch"],
+            enabled=False,
+        )
+    assert new_id == 99
+    assert captured["body"] == {
+        "url": "https://hooks.example/y",
+        "table": "items",
+        "events": ["insert", "patch"],
+        "enabled": False,
+    }
+
+
+def test_edit_webhook_omits_table_when_not_passed() -> None:
+    """``table`` not passed → omit from body → server leaves it unchanged."""
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["method"] = request.method
+        captured["path"] = request.url.path
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json=_WEBHOOK_ROW_TABLED)
+
+    with _sync_client(handler) as c:
+        wh = c.edit_webhook("kanban", 11, enabled=False)
+    assert captured["method"] == "PUT"
+    assert captured["path"] == "/admin/db/kanban/webhooks/11"
+    assert captured["body"] == {"enabled": False}
+    assert "table" not in captured["body"]
+    assert isinstance(wh, Webhook)
+
+
+def test_edit_webhook_sends_table_null_to_clear() -> None:
+    """``table=None`` → JSON ``null`` → server clears to all-tables."""
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json=_WEBHOOK_ROW_ALL_TABLES)
+
+    with _sync_client(handler) as c:
+        wh = c.edit_webhook("kanban", 11, table=None)
+    assert captured["body"] == {"table": None}
+    assert isinstance(wh, Webhook)
+    assert wh.table is None
+
+
+def test_edit_webhook_sends_table_string_to_set() -> None:
+    """``table="items"`` → JSON ``"items"`` → set to that table."""
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json=_WEBHOOK_ROW_TABLED)
+
+    with _sync_client(handler) as c:
+        wh = c.edit_webhook("kanban", 11, table="items")
+    assert captured["body"] == {"table": "items"}
+    assert wh.table == "items"
+
+
+def test_edit_webhook_sends_multiple_fields_together() -> None:
+    """Multiple kwargs at once compose into one body."""
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json=_WEBHOOK_ROW_TABLED)
+
+    with _sync_client(handler) as c:
+        c.edit_webhook(
+            "kanban",
+            11,
+            url="https://hooks.example/z",
+            table=None,
+            events=["delete"],
+            enabled=True,
+        )
+    assert captured["body"] == {
+        "url": "https://hooks.example/z",
+        "table": None,
+        "events": ["delete"],
+        "enabled": True,
+    }
+
+
+def test_delete_webhook_returns_none_on_ok() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["method"] = request.method
+        captured["path"] = request.url.path
+        return httpx.Response(200, json={"ok": True})
+
+    with _sync_client(handler) as c:
+        result = c.delete_webhook("kanban", 11)
+    assert result is None
+    assert captured["method"] == "DELETE"
+    assert captured["path"] == "/admin/db/kanban/webhooks/11"
+
+
+def test_delete_webhook_raises_on_ok_false() -> None:
+    """Missing webhook id → server returns ``ok:false`` (404 body) → raise."""
+    with (
+        _sync_client(
+            _handler_map(
+                {
+                    ("DELETE", "/admin/db/kanban/webhooks/999", ""): httpx.Response(
+                        404, json={"code": "NOT_FOUND", "message": "no such webhook"}
+                    )
+                }
+            )
+        ) as c,
+        pytest.raises(RtDbError),
+    ):
+        c.delete_webhook("kanban", 999)
+
+
+def test_list_deliveries_builds_query_params_when_all_set() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["path"] = request.url.path
+        captured["params"] = dict(request.url.params)
+        return httpx.Response(200, json={"deliveries": [_DELIVERY_ROW_OK, _DELIVERY_ROW_FAILED]})
+
+    with _sync_client(handler) as c:
+        rows = c.list_deliveries("kanban", 11, status="retrying", limit=50, offset=10)
+    assert captured["path"] == "/admin/db/kanban/webhooks/11/deliveries"
+    assert captured["params"] == {"status": "retrying", "limit": "50", "offset": "10"}
+    assert len(rows) == 2
+    assert all(isinstance(r, WebhookDelivery) for r in rows)
+    assert rows[0].last_error is None
+    assert rows[1].status == "failed"
+    assert rows[1].last_error == "HTTP 503"
+
+
+def test_list_deliveries_omits_unset_query_params() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["params"] = dict(request.url.params)
+        return httpx.Response(200, json={"deliveries": []})
+
+    with _sync_client(handler) as c:
+        rows = c.list_deliveries("kanban", 11)
+    assert rows == []
+    assert captured["params"] == {}
+
+
+def test_list_deliveries_parses_fixture_with_opaque_payload() -> None:
+    with _sync_client(
+        _handler_map(
+            {
+                ("GET", "/admin/db/kanban/webhooks/11/deliveries", ""): httpx.Response(
+                    200, json={"deliveries": [_DELIVERY_ROW_FAILED]}
+                )
+            }
+        )
+    ) as c:
+        rows = c.list_deliveries("kanban", 11)
+    assert len(rows) == 1
+    d = rows[0]
+    assert d.attempts == 5
+    assert d.next_attempt == 1700000010000
+    assert d.payload == {"arbitrary": ["nested", {"obj": True}]}
+
+
+# --- async: webhook mirror (representative) -------------------------------
+
+
+async def test_async_list_webhooks_parses_rows() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["auth"] = request.headers["authorization"]
+        captured["path"] = request.url.path
+        return httpx.Response(
+            200,
+            json={"webhooks": [_WEBHOOK_ROW_ALL_TABLES, _WEBHOOK_ROW_TABLED]},
+        )
+
+    async with _async_client(handler) as c:
+        rows = await c.list_webhooks("kanban")
+    assert captured["auth"] == ADMIN_BEARER
+    assert captured["path"] == "/admin/db/kanban/webhooks"
+    assert len(rows) == 2
+    assert rows[0].table is None
+    assert rows[1].table == "items"
+
+
+async def test_async_create_webhook_posts_body_and_returns_id() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"id": 7})
+
+    async with _async_client(handler) as c:
+        new_id = await c.create_webhook("kanban", url="https://hooks.example/x", events=["insert"])
+    assert new_id == 7
+    assert captured["body"] == {"url": "https://hooks.example/x", "events": ["insert"]}
+
+
+async def test_async_edit_webhook_omits_unset_table() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json=_WEBHOOK_ROW_TABLED)
+
+    async with _async_client(handler) as c:
+        wh = await c.edit_webhook("kanban", 11, enabled=False)
+    assert captured["body"] == {"enabled": False}
+    assert "table" not in captured["body"]
+    assert isinstance(wh, Webhook)
+
+
+async def test_async_edit_webhook_sends_table_null_to_clear() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json=_WEBHOOK_ROW_ALL_TABLES)
+
+    async with _async_client(handler) as c:
+        wh = await c.edit_webhook("kanban", 11, table=None)
+    assert captured["body"] == {"table": None}
+    assert wh.table is None
+
+
+async def test_async_delete_webhook_hits_correct_route() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["method"] = request.method
+        captured["path"] = request.url.path
+        return httpx.Response(200, json={"ok": True})
+
+    async with _async_client(handler) as c:
+        await c.delete_webhook("kanban", 11)
+    assert captured["method"] == "DELETE"
+    assert captured["path"] == "/admin/db/kanban/webhooks/11"
+
+
+async def test_async_list_deliveries_builds_query_params() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["path"] = request.url.path
+        captured["params"] = dict(request.url.params)
+        return httpx.Response(200, json={"deliveries": [_DELIVERY_ROW_OK]})
+
+    async with _async_client(handler) as c:
+        rows = await c.list_deliveries("kanban", 11, status="delivered", limit=10)
+    assert captured["path"] == "/admin/db/kanban/webhooks/11/deliveries"
+    assert captured["params"] == {"status": "delivered", "limit": "10"}
+    assert len(rows) == 1
+    assert rows[0].status == "delivered"

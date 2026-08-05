@@ -21,9 +21,12 @@ import type {
   AdminMutateResult,
   AdminQueryResult,
   ConfigResponse,
+  CreateWebhookOptions,
   DbStats,
+  EditWebhookOptions,
   FileMeta,
   HotConfigPatch,
+  ListDeliveriesOptions,
   MetricsSnapshot,
   OpEvent,
   RtDbErrorEnvelope,
@@ -31,9 +34,27 @@ import type {
   ScheduleWhen,
   SchemaDiff,
   TokenRow,
+  Webhook,
+  WebhookDelivery,
 } from "./types";
 
 const enc = encodeURIComponent;
+
+/** Build a request body from only the keys on `opts` whose value is not
+ *  `undefined`. Used by webhook create/edit so omitted fields are absent on the
+ *  wire (server default applies) while an explicit `null` (e.g. clearing a
+ *  webhook's `table` to all-tables) is preserved as JSON `null`. Mirrors the
+ *  ts-client's `pickDefined`. */
+function pickDefined<T extends object>(opts: T): Partial<T> {
+  const out: { [K in keyof T]: T[K] } = {} as Partial<T> as {
+    [K in keyof T]: T[K];
+  };
+  for (const key of Object.keys(opts) as (keyof T)[]) {
+    const v = opts[key];
+    if (v !== undefined) out[key] = v;
+  }
+  return out;
+}
 
 export class RtDbRequestError extends Error {
   code: string;
@@ -297,6 +318,59 @@ export class AdminClient {
       method: "POST",
       body: JSON.stringify({ name, confirm: name }),
     });
+  }
+  /** List webhooks registered for `db` (GET /admin/db/{db}/webhooks). Returns
+   *  an empty array when webhooks are disabled at boot — the table may not
+   *  exist. */
+  listWebhooks(db: string): Promise<Webhook[]> {
+    return this.req<{ webhooks: Webhook[] }>(`/admin/db/${enc(db)}/webhooks`).then(
+      (r) => r.webhooks,
+    );
+  }
+  /** Register a webhook for `db` (POST /admin/db/{db}/webhooks). Only the
+   *  provided option keys are sent; the server defaults `table` to all-tables,
+   *  `events` to `["*"]`, and `enabled` to true when their keys are absent.
+   *  Returns the new id. */
+  createWebhook(db: string, opts: CreateWebhookOptions): Promise<{ id: number }> {
+    return this.req<{ id: number }>(`/admin/db/${enc(db)}/webhooks`, {
+      method: "POST",
+      body: JSON.stringify(pickDefined(opts)),
+    });
+  }
+  /** Partial-edit a webhook (PUT /admin/db/{db}/webhooks/{id}). Each present
+   *  field overwrites the stored value; absent fields are unchanged. `table`
+   *  is a tri-state: omitted leaves it alone, `null` clears it to all-tables, a
+   *  string sets it. Returns the updated webhook. */
+  editWebhook(db: string, id: number, opts: EditWebhookOptions): Promise<Webhook> {
+    return this.req<Webhook>(`/admin/db/${enc(db)}/webhooks/${enc(id)}`, {
+      method: "PUT",
+      body: JSON.stringify(pickDefined(opts)),
+    });
+  }
+  /** Delete a webhook and cascade its pending deliveries
+   *  (DELETE /admin/db/{db}/webhooks/{id}). */
+  deleteWebhook(db: string, id: number): Promise<{ ok: boolean }> {
+    return this.req<{ ok: boolean }>(`/admin/db/${enc(db)}/webhooks/${enc(id)}`, {
+      method: "DELETE",
+    });
+  }
+  /** List a webhook's delivery outbox newest-first
+   *  (GET /admin/db/{db}/webhooks/{id}/deliveries?status=&limit=&offset=).
+   *  `status` filters by `pending|retrying|delivered|failed`; `limit`/`offset`
+   *  page. */
+  listDeliveries(
+    db: string,
+    id: number,
+    opts: ListDeliveriesOptions = {},
+  ): Promise<WebhookDelivery[]> {
+    const params = new URLSearchParams();
+    if (opts.status) params.set("status", opts.status);
+    if (opts.limit !== undefined) params.set("limit", String(opts.limit));
+    if (opts.offset !== undefined) params.set("offset", String(opts.offset));
+    const qs = params.toString();
+    return this.req<{ deliveries: WebhookDelivery[] }>(
+      `/admin/db/${enc(db)}/webhooks/${enc(id)}/deliveries${qs ? `?${qs}` : ""}`,
+    ).then((r) => r.deliveries);
   }
 }
 

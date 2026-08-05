@@ -869,6 +869,117 @@ pub mod admin {
         pub target: String,
         pub instructions: String,
     }
+
+    // ---- webhook management (GET/POST/PUT/DELETE /admin/db/{db}/webhooks[...]) -
+    //
+    // Mirror server `webhook::{Webhook, DeliveryRow}` and the admin handler
+    // request/response structs byte-for-byte (camelCase). The `enabled` field
+    // landed after launch (ENH-003), so it and the optional `table` carry
+    // `#[serde(default)]` for back-compat with an older server's responses.
+
+    /// One registered webhook returned by `GET /admin/db/{db}/webhooks`. Mirrors
+    /// server `webhook::Webhook`. `table = None` means "all tables"; `events`
+    /// carries op names (`insert`/`patch`/`replace`/`delete`/`upsert`) or the
+    /// single-element `["*"]` to match every event.
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct Webhook {
+        pub id: i64,
+        pub db: String,
+        #[serde(default)]
+        pub table: Option<String>,
+        pub url: String,
+        pub events: Vec<String>,
+        pub created_at: i64,
+        /// Added in ENH-003. `#[serde(default)]` so an older server that omits
+        /// the field still parses (defaulting to `false`); a current server
+        /// always emits it.
+        #[serde(default)]
+        pub enabled: bool,
+    }
+
+    /// One delivery row from a webhook's outbox
+    /// (`GET .../webhooks/{id}/deliveries`). Mirrors server
+    /// `webhook::DeliveryRow`. `payload` is the raw JSON body queued at enqueue
+    /// time, passed through verbatim so an operator can inspect the exact event
+    /// the worker will/did POST.
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct WebhookDelivery {
+        pub id: i64,
+        pub attempts: i64,
+        pub status: String,
+        pub next_attempt: i64,
+        pub last_error: Option<String>,
+        pub payload: serde_json::Value,
+    }
+
+    /// Options for [`crate::http::RtDbHttpClient::create_webhook`]. `url` is
+    /// required; the rest fall back to server defaults when `None` (all-tables,
+    /// `["*"]` events, enabled). Mirrors `CreateWebhookOptions` in `ts-client`.
+    /// `skip_serializing_if = "Option::is_none"` keeps each `None` field off the
+    /// wire so the server default applies.
+    #[derive(Debug, Clone, Default, Serialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct CreateWebhookOptions {
+        pub url: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub table: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub events: Option<Vec<String>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub enabled: Option<bool>,
+    }
+
+    /// Options for [`crate::http::RtDbHttpClient::edit_webhook`]. Every field is
+    /// optional — absent means "leave unchanged". `table` is a tri-state: outer
+    /// `None` leaves the filter alone, `Some(None)` (serialized as JSON `null`)
+    /// clears it to all-tables, and `Some(Some(t))` sets it to `t`. Mirrors
+    /// `EditWebhookOptions` in `ts-client` (where `undefined`/`null`/`string` is
+    /// the same tri-state) and pairs with the server's `deserialize_some` on the
+    /// PUT body.
+    #[derive(Debug, Clone, Default, Serialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct WebhookEditOptions {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub url: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub table: Option<Option<String>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub events: Option<Vec<String>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub enabled: Option<bool>,
+    }
+
+    /// Optional filters for [`crate::http::RtDbHttpClient::list_deliveries`]. All
+    /// fields optional: `status` filters by `pending|retrying|delivered|failed`;
+    /// `limit`/`offset` page (server defaults: limit=50 clamped to `[1,1000]`,
+    /// offset=0). Mirrors `ListDeliveriesOptions` in `ts-client`.
+    #[derive(Debug, Clone, Default)]
+    pub struct ListDeliveriesOptions {
+        pub status: Option<String>,
+        pub limit: Option<i64>,
+        pub offset: Option<i64>,
+    }
+
+    // Internal response wrappers (one per admin webhook endpoint that returns a
+    // collection or a scalar the SDK unwraps). Field names match the server's
+    // JSON keys verbatim (no camelCase mapping needed — `webhooks`/`id`/
+    // `deliveries` are already lowercase).
+    #[derive(Deserialize)]
+    pub(crate) struct WebhooksResponse {
+        pub(crate) webhooks: Vec<Webhook>,
+    }
+
+    #[derive(Deserialize)]
+    pub(crate) struct CreateWebhookResponse {
+        pub(crate) id: i64,
+    }
+
+    #[derive(Deserialize)]
+    pub(crate) struct DeliveriesResponse {
+        pub(crate) deliveries: Vec<WebhookDelivery>,
+    }
 }
 
 #[cfg(test)]

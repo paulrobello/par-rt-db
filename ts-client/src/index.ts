@@ -59,8 +59,13 @@ export type {
   AdminStreamFrame,
   BackupFile,
   BackupsListResponse,
+  CreateWebhookOptions,
+  EditWebhookOptions,
+  ListDeliveriesOptions,
   RestoreResult,
   RtDbAdminClientOptions,
+  Webhook,
+  WebhookDelivery,
 } from "./admin.js";
 export { RtDbClient } from "./client.js";
 export type { AuthState, ConnectionState, RtDbClientOptions, WebSocketLike } from "./client.js";

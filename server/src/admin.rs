@@ -10,7 +10,7 @@ use axum::http::{
     HeaderMap, HeaderValue, StatusCode, header, header::CONTENT_TYPE, header::SET_COOKIE,
 };
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
@@ -878,6 +878,9 @@ struct AdminCreateWebhookRequest {
     table: Option<String>,
     #[serde(default)]
     events: Option<Vec<String>>,
+    /// When omitted the webhook is created enabled (the historical behavior).
+    #[serde(default)]
+    enabled: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -937,7 +940,15 @@ async fn admin_create_webhook(
             )));
         }
     }
-    let webhook = crate::webhook::create_webhook(&state.pool, &db, table, url, &events).await?;
+    let webhook = crate::webhook::create_webhook(
+        &state.pool,
+        &db,
+        table,
+        url,
+        &events,
+        body.enabled.unwrap_or(true),
+    )
+    .await?;
     Ok(Json(AdminCreateWebhookResponse { id: webhook.id }))
 }
 
@@ -962,6 +973,166 @@ async fn admin_delete_webhook(
     }
     let ok = crate::webhook::delete_webhook(&state.pool, id).await?;
     Ok(Json(OkResponse { ok }))
+}
+
+/// Deserialize a present-as-`null` JSON value as `Some(None)` rather than the
+/// serde default of collapsing `null` on an `Option<T>` field to `None`. This
+/// is what lets `table: Option<Option<String>>` distinguish "field omitted"
+/// (`None` → leave alone) from `"table": null` (`Some(None)` → clear to
+/// all-tables) from `"table": "x"` (`Some(Some("x"))` → set). Standard serde
+/// idiom for the double-Option patch-edit pattern.
+fn deserialize_some<'de, T, D>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    Deserialize::deserialize(deserializer).map(Some)
+}
+
+/// Body for `PUT /admin/db/{db}/webhooks/{id}` — every field optional, absent =
+/// unchanged. `table` is a nested `Option<Option<String>>`: outer `None` leaves
+/// the table filter alone, `Some(None)` (JSON `null`) clears it to all-tables,
+/// and `Some(Some(t))` sets it to `t`. The other fields are flat `Option<T>` —
+/// present sets, absent keeps the existing value.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AdminEditWebhookRequest {
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_some")]
+    table: Option<Option<String>>,
+    #[serde(default)]
+    events: Option<Vec<String>>,
+    #[serde(default)]
+    enabled: Option<bool>,
+}
+
+/// `PUT /admin/db/{db}/webhooks/{id}` — partial-edit a webhook's `url`,
+/// `table`, `events`, or `enabled`. Only fields present in the body are
+/// updated; absent fields keep their existing value. Rejected with a 400 when
+/// webhooks are disabled at boot or `events` contains an unknown name; a
+/// missing `(id, db)` row is a 404. Returns the updated webhook.
+async fn admin_edit_webhook(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((db, id)): Path<(String, String)>,
+    ApiJson(body): ApiJson<AdminEditWebhookRequest>,
+) -> Result<Json<crate::webhook::Webhook>, RtDbError> {
+    require_admin(&state, &headers).await?;
+    if !db::database_exists(&state.pool, &db).await? {
+        return Err(RtDbError::not_found("unknown database"));
+    }
+    let id: i64 = id
+        .parse()
+        .map_err(|_| RtDbError::bad_request("webhook id must be an integer"))?;
+    if !state.config.webhooks_enabled {
+        return Err(RtDbError::bad_request(
+            "webhooks are disabled on this server (set RTDB_WEBHOOKS_ENABLED=true at boot)",
+        ));
+    }
+    let url = body.url.as_deref().map(str::trim);
+    if let Some(u) = url
+        && u.is_empty()
+    {
+        return Err(RtDbError::bad_request("url must not be empty"));
+    }
+    // Normalize `table`: an empty string is treated as "all tables" (None),
+    // matching the create path. Trim the inner value when present. Built as an
+    // owned `Option<Option<String>>` so we can hand `edit_webhook` a borrowed
+    // `Option<Option<&str>>` view below without borrowing the closure's local.
+    let tbl: Option<Option<String>> = body.table.map(|inner| {
+        inner.and_then(|s| {
+            let t = s.trim();
+            if t.is_empty() {
+                None
+            } else {
+                Some(t.to_string())
+            }
+        })
+    });
+    let tbl_ref = tbl.as_ref().map(|i| i.as_deref());
+    let events = if let Some(ev) = body.events {
+        if ev.is_empty() {
+            return Err(RtDbError::bad_request("events must not be empty"));
+        }
+        for name in &ev {
+            if !is_valid_event(name) {
+                return Err(RtDbError::bad_request(format!(
+                    "unknown event '{name}'; expected one of insert, patch, replace, delete, upsert, or *"
+                )));
+            }
+        }
+        Some(ev)
+    } else {
+        None
+    };
+    let updated = crate::webhook::edit_webhook(
+        &state.pool,
+        id,
+        &db,
+        url,
+        tbl_ref,
+        events.as_deref(),
+        body.enabled,
+    )
+    .await?
+    .ok_or_else(|| RtDbError::not_found("webhook not found for this database"))?;
+    Ok(Json(updated))
+}
+
+#[derive(Deserialize)]
+struct DeliveryListParams {
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default = "default_delivery_limit")]
+    limit: i64,
+    #[serde(default = "default_delivery_offset")]
+    offset: i64,
+}
+fn default_delivery_limit() -> i64 {
+    50
+}
+fn default_delivery_offset() -> i64 {
+    0
+}
+
+#[derive(Serialize)]
+struct DeliveriesResponse {
+    deliveries: Vec<crate::webhook::DeliveryRow>,
+}
+
+/// `GET /admin/db/{db}/webhooks/{id}/deliveries?status=&limit=&offset=` — list
+/// the delivery outbox for a webhook, newest `next_attempt` first. `status`
+/// filters by `pending|retrying|delivered|failed`; `limit` defaults to 50 and
+/// clamps to `[1,1000]`; `offset` defaults to 0. When webhooks are disabled at
+/// boot this returns an empty list (the table may not exist). A non-numeric id
+/// is a 400; the webhook not existing yields an empty list rather than a 404 —
+/// the outbox is scoped by `webhook_id`, so a never-existed id simply has no
+/// rows (mirrors how `admin_list_webhooks` returns `[]` for a db with none).
+async fn admin_list_deliveries(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((db, id)): Path<(String, String)>,
+    QueryParams(params): QueryParams<DeliveryListParams>,
+) -> Result<Json<DeliveriesResponse>, RtDbError> {
+    require_admin(&state, &headers).await?;
+    if !db::database_exists(&state.pool, &db).await? {
+        return Err(RtDbError::not_found("unknown database"));
+    }
+    let id: i64 = id
+        .parse()
+        .map_err(|_| RtDbError::bad_request("webhook id must be an integer"))?;
+    if !state.config.webhooks_enabled {
+        return Ok(Json(DeliveriesResponse {
+            deliveries: Vec::new(),
+        }));
+    }
+    let limit = params.limit.clamp(1, 1000);
+    let offset = params.offset.max(0);
+    let deliveries =
+        crate::webhook::fetch_deliveries(&state.pool, id, params.status.as_deref(), limit, offset)
+            .await?;
+    Ok(Json(DeliveriesResponse { deliveries }))
 }
 
 #[derive(Serialize)]
@@ -1614,7 +1785,14 @@ pub fn admin_routes() -> Router<Arc<AppState>> {
             "/admin/db/{db}/webhooks",
             get(admin_list_webhooks).post(admin_create_webhook),
         )
-        .route("/admin/db/{db}/webhooks/{id}", delete(admin_delete_webhook))
+        .route(
+            "/admin/db/{db}/webhooks/{id}",
+            put(admin_edit_webhook).delete(admin_delete_webhook),
+        )
+        .route(
+            "/admin/db/{db}/webhooks/{id}/deliveries",
+            get(admin_list_deliveries),
+        )
         .route(
             "/admin/db/{db}/schedules",
             get(admin_list_schedules).post(admin_create_schedule),

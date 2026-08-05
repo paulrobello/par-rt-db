@@ -242,6 +242,15 @@ pub async fn ensure_webhooks_tables(pool: &PgPool) -> Result<(), RtDbError> {
     .execute(&mut *tx)
     .await?;
 
+    // Additive column (ENH-003): existing webhooks default to enabled so the
+    // delivery worker's behavior on pre-flag rows is unchanged.
+    sqlx::query(
+        "ALTER TABLE rtdb.webhooks \
+         ADD COLUMN IF NOT EXISTS enabled BOOLEAN NOT NULL DEFAULT true",
+    )
+    .execute(&mut *tx)
+    .await?;
+
     sqlx::query("CREATE INDEX IF NOT EXISTS webhooks_db_idx ON rtdb.webhooks (db)")
         .execute(&mut *tx)
         .await?;

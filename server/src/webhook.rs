@@ -89,6 +89,7 @@ pub struct Webhook {
     pub url: String,
     pub events: Vec<String>,
     pub created_at: i64,
+    pub enabled: bool,
 }
 
 /// Exponential backoff in milliseconds for the next retry after `attempts`
@@ -137,12 +138,14 @@ pub async fn enqueue_for_ops(
         let kind = op_kind_name(op.kind);
         // Match webhooks for this (db, table, kind). `tbl IS NULL` = all tables;
         // `events = '{*}'` = the literal single-element wildcard array; otherwise
-        // the op kind must appear in the events array.
+        // the op kind must appear in the events array. `enabled` excludes paused
+        // webhooks so they produce no deliveries while retaining their config.
         let matches: Vec<(i64,)> = sqlx::query_as(
             "SELECT id FROM rtdb.webhooks \
              WHERE db = $1 \
                AND (tbl IS NULL OR tbl = $2) \
-               AND (events = '{*}' OR $3 = ANY(events))",
+               AND (events = '{*}' OR $3 = ANY(events)) \
+               AND enabled",
         )
         .bind(db)
         .bind(&op.table)
@@ -291,9 +294,9 @@ pub async fn run_delivery_worker(pool: PgPool) {
 /// Lists webhooks registered for `db`, ordered by id. Called by
 /// `GET /admin/db/{db}/webhooks`.
 pub async fn list_webhooks(pool: &PgPool, db: &str) -> Result<Vec<Webhook>, RtDbError> {
-    type Row = (i64, String, Option<String>, String, Vec<String>, i64);
+    type Row = (i64, String, Option<String>, String, Vec<String>, i64, bool);
     let rows: Vec<Row> = sqlx::query_as(
-        "SELECT id, db, tbl, url, events, created_at \
+        "SELECT id, db, tbl, url, events, created_at, enabled \
          FROM rtdb.webhooks WHERE db = $1 ORDER BY id",
     )
     .bind(db)
@@ -301,38 +304,42 @@ pub async fn list_webhooks(pool: &PgPool, db: &str) -> Result<Vec<Webhook>, RtDb
     .await?;
     Ok(rows
         .into_iter()
-        .map(|(id, db, tbl, url, events, created_at)| Webhook {
+        .map(|(id, db, tbl, url, events, created_at, enabled)| Webhook {
             id,
             db,
             tbl,
             url,
             events,
             created_at,
+            enabled,
         })
         .collect())
 }
 
 /// Inserts a webhook for `db` and returns the stored row. `tbl = None` means
 /// all tables; `events` is stored verbatim (use `["*"]` for all events).
-/// Called by `POST /admin/db/{db}/webhooks`.
+/// `enabled = false` registers the webhook paused (no deliveries until flipped
+/// back on). Called by `POST /admin/db/{db}/webhooks`.
 pub async fn create_webhook(
     pool: &PgPool,
     db: &str,
     tbl: Option<&str>,
     url: &str,
     events: &[String],
+    enabled: bool,
 ) -> Result<Webhook, RtDbError> {
-    type Row = (i64, String, Option<String>, String, Vec<String>, i64);
+    type Row = (i64, String, Option<String>, String, Vec<String>, i64, bool);
     let row: Row = sqlx::query_as(
-        "INSERT INTO rtdb.webhooks (db, tbl, url, events, created_at) \
-         VALUES ($1, $2, $3, $4, $5) \
-         RETURNING id, db, tbl, url, events, created_at",
+        "INSERT INTO rtdb.webhooks (db, tbl, url, events, created_at, enabled) \
+         VALUES ($1, $2, $3, $4, $5, $6) \
+         RETURNING id, db, tbl, url, events, created_at, enabled",
     )
     .bind(db)
     .bind(tbl)
     .bind(url)
     .bind(events)
     .bind(now_ms())
+    .bind(enabled)
     .fetch_one(pool)
     .await?;
     Ok(Webhook {
@@ -342,6 +349,7 @@ pub async fn create_webhook(
         url: row.3,
         events: row.4,
         created_at: row.5,
+        enabled: row.6,
     })
 }
 
@@ -353,6 +361,148 @@ pub async fn delete_webhook(pool: &PgPool, id: i64) -> Result<bool, RtDbError> {
         .execute(pool)
         .await?;
     Ok(res.rows_affected() > 0)
+}
+
+/// One delivery row from the `rtdb.webhook_deliveries` outbox. The wire shape is
+/// camelCase (`nextAttempt`/`lastError`); `payload` is the raw JSONB body queued
+/// at enqueue time, passed through verbatim so an operator can inspect the exact
+/// event the worker will/did POST.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeliveryRow {
+    pub id: i64,
+    pub attempts: i32,
+    pub status: String,
+    pub next_attempt: i64,
+    pub last_error: Option<String>,
+    pub payload: serde_json::Value,
+}
+
+/// Applies a partial update to webhook `id` scoped to `db`, returning the
+/// updated row or `None` if no such `(id, db)` row exists. Each `Option`
+/// argument is itself "unchanged when `None`": `url`/`events`/`enabled` take
+/// `Some(value)` to set, and `tbl` is a nested `Option<Option<&str>>` so the
+/// caller can distinguish "leave the table filter alone" (`None`) from "set it
+/// to all-tables" (`Some(None)`) from "set it to this table" (`Some(Some(t))`.
+/// When every field is `None` this short-circuits to a plain SELECT — no
+/// empty-SET SQL is synthesized. Called by `PUT /admin/db/{db}/webhooks/{id}`.
+pub async fn edit_webhook(
+    pool: &PgPool,
+    id: i64,
+    db: &str,
+    url: Option<&str>,
+    tbl: Option<Option<&str>>,
+    events: Option<&[String]>,
+    enabled: Option<bool>,
+) -> Result<Option<Webhook>, RtDbError> {
+    type Row = (i64, String, Option<String>, String, Vec<String>, i64, bool);
+    // No fields → just read the current row.
+    if url.is_none() && tbl.is_none() && events.is_none() && enabled.is_none() {
+        let row: Option<Row> = sqlx::query_as(
+            "SELECT id, db, tbl, url, events, created_at, enabled \
+             FROM rtdb.webhooks WHERE id = $1 AND db = $2",
+        )
+        .bind(id)
+        .bind(db)
+        .fetch_optional(pool)
+        .await?;
+        return Ok(row.map(|r| Webhook {
+            id: r.0,
+            db: r.1,
+            tbl: r.2,
+            url: r.3,
+            events: r.4,
+            created_at: r.5,
+            enabled: r.6,
+        }));
+    }
+    let mut q = sqlx::QueryBuilder::<sqlx::Postgres>::new("UPDATE rtdb.webhooks SET ");
+    let mut need_comma = false;
+    if let Some(u) = url {
+        q.push("url = ");
+        q.push_bind(u);
+        need_comma = true;
+    }
+    if let Some(t) = tbl {
+        if need_comma {
+            q.push(", ");
+        }
+        q.push("tbl = ");
+        q.push_bind(t);
+        need_comma = true;
+    }
+    if let Some(ev) = events {
+        if need_comma {
+            q.push(", ");
+        }
+        q.push("events = ");
+        q.push_bind(ev);
+        need_comma = true;
+    }
+    if let Some(en) = enabled {
+        if need_comma {
+            q.push(", ");
+        }
+        q.push("enabled = ");
+        q.push_bind(en);
+    }
+    q.push(" WHERE id = ");
+    q.push_bind(id);
+    q.push(" AND db = ");
+    q.push_bind(db);
+    q.push(" RETURNING id, db, tbl, url, events, created_at, enabled");
+    // `build()` yields a `Query` whose rows decode as the raw `PgRow` (no tuple
+    // indexing); `build_query_as::<Row>()` attaches the tuple decoder so
+    // `fetch_optional` returns `Option<Row>` directly.
+    let row: Option<Row> = q.build_query_as::<Row>().fetch_optional(pool).await?;
+    Ok(row.map(|r| Webhook {
+        id: r.0,
+        db: r.1,
+        tbl: r.2,
+        url: r.3,
+        events: r.4,
+        created_at: r.5,
+        enabled: r.6,
+    }))
+}
+
+/// Reads delivery rows for `webhook_id` newest-first (by `next_attempt DESC`
+/// then `id DESC` as a stable tie-breaker). `status` filters when `Some`;
+/// `limit`/`offset` page. Called by `GET /admin/db/{db}/webhooks/{id}/deliveries`.
+pub async fn fetch_deliveries(
+    pool: &PgPool,
+    webhook_id: i64,
+    status: Option<&str>,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<DeliveryRow>, RtDbError> {
+    type Row = (i64, i32, String, i64, Option<String>, serde_json::Value);
+    let rows: Vec<Row> = sqlx::query_as(
+        "SELECT id, attempts, status, next_attempt, last_error, payload \
+         FROM rtdb.webhook_deliveries \
+         WHERE webhook_id = $1 AND ($2::text IS NULL OR status = $2) \
+         ORDER BY next_attempt DESC, id DESC \
+         LIMIT $3 OFFSET $4",
+    )
+    .bind(webhook_id)
+    .bind(status)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(
+            |(id, attempts, status, next_attempt, last_error, payload)| DeliveryRow {
+                id,
+                attempts,
+                status,
+                next_attempt,
+                last_error,
+                payload,
+            },
+        )
+        .collect())
 }
 
 #[cfg(test)]

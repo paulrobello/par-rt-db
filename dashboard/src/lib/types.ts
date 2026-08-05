@@ -185,3 +185,51 @@ export interface HotConfigPatch {
   maxFileSize?: number;
   idempotencyTtlMs?: number;
 }
+
+// Webhooks — mirrors server/src/webhook.rs (Webhook, DeliveryRow) and the
+// ts-client's admin.ts shapes. Field names are camelCase on the wire.
+// `table: null` means "all tables"; `events` carries op names
+// (`insert`/`patch`/`replace`/`delete`/`upsert`) or `["*"]` for all.
+export interface Webhook {
+  id: number;
+  db: string;
+  table: string | null;
+  url: string;
+  events: string[];
+  createdAt: number;
+  enabled: boolean;
+}
+
+// `payload` is the raw JSON body the worker POSTs — typed `unknown` because the
+// server passes it through verbatim. `status` is one of
+// `pending|retrying|delivered|failed` (free-form here to tolerate future states).
+export interface WebhookDelivery {
+  id: number;
+  attempts: number;
+  status: string;
+  nextAttempt: number;
+  lastError: string | null;
+  payload: unknown;
+}
+
+export interface CreateWebhookOptions {
+  url: string;
+  table?: string | null;
+  events?: string[];
+  enabled?: boolean;
+}
+
+// Tri-state `table`: omitted = unchanged, `null` = clear to all-tables,
+// string = set. Other fields are plain optional — present sets, absent keeps.
+export interface EditWebhookOptions {
+  url?: string;
+  table?: string | null;
+  events?: string[];
+  enabled?: boolean;
+}
+
+export interface ListDeliveriesOptions {
+  status?: string;
+  limit?: number;
+  offset?: number;
+}

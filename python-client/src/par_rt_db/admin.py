@@ -15,6 +15,8 @@ admin control plane found on :class:`par_rt_db.http_client.RtDbHttpClient`:
 * managed backups — ``backup`` / ``backups`` / ``restore``
 * token management (ENH-005) — ``mint-token`` / ``revoke-token`` / ``tokens``
   with the capability fields (``expiresAt``, ``readOnly``, ``tables``)
+* webhook management (ENH-003) — ``/admin/db/{db}/webhooks`` (list / create /
+  edit / delete) plus ``.../{id}/deliveries`` for the delivery outbox
 
 This is the canonical admin surface; the same methods also remain on
 :class:`par_rt_db.http_client.RtDbHttpClient` /
@@ -57,6 +59,8 @@ from .http_client import (
     MintedToken,
     OpEvent,
     TokenInfo,
+    Webhook,
+    WebhookDelivery,
 )
 from .migration import Directive, MigrateRequest
 from .mutation import StepResult, Transaction
@@ -65,6 +69,15 @@ from .schema import SchemaDef
 
 if TYPE_CHECKING:
     import httpx
+
+
+# Sentinel for ``edit_webhook`` kwargs that distinguishes "caller did not pass
+# this kwarg" (``_UNSET`` → omit from the body → server leaves the field
+# unchanged) from "caller passed ``None``" (``table=None`` → send JSON ``null``
+# → server clears the field). Only ``edit_webhook`` needs the tri-state —
+# ``create_webhook`` treats ``table=None`` as all-tables (matching the server's
+# create semantics), so it does not use the sentinel.
+_UNSET: Any = object()
 
 
 # ``StepResult`` is a ``Union`` alias (no ``model_validate``); route through a
@@ -452,6 +465,124 @@ class RtDbAdminClient:
         resp = self._req("GET", "/admin/tokens", params={"db": db})
         return [TokenInfo.model_validate(t) for t in resp.json()["tokens"]]
 
+    # --- webhook surface (ENH-003) ---
+
+    def list_webhooks(self, db: str) -> list[Webhook]:
+        """``GET /admin/db/{db}/webhooks`` → ``{webhooks:[...]}``.
+
+        Returns an empty list when webhooks are disabled at boot (the server
+        permits the table to not exist), and for a db with no webhooks.
+        """
+        resp = self._req("GET", f"/admin/db/{db}/webhooks")
+        return [Webhook.model_validate(w) for w in resp.json()["webhooks"]]
+
+    def create_webhook(
+        self,
+        db: str,
+        *,
+        url: str,
+        table: str | None = None,
+        events: list[str] | None = None,
+        enabled: bool | None = None,
+    ) -> int:
+        """``POST /admin/db/{db}/webhooks`` ``{url, table?, events?, enabled?}``
+        → ``{id}``.
+
+        Returns the new webhook id. ``table=None`` (the default) means
+        all-tables (the server's ``tbl = None``); ``events=None`` lets the
+        server default to ``["*"]`` (all events); ``enabled=None`` lets the
+        server default to enabled (the historical behavior). Each ``None``
+        field is omitted from the body so the server applies its defaults.
+        """
+        body: dict[str, Any] = {"url": url}
+        if table is not None:
+            body["table"] = table
+        if events is not None:
+            body["events"] = list(events)
+        if enabled is not None:
+            body["enabled"] = enabled
+        resp = self._req("POST", f"/admin/db/{db}/webhooks", json=body)
+        return int(resp.json()["id"])
+
+    def edit_webhook(
+        self,
+        db: str,
+        id: int,
+        *,
+        url: str | None = None,
+        table: str | None | object = _UNSET,
+        events: list[str] | None = None,
+        enabled: bool | None = None,
+    ) -> Webhook:
+        """``PUT /admin/db/{db}/webhooks/{id}`` → the updated :class:`Webhook`.
+
+        Each kwarg is independently optional on the wire — only kwargs the
+        caller passes are sent, omitted fields are left unchanged by the
+        server. ``table`` is a tri-state kwarg (the load-bearing case):
+
+        * omitted (``_UNSET``) → omitted from the body → table filter unchanged
+        * ``None`` → sent as JSON ``null`` → clears to all-tables
+        * ``"items"`` → sent as ``"items"`` → set to that table
+
+        ``url``/``events``/``enabled`` use a plain ``None`` default (their
+        distinguishing value would be the empty string / empty list / etc., so
+        a sentinel is unnecessary): ``None`` means "not passed" → omitted from
+        the body → unchanged; pass a real value to set it.
+        """
+        body: dict[str, Any] = {}
+        if url is not None:
+            body["url"] = url
+        if table is not _UNSET:
+            # ``table`` may be ``None`` (clear to all-tables) or a string (set);
+            # both are valid body values, so assign verbatim.
+            body["table"] = table
+        if events is not None:
+            body["events"] = list(events)
+        if enabled is not None:
+            body["enabled"] = enabled
+        resp = self._req("PUT", f"/admin/db/{db}/webhooks/{id}", json=body)
+        return Webhook.model_validate(resp.json())
+
+    def delete_webhook(self, db: str, id: int) -> None:
+        """``DELETE /admin/db/{db}/webhooks/{id}`` → ``{ok:true}``.
+
+        Cascading pending deliveries via the FK. A non-numeric id is a 400 on
+        the server; a missing id is a 404 (returns ``ok:false`` → raises).
+        """
+        resp = self._req("DELETE", f"/admin/db/{db}/webhooks/{id}")
+        self._expect_ok(resp)
+
+    def list_deliveries(
+        self,
+        db: str,
+        id: int,
+        *,
+        status: str | None = None,
+        limit: int | None = None,
+        offset: int | None = None,
+    ) -> list[WebhookDelivery]:
+        """``GET /admin/db/{db}/webhooks/{id}/deliveries?status=&limit=&offset=``
+        → ``{deliveries:[...]}``.
+
+        All three filters are optional; omitted filters are not sent (the
+        server then ignores no filter, default limit 100, offset 0). Returns
+        an empty list when webhooks are disabled at boot or the webhook has no
+        deliveries.
+        """
+        params: dict[str, Any] = {}
+        if status is not None:
+            params["status"] = status
+        if limit is not None:
+            params["limit"] = limit
+        if offset is not None:
+            params["offset"] = offset
+        resp = self._req(
+            "GET",
+            f"/admin/db/{db}/webhooks/{id}/deliveries",
+            params=params,
+        )
+        return [WebhookDelivery.model_validate(d) for d in resp.json()["deliveries"]]
+
     # --- request plumbing ---
 
     def _req(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
@@ -806,6 +937,99 @@ class AsyncRtDbAdminClient:
         """``GET /admin/tokens?db=<db>`` → ``[TokenInfo, ...]`` (async)."""
         resp = await self._req("GET", "/admin/tokens", params={"db": db})
         return [TokenInfo.model_validate(t) for t in resp.json()["tokens"]]
+
+    # --- webhook surface (ENH-003) ---
+
+    async def list_webhooks(self, db: str) -> list[Webhook]:
+        """``GET /admin/db/{db}/webhooks`` → ``{webhooks:[...]}`` (async).
+
+        See :meth:`RtDbAdminClient.list_webhooks` for empty-list semantics.
+        """
+        resp = await self._req("GET", f"/admin/db/{db}/webhooks")
+        return [Webhook.model_validate(w) for w in resp.json()["webhooks"]]
+
+    async def create_webhook(
+        self,
+        db: str,
+        *,
+        url: str,
+        table: str | None = None,
+        events: list[str] | None = None,
+        enabled: bool | None = None,
+    ) -> int:
+        """``POST /admin/db/{db}/webhooks`` → ``{id}`` (async).
+
+        See :meth:`RtDbAdminClient.create_webhook` for body semantics.
+        """
+        body: dict[str, Any] = {"url": url}
+        if table is not None:
+            body["table"] = table
+        if events is not None:
+            body["events"] = list(events)
+        if enabled is not None:
+            body["enabled"] = enabled
+        resp = await self._req("POST", f"/admin/db/{db}/webhooks", json=body)
+        return int(resp.json()["id"])
+
+    async def edit_webhook(
+        self,
+        db: str,
+        id: int,
+        *,
+        url: str | None = None,
+        table: str | None | object = _UNSET,
+        events: list[str] | None = None,
+        enabled: bool | None = None,
+    ) -> Webhook:
+        """``PUT /admin/db/{db}/webhooks/{id}`` → updated :class:`Webhook` (async).
+
+        See :meth:`RtDbAdminClient.edit_webhook` for the ``table`` tri-state
+        (omitted vs ``None`` vs string) and body-building rules.
+        """
+        body: dict[str, Any] = {}
+        if url is not None:
+            body["url"] = url
+        if table is not _UNSET:
+            body["table"] = table
+        if events is not None:
+            body["events"] = list(events)
+        if enabled is not None:
+            body["enabled"] = enabled
+        resp = await self._req("PUT", f"/admin/db/{db}/webhooks/{id}", json=body)
+        return Webhook.model_validate(resp.json())
+
+    async def delete_webhook(self, db: str, id: int) -> None:
+        """``DELETE /admin/db/{db}/webhooks/{id}`` → ``{ok:true}`` (async)."""
+        resp = await self._req("DELETE", f"/admin/db/{db}/webhooks/{id}")
+        self._expect_ok(resp)
+
+    async def list_deliveries(
+        self,
+        db: str,
+        id: int,
+        *,
+        status: str | None = None,
+        limit: int | None = None,
+        offset: int | None = None,
+    ) -> list[WebhookDelivery]:
+        """``GET /admin/db/{db}/webhooks/{id}/deliveries?status=&limit=&offset=``
+        → ``{deliveries:[...]}`` (async).
+
+        See :meth:`RtDbAdminClient.list_deliveries` for filter semantics.
+        """
+        params: dict[str, Any] = {}
+        if status is not None:
+            params["status"] = status
+        if limit is not None:
+            params["limit"] = limit
+        if offset is not None:
+            params["offset"] = offset
+        resp = await self._req(
+            "GET",
+            f"/admin/db/{db}/webhooks/{id}/deliveries",
+            params=params,
+        )
+        return [WebhookDelivery.model_validate(d) for d in resp.json()["deliveries"]]
 
     # --- request plumbing ---
 

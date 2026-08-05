@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import type { Webhook, WebhookDelivery } from "../src/admin.js";
 import { RtDbAdminClient } from "../src/admin.js";
 import { Migration } from "../src/migration.js";
 import type { TransactionJson } from "../src/protocol.js";
@@ -679,5 +680,198 @@ describe("RtDbAdminClient backups", () => {
       code: "BAD_REQUEST",
       message: "confirm must match backup name",
     });
+  });
+});
+
+describe("RtDbAdminClient webhooks", () => {
+  it("listWebhooks GETs /admin/db/{db}/webhooks and unwraps {webhooks}", async () => {
+    // Two fixture rows: one all-tables (table:null), one scoped to a table.
+    const webhooks: Webhook[] = [
+      {
+        id: 1,
+        db: "kanban",
+        table: null,
+        url: "https://a.example/hook",
+        events: ["*"],
+        createdAt: 1_700_000_000_000,
+        enabled: true,
+      },
+      {
+        id: 2,
+        db: "kanban",
+        table: "items",
+        url: "https://b.example/hook",
+        events: ["insert", "patch"],
+        createdAt: 1_700_000_000_001,
+        enabled: false,
+      },
+    ];
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ webhooks }));
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+    await expect(admin.listWebhooks("kanban")).resolves.toEqual(webhooks);
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("http://h:8300/admin/db/kanban/webhooks");
+    expect(init.method).toBe("GET");
+    expect(init.headers.Authorization).toBe("Bearer k");
+  });
+
+  it("createWebhook POSTs only provided keys and unwraps {id}", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ id: 7 }));
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+    await expect(
+      admin.createWebhook("kanban", {
+        url: "https://x.example/hook",
+        table: "items",
+        events: ["insert"],
+        enabled: false,
+      }),
+    ).resolves.toEqual({ id: 7 });
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("http://h:8300/admin/db/kanban/webhooks");
+    expect(init.method).toBe("POST");
+    expect(JSON.parse(init.body)).toEqual({
+      url: "https://x.example/hook",
+      table: "items",
+      events: ["insert"],
+      enabled: false,
+    });
+  });
+
+  it("createWebhook sends {table:null} as JSON null when called with table:null", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ id: 8 }));
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+    await admin.createWebhook("kanban", { url: "https://x.example/hook", table: null });
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+    expect(body).toEqual({ url: "https://x.example/hook", table: null });
+  });
+
+  it("createWebhook omits absent option keys (no undefined leaks)", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ id: 9 }));
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+    await admin.createWebhook("kanban", { url: "https://x.example/hook" });
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+    // Only `url` was provided; server defaults apply to the rest.
+    expect(body).toEqual({ url: "https://x.example/hook" });
+    expect("table" in body).toBe(false);
+    expect("events" in body).toBe(false);
+    expect("enabled" in body).toBe(false);
+  });
+
+  it("editWebhook PUTs to /admin/db/{db}/webhooks/{id} and returns the updated Webhook", async () => {
+    const updated: Webhook = {
+      id: 3,
+      db: "kanban",
+      table: "items",
+      url: "https://new.example/hook",
+      events: ["insert"],
+      createdAt: 1_700_000_000_000,
+      enabled: false,
+    };
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(updated));
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+    await expect(
+      admin.editWebhook("kanban", 3, {
+        url: "https://new.example/hook",
+        events: ["insert"],
+        enabled: false,
+      }),
+    ).resolves.toEqual(updated);
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("http://h:8300/admin/db/kanban/webhooks/3");
+    expect(init.method).toBe("PUT");
+    expect(JSON.parse(init.body)).toEqual({
+      url: "https://new.example/hook",
+      events: ["insert"],
+      enabled: false,
+    });
+  });
+
+  it("editWebhook sends table:null as JSON null (clear to all-tables)", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      jsonResponse({
+        id: 3,
+        db: "kanban",
+        table: null,
+        url: "u",
+        events: ["*"],
+        createdAt: 1,
+        enabled: true,
+      }),
+    );
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+    await admin.editWebhook("kanban", 3, { table: null });
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+    // Key present with JSON null — server reads Some(None) and clears the table filter.
+    expect(body).toEqual({ table: null });
+    expect("table" in body).toBe(true);
+  });
+
+  it("editWebhook omits table entirely when the caller did not provide it (unchanged)", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      jsonResponse({
+        id: 3,
+        db: "kanban",
+        table: "items",
+        url: "u",
+        events: ["*"],
+        createdAt: 1,
+        enabled: true,
+      }),
+    );
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+    await admin.editWebhook("kanban", 3, { enabled: false });
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+    // No `table` key on the wire — server leaves the existing filter alone.
+    expect(body).toEqual({ enabled: false });
+    expect("table" in body).toBe(false);
+  });
+
+  it("deleteWebhook DELETEs /admin/db/{db}/webhooks/{id} and resolves void on {ok:true}", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ ok: true }));
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+    await expect(admin.deleteWebhook("kanban", 5)).resolves.toBeUndefined();
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("http://h:8300/admin/db/kanban/webhooks/5");
+    expect(init.method).toBe("DELETE");
+    expect(init.headers.Authorization).toBe("Bearer k");
+  });
+
+  it("listDeliveries GETs the deliveries path with status/limit/offset query and unwraps {deliveries}", async () => {
+    const deliveries: WebhookDelivery[] = [
+      {
+        id: 11,
+        attempts: 0,
+        status: "pending",
+        nextAttempt: 1_700_000_000_000,
+        lastError: null,
+        payload: { db: "kanban", table: "items", docId: "x", kind: "insert", ts: 1 },
+      },
+      {
+        id: 12,
+        attempts: 2,
+        status: "retrying",
+        nextAttempt: 1_700_000_000_004,
+        lastError: "HTTP 503",
+        payload: { db: "kanban", table: "items", docId: "y", kind: "patch", ts: 2 },
+      },
+    ];
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ deliveries }));
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+    await expect(
+      admin.listDeliveries("kanban", 3, { status: "retrying", limit: 50, offset: 100 }),
+    ).resolves.toEqual(deliveries);
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe(
+      "http://h:8300/admin/db/kanban/webhooks/3/deliveries?status=retrying&limit=50&offset=100",
+    );
+    expect(init.method).toBe("GET");
+    expect(init.headers.Authorization).toBe("Bearer k");
+  });
+
+  it("listDeliveries omits the query string when no opts are provided", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ deliveries: [] }));
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+    await expect(admin.listDeliveries("kanban", 3)).resolves.toEqual([]);
+    expect(fetchMock.mock.calls[0][0]).toBe("http://h:8300/admin/db/kanban/webhooks/3/deliveries");
   });
 });
