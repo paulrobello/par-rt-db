@@ -189,6 +189,9 @@ async fn mutate_handler(
     let token = bearer_token(&headers)?;
     let principal = resolve_bearer(&state.pool, token).await?;
     authorize(&state.pool, &principal, &body.db).await?;
+    if principal.is_read_only() {
+        return Err(RtDbError::forbidden("read-only token cannot mutate"));
+    }
     check_http_rate_limits(&state, &principal, &body.db).await?;
 
     let t = Instant::now();
@@ -233,6 +236,9 @@ async fn schedule_handler(
     let token = bearer_token(&headers)?;
     let principal = resolve_bearer(&state.pool, token).await?;
     authorize(&state.pool, &principal, &body.db).await?;
+    if principal.is_read_only() {
+        return Err(RtDbError::forbidden("read-only token cannot mutate"));
+    }
     check_http_rate_limits(&state, &principal, &body.db).await?;
 
     let (kind, due_at, cron) = scheduler::resolve_when(body.when, now_ms())?;
@@ -387,6 +393,9 @@ async fn upload_handler(
     let token = bearer_token(&headers)?;
     let principal = resolve_bearer(&state.pool, token).await?;
     authorize(&state.pool, &principal, &db).await?;
+    if principal.is_read_only() {
+        return Err(RtDbError::forbidden("read-only token cannot mutate"));
+    }
     check_http_rate_limits(&state, &principal, &db).await?;
     storage::ensure_table(&state.pool, &db).await?; // revive storage for old dbs
 
@@ -477,6 +486,9 @@ async fn delete_handler(
     let token = bearer_token(&headers)?;
     let principal = resolve_bearer(&state.pool, token).await?;
     authorize(&state.pool, &principal, &db).await?;
+    if principal.is_read_only() {
+        return Err(RtDbError::forbidden("read-only token cannot mutate"));
+    }
     check_http_rate_limits(&state, &principal, &db).await?;
     storage::delete(&state.pool, &db, &id).await?;
     Ok(Json(OkResponse { ok: true }))

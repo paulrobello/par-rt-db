@@ -686,6 +686,7 @@ async fn reaper_bypasses_per_row_owner_auth() {
             PrincipalCtx {
                 user_id: Some("alice".to_string()),
                 email: None,
+                ..Default::default()
             },
         )
         .await

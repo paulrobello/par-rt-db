@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use sqlx::{PgConnection, PgPool};
 
-use crate::auth::PrincipalCtx;
+use crate::auth::{PrincipalCtx, authorize_table};
 use crate::db::{new_id, now_ms, validate_db_name};
 use crate::ddl::{pg_col, pg_schema, pg_table};
 use crate::error::RtDbError;
@@ -57,6 +57,24 @@ pub enum Step {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Transaction {
     pub steps: Vec<Step>,
+}
+
+impl Step {
+    /// The table this step targets. Every variant carries one; the table-scope
+    /// gate (`authorize_table`) runs once per step inside `execute_txn` so a
+    /// machine token scoped to a subset of tables cannot reach a forbidden table
+    /// via any write path.
+    pub fn table(&self) -> &str {
+        match self {
+            Step::Insert { table, .. }
+            | Step::Patch { table, .. }
+            | Step::Replace { table, .. }
+            | Step::Delete { table, .. }
+            | Step::ExpectVersion { table, .. }
+            | Step::ExpectAbsent { table, .. }
+            | Step::Upsert { table, .. } => table,
+        }
+    }
 }
 
 /// The kind of write a step performed on a document. Recorded in `WriteSet.ops`
@@ -1195,6 +1213,13 @@ pub async fn execute_txn(
     let mut tx = pool.begin().await?;
 
     for step in &txn.steps {
+        // ENH-005 Task 4: gate each step against the machine-token table
+        // allowlist BEFORE any work. A scoped token cannot write a forbidden
+        // table via any step variant. `tables = None` (admin/scheduled/`User`/
+        // full-access machine tokens) bypasses; the gate is a pure read. Runs
+        // inside the sqlx tx so a `Forbidden` returns via `?` before commit and
+        // rolls back the whole transaction.
+        authorize_table(ctx, step.table())?;
         match step {
             Step::Insert { table, doc } => {
                 let table_def = schema.table(table)?;

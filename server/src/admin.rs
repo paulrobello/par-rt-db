@@ -229,9 +229,16 @@ async fn list_dbs(
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct MintTokenRequest {
     db: String,
     name: String,
+    #[serde(default)]
+    expires_at: Option<i64>,
+    #[serde(default)]
+    read_only: bool,
+    #[serde(default)]
+    tables: Option<Vec<String>>,
 }
 
 #[derive(Serialize)]
@@ -250,7 +257,15 @@ async fn mint_token(
     if !db::database_exists(&state.pool, &body.db).await? {
         return Err(RtDbError::bad_request("unknown database"));
     }
-    let (token_id, token) = auth::tokens::mint_token(&state.pool, &body.db, &body.name).await?;
+    let (token_id, token) = auth::tokens::mint_token(
+        &state.pool,
+        &body.db,
+        &body.name,
+        body.expires_at,
+        body.read_only,
+        body.tables.as_deref(),
+    )
+    .await?;
     Ok(Json(MintTokenResponse { token_id, token }))
 }
 
@@ -950,12 +965,15 @@ async fn admin_delete_webhook(
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct TokenRow {
     id: String,
     name: String,
-    #[serde(rename = "createdAt")]
     created_at: i64,
     revoked: bool,
+    expires_at: Option<i64>,
+    read_only: bool,
+    tables: Option<Vec<String>>,
 }
 
 #[derive(Serialize)]
@@ -977,9 +995,20 @@ async fn list_tokens(
     if !db::database_exists(&state.pool, &params.db).await? {
         return Err(RtDbError::bad_request("unknown database"));
     }
-    let rows: Vec<(String, String, i64, bool)> = sqlx::query_as(
-        "SELECT id, name, created_at, revoked FROM rtdb_auth.machine_tokens \
-         WHERE db_name = $1 ORDER BY created_at",
+    // Column order matches the SELECT below; aliased to keep clippy's
+    // type-complexity lint happy without inlining a 7-tuple into the signature.
+    type TokenRowDb = (
+        String,
+        String,
+        i64,
+        bool,
+        Option<i64>,
+        bool,
+        Option<Vec<String>>,
+    );
+    let rows: Vec<TokenRowDb> = sqlx::query_as(
+        "SELECT id, name, created_at, revoked, expires_at, read_only, tables \
+         FROM rtdb_auth.machine_tokens WHERE db_name = $1 ORDER BY created_at",
     )
     .bind(&params.db)
     .fetch_all(&state.pool)
@@ -987,12 +1016,17 @@ async fn list_tokens(
     Ok(Json(TokensResponse {
         tokens: rows
             .into_iter()
-            .map(|(id, name, created_at, revoked)| TokenRow {
-                id,
-                name,
-                created_at,
-                revoked,
-            })
+            .map(
+                |(id, name, created_at, revoked, expires_at, read_only, tables)| TokenRow {
+                    id,
+                    name,
+                    created_at,
+                    revoked,
+                    expires_at,
+                    read_only,
+                    tables,
+                },
+            )
             .collect(),
     }))
 }

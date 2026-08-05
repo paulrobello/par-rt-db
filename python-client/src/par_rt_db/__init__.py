@@ -36,6 +36,7 @@ from .schema import SchemaDef, TableDef, t
 from .wire import FilterExpr
 
 if TYPE_CHECKING:
+    from .admin import AsyncRtDbAdminClient, MintedToken, RtDbAdminClient, TokenInfo
     from .aio_http_client import RtDbAsyncHttpClient
     from .http_client import RtDbHttpClient
     from .ws_client import RtDbClient, Subscription
@@ -61,6 +62,10 @@ __all__ = [
     "RtDbHttpClient",
     "RtDbClient",
     "Subscription",
+    "RtDbAdminClient",
+    "AsyncRtDbAdminClient",
+    "MintedToken",
+    "TokenInfo",
 ]
 
 
@@ -82,4 +87,8 @@ def __getattr__(name: str) -> Any:
         from . import ws_client
 
         return getattr(ws_client, name)
+    if name in ("RtDbAdminClient", "AsyncRtDbAdminClient", "MintedToken", "TokenInfo"):
+        from . import admin
+
+        return getattr(admin, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

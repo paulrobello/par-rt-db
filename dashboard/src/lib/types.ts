@@ -100,6 +100,10 @@ export interface TokenRow {
   name: string;
   createdAt: number;
   revoked: boolean;
+  /** Server always emits these three; `null` means "no limit" (full access). */
+  expiresAt: number | null;
+  readOnly: boolean;
+  tables: string[] | null;
 }
 
 // File storage — mirrors server/src/storage.rs `FileMeta`. Field names are

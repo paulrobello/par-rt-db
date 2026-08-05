@@ -330,6 +330,56 @@ async fn subscribe_to_unknown_index_returns_subscribe_err() -> anyhow::Result<()
     Ok(())
 }
 
+// ENH-005 Task 4 (h): a machine token scoped to `["projects"]` cannot subscribe
+// to `workItems` — the table-scope gate fires inside `execute_query` (the
+// subscribe path's initial run in `handle_subscribe`) AND again inside
+// `subs::register` as defense-in-depth. Either way the client sees a
+// `subscribeErr` carrying `FORBIDDEN`. Minted directly via the token helper
+// because the admin HTTP route doesn't yet accept `tables`.
+#[tokio::test]
+async fn subscribe_on_forbidden_table_returns_subscribe_err_for_scoped_token() -> anyhow::Result<()>
+{
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let db = fresh_db(&state).await;
+
+    let (_, scoped) = rtdb_server::auth::tokens::mint_token(
+        &state.pool,
+        &db,
+        "scoped",
+        None,
+        false,
+        Some(&["projects".to_string()]),
+    )
+    .await
+    .expect("mint scoped token");
+
+    let mut ws = ws_connect(addr).await;
+    auth(&mut ws, &scoped, &db).await;
+
+    // Subscribe to the forbidden table → subscribeErr / FORBIDDEN.
+    send_json(
+        &mut ws,
+        json!({"type": "subscribe", "queryId": "q1", "query": {"table": "workItems"}}),
+    )
+    .await;
+    let msg = recv_json(&mut ws).await;
+    assert_eq!(msg["type"], json!("subscribeErr"));
+    assert_eq!(msg["queryId"], json!("q1"));
+    assert_eq!(msg["error"]["code"], json!("FORBIDDEN"));
+
+    // Subscribe to the allowed table → initial queryUpdate (empty Docs).
+    send_json(
+        &mut ws,
+        json!({"type": "subscribe", "queryId": "q2", "query": {"table": "projects"}}),
+    )
+    .await;
+    let msg = recv_json(&mut ws).await;
+    assert_eq!(msg["type"], json!("queryUpdate"));
+    assert_eq!(msg["queryId"], json!("q2"));
+    Ok(())
+}
+
 // (h) unsubscribe then mutate -> no further queryUpdate (drain with timeout).
 #[tokio::test]
 async fn unsubscribe_then_mutate_sends_no_further_update() -> anyhow::Result<()> {

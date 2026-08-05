@@ -188,6 +188,7 @@ async fn revoke_token(addr: &SocketAddr, state: &Arc<AppState>, db: &str, token:
         Principal::Machine {
             token_id,
             db: token_db,
+            ..
         } => {
             assert_eq!(token_db, db, "token not minted for this db");
             token_id

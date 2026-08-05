@@ -38,6 +38,17 @@ export interface TokenInfo {
   name: string;
   createdAt: number;
   revoked: boolean;
+  /** Server always sends these three; `null` means "no limit" (full access). */
+  expiresAt: number | null;
+  readOnly: boolean;
+  tables: string[] | null;
+}
+/** Optional capabilities for `mintToken`. Omitted fields fall back to server
+ *  defaults (full access: no expiry, read-write, all tables). */
+export interface MintTokenOptions {
+  expiresAt?: number;
+  readOnly?: boolean;
+  tables?: string[];
 }
 export interface LatencyStats {
   p50: number;
@@ -197,8 +208,12 @@ export class RtDbAdminClient {
     return (body as { databases: string[] }).databases;
   }
 
-  async mintToken(db: string, name: string): Promise<{ tokenId: string; token: string }> {
-    const body = await this.request("POST", "/admin/mint-token", { db, name });
+  async mintToken(
+    db: string,
+    name: string,
+    opts: MintTokenOptions = {},
+  ): Promise<{ tokenId: string; token: string }> {
+    const body = await this.request("POST", "/admin/mint-token", { db, name, ...opts });
     return body as { tokenId: string; token: string };
   }
 

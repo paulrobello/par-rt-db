@@ -147,6 +147,26 @@ export class AdminClient {
   listTokens(db: string) {
     return this.req<{ tokens: TokenRow[] }>(`/admin/tokens?db=${enc(db)}`);
   }
+  /** Mint a scoped/time-limited machine token. Omitted capability fields fall
+   *  back to server defaults (no expiry, read-write, all tables). The plaintext
+   *  `token` is returned ONLY here — the server stores a hash, so it cannot be
+   *  recovered; surface it for one-time copy in the UI. */
+  mintToken(
+    db: string,
+    name: string,
+    opts: { expiresAt?: number; readOnly?: boolean; tables?: string[] } = {},
+  ): Promise<{ tokenId: string; token: string }> {
+    return this.req<{ tokenId: string; token: string }>("/admin/mint-token", {
+      method: "POST",
+      body: JSON.stringify({ db, name, ...opts }),
+    });
+  }
+  revokeToken(tokenId: string): Promise<{ ok: boolean }> {
+    return this.req<{ ok: boolean }>("/admin/revoke-token", {
+      method: "POST",
+      body: JSON.stringify({ tokenId }),
+    });
+  }
   getMetrics() {
     return this.req<MetricsSnapshot>("/admin/metrics");
   }

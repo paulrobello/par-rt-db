@@ -36,6 +36,32 @@ describe("RtDbAdminClient", () => {
       tokenId: "id1",
       token: "secret",
     });
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("http://h:8300/admin/mint-token");
+    // Backward compat: omitting opts POSTs exactly {db, name} — no undefined keys leak.
+    expect(JSON.parse(init.body)).toEqual({ db: "kanban", name: "cli" });
+  });
+
+  it("mintToken spreads capability opts into the body and omits absent fields", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ tokenId: "id2", token: "s2" }));
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+
+    await admin.mintToken("dbx", "scraper", {
+      readOnly: true,
+      tables: ["users"],
+      expiresAt: 1700000000000,
+    });
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("http://h:8300/admin/mint-token");
+    expect(init.method).toBe("POST");
+    // Only the provided fields are sent — server defaults apply to the rest.
+    expect(JSON.parse(init.body)).toEqual({
+      db: "dbx",
+      name: "scraper",
+      readOnly: true,
+      tables: ["users"],
+      expiresAt: 1700000000000,
+    });
   });
 
   it("lists databases", async () => {
@@ -177,8 +203,29 @@ describe("RtDbAdminClient — new endpoints", () => {
     expect(fetchMock.mock.calls[0][0]).toBe("http://h:8300/admin/dbs/kanban/stats");
   });
 
-  it("listTokens GETs /admin/tokens?db= and unwraps {tokens}", async () => {
-    const tokens = [{ id: "t1", name: "ci", createdAt: 1, revoked: false }];
+  it("listTokens GETs /admin/tokens?db= and unwraps {tokens} with capability fields", async () => {
+    const tokens = [
+      // Full-access token: expiresAt null, readOnly false, tables null.
+      {
+        id: "t1",
+        name: "ci",
+        createdAt: 1,
+        revoked: false,
+        expiresAt: null,
+        readOnly: false,
+        tables: null,
+      },
+      // Restricted token: carries every capability field populated.
+      {
+        id: "t2",
+        name: "scraper",
+        createdAt: 2,
+        revoked: false,
+        expiresAt: 1700000000000,
+        readOnly: true,
+        tables: ["users"],
+      },
+    ];
     const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ tokens }));
     const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
     await expect(admin.listTokens("kanban")).resolves.toEqual(tokens);

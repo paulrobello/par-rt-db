@@ -109,6 +109,23 @@ async fn bootstrap_ddl(conn: &mut PgConnection) -> Result<(), RtDbError> {
     .execute(&mut *conn)
     .await?;
 
+    // ENH-005: additive capability columns on machine_tokens. Idempotent alters
+    // so existing deployments pick them up on boot; NULL/empty/false defaults
+    // preserve full-access semantics for tokens minted before the upgrade.
+    sqlx::query(
+        "ALTER TABLE rtdb_auth.machine_tokens ADD COLUMN IF NOT EXISTS expires_at BIGINT NULL",
+    )
+    .execute(&mut *conn)
+    .await?;
+    sqlx::query(
+        "ALTER TABLE rtdb_auth.machine_tokens ADD COLUMN IF NOT EXISTS read_only BOOLEAN NOT NULL DEFAULT false",
+    )
+    .execute(&mut *conn)
+    .await?;
+    sqlx::query("ALTER TABLE rtdb_auth.machine_tokens ADD COLUMN IF NOT EXISTS tables TEXT[] NULL")
+        .execute(&mut *conn)
+        .await?;
+
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS rtdb_auth.admins (
             email text PRIMARY KEY,

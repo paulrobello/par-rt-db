@@ -190,6 +190,7 @@ async fn user_reads_only_own_rows_on_owner_table() -> anyhow::Result<()> {
         &PrincipalCtx {
             user_id: Some("alice".to_string()),
             email: None,
+            ..Default::default()
         },
     )
     .await?;
@@ -229,6 +230,7 @@ async fn owner_filter_composes_with_client_filter() -> anyhow::Result<()> {
         &PrincipalCtx {
             user_id: Some("alice".to_string()),
             email: None,
+            ..Default::default()
         },
     )
     .await?;
@@ -279,6 +281,7 @@ async fn get_point_read_filters_unowned() -> anyhow::Result<()> {
         &PrincipalCtx {
             user_id: Some("bob".to_string()),
             email: None,
+            ..Default::default()
         },
     )
     .await?;
@@ -295,6 +298,7 @@ async fn get_point_read_filters_unowned() -> anyhow::Result<()> {
         &PrincipalCtx {
             user_id: Some("alice".to_string()),
             email: None,
+            ..Default::default()
         },
     )
     .await?;
@@ -360,6 +364,7 @@ async fn non_owner_table_is_unaffected_by_owner() -> anyhow::Result<()> {
         &PrincipalCtx {
             user_id: Some("alice".to_string()),
             email: None,
+            ..Default::default()
         },
     )
     .await?;
@@ -417,6 +422,7 @@ async fn fan_out_does_not_push_cross_user_rows() -> anyhow::Result<()> {
             PrincipalCtx {
                 user_id: Some("alice".to_string()),
                 email: None,
+                ..Default::default()
             },
         )
         .await?;
@@ -432,6 +438,7 @@ async fn fan_out_does_not_push_cross_user_rows() -> anyhow::Result<()> {
             PrincipalCtx {
                 user_id: Some("bob".to_string()),
                 email: None,
+                ..Default::default()
             },
         )
         .await?;
@@ -569,6 +576,7 @@ async fn search_filters_to_own_rows() -> anyhow::Result<()> {
             &PrincipalCtx {
                 user_id: Some("alice".to_string()),
                 email: None,
+                ..Default::default()
             },
         )
         .await?,
@@ -584,6 +592,7 @@ async fn search_filters_to_own_rows() -> anyhow::Result<()> {
             &PrincipalCtx {
                 user_id: Some("bob".to_string()),
                 email: None,
+                ..Default::default()
             },
         )
         .await?,
@@ -688,7 +697,8 @@ async fn vector_search_filters_to_own_rows() -> anyhow::Result<()> {
                 &q.clone(),
                 &PrincipalCtx {
                     user_id: Some("alice".to_string()),
-                    email: None
+                    email: None,
+                    ..Default::default()
                 }
             )
             .await?
@@ -704,7 +714,8 @@ async fn vector_search_filters_to_own_rows() -> anyhow::Result<()> {
                 &q.clone(),
                 &PrincipalCtx {
                     user_id: Some("bob".to_string()),
-                    email: None
+                    email: None,
+                    ..Default::default()
                 }
             )
             .await?
@@ -805,6 +816,7 @@ async fn vector_search_composes_filter_fields_with_owner() -> anyhow::Result<()>
         &PrincipalCtx {
             user_id: Some("alice".to_string()),
             email: None,
+            ..Default::default()
         },
     )
     .await?;
@@ -840,6 +852,7 @@ async fn insert_auto_stamps_owner() -> anyhow::Result<()> {
         &PrincipalCtx {
             user_id: Some("alice".to_string()),
             email: None,
+            ..Default::default()
         },
     )
     .await
@@ -876,6 +889,7 @@ async fn insert_cannot_forge_another_users_owner() -> anyhow::Result<()> {
         &PrincipalCtx {
             user_id: Some("alice".to_string()),
             email: None,
+            ..Default::default()
         },
     )
     .await
@@ -931,6 +945,7 @@ async fn patch_on_unowned_doc_is_forbidden_and_atomic() -> anyhow::Result<()> {
         &PrincipalCtx {
             user_id: Some("alice".to_string()),
             email: None,
+            ..Default::default()
         },
     )
     .await
@@ -983,6 +998,7 @@ async fn delete_and_replace_on_unowned_doc_are_forbidden() -> anyhow::Result<()>
         &PrincipalCtx {
             user_id: Some("alice".to_string()),
             email: None,
+            ..Default::default()
         },
     )
     .await
@@ -1013,6 +1029,7 @@ async fn delete_and_replace_on_unowned_doc_are_forbidden() -> anyhow::Result<()>
         &PrincipalCtx {
             user_id: Some("alice".to_string()),
             email: None,
+            ..Default::default()
         },
     )
     .await
@@ -1057,6 +1074,7 @@ async fn upsert_insert_branch_stamps_and_update_branch_checks_owner() -> anyhow:
         &PrincipalCtx {
             user_id: Some("alice".to_string()),
             email: None,
+            ..Default::default()
         },
     )
     .await
@@ -1092,6 +1110,7 @@ async fn upsert_insert_branch_stamps_and_update_branch_checks_owner() -> anyhow:
         &PrincipalCtx {
             user_id: Some("alice".to_string()),
             email: None,
+            ..Default::default()
         },
     )
     .await
@@ -1170,6 +1189,7 @@ async fn patch_cannot_transfer_ownership() -> anyhow::Result<()> {
         &PrincipalCtx {
             user_id: Some("alice".to_string()),
             email: None,
+            ..Default::default()
         },
     )
     .await
@@ -1196,6 +1216,7 @@ async fn patch_cannot_transfer_ownership() -> anyhow::Result<()> {
             &PrincipalCtx {
                 user_id: Some("bob".to_string()),
                 email: None,
+                ..Default::default()
             },
         )
         .await?,
@@ -1231,6 +1252,7 @@ async fn replace_cannot_transfer_ownership() -> anyhow::Result<()> {
         &PrincipalCtx {
             user_id: Some("alice".to_string()),
             email: None,
+            ..Default::default()
         },
     )
     .await
@@ -1278,6 +1300,7 @@ async fn patch_owner_change_does_not_inject_into_other_users_feed() -> anyhow::R
             PrincipalCtx {
                 user_id: Some("bob".to_string()),
                 email: None,
+                ..Default::default()
             },
         )
         .await?;
@@ -1302,6 +1325,7 @@ async fn patch_owner_change_does_not_inject_into_other_users_feed() -> anyhow::R
             PrincipalCtx {
                 user_id: Some("alice".to_string()),
                 email: None,
+                ..Default::default()
             },
         )
         .await?;
@@ -1339,6 +1363,7 @@ async fn patch_owner_change_does_not_inject_into_other_users_feed() -> anyhow::R
             PrincipalCtx {
                 user_id: Some("alice".to_string()),
                 email: None,
+                ..Default::default()
             },
         )
         .await?;
@@ -1770,6 +1795,7 @@ async fn collab_owner_and_collaborator_both_read_shared_row() -> anyhow::Result<
         &PrincipalCtx {
             user_id: Some("alice".to_string()),
             email: None,
+            ..Default::default()
         },
     )
     .await?;
@@ -1784,6 +1810,7 @@ async fn collab_owner_and_collaborator_both_read_shared_row() -> anyhow::Result<
         &PrincipalCtx {
             user_id: Some("bob".to_string()),
             email: None,
+            ..Default::default()
         },
     )
     .await?;
@@ -1798,6 +1825,7 @@ async fn collab_owner_and_collaborator_both_read_shared_row() -> anyhow::Result<
         &PrincipalCtx {
             user_id: Some("carol".to_string()),
             email: None,
+            ..Default::default()
         },
     )
     .await?;
@@ -1847,7 +1875,8 @@ async fn collab_missing_array_degrades_to_owner_only() -> anyhow::Result<()> {
                 &q,
                 &PrincipalCtx {
                     user_id: Some("alice".to_string()),
-                    email: None
+                    email: None,
+                    ..Default::default()
                 }
             )
             .await?
@@ -1863,7 +1892,8 @@ async fn collab_missing_array_degrades_to_owner_only() -> anyhow::Result<()> {
                 &q,
                 &PrincipalCtx {
                     user_id: Some("bob".to_string()),
-                    email: None
+                    email: None,
+                    ..Default::default()
                 }
             )
             .await?
@@ -1893,6 +1923,7 @@ async fn collab_point_read_filters_non_collaborator() -> anyhow::Result<()> {
             &PrincipalCtx {
                 user_id: Some(uid.to_string()),
                 email: None,
+                ..Default::default()
             },
         )
         .await?
@@ -1909,6 +1940,7 @@ async fn collab_point_read_filters_non_collaborator() -> anyhow::Result<()> {
         &PrincipalCtx {
             user_id: Some("carol".to_string()),
             email: None,
+            ..Default::default()
         },
     )
     .await?
@@ -1944,6 +1976,7 @@ async fn collab_collaborator_can_write_non_collaborator_forbidden() -> anyhow::R
         &PrincipalCtx {
             user_id: Some("carol".to_string()),
             email: None,
+            ..Default::default()
         },
     )
     .await
@@ -1970,6 +2003,7 @@ async fn collab_collaborator_can_write_non_collaborator_forbidden() -> anyhow::R
         &PrincipalCtx {
             user_id: Some("bob".to_string()),
             email: None,
+            ..Default::default()
         },
     )
     .await
@@ -1997,6 +2031,7 @@ async fn collab_collaborator_can_write_non_collaborator_forbidden() -> anyhow::R
         &PrincipalCtx {
             user_id: Some("carol".to_string()),
             email: None,
+            ..Default::default()
         },
     )
     .await
@@ -2017,6 +2052,7 @@ async fn collab_collaborator_can_write_non_collaborator_forbidden() -> anyhow::R
         &PrincipalCtx {
             user_id: Some("bob".to_string()),
             email: None,
+            ..Default::default()
         },
     )
     .await
@@ -2052,6 +2088,7 @@ async fn collab_upsert_update_branch_checks_collaborator() -> anyhow::Result<()>
         &PrincipalCtx {
             user_id: Some("carol".to_string()),
             email: None,
+            ..Default::default()
         },
     )
     .await
@@ -2075,6 +2112,7 @@ async fn collab_upsert_update_branch_checks_collaborator() -> anyhow::Result<()>
         &PrincipalCtx {
             user_id: Some("bob".to_string()),
             email: None,
+            ..Default::default()
         },
     )
     .await
@@ -2114,6 +2152,7 @@ async fn collab_fan_out_reaches_owner_and_collaborator() -> anyhow::Result<()> {
             PrincipalCtx {
                 user_id: Some("alice".to_string()),
                 email: None,
+                ..Default::default()
             },
         )
         .await?;
@@ -2129,6 +2168,7 @@ async fn collab_fan_out_reaches_owner_and_collaborator() -> anyhow::Result<()> {
             PrincipalCtx {
                 user_id: Some("bob".to_string()),
                 email: None,
+                ..Default::default()
             },
         )
         .await?;
@@ -2144,6 +2184,7 @@ async fn collab_fan_out_reaches_owner_and_collaborator() -> anyhow::Result<()> {
             PrincipalCtx {
                 user_id: Some("carol".to_string()),
                 email: None,
+                ..Default::default()
             },
         )
         .await?;
@@ -2240,6 +2281,7 @@ async fn collab_or_predicate_composes_with_client_filter() -> anyhow::Result<()>
             &PrincipalCtx {
                 user_id: Some("bob".to_string()),
                 email: None,
+                ..Default::default()
             },
         )
         .await?,
@@ -2263,6 +2305,7 @@ async fn collab_or_predicate_composes_with_client_filter() -> anyhow::Result<()>
             &PrincipalCtx {
                 user_id: Some("bob".to_string()),
                 email: None,
+                ..Default::default()
             },
         )
         .await?,
@@ -2425,6 +2468,7 @@ async fn authorize_user_sees_own_and_public_not_others_private() -> anyhow::Resu
         &PrincipalCtx {
             user_id: Some("alice".to_string()),
             email: None,
+            ..Default::default()
         },
     )
     .await?;
@@ -2490,6 +2534,7 @@ async fn authorize_count_filters_user() -> anyhow::Result<()> {
         &PrincipalCtx {
             user_id: Some("alice".to_string()),
             email: None,
+            ..Default::default()
         },
     )
     .await?;
@@ -2529,6 +2574,7 @@ async fn client_filter_rejects_principal_marker() -> anyhow::Result<()> {
         &PrincipalCtx {
             user_id: Some("alice".to_string()),
             email: None,
+            ..Default::default()
         },
     )
     .await
@@ -2577,6 +2623,7 @@ async fn authorize_get_filters_unauthorized_user() -> anyhow::Result<()> {
         &PrincipalCtx {
             user_id: Some("alice".to_string()),
             email: None,
+            ..Default::default()
         },
     )
     .await?;
@@ -2596,6 +2643,7 @@ async fn authorize_get_filters_unauthorized_user() -> anyhow::Result<()> {
         &PrincipalCtx {
             user_id: Some("alice".to_string()),
             email: None,
+            ..Default::default()
         },
     )
     .await?;
@@ -2635,6 +2683,7 @@ async fn authorize_get_allows_other_users_public() -> anyhow::Result<()> {
         &PrincipalCtx {
             user_id: Some("alice".to_string()),
             email: None,
+            ..Default::default()
         },
     )
     .await?;
@@ -2709,6 +2758,7 @@ async fn authorize_patch_on_unauthorized_doc_is_forbidden_and_atomic() -> anyhow
         &PrincipalCtx {
             user_id: Some("alice".to_string()),
             email: None,
+            ..Default::default()
         },
     )
     .await
@@ -2765,6 +2815,7 @@ async fn authorize_patch_own_and_delete_other_public_succeed() -> anyhow::Result
         &PrincipalCtx {
             user_id: Some("alice".to_string()),
             email: None,
+            ..Default::default()
         },
     )
     .await
@@ -2788,6 +2839,7 @@ async fn authorize_patch_own_and_delete_other_public_succeed() -> anyhow::Result
         &PrincipalCtx {
             user_id: Some("alice".to_string()),
             email: None,
+            ..Default::default()
         },
     )
     .await
@@ -2821,6 +2873,7 @@ async fn authorize_replace_and_delete_on_unauthorized_doc_are_forbidden() -> any
         &PrincipalCtx {
             user_id: Some("alice".to_string()),
             email: None,
+            ..Default::default()
         },
     )
     .await
@@ -2852,6 +2905,7 @@ async fn authorize_replace_and_delete_on_unauthorized_doc_are_forbidden() -> any
         &PrincipalCtx {
             user_id: Some("alice".to_string()),
             email: None,
+            ..Default::default()
         },
     )
     .await
@@ -2901,6 +2955,7 @@ async fn authorize_upsert_update_on_unauthorized_doc_is_forbidden() -> anyhow::R
         &PrincipalCtx {
             user_id: Some("alice".to_string()),
             email: None,
+            ..Default::default()
         },
     )
     .await
@@ -3116,6 +3171,7 @@ fn alice_ctx() -> PrincipalCtx {
     PrincipalCtx {
         user_id: Some("alice".to_string()),
         email: None,
+        ..Default::default()
     }
 }
 
@@ -3521,6 +3577,7 @@ async fn authorize_patch_re_stamps_eq_user_leaf_closing_injection() -> anyhow::R
         &PrincipalCtx {
             user_id: Some("bob".to_string()),
             email: None,
+            ..Default::default()
         },
     )
     .await?;
@@ -3905,6 +3962,7 @@ async fn owner_and_authorize_both_gates_must_pass() -> anyhow::Result<()> {
     let alice = PrincipalCtx {
         user_id: Some("alice".to_string()),
         email: None,
+        ..Default::default()
     };
 
     // (1) Scan: alice sees only the row she owns AND that is public.
@@ -3988,6 +4046,7 @@ async fn expect_version_does_not_leak_unowned_doc() -> anyhow::Result<()> {
     let alice = PrincipalCtx {
         user_id: Some("alice".into()),
         email: None,
+        ..Default::default()
     };
 
     for probe in [0_i64, 1, 2, 99] {
@@ -4026,6 +4085,7 @@ async fn expect_version_own_doc_behaves_as_before() -> anyhow::Result<()> {
     let alice = PrincipalCtx {
         user_id: Some("alice".into()),
         email: None,
+        ..Default::default()
     };
 
     let err = execute_txn(
@@ -4146,6 +4206,7 @@ async fn expect_version_authorize_hides_invisible_doc() -> anyhow::Result<()> {
     let alice = PrincipalCtx {
         user_id: Some("alice".into()),
         email: None,
+        ..Default::default()
     };
 
     // alice cannot see bob's private post -> NotFound even on the real version.
@@ -4181,6 +4242,7 @@ async fn expect_version_authorize_hides_invisible_doc() -> anyhow::Result<()> {
         &PrincipalCtx {
             user_id: Some("bob".into()),
             email: None,
+            ..Default::default()
         },
     )
     .await
@@ -4210,6 +4272,7 @@ async fn expect_absent_does_not_leak_unowned_doc() -> anyhow::Result<()> {
     let alice = PrincipalCtx {
         user_id: Some("alice".into()),
         email: None,
+        ..Default::default()
     };
 
     // bob owns the userId="bob" row; alice probing that key sees "absent" -> Ok.
@@ -4256,6 +4319,7 @@ async fn expect_absent_own_doc_behaves_as_before() -> anyhow::Result<()> {
     let alice = PrincipalCtx {
         user_id: Some("alice".into()),
         email: None,
+        ..Default::default()
     };
 
     let err = execute_txn(
@@ -4324,6 +4388,7 @@ async fn expect_absent_collaborators_visibility() -> anyhow::Result<()> {
         &PrincipalCtx {
             user_id: Some("carol".into()),
             email: None,
+            ..Default::default()
         },
     )
     .await
@@ -4343,6 +4408,7 @@ async fn expect_absent_collaborators_visibility() -> anyhow::Result<()> {
         &PrincipalCtx {
             user_id: Some("alice".into()),
             email: None,
+            ..Default::default()
         },
     )
     .await
@@ -4379,6 +4445,7 @@ async fn expect_absent_authorize_hides_invisible_doc() -> anyhow::Result<()> {
         &PrincipalCtx {
             user_id: Some("carol".into()),
             email: None,
+            ..Default::default()
         },
     )
     .await
@@ -4399,6 +4466,7 @@ async fn expect_absent_authorize_hides_invisible_doc() -> anyhow::Result<()> {
         &PrincipalCtx {
             user_id: Some("bob".into()),
             email: None,
+            ..Default::default()
         },
     )
     .await

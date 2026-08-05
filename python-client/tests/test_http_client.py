@@ -663,6 +663,9 @@ def test_admin_admins_remove_uses_delete_with_body() -> None:
 
 
 def test_admin_list_tokens_returns_token_info() -> None:
+    """The server (ENH-005) always serializes the 7-field shape; the mock must
+    match the real wire so the ``extra="forbid"`` model exercises the new
+    ``expiresAt``/``readOnly``/``tables`` fields, not a frozen old 4-field one."""
     client = _admin_client(
         _handler_map(
             {
@@ -670,8 +673,24 @@ def test_admin_list_tokens_returns_token_info() -> None:
                     200,
                     json={
                         "tokens": [
-                            {"id": "t1", "name": "cli", "createdAt": 500, "revoked": False},
-                            {"id": "t2", "name": "ci", "createdAt": 600, "revoked": True},
+                            {
+                                "id": "t1",
+                                "name": "scraper",
+                                "createdAt": 500,
+                                "revoked": False,
+                                "expiresAt": 1700000000000,
+                                "readOnly": True,
+                                "tables": ["users"],
+                            },
+                            {
+                                "id": "t2",
+                                "name": "ci",
+                                "createdAt": 600,
+                                "revoked": True,
+                                "expiresAt": None,
+                                "readOnly": False,
+                                "tables": None,
+                            },
                         ]
                     },
                 )
@@ -683,9 +702,17 @@ def test_admin_list_tokens_returns_token_info() -> None:
     tokens = client.list_tokens("kanban")
     assert len(tokens) == 2
     assert isinstance(tokens[0], TokenInfo)
+    # restricted row — capability fields populated
     assert tokens[0].id == "t1"
     assert tokens[0].created_at == 500
+    assert tokens[0].expires_at == 1700000000000
+    assert tokens[0].read_only is True
+    assert tokens[0].tables == ["users"]
+    # full-access row — null/false/None defaults
     assert tokens[1].revoked is True
+    assert tokens[1].expires_at is None
+    assert tokens[1].read_only is False
+    assert tokens[1].tables is None
 
 
 def test_admin_get_schema_returns_schema_def() -> None:

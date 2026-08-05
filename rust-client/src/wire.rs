@@ -470,9 +470,30 @@ pub mod admin {
     }
 
     #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
     pub(crate) struct MintTokenRequest<'a> {
         pub(crate) db: &'a str,
         pub(crate) name: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub(crate) expires_at: Option<i64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub(crate) read_only: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub(crate) tables: Option<&'a [String]>,
+    }
+
+    /// Optional capabilities for [`crate::http::RtDbHttpClient::mint_token_with_options`].
+    /// Every field is optional; `MintTokenOptions::default()` is a full-access
+    /// mint (no expiry, read-write, all tables) — the server applies those
+    /// defaults to any field left `None`.
+    #[derive(Debug, Clone, Default)]
+    pub struct MintTokenOptions {
+        /// Unix-millis expiry (`expiresAt` on the wire). `None` = no expiry.
+        pub expires_at: Option<i64>,
+        /// `readOnly` on the wire. `None` = read-write (server default).
+        pub read_only: Option<bool>,
+        /// `tables` allowlist on the wire. `None` = all tables (server default).
+        pub tables: Option<Vec<String>>,
     }
 
     #[derive(Serialize)]
@@ -545,6 +566,18 @@ pub mod admin {
         pub name: String,
         pub created_at: i64,
         pub revoked: bool,
+        /// `null` = no expiry. Defaults to `None` for older servers that
+        /// omit the field.
+        #[serde(default)]
+        pub expires_at: Option<i64>,
+        /// Server always emits `readOnly`. Defaults to `false` for older
+        /// servers that omit the field.
+        #[serde(default)]
+        pub read_only: bool,
+        /// `null` = all tables. Defaults to `None` for older servers that
+        /// omit the field.
+        #[serde(default)]
+        pub tables: Option<Vec<String>>,
     }
 
     /// p50/p95/p99 latency percentile triple (microseconds). Mirrors

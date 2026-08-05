@@ -669,6 +669,9 @@ async def test_admin_admins_remove_uses_delete_with_body() -> None:
 
 
 async def test_admin_list_tokens_returns_token_info() -> None:
+    """Async mirror of the sync test — the 7-field wire shape must deserialize
+    on the ``extra="forbid"`` model, exercising ``expiresAt``/``readOnly``/
+    ``tables`` on both a restricted and a full-access row."""
     async with _admin_client(
         _handler_map(
             {
@@ -676,8 +679,24 @@ async def test_admin_list_tokens_returns_token_info() -> None:
                     200,
                     json={
                         "tokens": [
-                            {"id": "t1", "name": "cli", "createdAt": 500, "revoked": False},
-                            {"id": "t2", "name": "ci", "createdAt": 600, "revoked": True},
+                            {
+                                "id": "t1",
+                                "name": "scraper",
+                                "createdAt": 500,
+                                "revoked": False,
+                                "expiresAt": 1700000000000,
+                                "readOnly": True,
+                                "tables": ["users"],
+                            },
+                            {
+                                "id": "t2",
+                                "name": "ci",
+                                "createdAt": 600,
+                                "revoked": True,
+                                "expiresAt": None,
+                                "readOnly": False,
+                                "tables": None,
+                            },
                         ]
                     },
                 )
@@ -690,8 +709,13 @@ async def test_admin_list_tokens_returns_token_info() -> None:
     assert len(tokens) == 2
     assert isinstance(tokens[0], TokenInfo)
     assert tokens[0].id == "t1"
-    assert tokens[0].created_at == 500
+    assert tokens[0].expires_at == 1700000000000
+    assert tokens[0].read_only is True
+    assert tokens[0].tables == ["users"]
     assert tokens[1].revoked is True
+    assert tokens[1].expires_at is None
+    assert tokens[1].read_only is False
+    assert tokens[1].tables is None
 
 
 async def test_admin_get_schema_returns_schema_def() -> None:

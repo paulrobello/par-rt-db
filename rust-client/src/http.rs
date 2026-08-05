@@ -618,15 +618,39 @@ impl RtDbHttpClient {
     }
 
     /// `POST /admin/mint-token` `{db, name}` → `{tokenId, token}`.
+    ///
+    /// Mints a full-access token (no expiry, read-write, all tables) — the
+    /// server defaults. For scoped capabilities use
+    /// [`mint_token_with_options`](Self::mint_token_with_options).
     pub async fn mint_token(
         &self,
         db: &str,
         name: &str,
     ) -> Result<crate::wire::admin::MintedToken, RtDbError> {
+        self.mint_token_with_options(db, name, &crate::wire::admin::MintTokenOptions::default())
+            .await
+    }
+
+    /// `POST /admin/mint-token` `{db, name, expiresAt?, readOnly?, tables?}` →
+    /// `{tokenId, token}`. Fields left `None` on [`MintTokenOptions`] are omitted
+    /// from the body so the server applies its defaults (no expiry, read-write,
+    /// all tables).
+    pub async fn mint_token_with_options(
+        &self,
+        db: &str,
+        name: &str,
+        opts: &crate::wire::admin::MintTokenOptions,
+    ) -> Result<crate::wire::admin::MintedToken, RtDbError> {
         let resp = self
             .post_json(
                 "/admin/mint-token",
-                &crate::wire::admin::MintTokenRequest { db, name },
+                &crate::wire::admin::MintTokenRequest {
+                    db,
+                    name,
+                    expires_at: opts.expires_at,
+                    read_only: opts.read_only,
+                    tables: opts.tables.as_deref(),
+                },
             )
             .await?;
         self.deserialize::<crate::wire::admin::MintedToken>(resp)
@@ -2067,6 +2091,233 @@ mod admin_tests {
         assert_eq!(tokens[0].created_at, 123);
         assert!(!tokens[0].revoked);
         assert!(tokens[1].revoked);
+    }
+
+    #[tokio::test]
+    async fn mint_token_with_options_posts_capabilities() {
+        let (server, client) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/admin/mint-token"))
+            .and(body_partial_json(json!({
+                "db": "kanban",
+                "name": "scraper",
+                "expiresAt": 1700000000000_i64,
+                "readOnly": true,
+                "tables": ["users"],
+            })))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"tokenId": "id2", "token": "s2"})),
+            )
+            .mount(&server)
+            .await;
+        let minted = client
+            .mint_token_with_options(
+                "kanban",
+                "scraper",
+                &crate::wire::admin::MintTokenOptions {
+                    expires_at: Some(1700000000000),
+                    read_only: Some(true),
+                    tables: Some(vec!["users".to_string()]),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(minted.token_id, "id2");
+        assert_eq!(minted.token, "s2");
+    }
+
+    #[tokio::test]
+    async fn mint_token_omits_unset_capabilities() {
+        // Backward compat: an unset MintTokenOptions (Default) must serialize
+        // to exactly {db, name} — no capability keys leak, so server defaults
+        // (full access) apply. Verifies `skip_serializing_if = "Option::is_none"`.
+        let (server, client) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/admin/mint-token"))
+            .and(body_partial_json(json!({"db": "kanban", "name": "cli"})))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"tokenId": "id1", "token": "secret"})),
+            )
+            .mount(&server)
+            .await;
+        let minted = client
+            .mint_token_with_options(
+                "kanban",
+                "cli",
+                &crate::wire::admin::MintTokenOptions::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(minted.token_id, "id1");
+        assert_eq!(minted.token, "secret");
+    }
+
+    #[tokio::test]
+    async fn list_tokens_returns_capability_fields() {
+        let (server, client) = setup().await;
+        Mock::given(method("GET"))
+            .and(path("/admin/tokens"))
+            .and(query_param("db", "kanban"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "tokens": [
+                    {
+                        "id": "t1",
+                        "name": "ci",
+                        "createdAt": 1,
+                        "revoked": false,
+                        "expiresAt": null,
+                        "readOnly": false,
+                        "tables": null
+                    },
+                    {
+                        "id": "t2",
+                        "name": "scraper",
+                        "createdAt": 2,
+                        "revoked": false,
+                        "expiresAt": 1700000000000_i64,
+                        "readOnly": true,
+                        "tables": ["users"]
+                    }
+                ]
+            })))
+            .mount(&server)
+            .await;
+        let tokens = client.list_tokens("kanban").await.unwrap();
+        assert_eq!(tokens.len(), 2);
+        // Full-access token: null/None/false means "no limit".
+        assert_eq!(tokens[0].expires_at, None);
+        assert!(!tokens[0].read_only);
+        assert_eq!(tokens[0].tables, None);
+        // Restricted token: every capability field populated.
+        assert_eq!(tokens[1].expires_at, Some(1700000000000));
+        assert!(tokens[1].read_only);
+        assert_eq!(tokens[1].tables, Some(vec!["users".to_string()]));
+    }
+
+    #[tokio::test]
+    async fn list_tokens_deserializes_legacy_fixture() {
+        // Older servers that don't send the capability fields must still
+        // deserialize (defaults: expires_at=None, read_only=false, tables=None).
+        let (server, client) = setup().await;
+        Mock::given(method("GET"))
+            .and(path("/admin/tokens"))
+            .and(query_param("db", "kanban"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "tokens": [
+                    {"id":"old","name":"legacy","createdAt":42,"revoked":false}
+                ]
+            })))
+            .mount(&server)
+            .await;
+        let tokens = client.list_tokens("kanban").await.unwrap();
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0].id, "old");
+        assert_eq!(tokens[0].expires_at, None);
+        assert!(!tokens[0].read_only);
+        assert_eq!(tokens[0].tables, None);
+    }
+
+    /// Wire-parity for `MintTokenRequest`: camelCase keys, and `None`
+    /// capability fields are omitted entirely (not `null`) so server defaults
+    /// apply. Mirrors the ts-client `mintToken` body-shape assertion.
+    #[test]
+    fn mint_token_request_serializes_wire_shape() {
+        use crate::wire::admin::MintTokenRequest;
+
+        // Full-access: every capability None → body is exactly {db, name}.
+        let full = MintTokenRequest {
+            db: "kanban",
+            name: "cli",
+            expires_at: None,
+            read_only: None,
+            tables: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&full).unwrap(),
+            json!({"db": "kanban", "name": "cli"}),
+        );
+
+        // Restricted: every capability set → camelCase keys present.
+        let tables = vec!["users".to_string(), "notes".to_string()];
+        let scoped = MintTokenRequest {
+            db: "dbx",
+            name: "scraper",
+            expires_at: Some(1700000000000),
+            read_only: Some(true),
+            tables: Some(&tables),
+        };
+        assert_eq!(
+            serde_json::to_value(&scoped).unwrap(),
+            json!({
+                "db": "dbx",
+                "name": "scraper",
+                "expiresAt": 1700000000000_i64,
+                "readOnly": true,
+                "tables": ["users", "notes"],
+            }),
+        );
+
+        // Partial: only one capability set → only that key appears.
+        let partial = MintTokenRequest {
+            db: "dbx",
+            name: "reader",
+            expires_at: None,
+            read_only: Some(true),
+            tables: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&partial).unwrap(),
+            json!({"db": "dbx", "name": "reader", "readOnly": true}),
+        );
+    }
+
+    /// Wire-parity for `TokenInfo`: deserializes both the restricted fixture
+    /// (`expiresAt:number, readOnly:true, tables:[...]`) and the full-access
+    /// fixture (`expiresAt:null, readOnly:false, tables:null`), plus the
+    /// legacy fixture (capability fields absent → defaults).
+    #[test]
+    fn token_info_deserializes_wire_shapes() {
+        use crate::wire::admin::TokenInfo;
+
+        let restricted: TokenInfo = serde_json::from_value(json!({
+            "id": "t2",
+            "name": "scraper",
+            "createdAt": 2,
+            "revoked": false,
+            "expiresAt": 1700000000000_i64,
+            "readOnly": true,
+            "tables": ["users"],
+        }))
+        .unwrap();
+        assert_eq!(restricted.expires_at, Some(1700000000000));
+        assert!(restricted.read_only);
+        assert_eq!(restricted.tables, Some(vec!["users".to_string()]));
+
+        let full: TokenInfo = serde_json::from_value(json!({
+            "id": "t1",
+            "name": "ci",
+            "createdAt": 1,
+            "revoked": false,
+            "expiresAt": null,
+            "readOnly": false,
+            "tables": null,
+        }))
+        .unwrap();
+        assert_eq!(full.expires_at, None);
+        assert!(!full.read_only);
+        assert_eq!(full.tables, None);
+
+        let legacy: TokenInfo = serde_json::from_value(json!({
+            "id": "old",
+            "name": "legacy",
+            "createdAt": 42,
+            "revoked": false,
+        }))
+        .unwrap();
+        assert_eq!(legacy.expires_at, None);
+        assert!(!legacy.read_only);
+        assert_eq!(legacy.tables, None);
     }
 
     #[tokio::test]

@@ -670,6 +670,7 @@ async fn owner_filtered_collect_over_approximates_for_other_users_doc() -> anyho
             PrincipalCtx {
                 user_id: Some("userA".to_string()),
                 email: None,
+                ..Default::default()
             },
         )
         .await?;
@@ -686,6 +687,7 @@ async fn owner_filtered_collect_over_approximates_for_other_users_doc() -> anyho
             PrincipalCtx {
                 user_id: Some("userA".to_string()),
                 email: None,
+                ..Default::default()
             },
         )
         .await?;
@@ -704,6 +706,7 @@ async fn owner_filtered_collect_over_approximates_for_other_users_doc() -> anyho
             PrincipalCtx {
                 user_id: Some("userB".to_string()),
                 email: None,
+                ..Default::default()
             },
         )
         .await?;
@@ -724,6 +727,7 @@ async fn owner_filtered_collect_over_approximates_for_other_users_doc() -> anyho
             PrincipalCtx {
                 user_id: Some("userB".to_string()),
                 email: None,
+                ..Default::default()
             },
         )
         .await?;

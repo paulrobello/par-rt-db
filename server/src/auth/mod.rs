@@ -20,6 +20,12 @@ pub enum Principal {
     Machine {
         db: String,
         token_id: String,
+        /// ENH-005: when `true`, the token may only read; writes are rejected
+        /// (enforced by the executors, not here). Captured once at resolution.
+        read_only: bool,
+        /// ENH-005: when `Some`, the token is scoped to exactly these tables;
+        /// `None` means all tables. Captured once at resolution.
+        tables: Option<Vec<String>>,
     },
     User {
         user_id: String,
@@ -36,21 +42,51 @@ pub enum Principal {
     },
 }
 
+impl Principal {
+    /// ENH-005: whether this principal is read-only. Only `Machine` tokens
+    /// minted with `read_only = true` are; `User` principals are never
+    /// read-only. Used by the executors to gate writes.
+    pub fn is_read_only(&self) -> bool {
+        matches!(
+            self,
+            Principal::Machine {
+                read_only: true,
+                ..
+            }
+        )
+    }
+}
+
 /// Resolves a bearer token to a `Principal`: first a machine-token digest
 /// lookup (`rtdb_auth.machine_tokens`, revoked tokens excluded), then falls
 /// back to session tokens. Errors `Unauthorized` if neither resolves.
+///
+/// ENH-005: the machine-token row also carries `read_only` and `tables`,
+/// which are threaded onto `Principal::Machine` for the executors. Expiry is
+/// NOT resolved here — it stays a live check in `authorize` so an expired
+/// token that still resolves (for the live-reject path) is denied per-op.
 pub async fn resolve_bearer(pool: &PgPool, token: &str) -> Result<Principal, RtDbError> {
     let hash = sha256_hex(token);
 
-    let machine: Option<(String, String)> = sqlx::query_as(
-        "SELECT id, db_name FROM rtdb_auth.machine_tokens WHERE token_hash = $1 AND NOT revoked",
+    // `(id, db_name, read_only, tables, expires_at)`. `expires_at` is read
+    // here only so the row shape matches the SELECT — it is NOT threaded onto
+    // the Principal; `authorize` re-queries it live per-op.
+    type MachineRow = (String, String, bool, Option<Vec<String>>, Option<i64>);
+    let machine: Option<MachineRow> = sqlx::query_as(
+        "SELECT id, db_name, read_only, tables, expires_at \
+             FROM rtdb_auth.machine_tokens WHERE token_hash = $1 AND NOT revoked",
     )
     .bind(&hash)
     .fetch_optional(pool)
     .await?;
 
-    if let Some((token_id, db)) = machine {
-        return Ok(Principal::Machine { db, token_id });
+    if let Some((token_id, db, read_only, tables, _expires_at)) = machine {
+        return Ok(Principal::Machine {
+            db,
+            token_id,
+            read_only,
+            tables,
+        });
     }
 
     if let Some(principal) = session::resolve_session(pool, token).await? {
@@ -61,10 +97,11 @@ pub async fn resolve_bearer(pool: &PgPool, token: &str) -> Result<Principal, RtD
 }
 
 /// Authorization for a database: a machine token must match `db` exactly and
-/// still be un-revoked — checked live against `rtdb_auth.machine_tokens` on
-/// every call, so a token revoked mid-session is denied on its very next
-/// operation rather than only at the next fresh connection; a user must hold
-/// an unexpired session and be present in `rtdb_auth.allowlist` for `db`.
+/// still be un-revoked AND un-expired — checked live against
+/// `rtdb_auth.machine_tokens` on every call, so a token revoked or expired
+/// mid-session is denied on its very next operation rather than only at the
+/// next fresh connection; a user must hold an unexpired session and be present
+/// in `rtdb_auth.allowlist` for `db`.
 /// Session expiry is checked against `expires_at`, captured once at session
 /// resolution — a session's expiry is immutable once minted, so this cached
 /// comparison is exactly as live as a fresh DB query, without costing one
@@ -76,20 +113,27 @@ pub async fn authorize(pool: &PgPool, principal: &Principal, db: &str) -> Result
         Principal::Machine {
             db: token_db,
             token_id,
+            ..
         } => {
             if token_db != db {
                 return Err(RtDbError::forbidden("token is not valid for this database"));
             }
+            // Live check: the token must still be un-revoked AND un-expired.
+            // `expires_at IS NULL` ⇒ never expires (legacy full-access path);
+            // otherwise it must be in the future. Re-queried per op so a token
+            // that expires or is revoked mid-session is denied on its next use.
             let (live,): (bool,) = sqlx::query_as(
-                "SELECT EXISTS(SELECT 1 FROM rtdb_auth.machine_tokens WHERE id = $1 AND NOT revoked)",
+                "SELECT EXISTS(SELECT 1 FROM rtdb_auth.machine_tokens \
+                 WHERE id = $1 AND NOT revoked AND (expires_at IS NULL OR expires_at > $2))",
             )
             .bind(token_id)
+            .bind(now_ms())
             .fetch_one(pool)
             .await?;
             if live {
                 Ok(())
             } else {
-                Err(RtDbError::unauthorized("token revoked"))
+                Err(RtDbError::unauthorized("token revoked or expired"))
             }
         }
         Principal::User {
@@ -122,43 +166,78 @@ pub async fn authorize(pool: &PgPool, principal: &Principal, db: &str) -> Result
 /// predicate evaluation. `user_id == None` ⇒ bypass (`Machine`/admin/scheduled);
 /// `Some` ⇒ `$user`/`$email` markers in a `FilterExpr` resolve to this identity.
 ///
+/// ENH-005 Task 4: `tables` carries the machine-token table allowlist so the
+/// executor boundary can gate reads/writes/subscriptions without a separate
+/// `&Principal` thread. `None` ⇒ all tables (admin/scheduled/`User`/full-access
+/// machine tokens); `Some(non-empty)` ⇒ only those tables. An empty list is
+/// treated as "no restriction" (mint-time contract: empty ⇒ `None`).
+///
 /// Held as owned `Option<String>` (rather than the brief's `&'a str` sketch) so
 /// Task 5 can thread it through the executors without lifetime gymnastics.
-#[derive(Debug, Clone)]
+/// `Default` is the bypass view (`user_id`/`email`/`tables` all `None`); the
+/// `..Default::default()` spread keeps the many test literals that construct a
+/// `PrincipalCtx` for per-row-auth scenarios stable when new fields are added.
+#[derive(Debug, Clone, Default)]
 pub struct PrincipalCtx {
     pub user_id: Option<String>,
     pub email: Option<String>,
+    pub tables: Option<Vec<String>>,
 }
 
 impl PrincipalCtx {
-    /// Bypass context: no user identity. Used for machine tokens, scheduled
-    /// jobs, the TTL reaper, schema migrations, and the WS admin bypass — every
-    /// path that must NOT enforce per-row ownership (ownerField /
-    /// collaboratorsField) or resolve `$user`/`$email` markers. Equivalent to
-    /// the pre-Task-5 `owner = None`.
+    /// Bypass context: no user identity, no table restriction. Used for machine
+    /// tokens (the table allowlist is populated separately by `row_ctx` for
+    /// scoped tokens), scheduled jobs, the TTL reaper, schema migrations, and
+    /// the WS admin bypass — every path that must NOT enforce per-row ownership
+    /// (ownerField / collaboratorsField) or resolve `$user`/`$email` markers.
+    /// Equivalent to the pre-Task-5 `owner = None`.
     pub fn bypass() -> Self {
         PrincipalCtx {
             user_id: None,
             email: None,
+            tables: None,
         }
     }
 }
 
 impl Principal {
-    /// Builds the per-row auth view. `Machine` ⇒ bypass (`user_id = None`).
-    /// `User` ⇒ `Some(user_id)` and `Some(email)` so `$email` predicates resolve.
+    /// Builds the per-row auth view. `Machine` ⇒ identity bypass
+    /// (`user_id = None`) but carries the table allowlist so the executor
+    /// boundary can enforce it. `User` ⇒ `Some(user_id)` and `Some(email)` so
+    /// `$email` predicates resolve; `User` principals are never table-scoped.
     pub fn row_ctx(&self) -> PrincipalCtx {
         match self {
             Principal::User { user_id, email, .. } => PrincipalCtx {
                 user_id: Some(user_id.clone()),
                 email: Some(email.clone()),
+                tables: None,
             },
-            Principal::Machine { .. } => PrincipalCtx {
+            Principal::Machine { tables, .. } => PrincipalCtx {
                 user_id: None,
                 email: None,
+                tables: tables.clone(),
             },
         }
     }
+}
+
+/// ENH-005 Task 4: table allowlist gate for machine tokens. The executor
+/// boundary (reads in `query::execute_query`, every write step in
+/// `txn::execute_txn`, subscription registration in `subs::register`) calls this
+/// with the `PrincipalCtx` already in scope. `tables = None` (admin, scheduled,
+/// `User`, full-access machine tokens) and `tables = Some([])` (treated as
+/// no-restriction, matching the mint-time contract) bypass; only
+/// `tables = Some(non-empty)` restricts, rejecting a table not on the list with
+/// `Forbidden`. A pure read-only gate — writes nothing, leaves the single-writer
+/// invariant untouched.
+pub fn authorize_table(ctx: &PrincipalCtx, table: &str) -> Result<(), RtDbError> {
+    if let Some(list) = &ctx.tables
+        && !list.is_empty()
+        && !list.iter().any(|t| t == table)
+    {
+        return Err(RtDbError::forbidden("token is not scoped for this table"));
+    }
+    Ok(())
 }
 
 /// Idempotently seeds `RTDB_ADMIN_EMAILS` into `rtdb_auth.admins` at startup
@@ -255,6 +334,8 @@ mod tests {
         let principal = Principal::Machine {
             db: "d".to_string(),
             token_id: "t".to_string(),
+            read_only: false,
+            tables: None,
         };
         let user = authed_user(&principal);
         assert_eq!(user.kind, UserKind::Machine);

@@ -6,7 +6,8 @@ use sqlx::PgPool;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::auth::PrincipalCtx;
+use crate::auth::{PrincipalCtx, authorize_table};
+use crate::error::RtDbError;
 use crate::metrics::{Metrics, SkipClass};
 use crate::protocol::ServerMessage;
 use crate::query::{Order, Query, QueryResult, canonical, execute_query};
@@ -900,6 +901,14 @@ impl SubscriptionManager {
     /// re-run via `Window::contains`'s "any doubt ⇒ outside" rule).
     /// `initial` is the result just pushed, from which an `Ordered` read seeds
     /// its top-N boundary; every other shape ignores it.
+    ///
+    /// ENH-005 Task 4: the machine-token table allowlist is enforced here, at
+    /// registration, so a scoped token cannot subscribe to a forbidden table.
+    /// `fan_out` re-runs need no check — they reuse the stored `principal_ctx`
+    /// that was already gated here, and the re-run's `execute_query` call would
+    /// re-check harmlessly anyway. Returns `Forbidden` if `principal_ctx.tables`
+    /// is a non-empty allowlist that does not contain the query's table; the
+    /// sole caller (`handle_subscribe`) propagates the error to the WS client.
     // Each arg is independently required by the committer's register path;
     // bundling them into a context struct would add indirection without
     // reducing coupling (same call as `ws::handle_text_frame`).
@@ -915,7 +924,8 @@ impl SubscriptionManager {
         principal_ctx: PrincipalCtx,
         table_def: &TableDef,
         initial: &QueryResult,
-    ) {
+    ) -> Result<(), RtDbError> {
+        authorize_table(&principal_ctx, &query.table)?;
         let mut read_set = ReadSet::from_query(&query, table_def);
         if let ReadSet::Ordered(ordered) = &mut read_set {
             ordered.boundary = ordered.boundary_from_result(initial);
@@ -932,6 +942,7 @@ impl SubscriptionManager {
                 principal_ctx,
             },
         );
+        Ok(())
     }
 
     /// Re-runs every subscription on `db` whose query table is in

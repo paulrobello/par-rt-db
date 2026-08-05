@@ -89,12 +89,23 @@ class AdminMember(_Wire):
 
 
 class TokenInfo(_Wire):
-    """``GET /admin/tokens`` row — ``{id, name, createdAt, revoked}``."""
+    """``GET /admin/tokens`` row — ``{id, name, createdAt, revoked, expiresAt,
+    readOnly, tables}``.
+
+    The last three fields default so an older server that omits them still
+    deserializes (matches the server's ``#[serde(default)]`` on
+    ``TokenRow``); a current server always sends them. ``expiresAt``/``tables``
+    are ``None`` for a full-access token; ``readOnly`` is ``False`` for a
+    read-write token.
+    """
 
     id: str
     name: str
     created_at: int
     revoked: bool
+    expires_at: int | None = None
+    read_only: bool = False
+    tables: list[str] | None = None
 
 
 class TableStat(_Wire):

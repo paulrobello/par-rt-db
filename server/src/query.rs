@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 
 use sqlx::PgPool;
 
-use crate::auth::PrincipalCtx;
+use crate::auth::{PrincipalCtx, authorize_table};
 use crate::db::validate_db_name;
 use crate::ddl::{pg_col, pg_schema, pg_search_col, pg_table, pg_vector_col};
 use crate::error::RtDbError;
@@ -680,6 +680,11 @@ pub async fn execute_query(
     ctx: &PrincipalCtx,
 ) -> Result<QueryResult, RtDbError> {
     validate_db_name(db)?;
+    // ENH-005 Task 4: a machine token with a non-empty `tables` allowlist cannot
+    // read a table not on the list. `tables = None` (admin/`User`/scheduled/
+    // full-access machine tokens) and `tables = Some([])` bypass. The gate runs
+    // before the table def resolves so a `Forbidden` never leaks table metadata.
+    authorize_table(ctx, &q.table)?;
     // Task 5: `ctx` carries `user_id` + `email` so Task 6+ can resolve `$email`
     // markers. The SQL row-auth paths here only need the uid, so derive the
     // legacy `owner: Option<&str>` view once and thread it unchanged —
@@ -2700,6 +2705,7 @@ mod tests {
         let ctx = PrincipalCtx {
             user_id: Some("u1".to_string()),
             email: Some("e@x".to_string()),
+            ..Default::default()
         };
         let doc = json!({"owner":"u1","editors":["u1","u2"],"visibility":"public","archivedat":null,"n":5});
 
@@ -2722,6 +2728,7 @@ mod tests {
             &PrincipalCtx {
                 user_id: Some("u9".to_string()),
                 email: None,
+                ..Default::default()
             },
         ));
         // Neq: a present-and-unequal field matches; present-and-equal does not.
@@ -2887,6 +2894,7 @@ mod tests {
             &PrincipalCtx {
                 user_id: Some("u1".to_string()),
                 email: Some("u1".to_string()),
+                ..Default::default()
             },
         ));
     }
@@ -2902,6 +2910,7 @@ mod tests {
         let ctx = PrincipalCtx {
             user_id: Some("u1".to_string()),
             email: Some("e@x".to_string()),
+            ..Default::default()
         };
         let doc = json!({"owner":"u1","archivedat":null,"n":5});
 

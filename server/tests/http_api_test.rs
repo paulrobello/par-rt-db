@@ -641,3 +641,69 @@ async fn batch_query_bad_token_is_unauthorized() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+// (n) A read-only machine token cannot mutate (403 Forbidden) but can still
+// query the same db. The token is minted directly with read_only=true via
+// auth::tokens::mint_token (the /admin/mint-token endpoint doesn't yet expose
+// the flag), then exercised over the real HTTP path.
+#[tokio::test]
+async fn read_only_token_cannot_mutate_but_can_query() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let name = fresh_db(&state).await;
+
+    let (_id, ro_token) =
+        rtdb_server::auth::tokens::mint_token(&state.pool, &name, "ro", None, true, None)
+            .await
+            .expect("mint read-only token");
+
+    // Mutate is forbidden.
+    let resp = api_post(
+        addr,
+        "/api/mutate",
+        &ro_token,
+        json!({"db": name, "txn": insert_work_item_txn()}),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::FORBIDDEN);
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(body["code"], "FORBIDDEN");
+
+    // Query is allowed (no rows, but must not be 403).
+    let resp = api_post(
+        addr,
+        "/api/query",
+        &ro_token,
+        json!({"db": name, "query": {"table": "workItems"}}),
+    )
+    .await;
+    assert_ne!(resp.status(), reqwest::StatusCode::FORBIDDEN);
+
+    Ok(())
+}
+
+// (n2) A read-only machine token cannot upload to storage (403 Forbidden).
+// Verifies the storage-upload write gate. Uses a raw body (storage uploads
+// don't use ApiJson) and the same directly-minted read-only token.
+#[tokio::test]
+async fn read_only_token_cannot_upload_storage() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let name = fresh_db(&state).await;
+
+    let (_id, ro_token) =
+        rtdb_server::auth::tokens::mint_token(&state.pool, &name, "ro", None, true, None)
+            .await
+            .expect("mint read-only token");
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/api/storage/{name}"))
+        .header("Authorization", format!("Bearer {ro_token}"))
+        .header("Content-Type", "application/octet-stream")
+        .body(b"hello".to_vec())
+        .send()
+        .await?;
+    assert_eq!(resp.status(), reqwest::StatusCode::FORBIDDEN);
+
+    Ok(())
+}

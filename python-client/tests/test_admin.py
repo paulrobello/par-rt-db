@@ -1,0 +1,365 @@
+"""Tests for ``par_rt_db.admin`` — the dedicated admin control-plane client.
+
+Covers the ENH-005 token surface (``mint_token`` / ``revoke_token`` /
+``list_tokens``) on both :class:`RtDbAdminClient` (sync) and
+:class:`AsyncRtDbAdminClient` (async), using ``httpx.MockTransport`` for
+in-process, no-port testing (same pattern as ``test_http_client.py`` /
+``test_aio_http_client.py``).
+
+Each test stubs the route the client should hit and asserts on the wire
+request (method, path, bearer, camelCase body) the client actually sent, plus
+the dataclass mapping on the response.
+"""
+
+from __future__ import annotations
+
+import json
+from collections.abc import Callable
+from typing import Any
+
+import httpx
+import pytest
+
+from par_rt_db.admin import (
+    AsyncRtDbAdminClient,
+    MintedToken,
+    RtDbAdminClient,
+    TokenInfo,
+)
+from par_rt_db.errors import ErrorCode, RtDbError
+
+ADMIN_BEARER = "Bearer admin-key"
+URL = "https://rtdb.example"
+
+RouteResponse = httpx.Response | Callable[[httpx.Request], httpx.Response]
+
+
+def _sync_client(
+    handler: Callable[[httpx.Request], httpx.Response],
+    *,
+    admin_key: str = "admin-key",
+) -> RtDbAdminClient:
+    return RtDbAdminClient(URL, admin_key, transport=httpx.MockTransport(handler))
+
+
+def _async_client(
+    handler: Callable[[httpx.Request], httpx.Response],
+    *,
+    admin_key: str = "admin-key",
+) -> AsyncRtDbAdminClient:
+    return AsyncRtDbAdminClient(URL, admin_key, transport=httpx.MockTransport(handler))
+
+
+def _handler_map(
+    routes: dict[tuple[str, str, str], RouteResponse],
+) -> Callable[[httpx.Request], httpx.Response]:
+    """Build a MockTransport handler from a route table.
+
+    Keys are ``(method, path, body_contains)`` triples (``body_contains=""``
+    skips the body check). Values are either an ``httpx.Response`` or a
+    ``(request) -> httpx.Response`` callable.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        key_path = request.url.path
+        for (method, path, body_contains), response in routes.items():
+            if request.method != method:
+                continue
+            if path != key_path:
+                continue
+            if body_contains and body_contains not in request.content.decode("utf-8", "replace"):
+                continue
+            if callable(response):
+                return response(request)
+            return response
+        return httpx.Response(404, text=f"no mock for {request.method} {key_path}")
+
+    return handler
+
+
+# --- dataclass wire mapping -----------------------------------------------
+
+
+def test_minted_token_from_dict_maps_camelcase() -> None:
+    mt = MintedToken.from_dict({"tokenId": "tid", "token": "secret"})
+    assert mt.token_id == "tid"
+    assert mt.token == "secret"
+
+
+def test_token_info_from_dict_restricted_row() -> None:
+    row = TokenInfo.from_dict(
+        {
+            "id": "t1",
+            "name": "scraper",
+            "createdAt": 500,
+            "revoked": False,
+            "expiresAt": 1700000000000,
+            "readOnly": True,
+            "tables": ["users"],
+        }
+    )
+    assert row.id == "t1"
+    assert row.created_at == 500
+    assert row.revoked is False
+    assert row.expires_at == 1700000000000
+    assert row.read_only is True
+    assert row.tables == ["users"]
+
+
+def test_token_info_from_dict_full_access_row() -> None:
+    """Full-access token: ``expiresAt:null, readOnly:false, tables:null``."""
+    row = TokenInfo.from_dict(
+        {
+            "id": "t2",
+            "name": "ci",
+            "createdAt": 600,
+            "revoked": True,
+            "expiresAt": None,
+            "readOnly": False,
+            "tables": None,
+        }
+    )
+    assert row.expires_at is None
+    assert row.read_only is False
+    assert row.tables is None
+    assert row.revoked is True
+
+
+def test_token_info_from_dict_omitted_optional_fields_default() -> None:
+    """An older server omitting ``expiresAt``/``readOnly``/``tables`` still
+    deserializes (matches the server's ``#[serde(default)]``)."""
+    row = TokenInfo.from_dict({"id": "t3", "name": "legacy", "createdAt": 700, "revoked": False})
+    assert row.expires_at is None
+    assert row.read_only is False
+    assert row.tables is None
+
+
+# --- sync: mint_token -----------------------------------------------------
+
+
+def test_mint_token_posts_capabilities_and_parses_response() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["request"] = request
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"tokenId": "id1", "token": "secret"})
+
+    with _sync_client(handler) as c:
+        minted = c.mint_token(
+            "dbx",
+            "scraper",
+            read_only=True,
+            tables=["users"],
+            expires_at=1700000000000,
+        )
+    assert isinstance(minted, MintedToken)
+    assert minted.token_id == "id1"
+    assert minted.token == "secret"
+    # route + admin bearer
+    assert captured["request"].method == "POST"
+    assert captured["request"].url.path == "/admin/mint-token"
+    assert captured["request"].headers["authorization"] == ADMIN_BEARER
+    # body: camelCase keys, all three capabilities present when set
+    assert captured["body"] == {
+        "db": "dbx",
+        "name": "scraper",
+        "readOnly": True,
+        "expiresAt": 1700000000000,
+        "tables": ["users"],
+    }
+
+
+def test_mint_token_omits_expiresat_and_tables_when_none() -> None:
+    """When ``expires_at``/``tables`` are ``None`` they are omitted from the
+    body so the server applies its defaults; ``readOnly`` is always sent."""
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"tokenId": "id2", "token": "t"})
+
+    with _sync_client(handler) as c:
+        c.mint_token("dbx", "ci")
+    assert captured["body"] == {"db": "dbx", "name": "ci", "readOnly": False}
+    assert "expiresAt" not in captured["body"]
+    assert "tables" not in captured["body"]
+
+
+# --- sync: revoke_token ---------------------------------------------------
+
+
+def test_revoke_token_posts_token_id() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"ok": True})
+
+    with _sync_client(handler) as c:
+        c.revoke_token("tid")
+    assert captured["body"] == {"tokenId": "tid"}
+
+
+# --- sync: list_tokens ----------------------------------------------------
+
+
+def test_list_tokens_parses_restricted_and_full_access_rows() -> None:
+    client = _sync_client(
+        _handler_map(
+            {
+                ("GET", "/admin/tokens", ""): httpx.Response(
+                    200,
+                    json={
+                        "tokens": [
+                            {
+                                "id": "t1",
+                                "name": "scraper",
+                                "createdAt": 500,
+                                "revoked": False,
+                                "expiresAt": 1700000000000,
+                                "readOnly": True,
+                                "tables": ["users"],
+                            },
+                            {
+                                "id": "t2",
+                                "name": "ci",
+                                "createdAt": 600,
+                                "revoked": False,
+                                "expiresAt": None,
+                                "readOnly": False,
+                                "tables": None,
+                            },
+                        ]
+                    },
+                )
+            }
+        )
+    )
+    with client as c:
+        rows = c.list_tokens("dbx")
+    assert len(rows) == 2
+    assert all(isinstance(r, TokenInfo) for r in rows)
+    # restricted row
+    assert rows[0].id == "t1"
+    assert rows[0].read_only is True
+    assert rows[0].tables == ["users"]
+    assert rows[0].expires_at == 1700000000000
+    # full-access row
+    assert rows[1].id == "t2"
+    assert rows[1].read_only is False
+    assert rows[1].tables is None
+    assert rows[1].expires_at is None
+
+
+def test_list_tokens_sends_db_query_param() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["url"] = request.url
+        return httpx.Response(200, json={"tokens": []})
+
+    with _sync_client(handler) as c:
+        rows = c.list_tokens("kanban")
+    assert rows == []
+    assert captured["url"].path == "/admin/tokens"
+    assert captured["url"].params["db"] == "kanban"
+
+
+# --- sync: error envelope -------------------------------------------------
+
+
+def test_non_2xx_raises_rtdb_error_with_code() -> None:
+    client = _sync_client(
+        _handler_map(
+            {
+                ("POST", "/admin/mint-token", ""): httpx.Response(
+                    401, json={"code": "UNAUTHORIZED", "message": "bad admin key"}
+                )
+            }
+        )
+    )
+    with client as c, pytest.raises(RtDbError) as ei:
+        c.mint_token("dbx", "x")
+    assert ei.value.code is ErrorCode.UNAUTHORIZED
+
+
+# --- async: mint / revoke / list mirror -----------------------------------
+
+
+async def test_async_mint_token_posts_capabilities_and_parses_response() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        captured["auth"] = request.headers["authorization"]
+        return httpx.Response(200, json={"tokenId": "aid", "token": "atok"})
+
+    async with _async_client(handler) as c:
+        minted = await c.mint_token(
+            "dbx", "scraper", read_only=True, tables=["users"], expires_at=1700000000000
+        )
+    assert isinstance(minted, MintedToken)
+    assert minted.token_id == "aid"
+    assert minted.token == "atok"
+    assert captured["auth"] == ADMIN_BEARER
+    assert captured["body"] == {
+        "db": "dbx",
+        "name": "scraper",
+        "readOnly": True,
+        "expiresAt": 1700000000000,
+        "tables": ["users"],
+    }
+
+
+async def test_async_revoke_token_posts_token_id() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"ok": True})
+
+    async with _async_client(handler) as c:
+        await c.revoke_token("tid")
+    assert captured["body"] == {"tokenId": "tid"}
+
+
+async def test_async_list_tokens_parses_rows() -> None:
+    async with _async_client(
+        _handler_map(
+            {
+                ("GET", "/admin/tokens", ""): httpx.Response(
+                    200,
+                    json={
+                        "tokens": [
+                            {
+                                "id": "t1",
+                                "name": "scraper",
+                                "createdAt": 500,
+                                "revoked": False,
+                                "expiresAt": 1700000000000,
+                                "readOnly": True,
+                                "tables": ["users"],
+                            },
+                            {
+                                "id": "t2",
+                                "name": "ci",
+                                "createdAt": 600,
+                                "revoked": True,
+                                "expiresAt": None,
+                                "readOnly": False,
+                                "tables": None,
+                            },
+                        ]
+                    },
+                )
+            }
+        )
+    ) as c:
+        rows = await c.list_tokens("dbx")
+    assert len(rows) == 2
+    assert rows[0].read_only is True
+    assert rows[0].tables == ["users"]
+    assert rows[1].read_only is False
+    assert rows[1].tables is None
+    assert rows[1].revoked is True

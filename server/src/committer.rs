@@ -885,6 +885,6 @@ async fn handle_subscribe(
             table_def,
             &result,
         )
-        .await;
+        .await?;
     Ok(())
 }

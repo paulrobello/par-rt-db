@@ -431,6 +431,13 @@ async fn handle_text_frame(
             };
             match authed {
                 Ok(()) => {
+                    if principal.is_read_only() {
+                        let _ = out_tx.send(ServerMessage::MutateErr {
+                            mut_id,
+                            error: RtDbError::forbidden("read-only token cannot mutate"),
+                        });
+                        return false;
+                    }
                     if let RateDecision::Denied { retry_after_secs } =
                         evaluate(state, principal, db).await
                     {
@@ -492,6 +499,10 @@ async fn handle_text_frame(
             txn,
         } => {
             let reply = match authorize(&state.pool, principal, db).await {
+                Ok(()) if principal.is_read_only() => ServerMessage::ScheduleErr {
+                    schedule_id,
+                    error: RtDbError::forbidden("read-only token cannot mutate"),
+                },
                 Ok(()) => match scheduler::resolve_when(when, now_ms()) {
                     Ok((kind, due_at, cron)) => {
                         match scheduler::insert(

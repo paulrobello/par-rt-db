@@ -1438,3 +1438,80 @@ async fn delete_backup_rejects_bad_name_and_404s_when_missing() -> anyhow::Resul
     assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
     Ok(())
 }
+
+// --- Machine-token capabilities (ENH-005 Task 5) --------------------------
+//
+// `POST /admin/mint-token` accepts the optional ENH-005 fields (`expiresAt`,
+// `readOnly`, `tables`) and `GET /admin/tokens?db=` echoes them back on each
+// row. Wire field names are camelCase. A mint that omits them must still
+// produce a full-access token (defaults: read_only=false, tables=null,
+// expires_at=null) so pre-ENH-005 clients keep working.
+
+#[tokio::test]
+async fn mint_and_list_token_with_capabilities() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let db = fresh_db(&state).await;
+
+    // Mint with all three capabilities set.
+    let minted: serde_json::Value = admin_post(
+        addr,
+        "/admin/mint-token",
+        serde_json::json!({
+            "db": db,
+            "name": "scraper",
+            "readOnly": true,
+            "tables": ["users"],
+            "expiresAt": 1_700_000_000_000_i64,
+        }),
+    )
+    .await
+    .json()
+    .await?;
+    let token_id = minted["tokenId"].as_str().expect("tokenId").to_string();
+
+    // Mint with no optional fields → full-access defaults.
+    let defaults_minted: serde_json::Value = admin_post(
+        addr,
+        "/admin/mint-token",
+        serde_json::json!({"db": db, "name": "legacy"}),
+    )
+    .await
+    .json()
+    .await?;
+    let defaults_id = defaults_minted["tokenId"]
+        .as_str()
+        .expect("tokenId")
+        .to_string();
+
+    // GET /admin/tokens?db= returns both rows with the stored capabilities.
+    let listed: serde_json::Value = admin_get(addr, &format!("/admin/tokens?db={db}"))
+        .await
+        .json()
+        .await?;
+    let tokens = listed["tokens"].as_array().expect("tokens array");
+
+    let scraper = tokens
+        .iter()
+        .find(|r| r["id"].as_str() == Some(token_id.as_str()))
+        .expect("scraper row present");
+    assert_eq!(scraper["readOnly"], serde_json::json!(true));
+    assert_eq!(scraper["tables"], serde_json::json!(["users"]));
+    assert_eq!(
+        scraper["expiresAt"],
+        serde_json::json!(1_700_000_000_000_i64)
+    );
+    // Sanity: the always-present fields are still there.
+    assert_eq!(scraper["name"], serde_json::json!("scraper"));
+    assert_eq!(scraper["revoked"], serde_json::json!(false));
+
+    let legacy = tokens
+        .iter()
+        .find(|r| r["id"].as_str() == Some(defaults_id.as_str()))
+        .expect("legacy row present");
+    assert_eq!(legacy["readOnly"], serde_json::json!(false));
+    assert_eq!(legacy["tables"], serde_json::Value::Null);
+    assert_eq!(legacy["expiresAt"], serde_json::Value::Null);
+
+    Ok(())
+}
