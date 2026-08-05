@@ -13,7 +13,7 @@ import json
 import pytest
 from pydantic import ValidationError
 
-from par_rt_db.schema import IndexDef, Schema, t
+from par_rt_db.schema import IndexDef, Schema, VectorIndexSpec, t
 
 
 def test_scalar_and_compound_fields_round_trip():
@@ -200,6 +200,57 @@ def test_vector_index_without_filter_fields_omits_filterFields():
     vec = wire["tables"]["docs"]["indexes"][0]["vector"]
     assert vec == {"dimensions": 8}
     assert "filterFields" not in vec
+
+
+def test_vector_index_metric_l2_serialized_on_wire():
+    """``VectorIndexSpec.metric`` serializes as ``"metric"`` when set to a
+    non-default value (``"l2"``), and the builder forwards it into the spec."""
+    schema = (
+        Schema.builder()
+        .table(
+            "docs",
+            lambda tb: tb.field("embedding", t.vector(8)).vector_index(
+                "by_emb", "embedding", 8, metric="l2"
+            ),
+        )
+        .build()
+    )
+    wire = json.loads(schema.model_dump_json(by_alias=True))
+    vec = wire["tables"]["docs"]["indexes"][0]["vector"]
+    assert vec["metric"] == "l2"
+    # Direct model assertion: a hand-constructed spec carries the key too.
+    spec = VectorIndexSpec.model_validate({"dimensions": 4, "metric": "l2"})
+    spec_wire = json.loads(spec.model_dump_json(by_alias=True))
+    assert spec_wire == {"dimensions": 4, "metric": "l2"}
+
+
+def test_vector_index_default_metric_omitted_on_wire():
+    """``VectorIndexSpec.metric`` defaults to ``"cosine"`` and is omitted on the
+    wire at its default (mirrors the server's default-value skip rule, so
+    existing schemas serialize byte-identically)."""
+    schema = (
+        Schema.builder()
+        .table(
+            "docs",
+            lambda tb: tb.field("embedding", t.vector(8)).vector_index("by_emb", "embedding", 8),
+        )
+        .build()
+    )
+    wire = json.loads(schema.model_dump_json(by_alias=True))
+    vec = wire["tables"]["docs"]["indexes"][0]["vector"]
+    assert "metric" not in vec
+    # Direct model assertion: default-constructed spec carries no metric key.
+    spec_wire = json.loads(
+        VectorIndexSpec.model_validate({"dimensions": 4}).model_dump_json(by_alias=True)
+    )
+    assert spec_wire == {"dimensions": 4}
+
+
+def test_vector_index_rejects_invalid_metric():
+    """``metric`` is a closed ``Literal`` — an unknown value is a validation
+    error (server side rejects via deny_unknown_fields + the enum)."""
+    with pytest.raises(ValidationError):
+        VectorIndexSpec.model_validate({"dimensions": 4, "metric": "manhattan"})
 
 
 def test_unique_index_builder_emits_unique_true():

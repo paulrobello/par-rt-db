@@ -273,8 +273,9 @@ pub async fn push_schema(
             } else if let Some(vec_spec) = &index.vector {
                 // Vector index: a plain `vector(N)` column (write-maintained by
                 // Task 5, not generated — pgvector has no jsonb->vector generated
-                // cast) plus an HNSW cosine index. The filterFields' `f_` columns
-                // already exist (created with the table / added+backfilled above).
+                // cast) plus an HNSW index over the declared metric (cosine/l2/ip,
+                // ENH-007). The filterFields' `f_` columns already exist (created
+                // with the table / added+backfilled above).
                 let v_col = pg_vector_col(&index.name);
                 let dim = vec_spec.dimensions;
                 let vfield = index
@@ -297,9 +298,10 @@ pub async fn push_schema(
                 ))
                 .execute(&mut *tx)
                 .await?;
+                let opclass = vec_spec.metric.opclass();
                 sqlx::query(&format!(
                     "CREATE INDEX \"{index_ident}\" ON \"{pg_schema_name}\".\"{table_ident}\" \
-                     USING hnsw (\"{v_col}\" vector_cosine_ops)"
+                     USING hnsw (\"{v_col}\" {opclass})"
                 ))
                 .execute(&mut *tx)
                 .await?;

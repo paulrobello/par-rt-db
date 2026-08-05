@@ -1,4 +1,5 @@
 import type {
+  DistanceMetric,
   FieldTypeJson,
   FilterExpr,
   IndexJson,
@@ -169,14 +170,17 @@ export class TableDefinition<
   }
 
   /** Declare a vector (approximate nearest-neighbor) index. `field` is a single
-   * `t.vector(dimensions)` field; the server stores a pgvector column ranked by
-   * cosine distance via the `vectorSearch` query terminal. `filterFields` are
-   * scalar fields usable as eq-filters in a `vectorSearch`. */
+   * `t.vector(dimensions)` field; the server stores a pgvector column ranked by the
+   * configured distance `metric` via the `vectorSearch` query terminal. `filterFields`
+   * are scalar fields usable as eq-filters in a `vectorSearch`. `metric` selects the
+   * distance function (`cosine` default, also `l2` or `ip`); the default is omitted on
+   * the wire for backward compatibility. */
   vectorIndex<Name extends string>(
     name: Name,
     field: keyof Fields & string,
     dimensions: number,
     filterFields: (keyof Fields & string)[] = [],
+    metric: DistanceMetric = "cosine",
   ): TableDefinition<Fields, Indexes | Name> {
     return new TableDefinition(
       this.fields,
@@ -188,6 +192,7 @@ export class TableDefinition<
           vector: {
             dimensions,
             ...(filterFields.length > 0 ? { filterFields: [...filterFields] } : {}),
+            ...(metric && metric !== "cosine" ? { metric } : {}),
           },
         },
       ],

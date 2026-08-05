@@ -134,15 +134,43 @@ pub struct IndexDef {
     pub r#where: Option<FilterExpr>,
 }
 
+/// Distance metric for a vector index. Mirrors
+/// `server/src/schema.rs::DistanceMetric` byte-for-byte: serializes as
+/// lowercase `"cosine" | "l2" | "ip"`. The default (`Cosine`) is omitted on
+/// the wire by `VectorIndexSpec`'s `skip_serializing_if`, so existing schemas
+/// serialize identically — backward compatible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DistanceMetric {
+    #[default]
+    Cosine,
+    L2,
+    Ip,
+}
+
+impl DistanceMetric {
+    /// Returns `true` for the default metric, so `VectorIndexSpec` can omit it
+    /// on the wire (backward compatible with pre-metric schemas).
+    fn is_cosine(&self) -> bool {
+        matches!(self, Self::Cosine)
+    }
+}
+
 /// Declaration of a vector (approximate nearest-neighbor) index. Wire shape is
-/// camelCase (`filterFields`) to match the rest of the protocol. Mirrors
-/// `server/src/schema.rs::VectorIndexSpec` byte-for-byte.
+/// camelCase (`filterFields`, and `metric` as lowercase `"cosine"|"l2"|"ip"`)
+/// to match the rest of the protocol. Mirrors `server/src/schema.rs::VectorIndexSpec`
+/// byte-for-byte — including the optional `metric` field (default `Cosine`,
+/// omitted on the wire).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VectorIndexSpec {
     pub dimensions: u32,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub filter_fields: Vec<String>,
+    /// Distance metric used by this index (default `Cosine`). Omitted on the
+    /// wire when `Cosine`, so existing schemas serialize identically.
+    #[serde(default, skip_serializing_if = "DistanceMetric::is_cosine")]
+    pub metric: DistanceMetric,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -274,14 +302,16 @@ impl TableBuilder {
     }
 
     /// Declare a vector index over a `Vector`-typed `field`. The server stores a
-    /// pgvector column ranked by cosine distance via the `vectorSearch` terminal;
-    /// `filter_fields` names scalar fields usable as eq-filters there.
+    /// pgvector column ranked by the given `metric` (`Cosine` by default) via
+    /// the `vectorSearch` terminal; `filter_fields` names scalar fields usable
+    /// as eq-filters there.
     pub fn vector_index(
         mut self,
         name: &str,
         field: &str,
         dimensions: u32,
         filter_fields: &[&str],
+        metric: DistanceMetric,
     ) -> Self {
         self.indexes.push(IndexDef {
             name: name.into(),
@@ -290,6 +320,7 @@ impl TableBuilder {
             vector: Some(VectorIndexSpec {
                 dimensions,
                 filter_fields: filter_fields.iter().map(|s| (*s).into()).collect(),
+                metric,
             }),
             unique: false,
             r#where: None,
@@ -591,7 +622,13 @@ mod tests {
                     .field("title", FieldType::String)
                     .field("embedding", FieldType::vector(4))
                     .index("by_title", &["title"])
-                    .vector_index("by_embedding", "embedding", 4, &["userId"]),
+                    .vector_index(
+                        "by_embedding",
+                        "embedding",
+                        4,
+                        &["userId"],
+                        DistanceMetric::Cosine,
+                    ),
             )
             .build();
         let v = serde_json::to_value(&schema).unwrap();
@@ -631,7 +668,7 @@ mod tests {
                 "notes",
                 Table::new()
                     .field("embedding", FieldType::vector(8))
-                    .vector_index("by_embedding", "embedding", 8, &[]),
+                    .vector_index("by_embedding", "embedding", 8, &[], DistanceMetric::Cosine),
             )
             .build();
         let v = serde_json::to_value(&schema).unwrap();
@@ -646,6 +683,45 @@ mod tests {
                 .is_none(),
             "empty filter_fields must omit filterFields on the wire"
         );
+    }
+
+    #[test]
+    fn vector_index_metric_serializes_and_round_trips() {
+        // `metric` serializes as a lowercase string and is omitted on the wire
+        // when `Cosine` (the default), mirroring `server/src/schema.rs`'s
+        // `skip_serializing_if = "DistanceMetric::is_cosine"`. A non-cosine
+        // metric round-trips; a missing metric deserializes to `Cosine`.
+        let l2 = VectorIndexSpec {
+            dimensions: 4,
+            filter_fields: vec![],
+            metric: DistanceMetric::L2,
+        };
+        let l2_json = serde_json::to_value(&l2).unwrap();
+        assert_eq!(l2_json["metric"], json!("l2"));
+
+        let cosine = VectorIndexSpec {
+            dimensions: 4,
+            filter_fields: vec![],
+            metric: DistanceMetric::Cosine,
+        };
+        let cosine_json = serde_json::to_value(&cosine).unwrap();
+        assert!(
+            cosine_json
+                .as_object()
+                .expect("vector spec is object")
+                .get("metric")
+                .is_none(),
+            "metric must be omitted on the wire when Cosine"
+        );
+
+        // Round-trip: `"l2"` deserializes back to `DistanceMetric::L2`.
+        let back: VectorIndexSpec = serde_json::from_value(l2_json).unwrap();
+        assert_eq!(back.metric, DistanceMetric::L2);
+        // A spec serialized without a `metric` key (as all pre-metric schemas
+        // carry) deserializes to the default `Cosine`.
+        let legacy = json!({"dimensions": 4, "filterFields": []});
+        let from_legacy: VectorIndexSpec = serde_json::from_value(legacy).unwrap();
+        assert_eq!(from_legacy.metric, DistanceMetric::Cosine);
     }
 
     #[test]

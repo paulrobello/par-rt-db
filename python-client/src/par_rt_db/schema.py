@@ -143,17 +143,23 @@ class VectorIndexSpec(_S):
     """Vector-index spec carried on ``IndexDef.vector``.
 
     ``filter_fields`` serializes as ``filterFields`` and is omitted on the wire
-    when empty (mirrors server's ``Vec::is_empty`` skip rule).
+    when empty (mirrors server's ``Vec::is_empty`` skip rule). ``metric`` defaults
+    to ``"cosine"`` and is omitted on the wire when ``"cosine"`` (mirrors the
+    server's ``skip_serializing_if`` default-value rule, so existing schemas
+    serialize byte-identically).
     """
 
     dimensions: int
     filter_fields: list[str] = Field(default_factory=list)
+    metric: Literal["cosine", "l2", "ip"] = "cosine"
 
     @model_serializer(mode="wrap")
-    def _drop_empty_filter_fields(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+    def _drop_defaults(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
         out = handler(self)
         if not out.get("filterFields"):
             out.pop("filterFields", None)
+        if out.get("metric") == "cosine":
+            out.pop("metric", None)
         return out
 
 
@@ -299,10 +305,20 @@ class TableBuilder:
         dimensions: int,
         *,
         filter_fields: list[str] | None = None,
+        metric: Literal["cosine", "l2", "ip"] | None = None,
     ) -> TableBuilder:
+        """Declare a vector index over ``field`` (a ``t.vector(dimensions)`` column).
+
+        ``filter_fields`` adds prefilter columns (``filterFields`` on the wire),
+        omitted when empty. ``metric`` selects the distance metric; it defaults to
+        ``"cosine"`` server-side and is only added to the spec when set to a
+        non-default value (``"l2"`` or ``"ip"``) so existing schemas serialize
+        byte-identically."""
         spec: dict[str, Any] = {"dimensions": dimensions}
         if filter_fields:
             spec["filterFields"] = list(filter_fields)
+        if metric is not None and metric != "cosine":
+            spec["metric"] = metric
         self._indexes.append({"name": name, "fields": [field], "vector": spec})
         return self
 

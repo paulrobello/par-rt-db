@@ -7,7 +7,9 @@ use rtdb_server::ddl::push_schema;
 use rtdb_server::error::ErrorCode;
 use rtdb_server::protocol::ServerMessage;
 use rtdb_server::query::{Query, QueryResult, execute_query};
-use rtdb_server::schema::{FieldType, IndexDef, SchemaDef, TableDef, VectorIndexSpec};
+use rtdb_server::schema::{
+    DistanceMetric, FieldType, IndexDef, SchemaDef, TableDef, VectorIndexSpec,
+};
 use rtdb_server::subs::next_conn_id;
 use rtdb_server::txn::{Step, Transaction, execute_txn};
 use serde_json::json;
@@ -628,6 +630,7 @@ async fn vector_search_filters_to_own_rows() -> anyhow::Result<()> {
         vector: Some(VectorIndexSpec {
             dimensions: 3,
             filter_fields: vec![],
+            metric: DistanceMetric::Cosine,
         }),
         unique: false,
         r#where: None,
@@ -754,6 +757,7 @@ async fn vector_search_composes_filter_fields_with_owner() -> anyhow::Result<()>
         vector: Some(VectorIndexSpec {
             dimensions: 3,
             filter_fields: vec!["category".into()],
+            metric: DistanceMetric::Cosine,
         }),
         unique: false,
         r#where: None,

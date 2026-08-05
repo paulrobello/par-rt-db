@@ -164,6 +164,25 @@ describe("vectorIndex builder", () => {
     });
     expect(s.toJSON().tables.docs.indexes).toEqual([{ name: "by_user", fields: ["userId"] }]);
   });
+
+  it("emits metric on the wire when a non-default metric is declared", () => {
+    const s = defineSchema({
+      docs: defineTable({ embedding: t.vector(4) }).vectorIndex("by_emb", "embedding", 4, [], "l2"),
+    });
+    expect(s.toJSON().tables.docs.indexes).toEqual([
+      { name: "by_emb", fields: ["embedding"], vector: { dimensions: 4, metric: "l2" } },
+    ]);
+  });
+
+  it("omits metric on the wire when the default cosine metric is used", () => {
+    const s = defineSchema({
+      docs: defineTable({ embedding: t.vector(4) }).vectorIndex("by_emb", "embedding", 4),
+    });
+    expect(s.toJSON().tables.docs.indexes).toEqual([
+      { name: "by_emb", fields: ["embedding"], vector: { dimensions: 4 } },
+    ]);
+    expect(s.toJSON().tables.docs.indexes?.[0]?.vector).not.toHaveProperty("metric");
+  });
 });
 
 describe("ownerField builder", () => {

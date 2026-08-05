@@ -5,12 +5,18 @@ use rtdb_server::auth::PrincipalCtx;
 use rtdb_server::ddl::push_schema;
 use rtdb_server::error::ErrorCode;
 use rtdb_server::query::{Query, QueryResult, VectorSearchQuery, execute_query};
-use rtdb_server::schema::{FieldType, IndexDef, SchemaDef, TableDef, VectorIndexSpec};
+use rtdb_server::schema::{
+    DistanceMetric, FieldType, IndexDef, SchemaDef, TableDef, VectorIndexSpec,
+};
 use rtdb_server::txn::{Step, Transaction, execute_txn};
 use sqlx::Row;
 use std::collections::BTreeMap;
 
 fn vector_schema(dim: u32, with_filter: bool) -> SchemaDef {
+    vector_schema_with_metric(dim, with_filter, DistanceMetric::Cosine)
+}
+
+fn vector_schema_with_metric(dim: u32, with_filter: bool, metric: DistanceMetric) -> SchemaDef {
     let mut fields = BTreeMap::new();
     fields.insert(
         "embedding".to_string(),
@@ -30,6 +36,7 @@ fn vector_schema(dim: u32, with_filter: bool) -> SchemaDef {
             } else {
                 vec![]
             },
+            metric,
         }),
         unique: false,
         r#where: None,
@@ -198,6 +205,28 @@ async fn vec_db(state: &std::sync::Arc<rtdb_server::AppState>) -> common::TestDb
     push_schema(&state.pool, &name, vector_schema(3, false))
         .await
         .expect("push vector schema");
+    common::wrap_test_db(name)
+}
+
+/// Like `vec_db` but with a caller-chosen metric and dimension (ENH-007). The
+/// metric-ranking tests need 2-D vectors to construct a case whose ordering
+/// differs between cosine and L2/inner-product.
+async fn vec_db_with_metric(
+    state: &std::sync::Arc<rtdb_server::AppState>,
+    dim: u32,
+    metric: DistanceMetric,
+) -> common::TestDb {
+    let name = format!("t{}", uuid::Uuid::now_v7().simple());
+    rtdb_server::db::create_database(&state.pool, &name)
+        .await
+        .expect("create database");
+    push_schema(
+        &state.pool,
+        &name,
+        vector_schema_with_metric(dim, false, metric),
+    )
+    .await
+    .expect("push vector schema");
     common::wrap_test_db(name)
 }
 
@@ -913,4 +942,97 @@ fn hybrid_search_wire_round_trips() {
     assert_eq!(back_full["hybridSearch"]["k"], 42);
     assert_eq!(back_full["hybridSearch"]["searchIndex"], "search_body");
     assert_eq!(back_full["hybridSearch"]["vectorIndex"], "by_embedding");
+}
+
+/// ENH-007: pushing a vector schema compiles the HNSW index with the declared
+/// metric's opclass — `vector_cosine_ops` / `vector_l2_ops` / `vector_ip_ops`.
+#[tokio::test]
+async fn push_schema_compiles_declared_metric_opclass() {
+    let state = test_state().await;
+    for (metric, opclass) in [
+        (DistanceMetric::Cosine, "vector_cosine_ops"),
+        (DistanceMetric::L2, "vector_l2_ops"),
+        (DistanceMetric::Ip, "vector_ip_ops"),
+    ] {
+        let raw = format!("t{}", uuid::Uuid::now_v7().simple());
+        rtdb_server::db::create_database(&state.pool, &raw)
+            .await
+            .expect("create database");
+        let db = common::wrap_test_db(raw);
+        push_schema(
+            &state.pool,
+            &db,
+            vector_schema_with_metric(3, false, metric),
+        )
+        .await
+        .expect("push vector schema");
+        let idx: (String,) = sqlx::query_as(
+            "SELECT indexdef FROM pg_indexes \
+             WHERE schemaname = $1 AND tablename = $2 AND indexname = 'i_docs_by_embedding'",
+        )
+        .bind(format!("db_{db}"))
+        .bind("t_docs")
+        .fetch_one(&state.pool)
+        .await
+        .expect("index row");
+        assert!(
+            idx.0.contains(opclass),
+            "metric {:?} should compile opclass {opclass}, got: {}",
+            metric,
+            idx.0
+        );
+    }
+}
+
+/// ENH-007: vectorSearch ranks by the index's declared distance metric, not
+/// always cosine. With query `[1,0]` and rows `[1,1]` + `[3,0]`, the metrics
+/// disagree on the nearest neighbor: cosine picks `[3,0]` (same direction,
+/// distance 0); L2 picks `[1,1]` (Euclidean 1 < 2); inner product picks `[3,0]`
+/// (largest dot product). Each metric's index must surface its matching row.
+#[tokio::test]
+async fn vector_search_honors_declared_metric() {
+    let state = test_state().await;
+    for (metric, nearest) in [
+        (DistanceMetric::Cosine, vec![3.0, 0.0]),
+        (DistanceMetric::L2, vec![1.0, 1.0]),
+        (DistanceMetric::Ip, vec![3.0, 0.0]),
+    ] {
+        let db = vec_db_with_metric(&state, 2, metric).await;
+        let schema = vector_schema_with_metric(2, false, metric);
+        for emb in [[1.0, 1.0], [3.0, 0.0]] {
+            execute_txn(
+                &state.pool,
+                &db,
+                &schema,
+                &Transaction {
+                    steps: vec![Step::Insert {
+                        table: "docs".into(),
+                        doc: vec_doc(emb.to_vec()),
+                    }],
+                },
+                &PrincipalCtx::bypass(),
+            )
+            .await
+            .expect("insert vector doc");
+        }
+        let q = serde_json::from_value::<Query>(serde_json::json!({
+            "table": "docs",
+            "vectorSearch": {"index": "by_embedding", "vector": [1.0, 0.0], "limit": 1}
+        }))
+        .expect("parse vectorSearch query");
+        let res = execute_query(&state.pool, &db, &schema, &q, &PrincipalCtx::bypass())
+            .await
+            .expect("execute vectorSearch");
+        let docs = match res {
+            QueryResult::Docs(d) => d,
+            _ => panic!("expected Docs"),
+        };
+        assert_eq!(docs.len(), 1, "limit honored for {:?}", metric);
+        assert_eq!(
+            docs[0]["embedding"],
+            serde_json::json!(nearest),
+            "metric {:?} should rank {nearest:?} first",
+            metric
+        );
+    }
 }

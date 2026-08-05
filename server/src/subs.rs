@@ -1172,7 +1172,7 @@ impl SubscriptionManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{IndexDef, VectorIndexSpec};
+    use crate::schema::{DistanceMetric, IndexDef, VectorIndexSpec};
     use std::collections::BTreeMap;
 
     fn q(value: serde_json::Value) -> Query {
@@ -1230,6 +1230,7 @@ mod tests {
         VectorIndexSpec {
             dimensions: 1,
             filter_fields: vec![],
+            metric: DistanceMetric::Cosine,
         }
     }
 

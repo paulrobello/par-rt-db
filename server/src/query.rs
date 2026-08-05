@@ -139,8 +139,9 @@ pub struct SearchQuery {
 
 /// A vector-similarity terminal over a declared vector index. `vector` is the
 /// caller-supplied query embedding (length must equal the index dimensions);
-/// ranked by cosine distance (`<=>`) ascending. `filter` is an optional eq-map
-/// over the index's declared `filterFields`.
+/// ranked by the index's declared metric distance (`<=>`/`<->`/`<#>` for
+/// cosine/l2/ip) ascending. `filter` is an optional eq-map over the index's
+/// declared `filterFields`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct VectorSearchQuery {
@@ -2002,9 +2003,10 @@ async fn execute_search(
     Ok(QueryResult::Docs(docs))
 }
 
-/// Vector-similarity terminal: ranks rows by cosine distance (`<=>`) between
-/// the index's `v_<index>` column and the query vector, ascending, limited to
-/// `limit`. Optional `filter` eq-binds over the index's declared `filterFields`.
+/// Vector-similarity terminal: ranks rows by the index's declared metric
+/// distance (`<=>`/`<->`/`<#>` for cosine/l2/ip) between the index's `v_<index>`
+/// column and the query vector, ascending, limited to `limit`. Optional `filter`
+/// eq-binds over the index's declared `filterFields`.
 /// Unknown index / length mismatch / unknown filter key / out-of-range limit
 /// → `BadRequest`. Bind order: filter eq-binds occupy `$1..$k`, then (when the
 /// table is owner-gated and the caller is a user) the owner id occupies
@@ -2137,10 +2139,11 @@ async fn execute_vector_search(
     }
     where_clause.push_str(&auth_clause);
 
+    let dist_op = vec_spec.metric.distance_op();
     let sql = format!(
         "SELECT \"id\", \"doc\", \"created_at\", \"version\" FROM \"{pg_schema_name}\".\"{table_ident}\" \
          WHERE {where_clause} \
-         ORDER BY \"{v_col}\" <=> ${qvec_ph}::vector \
+         ORDER BY \"{v_col}\" {dist_op} ${qvec_ph}::vector \
          LIMIT ${limit_ph}"
     );
 
@@ -2173,8 +2176,8 @@ async fn execute_vector_search(
     Ok(QueryResult::Docs(docs))
 }
 
-/// Hybrid search terminal: fuses full-text (`ts_rank`) and vector (cosine
-/// `<=>`) ranking over the same table via Reciprocal Rank Fusion (RRF). The
+/// Hybrid search terminal: fuses full-text (`ts_rank`) and vector ranking (the
+/// resolved vector index's metric operator) over the same table via RRF. The
 /// table must declare BOTH a search index (tsvector) AND a vector index; if
 /// either is missing → `BadRequest`. The candidate set is the UNION of rows
 /// matching `plainto_tsquery($text)` and rows with a non-null vector; both
@@ -2318,11 +2321,12 @@ async fn execute_hybrid_search(
     // with a null vector get dist NULL (ranked last on the vector axis via NULLS
     // LAST). The final ORDER BY tie-breakers (created_at, id) keep output
     // deterministic when RRF scores collide.
+    let dist_op = vec_spec.metric.distance_op();
     let sql = format!(
         "WITH matched AS ( \
            SELECT \"id\", \"doc\", \"created_at\", \"version\", \
                   ts_rank(\"{sv_col}\", plainto_tsquery(${text_ph})) AS trank, \
-                  (\"{v_col}\" <=> ${qvec_ph}::vector) AS dist \
+                  (\"{v_col}\" {dist_op} ${qvec_ph}::vector) AS dist \
            FROM \"{pg_schema_name}\".\"{table_ident}\" \
            WHERE (\"{sv_col}\" @@ plainto_tsquery(${text_ph}) OR \"{v_col}\" IS NOT NULL){auth_clause} \
          ), ranked AS ( \

@@ -56,15 +56,57 @@ pub struct IndexDef {
     pub r#where: Option<FilterExpr>,
 }
 
+/// Distance metric for a vector index. Selects the pgvector opclass used to
+/// build the HNSW index and the operator used to rank `vectorSearch`/hybrid
+/// results. Wire form is lowercase (`cosine` | `l2` | `ip`); default `cosine`
+/// (today's only behavior), omitted on the wire so existing schemas stay
+/// byte-identical. See ENH-007.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DistanceMetric {
+    #[default]
+    Cosine,
+    L2,
+    Ip,
+}
+
+impl DistanceMetric {
+    /// pgvector access-method opclass for this metric (HNSW `CREATE INDEX`).
+    pub fn opclass(self) -> &'static str {
+        match self {
+            Self::Cosine => "vector_cosine_ops",
+            Self::L2 => "vector_l2_ops",
+            Self::Ip => "vector_ip_ops",
+        }
+    }
+
+    /// pgvector distance operator for this metric (`ORDER BY ... <op> $q`).
+    pub fn distance_op(self) -> &'static str {
+        match self {
+            Self::Cosine => "<=>",
+            Self::L2 => "<->",
+            // Negative inner product; ascending order = most-similar-first,
+            // consistent with `<=>`/`<->`.
+            Self::Ip => "<#>",
+        }
+    }
+
+    fn is_cosine(&self) -> bool {
+        matches!(self, Self::Cosine)
+    }
+}
+
 /// Declaration of a vector (approximate nearest-neighbor) index. Carried
 /// alongside the btree/search knobs on `IndexDef`. Wire shape is camelCase
-/// (`filterFields`) to match the rest of the protocol.
+/// (`filterFields`, `metric`) to match the rest of the protocol.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VectorIndexSpec {
     pub dimensions: u32,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub filter_fields: Vec<String>,
+    #[serde(default, skip_serializing_if = "DistanceMetric::is_cosine")]
+    pub metric: DistanceMetric,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -1768,6 +1810,7 @@ mod tests {
                 vector: Some(VectorIndexSpec {
                     dimensions: 8,
                     filter_fields: vec![],
+                    metric: DistanceMetric::Cosine,
                 }),
                 unique: false,
                 r#where: None,
@@ -1794,6 +1837,7 @@ mod tests {
                 vector: Some(VectorIndexSpec {
                     dimensions: 4,
                     filter_fields: vec!["userId".to_string()],
+                    metric: DistanceMetric::Cosine,
                 }),
                 unique: false,
                 r#where: None,
@@ -1819,6 +1863,7 @@ mod tests {
                 vector: Some(VectorIndexSpec {
                     dimensions: 4,
                     filter_fields: vec![],
+                    metric: DistanceMetric::Cosine,
                 }),
                 unique: false,
                 r#where: None,
@@ -1846,6 +1891,7 @@ mod tests {
                 vector: Some(VectorIndexSpec {
                     dimensions: 0,
                     filter_fields: vec![],
+                    metric: DistanceMetric::Cosine,
                 }),
                 unique: false,
                 r#where: None,
@@ -1872,6 +1918,7 @@ mod tests {
                 vector: Some(VectorIndexSpec {
                     dimensions: 4,
                     filter_fields: vec![],
+                    metric: DistanceMetric::Cosine,
                 }),
                 unique: false,
                 r#where: None,
@@ -1897,6 +1944,7 @@ mod tests {
                 vector: Some(VectorIndexSpec {
                     dimensions: 4,
                     filter_fields: vec![],
+                    metric: DistanceMetric::Cosine,
                 }),
                 unique: false,
                 r#where: None,
@@ -1922,6 +1970,7 @@ mod tests {
                 vector: Some(VectorIndexSpec {
                     dimensions: 4,
                     filter_fields: vec!["userId".to_string()],
+                    metric: DistanceMetric::Cosine,
                 }),
                 unique: false,
                 r#where: None,
@@ -1953,6 +2002,7 @@ mod tests {
                 vector: Some(VectorIndexSpec {
                     dimensions: 4,
                     filter_fields: vec!["meta".to_string()],
+                    metric: DistanceMetric::Cosine,
                 }),
                 unique: false,
                 r#where: None,

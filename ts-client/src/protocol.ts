@@ -302,11 +302,18 @@ export type FieldTypeJson =
   | { type: "record"; value: FieldTypeJson }
   | { type: "vector"; dimensions: number };
 
+/** Distance metric for a vector index. Lives on the index spec, not the query.
+ * `cosine` is the default and is omitted on the wire so existing schemas serialize
+ * unchanged. */
+export type DistanceMetric = "cosine" | "l2" | "ip";
+
 /** Mirrors server `schema::VectorIndexSpec` byte-for-byte (camelCase). `filterFields`
- * is omitted on the wire when the index declares none. */
+ * is omitted on the wire when the index declares none. `metric` is omitted when it
+ * equals the default `cosine`. */
 export interface VectorIndexSpec {
   dimensions: number;
   filterFields?: string[];
+  metric?: DistanceMetric;
 }
 
 export interface IndexJson {
