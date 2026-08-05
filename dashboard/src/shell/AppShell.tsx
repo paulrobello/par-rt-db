@@ -17,6 +17,7 @@ const NAV = [
   { to: "/console", label: "Console" },
   { to: "/config", label: "Config" },
   { to: "/admins", label: "Admins" },
+  { to: "/audit", label: "Audit" },
   { to: "/backups", label: "Backups" },
 ];
 

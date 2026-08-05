@@ -1099,6 +1099,49 @@ impl RtDbHttpClient {
         Ok(parsed.deliveries)
     }
 
+    /// `GET /admin/audit?db=&table=&op=&principal=&source=&limit=&offset=` →
+    /// `{entries:[...]}`, newest `ts_ms` first. `db` is always sent; every other
+    /// filter is omitted from the query when `None` (matches all rows).
+    /// `opts = None` sends just `db` (server defaults: limit=100, offset=0, no
+    /// table/op/principal/source filter). When audit is disabled at boot the
+    /// server short-circuits to an empty list. Mirrors `list_deliveries`'
+    /// borrowed query-string assembly: own the strings on this stack, then hand
+    /// `get_json` a slice of `(&str, &str)` refs.
+    pub async fn get_audit(
+        &self,
+        db: &str,
+        opts: Option<&crate::wire::admin::AuditQuery>,
+    ) -> Result<Vec<crate::wire::admin::AuditEntry>, RtDbError> {
+        let table_s = opts.and_then(|o| o.table.clone());
+        let op_s = opts.and_then(|o| o.op.clone());
+        let principal_s = opts.and_then(|o| o.principal.clone());
+        let source_s = opts.and_then(|o| o.source.clone());
+        let limit_s = opts.and_then(|o| o.limit).map(|n| n.to_string());
+        let offset_s = opts.and_then(|o| o.offset).map(|n| n.to_string());
+        let mut q: Vec<(&str, &str)> = Vec::with_capacity(7);
+        q.push(("db", db));
+        if let Some(ref v) = table_s {
+            q.push(("table", v.as_str()));
+        }
+        if let Some(ref v) = op_s {
+            q.push(("op", v.as_str()));
+        }
+        if let Some(ref v) = principal_s {
+            q.push(("principal", v.as_str()));
+        }
+        if let Some(ref v) = source_s {
+            q.push(("source", v.as_str()));
+        }
+        if let Some(ref v) = limit_s {
+            q.push(("limit", v.as_str()));
+        }
+        if let Some(ref v) = offset_s {
+            q.push(("offset", v.as_str()));
+        }
+        let parsed: crate::wire::admin::AuditResponse = self.get_json("/admin/audit", &q).await?;
+        Ok(parsed.entries)
+    }
+
     async fn post_json<Req: Serialize>(
         &self,
         path: &str,
@@ -3405,5 +3448,144 @@ mod admin_tests {
                 "enabled": false
             }),
         );
+    }
+
+    // ── Audit log (GET /admin/audit) ─────────────────────────────────────────
+    //
+    // Mirror `list_deliveries`-style assertions: provided opts build the right
+    // `?db=&table=&op=&principal=&source=&limit=&offset=` query, `opts = None`
+    // sends only `db`, and the parsed `AuditEntry` rows match the wire shape
+    // (camelCase, `null` op/principal for system-initiated rows).
+
+    #[tokio::test]
+    async fn get_audit_builds_query_params_from_opts() {
+        let (server, client) = setup().await;
+        Mock::given(method("GET"))
+            .and(path("/admin/audit"))
+            .and(query_param("db", "kanban"))
+            .and(query_param("table", "notes"))
+            .and(query_param("op", "insert"))
+            .and(query_param("principal", "u1"))
+            .and(query_param("source", "mutate"))
+            .and(query_param("limit", "50"))
+            .and(query_param("offset", "100"))
+            .and(header("authorization", BEARER))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "entries": [
+                    {"id":1,"tsMs":1000,"db":"kanban","table":"notes","op":"insert","docId":"n1","principal":"u1","source":"mutate"}
+                ]
+            })))
+            .mount(&server)
+            .await;
+        let rows = client
+            .get_audit(
+                "kanban",
+                Some(&crate::wire::admin::AuditQuery {
+                    table: Some("notes".to_string()),
+                    op: Some("insert".to_string()),
+                    principal: Some("u1".to_string()),
+                    source: Some("mutate".to_string()),
+                    limit: Some(50),
+                    offset: Some(100),
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, 1);
+        assert_eq!(rows[0].ts_ms, 1000);
+        assert_eq!(rows[0].db, "kanban");
+        assert_eq!(rows[0].table, "notes");
+        assert_eq!(rows[0].op.as_deref(), Some("insert"));
+        assert_eq!(rows[0].doc_id, "n1");
+        assert_eq!(rows[0].principal.as_deref(), Some("u1"));
+        assert_eq!(rows[0].source, "mutate");
+    }
+
+    #[tokio::test]
+    async fn get_audit_none_opts_sends_only_db() {
+        // `opts = None` ⇒ only `db` rides on the query string; no
+        // `table`/`op`/`principal`/`source`/`limit`/`offset` may appear.
+        let (server, client) = setup().await;
+        Mock::given(method("GET"))
+            .and(path("/admin/audit"))
+            .and(query_param("db", "kanban"))
+            .and(header("authorization", BEARER))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"entries": []})))
+            .mount(&server)
+            .await;
+        let rows = client.get_audit("kanban", None).await.unwrap();
+        assert!(rows.is_empty());
+        let reqs = server.received_requests().await.unwrap();
+        assert_eq!(reqs.len(), 1);
+        let query = reqs[0].url.query().unwrap_or("");
+        for key in ["table", "op", "principal", "source", "limit", "offset"] {
+            assert!(
+                !query.contains(&format!("{key}=")),
+                "unexpected {key} in query: {query}"
+            );
+        }
+    }
+
+    /// Wire-shape parity for `AuditEntry`: camelCase keys, `null` op/principal
+    /// deserializes to `None`, and a legacy server omitting the optional fields
+    /// still parses via `#[serde(default)]`.
+    #[test]
+    fn audit_entry_deserializes_wire_shapes() {
+        use crate::wire::admin::AuditEntry;
+
+        // Fully-specified interactive row: every field present, op/principal
+        // carrying real values.
+        let interactive: AuditEntry = serde_json::from_value(json!({
+            "id": 1,
+            "tsMs": 1700000000000_i64,
+            "db": "kanban",
+            "table": "notes",
+            "op": "insert",
+            "docId": "n1",
+            "principal": "u1",
+            "source": "mutate"
+        }))
+        .unwrap();
+        assert_eq!(interactive.id, 1);
+        assert_eq!(interactive.ts_ms, 1700000000000_i64);
+        assert_eq!(interactive.db, "kanban");
+        assert_eq!(interactive.table, "notes");
+        assert_eq!(interactive.op.as_deref(), Some("insert"));
+        assert_eq!(interactive.doc_id, "n1");
+        assert_eq!(interactive.principal.as_deref(), Some("u1"));
+        assert_eq!(interactive.source, "mutate");
+
+        // System-initiated row (TTL reap / scheduled job): op and principal
+        // are JSON `null` on the wire.
+        let system: AuditEntry = serde_json::from_value(json!({
+            "id": 2,
+            "tsMs": 1700000000001_i64,
+            "db": "kanban",
+            "table": "notes",
+            "op": null,
+            "docId": "n2",
+            "principal": null,
+            "source": "ttl"
+        }))
+        .unwrap();
+        assert_eq!(system.op, None);
+        assert_eq!(system.principal, None);
+        assert_eq!(system.source, "ttl");
+
+        // Legacy fixture: an older server that omits `op`/`principal` entirely
+        // must still deserialize via `#[serde(default)]` (both default to None).
+        let legacy: AuditEntry = serde_json::from_value(json!({
+            "id": 3,
+            "tsMs": 42,
+            "db": "legacy",
+            "table": "things",
+            "docId": "t3",
+            "source": "mutate"
+        }))
+        .unwrap();
+        assert_eq!(legacy.id, 3);
+        assert_eq!(legacy.op, None);
+        assert_eq!(legacy.principal, None);
     }
 }

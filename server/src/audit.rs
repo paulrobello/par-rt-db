@@ -74,12 +74,19 @@ pub struct AuditEntry {
 }
 
 /// Reads audit rows newest-first (by `ts_ms DESC`, then `id DESC` as a stable
-/// tie-breaker). `db` filters when `Some`; `limit`/`offset` page. Called by the
-/// admin endpoint; returns an empty `Vec` when the table does not exist (audit
-/// disabled at boot) — the caller need not distinguish.
+/// tie-breaker). `db`/`table`/`op`/`principal`/`source` each filter when
+/// `Some` (equality, combined with AND); an absent filter matches all rows.
+/// `limit`/`offset` page. Called by the admin endpoint; returns an empty `Vec`
+/// when the table does not exist (audit disabled at boot) — the caller need not
+/// distinguish.
+#[allow(clippy::too_many_arguments)]
 pub async fn fetch_audit_rows(
     pool: &PgPool,
     db: Option<&str>,
+    table: Option<&str>,
+    op: Option<&str>,
+    principal: Option<&str>,
+    source: Option<&str>,
     limit: i64,
     offset: i64,
 ) -> Result<Vec<AuditEntry>, RtDbError> {
@@ -100,10 +107,18 @@ pub async fn fetch_audit_rows(
         "SELECT id, ts_ms, db, tbl, op, doc_id, principal, source \
              FROM rtdb.audit_log \
              WHERE ($1::text IS NULL OR db = $1) \
+               AND ($2::text IS NULL OR tbl = $2) \
+               AND ($3::text IS NULL OR op = $3) \
+               AND ($4::text IS NULL OR principal = $4) \
+               AND ($5::text IS NULL OR source = $5) \
              ORDER BY ts_ms DESC, id DESC \
-             LIMIT $2 OFFSET $3",
+             LIMIT $6 OFFSET $7",
     )
     .bind(db)
+    .bind(table)
+    .bind(op)
+    .bind(principal)
+    .bind(source)
     .bind(limit)
     .bind(offset)
     .fetch_all(pool)

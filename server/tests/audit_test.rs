@@ -46,6 +46,22 @@ async fn audit_for_db(addr: std::net::SocketAddr, db: &str) -> serde_json::Value
     body["entries"].clone()
 }
 
+/// Reads `GET /admin/audit?db=<db><suffix>` (extra filter params) into the
+/// entries array, then projects to the ordered list of `docId` values — the
+/// stable handle assertions use to identify rows regardless of which filters
+/// matched.
+async fn audit_doc_ids(addr: std::net::SocketAddr, db: &str, suffix: &str) -> Vec<String> {
+    let resp = admin_get(addr, &format!("/admin/audit?db={db}{suffix}")).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await.expect("parse audit response");
+    body["entries"]
+        .as_array()
+        .expect("entries array")
+        .iter()
+        .map(|e| e["docId"].as_str().expect("docId").to_string())
+        .collect()
+}
+
 // (a) Enabled: insert / patch / replace / delete each write one audit row, with
 // the right db / table / docId / op / source. The admin mutate path passes
 // `owner = None`, so `principal` is null. `GET /admin/audit?db=<db>` returns
@@ -226,6 +242,134 @@ async fn audit_disabled_writes_nothing_and_endpoint_returns_empty() -> anyhow::R
     assert!(
         entries.as_array().map(|a| a.is_empty()).unwrap_or(false),
         "disabled endpoint returns empty entries: {entries:?}"
+    );
+
+    Ok(())
+}
+
+// (d) `table` / `op` / `principal` / `source` filters narrow the result set,
+// combine with AND, and leave the newest-first ordering unchanged when absent.
+// Rows are seeded directly via SQL so `principal`/`source` can take values the
+// admin-mutate path never produces (admin owner=None ⇒ principal=null,
+// source="mutate"). The `db` column is just a string filter — it need not name
+// a real database — so we isolate with a uuid stem instead of a fresh schema.
+#[tokio::test]
+async fn audit_endpoint_filters_by_table_op_principal_source() -> anyhow::Result<()> {
+    let state = test_state_with_audit().await;
+    let pool = state.pool.clone();
+    let addr = spawn_app(state.clone()).await;
+    let db = format!("filter_{}", uuid::Uuid::now_v7().simple());
+
+    // Six rows spanning distinct tbl/op/principal/source combinations. `ts_ms`
+    // strictly increases with insertion order so `id` order tracks `ts_ms`
+    // (both ASC and DESC agree), making the newest-first expectations stable.
+    // (ts_ms, tbl, op, principal, doc_id, source)
+    type Seed = (
+        i64,
+        &'static str,
+        &'static str,
+        Option<&'static str>,
+        &'static str,
+        &'static str,
+    );
+    let seed: &[Seed] = &[
+        (100, "projects", "insert", Some("alice"), "d1", "mutate"),
+        (110, "projects", "patch", Some("alice"), "d2", "mutate"),
+        (120, "tasks", "insert", Some("bob"), "d3", "scheduled"),
+        (130, "tasks", "delete", Some("bob"), "d4", "scheduled"),
+        (140, "projects", "insert", None, "d5", "ttl"),
+        (150, "tasks", "insert", Some("alice"), "d6", "mutate"),
+    ];
+    for (ts, tbl, op, principal, doc_id, source) in seed {
+        sqlx::query(
+            "INSERT INTO rtdb.audit_log (ts_ms, db, tbl, op, doc_id, principal, source) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(*ts)
+        .bind(db.as_str())
+        .bind(*tbl)
+        .bind(*op)
+        .bind(*doc_id)
+        .bind(*principal)
+        .bind(*source)
+        .execute(&pool)
+        .await?;
+    }
+
+    // Absent filters: all six rows, newest-first by ts_ms.
+    assert_eq!(
+        audit_doc_ids(addr, &db, "").await,
+        ["d6", "d5", "d4", "d3", "d2", "d1"],
+        "no filter ⇒ newest-first, all rows"
+    );
+
+    // Single filters.
+    assert_eq!(
+        audit_doc_ids(addr, &db, "&table=tasks").await,
+        ["d6", "d4", "d3"],
+        "table=tasks"
+    );
+    assert_eq!(
+        audit_doc_ids(addr, &db, "&table=projects").await,
+        ["d5", "d2", "d1"],
+        "table=projects"
+    );
+    assert_eq!(
+        audit_doc_ids(addr, &db, "&op=insert").await,
+        ["d6", "d5", "d3", "d1"],
+        "op=insert"
+    );
+    assert_eq!(
+        audit_doc_ids(addr, &db, "&op=delete").await,
+        ["d4"],
+        "op=delete"
+    );
+    assert_eq!(
+        audit_doc_ids(addr, &db, "&principal=alice").await,
+        ["d6", "d2", "d1"],
+        "principal=alice excludes NULL and bob"
+    );
+    assert_eq!(
+        audit_doc_ids(addr, &db, "&principal=bob").await,
+        ["d4", "d3"],
+        "principal=bob"
+    );
+    assert_eq!(
+        audit_doc_ids(addr, &db, "&source=mutate").await,
+        ["d6", "d2", "d1"],
+        "source=mutate"
+    );
+    assert_eq!(
+        audit_doc_ids(addr, &db, "&source=scheduled").await,
+        ["d4", "d3"],
+        "source=scheduled"
+    );
+    assert_eq!(
+        audit_doc_ids(addr, &db, "&source=ttl").await,
+        ["d5"],
+        "source=ttl"
+    );
+
+    // Combinations (AND semantics).
+    assert_eq!(
+        audit_doc_ids(addr, &db, "&table=tasks&op=insert").await,
+        ["d6", "d3"],
+        "table=tasks AND op=insert"
+    );
+    assert_eq!(
+        audit_doc_ids(addr, &db, "&table=projects&op=insert&source=ttl").await,
+        ["d5"],
+        "table=projects AND op=insert AND source=ttl"
+    );
+    assert_eq!(
+        audit_doc_ids(addr, &db, "&op=delete&principal=bob&source=scheduled").await,
+        ["d4"],
+        "all three filters pin a single row"
+    );
+    // A filter that matches nothing returns an empty array.
+    assert!(
+        audit_doc_ids(addr, &db, "&op=replace").await.is_empty(),
+        "op=replace matches no seeded row"
     );
 
     Ok(())

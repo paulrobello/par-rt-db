@@ -1572,6 +1572,14 @@ fn default_ops_n() -> usize {
 #[derive(Deserialize)]
 struct AuditParams {
     db: Option<String>,
+    #[serde(default)]
+    table: Option<String>,
+    #[serde(default)]
+    op: Option<String>,
+    #[serde(default)]
+    principal: Option<String>,
+    #[serde(default)]
+    source: Option<String>,
     #[serde(default = "default_audit_limit")]
     limit: i64,
     #[serde(default = "default_audit_offset")]
@@ -1589,12 +1597,14 @@ struct AuditResponse {
     entries: Vec<crate::audit::AuditEntry>,
 }
 
-/// `GET /admin/audit?db=<optional>&limit=<n>&offset=<m>` — durable audit log,
-/// newest-first. `limit` defaults to 100 and is capped at 1000; `offset`
-/// defaults to 0. When audit is disabled at boot (`!config.audit_log_enabled`)
-/// this short-circuits to an empty list — the `rtdb.audit_log` table may not
-/// exist, and an operator who turned audit off should not see stale rows from
-/// a previous enabled run either.
+/// `GET /admin/audit?db=<optional>&table=<optional>&op=<optional>&principal=<optional>&source=<optional>&limit=<n>&offset=<m>`
+/// — durable audit log, newest-first. `table`/`op`/`principal`/`source` are
+/// optional equality filters that combine with AND; an absent filter matches
+/// all rows. `limit` defaults to 100 and is capped at 1000; `offset` defaults
+/// to 0. When audit is disabled at boot (`!config.audit_log_enabled`) this
+/// short-circuits to an empty list — the `rtdb.audit_log` table may not exist,
+/// and an operator who turned audit off should not see stale rows from a
+/// previous enabled run either.
 async fn audit_recent(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -1610,8 +1620,17 @@ async fn audit_recent(
     // otherwise accepted by Postgres, so guard at the API edge.
     let limit = params.limit.clamp(1, 1000);
     let offset = params.offset.max(0);
-    let entries =
-        crate::audit::fetch_audit_rows(&state.pool, params.db.as_deref(), limit, offset).await?;
+    let entries = crate::audit::fetch_audit_rows(
+        &state.pool,
+        params.db.as_deref(),
+        params.table.as_deref(),
+        params.op.as_deref(),
+        params.principal.as_deref(),
+        params.source.as_deref(),
+        limit,
+        offset,
+    )
+    .await?;
     Ok(Json(AuditResponse { entries }))
 }
 

@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import type { Webhook, WebhookDelivery } from "../src/admin.js";
+import type { AuditEntry, Webhook, WebhookDelivery } from "../src/admin.js";
 import { RtDbAdminClient } from "../src/admin.js";
 import { Migration } from "../src/migration.js";
 import type { TransactionJson } from "../src/protocol.js";
@@ -873,5 +873,62 @@ describe("RtDbAdminClient webhooks", () => {
     const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
     await expect(admin.listDeliveries("kanban", 3)).resolves.toEqual([]);
     expect(fetchMock.mock.calls[0][0]).toBe("http://h:8300/admin/db/kanban/webhooks/3/deliveries");
+  });
+});
+
+describe("RtDbAdminClient audit", () => {
+  it("getAudit GETs /admin/audit with provided filters and unwraps {entries}", async () => {
+    // Two fixture rows: one labeled with op/principal, one system-initiated
+    // (TTL reaper) where op/principal come back as JSON null.
+    const entries: AuditEntry[] = [
+      {
+        id: 1,
+        tsMs: 1_700_000_000_000,
+        db: "kanban",
+        table: "items",
+        op: "insert",
+        docId: "a",
+        principal: "user@example.com",
+        source: "mutate",
+      },
+      {
+        id: 2,
+        tsMs: 1_700_000_000_001,
+        db: "kanban",
+        table: "items",
+        op: null,
+        docId: "b",
+        principal: null,
+        source: "ttl",
+      },
+    ];
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ entries }));
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+    await expect(
+      admin.getAudit({ db: "kanban", table: "items", op: "insert", limit: 50, offset: 100 }),
+    ).resolves.toEqual(entries);
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe(
+      "http://h:8300/admin/audit?db=kanban&table=items&op=insert&limit=50&offset=100",
+    );
+    expect(init.method).toBe("GET");
+    expect(init.headers.Authorization).toBe("Bearer k");
+  });
+
+  it("getAudit omits the query string when no opts are provided", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ entries: [] }));
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+    await expect(admin.getAudit()).resolves.toEqual([]);
+    expect(fetchMock.mock.calls[0][0]).toBe("http://h:8300/admin/audit");
+  });
+
+  it("getAudit omits undefined filters (no param leaks) and URL-encodes values", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ entries: [] }));
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+    // Only principal/source provided; db/table/op/limit/offset absent.
+    await admin.getAudit({ principal: "user@example.com", source: "ttl" });
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "http://h:8300/admin/audit?principal=user%40example.com&source=ttl",
+    );
   });
 });

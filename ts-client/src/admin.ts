@@ -131,6 +131,33 @@ export type AdminStreamFrame =
   | { kind: "op"; event: OpEvent }
   | { kind: "gauges"; gauges: MetricsSnapshot };
 
+/** One durable row from the audit log (`GET /admin/audit`). `op` is `null` for
+ *  rows the server could not label with a kind; `principal` is `null` for
+ *  system-initiated writes (TTL reaper, scheduled jobs) where there is no
+ *  interactive user. */
+export interface AuditEntry {
+  id: number;
+  tsMs: number;
+  db: string;
+  table: string;
+  op: string | null;
+  docId: string;
+  principal: string | null;
+  source: string;
+}
+
+/** Options for `getAudit`. All optional; omitted filters match all rows, and
+ *  omitted paging falls back to server defaults (limit 100, offset 0). */
+export interface GetAuditOptions {
+  db?: string;
+  table?: string;
+  op?: string;
+  principal?: string;
+  source?: string;
+  limit?: number;
+  offset?: number;
+}
+
 /** One managed pg_dump file on disk (GET /admin/backups). */
 export interface BackupFile {
   name: string;
@@ -407,6 +434,24 @@ export class RtDbAdminClient {
     const qs = params.toString();
     const body = await this.request("GET", `/admin/ops/recent${qs ? `?${qs}` : ""}`);
     return (body as { ops: OpEvent[] }).ops;
+  }
+
+  /** Durable audit-log entries, newest-first (GET /admin/audit). Each of
+   *  `db`/`table`/`op`/`principal`/`source` is an optional equality filter
+   *  (combined with AND); `limit`/`offset` page. Returns an empty array when
+   *  audit logging is disabled at boot — the table may not exist. */
+  async getAudit(opts?: GetAuditOptions): Promise<AuditEntry[]> {
+    const params = new URLSearchParams();
+    if (opts?.db) params.set("db", opts.db);
+    if (opts?.table) params.set("table", opts.table);
+    if (opts?.op) params.set("op", opts.op);
+    if (opts?.principal) params.set("principal", opts.principal);
+    if (opts?.source) params.set("source", opts.source);
+    if (opts?.limit !== undefined) params.set("limit", String(opts.limit));
+    if (opts?.offset !== undefined) params.set("offset", String(opts.offset));
+    const qs = params.toString();
+    const body = await this.request("GET", `/admin/audit${qs ? `?${qs}` : ""}`);
+    return (body as { entries: AuditEntry[] }).entries;
   }
 
   /** Owner-bypass document read (POST /admin/db/{db}/query). Admin sees every row regardless

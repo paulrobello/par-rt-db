@@ -17,6 +17,8 @@ admin control plane found on :class:`par_rt_db.http_client.RtDbHttpClient`:
   with the capability fields (``expiresAt``, ``readOnly``, ``tables``)
 * webhook management (ENH-003) — ``/admin/db/{db}/webhooks`` (list / create /
   edit / delete) plus ``.../{id}/deliveries`` for the delivery outbox
+* audit log (ENH-004) — ``/admin/audit`` durable per-write audit rows, filtered
+  by db/table/op/principal/source with limit/offset paging
 
 This is the canonical admin surface; the same methods also remain on
 :class:`par_rt_db.http_client.RtDbHttpClient` /
@@ -51,6 +53,7 @@ from pydantic import TypeAdapter
 from .errors import ErrorCode, RtDbError
 from .http_client import (
     AdminMember,
+    AuditEntry,
     ConfigResponse,
     DbStats,
     HotConfigPatch,
@@ -583,6 +586,50 @@ class RtDbAdminClient:
         )
         return [WebhookDelivery.model_validate(d) for d in resp.json()["deliveries"]]
 
+    # --- audit log surface (ENH-004) ---
+
+    def get_audit(
+        self,
+        db: str,
+        *,
+        table: str | None = None,
+        op: str | None = None,
+        principal: str | None = None,
+        source: str | None = None,
+        limit: int | None = None,
+        offset: int | None = None,
+    ) -> list[AuditEntry]:
+        """``GET /admin/audit?db=<db>&table=&op=&principal=&source=&limit=&offset=``
+        → ``{entries:[...]}``.
+
+        Durable audit-log rows, newest-first. ``table``/``op``/``principal``/
+        ``source`` are optional equality filters (combined with AND); an omitted
+        filter is not sent and matches all rows server-side. ``limit`` and
+        ``offset`` page the result (server defaults: limit 100, offset 0;
+        ``limit`` is clamped to [1, 1000]); both are sent only when not ``None``,
+        so an explicit ``0`` for either survives the wire.
+
+        Returns an empty list when audit is disabled at boot
+        (``!RTDB_AUDIT_LOG_ENABLED``) — the ``rtdb.audit_log`` table may not
+        exist, and the server short-circuits to ``{entries:[]}`` rather than
+        surfacing stale rows from a previously enabled run.
+        """
+        params: dict[str, Any] = {"db": db}
+        if table is not None:
+            params["table"] = table
+        if op is not None:
+            params["op"] = op
+        if principal is not None:
+            params["principal"] = principal
+        if source is not None:
+            params["source"] = source
+        if limit is not None:
+            params["limit"] = limit
+        if offset is not None:
+            params["offset"] = offset
+        resp = self._req("GET", "/admin/audit", params=params)
+        return [AuditEntry.model_validate(e) for e in resp.json()["entries"]]
+
     # --- request plumbing ---
 
     def _req(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
@@ -1030,6 +1077,40 @@ class AsyncRtDbAdminClient:
             params=params,
         )
         return [WebhookDelivery.model_validate(d) for d in resp.json()["deliveries"]]
+
+    # --- audit log surface (ENH-004) ---
+
+    async def get_audit(
+        self,
+        db: str,
+        *,
+        table: str | None = None,
+        op: str | None = None,
+        principal: str | None = None,
+        source: str | None = None,
+        limit: int | None = None,
+        offset: int | None = None,
+    ) -> list[AuditEntry]:
+        """``GET /admin/audit?db=<db>&table=&op=&principal=&source=&limit=&offset=``
+        → ``{entries:[...]}`` (async).
+
+        See :meth:`RtDbAdminClient.get_audit` for filter and paging semantics.
+        """
+        params: dict[str, Any] = {"db": db}
+        if table is not None:
+            params["table"] = table
+        if op is not None:
+            params["op"] = op
+        if principal is not None:
+            params["principal"] = principal
+        if source is not None:
+            params["source"] = source
+        if limit is not None:
+            params["limit"] = limit
+        if offset is not None:
+            params["offset"] = offset
+        resp = await self._req("GET", "/admin/audit", params=params)
+        return [AuditEntry.model_validate(e) for e in resp.json()["entries"]]
 
     # --- request plumbing ---
 

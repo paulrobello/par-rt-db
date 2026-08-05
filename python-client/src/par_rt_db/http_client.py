@@ -298,6 +298,25 @@ class WebhookDelivery(_Wire):
     payload: Any
 
 
+class AuditEntry(_Wire):
+    """``GET /admin/audit`` row — one durable audit-log record.
+
+    Mirrors ``server::audit::AuditEntry``. ``op`` is ``None`` for rows where the
+    op kind was not recorded; ``principal`` is ``None`` for system-initiated
+    writes (scheduled jobs, TTL reaper — ``owner = None`` at the tap site) where
+    no interactive user was involved. ``ts_ms`` is epoch-millis.
+    """
+
+    id: int
+    ts_ms: int
+    db: str
+    table: str
+    op: str | None = None
+    doc_id: str
+    principal: str | None = None
+    source: str
+
+
 # ``StepResult`` is a ``Union`` alias (no ``model_validate``); route through a
 # single ``TypeAdapter`` for the untagged per-step result, mirroring mutation.py.
 _STEP_RESULT_ADAPTER = TypeAdapter(StepResult)

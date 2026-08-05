@@ -4,6 +4,7 @@ import { Spinner } from "./components/ui";
 import { AdminProvider } from "./lib/admin";
 import { SessionProvider, useSession } from "./lib/session";
 import { AdminsPage } from "./pages/AdminsPage";
+import { AuditPage } from "./pages/AuditPage";
 import { BackupsPage } from "./pages/BackupsPage";
 import { ConfigPage } from "./pages/ConfigPage";
 import { DataBrowserPage } from "./pages/DataBrowserPage";
@@ -57,6 +58,7 @@ function Root() {
             <Route path="console" element={<QueryConsolePage />} />
             <Route path="config" element={<ConfigPage />} />
             <Route path="admins" element={<AdminsPage />} />
+            <Route path="audit" element={<AuditPage />} />
             <Route path="backups" element={<BackupsPage />} />
             <Route path="*" element={<NotFound />} />
           </Route>

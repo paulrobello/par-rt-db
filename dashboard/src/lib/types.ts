@@ -233,3 +233,30 @@ export interface ListDeliveriesOptions {
   limit?: number;
   offset?: number;
 }
+
+// Audit log — mirrors server/src/audit.rs (AuditEntry, camelCase wire) and the
+// ts-client's admin.ts shape. `op` is null for rows the server could not label
+// with a kind; `principal` is null for system-initiated writes (TTL reaper,
+// scheduled jobs) where there is no interactive user.
+export interface AuditEntry {
+  id: number;
+  tsMs: number;
+  db: string;
+  table: string;
+  op: string | null;
+  docId: string;
+  principal: string | null;
+  source: string;
+}
+
+/** Options for `getAudit`. All optional; omitted filters match all rows, and
+ *  omitted paging falls back to server defaults (limit 100, offset 0). */
+export interface GetAuditOptions {
+  db?: string;
+  table?: string;
+  op?: string;
+  principal?: string;
+  source?: string;
+  limit?: number;
+  offset?: number;
+}

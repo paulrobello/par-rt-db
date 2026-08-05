@@ -38,6 +38,7 @@ from .wire import FilterExpr
 if TYPE_CHECKING:
     from .admin import (
         AsyncRtDbAdminClient,
+        AuditEntry,
         MintedToken,
         RtDbAdminClient,
         TokenInfo,
@@ -75,6 +76,7 @@ __all__ = [
     "TokenInfo",
     "Webhook",
     "WebhookDelivery",
+    "AuditEntry",
 ]
 
 
@@ -103,6 +105,7 @@ def __getattr__(name: str) -> Any:
         "TokenInfo",
         "Webhook",
         "WebhookDelivery",
+        "AuditEntry",
     ):
         from . import admin
 

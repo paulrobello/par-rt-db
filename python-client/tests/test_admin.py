@@ -24,6 +24,7 @@ from par_rt_db import Mutation, TableQuery, t
 from par_rt_db.admin import (
     AdminMember,
     AsyncRtDbAdminClient,
+    AuditEntry,
     ConfigResponse,
     DbStats,
     HotConfigPatch,
@@ -1124,3 +1125,179 @@ async def test_async_list_deliveries_builds_query_params() -> None:
     assert captured["params"] == {"status": "delivered", "limit": "10"}
     assert len(rows) == 1
     assert rows[0].status == "delivered"
+
+
+# --- audit log surface (ENH-004) -----------------------------------------
+#
+# ``MockTransport`` tests mirroring the webhook/deliveries suite. Asserts the
+# ``GET /admin/audit`` route + the query-string build (omit ``None`` filters,
+# explicit ``0`` for limit/offset survives), and parses an ``entries`` fixture
+# including a row with ``op:null``/``principal:null`` (system-initiated write).
+
+
+_AUDIT_ROW_USER_WRITE = {
+    "id": 301,
+    "tsMs": 1700000004000,
+    "db": "kanban",
+    "table": "items",
+    "op": "insert",
+    "docId": "i1",
+    "principal": "u@e.com",
+    "source": "client",
+}
+_AUDIT_ROW_SYSTEM_WRITE = {
+    "id": 302,
+    "tsMs": 1700000005000,
+    "db": "kanban",
+    "table": "items",
+    "op": None,
+    "docId": "i2",
+    "principal": None,
+    "source": "ttl",
+}
+
+
+def test_audit_entry_model_validate_maps_camelcase() -> None:
+    e = AuditEntry.model_validate(_AUDIT_ROW_USER_WRITE)
+    assert isinstance(e, AuditEntry)
+    assert e.id == 301
+    assert e.ts_ms == 1700000004000
+    assert e.db == "kanban"
+    assert e.table == "items"
+    assert e.op == "insert"
+    assert e.doc_id == "i1"
+    assert e.principal == "u@e.com"
+    assert e.source == "client"
+
+
+def test_audit_entry_model_validate_system_write_nones() -> None:
+    """System-initiated write (TTL/scheduler): ``op:null`` and ``principal:null``."""
+    e = AuditEntry.model_validate(_AUDIT_ROW_SYSTEM_WRITE)
+    assert e.op is None
+    assert e.principal is None
+    assert e.source == "ttl"
+    assert e.doc_id == "i2"
+
+
+def test_get_audit_builds_query_params_when_all_set() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["method"] = request.method
+        captured["path"] = request.url.path
+        captured["params"] = dict(request.url.params)
+        return httpx.Response(
+            200,
+            json={"entries": [_AUDIT_ROW_USER_WRITE, _AUDIT_ROW_SYSTEM_WRITE]},
+        )
+
+    with _sync_client(handler) as c:
+        rows = c.get_audit(
+            "kanban",
+            table="items",
+            op="insert",
+            principal="u@e.com",
+            source="client",
+            limit=50,
+            offset=10,
+        )
+    assert captured["method"] == "GET"
+    assert captured["path"] == "/admin/audit"
+    assert captured["params"] == {
+        "db": "kanban",
+        "table": "items",
+        "op": "insert",
+        "principal": "u@e.com",
+        "source": "client",
+        "limit": "50",
+        "offset": "10",
+    }
+    assert len(rows) == 2
+    assert all(isinstance(r, AuditEntry) for r in rows)
+    assert rows[0].op == "insert"
+    assert rows[1].op is None
+    assert rows[1].principal is None
+
+
+def test_get_audit_omits_unset_filters() -> None:
+    """Omitted filter opts are absent from the query string; ``db`` is always sent."""
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["params"] = dict(request.url.params)
+        return httpx.Response(200, json={"entries": []})
+
+    with _sync_client(handler) as c:
+        rows = c.get_audit("kanban")
+    assert rows == []
+    assert captured["params"] == {"db": "kanban"}
+
+
+def test_get_audit_explicit_zero_limit_offset_survives() -> None:
+    """An explicit ``0`` for limit/offset must be sent (not omitted as a falsy)."""
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["params"] = dict(request.url.params)
+        return httpx.Response(200, json={"entries": []})
+
+    with _sync_client(handler) as c:
+        c.get_audit("kanban", limit=0, offset=0)
+    assert captured["params"] == {"db": "kanban", "limit": "0", "offset": "0"}
+
+
+def test_get_audit_parses_fixture_with_none_op_principal() -> None:
+    with _sync_client(
+        _handler_map(
+            {
+                ("GET", "/admin/audit", ""): httpx.Response(
+                    200, json={"entries": [_AUDIT_ROW_SYSTEM_WRITE]}
+                )
+            }
+        )
+    ) as c:
+        rows = c.get_audit("kanban", source="ttl")
+    assert len(rows) == 1
+    e = rows[0]
+    assert e.id == 302
+    assert e.ts_ms == 1700000005000
+    assert e.op is None
+    assert e.principal is None
+    assert e.source == "ttl"
+
+
+def test_get_audit_empty_when_disabled() -> None:
+    """Audit disabled at boot → server short-circuits to ``{entries:[]}``."""
+    with _sync_client(
+        _handler_map({("GET", "/admin/audit", ""): httpx.Response(200, json={"entries": []})})
+    ) as c:
+        rows = c.get_audit("kanban")
+    assert rows == []
+
+
+async def test_async_get_audit_builds_query_params() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["auth"] = request.headers["authorization"]
+        captured["path"] = request.url.path
+        captured["params"] = dict(request.url.params)
+        return httpx.Response(
+            200,
+            json={"entries": [_AUDIT_ROW_USER_WRITE]},
+        )
+
+    async with _async_client(handler) as c:
+        rows = await c.get_audit("kanban", table="items", op="insert", limit=10, offset=5)
+    assert captured["auth"] == ADMIN_BEARER
+    assert captured["path"] == "/admin/audit"
+    assert captured["params"] == {
+        "db": "kanban",
+        "table": "items",
+        "op": "insert",
+        "limit": "10",
+        "offset": "5",
+    }
+    assert len(rows) == 1
+    assert isinstance(rows[0], AuditEntry)
+    assert rows[0].doc_id == "i1"

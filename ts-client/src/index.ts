@@ -57,10 +57,12 @@ export type { RtDbHttpClientOptions, UploadResult, FileMetadata } from "./http.j
 export { RtDbAdminClient } from "./admin.js";
 export type {
   AdminStreamFrame,
+  AuditEntry,
   BackupFile,
   BackupsListResponse,
   CreateWebhookOptions,
   EditWebhookOptions,
+  GetAuditOptions,
   ListDeliveriesOptions,
   RestoreResult,
   RtDbAdminClientOptions,

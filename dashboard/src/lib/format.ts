@@ -50,6 +50,13 @@ export function formatTime(ms: number): string {
   return new Date(ms).toLocaleTimeString(undefined, { hour12: false });
 }
 
+/** Absolute date+time, hour12:false (e.g. "8/4/2026, 14:03:09"). Use for log
+ *  rows where the calendar day matters; sibling pages inline this same
+ *  toLocaleString call for their timestamps. */
+export function formatDateTime(ms: number): string {
+  return new Date(ms).toLocaleString(undefined, { hour12: false });
+}
+
 /** Compact human duration from seconds: 1d 3h 4m 5s, trimming leading zero units. */
 export function formatDuration(seconds: number): string {
   const sec = Math.max(0, Math.floor(seconds));

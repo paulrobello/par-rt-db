@@ -20,11 +20,13 @@ import { useSession } from "./session";
 import type {
   AdminMutateResult,
   AdminQueryResult,
+  AuditEntry,
   ConfigResponse,
   CreateWebhookOptions,
   DbStats,
   EditWebhookOptions,
   FileMeta,
+  GetAuditOptions,
   HotConfigPatch,
   ListDeliveriesOptions,
   MetricsSnapshot,
@@ -371,6 +373,25 @@ export class AdminClient {
     return this.req<{ deliveries: WebhookDelivery[] }>(
       `/admin/db/${enc(db)}/webhooks/${enc(id)}/deliveries${qs ? `?${qs}` : ""}`,
     ).then((r) => r.deliveries);
+  }
+  /** Durable audit-log entries, newest-first (GET /admin/audit). Each of
+   *  `db`/`table`/`op`/`principal`/`source` is an optional equality filter
+   *  (combined with AND); `limit`/`offset` page (`!== undefined` so an explicit
+   *  0 survives). Returns an empty array when audit logging is disabled at boot
+   *  — the table may not exist. */
+  getAudit(opts: GetAuditOptions = {}): Promise<AuditEntry[]> {
+    const params = new URLSearchParams();
+    if (opts.db) params.set("db", opts.db);
+    if (opts.table) params.set("table", opts.table);
+    if (opts.op) params.set("op", opts.op);
+    if (opts.principal) params.set("principal", opts.principal);
+    if (opts.source) params.set("source", opts.source);
+    if (opts.limit !== undefined) params.set("limit", String(opts.limit));
+    if (opts.offset !== undefined) params.set("offset", String(opts.offset));
+    const qs = params.toString();
+    return this.req<{ entries: AuditEntry[] }>(`/admin/audit${qs ? `?${qs}` : ""}`).then(
+      (r) => r.entries,
+    );
   }
 }
 

@@ -962,10 +962,58 @@ pub mod admin {
         pub offset: Option<i64>,
     }
 
+    // ---- audit log (GET /admin/audit) --------------------------------------
+    //
+    // Mirror server `audit::AuditEntry` byte-for-byte (camelCase). `op` and
+    // `principal` are `Option<String>` on the wire (the server emits JSON `null`
+    // for system-initiated rows such as TTL reaps and scheduled jobs, which
+    // carry no per-doc op or user principal); both carry `#[serde(default)]` so
+    // an older server that omits either still parses. `table` is the wire alias
+    // of the server's `tbl` field — named `table` directly here so the
+    // camelCase rename leaves it untouched, matching the wire key.
+
+    /// One durable-audit row as returned by `GET /admin/audit`. Mirrors server
+    /// `audit::AuditEntry` (camelCase). `op`/`principal` are `None` for
+    /// system-initiated writes (TTL reaps, scheduled jobs).
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct AuditEntry {
+        pub id: i64,
+        pub ts_ms: i64,
+        pub db: String,
+        pub table: String,
+        /// Wire `op`. `null` for system-initiated rows. Defaults to `None`
+        /// for older servers that omit the field.
+        #[serde(default)]
+        pub op: Option<String>,
+        pub doc_id: String,
+        /// Wire `principal` (the per-row owner when an interactive user wrote
+        /// the doc, `null` for machine tokens / system sources). Defaults to
+        /// `None` for older servers that omit the field.
+        #[serde(default)]
+        pub principal: Option<String>,
+        pub source: String,
+    }
+
+    /// Optional filters for [`crate::http::RtDbHttpClient::get_audit`]. Every
+    /// field is optional: `table`/`op`/`principal`/`source` are equality filters
+    /// combined with AND (an absent field matches all rows); `limit`/`offset`
+    /// page (server defaults: limit=100 clamped to `[1,1000]`, offset=0). Mirrors
+    /// `AuditQuery` in `ts-client`.
+    #[derive(Debug, Clone, Default)]
+    pub struct AuditQuery {
+        pub table: Option<String>,
+        pub op: Option<String>,
+        pub principal: Option<String>,
+        pub source: Option<String>,
+        pub limit: Option<i64>,
+        pub offset: Option<i64>,
+    }
+
     // Internal response wrappers (one per admin webhook endpoint that returns a
     // collection or a scalar the SDK unwraps). Field names match the server's
     // JSON keys verbatim (no camelCase mapping needed — `webhooks`/`id`/
-    // `deliveries` are already lowercase).
+    // `deliveries`/`entries` are already lowercase).
     #[derive(Deserialize)]
     pub(crate) struct WebhooksResponse {
         pub(crate) webhooks: Vec<Webhook>,
@@ -979,6 +1027,11 @@ pub mod admin {
     #[derive(Deserialize)]
     pub(crate) struct DeliveriesResponse {
         pub(crate) deliveries: Vec<WebhookDelivery>,
+    }
+
+    #[derive(Deserialize)]
+    pub(crate) struct AuditResponse {
+        pub(crate) entries: Vec<AuditEntry>,
     }
 }
 
