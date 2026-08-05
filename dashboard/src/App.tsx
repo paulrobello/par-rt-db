@@ -17,6 +17,7 @@ import { QueryConsolePage } from "./pages/QueryConsolePage";
 import { ScheduledJobsPage } from "./pages/ScheduledJobsPage";
 import { SchemaPage } from "./pages/SchemaPage";
 import { StoragePage } from "./pages/StoragePage";
+import { SubscriptionsPage } from "./pages/SubscriptionsPage";
 import { TokensPage } from "./pages/TokensPage";
 import { WebhooksPage } from "./pages/WebhooksPage";
 import { NotFound } from "./routes";
@@ -53,6 +54,7 @@ function Root() {
             <Route path="ops" element={<OpsPage />} />
             <Route path="scheduled" element={<ScheduledJobsPage />} />
             <Route path="storage" element={<StoragePage />} />
+            <Route path="subscriptions" element={<SubscriptionsPage />} />
             <Route path="tokens" element={<TokensPage />} />
             <Route path="webhooks" element={<WebhooksPage />} />
             <Route path="console" element={<QueryConsolePage />} />

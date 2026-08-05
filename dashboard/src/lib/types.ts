@@ -53,6 +53,50 @@ export interface MetricsSnapshot {
    */
   subsSkipVerificationsTotal: number;
   subsMissedPushesTotal: number;
+  /** Per-db breakdown of the skip/re-run/missed counters above (ENH-010),
+   *  sorted by db; absent/empty until a fan_out records a decision. */
+  perDbSubs?: DbSubCounters[];
+}
+
+/** One database's subscription-invalidation counters (ENH-010). camelCase wire. */
+export interface DbSubCounters {
+  db: string;
+  reruns: number;
+  skipsPoint: number;
+  skipsIndexed: number;
+  skipsOrdered: number;
+  missed: number;
+}
+
+/** The interactive identity of a subscriber, when it has one. A machine token,
+ *  scheduled job, or admin bypass carries no user identity, so its subscription
+ *  reports `principal: null`. */
+export interface SubscriptionsPrincipal {
+  userId: string | null;
+  email: string | null;
+}
+
+/** One active subscription, as listed by the inspector (`GET /admin/subscriptions`).
+ *  The registry keys on (connection, queryId), so each row is one subscriber's
+ *  one query — there is no per-sub subscriber count. */
+export interface SubscriptionInfo {
+  db: string;
+  table: string;
+  terminal: string;
+  readSetClass: string;
+  principal: SubscriptionsPrincipal | null;
+}
+
+/** Response from `GET /admin/subscriptions`: the live subscription list plus the
+ *  global and per-db invalidation counters that explain re-run behavior. */
+export interface SubscriptionsResponse {
+  subscriptions: SubscriptionInfo[];
+  subsRerunsTotal: number;
+  subsSkipsPointTotal: number;
+  subsSkipsIndexedTotal: number;
+  subsSkipsOrderedTotal: number;
+  subsMissedPushesTotal: number;
+  perDb: DbSubCounters[];
 }
 
 export interface TableStat {

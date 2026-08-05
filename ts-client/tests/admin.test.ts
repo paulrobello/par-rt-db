@@ -1,5 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
-import type { AuditEntry, Webhook, WebhookDelivery } from "../src/admin.js";
+import type {
+  AuditEntry,
+  SubscriptionInfo,
+  SubscriptionsResponse,
+  Webhook,
+  WebhookDelivery,
+} from "../src/admin.js";
 import { RtDbAdminClient } from "../src/admin.js";
 import { Migration } from "../src/migration.js";
 import type { TransactionJson } from "../src/protocol.js";
@@ -930,5 +936,69 @@ describe("RtDbAdminClient audit", () => {
     expect(fetchMock.mock.calls[0][0]).toBe(
       "http://h:8300/admin/audit?principal=user%40example.com&source=ttl",
     );
+  });
+});
+
+describe("RtDbAdminClient subscriptions", () => {
+  it("listSubscriptions GETs /admin/subscriptions with optional db and unwraps the body", async () => {
+    // One interactive-principal sub and one system sub (machine token) where
+    // principal comes back as JSON null.
+    const subscriptions: SubscriptionInfo[] = [
+      {
+        db: "kanban",
+        table: "items",
+        terminal: "collect",
+        readSetClass: "indexed",
+        principal: { userId: "u1", email: "user@example.com" },
+      },
+      {
+        db: "kanban",
+        table: "items",
+        terminal: "get",
+        readSetClass: "point",
+        principal: null,
+      },
+    ];
+    const payload: SubscriptionsResponse = {
+      subscriptions,
+      subsRerunsTotal: 12,
+      subsSkipsPointTotal: 3,
+      subsSkipsIndexedTotal: 4,
+      subsSkipsOrderedTotal: 5,
+      subsMissedPushesTotal: 0,
+      perDb: [
+        {
+          db: "kanban",
+          reruns: 12,
+          skipsPoint: 3,
+          skipsIndexed: 4,
+          skipsOrdered: 5,
+          missed: 0,
+        },
+      ],
+    };
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(payload));
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+    await expect(admin.listSubscriptions({ db: "kanban" })).resolves.toEqual(payload);
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("http://h:8300/admin/subscriptions?db=kanban");
+    expect(init.method).toBe("GET");
+    expect(init.headers.Authorization).toBe("Bearer k");
+  });
+
+  it("listSubscriptions omits the query string when no opts are provided", async () => {
+    const payload: SubscriptionsResponse = {
+      subscriptions: [],
+      subsRerunsTotal: 0,
+      subsSkipsPointTotal: 0,
+      subsSkipsIndexedTotal: 0,
+      subsSkipsOrderedTotal: 0,
+      subsMissedPushesTotal: 0,
+      perDb: [],
+    };
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(payload));
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+    await expect(admin.listSubscriptions()).resolves.toEqual(payload);
+    expect(fetchMock.mock.calls[0][0]).toBe("http://h:8300/admin/subscriptions");
   });
 });

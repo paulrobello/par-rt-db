@@ -148,6 +148,122 @@ fn migrate_results_round_trip() {
     }
 }
 
+/// ENH-010 subscription-inspector wire shapes. Self-contained (not in the
+/// shared corpus — these admin-only response types landed with the inspector)
+/// so the round-trip still asserts the exact camelCase keys the server emits.
+#[cfg(feature = "admin")]
+#[test]
+fn subscriptions_response_round_trip() {
+    use par_rt_db_client::wire::admin::{
+        DbSubCounters, SubscriptionInfo, SubscriptionsPrincipal, SubscriptionsResponse,
+    };
+    let input = json!({
+        "subscriptions": [
+            {
+                "db": "app",
+                "table": "workItems",
+                "terminal": "collect",
+                "readSetClass": "indexed",
+                "principal": {"userId": "u1", "email": "a@b.com"}
+            },
+            {
+                "db": "app",
+                "table": "users",
+                "terminal": "get",
+                "readSetClass": "point",
+                "principal": null
+            }
+        ],
+        "subsRerunsTotal": 12,
+        "subsSkipsPointTotal": 3,
+        "subsSkipsIndexedTotal": 5,
+        "subsSkipsOrderedTotal": 1,
+        "subsMissedPushesTotal": 0,
+        "perDb": [
+            {
+                "db": "app",
+                "reruns": 12,
+                "skipsPoint": 3,
+                "skipsIndexed": 5,
+                "skipsOrdered": 1,
+                "missed": 0
+            }
+        ]
+    });
+    let parsed: SubscriptionsResponse =
+        serde_json::from_value(input.clone()).expect("parse SubscriptionsResponse");
+    let dumped = serde_json::to_value(&parsed).expect("serialize SubscriptionsResponse");
+    assert_eq!(dumped, input, "wire drift in SubscriptionsResponse");
+    assert!(parsed.subscriptions[1].principal.is_none());
+    assert_eq!(parsed.per_db[0].skips_indexed, 5);
+
+    // Nested-type camelCase, including the `null` principal on the wire.
+    let p = SubscriptionsPrincipal {
+        user_id: Some("u".into()),
+        email: None,
+    };
+    assert_eq!(
+        serde_json::to_value(&p).unwrap(),
+        json!({"userId": "u", "email": null})
+    );
+    let info = SubscriptionInfo {
+        db: "d".into(),
+        table: "t".into(),
+        terminal: "count".into(),
+        read_set_class: "point".into(),
+        principal: None,
+    };
+    assert_eq!(
+        serde_json::to_value(&info).unwrap(),
+        json!({"db":"d","table":"t","terminal":"count","readSetClass":"point","principal":null})
+    );
+    let c = DbSubCounters {
+        db: "d".into(),
+        reruns: 1,
+        skips_point: 2,
+        skips_indexed: 3,
+        skips_ordered: 4,
+        missed: 5,
+    };
+    assert_eq!(
+        serde_json::to_value(&c).unwrap(),
+        json!({"db":"d","reruns":1,"skipsPoint":2,"skipsIndexed":3,"skipsOrdered":4,"missed":5})
+    );
+}
+
+/// Confirms the `perDbSubs` field added to `MetricsSnapshot` (ENH-010)
+/// deserializes under its camelCase key and defaults to empty when an older
+/// server omits it. `MetricsSnapshot` is `Deserialize`-only (server emits it;
+/// client never sends it), so this is a one-way parse check.
+#[cfg(feature = "admin")]
+#[test]
+fn metrics_snapshot_deserializes_per_db_subs() {
+    use par_rt_db_client::wire::admin::MetricsSnapshot;
+    let base = || {
+        json!({
+            "queriesTotal": 0, "mutationsTotal": 0, "uploadsTotal": 0,
+            "wsConnections": 0, "activeSubscriptions": 0,
+            "poolSize": 0, "poolIdle": 0, "uptimeSeconds": 0,
+            "queryLatency": {"p50": 0, "p95": 0, "p99": 0},
+            "mutateLatency": {"p50": 0, "p95": 0, "p99": 0},
+            "subscribeLatency": {"p50": 0, "p95": 0, "p99": 0}
+        })
+    };
+    let mut with_subs = base();
+    with_subs["perDbSubs"] = json!([{
+        "db": "app", "reruns": 1, "skipsPoint": 2,
+        "skipsIndexed": 3, "skipsOrdered": 4, "missed": 0
+    }]);
+    let m: MetricsSnapshot = serde_json::from_value(with_subs).expect("parse with perDbSubs");
+    assert_eq!(m.per_db_subs.len(), 1);
+    assert_eq!(m.per_db_subs[0].db, "app");
+    assert_eq!(m.per_db_subs[0].skips_ordered, 4);
+
+    // Older server that omits the field → empty vec, not an error.
+    let older: MetricsSnapshot = serde_json::from_value(base()).expect("parse without perDbSubs");
+    assert!(older.per_db_subs.is_empty());
+}
+
 #[test]
 fn rejects_unknown_fields() {
     let corpus = load_corpus();

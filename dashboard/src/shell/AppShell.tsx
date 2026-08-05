@@ -10,6 +10,7 @@ const NAV = [
   { to: "/", label: "Databases", end: true },
   { to: "/metrics", label: "Metrics" },
   { to: "/ops", label: "Op feed" },
+  { to: "/subscriptions", label: "Subscriptions" },
   { to: "/scheduled", label: "Scheduled" },
   { to: "/storage", label: "Storage" },
   { to: "/tokens", label: "Tokens" },

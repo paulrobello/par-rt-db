@@ -631,6 +631,62 @@ pub mod admin {
         pub subs_skip_verifications_total: i64,
         #[serde(default)]
         pub subs_missed_pushes_total: i64,
+        /// ENH-010 per-db breakdown of the subscription counters above
+        /// (`perDbSubs` on the wire). `#[serde(default)]` so an older server
+        /// that omits it still deserializes to an empty vec.
+        #[serde(default)]
+        pub per_db_subs: Vec<DbSubCounters>,
+    }
+
+    /// Subscriber identity for [`SubscriptionInfo`]. The server emits `null`
+    /// (→ `None`) when the subscriber has no interactive identity — a machine
+    /// token, a scheduled job, or admin bypass.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct SubscriptionsPrincipal {
+        pub user_id: Option<String>,
+        pub email: Option<String>,
+    }
+
+    /// One row of [`SubscriptionsResponse::subscriptions`]: a live subscription
+    /// and the read-set class that governs its skip/re-run invalidation.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct SubscriptionInfo {
+        pub db: String,
+        pub table: String,
+        pub terminal: String,
+        pub read_set_class: String,
+        pub principal: Option<SubscriptionsPrincipal>,
+    }
+
+    /// Per-db subscription-invalidation counters — one row of
+    /// [`SubscriptionsResponse::per_db`] and [`MetricsSnapshot::per_db_subs`].
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct DbSubCounters {
+        pub db: String,
+        pub reruns: u64,
+        pub skips_point: u64,
+        pub skips_indexed: u64,
+        pub skips_ordered: u64,
+        pub missed: u64,
+    }
+
+    /// `GET /admin/subscriptions?db=<optional>` response (ENH-010): the live
+    /// subscription inspector. `subscriptions` enumerates every active
+    /// subscription; the counter totals mirror `MetricsSnapshot`'s invalidation
+    /// totals server-wide, and `per_db` breaks them down per database.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct SubscriptionsResponse {
+        pub subscriptions: Vec<SubscriptionInfo>,
+        pub subs_reruns_total: u64,
+        pub subs_skips_point_total: u64,
+        pub subs_skips_indexed_total: u64,
+        pub subs_skips_ordered_total: u64,
+        pub subs_missed_pushes_total: u64,
+        pub per_db: Vec<DbSubCounters>,
     }
 
     /// Runtime-mutable hot-config subset of `ConfigResponse`. Mirrors

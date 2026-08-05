@@ -2,6 +2,7 @@
 //! counters incremented at the transport boundary (HTTP + WS handlers), snapshotted
 //! on demand by `GET /admin/metrics`. Rates are derived client-side from successive
 //! snapshots; the realtime push stream + op feed live in Phase 3b.
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
@@ -82,6 +83,37 @@ pub enum SkipClass {
     Ordered,
 }
 
+/// Per-database subscription-invalidation counters — the per-db breakdown of
+/// the global skip/re-run/missed counters on [`Metrics`]. Stored inside
+/// [`Metrics::per_db_subs`], a `Mutex<HashMap<String, Self>>`; the mutex is held
+/// only across a single atomic increment (no I/O), so it does not reintroduce
+/// the cross-db serialization the sharded registry (`crate::subs`) removed —
+/// that concern is about holding locks across Postgres round-trips, not
+/// nanosecond atomic adds. Exposed only in the JSON metrics snapshot and the
+/// `/admin/subscriptions` inspector; deliberately absent from the Prometheus
+/// scrape to avoid per-db label cardinality on the public export.
+#[derive(Default)]
+struct DbSubCounters {
+    reruns: AtomicU64,
+    skips_point: AtomicU64,
+    skips_indexed: AtomicU64,
+    skips_ordered: AtomicU64,
+    missed: AtomicU64,
+}
+
+/// One db's subscription-invalidation counters in a serializable, sorted form
+/// (the JSON snapshot + inspector shape). camelCase on the wire.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DbSubCounterRow {
+    pub db: String,
+    pub reruns: u64,
+    pub skips_point: u64,
+    pub skips_indexed: u64,
+    pub skips_ordered: u64,
+    pub missed: u64,
+}
+
 #[derive(Default)]
 pub struct Metrics {
     queries_total: AtomicU64,
@@ -114,6 +146,11 @@ pub struct Metrics {
     /// Total expired documents deleted by the per-db TTL reaper across all
     /// dbs/tables. Global (no db/table labels) to match the neighboring counters.
     ttl_expired_total: AtomicU64,
+    // ---- Per-db subscription-invalidation counters (ENH-010) ----
+    /// Per-db breakdown of the skip/re-run/missed counters above, keyed by db
+    /// name. Updated alongside the globals in `fan_out`; read by the JSON
+    /// metrics snapshot and `/admin/subscriptions`. See [`DbSubCounters`].
+    per_db_subs: Mutex<HashMap<String, DbSubCounters>>,
 }
 
 impl Metrics {
@@ -162,20 +199,37 @@ impl Metrics {
         }
     }
 
-    /// A subscription on a written table was re-run by `fan_out`.
-    pub fn record_subs_rerun(&self) {
+    /// A subscription on a written table was re-run by `fan_out`. Records both
+    /// the global counter and the per-db counter for `db`.
+    pub fn record_subs_rerun(&self, db: &str) {
         self.subs_reruns_total.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut map) = self.per_db_subs.lock() {
+            map.entry(db.to_string())
+                .or_default()
+                .reruns
+                .fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// A subscription on a written table was skipped: its read set proved every
-    /// written document irrelevant.
-    pub fn record_subs_skip(&self, class: SkipClass) {
+    /// written document irrelevant. Records both the global counter and the
+    /// per-db counter for `db` (by `class`).
+    pub fn record_subs_skip(&self, db: &str, class: SkipClass) {
         let counter = match class {
             SkipClass::Point => &self.subs_skips_point_total,
             SkipClass::Indexed => &self.subs_skips_indexed_total,
             SkipClass::Ordered => &self.subs_skips_ordered_total,
         };
         counter.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut map) = self.per_db_subs.lock() {
+            let entry = map.entry(db.to_string()).or_default();
+            let per_db = match class {
+                SkipClass::Point => &entry.skips_point,
+                SkipClass::Indexed => &entry.skips_indexed,
+                SkipClass::Ordered => &entry.skips_ordered,
+            };
+            per_db.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// A skip was shadow-verified. Call once per verification regardless of the
@@ -187,14 +241,42 @@ impl Metrics {
 
     /// A shadow-verified skip turned out to be wrong — the result HAD changed.
     /// See `subs_missed_pushes_total`: non-zero means a correctness defect.
-    pub fn record_subs_missed_push(&self) {
+    /// Records both the global counter and the per-db counter for `db`.
+    pub fn record_subs_missed_push(&self, db: &str) {
         self.subs_missed_pushes_total
             .fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut map) = self.per_db_subs.lock() {
+            map.entry(db.to_string())
+                .or_default()
+                .missed
+                .fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// A TTL reaper sweep deleted an expired document. Call once per deleted doc.
     pub fn record_ttl_expired(&self) {
         self.ttl_expired_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Snapshot of the per-db subscription-invalidation counters, sorted by db
+    /// name for stable output. Empty until a `fan_out` records a decision.
+    pub fn per_db_subs_snapshot(&self) -> Vec<DbSubCounterRow> {
+        let Ok(map) = self.per_db_subs.lock() else {
+            return Vec::new();
+        };
+        let mut rows: Vec<DbSubCounterRow> = map
+            .iter()
+            .map(|(db, c)| DbSubCounterRow {
+                db: db.clone(),
+                reruns: c.reruns.load(Ordering::Relaxed),
+                skips_point: c.skips_point.load(Ordering::Relaxed),
+                skips_indexed: c.skips_indexed.load(Ordering::Relaxed),
+                skips_ordered: c.skips_ordered.load(Ordering::Relaxed),
+                missed: c.missed.load(Ordering::Relaxed),
+            })
+            .collect();
+        rows.sort_by(|a, b| a.db.cmp(&b.db));
+        rows
     }
 
     pub async fn snapshot(
@@ -239,6 +321,7 @@ impl Metrics {
                 .load(Ordering::Relaxed),
             subs_missed_pushes_total: self.subs_missed_pushes_total.load(Ordering::Relaxed),
             ttl_expired_total: self.ttl_expired_total.load(Ordering::Relaxed),
+            per_db_subs: self.per_db_subs_snapshot(),
         }
     }
 }
@@ -272,6 +355,9 @@ pub struct MetricsSnapshot {
     pub subs_missed_pushes_total: u64,
     /// Total expired documents deleted by the TTL reaper (all dbs/tables).
     pub ttl_expired_total: u64,
+    /// Per-database breakdown of the subscription-invalidation counters above
+    /// (ENH-010). Empty until a `fan_out` records a decision; sorted by db.
+    pub per_db_subs: Vec<DbSubCounterRow>,
 }
 
 /// Render the snapshot as Prometheus text-exposition format (version 0.0.4).
@@ -412,6 +498,7 @@ mod tests {
             subs_skip_verifications_total: 15,
             subs_missed_pushes_total: 0,
             ttl_expired_total: 0,
+            per_db_subs: Vec::new(),
         };
         let body = render_prometheus(&snap, "0.0.0", "abc");
         assert!(
@@ -449,6 +536,7 @@ mod tests {
             subs_skip_verifications_total: 7,
             subs_missed_pushes_total: 9,
             ttl_expired_total: 0,
+            per_db_subs: Vec::new(),
         };
         let body = render_prometheus(&snap, "0.0.0", "abc");
         // One metric name, one sample per skip class.
@@ -479,19 +567,37 @@ mod tests {
     #[test]
     fn skip_and_verification_counters_land_in_the_snapshot() {
         let m = Metrics::default();
-        m.record_subs_skip(SkipClass::Point);
-        m.record_subs_skip(SkipClass::Indexed);
-        m.record_subs_skip(SkipClass::Indexed);
-        m.record_subs_skip(SkipClass::Ordered);
-        m.record_subs_rerun();
+        m.record_subs_skip("db-a", SkipClass::Point);
+        m.record_subs_skip("db-a", SkipClass::Indexed);
+        m.record_subs_skip("db-b", SkipClass::Indexed);
+        m.record_subs_skip("db-a", SkipClass::Ordered);
+        m.record_subs_rerun("db-a");
         m.record_subs_skip_verification();
-        m.record_subs_missed_push();
+        m.record_subs_missed_push("db-b");
         assert_eq!(m.subs_skips_point_total.load(Ordering::Relaxed), 1);
         assert_eq!(m.subs_skips_indexed_total.load(Ordering::Relaxed), 2);
         assert_eq!(m.subs_skips_ordered_total.load(Ordering::Relaxed), 1);
         assert_eq!(m.subs_reruns_total.load(Ordering::Relaxed), 1);
         assert_eq!(m.subs_skip_verifications_total.load(Ordering::Relaxed), 1);
         assert_eq!(m.subs_missed_pushes_total.load(Ordering::Relaxed), 1);
+        // Per-db breakdown (ENH-010): globals fan out into per-db rows.
+        let rows = m.per_db_subs_snapshot();
+        assert_eq!(rows.len(), 2, "two dbs recorded");
+        // Sorted by db name: db-a first, then db-b.
+        assert_eq!(rows[0].db, "db-a");
+        assert_eq!(rows[0].skips_point, 1);
+        assert_eq!(rows[0].skips_indexed, 1);
+        assert_eq!(rows[0].skips_ordered, 1);
+        assert_eq!(rows[0].reruns, 1);
+        assert_eq!(rows[0].missed, 0);
+        assert_eq!(rows[1].db, "db-b");
+        assert_eq!(rows[1].skips_indexed, 1);
+        assert_eq!(rows[1].missed, 1);
+        // Globals are the sum across dbs.
+        assert_eq!(
+            rows.iter().map(|r| r.skips_indexed).sum::<u64>(),
+            m.subs_skips_indexed_total.load(Ordering::Relaxed)
+        );
     }
 
     #[test]

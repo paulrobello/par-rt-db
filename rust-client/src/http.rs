@@ -820,6 +820,23 @@ impl RtDbHttpClient {
         self.get_json("/admin/metrics", &[]).await
     }
 
+    /// `GET /admin/subscriptions?db=<optional>` → live subscription inspector
+    /// (ENH-010): every active subscription's db/table/terminal/read-set
+    /// class/principal, plus invalidation-effectiveness counters (re-runs vs.
+    /// proven skips by class, sampled missed pushes) both server-wide and
+    /// per-db. Pass `Some(db)` to scope to one database; `None` for every
+    /// database on the instance.
+    pub async fn list_subscriptions(
+        &self,
+        db: Option<&str>,
+    ) -> Result<crate::wire::admin::SubscriptionsResponse, RtDbError> {
+        let params: &[(&str, &str)] = match db {
+            Some(d) => &[("db", d)],
+            None => &[],
+        };
+        self.get_json("/admin/subscriptions", params).await
+    }
+
     /// `GET /admin/config` → redacted running config + build identity + admins.
     pub async fn get_config(&self) -> Result<crate::wire::admin::ConfigResponse, RtDbError> {
         self.get_json("/admin/config", &[]).await

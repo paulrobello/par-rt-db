@@ -1634,6 +1634,60 @@ async fn audit_recent(
     Ok(Json(AuditResponse { entries }))
 }
 
+#[derive(Deserialize)]
+struct SubscriptionsParams {
+    #[serde(default)]
+    db: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SubscriptionsResponse {
+    subscriptions: Vec<crate::subs::SubSnapshot>,
+    /// Global subscription-invalidation counters (the same totals exposed on
+    /// `/admin/metrics`), repeated here so an operator inspecting live queries
+    /// sees the invalidation behavior in one place.
+    subs_reruns_total: u64,
+    subs_skips_point_total: u64,
+    subs_skips_indexed_total: u64,
+    subs_skips_ordered_total: u64,
+    subs_missed_pushes_total: u64,
+    /// Per-db breakdown of those counters (ENH-010); sorted by db.
+    per_db: Vec<crate::metrics::DbSubCounterRow>,
+}
+
+/// `GET /admin/subscriptions?db=<optional>` — the live subscription inspector
+/// (ENH-010). Snapshots the registry (read-only; same lock discipline as the
+/// `active_subscriptions` gauge) so an operator can see WHAT is subscribed per
+/// database — table, terminal, read-set class, principal — alongside the
+/// per-db skip/re-run/missed counters that explain invalidation behavior. Does
+/// not execute txns and does not touch the single-writer invariant.
+async fn list_subscriptions(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    QueryParams(params): QueryParams<SubscriptionsParams>,
+) -> Result<Json<SubscriptionsResponse>, RtDbError> {
+    require_admin(&state, &headers).await?;
+    // Reuse the metrics snapshot for the global + per-db counters (the inspector
+    // is a low-frequency admin poll, so the extra pool/latency reads are
+    // negligible) and the registry snapshot for the per-subscription rows.
+    let snap = state
+        .runtime
+        .metrics
+        .snapshot(&state.pool, &state.realtime.subs, state.runtime.started_at)
+        .await;
+    let subscriptions = state.realtime.subs.snapshot(params.db.as_deref()).await;
+    Ok(Json(SubscriptionsResponse {
+        subscriptions,
+        subs_reruns_total: snap.subs_reruns_total,
+        subs_skips_point_total: snap.subs_skips_point_total,
+        subs_skips_indexed_total: snap.subs_skips_indexed_total,
+        subs_skips_ordered_total: snap.subs_skips_ordered_total,
+        subs_missed_pushes_total: snap.subs_missed_pushes_total,
+        per_db: snap.per_db_subs,
+    }))
+}
+
 #[derive(Serialize)]
 struct OpsRecentResponse {
     ops: Vec<crate::op_feed::OpEvent>,
@@ -1839,6 +1893,7 @@ pub fn admin_routes() -> Router<Arc<AppState>> {
         .route("/admin/restore", post(restore_backup))
         .route("/admin/ops/recent", get(ops_recent))
         .route("/admin/audit", get(audit_recent))
+        .route("/admin/subscriptions", get(list_subscriptions))
         .route("/admin/stream", get(admin_stream))
         .route("/admin/tokens", get(list_tokens))
         .route("/admin/export-db", get(export_db))

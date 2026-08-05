@@ -33,7 +33,7 @@ real code surface cited in the paragraph.
 
 - [ ] **ENH-009 — One-shot database clone** — Snapshot export (`GET /admin/export-db`) and import (`POST /admin/import-db`) already give app-level portability (#7), but cloning a database is a two-step manual dance. Add a `POST /admin/clone-db?from=&to=` that streams export→import server-side into a freshly created database (schema plus all documents, preserving ids), useful for dev/preview seeds and safe experimentation off a live db. (impact: low-medium, effort: small, plan: none)
 
-- [ ] **ENH-010 — Live subscription inspector** — The metrics page shows subscription *counts* (gauges) but not *what* is subscribed, so an operator debugging "why does this table re-run so often" cannot see the live query set. Add an admin view (and dashboard surface) enumerating active subscriptions per database — table, terminal, read-set class, subscriber count — surfacing the per-class skip/re-run counters (`rtdb_subs_skips_total` / `reruns`) already tracked in `subs.rs` so invalidation behavior is observable per query, not just aggregated. (impact: medium, effort: medium, plan: none)
+- [x] **ENH-010 — Live subscription inspector**
 
 - [ ] **ENH-011 — Per-database resource quotas** — One instance hosts many named databases, and today nothing stops one db's tables, storage, or subscriptions from crowding the rest. Add optional per-db quotas (max tables, max storage bytes, max concurrent subscriptions) enforced at create / push-schema / mutate / subscribe, configurable via hot config, so multi-tenant self-hosting stays fair without per-db deployment. (impact: medium, effort: medium-large, plan: none)
 

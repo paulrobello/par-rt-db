@@ -132,12 +132,27 @@ class LatencyStats(_Wire):
     p99: int
 
 
+class DbSubCounters(_Wire):
+    """Per-db subscription counter row — the shape shared by ``perDb[]`` on
+    ``GET /admin/subscriptions`` and ``perDbSubs[]`` on ``GET /admin/metrics``.
+    Mirrors ``server::subs::DbSubCounters``."""
+
+    db: str
+    reruns: int
+    skips_point: int
+    skips_indexed: int
+    skips_ordered: int
+    missed: int
+
+
 class MetricsSnapshot(_Wire):
     """``GET /admin/metrics`` response — server-wide counters and gauges.
 
     The ``subs_*`` fields default to 0 so a client built against a newer server
     still deserializes an older server's response (these counters landed
     2026-07-29); 0 is the correct "not reported" value for a monotonic counter.
+    ``per_db_subs`` defaults to empty for the same reason (added 2026-08-05 with
+    the live subscription inspector, ENH-010).
     """
 
     queries_total: int
@@ -157,6 +172,7 @@ class MetricsSnapshot(_Wire):
     subs_skips_ordered_total: int = 0
     subs_skip_verifications_total: int = 0
     subs_missed_pushes_total: int = 0
+    per_db_subs: list[DbSubCounters] = Field(default_factory=list)
 
 
 class HotConfig(_Wire):
@@ -315,6 +331,41 @@ class AuditEntry(_Wire):
     doc_id: str
     principal: str | None = None
     source: str
+
+
+class SubscriptionsPrincipal(_Wire):
+    """Interactive principal on a live subscription row — ``null`` for machine
+    tokens, scheduled jobs, and admin bypass (no interactive identity)."""
+
+    user_id: str | None
+    email: str | None
+
+
+class SubscriptionInfo(_Wire):
+    """``GET /admin/subscriptions`` row — one live subscription.
+
+    ``read_set_class`` is one of ``point``/``indexed``/``ordered``/``table``
+    (the four :class:`subs::ReadSet` variants); ``terminal`` is the query's
+    terminal operation (``get``/``count``/``collect``/``unique``/…)."""
+
+    db: str
+    table: str
+    terminal: str
+    read_set_class: str
+    principal: SubscriptionsPrincipal | None
+
+
+class SubscriptionsResponse(_Wire):
+    """``GET /admin/subscriptions`` response — live subscription rows plus the
+    subscription fan-out counters (rerun/skip totals, per-db breakdown)."""
+
+    subscriptions: list[SubscriptionInfo]
+    subs_reruns_total: int
+    subs_skips_point_total: int
+    subs_skips_indexed_total: int
+    subs_skips_ordered_total: int
+    subs_missed_pushes_total: int
+    per_db: list[DbSubCounters]
 
 
 # ``StepResult`` is a ``Union`` alias (no ``model_validate``); route through a

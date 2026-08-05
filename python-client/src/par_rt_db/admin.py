@@ -19,6 +19,8 @@ admin control plane found on :class:`par_rt_db.http_client.RtDbHttpClient`:
   edit / delete) plus ``.../{id}/deliveries`` for the delivery outbox
 * audit log (ENH-004) — ``/admin/audit`` durable per-write audit rows, filtered
   by db/table/op/principal/source with limit/offset paging
+* live subscription inspector (ENH-010) — ``/admin/subscriptions`` for the live
+  subscription table + fan-out counters, optionally filtered by db
 
 This is the canonical admin surface; the same methods also remain on
 :class:`par_rt_db.http_client.RtDbHttpClient` /
@@ -61,6 +63,7 @@ from .http_client import (
     MigrateResult,
     MintedToken,
     OpEvent,
+    SubscriptionsResponse,
     TokenInfo,
     Webhook,
     WebhookDelivery,
@@ -630,6 +633,23 @@ class RtDbAdminClient:
         resp = self._req("GET", "/admin/audit", params=params)
         return [AuditEntry.model_validate(e) for e in resp.json()["entries"]]
 
+    def get_subscriptions(self, db: str | None = None) -> SubscriptionsResponse:
+        """``GET /admin/subscriptions[?db=<db>]`` → live subscription table + counters.
+
+        Returns one row per active subscription across every database (the live
+        view the committer invalidates against), plus the subscription fan-out
+        counters (``subsRerunsTotal``/``subsSkips*Total``/``subsMissedPushesTotal``)
+        and a per-db counter breakdown. ``db`` is an optional filter; when
+        ``None`` the server returns rows for every database. The ``principal`` on
+        each row is ``None`` for non-interactive subscribers (machine tokens,
+        scheduled jobs, admin bypass).
+        """
+        params: dict[str, Any] = {}
+        if db is not None:
+            params["db"] = db
+        resp = self._req("GET", "/admin/subscriptions", params=params)
+        return SubscriptionsResponse.model_validate(resp.json())
+
     # --- request plumbing ---
 
     def _req(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
@@ -1111,6 +1131,17 @@ class AsyncRtDbAdminClient:
             params["offset"] = offset
         resp = await self._req("GET", "/admin/audit", params=params)
         return [AuditEntry.model_validate(e) for e in resp.json()["entries"]]
+
+    async def get_subscriptions(self, db: str | None = None) -> SubscriptionsResponse:
+        """``GET /admin/subscriptions[?db=<db>]`` → live subscription table + counters (async).
+
+        See :meth:`RtDbAdminClient.get_subscriptions` for response semantics.
+        """
+        params: dict[str, Any] = {}
+        if db is not None:
+            params["db"] = db
+        resp = await self._req("GET", "/admin/subscriptions", params=params)
+        return SubscriptionsResponse.model_validate(resp.json())
 
     # --- request plumbing ---
 

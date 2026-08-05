@@ -757,3 +757,134 @@ async fn get_subscription_updates_when_its_doc_is_deleted() -> anyhow::Result<()
     assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
     Ok(())
 }
+
+// ENH-010: the live subscription inspector. Register subscriptions across two
+// dbs with different query shapes (and a user-identity principal on one), then
+// assert the registry snapshot lists them with the right db/table/terminal/
+// read-set class/principal, the db filter narrows correctly, and a mutate
+// increments the per-db re-run counter for the written db only.
+#[tokio::test]
+async fn inspector_snapshots_subscriptions_and_per_db_counters() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let db_a = fresh_db(&state).await;
+    let db_b = fresh_db(&state).await;
+    // &str views borrow the TestDb handles, which stay alive to function end so
+    // their RAII cleanup (DROP SCHEMA) runs after the test, not now.
+    let a = db_a.as_str();
+    let b = db_b.as_str();
+
+    // db_a: a plain collect (Table read-set, bypass principal) and an indexed
+    // by_status read (Indexed read-set, an interactive-user principal).
+    let (tx1, _rx1) = tokio::sync::mpsc::unbounded_channel();
+    state
+        .realtime
+        .committers
+        .subscribe(
+            a,
+            next_conn_id(),
+            "collect-a".to_string(),
+            collect_work_items(),
+            tx1,
+            PrincipalCtx::bypass(),
+        )
+        .await?;
+    let (tx2, _rx2) = tokio::sync::mpsc::unbounded_channel();
+    state
+        .realtime
+        .committers
+        .subscribe(
+            a,
+            next_conn_id(),
+            "by-status-a".to_string(),
+            work_items_by_status("backlog"),
+            tx2,
+            PrincipalCtx {
+                user_id: Some("user-1".to_string()),
+                email: Some("user-1@example.com".to_string()),
+                tables: None,
+            },
+        )
+        .await?;
+    // db_b: one plain collect (Table read-set, bypass principal).
+    let (tx3, _rx3) = tokio::sync::mpsc::unbounded_channel();
+    state
+        .realtime
+        .committers
+        .subscribe(
+            b,
+            next_conn_id(),
+            "collect-b".to_string(),
+            collect_work_items(),
+            tx3,
+            PrincipalCtx::bypass(),
+        )
+        .await?;
+
+    // Unfiltered snapshot lists all three, sorted by (db, table).
+    let all = state.realtime.subs.snapshot(None).await;
+    assert_eq!(all.len(), 3, "three subscriptions across two dbs");
+
+    let collect_a = all
+        .iter()
+        .find(|s| s.db == a && s.terminal == "collect" && s.read_set_class == "table")
+        .expect("db_a collect (Table) subscription present");
+    assert!(collect_a.principal.is_none(), "bypass principal is null");
+
+    let by_status_a = all
+        .iter()
+        .find(|s| s.db == a && s.read_set_class == "indexed")
+        .expect("db_a indexed subscription present");
+    assert_eq!(by_status_a.terminal, "collect");
+    let principal = by_status_a
+        .principal
+        .as_ref()
+        .expect("user principal is surfaced");
+    assert_eq!(principal.user_id.as_deref(), Some("user-1"));
+    assert_eq!(principal.email.as_deref(), Some("user-1@example.com"));
+
+    assert!(
+        all.iter().any(|s| s.db == b && s.read_set_class == "table"),
+        "db_b subscription present"
+    );
+
+    // db filter narrows to one db's subscriptions.
+    let only_a = state.realtime.subs.snapshot(Some(a)).await;
+    assert_eq!(only_a.len(), 2);
+    assert!(only_a.iter().all(|s| s.db == a));
+    let only_b = state.realtime.subs.snapshot(Some(b)).await;
+    assert_eq!(only_b.len(), 1);
+
+    // No fan_out has run yet → no per-db counter rows.
+    assert!(
+        state.runtime.metrics.per_db_subs_snapshot().is_empty(),
+        "no counters before any fan_out"
+    );
+
+    // Mutating db_a re-runs both of its subscriptions (Table always re-runs;
+    // the indexed read's window matches the inserted status). db_b is untouched.
+    state
+        .realtime
+        .committers
+        .mutate(
+            a,
+            None,
+            insert_work_item("backlog", 9.0),
+            PrincipalCtx::bypass(),
+        )
+        .await?;
+
+    let per_db = state.runtime.metrics.per_db_subs_snapshot();
+    assert_eq!(per_db.len(), 1, "only the written db recorded counters");
+    assert_eq!(per_db[0].db, a);
+    assert_eq!(per_db[0].reruns, 2, "both db_a subscriptions re-ran");
+    assert_eq!(per_db[0].missed, 0);
+
+    // Globals move too: the metrics snapshot's rerun total reflects db_a.
+    let snap = state
+        .runtime
+        .metrics
+        .snapshot(&state.pool, &state.realtime.subs, state.runtime.started_at)
+        .await;
+    assert_eq!(snap.subs_reruns_total, 2);
+    Ok(())
+}

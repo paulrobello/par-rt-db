@@ -1,0 +1,242 @@
+.page {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+}
+
+.head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  flex-wrap: wrap;
+}
+
+.title {
+  margin: 0;
+  font-size: var(--t-display);
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  font-family: var(--mono);
+}
+
+.count {
+  margin-left: auto;
+  font-family: var(--mono);
+  font-size: var(--t-mono-sm);
+  color: var(--ink-3);
+}
+
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  flex-wrap: wrap;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+}
+
+.fieldLabel {
+  font-family: var(--mono);
+  font-size: var(--t-mono-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  color: var(--ink-3);
+}
+
+.select {
+  background: var(--inset);
+  color: var(--ink);
+  border: 1px solid var(--rule-strong);
+  border-radius: var(--r-1);
+  font-family: var(--mono);
+  font-size: var(--t-mono-sm);
+  padding: 6px var(--sp-2);
+  outline: none;
+  min-width: 200px;
+}
+
+.refresh {
+  background: var(--inset);
+  color: var(--ink);
+  border: 1px solid var(--rule-strong);
+  border-radius: var(--r-1);
+  font-family: var(--mono);
+  font-size: var(--t-mono-sm);
+  padding: 6px var(--sp-3);
+  cursor: pointer;
+}
+
+.refresh:hover:not(:disabled) {
+  border-color: var(--ink-3);
+}
+
+.refresh:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.error {
+  margin: 0;
+  color: var(--danger, #f44336);
+  font-family: var(--mono);
+  font-size: var(--t-mono-sm);
+}
+
+.muted {
+  margin: 0;
+  color: var(--ink-3);
+  font-family: var(--mono);
+  font-size: var(--t-mono-sm);
+}
+
+.tableWrap {
+  overflow-x: auto;
+  border: 1px solid var(--rule-strong);
+  border-radius: var(--r-1);
+}
+
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--t-mono-sm);
+}
+
+.table thead th {
+  text-align: left;
+  font-family: var(--mono);
+  font-size: var(--t-mono-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  color: var(--ink-3);
+  padding: var(--sp-2) var(--sp-3);
+  border-bottom: 1px solid var(--rule-strong);
+  white-space: nowrap;
+  background: var(--inset);
+}
+
+.table tbody td {
+  padding: var(--sp-1) var(--sp-3);
+  border-bottom: 1px solid var(--rule);
+  white-space: nowrap;
+}
+
+.table tbody tr:last-child td {
+  border-bottom: none;
+}
+
+.mono {
+  font-family: var(--mono);
+}
+
+.num {
+  font-family: var(--mono);
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.pill {
+  display: inline-block;
+  font-family: var(--mono);
+  font-size: var(--t-mono-xs);
+  text-transform: lowercase;
+  padding: 1px var(--sp-2);
+  border-radius: 999px;
+  border: 1px solid var(--rule-strong);
+  color: var(--ink-2, var(--ink));
+  background: var(--inset);
+}
+
+/* Tint the pill by read-set class so an operator can scan the mix at a glance. */
+.pill[data-class="point"] {
+  border-color: var(--accent, #2196f3);
+  color: var(--accent, #2196f3);
+}
+
+.pill[data-class="indexed"] {
+  border-color: var(--success, #4caf50);
+  color: var(--success, #4caf50);
+}
+
+.pill[data-class="ordered"] {
+  border-color: var(--warning, #ffc107);
+  color: var(--warning, #ffc107);
+}
+
+.sectionTitle {
+  margin: var(--sp-2) 0 0;
+  font-size: var(--t-h2, 1.1rem);
+  font-weight: 600;
+  font-family: var(--mono);
+}
+
+.subTitle {
+  margin: var(--sp-1) 0 0;
+  font-size: var(--t-mono-sm);
+  font-weight: 600;
+  font-family: var(--mono);
+  color: var(--ink-3);
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+}
+
+.lede {
+  margin: 0;
+  color: var(--ink-3);
+  font-size: var(--t-mono-sm);
+  max-width: 70ch;
+  line-height: 1.5;
+}
+
+.code {
+  font-family: var(--mono);
+  color: var(--ink);
+}
+
+.counters {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: var(--sp-2);
+}
+
+.counter {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  padding: var(--sp-2) var(--sp-3);
+  background: var(--inset);
+  border: 1px solid var(--rule-strong);
+  border-radius: var(--r-1);
+}
+
+.counterLabel {
+  font-family: var(--mono);
+  font-size: var(--t-mono-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--ink-3);
+}
+
+.counterValue {
+  font-family: var(--mono);
+  font-size: var(--t-display, 1.4rem);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+/* missed > 0 is a correctness defect — make it unmissable. */
+.alarm {
+  border-color: var(--danger, #f44336);
+}
+
+.alarm .counterValue {
+  color: var(--danger, #f44336);
+}
+
+.alarmText {
+  color: var(--danger, #f44336);
+  font-weight: 600;
+}

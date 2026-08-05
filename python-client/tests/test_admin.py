@@ -32,11 +32,13 @@ from par_rt_db.admin import (
     MintedToken,
     OpEvent,
     RtDbAdminClient,
+    SubscriptionsResponse,
     TokenInfo,
     Webhook,
     WebhookDelivery,
 )
 from par_rt_db.errors import ErrorCode, RtDbError
+from par_rt_db.http_client import SubscriptionInfo
 from par_rt_db.schema import Schema
 
 ADMIN_BEARER = "Bearer admin-key"
@@ -1301,3 +1303,159 @@ async def test_async_get_audit_builds_query_params() -> None:
     assert len(rows) == 1
     assert isinstance(rows[0], AuditEntry)
     assert rows[0].doc_id == "i1"
+
+
+# --- ENH-010: live subscription inspector ---------------------------------
+
+_SUBS_ROW_INTERACTIVE = {
+    "db": "kanban",
+    "table": "items",
+    "terminal": "collect",
+    "readSetClass": "indexed",
+    "principal": {"userId": "u1", "email": "u@e.com"},
+}
+_SUBS_ROW_MACHINE = {
+    "db": "kanban",
+    "table": "items",
+    "terminal": "count",
+    "readSetClass": "point",
+    "principal": None,
+}
+_SUBS_RESPONSE = {
+    "subscriptions": [_SUBS_ROW_INTERACTIVE, _SUBS_ROW_MACHINE],
+    "subsRerunsTotal": 7,
+    "subsSkipsPointTotal": 3,
+    "subsSkipsIndexedTotal": 2,
+    "subsSkipsOrderedTotal": 1,
+    "subsMissedPushesTotal": 0,
+    "perDb": [
+        {
+            "db": "kanban",
+            "reruns": 7,
+            "skipsPoint": 3,
+            "skipsIndexed": 2,
+            "skipsOrdered": 1,
+            "missed": 0,
+        }
+    ],
+}
+
+
+def test_subscriptions_response_model_validate_maps_camelcase() -> None:
+    r = SubscriptionsResponse.model_validate(_SUBS_RESPONSE)
+    assert isinstance(r, SubscriptionsResponse)
+    assert r.subs_reruns_total == 7
+    assert r.subs_skips_point_total == 3
+    assert r.subs_skips_indexed_total == 2
+    assert r.subs_skips_ordered_total == 1
+    assert r.subs_missed_pushes_total == 0
+    assert len(r.subscriptions) == 2
+    interactive = r.subscriptions[0]
+    assert isinstance(interactive, SubscriptionInfo)
+    assert interactive.table == "items"
+    assert interactive.terminal == "collect"
+    assert interactive.read_set_class == "indexed"
+    assert interactive.principal is not None
+    assert interactive.principal.user_id == "u1"
+    assert interactive.principal.email == "u@e.com"
+    machine = r.subscriptions[1]
+    assert machine.read_set_class == "point"
+    assert machine.principal is None
+    assert len(r.per_db) == 1
+    assert r.per_db[0].db == "kanban"
+    assert r.per_db[0].skips_indexed == 2
+
+
+def test_get_subscriptions_no_db_filter_omits_param() -> None:
+    """With no ``db`` filter the query string carries no params."""
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["method"] = request.method
+        captured["path"] = request.url.path
+        captured["params"] = dict(request.url.params)
+        return httpx.Response(200, json=_SUBS_RESPONSE)
+
+    with _sync_client(handler) as c:
+        r = c.get_subscriptions()
+    assert captured["method"] == "GET"
+    assert captured["path"] == "/admin/subscriptions"
+    assert captured["params"] == {}
+    assert isinstance(r, SubscriptionsResponse)
+    assert len(r.subscriptions) == 2
+
+
+def test_get_subscriptions_with_db_filter_sends_param() -> None:
+    """A ``db`` filter is sent as the ``db`` query param."""
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["params"] = dict(request.url.params)
+        return httpx.Response(200, json=_SUBS_RESPONSE)
+
+    with _sync_client(handler) as c:
+        r = c.get_subscriptions("kanban")
+    assert captured["params"] == {"db": "kanban"}
+    assert isinstance(r, SubscriptionsResponse)
+    assert all(s.db == "kanban" for s in r.subscriptions)
+
+
+async def test_async_get_subscriptions_builds_request() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["auth"] = request.headers["authorization"]
+        captured["path"] = request.url.path
+        captured["params"] = dict(request.url.params)
+        return httpx.Response(200, json=_SUBS_RESPONSE)
+
+    async with _async_client(handler) as c:
+        r = await c.get_subscriptions("kanban")
+    assert captured["auth"] == ADMIN_BEARER
+    assert captured["path"] == "/admin/subscriptions"
+    assert captured["params"] == {"db": "kanban"}
+    assert isinstance(r, SubscriptionsResponse)
+    assert r.subs_reruns_total == 7
+    assert r.per_db[0].reruns == 7
+
+
+def test_metrics_snapshot_includes_per_db_subs() -> None:
+    """``perDbSubs`` on ``/admin/metrics`` parses into ``per_db_subs`` and stays
+    optional (older servers omit it → empty list)."""
+    with _sync_client(
+        _handler_map(
+            {
+                ("GET", "/admin/metrics", ""): httpx.Response(
+                    200,
+                    json={
+                        "queriesTotal": 1,
+                        "mutationsTotal": 0,
+                        "uploadsTotal": 0,
+                        "wsConnections": 1,
+                        "activeSubscriptions": 2,
+                        "poolSize": 4,
+                        "poolIdle": 3,
+                        "uptimeSeconds": 10,
+                        "queryLatency": {"p50": 1, "p95": 2, "p99": 3},
+                        "mutateLatency": {"p50": 4, "p95": 5, "p99": 6},
+                        "subscribeLatency": {"p50": 7, "p95": 8, "p99": 9},
+                        "perDbSubs": [
+                            {
+                                "db": "kanban",
+                                "reruns": 5,
+                                "skipsPoint": 1,
+                                "skipsIndexed": 1,
+                                "skipsOrdered": 0,
+                                "missed": 0,
+                            }
+                        ],
+                    },
+                )
+            }
+        )
+    ) as c:
+        snap = c.metrics()
+    assert isinstance(snap, MetricsSnapshot)
+    assert len(snap.per_db_subs) == 1
+    assert snap.per_db_subs[0].db == "kanban"
+    assert snap.per_db_subs[0].reruns == 5

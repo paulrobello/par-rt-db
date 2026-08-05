@@ -87,6 +87,9 @@ export interface MetricsSnapshot {
    */
   subsSkipVerificationsTotal: number;
   subsMissedPushesTotal: number;
+  /** Per-db rollup of the subscription counters above, when the server
+   *  includes it on `/admin/metrics`. Absent on older server builds. */
+  perDbSubs?: DbSubCounters[];
 }
 export interface HotConfig {
   allowedOrigins: string[];
@@ -156,6 +159,48 @@ export interface GetAuditOptions {
   source?: string;
   limit?: number;
   offset?: number;
+}
+
+/** Identity of a subscriber, when it has an interactive principal. `null` for
+ *  machine tokens, scheduled jobs, and admin-bypass subscriptions — anything
+ *  with no user identity. */
+export interface SubscriptionsPrincipal {
+  userId: string | null;
+  email: string | null;
+}
+
+/** One live subscription from `GET /admin/subscriptions`. `terminal` is the
+ *  query-DSL terminal step kind; `readSetClass` is the invalidation class the
+ *  committer uses to decide skip-vs-rerun (point/indexed/ordered/table). */
+export interface SubscriptionInfo {
+  db: string;
+  table: string;
+  terminal: string;
+  readSetClass: string;
+  principal: SubscriptionsPrincipal | null;
+}
+
+/** Per-db rollup of subscription-invalidation counters (the same fields the
+ *  server totals across all dbs on `SubscriptionsResponse`). */
+export interface DbSubCounters {
+  db: string;
+  reruns: number;
+  skipsPoint: number;
+  skipsIndexed: number;
+  skipsOrdered: number;
+  missed: number;
+}
+
+/** Response from `GET /admin/subscriptions`: the live subscription list plus
+ *  server-wide invalidation totals and a per-db rollup. */
+export interface SubscriptionsResponse {
+  subscriptions: SubscriptionInfo[];
+  subsRerunsTotal: number;
+  subsSkipsPointTotal: number;
+  subsSkipsIndexedTotal: number;
+  subsSkipsOrderedTotal: number;
+  subsMissedPushesTotal: number;
+  perDb: DbSubCounters[];
 }
 
 /** One managed pg_dump file on disk (GET /admin/backups). */
@@ -452,6 +497,17 @@ export class RtDbAdminClient {
     const qs = params.toString();
     const body = await this.request("GET", `/admin/audit${qs ? `?${qs}` : ""}`);
     return (body as { entries: AuditEntry[] }).entries;
+  }
+
+  /** Live subscription inspector (GET /admin/subscriptions). Returns every
+   *  active subscription across all dbs (or one `db` when filtered), plus
+   *  server-wide invalidation totals and a per-db rollup. */
+  async listSubscriptions(opts?: { db?: string }): Promise<SubscriptionsResponse> {
+    const params = new URLSearchParams();
+    if (opts?.db) params.set("db", opts.db);
+    const qs = params.toString();
+    const body = await this.request("GET", `/admin/subscriptions${qs ? `?${qs}` : ""}`);
+    return body as SubscriptionsResponse;
   }
 
   /** Owner-bypass document read (POST /admin/db/{db}/query). Admin sees every row regardless

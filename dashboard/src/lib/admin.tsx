@@ -35,6 +35,7 @@ import type {
   ScheduleInfo,
   ScheduleWhen,
   SchemaDiff,
+  SubscriptionsResponse,
   TokenRow,
   Webhook,
   WebhookDelivery,
@@ -392,6 +393,16 @@ export class AdminClient {
     return this.req<{ entries: AuditEntry[] }>(`/admin/audit${qs ? `?${qs}` : ""}`).then(
       (r) => r.entries,
     );
+  }
+  /** Live subscription inspector (GET /admin/subscriptions). `db` is optional —
+   *  omit it to list across every database. Returns the per-subscription rows
+   *  plus the global and per-db invalidation counters that explain re-run
+   *  behavior. */
+  getSubscriptions(opts: { db?: string } = {}): Promise<SubscriptionsResponse> {
+    const params = new URLSearchParams();
+    if (opts.db) params.set("db", opts.db);
+    const qs = params.toString();
+    return this.req<SubscriptionsResponse>(`/admin/subscriptions${qs ? `?${qs}` : ""}`);
   }
 }
 

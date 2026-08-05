@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use serde::Serialize;
 use sqlx::PgPool;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc::UnboundedSender;
@@ -559,6 +560,17 @@ impl ReadSet {
         }
     }
 
+    /// The wire label for this read-set class (`point` / `indexed` / `ordered` /
+    /// `table`), surfaced per-subscription by the inspector endpoint.
+    fn class_name(&self) -> &'static str {
+        match self {
+            ReadSet::Point { .. } => "point",
+            ReadSet::Indexed(_) => "indexed",
+            ReadSet::Ordered(_) => "ordered",
+            ReadSet::Table => "table",
+        }
+    }
+
     /// Derive an `Indexed` window from the query + table def. Returns `None`
     /// (⇒ try `Ordered`, else fall back to `Table`) when ANY of:
     /// - the terminal is not one of `count` / `collect` (no terminal) / `unique`;
@@ -788,6 +800,42 @@ pub struct SubscriptionManager {
     skip_seq: AtomicU64,
 }
 
+/// One active subscription, as surfaced by the inspector endpoint
+/// (`GET /admin/subscriptions`). camelCase on the wire. The registry keys on
+/// `(connection, queryId)`, so each row is ONE subscriber's ONE query — there
+/// is intentionally no per-sub subscriber count.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubSnapshot {
+    pub db: String,
+    pub table: String,
+    pub terminal: String,
+    pub read_set_class: String,
+    /// The subscriber's interactive identity, when it has one. `None` for
+    /// system/bypass principals (machine tokens, scheduled jobs, admin).
+    pub principal: Option<SubPrincipal>,
+}
+
+/// The subscriber identity on a [`SubSnapshot`]. Surfaced only when the
+/// subscription carries an interactive user (`userId` and/or `email`); a
+/// machine token has neither, so its row reports `principal: null`.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubPrincipal {
+    pub user_id: Option<String>,
+    pub email: Option<String>,
+}
+
+fn principal_snapshot(ctx: &PrincipalCtx) -> Option<SubPrincipal> {
+    if ctx.user_id.is_none() && ctx.email.is_none() {
+        return None;
+    }
+    Some(SubPrincipal {
+        user_id: ctx.user_id.clone(),
+        email: ctx.email.clone(),
+    })
+}
+
 impl SubscriptionManager {
     /// Uninstrumented manager: no metrics recording, no skip verification.
     pub fn new() -> Arc<Self> {
@@ -886,6 +934,43 @@ impl SubscriptionManager {
             total += shard.lock().await.len();
         }
         total
+    }
+
+    /// Snapshot every active subscription for the inspector endpoint
+    /// (`GET /admin/subscriptions`), optionally filtered to one db. Same lock
+    /// discipline as [`count`](Self::count): clone the matching shard `Arc`s
+    /// under the outer map lock, drop it, then lock shards one at a time — the
+    /// outer lock is never held while waiting on a shard, so this cannot
+    /// deadlock against `fan_out`/`register`/`remove`. Approximate by design
+    /// (a subscribe/unsubscribe racing this call can add or drop a row), which
+    /// is acceptable for an operator inspection view. Sorted by `(db, table)`
+    /// for stable output; does not touch the single-writer invariant (this is
+    /// a read of the shared registry, not a txn execution).
+    pub async fn snapshot(&self, db_filter: Option<&str>) -> Vec<SubSnapshot> {
+        // Clone the matching shard Arcs under the outer lock, then drop it.
+        let shards: Vec<(String, Arc<Mutex<DbSubs>>)> = {
+            let guard = self.subs.lock().await;
+            guard
+                .iter()
+                .filter(|(db, _)| db_filter.is_none_or(|f| db.as_str() == f))
+                .map(|(db, shard)| (db.clone(), shard.clone()))
+                .collect()
+        };
+        let mut out = Vec::new();
+        for (db, shard) in shards {
+            let db_subs = shard.lock().await;
+            for entry in db_subs.values() {
+                out.push(SubSnapshot {
+                    db: db.clone(),
+                    table: entry.query.table.clone(),
+                    terminal: entry.query.terminal_name().to_string(),
+                    read_set_class: entry.read_set.class_name().to_string(),
+                    principal: principal_snapshot(&entry.principal_ctx),
+                });
+            }
+        }
+        out.sort_by(|a, b| a.db.cmp(&b.db).then(a.table.cmp(&b.table)));
+        out
     }
 
     /// Registers a subscription that has already sent its initial
@@ -989,13 +1074,13 @@ impl SubscriptionManager {
             let verifying = match decide(&entry.read_set, &entry.query.table, write_set) {
                 Decision::Rerun => {
                     if let Some(metrics) = &self.metrics {
-                        metrics.record_subs_rerun();
+                        metrics.record_subs_rerun(db);
                     }
                     None
                 }
                 Decision::Skip(class) => {
                     if let Some(metrics) = &self.metrics {
-                        metrics.record_subs_skip(class);
+                        metrics.record_subs_skip(db, class);
                     }
                     if !self.sample_skip_verification() {
                         continue;
@@ -1048,7 +1133,7 @@ impl SubscriptionManager {
                 // corrected result so the subscriber is repaired rather than
                 // left stale.
                 if let Some(metrics) = &self.metrics {
-                    metrics.record_subs_missed_push();
+                    metrics.record_subs_missed_push(db);
                 }
                 tracing::error!(
                     db,

@@ -115,4 +115,9 @@ async fn admin_control_plane() {
     );
 
     admin.revoke_token(&minted.token_id).await.unwrap();
+
+    // ENH-010 live subscription inspector: both the db-scoped and global calls
+    // should succeed and deserialize (fresh db has no active subscriptions).
+    let _scoped = admin.list_subscriptions(Some(&new_db)).await.unwrap();
+    let _global = admin.list_subscriptions(None).await.unwrap();
 }

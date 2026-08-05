@@ -77,6 +77,40 @@ pub struct Query {
     pub hybrid_search: Option<HybridSearchQuery>, // hybrid terminal: fuses full-text (ts_rank) and vector (cosine) ranking via Reciprocal Rank Fusion; carries its own limit
 }
 
+impl Query {
+    /// The wire label for this query's terminal — the output mode an operator
+    /// sees in the subscription inspector (`GET /admin/subscriptions`).
+    /// Terminals are mutually exclusive (validated in `execute_query`), so the
+    /// first set field wins; a query with no terminal is a plain `collect`.
+    pub fn terminal_name(&self) -> &'static str {
+        if self.get.is_some() {
+            "get"
+        } else if self.count {
+            "count"
+        } else if self.distinct {
+            "distinct"
+        } else if self.aggregate.is_some() {
+            "aggregate"
+        } else if self.search.is_some() {
+            "search"
+        } else if self.vector_search.is_some() {
+            "vectorSearch"
+        } else if self.hybrid_search.is_some() {
+            "hybridSearch"
+        } else if self.paginate.is_some() {
+            "paginate"
+        } else if self.first {
+            "first"
+        } else if self.unique {
+            "unique"
+        } else if self.take.is_some() {
+            "take"
+        } else {
+            "collect"
+        }
+    }
+}
+
 /// Serde skip predicate for `bool` fields whose default is `false`. Keeps the
 /// wire form minimal — `unique`/`first`/`count` are omitted unless `true`,
 /// matching the TS client's `JSON.stringify` (which drops `undefined`) and the
