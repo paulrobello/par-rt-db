@@ -16,6 +16,7 @@ mod common;
 use std::future::IntoFuture;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use axum::extract::State;
 use axum::response::IntoResponse;
@@ -324,17 +325,31 @@ async fn webhook_delivery_end_to_end_posts_payload() -> anyhow::Result<()> {
     // Confirm enqueued before drain.
     assert_eq!(delivery_count(&pool, webhook_id).await, 1);
 
-    let processed = rtdb_server::webhook::drain_once(&pool)
+    // Drain the shared outbox until *our* delivery is delivered. A single
+    // `drain_once` is not enough under parallel test load: it pulls a bounded
+    // batch ordered by `next_attempt` from the shared `webhook_deliveries`
+    // table, so rows other tests enqueued earlier can fill the batch and defer
+    // ours to a later pass — the receiver then sees zero POSTs even though
+    // `drain_once` returned a nonzero count. Loop (bounded by a deadline) until
+    // our row reaches `delivered`; the receiver-side and body assertions below
+    // remain the precise per-webhook checks.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        rtdb_server::webhook::drain_once(&pool)
+            .await
+            .expect("drain_once");
+        let delivered: bool = sqlx::query_scalar(
+            "SELECT status = 'delivered' FROM rtdb.webhook_deliveries WHERE webhook_id = $1",
+        )
+        .bind(webhook_id)
+        .fetch_one(&pool)
         .await
-        .expect("drain_once");
-    // `drain_once` processes every due row in the shared `webhook_deliveries`
-    // table (other tests, running in parallel, may have enqueued their own), so
-    // we only assert this test's row was among them — the receiver-side count
-    // and the row-status check below are the precise per-webhook assertions.
-    assert!(
-        processed >= 1,
-        "drain_once processed at least the one due delivery for this webhook"
-    );
+        .expect("fetch delivery status");
+        if delivered || Instant::now() > deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
 
     // Receiver got exactly one POST matching the payload (other webhooks POST to
     // their own URLs, never this receiver, so its count is precisely ours).
