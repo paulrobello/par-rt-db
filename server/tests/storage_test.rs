@@ -430,3 +430,95 @@ async fn revoked_token_cannot_delete() -> anyhow::Result<()> {
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     Ok(())
 }
+
+// --- Content-addressed dedup (ENH-008) ---
+
+/// Counts blob rows for a sha256 in a database's storage table.
+async fn sha256_count(state: &Arc<AppState>, db: &str, sha: &str) -> i64 {
+    let schema = format!("db_{db}");
+    sqlx::query_scalar(&format!(
+        "SELECT COUNT(*) FROM \"{schema}\".storage WHERE sha256 = $1"
+    ))
+    .bind(sha)
+    .fetch_one(&state.pool)
+    .await
+    .expect("count rows")
+}
+
+#[tokio::test]
+async fn put_dedups_identical_content() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let db = fresh_db(&state).await;
+    let bytes = b"dedup me";
+    let sha = storage::sha256_hex_bytes(bytes);
+
+    let id1 = storage::put(&state.pool, &db, &sha, bytes.len() as i64, None, bytes).await?;
+    let id2 = storage::put(&state.pool, &db, &sha, bytes.len() as i64, None, bytes).await?;
+    assert_eq!(id1, id2, "re-uploading identical bytes returns the same id");
+    assert_eq!(
+        sha256_count(&state, &db, &sha).await,
+        1,
+        "duplicate content is stored once"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn put_distinct_content_gets_distinct_ids() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let db = fresh_db(&state).await;
+    let a = b"aaa";
+    let b = b"bbb";
+    let id_a = storage::put(
+        &state.pool,
+        &db,
+        &storage::sha256_hex_bytes(a),
+        a.len() as i64,
+        None,
+        a,
+    )
+    .await?;
+    let id_b = storage::put(
+        &state.pool,
+        &db,
+        &storage::sha256_hex_bytes(b),
+        b.len() as i64,
+        None,
+        b,
+    )
+    .await?;
+    assert_ne!(id_a, id_b, "different bytes get different ids");
+    Ok(())
+}
+
+#[tokio::test]
+async fn dedup_respects_delete() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let db = fresh_db(&state).await;
+    let bytes = b"once then gone";
+    let sha = storage::sha256_hex_bytes(bytes);
+    let id1 = storage::put(&state.pool, &db, &sha, bytes.len() as i64, None, bytes).await?;
+    assert!(storage::delete(&state.pool, &db, &id1).await?);
+
+    // Content is gone, so a re-upload stores a fresh blob (new id), not a dedup hit.
+    let id2 = storage::put(&state.pool, &db, &sha, bytes.len() as i64, None, bytes).await?;
+    assert_ne!(id1, id2, "re-upload after delete is a new blob");
+    Ok(())
+}
+
+#[tokio::test]
+async fn upload_same_bytes_twice_returns_same_id() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let db = fresh_db(&state).await;
+    let token = mint_token(addr, &db).await;
+
+    let payload = b"identical payload";
+    let id1 = upload(&addr, &db, &token, payload).await;
+    let id2 = upload(&addr, &db, &token, payload).await;
+    assert_eq!(
+        id1, id2,
+        "HTTP re-upload of identical bytes dedups to one id/URL"
+    );
+    Ok(())
+}

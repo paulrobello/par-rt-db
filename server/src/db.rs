@@ -358,6 +358,14 @@ pub async fn create_database(pool: &PgPool, name: &str) -> Result<(), RtDbError>
     ))
     .execute(&mut *tx)
     .await?;
+    // Content-addressed dedup: one blob per sha256 so re-uploaded bytes reuse
+    // the existing id/URL (ENH-008). See `storage::put` / `ensure_table`.
+    sqlx::query(&format!(
+        "CREATE UNIQUE INDEX \"{schema_name}_storage_sha256_idx\"
+         ON \"{schema_name}\".storage (sha256)"
+    ))
+    .execute(&mut *tx)
+    .await?;
 
     sqlx::query("INSERT INTO rtdb_auth.databases (name, created_at) VALUES ($1, $2)")
         .bind(name)

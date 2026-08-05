@@ -13,7 +13,9 @@ use crate::error::RtDbError;
 
 /// `CREATE TABLE IF NOT EXISTS` for the per-db `storage` table, for databases
 /// that predate this feature. Mirrors `mutation_log::ensure_table`; called once
-/// at committer startup.
+/// at committer startup and before every upload (`upload_handler`), so it also
+/// retrofits the content-addressed dedup index (`ENH-008`) onto tables created
+/// before the index existed.
 pub async fn ensure_table(pool: &PgPool, db: &str) -> Result<(), RtDbError> {
     validate_db_name(db)?;
     let schema = pg_schema(db);
@@ -29,6 +31,23 @@ pub async fn ensure_table(pool: &PgPool, db: &str) -> Result<(), RtDbError> {
     ))
     .execute(pool)
     .await?;
+    // Best-effort: a database that predates dedup and already holds duplicate
+    // hashes cannot build the index, so dedup stays off for it (uploads keep
+    // working, `put` simply stores a copy) until an operator clears the dupes.
+    if let Err(e) = sqlx::query(&format!(
+        "CREATE UNIQUE INDEX IF NOT EXISTS \"{schema}_storage_sha256_idx\"
+         ON \"{schema}\".storage (sha256)"
+    ))
+    .execute(pool)
+    .await
+    {
+        tracing::warn!(
+            db = %db,
+            error = %e,
+            "storage: sha256 dedup index not built (duplicate content present?); \
+             dedup disabled for this db",
+        );
+    }
     Ok(())
 }
 
@@ -52,7 +71,14 @@ pub struct FileMeta {
     pub creation_time: i64,
 }
 
-/// Inserts a blob + metadata and records the global index row. Returns the id.
+/// Inserts a blob + metadata and records the global index row, returning the
+/// id. Content-addressed dedup (`ENH-008`): if bytes with this `sha256` are
+/// already stored in the database, the existing id is returned and no second
+/// copy is written — so re-uploading identical bytes yields the same public
+/// URL. Dedup needs the per-db unique index on `sha256` (added by
+/// `create_database` / `ensure_table`); `ON CONFLICT DO NOTHING` (no target)
+/// keeps this safe even when that index is absent — the insert then always
+/// lands and dedup is simply off for that database.
 pub async fn put(
     pool: &PgPool,
     db: &str,
@@ -65,9 +91,11 @@ pub async fn put(
     let schema = pg_schema(db);
     let id = new_id();
     let mut tx = pool.begin().await?;
-    sqlx::query(&format!(
+    let inserted: Option<(String,)> = sqlx::query_as(&format!(
         "INSERT INTO \"{schema}\".storage (id, sha256, size, content_type, bytes, created_at)
-         VALUES ($1, $2, $3, $4, $5, $6)"
+         VALUES ($1, $2, $3, $4, $5, $6)
+         ON CONFLICT DO NOTHING
+         RETURNING id"
     ))
     .bind(&id)
     .bind(sha256)
@@ -75,13 +103,29 @@ pub async fn put(
     .bind(content_type)
     .bind(bytes)
     .bind(now_ms())
-    .execute(&mut *tx)
+    .fetch_optional(&mut *tx)
     .await?;
-    sqlx::query("INSERT INTO rtdb.storage_index (id, db_name) VALUES ($1, $2)")
-        .bind(&id)
-        .bind(db)
-        .execute(&mut *tx)
-        .await?;
+    let id = match inserted {
+        // Won the insert — record the global index row for the new id.
+        Some((row_id,)) => {
+            sqlx::query("INSERT INTO rtdb.storage_index (id, db_name) VALUES ($1, $2)")
+                .bind(&row_id)
+                .bind(db)
+                .execute(&mut *tx)
+                .await?;
+            row_id
+        }
+        // A blob with this sha256 already exists — reuse its id (dedup hit).
+        None => {
+            let (existing,): (String,) = sqlx::query_as(&format!(
+                "SELECT id FROM \"{schema}\".storage WHERE sha256 = $1"
+            ))
+            .bind(sha256)
+            .fetch_one(&mut *tx)
+            .await?;
+            existing
+        }
+    };
     tx.commit().await?;
     Ok(id)
 }
