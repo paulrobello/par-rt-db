@@ -413,6 +413,55 @@ async fn import_db(
     }
 }
 
+#[derive(Deserialize)]
+struct CloneDbParams {
+    from: String,
+    to: String,
+}
+
+/// Clones `from` into a freshly created `to` in one server-side step: exports
+/// `from`'s schema + documents and replays them into `to` (which must not
+/// already exist), preserving ids, `createdAt`, and `version`. Scope matches
+/// `export-db`/`import-db` exactly — schema and documents only; storage blobs
+/// and scheduled transactions are not part of the snapshot format and are not
+/// copied. On an import failure after `to` is created, the empty `to` database
+/// is left in place for the operator to delete (consistent with `import-db`'s
+/// no-cleanup behavior) and its cache entry is dropped. See ENH-009.
+async fn clone_db(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    QueryParams(params): QueryParams<CloneDbParams>,
+) -> Result<Json<OkResponse>, RtDbError> {
+    require_admin(&state, &headers).await?;
+    if params.from == params.to {
+        return Err(RtDbError::bad_request(
+            "cannot clone a database onto itself; choose a different destination name",
+        ));
+    }
+    if !db::database_exists(&state.pool, &params.from).await? {
+        return Err(RtDbError::not_found("source database not found"));
+    }
+    if db::database_exists(&state.pool, &params.to).await? {
+        return Err(RtDbError::bad_request(
+            "destination database already exists",
+        ));
+    }
+    // Export before creating `to` so a read failure leaves nothing behind.
+    let schema = state.schemas.get(&state.pool, &params.from).await?;
+    let jsonl = snapshot::export_database(&state.pool, &params.from, &schema).await?;
+    db::create_database(&state.pool, &params.to).await?;
+    match snapshot::import_database(&state.pool, &params.to, &jsonl).await {
+        Ok(applied) => {
+            state.schemas.put(&params.to, applied).await;
+            Ok(Json(OkResponse { ok: true }))
+        }
+        Err(err) => {
+            state.schemas.invalidate(&params.to).await;
+            Err(err)
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct AdminMember {
     email: String,
@@ -1898,4 +1947,5 @@ pub fn admin_routes() -> Router<Arc<AppState>> {
         .route("/admin/tokens", get(list_tokens))
         .route("/admin/export-db", get(export_db))
         .route("/admin/import-db", post(import_db))
+        .route("/admin/clone-db", post(clone_db))
 }

@@ -625,6 +625,143 @@ async fn export_then_import_round_trips_docs_indexes_and_schema() -> anyhow::Res
     Ok(())
 }
 
+// ENH-009: POST /admin/clone-db streams export→create→import server-side into a
+// fresh database, preserving schema, documents, ids, createdAt, and version.
+// Scope matches export/import (no storage blobs or scheduled txns).
+#[tokio::test]
+async fn clone_db_round_trips_schema_and_documents() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let addr = spawn_app(state.clone()).await;
+    let source = fresh_db(&state).await; // kanban schema (projects + workItems)
+    let source_name = source.as_str().to_string();
+
+    let schema = state.schemas.get(&pool, &source_name).await?;
+    let outcome = execute_txn(
+        &pool,
+        &source_name,
+        &schema,
+        &Transaction {
+            steps: vec![
+                Step::Insert {
+                    table: "projects".to_string(),
+                    doc: serde_json::json!({"name":"Roadmap","status":"active","tags":["q3"],"updatedAt":1})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                },
+                Step::Insert {
+                    table: "projects".to_string(),
+                    doc: serde_json::json!({"name":"Archive","status":"archived","tags":[],"updatedAt":2})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                },
+            ],
+        },
+        &PrincipalCtx::bypass(),
+    )
+    .await?;
+    let project_id = outcome.results[0]["id"]
+        .as_str()
+        .expect("project id")
+        .to_string();
+    execute_txn(
+        &pool,
+        &source_name,
+        &schema,
+        &Transaction {
+            steps: vec![Step::Insert {
+                table: "workItems".to_string(),
+                doc: serde_json::json!({"projectId":project_id,"title":"Ship it","status":"in_progress","order":1})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            }],
+        },
+        &PrincipalCtx::bypass(),
+    )
+    .await?;
+
+    let target = fresh_name();
+    let resp = admin_post_raw(
+        addr,
+        &format!("/admin/clone-db?from={source_name}&to={target}"),
+        String::new(),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(body["ok"], true);
+
+    let source_schema = db::load_schema(&pool, &source_name)
+        .await?
+        .expect("source schema");
+    let target_schema = db::load_schema(&pool, &target)
+        .await?
+        .expect("target schema");
+    assert_eq!(source_schema, target_schema);
+
+    for (table, phys) in [("projects", "t_projects"), ("workItems", "t_workitems")] {
+        let src: Vec<(String, serde_json::Value, i64, i64)> = sqlx::query_as(&format!(
+            "SELECT \"id\", \"doc\", \"created_at\", \"version\" FROM \"db_{source_name}\".\"{phys}\" ORDER BY \"id\""
+        ))
+        .fetch_all(&pool)
+        .await?;
+        let dst: Vec<(String, serde_json::Value, i64, i64)> = sqlx::query_as(&format!(
+            "SELECT \"id\", \"doc\", \"created_at\", \"version\" FROM \"db_{target}\".\"{phys}\" ORDER BY \"id\""
+        ))
+        .fetch_all(&pool)
+        .await?;
+        assert_eq!(src, dst, "table {table} should match after clone");
+    }
+
+    Ok(())
+}
+
+// ENH-009 error surface: self-clone (400), unknown source (404), and an
+// already-existing destination (400) are clear client errors, never 500s.
+#[tokio::test]
+async fn clone_db_rejects_self_clone_missing_source_and_existing_target() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let source = fresh_db(&state).await;
+    let source_name = source.as_str().to_string();
+
+    // from == to -> 400 BAD_REQUEST.
+    let resp = admin_post_raw(
+        addr,
+        &format!("/admin/clone-db?from={source_name}&to={source_name}"),
+        String::new(),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    // unknown source -> 404 NOT_FOUND.
+    let resp = admin_post_raw(
+        addr,
+        &format!("/admin/clone-db?from={}&to={}", fresh_name(), fresh_name()),
+        String::new(),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+
+    // existing destination (a real second db) -> 400 BAD_REQUEST.
+    let existing = fresh_db(&state).await;
+    let resp = admin_post_raw(
+        addr,
+        &format!(
+            "/admin/clone-db?from={source_name}&to={}",
+            existing.as_str()
+        ),
+        String::new(),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    Ok(())
+}
+
 // (i) export of an empty database (schema pushed, no docs) yields just the schema line.
 #[tokio::test]
 async fn export_of_empty_database_yields_only_schema_line() -> anyhow::Result<()> {
