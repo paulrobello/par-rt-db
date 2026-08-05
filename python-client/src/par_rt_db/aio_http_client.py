@@ -299,9 +299,26 @@ class RtDbAsyncHttpClient:
         resp = await self._send("GET", "/admin/dbs")
         return list(resp.json()["databases"])
 
-    async def mint_token(self, db: str, name: str) -> MintedToken:
-        """``POST /admin/mint-token`` ``{db, name}`` → ``{tokenId, token}``."""
-        resp = await self._send("POST", "/admin/mint-token", json={"db": db, "name": name})
+    async def mint_token(
+        self,
+        db: str,
+        name: str,
+        *,
+        expires_at: int | None = None,
+        read_only: bool = False,
+        tables: list[str] | None = None,
+    ) -> MintedToken:
+        """``POST /admin/mint-token`` with capability fields → ``{tokenId, token}``.
+
+        Async twin of :meth:`par_rt_db.http_client.RtDbHttpClient.mint_token`;
+        body semantics and capability defaults are identical.
+        """
+        body: dict[str, Any] = {"db": db, "name": name, "readOnly": read_only}
+        if expires_at is not None:
+            body["expiresAt"] = expires_at
+        if tables is not None:
+            body["tables"] = list(tables)
+        resp = await self._send("POST", "/admin/mint-token", json=body)
         return MintedToken.model_validate(resp.json())
 
     async def revoke_token(self, token_id: str) -> None:

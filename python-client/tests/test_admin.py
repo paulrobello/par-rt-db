@@ -8,7 +8,7 @@ in-process, no-port testing (same pattern as ``test_http_client.py`` /
 
 Each test stubs the route the client should hit and asserts on the wire
 request (method, path, bearer, camelCase body) the client actually sent, plus
-the dataclass mapping on the response.
+the pydantic model mapping on the response.
 """
 
 from __future__ import annotations
@@ -20,13 +20,21 @@ from typing import Any
 import httpx
 import pytest
 
+from par_rt_db import Mutation, TableQuery, t
 from par_rt_db.admin import (
+    AdminMember,
     AsyncRtDbAdminClient,
+    ConfigResponse,
+    DbStats,
+    HotConfigPatch,
+    MetricsSnapshot,
     MintedToken,
+    OpEvent,
     RtDbAdminClient,
     TokenInfo,
 )
 from par_rt_db.errors import ErrorCode, RtDbError
+from par_rt_db.schema import Schema
 
 ADMIN_BEARER = "Bearer admin-key"
 URL = "https://rtdb.example"
@@ -77,17 +85,17 @@ def _handler_map(
     return handler
 
 
-# --- dataclass wire mapping -----------------------------------------------
+# --- pydantic wire mapping ------------------------------------------------
 
 
-def test_minted_token_from_dict_maps_camelcase() -> None:
-    mt = MintedToken.from_dict({"tokenId": "tid", "token": "secret"})
+def test_minted_token_model_validate_maps_camelcase() -> None:
+    mt = MintedToken.model_validate({"tokenId": "tid", "token": "secret"})
     assert mt.token_id == "tid"
     assert mt.token == "secret"
 
 
-def test_token_info_from_dict_restricted_row() -> None:
-    row = TokenInfo.from_dict(
+def test_token_info_model_validate_restricted_row() -> None:
+    row = TokenInfo.model_validate(
         {
             "id": "t1",
             "name": "scraper",
@@ -106,9 +114,9 @@ def test_token_info_from_dict_restricted_row() -> None:
     assert row.tables == ["users"]
 
 
-def test_token_info_from_dict_full_access_row() -> None:
+def test_token_info_model_validate_full_access_row() -> None:
     """Full-access token: ``expiresAt:null, readOnly:false, tables:null``."""
-    row = TokenInfo.from_dict(
+    row = TokenInfo.model_validate(
         {
             "id": "t2",
             "name": "ci",
@@ -125,10 +133,12 @@ def test_token_info_from_dict_full_access_row() -> None:
     assert row.revoked is True
 
 
-def test_token_info_from_dict_omitted_optional_fields_default() -> None:
+def test_token_info_model_validate_omitted_optional_fields_default() -> None:
     """An older server omitting ``expiresAt``/``readOnly``/``tables`` still
     deserializes (matches the server's ``#[serde(default)]``)."""
-    row = TokenInfo.from_dict({"id": "t3", "name": "legacy", "createdAt": 700, "revoked": False})
+    row = TokenInfo.model_validate(
+        {"id": "t3", "name": "legacy", "createdAt": 700, "revoked": False}
+    )
     assert row.expires_at is None
     assert row.read_only is False
     assert row.tables is None
@@ -363,3 +373,340 @@ async def test_async_list_tokens_parses_rows() -> None:
     assert rows[1].read_only is False
     assert rows[1].tables is None
     assert rows[1].revoked is True
+
+
+# --- mirrored admin surface (ENH-005 parity sweep) -----------------------
+#
+# Representative subset across categories proving the mirrored methods hit the
+# right route with the right camelCase body + admin bearer and parse the
+# response into the shared pydantic models. Exhaustive per-method coverage
+# lives in test_http_client.py; here we prove the mirroring pattern.
+
+
+def test_create_db_posts_name_and_expects_ok() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["method"] = request.method
+        captured["path"] = request.url.path
+        captured["auth"] = request.headers["authorization"]
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"ok": True})
+
+    with _sync_client(handler) as c:
+        c.create_db("mydb")
+    assert captured["method"] == "POST"
+    assert captured["path"] == "/admin/create-db"
+    assert captured["auth"] == ADMIN_BEARER
+    assert captured["body"] == {"name": "mydb"}
+
+
+def test_list_dbs_gets_databases_list() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["path"] = request.url.path
+        captured["method"] = request.method
+        return httpx.Response(200, json={"databases": ["a", "b", "c"]})
+
+    with _sync_client(handler) as c:
+        dbs = c.list_dbs()
+    assert dbs == ["a", "b", "c"]
+    assert captured["method"] == "GET"
+    assert captured["path"] == "/admin/dbs"
+
+
+def test_push_schema_posts_db_and_schema() -> None:
+    captured: dict[str, Any] = {}
+    schema = Schema.builder().table("items", lambda tb: tb.field("sku", t.string())).build()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["path"] = request.url.path
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"ok": True})
+
+    with _sync_client(handler) as c:
+        c.push_schema("dbx", schema)
+    assert captured["path"] == "/admin/push-schema"
+    assert captured["body"]["db"] == "dbx"
+    assert "schema" in captured["body"]
+
+
+def test_allowlist_add_posts_action_and_email() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["path"] = request.url.path
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"ok": True})
+
+    with _sync_client(handler) as c:
+        c.allowlist_add("dbx", "user@example.com")
+    assert captured["path"] == "/admin/allowlist"
+    assert captured["body"] == {
+        "db": "dbx",
+        "action": "add",
+        "email": "user@example.com",
+    }
+
+
+def test_get_config_parses_config_response() -> None:
+    with _sync_client(
+        _handler_map(
+            {
+                ("GET", "/admin/config", ""): httpx.Response(
+                    200,
+                    json={
+                        "port": 8300,
+                        "publicUrl": "https://rtdb.example",
+                        "githubBaseUrl": "https://github.com",
+                        "githubApiUrl": "https://api.github.com",
+                        "databaseUrlConfigured": True,
+                        "adminKeyConfigured": True,
+                        "githubConfigured": False,
+                        "googleConfigured": False,
+                        "gitlabConfigured": False,
+                        "oidcConfigured": False,
+                        "hot": {
+                            "allowedOrigins": ["https://rtdb.example"],
+                            "sessionTtlDays": 30,
+                            "maxFileSize": 10485760,
+                            "idempotencyTtlMs": 86400000,
+                        },
+                        "version": "0.1.0",
+                        "gitCommit": "abc1234",
+                        "admins": [{"email": "admin@example.com"}],
+                    },
+                )
+            }
+        )
+    ) as c:
+        cfg = c.get_config()
+    assert isinstance(cfg, ConfigResponse)
+    assert cfg.port == 8300
+    assert cfg.hot.session_ttl_days == 30
+    assert cfg.admins == [AdminMember(email="admin@example.com")]
+
+
+def test_patch_config_sends_camel_case_and_parses_response() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["method"] = request.method
+        captured["path"] = request.url.path
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "port": 8300,
+                "publicUrl": "https://rtdb.example",
+                "githubBaseUrl": "https://github.com",
+                "githubApiUrl": "https://api.github.com",
+                "databaseUrlConfigured": True,
+                "adminKeyConfigured": True,
+                "githubConfigured": False,
+                "googleConfigured": False,
+                "gitlabConfigured": False,
+                "oidcConfigured": False,
+                "hot": {
+                    "allowedOrigins": ["https://rtdb.example"],
+                    "sessionTtlDays": 60,
+                    "maxFileSize": 10485760,
+                    "idempotencyTtlMs": 86400000,
+                },
+                "version": "0.1.0",
+                "gitCommit": "abc1234",
+                "admins": [],
+            },
+        )
+
+    with _sync_client(handler) as c:
+        cfg = c.patch_config(HotConfigPatch(session_ttl_days=60))
+    assert captured["method"] == "PATCH"
+    assert captured["path"] == "/admin/config"
+    assert captured["body"] == {"sessionTtlDays": 60}
+    assert isinstance(cfg, ConfigResponse)
+    assert cfg.hot.session_ttl_days == 60
+
+
+def test_backup_now_posts_empty_body() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["path"] = request.url.path
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"ok": True})
+
+    with _sync_client(handler) as c:
+        c.backup_now()
+    assert captured["path"] == "/admin/backup"
+    assert captured["body"] == {}
+
+
+def test_admin_query_posts_query_and_parses_result() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["path"] = request.url.path
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"result": [{"_id": "a"}, {"_id": "b"}]})
+
+    with _sync_client(handler) as c:
+        docs = c.admin_query("dbx", TableQuery("items").take(2))
+    assert captured["path"] == "/admin/db/dbx/query"
+    # db rides in the URL, not the body
+    assert "db" not in captured["body"]
+    assert "query" in captured["body"]
+    assert len(docs) == 2
+
+
+def test_admin_mutate_posts_txn_and_parses_step_result() -> None:
+    captured: dict[str, Any] = {}
+    txn = Mutation.builder().insert("items", {"_id": "i1", "sku": "A"}).build()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["path"] = request.url.path
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"results": [{"id": "i1"}, None]})
+
+    with _sync_client(handler) as c:
+        results = c.admin_mutate("dbx", txn)
+    assert captured["path"] == "/admin/db/dbx/mutate"
+    assert "db" not in captured["body"]
+    assert "txn" in captured["body"]
+    assert len(results) == 2
+
+
+def test_db_stats_parses_table_stats() -> None:
+    with _sync_client(
+        _handler_map(
+            {
+                ("GET", "/admin/dbs/dbx/stats", ""): httpx.Response(
+                    200,
+                    json={
+                        "tables": [{"name": "items", "rowCount": 5, "sizeBytes": 4096}],
+                        "totalSizeBytes": 4096,
+                    },
+                )
+            }
+        )
+    ) as c:
+        stats = c.db_stats("dbx")
+    assert isinstance(stats, DbStats)
+    assert stats.tables[0].row_count == 5
+    assert stats.total_size_bytes == 4096
+
+
+def test_metrics_parses_snapshot() -> None:
+    with _sync_client(
+        _handler_map(
+            {
+                ("GET", "/admin/metrics", ""): httpx.Response(
+                    200,
+                    json={
+                        "queriesTotal": 10,
+                        "mutationsTotal": 3,
+                        "uploadsTotal": 0,
+                        "wsConnections": 2,
+                        "activeSubscriptions": 4,
+                        "poolSize": 8,
+                        "poolIdle": 5,
+                        "uptimeSeconds": 99,
+                        "queryLatency": {"p50": 1, "p95": 2, "p99": 3},
+                        "mutateLatency": {"p50": 4, "p95": 5, "p99": 6},
+                        "subscribeLatency": {"p50": 7, "p95": 8, "p99": 9},
+                    },
+                )
+            }
+        )
+    ) as c:
+        snap = c.metrics()
+    assert isinstance(snap, MetricsSnapshot)
+    assert snap.queries_total == 10
+    assert snap.query_latency.p99 == 3
+
+
+def test_ops_recent_parses_events() -> None:
+    with _sync_client(
+        _handler_map(
+            {
+                ("GET", "/admin/ops/recent", ""): httpx.Response(
+                    200,
+                    json={
+                        "ops": [
+                            {
+                                "db": "dbx",
+                                "table": "items",
+                                "docId": "i1",
+                                "kind": "insert",
+                                "ts": 1700000000000,
+                                "owner": "u@e.com",
+                            }
+                        ]
+                    },
+                )
+            }
+        )
+    ) as c:
+        ops = c.ops_recent(db="dbx", n=5)
+    assert len(ops) == 1
+    assert isinstance(ops[0], OpEvent)
+    assert ops[0].kind == "insert"
+    assert ops[0].owner == "u@e.com"
+
+
+# --- async: mirrored admin surface (representative) ----------------------
+
+
+async def test_async_list_dbs_gets_databases_list() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["auth"] = request.headers["authorization"]
+        return httpx.Response(200, json={"databases": ["x", "y"]})
+
+    async with _async_client(handler) as c:
+        dbs = await c.list_dbs()
+    assert dbs == ["x", "y"]
+    assert captured["auth"] == ADMIN_BEARER
+
+
+async def test_async_create_db_posts_name() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["path"] = request.url.path
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"ok": True})
+
+    async with _async_client(handler) as c:
+        await c.create_db("adb")
+    assert captured["path"] == "/admin/create-db"
+    assert captured["body"] == {"name": "adb"}
+
+
+async def test_async_admin_query_posts_query_and_parses_result() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["path"] = request.url.path
+        return httpx.Response(200, json={"result": [{"_id": "a"}, {"_id": "b"}]})
+
+    async with _async_client(handler) as c:
+        docs = await c.admin_query("dbx", TableQuery("items").take(2))
+    assert captured["path"] == "/admin/db/dbx/query"
+    assert len(docs) == 2
+
+
+async def test_async_backup_now_posts_empty_body() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["path"] = request.url.path
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"ok": True})
+
+    async with _async_client(handler) as c:
+        await c.backup_now()
+    assert captured["path"] == "/admin/backup"
+    assert captured["body"] == {}

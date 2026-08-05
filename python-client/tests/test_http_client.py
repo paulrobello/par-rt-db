@@ -521,6 +521,61 @@ def test_admin_mint_token_returns_token_id_and_token() -> None:
     assert minted.token == "secret"
 
 
+def test_admin_mint_token_sends_capability_body() -> None:
+    """The legacy client forwards ``readOnly``/``expiresAt``/``tables`` to the
+    wire body (capability parity with ``RtDbAdminClient.mint_token``)."""
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"tokenId": "id2", "token": "secret2"})
+
+    client = _admin_client(handler)
+    minted = client.mint_token(
+        "kanban", "scraper", read_only=True, tables=["users"], expires_at=1700000000000
+    )
+    assert isinstance(minted, MintedToken)
+    assert minted.token_id == "id2"
+    assert captured["body"] == {
+        "db": "kanban",
+        "name": "scraper",
+        "readOnly": True,
+        "expiresAt": 1700000000000,
+        "tables": ["users"],
+    }
+
+
+def test_admin_mint_token_omits_optional_body_fields_by_default() -> None:
+    """The two-arg ``mint_token(db, name)`` call still works and omits
+    ``expiresAt``/``tables``; ``readOnly`` is always sent (False default)."""
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"tokenId": "id3", "token": "secret3"})
+
+    client = _admin_client(handler)
+    client.mint_token("kanban", "ci")
+    assert captured["body"] == {"db": "kanban", "name": "ci", "readOnly": False}
+    assert "expiresAt" not in captured["body"]
+    assert "tables" not in captured["body"]
+
+
+def test_top_level_minted_token_is_http_client_minted_token() -> None:
+    """Regression: ``from par_rt_db import MintedToken`` (routed via the package
+    ``__getattr__`` to ``admin``, which re-exports it) and
+    ``from par_rt_db.http_client import MintedToken`` must be the SAME class —
+    otherwise ``isinstance(obj, MintedToken)`` is silently False (the ENH-005
+    footgun this test locks down)."""
+    import par_rt_db
+    from par_rt_db.http_client import MintedToken as HttpClientMintedToken
+    from par_rt_db.http_client import TokenInfo as HttpClientTokenInfo
+
+    assert par_rt_db.MintedToken is HttpClientMintedToken
+    assert par_rt_db.MintedToken is MintedToken
+    assert par_rt_db.TokenInfo is HttpClientTokenInfo
+
+
 def test_admin_revoke_token_posts_token_id() -> None:
     captured: dict[str, Any] = {}
 

@@ -537,9 +537,30 @@ class RtDbHttpClient:
         resp = self._send("GET", "/admin/dbs")
         return list(resp.json()["databases"])
 
-    def mint_token(self, db: str, name: str) -> MintedToken:
-        """``POST /admin/mint-token`` ``{db, name}`` → ``{tokenId, token}``."""
-        resp = self._send("POST", "/admin/mint-token", json={"db": db, "name": name})
+    def mint_token(
+        self,
+        db: str,
+        name: str,
+        *,
+        expires_at: int | None = None,
+        read_only: bool = False,
+        tables: list[str] | None = None,
+    ) -> MintedToken:
+        """``POST /admin/mint-token`` with capability fields → ``{tokenId, token}``.
+
+        ``expiresAt`` and ``tables`` are omitted from the body when ``None`` so
+        the server applies its defaults (no expiry, all tables). ``readOnly`` is
+        always sent — the server's ``#[serde(default)]`` treats absent as
+        ``false``, so sending it explicitly is harmless and clearer. The
+        two-arg ``mint_token(db, name)`` call still works (capability defaults:
+        read-write, no expiry, all tables).
+        """
+        body: dict[str, Any] = {"db": db, "name": name, "readOnly": read_only}
+        if expires_at is not None:
+            body["expiresAt"] = expires_at
+        if tables is not None:
+            body["tables"] = list(tables)
+        resp = self._send("POST", "/admin/mint-token", json=body)
         return MintedToken.model_validate(resp.json())
 
     def revoke_token(self, token_id: str) -> None:

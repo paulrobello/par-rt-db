@@ -707,3 +707,54 @@ async fn read_only_token_cannot_upload_storage() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+// (n3) A read-only machine token cannot manage scheduled jobs: each of the
+// three :id manage routes (pause/resume/cancel) returns 403 FORBIDDEN. The
+// job is created by a full-access token, then a directly-minted read-only
+// token (read_only=true via auth::tokens::mint_token, since /admin/mint-token
+// doesn't expose the flag) attempts to tamper with it. Gates the
+// scheduler-management path that ENH-005 left open after gating schedule-create.
+#[tokio::test]
+async fn read_only_token_cannot_manage_schedule() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let name = fresh_db(&state).await;
+    let (_, token) = mint_token(addr, &name).await;
+
+    // Create the job with a full-access token (far-future afterMs so the
+    // scheduler, which isn't spawned for this db during the test, never drains it).
+    let resp = api_post(
+        addr,
+        "/api/schedule",
+        &token,
+        json!({
+            "db": name,
+            "when": {"type": "afterMs", "ms": 3_600_000},
+            "txn": insert_work_item_txn(),
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await?;
+    let id = body["id"].as_str().expect("schedule id").to_string();
+
+    let (_id, ro_token) =
+        rtdb_server::auth::tokens::mint_token(&state.pool, &name, "ro", None, true, None)
+            .await
+            .expect("mint read-only token");
+
+    for op in &["pause", "resume", "cancel"] {
+        let resp = api_post(
+            addr,
+            &format!("/api/schedule/{id}/{op}"),
+            &ro_token,
+            json!({"db": name}),
+        )
+        .await;
+        assert_eq!(resp.status(), reqwest::StatusCode::FORBIDDEN);
+        let body: serde_json::Value = resp.json().await?;
+        assert_eq!(body["code"], "FORBIDDEN");
+    }
+
+    Ok(())
+}

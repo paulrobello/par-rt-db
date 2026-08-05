@@ -282,6 +282,9 @@ async fn run_manage_op(
     let token = bearer_token(headers)?;
     let principal = resolve_bearer(&state.pool, token).await?;
     authorize(&state.pool, &principal, db).await?;
+    if principal.is_read_only() {
+        return Err(RtDbError::forbidden("read-only token cannot mutate"));
+    }
     check_http_rate_limits(state, &principal, db).await?;
     let ok = match op {
         ManageOp::Cancel => scheduler::cancel(&state.pool, db, id).await?,

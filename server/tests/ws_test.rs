@@ -868,3 +868,96 @@ async fn ws_subscribe_rate_limited_keeps_connection_open() -> anyhow::Result<()>
     assert_eq!(recv_json(&mut ws).await["type"], json!("pong"));
     Ok(())
 }
+
+// (ro1) A read-only machine token connecting over WS is authed (authOk), but
+// its Mutate frame is rejected with mutateErr FORBIDDEN. The WS Mutate
+// read-only gate landed in ENH-005 Task 3 but had no WS test coverage — this
+// establishes the read-only-over-WS pattern (mint directly with read_only=true
+// via auth::tokens::mint_token, since the /admin/mint-token helper can't set
+// the flag, then connect with the shared `auth` helper).
+#[tokio::test]
+async fn read_only_token_ws_mutate_is_forbidden() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let db = fresh_db(&state).await;
+
+    let (_id, ro_token) =
+        rtdb_server::auth::tokens::mint_token(&state.pool, &db, "ro", None, true, None)
+            .await
+            .expect("mint read-only token");
+
+    let mut ws = ws_connect(addr).await;
+    let msg = auth(&mut ws, &ro_token, &db).await;
+    assert_eq!(msg["type"], json!("authOk"));
+
+    send_json(
+        &mut ws,
+        json!({"type": "mutate", "mutId": "m1", "txn": insert_work_item_txn()}),
+    )
+    .await;
+    let msg = recv_json(&mut ws).await;
+    assert_eq!(msg["type"], json!("mutateErr"));
+    assert_eq!(msg["mutId"], json!("m1"));
+    assert_eq!(msg["error"]["code"], json!("FORBIDDEN"));
+
+    Ok(())
+}
+
+// (ro2) A read-only machine token cannot manage scheduled jobs over WS: each
+// of cancelSchedule/pauseSchedule/resumeSchedule returns a scheduleAck with
+// ok:false and error.code FORBIDDEN. The job is created on a separate
+// full-access connection, then the read-only token attempts to tamper with it
+// — covering the new WS gate in run_simple_schedule (ENH-005 follow-up: the
+// schedule-create arm was gated, but the manage arms were not).
+#[tokio::test]
+async fn read_only_token_ws_cannot_manage_schedule() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let db = fresh_db(&state).await;
+    let full_token = mint_token(addr, &db).await;
+
+    // Connection 1 (full-access): schedule a far-future one-shot so the
+    // scheduler loop cannot claim+fire it before the manage frames land.
+    let mut ws_full = ws_connect(addr).await;
+    auth(&mut ws_full, &full_token, &db).await;
+    send_json(
+        &mut ws_full,
+        json!({
+            "type": "schedule", "scheduleId": "s1",
+            "when": {"type": "afterMs", "ms": 3_600_000},
+            "txn": {"steps": [{"op": "insert", "table": "items", "doc": {"n": 1}}]}
+        }),
+    )
+    .await;
+    let reply = recv_json(&mut ws_full).await;
+    assert_eq!(reply["type"], json!("scheduleOk"));
+    let id = reply["id"].as_str().expect("id").to_string();
+
+    // Connection 2 (read-only): each manage arm is forbidden.
+    let (_id, ro_token) =
+        rtdb_server::auth::tokens::mint_token(&state.pool, &db, "ro", None, true, None)
+            .await
+            .expect("mint read-only token");
+    let mut ws = ws_connect(addr).await;
+    let msg = auth(&mut ws, &ro_token, &db).await;
+    assert_eq!(msg["type"], json!("authOk"));
+
+    for (frame_ty, sched_id) in [
+        ("pauseSchedule", "p1"),
+        ("resumeSchedule", "r1"),
+        ("cancelSchedule", "c1"),
+    ] {
+        send_json(
+            &mut ws,
+            json!({"type": frame_ty, "scheduleId": sched_id, "id": id}),
+        )
+        .await;
+        let ack = recv_json(&mut ws).await;
+        assert_eq!(ack["type"], json!("scheduleAck"), "for {frame_ty}");
+        assert_eq!(ack["scheduleId"], json!(sched_id), "for {frame_ty}");
+        assert_eq!(ack["ok"], json!(false), "for {frame_ty}");
+        assert_eq!(ack["error"]["code"], json!("FORBIDDEN"), "for {frame_ty}");
+    }
+
+    Ok(())
+}

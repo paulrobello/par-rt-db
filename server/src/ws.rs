@@ -594,6 +594,10 @@ async fn run_simple_schedule<'a>(
     action: impl std::future::Future<Output = Result<bool, RtDbError>> + Send + 'a,
 ) -> bool {
     let (ok, error) = match authorize(&state.pool, principal, db).await {
+        Ok(()) if principal.is_read_only() => (
+            false,
+            Some(RtDbError::forbidden("read-only token cannot mutate")),
+        ),
         Ok(()) => match action.await {
             Ok(ok) => (ok, None),
             Err(error) => (false, Some(error)),

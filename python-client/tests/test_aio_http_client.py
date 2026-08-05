@@ -527,6 +527,30 @@ async def test_admin_mint_token_returns_token_id_and_token() -> None:
     assert minted.token == "secret"
 
 
+async def test_admin_mint_token_sends_capability_body() -> None:
+    """Async twin: forwards ``readOnly``/``expiresAt``/``tables`` to the wire
+    body (capability parity with ``AsyncRtDbAdminClient.mint_token``)."""
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"tokenId": "id2", "token": "secret2"})
+
+    async with _admin_client(handler) as c:
+        minted = await c.mint_token(
+            "kanban", "scraper", read_only=True, tables=["users"], expires_at=1700000000000
+        )
+    assert isinstance(minted, MintedToken)
+    assert minted.token_id == "id2"
+    assert captured["body"] == {
+        "db": "kanban",
+        "name": "scraper",
+        "readOnly": True,
+        "expiresAt": 1700000000000,
+        "tables": ["users"],
+    }
+
+
 async def test_admin_revoke_token_posts_token_id() -> None:
     captured: dict[str, Any] = {}
 
