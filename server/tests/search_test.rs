@@ -293,3 +293,152 @@ async fn adding_search_index_backfills_existing_rows() {
     .expect("search");
     assert_eq!(titles(&res), vec!["database notes".to_string()]);
 }
+
+// ENH-006: a search index may declare a `language` (a Postgres regconfig) that
+// drives its tsvector column and query tsquery. These cover the end-to-end path,
+// the behavioral effect (stemming), and the validation surface.
+
+fn lang_search_schema(language: Option<&str>) -> SchemaDef {
+    let mut idx =
+        serde_json::json!({"name":"search_content","fields":["title","body"],"search":true});
+    if let Some(lang) = language {
+        idx["language"] = serde_json::json!(lang);
+    }
+    serde_json::from_value(serde_json::json!({"tables":{"notes":{
+        "fields":{"title":{"type":"string"},"body":{"type":"string"}},
+        "indexes":[idx]
+    }}}))
+    .expect("parse language search schema")
+}
+
+async fn fresh_db_with(state: &Arc<AppState>, schema: SchemaDef) -> (common::TestDb, SchemaDef) {
+    let name = format!("t{}", uuid::Uuid::now_v7().simple());
+    db::create_database(&state.pool, &name)
+        .await
+        .expect("create db");
+    ddl::push_schema(&state.pool, &name, schema.clone())
+        .await
+        .expect("push schema");
+    (common::wrap_test_db(name), schema)
+}
+
+// A `simple`-language index (no stemming, no stop-words) matches an exact word,
+// proving the declared regconfig flows through both the generated column and the
+// query tsquery end to end.
+#[tokio::test]
+async fn search_index_language_simple_matches_exact_word() {
+    let state = test_state().await;
+    let (db, schema) = fresh_db_with(&state, lang_search_schema(Some("simple"))).await;
+    insert_note(&state.pool, &db, &schema, "quick fox", "lazy dog").await;
+    let res = execute_query(
+        &state.pool,
+        &db,
+        &schema,
+        &search_query("search_content", "fox"),
+        &PrincipalCtx::bypass(),
+    )
+    .await
+    .expect("search");
+    assert_eq!(titles(&res), vec!["quick fox".to_string()]);
+}
+
+// The `simple` regconfig does no stemming, so a singular query does not match a
+// plural document — while the default `english` config does (Porter stemming).
+// This is the load-bearing behavioral proof that `language` actually changes
+// tokenization rather than being a no-op.
+#[tokio::test]
+async fn search_index_language_simple_does_not_stem() {
+    let state = test_state().await;
+    let (db_simple, schema_simple) =
+        fresh_db_with(&state, lang_search_schema(Some("simple"))).await;
+    insert_note(&state.pool, &db_simple, &schema_simple, "databases", "").await;
+    let res = execute_query(
+        &state.pool,
+        &db_simple,
+        &schema_simple,
+        &search_query("search_content", "database"),
+        &PrincipalCtx::bypass(),
+    )
+    .await
+    .expect("search");
+    assert!(
+        matches!(res, QueryResult::Docs(ref d) if d.is_empty()),
+        "simple config must not stem the plural"
+    );
+
+    let (db_en, schema_en) = fresh_db_with(&state, lang_search_schema(None)).await;
+    insert_note(&state.pool, &db_en, &schema_en, "databases", "").await;
+    let res = execute_query(
+        &state.pool,
+        &db_en,
+        &schema_en,
+        &search_query("search_content", "database"),
+        &PrincipalCtx::bypass(),
+    )
+    .await
+    .expect("search");
+    assert_eq!(
+        titles(&res),
+        vec!["databases".to_string()],
+        "english config should stem the plural"
+    );
+}
+
+// A language that is not a real Postgres text-search config is rejected at push
+// (existence-checked against pg_ts_config), surfacing as a clear BadRequest
+// rather than a DDL-time 500.
+#[tokio::test]
+async fn search_index_unknown_language_rejected_at_push() {
+    let state = test_state().await;
+    let name = format!("t{}", uuid::Uuid::now_v7().simple());
+    db::create_database(&state.pool, &name)
+        .await
+        .expect("create db");
+    let name = common::wrap_test_db(name);
+    let err = ddl::push_schema(&state.pool, &name, lang_search_schema(Some("nonsense")))
+        .await
+        .expect_err("unknown language");
+    assert_eq!(err.code, ErrorCode::BadRequest);
+    assert!(err.message.contains("nonsense"));
+}
+
+// `language` is only meaningful on a search index; declaring it on a btree index
+// is rejected at schema-validation time.
+#[tokio::test]
+async fn search_index_language_on_non_search_rejected() {
+    let state = test_state().await;
+    let name = format!("t{}", uuid::Uuid::now_v7().simple());
+    db::create_database(&state.pool, &name)
+        .await
+        .expect("create db");
+    let name = common::wrap_test_db(name);
+    let schema: SchemaDef = serde_json::from_value(serde_json::json!({"tables":{"notes":{
+        "fields":{"title":{"type":"string"}},
+        "indexes":[{"name":"by_title","fields":["title"],"language":"english"}]
+    }}}))
+    .expect("parse schema");
+    let err = ddl::push_schema(&state.pool, &name, schema)
+        .await
+        .expect_err("language on btree index");
+    assert_eq!(err.code, ErrorCode::SchemaViolation);
+    assert!(err.message.contains("not a search index"));
+}
+
+// Changing an existing search index's language is a breaking change (the regconfig
+// is baked into a STORED generated column Postgres cannot alter in place) and is
+// rejected, while re-pushing the same language is accepted.
+#[tokio::test]
+async fn search_index_language_change_is_breaking() {
+    let state = test_state().await;
+    let (db, _schema) = fresh_db_with(&state, lang_search_schema(Some("simple"))).await;
+    // Same language re-pushed: accepted.
+    ddl::push_schema(&state.pool, &db, lang_search_schema(Some("simple")))
+        .await
+        .expect("re-push same language");
+    // Different language: rejected.
+    let err = ddl::push_schema(&state.pool, &db, lang_search_schema(Some("english")))
+        .await
+        .expect_err("language change");
+    assert_eq!(err.code, ErrorCode::BadRequest);
+    assert!(err.message.contains("changed language"));
+}

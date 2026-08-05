@@ -94,6 +94,38 @@ describe("SchemaPage", () => {
     expect(await screen.findByText("VEC·cosine")).toBeInTheDocument();
   });
 
+  // A search index may declare a `language` (a Postgres regconfig, ENH-006);
+  // it is omitted on the wire when unset, so a plain search index has no key.
+  it("renders a search index with its declared language", async () => {
+    adminClientMock.getSchema.mockResolvedValue({
+      tables: {
+        notes: {
+          fields: { title: { type: "string" }, body: { type: "string" } },
+          indexes: [
+            { name: "search_content", fields: ["title", "body"], search: true, language: "simple" },
+          ],
+        },
+      },
+    });
+    render(<SchemaPage />);
+    expect(await screen.findByText("search_content")).toBeInTheDocument();
+    expect(screen.getByText("FTS·simple")).toBeInTheDocument();
+  });
+
+  it("renders a search index with no language as a bare FTS tag", async () => {
+    adminClientMock.getSchema.mockResolvedValue({
+      tables: {
+        notes: {
+          fields: { body: { type: "string" } },
+          indexes: [{ name: "search_body", fields: ["body"], search: true }],
+        },
+      },
+    });
+    render(<SchemaPage />);
+    expect(await screen.findByText("search_body")).toBeInTheDocument();
+    expect(screen.getByText("FTS")).toBeInTheDocument();
+  });
+
   it("switches to push mode and previews an additive diff (added column)", async () => {
     const user = userEvent.setup();
     adminClientMock.previewSchema.mockResolvedValue({

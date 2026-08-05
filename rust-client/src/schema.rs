@@ -132,6 +132,14 @@ pub struct IndexDef {
     /// and omitted on the wire when `None`.
     #[serde(default, rename = "where", skip_serializing_if = "Option::is_none")]
     pub r#where: Option<FilterExpr>,
+    /// Full-text search language for a search index — a Postgres `regconfig`
+    /// name (e.g. `"english"`, `"simple"`, `"spanish"`) that the server uses to
+    /// tsvectorize the index's text `fields`. Only meaningful when `search: true`;
+    /// the server default (field absent) behaves as `english`. Mirrors
+    /// `server/src/schema.rs::IndexDef` byte-for-byte: omitted on the wire when
+    /// `None`, so existing schemas serialize unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
 }
 
 /// Distance metric for a vector index. Mirrors
@@ -281,14 +289,18 @@ impl TableBuilder {
             vector: None,
             unique: false,
             r#where: None,
+            language: None,
         });
         self.last_index = Some(self.indexes.len() - 1);
         self
     }
 
     /// Declare a full-text search index. The server tsvectorizes the (text)
-    /// `fields` and ranks matches via the `search` query terminal.
-    pub fn search_index(mut self, name: &str, fields: &[&str]) -> Self {
+    /// `fields` and ranks matches via the `search` query terminal. Pass `language`
+    /// to override the server's default (`english`) Postgres `regconfig` (e.g.
+    /// `"spanish"`, `"simple"`); `None` omits the field on the wire and lets the
+    /// server default apply.
+    pub fn search_index(mut self, name: &str, fields: &[&str], language: Option<&str>) -> Self {
         self.indexes.push(IndexDef {
             name: name.into(),
             fields: fields.iter().map(|s| (*s).into()).collect(),
@@ -296,6 +308,7 @@ impl TableBuilder {
             vector: None,
             unique: false,
             r#where: None,
+            language: language.map(|s| s.into()),
         });
         self.last_index = Some(self.indexes.len() - 1);
         self
@@ -324,6 +337,7 @@ impl TableBuilder {
             }),
             unique: false,
             r#where: None,
+            language: None,
         });
         self.last_index = Some(self.indexes.len() - 1);
         self
@@ -582,7 +596,7 @@ mod tests {
                     .field("title", FieldType::String)
                     .field("body", FieldType::String)
                     .index("by_title", &["title"])
-                    .search_index("search_content", &["title", "body"]),
+                    .search_index("search_content", &["title", "body"], None),
             )
             .build();
         let v = serde_json::to_value(&schema).unwrap();
@@ -609,6 +623,77 @@ mod tests {
             .and_then(|idxs| idxs.iter().find(|i| i.name == "by_title"))
             .expect("btree index present");
         assert!(!by_title.search);
+    }
+
+    #[test]
+    fn search_index_language_serializes_and_round_trips() {
+        // A search index WITHOUT `language` omits the key on the wire (the server
+        // default `english` applies), and one WITH a language carries it and
+        // round-trips. Mirrors `server/src/schema.rs::IndexDef`'s
+        // `skip_serializing_if = "Option::is_none"` on the `language` field.
+        let schema = Schema::builder()
+            .table(
+                "notes",
+                Table::new()
+                    .field("title", FieldType::String)
+                    .field("body", FieldType::String)
+                    .search_index("search_default", &["title", "body"], None)
+                    .search_index("search_spanish", &["title", "body"], Some("spanish")),
+            )
+            .build();
+        let v = serde_json::to_value(&schema).unwrap();
+        let idxs = &v["tables"]["notes"]["indexes"];
+        // No-language index: `language` key is absent on the wire.
+        let default_idx = &idxs[0];
+        assert_eq!(default_idx["name"], json!("search_default"));
+        assert_eq!(default_idx["search"], json!(true));
+        assert!(
+            default_idx
+                .as_object()
+                .expect("default search index is object")
+                .get("language")
+                .is_none(),
+            "language must be omitted on the wire when None"
+        );
+        // With-language index: `language` is present and carries the regconfig.
+        let spanish_idx = &idxs[1];
+        assert_eq!(spanish_idx["name"], json!("search_spanish"));
+        assert_eq!(spanish_idx["language"], json!("spanish"));
+
+        // Round-trips: `None` stays `None`; `Some("spanish")` is preserved.
+        let back: SchemaDef = serde_json::from_value(v).unwrap();
+        let notes = back.tables.get("notes").expect("notes present");
+        let default_back = notes
+            .indexes
+            .as_ref()
+            .and_then(|i| i.iter().find(|x| x.name == "search_default"))
+            .expect("default search index present");
+        assert!(default_back.language.is_none());
+        let spanish_back = notes
+            .indexes
+            .as_ref()
+            .and_then(|i| i.iter().find(|x| x.name == "search_spanish"))
+            .expect("spanish search index present");
+        assert_eq!(spanish_back.language.as_deref(), Some("spanish"));
+
+        // A schema that never carried a `language` key (legacy) deserializes to
+        // `language: None`, so existing wire payloads stay compatible.
+        let legacy = json!({
+            "tables": {
+                "notes": {
+                    "fields": {"body": {"type":"string"}},
+                    "indexes": [{"name":"search_content","fields":["body"],"search":true}]
+                }
+            }
+        });
+        let from_legacy: SchemaDef = serde_json::from_value(legacy).unwrap();
+        let legacy_idx = from_legacy
+            .tables
+            .get("notes")
+            .and_then(|t| t.indexes.as_ref())
+            .and_then(|i| i.first())
+            .expect("legacy index present");
+        assert!(legacy_idx.language.is_none());
     }
 
     #[test]

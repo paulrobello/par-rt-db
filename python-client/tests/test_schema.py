@@ -253,6 +253,59 @@ def test_vector_index_rejects_invalid_metric():
         VectorIndexSpec.model_validate({"dimensions": 4, "metric": "manhattan"})
 
 
+def test_search_index_without_language_omits_language_key():
+    """``IndexDef.language`` is omitted on the wire when not provided (mirrors
+    the server's ``Option::is_none`` skip rule, so existing search indexes
+    serialize byte-identically and behave as ``english`` server-side)."""
+    schema = (
+        Schema.builder()
+        .table("docs", lambda tb: tb.field("body", t.string()).search_index("body_idx", ["body"]))
+        .build()
+    )
+    wire = json.loads(schema.model_dump_json(by_alias=True))
+    idx = wire["tables"]["docs"]["indexes"][0]
+    assert idx == {"name": "body_idx", "fields": ["body"], "search": True}
+    assert "language" not in idx
+    # Direct model assertion: a default-constructed search IndexDef carries no
+    # language key either.
+    idx_wire = json.loads(
+        IndexDef.model_validate(
+            {"name": "body_idx", "fields": ["body"], "search": True}
+        ).model_dump_json(by_alias=True)
+    )
+    assert "language" not in idx_wire
+
+
+def test_search_index_with_language_carries_language_key():
+    """``IndexDef.language`` serializes as ``"language"`` when set, the builder
+    forwards it into the index, and the value round-trips through ``IndexDef``
+    (mirrors the server's ``Option<String>`` with ``skip_serializing_if =
+    "Option::is_none"``)."""
+    schema = (
+        Schema.builder()
+        .table(
+            "docs",
+            lambda tb: tb.field("body", t.string()).search_index(
+                "body_idx", ["body"], language="spanish"
+            ),
+        )
+        .build()
+    )
+    wire = json.loads(schema.model_dump_json(by_alias=True))
+    idx = wire["tables"]["docs"]["indexes"][0]
+    assert idx == {
+        "name": "body_idx",
+        "fields": ["body"],
+        "search": True,
+        "language": "spanish",
+    }
+    # Round-trips through IndexDef: the parsed model re-emits the value and
+    # validates against the discriminated index shape.
+    reparsed = IndexDef.model_validate(idx)
+    assert reparsed.language == "spanish"
+    assert json.loads(reparsed.model_dump_json(by_alias=True)) == idx
+
+
 def test_unique_index_builder_emits_unique_true():
     """``.index(...).unique()`` marks the most recently declared index as
     unique; on the wire ``unique: true`` is emitted and ``where`` stays omitted

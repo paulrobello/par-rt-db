@@ -165,9 +165,17 @@ class VectorIndexSpec(_S):
 
 class IndexDef(_S):
     """Index declaration: btree, full-text search (``search=True``), or vector
-    (``vector=...``). ``search``/``vector``/``unique``/``where`` are omitted on
-    the wire when absent, so a plain btree index serializes as
-    ``{"name", "fields"}`` only."""
+    (``vector=...``). ``search``/``vector``/``unique``/``where``/``language``
+    are omitted on the wire when absent, so a plain btree index serializes as
+    ``{"name", "fields"}`` only.
+
+    ``language`` optionally selects a Postgres ``regconfig`` name (e.g.
+    ``"english"``, ``"simple"``, ``"spanish"``) for a search index's generated
+    tsvector column and ``search``/``hybridSearch`` query-text parsing, so
+    non-English corpora get correct stemming and stop-words. Valid only on a
+    search index; the server default (field absent) behaves as ``english``.
+    Mirrors ``server/src/schema.rs::IndexDef.language``
+    (``skip_serializing_if = "Option::is_none"``). See ENH-006."""
 
     name: str
     fields: list[str]
@@ -175,6 +183,7 @@ class IndexDef(_S):
     vector: VectorIndexSpec | None = None
     unique: bool | None = None
     where: FilterExpr | None = None
+    language: str | None = None
 
     @model_serializer(mode="wrap")
     def _drop_absent_flags(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
@@ -191,6 +200,10 @@ class IndexDef(_S):
             out.pop("unique", None)
         if out.get("where") is None:
             out.pop("where", None)
+        # `language` is Option<String>; drop only when None (a present value
+        # always serializes).
+        if out.get("language") is None:
+            out.pop("language", None)
         return out
 
 
@@ -294,8 +307,24 @@ class TableBuilder:
             self._indexes[-1]["where"] = predicate
         return self
 
-    def search_index(self, name: str, fields: list[str]) -> TableBuilder:
-        self._indexes.append({"name": name, "fields": fields, "search": True})
+    def search_index(
+        self,
+        name: str,
+        fields: list[str],
+        *,
+        language: str | None = None,
+    ) -> TableBuilder:
+        """Declare a full-text-search index over ``fields``.
+
+        ``language`` optionally selects a Postgres ``regconfig`` name (e.g.
+        ``"english"``, ``"simple"``, ``"spanish"``) for stemming and stop-words;
+        it defaults to ``"english"`` server-side and is only added to the index
+        when a value is provided so existing schemas serialize byte-identically.
+        See ENH-006."""
+        entry: dict[str, Any] = {"name": name, "fields": fields, "search": True}
+        if language is not None:
+            entry["language"] = language
+        self._indexes.append(entry)
         return self
 
     def vector_index(

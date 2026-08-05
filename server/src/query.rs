@@ -1915,6 +1915,19 @@ fn jsonb_lhs_and_bind(
     }
 }
 
+/// `plainto_tsquery` SQL fragment honoring an optional search-index `language`
+/// (a `schema::validate_structure`-checked regconfig name interpolated as a
+/// literal). The query text stays a `$ph` bind, so user input can never inject
+/// tsquery syntax or escape the regconfig literal. The tsvector column and the
+/// tsquery must share a regconfig for `@@` to match correctly, so every search
+/// path builds both from the same index `language`.
+fn plainto_tsquery_sql(language: Option<&str>, ph: usize) -> String {
+    match language {
+        Some(lang) => format!("plainto_tsquery('{lang}'::regconfig, ${ph})"),
+        None => format!("plainto_tsquery(${ph})"),
+    }
+}
+
 /// Full-text search terminal: matches a search index's generated tsvector
 /// against `plainto_tsquery(<query text>)` and ranks by `ts_rank` descending,
 /// with `(created_at, id)` tie-breakers. Composes with `take` (defaulting to
@@ -1948,6 +1961,7 @@ async fn execute_search(
             RtDbError::bad_request(format!("search index '{}' not found", search.index))
         })?;
     let sv_col = pg_search_col(&index_def.name);
+    let tsq = plainto_tsquery_sql(index_def.language.as_deref(), 1);
     let limit = take.unwrap_or(MAX_TAKE);
     let pg_schema_name = pg_schema(db);
     let table_ident = pg_table(table_name);
@@ -1981,8 +1995,8 @@ async fn execute_search(
     let limit_ph = auth_start + auth_binds.len();
     let sql = format!(
         "SELECT \"id\", \"doc\", \"created_at\", \"version\" FROM \"{pg_schema_name}\".\"{table_ident}\" \
-         WHERE \"{sv_col}\" @@ plainto_tsquery($1){auth_clause} \
-         ORDER BY ts_rank(\"{sv_col}\", plainto_tsquery($1)) DESC, \"created_at\" DESC, \"id\" DESC \
+         WHERE \"{sv_col}\" @@ {tsq}{auth_clause} \
+         ORDER BY ts_rank(\"{sv_col}\", {tsq}) DESC, \"created_at\" DESC, \"id\" DESC \
          LIMIT ${limit_ph}"
     );
     let mut query =
@@ -2295,6 +2309,7 @@ async fn execute_hybrid_search(
     let owner = ctx.user_id.as_deref();
     let enforced_uid = row_auth_enforced_uid(owner_field, collaborators_field, owner);
     let text_ph = 1usize;
+    let tsq = plainto_tsquery_sql(search_index.language.as_deref(), text_ph);
     let mut auth_binds: Vec<EqBind> = Vec::new();
     let mut auth_clause = String::new();
     let auth_start = 2usize;
@@ -2325,10 +2340,10 @@ async fn execute_hybrid_search(
     let sql = format!(
         "WITH matched AS ( \
            SELECT \"id\", \"doc\", \"created_at\", \"version\", \
-                  ts_rank(\"{sv_col}\", plainto_tsquery(${text_ph})) AS trank, \
+                  ts_rank(\"{sv_col}\", {tsq}) AS trank, \
                   (\"{v_col}\" {dist_op} ${qvec_ph}::vector) AS dist \
            FROM \"{pg_schema_name}\".\"{table_ident}\" \
-           WHERE (\"{sv_col}\" @@ plainto_tsquery(${text_ph}) OR \"{v_col}\" IS NOT NULL){auth_clause} \
+           WHERE (\"{sv_col}\" @@ {tsq} OR \"{v_col}\" IS NOT NULL){auth_clause} \
          ), ranked AS ( \
            SELECT \"id\", \"doc\", \"created_at\", \"version\", \
                   ROW_NUMBER() OVER (ORDER BY trank DESC, \"created_at\" DESC, \"id\" DESC) AS r_text, \
@@ -2642,6 +2657,7 @@ mod tests {
                 vector: None,
                 unique: false,
                 r#where: None,
+                language: None,
             }],
             owner_field: None,
             collaborators_field: None,

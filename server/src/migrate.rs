@@ -1202,6 +1202,7 @@ mod tests {
                     vector: None,
                     unique: false,
                     r#where: None,
+                    language: None,
                 }],
                 owner_field: Some("ownerId".into()),
                 collaborators_field: Some("collabs".into()),

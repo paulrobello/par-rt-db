@@ -154,14 +154,21 @@ export class TableDefinition<
 
   /** Declare a full-text search index. The server tsvectorizes the (text)
    * `fields` into a GIN-indexed generated column ranked via the `search` query
-   * terminal. Mirrors `index` but carries `search: true`. */
+   * terminal. Mirrors `index` but carries `search: true`. `language` optionally
+   * selects the Postgres `regconfig` (e.g. `"english"`, `"simple"`,
+   * `"spanish"`) used to tsvectorize; omitted on the wire when absent (server
+   * default behaves as `english`). */
   searchIndex<Name extends string>(
     name: Name,
     fields: [keyof Fields & string, ...(keyof Fields & string)[]],
+    language?: string,
   ): TableDefinition<Fields, Indexes | Name> {
     return new TableDefinition(
       this.fields,
-      [...this.indexes, { name, fields: [...fields], search: true }],
+      [
+        ...this.indexes,
+        { name, fields: [...fields], search: true, ...(language ? { language } : {}) },
+      ],
       this.ownerFieldName,
       this.collaboratorsFieldName,
       this.ttlDef,

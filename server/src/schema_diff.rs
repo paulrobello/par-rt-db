@@ -252,6 +252,7 @@ mod tests {
             vector: None,
             unique: false,
             r#where: None,
+            language: None,
         }
     }
 

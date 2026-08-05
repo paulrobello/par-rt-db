@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import type { IndexJson } from "../src/protocol.js";
 import { defineSchema, defineTable, t } from "../src/schema.js";
 
 const schema = defineSchema({
@@ -120,6 +121,27 @@ describe("searchIndex builder", () => {
       notes: defineTable({ title: t.string() }).index("by_title", ["title"]),
     });
     expect(s.toJSON().tables.notes.indexes).toEqual([{ name: "by_title", fields: ["title"] }]);
+  });
+
+  it("omits language on the wire when none is declared", () => {
+    const s = defineSchema({
+      notes: defineTable({ title: t.string() }).searchIndex("search_title", ["title"]),
+    });
+    expect(s.toJSON().tables.notes.indexes).toEqual([
+      { name: "search_title", fields: ["title"], search: true },
+    ]);
+    expect(s.toJSON().tables.notes.indexes?.[0]).not.toHaveProperty("language");
+  });
+
+  it("emits language on the wire when declared and round-trips through IndexJson", () => {
+    const s = defineSchema({
+      notes: defineTable({ title: t.string() }).searchIndex("search_title", ["title"], "spanish"),
+    });
+    expect(s.toJSON().tables.notes.indexes).toEqual([
+      { name: "search_title", fields: ["title"], search: true, language: "spanish" },
+    ]);
+    const idx: IndexJson = s.toJSON().tables.notes.indexes?.[0] as IndexJson;
+    expect(idx.language).toBe("spanish");
   });
 });
 

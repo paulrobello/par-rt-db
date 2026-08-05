@@ -40,6 +40,7 @@ fn vector_schema_with_metric(dim: u32, with_filter: bool, metric: DistanceMetric
         }),
         unique: false,
         r#where: None,
+        language: None,
     }];
     let mut tables = BTreeMap::new();
     tables.insert(

@@ -1198,6 +1198,7 @@ mod tests {
                     vector: None,
                     unique: false,
                     r#where: None,
+                    language: None,
                 },
                 IndexDef {
                     name: "by_status_order".to_string(),
@@ -1206,6 +1207,7 @@ mod tests {
                     vector: None,
                     unique: false,
                     r#where: None,
+                    language: None,
                 },
                 IndexDef {
                     name: "by_flag".to_string(),
@@ -1214,6 +1216,7 @@ mod tests {
                     vector: None,
                     unique: false,
                     r#where: None,
+                    language: None,
                 },
             ],
             owner_field: None,

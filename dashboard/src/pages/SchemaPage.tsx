@@ -192,7 +192,9 @@ export function SchemaPage() {
                     {table.indexes.map((idx) => (
                       <span key={idx.name} className={s.index}>
                         {idx.search ? (
-                          <span className={s.indexTag}>FTS</span>
+                          <span className={s.indexTag}>
+                            FTS{idx.language ? `·${idx.language}` : ""}
+                          </span>
                         ) : idx.vector ? (
                           <span className={s.indexTag}>VEC·{idx.vector.metric ?? "cosine"}</span>
                         ) : null}

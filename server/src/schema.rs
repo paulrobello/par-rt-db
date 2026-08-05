@@ -54,6 +54,16 @@ pub struct IndexDef {
     /// the wire when `None`. Wire key is `where` (Rust keyword ⇒ raw identifier).
     #[serde(default, rename = "where", skip_serializing_if = "Option::is_none")]
     pub r#where: Option<FilterExpr>,
+    /// Optional full-text-search language for a search index: a Postgres
+    /// `regconfig` name (e.g. `english`, `simple`, `spanish`) used to build the
+    /// index's generated `tsvector` column and to parse `search`/`hybridSearch`
+    /// query text, so non-English corpora get correct stemming and stop-words.
+    /// Valid only on a search index; format-checked here and existence-checked
+    /// against `pg_ts_config` at push time. Omitted on the wire when `None`, so
+    /// existing schemas deserialize unchanged and behave exactly as today
+    /// (`english`). See ENH-006.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
 }
 
 /// Distance metric for a vector index. Selects the pgvector opclass used to
@@ -195,6 +205,23 @@ pub(crate) fn is_valid_identifier(s: &str, max_len: usize) -> bool {
         _ => return false,
     }
     chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// A Postgres text-search `regconfig` name (`pg_ts_config.cfgname`): a lowercase
+/// identifier like `english`, `simple`, `spanish`. This only gates the literal
+/// interpolated into `to_tsvector('<lang>'::regconfig, …)` so it can never break
+/// out of the string or inject SQL; existence is re-checked against
+/// `pg_ts_config` at push time (`ddl::validate_search_languages`).
+pub(crate) fn is_valid_regconfig(s: &str) -> bool {
+    if s.is_empty() || s.len() > 63 {
+        return false;
+    }
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_lowercase() => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
 }
 
 /// Structural validation of a single field type: `Literal` must carry a scalar
@@ -586,6 +613,24 @@ impl TableDef {
                     return Err(RtDbError::schema(format!(
                         "index '{}' cannot combine unique/where with a vector index",
                         index.name
+                    )));
+                }
+            }
+            // `language` selects a search index's tsvector `regconfig`; it is
+            // meaningless on a btree or vector index, and the literal is later
+            // interpolated into DDL, so both its placement and format are gated
+            // here. Existence against `pg_ts_config` is checked at push time.
+            if let Some(lang) = &index.language {
+                if !index.search {
+                    return Err(RtDbError::schema(format!(
+                        "index '{}' declares language '{}' but is not a search index",
+                        index.name, lang
+                    )));
+                }
+                if !is_valid_regconfig(lang) {
+                    return Err(RtDbError::schema(format!(
+                        "search index '{}' has invalid language '{}' (expected a lowercase regconfig name like 'english')",
+                        index.name, lang
                     )));
                 }
             }
@@ -1008,6 +1053,7 @@ mod tests {
                 vector: None,
                 unique: false,
                 r#where: None,
+                language: None,
             }],
             owner_field: None,
             collaborators_field: None,
@@ -1032,6 +1078,7 @@ mod tests {
                 vector: None,
                 unique: false,
                 r#where: None,
+                language: None,
             }],
             owner_field: None,
             collaborators_field: None,
@@ -1075,6 +1122,7 @@ mod tests {
                     vector: None,
                     unique: false,
                     r#where: None,
+                    language: None,
                 },
                 IndexDef {
                     name: "By_X".to_string(),
@@ -1083,6 +1131,7 @@ mod tests {
                     vector: None,
                     unique: false,
                     r#where: None,
+                    language: None,
                 },
             ],
             owner_field: None,
@@ -1141,6 +1190,7 @@ mod tests {
                 vector: None,
                 unique: false,
                 r#where: None,
+                language: None,
             }],
             owner_field: None,
             collaborators_field: None,
@@ -1164,6 +1214,7 @@ mod tests {
                 vector: None,
                 unique: false,
                 r#where: None,
+                language: None,
             }],
             owner_field: None,
             collaborators_field: None,
@@ -1187,6 +1238,7 @@ mod tests {
                 vector: None,
                 unique: false,
                 r#where: None,
+                language: None,
             }],
             owner_field: None,
             collaborators_field: None,
@@ -1211,6 +1263,7 @@ mod tests {
                     vector: None,
                     unique: false,
                     r#where: None,
+                    language: None,
                 },
                 IndexDef {
                     name: "by_name".to_string(),
@@ -1219,6 +1272,7 @@ mod tests {
                     vector: None,
                     unique: false,
                     r#where: None,
+                    language: None,
                 },
             ],
             owner_field: None,
@@ -1243,6 +1297,7 @@ mod tests {
                 vector: None,
                 unique: false,
                 r#where: None,
+                language: None,
             }],
             owner_field: None,
             collaborators_field: None,
@@ -1266,6 +1321,7 @@ mod tests {
                 vector: None,
                 unique: false,
                 r#where: None,
+                language: None,
             }],
             owner_field: None,
             collaborators_field: None,
@@ -1630,6 +1686,7 @@ mod tests {
                 vector: None,
                 unique: false,
                 r#where: None,
+                language: None,
             }],
             owner_field: None,
             collaborators_field: None,
@@ -1688,6 +1745,7 @@ mod tests {
                 vector: None,
                 unique: false,
                 r#where: None,
+                language: None,
             }],
             owner_field: None,
             collaborators_field: None,
@@ -1716,6 +1774,7 @@ mod tests {
                 vector: None,
                 unique: false,
                 r#where: None,
+                language: None,
             }],
             owner_field: None,
             collaborators_field: None,
@@ -1814,6 +1873,7 @@ mod tests {
                 }),
                 unique: false,
                 r#where: None,
+                language: None,
             }],
             owner_field: None,
             collaborators_field: None,
@@ -1841,6 +1901,7 @@ mod tests {
                 }),
                 unique: false,
                 r#where: None,
+                language: None,
             }],
             owner_field: None,
             collaborators_field: None,
@@ -1867,6 +1928,7 @@ mod tests {
                 }),
                 unique: false,
                 r#where: None,
+                language: None,
             }],
             owner_field: None,
             collaborators_field: None,
@@ -1895,6 +1957,7 @@ mod tests {
                 }),
                 unique: false,
                 r#where: None,
+                language: None,
             }],
             owner_field: None,
             collaborators_field: None,
@@ -1922,6 +1985,7 @@ mod tests {
                 }),
                 unique: false,
                 r#where: None,
+                language: None,
             }],
             owner_field: None,
             collaborators_field: None,
@@ -1948,6 +2012,7 @@ mod tests {
                 }),
                 unique: false,
                 r#where: None,
+                language: None,
             }],
             owner_field: None,
             collaborators_field: None,
@@ -1974,6 +2039,7 @@ mod tests {
                 }),
                 unique: false,
                 r#where: None,
+                language: None,
             }],
             owner_field: None,
             collaborators_field: None,
@@ -2006,6 +2072,7 @@ mod tests {
                 }),
                 unique: false,
                 r#where: None,
+                language: None,
             }],
             owner_field: None,
             collaborators_field: None,
@@ -2247,6 +2314,7 @@ mod tests {
                 search: false,
                 vector: None,
                 r#where: None,
+                language: None,
             }],
             owner_field: None,
             collaborators_field: None,
@@ -2308,6 +2376,7 @@ mod tests {
                 search: false,
                 vector: None,
                 r#where: None,
+                language: None,
             },
             IndexDef {
                 name: "x".to_string(),
@@ -2319,6 +2388,7 @@ mod tests {
                     field: "expiresAt".to_string(),
                     value: serde_json::json!(0),
                 }),
+                language: None,
             },
             IndexDef {
                 name: "x".to_string(),
@@ -2327,6 +2397,7 @@ mod tests {
                 search: false,
                 vector: None,
                 r#where: None,
+                language: None,
             },
         ] {
             let mut table = table_with_ttl(Some(TtlDef {

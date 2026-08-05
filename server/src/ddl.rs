@@ -144,11 +144,59 @@ fn detect_destructive_changes(old: &SchemaDef, new: &SchemaDef) -> Result<(), Rt
                         old_index.name
                     )));
                 }
+                // A search index's `regconfig` is baked into a STORED generated
+                // column whose expression Postgres cannot alter in place, so a
+                // language change is a breaking index change (reject, like a
+                // vector-spec change) rather than a silent no-op.
+                Some(new_index) if new_index.language != old_index.language => {
+                    return Err(RtDbError::bad_request(format!(
+                        "changed language of search index '{}'",
+                        old_index.name
+                    )));
+                }
                 _ => {}
             }
         }
     }
     Ok(())
+}
+
+/// Verifies every search-index `language` declared in `schema` names a real
+/// Postgres text-search configuration (`pg_ts_config.cfgname`). The regconfig is
+/// interpolated as a literal into `to_tsvector('<lang>'::regconfig, …)`, so a
+/// typo must surface as a clear 400 here rather than a DDL-time 500. Format is
+/// already gated by `schema::validate_structure`; this is the existence check.
+async fn validate_search_languages(pool: &PgPool, schema: &SchemaDef) -> Result<(), RtDbError> {
+    let wanted: HashSet<String> = schema
+        .tables
+        .values()
+        .flat_map(|table| table.indexes.iter())
+        .filter_map(|index| index.language.clone())
+        .collect();
+    if wanted.is_empty() {
+        return Ok(());
+    }
+    let wanted_vec: Vec<String> = wanted.iter().cloned().collect();
+    let known: HashSet<String> =
+        sqlx::query_scalar::<_, String>("SELECT cfgname FROM pg_ts_config WHERE cfgname = ANY($1)")
+            .bind(&wanted_vec)
+            .fetch_all(pool)
+            .await?
+            .into_iter()
+            .collect();
+    let unknown: Vec<&str> = wanted
+        .iter()
+        .filter(|lang| !known.contains(*lang))
+        .map(String::as_str)
+        .collect();
+    if unknown.is_empty() {
+        Ok(())
+    } else {
+        Err(RtDbError::bad_request(format!(
+            "unknown text-search language(s): {} (see pg_ts_config for available configs)",
+            unknown.join(", ")
+        )))
+    }
 }
 
 /// Validates `schema`, diffs it against whatever is currently pushed for `db`
@@ -162,6 +210,7 @@ pub async fn push_schema(
 ) -> Result<SchemaDef, RtDbError> {
     schema.validate()?;
     validate_db_name(db)?;
+    validate_search_languages(pool, &schema).await?;
 
     if !database_exists(pool, db).await? {
         return Err(RtDbError::not_found("unknown database"));
@@ -249,8 +298,13 @@ pub async fn push_schema(
                 // `f_<field>` typed columns are created with the table (new) or
                 // added and backfilled just above (existing), so they already
                 // exist by this point. `to_tsvector(regconfig, text)` is
-                // immutable, so it is allowed in a STORED generated column.
+                // immutable, so it is allowed in a STORED generated column. The
+                // `regconfig` is the index's declared `language` (default
+                // `english`); the literal is format-validated in
+                // `schema::validate_structure` and existence-checked in
+                // `validate_search_languages`, so it is safe to interpolate.
                 let sv_col = pg_search_col(&index.name);
+                let regconfig = index.language.as_deref().unwrap_or("english");
                 let terms: Vec<String> = index
                     .fields
                     .iter()
@@ -259,7 +313,7 @@ pub async fn push_schema(
                 sqlx::query(&format!(
                     "ALTER TABLE \"{pg_schema_name}\".\"{table_ident}\" \
                      ADD COLUMN \"{sv_col}\" tsvector GENERATED ALWAYS AS \
-                     (to_tsvector('english', {})) STORED",
+                     (to_tsvector('{regconfig}'::regconfig, {})) STORED",
                     terms.join(" || ' ' || ")
                 ))
                 .execute(&mut *tx)

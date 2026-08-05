@@ -332,6 +332,11 @@ export interface IndexJson {
    * type as the query-time `filter()` terminal. Omitted when absent. Wire key is
    * `where` (Rust keyword ⇒ raw identifier on the server). */
   where?: FilterExpr;
+  /** Optional Postgres `regconfig` name (e.g. `"english"`, `"simple"`,
+   * `"spanish"`) selecting the FTS dictionary the server uses to tsvectorize
+   * this index's `fields`. Omitted on the wire when absent (the server default
+   * behaves as `english`). Search-only. */
+  language?: string;
 }
 
 /** Declarative document TTL (auto-expiry). `field` names a declared numeric
