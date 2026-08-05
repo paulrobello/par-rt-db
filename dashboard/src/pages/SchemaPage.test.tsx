@@ -47,6 +47,17 @@ const APPLIED_SCHEMA = {
   },
 };
 
+// A vector index carries its distance metric on `vector.metric` (ENH-007);
+// cosine is omitted on the wire, so a cosine index has no `metric` key.
+const VECTOR_SCHEMA = {
+  tables: {
+    docs: {
+      fields: { embedding: { type: "vector", dimensions: 4 } },
+      indexes: [{ name: "by_emb", fields: ["embedding"], vector: { dimensions: 4, metric: "l2" } }],
+    },
+  },
+};
+
 describe("SchemaPage", () => {
   beforeEach(() => {
     adminClientMock.getSchema.mockReset();
@@ -61,6 +72,26 @@ describe("SchemaPage", () => {
     expect(screen.getByText("name")).toBeInTheDocument();
     expect(screen.getByText(/string/)).toBeInTheDocument();
     expect(screen.getByText("by_name")).toBeInTheDocument();
+  });
+
+  it("renders a vector index with its declared distance metric", async () => {
+    adminClientMock.getSchema.mockResolvedValue(VECTOR_SCHEMA);
+    render(<SchemaPage />);
+    expect(await screen.findByText("by_emb")).toBeInTheDocument();
+    expect(screen.getByText("VEC·l2")).toBeInTheDocument();
+  });
+
+  it("defaults an unspecified vector index metric to cosine", async () => {
+    adminClientMock.getSchema.mockResolvedValue({
+      tables: {
+        docs: {
+          fields: { embedding: { type: "vector", dimensions: 4 } },
+          indexes: [{ name: "by_emb", fields: ["embedding"], vector: { dimensions: 4 } }],
+        },
+      },
+    });
+    render(<SchemaPage />);
+    expect(await screen.findByText("VEC·cosine")).toBeInTheDocument();
   });
 
   it("switches to push mode and previews an additive diff (added column)", async () => {

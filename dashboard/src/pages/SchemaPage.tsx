@@ -194,7 +194,7 @@ export function SchemaPage() {
                         {idx.search ? (
                           <span className={s.indexTag}>FTS</span>
                         ) : idx.vector ? (
-                          <span className={s.indexTag}>VEC</span>
+                          <span className={s.indexTag}>VEC·{idx.vector.metric ?? "cosine"}</span>
                         ) : null}
                         <span className={s.indexName}>{idx.name}</span>
                         <span className={s.indexFields}>({idx.fields.join(", ")})</span>
