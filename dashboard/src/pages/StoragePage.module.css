@@ -59,6 +59,20 @@
   min-width: 200px;
 }
 
+/* Per-row image-size selector for "copy URL" (ENH-014). Same tokens as the
+   database `.select` above, but auto-width so it fits inside row-actions. */
+.sizeSelect {
+  background: var(--inset);
+  color: var(--ink);
+  border: 1px solid var(--rule-strong);
+  border-radius: var(--r-1);
+  font-family: var(--mono);
+  font-size: var(--t-mono-sm);
+  padding: 6px var(--sp-2);
+  outline: none;
+  cursor: pointer;
+}
+
 .fileInput {
   font-family: var(--mono);
   font-size: var(--t-mono-sm);

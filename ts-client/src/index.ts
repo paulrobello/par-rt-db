@@ -54,7 +54,7 @@ export { projectOptimisticUpdate } from "./optimistic.js";
 export type { OptimisticProjection } from "./optimistic.js";
 export { retryOnPrecondition } from "./retry.js";
 export { encodeCursor, decodeCursor } from "./pagination.js";
-export { RtDbHttpClient } from "./http.js";
+export { RtDbHttpClient, appendImageParams } from "./http.js";
 export type { RtDbHttpClientOptions, UploadResult, FileMetadata, TransformOpts } from "./http.js";
 export { RtDbAdminClient } from "./admin.js";
 export type {

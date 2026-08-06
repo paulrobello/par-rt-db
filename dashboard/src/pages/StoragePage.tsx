@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { appendImageParams, type TransformOpts } from "@par-rt-db/client";
 import { Button, Placard, Spinner } from "../components/ui";
 import { useAdmin } from "../lib/admin";
 import { formatBytes } from "../lib/format";
@@ -8,6 +9,14 @@ import s from "./StoragePage.module.css";
 function timeLabel(ms: number): string {
   return new Date(ms).toLocaleString(undefined, { hour12: false });
 }
+
+type ImageSize = "orig" | "lg" | "md" | "sm";
+
+const SIZE_OPTS: Record<Exclude<ImageSize, "orig">, TransformOpts> = {
+  lg: { w: 1024, fit: "contain" },
+  md: { w: 512, fit: "contain" },
+  sm: { w: 128, fit: "cover" },
+};
 
 export function StoragePage() {
   const { client, databases } = useAdmin();
@@ -28,6 +37,11 @@ export function StoragePage() {
   const [confirmingDelete, setConfirmingDelete] = useState<string | null>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const copiedTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Image-transform size applied to "copy URL" outputs (ENH-014). Page-scoped —
+  // every row's selector mirrors the same value so an operator can batch-copy
+  // thumbnails at one size without re-selecting per row.
+  const [size, setSize] = useState<ImageSize>("orig");
 
   // Auto-select the first database once the list arrives.
   useEffect(() => {
@@ -80,7 +94,10 @@ export function StoragePage() {
 
   async function copyPublicUrl(file: FileMeta) {
     try {
-      await navigator.clipboard.writeText(`${window.location.origin}/storage/${file.id}`);
+      const base = `${window.location.origin}/storage/${file.id}`;
+      const opts = size === "orig" ? null : SIZE_OPTS[size];
+      const url = opts ? appendImageParams(base, opts) : base;
+      await navigator.clipboard.writeText(url);
       setCopiedId(file.id);
       if (copiedTimer.current) clearTimeout(copiedTimer.current);
       copiedTimer.current = setTimeout(() => setCopiedId(null), 1500);
@@ -179,6 +196,17 @@ export function StoragePage() {
                         <Button onClick={() => void copyPublicUrl(file)} disabled={busy}>
                           {copied ? "copied!" : "copy URL"}
                         </Button>
+                        <select
+                          className={s.sizeSelect}
+                          aria-label="image size"
+                          value={size}
+                          onChange={(e) => setSize(e.target.value as ImageSize)}
+                        >
+                          <option value="orig">original</option>
+                          <option value="lg">large 1024</option>
+                          <option value="md">medium 512</option>
+                          <option value="sm">small 128</option>
+                        </select>
                         {confirming ? (
                           <span className={s.confirmInline}>
                             <span className={s.confirmLabel}>delete?</span>

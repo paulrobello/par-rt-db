@@ -13,6 +13,16 @@ const adminClientMock = vi.hoisted(() => ({
   deleteFile: vi.fn(),
 }));
 
+// Mock the runtime export from @par-rt-db/client (added in ENH-014). The
+// dashboard imports `appendImageParams` to compose image-transform URLs; the
+// stub records the call and produces a `?w=` URL the copy path can write.
+const appendImageParamsMock = vi.hoisted(() =>
+  vi.fn((url: string, opts: { w?: number }) => `${url}?w=${opts.w ?? 0}`),
+);
+vi.mock("@par-rt-db/client", () => ({
+  appendImageParams: (url: string, opts: { w?: number }) => appendImageParamsMock(url, opts),
+}));
+
 vi.mock("../lib/admin", () => ({
   useAdmin: () => ({
     client: adminClientMock,
@@ -39,6 +49,9 @@ describe("StoragePage", () => {
   });
   afterEach(() => {
     vi.useRealTimers();
+    // mockClear (not mockReset): preserves the default impl set in the hoisted
+    // factory so the next test still gets a `?w=` URL when copy runs.
+    appendImageParamsMock.mockClear();
   });
 
   it("lists files for the selected database", async () => {
@@ -88,5 +101,62 @@ describe("StoragePage", () => {
     await waitFor(() => {
       expect(adminClientMock.uploadFile).toHaveBeenCalledWith("db1", file);
     });
+  });
+
+  it("renders a per-row image size selector", async () => {
+    adminClientMock.listFiles.mockResolvedValue([fileRow]);
+    render(<StoragePage />);
+    const row = (await screen.findByText("file0001")).closest("tr");
+    if (!row) throw new Error("row not found");
+    const select = within(row).getByRole("combobox", { name: /size/i });
+    expect(select).toBeInTheDocument();
+  });
+
+  it("applies an image transform to the copied URL when a size is chosen", async () => {
+    adminClientMock.listFiles.mockResolvedValue([fileRow]);
+    const user = userEvent.setup();
+    render(<StoragePage />);
+    const row = (await screen.findByText("file0001")).closest("tr");
+    if (!row) throw new Error("row not found");
+
+    const writeText = vi.fn<(text: string) => Promise<void>>().mockResolvedValue(undefined);
+    vi.spyOn(navigator, "clipboard", "get").mockReturnValue({ writeText } as never);
+
+    // Choose medium size — should map to { w: 512, fit: "contain" }.
+    await user.selectOptions(within(row).getByRole("combobox", { name: /size/i }), "md");
+    await user.click(within(row).getByRole("button", { name: "copy URL" }));
+
+    await waitFor(() => {
+      expect(appendImageParamsMock).toHaveBeenCalledWith(
+        `${window.location.origin}/storage/${fileRow.id}`,
+        { w: 512, fit: "contain" },
+      );
+    });
+    expect(writeText).toHaveBeenCalled();
+    const copied = writeText.mock.calls[0][0];
+    expect(copied).toContain("?w=");
+    expect(copied).toContain("w=512");
+
+    vi.restoreAllMocks();
+  });
+
+  it("copies the bare URL when size is original", async () => {
+    adminClientMock.listFiles.mockResolvedValue([fileRow]);
+    const user = userEvent.setup();
+    render(<StoragePage />);
+    const row = (await screen.findByText("file0001")).closest("tr");
+    if (!row) throw new Error("row not found");
+
+    const writeText = vi.fn<(text: string) => Promise<void>>().mockResolvedValue(undefined);
+    vi.spyOn(navigator, "clipboard", "get").mockReturnValue({ writeText } as never);
+
+    // Original is the default — no transform should be applied.
+    await user.click(within(row).getByRole("button", { name: "copy URL" }));
+    await waitFor(() => {
+      expect(writeText).toHaveBeenCalledWith(`${window.location.origin}/storage/${fileRow.id}`);
+    });
+    expect(appendImageParamsMock).not.toHaveBeenCalled();
+
+    vi.restoreAllMocks();
   });
 });
