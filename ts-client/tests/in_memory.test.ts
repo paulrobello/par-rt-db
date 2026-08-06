@@ -1,10 +1,20 @@
 import { describe, expect, it } from "vitest";
 import { RtDbError } from "../src/errors.js";
-import { evalFilterExpr, InMemoryRtDbClient, validateFilter } from "../src/in_memory.js";
+import {
+  evalFilterExpr,
+  InMemoryRtDbClient,
+  PresenceRooms,
+  validateFilter,
+} from "../src/in_memory.js";
 import { Migration } from "../src/migration.js";
 import { mutation } from "../src/mutation.js";
 import { decodeCursor, encodeCursor } from "../src/pagination.js";
-import type { FilterExpr, PaginatedResultJson, ScheduleInfo } from "../src/protocol.js";
+import type {
+  FilterExpr,
+  PaginatedResultJson,
+  PresenceMember,
+  ScheduleInfo,
+} from "../src/protocol.js";
 import { createApi, type RtQuery } from "../src/query.js";
 import { defineSchema, defineTable, t } from "../src/schema.js";
 
@@ -399,6 +409,88 @@ describe("InMemoryRtDbClient — subscribe", () => {
     unsub();
     await c.mutate(mutation().insert("items", { name: "c", status: "todo", order: 3 }).build());
     expect(updates).toEqual([0, 1]); // unsubscribed: no further updates
+  });
+});
+
+describe("InMemoryRtDbClient — presence", () => {
+  it("two clients sharing PresenceRooms see each other's cursor updates and leaves", () => {
+    const rooms = new PresenceRooms();
+    const alice = new InMemoryRtDbClient({
+      connectionId: "alice",
+      presenceUser: { kind: "user", email: "alice@example.com" },
+      presenceRooms: rooms,
+      now: () => 0,
+      random: () => 0,
+    });
+    const bob = new InMemoryRtDbClient({
+      connectionId: "bob",
+      presenceUser: { kind: "user", email: "bob@example.com" },
+      presenceRooms: rooms,
+      now: () => 0,
+      random: () => 0,
+    });
+
+    const aliceUpdates: PresenceMember[][] = [];
+    alice.presence("doc:1", { cursor: { x: 0, y: 0 } }, (m) => aliceUpdates.push(m));
+
+    // Alice's first snapshot lists just herself.
+    expect(aliceUpdates).toHaveLength(1);
+    expect(aliceUpdates[0]).toEqual([
+      {
+        connectionId: "alice",
+        user: { kind: "user", email: "alice@example.com" },
+        state: { cursor: { x: 0, y: 0 } },
+      },
+    ]);
+
+    // Bob joins; Alice's listener fires again with both members.
+    bob.presence("doc:1", { cursor: { x: 5, y: 5 } });
+    expect(aliceUpdates.at(-1)).toEqual([
+      {
+        connectionId: "alice",
+        user: { kind: "user", email: "alice@example.com" },
+        state: { cursor: { x: 0, y: 0 } },
+      },
+      {
+        connectionId: "bob",
+        user: { kind: "user", email: "bob@example.com" },
+        state: { cursor: { x: 5, y: 5 } },
+      },
+    ]);
+
+    // Alice moves her cursor; she sees her own updated state in the next snapshot.
+    alice.updatePresence("doc:1", { cursor: { x: 10, y: 10 } });
+    const aliceSelf = aliceUpdates.at(-1)?.find((m) => m.connectionId === "alice");
+    expect(aliceSelf?.state).toEqual({ cursor: { x: 10, y: 10 } });
+
+    // updatePresence on a room the client has not joined is a no-op (mirrors
+    // the live server, which would not relay for a non-member).
+    const beforeLen = aliceUpdates.length;
+    const carol = new InMemoryRtDbClient({ connectionId: "carol", presenceRooms: rooms });
+    carol.updatePresence("doc:1", { cursor: { x: 99 } });
+    expect(aliceUpdates).toHaveLength(beforeLen);
+
+    // Bob leaves; Alice's snapshot shrinks back to just herself.
+    bob.leavePresence("doc:1");
+    expect(aliceUpdates.at(-1)?.map((m) => m.connectionId)).toEqual(["alice"]);
+
+    // Unsub stops further fan-out to that listener.
+    const unsubLen = aliceUpdates.length;
+    alice.leavePresence("doc:1");
+    bob.presence("doc:1", { cursor: { x: 50 } });
+    expect(aliceUpdates).toHaveLength(unsubLen); // alice has left: no further updates
+  });
+
+  it("isolated clients see only themselves in their rooms", () => {
+    // No shared `presenceRooms`: each client gets a private PresenceRooms and
+    // therefore cannot observe peers. Mirrors the contract that the in-memory
+    // harness does not multiplex between independent clients by default.
+    const a = new InMemoryRtDbClient({ connectionId: "a" });
+    const b = new InMemoryRtDbClient({ connectionId: "b" });
+    const seen: PresenceMember[][] = [];
+    a.presence("doc:1", undefined, (m) => seen.push(m));
+    b.presence("doc:1", undefined);
+    expect(seen.at(-1)?.map((m) => m.connectionId)).toEqual(["a"]);
   });
 });
 

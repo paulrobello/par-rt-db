@@ -20,7 +20,9 @@ use crate::error::{ErrorCode, RtDbError};
 use crate::mutation::{StepResult, Transaction};
 use crate::optimistic::{OptimisticProjection, project_optimistic_update};
 use crate::query::Query;
-use crate::wire::{AuthedUser, ClientMessage, ScheduleInfo, ScheduleWhen, ServerMessage};
+use crate::wire::{
+    AuthedUser, ClientMessage, PresenceMember, ScheduleInfo, ScheduleWhen, ServerMessage,
+};
 
 #[cfg(test)]
 use crate::wire::{ScheduleKind, ScheduleStatus};
@@ -85,6 +87,20 @@ pub enum Snapshot {
     /// The latest authoritative result.
     Value(Box<serde_json::Value>),
     /// The subscription failed (e.g. malformed query); it will not recover.
+    Error(RtDbError),
+}
+
+/// One observable member-list for a presence room, delivered through a `watch`
+/// channel. Mirrors [`Snapshot`] for subscriptions: [`Pending`](Self::Pending)
+/// until the first `presenceSnapshot`, then the latest member list on each
+/// fan-out, or [`Error`](Self::Error) if the server rejects the join.
+#[derive(Debug, Clone)]
+pub enum PresenceSnapshot {
+    /// No `presenceSnapshot` has arrived yet (the receiver starts here).
+    Pending,
+    /// The latest member list from a `presenceSnapshot`.
+    Members(Vec<PresenceMember>),
+    /// The server rejected the join (e.g. presence not enabled).
     Error(RtDbError),
 }
 
@@ -155,6 +171,24 @@ struct SubMaps {
     by_key: HashMap<String, Arc<SubState>>,
     by_id: HashMap<String, String>,
     overlays: HashMap<String, HashSet<String>>,
+}
+
+/// One presence room, shared by every caller that joined it. `state` is the
+/// latest join/update state (so a reconnect replays with the freshest value);
+/// `tx` delivers [`PresenceSnapshot`]s to every live [`Presence`] handle.
+/// Guarded by its own mutex for interior mutability through the shared `Arc`.
+struct PresenceRoomState {
+    room: String,
+    state: Mutex<Option<serde_json::Value>>,
+    tx: watch::Sender<PresenceSnapshot>,
+}
+
+/// Per-client presence registry. One entry per joined room, keyed by room name
+/// (rooms are unique per client — one connection joins a room once). Mirrors how
+/// [`SubMaps`] holds one entry per query shape.
+#[derive(Default)]
+struct PresenceMaps {
+    by_room: HashMap<String, Arc<PresenceRoomState>>,
 }
 
 /// Reply channel for a mutation the caller is awaiting.
@@ -230,6 +264,22 @@ enum Cmd {
     /// A caller-initiated schedule/list/manage call with its reply channel.
     /// Boxed for the same reason as [`Cmd::Mutate`].
     Schedule(Box<QueuedSchedule>),
+    /// Join a presence room (bookkeeping already done; driver sends the wire
+    /// frame only after auth, mirroring `Cmd::Subscribe`). Idempotent within a
+    /// session — deduped via the `sent_rooms` set in the session loop.
+    PresenceJoin {
+        room: String,
+        state: Option<serde_json::Value>,
+    },
+    /// Update this connection's state in a joined room. Sent only while
+    /// authenticated; on a dropped session the cached state in
+    /// [`PresenceRoomState`] replays with the freshest value on the next join.
+    PresenceUpdate {
+        room: String,
+        state: serde_json::Value,
+    },
+    /// Leave a presence room (bookkeeping already cleared by the caller).
+    PresenceLeave { room: String },
     /// Tear the driver down.
     Shutdown,
 }
@@ -268,6 +318,9 @@ struct ClientInner {
     cmd_tx: mpsc::UnboundedSender<Cmd>,
     status_tx: watch::Sender<ClientStatus>,
     subs: Mutex<SubMaps>,
+    /// Joined presence rooms. The driver replays these on each (re)connect,
+    /// mirroring how it re-establishes subscriptions from `subs`.
+    presence: Mutex<PresenceMaps>,
     /// Bumped on every (re)open and on `close()`; async wakeups capture the value
     /// they were scheduled under and abort if it has advanced — the guard that
     /// keeps a stale token resolution from opening a duplicate socket.
@@ -366,6 +419,69 @@ impl Drop for Subscription {
     }
 }
 
+/// A presence-room handle returned by [`RtDbClient::presence`]. Each handle
+/// observes the room's member list through its own `watch` receiver. Dropping a
+/// handle stops listening but does NOT leave the room — call
+/// [`RtDbClient::leave_presence`] for that, mirroring the TS client where the
+/// returned unsubscribe only removes the listener and `leavePresence` is the
+/// explicit leave.
+pub struct Presence {
+    rx: watch::Receiver<PresenceSnapshot>,
+    room: String,
+}
+
+impl fmt::Debug for Presence {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Presence")
+            .field("room", &self.room)
+            .finish()
+    }
+}
+
+impl Presence {
+    /// The current snapshot without waiting.
+    pub fn snapshot(&self) -> PresenceSnapshot {
+        self.rx.borrow().clone()
+    }
+
+    /// The latest member list, or `Ok(None)` before the first `presenceSnapshot`.
+    pub fn members(&self) -> Result<Option<Vec<PresenceMember>>, RtDbError> {
+        match self.rx.borrow().clone() {
+            PresenceSnapshot::Pending => Ok(None),
+            PresenceSnapshot::Members(m) => Ok(Some(m)),
+            PresenceSnapshot::Error(e) => Err(e),
+        }
+    }
+
+    /// The room error if the server rejected the join; `None` otherwise.
+    pub fn error(&self) -> Option<RtDbError> {
+        match self.rx.borrow().clone() {
+            PresenceSnapshot::Error(e) => Some(e),
+            _ => None,
+        }
+    }
+
+    /// Wait for the next snapshot change. Resolves `Err` once the room (or the
+    /// client) is gone so a poll loop can terminate.
+    pub async fn changed(&mut self) -> Result<(), RtDbError> {
+        if self.rx.changed().await.is_err() {
+            return Err(RtDbError::internal("presence room closed"));
+        }
+        Ok(())
+    }
+}
+
+impl Clone for Presence {
+    /// Clone the handle — each clone gets its own watch receiver sharing the
+    /// same room membership.
+    fn clone(&self) -> Self {
+        Self {
+            rx: self.rx.clone(),
+            room: self.room.clone(),
+        }
+    }
+}
+
 impl RtDbClient {
     /// Connect to `<url>/sync`, authenticating to `db` with the token returned by
     /// `get_token` (called on every open/reconnect so a refreshed credential can be
@@ -397,6 +513,7 @@ impl RtDbClient {
             cmd_tx,
             status_tx,
             subs: Mutex::new(SubMaps::default()),
+            presence: Mutex::new(PresenceMaps::default()),
             generation: Arc::new(AtomicU64::new(0)),
             closed: Arc::new(AtomicBool::new(false)),
             sub_counter: AtomicU64::new(1),
@@ -494,6 +611,104 @@ impl RtDbClient {
             cmd_tx: self.inner.cmd_tx.clone(),
             query_id,
         }
+    }
+
+    /// Join presence room `room`, optionally with initial `state`. The first
+    /// `presenceSnapshot` (the server sends one on join listing current members)
+    /// resolves [`PresenceSnapshot::Pending`] → [`PresenceSnapshot::Members`].
+    ///
+    /// Synchronous: the [`watch`] receiver exists immediately, before the server
+    /// replies. Multiple joins to the same room share one wire membership (dedup
+    /// by room name); each call returns a fresh [`Presence`] handle. If the
+    /// connection is down, the join is registered and sent on the next successful
+    /// auth — same gate as [`subscribe`](Self::subscribe).
+    ///
+    /// Dropping the returned handle stops listening but does NOT leave the room;
+    /// call [`leave_presence`](Self::leave_presence) for that, mirroring the TS
+    /// client where the returned unsubscribe only removes the listener.
+    pub fn presence(&self, room: &str, state: Option<serde_json::Value>) -> Presence {
+        let (rx, is_new) = {
+            let mut maps = self
+                .inner
+                .presence
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if let Some(existing) = maps.by_room.get(room) {
+                // Refresh the cached join state so a reconnect replays with the
+                // latest value (mirrors the TS client's joinedRooms.set on join).
+                if let Some(s) = &state {
+                    *existing.state.lock().unwrap_or_else(|p| p.into_inner()) = Some(s.clone());
+                }
+                let rx = existing.tx.subscribe();
+                (rx, false)
+            } else {
+                let (tx, rx) = watch::channel(PresenceSnapshot::Pending);
+                let st = Arc::new(PresenceRoomState {
+                    room: room.to_string(),
+                    state: Mutex::new(state.clone()),
+                    tx,
+                });
+                maps.by_room.insert(room.to_string(), st);
+                (rx, true)
+            }
+        };
+        if is_new {
+            let _ = self.inner.cmd_tx.send(Cmd::PresenceJoin {
+                room: room.to_string(),
+                state,
+            });
+        }
+        Presence {
+            rx,
+            room: room.to_string(),
+        }
+    }
+
+    /// Broadcast updated `state` for this connection in `room`. The server fans
+    /// out a fresh `presenceSnapshot` to every member of the room. Also updates
+    /// the cached join state so a reconnect re-joins with the latest value. No-op
+    /// if this client has not joined `room` (mirrors the live server, which would
+    /// not relay an update from a non-member).
+    pub fn update_presence(&self, room: &str, state: serde_json::Value) {
+        let joined = {
+            let maps = self
+                .inner
+                .presence
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if let Some(existing) = maps.by_room.get(room) {
+                *existing.state.lock().unwrap_or_else(|p| p.into_inner()) = Some(state.clone());
+                true
+            } else {
+                false
+            }
+        };
+        if joined {
+            let _ = self.inner.cmd_tx.send(Cmd::PresenceUpdate {
+                room: room.to_string(),
+                state,
+            });
+        }
+    }
+
+    /// Leave presence room `room`: drops the local membership, so the driver
+    /// sends `{type:"leavePresence"}` when the last handle for the room is
+    /// dropped. Local state is cleared regardless of auth state so a buffered
+    /// pre-auth join does not replay after the caller has already left.
+    pub fn leave_presence(&self, room: &str) {
+        // Removing from the map means the driver's replay-at-session-start loop
+        // will skip this room, and a subsequent Cmd::PresenceLeave (from the
+        // handle's Drop) becomes a no-op (room already absent).
+        let _ = self
+            .inner
+            .presence
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .by_room
+            .remove(room);
+        let _ = self.inner.cmd_tx.send(Cmd::PresenceLeave {
+            room: room.to_string(),
+        });
     }
 
     /// Submit a transaction, resolving to one [`StepResult`] per step. Pass
@@ -886,6 +1101,38 @@ async fn run_session(
         }
     }
 
+    // Replay joined presence rooms, mirroring subscription replay above. Each
+    // (re)connect re-joins with the latest cached state — the server lost this
+    // connection's presence on disconnect, so a fresh `presence` frame is
+    // required (not `presenceState`).
+    let mut sent_rooms: HashSet<String> = HashSet::new();
+    let rooms_snapshot: Vec<(String, Option<serde_json::Value>)> = {
+        let maps = driver
+            .inner
+            .presence
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        maps.by_room
+            .values()
+            .map(|s| {
+                (
+                    s.room.clone(),
+                    s.state.lock().unwrap_or_else(|p| p.into_inner()).clone(),
+                )
+            })
+            .collect()
+    };
+    for (room, state) in &rooms_snapshot {
+        sent_rooms.insert(room.clone());
+        let frame = ClientMessage::Presence {
+            room: room.clone(),
+            state: state.clone(),
+        };
+        if send_text(&mut sink, &frame).await.is_err() {
+            return SessionOutcome::Reconnect;
+        }
+    }
+
     // Flush mutations queued while disconnected.
     while let Some(q) = unsent.pop_front() {
         match deliver_mutate(&mut sink, q, pending).await {
@@ -951,6 +1198,41 @@ async fn run_session(
                         Ok(()) => {}
                         Err(q) => {
                             unsent_schedules.push_back(q);
+                            return SessionOutcome::Reconnect;
+                        }
+                    }
+                }
+                Some(Cmd::PresenceJoin { room, state }) => {
+                    // Dedup within the session: the replay-at-session-start loop
+                    // may have already sent this room's join.
+                    if sent_rooms.insert(room.clone()) {
+                        let frame = ClientMessage::Presence { room, state };
+                        if send_text(&mut sink, &frame).await.is_err() {
+                            return SessionOutcome::Reconnect;
+                        }
+                    }
+                }
+                Some(Cmd::PresenceUpdate { room, state }) => {
+                    // Only relay if the room is joined on this session (it may
+                    // have been left while this cmd was queued, or the connection
+                    // dropped and the room was not re-joined).
+                    if sent_rooms.contains(&room) {
+                        let frame = ClientMessage::PresenceState { room, state };
+                        if send_text(&mut sink, &frame).await.is_err() {
+                            return SessionOutcome::Reconnect;
+                        }
+                    }
+                }
+                Some(Cmd::PresenceLeave { room }) => {
+                    // Only send leavePresence if this room was joined on this
+                    // session (via replay or a PresenceJoin cmd). A leave queued
+                    // while disconnected fires on the next session, but the room
+                    // is no longer in the map → no replay joined it →
+                    // `sent_rooms` doesn't contain it → skip, matching the TS
+                    // client's `if (authenticated) send(...)` gate.
+                    if sent_rooms.remove(&room) {
+                        let frame = ClientMessage::LeavePresence { room };
+                        if send_text(&mut sink, &frame).await.is_err() {
                             return SessionOutcome::Reconnect;
                         }
                     }
@@ -1163,6 +1445,25 @@ fn apply_server_message(
         } => {
             if let Some(reply) = pending_schedules.remove(&schedule_id) {
                 let _ = reply.send(Ok(ScheduleOutcome::List(schedules)));
+            }
+        }
+        ServerMessage::PresenceSnapshot { room, members } => {
+            // Per-room fan-out, mirroring how QueryUpdate routes to a per-id
+            // handler through the subs map. Anyone holding a Presence handle for
+            // this room observes the new member list via its watch receiver.
+            let maps = inner.presence.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(state) = maps.by_room.get(&room) {
+                let _ = state.tx.send(PresenceSnapshot::Members(members));
+            }
+        }
+        ServerMessage::PresenceErr { room, error } => {
+            // The server rejected the join (e.g. presence not enabled). Surface
+            // the error on the room's watch channel so a stale room doesn't keep
+            // accumulating snapshots the caller can no longer act on, mirroring
+            // the TS client which drops listeners on presenceErr.
+            let maps = inner.presence.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(state) = maps.by_room.get(&room) {
+                let _ = state.tx.send(PresenceSnapshot::Error(error));
             }
         }
         // Pong is handled by the session loop; AuthOk/AuthErr arrive only at the
@@ -1519,6 +1820,7 @@ mod tests {
             cmd_tx,
             status_tx,
             subs: Mutex::new(SubMaps::default()),
+            presence: Mutex::new(PresenceMaps::default()),
             generation: Arc::new(AtomicU64::new(0)),
             closed: Arc::new(AtomicBool::new(false)),
             sub_counter: AtomicU64::new(1),
@@ -1622,6 +1924,108 @@ mod tests {
         let err = rx_err.await.unwrap().unwrap_err();
         assert_eq!(err.code, ErrorCode::NotFound);
         assert!(pending.is_empty());
+    }
+
+    // ── presence routing ───────────────────────────────────────────────────
+    //
+    // Mirror how queryUpdate/SubscribeErr route to a per-id handler, but for
+    // presence: a presenceSnapshot fans out to the room's watch sender, and a
+    // presenceErr sets the Error state (mirrors the TS client dropping listeners).
+
+    /// Helper: build an inner with one seeded presence room and return the receiver.
+    fn rig_with_presence(room: &str) -> (Arc<ClientInner>, watch::Receiver<PresenceSnapshot>) {
+        let (inner, _) = rig_with_sub();
+        let (tx, rx) = watch::channel(PresenceSnapshot::Pending);
+        let state = Arc::new(PresenceRoomState {
+            room: room.to_string(),
+            state: Mutex::new(None),
+            tx,
+        });
+        inner
+            .presence
+            .lock()
+            .unwrap()
+            .by_room
+            .insert(room.to_string(), state);
+        (inner, rx)
+    }
+
+    fn presence_member(cid: &str) -> crate::wire::PresenceMember {
+        crate::wire::PresenceMember {
+            connection_id: cid.to_string(),
+            user: crate::wire::AuthedUser {
+                kind: crate::wire::UserKind::User,
+                email: None,
+                name: None,
+                github_login: None,
+                github_id: None,
+            },
+            state: json!({}),
+        }
+    }
+
+    #[test]
+    fn presence_snapshot_routes_to_room() {
+        let (inner, rx) = rig_with_presence("doc:1");
+        let mut pending = HashMap::new();
+        let mut pending_schedules: HashMap<String, SchedReply> = HashMap::new();
+        apply_server_message(
+            &inner,
+            ServerMessage::PresenceSnapshot {
+                room: "doc:1".into(),
+                members: vec![presence_member("c1"), presence_member("c2")],
+            },
+            &mut pending,
+            &mut pending_schedules,
+        );
+        match rx.borrow().clone() {
+            PresenceSnapshot::Members(m) => {
+                assert_eq!(m.len(), 2);
+                assert_eq!(m[0].connection_id, "c1");
+                assert_eq!(m[1].connection_id, "c2");
+            }
+            other => panic!("expected Members, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn presence_snapshot_ignored_for_unknown_room() {
+        let (inner, rx) = rig_with_presence("doc:1");
+        let mut pending = HashMap::new();
+        let mut pending_schedules: HashMap<String, SchedReply> = HashMap::new();
+        // A snapshot for a room we haven't joined should not affect our receiver.
+        apply_server_message(
+            &inner,
+            ServerMessage::PresenceSnapshot {
+                room: "doc:other".into(),
+                members: vec![presence_member("c9")],
+            },
+            &mut pending,
+            &mut pending_schedules,
+        );
+        assert!(matches!(rx.borrow().clone(), PresenceSnapshot::Pending));
+    }
+
+    #[test]
+    fn presence_err_routes_error_to_room() {
+        let (inner, rx) = rig_with_presence("doc:1");
+        let mut pending = HashMap::new();
+        let mut pending_schedules: HashMap<String, SchedReply> = HashMap::new();
+        apply_server_message(
+            &inner,
+            ServerMessage::PresenceErr {
+                room: "doc:1".into(),
+                error: RtDbError::new(ErrorCode::Forbidden, "presence not enabled"),
+            },
+            &mut pending,
+            &mut pending_schedules,
+        );
+        match rx.borrow().clone() {
+            PresenceSnapshot::Error(e) => {
+                assert_eq!(e.code, ErrorCode::Forbidden);
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
     }
 
     // ── optimistic-update wiring ───────────────────────────────────────────

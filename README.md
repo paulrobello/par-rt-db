@@ -530,6 +530,48 @@ The WS surface adds `schedule` / `cancelSchedule` / `pauseSchedule` /
 `scheduleOk` / `scheduleErr` / `scheduleAck` / `listSchedulesOk`. Authorization is
 re-run on every op, not just at connect.
 
+## Realtime presence
+
+For ephemeral "who is online right now" data — online indicators, cursors,
+typing — that doesn't fit durable document queries, par-rt-db ships a transient,
+in-memory presence layer over the existing `/sync` WebSocket. It is **opt-in**
+(`RTDB_PRESENCE_ENABLED=true`, default off), **not committer-bound, not durable,
+not persisted** (no document tables, no Postgres write — a sibling reactive
+surface to live queries), and **connection-bound**: each joined `/sync`
+connection is one presence session, and the open WS is itself the liveness
+signal (disconnect evicts; no app-level heartbeat). Joining a room makes a
+connection present *and* subscribes it to the member list in one act; broadcasts
+are coalesced by a process-wide flush task (`RTDB_PRESENCE_BROADCAST_INTERVAL_MS`,
+default 50 ms), and per-connection safeguards bound state size, room size, room
+count, and update rate. See FEATURE_MATRIX #25 and
+[`docs/superpowers/specs/2026-08-06-presence-design.md`](docs/superpowers/specs/2026-08-06-presence-design.md).
+
+```ts
+import { usePresence } from "@par-rt-db/client/react";
+
+function Cursors({ roomId }: { roomId: string }) {
+  // Joins on mount, re-renders on every presenceSnapshot, leaves on unmount.
+  const { members, updatePresence } = usePresence(roomId);
+  return (
+    <ul>
+      {members.map((m) => (
+        <li key={m.connectionId}>{m.user.email ?? m.user.kind}</li>
+      ))}
+    </ul>
+  );
+}
+// Broadcast local cursor/typing state from an event handler:
+//   updatePresence({ x: 120, y: 40, typing: true });
+```
+
+The TS client also exposes `RtDbClient.presence(room, state?, onSnapshot?)` /
+`updatePresence(room, state)` / `leavePresence(room)` for non-React callers; the
+Rust and Python reactive clients mirror them as `presence` / `update_presence` /
+`leave_presence`. The wire frames are `presence` / `updatePresence` /
+`leavePresence` (client) and `presenceSnapshot` / `presenceOk` / `presenceErr`
+(server). When presence is disabled, the WS frames reply with a
+`PRESENCE_DISABLED` `presenceErr`.
+
 ## Make targets
 
 Each `make` target spans **all five packages** (server, ts-client, rust-client,

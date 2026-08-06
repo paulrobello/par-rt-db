@@ -124,6 +124,13 @@ pub struct Metrics {
     image_transforms_miss_total: AtomicU64,
     image_transforms_error_total: AtomicU64,
     image_transform_bytes_total: AtomicU64,
+    // ---- Presence (ENH-015) ----
+    /// Total `presence/update` frames processed (one per inbound client update).
+    presence_updates_total: AtomicU64,
+    /// Total presence-state broadcasts fanned out to interested subscribers.
+    /// Incremented once per `flush_once` even when multiple peers receive it,
+    /// so it counts fan-out decisions, not delivered frames.
+    presence_broadcasts_total: AtomicU64,
     /// Current open `/sync` WebSocket connections (inc on auth, dec on close).
     ws_connections: AtomicI64,
     query_latency: Mutex<LatencySamples>,
@@ -185,6 +192,19 @@ impl Metrics {
     pub fn record_image_transform_error(&self) {
         self.image_transforms_error_total
             .fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn record_presence_update(&self) {
+        self.presence_updates_total.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn record_presence_broadcast(&self) {
+        self.presence_broadcasts_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn presence_updates_total(&self) -> u64 {
+        self.presence_updates_total.load(Ordering::Relaxed)
+    }
+    pub fn presence_broadcasts_total(&self) -> u64 {
+        self.presence_broadcasts_total.load(Ordering::Relaxed)
     }
     pub fn ws_connect(&self) {
         self.ws_connections.fetch_add(1, Ordering::Relaxed);
@@ -344,6 +364,8 @@ impl Metrics {
             image_transforms_miss_total: self.image_transforms_miss_total.load(Ordering::Relaxed),
             image_transforms_error_total: self.image_transforms_error_total.load(Ordering::Relaxed),
             image_transform_bytes_total: self.image_transform_bytes_total.load(Ordering::Relaxed),
+            presence_updates_total: self.presence_updates_total.load(Ordering::Relaxed),
+            presence_broadcasts_total: self.presence_broadcasts_total.load(Ordering::Relaxed),
             per_db_subs: self.per_db_subs_snapshot(),
         }
     }
@@ -385,6 +407,12 @@ pub struct MetricsSnapshot {
     /// Total bytes emitted by image transforms (miss path only; hits serve
     /// from the cache and aren't re-encoded).
     pub image_transform_bytes_total: u64,
+    /// Presence `presence/update` frames processed (ENH-015). Counted once per
+    /// inbound client update, before fan-out.
+    pub presence_updates_total: u64,
+    /// Presence-state broadcasts fanned out to interested subscribers
+    /// (ENH-015). One per `flush_once`, regardless of recipient count.
+    pub presence_broadcasts_total: u64,
     /// Per-database breakdown of the subscription-invalidation counters above
     /// (ENH-010). Empty until a `fan_out` records a decision; sorted by db.
     pub per_db_subs: Vec<DbSubCounterRow>,
@@ -495,6 +523,24 @@ pub fn render_prometheus(snap: &MetricsSnapshot, version: &str, git_commit: &str
         snap.image_transform_bytes_total
     ));
 
+    // Presence (ENH-015). Monotonic counters only; the live
+    // `presence_rooms`/`presence_sessions` gauges are deferred until the
+    // PresenceManager is wired into the snapshot builder (Task 7).
+    s.push_str("# HELP rtdb_presence_updates_total Inbound presence/update frames processed.\n");
+    s.push_str("# TYPE rtdb_presence_updates_total counter\n");
+    s.push_str(&format!(
+        "rtdb_presence_updates_total {}\n",
+        snap.presence_updates_total
+    ));
+    s.push_str(
+        "# HELP rtdb_presence_broadcasts_total Presence-state broadcasts fanned out to subscribers.\n",
+    );
+    s.push_str("# TYPE rtdb_presence_broadcasts_total counter\n");
+    s.push_str(&format!(
+        "rtdb_presence_broadcasts_total {}\n",
+        snap.presence_broadcasts_total
+    ));
+
     // Gauges — point-in-time process/runtime state.
     s.push_str("# HELP rtdb_ws_connections Current open /sync WebSocket connections.\n");
     s.push_str("# TYPE rtdb_ws_connections gauge\n");
@@ -557,6 +603,8 @@ mod tests {
             image_transforms_miss_total: 0,
             image_transforms_error_total: 0,
             image_transform_bytes_total: 0,
+            presence_updates_total: 0,
+            presence_broadcasts_total: 0,
             per_db_subs: Vec::new(),
         };
         let body = render_prometheus(&snap, "0.0.0", "abc");
@@ -599,6 +647,8 @@ mod tests {
             image_transforms_miss_total: 0,
             image_transforms_error_total: 0,
             image_transform_bytes_total: 0,
+            presence_updates_total: 0,
+            presence_broadcasts_total: 0,
             per_db_subs: Vec::new(),
         };
         let body = render_prometheus(&snap, "0.0.0", "abc");
@@ -730,5 +780,19 @@ mod tests {
         let p = s.percentiles();
         // len=1: rank(p) = ceil(p*1) - 1 = 0 for any p in (0, 1].
         assert_eq!((p.p50, p.p95, p.p99), (4242, 4242, 4242));
+    }
+
+    #[test]
+    fn presence_counters_record() {
+        // Assert via the public getters rather than `snapshot()` — the snapshot
+        // builder needs a PgPool + SubscriptionManager (heavyweight for a unit
+        // test), and coupling the test to its signature would break every time
+        // the builder's deps change.
+        let m = Metrics::default();
+        m.record_presence_update();
+        m.record_presence_update();
+        m.record_presence_broadcast();
+        assert_eq!(m.presence_updates_total(), 2);
+        assert_eq!(m.presence_broadcasts_total(), 1);
     }
 }

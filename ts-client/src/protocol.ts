@@ -274,6 +274,17 @@ export interface AuthedUser {
   githubId?: number | null;
 }
 
+/** One entry in a presence room's member list. Mirrors server
+ * `protocol::PresenceMember` byte-for-byte (camelCase). `connectionId` is the
+ * opaque, unique-per-session key; `user` carries display identity; `state` is
+ * an opaque client-supplied blob (always present on the wire — the server
+ * serializes `serde_json::Value` even when it is JSON `null`). */
+export interface PresenceMember {
+  connectionId: string;
+  user: AuthedUser;
+  state: unknown;
+}
+
 /** Client -> server WS vocabulary. Tags/fields match server `protocol::ClientMessage`. */
 export type ClientMessage =
   | { type: "auth"; token?: string; db: string }
@@ -285,6 +296,9 @@ export type ClientMessage =
   | { type: "pauseSchedule"; scheduleId: string; id: string }
   | { type: "resumeSchedule"; scheduleId: string; id: string }
   | { type: "listSchedules"; scheduleId: string }
+  | { type: "presence"; room: string; state?: unknown }
+  | { type: "presenceState"; room: string; state: unknown }
+  | { type: "leavePresence"; room: string }
   | { type: "ping" };
 
 /** Server -> client WS vocabulary. Tags/fields match server `protocol::ServerMessage`. */
@@ -299,6 +313,8 @@ export type ServerMessage =
   | { type: "scheduleErr"; scheduleId: string; error: RtDbErrorEnvelope }
   | { type: "scheduleAck"; scheduleId: string; ok: boolean; error?: RtDbErrorEnvelope }
   | { type: "listSchedulesOk"; scheduleId: string; schedules: ScheduleInfo[] }
+  | { type: "presenceSnapshot"; room: string; members: PresenceMember[] }
+  | { type: "presenceErr"; room: string; error: RtDbErrorEnvelope }
   | { type: "pong" };
 
 /** Mirrors server `schema::FieldType` (tag `type`). */

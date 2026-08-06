@@ -99,6 +99,23 @@ pub struct Config {
     pub image_cache_bytes: u64,         // RTDB_IMAGE_CACHE_BYTES, default 256 MiB
     pub image_concurrency: usize,       // RTDB_IMAGE_CONCURRENCY, default 4
     pub image_default_quality: u8,      // RTDB_IMAGE_DEFAULT_QUALITY, default 80
+    // ---- Presence (ENH-015) ----
+    // Boot-only operational knobs for realtime presence (not hot). Default-off
+    // master switch + caps consumed by `PresenceConfig::from_config` (Task 3).
+    /// RTDB_PRESENCE_ENABLED (default false). Master switch.
+    pub presence_enabled: bool,
+    /// RTDB_PRESENCE_MAX_STATE_BYTES (default 1024).
+    pub presence_max_state_bytes: usize,
+    /// RTDB_PRESENCE_MAX_ROOM_SIZE (default 100).
+    pub presence_max_room_size: usize,
+    /// RTDB_PRESENCE_MAX_ROOMS_PER_CONN (default 32).
+    pub presence_max_rooms_per_conn: usize,
+    /// RTDB_PRESENCE_MAX_ROOM_BYTES (default 256). Room-name length cap.
+    pub presence_max_room_bytes: usize,
+    /// RTDB_PRESENCE_BROADCAST_INTERVAL_MS (default 50). 0 = immediate.
+    pub presence_broadcast_interval_ms: u64,
+    /// RTDB_PRESENCE_UPDATE_LIMIT_PER_SEC (default 20).
+    pub presence_update_limit_per_sec: u32,
 }
 
 impl Config {
@@ -275,6 +292,46 @@ impl Config {
             Err(_) => 80,
         };
 
+        // Realtime presence (ENH-015). Default-off master switch (audit-log
+        // style) + numerics following the `ttl_batch` `.unwrap_or(default)` +
+        // `.max(1)` clamp idiom (a 0 size/count/limit would be unusable; a 0
+        // broadcast interval means "immediate", so it is NOT clamped).
+        let presence_enabled = matches!(
+            std::env::var("RTDB_PRESENCE_ENABLED")
+                .ok()
+                .map(|v| v.trim().to_ascii_lowercase()),
+            Some(ref s) if s == "true" || s == "1" || s == "yes"
+        );
+        let presence_max_state_bytes = std::env::var("RTDB_PRESENCE_MAX_STATE_BYTES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1024)
+            .max(1);
+        let presence_max_room_size = std::env::var("RTDB_PRESENCE_MAX_ROOM_SIZE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(100)
+            .max(1);
+        let presence_max_rooms_per_conn = std::env::var("RTDB_PRESENCE_MAX_ROOMS_PER_CONN")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(32)
+            .max(1);
+        let presence_max_room_bytes = std::env::var("RTDB_PRESENCE_MAX_ROOM_BYTES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(256)
+            .max(1);
+        let presence_broadcast_interval_ms = std::env::var("RTDB_PRESENCE_BROADCAST_INTERVAL_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(50);
+        let presence_update_limit_per_sec = std::env::var("RTDB_PRESENCE_UPDATE_LIMIT_PER_SEC")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(20)
+            .max(1);
+
         Ok(Self {
             port,
             database_url,
@@ -315,6 +372,13 @@ impl Config {
             image_cache_bytes,
             image_concurrency,
             image_default_quality,
+            presence_enabled,
+            presence_max_state_bytes,
+            presence_max_room_size,
+            presence_max_rooms_per_conn,
+            presence_max_room_bytes,
+            presence_broadcast_interval_ms,
+            presence_update_limit_per_sec,
         })
     }
 }
@@ -651,5 +715,64 @@ mod tests {
         assert!(hot.origins_valid());
         hot.allowed_origins.push("https://c.com\"".into());
         assert!(!hot.origins_valid());
+    }
+
+    /// `RTDB_PRESENCE_*` boot knobs: defaults when unset, env overrides honored.
+    /// `from_env` requires `RTDB_DATABASE_URL` and `RTDB_ADMIN_KEY`, so this test
+    /// sets them for its lifetime and restores them at the end. All `RTDB_PRESENCE_*`
+    /// vars are removed at the end so they don't leak into other lib tests.
+    #[test]
+    fn presence_env_defaults_and_overrides() {
+        // Rust 2024: env mutation is `unsafe` (not thread-safe in general). Within
+        // a single test binary where no other test reads these vars, this is sound.
+        unsafe {
+            // Seed the two required vars (save originals to restore at the end).
+            let saved_db = std::env::var("RTDB_DATABASE_URL").ok();
+            let saved_key = std::env::var("RTDB_ADMIN_KEY").ok();
+            std::env::set_var("RTDB_DATABASE_URL", "postgres://test");
+            std::env::set_var("RTDB_ADMIN_KEY", "test-key");
+
+            // Defaults (vars unset): enabled=false, sensible caps.
+            std::env::remove_var("RTDB_PRESENCE_ENABLED");
+            std::env::remove_var("RTDB_PRESENCE_MAX_STATE_BYTES");
+            std::env::remove_var("RTDB_PRESENCE_MAX_ROOM_SIZE");
+            std::env::remove_var("RTDB_PRESENCE_MAX_ROOMS_PER_CONN");
+            std::env::remove_var("RTDB_PRESENCE_MAX_ROOM_BYTES");
+            std::env::remove_var("RTDB_PRESENCE_BROADCAST_INTERVAL_MS");
+            std::env::remove_var("RTDB_PRESENCE_UPDATE_LIMIT_PER_SEC");
+            let c = Config::from_env().expect("from_env with required vars set");
+            assert!(!c.presence_enabled);
+            assert_eq!(c.presence_max_state_bytes, 1024);
+            assert_eq!(c.presence_max_room_size, 100);
+            assert_eq!(c.presence_max_rooms_per_conn, 32);
+            assert_eq!(c.presence_max_room_bytes, 256);
+            assert_eq!(c.presence_broadcast_interval_ms, 50);
+            assert_eq!(c.presence_update_limit_per_sec, 20);
+
+            // Overrides: the on/off switch accepts "true", and numerics parse.
+            std::env::set_var("RTDB_PRESENCE_ENABLED", "true");
+            std::env::set_var("RTDB_PRESENCE_MAX_ROOM_SIZE", "5");
+            let c = Config::from_env().expect("from_env with required vars set");
+            assert!(c.presence_enabled);
+            assert_eq!(c.presence_max_room_size, 5);
+
+            // Cleanup: remove presence vars (don't leak into other lib tests) and
+            // restore the required vars to their pre-test state.
+            std::env::remove_var("RTDB_PRESENCE_ENABLED");
+            std::env::remove_var("RTDB_PRESENCE_MAX_STATE_BYTES");
+            std::env::remove_var("RTDB_PRESENCE_MAX_ROOM_SIZE");
+            std::env::remove_var("RTDB_PRESENCE_MAX_ROOMS_PER_CONN");
+            std::env::remove_var("RTDB_PRESENCE_MAX_ROOM_BYTES");
+            std::env::remove_var("RTDB_PRESENCE_BROADCAST_INTERVAL_MS");
+            std::env::remove_var("RTDB_PRESENCE_UPDATE_LIMIT_PER_SEC");
+            match saved_db {
+                Some(v) => std::env::set_var("RTDB_DATABASE_URL", v),
+                None => std::env::remove_var("RTDB_DATABASE_URL"),
+            }
+            match saved_key {
+                Some(v) => std::env::set_var("RTDB_ADMIN_KEY", v),
+                None => std::env::remove_var("RTDB_ADMIN_KEY"),
+            }
+        }
     }
 }

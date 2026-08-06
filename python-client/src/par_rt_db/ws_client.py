@@ -27,13 +27,17 @@ from .optimistic import project as _project_optimistic
 from .query import _dump_query, _terminal_of, parse_result
 from .wire import (
     AuthedUser,
+    PresenceMember,
     ScheduleInfo,
     ScheduleWhen,
     ServerMessage,
     _ClientCancelSchedule,
+    _ClientLeavePresence,
     _ClientListSchedules,
     _ClientMutate,
     _ClientPauseSchedule,
+    _ClientPresence,
+    _ClientPresenceState,
     _ClientResumeSchedule,
     _ClientSchedule,
 )
@@ -153,6 +157,28 @@ class _SchedPending:
     sent: bool = False
 
 
+@dataclass
+class _PresenceRoom:
+    """Internal per-room presence state (ENH-015), shared by every ``Presence``
+    handle on that room. Mirrors ``_Sub``: ``cond`` wakes the async iterator;
+    ``members``/``error``/``version`` mutate under ``cond`` from the inbound
+    handlers. ``join_state`` is the latest state this connection advertised in
+    the room — the source of truth for reconnect replay (a ``presenceState``
+    update advances it so the replay carries the freshest value, not the stale
+    join value). ``handle_count`` is the live ``Presence`` handle count; a room
+    with no handles and no explicit ``leave_presence`` stays joined (parity with
+    ts-client/rust-client), but ``leave_presence`` clears it."""
+
+    room: str
+    join_state: Any | None = None
+    members: list[PresenceMember] | None = None
+    error: RtDbError | None = None
+    version: int = 0
+    closed: bool = False
+    handle_count: int = 0
+    cond: asyncio.Condition = field(default_factory=asyncio.Condition)
+
+
 class RtDbClient:
     """Reactive par-rt-db client.
 
@@ -207,6 +233,8 @@ class RtDbClient:
         # Reverse index (mut_id -> query_ids) for optimistic-overlay rollback;
         # only populated when ``optimistic_updates`` is on.
         self._overlays: dict[str, set[str]] = {}
+        # ENH-015 presence: one entry per joined room, keyed by room name.
+        self._presence_by_room: dict[str, _PresenceRoom] = {}
 
     def status(self) -> ClientStatus:
         return ClientStatus(self._state, self._user)
@@ -384,6 +412,10 @@ class RtDbClient:
             if not sp.sent:
                 await self._send(sp.frame)
                 sp.sent = True
+        # ENH-015: replay one join per joined room, using the latest join_state
+        # (a pre-auth update_presence advances it, so the replay stays fresh).
+        for room in list(self._presence_by_room):
+            await self._send(_presence_join_frame(room, self._presence_by_room[room].join_state))
 
     # --- dispatch (forward-compatible; Tasks 3-4 fill the maps) --------
 
@@ -401,6 +433,10 @@ class RtDbClient:
             self._on_mutate_err(msg)
         elif tag in ("scheduleOk", "scheduleErr", "scheduleAck", "listSchedulesOk"):
             self._on_sched(msg)
+        elif tag == "presenceSnapshot":
+            self._on_presence_snapshot(msg)
+        elif tag == "presenceErr":
+            self._on_presence_err(msg)
         # authOk/authErr are handled in _await_auth; unknown tags ignored.
 
     # --- subscriptions (Task 3) ----------------------------------------
@@ -586,6 +622,103 @@ class RtDbClient:
                 )
                 sp.future.set_exception(RtDbError.from_envelope(env))
 
+    # --- presence (ENH-015) -------------------------------------------
+    #
+    # Join a presence room, broadcast state updates, and leave. Mirrors how
+    # ``subscribe`` gates sends on the auth state: the join is recorded locally
+    # (in ``_presence_by_room``) and the wire frame is sent ONLY when CONNECTED.
+    # A pre-auth call buffers the join so ``_flush_on_auth`` replays it on the
+    # next ``authOk`` — exactly how ``_subs_by_id`` replays ``subscribe`` frames
+    # (parity with the ts-client fix, T10). One room = one connection-side join;
+    # multiple ``Presence`` handles on the same room share one ``_PresenceRoom``.
+
+    def presence(self, room: str, state: Any | None = None) -> Presence:
+        """Join presence room ``room`` with optional initial ``state`` and return
+        a :class:`Presence` handle. The first ``presenceSnapshot`` (the server
+        sends one on join) resolves the handle's ``current()`` from ``None``.
+
+        Identical rooms share one server-side join via handle count. The join is
+        sent only when authenticated; otherwise it buffers and ``_flush_on_auth``
+        replays it on ``authOk``. Handle ``.unsubscribe()`` only detaches the
+        listener; call :meth:`leave_presence` to actually leave the room.
+        """
+        rm = self._presence_by_room.get(room)
+        if rm is None:
+            rm = _PresenceRoom(room=room, join_state=state)
+            self._presence_by_room[room] = rm
+            if self._state is ConnectionState.CONNECTED:
+                asyncio.get_running_loop().create_task(
+                    self._send(_presence_join_frame(room, state))
+                )
+        rm.handle_count += 1
+        return Presence(self, rm)
+
+    def update_presence(self, room: str, state: Any) -> None:
+        """Broadcast updated ``state`` for this connection in ``room``. Also
+        advances the cached join state so a reconnect/``authOk`` replay carries
+        the latest value. The wire frame is sent ONLY when authenticated — a
+        pre-auth update just advances the cached state of the buffered join."""
+        rm = self._presence_by_room.get(room)
+        if rm is None:
+            return  # not joined — mirrors the live server ignoring a non-member
+        rm.join_state = state
+        if self._state is ConnectionState.CONNECTED:
+            frame = _ClientPresenceState(room=room, state=state).model_dump_json(by_alias=True)
+            asyncio.get_running_loop().create_task(self._send(frame))
+
+    def leave_presence(self, room: str) -> None:
+        """Leave presence room ``room``: drops local state and (when
+        authenticated) sends ``leavePresence``. Local state is cleared regardless
+        of auth so a buffered pre-auth join does not replay after the caller has
+        already left — parity with the ts-client fix (T10)."""
+        rm = self._presence_by_room.pop(room, None)
+        if rm is None:
+            return
+        rm.closed = True
+        self._notify_presence(rm)
+        if self._state is ConnectionState.CONNECTED:
+            asyncio.get_running_loop().create_task(
+                self._send(_ClientLeavePresence(room=room).model_dump_json(by_alias=True))
+            )
+
+    def _on_presence_snapshot(self, msg: Any) -> None:
+        rm = self._presence_by_room.get(msg.room)
+        if rm is None:
+            return
+        rm.members = list(msg.members)
+        rm.version += 1
+        self._notify_presence(rm)
+
+    def _on_presence_err(self, msg: Any) -> None:
+        rm = self._presence_by_room.get(msg.room)
+        if rm is None:
+            return
+        rm.error = RtDbError.from_envelope(msg.error.model_dump())
+        # The join is dead: drop it so a reconnect never re-sends it.
+        self._presence_by_room.pop(rm.room, None)
+        self._notify_presence(rm)
+
+    def _decref_presence(self, room: str) -> None:
+        """Drop one ``Presence`` handle on a room. Listener-only: the room stays
+        joined (and snapshots keep routing to remaining handles) until
+        ``leave_presence`` is called explicitly — parity with ts-client and
+        rust-client. The unsubscribed handle is closed via its own ``closed`` flag."""
+        rm = self._presence_by_room.get(room)
+        if rm is None:
+            return
+        rm.handle_count -= 1
+
+    @staticmethod
+    def _notify_presence(rm: _PresenceRoom) -> None:
+        """Wake any async iterator parked on ``rm.cond``."""
+
+        async def _wake() -> None:
+            async with rm.cond:
+                rm.cond.notify_all()
+
+        with contextlib.suppress(RuntimeError):
+            asyncio.get_running_loop().create_task(_wake())
+
     def _reject_inflight(self, reason: str) -> None:
         # Only in-flight (sent) entries die on a reconnectable drop; queued
         # entries survive so ``_flush_on_auth`` can resend them on reconnect.
@@ -727,8 +860,78 @@ class Subscription:
         return sub.value
 
 
+class Presence:
+    """A presence-room handle (ENH-015): latest member list (``current()``),
+    terminal error (``error()``), and an async iterator that yields each fresh
+    snapshot. Mirrors :class:`Subscription`'s shape.
+
+    ``unsubscribe()`` only detaches this listener — the room stays joined and
+    subsequent snapshots keep routing to remaining handles. Call
+    :meth:`RtDbClient.leave_presence` to actually leave the room (parity with
+    the ts-client and rust-client). Closing the async context manager
+    detaches the listener.
+    """
+
+    def __init__(self, client: RtDbClient, room: _PresenceRoom) -> None:
+        self._client = client
+        self._room = room
+        self._iter_version = 0
+        self._closed = False
+
+    def current(self) -> list[PresenceMember] | None:
+        """Latest member list, or ``None`` before the first ``presenceSnapshot``."""
+        return self._room.members
+
+    def error(self) -> RtDbError | None:
+        """The terminal error if ``presenceErr`` arrived, else ``None``."""
+        return self._room.error
+
+    def unsubscribe(self) -> None:
+        """Detach this listener; the room stays joined until ``leave_presence``."""
+        if self._closed:
+            return
+        self._closed = True
+        self._client._decref_presence(self._room.room)
+
+    async def __aenter__(self) -> Presence:
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        self.unsubscribe()
+
+    def __aiter__(self) -> Presence:
+        self._iter_version = 0
+        return self
+
+    async def __anext__(self) -> list[PresenceMember]:
+        room = self._room
+        if self._closed:
+            raise StopAsyncIteration
+        async with room.cond:
+            while (
+                not self._closed
+                and room.version <= self._iter_version
+                and room.error is None
+                and not room.closed
+            ):
+                await room.cond.wait()
+        if self._closed or room.closed:
+            raise StopAsyncIteration
+        if room.error is not None:
+            raise room.error
+        self._iter_version = room.version
+        # current() is non-None here because version advanced past 0.
+        return room.members or []
+
+
 def _tag(msg: Any) -> str:
     return getattr(msg, "type", "")
+
+
+def _presence_join_frame(room: str, state: Any | None) -> str:
+    """Serialize a ``{type:"presence", room, state?}`` join frame (``state``
+    omitted when ``None`` — the wire model's serializer drops it)."""
+    return _ClientPresence(room=room, state=state).model_dump_json(by_alias=True)
 
 
 def _reproject(sub: _Sub, overlaid: Any) -> Any:

@@ -104,6 +104,37 @@ should be idempotent. The in-memory test client (`InMemoryRtDbClient`) mirrors
 the store and exposes a timer-less `tick(nowMs?)` that fires due jobs
 synchronously in unit tests.
 
+## Realtime presence
+
+Ephemeral "who is online right now" data (online indicators, cursors, typing)
+that doesn't fit durable document queries uses the presence layer — opt-in on
+the server (`RTDB_PRESENCE_ENABLED=true`), in-memory, connection-bound (the open
+`/sync` WS *is* the liveness signal), and not committer-bound or persisted. The
+reactive client exposes `presence` / `updatePresence` / `leavePresence`, and the
+React hook `usePresence(room)` joins on mount, re-renders on every snapshot, and
+leaves on unmount:
+
+```tsx
+import { usePresence } from "@par-rt-db/client/react";
+
+function Cursors({ roomId }: { roomId: string }) {
+  const { members, updatePresence, leavePresence } = usePresence(roomId);
+  // members: PresenceMember[] — each carries { connectionId, user, state }
+  return (
+    <ul>
+      {members.map((m) => (
+        <li key={m.connectionId}>{m.user.email ?? m.user.kind}</li>
+      ))}
+    </ul>
+  );
+}
+// updatePresence({ x: 120, y: 40, typing: true }) broadcasts on the next flush.
+```
+
+`InMemoryRtDbClient` mirrors `PresenceRooms` so app-level presence flows are
+exercisable in unit tests with no network. See FEATURE_MATRIX #25 and the
+top-level [`README.md`](../README.md#realtime-presence).
+
 ## Schema migration
 
 Destructive/type-changing schema transformations (rename, type coercion, removal,

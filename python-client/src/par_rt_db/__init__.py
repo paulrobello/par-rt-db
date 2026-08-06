@@ -49,7 +49,7 @@ if TYPE_CHECKING:
     )
     from .aio_http_client import RtDbAsyncHttpClient
     from .http_client import RtDbHttpClient
-    from .ws_client import RtDbClient, Subscription
+    from .ws_client import Presence, RtDbClient, Subscription
 
 __all__ = [
     "Mutation",
@@ -72,6 +72,7 @@ __all__ = [
     "RtDbHttpClient",
     "RtDbClient",
     "Subscription",
+    "Presence",
     "RtDbAdminClient",
     "AsyncRtDbAdminClient",
     "MintedToken",
@@ -98,7 +99,7 @@ def __getattr__(name: str) -> Any:
         from . import http_client
 
         return http_client.RtDbHttpClient
-    if name in ("RtDbClient", "Subscription"):
+    if name in ("RtDbClient", "Subscription", "Presence"):
         from . import ws_client
 
         return getattr(ws_client, name)

@@ -6,6 +6,7 @@ import { projectOptimisticUpdate } from "./optimistic.js";
 import type {
   AuthedUser,
   ClientMessage,
+  PresenceMember,
   QueryJson,
   ScheduleInfo,
   ScheduleWhen,
@@ -139,6 +140,16 @@ export class RtDbClient {
   private readonly unsentSchedules: QueuedSchedule[] = [];
   private readonly authListeners = new Set<(state: AuthState, user: AuthedUser | null) => void>();
   private readonly connListeners = new Set<(state: ConnectionState) => void>();
+  /** Per-room presence callbacks. Inbound `presenceSnapshot` fans out to the
+   * registered set for `msg.room`, mirroring how `subsById` routes `queryUpdate`
+   * to per-`queryId` handlers. `leavePresence` drops the whole set (the server
+   * stops sending snapshots for that room once the connection has left). */
+  private readonly presenceListeners = new Map<string, Set<(members: PresenceMember[]) => void>>();
+  /** Joined rooms + their last state, so `flushOnAuth` can re-send every join
+   * after a reconnect/authOk — mirroring how `subsByKey` re-sends `subscribe`
+   * frames. A `leavePresence` removes the entry; an `updatePresence` updates
+   * the cached state so a reconnect re-joins with the latest, not the original. */
+  private readonly joinedRooms = new Map<string, unknown>();
   /** mutId → subscriptions whose last result this mutation optimistically overlaid. */
   private readonly optimisticOverlays = new Map<string, Set<Subscription>>();
   private readonly optimistic: boolean;
@@ -397,6 +408,79 @@ export class RtDbClient {
       db: this.options.db,
       token: this.token ?? "",
     });
+  }
+
+  // ---- presence -------------------------------------------------------------
+
+  /**
+   * Joins presence room `room`, optionally with initial `state`. When `onUpdate`
+   * is supplied, it fires on every inbound `presenceSnapshot` for this room
+   * (including the first one the server sends on join, which lists the current
+   * members). Returns an unsubscribe that stops listening but does NOT leave
+   * the room — call `leavePresence(room)` for that. Mirrors `subscribe`'s
+   * send + register pattern, keyed by `room` instead of `queryId`.
+   *
+   * The join is recorded in `joinedRooms` and the wire frame is sent ONLY when
+   * authenticated — same gate as `subscribe`. A pre-auth call buffers the join,
+   * and `flushOnAuth` replays it on authOk (exactly how `subsByKey` replays
+   * `subscribe` frames), so a direct caller doing `connect(); presence(...)`
+   * sends exactly one join, not two.
+   */
+  presence(
+    room: string,
+    state?: unknown,
+    onUpdate?: (members: PresenceMember[]) => void,
+  ): () => void {
+    this.joinedRooms.set(room, state);
+    if (onUpdate) {
+      let set = this.presenceListeners.get(room);
+      if (!set) {
+        set = new Set();
+        this.presenceListeners.set(room, set);
+      }
+      set.add(onUpdate);
+    }
+    if (this.authState === "authenticated") {
+      this.send({ type: "presence", room, state });
+    }
+    return () => {
+      const set = this.presenceListeners.get(room);
+      if (!set) {
+        return;
+      }
+      set.delete(onUpdate as (members: PresenceMember[]) => void);
+      if (set.size === 0) {
+        this.presenceListeners.delete(room);
+      }
+    };
+  }
+
+  /** Broadcasts updated `state` for the current connection in `room`. The
+   * server fans out a fresh `presenceSnapshot` to every member of the room.
+   * Also updates the cached join state so a reconnect re-joins with the latest.
+   * No-op on the wire when not authenticated — without a join the server has
+   * no member to update — but still updates `joinedRooms` so the buffered join
+   * (if any) replays with the latest state on authOk. */
+  updatePresence(room: string, state: unknown): void {
+    if (this.joinedRooms.has(room)) {
+      this.joinedRooms.set(room, state);
+    }
+    if (this.authState === "authenticated") {
+      this.send({ type: "presenceState", room, state });
+    }
+  }
+
+  /** Leaves presence room `room`. Drops local listeners for this room (the
+   * server stops sending snapshots once the connection has left). Local state
+   * (`joinedRooms`, listeners) is cleared regardless of auth state so a
+   * buffered pre-auth join does not replay after the caller has already left;
+   * the wire frame is sent ONLY when authenticated. */
+  leavePresence(room: string): void {
+    this.joinedRooms.delete(room);
+    this.presenceListeners.delete(room);
+    if (this.authState === "authenticated") {
+      this.send({ type: "leavePresence", room });
+    }
   }
 
   /** Mints a `sch-${n}` correlation id and either dispatches (when authenticated)
@@ -677,6 +761,24 @@ export class RtDbClient {
         pending?.resolve(msg.schedules);
         break;
       }
+      case "presenceSnapshot": {
+        // Per-room fan-out, mirroring how `queryUpdate` routes to per-`queryId`
+        // handlers via `subsById`.
+        const set = this.presenceListeners.get(msg.room);
+        if (set) {
+          for (const fn of set) {
+            fn(msg.members);
+          }
+        }
+        break;
+      }
+      case "presenceErr": {
+        // The server rejected the join (e.g. presence not enabled). Drop local
+        // listeners so a stale room doesn't keep accumulating snapshots the
+        // caller can no longer act on.
+        this.presenceListeners.delete(msg.room);
+        break;
+      }
       case "pong":
         this.lastPongAt = this.now();
         break;
@@ -686,6 +788,10 @@ export class RtDbClient {
   private flushOnAuth(): void {
     for (const sub of this.subsByKey.values()) {
       this.send({ type: "subscribe", queryId: sub.queryId, query: sub.query });
+    }
+    // Replay buffered presence joins, mirroring subscription replay above.
+    for (const [room, state] of this.joinedRooms) {
+      this.send({ type: "presence", room, state });
     }
     const queued = this.unsentMutates.splice(0);
     for (const entry of queued) {

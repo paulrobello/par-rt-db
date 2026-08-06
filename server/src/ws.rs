@@ -186,6 +186,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, headers: Hea
     }
 
     state.realtime.subs.remove_conn(&db, conn_id).await;
+    state.realtime.presence.remove_conn(&db, conn_id).await;
     state.runtime.metrics.ws_disconnect();
 }
 
@@ -571,6 +572,64 @@ async fn handle_text_frame(
                 Err(error) => ServerMessage::ScheduleErr { schedule_id, error },
             };
             let _ = out_tx.send(reply);
+            false
+        }
+        // ENH-015 presence frames. Join re-runs `is_admin` + `authorize`
+        // (SEC-004 parity: revocation takes effect on open connections) and
+        // captures `authed_user(principal)` here — the load-bearing
+        // identity-capture point (the full `Principal` lives only at the WS
+        // layer; downstream code sees `PrincipalCtx` with no display identity).
+        // `PresenceState`/`LeavePresence` do NOT re-run `authorize`: membership
+        // implies prior auth, and keeping cursor updates off Postgres is a
+        // stated design rule. Presence is not routed through the committer and
+        // is not gated by the token/db RPM limiter.
+        ClientMessage::Presence {
+            room,
+            state: presence_state,
+        } => {
+            let admin = is_admin(&state.pool, principal).await;
+            let authed = if admin {
+                Ok(())
+            } else {
+                authorize(&state.pool, principal, db).await
+            };
+            if let Err(error) = authed {
+                let _ = out_tx.send(ServerMessage::PresenceErr { room, error });
+                return false;
+            }
+            let user = authed_user(principal);
+            match state
+                .realtime
+                .presence
+                .join(db, conn_id, &room, presence_state, user, out_tx.clone())
+                .await
+            {
+                Ok(()) => state.runtime.metrics.record_presence_update(),
+                Err(error) => {
+                    let _ = out_tx.send(ServerMessage::PresenceErr { room, error });
+                }
+            }
+            false
+        }
+        ClientMessage::PresenceState {
+            room,
+            state: presence_state,
+        } => {
+            match state
+                .realtime
+                .presence
+                .update_state(db, conn_id, &room, presence_state)
+                .await
+            {
+                Ok(()) => state.runtime.metrics.record_presence_update(),
+                Err(error) => {
+                    let _ = out_tx.send(ServerMessage::PresenceErr { room, error });
+                }
+            }
+            false
+        }
+        ClientMessage::LeavePresence { room } => {
+            state.realtime.presence.leave(db, conn_id, &room).await;
             false
         }
     }

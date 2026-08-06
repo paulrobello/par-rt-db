@@ -50,7 +50,8 @@ use crate::mutation::{Step, StepResult, Transaction};
 use crate::query::{Order, Query};
 use crate::schema::{FieldType, IndexDef, SchemaDef, TableDef, is_widening_of};
 use crate::wire::{
-    AggregateOp, FilterExpr, ScheduleInfo, ScheduleKind, ScheduleStatus, ScheduleWhen,
+    AggregateOp, AuthedUser, FilterExpr, PresenceMember, ScheduleInfo, ScheduleKind,
+    ScheduleStatus, ScheduleWhen,
 };
 
 /// Maximum number of steps in a single transaction (mirrors the server cap).
@@ -169,6 +170,154 @@ impl Drop for SubscriptionHandle {
     }
 }
 
+/// Shared in-memory presence backing: a `room → connectionId → member` map with
+/// a per-room subscriber list. Two [`InMemoryRtDbClient`]s that share a
+/// `PresenceRooms` instance see each other's joins/updates/leaves fan out,
+/// approximating the server's per-db presence registry for tests (one client,
+/// one connection — exactly like the live server's per-ConnId keying). A client
+/// with no `presence_rooms` option gets a private instance and only ever sees
+/// itself in its rooms.
+///
+/// Ports `PresenceRooms` from `ts-client/src/in_memory.ts`. Mirrors the existing
+/// harness pattern of `notify_subs(write_set)` fanning a recomputed snapshot to
+/// every local subscriber after a write, including the `Arc<AtomicBool>` alive
+/// flag that lets a dropped handle lazily unregister its callback.
+#[derive(Default)]
+pub struct PresenceRooms {
+    /// `room → connectionId → member`. Inner vec preserves insertion order so
+    /// `snapshot` returns members in join order (matching the TS `Map` iteration
+    /// semantics).
+    members: HashMap<String, Vec<(String, PresenceMember)>>,
+    /// `room → list of (alive, callback)`. The alive flag is cleared by
+    /// [`PresenceHandle`]'s Drop; fan_out skips and lazily compacts dead entries
+    /// — the same pattern as [`InMemoryRtDbClient::notify_subs`].
+    subs: HashMap<String, Vec<PresenceListener>>,
+}
+
+/// One registered presence callback + its alive flag.
+struct PresenceListener {
+    alive: Arc<AtomicBool>,
+    callback: Arc<dyn Fn(Vec<PresenceMember>) + Send + Sync>,
+}
+
+/// Handle returned by [`PresenceRooms::subscribe`]. Dropping it (or calling
+/// [`unsubscribe`](Self::unsubscribe)) clears the callback so no further fan-outs
+/// fire — matching the TS `() => unsub()` contract. Mirrors [`SubscriptionHandle`].
+#[derive(Clone)]
+pub struct PresenceHandle {
+    alive: Arc<AtomicBool>,
+}
+
+impl PresenceHandle {
+    /// Detach the listener; equivalent to dropping the handle.
+    pub fn unsubscribe(self) {
+        self.alive.store(false, Ordering::SeqCst);
+    }
+}
+
+impl Drop for PresenceHandle {
+    fn drop(&mut self) {
+        self.alive.store(false, Ordering::SeqCst);
+    }
+}
+
+impl PresenceRooms {
+    /// Returns a stable-order snapshot of `room`'s current members (join order).
+    pub fn snapshot(&self, room: &str) -> Vec<PresenceMember> {
+        self.members
+            .get(room)
+            .map(|entries| entries.iter().map(|(_, m)| m.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    /// Adds or replaces `member` in `room` and fans out a fresh snapshot.
+    pub fn join(&mut self, room: &str, member: PresenceMember) {
+        let entries = self.members.entry(room.to_string()).or_default();
+        if let Some((_, existing)) = entries
+            .iter_mut()
+            .find(|(id, _)| *id == member.connection_id)
+        {
+            *existing = member;
+        } else {
+            entries.push((member.connection_id.clone(), member));
+        }
+        self.fan_out(room);
+    }
+
+    /// Updates `connection_id`'s state in `room` and fans out. No-op if the
+    /// connection is not in the room (matches the live server, which would not
+    /// relay an update for a non-member).
+    pub fn update(&mut self, room: &str, connection_id: &str, state: Value) {
+        let Some(entries) = self.members.get_mut(room) else {
+            return;
+        };
+        let Some((_, member)) = entries.iter_mut().find(|(id, _)| id == connection_id) else {
+            return;
+        };
+        member.state = state;
+        self.fan_out(room);
+    }
+
+    /// Removes `connection_id` from `room` and fans out. No-op if absent.
+    pub fn leave(&mut self, room: &str, connection_id: &str) {
+        let Some(entries) = self.members.get_mut(room) else {
+            return;
+        };
+        let before = entries.len();
+        entries.retain(|(id, _)| id != connection_id);
+        if entries.len() == before {
+            return; // was not a member — no fan-out
+        }
+        if entries.is_empty() {
+            self.members.remove(room);
+        }
+        self.fan_out(room);
+    }
+
+    /// Registers `cb` for `room` snapshots and immediately fires it with the
+    /// current snapshot (mirroring the server's first `presenceSnapshot` on
+    /// join). Returns a [`PresenceHandle`] whose Drop clears the callback.
+    pub fn subscribe<F>(&mut self, room: &str, cb: F) -> PresenceHandle
+    where
+        F: Fn(Vec<PresenceMember>) + Send + Sync + 'static,
+    {
+        let alive = Arc::new(AtomicBool::new(true));
+        let callback: Arc<dyn Fn(Vec<PresenceMember>) + Send + Sync> = Arc::new(cb);
+        let initial = self.snapshot(room);
+        self.subs
+            .entry(room.to_string())
+            .or_default()
+            .push(PresenceListener {
+                alive: alive.clone(),
+                callback: callback.clone(),
+            });
+        callback(initial);
+        PresenceHandle { alive }
+    }
+
+    /// Re-snapshots `room` and fires every live callback. Lazily compacts dead
+    /// listeners (handle dropped → alive=false), mirroring `notify_subs`.
+    fn fan_out(&mut self, room: &str) {
+        let snap = self.snapshot(room);
+        let mut fires: Vec<Arc<dyn Fn(Vec<PresenceMember>) + Send + Sync>> = Vec::new();
+        if let Some(listeners) = self.subs.get_mut(room) {
+            // Collect live callbacks, then compact.
+            for l in listeners.iter() {
+                if l.alive.load(Ordering::SeqCst) {
+                    fires.push(l.callback.clone());
+                }
+            }
+            listeners.retain(|l| l.alive.load(Ordering::SeqCst));
+            if listeners.is_empty() {
+                self.subs.remove(room);
+            }
+        }
+        for cb in fires {
+            cb(snap.clone());
+        }
+    }
+}
+
 /// Injectable clock and RNG for deterministic id minting and `_creationTime`.
 ///
 /// Mirrors `InMemoryRtDbClientOptions` in `ts-client/src/in_memory.ts:91-96`.
@@ -179,6 +328,16 @@ impl Drop for SubscriptionHandle {
 pub struct InMemoryRtDbClientOptions {
     now: Option<Arc<dyn Fn() -> i64 + Send + Sync>>,
     random: Option<Arc<dyn Fn() -> f64 + Send + Sync>>,
+    /// Stable identity for this client in presence rooms. Auto-generated as a
+    /// `c{N}` counter when not set (mirrors the TS harness default).
+    connection_id: Option<String>,
+    /// Display identity stamped on this client's presence entries. Defaults to
+    /// `{ kind: User }` (a nameless user) when not set.
+    presence_user: Option<AuthedUser>,
+    /// Optional shared presence backing. Two clients that pass the same
+    /// `PresenceRooms` instance see each other's joins/updates/leaves; a client
+    /// with no `presence_rooms` gets a private instance and sees only itself.
+    presence_rooms: Option<Arc<Mutex<PresenceRooms>>>,
 }
 
 impl InMemoryRtDbClientOptions {
@@ -191,6 +350,23 @@ impl InMemoryRtDbClientOptions {
     /// Inject an RNG in `[0, 1)` for deterministic id minting.
     pub fn random(mut self, f: impl Fn() -> f64 + Send + Sync + 'static) -> Self {
         self.random = Some(Arc::new(f));
+        self
+    }
+    /// Set this client's stable identity in presence rooms.
+    pub fn connection_id(mut self, id: impl Into<String>) -> Self {
+        self.connection_id = Some(id.into());
+        self
+    }
+    /// Set the display identity stamped on this client's presence entries.
+    pub fn presence_user(mut self, user: AuthedUser) -> Self {
+        self.presence_user = Some(user);
+        self
+    }
+    /// Share a presence backing so two clients see each other's joins/leaves.
+    /// The caller mints one with [`PresenceRooms::default`] and passes a clone
+    /// of `Arc::new(Mutex::new(rooms))` to each client.
+    pub fn presence_rooms(mut self, rooms: Arc<Mutex<PresenceRooms>>) -> Self {
+        self.presence_rooms = Some(rooms);
         self
     }
 }
@@ -223,6 +399,19 @@ pub struct InMemoryRtDbClient {
     /// Storage stub: per-id blobs with their bytes, content-type, creation
     /// time, and SHA-256. Mirrors the TS `files: Map<...>`.
     storage: HashMap<String, StoredBlob>,
+    /// Shared presence backing. Wrapped in `Arc<Mutex>` so two clients that
+    /// pass the same instance see each other's joins/leaves.
+    presence_rooms: Arc<Mutex<PresenceRooms>>,
+    /// Display identity stamped on this client's presence entries.
+    presence_user: AuthedUser,
+    /// This client's stable identity in presence rooms. Generated as a `c{N}`
+    /// counter when not injected.
+    connection_id: String,
+    /// Rooms this client has joined (for `update_presence`/`leave_presence`).
+    joined_rooms: BTreeSet<String>,
+    /// Unsubscribe handles for presence callbacks this client registered, keyed
+    /// by room. Tracked so `leave_presence` can drop every local subscriber.
+    presence_unsubs: HashMap<String, Vec<PresenceHandle>>,
 }
 
 impl InMemoryRtDbClient {
@@ -230,6 +419,11 @@ impl InMemoryRtDbClient {
     /// the system clock and a constant `0.5` respectively; tests that need
     /// deterministic ids/timestamps should always inject both.
     pub fn new(options: InMemoryRtDbClientOptions) -> Self {
+        let mut id_counter = 0u64;
+        let connection_id = options.connection_id.unwrap_or_else(|| {
+            id_counter += 1;
+            format!("c{id_counter}")
+        });
         Self {
             now: options.now.unwrap_or_else(|| {
                 Arc::new(|| {
@@ -243,11 +437,24 @@ impl InMemoryRtDbClient {
             schema: None,
             tables: HashMap::new(),
             docs: HashMap::new(),
-            id_counter: 0,
+            id_counter,
             idempotency: HashMap::new(),
             schedules: Vec::new(),
             subscribers: Vec::new(),
             storage: HashMap::new(),
+            presence_rooms: options
+                .presence_rooms
+                .unwrap_or_else(|| Arc::new(Mutex::new(PresenceRooms::default()))),
+            presence_user: options.presence_user.unwrap_or(AuthedUser {
+                kind: crate::wire::UserKind::User,
+                email: None,
+                name: None,
+                github_login: None,
+                github_id: None,
+            }),
+            connection_id,
+            joined_rooms: BTreeSet::new(),
+            presence_unsubs: HashMap::new(),
         }
     }
 
@@ -1916,6 +2123,83 @@ impl InMemoryRtDbClient {
         for (callback, value) in fires {
             callback(value);
         }
+    }
+
+    // ---- presence ---------------------------------------------------------
+    //
+    // Ports `presence`/`updatePresence`/`leavePresence`
+    // (`ts-client/src/in_memory.ts:1217-1285`). Backed by [`PresenceRooms`],
+    // which approximates the server's per-db presence registry: one client =
+    // one connection, keyed by `connectionId`. Two clients sharing the same
+    // `PresenceRooms` instance see each other's joins/updates/leaves fan out.
+
+    /// Joins presence room `room` with optional initial `state`, mirroring the
+    /// reactive client's [`presence`](crate::ws::RtDbClient::presence). The
+    /// `on_update` callback fires with the current member list on join and again
+    /// on every local mutation (a peer's join/update/leave on a shared
+    /// [`PresenceRooms`]).
+    ///
+    /// Returns a [`PresenceHandle`] whose Drop stops listening but does NOT leave
+    /// the room — call [`leave_presence`](Self::leave_presence) for that,
+    /// mirroring the TS harness and the reactive client.
+    pub fn presence<F>(&mut self, room: &str, state: Option<Value>, on_update: F) -> PresenceHandle
+    where
+        F: Fn(Vec<PresenceMember>) + Send + Sync + 'static,
+    {
+        self.joined_rooms.insert(room.to_string());
+        let member = PresenceMember {
+            connection_id: self.connection_id.clone(),
+            user: self.presence_user.clone(),
+            state: state.unwrap_or(Value::Null),
+        };
+        // Join first, then subscribe — the TS harness calls `join` before
+        // `subscribe` so the initial snapshot (fired synchronously inside
+        // `subscribe`) already includes this connection.
+        let handle = {
+            let mut rooms = self
+                .presence_rooms
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            rooms.join(room, member);
+            rooms.subscribe(room, on_update)
+        };
+        // Track the handle so `leave_presence` can drop every local subscriber
+        // for this room (the TS harness tracks an array of unsubs per room).
+        self.presence_unsubs
+            .entry(room.to_string())
+            .or_default()
+            .push(handle.clone());
+        handle
+    }
+
+    /// Broadcasts updated `state` for this connection in `room`. No-op if this
+    /// client has not joined `room` (mirrors the live server, which would not
+    /// relay an update from a non-member).
+    pub fn update_presence(&mut self, room: &str, state: Value) {
+        if !self.joined_rooms.contains(room) {
+            return;
+        }
+        self.presence_rooms
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .update(room, &self.connection_id, state);
+    }
+
+    /// Leaves `room`: removes this connection from the member list, drops every
+    /// local subscriber this client registered for that room, and fans out a
+    /// fresh snapshot to remaining subscribers.
+    pub fn leave_presence(&mut self, room: &str) {
+        if !self.joined_rooms.remove(room) {
+            return;
+        }
+        // Drop every local subscriber this client registered for this room.
+        if let Some(handles) = self.presence_unsubs.remove(room) {
+            drop(handles);
+        }
+        self.presence_rooms
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .leave(room, &self.connection_id);
     }
 
     // ---- schedules --------------------------------------------------------
@@ -7390,5 +7674,141 @@ mod tests {
                 .contains("unique index 'by_email_active' violated"),
             "got: {err}"
         );
+    }
+
+    // ---- presence ----------------------------------------------------------
+    //
+    // Ports the presence surface of `ts-client/src/in_memory.ts:1217-1285`.
+    // A private PresenceRooms sees only self; a shared backing lets two clients
+    // see each other's joins/updates/leaves — approximating the server's
+    // per-connection registry for tests.
+
+    fn new_presence_client(conn: &str, rooms: Arc<Mutex<PresenceRooms>>) -> InMemoryRtDbClient {
+        InMemoryRtDbClient::new(
+            InMemoryRtDbClientOptions::default()
+                .connection_id(conn)
+                .presence_user(AuthedUser {
+                    kind: crate::wire::UserKind::User,
+                    email: Some(format!("{conn}@x.com")),
+                    name: None,
+                    github_login: None,
+                    github_id: None,
+                })
+                .presence_rooms(rooms),
+        )
+    }
+
+    #[tokio::test]
+    async fn presence_join_fires_initial_snapshot_with_self() {
+        // Brief: join a room; callback fires immediately with a one-member
+        // snapshot (the joining connection itself).
+        let mut c =
+            InMemoryRtDbClient::new(InMemoryRtDbClientOptions::default().connection_id("c1"));
+        let snaps: Arc<Mutex<Vec<Vec<PresenceMember>>>> = Arc::new(Mutex::new(Vec::new()));
+        let snaps_clone = snaps.clone();
+        let _h = c.presence("doc:1", Some(json!({"cursor": 5})), move |members| {
+            snaps_clone.lock().unwrap().push(members);
+        });
+        let got = snaps.lock().unwrap();
+        assert_eq!(got.len(), 1, "initial snapshot delivered on join");
+        assert_eq!(got[0].len(), 1);
+        assert_eq!(got[0][0].connection_id, "c1");
+        assert_eq!(got[0][0].state, json!({"cursor": 5}));
+    }
+
+    #[tokio::test]
+    async fn presence_update_broadcasts_new_state() {
+        // Brief: update_presence fans out a fresh snapshot with the new state.
+        let mut c =
+            InMemoryRtDbClient::new(InMemoryRtDbClientOptions::default().connection_id("c1"));
+        let snaps: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let snaps_clone = snaps.clone();
+        let _h = c.presence("room", None, move |members| {
+            if let Some(m) = members.first() {
+                snaps_clone.lock().unwrap().push(m.state.clone());
+            }
+        });
+        c.update_presence("room", json!({"typing": true}));
+        let got = snaps.lock().unwrap();
+        assert_eq!(got.len(), 2, "initial + update");
+        assert_eq!(got[1], json!({"typing": true}));
+    }
+
+    #[tokio::test]
+    async fn presence_update_noop_for_unjoined_room() {
+        // Brief: update_presence on a room we haven't joined does nothing.
+        let mut c = InMemoryRtDbClient::new(InMemoryRtDbClientOptions::default());
+        let snaps: Arc<Mutex<Vec<usize>>> = Arc::new(Mutex::new(Vec::new()));
+        let snaps_clone = snaps.clone();
+        let _h = c.presence("room", None, move |members| {
+            snaps_clone.lock().unwrap().push(members.len());
+        });
+        // Update a different room — no fan-out for "room".
+        c.update_presence("other", json!({}));
+        assert_eq!(snaps.lock().unwrap().len(), 1, "no new snapshot");
+    }
+
+    #[tokio::test]
+    async fn presence_leave_removes_member_and_drops_listeners() {
+        // Brief: leave_presence removes the member and fans out; further updates
+        // to the room from a peer do not invoke the (now-dropped) callback.
+        let rooms = Arc::new(Mutex::new(PresenceRooms::default()));
+        let mut c1 = new_presence_client("c1", rooms.clone());
+        let mut c2 = new_presence_client("c2", rooms.clone());
+
+        let c1_snaps: Arc<Mutex<Vec<usize>>> = Arc::new(Mutex::new(Vec::new()));
+        let c1_snaps_clone = c1_snaps.clone();
+        let h1 = c1.presence("room", None, move |members| {
+            c1_snaps_clone.lock().unwrap().push(members.len());
+        });
+
+        // c2 joins → c1 sees 2 members.
+        let _h2 = c2.presence("room", None, |_| {});
+        assert_eq!(*c1_snaps.lock().unwrap(), [1, 2]);
+
+        // c1 leaves → its listener is dropped; the fan-out goes to remaining
+        // listeners only. h1 is now inert.
+        c1.leave_presence("room");
+        drop(h1);
+
+        // c2 updates — c1's callback must not fire (listener dropped).
+        c2.update_presence("room", json!({"x": 1}));
+        assert_eq!(
+            *c1_snaps.lock().unwrap(),
+            [1, 2],
+            "no further fire after leave"
+        );
+    }
+
+    #[tokio::test]
+    async fn presence_two_clients_on_shared_rooms_see_each_other() {
+        // Brief: two clients sharing a PresenceRooms instance see each other's
+        // joins and leaves — approximating the server's per-db registry.
+        let rooms = Arc::new(Mutex::new(PresenceRooms::default()));
+        let mut c1 = new_presence_client("c1", rooms.clone());
+        let mut c2 = new_presence_client("c2", rooms.clone());
+
+        let c1_snaps: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        let c1_snaps_clone = c1_snaps.clone();
+        let _h1 = c1.presence("room", None, move |members| {
+            let ids: Vec<String> = members.into_iter().map(|m| m.connection_id).collect();
+            c1_snaps_clone.lock().unwrap().push(ids);
+        });
+
+        // c2 joins → c1 sees [c1, c2].
+        let _h2 = c2.presence("room", None, |_| {});
+        {
+            let got = c1_snaps.lock().unwrap();
+            assert_eq!(got.len(), 2, "initial self + c2 join");
+            assert_eq!(got[1], ["c1", "c2"]);
+        }
+
+        // c2 leaves → c1 sees [c1] again.
+        c2.leave_presence("room");
+        {
+            let got = c1_snaps.lock().unwrap();
+            assert_eq!(got.len(), 3);
+            assert_eq!(got[2], ["c1"]);
+        }
     }
 }

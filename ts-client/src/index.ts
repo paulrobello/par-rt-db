@@ -9,6 +9,7 @@ export type {
   FieldTypeJson,
   IndexJson,
   Order,
+  PresenceMember,
   QueryJson,
   ScheduleInfo,
   ScheduleWhen,
@@ -73,5 +74,5 @@ export type {
 } from "./admin.js";
 export { RtDbClient } from "./client.js";
 export type { AuthState, ConnectionState, RtDbClientOptions, WebSocketLike } from "./client.js";
-export { InMemoryRtDbClient } from "./in_memory.js";
+export { InMemoryRtDbClient, PresenceRooms } from "./in_memory.js";
 export type { InMemoryRtDbClientOptions } from "./in_memory.js";

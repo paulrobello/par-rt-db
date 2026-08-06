@@ -4,6 +4,7 @@ import { parseStepResults, type StepResult } from "./mutation.js";
 import { decodeCursor, encodeCursor } from "./pagination.js";
 import type {
   AggregateOp,
+  AuthedUser,
   Cast,
   DirectiveJson,
   DirectiveReportJson,
@@ -15,6 +16,7 @@ import type {
   Order,
   Paginate,
   PaginatedResultJson,
+  PresenceMember,
   QueryJson,
   ScheduleInfo,
   ScheduleWhen,
@@ -95,11 +97,116 @@ interface ScheduledJob {
  * parsing is deferred to the server; the harness only needs crons to re-arm. */
 const CRON_STEP_MS = 60_000;
 
+/**
+ * Shared in-memory presence backing: a `room -> connectionId -> member` map with
+ * a per-room subscriber set. Two `InMemoryRtDbClient`s that share a
+ * `PresenceRooms` instance see each other's joins/updates/leaves fan out,
+ * approximating the server's per-db presence registry for tests (one client,
+ * one connection — exactly like the live server's per-ConnId keying). A client
+ * with no `presenceRooms` option gets a private instance and only ever sees
+ * itself in its rooms.
+ *
+ * Mirrors the existing harness pattern of `notifySubs(writeSet)` fanning a
+ * recomputed snapshot to every local subscriber after a write.
+ */
+export class PresenceRooms {
+  private readonly members = new Map<string, Map<string, PresenceMember>>();
+  private readonly subs = new Map<string, Set<(members: PresenceMember[]) => void>>();
+
+  /** Returns a stable-order snapshot of `room`'s current members. */
+  snapshot(room: string): PresenceMember[] {
+    const map = this.members.get(room);
+    return map ? [...map.values()] : [];
+  }
+
+  /** Adds or replaces `member` in `room` and fans out a fresh snapshot. */
+  join(room: string, member: PresenceMember): void {
+    let map = this.members.get(room);
+    if (!map) {
+      map = new Map();
+      this.members.set(room, map);
+    }
+    map.set(member.connectionId, member);
+    this.fanOut(room);
+  }
+
+  /** Updates `connectionId`'s state in `room` and fans out. No-op if the
+   * connection is not in the room (matches the live server, which would not
+   * relay an update for a non-member). */
+  update(room: string, connectionId: string, state: unknown): void {
+    const map = this.members.get(room);
+    const member = map?.get(connectionId);
+    if (!member) {
+      return;
+    }
+    member.state = state;
+    this.fanOut(room);
+  }
+
+  /** Removes `connectionId` from `room` and fans out. No-op if absent. */
+  leave(room: string, connectionId: string): void {
+    const map = this.members.get(room);
+    if (!map) {
+      return;
+    }
+    map.delete(connectionId);
+    if (map.size === 0) {
+      this.members.delete(room);
+    }
+    this.fanOut(room);
+  }
+
+  /** Registers `fn` for `room` snapshots and immediately fires it with the
+   * current snapshot (mirroring the server's first `presenceSnapshot` on join).
+   * Returns an unsubscribe. */
+  subscribe(room: string, fn: (members: PresenceMember[]) => void): () => void {
+    let set = this.subs.get(room);
+    if (!set) {
+      set = new Set();
+      this.subs.set(room, set);
+    }
+    set.add(fn);
+    fn(this.snapshot(room));
+    return () => {
+      const current = this.subs.get(room);
+      if (!current) {
+        return;
+      }
+      current.delete(fn);
+      if (current.size === 0) {
+        this.subs.delete(room);
+      }
+    };
+  }
+
+  private fanOut(room: string): void {
+    const set = this.subs.get(room);
+    if (!set) {
+      return;
+    }
+    const snap = this.snapshot(room);
+    for (const fn of set) {
+      fn(snap);
+    }
+  }
+}
+
 export interface InMemoryRtDbClientOptions {
   /** Injectable clock (epoch ms) for deterministic `_creationTime` and id minting. */
   now?: () => number;
   /** Injectable RNG in [0, 1) for deterministic id minting. */
   random?: () => number;
+  /** Stable identity for this client in presence rooms. Auto-generated as a
+   * counter-prefixed token (distinct from document ids) when omitted. */
+  connectionId?: string;
+  /** Display identity stamped on this client's presence entries. Defaults to a
+   * bare `{ kind: "user" }` (no email/name) — tests that assert on member
+   * identity can override. */
+  presenceUser?: AuthedUser;
+  /** Optional shared presence backing. Two clients that pass the same
+   * `PresenceRooms` instance see each other's joins/updates/leaves; a client
+   * with no `presenceRooms` gets a private instance and sees only itself. */
+  presenceRooms?: PresenceRooms;
 }
 
 function toSchemaJson(schema: SchemaDefinition<any> | SchemaJson): SchemaJson {
@@ -760,11 +867,26 @@ export class InMemoryRtDbClient {
     string,
     { bytes: Uint8Array; contentType?: string; createdAt: number }
   >();
+  private readonly presenceRooms: PresenceRooms;
+  private readonly presenceUser: AuthedUser;
+  private readonly joinedRooms = new Set<string>();
+  /** Unsubscribe handles for the per-room callbacks this client registered on
+   * `PresenceRooms`. Tracked so `leavePresence(room)` can drop every local
+   * subscriber for that room, mirroring the reactive client and the live
+   * server (which stops delivering snapshots once a connection has left). */
+  private readonly presenceUnsubs = new Map<string, Array<() => void>>();
+  /** This client's stable identity in presence rooms. Generated as a
+   * counter-prefixed token distinct from document ids so tests can tell them
+   * apart at a glance. */
+  readonly connectionId: string;
   private idCounter = 0;
 
   constructor(options: InMemoryRtDbClientOptions = {}) {
     this.now = options.now ?? (() => Date.now());
     this.random = options.random ?? Math.random;
+    this.presenceRooms = options.presenceRooms ?? new PresenceRooms();
+    this.presenceUser = options.presenceUser ?? { kind: "user" };
+    this.connectionId = options.connectionId ?? `c${(++this.idCounter).toString(36)}`;
   }
 
   /** Installs `schema` as this client's sole in-memory database schema. The
@@ -1090,6 +1212,76 @@ export class InMemoryRtDbClient {
         this.subs.splice(index, 1);
       }
     };
+  }
+
+  // ---- presence -------------------------------------------------------------
+
+  /**
+   * Joins presence room `room` with optional initial `state`, mirroring
+   * `RtDbClient.presence`. When `onUpdate` is supplied, it fires with the
+   * current member list on join and again on every local mutation (a peer's
+   * join/update/leave on a shared `PresenceRooms`).
+   *
+   * Returns an unsubscribe that stops listening but does NOT leave the room —
+   * call `leavePresence(room)` for that, mirroring the reactive client.
+   */
+  presence(
+    room: string,
+    state?: unknown,
+    onUpdate?: (members: PresenceMember[]) => void,
+  ): () => void {
+    this.joinedRooms.add(room);
+    this.presenceRooms.join(room, {
+      connectionId: this.connectionId,
+      user: this.presenceUser,
+      state: state ?? null,
+    });
+    let off: (() => void) | undefined;
+    if (onUpdate) {
+      off = this.presenceRooms.subscribe(room, onUpdate);
+      let arr = this.presenceUnsubs.get(room);
+      if (!arr) {
+        arr = [];
+        this.presenceUnsubs.set(room, arr);
+      }
+      arr.push(off);
+    }
+    return () => {
+      off?.();
+      if (off) {
+        const arr = this.presenceUnsubs.get(room);
+        if (arr) {
+          const i = arr.indexOf(off);
+          if (i >= 0) arr.splice(i, 1);
+          if (arr.length === 0) this.presenceUnsubs.delete(room);
+        }
+      }
+    };
+  }
+
+  /** Broadcasts updated `state` for this connection in `room`. No-op if this
+   * client has not joined `room` (mirrors the live server, which would not
+   * relay an update from a non-member). */
+  updatePresence(room: string, state: unknown): void {
+    if (!this.joinedRooms.has(room)) {
+      return;
+    }
+    this.presenceRooms.update(room, this.connectionId, state);
+  }
+
+  /** Leaves `room`: removes this connection from the member list, drops every
+   * local subscriber this client registered for that room, and fans out a
+   * fresh snapshot to remaining subscribers. */
+  leavePresence(room: string): void {
+    if (!this.joinedRooms.delete(room)) {
+      return;
+    }
+    const arr = this.presenceUnsubs.get(room);
+    if (arr) {
+      for (const off of arr) off();
+      this.presenceUnsubs.delete(room);
+    }
+    this.presenceRooms.leave(room, this.connectionId);
   }
 
   // ---- schedules ------------------------------------------------------------

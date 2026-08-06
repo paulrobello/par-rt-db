@@ -15,6 +15,7 @@ pub mod migrate;
 pub mod mutation_log;
 pub mod op_feed;
 pub mod pagination;
+pub mod presence;
 pub mod privacy;
 pub mod protocol;
 pub mod query;
@@ -61,6 +62,10 @@ pub struct Realtime {
     pub subs: Arc<SubscriptionManager>,
     pub committers: Committers,
     pub op_feed: Arc<op_feed::OpFeed>,
+    /// Transient in-memory presence (ENH-015). Sibling to the committer —
+    /// presence does NOT route through the committer or any `handle_*` tap
+    /// site; the flush task is spawned only when `presence_enabled`.
+    pub presence: Arc<presence::PresenceManager>,
 }
 
 /// Runtime-wide mutable/process state: hot-reloaded config, metrics, and the
@@ -134,6 +139,20 @@ impl AppState {
             config.image_concurrency,
             metrics.clone(),
         ));
+        // Presence manager (ENH-015) shares the same `Arc<Metrics>` so its
+        // update/broadcast counters surface on the dashboard. It is a sibling
+        // of the committer, NOT routed through it: the periodic flush task is
+        // spawned only when `presence_enabled` (default off) — a disabled
+        // server still has the manager (so `presenceErr` works) but no
+        // spinning task. Built before the struct literal so `metrics` can
+        // still move into Runtime.
+        let presence_cfg = presence::PresenceConfig::from_config(&config);
+        let presence = presence::PresenceManager::new(Some(metrics.clone()), presence_cfg);
+        if presence_cfg.enabled {
+            // Detach: the flush task runs for the lifetime of the process,
+            // self-terminates if it ever errors, and nothing awaits its handle.
+            let _handle = presence.clone().run_flush_task();
+        }
         Arc::new(Self {
             pool,
             config,
@@ -142,6 +161,7 @@ impl AppState {
                 subs,
                 committers,
                 op_feed,
+                presence,
             },
             runtime: Runtime {
                 hot,

@@ -64,18 +64,21 @@ pub use query::{
 pub use schema::{DistanceMetric, FieldType, IndexDef, SchemaDef, TableDef, VectorIndexSpec};
 pub use wire::{
     AggregateGroup, AggregateOp, AggregateSpec, AuthedUser, ClientMessage, FilterExpr,
-    ScheduleInfo, ScheduleKind, ScheduleStatus, ScheduleWhen, SearchQuery, ServerMessage, UserKind,
-    VectorSearchQuery,
+    PresenceMember, ScheduleInfo, ScheduleKind, ScheduleStatus, ScheduleWhen, SearchQuery,
+    ServerMessage, UserKind, VectorSearchQuery,
 };
 
 #[cfg(feature = "http")]
 pub use http::{Fit, OutFormat, RtDbHttpClient, TransformOpts};
 
 #[cfg(feature = "in_memory")]
-pub use in_memory::InMemoryRtDbClient;
+pub use in_memory::{InMemoryRtDbClient, PresenceHandle, PresenceRooms};
 
 #[cfg(feature = "ws")]
-pub use ws::{ClientStatus, Config, ConnectionState, RtDbClient, Snapshot, Subscription};
+pub use ws::{
+    ClientStatus, Config, ConnectionState, Presence, PresenceSnapshot, RtDbClient, Snapshot,
+    Subscription,
+};
 
 #[cfg(feature = "admin")]
 pub use wire::admin::{

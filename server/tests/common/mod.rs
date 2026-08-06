@@ -50,6 +50,13 @@ pub fn test_config() -> Config {
         image_cache_bytes: 256 * 1024 * 1024,
         image_concurrency: 4,
         image_default_quality: 80,
+        presence_enabled: false,
+        presence_max_state_bytes: 1024,
+        presence_max_room_size: 100,
+        presence_max_rooms_per_conn: 32,
+        presence_max_room_bytes: 256,
+        presence_broadcast_interval_ms: 50,
+        presence_update_limit_per_sec: 20,
     }
 }
 
@@ -199,6 +206,24 @@ pub async fn test_state_with_ttl_audit_webhooks(secs: u64) -> Arc<AppState> {
     db::ensure_webhooks_tables(&pool)
         .await
         .expect("ensure rtdb.webhooks tables");
+    AppState::new(pool, config, test_hot())
+}
+
+/// Like `test_state` but with `presence_enabled = true` and
+/// `presence_broadcast_interval_ms = 0` so the flush task spins continuously
+/// (broadcasts dirty rooms as fast as possible). Tests can ALSO call
+/// `state.realtime.presence.flush_once().await` directly to force a
+/// deterministic snapshot between actions. Mirrors the
+/// `test_state_with_audit` override pattern.
+#[allow(dead_code)]
+pub async fn test_state_with_presence() -> Arc<AppState> {
+    let mut config = test_config();
+    config.presence_enabled = true;
+    config.presence_broadcast_interval_ms = 0;
+    let pool = sqlx::PgPool::connect(&config.database_url)
+        .await
+        .expect("connect to test postgres");
+    db::bootstrap(&pool).await.expect("bootstrap rtdb_auth");
     AppState::new(pool, config, test_hot())
 }
 

@@ -410,6 +410,13 @@ mod tests {
             image_cache_bytes: 256 * 1024 * 1024,
             image_concurrency: 4,
             image_default_quality: 80,
+            presence_enabled: false,
+            presence_max_state_bytes: 1024,
+            presence_max_room_size: 100,
+            presence_max_rooms_per_conn: 32,
+            presence_max_room_bytes: 256,
+            presence_broadcast_interval_ms: 50,
+            presence_update_limit_per_sec: 20,
         };
         assert!(GithubProvider::from_config(&cfg).is_none());
         cfg.github_client_id = Some("id".into());

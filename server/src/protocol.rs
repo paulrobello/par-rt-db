@@ -55,6 +55,18 @@ pub enum ClientMessage {
     ListSchedules {
         schedule_id: String,
     },
+    Presence {
+        room: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        state: Option<serde_json::Value>,
+    },
+    PresenceState {
+        room: String,
+        state: serde_json::Value,
+    },
+    LeavePresence {
+        room: String,
+    },
     Ping,
 }
 
@@ -106,6 +118,14 @@ pub enum ServerMessage {
     ListSchedulesOk {
         schedule_id: String,
         schedules: Vec<ScheduleInfo>,
+    },
+    PresenceSnapshot {
+        room: String,
+        members: Vec<PresenceMember>,
+    },
+    PresenceErr {
+        room: String,
+        error: RtDbError,
     },
     Pong,
 }
@@ -163,6 +183,17 @@ pub struct AuthedUser {
     /// GitHub numeric id, paired with `github_login`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub github_id: Option<i64>,
+}
+
+/// One entry in a presence room's member list. `connectionId` is the opaque,
+/// unique-per-session key (the `ConnId` stringified); `user` carries display
+/// identity; `state` is an opaque client-supplied blob.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PresenceMember {
+    pub connection_id: String,
+    pub user: AuthedUser,
+    pub state: serde_json::Value,
 }
 
 /// How a caller wants a transaction scheduled. Mirrored byte-for-byte in
@@ -487,5 +518,84 @@ mod tests {
         let value = serde_json::to_value(&msg).unwrap();
         let restored: ClientMessage = serde_json::from_value(value).unwrap();
         assert!(matches!(restored, ClientMessage::Subscribe { query_id, .. } if query_id == "q1"));
+    }
+
+    #[test]
+    fn presence_client_message_wire_tags() {
+        // presence: optional state omitted when None
+        assert_eq!(
+            serde_json::to_value(ClientMessage::Presence {
+                room: "doc:1".to_string(),
+                state: None,
+            })
+            .unwrap(),
+            serde_json::json!({"type": "presence", "room": "doc:1"})
+        );
+        // presence: state present when Some
+        assert_eq!(
+            serde_json::to_value(ClientMessage::Presence {
+                room: "doc:1".to_string(),
+                state: Some(serde_json::json!({"x": 3, "y": 4})),
+            })
+            .unwrap(),
+            serde_json::json!({"type": "presence", "room": "doc:1", "state": {"x": 3, "y": 4}})
+        );
+        assert_eq!(
+            serde_json::to_value(ClientMessage::PresenceState {
+                room: "doc:1".to_string(),
+                state: serde_json::json!({"typing": true}),
+            })
+            .unwrap(),
+            serde_json::json!({"type": "presenceState", "room": "doc:1", "state": {"typing": true}})
+        );
+        assert_eq!(
+            serde_json::to_value(ClientMessage::LeavePresence {
+                room: "doc:1".to_string(),
+            })
+            .unwrap(),
+            serde_json::json!({"type": "leavePresence", "room": "doc:1"})
+        );
+    }
+
+    #[test]
+    fn presence_server_message_wire_tags() {
+        let member = PresenceMember {
+            connection_id: "42".to_string(),
+            user: AuthedUser {
+                kind: UserKind::User,
+                email: Some("a@b.com".to_string()),
+                name: None,
+                github_login: None,
+                github_id: None,
+            },
+            state: serde_json::json!({"x": 1}),
+        };
+        assert_eq!(
+            serde_json::to_value(ServerMessage::PresenceSnapshot {
+                room: "doc:1".to_string(),
+                members: vec![member.clone()],
+            })
+            .unwrap(),
+            serde_json::json!({
+                "type": "presenceSnapshot",
+                "room": "doc:1",
+                "members": [{
+                    "connectionId": "42",
+                    // AuthedUser has no `skip_serializing_if` on `name`, so
+                    // `None` serializes as `null` (pre-existing wire shape
+                    // mirrored across all four clients).
+                    "user": {"kind": "user", "email": "a@b.com", "name": null},
+                    "state": {"x": 1}
+                }]
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(ServerMessage::PresenceErr {
+                room: "doc:1".to_string(),
+                error: RtDbError::forbidden("presence not enabled"),
+            })
+            .unwrap()["type"],
+            serde_json::json!("presenceErr")
+        );
     }
 }

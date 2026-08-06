@@ -10,7 +10,7 @@ import {
 } from "react";
 import type { AuthState, ConnectionState, RtDbClient } from "./client.js";
 import type { StepResult } from "./mutation.js";
-import type { AuthedUser, TransactionJson } from "./protocol.js";
+import type { AuthedUser, PresenceMember, TransactionJson } from "./protocol.js";
 import type { RtQuery } from "./query.js";
 
 export type { UsePaginatedQueryOptions, UsePaginatedQueryResult } from "./usePaginatedQuery.js";
@@ -111,6 +111,42 @@ export function useQuery<R>(query: RtQuery<R> | "skip"): R | undefined {
 export function useMutation(): (txn: TransactionJson) => Promise<StepResult[]> {
   const { client } = useContextValue();
   return useCallback((txn: TransactionJson) => client.mutate(txn), [client]);
+}
+
+/**
+ * Subscribes to presence room `room`: joins on mount, returns the current
+ * `members` list (re-rendered on every `presenceSnapshot`), and leaves on
+ * unmount. Mirrors `useQuery`'s mount/subscribe/teardown lifecycle: `room` is
+ * the real dependency, so changing it leaves the old room and joins the new.
+ */
+export function usePresence(room: string): {
+  members: PresenceMember[];
+  updatePresence: (state: unknown) => void;
+  leavePresence: () => void;
+} {
+  const { client } = useContextValue();
+  const [members, setMembers] = useState<PresenceMember[]>([]);
+
+  // `client` and `room` are both read inside the effect and listed as deps —
+  // exhaustive. Changing `room` leaves the old room and joins the new.
+  useEffect(() => {
+    setMembers([]);
+    const off = client.presence(room, undefined, setMembers);
+    return () => {
+      // Leave the room first (sends the wire frame AND drops local listeners),
+      // then run the snapshot unsub — a no-op once `leavePresence` cleared the set.
+      client.leavePresence(room);
+      off();
+    };
+  }, [client, room]);
+
+  const updatePresence = useCallback(
+    (state: unknown) => client.updatePresence(room, state),
+    [client, room],
+  );
+  const leavePresence = useCallback(() => client.leavePresence(room), [client, room]);
+
+  return { members, updatePresence, leavePresence };
 }
 
 export function useConnectionState(): ConnectionState {

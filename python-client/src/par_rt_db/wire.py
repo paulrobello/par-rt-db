@@ -387,6 +387,37 @@ class _ClientPing(_Camel):
     type: Literal["ping"] = "ping"
 
 
+class _ClientPresence(_Camel):
+    """ENH-015 join a presence room. ``state`` is omitted on the wire when
+    ``None`` (mirrors the server's ``skip_serializing_if = "Option::is_none"``)."""
+
+    type: Literal["presence"] = "presence"
+    room: str
+    state: Any | None = None
+
+    @model_serializer(mode="wrap")
+    def _drop_none_state(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        out = handler(self)
+        if out.get("state") is None:
+            out.pop("state", None)
+        return out
+
+
+class _ClientPresenceState(_Camel):
+    """ENH-015 broadcast updated presence state for this connection in ``room``."""
+
+    type: Literal["presenceState"] = "presenceState"
+    room: str
+    state: Any
+
+
+class _ClientLeavePresence(_Camel):
+    """ENH-015 leave a presence room."""
+
+    type: Literal["leavePresence"] = "leavePresence"
+    room: str
+
+
 ClientMessage = Annotated[
     (
         _ClientAuth
@@ -398,10 +429,28 @@ ClientMessage = Annotated[
         | _ClientPauseSchedule
         | _ClientResumeSchedule
         | _ClientListSchedules
+        | _ClientPresence
+        | _ClientPresenceState
+        | _ClientLeavePresence
         | _ClientPing
     ),
     Field(discriminator="type"),
 ]
+
+
+# --- PresenceMember (ENH-015; mirrors server protocol.rs::PresenceMember) ----
+#
+# One entry in a presence room's member list. ``connectionId`` is the opaque,
+# unique-per-session key; ``user`` carries display identity; ``state`` is an
+# opaque client-supplied blob (always present on the wire — ``None`` serializes
+# as JSON ``null``, mirroring the server's ``serde_json::Value`` which has no
+# notion of absence).
+
+
+class PresenceMember(_Camel):
+    connection_id: str
+    user: AuthedUser
+    state: Any
 
 
 # --- ServerMessage (server -> client WS vocabulary; discriminator "type") ---
@@ -507,6 +556,22 @@ class _ServerListSchedulesOk(_Camel):
     schedules: list[ScheduleInfo]
 
 
+class _ServerPresenceSnapshot(_Camel):
+    """ENH-015 fan-out of a room's current member list (server→client)."""
+
+    type: Literal["presenceSnapshot"] = "presenceSnapshot"
+    room: str
+    members: list[PresenceMember]
+
+
+class _ServerPresenceErr(_Camel):
+    """ENH-015 the server rejected a presence op for ``room``."""
+
+    type: Literal["presenceErr"] = "presenceErr"
+    room: str
+    error: _ErrorEnvelope
+
+
 class _ServerPong(_Camel):
     type: Literal["pong"] = "pong"
 
@@ -523,6 +588,8 @@ ServerMessage = Annotated[
         | _ServerScheduleErr
         | _ServerScheduleAck
         | _ServerListSchedulesOk
+        | _ServerPresenceSnapshot
+        | _ServerPresenceErr
         | _ServerPong
     ),
     Field(discriminator="type"),

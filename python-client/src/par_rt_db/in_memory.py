@@ -100,7 +100,9 @@ from .schema import (
 )
 from .wire import (
     AggregateOp,
+    AuthedUser,
     FilterExpr,
+    PresenceMember,
     ScheduleInfo,
     ScheduleWhen,
     _AfterMs,
@@ -220,14 +222,150 @@ class FileMetadata:
     creation_time: int
 
 
+# ---- ENH-015 presence (shared in-memory backing) ---------------------------
+#
+# Ports ``PresenceRooms`` from ``ts-client/src/in_memory.ts`` (and through it
+# ``rust-client/src/in_memory.rs``). A ``room → connectionId → member`` map with
+# a per-room subscriber list: two :class:`InMemoryRtDbClient` instances that
+# share a :class:`PresenceRooms` see each other's joins/updates/leaves fan out,
+# approximating the server's per-db presence registry for tests (one client =
+# one connection, keyed by ``connectionId``). A client with no ``presence_rooms``
+# option gets a private instance and only ever sees itself.
+
+
+class PresenceRooms:
+    """Shared in-memory presence backing for tests.
+
+    Mirrors :class:`PresenceRooms` in ts-client/rust-client: a
+    ``room → connectionId → member`` map with a per-room subscriber list. Two
+    :class:`InMemoryRtDbClient` instances sharing one ``PresenceRooms`` see each
+    other's joins/updates/leaves fan out. A client with no ``presence_rooms``
+    option gets a private instance and only ever sees itself in its rooms.
+
+    Subscribers fire inline on the mutating caller's thread; never recursively
+    mutate the same backing from inside a callback.
+    """
+
+    def __init__(self) -> None:
+        # room -> list of (connectionId, PresenceMember) preserving join order
+        # (matches the TS Map iteration semantics the server's snapshot relies on).
+        self._members: dict[str, list[tuple[str, PresenceMember]]] = {}
+        # room -> list of (alive flag, callback). The alive flag is a one-element
+        # list shared with the handle (same pattern as _Subscription).
+        self._subs: dict[str, list[tuple[list[bool], Callable[[list[PresenceMember]], None]]]] = {}
+
+    def snapshot(self, room: str) -> list[PresenceMember]:
+        """Current members of ``room`` in join order (empty if no such room)."""
+        entries = self._members.get(room)
+        if not entries:
+            return []
+        return [m for _, m in entries]
+
+    def join(self, room: str, member: PresenceMember) -> None:
+        """Add or replace ``member`` (keyed by ``connectionId``) and fan out."""
+        entries = self._members.setdefault(room, [])
+        for i, (cid, _) in enumerate(entries):
+            if cid == member.connection_id:
+                entries[i] = (member.connection_id, member)
+                break
+        else:
+            entries.append((member.connection_id, member))
+        self._fan_out(room)
+
+    def update(self, room: str, connection_id: str, state: Any) -> None:
+        """Update ``connection_id``'s state in ``room`` and fan out. No-op if the
+        connection is not in the room (mirrors the live server ignoring a
+        non-member update)."""
+        entries = self._members.get(room)
+        if entries is None:
+            return
+        for i, (cid, existing) in enumerate(entries):
+            if cid == connection_id:
+                entries[i] = (
+                    cid,
+                    PresenceMember(connection_id=connection_id, user=existing.user, state=state),
+                )
+                self._fan_out(room)
+                return
+
+    def leave(self, room: str, connection_id: str) -> None:
+        """Remove ``connection_id`` from ``room`` and fan out. No-op if absent."""
+        entries = self._members.get(room)
+        if entries is None:
+            return
+        before = len(entries)
+        entries[:] = [(cid, m) for cid, m in entries if cid != connection_id]
+        if len(entries) == before:
+            return  # was not a member — no fan-out
+        if not entries:
+            self._members.pop(room, None)
+        self._fan_out(room)
+
+    def subscribe(
+        self, room: str, cb: Callable[[list[PresenceMember]], None]
+    ) -> PresenceTestHandle:
+        """Register ``cb`` for ``room`` snapshots and fire it immediately with the
+        current snapshot (mirroring the server's first ``presenceSnapshot`` on
+        join). The returned :class:`PresenceTestHandle` detaches the callback."""
+        alive = [True]
+        self._subs.setdefault(room, []).append((alive, cb))
+        cb(self.snapshot(room))
+        return PresenceTestHandle(alive)
+
+    def _fan_out(self, room: str) -> None:
+        """Re-snapshot ``room`` and fire every live callback; compact dead ones."""
+        snap = self.snapshot(room)
+        listeners = self._subs.get(room)
+        if listeners is None:
+            return
+        fires = [cb for alive, cb in listeners if alive[0]]
+        listeners[:] = [(alive, cb) for alive, cb in listeners if alive[0]]
+        if not listeners:
+            self._subs.pop(room, None)
+        for cb in fires:
+            cb(list(snap))
+
+
+class PresenceTestHandle:
+    """Unsubscribe handle returned by :meth:`PresenceRooms.subscribe`.
+
+    Mirrors :class:`SubscriptionHandle`: the alive flag is shared with the
+    backing so ``unsubscribe`` (or a ``with`` block) detaches without holding a
+    reference to the room. Python's GC is not deterministic, so prefer an
+    explicit :meth:`unsubscribe` (or ``with``) over relying on ``__del__``.
+    """
+
+    def __init__(self, alive: list[bool]) -> None:
+        self._alive = alive
+
+    def unsubscribe(self) -> None:
+        """Detach the callback; no further fan-outs fire."""
+        self._alive[0] = False
+
+    def __enter__(self) -> PresenceTestHandle:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self._alive[0] = False
+
+
 @dataclass
 class InMemoryRtDbClientOptions:
     """Injectable clock and RNG for deterministic id minting and
     ``_creationTime``. Both optional; defaults are the system clock and a
-    constant ``0.5``. Tests that need determinism should inject both."""
+    constant ``0.5``. Tests that need determinism should inject both.
+
+    ENH-015 presence options (all optional): ``connection_id`` (stable identity
+    in presence rooms; auto-generated as ``c{N}`` when unset), ``presence_user``
+    (display identity; defaults to a nameless ``{kind:"user"}``), and
+    ``presence_rooms`` (shared backing so two clients see each other).
+    """
 
     now: Callable[[], int] | None = None
     random: Callable[[], float] | None = None
+    connection_id: str | None = None
+    presence_user: AuthedUser | None = None
+    presence_rooms: PresenceRooms | None = None
 
 
 @dataclass
@@ -289,7 +427,8 @@ class InMemoryRtDbClient:
         self._tables: dict[str, TableDef] = {}
         # Document store keyed by (table_name, id).
         self._docs: dict[tuple[str, str], StoredRow] = {}
-        # Counter for storage-upload id minting.
+        # Counter for storage-upload id minting (also seeds connection_id when
+        # not injected — mirrors the TS harness's `c{N}` default).
         self._id_counter: int = 0
         # mut_id -> cached results (idempotency short-circuit).
         self._idempotency: dict[str, list[StepResult]] = {}
@@ -299,6 +438,23 @@ class InMemoryRtDbClient:
         self._subscribers: list[_Subscription] = []
         # Storage stub: per-id blobs.
         self._storage: dict[str, StoredBlob] = {}
+        # ENH-015 presence backing + per-client identity. ``_conn_counter`` is a
+        # separate counter so connection_id minting does not shift storage ids.
+        self._presence_rooms: PresenceRooms = opts.presence_rooms or PresenceRooms()
+        self._presence_user: AuthedUser = opts.presence_user or AuthedUser(kind="user")
+        self._conn_counter: int = 0
+        self._connection_id: str = opts.connection_id or self._mint_connection_id()
+        # Rooms this client has joined (for update/leave bookkeeping).
+        self._joined_rooms: set[str] = set()
+        # Unsubscribe handles for this client's registered presence callbacks,
+        # keyed by room (so leave_presence can drop every local subscriber).
+        self._presence_unsubs: dict[str, list[PresenceTestHandle]] = {}
+
+    def _mint_connection_id(self) -> str:
+        """Auto-generated identity when ``connection_id`` is not injected
+        (mirrors the TS harness's ``c{N}`` counter)."""
+        self._conn_counter += 1
+        return f"c{self._conn_counter}"
 
     # ---- schema ---------------------------------------------------------
 
@@ -1347,6 +1503,62 @@ class InMemoryRtDbClient:
         self._subscribers = [s for s in self._subscribers if s.alive[0]]
         for callback, value in fires:
             callback(value)
+
+    # ---- presence (ENH-015) --------------------------------------------
+    #
+    # Ports ``presence``/``updatePresence``/``leavePresence``
+    # (``ts-client/src/in_memory.ts``, ``rust-client/src/in_memory.rs``). Backed
+    # by :class:`PresenceRooms`, which approximates the server's per-db presence
+    # registry: one client = one connection, keyed by ``connectionId``. Two
+    # clients sharing the same ``PresenceRooms`` see each other.
+
+    def presence(
+        self,
+        room: str,
+        state: Any | None,
+        on_update: Callable[[list[PresenceMember]], None],
+    ) -> PresenceTestHandle:
+        """Join presence room ``room`` with optional initial ``state``; fire
+        ``on_update`` with the current member list on join and again on every
+        local mutation (or a peer's join/update/leave on a shared
+        :class:`PresenceRooms`).
+
+        The returned :class:`PresenceTestHandle` detaches the listener but does
+        NOT leave the room — call :meth:`leave_presence` for that (parity with
+        ts-client/rust-client and the reactive client)."""
+        self._joined_rooms.add(room)
+        member = PresenceMember(
+            connection_id=self._connection_id,
+            user=self._presence_user.model_copy(),
+            state=None if state is None else state,
+        )
+        # Join first, then subscribe — the initial snapshot (fired synchronously
+        # inside subscribe) already includes this connection.
+        self._presence_rooms.join(room, member)
+        handle = self._presence_rooms.subscribe(room, on_update)
+        self._presence_unsubs.setdefault(room, []).append(handle)
+        return handle
+
+    def update_presence(self, room: str, state: Any) -> None:
+        """Broadcast updated ``state`` for this connection in ``room``. No-op if
+        this client has not joined ``room`` (mirrors the live server ignoring a
+        non-member update)."""
+        if room not in self._joined_rooms:
+            return
+        self._presence_rooms.update(room, self._connection_id, state)
+
+    def leave_presence(self, room: str) -> None:
+        """Leave ``room``: drop every local subscriber this client registered for
+        it, remove this connection from the member list, and fan out a fresh
+        snapshot to any remaining subscribers. No-op if not joined."""
+        if room not in self._joined_rooms:
+            return
+        self._joined_rooms.discard(room)
+        # Drop every local subscriber this client registered for this room.
+        handles = self._presence_unsubs.pop(room, [])
+        for h in handles:
+            h.unsubscribe()
+        self._presence_rooms.leave(room, self._connection_id)
 
     # ---- schedules ------------------------------------------------------
 
