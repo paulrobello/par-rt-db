@@ -95,6 +95,9 @@ pub struct AppState {
     /// touch it without serialization — the same way the cron backup task
     /// (which never touches this flag) runs alongside them.
     pub backup_running: Arc<AtomicBool>,
+    /// On-the-fly image transform cache (ENH-014). `Arc` because every storage
+    /// serve request shares the one moka cache + concurrency semaphore.
+    pub image: Arc<image_transform::TransformCache>,
 }
 
 impl AppState {
@@ -122,6 +125,15 @@ impl AppState {
             config.ttl_batch,
             metrics.clone(),
         );
+        // Image transform cache shares the same `Arc<Metrics>` as Runtime and
+        // the committers so its hit/miss/error counters surface on the dashboard.
+        // Built before the struct literal so `metrics` can still move into Runtime.
+        let image = Arc::new(image_transform::TransformCache::new(
+            image_transform::TransformConfig::from_config(&config),
+            config.image_cache_bytes,
+            config.image_concurrency,
+            metrics.clone(),
+        ));
         Arc::new(Self {
             pool,
             config,
@@ -141,6 +153,7 @@ impl AppState {
             },
             rate_limiter: rate_limit::RateLimiter::new(),
             backup_running: Arc::new(AtomicBool::new(false)),
+            image,
         })
     }
 }

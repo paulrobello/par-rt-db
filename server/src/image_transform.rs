@@ -3,8 +3,11 @@
 //! (`TransformCache`, added later). HTTP-only; no committer/protocol involvement.
 
 use std::io::Cursor;
+use std::sync::Arc;
+use std::time::Duration;
 
 use image::{DynamicImage, GenericImageView, ImageEncoder, ImageFormat, ImageReader};
+use tokio::sync::Semaphore;
 
 use crate::config::Config;
 use crate::error::RtDbError;
@@ -288,9 +291,132 @@ fn contain_target(ow: u32, oh: u32, want_w: u32, want_h: u32) -> (u32, u32) {
     (tw.min(want_w).max(1), th.min(want_h).max(1))
 }
 
-// `TransformCache`, `CachedImage`, `Resolved` are added in Task 4.
-#[allow(dead_code)]
-fn _placeholder_link(_pool: &sqlx::PgPool) {}
+/// Cached transformed bytes plus the derived content type. `Arc<[u8]>` so a
+/// cache hit hands out a cheap reference-counted slice rather than a copy.
+#[derive(Debug, Clone)]
+pub struct CachedImage {
+    pub bytes: Arc<[u8]>,
+    pub content_type: &'static str,
+}
+
+/// Outcome of a transform-or-passthrough request.
+pub enum Resolved {
+    Transformed(CachedImage),
+    Raw {
+        bytes: Arc<[u8]>,
+        content_type: String,
+    },
+}
+
+/// Bounded-concurrency transform cache. Limits the number of in-flight
+/// decode→resize→encode pipelines via an internal semaphore, memoizes the
+/// results in a byte-weighted `moka` cache, and records hit/miss/error
+/// counters on the shared `Metrics` instance.
+pub struct TransformCache {
+    cache: moka::future::Cache<String, CachedImage>,
+    sem: Semaphore,
+    cfg: TransformConfig,
+    metrics: Arc<crate::metrics::Metrics>,
+}
+
+impl TransformCache {
+    /// `cache_bytes` is the byte-weight cap (passed as `max_capacity`); the
+    /// weigher makes it a proxy for total cached raster bytes. `concurrency`
+    /// is the permit count for in-flight transforms (sourced from
+    /// `Config::image_concurrency`).
+    pub fn new(
+        cfg: TransformConfig,
+        cache_bytes: u64,
+        concurrency: usize,
+        metrics: Arc<crate::metrics::Metrics>,
+    ) -> Self {
+        let cache = moka::future::Cache::builder()
+            .max_capacity(cache_bytes)
+            .weigher(|_, v: &CachedImage| -> u32 { v.bytes.len().min(u32::MAX as usize) as u32 })
+            .build();
+        Self {
+            cache,
+            sem: Semaphore::new(concurrency.max(1)),
+            cfg,
+            metrics,
+        }
+    }
+
+    pub fn cfg(&self) -> &TransformConfig {
+        &self.cfg
+    }
+
+    /// `Ok(Transformed)` from cache or freshly computed; `Ok(Raw)` when the
+    /// source is not a decodable image (serve the original bytes); `Err` for
+    /// over-cap (`BadRequest`), not-found, or internal failure.
+    pub async fn get_or_transform(
+        &self,
+        pool: &sqlx::PgPool,
+        db: &str,
+        id: &str,
+        params: TransformParams,
+    ) -> Result<Resolved, RtDbError> {
+        let key = format!(
+            "{id}|{:?}|{:?}|{:?}|{:?}|{:?}",
+            params.w, params.h, params.fit, params.q, params.format
+        );
+        if let Some(hit) = self.cache.get(&key).await {
+            self.metrics.record_image_transform_hit();
+            return Ok(Resolved::Transformed(hit));
+        }
+        // Bound concurrent decodes; 429 (Retry-After) if the queue stalls.
+        let permit = match tokio::time::timeout(Duration::from_secs(5), self.sem.acquire()).await {
+            Ok(Ok(p)) => p,
+            _ => return Err(RtDbError::rate_limited(2)),
+        };
+        // Double-checked: a concurrent request may have populated the cache.
+        if let Some(hit) = self.cache.get(&key).await {
+            drop(permit);
+            self.metrics.record_image_transform_hit();
+            return Ok(Resolved::Transformed(hit));
+        }
+        let (bytes, ct) = crate::storage::get(pool, db, id)
+            .await?
+            .ok_or_else(|| RtDbError::not_found("unknown file"))?;
+        let cfg = self.cfg.clone();
+        // `bytes` and `ct` are reused in the `NotImage` branch below, so clone
+        // the references the closure needs before moving them.
+        let bytes_for_closure = bytes.clone();
+        let ct_for_closure = ct.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            apply(&bytes_for_closure, ct_for_closure.as_deref(), &params, &cfg)
+        })
+        .await
+        .map_err(|e| RtDbError::internal(format!("transform join: {e}")))?;
+        drop(permit);
+        match result {
+            Ok((tbytes, tct)) => {
+                let n = tbytes.len() as u64;
+                let cached = CachedImage {
+                    bytes: Arc::from(tbytes),
+                    content_type: tct,
+                };
+                self.cache.insert(key, cached.clone()).await;
+                self.metrics.record_image_transform_miss(n);
+                Ok(Resolved::Transformed(cached))
+            }
+            Err(TransformError::NotImage) => Ok(Resolved::Raw {
+                bytes: Arc::from(bytes),
+                content_type: ct.unwrap_or_else(|| "application/octet-stream".to_string()),
+            }),
+            Err(TransformError::TooLarge) => {
+                self.metrics.record_image_transform_error();
+                Err(RtDbError::bad_request(
+                    "image exceeds max pixels for transform",
+                ))
+            }
+            Err(TransformError::Internal(m)) => {
+                self.metrics.record_image_transform_error();
+                Err(RtDbError::internal(m))
+            }
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
