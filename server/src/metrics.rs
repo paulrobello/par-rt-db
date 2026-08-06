@@ -119,6 +119,11 @@ pub struct Metrics {
     queries_total: AtomicU64,
     mutations_total: AtomicU64,
     uploads_total: AtomicU64,
+    // ---- Image transforms (ENH-014) ----
+    pub image_transforms_hit_total: AtomicU64,
+    pub image_transforms_miss_total: AtomicU64,
+    pub image_transforms_error_total: AtomicU64,
+    pub image_transform_bytes_total: AtomicU64,
     /// Current open `/sync` WebSocket connections (inc on auth, dec on close).
     ws_connections: AtomicI64,
     query_latency: Mutex<LatencySamples>,
@@ -166,6 +171,20 @@ impl Metrics {
     }
     pub fn record_upload(&self) {
         self.uploads_total.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn record_image_transform_hit(&self) {
+        self.image_transforms_hit_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn record_image_transform_miss(&self, out_bytes: u64) {
+        self.image_transforms_miss_total
+            .fetch_add(1, Ordering::Relaxed);
+        self.image_transform_bytes_total
+            .fetch_add(out_bytes, Ordering::Relaxed);
+    }
+    pub fn record_image_transform_error(&self) {
+        self.image_transforms_error_total
+            .fetch_add(1, Ordering::Relaxed);
     }
     pub fn ws_connect(&self) {
         self.ws_connections.fetch_add(1, Ordering::Relaxed);
@@ -321,6 +340,10 @@ impl Metrics {
                 .load(Ordering::Relaxed),
             subs_missed_pushes_total: self.subs_missed_pushes_total.load(Ordering::Relaxed),
             ttl_expired_total: self.ttl_expired_total.load(Ordering::Relaxed),
+            image_transforms_hit_total: self.image_transforms_hit_total.load(Ordering::Relaxed),
+            image_transforms_miss_total: self.image_transforms_miss_total.load(Ordering::Relaxed),
+            image_transforms_error_total: self.image_transforms_error_total.load(Ordering::Relaxed),
+            image_transform_bytes_total: self.image_transform_bytes_total.load(Ordering::Relaxed),
             per_db_subs: self.per_db_subs_snapshot(),
         }
     }
@@ -355,6 +378,13 @@ pub struct MetricsSnapshot {
     pub subs_missed_pushes_total: u64,
     /// Total expired documents deleted by the TTL reaper (all dbs/tables).
     pub ttl_expired_total: u64,
+    /// Image-transform cache lookups, by outcome (ENH-014).
+    pub image_transforms_hit_total: u64,
+    pub image_transforms_miss_total: u64,
+    pub image_transforms_error_total: u64,
+    /// Total bytes emitted by image transforms (miss path only; hits serve
+    /// from the cache and aren't re-encoded).
+    pub image_transform_bytes_total: u64,
     /// Per-database breakdown of the subscription-invalidation counters above
     /// (ENH-010). Empty until a `fan_out` records a decision; sorted by db.
     pub per_db_subs: Vec<DbSubCounterRow>,
@@ -440,6 +470,31 @@ pub fn render_prometheus(snap: &MetricsSnapshot, version: &str, git_commit: &str
         snap.ttl_expired_total
     ));
 
+    // Image transforms (ENH-014). `result` label mirrors the `class` label on
+    // subs_skips_total: one metric name, one sample per outcome.
+    s.push_str("# HELP rtdb_image_transforms_total Image transforms served, by result.\n");
+    s.push_str("# TYPE rtdb_image_transforms_total counter\n");
+    s.push_str(&format!(
+        "rtdb_image_transforms_total{{result=\"hit\"}} {}\n",
+        snap.image_transforms_hit_total
+    ));
+    s.push_str(&format!(
+        "rtdb_image_transforms_total{{result=\"miss\"}} {}\n",
+        snap.image_transforms_miss_total
+    ));
+    s.push_str(&format!(
+        "rtdb_image_transforms_total{{result=\"error\"}} {}\n",
+        snap.image_transforms_error_total
+    ));
+    s.push_str(
+        "# HELP rtdb_image_transform_bytes_total Total bytes emitted by image transforms.\n",
+    );
+    s.push_str("# TYPE rtdb_image_transform_bytes_total counter\n");
+    s.push_str(&format!(
+        "rtdb_image_transform_bytes_total {}\n",
+        snap.image_transform_bytes_total
+    ));
+
     // Gauges — point-in-time process/runtime state.
     s.push_str("# HELP rtdb_ws_connections Current open /sync WebSocket connections.\n");
     s.push_str("# TYPE rtdb_ws_connections gauge\n");
@@ -498,6 +553,10 @@ mod tests {
             subs_skip_verifications_total: 15,
             subs_missed_pushes_total: 0,
             ttl_expired_total: 0,
+            image_transforms_hit_total: 0,
+            image_transforms_miss_total: 0,
+            image_transforms_error_total: 0,
+            image_transform_bytes_total: 0,
             per_db_subs: Vec::new(),
         };
         let body = render_prometheus(&snap, "0.0.0", "abc");
@@ -536,6 +595,10 @@ mod tests {
             subs_skip_verifications_total: 7,
             subs_missed_pushes_total: 9,
             ttl_expired_total: 0,
+            image_transforms_hit_total: 0,
+            image_transforms_miss_total: 0,
+            image_transforms_error_total: 0,
+            image_transform_bytes_total: 0,
             per_db_subs: Vec::new(),
         };
         let body = render_prometheus(&snap, "0.0.0", "abc");
