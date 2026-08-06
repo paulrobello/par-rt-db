@@ -1,7 +1,9 @@
 //! Declarative schema migration: an ordered list of directives the server
 //! applies transactionally to transform a database's schema and documents.
 //! See docs/superpowers/specs/2026-07-31-schema-migration-backfill-design.md.
-use crate::ddl::{backfill_expr, indexed_fields, pg_col, pg_schema, pg_table};
+use crate::ddl::{
+    backfill_expr, indexed_fields, pg_col, pg_schema, pg_search_col, pg_table, pg_vector_col,
+};
 use crate::error::RtDbError;
 use crate::schema::{FieldType, SchemaDef, TableDef, indexed_column_type};
 use crate::txn::{DocOp, OpKind};
@@ -555,25 +557,47 @@ async fn apply_one(
             sqlx::query(&format!("DROP INDEX IF EXISTS \"{schema_name}\".\"{idx}\""))
                 .execute(&mut **tx)
                 .await?;
-            // Drop backing `f_` columns that the dropped index owned and NO
-            // remaining index still uses. `old` is the pre-migration schema
-            // (still has the dropped index's `.fields`); `derived` is
-            // post-migration (the index is gone). Without this, an orphan
-            // column makes a later push_schema's ADD COLUMN fail with
-            // "column already exists" (the next push treats the field as
-            // newly-indexed again).
+            // `old` is the pre-migration schema (still has the dropped index);
+            // `derived` is post-migration (the index is gone). Drop the index's
+            // generated/maintained columns that no surviving index owns, so a
+            // later push_schema/migrate re-creating the index can't collide on
+            // an orphan column — parity with `ddl::reconcile_diff`'s
+            // `drop_search_cols` / `drop_vector_cols` / `drop_columns`.
+            let dropped_index = old
+                .tables
+                .get(table)
+                .and_then(|t| t.indexes.iter().find(|i| i.name == *name));
+            let t_ident = pg_table(table);
+            // A dropped search index leaves its generated `s_` tsvector column.
+            if dropped_index.map(|i| i.search).unwrap_or(false) {
+                let sv_col = pg_search_col(name);
+                sqlx::query(&format!(
+                    "ALTER TABLE \"{schema_name}\".\"{t_ident}\" DROP COLUMN IF EXISTS \"{sv_col}\""
+                ))
+                .execute(&mut **tx)
+                .await?;
+            }
+            // A dropped vector index leaves its write-maintained `v_` vector(N)
+            // column (the vector field itself lives in `doc` jsonb, not a typed
+            // `f_` column).
+            if dropped_index.and_then(|i| i.vector.as_ref()).is_some() {
+                let v_col = pg_vector_col(name);
+                sqlx::query(&format!(
+                    "ALTER TABLE \"{schema_name}\".\"{t_ident}\" DROP COLUMN IF EXISTS \"{v_col}\""
+                ))
+                .execute(&mut **tx)
+                .await?;
+            }
+            // Drop backing `f_` columns the dropped index owned and NO remaining
+            // index still uses. Without this, an orphan column makes a later
+            // push_schema's ADD COLUMN fail with "column already exists".
             let still_indexed: BTreeSet<String> = derived
                 .tables
                 .get(table)
                 .map(indexed_fields)
                 .unwrap_or_default();
-            let dropped_fields: Vec<String> = old
-                .tables
-                .get(table)
-                .and_then(|t| t.indexes.iter().find(|i| i.name == *name))
-                .map(|i| i.fields.clone())
-                .unwrap_or_default();
-            let t_ident = pg_table(table);
+            let dropped_fields: Vec<String> =
+                dropped_index.map(|i| i.fields.clone()).unwrap_or_default();
             for field_name in dropped_fields {
                 if still_indexed.contains(&field_name) {
                     continue;

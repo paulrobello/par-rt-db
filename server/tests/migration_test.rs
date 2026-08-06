@@ -1448,3 +1448,110 @@ async fn drop_index_keeps_shared_column_when_another_index_uses_it() {
         .expect("re-adding by_name must not collide with the surviving f_name column");
     drop_db(&db).await;
 }
+
+/// `information_schema.columns` membership check for a physical column on a
+/// table. Used by the search/vector column-leak test below.
+async fn column_exists(db: &Db, table: &str, col: &str) -> bool {
+    let schema_name = format!("db_{}", db.name);
+    let table_ident = format!("t_{}", table.to_lowercase());
+    let (n,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM information_schema.columns \
+         WHERE table_schema = $1 AND table_name = $2 AND column_name = $3",
+    )
+    .bind(&schema_name)
+    .bind(&table_ident)
+    .bind(col)
+    .fetch_one(&db.state.pool)
+    .await
+    .expect("information_schema lookup");
+    n > 0
+}
+
+// Proves `Directive::DropIndex` drops a dropped search index's generated `s_`
+// tsvector column AND a dropped vector index's `v_` vector(N) column — parity
+// with `ddl::reconcile_diff`'s `drop_search_cols`/`drop_vector_cols`. Before
+// the fix, migrate::DropIndex dropped only the index and its `f_` columns,
+// leaving `s_`/`v_` orphaned, so the next push_schema re-creating the index
+// failed with "column already exists" (the leak the reconcile path already
+// fixed but the migrate path did not mirror).
+#[tokio::test]
+async fn drop_index_drops_search_and_vector_columns() {
+    let schema_json = r#"{"tables":{"docs":{"fields":{
+        "title":{"type":"string"},
+        "body":{"type":"string"},
+        "embedding":{"type":"vector","dimensions":3}
+    },"indexes":[
+        {"name":"search_body","fields":["title","body"],"search":true},
+        {"name":"by_embedding","fields":["embedding"],"vector":{"dimensions":3}}
+    ]}}}"#;
+    let mut db = setup_db_with_schema(schema_json).await;
+    // Insert so the maintained columns are real, not just schema metadata.
+    let _ = insert_doc(
+        &db,
+        "docs",
+        r#"{"title":"t","body":"b","embedding":[1.0,0.0,0.0]}"#,
+    )
+    .await;
+    let schema_name = format!("db_{}", db.name);
+
+    // Both generated columns exist before the migration.
+    assert!(
+        column_exists(&db, "docs", "s_search_body").await,
+        "search tsvector column present before dropIndex"
+    );
+    assert!(
+        column_exists(&db, "docs", "v_by_embedding").await,
+        "vector column present before dropIndex"
+    );
+
+    // migrate dropIndex both. Inline (persist the derived schema to `meta`) to
+    // mirror production `committer::handle_migrate` — a later push_schema loads
+    // the live schema from `meta`, so without persisting it the re-push below
+    // would not exercise the collision the fix prevents.
+    let request: MigrateRequest = serde_json::from_str(
+        r#"{"directives":[
+            {"op":"dropIndex","table":"docs","name":"search_body"},
+            {"op":"dropIndex","table":"docs","name":"by_embedding"}
+        ]}"#,
+    )
+    .expect("parse migrate request");
+    let derived = plan_migration(&db.schema, &request.directives).expect("plan migration");
+    let mut tx = db.state.pool.begin().await.expect("begin tx");
+    apply_migration(
+        &mut tx,
+        &db.name,
+        &request.directives,
+        &derived,
+        request.dry_run,
+    )
+    .await
+    .expect("apply migration");
+    let derived_json = serde_json::to_value(&derived).expect("serialize derived schema");
+    sqlx::query(&format!(
+        "INSERT INTO \"{schema_name}\".meta (key, value) VALUES ('schema', $1) \
+         ON CONFLICT (key) DO UPDATE SET value = excluded.value"
+    ))
+    .bind(derived_json)
+    .execute(&mut *tx)
+    .await
+    .expect("persist derived schema");
+    tx.commit().await.expect("commit migration tx");
+    db.schema = derived;
+
+    // THE FIX: both generated columns are gone (previously leaked).
+    assert!(
+        !column_exists(&db, "docs", "s_search_body").await,
+        "search tsvector column dropped with its index"
+    );
+    assert!(
+        !column_exists(&db, "docs", "v_by_embedding").await,
+        "vector column dropped with its index"
+    );
+
+    // Re-pushing the same schema must not collide on the (now-dropped) columns.
+    db.schema = serde_json::from_str(schema_json).expect("parse re-push schema");
+    push_schema(&db.state.pool, &db.name, db.schema.clone())
+        .await
+        .expect("re-push schema after dropIndex must not collide");
+    drop_db(&db).await;
+}
