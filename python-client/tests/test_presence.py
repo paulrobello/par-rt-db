@@ -56,6 +56,47 @@ def test_presence_state_always_carries_state() -> None:
     }
 
 
+def test_presence_state_ttl_omitted_when_none() -> None:
+    """ENH-015 ttl follow-up: ``ttlMs`` is omitted from the wire when ``None``
+    (mirrors the server's ``skip_serializing_if``). A bare ``presenceState``
+    frame round-trips to exactly ``{type, room, state}``."""
+    from par_rt_db.wire import _ClientPresenceState
+
+    frame = _ClientPresenceState(room="doc:1", state={"typing": True})
+    dumped = json.loads(frame.model_dump_json(by_alias=True))
+    assert dumped == {"type": "presenceState", "room": "doc:1", "state": {"typing": True}}
+    assert "ttlMs" not in dumped
+
+
+def test_presence_state_ttl_carried_when_set() -> None:
+    """ENH-015 ttl follow-up: ``ttl_ms=3000`` serializes as ``ttlMs: 3000``."""
+    from par_rt_db.wire import _ClientPresenceState
+
+    frame = _ClientPresenceState(room="doc:1", state={"typing": True}, ttl_ms=3000)
+    dumped = json.loads(frame.model_dump_json(by_alias=True))
+    assert dumped == {
+        "type": "presenceState",
+        "room": "doc:1",
+        "state": {"typing": True},
+        "ttlMs": 3000,
+    }
+
+
+def test_presence_state_ttl_accepts_camel_alias_on_parse() -> None:
+    """``populate_by_name=True`` + ``alias_generator=to_camel`` lets the wire
+    form ``ttlMs`` parse back into ``ttl_ms`` (round-trip parity)."""
+    adapter = TypeAdapter(ClientMessage)
+    msg = adapter.validate_python(
+        {"type": "presenceState", "room": "doc:1", "state": {}, "ttlMs": 250}
+    )
+    assert msg.model_dump(by_alias=True, mode="json") == {
+        "type": "presenceState",
+        "room": "doc:1",
+        "state": {},
+        "ttlMs": 250,
+    }
+
+
 def test_leave_presence_is_room_only() -> None:
     adapter = TypeAdapter(ClientMessage)
     msg = adapter.validate_python({"type": "leavePresence", "room": "doc:1"})
@@ -659,3 +700,206 @@ def test_in_memory_presence_two_clients_on_shared_rooms_see_each_other() -> None
         assert [m.connection_id for m in a_snaps[-1]] == ["a"]
     finally:
         a_handle.unsubscribe()
+
+
+# --- ENH-015 follow-up: presence ttl expiry --------------------------------
+#
+# Parity with ``rust-client/src/in_memory.rs`` ``presence_ttl_*`` tests and the
+# ts-client suite: ``ttl_ms > 0`` arms a per-state expiry that nulls ``state``
+# at ``now + ttl_ms`` (the member stays listed); a refresh without ``ttl_ms``
+# clears it; ``leave`` clears the entry so a re-join does not inherit a stale
+# ttl; ``expire`` is idempotent.
+
+
+def test_presence_ttl_expires_state_to_null_member_stays() -> None:
+    """``ttl_ms=1000`` at ``now=5000`` nulls the member's ``state`` at
+    ``now >= 6000``; the member stays listed; ``expire`` returns True then
+    idempotent False on a second sweep at the same instant."""
+    from par_rt_db.in_memory import PresenceRooms
+
+    rooms = PresenceRooms()
+    c1_states: list[tuple[object, str]] = []
+    handle = rooms.subscribe(
+        "room",
+        lambda members: c1_states.append(
+            next(
+                ((m.state, m.connection_id) for m in members if m.connection_id == "c1"),
+                (None, ""),
+            )
+        ),
+    )
+    try:
+        rooms.join("room", _member("c1", None))
+        rooms.update("room", "c1", {"typing": True}, ttl_ms=1000, now=5000)
+        # Two observations so far: join (None state) + update (typing).
+        assert c1_states[-1] == ({"typing": True}, "c1")
+
+        # Before expiry: no change, expire returns False.
+        assert rooms.expire(5999) is False
+        assert c1_states[-1] == ({"typing": True}, "c1")
+
+        # At/after expiry: state → null, member stays, expire returns True.
+        assert rooms.expire(6000) is True
+        assert c1_states[-1] == (None, "c1")
+
+        snap = rooms.snapshot("room")
+        assert len(snap) == 1, "member stays listed after expiry"
+        assert snap[0].state is None
+
+        # Idempotent: a second sweep at the same instant is a no-op.
+        assert rooms.expire(6000) is False
+        assert c1_states[-1] == (None, "c1")
+    finally:
+        handle.unsubscribe()
+
+
+def test_presence_ttl_refresh_without_ttl_clears_expiry() -> None:
+    """A refresh with ``ttl_ms=None`` clears any pending expiry — the state
+    persists past the original expiry instant."""
+    from par_rt_db.in_memory import PresenceRooms
+
+    rooms = PresenceRooms()
+    rooms.join("room", _member("c1", None))
+    rooms.update("room", "c1", {"typing": True}, ttl_ms=1000, now=5000)
+    rooms.update("room", "c1", {"typing": False}, ttl_ms=None, now=5500)
+    # Past the original expiry instant — no expiry armed, state persists.
+    assert rooms.expire(10_000) is False
+    snap = rooms.snapshot("room")
+    assert len(snap) == 1
+    assert snap[0].state == {"typing": False}
+
+
+def test_presence_ttl_leave_clears_expiry_entry() -> None:
+    """``leave`` clears the expiry entry, so a re-join with the same
+    connectionId does not inherit a stale ttl."""
+    from par_rt_db.in_memory import PresenceRooms
+
+    rooms = PresenceRooms()
+    rooms.join("room", _member("c1", None))
+    rooms.update("room", "c1", {"typing": True}, ttl_ms=1000, now=5000)
+    rooms.leave("room", "c1")
+    # After leave, the expiry map is empty (no fire, no panic).
+    assert rooms.expire(10_000) is False
+    # Re-join with the same connId does not carry the old ttl.
+    rooms.join("room", _member("c1", {"fresh": True}))
+    assert rooms.expire(10_000) is False
+    snap = rooms.snapshot("room")
+    assert len(snap) == 1
+    assert snap[0].state == {"fresh": True}
+
+
+def test_presence_ttl_client_update_presence_threads_ttl_and_clock() -> None:
+    """The client's ``update_presence`` forwards ``ttl_ms`` to ``PresenceRooms``
+    using the client's injected clock for ``now``. ``expire_presence`` drives
+    the same sweep through that clock. Two clients on shared rooms; one updates
+    with a short ttl; the other observes the null at expiry."""
+    from par_rt_db.in_memory import (
+        InMemoryRtDbClient,
+        InMemoryRtDbClientOptions,
+        PresenceRooms,
+    )
+    from par_rt_db.wire import AuthedUser
+
+    clock = [5000]
+
+    def now() -> int:
+        return clock[0]
+
+    rooms = PresenceRooms()
+    a = InMemoryRtDbClient(
+        InMemoryRtDbClientOptions(
+            connection_id="a",
+            now=now,
+            presence_rooms=rooms,
+            presence_user=AuthedUser(kind="user"),
+        )
+    )
+    b = InMemoryRtDbClient(
+        InMemoryRtDbClientOptions(
+            connection_id="b",
+            now=now,
+            presence_rooms=rooms,
+            presence_user=AuthedUser(kind="user"),
+        )
+    )
+    a_states: list[object] = []
+    b_handle = b.presence(
+        "room",
+        None,
+        lambda members: a_states.append(
+            next((m.state for m in members if m.connection_id == "a"), None)
+        ),
+    )
+    a_handle = a.presence("room", None, lambda _: None)
+    try:
+        # Advance the clock to t=5000 and refresh a with a 1000ms ttl.
+        clock[0] = 5000
+        a.update_presence("room", {"typing": True}, ttl_ms=1000)
+
+        # Before expiry: helper returns False, latest observed state is typing.
+        assert b.expire_presence(5999) is False
+        assert a_states[-1] == {"typing": True}
+
+        # After expiry: helper returns True, b observes the null.
+        assert b.expire_presence(6000) is True
+        assert a_states[-1] is None
+    finally:
+        a_handle.unsubscribe()
+        b_handle.unsubscribe()
+
+
+async def test_presence_ttl_update_presence_forwards_ttl_on_wire_when_connected() -> None:
+    """``update_presence(ttl_ms=...)`` puts ``ttlMs`` on the wire frame when
+    authenticated (parity with the ts-client/rust-client reactive clients)."""
+    conn = _FakeConn()
+    client = await _connected(conn)
+    try:
+        client.presence("doc:1", state={"v": 1})
+        await _drain()
+        client.update_presence("doc:1", {"v": 2}, ttl_ms=3000)
+        await _drain()
+        assert any(
+            json.loads(f)
+            == {
+                "type": "presenceState",
+                "room": "doc:1",
+                "state": {"v": 2},
+                "ttlMs": 3000,
+            }
+            for f in conn.sent
+        )
+    finally:
+        await client.close()
+
+
+async def test_presence_ttl_update_presence_omits_ttlms_when_none_on_wire() -> None:
+    """``update_presence(ttl_ms=None)`` omits ``ttlMs`` from the wire frame
+    (regression for the drop-None serializer)."""
+    conn = _FakeConn()
+    client = await _connected(conn)
+    try:
+        client.presence("doc:1")
+        await _drain()
+        client.update_presence("doc:1", {"v": 9}, ttl_ms=None)
+        await _drain()
+        frames = [json.loads(f) for f in conn.sent if json.loads(f).get("type") == "presenceState"]
+        assert frames, "expected a presenceState frame"
+        assert frames[-1] == {
+            "type": "presenceState",
+            "room": "doc:1",
+            "state": {"v": 9},
+        }
+        assert "ttlMs" not in frames[-1]
+    finally:
+        await client.close()
+
+
+def _member(conn_id: str, state: object):
+    """Build a ``PresenceMember`` for tests (mirrors rust ``presence_member``)."""
+    from par_rt_db.wire import AuthedUser, PresenceMember
+
+    return PresenceMember(
+        connection_id=conn_id,
+        user=AuthedUser(kind="user"),
+        state=state,  # type: ignore[arg-type]
+    )

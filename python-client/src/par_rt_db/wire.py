@@ -404,11 +404,23 @@ class _ClientPresence(_Camel):
 
 
 class _ClientPresenceState(_Camel):
-    """ENH-015 broadcast updated presence state for this connection in ``room``."""
+    """ENH-015 broadcast updated presence state for this connection in ``room``.
+
+    ``ttl_ms`` (ENH-015 follow-up) arms a per-state expiry; omitted on the wire
+    when ``None`` (the server clears ``state`` to ``null`` ``ttlMs`` after the
+    last refresh; the member stays)."""
 
     type: Literal["presenceState"] = "presenceState"
     room: str
     state: Any
+    ttl_ms: int | None = None
+
+    @model_serializer(mode="wrap")
+    def _drop_none_ttl(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        out = handler(self)
+        if out.get("ttlMs") is None:
+            out.pop("ttlMs", None)
+        return out
 
 
 class _ClientLeavePresence(_Camel):

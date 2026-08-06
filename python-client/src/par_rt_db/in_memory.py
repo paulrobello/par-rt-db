@@ -233,6 +233,13 @@ class FileMetadata:
 # option gets a private instance and only ever sees itself.
 
 
+def _wall_now() -> int:
+    """Wall-clock epoch ms; the default clock for :meth:`PresenceRooms.update`
+    / :meth:`PresenceRooms.expire` when the caller does not pass an explicit
+    ``now`` (tests should pass ``now`` for determinism, mirroring ttl/``tick``)."""
+    return int(time.time() * 1000)
+
+
 class PresenceRooms:
     """Shared in-memory presence backing for tests.
 
@@ -253,6 +260,10 @@ class PresenceRooms:
         # room -> list of (alive flag, callback). The alive flag is a one-element
         # list shared with the handle (same pattern as _Subscription).
         self._subs: dict[str, list[tuple[list[bool], Callable[[list[PresenceMember]], None]]]] = {}
+        # room -> connectionId -> expiresAt (ms). Parallel to ``_members`` so the
+        # server→client ``PresenceMember`` snapshot shape stays byte-identical —
+        # expiry metadata never appears on the wire (parity with ts/rust). ENH-015.
+        self._expiry: dict[str, dict[str, int]] = {}
 
     def snapshot(self, room: str) -> list[PresenceMember]:
         """Current members of ``room`` in join order (empty if no such room)."""
@@ -272,10 +283,23 @@ class PresenceRooms:
             entries.append((member.connection_id, member))
         self._fan_out(room)
 
-    def update(self, room: str, connection_id: str, state: Any) -> None:
+    def update(
+        self,
+        room: str,
+        connection_id: str,
+        state: Any,
+        ttl_ms: int | None = None,
+        now: int | None = None,
+    ) -> None:
         """Update ``connection_id``'s state in ``room`` and fan out. No-op if the
         connection is not in the room (mirrors the live server ignoring a
-        non-member update)."""
+        non-member update).
+
+        When ``ttl_ms`` is an ``int > 0``, schedules an expiry sweep that nulls
+        this member's ``state`` at ``now + ttl_ms`` (the member stays listed);
+        ``None`` (or ``<= 0``) clears any pending expiry — parity with the
+        ts/rust harness and the live server's "ttlMs after the last refresh"
+        semantics (ENH-015 follow-up). ``now`` defaults to wall-clock ms."""
         entries = self._members.get(room)
         if entries is None:
             return
@@ -285,11 +309,20 @@ class PresenceRooms:
                     cid,
                     PresenceMember(connection_id=connection_id, user=existing.user, state=state),
                 )
+                exp = self._expiry.setdefault(room, {})
+                if isinstance(ttl_ms, int) and ttl_ms > 0:
+                    exp[connection_id] = (now if now is not None else _wall_now()) + ttl_ms
+                else:
+                    exp.pop(connection_id, None)
+                    if not exp:
+                        self._expiry.pop(room, None)
                 self._fan_out(room)
                 return
 
     def leave(self, room: str, connection_id: str) -> None:
-        """Remove ``connection_id`` from ``room`` and fan out. No-op if absent."""
+        """Remove ``connection_id`` from ``room`` and fan out. No-op if absent.
+        Also clears any pending expiry entry so a re-join with the same
+        connectionId does not inherit a stale ttl (ENH-015 follow-up)."""
         entries = self._members.get(room)
         if entries is None:
             return
@@ -299,7 +332,59 @@ class PresenceRooms:
             return  # was not a member — no fan-out
         if not entries:
             self._members.pop(room, None)
+        exp = self._expiry.get(room)
+        if exp is not None:
+            exp.pop(connection_id, None)
+            if not exp:
+                self._expiry.pop(room, None)
         self._fan_out(room)
+
+    def expire(self, now: int | None = None) -> bool:
+        """Clear expired members' ``state`` to ``None`` (the member stays listed)
+        and fan out each touched room once. Returns ``True`` if anything expired.
+        Mirrors the live server's per-connection ttl clearing
+        (``server::presence::expire_once``) and the ts/rust harness's ``expire``
+        (ENH-015 follow-up). Idempotent: a second sweep with the same ``now`` is a
+        no-op (the expiry entries were drained). ``now`` defaults to wall-clock ms."""
+        cur = now if now is not None else _wall_now()
+        any_expired = False
+        touched: list[str] = []
+        # Drain the rooms that currently have an expiry map; we can't iterate
+        # ``self._expiry`` while mutating it, so snapshot the rooms first.
+        for room in list(self._expiry.keys()):
+            exp = self._expiry.get(room)
+            if exp is None:
+                continue
+            entries = self._members.get(room)
+            if entries is None:
+                # Room was dropped (e.g. last member left) — drop its expiry map.
+                self._expiry.pop(room, None)
+                continue
+            due = [cid for cid, at in exp.items() if at <= cur]
+            for cid in due:
+                exp.pop(cid, None)
+            if not exp:
+                self._expiry.pop(room, None)
+            if not due:
+                continue
+            room_touched = False
+            for i, (cid, existing) in enumerate(entries):
+                if cid in due:
+                    entries[i] = (
+                        cid,
+                        PresenceMember(
+                            connection_id=existing.connection_id,
+                            user=existing.user,
+                            state=None,
+                        ),
+                    )
+                    any_expired = True
+                    room_touched = True
+            if room_touched:
+                touched.append(room)
+        for room in touched:
+            self._fan_out(room)
+        return any_expired
 
     def subscribe(
         self, room: str, cb: Callable[[list[PresenceMember]], None]
@@ -1539,13 +1624,32 @@ class InMemoryRtDbClient:
         self._presence_unsubs.setdefault(room, []).append(handle)
         return handle
 
-    def update_presence(self, room: str, state: Any) -> None:
+    def update_presence(self, room: str, state: Any, ttl_ms: int | None = None) -> None:
         """Broadcast updated ``state`` for this connection in ``room``. No-op if
         this client has not joined ``room`` (mirrors the live server ignoring a
-        non-member update)."""
+        non-member update).
+
+        When ``ttl_ms`` is an ``int > 0``, the harness schedules an expiry that
+        nulls this member's ``state`` at ``now + ttl_ms`` (the member stays
+        listed); ``None`` (or ``<= 0``) clears any pending expiry. Call
+        :meth:`expire_presence` to run the sweep (note: :meth:`tick` only reaps
+        document TTL, not presence ttl — parity with ts/rust). The client's
+        injected clock (``InMemoryRtDbClientOptions.now``) supplies ``now``, so
+        tests that inject a controllable clock get deterministic expiry
+        (ENH-015 follow-up; parity with ts/rust)."""
         if room not in self._joined_rooms:
             return
-        self._presence_rooms.update(room, self._connection_id, state)
+        self._presence_rooms.update(room, self._connection_id, state, ttl_ms, self._now())
+
+    def expire_presence(self, now: int | None = None) -> bool:
+        """Run a presence-ttl expiry sweep: clears expired members' ``state`` to
+        ``None`` (the member stays listed) and fans out each touched room once.
+        Returns ``True`` if anything expired. Mirrors the live server's
+        per-connection ttl clearing (``server::presence::expire_once``) and the
+        ts/rust harness ``expire``. Use this in tests that don't otherwise drive
+        the clock via :meth:`tick`; pass an explicit ``now`` for determinism,
+        else the client's injected clock is used (ENH-015 follow-up)."""
+        return self._presence_rooms.expire(now if now is not None else self._now())
 
     def leave_presence(self, room: str) -> None:
         """Leave ``room``: drop every local subscriber this client registered for

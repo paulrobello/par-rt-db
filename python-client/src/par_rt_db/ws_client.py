@@ -657,17 +657,25 @@ class RtDbClient:
         rm.handle_count += 1
         return Presence(self, rm)
 
-    def update_presence(self, room: str, state: Any) -> None:
+    def update_presence(self, room: str, state: Any, ttl_ms: int | None = None) -> None:
         """Broadcast updated ``state`` for this connection in ``room``. Also
         advances the cached join state so a reconnect/``authOk`` replay carries
         the latest value. The wire frame is sent ONLY when authenticated — a
-        pre-auth update just advances the cached state of the buffered join."""
+        pre-auth update just advances the cached state of the buffered join.
+
+        ``ttl_ms`` (ENH-015 follow-up) arms a per-state expiry on the server
+        (forwarded as ``ttlMs``; omitted when ``None``); the server clears this
+        connection's ``state`` to ``null`` ``ttl_ms`` after the last refresh and
+        the member stays listed. ttl rides on ``update_presence`` only — the join
+        frame is unchanged."""
         rm = self._presence_by_room.get(room)
         if rm is None:
             return  # not joined — mirrors the live server ignoring a non-member
         rm.join_state = state
         if self._state is ConnectionState.CONNECTED:
-            frame = _ClientPresenceState(room=room, state=state).model_dump_json(by_alias=True)
+            frame = _ClientPresenceState(room=room, state=state, ttl_ms=ttl_ms).model_dump_json(
+                by_alias=True
+            )
             asyncio.get_running_loop().create_task(self._send(frame))
 
     def leave_presence(self, room: str) -> None:
