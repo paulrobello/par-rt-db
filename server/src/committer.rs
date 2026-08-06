@@ -60,6 +60,15 @@ pub enum CommitterRequest {
     /// delete inside its serialized turn and publishes through the four tap
     /// sites with `source = "ttl"`.
     RunReaper,
+    /// Restore the database's schema shape to a captured `schema_history`
+    /// snapshot. Serialized through the committer like `RunMigrate`: the
+    /// destructive DDL reconcile runs inside the serialized turn, the outgoing
+    /// schema is captured first (so the restore is itself undoable), and the
+    /// incoming schema is captured after. `reply` carries the restored version.
+    RunRestoreSchema {
+        target_version: i64,
+        reply: oneshot::Sender<Result<i64, RtDbError>>,
+    },
 }
 
 /// Owns one serialized committer task per database. Every mutation and every
@@ -274,6 +283,30 @@ impl Committers {
             .map_err(|_| RtDbError::internal("committer task dropped the reply"))?
     }
 
+    /// Restores `db`'s schema shape to the captured `schema_history` snapshot
+    /// at `target_version` and waits for the commit-then-fan-out cycle to
+    /// complete. Funneled through the per-db committer like `migrate` so the
+    /// destructive reconcile (drop tables/columns/indexes in the live shape but
+    /// not the target, then additive-create the inverse) runs inside the only
+    /// writer's serialized turn. The outgoing (current) schema is captured to
+    /// history first, so a restore is itself undoable; the incoming (target)
+    /// schema is captured after, so the latest history row always equals the
+    /// live schema. Returns the restored version. See `handle_restore_schema`.
+    pub async fn restore_schema(&self, db: &str, target_version: i64) -> Result<i64, RtDbError> {
+        let (reply, reply_rx) = oneshot::channel();
+        self.submit(
+            db,
+            CommitterRequest::RunRestoreSchema {
+                target_version,
+                reply,
+            },
+        )
+        .await?;
+        reply_rx
+            .await
+            .map_err(|_| RtDbError::internal("committer task dropped the reply"))?
+    }
+
     /// Runs `query` on `db`, sends the initial result on `tx`, and registers
     /// the subscription for future push-on-change updates. `principal_ctx` is
     /// the subscriber's per-row auth identity (captured on the `SubEntry` and
@@ -407,6 +440,13 @@ async fn run_committer(
                 if let Err(err) = handle_reaper(&ctx).await {
                     tracing::error!(db = %ctx.db, error = %err, "ttl reaper handling failed");
                 }
+            }
+            CommitterRequest::RunRestoreSchema {
+                target_version,
+                reply,
+            } => {
+                let outcome = handle_restore_schema(&ctx, target_version).await;
+                let _ = reply.send(outcome);
             }
         }
     }
@@ -785,6 +825,15 @@ async fn handle_migrate(
     tx.commit().await?;
     ctx.schemas.put(&ctx.db, derived.clone()).await;
 
+    // Schema history capture — best-effort, like the audit/webhook taps below.
+    // `derived` is the post-migration schema; principal is None (migrate carries
+    // no interactive principal — matches the audit `owner = None` for migrate).
+    if let Err(err) =
+        crate::schema_history::capture(&ctx.pool, &ctx.db, "migrate", None, &derived).await
+    {
+        tracing::warn!(db = %ctx.db, error = %err, "schema history capture failed");
+    }
+
     // Four tap sites — same contract as `handle_mutate`. The hand-built
     // `WriteSet` carries the touched tables (the subscription re-run gate) and
     // the per-doc ops; `docs`/`doc_values` empty ⇒ table-level re-run, the safe
@@ -826,6 +875,89 @@ async fn handle_migrate(
         schema: derived,
         directives: fx.reports,
     })
+}
+
+/// Restores the database's schema shape to a captured `schema_history`
+/// snapshot, mirroring `handle_migrate`'s structure (load current → begin tx →
+/// DDL → meta upsert → commit → cache refresh → capture → fan-out).
+///
+/// Single-writer invariant: like `handle_migrate`, this opens its own
+/// `pool.begin()` inside the committer task's serialized turn (the only
+/// writer) and never calls `execute_txn`. The destructive reconcile
+/// (`ddl::reconcile_schema_destructive`) drops tables/columns/indexes present
+/// in the live shape but absent from the target snapshot, then
+/// `apply_schema_additive` creates the inverse — all in the one tx.
+///
+/// Two `schema_history` captures bracket the apply: the OUTGOING (current)
+/// schema first, so the restore is itself a versioned, undoable operation; the
+/// INCOMING (target) schema after, so "latest history row == live schema"
+/// stays invariant. Both best-effort (warn, never propagate — the schema change
+/// already committed by then), matching the audit/webhook tap discipline.
+/// Restore does NOT write `audit_log`/`webhook` rows — it is DDL, not DocOps;
+/// `schema_history` is its trail.
+///
+/// Subscription re-evaluation: the reconcile returns the touched table set,
+/// which feeds `fan_out` as a `WriteSet` (table-level re-run, the safe
+/// over-approximation — no per-doc `doc_values` are captured for a shape
+/// change, mirroring `handle_migrate`).
+async fn handle_restore_schema(ctx: &CommitterCtx, target_version: i64) -> Result<i64, RtDbError> {
+    let current = crate::db::load_schema(&ctx.pool, &ctx.db)
+        .await?
+        .ok_or_else(|| RtDbError::not_found("database has no schema"))?;
+    let entry = crate::schema_history::get(&ctx.pool, &ctx.db, target_version)
+        .await?
+        .ok_or_else(|| RtDbError::not_found("schema version not found"))?;
+    let target: crate::schema::SchemaDef = serde_json::from_value(entry.schema).map_err(|e| {
+        tracing::error!(db = %ctx.db, error = %e, "failed to decode schema snapshot");
+        RtDbError::internal("failed to decode schema snapshot")
+    })?;
+    target.validate()?;
+
+    // Safety net: capture the outgoing schema first so the restore is undoable.
+    if let Err(err) =
+        crate::schema_history::capture(&ctx.pool, &ctx.db, "restore", None, &current).await
+    {
+        tracing::warn!(db = %ctx.db, error = %err, "schema history capture (outgoing) failed");
+    }
+
+    let mut tx = ctx.pool.begin().await?;
+    let touched =
+        crate::ddl::reconcile_schema_destructive(&mut tx, &ctx.db, &current, &target).await?;
+    // Persist the target blob (same shape as push/migrate tails).
+    let schema_json = serde_json::to_value(&target).map_err(|e| {
+        tracing::error!(db = %ctx.db, error = %e, "failed to serialize schema");
+        RtDbError::internal("failed to serialize schema")
+    })?;
+    let schema_name = crate::ddl::pg_schema(&ctx.db);
+    sqlx::query(&format!(
+        "INSERT INTO \"{schema_name}\".meta (key, value) VALUES ('schema', $1) \
+         ON CONFLICT (key) DO UPDATE SET value = excluded.value"
+    ))
+    .bind(schema_json)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    ctx.schemas.put(&ctx.db, target.clone()).await;
+
+    // Capture the incoming (target) state so the latest history row == live schema.
+    if let Err(err) =
+        crate::schema_history::capture(&ctx.pool, &ctx.db, "restore", None, &target).await
+    {
+        tracing::warn!(db = %ctx.db, error = %err, "schema history capture (incoming) failed");
+    }
+
+    // Re-evaluate subscriptions: dropped tables/columns invalidate their subs.
+    // Table-level re-run (no per-doc `doc_values`) — the safe over-approximation
+    // for a shape change, same as `handle_migrate`.
+    let write_set = WriteSet {
+        tables: touched.into_iter().collect(),
+        ..Default::default()
+    };
+    ctx.subs
+        .fan_out(&ctx.pool, &ctx.db, &target, &write_set)
+        .await;
+
+    Ok(target_version)
 }
 
 async fn handle_subscribe(

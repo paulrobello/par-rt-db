@@ -231,8 +231,38 @@ pub async fn push_schema(
         .execute(&mut *tx)
         .await?;
 
+    apply_schema_additive(&mut tx, &pg_schema_name, previous.as_ref(), &schema).await?;
+
+    let schema_json = serde_json::to_value(&schema).map_err(|err| {
+        tracing::error!(error = %err, db, "failed to serialize schema for storage");
+        RtDbError::internal("failed to store schema")
+    })?;
+    sqlx::query(&format!(
+        "INSERT INTO \"{pg_schema_name}\".meta (key, value) VALUES ('schema', $1) \
+         ON CONFLICT (key) DO UPDATE SET value = excluded.value"
+    ))
+    .bind(schema_json)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    Ok(schema)
+}
+
+/// Additive table + index DDL shared by `push_schema` and the destructive
+/// reconcile. `previous` is the currently-applied schema (`None` = fresh); only
+/// NEW tables/columns/indexes (in `schema` but not `previous`) are created.
+/// Runs inside the caller's transaction. No `meta` upsert — the caller owns
+/// that. Pure extraction of the per-table CREATE/ALTER + index-creation loop
+/// that used to live inline in `push_schema`; behavior identical.
+async fn apply_schema_additive(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    pg_schema_name: &str,
+    previous: Option<&SchemaDef>,
+    schema: &SchemaDef,
+) -> Result<(), RtDbError> {
     for (table_name, new_table) in &schema.tables {
-        let old_table = previous.as_ref().and_then(|s| s.tables.get(table_name));
+        let old_table = previous.and_then(|s| s.tables.get(table_name));
         let table_ident = pg_table(table_name);
         let new_indexed = indexed_fields(new_table);
 
@@ -255,7 +285,7 @@ pub async fn push_schema(
                     "CREATE TABLE \"{pg_schema_name}\".\"{table_ident}\" ({})",
                     columns.join(", ")
                 );
-                sqlx::query(&sql).execute(&mut *tx).await?;
+                sqlx::query(&sql).execute(&mut **tx).await?;
             }
             Some(old_table) => {
                 let old_indexed = indexed_fields(old_table);
@@ -267,14 +297,14 @@ pub async fn push_schema(
                     sqlx::query(&format!(
                         "ALTER TABLE \"{pg_schema_name}\".\"{table_ident}\" ADD COLUMN IF NOT EXISTS \"{col}\" {pg_type}"
                     ))
-                    .execute(&mut *tx)
+                    .execute(&mut **tx)
                     .await?;
 
                     let expr = backfill_expr(pg_type, field_name)?;
                     sqlx::query(&format!(
                         "UPDATE \"{pg_schema_name}\".\"{table_ident}\" SET \"{col}\" = {expr} WHERE doc ? '{field_name}'"
                     ))
-                    .execute(&mut *tx)
+                    .execute(&mut **tx)
                     .await?;
                 }
             }
@@ -316,13 +346,13 @@ pub async fn push_schema(
                      (to_tsvector('{regconfig}'::regconfig, {})) STORED",
                     terms.join(" || ' ' || ")
                 ))
-                .execute(&mut *tx)
+                .execute(&mut **tx)
                 .await?;
                 sqlx::query(&format!(
                     "CREATE INDEX \"{index_ident}\" ON \"{pg_schema_name}\".\"{table_ident}\" \
                      USING GIN (\"{sv_col}\")"
                 ))
-                .execute(&mut *tx)
+                .execute(&mut **tx)
                 .await?;
             } else if let Some(vec_spec) = &index.vector {
                 // Vector index: a plain `vector(N)` column (write-maintained by
@@ -340,7 +370,7 @@ pub async fn push_schema(
                     "ALTER TABLE \"{pg_schema_name}\".\"{table_ident}\" \
                      ADD COLUMN \"{v_col}\" vector({dim})"
                 ))
-                .execute(&mut *tx)
+                .execute(&mut **tx)
                 .await?;
                 // Backfill from existing rows (no-op on a brand-new table).
                 // `vfield` is a doc field name validated by is_valid_identifier
@@ -350,14 +380,14 @@ pub async fn push_schema(
                      SET \"{v_col}\" = (doc->>'{vfield}')::vector \
                      WHERE doc ? '{vfield}'"
                 ))
-                .execute(&mut *tx)
+                .execute(&mut **tx)
                 .await?;
                 let opclass = vec_spec.metric.opclass();
                 sqlx::query(&format!(
                     "CREATE INDEX \"{index_ident}\" ON \"{pg_schema_name}\".\"{table_ident}\" \
                      USING hnsw (\"{v_col}\" {opclass})"
                 ))
-                .execute(&mut *tx)
+                .execute(&mut **tx)
                 .await?;
             } else {
                 let cols: Vec<String> = index
@@ -387,7 +417,7 @@ pub async fn push_schema(
                         "SELECT {grouped} FROM \"{pg_schema_name}\".\"{table_ident}\"{where_sql} \
                          GROUP BY {grouped} HAVING count(*) > 1 LIMIT 5"
                     );
-                    match sqlx::query(&sql).fetch_all(&mut *tx).await {
+                    match sqlx::query(&sql).fetch_all(&mut **tx).await {
                         Ok(rows) if !rows.is_empty() => {
                             return Err(RtDbError::conflict(format!(
                                 "unique index '{}' cannot be created: {} existing row(s) duplicate its key",
@@ -421,7 +451,7 @@ pub async fn push_schema(
                 sqlx::query(&format!(
                     "CREATE {unique_kw}INDEX \"{index_ident}\" ON \"{pg_schema_name}\".\"{table_ident}\" ({index_cols}){where_sql}"
                 ))
-                .execute(&mut *tx)
+                .execute(&mut **tx)
                 .await?;
             }
         }
@@ -449,25 +479,154 @@ pub async fn push_schema(
                  WHERE \"{col}\" IS NULL"
             ))
             .bind(d)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
         }
     }
+    Ok(())
+}
 
-    let schema_json = serde_json::to_value(&schema).map_err(|err| {
-        tracing::error!(error = %err, db, "failed to serialize schema for storage");
-        RtDbError::internal("failed to store schema")
-    })?;
-    sqlx::query(&format!(
-        "INSERT INTO \"{pg_schema_name}\".meta (key, value) VALUES ('schema', $1) \
-         ON CONFLICT (key) DO UPDATE SET value = excluded.value"
-    ))
-    .bind(schema_json)
-    .execute(&mut *tx)
-    .await?;
+/// Pure enumeration of the DDL needed to make `current`'s shape match `target`.
+/// The inverse of `detect_destructive_changes`: instead of rejecting the first
+/// difference, it lists everything to drop and (via `apply_schema_additive`) add.
+pub(crate) struct ReconcileDiff {
+    pub drop_tables: Vec<String>,
+    /// `(table, index_name)` — drop these indexes (by their physical ident).
+    pub drop_indexes: Vec<(String, String)>,
+    /// `(table, field_name)` — drop these typed index columns (doc jsonb is preserved).
+    pub drop_columns: Vec<(String, String)>,
+    /// search indexes to drop also need their generated tsvector column removed.
+    pub drop_search_cols: Vec<(String, String)>,
+    /// vector indexes to drop also need their write-maintained `vector(N)`
+    /// column removed (the `v_<index>` column; the vector field itself is NOT a
+    /// typed `f_` column — it lives only in `doc` jsonb and the `v_` column).
+    pub drop_vector_cols: Vec<(String, String)>,
+}
 
-    tx.commit().await?;
-    Ok(schema)
+pub(crate) fn reconcile_diff(current: &SchemaDef, target: &SchemaDef) -> ReconcileDiff {
+    let mut drop_tables = Vec::new();
+    let mut drop_indexes = Vec::new();
+    let mut drop_columns = Vec::new();
+    let mut drop_search_cols = Vec::new();
+    let mut drop_vector_cols = Vec::new();
+
+    for (table_name, cur_table) in &current.tables {
+        match target.tables.get(table_name) {
+            None => drop_tables.push(table_name.clone()),
+            Some(tgt_table) => {
+                let cur_indexed_set = indexed_fields(cur_table);
+                let tgt_indexed_set = indexed_fields(tgt_table);
+                let cur_indexed: HashSet<&str> =
+                    cur_indexed_set.iter().map(String::as_str).collect();
+                let tgt_indexed: HashSet<&str> =
+                    tgt_indexed_set.iter().map(String::as_str).collect();
+                for field in cur_indexed.difference(&tgt_indexed) {
+                    drop_columns.push((table_name.clone(), field.to_string()));
+                }
+                let tgt_index_names: HashSet<&str> =
+                    tgt_table.indexes.iter().map(|i| i.name.as_str()).collect();
+                for idx in &cur_table.indexes {
+                    if !tgt_index_names.contains(idx.name.as_str()) {
+                        drop_indexes.push((table_name.clone(), idx.name.clone()));
+                        if idx.search {
+                            drop_search_cols.push((table_name.clone(), idx.name.clone()));
+                        }
+                        if idx.vector.is_some() {
+                            drop_vector_cols.push((table_name.clone(), idx.name.clone()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    ReconcileDiff {
+        drop_tables,
+        drop_indexes,
+        drop_columns,
+        drop_search_cols,
+        drop_vector_cols,
+    }
+}
+
+/// Destructive reconcile: drop tables/columns/indexes in `current` but not
+/// `target`, add those in `target` but not `current`, inside the caller's tx.
+/// Returns the set of touched table names (for subscription fan-out). Does NOT
+/// touch `meta` — the caller upserts the target blob.
+///
+/// Drop order is indexes → search-generated tsvector columns → vector-index
+/// `vector(N)` columns → typed `f_` columns → tables, so each index's
+/// generated/maintained column is removed before any backing `f_` column, and
+/// indexes always go before any column/table they depend on. Identifiers are
+/// produced by the existing validated `pg_*` helpers and `IF EXISTS` guards
+/// every drop, so a partial state from a prior failed reconcile is itself
+/// reconcilable. Document jsonb is never touched — only the redundant
+/// typed/index copies are — so a restore that removes an index column preserves
+/// the doc data.
+pub async fn reconcile_schema_destructive(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    db: &str,
+    current: &SchemaDef,
+    target: &SchemaDef,
+) -> Result<Vec<String>, RtDbError> {
+    let pg_schema_name = pg_schema(db);
+    let diff = reconcile_diff(current, target);
+    let mut touched: HashSet<String> = HashSet::new();
+
+    for (table, index_name) in &diff.drop_indexes {
+        let index_ident = format!("i_{}_{}", table.to_lowercase(), index_name.to_lowercase());
+        sqlx::query(&format!(
+            "DROP INDEX IF EXISTS \"{pg_schema_name}\".\"{index_ident}\""
+        ))
+        .execute(&mut **tx)
+        .await?;
+        touched.insert(table.clone());
+    }
+    for (table, index_name) in &diff.drop_search_cols {
+        let table_ident = pg_table(table);
+        let sv_col = pg_search_col(index_name);
+        sqlx::query(&format!(
+            "ALTER TABLE \"{pg_schema_name}\".\"{table_ident}\" DROP COLUMN IF EXISTS \"{sv_col}\""
+        ))
+        .execute(&mut **tx)
+        .await?;
+        touched.insert(table.clone());
+    }
+    for (table, index_name) in &diff.drop_vector_cols {
+        let table_ident = pg_table(table);
+        let v_col = pg_vector_col(index_name);
+        sqlx::query(&format!(
+            "ALTER TABLE \"{pg_schema_name}\".\"{table_ident}\" DROP COLUMN IF EXISTS \"{v_col}\""
+        ))
+        .execute(&mut **tx)
+        .await?;
+        touched.insert(table.clone());
+    }
+    for (table, field) in &diff.drop_columns {
+        let table_ident = pg_table(table);
+        let col = pg_col(field);
+        sqlx::query(&format!(
+            "ALTER TABLE \"{pg_schema_name}\".\"{table_ident}\" DROP COLUMN IF EXISTS \"{col}\""
+        ))
+        .execute(&mut **tx)
+        .await?;
+        touched.insert(table.clone());
+    }
+    for table in &diff.drop_tables {
+        let table_ident = pg_table(table);
+        sqlx::query(&format!(
+            "DROP TABLE IF EXISTS \"{pg_schema_name}\".\"{table_ident}\""
+        ))
+        .execute(&mut **tx)
+        .await?;
+        touched.insert(table.clone());
+    }
+
+    // Additive side: anything in target not in (post-drop) current.
+    apply_schema_additive(tx, &pg_schema_name, Some(current), target).await?;
+    for table_name in target.tables.keys() {
+        touched.insert(table_name.clone());
+    }
+    Ok(touched.into_iter().collect())
 }
 
 #[cfg(test)]

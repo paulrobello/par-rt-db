@@ -8,7 +8,11 @@ import type {
 } from "../src/admin.js";
 import { RtDbAdminClient } from "../src/admin.js";
 import { Migration } from "../src/migration.js";
-import type { TransactionJson } from "../src/protocol.js";
+import type {
+  SchemaHistoryEntry,
+  SchemaHistoryEntrySummary,
+  TransactionJson,
+} from "../src/protocol.js";
 import { defineSchema, defineTable, t } from "../src/schema.js";
 
 function jsonResponse(body: unknown, status = 200): Response {
@@ -452,6 +456,91 @@ describe("RtDbAdminClient — new endpoints", () => {
       name: "RtDbError",
       code: "BAD_REQUEST",
       message: "renamed field 'users.nope' does not exist",
+    });
+  });
+
+  it("getSchemaHistory GETs /admin/db/{db}/schema/history and unwraps {entries}", async () => {
+    // Two fixtures: a push by an interactive principal, and a system-initiated
+    // restore where `principal` comes back as JSON null.
+    const entries: SchemaHistoryEntrySummary[] = [
+      { version: 3, capturedAt: 1_700_000_000_003, source: "restore", principal: null },
+      { version: 2, capturedAt: 1_700_000_000_002, source: "migrate", principal: "u@x.com" },
+      { version: 1, capturedAt: 1_700_000_000_001, source: "push", principal: "u@x.com" },
+    ];
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ entries }));
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+    await expect(admin.getSchemaHistory("kanban")).resolves.toEqual(entries);
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("http://h:8300/admin/db/kanban/schema/history");
+    expect(init.method).toBe("GET");
+    expect(init.headers.Authorization).toBe("Bearer k");
+  });
+
+  it("getSchemaHistory forwards limit/offset as a query string and omits it when absent", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ entries: [] }));
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+    await admin.getSchemaHistory("kanban", { limit: 10, offset: 20 });
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "http://h:8300/admin/db/kanban/schema/history?limit=10&offset=20",
+    );
+  });
+
+  it("getSchemaVersion GETs /admin/db/{db}/schema/history/{version} and returns the entry with schema", async () => {
+    const entry: SchemaHistoryEntry = {
+      version: 2,
+      capturedAt: 1_700_000_000_002,
+      source: "migrate",
+      principal: "u@x.com",
+      schema: { tables: { items: { fields: { title: { type: "string" } } } } },
+    };
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(entry));
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+    await expect(admin.getSchemaVersion("kanban", 2)).resolves.toEqual(entry);
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("http://h:8300/admin/db/kanban/schema/history/2");
+    expect(init.method).toBe("GET");
+    expect(init.headers.Authorization).toBe("Bearer k");
+  });
+
+  it("restoreSchema POSTs {version, confirm} to /admin/db/{db}/schema/restore and unwraps {ok, restoredTo}", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ ok: true, restoredTo: 2 }));
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+    await expect(admin.restoreSchema("kanban", 2, "kanban")).resolves.toEqual({
+      ok: true,
+      restoredTo: 2,
+    });
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("http://h:8300/admin/db/kanban/schema/restore");
+    expect(init.method).toBe("POST");
+    expect(init.headers.Authorization).toBe("Bearer k");
+    expect(JSON.parse(init.body)).toEqual({ version: 2, confirm: "kanban" });
+  });
+
+  it("restoreSchema surfaces a 400 confirmation-mismatch envelope as RtDbError", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(
+        jsonResponse({ code: "BAD_REQUEST", message: "confirm must equal the database name" }, 400),
+      );
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+    await expect(admin.restoreSchema("kanban", 2, "wrong")).rejects.toMatchObject({
+      name: "RtDbError",
+      code: "BAD_REQUEST",
+      message: "confirm must equal the database name",
+    });
+  });
+
+  it("restoreSchema surfaces a 404 unknown-snapshot envelope as RtDbError", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(
+        jsonResponse({ code: "NOT_FOUND", message: "schema snapshot not found" }, 404),
+      );
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+    await expect(admin.restoreSchema("kanban", 99, "kanban")).rejects.toMatchObject({
+      name: "RtDbError",
+      code: "NOT_FOUND",
+      message: "schema snapshot not found",
     });
   });
 

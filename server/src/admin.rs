@@ -24,7 +24,7 @@ use crate::query::{Query, QueryResult, execute_query};
 use crate::scheduler;
 use crate::schema::SchemaDef;
 use crate::txn::Transaction;
-use crate::{AppState, auth, db, ddl, snapshot, storage};
+use crate::{AppState, auth, db, ddl, schema_history, snapshot, storage};
 
 /// Who an admin request was made as: the raw admin key (CLI/automation) or an
 /// OAuth user on the server-wide admin allowlist (browser dashboard). The
@@ -210,7 +210,10 @@ async fn push_schema(
 ) -> Result<Json<OkResponse>, RtDbError> {
     require_admin(&state, &headers).await?;
     let applied = ddl::push_schema(&state.pool, &body.db, body.schema).await?;
-    state.schemas.put(&body.db, applied).await;
+    state.schemas.put(&body.db, applied.clone()).await;
+    if let Err(err) = schema_history::capture(&state.pool, &body.db, "push", None, &applied).await {
+        tracing::warn!(db = %body.db, error = %err, "schema history capture failed");
+    }
     Ok(Json(OkResponse { ok: true }))
 }
 
@@ -560,6 +563,51 @@ async fn get_schema(
 }
 
 #[derive(Deserialize)]
+struct HistoryParams {
+    #[serde(default)]
+    limit: Option<i64>,
+    #[serde(default)]
+    offset: Option<i64>,
+}
+
+/// `GET /admin/db/{db}/schema/history` — newest-first list of captured schema
+/// snapshots (metadata only; the blob lives at the per-version route). Clamps
+/// `limit` to [1, 1000] and floors `offset` at 0. Always on: `schema_history`
+/// self-heals on first read for databases created before this feature shipped.
+async fn schema_history_list(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(db): Path<String>,
+    QueryParams(params): QueryParams<HistoryParams>,
+) -> Result<Json<serde_json::Value>, RtDbError> {
+    require_admin(&state, &headers).await?;
+    if !db::database_exists(&state.pool, &db).await? {
+        return Err(RtDbError::not_found("unknown database"));
+    }
+    let limit = params.limit.unwrap_or(100).clamp(1, 1000);
+    let offset = params.offset.unwrap_or(0).max(0);
+    let entries = schema_history::list(&state.pool, &db, limit, offset).await?;
+    Ok(Json(serde_json::json!({ "entries": entries })))
+}
+
+/// `GET /admin/db/{db}/schema/history/{version}` — one full snapshot, including
+/// the `schema` JSON blob. 404 on a database or version that does not exist.
+async fn schema_history_get(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((db, version)): Path<(String, i64)>,
+) -> Result<Json<schema_history::HistoryEntry>, RtDbError> {
+    require_admin(&state, &headers).await?;
+    if !db::database_exists(&state.pool, &db).await? {
+        return Err(RtDbError::not_found("unknown database"));
+    }
+    schema_history::get(&state.pool, &db, version)
+        .await?
+        .map(Json)
+        .ok_or_else(|| RtDbError::not_found("schema version not found"))
+}
+
+#[derive(Deserialize)]
 struct PreviewSchemaRequest {
     schema: SchemaDef,
 }
@@ -689,6 +737,57 @@ async fn admin_migrate(
     }
     let result = state.realtime.committers.migrate(&db, body).await?;
     Ok(Json(result))
+}
+
+#[derive(Deserialize)]
+struct RestoreSchemaRequest {
+    version: i64,
+    confirm: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RestoreSchemaResponse {
+    ok: bool,
+    restored_to: i64,
+}
+
+/// `POST /admin/db/{db}/schema/restore` — restore the database's schema shape
+/// (and therefore its live `doc`-jsonb-compatible table/index shape) to a
+/// captured `schema_history` snapshot. Serialized through the committer like
+/// `admin_migrate`; the destructive reconcile runs inside the committer's
+/// serialized turn. `confirm` must equal the db name (typed guard, mirrors
+/// `delete-db`). Body: `{version, confirm}`; the target snapshot is resolved by
+/// `version` from `schema_history`. The restore captures the OUTGOING schema
+/// first (so it is itself undoable) and the INCOMING schema after (so the
+/// latest history row still equals the live schema). Document jsonb data on
+/// surviving tables is preserved — only redundant typed/index copies are
+/// dropped, never the `doc` column.
+async fn restore_schema(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(db): Path<String>,
+    ApiJson(body): ApiJson<RestoreSchemaRequest>,
+) -> Result<Json<RestoreSchemaResponse>, RtDbError> {
+    require_admin(&state, &headers).await?;
+    if !db::database_exists(&state.pool, &db).await? {
+        return Err(RtDbError::not_found("unknown database"));
+    }
+    // Typed guard: confirm must equal the db name (mirrors delete-db).
+    if body.confirm != db {
+        return Err(RtDbError::bad_request(
+            "confirm must equal the database name",
+        ));
+    }
+    let restored_to = state
+        .realtime
+        .committers
+        .restore_schema(&db, body.version)
+        .await?;
+    Ok(Json(RestoreSchemaResponse {
+        ok: true,
+        restored_to,
+    }))
 }
 
 // --- Scheduled jobs (admin) ------------------------------------------------
@@ -1892,10 +1991,16 @@ pub fn admin_routes() -> Router<Arc<AppState>> {
         )
         .route("/admin/dbs/{db}/schema", get(get_schema))
         .route("/admin/db/{db}/schema/preview", post(preview_schema))
+        .route("/admin/db/{db}/schema/history", get(schema_history_list))
+        .route(
+            "/admin/db/{db}/schema/history/{version}",
+            get(schema_history_get),
+        )
         .route("/admin/dbs/{db}/stats", get(db_stats))
         .route("/admin/db/{db}/query", post(admin_query))
         .route("/admin/db/{db}/mutate", post(admin_mutate))
         .route("/admin/db/{db}/migrate", post(admin_migrate))
+        .route("/admin/db/{db}/schema/restore", post(restore_schema))
         .route(
             "/admin/db/{db}/storage",
             get(admin_storage_list)

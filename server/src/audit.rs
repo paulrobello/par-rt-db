@@ -1,9 +1,9 @@
 //! Durable audit log — the persistent counterpart to the in-memory `OpFeed`.
 //!
 //! When `Config::audit_log_enabled` is set at boot, the committer calls
-//! `write_audit_rows` at its two op-feed tap sites (`handle_mutate` and
-//! `handle_scheduled`) so every durable document mutation is recorded in the
-//! global `rtdb.audit_log` table. Writes are best-effort: a logging failure is
+//! `write_audit_rows` at its four op-feed tap sites (`handle_mutate`,
+//! `handle_scheduled`, `handle_migrate`, and `handle_reaper`) so every durable
+//! document mutation is recorded in the global `rtdb.audit_log` table. Writes are best-effort: a logging failure is
 //! warned and never fails a mutation, mirroring the idempotency-cache error
 //! handling in `committer::handle_mutate`.
 

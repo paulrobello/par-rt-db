@@ -159,6 +159,9 @@ since browsers cannot set headers on a WS handshake.
 | `GET /admin/dbs` | Bearer admin key | Lists all databases. |
 | `GET /admin/dbs/{db}/schema` | Bearer admin key | Returns the pushed schema for a database. |
 | `GET /admin/dbs/{db}/stats` | Bearer admin key | Per-table row counts and storage sizes. |
+| `GET /admin/db/{db}/schema/history` | Bearer admin key | Lists schema-change snapshots newest-first (`?limit=`/`?offset=`). See [Schema change history](#schema-change-history). |
+| `GET /admin/db/{db}/schema/history/{version}` | Bearer admin key | Returns one full schema snapshot by version. |
+| `POST /admin/db/{db}/schema/restore` | Bearer admin key | Reconciles the db to a prior snapshot's shape. Body `{ version, confirm }`, `confirm` = db name. |
 | `POST /admin/mint-token` | Bearer admin key | Mints a machine token scoped to one database. |
 | `POST /admin/revoke-token` | Bearer admin key | Revokes a machine token by its id. |
 | `GET /admin/tokens?db=` | Bearer admin key | Lists machine tokens for a database (no secrets). |
@@ -167,6 +170,20 @@ since browsers cannot set headers on a WS handshake.
 | `GET /admin/admins` | Bearer admin key | Lists the server-wide OAuth admin allowlist (`rtdb_auth.admins`). |
 | `POST /admin/admins` | Bearer admin key | Adds an email to the admin allowlist. |
 | `DELETE /admin/admins` | Bearer admin key | Removes an email from the admin allowlist. |
+
+#### Schema change history
+
+Every `push-schema`, `migrate`, and `restore` captures a schema snapshot into a per-db
+`schema_history` table (always-on, lazy-created on first capture, retention-capped at the
+most recent 100 versions). The history list (`GET /admin/db/{db}/schema/history`) returns
+summaries newest-first; `GET /admin/db/{db}/schema/history/{version}` returns one full
+snapshot. `POST /admin/db/{db}/schema/restore` body `{ version, confirm }` — where `confirm`
+must equal the db name (the same typed guard as `delete-db`) — runs an **in-place destructive
+shape reconcile** inside the committer: it captures the outgoing schema first (so the restore
+itself is undoable), then applies the target shape. Data-loss caveat: restore reconciles
+schema SHAPE — dropping an index column preserves the `doc` jsonb data, so the only real data
+loss is `DROP TABLE` for tables absent from the target snapshot, and migrate data-transforms
+(`renameField`/`changeType`/…) applied after the captured snapshot are not rewound.
 
 ### Admin: dashboard operator surface
 

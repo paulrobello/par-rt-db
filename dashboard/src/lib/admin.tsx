@@ -3,6 +3,8 @@ import type {
   MigrateRequestJson,
   MigrateResultJson,
   QueryJson,
+  SchemaHistoryEntry,
+  SchemaHistoryEntrySummary,
   SchemaJson,
   TransactionJson,
 } from "@par-rt-db/client";
@@ -163,6 +165,42 @@ export class AdminClient {
     return this.req<MigrateResultJson>(`/admin/db/${enc(db)}/migrate`, {
       method: "POST",
       body: JSON.stringify(req),
+    });
+  }
+  /** Schema snapshot history, newest-first
+   *  (GET /admin/db/{db}/schema/history). Each entry is metadata-only (no
+   *  schema blob); fetch the full snapshot with `getSchemaVersion`.
+   *  `limit`/`offset` page. */
+  getSchemaHistory(
+    db: string,
+    opts: { limit?: number; offset?: number } = {},
+  ): Promise<SchemaHistoryEntrySummary[]> {
+    const params = new URLSearchParams();
+    if (opts.limit !== undefined) params.set("limit", String(opts.limit));
+    if (opts.offset !== undefined) params.set("offset", String(opts.offset));
+    const qs = params.toString();
+    return this.req<{ entries: SchemaHistoryEntrySummary[] }>(
+      `/admin/db/${enc(db)}/schema/history${qs ? `?${qs}` : ""}`,
+    ).then((r) => r.entries);
+  }
+  /** One full schema snapshot
+   *  (GET /admin/db/{db}/schema/history/{version}), including the `schema`
+   *  blob. */
+  getSchemaVersion(db: string, version: number): Promise<SchemaHistoryEntry> {
+    return this.req<SchemaHistoryEntry>(`/admin/db/${enc(db)}/schema/history/${version}`);
+  }
+  /** Restore the live schema shape to a prior snapshot
+   *  (POST /admin/db/{db}/schema/restore). `confirm` must equal the db name
+   *  (typed guard, mirrors delete-db). The outgoing schema is captured first,
+   *  so a restore is itself undoable. */
+  restoreSchema(
+    db: string,
+    version: number,
+    confirm: string,
+  ): Promise<{ ok: boolean; restoredTo: number }> {
+    return this.req(`/admin/db/${enc(db)}/schema/restore`, {
+      method: "POST",
+      body: JSON.stringify({ version, confirm }),
     });
   }
   getStats(db: string) {

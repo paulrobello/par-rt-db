@@ -2,6 +2,8 @@ import { RtDbError } from "./errors.js";
 import type {
   MigrateRequestJson,
   MigrateResultJson,
+  SchemaHistoryEntry,
+  SchemaHistoryEntrySummary,
   SchemaJson,
   TransactionJson,
 } from "./protocol.js";
@@ -542,6 +544,47 @@ export class RtDbAdminClient {
       `/admin/db/${encodeURIComponent(db)}/migrate`,
       req,
     )) as MigrateResultJson;
+  }
+
+  /** Schema snapshot history, newest-first (GET /admin/db/{db}/schema/history).
+   *  Each entry is metadata-only (no schema blob); fetch the full snapshot with
+   *  `getSchemaVersion`. `limit`/`offset` page. */
+  async getSchemaHistory(
+    db: string,
+    opts: { limit?: number; offset?: number } = {},
+  ): Promise<SchemaHistoryEntrySummary[]> {
+    const params = new URLSearchParams();
+    if (opts.limit !== undefined) params.set("limit", String(opts.limit));
+    if (opts.offset !== undefined) params.set("offset", String(opts.offset));
+    const qs = params.toString();
+    const body = await this.request(
+      "GET",
+      `/admin/db/${encodeURIComponent(db)}/schema/history${qs ? `?${qs}` : ""}`,
+    );
+    return (body as { entries: SchemaHistoryEntrySummary[] }).entries;
+  }
+
+  /** One full schema snapshot (GET /admin/db/{db}/schema/history/{version}),
+   *  including the `schema` blob. */
+  async getSchemaVersion(db: string, version: number): Promise<SchemaHistoryEntry> {
+    return (await this.request(
+      "GET",
+      `/admin/db/${encodeURIComponent(db)}/schema/history/${version}`,
+    )) as SchemaHistoryEntry;
+  }
+
+  /** Restore the live schema shape to a prior snapshot (POST /admin/db/{db}/schema/restore).
+   *  `confirm` must equal the db name (typed guard, mirrors delete-db). The
+   *  outgoing schema is captured first, so a restore is itself undoable. */
+  async restoreSchema(
+    db: string,
+    version: number,
+    confirm: string,
+  ): Promise<{ ok: boolean; restoredTo: number }> {
+    return (await this.request("POST", `/admin/db/${encodeURIComponent(db)}/schema/restore`, {
+      version,
+      confirm,
+    })) as { ok: boolean; restoredTo: number };
   }
 
   /** Trigger one pg_dump now (POST /admin/backup, 202 Accepted). Runs async server-side;

@@ -12,6 +12,8 @@ export type {
   QueryJson,
   ScheduleInfo,
   ScheduleWhen,
+  SchemaHistoryEntry,
+  SchemaHistoryEntrySummary,
   SchemaJson,
   SearchQuery,
   ServerMessage,

@@ -61,6 +61,9 @@ export function DbPage() {
         <Link to={`/dbs/${db}/schema`} className={s.link}>
           Schema →
         </Link>
+        <Link to={`/dbs/${db}/schema/history`} className={s.link}>
+          History →
+        </Link>
         <Link to={`/dbs/${db}/migrate`} className={s.link}>
           Migrate →
         </Link>

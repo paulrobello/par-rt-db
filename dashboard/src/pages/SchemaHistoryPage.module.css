@@ -1,0 +1,359 @@
+.page {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-4);
+  max-width: 880px;
+}
+
+.title {
+  margin: 0;
+  font-size: var(--t-display);
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+.nav {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-3);
+}
+
+.back {
+  color: var(--accent);
+  font-family: var(--mono);
+  font-size: var(--t-mono-sm);
+}
+
+/* --- Version list -------------------------------------------------------- */
+
+.list {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  border: 1px solid var(--rule);
+}
+
+.row {
+  display: grid;
+  grid-template-columns: 72px 1fr 96px minmax(120px, 1fr);
+  align-items: baseline;
+  gap: var(--sp-2);
+  padding: var(--sp-2);
+  background: var(--surface);
+  border: none;
+  cursor: pointer;
+  text-align: left;
+  font-family: var(--mono);
+  font-size: var(--t-mono-sm);
+  color: var(--ink);
+  transition: background 140ms var(--ease);
+}
+.row:hover {
+  background: rgba(69, 230, 211, 0.045);
+}
+
+.rowActive {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+.rowActive:hover {
+  background: var(--accent-soft);
+}
+
+.version {
+  color: var(--ink);
+  font-weight: 600;
+}
+.rowActive .version {
+  color: var(--accent);
+}
+
+.capturedAt {
+  color: var(--ink-2);
+  white-space: nowrap;
+}
+
+.source {
+  color: var(--ink-3);
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  font-size: var(--t-mono-xs);
+}
+
+.principal {
+  color: var(--ink-2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mutedCell {
+  color: var(--ink-3);
+}
+
+/* --- Detail (snapshot + diff + restore) ---------------------------------- */
+
+.detail {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  border-top: 1px solid var(--rule);
+  padding-top: var(--sp-3);
+}
+
+.snapshotHead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-3);
+  flex-wrap: wrap;
+}
+
+.diffTitle {
+  margin: 0;
+  font-family: var(--mono);
+  font-size: var(--t-h2);
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.diffPanel {
+  background: var(--inset);
+  border: 1px solid var(--rule);
+  border-radius: var(--r-1);
+  padding: var(--sp-2);
+}
+
+.diffSection {
+  margin-bottom: var(--sp-3);
+}
+.diffSection:last-child {
+  margin-bottom: 0;
+}
+
+.diffHead {
+  margin: 0 0 var(--sp-2);
+  font-family: var(--mono);
+  font-size: var(--t-mono-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+}
+.addedHead {
+  color: var(--accent);
+}
+.removedHead {
+  color: var(--error);
+}
+
+.diffRow {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-2);
+  font-family: var(--mono);
+  font-size: var(--t-mono-sm);
+  padding-left: var(--sp-2);
+}
+
+.diffAddedMark {
+  color: var(--accent);
+  font-weight: 600;
+}
+.diffRemovedMark {
+  color: var(--error);
+  font-weight: 600;
+}
+
+.diffTableName {
+  color: var(--ink);
+}
+.diffName {
+  color: var(--ink-2);
+}
+
+.resultEmpty {
+  margin: 0;
+  font-family: var(--mono);
+  font-size: var(--t-mono-sm);
+  color: var(--ink-3);
+}
+
+.applied {
+  margin: 0;
+  font-family: var(--mono);
+  font-size: var(--t-mono-sm);
+  color: var(--accent);
+}
+
+/* --- Snapshot tables (mirrors SchemaPage table rendering) ---------------- */
+
+.tables {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+}
+
+.tableBlock {
+  border: 1px solid var(--rule);
+  background: var(--surface);
+  padding: var(--sp-3);
+}
+
+.tableHead {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-3);
+  margin-bottom: var(--sp-2);
+  padding-bottom: var(--sp-2);
+  border-bottom: 1px solid var(--rule);
+}
+
+.tableName {
+  margin: 0;
+  font-family: var(--mono);
+  font-size: var(--t-mono-md);
+  color: var(--ink);
+}
+
+.owner {
+  font-family: var(--mono);
+  font-size: var(--t-mono-sm);
+  color: var(--accent);
+}
+
+.fields {
+  width: 100%;
+  border-collapse: collapse;
+}
+.fields td {
+  padding: var(--sp-1) var(--sp-2);
+  border-bottom: 1px solid var(--rule);
+  font-family: var(--mono);
+  font-size: var(--t-mono-sm);
+  vertical-align: top;
+}
+.fieldName {
+  color: var(--ink);
+  white-space: nowrap;
+}
+.fieldType {
+  color: var(--ink-2);
+}
+
+.indexes {
+  margin-top: var(--sp-2);
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  align-items: center;
+}
+.indexLabel {
+  font-family: var(--mono);
+  font-size: var(--t-mono-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.16em;
+  color: var(--ink-3);
+}
+.index {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-1);
+  font-family: var(--mono);
+  font-size: var(--t-mono-sm);
+  color: var(--ink-2);
+}
+.indexTag {
+  padding: 0 4px;
+  border: 1px solid var(--rule-strong);
+  border-radius: var(--r-1);
+  color: var(--accent);
+  font-size: var(--t-mono-xs);
+}
+.indexName {
+  color: var(--ink);
+}
+.indexFields {
+  color: var(--ink-3);
+}
+
+/* --- Restore confirm ----------------------------------------------------- */
+
+.confirm {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  border: 1px solid var(--rule);
+  border-left: 2px solid var(--error);
+  background: var(--surface);
+  padding: var(--sp-3);
+  max-width: 540px;
+}
+
+.confirmLabel {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  color: var(--ink-3);
+  font-family: var(--mono);
+  font-size: var(--t-mono-sm);
+}
+
+.confirmInput {
+  background: var(--inset);
+  color: var(--ink);
+  border: 1px solid var(--rule-strong);
+  border-radius: var(--r-1);
+  font-family: var(--mono);
+  font-size: var(--t-mono-sm);
+  padding: 6px var(--sp-2);
+  outline: none;
+}
+
+.confirmActions {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  flex-wrap: wrap;
+}
+
+/* --- Error / status panels ----------------------------------------------- */
+
+.error {
+  margin: 0;
+  font-family: var(--mono);
+  font-size: var(--t-mono-sm);
+  color: var(--error);
+}
+
+.empty {
+  color: var(--ink-3);
+  font-family: var(--mono);
+  font-size: var(--t-mono-sm);
+}
+
+.resultPanel {
+  background: var(--inset);
+  border: 1px solid var(--rule);
+  border-radius: var(--r-1);
+  padding: var(--sp-2);
+}
+
+.errorHead {
+  font-family: var(--mono);
+  font-size: var(--t-mono-sm);
+  color: var(--error);
+  margin: 0 0 var(--sp-1);
+}
+.errorBody {
+  margin: 0;
+  white-space: pre-wrap;
+  font-family: var(--mono);
+  font-size: var(--t-mono-sm);
+  color: var(--ink-2);
+  line-height: 1.5;
+}
+
+.hint {
+  font-family: var(--mono);
+  font-size: var(--t-mono-xs);
+  color: var(--ink-3);
+}

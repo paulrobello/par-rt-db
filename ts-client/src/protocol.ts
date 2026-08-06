@@ -240,6 +240,23 @@ export interface MigrateResultJson {
   directives: DirectiveReportJson[];
 }
 
+/** Mirrors server `schema_history::HistorySummary` (camelCase). One row in
+ * `GET /admin/db/{db}/schema/history` — no `schema` blob, just the metadata
+ * needed to pick a version to inspect or restore. `source` is the event that
+ * captured the snapshot: `push` (push-schema), `migrate`, or `restore`. */
+export interface SchemaHistoryEntrySummary {
+  version: number;
+  capturedAt: number;
+  source: "push" | "migrate" | "restore";
+  principal: string | null;
+}
+
+/** Mirrors server `schema_history::HistoryEntry` (camelCase). Adds the full
+ * `schema` blob — returned by `GET /admin/db/{db}/schema/history/{version}`. */
+export interface SchemaHistoryEntry extends SchemaHistoryEntrySummary {
+  schema: SchemaJson;
+}
+
 /**
  * Whether an `AuthedUser` resolved from an interactive OAuth session or a
  * per-database machine token. Mirrors server `protocol::UserKind` (ARC-009):

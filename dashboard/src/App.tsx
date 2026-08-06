@@ -15,6 +15,7 @@ import { MigratePage } from "./pages/MigratePage";
 import { OpsPage } from "./pages/OpsPage";
 import { QueryConsolePage } from "./pages/QueryConsolePage";
 import { ScheduledJobsPage } from "./pages/ScheduledJobsPage";
+import { SchemaHistoryPage } from "./pages/SchemaHistoryPage";
 import { SchemaPage } from "./pages/SchemaPage";
 import { StoragePage } from "./pages/StoragePage";
 import { SubscriptionsPage } from "./pages/SubscriptionsPage";
@@ -48,6 +49,7 @@ function Root() {
             <Route index element={<DatabasesPage />} />
             <Route path="dbs/:db" element={<DbPage />} />
             <Route path="dbs/:db/schema" element={<SchemaPage />} />
+            <Route path="dbs/:db/schema/history" element={<SchemaHistoryPage />} />
             <Route path="dbs/:db/migrate" element={<MigratePage />} />
             <Route path="dbs/:db/tables/:table" element={<DataBrowserPage />} />
             <Route path="metrics" element={<MetricsPage />} />

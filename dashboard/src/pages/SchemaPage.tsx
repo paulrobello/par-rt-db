@@ -146,6 +146,9 @@ export function SchemaPage() {
       <Link to={`/dbs/${db}`} className={s.back}>
         ← {db}
       </Link>
+      <Link to={`/dbs/${db}/schema/history`} className={s.back}>
+        history →
+      </Link>
 
       <div className={s.segment}>
         {(["view", "push"] as const).map((m) => (

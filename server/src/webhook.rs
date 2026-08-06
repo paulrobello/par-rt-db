@@ -2,9 +2,10 @@
 //! document changes" in a no-embedded-JS architecture.
 //!
 //! When `Config::webhooks_enabled` is set at boot, the committer calls
-//! `enqueue_for_ops` at its two op-feed tap sites (`handle_mutate` and
-//! `handle_scheduled`) so every durable document mutation fans out one
-//! `rtdb.webhook_deliveries` row per matching webhook. A background worker
+//! `enqueue_for_ops` at its four op-feed tap sites (`handle_mutate`,
+//! `handle_scheduled`, `handle_migrate`, and `handle_reaper`) so every durable
+//! document mutation fans out one `rtdb.webhook_deliveries` row per matching
+//! webhook. A background worker
 //! (`run_delivery_worker`) drains that outbox and POSTs each payload
 //! at-least-once to the registered URL with exponential backoff (capped) and a
 //! hard attempt ceiling. Enqueue is best-effort by contract: a logging failure

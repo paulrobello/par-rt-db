@@ -22,6 +22,7 @@ pub mod reaper;
 pub mod scheduler;
 pub mod schema;
 pub mod schema_diff;
+pub mod schema_history;
 pub mod snapshot;
 pub mod storage;
 pub mod subs;
