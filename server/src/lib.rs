@@ -9,6 +9,7 @@ pub mod ddl;
 pub mod error;
 pub mod health;
 pub mod http_api;
+pub mod image_transform;
 pub mod metrics;
 pub mod migrate;
 pub mod mutation_log;
