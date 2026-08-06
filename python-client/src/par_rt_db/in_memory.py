@@ -1535,8 +1535,9 @@ class InMemoryRtDbClient:
         """Synthetic handle with image-transform params (ENH-014). No real byte stream.
 
         Params appear in the deterministic order ``w, h, fit, q, format``; unset
-        params are omitted. Mirrors ``RtDbHttpClient.transform_url`` so tests
-        against the in-memory harness assert the same query-string shape.
+        params (and ``format="auto"``, the server default) are omitted. Mirrors
+        ``RtDbHttpClient.transform_url`` so tests against the in-memory harness
+        assert the same query-string shape.
         """
         parts: list[str] = []
         if w is not None:
@@ -1547,7 +1548,8 @@ class InMemoryRtDbClient:
             parts.append(f"fit={fit}")
         if q is not None:
             parts.append(f"q={q}")
-        if format is not None:
+        # "auto" is the server default — omit so the URL stays minimal (rust parity).
+        if format is not None and format != "auto":
             parts.append(f"format={format}")
         base = f"memory://{id}"
         return f"{base}?{'&'.join(parts)}" if parts else base

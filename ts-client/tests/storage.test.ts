@@ -48,6 +48,15 @@ describe("in-memory storage", () => {
     );
   });
 
+  it("appendImageParams omits format=auto (server default)", async () => {
+    const { appendImageParams } = await import("../src/http.js");
+    const url = appendImageParams("https://rtdb.example/storage/abc", {
+      w: 100,
+      format: "auto",
+    });
+    expect(url).toBe("https://rtdb.example/storage/abc?w=100");
+  });
+
   it("transformUrl against the http client builds the URL with params", async () => {
     const { RtDbHttpClient } = await import("../src/http.js");
     const http = new RtDbHttpClient({ url: "https://rtdb.example.com/", db: "kanban", token: "t" });

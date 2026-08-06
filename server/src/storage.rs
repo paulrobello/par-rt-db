@@ -6,6 +6,7 @@
 //! transforms on the serve routes (`?w=&h=&fit=&q=&format=`) live in
 //! `image_transform.rs`.
 
+use bytes::Bytes;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 
@@ -133,11 +134,13 @@ pub async fn put(
 }
 
 /// Reads a blob and its content type for serving. `None` if the id is absent.
+/// Returns `Bytes` so the serve path and transform cache can hand the buffer to
+/// the HTTP body without cloning the (potentially large) payload.
 pub async fn get(
     pool: &PgPool,
     db: &str,
     id: &str,
-) -> Result<Option<(Vec<u8>, Option<String>)>, RtDbError> {
+) -> Result<Option<(Bytes, Option<String>)>, RtDbError> {
     validate_db_name(db)?;
     let schema = pg_schema(db);
     let row: Option<(Vec<u8>, Option<String>)> = sqlx::query_as(&format!(
@@ -146,7 +149,7 @@ pub async fn get(
     .bind(id)
     .fetch_optional(pool)
     .await?;
-    Ok(row)
+    Ok(row.map(|(bytes, ct)| (Bytes::from(bytes), ct)))
 }
 
 /// Reads just the metadata. `None` if absent.

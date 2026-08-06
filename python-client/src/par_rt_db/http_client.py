@@ -647,7 +647,8 @@ class RtDbHttpClient:
         """The public serve URL for ``id`` with image-transform params (ENH-014).
 
         No request is made. Params appear in the deterministic order
-        ``w, h, fit, q, format``; unset params are omitted.
+        ``w, h, fit, q, format``; unset params (and ``format="auto"``, the
+        server default) are omitted.
         """
         parts: list[str] = []
         if w is not None:
@@ -658,7 +659,8 @@ class RtDbHttpClient:
             parts.append(f"fit={fit}")
         if q is not None:
             parts.append(f"q={q}")
-        if format is not None:
+        # "auto" is the server default — omit so the URL stays minimal (rust parity).
+        if format is not None and format != "auto":
             parts.append(f"format={format}")
         base = f"{self._base}/storage/{id}"
         return f"{base}?{'&'.join(parts)}" if parts else base

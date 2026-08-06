@@ -8,6 +8,7 @@ license = "MIT"
 arc-swap = "1"
 async-trait = "0.1"
 axum = { version = "0.8", features = ["ws"] }
+bytes = "1"
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 tower = "0.5"

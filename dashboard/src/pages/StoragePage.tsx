@@ -38,9 +38,10 @@ export function StoragePage() {
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const copiedTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // Image-transform size applied to "copy URL" outputs (ENH-014). Page-scoped —
-  // every row's selector mirrors the same value so an operator can batch-copy
-  // thumbnails at one size without re-selecting per row.
+  // Image-transform size applied to "copy URL" outputs (ENH-014). Page-scoped:
+  // a single control in the actions column header sets it, and every row's
+  // copy-URL uses that size, so an operator can batch-copy thumbnails at one
+  // size without re-selecting per row.
   const [size, setSize] = useState<ImageSize>("orig");
 
   // Auto-select the first database once the list arrives.
@@ -172,7 +173,21 @@ export function StoragePage() {
                 <th>content type</th>
                 <th>created</th>
                 <th>sha256</th>
-                <th>actions</th>
+                <th>
+                  actions
+                  <select
+                    className={s.sizeSelect}
+                    aria-label="copy-URL image size"
+                    title="image size applied to copy-URL for every row"
+                    value={size}
+                    onChange={(e) => setSize(e.target.value as ImageSize)}
+                  >
+                    <option value="orig">original</option>
+                    <option value="lg">large 1024</option>
+                    <option value="md">medium 512</option>
+                    <option value="sm">small 128</option>
+                  </select>
+                </th>
               </tr>
             </thead>
             <tbody>
@@ -196,17 +211,6 @@ export function StoragePage() {
                         <Button onClick={() => void copyPublicUrl(file)} disabled={busy}>
                           {copied ? "copied!" : "copy URL"}
                         </Button>
-                        <select
-                          className={s.sizeSelect}
-                          aria-label="image size"
-                          value={size}
-                          onChange={(e) => setSize(e.target.value as ImageSize)}
-                        >
-                          <option value="orig">original</option>
-                          <option value="lg">large 1024</option>
-                          <option value="md">medium 512</option>
-                          <option value="sm">small 128</option>
-                        </select>
                         {confirming ? (
                           <span className={s.confirmInline}>
                             <span className={s.confirmLabel}>delete?</span>

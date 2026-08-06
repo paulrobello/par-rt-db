@@ -103,12 +103,12 @@ describe("StoragePage", () => {
     });
   });
 
-  it("renders a per-row image size selector", async () => {
+  it("renders a single header image-size selector", async () => {
     adminClientMock.listFiles.mockResolvedValue([fileRow]);
     render(<StoragePage />);
-    const row = (await screen.findByText("file0001")).closest("tr");
-    if (!row) throw new Error("row not found");
-    const select = within(row).getByRole("combobox", { name: /size/i });
+    await screen.findByText("file0001");
+    // The size control is one select in the actions column header, not per row.
+    const select = screen.getByRole("combobox", { name: /size/i });
     expect(select).toBeInTheDocument();
   });
 
@@ -123,7 +123,7 @@ describe("StoragePage", () => {
     vi.spyOn(navigator, "clipboard", "get").mockReturnValue({ writeText } as never);
 
     // Choose medium size — should map to { w: 512, fit: "contain" }.
-    await user.selectOptions(within(row).getByRole("combobox", { name: /size/i }), "md");
+    await user.selectOptions(screen.getByRole("combobox", { name: /size/i }), "md");
     await user.click(within(row).getByRole("button", { name: "copy URL" }));
 
     await waitFor(() => {

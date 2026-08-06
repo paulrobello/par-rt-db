@@ -85,7 +85,7 @@ async fn put_get_meta_delete_round_trip() -> anyhow::Result<()> {
     let fetched = storage::get(&state.pool, &db, &id)
         .await?
         .expect("row present");
-    assert_eq!(fetched.0, bytes);
+    assert_eq!(fetched.0.as_ref(), &bytes[..]);
     assert_eq!(fetched.1.as_deref(), Some("text/plain"));
 
     let meta = storage::get_meta(&state.pool, &db, &id)

@@ -495,7 +495,7 @@ async fn serve_bytes(
                 .await?
                 .ok_or_else(|| RtDbError::not_found("unknown file"))?;
             (
-                Arc::<[u8]>::from(raw),
+                raw,
                 ct.unwrap_or_else(|| "application/octet-stream".to_string()),
             )
         }
@@ -503,7 +503,7 @@ async fn serve_bytes(
     Response::builder()
         .header(header::CONTENT_TYPE, content_type)
         .header(header::CACHE_CONTROL, IMMUTABLE)
-        .body(Body::from(bytes.to_vec()))
+        .body(Body::from(bytes))
         .map_err(|err| RtDbError::internal(format!("failed to build serve response: {err}")))
 }
 

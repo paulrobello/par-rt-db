@@ -448,6 +448,16 @@ def test_transform_url_omits_unset_opts() -> None:
     assert list(qs) == ["w"]
 
 
+def test_transform_url_omits_format_auto() -> None:
+    from urllib.parse import urlparse
+
+    client = _client(lambda r: httpx.Response(500))
+    # "auto" is the server default — omitted to keep the URL minimal.
+    url = client.transform_url("f1", w=100, format="auto")
+    assert url == "https://rtdb.example/storage/f1?w=100"
+    assert "format" not in urlparse(url).query
+
+
 # --- admin control plane ----------------------------------------------------
 
 

@@ -2091,6 +2091,41 @@ mod tests {
             "https://rtdb.example/storage/f1?w=100&h=50&fit=cover&q=80"
         );
     }
+
+    #[test]
+    fn transform_url_scale_down_and_jpeg() {
+        let client = RtDbHttpClient::new("https://rtdb.example", "db", "tok");
+        let url = client.transform_url(
+            "f1",
+            &TransformOpts {
+                w: None,
+                h: Some(200),
+                fit: Some(Fit::ScaleDown),
+                q: None,
+                format: Some(OutFormat::Jpeg),
+            },
+        );
+        assert_eq!(
+            url,
+            "https://rtdb.example/storage/f1?h=200&fit=scale-down&format=jpeg"
+        );
+    }
+
+    #[test]
+    fn transform_url_png_omits_unset_params() {
+        let client = RtDbHttpClient::new("https://rtdb.example", "db", "tok");
+        let url = client.transform_url(
+            "f1",
+            &TransformOpts {
+                w: None,
+                h: None,
+                fit: None,
+                q: None,
+                format: Some(OutFormat::Png),
+            },
+        );
+        assert_eq!(url, "https://rtdb.example/storage/f1?format=png");
+    }
 }
 
 /// Mirrors `ts-client/tests/admin.test.ts`: each method posts/gets the right

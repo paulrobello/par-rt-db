@@ -120,10 +120,10 @@ pub struct Metrics {
     mutations_total: AtomicU64,
     uploads_total: AtomicU64,
     // ---- Image transforms (ENH-014) ----
-    pub image_transforms_hit_total: AtomicU64,
-    pub image_transforms_miss_total: AtomicU64,
-    pub image_transforms_error_total: AtomicU64,
-    pub image_transform_bytes_total: AtomicU64,
+    image_transforms_hit_total: AtomicU64,
+    image_transforms_miss_total: AtomicU64,
+    image_transforms_error_total: AtomicU64,
+    image_transform_bytes_total: AtomicU64,
     /// Current open `/sync` WebSocket connections (inc on auth, dec on close).
     ws_connections: AtomicI64,
     query_latency: Mutex<LatencySamples>,

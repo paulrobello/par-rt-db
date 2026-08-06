@@ -6,6 +6,7 @@ use std::io::Cursor;
 use std::sync::Arc;
 use std::time::Duration;
 
+use bytes::Bytes;
 use image::{DynamicImage, GenericImageView, ImageEncoder, ImageFormat, ImageReader};
 use tokio::sync::Semaphore;
 
@@ -291,21 +292,18 @@ fn contain_target(ow: u32, oh: u32, want_w: u32, want_h: u32) -> (u32, u32) {
     (tw.min(want_w).max(1), th.min(want_h).max(1))
 }
 
-/// Cached transformed bytes plus the derived content type. `Arc<[u8]>` so a
-/// cache hit hands out a cheap reference-counted slice rather than a copy.
+/// Cached transformed bytes plus the derived content type. `Bytes` so a cache
+/// hit hands out a cheap reference-counted handle rather than a copy.
 #[derive(Debug, Clone)]
 pub struct CachedImage {
-    pub bytes: Arc<[u8]>,
+    pub bytes: Bytes,
     pub content_type: &'static str,
 }
 
 /// Outcome of a transform-or-passthrough request.
 pub enum Resolved {
     Transformed(CachedImage),
-    Raw {
-        bytes: Arc<[u8]>,
-        content_type: String,
-    },
+    Raw { bytes: Bytes, content_type: String },
 }
 
 /// Bounded-concurrency transform cache. Limits the number of in-flight
@@ -356,6 +354,10 @@ impl TransformCache {
         id: &str,
         params: TransformParams,
     ) -> Result<Resolved, RtDbError> {
+        // Cache key is the params' Debug repr — stable only while each field's
+        // `{:?}` output stays fixed. A new param or a changed Debug repr must
+        // extend/alter this format, or the cache will silently serve stale
+        // entries for the old key shape.
         let key = format!(
             "{id}|{:?}|{:?}|{:?}|{:?}|{:?}",
             params.w, params.h, params.fit, params.q, params.format
@@ -393,7 +395,7 @@ impl TransformCache {
             Ok((tbytes, tct)) => {
                 let n = tbytes.len() as u64;
                 let cached = CachedImage {
-                    bytes: Arc::from(tbytes),
+                    bytes: Bytes::from(tbytes),
                     content_type: tct,
                 };
                 self.cache.insert(key, cached.clone()).await;
@@ -401,7 +403,7 @@ impl TransformCache {
                 Ok(Resolved::Transformed(cached))
             }
             Err(TransformError::NotImage) => Ok(Resolved::Raw {
-                bytes: Arc::from(bytes),
+                bytes,
                 content_type: ct.unwrap_or_else(|| "application/octet-stream".to_string()),
             }),
             Err(TransformError::TooLarge) => {

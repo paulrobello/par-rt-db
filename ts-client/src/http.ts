@@ -53,7 +53,8 @@ export function appendImageParams(url: string, opts: TransformOpts): string {
   push("h", opts.h?.toString());
   push("fit", opts.fit);
   push("q", opts.q?.toString());
-  push("format", opts.format);
+  // "auto" is the server default — omit so the URL stays minimal (rust parity).
+  if (opts.format && opts.format !== "auto") push("format", opts.format);
   return parts.length ? `${url}?${parts.join("&")}` : url;
 }
 
