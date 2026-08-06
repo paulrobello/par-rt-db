@@ -131,6 +131,8 @@ pub struct Metrics {
     /// Incremented once per `flush_once` even when multiple peers receive it,
     /// so it counts fan-out decisions, not delivered frames.
     presence_broadcasts_total: AtomicU64,
+    /// Total presence sessions whose per-state TTL expired (state cleared to null).
+    presence_ttl_expiries_total: AtomicU64,
     /// Current open `/sync` WebSocket connections (inc on auth, dec on close).
     ws_connections: AtomicI64,
     query_latency: Mutex<LatencySamples>,
@@ -200,11 +202,18 @@ impl Metrics {
         self.presence_broadcasts_total
             .fetch_add(1, Ordering::Relaxed);
     }
+    pub fn record_presence_ttl_expiry(&self) {
+        self.presence_ttl_expiries_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
     pub fn presence_updates_total(&self) -> u64 {
         self.presence_updates_total.load(Ordering::Relaxed)
     }
     pub fn presence_broadcasts_total(&self) -> u64 {
         self.presence_broadcasts_total.load(Ordering::Relaxed)
+    }
+    pub fn presence_ttl_expiries_total(&self) -> u64 {
+        self.presence_ttl_expiries_total.load(Ordering::Relaxed)
     }
     pub fn ws_connect(&self) {
         self.ws_connections.fetch_add(1, Ordering::Relaxed);
@@ -368,6 +377,7 @@ impl Metrics {
             image_transform_bytes_total: self.image_transform_bytes_total.load(Ordering::Relaxed),
             presence_updates_total: self.presence_updates_total.load(Ordering::Relaxed),
             presence_broadcasts_total: self.presence_broadcasts_total.load(Ordering::Relaxed),
+            presence_ttl_expiries_total: self.presence_ttl_expiries_total.load(Ordering::Relaxed),
             presence_rooms,
             presence_sessions,
             per_db_subs: self.per_db_subs_snapshot(),
@@ -417,6 +427,8 @@ pub struct MetricsSnapshot {
     /// Presence-state broadcasts fanned out to interested subscribers
     /// (ENH-015). One per `flush_once`, regardless of recipient count.
     pub presence_broadcasts_total: u64,
+    /// Presence sessions whose per-state TTL expired (ENH-015 follow-up).
+    pub presence_ttl_expiries_total: u64,
     /// Distinct presence rooms across all dbs at snapshot time (ENH-015). Gauge,
     /// not counter — membership is per-shard HashMap state tallied at read time
     /// by `PresenceManager::counts`.
@@ -550,6 +562,14 @@ pub fn render_prometheus(snap: &MetricsSnapshot, version: &str, git_commit: &str
         "rtdb_presence_broadcasts_total {}\n",
         snap.presence_broadcasts_total
     ));
+    s.push_str(
+        "# HELP rtdb_presence_ttl_expiries_total Presence sessions whose per-state TTL expired.\n",
+    );
+    s.push_str("# TYPE rtdb_presence_ttl_expiries_total counter\n");
+    s.push_str(&format!(
+        "rtdb_presence_ttl_expiries_total {}\n",
+        snap.presence_ttl_expiries_total
+    ));
     s.push_str("# HELP rtdb_presence_rooms Distinct presence rooms across all dbs.\n");
     s.push_str("# TYPE rtdb_presence_rooms gauge\n");
     s.push_str(&format!("rtdb_presence_rooms {}\n", snap.presence_rooms));
@@ -624,6 +644,7 @@ mod tests {
             image_transform_bytes_total: 0,
             presence_updates_total: 0,
             presence_broadcasts_total: 0,
+            presence_ttl_expiries_total: 0,
             presence_rooms: 0,
             presence_sessions: 0,
             per_db_subs: Vec::new(),
@@ -678,6 +699,7 @@ mod tests {
             image_transform_bytes_total: 0,
             presence_updates_total: 0,
             presence_broadcasts_total: 0,
+            presence_ttl_expiries_total: 0,
             presence_rooms: 0,
             presence_sessions: 0,
             per_db_subs: Vec::new(),
@@ -823,7 +845,9 @@ mod tests {
         m.record_presence_update();
         m.record_presence_update();
         m.record_presence_broadcast();
+        m.record_presence_ttl_expiry();
         assert_eq!(m.presence_updates_total(), 2);
         assert_eq!(m.presence_broadcasts_total(), 1);
+        assert_eq!(m.presence_ttl_expiries_total(), 1);
     }
 }

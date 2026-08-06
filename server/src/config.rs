@@ -116,6 +116,9 @@ pub struct Config {
     pub presence_broadcast_interval_ms: u64,
     /// RTDB_PRESENCE_UPDATE_LIMIT_PER_SEC (default 20).
     pub presence_update_limit_per_sec: u32,
+    /// RTDB_PRESENCE_MAX_TTL_MS (default 300000 = 5 min). Upper bound on a
+    /// client-supplied presenceState ttlMs; over-cap is rejected (no clamping).
+    pub presence_max_ttl_ms: u64,
 }
 
 impl Config {
@@ -330,6 +333,11 @@ impl Config {
             .and_then(|v| v.parse().ok())
             .unwrap_or(20)
             .max(1);
+        let presence_max_ttl_ms = std::env::var("RTDB_PRESENCE_MAX_TTL_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(300_000)
+            .max(1000);
 
         Ok(Self {
             port,
@@ -378,6 +386,7 @@ impl Config {
             presence_max_room_bytes,
             presence_broadcast_interval_ms,
             presence_update_limit_per_sec,
+            presence_max_ttl_ms,
         })
     }
 }
@@ -739,6 +748,7 @@ mod tests {
             std::env::remove_var("RTDB_PRESENCE_MAX_ROOM_BYTES");
             std::env::remove_var("RTDB_PRESENCE_BROADCAST_INTERVAL_MS");
             std::env::remove_var("RTDB_PRESENCE_UPDATE_LIMIT_PER_SEC");
+            std::env::remove_var("RTDB_PRESENCE_MAX_TTL_MS");
             let c = Config::from_env().expect("from_env with required vars set");
             assert!(c.presence_enabled);
             assert_eq!(c.presence_max_state_bytes, 1024);
@@ -747,6 +757,7 @@ mod tests {
             assert_eq!(c.presence_max_room_bytes, 256);
             assert_eq!(c.presence_broadcast_interval_ms, 50);
             assert_eq!(c.presence_update_limit_per_sec, 20);
+            assert_eq!(c.presence_max_ttl_ms, 300_000);
 
             // Overrides: the on/off switch accepts "true", and numerics parse.
             std::env::set_var("RTDB_PRESENCE_ENABLED", "true");
@@ -769,6 +780,7 @@ mod tests {
             std::env::remove_var("RTDB_PRESENCE_MAX_ROOM_BYTES");
             std::env::remove_var("RTDB_PRESENCE_BROADCAST_INTERVAL_MS");
             std::env::remove_var("RTDB_PRESENCE_UPDATE_LIMIT_PER_SEC");
+            std::env::remove_var("RTDB_PRESENCE_MAX_TTL_MS");
             match saved_db {
                 Some(v) => std::env::set_var("RTDB_DATABASE_URL", v),
                 None => std::env::remove_var("RTDB_DATABASE_URL"),

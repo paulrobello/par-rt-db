@@ -22,6 +22,7 @@ pub struct PresenceConfig {
     pub max_room_bytes: usize,
     pub broadcast_interval_ms: u64,
     pub update_limit_per_sec: u32,
+    pub max_ttl_ms: u64,
 }
 
 impl PresenceConfig {
@@ -35,6 +36,7 @@ impl PresenceConfig {
             max_room_bytes: c.presence_max_room_bytes,
             broadcast_interval_ms: c.presence_broadcast_interval_ms,
             update_limit_per_sec: c.presence_update_limit_per_sec,
+            max_ttl_ms: c.presence_max_ttl_ms,
         }
     }
 }
@@ -438,6 +440,7 @@ mod tests {
             max_room_bytes: 256,
             broadcast_interval_ms: 0,
             update_limit_per_sec: 20,
+            max_ttl_ms: 300_000,
         }
     }
     fn user(email: &str) -> AuthedUser {

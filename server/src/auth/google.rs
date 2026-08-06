@@ -322,6 +322,7 @@ mod tests {
             presence_max_room_bytes: 256,
             presence_broadcast_interval_ms: 50,
             presence_update_limit_per_sec: 20,
+            presence_max_ttl_ms: 300_000,
         };
         assert!(GoogleProvider::from_config(&cfg).is_none());
         cfg.google_client_id = Some("id".into());
