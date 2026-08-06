@@ -13,22 +13,37 @@ working with zero providers configured.
 
 ## How it works
 
-- The browser starts a login at `GET /auth/{provider}?origin=<app-origin>`. The
-  `origin` is validated against the **live** `RTDB_ALLOWED_ORIGINS` (the same
+- The browser starts a login at `GET /auth/{provider}/begin?origin=<app-origin>`.
+  The `origin` is validated against the **live** `RTDB_ALLOWED_ORIGINS` (the same
   list hot-reloadable via `PATCH /admin/config`); an origin not on the list is
-  `403`. The server then `302`s to the provider's authorize URL.
-- The provider redirects back to `/auth/{provider}/callback?code=&state=`, the
-  server exchanges the code for an access token, fetches the user's **verified**
-  email, upserts `rtdb_auth.users`, and mints a session (HttpOnly cookie).
+  `403`. The server mints a single-use `state` token, sets a `SameSite=None;HttpOnly`
+  `rtdb-oauth-csrf` nonce cookie (Login-CSRF defense — see [Hardening](#hardening)),
+  and returns the provider authorize URL + the state as JSON
+  (`{ authorizeUrl, state }`). The caller opens `authorizeUrl` in a `noopener`
+  popup and polls `GET /auth/state?state=…` for completion.
+- The provider redirects back to the callback (`/auth/callback` for GitHub,
+  `/auth/{provider}/callback` for Google/GitLab/OIDC) with `?code=&state=`. The
+  server constant-time-verifies the CSRF nonce cookie against `state`, claims
+  the pending entry (a replay rejects with `400`), exchanges the code for an
+  access token, fetches the user's **verified** email, upserts `rtdb_auth.users`,
+  and returns popup-closing HTML. The session token is delivered twice — via the
+  HttpOnly session cookie **and** via the one-shot `/auth/state` poll. The
+  `state` token (not the cookie) is the poll capability, which is what makes
+  cross-origin SDK login work where the `SameSite=Lax` session cookie would not
+  be sent.
 - Identity is **email-keyed with cross-provider linking**: a user who first
   logs in via GitHub and later via Google (same verified email) resolves to the
   same account. Enabling more providers is additive, not fragmenting.
 - All providers **require a verified email**. Google requires `email_verified`;
   GitHub picks the primary verified address (falling back to any verified one)
   and never trusts the unverified profile-level email; GitLab requires a
-  confirmed email (`confirmed_at` set on `/api/v4/user`).
-- A provider is "configured" only when **both** its `CLIENT_ID` and
-  `CLIENT_SECRET` are non-empty (`from_config` returns `None` otherwise).
+  confirmed email (`confirmed_at` set on `/api/v4/user`). The generic OIDC
+  provider trusts the configured IdP's assertion and rejects only when userinfo
+  explicitly says `email_verified: false` (many IdPs omit the field).
+- A provider is "configured" only when its required env vars are all non-empty
+  (`from_config` returns `None` otherwise) — the two credentials for
+  GitHub/Google/GitLab, and all five `RTDB_OIDC_*` fields for the generic OIDC
+  provider.
 
 ## Prerequisites (all providers)
 
@@ -47,6 +62,7 @@ working with zero providers configured.
 | GitHub | `RTDB_GITHUB_CLIENT_ID` / `RTDB_GITHUB_CLIENT_SECRET` | `RTDB_PUBLIC_URL` + `/auth/callback` | `read:user user:email` |
 | Google | `RTDB_GOOGLE_CLIENT_ID` / `RTDB_GOOGLE_CLIENT_SECRET` | `RTDB_PUBLIC_URL` + `/auth/google/callback` | `openid email profile` |
 | GitLab | `RTDB_GITLAB_CLIENT_ID` / `RTDB_GITLAB_CLIENT_SECRET` | `RTDB_PUBLIC_URL` + `/auth/gitlab/callback` | `read_user email` |
+| OIDC (generic) | `RTDB_OIDC_CLIENT_ID` / `_SECRET` / `_AUTHORIZE_URL` / `_TOKEN_URL` / `_USERINFO_URL` | `RTDB_PUBLIC_URL` + `/auth/oidc/callback` | `openid email profile` |
 
 ---
 
@@ -156,6 +172,37 @@ to your instance root, e.g. `https://gitlab.example.com`. par-rt-db then uses
 
 ---
 
+## OIDC (generic provider)
+
+par-rt-db ships one generic OpenID Connect provider that serves any
+standards-compliant IdP — Azure AD, Keycloak, Auth0, Okta, self-hosted, etc.
+Unlike the per-IdP modules above, the authorize/token/userinfo endpoints are
+not hardcoded: the operator supplies them from their IdP's
+`/.well-known/openid-configuration`. (The `OAuthProvider` trait's `authorize_url`
+is sync, so it cannot do live OIDC discovery at request time — endpoints are
+configuration, not discovered per login.)
+
+The provider is **active only when all five** `RTDB_OIDC_*` vars are set; with
+any one blank, the `/auth/oidc/*` routes return `503`, exactly like an
+unconfigured google/gitlab.
+
+1. Fetch your IdP's `/.well-known/openid-configuration` and note the
+   `authorization_endpoint`, `token_endpoint`, and `userinfo_endpoint` URLs.
+2. Register a confidential OAuth/OIDC client at your IdP with the redirect URI
+   `RTDB_PUBLIC_URL` + `/auth/oidc/callback`
+   (e.g. `https://rtdb.pardev.net/auth/oidc/callback`). This must match
+   byte-for-byte, including `https://`.
+3. Set all five env vars — `RTDB_OIDC_CLIENT_ID`, `RTDB_OIDC_CLIENT_SECRET`,
+   `RTDB_OIDC_AUTHORIZE_URL`, `RTDB_OIDC_TOKEN_URL`, `RTDB_OIDC_USERINFO_URL`
+   (see [Applying changes](#applying-changes)).
+
+par-rt-db requests the `openid email profile` scopes. A present email is
+required; the IdP's verification posture is trusted (an explicit
+`email_verified: false` rejects with `403 "email is not verified"`, but a
+missing `email_verified` is accepted — many IdPs omit it).
+
+---
+
 ## Applying changes
 
 OAuth client IDs/secrets are **boot-time config** (held on the server's `Config`,
@@ -176,13 +223,14 @@ Locally / in dev, put the same vars in your `.env` and restart the dev server.
 
 ## Verifying
 
-Hit the start endpoint and check the status code — a configured provider
-`302`s to the provider; an unconfigured one `503`s; a disallowed origin `403`s:
+Hit the begin endpoint and check the status code — a configured provider
+returns `200` with the JSON body `{ authorizeUrl, state }`; an unconfigured one
+`503`s; a disallowed origin `403`s:
 
 ```sh
-# expect 302 (→ Google). 503 = secrets not applied; 403 = origin not allowed.
+# expect 200 (JSON body with authorizeUrl + state). 503 = secrets not applied; 403 = origin not allowed.
 curl -s -o /dev/null -w "%{http_code}\n" \
-  "https://rtdb.pardev.net/auth/google?origin=https://projects.pardev.net"
+  "https://rtdb.pardev.net/auth/google/begin?origin=https://projects.pardev.net"
 ```
 
 Then do a real end-to-end login from the frontend, and confirm the session with:
@@ -191,12 +239,35 @@ Then do a real end-to-end login from the frontend, and confirm the session with:
 curl -s https://rtdb.pardev.net/auth/me -H "Authorization: Bearer <session-token>" | jq .
 ```
 
+## Hardening
+
+Two security properties of the login flow are worth knowing when you operate
+or integrate with par-rt-db:
+
+- **Login-CSRF (double-submit nonce).** `/auth/{provider}/begin` sets a
+  `SameSite=None;HttpOnly` cookie named `rtdb-oauth-csrf` whose value is the
+  minted `state` token; `/auth/{provider}/callback` rejects (400) any callback
+  whose cookie does not constant-time-equal the `state` query param. This binds
+  a callback to the browser that started the login, so an attacker can't induce a
+  victim into completing the attacker's own exchange. `SameSite=None` is
+  required so the cookie survives the provider → callback cross-site redirect;
+  cross-origin SDK consumers must therefore send `credentials: "include"` on the
+  `/begin` fetch (the same-origin dashboard does this by default). Disable as
+  break-glass via `RTDB_OAUTH_LOGIN_CSRF=false` (default `true`).
+- **Reverse-tabnabbing + cross-origin poll.** The popup opens with
+  `noopener,noreferrer`, so the authorize page has no `window.opener` handle.
+  Completion is relayed by the **parent** polling `GET /auth/state?state=` keyed
+  on the single-use state token — not by `window.opener.postMessage`. The state
+  token, not the session cookie, is the poll capability; this is what makes
+  cross-origin SDK login work where the `SameSite=Lax` session cookie would not
+  be sent on the poll request.
+
 ## Troubleshooting
 
 | Symptom | Cause / fix |
 |---|---|
 | `503 {… "oauth not configured"}` | `CLIENT_ID`/`CLIENT_SECRET` not set in the **container's** env. Three causes: blank in `.env`, the container wasn't recreated after editing `.env`, or `docker-compose.yml` doesn't pass that provider's vars into the server `environment:` block (so they sit in `.env` unused — the bug that blocked Google on first enable). |
-| `403 "origin not allowed"` | The `origin=` you passed to `/auth/{provider}` is not in `RTDB_ALLOWED_ORIGINS`. Add it (hot-reloadable via `PATCH /admin/config`). |
+| `403 "origin not allowed"` | The `origin=` you passed to `/auth/{provider}/begin` is not in `RTDB_ALLOWED_ORIGINS`. Add it (hot-reloadable via `PATCH /admin/config`). |
 | Provider error page: `redirect_uri_mismatch` | The callback URL registered at the provider doesn't exactly match `RTDB_PUBLIC_URL` + the callback path (see the [quick reference](#quick-reference)). Watch the scheme (`https://`) and trailing slash. |
 | `403 "no verified email"` | The account's email isn't verified at the provider. Verify it, or (Google) ensure the account is a *Test user* while the consent screen is in Testing. |
 | Google login works only for one account | Consent screen still in *Testing*. **Publish app** → *In production*. |
@@ -209,22 +280,24 @@ Each new provider is a small, self-contained implementation behind the
 - Implement `OAuthProvider` in a new module under `server/src/auth/`
   (`name`, `from_config` reading the provider's `Config` fields, `callback_path`,
   `authorize_url`, and `complete_login` doing the code-for-token exchange +
-  verified-email fetch + `session::create_session`). `gitlab.rs` is the most
-  recent worked example.
+  verified-email fetch + `session::create_session`). `gitlab.rs` is a worked
+  example for a hosted IdP with an overridable base URL; `oidc.rs` is the most
+  recent and shows the fully config-supplied-endpoint case.
 - Add the `Config` fields — at minimum `RTDB_<PROVIDER>_CLIENT_ID` /
   `_SECRET`, plus a base/API URL field when the provider is self-hostable
-  (`gitlab.rs`/`github.rs`) — and the two routes in `auth_routes()`.
-- **Wire the env vars into the deploy** — add the two vars to the server
+  (`gitlab.rs`/`github.rs`) — and the provider's route pair (`/auth/<provider>/begin`
+  + `/auth/<provider>/callback`) in `auth_routes()`.
+- **Wire the env vars into the deploy** — add each new var to the server
   service's `environment:` block in `docker-compose.yml` (mirroring the
-  GitHub/Google pair) and to `.env.example`. Without the compose line the vars
-  sit in `.env` unused: the container never sees them, `from_config` returns
+  GitHub/Google/OIDC entries) and to `.env.example`. Without the compose line the
+  vars sit in `.env` unused: the container never sees them, `from_config` returns
   `None`, and the provider's routes return `503` even after a container
   recreate.
 - Register an OAuth app with that provider; its callback is
   `RTDB_PUBLIC_URL` + the new `callback_path`.
 
 `FEATURE_MATRIX.md` rates each additional provider **S effort** — the shared
-plumbing (state tokens, redirects, HttpOnly cookie sessions, `/auth/me`,
-`/auth/logout`, per-Subscribe/Mutate `authorize`, cross-provider email linking)
-is provider-agnostic and reused unchanged; only the authorize-URL and
-code-exchange dance is provider-specific.
+plumbing (state tokens, the `rtdb-oauth-csrf` nonce, `/auth/state` polling,
+HttpOnly cookie sessions, `/auth/me`, `/auth/logout`, per-Subscribe/Mutate
+`authorize`, cross-provider email linking) is provider-agnostic and reused
+unchanged; only the authorize-URL and code-exchange dance is provider-specific.
