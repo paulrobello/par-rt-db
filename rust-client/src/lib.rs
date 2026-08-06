@@ -69,7 +69,7 @@ pub use wire::{
 };
 
 #[cfg(feature = "http")]
-pub use http::RtDbHttpClient;
+pub use http::{Fit, OutFormat, RtDbHttpClient, TransformOpts};
 
 #[cfg(feature = "in_memory")]
 pub use in_memory::InMemoryRtDbClient;

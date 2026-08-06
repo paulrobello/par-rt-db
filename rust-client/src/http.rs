@@ -72,6 +72,49 @@ pub struct FileMetadata {
     pub creation_time: i64,
 }
 
+/// Image-transform `fit` mode for [`RtDbHttpClient::transform_url`] (ENH-014).
+/// The serde rename is `kebab-case` so `ScaleDown` serializes as `scale-down`
+/// on the wire; `as_str` mirrors that for the hand-built query string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Fit {
+    #[default]
+    Contain,
+    Cover,
+    ScaleDown,
+}
+
+impl Fit {
+    fn as_str(self) -> &'static str {
+        match self {
+            Fit::Cover => "cover",
+            Fit::Contain => "contain",
+            Fit::ScaleDown => "scale-down",
+        }
+    }
+}
+
+/// Output format for [`RtDbHttpClient::transform_url`] (ENH-014).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OutFormat {
+    #[default]
+    Auto,
+    Jpeg,
+    Png,
+}
+
+/// Optional image-transform parameters for [`RtDbHttpClient::transform_url`]
+/// (ENH-014). All fields are optional; only `Some` fields appear in the query.
+#[derive(Debug, Clone, Default)]
+pub struct TransformOpts {
+    pub w: Option<u32>,
+    pub h: Option<u32>,
+    pub fit: Option<Fit>,
+    pub q: Option<u8>,
+    pub format: Option<OutFormat>,
+}
+
 impl RtDbHttpClient {
     pub fn new(url: &str, db: &str, token: &str) -> Self {
         let url = url.trim_end_matches('/').to_string();
@@ -462,6 +505,42 @@ impl RtDbHttpClient {
     /// The public serve URL — no request is made.
     pub fn get_url(&self, id: &str) -> String {
         format!("{}/storage/{id}", self.url)
+    }
+
+    /// The public serve URL for `id` with image-transform query params appended
+    /// (ENH-014). Params are emitted in fixed order `w, h, fit, q, format` and
+    /// only when `Some`. No request is made.
+    pub fn transform_url(&self, id: &str, opts: &TransformOpts) -> String {
+        let base = format!("{}/storage/{id}", self.url);
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(w) = opts.w {
+            parts.push(format!("w={w}"));
+        }
+        if let Some(h) = opts.h {
+            parts.push(format!("h={h}"));
+        }
+        if let Some(fit) = opts.fit {
+            parts.push(format!("fit={}", fit.as_str()));
+        }
+        if let Some(q) = opts.q {
+            parts.push(format!("q={q}"));
+        }
+        if let Some(f) = opts.format {
+            // `Auto` is the server default; omit it so the URL stays minimal.
+            let s = match f {
+                OutFormat::Auto => "",
+                OutFormat::Jpeg => "jpeg",
+                OutFormat::Png => "png",
+            };
+            if !s.is_empty() {
+                parts.push(format!("format={s}"));
+            }
+        }
+        if parts.is_empty() {
+            base
+        } else {
+            format!("{base}?{}", parts.join("&"))
+        }
     }
 
     /// Validate the bearer (session) token via `GET /auth/me`. Machine tokens get 401.
@@ -1992,6 +2071,25 @@ mod tests {
         // `mod tests` is a child of the `http` module, so it can read the private
         // `url` field of `RtDbHttpClient`.
         assert_eq!(client.get_url("f1"), format!("{}/storage/f1", client.url));
+    }
+
+    #[test]
+    fn transform_url_appends_query_params() {
+        let client = RtDbHttpClient::new("https://rtdb.example", "db", "tok");
+        let url = client.transform_url(
+            "f1",
+            &TransformOpts {
+                w: Some(100),
+                h: Some(50),
+                fit: Some(Fit::Cover),
+                q: Some(80),
+                format: Some(OutFormat::Auto),
+            },
+        );
+        assert_eq!(
+            url,
+            "https://rtdb.example/storage/f1?w=100&h=50&fit=cover&q=80"
+        );
     }
 }
 
