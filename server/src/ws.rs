@@ -614,6 +614,7 @@ async fn handle_text_frame(
         ClientMessage::PresenceState {
             room,
             state: presence_state,
+            ..
         } => {
             match state
                 .realtime

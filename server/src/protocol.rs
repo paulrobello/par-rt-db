@@ -63,6 +63,8 @@ pub enum ClientMessage {
     PresenceState {
         room: String,
         state: serde_json::Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ttl_ms: Option<u64>,
     },
     LeavePresence {
         room: String,
@@ -544,6 +546,7 @@ mod tests {
             serde_json::to_value(ClientMessage::PresenceState {
                 room: "doc:1".to_string(),
                 state: serde_json::json!({"typing": true}),
+                ttl_ms: None,
             })
             .unwrap(),
             serde_json::json!({"type": "presenceState", "room": "doc:1", "state": {"typing": true}})
@@ -555,6 +558,39 @@ mod tests {
             .unwrap(),
             serde_json::json!({"type": "leavePresence", "room": "doc:1"})
         );
+    }
+
+    #[test]
+    fn presence_state_ttl_ms_wire_tag() {
+        // ttlMs omitted when None (backward compatible — unchanged shape)
+        assert_eq!(
+            serde_json::to_value(ClientMessage::PresenceState {
+                room: "doc:1".to_string(),
+                state: serde_json::json!({"typing": true}),
+                ttl_ms: None,
+            })
+            .unwrap(),
+            serde_json::json!({"type": "presenceState", "room": "doc:1", "state": {"typing": true}})
+        );
+        // ttlMs present when Some
+        assert_eq!(
+            serde_json::to_value(ClientMessage::PresenceState {
+                room: "doc:1".to_string(),
+                state: serde_json::json!({"typing": true}),
+                ttl_ms: Some(3000),
+            })
+            .unwrap(),
+            serde_json::json!({"type": "presenceState", "room": "doc:1", "state": {"typing": true}, "ttlMs": 3000})
+        );
+        // and it deserializes back
+        let parsed: ClientMessage = serde_json::from_str(
+            r#"{"type":"presenceState","room":"doc:1","state":{},"ttlMs":500}"#,
+        )
+        .unwrap();
+        match parsed {
+            ClientMessage::PresenceState { ttl_ms, .. } => assert_eq!(ttl_ms, Some(500)),
+            _ => panic!("expected PresenceState"),
+        }
     }
 
     #[test]
