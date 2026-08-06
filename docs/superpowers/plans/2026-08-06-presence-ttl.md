@@ -300,7 +300,7 @@ Then add these tests:
         let expired = m.expire_once().await;
         assert!(expired);
         // state cleared to null, but the MEMBER is still present.
-        let members = m.snapshot("db", room()).await; // BUG-BAIT: see note
+        let members = m.snapshot("db", "room").await;
         let conn1 = members.iter().find(|x| x.connection_id == "1").unwrap();
         assert_eq!(conn1.state, serde_json::Value::Null);
         assert_eq!(members.len(), 2, "expiry clears state, not membership");
@@ -606,9 +606,8 @@ async fn ttl_expires_state_to_null_member_remains() {
     state.realtime.presence.flush_once().await;
     // peer observes typing:true
     let snap = drain_until_snapshot(&mut wb, "doc:1", |n| n == 2).await;
-    let a = snap["members"].as_array().unwrap().iter()
-        .find(|m| m["connectionId"] != json!(<String as std::str::FromStr>::from_str /* unused */ ).to_string()).unwrap();
-    // (assert conn A's state has typing:true — find by counting, both are present)
+    // both members are present and indistinguishable by identity here, so assert
+    // on the aggregate: at least one member is typing before the ttl fires.
     let typing = snap["members"].as_array().unwrap()
         .iter().any(|m| m["state"]["typing"] == json!(true));
     assert!(typing, "peer saw typing:true before ttl");
@@ -628,7 +627,7 @@ async fn ttl_expires_state_to_null_member_remains() {
 }
 ```
 
-**Implementer note (BUG-BAIT):** I left a broken `FromStr` expression in the `let a = ...` line as a placeholder — **delete that line entirely**; the real assertion is the `typing` bool computed just below it (`let typing = snap["members"]...any(|m| m["state"]["typing"] == json!(true))`). The `drain_until_snapshot` helper returns the matching snapshot as a `serde_json::Value`; confirm its exact return shape by reading `presence_test.rs:67` and assert against that shape (it returns the full `presenceSnapshot` `Value`). Both members are present and indistinguishable by identity here, so assert on the *aggregate* (one null state, no typing flag) rather than per-connectionId.
+**Implementer note:** the `drain_until_snapshot` helper returns the matching snapshot as a `serde_json::Value` — confirm its exact return shape by reading `presence_test.rs:67` and assert against that shape (it returns the full `presenceSnapshot` `Value`). Both members are present and indistinguishable by identity here, so assert on the *aggregate* (one null state, no typing flag) rather than per-connectionId.
 
 - [ ] **Step 3: Run the integration suite**
 
