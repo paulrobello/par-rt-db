@@ -59,21 +59,32 @@ freeze. Every chat/collab app on par-rt-db hits this.
   no new task. Expiry latency ≤ broadcast interval (~50 ms; ≤1 ms in immediate
   mode) — fine for 3 s typing indicators.
 - **Per-update ttl, re-armed on every refresh; omitted ttl removes the expiry.**
-  Each `presenceState`/`presence` carrying `ttlMs` sets `ttl_expires_at =
+  Each `presenceState` carrying `ttlMs` sets `ttl_expires_at =
   now + ttlMs`. An update with no `ttlMs` clears the expiry (state becomes
   permanent again). ttl omitted entirely = today's behavior (criterion 3).
+  ttl rides on `presenceState` **only** — not the join `presence` frame (see
+  Wire protocol).
 
 ## Wire protocol
 
-The two state-bearing client→server frames gain an optional `ttlMs`. Both use
-`Option<u64>` (milliseconds), `rename_all = "camelCase"` → serialized as
-`ttlMs`, `#[serde(default, skip_serializing_if = "Option::is_none")]` so an
-omitted field round-trips identically across all four implementations.
+Only the `presenceState` client→server frame gains an optional `ttlMs` — ttl is
+a *refresh* concept, so it belongs on the update frame, not the join. (`presence`
+join is unchanged.) The field is `Option<u64>` (milliseconds),
+`rename_all = "camelCase"` → serialized as `ttlMs`,
+`#[serde(default, skip_serializing_if = "Option::is_none")]` so an omitted field
+round-trips identically across all four implementations.
 
 | `type`          | fields (delta bolded) | meaning |
 |-----------------|-----------------------|---------|
-| `presence`      | `room: String`, `state?: Value`, **`ttlMs?: u64`** | Join/re-join. If `ttlMs` is present, arm an expiry for this session's state `ttlMs` after `now`; if absent, clear any existing expiry (state permanent). |
-| `presenceState` | `room: String`, `state: Value`, **`ttlMs?: u64`** | State update. Same ttl arming/clearing rule as `presence`. |
+| `presence`      | `room: String`, `state?: Value` | Join/re-join (**unchanged**). |
+| `presenceState` | `room: String`, `state: Value`, **`ttlMs?: u64`** | State update. If `ttlMs` is present, arm an expiry for this session's state `ttlMs` after `now`; if absent, clear any existing expiry (state permanent). |
+
+**Why not the join frame too:** the reactive clients cache join state for
+reconnect replay (rust `PresenceRoomState`, python `_PresenceRoom.join_state`, ts
+`joinedRooms`). Putting ttl on `presenceState` (which is **not** replayed) means
+zero replay-cache changes across all three clients, and avoids churn in the
+join methods' signatures. The join→update sequence covers every use case (join
+to appear online, then refresh the transient typing/cursor state with a ttl).
 
 `leavePresence` is unchanged. No new server→client frame: the observable
 effect of an expiry is the next coalesced `presenceSnapshot` showing the
@@ -92,11 +103,11 @@ member's `state` as `null`, exactly like a client-driven state update.
 
 ## Behavior rules
 
-1. **Arm on refresh.** A `presenceState`/`presence` with a valid `ttlMs` sets
+1. **Arm on refresh.** A `presenceState` with a valid `ttlMs` sets
    `ttl_expires_at = now + ttlMs` for that `(conn, room)` session and marks the
    room dirty (the state itself also changed). Repeated refreshes push the
    expiry forward.
-2. **Clear on permanent update.** A `presenceState`/`presence` with no `ttlMs`
+2. **Clear on permanent update.** A `presenceState` with no `ttlMs`
    sets `ttl_expires_at = None` (state permanent again). Omitted ttl = current
    behavior (criterion 3).
 3. **Expiry clears state, not membership.** When `ttl_expires_at <= now`,
@@ -156,14 +167,15 @@ Boot-only (not hot-reloadable), matching the rest of the presence runtime.
 ## Integration points
 
 - **`protocol.rs`** — add `ttl_ms: Option<u64>` (`rename_all = "camelCase"`) to
-  the `Presence` and `PresenceState` `ClientMessage` variants; wire-tag/field
-  tests next to the existing presence ones.
+  the `PresenceState` `ClientMessage` variant only; wire-tag/field tests next to
+  the existing presence ones.
 - **`presence.rs`** — add `ttl_expires_at: Option<i64>` to `Session`; arm/clear
-  it in `join`/`update_state` from the new `ttl_ms` arg; add `expire_once()`;
-  call it at the top of `run_flush_task`'s loop; add
-  `RTDB_PRESENCE_MAX_TTL_MS` to `PresenceConfig`/`Config`; validate `ttl_ms`.
-- **`ws.rs`** — thread the parsed `ttl_ms` from the `Presence`/`PresenceState`
-  frames into `join`/`update_state`.
+  it in `update_state` from the new `ttl_ms` arg (`join` is unchanged — joins are
+  permanent until an update arms a ttl); add `expire_once()`; call it at the top
+  of `run_flush_task`'s loop; add `RTDB_PRESENCE_MAX_TTL_MS` to
+  `PresenceConfig`/`Config`; validate `ttl_ms`.
+- **`ws.rs`** — thread the parsed `ttl_ms` from the `PresenceState` frame into
+  `update_state`.
 - **`config.rs`** — `RTDB_PRESENCE_MAX_TTL_MS`.
 - **`metrics`** — `rtdb_presence_ttl_expiries_total` (counter), surfaced on the
   dashboard metrics page.
@@ -178,12 +190,13 @@ log, webhooks, `SubscriptionManager`, document tables, or storage.
 
 ## Client mirror (all four clients + harness + matrix)
 
-- **ts-client** — `ttlMs?` on the wire; `updatePresence(room, state, opts?)` and
-  `presence(room, state?, opts?)` accept `{ ttlMs }`; `usePresence` forwards it.
-- **rust-client** — `ttlMs: Option<u64>` in `wire.rs`; `update_presence`/`presence`
-  take an optional ttl.
-- **python-client** — `ttlMs` in `wire.py`; `update_presence`/`presence` take an
-  optional `ttl_ms`.
+- **ts-client** — `ttlMs?` on the `presenceState` wire frame;
+  `updatePresence(room, state, ttlMs?)` accepts it (the join method is
+  unchanged); `usePresence`'s returned `updatePresence` forwards it.
+- **rust-client** — `ttlMs: Option<u64>` on `PresenceState` in `wire.rs`;
+  `update_presence` takes an optional ttl (join method unchanged).
+- **python-client** — `ttlMs` on `_ClientPresenceState` in `wire.py`;
+  `update_presence` takes an optional `ttl_ms` (join method unchanged).
 - **In-memory harness** (ts `InMemoryRtDbClient` + rust `in_memory` feature) —
   model ttl expiry against the harness's own clock so a two-"client" typing flow
   is testable with no network.
