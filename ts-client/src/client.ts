@@ -1,5 +1,6 @@
 import { RtDbError } from "./errors.js";
 import { RtDbHttpClient } from "./http.js";
+import type { TransformOpts } from "./http.js";
 import { parseStepResults, type StepResult } from "./mutation.js";
 import { projectOptimisticUpdate } from "./optimistic.js";
 import type {
@@ -384,6 +385,10 @@ export class RtDbClient {
 
   getUrl(id: string) {
     return this.httpForStorage().getUrl(id);
+  }
+
+  transformUrl(id: string, opts: TransformOpts) {
+    return this.httpForStorage().transformUrl(id, opts);
   }
 
   private httpForStorage(): RtDbHttpClient {

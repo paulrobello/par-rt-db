@@ -28,4 +28,25 @@ describe("in-memory storage", () => {
     const http = new RtDbHttpClient({ url: "https://rtdb.example.com/", db: "kanban", token: "t" });
     expect(http.getUrl("abc")).toBe("https://rtdb.example.com/storage/abc");
   });
+
+  it("appendImageParams builds the canonical query string", async () => {
+    const { appendImageParams } = await import("../src/http.js");
+    const url = appendImageParams("https://rtdb.example/storage/abc", {
+      w: 100, h: 50, fit: "cover", q: 80, format: "jpeg",
+    });
+    expect(url).toBe("https://rtdb.example/storage/abc?w=100&h=50&fit=cover&q=80&format=jpeg");
+  });
+
+  it("appendImageParams omits unset opts", async () => {
+    const { appendImageParams } = await import("../src/http.js");
+    expect(appendImageParams("https://rtdb.example/storage/abc", { w: 64 }))
+      .toBe("https://rtdb.example/storage/abc?w=64");
+  });
+
+  it("transformUrl against the http client builds the URL with params", async () => {
+    const { RtDbHttpClient } = await import("../src/http.js");
+    const http = new RtDbHttpClient({ url: "https://rtdb.example.com/", db: "kanban", token: "t" });
+    expect(http.transformUrl("abc", { w: 100, fit: "contain" }))
+      .toBe("https://rtdb.example.com/storage/abc?w=100&fit=contain");
+  });
 });

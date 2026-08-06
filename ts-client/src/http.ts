@@ -34,6 +34,29 @@ export interface FileMetadata {
   creationTime: number;
 }
 
+/** Image-transform query params appended to a storage serve URL (ENH-014). */
+export interface TransformOpts {
+  w?: number;
+  h?: number;
+  fit?: "cover" | "contain" | "scale-down";
+  q?: number;
+  format?: "jpeg" | "png" | "auto";
+}
+
+/** Append image-transform query params to a storage URL. Omits unset opts. */
+export function appendImageParams(url: string, opts: TransformOpts): string {
+  const parts: string[] = [];
+  const push = (k: string, v: string | undefined) => {
+    if (v !== undefined) parts.push(`${k}=${encodeURIComponent(v)}`);
+  };
+  push("w", opts.w?.toString());
+  push("h", opts.h?.toString());
+  push("fit", opts.fit);
+  push("q", opts.q?.toString());
+  push("format", opts.format);
+  return parts.length ? `${url}?${parts.join("&")}` : url;
+}
+
 /** One-shot HTTP client for machine callers (or any Bearer token). */
 export class RtDbHttpClient {
   private readonly url: string;
@@ -173,6 +196,11 @@ export class RtDbHttpClient {
   /** The public serve URL for `id` — no fetch, the browser consumes it. */
   getUrl(id: string): string {
     return `${this.url}/storage/${encodeURIComponent(id)}`;
+  }
+
+  /** The public serve URL for `id` with image-transform params applied. */
+  transformUrl(id: string, opts: TransformOpts): string {
+    return appendImageParams(this.getUrl(id), opts);
   }
 
   private async post(path: string, payload: unknown): Promise<unknown> {
