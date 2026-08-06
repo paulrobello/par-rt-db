@@ -47,7 +47,7 @@ from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import dataclass
 from functools import cmp_to_key
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import TypeAdapter
 
@@ -1521,6 +1521,36 @@ class InMemoryRtDbClient:
     def get_url(self, id: str) -> str:
         """Synthetic handle — no real byte stream."""
         return f"memory://{id}"
+
+    def transform_url(
+        self,
+        id: str,
+        *,
+        w: int | None = None,
+        h: int | None = None,
+        fit: Literal["cover", "contain", "scale-down"] | None = None,
+        q: int | None = None,
+        format: Literal["jpeg", "png", "auto"] | None = None,
+    ) -> str:
+        """Synthetic handle with image-transform params (ENH-014). No real byte stream.
+
+        Params appear in the deterministic order ``w, h, fit, q, format``; unset
+        params are omitted. Mirrors ``RtDbHttpClient.transform_url`` so tests
+        against the in-memory harness assert the same query-string shape.
+        """
+        parts: list[str] = []
+        if w is not None:
+            parts.append(f"w={w}")
+        if h is not None:
+            parts.append(f"h={h}")
+        if fit is not None:
+            parts.append(f"fit={fit}")
+        if q is not None:
+            parts.append(f"q={q}")
+        if format is not None:
+            parts.append(f"format={format}")
+        base = f"memory://{id}"
+        return f"{base}?{'&'.join(parts)}" if parts else base
 
 
 # ---------------------------------------------------------------------------

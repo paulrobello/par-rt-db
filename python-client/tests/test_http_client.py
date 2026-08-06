@@ -429,6 +429,25 @@ def test_get_url_is_base_plus_storage_id_no_request() -> None:
     assert client.get_url("f1") == "https://rtdb.example/storage/f1"
 
 
+def test_transform_url_emits_params_in_order() -> None:
+    from urllib.parse import parse_qs, urlparse
+
+    client = _client(lambda r: httpx.Response(500))
+    url = client.transform_url("f1", w=100, h=50, fit="cover", q=80, format="jpeg")
+    assert url == "https://rtdb.example/storage/f1?w=100&h=50&fit=cover&q=80&format=jpeg"
+    # Query keys must appear in the deterministic order w, h, fit, q, format.
+    qs = parse_qs(urlparse(url).query)
+    assert list(qs) == ["w", "h", "fit", "q", "format"]
+
+
+def test_transform_url_omits_unset_opts() -> None:
+    from urllib.parse import parse_qs, urlparse
+
+    client = _client(lambda r: httpx.Response(500))
+    qs = parse_qs(urlparse(client.transform_url("f1", w=64)).query)
+    assert list(qs) == ["w"]
+
+
 # --- admin control plane ----------------------------------------------------
 
 

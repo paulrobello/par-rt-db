@@ -25,7 +25,7 @@ machine token (or OAuth session token).
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
@@ -633,6 +633,35 @@ class RtDbHttpClient:
     def get_url(self, id: str) -> str:
         """The public serve URL (``GET /storage/{id}``) — no request is made."""
         return f"{self._base}/storage/{id}"
+
+    def transform_url(
+        self,
+        id: str,
+        *,
+        w: int | None = None,
+        h: int | None = None,
+        fit: Literal["cover", "contain", "scale-down"] | None = None,
+        q: int | None = None,
+        format: Literal["jpeg", "png", "auto"] | None = None,
+    ) -> str:
+        """The public serve URL for ``id`` with image-transform params (ENH-014).
+
+        No request is made. Params appear in the deterministic order
+        ``w, h, fit, q, format``; unset params are omitted.
+        """
+        parts: list[str] = []
+        if w is not None:
+            parts.append(f"w={w}")
+        if h is not None:
+            parts.append(f"h={h}")
+        if fit is not None:
+            parts.append(f"fit={fit}")
+        if q is not None:
+            parts.append(f"q={q}")
+        if format is not None:
+            parts.append(f"format={format}")
+        base = f"{self._base}/storage/{id}"
+        return f"{base}?{'&'.join(parts)}" if parts else base
 
     # --- admin control plane (admin key as the token) ---
 
