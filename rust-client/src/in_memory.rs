@@ -192,6 +192,13 @@ pub struct PresenceRooms {
     /// [`PresenceHandle`]'s Drop; fan_out skips and lazily compacts dead entries
     /// — the same pattern as [`InMemoryRtDbClient::notify_subs`].
     subs: HashMap<String, Vec<PresenceListener>>,
+    /// `room → connectionId → expiresAt(ms)` for ENH-015 presence-ttl. A member
+    /// with an entry here has its `state` cleared to null at the recorded
+    /// instant by [`expire`](Self::expire) (the member stays listed). Mirrors
+    /// the ts harness's parallel `expiry` map — kept separate from
+    /// [`PresenceMember`] because that struct is the server→client snapshot
+    /// shape and must stay byte-identical with the server.
+    expiry: HashMap<String, HashMap<String, i64>>,
 }
 
 /// One registered presence callback + its alive flag.
@@ -246,8 +253,19 @@ impl PresenceRooms {
 
     /// Updates `connection_id`'s state in `room` and fans out. No-op if the
     /// connection is not in the room (matches the live server, which would not
-    /// relay an update for a non-member).
-    pub fn update(&mut self, room: &str, connection_id: &str, state: Value) {
+    /// relay an update for a non-member). When `ttl_ms` is `Some(n)` with `n > 0`,
+    /// schedules an expiry sweep that nulls this member's `state` at `now + n`
+    /// (the member stays listed); `None` (or `Some(0)`) clears any pending
+    /// expiry, mirroring the live server's "ttlMs after the last refresh"
+    /// semantics. Mirrors TS `PresenceRooms.update` (ENH-015 presence-ttl).
+    pub fn update(
+        &mut self,
+        room: &str,
+        connection_id: &str,
+        state: Value,
+        ttl_ms: Option<u64>,
+        now: i64,
+    ) {
         let Some(entries) = self.members.get_mut(room) else {
             return;
         };
@@ -255,10 +273,23 @@ impl PresenceRooms {
             return;
         };
         member.state = state;
+        let exp = self.expiry.entry(room.to_string()).or_default();
+        match ttl_ms {
+            Some(n) if n > 0 => {
+                exp.insert(connection_id.to_string(), now + n as i64);
+            }
+            _ => {
+                exp.remove(connection_id);
+            }
+        }
+        if exp.is_empty() {
+            self.expiry.remove(room);
+        }
         self.fan_out(room);
     }
 
-    /// Removes `connection_id` from `room` and fans out. No-op if absent.
+    /// Removes `connection_id` from `room` and fans out. No-op if absent. Also
+    /// clears any pending expiry entry so a re-join doesn't inherit a stale ttl.
     pub fn leave(&mut self, room: &str, connection_id: &str) {
         let Some(entries) = self.members.get_mut(room) else {
             return;
@@ -271,7 +302,66 @@ impl PresenceRooms {
         if entries.is_empty() {
             self.members.remove(room);
         }
+        if let Some(exp) = self.expiry.get_mut(room) {
+            exp.remove(connection_id);
+            if exp.is_empty() {
+                self.expiry.remove(room);
+            }
+        }
         self.fan_out(room);
+    }
+
+    /// Clears expired members' `state` to `Value::Null` (the member stays
+    /// listed) and fans out each touched room once. Returns `true` if anything
+    /// expired. Mirrors the live server's per-connection ttl clearing
+    /// (`server::presence::expire_once`) and the TS harness's `expire`. Idempotent:
+    /// a second sweep with the same `now` is a no-op (the expiry entries were
+    /// already drained).
+    pub fn expire(&mut self, now: i64) -> bool {
+        let mut any = false;
+        let mut touched: Vec<String> = Vec::new();
+        // Drain the rooms that currently have an expiry map. We can't mutate
+        // `self.members` while iterating `self.expiry`, so collect the work
+        // first, then apply.
+        let rooms_with_expiry: Vec<String> = self.expiry.keys().cloned().collect();
+        for room in rooms_with_expiry {
+            let Some(exp) = self.expiry.get_mut(&room) else {
+                continue;
+            };
+            let due: Vec<String> = exp
+                .iter()
+                .filter(|(_, at)| **at <= now)
+                .map(|(id, _)| id.clone())
+                .collect();
+            if due.is_empty() {
+                continue;
+            }
+            // Drop the expired entries from the expiry map.
+            for id in &due {
+                exp.remove(id);
+            }
+            if exp.is_empty() {
+                self.expiry.remove(&room);
+            }
+            // Null the state of each due member in the room's member list.
+            if let Some(entries) = self.members.get_mut(&room) {
+                let mut room_touched = false;
+                for id in &due {
+                    if let Some((_, member)) = entries.iter_mut().find(|(cid, _)| cid == id) {
+                        member.state = Value::Null;
+                        any = true;
+                        room_touched = true;
+                    }
+                }
+                if room_touched {
+                    touched.push(room);
+                }
+            }
+        }
+        for room in &touched {
+            self.fan_out(room);
+        }
+        any
     }
 
     /// Registers `cb` for `room` snapshots and immediately fires it with the
@@ -2174,15 +2264,35 @@ impl InMemoryRtDbClient {
 
     /// Broadcasts updated `state` for this connection in `room`. No-op if this
     /// client has not joined `room` (mirrors the live server, which would not
-    /// relay an update from a non-member).
-    pub fn update_presence(&mut self, room: &str, state: Value) {
+    /// relay an update from a non-member). When `ttl_ms` is `Some(n)` with
+    /// `n > 0`, the harness schedules an expiry that nulls this member's
+    /// `state` at `now + n` (the member stays listed) — mirroring the live
+    /// server. Call [`expire_presence`](Self::expire_presence) (or `tick`) to
+    /// run the sweep.
+    pub fn update_presence(&mut self, room: &str, state: Value, ttl_ms: Option<u64>) {
         if !self.joined_rooms.contains(room) {
             return;
         }
+        let now = (self.now)();
         self.presence_rooms
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .update(room, &self.connection_id, state);
+            .update(room, &self.connection_id, state, ttl_ms, now);
+    }
+
+    /// Runs a presence-ttl expiry sweep: clears expired members' `state` to
+    /// `Value::Null` (the member stays listed) and fans out each touched room
+    /// once. Returns `true` if anything expired. Mirrors the live server's
+    /// per-connection ttl clearing (`server::presence::expire_once`). Use this
+    /// in tests that don't otherwise drive the clock via [`tick`](Self::tick).
+    /// Pass an explicit `now` for determinism; `None` uses the client's injected
+    /// clock.
+    pub fn expire_presence(&mut self, now: Option<i64>) -> bool {
+        let now = now.unwrap_or_else(|| (self.now)());
+        self.presence_rooms
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .expire(now)
     }
 
     /// Leaves `room`: removes this connection from the member list, drops every
@@ -7728,7 +7838,7 @@ mod tests {
                 snaps_clone.lock().unwrap().push(m.state.clone());
             }
         });
-        c.update_presence("room", json!({"typing": true}));
+        c.update_presence("room", json!({"typing": true}), None);
         let got = snaps.lock().unwrap();
         assert_eq!(got.len(), 2, "initial + update");
         assert_eq!(got[1], json!({"typing": true}));
@@ -7744,7 +7854,7 @@ mod tests {
             snaps_clone.lock().unwrap().push(members.len());
         });
         // Update a different room — no fan-out for "room".
-        c.update_presence("other", json!({}));
+        c.update_presence("other", json!({}), None);
         assert_eq!(snaps.lock().unwrap().len(), 1, "no new snapshot");
     }
 
@@ -7772,7 +7882,7 @@ mod tests {
         drop(h1);
 
         // c2 updates — c1's callback must not fire (listener dropped).
-        c2.update_presence("room", json!({"x": 1}));
+        c2.update_presence("room", json!({"x": 1}), None);
         assert_eq!(
             *c1_snaps.lock().unwrap(),
             [1, 2],
@@ -7809,6 +7919,181 @@ mod tests {
             let got = c1_snaps.lock().unwrap();
             assert_eq!(got.len(), 3);
             assert_eq!(got[2], ["c1"]);
+        }
+    }
+
+    // ---- presence ttl (ENH-015) ------------------------------------------
+    //
+    // Mirrors `PresenceRooms.expire` + `update(..., ttlMs, now)` in
+    // `ts-client/src/in_memory.ts`: a refresh with a ttl schedules an expiry
+    // sweep that nulls this member's `state` to Value::Null at `now + ttl`
+    // (the member stays listed); a refresh with no ttl clears any pending
+    // expiry. Mirrors the live server's `expire_once`.
+    //
+    // These tests drive `PresenceRooms` directly with controlled `now` values
+    // (the harness's `update`/`expire` take `now` explicitly) so the expiry
+    // math is deterministic without relying on the client's injected clock.
+    // The client-surface helper is covered separately below.
+
+    fn presence_member(conn: &str, state: Value) -> PresenceMember {
+        PresenceMember {
+            connection_id: conn.to_string(),
+            user: AuthedUser {
+                kind: crate::wire::UserKind::User,
+                email: Some(format!("{conn}@x.com")),
+                name: None,
+                github_login: None,
+                github_id: None,
+            },
+            state,
+        }
+    }
+
+    #[tokio::test]
+    async fn presence_ttl_expires_state_to_null_member_stays() {
+        // Brief: c1 and c2 share a PresenceRooms. c1 updates with ttl_ms = 1000
+        // at t = 5000. At t = 5999 nothing has expired. At t = 6000+ the sweep
+        // nulls c1's state, c2 observes the null, c1 is still a member.
+        let mut rooms = PresenceRooms::default();
+
+        let c2_states: Arc<Mutex<Vec<(Value, String)>>> = Arc::new(Mutex::new(Vec::new()));
+        let c2_states_clone = c2_states.clone();
+        let _h2 = rooms.subscribe("room", move |members| {
+            if let Some(c1) = members.iter().find(|m| m.connection_id == "c1") {
+                c2_states_clone
+                    .lock()
+                    .unwrap()
+                    .push((c1.state.clone(), c1.connection_id.clone()));
+            }
+        });
+
+        // c1 joins, then refreshes with a ttl at t = 5000.
+        rooms.join("room", presence_member("c1", Value::Null));
+        rooms.update("room", "c1", json!({"typing": true}), Some(1000), 5000);
+        {
+            let got = c2_states.lock().unwrap();
+            // Two observations of c1's state so far: c1 join (null), c1 update
+            // (typing). (c2 has no presence entry — it only subscribes.)
+            assert_eq!(got.len(), 2);
+            assert_eq!(got[1].0, json!({"typing": true}));
+        }
+
+        // Before expiry: no change, expire returns false.
+        assert!(!rooms.expire(5999));
+        {
+            let got = c2_states.lock().unwrap();
+            assert_eq!(got.len(), 2, "no fire before expiry");
+        }
+
+        // At/after expiry: state → null, member stays, expire returns true.
+        assert!(rooms.expire(6000));
+        {
+            let got = c2_states.lock().unwrap();
+            assert_eq!(got.len(), 3, "one fire on expiry");
+            assert_eq!(got[2].0, Value::Null, "state cleared to null");
+            assert_eq!(got[2].1, "c1", "member stays in the room");
+        }
+        let snap = rooms.snapshot("room");
+        assert_eq!(snap.len(), 1, "member stays listed after expiry");
+        assert_eq!(snap[0].state, Value::Null);
+
+        // Idempotent: a second sweep at the same instant is a no-op.
+        assert!(!rooms.expire(6000));
+        {
+            let got = c2_states.lock().unwrap();
+            assert_eq!(got.len(), 3, "no further fire");
+        }
+    }
+
+    #[tokio::test]
+    async fn presence_ttl_refresh_without_ttl_clears_expiry() {
+        // Brief: a refresh with ttl_ms = None clears any pending expiry — the
+        // state persists past the original expiry instant.
+        let mut rooms = PresenceRooms::default();
+        rooms.join("room", presence_member("c1", Value::Null));
+        rooms.update("room", "c1", json!({"typing": true}), Some(1000), 5000);
+        rooms.update("room", "c1", json!({"typing": false}), None, 5500);
+        // Past the original expiry instant — no expiry, state persists.
+        assert!(!rooms.expire(10_000));
+        let snap = rooms.snapshot("room");
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].state, json!({"typing": false}));
+    }
+
+    #[tokio::test]
+    async fn presence_ttl_leave_clears_expiry_entry() {
+        // Brief: leaving clears the expiry entry, so a re-join with the same
+        // connectionId does not inherit a stale ttl.
+        let mut rooms = PresenceRooms::default();
+        rooms.join("room", presence_member("c1", Value::Null));
+        rooms.update("room", "c1", json!({"typing": true}), Some(1000), 5000);
+        rooms.leave("room", "c1");
+        // After leave, the expiry map should be empty (no fire, no panic).
+        assert!(!rooms.expire(10_000));
+        // And re-join with the same connId does not carry the old ttl.
+        rooms.join("room", presence_member("c1", json!({"fresh": true})));
+        assert!(!rooms.expire(10_000));
+        let snap = rooms.snapshot("room");
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].state, json!({"fresh": true}));
+    }
+
+    #[tokio::test]
+    async fn presence_ttl_client_expire_presence_helper() {
+        // Brief: the client's `expire_presence(now)` helper drives the same
+        // sweep through the client's injected clock, mirroring `tick` for the
+        // document reaper. Two clients on shared rooms; one updates with a
+        // short ttl; the other observes the null at expiry.
+        let t: Arc<Mutex<i64>> = Arc::new(Mutex::new(0));
+        let t_clone = t.clone();
+        let rooms = Arc::new(Mutex::new(PresenceRooms::default()));
+        let make = |conn: &'static str| {
+            let t = t_clone.clone();
+            let rooms = rooms.clone();
+            InMemoryRtDbClient::new(
+                InMemoryRtDbClientOptions::default()
+                    .connection_id(conn)
+                    .now(move || *t.lock().unwrap())
+                    .presence_user(AuthedUser {
+                        kind: crate::wire::UserKind::User,
+                        email: Some(format!("{conn}@x.com")),
+                        name: None,
+                        github_login: None,
+                        github_id: None,
+                    })
+                    .presence_rooms(rooms),
+            )
+        };
+        let mut c1 = make("c1");
+        let mut c2 = make("c2");
+
+        let c2_states: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let c2_states_clone = c2_states.clone();
+        let _h2 = c2.presence("room", None, move |members| {
+            if let Some(c1) = members.iter().find(|m| m.connection_id == "c1") {
+                c2_states_clone.lock().unwrap().push(c1.state.clone());
+            }
+        });
+
+        let _h1 = c1.presence("room", None, |_| {});
+
+        // Advance the clock to t = 5000 and refresh c1 with a 1000ms ttl.
+        *t.lock().unwrap() = 5000;
+        c1.update_presence("room", json!({"typing": true}), Some(1000));
+
+        // Before expiry: helper returns false, no new observation.
+        assert!(!c2.expire_presence(Some(5999)));
+        {
+            let got = c2_states.lock().unwrap();
+            assert!(got.len() >= 2);
+            assert_eq!(got.last().unwrap(), &json!({"typing": true}));
+        }
+
+        // After expiry: helper returns true, c2 observes the null.
+        assert!(c2.expire_presence(Some(6000)));
+        {
+            let got = c2_states.lock().unwrap();
+            assert_eq!(got.last().unwrap(), &Value::Null);
         }
     }
 }

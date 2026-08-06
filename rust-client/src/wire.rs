@@ -66,6 +66,8 @@ pub enum ClientMessage {
     PresenceState {
         room: String,
         state: serde_json::Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ttl_ms: Option<u64>,
     },
     LeavePresence {
         room: String,
@@ -1295,9 +1297,20 @@ mod tests {
             serde_json::to_value(ClientMessage::PresenceState {
                 room: "doc:1".to_string(),
                 state: json!({"typing": true}),
+                ttl_ms: None,
             })
             .unwrap(),
             json!({"type": "presenceState", "room": "doc:1", "state": {"typing": true}})
+        );
+        // ttl_ms: Some emits "ttlMs" on the wire (ENH-015 presence-ttl).
+        assert_eq!(
+            serde_json::to_value(ClientMessage::PresenceState {
+                room: "doc:1".to_string(),
+                state: json!({"typing": true}),
+                ttl_ms: Some(3000),
+            })
+            .unwrap(),
+            json!({"type": "presenceState", "room": "doc:1", "state": {"typing": true}, "ttlMs": 3000})
         );
         assert_eq!(
             serde_json::to_value(ClientMessage::LeavePresence {
@@ -1305,6 +1318,77 @@ mod tests {
             })
             .unwrap(),
             json!({"type": "leavePresence", "room": "doc:1"})
+        );
+    }
+
+    // ENH-015 presence-ttl: PresenceState carries an optional `ttlMs` that the
+    // server uses to clear this connection's `state` to null `ttlMs` after the
+    // last refresh (member stays). Some emits the field; None omits it; the
+    // deserialize path accepts both forms and round-trips.
+    #[test]
+    fn presence_state_ttl_ms_round_trip() {
+        // ttlMs present → deserializes into Some(_).
+        let with_ttl = json!({
+            "type": "presenceState",
+            "room": "doc:1",
+            "state": {"typing": true},
+            "ttlMs": 3000
+        });
+        let back: ClientMessage = serde_json::from_value(with_ttl.clone()).unwrap();
+        match back {
+            ClientMessage::PresenceState {
+                room,
+                state,
+                ttl_ms,
+            } => {
+                assert_eq!(room, "doc:1");
+                assert_eq!(state, json!({"typing": true}));
+                assert_eq!(ttl_ms, Some(3000));
+            }
+            other => panic!("expected PresenceState, got {other:?}"),
+        }
+        // Re-serialize preserves ttlMs.
+        assert_eq!(
+            serde_json::to_value(ClientMessage::PresenceState {
+                room: "doc:1".to_string(),
+                state: json!({"typing": true}),
+                ttl_ms: Some(3000),
+            })
+            .unwrap(),
+            with_ttl
+        );
+
+        // Absent ttlMs → deserializes into None; re-serialization omits the key.
+        let without_ttl = json!({
+            "type": "presenceState",
+            "room": "doc:1",
+            "state": {"typing": true}
+        });
+        let back: ClientMessage = serde_json::from_value(without_ttl.clone()).unwrap();
+        match back {
+            ClientMessage::PresenceState { ttl_ms, .. } => assert_eq!(ttl_ms, None),
+            other => panic!("expected PresenceState, got {other:?}"),
+        }
+        assert_eq!(
+            serde_json::to_value(ClientMessage::PresenceState {
+                room: "doc:1".to_string(),
+                state: json!({"typing": true}),
+                ttl_ms: None,
+            })
+            .unwrap(),
+            without_ttl
+        );
+
+        // ttlMs: 0 is a real value, not omitted (skip_serializing_if checks
+        // Option::is_none, not falsiness — the server treats 0 as "no ttl").
+        assert_eq!(
+            serde_json::to_value(ClientMessage::PresenceState {
+                room: "doc:1".to_string(),
+                state: json!({"typing": true}),
+                ttl_ms: Some(0),
+            })
+            .unwrap(),
+            json!({"type": "presenceState", "room": "doc:1", "state": {"typing": true}, "ttlMs": 0})
         );
     }
 

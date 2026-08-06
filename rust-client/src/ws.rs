@@ -274,9 +274,14 @@ enum Cmd {
     /// Update this connection's state in a joined room. Sent only while
     /// authenticated; on a dropped session the cached state in
     /// [`PresenceRoomState`] replays with the freshest value on the next join.
+    /// `ttl_ms` (ENH-015 presence-ttl) tells the server to clear this
+    /// connection's `state` to null `ttl_ms` after the last refresh (the member
+    /// stays); `None` means no expiry. The join frame (`PresenceJoin`) never
+    /// carries ttl — ttl is a refresh concept.
     PresenceUpdate {
         room: String,
         state: serde_json::Value,
+        ttl_ms: Option<u64>,
     },
     /// Leave a presence room (bookkeeping already cleared by the caller).
     PresenceLeave { room: String },
@@ -669,7 +674,14 @@ impl RtDbClient {
     /// the cached join state so a reconnect re-joins with the latest value. No-op
     /// if this client has not joined `room` (mirrors the live server, which would
     /// not relay an update from a non-member).
-    pub fn update_presence(&self, room: &str, state: serde_json::Value) {
+    ///
+    /// `ttl_ms` (ENH-015 presence-ttl) tells the server to clear this
+    /// connection's `state` to null `ttl_ms` milliseconds after the last
+    /// refresh (the member stays in the room). `None` clears any pending
+    /// expiry, mirroring the live server's "ttlMs after the last refresh"
+    /// semantics. Pass `Some(ms)` for a heartbeat-style refresh, `None` for a
+    /// plain update.
+    pub fn update_presence(&self, room: &str, state: serde_json::Value, ttl_ms: Option<u64>) {
         let joined = {
             let maps = self
                 .inner
@@ -687,6 +699,7 @@ impl RtDbClient {
             let _ = self.inner.cmd_tx.send(Cmd::PresenceUpdate {
                 room: room.to_string(),
                 state,
+                ttl_ms,
             });
         }
     }
@@ -1212,12 +1225,12 @@ async fn run_session(
                         }
                     }
                 }
-                Some(Cmd::PresenceUpdate { room, state }) => {
+                Some(Cmd::PresenceUpdate { room, state, ttl_ms }) => {
                     // Only relay if the room is joined on this session (it may
                     // have been left while this cmd was queued, or the connection
                     // dropped and the room was not re-joined).
                     if sent_rooms.contains(&room) {
-                        let frame = ClientMessage::PresenceState { room, state };
+                        let frame = ClientMessage::PresenceState { room, state, ttl_ms };
                         if send_text(&mut sink, &frame).await.is_err() {
                             return SessionOutcome::Reconnect;
                         }
