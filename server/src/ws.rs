@@ -614,12 +614,12 @@ async fn handle_text_frame(
         ClientMessage::PresenceState {
             room,
             state: presence_state,
-            ..
+            ttl_ms,
         } => {
             match state
                 .realtime
                 .presence
-                .update_state(db, conn_id, &room, presence_state)
+                .update_state(db, conn_id, &room, presence_state, ttl_ms)
                 .await
             {
                 Ok(()) => state.runtime.metrics.record_presence_update(),

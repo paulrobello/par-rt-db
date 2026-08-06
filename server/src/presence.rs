@@ -48,6 +48,10 @@ struct Session {
     #[allow(dead_code)] // read in Task 4's broadcast path
     joined_at: i64,
     updated_at: i64,
+    /// Absolute epoch-ms at which `state` should be cleared to null by
+    /// `expire_once`. `None` = permanent (no ttl armed). Joins never arm it
+    /// (ttl rides on `presenceState` only); only `update_state` sets/clears it.
+    expires_at: Option<i64>,
 }
 
 /// Per-db shard.
@@ -171,6 +175,7 @@ impl PresenceManager {
                 tx,
                 joined_at: now,
                 updated_at: now,
+                expires_at: None,
             },
         );
         // index (only on a genuine new join — re-join must not append a
@@ -189,11 +194,23 @@ impl PresenceManager {
         conn: ConnId,
         room: &str,
         state: serde_json::Value,
+        ttl_ms: Option<u64>,
     ) -> Result<(), RtDbError> {
         if !self.config.enabled {
             return Err(RtDbError::forbidden("presence not enabled"));
         }
         Self::validate_state(&state, &self.config)?;
+        // ttl validation (early reject, alongside the state-size check, before
+        // the rate-limit window is touched): 0 is nonsensical, over-cap is
+        // rejected — never clamped (presence's "no silent clamping" rule).
+        if let Some(t) = ttl_ms {
+            if t == 0 {
+                return Err(RtDbError::bad_request("ttl must be positive"));
+            }
+            if t > self.config.max_ttl_ms {
+                return Err(RtDbError::bad_request("ttl exceeds maximum"));
+            }
+        }
         let shard = self.shard(db).await;
         let mut p = shard.lock().await;
         // per-conn update rate limit (membership required)
@@ -224,6 +241,7 @@ impl PresenceManager {
         };
         sess.state = state;
         sess.updated_at = now;
+        sess.expires_at = ttl_ms.map(|t| now + t as i64); // arm or clear
         drop(p);
         self.mark_dirty(db, room).await;
         Ok(())
@@ -331,6 +349,52 @@ impl PresenceManager {
         (rooms, sessions)
     }
 
+    /// Clear every session whose armed TTL has elapsed: set its `state` to
+    /// `null`, clear its expiry, mark each affected room dirty, and count one
+    /// expiry per session. Called at the top of every flush-tick (before
+    /// `flush_once`) so the coalesced broadcast picks up the null states.
+    /// Returns `true` if any session expired (so the immediate-mode flush loop
+    /// can yield instead of sleeping). Membership is never removed here — only
+    /// `leavePresence`/disconnect do that.
+    pub async fn expire_once(&self) -> bool {
+        let now = crate::db::now_ms();
+        let shards: Vec<(String, Arc<Mutex<DbPresence>>)> = {
+            let dbs = self.dbs.lock().await;
+            dbs.iter().map(|(db, s)| (db.clone(), s.clone())).collect()
+        };
+        let mut expired_any = false;
+        for (db, shard) in shards {
+            let mut dirty_rooms: Vec<String> = Vec::new();
+            {
+                let mut p = shard.lock().await;
+                for (room, members) in p.rooms.iter_mut() {
+                    let mut room_expired = false;
+                    for sess in members.values_mut() {
+                        if let Some(exp) = sess.expires_at
+                            && exp <= now
+                        {
+                            sess.state = serde_json::Value::Null;
+                            sess.expires_at = None;
+                            room_expired = true;
+                            expired_any = true;
+                            if let Some(m) = &self.metrics {
+                                m.record_presence_ttl_expiry();
+                            }
+                        }
+                    }
+                    if room_expired {
+                        dirty_rooms.push(room.clone());
+                    }
+                }
+            }
+            // mark_dirty takes only the dirty lock — never hold the shard lock across it.
+            for room in &dirty_rooms {
+                self.mark_dirty(&db, room).await;
+            }
+        }
+        expired_any
+    }
+
     /// Broadcast one `presenceSnapshot` per dirty room to every member of that
     /// room, then clear the dirty set. Called by the periodic flush task and by
     /// tests. Cheap when there are no dirty rooms.
@@ -411,10 +475,12 @@ impl PresenceManager {
             loop {
                 if let Some(t) = ticker.as_mut() {
                     t.tick().await;
+                    let _ = this.expire_once().await;
                     let _ = this.flush_once().await;
                 } else {
                     // interval == 0: cooperative when busy, 1ms sleep when idle
-                    if this.flush_once().await {
+                    let expired = this.expire_once().await;
+                    if this.flush_once().await || expired {
                         tokio::task::yield_now().await;
                     } else {
                         tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
@@ -482,7 +548,7 @@ mod tests {
         m.join("db", 1, "room", None, user("a@b.com"), t)
             .await
             .unwrap();
-        m.update_state("db", 1, "room", serde_json::json!({"x": 5}))
+        m.update_state("db", 1, "room", serde_json::json!({"x": 5}), None)
             .await
             .unwrap();
         let members = m.snapshot("db", "room").await;
@@ -493,7 +559,7 @@ mod tests {
     async fn update_state_when_not_joined_errors() {
         let m = mgr();
         let err = m
-            .update_state("db", 1, "room", serde_json::json!({}))
+            .update_state("db", 1, "room", serde_json::json!({}), None)
             .await
             .unwrap_err();
         assert_eq!(err.code, crate::error::ErrorCode::BadRequest);
@@ -620,13 +686,13 @@ mod tests {
             .await
             .unwrap();
         // three rapid state updates by conn 1 -> conn 2 should see ONE snapshot after flush
-        m.update_state("db", 1, "room", serde_json::json!({"n":1}))
+        m.update_state("db", 1, "room", serde_json::json!({"n":1}), None)
             .await
             .unwrap();
-        m.update_state("db", 1, "room", serde_json::json!({"n":2}))
+        m.update_state("db", 1, "room", serde_json::json!({"n":2}), None)
             .await
             .unwrap();
-        m.update_state("db", 1, "room", serde_json::json!({"n":3}))
+        m.update_state("db", 1, "room", serde_json::json!({"n":3}), None)
             .await
             .unwrap();
         m.flush_once().await;
@@ -744,17 +810,17 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            m.update_state("db", 1, "room", serde_json::json!({"n":1}))
+            m.update_state("db", 1, "room", serde_json::json!({"n":1}), None)
                 .await
                 .is_ok()
         );
         assert!(
-            m.update_state("db", 1, "room", serde_json::json!({"n":2}))
+            m.update_state("db", 1, "room", serde_json::json!({"n":2}), None)
                 .await
                 .is_ok()
         );
         let err = m
-            .update_state("db", 1, "room", serde_json::json!({"n":3}))
+            .update_state("db", 1, "room", serde_json::json!({"n":3}), None)
             .await
             .unwrap_err();
         assert_eq!(err.code, crate::error::ErrorCode::RateLimited);
@@ -771,5 +837,126 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code, crate::error::ErrorCode::Forbidden);
+    }
+
+    #[tokio::test]
+    async fn update_state_arms_ttl_that_expires_to_null_not_remove() {
+        let m = mgr();
+        let (t1, _r1) = tx();
+        let (t2, mut r2) = tx();
+        m.join("db", 1, "room", None, user("a@b.com"), t1)
+            .await
+            .unwrap();
+        m.join("db", 2, "room", None, user("b@b.com"), t2)
+            .await
+            .unwrap();
+        // conn 1 arms a 60ms ttl on its typing state.
+        m.update_state(
+            "db",
+            1,
+            "room",
+            serde_json::json!({"typing": true}),
+            Some(60),
+        )
+        .await
+        .unwrap();
+        // member is still present, state is the blob.
+        let members = m.snapshot("db", "room").await;
+        assert_eq!(
+            members
+                .iter()
+                .find(|x| x.connection_id == "1")
+                .unwrap()
+                .state,
+            serde_json::json!({"typing": true})
+        );
+        assert_eq!(members.len(), 2);
+        // wait out the ttl, then expire.
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        let expired = m.expire_once().await;
+        assert!(expired);
+        // state cleared to null, but the MEMBER is still present.
+        let members = m.snapshot("db", "room").await;
+        let conn1 = members.iter().find(|x| x.connection_id == "1").unwrap();
+        assert_eq!(conn1.state, serde_json::Value::Null);
+        assert_eq!(members.len(), 2, "expiry clears state, not membership");
+        // and the dirty room broadcast a snapshot with null state.
+        m.flush_once().await;
+        let msg = r2.try_recv().expect("snapshot after expiry");
+        let ServerMessage::PresenceSnapshot { members, .. } = msg else {
+            panic!("snapshot")
+        };
+        let conn1 = members.iter().find(|x| x.connection_id == "1").unwrap();
+        assert_eq!(conn1.state, serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn omitted_ttl_is_permanent_and_does_not_expire() {
+        let m = mgr();
+        let (t, _r) = tx();
+        m.join("db", 1, "room", None, user("a@b.com"), t)
+            .await
+            .unwrap();
+        // update with NO ttl -> permanent.
+        m.update_state("db", 1, "room", serde_json::json!({"x": 1}), None)
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let expired = m.expire_once().await;
+        assert!(!expired, "no ttl armed -> nothing expires");
+        let members = m.snapshot("db", "room").await;
+        assert_eq!(members[0].state, serde_json::json!({"x": 1}));
+    }
+
+    #[tokio::test]
+    async fn ttl_refresh_re_arms_and_a_non_ttl_update_clears_it() {
+        let m = mgr();
+        let (t, _r) = tx();
+        m.join("db", 1, "room", None, user("a@b.com"), t)
+            .await
+            .unwrap();
+        m.update_state("db", 1, "room", serde_json::json!({"t": true}), Some(200))
+            .await
+            .unwrap();
+        // a later update with NO ttl clears the expiry -> permanent.
+        m.update_state("db", 1, "room", serde_json::json!({"t": false}), None)
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(220)).await;
+        let expired = m.expire_once().await;
+        assert!(!expired, "ttl was cleared by the non-ttl update");
+        assert_eq!(
+            m.snapshot("db", "room").await[0].state,
+            serde_json::json!({"t": false})
+        );
+    }
+
+    #[tokio::test]
+    async fn ttl_validation_rejects_zero_and_over_cap() {
+        let m = mgr();
+        let (t, _r) = tx();
+        m.join("db", 1, "room", None, user("a@b.com"), t)
+            .await
+            .unwrap();
+        let err = m
+            .update_state("db", 1, "room", serde_json::json!({}), Some(0))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, crate::error::ErrorCode::BadRequest);
+        let err = m
+            .update_state("db", 1, "room", serde_json::json!({}), Some(300_001))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, crate::error::ErrorCode::BadRequest);
+    }
+
+    #[tokio::test]
+    async fn expire_once_with_nothing_expired_is_idle() {
+        let m = mgr();
+        let (t, _r) = tx();
+        m.join("db", 1, "room", None, user("a@b.com"), t)
+            .await
+            .unwrap();
+        assert!(!m.expire_once().await);
     }
 }
