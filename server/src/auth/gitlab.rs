@@ -320,6 +320,12 @@ mod tests {
             subs_verify_skip_every: 0,
             ttl_sweep_interval_secs: 60,
             ttl_batch: 5000,
+            image_transforms_enabled: true,
+            image_max_dim: 2048,
+            image_max_pixels: 25_000_000,
+            image_cache_bytes: 256 * 1024 * 1024,
+            image_concurrency: 4,
+            image_default_quality: 80,
         };
         assert!(GitlabProvider::from_config(&cfg).is_none());
         cfg.gitlab_client_id = Some("id".into());

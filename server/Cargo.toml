@@ -34,6 +34,11 @@ url = "2"
 # (`url::Url::username` etc. return encoded values); same crate `url` already
 # pulls in transitively.
 percent-encoding = "2"
+# On-the-fly image transforms on storage serve (ENH-014): `image` decodes +
+# re-encodes served blobs (default features off, only the codecs we serve);
+# `moka` is the LRU result cache keyed by (blob id, transform params).
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "webp"] }
+moka = { version = "0.12", features = ["future"] }
 
 [dev-dependencies]
 anyhow = "1"

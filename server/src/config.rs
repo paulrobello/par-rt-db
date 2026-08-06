@@ -91,6 +91,14 @@ pub struct Config {
     // table per sweep. TTL is best-effort, so these are boot-only (not hot).
     pub ttl_sweep_interval_secs: u64,
     pub ttl_batch: i64,
+    // On-the-fly image transforms on storage serve (ENH-014). RTDB_IMAGE_*.
+    // Boot-time operational knobs (not admin-mutable). All optional w/ defaults.
+    pub image_transforms_enabled: bool, // RTDB_IMAGE_TRANSFORMS_ENABLED, default true
+    pub image_max_dim: u32,             // RTDB_IMAGE_MAX_DIM, default 2048
+    pub image_max_pixels: u64,          // RTDB_IMAGE_MAX_PIXELS, default 25_000_000
+    pub image_cache_bytes: u64,         // RTDB_IMAGE_CACHE_BYTES, default 256 MiB
+    pub image_concurrency: usize,       // RTDB_IMAGE_CONCURRENCY, default 4
+    pub image_default_quality: u8,      // RTDB_IMAGE_DEFAULT_QUALITY, default 80
 }
 
 impl Config {
@@ -239,6 +247,34 @@ impl Config {
         // negative batch errors per sweep, so clamp both to at least 1.
         let ttl_batch = ttl_batch.max(1);
 
+        // On-the-fly image transforms on storage serve (ENH-014). Boot-only
+        // operational knobs. Default-on (mirror the login-CSRF block above);
+        // numerics follow the `ttl_batch` `.unwrap_or(default)` + clamp idiom.
+        let image_transforms_enabled = match std::env::var("RTDB_IMAGE_TRANSFORMS_ENABLED") {
+            Ok(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "false" | "0" | "no"),
+            Err(_) => true,
+        };
+        let image_max_dim = match std::env::var("RTDB_IMAGE_MAX_DIM") {
+            Ok(v) => v.trim().parse::<u32>().unwrap_or(2048).clamp(1, 8192),
+            Err(_) => 2048,
+        };
+        let image_max_pixels = match std::env::var("RTDB_IMAGE_MAX_PIXELS") {
+            Ok(v) => v.trim().parse::<u64>().unwrap_or(25_000_000).max(1_000_000),
+            Err(_) => 25_000_000,
+        };
+        let image_cache_bytes = match std::env::var("RTDB_IMAGE_CACHE_BYTES") {
+            Ok(v) => v.trim().parse::<u64>().unwrap_or(256 * 1024 * 1024),
+            Err(_) => 256 * 1024 * 1024,
+        };
+        let image_concurrency = match std::env::var("RTDB_IMAGE_CONCURRENCY") {
+            Ok(v) => v.trim().parse::<usize>().unwrap_or(4).max(1),
+            Err(_) => 4,
+        };
+        let image_default_quality = match std::env::var("RTDB_IMAGE_DEFAULT_QUALITY") {
+            Ok(v) => v.trim().parse::<u8>().unwrap_or(80).clamp(1, 100),
+            Err(_) => 80,
+        };
+
         Ok(Self {
             port,
             database_url,
@@ -273,6 +309,12 @@ impl Config {
             subs_verify_skip_every,
             ttl_sweep_interval_secs,
             ttl_batch,
+            image_transforms_enabled,
+            image_max_dim,
+            image_max_pixels,
+            image_cache_bytes,
+            image_concurrency,
+            image_default_quality,
         })
     }
 }

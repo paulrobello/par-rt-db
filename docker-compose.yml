@@ -73,6 +73,14 @@ services:
       RTDB_GITLAB_BASE_URL: ${RTDB_GITLAB_BASE_URL:-https://gitlab.com}
       # Shadow-verify 1 subscription-invalidation skip in every N (0 = off).
       RTDB_SUBS_VERIFY_SKIP_EVERY: ${RTDB_SUBS_VERIFY_SKIP_EVERY:-0}
+      # On-the-fly image transforms on storage serve (ENH-014). All optional;
+      # defaults mirror the server's code defaults.
+      RTDB_IMAGE_TRANSFORMS_ENABLED: ${RTDB_IMAGE_TRANSFORMS_ENABLED:-true}
+      RTDB_IMAGE_MAX_DIM: ${RTDB_IMAGE_MAX_DIM:-2048}
+      RTDB_IMAGE_MAX_PIXELS: ${RTDB_IMAGE_MAX_PIXELS:-25000000}
+      RTDB_IMAGE_CACHE_BYTES: ${RTDB_IMAGE_CACHE_BYTES:-268435456}
+      RTDB_IMAGE_CONCURRENCY: ${RTDB_IMAGE_CONCURRENCY:-4}
+      RTDB_IMAGE_DEFAULT_QUALITY: ${RTDB_IMAGE_DEFAULT_QUALITY:-80}
       RUST_LOG: ${RUST_LOG:-info}
     ports:
       - "127.0.0.1:8300:8300"
