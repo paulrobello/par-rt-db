@@ -177,6 +177,59 @@ async fn state_update_is_observed_by_peer() {
     );
 }
 
+/// A presenceState ttl clears the sender's state to null (member still present),
+/// observed by the peer via a presenceSnapshot.
+#[tokio::test]
+async fn ttl_expires_state_to_null_member_remains() {
+    let state = test_state_with_presence().await;
+    let addr = spawn_app(state.clone()).await;
+    let db = fresh_db(&state).await;
+    let (token_a, email_a) = mint_user_for_db(&state, &db, "a").await;
+    let (token_b, email_b) = mint_user_for_db(&state, &db, "b").await;
+    allowlist(addr, &db, &[&email_a, &email_b]).await;
+    let mut wa = ws_connect(addr).await;
+    let mut wb = ws_connect(addr).await;
+    assert_eq!(auth(&mut wa, &token_a, &db).await["type"], json!("authOk"));
+    assert_eq!(auth(&mut wb, &token_b, &db).await["type"], json!("authOk"));
+
+    // both join -> 2 members
+    send_json(&mut wa, json!({"type": "presence", "room": "doc:1"})).await;
+    send_json(&mut wb, json!({"type": "presence", "room": "doc:1"})).await;
+    state.realtime.presence.flush_once().await;
+    let _ = drain_until_snapshot(&mut wb, "doc:1", |n| n == 2).await;
+
+    // conn A arms a 100ms ttl on its typing state.
+    send_json(
+        &mut wa,
+        json!({"type": "presenceState", "room": "doc:1", "state": {"typing": true}, "ttlMs": 100}),
+    )
+    .await;
+    state.realtime.presence.flush_once().await;
+    // peer observes typing:true
+    let snap = drain_until_snapshot(&mut wb, "doc:1", |n| n == 2).await;
+    // both members are present and indistinguishable by identity here, so assert
+    // on the aggregate: at least one member is typing before the ttl fires.
+    let typing = snap["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|m| m["state"]["typing"] == json!(true));
+    assert!(typing, "peer saw typing:true before ttl");
+
+    // wait out the ttl, then drive expiry + flush explicitly.
+    tokio::time::sleep(std::time::Duration::from_millis(140)).await;
+    state.realtime.presence.expire_once().await;
+    state.realtime.presence.flush_once().await;
+
+    // peer now sees conn A's state as null, but A is still a member (2 members).
+    let snap = drain_until_snapshot(&mut wb, "doc:1", |n| n == 2).await;
+    let members = snap["members"].as_array().unwrap();
+    assert_eq!(members.len(), 2, "expiry clears state, not membership");
+    // exactly one member has state null (the expired typing one); the typing flag is gone.
+    assert!(members.iter().any(|m| m["state"].is_null()));
+    assert!(members.iter().all(|m| m["state"]["typing"] != json!(true)));
+}
+
 /// `leavePresence` removes the member; the survivor's next snapshot shrinks
 /// to 1. (The leaver is NOT broadcast to — `leave` drops them from the room
 /// before the flush sends the snapshot — so only the survivor observes it.)
