@@ -276,6 +276,29 @@ class MigrateResult(_Wire):
     directives: list[DirectiveReport]
 
 
+class SchemaHistorySummary(_Wire):
+    """One row of ``GET /admin/db/{db}/schema/history`` (newest-first). Mirrors
+    ``server::schema_history::HistorySummary``. ``source`` is the event that
+    captured the snapshot: ``"push"`` | ``"migrate"`` | ``"restore"``."""
+
+    version: int
+    captured_at: int
+    source: str
+    principal: str | None = None
+
+
+class SchemaHistoryEntry(SchemaHistorySummary):
+    """One full snapshot from ``GET /admin/db/{db}/schema/history/{version}``,
+    adding the ``schema`` blob. Mirrors ``server::schema_history::HistoryEntry``.
+
+    ``schema_`` is the raw captured JSON (a serialized ``SchemaDef``), kept as a
+    plain dict so an older snapshot never fails to validate. The trailing
+    underscore mirrors :class:`MigrateResult` (pydantic v2 reserves ``.schema()``).
+    """
+
+    schema_: dict[str, Any] = Field(alias="schema")
+
+
 class Webhook(_Wire):
     """``GET /admin/db/{db}/webhooks`` row — one registered webhook.
 

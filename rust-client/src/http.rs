@@ -795,6 +795,77 @@ impl RtDbHttpClient {
         self.get_json(&format!("/admin/dbs/{db}/schema"), &[]).await
     }
 
+    /// `GET /admin/db/{db}/schema/history?limit=&offset=` → newest-first list of
+    /// captured schema snapshots (summaries, no `schema` blob). Mirrors server
+    /// `schema_history::list`. `limit`/`offset` are optional paging params
+    /// (server defaults: limit 100 clamped to 1000, offset 0).
+    pub async fn schema_history(
+        &self,
+        db: &str,
+        limit: Option<u32>,
+        offset: Option<u32>,
+    ) -> Result<Vec<crate::wire::admin::SchemaHistorySummary>, RtDbError> {
+        #[derive(serde::Deserialize)]
+        struct Resp {
+            entries: Vec<crate::wire::admin::SchemaHistorySummary>,
+        }
+        let mut params: Vec<(&str, String)> = Vec::new();
+        if let Some(l) = limit {
+            params.push(("limit", l.to_string()));
+        }
+        if let Some(o) = offset {
+            params.push(("offset", o.to_string()));
+        }
+        let q: Vec<(&str, &str)> = params.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        Ok(self
+            .get_json::<Resp>(&format!("/admin/db/{db}/schema/history"), &q)
+            .await?
+            .entries)
+    }
+
+    /// `GET /admin/db/{db}/schema/history/{version}` → one full snapshot,
+    /// including the `schema` blob. `not_found` if the database or version does
+    /// not exist. Mirrors server `schema_history::get`.
+    pub async fn schema_history_get(
+        &self,
+        db: &str,
+        version: i64,
+    ) -> Result<crate::wire::admin::SchemaHistoryEntry, RtDbError> {
+        self.get_json(&format!("/admin/db/{db}/schema/history/{version}"), &[])
+            .await
+    }
+
+    /// `POST /admin/db/{db}/schema/restore` `{version, confirm}` → restore the
+    /// live schema shape to a prior captured snapshot; returns the restored
+    /// version. `confirm` must equal the db name (typed guard, mirrors
+    /// delete-db). Mirrors server `admin::restore_schema`; the redundant `ok`
+    /// flag collapses into the `Result` (errors surface as `RtDbError`), the
+    /// same way `delete_db`/`push_schema` collapse `{ok:true}` bodies.
+    pub async fn restore_schema(
+        &self,
+        db: &str,
+        version: i64,
+        confirm: &str,
+    ) -> Result<i64, RtDbError> {
+        #[derive(Serialize)]
+        struct Body<'a> {
+            version: i64,
+            confirm: &'a str,
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Resp {
+            restored_to: i64,
+        }
+        let resp = self
+            .post_json(
+                &format!("/admin/db/{db}/schema/restore"),
+                &Body { version, confirm },
+            )
+            .await?;
+        Ok(self.deserialize::<Resp>(resp).await?.restored_to)
+    }
+
     /// `GET /admin/dbs/{db}/stats` → per-table row counts + sizes.
     pub async fn db_stats(&self, db: &str) -> Result<crate::wire::admin::DbStats, RtDbError> {
         self.get_json(&format!("/admin/dbs/{db}/stats"), &[]).await
@@ -2219,6 +2290,73 @@ mod admin_tests {
         let schema = client.get_schema("kanban").await.unwrap();
         assert_eq!(schema.tables.len(), 1);
         assert!(schema.tables.contains_key("notes"));
+    }
+
+    #[tokio::test]
+    async fn schema_history_lists_summaries() {
+        let (server, client) = setup().await;
+        Mock::given(method("GET"))
+            .and(path("/admin/db/kanban/schema/history"))
+            .and(header("authorization", BEARER))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "entries": [
+                    {"version": 3, "capturedAt": 30, "source": "migrate", "principal": "u@x"},
+                    {"version": 2, "capturedAt": 20, "source": "push", "principal": null}
+                ]
+            })))
+            .mount(&server)
+            .await;
+        let entries = client
+            .schema_history("kanban", Some(5), None)
+            .await
+            .unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].version, 3);
+        assert_eq!(entries[0].source, "migrate");
+        assert_eq!(entries[0].principal.as_deref(), Some("u@x"));
+        assert!(entries[1].principal.is_none());
+    }
+
+    #[tokio::test]
+    async fn schema_history_get_returns_entry_with_schema_blob() {
+        let (server, client) = setup().await;
+        Mock::given(method("GET"))
+            .and(path("/admin/db/kanban/schema/history/3"))
+            .and(header("authorization", BEARER))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "version": 3,
+                "capturedAt": 30,
+                "source": "restore",
+                "principal": null,
+                "schema": {"tables": {"notes": {"fields": {"body": {"type": "string"}}}}}
+            })))
+            .mount(&server)
+            .await;
+        let entry = client.schema_history_get("kanban", 3).await.unwrap();
+        assert_eq!(entry.version, 3);
+        assert_eq!(entry.source, "restore");
+        assert_eq!(
+            entry.schema["tables"]["notes"]["fields"]["body"]["type"],
+            "string"
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_schema_posts_version_and_confirm() {
+        let (server, client) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/admin/db/kanban/schema/restore"))
+            .and(header("authorization", BEARER))
+            .and(body_partial_json(
+                json!({"version": 2, "confirm": "kanban"}),
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"ok": true, "restoredTo": 2})),
+            )
+            .mount(&server)
+            .await;
+        let restored_to = client.restore_schema("kanban", 2, "kanban").await.unwrap();
+        assert_eq!(restored_to, 2);
     }
 
     #[tokio::test]

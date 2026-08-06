@@ -855,6 +855,34 @@ pub mod admin {
         pub directives: Vec<DirectiveReport>,
     }
 
+    /// One row of `GET /admin/db/{db}/schema/history` (newest-first). Mirrors
+    /// server `schema_history::HistorySummary` (camelCase). `source` is the
+    /// event that captured the snapshot: `"push"` | `"migrate"` | `"restore"`.
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct SchemaHistorySummary {
+        pub version: i64,
+        pub captured_at: i64,
+        pub source: String,
+        #[serde(default)]
+        pub principal: Option<String>,
+    }
+
+    /// One full snapshot from `GET /admin/db/{db}/schema/history/{version}`,
+    /// adding the `schema` blob. Mirrors server `schema_history::HistoryEntry`.
+    /// `schema` is the raw captured JSON (a serialized `SchemaDef`), kept as a
+    /// `Value` so an older snapshot never fails to deserialize.
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct SchemaHistoryEntry {
+        pub version: i64,
+        pub captured_at: i64,
+        pub source: String,
+        #[serde(default)]
+        pub principal: Option<String>,
+        pub schema: serde_json::Value,
+    }
+
     /// Per-directive outcome. `castFailures` and `sampleChanges` are
     /// `skip_serializing_if = "Vec::is_empty"` on the server, so they surface as
     /// optional on the wire (absent when empty). Mirrors server

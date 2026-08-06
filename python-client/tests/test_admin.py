@@ -32,6 +32,8 @@ from par_rt_db.admin import (
     MintedToken,
     OpEvent,
     RtDbAdminClient,
+    SchemaHistoryEntry,
+    SchemaHistorySummary,
     SubscriptionsResponse,
     TokenInfo,
     Webhook,
@@ -435,6 +437,87 @@ def test_push_schema_posts_db_and_schema() -> None:
     assert captured["path"] == "/admin/push-schema"
     assert captured["body"]["db"] == "dbx"
     assert "schema" in captured["body"]
+
+
+def test_list_schema_history_parses_summaries() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["path"] = request.url.path
+        captured["params"] = dict(request.url.params)
+        return httpx.Response(
+            200,
+            json={
+                "entries": [
+                    {"version": 3, "capturedAt": 30, "source": "migrate", "principal": "u@x"},
+                    {"version": 2, "capturedAt": 20, "source": "push", "principal": None},
+                ]
+            },
+        )
+
+    with _sync_client(handler) as c:
+        entries = c.list_schema_history("kanban", limit=5)
+    assert captured["path"] == "/admin/db/kanban/schema/history"
+    assert captured["params"] == {"limit": "5"}
+    assert len(entries) == 2
+    assert all(isinstance(e, SchemaHistorySummary) for e in entries)
+    assert entries[0].version == 3
+    assert entries[0].source == "migrate"
+    assert entries[0].principal == "u@x"
+    assert entries[1].principal is None
+
+
+def test_get_schema_version_returns_entry_with_schema_blob() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/admin/db/kanban/schema/history/3"
+        return httpx.Response(
+            200,
+            json={
+                "version": 3,
+                "capturedAt": 30,
+                "source": "restore",
+                "principal": None,
+                "schema": {"tables": {"notes": {"fields": {"body": {"type": "string"}}}}},
+            },
+        )
+
+    with _sync_client(handler) as c:
+        entry = c.get_schema_version("kanban", 3)
+    assert isinstance(entry, SchemaHistoryEntry)
+    assert entry.version == 3
+    assert entry.source == "restore"
+    assert entry.principal is None
+    assert entry.schema_["tables"]["notes"]["fields"]["body"]["type"] == "string"
+
+
+def test_restore_schema_posts_version_and_confirm() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["path"] = request.url.path
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"ok": True, "restoredTo": 2})
+
+    with _sync_client(handler) as c:
+        restored_to = c.restore_schema("kanban", 2, confirm="kanban")
+    assert restored_to == 2
+    assert captured["path"] == "/admin/db/kanban/schema/restore"
+    assert captured["body"] == {"version": 2, "confirm": "kanban"}
+
+
+async def test_async_restore_schema_posts_version_and_confirm() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["path"] = request.url.path
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"ok": True, "restoredTo": 4})
+
+    async with _async_client(handler) as c:
+        restored_to = await c.restore_schema("kanban", 4, confirm="kanban")
+    assert restored_to == 4
+    assert captured["path"] == "/admin/db/kanban/schema/restore"
+    assert captured["body"] == {"version": 4, "confirm": "kanban"}
 
 
 def test_allowlist_add_posts_action_and_email() -> None:

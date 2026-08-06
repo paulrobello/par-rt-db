@@ -41,6 +41,8 @@ if TYPE_CHECKING:
         AuditEntry,
         MintedToken,
         RtDbAdminClient,
+        SchemaHistoryEntry,
+        SchemaHistorySummary,
         TokenInfo,
         Webhook,
         WebhookDelivery,
@@ -77,6 +79,8 @@ __all__ = [
     "Webhook",
     "WebhookDelivery",
     "AuditEntry",
+    "SchemaHistorySummary",
+    "SchemaHistoryEntry",
 ]
 
 
@@ -106,6 +110,8 @@ def __getattr__(name: str) -> Any:
         "Webhook",
         "WebhookDelivery",
         "AuditEntry",
+        "SchemaHistorySummary",
+        "SchemaHistoryEntry",
     ):
         from . import admin
 

@@ -63,6 +63,8 @@ from .http_client import (
     MigrateResult,
     MintedToken,
     OpEvent,
+    SchemaHistoryEntry,
+    SchemaHistorySummary,
     SubscriptionsResponse,
     TokenInfo,
     Webhook,
@@ -217,6 +219,54 @@ class RtDbAdminClient:
         }
         resp = self._req("POST", f"/admin/db/{db}/migrate", json=body)
         return MigrateResult.model_validate(resp.json())
+
+    # --- schema history (ENH-013) ---
+
+    def list_schema_history(
+        self,
+        db: str,
+        *,
+        limit: int | None = None,
+        offset: int | None = None,
+    ) -> list[SchemaHistorySummary]:
+        """``GET /admin/db/{db}/schema/history`` → newest-first summary list.
+
+        Optional ``limit`` (server default 100, clamped to 1000) and ``offset``
+        (default 0) page the results. Each row omits the ``schema`` blob; use
+        :meth:`get_schema_version` for a full snapshot.
+        """
+        params: dict[str, int] = {}
+        if limit is not None:
+            params["limit"] = limit
+        if offset is not None:
+            params["offset"] = offset
+        resp = self._req(
+            "GET",
+            f"/admin/db/{db}/schema/history",
+            params=params or None,
+        )
+        return [SchemaHistorySummary.model_validate(e) for e in resp.json()["entries"]]
+
+    def get_schema_version(self, db: str, version: int) -> SchemaHistoryEntry:
+        """``GET /admin/db/{db}/schema/history/{version}`` → one full snapshot,
+        including the ``schema`` blob. Raises :class:`RtDbError` (``not_found``)
+        if the database or version does not exist.
+        """
+        resp = self._req("GET", f"/admin/db/{db}/schema/history/{version}")
+        return SchemaHistoryEntry.model_validate(resp.json())
+
+    def restore_schema(self, db: str, version: int, *, confirm: str) -> int:
+        """``POST /admin/db/{db}/schema/restore`` ``{version, confirm}`` → restore
+        the live schema shape to a prior snapshot; returns the restored version.
+
+        ``confirm`` must equal the db name (typed guard, mirrors ``delete-db``).
+        """
+        resp = self._req(
+            "POST",
+            f"/admin/db/{db}/schema/restore",
+            json={"version": version, "confirm": confirm},
+        )
+        return int(resp.json()["restoredTo"])
 
     # --- export / import ---
 
@@ -783,6 +833,51 @@ class AsyncRtDbAdminClient:
         }
         resp = await self._req("POST", f"/admin/db/{db}/migrate", json=body)
         return MigrateResult.model_validate(resp.json())
+
+    # --- schema history (ENH-013) ---
+
+    async def list_schema_history(
+        self,
+        db: str,
+        *,
+        limit: int | None = None,
+        offset: int | None = None,
+    ) -> list[SchemaHistorySummary]:
+        """``GET /admin/db/{db}/schema/history`` → newest-first summary list (async).
+
+        See :meth:`RtDbAdminClient.list_schema_history` for body semantics.
+        """
+        params: dict[str, int] = {}
+        if limit is not None:
+            params["limit"] = limit
+        if offset is not None:
+            params["offset"] = offset
+        resp = await self._req(
+            "GET",
+            f"/admin/db/{db}/schema/history",
+            params=params or None,
+        )
+        return [SchemaHistorySummary.model_validate(e) for e in resp.json()["entries"]]
+
+    async def get_schema_version(self, db: str, version: int) -> SchemaHistoryEntry:
+        """``GET /admin/db/{db}/schema/history/{version}`` → one full snapshot (async).
+
+        See :meth:`RtDbAdminClient.get_schema_version`.
+        """
+        resp = await self._req("GET", f"/admin/db/{db}/schema/history/{version}")
+        return SchemaHistoryEntry.model_validate(resp.json())
+
+    async def restore_schema(self, db: str, version: int, *, confirm: str) -> int:
+        """``POST /admin/db/{db}/schema/restore`` → restored version (async).
+
+        See :meth:`RtDbAdminClient.restore_schema`.
+        """
+        resp = await self._req(
+            "POST",
+            f"/admin/db/{db}/schema/restore",
+            json={"version": version, "confirm": confirm},
+        )
+        return int(resp.json()["restoredTo"])
 
     # --- export / import ---
 
