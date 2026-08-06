@@ -172,6 +172,10 @@ server — the server validates only its size, never its shape.
    "already present".
 3. **State update.** `presenceState { room, state }` updates `state` and marks
    the room dirty; not-joined → `presenceErr` `BAD_REQUEST`.
+
+   > Per-state TTL shipped as a follow-up (`presenceState` `ttlMs` → state clears
+   > to null after the refresh window; see
+   > `2026-08-06-presence-ttl-design.md`).
 4. **Leave.** `leavePresence { room }` removes the membership, marks the room
    dirty; not-joined is a silent no-op (no error). `leavePresence` and
    `presenceState` produce **no success ack** of their own — the observable
