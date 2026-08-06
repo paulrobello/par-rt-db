@@ -1,8 +1,9 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
 use axum::body::Body;
-use axum::extract::{DefaultBodyLimit, FromRequest, Path, Request, State};
+use axum::extract::{DefaultBodyLimit, FromRequest, Path, Query as AxumQuery, Request, State};
 use axum::http::{HeaderMap, header};
 use axum::response::Response;
 use axum::routing::{get, post};
@@ -13,6 +14,7 @@ use crate::AppState;
 use crate::auth::{authorize, resolve_bearer};
 use crate::db::now_ms;
 use crate::error::RtDbError;
+use crate::image_transform::{Resolved, TransformParams};
 use crate::protocol::{ScheduleInfo, ScheduleWhen};
 use crate::query::{Query, QueryResult, execute_query};
 use crate::rate_limit::check_http_rate_limits;
@@ -437,39 +439,71 @@ async fn upload_handler(
 }
 
 /// Public, unauthenticated serve: anyone with the URL fetches the bytes. The
-/// opaque id resolves to its owning db via the global index.
+/// opaque id resolves to its owning db via the global index. Query params, if
+/// present, request an on-the-fly image transform (ENH-014).
 async fn serve_public_handler(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    AxumQuery(q): AxumQuery<HashMap<String, String>>,
 ) -> Result<Response, RtDbError> {
     let db = storage::resolve_db(&state.pool, &id)
         .await?
         .ok_or_else(|| RtDbError::not_found("unknown file"))?;
-    serve_bytes(&state, &db, &id).await
+    serve_bytes(&state, &db, &id, &q).await
 }
 
 /// Authed serve: the caller's principal must be authorized for `{db}`; the id
-/// must live in that db's table (404 otherwise — cross-db isolation).
+/// must live in that db's table (404 otherwise — cross-db isolation). Query
+/// params, if present, request an on-the-fly image transform (ENH-014).
 async fn serve_authed_handler(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path((db, id)): Path<(String, String)>,
+    AxumQuery(q): AxumQuery<HashMap<String, String>>,
 ) -> Result<Response, RtDbError> {
     let token = bearer_token(&headers)?;
     let principal = resolve_bearer(&state.pool, token).await?;
     authorize(&state.pool, &principal, &db).await?;
     check_http_rate_limits(&state, &principal, &db).await?;
-    serve_bytes(&state, &db, &id).await
+    serve_bytes(&state, &db, &id, &q).await
 }
 
-async fn serve_bytes(state: &Arc<AppState>, db: &str, id: &str) -> Result<Response, RtDbError> {
-    let (bytes, content_type) = storage::get(&state.pool, db, id)
-        .await?
-        .ok_or_else(|| RtDbError::not_found("unknown file"))?;
-    let ct = content_type.unwrap_or_else(|| "application/octet-stream".to_string());
+async fn serve_bytes(
+    state: &Arc<AppState>,
+    db: &str,
+    id: &str,
+    q: &HashMap<String, String>,
+) -> Result<Response, RtDbError> {
+    // Immutable: serve URLs are opaque ids (no enumeration), and any change to
+    // a stored blob produces a fresh id, so a cached response is always valid.
+    const IMMUTABLE: &str = "public, max-age=31536000, immutable";
+    // Parse params (None ⇒ passthrough); honor the enabled kill switch.
+    let params = TransformParams::parse(q, state.image.cfg())?;
+    let resolved = match params {
+        None => None,
+        Some(_) if !state.image.cfg().enabled => None,
+        Some(p) => Some(state.image.get_or_transform(&state.pool, db, id, p).await?),
+    };
+    let (bytes, content_type) = match resolved {
+        Some(Resolved::Transformed(cached)) => (cached.bytes, cached.content_type.to_string()),
+        Some(Resolved::Raw {
+            bytes,
+            content_type,
+        }) => (bytes, content_type),
+        None => {
+            let (raw, ct) = storage::get(&state.pool, db, id)
+                .await?
+                .ok_or_else(|| RtDbError::not_found("unknown file"))?;
+            (
+                Arc::<[u8]>::from(raw),
+                ct.unwrap_or_else(|| "application/octet-stream".to_string()),
+            )
+        }
+    };
     Response::builder()
-        .header(header::CONTENT_TYPE, ct)
-        .body(Body::from(bytes))
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::CACHE_CONTROL, IMMUTABLE)
+        .body(Body::from(bytes.to_vec()))
         .map_err(|err| RtDbError::internal(format!("failed to build serve response: {err}")))
 }
 
