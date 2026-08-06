@@ -2,7 +2,9 @@
 //! Postgres `bytea` (TOAST-managed) in a per-db `storage` table; a global
 //! `rtdb.storage_index(id -> db_name)` resolves the unauthenticated public serve
 //! URL to the owning database. See
-//! docs/superpowers/specs/2026-07-23-file-storage-design.md.
+//! docs/superpowers/specs/2026-07-23-file-storage-design.md. On-the-fly image
+//! transforms on the serve routes (`?w=&h=&fit=&q=&format=`) live in
+//! `image_transform.rs`.
 
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
