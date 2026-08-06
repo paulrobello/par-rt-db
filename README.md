@@ -534,8 +534,8 @@ re-run on every op, not just at connect.
 
 For ephemeral "who is online right now" data — online indicators, cursors,
 typing — that doesn't fit durable document queries, par-rt-db ships a transient,
-in-memory presence layer over the existing `/sync` WebSocket. It is **opt-in**
-(`RTDB_PRESENCE_ENABLED=true`, default off), **not committer-bound, not durable,
+in-memory presence layer over the existing `/sync` WebSocket. It is **on by
+default** (`RTDB_PRESENCE_ENABLED`, default on; set `=false` to disable), **not committer-bound, not durable,
 not persisted** (no document tables, no Postgres write — a sibling reactive
 surface to live queries), and **connection-bound**: each joined `/sync`
 connection is one presence session, and the open WS is itself the liveness

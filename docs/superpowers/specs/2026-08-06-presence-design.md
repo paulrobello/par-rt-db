@@ -257,7 +257,7 @@ truthy default-off on/off, and numeric `.unwrap_or(default)` + clamp), parsed in
 
 | env var | default | meaning |
 |---------|---------|---------|
-| `RTDB_PRESENCE_ENABLED` | `false` | Master switch (default-off, audit-log-style: only `true`/`1`/`yes` enable). |
+| `RTDB_PRESENCE_ENABLED` | `true` | Master switch (default-on, image-transforms-style: anything but `false`/`0`/`no` enables). |
 | `RTDB_PRESENCE_MAX_STATE_BYTES` | `1024` | Per-`state` payload cap. |
 | `RTDB_PRESENCE_MAX_ROOM_SIZE` | `100` | Members per room. |
 | `RTDB_PRESENCE_MAX_ROOMS_PER_CONN` | `32` | Rooms one connection may join. |

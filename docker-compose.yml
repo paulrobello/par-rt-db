@@ -83,7 +83,7 @@ services:
       RTDB_IMAGE_DEFAULT_QUALITY: ${RTDB_IMAGE_DEFAULT_QUALITY:-80}
       # Realtime presence primitive (ENH-015). All optional; OFF unless the
       # master switch is true. Defaults mirror the server's code defaults.
-      RTDB_PRESENCE_ENABLED: ${RTDB_PRESENCE_ENABLED:-false}
+      RTDB_PRESENCE_ENABLED: ${RTDB_PRESENCE_ENABLED:-true}
       RTDB_PRESENCE_MAX_STATE_BYTES: ${RTDB_PRESENCE_MAX_STATE_BYTES:-1024}
       RTDB_PRESENCE_MAX_ROOM_SIZE: ${RTDB_PRESENCE_MAX_ROOM_SIZE:-100}
       RTDB_PRESENCE_MAX_ROOMS_PER_CONN: ${RTDB_PRESENCE_MAX_ROOMS_PER_CONN:-32}

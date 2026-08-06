@@ -107,8 +107,8 @@ synchronously in unit tests.
 ## Realtime presence
 
 Ephemeral "who is online right now" data (online indicators, cursors, typing)
-that doesn't fit durable document queries uses the presence layer — opt-in on
-the server (`RTDB_PRESENCE_ENABLED=true`), in-memory, connection-bound (the open
+that doesn't fit durable document queries uses the presence layer — on by
+default on the server (`RTDB_PRESENCE_ENABLED`, default on), in-memory, connection-bound (the open
 `/sync` WS *is* the liveness signal), and not committer-bound or persisted. The
 reactive client exposes `presence` / `updatePresence` / `leavePresence`, and the
 React hook `usePresence(room)` joins on mount, re-renders on every snapshot, and
