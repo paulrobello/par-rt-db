@@ -112,6 +112,7 @@ const CRON_STEP_MS = 60_000;
 export class PresenceRooms {
   private readonly members = new Map<string, Map<string, PresenceMember>>();
   private readonly subs = new Map<string, Set<(members: PresenceMember[]) => void>>();
+  private readonly expiry = new Map<string, Map<string, number>>();
 
   /** Returns a stable-order snapshot of `room`'s current members. */
   snapshot(room: string): PresenceMember[] {
@@ -132,28 +133,83 @@ export class PresenceRooms {
 
   /** Updates `connectionId`'s state in `room` and fans out. No-op if the
    * connection is not in the room (matches the live server, which would not
-   * relay an update for a non-member). */
-  update(room: string, connectionId: string, state: unknown): void {
+   * relay an update for a non-member). When `ttlMs` > 0, schedules an expiry
+   * sweep that nulls this member's `state` at `now + ttlMs` (the member stays
+   * listed); a refresh without `ttlMs` clears any pending expiry, mirroring the
+   * live server's "ttlMs after the last refresh" semantics. */
+  update(
+    room: string,
+    connectionId: string,
+    state: unknown,
+    ttlMs?: number,
+    now: number = Date.now(),
+  ): void {
     const map = this.members.get(room);
     const member = map?.get(connectionId);
     if (!member) {
       return;
     }
-    member.state = state;
+    member.state = state ?? null;
+    let exp = this.expiry.get(room);
+    if (!exp) {
+      exp = new Map();
+      this.expiry.set(room, exp);
+    }
+    if (ttlMs && ttlMs > 0) {
+      exp.set(connectionId, now + ttlMs);
+    } else {
+      exp.delete(connectionId);
+    }
     this.fanOut(room);
   }
 
-  /** Removes `connectionId` from `room` and fans out. No-op if absent. */
+  /** Removes `connectionId` from `room` and fans out. No-op if absent. Also
+   * clears any pending expiry so a re-join doesn't inherit a stale ttl. */
   leave(room: string, connectionId: string): void {
     const map = this.members.get(room);
     if (!map) {
       return;
     }
     map.delete(connectionId);
+    this.expiry.get(room)?.delete(connectionId);
     if (map.size === 0) {
       this.members.delete(room);
     }
     this.fanOut(room);
+  }
+
+  /** Clears expired members' `state` to `null` (the member stays listed) and
+   * fans out each touched room once. Returns true if anything expired. Mirrors
+   * the live server's per-connection ttl clearing. */
+  expire(now: number = Date.now()): boolean {
+    let any = false;
+    const touched: string[] = [];
+    for (const [room, exp] of this.expiry) {
+      const roomMap = this.members.get(room);
+      if (!roomMap) {
+        this.expiry.delete(room);
+        continue;
+      }
+      let roomTouched = false;
+      for (const [connId, at] of exp) {
+        if (at <= now) {
+          const m = roomMap.get(connId);
+          if (m) {
+            m.state = null;
+            any = true;
+            roomTouched = true;
+          }
+          exp.delete(connId);
+        }
+      }
+      if (roomTouched) {
+        touched.push(room);
+      }
+    }
+    for (const room of touched) {
+      this.fanOut(room);
+    }
+    return any;
   }
 
   /** Registers `fn` for `room` snapshots and immediately fires it with the
@@ -1261,12 +1317,14 @@ export class InMemoryRtDbClient {
 
   /** Broadcasts updated `state` for this connection in `room`. No-op if this
    * client has not joined `room` (mirrors the live server, which would not
-   * relay an update from a non-member). */
-  updatePresence(room: string, state: unknown): void {
+   * relay an update from a non-member). When `ttlMs` is set, the harness
+   * schedules an expiry that nulls this member's `state` at `now + ttlMs`
+   * (the member stays listed) — mirroring the live server. */
+  updatePresence(room: string, state: unknown, ttlMs?: number): void {
     if (!this.joinedRooms.has(room)) {
       return;
     }
-    this.presenceRooms.update(room, this.connectionId, state);
+    this.presenceRooms.update(room, this.connectionId, state, ttlMs, this.now());
   }
 
   /** Leaves `room`: removes this connection from the member list, drops every

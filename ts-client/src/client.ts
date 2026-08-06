@@ -468,12 +468,16 @@ export class RtDbClient {
    * No-op on the wire when not authenticated — without a join the server has
    * no member to update — but still updates `joinedRooms` so the buffered join
    * (if any) replays with the latest state on authOk. */
-  updatePresence(room: string, state: unknown): void {
+  updatePresence(room: string, state: unknown, ttlMs?: number): void {
     if (this.joinedRooms.has(room)) {
       this.joinedRooms.set(room, state);
     }
     if (this.authState === "authenticated") {
-      this.send({ type: "presenceState", room, state });
+      const frame: ClientMessage =
+        ttlMs == null
+          ? { type: "presenceState", room, state }
+          : { type: "presenceState", room, state, ttlMs };
+      this.send(frame);
     }
   }
 

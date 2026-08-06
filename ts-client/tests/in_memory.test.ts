@@ -492,6 +492,104 @@ describe("InMemoryRtDbClient — presence", () => {
     b.presence("doc:1", undefined);
     expect(seen.at(-1)?.map((m) => m.connectionId)).toEqual(["a"]);
   });
+
+  it("ttlMs expires a member's state to null while keeping them listed", () => {
+    // Two clients share PresenceRooms. Alice refreshes with ttlMs=50; the
+    // injected clock pins `now` at 0 so the expiry lands at 50. Calling
+    // `rooms.expire(60)` clears Alice's state to null but she STAYS in the
+    // member list — mirrors the live server's "state to null after ttl"
+    // semantics (the member stays; only its state clears).
+    const rooms = new PresenceRooms();
+    const alice = new InMemoryRtDbClient({
+      connectionId: "alice",
+      presenceUser: { kind: "user", email: "alice@example.com" },
+      presenceRooms: rooms,
+      now: () => 0,
+      random: () => 0,
+    });
+    const bob = new InMemoryRtDbClient({
+      connectionId: "bob",
+      presenceUser: { kind: "user", email: "bob@example.com" },
+      presenceRooms: rooms,
+      now: () => 0,
+      random: () => 0,
+    });
+
+    const bobSees: PresenceMember[][] = [];
+    bob.presence("doc:1", undefined, (m) => bobSees.push(m));
+    alice.presence("doc:1", undefined);
+    // The ttl is a refresh concept — set via updatePresence, not the join.
+    alice.updatePresence("doc:1", { typing: true }, 50);
+
+    // Pre-expiry: Alice is listed with her typing state.
+    const before = bobSees.at(-1)?.find((m) => m.connectionId === "alice");
+    expect(before?.state).toEqual({ typing: true });
+
+    // Before the expiry elapses, expire() is a no-op: state survives.
+    expect(rooms.expire(40)).toBe(false);
+    const mid = bobSees.at(-1)?.find((m) => m.connectionId === "alice");
+    expect(mid?.state).toEqual({ typing: true });
+
+    // At/after the expiry, the member's state nulls but the member stays.
+    expect(rooms.expire(60)).toBe(true);
+    const after = bobSees.at(-1)?.find((m) => m.connectionId === "alice");
+    expect(after?.state).toBeNull();
+    expect(bobSees.at(-1)?.map((m) => m.connectionId)).toContain("alice");
+
+    // Idempotent: a second sweep with nothing to expire returns false and
+    // does not fire an extra fan-out.
+    const lenBefore = bobSees.length;
+    expect(rooms.expire(10_000)).toBe(false);
+    expect(bobSees).toHaveLength(lenBefore);
+  });
+
+  it("a presence refresh without ttlMs clears a pending expiry", () => {
+    // Mirrors the server's "ttlMs after the LAST refresh" semantics: if a
+    // client refreshes state without ttlMs, any prior ttl is withdrawn — the
+    // member's state must not later spontaneously null out.
+    const rooms = new PresenceRooms();
+    const alice = new InMemoryRtDbClient({
+      connectionId: "alice",
+      presenceUser: { kind: "user", email: "alice@example.com" },
+      presenceRooms: rooms,
+      now: () => 0,
+      random: () => 0,
+    });
+    const seen: PresenceMember[][] = [];
+    alice.presence("doc:1", undefined, (m) => seen.push(m));
+
+    alice.updatePresence("doc:1", { typing: true }, 50); // schedules expiry at 50
+    alice.updatePresence("doc:1", { typing: false }); // no ttlMs → clears expiry
+
+    // Even far in the future, expire() must not null out her state.
+    expect(rooms.expire(10_000)).toBe(false);
+    const self = seen.at(-1)?.find((m) => m.connectionId === "alice");
+    expect(self?.state).toEqual({ typing: false });
+  });
+
+  it("leave clears a pending expiry so a re-join does not inherit it", () => {
+    // Regression guard: `leave` must delete the expiry entry alongside the
+    // member, otherwise a re-join could resurrect a stale ttl that nulls the
+    // fresh state out from under the new membership.
+    const rooms = new PresenceRooms();
+    const alice = new InMemoryRtDbClient({
+      connectionId: "alice",
+      presenceUser: { kind: "user", email: "alice@example.com" },
+      presenceRooms: rooms,
+      now: () => 0,
+      random: () => 0,
+    });
+    alice.presence("doc:1", { typing: true });
+    alice.updatePresence("doc:1", { typing: true }, 50); // schedules expiry at 50
+    alice.leavePresence("doc:1");
+
+    // Re-join with a fresh state and no ttl. A stale expiry from the prior
+    // membership would null this out; the cleared expiry must keep it alive.
+    alice.presence("doc:1", { typing: false });
+    expect(rooms.expire(10_000)).toBe(false);
+    const self = rooms.snapshot("doc:1").find((m) => m.connectionId === "alice");
+    expect(self?.state).toEqual({ typing: false });
+  });
 });
 
 describe("InMemoryRtDbClient — paginate (cursor keyset)", () => {

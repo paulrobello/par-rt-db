@@ -90,6 +90,23 @@ describe("presence wire types", () => {
       room: "doc:1",
       state: { typing: true },
     });
+    // ttlMs is optional: omitting it must keep the field absent on the wire.
+    expect("ttlMs" in JSON.parse(JSON.stringify(f))).toBe(false);
+  });
+
+  it("presenceState carries optional ttlMs when set", () => {
+    const f = {
+      type: "presenceState",
+      room: "doc:1",
+      state: { typing: true },
+      ttlMs: 3000,
+    } satisfies ClientMessage;
+    expect(JSON.parse(JSON.stringify(f))).toEqual({
+      type: "presenceState",
+      room: "doc:1",
+      state: { typing: true },
+      ttlMs: 3000,
+    });
   });
 
   it("leavePresence carries only room", () => {
@@ -167,6 +184,41 @@ describe("RtDbClient presence", () => {
       state: { cursor: { x: 5 } },
     });
     expect(leaveFrame).toEqual({ type: "leavePresence", room: "doc:1" });
+  });
+
+  it("updatePresence forwards ttlMs onto the wire and omits it when unset", () => {
+    const { client, sockets } = setupClient();
+    client.connect();
+    sockets[0].open();
+    sockets[0].deliver({ type: "authOk", user: { kind: "user" } });
+
+    client.presence("doc:1", undefined, () => {});
+
+    // With ttlMs: the frame carries ttlMs alongside room + state.
+    client.updatePresence("doc:1", { typing: true }, 3000);
+    const withTtl = sockets[0]
+      .parsed()
+      .filter((m) => (m as { type: string }).type === "presenceState")
+      .at(-1) as ClientMessage;
+    expect(withTtl).toEqual({
+      type: "presenceState",
+      room: "doc:1",
+      state: { typing: true },
+      ttlMs: 3000,
+    });
+
+    // Without ttlMs: the field must be absent on the wire (optional, not `undefined`).
+    client.updatePresence("doc:1", { typing: false });
+    const withoutTtl = sockets[0]
+      .parsed()
+      .filter((m) => (m as { type: string }).type === "presenceState")
+      .at(-1) as ClientMessage;
+    expect(withoutTtl).toEqual({
+      type: "presenceState",
+      room: "doc:1",
+      state: { typing: false },
+    });
+    expect("ttlMs" in withoutTtl).toBe(false);
   });
 
   it("unsub stops the snapshot callback; leavePresence drops the room entirely", () => {

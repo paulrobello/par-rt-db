@@ -121,7 +121,7 @@ export function useMutation(): (txn: TransactionJson) => Promise<StepResult[]> {
  */
 export function usePresence(room: string): {
   members: PresenceMember[];
-  updatePresence: (state: unknown) => void;
+  updatePresence: (state: unknown, ttlMs?: number) => void;
   leavePresence: () => void;
 } {
   const { client } = useContextValue();
@@ -141,7 +141,7 @@ export function usePresence(room: string): {
   }, [client, room]);
 
   const updatePresence = useCallback(
-    (state: unknown) => client.updatePresence(room, state),
+    (state: unknown, ttlMs?: number) => client.updatePresence(room, state, ttlMs),
     [client, room],
   );
   const leavePresence = useCallback(() => client.leavePresence(room), [client, room]);

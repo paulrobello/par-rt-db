@@ -297,7 +297,7 @@ export type ClientMessage =
   | { type: "resumeSchedule"; scheduleId: string; id: string }
   | { type: "listSchedules"; scheduleId: string }
   | { type: "presence"; room: string; state?: unknown }
-  | { type: "presenceState"; room: string; state: unknown }
+  | { type: "presenceState"; room: string; state: unknown; ttlMs?: number }
   | { type: "leavePresence"; room: string }
   | { type: "ping" };
 
