@@ -328,4 +328,31 @@ describe("RtDbClient presence", () => {
       .filter((m) => (m as { type: string }).type === "presenceState");
     expect(stateFrames).toHaveLength(0); // pre-auth update did not send
   });
+
+  it("leavePresence is refcounted: only the last detach sends the wire leave", () => {
+    // Regression: the server holds one membership per conn+room, so N listeners
+    // on one client must produce exactly one wire leave — not one per detach.
+    // Two presence() calls → first leavePresence() must NOT send the wire frame
+    // or clear joinedRooms; the second one must.
+    const { client, sockets } = setupClient();
+    client.connect();
+    sockets[0].open();
+    sockets[0].deliver({ type: "authOk", user: { kind: "user" } });
+
+    client.presence("doc:1", { cursor: { x: 0 } });
+    client.presence("doc:1", { cursor: { x: 1 } });
+
+    const leaveFrames = (): unknown[] =>
+      sockets[0].parsed().filter((m) => (m as { type: string }).type === "leavePresence");
+
+    client.leavePresence("doc:1"); // first detach — still one listener held
+    expect(leaveFrames()).toHaveLength(0);
+
+    client.leavePresence("doc:1"); // last detach — wire leave fires now
+    expect(leaveFrames()).toEqual([{ type: "leavePresence", room: "doc:1" }]);
+
+    // A third call on a fully-left room is a no-op (no duplicate wire frame).
+    client.leavePresence("doc:1");
+    expect(leaveFrames()).toHaveLength(1);
+  });
 });

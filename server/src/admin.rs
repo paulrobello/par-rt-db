@@ -1415,11 +1415,18 @@ async fn metrics_handler(
     headers: HeaderMap,
 ) -> Result<Json<crate::metrics::MetricsSnapshot>, RtDbError> {
     require_admin(&state, &headers).await?;
+    let (presence_rooms, presence_sessions) = state.realtime.presence.counts().await;
     Ok(Json(
         state
             .runtime
             .metrics
-            .snapshot(&state.pool, &state.realtime.subs, state.runtime.started_at)
+            .snapshot(
+                &state.pool,
+                &state.realtime.subs,
+                state.runtime.started_at,
+                presence_rooms,
+                presence_sessions,
+            )
             .await,
     ))
 }
@@ -1819,10 +1826,17 @@ async fn list_subscriptions(
     // Reuse the metrics snapshot for the global + per-db counters (the inspector
     // is a low-frequency admin poll, so the extra pool/latency reads are
     // negligible) and the registry snapshot for the per-subscription rows.
+    let (presence_rooms, presence_sessions) = state.realtime.presence.counts().await;
     let snap = state
         .runtime
         .metrics
-        .snapshot(&state.pool, &state.realtime.subs, state.runtime.started_at)
+        .snapshot(
+            &state.pool,
+            &state.realtime.subs,
+            state.runtime.started_at,
+            presence_rooms,
+            presence_sessions,
+        )
         .await;
     let subscriptions = state.realtime.subs.snapshot(params.db.as_deref()).await;
     Ok(Json(SubscriptionsResponse {
@@ -1944,10 +1958,18 @@ async fn run_admin_stream(
                 }
             }
             _ = gauge_tick.tick() => {
+                let (presence_rooms, presence_sessions) =
+                    state.realtime.presence.counts().await;
                 let snap = state
                     .runtime
                     .metrics
-                    .snapshot(&state.pool, &state.realtime.subs, state.runtime.started_at)
+                    .snapshot(
+                        &state.pool,
+                        &state.realtime.subs,
+                        state.runtime.started_at,
+                        presence_rooms,
+                        presence_sessions,
+                    )
                     .await;
                 if send_stream_json(&mut socket, &serde_json::json!({"kind":"gauges","gauges":snap}))
                     .await

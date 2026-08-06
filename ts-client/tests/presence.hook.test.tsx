@@ -164,4 +164,50 @@ describe("usePresence", () => {
     expect(presences).toEqual(["doc:1", "doc:2"]);
     expect(leaves).toEqual(["doc:1"]);
   });
+
+  it("shares a room across hooks: first unmount does NOT leave, last does", async () => {
+    // Regression: two usePresence("doc:1") hooks share one server-side
+    // membership on this connection. The first to unmount must not send
+    // leavePresence (would kill the room for the still-mounted second); only
+    // the LAST unmount sends the wire leave.
+    const { client, sockets } = setup();
+    function A() {
+      usePresence("doc:1");
+      return <div>a</div>;
+    }
+    function B() {
+      usePresence("doc:1");
+      return <div>b</div>;
+    }
+    const Tree = ({ showA, showB }: { showA: boolean; showB: boolean }) => (
+      <RtDbProvider client={client} authBaseUrl="http://h:8300">
+        {showA && <A />}
+        {showB && <B />}
+      </RtDbProvider>
+    );
+    const { rerender } = render(<Tree showA showB />);
+
+    await act(async () => {
+      sockets[0].open();
+      sockets[0].deliver({ type: "authOk", user: { kind: "user" } });
+    });
+    // Both hooks mounted: the wire JOIN is deduped by joinedRooms on the
+    // flushOnAuth replay (one membership per conn+room), so exactly one
+    // presence frame. No leaves yet.
+    expect(sockets[0].parsed().filter((m) => m.type === "presence").length).toBe(1);
+    expect(sockets[0].parsed().filter((m) => m.type === "leavePresence").length).toBe(0);
+
+    // Unmount A only: B still holds the room — no wire leave.
+    await act(async () => {
+      rerender(<Tree showA={false} showB />);
+    });
+    expect(sockets[0].parsed().filter((m) => m.type === "leavePresence").length).toBe(0);
+
+    // Unmount B too: last listener → wire leave fires exactly once.
+    await act(async () => {
+      rerender(<Tree showA={false} showB={false} />);
+    });
+    const leaves = sockets[0].parsed().filter((m) => m.type === "leavePresence");
+    expect(leaves).toEqual([{ type: "leavePresence", room: "doc:1" }]);
+  });
 });

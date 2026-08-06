@@ -883,7 +883,13 @@ async fn inspector_snapshots_subscriptions_and_per_db_counters() -> anyhow::Resu
     let snap = state
         .runtime
         .metrics
-        .snapshot(&state.pool, &state.realtime.subs, state.runtime.started_at)
+        .snapshot(
+            &state.pool,
+            &state.realtime.subs,
+            state.runtime.started_at,
+            0,
+            0,
+        )
         .await;
     assert_eq!(snap.subs_reruns_total, 2);
     Ok(())

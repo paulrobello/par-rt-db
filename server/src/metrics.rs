@@ -323,6 +323,8 @@ impl Metrics {
         pool: &PgPool,
         subs: &SubscriptionManager,
         started_at: SystemTime,
+        presence_rooms: usize,
+        presence_sessions: usize,
     ) -> MetricsSnapshot {
         let query_latency = self
             .query_latency
@@ -366,6 +368,8 @@ impl Metrics {
             image_transform_bytes_total: self.image_transform_bytes_total.load(Ordering::Relaxed),
             presence_updates_total: self.presence_updates_total.load(Ordering::Relaxed),
             presence_broadcasts_total: self.presence_broadcasts_total.load(Ordering::Relaxed),
+            presence_rooms,
+            presence_sessions,
             per_db_subs: self.per_db_subs_snapshot(),
         }
     }
@@ -413,6 +417,12 @@ pub struct MetricsSnapshot {
     /// Presence-state broadcasts fanned out to interested subscribers
     /// (ENH-015). One per `flush_once`, regardless of recipient count.
     pub presence_broadcasts_total: u64,
+    /// Distinct presence rooms across all dbs at snapshot time (ENH-015). Gauge,
+    /// not counter — membership is per-shard HashMap state tallied at read time
+    /// by `PresenceManager::counts`.
+    pub presence_rooms: usize,
+    /// Total presence sessions across all rooms at snapshot time (ENH-015).
+    pub presence_sessions: usize,
     /// Per-database breakdown of the subscription-invalidation counters above
     /// (ENH-010). Empty until a `fan_out` records a decision; sorted by db.
     pub per_db_subs: Vec<DbSubCounterRow>,
@@ -523,9 +533,9 @@ pub fn render_prometheus(snap: &MetricsSnapshot, version: &str, git_commit: &str
         snap.image_transform_bytes_total
     ));
 
-    // Presence (ENH-015). Monotonic counters only; the live
-    // `presence_rooms`/`presence_sessions` gauges are deferred until the
-    // PresenceManager is wired into the snapshot builder (Task 7).
+    // Presence (ENH-015). Two monotonic counters plus two gauges computed at
+    // snapshot time by `PresenceManager::counts` (membership is per-shard
+    // HashMap state, not an atomic counter).
     s.push_str("# HELP rtdb_presence_updates_total Inbound presence/update frames processed.\n");
     s.push_str("# TYPE rtdb_presence_updates_total counter\n");
     s.push_str(&format!(
@@ -539,6 +549,15 @@ pub fn render_prometheus(snap: &MetricsSnapshot, version: &str, git_commit: &str
     s.push_str(&format!(
         "rtdb_presence_broadcasts_total {}\n",
         snap.presence_broadcasts_total
+    ));
+    s.push_str("# HELP rtdb_presence_rooms Distinct presence rooms across all dbs.\n");
+    s.push_str("# TYPE rtdb_presence_rooms gauge\n");
+    s.push_str(&format!("rtdb_presence_rooms {}\n", snap.presence_rooms));
+    s.push_str("# HELP rtdb_presence_sessions Total presence sessions across all rooms.\n");
+    s.push_str("# TYPE rtdb_presence_sessions gauge\n");
+    s.push_str(&format!(
+        "rtdb_presence_sessions {}\n",
+        snap.presence_sessions
     ));
 
     // Gauges — point-in-time process/runtime state.
@@ -605,6 +624,8 @@ mod tests {
             image_transform_bytes_total: 0,
             presence_updates_total: 0,
             presence_broadcasts_total: 0,
+            presence_rooms: 0,
+            presence_sessions: 0,
             per_db_subs: Vec::new(),
         };
         let body = render_prometheus(&snap, "0.0.0", "abc");
@@ -615,6 +636,14 @@ mod tests {
         assert!(
             body.contains("# TYPE rtdb_ws_connections gauge"),
             "missing gauge TYPE: {body}"
+        );
+        assert!(
+            body.contains("# TYPE rtdb_presence_rooms gauge"),
+            "missing presence_rooms gauge TYPE: {body}"
+        );
+        assert!(
+            body.contains("# TYPE rtdb_presence_sessions gauge"),
+            "missing presence_sessions gauge TYPE: {body}"
         );
         assert!(
             body.contains("rtdb_build_info{version=\"0.0.0\",git_commit=\"abc\"} 1"),
@@ -649,6 +678,8 @@ mod tests {
             image_transform_bytes_total: 0,
             presence_updates_total: 0,
             presence_broadcasts_total: 0,
+            presence_rooms: 0,
+            presence_sessions: 0,
             per_db_subs: Vec::new(),
         };
         let body = render_prometheus(&snap, "0.0.0", "abc");

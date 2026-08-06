@@ -430,7 +430,13 @@ async fn metrics_counters_and_subs_count() -> anyhow::Result<()> {
     assert_eq!(state.realtime.subs.count().await, 0);
 
     let snap = m
-        .snapshot(&state.pool, &state.realtime.subs, state.runtime.started_at)
+        .snapshot(
+            &state.pool,
+            &state.realtime.subs,
+            state.runtime.started_at,
+            0,
+            0,
+        )
         .await;
     assert_eq!(snap.queries_total, 2);
     assert_eq!(snap.mutations_total, 1);

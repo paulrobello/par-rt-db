@@ -264,10 +264,17 @@ async fn prometheus_metrics_handler(
         return (StatusCode::OK, h, index).into_response();
     }
 
+    let (presence_rooms, presence_sessions) = state.realtime.presence.counts().await;
     let snap = state
         .runtime
         .metrics
-        .snapshot(&state.pool, &state.realtime.subs, state.runtime.started_at)
+        .snapshot(
+            &state.pool,
+            &state.realtime.subs,
+            state.runtime.started_at,
+            presence_rooms,
+            presence_sessions,
+        )
         .await;
     let body =
         metrics::render_prometheus(&snap, env!("CARGO_PKG_VERSION"), env!("BUILD_GIT_COMMIT"));

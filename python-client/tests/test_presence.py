@@ -464,6 +464,39 @@ async def test_reconnect_replays_active_presence_join_with_latest_state() -> Non
         await client.close()
 
 
+async def test_rejoin_with_state_refreshes_cached_join_state() -> None:
+    """Re-joining an already-joined room with non-None state refreshes the
+    cached join_state so a reconnect replays the freshest value (parity with
+    rust-client/ts-client; regression for the silent state-drop bug)."""
+    conn = _FakeConn()
+    client = await _connected(conn)
+    try:
+        client.presence("doc:1", state={"v": 1})
+        await _drain()
+        # Re-join the same room with newer state. Before the fix this was
+        # silently dropped; the cached join_state must move to v=2 so the
+        # reconnect replay carries it.
+        client.presence("doc:1", state={"v": 2})
+        await _drain()
+
+        conn2 = _FakeConn()
+
+        async def _connect2(url: str) -> _FakeConn:
+            return conn2
+
+        client._connect = _connect2  # type: ignore[assignment]
+        conn.close_code = 4000
+        await conn._inbox.put(None)
+        await _wait_until(lambda: any('"type":"auth"' in f for f in conn2.sent))
+        await conn2.deliver('{"type":"authOk","user":{"kind":"machine"}}')
+        await _wait_until(lambda: any('"type":"presence"' in f for f in conn2.sent))
+        joins = [json.loads(f) for f in conn2.sent if json.loads(f).get("type") == "presence"]
+        assert len(joins) == 1
+        assert joins[0]["state"] == {"v": 2}  # refreshed, not the stale v=1
+    finally:
+        await client.close()
+
+
 async def test_presence_handle_unsubscribe_does_not_leave_room() -> None:
     """A handle drop only removes the listener; the room stays joined until
     leave_presence is called (parity with ts-client/rust-client)."""

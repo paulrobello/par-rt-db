@@ -150,6 +150,12 @@ export class RtDbClient {
    * frames. A `leavePresence` removes the entry; an `updatePresence` updates
    * the cached state so a reconnect re-joins with the latest, not the original. */
   private readonly joinedRooms = new Map<string, unknown>();
+  /** Per-room count of outstanding `presence()` join interests. `leavePresence`
+   *  only tears the room down (wire frame + `joinedRooms`/listener clear) when
+   *  the LAST listener detaches, so two `usePresence(room)` hooks sharing a room
+   *  don't kill it for each other on the first unmount. The wire JOIN itself is
+   *  already idempotent server-side (one membership per conn+room). */
+  private readonly presenceRefcounts = new Map<string, number>();
   /** mutId → subscriptions whose last result this mutation optimistically overlaid. */
   private readonly optimisticOverlays = new Map<string, Set<Subscription>>();
   private readonly optimistic: boolean;
@@ -432,6 +438,7 @@ export class RtDbClient {
     onUpdate?: (members: PresenceMember[]) => void,
   ): () => void {
     this.joinedRooms.set(room, state);
+    this.presenceRefcounts.set(room, (this.presenceRefcounts.get(room) ?? 0) + 1);
     if (onUpdate) {
       let set = this.presenceListeners.get(room);
       if (!set) {
@@ -470,12 +477,28 @@ export class RtDbClient {
     }
   }
 
-  /** Leaves presence room `room`. Drops local listeners for this room (the
-   * server stops sending snapshots once the connection has left). Local state
-   * (`joinedRooms`, listeners) is cleared regardless of auth state so a
-   * buffered pre-auth join does not replay after the caller has already left;
-   * the wire frame is sent ONLY when authenticated. */
+  /** Leaves presence room `room`: drops one outstanding join interest (from a
+   *  matching `presence()` call) and, when the LAST listener detaches, clears
+   *  local state (`joinedRooms`, listeners) and sends the wire `leavePresence`
+   *  frame (only when authenticated). This refcounting keeps a shared room alive
+   *  until every `usePresence(room)` / `presence(room)` consumer has detached —
+   *  the server models one membership per conn+room, so the wire leave must fire
+   *  once, not once per listener. Local state is cleared regardless of auth
+   *  state on the final detach so a buffered pre-auth join does not replay after
+   *  the caller has left. */
   leavePresence(room: string): void {
+    const count = this.presenceRefcounts.get(room) ?? 0;
+    if (count > 1) {
+      // Other listeners still hold this room — drop one join interest only.
+      this.presenceRefcounts.set(room, count - 1);
+      return;
+    }
+    if (count <= 0) {
+      // Not joined (or already left) — no-op, never a duplicate wire leave.
+      return;
+    }
+    // count === 1: last detach — tear down fully.
+    this.presenceRefcounts.delete(room);
     this.joinedRooms.delete(room);
     this.presenceListeners.delete(room);
     if (this.authState === "authenticated") {

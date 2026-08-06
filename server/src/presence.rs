@@ -307,6 +307,28 @@ impl PresenceManager {
             .unwrap_or_default()
     }
 
+    /// Live counts across all shards: `(distinct_rooms, total_sessions)`.
+    /// Computed at snapshot time for the `rtdb_presence_rooms` /
+    /// `rtdb_presence_sessions` gauges — not atomic counters on `Metrics`, since
+    /// membership is per-shard `HashMap` state that can't be tallied at increment
+    /// time. Same lock discipline as `shard()`: clone each shard `Arc` under the
+    /// brief outer lock, release it, then lock each shard individually (never
+    /// hold the outer lock across a shard lock acquisition).
+    pub async fn counts(&self) -> (usize, usize) {
+        let shards: Vec<Arc<Mutex<DbPresence>>> = {
+            let dbs = self.dbs.lock().await;
+            dbs.values().cloned().collect()
+        };
+        let mut rooms = 0usize;
+        let mut sessions = 0usize;
+        for shard in shards {
+            let p = shard.lock().await;
+            rooms += p.rooms.len();
+            sessions += p.rooms.values().map(|m| m.len()).sum::<usize>();
+        }
+        (rooms, sessions)
+    }
+
     /// Broadcast one `presenceSnapshot` per dirty room to every member of that
     /// room, then clear the dirty set. Called by the periodic flush task and by
     /// tests. Cheap when there are no dirty rooms.

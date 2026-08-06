@@ -650,6 +650,10 @@ class RtDbClient:
                 asyncio.get_running_loop().create_task(
                     self._send(_presence_join_frame(room, state))
                 )
+        elif state is not None:
+            # Refresh the cached join state so a reconnect replays the freshest
+            # value (parity with rust-client/ts-client on re-join).
+            rm.join_state = state
         rm.handle_count += 1
         return Presence(self, rm)
 

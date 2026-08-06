@@ -1,5 +1,5 @@
 {
-  "$comment": "Canonical cross-client wire-parity corpus (ARC-008). Every entry is the raw JSON object as it appears on the wire. Each client's parity test parses -> serializes -> deep-compares to the input. Bytes are authoritative; tag/field names are load-bearing (see server/src/protocol.rs header). Sections: 'client_messages', 'server_messages', 'authed_users', 'schedule_whens', 'schedule_infos', 'query_results', 'error_envelopes', 'queries' (embedded query shapes covering filter/search/vectorSearch/paginate), 'migrate_requests' / 'migrate_results' (admin migrate Directive list + response — op tag, camelCase, `where`/`from` aliases, cast literals), 'rejects_client_message_unknown_field' (must fail to parse where deny_unknown_fields / extra='forbid' applies).",
+  "$comment": "Canonical cross-client wire-parity corpus (ARC-008). Every entry is the raw JSON object as it appears on the wire. Each client's parity test parses -> serializes -> deep-compares to the input. Bytes are authoritative; tag/field names are load-bearing (see server/src/protocol.rs header). Sections: 'client_messages' (incl. ENH-015 presence join/state/leave frames), 'server_messages' (incl. ENH-015 presenceSnapshot/presenceErr), 'authed_users', 'schedule_whens', 'schedule_infos', 'query_results', 'error_envelopes', 'queries' (embedded query shapes covering filter/search/vectorSearch/paginate), 'migrate_requests' / 'migrate_results' (admin migrate Directive list + response — op tag, camelCase, `where`/`from` aliases, cast literals), 'rejects_client_message_unknown_field' (must fail to parse where deny_unknown_fields / extra='forbid' applies).",
   "client_messages": [
     { "type": "auth", "token": "t", "db": "d" },
     { "type": "auth", "db": "d" },
@@ -21,6 +21,10 @@
     { "type": "pauseSchedule", "scheduleId": "s1", "id": "job-9" },
     { "type": "resumeSchedule", "scheduleId": "s1", "id": "job-9" },
     { "type": "listSchedules", "scheduleId": "s1" },
+    { "type": "presence", "room": "doc:1" },
+    { "type": "presence", "room": "doc:1", "state": { "cursor": { "x": 1, "y": 2 } } },
+    { "type": "presenceState", "room": "doc:1", "state": { "typing": true } },
+    { "type": "leavePresence", "room": "doc:1" },
     { "type": "ping" }
   ],
   "server_messages": [
@@ -45,6 +49,8 @@
     { "type": "listSchedulesOk", "scheduleId": "s1", "schedules": [] },
     { "type": "listSchedulesOk", "scheduleId": "s1", "schedules": [ { "id": "j1", "kind": "oneshot", "dueAt": 1000, "status": "pending", "createdAt": 500, "firedCount": 0 } ] },
     { "type": "listSchedulesOk", "scheduleId": "s1", "schedules": [ { "id": "j2", "kind": "cron", "dueAt": 2000, "cron": "*/5 * * * *", "status": "error", "lastError": "boom", "createdAt": 500, "firedCount": 3 } ] },
+    { "type": "presenceSnapshot", "room": "doc:1", "members": [ { "connectionId": "c1", "user": { "kind": "user", "email": "a@b.com", "name": null }, "state": { "cursor": { "x": 1, "y": 2 } } }, { "connectionId": "c2", "user": { "kind": "machine", "email": null, "name": null }, "state": {} } ] },
+    { "type": "presenceErr", "room": "doc:1", "error": { "code": "FORBIDDEN", "message": "presence not enabled" } },
     { "type": "pong" }
   ],
   "authed_users": [

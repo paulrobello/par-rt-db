@@ -241,15 +241,13 @@ async fn disconnect_evicts_the_member() {
     // Drop wb's socket → server reads EOF → remove_conn → room dirty → the
     // interval=0 background flush task broadcasts the 1-member snapshot to wa.
     // An explicit `flush_once` here would race the background task (both drain
-    // the same dirty set under one mutex), so we rely on the background task
-    // and just bound the wait. The `loop` re-arms `drain_until_snapshot` in
-    // case the first read lands before the eviction snapshot is enqueued.
+    // the same dirty set under one mutex), so we rely on the background task.
     drop(wb);
-    let snap = tokio::time::timeout(Duration::from_secs(3), async {
-        drain_until_snapshot(&mut wa, "doc:1", |n| n == 1).await
-    })
-    .await
-    .expect("timed out waiting for disconnect eviction");
+    // `drain_until_snapshot`'s own 2s timeout is the single bound on the
+    // eviction wait — the prior outer 3s wrapper was unreachable dead code (the
+    // inner helper times out first). The interval=0 flush task enqueues the
+    // eviction snapshot within milliseconds of the TCP close, so 2s is ample.
+    let snap = drain_until_snapshot(&mut wa, "doc:1", |n| n == 1).await;
     assert_eq!(snap["members"].as_array().map(|a| a.len()), Some(1));
 }
 
@@ -296,7 +294,11 @@ async fn rooms_are_db_scoped() {
     assert_eq!(db1_members.len(), 1, "db1 room X has only wa");
     assert_eq!(db2_members.len(), 1, "db2 room X has only wb");
     // ...and at the wire: wa receives NO frame within 150ms after wb's db2
-    // join, because db1's room "X" was never dirtied by wb's action.
+    // join, because db1's room "X" was never dirtied by wb's action. 150ms is
+    // a safe negative window: the flush task runs at interval=0 here (a genuine
+    // cross-db leak would land within ~ms, not 150), the only periodic wire
+    // frame is the 30s PING (well outside this window), and the dirty set is
+    // keyed by (db, room) so a db2 join can never mark db1's room dirty.
     let leaked = tokio::time::timeout(Duration::from_millis(150), wa.next()).await;
     assert!(
         leaked.is_err(),
