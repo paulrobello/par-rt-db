@@ -137,6 +137,12 @@ pub struct Config {
     /// RTDB_PRESENCE_MAX_TTL_MS (default 300000 = 5 min). Upper bound on a
     /// client-supplied presenceState ttlMs; over-cap is rejected (no clamping).
     pub presence_max_ttl_ms: u64,
+    /// RTDB_QUOTA_CACHE_TTL_SECS (default 60). TTL for the per-db quota
+    /// counters (table count, storage bytes, active subs) maintained by the
+    /// enforcement layer (ENH-011). 0 is interpreted as "no caching" by the
+    /// reader; boot-only (not hot-reloadable) because the cache lives outside
+    /// `HotConfig` and is rebuilt from `AppState` on its own cadence.
+    pub quota_cache_ttl_secs: u64,
 }
 
 impl Config {
@@ -376,6 +382,13 @@ impl Config {
             .unwrap_or(300_000)
             .max(1000);
 
+        // Quota counter cache TTL (ENH-011). 0 = no caching. An unparseable
+        // value falls back to the default, matching the parses above.
+        let quota_cache_ttl_secs = match std::env::var("RTDB_QUOTA_CACHE_TTL_SECS") {
+            Ok(v) => v.parse::<u64>().unwrap_or(60),
+            Err(_) => 60,
+        };
+
         Ok(Self {
             port,
             database_url,
@@ -431,6 +444,7 @@ impl Config {
             presence_broadcast_interval_ms,
             presence_update_limit_per_sec,
             presence_max_ttl_ms,
+            quota_cache_ttl_secs,
         })
     }
 }
@@ -446,6 +460,10 @@ pub struct HotConfig {
     pub session_ttl_days: i64,        // RTDB_SESSION_TTL_DAYS, default 30
     pub max_file_size: usize,         // RTDB_MAX_FILE_SIZE, default 50 MiB
     pub idempotency_ttl_ms: i64, // RTDB_IDEMPOTENCY_TTL_MS, default mutation_log::DEFAULT_DEDUP_TTL_MS (5 min)
+    /// Per-database resource quotas (ENH-011). 0 = unlimited (quota disabled).
+    pub max_tables_per_db: usize, // RTDB_MAX_TABLES_PER_DB,       default 0
+    pub max_storage_bytes_per_db: u64, // RTDB_MAX_STORAGE_BYTES_PER_DB, default 0
+    pub max_subs_per_db: usize,  // RTDB_MAX_SUBS_PER_DB,        default 0
 }
 
 impl HotConfig {
@@ -483,11 +501,29 @@ impl HotConfig {
                 .unwrap_or(crate::mutation_log::DEFAULT_DEDUP_TTL_MS),
             Err(_) => crate::mutation_log::DEFAULT_DEDUP_TTL_MS,
         };
+        // Per-database resource quotas (ENH-011). 0 = unlimited. An unparseable
+        // value falls back to 0 (quota disabled), matching the permissiveness of
+        // the parses above while failing open on the operator side.
+        let max_tables_per_db = match std::env::var("RTDB_MAX_TABLES_PER_DB") {
+            Ok(v) => v.parse::<usize>().unwrap_or(0),
+            Err(_) => 0,
+        };
+        let max_storage_bytes_per_db = match std::env::var("RTDB_MAX_STORAGE_BYTES_PER_DB") {
+            Ok(v) => v.parse::<u64>().unwrap_or(0),
+            Err(_) => 0,
+        };
+        let max_subs_per_db = match std::env::var("RTDB_MAX_SUBS_PER_DB") {
+            Ok(v) => v.parse::<usize>().unwrap_or(0),
+            Err(_) => 0,
+        };
         Self {
             allowed_origins,
             session_ttl_days,
             max_file_size,
             idempotency_ttl_ms,
+            max_tables_per_db,
+            max_storage_bytes_per_db,
+            max_subs_per_db,
         }
     }
 
@@ -579,6 +615,12 @@ struct PersistedHotConfig {
     max_file_size: Option<usize>,
     #[serde(default)]
     idempotency_ttl_ms: Option<i64>,
+    #[serde(default)]
+    max_tables_per_db: Option<usize>,
+    #[serde(default)]
+    max_storage_bytes_per_db: Option<u64>,
+    #[serde(default)]
+    max_subs_per_db: Option<usize>,
 }
 
 impl PersistedHotConfig {
@@ -593,6 +635,11 @@ impl PersistedHotConfig {
             idempotency_ttl_ms: self
                 .idempotency_ttl_ms
                 .unwrap_or(defaults.idempotency_ttl_ms),
+            max_tables_per_db: self.max_tables_per_db.unwrap_or(defaults.max_tables_per_db),
+            max_storage_bytes_per_db: self
+                .max_storage_bytes_per_db
+                .unwrap_or(defaults.max_storage_bytes_per_db),
+            max_subs_per_db: self.max_subs_per_db.unwrap_or(defaults.max_subs_per_db),
         }
     }
 }
@@ -645,6 +692,9 @@ mod tests {
             session_ttl_days: 30,
             max_file_size: 50 * 1024 * 1024,
             idempotency_ttl_ms: 300_000,
+            max_tables_per_db: 0,
+            max_storage_bytes_per_db: 0,
+            max_subs_per_db: 0,
         }
     }
 
@@ -675,6 +725,32 @@ mod tests {
         assert_eq!(merged.session_ttl_days, 30);
         // The one absent field falls back to the env seed...
         assert_eq!(merged.idempotency_ttl_ms, 300_000);
+        // The absent quota fields (ENH-011) fall back to the env seed (0 =
+        // unlimited), not to a structural default that would silently cap.
+        assert_eq!(merged.max_tables_per_db, 0);
+        assert_eq!(merged.max_storage_bytes_per_db, 0);
+        assert_eq!(merged.max_subs_per_db, 0);
+    }
+
+    /// `HotConfig` quota fields (ENH-011) round-trip through the persisted
+    /// jsonb row: a row carrying `maxTablesPerDb` / `maxStorageBytesPerDb` /
+    /// `maxSubsPerDb` decodes and merges so the persisted values win over the
+    /// env seed. Regression guard for the prod incident class documented on
+    /// `PersistedHotConfig` (a field added to `HotConfig` without a mirror in
+    /// `PersistedHotConfig` + `merge_onto` silently reverts to env on every boot).
+    #[test]
+    fn persisted_quota_fields_round_trip() {
+        let row = serde_json::json!({
+            "maxTablesPerDb": 25,
+            "maxStorageBytesPerDb": 536870912,
+            "maxSubsPerDb": 100,
+            "sessionTtlDays": 30
+        });
+        let persisted: PersistedHotConfig = serde_json::from_value(row).expect("quota row decodes");
+        let merged = persisted.merge_onto(env_seed());
+        assert_eq!(merged.max_tables_per_db, 25);
+        assert_eq!(merged.max_storage_bytes_per_db, 536870912);
+        assert_eq!(merged.max_subs_per_db, 100);
     }
 
     /// ...and specifically NOT to the type default, which would be harmful.
@@ -763,6 +839,9 @@ mod tests {
             session_ttl_days: 30,
             max_file_size: 1024,
             idempotency_ttl_ms: crate::mutation_log::DEFAULT_DEDUP_TTL_MS,
+            max_tables_per_db: 0,
+            max_storage_bytes_per_db: 0,
+            max_subs_per_db: 0,
         };
         assert!(hot.origins_valid());
         hot.allowed_origins.push("https://c.com\"".into());

@@ -182,6 +182,10 @@ class HotConfig(_Wire):
     session_ttl_days: int
     max_file_size: int
     idempotency_ttl_ms: int
+    # Per-db resource quotas (ENH-011); 0 = unlimited. Mirrors server HotConfig.
+    max_tables_per_db: int = 0
+    max_storage_bytes_per_db: int = 0
+    max_subs_per_db: int = 0
 
 
 class ConfigResponse(_Wire):
@@ -216,6 +220,9 @@ class HotConfigPatch(_Wire):
     session_ttl_days: int | None = None
     max_file_size: int | None = None
     idempotency_ttl_ms: int | None = None
+    max_tables_per_db: int | None = None
+    max_storage_bytes_per_db: int | None = None
+    max_subs_per_db: int | None = None
 
 
 class OpEvent(_Wire):

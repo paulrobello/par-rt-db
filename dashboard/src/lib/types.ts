@@ -108,6 +108,12 @@ export interface TableStat {
 export interface DbStats {
   tables: TableStat[];
   totalSizeBytes: number;
+  tablesQuota: number;
+  tablesUsed: number;
+  storageQuotaBytes: number;
+  storageUsedBytes: number;
+  subsQuota: number;
+  subsUsed: number;
 }
 
 export interface AdminMember {
@@ -120,6 +126,9 @@ export interface HotConfig {
   sessionTtlDays: number;
   maxFileSize: number;
   idempotencyTtlMs: number;
+  maxTablesPerDb: number;
+  maxStorageBytesPerDb: number;
+  maxSubsPerDb: number;
 }
 
 export interface ConfigResponse {
@@ -228,6 +237,9 @@ export interface HotConfigPatch {
   sessionTtlDays?: number;
   maxFileSize?: number;
   idempotencyTtlMs?: number;
+  maxTablesPerDb?: number;
+  maxStorageBytesPerDb?: number;
+  maxSubsPerDb?: number;
 }
 
 // Webhooks — mirrors server/src/webhook.rs (Webhook, DeliveryRow) and the

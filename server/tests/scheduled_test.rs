@@ -22,6 +22,7 @@ use rtdb_server::metrics::Metrics;
 use rtdb_server::op_feed::OpFeed;
 use rtdb_server::protocol::{ScheduleKind, ScheduleStatus};
 use rtdb_server::query::{Query, QueryResult, execute_query};
+use rtdb_server::quota;
 use rtdb_server::scheduler;
 use rtdb_server::schema::SchemaDef;
 use rtdb_server::subs::SubscriptionManager;
@@ -331,6 +332,8 @@ async fn one_shot_fires_and_writes() {
         60,
         5000,
         Metrics::new(),
+        Arc::new(quota::UsageCache::new()),
+        60,
     );
 
     // Schedule a one-shot due in the past so it fires on the scheduler's first
@@ -381,6 +384,8 @@ async fn cron_fires_and_stays_pending() {
         60,
         5000,
         Metrics::new(),
+        Arc::new(quota::UsageCache::new()),
+        60,
     );
 
     // `* * * * *` = every minute. Scheduled due in the past, so it fires once
@@ -436,6 +441,8 @@ async fn failing_cron_reschedules_anyway() {
         60,
         5000,
         Metrics::new(),
+        Arc::new(quota::UsageCache::new()),
+        60,
     );
 
     // A cron whose txn FAILS every fire: `ExpectVersion` against a document
@@ -510,6 +517,8 @@ async fn one_shot_catches_up_after_being_past_due() {
         60,
         5000,
         Metrics::new(),
+        Arc::new(quota::UsageCache::new()),
+        60,
     );
 
     // Warm the committer+scheduler up FIRST so the per-db scheduler loop is
@@ -556,6 +565,8 @@ async fn cron_skips_missed_windows() {
         60,
         5000,
         Metrics::new(),
+        Arc::new(quota::UsageCache::new()),
+        60,
     );
 
     // `* * * * *` (every minute) with due_at ~1 hour in the past. A naive
@@ -633,6 +644,8 @@ async fn failing_txn_marks_error_one_shot() {
         60,
         5000,
         Metrics::new(),
+        Arc::new(quota::UsageCache::new()),
+        60,
     );
 
     // A one-shot whose txn is set up to FAIL: step 1 inserts a doc, step 2 is

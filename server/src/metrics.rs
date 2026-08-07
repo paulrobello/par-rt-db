@@ -114,6 +114,41 @@ pub struct DbSubCounterRow {
     pub missed: u64,
 }
 
+/// Which resource quota was exceeded. Mirrors the `SkipClass` pattern: the
+/// kind becomes a Prometheus label on the aggregate counter, so a new quota
+/// dimension is a new variant rather than a new metric name.
+#[derive(Debug, Clone, Copy)]
+pub enum QuotaKind {
+    Tables,
+    Storage,
+    Subs,
+}
+
+/// Per-database resource-quota rejection counters — the per-db breakdown of the
+/// global `quota_rejections_*_total` counters on [`Metrics`]. Same shape and
+/// same concurrency posture as [`DbSubCounters`]: held under a
+/// `Mutex<HashMap<String, Self>>`, the mutex held only across a single atomic
+/// increment. Exposed only in the JSON metrics snapshot; deliberately absent
+/// from the Prometheus scrape to avoid per-db label cardinality on the public
+/// export (see `lib.rs:239` — the `/metrics` scrape is aggregate-only).
+#[derive(Default)]
+struct QuotaCounters {
+    tables: AtomicU64,
+    storage: AtomicU64,
+    subs: AtomicU64,
+}
+
+/// One db's quota-rejection counters in a serializable, sorted form (the JSON
+/// snapshot shape). camelCase on the wire.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DbQuotaCounterRow {
+    pub db: String,
+    pub tables: u64,
+    pub storage: u64,
+    pub subs: u64,
+}
+
 #[derive(Default)]
 pub struct Metrics {
     queries_total: AtomicU64,
@@ -165,6 +200,14 @@ pub struct Metrics {
     /// name. Updated alongside the globals in `fan_out`; read by the JSON
     /// metrics snapshot and `/admin/subscriptions`. See [`DbSubCounters`].
     per_db_subs: Mutex<HashMap<String, DbSubCounters>>,
+    // ---- Per-db resource-quota counters (ENH-011) ----
+    /// Per-db breakdown of the `quota_rejections_*_total` counters below,
+    /// keyed by db name. JSON-snapshot only — the Prometheus scrape carries
+    /// the aggregate-by-kind totals (no per-db labels). See [`QuotaCounters`].
+    per_db_quota: Mutex<HashMap<String, QuotaCounters>>,
+    quota_rejections_tables_total: AtomicU64,
+    quota_rejections_storage_total: AtomicU64,
+    quota_rejections_subs_total: AtomicU64,
 }
 
 impl Metrics {
@@ -327,6 +370,47 @@ impl Metrics {
         rows
     }
 
+    /// A per-db resource quota rejection (ENH-011). Records the global per-kind
+    /// counter + a per-db breakdown. The per-db breakdown is JSON-snapshot only;
+    /// the Prometheus scrape carries the aggregate-by-kind totals (no per-db
+    /// labels on the public export — same convention as `per_db_subs`).
+    pub fn record_quota_rejection(&self, db: &str, kind: QuotaKind) {
+        let global = match kind {
+            QuotaKind::Tables => &self.quota_rejections_tables_total,
+            QuotaKind::Storage => &self.quota_rejections_storage_total,
+            QuotaKind::Subs => &self.quota_rejections_subs_total,
+        };
+        global.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut map) = self.per_db_quota.lock() {
+            let entry = map.entry(db.to_string()).or_default();
+            let per_db = match kind {
+                QuotaKind::Tables => &entry.tables,
+                QuotaKind::Storage => &entry.storage,
+                QuotaKind::Subs => &entry.subs,
+            };
+            per_db.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Snapshot of the per-db quota-rejection counters, sorted by db name for
+    /// stable output. Empty until a `record_quota_rejection` lands.
+    pub fn per_db_quota_snapshot(&self) -> Vec<DbQuotaCounterRow> {
+        let Ok(map) = self.per_db_quota.lock() else {
+            return Vec::new();
+        };
+        let mut rows: Vec<DbQuotaCounterRow> = map
+            .iter()
+            .map(|(db, c)| DbQuotaCounterRow {
+                db: db.clone(),
+                tables: c.tables.load(Ordering::Relaxed),
+                storage: c.storage.load(Ordering::Relaxed),
+                subs: c.subs.load(Ordering::Relaxed),
+            })
+            .collect();
+        rows.sort_by(|a, b| a.db.cmp(&b.db));
+        rows
+    }
+
     pub async fn snapshot(
         &self,
         pool: &PgPool,
@@ -381,6 +465,14 @@ impl Metrics {
             presence_rooms,
             presence_sessions,
             per_db_subs: self.per_db_subs_snapshot(),
+            quota_rejections_tables_total: self
+                .quota_rejections_tables_total
+                .load(Ordering::Relaxed),
+            quota_rejections_storage_total: self
+                .quota_rejections_storage_total
+                .load(Ordering::Relaxed),
+            quota_rejections_subs_total: self.quota_rejections_subs_total.load(Ordering::Relaxed),
+            per_db_quota: self.per_db_quota_snapshot(),
         }
     }
 }
@@ -438,6 +530,15 @@ pub struct MetricsSnapshot {
     /// Per-database breakdown of the subscription-invalidation counters above
     /// (ENH-010). Empty until a `fan_out` records a decision; sorted by db.
     pub per_db_subs: Vec<DbSubCounterRow>,
+    /// Aggregate quota rejections by kind (ENH-011), surfaced in BOTH the JSON
+    /// snapshot and the Prometheus scrape (`rtdb_quota_rejections_total{kind=…}`).
+    pub quota_rejections_tables_total: u64,
+    pub quota_rejections_storage_total: u64,
+    pub quota_rejections_subs_total: u64,
+    /// Per-database breakdown of the quota-rejection counters above (ENH-011).
+    /// JSON-snapshot only — deliberately absent from the Prometheus scrape
+    /// (per-db labels would blow up cardinality on the public export).
+    pub per_db_quota: Vec<DbQuotaCounterRow>,
 }
 
 /// Render the snapshot as Prometheus text-exposition format (version 0.0.4).
@@ -509,6 +610,23 @@ pub fn render_prometheus(snap: &MetricsSnapshot, version: &str, git_commit: &str
     s.push_str(&format!(
         "rtdb_subs_missed_pushes_total {}\n",
         snap.subs_missed_pushes_total
+    ));
+
+    // Resource quota rejections (ENH-011). Aggregate-by-kind only — no per-db
+    // labels (cardinality). The per-db breakdown lives in the JSON snapshot.
+    s.push_str("# HELP rtdb_quota_rejections_total Resource-quota rejections by kind.\n");
+    s.push_str("# TYPE rtdb_quota_rejections_total counter\n");
+    s.push_str(&format!(
+        "rtdb_quota_rejections_total{{kind=\"tables\"}} {}\n",
+        snap.quota_rejections_tables_total
+    ));
+    s.push_str(&format!(
+        "rtdb_quota_rejections_total{{kind=\"storage\"}} {}\n",
+        snap.quota_rejections_storage_total
+    ));
+    s.push_str(&format!(
+        "rtdb_quota_rejections_total{{kind=\"subs\"}} {}\n",
+        snap.quota_rejections_subs_total
     ));
 
     s.push_str(
@@ -648,6 +766,10 @@ mod tests {
             presence_rooms: 0,
             presence_sessions: 0,
             per_db_subs: Vec::new(),
+            quota_rejections_tables_total: 0,
+            quota_rejections_storage_total: 0,
+            quota_rejections_subs_total: 0,
+            per_db_quota: Vec::new(),
         };
         let body = render_prometheus(&snap, "0.0.0", "abc");
         assert!(
@@ -703,6 +825,10 @@ mod tests {
             presence_rooms: 0,
             presence_sessions: 0,
             per_db_subs: Vec::new(),
+            quota_rejections_tables_total: 0,
+            quota_rejections_storage_total: 0,
+            quota_rejections_subs_total: 0,
+            per_db_quota: Vec::new(),
         };
         let body = render_prometheus(&snap, "0.0.0", "abc");
         // One metric name, one sample per skip class.
@@ -764,6 +890,92 @@ mod tests {
             rows.iter().map(|r| r.skips_indexed).sum::<u64>(),
             m.subs_skips_indexed_total.load(Ordering::Relaxed)
         );
+    }
+
+    #[test]
+    fn quota_rejections_land_in_snapshot_and_prometheus() {
+        // Mirrors `skip_and_verification_counters_land_in_the_snapshot` — the
+        // per-db breakdown fans out into rows, the globals are the sum across
+        // dbs, and the aggregate-by-kind totals appear in the Prometheus scrape
+        // under one metric name with a `kind` label (no per-db labels).
+        let m = Metrics::default();
+        m.record_quota_rejection("db-a", QuotaKind::Tables);
+        m.record_quota_rejection("db-a", QuotaKind::Storage);
+        m.record_quota_rejection("db-b", QuotaKind::Storage);
+        m.record_quota_rejection("db-a", QuotaKind::Subs);
+        assert_eq!(m.quota_rejections_tables_total.load(Ordering::Relaxed), 1);
+        assert_eq!(m.quota_rejections_storage_total.load(Ordering::Relaxed), 2);
+        assert_eq!(m.quota_rejections_subs_total.load(Ordering::Relaxed), 1);
+        // Per-db breakdown: db-a owns 3 rejections across kinds, db-b owns 1.
+        let rows = m.per_db_quota_snapshot();
+        assert_eq!(rows.len(), 2, "two dbs recorded");
+        assert_eq!(rows[0].db, "db-a");
+        assert_eq!(rows[0].tables, 1);
+        assert_eq!(rows[0].storage, 1);
+        assert_eq!(rows[0].subs, 1);
+        assert_eq!(rows[1].db, "db-b");
+        assert_eq!(rows[1].storage, 1);
+        assert_eq!(rows[1].tables, 0);
+        assert_eq!(rows[1].subs, 0);
+        // Globals = sum across dbs.
+        assert_eq!(
+            rows.iter().map(|r| r.storage).sum::<u64>(),
+            m.quota_rejections_storage_total.load(Ordering::Relaxed)
+        );
+        // Prometheus renders the three aggregate-by-kind totals (no per-db).
+        let snap = MetricsSnapshot {
+            queries_total: 0,
+            mutations_total: 0,
+            uploads_total: 0,
+            ws_connections: 0,
+            active_subscriptions: 0,
+            pool_size: 0,
+            pool_idle: 0,
+            uptime_seconds: 0,
+            query_latency: LatencyStats::default(),
+            mutate_latency: LatencyStats::default(),
+            subscribe_latency: LatencyStats::default(),
+            subs_reruns_total: 0,
+            subs_skips_point_total: 0,
+            subs_skips_indexed_total: 0,
+            subs_skips_ordered_total: 0,
+            subs_skip_verifications_total: 0,
+            subs_missed_pushes_total: 0,
+            ttl_expired_total: 0,
+            image_transforms_hit_total: 0,
+            image_transforms_miss_total: 0,
+            image_transforms_error_total: 0,
+            image_transform_bytes_total: 0,
+            presence_updates_total: 0,
+            presence_broadcasts_total: 0,
+            presence_ttl_expiries_total: 0,
+            presence_rooms: 0,
+            presence_sessions: 0,
+            per_db_subs: Vec::new(),
+            quota_rejections_tables_total: 1,
+            quota_rejections_storage_total: 2,
+            quota_rejections_subs_total: 3,
+            per_db_quota: Vec::new(),
+        };
+        let body = render_prometheus(&snap, "0.0.0", "abc");
+        assert!(
+            body.contains("# TYPE rtdb_quota_rejections_total counter"),
+            "{body}"
+        );
+        assert!(
+            body.contains("rtdb_quota_rejections_total{kind=\"tables\"} 1"),
+            "{body}"
+        );
+        assert!(
+            body.contains("rtdb_quota_rejections_total{kind=\"storage\"} 2"),
+            "{body}"
+        );
+        assert!(
+            body.contains("rtdb_quota_rejections_total{kind=\"subs\"} 3"),
+            "{body}"
+        );
+        // Per-db breakdown deliberately absent from the scrape (cardinality).
+        assert!(!body.contains("db-a"), "per-db leaked into scrape: {body}");
     }
 
     #[test]

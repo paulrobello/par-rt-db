@@ -7,7 +7,8 @@ export type RtDbErrorCode =
   | "CONFLICT"
   | "BAD_REQUEST"
   | "INTERNAL"
-  | "RATE_LIMITED";
+  | "RATE_LIMITED"
+  | "QUOTA_EXCEEDED";
 
 const CODES: ReadonlySet<string> = new Set<RtDbErrorCode>([
   "UNAUTHORIZED",
@@ -19,6 +20,7 @@ const CODES: ReadonlySet<string> = new Set<RtDbErrorCode>([
   "BAD_REQUEST",
   "INTERNAL",
   "RATE_LIMITED",
+  "QUOTA_EXCEEDED",
 ]);
 
 export interface RtDbErrorEnvelope {

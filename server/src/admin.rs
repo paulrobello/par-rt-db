@@ -194,6 +194,9 @@ async fn delete_db(
     state.schemas.invalidate(&body.name).await;
     state.realtime.subs.drop_db(&body.name).await;
     state.realtime.committers.drop_db(&body.name).await;
+    // ENH-011: drop the cached storage-usage entry so a future db that reuses
+    // this name doesn't read a stale byte count from before the drop.
+    state.quotas.evict(&body.name);
     Ok(Json(OkResponse { ok: true }))
 }
 
@@ -209,6 +212,14 @@ async fn push_schema(
     ApiJson(body): ApiJson<PushSchemaRequest>,
 ) -> Result<Json<OkResponse>, RtDbError> {
     require_admin(&state, &headers).await?;
+    body.schema
+        .check_table_quota(state.runtime.hot.load().max_tables_per_db)
+        .inspect_err(|_e| {
+            state
+                .runtime
+                .metrics
+                .record_quota_rejection(&body.db, crate::metrics::QuotaKind::Tables);
+        })?;
     let applied = ddl::push_schema(&state.pool, &body.db, body.schema).await?;
     state.schemas.put(&body.db, applied.clone()).await;
     if let Err(err) = schema_history::capture(&state.pool, &body.db, "push", None, &applied).await {
@@ -1364,6 +1375,18 @@ struct DbStatsResponse {
     tables: Vec<TableStat>,
     #[serde(rename = "totalSizeBytes")]
     total_size_bytes: i64,
+    #[serde(rename = "tablesQuota")]
+    tables_quota: usize,
+    #[serde(rename = "tablesUsed")]
+    tables_used: usize,
+    #[serde(rename = "storageQuotaBytes")]
+    storage_quota_bytes: u64,
+    #[serde(rename = "storageUsedBytes")]
+    storage_used_bytes: u64,
+    #[serde(rename = "subsQuota")]
+    subs_quota: usize,
+    #[serde(rename = "subsUsed")]
+    subs_used: usize,
 }
 
 async fn db_stats(
@@ -1404,9 +1427,17 @@ async fn db_stats(
         });
     }
     tables.sort_by(|a, b| a.name.cmp(&b.name));
+    let hot = state.runtime.hot.load();
+    let subs_used = state.realtime.subs.count_for_db(&db).await;
     Ok(Json(DbStatsResponse {
         tables,
         total_size_bytes,
+        tables_quota: hot.max_tables_per_db,
+        tables_used: schema_def.tables.len(),
+        storage_quota_bytes: hot.max_storage_bytes_per_db,
+        storage_used_bytes: total_size_bytes.max(0) as u64,
+        subs_quota: hot.max_subs_per_db,
+        subs_used,
     }))
 }
 
@@ -1655,6 +1686,10 @@ struct HotConfigPatch {
     session_ttl_days: Option<i64>,
     max_file_size: Option<usize>,
     idempotency_ttl_ms: Option<i64>,
+    // Per-database resource quotas (ENH-011). 0 = unlimited.
+    max_tables_per_db: Option<usize>,
+    max_storage_bytes_per_db: Option<u64>,
+    max_subs_per_db: Option<usize>,
 }
 
 /// `PATCH /admin/config` — apply a subset patch to the hot config, validate,
@@ -1702,6 +1737,18 @@ async fn patch_config(
             return Err(RtDbError::bad_request("idempotencyTtlMs must be > 0"));
         }
         next.idempotency_ttl_ms = ttl;
+    }
+    // Quota caps (ENH-011): unsigned types forbid negatives, and 0 means
+    // unlimited (no cap), so there is no lower bound to enforce and no hard
+    // upper ceiling — an operator can set whatever limit they want live.
+    if let Some(cap) = patch.max_tables_per_db {
+        next.max_tables_per_db = cap;
+    }
+    if let Some(cap) = patch.max_storage_bytes_per_db {
+        next.max_storage_bytes_per_db = cap;
+    }
+    if let Some(cap) = patch.max_subs_per_db {
+        next.max_subs_per_db = cap;
     }
     if !next.origins_valid() {
         return Err(RtDbError::bad_request(

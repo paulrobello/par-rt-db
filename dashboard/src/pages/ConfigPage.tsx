@@ -15,6 +15,9 @@ export function ConfigPage() {
   const [ttl, setTtl] = useState("");
   const [maxSize, setMaxSize] = useState("");
   const [dedupTtl, setDedupTtl] = useState("");
+  const [maxTables, setMaxTables] = useState("");
+  const [maxStorage, setMaxStorage] = useState("");
+  const [maxSubs, setMaxSubs] = useState("");
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [savedAt, setSavedAt] = useState(false);
@@ -32,6 +35,9 @@ export function ConfigPage() {
         setTtl(String(c.hot.sessionTtlDays));
         setMaxSize(String(c.hot.maxFileSize));
         setDedupTtl(String(c.hot.idempotencyTtlMs));
+        setMaxTables(String(c.hot.maxTablesPerDb));
+        setMaxStorage(String(c.hot.maxStorageBytesPerDb));
+        setMaxSubs(String(c.hot.maxSubsPerDb));
       })
       .catch((e) => {
         if (!cancelled) setError(e instanceof Error ? e.message : String(e));
@@ -51,6 +57,9 @@ export function ConfigPage() {
     const sessionTtlDays = Number(ttl);
     const maxFileSize = Number(maxSize);
     const idempotencyTtlMs = Number(dedupTtl);
+    const maxTablesPerDb = Number(maxTables);
+    const maxStorageBytesPerDb = Number(maxStorage);
+    const maxSubsPerDb = Number(maxSubs);
     if (!Number.isFinite(sessionTtlDays) || sessionTtlDays < 0) {
       setSaveError("session TTL must be a non-negative number of days");
       setSaving(false);
@@ -66,6 +75,21 @@ export function ConfigPage() {
       setSaving(false);
       return;
     }
+    if (!Number.isFinite(maxTablesPerDb) || maxTablesPerDb < 0) {
+      setSaveError("max tables per db must be a non-negative integer (0 = unlimited)");
+      setSaving(false);
+      return;
+    }
+    if (!Number.isFinite(maxStorageBytesPerDb) || maxStorageBytesPerDb < 0) {
+      setSaveError("max storage per db must be a non-negative byte count (0 = unlimited)");
+      setSaving(false);
+      return;
+    }
+    if (!Number.isFinite(maxSubsPerDb) || maxSubsPerDb < 0) {
+      setSaveError("max subs per db must be a non-negative integer (0 = unlimited)");
+      setSaving(false);
+      return;
+    }
     try {
       const c = await client.patchConfig({
         allowedOrigins: origins
@@ -75,12 +99,18 @@ export function ConfigPage() {
         sessionTtlDays,
         maxFileSize,
         idempotencyTtlMs,
+        maxTablesPerDb,
+        maxStorageBytesPerDb,
+        maxSubsPerDb,
       });
       setCfg(c);
       setOrigins(c.hot.allowedOrigins.join("\n"));
       setTtl(String(c.hot.sessionTtlDays));
       setMaxSize(String(c.hot.maxFileSize));
       setDedupTtl(String(c.hot.idempotencyTtlMs));
+      setMaxTables(String(c.hot.maxTablesPerDb));
+      setMaxStorage(String(c.hot.maxStorageBytesPerDb));
+      setMaxSubs(String(c.hot.maxSubsPerDb));
       setSavedAt(true);
     } catch (e) {
       setSaveError(e instanceof Error ? e.message : String(e));
@@ -145,6 +175,38 @@ export function ConfigPage() {
               mutation dedup window in milliseconds (default 300000 = 5 min)
             </span>
           </label>
+          <div className={s.row}>
+            <label className={s.field}>
+              <span className={s.fieldLabel}>max tables / db</span>
+              <input
+                className={s.input}
+                value={maxTables}
+                onChange={(e) => setMaxTables(e.target.value)}
+                spellCheck={false}
+              />
+              <span className={s.hint}>0 = unlimited</span>
+            </label>
+            <label className={s.field}>
+              <span className={s.fieldLabel}>max storage / db (bytes)</span>
+              <input
+                className={s.input}
+                value={maxStorage}
+                onChange={(e) => setMaxStorage(e.target.value)}
+                spellCheck={false}
+              />
+              <span className={s.hint}>{formatBytes(Number(maxStorage) || 0)}</span>
+            </label>
+            <label className={s.field}>
+              <span className={s.fieldLabel}>max subs / db</span>
+              <input
+                className={s.input}
+                value={maxSubs}
+                onChange={(e) => setMaxSubs(e.target.value)}
+                spellCheck={false}
+              />
+              <span className={s.hint}>0 = unlimited</span>
+            </label>
+          </div>
           <div className={s.actions}>
             <Button variant="primary" onClick={save} disabled={saving}>
               {saving ? "saving…" : "save"}

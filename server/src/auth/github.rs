@@ -425,6 +425,7 @@ mod tests {
             presence_broadcast_interval_ms: 50,
             presence_update_limit_per_sec: 20,
             presence_max_ttl_ms: 300_000,
+            quota_cache_ttl_secs: 60,
         };
         assert!(GithubProvider::from_config(&cfg).is_none());
         cfg.github_client_id = Some("id".into());

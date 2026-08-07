@@ -415,6 +415,28 @@ async fn upload_handler(
         .map_err(|_| RtDbError::bad_request("upload exceeds max file size"))?;
 
     let size = bytes.len() as i64;
+    // ENH-011: enforce per-db storage cap on the blob path. `storage::put`
+    // bypasses the committer (blobs don't touch document tables), so the upload
+    // route is the only place this cap applies to blobs — check `used + size`
+    // (not `enforce`, which would ignore the incoming blob) so a write that
+    // exactly fills to the cap is allowed and one byte over is not. Uniform —
+    // no admin bypass; the bearer above is already authorized.
+    let storage_cap = state.runtime.hot.load().max_storage_bytes_per_db;
+    if storage_cap > 0 {
+        let used = state
+            .quotas
+            .current_usage(&state.pool, &db, state.config.quota_cache_ttl_secs)
+            .await?;
+        if used + (size as u64) > storage_cap {
+            state
+                .runtime
+                .metrics
+                .record_quota_rejection(&db, crate::metrics::QuotaKind::Storage);
+            return Err(RtDbError::quota_exceeded(format!(
+                "upload of {size} bytes would exceed storage quota for db '{db}' ({used} used, limit {storage_cap})"
+            )));
+        }
+    }
     let sha256 = storage::sha256_hex_bytes(&bytes);
     let content_type = headers
         .get(header::CONTENT_TYPE)
@@ -429,6 +451,17 @@ async fn upload_handler(
         &bytes,
     )
     .await?;
+    // ENH-011: best-effort post-upload refresh of the storage cache so the next
+    // check sees fresh bytes. Fire-and-forget — mirrors the committer refresh
+    // spawn; a failure here just leaves the entry stale (TTL-bounded self-heal).
+    {
+        let quotas = state.quotas.clone();
+        let pool = state.pool.clone();
+        let db = db.clone();
+        tokio::spawn(async move {
+            let _ = quotas.refresh(&pool, &db).await;
+        });
+    }
     state.runtime.metrics.record_upload();
     Ok(Json(UploadResponse {
         id,

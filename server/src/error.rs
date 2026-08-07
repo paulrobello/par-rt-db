@@ -14,6 +14,7 @@ pub enum ErrorCode {
     Internal,
     RateLimited,
     Conflict,
+    QuotaExceeded,
 }
 
 /// Optional `Retry-After` hint, in seconds, attached to a `RateLimited` error.
@@ -90,6 +91,13 @@ impl RtDbError {
         Self::new(ErrorCode::Conflict, msg)
     }
 
+    /// A per-database resource quota was exceeded (HTTP 507). Used for
+    /// table-count, storage-byte, and concurrent-subscription caps; the message
+    /// identifies which. Wire code `QUOTA_EXCEEDED`.
+    pub fn quota_exceeded(msg: impl Into<String>) -> Self {
+        Self::new(ErrorCode::QuotaExceeded, msg)
+    }
+
     pub fn status(&self) -> StatusCode {
         match self.code {
             ErrorCode::Unauthorized => StatusCode::UNAUTHORIZED,
@@ -101,6 +109,7 @@ impl RtDbError {
             ErrorCode::Internal => StatusCode::INTERNAL_SERVER_ERROR,
             ErrorCode::RateLimited => StatusCode::TOO_MANY_REQUESTS,
             ErrorCode::Conflict => StatusCode::CONFLICT,
+            ErrorCode::QuotaExceeded => StatusCode::INSUFFICIENT_STORAGE,
         }
     }
 }
@@ -231,5 +240,15 @@ mod tests {
             serde_json::to_value(&err).unwrap(),
             json!({"code": "CONFLICT", "message": "unique index 'i_t_by_email' violated"})
         );
+    }
+
+    #[test]
+    fn quota_exceeded_maps_to_507() {
+        let err = RtDbError::quota_exceeded("db over cap");
+        assert_eq!(err.code, ErrorCode::QuotaExceeded);
+        assert_eq!(err.status(), StatusCode::INSUFFICIENT_STORAGE);
+        let json = serde_json::to_value(&err).unwrap();
+        assert_eq!(json["code"], "QUOTA_EXCEEDED");
+        assert_eq!(json["message"], "db over cap");
     }
 }

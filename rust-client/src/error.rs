@@ -19,6 +19,9 @@ pub enum ErrorCode {
     /// Mirrors server `error::ErrorCode::RateLimited` (HTTP 429). Serialized
     /// `"RATE_LIMITED"`; the carrying envelope includes `retryAfter` when set.
     RateLimited,
+    /// Mirrors server `error::ErrorCode::QuotaExceeded` (HTTP 507). Serialized
+    /// `"QUOTA_EXCEEDED"`.
+    QuotaExceeded,
 }
 
 /// Raw `{code, message, retryAfter?}` as it appears on the wire (HTTP body /

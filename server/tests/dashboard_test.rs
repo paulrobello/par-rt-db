@@ -850,6 +850,9 @@ async fn hot_config_round_trips_through_rtdb_config() -> anyhow::Result<()> {
         session_ttl_days: 7,
         max_file_size: 12345,
         idempotency_ttl_ms: rtdb_server::mutation_log::DEFAULT_DEDUP_TTL_MS,
+        max_tables_per_db: 0,
+        max_storage_bytes_per_db: 0,
+        max_subs_per_db: 0,
     };
     rtdb_server::config::save_hot(&state.pool, &hot).await?;
     let loaded = rtdb_server::config::load_hot(&state.pool, &common::test_hot())
@@ -1310,5 +1313,33 @@ async fn no_static_dir_is_api_only() -> anyhow::Result<()> {
     // API still works.
     let resp = common::admin_get(addr, "/admin/dbs").await;
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    Ok(())
+}
+
+// ENH-011: db_stats exposes the per-db resource caps (tables/storage/subs)
+// alongside live usage so the dashboard can render a usage bar. The caps come
+// from the runtime HotConfig; the storage-used value comes from the existing
+// totalSizeBytes sum; subsUsed comes from SubscriptionManager::count_for_db.
+#[tokio::test]
+async fn db_stats_reports_quota_and_usage() -> anyhow::Result<()> {
+    let state = common::test_state().await;
+    state
+        .runtime
+        .hot
+        .store(std::sync::Arc::new(rtdb_server::config::HotConfig {
+            max_tables_per_db: 9,
+            max_storage_bytes_per_db: 1000,
+            max_subs_per_db: 5,
+            ..common::test_hot()
+        }));
+    let db = common::fresh_db(&state).await;
+    let addr = common::spawn_app(state).await;
+
+    let resp = common::admin_get(addr, &format!("/admin/dbs/{db}/stats")).await;
+    assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(body["tablesQuota"], 9);
+    assert_eq!(body["storageQuotaBytes"], 1000);
+    assert_eq!(body["subsQuota"], 5);
     Ok(())
 }

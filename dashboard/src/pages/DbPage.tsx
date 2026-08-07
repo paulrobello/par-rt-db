@@ -70,6 +70,30 @@ export function DbPage() {
         {stats && (
           <span className={s.total}>
             {formatBytes(stats.totalSizeBytes)} · {formatNumber(stats.tables.length)} tables
+            {stats.storageQuotaBytes > 0 && (
+              <>
+                {" · storage "}
+                {formatBytes(stats.storageUsedBytes)} / {formatBytes(stats.storageQuotaBytes)}
+                {" ("}
+                {Math.min(
+                  100,
+                  Math.round((stats.storageUsedBytes / stats.storageQuotaBytes) * 100),
+                )}
+                %)
+              </>
+            )}
+            {stats.tablesQuota > 0 && (
+              <>
+                {" · tables "}
+                {stats.tablesUsed}/{stats.tablesQuota}
+              </>
+            )}
+            {stats.subsQuota > 0 && (
+              <>
+                {" · subs "}
+                {stats.subsUsed}/{stats.subsQuota}
+              </>
+            )}
           </span>
         )}
       </div>

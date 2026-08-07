@@ -732,6 +732,10 @@ pub mod admin {
         pub session_ttl_days: i64,
         pub max_file_size: i64,
         pub idempotency_ttl_ms: i64,
+        /// Per-db resource quotas (ENH-011); 0 = unlimited. Mirrors server.
+        pub max_tables_per_db: i64,
+        pub max_storage_bytes_per_db: i64,
+        pub max_subs_per_db: i64,
     }
 
     /// `GET /admin/config` response — redacted boot config + hot config + build
@@ -769,6 +773,12 @@ pub mod admin {
         pub max_file_size: Option<i64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub idempotency_ttl_ms: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub max_tables_per_db: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub max_storage_bytes_per_db: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub max_subs_per_db: Option<i64>,
     }
 
     /// One row of `OpEvent` returned by `GET /admin/ops/recent`. `kind` is a

@@ -1,12 +1,15 @@
 import { describe, expect, it, vi } from "vitest";
 import type {
   AuditEntry,
+  HotConfig,
+  HotConfigPatch,
   SubscriptionInfo,
   SubscriptionsResponse,
   Webhook,
   WebhookDelivery,
 } from "../src/admin.js";
 import { RtDbAdminClient } from "../src/admin.js";
+import { RtDbError } from "../src/errors.js";
 import { Migration } from "../src/migration.js";
 import type {
   SchemaHistoryEntry,
@@ -1089,5 +1092,40 @@ describe("RtDbAdminClient subscriptions", () => {
     const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
     await expect(admin.listSubscriptions()).resolves.toEqual(payload);
     expect(fetchMock.mock.calls[0][0]).toBe("http://h:8300/admin/subscriptions");
+  });
+});
+
+describe("HotConfig quota fields (ENH-011)", () => {
+  it("HotConfig carries maxTablesPerDb / maxStorageBytesPerDb / maxSubsPerDb", () => {
+    const hot: HotConfig = {
+      allowedOrigins: [],
+      sessionTtlDays: 30,
+      maxFileSize: 5_242_880,
+      idempotencyTtlMs: 300_000,
+      maxTablesPerDb: 25,
+      maxStorageBytesPerDb: 104_857_600,
+      maxSubsPerDb: 500,
+    };
+    expect(hot.maxTablesPerDb).toBe(25);
+    expect(hot.maxStorageBytesPerDb).toBe(104_857_600);
+    expect(hot.maxSubsPerDb).toBe(500);
+  });
+
+  it("HotConfigPatch makes the quota fields optional (omittable)", () => {
+    const patchOnlyOrigins: HotConfigPatch = { allowedOrigins: ["https://app.x"] };
+    const patchOneQuota: HotConfigPatch = { maxSubsPerDb: 50 };
+    expect(patchOnlyOrigins.maxTablesPerDb).toBeUndefined();
+    expect((patchOneQuota as HotConfigPatch).maxSubsPerDb).toBe(50);
+  });
+
+  it("QUOTA_EXCEEDED is a recognized error code on the wire", () => {
+    // The validator the client actually uses is RtDbError.isEnvelope, which
+    // checks the CODES set. QUOTA_EXCEEDED must be a known code so an envelope
+    // carrying it rebuilds as an RtDbError instead of falling back to INTERNAL.
+    const raw: unknown = { code: "QUOTA_EXCEEDED", message: "too many tables" };
+    expect(RtDbError.isEnvelope(raw)).toBe(true);
+    const e = RtDbError.fromEnvelope(raw as { code: "QUOTA_EXCEEDED"; message: string });
+    expect(e.code).toBe("QUOTA_EXCEEDED");
+    expect(e.message).toBe("too many tables");
   });
 });

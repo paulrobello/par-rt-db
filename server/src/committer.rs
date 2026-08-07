@@ -91,6 +91,8 @@ pub struct Committers {
     ttl_sweep_interval: std::time::Duration,
     ttl_batch: i64,
     metrics: Arc<Metrics>,
+    quotas: Arc<crate::quota::UsageCache>,
+    quota_cache_ttl_secs: u64,
     channels: Mutex<HashMap<String, mpsc::Sender<CommitterRequest>>>,
 }
 
@@ -107,6 +109,8 @@ impl Committers {
         ttl_sweep_interval_secs: u64,
         ttl_batch: i64,
         metrics: Arc<Metrics>,
+        quotas: Arc<crate::quota::UsageCache>,
+        quota_cache_ttl_secs: u64,
     ) -> Self {
         Self {
             pool,
@@ -119,6 +123,8 @@ impl Committers {
             ttl_sweep_interval: std::time::Duration::from_secs(ttl_sweep_interval_secs),
             ttl_batch,
             metrics,
+            quotas,
+            quota_cache_ttl_secs,
             channels: Mutex::new(HashMap::new()),
         }
     }
@@ -203,6 +209,8 @@ impl Committers {
             self.webhooks_enabled,
             self.ttl_batch,
             self.metrics.clone(),
+            self.quotas.clone(),
+            self.quota_cache_ttl_secs,
             rx,
         ));
         tokio::spawn(scheduler::run_scheduler(
@@ -354,6 +362,12 @@ struct CommitterCtx {
     webhooks_enabled: bool,
     ttl_batch: i64,
     metrics: Arc<Metrics>,
+    /// Per-db storage-usage cache (ENH-011). Read on every growing write at the
+    /// three committer arms (`handle_mutate`/`handle_scheduled`/`handle_migrate`);
+    /// refreshed eagerly (post-commit spawn) and lazily (TTL-bounded stale read).
+    quotas: Arc<crate::quota::UsageCache>,
+    /// TTL for `quotas` fresh-cache lookups (mirrors `Config::quota_cache_ttl_secs`).
+    quota_cache_ttl_secs: u64,
 }
 
 /// The per-db committer task loop: processes exactly one `CommitterRequest`
@@ -379,6 +393,8 @@ async fn run_committer(
     webhooks_enabled: bool,
     ttl_batch: i64,
     metrics: Arc<Metrics>,
+    quotas: Arc<crate::quota::UsageCache>,
+    quota_cache_ttl_secs: u64,
     mut rx: mpsc::Receiver<CommitterRequest>,
 ) {
     if let Err(err) = mutation_log::ensure_table(&pool, &db).await {
@@ -398,6 +414,8 @@ async fn run_committer(
         webhooks_enabled,
         ttl_batch,
         metrics,
+        quotas,
+        quota_cache_ttl_secs,
     };
     while let Some(req) = rx.recv().await {
         match req {
@@ -475,6 +493,22 @@ async fn handle_mutate(
     }
 
     let schema = ctx.schemas.get(&ctx.pool, &ctx.db).await?;
+    // ENH-011: enforce per-db storage cap before the first write. Uniform — no
+    // admin bypass — `enforce(cap=0)` is a no-op, so an unset cap is the fast
+    // path. Best-effort post-commit `refresh` keeps the cache honest; a stale
+    // entry would either over-block (until TTL) or under-block (within one
+    // `quota_cache_ttl_secs` window of a write) — over-blocking is the safe side.
+    let storage_cap = ctx.hot.load().max_storage_bytes_per_db;
+    if storage_cap > 0
+        && let Err(e) = ctx
+            .quotas
+            .enforce(&ctx.pool, &ctx.db, storage_cap, ctx.quota_cache_ttl_secs)
+            .await
+    {
+        ctx.metrics
+            .record_quota_rejection(&ctx.db, crate::metrics::QuotaKind::Storage);
+        return Err(e);
+    }
     let outcome = execute_txn(&ctx.pool, &ctx.db, &schema, &txn, &principal_ctx).await?;
     ctx.subs
         .fan_out(&ctx.pool, &ctx.db, &schema, &outcome.write_set)
@@ -534,6 +568,19 @@ async fn handle_mutate(
         }
     }
 
+    // ENH-011: best-effort post-commit refresh of the storage cache so the next
+    // enforce sees fresh bytes. Fire-and-forget — mirrors the audit/webhook tap
+    // spawns; a failure to refresh here just leaves the entry stale (TTL-bounded
+    // self-heal on the next `enforce`).
+    {
+        let quotas = ctx.quotas.clone();
+        let pool = ctx.pool.clone();
+        let db = ctx.db.clone();
+        tokio::spawn(async move {
+            let _ = quotas.refresh(&pool, &db).await;
+        });
+    }
+
     Ok(outcome)
 }
 
@@ -557,6 +604,24 @@ async fn handle_scheduled(
             return Err(err);
         }
     };
+    // ENH-011: enforce per-db storage cap before the scheduled write. A
+    // scheduled job has no interactive principal; on rejection, mirror the
+    // execute_txn-failure path below — record the quota metric, mark the job
+    // row errored (so it surfaces in the scheduler admin UI), and return
+    // `Ok(())` (the scheduler records the error rather than propagating —
+    // fire-and-forget, no caller to surface it to). Uniform — no admin bypass.
+    let storage_cap = ctx.hot.load().max_storage_bytes_per_db;
+    if storage_cap > 0
+        && let Err(e) = ctx
+            .quotas
+            .enforce(&ctx.pool, &ctx.db, storage_cap, ctx.quota_cache_ttl_secs)
+            .await
+    {
+        ctx.metrics
+            .record_quota_rejection(&ctx.db, crate::metrics::QuotaKind::Storage);
+        let _ = scheduler::mark_error(&ctx.pool, &ctx.db, &id, &e.message).await;
+        return Ok(());
+    }
     match execute_txn(&ctx.pool, &ctx.db, &schema, &txn, &PrincipalCtx::bypass()).await {
         Ok(outcome) => {
             ctx.subs
@@ -619,6 +684,17 @@ async fn handle_scheduled(
             };
             if let Err(err) = finalize {
                 tracing::error!(db = %ctx.db, %id, error = %err, "scheduled job finalize failed");
+            }
+            // ENH-011: best-effort post-commit refresh of the storage cache.
+            // Fire-and-forget — mirrors `handle_mutate`. Only on the success
+            // path (an `execute_txn` failure rolled nothing back to refresh).
+            {
+                let quotas = ctx.quotas.clone();
+                let pool = ctx.pool.clone();
+                let db = ctx.db.clone();
+                tokio::spawn(async move {
+                    let _ = quotas.refresh(&pool, &db).await;
+                });
             }
         }
         Err(err) => {
@@ -786,6 +862,25 @@ async fn handle_migrate(
     // schema catches invalid identifiers/types before any DML runs.
     // `plan_migration` folds structurally but does not call `validate`.
     derived.validate()?;
+    derived
+        .check_table_quota(ctx.hot.load().max_tables_per_db)
+        .inspect_err(|_e| {
+            ctx.metrics
+                .record_quota_rejection(&ctx.db, crate::metrics::QuotaKind::Tables);
+        })?;
+    // ENH-011: enforce per-db storage cap before the migration writes. Uniform
+    // — no admin bypass (migrate is admin-only, but a cap applies the same as
+    // any other growing write). `enforce(cap=0)` is a no-op (unset cap).
+    let storage_cap = ctx.hot.load().max_storage_bytes_per_db;
+    if storage_cap > 0 {
+        ctx.quotas
+            .enforce(&ctx.pool, &ctx.db, storage_cap, ctx.quota_cache_ttl_secs)
+            .await
+            .inspect_err(|_e| {
+                ctx.metrics
+                    .record_quota_rejection(&ctx.db, crate::metrics::QuotaKind::Storage);
+            })?;
+    }
 
     let mut tx = ctx.pool.begin().await?;
     let fx = crate::migrate::apply_migration(
@@ -868,6 +963,17 @@ async fn handle_migrate(
                 .await
     {
         tracing::warn!(db = %ctx.db, error = %err, "webhook enqueue failed");
+    }
+    // ENH-011: best-effort post-commit refresh of the storage cache. Fire-and-
+    // forget — mirrors `handle_mutate`/`handle_scheduled`. Only after a real
+    // `apply_migration` commit (`dry_run` rolled back and returned early above).
+    {
+        let quotas = ctx.quotas.clone();
+        let pool = ctx.pool.clone();
+        let db = ctx.db.clone();
+        tokio::spawn(async move {
+            let _ = quotas.refresh(&pool, &db).await;
+        });
     }
 
     Ok(crate::migrate::MigrateResult {
@@ -1005,6 +1111,29 @@ async fn handle_subscribe(
     // table has vanished between execute and register is already a transient
     // error path.
     let table_def = schema.table(&query.table)?;
+
+    // ENH-011: enforce the per-db concurrent-subscription cap (RTDB_MAX_SUBS_PER_DB,
+    // hot-reloadable). Uniform — no admin bypass — because `PrincipalCtx` cannot
+    // distinguish an admin from a machine token at the committer (both arrive as
+    // `PrincipalCtx::bypass()`, `user_id == None`); the db-level gate has already
+    // authorized the connection. Runs before registration so a rejected subscribe
+    // never enters the shard. `count_for_db` is approximate (a concurrent
+    // unsubscribe can drop the count), which is acceptable — the cap is a guard
+    // rail, not an exact budget, and a near-concurrent subscribe still lands within
+    // `cap + (concurrent subscribers)` of the limit.
+    let sub_cap = ctx.hot.load().max_subs_per_db;
+    if sub_cap > 0 {
+        let n = ctx.subs.count_for_db(&ctx.db).await;
+        if n >= sub_cap {
+            ctx.metrics
+                .record_quota_rejection(&ctx.db, crate::metrics::QuotaKind::Subs);
+            return Err(RtDbError::quota_exceeded(format!(
+                "db '{}' has {} active subscription(s), limit is {sub_cap}",
+                ctx.db, n
+            )));
+        }
+    }
+
     ctx.subs
         .register(
             &ctx.db,

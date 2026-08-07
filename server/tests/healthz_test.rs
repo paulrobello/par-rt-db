@@ -58,6 +58,7 @@ fn test_config() -> Config {
         presence_broadcast_interval_ms: 50,
         presence_update_limit_per_sec: 20,
         presence_max_ttl_ms: 300_000,
+        quota_cache_ttl_secs: 60,
     }
 }
 
@@ -67,6 +68,9 @@ fn test_hot() -> HotConfig {
         session_ttl_days: 30,
         max_file_size: 50 * 1024 * 1024,
         idempotency_ttl_ms: rtdb_server::mutation_log::DEFAULT_DEDUP_TTL_MS,
+        max_tables_per_db: 0,
+        max_storage_bytes_per_db: 0,
+        max_subs_per_db: 0,
     }
 }
 

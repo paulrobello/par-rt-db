@@ -2863,7 +2863,10 @@ mod admin_tests {
                     "allowedOrigins": ["https://app.example"],
                     "sessionTtlDays": 30,
                     "maxFileSize": 5242880,
-                    "idempotencyTtlMs": 300000
+                    "idempotencyTtlMs": 300000,
+                    "maxTablesPerDb": 0,
+                    "maxStorageBytesPerDb": 0,
+                    "maxSubsPerDb": 0
                 },
                 "version": "0.1.0",
                 "gitCommit": "abc1234",
@@ -2916,7 +2919,10 @@ mod admin_tests {
                     "allowedOrigins": ["https://x.example"],
                     "sessionTtlDays": 60,
                     "maxFileSize": 5242880,
-                    "idempotencyTtlMs": 300000
+                    "idempotencyTtlMs": 300000,
+                    "maxTablesPerDb": 0,
+                    "maxStorageBytesPerDb": 0,
+                    "maxSubsPerDb": 0
                 },
                 "version": "",
                 "gitCommit": "",
@@ -2929,6 +2935,9 @@ mod admin_tests {
             session_ttl_days: Some(60),
             max_file_size: None,
             idempotency_ttl_ms: None,
+            max_tables_per_db: None,
+            max_storage_bytes_per_db: None,
+            max_subs_per_db: None,
         };
         let cfg = client.patch_config(&patch).await.unwrap();
         assert_eq!(

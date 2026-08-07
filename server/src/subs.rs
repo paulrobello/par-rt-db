@@ -936,6 +936,21 @@ impl SubscriptionManager {
         total
     }
 
+    /// Active subscription count for one database. Same lock discipline as
+    /// [`count`](Self::count): clone the shard `Arc` under the outer lock, drop
+    /// it, then lock the shard — the outer lock is never held while waiting on
+    /// the shard, so this cannot deadlock against `fan_out`/`register`/`remove`.
+    /// Approximate by design (a concurrent subscribe/unsubscribe can shift the
+    /// count by one), which is acceptable for a cap check that runs once per
+    /// subscribe before registration.
+    pub async fn count_for_db(&self, db: &str) -> usize {
+        let shard = { self.subs.lock().await.get(db).cloned() };
+        match shard {
+            Some(s) => s.lock().await.len(),
+            None => 0,
+        }
+    }
+
     /// Snapshot every active subscription for the inspector endpoint
     /// (`GET /admin/subscriptions`), optionally filtered to one db. Same lock
     /// discipline as [`count`](Self::count): clone the matching shard `Arc`s

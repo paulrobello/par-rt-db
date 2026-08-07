@@ -19,6 +19,7 @@ pub mod presence;
 pub mod privacy;
 pub mod protocol;
 pub mod query;
+pub mod quota;
 pub mod rate_limit;
 pub mod reaper;
 pub mod scheduler;
@@ -103,6 +104,9 @@ pub struct AppState {
     /// On-the-fly image transform cache (ENH-014). `Arc` because every storage
     /// serve request shares the one moka cache + concurrency semaphore.
     pub image: Arc<image_transform::TransformCache>,
+    /// Per-db storage-usage cache (ENH-011). `Arc` — read on every growing
+    /// write, refreshed lazily + eagerly.
+    pub quotas: Arc<quota::UsageCache>,
 }
 
 impl AppState {
@@ -118,6 +122,11 @@ impl AppState {
         );
         let op_feed = op_feed::OpFeed::new(1024, 500);
         let hot = Arc::new(ArcSwap::from_pointee(hot));
+        // Per-db storage-usage cache (ENH-011). Built before the committers so
+        // it can be threaded into `Committers::new` (the committer arms enforce
+        // `maxStorageBytesPerDb` on every growing write) and Arc-shared onto
+        // `AppState` for the storage/upload paths.
+        let quotas = Arc::new(quota::UsageCache::new());
         let committers = Committers::new(
             pool.clone(),
             subs.clone(),
@@ -129,6 +138,8 @@ impl AppState {
             config.ttl_sweep_interval_secs,
             config.ttl_batch,
             metrics.clone(),
+            quotas.clone(),
+            config.quota_cache_ttl_secs,
         );
         // Image transform cache shares the same `Arc<Metrics>` as Runtime and
         // the committers so its hit/miss/error counters surface on the dashboard.
@@ -174,6 +185,7 @@ impl AppState {
             rate_limiter: rate_limit::RateLimiter::new(),
             backup_running: Arc::new(AtomicBool::new(false)),
             image,
+            quotas,
         })
     }
 }

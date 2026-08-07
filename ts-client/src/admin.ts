@@ -98,6 +98,10 @@ export interface HotConfig {
   sessionTtlDays: number;
   maxFileSize: number;
   idempotencyTtlMs: number;
+  /** Per-db resource quotas (ENH-011). Zero means "no limit" on the server. */
+  maxTablesPerDb: number;
+  maxStorageBytesPerDb: number;
+  maxSubsPerDb: number;
 }
 export interface ConfigResponse {
   port: number;
@@ -120,6 +124,10 @@ export interface HotConfigPatch {
   sessionTtlDays?: number;
   maxFileSize?: number;
   idempotencyTtlMs?: number;
+  /** Per-db resource quotas (ENH-011). Omit to leave unchanged. */
+  maxTablesPerDb?: number;
+  maxStorageBytesPerDb?: number;
+  maxSubsPerDb?: number;
 }
 export type OpEventKind = "insert" | "patch" | "replace" | "delete" | "upsert";
 export interface OpEvent {

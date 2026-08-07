@@ -775,6 +775,18 @@ impl SchemaDef {
         Ok(())
     }
 
+    /// Reject a schema whose table count exceeds `cap`. `cap == 0` is unlimited.
+    /// Counted as `tables.len()` (user-declared tables only).
+    pub fn check_table_quota(&self, cap: usize) -> Result<(), RtDbError> {
+        if cap > 0 && self.tables.len() > cap {
+            return Err(RtDbError::quota_exceeded(format!(
+                "db has {} table(s), limit is {cap}",
+                self.tables.len()
+            )));
+        }
+        Ok(())
+    }
+
     pub fn table(&self, name: &str) -> Result<&TableDef, RtDbError> {
         self.tables
             .get(name)
