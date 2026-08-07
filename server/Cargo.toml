@@ -26,6 +26,11 @@ rand = "0.8"
 subtle = "2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "cookies"] }
 base64 = "0.22"
+# Sign in with Apple (ENH-001): Apple rejects a static client_secret, so the
+# secret sent to Apple's token endpoint is a short-lived ES256 JWT the server
+# signs with the registered EC private key. 9.x uses `ring` (already in the
+# tree via rustls) as its sole crypto backend — no new native build.
+jsonwebtoken = "9"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 croner = "2"
 # Used by the managed-backup task to parse `postgres://` connection strings
@@ -43,6 +48,10 @@ moka = { version = "0.12", features = ["future"] }
 
 [dev-dependencies]
 anyhow = "1"
+# Test-only: generates an ephemeral P-256 key for the Apple client_secret JWT
+# signing test so no private key lives in the repo. Already compiled transitively
+# (rustls/jsonwebtoken backend); pinning the dev-dep to the in-tree major.
+ring = "0.17"
 tempfile = "3"
 tokio-tungstenite = "0.26"
 futures-util = "0.3"

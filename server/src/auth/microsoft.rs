@@ -10,64 +10,84 @@ use crate::config::Config;
 use crate::db::{new_id, now_ms};
 use crate::error::RtDbError;
 
-/// Generic OpenID Connect provider — one implementation serving any
-/// standards-compliant IdP (Azure AD, Keycloak, Auth0, Okta, self-hosted).
-/// Unlike the per-IdP modules, the authorize/token/userinfo endpoints are not
-/// constants: the operator supplies them from their IdP's
-/// `/.well-known/openid-configuration`. The trait's `authorize_url` is sync, so
-/// it cannot perform live OIDC discovery at request time — endpoints are
-/// configuration rather than discovered per login. The provider is active only
-/// when all five required fields are set; otherwise the routes return 503, like
-/// an unconfigured google/gitlab.
-pub struct OidcProvider {
+/// Microsoft (Entra ID / Azure AD v2.0) OAuth provider. This is OIDC with
+/// well-known endpoint URLs derived from `tenant`, so — unlike the generic
+/// `oidc` provider — the operator supplies credentials + tenant only and never
+/// pastes four discovery URLs. `tenant` defaults to "common" (any Microsoft
+/// account, work/school or personal); a specific tenant GUID/name restricts
+/// the audience to one organization.
+///
+/// Identity is email-keyed (Graph's `/oidc/userinfo` `email`), mirroring the
+/// generic OIDC and Google providers: `email` is UNIQUE and the allowlist key,
+/// so a Microsoft login reuses an existing row if the same person previously
+/// signed in with another provider matching on email. Microsoft's `sub` is not
+/// persisted — consistent with the google/oidc providers and the email-based
+/// authorization model.
+pub struct MicrosoftProvider {
     client_id: String,
     client_secret: String,
-    authorize_url: String,
-    token_url: String,
-    userinfo_url: String,
+    tenant: String,
 }
 
-impl OidcProvider {
+impl MicrosoftProvider {
     fn redirect_uri(&self, public_url: &str) -> String {
-        format!("{public_url}/auth/oidc/callback")
+        format!("{public_url}/auth/microsoft/callback")
     }
+
+    fn authorize_endpoint(&self) -> String {
+        format!(
+            "https://login.microsoftonline.com/{}/oauth2/v2.0/authorize",
+            self.tenant
+        )
+    }
+
+    fn token_endpoint(&self) -> String {
+        format!(
+            "https://login.microsoftonline.com/{}/oauth2/v2.0/token",
+            self.tenant
+        )
+    }
+
+    // Microsoft Graph's OIDC userinfo endpoint — returns a standards-compliant
+    // `{sub, email, name, ...}` payload for an access token minted with the
+    // `openid email profile` scope, uniform across work/school and personal
+    // (MSA) accounts.
+    const USERINFO_ENDPOINT: &'static str = "https://graph.microsoft.com/oidc/userinfo";
 }
 
-/// Normalized identity extracted from the IdP's userinfo response.
-struct OidcIdentity {
+/// Normalized identity extracted from Graph's userinfo response.
+struct MicrosoftIdentity {
     email: String,
     name: Option<String>,
 }
 
 #[async_trait]
-impl OAuthProvider for OidcProvider {
+impl OAuthProvider for MicrosoftProvider {
     fn name() -> &'static str {
-        "oidc"
+        "microsoft"
     }
 
     fn from_config(config: &Config) -> Option<Self> {
-        let client_id = config.oidc_client_id.clone()?;
-        let client_secret = config.oidc_client_secret.clone()?;
-        let authorize_url = config.oidc_authorize_url.clone()?;
-        let token_url = config.oidc_token_url.clone()?;
-        let userinfo_url = config.oidc_userinfo_url.clone()?;
+        let client_id = config.microsoft_client_id.clone()?;
+        let client_secret = config.microsoft_client_secret.clone()?;
         Some(Self {
             client_id,
             client_secret,
-            authorize_url,
-            token_url,
-            userinfo_url,
+            tenant: config.microsoft_tenant.clone(),
         })
     }
 
     fn callback_path(&self) -> &'static str {
-        "/auth/oidc/callback"
+        "/auth/microsoft/callback"
     }
 
     fn authorize_url(&self, redirect_uri: &str, state: &str) -> String {
+        // `response_mode=query` is a supported Microsoft mode, so the existing
+        // GET `provider_callback` generic handles the redirect (no form_post).
         format!(
-            "{}?client_id={}&redirect_uri={redirect_uri}&response_type=code&scope=openid%20email%20profile&state={state}",
-            self.authorize_url, self.client_id,
+            "{}?client_id={}&redirect_uri={redirect_uri}&response_type=code&response_mode=query&scope=openid%20email%20profile&state={state}",
+            self.authorize_endpoint(),
+            self.client_id,
         )
     }
 
@@ -76,31 +96,32 @@ impl OAuthProvider for OidcProvider {
         let redirect_uri = self.redirect_uri(&state.config.public_url);
 
         let token_resp: serde_json::Value = client
-            .post(&self.token_url)
+            .post(self.token_endpoint())
             .form(&TokenExchangeRequest {
                 client_id: &self.client_id,
                 client_secret: &self.client_secret,
                 code,
                 redirect_uri: &redirect_uri,
                 grant_type: "authorization_code",
+                scope: "openid email profile",
             })
             .send()
             .await
             .map_err(|err| {
-                tracing::warn!(error = %err, "oidc token exchange request failed");
-                RtDbError::internal("oidc token exchange failed")
+                tracing::warn!(error = %err, "microsoft token exchange request failed");
+                RtDbError::internal("microsoft token exchange failed")
             })?
             .json()
             .await
             .map_err(|err| {
-                tracing::warn!(error = %err, "oidc token exchange response decode failed");
-                RtDbError::internal("oidc token exchange failed")
+                tracing::warn!(error = %err, "microsoft token exchange response decode failed");
+                RtDbError::internal("microsoft token exchange failed")
             })?;
 
         let access_token = parse_token_response(token_resp)?;
 
         let userinfo: serde_json::Value = client
-            .get(&self.userinfo_url)
+            .get(Self::USERINFO_ENDPOINT)
             .header(
                 reqwest::header::AUTHORIZATION,
                 format!("Bearer {access_token}"),
@@ -108,24 +129,23 @@ impl OAuthProvider for OidcProvider {
             .send()
             .await
             .map_err(|err| {
-                tracing::warn!(error = %err, "oidc userinfo fetch request failed");
-                RtDbError::internal("oidc userinfo fetch failed")
+                tracing::warn!(error = %err, "microsoft userinfo fetch request failed");
+                RtDbError::internal("microsoft userinfo fetch failed")
             })?
             .json()
             .await
             .map_err(|err| {
-                tracing::warn!(error = %err, "oidc userinfo fetch response decode failed");
-                RtDbError::internal("oidc userinfo fetch failed")
+                tracing::warn!(error = %err, "microsoft userinfo fetch response decode failed");
+                RtDbError::internal("microsoft userinfo fetch failed")
             })?;
 
         let identity = parse_userinfo(userinfo)?;
         let email = identity.email.to_lowercase();
 
-        // Identity is email-keyed (UNIQUE; the key the allowlist uses), so an
-        // OIDC login reuses an existing row if the same person previously signed
-        // in with another provider matching on email. The IdP's `sub` is not
-        // persisted, mirroring the google provider — no schema change, identity
-        // aligned with the email-based authorization model.
+        // Email-keyed (UNIQUE; the allowlist key), so a Microsoft login reuses
+        // an existing row if the same person previously signed in with another
+        // provider matching on email. Microsoft's `sub` is not persisted —
+        // mirrors the google/oidc providers and the email-based authz model.
         let login = identity.name.clone().unwrap_or_else(|| email.clone());
         let id = new_id();
         let now = now_ms();
@@ -158,18 +178,20 @@ struct TokenExchangeRequest<'a> {
     code: &'a str,
     redirect_uri: &'a str,
     grant_type: &'a str,
+    scope: &'a str,
 }
 
-/// Extracts the access token from the IdP's token-exchange response. An OIDC
-/// token endpoint returns `{"access_token": "...", ...}` on success and an
-/// `{"error": "..."}` body on failure — the latter is surfaced as a generic
-/// internal error.
+/// Extracts the access token from Microsoft's token-exchange response. The v2.0
+/// token endpoint returns `{"access_token": "...", "id_token": "...", ...}` on
+/// success and an `{"error": "...", "error_description": "..."}` body on
+/// failure — the latter is surfaced as a generic internal error so the OAuth
+/// error text never reaches the response body.
 fn parse_token_response(value: serde_json::Value) -> Result<String, RtDbError> {
     match value.get("access_token").and_then(|v| v.as_str()) {
         Some(token) => Ok(token.to_string()),
         None => {
-            tracing::warn!(response = ?value, "oidc token exchange returned no access_token");
-            Err(RtDbError::internal("oidc token exchange failed"))
+            tracing::warn!(response = ?value, "microsoft token exchange returned no access_token");
+            Err(RtDbError::internal("microsoft token exchange failed"))
         }
     }
 }
@@ -184,15 +206,13 @@ fn is_email_verified(value: &serde_json::Value) -> bool {
     }
 }
 
-/// Parses userinfo into a normalized identity. A present email is required.
-///
-/// Unlike the google provider (which *requires* `email_verified` true), a
-/// generic OIDC IdP's email-verification guarantees vary and many omit
-/// `email_verified` from userinfo entirely. So the gate here is: trust the
-/// configured IdP's assertion unless it explicitly says the email is
-/// unverified (`email_verified: false` rejects). The operator chose this IdP
-/// and is responsible for its verification posture.
-fn parse_userinfo(value: serde_json::Value) -> Result<OidcIdentity, RtDbError> {
+/// Parses Graph userinfo into a normalized identity. A present email is
+/// required. Microsoft work/school emails are administrator-verified and MSA
+/// emails are Microsoft-verified, but Graph does not always emit
+/// `email_verified`; matching the generic OIDC provider's posture, the email is
+/// trusted unless it is explicitly marked unverified (`email_verified: false`
+/// rejects).
+fn parse_userinfo(value: serde_json::Value) -> Result<MicrosoftIdentity, RtDbError> {
     let email = value
         .get("email")
         .and_then(|v| v.as_str())
@@ -207,7 +227,7 @@ fn parse_userinfo(value: serde_json::Value) -> Result<OidcIdentity, RtDbError> {
 
     let name = value.get("name").and_then(|v| v.as_str()).map(String::from);
 
-    Ok(OidcIdentity { email, name })
+    Ok(MicrosoftIdentity { email, name })
 }
 
 #[cfg(test)]
@@ -217,8 +237,13 @@ mod tests {
 
     #[test]
     fn parse_token_response_returns_access_token_on_success() {
-        let resp = json!({"access_token": "eyJabc", "token_type": "Bearer", "expires_in": 3600, "id_token": "x"});
-        assert_eq!(parse_token_response(resp).unwrap(), "eyJabc");
+        let resp = json!({
+            "access_token": "EwAoA-abc",
+            "token_type": "Bearer",
+            "expires_in": 3600,
+            "id_token": "eyJ..."
+        });
+        assert_eq!(parse_token_response(resp).unwrap(), "EwAoA-abc");
     }
 
     #[test]
@@ -230,7 +255,7 @@ mod tests {
     #[test]
     fn parse_userinfo_accepts_verified_boolean_email() {
         let id = parse_userinfo(json!({
-            "sub": "123",
+            "sub": "AAAA",
             "email": "Alice@Example.com",
             "email_verified": true,
             "name": "Alice"
@@ -241,16 +266,8 @@ mod tests {
     }
 
     #[test]
-    fn parse_userinfo_accepts_verified_string_email() {
-        let id =
-            parse_userinfo(json!({"email": "bob@example.com", "email_verified": "true"})).unwrap();
-        assert_eq!(id.email, "bob@example.com");
-        assert!(id.name.is_none());
-    }
-
-    #[test]
     fn parse_userinfo_accepts_absent_verified_flag() {
-        // Many OIDC IdPs omit email_verified from userinfo — trust the IdP.
+        // Graph often omits email_verified — trust Microsoft's assertion.
         let id = parse_userinfo(json!({"sub": "9", "email": "c@x.com", "name": "C"})).unwrap();
         assert_eq!(id.email, "c@x.com");
     }
@@ -268,49 +285,56 @@ mod tests {
     }
 
     #[test]
-    fn authorize_url_uses_configured_endpoint_and_scope() {
-        let provider = OidcProvider {
-            client_id: "oidc-client".into(),
-            client_secret: "oidc-secret".into(),
-            authorize_url: "https://idp.example.com/oauth2/authorize".into(),
-            token_url: "https://idp.example.com/oauth2/token".into(),
-            userinfo_url: "https://idp.example.com/userinfo".into(),
+    fn authorize_url_uses_tenant_endpoint_query_mode_and_scope() {
+        let provider = MicrosoftProvider {
+            client_id: "ms-client".into(),
+            client_secret: "ms-secret".into(),
+            tenant: "common".into(),
         };
-        let url = provider.authorize_url("https://app.example/auth/oidc/callback", "st");
-        assert!(url.starts_with("https://idp.example.com/oauth2/authorize?"));
-        assert!(url.contains("client_id=oidc-client"));
+        let url = provider.authorize_url("https://app.example/auth/microsoft/callback", "st");
+        assert!(url.starts_with("https://login.microsoftonline.com/common/oauth2/v2.0/authorize?"));
+        assert!(url.contains("client_id=ms-client"));
         assert!(url.contains("response_type=code"));
+        assert!(url.contains("response_mode=query"));
         assert!(url.contains("scope=openid%20email%20profile"));
         assert!(url.contains("state=st"));
     }
 
     #[test]
-    fn from_config_requires_all_five_fields() {
+    fn token_and_authorize_endpoints_reflect_a_specific_tenant() {
+        let provider = MicrosoftProvider {
+            client_id: "x".into(),
+            client_secret: "y".into(),
+            tenant: "11111111-2222-3333-4444-555555555555".into(),
+        };
+        assert_eq!(
+            provider.authorize_endpoint(),
+            "https://login.microsoftonline.com/11111111-2222-3333-4444-555555555555/oauth2/v2.0/authorize"
+        );
+        assert_eq!(
+            provider.token_endpoint(),
+            "https://login.microsoftonline.com/11111111-2222-3333-4444-555555555555/oauth2/v2.0/token"
+        );
+    }
+
+    #[test]
+    fn from_config_requires_client_id_and_secret() {
         let mut cfg = base_cfg();
-        assert!(OidcProvider::from_config(&cfg).is_none());
-        cfg.oidc_client_id = Some("id".into());
+        assert!(MicrosoftProvider::from_config(&cfg).is_none());
+        cfg.microsoft_client_id = Some("id".into());
         assert!(
-            OidcProvider::from_config(&cfg).is_none(),
-            "still missing secret+urls"
+            MicrosoftProvider::from_config(&cfg).is_none(),
+            "still missing secret"
         );
-        cfg.oidc_client_secret = Some("secret".into());
-        assert!(
-            OidcProvider::from_config(&cfg).is_none(),
-            "still missing urls"
-        );
-        cfg.oidc_authorize_url = Some("https://idp/authorize".into());
-        cfg.oidc_token_url = Some("https://idp/token".into());
-        assert!(
-            OidcProvider::from_config(&cfg).is_none(),
-            "still missing userinfo url"
-        );
-        cfg.oidc_userinfo_url = Some("https://idp/userinfo".into());
-        assert!(OidcProvider::from_config(&cfg).is_some());
+        cfg.microsoft_client_secret = Some("secret".into());
+        let provider = MicrosoftProvider::from_config(&cfg).expect("configured");
+        // tenant defaults to "common" when RTDB_MICROSOFT_TENANT is unset.
+        assert_eq!(provider.tenant, "common");
     }
 
     /// Minimal `Config` with every OAuth provider unconfigured — shared by the
-    /// `from_config` test. Mirrors the literal `Config { ... }` the google
-    /// provider's test constructs.
+    /// `from_config` test. Mirrors the literal `Config { ... }` the other
+    /// provider tests construct.
     fn base_cfg() -> Config {
         Config {
             port: 0,

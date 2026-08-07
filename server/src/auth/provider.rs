@@ -3,7 +3,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use axum::Json;
 use axum::Router;
-use axum::extract::{Query as QueryParams, State};
+use axum::extract::{Form, Query as QueryParams, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header::SET_COOKIE};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
@@ -17,9 +17,11 @@ use crate::db::{now_ms, random_token};
 use crate::error::RtDbError;
 use crate::protocol::AuthedUser;
 
+use super::apple::AppleProvider;
 use super::github::GithubProvider;
 use super::gitlab::GitlabProvider;
 use super::google::GoogleProvider;
+use super::microsoft::MicrosoftProvider;
 use super::oidc::OidcProvider;
 
 const STATE_TTL_MS: i64 = 10 * 60 * 1000;
@@ -295,6 +297,57 @@ async fn provider_callback<P: OAuthProvider>(
     }
 }
 
+/// `POST /auth/apple/callback`: Apple's `response_mode=form_post` variant of
+/// `provider_callback`. Apple POSTs `code` + `state` (URL-encoded form body) to
+/// the redirect URI instead of appending them as query params, so the GET
+/// generic can't serve it. The flow is otherwise identical: the login-CSRF
+/// nonce cookie (SameSite=None, so it survives Apple's cross-site POST) is
+/// constant-time-checked, the state entry is claimed single-use, and on success
+/// the popup-closing HTML + HttpOnly session cookie are returned exactly as the
+/// GET path returns them.
+async fn apple_callback(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Form(form): Form<AppleCallbackForm>,
+) -> Response {
+    if state.config.oauth_login_csrf {
+        let ok = crate::auth::cookie::oauth_csrf_cookie(&headers)
+            .is_some_and(|c| bool::from(c.as_bytes().ct_eq(form.state.as_bytes())));
+        if !ok {
+            return RtDbError::bad_request("login CSRF check failed").into_response();
+        }
+    }
+
+    if !claim_pending(&state, &form.state).await {
+        return RtDbError::bad_request("invalid or expired state").into_response();
+    }
+
+    let Some(provider) = AppleProvider::from_config(&state.config) else {
+        set_outcome(&state, &form.state, LoginOutcome::Failed).await;
+        return unconfigured_response(AppleProvider::name());
+    };
+
+    let secure = crate::auth::cookie::request_is_secure(&headers);
+    match provider.complete_login(&state, &form.code).await {
+        Ok(token) => {
+            set_outcome(&state, &form.state, LoginOutcome::Completed(token.clone())).await;
+            callback_close_response(&token, secure)
+        }
+        Err(err) => {
+            set_outcome(&state, &form.state, LoginOutcome::Failed).await;
+            err.into_response()
+        }
+    }
+}
+
+/// Apple POSTs the authorization code + state as a URL-encoded form body
+/// (`response_mode=form_post`).
+#[derive(Deserialize)]
+struct AppleCallbackForm {
+    code: String,
+    state: String,
+}
+
 /// The popup-closing HTML the callback returns on success. Nothing is
 /// interpolated (no `origin`, no token) — the token rides the HttpOnly
 /// `Set-Cookie`, so there is no self-XSS surface (SEC-005 fully retired by
@@ -451,6 +504,16 @@ pub fn auth_routes() -> Router<Arc<AppState>> {
             "/auth/oidc/callback",
             get(provider_callback::<OidcProvider>),
         )
+        .route(
+            "/auth/microsoft/begin",
+            get(provider_begin::<MicrosoftProvider>),
+        )
+        .route(
+            "/auth/microsoft/callback",
+            get(provider_callback::<MicrosoftProvider>),
+        )
+        .route("/auth/apple/begin", get(provider_begin::<AppleProvider>))
+        .route("/auth/apple/callback", post(apple_callback))
         .route("/auth/state", get(auth_state))
         .route("/auth/logout", post(logout))
         .route("/auth/me", get(me))

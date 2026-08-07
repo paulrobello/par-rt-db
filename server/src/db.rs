@@ -67,10 +67,27 @@ async fn bootstrap_ddl(conn: &mut PgConnection) -> Result<(), RtDbError> {
         "CREATE TABLE IF NOT EXISTS rtdb_auth.users (
             id text PRIMARY KEY,
             github_id bigint UNIQUE,
+            apple_sub text UNIQUE,
             login text NOT NULL,
             email text UNIQUE,
             created_at bigint NOT NULL
         )",
+    )
+    .execute(&mut *conn)
+    .await?;
+
+    // ENH-001: Apple's stable identifier (`apple_sub`), mirroring `github_id`.
+    // Apple may relay the email through @privaterelay.appleid.com (and rotates
+    // it if the user re-hides), so `sub` is the durable key, not email. The
+    // partial unique index tolerates the many NULLs of non-Apple users.
+    // Idempotent so an existing deployment adds the column on boot; a new
+    // deployment already has it (and the inline UNIQUE) from CREATE TABLE.
+    sqlx::query("ALTER TABLE rtdb_auth.users ADD COLUMN IF NOT EXISTS apple_sub TEXT NULL")
+        .execute(&mut *conn)
+        .await?;
+    sqlx::query(
+        "CREATE UNIQUE INDEX IF NOT EXISTS rtdb_auth_users_apple_sub_key \
+         ON rtdb_auth.users (apple_sub) WHERE apple_sub IS NOT NULL",
     )
     .execute(&mut *conn)
     .await?;

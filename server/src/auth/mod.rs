@@ -1,7 +1,9 @@
+pub mod apple;
 pub mod cookie;
 pub mod github;
 pub mod gitlab;
 pub mod google;
+pub mod microsoft;
 pub mod oidc;
 pub mod provider;
 pub mod session;

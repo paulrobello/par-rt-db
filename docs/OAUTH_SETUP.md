@@ -62,6 +62,8 @@ working with zero providers configured.
 | GitHub | `RTDB_GITHUB_CLIENT_ID` / `RTDB_GITHUB_CLIENT_SECRET` | `RTDB_PUBLIC_URL` + `/auth/callback` | `read:user user:email` |
 | Google | `RTDB_GOOGLE_CLIENT_ID` / `RTDB_GOOGLE_CLIENT_SECRET` | `RTDB_PUBLIC_URL` + `/auth/google/callback` | `openid email profile` |
 | GitLab | `RTDB_GITLAB_CLIENT_ID` / `RTDB_GITLAB_CLIENT_SECRET` | `RTDB_PUBLIC_URL` + `/auth/gitlab/callback` | `read_user email` |
+| Microsoft | `RTDB_MICROSOFT_CLIENT_ID` / `RTDB_MICROSOFT_CLIENT_SECRET` (`_TENANT` optional, default `common`) | `RTDB_PUBLIC_URL` + `/auth/microsoft/callback` | `openid email profile` |
+| Apple | `RTDB_APPLE_CLIENT_ID` / `_TEAM_ID` / `_KEY_ID` / `_PRIVATE_KEY` | `RTDB_PUBLIC_URL` + `/auth/apple/callback` (Apple POSTs via `response_mode=form_post`) | `name email` |
 | OIDC (generic) | `RTDB_OIDC_CLIENT_ID` / `_SECRET` / `_AUTHORIZE_URL` / `_TOKEN_URL` / `_USERINFO_URL` | `RTDB_PUBLIC_URL` + `/auth/oidc/callback` | `openid email profile` |
 
 ---
@@ -200,6 +202,58 @@ par-rt-db requests the `openid email profile` scopes. A present email is
 required; the IdP's verification posture is trusted (an explicit
 `email_verified: false` rejects with `403 "email is not verified"`, but a
 missing `email_verified` is accepted — many IdPs omit it).
+
+---
+
+## Microsoft (Entra ID / Azure AD v2.0)
+
+This is OIDC against Microsoft's well-known endpoints, so unlike the generic
+OIDC provider you supply **credentials + tenant only** — no four-URL paste.
+Register an app in the [Microsoft Entra admin center](https://entra.microsoft.com/)
+(App registrations → New registration), add the web redirect URI
+`$RTDB_PUBLIC_URL/auth/microsoft/callback`, and create a client secret.
+
+- `RTDB_MICROSOFT_CLIENT_ID` — the app (application) client id.
+- `RTDB_MICROSOFT_CLIENT_SECRET` — the app's client secret **value** (not the
+  secret id).
+- `RTDB_MICROSOFT_TENANT` — `common` (default; any Microsoft account, work/school
+  or personal) or a tenant GUID/`organizations`/`consumers` to restrict audience.
+
+The authorize URL uses `response_mode=query`, so the standard GET callback
+handles the redirect. Identity is email-keyed (Microsoft Graph's
+`/oidc/userinfo` `email`), reusing an existing account when the email matches.
+
+## Sign in with Apple
+
+Two protocol-mandated differences from the other providers:
+
+1. **No static client secret.** Apple requires the `client_secret` sent to its
+   token endpoint to be a short-lived **ES256 JWT** signed with the EC private
+   key you register with Apple. par-rt-db generates and signs it per exchange
+   from four config pieces, so you configure a *key*, not a password:
+   - `RTDB_APPLE_CLIENT_ID` — the **Services ID** (not an App ID).
+   - `RTDB_APPLE_TEAM_ID` — your 10-character Apple Developer team id.
+   - `RTDB_APPLE_KEY_ID` — the key id of the Sign in with Apple key you created.
+   - `RTDB_APPLE_PRIVATE_KEY` — the PEM you download with that key. Env stores
+     that can't carry real newlines (most of them) accept `\n`-escaped PEMs;
+     par-rt-db unescapes them.
+
+2. **`response_mode=form_post`.** Apple POSTs `code` + `state` to the redirect
+   URI as a form body rather than query params, so par-rt-db serves Apple's
+   callback with a dedicated `POST /auth/apple/callback` (the `rtdb-oauth-csrf`
+   nonce cookie is `SameSite=None`, so it survives the cross-site POST).
+
+Identity keys on Apple's stable **`sub`** (not email): Apple may relay the email
+through `@privaterelay.appleid.com` and rotate it if a user re-hides their
+address. par-rt-db stores `apple_sub` (mirroring `github_id`) and links to an
+existing account only when the Apple-reported email matches; a hidden-email
+user whose real address exists under another provider gets a separate account
+(the opaque relay address can't be reliably matched). Both real and relay
+emails are accepted.
+
+Register the redirect URI exactly — `$RTDB_PUBLIC_URL/auth/apple/callback` —
+under your Services ID's "Return URLs". Apple does not allow `http`/`localhost`
+redirects in production (Sandbox allows `localhost` for testing).
 
 ---
 

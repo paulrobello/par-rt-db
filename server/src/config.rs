@@ -37,6 +37,24 @@ pub struct Config {
     pub oidc_authorize_url: Option<String>, // RTDB_OIDC_AUTHORIZE_URL
     pub oidc_token_url: Option<String>,     // RTDB_OIDC_TOKEN_URL
     pub oidc_userinfo_url: Option<String>,  // RTDB_OIDC_USERINFO_URL
+    // Microsoft (Entra ID / Azure AD v2.0) OAuth provider. Models on the generic
+    // OIDC provider but derives Microsoft's well-known authorize/token/userinfo
+    // endpoints from `microsoft_tenant`, so the operator supplies credentials +
+    // tenant only (no four-URL paste). RTDB_MICROSOFT_CLIENT_ID /
+    // RTDB_MICROSOFT_CLIENT_SECRET / RTDB_MICROSOFT_TENANT (default "common" =
+    // any Microsoft account; a tenant GUID/name restricts to one org).
+    pub microsoft_client_id: Option<String>, // RTDB_MICROSOFT_CLIENT_ID
+    pub microsoft_client_secret: Option<String>, // RTDB_MICROSOFT_CLIENT_SECRET
+    pub microsoft_tenant: String,            // RTDB_MICROSOFT_TENANT, default "common"
+    // Sign in with Apple. Apple rejects a static client_secret: the secret sent
+    // to Apple's token endpoint is a short-lived ES256 JWT the server signs with
+    // the private key registered with Apple, assembled from four config pieces.
+    // Identity keys on Apple's stable `sub` (see `apple.rs`), because Apple may
+    // relay the email through `@privaterelay.appleid.com`. RTDB_APPLE_* env.
+    pub apple_client_id: Option<String>, // RTDB_APPLE_CLIENT_ID (Services ID)
+    pub apple_team_id: Option<String>,   // RTDB_APPLE_TEAM_ID
+    pub apple_key_id: Option<String>,    // RTDB_APPLE_KEY_ID
+    pub apple_private_key: Option<String>, // RTDB_APPLE_PRIVATE_KEY (PEM, \n-escaped)
     pub max_affected_docs: usize, // RTDB_MAX_AFFECTED_DOCS, default 100 (admin data-browser guardrail)
     pub static_dir: Option<String>, // RTDB_STATIC_DIR — unset/empty ⇒ API-only (no SPA served)
     pub pool_max_connections: u32, // RTDB_POOL_MAX_CONNECTIONS, default 75 (multi-tenant; one committer task + N sub re-runs per db)
@@ -162,6 +180,25 @@ impl Config {
         let oidc_authorize_url = std::env::var("RTDB_OIDC_AUTHORIZE_URL").ok();
         let oidc_token_url = std::env::var("RTDB_OIDC_TOKEN_URL").ok();
         let oidc_userinfo_url = std::env::var("RTDB_OIDC_USERINFO_URL").ok();
+
+        // Microsoft (Entra ID / Azure AD v2.0). `tenant` defaults to "common"
+        // (any Microsoft account); an empty value falls back to that default so
+        // a blank RTDB_MICROSOFT_TENANT isn't interpolated into the endpoint URL.
+        let microsoft_client_id = std::env::var("RTDB_MICROSOFT_CLIENT_ID").ok();
+        let microsoft_client_secret = std::env::var("RTDB_MICROSOFT_CLIENT_SECRET").ok();
+        let microsoft_tenant = match std::env::var("RTDB_MICROSOFT_TENANT") {
+            Ok(v) if !v.trim().is_empty() => v,
+            _ => "common".to_string(),
+        };
+
+        // Sign in with Apple. The private key is a PEM, which can't carry real
+        // newlines through most env stores, so `\n` escapes are unescaped here.
+        let apple_client_id = std::env::var("RTDB_APPLE_CLIENT_ID").ok();
+        let apple_team_id = std::env::var("RTDB_APPLE_TEAM_ID").ok();
+        let apple_key_id = std::env::var("RTDB_APPLE_KEY_ID").ok();
+        let apple_private_key = std::env::var("RTDB_APPLE_PRIVATE_KEY")
+            .ok()
+            .map(|v| v.replace("\\n", "\n"));
 
         let max_affected_docs = match std::env::var("RTDB_MAX_AFFECTED_DOCS") {
             Ok(v) => v.parse::<usize>().unwrap_or(100),
@@ -358,6 +395,13 @@ impl Config {
             oidc_authorize_url,
             oidc_token_url,
             oidc_userinfo_url,
+            microsoft_client_id,
+            microsoft_client_secret,
+            microsoft_tenant,
+            apple_client_id,
+            apple_team_id,
+            apple_key_id,
+            apple_private_key,
             max_affected_docs,
             static_dir,
             pool_max_connections,
