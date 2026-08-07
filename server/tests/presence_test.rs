@@ -225,7 +225,8 @@ async fn ttl_expires_state_to_null_member_remains() {
     let snap = drain_until_snapshot(&mut wb, "doc:1", |n| n == 2).await;
     let members = snap["members"].as_array().unwrap();
     assert_eq!(members.len(), 2, "expiry clears state, not membership");
-    // exactly one member has state null (the expired typing one); the typing flag is gone.
+    // at least one member's state is null (both are: A's typing expired to null,
+    // B joined with no state); the typing flag is gone from every member.
     assert!(members.iter().any(|m| m["state"].is_null()));
     assert!(members.iter().all(|m| m["state"]["typing"] != json!(true)));
 }

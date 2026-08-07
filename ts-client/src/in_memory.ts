@@ -135,8 +135,10 @@ export class PresenceRooms {
    * connection is not in the room (matches the live server, which would not
    * relay an update for a non-member). When `ttlMs` > 0, schedules an expiry
    * sweep that nulls this member's `state` at `now + ttlMs` (the member stays
-   * listed); a refresh without `ttlMs` clears any pending expiry, mirroring the
-   * live server's "ttlMs after the last refresh" semantics. */
+   * listed); a refresh with `ttlMs` absent/0/falsy clears any pending expiry (a
+   * permissive offline approximation — the LIVE SERVER rejects ttlMs <= 0 with
+   * BAD_REQUEST), mirroring the live server's "ttlMs after the last refresh"
+   * semantics for the > 0 case. */
   update(
     room: string,
     connectionId: string,

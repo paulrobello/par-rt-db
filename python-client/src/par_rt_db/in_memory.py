@@ -297,9 +297,11 @@ class PresenceRooms:
 
         When ``ttl_ms`` is an ``int > 0``, schedules an expiry sweep that nulls
         this member's ``state`` at ``now + ttl_ms`` (the member stays listed);
-        ``None`` (or ``<= 0``) clears any pending expiry — parity with the
-        ts/rust harness and the live server's "ttlMs after the last refresh"
-        semantics (ENH-015 follow-up). ``now`` defaults to wall-clock ms."""
+        ``None`` clears any pending expiry, mirroring the live server's "ttlMs
+        after the last refresh" semantics. ``<= 0`` is treated as ``None`` (no
+        expiry) — a permissive offline approximation; the LIVE SERVER rejects
+        ``ttl_ms <= 0`` with BAD_REQUEST (authoritative). ``now`` defaults to
+        wall-clock ms."""
         entries = self._members.get(room)
         if entries is None:
             return

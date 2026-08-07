@@ -255,9 +255,11 @@ impl PresenceRooms {
     /// connection is not in the room (matches the live server, which would not
     /// relay an update for a non-member). When `ttl_ms` is `Some(n)` with `n > 0`,
     /// schedules an expiry sweep that nulls this member's `state` at `now + n`
-    /// (the member stays listed); `None` (or `Some(0)`) clears any pending
-    /// expiry, mirroring the live server's "ttlMs after the last refresh"
-    /// semantics. Mirrors TS `PresenceRooms.update` (ENH-015 presence-ttl).
+    /// (the member stays listed); `None` clears any pending expiry, mirroring the
+    /// live server's "ttlMs after the last refresh" semantics. `Some(<=0)` is
+    /// treated as `None` (no expiry) — a permissive offline approximation; the
+    /// LIVE SERVER rejects ttl_ms <= 0 with BAD_REQUEST. Mirrors TS
+    /// `PresenceRooms.update` (ENH-015 presence-ttl).
     pub fn update(
         &mut self,
         room: &str,
