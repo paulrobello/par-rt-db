@@ -251,20 +251,34 @@ surface); the check runs at `handle_mutate` entry, so nothing partial is written
 
 ## Admin bypass
 
-An admin (`is_admin` at the WS handshake, or admin bearer on
-`/admin/db/{db}/mutate` + `/sync`) **skips all three checks**, reusing the same
-flag that already bypasses `authorize` + per-row `ownerField`. Rationale: the
-operator sets the caps and must not be locked out by their own limits during
-restore/migrate. For a large restore, raise the cap first.
+Split by resource, because the enforcement paths differ:
+
+- **Tables — admin does NOT bypass.** Schema push (`/admin/push-schema`) and
+  migrate (`/admin/db/{db}/migrate`) are both admin-only (`require_admin`), so
+  the tables quota only ever runs on admin paths — admin-bypassing it would be
+  dead code. Like `HARD_MAX_FILE_SIZE`, it is an operator-set guardrail against
+  an oversized schema push (and a check on a compromised admin token), not a
+  tenant-isolation gate. It applies to everyone.
+- **Storage + subs — admin bypasses.** An admin (`is_admin` at the WS handshake,
+  or admin bearer on `/admin/db/{db}/mutate` + `/sync`) skips these two, reusing
+  the same flag that already bypasses `authorize` + per-row `ownerField`.
+  Rationale: operational writes (admin diagnosing/restoring via mutate) and the
+  dashboard's own inspector subscriptions shouldn't self-block against a cap the
+  operator set for tenants; admin is already god-mode. The real growers —
+  regular client mutates, uploads, and client subscriptions — are non-admin and
+  enforced. For a large *non-admin* operation, raise the cap first via
+  `PATCH /admin/config` (instant, no restart).
 
 ## Client mirror
 
 No DSL or wire *frame* changes — enforcement is server-side. Two typed additions
 per client (exact files from the hot-config audit):
 
-- **`QUOTA_EXCEEDED` error code** in the error-code union:
-  `ts-client/src/protocol.ts`, `rust-client/src/wire.rs`,
-  `python-client/src/par_rt_db/wire.py`.
+- **`QUOTA_EXCEEDED` error code** in each client's error-code definition (the
+  authoritative server enum is `server/src/error.rs`; clients mirror it in
+  `ts-client/src/errors.ts`, `rust-client/src/error.rs`,
+  `python-client/src/par_rt_db/errors.py` — note the Python client also has a
+  `_STATUS` code→HTTP map there that needs the `QUOTA_EXCEEDED → 507` entry).
 - **`HotConfig` + `HotConfigPatch`** gain the three fields:
   `ts-client/src/admin.ts:96/118` + `dashboard/src/lib/types.ts:118/226`,
   `rust-client/src/wire.rs:730/763`,
@@ -279,8 +293,14 @@ clients land together or a client PATCH 400s.
   `storageUsedBytes` (and tables/subs usage+cap) so the dashboard renders a usage
   bar — "Storage: 142 MB / 500 MB".
 - The hot-config panel gets the three new editable fields (types mirrored above).
-- One new counter `rtdb_quota_rejections_total{db,kind="tables|storage|subs"}`,
-  surfaced on the metrics page.
+- A new rejection counter, following the existing hand-rolled `Metrics` pattern
+  (`AtomicU64` fields incremented via `record_*`, mirroring `record_subs_skip`):
+  `record_quota_rejection(db, kind)` maintains a per-db breakdown
+  (`Mutex<HashMap<String, QuotaCounters>>`, like `per_db_subs`) exposed in the
+  JSON metrics snapshot + `/admin/subscriptions`, plus an **aggregate-by-kind**
+  total (`rtdb_quota_rejections_total{kind="tables|storage|subs"}`) in the
+  Prometheus scrape. Per-db labels are deliberately kept off the public scrape to
+  avoid cardinality — the same convention `per_db_subs` already follows.
 
 ## Security
 
@@ -289,8 +309,8 @@ clients land together or a client PATCH 400s.
   does. No new interpolation.
 - **Quotas do not weaken auth.** The checks run after the existing `authorize` /
   admin gate; they never replace it.
-- **Admin bypass is deliberate and scoped** to the already-authenticated admin
-  principal (see above).
+- **Admin bypass is deliberate and scoped** — storage + subs only, on the
+  already-authenticated admin principal; tables applies to admin (see above).
 - **No new secrets or tokens.** Config values are operator-set numeric limits,
   surfaced unredacted (not secrets).
 
@@ -302,7 +322,7 @@ clients land together or a client PATCH 400s.
   `dashboard_test.rs:832` (`hot_config_round_trips_through_rtdb_config`). This is
   the test that prevents replaying the prod decode incident.
 - *Tables:* push over cap → rejected; at-cap → ok; `cap=0` → unlimited; migrate
-  over cap → rejected; admin bypass.
+  over cap → rejected; admin is **not** bypassed (tables applies to admin).
 - *Subs:* open > cap subs → Nth rejected, connection stays open; admin bypass;
   `cap=0` unlimited.
 - *Storage:* seed a db, low cap, exceed → 507; cache stale→live re-query; post-
