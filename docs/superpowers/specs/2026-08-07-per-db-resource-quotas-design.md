@@ -251,23 +251,20 @@ surface); the check runs at `handle_mutate` entry, so nothing partial is written
 
 ## Admin bypass
 
-Split by resource, because the enforcement paths differ:
-
-- **Tables — admin does NOT bypass.** Schema push (`/admin/push-schema`) and
-  migrate (`/admin/db/{db}/migrate`) are both admin-only (`require_admin`), so
-  the tables quota only ever runs on admin paths — admin-bypassing it would be
-  dead code. Like `HARD_MAX_FILE_SIZE`, it is an operator-set guardrail against
-  an oversized schema push (and a check on a compromised admin token), not a
-  tenant-isolation gate. It applies to everyone.
-- **Storage + subs — admin bypasses.** An admin (`is_admin` at the WS handshake,
-  or admin bearer on `/admin/db/{db}/mutate` + `/sync`) skips these two, reusing
-  the same flag that already bypasses `authorize` + per-row `ownerField`.
-  Rationale: operational writes (admin diagnosing/restoring via mutate) and the
-  dashboard's own inspector subscriptions shouldn't self-block against a cap the
-  operator set for tenants; admin is already god-mode. The real growers —
-  regular client mutates, uploads, and client subscriptions — are non-admin and
-  enforced. For a large *non-admin* operation, raise the cap first via
-  `PATCH /admin/config` (instant, no restart).
+**No admin bypass for any quota — all three apply uniformly.** This is forced
+by the principal model: at the committer enforcement points (`handle_mutate`,
+`handle_subscribe`) the caller is a `PrincipalCtx`, where admin (the WS admin
+bypass), machine tokens, and scheduled jobs are all structurally identical
+(`user_id == None` via `PrincipalCtx::bypass()`) — admin cannot be told apart
+from a machine token at the enforcement point, so a bypass guard is
+unimplementable there without threading a new flag through the committer API.
+Uniform enforcement is the clean choice and is consistent with the tables cap
+(which is admin-inclusive anyway, since schema push/migrate are admin-only). The
+operator is never truly locked out: any cap is raisable instantly via
+`PATCH /admin/config` (no restart) — raise-before-restore is the workflow for a
+large operation. A scheduled job that would exceed the storage cap is recorded
+as errored via the existing `handle_scheduled` failure path, the correct
+outcome for a config conflict.
 
 ## Client mirror
 
@@ -309,8 +306,8 @@ clients land together or a client PATCH 400s.
   does. No new interpolation.
 - **Quotas do not weaken auth.** The checks run after the existing `authorize` /
   admin gate; they never replace it.
-- **Admin bypass is deliberate and scoped** — storage + subs only, on the
-  already-authenticated admin principal; tables applies to admin (see above).
+- **No admin bypass.** All three quotas apply uniformly to every principal
+  (admin, machine token, user, scheduled job) — see above.
 - **No new secrets or tokens.** Config values are operator-set numeric limits,
   surfaced unredacted (not secrets).
 
@@ -322,12 +319,13 @@ clients land together or a client PATCH 400s.
   `dashboard_test.rs:832` (`hot_config_round_trips_through_rtdb_config`). This is
   the test that prevents replaying the prod decode incident.
 - *Tables:* push over cap → rejected; at-cap → ok; `cap=0` → unlimited; migrate
-  over cap → rejected; admin is **not** bypassed (tables applies to admin).
-- *Subs:* open > cap subs → Nth rejected, connection stays open; admin bypass;
-  `cap=0` unlimited.
+  over cap → rejected.
+- *Subs:* open > cap subs → Nth rejected, connection stays open; `cap=0`
+  unlimited.
 - *Storage:* seed a db, low cap, exceed → 507; cache stale→live re-query; post-
-  write refresh; `storage::put` exceed → 507; admin bypass; delete-db evicts the
-  cache entry; over-quota-at-enable (already-over db blocks growth, reads fine).
+  write refresh; `storage::put` exceed → 507; delete-db evicts the cache entry;
+  over-quota-at-enable (already-over db blocks growth, reads fine); scheduled
+  job over cap → recorded errored.
 - *Metrics:* rejection counter increments per `{kind}`.
 
 **Clients:** `HotConfig` field round-trip in each client's suite; the new error
