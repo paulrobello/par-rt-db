@@ -1379,8 +1379,11 @@ mod tests {
             without_ttl
         );
 
-        // ttlMs: 0 is a real value, not omitted (skip_serializing_if checks
-        // Option::is_none, not falsiness — the server treats 0 as "no ttl").
+        // ttlMs: 0 is a real value on the wire TYPE, not omitted
+        // (skip_serializing_if checks Option::is_none, not falsiness). The live
+        // server REJECTS ttl_ms <= 0 with BAD_REQUEST at the logic layer — the
+        // wire type faithfully carries it (serialization != validation), and the
+        // SDK forwards ttl as-is so the server stays the authoritative validator.
         assert_eq!(
             serde_json::to_value(ClientMessage::PresenceState {
                 room: "doc:1".to_string(),
