@@ -153,6 +153,8 @@ since browsers cannot set headers on a WS handshake.
 | `DELETE /api/storage/{db}/{id}` | Bearer token | Deletes a blob (idempotent; revokes the public URL). |
 | `GET /api/storage/{db}/{id}/metadata` | Bearer token | `{ id, sha256, size, contentType?, creationTime }`. |
 
+Both serve routes honor HTTP `Range` requests: `Range: bytes=...` → `206 Partial Content` with `Content-Range`/`Content-Length` (and `Accept-Ranges: bytes` advertised), `416` for an out-of-bounds range, and a `200` full body when no range is requested. Single-range only; on-the-fly image transforms (`?w=` etc.) skip range handling.
+
 ### Admin: databases, schema, tokens, allowlist
 
 | Method & path | Auth | Description |

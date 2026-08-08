@@ -126,6 +126,14 @@ variants** — the surface is HTTP only:
 - `DELETE /api/storage/{db}/{id}` — bearer → `{ ok: true }` (idempotent; revokes the public URL).
 - `GET /api/storage/{db}/{id}/metadata` — bearer → `{ id, sha256, size, contentType?, creationTime }`.
 
+Both serve routes honor HTTP `Range` requests (`serve_bytes` in `http_api.rs`):
+`Range: bytes=...` → `206 Partial Content` with `Content-Range`/`Content-Length`
+plus `Accept-Ranges: bytes`; an out-of-bounds range → `416 Range Not Satisfiable`
+(`Content-Range: bytes */<total>`); no/ignored range → `200` full body as before.
+Single-range only (multipart/non-`bytes`/malformed ranges are ignored per RFC
+7233). On-the-fly image transforms are cache-keyed whole renders, so `Range` is
+skipped there. Read-path only — no committer, protocol, or WS change.
+
 `{db}` is in the path because the raw upload/serve bodies can't carry it and
 session principals aren't db-scoped. The table is created eagerly in
 `db::create_database` and lazily via `storage::ensure_table` at committer

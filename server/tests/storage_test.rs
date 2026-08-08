@@ -522,3 +522,143 @@ async fn upload_same_bytes_twice_returns_same_id() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+// --- HTTP Range requests on /storage/{id} (RFC 7233 partial content) ---
+
+#[tokio::test]
+async fn range_request_returns_206_partial_content() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let db = fresh_db(&state).await;
+    let token = mint_token(addr, &db).await;
+    let body: Vec<u8> = (0..200u32).map(|i| (i % 256) as u8).collect();
+    let id = upload(&addr, &db, &token, &body).await;
+
+    let resp = reqwest::Client::new()
+        .get(format!("http://{addr}/storage/{id}"))
+        .header("range", "bytes=0-99")
+        .send()
+        .await?;
+    assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        resp.headers().get("content-range").unwrap(),
+        "bytes 0-99/200"
+    );
+    assert_eq!(resp.headers().get("content-length").unwrap(), "100");
+    assert_eq!(resp.headers().get("accept-ranges").unwrap(), "bytes");
+    assert_eq!(resp.bytes().await?, &body[0..100]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn mid_file_open_and_suffix_ranges() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let db = fresh_db(&state).await;
+    let token = mint_token(addr, &db).await;
+    let body: Vec<u8> = (0..200u32).map(|i| (i % 256) as u8).collect();
+    let id = upload(&addr, &db, &token, &body).await;
+
+    let mid = reqwest::Client::new()
+        .get(format!("http://{addr}/storage/{id}"))
+        .header("range", "bytes=50-149")
+        .send()
+        .await?;
+    assert_eq!(mid.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        mid.headers().get("content-range").unwrap(),
+        "bytes 50-149/200"
+    );
+    assert_eq!(mid.bytes().await?, &body[50..150]);
+
+    // Open-ended `150-` through EOF.
+    let open = reqwest::Client::new()
+        .get(format!("http://{addr}/storage/{id}"))
+        .header("range", "bytes=150-")
+        .send()
+        .await?;
+    assert_eq!(open.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        open.headers().get("content-range").unwrap(),
+        "bytes 150-199/200"
+    );
+    assert_eq!(open.bytes().await?, &body[150..200]);
+
+    // Suffix `-20` = the last 20 bytes.
+    let suffix = reqwest::Client::new()
+        .get(format!("http://{addr}/storage/{id}"))
+        .header("range", "bytes=-20")
+        .send()
+        .await?;
+    assert_eq!(suffix.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        suffix.headers().get("content-range").unwrap(),
+        "bytes 180-199/200"
+    );
+    assert_eq!(suffix.bytes().await?, &body[180..200]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn out_of_bounds_range_returns_416() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let db = fresh_db(&state).await;
+    let token = mint_token(addr, &db).await;
+    let body = b"twenty bytes of data";
+    let n = body.len();
+    let id = upload(&addr, &db, &token, body).await;
+
+    let resp = reqwest::Client::new()
+        .get(format!("http://{addr}/storage/{id}"))
+        .header("range", "bytes=100-200")
+        .send()
+        .await?;
+    assert_eq!(resp.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+    assert_eq!(
+        resp.headers().get("content-range").unwrap(),
+        format!("bytes */{n}").as_str()
+    );
+    assert_eq!(resp.headers().get("accept-ranges").unwrap(), "bytes");
+    Ok(())
+}
+
+#[tokio::test]
+async fn no_range_returns_full_200_advertising_accept_ranges() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let db = fresh_db(&state).await;
+    let token = mint_token(addr, &db).await;
+    let payload = b"serve me whole";
+    let id = upload(&addr, &db, &token, payload).await;
+
+    let resp = reqwest::get(format!("http://{addr}/storage/{id}")).await?;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers().get("accept-ranges").unwrap(), "bytes");
+    assert_eq!(resp.bytes().await?, &payload[..]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn range_works_on_authed_serve_route() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let db = fresh_db(&state).await;
+    let token = mint_token(addr, &db).await;
+    let body: Vec<u8> = (0..100u32).map(|i| (i % 256) as u8).collect();
+    let id = upload(&addr, &db, &token, &body).await;
+
+    let resp = reqwest::Client::new()
+        .get(format!("http://{addr}/api/storage/{db}/{id}"))
+        .bearer_auth(&token)
+        .header("range", "bytes=0-9")
+        .send()
+        .await?;
+    assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        resp.headers().get("content-range").unwrap(),
+        "bytes 0-9/100"
+    );
+    assert_eq!(resp.bytes().await?, &body[0..10]);
+    Ok(())
+}

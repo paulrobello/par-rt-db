@@ -6,7 +6,7 @@ use axum::body::Body;
 use axum::extract::{
     ConnectInfo, DefaultBodyLimit, FromRequest, Path, Query as AxumQuery, Request, State,
 };
-use axum::http::{HeaderMap, header};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::Response;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -489,7 +489,8 @@ async fn serve_public_handler(
     let db = storage::resolve_db(&state.pool, &id)
         .await?
         .ok_or_else(|| RtDbError::not_found("unknown file"))?;
-    serve_bytes(&state, &db, &id, &q).await
+    let range = headers.get(header::RANGE).and_then(|v| v.to_str().ok());
+    serve_bytes(&state, &db, &id, &q, range).await
 }
 
 /// Canonical per-IP rate-limit key for an unauthenticated request. The deploy
@@ -528,7 +529,8 @@ async fn serve_authed_handler(
     let principal = resolve_bearer(&state.pool, token).await?;
     authorize(&state.pool, &principal, &db).await?;
     check_http_rate_limits(&state, &principal, &db).await?;
-    serve_bytes(&state, &db, &id, &q).await
+    let range = headers.get(header::RANGE).and_then(|v| v.to_str().ok());
+    serve_bytes(&state, &db, &id, &q, range).await
 }
 
 async fn serve_bytes(
@@ -536,6 +538,7 @@ async fn serve_bytes(
     db: &str,
     id: &str,
     q: &HashMap<String, String>,
+    range_header: Option<&str>,
 ) -> Result<Response, RtDbError> {
     // Immutable: serve URLs are opaque ids (no enumeration), and any change to
     // a stored blob produces a fresh id, so a cached response is always valid.
@@ -547,6 +550,10 @@ async fn serve_bytes(
         Some(_) if !state.image.cfg().enabled => None,
         Some(p) => Some(state.image.get_or_transform(&state.pool, db, id, p).await?),
     };
+    // Range requests apply only to plain blob fetches (no transform params).
+    // Transformed images are cache-keyed as whole renders, so a Range header on
+    // them is ignored and `Accept-Ranges` is not advertised.
+    let supports_range = resolved.is_none();
     let (bytes, content_type) = match resolved {
         Some(Resolved::Transformed(cached)) => (cached.bytes, cached.content_type.to_string()),
         Some(Resolved::Raw {
@@ -563,11 +570,252 @@ async fn serve_bytes(
             )
         }
     };
-    Response::builder()
-        .header(header::CONTENT_TYPE, content_type)
-        .header(header::CACHE_CONTROL, IMMUTABLE)
-        .body(Body::from(bytes))
-        .map_err(|err| RtDbError::internal(format!("failed to build serve response: {err}")))
+    build_serve_response(
+        bytes.to_vec(),
+        &content_type,
+        IMMUTABLE,
+        supports_range,
+        range_header,
+    )
+}
+
+/// The range unit advertised on responses that honor `Range` requests.
+const ACCEPT_RANGES_BYTES: &str = "bytes";
+
+/// Resolved outcome of a `Range: bytes=...` request against a blob of `total`
+/// bytes (RFC 7233).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RangeOutcome {
+    /// No range, or an unsupported/malformed range the server ignores → 200.
+    Full,
+    /// A satisfiable single range, inclusive `start..=end` (already clamped).
+    Partial { start: u64, end: u64 },
+    /// A syntactically valid range whose start is at or past the end → 416.
+    Unsatisfiable,
+}
+
+/// Parse a single `Range: bytes=...` header for a resource of `total` bytes.
+/// Non-`bytes` units, multipart (multi-range) requests, and malformed specs are
+/// ignored → [`RangeOutcome::Full`] (a 200 with the full body): RFC 7233 §2.1
+/// permits an origin server to ignore a Range header it does not support. Only a
+/// range whose start is at or past the resource end is unsatisfiable → 416.
+fn resolve_byte_range(raw: Option<&str>, total: u64) -> RangeOutcome {
+    let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return RangeOutcome::Full;
+    };
+    let Some(spec) = raw.strip_prefix("bytes=") else {
+        return RangeOutcome::Full; // unsupported range unit → ignore
+    };
+    let spec = spec.trim();
+    if spec.contains(',') {
+        return RangeOutcome::Full; // multipart not supported → ignore
+    }
+    let Some(dash) = spec.find('-') else {
+        return RangeOutcome::Full; // no '-' → malformed, ignore
+    };
+    let (start_s, end_s) = (&spec[..dash], &spec[dash + 1..]);
+
+    let (start, end) = if start_s.is_empty() {
+        // Suffix `-N` = the last N bytes.
+        let Ok(n) = end_s.parse::<u64>() else {
+            return RangeOutcome::Full;
+        };
+        if n == 0 || total == 0 {
+            return RangeOutcome::Unsatisfiable;
+        }
+        (total - n.min(total), total - 1)
+    } else {
+        let Ok(start) = start_s.parse::<u64>() else {
+            return RangeOutcome::Full;
+        };
+        if total == 0 || start >= total {
+            return RangeOutcome::Unsatisfiable;
+        }
+        let end = if end_s.is_empty() {
+            total - 1 // `start-` → through the end
+        } else {
+            let Ok(end) = end_s.parse::<u64>() else {
+                return RangeOutcome::Full;
+            };
+            if end < start {
+                return RangeOutcome::Full; // malformed → ignore
+            }
+            end.min(total - 1)
+        };
+        (start, end)
+    };
+    RangeOutcome::Partial { start, end }
+}
+
+/// Build the storage serve response, honoring a `Range` header when
+/// `supports_range` (plain blob fetches only). Transformed-image responses pass
+/// `supports_range = false` — they are cache-keyed as whole renders, so a Range
+/// header is ignored and `Accept-Ranges` is not advertised.
+fn build_serve_response(
+    bytes: Vec<u8>,
+    content_type: &str,
+    cache_control: &str,
+    supports_range: bool,
+    range_header: Option<&str>,
+) -> Result<Response, RtDbError> {
+    let total = bytes.len() as u64;
+    let outcome = if supports_range {
+        resolve_byte_range(range_header, total)
+    } else {
+        RangeOutcome::Full
+    };
+    let result: Result<Response, axum::http::Error> = match outcome {
+        RangeOutcome::Full => {
+            let mut builder = Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, content_type)
+                .header(header::CACHE_CONTROL, cache_control);
+            if supports_range {
+                builder = builder.header(header::ACCEPT_RANGES, ACCEPT_RANGES_BYTES);
+            }
+            builder.body(Body::from(bytes))
+        }
+        RangeOutcome::Partial { start, end } => {
+            let slice = bytes[(start as usize)..=(end as usize)].to_vec();
+            Response::builder()
+                .status(StatusCode::PARTIAL_CONTENT)
+                .header(header::CONTENT_TYPE, content_type)
+                .header(header::CACHE_CONTROL, cache_control)
+                .header(header::ACCEPT_RANGES, ACCEPT_RANGES_BYTES)
+                .header(
+                    header::CONTENT_RANGE,
+                    format!("bytes {start}-{end}/{total}"),
+                )
+                .header(header::CONTENT_LENGTH, slice.len() as u64)
+                .body(Body::from(slice))
+        }
+        RangeOutcome::Unsatisfiable => Response::builder()
+            .status(StatusCode::RANGE_NOT_SATISFIABLE)
+            .header(header::ACCEPT_RANGES, ACCEPT_RANGES_BYTES)
+            .header(header::CONTENT_RANGE, format!("bytes */{total}"))
+            .body(Body::empty()),
+    };
+    result.map_err(|err| RtDbError::internal(format!("failed to build serve response: {err}")))
+}
+
+#[cfg(test)]
+mod range_tests {
+    use super::{RangeOutcome, resolve_byte_range};
+
+    fn partial(start: u64, end: u64) -> RangeOutcome {
+        RangeOutcome::Partial { start, end }
+    }
+
+    #[test]
+    fn no_or_empty_range_is_full() {
+        assert!(matches!(resolve_byte_range(None, 100), RangeOutcome::Full));
+        assert!(matches!(
+            resolve_byte_range(Some(""), 100),
+            RangeOutcome::Full
+        ));
+        assert!(matches!(
+            resolve_byte_range(Some("   "), 100),
+            RangeOutcome::Full
+        ));
+    }
+
+    #[test]
+    fn non_bytes_unit_is_ignored() {
+        assert!(matches!(
+            resolve_byte_range(Some("items=0-99"), 100),
+            RangeOutcome::Full
+        ));
+    }
+
+    #[test]
+    fn multipart_range_is_ignored() {
+        assert!(matches!(
+            resolve_byte_range(Some("bytes=0-1,3-4"), 100),
+            RangeOutcome::Full
+        ));
+    }
+
+    #[test]
+    fn basic_inclusive_range() {
+        assert_eq!(resolve_byte_range(Some("bytes=0-99"), 100), partial(0, 99));
+    }
+
+    #[test]
+    fn open_ended_range() {
+        assert_eq!(resolve_byte_range(Some("bytes=50-"), 100), partial(50, 99));
+    }
+
+    #[test]
+    fn suffix_range() {
+        assert_eq!(resolve_byte_range(Some("bytes=-10"), 100), partial(90, 99));
+    }
+
+    #[test]
+    fn suffix_larger_than_total_is_whole() {
+        assert_eq!(resolve_byte_range(Some("bytes=-200"), 100), partial(0, 99));
+    }
+
+    #[test]
+    fn end_is_clamped_to_total() {
+        assert_eq!(
+            resolve_byte_range(Some("bytes=90-1000"), 100),
+            partial(90, 99)
+        );
+    }
+
+    #[test]
+    fn single_byte_range() {
+        assert_eq!(resolve_byte_range(Some("bytes=0-0"), 100), partial(0, 0));
+        assert_eq!(resolve_byte_range(Some("bytes=5-5"), 100), partial(5, 5));
+    }
+
+    #[test]
+    fn start_at_or_past_end_is_unsatisfiable() {
+        assert!(matches!(
+            resolve_byte_range(Some("bytes=100-"), 100),
+            RangeOutcome::Unsatisfiable
+        ));
+        assert!(matches!(
+            resolve_byte_range(Some("bytes=150-200"), 100),
+            RangeOutcome::Unsatisfiable
+        ));
+    }
+
+    #[test]
+    fn zero_byte_resource_is_unsatisfiable() {
+        assert!(matches!(
+            resolve_byte_range(Some("bytes=0-0"), 0),
+            RangeOutcome::Unsatisfiable
+        ));
+        assert!(matches!(
+            resolve_byte_range(Some("bytes=-5"), 0),
+            RangeOutcome::Unsatisfiable
+        ));
+    }
+
+    #[test]
+    fn zero_length_suffix_is_unsatisfiable() {
+        assert!(matches!(
+            resolve_byte_range(Some("bytes=-0"), 100),
+            RangeOutcome::Unsatisfiable
+        ));
+    }
+
+    #[test]
+    fn malformed_ranges_are_ignored() {
+        assert!(matches!(
+            resolve_byte_range(Some("bytes=5-2"), 100),
+            RangeOutcome::Full
+        ));
+        assert!(matches!(
+            resolve_byte_range(Some("bytes=abc-2"), 100),
+            RangeOutcome::Full
+        ));
+        assert!(matches!(
+            resolve_byte_range(Some("bytes=0_9"), 100),
+            RangeOutcome::Full
+        ));
+    }
 }
 
 #[derive(Serialize)]
