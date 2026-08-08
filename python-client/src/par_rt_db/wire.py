@@ -209,15 +209,17 @@ class AggregateOp:
     """Lowercase aggregate-op wire tags for the ``aggregate`` terminal.
 
     Mirrors ``server/src/query.rs::AggregateOp`` (``#[serde(rename_all =
-    "lowercase")]``) — the four SQL aggregates this terminal can run. A plain
-    class because Python's ``Literal`` already gives us the closed domain; this
-    is just the canonical string constants.
+    "lowercase")]``) — the five SQL aggregates this terminal can run. ``count``
+    aggregates rows and consumes no aggregate field. A plain class because
+    Python's ``Literal`` already gives us the closed domain; this is just the
+    canonical string constants.
     """
 
     SUM = "sum"
     AVG = "avg"
     MIN = "min"
     MAX = "max"
+    COUNT = "count"
 
 
 class AggregateSpec(_Camel):
@@ -225,12 +227,15 @@ class AggregateSpec(_Camel):
 
     ``op`` selects the SQL aggregate run over the index field after the eq
     prefix; ``groupBy`` (camelCase on the wire) shifts the terminal to a grouped
-    aggregate. Mirrors ``server/src/query.rs::AggregateSpec`` byte-for-byte.
-    ``groupBy`` is omitted on the wire when ``False`` (mirrors the TS/Rust
-    clients' skip-when-false convention; the server accepts either form).
+    aggregate. ``count`` aggregates rows and consumes no aggregate field (a
+    scalar ``count`` needs no index at all; a grouped ``count`` needs one index
+    field beyond the eq prefix to group by). Mirrors
+    ``server/src/query.rs::AggregateSpec`` byte-for-byte. ``groupBy`` is omitted
+    on the wire when ``False`` (mirrors the TS/Rust clients' skip-when-false
+    convention; the server accepts either form).
     """
 
-    op: Literal["sum", "avg", "min", "max"]
+    op: Literal["sum", "avg", "min", "max", "count"]
     group_by: bool = False
 
     @model_serializer(mode="wrap")

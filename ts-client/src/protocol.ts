@@ -59,8 +59,11 @@ export interface SearchQuery {
   query: string;
 }
 
-/** Mirrors server `query::AggregateOp` byte-for-byte (lowercase variants). */
-export type AggregateOp = "sum" | "avg" | "min" | "max";
+/** Mirrors server `query::AggregateOp` byte-for-byte (lowercase variants).
+ * `count` aggregates rows (consumes no aggregate field): a scalar `count` is the
+ * number of matching rows; a grouped `count` (`groupBy: true`) is the count per
+ * group. */
+export type AggregateOp = "sum" | "avg" | "min" | "max" | "count";
 
 /** Mirrors server `query::AggregateSpec` byte-for-byte (camelCase, deny_unknown_fields).
  * `groupBy` defaults false — the server emits `false` even when unset (it uses
@@ -164,6 +167,19 @@ export type StepJson =
       eq: unknown[];
       insert: Record<string, unknown>;
       patch: Record<string, unknown>;
+    }
+  | {
+      op: "patchByQuery";
+      table: string;
+      filter: FilterExpr;
+      patch: Record<string, unknown>;
+      limit?: number;
+    }
+  | {
+      op: "deleteByQuery";
+      table: string;
+      filter: FilterExpr;
+      limit?: number;
     };
 
 export interface TransactionJson {

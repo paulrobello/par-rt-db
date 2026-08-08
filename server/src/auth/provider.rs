@@ -7,7 +7,7 @@ use axum::extract::{Form, Query as QueryParams, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header::SET_COOKIE};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 
 use crate::AppState;
@@ -479,6 +479,68 @@ async fn validate(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Res
     }
 }
 
+/// `POST /auth/anonymous`: mints an ephemeral anonymous user + session for a
+/// credential-less guest. The HttpOnly session cookie is set (browser path) AND
+/// the plaintext session token is returned in the body (SDK/bearer path — an
+/// SDK passes it as the WS/HTTP bearer, exactly like a machine token). Gated by
+/// `RTDB_AUTH_ANONYMOUS_ENABLED` (default off): disabled ⇒ 403 FORBIDDEN. An
+/// anonymous user is authorized for any database via that boot gate (no
+/// allowlist entry) and owns its own documents via per-row `ownerField` (the
+/// anon `user_id`). The anon→real merge on a later OAuth sign-in is a follow-up.
+#[derive(Serialize)]
+struct AnonymousResponse {
+    user: AuthedUser,
+    token: String,
+}
+
+async fn anonymous(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if !state.config.auth_anonymous_enabled {
+        return RtDbError::forbidden("anonymous authentication is disabled").into_response();
+    }
+    let user_id = crate::db::new_id();
+    let now = now_ms();
+    // `login` is NOT NULL (store the literal "anonymous"); `email` is UNIQUE but
+    // nullable (NULL for an anon user); `anonymous = TRUE` marks the row.
+    let insert = sqlx::query(
+        "INSERT INTO rtdb_auth.users (id, login, email, anonymous, created_at) \
+         VALUES ($1, $2, NULL, TRUE, $3)",
+    )
+    .bind(&user_id)
+    .bind("anonymous")
+    .bind(now)
+    .execute(&state.pool)
+    .await;
+    if let Err(err) = insert {
+        tracing::error!(error = %err, "anonymous user insert failed");
+        return RtDbError::internal("failed to create anonymous user").into_response();
+    }
+    let ttl_days = state.runtime.hot.load().session_ttl_days;
+    let token = match session::create_session(&state.pool, &user_id, ttl_days).await {
+        Ok(t) => t,
+        Err(err) => return err.into_response(),
+    };
+    let expires_at = now + ttl_days * 86_400_000;
+    let principal = Principal::User {
+        user_id,
+        email: None,
+        name: None,
+        expires_at,
+        anonymous: true,
+        github_id: None,
+        github_login: None,
+    };
+    let secure = crate::auth::cookie::request_is_secure(&headers);
+    let mut response = Json(AnonymousResponse {
+        user: authed_user(&principal),
+        token: token.clone(),
+    })
+    .into_response();
+    if let Ok(cookie) = crate::auth::cookie::set_session_cookie(&token, secure) {
+        response.headers_mut().append(SET_COOKIE, cookie);
+    }
+    response
+}
+
 /// OAuth + session routes. SEC-012: each provider mounts a `begin` endpoint
 /// that returns `{authorizeUrl, state}` (the parent opens it in a `noopener`
 /// popup and polls `/auth/state`); the callback handler is generic over the
@@ -514,6 +576,7 @@ pub fn auth_routes() -> Router<Arc<AppState>> {
         )
         .route("/auth/apple/begin", get(provider_begin::<AppleProvider>))
         .route("/auth/apple/callback", post(apple_callback))
+        .route("/auth/anonymous", post(anonymous))
         .route("/auth/state", get(auth_state))
         .route("/auth/logout", post(logout))
         .route("/auth/me", get(me))

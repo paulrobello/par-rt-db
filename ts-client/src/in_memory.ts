@@ -55,6 +55,9 @@ import type {
 
 const MAX_STEPS = 256;
 const MAX_TAKE = 4096;
+/** Hard cap on rows a single `patchByQuery`/`deleteByQuery` step may touch.
+ * Mirrors server `txn::MAX_BY_QUERY_ROWS`; a larger match set is truncated. */
+const MAX_BY_QUERY_ROWS = 1000;
 
 /** Lowercase a value to FTS-indexable text. Mirrors the text the server feeds
  * into a search index's generated tsvector for a declared field. */
@@ -760,6 +763,10 @@ function compareIndexValues(a: unknown, b: unknown, pg?: PgType): number {
  * arithmetic mean (no rounding). */
 function applyAggregate(op: AggregateOp, values: unknown[], pg?: PgType): unknown {
   switch (op) {
+    case "count":
+      // COUNT(*) over the matching set — consumes no aggregate field, so `pg`
+      // is irrelevant and `values` is one entry per counted row.
+      return values.length;
     case "sum":
       if (pg === "int64") {
         return values.reduce<number>((acc, v) => acc + Number(v), 0);
@@ -1626,6 +1633,23 @@ export class InMemoryRtDbClient {
         this.doUpdate(table, tableDef, row, merged);
         return { result: { id: row.id, inserted: false }, table };
       }
+      case "patchByQuery": {
+        const tableDef = this.requireTable(table);
+        const { rows, truncated } = this.scanByQuery(tableDef, table, step.filter, step.limit);
+        for (const row of rows) {
+          const merged = applyPatch(tableDef, row.doc, step.patch);
+          this.doUpdate(table, tableDef, row, merged);
+        }
+        return { result: { patched: rows.length, truncated }, table };
+      }
+      case "deleteByQuery": {
+        const tableDef = this.requireTable(table);
+        const { rows, truncated } = this.scanByQuery(tableDef, table, step.filter, step.limit);
+        for (const row of rows) {
+          this.rowsFor(table).delete(row.id);
+        }
+        return { result: { deleted: rows.length, truncated }, table };
+      }
     }
   }
 
@@ -1678,6 +1702,31 @@ export class InMemoryRtDbClient {
         `version mismatch: expected ${expected}, actual ${row.version}`,
       );
     }
+  }
+
+  /** Scans `table` for rows matching `filter` (the same `FilterExpr` the read
+   * path uses), ordered by `createdAt` then `id` (server
+   * `ORDER BY "created_at", "id"`), and applies the by-query `limit` (default
+   * and cap `MAX_BY_QUERY_ROWS`). Returns the selected rows and whether the
+   * match set exceeded the limit (`truncated`). Mirrors server
+   * `txn::step_{patch,delete}_by_query`'s scan + `query::compile_scan_where`. */
+  private scanByQuery(
+    tableDef: TableJson,
+    tableName: string,
+    filter: FilterExpr,
+    limitOpt: number | undefined,
+  ): { rows: StoredRow[]; truncated: boolean } {
+    validateFilter(filter, new Set(Object.keys(tableDef.fields)));
+    const limit = Math.min(limitOpt ?? MAX_BY_QUERY_ROWS, MAX_BY_QUERY_ROWS);
+    const matched: StoredRow[] = [];
+    for (const row of this.rowsFor(tableName).values()) {
+      if (evalFilterExpr(filter, row.doc)) {
+        matched.push(row);
+      }
+    }
+    matched.sort((a, b) => a.createdAt - b.createdAt || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+    const truncated = matched.length > limit;
+    return { rows: truncated ? matched.slice(0, limit) : matched, truncated };
   }
 
   /** Shared by `patch`, `replace`, and `upsert`'s patch path: writes the merged
@@ -2189,20 +2238,17 @@ export class InMemoryRtDbClient {
       return values.slice(0, MAX_TAKE);
     }
 
-    // Aggregate terminal: run <OP> (SUM/AVG/MIN/MAX) over the index field
-    // after the eq prefix over the matching set. With `groupBy: true`, groups
-    // by that field and aggregates the next one. Server-side preconditions
-    // (index set, fields beyond prefix, sum/avg numeric) are mirrored here as
+    // Aggregate terminal: run <OP> over the index field after the eq prefix
+    // over the matching set. With `groupBy: true`, groups by that field and
+    // aggregates the next one. `count` aggregates rows (COUNT(*)) and consumes
+    // no aggregate field — a scalar `count` needs no index, a grouped `count`
+    // needs one index field (the group key). Server-side preconditions (index
+    // set, fields beyond prefix, sum/avg numeric) are mirrored here as
     // BAD_REQUEST so the in-memory cascade agrees with the server. Group count
     // is capped by MAX_TAKE. Empty matching set yields null for the scalar
-    // form (server `to_jsonb(SUM(empty))` → SQL NULL → JSON null).
+    // sum/avg/min/max form (server `to_jsonb(SUM(empty))` → SQL NULL → JSON
+    // null); a scalar `count` over zero rows yields 0 (COUNT(*)).
     if (q.aggregate !== undefined) {
-      if (!indexDef) {
-        throw new RtDbError(
-          "BAD_REQUEST",
-          "aggregate requires an index field beyond the eq prefix",
-        );
-      }
       const isNumeric = (fieldName: string): boolean => {
         const ft = tableDef.fields[fieldName];
         // `number` and `int64` are the numeric indexable types; an optional
@@ -2217,32 +2263,47 @@ export class InMemoryRtDbClient {
         return false;
       };
       const { op, groupBy = false } = q.aggregate;
+      // `count` aggregates rows, not a field — it consumes no aggregate index
+      // field (mirrors server `AggregateOp::needs_field`).
+      const needsField = op !== "count";
       if (groupBy) {
-        if (eqLen + 1 >= indexDef.fields.length) {
+        if (!indexDef || eqLen >= indexDef.fields.length) {
           throw new RtDbError(
             "BAD_REQUEST",
-            "aggregate groupBy requires two index fields beyond the eq prefix",
+            "aggregate groupBy requires an index field beyond the eq prefix",
           );
         }
         const groupField = indexDef.fields[eqLen];
-        const aggField = indexDef.fields[eqLen + 1];
         const groupFieldPg = indexColumnType(tableDef.fields[groupField]).pg;
-        const aggFieldPg = indexColumnType(tableDef.fields[aggField]).pg;
-        if ((op === "sum" || op === "avg") && !isNumeric(aggField)) {
-          throw new RtDbError("BAD_REQUEST", `aggregate op ${op} requires a numeric index field`);
+        let aggField: string | undefined;
+        let aggFieldPg: PgType | undefined;
+        if (needsField) {
+          if (eqLen + 1 >= indexDef.fields.length) {
+            throw new RtDbError(
+              "BAD_REQUEST",
+              "aggregate groupBy requires two index fields beyond the eq prefix",
+            );
+          }
+          aggField = indexDef.fields[eqLen + 1];
+          aggFieldPg = indexColumnType(tableDef.fields[aggField]).pg;
+          if ((op === "sum" || op === "avg") && !isNumeric(aggField)) {
+            throw new RtDbError("BAD_REQUEST", `aggregate op ${op} requires a numeric index field`);
+          }
         }
         // Group rows by `groupField` value (skip null/undefined group keys —
         // the server's typed column excludes NULL), preserving first-seen order
         // and then sorting by key ascending for parity with the server's ORDER BY k.
+        // `count` counts rows (one entry per row); else aggregate the field value.
         const groups = new Map<unknown, unknown[]>();
         for (const row of filtered) {
           const k = row.doc[groupField];
           if (k === null || k === undefined) continue;
+          const entry = aggField !== undefined ? row.doc[aggField] : row;
           const existing = groups.get(k);
           if (existing) {
-            existing.push(row.doc[aggField]);
+            existing.push(entry);
           } else {
-            groups.set(k, [row.doc[aggField]]);
+            groups.set(k, [entry]);
           }
         }
         const out = Array.from(groups.entries())
@@ -2251,22 +2312,34 @@ export class InMemoryRtDbClient {
           .slice(0, MAX_TAKE);
         return out;
       }
-      if (eqLen >= indexDef.fields.length) {
-        throw new RtDbError(
-          "BAD_REQUEST",
-          "aggregate requires an index field beyond the eq prefix",
-        );
+      // Scalar: `count` needs no index/field (COUNT(*) over the matching set);
+      // sum/avg/min/max require an aggregate field beyond the eq prefix.
+      if (needsField) {
+        if (!indexDef) {
+          throw new RtDbError(
+            "BAD_REQUEST",
+            "aggregate requires an index field beyond the eq prefix",
+          );
+        }
+        if (eqLen >= indexDef.fields.length) {
+          throw new RtDbError(
+            "BAD_REQUEST",
+            "aggregate requires an index field beyond the eq prefix",
+          );
+        }
+        const aggField = indexDef.fields[eqLen];
+        const aggFieldPg = indexColumnType(tableDef.fields[aggField]).pg;
+        if ((op === "sum" || op === "avg") && !isNumeric(aggField)) {
+          throw new RtDbError("BAD_REQUEST", `aggregate op ${op} requires a numeric index field`);
+        }
+        const values = filtered
+          .map((row) => row.doc[aggField])
+          .filter((v) => v !== null && v !== undefined);
+        // Empty set → null (matches server SUM/AVG/MIN/MAX over zero rows).
+        return values.length === 0 ? null : applyAggregate(op, values, aggFieldPg);
       }
-      const aggField = indexDef.fields[eqLen];
-      const aggFieldPg = indexColumnType(tableDef.fields[aggField]).pg;
-      if ((op === "sum" || op === "avg") && !isNumeric(aggField)) {
-        throw new RtDbError("BAD_REQUEST", `aggregate op ${op} requires a numeric index field`);
-      }
-      const values = filtered
-        .map((row) => row.doc[aggField])
-        .filter((v) => v !== null && v !== undefined);
-      // Empty set → null (matches server SUM/AVG/MIN/MAX over zero rows).
-      return values.length === 0 ? null : applyAggregate(op, values, aggFieldPg);
+      // Scalar count: COUNT(*) over the matching set (0 when empty).
+      return filtered.length;
     }
 
     // Sort keys: unbound index fields (after the eq prefix), then createdAt, id.

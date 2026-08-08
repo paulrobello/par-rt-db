@@ -364,7 +364,7 @@ async def test_overlay_applied_on_mutate_then_reconciled_by_query_update():
 
         results = await asyncio.wait_for(task, 1.0)
         assert results[0] is not None
-        assert results[0].id == "srv1"
+        assert results[0].model_dump()["id"] == "srv1"
     finally:
         await client.close()
 

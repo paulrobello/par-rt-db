@@ -58,6 +58,10 @@ use crate::wire::{
 pub const MAX_STEPS: usize = 256;
 /// Maximum rows returned from a single `take`/`collect` (mirrors the server cap).
 pub const MAX_TAKE: usize = 4096;
+/// Default/cap rows a single `patchByQuery`/`deleteByQuery` step may touch
+/// (mirrors `server/src/txn.rs::MAX_BY_QUERY_ROWS`). A step whose match set
+/// exceeds `limit` touches exactly `limit` and reports `truncated: true`.
+pub const MAX_BY_QUERY_ROWS: u32 = 1000;
 /// Approximate cron re-fire interval for the in-memory stub. Real 5-field cron
 /// parsing is deferred to the server; the harness only needs crons to re-arm.
 pub const CRON_STEP_MS: i64 = 60_000;
@@ -1492,6 +1496,66 @@ impl InMemoryRtDbClient {
                 )
             })?;
             let eq_len = typed_eq.len();
+            // `count` aggregates matching rows and consumes no aggregate field
+            // (mirrors `server/src/query.rs::AggregateOp::needs_field`). Scalar
+            // count = number of matching rows (0 if none, never null); grouped
+            // count = the size of each group.
+            if matches!(agg.op, AggregateOp::Count) {
+                if agg.group_by {
+                    let group_field = idx.fields.get(eq_len).ok_or_else(|| {
+                        RtDbError::new(
+                            ErrorCode::BadRequest,
+                            "aggregate groupBy requires an index field beyond the eq prefix",
+                        )
+                    })?;
+                    let group_field_pg = table_def
+                        .fields
+                        .get(group_field.as_str())
+                        .and_then(|ty| index_column_type(ty).ok())
+                        .map(|it| it.pg)
+                        .unwrap_or(PgType::Text);
+                    let mut groups: Vec<(Value, u64)> = Vec::new();
+                    let mut group_index: HashMap<String, usize> = HashMap::new();
+                    for row in &filtered {
+                        let Some(k) = row.doc.get(group_field.as_str()) else {
+                            continue;
+                        };
+                        if k.is_null() {
+                            continue;
+                        }
+                        let key = k.to_string();
+                        let i = match group_index.get(&key).copied() {
+                            Some(i) => i,
+                            None => {
+                                let i = groups.len();
+                                group_index.insert(key, i);
+                                groups.push((k.clone(), 0));
+                                i
+                            }
+                        };
+                        groups[i].1 += 1;
+                    }
+                    let mut out: Vec<Value> = groups
+                        .into_iter()
+                        .map(|(k, count)| {
+                            let mut obj = Map::new();
+                            obj.insert("key".to_string(), k);
+                            obj.insert(
+                                "value".to_string(),
+                                Value::Number(serde_json::Number::from(count)),
+                            );
+                            Value::Object(obj)
+                        })
+                        .collect();
+                    out.sort_by(|a, b| compare_index_values(&a["key"], &b["key"], group_field_pg));
+                    let out: Vec<Value> = out.into_iter().take(MAX_TAKE).collect();
+                    return Ok(Value::Array(out));
+                }
+                // Scalar count: number of matching rows (0 if none, never null).
+                return Ok(Value::Number(serde_json::Number::from(
+                    filtered.len() as i64
+                )));
+            }
             let (group_field, agg_field) = if agg.group_by {
                 if eq_len + 1 >= idx.fields.len() {
                     return Err(RtDbError::new(
@@ -1523,6 +1587,9 @@ impl InMemoryRtDbClient {
                 AggregateOp::Avg => "avg",
                 AggregateOp::Min => "min",
                 AggregateOp::Max => "max",
+                // Count returns early above; this arm is unreachable but keeps
+                // the match exhaustive as the enum grows.
+                AggregateOp::Count => "count",
             };
             if matches!(agg.op, AggregateOp::Sum | AggregateOp::Avg)
                 && !matches!(agg_field_pg, PgType::Number | PgType::Int64)
@@ -1840,6 +1907,29 @@ impl InMemoryRtDbClient {
                     ))
                 }
             }
+            Step::PatchByQuery {
+                table,
+                filter,
+                patch,
+                limit,
+            } => {
+                let (patched, truncated) = self.patch_by_query(table, filter, patch, *limit)?;
+                Ok((
+                    StepResult::PatchByQuery { patched, truncated },
+                    Some(table.clone()),
+                ))
+            }
+            Step::DeleteByQuery {
+                table,
+                filter,
+                limit,
+            } => {
+                let (deleted, truncated) = self.delete_by_query(table, filter, *limit)?;
+                Ok((
+                    StepResult::DeleteByQuery { deleted, truncated },
+                    Some(table.clone()),
+                ))
+            }
         }
     }
 
@@ -1924,6 +2014,72 @@ impl InMemoryRtDbClient {
             RtDbError::new(ErrorCode::NotFound, format!("document '{id}' not found"))
         })?;
         Ok(())
+    }
+
+    /// Scans `table` for rows matching `filter`, returning their ids ordered by
+    /// `(created_at, id)` — the same order the server uses for
+    /// `patchByQuery`/`deleteByQuery`. Fetches the full match set so a truncation
+    /// is detectable; returns `(ids, truncated)` where `ids` is at most `limit`.
+    /// `limit_opt` defaults to and is clamped by [`MAX_BY_QUERY_ROWS`].
+    fn scan_ids_by_filter(
+        &self,
+        table_def: &TableDef,
+        table: &str,
+        filter: &FilterExpr,
+        limit_opt: Option<u32>,
+    ) -> Result<(Vec<String>, bool), RtDbError> {
+        let fields: BTreeSet<String> = table_def.fields.keys().cloned().collect();
+        validate_filter(filter, &fields)?;
+        let limit = limit_opt
+            .unwrap_or(MAX_BY_QUERY_ROWS)
+            .min(MAX_BY_QUERY_ROWS);
+        let mut matching: Vec<(i64, String)> = self
+            .docs
+            .iter()
+            .filter(|((t, _), _)| t == table)
+            .filter(|(_, row)| matches_filter(filter, &row.doc))
+            .map(|(_, row)| (row.created_at, row.id.clone()))
+            .collect();
+        matching.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        let truncated = matching.len() as u32 > limit;
+        let take = std::cmp::min(matching.len(), limit as usize);
+        let ids: Vec<String> = matching.into_iter().take(take).map(|(_, id)| id).collect();
+        Ok((ids, truncated))
+    }
+
+    /// `patchByQuery` executor: patches every matching row via the same
+    /// `apply_patch` + `do_update` path as a per-id `Patch`. Mirrors
+    /// `server/src/txn.rs::step_patch_by_query`.
+    fn patch_by_query(
+        &mut self,
+        table: &str,
+        filter: &FilterExpr,
+        patch: &Map<String, Value>,
+        limit: Option<u32>,
+    ) -> Result<(u32, bool), RtDbError> {
+        let table_def = self.require_table(table)?.clone();
+        let (ids, truncated) = self.scan_ids_by_filter(&table_def, table, filter, limit)?;
+        for id in &ids {
+            self.do_patch(&table_def, table, id, patch)?;
+        }
+        Ok((ids.len() as u32, truncated))
+    }
+
+    /// `deleteByQuery` executor: deletes every matching row via the same
+    /// `do_delete` path as a per-id `Delete`. Mirrors
+    /// `server/src/txn.rs::step_delete_by_query`.
+    fn delete_by_query(
+        &mut self,
+        table: &str,
+        filter: &FilterExpr,
+        limit: Option<u32>,
+    ) -> Result<(u32, bool), RtDbError> {
+        let table_def = self.require_table(table)?;
+        let (ids, truncated) = self.scan_ids_by_filter(table_def, table, filter, limit)?;
+        for id in &ids {
+            self.do_delete(table, id)?;
+        }
+        Ok((ids.len() as u32, truncated))
     }
 
     /// Asserts a doc's current `_version` matches `expected`. Ports
@@ -3313,6 +3469,10 @@ pub fn apply_aggregate(op: AggregateOp, values: &[Value], pg: PgType) -> Value {
             }
             best.clone()
         }
+        // Count counts rows and is handled by an early return in the aggregate
+        // path (it consumes no field); this arm is for exhaustiveness when the
+        // helper is called directly — it returns the count of provided values.
+        AggregateOp::Count => Value::Number(serde_json::Number::from(values.len() as i64)),
     }
 }
 
@@ -4800,6 +4960,144 @@ mod tests {
         assert_eq!(c.collect_all("items").len(), 1);
     }
 
+    // ---- mutate: patchByQuery / deleteByQuery -----------------------
+
+    #[tokio::test]
+    async fn patch_by_query_patches_every_match_and_reports_count() {
+        let mut c = new_client();
+        seed_query_rows(&mut c).await; // three "todo" rows (orders 3,1,2)
+        let results = c
+            .mutate(
+                &Mutation::new()
+                    .patch_by_query(
+                        "items",
+                        FilterExpr::Eq {
+                            field: "status".into(),
+                            value: json!("todo"),
+                        },
+                        json!({"status": "done"}),
+                        None,
+                    )
+                    .build(),
+                None,
+            )
+            .await
+            .expect("patchByQuery ok");
+        assert_eq!(results.len(), 1);
+        match &results[0] {
+            StepResult::PatchByQuery { patched, truncated } => {
+                assert_eq!(*patched, 3);
+                assert!(!*truncated);
+            }
+            other => panic!("expected PatchByQuery, got {other:?}"),
+        }
+        // Every matching row was patched; no "todo" remains.
+        let docs = c.collect_all("items");
+        assert_eq!(docs.len(), 3);
+        assert!(docs.iter().all(|d| d["status"] == "done"));
+    }
+
+    #[tokio::test]
+    async fn delete_by_query_removes_matches_and_reports_count() {
+        let mut c = new_client();
+        seed_query_rows(&mut c).await; // three "todo" rows
+        let results = c
+            .mutate(
+                &Mutation::new()
+                    .delete_by_query(
+                        "items",
+                        FilterExpr::Eq {
+                            field: "status".into(),
+                            value: json!("todo"),
+                        },
+                        None,
+                    )
+                    .build(),
+                None,
+            )
+            .await
+            .expect("deleteByQuery ok");
+        assert_eq!(results.len(), 1);
+        match &results[0] {
+            StepResult::DeleteByQuery { deleted, truncated } => {
+                assert_eq!(*deleted, 3);
+                assert!(!*truncated);
+            }
+            other => panic!("expected DeleteByQuery, got {other:?}"),
+        }
+        assert!(c.collect_all("items").is_empty());
+    }
+
+    #[tokio::test]
+    async fn patch_by_query_truncates_at_limit() {
+        let mut c = new_client();
+        seed_query_rows(&mut c).await; // three "todo" rows
+        // limit below the match set: patches exactly `limit` and reports
+        // truncated.
+        let results = c
+            .mutate(
+                &Mutation::new()
+                    .patch_by_query(
+                        "items",
+                        FilterExpr::Eq {
+                            field: "status".into(),
+                            value: json!("todo"),
+                        },
+                        json!({"status": "done"}),
+                        Some(2),
+                    )
+                    .build(),
+                None,
+            )
+            .await
+            .expect("patchByQuery ok");
+        match &results[0] {
+            StepResult::PatchByQuery { patched, truncated } => {
+                assert_eq!(*patched, 2);
+                assert!(*truncated, "match set (3) exceeded limit (2)");
+            }
+            other => panic!("expected PatchByQuery, got {other:?}"),
+        }
+        // Two patched, one still "todo".
+        let docs = c.collect_all("items");
+        let done = docs.iter().filter(|d| d["status"] == "done").count();
+        let todo = docs.iter().filter(|d| d["status"] == "todo").count();
+        assert_eq!(done, 2);
+        assert_eq!(todo, 1);
+    }
+
+    #[tokio::test]
+    async fn patch_by_query_zero_matches_reports_zero_not_truncated() {
+        let mut c = new_client();
+        seed_query_rows(&mut c).await;
+        let results = c
+            .mutate(
+                &Mutation::new()
+                    .patch_by_query(
+                        "items",
+                        FilterExpr::Eq {
+                            field: "status".into(),
+                            value: json!("missing"),
+                        },
+                        json!({"status": "done"}),
+                        None,
+                    )
+                    .build(),
+                None,
+            )
+            .await
+            .expect("patchByQuery ok");
+        match &results[0] {
+            StepResult::PatchByQuery { patched, truncated } => {
+                assert_eq!(*patched, 0);
+                assert!(!*truncated);
+            }
+            other => panic!("expected PatchByQuery, got {other:?}"),
+        }
+        // Nothing changed.
+        assert_eq!(c.collect_all("items").len(), 3);
+    }
+
     // ---- mutate: step helpers ----------------------------------------
 
     #[test]
@@ -5948,6 +6246,72 @@ mod tests {
         assert_eq!(arr[0]["value"].as_f64(), Some(7.0));
         assert_eq!(arr[1]["key"].as_str(), Some("todo"));
         assert_eq!(arr[1]["value"].as_f64(), Some(3.0));
+    }
+
+    #[tokio::test]
+    async fn aggregate_count_scalar_returns_matching_row_count() {
+        let mut c = new_client();
+        seed_query_rows(&mut c).await; // three "todo" rows
+        let v = c
+            .run_query(
+                &TableQuery::new("items")
+                    .with_index("by_status_and_order", &[json!("todo")])
+                    .aggregate(AggregateOp::Count, false),
+            )
+            .expect("count ok");
+        assert_eq!(v.as_i64(), Some(3));
+    }
+
+    #[tokio::test]
+    async fn aggregate_count_scalar_empty_matching_set_is_zero() {
+        let mut c = new_client();
+        seed_query_rows(&mut c).await;
+        // count over zero rows is 0 (never null, unlike sum/avg/min/max).
+        let v = c
+            .run_query(
+                &TableQuery::new("items")
+                    .with_index("by_status_and_order", &[json!("missing")])
+                    .aggregate(AggregateOp::Count, false),
+            )
+            .expect("count ok");
+        assert_eq!(v.as_i64(), Some(0));
+    }
+
+    #[tokio::test]
+    async fn aggregate_count_grouped_returns_group_sizes() {
+        let mut c = new_client();
+        seed_group_rows(&mut c).await; // todo{1,2}, done{3,4}
+        let v = c
+            .run_query(
+                &TableQuery::new("items")
+                    .with_index("by_status_and_order", &[])
+                    .aggregate(AggregateOp::Count, true),
+            )
+            .expect("groupBy count ok");
+        let arr = v.as_array().expect("array of {key,value}");
+        assert_eq!(arr.len(), 2);
+        // Ordered by key ascending: "done" < "todo".
+        assert_eq!(arr[0]["key"].as_str(), Some("done"));
+        assert_eq!(arr[0]["value"].as_i64(), Some(2));
+        assert_eq!(arr[1]["key"].as_str(), Some("todo"));
+        assert_eq!(arr[1]["value"].as_i64(), Some(2));
+    }
+
+    #[tokio::test]
+    async fn aggregate_count_consumes_no_aggregate_field() {
+        // count needs no field beyond the eq prefix: by_status [status] with an
+        // empty eq prefix would error for sum/avg ("requires an index field
+        // beyond the eq prefix") but succeeds for count.
+        let mut c = new_client();
+        seed_status_rows(&mut c).await; // three rows
+        let v = c
+            .run_query(
+                &TableQuery::new("items")
+                    .with_index("by_status", &[])
+                    .aggregate(AggregateOp::Count, false),
+            )
+            .expect("count needs no agg field");
+        assert_eq!(v.as_i64(), Some(3));
     }
 
     #[tokio::test]

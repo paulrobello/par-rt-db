@@ -359,9 +359,10 @@ async fn authorize_user_branch_matches_allowlist_case_insensitively() -> anyhow:
 
     let allowed = Principal::User {
         user_id: "u1".to_string(),
-        email: "Probello@Gmail.com".to_string(),
+        email: Some("Probello@Gmail.com".to_string()),
         name: None,
         expires_at: i64::MAX,
+        anonymous: false,
         github_id: None,
         github_login: None,
     };
@@ -371,9 +372,10 @@ async fn authorize_user_branch_matches_allowlist_case_insensitively() -> anyhow:
 
     let not_allowed = Principal::User {
         user_id: "u2".to_string(),
-        email: "someone-else@example.com".to_string(),
+        email: Some("someone-else@example.com".to_string()),
         name: None,
         expires_at: i64::MAX,
+        anonymous: false,
         github_id: None,
         github_login: None,
     };
@@ -501,9 +503,10 @@ async fn authorize_user_branch_rejects_expired_session() -> anyhow::Result<()> {
 
     let expired = Principal::User {
         user_id: "u1".to_string(),
-        email: "probello@gmail.com".to_string(),
+        email: Some("probello@gmail.com".to_string()),
         name: None,
         expires_at: db::now_ms() - 1,
+        anonymous: false,
         github_id: None,
         github_login: None,
     };

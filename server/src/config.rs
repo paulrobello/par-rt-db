@@ -151,6 +151,14 @@ pub struct Config {
     /// RTDB_PRESENCE_MAX_TTL_MS (default 300000 = 5 min). Upper bound on a
     /// client-supplied presenceState ttlMs; over-cap is rejected (no clamping).
     pub presence_max_ttl_ms: u64,
+    /// RTDB_AUTH_ANONYMOUS_ENABLED (default false). Master switch for
+    /// `POST /auth/anonymous`, which mints an ephemeral user + session for a
+    /// credential-less guest. Off ⇒ the endpoint returns 403 FORBIDDEN. An
+    /// anonymous user is authorized for any database via this boot gate (no
+    /// allowlist entry) and owns its own documents via per-row `ownerField`.
+    /// Opt-in like presence, but default-OFF (anonymous access is a per-app
+    /// decision). Boot-only (not hot-reloadable).
+    pub auth_anonymous_enabled: bool,
     /// RTDB_QUOTA_CACHE_TTL_SECS (default 60). TTL for the per-db quota
     /// counters (table count, storage bytes, active subs) maintained by the
     /// enforcement layer (ENH-011). 0 is interpreted as "no caching" by the
@@ -413,6 +421,16 @@ impl Config {
             .unwrap_or(300_000)
             .max(1000);
 
+        // Anonymous auth master switch. Default-OFF (opt-in per app); any of
+        // "false"/"0"/"no" (case-insensitive) disables, everything else (incl.
+        // unset) leaves it off — the inverse of presence_enabled's default-true.
+        let auth_anonymous_enabled = matches!(
+            std::env::var("RTDB_AUTH_ANONYMOUS_ENABLED")
+                .ok()
+                .map(|v| v.trim().to_ascii_lowercase()),
+            Some(v) if !matches!(v.as_str(), "false" | "0" | "no")
+        );
+
         // Quota counter cache TTL (ENH-011). 0 = no caching. An unparseable
         // value falls back to the default, matching the parses above.
         let quota_cache_ttl_secs = match std::env::var("RTDB_QUOTA_CACHE_TTL_SECS") {
@@ -477,6 +495,7 @@ impl Config {
             presence_broadcast_interval_ms,
             presence_update_limit_per_sec,
             presence_max_ttl_ms,
+            auth_anonymous_enabled,
             quota_cache_ttl_secs,
         })
     }

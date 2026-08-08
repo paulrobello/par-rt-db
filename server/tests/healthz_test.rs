@@ -60,6 +60,7 @@ fn test_config() -> Config {
         presence_broadcast_interval_ms: 50,
         presence_update_limit_per_sec: 20,
         presence_max_ttl_ms: 300_000,
+        auth_anonymous_enabled: false,
         quota_cache_ttl_secs: 60,
     }
 }

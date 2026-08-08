@@ -64,6 +64,8 @@ services:
       RTDB_SESSION_TTL_DAYS: ${RTDB_SESSION_TTL_DAYS:-30}
       # Login-CSRF defense (double-submit nonce cookie at OAuth /begin + /callback).
       RTDB_OAUTH_LOGIN_CSRF: ${RTDB_OAUTH_LOGIN_CSRF:-true}
+      # Anonymous auth (off by default). Mirrors the .env.example default.
+      RTDB_AUTH_ANONYMOUS_ENABLED: ${RTDB_AUTH_ANONYMOUS_ENABLED:-false}
       # Webhook delivery registry (off by default). Mirrors SEC-001 SSRF
       # hardening: when enabled, registration requires https + rejects private
       # IP ranges; RTDB_WEBHOOK_ALLOW_HTTP is the dev escape hatch (off).

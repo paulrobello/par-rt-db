@@ -45,6 +45,32 @@ describe("transaction builder", () => {
     expect(mutation().build()).toEqual({ steps: [] });
   });
 
+  it("builds a patchByQuery step (limit omitted when absent, included when set)", () => {
+    const filter = { op: "eq", field: "status", value: "todo" } as const;
+    const noLimit = mutation().patchByQuery("items", filter, { title: "x" }).build();
+    expect(noLimit).toEqual({
+      steps: [{ op: "patchByQuery", table: "items", filter, patch: { title: "x" } }],
+    });
+
+    const withLimit = mutation().patchByQuery("items", filter, { title: "x" }, 50).build();
+    expect(withLimit).toEqual({
+      steps: [{ op: "patchByQuery", table: "items", filter, patch: { title: "x" }, limit: 50 }],
+    });
+  });
+
+  it("builds a deleteByQuery step (limit omitted when absent, included when set)", () => {
+    const filter = { op: "eq", field: "status", value: "done" } as const;
+    const noLimit = mutation().deleteByQuery("items", filter).build();
+    expect(noLimit).toEqual({
+      steps: [{ op: "deleteByQuery", table: "items", filter }],
+    });
+
+    const withLimit = mutation().deleteByQuery("items", filter, 10).build();
+    expect(withLimit).toEqual({
+      steps: [{ op: "deleteByQuery", table: "items", filter, limit: 10 }],
+    });
+  });
+
   it("produces the same JSON step shape when built with a typed schema", () => {
     const schema = defineSchema({
       projects: defineTable({
@@ -128,9 +154,10 @@ describe("parseStepResults", () => {
       null,
     ]);
     // Narrowing smoke checks: the upsert variant carries `inserted`, the plain
-    // variant does not, and null is its own branch — mirroring rust/python.
+    // variant carries only `id` (the by-query `{patched}`/`{deleted}` variants
+    // carry neither), and null is its own branch — mirroring rust/python.
     const [plain, upsertInsert, upsertPatch, noop] = decoded;
-    if (plain && typeof plain === "object" && !("inserted" in plain)) {
+    if (plain && typeof plain === "object" && "id" in plain && !("inserted" in plain)) {
       expect(plain.id).toBe("a");
     } else {
       throw new Error("plain variant did not narrow");
@@ -148,9 +175,42 @@ describe("parseStepResults", () => {
     expect(noop).toBeNull();
   });
 
+  it("decodes {patched, truncated} as a patchByQuery step result", () => {
+    expect(parseStepResults([{ patched: 7, truncated: false }])).toEqual([
+      { patched: 7, truncated: false },
+    ]);
+  });
+
+  it("decodes {deleted, truncated} as a deleteByQuery step result", () => {
+    expect(parseStepResults([{ deleted: 1000, truncated: true }])).toEqual([
+      { deleted: 1000, truncated: true },
+    ]);
+  });
+
+  it("narrows by-query results via 'patched'/'deleted' keys", () => {
+    const [patched, deleted] = parseStepResults([
+      { patched: 3, truncated: false },
+      { deleted: 1, truncated: true },
+    ]);
+    if (patched && typeof patched === "object" && "patched" in patched) {
+      expect(patched.patched).toBe(3);
+      expect(patched.truncated).toBe(false);
+    } else {
+      throw new Error("patchByQuery variant did not narrow");
+    }
+    if (deleted && typeof deleted === "object" && "deleted" in deleted) {
+      expect(deleted.deleted).toBe(1);
+      expect(deleted.truncated).toBe(true);
+    } else {
+      throw new Error("deleteByQuery variant did not narrow");
+    }
+  });
+
   it("throws RtDbError on a shape the server contract does not permit", () => {
     expect(() => parseStepResults([{ noId: true }])).toThrow(RtDbError);
     expect(() => parseStepResults(["not-an-object"])).toThrow(RtDbError);
     expect(() => parseStepResults([{ id: 123 }])).toThrow(RtDbError);
+    expect(() => parseStepResults([{ patched: 1 }])).toThrow(RtDbError); // missing truncated
+    expect(() => parseStepResults([{ deleted: "x", truncated: false }])).toThrow(RtDbError);
   });
 });

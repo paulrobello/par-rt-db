@@ -35,6 +35,14 @@ def _inserted(res: StepResult) -> bool:
     return bool(res.model_dump().get("inserted"))
 
 
+def _id_of(res: StepResult) -> str:
+    """Extract the ``id`` of an insert/upsert ``StepResult`` via ``model_dump``
+    (the union also carries ``patchByQuery``/``deleteByQuery`` shapes with no
+    ``id``, so attribute access does not type-check)."""
+    assert res is not None
+    return str(res.model_dump()["id"])
+
+
 def _test_schema() -> Any:
     """The ``items`` schema mirrored from the Rust/TS harnesses."""
     return (
@@ -204,12 +212,12 @@ def test_insert_merges_system_fields_at_read_time() -> None:
         Mutation.builder().insert("items", {"name": "a", "status": "todo", "order": 1}).build()
     )
     assert res is not None
-    assert is_hex_id(res.id)
-    doc = c.run_query(TableQuery("items").get(res.id).build())
+    assert is_hex_id(_id_of(res))
+    doc = c.run_query(TableQuery("items").get(_id_of(res)).build())
     assert doc["name"] == "a"
     assert doc["status"] == "todo"
     assert doc["order"] == 1
-    assert doc["_id"] == res.id
+    assert doc["_id"] == _id_of(res)
     assert doc["_version"] == 1
     assert isinstance(doc["_creationTime"], int)
 
@@ -222,7 +230,7 @@ def test_insert_strips_optional_field_set_to_null() -> None:
         .build()
     )
     assert res is not None
-    doc = c.run_query(TableQuery("items").get(res.id).build())
+    doc = c.run_query(TableQuery("items").get(_id_of(res)).build())
     assert "note" not in doc  # null optional is stored as "key absent"
 
 
@@ -330,10 +338,10 @@ def test_unique_index_patch_collision_raises_conflict() -> None:
     [r2] = c.mutate(Mutation.builder().insert("users", {"email": "b@x", "status": "on"}).build())
     assert r1 is not None and r2 is not None
     with pytest.raises(RtDbError) as ei:
-        c.mutate(Mutation.builder().patch("users", r2.id, {"email": "a@x"}).build())
+        c.mutate(Mutation.builder().patch("users", _id_of(r2), {"email": "a@x"}).build())
     assert ei.value.code is ErrorCode.CONFLICT
     # r2 kept its original email (write rolled back).
-    patched = c.get("users", r2.id)
+    patched = c.get("users", _id_of(r2))
     assert patched is not None and patched["email"] == "b@x"
 
 
@@ -344,10 +352,12 @@ def test_unique_index_replace_collision_raises_conflict() -> None:
     assert r1 is not None and r2 is not None
     with pytest.raises(RtDbError) as ei:
         c.mutate(
-            Mutation.builder().replace("users", r2.id, {"email": "a@x", "status": "off"}).build()
+            Mutation.builder()
+            .replace("users", _id_of(r2), {"email": "a@x", "status": "off"})
+            .build()
         )
     assert ei.value.code is ErrorCode.CONFLICT
-    replaced = c.get("users", r2.id)
+    replaced = c.get("users", _id_of(r2))
     assert replaced is not None and replaced["email"] == "b@x"
 
 
@@ -467,7 +477,7 @@ def _seed_query_rows(c: InMemoryRtDbClient) -> list[str]:
             .build()
         )
         assert res is not None
-        ids.append(res.id)
+        ids.append(_id_of(res))
     return ids
 
 
@@ -728,6 +738,67 @@ def test_aggregate_group_by_groups_and_aggregates() -> None:
     assert v == [{"key": "done", "value": 7}, {"key": "todo", "value": 3}]
 
 
+def test_aggregate_count_scalar_returns_row_count() -> None:
+    # `count` aggregates rows (COUNT(*)) and consumes no aggregate field; a
+    # scalar count needs no index field beyond the eq prefix.
+    c = _new_client()
+    _seed_orders(c, [3, 1, 2])
+    assert (
+        c.run_query(
+            TableQuery("items")
+            .with_index("by_status_and_order")
+            .eq("todo")
+            .aggregate("count")
+            .build()
+        )
+        == 3
+    )
+
+
+def test_aggregate_count_scalar_over_empty_set_is_zero() -> None:
+    # Unlike the field-bearing ops (which yield None over an empty set), count
+    # returns 0.
+    c = _new_client()
+    _seed_orders(c, [1])
+    assert (
+        c.run_query(
+            TableQuery("items")
+            .with_index("by_status_and_order")
+            .eq("missing")
+            .aggregate("count")
+            .build()
+        )
+        == 0
+    )
+
+
+def test_aggregate_count_scalar_needs_no_index() -> None:
+    # A scalar count with no index counts every row in the table.
+    c = _new_client()
+    _seed_orders(c, [1, 2])
+    _seed_orders(c, [3], status="done")
+    assert c.run_query(TableQuery("items").aggregate("count").build()) == 3
+
+
+def test_aggregate_count_grouped_returns_count_per_group() -> None:
+    # A grouped count needs one index field beyond the eq prefix to group by;
+    # it returns the row count per group.
+    c = _new_client()
+    for status, order in [("todo", 1), ("todo", 2), ("done", 3), ("done", 4), ("done", 5)]:
+        c.mutate(
+            Mutation.builder()
+            .insert("items", {"name": "n", "status": status, "order": order})
+            .build()
+        )
+    v = c.run_query(
+        TableQuery("items")
+        .with_index("by_status_and_order")
+        .aggregate("count", group_by=True)
+        .build()
+    )
+    assert v == [{"key": "done", "value": 3}, {"key": "todo", "value": 2}]
+
+
 def test_aggregate_group_by_requires_two_index_fields_beyond_prefix() -> None:
     c = _new_client()
     with pytest.raises(RtDbError) as ei:
@@ -789,8 +860,8 @@ def test_patch_updates_a_field_and_bumps_version() -> None:
         Mutation.builder().insert("items", {"name": "a", "status": "todo", "order": 1}).build()
     )
     assert res is not None
-    c.mutate(Mutation.builder().patch("items", res.id, {"status": "done"}).build())
-    doc = c.run_query(TableQuery("items").get(res.id).build())
+    c.mutate(Mutation.builder().patch("items", _id_of(res), {"status": "done"}).build())
+    doc = c.run_query(TableQuery("items").get(_id_of(res)).build())
     assert doc["status"] == "done"
     assert doc["_version"] == 2
 
@@ -803,10 +874,10 @@ def test_replace_overwrites_the_whole_doc() -> None:
     assert res is not None
     c.mutate(
         Mutation.builder()
-        .replace("items", res.id, {"name": "a2", "status": "done", "order": 9})
+        .replace("items", _id_of(res), {"name": "a2", "status": "done", "order": 9})
         .build()
     )
-    doc = c.run_query(TableQuery("items").get(res.id).build())
+    doc = c.run_query(TableQuery("items").get(_id_of(res)).build())
     assert doc["name"] == "a2"
     assert doc["order"] == 9
     assert doc["_version"] == 2
@@ -818,8 +889,8 @@ def test_delete_removes_the_doc() -> None:
         Mutation.builder().insert("items", {"name": "a", "status": "todo", "order": 1}).build()
     )
     assert res is not None
-    c.mutate(Mutation.builder().delete("items", res.id).build())
-    assert c.run_query(TableQuery("items").get(res.id).build()) is None
+    c.mutate(Mutation.builder().delete("items", _id_of(res)).build())
+    assert c.run_query(TableQuery("items").get(_id_of(res)).build()) is None
 
 
 def test_delete_unknown_id_is_not_found() -> None:
@@ -827,6 +898,87 @@ def test_delete_unknown_id_is_not_found() -> None:
     with pytest.raises(RtDbError) as ei:
         c.mutate(Mutation.builder().delete("items", "deadbeef").build())
     assert ei.value.code is ErrorCode.NOT_FOUND
+
+
+def _flt(expr: dict[str, object]) -> Any:
+    from par_rt_db.wire import FilterExpr
+
+    return TypeAdapter(FilterExpr).validate_python(expr)
+
+
+def test_patch_by_query_patches_matching_rows_and_reports_count() -> None:
+    c = _new_client()
+    for status in ("todo", "todo", "done"):
+        c.mutate(
+            Mutation.builder().insert("items", {"name": "n", "status": status, "order": 1}).build()
+        )
+    flt = _flt({"op": "eq", "field": "status", "value": "todo"})
+    [res] = c.mutate(Mutation.builder().patch_by_query("items", flt, {"status": "done"}).build())
+    assert res is not None
+    assert res.model_dump(by_alias=True, mode="json") == {"patched": 2, "truncated": False}
+    # All rows are now done.
+    docs = c.run_query(TableQuery("items").build())
+    assert all(d["status"] == "done" for d in docs)
+    # The two patched rows bumped to version 2; the already-done row stays at 1.
+    assert sorted(d["_version"] for d in docs) == [1, 2, 2]
+
+
+def test_patch_by_query_truncates_at_limit() -> None:
+    c = _new_client()
+    for _ in range(3):
+        c.mutate(
+            Mutation.builder().insert("items", {"name": "n", "status": "todo", "order": 1}).build()
+        )
+    flt = _flt({"op": "eq", "field": "status", "value": "todo"})
+    [res] = c.mutate(Mutation.builder().patch_by_query("items", flt, {"order": 9}, limit=2).build())
+    assert res is not None
+    dumped = res.model_dump(by_alias=True, mode="json")
+    assert dumped["patched"] == 2
+    assert dumped["truncated"] is True
+    # Exactly 2 patched (order 9) + 1 untouched (order 1).
+    docs = c.run_query(TableQuery("items").build())
+    assert sum(1 for d in docs if d["order"] == 9) == 2
+
+
+def test_patch_by_query_no_matches_reports_zero() -> None:
+    c = _new_client()
+    c.mutate(
+        Mutation.builder().insert("items", {"name": "n", "status": "todo", "order": 1}).build()
+    )
+    flt = _flt({"op": "eq", "field": "status", "value": "missing"})
+    [res] = c.mutate(Mutation.builder().patch_by_query("items", flt, {"order": 9}).build())
+    assert res is not None
+    assert res.model_dump(by_alias=True, mode="json") == {"patched": 0, "truncated": False}
+
+
+def test_delete_by_query_removes_matching_rows_and_reports_count() -> None:
+    c = _new_client()
+    for status in ("todo", "todo", "done"):
+        c.mutate(
+            Mutation.builder().insert("items", {"name": "n", "status": status, "order": 1}).build()
+        )
+    flt = _flt({"op": "eq", "field": "status", "value": "todo"})
+    [res] = c.mutate(Mutation.builder().delete_by_query("items", flt).build())
+    assert res is not None
+    assert res.model_dump(by_alias=True, mode="json") == {"deleted": 2, "truncated": False}
+    docs = c.run_query(TableQuery("items").build())
+    assert len(docs) == 1
+    assert docs[0]["status"] == "done"
+
+
+def test_delete_by_query_truncates_at_limit() -> None:
+    c = _new_client()
+    for _ in range(3):
+        c.mutate(
+            Mutation.builder().insert("items", {"name": "n", "status": "todo", "order": 1}).build()
+        )
+    flt = _flt({"op": "eq", "field": "status", "value": "todo"})
+    [res] = c.mutate(Mutation.builder().delete_by_query("items", flt, limit=2).build())
+    assert res is not None
+    dumped = res.model_dump(by_alias=True, mode="json")
+    assert dumped["deleted"] == 2
+    assert dumped["truncated"] is True
+    assert len(c.run_query(TableQuery("items").build())) == 1
 
 
 def test_upsert_inserts_on_no_match_and_patches_on_match() -> None:
@@ -858,8 +1010,8 @@ def test_upsert_inserts_on_no_match_and_patches_on_match() -> None:
     )
     assert r2 is not None
     assert _inserted(r2) is False
-    assert r2.id == r1.id
-    doc = c.run_query(TableQuery("items").get(r1.id).build())
+    assert _id_of(r2) == _id_of(r1)
+    doc = c.run_query(TableQuery("items").get(_id_of(r1)).build())
     assert doc["order"] == 5
 
 
@@ -870,9 +1022,9 @@ def test_expect_version_passes_and_fails() -> None:
     )
     assert res is not None
     # Correct version passes.
-    c.mutate(Mutation.builder().expect_version("items", res.id, 1).build())
+    c.mutate(Mutation.builder().expect_version("items", _id_of(res), 1).build())
     with pytest.raises(RtDbError) as ei:
-        c.mutate(Mutation.builder().expect_version("items", res.id, 99).build())
+        c.mutate(Mutation.builder().expect_version("items", _id_of(res), 99).build())
     assert ei.value.code is ErrorCode.PRECONDITION_FAILED
 
 

@@ -25,6 +25,7 @@ import pytest
 from pydantic import TypeAdapter, ValidationError
 
 from par_rt_db.mutation import MAX_STEPS, Mutation, StepResult, Transaction
+from par_rt_db.wire import FilterExpr
 
 
 def test_insert_patch_replace_delete_upsert_wire():
@@ -143,6 +144,7 @@ def test_transaction_max_steps_enforced_client_side():
 
 def test_mutation_builder_returns_self():
     # Each builder method returns the same instance for chaining.
+    flt = _flt({"op": "eq", "field": "x", "value": 1})
     b = Mutation.builder()
     assert b.insert("t", {"x": 1}) is b
     assert b.patch("t", "i", {"x": 1}) is b
@@ -151,3 +153,88 @@ def test_mutation_builder_returns_self():
     assert b.expect_version("t", "i", 1) is b
     assert b.expect_absent("t", "idx", ["v"]) is b
     assert b.upsert("t", "idx", ["v"], {"x": 1}, {"x": 2}) is b
+    assert b.patch_by_query("t", flt, {"x": 1}) is b
+    assert b.delete_by_query("t", flt) is b
+
+
+def _flt(expr: dict[str, object]) -> FilterExpr:
+    return TypeAdapter(FilterExpr).validate_python(expr)
+
+
+def test_patch_by_query_and_delete_by_query_wire_omit_limit():
+    flt = _flt({"op": "eq", "field": "status", "value": "todo"})
+    m = (
+        Mutation.builder()
+        .patch_by_query("items", flt, {"status": "done"})
+        .delete_by_query("items", flt)
+        .build()
+    )
+    wire = json.loads(m.model_dump_json(by_alias=True))
+    assert wire["steps"][0] == {
+        "op": "patchByQuery",
+        "table": "items",
+        "filter": {"op": "eq", "field": "status", "value": "todo"},
+        "patch": {"status": "done"},
+    }
+    assert wire["steps"][1] == {
+        "op": "deleteByQuery",
+        "table": "items",
+        "filter": {"op": "eq", "field": "status", "value": "todo"},
+    }
+
+
+def test_patch_by_query_and_delete_by_query_wire_emit_limit():
+    flt = _flt({"op": "eq", "field": "status", "value": "todo"})
+    m = (
+        Mutation.builder()
+        .patch_by_query("items", flt, {"status": "done"}, limit=50)
+        .delete_by_query("items", flt, limit=10)
+        .build()
+    )
+    wire = json.loads(m.model_dump_json(by_alias=True))
+    assert wire["steps"][0]["limit"] == 50
+    assert wire["steps"][1]["limit"] == 10
+
+
+def test_patch_by_query_rejects_unknown_field():
+    with pytest.raises(ValidationError):
+        Transaction.model_validate(
+            {
+                "steps": [
+                    {
+                        "op": "patchByQuery",
+                        "table": "t",
+                        "filter": {"op": "eq", "field": "x", "value": 1},
+                        "patch": {"x": 1},
+                        "bogus": 7,
+                    }
+                ]
+            }
+        )
+
+
+def test_delete_by_query_rejects_unknown_field():
+    with pytest.raises(ValidationError):
+        Transaction.model_validate(
+            {
+                "steps": [
+                    {
+                        "op": "deleteByQuery",
+                        "table": "t",
+                        "filter": {"op": "eq", "field": "x", "value": 1},
+                        "limit": 5,
+                        "bogus": 7,
+                    }
+                ]
+            }
+        )
+
+
+def test_step_result_patch_by_query_and_delete_by_query():
+    sr = TypeAdapter(StepResult)
+    assert sr.validate_python({"patched": 3, "truncated": False}).model_dump(
+        by_alias=True, mode="json"
+    ) == {"patched": 3, "truncated": False}
+    assert sr.validate_python({"deleted": 2, "truncated": True}).model_dump(
+        by_alias=True, mode="json"
+    ) == {"deleted": 2, "truncated": True}

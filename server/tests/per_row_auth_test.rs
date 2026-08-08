@@ -74,9 +74,10 @@ fn owner_schema() -> SchemaDef {
 fn user(id: &str) -> rtdb_server::auth::Principal {
     rtdb_server::auth::Principal::User {
         user_id: id.into(),
-        email: format!("{id}@x"),
+        email: Some(format!("{id}@x")),
         name: None,
         expires_at: i64::MAX,
+        anonymous: false,
         github_id: None,
         github_login: None,
     }

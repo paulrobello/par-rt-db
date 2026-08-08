@@ -1,18 +1,25 @@
 import { RtDbError } from "./errors.js";
-import type { StepJson, TransactionJson } from "./protocol.js";
+import type { FilterExpr, StepJson, TransactionJson } from "./protocol.js";
 import type { IndexNamesOf, SchemaDefinition, TableNames, WithoutSystemFields } from "./schema.js";
 
 /**
  * One entry of a mutation's `results`, positionally aligned with `steps`.
  *
  * Mirrors `rust-client::StepResult` and `python-client.StepResult`: untagged,
- * with three shapes the server may emit. The richer upsert shape
+ * with the shapes the server may emit. The richer upsert shape
  * (`{ id, inserted }`) is a separate variant from the plain `{ id }` so callers
- * can narrow with `'inserted' in r`; `null` covers `delete` of an absent doc
- * and any other no-op. Variant order matters for the rust/python decoders
- * (richest first); here it is just documentation since TS narrows structurally.
+ * can narrow with `'inserted' in r`; the by-query shapes (`{ patched }`/
+ * `{ deleted }`, each with `truncated`) narrow via those own fields; `null`
+ * covers `delete` of an absent doc and any other no-op. Variant order matters
+ * for the rust/python decoders (richest first); here it is just documentation
+ * since TS narrows structurally.
  */
-export type StepResult = StepUpsertResult | StepInsertResult | null;
+export type StepResult =
+  | StepUpsertResult
+  | StepInsertResult
+  | StepPatchByQueryResult
+  | StepDeleteByQueryResult
+  | null;
 
 /** Result of an `upsert` step: the doc id and whether the insert branch ran. */
 export interface StepUpsertResult {
@@ -25,29 +32,59 @@ export interface StepInsertResult {
   id: string;
 }
 
+/** Result of a `patchByQuery` step: rows patched and whether the match set
+ * exceeded `limit` (server cap 1000). */
+export interface StepPatchByQueryResult {
+  patched: number;
+  truncated: boolean;
+}
+
+/** Result of a `deleteByQuery` step: rows deleted and whether the match set
+ * exceeded `limit` (server cap 1000). */
+export interface StepDeleteByQueryResult {
+  deleted: number;
+  truncated: boolean;
+}
+
 /**
  * Decodes one `mutateOk.results` entry (raw server JSON) into a {@link StepResult}.
  *
- * The server emits exactly three shapes per the contract: `{ id, inserted }`
- * (upsert), `{ id }` (insert/patch/replace/delete of a present doc), or `null`
- * (delete of an absent doc / no-op). Anything else is a server contract
- * violation and is surfaced as an `RtDbError` rather than silently passed
- * through — mirroring the rust/python clients' strict untagged decoding.
+ * The server emits these shapes per the contract: `{ id, inserted }` (upsert),
+ * `{ id }` (insert/patch/replace/delete of a present doc), `{ patched, truncated }`
+ * (patchByQuery), `{ deleted, truncated }` (deleteByQuery), or `null` (delete of
+ * an absent doc / no-op). Anything else is a server contract violation and is
+ * surfaced as an `RtDbError` rather than silently passed through — mirroring the
+ * rust/python clients' strict untagged decoding.
  */
 function parseStepResult(value: unknown): StepResult {
   if (value === null) {
     return null;
   }
   if (typeof value === "object" && value !== null) {
-    const v = value as { id?: unknown; inserted?: unknown };
+    const v = value as {
+      id?: unknown;
+      inserted?: unknown;
+      patched?: unknown;
+      deleted?: unknown;
+      truncated?: unknown;
+    };
     if (typeof v.id === "string") {
       if (typeof v.inserted === "boolean") {
         return { id: v.id, inserted: v.inserted };
       }
       return { id: v.id };
     }
+    if (typeof v.patched === "number" && typeof v.truncated === "boolean") {
+      return { patched: v.patched, truncated: v.truncated };
+    }
+    if (typeof v.deleted === "number" && typeof v.truncated === "boolean") {
+      return { deleted: v.deleted, truncated: v.truncated };
+    }
   }
-  throw new RtDbError("INTERNAL", "malformed step result: expected {id}, {id, inserted}, or null");
+  throw new RtDbError(
+    "INTERNAL",
+    "malformed step result: expected {id}, {id, inserted}, {patched, truncated}, {deleted, truncated}, or null",
+  );
 }
 
 /**
@@ -111,6 +148,27 @@ export class TxnBuilder<S extends SchemaDefinition<any> = SchemaDefinition<any>>
     },
   ): this {
     this.steps.push({ op: "upsert", table, ...args });
+    return this;
+  }
+
+  patchByQuery<T extends TableNames<S>>(
+    table: T,
+    filter: FilterExpr,
+    patch: Partial<WithoutSystemFields<S, T>>,
+    limit?: number,
+  ): this {
+    this.steps.push({
+      op: "patchByQuery",
+      table,
+      filter,
+      patch,
+      ...(limit !== undefined && { limit }),
+    });
+    return this;
+  }
+
+  deleteByQuery<T extends TableNames<S>>(table: T, filter: FilterExpr, limit?: number): this {
+    this.steps.push({ op: "deleteByQuery", table, filter, ...(limit !== undefined && { limit }) });
     return this;
   }
 

@@ -133,6 +133,12 @@ fn project_unfiltered_array(
             Step::Delete { id, .. } => remove_by_id(&mut working, id),
             Step::Upsert { .. } => return OptimisticProjection::Skip,
             Step::ExpectVersion { .. } | Step::ExpectAbsent { .. } => {}
+            // By-query steps match an unbounded set of rows by a filter this
+            // projection can't evaluate (no table store, no schema) — the effect
+            // on the cached result is membership-ambiguous, so decline.
+            Step::PatchByQuery { .. } | Step::DeleteByQuery { .. } => {
+                return OptimisticProjection::Skip;
+            }
         }
     }
     finalize(Value::Array(working), last)
@@ -157,6 +163,11 @@ fn project_filtered_array(query: &Query, last: &Value, txn: &Transaction) -> Opt
             | Step::Replace { .. }
             | Step::Upsert { .. } => return OptimisticProjection::Skip,
             Step::ExpectVersion { .. } | Step::ExpectAbsent { .. } => {}
+            // By-query steps match rows by a filter we can't evaluate here —
+            // the effect on the filtered result is ambiguous, so decline.
+            Step::PatchByQuery { .. } | Step::DeleteByQuery { .. } => {
+                return OptimisticProjection::Skip;
+            }
         }
     }
     finalize(Value::Array(working), last)
@@ -196,6 +207,11 @@ fn project_get(query: &Query, last: &Value, txn: &Transaction) -> OptimisticProj
                 }
             }
             Step::Upsert { .. } => return OptimisticProjection::Skip,
+            // A by-query step may patch/delete the target row, but the filter is
+            // unevaluable here — decline rather than guess.
+            Step::PatchByQuery { .. } | Step::DeleteByQuery { .. } => {
+                return OptimisticProjection::Skip;
+            }
             // Insert (fresh id never matches a pre-existing get target),
             // ExpectVersion/ExpectAbsent (preconditions, no data effect), and
             // non-target Patch/Replace/Delete: nothing to do here.
@@ -217,7 +233,9 @@ impl Step {
             | Step::Replace { table, .. }
             | Step::Delete { table, .. }
             | Step::ExpectVersion { table, .. }
-            | Step::Upsert { table, .. } => Some(table.as_str()),
+            | Step::Upsert { table, .. }
+            | Step::PatchByQuery { table, .. }
+            | Step::DeleteByQuery { table, .. } => Some(table.as_str()),
             Step::ExpectAbsent { .. } => None,
         }
     }

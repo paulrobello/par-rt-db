@@ -2970,6 +2970,153 @@ async fn aggregate_group_by_with_one_field_beyond_prefix_is_bad_request() -> any
     Ok(())
 }
 
+// (agg-count-a) scalar COUNT over the matching set (no aggregate field consumed).
+#[tokio::test]
+async fn aggregate_count_over_matching_set() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+
+    let (project_id, _items) = seed_kanban(&pool, &db, &schema).await?;
+
+    // 5 work items seeded for this project; count consumes no aggregate field,
+    // so eq consuming `projectId` (index by_project_and_order) leaves nothing to
+    // aggregate over — fine for count, which counts rows.
+    let result = execute_query(
+        &pool,
+        &db,
+        &schema,
+        &aggregate_query(
+            Some("by_project_and_order"),
+            vec![serde_json::json!(project_id)],
+            agg(AggregateOp::Count),
+            |_| {},
+        ),
+        &PrincipalCtx::bypass(),
+    )
+    .await?;
+
+    assert_eq!(aggregate_scalar(&result).as_f64(), Some(5.0));
+    Ok(())
+}
+
+// (agg-count-b) COUNT over an empty matching set is 0 (COUNT(*) never yields NULL,
+// unlike SUM/MIN/MAX).
+#[tokio::test]
+async fn aggregate_count_over_empty_set_returns_zero() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+
+    let (_project_id, _items) = seed_kanban(&pool, &db, &schema).await?;
+
+    // A 32-hex project id that was never seeded matches nothing.
+    let unused_project_id = "f".repeat(32);
+    let result = execute_query(
+        &pool,
+        &db,
+        &schema,
+        &aggregate_query(
+            Some("by_project_and_order"),
+            vec![serde_json::json!(unused_project_id)],
+            agg(AggregateOp::Count),
+            |_| {},
+        ),
+        &PrincipalCtx::bypass(),
+    )
+    .await?;
+
+    assert_eq!(aggregate_scalar(&result).as_f64(), Some(0.0));
+    Ok(())
+}
+
+// (agg-count-c) grouped COUNT: count per status within a project. This is the
+// dashboard "items by status" use case that previously needed a sum-over-1 workaround.
+#[tokio::test]
+async fn aggregate_count_grouped_by_status() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+
+    let (project_id, _items) = seed_kanban(&pool, &db, &schema).await?;
+
+    // by_project_status_order is [projectId, status, order]; eq consumes
+    // projectId, leaving `status` as the group key. count consumes no aggregate
+    // field, so the `order` field is unused. Seeded counts:
+    //   backlog=2, in_progress=2, done=1.
+    let result = execute_query(
+        &pool,
+        &db,
+        &schema,
+        &aggregate_query(
+            Some("by_project_status_order"),
+            vec![serde_json::json!(project_id)],
+            AggregateSpec {
+                op: AggregateOp::Count,
+                group_by: true,
+            },
+            |_| {},
+        ),
+        &PrincipalCtx::bypass(),
+    )
+    .await?;
+
+    let groups = aggregate_groups(&result);
+    // Ordered by group key ascending — backlog, done, in_progress.
+    let pairs: Vec<(String, f64)> = groups
+        .iter()
+        .map(|g| {
+            (
+                g.key.as_str().expect("status string").to_string(),
+                g.value.as_f64().expect("count is numeric"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        pairs,
+        vec![
+            ("backlog".to_string(), 2.0),
+            ("done".to_string(), 1.0),
+            ("in_progress".to_string(), 2.0),
+        ]
+    );
+    Ok(())
+}
+
+// (agg-count-d) count needs no aggregate field beyond the eq prefix — eq may
+// consume every index field. (Sum/Min/Max would BadRequest here; count does not.)
+#[tokio::test]
+async fn aggregate_count_with_no_field_beyond_eq_prefix_works() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+
+    let (project_id, _items) = seed_kanban(&pool, &db, &schema).await?;
+
+    // by_project_and_status is [projectId, status]; consuming both leaves none.
+    // Two seeded backlog items for this project.
+    let result = execute_query(
+        &pool,
+        &db,
+        &schema,
+        &aggregate_query(
+            Some("by_project_and_status"),
+            vec![serde_json::json!(project_id), serde_json::json!("backlog")],
+            agg(AggregateOp::Count),
+            |_| {},
+        ),
+        &PrincipalCtx::bypass(),
+    )
+    .await?;
+
+    assert_eq!(aggregate_scalar(&result).as_f64(), Some(2.0));
+    Ok(())
+}
+
 // =============================================================================
 // Cursor-based pagination (`paginate` terminal).
 // =============================================================================

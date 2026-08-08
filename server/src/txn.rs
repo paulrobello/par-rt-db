@@ -12,7 +12,25 @@ use crate::schema::{
     FieldType, IndexDef, SchemaDef, TableDef, indexed_column_type, validate_doc, validate_value,
 };
 
-const MAX_STEPS: usize = 256;
+/// Maximum number of steps in a single transaction. A hard ceiling that bounds
+/// how much work one serialized committer turn can do. Raised from 256 → 1024
+/// (4× headroom) so reactive multi-writer apps can batch larger atomic units.
+/// For bulk operations over many rows, prefer `PatchByQuery`/`DeleteByQuery`
+/// (one step, server-side row cap) over unrolling per-id steps — that keeps a
+/// txn under this limit AND avoids client-side read-all-then-patch patterns.
+/// Raise further only if a measured workload genuinely needs >1024 atomic steps.
+const MAX_STEPS: usize = 1024;
+
+/// Hard cap on the number of rows a single `PatchByQuery`/`DeleteByQuery` step
+/// may touch. A per-step safety backstop (these steps can affect many rows,
+/// unlike the per-id steps which touch one): it bounds one serialized committer
+/// turn and prevents a wildcard filter from sweeping an entire table. A step
+/// whose match set exceeds its `limit` patches/deletes exactly `limit` and
+/// reports `truncated: true` so the caller can re-run (the cron archiver
+/// pattern). The step's optional `limit` is clamped to this ceiling; `None`
+/// means "use this default". NOTE: a by-query step is ONE step, so the admin
+/// `max_affected_docs` step-COUNT guardrail does not bound it — this const does.
+const MAX_BY_QUERY_ROWS: u32 = 1000;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "op", rename_all = "camelCase", deny_unknown_fields)]
@@ -52,6 +70,33 @@ pub enum Step {
         insert: serde_json::Map<String, serde_json::Value>,
         patch: serde_json::Map<String, serde_json::Value>,
     },
+    /// Find every row in `table` matching `filter` (the same `FilterExpr` the
+    /// read path accepts) and apply `patch` to it, atomically, inside the
+    /// serialized committer turn. Visibility matches the read path exactly: an
+    /// interactive caller patches only rows they own/collaborate on and that
+    /// satisfy the table's `authorize` predicate; a bypass principal (machine
+    /// token/admin/scheduled) touches all matching rows. At most `limit` rows
+    /// (default `MAX_BY_QUERY_ROWS`); a larger match set patches `limit` and
+    /// reports `truncated: true`. Each patched row records a `DocOp`/`WriteSet`
+    /// entry, so subscriptions, the op-feed, audit log, and webhooks all fire
+    /// per row — the same contract as a per-id `Patch`.
+    PatchByQuery {
+        table: String,
+        filter: crate::query::FilterExpr,
+        patch: serde_json::Map<String, serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<u32>,
+    },
+    /// Find every row in `table` matching `filter` and delete it (same
+    /// visibility/`limit`/`truncated` semantics as `PatchByQuery`). Enables
+    /// server-side cascades and bulk cleanup (e.g. a scheduled job deleting
+    /// expired rows by predicate) without a client-side read-all-then-delete.
+    DeleteByQuery {
+        table: String,
+        filter: crate::query::FilterExpr,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<u32>,
+    },
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -72,7 +117,9 @@ impl Step {
             | Step::Delete { table, .. }
             | Step::ExpectVersion { table, .. }
             | Step::ExpectAbsent { table, .. }
-            | Step::Upsert { table, .. } => table,
+            | Step::Upsert { table, .. }
+            | Step::PatchByQuery { table, .. }
+            | Step::DeleteByQuery { table, .. } => table,
         }
     }
 }
@@ -1327,6 +1374,46 @@ pub async fn execute_txn(
                 )
                 .await?
             }
+            Step::PatchByQuery {
+                table,
+                filter,
+                patch,
+                limit,
+            } => {
+                step_patch_by_query(
+                    &mut tx,
+                    &pg_schema_name,
+                    schema,
+                    ctx,
+                    owner,
+                    &mut write_set,
+                    &mut results,
+                    table,
+                    filter,
+                    patch,
+                    *limit,
+                )
+                .await?
+            }
+            Step::DeleteByQuery {
+                table,
+                filter,
+                limit,
+            } => {
+                step_delete_by_query(
+                    &mut tx,
+                    &pg_schema_name,
+                    schema,
+                    ctx,
+                    owner,
+                    &mut write_set,
+                    &mut results,
+                    table,
+                    filter,
+                    *limit,
+                )
+                .await?
+            }
         }
     }
 
@@ -1567,6 +1654,138 @@ async fn step_upsert(
             results.push(serde_json::json!({ "id": id, "inserted": false }));
         }
     }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn step_patch_by_query(
+    tx: &mut PgConnection,
+    pg_schema_name: &str,
+    schema: &SchemaDef,
+    ctx: &PrincipalCtx,
+    owner: Option<&str>,
+    write_set: &mut WriteSet,
+    results: &mut Vec<serde_json::Value>,
+    table: &str,
+    filter: &crate::query::FilterExpr,
+    patch: &serde_json::Map<String, serde_json::Value>,
+    limit_opt: Option<u32>,
+) -> Result<(), RtDbError> {
+    let table_def = schema.table(table)?;
+    let limit = limit_opt
+        .unwrap_or(MAX_BY_QUERY_ROWS)
+        .min(MAX_BY_QUERY_ROWS);
+    let (where_sql, binds, limit_ph) =
+        crate::query::compile_scan_where(table_def, ctx, owner, Some(filter))?;
+    let table_ident = pg_table(table);
+    let base = format!(
+        "SELECT \"id\", \"doc\", \"created_at\" FROM \"{pg_schema_name}\".\"{table_ident}\""
+    );
+    let sql = if where_sql.is_empty() {
+        format!("{base} ORDER BY \"created_at\", \"id\" LIMIT ${limit_ph}")
+    } else {
+        format!("{base} WHERE {where_sql} ORDER BY \"created_at\", \"id\" LIMIT ${limit_ph}")
+    };
+    let mut query = sqlx::query_as::<_, (String, serde_json::Value, i64)>(&sql);
+    for bind in binds {
+        query = match bind {
+            EqBind::Text(v) => query.bind(v),
+            EqBind::Num(v) => query.bind(v),
+            EqBind::Bool(v) => query.bind(v),
+            EqBind::I64(v) => query.bind(v),
+        };
+    }
+    // Fetch limit+1 so a full match set is detectable (`truncated`).
+    query = query.bind(i64::from(limit) + 1);
+    let rows = query.fetch_all(&mut *tx).await?;
+    let truncated = rows.len() as u32 > limit;
+    let take = std::cmp::min(rows.len(), limit as usize);
+    for (id, doc_value, created_at) in rows.into_iter().take(take) {
+        let doc = match doc_value {
+            serde_json::Value::Object(map) => map,
+            _ => return Err(RtDbError::internal("stored doc is not a JSON object")),
+        };
+        let pre_doc = doc.clone();
+        let fields = stamp_owner(table_def, patch.clone(), owner);
+        let fields = stamp_authorize(table_def, fields, ctx);
+        let merged = apply_patch(table_def, doc, &fields)?;
+        apply_update(tx, pg_schema_name, table_def, table, &id, &merged).await?;
+        verify_authorize_doc(table_def, &merged, ctx)?;
+        write_set.touch(table, &id, OpKind::Patch);
+        write_set.capture_doc(
+            table,
+            &id,
+            Some(Some(&pre_doc)),
+            Some(Some(&merged)),
+            Some(created_at),
+        );
+    }
+    results.push(serde_json::json!({ "patched": take, "truncated": truncated }));
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn step_delete_by_query(
+    tx: &mut PgConnection,
+    pg_schema_name: &str,
+    schema: &SchemaDef,
+    ctx: &PrincipalCtx,
+    owner: Option<&str>,
+    write_set: &mut WriteSet,
+    results: &mut Vec<serde_json::Value>,
+    table: &str,
+    filter: &crate::query::FilterExpr,
+    limit_opt: Option<u32>,
+) -> Result<(), RtDbError> {
+    let table_def = schema.table(table)?;
+    let limit = limit_opt
+        .unwrap_or(MAX_BY_QUERY_ROWS)
+        .min(MAX_BY_QUERY_ROWS);
+    let (where_sql, binds, limit_ph) =
+        crate::query::compile_scan_where(table_def, ctx, owner, Some(filter))?;
+    let table_ident = pg_table(table);
+    let base = format!("SELECT \"id\" FROM \"{pg_schema_name}\".\"{table_ident}\"");
+    let sql = if where_sql.is_empty() {
+        format!("{base} ORDER BY \"created_at\", \"id\" LIMIT ${limit_ph}")
+    } else {
+        format!("{base} WHERE {where_sql} ORDER BY \"created_at\", \"id\" LIMIT ${limit_ph}")
+    };
+    let mut query = sqlx::query_as::<_, (String,)>(&sql);
+    for bind in binds {
+        query = match bind {
+            EqBind::Text(v) => query.bind(v),
+            EqBind::Num(v) => query.bind(v),
+            EqBind::Bool(v) => query.bind(v),
+            EqBind::I64(v) => query.bind(v),
+        };
+    }
+    query = query.bind(i64::from(limit) + 1);
+    let rows = query.fetch_all(&mut *tx).await?;
+    let truncated = rows.len() as u32 > limit;
+    let take = std::cmp::min(rows.len(), limit as usize);
+    let ids: Vec<String> = rows.into_iter().take(take).map(|(id,)| id).collect();
+    let deleted = ids.len();
+    if !ids.is_empty() {
+        // Bulk delete the selected ids in one statement. They were selected in
+        // this same serialized txn, so there is no TOCTOU gap (no concurrent
+        // writer can touch this db outside the committer turn).
+        let placeholders: Vec<String> = (0..ids.len()).map(|i| format!("${}", i + 1)).collect();
+        let del_sql = format!(
+            "DELETE FROM \"{pg_schema_name}\".\"{table_ident}\" WHERE \"id\" IN ({})",
+            placeholders.join(", ")
+        );
+        let mut del = sqlx::query(&del_sql);
+        for id in &ids {
+            del = del.bind(id);
+        }
+        del.execute(&mut *tx).await?;
+    }
+    for id in &ids {
+        write_set.touch(table, id, OpKind::Delete);
+        // Delete records no value: `after = None` ⇒ `fan_out` always re-runs.
+        write_set.capture_doc(table, id, None, Some(None), None);
+    }
+    results.push(serde_json::json!({ "deleted": deleted, "truncated": truncated }));
     Ok(())
 }
 

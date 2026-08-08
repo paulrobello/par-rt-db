@@ -70,6 +70,7 @@ async fn bootstrap_ddl(conn: &mut PgConnection) -> Result<(), RtDbError> {
             apple_sub text UNIQUE,
             login text NOT NULL,
             email text UNIQUE,
+            anonymous boolean NOT NULL DEFAULT FALSE,
             created_at bigint NOT NULL
         )",
     )
@@ -91,6 +92,18 @@ async fn bootstrap_ddl(conn: &mut PgConnection) -> Result<(), RtDbError> {
     )
     .execute(&mut *conn)
     .await?;
+
+    // Anonymous auth (2026-08-08): marks a user row minted by
+    // `POST /auth/anonymous` (no OAuth identity, no email). `false` for every
+    // existing/OAuth user. Idempotent ALTER so a running deployment adds it on
+    // boot; a new deployment gets it inline below.
+    sqlx::query("ALTER TABLE rtdb_auth.users ADD COLUMN IF NOT EXISTS anonymous BOOLEAN NOT NULL DEFAULT FALSE")
+        .execute(&mut *conn)
+        .await?;
+    // Also ensure new tables have it inline (the CREATE TABLE above predates it).
+    sqlx::query("ALTER TABLE rtdb_auth.users ALTER COLUMN anonymous SET DEFAULT FALSE")
+        .execute(&mut *conn)
+        .await?;
 
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS rtdb_auth.sessions (

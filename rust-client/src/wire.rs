@@ -359,7 +359,9 @@ pub struct HybridSearchQuery {
 }
 
 /// Aggregate operator for the `aggregate` terminal. Mirrors
-/// `server/src/query.rs::AggregateOp` byte-for-byte (lowercase variants).
+/// `server/src/query.rs::AggregateOp` byte-for-byte (lowercase variants). `Count`
+/// aggregates rows and consumes no aggregate field (a grouped `count` is the
+/// count per group).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AggregateOp {
@@ -367,6 +369,7 @@ pub enum AggregateOp {
     Avg,
     Min,
     Max,
+    Count,
 }
 
 /// `aggregate` terminal spec. `op` selects the SQL aggregate run over the index

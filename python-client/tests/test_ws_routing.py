@@ -394,7 +394,7 @@ async def test_mutate_resolves_on_mutate_ok():
         await _drain()
         results = await asyncio.wait_for(task, 1.0)
         assert results[0] is not None
-        assert results[0].id == "i1"
+        assert results[0].model_dump()["id"] == "i1"
     finally:
         await client.close()
 
@@ -472,7 +472,7 @@ async def test_queued_mutate_survives_drop_flushes_on_reconnect():
         await conn2.deliver('{"type":"mutateOk","mutId":"' + mid + '","results":[{"id":"i1"}]}')
         results = await asyncio.wait_for(queued, 1.0)
         assert results[0] is not None
-        assert results[0].id == "i1"
+        assert results[0].model_dump()["id"] == "i1"
         assert client.status().state is ConnectionState.CONNECTED
     finally:
         await client.close()

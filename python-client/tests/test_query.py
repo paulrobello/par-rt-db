@@ -132,6 +132,27 @@ def test_query_aggregate_terminal_group_by():
     assert wire["aggregate"] == {"op": "sum", "groupBy": True}
 
 
+def test_query_aggregate_terminal_count():
+    # `count` serializes its lowercase op tag like the other aggregates.
+    wire = (
+        TableQuery("t")
+        .with_index("i")
+        .eq("a")
+        .build_for_aggregate("count")
+        .model_dump(by_alias=True, mode="json")
+    )
+    assert wire["aggregate"] == {"op": "count"}
+    # groupBy + count composes on the wire too.
+    wire_g = (
+        TableQuery("t")
+        .with_index("i")
+        .eq("a")
+        .build_for_aggregate("count", group_by=True)
+        .model_dump(by_alias=True, mode="json")
+    )
+    assert wire_g["aggregate"] == {"op": "count", "groupBy": True}
+
+
 def test_query_get_rejects_aggregate():
     # `get` is mutually exclusive with `aggregate`, same shape as count/distinct.
     with pytest.raises(ValueError):

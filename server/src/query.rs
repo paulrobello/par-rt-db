@@ -12,7 +12,17 @@ use crate::schema::{FieldType, IndexDef, SchemaDef, TableDef, validate_filter_ex
 use crate::txn::{EqBind, eq_bind_for, eq_binds, row_visible_to};
 
 /// Hard cap on rows returned by a single query, whether via an explicit
-/// `take` or a `take`-less collect.
+/// `take` or a `take`-less collect. Also bounds `distinct`, aggregate group
+/// counts, and paginate page sizes. **Scaling guidance:** every result row is
+/// materialized server-side, so this is a per-query memory ceiling shared
+/// across all tenants on a multi-tenant instance. For larger scans, paginate
+/// (`take(N)` / `paginate`) rather than collecting unbounded result sets —
+/// pages stream and are not bound by this cap beyond the page size. Raise this
+/// const only if a measured single-query workload genuinely needs >4096 rows
+/// AND cannot paginate (bulk operations should use `PatchByQuery`/
+/// `DeleteByQuery`, not large collects). `MAX_STEPS` (the txn step cap) was
+/// raised to 1024 for larger atomic units; this collect cap is kept at 4096
+/// deliberately (memory cost scales with it).
 const MAX_TAKE: u32 = 4096;
 
 /// Hard cap on `vectorSearch` `limit`.
@@ -178,8 +188,11 @@ pub struct HybridSearchQuery {
 
 /// Aggregate operator for the `aggregate` terminal. Mirrors the SQL aggregate
 /// of the same name. `Sum`/`Avg` require a numeric index field; `Min`/`Max`
-/// work on any orderable indexed field. Serializes lowercase (`"sum"`/`"avg"`/
-/// `"min"`/`"max"`) — byte-identical to the TS/Rust/Python client mirrors.
+/// work on any orderable indexed field; `Count` counts matching rows and
+/// consumes no aggregate field (a grouped `count` is the count-per-group the
+/// dashboard "items by status" view needs — previously a `sum` over a constant
+/// `1` field workaround). Serializes lowercase (`"sum"`/`"avg"`/`"min"`/
+/// `"max"`/`"count"`) — byte-identical to the TS/Rust/Python client mirrors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AggregateOp {
@@ -187,6 +200,7 @@ pub enum AggregateOp {
     Avg,
     Min,
     Max,
+    Count,
 }
 
 impl AggregateOp {
@@ -197,7 +211,15 @@ impl AggregateOp {
             AggregateOp::Avg => "AVG",
             AggregateOp::Min => "MIN",
             AggregateOp::Max => "MAX",
+            AggregateOp::Count => "COUNT",
         }
+    }
+
+    /// Whether this op aggregates a field value (and so needs an aggregate
+    /// index field beyond the eq prefix / group field). `Count` counts rows and
+    /// consumes no field.
+    fn needs_field(self) -> bool {
+        !matches!(self, AggregateOp::Count)
     }
 }
 
@@ -1223,52 +1245,76 @@ async fn execute_aggregate_terminal(
         filter_binds,
         limit_placeholder,
     } = w;
-    let idx = index_def.ok_or_else(|| {
-        RtDbError::bad_request("aggregate requires an index field beyond the eq prefix")
-    })?;
-    // Resolve the aggregate field (the one after the eq prefix for plain
-    // aggregate, the one after that for groupBy) and validate the schema
-    // field type for sum/avg's numeric requirement. The groupcol for the
-    // groupBy case is the same field distinct would use.
-    let (group_col, agg_field_name) = if agg.group_by {
-        if eq_len + 1 >= idx.fields.len() {
-            return Err(RtDbError::bad_request(
-                "aggregate groupBy requires two index fields beyond the eq prefix",
-            ));
-        }
-        let group_field = idx.fields[eq_len].as_str();
-        let agg_field = idx.fields[eq_len + 1].as_str();
-        (Some(pg_col(group_field)), agg_field)
+    // Resolve the group column (groupBy) and the aggregate field. `count`
+    // aggregates rows, not a field — it consumes no aggregate index field (a
+    // scalar `count` needs no index at all; a grouped `count` needs one index
+    // field beyond the eq prefix to group by). Every other op needs an aggregate
+    // field: the one after the eq prefix (plain), or the one after the group
+    // field (groupBy). The groupcol for groupBy is the same field `distinct` uses.
+    let group_col: Option<String> = if agg.group_by {
+        let idx = index_def.ok_or_else(|| {
+            RtDbError::bad_request("aggregate groupBy requires an index field beyond the eq prefix")
+        })?;
+        let group_field = idx.fields.get(eq_len).ok_or_else(|| {
+            RtDbError::bad_request("aggregate groupBy requires an index field beyond the eq prefix")
+        })?;
+        Some(pg_col(group_field))
     } else {
-        if eq_len >= idx.fields.len() {
-            return Err(RtDbError::bad_request(
-                "aggregate requires an index field beyond the eq prefix",
-            ));
-        }
-        (None, idx.fields[eq_len].as_str())
+        None
     };
-    let agg_field_type = table_def.fields.get(agg_field_name).ok_or_else(|| {
-        RtDbError::internal(format!("index references unknown field '{agg_field_name}'"))
-    })?;
-    if matches!(agg.op, AggregateOp::Sum | AggregateOp::Avg)
-        && !is_numeric_index_field(agg_field_type)
-    {
-        return Err(RtDbError::bad_request(format!(
-            "aggregate op {} requires a numeric index field",
-            agg.op.sql_fn().to_lowercase()
-        )));
+    let agg_field_name: Option<&str> = if !agg.op.needs_field() {
+        None
+    } else {
+        let idx = index_def.ok_or_else(|| {
+            RtDbError::bad_request("aggregate requires an index field beyond the eq prefix")
+        })?;
+        let agg_field = if agg.group_by {
+            idx.fields.get(eq_len + 1).ok_or_else(|| {
+                RtDbError::bad_request(
+                    "aggregate groupBy requires two index fields beyond the eq prefix",
+                )
+            })?
+        } else {
+            idx.fields.get(eq_len).ok_or_else(|| {
+                RtDbError::bad_request("aggregate requires an index field beyond the eq prefix")
+            })?
+        };
+        Some(agg_field.as_str())
+    };
+    // Validate the aggregate field's schema type and sum/avg's numeric
+    // requirement. count/min/max skip the numeric check; count has no field.
+    if let Some(name) = agg_field_name {
+        let agg_field_type = table_def.fields.get(name).ok_or_else(|| {
+            RtDbError::internal(format!("index references unknown field '{name}'"))
+        })?;
+        if matches!(agg.op, AggregateOp::Sum | AggregateOp::Avg)
+            && !is_numeric_index_field(agg_field_type)
+        {
+            return Err(RtDbError::bad_request(format!(
+                "aggregate op {} requires a numeric index field",
+                agg.op.sql_fn().to_lowercase()
+            )));
+        }
     }
-    let agg_col = pg_col(agg_field_name);
     let pg_schema_name = pg_schema(db);
     let table_ident = pg_table(table);
     let op_sql = agg.op.sql_fn();
+    // The aggregate expression: COUNT(*) for `count` (no column), else
+    // OP("agg_col") over the resolved aggregate field.
+    let agg_expr = match agg_field_name {
+        Some(name) => {
+            let agg_col = pg_col(name);
+            format!("{op_sql}(\"{agg_col}\")")
+        }
+        None => "COUNT(*)".to_string(),
+    };
     // Project via `to_jsonb` so a single `serde_json::Value` decoder handles
     // text/number/boolean columns uniformly, exactly like `distinct`. A
     // scalar SUM/AVG/MIN/MAX over zero matching rows yields one row with
-    // SQL NULL → `serde_json::Value::Null`.
+    // SQL NULL → `serde_json::Value::Null`; COUNT(*) over zero rows yields 0.
     if let Some(group_col) = group_col {
         let mut sql = format!(
-            "SELECT to_jsonb(\"{group_col}\") AS k, to_jsonb({op_sql}(\"{agg_col}\")) AS v FROM \"{pg_schema_name}\".\"{table_ident}\""
+            "SELECT to_jsonb(\"{group_col}\") AS k, to_jsonb({agg_expr}) AS v FROM \"{pg_schema_name}\".\"{table_ident}\""
         );
         if !where_conditions.is_empty() {
             sql.push_str(" WHERE ");
@@ -1311,7 +1357,7 @@ async fn execute_aggregate_terminal(
         return Ok(QueryResult::AggregateGroups(groups));
     }
     let mut sql = format!(
-        "SELECT COALESCE(to_jsonb({op_sql}(\"{agg_col}\")), 'null'::jsonb) AS v FROM \"{pg_schema_name}\".\"{table_ident}\""
+        "SELECT COALESCE(to_jsonb({agg_expr}), 'null'::jsonb) AS v FROM \"{pg_schema_name}\".\"{table_ident}\""
     );
     if !where_conditions.is_empty() {
         sql.push_str(" WHERE ");
@@ -1700,6 +1746,53 @@ fn push_filter_bind(start_pos: usize, binds: &mut Vec<EqBind>, bind: EqBind) -> 
     let placeholder = format!("${}", start_pos + binds.len());
     binds.push(bind);
     placeholder
+}
+
+/// Compiles the WHERE clause for a by-query scan (`PatchByQuery`/`DeleteByQuery`
+/// in `txn.rs`): the client `filter` AND the per-row visibility predicates
+/// (`ownerField`/`collaboratorsField` OR, and the `authorize` predicate), so a
+/// by-query write touches exactly the rows the caller could read — the same set
+/// `compile_query_window` produces for a read. Returns the WHERE fragment (no
+/// leading `WHERE`; empty when nothing restricts the scan, i.e. a bypass caller
+/// with no filter on an un-gated table), its typed binds with `$n` placeholders
+/// numbered from 1, and the 1-based position of the next placeholder for the
+/// caller's `LIMIT` bind.
+///
+/// Unlike `compile_query_window` this always appends the standalone
+/// `row_auth_predicate_body` for an enforced uid (the read path instead merges
+/// the owner equality into the filter via `owner_filter` when the table is
+/// owner-only, as an index-usage optimization). The two are semantically
+/// identical; a by-query scan never index-seeks on the owner field, so the
+/// merge optimization is irrelevant here and the standalone form is simpler.
+pub(crate) fn compile_scan_where(
+    table_def: &TableDef,
+    ctx: &PrincipalCtx,
+    owner: Option<&str>,
+    filter: Option<&FilterExpr>,
+) -> Result<(String, Vec<EqBind>, usize), RtDbError> {
+    let owner_field = table_def.owner_field.as_deref();
+    let collaborators_field = table_def.collaborators_field.as_deref();
+    let mut where_conditions: Vec<String> = Vec::new();
+    let mut binds: Vec<EqBind> = Vec::new();
+    if let Some(f) = filter {
+        let (fragment, filter_binds) = compile_filter(f, table_def, 1)?;
+        where_conditions.push(fragment);
+        binds.extend(filter_binds);
+    }
+    if let Some(uid) = row_auth_enforced_uid(owner_field, collaborators_field, owner) {
+        let ph = 1 + binds.len();
+        where_conditions.push(row_auth_predicate_body(
+            owner_field,
+            collaborators_field,
+            ph,
+        ));
+        binds.push(EqBind::Text(uid.to_string()));
+    }
+    if let Some(fragment) = authorize_predicate_body(table_def, ctx, 1, &mut binds)? {
+        where_conditions.push(fragment);
+    }
+    let limit_placeholder = 1 + binds.len();
+    Ok((where_conditions.join(" AND "), binds, limit_placeholder))
 }
 
 /// Compiles a `filter` into a fully-parenthesized SQL predicate plus its typed

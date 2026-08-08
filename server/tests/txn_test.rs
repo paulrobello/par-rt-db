@@ -9,8 +9,10 @@ use rtdb_server::auth::PrincipalCtx;
 use rtdb_server::db;
 use rtdb_server::ddl;
 use rtdb_server::error::ErrorCode;
+use rtdb_server::query::{FilterExpr, Query, QueryResult, execute_query};
 use rtdb_server::schema::SchemaDef;
 use rtdb_server::txn::{Step, Transaction, execute_txn};
+use sqlx::PgPool;
 
 fn kanban_schema() -> SchemaDef {
     serde_json::from_value(kanban_schema_json()).expect("parse kanban schema")
@@ -1000,7 +1002,7 @@ async fn upsert_multiple_matches_is_precondition_failed() -> anyhow::Result<()> 
     Ok(())
 }
 
-// (n) MAX_STEPS boundary: 256 steps ok, 257 -> BadRequest.
+// (n) MAX_STEPS boundary: 1024 steps ok, 1025 -> BadRequest.
 #[tokio::test]
 async fn max_steps_boundary() -> anyhow::Result<()> {
     let state = test_state().await;
@@ -1008,7 +1010,9 @@ async fn max_steps_boundary() -> anyhow::Result<()> {
     let db = fresh_db(&state).await;
     let schema = kanban_schema();
 
-    let steps_256: Vec<Step> = (0..256)
+    // MAX_STEPS is 1024: a 1024-step txn commits, a 1025-step txn is rejected
+    // up front (before any DB write) with BadRequest.
+    let steps_256: Vec<Step> = (0..1024)
         .map(|_| Step::Insert {
             table: "projects".to_string(),
             doc: valid_project_doc(),
@@ -1022,9 +1026,9 @@ async fn max_steps_boundary() -> anyhow::Result<()> {
         &PrincipalCtx::bypass(),
     )
     .await?;
-    assert_eq!(outcome.results.len(), 256);
+    assert_eq!(outcome.results.len(), 1024);
 
-    let steps_257: Vec<Step> = (0..257)
+    let steps_257: Vec<Step> = (0..1025)
         .map(|_| Step::Insert {
             table: "projects".to_string(),
             doc: valid_project_doc(),
@@ -1540,5 +1544,227 @@ async fn patch_creating_collision_is_conflict() -> anyhow::Result<()> {
     .expect_err("expected conflict");
     assert_eq!(err.code, ErrorCode::Conflict);
 
+    Ok(())
+}
+
+// =============================================================================
+// PatchByQuery / DeleteByQuery — predicate-driven bulk write steps.
+// =============================================================================
+
+/// Inserts one workItem with the given status/order under a fixed project id and
+/// returns its id. `projectId` is a 32-hex id type (format-validated, not FK-enforced).
+async fn insert_work_item_with(
+    pool: &PgPool,
+    db: &str,
+    schema: &SchemaDef,
+    status: &str,
+    order: f64,
+) -> anyhow::Result<String> {
+    let outcome = execute_txn(
+        pool,
+        db,
+        schema,
+        &Transaction {
+            steps: vec![Step::Insert {
+                table: "workItems".to_string(),
+                doc: doc(serde_json::json!({
+                    "projectId": "a".repeat(32),
+                    "title": "x",
+                    "status": status,
+                    "order": order,
+                })),
+            }],
+        },
+        &PrincipalCtx::bypass(),
+    )
+    .await?;
+    Ok(outcome.results[0]["id"].as_str().expect("id").to_string())
+}
+
+/// `count` terminal over the `by_status` index — the cheapest verify read.
+async fn count_by_status(
+    pool: &PgPool,
+    db: &str,
+    schema: &SchemaDef,
+    status: &str,
+) -> anyhow::Result<i64> {
+    let q = Query {
+        table: "workItems".to_string(),
+        get: None,
+        index: Some("by_status".to_string()),
+        eq: vec![serde_json::json!(status)],
+        gt: None,
+        gte: None,
+        lt: None,
+        lte: None,
+        order: None,
+        take: None,
+        unique: false,
+        first: false,
+        count: true,
+        distinct: false,
+        aggregate: None,
+        paginate: None,
+        filter: None,
+        search: None,
+        vector_search: None,
+        hybrid_search: None,
+    };
+    match execute_query(pool, db, schema, &q, &PrincipalCtx::bypass()).await? {
+        QueryResult::Count(n) => Ok(n),
+        other => panic!("expected Count, got {other:?}"),
+    }
+}
+
+// (byq-a) PatchByQuery patches every matching row and reports the count.
+#[tokio::test]
+async fn patch_by_query_updates_matching_rows() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+
+    insert_work_item_with(&pool, &db, &schema, "backlog", 1.0).await?;
+    insert_work_item_with(&pool, &db, &schema, "backlog", 2.0).await?;
+    insert_work_item_with(&pool, &db, &schema, "done", 3.0).await?;
+    assert_eq!(count_by_status(&pool, &db, &schema, "backlog").await?, 2);
+
+    let outcome = execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::PatchByQuery {
+                table: "workItems".to_string(),
+                filter: FilterExpr::Eq {
+                    field: "status".to_string(),
+                    value: serde_json::json!("backlog"),
+                },
+                patch: doc(serde_json::json!({ "status": "done" })),
+                limit: None,
+            }],
+        },
+        &PrincipalCtx::bypass(),
+    )
+    .await?;
+
+    assert_eq!(outcome.results.len(), 1);
+    assert_eq!(outcome.results[0]["patched"].as_u64(), Some(2));
+    assert_eq!(outcome.results[0]["truncated"].as_bool(), Some(false));
+    // Both backlog rows moved to done; none remain.
+    assert_eq!(count_by_status(&pool, &db, &schema, "backlog").await?, 0);
+    assert_eq!(count_by_status(&pool, &db, &schema, "done").await?, 3);
+    Ok(())
+}
+
+// (byq-b) PatchByQuery caps at `limit` and reports `truncated` when more match.
+#[tokio::test]
+async fn patch_by_query_respects_limit_and_truncated() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+
+    for i in 0..5 {
+        insert_work_item_with(&pool, &db, &schema, "backlog", i as f64).await?;
+    }
+
+    let outcome = execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::PatchByQuery {
+                table: "workItems".to_string(),
+                filter: FilterExpr::Eq {
+                    field: "status".to_string(),
+                    value: serde_json::json!("backlog"),
+                },
+                patch: doc(serde_json::json!({ "status": "done" })),
+                limit: Some(3),
+            }],
+        },
+        &PrincipalCtx::bypass(),
+    )
+    .await?;
+
+    assert_eq!(outcome.results[0]["patched"].as_u64(), Some(3));
+    assert_eq!(outcome.results[0]["truncated"].as_bool(), Some(true));
+    // 3 patched to done, 2 still backlog.
+    assert_eq!(count_by_status(&pool, &db, &schema, "done").await?, 3);
+    assert_eq!(count_by_status(&pool, &db, &schema, "backlog").await?, 2);
+    Ok(())
+}
+
+// (byq-c) DeleteByQuery removes every matching row and reports the count.
+#[tokio::test]
+async fn delete_by_query_removes_matching_rows() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+
+    insert_work_item_with(&pool, &db, &schema, "backlog", 1.0).await?;
+    insert_work_item_with(&pool, &db, &schema, "backlog", 2.0).await?;
+    insert_work_item_with(&pool, &db, &schema, "done", 3.0).await?;
+
+    let outcome = execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::DeleteByQuery {
+                table: "workItems".to_string(),
+                filter: FilterExpr::Eq {
+                    field: "status".to_string(),
+                    value: serde_json::json!("backlog"),
+                },
+                limit: None,
+            }],
+        },
+        &PrincipalCtx::bypass(),
+    )
+    .await?;
+
+    assert_eq!(outcome.results[0]["deleted"].as_u64(), Some(2));
+    assert_eq!(outcome.results[0]["truncated"].as_bool(), Some(false));
+    assert_eq!(count_by_status(&pool, &db, &schema, "backlog").await?, 0);
+    assert_eq!(count_by_status(&pool, &db, &schema, "done").await?, 1);
+    Ok(())
+}
+
+// (byq-d) DeleteByQuery respects `limit`/`truncated`.
+#[tokio::test]
+async fn delete_by_query_respects_limit_and_truncated() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+
+    for i in 0..4 {
+        insert_work_item_with(&pool, &db, &schema, "backlog", i as f64).await?;
+    }
+
+    let outcome = execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::DeleteByQuery {
+                table: "workItems".to_string(),
+                filter: FilterExpr::Eq {
+                    field: "status".to_string(),
+                    value: serde_json::json!("backlog"),
+                },
+                limit: Some(2),
+            }],
+        },
+        &PrincipalCtx::bypass(),
+    )
+    .await?;
+
+    assert_eq!(outcome.results[0]["deleted"].as_u64(), Some(2));
+    assert_eq!(outcome.results[0]["truncated"].as_bool(), Some(true));
+    assert_eq!(count_by_status(&pool, &db, &schema, "backlog").await?, 2);
     Ok(())
 }

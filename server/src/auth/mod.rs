@@ -31,9 +31,16 @@ pub enum Principal {
     },
     User {
         user_id: String,
-        email: String,
+        /// `None` for an anonymous user (no OAuth identity, no email). OAuth
+        /// users always carry a verified email.
+        email: Option<String>,
         name: Option<String>,
         expires_at: i64,
+        /// `true` for a credential-less guest minted by `POST /auth/anonymous`.
+        /// An anonymous user is authorized for any database via the
+        /// `RTDB_AUTH_ANONYMOUS_ENABLED` boot gate (no allowlist entry) and owns
+        /// its own documents via per-row `ownerField` (the anon `user_id`).
+        anonymous: bool,
         /// GitHub numeric id; `None` for users who authenticated through a
         /// non-GitHub provider (Google). Pairs with `github_login`.
         github_id: Option<i64>,
@@ -139,11 +146,26 @@ pub async fn authorize(pool: &PgPool, principal: &Principal, db: &str) -> Result
             }
         }
         Principal::User {
-            email, expires_at, ..
+            email,
+            expires_at,
+            anonymous,
+            ..
         } => {
             if *expires_at < now_ms() {
                 return Err(RtDbError::unauthorized("session expired"));
             }
+            // An anonymous user is authorized for any database via the boot
+            // `RTDB_AUTH_ANONYMOUS_ENABLED` gate (checked at mint time) — it has
+            // no email, so it can never appear in a per-db allowlist. Per-row
+            // `ownerField` still scopes it to its own documents.
+            if *anonymous {
+                return Ok(());
+            }
+            let Some(email) = email else {
+                return Err(RtDbError::forbidden(
+                    "user has no verified email and is not allowlisted for this database",
+                ));
+            };
 
             let row: Option<(String,)> = sqlx::query_as(
                 "SELECT email FROM rtdb_auth.allowlist WHERE db_name = $1 AND email = $2",
@@ -211,7 +233,7 @@ impl Principal {
         match self {
             Principal::User { user_id, email, .. } => PrincipalCtx {
                 user_id: Some(user_id.clone()),
-                email: Some(email.clone()),
+                email: email.clone(),
                 tables: None,
             },
             Principal::Machine { tables, .. } => PrincipalCtx {
@@ -278,6 +300,10 @@ pub async fn is_admin(pool: &PgPool, principal: &Principal) -> bool {
     else {
         return false;
     };
+    // An anonymous user (no email) is never a dashboard admin.
+    let Some(email) = email else {
+        return false;
+    };
     let email = email.to_lowercase();
     match sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS(SELECT 1 FROM rtdb_auth.admins WHERE email = $1 OR github_id = $2)",
@@ -319,7 +345,7 @@ pub fn authed_user(p: &Principal) -> AuthedUser {
             ..
         } => AuthedUser {
             kind: UserKind::User,
-            email: Some(email.clone()),
+            email: email.clone(),
             name: name.clone(),
             github_login: github_login.clone(),
             github_id: *github_id,
@@ -349,9 +375,10 @@ mod tests {
     fn authed_user_for_user_carries_email_and_name() {
         let principal = Principal::User {
             user_id: "u".to_string(),
-            email: "a@b.com".to_string(),
+            email: Some("a@b.com".to_string()),
             name: Some("Alice".to_string()),
             expires_at: i64::MAX,
+            anonymous: false,
             github_id: None,
             github_login: None,
         };
@@ -367,9 +394,10 @@ mod tests {
     fn authed_user_for_user_surfaces_github_identity() {
         let principal = Principal::User {
             user_id: "u".to_string(),
-            email: "a@b.com".to_string(),
+            email: Some("a@b.com".to_string()),
             name: Some("Alice".to_string()),
             expires_at: i64::MAX,
+            anonymous: false,
             github_id: Some(42),
             github_login: Some("alice".to_string()),
         };

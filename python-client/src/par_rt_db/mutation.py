@@ -29,9 +29,10 @@ from __future__ import annotations
 
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_serializer
+from pydantic_core.core_schema import SerializerFunctionWrapHandler
 
-from .wire import to_camel
+from .wire import FilterExpr, to_camel
 
 #: Client-side cap on transaction length. Mirrors ``server/src/txn.rs::MAX_STEPS``;
 #: the server rejects anything longer, so the builder raises eagerly to keep
@@ -98,10 +99,55 @@ class _Upsert(_Step):
     patch: dict[str, Any]
 
 
-#: Discriminated union of all 7 step ops. The ``op`` literal drives dispatch;
+class _PatchByQuery(_Step):
+    op: Literal["patchByQuery"] = "patchByQuery"
+    table: str
+    filter: FilterExpr
+    patch: dict[str, Any]
+    #: Optional row cap (default ``MAX_BY_QUERY_ROWS`` server-side). Omitted on
+    #: the wire when ``None`` (mirrors the server's
+    #: ``skip_serializing_if = "Option::is_none"``).
+    limit: int | None = None
+
+    @model_serializer(mode="wrap")
+    def _drop_none_limit(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        out = handler(self)
+        if out.get("limit") is None:
+            out.pop("limit", None)
+        return out
+
+
+class _DeleteByQuery(_Step):
+    op: Literal["deleteByQuery"] = "deleteByQuery"
+    table: str
+    filter: FilterExpr
+    #: Optional row cap (default ``MAX_BY_QUERY_ROWS`` server-side). Omitted on
+    #: the wire when ``None`` (mirrors the server's
+    #: ``skip_serializing_if = "Option::is_none"``).
+    limit: int | None = None
+
+    @model_serializer(mode="wrap")
+    def _drop_none_limit(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        out = handler(self)
+        if out.get("limit") is None:
+            out.pop("limit", None)
+        return out
+
+
+#: Discriminated union of all 9 step ops. The ``op`` literal drives dispatch;
 #: ``deny_unknown_fields`` is per-variant via ``extra="forbid"`` on ``_Step``.
 Step = Annotated[
-    (_Insert | _Patch | _Replace | _Delete | _ExpectVersion | _ExpectAbsent | _Upsert),
+    (
+        _Insert
+        | _Patch
+        | _Replace
+        | _Delete
+        | _ExpectVersion
+        | _ExpectAbsent
+        | _Upsert
+        | _PatchByQuery
+        | _DeleteByQuery
+    ),
     Field(discriminator="op"),
 ]
 
@@ -152,12 +198,39 @@ class _StepUpsert(BaseModel):
     inserted: bool
 
 
+class _StepPatchByQuery(BaseModel):
+    """Per-step result for ``patchByQuery``: ``{"patched", "truncated"}``."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        populate_by_name=True,
+        alias_generator=to_camel,
+    )
+
+    patched: int
+    truncated: bool
+
+
+class _StepDeleteByQuery(BaseModel):
+    """Per-step result for ``deleteByQuery``: ``{"deleted", "truncated"}``."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        populate_by_name=True,
+        alias_generator=to_camel,
+    )
+
+    deleted: int
+    truncated: bool
+
+
 #: Untagged per-step result, positionally aligned with ``Transaction.steps``.
 #: Variant order matters: ``_StepUpsert`` (richer) must precede ``_StepInsert``
 #: so ``{"id","inserted"}`` is captured as an upsert, not silently trimmed to an
 #: insert. ``None`` covers the ``null`` wire shape produced by ``expectVersion``/
-#: ``expectAbsent``/``patch``/``replace``/``delete``.
-StepResult = _StepUpsert | _StepInsert | None
+#: ``expectAbsent``/``patch``/``replace``/``delete``. ``patchByQuery``/
+#: ``deleteByQuery`` carry their own ``{patched|deleted, truncated}`` shape.
+StepResult = _StepUpsert | _StepInsert | _StepPatchByQuery | _StepDeleteByQuery | None
 
 
 class _MutationBuilder:
@@ -213,6 +286,25 @@ class _MutationBuilder:
                 patch=patch,
             )
         )
+        return self
+
+    def patch_by_query(
+        self,
+        table: str,
+        filter: FilterExpr,
+        patch: dict[str, Any],
+        limit: int | None = None,
+    ) -> _MutationBuilder:
+        self._steps.append(_PatchByQuery(table=table, filter=filter, patch=patch, limit=limit))
+        return self
+
+    def delete_by_query(
+        self,
+        table: str,
+        filter: FilterExpr,
+        limit: int | None = None,
+    ) -> _MutationBuilder:
+        self._steps.append(_DeleteByQuery(table=table, filter=filter, limit=limit))
         return self
 
     def build(self) -> Transaction:

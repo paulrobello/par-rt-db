@@ -166,6 +166,7 @@ export function useRtDbAuth(): {
   state: AuthState;
   user: AuthedUser | null;
   signIn: (provider?: "github" | "google" | "oidc") => Promise<void>;
+  signInAnonymous: () => Promise<void>;
   signOut: () => Promise<void>;
 } {
   const { client, authBaseUrl, state, user } = useContextValue();
@@ -189,6 +190,29 @@ export function useRtDbAuth(): {
     },
     [client, authBaseUrl],
   );
+
+  // Anonymous sign-in: a direct POST (no OAuth popup). The server mints an
+  // ephemeral user + session when RTDB_AUTH_ANONYMOUS_ENABLED is on; the
+  // response sets the HttpOnly cookie (cookie mode) AND returns the session
+  // token (token mode). A disabled server replies 403, which rejects here.
+  const signInAnonymous = useCallback(async () => {
+    const resp = await fetch(`${authBaseUrl.replace(/\/+$/, "")}/auth/anonymous`, {
+      method: "POST",
+      credentials: "include",
+    });
+    if (!resp.ok) {
+      throw new Error(`anonymous sign-in failed: ${resp.status}`);
+    }
+    if (client.cookieMode) {
+      client.setToken(null);
+    } else {
+      const body = (await resp.json()) as { token: string };
+      if (typeof localStorage !== "undefined") {
+        localStorage.setItem(TOKEN_STORAGE_KEY, body.token);
+      }
+      client.setToken(body.token);
+    }
+  }, [client, authBaseUrl]);
 
   const signOut = useCallback(async () => {
     if (client.cookieMode) {
@@ -215,7 +239,7 @@ export function useRtDbAuth(): {
     }
   }, [client, authBaseUrl]);
 
-  return { state, user, signIn, signOut };
+  return { state, user, signIn, signInAnonymous, signOut };
 }
 
 export function Authenticated(props: { children: ReactNode }): ReactNode {

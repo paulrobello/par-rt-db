@@ -246,15 +246,18 @@ class TableQuery:
         return self
 
     def aggregate(
-        self, op: Literal["sum", "avg", "min", "max"], *, group_by: bool = False
+        self, op: Literal["sum", "avg", "min", "max", "count"], *, group_by: bool = False
     ) -> TableQuery:
-        """Aggregate terminal: runs ``<op>`` (SUM/AVG/MIN/MAX) over the index
-        field after the eq prefix. With ``group_by=True``, groups by that field
-        and aggregates the next one. ``sum``/``avg`` require a numeric aggregate
-        field; the server rejects non-numeric, no-index, or no-field-beyond-prefix
-        cases. Mutually exclusive with every other terminal except ``eq``/range
-        bounds/``filter``; ``take`` is also rejected — group count is capped
-        internally by MAX_TAKE."""
+        """Aggregate terminal: runs ``<op>`` (SUM/AVG/MIN/MAX/COUNT) over the
+        index field after the eq prefix. With ``group_by=True``, groups by that
+        field and aggregates the next one. ``sum``/``avg`` require a numeric
+        aggregate field; ``count`` aggregates rows and consumes no aggregate
+        field (a scalar ``count`` needs no index at all; a grouped ``count``
+        needs one index field beyond the eq prefix to group by). The server
+        rejects non-numeric, no-index, or no-field-beyond-prefix cases for the
+        field-bearing ops. Mutually exclusive with every other terminal except
+        ``eq``/range bounds/``filter``; ``take`` is also rejected — group count
+        is capped internally by MAX_TAKE."""
         self._aggregate = AggregateSpec.model_validate({"op": op, "groupBy": bool(group_by)})
         return self
 
@@ -337,7 +340,7 @@ class TableQuery:
         return self.build()
 
     def build_for_aggregate(
-        self, op: Literal["sum", "avg", "min", "max"], *, group_by: bool = False
+        self, op: Literal["sum", "avg", "min", "max", "count"], *, group_by: bool = False
     ) -> Query:
         self.aggregate(op, group_by=group_by)
         return self.build()
@@ -387,7 +390,9 @@ def parse_result(model: type[Any], terminal: str, value: Any) -> Any:
         ``distinct`` → ``list[model]`` (typically ``list[Any]`` — the unique
         scalar values of the index field after the eq prefix);
         ``aggregate`` → ``model | None`` (the scalar aggregate value, or ``None``
-        when the server returned JSON null over an empty matching set);
+        when the server returned JSON null over an empty matching set; ``count``
+        returns an integer and is never ``None`` — it yields ``0`` over an empty
+        set);
         ``aggregateGroups`` → ``list[AggregateGroup]`` (the ``{key, value}``
         rows from a grouped aggregate);
         ``paginate`` → ``Paginated[model]``.

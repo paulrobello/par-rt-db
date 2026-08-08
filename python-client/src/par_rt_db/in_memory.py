@@ -70,10 +70,12 @@ from .mutation import (
     StepResult,
     Transaction,
     _Delete,
+    _DeleteByQuery,
     _ExpectAbsent,
     _ExpectVersion,
     _Insert,
     _Patch,
+    _PatchByQuery,
     _Replace,
     _Upsert,
 )
@@ -126,6 +128,11 @@ from .wire import (
 MAX_STEPS = 256
 #: Maximum rows returned from a single ``take``/``collect`` (mirrors the server cap).
 MAX_TAKE = 4096
+#: Hard cap on rows a single ``patchByQuery``/``deleteByQuery`` step may touch
+#: (mirrors ``server/src/txn.rs::MAX_BY_QUERY_ROWS``). Bounds one serialized
+#: turn and prevents a wildcard filter from sweeping a whole table; a larger
+#: match set touches exactly this many and reports ``truncated: true``.
+MAX_BY_QUERY_ROWS = 1000
 #: Approximate cron re-fire interval for the in-memory stub. Real 5-field cron
 #: parsing is deferred to the server; the harness only needs crons to re-arm.
 CRON_STEP_MS = 60_000
@@ -1162,39 +1169,62 @@ class InMemoryRtDbClient:
             return distinct_values[:MAX_TAKE]
 
         # `aggregate` terminal: <OP> over the index field after the eq prefix
-        # (groupBy: group by that field, aggregate the next). Null agg values are
-        # skipped (SQL NULL semantics); an empty scalar set -> None; groups are
-        # ordered by key asc and capped by MAX_TAKE.
+        # (groupBy: group by that field, aggregate the next). `count` aggregates
+        # rows, not a field — it consumes no aggregate index field (a scalar
+        # `count` needs no index at all; a grouped `count` needs one index field
+        # beyond the eq prefix to group by). Null agg values are skipped for the
+        # field-bearing ops (SQL NULL semantics); an empty scalar set -> None
+        # (count -> 0); groups are ordered by key asc and capped by MAX_TAKE.
         if q.aggregate is not None:
             agg = q.aggregate
-            if index_def is None:
-                raise RtDbError(
-                    ErrorCode.BAD_REQUEST,
-                    "aggregate requires an index field beyond the eq prefix",
-                )
             eq_len = len(typed_eq)
+            # `count` aggregates rows and consumes no aggregate field.
+            needs_field = agg.op != AggregateOp.COUNT
+
+            # Resolve the group field: groupBy always needs one index field
+            # beyond the eq prefix.
             if agg.group_by:
-                if eq_len + 1 >= len(index_def.fields):
+                if index_def is None or eq_len >= len(index_def.fields):
                     raise RtDbError(
                         ErrorCode.BAD_REQUEST,
-                        "aggregate groupBy requires two index fields beyond the eq prefix",
+                        "aggregate groupBy requires an index field beyond the eq prefix",
                     )
                 group_field = index_def.fields[eq_len]
-                agg_field = index_def.fields[eq_len + 1]
             else:
-                if eq_len >= len(index_def.fields):
+                group_field = None
+
+            # Resolve the aggregate field (count consumes none; the rest need
+            # one beyond the eq prefix, or two when grouped).
+            if needs_field:
+                if index_def is None:
                     raise RtDbError(
                         ErrorCode.BAD_REQUEST,
                         "aggregate requires an index field beyond the eq prefix",
                     )
-                group_field = None
-                agg_field = index_def.fields[eq_len]
-            agg_pg = _pg_for_field(table_def, agg_field)
-            if agg.op in (AggregateOp.SUM, AggregateOp.AVG) and agg_pg not in (_NUMBER, _INT64):
-                raise RtDbError(
-                    ErrorCode.BAD_REQUEST,
-                    f"aggregate op {agg.op} requires a numeric index field",
-                )
+                if agg.group_by:
+                    if eq_len + 1 >= len(index_def.fields):
+                        raise RtDbError(
+                            ErrorCode.BAD_REQUEST,
+                            "aggregate groupBy requires two index fields beyond the eq prefix",
+                        )
+                    agg_field = index_def.fields[eq_len + 1]
+                else:
+                    if eq_len >= len(index_def.fields):
+                        raise RtDbError(
+                            ErrorCode.BAD_REQUEST,
+                            "aggregate requires an index field beyond the eq prefix",
+                        )
+                    agg_field = index_def.fields[eq_len]
+                agg_pg = _pg_for_field(table_def, agg_field)
+                if agg.op in (AggregateOp.SUM, AggregateOp.AVG) and agg_pg not in (_NUMBER, _INT64):
+                    raise RtDbError(
+                        ErrorCode.BAD_REQUEST,
+                        f"aggregate op {agg.op} requires a numeric index field",
+                    )
+            else:
+                agg_field = None
+                agg_pg = _TEXT  # unused for count
+
             if group_field is not None:
                 group_pg = _pg_for_field(table_def, group_field)
                 groups: list[tuple[Any, list[Any]]] = []
@@ -1209,17 +1239,29 @@ class InMemoryRtDbClient:
                         i = len(groups)
                         group_index[key] = i
                         groups.append((k, []))
-                    av = row.doc.get(agg_field)
-                    if av is not None:
-                        groups[i][1].append(av)
-                out: list[dict[str, Any]] = [
-                    {"key": k, "value": _apply_aggregate(agg.op, vs, agg_pg) if vs else None}
-                    for k, vs in groups
-                ]
+                    if agg_field is not None:
+                        av = row.doc.get(agg_field)
+                        if av is not None:
+                            groups[i][1].append(av)
+                    else:
+                        # count: every row in the group counts (COUNT(*)).
+                        groups[i][1].append(1)
+                if agg.op == AggregateOp.COUNT:
+                    out: list[dict[str, Any]] = [{"key": k, "value": len(vs)} for k, vs in groups]
+                else:
+                    out = [
+                        {"key": k, "value": _apply_aggregate(agg.op, vs, agg_pg) if vs else None}
+                        for k, vs in groups
+                    ]
                 out.sort(
                     key=cmp_to_key(lambda a, b: _compare_index_values(a["key"], b["key"], group_pg))
                 )
                 return out[:MAX_TAKE]
+            # Scalar path: count returns the matching-row count (0 if none);
+            # the field-bearing ops reduce their non-null agg values (None if empty).
+            if agg.op == AggregateOp.COUNT:
+                return len(filtered)
+            assert agg_field is not None  # needs_field is True for every non-count op
             agg_values = [row.doc.get(agg_field) for row in filtered]
             agg_values = [v for v in agg_values if v is not None]
             if not agg_values:
@@ -1378,6 +1420,41 @@ class InMemoryRtDbClient:
                     return _upsert_result(row.id, False), table
                 new_id = self._do_insert(table, table_def, insert_doc)
                 return _upsert_result(new_id, True), table
+            case _PatchByQuery(table=table, filter=flt, patch=patch_fields, limit=limit_opt):
+                table_def = self._require_table(table)
+                _validate_filter(flt, set(table_def.fields.keys()))
+                matched = [
+                    row
+                    for (t, _id), row in self._docs.items()
+                    if t == table and _eval_filter_expr(flt, row.doc)
+                ]
+                matched.sort(key=lambda r: (r.created_at, r.id))
+                limit = (
+                    MAX_BY_QUERY_ROWS if limit_opt is None else min(limit_opt, MAX_BY_QUERY_ROWS)
+                )
+                truncated = len(matched) > limit
+                take = matched[:limit]
+                for row in take:
+                    merged = apply_patch(table_def, row.doc, patch_fields)
+                    self._do_update(table_def, table, row.id, merged)
+                return _patch_by_query_result(len(take), truncated), table
+            case _DeleteByQuery(table=table, filter=flt, limit=limit_opt):
+                table_def = self._require_table(table)
+                _validate_filter(flt, set(table_def.fields.keys()))
+                matched = [
+                    row
+                    for (t, _id), row in self._docs.items()
+                    if t == table and _eval_filter_expr(flt, row.doc)
+                ]
+                matched.sort(key=lambda r: (r.created_at, r.id))
+                limit = (
+                    MAX_BY_QUERY_ROWS if limit_opt is None else min(limit_opt, MAX_BY_QUERY_ROWS)
+                )
+                truncated = len(matched) > limit
+                take = matched[:limit]
+                for row in take:
+                    self._do_delete(table, row.id)
+                return _delete_by_query_result(len(take), truncated), table
             case _:
                 raise RtDbError(ErrorCode.INTERNAL, "unknown step op")
 
@@ -1885,6 +1962,14 @@ def _insert_result(id: str) -> StepResult:
 
 def _upsert_result(id: str, inserted: bool) -> StepResult:
     return _STEP_RESULT.validate_python({"id": id, "inserted": inserted})
+
+
+def _patch_by_query_result(patched: int, truncated: bool) -> StepResult:
+    return _STEP_RESULT.validate_python({"patched": patched, "truncated": truncated})
+
+
+def _delete_by_query_result(deleted: int, truncated: bool) -> StepResult:
+    return _STEP_RESULT.validate_python({"deleted": deleted, "truncated": truncated})
 
 
 # ---------------------------------------------------------------------------

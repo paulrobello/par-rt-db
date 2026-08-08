@@ -302,6 +302,7 @@ mod tests {
             apple_key_id: None,
             apple_private_key: None,
             max_affected_docs: 100,
+            auth_anonymous_enabled: false,
             static_dir: None,
             pool_max_connections: 75,
             rate_limit_per_token_rpm: 0,

@@ -254,6 +254,58 @@ describe("InMemoryRtDbClient — query by index", () => {
     expect(v).toBeNull();
   });
 
+  it("aggregate count counts matching rows (scalar, needs no index field)", async () => {
+    const c = newClient();
+    await seed(c); // 3× todo
+    // Over an eq prefix: count of todo rows.
+    const n = await c.query(
+      api.items.query().withIndex("by_status_and_order", ["todo"]).aggregate("count"),
+    );
+    expect(n).toBe(3);
+    // Scalar count needs no aggregate index field at all — a full-table count
+    // (no index) is allowed for `count`, unlike sum/avg/min/max.
+    const all = await c.query(api.items.query().aggregate("count"));
+    expect(all).toBe(3);
+    // Zero matching rows → 0 (not null, unlike the field-bearing ops).
+    const none = await c.query(
+      api.items.query().withIndex("by_status_and_order", ["done"]).aggregate("count"),
+    );
+    expect(none).toBe(0);
+  });
+
+  it("aggregate count groupBy returns one {key, count} per group", async () => {
+    const c = newClient();
+    await c.mutate(mutation().insert("items", { name: "a", status: "todo", order: 1 }).build());
+    await c.mutate(mutation().insert("items", { name: "b", status: "todo", order: 2 }).build());
+    await c.mutate(mutation().insert("items", { name: "c", status: "done", order: 5 }).build());
+    // by_status_and_order has [status, order]; eq=[] leaves `status` as the group
+    // key. Count consumes no second index field (unlike sum groupBy).
+    const rows = (await c.query(
+      api.items.query().withIndex("by_status_and_order", []).aggregate("count", true),
+    )) as { key: unknown; value: unknown }[];
+    expect(rows).toEqual([
+      { key: "done", value: 1 },
+      { key: "todo", value: 2 },
+    ]);
+  });
+
+  it("aggregate count groupBy requires an index field beyond the eq prefix", async () => {
+    const c = newClient();
+    await seed(c);
+    // by_status has only one field; groupBy needs one to group by (count needs
+    // no second field, but still needs the group field).
+    await expect(
+      c.query(
+        // eq consumes the only field, leaving none to group by.
+        api.items.query().withIndex("by_status", ["todo"]).aggregate("count", true),
+      ),
+    ).rejects.toMatchObject({
+      name: "RtDbError",
+      code: "BAD_REQUEST",
+      message: /requires an index field beyond the eq prefix/,
+    });
+  });
+
   it("aggregate sum on a non-numeric index field is bad request", async () => {
     const c = newClient();
     await seed(c);
@@ -388,6 +440,98 @@ describe("InMemoryRtDbClient — transactions", () => {
     const docs = await c.query(api.items.query().withIndex("by_status", ["todo"]).collect());
     expect(docs).toHaveLength(1);
     expect((docs[0] as { name: string }).name).toBe("a");
+  });
+});
+
+describe("InMemoryRtDbClient — by-query (patchByQuery / deleteByQuery)", () => {
+  const todoFilter: FilterExpr = { op: "eq", field: "status", value: "todo" };
+
+  it("patchByQuery patches every matching row and reports {patched, truncated}", async () => {
+    const c = newClient();
+    for (const order of [1, 2, 3]) {
+      await c.mutate(
+        mutation()
+          .insert("items", { name: `n${order}`, status: "todo", order })
+          .build(),
+      );
+    }
+    await c.mutate(mutation().insert("items", { name: "done1", status: "done", order: 9 }).build());
+
+    const [res] = await c.mutate(
+      mutation().patchByQuery("items", todoFilter, { order: 0 }).build(),
+    );
+    expect(res).toEqual({ patched: 3, truncated: false });
+
+    // Only the three todo rows were patched; the done row is unchanged.
+    const docs = (await c.query(api.items.query().withIndex("by_status", ["todo"]).collect())) as {
+      order: number;
+    }[];
+    expect(docs).toHaveLength(3);
+    expect(docs.every((d) => d.order === 0)).toBe(true);
+    const done = (await c.query(api.items.query().withIndex("by_status", ["done"]).collect())) as {
+      order: number;
+    }[];
+    expect(done[0].order).toBe(9);
+  });
+
+  it("patchByQuery truncates when the match set exceeds limit", async () => {
+    const c = newClient();
+    for (const order of [1, 2, 3, 4, 5]) {
+      await c.mutate(
+        mutation()
+          .insert("items", { name: `n${order}`, status: "todo", order })
+          .build(),
+      );
+    }
+    const [res] = await c.mutate(
+      mutation().patchByQuery("items", todoFilter, { order: 0 }, 2).build(),
+    );
+    expect(res).toEqual({ patched: 2, truncated: true });
+  });
+
+  it("deleteByQuery deletes every matching row and reports {deleted, truncated}", async () => {
+    const c = newClient();
+    for (const order of [1, 2, 3]) {
+      await c.mutate(
+        mutation()
+          .insert("items", { name: `n${order}`, status: "todo", order })
+          .build(),
+      );
+    }
+    await c.mutate(mutation().insert("items", { name: "done1", status: "done", order: 9 }).build());
+
+    const [res] = await c.mutate(mutation().deleteByQuery("items", todoFilter).build());
+    expect(res).toEqual({ deleted: 3, truncated: false });
+
+    const todo = await c.query(api.items.query().withIndex("by_status", ["todo"]).collect());
+    expect(todo).toEqual([]);
+    const done = await c.query(api.items.query().withIndex("by_status", ["done"]).collect());
+    expect(done).toHaveLength(1);
+  });
+
+  it("deleteByQuery truncates when the match set exceeds limit", async () => {
+    const c = newClient();
+    for (const order of [1, 2, 3, 4, 5]) {
+      await c.mutate(
+        mutation()
+          .insert("items", { name: `n${order}`, status: "todo", order })
+          .build(),
+      );
+    }
+    const [res] = await c.mutate(mutation().deleteByQuery("items", todoFilter, 2).build());
+    expect(res).toEqual({ deleted: 2, truncated: true });
+    // The remaining 3 todo rows are still present.
+    const remaining = await c.query(api.items.query().withIndex("by_status", ["todo"]).collect());
+    expect(remaining).toHaveLength(3);
+  });
+
+  it("patchByQuery over an empty match set is a no-op (patched:0)", async () => {
+    const c = newClient();
+    await c.mutate(mutation().insert("items", { name: "a", status: "done", order: 1 }).build());
+    const [res] = await c.mutate(
+      mutation().patchByQuery("items", todoFilter, { order: 0 }).build(),
+    );
+    expect(res).toEqual({ patched: 0, truncated: false });
   });
 });
 

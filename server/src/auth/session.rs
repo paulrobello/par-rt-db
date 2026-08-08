@@ -45,8 +45,10 @@ pub async fn create_session(
 pub async fn resolve_session(pool: &PgPool, token: &str) -> Result<Option<Principal>, RtDbError> {
     let hash = sha256_hex(token);
 
-    let row: Option<(String, i64, String, Option<i64>, String)> = sqlx::query_as(
-        "SELECT s.user_id, s.expires_at, u.email, u.github_id, u.login \
+    // `(user_id, expires_at, email, github_id, login, anonymous)`.
+    type SessionUserRow = (String, i64, Option<String>, Option<i64>, String, bool);
+    let row: Option<SessionUserRow> = sqlx::query_as(
+        "SELECT s.user_id, s.expires_at, u.email, u.github_id, u.login, u.anonymous \
          FROM rtdb_auth.sessions s JOIN rtdb_auth.users u ON u.id = s.user_id \
          WHERE s.token_hash = $1",
     )
@@ -54,7 +56,7 @@ pub async fn resolve_session(pool: &PgPool, token: &str) -> Result<Option<Princi
     .fetch_optional(pool)
     .await?;
 
-    let Some((user_id, expires_at, email, github_id, login)) = row else {
+    let Some((user_id, expires_at, email, github_id, login, anonymous)) = row else {
         return Ok(None);
     };
 
@@ -71,6 +73,7 @@ pub async fn resolve_session(pool: &PgPool, token: &str) -> Result<Option<Princi
         email,
         name: None,
         expires_at,
+        anonymous,
         github_id,
         github_login: github_id.is_some().then_some(login),
     }))

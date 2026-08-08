@@ -3,6 +3,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+use crate::wire::FilterExpr;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Transaction {
     pub steps: Vec<Step>,
@@ -46,6 +48,26 @@ pub enum Step {
         insert: Map<String, Value>,
         patch: Map<String, Value>,
     },
+    /// Patch every row in `table` matching `filter`. At most `limit` rows
+    /// (default server cap 1000); a larger match set patches `limit` and reports
+    /// `truncated: true`. Mirrors `server/src/txn.rs::Step::PatchByQuery`
+    /// byte-for-byte.
+    PatchByQuery {
+        table: String,
+        filter: FilterExpr,
+        patch: Map<String, Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<u32>,
+    },
+    /// Delete every row in `table` matching `filter` (same `limit`/`truncated`
+    /// semantics as `PatchByQuery`). Mirrors
+    /// `server/src/txn.rs::Step::DeleteByQuery` byte-for-byte.
+    DeleteByQuery {
+        table: String,
+        filter: FilterExpr,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<u32>,
+    },
 }
 
 /// One entry of `mutateOk.results`, positionally aligned with `steps`.
@@ -53,12 +75,17 @@ pub enum Step {
 /// Variant order matters: `Upsert` must precede `Insert` because serde's
 /// `untagged` deserializer tries variants in declaration order and struct
 /// variants ignore unknown fields — so `{id, inserted}` would otherwise be
-/// greedily captured by `Insert`, silently dropping `inserted`.
+/// greedily captured by `Insert`, silently dropping `inserted`. `PatchByQuery`
+/// and `DeleteByQuery` carry distinct fields (`patched`/`deleted` + `truncated`)
+/// that never collide with `{id}` / `{id, inserted}`, so their order relative
+/// to the others is unconstrained.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum StepResult {
     Upsert { id: String, inserted: bool },
     Insert { id: String },
+    PatchByQuery { patched: u32, truncated: bool },
+    DeleteByQuery { deleted: u32, truncated: bool },
     Null,
 }
 
@@ -151,6 +178,36 @@ impl Mutation {
         self
     }
 
+    /// Patch every row in `table` matching `filter`. `limit` defaults to the
+    /// server cap (1000) when `None`; a larger match set patches `limit` rows and
+    /// reports `truncated: true` in the result.
+    pub fn patch_by_query(
+        mut self,
+        table: &str,
+        filter: FilterExpr,
+        patch: Value,
+        limit: Option<u32>,
+    ) -> Self {
+        self.steps.push(Step::PatchByQuery {
+            table: table.into(),
+            filter,
+            patch: Self::obj(patch),
+            limit,
+        });
+        self
+    }
+
+    /// Delete every row in `table` matching `filter` (same `limit`/`truncated`
+    /// semantics as [`patch_by_query`](Self::patch_by_query)).
+    pub fn delete_by_query(mut self, table: &str, filter: FilterExpr, limit: Option<u32>) -> Self {
+        self.steps.push(Step::DeleteByQuery {
+            table: table.into(),
+            filter,
+            limit,
+        });
+        self
+    }
+
     pub fn build(self) -> Transaction {
         Transaction { steps: self.steps }
     }
@@ -222,6 +279,84 @@ mod tests {
             StepResult::Upsert {
                 inserted: false,
                 ..
+            }
+        ));
+    }
+
+    #[test]
+    fn patch_by_query_serializes() {
+        let txn = Mutation::new()
+            .patch_by_query(
+                "items",
+                FilterExpr::Eq {
+                    field: "status".into(),
+                    value: json!("backlog"),
+                },
+                json!({"status":"done"}),
+                None,
+            )
+            .build();
+        // limit omitted on the wire when None.
+        assert_eq!(
+            serde_json::to_value(&txn).unwrap(),
+            json!({
+                "steps": [
+                    {
+                        "op":"patchByQuery",
+                        "table":"items",
+                        "filter":{"op":"eq","field":"status","value":"backlog"},
+                        "patch":{"status":"done"}
+                    }
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn delete_by_query_serializes_with_limit() {
+        let txn = Mutation::new()
+            .delete_by_query(
+                "items",
+                FilterExpr::Eq {
+                    field: "status".into(),
+                    value: json!("archived"),
+                },
+                Some(50),
+            )
+            .build();
+        assert_eq!(
+            serde_json::to_value(&txn).unwrap(),
+            json!({
+                "steps": [
+                    {
+                        "op":"deleteByQuery",
+                        "table":"items",
+                        "filter":{"op":"eq","field":"status","value":"archived"},
+                        "limit":50
+                    }
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn step_result_parses_patch_and_delete_by_query() {
+        let patched: StepResult =
+            serde_json::from_value(json!({"patched":3,"truncated":false})).unwrap();
+        assert!(matches!(
+            patched,
+            StepResult::PatchByQuery {
+                patched: 3,
+                truncated: false
+            }
+        ));
+        let deleted: StepResult =
+            serde_json::from_value(json!({"deleted":1000,"truncated":true})).unwrap();
+        assert!(matches!(
+            deleted,
+            StepResult::DeleteByQuery {
+                deleted: 1000,
+                truncated: true
             }
         ));
     }

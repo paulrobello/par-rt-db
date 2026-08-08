@@ -123,15 +123,18 @@ export class TableQuery<DocT, Indexes extends string> {
     return { json: { ...this.json, distinct: true } };
   }
 
-  /** Aggregate terminal: runs `<op>` (SUM/AVG/MIN/MAX) over the index field
-   * immediately after the `eq` prefix. Without `groupBy`, returns one scalar
-   * (`null` if no rows match). With `groupBy: true`, groups by the index field
-   * after the eq prefix and aggregates the one after that, returning
-   * `{key, value}[]` ordered by group key. `sum`/`avg` require a numeric
-   * aggregate field; the server rejects non-numeric, no-index, or
-   * no-field-beyond-prefix cases. Mutually exclusive with every other terminal
-   * except `eq`/range bounds/`filter` (which narrow the matching set); `take`
-   * is also rejected — group count is capped internally by MAX_TAKE. */
+  /** Aggregate terminal: runs `<op>` (SUM/AVG/MIN/MAX/COUNT) over the index
+   * field immediately after the `eq` prefix. Without `groupBy`, returns one
+   * scalar (`null` if no rows match; `0` for `count`). With `groupBy: true`,
+   * groups by the index field after the eq prefix and aggregates the one after
+   * that, returning `{key, value}[]` ordered by group key. `sum`/`avg` require
+   * a numeric aggregate field; `count` aggregates rows and consumes no
+   * aggregate field (a scalar `count` needs no index, a grouped `count` needs
+   * one index field to group by). The server rejects non-numeric, no-index, or
+   * no-field-beyond-prefix cases for the field-bearing ops. Mutually exclusive
+   * with every other terminal except `eq`/range bounds/`filter` (which narrow
+   * the matching set); `take` is also rejected — group count is capped
+   * internally by MAX_TAKE. */
   aggregate(
     op: AggregateOp,
     groupBy: boolean = false,

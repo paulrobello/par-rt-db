@@ -48,10 +48,11 @@ def _new_client() -> InMemoryRtDbClient:
 
 def _insert(c: InMemoryRtDbClient, doc: dict[str, Any]) -> str:
     """Insert ``doc`` into the sessions table and return its id (narrowing the
-    ``StepResult | None`` union the way the existing suite does)."""
+    ``StepResult | None`` union via ``model_dump`` — the union also carries
+    ``patchByQuery``/``deleteByQuery`` shapes with no ``id``)."""
     [res] = c.mutate(Mutation.builder().insert(_TABLE, doc).build())
     assert res is not None
-    return res.id
+    return str(res.model_dump()["id"])
 
 
 def test_ttl_serializes_with_camel_alias_and_omits_none() -> None:
