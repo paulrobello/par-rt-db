@@ -851,6 +851,94 @@ pub async fn execute_query(
         .await;
     }
 
+    // Compile the index window (eq/range binds, client `filter`, owner/
+    // collaborator/`authorize` predicates, and placeholder offsets) shared by
+    // every remaining terminal. `compile_query_window` is a verbatim lift of
+    // the block that previously lived inline here; see its body for the
+    // bind-ordering and placeholder-numbering invariants.
+    let w = compile_query_window(table_def, q, ctx, owner, owner_field, collaborators_field)?;
+
+    if q.count {
+        return execute_count_terminal(w, pool, db, &q.table).await;
+    }
+
+    if q.distinct {
+        return execute_distinct_terminal(w, pool, db, &q.table).await;
+    }
+
+    if let Some(agg) = &q.aggregate {
+        return execute_aggregate_terminal(w, table_def, agg, pool, db, &q.table).await;
+    }
+
+    let mut sort_cols: Vec<String> = match w.index_def {
+        Some(idx) => idx.fields[w.eq_len..]
+            .iter()
+            .map(|field_name| format!("\"{}\"", pg_col(field_name)))
+            .collect(),
+        None => Vec::new(),
+    };
+    sort_cols.push("\"created_at\"".to_string());
+    sort_cols.push("\"id\"".to_string());
+
+    let dir = match q.order {
+        Some(Order::Desc) => "DESC",
+        _ => "ASC",
+    };
+    let order_by = sort_cols
+        .iter()
+        .map(|col| format!("{col} {dir}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    if let Some(paginate) = &q.paginate {
+        return execute_paginate_terminal(
+            w, table_def, paginate, sort_cols, dir, &order_by, pool, db, &q.table,
+        )
+        .await;
+    }
+
+    execute_collect_terminal(w, q.unique, q.first, q.take, &order_by, pool, db, &q.table).await
+}
+
+// ============ execute_query cascade helpers (QA-002) ============
+//
+// `execute_query` was the repo's worst complexity hotspot (cc216): a terminal
+// cascade — setup → early-return terminals → validation flags → index-window
+// compilation → inline terminals — all inline. The helpers below decompose it
+// into a routing table without changing behavior: `compile_query_window` lifts
+// the index-window compilation block verbatim, and each `execute_*_terminal`
+// lifts one inline terminal body verbatim. Each terminal destructures the
+// `QueryWindow` back into the same locals the inline body used, so every SQL
+// fragment, bind ordering, placeholder offset, error variant, and evaluation
+// order is byte-for-byte identical to the pre-refactor cascade.
+
+/// The compiled index window shared by every non-early-return terminal in
+/// `execute_query`. Built once by `compile_query_window` and consumed by-value
+/// on exactly one terminal's return path. The field set is precisely what the
+/// inline terminals read — no speculative fields.
+struct QueryWindow<'a> {
+    index_def: Option<&'a IndexDef>,
+    binds: Vec<EqBind>,
+    eq_len: usize,
+    range_binds: Vec<EqBind>,
+    where_conditions: Vec<String>,
+    filter_binds: Vec<EqBind>,
+    limit_placeholder: usize,
+}
+
+/// Compiles the eq/range binds, the client `filter`, and the owner/collaborator/
+/// `authorize` predicates into a `QueryWindow`. Verbatim lift of the block that
+/// previously lived inline in `execute_query`; the locals it left behind
+/// (`index_def`, `binds`, `eq_len`, `range_binds`, `where_conditions`,
+/// `filter_binds`, `limit_placeholder`) became the returned struct's fields.
+fn compile_query_window<'a>(
+    table_def: &'a TableDef,
+    q: &Query,
+    ctx: &PrincipalCtx,
+    owner: Option<&str>,
+    owner_field: Option<&str>,
+    collaborators_field: Option<&str>,
+) -> Result<QueryWindow<'a>, RtDbError> {
     let index_def: Option<&IndexDef> = match &q.index {
         Some(name) => Some(table_def.index(name)?),
         None => {
@@ -966,78 +1054,230 @@ pub async fn execute_query(
     }
     let limit_placeholder = filter_start + filter_binds.len();
 
-    if q.count {
-        let pg_schema_name = pg_schema(db);
-        let table_ident = pg_table(&q.table);
-        let mut sql = format!("SELECT COUNT(*) FROM \"{pg_schema_name}\".\"{table_ident}\"");
-        if !where_conditions.is_empty() {
-            sql.push_str(" WHERE ");
-            sql.push_str(&where_conditions.join(" AND "));
-        }
-        let mut query = sqlx::query_scalar::<_, i64>(&sql);
-        for bind in binds {
-            query = match bind {
-                EqBind::Text(v) => query.bind(v),
-                EqBind::Num(v) => query.bind(v),
-                EqBind::Bool(v) => query.bind(v),
-                EqBind::I64(v) => query.bind(v),
-            };
-        }
-        for bind in range_binds {
-            query = match bind {
-                EqBind::Text(v) => query.bind(v),
-                EqBind::Num(v) => query.bind(v),
-                EqBind::Bool(v) => query.bind(v),
-                EqBind::I64(v) => query.bind(v),
-            };
-        }
-        for bind in &filter_binds {
-            query = match bind {
-                EqBind::Text(v) => query.bind(v),
-                EqBind::Num(v) => query.bind(v),
-                EqBind::Bool(v) => query.bind(v),
-                EqBind::I64(v) => query.bind(v),
-            };
-        }
-        let count = query.fetch_one(pool).await?;
-        return Ok(QueryResult::Count(count));
-    }
+    Ok(QueryWindow {
+        index_def,
+        binds,
+        eq_len,
+        range_binds,
+        where_conditions,
+        filter_binds,
+        limit_placeholder,
+    })
+}
 
-    // Distinct terminal: SELECT DISTINCT of the index field immediately after
-    // the eq prefix over the same eq/range WHERE clause every other terminal
-    // builds. The combination cascade already rejected every other terminal;
-    // `distinct` composes only with `index`/`eq`/range bounds. The preconditions
-    // below reject the no-index and no-remaining-field cases with the same
-    // BadRequest shape as a missing-index `eq` bind. Capped by `MAX_TAKE` for
-    // parity with `collect` (a distinct set bounded by the matching row count).
-    if q.distinct {
-        let idx = index_def.ok_or_else(|| {
-            RtDbError::bad_request("distinct requires an index field beyond the eq prefix")
-        })?;
-        if eq_len >= idx.fields.len() {
+/// `count` terminal: `SELECT COUNT(*)` over the compiled window's WHERE clause.
+/// Verbatim lift of the former inline `if q.count { … }` block.
+async fn execute_count_terminal(
+    w: QueryWindow<'_>,
+    pool: &PgPool,
+    db: &str,
+    table: &str,
+) -> Result<QueryResult, RtDbError> {
+    let QueryWindow {
+        binds,
+        range_binds,
+        where_conditions,
+        filter_binds,
+        ..
+    } = w;
+    let pg_schema_name = pg_schema(db);
+    let table_ident = pg_table(table);
+    let mut sql = format!("SELECT COUNT(*) FROM \"{pg_schema_name}\".\"{table_ident}\"");
+    if !where_conditions.is_empty() {
+        sql.push_str(" WHERE ");
+        sql.push_str(&where_conditions.join(" AND "));
+    }
+    let mut query = sqlx::query_scalar::<_, i64>(&sql);
+    for bind in binds {
+        query = match bind {
+            EqBind::Text(v) => query.bind(v),
+            EqBind::Num(v) => query.bind(v),
+            EqBind::Bool(v) => query.bind(v),
+            EqBind::I64(v) => query.bind(v),
+        };
+    }
+    for bind in range_binds {
+        query = match bind {
+            EqBind::Text(v) => query.bind(v),
+            EqBind::Num(v) => query.bind(v),
+            EqBind::Bool(v) => query.bind(v),
+            EqBind::I64(v) => query.bind(v),
+        };
+    }
+    for bind in &filter_binds {
+        query = match bind {
+            EqBind::Text(v) => query.bind(v),
+            EqBind::Num(v) => query.bind(v),
+            EqBind::Bool(v) => query.bind(v),
+            EqBind::I64(v) => query.bind(v),
+        };
+    }
+    let count = query.fetch_one(pool).await?;
+    Ok(QueryResult::Count(count))
+}
+
+/// Distinct terminal: `SELECT DISTINCT` of the index field immediately after
+/// the eq prefix over the same eq/range WHERE clause every other terminal
+/// builds. The combination cascade already rejected every other terminal;
+/// `distinct` composes only with `index`/`eq`/range bounds. The preconditions
+/// below reject the no-index and no-remaining-field cases with the same
+/// BadRequest shape as a missing-index `eq` bind. Capped by `MAX_TAKE` for
+/// parity with `collect` (a distinct set bounded by the matching row count).
+/// Verbatim lift of the former inline `if q.distinct { … }` block.
+async fn execute_distinct_terminal(
+    w: QueryWindow<'_>,
+    pool: &PgPool,
+    db: &str,
+    table: &str,
+) -> Result<QueryResult, RtDbError> {
+    let QueryWindow {
+        index_def,
+        binds,
+        eq_len,
+        range_binds,
+        where_conditions,
+        filter_binds,
+        limit_placeholder,
+    } = w;
+    let idx = index_def.ok_or_else(|| {
+        RtDbError::bad_request("distinct requires an index field beyond the eq prefix")
+    })?;
+    if eq_len >= idx.fields.len() {
+        return Err(RtDbError::bad_request(
+            "distinct requires an index field beyond the eq prefix",
+        ));
+    }
+    let field_name = idx.fields[eq_len].as_str();
+    // The field's existence is guaranteed by the schema's index definition
+    // (validated at schema push), so no extra lookup is needed here.
+    let col = pg_col(field_name);
+    let pg_schema_name = pg_schema(db);
+    let table_ident = pg_table(table);
+    // Project the column to jsonb so a single `serde_json::Value` decoder
+    // handles text/number/boolean columns uniformly. The physical column
+    // name and schema/table identifiers are schema-validated and double-
+    // quoted; only the LIMIT is `$n`-bound.
+    let mut sql = format!(
+        "SELECT DISTINCT to_jsonb(\"{col}\") AS v FROM \"{pg_schema_name}\".\"{table_ident}\""
+    );
+    if !where_conditions.is_empty() {
+        sql.push_str(" WHERE ");
+        sql.push_str(&where_conditions.join(" AND "));
+    }
+    sql.push_str(&format!(" ORDER BY v LIMIT ${limit_placeholder}"));
+    let mut query = sqlx::query_as::<_, (serde_json::Value,)>(sql.as_str());
+    for bind in binds {
+        query = match bind {
+            EqBind::Text(v) => query.bind(v),
+            EqBind::Num(v) => query.bind(v),
+            EqBind::Bool(v) => query.bind(v),
+            EqBind::I64(v) => query.bind(v),
+        };
+    }
+    for bind in range_binds {
+        query = match bind {
+            EqBind::Text(v) => query.bind(v),
+            EqBind::Num(v) => query.bind(v),
+            EqBind::Bool(v) => query.bind(v),
+            EqBind::I64(v) => query.bind(v),
+        };
+    }
+    for bind in &filter_binds {
+        query = match bind {
+            EqBind::Text(v) => query.bind(v),
+            EqBind::Num(v) => query.bind(v),
+            EqBind::Bool(v) => query.bind(v),
+            EqBind::I64(v) => query.bind(v),
+        };
+    }
+    query = query.bind(i64::from(MAX_TAKE));
+    let rows = query.fetch_all(pool).await?;
+    let values: Vec<serde_json::Value> = rows.into_iter().map(|(v,)| v).collect();
+    Ok(QueryResult::Distinct(values))
+}
+
+/// Aggregate terminal: runs `<OP>("<col>")` (SUM/AVG/MIN/MAX) over the same
+/// eq/range WHERE clause every other terminal builds, returning one scalar
+/// (`Aggregate(value)`). With `group_by: true`, it groups by the index field
+/// after the eq prefix and aggregates the one after that, returning
+/// `AggregateGroups([{key,value},…])`. The combination cascade already
+/// rejected every other terminal; `aggregate` composes only with `index`/
+/// `eq`/range bounds/`filter`. The preconditions below reject the no-index,
+/// no-remaining-field, and (for sum/avg) non-numeric-field cases. Group count
+/// is capped by `MAX_TAKE` for parity with `collect`. Verbatim lift of the
+/// former inline `if let Some(agg) = &q.aggregate { … }` block.
+async fn execute_aggregate_terminal(
+    w: QueryWindow<'_>,
+    table_def: &TableDef,
+    agg: &AggregateSpec,
+    pool: &PgPool,
+    db: &str,
+    table: &str,
+) -> Result<QueryResult, RtDbError> {
+    let QueryWindow {
+        index_def,
+        binds,
+        eq_len,
+        range_binds,
+        where_conditions,
+        filter_binds,
+        limit_placeholder,
+    } = w;
+    let idx = index_def.ok_or_else(|| {
+        RtDbError::bad_request("aggregate requires an index field beyond the eq prefix")
+    })?;
+    // Resolve the aggregate field (the one after the eq prefix for plain
+    // aggregate, the one after that for groupBy) and validate the schema
+    // field type for sum/avg's numeric requirement. The groupcol for the
+    // groupBy case is the same field distinct would use.
+    let (group_col, agg_field_name) = if agg.group_by {
+        if eq_len + 1 >= idx.fields.len() {
             return Err(RtDbError::bad_request(
-                "distinct requires an index field beyond the eq prefix",
+                "aggregate groupBy requires two index fields beyond the eq prefix",
             ));
         }
-        let field_name = idx.fields[eq_len].as_str();
-        // The field's existence is guaranteed by the schema's index definition
-        // (validated at schema push), so no extra lookup is needed here.
-        let col = pg_col(field_name);
-        let pg_schema_name = pg_schema(db);
-        let table_ident = pg_table(&q.table);
-        // Project the column to jsonb so a single `serde_json::Value` decoder
-        // handles text/number/boolean columns uniformly. The physical column
-        // name and schema/table identifiers are schema-validated and double-
-        // quoted; only the LIMIT is `$n`-bound.
+        let group_field = idx.fields[eq_len].as_str();
+        let agg_field = idx.fields[eq_len + 1].as_str();
+        (Some(pg_col(group_field)), agg_field)
+    } else {
+        if eq_len >= idx.fields.len() {
+            return Err(RtDbError::bad_request(
+                "aggregate requires an index field beyond the eq prefix",
+            ));
+        }
+        (None, idx.fields[eq_len].as_str())
+    };
+    let agg_field_type = table_def.fields.get(agg_field_name).ok_or_else(|| {
+        RtDbError::internal(format!("index references unknown field '{agg_field_name}'"))
+    })?;
+    if matches!(agg.op, AggregateOp::Sum | AggregateOp::Avg)
+        && !is_numeric_index_field(agg_field_type)
+    {
+        return Err(RtDbError::bad_request(format!(
+            "aggregate op {} requires a numeric index field",
+            agg.op.sql_fn().to_lowercase()
+        )));
+    }
+    let agg_col = pg_col(agg_field_name);
+    let pg_schema_name = pg_schema(db);
+    let table_ident = pg_table(table);
+    let op_sql = agg.op.sql_fn();
+    // Project via `to_jsonb` so a single `serde_json::Value` decoder handles
+    // text/number/boolean columns uniformly, exactly like `distinct`. A
+    // scalar SUM/AVG/MIN/MAX over zero matching rows yields one row with
+    // SQL NULL → `serde_json::Value::Null`.
+    if let Some(group_col) = group_col {
         let mut sql = format!(
-            "SELECT DISTINCT to_jsonb(\"{col}\") AS v FROM \"{pg_schema_name}\".\"{table_ident}\""
+            "SELECT to_jsonb(\"{group_col}\") AS k, to_jsonb({op_sql}(\"{agg_col}\")) AS v FROM \"{pg_schema_name}\".\"{table_ident}\""
         );
         if !where_conditions.is_empty() {
             sql.push_str(" WHERE ");
             sql.push_str(&where_conditions.join(" AND "));
         }
-        sql.push_str(&format!(" ORDER BY v LIMIT ${limit_placeholder}"));
-        let mut query = sqlx::query_as::<_, (serde_json::Value,)>(sql.as_str());
+        sql.push_str(&format!(
+            " GROUP BY \"{group_col}\" ORDER BY k LIMIT ${limit_placeholder}"
+        ));
+        let mut query = sqlx::query_as::<_, (serde_json::Value, serde_json::Value)>(&sql);
         for bind in binds {
             query = match bind {
                 EqBind::Text(v) => query.bind(v),
@@ -1064,309 +1304,124 @@ pub async fn execute_query(
         }
         query = query.bind(i64::from(MAX_TAKE));
         let rows = query.fetch_all(pool).await?;
-        let values: Vec<serde_json::Value> = rows.into_iter().map(|(v,)| v).collect();
-        return Ok(QueryResult::Distinct(values));
+        let groups: Vec<AggregateGroup> = rows
+            .into_iter()
+            .map(|(k, v)| AggregateGroup { key: k, value: v })
+            .collect();
+        return Ok(QueryResult::AggregateGroups(groups));
     }
-
-    // Aggregate terminal: runs `<OP>("<col>")` (SUM/AVG/MIN/MAX) over the same
-    // eq/range WHERE clause every other terminal builds, returning one scalar
-    // (`Aggregate(value)`). With `group_by: true`, it groups by the index field
-    // after the eq prefix and aggregates the one after that, returning
-    // `AggregateGroups([{key,value},…])`. The combination cascade already
-    // rejected every other terminal; `aggregate` composes only with `index`/
-    // `eq`/range bounds/`filter`. The preconditions below reject the no-index,
-    // no-remaining-field, and (for sum/avg) non-numeric-field cases. Group count
-    // is capped by `MAX_TAKE` for parity with `collect`.
-    if let Some(agg) = &q.aggregate {
-        let idx = index_def.ok_or_else(|| {
-            RtDbError::bad_request("aggregate requires an index field beyond the eq prefix")
-        })?;
-        // Resolve the aggregate field (the one after the eq prefix for plain
-        // aggregate, the one after that for groupBy) and validate the schema
-        // field type for sum/avg's numeric requirement. The groupcol for the
-        // groupBy case is the same field distinct would use.
-        let (group_col, agg_field_name) = if agg.group_by {
-            if eq_len + 1 >= idx.fields.len() {
-                return Err(RtDbError::bad_request(
-                    "aggregate groupBy requires two index fields beyond the eq prefix",
-                ));
-            }
-            let group_field = idx.fields[eq_len].as_str();
-            let agg_field = idx.fields[eq_len + 1].as_str();
-            (Some(pg_col(group_field)), agg_field)
-        } else {
-            if eq_len >= idx.fields.len() {
-                return Err(RtDbError::bad_request(
-                    "aggregate requires an index field beyond the eq prefix",
-                ));
-            }
-            (None, idx.fields[eq_len].as_str())
+    let mut sql = format!(
+        "SELECT COALESCE(to_jsonb({op_sql}(\"{agg_col}\")), 'null'::jsonb) AS v FROM \"{pg_schema_name}\".\"{table_ident}\""
+    );
+    if !where_conditions.is_empty() {
+        sql.push_str(" WHERE ");
+        sql.push_str(&where_conditions.join(" AND "));
+    }
+    let mut query = sqlx::query_as::<_, (serde_json::Value,)>(&sql);
+    for bind in binds {
+        query = match bind {
+            EqBind::Text(v) => query.bind(v),
+            EqBind::Num(v) => query.bind(v),
+            EqBind::Bool(v) => query.bind(v),
+            EqBind::I64(v) => query.bind(v),
         };
-        let agg_field_type = table_def.fields.get(agg_field_name).ok_or_else(|| {
-            RtDbError::internal(format!("index references unknown field '{agg_field_name}'"))
-        })?;
-        if matches!(agg.op, AggregateOp::Sum | AggregateOp::Avg)
-            && !is_numeric_index_field(agg_field_type)
-        {
+    }
+    for bind in range_binds {
+        query = match bind {
+            EqBind::Text(v) => query.bind(v),
+            EqBind::Num(v) => query.bind(v),
+            EqBind::Bool(v) => query.bind(v),
+            EqBind::I64(v) => query.bind(v),
+        };
+    }
+    for bind in &filter_binds {
+        query = match bind {
+            EqBind::Text(v) => query.bind(v),
+            EqBind::Num(v) => query.bind(v),
+            EqBind::Bool(v) => query.bind(v),
+            EqBind::I64(v) => query.bind(v),
+        };
+    }
+    let (v,) = query.fetch_one(pool).await?;
+    Ok(QueryResult::Aggregate(v))
+}
+
+/// Paginate terminal: keyset-paginated scan over the compiled window's WHERE
+/// clause, using `sort_cols` (the unbound index fields + `created_at` + `id`)
+/// and `dir`/`order_by` computed by the caller. Fetches one extra row to
+/// detect a next page; the cursor encodes the last row's sort-column values.
+/// Verbatim lift of the former inline
+/// `if let Some(paginate) = &q.paginate { … }` block.
+#[allow(clippy::too_many_arguments)]
+async fn execute_paginate_terminal(
+    w: QueryWindow<'_>,
+    table_def: &TableDef,
+    paginate: &Paginate,
+    sort_cols: Vec<String>,
+    dir: &str,
+    order_by: &str,
+    pool: &PgPool,
+    db: &str,
+    table: &str,
+) -> Result<QueryResult, RtDbError> {
+    let QueryWindow {
+        index_def,
+        binds,
+        eq_len,
+        range_binds,
+        mut where_conditions,
+        filter_binds,
+        ..
+    } = w;
+    let num_items = paginate.num_items.min(MAX_TAKE);
+
+    // Sort-column types parallel `sort_cols`, for cursor bind typing.
+    let sort_col_types: Vec<SortCol> = {
+        let mut v: Vec<SortCol> = match index_def {
+            Some(idx) => idx.fields[eq_len..]
+                .iter()
+                .map(|fname| {
+                    let ft = table_def.fields.get(fname).ok_or_else(|| {
+                        RtDbError::internal(format!("index references unknown field '{fname}'"))
+                    })?;
+                    Ok(SortCol::IndexField(ft))
+                })
+                .collect::<Result<Vec<_>, RtDbError>>()?,
+            None => Vec::new(),
+        };
+        v.push(SortCol::CreatedAt);
+        v.push(SortCol::Id);
+        v
+    };
+
+    // Decode the cursor (if any) and append the keyset resume predicate to
+    // the eq/range WHERE already built for this query.
+    let cursor_start = eq_len + range_binds.len() + filter_binds.len() + 1;
+    let cursor_binds: Vec<EqBind> = if let Some(cursor) = &paginate.cursor {
+        let cursor_values = decode_cursor(cursor)?;
+        if cursor_values.len() != sort_cols.len() {
             return Err(RtDbError::bad_request(format!(
-                "aggregate op {} requires a numeric index field",
-                agg.op.sql_fn().to_lowercase()
+                "cursor has {} value(s) but this query sorts over {} column(s)",
+                cursor_values.len(),
+                sort_cols.len()
             )));
         }
-        let agg_col = pg_col(agg_field_name);
-        let pg_schema_name = pg_schema(db);
-        let table_ident = pg_table(&q.table);
-        let op_sql = agg.op.sql_fn();
-        // Project via `to_jsonb` so a single `serde_json::Value` decoder handles
-        // text/number/boolean columns uniformly, exactly like `distinct`. A
-        // scalar SUM/AVG/MIN/MAX over zero matching rows yields one row with
-        // SQL NULL → `serde_json::Value::Null`.
-        if let Some(group_col) = group_col {
-            let mut sql = format!(
-                "SELECT to_jsonb(\"{group_col}\") AS k, to_jsonb({op_sql}(\"{agg_col}\")) AS v FROM \"{pg_schema_name}\".\"{table_ident}\""
-            );
-            if !where_conditions.is_empty() {
-                sql.push_str(" WHERE ");
-                sql.push_str(&where_conditions.join(" AND "));
-            }
-            sql.push_str(&format!(
-                " GROUP BY \"{group_col}\" ORDER BY k LIMIT ${limit_placeholder}"
-            ));
-            let mut query = sqlx::query_as::<_, (serde_json::Value, serde_json::Value)>(&sql);
-            for bind in binds {
-                query = match bind {
-                    EqBind::Text(v) => query.bind(v),
-                    EqBind::Num(v) => query.bind(v),
-                    EqBind::Bool(v) => query.bind(v),
-                    EqBind::I64(v) => query.bind(v),
-                };
-            }
-            for bind in range_binds {
-                query = match bind {
-                    EqBind::Text(v) => query.bind(v),
-                    EqBind::Num(v) => query.bind(v),
-                    EqBind::Bool(v) => query.bind(v),
-                    EqBind::I64(v) => query.bind(v),
-                };
-            }
-            for bind in &filter_binds {
-                query = match bind {
-                    EqBind::Text(v) => query.bind(v),
-                    EqBind::Num(v) => query.bind(v),
-                    EqBind::Bool(v) => query.bind(v),
-                    EqBind::I64(v) => query.bind(v),
-                };
-            }
-            query = query.bind(i64::from(MAX_TAKE));
-            let rows = query.fetch_all(pool).await?;
-            let groups: Vec<AggregateGroup> = rows
-                .into_iter()
-                .map(|(k, v)| AggregateGroup { key: k, value: v })
-                .collect();
-            return Ok(QueryResult::AggregateGroups(groups));
-        }
-        let mut sql = format!(
-            "SELECT COALESCE(to_jsonb({op_sql}(\"{agg_col}\")), 'null'::jsonb) AS v FROM \"{pg_schema_name}\".\"{table_ident}\""
-        );
-        if !where_conditions.is_empty() {
-            sql.push_str(" WHERE ");
-            sql.push_str(&where_conditions.join(" AND "));
-        }
-        let mut query = sqlx::query_as::<_, (serde_json::Value,)>(&sql);
-        for bind in binds {
-            query = match bind {
-                EqBind::Text(v) => query.bind(v),
-                EqBind::Num(v) => query.bind(v),
-                EqBind::Bool(v) => query.bind(v),
-                EqBind::I64(v) => query.bind(v),
-            };
-        }
-        for bind in range_binds {
-            query = match bind {
-                EqBind::Text(v) => query.bind(v),
-                EqBind::Num(v) => query.bind(v),
-                EqBind::Bool(v) => query.bind(v),
-                EqBind::I64(v) => query.bind(v),
-            };
-        }
-        for bind in &filter_binds {
-            query = match bind {
-                EqBind::Text(v) => query.bind(v),
-                EqBind::Num(v) => query.bind(v),
-                EqBind::Bool(v) => query.bind(v),
-                EqBind::I64(v) => query.bind(v),
-            };
-        }
-        let (v,) = query.fetch_one(pool).await?;
-        return Ok(QueryResult::Aggregate(v));
-    }
-
-    let mut sort_cols: Vec<String> = match index_def {
-        Some(idx) => idx.fields[eq_len..]
-            .iter()
-            .map(|field_name| format!("\"{}\"", pg_col(field_name)))
-            .collect(),
-        None => Vec::new(),
-    };
-    sort_cols.push("\"created_at\"".to_string());
-    sort_cols.push("\"id\"".to_string());
-
-    let dir = match q.order {
-        Some(Order::Desc) => "DESC",
-        _ => "ASC",
-    };
-    let order_by = sort_cols
-        .iter()
-        .map(|col| format!("{col} {dir}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-
-    if let Some(paginate) = &q.paginate {
-        let num_items = paginate.num_items.min(MAX_TAKE);
-
-        // Sort-column types parallel `sort_cols`, for cursor bind typing.
-        let sort_col_types: Vec<SortCol> = {
-            let mut v: Vec<SortCol> = match index_def {
-                Some(idx) => idx.fields[eq_len..]
-                    .iter()
-                    .map(|fname| {
-                        let ft = table_def.fields.get(fname).ok_or_else(|| {
-                            RtDbError::internal(format!("index references unknown field '{fname}'"))
-                        })?;
-                        Ok(SortCol::IndexField(ft))
-                    })
-                    .collect::<Result<Vec<_>, RtDbError>>()?,
-                None => Vec::new(),
-            };
-            v.push(SortCol::CreatedAt);
-            v.push(SortCol::Id);
-            v
-        };
-
-        // Decode the cursor (if any) and append the keyset resume predicate to
-        // the eq/range WHERE already built for this query.
-        let cursor_start = eq_len + range_binds.len() + filter_binds.len() + 1;
-        let cursor_binds: Vec<EqBind> = if let Some(cursor) = &paginate.cursor {
-            let cursor_values = decode_cursor(cursor)?;
-            if cursor_values.len() != sort_cols.len() {
-                return Err(RtDbError::bad_request(format!(
-                    "cursor has {} value(s) but this query sorts over {} column(s)",
-                    cursor_values.len(),
-                    sort_cols.len()
-                )));
-            }
-            let (clause, binds) = build_cursor_conditions(
-                &cursor_values,
-                &sort_cols,
-                &sort_col_types,
-                dir,
-                cursor_start,
-            )?;
-            where_conditions.push(clause);
-            binds
-        } else {
-            Vec::new()
-        };
-
-        let limit_placeholder = cursor_start + cursor_binds.len();
-        let pg_schema_name = pg_schema(db);
-        let table_ident = pg_table(&q.table);
-        let mut sql = format!(
-            "SELECT \"id\", \"doc\", \"created_at\", \"version\" FROM \"{pg_schema_name}\".\"{table_ident}\""
-        );
-        if !where_conditions.is_empty() {
-            sql.push_str(" WHERE ");
-            sql.push_str(&where_conditions.join(" AND "));
-        }
-        sql.push_str(" ORDER BY ");
-        sql.push_str(&order_by);
-        sql.push_str(&format!(" LIMIT ${limit_placeholder}"));
-
-        let mut query = sqlx::query_as::<_, (String, serde_json::Value, i64, i64)>(&sql);
-        for bind in binds {
-            query = match bind {
-                EqBind::Text(v) => query.bind(v),
-                EqBind::Num(v) => query.bind(v),
-                EqBind::Bool(v) => query.bind(v),
-                EqBind::I64(v) => query.bind(v),
-            };
-        }
-        for bind in range_binds {
-            query = match bind {
-                EqBind::Text(v) => query.bind(v),
-                EqBind::Num(v) => query.bind(v),
-                EqBind::Bool(v) => query.bind(v),
-                EqBind::I64(v) => query.bind(v),
-            };
-        }
-        for bind in &filter_binds {
-            query = match bind {
-                EqBind::Text(v) => query.bind(v),
-                EqBind::Num(v) => query.bind(v),
-                EqBind::Bool(v) => query.bind(v),
-                EqBind::I64(v) => query.bind(v),
-            };
-        }
-        for bind in cursor_binds {
-            query = match bind {
-                EqBind::Text(v) => query.bind(v),
-                EqBind::Num(v) => query.bind(v),
-                EqBind::Bool(v) => query.bind(v),
-                EqBind::I64(v) => query.bind(v),
-            };
-        }
-        // Fetch one extra row so a next page can be detected without a second
-        // round-trip; the extra is discarded after the has-next check.
-        query = query.bind(i64::from(num_items) + 1);
-        let mut rows = query.fetch_all(pool).await?;
-
-        let has_next = rows.len() > num_items as usize;
-        if has_next {
-            rows.pop();
-        }
-
-        // The next cursor is built from the last row of the page (after the
-        // extra is discarded); absent when the page is empty or last.
-        let next_cursor =
-            if has_next && let Some((last_id, last_doc, last_created_at, _)) = rows.last() {
-                let mut cursor_values: Vec<serde_json::Value> = Vec::new();
-                if let Some(idx) = index_def {
-                    for fname in &idx.fields[eq_len..] {
-                        let val = last_doc.get(fname).ok_or_else(|| {
-                            RtDbError::internal(format!(
-                                "stored doc is missing indexed field '{fname}'"
-                            ))
-                        })?;
-                        cursor_values.push(val.clone());
-                    }
-                }
-                cursor_values.push(serde_json::json!(*last_created_at));
-                cursor_values.push(serde_json::Value::String(last_id.clone()));
-                Some(encode_cursor(&cursor_values)?)
-            } else {
-                None
-            };
-
-        let docs = rows
-            .into_iter()
-            .map(|(id, doc, created_at, version)| merge_doc(id, doc, created_at, version))
-            .collect::<Result<Vec<_>, _>>()?;
-        return Ok(QueryResult::Paginated(PaginatedResult {
-            docs,
-            next_cursor,
-        }));
-    }
-
-    let limit: u32 = if q.unique {
-        2
-    } else if q.first {
-        1
+        let (clause, binds) = build_cursor_conditions(
+            &cursor_values,
+            &sort_cols,
+            &sort_col_types,
+            dir,
+            cursor_start,
+        )?;
+        where_conditions.push(clause);
+        binds
     } else {
-        q.take.unwrap_or(MAX_TAKE)
+        Vec::new()
     };
 
+    let limit_placeholder = cursor_start + cursor_binds.len();
     let pg_schema_name = pg_schema(db);
-    let table_ident = pg_table(&q.table);
+    let table_ident = pg_table(table);
     let mut sql = format!(
         "SELECT \"id\", \"doc\", \"created_at\", \"version\" FROM \"{pg_schema_name}\".\"{table_ident}\""
     );
@@ -1375,7 +1430,125 @@ pub async fn execute_query(
         sql.push_str(&where_conditions.join(" AND "));
     }
     sql.push_str(" ORDER BY ");
-    sql.push_str(&order_by);
+    sql.push_str(order_by);
+    sql.push_str(&format!(" LIMIT ${limit_placeholder}"));
+
+    let mut query = sqlx::query_as::<_, (String, serde_json::Value, i64, i64)>(&sql);
+    for bind in binds {
+        query = match bind {
+            EqBind::Text(v) => query.bind(v),
+            EqBind::Num(v) => query.bind(v),
+            EqBind::Bool(v) => query.bind(v),
+            EqBind::I64(v) => query.bind(v),
+        };
+    }
+    for bind in range_binds {
+        query = match bind {
+            EqBind::Text(v) => query.bind(v),
+            EqBind::Num(v) => query.bind(v),
+            EqBind::Bool(v) => query.bind(v),
+            EqBind::I64(v) => query.bind(v),
+        };
+    }
+    for bind in &filter_binds {
+        query = match bind {
+            EqBind::Text(v) => query.bind(v),
+            EqBind::Num(v) => query.bind(v),
+            EqBind::Bool(v) => query.bind(v),
+            EqBind::I64(v) => query.bind(v),
+        };
+    }
+    for bind in cursor_binds {
+        query = match bind {
+            EqBind::Text(v) => query.bind(v),
+            EqBind::Num(v) => query.bind(v),
+            EqBind::Bool(v) => query.bind(v),
+            EqBind::I64(v) => query.bind(v),
+        };
+    }
+    // Fetch one extra row so a next page can be detected without a second
+    // round-trip; the extra is discarded after the has-next check.
+    query = query.bind(i64::from(num_items) + 1);
+    let mut rows = query.fetch_all(pool).await?;
+
+    let has_next = rows.len() > num_items as usize;
+    if has_next {
+        rows.pop();
+    }
+
+    // The next cursor is built from the last row of the page (after the
+    // extra is discarded); absent when the page is empty or last.
+    let next_cursor = if has_next && let Some((last_id, last_doc, last_created_at, _)) = rows.last()
+    {
+        let mut cursor_values: Vec<serde_json::Value> = Vec::new();
+        if let Some(idx) = index_def {
+            for fname in &idx.fields[eq_len..] {
+                let val = last_doc.get(fname).ok_or_else(|| {
+                    RtDbError::internal(format!("stored doc is missing indexed field '{fname}'"))
+                })?;
+                cursor_values.push(val.clone());
+            }
+        }
+        cursor_values.push(serde_json::json!(*last_created_at));
+        cursor_values.push(serde_json::Value::String(last_id.clone()));
+        Some(encode_cursor(&cursor_values)?)
+    } else {
+        None
+    };
+
+    let docs = rows
+        .into_iter()
+        .map(|(id, doc, created_at, version)| merge_doc(id, doc, created_at, version))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(QueryResult::Paginated(PaginatedResult {
+        docs,
+        next_cursor,
+    }))
+}
+
+/// `unique`/`first`/`collect` fall-through terminal: scans the compiled
+/// window's WHERE clause ordered by `order_by`, applies a `limit` derived from
+/// `unique` (2), `first` (1), or `take` (defaulting to `MAX_TAKE`), and shapes
+/// the result (`Doc`/`Doc(None)` for unique/first, `Docs` for collect). Verbatim
+/// lift of the former inline fall-through block.
+#[allow(clippy::too_many_arguments)]
+async fn execute_collect_terminal(
+    w: QueryWindow<'_>,
+    unique: bool,
+    first: bool,
+    take: Option<u32>,
+    order_by: &str,
+    pool: &PgPool,
+    db: &str,
+    table: &str,
+) -> Result<QueryResult, RtDbError> {
+    let QueryWindow {
+        binds,
+        range_binds,
+        where_conditions,
+        filter_binds,
+        limit_placeholder,
+        ..
+    } = w;
+    let limit: u32 = if unique {
+        2
+    } else if first {
+        1
+    } else {
+        take.unwrap_or(MAX_TAKE)
+    };
+
+    let pg_schema_name = pg_schema(db);
+    let table_ident = pg_table(table);
+    let mut sql = format!(
+        "SELECT \"id\", \"doc\", \"created_at\", \"version\" FROM \"{pg_schema_name}\".\"{table_ident}\""
+    );
+    if !where_conditions.is_empty() {
+        sql.push_str(" WHERE ");
+        sql.push_str(&where_conditions.join(" AND "));
+    }
+    sql.push_str(" ORDER BY ");
+    sql.push_str(order_by);
     sql.push_str(&format!(" LIMIT ${limit_placeholder}"));
 
     let mut query = sqlx::query_as::<_, (String, serde_json::Value, i64, i64)>(&sql);
@@ -1406,7 +1579,7 @@ pub async fn execute_query(
     query = query.bind(i64::from(limit));
     let mut rows = query.fetch_all(pool).await?;
 
-    if q.unique {
+    if unique {
         if rows.len() > 1 {
             return Err(RtDbError::precondition(
                 "unique query matched multiple documents",
@@ -1420,7 +1593,7 @@ pub async fn execute_query(
         };
     }
 
-    if q.first {
+    if first {
         return match rows.pop() {
             Some((id, doc, created_at, version)) => Ok(QueryResult::Doc(Some(merge_doc(
                 id, doc, created_at, version,

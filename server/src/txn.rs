@@ -1222,105 +1222,87 @@ pub async fn execute_txn(
         authorize_table(ctx, step.table())?;
         match step {
             Step::Insert { table, doc } => {
-                let table_def = schema.table(table)?;
-                let doc = stamp_ttl_default(table_def, doc.clone(), now_ms());
-                let doc = stamp_owner(table_def, doc, owner);
-                let doc = stamp_authorize(table_def, doc, ctx);
-                verify_authorize_doc(table_def, &doc, ctx)?;
-                let (id, stored, created_at) =
-                    do_insert(&mut tx, &pg_schema_name, table_def, table, &doc).await?;
-                write_set.touch(table, &id, OpKind::Insert);
-                // Created in this txn: before = None (created), after = stored doc.
-                write_set.capture_doc(
-                    table,
-                    &id,
-                    Some(None),
-                    Some(Some(&stored)),
-                    Some(created_at),
-                );
-                results.push(serde_json::json!({ "id": id }));
-            }
-            Step::Patch { table, id, fields } => {
-                let table_def = schema.table(table)?;
-                check_owner(&mut tx, &pg_schema_name, table_def, table, id, ctx).await?;
-                let fields = stamp_owner(table_def, fields.clone(), owner);
-                let fields = stamp_authorize(table_def, fields, ctx);
-                let (pre_doc, merged, created_at) =
-                    do_patch(&mut tx, &pg_schema_name, table_def, table, id, &fields).await?;
-                verify_authorize_doc(table_def, &merged, ctx)?;
-                write_set.touch(table, id, OpKind::Patch);
-                // `before` = pre-merge body (frozen on first touch by the helper
-                // so a doc inserted earlier this txn stays `before = None`);
-                // `after` = merged body.
-                write_set.capture_doc(
-                    table,
-                    id,
-                    Some(Some(&pre_doc)),
-                    Some(Some(&merged)),
-                    Some(created_at),
-                );
-                results.push(serde_json::Value::Null);
-            }
-            Step::Replace { table, id, doc } => {
-                let table_def = schema.table(table)?;
-                check_owner(&mut tx, &pg_schema_name, table_def, table, id, ctx).await?;
-                let doc = stamp_owner(table_def, doc.clone(), owner);
-                let doc = stamp_authorize(table_def, doc, ctx);
-                let (old_doc, new_doc, created_at) =
-                    do_replace(&mut tx, &pg_schema_name, table_def, table, id, &doc).await?;
-                verify_authorize_doc(table_def, &new_doc, ctx)?;
-                write_set.touch(table, id, OpKind::Replace);
-                write_set.capture_doc(
-                    table,
-                    id,
-                    Some(Some(&old_doc)),
-                    Some(Some(&new_doc)),
-                    Some(created_at),
-                );
-                results.push(serde_json::Value::Null);
-            }
-            Step::Delete { table, id } => {
-                let table_def = schema.table(table)?;
-                check_owner(&mut tx, &pg_schema_name, table_def, table, id, ctx).await?;
-                do_delete(&mut tx, &pg_schema_name, table, id).await?;
-                write_set.touch(table, id, OpKind::Delete);
-                // Delete records no value: `after = None` marks it deleted so
-                // `fan_out` always re-runs (deleted ⇒ affects). `before` is left
-                // for the helper to freeze at the earliest capture if this same
-                // id was touched earlier in the txn, and `created_at` likewise
-                // (a delete never fetches the row).
-                write_set.capture_doc(table, id, None, Some(None), None);
-                results.push(serde_json::Value::Null);
-            }
-            Step::ExpectVersion { table, id, version } => {
-                let table_def = schema.table(table)?;
-                do_expect_version(
+                step_insert(
                     &mut tx,
                     &pg_schema_name,
-                    table_def,
+                    schema,
+                    ctx,
+                    owner,
+                    &mut write_set,
+                    &mut results,
+                    table,
+                    doc,
+                )
+                .await?
+            }
+            Step::Patch { table, id, fields } => {
+                step_patch(
+                    &mut tx,
+                    &pg_schema_name,
+                    schema,
+                    ctx,
+                    owner,
+                    &mut write_set,
+                    &mut results,
+                    table,
+                    id,
+                    fields,
+                )
+                .await?
+            }
+            Step::Replace { table, id, doc } => {
+                step_replace(
+                    &mut tx,
+                    &pg_schema_name,
+                    schema,
+                    ctx,
+                    owner,
+                    &mut write_set,
+                    &mut results,
+                    table,
+                    id,
+                    doc,
+                )
+                .await?
+            }
+            Step::Delete { table, id } => {
+                step_delete(
+                    &mut tx,
+                    &pg_schema_name,
+                    schema,
+                    ctx,
+                    &mut write_set,
+                    &mut results,
+                    table,
+                    id,
+                )
+                .await?
+            }
+            Step::ExpectVersion { table, id, version } => {
+                step_expect_version(
+                    &mut tx,
+                    &pg_schema_name,
+                    schema,
+                    ctx,
+                    &mut results,
                     table,
                     id,
                     *version,
-                    ctx,
                 )
-                .await?;
-                results.push(serde_json::Value::Null);
+                .await?
             }
             Step::ExpectAbsent { table, index, eq } => {
-                let table_def = schema.table(table)?;
-                let rows = eq_lookup(&mut tx, &pg_schema_name, table_def, table, index, eq).await?;
-                // Side-channel closure: only a matched doc the caller can see
-                // counts as "present". A matched-but-invisible doc is "absent"
-                // from the caller's view, so it does not fail the precondition.
-                let present = rows
-                    .iter()
-                    .any(|(_id, doc, _created_at)| doc_visible_to(doc, table_def, ctx));
-                if present {
-                    return Err(RtDbError::precondition(format!(
-                        "index '{index}' already has a matching document"
-                    )));
-                }
-                results.push(serde_json::Value::Null);
+                step_expect_absent(
+                    &mut tx,
+                    &pg_schema_name,
+                    schema,
+                    ctx,
+                    &mut results,
+                    table,
+                    index,
+                    eq,
+                )
+                .await?
             }
             Step::Upsert {
                 table,
@@ -1329,64 +1311,263 @@ pub async fn execute_txn(
                 insert,
                 patch,
             } => {
-                let table_def = schema.table(table)?;
-                let mut rows =
-                    eq_lookup(&mut tx, &pg_schema_name, table_def, table, index, eq).await?;
-                if rows.len() > 1 {
-                    return Err(RtDbError::precondition("upsert matched multiple documents"));
-                }
-                match rows.pop() {
-                    None => {
-                        let insert = stamp_owner(table_def, insert.clone(), owner);
-                        let insert = stamp_authorize(table_def, insert, ctx);
-                        verify_authorize_doc(table_def, &insert, ctx)?;
-                        let (id, stored, created_at) =
-                            do_insert(&mut tx, &pg_schema_name, table_def, table, &insert).await?;
-                        write_set.touch(table, &id, OpKind::Upsert);
-                        // Upsert-insert branch: same as Insert — created this txn.
-                        write_set.capture_doc(
-                            table,
-                            &id,
-                            Some(None),
-                            Some(Some(&stored)),
-                            Some(created_at),
-                        );
-                        results.push(serde_json::json!({ "id": id, "inserted": true }));
-                    }
-                    Some((id, doc_value, created_at)) => {
-                        let doc = match doc_value {
-                            serde_json::Value::Object(map) => map,
-                            _ => {
-                                return Err(RtDbError::internal("stored doc is not a JSON object"));
-                            }
-                        };
-                        check_owner_doc(table_def, &doc, &id, ctx)?;
-                        let patch = stamp_owner(table_def, patch.clone(), owner);
-                        let patch = stamp_authorize(table_def, patch, ctx);
-                        let pre_doc = doc.clone();
-                        let merged = apply_patch(table_def, doc, &patch)?;
-                        apply_update(&mut tx, &pg_schema_name, table_def, table, &id, &merged)
-                            .await?;
-                        verify_authorize_doc(table_def, &merged, ctx)?;
-                        write_set.touch(table, &id, OpKind::Upsert);
-                        // Upsert-update branch: same as Patch — before = matched
-                        // body (first touch), after = merged.
-                        write_set.capture_doc(
-                            table,
-                            &id,
-                            Some(Some(&pre_doc)),
-                            Some(Some(&merged)),
-                            Some(created_at),
-                        );
-                        results.push(serde_json::json!({ "id": id, "inserted": false }));
-                    }
-                }
+                step_upsert(
+                    &mut tx,
+                    &pg_schema_name,
+                    schema,
+                    ctx,
+                    owner,
+                    &mut write_set,
+                    &mut results,
+                    table,
+                    index,
+                    eq,
+                    insert,
+                    patch,
+                )
+                .await?
             }
         }
     }
 
     tx.commit().await?;
     Ok(TxnOutcome { results, write_set })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn step_insert(
+    tx: &mut PgConnection,
+    pg_schema_name: &str,
+    schema: &SchemaDef,
+    ctx: &PrincipalCtx,
+    owner: Option<&str>,
+    write_set: &mut WriteSet,
+    results: &mut Vec<serde_json::Value>,
+    table: &str,
+    doc: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), RtDbError> {
+    let table_def = schema.table(table)?;
+    let doc = stamp_ttl_default(table_def, doc.clone(), now_ms());
+    let doc = stamp_owner(table_def, doc, owner);
+    let doc = stamp_authorize(table_def, doc, ctx);
+    verify_authorize_doc(table_def, &doc, ctx)?;
+    let (id, stored, created_at) = do_insert(tx, pg_schema_name, table_def, table, &doc).await?;
+    write_set.touch(table, &id, OpKind::Insert);
+    // Created in this txn: before = None (created), after = stored doc.
+    write_set.capture_doc(
+        table,
+        &id,
+        Some(None),
+        Some(Some(&stored)),
+        Some(created_at),
+    );
+    results.push(serde_json::json!({ "id": id }));
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn step_patch(
+    tx: &mut PgConnection,
+    pg_schema_name: &str,
+    schema: &SchemaDef,
+    ctx: &PrincipalCtx,
+    owner: Option<&str>,
+    write_set: &mut WriteSet,
+    results: &mut Vec<serde_json::Value>,
+    table: &str,
+    id: &str,
+    fields: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), RtDbError> {
+    let table_def = schema.table(table)?;
+    check_owner(tx, pg_schema_name, table_def, table, id, ctx).await?;
+    let fields = stamp_owner(table_def, fields.clone(), owner);
+    let fields = stamp_authorize(table_def, fields, ctx);
+    let (pre_doc, merged, created_at) =
+        do_patch(tx, pg_schema_name, table_def, table, id, &fields).await?;
+    verify_authorize_doc(table_def, &merged, ctx)?;
+    write_set.touch(table, id, OpKind::Patch);
+    // `before` = pre-merge body (frozen on first touch by the helper
+    // so a doc inserted earlier this txn stays `before = None`);
+    // `after` = merged body.
+    write_set.capture_doc(
+        table,
+        id,
+        Some(Some(&pre_doc)),
+        Some(Some(&merged)),
+        Some(created_at),
+    );
+    results.push(serde_json::Value::Null);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn step_replace(
+    tx: &mut PgConnection,
+    pg_schema_name: &str,
+    schema: &SchemaDef,
+    ctx: &PrincipalCtx,
+    owner: Option<&str>,
+    write_set: &mut WriteSet,
+    results: &mut Vec<serde_json::Value>,
+    table: &str,
+    id: &str,
+    doc: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), RtDbError> {
+    let table_def = schema.table(table)?;
+    check_owner(tx, pg_schema_name, table_def, table, id, ctx).await?;
+    let doc = stamp_owner(table_def, doc.clone(), owner);
+    let doc = stamp_authorize(table_def, doc, ctx);
+    let (old_doc, new_doc, created_at) =
+        do_replace(tx, pg_schema_name, table_def, table, id, &doc).await?;
+    verify_authorize_doc(table_def, &new_doc, ctx)?;
+    write_set.touch(table, id, OpKind::Replace);
+    write_set.capture_doc(
+        table,
+        id,
+        Some(Some(&old_doc)),
+        Some(Some(&new_doc)),
+        Some(created_at),
+    );
+    results.push(serde_json::Value::Null);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn step_delete(
+    tx: &mut PgConnection,
+    pg_schema_name: &str,
+    schema: &SchemaDef,
+    ctx: &PrincipalCtx,
+    write_set: &mut WriteSet,
+    results: &mut Vec<serde_json::Value>,
+    table: &str,
+    id: &str,
+) -> Result<(), RtDbError> {
+    let table_def = schema.table(table)?;
+    check_owner(tx, pg_schema_name, table_def, table, id, ctx).await?;
+    do_delete(tx, pg_schema_name, table, id).await?;
+    write_set.touch(table, id, OpKind::Delete);
+    // Delete records no value: `after = None` marks it deleted so
+    // `fan_out` always re-runs (deleted ⇒ affects). `before` is left
+    // for the helper to freeze at the earliest capture if this same
+    // id was touched earlier in the txn, and `created_at` likewise
+    // (a delete never fetches the row).
+    write_set.capture_doc(table, id, None, Some(None), None);
+    results.push(serde_json::Value::Null);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn step_expect_version(
+    tx: &mut PgConnection,
+    pg_schema_name: &str,
+    schema: &SchemaDef,
+    ctx: &PrincipalCtx,
+    results: &mut Vec<serde_json::Value>,
+    table: &str,
+    id: &str,
+    version: i64,
+) -> Result<(), RtDbError> {
+    let table_def = schema.table(table)?;
+    do_expect_version(tx, pg_schema_name, table_def, table, id, version, ctx).await?;
+    results.push(serde_json::Value::Null);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn step_expect_absent(
+    tx: &mut PgConnection,
+    pg_schema_name: &str,
+    schema: &SchemaDef,
+    ctx: &PrincipalCtx,
+    results: &mut Vec<serde_json::Value>,
+    table: &str,
+    index: &str,
+    eq: &[serde_json::Value],
+) -> Result<(), RtDbError> {
+    let table_def = schema.table(table)?;
+    let rows = eq_lookup(tx, pg_schema_name, table_def, table, index, eq).await?;
+    // Side-channel closure: only a matched doc the caller can see
+    // counts as "present". A matched-but-invisible doc is "absent"
+    // from the caller's view, so it does not fail the precondition.
+    let present = rows
+        .iter()
+        .any(|(_id, doc, _created_at)| doc_visible_to(doc, table_def, ctx));
+    if present {
+        return Err(RtDbError::precondition(format!(
+            "index '{index}' already has a matching document"
+        )));
+    }
+    results.push(serde_json::Value::Null);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn step_upsert(
+    tx: &mut PgConnection,
+    pg_schema_name: &str,
+    schema: &SchemaDef,
+    ctx: &PrincipalCtx,
+    owner: Option<&str>,
+    write_set: &mut WriteSet,
+    results: &mut Vec<serde_json::Value>,
+    table: &str,
+    index: &str,
+    eq: &[serde_json::Value],
+    insert: &serde_json::Map<String, serde_json::Value>,
+    patch: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), RtDbError> {
+    let table_def = schema.table(table)?;
+    let mut rows = eq_lookup(tx, pg_schema_name, table_def, table, index, eq).await?;
+    if rows.len() > 1 {
+        return Err(RtDbError::precondition("upsert matched multiple documents"));
+    }
+    match rows.pop() {
+        None => {
+            let insert = stamp_owner(table_def, insert.clone(), owner);
+            let insert = stamp_authorize(table_def, insert, ctx);
+            verify_authorize_doc(table_def, &insert, ctx)?;
+            let (id, stored, created_at) =
+                do_insert(tx, pg_schema_name, table_def, table, &insert).await?;
+            write_set.touch(table, &id, OpKind::Upsert);
+            // Upsert-insert branch: same as Insert — created this txn.
+            write_set.capture_doc(
+                table,
+                &id,
+                Some(None),
+                Some(Some(&stored)),
+                Some(created_at),
+            );
+            results.push(serde_json::json!({ "id": id, "inserted": true }));
+        }
+        Some((id, doc_value, created_at)) => {
+            let doc = match doc_value {
+                serde_json::Value::Object(map) => map,
+                _ => {
+                    return Err(RtDbError::internal("stored doc is not a JSON object"));
+                }
+            };
+            check_owner_doc(table_def, &doc, &id, ctx)?;
+            let patch = stamp_owner(table_def, patch.clone(), owner);
+            let patch = stamp_authorize(table_def, patch, ctx);
+            let pre_doc = doc.clone();
+            let merged = apply_patch(table_def, doc, &patch)?;
+            apply_update(tx, pg_schema_name, table_def, table, &id, &merged).await?;
+            verify_authorize_doc(table_def, &merged, ctx)?;
+            write_set.touch(table, &id, OpKind::Upsert);
+            // Upsert-update branch: same as Patch — before = matched
+            // body (first touch), after = merged.
+            write_set.capture_doc(
+                table,
+                &id,
+                Some(Some(&pre_doc)),
+                Some(Some(&merged)),
+                Some(created_at),
+            );
+            results.push(serde_json::json!({ "id": id, "inserted": false }));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
