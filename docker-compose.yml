@@ -71,6 +71,10 @@ services:
       # IP ranges; RTDB_WEBHOOK_ALLOW_HTTP is the dev escape hatch (off).
       RTDB_WEBHOOKS_ENABLED: ${RTDB_WEBHOOKS_ENABLED:-false}
       RTDB_WEBHOOK_ALLOW_HTTP: ${RTDB_WEBHOOK_ALLOW_HTTP:-false}
+      # Durable audit log (off by default). When true the committer writes one
+      # rtdb.audit_log row per DocOp at every durable tap site. Mirrors the
+      # .env.example default.
+      RTDB_AUDIT_LOG_ENABLED: ${RTDB_AUDIT_LOG_ENABLED:-false}
       # Per-IP rate limit on the public storage serve route (SEC-004). 0 = off.
       RTDB_STORAGE_RATE_LIMIT_PER_IP_RPM: ${RTDB_STORAGE_RATE_LIMIT_PER_IP_RPM:-0}
       # NOTE: this `environment:` block is an explicit ALLOWLIST — a key present

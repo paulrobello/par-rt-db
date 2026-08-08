@@ -46,7 +46,6 @@ echo "env-drift-check: all $(echo "$documented" | wc -l | tr -d ' ') documented 
 # added to `Config::from_env` are NOT exempt and must be added to
 # docker-compose.yml at the same PR or this check fails.
 exempt=$(cat <<'EOF'
-RTDB_AUDIT_LOG_ENABLED
 RTDB_BACKUP_CRON
 RTDB_BACKUP_DIR
 RTDB_BACKUP_ENABLED
