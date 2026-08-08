@@ -368,4 +368,50 @@ describe("RtDbHttpClient", () => {
       message: "machine token rejected",
     });
   });
+
+  it("mints a signed URL via GET /api/storage/{db}/{id}/signed-url", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(
+        jsonResponse({ url: "http://h:8300/storage/f1?exp=100&sig=abc", expiresAt: 100 }),
+      );
+    const client = new RtDbHttpClient({
+      url: "http://h:8300",
+      db: "kanban",
+      token: "tok",
+      fetch: fetchMock,
+    });
+
+    const res = await client.getSignedUrl("f1");
+
+    expect(res).toEqual({ url: "http://h:8300/storage/f1?exp=100&sig=abc", expiresAt: 100 });
+    const [calledUrl, init] = fetchMock.mock.calls[0];
+    expect(calledUrl).toBe("http://h:8300/api/storage/kanban/f1/signed-url");
+    expect(init.method).toBe("GET");
+    expect(init.headers.Authorization).toBe("Bearer tok");
+  });
+
+  it("getSignedUrl appends ttlSeconds only when provided", async () => {
+    const withTtl = vi.fn().mockResolvedValue(jsonResponse({ url: "u", expiresAt: 1 }));
+    const c1 = new RtDbHttpClient({
+      url: "http://h:8300",
+      db: "kanban",
+      token: "tok",
+      fetch: withTtl,
+    });
+    await c1.getSignedUrl("f1", 120);
+    expect(withTtl.mock.calls[0][0]).toBe(
+      "http://h:8300/api/storage/kanban/f1/signed-url?ttlSeconds=120",
+    );
+
+    const noTtl = vi.fn().mockResolvedValue(jsonResponse({ url: "u", expiresAt: 1 }));
+    const c2 = new RtDbHttpClient({
+      url: "http://h:8300",
+      db: "kanban",
+      token: "tok",
+      fetch: noTtl,
+    });
+    await c2.getSignedUrl("f1");
+    expect(noTtl.mock.calls[0][0]).toBe("http://h:8300/api/storage/kanban/f1/signed-url");
+  });
 });

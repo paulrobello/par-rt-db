@@ -34,6 +34,12 @@ export interface FileMetadata {
   creationTime: number;
 }
 
+/** A signed, time-limited storage URL: `url` works until `expiresAt` (epoch ms). */
+export interface SignedUrl {
+  url: string;
+  expiresAt: number;
+}
+
 /** Image-transform query params appended to a storage serve URL (ENH-014). */
 export interface TransformOpts {
   w?: number;
@@ -192,6 +198,15 @@ export class RtDbHttpClient {
       this.token,
     );
     return body as FileMetadata;
+  }
+
+  /** Mint a signed, time-limited URL for `id` via the server (GET mint endpoint). */
+  async getSignedUrl(id: string, ttlSeconds?: number): Promise<SignedUrl> {
+    let path = `/api/storage/${encodeURIComponent(this.db)}/${encodeURIComponent(id)}/signed-url`;
+    if (ttlSeconds !== undefined) {
+      path += `?ttlSeconds=${ttlSeconds}`;
+    }
+    return (await this.get(path, this.token)) as SignedUrl;
   }
 
   /** The public serve URL for `id` — no fetch, the browser consumes it. */

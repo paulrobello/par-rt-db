@@ -400,6 +400,10 @@ export class RtDbClient {
     return this.httpForStorage().getFileMetadata(id);
   }
 
+  getSignedUrl(id: string, ttlSeconds?: number) {
+    return this.httpForStorage().getSignedUrl(id, ttlSeconds);
+  }
+
   getUrl(id: string) {
     return this.httpForStorage().getUrl(id);
   }
