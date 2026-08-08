@@ -888,7 +888,7 @@ Add a one-line mention of `getSignedUrl`/`get_signed_url` to the "File storage" 
 In `CLAUDE.md`'s "File storage is HTTP-only…" invariant paragraph (the one that says "`GET /storage/{id}` is the one unauthenticated route"), append one sentence:
 
 ```markdown
-Signed, time-limited URLs (ENH-016+) are an additive capability on that public route: when `?exp=&sig=` are present the route HMAC-verifies (key derived from `admin_key`) and enforces expiry (403 on failure); absent, behavior is unchanged. A bearer-authorized `GET /api/storage/{db}/{id}/signed-url` mints them.
+Signed, time-limited URLs (ENH-017) are an additive capability on that public route: when `?exp=&sig=` are present the route HMAC-verifies (key derived from `admin_key`) and enforces expiry (403 on failure); absent, behavior is unchanged. A bearer-authorized `GET /api/storage/{db}/{id}/signed-url` mints them.
 ```
 
 - [ ] **Step 5: Commit**

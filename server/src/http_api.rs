@@ -500,9 +500,9 @@ async fn signed_url_handler(
     check_http_rate_limits(&state, &principal, &db).await?;
     let ttl = q
         .get("ttlSeconds")
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(signed_url::DEFAULT_SIGNED_URL_TTL_SECS)
-        .clamp(1, signed_url::MAX_SIGNED_URL_TTL_SECS);
+        .and_then(|v| v.parse::<i64>().ok())
+        .map(|v| v.clamp(1, signed_url::MAX_SIGNED_URL_TTL_SECS as i64) as u64)
+        .unwrap_or(signed_url::DEFAULT_SIGNED_URL_TTL_SECS);
     let exp = now_ms() + (ttl as i64) * 1000;
     let sig = signed_url::sign(&state.signed_url_key, &id, exp);
     let base = state.config.public_url.trim_end_matches('/');

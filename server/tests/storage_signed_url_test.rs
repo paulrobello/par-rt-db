@@ -124,6 +124,25 @@ async fn tampered_id_returns_403() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn tampered_exp_returns_403() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let db = fresh_db(&state).await;
+    let addr = spawn_app(state.clone()).await;
+    let (id, _) = seed(&state, &db).await;
+
+    let exp = rtdb_server::db::now_ms() + 60_000;
+    let sig = signed_url::sign(&state.signed_url_key, &id, exp);
+    // The sig was computed over `exp`; fetching with a different exp fails verify.
+    let tampered_exp = exp + 1;
+    let resp = reqwest::get(format!(
+        "http://{addr}/storage/{id}?exp={tampered_exp}&sig={sig}"
+    ))
+    .await?;
+    assert_eq!(resp.status(), 403);
+    Ok(())
+}
+
+#[tokio::test]
 async fn partial_signature_returns_403() -> anyhow::Result<()> {
     let state = test_state().await;
     let db = fresh_db(&state).await;
@@ -191,6 +210,33 @@ async fn ttl_is_clamped() -> anyhow::Result<()> {
         .as_i64()
         .unwrap();
     assert!(exp_zero >= now + 1000); // at least the 1s floor
+    Ok(())
+}
+
+#[tokio::test]
+async fn negative_ttl_clamps_to_minimum() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let db = fresh_db(&state).await;
+    let addr = spawn_app(state.clone()).await;
+    let (id, _) = seed(&state, &db).await;
+    let token = mint_token(addr, &db).await;
+    let now = rtdb_server::db::now_ms();
+
+    // A negative ttl clamps to the 1s floor (not the 1h default a naive
+    // u64 parse would fall back to). Allow ~2s of HTTP round-trip slack.
+    let resp = reqwest::Client::new()
+        .get(format!(
+            "http://{addr}/api/storage/{db}/{id}/signed-url?ttlSeconds=-5"
+        ))
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), 200);
+    let exp = resp.json::<serde_json::Value>().await?["expiresAt"]
+        .as_i64()
+        .unwrap();
+    assert!(exp <= now + 3000); // clamped to ~1s, well under the 3600s default
+    assert!(exp >= now + 1000); // at least the 1s floor
     Ok(())
 }
 
