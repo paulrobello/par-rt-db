@@ -29,13 +29,16 @@ use crate::AppState;
 use crate::auth::Principal;
 use crate::error::RtDbError;
 
-/// What the limiter is bucketing: a single machine token (per-token ceiling)
-/// or every request against one database (per-db ceiling shared across all
-/// principals). `String` is the token id or db name respectively.
+/// What the limiter is bucketing: a single machine token (per-token ceiling),
+/// every request against one database (per-db ceiling shared across all
+/// principals), or an unauthenticated caller's client IP (per-IP ceiling on
+/// the public storage serve route — SEC-004). `String` is the token id, db
+/// name, or IP literal/textual key respectively.
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub enum RateKey {
     Token(String),
     Db(String),
+    Ip(String),
 }
 
 /// Outcome of a `RateLimiter::check`. `Denied` carries a `retry_after_secs`
@@ -150,6 +153,33 @@ pub async fn check_http_rate_limits(
     }
 }
 
+/// Per-IP gate for the unauthenticated public storage serve route
+/// (`GET /storage/{id}`, SEC-004). The opaque blob id is not enumerable, but a
+/// holder of one valid id can otherwise hammer the route without bound — the
+/// on-the-fly image-transform path (`?w=&h=&...`) amplifies cost per request,
+/// and an unauth route has no principal to key on, so the caller's IP is the
+/// only available identity. `ip_key` is the textual client IP (already
+/// canonicalized by the caller: X-Forwarded-For leftmost → ConnectInfo → a
+/// shared `"unknown"` sentinel when neither is available). Disabled when
+/// `Config::storage_rate_limit_per_ip_rpm == 0`, the default.
+pub async fn check_storage_public_rate_limit(
+    state: &AppState,
+    ip_key: &str,
+) -> Result<(), RtDbError> {
+    let limit = state.config.storage_rate_limit_per_ip_rpm;
+    if limit == 0 {
+        return Ok(());
+    }
+    match state
+        .rate_limiter
+        .check(RateKey::Ip(ip_key.to_string()), limit)
+        .await
+    {
+        RateDecision::Denied { retry_after_secs } => Err(RtDbError::rate_limited(retry_after_secs)),
+        RateDecision::Allowed => Ok(()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -207,6 +237,37 @@ mod tests {
             RateDecision::Allowed
         );
         // And a db-key budget is independent of both token budgets.
+        assert_eq!(
+            limiter.check(RateKey::Db("d".into()), 1).await,
+            RateDecision::Allowed
+        );
+    }
+
+    #[tokio::test]
+    async fn ip_key_buckets_independently_of_token_and_db() {
+        // SEC-004: per-IP budget is a separate axis from per-token / per-db so
+        // an unauthenticated public-storage flood can be capped without
+        // affecting authenticated traffic budgets on the same limiter.
+        let limiter = RateLimiter::new();
+        assert_eq!(
+            limiter.check(RateKey::Ip("203.0.113.9".into()), 2).await,
+            RateDecision::Allowed
+        );
+        assert_eq!(
+            limiter.check(RateKey::Ip("203.0.113.9".into()), 2).await,
+            RateDecision::Allowed
+        );
+        // Third hit same minute is denied; a different IP is unaffected, and
+        // the token/db budgets remain untouched.
+        assert!(deny_secs(limiter.check(RateKey::Ip("203.0.113.9".into()), 2).await).is_some());
+        assert_eq!(
+            limiter.check(RateKey::Ip("198.51.100.42".into()), 2).await,
+            RateDecision::Allowed
+        );
+        assert_eq!(
+            limiter.check(RateKey::Token("t".into()), 1).await,
+            RateDecision::Allowed
+        );
         assert_eq!(
             limiter.check(RateKey::Db("d".into()), 1).await,
             RateDecision::Allowed

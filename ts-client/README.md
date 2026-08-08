@@ -52,7 +52,8 @@ const client = new RtDbClient({ url: "wss://rtdb.pardev.net", db: "kanban", getT
 const api = createApi(schema);
 
 // RtDbProvider is required around any component using the hooks. `authBaseUrl`
-// is the server's HTTP origin, used for the GitHub/Google sign-in popup and logout.
+// is the server's HTTP origin, used for the OAuth sign-in popup and logout
+// (any of the server's configured providers: GitHub/Google/GitLab/Microsoft/Apple/OIDC).
 function App() {
   return (
     <RtDbProvider client={client} authBaseUrl="https://rtdb.pardev.net">
@@ -190,6 +191,6 @@ mutations to local state before the server confirms them.
 ## Development
 
 ```sh
-make checkall          # from the repo root: fmt-check + lint + typecheck + test (all 3 packages)
+make checkall          # from the repo root: fmt-check + lint + typecheck + test (all 6 packages)
 make test-integration  # opt-in; needs RTDB_TEST_SERVER_URL + RTDB_TEST_ADMIN_KEY
 ```

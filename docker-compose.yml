@@ -64,6 +64,13 @@ services:
       RTDB_SESSION_TTL_DAYS: ${RTDB_SESSION_TTL_DAYS:-30}
       # Login-CSRF defense (double-submit nonce cookie at OAuth /begin + /callback).
       RTDB_OAUTH_LOGIN_CSRF: ${RTDB_OAUTH_LOGIN_CSRF:-true}
+      # Webhook delivery registry (off by default). Mirrors SEC-001 SSRF
+      # hardening: when enabled, registration requires https + rejects private
+      # IP ranges; RTDB_WEBHOOK_ALLOW_HTTP is the dev escape hatch (off).
+      RTDB_WEBHOOKS_ENABLED: ${RTDB_WEBHOOKS_ENABLED:-false}
+      RTDB_WEBHOOK_ALLOW_HTTP: ${RTDB_WEBHOOK_ALLOW_HTTP:-false}
+      # Per-IP rate limit on the public storage serve route (SEC-004). 0 = off.
+      RTDB_STORAGE_RATE_LIMIT_PER_IP_RPM: ${RTDB_STORAGE_RATE_LIMIT_PER_IP_RPM:-0}
       # NOTE: this `environment:` block is an explicit ALLOWLIST — a key present
       # in `.env` but absent here never reaches the container. Adding a new
       # RTDB_* boot knob means adding a line here too, or it silently keeps its

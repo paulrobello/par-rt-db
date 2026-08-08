@@ -150,6 +150,29 @@ impl Committers {
         guard.remove(db);
     }
 
+    /// Bundles this `Committers`'s shared state with a per-task `db` into a
+    /// `CommitterCtx` ready to hand to `run_committer` by value. Constructs
+    /// the ctx once at spawn time in `channel_for` so `run_committer` accepts
+    /// a single `ctx` argument instead of re-receiving 12 individual params
+    /// (ARC-002). All fields are `Clone` (`Arc`/`PgPool`/`bool`/`i64`/`u64`),
+    /// so this is cheap reference-bumps + primitive copies.
+    fn make_ctx(&self, db: String) -> CommitterCtx {
+        CommitterCtx {
+            pool: self.pool.clone(),
+            db,
+            subs: self.subs.clone(),
+            schemas: self.schemas.clone(),
+            op_feed: self.op_feed.clone(),
+            hot: self.hot.clone(),
+            audit_log_enabled: self.audit_log_enabled,
+            webhooks_enabled: self.webhooks_enabled,
+            ttl_batch: self.ttl_batch,
+            metrics: self.metrics.clone(),
+            quotas: self.quotas.clone(),
+            quota_cache_ttl_secs: self.quota_cache_ttl_secs,
+        }
+    }
+
     /// Submits a request to `db`'s committer task, lazily spawning it on
     /// first use. Errors `NotFound` if `db` isn't a registered database. If
     /// the send fails because the committer task is gone (e.g. it panicked),
@@ -198,21 +221,7 @@ impl Committers {
         }
 
         let (tx, rx) = mpsc::channel(CHANNEL_BUFFER);
-        tokio::spawn(run_committer(
-            self.pool.clone(),
-            db.to_string(),
-            self.subs.clone(),
-            self.schemas.clone(),
-            self.op_feed.clone(),
-            self.hot.clone(),
-            self.audit_log_enabled,
-            self.webhooks_enabled,
-            self.ttl_batch,
-            self.metrics.clone(),
-            self.quotas.clone(),
-            self.quota_cache_ttl_secs,
-            rx,
-        ));
+        tokio::spawn(run_committer(self.make_ctx(db.to_string()), rx));
         tokio::spawn(scheduler::run_scheduler(
             self.pool.clone(),
             db.to_string(),
@@ -381,42 +390,17 @@ struct CommitterCtx {
 ///   only then is the subscription registered — both steps happen before any
 ///   other message (in particular, a concurrent `Mutate`) can be processed,
 ///   so no update between execute and register can be missed.
-#[allow(clippy::too_many_arguments)]
-async fn run_committer(
-    pool: PgPool,
-    db: String,
-    subs: Arc<SubscriptionManager>,
-    schemas: SchemaCache,
-    op_feed: Arc<crate::op_feed::OpFeed>,
-    hot: Arc<ArcSwap<HotConfig>>,
-    audit_log_enabled: bool,
-    webhooks_enabled: bool,
-    ttl_batch: i64,
-    metrics: Arc<Metrics>,
-    quotas: Arc<crate::quota::UsageCache>,
-    quota_cache_ttl_secs: u64,
-    mut rx: mpsc::Receiver<CommitterRequest>,
-) {
-    if let Err(err) = mutation_log::ensure_table(&pool, &db).await {
-        tracing::error!(db = %db, error = %err, "failed to ensure mutations dedup table");
+///
+/// Takes `ctx` by value (ARC-002): the ctx is constructed once in
+/// `channel_for` via `Committers::make_ctx`, eliminating the prior 12-arg
+/// signature and the second copy of the field list that used to live here.
+async fn run_committer(ctx: CommitterCtx, mut rx: mpsc::Receiver<CommitterRequest>) {
+    if let Err(err) = mutation_log::ensure_table(&ctx.pool, &ctx.db).await {
+        tracing::error!(db = %ctx.db, error = %err, "failed to ensure mutations dedup table");
     }
-    if let Err(err) = crate::storage::ensure_table(&pool, &db).await {
-        tracing::error!(db = %db, error = %err, "committer: storage::ensure_table failed");
+    if let Err(err) = crate::storage::ensure_table(&ctx.pool, &ctx.db).await {
+        tracing::error!(db = %ctx.db, error = %err, "committer: storage::ensure_table failed");
     }
-    let ctx = CommitterCtx {
-        pool,
-        db,
-        subs,
-        schemas,
-        op_feed,
-        hot,
-        audit_log_enabled,
-        webhooks_enabled,
-        ttl_batch,
-        metrics,
-        quotas,
-        quota_cache_ttl_secs,
-    };
     while let Some(req) = rx.recv().await {
         match req {
             CommitterRequest::Mutate {
@@ -470,6 +454,76 @@ async fn run_committer(
     }
 }
 
+/// Four-tap publication of a durable write: subscription `fan_out` → op-feed
+/// `publish` → audit-log `write_audit_rows` → webhook `enqueue_for_ops`, with
+/// an optional fire-and-forget storage-cache refresh at the end.
+///
+/// **This is the load-bearing "every durable write publishes here" contract**
+/// referenced from `CLAUDE.md`. Folding the four `handle_*` arms' shared tail
+/// into one helper converts a silent omission into a single call-site decision:
+/// a new durable-write sink calls `publish_taps` instead of re-deriving the
+/// four-tap sequence, and a non-DocOp sink (e.g. `handle_restore_schema`) can
+/// opt out of the op-feed/audit/webhook taps without leaving a "missing tap"
+/// gap at the call site.
+///
+/// Parameters:
+/// - `schema`: post-write schema the subscription re-runs read against.
+/// - `write_set`: the durable write's touched tables + per-doc ops.
+/// - `owner`: interactive principal's user id, or `None` for system-initiated
+///   writes (scheduled jobs, TTL reaper, schema migrations).
+/// - `source`: short tag embedded in audit rows, webhook payloads, and op-feed
+///   attribution — `"mutate"` / `"scheduled"` / `"ttl"` / `"migrate"`.
+/// - `docop_taps`: when `false`, only `fan_out` runs. Used by paths that are
+///   DDL, not DocOps (e.g. `handle_restore_schema`) so the exception is
+///   visible at the call site rather than reading as a missed tap.
+/// - `refresh_quota_cache`: when `true`, fire-and-forget a storage-cache
+///   refresh after the taps (growing writes — mutate/scheduled/migrate). The
+///   reaper (`false`) only frees storage; restore (`false`) changes no bytes.
+///
+/// The audit and webhook taps are best-effort: a logging/enqueue failure is
+/// warned and never propagated. The write has already committed and fanned
+/// out by the time these run, so they cannot be allowed to fail the mutation.
+async fn publish_taps(
+    ctx: &CommitterCtx,
+    schema: &crate::schema::SchemaDef,
+    write_set: &WriteSet,
+    owner: Option<&str>,
+    source: &'static str,
+    docop_taps: bool,
+    refresh_quota_cache: bool,
+) {
+    ctx.subs
+        .fan_out(&ctx.pool, &ctx.db, schema, write_set)
+        .await;
+    if !docop_taps {
+        return;
+    }
+    // Op-feed completeness: every durable document write publishes here.
+    ctx.op_feed.publish(&ctx.db, owner, &write_set.ops).await;
+    // Durable audit tap (the persistent counterpart to the op-feed above).
+    if ctx.audit_log_enabled
+        && let Err(err) =
+            crate::audit::write_audit_rows(&ctx.pool, &ctx.db, owner, source, &write_set.ops).await
+    {
+        tracing::warn!(db = %ctx.db, source, error = %err, "audit log write failed");
+    }
+    // Webhook enqueue tap — mirrors the audit tap above.
+    if ctx.webhooks_enabled
+        && let Err(err) =
+            crate::webhook::enqueue_for_ops(&ctx.pool, &ctx.db, owner, source, &write_set.ops).await
+    {
+        tracing::warn!(db = %ctx.db, source, error = %err, "webhook enqueue failed");
+    }
+    if refresh_quota_cache {
+        let quotas = ctx.quotas.clone();
+        let pool = ctx.pool.clone();
+        let db = ctx.db.clone();
+        tokio::spawn(async move {
+            let _ = quotas.refresh(&pool, &db).await;
+        });
+    }
+}
+
 async fn handle_mutate(
     ctx: &CommitterCtx,
     idempotency_key: Option<String>,
@@ -510,44 +564,20 @@ async fn handle_mutate(
         return Err(e);
     }
     let outcome = execute_txn(&ctx.pool, &ctx.db, &schema, &txn, &principal_ctx).await?;
-    ctx.subs
-        .fan_out(&ctx.pool, &ctx.db, &schema, &outcome.write_set)
-        .await;
-    // Op-feed completeness: every durable document write must publish here, in handle_scheduled, or in handle_migrate.
-    ctx.op_feed
-        .publish(&ctx.db, owner, &outcome.write_set.ops)
-        .await;
-    // Durable audit tap (the persistent counterpart to the op-feed above).
-    // Best-effort: a logging failure is warned, never surfaced to the client —
-    // the mutation has already committed and fanned out by this point.
-    if ctx.audit_log_enabled
-        && let Err(err) = crate::audit::write_audit_rows(
-            &ctx.pool,
-            &ctx.db,
-            owner,
-            "mutate",
-            &outcome.write_set.ops,
-        )
-        .await
-    {
-        tracing::warn!(db = %ctx.db, error = %err, "audit log write failed");
-    }
-    // Webhook enqueue tap — mirrors the audit tap above: best-effort, warned on
-    // failure, never surfaces to the client. The mutation has already committed
-    // and fanned out by this point. `source = "mutate"` distinguishes the
-    // interactive tap from the scheduled one below in delivered payloads.
-    if ctx.webhooks_enabled
-        && let Err(err) = crate::webhook::enqueue_for_ops(
-            &ctx.pool,
-            &ctx.db,
-            owner,
-            "mutate",
-            &outcome.write_set.ops,
-        )
-        .await
-    {
-        tracing::warn!(db = %ctx.db, error = %err, "webhook enqueue failed");
-    }
+    // Four-tap publication (fan_out → op-feed → audit → webhook → quota-refresh).
+    // `owner = principal_ctx.user_id` carries the interactive uid into the
+    // op-feed/audit/webhook payloads; `source = "mutate"` distinguishes the
+    // interactive tap from scheduled/ttl/migrate.
+    publish_taps(
+        ctx,
+        &schema,
+        &outcome.write_set,
+        owner,
+        "mutate",
+        true,
+        true,
+    )
+    .await;
 
     if let Some(key) = &idempotency_key {
         // The dedup TTL is read live from hot config so a `PATCH /admin/config`
@@ -566,19 +596,6 @@ async fn handle_mutate(
                 "failed to cache mutation result for idempotency key; a retry with this key will re-execute"
             );
         }
-    }
-
-    // ENH-011: best-effort post-commit refresh of the storage cache so the next
-    // enforce sees fresh bytes. Fire-and-forget — mirrors the audit/webhook tap
-    // spawns; a failure to refresh here just leaves the entry stale (TTL-bounded
-    // self-heal on the next `enforce`).
-    {
-        let quotas = ctx.quotas.clone();
-        let pool = ctx.pool.clone();
-        let db = ctx.db.clone();
-        tokio::spawn(async move {
-            let _ = quotas.refresh(&pool, &db).await;
-        });
     }
 
     Ok(outcome)
@@ -624,43 +641,20 @@ async fn handle_scheduled(
     }
     match execute_txn(&ctx.pool, &ctx.db, &schema, &txn, &PrincipalCtx::bypass()).await {
         Ok(outcome) => {
-            ctx.subs
-                .fan_out(&ctx.pool, &ctx.db, &schema, &outcome.write_set)
-                .await;
-            // Op-feed completeness: every durable document write must publish here, in handle_mutate, or in handle_migrate.
-            ctx.op_feed
-                .publish(&ctx.db, None, &outcome.write_set.ops)
-                .await;
-            // Durable audit tap — scheduled jobs carry no interactive principal
-            // (the op-feed publish above also passes `None`), so `principal`
-            // is NULL and `source = "scheduled"`.
-            if ctx.audit_log_enabled
-                && let Err(err) = crate::audit::write_audit_rows(
-                    &ctx.pool,
-                    &ctx.db,
-                    None,
-                    "scheduled",
-                    &outcome.write_set.ops,
-                )
-                .await
-            {
-                tracing::warn!(db = %ctx.db, error = %err, "audit log write failed");
-            }
-            // Webhook enqueue tap — scheduled jobs carry no interactive
-            // principal (the audit tap above also passes `None`), so the
-            // payload's `owner` is null and `source = "scheduled"`.
-            if ctx.webhooks_enabled
-                && let Err(err) = crate::webhook::enqueue_for_ops(
-                    &ctx.pool,
-                    &ctx.db,
-                    None,
-                    "scheduled",
-                    &outcome.write_set.ops,
-                )
-                .await
-            {
-                tracing::warn!(db = %ctx.db, error = %err, "webhook enqueue failed");
-            }
+            // Four-tap publication (fan_out → op-feed → audit → webhook → quota-
+            // refresh). Scheduled jobs carry no interactive principal
+            // (`owner = None`); `source = "scheduled"` distinguishes from
+            // mutate/ttl/migrate in delivered payloads.
+            publish_taps(
+                ctx,
+                &schema,
+                &outcome.write_set,
+                None,
+                "scheduled",
+                true,
+                true,
+            )
+            .await;
             let finalize = match kind.as_str() {
                 "oneshot" => scheduler::finalize_one_shot_done(&ctx.pool, &ctx.db, &id).await,
                 "cron" => match cron.as_deref() {
@@ -684,17 +678,6 @@ async fn handle_scheduled(
             };
             if let Err(err) = finalize {
                 tracing::error!(db = %ctx.db, %id, error = %err, "scheduled job finalize failed");
-            }
-            // ENH-011: best-effort post-commit refresh of the storage cache.
-            // Fire-and-forget — mirrors `handle_mutate`. Only on the success
-            // path (an `execute_txn` failure rolled nothing back to refresh).
-            {
-                let quotas = ctx.quotas.clone();
-                let pool = ctx.pool.clone();
-                let db = ctx.db.clone();
-                tokio::spawn(async move {
-                    let _ = quotas.refresh(&pool, &db).await;
-                });
             }
         }
         Err(err) => {
@@ -803,29 +786,10 @@ async fn handle_reaper(ctx: &CommitterCtx) -> Result<(), RtDbError> {
         ops: ops.clone(),
         doc_values: BTreeMap::new(),
     };
-    ctx.subs
-        .fan_out(&ctx.pool, &ctx.db, &schema, &write_set)
-        .await;
-    // Op-feed completeness: every durable document write must publish here, in
-    // handle_mutate / handle_scheduled / handle_migrate, or (now) here.
-    ctx.op_feed.publish(&ctx.db, None, &write_set.ops).await;
-    // Durable audit tap — `source = "ttl"` distinguishes system-initiated
-    // expiry from interactive (`mutate`), scheduled (`scheduled`), and
-    // schema-migration (`migrate`) writes. `owner = None` (system principal).
-    if ctx.audit_log_enabled
-        && let Err(err) =
-            crate::audit::write_audit_rows(&ctx.pool, &ctx.db, None, "ttl", &write_set.ops).await
-    {
-        tracing::warn!(db = %ctx.db, error = %err, "audit log write failed (ttl)");
-    }
-    // Webhook enqueue tap — mirrors the audit tap above: best-effort, warned
-    // on failure, never surfaces to the client.
-    if ctx.webhooks_enabled
-        && let Err(err) =
-            crate::webhook::enqueue_for_ops(&ctx.pool, &ctx.db, None, "ttl", &write_set.ops).await
-    {
-        tracing::warn!(db = %ctx.db, error = %err, "webhook enqueue failed (ttl)");
-    }
+    // Four-tap publication (fan_out → op-feed → audit → webhook). No quota
+    // refresh — the reaper only frees storage. `owner = None`, `source = "ttl"`
+    // (system-initiated expiry, no interactive principal).
+    publish_taps(ctx, &schema, &write_set, None, "ttl", true, false).await;
     for _ in 0..ops.len() {
         ctx.metrics.record_ttl_expired();
     }
@@ -929,52 +893,19 @@ async fn handle_migrate(
         tracing::warn!(db = %ctx.db, error = %err, "schema history capture failed");
     }
 
-    // Four tap sites — same contract as `handle_mutate`. The hand-built
-    // `WriteSet` carries the touched tables (the subscription re-run gate) and
-    // the per-doc ops; `docs`/`doc_values` empty ⇒ table-level re-run, the safe
-    // over-approximation for a migration (some ops may touch docs whose ids
-    // weren't recorded at the fine-grained (table, id) level — re-running is
-    // always sound, never under-approximates).
+    // Four-tap publication (fan_out → op-feed → audit → webhook → quota-refresh)
+    // — same contract as `handle_mutate`. The hand-built `WriteSet` carries the
+    // touched tables (the subscription re-run gate) and the per-doc ops;
+    // `docs`/`doc_values` empty ⇒ table-level re-run, the safe over-approximation
+    // for a migration (some ops may touch docs whose ids weren't recorded at
+    // the fine-grained (table, id) level — re-running is always sound, never
+    // under-approximates). `owner = None`, `source = "migrate"`.
     let write_set = WriteSet {
         tables: fx.touched,
         ops: fx.ops.clone(),
         ..Default::default()
     };
-    ctx.subs
-        .fan_out(&ctx.pool, &ctx.db, &derived, &write_set)
-        .await;
-    // Op-feed completeness: every durable document write must publish here, in
-    // handle_mutate / handle_scheduled, or (now) here.
-    ctx.op_feed.publish(&ctx.db, None, &write_set.ops).await;
-    // Durable audit tap — `source = "migrate"` distinguishes schema-migration
-    // writes from interactive (`mutate`) and scheduled (`scheduled`) ones.
-    if ctx.audit_log_enabled
-        && let Err(err) =
-            crate::audit::write_audit_rows(&ctx.pool, &ctx.db, None, "migrate", &write_set.ops)
-                .await
-    {
-        tracing::warn!(db = %ctx.db, error = %err, "audit log write failed");
-    }
-    // Webhook enqueue tap — mirrors the audit tap above: best-effort, warned on
-    // failure, never surfaces to the client.
-    if ctx.webhooks_enabled
-        && let Err(err) =
-            crate::webhook::enqueue_for_ops(&ctx.pool, &ctx.db, None, "migrate", &write_set.ops)
-                .await
-    {
-        tracing::warn!(db = %ctx.db, error = %err, "webhook enqueue failed");
-    }
-    // ENH-011: best-effort post-commit refresh of the storage cache. Fire-and-
-    // forget — mirrors `handle_mutate`/`handle_scheduled`. Only after a real
-    // `apply_migration` commit (`dry_run` rolled back and returned early above).
-    {
-        let quotas = ctx.quotas.clone();
-        let pool = ctx.pool.clone();
-        let db = ctx.db.clone();
-        tokio::spawn(async move {
-            let _ = quotas.refresh(&pool, &db).await;
-        });
-    }
+    publish_taps(ctx, &derived, &write_set, None, "migrate", true, true).await;
 
     Ok(crate::migrate::MigrateResult {
         applied: true,
@@ -1054,14 +985,16 @@ async fn handle_restore_schema(ctx: &CommitterCtx, target_version: i64) -> Resul
 
     // Re-evaluate subscriptions: dropped tables/columns invalidate their subs.
     // Table-level re-run (no per-doc `doc_values`) — the safe over-approximation
-    // for a shape change, same as `handle_migrate`.
+    // for a shape change, same as `handle_migrate`. Routed through `publish_taps`
+    // with `docop_taps=false`: restore is pure DDL, no DocOps are produced, so
+    // the op-feed/audit/webhook taps are skipped — but the exception is now
+    // visible at the call site rather than hidden by a direct `fan_out` call,
+    // and a future change to the tap sequence stays consistent across handlers.
     let write_set = WriteSet {
         tables: touched.into_iter().collect(),
         ..Default::default()
     };
-    ctx.subs
-        .fan_out(&ctx.pool, &ctx.db, &target, &write_set)
-        .await;
+    publish_taps(ctx, &target, &write_set, None, "restore", false, false).await;
 
     Ok(target_version)
 }

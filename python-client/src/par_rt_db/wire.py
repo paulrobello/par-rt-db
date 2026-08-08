@@ -305,10 +305,10 @@ class HybridSearchQuery(_Camel):
 #
 # Mirrors ``server/src/protocol.rs::ClientMessage`` (the ``#[serde(tag = "type",
 # rename_all = "camelCase", deny_unknown_fields)]`` enum). ``extra="forbid"`` is
-# inherited from ``_Camel``. ``query``/``txn`` reference the Query / Transaction
-# models (Tasks 9-10); they are typed as ``dict[str, Any]`` for now so wire
-# payloads pass through unchanged.
-# TODO(tasks 9-10): tighten to Query / Transaction models.
+# inherited from ``_Camel``. ``query``/``txn`` are deliberately ``dict[str, Any]``
+# rather than ``Query``/``Transaction`` so the wire layer stays decoupled from the
+# DSL layer (avoids a circular import with ``query.py``/``mutation.py``) and so
+# future DSL extensions pass through unchanged until they're re-serialized.
 
 
 class _ClientAuth(_Camel):
@@ -331,7 +331,7 @@ class _ClientAuth(_Camel):
 class _ClientSubscribe(_Camel):
     type: Literal["subscribe"] = "subscribe"
     query_id: str
-    query: dict[str, Any]  # TODO(tasks 9-10): tighten to Query
+    query: dict[str, Any]
 
 
 class _ClientUnsubscribe(_Camel):
@@ -343,7 +343,7 @@ class _ClientMutate(_Camel):
     type: Literal["mutate"] = "mutate"
     mut_id: str
     idempotency_key: str | None = None
-    txn: dict[str, Any]  # TODO(tasks 9-10): tighten to Transaction
+    txn: dict[str, Any]
 
     @model_serializer(mode="wrap")
     def _drop_idempotency_when_none(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
@@ -357,7 +357,7 @@ class _ClientSchedule(_Camel):
     type: Literal["schedule"] = "schedule"
     schedule_id: str
     when: ScheduleWhen
-    txn: dict[str, Any]  # TODO(tasks 9-10): tighten to Transaction
+    txn: dict[str, Any]
 
 
 class _ClientCancelSchedule(_Camel):

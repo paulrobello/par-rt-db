@@ -56,3 +56,13 @@ tempfile = "3"
 tokio-tungstenite = "0.26"
 futures-util = "0.3"
 wiremock = "0.6"
+
+# Match cli/ and rust-client/: a direct `cargo clippy`/`cargo build` (editor,
+# rust-analyzer, pre-commit) denies warnings without needing the Makefile's
+# `-D warnings` flag. The Makefile's `make lint`/`make checkall` already pass
+# `-D warnings` so this is belt-and-suspenders, not a behavior change.
+[lints.rust]
+warnings = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }

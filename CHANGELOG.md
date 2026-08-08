@@ -4,8 +4,8 @@ All notable changes to par-rt-db will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
-Each package is versioned independently; the four client SDKs are at `0.1.0` until
-the first tagged release.
+Each package is versioned independently; the three client SDKs (ts/rust/python)
+and the dashboard + cli packages are at `0.1.0` until the first tagged release.
 
 Feature entries cross-reference the rows in
 [`FEATURE_MATRIX.md`](FEATURE_MATRIX.md), which is the authoritative parity
@@ -46,6 +46,39 @@ manual follow-ups — SEC-001 (HttpOnly cookie), SEC-008 (PATCH-side `maxFileSiz
 check), and ARC-008(a) (`Vec<f32>`→`Vec<f64>`) — are now implemented (CI fix
 `oven/setup-bun`→`oven-sh/setup-bun` landed too).
 
+### Shipped 2026-07-26 → 2026-08-07
+
+Post-audit feature work, all under `[Unreleased]` (no tagged release yet). Each
+entry cross-references the FEATURE_MATRIX row that is the authoritative parity
+contract.
+
+#### Server
+
+- **Microsoft + Apple OAuth** (FEATURE_MATRIX #14) — `auth/microsoft.rs` (Entra ID/Azure AD v2; derives endpoints from `RTDB_MICROSOFT_TENANT`) and `auth/apple.rs` (ES256 JWT `client_secret` signed per-exchange with the registered EC key, `response_mode=form_post` served by a dedicated POST `/auth/apple/callback`, identity keyed on Apple's stable `sub` via a new `apple_sub` column). Six providers now ship behind the `OAuthProvider` trait.
+- **Login-CSRF defense** (SEC-012) — `rtdb-oauth-csrf` double-submit cookie (`SameSite=None;HttpOnly`) set at `GET /auth/{provider}/begin`, constant-time-verified at the callback; kill-switch `RTDB_OAUTH_LOGIN_CSRF=false`. The OAuth popup opens `noopener,noreferrer` (reverse-tabnabbing); completion is relayed by the parent polling `GET /auth/state?state=<token>` (not `window.opener.postMessage`, which `noopener` severs). The state token, not the cookie, is the poll capability — the flow works cross-origin where the `SameSite=Lax` session cookie would not be sent.
+- **Schema migration** (`POST /admin/db/{db}/migrate`) — ordered `Directive` list (`renameField`/`renameTable`, `changeType` with closed cast matrix + optional `default`, `dropField`/`dropTable`/`dropIndex`, `setDefault`, scoped `evalExpr` raw-SQL doc-rewrite escape) running inside the committer's serialized `RunMigrate` arm so `fan_out` + op-feed + audit + webhook all fire. Dry-run-first. Mirrored across all four clients + the `rtdb migrate` CLI + the dashboard (preview → review → apply).
+- **Schema change history** (ENH-013) — every `push-schema`/`migrate`/`restore` captures a snapshot; `GET /admin/db/{db}/schema/history[?limit=&offset=]`, `GET /admin/db/{db}/schema/history/{version}`, `POST /admin/db/{db}/schema/restore` (in-place destructive shape reconcile inside the committer, captures the outgoing shape first so the restore itself is undoable).
+- **Per-row auth Model B + Model C** (FEATURE_MATRIX #20) — `collaboratorsField` (owner OR collaborator) and `authorize` (a general `FilterExpr` predicate over doc fields plus `$user`/`$email` principal markers; pre-check + auto-stamp + post-write verify on all five write paths). `ExpectVersion`/`ExpectAbsent` side-channel closed (2026-08-03): a doc the caller cannot see is indistinguishable from absent.
+- **Unique + partial (`WHERE`) indexes** (FEATURE_MATRIX #22) — `unique` + `where: FilterExpr` on `IndexDef`; partial predicate compiled to literal SQL at DDL time; `unique_violation` → `CONFLICT` (HTTP 409) wire code.
+- **Document TTL / auto-expiry** (FEATURE_MATRIX #23) — `ttl: { field, defaultDurationMs? }` declaration; per-db reaper task enqueues `RunReaper` every `RTDB_TTL_SWEEP_INTERVAL_SECS`, batch-deletes expired rows inside the committer's serialized turn, publishes through all four tap sites with `source = "ttl"`, `owner = None`.
+- **Webhooks** (ENH-003, when `RTDB_WEBHOOKS_ENABLED=true`) — per-`DocOp` outbox row drained by a boot worker (reqwest POSTs, exponential backoff, at-least-once); admin CRUD at `/admin/db/{db}/webhooks`.
+- **Audit log** (ENH-004, when `RTDB_AUDIT_LOG_ENABLED=true`) — best-effort `rtdb.audit_log` row per `DocOp` at the committer tap sites (`ts_ms, db, table, op, doc_id, principal, source`); `GET /admin/audit?db=&limit=&offset=`.
+- **Scoped machine tokens** (ENH-005) — optional `expiresAt`/`readOnly`/`tables` scoping with live expiry, mirrored across ts/rust/python clients + dashboard.
+- **Subscription inspector** (ENH-010) — `GET /admin/subscriptions` lists active subscriptions across all dbs with read-set class + skip/re-run counters.
+- **Database clone + delete** (ENH-009) — `POST /admin/clone-db` (schema-only clone); `POST /admin/delete-db` (typed `{name, confirm}` guard, retires the per-db committer/scheduler/reaper tasks cleanly).
+- **Search language config** (ENH-006) — `RTDB_SEARCH_LANGUAGE` boot config (Postgres `regconfig` for the generated tsvector + `plainto_tsquery`).
+- **Vector distance metrics** (ENH-007) — per-vector-index `metric: cosine | l2 | ip` (cosine default); HNSW index over `vector_cosine_ops`/`vector_l2_ops`/`vector_ip_ops`, ranking distance `<=>`/`<->`/`<#>`.
+- **Storage dedup** (ENH-008) — `sha256`-keyed dedup at upload; a second upload of the same bytes returns the existing id.
+- **Image transforms** (ENH-014) — pure-Rust decode → resize → re-encode on both serve routes (`?w=&h=&fit=&q=&format=`); in-memory `moka` cache, bounded decode concurrency, decode-pixel cap. Passthrough is zero-overhead; transformed responses carry `Cache-Control: public, max-age=31536000, immutable`. `RTDB_IMAGE_*` knobs.
+- **Realtime presence** (FEATURE_MATRIX #25, ENH-015) — transient, in-memory, connection-bound (the open `/sync` WS is the liveness signal), not committer-bound or persisted, coalesced via a process-wide flush task. Per-state TTL follow-up: `presenceState` accepts `ttlMs`; the server clears state to `null` after the TTL while the member stays. `RTDB_PRESENCE_*` knobs; `RTDB_PRESENCE_ENABLED` master switch.
+- **Per-database resource quotas** (FEATURE_MATRIX #26, ENH-011) — three global caps on `HotConfig` (`maxTablesPerDb`, `maxStorageBytesPerDb`, `maxSubsPerDb`, all `0` = unlimited) enforced hard at push-schema/migrate, `handle_subscribe`, and `handle_mutate`/`handle_scheduled`/`handle_migrate`/`upload_handler`; cached live `pg_total_relation_size` measurement; **no admin bypass** (PrincipalCtx can't distinguish admin from machine token at the committer). Over-cap → `QUOTA_EXCEEDED` (HTTP 507); `rtdb_quota_rejections_total{kind}` metric. Mirrored across all four clients.
+- **Backup lifecycle** — `POST /admin/backup` (manual `pg_dump`, 409 if already running), `GET /admin/backups`, `GET|DELETE /admin/backups/{name}`, `POST /admin/restore` (restores into a fresh `rtdb_restored_<stamp>` DB via `pg_restore --no-owner --no-privileges`; the live `rtdb` DB is never touched). Requires `CREATEDB` on the DB role. Mirrored in ts/rust/python admin clients + dashboard.
+- **Async python client** (ENH-012) — `RtDbAsyncHttpClient` over `httpx.AsyncClient` (`pip install par-rt-db[aio]`); same method set as the sync twin.
+
+#### Clients (cross-cutting)
+
+- **All four clients at feature parity** (2026-07-29) — ts/rust/python + dashboard. Optimistic updates, in-memory/offline test harness, the full admin control plane (allowlist/admins/metrics/hot-config/ops-feed/tokens/schema/stats), and the wire/DSL surfaces now mirror across all four ports.
+
 ### Added
 
 #### Server
@@ -84,13 +117,13 @@ check), and ARC-008(a) (`Vec<f32>`→`Vec<f64>`) — are now implemented (CI fix
 - **React bindings** — `RtDbProvider`, `useQuery`, `useMutation`, `useConnectionState`, auth gates, `usePaginatedQuery`.
 - **HTTP/admin clients** — one-shot query/mutate, schedule, storage, token mint/revoke, schema push, snapshot export/import.
 - **In-memory test harness** — `InMemoryRtDbClient` mirroring server query/txn/subscription semantics offline.
-- **Optimistic updates** — opt-in `optimisticUpdates` overlaid on each subscription's last result; server reconciles, rolls back on error (#12). Rust/Python pending.
+- **Optimistic updates** — opt-in `optimisticUpdates` overlaid on each subscription's last result; server reconciles, rolls back on error (#12). Mirrored in the rust and python clients.
 
 #### Rust client (`par-rt-db-client`, `rust-client/`)
 
 - Wire contract, schema/mutation/query DSL, http + reactive ws + admin clients, index helpers, `mutate_with_retry`, `.filter()`/`.search()`/`.vector_search()` builders, schedule + storage surfaces.
 - Opt-in live-server integration test (`tests/http_integration.rs`, `#[ignore]`, `RTDB_TEST_SERVER_URL` + `RTDB_TEST_ADMIN_KEY`).
-- Optimistic updates pending (matches FEATURE_MATRIX #12).
+- Optimistic updates (matches FEATURE_MATRIX #12).
 
 #### Python client (`par-rt-db`, `python-client/`)
 
@@ -99,7 +132,7 @@ check), and ARC-008(a) (`Vec<f32>`→`Vec<f64>`) — are now implemented (CI fix
 - Mutation DSL — `Step`/`StepResult`/`Transaction`/`Mutation` builders.
 - Query DSL — `TableQuery` builders (`get`/`with_index`/`eq`/`gt`/…/`order`/`take`/`unique`/`first`/`count`/`filter`/`search`/`vector_search`/`paginate`), `Query`/`QueryResult`, `encode_cursor`/`decode_cursor`.
 - Four-way wire-parity fixtures (Python ↔ server ↔ TS ↔ Rust).
-- HTTP/WS/admin/storage client surfaces pending.
+- HTTP/WS/admin/storage client surfaces shipped: sync `httpx` client (`pip install par-rt-db[http]`), async twin over `httpx.AsyncClient` (`pip install par-rt-db[aio]`, ENH-012), reactive `RtDbClient` over `/sync` (`pip install par-rt-db[ws]`), admin client + storage helpers, optimistic updates, and an in-memory/offline test harness (`par_rt_db.in_memory` + `tick()`). The four clients are now at feature parity (2026-07-29).
 
 #### Dashboard (`@par-rt-db/dashboard`, `dashboard/`)
 
@@ -108,7 +141,7 @@ check), and ARC-008(a) (`Vec<f32>`→`Vec<f64>`) — are now implemented (CI fix
 
 #### Build / operations
 
-- Root `Makefile` with `make build | fmt | fmt-check | lint | typecheck | test | checkall | dev-db-up | dev-db-down | pre-commit | pre-commit-update | deploy` spanning all five packages.
+- Root `Makefile` with `make build | fmt | fmt-check | lint | typecheck | test | checkall | dev-db-up | dev-db-down | pre-commit | pre-commit-update | deploy` spanning all six packages (server, ts-client, rust-client, python-client, dashboard, cli).
 - `pre-commit` runs `gitleaks` + `detect-private-key` + format/lint checks.
 - Docker deploy (`Dockerfile`, `docker-compose.yml`) — the dashboard SPA is baked into the image (`dashboard` build stage copies `dist/` to `/app/dashboard-dist`, pointed at by `RTDB_STATIC_DIR`).
 - Healthz `/healthz` — `{status:"ok"|"degraded", version, git_commit, build_timestamp, started_at, uptime_seconds, postgres}`; `RTDB_BUILD_COMMIT` bake-in via build-arg for image builds without `.git`.

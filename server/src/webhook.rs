@@ -11,6 +11,7 @@
 //! hard attempt ceiling. Enqueue is best-effort by contract: a logging failure
 //! is warned and never fails a durable mutation, mirroring `audit::write_audit_rows`.
 
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -114,6 +115,123 @@ fn truncate_error(s: &str) -> String {
         end -= 1;
     }
     format!("{}...", &s[..end])
+}
+
+/// `true` for IP addresses a webhook must never target — the SSRF denylist
+/// (SEC-001). Covers loopback, private (RFC1918), link-local (including the
+/// `169.254.169.254` cloud-metadata IP), unspecified, multicast, broadcast,
+/// and IPv6 unique-local/link-local. Pure (no I/O) so it is unit-testable.
+pub fn is_blocked_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v) => {
+            let oct = v.octets();
+            // 0.0.0.0/8 — "this network" / unspecified source.
+            oct[0] == 0
+            // 10.0.0.0/8 — RFC1918 private.
+            || oct[0] == 10
+            // 172.16.0.0/12 — RFC1918 private.
+            || (oct[0] == 172 && (oct[1] & 0xf0) == 16)
+            // 192.168.0.0/16 — RFC1918 private.
+            || (oct[0] == 192 && oct[1] == 168)
+            // 127.0.0.0/8 — loopback.
+            || oct[0] == 127
+            // 169.254.0.0/16 — link-local, which includes the cloud-metadata
+            // IP 169.254.169.254 (AWS/Azure/GCP).
+            || (oct[0] == 169 && oct[1] == 254)
+            // 224.0.0.0/4 — multicast.
+            || (oct[0] & 0xf0) == 224
+            // 255.255.255.255 — broadcast.
+            || (oct[0] == 255 && oct[1] == 255 && oct[2] == 255 && oct[3] == 255)
+        }
+        IpAddr::V6(v) => {
+            // ::1 — loopback.
+            v.is_loopback()
+            // :: — unspecified.
+            || v.is_unspecified()
+            // fe80::/10 — link-local.
+            || v.is_unicast_link_local()
+            // ff00::/8 — multicast.
+            || v.is_multicast()
+            // fc00::/7 — unique-local (RFC4193), the IPv6 RFC1918 analog.
+            || (v.octets()[0] & 0xfe) == 0xfc
+        }
+    }
+}
+
+/// Validates a webhook target URL against the SSRF policy (SEC-001). When
+/// `allow_http` is true (dev flag `RTDB_WEBHOOK_ALLOW_HTTP`) the scheme check
+/// and the IP-range denylist are both relaxed so a developer may point a
+/// webhook at a local HTTP receiver (`http://127.0.0.1:<port>/...`); this is
+/// the only escape hatch and is off by default. In production (`allow_http =
+/// false`):
+///   - URL must parse with the `https://` scheme (and no embedded credentials).
+///   - The host literal, if an IP, must not be in [`is_blocked_ip`]; the host
+///     literal, if a name, must not be a known cloud-metadata hostname.
+///   - The hostname is resolved via `tokio::net::lookup_host` and rejected if
+///     ANY resolved address is in [`is_blocked_ip`] (DNS-rebinding to a public
+///     address at registration time then private at delivery time is residual;
+///     the worker's `redirect(Policy::none())` client closes the redirect
+///     bypass).
+pub async fn validate_webhook_url(url: &str, allow_http: bool) -> Result<(), String> {
+    let parsed = url::Url::parse(url).map_err(|e| format!("invalid URL: {e}"))?;
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("URL must not contain embedded credentials".into());
+    }
+    let scheme = parsed.scheme().to_ascii_lowercase();
+    let scheme_ok = scheme == "https" || (allow_http && scheme == "http");
+    if !scheme_ok {
+        return Err(if allow_http {
+            "URL scheme must be http or https".into()
+        } else {
+            "URL scheme must be https (set RTDB_WEBHOOK_ALLOW_HTTP=true for http in dev)".into()
+        });
+    }
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| "URL must have a host".to_string())?;
+    // Defense-in-depth on the textual hostname: reject known metadata-service
+    // names even before DNS resolution. Cheap and stable; DNS could rebind.
+    if matches!(
+        host,
+        "metadata.google.internal" | "metadata" | "169.254.169.254"
+    ) {
+        return Err(format!("host '{host}' is a known cloud-metadata endpoint"));
+    }
+    // Dev escape hatch: skip the IP-range denylist entirely. Lets the
+    // integration tests point at `http://127.0.0.1:<port>/...` receivers.
+    if allow_http {
+        return Ok(());
+    }
+    // IP literal? Check directly with no DNS round-trip.
+    let ip_literal = match parsed.host() {
+        Some(url::Host::Ipv4(ip)) => Some(IpAddr::V4(ip)),
+        Some(url::Host::Ipv6(ip)) => Some(IpAddr::V6(ip)),
+        Some(url::Host::Domain(_)) | None => host.parse::<IpAddr>().ok(),
+    };
+    if let Some(ip) = ip_literal {
+        if is_blocked_ip(ip) {
+            return Err(format!(
+                "host IP {ip} is in a blocked range (private/loopback/metadata)"
+            ));
+        }
+        return Ok(());
+    }
+    // Hostname: resolve and reject if any address lands in a blocked range.
+    let port = parsed
+        .port_or_known_default()
+        .expect("http(s) always have a default port");
+    let resolved = tokio::net::lookup_host(format!("{host}:{port}"))
+        .await
+        .map_err(|e| format!("DNS resolution failed for '{host}': {e}"))?;
+    for addr in resolved {
+        if is_blocked_ip(addr.ip()) {
+            return Err(format!(
+                "'{host}' resolves to blocked IP {} (private/loopback/metadata)",
+                addr.ip()
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Enqueues one `webhook_deliveries` row per webhook matching any of `ops`,
@@ -261,13 +379,28 @@ async fn drain_once_with_client(
 /// One drain pass with a freshly-built HTTP client. Exposed for tests so the
 /// full enqueue → drain → receiver round-trip can be exercised without running
 /// the infinite worker loop. The worker itself reuses one client across ticks
-/// via `drain_once_with_client` to avoid reconnect churn.
+/// via `drain_once_with_client` to avoid reconnect churn. The client is built
+/// with `redirect(Policy::none())` so a 3xx response is surfaced as the
+/// delivery's terminal status instead of being followed — a redirect to an
+/// internal host is the SSRF bypass vector (SEC-001).
 pub async fn drain_once(pool: &PgPool) -> Result<usize, RtDbError> {
-    let client = reqwest::Client::builder()
-        .timeout(DELIVERY_TIMEOUT)
-        .build()
-        .map_err(|e| RtDbError::internal(format!("build webhook HTTP client: {e}")))?;
+    let client = build_delivery_client()?;
     drain_once_with_client(pool, &client).await
+}
+
+/// Builds the webhook-delivery `reqwest::Client`: bounded timeout, **no
+/// redirect-following**. A redirect to an internal host is the SSRF bypass
+/// vector — the registration validator ([`validate_webhook_url`]) vets the
+/// registered URL, but a benign-on-registration URL that later returns 3xx to
+/// `169.254.169.254` would still exfiltrate payloads. Surfacing 3xx as the
+/// delivery's `last_error` (via the `Ok(resp) if resp.status().is_success()`
+/// arm) closes that path without a per-redirect denylist (SEC-001).
+fn build_delivery_client() -> Result<reqwest::Client, RtDbError> {
+    reqwest::Client::builder()
+        .timeout(DELIVERY_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| RtDbError::internal(format!("build webhook HTTP client: {e}")))
 }
 
 /// The delivery worker loop: drain, sleep [`WORKER_POLL_INTERVAL`], repeat.
@@ -276,7 +409,7 @@ pub async fn drain_once(pool: &PgPool) -> Result<usize, RtDbError> {
 /// process exits (the task is `tokio::spawn`ed at boot when webhooks are
 /// enabled).
 pub async fn run_delivery_worker(pool: PgPool) {
-    let client = match reqwest::Client::builder().timeout(DELIVERY_TIMEOUT).build() {
+    let client = match build_delivery_client() {
         Ok(c) => c,
         Err(err) => {
             tracing::error!(error = %err, "webhook worker: failed to build HTTP client; worker exiting");
@@ -592,5 +725,142 @@ mod tests {
         let truncated = truncate_error(&emoji);
         assert!(truncated.ends_with("..."));
         assert!(truncated.len() <= MAX_ERROR_LEN + 3);
+    }
+
+    // ===================== SEC-001 URL validator =====================
+    // Pure IP-range denylist checks first (no network). DNS resolution is
+    // exercised in production code; the unit tests use IP literals and the
+    // dev escape hatch to avoid flakiness from real lookups.
+
+    #[test]
+    fn is_blocked_ip_catches_loopback_private_linklocal_metadata() {
+        use std::net::{Ipv4Addr, Ipv6Addr};
+        // Loopback.
+        assert!(is_blocked_ip(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))));
+        // RFC1918 private ranges.
+        assert!(is_blocked_ip(IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3))));
+        assert!(is_blocked_ip(IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1))));
+        assert!(is_blocked_ip(IpAddr::V4(Ipv4Addr::new(172, 31, 255, 255))));
+        assert!(is_blocked_ip(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))));
+        // Link-local — and the cloud-metadata IP specifically.
+        assert!(is_blocked_ip(IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254))));
+        assert!(is_blocked_ip(IpAddr::V4(Ipv4Addr::new(169, 254, 0, 1))));
+        // Multicast + broadcast + unspecified-source.
+        assert!(is_blocked_ip(IpAddr::V4(Ipv4Addr::new(224, 0, 0, 1))));
+        assert!(is_blocked_ip(IpAddr::V4(Ipv4Addr::new(255, 255, 255, 255))));
+        assert!(is_blocked_ip(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0))));
+        // IPv6 loopback / unspecified / link-local / ULA / multicast.
+        assert!(is_blocked_ip(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+        assert!(is_blocked_ip(IpAddr::V6(Ipv6Addr::UNSPECIFIED)));
+        assert!(is_blocked_ip("fe80::1".parse().unwrap()));
+        assert!(is_blocked_ip("fc00::1".parse().unwrap()));
+        assert!(is_blocked_ip("fd00::1".parse().unwrap()));
+        assert!(is_blocked_ip("ff02::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn is_blocked_ip_allows_public_addresses() {
+        use std::net::Ipv4Addr;
+        // A documented public DNS resolver (8.8.8.8) and a generic 203.0.113/24
+        // (TEST-NET-3) address are both non-private.
+        assert!(!is_blocked_ip(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
+        assert!(!is_blocked_ip(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10))));
+        assert!(!is_blocked_ip("2606:4700:4700::1111".parse().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn validate_rejects_http_scheme_by_default() {
+        let err = validate_webhook_url("http://example.com/hook", false)
+            .await
+            .expect_err("http rejected when allow_http=false");
+        assert!(
+            err.contains("https") && err.contains("RTDB_WEBHOOK_ALLOW_HTTP"),
+            "error should name the scheme rule and the dev flag: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_rejects_bare_schemeless_url() {
+        let err = validate_webhook_url("example.com/hook", false)
+            .await
+            .expect_err("schemeless url is invalid");
+        // url::Url treats `example.com/...` as a relative path with no scheme.
+        assert!(
+            err.contains("invalid URL") || err.contains("scheme"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_rejects_embedded_credentials() {
+        let err = validate_webhook_url("https://user:pass@example.com/hook", false)
+            .await
+            .expect_err("embedded credentials are rejected");
+        assert!(err.contains("credentials"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn validate_rejects_ip_literal_in_blocked_range() {
+        // Loopback, private, link-local, and the metadata IP all rejected
+        // regardless of port/path. No DNS round-trip needed.
+        let cases = [
+            "https://127.0.0.1/hook",
+            "https://10.0.0.1:8443/hook",
+            "https://192.168.1.1/hook",
+            "https://169.254.169.254/latest/meta-data/",
+            "https://[::1]/hook",
+            "https://[fe80::1]/hook",
+        ];
+        for url in cases {
+            let err = validate_webhook_url(url, false).await.unwrap_err();
+            assert!(
+                err.contains("blocked") || err.contains("metadata"),
+                "url {url}: expected blocked-range error, got {err}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn validate_rejects_known_metadata_hostnames() {
+        // The textual cloud-metadata hostnames are rejected before any DNS
+        // lookup, so the test is fast and network-independent.
+        for host in ["metadata.google.internal", "169.254.169.254"] {
+            let url = format!("https://{host}/");
+            let err = validate_webhook_url(&url, false).await.unwrap_err();
+            assert!(err.contains("metadata"), "{url}: got {err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn validate_allow_http_opens_dev_hatch_for_loopback() {
+        // With the dev flag on, http + 127.0.0.1 is permitted — this is the
+        // path the integration test's local axum receiver exercises.
+        validate_webhook_url("http://127.0.0.1:9999/hook", true)
+            .await
+            .expect("dev hatch permits local http");
+        // The https requirement is also relaxed.
+        validate_webhook_url("http://example.com/hook", true)
+            .await
+            .expect("dev hatch permits http scheme");
+    }
+
+    #[tokio::test]
+    async fn validate_allow_http_still_requires_a_real_scheme_and_host() {
+        // The dev flag is not a free pass for junk: an empty host or unknown
+        // scheme must still fail.
+        assert!(
+            validate_webhook_url("ftp://example.com/hook", true)
+                .await
+                .is_err()
+        );
+        assert!(validate_webhook_url("http://", true).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn validate_accepts_https_ip_literal_in_public_range() {
+        // A public IP literal with https must pass the literal check (no DNS).
+        validate_webhook_url("https://203.0.113.10/hook", false)
+            .await
+            .expect("public IP literal with https is allowed");
     }
 }

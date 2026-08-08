@@ -1,0 +1,150 @@
+{
+  "$comment": "QA-001: Shared golden-vector parity fixture. The three in-memory client engines (ts-client, rust-client, python-client) and the Postgres-backed server load this fixture and run each query case against the same seeded dataset, comparing canonicalized projected results. Catches sort-comparator / boundary / terminal-cascade divergence across the four implementations. Each case carries an `id` (slug), a `terminal` (which query terminal it exercises), a `query` (the wire-shape query DSL — same shape a client would send over the wire), and `expected` (the canonicalized result: a list of {name,status,order} projections in the expected order, or a scalar). System fields (_id, _creationTime, _owner, _updatedAt) are projected out before comparison so id-minting order differences don't cause spurious divergence.",
+  "schema_table": "items",
+  "schema_fields": {
+    "name": "string",
+    "status": "string",
+    "order": "number",
+    "note": "optional(string)"
+  },
+  "schema_indexes": [
+    { "name": "by_name", "fields": ["name"] },
+    { "name": "by_status", "fields": ["status"] },
+    { "name": "by_status_and_order", "fields": ["status", "order"] }
+  ],
+  "seed": [
+    { "name": "a", "status": "todo", "order": 3 },
+    { "name": "b", "status": "todo", "order": 1 },
+    { "name": "c", "status": "done", "order": 5 },
+    { "name": "d", "status": "todo", "order": 2 },
+    { "name": "e", "status": "done", "order": 4 }
+  ],
+  "cases": [
+    {
+      "id": "collect_all_unordered",
+      "terminal": "collect",
+      "$comment": "Baseline: collect with no filter/order returns every seeded doc. Order is unspecified by the protocol (no sort key) so the test compares as a sorted-by-name set rather than as a sequence.",
+      "query": { "table": "items" },
+      "expected_unordered": true,
+      "expected": [
+        { "name": "a", "status": "todo", "order": 3 },
+        { "name": "b", "status": "todo", "order": 1 },
+        { "name": "c", "status": "done", "order": 5 },
+        { "name": "d", "status": "todo", "order": 2 },
+        { "name": "e", "status": "done", "order": 4 }
+      ]
+    },
+    {
+      "id": "index_eq_prefix",
+      "terminal": "index+eq",
+      "$comment": "Index eq on status='todo' — covers the eq-prefix scan path. No order declared so protocol order is unspecified; compare as a set.",
+      "query": { "table": "items", "index": "by_status", "eq": ["todo"] },
+      "expected_unordered": true,
+      "expected": [
+        { "name": "a", "status": "todo", "order": 3 },
+        { "name": "b", "status": "todo", "order": 1 },
+        { "name": "d", "status": "todo", "order": 2 }
+      ]
+    },
+    {
+      "id": "index_eq_then_order",
+      "terminal": "order",
+      "$comment": "Compound index by_status_and_order with eq on status='todo' and order by the remaining index field (order asc). Exercises index-prefix-eq + tail-order cascade.",
+      "query": {
+        "table": "items",
+        "index": "by_status_and_order",
+        "eq": ["todo"],
+        "order": "asc"
+      },
+      "expected": [
+        { "name": "b", "status": "todo", "order": 1 },
+        { "name": "d", "status": "todo", "order": 2 },
+        { "name": "a", "status": "todo", "order": 3 }
+      ]
+    },
+    {
+      "id": "index_eq_order_desc",
+      "terminal": "order",
+      "$comment": "Same compound index, eq on status='done', order desc — exercises reverse-scan cascade.",
+      "query": {
+        "table": "items",
+        "index": "by_status_and_order",
+        "eq": ["done"],
+        "order": "desc"
+      },
+      "expected": [
+        { "name": "c", "status": "done", "order": 5 },
+        { "name": "e", "status": "done", "order": 4 }
+      ]
+    },
+    {
+      "id": "take_after_order",
+      "terminal": "take",
+      "$comment": "take(2) over by_status_and_order eq status='todo' order asc — covers ordered take / boundary.",
+      "query": {
+        "table": "items",
+        "index": "by_status_and_order",
+        "eq": ["todo"],
+        "order": "asc",
+        "take": 2
+      },
+      "expected": [
+        { "name": "b", "status": "todo", "order": 1 },
+        { "name": "d", "status": "todo", "order": 2 }
+      ]
+    },
+    {
+      "id": "first_after_order",
+      "terminal": "first",
+      "$comment": "first=true over by_status_and_order eq status='done' order asc returns a single doc (the lowest-order done item). Result is a single doc, not a list.",
+      "query": {
+        "table": "items",
+        "index": "by_status_and_order",
+        "eq": ["done"],
+        "order": "asc",
+        "first": true
+      },
+      "expected": { "name": "e", "status": "done", "order": 4 }
+    },
+    {
+      "id": "count_over_eq_prefix",
+      "terminal": "count",
+      "$comment": "count over by_status eq status='todo' — membership-only count, no content.",
+      "query": {
+        "table": "items",
+        "index": "by_status",
+        "eq": ["todo"],
+        "count": true
+      },
+      "expected_scalar": 3
+    },
+    {
+      "id": "unique_over_eq_prefix",
+      "terminal": "unique",
+      "$comment": "unique over by_status_and_order eq status='done' — exactly one match expected (returns the single matching doc). Would PRECONDITION_FAILED if >1 matched.",
+      "query": {
+        "table": "items",
+        "index": "by_status_and_order",
+        "eq": ["done", 4],
+        "unique": true
+      },
+      "expected": { "name": "e", "status": "done", "order": 4 }
+    },
+    {
+      "id": "paginate_num_items_2",
+      "terminal": "paginate",
+      "$comment": "Paginate the full ordered scan (by_status_and_order, no eq, order asc) with numItems=2 — exercises cursor construction + boundary. Sorted by (status asc, order asc): done<todo alphabetically, so first page is the two 'done' items in order-ascending. First page only; the test asserts the first page contents and that a nextCursor is present (more pages remain).",
+      "query": {
+        "table": "items",
+        "index": "by_status_and_order",
+        "order": "asc",
+        "paginate": { "numItems": 2 }
+      },
+      "expected": [
+        { "name": "e", "status": "done", "order": 4 },
+        { "name": "c", "status": "done", "order": 5 }
+      ],
+      "expected_has_next_cursor": true
+    }
+  ]
+}

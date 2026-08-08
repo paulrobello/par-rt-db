@@ -65,10 +65,12 @@ uv sync                    # installs the dev group by default (pytest, ruff, py
 
 ## Quick start
 
-`import par_rt_db` exposes the public DSL surface used below. Examples assume
-you have an HTTP client sending the wire payloads; the DSL produces
+`import par_rt_db` exposes the public DSL surface used below. The DSL produces
 JSON-serializable `pydantic` models you can `model_dump(by_alias=True)` onto the
-wire (the next plan ships the HTTP/WS clients that do this for you).
+wire. For live use, install the sync HTTP/admin/storage surface
+(`pip install par-rt-db[http]`), the async twin (`pip install par-rt-db[aio]`),
+or the reactive WebSocket client (`pip install par-rt-db[ws]`) — see the
+respective sections below.
 
 ### Atomic multi-step transaction
 
@@ -213,7 +215,8 @@ schema = SchemaDef.model_validate(
     }
 )
 # `model_dump(by_alias=True, exclude_none=True)` produces the wire shape to
-# `POST /admin/schema?db=...` (or the TS-style `pushSchema` helper in the next plan).
+# `POST /admin/push-schema` (or use `admin.push_schema(db, schema)` from the
+# admin client — `pip install par-rt-db[http]`).
 
 cursor = encode_cursor(["kanban-board-1", 42, "i4"])  # opaque base64 string
 sort_tuple = decode_cursor(cursor)  # round-trips back to the list

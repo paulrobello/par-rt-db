@@ -22,3 +22,28 @@ repos:
         language: system
         types: [rust]
         pass_filenames: false
+      # ARC-014: biome + ruff ran only in CI; add local hooks scoped to the
+      # files each tool owns. Each hook runs that client's lint + format-check
+      # so a typo'd file is caught at `git commit`, not at `make checkall` or
+      # in CI. `make fmt`/`make lint` already include these, but those targets
+      # run every package on every Rust commit (the cargo-fmt/clippy hooks
+      # above are scoped by `types: [rust]`), so a TS/Python-only commit would
+      # otherwise skip them.
+      - id: biome-ts-client
+        name: biome (ts-client)
+        entry: bash -c 'cd ts-client && bun run lint && bun run fmt-check'
+        language: system
+        files: ^ts-client/.*\.(ts|tsx|js|jsx)$
+        pass_filenames: false
+      - id: biome-dashboard
+        name: biome (dashboard)
+        entry: bash -c 'cd dashboard && bun run lint && bun run fmt-check'
+        language: system
+        files: ^dashboard/.*\.(ts|tsx|js|jsx)$
+        pass_filenames: false
+      - id: ruff-python-client
+        name: ruff (python-client)
+        entry: bash -c 'cd python-client && uv run ruff check . && uv run ruff format --check .'
+        language: system
+        files: ^python-client/.*\.py$
+        pass_filenames: false

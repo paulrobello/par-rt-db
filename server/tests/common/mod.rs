@@ -44,6 +44,8 @@ pub fn test_config() -> Config {
         audit_log_enabled: false,
         oauth_login_csrf: true,
         webhooks_enabled: false,
+        webhook_allow_http: false,
+        storage_rate_limit_per_ip_rpm: 0,
         backup_enabled: false,
         backup_cron: "0 3 * * *".into(),
         backup_dir: "./backups".into(),
@@ -138,6 +140,10 @@ pub async fn test_state_with_audit() -> Arc<AppState> {
 pub async fn test_state_with_webhooks() -> Arc<AppState> {
     let mut config = test_config();
     config.webhooks_enabled = true;
+    // The webhook SSRF dev-escape hatch (SEC-001) is on in tests so the
+    // registration validator lets the e2e test point at a local 127.0.0.1
+    // axum receiver over http. Production keeps the default (false).
+    config.webhook_allow_http = true;
     let pool = sqlx::PgPool::connect(&config.database_url)
         .await
         .expect("connect to test postgres");
@@ -208,6 +214,9 @@ pub async fn test_state_with_ttl_audit_webhooks(secs: u64) -> Arc<AppState> {
     config.ttl_sweep_interval_secs = secs;
     config.audit_log_enabled = true;
     config.webhooks_enabled = true;
+    // Match `test_state_with_webhooks`: SSRF dev-escape hatch on so the test
+    // can register an http webhook pointing at example.com (SEC-001).
+    config.webhook_allow_http = true;
     let pool = sqlx::PgPool::connect(&config.database_url)
         .await
         .expect("connect to test postgres");
@@ -270,7 +279,16 @@ pub async fn spawn_app(state: Arc<AppState>) -> SocketAddr {
         .await
         .expect("bind ephemeral port");
     let addr = listener.local_addr().expect("read local addr");
-    tokio::spawn(axum::serve(listener, build_router(state)).into_future());
+    // `into_make_service_with_connect_info` provides the peer `SocketAddr` to
+    // handlers via the `ConnectInfo<SocketAddr>` extractor — mirrors `main.rs`
+    // and is required by `serve_public_handler` (per-IP storage rate limit).
+    tokio::spawn(
+        axum::serve(
+            listener,
+            build_router(state).into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .into_future(),
+    );
     addr
 }
 

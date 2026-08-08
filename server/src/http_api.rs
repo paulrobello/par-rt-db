@@ -3,7 +3,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use axum::body::Body;
-use axum::extract::{DefaultBodyLimit, FromRequest, Path, Query as AxumQuery, Request, State};
+use axum::extract::{
+    ConnectInfo, DefaultBodyLimit, FromRequest, Path, Query as AxumQuery, Request, State,
+};
 use axum::http::{HeaderMap, header};
 use axum::response::Response;
 use axum::routing::{get, post};
@@ -17,7 +19,7 @@ use crate::error::RtDbError;
 use crate::image_transform::{Resolved, TransformParams};
 use crate::protocol::{ScheduleInfo, ScheduleWhen};
 use crate::query::{Query, QueryResult, execute_query};
-use crate::rate_limit::check_http_rate_limits;
+use crate::rate_limit::{check_http_rate_limits, check_storage_public_rate_limit};
 use crate::scheduler;
 use crate::storage;
 use crate::txn::Transaction;
@@ -473,16 +475,44 @@ async fn upload_handler(
 
 /// Public, unauthenticated serve: anyone with the URL fetches the bytes. The
 /// opaque id resolves to its owning db via the global index. Query params, if
-/// present, request an on-the-fly image transform (ENH-014).
+/// present, request an on-the-fly image transform (ENH-014). Rate-limited per
+/// client IP (SEC-004) when `RTDB_STORAGE_RATE_LIMIT_PER_IP_RPM > 0`; off by
+/// default.
 async fn serve_public_handler(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Path(id): Path<String>,
     AxumQuery(q): AxumQuery<HashMap<String, String>>,
 ) -> Result<Response, RtDbError> {
+    check_storage_public_rate_limit(&state, &client_ip_key(&headers, addr.ip())).await?;
     let db = storage::resolve_db(&state.pool, &id)
         .await?
         .ok_or_else(|| RtDbError::not_found("unknown file"))?;
     serve_bytes(&state, &db, &id, &q).await
+}
+
+/// Canonical per-IP rate-limit key for an unauthenticated request. The deploy
+/// runs behind a trusted Cloudflare tunnel which sets `X-Forwarded-For`, so the
+/// leftmost address is the real client; fall back to the connection's peer IP
+/// for direct calls, and to a shared `"unknown"` sentinel when neither is
+/// available (the XFF header is absent or unparseable). The `"unknown"` bucket
+/// rate-limits more aggressively under a missing-XFF flood, which is the safe
+/// failure mode for an unauthenticated cost-amplifying route (SEC-004).
+fn client_ip_key(headers: &HeaderMap, peer: std::net::IpAddr) -> String {
+    if let Some(xff) = headers
+        .get(header::FORWARDED)
+        .or_else(|| headers.get("x-forwarded-for"))
+        .and_then(|v| v.to_str().ok())
+    {
+        // X-Forwarded-For: client, proxy1, proxy2 — leftmost is the origin.
+        if let Some(first) = xff.split(',').map(str::trim).next()
+            && !first.is_empty()
+        {
+            return first.to_string();
+        }
+    }
+    peer.to_string()
 }
 
 /// Authed serve: the caller's principal must be authorized for `{db}`; the id

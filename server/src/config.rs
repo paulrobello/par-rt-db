@@ -83,6 +83,20 @@ pub struct Config {
     // external work in this no-embedded-JS architecture.
     // RTDB_WEBHOOKS_ENABLED (accepts "true"/"1"/"yes", case-insensitive).
     pub webhooks_enabled: bool,
+    // Webhook SSRF dev-escape hatch (SEC-001). When true, the registration
+    // validator permits `http://` URLs AND skips the private/loopback IP-range
+    // denylist so a developer can point a webhook at a local receiver
+    // (`http://127.0.0.1:...`). Default false: production enforces HTTPS and
+    // rejects any URL whose host resolves to a private, loopback, link-local,
+    // multicast, or cloud-metadata address. RTDB_WEBHOOK_ALLOW_HTTP.
+    pub webhook_allow_http: bool,
+    // Per-IP rate limit on the unauthenticated `GET /storage/{id}` route
+    // (SEC-004). 0 = unlimited (the default). The opaque blob id is not
+    // enumerable, but a holder of one valid id can otherwise hammer the route
+    // without bound — the on-the-fly image-transform path amplifies cost
+    // (each distinct `?w=&h=&...` set misses the cache and burns decode CPU).
+    // RTDB_STORAGE_RATE_LIMIT_PER_IP_RPM.
+    pub storage_rate_limit_per_ip_rpm: u32,
     // Managed pg_dump backup scheduler. Off by default — when true, a
     // background task runs `pg_dump` on `backup_cron` (5-field UTC cron, same
     // format `scheduler::next_fire` already handles) into `backup_dir`,
@@ -262,6 +276,23 @@ impl Config {
             Err(_) => false,
         };
 
+        // Webhook SSRF dev-escape hatch (SEC-001): opt-in to `http://` URLs and
+        // private/loopback targets, off by default. Same truthy parse.
+        let webhook_allow_http = match std::env::var("RTDB_WEBHOOK_ALLOW_HTTP") {
+            Ok(v) => matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes"),
+            Err(_) => false,
+        };
+
+        // Per-IP rate limit on the public storage route (SEC-004). 0 = off,
+        // matching the existing per-token/per-db limiter convention. Unparseable
+        // values fall back to 0 (off) rather than surprising a production
+        // deploy with an unintended limit.
+        let storage_rate_limit_per_ip_rpm =
+            match std::env::var("RTDB_STORAGE_RATE_LIMIT_PER_IP_RPM") {
+                Ok(v) => v.parse::<u32>().unwrap_or(0),
+                Err(_) => 0,
+            };
+
         // Managed pg_dump backup scheduler. Default off; cron/dir/retention
         // carry their own defaults so an operator can flip just
         // RTDB_BACKUP_ENABLED=true to get daily 03:00 UTC dumps with 7-day
@@ -423,6 +454,8 @@ impl Config {
             audit_log_enabled,
             oauth_login_csrf,
             webhooks_enabled,
+            webhook_allow_http,
+            storage_rate_limit_per_ip_rpm,
             backup_enabled,
             backup_cron,
             backup_dir,

@@ -5,7 +5,9 @@ use crate::ddl::{
     backfill_expr, indexed_fields, pg_col, pg_schema, pg_search_col, pg_table, pg_vector_col,
 };
 use crate::error::RtDbError;
-use crate::schema::{FieldType, SchemaDef, TableDef, indexed_column_type};
+use crate::schema::{
+    FieldType, MAX_FIELD_NAME_LEN, SchemaDef, TableDef, indexed_column_type, is_valid_identifier,
+};
 use crate::txn::{DocOp, OpKind};
 use std::collections::BTreeSet;
 
@@ -442,6 +444,14 @@ async fn apply_one(
 ) -> Result<DirectiveReport, RtDbError> {
     match d {
         Directive::RenameField { table, from, to } => {
+            // SEC-008 defense-in-depth: `from` and `to` are interpolated into
+            // SQL string literals below (`doc ? '{from}'`). The upstream
+            // push_schema path rejects malformed identifiers, so a directive
+            // reaching here with a quote-bearing field name is a regression —
+            // assert it in debug builds rather than silently emitting broken
+            // SQL. Production builds trust the upstream validation.
+            debug_assert!(is_valid_identifier(from, MAX_FIELD_NAME_LEN));
+            debug_assert!(is_valid_identifier(to, MAX_FIELD_NAME_LEN));
             let t = pg_table(table);
             // Rename the typed column only if the source field is indexed
             // (checked on the pre-migration table — the column still bears the
@@ -486,6 +496,9 @@ async fn apply_one(
             })
         }
         Directive::DropField { table, field } => {
+            // SEC-008 defense-in-depth: see RenameField. `field` is interpolated
+            // unbound into `doc ? '{field}'` and `doc - '{field}'` literals.
+            debug_assert!(is_valid_identifier(field, MAX_FIELD_NAME_LEN));
             let t = pg_table(table);
             // Reject dropping a field still referenced by an index — dropping
             // its typed column would desync the physical index from the derived
@@ -621,6 +634,9 @@ async fn apply_one(
             field,
             value,
         } => {
+            // SEC-008 defense-in-depth: see RenameField. `field` is interpolated
+            // unbound into `NOT doc ? '{field}'` and a jsonb_set path literal.
+            debug_assert!(is_valid_identifier(field, MAX_FIELD_NAME_LEN));
             let t = pg_table(table);
             let value_json =
                 serde_json::to_string(value).map_err(|e| RtDbError::internal(e.to_string()))?;
@@ -667,6 +683,10 @@ async fn apply_one(
             cast,
             default,
         } => {
+            // SEC-008 defense-in-depth: see RenameField. `field` is interpolated
+            // unbound into `doc ? '{field}'`, `doc->'{field}'`, and a
+            // jsonb_set path literal.
+            debug_assert!(is_valid_identifier(field, MAX_FIELD_NAME_LEN));
             let t = pg_table(table);
             let (pg_type, _nullable) = indexed_column_type(to).map_err(|_| {
                 RtDbError::bad_request(format!(

@@ -128,7 +128,7 @@ impl OAuthProvider for AppleProvider {
                 RtDbError::internal("apple token exchange failed")
             })?;
 
-        let identity = parse_identity(decode_id_token_claims(id_token)?)?;
+        let identity = parse_identity(decode_id_token_claims(id_token, &self.client_id)?)?;
         let email = identity.email.to_lowercase();
         let login = email.clone();
 
@@ -208,13 +208,22 @@ fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
-/// Decodes (without verifying) the payload claims of Apple's id_token. The token
-/// was received over TLS directly from Apple's token endpoint using our
-/// confidential client_secret_jwt, so it is authentic by transport — the same
-/// trust model the google/oidc providers apply to their userinfo fetch (they
-/// don't verify a signature either). Signature verification would require
-/// fetching Apple's rotating JWKS, out of scope for v1.
-fn decode_id_token_claims(id_token: &str) -> Result<serde_json::Value, RtDbError> {
+/// Decodes the payload claims of Apple's id_token and validates the OIDC claims
+/// (`iss`, `aud`, `exp`) that defend against a token minted for a different
+/// client or used after its short lifetime. The token was received over TLS
+/// directly from Apple's token endpoint using our confidential `client_secret`
+/// JWT, so it is authentic by transport — the same trust model the google/oidc
+/// providers apply to their userinfo fetch (they don't verify a signature
+/// either). **Signature verification** (fetching Apple's rotating JWKS and
+/// validating the ES256 signature against the token's `kid`) is therefore a
+/// defense-in-depth hardening, not a missing control, and is out of scope for
+/// v1 — see SEC-002. The claim checks below are the partial fix: a stolen code
+/// replay against the wrong client_id, or a token past its 10-minute `exp`,
+/// is rejected before any account upsert.
+fn decode_id_token_claims(
+    id_token: &str,
+    expected_client_id: &str,
+) -> Result<serde_json::Value, RtDbError> {
     let payload = id_token.split('.').nth(1).ok_or_else(|| {
         tracing::warn!("apple id_token malformed (no payload segment)");
         RtDbError::internal("apple token exchange failed")
@@ -227,10 +236,48 @@ fn decode_id_token_claims(id_token: &str) -> Result<serde_json::Value, RtDbError
             tracing::warn!(error = %err, "apple id_token payload decode failed");
             RtDbError::internal("apple token exchange failed")
         })?;
-    serde_json::from_slice(&bytes).map_err(|err| {
+    let claims: serde_json::Value = serde_json::from_slice(&bytes).map_err(|err| {
         tracing::warn!(error = %err, "apple id_token json decode failed");
         RtDbError::internal("apple token exchange failed")
-    })
+    })?;
+
+    // iss MUST be Apple's sole issuer — a token from any other issuer is not an
+    // Apple id_token regardless of how it reached us.
+    let iss = claims.get("iss").and_then(|v| v.as_str()).unwrap_or("");
+    if iss != AppleProvider::AUDIENCE {
+        tracing::warn!(iss, "apple id_token has unexpected issuer");
+        return Err(RtDbError::forbidden("apple id_token rejected"));
+    }
+    // aud MUST equal our client_id — a token minted for a different app cannot
+    // be redeemed for our user's identity, even if a stolen code reaches our
+    // token endpoint. Apple also sends `aud` as an array in some flows, so
+    // accept both shapes.
+    let aud_matches = match claims.get("aud") {
+        Some(serde_json::Value::String(s)) => s == expected_client_id,
+        Some(serde_json::Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|v| v.as_str())
+            .any(|s| s == expected_client_id),
+        _ => false,
+    };
+    if !aud_matches {
+        tracing::warn!("apple id_token audience does not match client_id");
+        return Err(RtDbError::forbidden("apple id_token rejected"));
+    }
+    // exp MUST be in the future (strict — Apple tokens carry a 10-minute
+    // lifetime; a small clock skew would still be inside the window). Reject
+    // any expired or malformed-exp token rather than trusting its claims.
+    let exp = claims.get("exp").and_then(|v| v.as_i64());
+    let now = now_secs();
+    match exp {
+        Some(exp) if exp > now => {}
+        _ => {
+            tracing::warn!(exp, now, "apple id_token missing or expired exp");
+            return Err(RtDbError::forbidden("apple id_token rejected"));
+        }
+    }
+
+    Ok(claims)
 }
 
 /// `email_verified` arrives as a JSON boolean or the string `"true"` (Apple
@@ -420,15 +467,78 @@ mod tests {
     fn decode_id_token_extracts_sub_and_email() {
         let token = fake_id_token(&json!({
             "iss": "https://appleid.apple.com",
+            "aud": "com.example.svc",
+            "exp": now_secs() + 600,
             "sub": "000123.abc",
             "email": "Alice@Example.com",
             "email_verified": "true",
             "is_private_email": "false"
         }));
-        let claims = decode_id_token_claims(&token).unwrap();
+        let claims = decode_id_token_claims(&token, "com.example.svc").unwrap();
         let id = parse_identity(claims).unwrap();
         assert_eq!(id.sub, "000123.abc");
         assert_eq!(id.email, "Alice@Example.com");
+    }
+
+    /// SEC-002: a token whose `aud` does not match our `client_id` is rejected,
+    /// even though the transport is trusted — defense against a stolen code
+    /// redeemed against the wrong app being used to log in here.
+    #[test]
+    fn decode_id_token_rejects_wrong_audience() {
+        let token = fake_id_token(&json!({
+            "iss": "https://appleid.apple.com",
+            "aud": "com.someone.else",
+            "exp": now_secs() + 600,
+            "sub": "s",
+            "email": "x@y.com",
+            "email_verified": "true"
+        }));
+        let err = decode_id_token_claims(&token, "com.example.svc").unwrap_err();
+        assert!(err.message.contains("rejected") || err.message.contains("forbidden"));
+    }
+
+    /// SEC-002: an id_token past its `exp` is rejected.
+    #[test]
+    fn decode_id_token_rejects_expired_exp() {
+        let token = fake_id_token(&json!({
+            "iss": "https://appleid.apple.com",
+            "aud": "com.example.svc",
+            "exp": now_secs() - 1,
+            "sub": "s",
+            "email": "x@y.com",
+            "email_verified": "true"
+        }));
+        assert!(decode_id_token_claims(&token, "com.example.svc").is_err());
+    }
+
+    /// SEC-002: an id_token from an unexpected issuer is rejected.
+    #[test]
+    fn decode_id_token_rejects_wrong_issuer() {
+        let token = fake_id_token(&json!({
+            "iss": "https://evil.example.com",
+            "aud": "com.example.svc",
+            "exp": now_secs() + 600,
+            "sub": "s",
+            "email": "x@y.com",
+            "email_verified": "true"
+        }));
+        assert!(decode_id_token_claims(&token, "com.example.svc").is_err());
+    }
+
+    /// SEC-002: Apple occasionally sends `aud` as an array — accept it as long
+    /// as our `client_id` is one of the entries.
+    #[test]
+    fn decode_id_token_accepts_array_audience_containing_client_id() {
+        let token = fake_id_token(&json!({
+            "iss": "https://appleid.apple.com",
+            "aud": ["com.example.svc", "com.example.svc.alt"],
+            "exp": now_secs() + 600,
+            "sub": "s",
+            "email": "x@y.com",
+            "email_verified": "true"
+        }));
+        let claims = decode_id_token_claims(&token, "com.example.svc").unwrap();
+        assert_eq!(claims["sub"], "s");
     }
 
     #[test]
@@ -538,6 +648,8 @@ mod tests {
             audit_log_enabled: false,
             oauth_login_csrf: true,
             webhooks_enabled: false,
+            webhook_allow_http: false,
+            storage_rate_limit_per_ip_rpm: 0,
             backup_enabled: false,
             backup_cron: "0 3 * * *".into(),
             backup_dir: "./backups".into(),

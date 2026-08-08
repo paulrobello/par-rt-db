@@ -10,7 +10,7 @@
 //! `revoke-token`) send the instance admin key as the bearer. Data-plane
 //! subcommands (`query`, `mutate`) send a machine token scoped to `--db`.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
 use par_rt_db_client::{
     MigrateRequestOwned, Query, RtDbError, RtDbHttpClient, SchemaDef, Transaction,
@@ -431,18 +431,26 @@ mod tests {
         // clap only consults these env vars when the matching flag is absent
         // from argv; every other test passes flags explicitly, so setting them
         // here cannot flake the rest of the suite.
-        std::env::set_var("RTDB_URL", "http://env");
-        std::env::set_var("RTDB_ADMIN_KEY", "env-admin");
-        std::env::set_var("RTDB_DB", "envdb");
-        std::env::set_var("RTDB_TOKEN", "env-tok");
+        // SAFETY: tests run single-threaded by default and no other test in
+        // this module reads these vars; we remove them at the end so the
+        // environment is clean for any future concurrent test executor.
+        unsafe {
+            std::env::set_var("RTDB_URL", "http://env");
+            std::env::set_var("RTDB_ADMIN_KEY", "env-admin");
+            std::env::set_var("RTDB_DB", "envdb");
+            std::env::set_var("RTDB_TOKEN", "env-tok");
+        }
         let cli = Cli::try_parse_from(["rtdb", "list-dbs"]).unwrap();
         assert_eq!(cli.url, "http://env");
         assert_eq!(cli.admin_key.as_deref(), Some("env-admin"));
         assert_eq!(cli.db.as_deref(), Some("envdb"));
         assert_eq!(cli.token.as_deref(), Some("env-tok"));
-        std::env::remove_var("RTDB_URL");
-        std::env::remove_var("RTDB_ADMIN_KEY");
-        std::env::remove_var("RTDB_DB");
-        std::env::remove_var("RTDB_TOKEN");
+        // SAFETY: same single-threaded test, cleanup only.
+        unsafe {
+            std::env::remove_var("RTDB_URL");
+            std::env::remove_var("RTDB_ADMIN_KEY");
+            std::env::remove_var("RTDB_DB");
+            std::env::remove_var("RTDB_TOKEN");
+        }
     }
 }

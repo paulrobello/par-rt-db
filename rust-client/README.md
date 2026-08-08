@@ -153,10 +153,11 @@ server's `SCREAMING_SNAKE_CASE` codes (`UNAUTHORIZED`, `PRECONDITION_FAILED`,
 
 ## Wire contract
 
-`src/wire.rs` is the **third** implementation of par-rt-db's protocol contract
-(alongside `server/src/protocol.rs` and `ts-client/src/protocol.ts`). They must
-stay byte-identical (same serde tags and field names); changing the wire format
-on any side is a breaking change unless mirrored on all three. See
+`src/wire.rs` is one of **four** implementations of par-rt-db's protocol
+contract (alongside `server/src/protocol.rs`, `ts-client/src/protocol.ts`, and
+`python-client/src/par_rt_db/wire.py`). They must stay byte-identical (same
+serde tags and field names); changing the wire format on any side is a
+breaking change unless mirrored on all four. See
 [`../CLAUDE.md`](../CLAUDE.md) and the design spec
 [`../docs/superpowers/specs/2026-07-22-rust-client-design.md`](../docs/superpowers/specs/2026-07-22-rust-client-design.md).
 

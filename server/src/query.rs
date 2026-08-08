@@ -1655,6 +1655,21 @@ pub(crate) fn compile_filter_literal(
     render_filter_literal_node(filter, table)
 }
 
+/// Shared body of the six comparison arms in `render_filter_literal_node`:
+/// emits `lhs <op> <literal>`. Splitting the arms per variant (rather than an
+/// `Eq | Neq | …` OR-pattern with an inner re-match) makes adding a new
+/// comparison variant a compile error in the outer match instead of a runtime
+/// `unreachable!()` (QA-006).
+fn render_comparison_literal(
+    op: &str,
+    field: &str,
+    value: &serde_json::Value,
+    table: &TableDef,
+) -> Result<String, RtDbError> {
+    let (lhs, bind) = field_lhs_and_bind(field, value, table)?;
+    Ok(format!("{lhs} {op} {}", render_literal(&bind)))
+}
+
 fn render_filter_literal_node(node: &FilterExpr, table: &TableDef) -> Result<String, RtDbError> {
     match node {
         FilterExpr::And { exprs } | FilterExpr::Or { exprs } => {
@@ -1679,24 +1694,12 @@ fn render_filter_literal_node(node: &FilterExpr, table: &TableDef) -> Result<Str
                 .collect::<Result<_, _>>()?;
             Ok(format!("({})", parts.join(joiner)))
         }
-        FilterExpr::Eq { field, value }
-        | FilterExpr::Neq { field, value }
-        | FilterExpr::Gt { field, value }
-        | FilterExpr::Gte { field, value }
-        | FilterExpr::Lt { field, value }
-        | FilterExpr::Lte { field, value } => {
-            let op = match node {
-                FilterExpr::Eq { .. } => "=",
-                FilterExpr::Neq { .. } => "<>",
-                FilterExpr::Gt { .. } => ">",
-                FilterExpr::Gte { .. } => ">=",
-                FilterExpr::Lt { .. } => "<",
-                FilterExpr::Lte { .. } => "<=",
-                _ => unreachable!(),
-            };
-            let (lhs, bind) = field_lhs_and_bind(field, value, table)?;
-            Ok(format!("{lhs} {op} {}", render_literal(&bind)))
-        }
+        FilterExpr::Eq { field, value } => render_comparison_literal("=", field, value, table),
+        FilterExpr::Neq { field, value } => render_comparison_literal("<>", field, value, table),
+        FilterExpr::Gt { field, value } => render_comparison_literal(">", field, value, table),
+        FilterExpr::Gte { field, value } => render_comparison_literal(">=", field, value, table),
+        FilterExpr::Lt { field, value } => render_comparison_literal("<", field, value, table),
+        FilterExpr::Lte { field, value } => render_comparison_literal("<=", field, value, table),
         FilterExpr::In { field, values } => {
             if values.is_empty() {
                 return Err(RtDbError::bad_request(
@@ -2704,6 +2707,39 @@ mod tests {
         };
         let sql = compile_filter_literal(&pred, &table).unwrap();
         assert_eq!(sql, "\"f_name\" = 'O''Brien'");
+    }
+
+    /// SEC-006 regression: a string literal carrying a classic SQL-injection
+    /// payload MUST be rendered inert by the single-quote doubling in
+    /// `render_literal` / `compile_filter_literal`. The emitted SQL stays a
+    /// single string literal — the payload's embedded `'` is doubled to `''`,
+    /// so the trailing `; DROP TABLE x; --` cannot terminate the literal and
+    /// become a statement of its own. This is a defense-in-depth check: the
+    /// value would also be bound via `$n` on the doc-eval path; this asserts
+    /// the literal path (used by indexed-column filter compilation) is safe.
+    #[test]
+    fn compile_filter_literal_neutralizes_sql_injection_payload() {
+        let table = one_indexed_field_table("name", FieldType::String);
+        let pred = FilterExpr::Eq {
+            field: "name".into(),
+            value: serde_json::json!("'; DROP TABLE x; --"),
+        };
+        let sql = compile_filter_literal(&pred, &table).unwrap();
+        // The payload's lone single quote is doubled; no statement terminator
+        // appears outside the string literal, so the DROP cannot execute.
+        assert_eq!(sql, "\"f_name\" = '''; DROP TABLE x; --'");
+        // Belt-and-suspenders: the rendered fragment contains no unescaped
+        // statement terminator — every `;` is inside the literal.
+        let outside_literal: String = sql
+            .split('\'')
+            .enumerate()
+            .filter(|(i, _)| *i % 2 == 0)
+            .map(|(_, s)| s)
+            .collect();
+        assert!(
+            !outside_literal.contains(';'),
+            "statement terminator leaked outside string literal: {outside_literal}"
+        );
     }
 
     #[test]

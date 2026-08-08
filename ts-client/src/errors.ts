@@ -1,3 +1,27 @@
+/**
+ * Error envelope for `@par-rt-db/client`. Every failure — over WebSocket,
+ * HTTP, or the in-memory test harness — surfaces as an {@link RtDbError}
+ * carrying a stable {@link RtDbErrorCode} from the closed set below, plus a
+ * human-readable message. The server's wire envelope is
+ * `{ code, message, retryAfter? }`; {@link RtDbError.fromEnvelope} materializes
+ * it into the thrown class. Codes map 1:1 to the server's `error.rs` table:
+ *
+ * - `UNAUTHORIZED` (401) — missing or invalid bearer/session token.
+ * - `FORBIDDEN` (403) — authenticated but not allowed (per-row `ownerField`,
+ *   `collaboratorsField`, or `authorize` predicate denied the write/read).
+ * - `NOT_FOUND` (404) — `get(id)` miss or unknown route.
+ * - `SCHEMA_VIOLATION` (400) — push-schema rejected (destructive change,
+ *   type mismatch, quota over-cap on tables).
+ * - `PRECONDITION_FAILED` (412) — `expectVersion`/`expectAbsent` step failed.
+ * - `CONFLICT` (409) — `unique` (or partial-`where` unique) index violation.
+ * - `BAD_REQUEST` (400) — malformed DSL, bad cast, bad cursor.
+ * - `INTERNAL` (500) — server-side failure (generic message; details in logs).
+ * - `RATE_LIMITED` (429) — per-token or per-db rate limit hit; carries
+ *   `retryAfter` (seconds).
+ * - `QUOTA_EXCEEDED` (507) — ENH-011 per-database resource quota hit
+ *   (tables / storage bytes / subs); carries `retryAfter` when applicable.
+ */
+
 export type RtDbErrorCode =
   | "UNAUTHORIZED"
   | "FORBIDDEN"

@@ -45,3 +45,17 @@ include = ["src", "tests"]
 venvPath = "."
 venv = ".venv"
 reportMissingImports = "error"
+# QA-003: incrementally stricter. Rules added are all clean on current code.
+# Intentionally NOT enabled (would error on the ~70 deliberate `Any` usages in
+# in_memory.py that mirror serde_json::Value wire shapes — see QA-004 for the
+# same rationale in ts-client):
+#   reportUnknownVariableType, reportUnknownArgumentType,
+#   reportUnknownMemberType, reportUnknownParameterType, reportAny
+# Also deferred (would fire on intentional defensive overapproximation in
+# in_memory.py): reportUnreachable.
+# Also deferred (would surface ~10 stale `# type: ignore` comments that pre-date
+# the current type accuracy — a separate cleanup): reportUnnecessaryTypeIgnoreComment.
+reportMissingTypeStubs = "warning"
+reportDuplicateImport = "warning"
+reportDeprecated = "warning"
+reportUnusedImport = "warning"

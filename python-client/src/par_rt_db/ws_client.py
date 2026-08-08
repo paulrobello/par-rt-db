@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import random as _random
 import time
 from collections.abc import Awaitable, Callable
@@ -41,6 +42,8 @@ from .wire import (
     _ClientResumeSchedule,
     _ClientSchedule,
 )
+
+_logger = logging.getLogger(__name__)
 
 
 def _sync_url(url: str) -> str:
@@ -276,6 +279,12 @@ class RtDbClient:
         try:
             ws = await self._connect(self._url)
         except Exception:
+            # Broad catch is intentional: any failure to establish the socket
+            # (DNS, TCP, TLS, timeout, handshake) is a reconnect signal, not a
+            # crash. Log at info (not error) because reconnects are expected
+            # under transient network conditions; logger.exception preserves the
+            # traceback for debugging (QA-005).
+            _logger.exception("ws connect failed; scheduling reconnect (gen=%s)", gen)
             await self._schedule_reconnect(gen)
             return
         if gen != self._generation or self._closed:
@@ -300,6 +309,11 @@ class RtDbClient:
         except _PeerClosed as e:
             await self._on_peer_closed(e.code, gen)
         except Exception:
+            # Broad catch is intentional: a transient decode error, network
+            # hiccup, or unexpected server frame should trigger reconnect
+            # rather than tear down the client. logger.exception surfaces the
+            # traceback so a real defect isn't silently swallowed (QA-005).
+            _logger.exception("ws session error; scheduling reconnect (gen=%s)", gen)
             await self._schedule_reconnect(gen)
 
     async def _await_auth(self, ws: Connection, gen: int) -> str:
@@ -953,10 +967,17 @@ def _reproject(sub: _Sub, overlaid: Any) -> Any:
     (so a caller mutating ``sub.current()`` cannot corrupt the projection base).
     The try/except falls back to the raw value if a custom model rejects the
     overlaid doc (shouldn't happen, since the overlay derives from the same base
-    the server validated)."""
+    the server validated). The broad catch is documented here and logged at
+    exception level so a real pydantic-schema mismatch surfaces in logs rather
+    than degrading silently to the raw value (QA-005)."""
     try:
         return parse_result(sub.model, sub.terminal, overlaid)
     except Exception:
+        _logger.exception(
+            "ws _reproject fallback: parse_result rejected an overlaid doc "
+            "(terminal=%s); returning raw value",
+            sub.terminal,
+        )
         return overlaid
 
 

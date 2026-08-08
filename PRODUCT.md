@@ -24,8 +24,8 @@ A self-hosted realtime document DB the operator fully controls — Convex's deve
 
 ## Operating Context
 
-- Deployed live at `rtdb.pardev.net` (host lenny2, docker compose behind a Cloudflare tunnel); the dashboard is a same-origin SPA served by the server itself from `RTDB_STATIC_DIR`, so new build artifacts update with no recompile or restart.
-- The operator authenticates either with the admin key (machine) or as an OAuth'd admin (GitHub/Google, allowlisted as admin).
+- Deployed live at `rtdb.pardev.net` (host lenny2, docker compose behind a Cloudflare tunnel); the dashboard is a same-origin SPA served by the server itself from `RTDB_STATIC_DIR`. In the docker deploy the SPA is **baked into the image** (the `dashboard` build stage in `Dockerfile` copies `dist/` to `/app/dashboard-dist`), so a frontend change ships via `docker compose up -d --build` (image rebuild + server container recreate), not a live-mounted volume.
+- The operator authenticates either with the admin key (machine) or as an OAuth'd admin (GitHub, Google, GitLab, Microsoft, Apple, or a configured OIDC provider — allowlisted as admin).
 - Every database is isolated and named; the operator juggles several (e.g. the projects board, app datastores). Documents are JSON; indexed fields become typed Postgres columns, the rest lives in a `doc` jsonb column merged in at read time.
 - Realtime is central: subscriptions re-run on every write, and the op feed surfaces durable mutations as they happen. The dashboard must feel live, not request/response.
 - Operational reality the console reflects and respects: one Postgres, one writer (the committer), hot config that applies without restart, optional per-row ownership auth on some tables.
@@ -40,7 +40,7 @@ Confirmed backend surfaces the dashboard consumes (all shipped, HTTP/WS):
 - **Schema viewer** — the compiled schema for each database/table (typed indexed fields, `ownerField`, table stats).
 - **Metrics** — `GET /admin/metrics`, instance-wide counters and gauges.
 - **Live op feed** — `GET /admin/ops/recent` (recent) and `WS /admin/stream` (streaming) durable document mutations as they happen.
-- **Hot config** — `GET/PATCH /admin/config` for runtime-mutable `allowed_origins`, `session_ttl_days`, `max_file_size` (secrets structurally redacted); admin allowlist management.
+- **Hot config** — `GET/PATCH /admin/config` for runtime-mutable `allowed_origins`, `session_ttl_days`, `max_file_size`, `idempotency_ttl_ms`, and the three per-database quota caps `max_tables_per_db` / `max_storage_bytes_per_db` / `max_subs_per_db` (`0` = unlimited; ENH-011) — secrets structurally redacted; admin allowlist management.
 - **Realtime over WS** — the SPA may subscribe like any client (`/sync`) to watch data move.
 
 Constraints:

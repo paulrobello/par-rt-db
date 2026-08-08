@@ -45,7 +45,13 @@ impl UsageCache {
     /// Cached bytes if an entry exists and is younger than `ttl_secs`, else None.
     pub fn fresh(&self, db: &str, ttl_secs: u64) -> Option<u64> {
         let now = now_ms();
-        let map = self.inner.read().unwrap();
+        // unwrap_or_else(into_inner) over .unwrap(): the only way this lock can
+        // be poisoned is if a panic occurred inside the (tiny, panic-free)
+        // critical section in store/evict. Recovering the inner value preserves
+        // the cache across a panic elsewhere in the program instead of
+        // propagating a second panic on the next read (QA-007). The data is
+        // plain HashMap entries — never an inconsistent half-update.
+        let map = self.inner.read().unwrap_or_else(|e| e.into_inner());
         let u = map.get(db)?;
         if (now - u.computed_at_ms) < (ttl_secs as i64) {
             Some(u.bytes)
@@ -74,7 +80,8 @@ impl UsageCache {
     }
 
     pub fn store(&self, db: &str, bytes: u64) {
-        let mut map = self.inner.write().unwrap();
+        // See `fresh` for the unwrap_or_else(into_inner) rationale (QA-007).
+        let mut map = self.inner.write().unwrap_or_else(|e| e.into_inner());
         map.insert(
             db.to_string(),
             StorageUsage {
@@ -85,7 +92,8 @@ impl UsageCache {
     }
 
     pub fn evict(&self, db: &str) {
-        let mut map = self.inner.write().unwrap();
+        // See `fresh` for the unwrap_or_else(into_inner) rationale (QA-007).
+        let mut map = self.inner.write().unwrap_or_else(|e| e.into_inner());
         map.remove(db);
     }
 

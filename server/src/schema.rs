@@ -505,6 +505,23 @@ fn literal_set(ty: &FieldType) -> Option<Vec<&serde_json::Value>> {
 
 impl TableDef {
     fn validate_structure(&self, table_name: &str) -> Result<(), RtDbError> {
+        // QA-002: extracted the six independent cascade stages into named
+        // helpers so this reads as a routing table. Order matters — early
+        // failures short-circuit later checks exactly as before.
+        self.validate_field_names(table_name)?;
+        self.validate_owner_field()?;
+        self.validate_collaborators_field()?;
+        if let Some(authorize) = &self.authorize {
+            // Principal markers are valid here (rejected in client filters by
+            // Task 6 at the query boundary via the same walker with `false`).
+            validate_filter_expr_fields(authorize, self, true)?;
+        }
+        self.validate_indexes(table_name)?;
+        self.validate_ttl()?;
+        Ok(())
+    }
+
+    fn validate_field_names(&self, table_name: &str) -> Result<(), RtDbError> {
         let mut lower_field_names = HashSet::new();
         for (field_name, field_type) in &self.fields {
             if !is_valid_identifier(field_name, MAX_FIELD_NAME_LEN) {
@@ -519,7 +536,10 @@ impl TableDef {
             }
             validate_field_type(field_type)?;
         }
+        Ok(())
+    }
 
+    fn validate_owner_field(&self) -> Result<(), RtDbError> {
         if let Some(owner) = &self.owner_field {
             if !is_valid_identifier(owner, MAX_FIELD_NAME_LEN) {
                 return Err(RtDbError::schema(format!(
@@ -540,7 +560,10 @@ impl TableDef {
                 )));
             }
         }
+        Ok(())
+    }
 
+    fn validate_collaborators_field(&self) -> Result<(), RtDbError> {
         if let Some(collab) = &self.collaborators_field {
             if !is_valid_identifier(collab, MAX_FIELD_NAME_LEN) {
                 return Err(RtDbError::schema(format!(
@@ -562,13 +585,10 @@ impl TableDef {
                 )));
             }
         }
+        Ok(())
+    }
 
-        if let Some(authorize) = &self.authorize {
-            // Principal markers are valid here (rejected in client filters by
-            // Task 6 at the query boundary via the same walker with `false`).
-            validate_filter_expr_fields(authorize, self, true)?;
-        }
-
+    fn validate_indexes(&self, table_name: &str) -> Result<(), RtDbError> {
         let mut index_names = HashSet::new();
         for index in &self.indexes {
             if !is_valid_identifier(&index.name, MAX_INDEX_NAME_LEN) {
@@ -702,7 +722,10 @@ impl TableDef {
                 }
             }
         }
+        Ok(())
+    }
 
+    fn validate_ttl(&self) -> Result<(), RtDbError> {
         if let Some(ttl) = &self.ttl {
             if !is_valid_identifier(&ttl.field, MAX_FIELD_NAME_LEN) {
                 return Err(RtDbError::schema(format!(

@@ -15,12 +15,14 @@ with Postgres 17 storage. Authoritative design:
 | **Server** | [`server/`](server) | Rust (axum/tokio + Postgres 17) | The realtime database binary |
 | **TypeScript client** | [`ts-client/`](ts-client) | TS (`@par-rt-db/client`, bun) | Browser/Node SDK + React bindings + in-memory test harness |
 | **Rust client** | [`rust-client/`](rust-client) | Rust (`par-rt-db-client`) | Rust SDK: http + reactive ws + admin + `.filter()`/`.search()`/`.vector_search()` builders |
-| **Python client** | [`python-client/`](python-client) | Python (`par-rt-db`, uv) | Python SDK: wire + schema/mutation/query DSL (HTTP/WS/admin pending) |
+| **Python client** | [`python-client/`](python-client) | Python (`par-rt-db`, uv) | Python SDK: wire + schema/mutation/query DSL + sync HTTP/admin/storage + reactive WS |
 | **Dashboard** | [`dashboard/`](dashboard) | Vite + React 19 + TS (bun) | Operator console SPA served same-origin at `RTDB_STATIC_DIR` |
+| **`rtdb` CLI** | [`cli/`](cli) | Rust (`rtdb` binary, cargo) | Operator/CI wrapper around `par-rt-db-client`: list/create dbs, push schema, query/mutate, mint/revoke tokens |
 
-The server is the source of truth; the four clients mirror its wire contract. See
-[`FEATURE_MATRIX.md`](FEATURE_MATRIX.md) for the Convex-parity contract and
-[`CLAUDE.md`](CLAUDE.md) for contributor guidance.
+The server is the source of truth; the three SDKs (ts/rust/python) each mirror
+its wire contract directly, the CLI wraps `rust-client`, and the dashboard SPA
+consumes `ts-client`. See [`FEATURE_MATRIX.md`](FEATURE_MATRIX.md) for the
+Convex-parity contract and [`CLAUDE.md`](CLAUDE.md) for contributor guidance.
 
 ## How it works
 
@@ -115,7 +117,7 @@ curl -s -X POST http://localhost:8300/api/query \
 To run the full test suite instead (dev Postgres must be up):
 
 ```bash
-make test   # dev-db-up + fmt/clippy/typecheck/tests across all five packages
+make test   # dev-db-up + fmt/clippy/typecheck/tests across all six packages
 ```
 
 ## Endpoints
@@ -135,6 +137,7 @@ since browsers cannot set headers on a WS handshake.
 | `GET /healthz` | none | Liveness: `{status:"ok"\|"degraded", version, git_commit, build_timestamp, started_at, uptime_seconds, postgres}`. 503 when Postgres is unreachable. |
 | `GET /sync` | first WS frame | WebSocket upgrade. Speaks the realtime protocol (auth, subscribe, mutate, schedule, ping). |
 | `POST /api/query` | Bearer token | One-shot query against a database; see [Query shape](#query-shape). |
+| `POST /api/query-batch` | Bearer token | Fans out N queries in one round trip (per-query error isolation); each slot returns `{ok, result}` or `{ok:false, error}`. |
 | `POST /api/mutate` | Bearer token | One-shot transaction (`insert`/`patch`/`replace`/`delete`/`expectVersion`/`expectAbsent`/`upsert` steps). |
 | `POST /api/schedule` | Bearer token | Schedules a transaction: `afterMs`/`runAt` one-shot or `cron` (5-field, UTC, min-first); returns `{id}`. |
 | `POST /api/schedule/{id}/{cancel,pause,resume}` | Bearer token | Cancels, pauses, or resumes a scheduled job. |
@@ -154,11 +157,17 @@ since browsers cannot set headers on a WS handshake.
 
 | Method & path | Auth | Description |
 | --- | --- | --- |
+| `POST /admin/login` | Bearer admin key | Validates the admin key and mints a short-lived admin session token (used by the dashboard's login form). |
+| `POST /admin/logout` | Bearer admin key | Invalidates the admin session token. |
 | `POST /admin/create-db` | Bearer admin key | Creates a new database. |
+| `POST /admin/delete-db` | Bearer admin key | Deletes a database. Body `{ name, confirm }` where `confirm` must equal the db name (typed guard). Retires the per-db committer/scheduler/reaper tasks cleanly. |
+| `POST /admin/clone-db` | Bearer admin key | Clones an existing database's schema into a new db name (no data). |
 | `POST /admin/push-schema` | Bearer admin key | Applies additive schema DDL to a database. |
+| `POST /admin/db/{db}/schema/preview` | Bearer admin key | Previews the DDL a `push-schema` would run, without applying. |
+| `POST /admin/db/{db}/migrate` | Bearer admin key | Runs an ordered `Directive` list (rename/coerce/remove/default-backfill) transactionally inside the committer; live queries, op feed, audit, and webhooks all fire. See [Schema migration](#schema-migration). |
 | `GET /admin/dbs` | Bearer admin key | Lists all databases. |
 | `GET /admin/dbs/{db}/schema` | Bearer admin key | Returns the pushed schema for a database. |
-| `GET /admin/dbs/{db}/stats` | Bearer admin key | Per-table row counts and storage sizes. |
+| `GET /admin/dbs/{db}/stats` | Bearer admin key | Per-table row counts and storage sizes; includes quota usage and caps (ENH-011). |
 | `GET /admin/db/{db}/schema/history` | Bearer admin key | Lists schema-change snapshots newest-first (`?limit=`/`?offset=`). See [Schema change history](#schema-change-history). |
 | `GET /admin/db/{db}/schema/history/{version}` | Bearer admin key | Returns one full schema snapshot by version. |
 | `POST /admin/db/{db}/schema/restore` | Bearer admin key | Reconciles the db to a prior snapshot's shape. Body `{ version, confirm }`, `confirm` = db name. |
@@ -170,6 +179,20 @@ since browsers cannot set headers on a WS handshake.
 | `GET /admin/admins` | Bearer admin key | Lists the server-wide OAuth admin allowlist (`rtdb_auth.admins`). |
 | `POST /admin/admins` | Bearer admin key | Adds an email to the admin allowlist. |
 | `DELETE /admin/admins` | Bearer admin key | Removes an email from the admin allowlist. |
+
+#### Schema migration
+
+Destructive/type-changing schema transformations (rename, type coercion, field
+removal, default backfill) are a deliberate admin operation separate from the
+additive `POST /admin/push-schema`. Build a `Migration` and apply it (or dry-run
+first) via `POST /admin/db/{db}/migrate` — the directives run transactionally
+inside the committer's serialized turn (`handle_migrate`), so live queries,
+the op feed, audit, and webhooks all fire under the same single-writer
+invariant as `handle_mutate`. `changeType` takes a closed `cast`
+(`toString`/`toNumber`/`toInt64`/`toBoolean`); the optional `default`
+substitutes for un-coercible rows (without it one bad value rolls the whole
+migrate back atomically). Spec:
+[`docs/superpowers/specs/2026-07-31-schema-migration-backfill-design.md`](docs/superpowers/specs/2026-07-31-schema-migration-backfill-design.md).
 
 #### Schema change history
 
@@ -191,44 +214,75 @@ loss is `DROP TABLE` for tables absent from the target snapshot, and migrate dat
 | --- | --- | --- |
 | `POST /admin/db/{db}/query` | Bearer admin key | Admin reads documents across any database (`owner=None`, bypassing per-row `ownerField`). |
 | `POST /admin/db/{db}/mutate` | Bearer admin key | Admin writes documents across any database. Capped by `RTDB_MAX_AFFECTED_DOCS`. |
+| `GET /admin/db/{db}/schedules` | Bearer admin key | Lists scheduled jobs for a database (admin-scoped). |
+| `POST /admin/db/{db}/schedules` | Bearer admin key | Creates a scheduled job for a database (admin-scoped). |
+| `POST /admin/db/{db}/schedules/{id}/{cancel,pause,resume}` | Bearer admin key | Cancels, pauses, or resumes a scheduled job (admin-scoped). |
+| `GET /admin/db/{db}/storage` | Bearer admin key | Lists blobs stored in a database (id, sha256, size, contentType, createdAt). |
+| `POST /admin/db/{db}/storage` | Bearer admin key | Uploads a blob (admin-scoped; same shape as `POST /api/storage/{db}`). |
+| `DELETE /admin/db/{db}/storage/{id}` | Bearer admin key | Deletes a blob (admin-scoped). |
+| `GET /admin/db/{db}/webhooks` | Bearer admin key | Lists webhooks configured for a database. |
+| `POST /admin/db/{db}/webhooks` | Bearer admin key | Creates a webhook (target URL + event filter). Enabled when `RTDB_WEBHOOKS_ENABLED=true`. |
+| `PUT /admin/db/{db}/webhooks/{id}` | Bearer admin key | Edits a webhook. |
+| `DELETE /admin/db/{db}/webhooks/{id}` | Bearer admin key | Deletes a webhook. |
+| `GET /admin/db/{db}/webhooks/{id}/deliveries` | Bearer admin key | Lists recent delivery attempts (outbox drain) for a webhook. |
 | `GET /admin/metrics` | Bearer admin key | Live gauges and throughput. |
 | `GET /admin/ops/recent` | Bearer admin key | Recent document-mutation op feed (durable). |
+| `GET /admin/audit?db=&limit=&offset=` | Bearer admin key | Audit log entries (`ts_ms, db, table, op, doc_id, principal, source`) — only when `RTDB_AUDIT_LOG_ENABLED=true`; 404 otherwise. |
+| `GET /admin/subscriptions` | Bearer admin key | Lists active subscriptions across all dbs (live query inspector). |
 | `WS /admin/stream` | Bearer admin key | Live op-feed stream over WebSocket (subprotocol auth for browsers). |
 | `GET /admin/config` | Bearer admin key | Hot config, redacted (`admin_key`/OAuth secrets/`database_url` → configured-bools only). |
-| `PATCH /admin/config` | Bearer admin key | Mutates `allowed_origins`/`session_ttl_days`/`max_file_size`; validates, persists, swaps live (no restart). |
+| `PATCH /admin/config` | Bearer admin key | Mutates `allowed_origins`/`session_ttl_days`/`max_file_size`/`idempotency_ttl_ms`/`max_tables_per_db`/`max_storage_bytes_per_db`/`max_subs_per_db`; validates, persists, swaps live (no restart). |
+| `POST /admin/backup` | Bearer admin key | Spawns a manual `pg_dump` of the live DB (409 if one is already running). Enabled when `RTDB_BACKUP_ENABLED=true`. |
+| `GET /admin/backups` | Bearer admin key | Lists existing dump files. |
+| `GET /admin/backups/{name}` | Bearer admin key | Downloads a dump file (path-traversal-guarded). |
+| `DELETE /admin/backups/{name}` | Bearer admin key | Deletes a dump file. |
+| `POST /admin/restore` | Bearer admin key | Restores a dump into a fresh `rtdb_restored_<stamp>` Postgres DB via `pg_restore --no-owner --no-privileges`. Body `{ name, confirm }`, `confirm` = name. The live `rtdb` DB is never touched (single-writer invariant intact). |
 | `GET /admin/export-db?db=` | Bearer admin key | Snapshot export: schema line + one JSONL doc line per document. |
 | `POST /admin/import-db?db=` | Bearer admin key | Snapshot import: applies the schema line, replays each doc with original id/timestamp/version. |
 
 ### Auth (OAuth + sessions)
 
+Six optional OAuth providers ship behind the shared `OAuthProvider` trait —
+GitHub, Google, GitLab, Microsoft, Apple, and a generic OIDC provider — plus
+hashed per-database machine tokens and a server-wide admin key. Each provider
+is independently optional: leave its env vars blank and its routes return
+`503`. See [`docs/OAUTH_SETUP.md`](docs/OAUTH_SETUP.md) for the per-provider
+setup (callback URLs, scopes, env-var pairs).
+
 | Method & path | Auth | Description |
 | --- | --- | --- |
-| `GET /auth/github?origin=` | none | Starts the GitHub OAuth flow; 302s to GitHub's authorize page. `origin` must be an exact member of `RTDB_ALLOWED_ORIGINS`. |
-| `GET /auth/callback` | none (state token) | GitHub OAuth callback; exchanges the code, mints a session, and returns HTML that `postMessage`s the session token back to the popup opener. |
-| `GET /auth/google?origin=` | none | Starts the Google OAuth flow; 302s to Google's authorize page. `origin` must be an exact member of `RTDB_ALLOWED_ORIGINS`. |
-| `GET /auth/google/callback` | none (state token) | Google OAuth callback; exchanges the code, mints a session, and returns HTML that `postMessage`s the session token back to the popup opener. |
+| `GET /auth/{provider}/begin?origin=` | none | Starts the OAuth flow for one of `github`/`google`/`gitlab`/`microsoft`/`apple`/`oidc`. Validates `origin` against the **live** `RTDB_ALLOWED_ORIGINS` (403 on miss), mints a single-use `state` token, sets the `SameSite=None;HttpOnly` `rtdb-oauth-csrf` nonce cookie, and returns JSON `{ authorizeUrl, state }`. The caller opens `authorizeUrl` in a `noopener,noreferrer` popup and polls `/auth/state` for completion. |
+| `GET /auth/callback` | none (state token) | GitHub OAuth callback (the canonical path; Google/GitLab/Microsoft/OIDC use `GET /auth/{provider}/callback`). Constant-time-verifies the CSRF nonce cookie against `state`, claims the pending entry (replay → 400), exchanges the code, fetches the verified email, upserts `rtdb_auth.users`, sets the `HttpOnly` session cookie, and returns popup-closing HTML. |
+| `POST /auth/apple/callback` | none (state token) | Apple-specific callback — Apple POSTs `code`+`state` via `response_mode=form_post`. Same CSRF/session handling as the GET path (the `SameSite=None` cookie survives the cross-site POST). |
+| `GET /auth/state?state=` | none (state token) | Provider-agnostic poll endpoint keyed on the single-use `state` token. Returns `{ status: "pending" }` until the callback completes, then `{ status: "ok", token }` (one-shot — the next poll returns `{ status: "gone" }`). The state token, not the session cookie, is the poll capability, which is what makes cross-origin SDK login work where the `SameSite=Lax` session cookie would not be sent. |
 | `POST /auth/logout` | Bearer session | Deletes the session for the given bearer token. Idempotent: always 200 unless the delete query itself fails. |
 | `GET /auth/me` | Bearer session | Returns the authenticated user. 401 for a machine token (session only). |
 | `GET /auth/validate` | Bearer token | Validates a presented session or machine token; returns the `AuthedUser`. Used by backends to check a player-supplied token. |
 
-Bearer tokens are either a per-database **machine token** (minted via `/admin/mint-token`)
-or a **session token** (minted by completing the GitHub or Google OAuth flow). Both resolve
-through the same `Authorization: Bearer <token>` header on `/api/*`, `/auth/*`, and the WS
-`auth` frame. The WS handler and admin re-auth paths re-run on every op (revocation and
-expiry take effect on open connections — see [Known MVP limitations](#known-mvp-limitations)).
+The live login flow (SEC-012): the browser hits `GET /auth/{provider}/begin` →
+opens the provider authorize URL in a `noopener,noreferrer` popup (reverse-tabnabbing
+defense — `window.opener` is severed) → the parent polls
+`GET /auth/state?state=<token>` → the provider redirects to the callback →
+the callback sets the `HttpOnly` session cookie and returns popup-closing HTML
+→ the parent's next poll receives the session token and closes the popup.
+Login-CSRF is defended by the `rtdb-oauth-csrf` double-submit cookie set at
+`/begin` and constant-time-verified at `/callback`
+(`RTDB_OAUTH_LOGIN_CSRF=true` by default; cross-origin SDK consumers must send
+`credentials: "include"` on the `/begin` fetch). Identity is email-keyed with
+cross-provider linking (Apple additionally keys on its stable `sub`).
 
 Bearer tokens are either a per-database **machine token** (minted via `/admin/mint-token`)
-or a **session token** (minted by completing the GitHub or Google OAuth flow). Both resolve
-through the same `Authorization: Bearer <token>` header on `/api/*`, `/auth/*`, and the WS
-`auth` frame.
+or a **session token** (minted by completing an OAuth flow). Both resolve through the same
+`Authorization: Bearer <token>` header on `/api/*`, `/auth/*`, and the WS `auth` frame. The
+WS handler and admin re-auth paths re-run on every op (revocation and expiry take effect on
+open connections — see [Known MVP limitations](#known-mvp-limitations)).
 
 ## Configuration
 
-The server reads its configuration from environment variables. Boot-time vars
-(prefix `RTDB_`) come from the environment; the three runtime-mutable ones
-(`allowed_origins`, `session_ttl_days`, `max_file_size`) are seeded from env at
-first boot, persisted in a single-row `rtdb_config` table, and hot-swappable
-via `PATCH /admin/config` thereafter.
+The server reads its configuration from environment variables (prefix `RTDB_`).
+The full, comment-annotated list lives in [`.env.example`](.env.example) — copy
+it to `.env` and edit. The subset below is what most operators tune on first
+boot:
 
 | Variable | Required | Default | Description |
 | --- | --- | --- | --- |
@@ -236,27 +290,24 @@ via `PATCH /admin/config` thereafter.
 | `RTDB_ADMIN_KEY` | yes | — | Server-wide admin bearer (constant-time compared). Generate with `openssl rand -hex 32`. |
 | `RTDB_PORT` | no | `8300` | HTTP/WS listen port. |
 | `RTDB_PUBLIC_URL` | no | `http://localhost:8300` | Public origin (OAuth callback base, external links). |
-| `RTDB_ALLOWED_ORIGINS` | no | empty | Comma-separated browser origins; also the exact-match CORS allowlist for `/api/*` and `/auth/*`. Hot-reloadable. |
-| `RTDB_SESSION_TTL_DAYS` | no | `30` | OAuth session lifetime in days. Hot-reloadable. |
-| `RTDB_MAX_FILE_SIZE` | no | `52428800` (50 MiB) | Per-upload byte ceiling enforced inside the upload handler. Hot-reloadable. |
-| `RTDB_MAX_AFFECTED_DOCS` | no | `100` | Max steps an admin mutation may carry — rejects over-cap writes before the committer (each DSL step touches ≤1 doc). |
+| `RTDB_ALLOWED_ORIGINS` | no | empty | Comma-separated browser origins; also the exact-match CORS allowlist for `/api/*` and `/auth/*`. **Hot-reloadable.** |
 | `RTDB_STATIC_DIR` | no | unset | Directory of static SPA build artifacts. Set/unset existing dir ⇒ dashboard served same-origin at the catch-all route fallback; unset/empty/missing ⇒ API-only. |
-| `RTDB_ADMIN_EMAILS` | no | empty | Comma-separated emails seeded into the server-wide OAuth admin allowlist (`rtdb_auth.admins`) at boot. Manageable at runtime via `/admin/admins`. |
-| `RTDB_GITHUB_CLIENT_ID` | no | none | GitHub OAuth app client id. |
-| `RTDB_GITHUB_CLIENT_SECRET` | no | none | GitHub OAuth app client secret. |
-| `RTDB_GITHUB_BASE_URL` | no | `https://github.com` | GitHub authorize/base URL (override for GitHub Enterprise). |
-| `RTDB_GITHUB_API_URL` | no | `https://api.github.com` | GitHub API base URL (override for GitHub Enterprise). |
-| `RTDB_GOOGLE_CLIENT_ID` | no | none | Google OAuth client id. |
-| `RTDB_GOOGLE_CLIENT_SECRET` | no | none | Google OAuth client secret. |
-| `RTDB_BUILD_COMMIT` | no | `git rev-parse --short HEAD`, else `unknown` | Short SHA baked into `/healthz` `git_commit` at build time. Set explicitly when building without `.git` (e.g. Docker build-arg). |
+| `RTDB_GITHUB_CLIENT_ID` + `RTDB_GITHUB_CLIENT_SECRET` | no | none | GitHub OAuth app credentials — both required to enable GitHub login. The other five providers (Google, GitLab, Microsoft, Apple, OIDC) follow the same `RTDB_<PROVIDER>_CLIENT_ID` + `_CLIENT_SECRET` pair pattern; see `.env.example` and [`docs/OAUTH_SETUP.md`](docs/OAUTH_SETUP.md). |
 
-`RTDB_ALLOWED_ORIGINS` is also the exact-match CORS allowlist for `/api/*` and `/auth/*`
-(GET, POST, OPTIONS; `authorization` and `content-type` headers). Each OAuth provider is
-only active when both its client id and secret are set — GitHub needs
-`RTDB_GITHUB_CLIENT_ID` + `RTDB_GITHUB_CLIENT_SECRET`, Google needs
-`RTDB_GOOGLE_CLIENT_ID` + `RTDB_GOOGLE_CLIENT_SECRET`. A half-configured pair (only one
-of the two) is treated the same as neither, and `GET /auth/<provider>` returns `503` with
-an `INTERNAL` error envelope.
+The hot-reloadable settings (live on `AppState` as `Arc<ArcSwap<HotConfig>>`,
+seeded from env at first boot, persisted in a single-row `rtdb_config` table,
+and swapable via `PATCH /admin/config` without a restart): `allowed_origins`,
+`session_ttl_days`, `max_file_size`, `idempotency_ttl_ms`, and the three
+per-database quota caps `max_tables_per_db` / `max_storage_bytes_per_db` /
+`max_subs_per_db` (`0` = unlimited, ENH-011). The full set of boot-time vars —
+OAuth, rate limits, scheduling, presence, image transforms, backups, audit,
+webhooks, storage dedup, search language, vector distance, and more — is
+annotated in [`.env.example`](.env.example). `RTDB_ALLOWED_ORIGINS` is also the
+exact-match CORS allowlist for `/api/*` and `/auth/*` (GET, POST, OPTIONS;
+`authorization` and `content-type` headers). Each OAuth provider is only active
+when both its client id and secret are set; a half-configured pair is treated
+the same as neither, and `GET /auth/<provider>/begin` returns `503` with an
+`INTERNAL` error envelope.
 
 ## Error envelope
 
@@ -280,9 +331,18 @@ Every error response — HTTP and WebSocket alike — is a JSON object:
 
 ### Query shape
 
-`{"table": "<name>", "get"?, "index"?, "eq"?, "order"?, "take"?, "unique"?}` — see
-`server/src/query.rs` for full semantics (index prefix binds, `order: "asc"|"desc"`,
-`take` capped at 4096, `unique`, point `get` by id).
+`{"table": "<name>", "get"?, "index"?, "eq"?, "order"?, "take"?, "unique"?, "first"?,
+"count"?, "filter"?, "search"?, "vectorSearch"?, "paginate"?, "distinct"?, "aggregate"?}`
+— exactly one terminal per query (terminals are mutually exclusive). See
+`server/src/query.rs` for full semantics: index prefix binds, range predicates
+(`gt`/`gte`/`lt`/`lte`) follow the `eq` prefix, `order: "asc"|"desc"`, `take`
+capped at 4096, `unique` de-duplicates on the indexed fields, `count` is an
+uncapped `SELECT COUNT(*)`, `first` is sugar over `take(1)`, `filter` carries
+an `eq`/`neq`/`gt`/`gte`/`lt`/`lte`/`in` + `and`/`or` predicate compiled to SQL,
+`search` ranks by `ts_rank` over a generated tsvector, `vectorSearch` ranks by
+the index's declared metric distance over a write-maintained pgvector column,
+`paginate` is opaque-cursor keyset pagination, `distinct` collapses duplicates
+on a field set, and `aggregate` runs a grouped `sum`/`min`/`max`/`avg`/`count`.
 
 ### Transaction shape
 
@@ -574,8 +634,8 @@ Rust and Python reactive clients mirror them as `presence` / `update_presence` /
 
 ## Make targets
 
-Each `make` target spans **all five packages** (server, ts-client, rust-client,
-dashboard, python-client). The composition is summarized below; see the
+Each `make` target spans **all six packages** (server, ts-client, rust-client,
+python-client, dashboard, cli). The composition is summarized below; see the
 [`Makefile`](Makefile) for the canonical commands.
 
 ### First-time install (per package)
@@ -589,7 +649,7 @@ dashboard, python-client). The composition is summarized below; see the
 Cargo workspaces (`server/`, `rust-client/`) have no install target — `cargo`
 fetches on first build.
 
-### Build / format / lint / typecheck / test (each runs across all five packages)
+### Build / format / lint / typecheck / test (each runs across all six packages)
 
 | Target | What runs in each package |
 | --- | --- |
@@ -608,7 +668,7 @@ fetches on first build.
 
 | Target | Purpose |
 | --- | --- |
-| `make checkall` | `fmt-check` + `lint` + `typecheck` + `test` across all five packages. **Definition of done; must pass before commit.** |
+| `make checkall` | `fmt-check` + `lint` + `typecheck` + `test` across all six packages. **Definition of done; must pass before commit.** |
 | `make pre-commit` | `pre-commit run --all-files` (runs `gitleaks`, `detect-private-key`, etc.). |
 | `make pre-commit-update` | `pre-commit autoupdate`. |
 | `make deploy` | `checkall` → rsync to lenny2 → `docker compose up -d --build` → healthz probe. |
@@ -642,19 +702,17 @@ that ultimately terminates a connection that never closes on its own.
 - `AuthedUser.name` is always `null`: the `rtdb_auth.users` table has no `name` column, so
   users are identified on the wire by `kind`, `email`, and (for GitHub-linked accounts)
   `githubLogin` / `githubId` — never by a free-form display name.
-- OAuth popup login has an accepted CSRF residual: the `state` token is bound to the
-  initiating *origin* (so a malicious page can't receive the session token even if it can
-  trigger the flow), but not to the initiating *browser* (no PKCE, no state cookie) — see
-  the design spec's Auth section for the accepted-risk rationale.
 
 ## Clients
 
-par-rt-db ships four clients that mirror one wire contract:
+par-rt-db ships three client SDKs that each mirror the server's wire contract,
+plus an operator SPA and a CLI built on top of them:
 
 - [`ts-client/`](ts-client/README.md) — `@par-rt-db/client` (browser/Node): schema builder, reactive WebSocket client, React bindings, HTTP/admin clients, in-memory test harness.
 - [`rust-client/`](rust-client/README.md) — `par-rt-db-client` (Rust): http + reactive ws + admin, `.filter()`/`.search()`/`.vector_search()` builders.
-- [`python-client/`](python-client/README.md) — `par-rt-db` (Python): wire contract + schema/mutation/query DSL (HTTP/WS/admin/storage pending).
-- [`dashboard/`](dashboard/README.md) — the operator console SPA (admin/operator UI served same-origin at `RTDB_STATIC_DIR`).
+- [`python-client/`](python-client/README.md) — `par-rt-db` (Python): wire contract + schema/mutation/query DSL + sync HTTP/admin/storage + reactive WS.
+- [`dashboard/`](dashboard/README.md) — the operator console SPA (admin/operator UI served same-origin at `RTDB_STATIC_DIR`; consumes `ts-client`).
+- [`cli/`](cli/README.md) — `rtdb` operator/CI binary (wraps `par-rt-db-client`).
 
 [`FEATURE_MATRIX.md`](FEATURE_MATRIX.md) tracks parity vs. Convex, with per-row notes on which clients mirror each feature.
 

@@ -1081,6 +1081,13 @@ async fn admin_create_webhook(
     if url.is_empty() {
         return Err(RtDbError::bad_request("url is required"));
     }
+    // SSRF guard (SEC-001): https-only by default, plus a private/loopback/
+    // metadata IP-range denylist + DNS resolution check. The dev flag
+    // `RTDB_WEBHOOK_ALLOW_HTTP` opts back into http + private targets so the
+    // integration tests can point at a local receiver.
+    crate::webhook::validate_webhook_url(url, state.config.webhook_allow_http)
+        .await
+        .map_err(RtDbError::bad_request)?;
     // An empty `table` string is treated as "all tables" (None), matching how
     // NULL is interpreted by the enqueue matcher.
     let table = body
@@ -1194,6 +1201,14 @@ async fn admin_edit_webhook(
         && u.is_empty()
     {
         return Err(RtDbError::bad_request("url must not be empty"));
+    }
+    // SSRF guard (SEC-001): when a new URL is supplied it must clear the same
+    // validator the create path uses (https-only + private/loopback/metadata
+    // denylist), so a `PUT` can't bypass registration-time validation.
+    if let Some(u) = url {
+        crate::webhook::validate_webhook_url(u, state.config.webhook_allow_http)
+            .await
+            .map_err(RtDbError::bad_request)?;
     }
     // Normalize `table`: an empty string is treated as "all tables" (None),
     // matching the create path. Trim the inner value when present. Built as an

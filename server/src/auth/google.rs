@@ -309,6 +309,8 @@ mod tests {
             audit_log_enabled: false,
             oauth_login_csrf: true,
             webhooks_enabled: false,
+            webhook_allow_http: false,
+            storage_rate_limit_per_ip_rpm: 0,
             backup_enabled: false,
             backup_cron: "0 3 * * *".into(),
             backup_dir: "./backups".into(),

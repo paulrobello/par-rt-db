@@ -19,7 +19,7 @@ notes), see [`CLAUDE.md`](CLAUDE.md).
 
 ## Repository layout
 
-par-rt-db is a monorepo with **five packages** built from one root `Makefile`:
+par-rt-db is a monorepo with **six packages** built from one root `Makefile`:
 
 | Package | Path | Stack |
 | --- | --- | --- |
@@ -28,6 +28,7 @@ par-rt-db is a monorepo with **five packages** built from one root `Makefile`:
 | Rust client | `rust-client/` | Rust (`par-rt-db-client`) |
 | Python client | `python-client/` | Python (`par-rt-db`, uv) |
 | Dashboard | `dashboard/` | Vite + React 19 + TS (bun) |
+| `rtdb` CLI | `cli/` | Rust (`rtdb` binary, cargo; wraps `par-rt-db-client`) |
 
 The server is the source of truth for the wire protocol and the DSL; the four
 clients mirror it. [`FEATURE_MATRIX.md`](FEATURE_MATRIX.md) tracks parity
@@ -68,7 +69,7 @@ gitignored and rebuilt on demand.
 ## The build gate
 
 `make checkall` is the **definition of done**. It must pass before commit. It
-runs, across all five packages:
+runs, across all six packages:
 
 - `fmt-check` — formatting check (cargo fmt, bun fmt-check, ruff format --check)
 - `lint` — `cargo clippy --all-targets --all-features -- -D warnings`, `bun run lint`, `uv run ruff check .`
@@ -88,7 +89,7 @@ databases per test case (`t<uuid>`). Never assume exclusive access, and never
 drop a database or schema you didn't create.
 
 ```bash
-make test                                       # whole suite (dev-db-up + tests across all 5 packages)
+make test                                       # whole suite (dev-db-up + tests across all 6 packages)
 
 # Per-package:
 cd server && cargo test                         # server tests
@@ -200,9 +201,11 @@ failing test.
   `is_admin` re-runs on every admin op. Don't add a cached auth check that
   bypasses this.
 - **Op-feed tap** — durable document mutations publish through the committer's
-  two tap sites (`handle_mutate`/`handle_scheduled` in `committer.rs`). Any
-  new code path that commits a document txn must publish there too, or the
-  op-feed (and `/admin/stream`) will silently miss those writes.
+  four tap sites (`handle_mutate`, `handle_scheduled`, `handle_migrate`, and
+  `handle_reaper` in `committer.rs`; plus `handle_restore_schema` for the
+  schema-restore arm). Any new code path that commits a document txn must
+  publish at the same tap sites, or the op-feed (and `/admin/stream`, the
+  audit log, and the webhook outbox) will silently miss those writes.
 - **Storage bypasses the committer** — `storage::put` writes directly to the
   `storage` side table because blobs don't touch document tables or
   subscriptions. `GET /storage/{id}` is the only unauthenticated route; keep

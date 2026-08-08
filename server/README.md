@@ -11,9 +11,11 @@ every app.
 This directory holds the `rtdb-server` binary. The three client SDKs live
 alongside it: [`../ts-client/`](../ts-client) (browser/Node),
 [`../rust-client/`](../rust-client) (Rust), and
-[`../python-client/`](../python-client) (Python — wire + DSL today; HTTP/WS/admin
-pending). An operator dashboard SPA ([`../dashboard/`](../dashboard)) is served
-same-origin by the server when `RTDB_STATIC_DIR` is set. See the
+[`../python-client/`](../python-client) (Python — wire + DSL + sync HTTP/admin/storage
++ reactive WS, all shipped). An operator dashboard SPA
+([`../dashboard/`](../dashboard)) is served same-origin by the server when
+`RTDB_STATIC_DIR` is set, and the [`../cli/`](../cli) package wraps
+`par-rt-db-client` as the `rtdb` operator/CI binary. See the
 [root README](../README.md) for the project overview and
 [`../CLAUDE.md`](../CLAUDE.md) for contributor guidance. Authoritative design:
 [`../docs/superpowers/specs/2026-07-21-par-rt-db-design.md`](../docs/superpowers/specs/2026-07-21-par-rt-db-design.md).
@@ -24,14 +26,23 @@ same-origin by the server when `RTDB_STATIC_DIR` is set. See the
 - **sqlx 0.8** + **Postgres 17** — storage: one typed column per indexed field,
   documents stored as `doc jsonb` (system fields merged in at read time).
 - **tracing** — structured logs.
-- Auth: multi-provider OAuth trait (`auth/provider.rs`) with GitHub
-  (`auth/github.rs`) and Google (`auth/google.rs`) providers — cross-provider
-  same-email logins link to one user by email — plus hashed per-database machine
-  tokens (`auth/tokens.rs`); the admin key is compared constant-time.
-- Per-row authorization: a table may declare an opt-in `ownerField`, after which
-  an authenticated user reads/mutates only rows they own (enforced server-side
-  on query, mutate, and subscription re-run; machine tokens and scheduled jobs
-  bypass it). See FEATURE_MATRIX #20.
+- Auth: multi-provider OAuth trait (`auth/provider.rs`) — six providers ship
+  behind it: GitHub (`auth/github.rs`), Google (`auth/google.rs`),
+  GitLab (`auth/gitlab.rs`), Microsoft / Entra ID v2 (`auth/microsoft.rs`),
+  Apple (`auth/apple.rs`, ES256 JWT `client_secret` + `response_mode=form_post`),
+  and a generic OIDC provider (`auth/oidc.rs`). Cross-provider same-email logins
+  link to one user by email (Apple additionally keys on its stable `sub`); a
+  per-database email allowlist gates database access; the admin key is compared
+  constant-time. Login-CSRF is defended by the `rtdb-oauth-csrf` double-submit
+  cookie (`RTDB_OAUTH_LOGIN_CSRF=false` to disable). See
+  [`../docs/OAUTH_SETUP.md`](../docs/OAUTH_SETUP.md) and FEATURE_MATRIX #14.
+- Per-row authorization (FEATURE_MATRIX #20): a table may declare any of three
+  opt-in rules — `ownerField` (owner-only), `collaboratorsField` (owner OR
+  collaborator), and `authorize` (a general `FilterExpr` predicate over doc
+  fields plus `$user`/`$email` principal markers). Enforced server-side on
+  query, mutate, and subscription re-run; machine tokens and scheduled jobs
+  bypass per-row rules. See
+  [`../docs/superpowers/specs/2026-08-02-per-row-auth-predicate-dsl-design.md`](../docs/superpowers/specs/2026-08-02-per-row-auth-predicate-dsl-design.md).
 
 ## Layout
 
@@ -39,13 +50,32 @@ same-origin by the server when `RTDB_STATIC_DIR` is set. See the
 | --- | --- |
 | Correctness core (serialized writes + subscription fan-out) | `src/committer.rs`, `src/subs.rs` |
 | Scheduled / cron transactions | `src/scheduler.rs` (+ the `RunScheduled` arm in `src/committer.rs`) |
+| TTL reaper | `src/reaper.rs` (+ the `RunReaper` arm in `src/committer.rs`) |
+| Schema migration (destructive transforms) | `src/migrate.rs` (+ the `RunMigrate` arm in `src/committer.rs`) |
+| Schema change history + restore | `src/schema_history.rs`, `src/schema_diff.rs` (+ the `RunRestoreSchema` arm in `src/committer.rs`) |
 | File storage (blobs) | `src/storage.rs` (+ the storage routes in `src/http_api.rs`) |
+| On-the-fly image transforms (ENH-014) | `src/image_transform.rs` (read-time, both serve routes; `moka` cache + decode semaphore + pixel cap; `RTDB_IMAGE_*` knobs) |
+| Per-database resource quotas (ENH-011) | `src/quota.rs` (three global caps on `HotConfig`; tables/subs/storage enforcement; `QUOTA_EXCEEDED` 507) |
+| Realtime presence (ENH-015) | `src/presence.rs` (in-memory, connection-bound, not committer-bound; `RTDB_PRESENCE_*` knobs) |
+| Audit log (when `RTDB_AUDIT_LOG_ENABLED=true`) | `src/audit.rs` (best-effort row per `DocOp` at the committer tap sites) |
+| Webhook outbox (when `RTDB_WEBHOOKS_ENABLED=true`) | `src/webhook.rs` (per-`DocOp` outbox row drained by a boot worker; at-least-once) |
+| Backup lifecycle (when `RTDB_BACKUP_ENABLED=true`) | `src/backup.rs` (manual `pg_dump` trigger + dump list/download/delete; `pg_restore --no-owner --no-privileges` into a fresh `rtdb_restored_<stamp>` DB) |
+| Rate limiter (per-token + per-db fixed window) | `src/rate_limit.rs` (`RTDB_RATE_LIMIT_PER_TOKEN_RPM` / `RTDB_RATE_LIMIT_PER_DB_RPM`, 0 = off) |
+| Mutation-log dedup (idempotency) | `src/mutation_log.rs` |
+| Op feed (in-memory ring + `/admin/stream`) | `src/op_feed.rs` |
+| Snapshot export/import | `src/snapshot.rs` |
+| Metrics | `src/metrics.rs` |
+| Hot config + dynamic CORS | `src/config.rs` (`Arc<ArcSwap<HotConfig>>` on `AppState`) |
+| Health | `src/health.rs` |
 | Schema model + validation | `src/schema.rs` |
 | Schema → Postgres DDL | `src/ddl.rs` |
 | Write / read paths | `src/txn.rs`, `src/query.rs` |
+| Pagination (cursor keyset) | `src/pagination.rs` |
 | Wire messages | `src/protocol.rs` |
+| Error envelope | `src/error.rs` |
 | Transports | `src/ws.rs` (reactive), `src/http_api.rs` (one-shot) |
-| Auth | `src/auth/` (`tokens.rs`, `provider.rs`, `github.rs`, `google.rs`, `session.rs`) |
+| Admin control plane | `src/admin.rs` (all `/admin/*` routes + `/admin/stream` WS) |
+| Auth (six OAuth providers + sessions + machine tokens) | `src/auth/` — `mod.rs`, `provider.rs` (trait + dispatcher), `github.rs`, `google.rs`, `gitlab.rs`, `microsoft.rs` (Entra ID/Azure AD v2), `apple.rs` (ES256 JWT `client_secret` + `form_post`), `oidc.rs` (generic), `session.rs`, `tokens.rs`, `cookie.rs` |
 
 The read path compiles a db-side `filter()` predicate DSL to SQL, a full-text
 `search` query terminal backed by a generated tsvector column + GIN index,

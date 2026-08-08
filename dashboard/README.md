@@ -71,10 +71,12 @@ Two login methods, both funneled through `authenticate_admin` on the server:
   config, admins) via the HTTP `/admin/*` API. The raw key is **not** accepted
   on `/sync`, so the **data browser falls back to ~2s polling** of
   `POST /admin/db/{db}/query` rather than subscribing.
-- **OAuth (GitHub or Google)** — sign in with an account whose email is on the
-  `RTDB_ADMIN_EMAILS` allowlist (or has been added via the Admins page since
-  boot). The session token issued by `/auth/*` **is** accepted on `/sync`, so
-  the **data browser subscribes for true realtime**.
+- **OAuth (GitHub / Google / GitLab / Microsoft / Apple / OIDC)** — sign in
+  with an account whose email is on the `RTDB_ADMIN_EMAILS` allowlist (or has
+  been added via the Admins page since boot). Available providers are those
+  whose env-var pairs are set on the server (each is independently optional).
+  The session token issued by `/auth/*` **is** accepted on `/sync`, so the
+  **data browser subscribes for true realtime**.
 
 The two methods differ only in how the data browser reads documents; the op
 feed, metrics, and database list stream over the same `/admin/stream`
@@ -88,18 +90,29 @@ best-effort calls `POST /auth/logout`.
 
 ### The dashboard surfaces
 
-Top-level nav (left rail) plus the per-table data browser reached by drilling
-into a database:
+Top-level nav (left rail) plus the per-database pages reached by drilling into
+a database. Eighteen routes mirror the admin API surface:
 
 | Surface | Path | What it does |
 | --- | --- | --- |
-| **Databases** | `/` | List and create databases; drill into one for stats, schema, and per-table data. |
-| **Schema** | `/dbs/:db/schema` | The pushed schema for one database. |
-| **Data browser** | `/dbs/:db/tables/:table` | Live documents in one table. OAuth = realtime over `/sync`; admin-key = ~2s poll. |
-| **Metrics** | `/metrics` | Server-wide gauges: queries, mutations, uploads, pool size/idle, uptime. |
-| **Op feed** | `/ops` | Newest-first document operations across all databases. Also streamed live into the right rail. |
-| **Config** | `/config` | Hot knobs (`allowed_origins`, `session_ttl_days`, `max_file_size`), server build info, and provider configuration status. |
+| **Databases** | `/` | List, create, clone, and delete databases; drill into one for stats, schema, storage, schedules, webhooks, audit, and backups. |
+| **Database overview** | `/dbs/:db` | Per-database stats (row counts, storage size, quota usage), recent ops, and quick links. |
+| **Schema** | `/dbs/:db/schema` | The pushed schema for one database (tables, fields, indexes, `ownerField`/`collaboratorsField`/`authorize`, `ttl`). |
+| **Schema history** | `/dbs/:db/schema/history` | Newest-first schema snapshots; diff against the current shape; restore-confirm to reconcile. |
+| **Migrate** | `/dbs/:db/migrate` | Guided destructive-shape migrate (dry-run → review → apply); see [Schema migration](#schema-migration-guided) below. |
+| **Data browser** | `/dbs/:db/tables/:table` | Live documents in one table. OAuth = realtime over `/sync`; admin-key = ~2s poll. Insert/patch/delete under the `RTDB_MAX_AFFECTED_DOCS` cap. |
+| **Metrics** | `/metrics` | Server-wide gauges (queries, mutations, uploads, pool size/idle, uptime) + quota-rejection counters (`rtdb_quota_rejections_total{kind=tables\|storage\|subs}`). |
+| **Op feed** | `/ops` | Newest-first document operations across all databases (`GET /admin/ops/recent`). Also streamed live into the right rail. |
+| **Scheduled jobs** | `/scheduled` | Lists scheduled/cron jobs across databases; cancel/pause/resume controls. |
+| **Storage** | `/storage` | Per-database blob browser; size, sha256, contentType, createdAt; delete/revoke. |
+| **Subscriptions** | `/subscriptions` | Live-query inspector — every active subscription across databases with its read-set class and skip/re-run counters. |
+| **Tokens** | `/tokens` | Per-database machine tokens (mint with optional `expiresAt`/`readOnly`/`tables` scoping, revoke, list — no secrets returned). |
+| **Webhooks** | `/webhooks` | Per-database webhook CRUD + recent delivery attempts (outbox drain). Requires `RTDB_WEBHOOKS_ENABLED=true`. |
+| **Query console** | `/console` | Free-form admin query/mutate against any database (`POST /admin/db/{db}/query\|mutate`, `owner=None`). |
+| **Config** | `/config` | Hot knobs (`allowed_origins`, `session_ttl_days`, `max_file_size`, `idempotency_ttl_ms`, `max_tables_per_db`, `max_storage_bytes_per_db`, `max_subs_per_db`), server build info, and provider configuration status. PATCH persists + swaps live (no restart). |
 | **Admins** | `/admins` | Manage the OAuth admin allowlist (`RTDB_ADMIN_EMAILS` + any runtime additions). |
+| **Audit** | `/audit` | Durable audit log viewer (`ts_ms, db, table, op, doc_id, principal, source`). Requires `RTDB_AUDIT_LOG_ENABLED=true`. |
+| **Backups** | `/backups` | Manual `pg_dump` trigger + dump list, download, delete, and restore into a fresh `rtdb_restored_<stamp>` DB. Requires `RTDB_BACKUP_ENABLED=true`. |
 
 ### Schema migration (guided)
 

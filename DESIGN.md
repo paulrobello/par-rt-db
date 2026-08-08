@@ -1,5 +1,13 @@
 # Design — par-rt-db console
 
+This is the **visual contract** for the operator dashboard SPA: the world,
+layout, components, and interaction language the dashboard implements. It is
+the source that [`dashboard/README.md`](dashboard/README.md) defers to for
+look-and-feel questions and that the `/impeccable` design review checks
+against. Authoritative for visuals; for product scope see
+[`PRODUCT.md`](PRODUCT.md), and for the backend API contract see the root
+[`README.md`](README.md).
+
 <!-- impeccable:design 1 -->
 
 > **Direction contract (chosen: par-mem ops cockpit)**

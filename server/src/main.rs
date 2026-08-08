@@ -115,13 +115,22 @@ async fn main() {
 
     tracing::info!("listening on 0.0.0.0:{port}");
 
-    axum::serve(listener, router)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .unwrap_or_else(|err| {
-            eprintln!("server error: {err}");
-            std::process::exit(1);
-        });
+    // `into_make_service_with_connect_info` makes the peer `SocketAddr`
+    // available to handlers via the `ConnectInfo<SocketAddr>` extractor — used
+    // by the per-IP rate limit on the unauthenticated public storage serve
+    // route (SEC-004). When deploying behind a trusted proxy (the Cloudflare
+    // tunnel in production) the IP is read from `X-Forwarded-For` first, with
+    // ConnectInfo as the fallback for direct connections.
+    axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await
+    .unwrap_or_else(|err| {
+        eprintln!("server error: {err}");
+        std::process::exit(1);
+    });
 }
 
 /// Resolves on SIGINT or SIGTERM, whichever arrives first. If a signal
