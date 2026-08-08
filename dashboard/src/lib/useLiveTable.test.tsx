@@ -30,7 +30,11 @@ const mocks = vi.hoisted(() => {
 });
 
 vi.mock("@par-rt-db/client", () => ({
-  RtDbClient: vi.fn(() => mocks.rtDbClientInstance),
+  // vitest 4 forbids arrow functions as mock constructors; a regular function
+  // body is constructable and returns the shared instance when invoked with new.
+  RtDbClient: vi.fn(function rtDbClientCtor() {
+    return mocks.rtDbClientInstance;
+  }),
 }));
 vi.mock("./admin", () => ({
   useAdmin: () => ({ client: { adminQuery: mocks.adminQuery } }),
