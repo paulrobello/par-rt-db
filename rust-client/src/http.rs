@@ -72,6 +72,16 @@ pub struct FileMetadata {
     pub creation_time: i64,
 }
 
+/// A signed, time-limited storage URL minted by the server
+/// (`GET /api/storage/{db}/{id}/signed-url`). `expires_at` is epoch
+/// milliseconds; the URL stops working after it.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SignedUrl {
+    pub url: String,
+    pub expires_at: i64,
+}
+
 /// Image-transform `fit` mode for [`RtDbHttpClient::transform_url`] (ENH-014).
 /// The serde rename is `kebab-case` so `ScaleDown` serializes as `scale-down`
 /// on the wire; `as_str` mirrors that for the hand-built query string.
@@ -500,6 +510,28 @@ impl RtDbHttpClient {
             .await
             .map_err(|e| RtDbError::internal(format!("file metadata request failed: {e}")))?;
         self.deserialize::<FileMetadata>(resp).await
+    }
+
+    pub async fn get_signed_url(
+        &self,
+        id: &str,
+        ttl_seconds: Option<u64>,
+    ) -> Result<SignedUrl, RtDbError> {
+        let mut req = self
+            .client
+            .get(format!(
+                "{}/api/storage/{}/{id}/signed-url",
+                self.url, self.db
+            ))
+            .bearer_auth(&self.token);
+        if let Some(ttl) = ttl_seconds {
+            req = req.query(&[("ttlSeconds", ttl)]);
+        }
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| RtDbError::internal(format!("signed url request failed: {e}")))?;
+        self.deserialize::<SignedUrl>(resp).await
     }
 
     /// The public serve URL — no request is made.
@@ -1410,7 +1442,7 @@ mod tests {
     use crate::query::TableQuery;
     use crate::wire::UserKind;
     use serde_json::{Value, json};
-    use wiremock::matchers::{body_bytes, body_partial_json, header, method, path};
+    use wiremock::matchers::{body_bytes, body_partial_json, header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn doc(id: &str) -> Value {
@@ -2071,6 +2103,34 @@ mod tests {
         // `mod tests` is a child of the `http` module, so it can read the private
         // `url` field of `RtDbHttpClient`.
         assert_eq!(client.get_url("f1"), format!("{}/storage/f1", client.url));
+    }
+
+    #[tokio::test]
+    async fn get_signed_url_builds_get_with_optional_ttl() {
+        let (server, client) = setup().await;
+        // With ttl — asserts the query param is sent.
+        Mock::given(method("GET"))
+            .and(path("/api/storage/t%3Cuuid%3E/f1/signed-url"))
+            .and(query_param("ttlSeconds", "120"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "url": "http://x/storage/f1?exp=9&sig=ab", "expiresAt": 9
+            })))
+            .mount(&server)
+            .await;
+        let r = client.get_signed_url("f1", Some(120)).await.unwrap();
+        assert_eq!(r.url, "http://x/storage/f1?exp=9&sig=ab");
+        assert_eq!(r.expires_at, 9);
+
+        // Without ttl — no query param matcher, still matches by path.
+        Mock::given(method("GET"))
+            .and(path("/api/storage/t%3Cuuid%3E/f1/signed-url"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "url": "u", "expiresAt": 7
+            })))
+            .mount(&server)
+            .await;
+        let r = client.get_signed_url("f1", None).await.unwrap();
+        assert_eq!(r.expires_at, 7);
     }
 
     #[test]
