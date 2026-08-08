@@ -26,6 +26,7 @@ pub mod scheduler;
 pub mod schema;
 pub mod schema_diff;
 pub mod schema_history;
+pub mod signed_url;
 pub mod snapshot;
 pub mod storage;
 pub mod subs;
@@ -107,6 +108,9 @@ pub struct AppState {
     /// Per-db storage-usage cache (ENH-011). `Arc` — read on every growing
     /// write, refreshed lazily + eagerly.
     pub quotas: Arc<quota::UsageCache>,
+    /// HMAC key for signing time-limited storage URLs (derived once at boot from
+    /// `config.admin_key`). Shared by every request via `Arc`.
+    pub signed_url_key: Arc<ring::hmac::Key>,
 }
 
 impl AppState {
@@ -144,6 +148,7 @@ impl AppState {
         // Image transform cache shares the same `Arc<Metrics>` as Runtime and
         // the committers so its hit/miss/error counters surface on the dashboard.
         // Built before the struct literal so `metrics` can still move into Runtime.
+        let signed_url_key = Arc::new(signed_url::derive_key(&config.admin_key));
         let image = Arc::new(image_transform::TransformCache::new(
             image_transform::TransformConfig::from_config(&config),
             config.image_cache_bytes,
@@ -186,6 +191,7 @@ impl AppState {
             backup_running: Arc::new(AtomicBool::new(false)),
             image,
             quotas,
+            signed_url_key,
         })
     }
 }
