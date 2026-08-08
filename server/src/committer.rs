@@ -169,7 +169,6 @@ impl Committers {
             ttl_batch: self.ttl_batch,
             metrics: self.metrics.clone(),
             quotas: self.quotas.clone(),
-            quota_cache_ttl_secs: self.quota_cache_ttl_secs,
         }
     }
 
@@ -245,6 +244,18 @@ impl Committers {
             db.to_string(),
             tx.clone(),
             self.ttl_sweep_interval,
+        ));
+        // Per-db storage-quota cache warmer (ARC-004): periodically re-measures
+        // the db's on-disk size off the committer turn so `enforce` is a cheap
+        // stale-read. Same lifecycle as the reaper/cleanup tasks (exits on
+        // channel close or db removal); a no-op tick when no storage cap is set.
+        tokio::spawn(run_quota_warmer(
+            self.pool.clone(),
+            db.to_string(),
+            self.quotas.clone(),
+            self.hot.clone(),
+            std::time::Duration::from_secs(self.quota_cache_ttl_secs),
+            tx.clone(),
         ));
         guard.insert(db.to_string(), tx.clone());
         Ok(tx)
@@ -371,12 +382,60 @@ struct CommitterCtx {
     webhooks_enabled: bool,
     ttl_batch: i64,
     metrics: Arc<Metrics>,
-    /// Per-db storage-usage cache (ENH-011). Read on every growing write at the
-    /// three committer arms (`handle_mutate`/`handle_scheduled`/`handle_migrate`);
-    /// refreshed eagerly (post-commit spawn) and lazily (TTL-bounded stale read).
+    /// Per-db storage-usage cache (ENH-011). Stale-read by `enforce` at the three
+    /// committer arms (`handle_mutate`/`handle_scheduled`/`handle_migrate`) so the
+    /// serialized turn never blocks on `pg_total_relation_size` (ARC-004); kept
+    /// current by a per-db background warmer (`run_quota_warmer`) + the post-commit
+    /// refresh. The upload route reads it via `current_usage` (TTL-bounded).
     quotas: Arc<crate::quota::UsageCache>,
-    /// TTL for `quotas` fresh-cache lookups (mirrors `Config::quota_cache_ttl_secs`).
-    quota_cache_ttl_secs: u64,
+}
+
+/// Per-db storage-quota cache warmer (ARC-004). Periodically re-measures the
+/// db's on-disk size off the committer critical path so `quota::UsageCache::
+/// enforce` is a cheap stale-read on the hot path instead of a
+/// `pg_total_relation_size` scan that stalls the serialized write turn.
+///
+/// Mirrors the reaper/scheduler/cleanup lifecycle: self-terminates when the
+/// committer channel closes (its task died) or the database is dropped (the
+/// `database_exists` check). The first tick fires immediately to seed the
+/// cache, then once per `warm_interval`. Each tick reads the live hot config
+/// and skips the measure when no storage cap is configured
+/// (`max_storage_bytes_per_db == 0`, the default) — so quota-less dbs pay zero
+/// background scan cost, and a runtime cap enable via `PATCH /admin/config`
+/// takes effect on the next tick. Writes nothing to document tables; it only
+/// measures + updates the in-memory cache (a pure reader), so the single-writer
+/// invariant is intact.
+async fn run_quota_warmer(
+    pool: PgPool,
+    db: String,
+    quotas: Arc<crate::quota::UsageCache>,
+    hot: Arc<ArcSwap<HotConfig>>,
+    warm_interval: std::time::Duration,
+    committer_tx: mpsc::Sender<CommitterRequest>,
+) {
+    let mut tick = tokio::time::interval(warm_interval);
+    loop {
+        tokio::select! {
+            _ = committer_tx.closed() => {
+                tracing::debug!(db = %db, "quota warmer: committer channel closed, exiting");
+                return;
+            }
+            _ = tick.tick() => {
+                // No cap configured (default) → nothing to warm; keep looping
+                // so a runtime cap enable is picked up on the next tick.
+                if hot.load().max_storage_bytes_per_db == 0 {
+                    continue;
+                }
+                if matches!(database_exists(&pool, &db).await, Ok(false)) {
+                    tracing::info!(db = %db, "quota warmer: database removed, exiting");
+                    return;
+                }
+                if let Err(e) = quotas.refresh(&pool, &db).await {
+                    tracing::warn!(db = %db, error = %e, "quota warmer: storage refresh failed");
+                }
+            }
+        }
+    }
 }
 
 /// The per-db committer task loop: processes exactly one `CommitterRequest`
@@ -547,17 +606,15 @@ async fn handle_mutate(
     }
 
     let schema = ctx.schemas.get(&ctx.pool, &ctx.db).await?;
-    // ENH-011: enforce per-db storage cap before the first write. Uniform — no
-    // admin bypass — `enforce(cap=0)` is a no-op, so an unset cap is the fast
-    // path. Best-effort post-commit `refresh` keeps the cache honest; a stale
-    // entry would either over-block (until TTL) or under-block (within one
-    // `quota_cache_ttl_secs` window of a write) — over-blocking is the safe side.
+    // ENH-011 / ARC-004: enforce per-db storage cap before the first write.
+    // Uniform — no admin bypass — `enforce(cap=0)` is a no-op, so an unset cap
+    // is the fast path. `enforce` is a cheap stale-read on the hot path (no
+    // `pg_total_relation_size` scan in the serialized turn); a per-db background
+    // warmer (`run_quota_warmer`) plus this path's post-commit refresh keep the
+    // reading current, and the only inline measure is a one-time cold start.
     let storage_cap = ctx.hot.load().max_storage_bytes_per_db;
     if storage_cap > 0
-        && let Err(e) = ctx
-            .quotas
-            .enforce(&ctx.pool, &ctx.db, storage_cap, ctx.quota_cache_ttl_secs)
-            .await
+        && let Err(e) = ctx.quotas.enforce(&ctx.pool, &ctx.db, storage_cap).await
     {
         ctx.metrics
             .record_quota_rejection(&ctx.db, crate::metrics::QuotaKind::Storage);
@@ -621,7 +678,8 @@ async fn handle_scheduled(
             return Err(err);
         }
     };
-    // ENH-011: enforce per-db storage cap before the scheduled write. A
+    // ENH-011 / ARC-004: enforce per-db storage cap (best-effort stale-read,
+    // kept current by the background warmer) before the scheduled write. A
     // scheduled job has no interactive principal; on rejection, mirror the
     // execute_txn-failure path below — record the quota metric, mark the job
     // row errored (so it surfaces in the scheduler admin UI), and return
@@ -629,10 +687,7 @@ async fn handle_scheduled(
     // fire-and-forget, no caller to surface it to). Uniform — no admin bypass.
     let storage_cap = ctx.hot.load().max_storage_bytes_per_db;
     if storage_cap > 0
-        && let Err(e) = ctx
-            .quotas
-            .enforce(&ctx.pool, &ctx.db, storage_cap, ctx.quota_cache_ttl_secs)
-            .await
+        && let Err(e) = ctx.quotas.enforce(&ctx.pool, &ctx.db, storage_cap).await
     {
         ctx.metrics
             .record_quota_rejection(&ctx.db, crate::metrics::QuotaKind::Storage);
@@ -832,13 +887,14 @@ async fn handle_migrate(
             ctx.metrics
                 .record_quota_rejection(&ctx.db, crate::metrics::QuotaKind::Tables);
         })?;
-    // ENH-011: enforce per-db storage cap before the migration writes. Uniform
-    // — no admin bypass (migrate is admin-only, but a cap applies the same as
-    // any other growing write). `enforce(cap=0)` is a no-op (unset cap).
+    // ENH-011 / ARC-004: enforce per-db storage cap (best-effort stale-read,
+    // kept current by the background warmer) before the migration writes.
+    // Uniform — no admin bypass (migrate is admin-only, but a cap applies the
+    // same as any other growing write). `enforce(cap=0)` is a no-op (unset cap).
     let storage_cap = ctx.hot.load().max_storage_bytes_per_db;
     if storage_cap > 0 {
         ctx.quotas
-            .enforce(&ctx.pool, &ctx.db, storage_cap, ctx.quota_cache_ttl_secs)
+            .enforce(&ctx.pool, &ctx.db, storage_cap)
             .await
             .inspect_err(|_e| {
                 ctx.metrics

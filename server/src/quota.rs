@@ -3,8 +3,10 @@
 //! `UsageCache` is the storage-measurement + cache foundation that the
 //! transport-layer enforcement points (Tasks 6 and 7) call into. It mirrors
 //! the Arc-shared-state pattern of `image::TransformCache` / `HotConfig`:
-//! cheap to clone (one `Arc`), lock-free over the async size query, and
-//! refreshed lazily (stale-read) + eagerly (post-commit spawn).
+//! cheap to clone (one `Arc`), lock-free over the async size query, and kept
+//! current three ways: a per-db background warmer (`committer::run_quota_warmer`,
+//! ARC-004), a stale-read on the hot path (`enforce`), and an eager post-commit
+//! refresh.
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -19,9 +21,11 @@ pub struct StorageUsage {
     pub computed_at_ms: i64,
 }
 
-/// Per-db storage-usage cache. Read on every growing write; refreshed lazily
-/// (stale read) + eagerly (post-commit spawn). Mirrors the Arc-shared-state
-/// pattern of `image::TransformCache` / `HotConfig`.
+/// Per-db storage-usage cache. Read on every growing write; kept current by a
+/// per-db background warmer + a post-commit refresh, and stale-read by `enforce`
+/// on the committer hot path so the serialized write turn never blocks on a
+/// `pg_total_relation_size` scan (ARC-004). Mirrors the Arc-shared-state pattern
+/// of `image::TransformCache` / `HotConfig`.
 #[derive(Clone)]
 pub struct UsageCache {
     // RwLock: read-lock for the hot lookup, write-lock only for the brief
@@ -112,19 +116,50 @@ impl UsageCache {
         Ok(b)
     }
 
-    /// Enforce a storage cap (0 = unlimited). Returns usage so callers can add
-    /// to it (e.g. upload adds the incoming blob size).
-    pub async fn enforce(
-        &self,
-        pool: &PgPool,
-        db: &str,
-        cap: u64,
-        ttl_secs: u64,
-    ) -> Result<u64, RtDbError> {
+    /// Pure in-memory read of the last cached reading for `db`, regardless of
+    /// age (no TTL check, no DB query). `None` only on a true cold start —
+    /// before any reading has been taken. This is the hot-path primitive
+    /// `enforce` stale-reads so the serialized committer turn never blocks on
+    /// `pg_total_relation_size` (ARC-004). Contrast `fresh`, which returns
+    /// `None` once a reading is older than the TTL and is what the
+    /// measure-on-miss paths (`current_usage` / the upload route) key on.
+    pub fn cached_usage(&self, db: &str) -> Option<u64> {
+        // See `fresh` for the unwrap_or_else(into_inner) rationale (QA-007).
+        let map = self.inner.read().unwrap_or_else(|e| e.into_inner());
+        map.get(db).map(|u| u.bytes)
+    }
+
+    /// Enforce a storage cap (0 = unlimited) on the committer critical path.
+    ///
+    /// **Best-effort stale-read (ARC-004):** when any cached reading exists —
+    /// fresh *or* stale — it is used directly and no DB query runs, so a warm
+    /// db's serialized write turn never stalls on `pg_total_relation_size`. A
+    /// per-db background warmer (`committer::run_quota_warmer`) plus the
+    /// post-commit refresh keep the reading current, so a stale read is
+    /// bounded-stale, never unbounded. The upload route calls `current_usage`
+    /// (TTL-bounded, measure-on-miss) directly when it needs the exact figure.
+    ///
+    /// The single remaining inline `measure` is the true cold start: the first
+    /// enforce on a db that has no reading yet (server boot / db create, before
+    /// the warmer has ticked). That is a one-time warmup, not the recurring
+    /// per-TTL-window stall ARC-004 removed. Returns the usage so a caller can
+    /// reason about headroom (the committer arms ignore it).
+    pub async fn enforce(&self, pool: &PgPool, db: &str, cap: u64) -> Result<u64, RtDbError> {
         if cap == 0 {
             return Ok(0);
         }
-        let usage = self.current_usage(pool, db, ttl_secs).await?;
+        // Stale-read: any entry, regardless of age, avoids a hot-path measure.
+        if let Some(usage) = self.cached_usage(db) {
+            if usage >= cap {
+                return Err(RtDbError::quota_exceeded(format!(
+                    "storage for db '{db}' is {usage} bytes, limit is {cap}"
+                )));
+            }
+            return Ok(usage);
+        }
+        // Cold start: no reading yet — measure once to seed + enforce accurately.
+        let usage = Self::measure(pool, db).await?;
+        self.store(db, usage);
         if usage >= cap {
             return Err(RtDbError::quota_exceeded(format!(
                 "storage for db '{db}' is {usage} bytes, limit is {cap}"
@@ -182,5 +217,36 @@ mod tests {
         c.store("db1", 1);
         c.evict("db1");
         assert!(c.fresh("db1", 60).is_none());
+    }
+
+    #[test]
+    fn cached_usage_none_when_empty() {
+        assert!(UsageCache::new().cached_usage("db1").is_none());
+    }
+
+    #[test]
+    fn cached_usage_returns_fresh_entry() {
+        let c = UsageCache::new();
+        c.store("db1", 12345);
+        assert_eq!(c.cached_usage("db1"), Some(12345));
+    }
+
+    // ARC-004: the hot-path stale-read primitive. An entry older than the TTL
+    // must still be returned by `cached_usage` (so `enforce` uses it and does
+    // NOT re-measure), even though `fresh` returns `None` for the same entry —
+    // that `None` is exactly what the old inline-measure path keyed on. This
+    // contrast is the behavior delta ARC-004 introduced.
+    #[test]
+    fn cached_usage_returns_stale_entry_that_fresh_evicts() {
+        let c = UsageCache::new();
+        c.inner.write().unwrap().insert(
+            "db1".to_string(),
+            StorageUsage {
+                bytes: 9999,
+                computed_at_ms: now_ms() - 120_000,
+            },
+        );
+        assert_eq!(c.fresh("db1", 60), None); // older than TTL
+        assert_eq!(c.cached_usage("db1"), Some(9999)); // but enforce still uses it
     }
 }
