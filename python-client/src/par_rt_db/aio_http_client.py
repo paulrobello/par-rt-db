@@ -36,6 +36,7 @@ from .http_client import (
     MigrateResult,
     MintedToken,
     OpEvent,
+    SignedUrl,
     TokenInfo,
     UploadResult,
 )
@@ -260,6 +261,12 @@ class RtDbAsyncHttpClient:
         """``GET /api/storage/{db}/{id}/metadata`` → stored file metadata."""
         resp = await self._send("GET", f"/api/storage/{self._db}/{id}/metadata")
         return FileMetadata.model_validate(resp.json())
+
+    async def get_signed_url(self, id: str, *, ttl_seconds: int | None = None) -> SignedUrl:
+        """``GET /api/storage/{db}/{id}/signed-url`` → ``SignedUrl`` (async)."""
+        params = {"ttlSeconds": ttl_seconds} if ttl_seconds is not None else None
+        resp = await self._send("GET", f"/api/storage/{self._db}/{id}/signed-url", params=params)
+        return SignedUrl.model_validate(resp.json())
 
     def get_url(self, id: str) -> str:
         """The public serve URL (``GET /storage/{id}``) — no request is made."""

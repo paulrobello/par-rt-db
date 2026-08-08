@@ -1270,3 +1270,41 @@ def test_context_manager_closes_client() -> None:
     # After exit the underlying httpx.Client is closed; further requests raise.
     with pytest.raises(RuntimeError):
         client.list_dbs()
+
+
+# --- storage: signed url ----------------------------------------------------
+
+
+def test_get_signed_url_omits_ttl_by_default():
+    seen: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.startswith("/api/storage/") and path.endswith("/signed-url"):
+            seen["query"] = str(request.url.params)
+            return httpx.Response(
+                200,
+                json={"url": "http://x/storage/f1?exp=9&sig=ab", "expiresAt": 9},
+            )
+        return httpx.Response(404)
+
+    c = _client(handler)
+    r = c.get_signed_url("f1")
+    from par_rt_db.http_client import SignedUrl
+
+    assert isinstance(r, SignedUrl)
+    assert r.url == "http://x/storage/f1?exp=9&sig=ab"
+    assert r.expires_at == 9
+    assert seen["query"] == ""  # no ttlSeconds param
+
+
+def test_get_signed_url_passes_ttl_seconds():
+    seen: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["ttl"] = request.url.params.get("ttlSeconds")
+        return httpx.Response(200, json={"url": "u", "expiresAt": 9})
+
+    c = _client(handler)
+    c.get_signed_url("f1", ttl_seconds=120)
+    assert seen["ttl"] == "120"

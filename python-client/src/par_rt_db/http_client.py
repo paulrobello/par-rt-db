@@ -81,6 +81,14 @@ class FileMetadata(_Wire):
     creation_time: int
 
 
+class SignedUrl(_Wire):
+    """``GET /api/storage/{db}/{id}/signed-url`` response: a time-limited signed
+    serve URL and its absolute expiry (epoch milliseconds)."""
+
+    url: str
+    expires_at: int
+
+
 class AdminMember(_Wire):
     """``GET /admin/admins`` row — ``{email, githubId?}``."""
 
@@ -636,6 +644,16 @@ class RtDbHttpClient:
         """``GET /api/storage/{db}/{id}/metadata`` → stored file metadata."""
         resp = self._send("GET", f"/api/storage/{self._db}/{id}/metadata")
         return FileMetadata.model_validate(resp.json())
+
+    def get_signed_url(self, id: str, *, ttl_seconds: int | None = None) -> SignedUrl:
+        """``GET /api/storage/{db}/{id}/signed-url`` → ``SignedUrl``.
+
+        ``ttl_seconds`` is optional (server default 1h, capped at 7d); when
+        ``None`` the request omits the query parameter.
+        """
+        params = {"ttlSeconds": ttl_seconds} if ttl_seconds is not None else None
+        resp = self._send("GET", f"/api/storage/{self._db}/{id}/signed-url", params=params)
+        return SignedUrl.model_validate(resp.json())
 
     def get_url(self, id: str) -> str:
         """The public serve URL (``GET /storage/{id}``) — no request is made."""

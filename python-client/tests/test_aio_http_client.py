@@ -429,6 +429,19 @@ async def test_get_file_metadata_returns_file_metadata_model() -> None:
     assert meta.content_type is None  # omitted by the server → default
 
 
+async def test_async_get_signed_url_passes_ttl() -> None:
+    seen: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["ttl"] = request.url.params.get("ttlSeconds")
+        return httpx.Response(200, json={"url": "u", "expiresAt": 9})
+
+    async with _client(handler) as c:
+        r = await c.get_signed_url("f1", ttl_seconds=90)
+    assert r.expires_at == 9
+    assert seen["ttl"] == "90"
+
+
 def test_get_url_is_base_plus_storage_id_no_request() -> None:
     # No mock handler installed → any request would fail; get_url makes none.
     client = _client(lambda r: httpx.Response(500))
