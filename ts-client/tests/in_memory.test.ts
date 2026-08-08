@@ -1794,3 +1794,169 @@ describe("InMemoryRtDbClient — partial unique index (where predicate)", () => 
     ).rejects.toMatchObject({ name: "RtDbError", code: "CONFLICT" });
   });
 });
+
+describe("InMemoryRtDbClient — full-text search", () => {
+  const searchSchema = defineSchema({
+    notes: defineTable({
+      title: t.string(),
+      body: t.string(),
+    }).searchIndex("search_text", ["title", "body"]),
+  });
+  const searchApi = createApi(searchSchema);
+
+  function searchClient(): InMemoryRtDbClient {
+    let ms = 1_700_000_000_000;
+    const c = new InMemoryRtDbClient({ now: () => ms++, random: () => 0 });
+    c.pushSchema(searchSchema);
+    return c;
+  }
+
+  async function seed(c: InMemoryRtDbClient): Promise<void> {
+    await c.mutate(
+      mutation().insert("notes", { title: "Alpha release", body: "ship the new search" }).build(),
+    );
+    await c.mutate(
+      mutation().insert("notes", { title: "Beta plan", body: "refine search ranking" }).build(),
+    );
+    await c.mutate(mutation().insert("notes", { title: "Unrelated", body: "lunch menu" }).build());
+  }
+
+  it("matches docs whose indexed text contains the query token", async () => {
+    const c = searchClient();
+    await seed(c);
+    const docs = (await c.query(
+      searchApi.notes.query().search("search_text", "search").take(10),
+    )) as Array<{ title: string }>;
+    expect(docs.map((d) => d.title).sort()).toEqual(["Alpha release", "Beta plan"]);
+  });
+
+  it("returns [] when no doc contains the query token", async () => {
+    const c = searchClient();
+    await seed(c);
+    const docs = await c.query(
+      searchApi.notes.query().search("search_text", "nonexistent").take(10),
+    );
+    expect(docs).toEqual([]);
+  });
+
+  it("requires every query token to be present (token-AND, not OR)", async () => {
+    const c = searchClient();
+    await seed(c);
+    // "lunch" + "search" never co-occur ⇒ AND yields no match
+    const none = await c.query(
+      searchApi.notes.query().search("search_text", "lunch search").take(10),
+    );
+    expect(none).toEqual([]);
+    // "search" + "ranking" co-occur only in the Beta note
+    const ranked = (await c.query(
+      searchApi.notes.query().search("search_text", "search ranking").take(10),
+    )) as Array<{ title: string }>;
+    expect(ranked.map((d) => d.title)).toEqual(["Beta plan"]);
+  });
+
+  it("respects take(N)", async () => {
+    const c = searchClient();
+    await seed(c);
+    const docs = await c.query(searchApi.notes.query().search("search_text", "search").take(1));
+    expect(docs).toHaveLength(1);
+  });
+
+  it("rejects an empty query (BAD_REQUEST)", async () => {
+    const c = searchClient();
+    await seed(c);
+    await expect(
+      c.query(searchApi.notes.query().search("search_text", "   ").take(10)),
+    ).rejects.toThrow(/search query text must not be empty/);
+  });
+
+  it("rejects an unknown search index (BAD_REQUEST)", async () => {
+    const c = searchClient();
+    await seed(c);
+    await expect(c.query(searchApi.notes.query().search("nope", "x").take(10))).rejects.toThrow(
+      /search index 'nope' not found/,
+    );
+  });
+});
+
+describe("InMemoryRtDbClient — admin surface", () => {
+  it("getAudit returns seeded rows newest-first in the documented shape", async () => {
+    const c = newClient();
+    c.admin.seedAudit([
+      {
+        tsMs: 100,
+        db: "db",
+        table: "items",
+        op: "insert",
+        docId: "a",
+        principal: "u1",
+        source: "client",
+      },
+      { tsMs: 300, table: "items", op: "patch", docId: "b" },
+      { tsMs: 200, table: "items", op: "delete", docId: "c" },
+    ]);
+    const rows = await c.admin.getAudit();
+    expect(rows.map((r) => r.docId)).toEqual(["b", "c", "a"]); // newest tsMs first
+    expect(rows[0]).toMatchObject({
+      id: 2,
+      tsMs: 300,
+      db: "db",
+      table: "items",
+      op: "patch",
+      docId: "b",
+      principal: null,
+      source: "client",
+    });
+  });
+
+  it("getAudit filters by table/op/principal and pages with limit/offset", async () => {
+    const c = newClient();
+    c.admin.seedAudit([
+      { tsMs: 1, table: "items", op: "insert", docId: "a", principal: "u1" },
+      { tsMs: 2, table: "items", op: "insert", docId: "b", principal: "u2" },
+      { tsMs: 3, table: "notes", op: "insert", docId: "c", principal: "u1" },
+    ]);
+    expect((await c.admin.getAudit({ op: "insert" })).length).toBe(3);
+    expect((await c.admin.getAudit({ principal: "u1" })).map((r) => r.docId).sort()).toEqual([
+      "a",
+      "c",
+    ]);
+    // Newest-first order is [c, b, a]; offset 1 + limit 1 ⇒ [b].
+    const paged = await c.admin.getAudit({ limit: 1, offset: 1 });
+    expect(paged).toHaveLength(1);
+    expect(paged[0].docId).toBe("b");
+  });
+
+  it("getAudit returns [] when nothing is seeded or nothing matches", async () => {
+    const c = newClient();
+    expect(await c.admin.getAudit()).toEqual([]);
+    c.admin.seedAudit([{ tsMs: 1, table: "items", op: "insert", docId: "a" }]);
+    expect(await c.admin.getAudit({ table: "nope" })).toEqual([]);
+  });
+
+  it("listSubscriptions reflects registered subscriptions and clears on unsubscribe", async () => {
+    const c = newClient();
+    expect((await c.admin.listSubscriptions()).subscriptions).toEqual([]);
+    const unsub = c.subscribe(api.items.query().withIndex("by_status", ["todo"]).count(), () => {});
+    const res = await c.admin.listSubscriptions();
+    expect(res.subscriptions).toHaveLength(1);
+    expect(res.subscriptions[0]).toMatchObject({
+      db: "db",
+      table: "items",
+      terminal: "count",
+      readSetClass: "indexed",
+      principal: null,
+    });
+    expect(res.perDb).toHaveLength(1);
+    unsub();
+    expect((await c.admin.listSubscriptions()).subscriptions).toEqual([]);
+  });
+
+  it("listSubscriptions filters by db", async () => {
+    const c = newClient();
+    c.subscribe(api.items.query().collect(), () => {});
+    const other = await c.admin.listSubscriptions({ db: "other" });
+    expect(other.subscriptions).toEqual([]);
+    const mine = await c.admin.listSubscriptions({ db: "db" });
+    expect(mine.subscriptions).toHaveLength(1);
+  });
+});

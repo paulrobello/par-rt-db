@@ -101,15 +101,19 @@ export type {
   BackupFile,
   BackupsListResponse,
   CreateWebhookOptions,
+  DbSubCounters,
   EditWebhookOptions,
   GetAuditOptions,
   ListDeliveriesOptions,
   RestoreResult,
   RtDbAdminClientOptions,
+  SubscriptionInfo,
+  SubscriptionsPrincipal,
+  SubscriptionsResponse,
   Webhook,
   WebhookDelivery,
 } from "./admin.js";
 export { RtDbClient } from "./client.js";
 export type { AuthState, ConnectionState, RtDbClientOptions, WebSocketLike } from "./client.js";
-export { InMemoryRtDbClient, PresenceRooms } from "./in_memory.js";
+export { InMemoryAdminClient, InMemoryRtDbClient, PresenceRooms } from "./in_memory.js";
 export type { InMemoryRtDbClientOptions } from "./in_memory.js";

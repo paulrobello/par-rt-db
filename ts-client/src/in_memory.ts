@@ -26,6 +26,13 @@ import type {
 } from "./protocol.js";
 import type { RtQuery } from "./query.js";
 import type { SchemaDefinition } from "./schema.js";
+import type {
+  AuditEntry,
+  DbSubCounters,
+  GetAuditOptions,
+  SubscriptionInfo,
+  SubscriptionsResponse,
+} from "./admin.js";
 
 /**
  * In-memory implementation of the par-rt-db client for unit tests.
@@ -48,6 +55,23 @@ import type { SchemaDefinition } from "./schema.js";
 
 const MAX_STEPS = 256;
 const MAX_TAKE = 4096;
+
+/** Lowercase a value to FTS-indexable text. Mirrors the text the server feeds
+ * into a search index's generated tsvector for a declared field. */
+function ftsStringify(v: unknown): string {
+  if (v === null || v === undefined) return "";
+  if (typeof v === "string") return v;
+  if (typeof v === "number" || typeof v === "boolean") return String(v);
+  return JSON.stringify(v);
+}
+
+/** Split text into lowercase word tokens — an approximation of the lexemes
+ * `plainto_tsquery` produces, close enough for match/no-match test parity.
+ * Stemming/stopwords are deliberately not replicated (a deterministic stand-in
+ * is sufficient; exact `ts_rank` ordering is out of scope for the harness). */
+function ftsTokens(s: string): string[] {
+  return s.toLowerCase().match(/[a-z0-9]+/g) ?? [];
+}
 
 /** Indexed-column storage type, mirroring server `indexed_column_type`. */
 type PgType = "text" | "number" | "boolean" | "int64";
@@ -938,6 +962,7 @@ export class InMemoryRtDbClient {
    * apart at a glance. */
   readonly connectionId: string;
   private idCounter = 0;
+  private _admin?: InMemoryAdminClient;
 
   constructor(options: InMemoryRtDbClientOptions = {}) {
     this.now = options.now ?? (() => Date.now());
@@ -945,6 +970,17 @@ export class InMemoryRtDbClient {
     this.presenceRooms = options.presenceRooms ?? new PresenceRooms();
     this.presenceUser = options.presenceUser ?? { kind: "user" };
     this.connectionId = options.connectionId ?? `c${(++this.idCounter).toString(36)}`;
+  }
+
+  /** In-memory admin surface mirroring `RtDbAdminClient`: a seedable audit log
+   *  (`getAudit`) and the live subscription inspector (`listSubscriptions`).
+   *  Bound to this client's state (shares the subscription registry + clock) so
+   *  admin-keyed consumers can be unit-tested with no network. */
+  get admin(): InMemoryAdminClient {
+    if (!this._admin) {
+      this._admin = new InMemoryAdminClient({ now: this.now, subs: this.subs });
+    }
+    return this._admin;
   }
 
   /** Installs `schema` as this client's sole in-memory database schema. The
@@ -1951,8 +1987,9 @@ export class InMemoryRtDbClient {
 
     // Full-text search terminal. Cascade mirror of server `execute_query`:
     // `search` composes only with `take`; every other terminal is rejected. The
-    // in-memory replica does not rank by ts_rank, but the guard exists so the
-    // cascade agrees with the server.
+    // in-memory replica matches by `plainto_tsquery` token-AND (a deterministic
+    // relevance stand-in, not `ts_rank`) so match/no-match agrees with the
+    // server while the combination guards agree too.
     if (q.search !== undefined) {
       if (
         q.index !== undefined ||
@@ -1974,9 +2011,59 @@ export class InMemoryRtDbClient {
           "search cannot be combined with index, eq, range bounds, order, unique, first, count, distinct, aggregate, paginate, filter, or vector search",
         );
       }
-      // No in-memory full-text ranking; return an empty result rather than
-      // silently misranking by falling through to the collect path.
-      return [];
+      // Full-text matching (not ts_rank ordering): mirror `plainto_tsquery`
+      // token-AND semantics closely enough that a unit test can assert
+      // match/no-match. The query is tokenized into lowercase word lexemes and a
+      // doc matches when every query lexeme appears in the concatenated text of
+      // the search index's declared fields. Ranking is a deterministic stand-in
+      // (query-lexeme frequency desc, then `created_at` desc, then `id` desc) —
+      // exact `ts_rank` order is intentionally not replicated. `take` (already
+      // capped to MAX_TAKE above) limits the result.
+      const search = q.search;
+      if (search.query.trim().length === 0) {
+        throw new RtDbError("BAD_REQUEST", "search query text must not be empty");
+      }
+      const searchDef = tableDef.indexes?.find((i) => i.name === search.index && i.search);
+      if (!searchDef) {
+        throw new RtDbError("BAD_REQUEST", `search index '${search.index}' not found`);
+      }
+      const queryTokens = [...new Set(ftsTokens(search.query))];
+      const limit = q.take ?? MAX_TAKE;
+      if (queryTokens.length === 0) {
+        return [];
+      }
+      const scored: Array<{ row: StoredRow; score: number }> = [];
+      for (const row of this.rowsFor(q.table).values()) {
+        const docTokens = ftsTokens(
+          searchDef.fields.map((f) => ftsStringify(row.doc[f])).join(" "),
+        );
+        let score = 0;
+        let allPresent = true;
+        for (const qt of queryTokens) {
+          let occurrences = 0;
+          for (const dt of docTokens) {
+            if (dt === qt) occurrences++;
+          }
+          if (occurrences === 0) {
+            allPresent = false;
+            break;
+          }
+          score += occurrences;
+        }
+        if (allPresent) scored.push({ row, score });
+      }
+      scored.sort((a, b) =>
+        a.score !== b.score
+          ? b.score - a.score
+          : a.row.createdAt !== b.row.createdAt
+            ? b.row.createdAt - a.row.createdAt
+            : a.row.id > b.row.id
+              ? -1
+              : a.row.id < b.row.id
+                ? 1
+                : 0,
+      );
+      return scored.slice(0, limit).map((s) => this.mergeDoc(s.row));
     }
 
     const indexDef: IndexJson | null = q.index
@@ -2474,5 +2561,145 @@ export class InMemoryRtDbClient {
     for (const [tableName, rows] of snapshot) {
       this.tables.set(tableName, rows);
     }
+  }
+}
+
+/** The single database name the in-memory harness models (it is single-db).
+ *  Surfaced on audit rows and the subscription inspector for shape parity with
+ *  `RtDbAdminClient`, which reads per-db data on a real multi-db server. */
+const IN_MEMORY_DB = "db";
+
+/** Terminal step kind a query resolves to (the `terminal` field the server
+ *  reports on `GET /admin/subscriptions`). Best-effort derivation from the
+ *  query JSON — sufficient for shape parity in the harness. */
+function queryTerminal(q: QueryJson): string {
+  if (q.get !== undefined) return "get";
+  if (q.count) return "count";
+  if (q.first) return "first";
+  if (q.unique) return "unique";
+  if (q.distinct) return "distinct";
+  if (q.aggregate !== undefined) return "aggregate";
+  if (q.paginate !== undefined) return "paginate";
+  if (q.search !== undefined) return "search";
+  if (q.vectorSearch !== undefined) return "vectorSearch";
+  if (q.hybridSearch !== undefined) return "hybridSearch";
+  return "collect";
+}
+
+/** Invalidation class the committer would assign (the `readSetClass` field the
+ *  server reports): point reads, indexed (eq/range) reads, ordered (take/first)
+ *  reads, else table-level. Best-effort — the harness does not track the real
+ *  skip logic, only the shape. */
+function queryReadSetClass(q: QueryJson): string {
+  if (q.get !== undefined) return "point";
+  const hasIndex =
+    q.index !== undefined ||
+    (q.eq?.length ?? 0) > 0 ||
+    q.gt !== undefined ||
+    q.gte !== undefined ||
+    q.lt !== undefined ||
+    q.lte !== undefined;
+  if (q.order !== undefined || q.first || q.take !== undefined) return "ordered";
+  if (hasIndex) return "indexed";
+  return "table";
+}
+
+/** In-memory admin surface mirroring `RtDbAdminClient`: a seedable durable
+ *  audit log (`getAudit`) and the live subscription inspector
+ *  (`listSubscriptions`). Bound to an `InMemoryRtDbClient`'s clock and
+ *  subscription registry so admin-keyed consumers (audit backstops, quota
+ *  inspection) are unit-testable with no network. The harness does not track
+ *  invalidation counters, so those totals read zero; the audit log is seedable
+ *  rather than auto-recorded (tests assert the read shape, not DocOp
+ *  provenance). */
+export class InMemoryAdminClient {
+  private readonly auditLog: AuditEntry[] = [];
+  private auditSeq = 0;
+
+  constructor(private readonly backplane: { now: () => number; subs: readonly Subscription[] }) {}
+
+  /** Seed audit rows directly (test affordance). `id` auto-increments when
+   *  omitted; `tsMs` defaults to the host clock; `op`/`principal` default to
+   *  null and the rest to empty strings, matching the `AuditEntry` shape. */
+  seedAudit(rows: Array<Partial<AuditEntry>>): void {
+    for (const row of rows) {
+      const id = row.id ?? ++this.auditSeq;
+      if (row.id !== undefined && row.id > this.auditSeq) this.auditSeq = row.id;
+      this.auditLog.push({
+        id,
+        tsMs: row.tsMs ?? this.backplane.now(),
+        db: row.db ?? IN_MEMORY_DB,
+        table: row.table ?? "",
+        op: row.op ?? null,
+        docId: row.docId ?? "",
+        principal: row.principal ?? null,
+        source: row.source ?? "client",
+      });
+    }
+  }
+
+  /** Durable audit-log entries, newest-first, mirroring `GET /admin/audit`.
+   *  Each of `db`/`table`/`op`/`principal`/`source` is an optional equality
+   *  filter (combined AND); `limit`/`offset` page (defaults 100/0). */
+  getAudit(opts?: GetAuditOptions): Promise<AuditEntry[]> {
+    let rows = this.auditLog;
+    if (opts?.db) rows = rows.filter((r) => r.db === opts.db);
+    if (opts?.table) rows = rows.filter((r) => r.table === opts.table);
+    if (opts?.op) rows = rows.filter((r) => r.op === opts.op);
+    if (opts?.principal) rows = rows.filter((r) => r.principal === opts.principal);
+    if (opts?.source) rows = rows.filter((r) => r.source === opts.source);
+    const sorted = [...rows].sort((a, b) => (a.tsMs !== b.tsMs ? b.tsMs - a.tsMs : b.id - a.id));
+    const offset = opts?.offset ?? 0;
+    const limit = opts?.limit ?? 100;
+    return Promise.resolve(sorted.slice(offset, offset + limit));
+  }
+
+  /** Live subscription inspector, mirroring `GET /admin/subscriptions`. Returns
+   *  the currently-registered queries as `SubscriptionInfo` rows plus per-db
+   *  rollup. Invalidation totals read zero (the harness does not track them). */
+  listSubscriptions(opts?: { db?: string }): Promise<SubscriptionsResponse> {
+    if (opts?.db && opts.db !== IN_MEMORY_DB) {
+      return Promise.resolve(this.emptySubscriptions());
+    }
+    const subscriptions: SubscriptionInfo[] = this.backplane.subs.map((s) => ({
+      db: IN_MEMORY_DB,
+      table: s.table,
+      terminal: queryTerminal(s.query),
+      readSetClass: queryReadSetClass(s.query),
+      principal: null,
+    }));
+    const perDb: DbSubCounters[] = subscriptions.length
+      ? [
+          {
+            db: IN_MEMORY_DB,
+            reruns: 0,
+            skipsPoint: 0,
+            skipsIndexed: 0,
+            skipsOrdered: 0,
+            missed: 0,
+          },
+        ]
+      : [];
+    return Promise.resolve({
+      subscriptions,
+      subsRerunsTotal: 0,
+      subsSkipsPointTotal: 0,
+      subsSkipsIndexedTotal: 0,
+      subsSkipsOrderedTotal: 0,
+      subsMissedPushesTotal: 0,
+      perDb,
+    });
+  }
+
+  private emptySubscriptions(): SubscriptionsResponse {
+    return {
+      subscriptions: [],
+      subsRerunsTotal: 0,
+      subsSkipsPointTotal: 0,
+      subsSkipsIndexedTotal: 0,
+      subsSkipsOrderedTotal: 0,
+      subsMissedPushesTotal: 0,
+      perDb: [],
+    };
   }
 }
