@@ -11,7 +11,7 @@
 ## Global Constraints
 
 - **Zero new environment variables.** The signing key is derived from `admin_key` (`HMAC-SHA256(admin_key, "rtdb-storage-signing-v1")`); do NOT add any `RTDB_*` var, and do NOT touch `.env.example` or `docker-compose.yml` (the env-drift gate would otherwise fail).
-- **No new crate dependencies.** Use `ring::hmac` (already a server dep via the Apple JWT backend) and `hex` (already used by `storage.rs`).
+- **No new vendor crates.** Use `ring::hmac` and `hex` (hex is already a runtime dep via `storage.rs`). NOTE: `ring` was a `[dev-dependencies]` entry in `server/Cargo.toml`; Task 1 promoted it to `[dependencies]`. It is already compiled transitively via rustls (sqlx `tls-rustls` + reqwest `rustls-tls`), so promotion adds zero new build/binary weight. (Corrects the original spec/plan's incorrect claim that ring was already a runtime dep.)
 - **Wire shape is camelCase** `{ "url": "<string>", "expiresAt": <i64 epoch-ms> }` across server + all clients — match exactly.
 - **Additive only.** A request to `GET /storage/{id}` with no `exp`/`sig` must behave exactly as before (public 200). Never gate the existing public route.
 - **Constant-time verification** via `ring::hmac::verify`; signature failures return `RtDbError::forbidden` (HTTP 403, code `FORBIDDEN`, generic message "invalid or expired signature").
