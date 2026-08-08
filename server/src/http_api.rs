@@ -21,6 +21,7 @@ use crate::protocol::{ScheduleInfo, ScheduleWhen};
 use crate::query::{Query, QueryResult, execute_query};
 use crate::rate_limit::{check_http_rate_limits, check_storage_public_rate_limit};
 use crate::scheduler;
+use crate::signed_url;
 use crate::storage;
 use crate::txn::Transaction;
 
@@ -375,6 +376,9 @@ pub fn http_api_routes() -> Router<Arc<AppState>> {
         )
         // Metadata — same auth + cross-db isolation as authed serve.
         .route("/api/storage/{db}/{id}/metadata", get(metadata_handler))
+        // Mint a signed, time-limited URL — same auth as authed serve; the
+        // holder fetches via `GET /storage/{id}?exp=&sig=` until expiry.
+        .route("/api/storage/{db}/{id}/signed-url", get(signed_url_handler))
         // Public, unauthenticated serve — the one unauthenticated route in the
         // server, by design. The opaque id resolves to its owning db via the
         // global index.
@@ -473,6 +477,42 @@ async fn upload_handler(
     }))
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SignedUrlResponse {
+    url: String,
+    expires_at: i64,
+}
+
+/// Mint a signed, time-limited URL for `{id}`. Same auth as authed serve
+/// (`bearer → authorize(db)`); the returned URL is fetched via
+/// `GET /storage/{id}?exp=&sig=` until `expiresAt`. Minting is pure
+/// computation — no DB write, no committer.
+async fn signed_url_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((db, id)): Path<(String, String)>,
+    AxumQuery(q): AxumQuery<HashMap<String, String>>,
+) -> Result<Json<SignedUrlResponse>, RtDbError> {
+    let token = bearer_token(&headers)?;
+    let principal = resolve_bearer(&state.pool, token).await?;
+    authorize(&state.pool, &principal, &db).await?;
+    check_http_rate_limits(&state, &principal, &db).await?;
+    let ttl = q
+        .get("ttlSeconds")
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(signed_url::DEFAULT_SIGNED_URL_TTL_SECS)
+        .clamp(1, signed_url::MAX_SIGNED_URL_TTL_SECS);
+    let exp = now_ms() + (ttl as i64) * 1000;
+    let sig = signed_url::sign(&state.signed_url_key, &id, exp);
+    let base = state.config.public_url.trim_end_matches('/');
+    let url = format!("{base}/storage/{id}?exp={exp}&sig={sig}");
+    Ok(Json(SignedUrlResponse {
+        url,
+        expires_at: exp,
+    }))
+}
+
 /// Public, unauthenticated serve: anyone with the URL fetches the bytes. The
 /// opaque id resolves to its owning db via the global index. Query params, if
 /// present, request an on-the-fly image transform (ENH-014). Rate-limited per
@@ -486,6 +526,28 @@ async fn serve_public_handler(
     AxumQuery(q): AxumQuery<HashMap<String, String>>,
 ) -> Result<Response, RtDbError> {
     check_storage_public_rate_limit(&state, &client_ip_key(&headers, addr.ip())).await?;
+    // Additive signed-URL verification: if either `exp` or `sig` is present,
+    // the request is signed-URL-shaped and must supply a complete, valid HMAC
+    // signature that has not expired. If neither param is present, behavior is
+    // unchanged (public by opaque id) — `?sig=` alone is treated as a malformed
+    // signed URL, never as a public fetch.
+    if q.contains_key("exp") || q.contains_key("sig") {
+        let exp_s = q
+            .get("exp")
+            .ok_or_else(|| RtDbError::forbidden("invalid or expired signature"))?;
+        let sig = q
+            .get("sig")
+            .ok_or_else(|| RtDbError::forbidden("invalid or expired signature"))?;
+        let exp: i64 = exp_s
+            .parse()
+            .map_err(|_| RtDbError::forbidden("invalid or expired signature"))?;
+        if now_ms() > exp {
+            return Err(RtDbError::forbidden("invalid or expired signature"));
+        }
+        if !signed_url::verify(&state.signed_url_key, &id, exp, sig) {
+            return Err(RtDbError::forbidden("invalid or expired signature"));
+        }
+    }
     let db = storage::resolve_db(&state.pool, &id)
         .await?
         .ok_or_else(|| RtDbError::not_found("unknown file"))?;
