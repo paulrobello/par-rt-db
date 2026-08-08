@@ -1,0 +1,208 @@
+use std::sync::Arc;
+
+use axum::Router;
+use axum::extract::DefaultBodyLimit;
+use axum::http::HeaderMap;
+use axum::routing::{delete, get, post, put};
+use serde::Serialize;
+use subtle::ConstantTimeEq;
+
+use crate::error::RtDbError;
+use crate::{AppState, auth};
+
+mod backups;
+mod dbs;
+mod docs;
+mod login;
+mod observability;
+mod schedules;
+mod schema_ops;
+mod settings;
+mod storage_ops;
+mod tokens;
+mod webhooks;
+
+// Re-export each domain's handlers into the module scope so `admin_routes`
+// below resolves them unqualified (e.g. `mint_token` -> `tokens::mint_token`)
+// without editing the route table — every route stays byte-identical to the
+// pre-split file. DTOs stay private to their own submodule.
+use backups::*;
+use dbs::*;
+use docs::*;
+use login::*;
+use observability::*;
+use schedules::*;
+use schema_ops::*;
+use settings::*;
+use storage_ops::*;
+use tokens::*;
+use webhooks::*;
+
+/// Who an admin request was made as: the raw admin key (CLI/automation) or an
+/// OAuth user on the server-wide admin allowlist (browser dashboard). The
+/// `User` variant is unit today — admin activity is currently attributed only
+/// through the op-feed's `owner` field (which is `None` for admin writes); if
+/// per-principal audit logging is added later, thread the resolved `Principal`
+/// back in here.
+pub(crate) enum AdminPrincipal {
+    Key,
+    User,
+}
+
+pub(super) fn bearer_value(headers: &HeaderMap) -> Result<&str, RtDbError> {
+    if let Some(v) = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+    {
+        return Ok(v);
+    }
+    // SEC-001: dashboard cookie path. The browser sends the HttpOnly
+    // `rtdb_session` cookie automatically on same-origin requests — including
+    // the `/admin/stream` WS upgrade — so JS never holds the admin key. Header
+    // still wins (CLI/automation/machine tokens).
+    auth::cookie::session_cookie(headers)
+        .ok_or_else(|| RtDbError::unauthorized("missing admin bearer token"))
+}
+
+/// Bearer credential carried in a WebSocket subprotocol. Browsers cannot set
+/// the `Authorization` header on a WS handshake, so the dashboard offers
+/// `Sec-WebSocket-Protocol: rtdb-admin.<token>` instead (a header browsers CAN
+/// set); this pulls the token back out. The subprotocol is an HTTP header during
+/// the handshake — it never enters the URL, so it is not captured by access logs
+/// the way a `?token=` query param would be.
+pub(super) fn bearer_from_subprotocol(headers: &HeaderMap) -> Result<&str, RtDbError> {
+    let proto = headers
+        .get("sec-websocket-protocol")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| RtDbError::unauthorized("missing admin bearer token"))?;
+    for entry in proto.split(',') {
+        if let Some(rest) = entry.trim().strip_prefix("rtdb-admin.")
+            && !rest.is_empty()
+        {
+            return Ok(rest);
+        }
+    }
+    Err(RtDbError::unauthorized("missing admin bearer token"))
+}
+
+/// Authenticate a raw bearer credential as an admin: the admin key first
+/// (constant-time compare, no DB lookup), then a resolved session/machine
+/// principal admitted only if it is an OAuth user on `rtdb_auth.admins`. Shared
+/// by the header path and the WS-subprotocol path so both enforce identically.
+pub(crate) async fn authenticate_admin(
+    state: &AppState,
+    token: &str,
+) -> Result<AdminPrincipal, RtDbError> {
+    if bool::from(token.as_bytes().ct_eq(state.config.admin_key.as_bytes())) {
+        return Ok(AdminPrincipal::Key);
+    }
+    let principal = match auth::resolve_bearer(&state.pool, token).await {
+        Ok(principal) => principal,
+        Err(_) => return Err(RtDbError::unauthorized("invalid admin credential")),
+    };
+    if auth::is_admin(&state.pool, &principal).await {
+        Ok(AdminPrincipal::User)
+    } else {
+        Err(RtDbError::forbidden("not a dashboard admin"))
+    }
+}
+
+/// Admin gate for ordinary HTTP routes — reads `Authorization: Bearer <token>`.
+pub(crate) async fn require_admin(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<AdminPrincipal, RtDbError> {
+    authenticate_admin(state, bearer_value(headers)?).await
+}
+
+#[derive(Serialize)]
+pub(super) struct OkResponse {
+    ok: bool,
+}
+
+/// Admin routes, all gated on `Authorization: Bearer <admin_key>` (constant-time
+/// compare).
+pub fn admin_routes() -> Router<Arc<AppState>> {
+    Router::new()
+        .route("/admin/login", post(admin_login))
+        .route("/admin/logout", post(admin_logout))
+        .route("/admin/create-db", post(create_db))
+        .route("/admin/delete-db", post(delete_db))
+        .route("/admin/push-schema", post(push_schema))
+        .route("/admin/dbs", get(list_dbs))
+        .route("/admin/mint-token", post(mint_token))
+        .route("/admin/revoke-token", post(revoke_token))
+        .route(
+            "/admin/allowlist",
+            get(allowlist_list).post(allowlist_write),
+        )
+        .route(
+            "/admin/admins",
+            get(list_admins).post(add_admin).delete(remove_admin),
+        )
+        .route("/admin/dbs/{db}/schema", get(get_schema))
+        .route("/admin/db/{db}/schema/preview", post(preview_schema))
+        .route("/admin/db/{db}/schema/history", get(schema_history_list))
+        .route(
+            "/admin/db/{db}/schema/history/{version}",
+            get(schema_history_get),
+        )
+        .route("/admin/dbs/{db}/stats", get(db_stats))
+        .route("/admin/db/{db}/query", post(admin_query))
+        .route("/admin/db/{db}/mutate", post(admin_mutate))
+        .route("/admin/db/{db}/migrate", post(admin_migrate))
+        .route("/admin/db/{db}/schema/restore", post(restore_schema))
+        .route(
+            "/admin/db/{db}/storage",
+            get(admin_storage_list)
+                .post(admin_storage_upload)
+                .layer(DefaultBodyLimit::disable()),
+        )
+        .route("/admin/db/{db}/storage/{id}", delete(admin_storage_delete))
+        .route(
+            "/admin/db/{db}/webhooks",
+            get(admin_list_webhooks).post(admin_create_webhook),
+        )
+        .route(
+            "/admin/db/{db}/webhooks/{id}",
+            put(admin_edit_webhook).delete(admin_delete_webhook),
+        )
+        .route(
+            "/admin/db/{db}/webhooks/{id}/deliveries",
+            get(admin_list_deliveries),
+        )
+        .route(
+            "/admin/db/{db}/schedules",
+            get(admin_list_schedules).post(admin_create_schedule),
+        )
+        .route(
+            "/admin/db/{db}/schedules/{id}/cancel",
+            post(admin_cancel_schedule),
+        )
+        .route(
+            "/admin/db/{db}/schedules/{id}/pause",
+            post(admin_pause_schedule),
+        )
+        .route(
+            "/admin/db/{db}/schedules/{id}/resume",
+            post(admin_resume_schedule),
+        )
+        .route("/admin/metrics", get(metrics_handler))
+        .route("/admin/config", get(get_config).patch(patch_config))
+        .route("/admin/backup", post(create_backup))
+        .route("/admin/backups", get(list_backups))
+        .route(
+            "/admin/backups/{name}",
+            get(download_backup).delete(delete_backup),
+        )
+        .route("/admin/restore", post(restore_backup))
+        .route("/admin/ops/recent", get(ops_recent))
+        .route("/admin/audit", get(audit_recent))
+        .route("/admin/subscriptions", get(list_subscriptions))
+        .route("/admin/stream", get(admin_stream))
+        .route("/admin/tokens", get(list_tokens))
+        .route("/admin/export-db", get(export_db))
+        .route("/admin/import-db", post(import_db))
+        .route("/admin/clone-db", post(clone_db))
+}

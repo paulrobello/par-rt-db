@@ -74,7 +74,7 @@ alongside it: [`../ts-client/`](../ts-client) (browser/Node),
 | Wire messages | `src/protocol.rs` |
 | Error envelope | `src/error.rs` |
 | Transports | `src/ws.rs` (reactive), `src/http_api.rs` (one-shot) |
-| Admin control plane | `src/admin.rs` (all `/admin/*` routes + `/admin/stream` WS) |
+| Admin control plane | `src/admin/` — `mod.rs` (shared core + assembled router) + per-domain submodules (`login`, `dbs`, `schema_ops`, `tokens`, `docs`, `schedules`, `storage_ops`, `webhooks`, `backups`, `settings`, `observability`); all `/admin/*` routes + `/admin/stream` WS |
 | Auth (six OAuth providers + sessions + machine tokens) | `src/auth/` — `mod.rs`, `provider.rs` (trait + dispatcher), `github.rs`, `google.rs`, `gitlab.rs`, `microsoft.rs` (Entra ID/Azure AD v2), `apple.rs` (ES256 JWT `client_secret` + `form_post`), `oidc.rs` (generic), `session.rs`, `tokens.rs`, `cookie.rs` |
 
 The read path compiles a db-side `filter()` predicate DSL to SQL, a full-text

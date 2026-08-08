@@ -81,7 +81,7 @@ Two orchestrator decisions shaped Wave 2 on this correctness-critical codebase: 
 ## Requires Manual Intervention 🔧
 
 ### Deferred correctness-core refactors (behavior-preserving, needs a focused session)
-- **[ARC-003]** `admin.rs` 2125-line god-module split into 8 submodules. Agent started but could not complete with line-by-line behavior-identical verification in one session (drafts discarded, **not** shipped). **Approach:** read `admin.rs` end-to-end, split one submodule at a time, verify the server compiles between each. Sequence after any `admin.rs` security work (SEC-001 already landed). **Effort:** large (1–2 focused sessions).
+- **[ARC-003]** ✅ **Shipped** (commit `8d5f5c1`) — the `admin.rs` god-module (2140 LOC) is now `admin/mod.rs` (shared core: `AdminPrincipal`, bearer/auth helpers, `OkResponse`, assembled router) + 11 per-domain submodules (`login`, `dbs`, `schema_ops`, `tokens`, `docs`, `schedules`, `storage_ops`, `webhooks`, `backups`, `settings`, `observability`). Behavior-identical — `admin_routes()` is byte-unchanged (handlers re-exported into the module root via `use <domain>::*`); `make checkall` green.
 - **[QA-002] (remaining 3 arms)** Extract terminal arms from `execute_query`/`apply_one`/`execute_txn`. **Approach:** one arm per follow-up PR, full `make checkall` between extractions. **Effort:** medium each.
 - **[ARC-006]** Coalesce per-mutate quota-refresh spawns (debounce vs fold-into-reaper) — touches observable spawn timing. **Effort:** medium.
 - **[ARC-011]** Dedupe the three `bearer_token` helpers into `auth::extract_bearer` — the cookie/subprotocol policy differences are exactly what drift on a quick refactor; wants cross-cutting tests. **Effort:** small-medium.
