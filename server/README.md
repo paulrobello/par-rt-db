@@ -134,6 +134,15 @@ Single-range only (multipart/non-`bytes`/malformed ranges are ignored per RFC
 7233). On-the-fly image transforms are cache-keyed whole renders, so `Range` is
 skipped there. Read-path only — no committer, protocol, or WS change.
 
+### Signed, time-limited URLs
+
+`GET /api/storage/{db}/{id}/signed-url?ttlSeconds=3600` (bearer-authorized for
+`{db}`) mints a URL that grants read access to one blob until an absolute
+expiry (default 1h, max 7d). The URL is `GET /storage/{id}?exp=<unix-ms>&sig=<hex>`,
+verified by an HMAC key derived from `admin_key` — no DB lookup, and a request
+with no `exp`/`sig` still serves publicly as before. Signature verification
+failure returns 403 `FORBIDDEN`.
+
 `{db}` is in the path because the raw upload/serve bodies can't carry it and
 session principals aren't db-scoped. The table is created eagerly in
 `db::create_database` and lazily via `storage::ensure_table` at committer

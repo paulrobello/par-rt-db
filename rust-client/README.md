@@ -131,7 +131,7 @@ escape hatch (one table's `doc` jsonb, no joins/DDL). See
 ## File storage
 
 `RtDbHttpClient` exposes file storage (`upload` / `delete_file` /
-`get_file_metadata` / `get_url`):
+`get_file_metadata` / `get_url` / `get_signed_url`):
 
 ```rust
 use par_rt_db_client::UploadResult;
@@ -142,7 +142,9 @@ db.delete_file(&up.id).await?;
 ```
 
 `upload` POSTs raw bytes to `POST /api/storage/{db}` (the client injects its
-db); `get_url` returns `{url}/storage/{id}`. Storage is HTTP-only.
+db); `get_url` returns `{url}/storage/{id}`; `get_signed_url` calls
+`GET /api/storage/{db}/{id}/signed-url?ttlSeconds=` to mint a signed,
+time-limited URL (returns `{url, expiresAt}`). Storage is HTTP-only.
 
 ## Errors
 
