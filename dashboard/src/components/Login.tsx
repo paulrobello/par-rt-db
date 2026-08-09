@@ -22,7 +22,7 @@ export function Login() {
     }
   }
 
-  async function oauth(provider: "github" | "google" | "gitlab" | "oidc") {
+  async function oauth(provider: "github" | "google" | "microsoft" | "apple" | "gitlab" | "oidc") {
     setBusy(true);
     setLocalError(null);
     try {
@@ -66,6 +66,12 @@ export function Login() {
         </Button>
         <Button onClick={() => oauth("google")} disabled={busy}>
           Sign in with Google
+        </Button>
+        <Button onClick={() => oauth("microsoft")} disabled={busy}>
+          Sign in with Microsoft
+        </Button>
+        <Button onClick={() => oauth("apple")} disabled={busy}>
+          Sign in with Apple
         </Button>
         <Button onClick={() => oauth("gitlab")} disabled={busy}>
           Sign in with GitLab
