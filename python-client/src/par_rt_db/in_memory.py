@@ -15,11 +15,13 @@ Parity is deliberately scoped to the documented core (schema push, insert /
 patch / replace / delete / expectVersion / expectAbsent / upsert, point reads,
 index eq + range queries with order/take/unique/first/count, filter expressions,
 keyset-cursor pagination, reactive subscriptions, and scheduled-job ``tick``).
-``distinct``/``aggregate``/``search``/``vectorSearch``/``hybridSearch`` are NOT
-implemented: the first two raise :class:`RtDbError` ``BAD_REQUEST`` (stricter than
-the Rust harness, which silently falls through to ``collect`` for them), and the
-search/vector/hybrid terminals return an empty list after the same combination
-guards the server enforces — there is no in-memory ts_rank or vector ranking.
+``distinct``/``aggregate``/``vectorSearch``/``hybridSearch`` are NOT implemented:
+the first two raise :class:`RtDbError` ``BAD_REQUEST`` (stricter than the Rust
+harness, which silently falls through to ``collect`` for them), and the
+vector/hybrid terminals return an empty list after the same combination guards
+the server enforces — there is no in-memory vector ranking. ``search`` applies
+its optional ``filter`` (every table row is a candidate — ts_rank is not modeled)
+but otherwise does not rank.
 
 Simplifications vs. the live server (be explicit when relying on these):
 
@@ -878,8 +880,9 @@ class InMemoryRtDbClient:
         * ``count`` → ``int``.
         * ``take`` / ``collect`` → ``list`` of merged docs.
         * ``paginate`` → ``{"docs": [...], "nextCursor"?: str}``.
-        * ``search`` / ``vectorSearch`` → empty list (no in-memory ranking; the
-          combination guards still reject conflicting terminals).
+        * ``search`` → list of merged docs narrowed by the terminal's optional
+          ``filter`` (ranking is not modeled — every table row is a candidate;
+          ``vectorSearch`` still returns an empty list).
 
         ``filter`` is structurally validated once up front, then evaluated per
         row. See the module docs for the unimplemented terminals.
@@ -1044,7 +1047,22 @@ class InMemoryRtDbClient:
                     "search cannot be combined with index, eq, range bounds, order, "
                     "unique, first, count, filter, or vector search",
                 )
-            return []
+            # Full-text ranking (tsvector match + ts_rank) is not modeled
+            # in-memory; every row in the table is treated as a candidate (the
+            # sound over-approximation — a real match can never be excluded). A
+            # declared `filter` narrows that candidate set via the same
+            # `_eval_filter_expr` the db-side `.filter()` uses, so the narrowing
+            # path is exercised end-to-end without modeling ts_rank.
+            if q.search.filter is not None:
+                _validate_filter(q.search.filter, set(table_def.fields.keys()))
+            candidates: list[StoredRow] = [
+                row for (t, _id), row in self._docs.items() if t == q.table
+            ]
+            if q.search.filter is not None:
+                candidates = [
+                    row for row in candidates if _eval_filter_expr(q.search.filter, row.doc)
+                ]
+            return [_merge_doc(row) for row in candidates]
 
         # Resolve index — required for `eq` and for any range bound.
         index_def: IndexDef | None = None

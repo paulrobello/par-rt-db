@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { encodeCursor, decodeCursor } from "../src/pagination.js";
 import { createApi } from "../src/query.js";
 import { defineSchema, defineTable, t } from "../src/schema.js";
+import { type FilterExpr } from "../src/protocol.js";
 
 const schema = defineSchema({
   items: defineTable({
@@ -281,6 +282,25 @@ describe("TableQuery.filter", () => {
 
 describe("TableQuery.search", () => {
   it("builds a search terminal and composes with take", () => {
+    const q = api.items.query().search("search_content", "hello world").take(10);
+    expect(q.json).toEqual({
+      table: "items",
+      search: { index: "search_content", query: "hello world" },
+      take: 10,
+    });
+  });
+
+  it("includes filter on the wire when provided", () => {
+    const filter: FilterExpr = { op: "and", exprs: [{ op: "eq", field: "status", value: "open" }] };
+    const q = api.items.query().search("search_content", "hello", { filter }).take(10);
+    expect(q.json).toEqual({
+      table: "items",
+      search: { index: "search_content", query: "hello", filter },
+      take: 10,
+    });
+  });
+
+  it("omits filter on the wire when not provided", () => {
     const q = api.items.query().search("search_content", "hello world").take(10);
     expect(q.json).toEqual({
       table: "items",

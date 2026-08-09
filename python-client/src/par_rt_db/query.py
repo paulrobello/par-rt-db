@@ -178,8 +178,23 @@ class TableQuery:
         self._filter = f
         return self
 
-    def search(self, index: str, query: str) -> TableQuery:
-        self._search = SearchQuery.model_validate({"index": index, "query": query})
+    def search(
+        self,
+        index: str,
+        query: str,
+        *,
+        filter_: FilterExpr | None = None,
+    ) -> TableQuery:
+        """Full-text search terminal. ``filter_`` is a ``FilterExpr`` (the same
+        type ``.filter()`` and ``authorize`` use) that narrows search results
+        server-side; omitted when ``None``. The trailing underscore mirrors
+        ``vector_search``'s ``filter_`` keyword. The nested search filter is
+        distinct from the query-level ``.filter()`` builder (which is mutually
+        exclusive with ``search``)."""
+        payload: dict[str, Any] = {"index": index, "query": query}
+        if filter_ is not None:
+            payload["filter"] = filter_
+        self._search = SearchQuery.model_validate(payload)
         return self
 
     def vector_search(

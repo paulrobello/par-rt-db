@@ -7,6 +7,7 @@ import type {
   Order,
   PaginatedResultJson,
   QueryJson,
+  SearchQuery,
   VectorQuery,
 } from "./protocol.js";
 import type { Doc, Id, IndexNamesOf, SchemaDefinition, TableNames } from "./schema.js";
@@ -53,9 +54,17 @@ export class TableQuery<DocT, Indexes extends string> {
 
   /** Full-text `search` over a declared search index. Composes only with `take`
    * (e.g. `.search("idx", "text").take(10)`); the server rejects every other
-   * terminal alongside it. */
-  search(index: string, query: string): TableQuery<DocT, Indexes> {
-    return new TableQuery({ ...this.json, search: { index, query } });
+   * terminal alongside it. The optional `filter` narrows results server-side via
+   * the full `FilterExpr` DSL (not to be confused with the query-level
+   * `.filter()` builder, which is mutually exclusive with `search`); omitted on
+   * the wire when absent so existing requests stay byte-identical. */
+  search(index: string, query: string, opts?: { filter?: FilterExpr }): TableQuery<DocT, Indexes> {
+    const search: SearchQuery = {
+      index,
+      query,
+      ...(opts?.filter ? { filter: opts.filter } : {}),
+    };
+    return new TableQuery({ ...this.json, search });
   }
 
   /** Vector-similarity `vectorSearch` over a declared vector index. The server

@@ -442,3 +442,308 @@ async fn search_index_language_change_is_breaking() {
     assert_eq!(err.code, ErrorCode::BadRequest);
     assert!(err.message.contains("changed language"));
 }
+
+// =========================================================================
+// search + filter (the `filter()` DSL narrowed into the search WHERE)
+// =========================================================================
+
+/// A `posts` table: text `title` (search-indexed), numeric `category` (btree
+/// `by_category`, so eq/range bind a typed `f_category` column), and a `tag`
+/// string with NO index (so filtering on it exercises jsonb extraction). Used
+/// to exercise the search+filter combination end to end.
+fn filter_schema() -> SchemaDef {
+    serde_json::from_value(serde_json::json!({"tables":{"posts":{
+        "fields":{
+            "title":{"type":"string"},
+            "category":{"type":"number"},
+            "tag":{"type":"string"}
+        },
+        "indexes":[
+            {"name":"by_category","fields":["category"]},
+            {"name":"search_title","fields":["title"],"search":true}
+        ]
+    }}}))
+    .expect("parse filter schema")
+}
+
+async fn fresh_filter_db(state: &Arc<AppState>) -> (common::TestDb, SchemaDef) {
+    let name = format!("t{}", uuid::Uuid::now_v7().simple());
+    db::create_database(&state.pool, &name)
+        .await
+        .expect("create db");
+    let schema = filter_schema();
+    ddl::push_schema(&state.pool, &name, schema.clone())
+        .await
+        .expect("push schema");
+    (common::wrap_test_db(name), schema)
+}
+
+async fn insert_post(
+    pool: &PgPool,
+    db: &str,
+    schema: &SchemaDef,
+    title: &str,
+    category: i64,
+    tag: &str,
+) -> String {
+    let outcome = execute_txn(
+        pool,
+        db,
+        schema,
+        &Transaction {
+            steps: vec![Step::Insert {
+                table: "posts".to_string(),
+                doc: doc(serde_json::json!({"title": title, "category": category, "tag": tag})),
+            }],
+        },
+        &PrincipalCtx::bypass(),
+    )
+    .await
+    .expect("insert post");
+    outcome.results[0]["id"]
+        .as_str()
+        .expect("id string")
+        .to_string()
+}
+
+fn search_filter_query(query: &str, filter: serde_json::Value) -> Query {
+    serde_json::from_value(serde_json::json!({
+        "table": "posts",
+        "search": {"index": "search_title", "query": query, "filter": filter}
+    }))
+    .expect("search+filter query")
+}
+
+fn post_titles(result: &QueryResult) -> Vec<String> {
+    match result {
+        QueryResult::Docs(docs) => docs
+            .iter()
+            .map(|d| d["title"].as_str().unwrap_or("").to_string())
+            .collect(),
+        other => panic!("expected Docs variant, got {other:?}"),
+    }
+}
+
+// Omitting `filter` behaves exactly like plain search (proves the field is
+// additive: an existing-shape request still works and returns every match).
+#[tokio::test]
+async fn search_filter_omitted_behaves_like_plain_search() {
+    let state = test_state().await;
+    let (db, schema) = fresh_filter_db(&state).await;
+    let pool = &state.pool;
+    insert_post(pool, &db, &schema, "database intro", 1, "a").await;
+    insert_post(pool, &db, &schema, "database advanced", 2, "b").await;
+
+    let q: Query = serde_json::from_value(serde_json::json!({
+        "table": "posts",
+        "search": {"index": "search_title", "query": "database"}
+    }))
+    .expect("plain search query");
+    let res = execute_query(pool, &db, &schema, &q, &PrincipalCtx::bypass())
+        .await
+        .expect("search");
+    assert_eq!(post_titles(&res).len(), 2);
+}
+
+// An eq filter on an indexed numeric field narrows ranked results via its typed
+// `f_category` column.
+#[tokio::test]
+async fn search_filter_eq_on_indexed_field_narrows() {
+    let state = test_state().await;
+    let (db, schema) = fresh_filter_db(&state).await;
+    let pool = &state.pool;
+    insert_post(pool, &db, &schema, "database intro", 1, "a").await;
+    insert_post(pool, &db, &schema, "database advanced", 2, "b").await;
+    insert_post(pool, &db, &schema, "database deep dive", 1, "c").await;
+
+    let res = execute_query(
+        pool,
+        &db,
+        &schema,
+        &search_filter_query(
+            "database",
+            serde_json::json!({"op":"eq","field":"category","value":1}),
+        ),
+        &PrincipalCtx::bypass(),
+    )
+    .await
+    .expect("search+filter");
+    let titles = post_titles(&res);
+    assert_eq!(titles.len(), 2);
+    assert!(titles.contains(&"database intro".to_string()));
+    assert!(titles.contains(&"database deep dive".to_string()));
+    assert!(!titles.contains(&"database advanced".to_string()));
+}
+
+// A range filter (gt) on the indexed numeric field narrows the same way.
+#[tokio::test]
+async fn search_filter_range_on_indexed_field_narrows() {
+    let state = test_state().await;
+    let (db, schema) = fresh_filter_db(&state).await;
+    let pool = &state.pool;
+    insert_post(pool, &db, &schema, "database intro", 1, "a").await;
+    insert_post(pool, &db, &schema, "database advanced", 2, "b").await;
+    insert_post(pool, &db, &schema, "database deep dive", 3, "c").await;
+
+    let res = execute_query(
+        pool,
+        &db,
+        &schema,
+        &search_filter_query(
+            "database",
+            serde_json::json!({"op":"gt","field":"category","value":1}),
+        ),
+        &PrincipalCtx::bypass(),
+    )
+    .await
+    .expect("search+filter");
+    let titles = post_titles(&res);
+    assert_eq!(titles.len(), 2);
+    assert!(titles.contains(&"database advanced".to_string()));
+    assert!(titles.contains(&"database deep dive".to_string()));
+}
+
+// An eq filter on a NON-indexed string field narrows via jsonb extraction.
+#[tokio::test]
+async fn search_filter_eq_on_unindexed_field_narrows() {
+    let state = test_state().await;
+    let (db, schema) = fresh_filter_db(&state).await;
+    let pool = &state.pool;
+    insert_post(pool, &db, &schema, "database intro", 1, "alpha").await;
+    insert_post(pool, &db, &schema, "database advanced", 2, "beta").await;
+
+    let res = execute_query(
+        pool,
+        &db,
+        &schema,
+        &search_filter_query(
+            "database",
+            serde_json::json!({"op":"eq","field":"tag","value":"beta"}),
+        ),
+        &PrincipalCtx::bypass(),
+    )
+    .await
+    .expect("search+filter");
+    let titles = post_titles(&res);
+    assert_eq!(titles, vec!["database advanced".to_string()]);
+}
+
+// `and` combines two predicates; `or` matches either. Both narrow correctly.
+#[tokio::test]
+async fn search_filter_and_or_combine() {
+    let state = test_state().await;
+    let (db, schema) = fresh_filter_db(&state).await;
+    let pool = &state.pool;
+    insert_post(pool, &db, &schema, "database intro", 1, "alpha").await;
+    insert_post(pool, &db, &schema, "database advanced", 2, "beta").await;
+    insert_post(pool, &db, &schema, "database deep dive", 3, "alpha").await;
+
+    // category == 1 AND tag == alpha -> only "database intro".
+    let res = execute_query(
+        pool,
+        &db,
+        &schema,
+        &search_filter_query(
+            "database",
+            serde_json::json!({"op":"and","exprs":[
+                {"op":"eq","field":"category","value":1},
+                {"op":"eq","field":"tag","value":"alpha"}
+            ]}),
+        ),
+        &PrincipalCtx::bypass(),
+    )
+    .await
+    .expect("search+filter");
+    assert_eq!(post_titles(&res), vec!["database intro".to_string()]);
+
+    // category == 1 OR category == 3 -> intro + deep dive.
+    let res = execute_query(
+        pool,
+        &db,
+        &schema,
+        &search_filter_query(
+            "database",
+            serde_json::json!({"op":"or","exprs":[
+                {"op":"eq","field":"category","value":1},
+                {"op":"eq","field":"category","value":3}
+            ]}),
+        ),
+        &PrincipalCtx::bypass(),
+    )
+    .await
+    .expect("search+filter");
+    let titles = post_titles(&res);
+    assert_eq!(titles.len(), 2);
+    assert!(titles.contains(&"database intro".to_string()));
+    assert!(titles.contains(&"database deep dive".to_string()));
+}
+
+// `not` excludes the matching subset.
+#[tokio::test]
+async fn search_filter_not_excludes() {
+    let state = test_state().await;
+    let (db, schema) = fresh_filter_db(&state).await;
+    let pool = &state.pool;
+    insert_post(pool, &db, &schema, "database intro", 1, "alpha").await;
+    insert_post(pool, &db, &schema, "database advanced", 2, "beta").await;
+
+    let res = execute_query(
+        pool,
+        &db,
+        &schema,
+        &search_filter_query(
+            "database",
+            serde_json::json!({"op":"not","expr":{"op":"eq","field":"tag","value":"beta"}}),
+        ),
+        &PrincipalCtx::bypass(),
+    )
+    .await
+    .expect("search+filter");
+    assert_eq!(post_titles(&res), vec!["database intro".to_string()]);
+}
+
+// A filter that matches no documents returns an empty result, not an error.
+#[tokio::test]
+async fn search_filter_no_match_returns_empty() {
+    let state = test_state().await;
+    let (db, schema) = fresh_filter_db(&state).await;
+    let pool = &state.pool;
+    insert_post(pool, &db, &schema, "database intro", 1, "alpha").await;
+
+    let res = execute_query(
+        pool,
+        &db,
+        &schema,
+        &search_filter_query(
+            "database",
+            serde_json::json!({"op":"eq","field":"category","value":99}),
+        ),
+        &PrincipalCtx::bypass(),
+    )
+    .await
+    .expect("search+filter");
+    assert!(matches!(res, QueryResult::Docs(ref d) if d.is_empty()));
+}
+
+// An unknown field in the filter is a clear BadRequest, never a 500.
+#[tokio::test]
+async fn search_filter_unknown_field_is_bad_request() {
+    let state = test_state().await;
+    let (db, schema) = fresh_filter_db(&state).await;
+    let pool = &state.pool;
+    insert_post(pool, &db, &schema, "database intro", 1, "alpha").await;
+
+    let err = execute_query(
+        pool,
+        &db,
+        &schema,
+        &search_filter_query(
+            "database",
+            serde_json::json!({"op":"eq","field":"nope","value":1}),
+        ),
+        &PrincipalCtx::bypass(),
+    )
+    .await
+    .expect_err("unknown filter field");
+    assert_eq!(err.code, ErrorCode::BadRequest);
+}

@@ -1262,8 +1262,11 @@ impl InMemoryRtDbClient {
 
         // `search` terminal — same reasoning as `vectorSearch`: no in-memory
         // ts_rank, but the guard exists so invalid combinations fail here
-        // instead of silently returning an unranked result.
-        if q.search.is_some() {
+        // instead of silently returning an unranked result. A carried `filter`
+        // (the db-side `FilterExpr` DSL) is validated against the table's
+        // declared fields and run through `matches_filter`, so the narrowing
+        // path is exercised even though the stub result set stays empty.
+        if let Some(search) = &q.search {
             if q.index.is_some()
                 || !eq.is_empty()
                 || has_range
@@ -1280,7 +1283,15 @@ impl InMemoryRtDbClient {
                      unique, first, count, filter, or vector search",
                 ));
             }
-            return Ok(Value::Array(Vec::new()));
+            if let Some(filter) = &search.filter {
+                let fields: BTreeSet<String> = table_def.fields.keys().cloned().collect();
+                validate_filter(filter, &fields)?;
+            }
+            let mut rows: Vec<Value> = Vec::new();
+            if let Some(filter) = &search.filter {
+                rows.retain(|d| matches_filter(filter, d));
+            }
+            return Ok(Value::Array(rows));
         }
 
         // Resolve index — required for `eq` and for any range bound.
@@ -4005,7 +4016,7 @@ fn require_index<'a>(table_def: &'a TableDef, name: &str) -> Result<&'a IndexDef
 mod tests {
     use super::*;
     use crate::mutation::Mutation;
-    use crate::query::{Paginate, Paginated, TableQuery};
+    use crate::query::{Paginate, Paginated, SearchOpts, TableQuery};
     use crate::schema::{Schema, Table};
     use crate::wire::{AggregateOp, AggregateSpec, FilterExpr};
     use serde_json::json;
@@ -6784,7 +6795,7 @@ mod tests {
         let v = c
             .run::<Vec<Value>>(
                 &TableQuery::new("items")
-                    .search("by_content", "hello")
+                    .search("by_content", "hello", ())
                     .take(5),
             )
             .expect("search stub");
@@ -6800,6 +6811,7 @@ mod tests {
                 search: Some(crate::wire::SearchQuery {
                     index: "by_content".into(),
                     query: "hello".into(),
+                    filter: None,
                 }),
                 index: Some("by_name".into()),
                 ..Default::default()
@@ -6810,6 +6822,57 @@ mod tests {
             err.message.contains("search cannot be combined"),
             "got: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn query_search_with_filter_returns_empty_after_narrowing() {
+        // ts_rank is unavailable in-memory, so the search stub stays empty; the
+        // carried `filter` is still validated and run through `matches_filter`
+        // on the (empty) result set, exercising the narrowing path.
+        let c = new_client();
+        let v = c
+            .run::<Vec<Value>>(
+                &TableQuery::new("items")
+                    .search(
+                        "by_content",
+                        "hello",
+                        SearchOpts {
+                            filter: Some(FilterExpr::Eq {
+                                field: "status".into(),
+                                value: "done".into(),
+                            }),
+                        },
+                    )
+                    .take(5),
+            )
+            .expect("search with filter narrows cleanly");
+        assert!(v.is_empty(), "search stub still returns [] after narrowing");
+    }
+
+    #[tokio::test]
+    async fn query_search_with_unknown_filter_field_is_bad_request() {
+        // The search filter runs through `validate_filter` against the table's
+        // declared fields, so an unknown field surfaces as BadRequest before
+        // the (stub) result is returned.
+        let c = new_client();
+        let err = c
+            .run::<Vec<Value>>(
+                &TableQuery::new("items")
+                    .search(
+                        "by_content",
+                        "hello",
+                        SearchOpts {
+                            filter: Some(FilterExpr::Eq {
+                                field: "nonexistent".into(),
+                                value: "x".into(),
+                            }),
+                        },
+                    )
+                    .take(5),
+            )
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::BadRequest);
+        assert!(err.message.contains("nonexistent"), "got: {err}");
     }
 
     #[tokio::test]

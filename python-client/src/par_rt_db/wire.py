@@ -199,10 +199,26 @@ FilterExpr = Annotated[
 
 
 class SearchQuery(_Camel):
-    """Full-text search terminal: ``{index, query}``."""
+    """Full-text search terminal: ``{index, query, filter?}``.
+
+    ``filter`` is the db-side ``FilterExpr`` (the same type ``.filter()`` and
+    ``authorize`` use), narrowing search results server-side. It is omitted on
+    the wire when ``None`` (mirrors the server's
+    ``#[serde(skip_serializing_if = "Option::is_none")]``), so existing requests
+    stay byte-identical. Unlike ``VectorSearchQuery.filter`` (an eq-map over the
+    index's ``filterFields``), this is the full ``FilterExpr``.
+    """
 
     index: str
     query: str
+    filter: FilterExpr | None = None
+
+    @model_serializer(mode="wrap")
+    def _drop_none_filter(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        out = handler(self)
+        if out.get("filter") is None:
+            out.pop("filter", None)
+        return out
 
 
 class AggregateOp:

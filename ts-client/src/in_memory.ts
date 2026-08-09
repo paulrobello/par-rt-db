@@ -2077,6 +2077,11 @@ export class InMemoryRtDbClient {
       if (!searchDef) {
         throw new RtDbError("BAD_REQUEST", `search index '${search.index}' not found`);
       }
+      // Validate the search-level filter against declared fields once (mirrors
+      // server `compile_filter` composed into the search WHERE).
+      if (search.filter) {
+        validateFilter(search.filter, new Set(Object.keys(tableDef.fields)));
+      }
       const queryTokens = [...new Set(ftsTokens(search.query))];
       const limit = q.take ?? MAX_TAKE;
       if (queryTokens.length === 0) {
@@ -2084,6 +2089,9 @@ export class InMemoryRtDbClient {
       }
       const scored: Array<{ row: StoredRow; score: number }> = [];
       for (const row of this.rowsFor(q.table).values()) {
+        if (search.filter && !evalFilterExpr(search.filter, row.doc)) {
+          continue;
+        }
         const docTokens = ftsTokens(
           searchDef.fields.map((f) => ftsStringify(row.doc[f])).join(" "),
         );

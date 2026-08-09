@@ -140,6 +140,25 @@ impl From<()> for HybridSearchOpts {
     }
 }
 
+/// Optional arguments for [`TableQuery::search`]: `filter` is an optional
+/// `FilterExpr` (the db-side `filter()` DSL) that narrows the search `WHERE`
+/// server-side. Defaults to `None` (no filter on the wire). The search filter is
+/// nested on the terminal — distinct from the top-level `.filter()` builder,
+/// which is mutually exclusive with `search` — so callers pass it through the
+/// `.search(idx, text, { filter })` opts, not a chained `.filter()`. `From<()>`
+/// lets callers omit it (`.search(idx, text, ())`); a `SearchOpts { filter }`
+/// literal names the field.
+#[derive(Debug, Clone, Default)]
+pub struct SearchOpts {
+    pub filter: Option<FilterExpr>,
+}
+
+impl From<()> for SearchOpts {
+    fn from(_: ()) -> Self {
+        Self::default()
+    }
+}
+
 /// A built query is just the wire `Query` (terminals consume the builder).
 pub struct TableQuery {
     q: Query,
@@ -200,12 +219,21 @@ impl TableQuery {
     }
 
     /// Full-text `search` terminal over a declared search index. Composes only
-    /// with `take` (e.g. `.search("idx", "text").take(10)`); the server rejects
-    /// every other terminal alongside it.
-    pub fn search(mut self, index: &str, query: &str) -> Self {
+    /// with `take` (e.g. `.search("idx", "text", ()).take(10)`); the server
+    /// rejects every other terminal alongside it.
+    ///
+    /// `opts` accepts any `Into<SearchOpts>`: pass `()` to omit the filter
+    /// (`.search(idx, text, ())`), or a `SearchOpts { filter }` literal to narrow
+    /// results server-side via a `FilterExpr`. The nested filter is distinct from
+    /// the top-level `.filter()` builder (which is mutually exclusive with
+    /// `search`) and is omitted on the wire when `None`, so both forms serialize
+    /// identically when no filter is wanted.
+    pub fn search(mut self, index: &str, query: &str, opts: impl Into<SearchOpts>) -> Self {
+        let opts = opts.into();
         self.q.search = Some(SearchQuery {
             index: index.into(),
             query: query.into(),
+            filter: opts.filter,
         });
         self
     }
@@ -570,12 +598,58 @@ mod tests {
 
     #[test]
     fn search_builder_serializes_terminal() {
+        // `()` → `SearchOpts::default()` (filter None) → omitted on the wire,
+        // so the terminal serializes identically to the pre-filter shape.
         let q = TableQuery::new("notes")
-            .search("search_content", "hello world")
+            .search("search_content", "hello world", ())
             .take(10);
         assert_eq!(
             serde_json::to_value(&q).unwrap(),
             json!({"table":"notes","search":{"index":"search_content","query":"hello world"},"take":10})
+        );
+    }
+
+    #[test]
+    fn search_with_opts_struct_carries_filter() {
+        // Named-field opts bag — a `FilterExpr` narrows the search server-side.
+        // Non-None filter is emitted on the wire, nested under the terminal.
+        let q = TableQuery::new("messages")
+            .search(
+                "search_body",
+                "hello",
+                SearchOpts {
+                    filter: Some(FilterExpr::And {
+                        exprs: vec![
+                            FilterExpr::Eq {
+                                field: "channel".into(),
+                                value: "#general".into(),
+                            },
+                            FilterExpr::Gt {
+                                field: "createdAt".into(),
+                                value: 1_780_000_000_000_i64.into(),
+                            },
+                        ],
+                    }),
+                },
+            )
+            .take(10);
+        assert_eq!(
+            serde_json::to_value(&q).unwrap(),
+            json!({
+                "table":"messages",
+                "search":{
+                    "index":"search_body",
+                    "query":"hello",
+                    "filter":{
+                        "op":"and",
+                        "exprs":[
+                            {"op":"eq","field":"channel","value":"#general"},
+                            {"op":"gt","field":"createdAt","value":1780000000000_i64}
+                        ]
+                    }
+                },
+                "take":10
+            })
         );
     }
 

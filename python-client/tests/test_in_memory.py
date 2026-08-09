@@ -551,6 +551,47 @@ def test_filter_reduces_the_result_set() -> None:
     assert {d["name"] for d in docs} == {"a", "c"}
 
 
+def test_search_filter_narrows_the_candidate_set() -> None:
+    # The in-memory search stub treats every table row as a candidate (ts_rank
+    # is not modeled); a declared terminal filter narrows that set via the same
+    # FilterExpr evaluator the db-side .filter() uses.
+    from par_rt_db.wire import FilterExpr
+
+    c = _new_client()
+    _seed_query_rows(c)  # a/todo/2, b/todo/1, c/done/3
+    flt = TypeAdapter(FilterExpr).validate_python({"op": "eq", "field": "status", "value": "todo"})
+    docs = c.run_query(TableQuery("items").search("by_status", "x", filter_=flt).build())
+    assert {d["name"] for d in docs} == {"a", "b"}
+    # Without a filter every table row is a candidate.
+    all_docs = c.run_query(TableQuery("items").search("by_status", "x").build())
+    assert {d["name"] for d in all_docs} == {"a", "b", "c"}
+    # A compound FilterExpr narrows further.
+    flt2 = TypeAdapter(FilterExpr).validate_python(
+        {
+            "op": "and",
+            "exprs": [
+                {"op": "eq", "field": "status", "value": "todo"},
+                {"op": "gt", "field": "order", "value": 1},
+            ],
+        }
+    )
+    docs2 = c.run_query(TableQuery("items").search("by_status", "x", filter_=flt2).build())
+    assert {d["name"] for d in docs2} == {"a"}
+
+
+def test_search_filter_rejects_unknown_field() -> None:
+    # The nested search filter is structurally validated against the table's
+    # declared fields, mirroring the server's compile_filter BadRequest.
+    from par_rt_db.wire import FilterExpr
+
+    c = _new_client()
+    _seed_query_rows(c)
+    flt = TypeAdapter(FilterExpr).validate_python({"op": "eq", "field": "nope", "value": 1})
+    with pytest.raises(RtDbError) as ei:
+        c.run_query(TableQuery("items").search("by_status", "x", filter_=flt).build())
+    assert ei.value.code is ErrorCode.BAD_REQUEST
+
+
 def test_paginate_keyset_pages_through_the_sorted_set() -> None:
     c = _new_client()
     _seed_query_rows(c)  # todo: order 2,1 ; done: order 3

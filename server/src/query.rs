@@ -139,12 +139,17 @@ pub struct Paginate {
 
 /// A full-text search terminal over a declared search index. `index` names a
 /// search index on the query's table; `query` is free-form user text matched
-/// via `plainto_tsquery` so it can't inject tsquery syntax.
+/// via `plainto_tsquery` so it can't inject tsquery syntax. `filter` is an
+/// optional db-side predicate (the `filter()` DSL) narrowed into the search
+/// WHERE — scoped search ("within channel X" / "last N ms"); omitted on the
+/// wire when `None` so existing requests deserialize unchanged.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SearchQuery {
     pub index: String,
     pub query: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter: Option<FilterExpr>,
 }
 
 /// A vector-similarity terminal over a declared vector index. `vector` is the
@@ -2235,42 +2240,49 @@ async fn execute_search(
     let pg_schema_name = pg_schema(db);
     let table_ident = pg_table(table_name);
 
-    // Per-row auth: `$1` is the search query text. The owner/collaborator uid
-    // bind (when enforced) and the `authorize` predicate's binds (when declared
-    // + user caller) follow in one shared accumulator so `compile_filter_node`'s
-    // `start_pos + binds.len()` placeholders stay correctly numbered; `LIMIT`
-    // occupies the next free slot after them. Schema-validated identifiers are
-    // interpolated; the uid is `$n`-bound once and reused on both sides of the
-    // OR. Owner-only emits the single-predicate form byte-identical to the
-    // pre-collaborators SQL.
+    // `$1` is the search query text (tsquery). The optional client `filter`
+    // compiles next at `$2`, then the per-row owner/collaborator and `authorize`
+    // predicates, then `LIMIT` — the same compose order `compile_scan_where` uses
+    // for reads. One shared accumulator keeps `compile_filter_node`'s
+    // `start_pos + binds.len()` placeholders correctly numbered. Schema-validated
+    // identifiers are interpolated; every value is `$n`-bound. With no filter and
+    // an owner-only table this emits the single-predicate form byte-identical to
+    // the pre-filter SQL.
+    let mut binds: Vec<EqBind> = Vec::new();
+    let mut extra = String::new();
+    let start = 2usize;
+    if let Some(filter) = &search.filter {
+        let (fragment, filter_binds) = compile_filter(filter, table_def, start)?;
+        binds.extend(filter_binds);
+        extra.push_str(" AND (");
+        extra.push_str(&fragment);
+        extra.push(')');
+    }
     let enforced_uid = row_auth_enforced_uid(owner_field, collaborators_field, owner);
-    let mut auth_binds: Vec<EqBind> = Vec::new();
-    let mut auth_clause = String::new();
-    let auth_start = 2usize;
     if let Some(uid) = enforced_uid {
-        let ph = auth_start + auth_binds.len();
-        auth_clause.push_str(" AND ");
-        auth_clause.push_str(&row_auth_predicate_body(
+        let ph = start + binds.len();
+        extra.push_str(" AND ");
+        extra.push_str(&row_auth_predicate_body(
             owner_field,
             collaborators_field,
             ph,
         ));
-        auth_binds.push(EqBind::Text(uid.to_string()));
+        binds.push(EqBind::Text(uid.to_string()));
     }
-    if let Some(frag) = authorize_predicate_body(table_def, ctx, auth_start, &mut auth_binds)? {
-        auth_clause.push_str(" AND ");
-        auth_clause.push_str(&frag);
+    if let Some(frag) = authorize_predicate_body(table_def, ctx, start, &mut binds)? {
+        extra.push_str(" AND ");
+        extra.push_str(&frag);
     }
-    let limit_ph = auth_start + auth_binds.len();
+    let limit_ph = start + binds.len();
     let sql = format!(
         "SELECT \"id\", \"doc\", \"created_at\", \"version\" FROM \"{pg_schema_name}\".\"{table_ident}\" \
-         WHERE \"{sv_col}\" @@ {tsq}{auth_clause} \
+         WHERE \"{sv_col}\" @@ {tsq}{extra} \
          ORDER BY ts_rank(\"{sv_col}\", {tsq}) DESC, \"created_at\" DESC, \"id\" DESC \
          LIMIT ${limit_ph}"
     );
     let mut query =
         sqlx::query_as::<_, (String, serde_json::Value, i64, i64)>(&sql).bind(&search.query);
-    for bind in &auth_binds {
+    for bind in &binds {
         query = match bind {
             EqBind::Text(v) => query.bind(v),
             EqBind::Num(v) => query.bind(v),

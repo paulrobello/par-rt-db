@@ -2020,6 +2020,36 @@ describe("InMemoryRtDbClient — full-text search", () => {
       /search index 'nope' not found/,
     );
   });
+
+  it("narrows results by a search-level filter (full FilterExpr)", async () => {
+    const c = searchClient();
+    await seed(c);
+    // "search" matches Alpha + Beta; the eq filter on `title` narrows to Alpha.
+    const docs = (await c.query(
+      searchApi.notes
+        .query()
+        .search("search_text", "search", {
+          filter: { op: "eq", field: "title", value: "Alpha release" },
+        })
+        .take(10),
+    )) as Array<{ title: string }>;
+    expect(docs.map((d) => d.title)).toEqual(["Alpha release"]);
+  });
+
+  it("rejects a search-level filter on an unknown field (BAD_REQUEST)", async () => {
+    const c = searchClient();
+    await seed(c);
+    await expect(
+      c.query(
+        searchApi.notes
+          .query()
+          .search("search_text", "search", {
+            filter: { op: "eq", field: "nope", value: "x" },
+          })
+          .take(10),
+      ),
+    ).rejects.toThrow(/filter references unknown field 'nope'/);
+  });
 });
 
 describe("InMemoryRtDbClient — admin surface", () => {

@@ -195,6 +195,47 @@ def test_query_search():
     }
 
 
+def test_query_search_omits_filter_when_absent():
+    # No filter= ⇒ the key is omitted entirely (existing requests stay byte-identical).
+    out = (
+        TableQuery("t")
+        .search("idx", "hello")
+        .build()
+        .model_dump(by_alias=True, mode="json")["search"]
+    )
+    assert "filter" not in out
+
+
+def test_query_search_serializes_full_filter_expr():
+    # search's filter is the FULL FilterExpr (not vector search's eq-map).
+    flt = _filter_adapter.validate_python(
+        {
+            "op": "and",
+            "exprs": [
+                {"op": "eq", "field": "channel", "value": "#general"},
+                {"op": "gt", "field": "createdAt", "value": 1780000000000},
+            ],
+        }
+    )
+    out = (
+        TableQuery("t")
+        .search("idx", "hi", filter_=flt)
+        .build()
+        .model_dump(by_alias=True, mode="json")["search"]
+    )
+    assert out == {
+        "index": "idx",
+        "query": "hi",
+        "filter": {
+            "op": "and",
+            "exprs": [
+                {"op": "eq", "field": "channel", "value": "#general"},
+                {"op": "gt", "field": "createdAt", "value": 1780000000000},
+            ],
+        },
+    }
+
+
 def test_query_vector_search_without_filter():
     v = TableQuery("t").vector_search("vidx", [1.0, 2.0], limit=3)
     assert v.build().model_dump(by_alias=True, mode="json")["vectorSearch"] == {

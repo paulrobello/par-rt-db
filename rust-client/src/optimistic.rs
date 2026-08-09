@@ -461,7 +461,7 @@ mod tests {
             TableQuery::new("items").count(),
             TableQuery::new("items").paginate(None, 10),
             TableQuery::new("items")
-                .search("search_idx", "query")
+                .search("search_idx", "query", ())
                 .take(5),
             TableQuery::new("items")
                 .vector_search("vec_idx", vec![1.0, 0.0], 5, BTreeMap::new())

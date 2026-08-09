@@ -53,10 +53,14 @@ export type FilterExpr =
   | { op: "contains"; field: string; value: unknown }
   | { op: "exists"; field: string };
 
-/** Mirrors server `query::SearchQuery` byte-for-byte (camelCase, deny_unknown_fields). */
+/** Mirrors server `query::SearchQuery` byte-for-byte (camelCase, deny_unknown_fields).
+ * `filter` narrows search results server-side via the db-side `FilterExpr` DSL
+ * (the full type — not vector search's eq-only map); omitted on the wire when
+ * absent so existing search requests stay byte-identical. */
 export interface SearchQuery {
   index: string;
   query: string;
+  filter?: FilterExpr;
 }
 
 /** Mirrors server `query::AggregateOp` byte-for-byte (lowercase variants).

@@ -309,13 +309,19 @@ pub struct ScheduleInfo {
 }
 
 /// A full-text search terminal over a declared search index. `index` names a
-/// search index on the query's table; `query` is free-form user text. Mirrors
-/// `server/src/query.rs::SearchQuery` byte-for-byte (camelCase, deny_unknown_fields).
+/// search index on the query's table; `query` is free-form user text; `filter`
+/// is an optional `FilterExpr` (the db-side `filter()` DSL) that narrows the
+/// search `WHERE` server-side. Mirrors `server/src/query.rs::SearchQuery`
+/// byte-for-byte (camelCase, deny_unknown_fields). The nested `filter` is
+/// additive — omitted when `None`, so existing search requests round-trip
+/// unchanged — and distinct from the Query-level top-level `filter` builder.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SearchQuery {
     pub index: String,
     pub query: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter: Option<FilterExpr>,
 }
 
 /// A vector-similarity terminal over a declared vector index. `vector` is the
@@ -795,9 +801,11 @@ mod tests {
     // FilterExpr/SearchQuery wire shapes are byte-identical to server query.rs.
     #[test]
     fn search_query_wire_shape() {
+        // `filter` omitted (None) → additive: same wire shape as before the field.
         let q = SearchQuery {
             index: "search_content".into(),
             query: "hello world".into(),
+            filter: None,
         };
         assert_eq!(
             serde_json::to_value(&q).unwrap(),
@@ -807,6 +815,41 @@ mod tests {
             serde_json::from_value(json!({"index":"search_content","query":"hello world"}))
                 .unwrap();
         assert_eq!(back.index, "search_content");
+        assert!(back.filter.is_none());
+
+        // `filter` present → emitted on the wire and round-trips through the
+        // `FilterExpr` tag (`op`, lowercase). Mirrors the server's camelCase
+        // `filter` nesting on the search terminal.
+        let with_filter = SearchQuery {
+            index: "search_content".into(),
+            query: "hello world".into(),
+            filter: Some(FilterExpr::And {
+                exprs: vec![
+                    FilterExpr::Eq {
+                        field: "channel".into(),
+                        value: "#general".into(),
+                    },
+                    FilterExpr::Gt {
+                        field: "createdAt".into(),
+                        value: 1_780_000_000_000_i64.into(),
+                    },
+                ],
+            }),
+        };
+        assert_eq!(
+            serde_json::to_value(&with_filter).unwrap(),
+            json!({
+                "index":"search_content",
+                "query":"hello world",
+                "filter":{
+                    "op":"and",
+                    "exprs":[
+                        {"op":"eq","field":"channel","value":"#general"},
+                        {"op":"gt","field":"createdAt","value":1780000000000_i64}
+                    ]
+                }
+            })
+        );
     }
 
     #[test]
