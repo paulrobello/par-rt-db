@@ -48,10 +48,11 @@ impl MicrosoftProvider {
         )
     }
 
-    // Microsoft Graph's OIDC userinfo endpoint — returns a standards-compliant
-    // `{sub, email, name, ...}` payload for an access token minted with the
-    // `openid email profile` scope, uniform across work/school and personal
-    // (MSA) accounts.
+    // Microsoft's OIDC userinfo endpoint. With the `openid email profile` scope
+    // it returns `{sub, name, preferred_username, email?}` — but `email` is only
+    // populated for personal (MSA) accounts; for work/school (Entra ID) accounts
+    // it is omitted and the address rides on `preferred_username` (the UPN), so
+    // `parse_userinfo` falls back through those fields.
     const USERINFO_ENDPOINT: &'static str = "https://graph.microsoft.com/oidc/userinfo";
 }
 
@@ -213,10 +214,22 @@ fn is_email_verified(value: &serde_json::Value) -> bool {
 /// trusted unless it is explicitly marked unverified (`email_verified: false`
 /// rejects).
 fn parse_userinfo(value: serde_json::Value) -> Result<MicrosoftIdentity, RtDbError> {
+    // `email` is populated for personal (MSA) accounts; work/school (Entra ID)
+    // accounts omit it and carry the address on `preferred_username` (the UPN).
+    // If none are present the payload is logged so a field-shape change is
+    // diagnosable rather than a silent FORBIDDEN.
     let email = value
         .get("email")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| RtDbError::forbidden("no email"))?
+        .or_else(|| value.get("preferred_username").and_then(|v| v.as_str()))
+        .or_else(|| value.get("userPrincipalName").and_then(|v| v.as_str()))
+        .ok_or_else(|| {
+            tracing::warn!(
+                userinfo = ?value,
+                "microsoft userinfo had no email/preferred_username/userPrincipalName"
+            );
+            RtDbError::forbidden("no email")
+        })?
         .to_string();
 
     if let Some(verified) = value.get("email_verified")
@@ -282,6 +295,33 @@ mod tests {
     fn parse_userinfo_rejects_missing_email() {
         let err = parse_userinfo(json!({"sub": "1", "email_verified": true}));
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn parse_userinfo_uses_preferred_username_when_email_absent() {
+        // Work/school (Entra ID) accounts omit `email`; the address is the UPN
+        // carried on `preferred_username`.
+        let id = parse_userinfo(json!({
+            "sub": "AAAA",
+            "preferred_username": "Alice@contoso.com",
+            "name": "Alice"
+        }))
+        .unwrap();
+        // parse_userinfo preserves case; lowercasing happens in complete_login.
+        assert_eq!(id.email, "Alice@contoso.com");
+        assert_eq!(id.name.as_deref(), Some("Alice"));
+    }
+
+    #[test]
+    fn parse_userinfo_prefers_email_over_preferred_username() {
+        // MSA accounts set `email`; it must win over `preferred_username`.
+        let id = parse_userinfo(json!({
+            "sub": "B",
+            "email": "real@outlook.com",
+            "preferred_username": "alias@outlook.com"
+        }))
+        .unwrap();
+        assert_eq!(id.email, "real@outlook.com");
     }
 
     #[test]
