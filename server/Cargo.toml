@@ -34,7 +34,7 @@ base64 = "0.22"
 # secret sent to Apple's token endpoint is a short-lived ES256 JWT the server
 # signs with the registered EC private key. 9.x uses `ring` (already in the
 # tree via rustls) as its sole crypto backend — no new native build.
-jsonwebtoken = "9"
+jsonwebtoken = { version = "10", features = ["rust_crypto"] }
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 croner = "2"
 # Used by the managed-backup task to parse `postgres://` connection strings
