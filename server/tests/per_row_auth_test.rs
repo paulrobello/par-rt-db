@@ -80,6 +80,7 @@ fn user(id: &str) -> rtdb_server::auth::Principal {
         anonymous: false,
         github_id: None,
         github_login: None,
+        session_hash: None,
     }
 }
 

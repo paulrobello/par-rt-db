@@ -37,6 +37,7 @@ import type {
   ScheduleInfo,
   ScheduleWhen,
   SchemaDiff,
+  SessionRow,
   SubscriptionsResponse,
   TokenRow,
   Webhook,
@@ -227,6 +228,30 @@ export class AdminClient {
     return this.req<{ ok: boolean }>("/admin/revoke-token", {
       method: "POST",
       body: JSON.stringify({ tokenId }),
+    });
+  }
+  /** List active sessions server-wide, optionally narrowed by a user id or
+   *  email substring (GET /admin/sessions?user=&limit=). `filter.user` is
+   *  matched against both user id and email on the server. */
+  listSessions(filter?: { user?: string; limit?: number }): Promise<{ sessions: SessionRow[] }> {
+    const qs = new URLSearchParams();
+    if (filter?.user) qs.set("user", filter.user);
+    if (filter?.limit !== undefined) qs.set("limit", String(filter.limit));
+    const suffix = qs.toString() ? `?${qs}` : "";
+    return this.req<{ sessions: SessionRow[] }>(`/admin/sessions${suffix}`);
+  }
+  /** Revoke a single session by its token hash (DELETE /admin/sessions/{hash}).
+   *  The cookie/token stops authenticating immediately. */
+  revokeSession(tokenHash: string): Promise<{ ok: boolean }> {
+    return this.req<{ ok: boolean }>(`/admin/sessions/${enc(tokenHash)}`, {
+      method: "DELETE",
+    });
+  }
+  /** Revoke every session belonging to a user id
+   *  (DELETE /admin/sessions?user={userId}). Returns how many were revoked. */
+  revokeUserSessions(userId: string): Promise<{ ok: boolean; revoked: number }> {
+    return this.req<{ ok: boolean; revoked: number }>(`/admin/sessions?user=${enc(userId)}`, {
+      method: "DELETE",
     });
   }
   getMetrics() {

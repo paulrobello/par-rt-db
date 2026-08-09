@@ -30,6 +30,7 @@ import type {
   AuditEntry,
   DbSubCounters,
   GetAuditOptions,
+  SessionInfo,
   SubscriptionInfo,
   SubscriptionsResponse,
 } from "./admin.js";
@@ -2762,6 +2763,23 @@ export class InMemoryAdminClient {
       subsMissedPushesTotal: 0,
       perDb,
     });
+  }
+
+  /** Active interactive sessions. The harness mints no sessions, so this always
+   *  reads empty — mirroring `RtDbAdminClient.listSessions` for admin consumers
+   *  unit-tested with no network. */
+  listSessions(_filter?: { user?: string; limit?: number }): Promise<SessionInfo[]> {
+    return Promise.resolve([]);
+  }
+
+  /** Revoke one session by token hash. No-op in-memory; resolves void. */
+  revokeSession(_tokenHash: string): Promise<void> {
+    return Promise.resolve();
+  }
+
+  /** Revoke every session for a user. No-op in-memory; reports zero revoked. */
+  revokeUserSessions(_userId: string): Promise<{ ok: boolean; revoked: number }> {
+    return Promise.resolve({ ok: true, revoked: 0 });
   }
 
   private emptySubscriptions(): SubscriptionsResponse {

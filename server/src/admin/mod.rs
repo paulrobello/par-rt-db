@@ -17,6 +17,7 @@ mod login;
 mod observability;
 mod schedules;
 mod schema_ops;
+mod sessions;
 mod settings;
 mod storage_ops;
 mod tokens;
@@ -33,6 +34,7 @@ use login::*;
 use observability::*;
 use schedules::*;
 use schema_ops::*;
+use sessions::*;
 use settings::*;
 use storage_ops::*;
 use tokens::*;
@@ -202,6 +204,14 @@ pub fn admin_routes() -> Router<Arc<AppState>> {
         .route("/admin/subscriptions", get(list_subscriptions))
         .route("/admin/stream", get(admin_stream))
         .route("/admin/tokens", get(list_tokens))
+        .route(
+            "/admin/sessions",
+            get(list_sessions_handler).delete(revoke_user_sessions_handler),
+        )
+        .route(
+            "/admin/sessions/{token_hash}",
+            delete(revoke_session_handler),
+        )
         .route("/admin/export-db", get(export_db))
         .route("/admin/import-db", post(import_db))
         .route("/admin/clone-db", post(clone_db))

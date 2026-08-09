@@ -48,6 +48,12 @@ pub enum Principal {
         /// `login` also stores the display name for Google users, so it is a
         /// genuine GitHub handle only when paired with a github id.
         github_login: Option<String>,
+        /// sha256 digest of the session token == `rtdb_auth.sessions.token_hash`
+        /// PK. `None` for principals not built from a session row (test fixtures,
+        /// the OAuth-callback principal that is never the connection principal).
+        /// Set by `session::resolve_session`; the per-op `session_still_valid`
+        /// check reads it to deny a revoked session on its next op.
+        session_hash: Option<String>,
     },
 }
 
@@ -63,6 +69,16 @@ impl Principal {
                 ..
             }
         )
+    }
+
+    /// The `rtdb_auth.sessions.token_hash` backing this principal, if any.
+    /// `None` for `Machine` and for `User` principals not built from a session
+    /// row. Used by the per-op live-revocation check (`session_still_valid`).
+    pub fn session_hash(&self) -> Option<&str> {
+        match self {
+            Principal::User { session_hash, .. } => session_hash.as_deref(),
+            Principal::Machine { .. } => None,
+        }
     }
 }
 
@@ -151,6 +167,10 @@ pub async fn authorize(pool: &PgPool, principal: &Principal, db: &str) -> Result
             anonymous,
             ..
         } => {
+            // Live revocation: a session deleted via the admin surface must be
+            // denied on its next op. (Non-admin path; admins bypass `authorize`
+            // per-op and are covered by the explicit check in the WS arms.)
+            session_still_valid(pool, principal).await?;
             if *expires_at < now_ms() {
                 return Err(RtDbError::unauthorized("session expired"));
             }
@@ -183,6 +203,29 @@ pub async fn authorize(pool: &PgPool, principal: &Principal, db: &str) -> Result
                 ))
             }
         }
+    }
+}
+
+/// Live check that the session backing `principal` still exists (has not been
+/// revoked via the admin surface). Mirrors the machine-token per-op re-check:
+/// a session deleted mid-connection must be denied on its very next op over an
+/// already-open `/sync`. `Ok(())` for principals with no session hash. Errors
+/// `Unauthorized` ("session revoked") when the row is gone. Expiry is handled
+/// separately by the cached `expires_at` comparison in `authorize`; this check
+/// is purely for revocation (row deletion).
+pub async fn session_still_valid(pool: &PgPool, principal: &Principal) -> Result<(), RtDbError> {
+    let Some(hash) = principal.session_hash() else {
+        return Ok(());
+    };
+    let (live,): (bool,) =
+        sqlx::query_as("SELECT EXISTS(SELECT 1 FROM rtdb_auth.sessions WHERE token_hash = $1)")
+            .bind(hash)
+            .fetch_one(pool)
+            .await?;
+    if live {
+        Ok(())
+    } else {
+        Err(RtDbError::unauthorized("session revoked"))
     }
 }
 
@@ -381,6 +424,7 @@ mod tests {
             anonymous: false,
             github_id: None,
             github_login: None,
+            session_hash: None,
         };
         let user = authed_user(&principal);
         assert_eq!(user.kind, UserKind::User);
@@ -400,6 +444,7 @@ mod tests {
             anonymous: false,
             github_id: Some(42),
             github_login: Some("alice".to_string()),
+            session_hash: None,
         };
         let user = authed_user(&principal);
         assert_eq!(user.github_id, Some(42));

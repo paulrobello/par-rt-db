@@ -14,6 +14,7 @@ const NAV = [
   { to: "/scheduled", label: "Scheduled" },
   { to: "/storage", label: "Storage" },
   { to: "/tokens", label: "Tokens" },
+  { to: "/sessions", label: "Sessions" },
   { to: "/webhooks", label: "Webhooks" },
   { to: "/console", label: "Console" },
   { to: "/config", label: "Config" },

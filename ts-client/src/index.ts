@@ -107,6 +107,7 @@ export type {
   ListDeliveriesOptions,
   RestoreResult,
   RtDbAdminClientOptions,
+  SessionInfo,
   SubscriptionInfo,
   SubscriptionsPrincipal,
   SubscriptionsResponse,

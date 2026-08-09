@@ -961,3 +961,161 @@ async fn read_only_token_ws_cannot_manage_schedule() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+// Live session revocation: a session deleted mid-connection is rejected on the
+// NEXT mutate over the SAME open socket (UNAUTHORIZED, not a close), and the
+// connection stays usable (a following ping still pongs). Revoke is done by the
+// same row DELETE the admin endpoint performs — proving the per-op check.
+#[tokio::test]
+async fn revoked_session_is_rejected_on_next_ws_op_over_open_connection() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let db = fresh_db(&state).await;
+    let suffix = uuid::Uuid::now_v7().simple();
+    let user_id = format!("u-rev-{suffix}");
+    let email = format!("rev-{suffix}@example.com");
+
+    let token = mint_user_session(&state.pool, &user_id, &email).await;
+    let add = admin_post(
+        addr,
+        "/admin/allowlist",
+        json!({"db": db.as_str(), "action": "add", "email": email}),
+    )
+    .await;
+    assert_eq!(add.status(), reqwest::StatusCode::OK);
+
+    let mut ws = ws_connect(addr).await;
+    let auth_msg = auth(&mut ws, &token, db.as_str()).await;
+    assert_eq!(auth_msg["type"], json!("authOk"));
+
+    // Subscribe so the mutate produces both mutateOk and a queryUpdate (the
+    // loop below drains both). Mirrors the (e) test pattern.
+    send_json(
+        &mut ws,
+        json!({"type": "subscribe", "queryId": "q1", "query": {"table": "workItems"}}),
+    )
+    .await;
+    recv_json(&mut ws).await; // initial queryUpdate
+
+    // mutate succeeds while the session is live
+    send_json(
+        &mut ws,
+        json!({"type": "mutate", "mutId": "m1", "txn": insert_work_item_txn()}),
+    )
+    .await;
+    let mut saw_ok = false;
+    for _ in 0..2 {
+        let m = recv_json(&mut ws).await;
+        if m["type"] == json!("mutateOk") {
+            assert_eq!(m["mutId"], json!("m1"));
+            saw_ok = true;
+        }
+    }
+    assert!(saw_ok, "expected mutateOk before revocation");
+
+    // revoke the session directly (exactly what DELETE /admin/sessions/{hash} does)
+    let hash = rtdb_server::db::sha256_hex(&token);
+    sqlx::query("DELETE FROM rtdb_auth.sessions WHERE token_hash = $1")
+        .bind(&hash)
+        .execute(&state.pool)
+        .await?;
+
+    // the NEXT mutate on the SAME open connection is now rejected
+    send_json(
+        &mut ws,
+        json!({"type": "mutate", "mutId": "m2", "txn": insert_work_item_txn()}),
+    )
+    .await;
+    let err_msg = recv_json(&mut ws).await;
+    assert_eq!(err_msg["type"], json!("mutateErr"));
+    assert_eq!(err_msg["mutId"], json!("m2"));
+    assert_eq!(err_msg["error"]["code"], json!("UNAUTHORIZED"));
+
+    // connection stays open (revocation errors the op, does not close)
+    send_json(&mut ws, json!({"type": "ping"})).await;
+    assert_eq!(recv_json(&mut ws).await["type"], json!("pong"));
+
+    Ok(())
+}
+
+// An admin OAuth session bypasses per-db `authorize` (the WS Subscribe/Mutate
+// arms take the `if admin` branch), so the per-op session-liveness check must
+// run on the admin branch too: revoking an admin's session rejects the next
+// mutate over the SAME open connection (UNAUTHORIZED, not a close).
+#[tokio::test]
+async fn revoked_admin_session_is_rejected_on_next_ws_op() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let db = fresh_db(&state).await;
+    // uuid suffix: `mint_user_session` writes the GLOBAL rtdb_auth.users row
+    // (PK on id); tests don't clean those rows, so a literal id collides on the
+    // second run.
+    let suffix = uuid::Uuid::now_v7().simple();
+    let user_id = format!("u-adm-{suffix}");
+    let email = format!("adm-{suffix}@example.com");
+
+    let token = mint_user_session(&state.pool, &user_id, &email).await;
+    // make the user a dashboard admin (server-wide) so `is_admin` returns true
+    // and the WS admin branch runs.
+    sqlx::query("INSERT INTO rtdb_auth.admins (email, github_id, added_at) VALUES ($1, NULL, $2)")
+        .bind(&email)
+        .bind(rtdb_server::db::now_ms())
+        .execute(&state.pool)
+        .await?;
+
+    let mut ws = ws_connect(addr).await;
+    let auth_msg = auth(&mut ws, &token, db.as_str()).await;
+    assert_eq!(auth_msg["type"], json!("authOk"));
+
+    // Subscribe so the mutate produces both mutateOk and a queryUpdate (the
+    // loop below drains both). Without this the second recv_json would block
+    // until the server's liveness timer fires a Ping the helper panics on.
+    send_json(
+        &mut ws,
+        json!({"type": "subscribe", "queryId": "q1", "query": {"table": "workItems"}}),
+    )
+    .await;
+    recv_json(&mut ws).await; // initial queryUpdate
+
+    // admin mutate succeeds (bypasses authorize) while the session is live
+    send_json(
+        &mut ws,
+        json!({"type": "mutate", "mutId": "m1", "txn": insert_work_item_txn()}),
+    )
+    .await;
+    let mut saw_ok = false;
+    for _ in 0..2 {
+        let m = recv_json(&mut ws).await;
+        if m["type"] == json!("mutateOk") {
+            assert_eq!(m["mutId"], json!("m1"));
+            saw_ok = true;
+        }
+    }
+    assert!(saw_ok, "expected mutateOk before revocation");
+
+    // revoke the session directly (exactly what DELETE /admin/sessions/{hash}
+    // does — Task 3 wires that endpoint).
+    let hash = rtdb_server::db::sha256_hex(&token);
+    sqlx::query("DELETE FROM rtdb_auth.sessions WHERE token_hash = $1")
+        .bind(&hash)
+        .execute(&state.pool)
+        .await?;
+
+    // the NEXT mutate on the SAME open connection is now rejected — proves the
+    // admin branch runs session_still_valid per op.
+    send_json(
+        &mut ws,
+        json!({"type": "mutate", "mutId": "m2", "txn": insert_work_item_txn()}),
+    )
+    .await;
+    let err_msg = recv_json(&mut ws).await;
+    assert_eq!(err_msg["type"], json!("mutateErr"));
+    assert_eq!(err_msg["mutId"], json!("m2"));
+    assert_eq!(err_msg["error"]["code"], json!("UNAUTHORIZED"));
+
+    // connection stays open (revocation errors the op, does not close)
+    send_json(&mut ws, json!({"type": "ping"})).await;
+    assert_eq!(recv_json(&mut ws).await["type"], json!("pong"));
+
+    Ok(())
+}

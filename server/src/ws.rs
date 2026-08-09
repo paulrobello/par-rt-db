@@ -20,7 +20,9 @@ use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio::time::{Instant, interval};
 
 use crate::AppState;
-use crate::auth::{Principal, PrincipalCtx, authed_user, authorize, is_admin, resolve_bearer};
+use crate::auth::{
+    Principal, PrincipalCtx, authed_user, authorize, is_admin, resolve_bearer, session_still_valid,
+};
 use crate::db::now_ms;
 use crate::error::{ErrorCode, RtDbError};
 use crate::protocol::{ClientMessage, ServerMessage};
@@ -351,10 +353,11 @@ async fn handle_text_frame(
             // allowlist on every op — a principal removed from
             // `rtdb_auth.admins` mid-connection must not keep bypassing
             // per-db `authorize`. `is_admin` fails safe (returns false on DB
-            // error).
+            // error). Admins still must hold a live session, so the same
+            // per-op revocation check runs on the admin branch too.
             let admin = is_admin(&state.pool, principal).await;
             let authed = if admin {
-                Ok(())
+                session_still_valid(&state.pool, principal).await
             } else {
                 authorize(&state.pool, principal, db).await
             };
@@ -426,7 +429,7 @@ async fn handle_text_frame(
             // SEC-004: re-justify the admin bypass on every op (see Subscribe).
             let admin = is_admin(&state.pool, principal).await;
             let authed = if admin {
-                Ok(())
+                session_still_valid(&state.pool, principal).await
             } else {
                 authorize(&state.pool, principal, db).await
             };
@@ -582,14 +585,17 @@ async fn handle_text_frame(
         // `PresenceState`/`LeavePresence` do NOT re-run `authorize`: membership
         // implies prior auth, and keeping cursor updates off Postgres is a
         // stated design rule. Presence is not routed through the committer and
-        // is not gated by the token/db RPM limiter.
+        // is not gated by the token/db RPM limiter. The Presence JOIN, like
+        // Subscribe/Mutate, still live-checks the session on the admin branch
+        // — admins must hold a live session (revocation applies to every
+        // interactive principal).
         ClientMessage::Presence {
             room,
             state: presence_state,
         } => {
             let admin = is_admin(&state.pool, principal).await;
             let authed = if admin {
-                Ok(())
+                session_still_valid(&state.pool, principal).await
             } else {
                 authorize(&state.pool, principal, db).await
             };

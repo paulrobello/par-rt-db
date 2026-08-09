@@ -1,3 +1,4 @@
+use serde::Serialize;
 use sqlx::PgPool;
 
 use crate::auth::Principal;
@@ -76,6 +77,7 @@ pub async fn resolve_session(pool: &PgPool, token: &str) -> Result<Option<Princi
         anonymous,
         github_id,
         github_login: github_id.is_some().then_some(login),
+        session_hash: Some(hash),
     }))
 }
 
@@ -88,4 +90,97 @@ pub async fn delete_session(pool: &PgPool, token: &str) -> Result<(), RtDbError>
         .execute(pool)
         .await?;
     Ok(())
+}
+
+/// One row of the admin sessions list. `token_hash` is a non-reversible sha256
+/// digest (the plaintext token is never stored), so it is safe to surface to an
+/// authenticated admin and lets the UI target a specific row.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionInfo {
+    pub token_hash: String,
+    pub user_id: String,
+    pub email: Option<String>,
+    /// Display hint: GitHub handle when the user has a `github_id`, else the
+    /// stored display name (same convention as `resolve_session`).
+    pub login: Option<String>,
+    pub anonymous: bool,
+    pub created_at: i64,
+    pub expires_at: i64,
+}
+
+/// Lists sessions newest-first. When `user_filter` is `Some`, matches rows whose
+/// `user_id` OR `users.email` equals it (an operator may paste either). `limit`
+/// is clamped to `[1, 1000]` by the caller.
+pub async fn list_sessions(
+    pool: &PgPool,
+    user_filter: Option<&str>,
+    limit: i64,
+) -> Result<Vec<SessionInfo>, RtDbError> {
+    // (token_hash, user_id, email, login, anonymous, created_at, expires_at)
+    type Row = (
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        bool,
+        i64,
+        i64,
+    );
+    let rows: Vec<Row> = if let Some(u) = user_filter {
+        sqlx::query_as(
+            "SELECT s.token_hash, s.user_id, u.email, u.login, u.anonymous, \
+                    s.created_at, s.expires_at \
+             FROM rtdb_auth.sessions s JOIN rtdb_auth.users u ON u.id = s.user_id \
+             WHERE s.user_id = $1 OR u.email = $1 \
+             ORDER BY s.created_at DESC LIMIT $2",
+        )
+        .bind(u)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?
+    } else {
+        sqlx::query_as(
+            "SELECT s.token_hash, s.user_id, u.email, u.login, u.anonymous, \
+                    s.created_at, s.expires_at \
+             FROM rtdb_auth.sessions s JOIN rtdb_auth.users u ON u.id = s.user_id \
+             ORDER BY s.created_at DESC LIMIT $1",
+        )
+        .bind(limit)
+        .fetch_all(pool)
+        .await?
+    };
+    Ok(rows
+        .into_iter()
+        .map(
+            |(token_hash, user_id, email, login, anonymous, created_at, expires_at)| SessionInfo {
+                token_hash,
+                user_id,
+                email,
+                login,
+                anonymous,
+                created_at,
+                expires_at,
+            },
+        )
+        .collect())
+}
+
+/// Deletes one session by its token_hash (the admin revoke-one path). Idempotent:
+/// returns 0 if the row is already gone — never an error.
+pub async fn delete_session_by_hash(pool: &PgPool, token_hash: &str) -> Result<u64, RtDbError> {
+    let result = sqlx::query("DELETE FROM rtdb_auth.sessions WHERE token_hash = $1")
+        .bind(token_hash)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
+}
+
+/// Deletes every session for `user_id` (the admin revoke-all path). Idempotent.
+pub async fn delete_sessions_for_user(pool: &PgPool, user_id: &str) -> Result<u64, RtDbError> {
+    let result = sqlx::query("DELETE FROM rtdb_auth.sessions WHERE user_id = $1")
+        .bind(user_id)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
 }

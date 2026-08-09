@@ -159,6 +159,20 @@ export interface TokenRow {
   tables: string[] | null;
 }
 
+/** One active session row from `GET /admin/sessions` (camelCase wire). A session
+ *  is an authenticated user or anonymous principal with a non-expired cookie /
+ *  token. `login`/`email` are null for anonymous sessions; `anonymous` flags
+ *  them. Revoking deletes the row (and the cookie stops authenticating). */
+export interface SessionRow {
+  tokenHash: string;
+  userId: string;
+  email: string | null;
+  login: string | null;
+  anonymous: boolean;
+  createdAt: number;
+  expiresAt: number;
+}
+
 // File storage — mirrors server/src/storage.rs `FileMeta`. Field names are
 // camelCase on the wire (serde `rename_all = "camelCase"`). `contentType` is
 // omitted by the server when the upload supplied no Content-Type header.

@@ -17,6 +17,7 @@ import { QueryConsolePage } from "./pages/QueryConsolePage";
 import { ScheduledJobsPage } from "./pages/ScheduledJobsPage";
 import { SchemaHistoryPage } from "./pages/SchemaHistoryPage";
 import { SchemaPage } from "./pages/SchemaPage";
+import { SessionsPage } from "./pages/SessionsPage";
 import { StoragePage } from "./pages/StoragePage";
 import { SubscriptionsPage } from "./pages/SubscriptionsPage";
 import { TokensPage } from "./pages/TokensPage";
@@ -58,6 +59,7 @@ function Root() {
             <Route path="storage" element={<StoragePage />} />
             <Route path="subscriptions" element={<SubscriptionsPage />} />
             <Route path="tokens" element={<TokensPage />} />
+            <Route path="sessions" element={<SessionsPage />} />
             <Route path="webhooks" element={<WebhooksPage />} />
             <Route path="console" element={<QueryConsolePage />} />
             <Route path="config" element={<ConfigPage />} />

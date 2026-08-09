@@ -528,6 +528,7 @@ async fn anonymous(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Re
         anonymous: true,
         github_id: None,
         github_login: None,
+        session_hash: None,
     };
     let secure = crate::auth::cookie::request_is_secure(&headers);
     let mut response = Json(AnonymousResponse {

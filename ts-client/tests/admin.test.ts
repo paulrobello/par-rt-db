@@ -3,6 +3,7 @@ import type {
   AuditEntry,
   HotConfig,
   HotConfigPatch,
+  SessionInfo,
   SubscriptionInfo,
   SubscriptionsResponse,
   Webhook,
@@ -1092,6 +1093,67 @@ describe("RtDbAdminClient subscriptions", () => {
     const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
     await expect(admin.listSubscriptions()).resolves.toEqual(payload);
     expect(fetchMock.mock.calls[0][0]).toBe("http://h:8300/admin/subscriptions");
+  });
+});
+
+describe("RtDbAdminClient sessions", () => {
+  it("listSessions GETs /admin/sessions with user+limit and unwraps {sessions}", async () => {
+    // Two fixture rows: one interactive (email/login populated), one anonymous
+    // where email/login come back as JSON null.
+    const sessions: SessionInfo[] = [
+      {
+        tokenHash: "a".repeat(64),
+        userId: "u1",
+        email: "user@example.com",
+        login: "user",
+        anonymous: false,
+        createdAt: 1_700_000_000_000,
+        expiresAt: 1_700_000_000_000 + 86_400_000,
+      },
+      {
+        tokenHash: "b".repeat(64),
+        userId: "u2",
+        email: null,
+        login: null,
+        anonymous: true,
+        createdAt: 1_700_000_000_001,
+        expiresAt: 1_700_000_000_001 + 3_600_000,
+      },
+    ];
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ sessions }));
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+    await expect(admin.listSessions({ user: "u1", limit: 50 })).resolves.toEqual(sessions);
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("http://h:8300/admin/sessions?user=u1&limit=50");
+    expect(init.method).toBe("GET");
+    expect(init.headers.Authorization).toBe("Bearer k");
+  });
+
+  it("listSessions omits the query string when no filter is provided", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ sessions: [] }));
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+    await expect(admin.listSessions()).resolves.toEqual([]);
+    expect(fetchMock.mock.calls[0][0]).toBe("http://h:8300/admin/sessions");
+  });
+
+  it("revokeSession DELETEs /admin/sessions/{tokenHash} and resolves void on {ok:true}", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ ok: true }));
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+    await expect(admin.revokeSession("0".repeat(64))).resolves.toBeUndefined();
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe(`http://h:8300/admin/sessions/${"0".repeat(64)}`);
+    expect(init.method).toBe("DELETE");
+    expect(init.headers.Authorization).toBe("Bearer k");
+  });
+
+  it("revokeUserSessions DELETEs /admin/sessions?user= and returns {ok, revoked}", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ ok: true, revoked: 3 }));
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+    await expect(admin.revokeUserSessions("u1")).resolves.toEqual({ ok: true, revoked: 3 });
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("http://h:8300/admin/sessions?user=u1");
+    expect(init.method).toBe("DELETE");
+    expect(init.headers.Authorization).toBe("Bearer k");
   });
 });
 

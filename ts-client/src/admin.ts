@@ -45,6 +45,19 @@ export interface TokenInfo {
   readOnly: boolean;
   tables: string[] | null;
 }
+/** One active interactive session from `GET /admin/sessions`. `tokenHash` is a
+ *  non-reversible sha256 digest (the plaintext token is never stored), safe to
+ *  surface to an admin and used to target a row for revoke. `email`/`login` are
+ *  `null` when the user has none (e.g. an anonymous session). */
+export interface SessionInfo {
+  tokenHash: string;
+  userId: string;
+  email: string | null;
+  login: string | null;
+  anonymous: boolean;
+  createdAt: number;
+  expiresAt: number;
+}
 /** Optional capabilities for `mintToken`. Omitted fields fall back to server
  *  defaults (full access: no expiry, read-write, all tables). */
 export interface MintTokenOptions {
@@ -462,6 +475,32 @@ export class RtDbAdminClient {
   async listTokens(db: string): Promise<TokenInfo[]> {
     const body = await this.request("GET", `/admin/tokens?db=${encodeURIComponent(db)}`);
     return (body as { tokens: TokenInfo[] }).tokens;
+  }
+
+  /** List active interactive sessions server-wide, optionally filtered by user
+   *  id or email (GET /admin/sessions?user=&limit=). Returns sessions
+   *  newest-first. `limit` is clamped server-side to [1, 1000] (default 200). */
+  async listSessions(filter?: { user?: string; limit?: number }): Promise<SessionInfo[]> {
+    const params = new URLSearchParams();
+    if (filter?.user) params.set("user", filter.user);
+    if (filter?.limit !== undefined) params.set("limit", String(filter.limit));
+    const qs = params.toString();
+    const body = await this.request("GET", `/admin/sessions${qs ? `?${qs}` : ""}`);
+    return (body as { sessions: SessionInfo[] }).sessions;
+  }
+
+  /** Revoke a single session by its `tokenHash` (DELETE /admin/sessions/{tokenHash}). */
+  async revokeSession(tokenHash: string): Promise<void> {
+    await this.request("DELETE", `/admin/sessions/${encodeURIComponent(tokenHash)}`);
+  }
+
+  /** Revoke every session for a user (DELETE /admin/sessions?user={userId}).
+   *  Returns `{ ok, revoked }` where `revoked` is the count of sessions dropped. */
+  async revokeUserSessions(userId: string): Promise<{ ok: boolean; revoked: number }> {
+    return (await this.request("DELETE", `/admin/sessions?user=${encodeURIComponent(userId)}`)) as {
+      ok: boolean;
+      revoked: number;
+    };
   }
 
   /** Server metrics snapshot (GET /admin/metrics). */

@@ -518,9 +518,14 @@ pub async fn mint_user_session(pool: &sqlx::PgPool, user_id: &str, email: &str) 
     let github_id: i64 =
         i64::from_str_radix(&db::sha256_hex(user_id)[..15], 16).expect("parse hex as i64");
     let now = db::now_ms();
+    // ON CONFLICT (id) DO NOTHING so a second call with the same `user_id`
+    // (e.g. to seed a second session for the same user) reuses the existing
+    // row instead of colliding on users_pkey. Existing callers use distinct
+    // ids per call, so the conflict branch never fires for them.
     sqlx::query(
         "INSERT INTO rtdb_auth.users (id, github_id, login, email, created_at) \
-         VALUES ($1, $2, $3, $4, $5)",
+         VALUES ($1, $2, $3, $4, $5) \
+         ON CONFLICT (id) DO NOTHING",
     )
     .bind(user_id)
     .bind(github_id)

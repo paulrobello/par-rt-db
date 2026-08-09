@@ -365,6 +365,7 @@ async fn authorize_user_branch_matches_allowlist_case_insensitively() -> anyhow:
         anonymous: false,
         github_id: None,
         github_login: None,
+        session_hash: None,
     };
     authorize(&state.pool, &allowed, &name)
         .await
@@ -378,6 +379,7 @@ async fn authorize_user_branch_matches_allowlist_case_insensitively() -> anyhow:
         anonymous: false,
         github_id: None,
         github_login: None,
+        session_hash: None,
     };
     let err = authorize(&state.pool, &not_allowed, &name)
         .await
@@ -509,6 +511,7 @@ async fn authorize_user_branch_rejects_expired_session() -> anyhow::Result<()> {
         anonymous: false,
         github_id: None,
         github_login: None,
+        session_hash: None,
     };
     let err = authorize(&state.pool, &expired, &name)
         .await
