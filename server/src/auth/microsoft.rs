@@ -17,10 +17,12 @@ use crate::error::RtDbError;
 /// account, work/school or personal); a specific tenant GUID/name restricts
 /// the audience to one organization.
 ///
-/// Identity is email-keyed (Graph's `/oidc/userinfo` `email`), mirroring the
-/// generic OIDC and Google providers: `email` is UNIQUE and the allowlist key,
-/// so a Microsoft login reuses an existing row if the same person previously
-/// signed in with another provider matching on email. Microsoft's `sub` is not
+/// Identity is email-keyed (the account email, read from the id_token and
+/// userinfo — Entra ID omits the email from userinfo, so the id_token's
+/// `preferred_username`/`email` is the primary source), mirroring the generic
+/// OIDC and Google providers: `email` is UNIQUE and the allowlist key, so a
+/// Microsoft login reuses an existing row if the same person previously signed
+/// in with another provider matching on email. Microsoft's `sub` is not
 /// persisted — consistent with the google/oidc providers and the email-based
 /// authorization model.
 pub struct MicrosoftProvider {
@@ -48,11 +50,11 @@ impl MicrosoftProvider {
         )
     }
 
-    // Microsoft's OIDC userinfo endpoint. With the `openid email profile` scope
-    // it returns `{sub, name, preferred_username, email?}` — but `email` is only
-    // populated for personal (MSA) accounts; for work/school (Entra ID) accounts
-    // it is omitted and the address rides on `preferred_username` (the UPN), so
-    // `parse_userinfo` falls back through those fields.
+    // Microsoft's OIDC userinfo endpoint. It returns a sparse `{sub, name,
+    // given_name, family_name, picture}` and omits `email`/`preferred_username`
+    // for work/school (Entra ID) accounts, so the email is sourced from the
+    // id_token claims returned by the token exchange — see `complete_login` and
+    // `parse_userinfo`.
     const USERINFO_ENDPOINT: &'static str = "https://graph.microsoft.com/oidc/userinfo";
 }
 
@@ -119,7 +121,14 @@ impl OAuthProvider for MicrosoftProvider {
                 RtDbError::internal("microsoft token exchange failed")
             })?;
 
-        let access_token = parse_token_response(token_resp)?;
+        let access_token = parse_token_response(&token_resp)?;
+        // The userinfo endpoint omits the email for Entra ID accounts; the
+        // id_token returned by the token exchange carries it (MSA `email`, AAD
+        // `preferred_username` = UPN), so decode its claims as the primary source.
+        let id_claims = token_resp
+            .get("id_token")
+            .and_then(|v| v.as_str())
+            .and_then(decode_jwt_claims);
 
         let userinfo: serde_json::Value = client
             .get(Self::USERINFO_ENDPOINT)
@@ -140,7 +149,7 @@ impl OAuthProvider for MicrosoftProvider {
                 RtDbError::internal("microsoft userinfo fetch failed")
             })?;
 
-        let identity = parse_userinfo(userinfo)?;
+        let identity = parse_userinfo(userinfo, id_claims.as_ref())?;
         let email = identity.email.to_lowercase();
 
         // Email-keyed (UNIQUE; the allowlist key), so a Microsoft login reuses
@@ -187,7 +196,7 @@ struct TokenExchangeRequest<'a> {
 /// success and an `{"error": "...", "error_description": "..."}` body on
 /// failure — the latter is surfaced as a generic internal error so the OAuth
 /// error text never reaches the response body.
-fn parse_token_response(value: serde_json::Value) -> Result<String, RtDbError> {
+fn parse_token_response(value: &serde_json::Value) -> Result<String, RtDbError> {
     match value.get("access_token").and_then(|v| v.as_str()) {
         Some(token) => Ok(token.to_string()),
         None => {
@@ -195,6 +204,22 @@ fn parse_token_response(value: serde_json::Value) -> Result<String, RtDbError> {
             Err(RtDbError::internal("microsoft token exchange failed"))
         }
     }
+}
+
+/// Decodes (without verifying) the payload claims of a JWT `id_token`. The
+/// token arrived from Microsoft's token endpoint over TLS, so trusting its
+/// contents matches the userinfo posture; verifying against Microsoft's JWKS
+/// would add a discovery fetch for no security gain on this trusted channel.
+/// Microsoft's userinfo endpoint omits the email for Entra ID accounts, so the
+/// id_token (`email` for MSA, `preferred_username` = UPN for Entra ID) is the
+/// reliable source.
+fn decode_jwt_claims(id_token: &str) -> Option<serde_json::Value> {
+    use base64::Engine;
+    let payload = id_token.split('.').nth(1)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .ok()?;
+    serde_json::from_slice(&bytes).ok()
 }
 
 /// `email_verified` may arrive as a JSON boolean or the string `"true"` (some
@@ -213,20 +238,28 @@ fn is_email_verified(value: &serde_json::Value) -> bool {
 /// `email_verified`; matching the generic OIDC provider's posture, the email is
 /// trusted unless it is explicitly marked unverified (`email_verified: false`
 /// rejects).
-fn parse_userinfo(value: serde_json::Value) -> Result<MicrosoftIdentity, RtDbError> {
-    // `email` is populated for personal (MSA) accounts; work/school (Entra ID)
-    // accounts omit it and carry the address on `preferred_username` (the UPN).
-    // If none are present the payload is logged so a field-shape change is
-    // diagnosable rather than a silent FORBIDDEN.
+fn parse_userinfo(
+    value: serde_json::Value,
+    id_claims: Option<&serde_json::Value>,
+) -> Result<MicrosoftIdentity, RtDbError> {
+    // Resolve the email from the userinfo fields, then the id_token claims —
+    // the reliable source for Entra ID accounts, where the userinfo endpoint
+    // omits the email and `preferred_username` is the UPN. If none are present
+    // both payloads are logged so a field-shape change is diagnosable rather
+    // than a silent FORBIDDEN.
     let email = value
         .get("email")
         .and_then(|v| v.as_str())
         .or_else(|| value.get("preferred_username").and_then(|v| v.as_str()))
         .or_else(|| value.get("userPrincipalName").and_then(|v| v.as_str()))
+        .or_else(|| id_claims.and_then(|c| c.get("email").and_then(|v| v.as_str())))
+        .or_else(|| id_claims.and_then(|c| c.get("preferred_username").and_then(|v| v.as_str())))
+        .or_else(|| id_claims.and_then(|c| c.get("upn").and_then(|v| v.as_str())))
         .ok_or_else(|| {
             tracing::warn!(
                 userinfo = ?value,
-                "microsoft userinfo had no email/preferred_username/userPrincipalName"
+                id_claims = ?id_claims,
+                "microsoft userinfo and id_token had no email"
             );
             RtDbError::forbidden("no email")
         })?
@@ -256,23 +289,39 @@ mod tests {
             "expires_in": 3600,
             "id_token": "eyJ..."
         });
-        assert_eq!(parse_token_response(resp).unwrap(), "EwAoA-abc");
+        assert_eq!(parse_token_response(&resp).unwrap(), "EwAoA-abc");
     }
 
     #[test]
     fn parse_token_response_fails_on_error_body() {
         let resp = json!({"error": "invalid_grant", "error_description": "Bad code"});
-        assert!(parse_token_response(resp).is_err());
+        assert!(parse_token_response(&resp).is_err());
+    }
+
+    #[test]
+    fn decode_jwt_claims_reads_payload_segment() {
+        use base64::Engine;
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(br#"{"preferred_username":"a@b.com","sub":"x"}"#);
+        let token = format!("header.{payload}.sig");
+        let claims = decode_jwt_claims(&token).unwrap();
+        assert_eq!(
+            claims.get("preferred_username").and_then(|v| v.as_str()),
+            Some("a@b.com")
+        );
     }
 
     #[test]
     fn parse_userinfo_accepts_verified_boolean_email() {
-        let id = parse_userinfo(json!({
-            "sub": "AAAA",
-            "email": "Alice@Example.com",
-            "email_verified": true,
-            "name": "Alice"
-        }))
+        let id = parse_userinfo(
+            json!({
+                "sub": "AAAA",
+                "email": "Alice@Example.com",
+                "email_verified": true,
+                "name": "Alice"
+            }),
+            None,
+        )
         .unwrap();
         assert_eq!(id.email, "Alice@Example.com");
         assert_eq!(id.name.as_deref(), Some("Alice"));
@@ -281,31 +330,35 @@ mod tests {
     #[test]
     fn parse_userinfo_accepts_absent_verified_flag() {
         // Graph often omits email_verified — trust Microsoft's assertion.
-        let id = parse_userinfo(json!({"sub": "9", "email": "c@x.com", "name": "C"})).unwrap();
+        let id =
+            parse_userinfo(json!({"sub": "9", "email": "c@x.com", "name": "C"}), None).unwrap();
         assert_eq!(id.email, "c@x.com");
     }
 
     #[test]
     fn parse_userinfo_rejects_unverified_email() {
-        let err = parse_userinfo(json!({"email": "c@x.com", "email_verified": false}));
+        let err = parse_userinfo(json!({"email": "c@x.com", "email_verified": false}), None);
         assert!(err.is_err());
     }
 
     #[test]
     fn parse_userinfo_rejects_missing_email() {
-        let err = parse_userinfo(json!({"sub": "1", "email_verified": true}));
+        // Neither userinfo nor id_token carries an address.
+        let err = parse_userinfo(json!({"sub": "1", "email_verified": true}), None);
         assert!(err.is_err());
     }
 
     #[test]
-    fn parse_userinfo_uses_preferred_username_when_email_absent() {
-        // Work/school (Entra ID) accounts omit `email`; the address is the UPN
-        // carried on `preferred_username`.
-        let id = parse_userinfo(json!({
-            "sub": "AAAA",
-            "preferred_username": "Alice@contoso.com",
-            "name": "Alice"
-        }))
+    fn parse_userinfo_uses_userinfo_preferred_username_when_present() {
+        // Some accounts put the UPN on userinfo `preferred_username`.
+        let id = parse_userinfo(
+            json!({
+                "sub": "AAAA",
+                "preferred_username": "Alice@contoso.com",
+                "name": "Alice"
+            }),
+            None,
+        )
         .unwrap();
         // parse_userinfo preserves case; lowercasing happens in complete_login.
         assert_eq!(id.email, "Alice@contoso.com");
@@ -313,15 +366,40 @@ mod tests {
     }
 
     #[test]
-    fn parse_userinfo_prefers_email_over_preferred_username() {
-        // MSA accounts set `email`; it must win over `preferred_username`.
-        let id = parse_userinfo(json!({
-            "sub": "B",
-            "email": "real@outlook.com",
-            "preferred_username": "alias@outlook.com"
-        }))
+    fn parse_userinfo_uses_id_token_preferred_username_when_userinfo_is_sparse() {
+        // Real Entra ID userinfo is {sub, name, ...} with no email/UPN; the
+        // id_token `preferred_username` (the UPN) is the reliable source.
+        let id_claims = json!({
+            "sub": "AAAA",
+            "preferred_username": "Paul@contoso.com",
+            "name": "Paul Robello"
+        });
+        let id = parse_userinfo(
+            json!({"sub": "AAAA", "name": "Paul Robello"}),
+            Some(&id_claims),
+        )
         .unwrap();
+        assert_eq!(id.email, "Paul@contoso.com");
+    }
+
+    #[test]
+    fn parse_userinfo_uses_id_token_email_when_userinfo_is_sparse() {
+        // MSA userinfo can omit the email; the id_token `email` claim covers it.
+        let id_claims = json!({"sub": "M", "email": "real@outlook.com"});
+        let id = parse_userinfo(json!({"sub": "M", "name": "M"}), Some(&id_claims)).unwrap();
         assert_eq!(id.email, "real@outlook.com");
+    }
+
+    #[test]
+    fn parse_userinfo_prefers_userinfo_email_over_id_token() {
+        // When both carry an address, the userinfo `email` wins.
+        let id_claims = json!({"email": "idtoken@outlook.com"});
+        let id = parse_userinfo(
+            json!({"email": "userinfo@outlook.com", "preferred_username": "alias@outlook.com"}),
+            Some(&id_claims),
+        )
+        .unwrap();
+        assert_eq!(id.email, "userinfo@outlook.com");
     }
 
     #[test]
