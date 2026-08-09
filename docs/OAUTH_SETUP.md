@@ -6,10 +6,9 @@ How to register OAuth apps and wire them into par-rt-db. Each provider is
 working with zero providers configured.
 
 > **Source of truth:** the provider implementations in `server/src/auth/`
-> (`provider.rs` for the shared trait/plumbing, `github.rs`, `gitlab.rs`,
-> `google.rs`). This
-> guide mirrors those files — if the code and this doc disagree, the code wins;
-> fix this doc.
+> (`provider.rs` for the shared trait/plumbing, then `github.rs`, `google.rs`,
+> `gitlab.rs`, `microsoft.rs`, `apple.rs`, `oidc.rs`). This guide mirrors those
+> files — if the code and this doc disagree, the code wins; fix this doc.
 
 ## How it works
 
@@ -22,8 +21,11 @@ working with zero providers configured.
   (`{ authorizeUrl, state }`). The caller opens `authorizeUrl` in a `noopener`
   popup and polls `GET /auth/state?state=…` for completion.
 - The provider redirects back to the callback (`/auth/callback` for GitHub,
-  `/auth/{provider}/callback` for Google/GitLab/OIDC) with `?code=&state=`. The
-  server constant-time-verifies the CSRF nonce cookie against `state`, claims
+  `/auth/{provider}/callback` for Google/GitLab/Microsoft/OIDC) with
+  `?code=&state=` (Apple is the exception — it POSTs `code` + `state` as a form
+  body to a dedicated `POST /auth/apple/callback`; see
+  [Sign in with Apple](#sign-in-with-apple)). The server constant-time-verifies
+  the CSRF nonce cookie against `state`, claims
   the pending entry (a replay rejects with `400`), exchanges the code for an
   access token, fetches the user's **verified** email, upserts `rtdb_auth.users`,
   and returns popup-closing HTML. The session token is delivered twice — via the
@@ -42,8 +44,9 @@ working with zero providers configured.
   explicitly says `email_verified: false` (many IdPs omit the field).
 - A provider is "configured" only when its required env vars are all non-empty
   (`from_config` returns `None` otherwise) — the two credentials for
-  GitHub/Google/GitLab, and all five `RTDB_OIDC_*` fields for the generic OIDC
-  provider.
+  GitHub/Google/GitLab, `RTDB_MICROSOFT_CLIENT_ID`/`_SECRET` for Microsoft
+  (`_TENANT` defaults to `common`), all four `RTDB_APPLE_*` fields for Apple,
+  and all five `RTDB_OIDC_*` fields for the generic OIDC provider.
 
 ## Prerequisites (all providers)
 
@@ -207,23 +210,78 @@ missing `email_verified` is accepted — many IdPs omit it).
 
 ## Microsoft (Entra ID / Azure AD v2.0)
 
-This is OIDC against Microsoft's well-known endpoints, so unlike the generic
-OIDC provider you supply **credentials + tenant only** — no four-URL paste.
-Register an app in the [Microsoft Entra admin center](https://entra.microsoft.com/)
-(App registrations → New registration), add the web redirect URI
-`$RTDB_PUBLIC_URL/auth/microsoft/callback`, and create a client secret.
+This is OIDC against Microsoft's well-known endpoints (derived from
+`RTDB_MICROSOFT_TENANT`), so unlike the generic OIDC provider you supply
+**credentials + tenant only** — no four-URL paste. Works for work/school
+(Entra ID) and personal (MSA) accounts.
 
-- `RTDB_MICROSOFT_CLIENT_ID` — the app (application) client id.
-- `RTDB_MICROSOFT_CLIENT_SECRET` — the app's client secret **value** (not the
-  secret id).
-- `RTDB_MICROSOFT_TENANT` — `common` (default; any Microsoft account, work/school
-  or personal) or a tenant GUID/`organizations`/`consumers` to restrict audience.
+1. In the [Microsoft Entra admin center](https://entra.microsoft.com/) go to
+   **Applications → App registrations → New registration**.
+2. **Supported account types** chooses the audience — and sets what you'll use
+   for `RTDB_MICROSOFT_TENANT`:
+   - *Accounts in this organizational directory only* → a single Entra tenant
+     (work/school only); use that directory's **Directory (tenant) ID**.
+   - *Accounts in any organizational directory* → `organizations`.
+   - *Accounts in any Microsoft Entra ID or personal Microsoft accounts* →
+     `common` (the default par-rt-db uses when `_TENANT` is unset).
+   - Note the **Application (client) ID** (`RTDB_MICROSOFT_CLIENT_ID`).
+3. **Authentication → Add a platform → Web** — *not* Single-page app or
+   Mobile/desktop. par-rt-db is a **confidential client**: it holds
+   `CLIENT_SECRET` and performs the code-for-token exchange server-side, which
+   is the *Web* platform. SPA and Public-client platforms are for secret-less
+   browser/native flows and do not match this server's design.
+   - **Redirect URI:** `RTDB_PUBLIC_URL` + `/auth/microsoft/callback`
+     (e.g. `https://rtdb.pardev.net/auth/microsoft/callback`). Must match
+     byte-for-byte, including `https://`.
+4. **Certificates & secrets → New client secret** → copy the secret **Value**
+   (not the Secret ID). The Value is hidden once you leave the page.
+5. Set the env vars (see [Applying changes](#applying-changes)):
+   - `RTDB_MICROSOFT_CLIENT_ID` — the application (client) id.
+   - `RTDB_MICROSOFT_CLIENT_SECRET` — the secret **value**.
+   - `RTDB_MICROSOFT_TENANT` — `common` (default; any account), `organizations`,
+     `consumers`, or a specific tenant GUID. A GUID restricts sign-in to that
+     one Entra tenant.
 
 The authorize URL uses `response_mode=query`, so the standard GET callback
-handles the redirect. Identity is email-keyed (Microsoft Graph's
-`/oidc/userinfo` `email`), reusing an existing account when the email matches.
+handles the redirect (no `form_post`, unlike Apple).
+
+**Email sourcing — read this if a Microsoft login fails with `no email`:**
+Microsoft's `oidc/userinfo` endpoint is sparse and **omits the email *and*
+`preferred_username` for Entra ID accounts**, returning only
+`{sub, name, given_name, family_name, picture}`. par-rt-db therefore reads the
+email from the **id_token** returned by the token exchange — the `email` claim
+for personal (MSA) accounts and `preferred_username` (the UPN, e.g.
+`you@org.com`) for work/school accounts — with the userinfo fields as a
+fallback. Identity is email-keyed and reuses an existing account when the
+address matches another provider. (The id_token payload is base64-decoded
+without signature verification — it arrived over TLS from the token endpoint,
+the same trust posture as the userinfo call.)
 
 ## Sign in with Apple
+
+Sign in with Apple requires a paid Apple Developer account. You create a
+**Services ID** (not an App ID) plus a **Sign in with Apple key**; par-rt-db
+derives its four config pieces from them.
+
+1. First create an **App ID** (if you don't have one): **Certificates,
+   Identifiers & Profiles → Identifiers → + → App IDs**, enable **Sign In with
+   Apple** (this is the *Primary App ID* the Services ID binds to).
+2. Create the **Services ID**: **Identifiers → + → Services ID**, give it an
+   identifier string (e.g. `com.example.rtdb`) — this is your
+   `RTDB_APPLE_CLIENT_ID`. Enable **Sign In with Apple → Configure**:
+   - **Primary App ID:** the App ID from step 1.
+   - **Domains:** the host of `RTDB_PUBLIC_URL` (e.g. `rtdb.pardev.net`).
+   - **Return URLs:** `RTDB_PUBLIC_URL` + `/auth/apple/callback`
+     (e.g. `https://rtdb.pardev.net/auth/apple/callback`). Must match
+     byte-for-byte. Apple does **not** allow `http`/`localhost` in production
+     (Sandbox allows `localhost` for testing).
+3. Note your **Team ID** (10 chars, top-right of the portal) →
+   `RTDB_APPLE_TEAM_ID`.
+4. Create the **key**: **Keys → + → Sign in with Apple → Configure** (select the
+   Primary App ID from step 1) → **Register**. Note the **Key ID**
+   (`RTDB_APPLE_KEY_ID`) and **download the private key once** (`.p8` PEM — you
+   cannot re-download it) → `RTDB_APPLE_PRIVATE_KEY`.
+5. Apply the four env vars (see [Applying changes](#applying-changes)).
 
 Two protocol-mandated differences from the other providers:
 
