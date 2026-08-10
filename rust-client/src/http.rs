@@ -3759,6 +3759,7 @@ mod admin_tests {
             table: Some(Some("notes".to_string())),
             events: Some(events.clone()),
             enabled: Some(false),
+            rotate_secret: Some(true),
         };
         assert_eq!(
             serde_json::to_value(&full).unwrap(),
@@ -3766,7 +3767,8 @@ mod admin_tests {
                 "url": "https://new.example/cb",
                 "table": "notes",
                 "events": ["insert", "patch"],
-                "enabled": false
+                "enabled": false,
+                "rotateSecret": true
             }),
         );
     }

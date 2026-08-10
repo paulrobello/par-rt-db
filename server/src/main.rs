@@ -55,6 +55,13 @@ async fn main() {
             .unwrap_or_else(|err| {
                 tracing::warn!(error = %err, "failed to ensure rtdb.webhooks tables");
             });
+        // SEC-115: every webhook needs a signing secret before the delivery
+        // worker drains, so backfill any legacy NULL-secret rows now.
+        rtdb_server::webhook::backfill_webhook_secrets(&pool)
+            .await
+            .unwrap_or_else(|err| {
+                tracing::warn!(error = %err, "failed to backfill webhook secrets");
+            });
         tokio::spawn(rtdb_server::webhook::run_delivery_worker(pool.clone()));
     }
 

@@ -549,6 +549,12 @@ pub struct Webhook {
     /// always emits it.
     #[serde(default)]
     pub enabled: bool,
+    /// Per-webhook HMAC signing key (SEC-115); the receiver uses it to verify
+    /// each delivery's `X-Rtdb-Signature` header. Server-generated; surfaced
+    /// here so an operator can copy it to the receiver. `#[serde(default)]`
+    /// parses an older server that omits the field as `None`.
+    #[serde(default)]
+    pub secret: Option<String>,
 }
 
 /// One delivery row from a webhook's outbox
@@ -590,7 +596,9 @@ pub struct CreateWebhookOptions {
 /// clears it to all-tables, and `Some(Some(t))` sets it to `t`. Mirrors
 /// `EditWebhookOptions` in `ts-client` (where `undefined`/`null`/`string` is
 /// the same tri-state) and pairs with the server's `deserialize_some` on the
-/// PUT body.
+/// PUT body. `rotate_secret = Some(true)` generates a fresh server-side
+/// signing secret (SEC-115); the secret value itself is never accepted from
+/// the client, so this is a flag, not a value.
 #[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WebhookEditOptions {
@@ -602,6 +610,8 @@ pub struct WebhookEditOptions {
     pub events: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rotate_secret: Option<bool>,
 }
 
 /// Optional filters for [`crate::http::RtDbHttpClient::list_deliveries`]. All

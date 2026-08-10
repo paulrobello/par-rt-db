@@ -569,6 +569,7 @@ class RtDbAdminClient:
         table: str | None | object = _UNSET,
         events: list[str] | None = None,
         enabled: bool | None = None,
+        rotate_secret: bool | None = None,
     ) -> Webhook:
         """``PUT /admin/db/{db}/webhooks/{id}`` → the updated :class:`Webhook`.
 
@@ -580,10 +581,13 @@ class RtDbAdminClient:
         * ``None`` → sent as JSON ``null`` → clears to all-tables
         * ``"items"`` → sent as ``"items"`` → set to that table
 
-        ``url``/``events``/``enabled`` use a plain ``None`` default (their
-        distinguishing value would be the empty string / empty list / etc., so
-        a sentinel is unnecessary): ``None`` means "not passed" → omitted from
-        the body → unchanged; pass a real value to set it.
+        ``url``/``events``/``enabled``/``rotate_secret`` use a plain ``None``
+        default (their distinguishing value would be the empty string / empty
+        list / etc., so a sentinel is unnecessary): ``None`` means "not passed"
+        → omitted from the body → unchanged; pass a real value to set it.
+        ``rotate_secret=True`` generates a fresh server-side signing secret
+        (SEC-115); the secret value itself is never accepted from the client,
+        so this is a flag, not a value.
         """
         body: dict[str, Any] = {}
         if url is not None:
@@ -596,6 +600,8 @@ class RtDbAdminClient:
             body["events"] = list(events)
         if enabled is not None:
             body["enabled"] = enabled
+        if rotate_secret is not None:
+            body["rotateSecret"] = rotate_secret
         resp = self._req("PUT", f"/admin/db/{db}/webhooks/{id}", json=body)
         return Webhook.model_validate(resp.json())
 
@@ -1142,11 +1148,13 @@ class AsyncRtDbAdminClient:
         table: str | None | object = _UNSET,
         events: list[str] | None = None,
         enabled: bool | None = None,
+        rotate_secret: bool | None = None,
     ) -> Webhook:
         """``PUT /admin/db/{db}/webhooks/{id}`` → updated :class:`Webhook` (async).
 
         See :meth:`RtDbAdminClient.edit_webhook` for the ``table`` tri-state
-        (omitted vs ``None`` vs string) and body-building rules.
+        (omitted vs ``None`` vs string) and body-building rules, and for the
+        ``rotate_secret`` flag (SEC-115).
         """
         body: dict[str, Any] = {}
         if url is not None:
@@ -1157,6 +1165,8 @@ class AsyncRtDbAdminClient:
             body["events"] = list(events)
         if enabled is not None:
             body["enabled"] = enabled
+        if rotate_secret is not None:
+            body["rotateSecret"] = rotate_secret
         resp = await self._req("PUT", f"/admin/db/{db}/webhooks/{id}", json=body)
         return Webhook.model_validate(resp.json())
 

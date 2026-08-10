@@ -794,6 +794,7 @@ describe("RtDbAdminClient webhooks", () => {
         events: ["*"],
         createdAt: 1_700_000_000_000,
         enabled: true,
+        secret: null,
       },
       {
         id: 2,
@@ -803,6 +804,7 @@ describe("RtDbAdminClient webhooks", () => {
         events: ["insert", "patch"],
         createdAt: 1_700_000_000_001,
         enabled: false,
+        secret: "deadbeef".repeat(8),
       },
     ];
     const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ webhooks }));
@@ -865,6 +867,7 @@ describe("RtDbAdminClient webhooks", () => {
       events: ["insert"],
       createdAt: 1_700_000_000_000,
       enabled: false,
+      secret: null,
     };
     const fetchMock = vi.fn().mockResolvedValue(jsonResponse(updated));
     const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });

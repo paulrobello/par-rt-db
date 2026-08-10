@@ -318,6 +318,16 @@ pub async fn ensure_webhooks_tables(pool: &PgPool) -> Result<(), RtDbError> {
     .execute(&mut *tx)
     .await?;
 
+    // Additive column (SEC-115): per-webhook HMAC secret used to sign each
+    // delivery (`X-Rtdb-Signature`). Nullable so the ALTER is idempotent and
+    // pre-existing rows survive; `webhook::backfill_webhook_secrets` (called
+    // from boot after this) generates a value for every NULL row, and
+    // `create_webhook` always sets one, so the column is effectively non-null
+    // once boot completes.
+    sqlx::query("ALTER TABLE rtdb.webhooks ADD COLUMN IF NOT EXISTS secret TEXT")
+        .execute(&mut *tx)
+        .await?;
+
     sqlx::query("CREATE INDEX IF NOT EXISTS webhooks_db_idx ON rtdb.webhooks (db)")
         .execute(&mut *tx)
         .await?;

@@ -168,7 +168,9 @@ where
 /// unchanged. `table` is a nested `Option<Option<String>>`: outer `None` leaves
 /// the table filter alone, `Some(None)` (JSON `null`) clears it to all-tables,
 /// and `Some(Some(t))` sets it to `t`. The other fields are flat `Option<T>` —
-/// present sets, absent keeps the existing value.
+/// present sets, absent keeps the existing value. `rotateSecret: true`
+/// generates a fresh server-side signing secret (SEC-115); the secret value
+/// itself is never accepted from the client.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct AdminEditWebhookRequest {
@@ -180,6 +182,8 @@ pub(super) struct AdminEditWebhookRequest {
     events: Option<Vec<String>>,
     #[serde(default)]
     enabled: Option<bool>,
+    #[serde(default)]
+    rotate_secret: bool,
 }
 
 /// `PUT /admin/db/{db}/webhooks/{id}` — partial-edit a webhook's `url`,
@@ -256,6 +260,7 @@ pub(super) async fn admin_edit_webhook(
         tbl_ref,
         events.as_deref(),
         body.enabled,
+        body.rotate_secret,
     )
     .await?
     .ok_or_else(|| RtDbError::not_found("webhook not found for this database"))?;

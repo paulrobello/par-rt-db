@@ -1037,6 +1037,27 @@ def test_edit_webhook_sends_multiple_fields_together() -> None:
     }
 
 
+def test_edit_webhook_rotate_secret_sends_camel_case_flag() -> None:
+    """`rotate_secret=True` is sent as the camelCase `rotateSecret` flag and
+    omitted when not passed (SEC-115 client mirror of the server's
+    `rotate_secret: bool` PUT body field)."""
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json=_WEBHOOK_ROW_TABLED)
+
+    with _sync_client(handler) as c:
+        c.edit_webhook("kanban", 11, rotate_secret=True)
+    assert captured["body"] == {"rotateSecret": True}
+
+    # Omitted → absent from body (server default `false` applies).
+    captured.clear()
+    with _sync_client(handler) as c:
+        c.edit_webhook("kanban", 11, enabled=False)
+    assert "rotateSecret" not in captured["body"]
+
+
 def test_delete_webhook_returns_none_on_ok() -> None:
     captured: dict[str, Any] = {}
 

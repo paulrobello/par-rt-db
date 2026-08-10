@@ -28,6 +28,14 @@ use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 
+/// One captured delivery: the raw body bytes plus the `X-Rtdb-Signature` header
+/// value (if present). Captured by `receive_signed_hook` for the SEC-115 test.
+#[derive(Clone)]
+struct CapturedDelivery {
+    body: Vec<u8>,
+    signature: Option<String>,
+}
+
 /// POSTs `{txn: {steps}}` to `/admin/db/{db}/mutate` and returns `results`.
 async fn mutate(addr: SocketAddr, db: &str, steps: Value) -> Value {
     let resp = admin_post(
@@ -764,6 +772,209 @@ async fn webhook_deliveries_filter_sort_and_paginate() -> anyhow::Result<()> {
     )
     .await;
     assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    Ok(())
+}
+
+// (f) SEC-115: each delivery carries `X-Rtdb-Signature: t=<ts>,v1=<hmac>` and
+// the tag verifies against the webhook's secret over the exact body bytes the
+// receiver observed. Also asserts the secret is generated server-side on
+// create (present in the list response), is not the literal a client might
+// have supplied, and rotates on `rotateSecret: true`.
+async fn receive_signed_hook(
+    State(captured): State<Arc<Mutex<Vec<CapturedDelivery>>>>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    let signature = headers
+        .get("x-rtdb-signature")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    captured.lock().await.push(CapturedDelivery {
+        body: body.to_vec(),
+        signature,
+    });
+    Json(json!({"ok": true}))
+}
+
+#[tokio::test]
+async fn webhook_delivery_carries_verifiable_signature() -> anyhow::Result<()> {
+    let state = test_state_with_webhooks().await;
+    let pool = state.pool.clone();
+    let addr = spawn_app(state.clone()).await;
+    let name = fresh_db(&state).await;
+
+    let captured: Arc<Mutex<Vec<CapturedDelivery>>> = Arc::new(Mutex::new(Vec::new()));
+    let receiver_app = Router::new()
+        .route("/hook", axum::routing::post(receive_signed_hook))
+        .with_state(captured.clone());
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind receiver");
+    let rx_addr = listener.local_addr().expect("receiver local_addr");
+    tokio::spawn(axum::serve(listener, receiver_app).into_future());
+    let url = format!("http://{rx_addr}/hook");
+
+    let webhook_id = create_webhook(
+        addr,
+        &name,
+        json!({"url": url, "table": "projects", "events": ["insert"]}),
+    )
+    .await;
+
+    // The webhook's secret is generated server-side and visible in the list
+    // response so an operator can copy it to the receiver.
+    let list_body: Value = admin_get(addr, &format!("/admin/db/{name}/webhooks"))
+        .await
+        .json()
+        .await
+        .expect("parse list");
+    let secret = list_body["webhooks"][0]["secret"]
+        .as_str()
+        .expect("secret present on create")
+        .to_string();
+    assert_eq!(secret.len(), 64, "secret is 64 hex chars (256 bits)");
+    assert!(
+        secret.chars().all(|c| c.is_ascii_hexdigit()),
+        "secret is hex: {secret}"
+    );
+
+    // Mutate to enqueue one delivery.
+    let results = mutate(
+        addr,
+        &name,
+        json!([{"op": "insert", "table": "projects", "doc": {
+            "name": "sig", "status": "active", "tags": [], "updatedAt": 0
+        }}]),
+    )
+    .await;
+    let doc_id = results[0]["id"]
+        .as_str()
+        .expect("insert returns id")
+        .to_string();
+    assert_eq!(delivery_count(&pool, webhook_id).await, 1);
+
+    // Drain until OUR delivery reaches `delivered` (matches the e2e test's
+    // bounded-loop pattern: a single `drain_once` can defer our row under
+    // parallel test load because the shared outbox is drained in bounded
+    // batches ordered by `next_attempt`).
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        rtdb_server::webhook::drain_once(&pool)
+            .await
+            .expect("drain_once");
+        let delivered: bool = sqlx::query_scalar(
+            "SELECT status = 'delivered' FROM rtdb.webhook_deliveries WHERE webhook_id = $1",
+        )
+        .bind(webhook_id)
+        .fetch_one(&pool)
+        .await
+        .expect("fetch delivery status");
+        if delivered || Instant::now() > deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    // Find OUR captured POST by matching the payload's docId. Under parallel
+    // test load a stale retrying webhook from another test whose URL happened
+    // to land on our recycled ephemeral port can produce an extra POST to our
+    // receiver — filtering by docId keeps the assertion precise about *our*
+    // delivery without coupling to total received count.
+    let cap = {
+        let got = captured.lock().await.clone();
+        let mut ours: Vec<CapturedDelivery> = Vec::new();
+        for entry in got.iter() {
+            if let Ok(parsed) = serde_json::from_slice::<Value>(&entry.body)
+                && parsed["docId"].as_str() == Some(doc_id.as_str())
+            {
+                ours.push(entry.clone());
+            }
+        }
+        ours.pop()
+            .expect("our delivery reached the receiver and was captured")
+    };
+
+    // Header present and well-formed: `t=<ts>,v1=<hex>`.
+    let sig_header = cap
+        .signature
+        .as_ref()
+        .expect("X-Rtdb-Signature header present")
+        .clone();
+    let (ts_str, v1) = sig_header
+        .split_once(',')
+        .and_then(|(t, v)| {
+            Some((
+                t.strip_prefix("t=")?.to_string(),
+                v.strip_prefix("v1=")?.to_string(),
+            ))
+        })
+        .unwrap_or_else(|| panic!("signature header malformed: {sig_header}"));
+    let ts: i64 = ts_str
+        .parse()
+        .unwrap_or_else(|_| panic!("timestamp numeric: {ts_str}"));
+
+    // The signature verifies against the webhook's secret over the EXACT body
+    // bytes the receiver observed — proving the receiver can authenticate the
+    // delivery and that no bytes were mangled in flight.
+    assert!(
+        rtdb_server::webhook::verify_signature(&secret, ts, &cap.body, &v1),
+        "signature verifies against the webhook secret and observed body"
+    );
+    // A tampered body must NOT verify (defense against forgery / capture-replay
+    // without the secret).
+    assert!(
+        !rtdb_server::webhook::verify_signature(&secret, ts, b"tampered", &v1),
+        "tampered body must not verify"
+    );
+
+    Ok(())
+}
+
+// (g) SEC-115 rotation: `PUT {rotateSecret: true}` generates a new secret,
+// different from the prior one. The secret value itself is never accepted from
+// the client (no `secret` field on the request body).
+#[tokio::test]
+async fn webhook_rotate_secret_generates_new_value() -> anyhow::Result<()> {
+    let state = test_state_with_webhooks().await;
+    let addr = spawn_app(state.clone()).await;
+    let name = fresh_db(&state).await;
+
+    let id = create_webhook(
+        addr,
+        &name,
+        json!({"url": "http://example.com/hook", "events": ["*"]}),
+    )
+    .await;
+    let before = list_webhook_by_id(addr, &name, id).await;
+    let secret_before = before["secret"]
+        .as_str()
+        .expect("secret present on create")
+        .to_string();
+    assert_eq!(secret_before.len(), 64);
+
+    // Rotate.
+    let resp = admin_put(
+        addr,
+        &format!("/admin/db/{name}/webhooks/{id}"),
+        json!({"rotateSecret": true}),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let updated: Value = resp.json().await.expect("parse edit response");
+    let secret_after = updated["secret"]
+        .as_str()
+        .expect("secret present after rotation")
+        .to_string();
+    assert_eq!(secret_after.len(), 64);
+    assert_ne!(
+        secret_after, secret_before,
+        "rotation produces a new secret value"
+    );
+
+    // The list view agrees with the rotated value.
+    let listed = list_webhook_by_id(addr, &name, id).await;
+    assert_eq!(listed["secret"], json!(secret_after));
 
     Ok(())
 }

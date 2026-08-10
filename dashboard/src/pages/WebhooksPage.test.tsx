@@ -35,6 +35,7 @@ const enabledAll: Webhook = {
   events: ["*"],
   createdAt: 1_750_000_000_000,
   enabled: true,
+  secret: null,
 };
 
 const scopedDisabled: Webhook = {
@@ -45,6 +46,7 @@ const scopedDisabled: Webhook = {
   events: ["insert", "patch"],
   createdAt: 1_750_000_000_000,
   enabled: false,
+  secret: null,
 };
 
 const deliveryDelivered: WebhookDelivery = {

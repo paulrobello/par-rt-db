@@ -11,10 +11,12 @@
 //! hard attempt ceiling. Enqueue is best-effort by contract: a logging failure
 //! is warned and never fails a durable mutation, mirroring `audit::write_audit_rows`.
 
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
+use rand::RngCore;
+use rand::rngs::OsRng;
 use serde::Serialize;
 use sqlx::PgPool;
 
@@ -80,7 +82,10 @@ pub struct WebhookPayload {
 
 /// One registered webhook. `tbl = None` means "all tables"; `events` contains
 /// op names (`insert`/`patch`/`replace`/`delete`/`upsert`) or the single
-/// element `*` to match every event.
+/// element `*` to match every event. `secret` is the per-webhook HMAC key used
+/// to sign each delivery (`X-Rtdb-Signature`); always set after boot backfill,
+/// surfaced in the admin response so an operator can copy it to the receiver
+/// (SEC-115).
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Webhook {
@@ -92,6 +97,7 @@ pub struct Webhook {
     pub events: Vec<String>,
     pub created_at: i64,
     pub enabled: bool,
+    pub secret: Option<String>,
 }
 
 /// Exponential backoff in milliseconds for the next retry after `attempts`
@@ -158,6 +164,88 @@ pub fn is_blocked_ip(ip: IpAddr) -> bool {
     }
 }
 
+/// Generates a fresh 256-bit webhook signing secret as 64 hex chars. Backed by
+/// `OsRng` (CSPRNG); the value never leaves the server except in the admin
+/// list/edit response so an operator can copy it to the receiver. Used at
+/// `create_webhook`, on a `rotateSecret` edit, and to backfill any NULL rows
+/// at boot.
+pub fn generate_secret() -> String {
+    let mut bytes = [0u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    hex::encode(bytes)
+}
+
+/// Hex HMAC-SHA256 over `"{ts}.{body}"` using the webhook's secret. The body is
+/// the exact byte sequence POSTed to the receiver, so the receiver can
+/// recompute the tag over the bytes it received without any normalization
+/// ambiguity. Hex (not base64) keeps the header free of `+/=` hazards.
+pub fn compute_signature(secret: &str, ts_ms: i64, body: &[u8]) -> String {
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, secret.as_bytes());
+    let mut msg = Vec::with_capacity(20 + body.len());
+    msg.extend_from_slice(ts_ms.to_string().as_bytes());
+    msg.push(b'.');
+    msg.extend_from_slice(body);
+    hex::encode(ring::hmac::sign(&key, &msg).as_ref())
+}
+
+/// Constant-time verification of a delivery signature, mirroring
+/// `signed_url::verify`. Returns `false` for a non-hex signature, a mismatched
+/// key, or any difference in `ts`/`body` (the compare itself is constant-time
+/// via `ring::hmac::verify`; the `false` return for bad hex reveals only
+/// "malformed", not a near-miss).
+pub fn verify_signature(secret: &str, ts_ms: i64, body: &[u8], sig_hex: &str) -> bool {
+    let Ok(sig_bytes) = hex::decode(sig_hex) else {
+        return false;
+    };
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, secret.as_bytes());
+    let mut msg = Vec::with_capacity(20 + body.len());
+    msg.extend_from_slice(ts_ms.to_string().as_bytes());
+    msg.push(b'.');
+    msg.extend_from_slice(body);
+    ring::hmac::verify(&key, &msg, &sig_bytes).is_ok()
+}
+
+/// reqwest DNS resolver that re-runs the SSRF denylist at connect time (SEC-114
+/// TOCTOU close). `validate_webhook_url` already vets the URL at registration,
+/// but reqwest performed an INDEPENDENT resolution at connect time with no
+/// re-check — a DNS-rebinding attack could land a public-at-registration host
+/// on a private/metadata IP at delivery. Wiring this resolver into the delivery
+/// client means reqwest's connect-time resolution passes through the same
+/// `is_blocked_ip` filter, so a rebind to a blocked IP is rejected (the
+/// resolver returns an error → the delivery fails and retries). The single
+/// shared delivery client is preserved; no per-delivery client build.
+#[derive(Clone, Default)]
+struct WebhookDnsResolver;
+
+impl reqwest::dns::Resolve for WebhookDnsResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_string();
+        Box::pin(async move {
+            // `tokio::net::lookup_host` needs a `host:port` string; the port is
+            // irrelevant to resolution (DNS is port-agnostic) and reqwest
+            // replaces port 0 with the scheme's conventional port, so 0 is a
+            // safe placeholder.
+            let resolved: Vec<SocketAddr> = tokio::net::lookup_host(format!("{host}:0"))
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                    format!("DNS resolution failed for '{host}': {e}").into()
+                })?
+                .filter(|addr| !is_blocked_ip(addr.ip()))
+                .collect();
+            if resolved.is_empty() {
+                return Err(format!(
+                    "'{host}' resolves only to blocked IPs (private/loopback/metadata)"
+                )
+                .into());
+            }
+            // Hand back the vetted SocketAddrs (port 0; reqwest fills the real
+            // port from the URL scheme). The order is whatever the OS resolver
+            // returned — reqwest connects to the first reachable one.
+            Ok(Box::new(resolved.into_iter()) as Box<dyn Iterator<Item = SocketAddr> + Send>)
+        })
+    }
+}
+
 /// Validates a webhook target URL against the SSRF policy (SEC-001). When
 /// `allow_http` is true (dev flag `RTDB_WEBHOOK_ALLOW_HTTP`) the scheme check
 /// and the IP-range denylist are both relaxed so a developer may point a
@@ -168,10 +256,11 @@ pub fn is_blocked_ip(ip: IpAddr) -> bool {
 ///   - The host literal, if an IP, must not be in [`is_blocked_ip`]; the host
 ///     literal, if a name, must not be a known cloud-metadata hostname.
 ///   - The hostname is resolved via `tokio::net::lookup_host` and rejected if
-///     ANY resolved address is in [`is_blocked_ip`] (DNS-rebinding to a public
-///     address at registration time then private at delivery time is residual;
-///     the worker's `redirect(Policy::none())` client closes the redirect
-///     bypass).
+///     ANY resolved address is in [`is_blocked_ip`]. The delivery client
+///     additionally routes connect-time resolution through [`WebhookDnsResolver`]
+///     so a DNS rebind between registration and delivery cannot land the
+///     connection on a blocked IP (SEC-114); the worker's
+///     `redirect(Policy::none())` closes the redirect bypass.
 pub async fn validate_webhook_url(url: &str, allow_http: bool) -> Result<(), String> {
     let parsed = url::Url::parse(url).map_err(|e| format!("invalid URL: {e}"))?;
     if !parsed.username().is_empty() || parsed.password().is_some() {
@@ -300,19 +389,24 @@ pub async fn enqueue_for_ops(
     Ok(())
 }
 
-/// Selects up to [`DRAIN_BATCH`] due deliveries joined with their webhook URL,
-/// POSTs each payload via reqwest, and updates the row to `delivered` (2xx) or
-/// bumps `attempts`/`last_error` and sets either `retrying` (under
+/// Selects up to [`DRAIN_BATCH`] due deliveries joined with their webhook URL
+/// and signing secret, POSTs each payload via reqwest with an
+/// `X-Rtdb-Signature` header (SEC-115), and updates the row to `delivered`
+/// (2xx) or bumps `attempts`/`last_error` and sets either `retrying` (under
 /// [`MAX_ATTEMPTS`]) or `failed` (at the ceiling). Returns the count processed.
 /// Best-effort per row: a single delivery's update failure is logged and the
 /// loop continues to the next row so one bad row cannot stall the outbox.
+///
+/// The body is serialized ONCE and the same bytes are both POSTed and
+/// HMAC'd, so the receiver can recompute the tag over exactly the bytes it
+/// received with no normalization ambiguity.
 async fn drain_once_with_client(
     pool: &PgPool,
     client: &reqwest::Client,
 ) -> Result<usize, RtDbError> {
-    type DueRow = (i64, String, serde_json::Value, i32);
+    type DueRow = (i64, String, Option<String>, serde_json::Value, i32);
     let rows: Vec<DueRow> = sqlx::query_as(
-        "SELECT d.id, w.url, d.payload, d.attempts \
+        "SELECT d.id, w.url, w.secret, d.payload, d.attempts \
          FROM rtdb.webhook_deliveries d \
          JOIN rtdb.webhooks w ON w.id = d.webhook_id \
          WHERE d.status IN ('pending', 'retrying') AND d.next_attempt <= $1 \
@@ -325,8 +419,37 @@ async fn drain_once_with_client(
     .await?;
 
     let count = rows.len();
-    for (id, url, payload, attempts) in rows {
-        let result = client.post(&url).json(&payload).send().await;
+    for (id, url, secret, payload, attempts) in rows {
+        // Serialize once; these exact bytes are both sent and signed.
+        let body_bytes = match serde_json::to_vec(&payload) {
+            Ok(b) => b,
+            Err(err) => {
+                let msg = truncate_error(&format!("encode payload: {err}"));
+                mark_retry(pool, id, attempts, msg).await;
+                continue;
+            }
+        };
+        let ts = now_ms();
+        let mut req = client
+            .post(&url)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body_bytes.clone());
+        match secret.as_deref() {
+            Some(s) if !s.is_empty() => {
+                req = req.header(
+                    "X-Rtdb-Signature",
+                    format!("t={ts},v1={}", compute_signature(s, ts, &body_bytes)),
+                );
+            }
+            // Should not happen after boot backfill, but degrade gracefully:
+            // deliver unsigned rather than drop the event. Receivers that
+            // require a signature will reject; the row retries and surfaces.
+            _ => tracing::warn!(
+                delivery_id = id,
+                "webhook delivery skipped signature: webhook has no secret"
+            ),
+        }
+        let result = req.send().await;
         let outcome = match result {
             Ok(resp) if resp.status().is_success() => Ok(()),
             Ok(resp) => Err(format!("HTTP {}", resp.status().as_u16())),
@@ -347,33 +470,41 @@ async fn drain_once_with_client(
                 }
             }
             Err(msg) => {
-                let new_attempts = attempts + 1;
-                let status = if new_attempts >= MAX_ATTEMPTS {
-                    "failed"
-                } else {
-                    "retrying"
-                };
-                let next_attempt = now_ms() + backoff_ms(new_attempts);
-                let last_error = truncate_error(&msg);
-                if let Err(err) = sqlx::query(
-                    "UPDATE rtdb.webhook_deliveries \
-                     SET attempts = $2, status = $3, next_attempt = $4, last_error = $5 \
-                     WHERE id = $1",
-                )
-                .bind(id)
-                .bind(new_attempts)
-                .bind(status)
-                .bind(next_attempt)
-                .bind(&last_error)
-                .execute(pool)
-                .await
-                {
-                    tracing::warn!(delivery_id = id, error = %err, "webhook: mark retry failed");
-                }
+                mark_retry(pool, id, attempts, truncate_error(&msg)).await;
             }
         }
     }
     Ok(count)
+}
+
+/// Bumps `attempts`, computes backoff, and sets the row to `retrying` (under
+/// [`MAX_ATTEMPTS`]) or `failed` (at the ceiling). Best-effort: a DB error here
+/// is logged and swallowed so a single bad update cannot stall the outbox loop.
+/// `raw_error` should already be truncated by the caller (the encode-failure
+/// path passes a truncated message; so does the send/HTTP-error path).
+async fn mark_retry(pool: &PgPool, id: i64, attempts: i32, last_error: String) {
+    let new_attempts = attempts + 1;
+    let status = if new_attempts >= MAX_ATTEMPTS {
+        "failed"
+    } else {
+        "retrying"
+    };
+    let next_attempt = now_ms() + backoff_ms(new_attempts);
+    if let Err(err) = sqlx::query(
+        "UPDATE rtdb.webhook_deliveries \
+         SET attempts = $2, status = $3, next_attempt = $4, last_error = $5 \
+         WHERE id = $1",
+    )
+    .bind(id)
+    .bind(new_attempts)
+    .bind(status)
+    .bind(next_attempt)
+    .bind(&last_error)
+    .execute(pool)
+    .await
+    {
+        tracing::warn!(delivery_id = id, error = %err, "webhook: mark retry failed");
+    }
 }
 
 /// One drain pass with a freshly-built HTTP client. Exposed for tests so the
@@ -389,16 +520,20 @@ pub async fn drain_once(pool: &PgPool) -> Result<usize, RtDbError> {
 }
 
 /// Builds the webhook-delivery `reqwest::Client`: bounded timeout, **no
-/// redirect-following**. A redirect to an internal host is the SSRF bypass
+/// redirect-following**, and a custom DNS resolver that re-runs the SSRF
+/// denylist at connect time. A redirect to an internal host is the SSRF bypass
 /// vector — the registration validator ([`validate_webhook_url`]) vets the
 /// registered URL, but a benign-on-registration URL that later returns 3xx to
 /// `169.254.169.254` would still exfiltrate payloads. Surfacing 3xx as the
 /// delivery's `last_error` (via the `Ok(resp) if resp.status().is_success()`
-/// arm) closes that path without a per-redirect denylist (SEC-001).
+/// arm) closes that path without a per-redirect denylist (SEC-001). The
+/// [`WebhookDnsResolver`] closes the SEC-114 residual: reqwest no longer does
+/// an independent unvetted resolution at connect time.
 fn build_delivery_client() -> Result<reqwest::Client, RtDbError> {
     reqwest::Client::builder()
         .timeout(DELIVERY_TIMEOUT)
         .redirect(reqwest::redirect::Policy::none())
+        .dns_resolver(Arc::new(WebhookDnsResolver))
         .build()
         .map_err(|e| RtDbError::internal(format!("build webhook HTTP client: {e}")))
 }
@@ -428,9 +563,18 @@ pub async fn run_delivery_worker(pool: PgPool) {
 /// Lists webhooks registered for `db`, ordered by id. Called by
 /// `GET /admin/db/{db}/webhooks`.
 pub async fn list_webhooks(pool: &PgPool, db: &str) -> Result<Vec<Webhook>, RtDbError> {
-    type Row = (i64, String, Option<String>, String, Vec<String>, i64, bool);
+    type Row = (
+        i64,
+        String,
+        Option<String>,
+        String,
+        Vec<String>,
+        i64,
+        bool,
+        Option<String>,
+    );
     let rows: Vec<Row> = sqlx::query_as(
-        "SELECT id, db, tbl, url, events, created_at, enabled \
+        "SELECT id, db, tbl, url, events, created_at, enabled, secret \
          FROM rtdb.webhooks WHERE db = $1 ORDER BY id",
     )
     .bind(db)
@@ -438,22 +582,27 @@ pub async fn list_webhooks(pool: &PgPool, db: &str) -> Result<Vec<Webhook>, RtDb
     .await?;
     Ok(rows
         .into_iter()
-        .map(|(id, db, tbl, url, events, created_at, enabled)| Webhook {
-            id,
-            db,
-            tbl,
-            url,
-            events,
-            created_at,
-            enabled,
-        })
+        .map(
+            |(id, db, tbl, url, events, created_at, enabled, secret)| Webhook {
+                id,
+                db,
+                tbl,
+                url,
+                events,
+                created_at,
+                enabled,
+                secret,
+            },
+        )
         .collect())
 }
 
 /// Inserts a webhook for `db` and returns the stored row. `tbl = None` means
 /// all tables; `events` is stored verbatim (use `["*"]` for all events).
 /// `enabled = false` registers the webhook paused (no deliveries until flipped
-/// back on). Called by `POST /admin/db/{db}/webhooks`.
+/// back on). A 256-bit `secret` is generated server-side (never client-supplied)
+/// and used to sign each delivery; it is returned here so the admin response
+/// can surface it to the operator. Called by `POST /admin/db/{db}/webhooks`.
 pub async fn create_webhook(
     pool: &PgPool,
     db: &str,
@@ -462,11 +611,21 @@ pub async fn create_webhook(
     events: &[String],
     enabled: bool,
 ) -> Result<Webhook, RtDbError> {
-    type Row = (i64, String, Option<String>, String, Vec<String>, i64, bool);
+    type Row = (
+        i64,
+        String,
+        Option<String>,
+        String,
+        Vec<String>,
+        i64,
+        bool,
+        Option<String>,
+    );
+    let secret = generate_secret();
     let row: Row = sqlx::query_as(
-        "INSERT INTO rtdb.webhooks (db, tbl, url, events, created_at, enabled) \
-         VALUES ($1, $2, $3, $4, $5, $6) \
-         RETURNING id, db, tbl, url, events, created_at, enabled",
+        "INSERT INTO rtdb.webhooks (db, tbl, url, events, created_at, enabled, secret) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7) \
+         RETURNING id, db, tbl, url, events, created_at, enabled, secret",
     )
     .bind(db)
     .bind(tbl)
@@ -474,6 +633,7 @@ pub async fn create_webhook(
     .bind(events)
     .bind(now_ms())
     .bind(enabled)
+    .bind(&secret)
     .fetch_one(pool)
     .await?;
     Ok(Webhook {
@@ -484,6 +644,7 @@ pub async fn create_webhook(
         events: row.4,
         created_at: row.5,
         enabled: row.6,
+        secret: row.7,
     })
 }
 
@@ -518,8 +679,11 @@ pub struct DeliveryRow {
 /// `Some(value)` to set, and `tbl` is a nested `Option<Option<&str>>` so the
 /// caller can distinguish "leave the table filter alone" (`None`) from "set it
 /// to all-tables" (`Some(None)`) from "set it to this table" (`Some(Some(t))`.
-/// When every field is `None` this short-circuits to a plain SELECT — no
-/// empty-SET SQL is synthesized. Called by `PUT /admin/db/{db}/webhooks/{id}`.
+/// `rotate_secret = true` generates a fresh server-side signing secret
+/// (SEC-115); the secret value is never accepted from the client. When every
+/// field is `None`/`false` this short-circuits to a plain SELECT — no empty-SET
+/// SQL is synthesized. Called by `PUT /admin/db/{db}/webhooks/{id}`.
+#[allow(clippy::too_many_arguments)]
 pub async fn edit_webhook(
     pool: &PgPool,
     id: i64,
@@ -528,12 +692,22 @@ pub async fn edit_webhook(
     tbl: Option<Option<&str>>,
     events: Option<&[String]>,
     enabled: Option<bool>,
+    rotate_secret: bool,
 ) -> Result<Option<Webhook>, RtDbError> {
-    type Row = (i64, String, Option<String>, String, Vec<String>, i64, bool);
+    type Row = (
+        i64,
+        String,
+        Option<String>,
+        String,
+        Vec<String>,
+        i64,
+        bool,
+        Option<String>,
+    );
     // No fields → just read the current row.
-    if url.is_none() && tbl.is_none() && events.is_none() && enabled.is_none() {
+    if url.is_none() && tbl.is_none() && events.is_none() && enabled.is_none() && !rotate_secret {
         let row: Option<Row> = sqlx::query_as(
-            "SELECT id, db, tbl, url, events, created_at, enabled \
+            "SELECT id, db, tbl, url, events, created_at, enabled, secret \
              FROM rtdb.webhooks WHERE id = $1 AND db = $2",
         )
         .bind(id)
@@ -548,6 +722,7 @@ pub async fn edit_webhook(
             events: r.4,
             created_at: r.5,
             enabled: r.6,
+            secret: r.7,
         }));
     }
     let mut q = sqlx::QueryBuilder::<sqlx::Postgres>::new("UPDATE rtdb.webhooks SET ");
@@ -579,12 +754,20 @@ pub async fn edit_webhook(
         }
         q.push("enabled = ");
         q.push_bind(en);
+        need_comma = true;
+    }
+    if rotate_secret {
+        if need_comma {
+            q.push(", ");
+        }
+        q.push("secret = ");
+        q.push_bind(generate_secret());
     }
     q.push(" WHERE id = ");
     q.push_bind(id);
     q.push(" AND db = ");
     q.push_bind(db);
-    q.push(" RETURNING id, db, tbl, url, events, created_at, enabled");
+    q.push(" RETURNING id, db, tbl, url, events, created_at, enabled, secret");
     // `build()` yields a `Query` whose rows decode as the raw `PgRow` (no tuple
     // indexing); `build_query_as::<Row>()` attaches the tuple decoder so
     // `fetch_optional` returns `Option<Row>` directly.
@@ -597,7 +780,33 @@ pub async fn edit_webhook(
         events: r.4,
         created_at: r.5,
         enabled: r.6,
+        secret: r.7,
     }))
+}
+
+/// Backfills `secret` for any webhooks with a NULL value (legacy rows from
+/// before SEC-115). Called once at boot after `ensure_webhooks_tables` so every
+/// webhook has a signing secret before the delivery worker ever drains. Each
+/// generated secret is 256 bits via [`generate_secret`]. Best-effort: a per-row
+/// UPDATE failure is logged and the row is skipped (it will deliver unsigned
+/// until a later boot or a `rotateSecret` edit regenerates it).
+pub async fn backfill_webhook_secrets(pool: &PgPool) -> Result<(), RtDbError> {
+    let ids: Vec<(i64,)> =
+        sqlx::query_as("SELECT id FROM rtdb.webhooks WHERE secret IS NULL ORDER BY id")
+            .fetch_all(pool)
+            .await?;
+    for (id,) in ids {
+        let secret = generate_secret();
+        if let Err(err) = sqlx::query("UPDATE rtdb.webhooks SET secret = $2 WHERE id = $1")
+            .bind(id)
+            .bind(&secret)
+            .execute(pool)
+            .await
+        {
+            tracing::warn!(webhook_id = id, error = %err, "webhook: backfill secret failed");
+        }
+    }
+    Ok(())
 }
 
 /// Reads delivery rows for `webhook_id` newest-first (by `next_attempt DESC`
@@ -862,5 +1071,46 @@ mod tests {
         validate_webhook_url("https://203.0.113.10/hook", false)
             .await
             .expect("public IP literal with https is allowed");
+    }
+
+    // ===================== SEC-115 delivery signing =====================
+
+    #[test]
+    fn generate_secret_is_64_hex_chars_and_unique() {
+        let a = generate_secret();
+        let b = generate_secret();
+        // 256 bits → 32 bytes → 64 hex chars.
+        assert_eq!(a.len(), 64, "secret is 64 hex chars: {a}");
+        assert!(
+            a.chars().all(|c| c.is_ascii_hexdigit()),
+            "secret is hex: {a}"
+        );
+        // Two consecutive draws differ (CSPRNG; collision over 256 bits is
+        // cryptographically infeasible — a repeat here means OsRng is broken).
+        assert_ne!(a, b, "two generated secrets must differ");
+    }
+
+    #[test]
+    fn signature_roundtrips_and_rejects_tamper() {
+        let secret = "whsec-abc";
+        let body = br#"{"db":"x","table":"t","docId":"d1","kind":"insert","ts":1}"#;
+        let ts = 1_700_000_000_000_i64;
+        let sig = compute_signature(secret, ts, body);
+        // Verifies against the same inputs.
+        assert!(
+            verify_signature(secret, ts, body, &sig),
+            "signature verifies against the same inputs"
+        );
+        // Hex tag is 64 chars (SHA-256 → 32 bytes → 64 hex).
+        assert_eq!(sig.len(), 64);
+        // Tampered body fails.
+        assert!(!verify_signature(secret, ts, b"different", &sig));
+        // Tampered timestamp fails.
+        assert!(!verify_signature(secret, ts + 1, body, &sig));
+        // Different secret fails.
+        assert!(!verify_signature("whsec-other", ts, body, &sig));
+        // Non-hex signature fails (constant-time path short-circuits on
+        // malformed input — reveals only "malformed", not a near-miss).
+        assert!(!verify_signature(secret, ts, body, "not-hex!!"));
     }
 }

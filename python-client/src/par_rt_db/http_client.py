@@ -320,7 +320,11 @@ class Webhook(_Wire):
     Mirrors ``server::webhook::Webhook``. ``table`` is ``None`` for an
     all-tables webhook (the server's ``tbl = None``); ``events`` is the
     matched op-name list (``["*"]`` for all events). ``created_at`` is
-    epoch-millis.
+    epoch-millis. ``secret`` is the per-webhook HMAC signing key (SEC-115);
+    the receiver uses it to verify each delivery's ``X-Rtdb-Signature``
+    header. Server-generated; surfaced here so an operator can copy it to the
+    receiver. ``None`` only before the boot backfill has run (or against an
+    older server that omits the field).
     """
 
     id: int
@@ -330,6 +334,7 @@ class Webhook(_Wire):
     events: list[str]
     created_at: int
     enabled: bool
+    secret: str | None = None
 
 
 class WebhookDelivery(_Wire):

@@ -24,3 +24,19 @@ END $$;
 DELETE FROM rtdb_auth.databases      WHERE name    ~ '^t[0-9a-f]{32}$';
 DELETE FROM rtdb_auth.machine_tokens WHERE db_name ~ '^t[0-9a-f]{32}$';
 DELETE FROM rtdb_auth.allowlist      WHERE db_name ~ '^t[0-9a-f]{32}$';
+-- Webhook delivery rows a test enqueued but never drained to a terminal
+-- (`delivered` / `failed`) state — left behind by a failed/aborted test run.
+-- These linger in the shared `rtdb` schema (not the per-test db schema) and
+-- keep retrying against `127.0.0.1:<ephemeral-port>` URLs whose listeners are
+-- long gone, polluting parallel test runs whose `drain_once` re-delivers them
+-- to whichever test happens to own the recycled port. Scoped to test-pattern
+-- URLs (`127.0.0.1` / `localhost`) so production webhooks are never touched.
+DELETE FROM rtdb.webhook_deliveries
+ WHERE status IN ('pending', 'retrying')
+   AND webhook_id IN (
+     SELECT id FROM rtdb.webhooks
+     WHERE url ~ '^https?://(127\.0\.0\.1|localhost)(:[0-9]+)?(/.*)?$'
+   );
+DELETE FROM rtdb.webhooks
+ WHERE url ~ '^https?://(127\.0\.0\.1|localhost)(:[0-9]+)?(/.*)?$';
+

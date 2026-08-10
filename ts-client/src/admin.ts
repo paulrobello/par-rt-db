@@ -245,7 +245,10 @@ export interface RestoreResult {
 
 /** One registered webhook. `table: null` means "all tables"; `events` carries op
  *  names (`insert`/`patch`/`replace`/`delete`/`upsert`) or the single element
- *  `["*"]` to match every event. */
+ *  `["*"]` to match every event. `secret` is the per-webhook HMAC key the
+ *  server generates (SEC-115); the receiver uses it to verify each delivery's
+ *  `X-Rtdb-Signature` header. Surfaced here so an operator can copy it to the
+ *  receiver; `null` only before the boot backfill has run. */
 export interface Webhook {
   id: number;
   db: string;
@@ -254,6 +257,7 @@ export interface Webhook {
   events: string[];
   createdAt: number;
   enabled: boolean;
+  secret: string | null;
 }
 
 /** One delivery row from a webhook's outbox (`GET .../webhooks/{id}/deliveries`).
@@ -279,12 +283,15 @@ export interface CreateWebhookOptions {
 
 /** Options for `editWebhook`. Every field is optional: omitted = unchanged.
  *  `table` is a tri-state — omit to leave the filter alone, `null` to clear it
- *  to all-tables, or a string to set it. */
+ *  to all-tables, or a string to set it. `rotateSecret: true` generates a fresh
+ *  server-side signing secret (SEC-115); the secret value itself is never
+ *  accepted from the client. */
 export interface EditWebhookOptions {
   url?: string;
   table?: string | null;
   events?: string[];
   enabled?: boolean;
+  rotateSecret?: boolean;
 }
 
 /** Options for `listDeliveries`. All optional; omitted filters/limits mean: no
