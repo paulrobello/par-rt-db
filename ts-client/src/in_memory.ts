@@ -2007,30 +2007,7 @@ export class InMemoryRtDbClient {
     // not rank by ts_rank or vector distance, but the guard exists so the cascade
     // agrees with the server.
     if (q.hybridSearch !== undefined) {
-      if (
-        q.index !== undefined ||
-        eq.length > 0 ||
-        hasRange ||
-        q.order !== undefined ||
-        q.unique ||
-        q.first ||
-        q.count ||
-        q.distinct ||
-        q.aggregate !== undefined ||
-        q.paginate !== undefined ||
-        q.filter !== undefined ||
-        q.search !== undefined ||
-        q.vectorSearch !== undefined ||
-        q.take !== undefined
-      ) {
-        throw new RtDbError(
-          "BAD_REQUEST",
-          "hybridSearch cannot be combined with any other terminal",
-        );
-      }
-      // No in-memory hybrid ranking; return an empty result rather than silently
-      // misranking by falling through to the collect path.
-      return [];
+      return this.executeHybridSearchTerminal(q, eq, hasRange);
     }
 
     // Full-text search terminal. Cascade mirror of server `execute_query`:
@@ -2479,6 +2456,33 @@ export class InMemoryRtDbClient {
       }
     }
     return out;
+  }
+
+  /** `hybridSearch` terminal: in-memory returns an empty result (no ts_rank +
+   * vector distance fusion). Verbatim lift of the former inline
+   * `if (q.hybridSearch !== undefined) { ... }` arm. */
+  private executeHybridSearchTerminal(q: QueryJson, eq: unknown[], hasRange: boolean): unknown {
+    if (
+      q.index !== undefined ||
+      eq.length > 0 ||
+      hasRange ||
+      q.order !== undefined ||
+      q.unique ||
+      q.first ||
+      q.count ||
+      q.distinct ||
+      q.aggregate !== undefined ||
+      q.paginate !== undefined ||
+      q.filter !== undefined ||
+      q.search !== undefined ||
+      q.vectorSearch !== undefined ||
+      q.take !== undefined
+    ) {
+      throw new RtDbError("BAD_REQUEST", "hybridSearch cannot be combined with any other terminal");
+    }
+    // No in-memory hybrid ranking; return an empty result rather than silently
+    // misranking by falling through to the collect path.
+    return [];
   }
 
   /** Merges a stored row with its system fields — a port of server `merge_doc`. */
