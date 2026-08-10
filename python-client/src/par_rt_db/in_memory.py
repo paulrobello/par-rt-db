@@ -1037,27 +1037,7 @@ class InMemoryRtDbClient:
         # hybridSearch returns an empty list (the sound stub — the combination
         # guards the server enforces are still exercised).
         if q.hybrid_search is not None:
-            if (
-                q.index is not None
-                or eq
-                or has_range
-                or q.order is not None
-                or unique
-                or first
-                or count
-                or q.distinct
-                or q.aggregate is not None
-                or q.paginate is not None
-                or q.filter is not None
-                or q.search is not None
-                or q.vector_search is not None
-                or q.take is not None
-            ):
-                raise RtDbError(
-                    ErrorCode.BAD_REQUEST,
-                    "hybridSearch cannot be combined with any other terminal",
-                )
-            return []
+            return self._execute_hybrid_search_terminal(q, eq, has_range)
 
         # Resolve index — required for `eq` and for any range bound.
         index_def: IndexDef | None = None
@@ -1449,6 +1429,41 @@ class InMemoryRtDbClient:
         if q.search.filter is not None:
             candidates = [row for row in candidates if _eval_filter_expr(q.search.filter, row.doc)]
         return [_merge_doc(row) for row in candidates]
+
+    def _execute_hybrid_search_terminal(
+        self, q: Query, eq: list[Any], has_range: bool
+    ) -> list[Any]:
+        """``hybridSearch`` terminal.
+
+        Lift of the former inline ``if q.hybrid_search is not None:`` arm of
+        :meth:`run_query`; mirrors ``ts-client``'s ``executeHybridSearchTerminal``.
+        Standalone like ``vectorSearch``: rejects every peer. RRF ranking is not
+        modeled in-memory, so a valid (peer-free) hybridSearch returns an empty
+        list (the sound stub — the combination guards the server enforces are
+        still exercised).
+        """
+        assert q.hybrid_search is not None  # caller dispatches only when set
+        if (
+            q.index is not None
+            or eq
+            or has_range
+            or q.order is not None
+            or q.unique
+            or q.first
+            or q.count
+            or q.distinct
+            or q.aggregate is not None
+            or q.paginate is not None
+            or q.filter is not None
+            or q.search is not None
+            or q.vector_search is not None
+            or q.take is not None
+        ):
+            raise RtDbError(
+                ErrorCode.BAD_REQUEST,
+                "hybridSearch cannot be combined with any other terminal",
+            )
+        return []
 
     def run(self, q: Query, model: type = dict) -> Any:
         """Typed wrapper around :meth:`run_query` that deserializes the result
