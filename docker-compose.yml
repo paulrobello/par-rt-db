@@ -75,8 +75,16 @@ services:
       # rtdb.audit_log row per DocOp at every durable tap site. Mirrors the
       # .env.example default.
       RTDB_AUDIT_LOG_ENABLED: ${RTDB_AUDIT_LOG_ENABLED:-false}
-      # Per-IP rate limit on the public storage serve route (SEC-004). 0 = off.
-      RTDB_STORAGE_RATE_LIMIT_PER_IP_RPM: ${RTDB_STORAGE_RATE_LIMIT_PER_IP_RPM:-0}
+      # Per-IP rate limit on the public storage serve route (SEC-004 / SEC-112).
+      # 0 = off. Shipped default is 600 RPM (10/sec) — the on-the-fly image
+      # transform path amplifies cost per request, and the route is
+      # unauthenticated, so leaving this off invites a cost flood. Set 0 only
+      # when an upstream proxy enforces its own per-IP cap.
+      RTDB_STORAGE_RATE_LIMIT_PER_IP_RPM: ${RTDB_STORAGE_RATE_LIMIT_PER_IP_RPM:-600}
+      # SEC-113: require a valid signed URL on every public storage fetch.
+      # false (default) keeps the opaque-id-as-bearer-URL behavior (Convex
+      # parity); true makes `?exp=&sig=` mandatory on GET /storage/{id}.
+      RTDB_STORAGE_REQUIRE_SIGNED_URLS: ${RTDB_STORAGE_REQUIRE_SIGNED_URLS:-false}
       # NOTE: this `environment:` block is an explicit ALLOWLIST — a key present
       # in `.env` but absent here never reaches the container. Adding a new
       # RTDB_* boot knob means adding a line here too, or it silently keeps its

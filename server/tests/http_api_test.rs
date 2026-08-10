@@ -648,6 +648,62 @@ async fn batch_query_bad_token_is_unauthorized() -> anyhow::Result<()> {
     Ok(())
 }
 
+// (m4) SEC-119: a batch with more than MAX_BATCH_QUERIES (64) entries is
+// rejected with 400 BEFORE any work runs — including before the bearer/authorize
+// gate, so an unauthenticated abuser cannot pin a worker with a 10k-query fan-out.
+// A batch at exactly the cap is still accepted (boundary check).
+#[tokio::test]
+async fn batch_query_rejects_oversized_batch() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let name = fresh_db(&state).await;
+
+    // 65 queries — one over the cap. Built without a token to prove the cap
+    // fires before the bearer gate (the empty-token path would otherwise 401).
+    let queries: Vec<serde_json::Value> = (0..65)
+        .map(|_| serde_json::json!({"table": "workItems"}))
+        .collect();
+    let resp = api_post(
+        addr,
+        "/api/query-batch",
+        "ignored-no-matter-what",
+        json!({"db": name, "queries": queries}),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(body["code"], "BAD_REQUEST");
+    // Error message names the cap so an operator reading the response knows
+    // the limit exists and what it is.
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("exceeds maximum"),
+        "response should mention the cap: {body}"
+    );
+
+    // 64 queries (exactly the cap) is accepted — proves the cap is `>`, not
+    // `>=`. The queries don't need to resolve (workItems may not even exist);
+    // we only assert the request is not 400'd at the gate.
+    let (_, token) = mint_token(addr, &name).await;
+    let queries: Vec<serde_json::Value> = (0..64)
+        .map(|_| serde_json::json!({"table": "workItems"}))
+        .collect();
+    let resp = api_post(
+        addr,
+        "/api/query-batch",
+        &token,
+        json!({"db": name, "queries": queries}),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(body["results"].as_array().expect("results").len(), 64);
+
+    Ok(())
+}
+
 // (n) A read-only machine token cannot mutate (403 Forbidden) but can still
 // query the same db. The token is minted directly with read_only=true via
 // auth::tokens::mint_token (the /admin/mint-token endpoint doesn't yet expose

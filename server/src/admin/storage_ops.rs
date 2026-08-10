@@ -74,6 +74,10 @@ pub(super) async fn admin_storage_upload(
         &sha256,
         size,
         content_type.as_deref(),
+        // SEC-118: admin uploads stay owner-less (NULL) — system-initiated,
+        // matching how ownerField treats admin writes. Admin reads/writes via
+        // this route bypass per-row enforcement either way.
+        None,
         &bytes,
     )
     .await?;

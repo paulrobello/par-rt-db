@@ -349,6 +349,7 @@ mod tests {
             webhooks_enabled: false,
             webhook_allow_http: false,
             storage_rate_limit_per_ip_rpm: 0,
+            storage_require_signed_urls: false,
             backup_enabled: false,
             backup_cron: "0 3 * * *".into(),
             backup_dir: "./backups".into(),

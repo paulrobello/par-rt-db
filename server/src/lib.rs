@@ -247,6 +247,61 @@ async fn set_static_cache_headers(req: Request, next: Next) -> Response {
     resp
 }
 
+/// Router-wide security headers (SEC-111): applied to every response so the
+/// admin SPA and the API surface both carry baseline defenses. Sets
+/// `X-Content-Type-Options`, `Referrer-Policy`, and `X-Frame-Options`
+/// unconditionally; `Content-Security-Policy` only on HTML responses (the
+/// dashboard bundle is same-origin and self-contained, so `'self'` holds); and
+/// `Strict-Transport-Security` only when the request arrived over HTTPS (the
+/// Cloudflare tunnel sets `X-Forwarded-Proto: https`, mirroring
+/// `auth::cookie::request_is_secure` — unconditional HSTS breaks plain-http
+/// local dev).
+///
+/// A response that already carries a `Content-Security-Policy` header (the
+/// OAuth callback page at `auth/provider.rs` sets a stricter per-page one) is
+/// left alone — one source of truth per route, never overwrite an existing
+/// policy.
+async fn security_headers(req: Request, next: Next) -> Response {
+    let https = req
+        .headers()
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|s| s.eq_ignore_ascii_case("https"));
+    let mut resp = next.run(req).await;
+    let headers = resp.headers_mut();
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("strict-origin-when-cross-origin"),
+    );
+    headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    // CSP is scoped to HTML (the SPA shell) so JSON/protobuf/Prometheus
+    // responses stay unaffected. Skip when the response already carries one —
+    // the OAuth callback's stricter per-page policy wins there.
+    let is_html = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| ct.starts_with("text/html"));
+    if is_html && !headers.contains_key("content-security-policy") {
+        headers.insert(
+            header::CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static(
+                "default-src 'self'; frame-ancestors 'none'; object-src 'none'; base-uri 'self'",
+            ),
+        );
+    }
+    if https {
+        headers.insert(
+            header::STRICT_TRANSPORT_SECURITY,
+            HeaderValue::from_static("max-age=31536000; includeSubDomains"),
+        );
+    }
+    resp
+}
+
 /// `GET /metrics`: unauthenticated Prometheus text-exposition scrape endpoint.
 ///
 /// Content-negotiates on `Accept` so the operator dashboard's browser route at
@@ -337,6 +392,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     }
 
     router
+        .layer(from_fn(security_headers))
         .layer(TraceLayer::new_for_http())
         .layer(cors)
         .with_state(state)

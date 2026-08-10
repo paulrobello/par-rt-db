@@ -8,7 +8,7 @@
 
 mod common;
 
-use common::{admin_post, fresh_db, spawn_app, test_state};
+use common::{admin_post, fresh_db, spawn_app, test_state, test_state_with_require_signed_urls};
 use rtdb_server::signed_url;
 use rtdb_server::storage;
 use serde_json::json;
@@ -36,6 +36,7 @@ async fn seed(state: &std::sync::Arc<rtdb_server::AppState>, db: &str) -> (Strin
         &sha,
         bytes.len() as i64,
         Some("text/plain"),
+        None,
         &bytes,
     )
     .await
@@ -266,5 +267,130 @@ async fn mint_requires_db_authorization() -> anyhow::Result<()> {
         .send()
         .await?;
     assert_eq!(noauth.status(), 401);
+    Ok(())
+}
+
+// --- SEC-113: require-signature mode + db-scope the mint ---
+
+// SEC-113: when `RTDB_STORAGE_REQUIRE_SIGNED_URLS=true`, the public serve
+// route rejects an opaque-id-only fetch (no `?exp=&sig=`) with 403. A valid
+// signed URL still serves.
+#[tokio::test]
+async fn sec113_require_signed_mode_rejects_opaque_id_only() -> anyhow::Result<()> {
+    let state = test_state_with_require_signed_urls().await;
+    let db = fresh_db(&state).await;
+    let addr = spawn_app(state.clone()).await;
+    let (id, bytes) = seed(&state, &db).await;
+    let token = mint_token(addr, &db).await;
+
+    // Opaque id alone is rejected — the prior behavior (anyone with the id
+    // fetches the bytes) is disabled in this mode.
+    let no_sig = reqwest::get(format!("http://{addr}/storage/{id}")).await?;
+    assert_eq!(no_sig.status(), 403);
+
+    // A valid signed URL still serves.
+    let mint = reqwest::Client::new()
+        .get(format!("http://{addr}/api/storage/{db}/{id}/signed-url"))
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .await?;
+    assert_eq!(mint.status(), 200);
+    let url = mint.json::<serde_json::Value>().await?["url"]
+        .as_str()
+        .expect("url")
+        .to_string();
+    let path = &url[url.find("/storage/").expect("path")..];
+    let served = reqwest::get(format!("http://{addr}{path}")).await?;
+    assert_eq!(served.status(), 200);
+    assert_eq!(served.bytes().await?.as_ref(), &bytes[..]);
+    Ok(())
+}
+
+// SEC-113: a partial signature (only `exp`, no `sig`) is rejected even in
+// require-signed mode — both must be present.
+#[tokio::test]
+async fn sec113_require_signed_mode_rejects_partial_signature() -> anyhow::Result<()> {
+    let state = test_state_with_require_signed_urls().await;
+    let db = fresh_db(&state).await;
+    let addr = spawn_app(state.clone()).await;
+    let (id, _) = seed(&state, &db).await;
+
+    let exp = rtdb_server::db::now_ms() + 60_000;
+    let exp_only = reqwest::get(format!("http://{addr}/storage/{id}?exp={exp}")).await?;
+    assert_eq!(exp_only.status(), 403);
+    Ok(())
+}
+
+// SEC-113: in default (require-signed=false) mode, the opaque id alone still
+// serves — guards against an accidental default flip that would break every
+// existing public bearer URL.
+#[tokio::test]
+async fn sec113_default_mode_still_allows_opaque_id() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let db = fresh_db(&state).await;
+    let addr = spawn_app(state.clone()).await;
+    let (id, bytes) = seed(&state, &db).await;
+
+    let served = reqwest::get(format!("http://{addr}/storage/{id}")).await?;
+    assert_eq!(served.status(), 200);
+    assert_eq!(served.bytes().await?.as_ref(), &bytes[..]);
+    Ok(())
+}
+
+// SEC-113: the mint endpoint must reject a caller authorized for db A asking
+// to sign an id that lives in db B. Cross-db mismatch returns 404 (matching
+// the authed-serve behavior for a foreign id — existence of an id in another
+// db is not disclosed).
+#[tokio::test]
+async fn sec113_mint_rejects_cross_db_id() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let db_a = fresh_db(&state).await;
+    let db_b = fresh_db(&state).await;
+    let addr = spawn_app(state.clone()).await;
+    let (id_a, _) = seed(&state, &db_a).await;
+    let token_b = mint_token(addr, &db_b).await;
+
+    // token_b is authorized for db_b but id_a lives in db_a — the mint must
+    // refuse, since minting grants a capability against the public serve route.
+    let resp = reqwest::Client::new()
+        .get(format!(
+            "http://{addr}/api/storage/{db_b}/{id_a}/signed-url"
+        ))
+        .header("Authorization", format!("Bearer {token_b}"))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), 404);
+
+    // Minting the same id against its real owner db_a still works.
+    let token_a = mint_token(addr, &db_a).await;
+    let ok = reqwest::Client::new()
+        .get(format!(
+            "http://{addr}/api/storage/{db_a}/{id_a}/signed-url"
+        ))
+        .header("Authorization", format!("Bearer {token_a}"))
+        .send()
+        .await?;
+    assert_eq!(ok.status(), 200);
+    Ok(())
+}
+
+// SEC-113: minting an id that does not exist anywhere returns 404 (the
+// storage_index lookup misses), not 403 — keeps the not-found vs forbidden
+// distinction consistent with the authed serve route.
+#[tokio::test]
+async fn sec113_mint_unknown_id_returns_404() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let db = fresh_db(&state).await;
+    let addr = spawn_app(state.clone()).await;
+    let token = mint_token(addr, &db).await;
+
+    let resp = reqwest::Client::new()
+        .get(format!(
+            "http://{addr}/api/storage/{db}/never-existed/signed-url"
+        ))
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), 404);
     Ok(())
 }

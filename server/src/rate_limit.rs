@@ -15,10 +15,14 @@
 //! Algorithm: a fixed window per `RateKey` keyed by the wall-clock minute
 //! (`secs_since_epoch / 60`). A burst at the minute boundary can momentarily
 //! exceed the limit by up to one window's worth (the boundary case is
-//! acceptable for v1 — predictable and cheap, no background reaping). The map
-//! grows with the number of distinct (token_id, db) tuples ever seen; a future
-//! enhancement can sweep stale buckets, but for a multi-tenant server with
-//! bounded tokens/dbs this is not a leak in practice.
+//! acceptable for v1 — predictable and cheap). The map is hard-bounded at
+//! `MAX_BUCKETS` entries: on insert at the cap, expired buckets (older than the
+//! current minute) are reclaimed first; if still at the cap, an arbitrary entry
+//! is evicted so the new key can be tracked (SEC-112). This bounds memory in
+//! the face of a varying-key flood, which the per-IP public route is exposed
+//! to — `client_ip_key` (CF-Connecting-IP preferred, rightmost XFF fallback)
+//! makes spoofing hard, but a real distributed flood can still surface many
+//! distinct legitimate-looking keys.
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -28,6 +32,14 @@ use tokio::sync::Mutex;
 use crate::AppState;
 use crate::auth::Principal;
 use crate::error::RtDbError;
+
+/// Hard cap on the number of distinct keys the limiter tracks at once. At
+/// ~24 bytes per entry this is roughly 2.4 MB; large enough that legitimate
+/// per-token / per-db / per-IP working sets never notice, small enough that a
+/// varying-key flood can't grow memory unboundedly. Reached only under attack
+/// or a misconfigured client spraying tokens; on insert past the cap the limter
+/// first sweeps stale (last-minute) entries, then evicts an arbitrary entry.
+pub const MAX_BUCKETS: usize = 100_000;
 
 /// What the limiter is bucketing: a single machine token (per-token ceiling),
 /// every request against one database (per-db ceiling shared across all
@@ -93,6 +105,21 @@ impl RateLimiter {
             _ => {
                 // Different minute bucket, or first time we've seen this key:
                 // reset/open with count = 1 for this request.
+                if map.len() >= MAX_BUCKETS {
+                    // SEC-112: cap map growth. First reclaim expired buckets
+                    // (older minute than current — they'd be overwritten on
+                    // next hit anyway). If still at the cap, evict an arbitrary
+                    // entry so this new key can be tracked — favor strict
+                    // accounting over allowing an untracked request, since the
+                    // only way to hit the cap is a varying-key flood and we
+                    // want every active attacker key to remain rate-limited.
+                    map.retain(|_, (bucket, _)| *bucket >= current_bucket);
+                    if map.len() >= MAX_BUCKETS
+                        && let Some(stale_key) = map.keys().next().cloned()
+                    {
+                        map.remove(&stale_key);
+                    }
+                }
                 map.insert(key, (current_bucket, 1));
                 RateDecision::Allowed
             }
@@ -154,14 +181,16 @@ pub async fn check_http_rate_limits(
 }
 
 /// Per-IP gate for the unauthenticated public storage serve route
-/// (`GET /storage/{id}`, SEC-004). The opaque blob id is not enumerable, but a
-/// holder of one valid id can otherwise hammer the route without bound — the
-/// on-the-fly image-transform path (`?w=&h=&...`) amplifies cost per request,
-/// and an unauth route has no principal to key on, so the caller's IP is the
-/// only available identity. `ip_key` is the textual client IP (already
-/// canonicalized by the caller: X-Forwarded-For leftmost → ConnectInfo → a
-/// shared `"unknown"` sentinel when neither is available). Disabled when
-/// `Config::storage_rate_limit_per_ip_rpm == 0`, the default.
+/// (`GET /storage/{id}`, SEC-004 / SEC-112). The opaque blob id is not
+/// enumerable, but a holder of one valid id can otherwise hammer the route
+/// without bound — the on-the-fly image-transform path (`?w=&h=&...`)
+/// amplifies cost per request, and an unauth route has no principal to key on,
+/// so the caller's IP is the only available identity. `ip_key` is the textual
+/// client IP already canonicalized by `client_ip_key` (CF-Connecting-IP
+/// preferred, rightmost XFF fallback, then the connection peer). Disabled when
+/// `Config::storage_rate_limit_per_ip_rpm == 0` (the code default; the shipped
+/// `docker-compose.yml` and `.env.example` set a non-zero default so the
+/// mitigation is on out-of-the-box).
 pub async fn check_storage_public_rate_limit(
     state: &AppState,
     ip_key: &str,
@@ -271,6 +300,36 @@ mod tests {
         assert_eq!(
             limiter.check(RateKey::Db("d".into()), 1).await,
             RateDecision::Allowed
+        );
+    }
+
+    // SEC-112: the map is hard-bounded. Inserting MAX_BUCKETS+1 distinct keys
+    // must not grow beyond the cap. After the flood, the limiter must still
+    // behave deterministically for a brand-new key (one outside the flood
+    // range) — first hit allowed, second hit at limit=1 denied — proving the
+    // cap-eviction path didn't leave the limiter in a degraded state.
+    #[tokio::test]
+    async fn sec112_map_is_hard_bounded_under_distinct_key_flood() {
+        let limiter = RateLimiter::new();
+        for i in 0..(MAX_BUCKETS + 50) {
+            let _ = limiter.check(RateKey::Ip(format!("10.0.0.{i}")), 5).await;
+        }
+        let len = limiter.inner.lock().await.len();
+        assert!(
+            len <= MAX_BUCKETS,
+            "map must stay at or under MAX_BUCKETS, got {len}"
+        );
+        // A key never seen before is still tracked correctly: first call opens
+        // the bucket, second exceeds the 1/min limit.
+        let fresh = RateKey::Ip("203.0.113.42".to_string());
+        assert_eq!(
+            limiter.check(fresh.clone(), 1).await,
+            RateDecision::Allowed,
+            "first hit on a brand-new key after the cap flood should still be allowed"
+        );
+        assert!(
+            deny_secs(limiter.check(fresh, 1).await).is_some(),
+            "second hit on the new key should be denied"
         );
     }
 }

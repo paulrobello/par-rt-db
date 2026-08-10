@@ -46,6 +46,7 @@ pub fn test_config() -> Config {
         webhooks_enabled: false,
         webhook_allow_http: false,
         storage_rate_limit_per_ip_rpm: 0,
+        storage_require_signed_urls: false,
         backup_enabled: false,
         backup_cron: "0 3 * * *".into(),
         backup_dir: "./backups".into(),
@@ -130,6 +131,20 @@ pub async fn test_state_with_audit() -> Arc<AppState> {
     db::ensure_audit_table(&pool)
         .await
         .expect("ensure rtdb.audit_log");
+    AppState::new(pool, config, test_hot())
+}
+
+/// Like `test_state` but with `storage_require_signed_urls = true`. Used by
+/// `tests/storage_signed_url_test.rs` (SEC-113) to exercise require-signature
+/// mode without touching env vars. Mirrors the `test_state_with_*` pattern.
+#[allow(dead_code)]
+pub async fn test_state_with_require_signed_urls() -> Arc<AppState> {
+    let mut config = test_config();
+    config.storage_require_signed_urls = true;
+    let pool = sqlx::PgPool::connect(&config.database_url)
+        .await
+        .expect("connect to test postgres");
+    db::bootstrap(&pool).await.expect("bootstrap rtdb_auth");
     AppState::new(pool, config, test_hot())
 }
 

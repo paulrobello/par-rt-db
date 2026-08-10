@@ -97,6 +97,15 @@ pub struct Config {
     // (each distinct `?w=&h=&...` set misses the cache and burns decode CPU).
     // RTDB_STORAGE_RATE_LIMIT_PER_IP_RPM.
     pub storage_rate_limit_per_ip_rpm: u32,
+    // SEC-113: when true, the public storage serve route (`GET /storage/{id}`)
+    // requires a valid `?exp=&sig=` pair on every request — a holder of the
+    // opaque id alone is no longer enough. Default false so existing public
+    // bearer URLs (a deliberate Convex-parity feature) keep working; operators
+    // who want signed-URL-only access (e.g. for sensitive content) flip it on.
+    // The mint endpoint (`GET /api/storage/{db}/{id}/signed-url`) is unaffected
+    // and remains the way to mint time-limited URLs under either mode.
+    // RTDB_STORAGE_REQUIRE_SIGNED_URLS.
+    pub storage_require_signed_urls: bool,
     // Managed pg_dump backup scheduler. Off by default — when true, a
     // background task runs `pg_dump` on `backup_cron` (5-field UTC cron, same
     // format `scheduler::next_fire` already handles) into `backup_dir`,
@@ -301,6 +310,15 @@ impl Config {
                 Err(_) => 0,
             };
 
+        // SEC-113: require a valid signed URL on every public storage fetch.
+        // Default false (Convex-parity: opaque public bearer URLs); operators
+        // who want signed-only access flip it on. Same truthy parse as the
+        // other boot flags.
+        let storage_require_signed_urls = match std::env::var("RTDB_STORAGE_REQUIRE_SIGNED_URLS") {
+            Ok(v) => matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes"),
+            Err(_) => false,
+        };
+
         // Managed pg_dump backup scheduler. Default off; cron/dir/retention
         // carry their own defaults so an operator can flip just
         // RTDB_BACKUP_ENABLED=true to get daily 03:00 UTC dumps with 7-day
@@ -474,6 +492,7 @@ impl Config {
             webhooks_enabled,
             webhook_allow_http,
             storage_rate_limit_per_ip_rpm,
+            storage_require_signed_urls,
             backup_enabled,
             backup_cron,
             backup_dir,

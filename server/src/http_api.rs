@@ -13,7 +13,7 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
 use crate::AppState;
-use crate::auth::{authorize, resolve_bearer};
+use crate::auth::{Principal, authorize, resolve_bearer};
 use crate::db::now_ms;
 use crate::error::RtDbError;
 use crate::image_transform::{Resolved, TransformParams};
@@ -116,6 +116,15 @@ struct BatchQueryOutcome {
     error: Option<RtDbError>,
 }
 
+/// SEC-119: hard cap on the number of queries a single
+/// `POST /api/query-batch` may carry. Rejects an oversized batch BEFORE the
+/// bearer/authorize gate (fail-fast on abuse) — a caller supplying thousands
+/// of queries otherwise amplifies one HTTP request into a serial fan-out that
+/// monopolizes a committer-adjacent worker. 64 mirrors a generous round-trip
+/// budget; raise via code change if a real workload needs more (use multiple
+/// batched requests rather than one giant one).
+const MAX_BATCH_QUERIES: usize = 64;
+
 #[derive(Serialize)]
 struct BatchQueryResponse {
     results: Vec<BatchQueryOutcome>,
@@ -134,6 +143,16 @@ async fn batch_query_handler(
 ) -> Result<Json<BatchQueryResponse>, RtDbError> {
     if body.queries.is_empty() {
         return Err(RtDbError::bad_request("queries must not be empty"));
+    }
+    // SEC-119: reject an oversized batch before the bearer/authorize gate so an
+    // unauthenticated abuser can't pin a worker on a 10k-query fan-out. The
+    // cap is server-side and uniform across all callers (no admin bypass — an
+    // admin-level need for more should split into multiple batched requests).
+    if body.queries.len() > MAX_BATCH_QUERIES {
+        return Err(RtDbError::bad_request(format!(
+            "query batch size {} exceeds maximum of {MAX_BATCH_QUERIES}",
+            body.queries.len()
+        )));
     }
     let token = bearer_token(&headers)?;
     let principal = resolve_bearer(&state.pool, token).await?;
@@ -448,12 +467,21 @@ async fn upload_handler(
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
+    // SEC-118: stamp the uploading user's user_id onto the row so the authed
+    // serve/delete/metadata routes can enforce per-row authorization. Machine
+    // tokens and admin uploads stay NULL (system-initiated) — matching how
+    // `ownerField` treats system writes.
+    let owner_id = match &principal {
+        Principal::User { user_id, .. } => Some(user_id.as_str()),
+        Principal::Machine { .. } => None,
+    };
     let id = storage::put(
         &state.pool,
         &db,
         &sha256,
         size,
         content_type.as_deref(),
+        owner_id,
         &bytes,
     )
     .await?;
@@ -488,6 +516,13 @@ struct SignedUrlResponse {
 /// (`bearer → authorize(db)`); the returned URL is fetched via
 /// `GET /storage/{id}?exp=&sig=` until `expiresAt`. Minting is pure
 /// computation — no DB write, no committer.
+///
+/// SEC-113: `{id}` must belong to `{db}` — a caller authorized for db A cannot
+/// mint a signed URL for a blob that lives in db B. The mint is the
+/// capability-granting step, so it is the right place to scope; the public
+/// serve route is unauthenticated by design. Cross-db mismatch returns 404
+/// (matching the authed-serve behavior for a foreign id) rather than 403, so
+/// the existence of an id in another db is not disclosed.
 async fn signed_url_handler(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -498,6 +533,15 @@ async fn signed_url_handler(
     let principal = resolve_bearer(&state.pool, token).await?;
     authorize(&state.pool, &principal, &db).await?;
     check_http_rate_limits(&state, &principal, &db).await?;
+    // SEC-113: resolve the owning db and reject cross-db. A caller authorized
+    // for db A must not be able to mint a URL for an id that lives in db B,
+    // even if they somehow know the id — the mint is the capability.
+    let owner_db = storage::resolve_db(&state.pool, &id)
+        .await?
+        .ok_or_else(|| RtDbError::not_found("unknown file"))?;
+    if owner_db != db {
+        return Err(RtDbError::not_found("unknown file"));
+    }
     let ttl = q
         .get("ttlSeconds")
         .and_then(|v| v.parse::<i64>().ok())
@@ -516,8 +560,14 @@ async fn signed_url_handler(
 /// Public, unauthenticated serve: anyone with the URL fetches the bytes. The
 /// opaque id resolves to its owning db via the global index. Query params, if
 /// present, request an on-the-fly image transform (ENH-014). Rate-limited per
-/// client IP (SEC-004) when `RTDB_STORAGE_RATE_LIMIT_PER_IP_RPM > 0`; off by
-/// default.
+/// client IP (SEC-004 / SEC-112) when `RTDB_STORAGE_RATE_LIMIT_PER_IP_RPM > 0`;
+/// off by default.
+///
+/// SEC-113: when `RTDB_STORAGE_REQUIRE_SIGNED_URLS=true`, every request must
+/// carry a complete, valid `?exp=&sig=` pair — the opaque id alone is no longer
+/// sufficient. The default (false) preserves today's behavior: opaque bearer
+/// URLs are a deliberate Convex-parity feature. Either way, a request that
+/// supplies `exp` or `sig` is signed-URL-shaped and must verify completely.
 async fn serve_public_handler(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -526,12 +576,20 @@ async fn serve_public_handler(
     AxumQuery(q): AxumQuery<HashMap<String, String>>,
 ) -> Result<Response, RtDbError> {
     check_storage_public_rate_limit(&state, &client_ip_key(&headers, addr.ip())).await?;
+    let has_exp = q.contains_key("exp");
+    let has_sig = q.contains_key("sig");
+    // SEC-113: require-signature mode flips the default — without a complete,
+    // valid signature, the request is rejected before resolving the blob.
+    if state.config.storage_require_signed_urls && !(has_exp && has_sig) {
+        return Err(RtDbError::forbidden("signed url required"));
+    }
     // Additive signed-URL verification: if either `exp` or `sig` is present,
     // the request is signed-URL-shaped and must supply a complete, valid HMAC
-    // signature that has not expired. If neither param is present, behavior is
-    // unchanged (public by opaque id) — `?sig=` alone is treated as a malformed
-    // signed URL, never as a public fetch.
-    if q.contains_key("exp") || q.contains_key("sig") {
+    // signature that has not expired. If neither param is present (only
+    // reachable when require-signed mode is off), behavior is unchanged
+    // (public by opaque id) — `?sig=` alone is treated as a malformed signed
+    // URL, never as a public fetch.
+    if has_exp || has_sig {
         let exp_s = q
             .get("exp")
             .ok_or_else(|| RtDbError::forbidden("invalid or expired signature"))?;
@@ -555,32 +613,67 @@ async fn serve_public_handler(
     serve_bytes(&state, &db, &id, &q, range).await
 }
 
-/// Canonical per-IP rate-limit key for an unauthenticated request. The deploy
-/// runs behind a trusted Cloudflare tunnel which sets `X-Forwarded-For`, so the
-/// leftmost address is the real client; fall back to the connection's peer IP
-/// for direct calls, and to a shared `"unknown"` sentinel when neither is
-/// available (the XFF header is absent or unparseable). The `"unknown"` bucket
-/// rate-limits more aggressively under a missing-XFF flood, which is the safe
-/// failure mode for an unauthenticated cost-amplifying route (SEC-004).
+/// Canonical per-IP rate-limit key for an unauthenticated request (SEC-112).
+///
+/// Order of preference:
+/// 1. `CF-Connecting-IP` — set by the Cloudflare tunnel edge to the connecting
+///    client. The deploy runs behind that tunnel, and CF appends (does not
+///    replace) this header, so it is the most trustworthy identifier on the
+///    route and not spoofable by the caller.
+/// 2. **Rightmost** hop of `X-Forwarded-For`. Cloudflare appends the real
+///    client IP to whatever chain the caller supplied, so the *leftmost* entry
+///    is attacker-controlled and the *rightmost* is CF's observation. The prior
+///    implementation took the leftmost and was therefore trivially bypassable
+///    by varying the XFF header per request (SEC-004 recurrence).
+/// 3. The connection's peer IP, for direct (non-tunneled) calls.
+///
+/// `Forwarded:` (RFC 7239) is intentionally NOT consulted — its `for=` value
+/// has the same spoofing shape as XFF, and the prior implementation parsed it
+/// as if it were a comma-separated IP list, which is simply wrong. CF-Connecting-IP
+/// + XFF cover every observed deployment shape.
 fn client_ip_key(headers: &HeaderMap, peer: std::net::IpAddr) -> String {
-    if let Some(xff) = headers
-        .get(header::FORWARDED)
-        .or_else(|| headers.get("x-forwarded-for"))
+    if let Some(cf) = headers
+        .get("cf-connecting-ip")
         .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
     {
-        // X-Forwarded-For: client, proxy1, proxy2 — leftmost is the origin.
-        if let Some(first) = xff.split(',').map(str::trim).next()
-            && !first.is_empty()
-        {
-            return first.to_string();
-        }
+        return cf.to_string();
+    }
+    if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok())
+        && let Some(last) = xff.split(',').map(str::trim).rfind(|s| !s.is_empty())
+    {
+        return last.to_string();
     }
     peer.to_string()
+}
+
+/// SEC-118: enforce per-row authorization on a stored blob. `blob_owner` is the
+/// row's `owner_id` (`None` for system-initiated uploads and rows that predate
+/// the column). The rule mirrors document per-row auth:
+/// - `blob_owner == None` → allow (system-initiated; anyone authorized for the
+///   db may touch it).
+/// - `blob_owner == Some(_)` and the caller is a `Machine` token → allow
+///   (machine bypass, same as document ownerField).
+/// - `blob_owner == Some(owner)` and the caller is a `User` whose `user_id`
+///   matches → allow.
+/// - Otherwise → `Forbidden`. Admin reaches storage via the `/admin/*` routes
+///   (which bypass per-row rules through `PrincipalCtx::bypass()`), not here.
+fn enforce_blob_owner(principal: &Principal, blob_owner: &Option<String>) -> Result<(), RtDbError> {
+    match (blob_owner, principal) {
+        (None, _) => Ok(()),
+        (Some(_), Principal::Machine { .. }) => Ok(()),
+        (Some(owner), Principal::User { user_id, .. }) if owner == user_id => Ok(()),
+        _ => Err(RtDbError::forbidden("not the blob owner")),
+    }
 }
 
 /// Authed serve: the caller's principal must be authorized for `{db}`; the id
 /// must live in that db's table (404 otherwise — cross-db isolation). Query
 /// params, if present, request an on-the-fly image transform (ENH-014).
+///
+/// SEC-118: per-row authorization runs after `authorize(db)` — fetch the row's
+/// `owner_id` via `get_meta` (cheap; no bytea) and enforce before serving.
 async fn serve_authed_handler(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -591,6 +684,12 @@ async fn serve_authed_handler(
     let principal = resolve_bearer(&state.pool, token).await?;
     authorize(&state.pool, &principal, &db).await?;
     check_http_rate_limits(&state, &principal, &db).await?;
+    // SEC-118: per-row owner check. Unknown id → 404 (matches today's
+    // `serve_bytes` behavior for a missing blob).
+    let meta = storage::get_meta(&state.pool, &db, &id)
+        .await?
+        .ok_or_else(|| RtDbError::not_found("unknown file"))?;
+    enforce_blob_owner(&principal, &meta.owner_id)?;
     let range = headers.get(header::RANGE).and_then(|v| v.to_str().ok());
     serve_bytes(&state, &db, &id, &q, range).await
 }
@@ -616,6 +715,17 @@ async fn serve_bytes(
     // Transformed images are cache-keyed as whole renders, so a Range header on
     // them is ignored and `Accept-Ranges` is not advertised.
     let supports_range = resolved.is_none();
+    // SEC-123: when a Range header is present on a plain blob fetch, resolve
+    // the range against `octet_length(bytes)` first (cheap — no bytea crosses
+    // the wire), then fetch ONLY the requested slice via `substring(bytes FROM
+    // ... FOR ...)`. A Range request on a multi-GB blob must not load the whole
+    // bytea into server memory just to slice it.
+    if supports_range {
+        let raw_range = range_header.map(str::trim).filter(|s| !s.is_empty());
+        if let Some(raw_range) = raw_range {
+            return build_range_response(&state.pool, db, id, raw_range, IMMUTABLE).await;
+        }
+    }
     let (bytes, content_type) = match resolved {
         Some(Resolved::Transformed(cached)) => (cached.bytes, cached.content_type.to_string()),
         Some(Resolved::Raw {
@@ -641,8 +751,127 @@ async fn serve_bytes(
     )
 }
 
+/// SEC-123: builds the response for a `Range:` request against a stored blob by
+/// fetching ONLY the requested byte slice from Postgres (`substring(...)`) — the
+/// whole bytea is never materialized in server memory. The total resource size
+/// is resolved cheaply up front via `octet_length(bytes)`; then the byte slice
+/// fetch uses `substring(bytes FROM $start FOR $len)` for the `Partial`
+/// outcome, fetches nothing for `Unsatisfiable`, and falls through to the
+/// whole-blob path for `Full` (a malformed/unsupported Range the server is
+/// entitled to ignore per RFC 7233).
+async fn build_range_response(
+    pool: &sqlx::PgPool,
+    db: &str,
+    id: &str,
+    raw_range: &str,
+    cache_control: &'static str,
+) -> Result<Response, RtDbError> {
+    // Cheap total via octet_length — does not materialize the bytea.
+    let total = match storage::total_bytes(pool, db, id).await? {
+        Some(t) => t,
+        None => return Err(RtDbError::not_found("unknown file")),
+    };
+    let outcome = resolve_byte_range(Some(raw_range), total);
+    match outcome {
+        RangeOutcome::Full => {
+            // Range was malformed/unsupported — RFC 7233 says ignore and serve
+            // the full body. The whole bytea must be loaded here.
+            let (bytes, content_type) = match storage::get(pool, db, id).await? {
+                Some(t) => t,
+                None => return Err(RtDbError::not_found("unknown file")),
+            };
+            let ct = content_type.unwrap_or_else(|| "application/octet-stream".to_string());
+            // Pass `range_header=None` so `build_serve_response` does not try
+            // to re-resolve (it would, to Full again, but this is clearer).
+            build_serve_response(bytes.to_vec(), &ct, cache_control, true, None)
+        }
+        RangeOutcome::Partial { start, end } => {
+            // Fetch ONLY the requested slice — the whole bytea stays in Postgres.
+            let (slice, content_type) = match storage::get_range(pool, db, id, start, end).await? {
+                Some(t) => t,
+                None => return Err(RtDbError::not_found("unknown file")),
+            };
+            let ct = content_type.unwrap_or_else(|| "application/octet-stream".to_string());
+            let (served_ct, force_attachment) = resolve_served_content_type(&ct);
+            let disposition = if force_attachment {
+                "attachment"
+            } else {
+                "inline"
+            };
+            Response::builder()
+                .status(StatusCode::PARTIAL_CONTENT)
+                .header(header::CONTENT_TYPE, served_ct)
+                .header(header::CACHE_CONTROL, cache_control)
+                .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
+                .header(header::CONTENT_DISPOSITION, disposition)
+                .header(header::ACCEPT_RANGES, ACCEPT_RANGES_BYTES)
+                .header(
+                    header::CONTENT_RANGE,
+                    format!("bytes {start}-{end}/{total}"),
+                )
+                .header(header::CONTENT_LENGTH, slice.len() as u64)
+                .body(Body::from(slice))
+                .map_err(|err| {
+                    RtDbError::internal(format!("failed to build range response: {err}"))
+                })
+        }
+        RangeOutcome::Unsatisfiable => Response::builder()
+            .status(StatusCode::RANGE_NOT_SATISFIABLE)
+            .header(header::ACCEPT_RANGES, ACCEPT_RANGES_BYTES)
+            .header(header::CONTENT_RANGE, format!("bytes */{total}"))
+            .body(Body::empty())
+            .map_err(|err| RtDbError::internal(format!("failed to build 416 response: {err}"))),
+    }
+}
+
 /// The range unit advertised on responses that honor `Range` requests.
 const ACCEPT_RANGES_BYTES: &str = "bytes";
+
+/// Content types safe to serve inline from the storage routes (SEC-101).
+/// Anything not on this list — including `text/html`, `image/svg+xml` (SVG
+/// executes script in a browsing context), and any `application/*` script type
+/// — is forced to `application/octet-stream` with `Content-Disposition:
+/// attachment` so a stored blob can never become an attacker-authored page on
+/// the console's own origin. Applied at read time in `build_serve_response` so
+/// it covers existing rows (uploaded before this fix) too.
+const INLINE_SAFE_CONTENT_TYPES: &[&str] = &[
+    "image/jpeg",
+    "image/png",
+    "image/gif",
+    "image/webp",
+    "image/avif",
+    "application/pdf",
+    "text/plain",
+];
+
+/// Resolves a stored `content_type` to the value + disposition to actually
+/// serve (SEC-101). Returns `(served_content_type, attachment)`: when the
+/// stored type is on the inline-safe allowlist it is preserved and served
+/// inline; everything else is downgraded to `application/octet-stream` and
+/// served as an attachment. `text/html`, `image/svg+xml`, and script-bearing
+/// `application/*` types are the threat this closes — same-origin stored XSS
+/// on the admin console. The check ignores parameters (`;charset=...`), so a
+/// stored `text/plain; charset=utf-8` stays inline.
+fn resolve_served_content_type(stored: &str) -> (&'static str, bool) {
+    let ess = stored
+        .split(';')
+        .next()
+        .unwrap_or(stored)
+        .trim()
+        .to_ascii_lowercase();
+    if INLINE_SAFE_CONTENT_TYPES.iter().any(|safe| *safe == ess) {
+        // Return the canonical static slice matching the allowlist entry so
+        // the header value borrows 'static — case-normalized.
+        let canonical = INLINE_SAFE_CONTENT_TYPES
+            .iter()
+            .copied()
+            .find(|safe| *safe == ess)
+            .expect("matched above");
+        (canonical, false)
+    } else {
+        ("application/octet-stream", true)
+    }
+}
 
 /// Resolved outcome of a `Range: bytes=...` request against a blob of `total`
 /// bytes (RFC 7233).
@@ -713,6 +942,11 @@ fn resolve_byte_range(raw: Option<&str>, total: u64) -> RangeOutcome {
 /// `supports_range` (plain blob fetches only). Transformed-image responses pass
 /// `supports_range = false` — they are cache-keyed as whole renders, so a Range
 /// header is ignored and `Accept-Ranges` is not advertised.
+///
+/// Applies the content-type allowlist (SEC-101): a stored `content_type` not on
+/// the inline-safe list is forced to `application/octet-stream` with
+/// `Content-Disposition: attachment` and `X-Content-Type-Options: nosniff`, so
+/// a stored HTML/SVG/script blob can never render same-origin in the console.
 fn build_serve_response(
     bytes: Vec<u8>,
     content_type: &str,
@@ -726,12 +960,24 @@ fn build_serve_response(
     } else {
         RangeOutcome::Full
     };
+    let (served_content_type, force_attachment) = resolve_served_content_type(content_type);
+    // SEC-101: nosniff on every storage response (defense in depth even with
+    // the router-wide layer — this is the one route where sniffing is the
+    // whole attack), and Content-Disposition: attachment when the stored type
+    // is not inline-safe.
+    let disposition = if force_attachment {
+        "attachment"
+    } else {
+        "inline"
+    };
     let result: Result<Response, axum::http::Error> = match outcome {
         RangeOutcome::Full => {
             let mut builder = Response::builder()
                 .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, content_type)
-                .header(header::CACHE_CONTROL, cache_control);
+                .header(header::CONTENT_TYPE, served_content_type)
+                .header(header::CACHE_CONTROL, cache_control)
+                .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
+                .header(header::CONTENT_DISPOSITION, disposition);
             if supports_range {
                 builder = builder.header(header::ACCEPT_RANGES, ACCEPT_RANGES_BYTES);
             }
@@ -741,8 +987,10 @@ fn build_serve_response(
             let slice = bytes[(start as usize)..=(end as usize)].to_vec();
             Response::builder()
                 .status(StatusCode::PARTIAL_CONTENT)
-                .header(header::CONTENT_TYPE, content_type)
+                .header(header::CONTENT_TYPE, served_content_type)
                 .header(header::CACHE_CONTROL, cache_control)
+                .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
+                .header(header::CONTENT_DISPOSITION, disposition)
                 .header(header::ACCEPT_RANGES, ACCEPT_RANGES_BYTES)
                 .header(
                     header::CONTENT_RANGE,
@@ -880,6 +1128,98 @@ mod range_tests {
     }
 }
 
+#[cfg(test)]
+mod client_ip_tests {
+    use super::client_ip_key;
+    use axum::http::{HeaderMap, HeaderValue};
+
+    fn peer() -> std::net::IpAddr {
+        "203.0.113.99".parse().unwrap()
+    }
+
+    fn headers_with(pairs: &[(&'static str, &'static str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            h.insert(*k, HeaderValue::from_str(v).unwrap());
+        }
+        h
+    }
+
+    // SEC-112: CF-Connecting-IP wins outright. A varying XFF with a constant
+    // CF-Connecting-IP must share one bucket — the spoofable XFF entries are
+    // ignored entirely when CF-Connecting-IP is present.
+    #[test]
+    fn cf_connecting_ip_wins_over_xff() {
+        let h = headers_with(&[
+            ("cf-connecting-ip", "198.51.100.10"),
+            ("x-forwarded-for", "10.1.1.1, 10.2.2.2, 10.3.3.3"),
+        ]);
+        assert_eq!(client_ip_key(&h, peer()), "198.51.100.10");
+    }
+
+    // SEC-112: the prior bug took the LEFTMOST XFF entry, which Cloudflare does
+    // not set — it appends the real client as the RIGHTMOST hop. So under a
+    // spoofed XFF like "fake-attacker-ip, real-client", the rightmost is what
+    // Cloudflare observed.
+    #[test]
+    fn xff_takes_rightmost_hop_not_leftmost() {
+        let h = headers_with(&[("x-forwarded-for", "10.4.4.4, 10.5.5.5, 198.51.100.20")]);
+        assert_eq!(
+            client_ip_key(&h, peer()),
+            "198.51.100.20",
+            "rightmost XFF hop is Cloudflare's observation"
+        );
+    }
+
+    // SEC-112: a single-hop XFF (the common case) returns that hop.
+    #[test]
+    fn xff_single_hop() {
+        let h = headers_with(&[("x-forwarded-for", "198.51.100.30")]);
+        assert_eq!(client_ip_key(&h, peer()), "198.51.100.30");
+    }
+
+    // SEC-112: falling back to the connection peer when neither trusted header
+    // is present (direct calls, no tunnel).
+    #[test]
+    fn falls_back_to_peer_when_no_proxy_headers() {
+        let h = HeaderMap::new();
+        assert_eq!(client_ip_key(&h, peer()), peer().to_string());
+    }
+
+    // SEC-112: empty/whitespace CF-Connecting-IP is ignored, not parsed as
+    // the bucket key (which would create an empty-string bucket shared by
+    // every malformed request).
+    #[test]
+    fn empty_cf_connecting_ip_falls_through() {
+        let h = headers_with(&[
+            ("cf-connecting-ip", "  "),
+            ("x-forwarded-for", "198.51.100.40"),
+        ]);
+        assert_eq!(client_ip_key(&h, peer()), "198.51.100.40");
+    }
+
+    // SEC-112: trailing/leading whitespace is trimmed so "1.2.3.4 " and
+    // "1.2.3.4" share a bucket.
+    #[test]
+    fn cf_connecting_ip_is_trimmed() {
+        let h = headers_with(&[("cf-connecting-ip", "  198.51.100.50  ")]);
+        assert_eq!(client_ip_key(&h, peer()), "198.51.100.50");
+    }
+
+    // SEC-112: Forwarded (RFC 7239) is intentionally NOT consulted. The prior
+    // implementation parsed it as a comma-list of IPs (wrong) and trusting it
+    // reopens the spoofing vector. Confirm it is ignored in favor of peer.
+    #[test]
+    fn forwarded_header_is_ignored() {
+        let h = headers_with(&[("forwarded", "for=198.51.100.99")]);
+        assert_eq!(
+            client_ip_key(&h, peer()),
+            peer().to_string(),
+            "Forwarded header must not be trusted — peer fallback wins"
+        );
+    }
+}
+
 #[derive(Serialize)]
 struct OkResponse {
     ok: bool,
@@ -888,6 +1228,10 @@ struct OkResponse {
 /// Delete a stored file. Idempotent: deleting a missing id still returns
 /// `{ ok: true }`. Both the per-db blob row and the global `storage_index`
 /// row are removed, so the public URL 404s afterward.
+///
+/// SEC-118: per-row authorization runs before the delete — a non-owner
+/// interactive caller gets 403, a missing id is a successful no-op (idempotent
+/// — does not disclose existence either way).
 async fn delete_handler(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -900,12 +1244,21 @@ async fn delete_handler(
         return Err(RtDbError::forbidden("read-only token cannot mutate"));
     }
     check_http_rate_limits(&state, &principal, &db).await?;
-    storage::delete(&state.pool, &db, &id).await?;
+    // SEC-118: per-row owner check before the destructive op. A missing row
+    // short-circuits to the idempotent `{ ok: true }` — the existence of an
+    // id is not disclosed to a non-owner.
+    if let Some(meta) = storage::get_meta(&state.pool, &db, &id).await? {
+        enforce_blob_owner(&principal, &meta.owner_id)?;
+        storage::delete(&state.pool, &db, &id).await?;
+    }
     Ok(Json(OkResponse { ok: true }))
 }
 
 /// Fetch a stored file's metadata. `contentType` is omitted from the response
 /// when the upload supplied no content-type. Unknown id → `NotFound`.
+///
+/// SEC-118: per-row authorization runs before the metadata is returned — a
+/// non-owner interactive caller gets 403.
 async fn metadata_handler(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -918,5 +1271,6 @@ async fn metadata_handler(
     let meta = storage::get_meta(&state.pool, &db, &id)
         .await?
         .ok_or_else(|| RtDbError::not_found("unknown file"))?;
+    enforce_blob_owner(&principal, &meta.owner_id)?;
     Ok(Json(meta))
 }

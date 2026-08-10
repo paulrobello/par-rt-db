@@ -383,7 +383,8 @@ pub async fn create_database(pool: &PgPool, name: &str) -> Result<(), RtDbError>
             size         bigint NOT NULL,
             content_type text,
             bytes        bytea NOT NULL,
-            created_at   bigint NOT NULL
+            created_at   bigint NOT NULL,
+            owner_id     text
         )"
     ))
     .execute(&mut *tx)
