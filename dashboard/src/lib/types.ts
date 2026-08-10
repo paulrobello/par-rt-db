@@ -1,20 +1,67 @@
-// Admin API data contract — mirrors server/src/admin.rs, op_feed.rs, metrics.rs.
-// Keep field names in sync with the server's serde output (camelCase).
+// Dashboard type hub.
+//
+// Wire-contract types are re-exported from `@par-rt-db/client` so the dashboard
+// cannot drift from the SDK — the fifth-copy bug this file used to be (ARC-107).
+// Only genuinely dashboard-local view shapes are declared here. The SDK
+// (`ts-client/src/index.ts`) is the single source of truth for the wire contract.
 
-import type { AuthedUser, QueryJson, TransactionJson } from "@par-rt-db/client";
+import type { AdminStreamFrame, DbSubCounters, ScheduleInfo } from "@par-rt-db/client";
 
-export type { AuthedUser, QueryJson, TransactionJson };
+// ---------------------------------------------------------------------------
+// Wire-contract types: re-exported from the SDK (single source of truth).
+// ---------------------------------------------------------------------------
 
-export type OpKind = "insert" | "patch" | "replace" | "delete";
+export type {
+  AuthedUser,
+  QueryJson,
+  TransactionJson,
+  ScheduleInfo,
+  ScheduleWhen,
+  AuditEntry,
+  Webhook,
+  WebhookDelivery,
+  SubscriptionInfo,
+  SubscriptionsResponse,
+  SubscriptionsPrincipal,
+  DbSubCounters,
+  CreateWebhookOptions,
+  EditWebhookOptions,
+  GetAuditOptions,
+  ListDeliveriesOptions,
+  RtDbErrorEnvelope,
+} from "@par-rt-db/client";
 
-export interface OpEvent {
-  db: string;
-  table: string;
-  docId: string;
-  kind: OpKind;
-  ts: number;
-  owner?: string | null;
-}
+// Aliased re-exports — the dashboard's historical names for SDK types whose
+// canonical name differs. `FileMeta` is the SDK's `FileMetadata`; `SessionRow`
+// is the SDK's `SessionInfo` (same shape, dashboard-local name).
+export type { FileMetadata as FileMeta } from "@par-rt-db/client";
+export type { SessionInfo as SessionRow } from "@par-rt-db/client";
+
+// ---------------------------------------------------------------------------
+// Op feed — derived from the SDK's exported `AdminStreamFrame`.
+//
+// `OpEvent`/`OpEventKind` live in `admin.ts` but are not re-exported through the
+// package entry point. `AdminStreamFrame` IS exported and carries `OpEvent` on
+// its `"op"` arm, so deriving here means a new op variant (e.g. `upsert`)
+// propagates automatically instead of silently drifting. `Record<OpKind, string>`
+// in AppShell becomes exhaustive by construction — the compiler flags any missing
+// variant.
+// ---------------------------------------------------------------------------
+
+export type OpEvent = Extract<AdminStreamFrame, { kind: "op" }>["event"];
+export type OpKind = OpEvent["kind"];
+
+// ---------------------------------------------------------------------------
+// Schedule enums — derived from the exported `ScheduleInfo` (the SDK inlines
+// these unions rather than naming them `ScheduleKind`/`ScheduleStatus`).
+// ---------------------------------------------------------------------------
+
+export type ScheduleKind = ScheduleInfo["kind"];
+export type ScheduleStatus = ScheduleInfo["status"];
+
+// ---------------------------------------------------------------------------
+// Dashboard-local view types (not part of the wire contract).
+// ---------------------------------------------------------------------------
 
 export interface LatencyStats {
   p50: number;
@@ -58,53 +105,15 @@ export interface MetricsSnapshot {
   perDbSubs?: DbSubCounters[];
 }
 
-/** One database's subscription-invalidation counters (ENH-010). camelCase wire. */
-export interface DbSubCounters {
-  db: string;
-  reruns: number;
-  skipsPoint: number;
-  skipsIndexed: number;
-  skipsOrdered: number;
-  missed: number;
-}
-
-/** The interactive identity of a subscriber, when it has one. A machine token,
- *  scheduled job, or admin bypass carries no user identity, so its subscription
- *  reports `principal: null`. */
-export interface SubscriptionsPrincipal {
-  userId: string | null;
-  email: string | null;
-}
-
-/** One active subscription, as listed by the inspector (`GET /admin/subscriptions`).
- *  The registry keys on (connection, queryId), so each row is one subscriber's
- *  one query — there is no per-sub subscriber count. */
-export interface SubscriptionInfo {
-  db: string;
-  table: string;
-  terminal: string;
-  readSetClass: string;
-  principal: SubscriptionsPrincipal | null;
-}
-
-/** Response from `GET /admin/subscriptions`: the live subscription list plus the
- *  global and per-db invalidation counters that explain re-run behavior. */
-export interface SubscriptionsResponse {
-  subscriptions: SubscriptionInfo[];
-  subsRerunsTotal: number;
-  subsSkipsPointTotal: number;
-  subsSkipsIndexedTotal: number;
-  subsSkipsOrderedTotal: number;
-  subsMissedPushesTotal: number;
-  perDb: DbSubCounters[];
-}
-
 export interface TableStat {
   name: string;
   rowCount: number;
   sizeBytes: number;
 }
 
+// Richer than the SDK's `DbStats` (admin.ts): the dashboard surface carries the
+// per-db ENH-011 quota/usage fields (`tablesQuota`/`storageQuotaBytes`/`subsQuota`
+// and their `*Used` counters) that the server includes on `/admin/dbs/{db}/stats`.
 export interface DbStats {
   tables: TableStat[];
   totalSizeBytes: number;
@@ -159,36 +168,6 @@ export interface TokenRow {
   tables: string[] | null;
 }
 
-/** One active session row from `GET /admin/sessions` (camelCase wire). A session
- *  is an authenticated user or anonymous principal with a non-expired cookie /
- *  token. `login`/`email` are null for anonymous sessions; `anonymous` flags
- *  them. Revoking deletes the row (and the cookie stops authenticating). */
-export interface SessionRow {
-  tokenHash: string;
-  userId: string;
-  email: string | null;
-  login: string | null;
-  anonymous: boolean;
-  createdAt: number;
-  expiresAt: number;
-}
-
-// File storage — mirrors server/src/storage.rs `FileMeta`. Field names are
-// camelCase on the wire (serde `rename_all = "camelCase"`). `contentType` is
-// omitted by the server when the upload supplied no Content-Type header.
-export interface FileMeta {
-  id: string;
-  sha256: string;
-  size: number;
-  contentType?: string;
-  creationTime: number;
-}
-
-export interface RtDbErrorEnvelope {
-  code: string;
-  message: string;
-}
-
 export interface AdminQueryResult {
   result: unknown;
 }
@@ -223,29 +202,6 @@ export interface SchemaDiff {
   rejected: Rejection[];
 }
 
-// Scheduled jobs — mirrors server/src/protocol.rs (ScheduleInfo, ScheduleWhen,
-// ScheduleKind, ScheduleStatus). Field names are camelCase on the wire.
-export type ScheduleKind = "oneshot" | "cron";
-export type ScheduleStatus = "pending" | "running" | "paused" | "error";
-
-export interface ScheduleInfo {
-  id: string;
-  kind: ScheduleKind;
-  dueAt: number;
-  cron?: string;
-  status: ScheduleStatus;
-  lastError?: string;
-  createdAt: number;
-  firedCount: number;
-}
-
-/** Wire shape for the `when` field of a create-schedule request. Mirrors the
- *  server's `ScheduleWhen` (tagged union, `type` discriminator). */
-export type ScheduleWhen =
-  | { type: "afterMs"; ms: number }
-  | { type: "runAt"; ms: number }
-  | { type: "cron"; expr: string };
-
 export interface HotConfigPatch {
   allowedOrigins?: string[];
   sessionTtlDays?: number;
@@ -254,79 +210,4 @@ export interface HotConfigPatch {
   maxTablesPerDb?: number;
   maxStorageBytesPerDb?: number;
   maxSubsPerDb?: number;
-}
-
-// Webhooks — mirrors server/src/webhook.rs (Webhook, DeliveryRow) and the
-// ts-client's admin.ts shapes. Field names are camelCase on the wire.
-// `table: null` means "all tables"; `events` carries op names
-// (`insert`/`patch`/`replace`/`delete`/`upsert`) or `["*"]` for all.
-export interface Webhook {
-  id: number;
-  db: string;
-  table: string | null;
-  url: string;
-  events: string[];
-  createdAt: number;
-  enabled: boolean;
-}
-
-// `payload` is the raw JSON body the worker POSTs — typed `unknown` because the
-// server passes it through verbatim. `status` is one of
-// `pending|retrying|delivered|failed` (free-form here to tolerate future states).
-export interface WebhookDelivery {
-  id: number;
-  attempts: number;
-  status: string;
-  nextAttempt: number;
-  lastError: string | null;
-  payload: unknown;
-}
-
-export interface CreateWebhookOptions {
-  url: string;
-  table?: string | null;
-  events?: string[];
-  enabled?: boolean;
-}
-
-// Tri-state `table`: omitted = unchanged, `null` = clear to all-tables,
-// string = set. Other fields are plain optional — present sets, absent keeps.
-export interface EditWebhookOptions {
-  url?: string;
-  table?: string | null;
-  events?: string[];
-  enabled?: boolean;
-}
-
-export interface ListDeliveriesOptions {
-  status?: string;
-  limit?: number;
-  offset?: number;
-}
-
-// Audit log — mirrors server/src/audit.rs (AuditEntry, camelCase wire) and the
-// ts-client's admin.ts shape. `op` is null for rows the server could not label
-// with a kind; `principal` is null for system-initiated writes (TTL reaper,
-// scheduled jobs) where there is no interactive user.
-export interface AuditEntry {
-  id: number;
-  tsMs: number;
-  db: string;
-  table: string;
-  op: string | null;
-  docId: string;
-  principal: string | null;
-  source: string;
-}
-
-/** Options for `getAudit`. All optional; omitted filters match all rows, and
- *  omitted paging falls back to server defaults (limit 100, offset 0). */
-export interface GetAuditOptions {
-  db?: string;
-  table?: string;
-  op?: string;
-  principal?: string;
-  source?: string;
-  limit?: number;
-  offset?: number;
 }

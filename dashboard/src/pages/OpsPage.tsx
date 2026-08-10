@@ -10,6 +10,7 @@ const KIND_GLYPH: Record<OpKind, string> = {
   patch: "P",
   replace: "R",
   delete: "D",
+  upsert: "U",
 };
 
 export function OpsPage() {

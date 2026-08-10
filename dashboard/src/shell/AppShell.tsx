@@ -28,6 +28,7 @@ const KIND_TONE: Record<OpKind, string> = {
   patch: s.kindPatch,
   replace: s.kindReplace,
   delete: s.kindDelete,
+  upsert: s.kindUpsert,
 };
 
 function clock(ms: number): string {

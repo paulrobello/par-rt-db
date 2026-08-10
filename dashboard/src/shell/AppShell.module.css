@@ -177,6 +177,10 @@
   color: var(--error);
   text-shadow: 0 0 8px rgba(255, 118, 108, 0.5);
 }
+.kindUpsert {
+  color: var(--accent);
+  text-shadow: 0 0 8px rgba(69, 230, 211, 0.45);
+}
 .opWhere {
   overflow: hidden;
   text-overflow: ellipsis;
