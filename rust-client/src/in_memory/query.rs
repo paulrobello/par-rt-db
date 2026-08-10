@@ -458,180 +458,13 @@ impl InMemoryRtDbClient {
         // set yields null, an empty group yields a null `value`. Group count is
         // capped by MAX_TAKE.
         if let Some(agg) = &q.aggregate {
-            let idx = index_def.as_ref().ok_or_else(|| {
-                RtDbError::new(
-                    ErrorCode::BadRequest,
-                    "aggregate requires an index field beyond the eq prefix",
-                )
-            })?;
-            let eq_len = typed_eq.len();
-            // `count` aggregates matching rows and consumes no aggregate field
-            // (mirrors `server/src/query.rs::AggregateOp::needs_field`). Scalar
-            // count = number of matching rows (0 if none, never null); grouped
-            // count = the size of each group.
-            if matches!(agg.op, AggregateOp::Count) {
-                if agg.group_by {
-                    let group_field = idx.fields.get(eq_len).ok_or_else(|| {
-                        RtDbError::new(
-                            ErrorCode::BadRequest,
-                            "aggregate groupBy requires an index field beyond the eq prefix",
-                        )
-                    })?;
-                    let group_field_pg = table_def
-                        .fields
-                        .get(group_field.as_str())
-                        .and_then(|ty| index_column_type(ty).ok())
-                        .map(|it| it.pg)
-                        .unwrap_or(PgType::Text);
-                    let mut groups: Vec<(Value, u64)> = Vec::new();
-                    let mut group_index: HashMap<String, usize> = HashMap::new();
-                    for row in &filtered {
-                        let Some(k) = row.doc.get(group_field.as_str()) else {
-                            continue;
-                        };
-                        if k.is_null() {
-                            continue;
-                        }
-                        let key = k.to_string();
-                        let i = match group_index.get(&key).copied() {
-                            Some(i) => i,
-                            None => {
-                                let i = groups.len();
-                                group_index.insert(key, i);
-                                groups.push((k.clone(), 0));
-                                i
-                            }
-                        };
-                        groups[i].1 += 1;
-                    }
-                    let mut out: Vec<Value> = groups
-                        .into_iter()
-                        .map(|(k, count)| {
-                            let mut obj = Map::new();
-                            obj.insert("key".to_string(), k);
-                            obj.insert(
-                                "value".to_string(),
-                                Value::Number(serde_json::Number::from(count)),
-                            );
-                            Value::Object(obj)
-                        })
-                        .collect();
-                    out.sort_by(|a, b| compare_index_values(&a["key"], &b["key"], group_field_pg));
-                    let out: Vec<Value> = out.into_iter().take(MAX_TAKE).collect();
-                    return Ok(Value::Array(out));
-                }
-                // Scalar count: number of matching rows (0 if none, never null).
-                return Ok(Value::Number(serde_json::Number::from(
-                    filtered.len() as i64
-                )));
-            }
-            let (group_field, agg_field) = if agg.group_by {
-                if eq_len + 1 >= idx.fields.len() {
-                    return Err(RtDbError::new(
-                        ErrorCode::BadRequest,
-                        "aggregate groupBy requires two index fields beyond the eq prefix",
-                    ));
-                }
-                (
-                    Some(idx.fields[eq_len].as_str()),
-                    idx.fields[eq_len + 1].as_str(),
-                )
-            } else {
-                if eq_len >= idx.fields.len() {
-                    return Err(RtDbError::new(
-                        ErrorCode::BadRequest,
-                        "aggregate requires an index field beyond the eq prefix",
-                    ));
-                }
-                (None, idx.fields[eq_len].as_str())
-            };
-            let agg_field_pg = table_def
-                .fields
-                .get(agg_field)
-                .and_then(|ty| index_column_type(ty).ok())
-                .map(|it| it.pg)
-                .unwrap_or(PgType::Text);
-            let op_name = match agg.op {
-                AggregateOp::Sum => "sum",
-                AggregateOp::Avg => "avg",
-                AggregateOp::Min => "min",
-                AggregateOp::Max => "max",
-                // Count returns early above; this arm is unreachable but keeps
-                // the match exhaustive as the enum grows.
-                AggregateOp::Count => "count",
-            };
-            if matches!(agg.op, AggregateOp::Sum | AggregateOp::Avg)
-                && !matches!(agg_field_pg, PgType::Number | PgType::Int64)
-            {
-                return Err(RtDbError::new(
-                    ErrorCode::BadRequest,
-                    format!("aggregate op {op_name} requires a numeric index field"),
-                ));
-            }
-            if let Some(group_field) = group_field {
-                let group_field_pg = table_def
-                    .fields
-                    .get(group_field)
-                    .and_then(|ty| index_column_type(ty).ok())
-                    .map(|it| it.pg)
-                    .unwrap_or(PgType::Text);
-                // Group rows by `group_field` (skip null keys), preserving
-                // first-seen order; sort by key ascending after, for parity with
-                // the server's `ORDER BY k`.
-                let mut groups: Vec<(Value, Vec<Value>)> = Vec::new();
-                let mut group_index: HashMap<String, usize> = HashMap::new();
-                for row in &filtered {
-                    let Some(k) = row.doc.get(group_field) else {
-                        continue;
-                    };
-                    if k.is_null() {
-                        continue;
-                    }
-                    let key = k.to_string();
-                    let i = match group_index.get(&key).copied() {
-                        Some(i) => i,
-                        None => {
-                            let i = groups.len();
-                            group_index.insert(key, i);
-                            groups.push((k.clone(), Vec::new()));
-                            i
-                        }
-                    };
-                    if let Some(v) = row.doc.get(agg_field)
-                        && !v.is_null()
-                    {
-                        groups[i].1.push(v.clone());
-                    }
-                }
-                let mut out: Vec<Value> = groups
-                    .into_iter()
-                    .map(|(k, vs)| {
-                        let value = if vs.is_empty() {
-                            Value::Null
-                        } else {
-                            apply_aggregate(agg.op, &vs, agg_field_pg)
-                        };
-                        let mut obj = Map::new();
-                        obj.insert("key".to_string(), k);
-                        obj.insert("value".to_string(), value);
-                        Value::Object(obj)
-                    })
-                    .collect();
-                out.sort_by(|a, b| compare_index_values(&a["key"], &b["key"], group_field_pg));
-                let out: Vec<Value> = out.into_iter().take(MAX_TAKE).collect();
-                return Ok(Value::Array(out));
-            }
-            // Scalar aggregate.
-            let values: Vec<Value> = filtered
-                .iter()
-                .filter_map(|row| row.doc.get(agg_field))
-                .filter(|v| !v.is_null())
-                .cloned()
-                .collect();
-            if values.is_empty() {
-                return Ok(Value::Null);
-            }
-            return Ok(apply_aggregate(agg.op, &values, agg_field_pg));
+            return self.execute_aggregate_terminal(
+                agg,
+                &table_def,
+                index_def.as_ref(),
+                &typed_eq,
+                &filtered,
+            );
         }
 
         // Sort keys: unbound index fields (after the eq prefix), then
@@ -977,6 +810,196 @@ impl InMemoryRtDbClient {
         values.sort_by(|a, b| compare_index_values(a, b, field_pg));
         let out: Vec<Value> = values.into_iter().take(MAX_TAKE).collect();
         Ok(Value::Array(out))
+    }
+
+    /// `aggregate` terminal: <OP> over the index field after the eq prefix
+    /// (groupBy: group by that field, aggregate the next). Ports ts
+    /// `executeQuery` :1391-1462 and the server's aggregate arm. Null agg
+    /// values are skipped (SQL SUM/AVG/MIN/MAX ignore NULL); an empty scalar
+    /// set yields null, an empty group yields a null `value`. Group count is
+    /// capped by MAX_TAKE.
+    fn execute_aggregate_terminal(
+        &self,
+        agg: &crate::wire::AggregateSpec,
+        table_def: &TableDef,
+        index_def: Option<&IndexDef>,
+        typed_eq: &[Value],
+        filtered: &[StoredRow],
+    ) -> Result<Value, RtDbError> {
+        let idx = index_def.ok_or_else(|| {
+            RtDbError::new(
+                ErrorCode::BadRequest,
+                "aggregate requires an index field beyond the eq prefix",
+            )
+        })?;
+        let eq_len = typed_eq.len();
+        // `count` aggregates matching rows and consumes no aggregate field
+        // (mirrors `server/src/query.rs::AggregateOp::needs_field`). Scalar
+        // count = number of matching rows (0 if none, never null); grouped
+        // count = the size of each group.
+        if matches!(agg.op, AggregateOp::Count) {
+            if agg.group_by {
+                let group_field = idx.fields.get(eq_len).ok_or_else(|| {
+                    RtDbError::new(
+                        ErrorCode::BadRequest,
+                        "aggregate groupBy requires an index field beyond the eq prefix",
+                    )
+                })?;
+                let group_field_pg = table_def
+                    .fields
+                    .get(group_field.as_str())
+                    .and_then(|ty| index_column_type(ty).ok())
+                    .map(|it| it.pg)
+                    .unwrap_or(PgType::Text);
+                let mut groups: Vec<(Value, u64)> = Vec::new();
+                let mut group_index: HashMap<String, usize> = HashMap::new();
+                for row in filtered {
+                    let Some(k) = row.doc.get(group_field.as_str()) else {
+                        continue;
+                    };
+                    if k.is_null() {
+                        continue;
+                    }
+                    let key = k.to_string();
+                    let i = match group_index.get(&key).copied() {
+                        Some(i) => i,
+                        None => {
+                            let i = groups.len();
+                            group_index.insert(key, i);
+                            groups.push((k.clone(), 0));
+                            i
+                        }
+                    };
+                    groups[i].1 += 1;
+                }
+                let mut out: Vec<Value> = groups
+                    .into_iter()
+                    .map(|(k, count)| {
+                        let mut obj = Map::new();
+                        obj.insert("key".to_string(), k);
+                        obj.insert(
+                            "value".to_string(),
+                            Value::Number(serde_json::Number::from(count)),
+                        );
+                        Value::Object(obj)
+                    })
+                    .collect();
+                out.sort_by(|a, b| compare_index_values(&a["key"], &b["key"], group_field_pg));
+                let out: Vec<Value> = out.into_iter().take(MAX_TAKE).collect();
+                return Ok(Value::Array(out));
+            }
+            // Scalar count: number of matching rows (0 if none, never null).
+            return Ok(Value::Number(serde_json::Number::from(
+                filtered.len() as i64
+            )));
+        }
+        let (group_field, agg_field) = if agg.group_by {
+            if eq_len + 1 >= idx.fields.len() {
+                return Err(RtDbError::new(
+                    ErrorCode::BadRequest,
+                    "aggregate groupBy requires two index fields beyond the eq prefix",
+                ));
+            }
+            (
+                Some(idx.fields[eq_len].as_str()),
+                idx.fields[eq_len + 1].as_str(),
+            )
+        } else {
+            if eq_len >= idx.fields.len() {
+                return Err(RtDbError::new(
+                    ErrorCode::BadRequest,
+                    "aggregate requires an index field beyond the eq prefix",
+                ));
+            }
+            (None, idx.fields[eq_len].as_str())
+        };
+        let agg_field_pg = table_def
+            .fields
+            .get(agg_field)
+            .and_then(|ty| index_column_type(ty).ok())
+            .map(|it| it.pg)
+            .unwrap_or(PgType::Text);
+        let op_name = match agg.op {
+            AggregateOp::Sum => "sum",
+            AggregateOp::Avg => "avg",
+            AggregateOp::Min => "min",
+            AggregateOp::Max => "max",
+            // Count returns early above; this arm is unreachable but keeps
+            // the match exhaustive as the enum grows.
+            AggregateOp::Count => "count",
+        };
+        if matches!(agg.op, AggregateOp::Sum | AggregateOp::Avg)
+            && !matches!(agg_field_pg, PgType::Number | PgType::Int64)
+        {
+            return Err(RtDbError::new(
+                ErrorCode::BadRequest,
+                format!("aggregate op {op_name} requires a numeric index field"),
+            ));
+        }
+        if let Some(group_field) = group_field {
+            let group_field_pg = table_def
+                .fields
+                .get(group_field)
+                .and_then(|ty| index_column_type(ty).ok())
+                .map(|it| it.pg)
+                .unwrap_or(PgType::Text);
+            // Group rows by `group_field` (skip null keys), preserving
+            // first-seen order; sort by key ascending after, for parity with
+            // the server's `ORDER BY k`.
+            let mut groups: Vec<(Value, Vec<Value>)> = Vec::new();
+            let mut group_index: HashMap<String, usize> = HashMap::new();
+            for row in filtered {
+                let Some(k) = row.doc.get(group_field) else {
+                    continue;
+                };
+                if k.is_null() {
+                    continue;
+                }
+                let key = k.to_string();
+                let i = match group_index.get(&key).copied() {
+                    Some(i) => i,
+                    None => {
+                        let i = groups.len();
+                        group_index.insert(key, i);
+                        groups.push((k.clone(), Vec::new()));
+                        i
+                    }
+                };
+                if let Some(v) = row.doc.get(agg_field)
+                    && !v.is_null()
+                {
+                    groups[i].1.push(v.clone());
+                }
+            }
+            let mut out: Vec<Value> = groups
+                .into_iter()
+                .map(|(k, vs)| {
+                    let value = if vs.is_empty() {
+                        Value::Null
+                    } else {
+                        apply_aggregate(agg.op, &vs, agg_field_pg)
+                    };
+                    let mut obj = Map::new();
+                    obj.insert("key".to_string(), k);
+                    obj.insert("value".to_string(), value);
+                    Value::Object(obj)
+                })
+                .collect();
+            out.sort_by(|a, b| compare_index_values(&a["key"], &b["key"], group_field_pg));
+            let out: Vec<Value> = out.into_iter().take(MAX_TAKE).collect();
+            return Ok(Value::Array(out));
+        }
+        // Scalar aggregate.
+        let values: Vec<Value> = filtered
+            .iter()
+            .filter_map(|row| row.doc.get(agg_field))
+            .filter(|v| !v.is_null())
+            .cloned()
+            .collect();
+        if values.is_empty() {
+            return Ok(Value::Null);
+        }
+        Ok(apply_aggregate(agg.op, &values, agg_field_pg))
     }
 }
 
