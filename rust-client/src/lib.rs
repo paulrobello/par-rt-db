@@ -13,7 +13,7 @@
 //! | `http` | yes | `RtDbHttpClient` — typed query / mutate / `auth_me` |
 //! | `ws` | no | `RtDbClient` (`src/ws.rs`) — reactive WebSocket client (live query subscriptions + mutate) |
 //! | `admin` | no | `/admin/*` control-plane client — push-schema, create-db, mint-token, revoke-token, allowlist, export, import |
-//! | `in_memory` | no | `InMemoryRtDbClient` (`src/in_memory.rs`) — in-memory harness for unit tests (no network, no Postgres) |
+//! | `in_memory` | no | `InMemoryRtDbClient` (`src/in_memory/mod.rs`) — in-memory harness for unit tests (no network, no Postgres) |
 //!
 //! `core` (wire types, schema/query/mutation builders, error model) compiles with no
 //! features. `[lints.rust] warnings = "deny"` — same zero-warning posture as the server.
