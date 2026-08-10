@@ -87,6 +87,17 @@ export interface RestoreResult {
   instructions: string;
 }
 
+/** Reads the readable (non-HttpOnly) `rtdb-admin-csrf` cookie set alongside
+ *  the session cookie by `/admin/login` and the OAuth callback (SEC-106).
+ *  Returns null when no admin session is active, or when running where
+ *  `document` is undefined (SSR). The value is echoed in the `X-Rtdb-Csrf`
+ *  header on admin requests — see `AdminClient.req`. */
+function readAdminCsrfCookie(): string | null {
+  if (typeof document === "undefined") return null;
+  const match = document.cookie.match(/(?:^|;\s*)rtdb-admin-csrf=([^;]+)/);
+  return match ? match[1] : null;
+}
+
 /** Admin/control-plane client. Same-origin; bearer read from the session. */
 export class AdminClient {
   constructor(private readonly getToken: () => string | null) {}
@@ -98,6 +109,14 @@ export class AdminClient {
       ...((init?.headers as Record<string, string>) ?? {}),
     };
     if (token) headers.authorization = `Bearer ${token}`;
+    // SEC-106: echo the readable admin-CSRF nonce on every admin request. The
+    // server enforces it on cookie-authenticated mutating requests; sending it
+    // on bearer-authenticated or GET requests is harmless (the server skips
+    // those branches). A cross-site forge cannot read this cookie and so
+    // cannot set the header — forcing a preflight that the CORS allowlist then
+    // gates.
+    const csrf = readAdminCsrfCookie();
+    if (csrf) headers["x-rtdb-csrf"] = csrf;
     const resp = await fetch(path, { ...init, headers });
     if (!resp.ok) {
       let code = "INTERNAL";

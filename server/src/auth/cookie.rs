@@ -118,6 +118,54 @@ pub(crate) fn clear_oauth_csrf_cookie() -> HeaderValue {
     .expect("static clear-cookie template is a valid header value")
 }
 
+/// Cookie name carrying the admin double-submit CSRF nonce (SEC-106). READABLE
+/// (NOT HttpOnly) so dashboard JS can read it and echo the value in the
+/// `X-Rtdb-Csrf` header on mutating `/admin/*` requests. Its scope and lifetime
+/// mirror the session cookie — `SameSite=Lax`, same 30-day Max-Age, same
+/// conditional `Secure` attribute — so it rides the same browser-sent envelope.
+/// The value is an opaque random token (e.g. `db::random_token()`), independent
+/// of the session credential, so leaking one does not leak the other.
+pub(crate) const ADMIN_CSRF_COOKIE: &str = "rtdb-admin-csrf";
+
+/// Reads the `rtdb-admin-csrf` cookie value from the `Cookie:` header, if present.
+pub(crate) fn admin_csrf_cookie(headers: &HeaderMap) -> Option<&str> {
+    let raw = headers.get(axum::http::header::COOKIE)?.to_str().ok()?;
+    raw.split(';').find_map(|pair| {
+        let (name, value) = pair.split_once('=')?;
+        (name.trim() == ADMIN_CSRF_COOKIE).then_some(value.trim())
+    })
+}
+
+/// Builds the `Set-Cookie` header for the admin CSRF nonce. Mirrors
+/// `set_session_cookie`'s injection-char guard (fails closed on `;`, `,`,
+/// whitespace, control bytes). NOT HttpOnly — dashboard JS must read the value
+/// to echo it in `X-Rtdb-Csrf`. `secure` mirrors the session cookie.
+pub(crate) fn set_admin_csrf_cookie(value: &str, secure: bool) -> Result<HeaderValue, RtDbError> {
+    if value.is_empty()
+        || value
+            .bytes()
+            .any(|b| matches!(b, b';' | b',' | b' ' | b'\t' | b'\r' | b'\n') || b < 0x20)
+    {
+        return Err(RtDbError::internal(
+            "admin csrf cookie value contains illegal characters",
+        ));
+    }
+    let mut s =
+        format!("{ADMIN_CSRF_COOKIE}={value}; SameSite=Lax; Path=/; Max-Age={COOKIE_MAX_AGE_SECS}");
+    if secure {
+        s.push_str("; Secure");
+    }
+    HeaderValue::from_str(&s).map_err(|_| RtDbError::internal("invalid admin csrf cookie value"))
+}
+
+/// Builds the `Set-Cookie` that deletes the admin CSRF nonce.
+pub(crate) fn clear_admin_csrf_cookie() -> HeaderValue {
+    HeaderValue::from_str(&format!(
+        "{ADMIN_CSRF_COOKIE}=; SameSite=Lax; Path=/; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT"
+    ))
+    .expect("static clear-cookie template is a valid header value")
+}
+
 /// True when the request arrived over HTTPS. The Cloudflare tunnel sets
 /// `X-Forwarded-Proto: https`; a same-origin dashboard request carries it. Local
 /// http dev has no such header → `false` → `Secure` is omitted so the cookie is
@@ -239,5 +287,63 @@ mod tests {
         assert!(set_oauth_csrf_cookie("a b", true).is_err());
         assert!(set_oauth_csrf_cookie("", true).is_err());
         assert!(set_oauth_csrf_cookie("deadbeef-0123", true).is_ok());
+    }
+
+    #[test]
+    fn admin_csrf_cookie_reads_among_pairs() {
+        let mut h = HeaderMap::new();
+        h.insert(
+            "cookie",
+            "rtdb_session=abc; rtdb-admin-csrf=xyz-nonce; lang=en"
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(admin_csrf_cookie(&h), Some("xyz-nonce"));
+    }
+
+    #[test]
+    fn admin_csrf_cookie_missing_is_none() {
+        let mut h = HeaderMap::new();
+        h.insert("cookie", "rtdb_session=abc".parse().unwrap());
+        assert_eq!(admin_csrf_cookie(&h), None);
+    }
+
+    #[test]
+    fn set_admin_csrf_cookie_is_readable_and_lax() {
+        // SEC-106: the CSRF cookie must NOT be HttpOnly (dashboard JS reads it)
+        // and must be SameSite=Lax (mirrors the session cookie scope).
+        let plain = set_admin_csrf_cookie("deadbeef", false)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(plain.contains("rtdb-admin-csrf=deadbeef"));
+        assert!(!plain.contains("HttpOnly"));
+        assert!(plain.contains("SameSite=Lax"));
+        assert!(plain.contains("Path=/"));
+        assert!(!plain.contains("Secure"));
+
+        let secure = set_admin_csrf_cookie("deadbeef", true)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(secure.contains("Secure"));
+    }
+
+    #[test]
+    fn set_admin_csrf_cookie_rejects_injection_chars() {
+        assert!(set_admin_csrf_cookie("a;b", false).is_err());
+        assert!(set_admin_csrf_cookie("a,b", false).is_err());
+        assert!(set_admin_csrf_cookie("a b", false).is_err());
+        assert!(set_admin_csrf_cookie("", false).is_err());
+        assert!(set_admin_csrf_cookie("deadbeef-0123", false).is_ok());
+    }
+
+    #[test]
+    fn clear_admin_csrf_cookie_zeros_the_value() {
+        let v = clear_admin_csrf_cookie().to_str().unwrap().to_string();
+        assert!(v.contains("rtdb-admin-csrf="));
+        assert!(v.contains("Max-Age=0"));
     }
 }

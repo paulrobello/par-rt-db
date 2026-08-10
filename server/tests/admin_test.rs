@@ -1652,3 +1652,206 @@ async fn mint_and_list_token_with_capabilities() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+// ===== SEC-106 admin CSRF double-submit nonce =====
+//
+// Cookie-authenticated admin requests (the browser dashboard path) must carry
+// the `X-Rtdb-Csrf` header matching the `rtdb-admin-csrf` cookie on mutating
+// verbs. Bearer-authenticated requests (CLI/automation/machine tokens) skip the
+// check. Login and logout are exempt — they mint/clear the cookies. GETs are
+// exempt — no state change.
+
+/// Extracts the value of `name` from a `Set-Cookie` header value, or panics.
+fn extract_cookie_value(set_cookie: &str, name: &str) -> String {
+    let prefix = format!("{name}=");
+    let start = set_cookie
+        .find(&prefix)
+        .unwrap_or_else(|| panic!("`{name}` in Set-Cookie: {set_cookie}"))
+        + prefix.len();
+    let rest = &set_cookie[start..];
+    let end = rest.find(';').unwrap_or(rest.len());
+    rest[..end].to_string()
+}
+
+/// Logs in via POST /admin/login and returns the `(session, csrf)` cookie pair
+/// the dashboard would store. Uses a fresh reqwest::Client per call so the
+/// cookie store is isolated.
+async fn admin_login_cookies(addr: SocketAddr) -> (reqwest::Client, String, String) {
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .cookie_store(true)
+        .build()
+        .expect("build client");
+    let resp = client
+        .post(format!("http://{addr}/admin/login"))
+        .json(&serde_json::json!({"adminKey": "test-admin-key"}))
+        .send()
+        .await
+        .expect("login");
+    assert_eq!(resp.status(), reqwest::StatusCode::NO_CONTENT);
+
+    let mut session = None;
+    let mut csrf = None;
+    for v in resp.headers().get_all(reqwest::header::SET_COOKIE) {
+        let s = v.to_str().expect("set-cookie str");
+        if s.starts_with("rtdb_session=") {
+            session = Some(extract_cookie_value(s, "rtdb_session"));
+        } else if s.starts_with("rtdb-admin-csrf=") {
+            csrf = Some(extract_cookie_value(s, "rtdb-admin-csrf"));
+        }
+    }
+    let session = session.expect("login set rtdb_session cookie");
+    let csrf = csrf.expect("login set rtdb-admin-csrf cookie");
+    (client, session, csrf)
+}
+
+#[tokio::test]
+async fn sec106_admin_login_mints_csrf_cookie_alongside_session() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state).await;
+
+    let (_client, session, csrf) = admin_login_cookies(addr).await;
+    // Sanity: both cookies are set, the CSRF nonce is an opaque independent
+    // random value (NOT the admin key — it is a freshly minted random_token),
+    // and the two cookie values are distinct from each other.
+    assert!(!session.is_empty());
+    assert!(!csrf.is_empty());
+    assert_ne!(session, csrf);
+    assert_ne!(
+        csrf, "test-admin-key",
+        "the CSRF nonce must be a fresh random value, not the admin key"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn sec106_cookie_post_without_csrf_header_rejected_403() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state).await;
+    let name = fresh_name();
+
+    // Log in to obtain the cookie pair, then send a mutating POST with the
+    // session cookie but WITHOUT the X-Rtdb-Csrf header — the forge shape.
+    let (client, _session, _csrf) = admin_login_cookies(addr).await;
+    let resp = client
+        .post(format!("http://{addr}/admin/create-db"))
+        .json(&serde_json::json!({"name": name}))
+        .send()
+        .await?;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::FORBIDDEN,
+        "a cookie-authenticated POST without X-Rtdb-Csrf must be rejected"
+    );
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(body["code"], serde_json::json!("FORBIDDEN"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn sec106_cookie_post_with_matching_csrf_header_accepted() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state).await;
+    let name = fresh_name();
+
+    let (client, _session, csrf) = admin_login_cookies(addr).await;
+    let resp = client
+        .post(format!("http://{addr}/admin/create-db"))
+        .header("x-rtdb-csrf", &csrf)
+        .json(&serde_json::json!({"name": name}))
+        .send()
+        .await?;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "a cookie-authenticated POST with matching X-Rtdb-Csrf must succeed"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn sec106_cookie_post_with_wrong_csrf_header_rejected_403() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state).await;
+    let name = fresh_name();
+
+    let (client, _session, _csrf) = admin_login_cookies(addr).await;
+    let resp = client
+        .post(format!("http://{addr}/admin/create-db"))
+        .header("x-rtdb-csrf", "not-the-real-nonce")
+        .json(&serde_json::json!({"name": name}))
+        .send()
+        .await?;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::FORBIDDEN,
+        "a mismatched X-Rtdb-Csrf must be rejected"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn sec106_bearer_post_without_csrf_header_accepted() -> anyhow::Result<()> {
+    // Existing CLI/automation path: an explicit Authorization: Bearer header
+    // is non-browser and skips the CSRF check. This is the contract that keeps
+    // `admin_post` (which sends `Bearer test-admin-key`) working unchanged.
+    let state = test_state().await;
+    let addr = spawn_app(state).await;
+    let name = fresh_name();
+    let resp = admin_post(addr, "/admin/create-db", serde_json::json!({"name": name})).await;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "a bearer-authenticated POST must skip the CSRF check"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn sec106_cookie_get_without_csrf_header_accepted() -> anyhow::Result<()> {
+    // GETs are exempt — no state change, no CSRF risk.
+    let state = test_state().await;
+    let addr = spawn_app(state).await;
+
+    let (client, _session, _csrf) = admin_login_cookies(addr).await;
+    let resp = client
+        .get(format!("http://{addr}/admin/dbs"))
+        .send()
+        .await?;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "a cookie-authenticated GET must skip the CSRF check (no state change)"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn sec106_logout_without_csrf_clears_both_cookies() -> anyhow::Result<()> {
+    // Logout is exempt from CSRF (its only effect is the cookie clear itself).
+    // Both rtdb_session and rtdb-admin-csrf must be cleared.
+    let state = test_state().await;
+    let addr = spawn_app(state).await;
+
+    let (client, _session, _csrf) = admin_login_cookies(addr).await;
+    let resp = client
+        .post(format!("http://{addr}/admin/logout"))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), reqwest::StatusCode::NO_CONTENT);
+
+    let mut saw_session_clear = false;
+    let mut saw_csrf_clear = false;
+    for v in resp.headers().get_all(reqwest::header::SET_COOKIE) {
+        let s = v.to_str().expect("set-cookie str");
+        if s.starts_with("rtdb_session=;") {
+            saw_session_clear = true;
+        }
+        if s.starts_with("rtdb-admin-csrf=;") {
+            saw_csrf_clear = true;
+        }
+    }
+    assert!(saw_session_clear, "logout cleared rtdb_session");
+    assert!(saw_csrf_clear, "logout cleared rtdb-admin-csrf");
+    Ok(())
+}

@@ -366,6 +366,14 @@ fn callback_close_response(token: &str, secure: bool) -> Response {
     match crate::auth::cookie::set_session_cookie(token, secure) {
         Ok(cookie) => {
             response.headers_mut().append(SET_COOKIE, cookie);
+            // SEC-106: mint the readable admin-CSRF nonce alongside the session
+            // cookie. The OAuth user may or may not be a dashboard admin; if
+            // they are, the nonce is already in place. Independent random value
+            // — leaking one does not leak the other.
+            let csrf_token = crate::db::random_token();
+            if let Ok(csrf) = crate::auth::cookie::set_admin_csrf_cookie(&csrf_token, secure) {
+                response.headers_mut().append(SET_COOKIE, csrf);
+            }
             response
                 .headers_mut()
                 .append(SET_COOKIE, crate::auth::cookie::clear_oauth_csrf_cookie());
@@ -425,9 +433,11 @@ async fn logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
     }
     let mut resp = Json(OkResponse { ok: true }).into_response();
     // SEC-001 phase 2: clear the HttpOnly session cookie alongside the
-    // server-side session row.
+    // server-side session row. SEC-106: clear the CSRF nonce with it.
     resp.headers_mut()
-        .insert(SET_COOKIE, crate::auth::cookie::clear_session_cookie());
+        .append(SET_COOKIE, crate::auth::cookie::clear_session_cookie());
+    resp.headers_mut()
+        .append(SET_COOKIE, crate::auth::cookie::clear_admin_csrf_cookie());
     resp
 }
 
@@ -566,6 +576,14 @@ async fn anonymous(
     .into_response();
     if let Ok(cookie) = crate::auth::cookie::set_session_cookie(&token, secure) {
         response.headers_mut().append(SET_COOKIE, cookie);
+    }
+    // SEC-106: anonymous sessions cannot be dashboard admins (no email, not on
+    // `rtdb_auth.admins`), but mint the CSRF nonce for symmetry with the OAuth
+    // path — the dashboard JS reads it unconditionally, and the cookie is
+    // inert if the bearer is the credential.
+    let csrf_token = crate::db::random_token();
+    if let Ok(csrf) = crate::auth::cookie::set_admin_csrf_cookie(&csrf_token, secure) {
+        response.headers_mut().append(SET_COOKIE, csrf);
     }
     response
 }

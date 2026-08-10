@@ -224,6 +224,13 @@ pub(super) async fn admin_stream(
     QueryParams(params): QueryParams<StreamParams>,
     req: Request,
 ) -> Result<Response, RtDbError> {
+    // SEC-105: WS handshakes are CORS-exempt — reject a cookie-authenticated
+    // upgrade from a disallowed Origin before WS negotiation begins. Browsers
+    // always send `Origin`; absent Origin = non-browser (CLI/automation) and
+    // the bearer/subprotocol gate still authenticates.
+    if !crate::origin_allowed(&headers, &state.runtime.hot, &state.config.public_url) {
+        return Err(RtDbError::forbidden("websocket origin not allowed"));
+    }
     // Bearer from the Authorization header (CLI/automation) or, failing that,
     // the `rtdb-admin.<token>` subprotocol (browser dashboard — browsers can't
     // set headers on a WS handshake). When the subprotocol path is used we echo

@@ -196,6 +196,34 @@ impl AppState {
     }
 }
 
+/// Origin allowlist check for the WebSocket upgrade handlers (SEC-105). CORS
+/// does not apply to the WS handshake, so a cookie-authenticated `/sync` or
+/// `/admin/stream` upgrade would otherwise admit any same-site origin (and the
+/// `SameSite=Lax` session cookie is scoped to the registrable domain, so every
+/// `*.pardev.net` host shares it). Browsers always send `Origin` on a WS
+/// handshake; absent Origin = non-browser client (CLI/SDK/machine token), and
+/// the existing auth gates — the post-upgrade `Auth` frame on `/sync`, the
+/// `Authorization` header or `Sec-WebSocket-Protocol: rtdb-admin.<token>`
+/// subprotocol on `/admin/stream` — still validate the credential. A present
+/// `Origin` must therefore match `hot.allowed_origins` or `public_url`; an
+/// absent `Origin` is admitted.
+pub(crate) fn origin_allowed(
+    headers: &HeaderMap,
+    hot: &Arc<ArcSwap<HotConfig>>,
+    public_url: &str,
+) -> bool {
+    let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) else {
+        return true;
+    };
+    if origin == public_url {
+        return true;
+    }
+    hot.load()
+        .allowed_origins
+        .iter()
+        .any(|allowed| allowed.as_str() == origin)
+}
+
 /// Origins are decided per request from live `HotConfig`, so `PATCH /admin/config`
 /// can add an origin and have it take effect without a restart. The layer itself
 /// is still constructed once at router build time; only the origin decision is

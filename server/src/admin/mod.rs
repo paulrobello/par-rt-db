@@ -1,8 +1,10 @@
 use std::sync::Arc;
 
 use axum::Router;
-use axum::extract::DefaultBodyLimit;
-use axum::http::HeaderMap;
+use axum::extract::{DefaultBodyLimit, Request};
+use axum::http::{HeaderMap, Method};
+use axum::middleware::{Next, from_fn};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use serde::Serialize;
 use subtle::ConstantTimeEq;
@@ -118,6 +120,88 @@ pub(crate) async fn require_admin(
     authenticate_admin(state, bearer_value(headers)?).await
 }
 
+/// HTTP header name the dashboard echoes the admin-CSRF nonce back in
+/// (SEC-106). Paired with the readable `rtdb-admin-csrf` cookie: a same-origin
+/// script reads the cookie via `document.cookie` and sets this header on every
+/// mutating admin request. A cross-site forge cannot read the cookie (different
+/// origin) and so cannot set the header — the request is rejected before any
+/// state changes. Requests authenticating with an explicit
+/// `Authorization: Bearer` header skip the check (non-browser, non-ambient).
+const ADMIN_CSRF_HEADER: &str = "x-rtdb-csrf";
+
+/// True when this request carries a non-browser bearer credential — an explicit
+/// `Authorization: Bearer …` header. Such requests do not rely on the ambient
+/// session cookie, so the CSRF defense is moot for them (CLI/automation/machine
+/// tokens). Keep this branch-first: `bearer_value` tries the header before the
+/// cookie for the same reason.
+fn has_explicit_bearer(headers: &HeaderMap) -> bool {
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .is_some_and(|t| !t.is_empty())
+}
+
+/// True when the `rtdb-admin-csrf` cookie and `X-Rtdb-Csrf` header are both
+/// present and equal (constant-time compare). False otherwise (missing either,
+/// or a mismatch). The constant-time compare closes a timing oracle that could
+/// otherwise probe the nonce byte by byte.
+fn admin_csrf_matches(headers: &HeaderMap) -> bool {
+    let Some(cookie) = auth::cookie::admin_csrf_cookie(headers) else {
+        return false;
+    };
+    let Some(header) = headers.get(ADMIN_CSRF_HEADER).and_then(|v| v.to_str().ok()) else {
+        return false;
+    };
+    if cookie.len() != header.len() {
+        return false;
+    }
+    bool::from(cookie.as_bytes().ct_eq(header.as_bytes()))
+}
+
+/// True when the ambient `rtdb_session` cookie is present on this request —
+/// i.e. it could be a cookie-authenticated browser request the CSRF defense
+/// needs to gate. Absent cookie = non-browser or pre-login request; fall
+/// through to the normal auth gate (401), don't 403.
+fn has_session_cookie(headers: &HeaderMap) -> bool {
+    auth::cookie::session_cookie(headers).is_some()
+}
+
+/// Middleware: require the admin CSRF double-submit nonce on mutating
+/// `/admin/*` requests when the credential is the ambient session cookie
+/// (SEC-106). Skipped for:
+/// - GET/HEAD/OPTIONS: no state change (read-only admin routes);
+/// - `/admin/login` + `/admin/logout`: they mint/clear the cookies and so
+///   cannot carry a nonce (login-CSRF on the OAuth flow has its own defense in
+///   `auth/cookie.rs`); and logout's only effect is the cookie clear itself;
+/// - Explicit `Authorization: Bearer` requests: non-browser, non-ambient;
+/// - No session cookie at all: falls through to the normal admin auth gate
+///   (401), so unauthenticated probes don't get a 403 that would mask the real
+///   reason.
+///
+/// On a cookie-authenticated mutating request, the nonce header must match the
+/// nonce cookie (constant-time) or the request is rejected with 403.
+pub(super) async fn admin_csrf_guard(req: Request, next: Next) -> Response {
+    let method = req.method();
+    let path = req.uri().path();
+    let is_mutating = matches!(
+        *method,
+        Method::POST | Method::PUT | Method::PATCH | Method::DELETE
+    );
+    let is_auth_endpoint = path == "/admin/login" || path == "/admin/logout";
+    if !is_mutating
+        || is_auth_endpoint
+        || has_explicit_bearer(req.headers())
+        || !has_session_cookie(req.headers())
+    {
+        return next.run(req).await;
+    }
+    if !admin_csrf_matches(req.headers()) {
+        return RtDbError::forbidden("missing or mismatched admin CSRF token").into_response();
+    }
+    next.run(req).await
+}
+
 #[derive(Serialize)]
 pub(super) struct OkResponse {
     ok: bool,
@@ -219,4 +303,93 @@ pub fn admin_routes() -> Router<Arc<AppState>> {
         .route("/admin/export-db", get(export_db))
         .route("/admin/import-db", post(import_db))
         .route("/admin/clone-db", post(clone_db))
+        // SEC-106: require the admin-CSRF double-submit nonce on cookie-
+        // authenticated mutating requests. Login/logout and bearer-authenticated
+        // requests skip the check (see `admin_csrf_guard`).
+        .layer(from_fn(admin_csrf_guard))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn headers_with(
+        cookie: Option<&str>,
+        csrf_header: Option<&str>,
+        bearer: Option<&str>,
+    ) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        if let Some(c) = cookie {
+            h.insert(axum::http::header::COOKIE, c.parse().unwrap());
+        }
+        if let Some(csrf) = csrf_header {
+            h.insert(ADMIN_CSRF_HEADER, csrf.parse().unwrap());
+        }
+        if let Some(b) = bearer {
+            h.insert(
+                axum::http::header::AUTHORIZATION,
+                format!("Bearer {b}").parse().unwrap(),
+            );
+        }
+        h
+    }
+
+    #[test]
+    fn has_explicit_bearer_true_when_authorization_present() {
+        assert!(has_explicit_bearer(&headers_with(None, None, Some("tok"))));
+    }
+
+    #[test]
+    fn has_explicit_bearer_false_when_absent() {
+        assert!(!has_explicit_bearer(&headers_with(None, None, None)));
+    }
+
+    #[test]
+    fn has_explicit_bearer_false_when_only_cookie() {
+        let h = headers_with(Some("rtdb_session=abc"), None, None);
+        assert!(!has_explicit_bearer(&h));
+    }
+
+    #[test]
+    fn csrf_matches_when_cookie_equals_header() {
+        let h = headers_with(Some("rtdb-admin-csrf=deadbeef"), Some("deadbeef"), None);
+        assert!(admin_csrf_matches(&h));
+    }
+
+    #[test]
+    fn csrf_rejects_when_header_missing() {
+        let h = headers_with(Some("rtdb-admin-csrf=deadbeef"), None, None);
+        assert!(!admin_csrf_matches(&h));
+    }
+
+    #[test]
+    fn csrf_rejects_when_cookie_missing() {
+        let h = headers_with(None, Some("deadbeef"), None);
+        assert!(!admin_csrf_matches(&h));
+    }
+
+    #[test]
+    fn csrf_rejects_when_values_differ() {
+        let h = headers_with(Some("rtdb-admin-csrf=deadbeef"), Some("feedface"), None);
+        assert!(!admin_csrf_matches(&h));
+    }
+
+    #[test]
+    fn csrf_rejects_when_length_differs() {
+        // Different lengths short-circuit before ct_eq (lengths must match for
+        // a constant-time compare). Confirms the guard is sound under unequal
+        // inputs, not leaking timing.
+        let h = headers_with(Some("rtdb-admin-csrf=deadbeef"), Some("deadbee"), None);
+        assert!(!admin_csrf_matches(&h));
+    }
+
+    #[test]
+    fn session_cookie_detector_distinguishes_present_from_absent() {
+        assert!(has_session_cookie(&headers_with(
+            Some("rtdb_session=abc"),
+            None,
+            None
+        )));
+        assert!(!has_session_cookie(&headers_with(None, None, None)));
+    }
 }

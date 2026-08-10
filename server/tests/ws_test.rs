@@ -1119,3 +1119,98 @@ async fn revoked_admin_session_is_rejected_on_next_ws_op() -> anyhow::Result<()>
 
     Ok(())
 }
+
+// SEC-105: the /sync WS upgrade must reject an Origin that is neither on the
+// hot-reloaded allowlist nor equal to public_url, since the cookie
+// authenticates a browser-opened handshake and CORS does not apply to WS.
+// `connect_async` surfaces a non-101 response (403 here) as a connect error.
+#[tokio::test]
+async fn sync_upgrade_rejects_disallowed_origin() -> anyhow::Result<()> {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    let state = test_state().await;
+    let addr = spawn_app(state).await;
+
+    let mut req = format!("ws://{addr}/sync").into_client_request()?;
+    req.headers_mut().insert(
+        "origin",
+        reqwest::header::HeaderValue::from_static("https://evil.example"),
+    );
+    let result = connect_async(req).await;
+    assert!(
+        result.is_err(),
+        "a disallowed Origin must be rejected before the WS upgrade"
+    );
+    Ok(())
+}
+
+// SEC-105: an allowed Origin upgrades normally. The test hot allowlist seeds
+// `http://localhost:5173`. The upgrade succeeds even though no Auth frame has
+// been sent — `/sync` authenticates post-upgrade, so the handshake itself only
+// gates on Origin.
+#[tokio::test]
+async fn sync_upgrade_allows_allowlisted_origin() -> anyhow::Result<()> {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    let state = test_state().await;
+    let addr = spawn_app(state).await;
+
+    let mut req = format!("ws://{addr}/sync").into_client_request()?;
+    req.headers_mut().insert(
+        "origin",
+        reqwest::header::HeaderValue::from_static("http://localhost:5173"),
+    );
+    let (_ws, resp) = connect_async(req).await?;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::SWITCHING_PROTOCOLS,
+        "an allowlisted Origin must upgrade to 101"
+    );
+    Ok(())
+}
+
+// SEC-105: no Origin header = non-browser client (CLI/SDK/machine token); the
+// existing auth gates (post-upgrade Auth frame) validate the credential
+// regardless, so the upgrade itself admits the connection.
+#[tokio::test]
+async fn sync_upgrade_admits_absent_origin() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state).await;
+
+    // connect_async does not set Origin by default.
+    let (_ws, resp) = connect_async(format!("ws://{addr}/sync")).await?;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::SWITCHING_PROTOCOLS,
+        "an absent Origin (non-browser client) must upgrade to 101"
+    );
+    Ok(())
+}
+
+// SEC-105: the /admin/stream WS upgrade applies the same Origin check. A
+// disallowed Origin is rejected before WS negotiation begins, regardless of
+// whether the bearer is offered via the subprotocol.
+#[tokio::test]
+async fn admin_stream_rejects_disallowed_origin() -> anyhow::Result<()> {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    let state = test_state().await;
+    let addr = spawn_app(state).await;
+
+    let mut req = format!("ws://{addr}/admin/stream").into_client_request()?;
+    req.headers_mut().insert(
+        "origin",
+        reqwest::header::HeaderValue::from_static("https://evil.example"),
+    );
+    req.headers_mut().insert(
+        "sec-websocket-protocol",
+        reqwest::header::HeaderValue::from_static("rtdb-admin.test-admin-key"),
+    );
+    let result = connect_async(req).await;
+    assert!(
+        result.is_err(),
+        "a disallowed Origin must be rejected before the /admin/stream upgrade, \
+         even with a valid subprotocol bearer"
+    );
+    Ok(())
+}

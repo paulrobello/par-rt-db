@@ -14,7 +14,7 @@ use axum::body::Bytes;
 use axum::extract::State;
 use axum::extract::ws::{CloseFrame, Message, Utf8Bytes, WebSocket, WebSocketUpgrade};
 use axum::http::HeaderMap;
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio::time::{Instant, interval};
@@ -67,6 +67,14 @@ async fn ws_upgrade(
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
+    // SEC-105: CORS does not apply to a WS handshake, so a cookie-authenticated
+    // upgrade from a disallowed (e.g. cross-origin-XSS) sibling host would
+    // otherwise be admitted. Browsers always send `Origin`; a present value
+    // must match the live allowlist or `public_url`. Absent `Origin` is a
+    // non-browser client and the post-upgrade Auth frame still authenticates.
+    if !crate::origin_allowed(&headers, &state.runtime.hot, &state.config.public_url) {
+        return RtDbError::forbidden("websocket origin not allowed").into_response();
+    }
     // Enforced at the protocol layer (not just the app-level length checks
     // below) so an unauthenticated `/sync` connection can't run axum's
     // default 64 MiB max message size as a memory-DoS vector.

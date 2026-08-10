@@ -23,10 +23,11 @@ pub(super) struct AdminLoginRequest {
 
 /// `POST /admin/login` — validates the admin key (constant-time, the same
 /// compare `authenticate_admin` runs) and, on success, issues the SEC-001
-/// HttpOnly session cookie. On a bad key we 401 without touching the cookie.
-/// The credential written is `state.config.admin_key` (the trusted configured
-/// value), never the raw request body, so a `;`-laden guess cannot inject cookie
-/// attributes — `set_session_cookie` validates regardless.
+/// HttpOnly session cookie plus the readable SEC-106 admin CSRF nonce. On a bad
+/// key we 401 without touching the cookies. The credential written is
+/// `state.config.admin_key` (the trusted configured value), never the raw
+/// request body, so a `;`-laden guess cannot inject cookie attributes —
+/// `set_session_cookie` validates regardless.
 pub(super) async fn admin_login(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -39,20 +40,27 @@ pub(super) async fn admin_login(
     if !bool::from(valid) {
         return Err(RtDbError::unauthorized("invalid admin key"));
     }
-    let cookie = auth::cookie::set_session_cookie(
-        &state.config.admin_key,
-        auth::cookie::request_is_secure(&headers),
-    )?;
+    let secure = auth::cookie::request_is_secure(&headers);
+    let cookie = auth::cookie::set_session_cookie(&state.config.admin_key, secure)?;
+    // SEC-106: mint the readable CSRF nonce alongside the session cookie. The
+    // dashboard reads it via `document.cookie` and echoes it in the
+    // `X-Rtdb-Csrf` header on mutating admin requests; a cross-site forge
+    // cannot read the cookie and so cannot set the header. `append` (not
+    // `insert`) so both Set-Cookie values reach the browser.
+    let csrf_cookie = auth::cookie::set_admin_csrf_cookie(&db::random_token(), secure)?;
     let mut resp = StatusCode::NO_CONTENT.into_response();
-    resp.headers_mut().insert(SET_COOKIE, cookie);
+    resp.headers_mut().append(SET_COOKIE, cookie);
+    resp.headers_mut().append(SET_COOKIE, csrf_cookie);
     Ok(resp)
 }
 
-/// `POST /admin/logout` — clears the SEC-001 session cookie.
+/// `POST /admin/logout` — clears the SEC-001 session cookie and SEC-106 CSRF nonce.
 pub(super) async fn admin_logout() -> Response {
     let mut resp = StatusCode::NO_CONTENT.into_response();
     resp.headers_mut()
-        .insert(SET_COOKIE, auth::cookie::clear_session_cookie());
+        .append(SET_COOKIE, auth::cookie::clear_session_cookie());
+    resp.headers_mut()
+        .append(SET_COOKIE, auth::cookie::clear_admin_csrf_cookie());
     resp
 }
 
