@@ -1317,49 +1317,109 @@ async fn execute_aggregate_terminal(
     // scalar SUM/AVG/MIN/MAX over zero matching rows yields one row with
     // SQL NULL → `serde_json::Value::Null`; COUNT(*) over zero rows yields 0.
     if let Some(group_col) = group_col {
-        let mut sql = format!(
-            "SELECT to_jsonb(\"{group_col}\") AS k, to_jsonb({agg_expr}) AS v FROM \"{pg_schema_name}\".\"{table_ident}\""
-        );
-        if !where_conditions.is_empty() {
-            sql.push_str(" WHERE ");
-            sql.push_str(&where_conditions.join(" AND "));
-        }
-        sql.push_str(&format!(
-            " GROUP BY \"{group_col}\" ORDER BY k LIMIT ${limit_placeholder}"
-        ));
-        let mut query = sqlx::query_as::<_, (serde_json::Value, serde_json::Value)>(&sql);
-        for bind in binds {
-            query = match bind {
-                EqBind::Text(v) => query.bind(v),
-                EqBind::Num(v) => query.bind(v),
-                EqBind::Bool(v) => query.bind(v),
-                EqBind::I64(v) => query.bind(v),
-            };
-        }
-        for bind in range_binds {
-            query = match bind {
-                EqBind::Text(v) => query.bind(v),
-                EqBind::Num(v) => query.bind(v),
-                EqBind::Bool(v) => query.bind(v),
-                EqBind::I64(v) => query.bind(v),
-            };
-        }
-        for bind in &filter_binds {
-            query = match bind {
-                EqBind::Text(v) => query.bind(v),
-                EqBind::Num(v) => query.bind(v),
-                EqBind::Bool(v) => query.bind(v),
-                EqBind::I64(v) => query.bind(v),
-            };
-        }
-        query = query.bind(i64::from(MAX_TAKE));
-        let rows = query.fetch_all(pool).await?;
-        let groups: Vec<AggregateGroup> = rows
-            .into_iter()
-            .map(|(k, v)| AggregateGroup { key: k, value: v })
-            .collect();
-        return Ok(QueryResult::AggregateGroups(groups));
+        return aggregate_grouped(
+            group_col,
+            agg_expr,
+            binds,
+            range_binds,
+            where_conditions,
+            filter_binds,
+            limit_placeholder,
+            &pg_schema_name,
+            &table_ident,
+            pool,
+        )
+        .await;
     }
+    aggregate_scalar(
+        agg_expr,
+        binds,
+        range_binds,
+        where_conditions,
+        filter_binds,
+        &pg_schema_name,
+        &table_ident,
+        pool,
+    )
+    .await
+}
+
+/// Grouped aggregate path: `SELECT to_jsonb(group_col), to_jsonb(OP(agg_col)) …
+/// GROUP BY … ORDER BY k LIMIT $`. Verbatim lift of the former grouped branch
+/// of `execute_aggregate_terminal`; the shared resolution (group column,
+/// aggregate field, type validation, `agg_expr`) lives in the caller.
+#[allow(clippy::too_many_arguments)]
+async fn aggregate_grouped(
+    group_col: String,
+    agg_expr: String,
+    binds: Vec<EqBind>,
+    range_binds: Vec<EqBind>,
+    where_conditions: Vec<String>,
+    filter_binds: Vec<EqBind>,
+    limit_placeholder: usize,
+    pg_schema_name: &str,
+    table_ident: &str,
+    pool: &PgPool,
+) -> Result<QueryResult, RtDbError> {
+    let mut sql = format!(
+        "SELECT to_jsonb(\"{group_col}\") AS k, to_jsonb({agg_expr}) AS v FROM \"{pg_schema_name}\".\"{table_ident}\""
+    );
+    if !where_conditions.is_empty() {
+        sql.push_str(" WHERE ");
+        sql.push_str(&where_conditions.join(" AND "));
+    }
+    sql.push_str(&format!(
+        " GROUP BY \"{group_col}\" ORDER BY k LIMIT ${limit_placeholder}"
+    ));
+    let mut query = sqlx::query_as::<_, (serde_json::Value, serde_json::Value)>(&sql);
+    for bind in binds {
+        query = match bind {
+            EqBind::Text(v) => query.bind(v),
+            EqBind::Num(v) => query.bind(v),
+            EqBind::Bool(v) => query.bind(v),
+            EqBind::I64(v) => query.bind(v),
+        };
+    }
+    for bind in range_binds {
+        query = match bind {
+            EqBind::Text(v) => query.bind(v),
+            EqBind::Num(v) => query.bind(v),
+            EqBind::Bool(v) => query.bind(v),
+            EqBind::I64(v) => query.bind(v),
+        };
+    }
+    for bind in &filter_binds {
+        query = match bind {
+            EqBind::Text(v) => query.bind(v),
+            EqBind::Num(v) => query.bind(v),
+            EqBind::Bool(v) => query.bind(v),
+            EqBind::I64(v) => query.bind(v),
+        };
+    }
+    query = query.bind(i64::from(MAX_TAKE));
+    let rows = query.fetch_all(pool).await?;
+    let groups: Vec<AggregateGroup> = rows
+        .into_iter()
+        .map(|(k, v)| AggregateGroup { key: k, value: v })
+        .collect();
+    Ok(QueryResult::AggregateGroups(groups))
+}
+
+/// Scalar (ungrouped) aggregate path:
+/// `SELECT COALESCE(to_jsonb(OP(agg_col)), 'null'::jsonb) …`.
+/// Verbatim lift of the former scalar branch of `execute_aggregate_terminal`;
+/// the shared resolution lives in the caller.
+#[allow(clippy::too_many_arguments)]
+async fn aggregate_scalar(
+    agg_expr: String,
+    binds: Vec<EqBind>,
+    range_binds: Vec<EqBind>,
+    where_conditions: Vec<String>,
+    filter_binds: Vec<EqBind>,
+    pg_schema_name: &str,
+    table_ident: &str,
+    pool: &PgPool,
+) -> Result<QueryResult, RtDbError> {
     let mut sql = format!(
         "SELECT COALESCE(to_jsonb({agg_expr}), 'null'::jsonb) AS v FROM \"{pg_schema_name}\".\"{table_ident}\""
     );
