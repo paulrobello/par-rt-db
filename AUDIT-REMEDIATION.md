@@ -1,146 +1,121 @@
 # Audit Remediation Report
 
-> **Project**: par-rt-db — self-hosted, Convex-inspired realtime document database (Rust/axum+tokio + Postgres 17)
-> **Audit Date**: 2026-08-07 (AUDIT.md against HEAD `a15e7ca`)
-> **Remediation Date**: 2026-08-07
-> **Severity Filter Applied**: `all`
-> **Plan Source**: AUDIT.md `## Remediation Plan` (no `AUDIT-REMEDIATION-PLAN.md` playbook present)
-> **Implementation Model**: Opus 5 fix agents (security, documentation, architecture, code-quality); orchestrator (this session) ran the authoritative gate and fixed regressions
-> **Branch**: `fix/audit-remediation` (worktree `.claude/worktrees/fix-audit-remediation`), 37 commits ahead of `a15e7ca`
-> **Final gate**: `make checkall` **GREEN** across all six packages (fmt-check, clippy `-D warnings`, typecheck, tests)
+> **Project**: par-rt-db — self-hosted realtime document database (Rust/axum + Postgres 17 · ts-client · rust-client · python-client · dashboard · cli)
+> **Audit Date**: 2026-08-09 (HEAD `613c7a6`)
+> **Remediation Date**: 2026-08-10
+> **Severity Filter Applied**: `all` (full remediation requested)
+> **Plan Source**: `AUDIT.md` `## Remediation Plan` + `AUDIT-REMEDIATION-PLAN.md` playbook
+> **Implementation Model**: Opus 5 (all fix agents); orchestrator (Fable) verified each batch with the authoritative `make checkall` gate
+> **Branch**: `fix/audit-remediation` (worktree `.claude/worktrees/fix-audit-remediation`), 8 commits, not yet merged
+
+---
+
+## ⚠️ Run status: PARTIAL — terminated by a 5-hour API usage limit
+
+The full 133-issue remediation was scoped and in progress. **21 issues were resolved and gate-verified** (all 4 Criticals, all Phase 1/2 Highs, and 4 Phase 3 Highs) before a 429 usage limit (`Usage limit reached for 5 hour`, reset 2026-08-10 16:04) terminated the SEC-105/106 subagent mid-task. The worktree was left **clean and green** (the agent died in its reading phase — no half-finished edits); all 8 commits are durable and each was verified with the real `make checkall` gate before the next batch began. **~112 issues remain carried forward** on this commit history.
 
 ---
 
 ## Execution Summary
 
-| Phase | Status | Agent | Targeted | Resolved | Partial | Manual/Deferred |
-|-------|--------|-------|----------|---------:|--------:|----------------:|
-| 1 — Critical Security | ⏭️ Skipped (none found) | — | 0 | 0 | 0 | 0 |
-| 2 — Critical Architecture | ⏭️ Skipped (none found) | — | 0 | 0 | 0 | 0 |
-| 3a — Security | ✅ | fix-security | 8 | 5 | 1 | 2 (monitor) |
-| 3b — Architecture | ✅ | fix-architecture | 16 | 7 | 0 | 7 + 2 no-action |
-| 3c — Code Quality | ✅ | fix-code-quality | 10 | 9 | 1 | 0 |
-| 3d — Documentation | ✅ | fix-documentation | 21 | 20 | 0 | 1 (skipped, no tag) |
-| 4 — Verification | ✅ | orchestrator | — | — | — | — |
+| Phase | Status | Agent | Targeted | Resolved | Partial | Carried-forward |
+|-------|--------|-------|----------|----------|---------|-----------------|
+| 1 — Critical Security | ✅ | fix-security ×3 | 11 | 11 | 0 | 0 |
+| 2 — Critical Architecture | ✅ | fix-arch ×3 + fix-doc ×1 | 8 | 7 | 1 (ARC-102) | 0 |
+| 3a — Security (remaining) | ⏸️ Partial | fix-security ×2 | 4 reached | 2 (SEC-117,103) | 0 | SEC-105/106 died; SEC-104, 108–115, 120–139, 002R/003R |
+| 3b — Architecture | ⏭️ Not started | — | — | 0 | 0 | ARC-106,108–110,112–115,117,119–121,123,125–134 |
+| 3c — Code Quality | ⏭️ Not started | — | — | 0 | 0 | QA-101,102,103,002R,104–111 |
+| 3d — Documentation | ⏭️ Not started | — | — | 0 | 0 | DOC2-002–008,010–012,014,020–054 |
+| 4 — Verification | ✅ per-batch | orchestrator | — | — | — | worktree clean; last gate green |
 
-**Overall (55 issues): 41 resolved · 2 partial · 9 deferred/manual · 2 monitor-only · 2 no-action (by design) · 1 correctly skipped.**
-
-Two orchestrator decisions shaped Wave 2 on this correctness-critical codebase: ARC-004 (quota *enforcement behavior* change) and ARC-005 (authz *caching*) were **deferred by design** — both are semantic changes whose risk exceeds what the test suite covers and warrant deliberate review. The big correctness-core refactors (ARC-003 admin split, ARC-006/011/012, QA-002's three remaining arms) were **deferred by the agents under a behavior-preserving rule** rather than shipped half-verified.
+**Overall**: 21 resolved (8 commits, +3389/−642, 55 files), 1 partial, ~112 carried forward.
 
 ---
 
 ## Resolved Issues ✅
 
-### Security (5)
-- **[SEC-001]** Webhook SSRF — `server/src/webhook.rs`, `admin.rs`, `config.rs`. `validate_webhook_url` enforces https-only (dev opt-in `RTDB_WEBHOOK_ALLOW_HTTP` for http), blocks embedded credentials, rejects the cloud-metadata hostnames, IP-literal + DNS-resolution denylist (loopback/RFC1918/link-local/`169.254.169.254`/multicast); `build_delivery_client` uses `redirect(Policy::none())`. New `RTDB_WEBHOOK_ALLOW_HTTP` + `RTDB_STORAGE_RATE_LIMIT_PER_IP_RPM` wired through `.env.example` + compose.
-- **[SEC-004]** Per-IP rate limit on unauthenticated `GET /storage/{id}` (incl. transform path) — `http_api.rs`, `rate_limit.rs`, `main.rs` (now serves with `into_make_service_with_connect_info`).
-- **[SEC-006]** Regression test pinning the DDL single-quote-doubling defense against `'; DROP TABLE x; --`.
-- **[SEC-007]** Webhook error-text disclosure — subsumed by SEC-001's `redirect(Policy::none())`.
-- **[SEC-008]** `debug_assert!(is_valid_identifier(field))` at migrate field-interpolation sites.
+### Security (13)
+- **[SEC-111]** Router-wide security headers — `server/src/lib.rs` — `security_headers` middleware (CSP `frame-ancestors 'none'`, `nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy`, HSTS on https only); skips the existing OAuth-callback CSP.
+- **[SEC-101]** Stored-XSS on public storage — `http_api.rs` — content-type allowlist (`INLINE_SAFE_CONTENT_TYPES`); non-allowlisted → `octet-stream` + `Content-Disposition: attachment` + `nosniff` at read time; SVG excluded. 3 tests.
+- **[SEC-112]** Spoofable rate-limit key — `http_api.rs`, `rate_limit.rs` — `CF-Connecting-IP` then rightmost XFF hop; `RateLimiter` hard-bounded (`MAX_BUCKETS=100_000`); compose default 0→600. 8 tests.
+- **[SEC-113]** Signed-URL bypass — `http_api.rs`, `config.rs` — `RTDB_STORAGE_REQUIRE_SIGNED_URLS` (default off); mint db-scoped. 5 tests.
+- **[SEC-118]** Blob per-row auth — `storage.rs`, `db.rs`, `http_api.rs` — nullable `owner_id`; enforced on authed serve/delete/metadata; public route unchanged; additive. 3 tests.
+- **[SEC-119]** `/api/query-batch` cap — `http_api.rs` — `MAX_BATCH_QUERIES=64`, pre-execution. 1 test.
+- **[SEC-123]** Range streaming — `storage.rs`, `http_api.rs` — `substring()` + `octet_length`; no whole-bytea load. 1 test.
+- **[SEC-102]** Microsoft nOAuth — `auth/microsoft.rs`, `db.rs` — identity keyed on `sub`+`tid` (`microsoft_sub` col + index); JWKS-verified (cached, fail-closed); `email` trusted only with `xms_edov`; upsert off `email`. *(Partial: no wiremock e2e — repo is GitHub-only; logic unit-tested.)*
+- **[SEC-122]** OIDC `email_verified` — `auth/oidc.rs` — absent ⇒ unverified (was trusted). Behavior change documented.
+- **[SEC-107]** `evalExpr` SQL — `admin/schema_ops.rs`, `migrate.rs` — gated to root `admin_key`; `has_sql_violation` deleted. *(Residual: least-priv Postgres role deferred; root-admin gate closes the exposure.)*
+- **[SEC-124]** `debug_assert` backstops — `migrate.rs`, `schema.rs` — 5→real checks + 3 new sibling-site checks (release-safe). 2 tests.
+- **[SEC-117]** `Not` divergence — `query.rs` — `NOT COALESCE((inner), FALSE)`; SQL scan and Rust evaluator now agree. 7 tests.
+- **[SEC-103]** Anonymous per-db — `auth/mod.rs`, `provider.rs`, `db.rs`, `config.rs` — `anonymous_enabled` column (default false) consulted in `authorize` against `db`; IP rate-limit; 1-day TTL; admin toggle. *(Residual: master-kill is mint-time only.)* 3 tests.
 
-### Documentation (20)
-- **[DOC-001]** (Critical) README OAuth flow corrected to the live six-provider routes + `OAUTH_SETUP.md` narrative; `postMessage` dropped.
-- **[DOC-002]** (Critical) Stale "unmitigated login-CSRF residual" bullet removed; `rtdb-oauth-csrf` double-submit defense documented.
-- **[DOC-003]/[DOC-009]** README config table trimmed + pointer to `.env.example`; ~10 missing admin routes added.
-- **[DOC-004]** Package count swept to six (incl `cli`) across README + CONTRIBUTING + **CLAUDE.md** (the doc agent's allowed-files list omitted CLAUDE.md; orchestrator fixed it).
-- **[DOC-005]/[DOC-006]** FEATURE_MATRIX §1 six providers (matches row #14); ENH-011 quotas row #26; §7 date bumped.
-- **[DOC-007]** dashboard/README surfaces table → all 18 `App.tsx` routes.
-- **[DOC-008]** CHANGELOG `[Unreleased]` backfilled; stale Python/Rust "pending" claims reconciled.
-- **[DOC-010]** server/README refreshed (4 SDKs + dashboard + cli, six providers, three per-row-auth options, regenerated module layout).
-- **[DOC-011]–[DOC-018], [DOC-020], [DOC-021]** Surgical fixes (duplicated paragraph, python/rust/ts READMEs, PRODUCT.md SPA claim, CONTRIBUTING tap-site count, DESIGN.md preamble, ts-client JSDoc).
+### Architecture (4 resolved + 1 partial)
+- **[ARC-101]** Subs-skip verifier default 0→1000 (`config.rs`, `.env.example`, `docker-compose.yml`, `CLAUDE.md`); ships ON.
+- **[ARC-103]** Quota-spawn gated on `max_storage_bytes_per_db != 0` (`committer.rs`), mirroring the warmer.
+- **[ARC-104]** `MAX_STEPS` 256→1024 in all 3 clients + `wire-corpus` pin + server-side assertion loop-closer.
+- **[ARC-107]** Dashboard 5th wire-contract copy deleted; 19 types re-exported; `OpKind` derived (drift-proof); `upsert` styling fixed. *(Residual: 6 types need a 1-line `ts-client/index.ts` export.)*
+- **[ARC-102]** **PARTIAL**: scheduler/reaper/mutation-log idle writes gated (the audit's core win); idle-database reclamation deferred (needs `Shutdown` + subscriber guard).
 
-### Architecture (7)
-- **[ARC-001]** `publish_taps(ctx, schema, write_set, owner, source, docop_taps, refresh_quota_cache)` helper extracted; the four durable-write arms (`handle_mutate`/`handle_scheduled`/`handle_migrate`/`handle_reaper`) now call it. Behavior identical — tap-site contract preserved (audit/webhook/admin/subs tests green).
-- **[ARC-002]** `run_committer` takes `CommitterCtx` by value via a `make_ctx` builder; `#[allow(too_many_arguments)]` removed.
-- **[ARC-008]** `cli` crate bumped to edition 2024 (test-only `set_var` wrapped in `unsafe`).
-- **[ARC-009]** `deny_unknown_fields` on `ServerMessage` (server only serializes it; no wire impact).
-- **[ARC-010]** `scripts/env-drift-check.sh` extended: diffs every `Config::from_env` key against the compose forwarded set.
-- **[ARC-013]** `handle_restore_schema` routed through `publish_taps` with `docop_taps=false` (the DDL-not-DocOps exception is now visible at the call site).
-- **[ARC-014]** Local pre-commit hooks for biome (ts-client/dashboard) + ruff (python-client).
-
-### Code Quality (9)
-- **[QA-001]** Golden-vector parity test: shared `wire-corpus/golden-vector.json` (9 query cases) consumed by **all four** in-memory engines + the server (Postgres-backed). 20 new tests; found+fixed a real `TestDb` RAII race in the server test.
-- **[QA-003]** python-client pyright tightened incrementally (still 0 errors).
-- **[QA-004]** `noExplicitAny` policy documented in `biome.policy.md`. *(Orchestrator follow-up: the agent's `//` comments in `dashboard/biome.json` were rejected by Biome v2.5.4, silently disabling the config — stripped them; the valid config is restored.)*
-- **[QA-005]** Bare `except Exception:` in the Python WS client now `logger.exception(...)` + documented.
-- **[QA-006]** Fragile production `unreachable!()` in the comparison compiler eliminated (new variant is now a compile error).
-- **[QA-007]** `quota::UsageCache` recovers from `PoisonError` explicitly (production paths; the remaining `.unwrap()` is test-only).
-- **[QA-008]** rust-client 700-line embedded `pub mod admin` extracted to `wire/admin.rs`.
-- **[QA-009]** `server/Cargo.toml` `[lints]` section added.
-- **[QA-010]** Stale `# TODO(tasks 9-10)` markers dropped.
-
----
-
-## Partial 🔶
-
-- **[SEC-002]** Apple `id_token` — `iss`/`aud`/`exp` claims now validated; **JWKS ES256 signature verification deferred** (non-trivial new fetcher/cache/rotation surface). Documented as a residual transport-trust trade-off in the code.
-- **[QA-002]** `schema.rs::validate_structure` (cc 55) extracted into 5 named helpers. **Three correctness-core arms deferred** (`execute_query` cc-216, `apply_one`, `execute_txn`) — see Manual Intervention.
-
----
-
-## Requires Manual Intervention 🔧
-
-### Deferred correctness-core refactors (behavior-preserving, needs a focused session)
-- **[ARC-003]** ✅ **Shipped** (commit `8d5f5c1`) — the `admin.rs` god-module (2140 LOC) is now `admin/mod.rs` (shared core: `AdminPrincipal`, bearer/auth helpers, `OkResponse`, assembled router) + 11 per-domain submodules (`login`, `dbs`, `schema_ops`, `tokens`, `docs`, `schedules`, `storage_ops`, `webhooks`, `backups`, `settings`, `observability`). Behavior-identical — `admin_routes()` is byte-unchanged (handlers re-exported into the module root via `use <domain>::*`); `make checkall` green.
-- **[QA-002] (remaining 3 arms)** Extract terminal arms from `execute_query`/`apply_one`/`execute_txn`. **Approach:** one arm per follow-up PR, full `make checkall` between extractions. **Effort:** medium each.
-- **[ARC-006]** Coalesce per-mutate quota-refresh spawns (debounce vs fold-into-reaper) — touches observable spawn timing. **Effort:** medium.
-- **[ARC-011]** Dedupe the three `bearer_token` helpers into `auth::extract_bearer` — the cookie/subprotocol policy differences are exactly what drift on a quick refactor; wants cross-cutting tests. **Effort:** small-medium.
-- **[ARC-012]** `drop_db` orphan per-db tasks → add `CommitterRequest::Shutdown` + `JoinHandle` registry (changes the committer lifecycle). Current self-termination works (single-writer intact), just log spam. **Effort:** medium.
-- **[ARC-015]** Gate cli's `tokio` behind a feature (low value). **Effort:** small.
-
-### Deferred by orchestrator decision (semantic risk)
-- **[ARC-004]** Move quota `enforce()` off the committer critical path. This is a **behavioral change to enforcement** (risk of over-cap writes committing), not a pure refactor. **Approach:** best-effort background refresh + cheap in-memory check + growth-signal re-measure, plus dedicated quota stress tests. Current critical-path enforce + fire-and-forget refresh left intact. **Effort:** medium.
-- **[ARC-005]** Short-TTL cache for per-WS-frame `is_admin`/`authorize`. **Caching authz** means a revoked token stays valid up to the TTL — a deliberate security trade-off that should be a reviewed decision, not autonomous. **Effort:** medium.
-
-### Monitor-only (no local fix available)
-- **[SEC-003]** `rsa 0.9.10` Marvin Attack — transitive (jsonwebtoken/ring), RUSTSEC-2023-0071, no upstream fix. Pin/deny via `[patch]` when one ships.
-- **[SEC-005]** `event-listener 5.4.1` unsound — transitive, RUSTSEC-2026-0221, not directly exercised. Update when fixed upstream.
-
-### No action (by design)
-- **[ARC-007]** Per-db single-writer scalability — intentional (correctness over horizontal scale; scales by adding databases).
-- **[ARC-016]** `WebhooksPage.tsx` size — watch-item only.
-
-### Skipped (correct)
-- **[DOC-019]** Bundle a tagged release with the CHANGELOG backfill — no version tag exists yet; `[Unreleased]` is the correct home until `0.1.0` is cut.
+### Documentation / Configuration (3)
+- **[DOC2-001]** Backup vars now reach the container (10 keys forwarded; `main.rs` INFO log when disabled). **Critical silent-data-loss fix.**
+- **[DOC2-019]** Six more env keys + drift-check grep widened to `server/src/`.
+- **[DOC2-013]** CONTRIBUTING checklist names the compose `environment:` block + `env-drift-check`.
 
 ---
 
 ## Verification Results
 
-| Gate | Result |
-|------|--------|
-| `make fmt-check` (cargo fmt + biome + ruff) | ✅ Pass |
-| `make lint` (clippy `-D warnings` + biome + ruff) | ✅ Pass |
-| `make typecheck` (tsc + cargo check + pyright) | ✅ Pass (pyright 0 errors) |
-| server tests | ✅ Pass — every binary `ok`, 0 failed (incl. new `golden_vector_test`) |
-| rust-client tests | ✅ 376 passed, 0 failed (wire split intact) |
-| cli tests | ✅ 9 passed (edition 2024) |
-| ts-client tests | ✅ 630 passed (+9 golden-vector) |
-| dashboard tests | ✅ 106 passed |
-| python tests | ✅ 574 passed (+9 golden-vector) |
+Each batch was verified by the orchestrator with the authoritative gate (`make checkall` stages **minus** `dev-db-up` — skipped intentionally: the worktree's compose project name would start a second Postgres on the already-bound port 55434; the dev DB was confirmed live and shared). Every batch returned `GATE_EXIT=0`: env-drift ✅ · fmt ✅ · lint (clippy `-D warnings`/biome/ruff) ✅ · typecheck ✅ · all six test suites ✅.
 
-**Two regressions caught and fixed by the orchestrator during verification** (neither shipped):
-1. SEC-004 made `serve_public_handler` require the `ConnectInfo` extractor; the test harness `spawn_app` wasn't updated → 4 image-transform tests failed. Fixed (mirrors `main.rs`).
-2. The QA agent's new golden-vector tests needed formatting + a ts type fix; QA-004's `//` comments in `dashboard/biome.json` were rejected by Biome v2.5.4 (silently disabling the config → a mass spaces→tabs reformat + spurious warnings). Fixed (stripped comments; policy lives in `biome.policy.md`).
+- Two transient flakes appeared and cleared on retry (confirmed flakes, not regressions): `webhook_delivery_end_to_end` and one oauth-class contention.
+- **One real regression was caught by the gate and fixed inline**: the Phase 2A scheduler's 60s idle sleep broke `one_shot_catches_up_after_being_past_due` (no notify-on-insert) — reverted to 2s, keeping the write-gating. This is why the orchestrator runs the gate itself rather than trusting agent self-reports (the 2A agent had reported "12/12 passed").
+- Final committed state (`9fb0950`): **worktree clean, last full gate green**.
 
 ---
 
-## Files Changed (high level)
+## Commits (branch `fix/audit-remediation`, 8; +3389/−642, 55 files)
 
-- **Server:** `committer.rs`, `protocol.rs`, `config.rs`, `webhook.rs`, `admin.rs`, `http_api.rs`, `main.rs`, `rate_limit.rs`, `query.rs`, `migrate.rs`, `quota.rs`, `schema.rs`, `Cargo.toml`, `tests/common/mod.rs`, `tests/golden_vector_test.rs`
-- **rust-client:** `wire.rs` → `wire/admin.rs`, `tests/golden_vector.rs`
-- **ts-client:** `tests/golden-vector.test.ts`, `src/{index,errors}.ts` (JSDoc), `biome.policy.md`
-- **dashboard:** `README.md`, `biome.json`, `biome.policy.md`
-- **python-client:** `pyproject.toml`, `ws_client.py`, `wire.py`, `README.md`, `tests/test_golden_vector.py`
-- **Docs/config:** `README.md`, `FEATURE_MATRIX.md`, `CHANGELOG.md`, `CONTRIBUTING.md`, `CLAUDE.md`, `server/README.md`, `python-client/README.md`, `ts-client/README.md`, `rust-client/README.md`, `PRODUCT.md`, `DESIGN.md`, `.env.example`, `docker-compose.yml`, `.pre-commit-config.yaml`, `scripts/env-drift-check.sh`, `cli/{Cargo.toml,src/main.rs}`
-- **New:** `wire-corpus/golden-vector.json` (shared fixture)
+```
+9fb0950 fix(security): SEC-117 Not-semantics divergence + SEC-103 per-db anonymous access
+e289b2b fix(doc/config): Phase 2D — forward RTDB_* env keys; backups no longer silent (DOC2-001,019,013)
+8f87490 fix(arc): Phase 2C — delete dashboard's 5th wire-contract copy; fix upsert drift (ARC-107)
+7197a4d fix(arc): Phase 2B — raise client MAX_STEPS 256->1024, pin in wire-corpus (ARC-104)
+c51697d fix(arc): gate idle pollers, enable subs verifier, gate quota spawn (ARC-101,102,103)
+2b95233 fix(security): Phase 1C — evalExpr root-admin gate + real identifier checks (SEC-107,124)
+969f7ab fix(security): Phase 1B — Microsoft nOAuth + OIDC email_verified default (SEC-102,122)
+00d6fe8 fix(security): Phase 1A — storage XSS, security headers, rate-limit key, signed URLs, blob auth, batch cap, range (SEC-111,101,112,113,118,119,123)
+```
 
-Full per-commit history: `git log --oneline a15e7ca..HEAD` (37 commits).
+---
+
+## Carried Forward (~112 issues) — recommended next session
+
+The 5-hour usage limit stopped work partway through Phase 3. Highest-impact remaining, in priority order:
+
+**Security (resume here):**
+- **SEC-105 + SEC-106** — CSRF/Origin on WS upgrades + admin routes. *Agent died mid-task (no edits); restart fresh.* Highest remaining deployed-instance impact.
+- **SEC-104** — aggregate affected-row budget + `statement_timeout` (the 1M-row committer stall).
+- SEC-108 (admin `route_layer` — must precede other `admin/**`), SEC-109/110, SEC-114/115 (webhook DNS pin + signing), SEC-120/121, SEC-125–134, SEC-136–139, SEC-002R/003R.
+
+**Architecture:** ARC-106 (dashboard consumes SDK), ARC-108+124 (collapse python's 4 admin copies — large), ARC-109/110/112/113/114/115/117/119/120/121/123, ARC-102 step 4, ARC-125–134.
+
+**Code Quality:** QA-103 (extend golden-vector corpus — must precede QA-002R), QA-002R (per-terminal extraction in 3 client engines — **large**), QA-101, QA-102, QA-104–111.
+
+**Documentation:** DOC2-002–008, 011/012, 014, 020–054 (status sweep, README/CHANGELOG backfill, docstrings).
+
+---
+
+## Requires a Human Decision 🔧
+
+1. **[DOC2-010] `ENHANCEMENTS.md`** — retire with a pointer to the kanban board (and update the 14 citing spec/plan `Source:` lines), or bring it current? The `/enhancement-*` family has migrated to the board.
+2. **[DOC2-015] `AUDIT-REMEDIATION.md`** — this report *replaces* the stale 2026-08-07 file (its unreachable commit `8d5f5c1` and shipped-as-deferred items are gone), so "delete vs correct" is mooted by replacement. Confirm keep vs delete at wrap-up.
 
 ---
 
 ## Next Steps
 
-1. **Review the 7 deferred refactors + 2 partials** above and decide which to schedule. ARC-003 (admin split) and QA-002's arms are the highest-value structural follow-ups; ARC-004/005 are the two semantic decisions needing a human call.
-2. **Wrap-up** (pending your confirmation): update CHANGELOG, delete the consumed audit artifacts (`AUDIT.md`, this report), and merge `fix/audit-remediation` → `main`. Pushing to `origin` is a separate, explicitly-confirmed step.
-3. **Re-run `/audit`** after merging to confirm SEC-001/004/006/007/008, the docs, ARC-001/002/008–014, and QA-001/003–010 clear, leaving only the deferred/monitor items.
+1. **Resume remediation** after the usage limit resets (2026-08-10 16:04) — re-run `/fix-audit` or continue manually; `AUDIT-REMEDIATION-PLAN.md` has per-issue detail for everything remaining, and board cards tagged `audit-2026-08-09` track each item.
+2. **Decide** DOC2-010 (above).
+3. **Merge** `fix/audit-remediation` to `main` (8 commits, gate-green) when ready — rebase onto latest `main` first. Push to `origin` is a separate, explicitly-confirmed step.
+4. **Re-run `/audit`** after merge to refresh `AUDIT.md` against the new state.
+5. Auth/security changes here (SEC-101/102/103/107/117/118/119/122/124) are flagged in their commit messages for manual review per the standing security rule — review the diffs before merge.
