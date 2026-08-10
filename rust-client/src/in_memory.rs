@@ -62,6 +62,31 @@ pub const MAX_TAKE: usize = 4096;
 /// (mirrors `server/src/txn.rs::MAX_BY_QUERY_ROWS`). A step whose match set
 /// exceeds `limit` touches exactly `limit` and reports `truncated: true`.
 pub const MAX_BY_QUERY_ROWS: u32 = 1000;
+/// SEC-104: hard cap on the count of `patchByQuery`/`deleteByQuery` steps in
+/// one txn (mirrors `server/src/txn.rs::MAX_BY_QUERY_STEPS_PER_TXN`). Bounds
+/// the worst case at 16 × 1000 = 16,000 rows rather than 1024 × 1000 ≈ 1M.
+pub const MAX_BY_QUERY_STEPS_PER_TXN: usize = 16;
+/// SEC-104: hard ceiling on the worst-case total documents a single txn may
+/// touch (mirrors `server/src/txn.rs::MAX_AFFECTED_ROWS_PER_TXN`). Per-id
+/// steps count 1 each; each by-query step counts up to its `limit`.
+pub const MAX_AFFECTED_ROWS_PER_TXN: usize = 10_000;
+
+/// SEC-104: total documents a txn could touch in the worst case. Per-id steps
+/// count 1 each; each `patchByQuery`/`deleteByQuery` step counts up to its
+/// `limit` (default and cap `MAX_BY_QUERY_ROWS`). Mirrors server
+/// `txn::worst_case_affected`. Used by [`Self::execute_transaction`]'s
+/// [`MAX_AFFECTED_ROWS_PER_TXN`] budget check.
+pub fn worst_case_affected(txn: &Transaction) -> usize {
+    txn.steps
+        .iter()
+        .map(|step| match step {
+            Step::PatchByQuery { limit, .. } | Step::DeleteByQuery { limit, .. } => {
+                (*limit).unwrap_or(MAX_BY_QUERY_ROWS).min(MAX_BY_QUERY_ROWS) as usize
+            }
+            _ => 1,
+        })
+        .sum()
+}
 /// Approximate cron re-fire interval for the in-memory stub. Real 5-field cron
 /// parsing is deferred to the server; the harness only needs crons to re-arm.
 pub const CRON_STEP_MS: i64 = 60_000;
@@ -1830,6 +1855,30 @@ impl InMemoryRtDbClient {
             return Err(RtDbError::new(
                 ErrorCode::BadRequest,
                 format!("transaction exceeds maximum of {MAX_STEPS} steps"),
+            ));
+        }
+        // SEC-104: bound the worst-case row count before any step applies so an
+        // over-budget txn rolls back nothing. Mirrors server `execute_txn`.
+        let by_query_steps = txn
+            .steps
+            .iter()
+            .filter(|s| matches!(s, Step::PatchByQuery { .. } | Step::DeleteByQuery { .. }))
+            .count();
+        if by_query_steps > MAX_BY_QUERY_STEPS_PER_TXN {
+            return Err(RtDbError::new(
+                ErrorCode::BadRequest,
+                format!(
+                    "transaction has {by_query_steps} by-query steps, exceeding the limit of {MAX_BY_QUERY_STEPS_PER_TXN}"
+                ),
+            ));
+        }
+        let worst = worst_case_affected(txn);
+        if worst > MAX_AFFECTED_ROWS_PER_TXN {
+            return Err(RtDbError::new(
+                ErrorCode::BadRequest,
+                format!(
+                    "transaction could affect up to {worst} documents, exceeding the limit of {MAX_AFFECTED_ROWS_PER_TXN}"
+                ),
             ));
         }
         let snapshot = self.snapshot_docs();
@@ -5135,6 +5184,88 @@ mod tests {
         }
         // Nothing changed.
         assert_eq!(c.collect_all("items").len(), 3);
+    }
+
+    #[tokio::test]
+    async fn sec104_rejects_over_budget_by_query_step_count() {
+        // Mirrors server `sec104_rejects_over_budget_by_query_step_count`. A
+        // txn with MAX_BY_QUERY_STEPS_PER_TXN+1 patchByQuery steps is rejected
+        // at the top of execute_transaction, before any step applies. The
+        // original AUDIT finding was 1024 by-query steps (~1M-row single-writer
+        // stall); the 16-step cap rejects it pre-execution.
+        let mut c = new_client();
+        c.mutate(
+            &Mutation::new()
+                .insert(
+                    "items",
+                    json!({"name": "seed", "status": "todo", "order": 0}),
+                )
+                .build(),
+            None,
+        )
+        .await
+        .unwrap();
+        let mut m = Mutation::new();
+        for i in 0..=(MAX_BY_QUERY_STEPS_PER_TXN as i32) {
+            m = m.patch_by_query(
+                "items",
+                FilterExpr::Eq {
+                    field: "status".into(),
+                    value: json!("todo"),
+                },
+                json!({"order": i}),
+                None,
+            );
+        }
+        let err = c.mutate(&m.build(), None).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::BadRequest);
+        assert!(
+            err.message.contains("by-query steps"),
+            "got: {}",
+            err.message
+        );
+        // Pre-execution rejection commits nothing.
+        let docs = c.collect_all("items");
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs[0]["order"], 0);
+    }
+
+    #[tokio::test]
+    async fn sec104_rejects_over_budget_aggregate_affected() {
+        // Mirrors server `sec104_rejects_over_budget_aggregate_affected`. A
+        // txn with few by-query steps (under the step cap) but each at the
+        // default 1000-row limit can still exceed MAX_AFFECTED_ROWS_PER_TXN;
+        // reject it before any step applies.
+        let over_steps = (MAX_AFFECTED_ROWS_PER_TXN / 1000) + 1;
+        assert!(over_steps <= MAX_BY_QUERY_STEPS_PER_TXN);
+        let mut c = new_client();
+        c.mutate(
+            &Mutation::new()
+                .insert(
+                    "items",
+                    json!({"name": "seed", "status": "todo", "order": 0}),
+                )
+                .build(),
+            None,
+        )
+        .await
+        .unwrap();
+        let mut m = Mutation::new();
+        for _ in 0..over_steps {
+            m = m.delete_by_query(
+                "items",
+                FilterExpr::Eq {
+                    field: "status".into(),
+                    value: json!("todo"),
+                },
+                None,
+            );
+        }
+        let err = c.mutate(&m.build(), None).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::BadRequest);
+        assert!(err.message.contains("affect up to"), "got: {}", err.message);
+        // Pre-execution rejection commits nothing.
+        assert_eq!(c.collect_all("items").len(), 1);
     }
 
     // ---- mutate: step helpers ----------------------------------------

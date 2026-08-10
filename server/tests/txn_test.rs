@@ -11,7 +11,9 @@ use rtdb_server::ddl;
 use rtdb_server::error::ErrorCode;
 use rtdb_server::query::{FilterExpr, Query, QueryResult, execute_query};
 use rtdb_server::schema::SchemaDef;
-use rtdb_server::txn::{Step, Transaction, execute_txn};
+use rtdb_server::txn::{
+    MAX_AFFECTED_ROWS_PER_TXN, MAX_BY_QUERY_STEPS_PER_TXN, Step, Transaction, execute_txn,
+};
 use sqlx::PgPool;
 
 fn kanban_schema() -> SchemaDef {
@@ -1766,5 +1768,109 @@ async fn delete_by_query_respects_limit_and_truncated() -> anyhow::Result<()> {
     assert_eq!(outcome.results[0]["deleted"].as_u64(), Some(2));
     assert_eq!(outcome.results[0]["truncated"].as_bool(), Some(true));
     assert_eq!(count_by_status(&pool, &db, &schema, "backlog").await?, 2);
+    Ok(())
+}
+
+// =============================================================================
+// SEC-104 — aggregate by-query budget. The two composite caps (by-query step
+// count + worst-case affected-document total) close the ~1,000,000-row single-
+// writer stall the audit describes (1024 by-query steps × MAX_BY_QUERY_ROWS).
+// Both reject before any step executes, so an over-cap txn commits nothing.
+// =============================================================================
+
+// (byq-e) SEC-104: a txn exceeding MAX_BY_QUERY_STEPS_PER_TXN by-query steps is
+// rejected pre-execution and commits nothing. This is the audit's worst case —
+// 1024 PatchByQuery steps — now bounded at the step-count cap (16), which fires
+// ahead of the affected-row budget.
+#[tokio::test]
+async fn sec104_rejects_over_budget_by_query_step_count() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+
+    // Seed one row so "committed nothing" is observable: a rejected txn must
+    // leave it intact (count stays 1, not 0).
+    insert_work_item_with(&pool, &db, &schema, "backlog", 1.0).await?;
+    assert_eq!(count_by_status(&pool, &db, &schema, "backlog").await?, 1);
+
+    let over = MAX_BY_QUERY_STEPS_PER_TXN + 1;
+    let steps: Vec<Step> = (0..over)
+        .map(|_| Step::PatchByQuery {
+            table: "workItems".to_string(),
+            filter: FilterExpr::Eq {
+                field: "status".to_string(),
+                value: serde_json::json!("backlog"),
+            },
+            patch: doc(serde_json::json!({ "order": 9.0 })),
+            limit: None,
+        })
+        .collect();
+
+    let err = execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction { steps },
+        &PrincipalCtx::bypass(),
+    )
+    .await
+    .expect_err("over-budget by-query step count must be rejected");
+    assert_eq!(err.code, ErrorCode::BadRequest);
+
+    // Nothing committed: the seeded row is unchanged.
+    assert_eq!(count_by_status(&pool, &db, &schema, "backlog").await?, 1);
+    Ok(())
+}
+
+// (byq-f) SEC-104: a txn under the by-query step-count cap but over the
+// aggregate affected-row budget is also rejected pre-execution. With the default
+// per-step row cap (MAX_BY_QUERY_ROWS = 1000), 11 by-query steps at the default
+// limit gives a worst case of 11_000 documents — over the 10_000 budget — while
+// staying under the 16-step cap, so this exercises the affected-row guard
+// specifically.
+#[tokio::test]
+async fn sec104_rejects_over_budget_aggregate_affected() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+
+    insert_work_item_with(&pool, &db, &schema, "backlog", 1.0).await?;
+    assert_eq!(count_by_status(&pool, &db, &schema, "backlog").await?, 1);
+
+    // 11 by-query steps: under MAX_BY_QUERY_STEPS_PER_TXN (16), but
+    // 11 * MAX_BY_QUERY_ROWS (1000) = 11_000 > MAX_AFFECTED_ROWS_PER_TXN (10_000).
+    let by_query_steps = 11;
+    assert!(by_query_steps <= MAX_BY_QUERY_STEPS_PER_TXN);
+    assert!(
+        by_query_steps * 1000 > MAX_AFFECTED_ROWS_PER_TXN,
+        "fixture must actually exceed the aggregate budget"
+    );
+
+    let steps: Vec<Step> = (0..by_query_steps)
+        .map(|_| Step::DeleteByQuery {
+            table: "workItems".to_string(),
+            filter: FilterExpr::Eq {
+                field: "status".to_string(),
+                value: serde_json::json!("backlog"),
+            },
+            limit: None,
+        })
+        .collect();
+
+    let err = execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction { steps },
+        &PrincipalCtx::bypass(),
+    )
+    .await
+    .expect_err("over-budget aggregate affected-row total must be rejected");
+    assert_eq!(err.code, ErrorCode::BadRequest);
+
+    // Nothing committed: the seeded row is unchanged.
+    assert_eq!(count_by_status(&pool, &db, &schema, "backlog").await?, 1);
     Ok(())
 }

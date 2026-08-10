@@ -3,6 +3,8 @@ import { RtDbError } from "../src/errors.js";
 import {
   evalFilterExpr,
   InMemoryRtDbClient,
+  MAX_AFFECTED_ROWS_PER_TXN,
+  MAX_BY_QUERY_STEPS_PER_TXN,
   MAX_STEPS,
   PresenceRooms,
   validateFilter,
@@ -559,6 +561,51 @@ describe("InMemoryRtDbClient — by-query (patchByQuery / deleteByQuery)", () =>
       mutation().patchByQuery("items", todoFilter, { order: 0 }).build(),
     );
     expect(res).toEqual({ patched: 0, truncated: false });
+  });
+
+  it("SEC-104: rejects a txn with too many by-query steps before any step runs", async () => {
+    // Mirrors server `sec104_rejects_over_budget_by_query_step_count`. A txn
+    // with MAX_BY_QUERY_STEPS_PER_TXN+1 patchByQuery steps is rejected at the
+    // top of executeTransaction, before any step applies. The original AUDIT
+    // finding was 1024 by-query steps (~1M-row stall); the 16-step cap rejects
+    // it pre-execution.
+    expect(MAX_BY_QUERY_STEPS_PER_TXN).toBeLessThan(MAX_STEPS);
+    const c = newClient();
+    await c.mutate(mutation().insert("items", { name: "seed", status: "todo", order: 0 }).build());
+    let b = mutation();
+    for (let i = 0; i <= MAX_BY_QUERY_STEPS_PER_TXN; i++) {
+      b = b.patchByQuery("items", todoFilter, { order: i });
+    }
+    await expect(c.mutate(b.build())).rejects.toMatchObject({
+      code: "BAD_REQUEST",
+      message: expect.stringContaining("by-query steps"),
+    });
+    // Pre-execution rejection commits nothing.
+    const docs = (await c.query(api.items.query().withIndex("by_status", ["todo"]).collect())) as {
+      order: number;
+    }[];
+    expect(docs).toHaveLength(1);
+    expect(docs[0].order).toBe(0);
+  });
+
+  it("SEC-104: rejects a txn over the aggregate affected-row budget", async () => {
+    // Mirrors server `sec104_rejects_over_budget_aggregate_affected`. A txn
+    // with few by-query steps (under the step cap) but each at the default
+    // 1000-row limit can still exceed MAX_AFFECTED_ROWS_PER_TXN; reject it.
+    const overSteps = Math.ceil(MAX_AFFECTED_ROWS_PER_TXN / 1000) + 1;
+    expect(overSteps).toBeLessThanOrEqual(MAX_BY_QUERY_STEPS_PER_TXN);
+    const c = newClient();
+    await c.mutate(mutation().insert("items", { name: "seed", status: "todo", order: 0 }).build());
+    let b = mutation();
+    for (let i = 0; i < overSteps; i++) {
+      b = b.deleteByQuery("items", todoFilter);
+    }
+    await expect(c.mutate(b.build())).rejects.toMatchObject({
+      code: "BAD_REQUEST",
+      message: expect.stringContaining("affect up to"),
+    });
+    const docs = await c.query(api.items.query().withIndex("by_status", ["todo"]).collect());
+    expect(docs).toHaveLength(1);
   });
 });
 

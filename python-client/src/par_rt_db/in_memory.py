@@ -136,9 +136,37 @@ MAX_TAKE = 4096
 #: turn and prevents a wildcard filter from sweeping a whole table; a larger
 #: match set touches exactly this many and reports ``truncated: true``.
 MAX_BY_QUERY_ROWS = 1000
+#: SEC-104: hard cap on the count of ``patchByQuery``/``deleteByQuery`` steps
+#: in one txn (mirrors ``server/src/txn.rs::MAX_BY_QUERY_STEPS_PER_TXN``).
+#: Bounds the worst case at 16 x 1000 = 16,000 rows rather than 1024 x 1000
+#: (~1M), which would otherwise stall the server's single-writer.
+MAX_BY_QUERY_STEPS_PER_TXN = 16
+#: SEC-104: hard ceiling on the worst-case total documents a single txn may
+#: touch (mirrors ``server/src/txn.rs::MAX_AFFECTED_ROWS_PER_TXN``). Per-id
+#: steps count 1 each; each by-query step counts up to its ``limit``.
+MAX_AFFECTED_ROWS_PER_TXN = 10_000
 #: Approximate cron re-fire interval for the in-memory stub. Real 5-field cron
 #: parsing is deferred to the server; the harness only needs crons to re-arm.
 CRON_STEP_MS = 60_000
+
+
+def worst_case_affected(txn: Transaction) -> int:
+    """SEC-104: total documents a txn could touch in the worst case.
+
+    Per-id steps count 1 each; each ``patchByQuery``/``deleteByQuery`` step
+    counts up to its ``limit`` (default and cap ``MAX_BY_QUERY_ROWS``). Mirrors
+    server ``txn::worst_case_affected``; used by ``_execute_transaction``'s
+    ``MAX_AFFECTED_ROWS_PER_TXN`` budget check.
+    """
+    total = 0
+    for step in txn.steps:
+        if isinstance(step, (_PatchByQuery, _DeleteByQuery)):
+            limit_opt = step.limit
+            total += MAX_BY_QUERY_ROWS if limit_opt is None else min(limit_opt, MAX_BY_QUERY_ROWS)
+        else:
+            total += 1
+    return total
+
 
 # Sentinel storage types mirroring ``PgType`` in the Rust harness. Selects the
 # comparison domain for index sorts and range bounds (int64 values are stored as
@@ -1388,6 +1416,22 @@ class InMemoryRtDbClient:
             raise RtDbError(
                 ErrorCode.BAD_REQUEST,
                 f"transaction exceeds maximum of {MAX_STEPS} steps",
+            )
+        # SEC-104: bound the worst-case row count before any step applies so an
+        # over-budget txn rolls back nothing. Mirrors server ``execute_txn``.
+        by_query_steps = sum(1 for s in txn.steps if isinstance(s, (_PatchByQuery, _DeleteByQuery)))
+        if by_query_steps > MAX_BY_QUERY_STEPS_PER_TXN:
+            raise RtDbError(
+                ErrorCode.BAD_REQUEST,
+                f"transaction has {by_query_steps} by-query steps, exceeding the limit "
+                f"of {MAX_BY_QUERY_STEPS_PER_TXN}",
+            )
+        worst = worst_case_affected(txn)
+        if worst > MAX_AFFECTED_ROWS_PER_TXN:
+            raise RtDbError(
+                ErrorCode.BAD_REQUEST,
+                f"transaction could affect up to {worst} documents, exceeding the limit "
+                f"of {MAX_AFFECTED_ROWS_PER_TXN}",
             )
         snapshot = dict(
             self._docs

@@ -460,14 +460,16 @@ async fn handle_text_frame(
                         return false;
                     }
                     // Same admin guardrail as the HTTP data-browser path: reject
-                    // an over-cap mutation before it reaches the committer.
+                    // an over-budget mutation before it reaches the committer.
+                    // The bound is worst-case affected documents, not raw step
+                    // count — a by-query step can touch many rows (SEC-104).
                     let cap = state.config.max_affected_docs;
-                    if admin && txn.steps.len() > cap {
+                    let worst = crate::txn::worst_case_affected(&txn);
+                    if admin && worst > cap {
                         let _ = out_tx.send(ServerMessage::MutateErr {
                             mut_id,
                             error: RtDbError::bad_request(format!(
-                                "mutation has {} step(s), exceeding the limit of {cap}",
-                                txn.steps.len()
+                                "mutation could affect up to {worst} document(s), exceeding the limit of {cap}"
                             )),
                         });
                         return false;

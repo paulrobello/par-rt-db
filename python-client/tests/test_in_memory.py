@@ -18,6 +18,8 @@ from pydantic import TypeAdapter
 from par_rt_db import Mutation, StepResult, TableQuery
 from par_rt_db.errors import ErrorCode, RtDbError
 from par_rt_db.in_memory import (
+    MAX_AFFECTED_ROWS_PER_TXN,
+    MAX_BY_QUERY_STEPS_PER_TXN,
     InMemoryRtDbClient,
     InMemoryRtDbClientOptions,
     is_hex_id,
@@ -1067,6 +1069,52 @@ def test_delete_by_query_truncates_at_limit() -> None:
     dumped = res.model_dump(by_alias=True, mode="json")
     assert dumped["deleted"] == 2
     assert dumped["truncated"] is True
+    assert len(c.run_query(TableQuery("items").build())) == 1
+
+
+def test_sec104_rejects_over_budget_by_query_step_count() -> None:
+    # Mirrors server `sec104_rejects_over_budget_by_query_step_count`. A txn
+    # with MAX_BY_QUERY_STEPS_PER_TXN+1 patchByQuery steps is rejected at the
+    # top of _execute_transaction, before any step applies. The original AUDIT
+    # finding was 1024 by-query steps (~1M-row single-writer stall); the 16-step
+    # cap rejects it pre-execution.
+    assert MAX_BY_QUERY_STEPS_PER_TXN < 1024
+    c = _new_client()
+    c.mutate(
+        Mutation.builder().insert("items", {"name": "seed", "status": "todo", "order": 0}).build()
+    )
+    flt = _flt({"op": "eq", "field": "status", "value": "todo"})
+    b = Mutation.builder()
+    for i in range(MAX_BY_QUERY_STEPS_PER_TXN + 1):
+        b = b.patch_by_query("items", flt, {"order": i})
+    with pytest.raises(RtDbError) as ei:
+        c.mutate(b.build())
+    assert ei.value.code is ErrorCode.BAD_REQUEST
+    assert "by-query steps" in ei.value.message
+    # Pre-execution rejection commits nothing.
+    docs = c.run_query(TableQuery("items").build())
+    assert len(docs) == 1
+    assert docs[0]["order"] == 0
+
+
+def test_sec104_rejects_over_budget_aggregate_affected() -> None:
+    # Mirrors server `sec104_rejects_over_budget_aggregate_affected`. A txn
+    # with few by-query steps (under the step cap) but each at the default
+    # 1000-row limit can still exceed MAX_AFFECTED_ROWS_PER_TXN; reject it.
+    over_steps = (MAX_AFFECTED_ROWS_PER_TXN // 1000) + 1
+    assert over_steps <= MAX_BY_QUERY_STEPS_PER_TXN
+    c = _new_client()
+    c.mutate(
+        Mutation.builder().insert("items", {"name": "seed", "status": "todo", "order": 0}).build()
+    )
+    flt = _flt({"op": "eq", "field": "status", "value": "todo"})
+    b = Mutation.builder()
+    for _ in range(over_steps):
+        b = b.delete_by_query("items", flt)
+    with pytest.raises(RtDbError) as ei:
+        c.mutate(b.build())
+    assert ei.value.code is ErrorCode.BAD_REQUEST
+    assert "affect up to" in ei.value.message
     assert len(c.run_query(TableQuery("items").build())) == 1
 
 

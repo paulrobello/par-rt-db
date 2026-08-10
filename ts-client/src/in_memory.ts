@@ -59,6 +59,31 @@ const MAX_TAKE = 4096;
 /** Hard cap on rows a single `patchByQuery`/`deleteByQuery` step may touch.
  * Mirrors server `txn::MAX_BY_QUERY_ROWS`; a larger match set is truncated. */
 const MAX_BY_QUERY_ROWS = 1000;
+/** SEC-104: hard cap on the count of `patchByQuery`/`deleteByQuery` steps in
+ * one txn. Mirrors server `txn::MAX_BY_QUERY_STEPS_PER_TXN`. Without it, 1024
+ * by-query steps × 1000 rows each could stall the (server's) single-writer on
+ * roughly 1M rows; the cap bounds the worst case at 16 × 1000 = 16,000. */
+export const MAX_BY_QUERY_STEPS_PER_TXN = 16;
+/** SEC-104: hard ceiling on the worst-case total documents a single txn may
+ * touch. Mirrors server `txn::MAX_AFFECTED_ROWS_PER_TXN`. Per-id steps count 1
+ * each; each by-query step counts up to its `limit` (default `MAX_BY_QUERY_ROWS`). */
+export const MAX_AFFECTED_ROWS_PER_TXN = 10_000;
+
+/** SEC-104: total documents a txn could touch in the worst case. Per-id steps
+ * count 1 each; each `patchByQuery`/`deleteByQuery` step counts up to its
+ * `limit` (default and cap `MAX_BY_QUERY_ROWS`). Mirrors server
+ * `txn::worst_case_affected`. */
+export function worstCaseAffected(txn: TransactionJson): number {
+  let total = 0;
+  for (const step of txn.steps) {
+    if (step.op === "patchByQuery" || step.op === "deleteByQuery") {
+      total += Math.min(step.limit ?? MAX_BY_QUERY_ROWS, MAX_BY_QUERY_ROWS);
+    } else {
+      total += 1;
+    }
+  }
+  return total;
+}
 
 /** Lowercase a value to FTS-indexable text. Mirrors the text the server feeds
  * into a search index's generated tsvector for a declared field. */
@@ -1268,6 +1293,25 @@ export class InMemoryRtDbClient {
   private executeTransaction(txn: TransactionJson): unknown[] {
     if (txn.steps.length > MAX_STEPS) {
       throw new RtDbError("BAD_REQUEST", `transaction exceeds maximum of ${MAX_STEPS} steps`);
+    }
+    // SEC-104: bound the worst-case row count before any step applies so an
+    // over-budget txn rolls back nothing. Mirrors server `execute_txn`.
+    let byQuerySteps = 0;
+    for (const step of txn.steps) {
+      if (step.op === "patchByQuery" || step.op === "deleteByQuery") byQuerySteps += 1;
+    }
+    if (byQuerySteps > MAX_BY_QUERY_STEPS_PER_TXN) {
+      throw new RtDbError(
+        "BAD_REQUEST",
+        `transaction has ${byQuerySteps} by-query steps, exceeding the limit of ${MAX_BY_QUERY_STEPS_PER_TXN}`,
+      );
+    }
+    const worst = worstCaseAffected(txn);
+    if (worst > MAX_AFFECTED_ROWS_PER_TXN) {
+      throw new RtDbError(
+        "BAD_REQUEST",
+        `transaction could affect up to ${worst} documents, exceeding the limit of ${MAX_AFFECTED_ROWS_PER_TXN}`,
+      );
     }
     const snapshot = this.snapshotTables();
     const results: unknown[] = [];

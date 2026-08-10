@@ -32,6 +32,33 @@ pub const MAX_STEPS: usize = 1024;
 /// `max_affected_docs` step-COUNT guardrail does not bound it — this const does.
 const MAX_BY_QUERY_ROWS: u32 = 1000;
 
+/// Hard cap on the number of by-query (`PatchByQuery`/`DeleteByQuery`) steps a
+/// single transaction may contain. Each such step can sweep up to
+/// [`MAX_BY_QUERY_ROWS`] rows, so without a step-count cap the worst-case
+/// committer turn would be `MAX_STEPS * MAX_BY_QUERY_ROWS` (~1,000,000 rows) —
+/// enough to stall the single-writer for a database for the duration and starve
+/// every other writer/subscription on it. This const composes with
+/// [`MAX_AFFECTED_ROWS_PER_TXN`] to bound the aggregate; the check runs before
+/// any step executes so an over-cap txn never partially commits. SEC-104.
+pub const MAX_BY_QUERY_STEPS_PER_TXN: usize = 16;
+
+/// Aggregate worst-case affected-document budget for a single transaction: a
+/// hard ceiling on [`worst_case_affected`] (per-id steps count 1 each; each
+/// by-query step counts up to its `limit`, default [`MAX_BY_QUERY_ROWS`]).
+/// Checked before execution so an over-budget txn commits nothing. This is the
+/// single-writer stall bound — one `/api/mutate` cannot monopolize the
+/// serialized committer turn. SEC-104.
+pub const MAX_AFFECTED_ROWS_PER_TXN: usize = 10_000;
+
+/// Per-statement timeout (ms) applied to every committer turn via
+/// `SET LOCAL statement_timeout` inside the [`execute_txn`] transaction. Bounds
+/// a pathological scan that escapes the row budget (e.g. a filter over an
+/// unindexed field) so it aborts this transaction rather than stalling the
+/// single-writer for the whole database. `SET LOCAL` scopes the value to this
+/// transaction and reverts on commit/rollback, so it never leaks to other pool
+/// users. SEC-104.
+const STATEMENT_TIMEOUT_MS: u64 = 60_000;
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "op", rename_all = "camelCase", deny_unknown_fields)]
 pub enum Step {
@@ -1234,6 +1261,26 @@ fn row_auth_enforced_uid<'a>(table_def: &'a TableDef, owner: Option<&'a str>) ->
 /// Runs under READ COMMITTED with no row locking; correctness depends on all
 /// writes for a database being serialized through the per-db committer.
 /// Never call `execute_txn` from a non-committer production path.
+/// Worst-case number of documents `txn` could affect. Per-id steps
+/// (`Insert`/`Patch`/`Replace`/`Delete`/`ExpectVersion`/`ExpectAbsent`/`Upsert`)
+/// touch at most one each; each `PatchByQuery`/`DeleteByQuery` step touches up
+/// to its `limit` (default and ceiling [`MAX_BY_QUERY_ROWS`]). The estimate is
+/// an over-approximation — the actual count is lower when fewer rows match —
+/// and is used by [`execute_txn`]'s [`MAX_AFFECTED_ROWS_PER_TXN`] budget check
+/// and the admin `max_affected_docs` guardrail (admin/docs.rs, ws.rs). It must
+/// never under-approximate (that would weaken both caps). SEC-104.
+pub fn worst_case_affected(txn: &Transaction) -> usize {
+    txn.steps
+        .iter()
+        .map(|step| match step {
+            Step::PatchByQuery { limit, .. } | Step::DeleteByQuery { limit, .. } => {
+                (*limit).unwrap_or(MAX_BY_QUERY_ROWS).min(MAX_BY_QUERY_ROWS) as usize
+            }
+            _ => 1,
+        })
+        .sum()
+}
+
 pub async fn execute_txn(
     pool: &PgPool,
     db: &str,
@@ -1253,11 +1300,47 @@ pub async fn execute_txn(
         )));
     }
 
+    // SEC-104: compose the per-step caps into an aggregate affected-document
+    // budget and a by-query step-count cap, both checked BEFORE any step
+    // executes so an over-cap txn commits nothing. Commit 82650c2 introduced
+    // by-query steps AND raised MAX_STEPS in the same change; without these
+    // composite caps the worst-case committer turn was ~1,000,000 rows — a
+    // single `/api/mutate` could stall the single-writer for a database and
+    // starve every other writer/subscription on it. The by-query step cap is
+    // the sharp bound; the affected-row budget is the blast-radius bound.
+    let by_query_steps = txn
+        .steps
+        .iter()
+        .filter(|s| matches!(s, Step::PatchByQuery { .. } | Step::DeleteByQuery { .. }))
+        .count();
+    if by_query_steps > MAX_BY_QUERY_STEPS_PER_TXN {
+        return Err(RtDbError::bad_request(format!(
+            "transaction has {by_query_steps} by-query steps, exceeding the limit of {MAX_BY_QUERY_STEPS_PER_TXN}"
+        )));
+    }
+    let worst = worst_case_affected(txn);
+    if worst > MAX_AFFECTED_ROWS_PER_TXN {
+        return Err(RtDbError::bad_request(format!(
+            "transaction could affect up to {worst} documents, exceeding the limit of {MAX_AFFECTED_ROWS_PER_TXN}"
+        )));
+    }
+
     let pg_schema_name = pg_schema(db);
     let mut results = Vec::with_capacity(txn.steps.len());
     let mut write_set = WriteSet::default();
 
     let mut tx = pool.begin().await?;
+    // SEC-104: bound every statement in this committer turn. A pathological
+    // scan (e.g. a filter over an unindexed field that escapes the row budget)
+    // aborts this transaction rather than stalling the single-writer for the
+    // whole database. `SET LOCAL` scopes the value to this transaction and
+    // reverts on commit/rollback — it never leaks to other pool users. The
+    // value is a const, never user input.
+    sqlx::query(&format!(
+        "SET LOCAL statement_timeout = {STATEMENT_TIMEOUT_MS}"
+    ))
+    .execute(&mut *tx)
+    .await?;
 
     for step in &txn.steps {
         // ENH-005 Task 4: gate each step against the machine-token table

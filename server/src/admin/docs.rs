@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::RtDbError;
 use crate::http_api::ApiJson;
 use crate::query::{Query, QueryResult, execute_query};
-use crate::txn::Transaction;
+use crate::txn::{Transaction, worst_case_affected};
 use crate::{AppState, db};
 
 use super::require_admin;
@@ -66,10 +66,15 @@ pub(super) struct AdminMutateResponse {
 }
 
 /// `POST /admin/db/{db}/mutate` — admin document write through the existing
-/// committer with `owner = None`. The step-count cap is the server-side
-/// guardrail: each step touches at most one document, so rejecting over-cap
-/// here guarantees an over-cap mutation never reaches the committer (never
-/// becomes durable).
+/// committer with `owner = None`. `max_affected_docs` bounds the worst-case
+/// number of documents this mutation could touch (per-id steps count 1 each;
+/// each by-query step counts up to its `limit`, default `MAX_BY_QUERY_ROWS`),
+/// not the raw step count. Rejecting over-budget here, before the committer
+/// turn, keeps a runaway admin mutation off the single-writer. A by-query step
+/// can touch many rows, so the prior step-count comparison silently allowed a
+/// 100-step admin mutation to affect up to 100,000 documents under a cap
+/// advertised as 100. `execute_txn` re-checks its own hard aggregate budget
+/// (`MAX_AFFECTED_ROWS_PER_TXN`), so this is a per-instance tightening on top.
 pub(super) async fn admin_mutate(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -81,10 +86,10 @@ pub(super) async fn admin_mutate(
         return Err(RtDbError::not_found("unknown database"));
     }
     let cap = state.config.max_affected_docs;
-    if body.txn.steps.len() > cap {
+    let worst = worst_case_affected(&body.txn);
+    if worst > cap {
         return Err(RtDbError::bad_request(format!(
-            "mutation has {} step(s), exceeding the limit of {cap}",
-            body.txn.steps.len()
+            "mutation could affect up to {worst} document(s), exceeding the limit of {cap}"
         )));
     }
     let outcome = state
