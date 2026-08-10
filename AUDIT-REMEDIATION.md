@@ -4,13 +4,13 @@
 > **Audit Date**: 2026-08-09 (HEAD `613c7a6`) · **Remediation Date**: 2026-08-10
 > **Severity Filter**: `all` (full remediation requested) · **Plan Source**: `AUDIT.md` `## Remediation Plan` + `AUDIT-REMEDIATION-PLAN.md`
 > **Implementation**: Opus 5 (all fix agents); orchestrator (Fable) verified every batch with the authoritative `make checkall` gate
-> **Branch**: `fix/audit-remediation` (worktree `.claude/worktrees/fix-audit-remediation`), 21 commits, +8219/−1270, 152 files. **Not merged, not pushed.**
+> **Branch**: `fix/audit-remediation` (worktree `.claude/worktrees/fix-audit-remediation`), 24 commits, +12776/−2420, 160 files. **Not merged, not pushed.**
 
 ---
 
-## Run status: ~71 of 133 resolved — paused for verification integrity
+## Run status: ~74 of 133 resolved — paused at a clean, green checkpoint
 
-The full 133-issue remediation is in progress. **The entire SECURITY domain (all 40 issues) is complete**, plus 13 architecture fixes, the four-client mirror sweep, and the bulk of documentation (Critical + High + the spec-status sweep). The run was paused deliberately while green: continuing into the remaining large refactors (each a multi-commit effort: ARC-108, QA-002R, ARC-106) would risk a context/usage-limit termination mid-batch leaving a half-verified state — one subagent already died that way earlier (SEC-105/106, since completed cleanly). Every landed batch was verified by the orchestrator with the real gate before the next began.
+The full 133-issue remediation is in progress. **The entire SECURITY domain (all 40 issues) is complete**, plus 14 architecture fixes (including the largest refactor, ARC-108), the four-client mirror sweep, the extended golden-vector corpus (QA-103, which also caught+fixed real rust divergences), and the bulk of documentation. The run is paused deliberately while green: the last remaining major piece (QA-002R — extract cc-200 functions across 3 client engines) is a multi-commit refactor that needs a fresh context budget to finish+verify without risking a half-extracted function across three engines. Every landed batch was verified by the orchestrator with the real gate before the next began.
 
 ---
 
@@ -19,11 +19,11 @@ The full 133-issue remediation is in progress. **The entire SECURITY domain (all
 | Domain | Done | Status |
 |--------|-----:|--------|
 | **Security** | **40/40** | ✅ **Complete** (4 Critical, 12 High, 14 Medium, 10 Low) |
-| **Architecture** | 12 + 1 partial | ARC-101,103,104,107,109,110,112,113,127,128,129,134; ARC-102 partial |
-| **Code Quality** | 2 | QA-101, QA-102 (client mirror sweep) |
+| **Architecture** | 14 + 1 partial | ARC-101,103,104,107,108(+124),109,110,112,113,127,128,129,134; ARC-102 partial |
+| **Code Quality** | 3 | QA-101, QA-102, QA-103 (golden-vector corpus → all terminals) |
 | **Documentation** | ~17 | DOC2-001–008, 011–014, 021, 022, 049, 050 |
 
-**Overall**: ~71 resolved, 1 partial (ARC-102), ~62 carried forward. One real regression was caught by the gate and fixed inline (Phase 2A scheduler 60s idle-sleep broke past-due catch-up → reverted to 2s, keeping the write-gating).
+**Overall**: ~74 resolved, 1 partial (ARC-102), ~59 carried forward. The orchestrator's gate caught and fixed inline: a Phase 2A scheduler regression, a python-admin-collapse pyright concern (stale), an ARC-110 feature-gate gap (parse_step_results dead under feature combos), and several test/fmt loose ends — illustrating why the orchestrator runs the gate itself rather than trusting agent self-reports.
 
 ---
 
@@ -31,67 +31,67 @@ The full 133-issue remediation is in progress. **The entire SECURITY domain (all
 
 ### Security — COMPLETE (40)
 - **Critical**: SEC-101 (stored XSS), SEC-102 (Microsoft nOAuth), ARC-101 (subs-verifier), DOC2-001 (backup env keys).
-- **High**: SEC-103 (per-db anonymous), SEC-104 (row budget + statement_timeout), SEC-105/106 (WS Origin + admin CSRF), SEC-107 (evalExpr root-admin gate), SEC-111 (security headers), SEC-112/113/118/119/123, SEC-117 (Not divergence), SEC-122 (OIDC email_verified), SEC-124 (debug_assert→real).
-- **Medium**: SEC-108 (admin route_layer), SEC-109 (admin brute-force), SEC-110 (weak-key boot), SEC-114 (webhook DNS pin), SEC-115 (webhook HMAC signing), SEC-120 (revocable admin session), SEC-121 (/auth/state cookie + trace redaction).
-- **Low**: SEC-125–134, SEC-136–139, SEC-002R, SEC-003R. *(SEC-128 http_api.rs:60 deliberately skipped — client-facing 400 for the client's own malformed payload, not an internal leak.)*
+- **High**: SEC-103/104/105/106/107/111/112/113/117/118/119/122/123/124.
+- **Medium**: SEC-108/109/110/114/115/120/121.
+- **Low**: SEC-125–134, 136–139, 002R, 003R. *(SEC-128 http_api.rs:60 deliberately skipped — client-facing 400 for the client's own malformed payload.)*
 
-### Architecture (12 + 1 partial)
-ARC-101 (subs-verifier), ARC-103 (quota-spawn guard), ARC-104 (MAX_STEPS clients), ARC-107 (dashboard wire-contract dedup), ARC-109 (python exports), ARC-110 (rust feature gate), ARC-112 (DbStats 6 fields), ARC-113 (clone-db mirror), ARC-127 (rust re-exports), ARC-128 (py WS backoff), ARC-129 (StepResult dedup), ARC-134 (error round-trip + pydantic bound). **ARC-102 partial**: idle-write gating done; idle-database reclamation deferred.
+### Architecture (14 + 1 partial)
+ARC-101, 103, 104, 107, **108+124** (collapse python's 4 admin copies — largest refactor, 615 tests unchanged), 109, 110 (feature-combo gate), 112, 113, 127, 128, 129, 134. **ARC-102 partial**: idle-write gating done; idle-database reclamation deferred.
 
-### Code Quality (2)
-QA-101 (ts-client OAuth union → 6 providers), QA-102 (session admin mirrored to rust/python/cli).
+### Code Quality (3)
+QA-101 (6-provider OAuth union), QA-102 (session admin mirror), **QA-103** (golden-vector corpus 9→38 cases, all 4 implementations; query_combinations ported to rust+python; caught+fixed rust search/vectorSearch divergences + cascade-guard gaps).
 
 ### Documentation (~17)
-DOC2-001/019/013 (env forwarding), DOC2-002–008 (dashboard/python README, CHANGELOG, README routes/codes/protocol), DOC2-014 (CONTRIBUTING dashboard tests), DOC2-021/022 (vector-search doc + FEATURE_MATRIX), DOC2-011/012/049/050 (spec-status sweep — 22 flipped, 7 added, 21 index rows, contradictions + miscount fixed).
+DOC2-001/019/013 (env forwarding), DOC2-002–008 (README/CHANGELOG/CONTRIBUTING), DOC2-021/022, DOC2-011/012/049/050 (spec-status sweep).
 
 ---
 
-## Commits (branch `fix/audit-remediation`, 21)
+## Commits (branch `fix/audit-remediation`, 24)
 
 ```
-3f6225f ARC-127/128/129/134/113 small architecture batch
-cf5fd0f DOC2-012/011 spec status sweep (+049/050)
-02dac80 High doc batch (DOC2-002..008,014,021,022)
-875ddcc ARC-109 python exports + ARC-110 rust feature gate + ARC-112 DbStats
-32548ac report update (security complete)
-dd4cfe7 QA-101 OAuth union + QA-102 session admin mirror
-5948a10 Low-severity security batch (SEC-125..134,136..139,002R,003R)
-103265e SEC-120 revocable admin session + SEC-121 /auth/state
-04d71b8 SEC-114 webhook DNS pin + SEC-115 HMAC signing
-d6884f7 SEC-108 admin route_layer + SEC-109 + SEC-110
-6db8de8 SEC-104 by-query row budget + statement_timeout
-9ddaf85 SEC-105 WS Origin + SEC-106 admin CSRF
-b220af4 audit remediation report
-9fb0950 SEC-117 Not divergence + SEC-103 per-db anonymous
-e289b2b Phase 2D — forward RTDB_* env keys (DOC2-001,019,013)
-8f87490 Phase 2C — delete dashboard 5th wire-contract copy (ARC-107)
-7197a4d Phase 2B — client MAX_STEPS 256->1024 (ARC-104)
-c51697d Phase 2A — gate idle pollers, subs verifier, quota spawn (ARC-101,102,103)
-2b95233 Phase 1C — evalExpr root-admin gate + identifier checks (SEC-107,124)
-969f7ab Phase 1B — Microsoft nOAuth + OIDC email_verified (SEC-102,122)
-00d6fe8 Phase 1A — storage XSS, security headers, rate-limit key, signed URLs, blob auth, batch cap, range (SEC-111,101,112,113,118,119,123)
+(prior 18 — see git log; highlights:)
+3f6225f ARC-127/128/129/134/113 small architecture
+cf5fd0f DOC2-012/011 spec status sweep
+02dac80 High doc batch
+875ddcc ARC-109/110/112
+dd4cfe7 QA-101/102 mirror sweep
+5948a10 Low-severity security
+103265e SEC-120/121
+04d71b8 SEC-114/115
+d6884f7 SEC-108/109/110
+6db8de8 SEC-104
+9ddaf85 SEC-105/106
+9fb0950 SEC-117/103
+e289b2b Phase 2D env forwarding
+8f87490 Phase 2C ARC-107
+7197a4d Phase 2B ARC-104
+c51697d Phase 2A ARC-101/102/103
+2b95233 Phase 1C SEC-107/124
+969f7ab Phase 1B SEC-102/122
+00d6fe8 Phase 1A SEC-111/101/112/113/118/119/123
+(+ ARC-108/124 python admin collapse, QA-103 corpus, two report updates)
 ```
 
 ---
 
 ## Verification
 
-Each batch verified by the orchestrator with the authoritative gate (`make checkall` stages minus `dev-db-up` — skipped intentionally: the worktree compose project name would start a second Postgres on the already-bound port 55434; the dev DB was confirmed live and shared). Every code batch `GATE_EXIT=0`: env-drift ✅ · fmt ✅ · lint (clippy `-D warnings`/biome/ruff) ✅ · typecheck ✅ · all six test suites ✅. Doc-only batches verified as markdown-only diffs.
+Each batch verified by the orchestrator with the authoritative gate (`make checkall` stages minus `dev-db-up` — skipped intentionally: the worktree compose project name would start a second Postgres on the already-bound port 55434). Every code batch `GATE_EXIT=0`: env-drift ✅ · fmt ✅ · lint (clippy `-D warnings`/biome/ruff) ✅ · typecheck ✅ · all six test suites ✅.
 
-- The `webhook_delivery_end_to_end` test had a load-dependent timing flake; its poll deadline was widened 10s→30s as a test-reliability fix (pre-existing condition, not a regression).
-- **One real regression was caught by the gate and fixed inline**: Phase 2A's 60s idle scheduler sleep broke past-due catch-up → reverted to 2s, keeping the write-gating. This is why the orchestrator runs the gate itself rather than trusting agent self-reports.
+- The `webhook_delivery_end_to_end` load-dependent flake was hardened (deadline 10s→30s).
+- **Regressions caught by the gate and fixed inline**: Phase 2A scheduler idle-sleep; ARC-129 `parse_step_results` dead under feature combos (ARC-110's gate caught it); the new `query_combinations` test ungated; multiple test/fmt loose ends.
 
 ---
 
-## Carried Forward (~62 issues) — recommended next session
+## Carried Forward (~59 issues) — recommended next session
 
-**Architecture (large refactors + remaining)**: ARC-106 (dashboard consumes SDK), ARC-108+124 (collapse python's 4 admin copies — **large**), ARC-114 (OAuth Template Method + shared reqwest), ARC-115 (structural auth gate), ARC-117 (cargo workspace), ARC-119 (bound SchemaCache), ARC-120/121 (toolchain pin / rust admin split), ARC-123 (dashboard useAsync + drop polls), ARC-125/126/130/131/132/133, ARC-102 step 4 (idle reclamation).
+**Code Quality (resume here — QA-103 unblocked it)**: **QA-002R** (per-terminal extraction of the cc-200 functions in ts/rust/python in-memory engines + split the server's `execute_aggregate_terminal` — **large, multi-commit, one arm at a time with the full gate between**; the extended corpus (QA-103) is now the behavior-preservation net), QA-108 (split rust in_memory.rs — precedes QA-002R's Rust arm), QA-104+106 (config helpers), QA-105 (StepCtx), QA-107 (split handle_text_frame), QA-109/110/111.
 
-**Code Quality**: QA-103 (extend golden-vector corpus — must precede QA-002R), QA-002R (per-terminal extraction in 3 client engines — **large, multi-commit**), QA-104+106 (config helpers), QA-105 (StepCtx), QA-107 (split handle_text_frame), QA-108 (split rust in_memory.rs — precedes QA-002R Rust arm), QA-109/110/111.
+**Architecture**: ARC-106 (dashboard consumes SDK — two-phase), ARC-114/115/117/119/120/121/123, ARC-125/126/130–133, ARC-102 step 4 (idle reclamation).
 
 **Documentation**: DOC2-009, 010, 015, 020, 023–048, 051–054 (README TOCs/badges, deploy runbook, client README gaps, docstrings, the one broken doc link DOC2-053).
 
-`AUDIT-REMEDIATION-PLAN.md` has per-issue detail for all of it; board cards tagged `audit-2026-08-09` track each item.
+`AUDIT-REMEDIATION-PLAN.md` has per-issue detail; board cards tagged `audit-2026-08-09` track each item.
 
 ---
 
@@ -104,8 +104,8 @@ Each batch verified by the orchestrator with the authoritative gate (`make check
 
 ## Next Steps
 
-1. **Continue remediation** (fresh session, full context budget) — security is fully done; resume with the large architecture refactors (ARC-108, then QA-103→QA-002R) or the remaining docs. Playbook + board cards have everything.
+1. **Continue remediation** (fresh session, full context budget) — security is fully done; resume with QA-002R (now unblocked by QA-103) one terminal-arm per commit, then the remaining architecture/docs.
 2. **Decide** DOC2-010.
-3. **Merge** `fix/audit-remediation` to `main` (21 commits, gate-green) when ready — rebase onto latest `main` first. Push to `origin` is a separate, explicitly-confirmed step.
-4. **Re-run `/audit`** after merge to refresh `AUDIT.md`.
+3. **Merge** `fix/audit-remediation` to `main` (24 commits, gate-green) when ready — rebase onto latest `main` first. Push to `origin` is a separate, explicitly-confirmed step.
+4. **Re-run `/audit`** after merge.
 5. **Review before merge**: the auth/security changes are flagged in their commit messages per the standing security rule — review the diffs (esp. SEC-101/102/103/105/106/107/108/110/114/115/117/118/119/120/122/124).
