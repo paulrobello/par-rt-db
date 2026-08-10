@@ -2106,7 +2106,7 @@ export class InMemoryRtDbClient {
     }
 
     if (q.count) {
-      return filtered.length;
+      return this.executeCountTerminal(filtered);
     }
 
     // Distinct terminal: return the unique values of the index field immediately
@@ -2493,6 +2493,12 @@ export class InMemoryRtDbClient {
               : 0,
     );
     return scored.slice(0, limit).map((s) => this.mergeDoc(s.row));
+  }
+
+  /** `count` terminal: COUNT(*) over the matching set. Verbatim lift of the
+   * former inline `if (q.count) { ... }` arm. */
+  private executeCountTerminal(filtered: StoredRow[]): number {
+    return filtered.length;
   }
 
   /** Merges a stored row with its system fields — a port of server `merge_doc`. */
