@@ -157,8 +157,9 @@ pub struct Config {
     pub image_concurrency: usize,       // RTDB_IMAGE_CONCURRENCY, default 4
     pub image_default_quality: u8,      // RTDB_IMAGE_DEFAULT_QUALITY, default 80
     // ---- Presence (ENH-015) ----
-    // Boot-only operational knobs for realtime presence (not hot). Default-off
-    // master switch + caps consumed by `PresenceConfig::from_config` (Task 3).
+    // Boot-only operational knobs for realtime presence (not hot). Master
+    // switch + caps consumed by `PresenceConfig::from_config` (Task 3); the
+    // switch ships default-ON (see the field doc just below).
     /// RTDB_PRESENCE_ENABLED (default true). Master switch.
     pub presence_enabled: bool,
     /// RTDB_PRESENCE_MAX_STATE_BYTES (default 1024).
@@ -228,15 +229,61 @@ pub struct Config {
     pub cookie_secure: bool,
 }
 
+/// Boot-time env parse for a typed knob (ARC-118, folded with QA-106). Unset
+/// ⇒ `default`; PRESENT but unparseable ⇒ an `Err` naming the variable, its
+/// raw value, and the parse failure. This is the sharp fix for the failure
+/// mode where a typo in e.g. `RTDB_SUBS_VERIFY_SKIP_EVERY` silently reverted
+/// to the default and disabled a safety net (ARC-101) — a malformed value now
+/// fails boot loudly instead. Leading/trailing whitespace is trimmed before
+/// parsing so a value copied with stray spaces does not read as a typo.
+///
+/// Call sites apply any per-knob clamp (`max(1)`, `clamp(1, 8192)`, …) to the
+/// returned `Ok` value, keeping the clamp-or-not policy explicit per knob.
+fn env_parsed<T>(key: &str, default: T) -> Result<T, String>
+where
+    T: std::str::FromStr,
+    <T as std::str::FromStr>::Err: std::fmt::Display,
+{
+    match std::env::var(key) {
+        Ok(raw) => raw.trim().parse::<T>().map_err(|e| {
+            format!(
+                "{key}={raw:?} is not a valid {} ({e}); fix the value or unset {key} to use the default",
+                std::any::type_name::<T>()
+            )
+        }),
+        Err(_) => Ok(default),
+    }
+}
+
+/// Boot-time env boolean (QA-106). `default` is returned when the var is
+/// unset. Recognized spellings ("true"/"1"/"yes" ⇒ true; "false"/"0"/"no" ⇒
+/// false, case-insensitive, trimmed) are honored; an UNRECOGNIZED value
+/// resolves to `default`, so a typo cannot flip a knob away from its
+/// documented posture — security flags that ship on stay on; opt-in flags
+/// that ship off stay off.
+fn env_bool(key: &str, default: bool) -> bool {
+    let Some(v) = std::env::var(key)
+        .ok()
+        .map(|v| v.trim().to_ascii_lowercase())
+    else {
+        return default;
+    };
+    match v.as_str() {
+        "true" | "1" | "yes" => true,
+        "false" | "0" | "no" => false,
+        _ => default,
+    }
+}
+
 impl Config {
-    /// Reads boot-only values from env. Errors (String) name the missing/invalid variable.
+    /// Reads boot-only values from env. Errors (String) name the missing or
+    /// invalid variable. Per ARC-118, a numeric knob that is PRESENT but
+    /// UNPARSEABLE (e.g. a typo) fails boot loudly via [`env_parsed`]; only
+    /// absence falls back to the documented default. Booleans use [`env_bool`]
+    /// (recognized spellings; unrecognized ⇒ the documented default, so a typo
+    /// cannot flip a security posture).
     pub fn from_env() -> Result<Self, String> {
-        let port = match std::env::var("RTDB_PORT") {
-            Ok(v) => v
-                .parse::<u16>()
-                .map_err(|_| "RTDB_PORT must be a valid u16".to_string())?,
-            Err(_) => 8300,
-        };
+        let port = env_parsed("RTDB_PORT", 8300u16)?;
 
         let database_url = std::env::var("RTDB_DATABASE_URL")
             .map_err(|_| "RTDB_DATABASE_URL is required".to_string())?;
@@ -297,10 +344,7 @@ impl Config {
             .ok()
             .map(|v| v.replace("\\n", "\n"));
 
-        let max_affected_docs = match std::env::var("RTDB_MAX_AFFECTED_DOCS") {
-            Ok(v) => v.parse::<usize>().unwrap_or(100),
-            Err(_) => 100,
-        };
+        let max_affected_docs = env_parsed("RTDB_MAX_AFFECTED_DOCS", 100usize)?;
 
         // Multi-tenant default (75): the committer-per-db model means each
         // active database can hold a connection during fan-out re-runs, so
@@ -308,12 +352,7 @@ impl Config {
         // dbs. 75 sits in the 50-100 range the audit recommends, leaving
         // headroom for concurrent subscription re-runs and HTTP reads
         // without overcommitting a typical Postgres `max_connections=100`.
-        // A non-parseable or out-of-range value falls back to the default
-        // (matching the `max_affected_docs` parse style).
-        let pool_max_connections = match std::env::var("RTDB_POOL_MAX_CONNECTIONS") {
-            Ok(v) => v.parse::<u32>().unwrap_or(75),
-            Err(_) => 75,
-        };
+        let pool_max_connections = env_parsed("RTDB_POOL_MAX_CONNECTIONS", 75u32)?;
 
         let static_dir = std::env::var("RTDB_STATIC_DIR")
             .ok()
@@ -321,34 +360,17 @@ impl Config {
             .filter(|s| !s.is_empty());
 
         // HTTP rate-limit ceilings: 0 = unlimited (the default), preserving
-        // today's behavior. Non-parseable values fall back to the default,
-        // matching the `max_affected_docs` parse style.
-        let rate_limit_per_token_rpm = match std::env::var("RTDB_RATE_LIMIT_PER_TOKEN_RPM") {
-            Ok(v) => v.parse::<u32>().unwrap_or(0),
-            Err(_) => 0,
-        };
-        let rate_limit_per_db_rpm = match std::env::var("RTDB_RATE_LIMIT_PER_DB_RPM") {
-            Ok(v) => v.parse::<u32>().unwrap_or(0),
-            Err(_) => 0,
-        };
+        // today's behavior.
+        let rate_limit_per_token_rpm = env_parsed("RTDB_RATE_LIMIT_PER_TOKEN_RPM", 0u32)?;
+        let rate_limit_per_db_rpm = env_parsed("RTDB_RATE_LIMIT_PER_DB_RPM", 0u32)?;
 
-        // Audit log: default off. Accepts the common truthy spellings
-        // case-insensitively and falls back to false on anything else,
-        // matching the permissiveness of the other env parses above.
-        let audit_log_enabled = match std::env::var("RTDB_AUDIT_LOG_ENABLED") {
-            Ok(v) => matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes"),
-            Err(_) => false,
-        };
+        // Audit log: default off (accepts "true"/"1"/"yes" to enable).
+        let audit_log_enabled = env_bool("RTDB_AUDIT_LOG_ENABLED", false);
 
-        // Login-CSRF: default ON (security). Only an explicit falsy spelling
-        // disables it (break-glass). Anything else, including unset, stays on.
-        let oauth_login_csrf = match std::env::var("RTDB_OAUTH_LOGIN_CSRF") {
-            Ok(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "false" | "0" | "no"),
-            Err(_) => true,
-        };
-        // SEC-131: surface the kill switch at boot so it does not silently
-        // survive into a copied `.env`. Local-dev only — production must keep
-        // the double-submit nonce enabled.
+        // Login-CSRF: default ON (security). SEC-131: surface the kill switch
+        // at boot so it does not silently survive into a copied `.env`.
+        // Local-dev only — production must keep the double-submit nonce enabled.
+        let oauth_login_csrf = env_bool("RTDB_OAUTH_LOGIN_CSRF", true);
         if !oauth_login_csrf {
             tracing::warn!(
                 "RTDB_OAUTH_LOGIN_CSRF is disabled — OAuth login-CSRF (double-submit nonce) is OFF. \
@@ -356,37 +378,20 @@ impl Config {
             );
         }
 
-        // Webhook registry: default off, same truthy-spelling parse as audit.
-        let webhooks_enabled = match std::env::var("RTDB_WEBHOOKS_ENABLED") {
-            Ok(v) => matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes"),
-            Err(_) => false,
-        };
-
+        // Webhook registry: default off.
+        let webhooks_enabled = env_bool("RTDB_WEBHOOKS_ENABLED", false);
         // Webhook SSRF dev-escape hatch (SEC-001): opt-in to `http://` URLs and
-        // private/loopback targets, off by default. Same truthy parse.
-        let webhook_allow_http = match std::env::var("RTDB_WEBHOOK_ALLOW_HTTP") {
-            Ok(v) => matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes"),
-            Err(_) => false,
-        };
+        // private/loopback targets, off by default.
+        let webhook_allow_http = env_bool("RTDB_WEBHOOK_ALLOW_HTTP", false);
 
         // Per-IP rate limit on the public storage route (SEC-004). 0 = off,
-        // matching the existing per-token/per-db limiter convention. Unparseable
-        // values fall back to 0 (off) rather than surprising a production
-        // deploy with an unintended limit.
-        let storage_rate_limit_per_ip_rpm =
-            match std::env::var("RTDB_STORAGE_RATE_LIMIT_PER_IP_RPM") {
-                Ok(v) => v.parse::<u32>().unwrap_or(0),
-                Err(_) => 0,
-            };
+        // matching the existing per-token/per-db limiter convention.
+        let storage_rate_limit_per_ip_rpm = env_parsed("RTDB_STORAGE_RATE_LIMIT_PER_IP_RPM", 0u32)?;
 
         // SEC-113: require a valid signed URL on every public storage fetch.
         // Default false (Convex-parity: opaque public bearer URLs); operators
-        // who want signed-only access flip it on. Same truthy parse as the
-        // other boot flags.
-        let storage_require_signed_urls = match std::env::var("RTDB_STORAGE_REQUIRE_SIGNED_URLS") {
-            Ok(v) => matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes"),
-            Err(_) => false,
-        };
+        // who want signed-only access flip it on.
+        let storage_require_signed_urls = env_bool("RTDB_STORAGE_REQUIRE_SIGNED_URLS", false);
 
         // Managed pg_dump backup scheduler. Default off; cron/dir/retention
         // carry their own defaults so an operator can flip just
@@ -394,10 +399,7 @@ impl Config {
         // retention. An empty RTDB_BACKUP_CRON falls back to the default
         // (a blank cron would surface as `invalid cron expression` from
         // `scheduler::next_fire` on every loop iteration, so clamp here).
-        let backup_enabled = match std::env::var("RTDB_BACKUP_ENABLED") {
-            Ok(v) => matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes"),
-            Err(_) => false,
-        };
+        let backup_enabled = env_bool("RTDB_BACKUP_ENABLED", false);
         let backup_cron = match std::env::var("RTDB_BACKUP_CRON") {
             Ok(v) if !v.trim().is_empty() => v,
             _ => "0 3 * * *".to_string(),
@@ -406,167 +408,80 @@ impl Config {
             Ok(v) if !v.trim().is_empty() => v,
             _ => "./backups".to_string(),
         };
-        let backup_retention = match std::env::var("RTDB_BACKUP_RETENTION") {
-            Ok(v) => v.parse::<u32>().unwrap_or(7),
-            Err(_) => 7,
-        };
+        let backup_retention = env_parsed("RTDB_BACKUP_RETENTION", 7u32)?;
 
-        // Skip verification: ships ON at DEFAULT_SUBS_VERIFY_SKIP_EVERY (ARC-101).
-        // A wrong skip is otherwise silent, so the verifier is the runtime
-        // detection for the documented silent-failure mode. Both a missing var
-        // and an unparseable value fall back to the default (not 0), so a typo
-        // cannot silently disable the safety net (pre-empts ARC-118).
-        let subs_verify_skip_every = match std::env::var("RTDB_SUBS_VERIFY_SKIP_EVERY") {
-            Ok(v) => v
-                .trim()
-                .parse::<u64>()
-                .unwrap_or(DEFAULT_SUBS_VERIFY_SKIP_EVERY),
-            Err(_) => DEFAULT_SUBS_VERIFY_SKIP_EVERY,
-        };
+        // Skip verification: ships ON at DEFAULT_SUBS_VERIFY_SKIP_EVERY
+        // (ARC-101). A wrong skip is otherwise silent, so the verifier is the
+        // runtime detection for the documented silent-failure mode. A typo in
+        // the value now fails boot (ARC-118 via `env_parsed`) rather than
+        // silently reverting to the default.
+        let subs_verify_skip_every = env_parsed(
+            "RTDB_SUBS_VERIFY_SKIP_EVERY",
+            DEFAULT_SUBS_VERIFY_SKIP_EVERY,
+        )?;
 
-        // Document TTL reaper. Best-effort expiry, so boot-only (not hot). An
-        // unparseable value falls back to the default, matching the parses above.
-        let ttl_sweep_interval_secs = match std::env::var("RTDB_TTL_SWEEP_INTERVAL_SECS") {
-            Ok(v) => v.parse::<u64>().unwrap_or(60),
-            Err(_) => 60,
-        };
+        // Document TTL reaper. Best-effort expiry, so boot-only (not hot).
         // `tokio::time::interval` panics on a zero duration, so an explicit 0
-        // would crash every db's reaper task on its first poll.
-        let ttl_sweep_interval_secs = ttl_sweep_interval_secs.max(1);
-        let ttl_batch = match std::env::var("RTDB_TTL_BATCH") {
-            Ok(v) => v.parse::<i64>().unwrap_or(5000),
-            Err(_) => 5000,
-        };
+        // would crash every db's reaper task on its first poll — clamp to 1.
         // `DELETE ... LIMIT 0` is a silent no-op (disables reaping) and a
-        // negative batch errors per sweep, so clamp both to at least 1.
-        let ttl_batch = ttl_batch.max(1);
+        // negative batch errors per sweep, so clamp the batch to at least 1.
+        let ttl_sweep_interval_secs = env_parsed("RTDB_TTL_SWEEP_INTERVAL_SECS", 60u64)?.max(1);
+        let ttl_batch = env_parsed("RTDB_TTL_BATCH", 5000i64)?.max(1);
 
         // On-the-fly image transforms on storage serve (ENH-014). Boot-only
-        // operational knobs. Default-on (mirror the login-CSRF block above);
-        // numerics follow the `ttl_batch` `.unwrap_or(default)` + clamp idiom.
-        let image_transforms_enabled = match std::env::var("RTDB_IMAGE_TRANSFORMS_ENABLED") {
-            Ok(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "false" | "0" | "no"),
-            Err(_) => true,
-        };
-        let image_max_dim = match std::env::var("RTDB_IMAGE_MAX_DIM") {
-            Ok(v) => v.trim().parse::<u32>().unwrap_or(2048).clamp(1, 8192),
-            Err(_) => 2048,
-        };
-        let image_max_pixels = match std::env::var("RTDB_IMAGE_MAX_PIXELS") {
-            Ok(v) => v.trim().parse::<u64>().unwrap_or(25_000_000).max(1_000_000),
-            Err(_) => 25_000_000,
-        };
-        let image_cache_bytes = match std::env::var("RTDB_IMAGE_CACHE_BYTES") {
-            Ok(v) => v.trim().parse::<u64>().unwrap_or(256 * 1024 * 1024),
-            Err(_) => 256 * 1024 * 1024,
-        };
-        let image_concurrency = match std::env::var("RTDB_IMAGE_CONCURRENCY") {
-            Ok(v) => v.trim().parse::<usize>().unwrap_or(4).max(1),
-            Err(_) => 4,
-        };
-        let image_default_quality = match std::env::var("RTDB_IMAGE_DEFAULT_QUALITY") {
-            Ok(v) => v.trim().parse::<u8>().unwrap_or(80).clamp(1, 100),
-            Err(_) => 80,
-        };
+        // operational knobs; default-on master switch + bounded numerics.
+        let image_transforms_enabled = env_bool("RTDB_IMAGE_TRANSFORMS_ENABLED", true);
+        let image_max_dim = env_parsed("RTDB_IMAGE_MAX_DIM", 2048u32)?.clamp(1, 8192);
+        let image_max_pixels = env_parsed("RTDB_IMAGE_MAX_PIXELS", 25_000_000u64)?.max(1_000_000);
+        let image_cache_bytes = env_parsed("RTDB_IMAGE_CACHE_BYTES", 256 * 1024 * 1024u64)?;
+        let image_concurrency = env_parsed("RTDB_IMAGE_CONCURRENCY", 4usize)?.max(1);
+        let image_default_quality = env_parsed("RTDB_IMAGE_DEFAULT_QUALITY", 80u8)?.clamp(1, 100);
 
-        // Realtime presence (ENH-015). Default-ON master switch
-        // (image-transforms style: anything but an explicit false/0/no stays
-        // on) + numerics following the `ttl_batch` `.unwrap_or(default)` +
-        // `.max(1)` clamp idiom (a 0 size/count/limit would be unusable; a 0
-        // broadcast interval means "immediate", so it is NOT clamped).
-        let presence_enabled = match std::env::var("RTDB_PRESENCE_ENABLED") {
-            Ok(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "false" | "0" | "no"),
-            Err(_) => true,
-        };
-        let presence_max_state_bytes = std::env::var("RTDB_PRESENCE_MAX_STATE_BYTES")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(1024)
-            .max(1);
-        let presence_max_room_size = std::env::var("RTDB_PRESENCE_MAX_ROOM_SIZE")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(100)
-            .max(1);
-        let presence_max_rooms_per_conn = std::env::var("RTDB_PRESENCE_MAX_ROOMS_PER_CONN")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(32)
-            .max(1);
-        let presence_max_room_bytes = std::env::var("RTDB_PRESENCE_MAX_ROOM_BYTES")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(256)
-            .max(1);
-        let presence_broadcast_interval_ms = std::env::var("RTDB_PRESENCE_BROADCAST_INTERVAL_MS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(50);
-        let presence_update_limit_per_sec = std::env::var("RTDB_PRESENCE_UPDATE_LIMIT_PER_SEC")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(20)
-            .max(1);
-        let presence_max_ttl_ms = std::env::var("RTDB_PRESENCE_MAX_TTL_MS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(300_000)
-            .max(1000);
+        // Realtime presence (ENH-015). Default-ON master switch + numerics;
+        // a 0 size/count/limit would be unusable (clamped to ≥1), and a 0
+        // broadcast interval means "immediate" (NOT clamped).
+        let presence_enabled = env_bool("RTDB_PRESENCE_ENABLED", true);
+        let presence_max_state_bytes =
+            env_parsed("RTDB_PRESENCE_MAX_STATE_BYTES", 1024usize)?.max(1);
+        let presence_max_room_size = env_parsed("RTDB_PRESENCE_MAX_ROOM_SIZE", 100usize)?.max(1);
+        let presence_max_rooms_per_conn =
+            env_parsed("RTDB_PRESENCE_MAX_ROOMS_PER_CONN", 32usize)?.max(1);
+        let presence_max_room_bytes = env_parsed("RTDB_PRESENCE_MAX_ROOM_BYTES", 256usize)?.max(1);
+        let presence_broadcast_interval_ms =
+            env_parsed("RTDB_PRESENCE_BROADCAST_INTERVAL_MS", 50u64)?;
+        let presence_update_limit_per_sec =
+            env_parsed("RTDB_PRESENCE_UPDATE_LIMIT_PER_SEC", 20u32)?.max(1);
+        let presence_max_ttl_ms = env_parsed("RTDB_PRESENCE_MAX_TTL_MS", 300_000u64)?.max(1000);
 
-        // Anonymous auth master switch. Default-OFF (opt-in per app); any of
-        // "false"/"0"/"no" (case-insensitive) disables, everything else (incl.
-        // unset) leaves it off — the inverse of presence_enabled's default-true.
-        let auth_anonymous_enabled = matches!(
-            std::env::var("RTDB_AUTH_ANONYMOUS_ENABLED")
-                .ok()
-                .map(|v| v.trim().to_ascii_lowercase()),
-            Some(v) if !matches!(v.as_str(), "false" | "0" | "no")
-        );
+        // Anonymous auth master switch. Default-OFF (opt-in per app): only an
+        // explicit truthy spelling ("true"/"1"/"yes") enables it; everything
+        // else (incl. unset) leaves it off. `env_bool` enforces this so a typo
+        // cannot enable anonymous auth.
+        let auth_anonymous_enabled = env_bool("RTDB_AUTH_ANONYMOUS_ENABLED", false);
 
         // SEC-103: short independent TTL for anonymous sessions so the
         // ephemeral rows minted by the unauthenticated anon route expire
-        // quickly rather than living for the standard 30-day TTL. Default 1
-        // day; an unparseable value falls back to 1.
-        let anonymous_session_ttl_days = match std::env::var("RTDB_ANONYMOUS_SESSION_TTL_DAYS") {
-            Ok(v) => v.parse::<i64>().unwrap_or(1),
-            Err(_) => 1,
-        };
+        // quickly rather than living for the standard 30-day TTL. Default 1.
+        let anonymous_session_ttl_days = env_parsed("RTDB_ANONYMOUS_SESSION_TTL_DAYS", 1i64)?;
         // SEC-103: per-IP rate limit on `POST /auth/anonymous`. 0 = unlimited
         // (the code default; the shipped `.env.example`/`docker-compose.yml`
         // set a non-zero default so the mitigation is on out-of-the-box).
         let anonymous_rate_limit_per_ip_rpm =
-            match std::env::var("RTDB_ANONYMOUS_RATE_LIMIT_PER_IP_RPM") {
-                Ok(v) => v.parse::<u32>().unwrap_or(0),
-                Err(_) => 0,
-            };
+            env_parsed("RTDB_ANONYMOUS_RATE_LIMIT_PER_IP_RPM", 0u32)?;
 
-        // Quota counter cache TTL (ENH-011). 0 = no caching. An unparseable
-        // value falls back to the default, matching the parses above.
-        let quota_cache_ttl_secs = match std::env::var("RTDB_QUOTA_CACHE_TTL_SECS") {
-            Ok(v) => v.parse::<u64>().unwrap_or(60),
-            Err(_) => 60,
-        };
+        // Quota counter cache TTL (ENH-011). 0 = no caching.
+        let quota_cache_ttl_secs = env_parsed("RTDB_QUOTA_CACHE_TTL_SECS", 60u64)?;
 
         // SEC-109: per-IP rate limit on `POST /admin/login`. 0 = unlimited
-        // (the default), preserving today's behavior. Unparseable values fall
-        // back to 0 (off), matching the other rate-limit parses — an operator
-        // who sets a non-numeric value gets the safe default, not a surprise
-        // lockout.
-        let admin_rate_limit_per_ip_rpm = match std::env::var("RTDB_ADMIN_RATE_LIMIT_PER_IP_RPM") {
-            Ok(v) => v.parse::<u32>().unwrap_or(0),
-            Err(_) => 0,
-        };
+        // (the default), preserving today's behavior.
+        let admin_rate_limit_per_ip_rpm = env_parsed("RTDB_ADMIN_RATE_LIMIT_PER_IP_RPM", 0u32)?;
 
         // SEC-120: cookie `Secure` attribute ships ON by default. An explicit
         // "false"/"0"/"no" (case-insensitive) is the local-http-dev escape
-        // hatch (the browser rejects Secure cookies over plain http). Anything
-        // else, including unset, stays on so production never accidentally sends
-        // a session cookie in the clear when a proxy strips
-        // `X-Forwarded-Proto`.
-        let cookie_secure = match std::env::var("RTDB_COOKIE_SECURE") {
-            Ok(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "false" | "0" | "no"),
-            Err(_) => true,
-        };
+        // hatch (the browser rejects Secure cookies over plain http); anything
+        // else stays on so production never accidentally sends a session
+        // cookie in the clear when a proxy strips `X-Forwarded-Proto`.
+        let cookie_secure = env_bool("RTDB_COOKIE_SECURE", true);
 
         Ok(Self {
             port,
@@ -1123,6 +1038,7 @@ mod tests {
             let saved_db = std::env::var("RTDB_DATABASE_URL").ok();
             let saved_key = std::env::var("RTDB_ADMIN_KEY").ok();
             let saved_admin_limit = std::env::var("RTDB_ADMIN_RATE_LIMIT_PER_IP_RPM").ok();
+            let saved_max = std::env::var("RTDB_MAX_AFFECTED_DOCS").ok();
             std::env::set_var("RTDB_DATABASE_URL", "postgres://test");
             // SEC-110: the boot validator (validate_admin_key) rejects keys
             // shorter than 16 chars, so use a key that clears the floor.
@@ -1160,7 +1076,11 @@ mod tests {
             assert!(!c.presence_enabled);
 
             // SEC-109: RTDB_ADMIN_RATE_LIMIT_PER_IP_RPM defaults to 0 (off)
-            // and parses a non-zero override; unparseable falls back to 0.
+            // and parses a non-zero override. ARC-118 (folded with QA-106):
+            // a present-but-unparseable value now fails boot loudly via
+            // `env_parsed` instead of silently reverting to the default — the
+            // silent-default-on-typo failure mode that could disable a safety
+            // net (e.g. RTDB_SUBS_VERIFY_SKIP_EVERY, ARC-101).
             std::env::remove_var("RTDB_ADMIN_RATE_LIMIT_PER_IP_RPM");
             let c = Config::from_env().expect("from_env with required vars set");
             assert_eq!(c.admin_rate_limit_per_ip_rpm, 0, "default is 0 = off");
@@ -1168,11 +1088,31 @@ mod tests {
             let c = Config::from_env().expect("from_env with required vars set");
             assert_eq!(c.admin_rate_limit_per_ip_rpm, 10);
             std::env::set_var("RTDB_ADMIN_RATE_LIMIT_PER_IP_RPM", "not-a-number");
-            let c = Config::from_env().expect("from_env with required vars set");
-            assert_eq!(
-                c.admin_rate_limit_per_ip_rpm, 0,
-                "unparseable falls back to 0"
+            let err = Config::from_env()
+                .expect_err("ARC-118: malformed numeric must fail boot, not default");
+            assert!(
+                err.contains("RTDB_ADMIN_RATE_LIMIT_PER_IP_RPM"),
+                "error names the var: {err}"
             );
+            // Clear the malformed value so it doesn't leak into the next block.
+            std::env::remove_var("RTDB_ADMIN_RATE_LIMIT_PER_IP_RPM");
+
+            // ARC-118: same contract for a different numeric knob. A malformed
+            // RTDB_MAX_AFFECTED_DOCS (a stand-in for every numeric knob now
+            // routed through env_parsed, including the ARC-101 safety net
+            // RTDB_SUBS_VERIFY_SKIP_EVERY) must fail boot naming the var and the
+            // bad value, instead of silently reverting to the default — the
+            // failure mode that could disable a safety net on a typo.
+            std::env::set_var("RTDB_MAX_AFFECTED_DOCS", "abc");
+            let err = Config::from_env()
+                .expect_err("ARC-118: malformed numeric must fail boot, not default");
+            assert!(
+                err.contains("RTDB_MAX_AFFECTED_DOCS"),
+                "error names the var: {err}"
+            );
+            assert!(err.contains("abc"), "error names the bad value: {err}");
+            // Clear so it doesn't leak into the SEC-110 block below.
+            std::env::remove_var("RTDB_MAX_AFFECTED_DOCS");
 
             // SEC-110: from_env rejects empty/short admin keys at boot.
             std::env::set_var("RTDB_ADMIN_KEY", "");
@@ -1206,6 +1146,10 @@ mod tests {
             match saved_admin_limit {
                 Some(v) => std::env::set_var("RTDB_ADMIN_RATE_LIMIT_PER_IP_RPM", v),
                 None => std::env::remove_var("RTDB_ADMIN_RATE_LIMIT_PER_IP_RPM"),
+            }
+            match saved_max {
+                Some(v) => std::env::set_var("RTDB_MAX_AFFECTED_DOCS", v),
+                None => std::env::remove_var("RTDB_MAX_AFFECTED_DOCS"),
             }
         }
     }

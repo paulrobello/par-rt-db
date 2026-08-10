@@ -158,7 +158,7 @@ impl AppState {
         // Presence manager (ENH-015) shares the same `Arc<Metrics>` so its
         // update/broadcast counters surface on the dashboard. It is a sibling
         // of the committer, NOT routed through it: the periodic flush task is
-        // spawned only when `presence_enabled` (default off) — a disabled
+        // spawned only when `presence_enabled` (default on) — a disabled
         // server still has the manager (so `presenceErr` works) but no
         // spinning task. Built before the struct literal so `metrics` can
         // still move into Runtime.
