@@ -541,26 +541,7 @@ impl InMemoryRtDbClient {
             return paginate_result(pag, &table_def, &filtered, &sort_cols, &col_types, dir);
         }
 
-        if q.unique {
-            if filtered.len() > 1 {
-                return Err(RtDbError::new(
-                    ErrorCode::PreconditionFailed,
-                    "unique query matched multiple documents",
-                ));
-            }
-            return Ok(filtered.first().map(merge_doc).unwrap_or(Value::Null));
-        }
-        if q.first {
-            return Ok(filtered.first().map(merge_doc).unwrap_or(Value::Null));
-        }
-
-        let limit = q.take.map(|t| t as usize).unwrap_or(MAX_TAKE);
-        let out: Vec<Value> = filtered
-            .into_iter()
-            .take(limit)
-            .map(|row| merge_doc(&row))
-            .collect();
-        Ok(Value::Array(out))
+        self.execute_collect_terminal(q, filtered)
     }
 
     /// `get` terminal — exclusive of every other clause.
@@ -1000,6 +981,37 @@ impl InMemoryRtDbClient {
             return Ok(Value::Null);
         }
         Ok(apply_aggregate(agg.op, &values, agg_field_pg))
+    }
+
+    /// `collect` tail of `run_query` — the fallthrough after every standalone
+    /// terminal: `unique` (PreconditionFailed on >1 match), `first`, or
+    /// `take`-bounded `collect`. Mirrors the server/ts/python
+    /// `executeCollect` terminal.
+    fn execute_collect_terminal(
+        &self,
+        q: &Query,
+        filtered: Vec<StoredRow>,
+    ) -> Result<Value, RtDbError> {
+        if q.unique {
+            if filtered.len() > 1 {
+                return Err(RtDbError::new(
+                    ErrorCode::PreconditionFailed,
+                    "unique query matched multiple documents",
+                ));
+            }
+            return Ok(filtered.first().map(merge_doc).unwrap_or(Value::Null));
+        }
+        if q.first {
+            return Ok(filtered.first().map(merge_doc).unwrap_or(Value::Null));
+        }
+
+        let limit = q.take.map(|t| t as usize).unwrap_or(MAX_TAKE);
+        let out: Vec<Value> = filtered
+            .into_iter()
+            .take(limit)
+            .map(|row| merge_doc(&row))
+            .collect();
+        Ok(Value::Array(out))
     }
 }
 
