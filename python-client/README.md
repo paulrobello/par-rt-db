@@ -19,17 +19,22 @@ Package name: `par-rt-db` → in Python, `import par_rt_db`.
 | Core wire types (`ClientMessage`, `ServerMessage`, `ScheduleWhen`, `FilterExpr`, …) | shipped | `par_rt_db.wire` |
 | Schema DSL (`SchemaDef`, `TableDef`, `t` field constructors, `SchemaBuilder`) | shipped | `par_rt_db.schema` |
 | Query DSL (`Query`, `TableQuery` builder, `Paginated`, `parse_result`) | shipped | `par_rt_db.query` |
-| Mutation DSL (`Mutation` builder, `Transaction`, `StepResult`, 7 step ops) | shipped | `par_rt_db.mutation` |
+| Mutation DSL (`Mutation` builder, `Transaction`, `StepResult`, 9 step ops) | shipped | `par_rt_db.mutation` |
 | Cursor codec (`encode_cursor` / `decode_cursor`) | shipped | `par_rt_db.cursor` |
 | Error model (`RtDbError`, `ErrorCode`, `retry_on_precondition`) | shipped | `par_rt_db.errors` |
 | HTTP / admin / storage client (`RtDbHttpClient`, sync `httpx`) | shipped | `par_rt_db.http_client` (`[http]` extra) |
 | Async HTTP / admin / storage client (`RtDbAsyncHttpClient`, `httpx.AsyncClient`) | shipped | `par_rt_db.aio_http_client` (`[aio]` extra) |
 | Reactive WebSocket client (`RtDbClient`, `Subscription`) | shipped | `par_rt_db.ws_client` (`[ws]` extra) |
+| Admin control plane (`RtDbAdminClient` — db/token/schema allowlist CRUD, webhooks, metrics, hot config, sessions, backups, snapshot export/import) | shipped | `par_rt_db.admin` (`[http]` extra) |
+| In-memory test harness (`InMemoryRtDbClient` — no network, no Postgres) | shipped | `par_rt_db.in_memory` |
+| Optimistic local-state updates (`OptimisticStore` for read-modify-write UI loops) | shipped | `par_rt_db.optimistic` |
 
 The DSL layer is feature-complete: every server query terminal
 (`get`/`index`+`eq`/`gt`/`gte`/`lt`/`lte`/`order`/`take`/`unique`/`first`/`count`/
-`filter`/`search`/`vector_search`/`paginate`) and every mutation step
-(`insert`/`patch`/`replace`/`delete`/`expectVersion`/`expectAbsent`/`upsert`)
+`collect`/`distinct`/`aggregate`/`filter`/`search`/`vector_search`/`hybrid_search`/`paginate`)
+and every mutation step
+(`insert`/`patch`/`replace`/`delete`/`expectVersion`/`expectAbsent`/`upsert`
+per-id steps, plus the `patch_by_query`/`delete_by_query` bulk steps)
 has a builder method that produces a wire-identical payload. Pydantic v2
 `extra="forbid"` mirrors the server's `deny_unknown_fields` on every variant.
 
@@ -92,7 +97,7 @@ payload = txn.model_dump(by_alias=True, exclude_none=True)
 # => {"steps": [{"op": "insert", "table": "items", "doc": {...}}, ...]}
 ```
 
-The builder caps at 256 steps (matching `server/src/txn.rs::MAX_STEPS`) and
+The builder caps at 1024 steps (matching `server/src/txn.rs::MAX_STEPS`) and
 raises `ValueError` eagerly so an over-cap transaction never reaches the wire.
 Add `expect_version` / `expect_absent` preconditions for optimistic-concurrency
 patterns; combine with `retry_on_precondition` from `par_rt_db.errors` for

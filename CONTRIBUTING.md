@@ -14,6 +14,7 @@ notes), see [`CLAUDE.md`](CLAUDE.md).
 - [Style and formatting](#style-and-formatting)
 - [Commit messages](#commit-messages)
 - [Pre-commit hooks](#pre-commit-hooks)
+- [Troubleshooting](#troubleshooting)
 - [Invariants you must preserve](#invariants-you-must-preserve)
 - [Pull request checklist](#pull-request-checklist)
 
@@ -175,6 +176,31 @@ You can run the full hook set on demand: `make pre-commit`. Never commit a
 real secret — if one slips in, force-push to remove it from history, rotate
 the secret, and audit logs for misuse.
 
+## Troubleshooting
+
+Common contributor symptoms:
+
+- **`make test` fails to connect to Postgres on `127.0.0.1:55434`, or two
+  worktrees collide on the port.** The dev Postgres is shared across worktrees,
+  so only one `make dev-db-up` can hold port `55434` at a time. If you work in a
+  git worktree, reuse the already-running dev Postgres from the main checkout
+  rather than starting a second one. `docker ps` shows whether it is up; the
+  integration tests hit it directly, never an exclusive instance.
+- **`make typecheck` fails on a fresh checkout because the dashboard can't
+  resolve `@par-rt-db/client`.** The dashboard links the SDK from
+  `ts-client/dist`, which is gitignored and rebuilt on demand. Run
+  `make ts-client-build` (or `make build`) first to populate `dist`.
+- **`uv run pyright` reports missing stubs/dependencies in `python-client/`.**
+  The type checker needs the optional extras installed. Run
+  `uv sync --all-extras` in `python-client/` so the `[http]`/`[aio]`/`[ws]`
+  extras and their deps (`httpx`, `websockets`) are visible to pyright, not just
+  the default dev group.
+- **`git commit` is killed mid-hook (staged but not committed).** The
+  pre-commit clippy pass can take longer than a short shell timeout. Re-run the
+  commit with a longer timeout (e.g. 600000 ms) rather than re-running it
+  unchanged; the staged changes are intact and recoverable. Do not
+  `--no-verify` past it — run `make checkall` and fix the underlying warning.
+
 ## Invariants you must preserve
 
 These are the load-bearing rules. Violating them silently is worse than a
@@ -226,6 +252,7 @@ When a feature lands or changes, update in the same PR:
 - [`FEATURE_MATRIX.md`](FEATURE_MATRIX.md) — flip rows ❌→✅, note client-mirror status, bump counts.
 - The relevant README(s) (`README.md`, `server/README.md`, `ts-client/README.md`, `rust-client/README.md`, `python-client/README.md`, `dashboard/README.md`, `deploy/README.md`).
 - [`CHANGELOG.md`](CHANGELOG.md) — add an entry under `[Unreleased]`.
+- [`docs/DOCUMENTATION_STYLE_GUIDE.md`](docs/DOCUMENTATION_STYLE_GUIDE.md) — the canonical style guide for all par-rt-db documentation (formatting, headings, tone, code-block conventions). Follow it for any documentation change.
 - Any skill that documents par-rt-db's surface.
 
 A stale doc that contradicts the code is a bug.

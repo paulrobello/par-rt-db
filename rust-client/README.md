@@ -24,6 +24,9 @@ server.
 
 The `http` surface also carries `.filter()` / `.search()` / `.vector_search()`
 query builders (predicate, full-text, and vector-similarity terminals), the
+`.hybrid_search()` fused full-text+vector terminal (Reciprocal Rank Fusion),
+`.distinct()` (collapse duplicates on a field set), and `.aggregate()` (grouped
+`sum`/`avg`/`min`/`max`/`count`) terminals, the
 `mutate_with_retry` precondition-conflict helper, `upsert_by_index` /
 `find_one_by_index` shortcuts, and `validate_session_token` for session
 validation. `search_index()` declares a full-text index in a `Schema`,

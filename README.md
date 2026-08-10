@@ -1,5 +1,8 @@
 # par-rt-db
 
+[![CI](https://github.com/paulrobello/par-rt-db/actions/workflows/ci.yml/badge.svg)](https://github.com/paulrobello/par-rt-db/actions/workflows/ci.yml)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 A self-hosted, Convex-inspired realtime document database. Clients send a
 **declarative JSON DSL** — typed queries and atomic multi-step transactions — over
 WebSocket (`/sync`) or one-shot HTTP; the server executes them and pushes live query
@@ -7,6 +10,31 @@ updates on change. There is no embedded JS runtime and no per-app server code �
 generic server hosts many named databases for every app. Built in Rust on axum/tokio
 with Postgres 17 storage. Authoritative design:
 [`docs/superpowers/specs`](docs/superpowers/specs).
+
+## Table of contents
+
+- [Packages](#packages)
+- [How it works](#how-it-works)
+- [Quickstart](#quickstart)
+- [Endpoints](#endpoints)
+- [Configuration](#configuration)
+- [Error envelope](#error-envelope)
+- [Wire protocol](#wire-protocol)
+- [Pagination](#pagination)
+- [Scheduling](#scheduling)
+- [Realtime presence](#realtime-presence)
+- [Make targets](#make-targets)
+- [Graceful shutdown](#graceful-shutdown)
+- [Known MVP limitations](#known-mvp-limitations)
+- [Clients](#clients)
+- [Contributing](#contributing)
+- [License](#license)
+
+Related documentation: [`CHANGELOG.md`](CHANGELOG.md), [`DESIGN.md`](DESIGN.md),
+[`PRODUCT.md`](PRODUCT.md), [`FEATURE_MATRIX.md`](FEATURE_MATRIX.md),
+[`deploy/README.md`](deploy/README.md) (production runbook),
+[`docs/README.md`](docs/README.md) (docs index),
+[`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 ## Packages
 
@@ -309,8 +337,7 @@ and swapable via `PATCH /admin/config` without a restart): `allowed_origins`,
 per-database quota caps `max_tables_per_db` / `max_storage_bytes_per_db` /
 `max_subs_per_db` (`0` = unlimited, ENH-011). The full set of boot-time vars —
 OAuth, rate limits, scheduling, presence, image transforms, backups, audit,
-webhooks, storage dedup, search language, vector distance, and more — is
-annotated in [`.env.example`](.env.example). `RTDB_ALLOWED_ORIGINS` is also the
+webhooks, and more — is annotated in [`.env.example`](.env.example). `RTDB_ALLOWED_ORIGINS` is also the
 exact-match CORS allowlist for `/api/*` and `/auth/*` (GET, POST, OPTIONS;
 `authorization` and `content-type` headers). Each OAuth provider is only active
 when both its client id and secret are set; a half-configured pair is treated
@@ -439,7 +466,7 @@ The `paginate` terminal composes with `index`, `eq`, range bounds (`gt`/`gte`/
 `lt`/`lte`), and `order`, and is mutually exclusive with `get`, `take`, `unique`,
 `first`, and `count`. `numItems` is capped at 4096 (`MAX_TAKE`).
 
-### Query shape
+### Pagination query shape
 
 ```jsonc
 // First page — cursor omitted
@@ -698,7 +725,19 @@ fetches on first build.
 
 `make dev-db-up` (a prerequisite of `make test`) starts the dev Postgres on
 `127.0.0.1:55434` via `docker-compose.dev.yml` and waits for it to be healthy.
-`make dev-db-down` stops it.
+`make dev-db-down` stops it. `make dev-db-clean` drops leaked test schemas
+(`db_t<uuid-v7>`) from the dev `rtdb` DB — tests create a database per test and
+don't drop it, so the dev DB bloats over time; run this periodically (it is
+scoped to the test pattern and never touches `rtdb`/`rtdb_auth`/real databases).
+
+### Other workflow targets
+
+| Target | Purpose |
+| --- | --- |
+| `make ts-client-build` | Builds `ts-client/dist` (gitignored). Run on a fresh or stale checkout before `typecheck`/`build` — the dashboard resolves `@par-rt-db/client` from `dist`. `build` and `typecheck` pull this first. |
+| `make env-drift-check` | First stage of `checkall`. Fails when a `RTDB_*` var documented in `.env.example` or read by the server is not forwarded to the container by `docker-compose.yml`'s `environment:` block (an explicit allowlist, so a `.env`-only key silently does nothing). |
+| `make rtdb-cli` | Builds the `rtdb` CLI release binary (`cli/`, wraps `par-rt-db-client`). |
+| `make dev-db-clean` | Drops leaked test schemas from the dev Postgres (see above). |
 
 ### The gate
 

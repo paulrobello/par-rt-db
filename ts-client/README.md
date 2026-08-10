@@ -26,10 +26,18 @@ export const schema = defineSchema({
 });
 ```
 
-A table can declare an owner field for opt-in per-row authorization
-(server-enforced on read, mutate, and subscription re-run; machine tokens
-bypass): `.ownerField("userId")` names a declared, string-compatible field
-holding the owner's `user_id`.
+A table can declare opt-in per-row authorization (server-enforced on read,
+mutate, and subscription re-run; machine tokens bypass):
+
+- `.ownerField("userId")` — names a declared, string-compatible field holding
+  the owner's `user_id`.
+- `.collaboratorsField("memberIds")` — names an array-of-strings field; a
+  principal reads/mutates a row if they own it **or** are listed in it.
+- `.authorize(expr)` — a general `FilterExpr` predicate over doc fields plus
+  `$user`/`$email` principal markers (e.g. `.authorize({ field: "userId", eq:
+  "$user" })`).
+- `.ttl({ field: "expiresAt" })` — declares a document-TTL field; the server's
+  per-db reaper deletes rows whose field value is past.
 
 Push it with the admin client (admin key required):
 
@@ -87,6 +95,16 @@ unless you have a specific reason and have audited your CSP / dependency
 surface; prefer cookie mode. Machine tokens minted via the admin API are the
 right choice for server-to-server (`Node / CLI`) callers, where `localStorage`
 does not apply.
+
+For a credential-less guest, `useRtDbAuth().signInAnonymous()` (or
+`RtDbClient.signInAnonymous()` outside React) mints an ephemeral anonymous
+session — gated by the server's `RTDB_AUTH_ANONYMOUS_ENABLED` boot flag (default
+off ⇒ `403`). It sets the same HttpOnly cookie **and** returns the plaintext
+session token for the SDK/bearer path; an anonymous user owns its own documents
+via per-row `ownerField`. The admin client (`RtDbAdminClient`) additionally
+exposes the active-session management surface — `listSessions({ user?, limit? })`
+and `revokeSession(tokenHash)` / `revokeSessionsForUser(user)` — mirroring
+`GET/DELETE /admin/sessions`.
 
 ## Node / CLI
 
@@ -190,12 +208,15 @@ HTTP) expose file storage; `InMemoryRtDbClient` mirrors it in memory:
 const { id } = await db.upload(bytes, "image/png");   // → { id, sha256, size, contentType }
 db.getUrl(id);                                         // public URL for <img src> — no fetch
 const meta = await db.getFileMetadata(id);             // { id, sha256, size, contentType?, creationTime }
+const { url, expiresAt } = await db.getSignedUrl(id, { ttlSeconds: 3600 }); // signed, time-limited public URL
 await db.deleteFile(id);                               // revokes the public URL
 ```
 
 `upload` POSTs raw bytes to `POST /api/storage/{db}` (the client injects its own
 db); `getUrl` returns `${url}/storage/${id}` for the browser to fetch with no
-token. Storage is HTTP-only (no reactive updates).
+token; `getSignedUrl` calls `GET /api/storage/{db}/{id}/signed-url?ttlSeconds=`
+to mint an HMAC-signed, time-limited public URL. Storage is HTTP-only (no
+reactive updates).
 
 ## In-memory test client
 
