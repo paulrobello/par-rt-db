@@ -237,9 +237,9 @@ audit, and webhooks all fire.
 ```python
 from par_rt_db import Cast, Migration
 from par_rt_db.schema import t
-from par_rt_db.http_client import RtDbHttpClient
+from par_rt_db.admin import RtDbAdminClient
 
-admin = RtDbHttpClient("https://rtdb.pardev.net", admin_key=ADMIN_KEY)
+admin = RtDbAdminClient("https://rtdb.pardev.net", ADMIN_KEY)
 result = admin.migrate_schema(
     "kanban",
     Migration.builder()

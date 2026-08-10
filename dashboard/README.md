@@ -138,10 +138,14 @@ the design spec at
 ### The mutation cap
 
 Mutations submitted from the data browser are bounded by `RTDB_MAX_AFFECTED_DOCS`
-(server boot config, default **100**). A transaction whose step count exceeds
-the cap is rejected **before** the committer — an over-cap write never becomes
-durable. Each DSL step touches at most one document, so the cap is effectively a
-per-transaction document-count limit. Non-admin mutations are bounded only by a
-separate `MAX_STEPS = 256` and are not affected by this knob. Raise
-`RTDB_MAX_AFFECTED_DOCS` only if a documented workflow legitimately needs a
-larger single-transaction footprint.
+(server boot config, default **100**), which counts the worst-case number of
+documents a transaction could touch — not the raw step count. Per-id steps
+(`insert`/`patch`/`replace`/`delete`/`expectVersion`/`expectAbsent`/`upsert`)
+count one document each; each `patchByQuery`/`deleteByQuery` step counts up to
+its `limit` (default and ceiling `MAX_BY_QUERY_ROWS = 1000`). An over-budget
+transaction is rejected **before** the committer — an over-cap write never
+becomes durable. Non-admin mutations are bounded by `MAX_STEPS = 1024` (step
+count), `MAX_BY_QUERY_STEPS_PER_TXN = 16`, and a per-transaction aggregate
+budget of `MAX_AFFECTED_ROWS_PER_TXN = 10000` rows (SEC-104); none of those are
+affected by this knob. Raise `RTDB_MAX_AFFECTED_DOCS` only if a documented
+workflow legitimately needs a larger single-transaction footprint.

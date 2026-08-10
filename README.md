@@ -135,10 +135,11 @@ since browsers cannot set headers on a WS handshake.
 | Method & path | Auth | Description |
 | --- | --- | --- |
 | `GET /healthz` | none | Liveness: `{status:"ok"\|"degraded", version, git_commit, build_timestamp, started_at, uptime_seconds, postgres}`. 503 when Postgres is unreachable. |
+| `GET /metrics` | none | Prometheus text-exposition scrape endpoint. Content-negotiated on `Accept`: a browser (`text/html`) is served the SPA's `index.html` when `RTDB_STATIC_DIR` is set; everything else (Prometheus sends `application/openmetrics-text`, curl, API-only deploys) gets Prometheus text. Aggregate-only (no per-db, no principal data), same posture as `/healthz`. The admin JSON snapshot stays at `GET /admin/metrics`. |
 | `GET /sync` | first WS frame | WebSocket upgrade. Speaks the realtime protocol (auth, subscribe, mutate, schedule, ping). |
 | `POST /api/query` | Bearer token | One-shot query against a database; see [Query shape](#query-shape). |
 | `POST /api/query-batch` | Bearer token | Fans out N queries in one round trip (per-query error isolation); each slot returns `{ok, result}` or `{ok:false, error}`. |
-| `POST /api/mutate` | Bearer token | One-shot transaction (`insert`/`patch`/`replace`/`delete`/`expectVersion`/`expectAbsent`/`upsert` steps). |
+| `POST /api/mutate` | Bearer token | One-shot transaction (`insert`/`patch`/`replace`/`delete`/`expectVersion`/`expectAbsent`/`upsert` + `patchByQuery`/`deleteByQuery` steps). |
 | `POST /api/schedule` | Bearer token | Schedules a transaction: `afterMs`/`runAt` one-shot or `cron` (5-field, UTC, min-first); returns `{id}`. |
 | `POST /api/schedule/{id}/{cancel,pause,resume}` | Bearer token | Cancels, pauses, or resumes a scheduled job. |
 | `POST /api/schedules` | Bearer token | Lists scheduled jobs for a database (`ScheduleInfo[]`). |
@@ -152,6 +153,7 @@ since browsers cannot set headers on a WS handshake.
 | `GET /api/storage/{db}/{id}` | Bearer token | Authed, caller-db-scoped serve. |
 | `DELETE /api/storage/{db}/{id}` | Bearer token | Deletes a blob (idempotent; revokes the public URL). |
 | `GET /api/storage/{db}/{id}/metadata` | Bearer token | `{ id, sha256, size, contentType?, creationTime }`. |
+| `GET /api/storage/{db}/{id}/signed-url` | Bearer token | Mints a signed, time-limited public URL (`?exp=` + HMAC `?sig=`) for the blob. The mint is db-scoped: a caller authorized for db A cannot mint for a blob in db B (SEC-113). `?ttlSeconds=` clamps to `[1, MAX_SIGNED_URL_TTL_SECS]`; default `DEFAULT_SIGNED_URL_TTL_SECS`. The unauthenticated `GET /storage/{id}` route verifies `?exp=&sig=` when present (403 on failure) and behaves unchanged when absent (ENH-017). |
 
 Both serve routes honor HTTP `Range` requests: `Range: bytes=...` → `206 Partial Content` with `Content-Range`/`Content-Length` (and `Accept-Ranges: bytes` advertised), `416` for an out-of-bounds range, and a `200` full body when no range is requested. Single-range only; on-the-fly image transforms (`?w=` etc.) skip range handling.
 
@@ -231,6 +233,9 @@ loss is `DROP TABLE` for tables absent from the target snapshot, and migrate dat
 | `GET /admin/ops/recent` | Bearer admin key | Recent document-mutation op feed (durable). |
 | `GET /admin/audit?db=&limit=&offset=` | Bearer admin key | Audit log entries (`ts_ms, db, table, op, doc_id, principal, source`) — only when `RTDB_AUDIT_LOG_ENABLED=true`; 404 otherwise. |
 | `GET /admin/subscriptions` | Bearer admin key | Lists active subscriptions across all dbs (live query inspector). |
+| `GET /admin/sessions?user=&limit=` | Bearer admin key | Lists active interactive sessions (OAuth/anonymous/admin-key). `?user=` filters by `user_id` or email (omitted ⇒ all, server-wide); `?limit=` clamped to `[1, 1000]`, default 200. `token_hash` is a non-reversible sha256 digest, safe to surface. |
+| `DELETE /admin/sessions/{token_hash}` | Bearer admin key | Revokes a single session by its `token_hash` (takes effect on the next op over an already-open connection — `session_still_valid` re-queries on every interactive Subscribe/Mutate/Presence). |
+| `DELETE /admin/sessions?user=` | Bearer admin key | Revokes every session for a user. Requires `?user=` — a bare `DELETE` is a 400 (refuses to revoke every session instance-wide from one unscoped call). |
 | `WS /admin/stream` | Bearer admin key | Live op-feed stream over WebSocket (subprotocol auth for browsers). |
 | `GET /admin/config` | Bearer admin key | Hot config, redacted (`admin_key`/OAuth secrets/`database_url` → configured-bools only). |
 | `PATCH /admin/config` | Bearer admin key | Mutates `allowed_origins`/`session_ttl_days`/`max_file_size`/`idempotency_ttl_ms`/`max_tables_per_db`/`max_storage_bytes_per_db`/`max_subs_per_db`; validates, persists, swaps live (no restart). |
@@ -260,6 +265,7 @@ setup (callback URLs, scopes, env-var pairs).
 | `POST /auth/logout` | Bearer session | Deletes the session for the given bearer token. Idempotent: always 200 unless the delete query itself fails. |
 | `GET /auth/me` | Bearer session | Returns the authenticated user. 401 for a machine token (session only). |
 | `GET /auth/validate` | Bearer token | Validates a presented session or machine token; returns the `AuthedUser`. Used by backends to check a player-supplied token. |
+| `POST /auth/anonymous` | none | Mints an ephemeral anonymous user + session for a credential-less guest (gated by `RTDB_AUTH_ANONYMOUS_ENABLED`, default off ⇒ `403 FORBIDDEN`). Sets the `HttpOnly` session cookie (browser path) **and** returns the plaintext session token in the body (SDK/bearer path — pass it as the WS/HTTP bearer, exactly like a machine token). Per-IP rate-limited; an anonymous user is authorized for any database via that boot gate (no allowlist entry) and owns its own documents via per-row `ownerField` (the anon `user_id`). |
 
 The live login flow (SEC-012): the browser hits `GET /auth/{provider}/begin` →
 opens the provider authorize URL in a `noopener,noreferrer` popup (reverse-tabnabbing
@@ -319,37 +325,56 @@ Every error response — HTTP and WebSocket alike — is a JSON object:
 {"code": "NOT_FOUND", "message": "document 'abc' not found"}
 ```
 
-| `code`                | HTTP status |
-| --------------------- | ----------- |
-| `UNAUTHORIZED`        | 401         |
-| `FORBIDDEN`           | 403         |
-| `NOT_FOUND`           | 404         |
-| `SCHEMA_VIOLATION`    | 422         |
-| `PRECONDITION_FAILED` | 409         |
-| `BAD_REQUEST`         | 400         |
-| `INTERNAL`            | 500         |
+A `RATE_LIMITED` denial additionally carries a `retryAfter` field (seconds,
+mirrored as the HTTP `Retry-After` header); every other code omits it:
+
+```json
+{"code": "RATE_LIMITED", "message": "rate limit exceeded", "retryAfter": 42}
+```
+
+| `code`                | HTTP status | Notes |
+| --------------------- | ----------- | --- |
+| `BAD_REQUEST`         | 400         | Validation or step/budget rejection (e.g. over `MAX_STEPS` / `MAX_AFFECTED_ROWS_PER_TXN`). |
+| `UNAUTHORIZED`        | 401         | Missing/invalid/expired token or session. |
+| `FORBIDDEN`           | 403         | Per-row `ownerField`/`authorize` denial; anonymous auth disabled; signed-URL verification failure. |
+| `NOT_FOUND`           | 404         | Unknown document/file/route; cross-db storage mismatch is reported as 404 (no existence disclosure). |
+| `CONFLICT`            | 409         | `UNIQUE` index violation (`unique_violation`, SQLSTATE 23505) at `CREATE UNIQUE INDEX` time or on a colliding write. |
+| `PRECONDITION_FAILED` | 409         | `expectVersion` / `expectAbsent` guard failed. |
+| `SCHEMA_VIOLATION`    | 422         | Schema push / type-coercion rejection. |
+| `RATE_LIMITED`        | 429         | Per-token or per-db rate limit hit (HTTP and WS frames). Carries `retryAfter`; the WS connection stays open. |
+| `INTERNAL`            | 500         | Unexpected server error (generic message; detail logged via `tracing`). |
+| `QUOTA_EXCEEDED`      | 507         | Per-database resource cap hit (tables / storage bytes / concurrent subscriptions — ENH-011). |
 
 ## Wire protocol
 
 ### Query shape
 
 `{"table": "<name>", "get"?, "index"?, "eq"?, "order"?, "take"?, "unique"?, "first"?,
-"count"?, "filter"?, "search"?, "vectorSearch"?, "paginate"?, "distinct"?, "aggregate"?}`
+"count"?, "filter"?, "search"?, "vectorSearch"?, "hybridSearch"?, "paginate"?, "distinct"?, "aggregate"?}`
 — exactly one terminal per query (terminals are mutually exclusive). See
 `server/src/query.rs` for full semantics: index prefix binds, range predicates
 (`gt`/`gte`/`lt`/`lte`) follow the `eq` prefix, `order: "asc"|"desc"`, `take`
 capped at 4096, `unique` de-duplicates on the indexed fields, `count` is an
 uncapped `SELECT COUNT(*)`, `first` is sugar over `take(1)`, `filter` carries
-an `eq`/`neq`/`gt`/`gte`/`lt`/`lte`/`in` + `and`/`or` predicate compiled to SQL,
-`search` ranks by `ts_rank` over a generated tsvector, `vectorSearch` ranks by
-the index's declared metric distance over a write-maintained pgvector column,
-`paginate` is opaque-cursor keyset pagination, `distinct` collapses duplicates
-on a field set, and `aggregate` runs a grouped `sum`/`min`/`max`/`avg`/`count`.
+an `eq`/`neq`/`gt`/`gte`/`lt`/`lte`/`in`/`not`/`contains`/`exists` + `and`/`or`
+predicate compiled to SQL, `search` ranks by `ts_rank` over a generated
+tsvector (and accepts an optional `filter` to narrow the `WHERE` in the same
+SQL pass — the same `FilterExpr` `.filter()` accepts), `vectorSearch` ranks by
+the index's declared metric distance over a write-maintained pgvector column
+(also accepting an optional full `filter`), `hybridSearch` fuses the full-text
+(`ts_rank`) and `vectorSearch` rankings for the same table into one list via
+Reciprocal Rank Fusion, `paginate` is opaque-cursor keyset pagination,
+`distinct` collapses duplicates on a field set, and `aggregate` runs a grouped
+`sum`/`min`/`max`/`avg`/`count`.
 
 ### Transaction shape
 
-`{"steps": [...]}` where each step is tagged by `"op"`: `insert`, `patch`, `replace`, `delete`,
-`expectVersion`, `expectAbsent`, `upsert` — see `server/src/txn.rs`.
+`{"steps": [...]}` where each step is tagged by `"op"`: `insert`, `patch`,
+`replace`, `delete`, `expectVersion`, `expectAbsent`, `upsert` (per-id, one
+document each), plus the predicate-driven bulk steps `patchByQuery` and
+`deleteByQuery` (each finds rows matching a `filter` and acts on up to
+`MAX_BY_QUERY_ROWS` of them in one serialized committer turn) — see
+`server/src/txn.rs`.
 
 ### WebSocket example: subscribe, then mutate
 
@@ -521,21 +546,30 @@ if let Some(cursor) = page.next_cursor.as_deref() {
 
 `TableQuery.paginate(*, cursor=None, num_items)` mirrors the same shape; combine
 it with `encode_cursor` / `decode_cursor` if you crack cursors client-side. The
-HTTP client surface is pending; today this is a DSL builder that emits the wire
-`paginate` field. See [`python-client/`](python-client).
+HTTP client (`pip install par-rt-db[http]`) runs the built query against
+`POST /api/query` and returns the `Paginated` result. See
+[`python-client/`](python-client).
 
 ```python
 from par_rt_db import TableQuery
+from par_rt_db.http_client import RtDbHttpClient
 
-# Wire payload for the first page (cursor omitted). Pass `nextCursor` back as
-# `cursor=...` on subsequent pages.
-q = (
-    TableQuery("items")
-    .with_index("by_priority")
-    .order("asc")
-    .paginate(num_items=20)
-)
-payload = q.build().model_dump(by_alias=True, mode="json")  # ready to POST as the `query`
+client = RtDbHttpClient("https://rtdb.pardev.net", db="myapp", token=TOKEN)
+
+cursor = None
+while True:
+    q = (
+        TableQuery("items")
+        .with_index("by_priority")
+        .order("asc")
+        .paginate(cursor=cursor, num_items=20)
+    )
+    page = client.query(q)           # -> Paginated(docs=[...], next_cursor="..." | None)
+    for doc in page.docs:
+        ...
+    cursor = page.next_cursor
+    if cursor is None:
+        break
 ```
 
 ### Cursor format

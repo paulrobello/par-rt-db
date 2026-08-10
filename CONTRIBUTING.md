@@ -77,8 +77,9 @@ runs, across all six packages:
 - `typecheck` — `cargo check`, `bun run typecheck`, `uv run pyright`
 - `test` — `cargo test`, `bun run test`, `cargo test --all-features`, `uv run pytest -q` (auto-runs `dev-db-up` first)
 
-The dashboard currently uses `vitest run --passWithNoTests`; tests are pending
-(audit QA-003). All four other packages have substantive suites.
+The dashboard runs `vitest run` over `dashboard/src/**/*.test.tsx` (18 files as
+of 2026-08-09 — page tests for every operator page plus library/component
+tests). All five other packages also have substantive suites.
 
 Never `--no-verify` past the gate. If you do, fix the gate immediately and push
 the fix before anything else.
@@ -96,7 +97,7 @@ make test                                       # whole suite (dev-db-up + tests
 cd server && cargo test                         # server tests
 cd ts-client && bunx vitest run                 # ts-client tests
 cd rust-client && cargo test --all-features     # rust-client tests
-cd dashboard && bun run test                    # dashboard tests (currently a no-op)
+cd dashboard && bun run test                    # dashboard tests (vitest, 18 files)
 cd python-client && uv run pytest -q            # python-client tests
 
 # Single test:

@@ -79,6 +79,25 @@ contract.
 
 - **All four clients at feature parity** (2026-07-29) — ts/rust/python + dashboard. Optimistic updates, in-memory/offline test harness, the full admin control plane (allowlist/admins/metrics/hot-config/ops-feed/tokens/schema/stats), and the wire/DSL surfaces now mirror across all four ports.
 
+### Shipped 2026-08-08 → 2026-08-10
+
+Continued post-audit feature work, still under `[Unreleased]` (no tagged
+release). Anchored by the 2026-08-10 audit-remediation cycle and the features
+that landed in the same window; entries cross-reference the FEATURE_MATRIX row
+that is the authoritative parity contract.
+
+#### Server
+
+- **Active-session management** — `GET /admin/sessions?user=&limit=&offset=` lists live sessions; `DELETE /admin/sessions?user=` revokes every session for a user; `DELETE /admin/sessions/{token_hash}` revokes one. Revocation is live per-op: an open `/sync` connection's next Subscribe/Mutate re-runs the session check and closes on a revoked token. Mirrored across ts/rust/python clients + the `rtdb` CLI.
+- **Anonymous auth** (`POST /auth/anonymous`, gated `RTDB_AUTH_ANONYMOUS_ENABLED`, default off) — mints an ephemeral `rtdb_auth.users` row (`anonymous = TRUE`, no email) plus a session, returning the session token in the body and setting the same HttpOnly cookie as OAuth. An anonymous user is a `Principal::User` with `anonymous = true`, `email = None` — `authorize` bypasses the per-db allowlist for it (its creation is its authorization), and per-row `ownerField` stamps its `user_id` so it owns its own drafts/cursors. The anon→real merge on a later OAuth sign-in is a follow-up (not yet shipped). ts-client exposes it as `useRtDbAuth().signInAnonymous()`; machine-side clients (rust/python) are out of scope. See FEATURE_MATRIX #20.
+- **By-query transaction steps** — `PatchByQuery{table, filter, patch, limit?}` and `DeleteByQuery{table, filter, limit?}` find rows matching the same `FilterExpr` `.filter()` accepts and act on them in one serialized committer turn. Row visibility matches the read path exactly (the caller's interactive filter composes with `ownerField`/`collaboratorsField`/`authorize`); each affected row records a `DocOp`/`WriteSet` entry so subscriptions, op-feed, audit, and webhooks fire per row. `MAX_BY_QUERY_ROWS = 1000` bounds rows per step; `MAX_BY_QUERY_STEPS_PER_TXN = 16` bounds by-query step count per transaction.
+- **`MAX_STEPS` 256 → 1024 + per-transaction affected-row budget (SEC-104)** — the per-transaction step cap is raised to 1024 (ARC-104), and a new aggregate budget `MAX_AFFECTED_ROWS_PER_TXN = 10000` bounds a transaction's worst-case row count (per-id steps count one document each; each by-query step counts up to its `limit`). An over-budget transaction is rejected **before** the committer — an over-cap write never becomes durable. Mirrored across all four clients (wire-corpus pinned).
+- **`count` aggregate** — the `aggregate` terminal now supports `sum`/`avg`/`min`/`max`/`count`. `count` counts rows and consumes no aggregate field; grouped `count` is the count-per-group the dashboards need.
+- **`filter()` on `search` and `vectorSearch`** (#11, #17) — both query terminals now accept an optional full `FilterExpr` (the same predicate `.filter()` accepts — `vectorSearch` was widened from the original eq-only map over `filterFields` in commit `613c7a6`); ranked results are post-filtered server-side. The `FilterExpr` predicate itself gained `not`/`contains`/`exists` variants.
+- **HTTP `Range` requests on storage** (ENH-016) — both serve routes (`GET /storage/{id}`, `GET /api/storage/{db}/{id}`) honor single-range `Range: bytes=…` requests with `206 Partial Content` + `Content-Range`/`Content-Length`/`Accept-Ranges`; out-of-bounds → `416 Range Not Satisfiable`; multipart/non-`bytes`/malformed ranges are ignored per RFC 7233. Read-path only — no committer, protocol, or WS change. Image-transform responses are whole renders and skip `Range`.
+- **Signed, time-limited storage URLs** (ENH-017) — `GET /api/storage/{db}/{id}/signed-url?ttlSeconds=3600` (bearer-authorized for `{db}`) mints a URL granting read access to one blob until an absolute expiry (default 1h, max 7d): `GET /storage/{id}?exp=<unix-ms>&sig=<hex>`, verified by an HMAC key derived from `admin_key`. A request with no `exp`/`sig` still serves publicly as before; a bad signature returns 403 `FORBIDDEN`. The `{db}` is in the minting route (SEC-113 — cross-db returns 404) because raw bodies can't carry it and session principals aren't db-scoped.
+- **`jsonwebtoken` 9 → 10.4.0** (CVE-2026-25537) — bumped the JWT crate and switched to the `RustCrypto` signing/verification backend (commit `dc9e958`). The 9.x line carried a critical verification vulnerability; 10.4.0 on the RustCrypto backend resolves it.
+
 ### Added
 
 #### Server

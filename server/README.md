@@ -80,9 +80,11 @@ alongside it: [`../ts-client/`](../ts-client) (browser/Node),
 The read path compiles a db-side `filter()` predicate DSL to SQL, a full-text
 `search` query terminal backed by a generated tsvector column + GIN index,
 ranked by `ts_rank`, and a `vectorSearch` terminal backed by pgvector — a
-write-maintained `vector(N)` column + HNSW `vector_cosine_ops` index per vector
-index, ranked by cosine distance (`<=>`) with an optional eq-`filter` over
-declared `filterFields`. Embeddings are client-supplied (no server-side
+write-maintained `vector(N)` column with an HNSW index using the declared
+metric's opclass (`vector_cosine_ops` for cosine (default), `vector_l2_ops` for
+L2, `vector_ip_ops` for inner-product), ranked by that metric's distance
+operator and carrying an optional full `FilterExpr` (the same predicate DSL
+`.filter()` accepts). Embeddings are client-supplied (no server-side
 generation); the Postgres image is `pgvector/pgvector:pg17`.
 
 ## Scheduling
