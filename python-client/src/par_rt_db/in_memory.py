@@ -1030,40 +1030,7 @@ class InMemoryRtDbClient:
         if q.vector_search is not None:
             return self._execute_vector_search_terminal(q, table_def, eq, has_range)
         if q.search is not None:
-            if (
-                q.index is not None
-                or eq
-                or has_range
-                or q.order is not None
-                or unique
-                or first
-                or count
-                or q.filter is not None
-                or q.vector_search is not None
-                or q.paginate is not None
-                or q.hybrid_search is not None
-            ):
-                raise RtDbError(
-                    ErrorCode.BAD_REQUEST,
-                    "search cannot be combined with index, eq, range bounds, order, "
-                    "unique, first, count, filter, vector search, paginate, or hybrid search",
-                )
-            # Full-text ranking (tsvector match + ts_rank) is not modeled
-            # in-memory; every row in the table is treated as a candidate (the
-            # sound over-approximation — a real match can never be excluded). A
-            # declared `filter` narrows that candidate set via the same
-            # `_eval_filter_expr` the db-side `.filter()` uses, so the narrowing
-            # path is exercised end-to-end without modeling ts_rank.
-            if q.search.filter is not None:
-                _validate_filter(q.search.filter, set(table_def.fields.keys()))
-            candidates: list[StoredRow] = [
-                row for (t, _id), row in self._docs.items() if t == q.table
-            ]
-            if q.search.filter is not None:
-                candidates = [
-                    row for row in candidates if _eval_filter_expr(q.search.filter, row.doc)
-                ]
-            return [_merge_doc(row) for row in candidates]
+            return self._execute_search_terminal(q, table_def, eq, has_range)
 
         # `hybridSearch` terminal — standalone like `vectorSearch`: rejects every
         # peer. RRF ranking is not modeled in-memory, so a valid (peer-free)
@@ -1444,6 +1411,44 @@ class InMemoryRtDbClient:
                 if _eval_filter_expr(q.vector_search.filter, row.doc)
             ]
         return [_merge_doc(row) for row in vector_candidates]
+
+    def _execute_search_terminal(
+        self, q: Query, table_def: TableDef, eq: list[Any], has_range: bool
+    ) -> list[dict[str, Any]]:
+        """``search`` terminal.
+
+        Lift of the former inline ``if q.search is not None:`` arm of
+        :meth:`run_query`; mirrors ``ts-client``'s ``executeSearchTerminal``.
+        Full-text ranking (tsvector match + ``ts_rank``) is not modeled
+        in-memory, so every table row is a candidate (the sound
+        over-approximation — a real match can never be excluded); a declared
+        ``filter`` narrows the set via :func:`_eval_filter_expr`.
+        """
+        assert q.search is not None  # caller dispatches only when set
+        if (
+            q.index is not None
+            or eq
+            or has_range
+            or q.order is not None
+            or q.unique
+            or q.first
+            or q.count
+            or q.filter is not None
+            or q.vector_search is not None
+            or q.paginate is not None
+            or q.hybrid_search is not None
+        ):
+            raise RtDbError(
+                ErrorCode.BAD_REQUEST,
+                "search cannot be combined with index, eq, range bounds, order, "
+                "unique, first, count, filter, vector search, paginate, or hybrid search",
+            )
+        if q.search.filter is not None:
+            _validate_filter(q.search.filter, set(table_def.fields.keys()))
+        candidates: list[StoredRow] = [row for (t, _id), row in self._docs.items() if t == q.table]
+        if q.search.filter is not None:
+            candidates = [row for row in candidates if _eval_filter_expr(q.search.filter, row.doc)]
+        return [_merge_doc(row) for row in candidates]
 
     def run(self, q: Query, model: type = dict) -> Any:
         """Typed wrapper around :meth:`run_query` that deserializes the result
