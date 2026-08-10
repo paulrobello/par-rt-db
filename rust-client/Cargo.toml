@@ -34,3 +34,22 @@ sha2 = { version = "0.10", default-features = false, optional = true }
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 wiremock = "0.6"
+
+# ARC-110: declare each test binary's feature dependencies so `cargo check
+# --all-targets` (what `cargo test` builds) compiles under every feature
+# combination, not only `--all-features`. Without these, an ungated import
+# (e.g. `in_memory` items in golden_vector, `HotConfig`/`HotConfigPatch` in
+# hot_config_test, or `reqwest::Client` via `tests/common/mod.rs` in
+# ws_integration) breaks every combination except the full feature set, and
+# neither `make` nor CI would notice — they only ever pass `--all-features`.
+[[test]]
+name = "golden_vector"
+required-features = ["in_memory"]
+
+[[test]]
+name = "hot_config_test"
+required-features = ["admin"]
+
+[[test]]
+name = "ws_integration"
+required-features = ["ws", "http"]

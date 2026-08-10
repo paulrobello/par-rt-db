@@ -69,22 +69,29 @@ class AuthedUser(_Camel):
 # --- ScheduleWhen (discriminator "type", camelCase) ---
 
 
-class _AfterMs(_Camel):
+class AfterMs(_Camel):
     type: Literal["afterMs"] = "afterMs"
     ms: int
 
 
-class _RunAt(_Camel):
+class RunAt(_Camel):
     type: Literal["runAt"] = "runAt"
     ms: int
 
 
-class _Cron(_Camel):
+class Cron(_Camel):
     type: Literal["cron"] = "cron"
     expr: str
 
 
-ScheduleWhen = Annotated[_AfterMs | _RunAt | _Cron, Field(discriminator="type")]
+ScheduleWhen = Annotated[AfterMs | RunAt | Cron, Field(discriminator="type")]
+
+# Backwards-compat aliases — the underscore spellings were the only way to
+# reach these before ARC-109 re-exported them from the package root. Kept so an
+# existing `from par_rt_db.wire import _AfterMs` keeps resolving.
+_AfterMs = AfterMs
+_RunAt = RunAt
+_Cron = Cron
 
 
 class ScheduleInfo(_Camel):

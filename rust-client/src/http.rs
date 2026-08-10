@@ -2626,7 +2626,13 @@ mod admin_tests {
             .and(header("authorization", BEARER))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "tables": [{"name":"notes","rowCount":5,"sizeBytes":100}],
-                "totalSizeBytes": 100
+                "totalSizeBytes": 100,
+                "tablesQuota": 10,
+                "tablesUsed": 2,
+                "storageQuotaBytes": 1048576,
+                "storageUsedBytes": 100,
+                "subsQuota": 50,
+                "subsUsed": 3
             })))
             .mount(&server)
             .await;
@@ -2636,6 +2642,12 @@ mod admin_tests {
         assert_eq!(stats.tables[0].name, "notes");
         assert_eq!(stats.tables[0].row_count, 5);
         assert_eq!(stats.tables[0].size_bytes, 100);
+        assert_eq!(stats.tables_quota, 10);
+        assert_eq!(stats.tables_used, 2);
+        assert_eq!(stats.storage_quota_bytes, 1048576);
+        assert_eq!(stats.storage_used_bytes, 100);
+        assert_eq!(stats.subs_quota, 50);
+        assert_eq!(stats.subs_used, 3);
     }
 
     #[tokio::test]

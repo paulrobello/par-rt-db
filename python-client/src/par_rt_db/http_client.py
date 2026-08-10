@@ -144,10 +144,20 @@ class TableStat(_Wire):
 
 
 class DbStats(_Wire):
-    """``GET /admin/dbs/{db}/stats`` response — per-table row counts + sizes."""
+    """``GET /admin/dbs/{db}/stats`` response — per-table row counts + sizes
+    plus the ENH-011 per-db quota/usage triple (``0`` = unlimited). The server
+    always emits all eight fields; ``extra='forbid'`` means a response missing
+    any would be rejected, matching the server's non-optional ``DbStatsResponse``.
+    """
 
     tables: list[TableStat]
     total_size_bytes: int
+    tables_quota: int
+    tables_used: int
+    storage_quota_bytes: int
+    storage_used_bytes: int
+    subs_quota: int
+    subs_used: int
 
 
 class LatencyStats(_Wire):
@@ -584,9 +594,10 @@ class RtDbHttpClient:
     def schedule(self, txn: Transaction, when: ScheduleWhen) -> str:
         """``POST /api/schedule`` → the new schedule's id.
 
-        ``when`` is a ``ScheduleWhen`` (``_AfterMs``/``_RunAt``/``_Cron`` from
-        ``par_rt_db.wire``). One-shot jobs past due run immediately; cron jobs
-        skip missed windows (server-side semantics).
+        ``when`` is a ``ScheduleWhen`` (``AfterMs``/``RunAt``/``Cron``, imported
+        from the package root — ``from par_rt_db import AfterMs``). One-shot jobs
+        past due run immediately; cron jobs skip missed windows (server-side
+        semantics).
         """
         body = {
             "db": self._db,

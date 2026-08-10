@@ -223,11 +223,11 @@ async def test_schedule_posts_when_and_txn_returns_id() -> None:
         captured["body"] = json.loads(request.content)
         return httpx.Response(200, json={"id": "sch-1"})
 
-    from par_rt_db.wire import _AfterMs
+    from par_rt_db.wire import AfterMs
 
     async with _client(handler) as c:
         txn = Mutation.builder().insert("items", {"name": "x"}).build()
-        sid = await c.schedule(txn, _AfterMs(ms=5000))
+        sid = await c.schedule(txn, AfterMs(ms=5000))
     assert sid == "sch-1"
     assert captured["body"]["db"] == DB
     assert captured["body"]["when"] == {"type": "afterMs", "ms": 5000}
@@ -807,6 +807,12 @@ async def test_admin_db_stats_returns_table_stats() -> None:
                     json={
                         "tables": [{"name": "notes", "rowCount": 5, "sizeBytes": 4096}],
                         "totalSizeBytes": 4096,
+                        "tablesQuota": 10,
+                        "tablesUsed": 1,
+                        "storageQuotaBytes": 1048576,
+                        "storageUsedBytes": 4096,
+                        "subsQuota": 50,
+                        "subsUsed": 3,
                     },
                 )
             }

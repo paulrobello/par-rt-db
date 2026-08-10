@@ -5,8 +5,7 @@ import json
 
 import pytest
 
-from par_rt_db import Mutation, TableQuery, Transaction
-from par_rt_db.wire import _AfterMs
+from par_rt_db import AfterMs, Mutation, TableQuery, Transaction
 from par_rt_db.ws_client import (
     ConnectionState,
     RtDbClient,
@@ -484,7 +483,7 @@ async def test_schedule_lifecycle():
     try:
         # ScheduleWhen is a pydantic discriminated union (tagged on "type"),
         # not a tuple — build the afterMs variant directly.
-        sch = asyncio.create_task(client.schedule(_insert_txn(), _AfterMs(ms=100)))
+        sch = asyncio.create_task(client.schedule(_insert_txn(), AfterMs(ms=100)))
         await _drain()
         sid = _id(conn, "schedule")
         await conn.deliver('{"type":"scheduleOk","scheduleId":"' + sid + '","id":"job-1"}')

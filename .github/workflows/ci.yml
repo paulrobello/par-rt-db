@@ -101,3 +101,12 @@ jobs:
       # satisfied automatically (gate-needs-ts-client-dist-built gotcha).
       - name: Run make checkall
         run: make checkall
+
+      # ARC-110: `make checkall` exercises rust-client only under
+      # `--all-features`. This extra gate checks the library AND every test
+      # target across meaningful feature combinations, so an ungated feature
+      # import in a test (which would compile under --all-features and break
+      # every other combo) is caught. The [[test]] required-features in
+      # rust-client/Cargo.toml make the per-test gating declarative.
+      - name: rust-client feature-combination gate (ARC-110)
+        run: make rust-client-check-features

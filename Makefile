@@ -12,7 +12,7 @@ DEPLOY_COMMIT := $(shell git rev-parse --short HEAD)
 	pre-commit pre-commit-update ts-client-build ts-client-install dashboard-install \
 	dashboard-test \
 	python-client-install python-client-test python-client-lint python-client-fmt \
-	python-client-typecheck python-client-checkall rtdb-cli deploy env-drift-check
+	python-client-typecheck python-client-checkall rust-client-check-features rtdb-cli deploy env-drift-check
 
 # The dashboard's typecheck/build resolve `@par-rt-db/client` from ts-client's
 # gitignored `dist/` (workspace link + exports.types). Build it first so the
@@ -107,6 +107,23 @@ python-client-typecheck:
 	cd python-client && uv run pyright
 
 python-client-checkall: python-client-fmt python-client-lint python-client-typecheck python-client-test
+
+# ARC-110: verify the rust-client library AND its test targets compile under
+# every meaningful feature combination, not only --all-features. The [[test]]
+# required-features in rust-client/Cargo.toml gate the test binaries; this loop
+# catches a regression where a test reintroduces an ungated feature import.
+# Uses --manifest-path so each iteration is independent of shell cwd.
+rust-client-check-features:
+	@set -e; \
+	for feats in "" "http" "ws" "admin" "in_memory" "http,ws" "http,in_memory" "http,ws,admin,in_memory"; do \
+		if [ -z "$$feats" ]; then \
+			echo "=== rust-client: cargo check --all-targets (no features) ==="; \
+			cargo check --manifest-path rust-client/Cargo.toml --all-targets --no-default-features; \
+		else \
+			echo "=== rust-client: cargo check --all-targets --features '$$feats' ==="; \
+			cargo check --manifest-path rust-client/Cargo.toml --all-targets --no-default-features --features "$$feats"; \
+		fi; \
+	done
 
 rtdb-cli:
 	cd cli && cargo build --release

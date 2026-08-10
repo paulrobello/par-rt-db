@@ -809,6 +809,12 @@ def test_db_stats_parses_table_stats() -> None:
                     json={
                         "tables": [{"name": "items", "rowCount": 5, "sizeBytes": 4096}],
                         "totalSizeBytes": 4096,
+                        "tablesQuota": 10,
+                        "tablesUsed": 1,
+                        "storageQuotaBytes": 1048576,
+                        "storageUsedBytes": 4096,
+                        "subsQuota": 50,
+                        "subsUsed": 3,
                     },
                 )
             }
@@ -818,6 +824,13 @@ def test_db_stats_parses_table_stats() -> None:
     assert isinstance(stats, DbStats)
     assert stats.tables[0].row_count == 5
     assert stats.total_size_bytes == 4096
+    # ENH-011 quota/usage fields (ARC-112): all six parse to their snake_case attrs.
+    assert stats.tables_quota == 10
+    assert stats.tables_used == 1
+    assert stats.storage_quota_bytes == 1048576
+    assert stats.storage_used_bytes == 4096
+    assert stats.subs_quota == 50
+    assert stats.subs_used == 3
 
 
 def test_metrics_parses_snapshot() -> None:

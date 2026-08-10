@@ -1,5 +1,5 @@
 {
-  "$comment": "Canonical cross-client wire-parity corpus (ARC-008). Every entry is the raw JSON object as it appears on the wire. Each client's parity test parses -> serializes -> deep-compares to the input. Bytes are authoritative; tag/field names are load-bearing (see server/src/protocol.rs header). Sections: 'client_messages' (incl. ENH-015 presence join/state/leave frames), 'server_messages' (incl. ENH-015 presenceSnapshot/presenceErr), 'authed_users', 'schedule_whens', 'schedule_infos', 'query_results', 'error_envelopes', 'queries' (embedded query shapes covering filter/search/vectorSearch/paginate), 'migrate_requests' / 'migrate_results' (admin migrate Directive list + response — op tag, camelCase, `where`/`from` aliases, cast literals), 'rejects_client_message_unknown_field' (must fail to parse where deny_unknown_fields / extra='forbid' applies).",
+  "$comment": "Canonical cross-client wire-parity corpus (ARC-008). Every entry is the raw JSON object as it appears on the wire. Each client's parity test parses -> serializes -> deep-compares to the input. Bytes are authoritative; tag/field names are load-bearing (see server/src/protocol.rs header). Sections: 'client_messages' (incl. ENH-015 presence join/state/leave frames), 'server_messages' (incl. ENH-015 presenceSnapshot/presenceErr), 'authed_users', 'schedule_whens', 'schedule_infos', 'query_results', 'error_envelopes', 'queries' (embedded query shapes covering filter/search/vectorSearch/paginate), 'migrate_requests' / 'migrate_results' (admin migrate Directive list + response — op tag, camelCase, `where`/`from` aliases, cast literals), 'db_stats' (admin GET /admin/dbs/{db}/stats response, ENH-011 quota/usage fields — ARC-112), 'rejects_client_message_unknown_field' (must fail to parse where deny_unknown_fields / extra='forbid' applies).",
   "client_messages": [
     { "type": "auth", "token": "t", "db": "d" },
     { "type": "auth", "db": "d" },
@@ -156,6 +156,32 @@
   ],
   "rejects_schedule_info_unknown_status": [
     { "id": "j1", "kind": "oneshot", "dueAt": 1000, "status": "queued", "createdAt": 500, "firedCount": 0 }
+  ],
+  "db_stats": [
+    {
+      "$comment": "ARC-112: GET /admin/dbs/{db}/stats response (DbStatsResponse, server/src/admin/dbs.rs). camelCase byte-for-byte; the six quota/usage fields are ENH-011, always emitted by the server. Consumer round-trips land with QA-103; the entry is the byte-authoritative shape clients must deserialize.",
+      "tables": [
+        { "name": "items", "rowCount": 5, "sizeBytes": 4096 },
+        { "name": "users", "rowCount": 12, "sizeBytes": 32768 }
+      ],
+      "totalSizeBytes": 36864,
+      "tablesQuota": 10,
+      "tablesUsed": 2,
+      "storageQuotaBytes": 1048576,
+      "storageUsedBytes": 36864,
+      "subsQuota": 50,
+      "subsUsed": 3
+    },
+    {
+      "tables": [],
+      "totalSizeBytes": 0,
+      "tablesQuota": 0,
+      "tablesUsed": 0,
+      "storageQuotaBytes": 0,
+      "storageUsedBytes": 0,
+      "subsQuota": 0,
+      "subsUsed": 0
+    }
   ],
   "protocol_constants": {
     "$comment": "ARC-104: canonical numeric limits shared across the server and all four clients. Each client's wire-parity test asserts its internal const equals the value recorded here, so a server change (e.g. server/src/txn.rs::MAX_STEPS) requires updating this fixture AND every client, or a test fails. Server source of truth: server/src/txn.rs:22 (MAX_STEPS).",

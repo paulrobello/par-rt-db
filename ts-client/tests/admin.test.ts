@@ -211,6 +211,12 @@ describe("RtDbAdminClient — new endpoints", () => {
     const stats = {
       tables: [{ name: "items", rowCount: 3, sizeBytes: 4096 }],
       totalSizeBytes: 4096,
+      tablesQuota: 10,
+      tablesUsed: 1,
+      storageQuotaBytes: 1048576,
+      storageUsedBytes: 4096,
+      subsQuota: 50,
+      subsUsed: 3,
     };
     const fetchMock = vi.fn().mockResolvedValue(jsonResponse(stats));
     const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });

@@ -34,6 +34,13 @@ export interface TableStat {
 export interface DbStats {
   tables: TableStat[];
   totalSizeBytes: number;
+  /** ENH-011 per-db quota/usage fields (0 = unlimited). Server always emits all six. */
+  tablesQuota: number;
+  tablesUsed: number;
+  storageQuotaBytes: number;
+  storageUsedBytes: number;
+  subsQuota: number;
+  subsUsed: number;
 }
 export interface TokenInfo {
   id: string;

@@ -10,9 +10,12 @@ storage, admin control plane) ships here (``[http]`` extra), its async twin
 
 Importing :mod:`par_rt_db` exposes the public DSL surface so
 ``from par_rt_db import Mutation, TableQuery, t`` works without per-module
-imports. Wire-protocol types (``ClientMessage``/``ServerMessage``/``Schedule*``)
-remain accessible via :mod:`par_rt_db.wire`; only the DSL symbols needed to
-build queries, transactions, schemas, and cursors are re-exported here.
+imports. The ``ScheduleWhen`` union and its ``AfterMs``/``RunAt``/``Cron``
+variants are re-exported here (the ``schedule()`` methods require them), as are
+``Schema`` and ``InMemoryRtDbClient``. The full wire-protocol families
+(``ClientMessage``/``ServerMessage``/``ScheduleInfo``/...) remain accessible via
+:mod:`par_rt_db.wire`; only the DSL symbols needed to build queries,
+transactions, schemas, and cursors are re-exported here.
 
 The sync HTTP client (``RtDbHttpClient``), its async twin
 (``RtDbAsyncHttpClient``), and the reactive WebSocket client (``RtDbClient`` /
@@ -29,11 +32,12 @@ from typing import TYPE_CHECKING, Any
 
 from .cursor import decode_cursor, encode_cursor
 from .errors import ErrorCode, RtDbError
+from .in_memory import InMemoryRtDbClient
 from .migration import Cast, Migration
 from .mutation import Mutation, StepResult, Transaction
 from .query import Paginated, Query, TableQuery
-from .schema import SchemaDef, TableDef, t
-from .wire import FilterExpr
+from .schema import Schema, SchemaDef, TableDef, t
+from .wire import AfterMs, Cron, FilterExpr, RunAt, ScheduleWhen
 
 if TYPE_CHECKING:
     from .admin import (
@@ -60,11 +64,17 @@ __all__ = [
     "StepResult",
     "SchemaDef",
     "TableDef",
+    "Schema",
     "t",
     "Query",
     "TableQuery",
     "Paginated",
     "FilterExpr",
+    "ScheduleWhen",
+    "AfterMs",
+    "RunAt",
+    "Cron",
+    "InMemoryRtDbClient",
     "encode_cursor",
     "decode_cursor",
     "RtDbError",

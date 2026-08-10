@@ -110,11 +110,22 @@ pub struct TableStat {
 }
 
 /// `GET /admin/dbs/{db}/stats` response.
+///
+/// The six quota/usage fields (ENH-011) are always emitted by the server; `i64`
+/// matches the existing `HotConfig` quota typing (the server's `usize`/`u64` both
+/// serialize as JSON numbers and never approach `i64` range).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DbStats {
     pub tables: Vec<TableStat>,
     pub total_size_bytes: i64,
+    /// Per-db resource quotas (ENH-011); 0 = unlimited.
+    pub tables_quota: i64,
+    pub tables_used: i64,
+    pub storage_quota_bytes: i64,
+    pub storage_used_bytes: i64,
+    pub subs_quota: i64,
+    pub subs_used: i64,
 }
 
 /// One row of `TokenInfo` returned by `GET /admin/tokens?db=...`.

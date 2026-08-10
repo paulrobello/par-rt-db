@@ -104,14 +104,15 @@ from .schema import (
     _FVector,
 )
 from .wire import (
+    AfterMs,
     AggregateOp,
     AuthedUser,
+    Cron,
     FilterExpr,
     PresenceMember,
+    RunAt,
     ScheduleInfo,
     ScheduleWhen,
-    _AfterMs,
-    _Cron,
     _FilterAnd,
     _FilterContains,
     _FilterEq,
@@ -124,7 +125,6 @@ from .wire import (
     _FilterNeq,
     _FilterNot,
     _FilterOr,
-    _RunAt,
 )
 
 #: Maximum number of steps in a single transaction (mirrors the server cap).
@@ -1834,7 +1834,7 @@ class InMemoryRtDbClient:
         new_id = self._new_id()
         now = self._now()
         match when:
-            case _Cron(expr=expr_str):
+            case Cron(expr=expr_str):
                 kind = "cron"
                 cron: str | None = expr_str
             case _:
@@ -1951,9 +1951,9 @@ class InMemoryRtDbClient:
 
     def _due_at_for(self, when: ScheduleWhen, now: int) -> int:
         match when:
-            case _AfterMs(ms=ms):
+            case AfterMs(ms=ms):
                 return now + ms
-            case _RunAt(ms=ms):
+            case RunAt(ms=ms):
                 return ms
             case _:
                 return now + CRON_STEP_MS  # cron
