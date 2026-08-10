@@ -46,7 +46,7 @@ The capability checks apply to **machine-token principals**: a token bypasses pe
 
 ### 2.4 Wire shapes (byte-identical mirror set)
 
-`MintTokenRequest` gains optional `expiresAt?: number`, `readOnly?: boolean`, `tables?: string[]`. `TokenRow` gains the same three fields. The mirror set: server `admin.rs` (structs at `admin.rs:231-264, 952-964`), `ts-client/src/admin.ts:36-41,200`, `rust-client/src/wire.rs:473,543`, `dashboard/src/lib/types.ts:98-103`, and the new `python-client` admin module. Casing stays camelCase (`expiresAt`, `readOnly`, `tokenId`, `createdAt`) — the protocol's non-uniform casing is load-bearing.
+`MintTokenRequest` gains optional `expiresAt?: number`, `readOnly?: boolean`, `tables?: string[]`. `TokenRow` gains the same three fields. The mirror set: server `admin/tokens.rs` (the `MintTokenRequest`/`TokenRow` structs), `ts-client/src/admin.ts:36-41,200`, `rust-client/src/wire.rs:473,543`, `dashboard/src/lib/types.ts:98-103`, and the new `python-client` admin module. Casing stays camelCase (`expiresAt`, `readOnly`, `tokenId`, `createdAt`) — the protocol's non-uniform casing is load-bearing.
 
 Tokens appear on the WS wire only as opaque `token: Option<String>` on the `Auth` frame (`protocol.rs:14-24`) — unchanged; the new fields are HTTP-admin only.
 
@@ -65,7 +65,7 @@ No token UI exists today (only a vestigial `listTokens`/`TokenRow` nothing rende
 
 ### 3.1 Server additions
 
-Existing surface is 3 routes (`admin.rs:1579-1583`): `GET`/`POST /admin/db/{db}/webhooks`, `DELETE /admin/db/{db}/webhooks/{id}`. Add:
+Existing surface is 3 routes (`admin/webhooks.rs`): `GET`/`POST /admin/db/{db}/webhooks`, `DELETE /admin/db/{db}/webhooks/{id}`. Add:
 
 - `PUT /admin/db/{db}/webhooks/{id}` — edit `url` / `table` / `events` / `enabled`. New `enabled BOOLEAN NOT NULL DEFAULT true` column on `rtdb.webhooks` (`db.rs:216`); the delivery worker skips disabled rows at `enqueue_for_ops` (`webhook.rs:124`). (Disable-without-delete is the obvious operator need and is cheap once `PUT` exists.)
 - `GET /admin/db/{db}/webhooks/{id}/deliveries?status=&limit=&offset=` — paginated read of the `rtdb.webhook_deliveries` outbox (`db.rs:233`) with optional `status` filter (`pending|retrying|delivered|failed`). Returns `{ deliveries: [{ id, attempts, status, nextAttempt, lastError, payload }] }`. Admin-only.
@@ -88,7 +88,7 @@ Add `listWebhooks / createWebhook / editWebhook / deleteWebhook / listDeliveries
 
 ### 4.1 Server
 
-Extend `GET /admin/audit` (`admin.rs:1393`) `AuditParams` (`admin.rs:1367`) with optional `table`, `op`, `principal`, `source` filters (today only `db` is supported). Thread them into `fetch_audit_rows` (`audit.rs:99`) as parameterized `WHERE` clauses: `AND ($table::text IS NULL OR tbl = $table)`, etc. `limit`/`offset` clamping unchanged (`[1,1000]`). Admin-only; short-circuits to empty when `audit_log_enabled` is false.
+Extend `GET /admin/audit` (`admin/observability.rs`) `AuditParams` (`admin/observability.rs`) with optional `table`, `op`, `principal`, `source` filters (today only `db` is supported). Thread them into `fetch_audit_rows` (`audit.rs:99`) as parameterized `WHERE` clauses: `AND ($table::text IS NULL OR tbl = $table)`, etc. `limit`/`offset` clamping unchanged (`[1,1000]`). Admin-only; short-circuits to empty when `audit_log_enabled` is false.
 
 ### 4.2 Clients & dashboard
 
@@ -144,7 +144,7 @@ Within each unit: **server first** (contract source of truth), then the **client
 ## 8. Verification & invariants
 
 - **Gate**: `make checkall` (fmt-check + clippy `-D warnings` + typecheck + tests) per unit, with `make dev-db-up` (dev Postgres on `127.0.0.1:55434`) — integration tests hit a real DB.
-- **Wire contract**: the four protocol implementations (`server/protocol.rs` + `admin.rs`, `ts-client`, `rust-client`, `python-client`) stay byte-identical; serde tags/field names match exactly. The dashboard `lib/types.ts` mirrors the admin shapes.
+- **Wire contract**: the four protocol implementations (`server/protocol.rs` + `admin/` module, `ts-client`, `rust-client`, `python-client`) stay byte-identical; serde tags/field names match exactly. The dashboard `lib/types.ts` mirrors the admin shapes.
 - **Single-writer invariant**: no new writer. The subscription inspector only *reads* the registry (behind async mutexes); it never executes txns outside the committer. Webhook/audit/storage writes go through their existing paths.
 - **SQL safety**: every new identifier is double-quoted; every value is `$n`-bound; no interpolation.
 - **Errors**: every new failure is an `RtDbError { code, message }` envelope; client-facing 500s stay generic.

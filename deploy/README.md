@@ -5,6 +5,21 @@ traffic reaches it through the host `cloudflared` tunnel, which routes
 `rtdb.pardev.net` -> `http://localhost:8300`. No ports 80/443 are opened on the
 VPS and no reverse proxy is needed — TLS is terminated at Cloudflare's edge.
 
+## Table of contents
+
+- [One-time DNS/tunnel wiring (already done 2026-07-21)](#one-time-dnstunnel-wiring-already-done-2026-07-21)
+- [Deploy / update](#deploy--update)
+- [Postgres image](#postgres-image)
+- [Collation](#collation)
+- [Subscription-invalidation observability](#subscription-invalidation-observability)
+- [Monitoring](#monitoring)
+- [Secrets (`/docker/par-rt-db/.env`, not committed)](#secrets-dockerpar-rt-dbenv-not-committed)
+- [Dashboard / SPA](#dashboard--spa)
+- [Admin bootstrap (after first deploy)](#admin-bootstrap-after-first-deploy)
+- [Backups & restore](#backups--restore)
+- [Troubleshooting](#troubleshooting)
+- [Rollback](#rollback)
+
 ## One-time DNS/tunnel wiring (already done 2026-07-21)
 
 - Proxied CNAME `rtdb.pardev.net` -> `<lenny2-tunnel-id>.cfargotunnel.com`
@@ -15,6 +30,21 @@ VPS and no reverse proxy is needed — TLS is terminated at Cloudflare's edge.
   exception in `~/.claude/guides/infrastructure.md`).
 
 ## Deploy / update
+
+The preferred path is `make deploy` from the repo root: it runs `make checkall`
+first (the full gate), then rsyncs to lenny2 and runs `docker compose up -d
+--build` with `RTDB_BUILD_COMMIT` baked in (so `/healthz` reports the deployed
+commit). See the [`Makefile`](../Makefile) `deploy` target for the canonical
+commands.
+
+```sh
+make deploy
+```
+
+The manual rsync path below is the same thing without the gate or the commit
+label: it skips `checkall`, and unless you export `RTDB_BUILD_COMMIT` yourself,
+`/healthz` reports `git_commit: "unknown"`. Use it only when you need to bypass
+the gate intentionally.
 
 Source is synced to `/docker/par-rt-db` on lenny2 and built there (the host is
 x86_64; do not `docker save` an arm64 image from a Mac).
@@ -34,7 +64,7 @@ cd /docker/par-rt-db
 docker compose up -d --build
 docker compose ps
 curl -fsS http://127.0.0.1:8300/healthz | jq .
-# -> {"status":"ok","version":"0.1.0","git_commit":"<sha>","build_timestamp":..,
+# -> {"status":"ok","version":"<crate-version>","git_commit":"<sha>","build_timestamp":..,
 #     "started_at":..,"uptime_seconds":..,"postgres":true}
 # A 503 with "status":"degraded"/"postgres":false means the server is up but
 # Postgres is not — `curl -f` exits non-zero so this surfaces in scripts.
@@ -93,7 +123,7 @@ metrics exist for it on `/metrics` and `GET /admin/metrics`:
 every N: the query runs anyway and its result is compared against the last
 pushed one. **Setting it in `.env` is not enough on its own** — compose's
 `environment:` block is an explicit allowlist, so a new `RTDB_*` key must also
-be forwarded there (this one is, as of 0609012). After changing it, recreate the
+be forwarded there (this one is). After changing it, recreate the
 container (`docker compose up -d server`) and confirm
 `rtdb_subs_skip_verifications_total` starts climbing; if it stays 0 while skips
 accumulate, the variable isn't reaching the process. A divergence logs at ERROR, increments the counter, and pushes the
@@ -103,6 +133,22 @@ Postgres round-trip the skip avoided. **Prod runs a permanent standing canary at
 silent, so the verifier stays on as a detector rather than being toggled off.
 After changing invalidation logic, temporarily lower it to N=20 for a few days
 and confirm `rtdb_subs_missed_pushes_total` stays 0, then return it to 200.
+
+## Monitoring
+
+`GET /metrics` is the Prometheus scrape endpoint — plain text exposition,
+aggregate-only (no per-db, no principal data), same auth posture as `/healthz`
+(none). Content-negotiated on `Accept`: a browser (`text/html`) is served the
+SPA's `index.html` when `RTDB_STATIC_DIR` is set; everything else (Prometheus
+sends `application/openmetrics-text`, curl, API-only deploys) gets the
+Prometheus text. Point a scraper at `https://rtdb.pardev.net/metrics`.
+
+The subscription-invalidation canary above is the one alert to wire up: alert
+on any increase of `rtdb_subs_missed_pushes_total` (only populated when
+verification is on — prod runs `RTDB_SUBS_VERIFY_SKIP_EVERY=200`). The admin
+JSON snapshot with per-db breakdowns (storage, subs, quota rejections) stays at
+`GET /admin/metrics`, behind the admin key — do not scrape that from Prometheus,
+since per-db labels would blow up cardinality.
 
 ## Secrets (`/docker/par-rt-db/.env`, not committed)
 
@@ -206,6 +252,32 @@ Restore produces a verified `rtdb_restored_<stamp>` database alongside the live
 
 Credentials for `createdb`/`pg_restore` travel via the `PG*` env vars, never on
 the argv.
+
+## Troubleshooting
+
+Common operator symptoms on the live deploy:
+
+- **`/healthz` returns 503 with `"status":"degraded"` / `"postgres":false`** —
+  the server process is up but cannot reach Postgres. Check
+  `docker compose ps`, the `rtdb-pg` container health, and the
+  `RTDB_DATABASE_URL` in `.env`. `curl -f` exits non-zero on the 503, so this
+  surfaces in deploy/wrapper scripts.
+- **A new `RTDB_*` var set in `.env` has no effect.** Compose's `environment:`
+  block is an explicit allowlist — a key only present in `.env` is never passed
+  to the container. Add it to `docker-compose.yml`'s `environment:` list too,
+  then `docker compose up -d server`. `make env-drift-check` (first stage of
+  `checkall`) catches this locally.
+- **`POST /admin/restore` fails with a permission/`createdb` error.** Restore
+  creates a fresh `rtdb_restored_<stamp>` database via `createdb`, so the DB
+  role needs the `CREATEDB` privilege. The docker-compose `POSTGRES_USER` is a
+  superuser and already has it; on managed Postgres, run
+  `ALTER ROLE "<role>" CREATEDB;`.
+- **Dashboard shows the old SPA after a frontend change.** The SPA is baked into
+  the server image, not a live-mounted volume — a frontend change ships only via
+  `docker compose up -d --build` (image rebuild + container recreate). A plain
+  `docker compose up -d` without `--build` keeps the old image and the old SPA.
+  A hard reload (`Cmd/Ctrl`+`Shift`+`R`) clears a stale browser cache, but the
+  image-rebuild step is the real fix.
 
 ## Rollback
 

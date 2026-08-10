@@ -158,7 +158,7 @@ benefit on a single-server, bearer-authed architecture.
 
 Both paths return the stored bytes via `Result<Response, RtDbError>` with
 `Body::from(bytes)` and the stored `Content-Type`, mirroring `export_db`
-(`admin.rs`). `Content-Type` defaults to `application/octet-stream` when the
+(`admin/dbs.rs`). `Content-Type` defaults to `application/octet-stream` when the
 upload omitted it.
 
 - **Public** — `GET /storage/{id}`, **no authentication**. Resolve `id → db_name`

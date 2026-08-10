@@ -21,8 +21,8 @@ runtime dependencies; no server changes.
     `poolIdle` shown as a busy/idle sub-line), and **System:** `uptimeSeconds`
 - `server/src/metrics.rs` documents that **rates are derived client-side from
   successive snapshots** — the server exposes only raw counters/gauges.
-- `server/src/admin.rs` pushes a `{kind:"gauges", gauges: MetricsSnapshot}` frame
-  every 1 second (`Duration::from_secs(1)`, line 864) over the `/admin/stream`
+- `server/src/admin/observability.rs` pushes a `{kind:"gauges", gauges: MetricsSnapshot}` frame
+  every 1 second over the `/admin/stream`
   WebSocket; `dashboard/src/lib/admin.tsx` stores only the latest snapshot in
   `AdminProvider` state (it discards history).
 - `dashboard` has **no charting dependency** (only `react`, `react-dom`,

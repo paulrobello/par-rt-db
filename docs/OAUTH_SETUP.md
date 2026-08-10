@@ -10,6 +10,23 @@ working with zero providers configured.
 > `gitlab.rs`, `microsoft.rs`, `apple.rs`, `oidc.rs`). This guide mirrors those
 > files — if the code and this doc disagree, the code wins; fix this doc.
 
+## Table of contents
+
+- [How it works](#how-it-works)
+- [Prerequisites (all providers)](#prerequisites-all-providers)
+- [Quick reference](#quick-reference)
+- [GitHub](#github)
+- [Google](#google)
+- [GitLab](#gitlab)
+- [OIDC (generic provider)](#oidc-generic-provider)
+- [Microsoft (Entra ID / Azure AD v2.0)](#microsoft-entra-id--azure-ad-v20)
+- [Sign in with Apple](#sign-in-with-apple)
+- [Applying changes](#applying-changes)
+- [Verifying](#verifying)
+- [Hardening](#hardening)
+- [Troubleshooting](#troubleshooting)
+- [Adding a new provider (Microsoft, Apple, …)](#adding-a-new-provider-microsoft-apple-)
+
 ## How it works
 
 - The browser starts a login at `GET /auth/{provider}/begin?origin=<app-origin>`.

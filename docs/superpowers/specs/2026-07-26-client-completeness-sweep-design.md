@@ -21,8 +21,8 @@ Two corrections to the python spec's 1-day-old framing, confirmed by reading cur
 
 1. **The admin-endpoint lag is cross-client, not ts-only.** rust-client's admin module
    (`rust-client/src/http.rs:499-675`, `#[cfg(feature = "admin")]`) ships the *same* 10-method subset as
-   ts-client (`ts-client/src/admin.ts`) — both lag the server's 20 routes (`server/src/admin.rs`,
-   registered in `admin_routes()` at `:907-935`). Both need the missing methods.
+   ts-client (`ts-client/src/admin.ts`) — both lag the server's 20 routes (the `server/src/admin/`
+   module, registered in `admin_routes()` in `admin/mod.rs`). Both need the missing methods.
 2. **The in-memory `filter` behavior is the only silent bug.** `ts-client/src/in_memory.ts:930-964`
    never evaluates `q.filter` and returns unfiltered results. `search`/`vectorSearch` are honestly
    stubbed — they return `[]` with an explanatory comment (`in_memory.ts:858-860`, `:885-887`), so they
@@ -36,8 +36,8 @@ Evidence gathered 2026-07-26 against current `main`. Sizes: S ≤1 day, M 1–3 
 |---|---|---|---|---|
 | **B** | Google OAuth + `/auth/me` | ts | S | `signInWithGitHub` (`react.tsx:170-207`); rust `auth_me` (`http.rs:427-434`) |
 | **C** | In-memory `filter` silently ignored | ts | M | server predicate semantics (`server/src/query.rs`) |
-| **A-ts** | Admin endpoint parity (browser) | ts | M | server `admin.rs` (20 routes) |
-| **A-rust** | Admin endpoint parity (machine) | rust | M | server `admin.rs` (machine-relevant subset) |
+| **A-ts** | Admin endpoint parity (browser) | ts | M | server `admin/` (20 routes) |
+| **A-rust** | Admin endpoint parity (machine) | rust | M | server `admin/` (machine-relevant subset) |
 | **D** | Optimistic updates (#12) | rust | M | `ts-client/src/optimistic.ts` (229 lines) + `client.ts` hooks |
 | **E** | In-memory test harness (#19) | rust | M–L | `ts-client/src/in_memory.ts` (1,249 lines) |
 
@@ -81,18 +81,18 @@ Evidence gathered 2026-07-26 against current `main`. Sizes: S ≤1 day, M 1–3 
 ### A-ts — ts admin endpoints (ts, M)
 
 Add the missing methods to `ts-client/src/admin.ts`, each a one-liner over the existing
-`RtDbAdminClient.request` helper (constructor `admin.ts:18`), mirroring `server/src/admin.rs` handlers:
+`RtDbAdminClient.request` helper (constructor `admin.ts:18`), mirroring the `server/src/admin/` handlers:
 
-- **Machine + browser:** `adminsList/add/remove` (`GET/POST/DELETE /admin/admins`, `admin.rs:386/403/432`),
-  `getSchema` (`GET /admin/dbs/{db}/schema`, `:445`), `dbStats` (`GET /admin/dbs/{db}/stats`, `:596`),
-  `adminQuery` (`POST /admin/db/{db}/query`, `:470`, owner bypass), `adminMutate` (`POST /admin/db/{db}/mutate`,
-  `:504`), `listTokens` (`GET /admin/tokens`, `:551`), `metrics` (`GET /admin/metrics`, `:640`),
-  `getConfig` (`GET /admin/config`, `:695`), `patchConfig` (`PATCH /admin/config`, `:715`),
-  `opsRecent` (`GET /admin/ops/recent`, `:779`).
-- **Browser-only:** `login` (`POST /admin/login`, `:111`, sets the cookie session), `logout`
-  (`POST /admin/logout`, `:133`, clears the cookie).
-- `stream()` — the `/admin/stream` WS (`admin.rs:815`), authing via the `Sec-WebSocket-Protocol:
-  rtdb-admin.<token>` subprotocol (`admin.rs:820-842`) since browsers cannot set the `Authorization`
+- **Machine + browser:** `adminsList/add/remove` (`GET/POST/DELETE /admin/admins`, `admin/login.rs`),
+  `getSchema` (`GET /admin/dbs/{db}/schema`, `admin/dbs.rs`), `dbStats` (`GET /admin/dbs/{db}/stats`, `admin/dbs.rs`),
+  `adminQuery` (`POST /admin/db/{db}/query`, `admin/docs.rs`, owner bypass), `adminMutate` (`POST /admin/db/{db}/mutate`,
+  `admin/docs.rs`), `listTokens` (`GET /admin/tokens`, `admin/tokens.rs`), `metrics` (`GET /admin/metrics`, `admin/observability.rs`),
+  `getConfig` (`GET /admin/config`, `admin/settings.rs`), `patchConfig` (`PATCH /admin/config`, `admin/settings.rs`),
+  `opsRecent` (`GET /admin/ops/recent`, `admin/observability.rs`).
+- **Browser-only:** `login` (`POST /admin/login`, `admin/login.rs`, sets the cookie session), `logout`
+  (`POST /admin/logout`, `admin/login.rs`, clears the cookie).
+- `stream()` — the `/admin/stream` WS (handler in `admin/observability.rs`), authing via the `Sec-WebSocket-Protocol:
+  rtdb-admin.<token>` subprotocol (upgrade gate in `admin/mod.rs`) since browsers cannot set the `Authorization`
   header on a WS handshake. Mirrors the dashboard's existing connection path.
 
 ### D — Optimistic updates (rust, M)
@@ -125,7 +125,7 @@ Add the **machine-relevant** admin methods only, to the `#[cfg(feature = "admin"
 `db_stats`, `admin_query`, `admin_mutate`, `list_tokens`, `metrics`, `get_config`, `patch_config`,
 `ops_recent`, and `stream` (WS). For `stream()`, rust authenticates via the `Authorization: Bearer
 <admin_key>` header on the WS handshake — the server's `/admin/stream` upgrade gate accepts the header
-(the CLI/automation path, `admin.rs:815`) **or** the `Sec-WebSocket-Protocol: rtdb-admin.<token>`
+(the CLI/automation path, in `admin/mod.rs`) **or** the `Sec-WebSocket-Protocol: rtdb-admin.<token>`
 subprotocol; rust takes the header path since, unlike browsers, tokio-tungstenite can set it, and rust is
 a CLI/automation client. (ts's `stream()` in A-ts uses the subprotocol because browsers cannot set the
 header — same server gate, different transport constraint.)
@@ -203,4 +203,4 @@ Each plan: implement → unit tests → `make checkall` → atomic commit → `F
 
 - python-client design (audit source): `docs/superpowers/specs/2026-07-25-python-client-design.md`.
 - rust-client design (template): `docs/superpowers/specs/2026-07-22-rust-client-design.md`.
-- ts-client: `ts-client/src/`. rust-client: `rust-client/src/`. Server admin: `server/src/admin.rs`.
+- ts-client: `ts-client/src/`. rust-client: `rust-client/src/`. Server admin: `server/src/admin/` module.

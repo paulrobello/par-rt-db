@@ -103,7 +103,7 @@ pub async fn get(pool: &PgPool, db: &str, version: i64)
 
 Capture is called at the two sites that overwrite the live schema:
 
-- **Push** — in `admin.rs` `push_schema` (`admin.rs:206`), immediately after
+- **Push** — in `admin/dbs.rs` `push_schema`, immediately after
   `ddl::push_schema` returns the applied `SchemaDef`. The handler already has the
   admin principal from `require_admin`, so it passes it through. Wrapped best-effort:
   `if let Err(e) = capture(...).await { tracing::warn!(...) }`.
@@ -251,10 +251,10 @@ in this change.
 |---|---|
 | `meta` table DDL / `load_schema` | `server/src/db.rs:311`, `db.rs:474` |
 | New module | `server/src/schema_history.rs` (mirror `audit.rs`) |
-| Push capture | `server/src/admin.rs:206` (`push_schema` handler) |
+| Push capture | `server/src/admin/dbs.rs` (`push_schema` handler) |
 | Migrate capture + restore arm | `server/src/committer.rs:736` (`handle_migrate`), new `handle_restore_schema`, `CommitterRequest::RunRestoreSchema` |
 | Destructive reconcile | `server/src/ddl.rs` (new `reconcile_schema_destructive`, reuses `detect_destructive_changes` at `ddl.rs:219`) |
-| New HTTP routes | `server/src/admin.rs` (near `:1881`/`:1898`) |
+| New HTTP routes | `server/src/admin/` (route registration in `mod.rs`; handlers in `dbs.rs`) |
 | ts-client wire + admin | `ts-client/src/protocol.ts`, `ts-client/src/admin.ts` |
 | Dashboard client + page | `dashboard/src/lib/admin.tsx`, `dashboard/src/pages/SchemaHistoryPage.tsx`, `dashboard/src/App.tsx` (route) |
 

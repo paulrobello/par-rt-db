@@ -56,7 +56,7 @@ Per-named-db overrides are explicitly out of scope (see Alternatives).
   or the incident recurs.
 - **`HotConfigPatch`** is `deny_unknown_fields`, so every client mirror of
   `HotConfig`/`HotConfigPatch` must land in lockstep or a client PATCH 400s.
-- **Storage size is already measurable live.** `db_stats` (`admin.rs:1369`)
+- **Storage size is already measurable live.** `db_stats` (`admin/dbs.rs`)
   loops each table running `pg_total_relation_size`. There is **no maintained
   size counter** anywhere — every consumer re-queries.
 - **Subscriptions are already sharded per-db.** `SubscriptionManager` holds
@@ -89,12 +89,12 @@ pub struct HotConfig {
   present else env. **Skipping this replays the prod incident** (a persisted row
   missing the new field would silently revert to env on every boot, and a PATCH
   carrying the new field would round-trip-lossy).
-- `HotConfigPatch` (`admin.rs:1651`) gets three optional fields; validation is
+- `HotConfigPatch` (`admin/settings.rs`) gets three optional fields; validation is
   "present → assign" (unsigned types already forbid negatives; **no hard
   ceiling** — unlike `max_file_size`, clamping a *limit the operator chose*
   would be wrong).
 - `GET /admin/config` needs no change: `hot` is already serialized in full
-  (`admin.rs:1634`); the three fields appear automatically and are not secrets
+  (`admin/settings.rs`); the three fields appear automatically and are not secrets
   (no redaction).
 - **Env-drift gate** (`scripts/env-drift-check.sh`, a `checkall` dependency):
   add the three `RTDB_*` to **both** `.env.example` and `docker-compose.yml`'s
@@ -286,7 +286,7 @@ clients land together or a client PATCH 400s.
 
 ## Dashboard + metrics
 
-- `db_stats` response (`admin.rs:1369`) gains `storageQuotaBytes` +
+- `db_stats` response (`admin/dbs.rs`) gains `storageQuotaBytes` +
   `storageUsedBytes` (and tables/subs usage+cap) so the dashboard renders a usage
   bar — "Storage: 142 MB / 500 MB".
 - The hot-config panel gets the three new editable fields (types mirrored above).

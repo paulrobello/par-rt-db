@@ -2,7 +2,7 @@
 
 - **Status:** Implemented (2026-08-10) — backend phases 1–6 + frontend SPA live (served same-origin from `RTDB_STATIC_DIR`). Delivers FEATURE_MATRIX #18 ("Data browser dashboard") and expands it from a table browser into a full realtime ops dashboard.
 - **Date:** 2026-07-24
-- **Related:** FEATURE_MATRIX #18 (and the "Admin control plane" row); main design spec `2026-07-21-par-rt-db-design.md` ("Auth", "Wire protocol", "Deployment"); per-row authorization `2026-07-24-per-row-authorization-design.md`; implementation plan `docs/superpowers/plans/2026-07-24-realtime-dashboard.md` (to be written).
+- **Related:** FEATURE_MATRIX #18 (and the "Admin control plane" row); main design spec `2026-07-21-par-rt-db-design.md` ("Auth", "Wire protocol", "Deployment"); per-row authorization `2026-07-24-per-row-authorization-design.md`; implementation plans — the seven-phase series under `docs/superpowers/plans/2026-07-24-realtime-dashboard-phase{1-auth,2-metadata,3a-metrics,3b-opfeed,4-config,5-admin-docs,6-static}.md`.
 - **Scope:** This document specifies the **backend surfaces and wire contract** the dashboard consumes. The frontend SPA itself is designed separately via the `/impeccable` skill in a follow-on phase; this spec does not prescribe its visual design, only the data it can read and the actions it can take. The dashboard's static assets are served by the server (§6).
 
 ## Summary
@@ -34,7 +34,7 @@ remaining parity gap vs. Convex and a real DX advantage.
 The existing building blocks the dashboard needs already exist but are incomplete as a
 dashboard substrate:
 
-- **Admin control plane** (`server/src/admin.rs`): create-db, push-schema, list-dbs,
+- **Admin control plane** (`server/src/admin/` module): create-db, push-schema, list-dbs,
   mint/revoke-token, allowlist, export/import-db — all gated on a single global
   `RTDB_ADMIN_KEY` (constant-time compare). Gaps: **no schema read-back, no token
   listing, no stats, no metrics, no config read or mutation.**

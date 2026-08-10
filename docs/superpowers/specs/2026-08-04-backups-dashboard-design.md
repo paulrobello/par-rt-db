@@ -49,7 +49,7 @@ Add `backup_running: Arc<std::sync::atomic::AtomicBool>`. Set by `POST /admin/ba
 
 No new boot config fields are required; trigger and restore reuse `config.database_url` and `config.backup_dir`.
 
-### `admin.rs` endpoints
+### `admin/backups.rs` endpoints
 
 All admin-gated through the same `authenticate_admin` middleware as the existing `GET /admin/backups`.
 
