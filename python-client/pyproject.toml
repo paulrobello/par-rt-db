@@ -10,8 +10,8 @@ dependencies = ["pydantic>=2.13.4,<3"]
 
 [project.optional-dependencies]
 ws = ["websockets>=17.0.1"]  # added in Plan 2
-http = ["httpx>=0.28.1"]     # added in Plan 2 (http_client + admin)
-aio = ["httpx>=0.28.1"]      # async HTTP/admin/storage client (ENH-012)
+http = ["httpx>=0.28.1"]     # sync + async HTTP/admin/storage client (http_client + admin + aio_http_client)
+aio = ["par-rt-db[http]"]    # alias for [http] (ARC-124): async surface no longer needs a separate dep
 
 [dependency-groups]
 # `dev` is a default group — `uv run` / `uv sync` installs it automatically, so

@@ -6,6 +6,15 @@ request is ``await``-ed. Wire types, DSL builders, and the response models are
 re-imported from :mod:`par_rt_db.http_client` and the shared modules — nothing
 is redefined. ``httpx`` is imported lazily inside ``__init__`` so this module
 imports without the ``[aio]`` extra installed.
+
+Architecture (ARC-108): the admin methods on this class are async façades that
+delegate to the shared request-description layer in :mod:`par_rt_db.admin` —
+each method builds an :class:`~par_rt_db.admin._AdminRequest` via an ``_op_*``
+builder and hands it to a :class:`~par_rt_db.admin._AsyncAdminExecutor` over
+this client's ``httpx.AsyncClient``. The admin surface therefore exists in
+exactly one place (the builders) rather than being duplicated across the
+sync/async × data-plane/admin clients. ``[aio]`` is kept as an alias for
+``[http]`` — both install ``httpx``, the only dependency this module needs.
 """
 
 from __future__ import annotations
@@ -13,6 +22,38 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, Literal
 
+from .admin import (
+    _AsyncAdminExecutor,
+    _op_admin_mutate,
+    _op_admin_query,
+    _op_admins_add,
+    _op_admins_list,
+    _op_admins_remove,
+    _op_allowlist_add,
+    _op_allowlist_list,
+    _op_allowlist_remove,
+    _op_backup_now,
+    _op_create_db,
+    _op_db_stats,
+    _op_delete_backup,
+    _op_delete_db,
+    _op_download_backup,
+    _op_export_db,
+    _op_get_config,
+    _op_get_schema,
+    _op_import_db,
+    _op_list_backups,
+    _op_list_dbs,
+    _op_list_tokens,
+    _op_metrics,
+    _op_migrate_schema,
+    _op_mint_token,
+    _op_ops_recent,
+    _op_patch_config,
+    _op_push_schema,
+    _op_restore_backup,
+    _op_revoke_token,
+)
 from .errors import ErrorCode, RtDbError
 from .migration import Directive, MigrateRequest
 from .mutation import StepResult, Transaction
@@ -23,6 +64,10 @@ if TYPE_CHECKING:
     import httpx
 
 # Re-import the shared response models + adapters this module references.
+# The admin models are canonically defined in :mod:`par_rt_db.admin_models` and
+# re-exported via :mod:`par_rt_db.http_client`; the storage models
+# (``UploadResult``/``FileMetadata``/``SignedUrl``) are defined in
+# :mod:`par_rt_db.http_client`. All resolve to the same class objects.
 from .http_client import (
     _BATCH_ADAPTER,
     _SCHEDULES_ADAPTER,
@@ -70,6 +115,7 @@ class RtDbAsyncHttpClient:
             headers={"Authorization": f"Bearer {token}"},
             transport=transport,
         )
+        self._admin_executor = _AsyncAdminExecutor(self._client)
 
     async def aclose(self) -> None:
         await self._client.aclose()
@@ -305,38 +351,32 @@ class RtDbAsyncHttpClient:
         return f"{base}?{'&'.join(parts)}" if parts else base
 
     # --- admin control plane (admin key as the token) ---
+    #
+    # Async façades over the shared admin request layer (ARC-108). Each method
+    # builds an ``_AdminRequest`` via an ``_op_*`` builder and delegates to the
+    # ``_AsyncAdminExecutor``. The canonical full-surface client is
+    # :class:`par_rt_db.admin.AsyncRtDbAdminClient`; see the ``_op_*`` builders
+    # there for the authoritative request-construction and response-parsing logic.
 
     async def create_db(self, name: str) -> None:
-        """``POST /admin/create-db`` ``{name}`` → ``{ok:true}``."""
-        resp = await self._send("POST", "/admin/create-db", json={"name": name})
-        self._expect_ok(resp)
+        """``POST /admin/create-db`` ``{name}`` → ``{ok:true}`` (async)."""
+        await self._admin_executor.run(_op_create_db(name))
 
     async def delete_db(self, name: str, confirm: str) -> None:
-        """``POST /admin/delete-db`` ``{name, confirm}`` → ``{ok:true}``.
+        """``POST /admin/delete-db`` ``{name, confirm}`` → ``{ok:true}`` (async).
 
         The server rejects with ``BAD_REQUEST`` unless ``confirm == name``
         exactly — the typed confirmation guard against accidental deletion.
         """
-        resp = await self._send(
-            "POST",
-            "/admin/delete-db",
-            json={"name": name, "confirm": confirm},
-        )
-        self._expect_ok(resp)
+        await self._admin_executor.run(_op_delete_db(name, confirm))
 
     async def push_schema(self, db: str, schema: SchemaDef) -> None:
-        """``POST /admin/push-schema`` ``{db, schema}`` → ``{ok:true}``."""
-        resp = await self._send(
-            "POST",
-            "/admin/push-schema",
-            json={"db": db, "schema": schema.model_dump(by_alias=True, mode="json")},
-        )
-        self._expect_ok(resp)
+        """``POST /admin/push-schema`` ``{db, schema}`` → ``{ok:true}`` (async)."""
+        await self._admin_executor.run(_op_push_schema(db, schema))
 
     async def list_dbs(self) -> list[str]:
-        """``GET /admin/dbs`` → ``{databases:[...]}``."""
-        resp = await self._send("GET", "/admin/dbs")
-        return list(resp.json()["databases"])
+        """``GET /admin/dbs`` → ``{databases:[...]}`` (async)."""
+        return await self._admin_executor.run(_op_list_dbs())
 
     async def mint_token(
         self,
@@ -347,128 +387,91 @@ class RtDbAsyncHttpClient:
         read_only: bool = False,
         tables: list[str] | None = None,
     ) -> MintedToken:
-        """``POST /admin/mint-token`` with capability fields → ``{tokenId, token}``.
+        """``POST /admin/mint-token`` with capability fields → ``{tokenId, token}`` (async).
 
         Async twin of :meth:`par_rt_db.http_client.RtDbHttpClient.mint_token`;
         body semantics and capability defaults are identical.
         """
-        body: dict[str, Any] = {"db": db, "name": name, "readOnly": read_only}
-        if expires_at is not None:
-            body["expiresAt"] = expires_at
-        if tables is not None:
-            body["tables"] = list(tables)
-        resp = await self._send("POST", "/admin/mint-token", json=body)
-        return MintedToken.model_validate(resp.json())
+        return await self._admin_executor.run(
+            _op_mint_token(
+                db,
+                name,
+                expires_at=expires_at,
+                read_only=read_only,
+                tables=tables,
+            )
+        )
 
     async def revoke_token(self, token_id: str) -> None:
-        """``POST /admin/revoke-token`` ``{tokenId}`` → ``{ok:true}``."""
-        resp = await self._send("POST", "/admin/revoke-token", json={"tokenId": token_id})
-        self._expect_ok(resp)
+        """``POST /admin/revoke-token`` ``{tokenId}`` → ``{ok:true}`` (async)."""
+        await self._admin_executor.run(_op_revoke_token(token_id))
 
     async def export_db(self, db: str) -> str:
-        """``GET /admin/export-db?db=<db>`` → the database snapshot as JSONL text."""
-        return (await self._send("GET", "/admin/export-db", params={"db": db})).text
+        """``GET /admin/export-db?db=<db>`` → the database snapshot as JSONL text (async)."""
+        return await self._admin_executor.run(_op_export_db(db))
 
     async def import_db(self, db: str, jsonl: str) -> None:
-        """``POST /admin/import-db?db=<db>`` with an ``application/x-ndjson`` body."""
-        resp = await self._send(
-            "POST",
-            "/admin/import-db",
-            params={"db": db},
-            content=jsonl,
-            headers={"Content-Type": "application/x-ndjson"},
-        )
-        self._expect_ok(resp)
+        """``POST /admin/import-db?db=<db>`` with an ``application/x-ndjson`` body (async)."""
+        await self._admin_executor.run(_op_import_db(db, jsonl))
 
     async def allowlist_add(self, db: str, email: str) -> None:
-        """``POST /admin/allowlist`` ``{db, action:"add", email}`` → ``{ok:true}``."""
-        resp = await self._send(
-            "POST",
-            "/admin/allowlist",
-            json={"db": db, "action": "add", "email": email},
-        )
-        self._expect_ok(resp)
+        """``POST /admin/allowlist`` ``{db, action:"add", email}`` → ``{ok:true}`` (async)."""
+        await self._admin_executor.run(_op_allowlist_add(db, email))
 
     async def allowlist_remove(self, db: str, email: str) -> None:
-        """``POST /admin/allowlist`` ``{db, action:"remove", email}`` → ``{ok:true}``."""
-        resp = await self._send(
-            "POST",
-            "/admin/allowlist",
-            json={"db": db, "action": "remove", "email": email},
-        )
-        self._expect_ok(resp)
+        """``POST /admin/allowlist`` ``{db, action:"remove", email}`` → ``{ok:true}`` (async)."""
+        await self._admin_executor.run(_op_allowlist_remove(db, email))
 
     async def allowlist_list(self, db: str) -> list[str]:
-        """``GET /admin/allowlist?db=<db>`` → ``{emails:[...]}``."""
-        resp = await self._send("GET", "/admin/allowlist", params={"db": db})
-        return list(resp.json()["emails"])
+        """``GET /admin/allowlist?db=<db>`` → ``{emails:[...]}`` (async)."""
+        return await self._admin_executor.run(_op_allowlist_list(db))
 
     async def admins_list(self) -> list[AdminMember]:
-        """``GET /admin/admins`` → ``{admins:[{email, githubId?}]}``."""
-        resp = await self._send("GET", "/admin/admins")
-        return [AdminMember.model_validate(m) for m in resp.json()["admins"]]
+        """``GET /admin/admins`` → ``{admins:[{email, githubId?}]}`` (async)."""
+        return await self._admin_executor.run(_op_admins_list())
 
     async def admins_add(self, email: str, github_id: int | None = None) -> None:
-        """``POST /admin/admins`` ``{email, githubId?}`` → ``{ok:true}``.
+        """``POST /admin/admins`` ``{email, githubId?}`` → ``{ok:true}`` (async).
 
         ``githubId`` is omitted from the body when ``None`` (matches the
         server's ``skip_serializing_if`` rule).
         """
-        body: dict[str, Any] = {"email": email}
-        if github_id is not None:
-            body["githubId"] = github_id
-        resp = await self._send("POST", "/admin/admins", json=body)
-        self._expect_ok(resp)
+        await self._admin_executor.run(_op_admins_add(email, github_id))
 
     async def admins_remove(self, email: str) -> None:
-        """``DELETE /admin/admins`` ``{email}`` → ``{ok:true}``.
+        """``DELETE /admin/admins`` ``{email}`` → ``{ok:true}`` (async).
 
         Body-on-DELETE (axum reads it from the request body, not the URL) —
         mirrors the rust-client's ``delete_json``.
         """
-        resp = await self._send("DELETE", "/admin/admins", json={"email": email})
-        self._expect_ok(resp)
+        await self._admin_executor.run(_op_admins_remove(email))
 
     async def list_tokens(self, db: str) -> list[TokenInfo]:
-        """``GET /admin/tokens?db=<db>`` → ``{tokens:[{id,name,createdAt,revoked}]}``."""
-        resp = await self._send("GET", "/admin/tokens", params={"db": db})
-        return [TokenInfo.model_validate(t) for t in resp.json()["tokens"]]
+        """``GET /admin/tokens?db=<db>`` → ``{tokens:[{id,name,createdAt,revoked}]}`` (async)."""
+        return await self._admin_executor.run(_op_list_tokens(db))
 
     async def get_schema(self, db: str) -> SchemaDef:
-        """``GET /admin/dbs/{db}/schema`` → the database's pushed ``SchemaDef``."""
-        resp = await self._send("GET", f"/admin/dbs/{db}/schema")
-        return SchemaDef.model_validate(resp.json())
+        """``GET /admin/dbs/{db}/schema`` → the database's pushed ``SchemaDef`` (async)."""
+        return await self._admin_executor.run(_op_get_schema(db))
 
     async def db_stats(self, db: str) -> DbStats:
-        """``GET /admin/dbs/{db}/stats`` → per-table row counts + storage sizes."""
-        resp = await self._send("GET", f"/admin/dbs/{db}/stats")
-        return DbStats.model_validate(resp.json())
+        """``GET /admin/dbs/{db}/stats`` → per-table row counts + storage sizes (async)."""
+        return await self._admin_executor.run(_op_db_stats(db))
 
     async def metrics(self) -> MetricsSnapshot:
-        """``GET /admin/metrics`` → server-wide counters and gauges."""
-        resp = await self._send("GET", "/admin/metrics")
-        return MetricsSnapshot.model_validate(resp.json())
+        """``GET /admin/metrics`` → server-wide counters and gauges (async)."""
+        return await self._admin_executor.run(_op_metrics())
 
     async def get_config(self) -> ConfigResponse:
-        """``GET /admin/config`` → redacted running config + build identity + admins."""
-        resp = await self._send("GET", "/admin/config")
-        return ConfigResponse.model_validate(resp.json())
+        """``GET /admin/config`` → redacted running config + build identity + admins (async)."""
+        return await self._admin_executor.run(_op_get_config())
 
     async def patch_config(self, patch: HotConfigPatch | Mapping[str, Any]) -> ConfigResponse:
-        """``PATCH /admin/config`` with a partial hot-config body → updated config.
+        """``PATCH /admin/config`` with a partial hot-config body → updated config (async).
 
-        Each present field fully replaces the prior value; the server validates
-        (``sessionTtlDays>=1``, ``maxFileSize`` within bounds, origin shape).
-        Accepts a ``HotConfigPatch`` model or a plain ``Mapping`` of wire camelCase
-        keys (e.g. ``{"sessionTtlDays": 60}``); ``None``-valued model fields are
-        omitted from the body (matches rust-client's ``skip_serializing_if``).
+        See :meth:`par_rt_db.admin.RtDbAdminClient.patch_config` for body semantics.
         """
-        if isinstance(patch, Mapping):
-            body: dict[str, Any] = dict(patch)
-        else:
-            body = patch.model_dump(by_alias=True, mode="json", exclude_none=True)
-        resp = await self._send("PATCH", "/admin/config", json=body)
-        return ConfigResponse.model_validate(resp.json())
+        return await self._admin_executor.run(_op_patch_config(patch))
 
     async def ops_recent(
         self,
@@ -477,35 +480,21 @@ class RtDbAsyncHttpClient:
         table: str | None = None,
         n: int | None = None,
     ) -> list[OpEvent]:
-        """``GET /admin/ops/recent`` → recent document-op events, newest-first.
+        """``GET /admin/ops/recent`` → recent document-op events, newest-first (async).
 
         All filter opts are optional; omitted filters are not sent. ``n`` caps
         the result count (server-side max 500).
         """
-        params: dict[str, Any] = {}
-        if db is not None:
-            params["db"] = db
-        if table is not None:
-            params["table"] = table
-        if n is not None:
-            params["n"] = n
-        resp = await self._send("GET", "/admin/ops/recent", params=params)
-        return [OpEvent.model_validate(e) for e in resp.json()["ops"]]
+        return await self._admin_executor.run(_op_ops_recent(db=db, table=table, n=n))
 
     # --- admin data access: owner-bypass query/mutate (admin key) ---
 
     async def admin_query(self, db: str, query: Query | TableQuery, *, model: type = dict) -> Any:
-        """``POST /admin/db/{db}/query`` ``{query}`` → parsed ``{result}``.
+        """``POST /admin/db/{db}/query`` ``{query}`` → parsed ``{result}`` (async).
 
-        Owner-bypass: an admin reads documents across every database regardless
-        of ``ownerField``. ``db`` rides in the URL (singular ``db``), so the body
-        omits it. Result parsing mirrors ``run``.
+        See :meth:`par_rt_db.admin.RtDbAdminClient.admin_query` for owner-bypass semantics.
         """
-        built = query.build() if isinstance(query, TableQuery) else query
-        body = {"query": built.model_dump(by_alias=True, mode="json")}
-        resp = await self._send("POST", f"/admin/db/{db}/query", json=body)
-        result = resp.json()["result"]
-        return parse_result(model, _terminal_of(built), result)
+        return await self._admin_executor.run(_op_admin_query(db, query, model=model))
 
     async def admin_mutate(
         self,
@@ -514,18 +503,13 @@ class RtDbAsyncHttpClient:
         *,
         idempotency_key: str | None = None,
     ) -> list[StepResult]:
-        """``POST /admin/db/{db}/mutate`` ``{txn, idempotencyKey?}`` → ``{results}``.
+        """``POST /admin/db/{db}/mutate`` ``{txn, idempotencyKey?}`` → ``{results}`` (async).
 
-        Owner-bypass: an admin writes documents across every database. ``db``
-        rides in the URL, so the body omits it. ``idempotencyKey`` is omitted
-        when ``None``.
+        See :meth:`par_rt_db.admin.RtDbAdminClient.admin_mutate` for owner-bypass semantics.
         """
-        body: dict[str, Any] = {"txn": txn.model_dump(by_alias=True, mode="json")}
-        if idempotency_key is not None:
-            body["idempotencyKey"] = idempotency_key
-        resp = await self._send("POST", f"/admin/db/{db}/mutate", json=body)
-        results = resp.json()["results"]
-        return [_STEP_RESULT_ADAPTER.validate_python(r) for r in results]
+        return await self._admin_executor.run(
+            _op_admin_mutate(db, txn, idempotency_key=idempotency_key)
+        )
 
     async def migrate_schema(
         self,
@@ -534,84 +518,58 @@ class RtDbAsyncHttpClient:
         *,
         dry_run: bool = False,
     ) -> MigrateResult:
-        """``POST /admin/db/{db}/migrate`` ``{directives, dryRun}`` → ``MigrateResult``.
+        """``POST /admin/db/{db}/migrate`` ``{directives, dryRun}`` → ``MigrateResult`` (async).
 
-        Apply (when ``dry_run`` is ``False``) or preview (when ``True``) a
-        declarative schema migration. The server validates and folds the
-        directives transactionally; on ``dry_run`` nothing is committed and the
-        returned ``schema`` is the derived preview (``applied: False``).
-
-        Accepts a list of ``Directive`` model instances (from the ``Migration``
-        builder's directives or hand-built) or a full :class:`MigrateRequest`.
-        When passing a ``MigrateRequest``, the request's own ``dry_run`` flag is
-        overridden by the ``dry_run`` keyword argument (mirrors the rust-client's
-        signature: directives + a separate ``dry_run`` bool).
+        See :meth:`par_rt_db.admin.RtDbAdminClient.migrate_schema` for body semantics.
         """
-        if isinstance(directives, MigrateRequest):
-            wire_directives = directives.directives
-        else:
-            wire_directives = directives
-        body = {
-            "directives": [d.model_dump(by_alias=True, mode="json") for d in wire_directives],
-            "dryRun": dry_run,
-        }
-        resp = await self._send("POST", f"/admin/db/{db}/migrate", json=body)
-        return MigrateResult.model_validate(resp.json())
+        return await self._admin_executor.run(_op_migrate_schema(db, directives, dry_run=dry_run))
 
     # --- admin control plane: managed backups (admin key) ---
 
     async def backup_now(self) -> None:
-        """``POST /admin/backup`` → 202; one ``pg_dump`` runs in the background.
+        """``POST /admin/backup`` → 202; one ``pg_dump`` runs in the background (async).
 
         Idempotent trigger guard: a second call while one is running → 409
         ``CONFLICT``. The dump runs outside the committer (``pg_dump`` is a
         read), so no document tables or subscriptions are touched.
         """
-        resp = await self._send("POST", "/admin/backup", json={})
-        self._expect_ok(resp)
+        await self._admin_executor.run(_op_backup_now())
 
     async def list_backups(self) -> dict[str, Any]:
-        """``GET /admin/backups`` → ``{running: bool, backups: [{name, sizeBytes, createdMs}]}``.
+        """``GET /admin/backups`` → backup list + in-progress flag (async).
 
         Newest-first. A missing backup dir returns an empty list rather than
         erroring — the endpoint describes what is on disk. ``running`` is the
         in-progress flag for the manual ``POST /admin/backup`` trigger.
         """
-        resp = await self._send("GET", "/admin/backups")
-        return dict(resp.json())
+        return await self._admin_executor.run(_op_list_backups())
 
     async def download_backup(self, name: str) -> bytes:
-        """``GET /admin/backups/{name}`` → the dump file's raw bytes.
+        """``GET /admin/backups/{name}`` → the dump file's raw bytes (async).
 
         The response body is ``application/octet-stream``; do not JSON-decode.
         The server validates ``name`` (``rtdb-<stamp>.dump`` shape) before any
         filesystem access, so a traversal-shaped name is rejected at the edge.
         """
-        resp = await self._send("GET", f"/admin/backups/{name}")
-        return resp.content
+        return await self._admin_executor.run(_op_download_backup(name))
 
     async def delete_backup(self, name: str) -> None:
-        """``DELETE /admin/backups/{name}`` → 204; removes one dump file.
+        """``DELETE /admin/backups/{name}`` → 204; removes one dump file (async).
 
         Same ``validate_dump_name`` short-circuit as download; 404 if the file
         is already gone.
         """
-        await self._send("DELETE", f"/admin/backups/{name}")
+        await self._admin_executor.run(_op_delete_backup(name))
 
     async def restore_backup(self, name: str) -> dict[str, Any]:
-        """``POST /admin/restore`` ``{name, confirm}`` → ``{target, instructions}``.
+        """``POST /admin/restore`` ``{name, confirm}`` → ``{target, instructions}`` (async).
 
         ``confirm`` is sent equal to ``name`` (typed guard, mirroring
         ``delete_db``). The live DB is never touched: restore creates a fresh
         ``rtdb_restored_<stamp>`` DB and ``pg_restore``s into it. The response
         carries the target DB name and cutover instructions.
         """
-        resp = await self._send(
-            "POST",
-            "/admin/restore",
-            json={"name": name, "confirm": name},
-        )
-        return dict(resp.json())
+        return await self._admin_executor.run(_op_restore_backup(name))
 
     # --- request plumbing ---
 

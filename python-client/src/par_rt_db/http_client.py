@@ -20,6 +20,20 @@ Token convention (same as rust-client): the bearer passed to the constructor is
 sent on every call. For admin methods, construct the client with the instance
 admin key as the token; for data-plane methods, construct it with a per-db
 machine token (or OAuth session token).
+
+Architecture (ARC-108): the admin methods on this class are thin façades that
+delegate to the shared request-description layer in :mod:`par_rt_db.admin` —
+each method builds an :class:`~par_rt_db.admin._AdminRequest` via an ``_op_*``
+builder and hands it to a :class:`~par_rt_db.admin._SyncAdminExecutor` over this
+client's ``httpx.Client``. The admin surface therefore exists in exactly one
+place (the builders) rather than being duplicated across the sync/async ×
+data-plane/admin clients. New admin surface should be added to the canonical
+:class:`par_rt_db.admin.RtDbAdminClient`; the methods here remain for backward
+compatibility. The response models are defined once in
+:mod:`par_rt_db.admin_models` and re-exported below so every existing
+``from par_rt_db.http_client import <Model>`` resolves to the same class object
+as ``from par_rt_db import <Model>`` (locked down by
+``test_http_client.py::test_top_level_minted_token_is_http_client_minted_token``).
 """
 
 from __future__ import annotations
@@ -27,34 +41,121 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
+from pydantic import TypeAdapter
 
+from .admin import (
+    _op_admin_mutate,
+    _op_admin_query,
+    _op_admins_add,
+    _op_admins_list,
+    _op_admins_remove,
+    _op_allowlist_add,
+    _op_allowlist_list,
+    _op_allowlist_remove,
+    _op_backup_now,
+    _op_create_db,
+    _op_db_stats,
+    _op_delete_backup,
+    _op_delete_db,
+    _op_download_backup,
+    _op_export_db,
+    _op_get_config,
+    _op_get_schema,
+    _op_import_db,
+    _op_list_backups,
+    _op_list_dbs,
+    _op_list_tokens,
+    _op_metrics,
+    _op_migrate_schema,
+    _op_mint_token,
+    _op_ops_recent,
+    _op_patch_config,
+    _op_push_schema,
+    _op_restore_backup,
+    _op_revoke_token,
+    _SyncAdminExecutor,
+)
+from .admin_models import (
+    _STEP_RESULT_ADAPTER,
+    AdminMember,
+    AuditEntry,
+    CastFailure,
+    ConfigResponse,
+    DbStats,
+    DbSubCounters,
+    DirectiveReport,
+    HotConfig,
+    HotConfigPatch,
+    LatencyStats,
+    MetricsSnapshot,
+    MigrateResult,
+    MintedToken,
+    OpEvent,
+    SampleChange,
+    SchemaHistoryEntry,
+    SchemaHistorySummary,
+    SessionInfo,
+    SubscriptionInfo,
+    SubscriptionsPrincipal,
+    SubscriptionsResponse,
+    TableStat,
+    TokenInfo,
+    Webhook,
+    WebhookDelivery,
+    _Wire,
+)
 from .errors import ErrorCode, RtDbError
 from .migration import Directive, MigrateRequest
 from .mutation import StepResult, Transaction
 from .query import Query, TableQuery, _terminal_of, parse_result
 from .schema import SchemaDef
-from .wire import BatchQueryOutcome, ScheduleInfo, ScheduleWhen, to_camel
+from .wire import BatchQueryOutcome, ScheduleInfo, ScheduleWhen
 
 if TYPE_CHECKING:
     import httpx
 
 
-class _Wire(BaseModel):
-    """camelCase wire keys, reject unknown fields — for HTTP response models."""
+# Re-exports: admin response models are canonically defined in
+# :mod:`par_rt_db.admin_models` but are re-exported here for backward
+# compatibility (existing ``from par_rt_db.http_client import <Model>`` imports
+# must resolve to the same class object — see ARC-108). ``__all__`` declares the
+# full public surface so linters do not flag these as unused.
+__all__ = [
+    "RtDbHttpClient",
+    # storage models (defined here)
+    "UploadResult",
+    "FileMetadata",
+    "SignedUrl",
+    # admin response models (re-exported from .admin_models for backward compat)
+    "AdminMember",
+    "AuditEntry",
+    "CastFailure",
+    "ConfigResponse",
+    "DbStats",
+    "DbSubCounters",
+    "DirectiveReport",
+    "HotConfig",
+    "HotConfigPatch",
+    "LatencyStats",
+    "MetricsSnapshot",
+    "MigrateResult",
+    "MintedToken",
+    "OpEvent",
+    "SampleChange",
+    "SchemaHistoryEntry",
+    "SchemaHistorySummary",
+    "SessionInfo",
+    "SubscriptionInfo",
+    "SubscriptionsPrincipal",
+    "SubscriptionsResponse",
+    "TableStat",
+    "TokenInfo",
+    "Webhook",
+    "WebhookDelivery",
+]
 
-    model_config = ConfigDict(
-        extra="forbid",
-        populate_by_name=True,
-        alias_generator=to_camel,
-    )
 
-
-class MintedToken(_Wire):
-    """``POST /admin/mint-token`` response: ``{tokenId, token}``."""
-
-    token_id: str
-    token: str
+# --- storage models (data-plane shapes; defined here, not admin shapes) ---
 
 
 class UploadResult(_Wire):
@@ -89,361 +190,9 @@ class SignedUrl(_Wire):
     expires_at: int
 
 
-class AdminMember(_Wire):
-    """``GET /admin/admins`` row — ``{email, githubId?}``."""
-
-    email: str
-    github_id: int | None = None
-
-
-class TokenInfo(_Wire):
-    """``GET /admin/tokens`` row — ``{id, name, createdAt, revoked, expiresAt,
-    readOnly, tables}``.
-
-    The last three fields default so an older server that omits them still
-    deserializes (matches the server's ``#[serde(default)]`` on
-    ``TokenRow``); a current server always sends them. ``expiresAt``/``tables``
-    are ``None`` for a full-access token; ``readOnly`` is ``False`` for a
-    read-write token.
-    """
-
-    id: str
-    name: str
-    created_at: int
-    revoked: bool
-    expires_at: int | None = None
-    read_only: bool = False
-    tables: list[str] | None = None
-
-
-class SessionInfo(_Wire):
-    """One active interactive session row from ``GET /admin/sessions``.
-
-    ``tokenHash`` is a non-reversible sha256 digest (the plaintext token is
-    never stored), safe to surface to an admin and used to target a row for
-    revoke. ``email``/``login`` are ``None`` when the user has none (e.g. an
-    anonymous session). Mirrors the ts-client ``SessionInfo`` byte-for-byte
-    (camelCase on the wire).
-    """
-
-    token_hash: str
-    user_id: str
-    email: str | None = None
-    login: str | None = None
-    anonymous: bool = False
-    created_at: int
-    expires_at: int
-
-
-class TableStat(_Wire):
-    """One row of ``DbStats.tables`` — ``{name, rowCount, sizeBytes}``."""
-
-    name: str
-    row_count: int
-    size_bytes: int
-
-
-class DbStats(_Wire):
-    """``GET /admin/dbs/{db}/stats`` response — per-table row counts + sizes
-    plus the ENH-011 per-db quota/usage triple (``0`` = unlimited). The server
-    always emits all eight fields; ``extra='forbid'`` means a response missing
-    any would be rejected, matching the server's non-optional ``DbStatsResponse``.
-    """
-
-    tables: list[TableStat]
-    total_size_bytes: int
-    tables_quota: int
-    tables_used: int
-    storage_quota_bytes: int
-    storage_used_bytes: int
-    subs_quota: int
-    subs_used: int
-
-
-class LatencyStats(_Wire):
-    """p50/p95/p99 latency percentile triple (microseconds). Field names are
-    already lowercase, so ``to_camel`` leaves them as ``p50``/``p95``/``p99``."""
-
-    p50: int
-    p95: int
-    p99: int
-
-
-class DbSubCounters(_Wire):
-    """Per-db subscription counter row — the shape shared by ``perDb[]`` on
-    ``GET /admin/subscriptions`` and ``perDbSubs[]`` on ``GET /admin/metrics``.
-    Mirrors ``server::subs::DbSubCounters``."""
-
-    db: str
-    reruns: int
-    skips_point: int
-    skips_indexed: int
-    skips_ordered: int
-    missed: int
-
-
-class MetricsSnapshot(_Wire):
-    """``GET /admin/metrics`` response — server-wide counters and gauges.
-
-    The ``subs_*`` fields default to 0 so a client built against a newer server
-    still deserializes an older server's response (these counters landed
-    2026-07-29); 0 is the correct "not reported" value for a monotonic counter.
-    ``per_db_subs`` defaults to empty for the same reason (added 2026-08-05 with
-    the live subscription inspector, ENH-010).
-    """
-
-    queries_total: int
-    mutations_total: int
-    uploads_total: int
-    ws_connections: int
-    active_subscriptions: int
-    pool_size: int
-    pool_idle: int
-    uptime_seconds: int
-    query_latency: LatencyStats
-    mutate_latency: LatencyStats
-    subscribe_latency: LatencyStats
-    subs_reruns_total: int = 0
-    subs_skips_point_total: int = 0
-    subs_skips_indexed_total: int = 0
-    subs_skips_ordered_total: int = 0
-    subs_skip_verifications_total: int = 0
-    subs_missed_pushes_total: int = 0
-    per_db_subs: list[DbSubCounters] = Field(default_factory=list)
-
-
-class HotConfig(_Wire):
-    """Runtime-mutable hot config — mirrors ``server::config::HotConfig``."""
-
-    allowed_origins: list[str]
-    session_ttl_days: int
-    max_file_size: int
-    idempotency_ttl_ms: int
-    # Per-db resource quotas (ENH-011); 0 = unlimited. Mirrors server HotConfig.
-    max_tables_per_db: int = 0
-    max_storage_bytes_per_db: int = 0
-    max_subs_per_db: int = 0
-
-
-class ConfigResponse(_Wire):
-    """``GET /admin/config`` response — redacted boot config + hot config + build
-    identity + admin allowlist. Secrets surface as configured-bools, never values."""
-
-    port: int
-    public_url: str
-    github_base_url: str
-    github_api_url: str
-    database_url_configured: bool
-    admin_key_configured: bool
-    github_configured: bool
-    google_configured: bool
-    gitlab_configured: bool
-    oidc_configured: bool
-    hot: HotConfig
-    version: str
-    git_commit: str
-    admins: list[AdminMember]
-
-
-class HotConfigPatch(_Wire):
-    """``PATCH /admin/config`` body — every field optional; omitted fields are
-    left unchanged. Serialize with ``exclude_none=True`` so the wire body carries
-    only the fields the caller sets (matches rust-client's
-    ``skip_serializing_if = "Option::is_none"``). Unknown fields are rejected
-    server-side (``deny_unknown_fields``).
-    """
-
-    allowed_origins: list[str] | None = None
-    session_ttl_days: int | None = None
-    max_file_size: int | None = None
-    idempotency_ttl_ms: int | None = None
-    max_tables_per_db: int | None = None
-    max_storage_bytes_per_db: int | None = None
-    max_subs_per_db: int | None = None
-
-
-class OpEvent(_Wire):
-    """``GET /admin/ops/recent`` row — one document-op event from the in-memory
-    ring. ``kind`` is a lowercase string (``insert``/``patch``/``replace``/
-    ``delete``/``upsert``); ``owner`` is ``null`` for admin/machine writes."""
-
-    db: str
-    table: str
-    doc_id: str
-    kind: str
-    ts: int
-    owner: str | None = None
-
-
-class CastFailure(_Wire):
-    """One row of ``DirectiveReport.cast_failures`` — a value that could not be
-    coerced under ``changeType.cast``. Mirrors ``server::migrate::CastFailure``."""
-
-    id: str
-    value: Any
-
-
-class SampleChange(_Wire):
-    """One row of ``DirectiveReport.sample_changes`` — a before/after pair for a
-    row touched by a migration directive. Mirrors ``server::migrate::SampleChange``."""
-
-    id: str
-    before: Any
-    after: Any
-
-
-class DirectiveReport(_Wire):
-    """Per-directive outcome. ``castFailures`` and ``sampleChanges`` are
-    ``skip_serializing_if = "Vec::is_empty"`` on the server, so they surface as
-    optional on the wire (absent when empty). Mirrors
-    ``server::migrate::DirectiveReport``."""
-
-    op: str
-    affected_rows: int
-    cast_failures: list[CastFailure] = Field(default_factory=list)
-    sample_changes: list[SampleChange] = Field(default_factory=list)
-
-
-class MigrateResult(_Wire):
-    """``POST /admin/db/{db}/migrate`` response. ``schema`` is the post-migration
-    derived schema — returned even on ``dryRun`` (with ``applied: false``), so a
-    caller can preview the resulting shape. Mirrors ``server::migrate::MigrateResult``.
-
-    The Python attribute is ``schema_`` (trailing underscore) because pydantic v2's
-    ``BaseModel`` still carries the deprecated v1 ``.schema()`` method, and a field
-    literally named ``schema`` shadows it (pydantic emits a ``UserWarning``). The
-    wire alias is the server-contract ``"schema"``.
-    """
-
-    applied: bool
-    schema_: SchemaDef = Field(alias="schema")
-    directives: list[DirectiveReport]
-
-
-class SchemaHistorySummary(_Wire):
-    """One row of ``GET /admin/db/{db}/schema/history`` (newest-first). Mirrors
-    ``server::schema_history::HistorySummary``. ``source`` is the event that
-    captured the snapshot: ``"push"`` | ``"migrate"`` | ``"restore"``."""
-
-    version: int
-    captured_at: int
-    source: str
-    principal: str | None = None
-
-
-class SchemaHistoryEntry(SchemaHistorySummary):
-    """One full snapshot from ``GET /admin/db/{db}/schema/history/{version}``,
-    adding the ``schema`` blob. Mirrors ``server::schema_history::HistoryEntry``.
-
-    ``schema_`` is the raw captured JSON (a serialized ``SchemaDef``), kept as a
-    plain dict so an older snapshot never fails to validate. The trailing
-    underscore mirrors :class:`MigrateResult` (pydantic v2 reserves ``.schema()``).
-    """
-
-    schema_: dict[str, Any] = Field(alias="schema")
-
-
-class Webhook(_Wire):
-    """``GET /admin/db/{db}/webhooks`` row — one registered webhook.
-
-    Mirrors ``server::webhook::Webhook``. ``table`` is ``None`` for an
-    all-tables webhook (the server's ``tbl = None``); ``events`` is the
-    matched op-name list (``["*"]`` for all events). ``created_at`` is
-    epoch-millis. ``secret`` is the per-webhook HMAC signing key (SEC-115);
-    the receiver uses it to verify each delivery's ``X-Rtdb-Signature``
-    header. Server-generated; surfaced here so an operator can copy it to the
-    receiver. ``None`` only before the boot backfill has run (or against an
-    older server that omits the field).
-    """
-
-    id: int
-    db: str
-    table: str | None = None
-    url: str
-    events: list[str]
-    created_at: int
-    enabled: bool
-    secret: str | None = None
-
-
-class WebhookDelivery(_Wire):
-    """``GET /admin/db/{db}/webhooks/{id}/deliveries`` row — one delivery from
-    the outbox.
-
-    Mirrors ``server::webhook::DeliveryRow``. ``status`` is ``pending`` /
-    ``retrying`` / ``delivered`` / ``failed``. ``next_attempt`` is epoch-millis
-    (the due time of the next retry, monotonic under backoff). ``last_error``
-    is ``None`` once a delivery succeeds (or before any attempt). ``payload`` is
-    the opaque queued JSONB body — passed through verbatim so callers can
-    inspect the exact event the worker will/did POST.
-    """
-
-    id: int
-    attempts: int
-    status: str
-    next_attempt: int
-    last_error: str | None = None
-    payload: Any
-
-
-class AuditEntry(_Wire):
-    """``GET /admin/audit`` row — one durable audit-log record.
-
-    Mirrors ``server::audit::AuditEntry``. ``op`` is ``None`` for rows where the
-    op kind was not recorded; ``principal`` is ``None`` for system-initiated
-    writes (scheduled jobs, TTL reaper — ``owner = None`` at the tap site) where
-    no interactive user was involved. ``ts_ms`` is epoch-millis.
-    """
-
-    id: int
-    ts_ms: int
-    db: str
-    table: str
-    op: str | None = None
-    doc_id: str
-    principal: str | None = None
-    source: str
-
-
-class SubscriptionsPrincipal(_Wire):
-    """Interactive principal on a live subscription row — ``null`` for machine
-    tokens, scheduled jobs, and admin bypass (no interactive identity)."""
-
-    user_id: str | None
-    email: str | None
-
-
-class SubscriptionInfo(_Wire):
-    """``GET /admin/subscriptions`` row — one live subscription.
-
-    ``read_set_class`` is one of ``point``/``indexed``/``ordered``/``table``
-    (the four :class:`subs::ReadSet` variants); ``terminal`` is the query's
-    terminal operation (``get``/``count``/``collect``/``unique``/…)."""
-
-    db: str
-    table: str
-    terminal: str
-    read_set_class: str
-    principal: SubscriptionsPrincipal | None
-
-
-class SubscriptionsResponse(_Wire):
-    """``GET /admin/subscriptions`` response — live subscription rows plus the
-    subscription fan-out counters (rerun/skip totals, per-db breakdown)."""
-
-    subscriptions: list[SubscriptionInfo]
-    subs_reruns_total: int
-    subs_skips_point_total: int
-    subs_skips_indexed_total: int
-    subs_skips_ordered_total: int
-    subs_missed_pushes_total: int
-    per_db: list[DbSubCounters]
-
-
-# ``StepResult`` is a ``Union`` alias (no ``model_validate``); route through a
-# single ``TypeAdapter`` for the untagged per-step result, mirroring mutation.py.
-_STEP_RESULT_ADAPTER = TypeAdapter(StepResult)
-# ``list[...]`` aliases likewise need a TypeAdapter to validate at runtime.
+# ``list[...]`` aliases need a TypeAdapter to validate at runtime.
+# ``_STEP_RESULT_ADAPTER`` is imported from :mod:`par_rt_db.admin_models` (one
+# shared adapter across the data-plane and admin clients).
 _SCHEDULES_ADAPTER = TypeAdapter(list[ScheduleInfo])
 _BATCH_ADAPTER = TypeAdapter(list[BatchQueryOutcome])
 
@@ -461,6 +210,13 @@ class RtDbHttpClient:
 
     Reactive WebSocket (``/sync``) is NOT provided here — it is a separate async
     surface tracked as a follow-on plan.
+
+    The admin methods (``create_db`` / ``push_schema`` / ``mint_token`` / ...)
+    are thin façades over the shared admin request layer in
+    :mod:`par_rt_db.admin`; the canonical, full-surface admin client is
+    :class:`par_rt_db.admin.RtDbAdminClient`. The methods here remain for
+    backward compatibility — behavior, signatures, and return types are
+    identical.
     """
 
     def __init__(
@@ -487,6 +243,7 @@ class RtDbHttpClient:
         self._base = base
         self._db = db
         self._token = token
+        self._admin_executor = _SyncAdminExecutor(self._client)
 
     # --- lifecycle ---
 
@@ -726,11 +483,16 @@ class RtDbHttpClient:
         return f"{base}?{'&'.join(parts)}" if parts else base
 
     # --- admin control plane (admin key as the token) ---
+    #
+    # Façades over the shared admin request layer (ARC-108). Each method builds
+    # an ``_AdminRequest`` via an ``_op_*`` builder and delegates to the
+    # ``_SyncAdminExecutor``. The canonical full-surface client is
+    # :class:`par_rt_db.admin.RtDbAdminClient`; see the ``_op_*`` builders there
+    # for the authoritative request-construction and response-parsing logic.
 
     def create_db(self, name: str) -> None:
         """``POST /admin/create-db`` ``{name}`` → ``{ok:true}``."""
-        resp = self._send("POST", "/admin/create-db", json={"name": name})
-        self._expect_ok(resp)
+        self._admin_executor.run(_op_create_db(name))
 
     def delete_db(self, name: str, confirm: str) -> None:
         """``POST /admin/delete-db`` ``{name, confirm}`` → ``{ok:true}``.
@@ -738,26 +500,15 @@ class RtDbHttpClient:
         The server rejects with ``BAD_REQUEST`` unless ``confirm == name``
         exactly — the typed confirmation guard against accidental deletion.
         """
-        resp = self._send(
-            "POST",
-            "/admin/delete-db",
-            json={"name": name, "confirm": confirm},
-        )
-        self._expect_ok(resp)
+        self._admin_executor.run(_op_delete_db(name, confirm))
 
     def push_schema(self, db: str, schema: SchemaDef) -> None:
         """``POST /admin/push-schema`` ``{db, schema}`` → ``{ok:true}``."""
-        resp = self._send(
-            "POST",
-            "/admin/push-schema",
-            json={"db": db, "schema": schema.model_dump(by_alias=True, mode="json")},
-        )
-        self._expect_ok(resp)
+        self._admin_executor.run(_op_push_schema(db, schema))
 
     def list_dbs(self) -> list[str]:
         """``GET /admin/dbs`` → ``{databases:[...]}``."""
-        resp = self._send("GET", "/admin/dbs")
-        return list(resp.json()["databases"])
+        return self._admin_executor.run(_op_list_dbs())
 
     def mint_token(
         self,
@@ -770,68 +521,45 @@ class RtDbHttpClient:
     ) -> MintedToken:
         """``POST /admin/mint-token`` with capability fields → ``{tokenId, token}``.
 
-        ``expiresAt`` and ``tables`` are omitted from the body when ``None`` so
-        the server applies its defaults (no expiry, all tables). ``readOnly`` is
-        always sent — the server's ``#[serde(default)]`` treats absent as
-        ``false``, so sending it explicitly is harmless and clearer. The
-        two-arg ``mint_token(db, name)`` call still works (capability defaults:
-        read-write, no expiry, all tables).
+        See :meth:`par_rt_db.admin.RtDbAdminClient.mint_token` for body semantics.
         """
-        body: dict[str, Any] = {"db": db, "name": name, "readOnly": read_only}
-        if expires_at is not None:
-            body["expiresAt"] = expires_at
-        if tables is not None:
-            body["tables"] = list(tables)
-        resp = self._send("POST", "/admin/mint-token", json=body)
-        return MintedToken.model_validate(resp.json())
+        return self._admin_executor.run(
+            _op_mint_token(
+                db,
+                name,
+                expires_at=expires_at,
+                read_only=read_only,
+                tables=tables,
+            )
+        )
 
     def revoke_token(self, token_id: str) -> None:
         """``POST /admin/revoke-token`` ``{tokenId}`` → ``{ok:true}``."""
-        resp = self._send("POST", "/admin/revoke-token", json={"tokenId": token_id})
-        self._expect_ok(resp)
+        self._admin_executor.run(_op_revoke_token(token_id))
 
     def export_db(self, db: str) -> str:
         """``GET /admin/export-db?db=<db>`` → the database snapshot as JSONL text."""
-        return self._send("GET", "/admin/export-db", params={"db": db}).text
+        return self._admin_executor.run(_op_export_db(db))
 
     def import_db(self, db: str, jsonl: str) -> None:
         """``POST /admin/import-db?db=<db>`` with an ``application/x-ndjson`` body."""
-        resp = self._send(
-            "POST",
-            "/admin/import-db",
-            params={"db": db},
-            content=jsonl,
-            headers={"Content-Type": "application/x-ndjson"},
-        )
-        self._expect_ok(resp)
+        self._admin_executor.run(_op_import_db(db, jsonl))
 
     def allowlist_add(self, db: str, email: str) -> None:
         """``POST /admin/allowlist`` ``{db, action:"add", email}`` → ``{ok:true}``."""
-        resp = self._send(
-            "POST",
-            "/admin/allowlist",
-            json={"db": db, "action": "add", "email": email},
-        )
-        self._expect_ok(resp)
+        self._admin_executor.run(_op_allowlist_add(db, email))
 
     def allowlist_remove(self, db: str, email: str) -> None:
         """``POST /admin/allowlist`` ``{db, action:"remove", email}`` → ``{ok:true}``."""
-        resp = self._send(
-            "POST",
-            "/admin/allowlist",
-            json={"db": db, "action": "remove", "email": email},
-        )
-        self._expect_ok(resp)
+        self._admin_executor.run(_op_allowlist_remove(db, email))
 
     def allowlist_list(self, db: str) -> list[str]:
         """``GET /admin/allowlist?db=<db>`` → ``{emails:[...]}``."""
-        resp = self._send("GET", "/admin/allowlist", params={"db": db})
-        return list(resp.json()["emails"])
+        return self._admin_executor.run(_op_allowlist_list(db))
 
     def admins_list(self) -> list[AdminMember]:
         """``GET /admin/admins`` → ``{admins:[{email, githubId?}]}``."""
-        resp = self._send("GET", "/admin/admins")
-        return [AdminMember.model_validate(m) for m in resp.json()["admins"]]
+        return self._admin_executor.run(_op_admins_list())
 
     def admins_add(self, email: str, github_id: int | None = None) -> None:
         """``POST /admin/admins`` ``{email, githubId?}`` → ``{ok:true}``.
@@ -839,11 +567,7 @@ class RtDbHttpClient:
         ``githubId`` is omitted from the body when ``None`` (matches the
         server's ``skip_serializing_if`` rule).
         """
-        body: dict[str, Any] = {"email": email}
-        if github_id is not None:
-            body["githubId"] = github_id
-        resp = self._send("POST", "/admin/admins", json=body)
-        self._expect_ok(resp)
+        self._admin_executor.run(_op_admins_add(email, github_id))
 
     def admins_remove(self, email: str) -> None:
         """``DELETE /admin/admins`` ``{email}`` → ``{ok:true}``.
@@ -851,49 +575,34 @@ class RtDbHttpClient:
         Body-on-DELETE (axum reads it from the request body, not the URL) —
         mirrors the rust-client's ``delete_json``.
         """
-        resp = self._send("DELETE", "/admin/admins", json={"email": email})
-        self._expect_ok(resp)
+        self._admin_executor.run(_op_admins_remove(email))
 
     def list_tokens(self, db: str) -> list[TokenInfo]:
         """``GET /admin/tokens?db=<db>`` → ``{tokens:[{id,name,createdAt,revoked}]}``."""
-        resp = self._send("GET", "/admin/tokens", params={"db": db})
-        return [TokenInfo.model_validate(t) for t in resp.json()["tokens"]]
+        return self._admin_executor.run(_op_list_tokens(db))
 
     def get_schema(self, db: str) -> SchemaDef:
         """``GET /admin/dbs/{db}/schema`` → the database's pushed ``SchemaDef``."""
-        resp = self._send("GET", f"/admin/dbs/{db}/schema")
-        return SchemaDef.model_validate(resp.json())
+        return self._admin_executor.run(_op_get_schema(db))
 
     def db_stats(self, db: str) -> DbStats:
         """``GET /admin/dbs/{db}/stats`` → per-table row counts + storage sizes."""
-        resp = self._send("GET", f"/admin/dbs/{db}/stats")
-        return DbStats.model_validate(resp.json())
+        return self._admin_executor.run(_op_db_stats(db))
 
     def metrics(self) -> MetricsSnapshot:
         """``GET /admin/metrics`` → server-wide counters and gauges."""
-        resp = self._send("GET", "/admin/metrics")
-        return MetricsSnapshot.model_validate(resp.json())
+        return self._admin_executor.run(_op_metrics())
 
     def get_config(self) -> ConfigResponse:
         """``GET /admin/config`` → redacted running config + build identity + admins."""
-        resp = self._send("GET", "/admin/config")
-        return ConfigResponse.model_validate(resp.json())
+        return self._admin_executor.run(_op_get_config())
 
     def patch_config(self, patch: HotConfigPatch | Mapping[str, Any]) -> ConfigResponse:
         """``PATCH /admin/config`` with a partial hot-config body → updated config.
 
-        Each present field fully replaces the prior value; the server validates
-        (``sessionTtlDays>=1``, ``maxFileSize`` within bounds, origin shape).
-        Accepts a ``HotConfigPatch`` model or a plain ``Mapping`` of wire camelCase
-        keys (e.g. ``{"sessionTtlDays": 60}``); ``None``-valued model fields are
-        omitted from the body (matches rust-client's ``skip_serializing_if``).
+        See :meth:`par_rt_db.admin.RtDbAdminClient.patch_config` for body semantics.
         """
-        if isinstance(patch, Mapping):
-            body: dict[str, Any] = dict(patch)
-        else:
-            body = patch.model_dump(by_alias=True, mode="json", exclude_none=True)
-        resp = self._send("PATCH", "/admin/config", json=body)
-        return ConfigResponse.model_validate(resp.json())
+        return self._admin_executor.run(_op_patch_config(patch))
 
     def ops_recent(
         self,
@@ -907,30 +616,16 @@ class RtDbHttpClient:
         All filter opts are optional; omitted filters are not sent. ``n`` caps
         the result count (server-side max 500).
         """
-        params: dict[str, Any] = {}
-        if db is not None:
-            params["db"] = db
-        if table is not None:
-            params["table"] = table
-        if n is not None:
-            params["n"] = n
-        resp = self._send("GET", "/admin/ops/recent", params=params)
-        return [OpEvent.model_validate(e) for e in resp.json()["ops"]]
+        return self._admin_executor.run(_op_ops_recent(db=db, table=table, n=n))
 
     # --- admin data access: owner-bypass query/mutate (admin key) ---
 
     def admin_query(self, db: str, query: Query | TableQuery, *, model: type = dict) -> Any:
         """``POST /admin/db/{db}/query`` ``{query}`` → parsed ``{result}``.
 
-        Owner-bypass: an admin reads documents across every database regardless
-        of ``ownerField``. ``db`` rides in the URL (singular ``db``), so the body
-        omits it. Result parsing mirrors ``run``.
+        See :meth:`par_rt_db.admin.RtDbAdminClient.admin_query` for owner-bypass semantics.
         """
-        built = query.build() if isinstance(query, TableQuery) else query
-        body = {"query": built.model_dump(by_alias=True, mode="json")}
-        resp = self._send("POST", f"/admin/db/{db}/query", json=body)
-        result = resp.json()["result"]
-        return parse_result(model, _terminal_of(built), result)
+        return self._admin_executor.run(_op_admin_query(db, query, model=model))
 
     def admin_mutate(
         self,
@@ -941,16 +636,9 @@ class RtDbHttpClient:
     ) -> list[StepResult]:
         """``POST /admin/db/{db}/mutate`` ``{txn, idempotencyKey?}`` → ``{results}``.
 
-        Owner-bypass: an admin writes documents across every database. ``db``
-        rides in the URL, so the body omits it. ``idempotencyKey`` is omitted
-        when ``None``.
+        See :meth:`par_rt_db.admin.RtDbAdminClient.admin_mutate` for owner-bypass semantics.
         """
-        body: dict[str, Any] = {"txn": txn.model_dump(by_alias=True, mode="json")}
-        if idempotency_key is not None:
-            body["idempotencyKey"] = idempotency_key
-        resp = self._send("POST", f"/admin/db/{db}/mutate", json=body)
-        results = resp.json()["results"]
-        return [_STEP_RESULT_ADAPTER.validate_python(r) for r in results]
+        return self._admin_executor.run(_op_admin_mutate(db, txn, idempotency_key=idempotency_key))
 
     def migrate_schema(
         self,
@@ -961,27 +649,9 @@ class RtDbHttpClient:
     ) -> MigrateResult:
         """``POST /admin/db/{db}/migrate`` ``{directives, dryRun}`` → ``MigrateResult``.
 
-        Apply (when ``dry_run`` is ``False``) or preview (when ``True``) a
-        declarative schema migration. The server validates and folds the
-        directives transactionally; on ``dry_run`` nothing is committed and the
-        returned ``schema`` is the derived preview (``applied: False``).
-
-        Accepts a list of ``Directive`` model instances (from the ``Migration``
-        builder's directives or hand-built) or a full :class:`MigrateRequest`.
-        When passing a ``MigrateRequest``, the request's own ``dry_run`` flag is
-        overridden by the ``dry_run`` keyword argument (mirrors the rust-client's
-        signature: directives + a separate ``dry_run`` bool).
+        See :meth:`par_rt_db.admin.RtDbAdminClient.migrate_schema` for body semantics.
         """
-        if isinstance(directives, MigrateRequest):
-            wire_directives = directives.directives
-        else:
-            wire_directives = directives
-        body = {
-            "directives": [d.model_dump(by_alias=True, mode="json") for d in wire_directives],
-            "dryRun": dry_run,
-        }
-        resp = self._send("POST", f"/admin/db/{db}/migrate", json=body)
-        return MigrateResult.model_validate(resp.json())
+        return self._admin_executor.run(_op_migrate_schema(db, directives, dry_run=dry_run))
 
     # --- admin control plane: managed backups (admin key) ---
 
@@ -992,8 +662,7 @@ class RtDbHttpClient:
         ``CONFLICT``. The dump runs outside the committer (``pg_dump`` is a
         read), so no document tables or subscriptions are touched.
         """
-        resp = self._send("POST", "/admin/backup", json={})
-        self._expect_ok(resp)
+        self._admin_executor.run(_op_backup_now())
 
     def list_backups(self) -> dict[str, Any]:
         """``GET /admin/backups`` → ``{running: bool, backups: [{name, sizeBytes, createdMs}]}``.
@@ -1002,8 +671,7 @@ class RtDbHttpClient:
         erroring — the endpoint describes what is on disk. ``running`` is the
         in-progress flag for the manual ``POST /admin/backup`` trigger.
         """
-        resp = self._send("GET", "/admin/backups")
-        return dict(resp.json())
+        return self._admin_executor.run(_op_list_backups())
 
     def download_backup(self, name: str) -> bytes:
         """``GET /admin/backups/{name}`` → the dump file's raw bytes.
@@ -1012,8 +680,7 @@ class RtDbHttpClient:
         The server validates ``name`` (``rtdb-<stamp>.dump`` shape) before any
         filesystem access, so a traversal-shaped name is rejected at the edge.
         """
-        resp = self._send("GET", f"/admin/backups/{name}")
-        return resp.content
+        return self._admin_executor.run(_op_download_backup(name))
 
     def delete_backup(self, name: str) -> None:
         """``DELETE /admin/backups/{name}`` → 204; removes one dump file.
@@ -1021,7 +688,7 @@ class RtDbHttpClient:
         Same ``validate_dump_name`` short-circuit as download; 404 if the file
         is already gone.
         """
-        self._send("DELETE", f"/admin/backups/{name}")
+        self._admin_executor.run(_op_delete_backup(name))
 
     def restore_backup(self, name: str) -> dict[str, Any]:
         """``POST /admin/restore`` ``{name, confirm}`` → ``{target, instructions}``.
@@ -1031,12 +698,7 @@ class RtDbHttpClient:
         ``rtdb_restored_<stamp>`` DB and ``pg_restore``s into it. The response
         carries the target DB name and cutover instructions.
         """
-        resp = self._send(
-            "POST",
-            "/admin/restore",
-            json={"name": name, "confirm": name},
-        )
-        return dict(resp.json())
+        return self._admin_executor.run(_op_restore_backup(name))
 
     # --- request plumbing ---
 
