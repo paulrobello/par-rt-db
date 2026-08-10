@@ -2,6 +2,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::RtDbError;
 
+/// Minimum admin-key length enforced at boot (SEC-110). 16 chars is the floor
+/// below which a key is brute-forceable over the public `POST /admin/login`
+/// endpoint within practical time even without the rate limiter; the
+/// recommended length is far higher (a 32-byte hex string, e.g. 64 chars).
+pub(crate) const MIN_ADMIN_KEY_LEN: usize = 16;
+
 /// Hard upper bound on `HotConfig::max_file_size`, enforced at boot seed
 /// (`HotConfig::from_env`) and at the upload buffering point
 /// (`http_api::upload_handler`). The hot-config value is admin-mutable via
@@ -203,6 +209,15 @@ pub struct Config {
     /// reader; boot-only (not hot-reloadable) because the cache lives outside
     /// `HotConfig` and is rebuilt from `AppState` on its own cadence.
     pub quota_cache_ttl_secs: u64,
+    /// RTDB_ADMIN_RATE_LIMIT_PER_IP_RPM (default 0 = unlimited). Per-IP fixed-
+    /// window rate limit on `POST /admin/login` (SEC-109) — without it, an
+    /// attacker can brute-force the admin key unbounded over the public
+    /// endpoint. 0 preserves today's unlimited behavior (the limiter is off
+    /// unless an operator opts in); a non-zero value like 10 means one IP gets
+    /// 10 admin-login attempts per minute before 429. The IP key is
+    /// canonicalized by `client_ip_key` (CF-Connecting-IP preferred, rightmost
+    /// XFF fallback). Boot-only (not hot-reloadable).
+    pub admin_rate_limit_per_ip_rpm: u32,
 }
 
 impl Config {
@@ -220,6 +235,14 @@ impl Config {
 
         let admin_key = std::env::var("RTDB_ADMIN_KEY")
             .map_err(|_| "RTDB_ADMIN_KEY is required".to_string())?;
+        // SEC-110: reject weak/placeholder admin keys at boot. An empty key
+        // makes the constant-time compare trivially pass (`ct_eq(b"", b"")`),
+        // authenticating anyone as admin; a short key is brute-forceable on
+        // the public `/admin/login` endpoint; a placeholder copied from
+        // `.env.example` / a quickstart is the most common cause of an
+        // accidental admin bypass. `authenticate_admin` re-checks for empty
+        // as defense-in-depth.
+        validate_admin_key(&admin_key)?;
 
         let public_url = std::env::var("RTDB_PUBLIC_URL")
             .unwrap_or_else(|_| "http://localhost:8300".to_string());
@@ -507,6 +530,16 @@ impl Config {
             Err(_) => 60,
         };
 
+        // SEC-109: per-IP rate limit on `POST /admin/login`. 0 = unlimited
+        // (the default), preserving today's behavior. Unparseable values fall
+        // back to 0 (off), matching the other rate-limit parses — an operator
+        // who sets a non-numeric value gets the safe default, not a surprise
+        // lockout.
+        let admin_rate_limit_per_ip_rpm = match std::env::var("RTDB_ADMIN_RATE_LIMIT_PER_IP_RPM") {
+            Ok(v) => v.parse::<u32>().unwrap_or(0),
+            Err(_) => 0,
+        };
+
         Ok(Self {
             port,
             database_url,
@@ -569,8 +602,61 @@ impl Config {
             anonymous_session_ttl_days,
             anonymous_rate_limit_per_ip_rpm,
             quota_cache_ttl_secs,
+            admin_rate_limit_per_ip_rpm,
         })
     }
+}
+
+/// SEC-110: minimum-strength gate for the configured admin key, enforced at
+/// boot. Rejects:
+/// - empty or whitespace-only (`ct_eq(b"", b"")` would authenticate anyone);
+/// - shorter than [`MIN_ADMIN_KEY_LEN`] (brute-forceable over `/admin/login`);
+/// - obvious placeholders copied verbatim from `.env.example` / quickstarts.
+///
+/// The min-length floor is the real strength gate; the placeholder list is a
+/// focused denylist of the most common copy-paste offenders (case-insensitive
+/// exact match, so a strong random key that happens to contain "admin" as a
+/// substring is NOT rejected). An operator who needs a weaker key for a local
+/// dev harness should set a 16+ char string — the floor is deliberately low.
+pub(crate) fn validate_admin_key(key: &str) -> Result<(), String> {
+    let trimmed = key.trim();
+    if trimmed.is_empty() {
+        return Err(
+            "RTDB_ADMIN_KEY must not be empty or whitespace (it would authenticate anyone as admin)"
+                .to_string(),
+        );
+    }
+    if trimmed.len() < MIN_ADMIN_KEY_LEN {
+        return Err(format!(
+            "RTDB_ADMIN_KEY must be at least {MIN_ADMIN_KEY_LEN} characters (got {}); \
+             configure a strong random key (e.g. 64 hex chars)",
+            trimmed.len()
+        ));
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    // Exact-match placeholders only (not substring) so a strong random key
+    // that happens to contain one of these words is not falsely rejected.
+    const PLACEHOLDERS: &[&str] = &[
+        "changeme",
+        "changeme-random-hex",
+        "password",
+        "secret",
+        "admin",
+        "admin-key",
+        "your-admin-key",
+        "your-secret-key",
+        "replace-me",
+        "replace-me-with-a-real-key",
+        "test-key",
+        "testadmin",
+    ];
+    if PLACEHOLDERS.iter().any(|p| lower == *p) {
+        return Err(format!(
+            "RTDB_ADMIN_KEY is set to an obvious placeholder ({trimmed:?}); \
+             set a real random key"
+        ));
+    }
+    Ok(())
 }
 
 /// Runtime-mutable, hot-reloadable configuration. Held in `AppState` behind an
@@ -996,8 +1082,11 @@ mod tests {
             // Seed the two required vars (save originals to restore at the end).
             let saved_db = std::env::var("RTDB_DATABASE_URL").ok();
             let saved_key = std::env::var("RTDB_ADMIN_KEY").ok();
+            let saved_admin_limit = std::env::var("RTDB_ADMIN_RATE_LIMIT_PER_IP_RPM").ok();
             std::env::set_var("RTDB_DATABASE_URL", "postgres://test");
-            std::env::set_var("RTDB_ADMIN_KEY", "test-key");
+            // SEC-110: the boot validator (validate_admin_key) rejects keys
+            // shorter than 16 chars, so use a key that clears the floor.
+            std::env::set_var("RTDB_ADMIN_KEY", "test-admin-key-0123");
 
             // Defaults (vars unset): enabled=true (default-on), sensible caps.
             std::env::remove_var("RTDB_PRESENCE_ENABLED");
@@ -1030,6 +1119,32 @@ mod tests {
             let c = Config::from_env().expect("from_env with required vars set");
             assert!(!c.presence_enabled);
 
+            // SEC-109: RTDB_ADMIN_RATE_LIMIT_PER_IP_RPM defaults to 0 (off)
+            // and parses a non-zero override; unparseable falls back to 0.
+            std::env::remove_var("RTDB_ADMIN_RATE_LIMIT_PER_IP_RPM");
+            let c = Config::from_env().expect("from_env with required vars set");
+            assert_eq!(c.admin_rate_limit_per_ip_rpm, 0, "default is 0 = off");
+            std::env::set_var("RTDB_ADMIN_RATE_LIMIT_PER_IP_RPM", "10");
+            let c = Config::from_env().expect("from_env with required vars set");
+            assert_eq!(c.admin_rate_limit_per_ip_rpm, 10);
+            std::env::set_var("RTDB_ADMIN_RATE_LIMIT_PER_IP_RPM", "not-a-number");
+            let c = Config::from_env().expect("from_env with required vars set");
+            assert_eq!(
+                c.admin_rate_limit_per_ip_rpm, 0,
+                "unparseable falls back to 0"
+            );
+
+            // SEC-110: from_env rejects empty/short admin keys at boot.
+            std::env::set_var("RTDB_ADMIN_KEY", "");
+            let err = Config::from_env().expect_err("empty admin key must fail boot");
+            assert!(err.contains("RTDB_ADMIN_KEY"), "error names the var: {err}");
+            std::env::set_var("RTDB_ADMIN_KEY", "short");
+            let err = Config::from_env().expect_err("short admin key must fail boot");
+            assert!(err.contains("RTDB_ADMIN_KEY"), "error names the var: {err}");
+            // Restore the valid key before cleanup so the next test's save/restore
+            // sees a valid state.
+            std::env::set_var("RTDB_ADMIN_KEY", "test-admin-key-0123");
+
             // Cleanup: remove presence vars (don't leak into other lib tests) and
             // restore the required vars to their pre-test state.
             std::env::remove_var("RTDB_PRESENCE_ENABLED");
@@ -1048,6 +1163,71 @@ mod tests {
                 Some(v) => std::env::set_var("RTDB_ADMIN_KEY", v),
                 None => std::env::remove_var("RTDB_ADMIN_KEY"),
             }
+            match saved_admin_limit {
+                Some(v) => std::env::set_var("RTDB_ADMIN_RATE_LIMIT_PER_IP_RPM", v),
+                None => std::env::remove_var("RTDB_ADMIN_RATE_LIMIT_PER_IP_RPM"),
+            }
         }
+    }
+
+    /// SEC-110: a strong random key clears the validator.
+    #[test]
+    fn validate_admin_key_accepts_strong_key() {
+        assert!(validate_admin_key("a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4").is_ok());
+        // 16 chars exactly (the floor) is accepted.
+        assert!(validate_admin_key("abcdef0123456789").is_ok());
+    }
+
+    /// SEC-110: empty / whitespace-only keys are rejected (they would make
+    /// `ct_eq(b"", b"")` authenticate anyone as admin).
+    #[test]
+    fn validate_admin_key_rejects_empty() {
+        assert!(validate_admin_key("").is_err());
+        assert!(validate_admin_key("   ").is_err());
+        assert!(validate_admin_key("\t\n").is_err());
+    }
+
+    /// SEC-110: keys shorter than 16 chars are rejected (brute-forceable).
+    #[test]
+    fn validate_admin_key_rejects_short() {
+        assert!(validate_admin_key("short").is_err());
+        assert!(validate_admin_key("1234567890abcde").is_err()); // 15 chars
+    }
+
+    /// SEC-110: obvious placeholders copied from templates are rejected.
+    #[test]
+    fn validate_admin_key_rejects_placeholders() {
+        for placeholder in [
+            "changeme",
+            "changeme-random-hex",
+            "password",
+            "secret",
+            "admin",
+            "admin-key",
+            "your-admin-key",
+            "replace-me",
+            "test-key",
+        ] {
+            assert!(
+                validate_admin_key(placeholder).is_err(),
+                "should reject placeholder: {placeholder}"
+            );
+            // Case-insensitive.
+            assert!(
+                validate_admin_key(&placeholder.to_uppercase()).is_err(),
+                "should reject placeholder (uppercase): {placeholder}"
+            );
+        }
+    }
+
+    /// SEC-110: a strong key that merely CONTAINS a placeholder word as a
+    /// substring is NOT rejected — the denylist is exact-match only, so real
+    /// random keys are not falsely blocked.
+    #[test]
+    fn validate_admin_key_substring_is_not_rejected() {
+        // Contains "admin" but is long and not an exact match.
+        assert!(validate_admin_key("my-admin-key-is-strong-0123").is_ok());
+        // Contains "secret" but is long and not an exact match.
+        assert!(validate_admin_key("a1b2c3secretd4e5f6a1b2").is_ok());
     }
 }

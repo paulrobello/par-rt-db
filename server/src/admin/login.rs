@@ -1,9 +1,10 @@
 //! Admin identity & access: key login/logout, dashboard admins, db allowlist.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::Json;
-use axum::extract::{Query as QueryParams, State};
+use axum::extract::{ConnectInfo, Query as QueryParams, State};
 use axum::http::{HeaderMap, StatusCode, header::SET_COOKIE};
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
@@ -13,7 +14,7 @@ use crate::error::RtDbError;
 use crate::http_api::ApiJson;
 use crate::{AppState, auth, db};
 
-use super::{OkResponse, require_admin};
+use super::OkResponse;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -28,16 +29,57 @@ pub(super) struct AdminLoginRequest {
 /// `state.config.admin_key` (the trusted configured value), never the raw
 /// request body, so a `;`-laden guess cannot inject cookie attributes —
 /// `set_session_cookie` validates regardless.
+///
+/// SEC-109: per-IP rate limiting bounds brute-force over this public endpoint.
+/// Each failure (rate-limited or bad key) increments the
+/// `rtdb_admin_auth_failures_total` counter and logs at WARN — a burst of those
+/// is the brute-force signal operators alert on.
 pub(super) async fn admin_login(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     ApiJson(body): ApiJson<AdminLoginRequest>,
 ) -> Result<Response, RtDbError> {
+    // SEC-109: per-IP fixed-window rate limit. 0 = off (the default); a
+    // non-zero value like 10 means one IP gets 10 attempts/minute before 429.
+    // Checked BEFORE the ct_eq so a flood of guesses never reaches the compare.
+    let ip_key = crate::http_api::client_ip_key(&headers, addr.ip());
+    let limit = state.config.admin_rate_limit_per_ip_rpm;
+    if limit > 0 {
+        match state
+            .rate_limiter
+            .check(crate::rate_limit::RateKey::Ip(ip_key.clone()), limit)
+            .await
+        {
+            crate::rate_limit::RateDecision::Denied { retry_after_secs } => {
+                state.runtime.metrics.record_admin_auth_failure();
+                tracing::warn!(
+                    ip = %ip_key,
+                    "admin login rate-limited (limit {} rpm)",
+                    limit
+                );
+                return Err(RtDbError::rate_limited(retry_after_secs));
+            }
+            crate::rate_limit::RateDecision::Allowed => {}
+        }
+    }
+
+    // SEC-110: defense-in-depth — never authenticate against an empty key.
+    // `Config::from_env` rejects this at boot, but `admin_login` does its own
+    // ct_eq (not through `authenticate_admin`), so guard here too.
+    if state.config.admin_key.trim().is_empty() {
+        state.runtime.metrics.record_admin_auth_failure();
+        tracing::warn!(ip = %ip_key, "admin login rejected: admin key not configured");
+        return Err(RtDbError::unauthorized("invalid admin key"));
+    }
+
     let valid = body
         .admin_key
         .as_bytes()
         .ct_eq(state.config.admin_key.as_bytes());
     if !bool::from(valid) {
+        state.runtime.metrics.record_admin_auth_failure();
+        tracing::warn!(ip = %ip_key, "admin login rejected: bad key");
         return Err(RtDbError::unauthorized("invalid admin key"));
     }
     let secure = auth::cookie::request_is_secure(&headers);
@@ -73,10 +115,9 @@ pub(super) struct AllowlistWriteRequest {
 
 pub(super) async fn allowlist_write(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
     ApiJson(body): ApiJson<AllowlistWriteRequest>,
 ) -> Result<Json<OkResponse>, RtDbError> {
-    require_admin(&state, &headers).await?;
     if !db::database_exists(&state.pool, &body.db).await? {
         return Err(RtDbError::bad_request("unknown database"));
     }
@@ -120,10 +161,9 @@ pub(super) struct AllowlistListResponse {
 
 pub(super) async fn allowlist_list(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
     QueryParams(params): QueryParams<AllowlistListParams>,
 ) -> Result<Json<AllowlistListResponse>, RtDbError> {
-    require_admin(&state, &headers).await?;
     if !db::database_exists(&state.pool, &params.db).await? {
         return Err(RtDbError::bad_request("unknown database"));
     }
@@ -166,9 +206,8 @@ pub(super) async fn admin_members(pool: &sqlx::PgPool) -> Result<Vec<AdminMember
 
 pub(super) async fn list_admins(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
 ) -> Result<Json<AdminsResponse>, RtDbError> {
-    require_admin(&state, &headers).await?;
     Ok(Json(AdminsResponse {
         admins: admin_members(&state.pool).await?,
     }))
@@ -183,10 +222,9 @@ pub(super) struct AddAdminRequest {
 
 pub(super) async fn add_admin(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
     ApiJson(body): ApiJson<AddAdminRequest>,
 ) -> Result<Json<OkResponse>, RtDbError> {
-    require_admin(&state, &headers).await?;
     let email = body.email.trim().to_lowercase();
     if email.is_empty() {
         return Err(RtDbError::bad_request("email is required"));
@@ -212,10 +250,9 @@ pub(super) struct RemoveAdminRequest {
 
 pub(super) async fn remove_admin(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
     ApiJson(body): ApiJson<RemoveAdminRequest>,
 ) -> Result<Json<OkResponse>, RtDbError> {
-    require_admin(&state, &headers).await?;
     sqlx::query("DELETE FROM rtdb_auth.admins WHERE email = $1")
         .bind(body.email.trim().to_lowercase())
         .execute(&state.pool)

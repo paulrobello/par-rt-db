@@ -18,8 +18,6 @@ use crate::scheduler;
 use crate::txn::Transaction;
 use crate::{AppState, db};
 
-use super::require_admin;
-
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct AdminScheduleCreateRequest {
@@ -45,10 +43,9 @@ pub(super) struct AdminScheduleManageResponse {
 /// `GET /admin/db/{db}/schedules` — list scheduled jobs for a database.
 pub(super) async fn admin_list_schedules(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
     Path(db): Path<String>,
 ) -> Result<Json<AdminScheduleListResponse>, RtDbError> {
-    require_admin(&state, &headers).await?;
     if !db::database_exists(&state.pool, &db).await? {
         return Err(RtDbError::not_found("unknown database"));
     }
@@ -61,11 +58,10 @@ pub(super) async fn admin_list_schedules(
 /// (admin-gated instead).
 pub(super) async fn admin_create_schedule(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
     Path(db): Path<String>,
     ApiJson(body): ApiJson<AdminScheduleCreateRequest>,
 ) -> Result<Json<AdminScheduleCreateResponse>, RtDbError> {
-    require_admin(&state, &headers).await?;
     if !db::database_exists(&state.pool, &db).await? {
         return Err(RtDbError::not_found("unknown database"));
     }
@@ -77,10 +73,9 @@ pub(super) async fn admin_create_schedule(
 /// `POST /admin/db/{db}/schedules/{id}/cancel` — delete a scheduled job.
 pub(super) async fn admin_cancel_schedule(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
     Path((db, id)): Path<(String, String)>,
 ) -> Result<Json<AdminScheduleManageResponse>, RtDbError> {
-    require_admin(&state, &headers).await?;
     if !db::database_exists(&state.pool, &db).await? {
         return Err(RtDbError::not_found("unknown database"));
     }
@@ -91,12 +86,10 @@ pub(super) async fn admin_cancel_schedule(
 /// Shared pause/resume path — `paused = true` pauses, `false` resumes.
 async fn admin_set_schedule_paused(
     state: &Arc<AppState>,
-    headers: &HeaderMap,
     db: &str,
     id: &str,
     paused: bool,
 ) -> Result<Json<AdminScheduleManageResponse>, RtDbError> {
-    require_admin(state, headers).await?;
     if !db::database_exists(&state.pool, db).await? {
         return Err(RtDbError::not_found("unknown database"));
     }
@@ -107,17 +100,17 @@ async fn admin_set_schedule_paused(
 /// `POST /admin/db/{db}/schedules/{id}/pause` — pause a pending job.
 pub(super) async fn admin_pause_schedule(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
     Path((db, id)): Path<(String, String)>,
 ) -> Result<Json<AdminScheduleManageResponse>, RtDbError> {
-    admin_set_schedule_paused(&state, &headers, &db, &id, true).await
+    admin_set_schedule_paused(&state, &db, &id, true).await
 }
 
 /// `POST /admin/db/{db}/schedules/{id}/resume` — resume a paused job.
 pub(super) async fn admin_resume_schedule(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
     Path((db, id)): Path<(String, String)>,
 ) -> Result<Json<AdminScheduleManageResponse>, RtDbError> {
-    admin_set_schedule_paused(&state, &headers, &db, &id, false).await
+    admin_set_schedule_paused(&state, &db, &id, false).await
 }

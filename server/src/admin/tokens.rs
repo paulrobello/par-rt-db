@@ -11,7 +11,7 @@ use crate::error::RtDbError;
 use crate::http_api::ApiJson;
 use crate::{AppState, auth, db};
 
-use super::{OkResponse, require_admin};
+use super::OkResponse;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -35,10 +35,9 @@ pub(super) struct MintTokenResponse {
 
 pub(super) async fn mint_token(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
     ApiJson(body): ApiJson<MintTokenRequest>,
 ) -> Result<Json<MintTokenResponse>, RtDbError> {
-    require_admin(&state, &headers).await?;
     if !db::database_exists(&state.pool, &body.db).await? {
         return Err(RtDbError::bad_request("unknown database"));
     }
@@ -62,10 +61,9 @@ pub(super) struct RevokeTokenRequest {
 
 pub(super) async fn revoke_token(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
     ApiJson(body): ApiJson<RevokeTokenRequest>,
 ) -> Result<Json<OkResponse>, RtDbError> {
-    require_admin(&state, &headers).await?;
     auth::tokens::revoke_token(&state.pool, &body.token_id).await?;
     Ok(Json(OkResponse { ok: true }))
 }
@@ -94,10 +92,9 @@ pub(super) struct TokensParams {
 
 pub(super) async fn list_tokens(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
     QueryParams(params): QueryParams<TokensParams>,
 ) -> Result<Json<TokensResponse>, RtDbError> {
-    require_admin(&state, &headers).await?;
     if !db::database_exists(&state.pool, &params.db).await? {
         return Err(RtDbError::bad_request("unknown database"));
     }

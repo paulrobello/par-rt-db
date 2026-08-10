@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
 use axum::Router;
-use axum::extract::{DefaultBodyLimit, Request};
+use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::http::{HeaderMap, Method};
-use axum::middleware::{Next, from_fn};
+use axum::middleware::{Next, from_fn, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use serde::Serialize;
@@ -48,6 +48,7 @@ use webhooks::*;
 /// through the op-feed's `owner` field (which is `None` for admin writes); if
 /// per-principal audit logging is added later, thread the resolved `Principal`
 /// back in here.
+#[derive(Clone, Copy)]
 pub(crate) enum AdminPrincipal {
     Key,
     User,
@@ -98,6 +99,13 @@ pub(crate) async fn authenticate_admin(
     state: &AppState,
     token: &str,
 ) -> Result<AdminPrincipal, RtDbError> {
+    // SEC-110: defense-in-depth — never authenticate against an empty/whitespace
+    // key. `Config::from_env` rejects this at boot, but if an empty key reaches
+    // here (test harness constructing Config directly, stale config), this
+    // short-circuit ensures `ct_eq(b"", b"")` cannot silently pass.
+    if state.config.admin_key.trim().is_empty() {
+        return Err(RtDbError::unauthorized("admin key not configured"));
+    }
     if bool::from(token.as_bytes().ct_eq(state.config.admin_key.as_bytes())) {
         return Ok(AdminPrincipal::Key);
     }
@@ -118,6 +126,38 @@ pub(crate) async fn require_admin(
     headers: &HeaderMap,
 ) -> Result<AdminPrincipal, RtDbError> {
     authenticate_admin(state, bearer_value(headers)?).await
+}
+
+/// SEC-108: middleware that gates every admin route at the router layer instead
+/// of relying on per-handler `require_admin(...)` calls (one omission = silent
+/// auth bypass). `/admin/login` and `/admin/logout` are exempt (they mint/clear
+/// credentials); `/admin/stream` is exempt (the WS upgrade authenticates inline
+/// via `bearer_value`/`bearer_from_subprotocol`, the latter unreachable from
+/// `require_admin`). The resolved `AdminPrincipal` is stashed in request
+/// extensions for handlers that need the Key-vs-User distinction (e.g.
+/// `admin_migrate`'s `evalExpr` gate, SEC-107).
+pub(super) async fn require_admin_mw(
+    State(state): State<Arc<AppState>>,
+    mut req: Request,
+    next: Next,
+) -> Response {
+    if matches!(
+        req.uri().path(),
+        "/admin/login" | "/admin/logout" | "/admin/stream"
+    ) {
+        return next.run(req).await;
+    }
+    let auth = {
+        let headers = req.headers();
+        require_admin(&state, headers).await
+    };
+    match auth {
+        Ok(principal) => {
+            req.extensions_mut().insert(principal);
+            next.run(req).await
+        }
+        Err(e) => e.into_response(),
+    }
 }
 
 /// HTTP header name the dashboard echoes the admin-CSRF nonce back in
@@ -207,9 +247,10 @@ pub(super) struct OkResponse {
     ok: bool,
 }
 
-/// Admin routes, all gated on `Authorization: Bearer <admin_key>` (constant-time
-/// compare).
-pub fn admin_routes() -> Router<Arc<AppState>> {
+/// Admin routes, gated at the router layer by `require_admin_mw` (SEC-108) and
+/// the CSRF double-submit guard (SEC-106). `state` is threaded into the
+/// auth middleware via `from_fn_with_state` so it can resolve `State<Arc<AppState>>`.
+pub fn admin_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
     Router::new()
         .route("/admin/login", post(admin_login))
         .route("/admin/logout", post(admin_logout))
@@ -303,6 +344,10 @@ pub fn admin_routes() -> Router<Arc<AppState>> {
         .route("/admin/export-db", get(export_db))
         .route("/admin/import-db", post(import_db))
         .route("/admin/clone-db", post(clone_db))
+        // SEC-108: gate every admin route at the router layer. Login/logout/
+        // stream are exempt (see `require_admin_mw`). Runs inside the CSRF
+        // guard so a cookie-authenticated CSRF attack is caught first.
+        .layer(from_fn_with_state(state, require_admin_mw))
         // SEC-106: require the admin-CSRF double-submit nonce on cookie-
         // authenticated mutating requests. Login/logout and bearer-authenticated
         // requests skip the check (see `admin_csrf_guard`).

@@ -14,7 +14,6 @@ use crate::error::RtDbError;
 use crate::http_api::ApiJson;
 
 use super::login::{AdminMember, admin_members};
-use super::require_admin;
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -67,9 +66,8 @@ async fn build_config_response(state: &AppState) -> Result<ConfigResponse, RtDbE
 /// in full) plus build identity and the admin allowlist.
 pub(super) async fn get_config(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
 ) -> Result<Json<ConfigResponse>, RtDbError> {
-    require_admin(&state, &headers).await?;
     Ok(Json(build_config_response(&state).await?))
 }
 
@@ -92,10 +90,9 @@ pub(super) struct HotConfigPatch {
 /// values are `BadRequest`; each provided field fully replaces the prior value.
 pub(super) async fn patch_config(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
     ApiJson(patch): ApiJson<HotConfigPatch>,
 ) -> Result<Json<ConfigResponse>, RtDbError> {
-    require_admin(&state, &headers).await?;
     let mut next: crate::config::HotConfig = (**state.runtime.hot.load()).clone();
     if let Some(origins) = &patch.allowed_origins {
         next.allowed_origins = origins

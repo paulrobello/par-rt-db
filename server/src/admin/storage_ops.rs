@@ -12,7 +12,7 @@ use serde::Serialize;
 use crate::error::RtDbError;
 use crate::{AppState, db, storage};
 
-use super::{OkResponse, require_admin};
+use super::OkResponse;
 
 #[derive(Serialize)]
 pub(super) struct AdminStorageListResponse {
@@ -30,10 +30,9 @@ pub(super) struct AdminStorageUploadResponse {
 /// (or had its table dropped) returns an empty list rather than erroring.
 pub(super) async fn admin_storage_list(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
     Path(db): Path<String>,
 ) -> Result<Json<AdminStorageListResponse>, RtDbError> {
-    require_admin(&state, &headers).await?;
     if !db::database_exists(&state.pool, &db).await? {
         return Err(RtDbError::not_found("unknown database"));
     }
@@ -49,11 +48,10 @@ pub(super) async fn admin_storage_list(
 /// `to_bytes` is the sole ceiling (SEC-008).
 pub(super) async fn admin_storage_upload(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
     Path(db): Path<String>,
     request: Request,
 ) -> Result<Json<AdminStorageUploadResponse>, RtDbError> {
-    require_admin(&state, &headers).await?;
     if !db::database_exists(&state.pool, &db).await? {
         return Err(RtDbError::not_found("unknown database"));
     }
@@ -64,7 +62,7 @@ pub(super) async fn admin_storage_upload(
         .map_err(|_| RtDbError::bad_request("upload exceeds max file size"))?;
     let size = bytes.len() as i64;
     let sha256 = storage::sha256_hex_bytes(&bytes);
-    let content_type = headers
+    let content_type = _headers
         .get(CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
@@ -90,10 +88,9 @@ pub(super) async fn admin_storage_upload(
 /// inside `storage::delete`), so the public serve URL 404s afterward.
 pub(super) async fn admin_storage_delete(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
     Path((db, id)): Path<(String, String)>,
 ) -> Result<Json<OkResponse>, RtDbError> {
-    require_admin(&state, &headers).await?;
     if !db::database_exists(&state.pool, &db).await? {
         return Err(RtDbError::not_found("unknown database"));
     }

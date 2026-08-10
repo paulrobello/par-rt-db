@@ -13,7 +13,7 @@ use crate::error::RtDbError;
 use crate::http_api::ApiJson;
 use crate::{AppState, db};
 
-use super::{OkResponse, require_admin};
+use super::OkResponse;
 
 #[derive(Serialize)]
 pub(super) struct WebhooksResponse {
@@ -25,10 +25,9 @@ pub(super) struct WebhooksResponse {
 /// returns an empty list rather than erroring (mirrors `/admin/audit`).
 pub(super) async fn admin_list_webhooks(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
     Path(db): Path<String>,
 ) -> Result<Json<WebhooksResponse>, RtDbError> {
-    require_admin(&state, &headers).await?;
     if !db::database_exists(&state.pool, &db).await? {
         return Err(RtDbError::not_found("unknown database"));
     }
@@ -76,11 +75,10 @@ fn is_valid_event(name: &str) -> bool {
 /// are disabled at boot or the events list contains an unknown name.
 pub(super) async fn admin_create_webhook(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
     Path(db): Path<String>,
     ApiJson(body): ApiJson<AdminCreateWebhookRequest>,
 ) -> Result<Json<AdminCreateWebhookResponse>, RtDbError> {
-    require_admin(&state, &headers).await?;
     if !db::database_exists(&state.pool, &db).await? {
         return Err(RtDbError::not_found("unknown database"));
     }
@@ -135,10 +133,9 @@ pub(super) async fn admin_create_webhook(
 /// 404.
 pub(super) async fn admin_delete_webhook(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
     Path((db, id)): Path<(String, String)>,
 ) -> Result<Json<OkResponse>, RtDbError> {
-    require_admin(&state, &headers).await?;
     if !db::database_exists(&state.pool, &db).await? {
         return Err(RtDbError::not_found("unknown database"));
     }
@@ -192,11 +189,10 @@ pub(super) struct AdminEditWebhookRequest {
 /// missing `(id, db)` row is a 404. Returns the updated webhook.
 pub(super) async fn admin_edit_webhook(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
     Path((db, id)): Path<(String, String)>,
     ApiJson(body): ApiJson<AdminEditWebhookRequest>,
 ) -> Result<Json<crate::webhook::Webhook>, RtDbError> {
-    require_admin(&state, &headers).await?;
     if !db::database_exists(&state.pool, &db).await? {
         return Err(RtDbError::not_found("unknown database"));
     }
@@ -297,11 +293,10 @@ pub(super) struct DeliveriesResponse {
 /// rows (mirrors how `admin_list_webhooks` returns `[]` for a db with none).
 pub(super) async fn admin_list_deliveries(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
     Path((db, id)): Path<(String, String)>,
     QueryParams(params): QueryParams<DeliveryListParams>,
 ) -> Result<Json<DeliveriesResponse>, RtDbError> {
-    require_admin(&state, &headers).await?;
     if !db::database_exists(&state.pool, &db).await? {
         return Err(RtDbError::not_found("unknown database"));
     }

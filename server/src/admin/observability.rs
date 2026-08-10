@@ -15,13 +15,12 @@ use serde::{Deserialize, Serialize};
 use crate::AppState;
 use crate::error::RtDbError;
 
-use super::{authenticate_admin, bearer_from_subprotocol, bearer_value, require_admin};
+use super::{authenticate_admin, bearer_from_subprotocol, bearer_value};
 
 pub(super) async fn metrics_handler(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
 ) -> Result<Json<crate::metrics::MetricsSnapshot>, RtDbError> {
-    require_admin(&state, &headers).await?;
     let (presence_rooms, presence_sessions) = state.realtime.presence.counts().await;
     Ok(Json(
         state
@@ -87,10 +86,9 @@ pub(super) struct AuditResponse {
 /// previous enabled run either.
 pub(super) async fn audit_recent(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
     QueryParams(params): QueryParams<AuditParams>,
 ) -> Result<Json<AuditResponse>, RtDbError> {
-    require_admin(&state, &headers).await?;
     if !state.config.audit_log_enabled {
         return Ok(Json(AuditResponse {
             entries: Vec::new(),
@@ -144,10 +142,9 @@ pub(super) struct SubscriptionsResponse {
 /// not execute txns and does not touch the single-writer invariant.
 pub(super) async fn list_subscriptions(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
     QueryParams(params): QueryParams<SubscriptionsParams>,
 ) -> Result<Json<SubscriptionsResponse>, RtDbError> {
-    require_admin(&state, &headers).await?;
     // Reuse the metrics snapshot for the global + per-db counters (the inspector
     // is a low-frequency admin poll, so the extra pool/latency reads are
     // negligible) and the registry snapshot for the per-subscription rows.
@@ -184,10 +181,9 @@ pub(super) struct OpsRecentResponse {
 /// `db`/`table`, newest-first, capped at `n` (max 500).
 pub(super) async fn ops_recent(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
     QueryParams(params): QueryParams<OpsRecentParams>,
 ) -> Result<Json<OpsRecentResponse>, RtDbError> {
-    require_admin(&state, &headers).await?;
     let ops = state
         .realtime
         .op_feed
@@ -220,7 +216,7 @@ pub(super) struct StreamParams {
 /// dashboard authenticates through that subprotocol instead.
 pub(super) async fn admin_stream(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
     QueryParams(params): QueryParams<StreamParams>,
     req: Request,
 ) -> Result<Response, RtDbError> {
@@ -228,7 +224,7 @@ pub(super) async fn admin_stream(
     // upgrade from a disallowed Origin before WS negotiation begins. Browsers
     // always send `Origin`; absent Origin = non-browser (CLI/automation) and
     // the bearer/subprotocol gate still authenticates.
-    if !crate::origin_allowed(&headers, &state.runtime.hot, &state.config.public_url) {
+    if !crate::origin_allowed(&_headers, &state.runtime.hot, &state.config.public_url) {
         return Err(RtDbError::forbidden("websocket origin not allowed"));
     }
     // Bearer from the Authorization header (CLI/automation) or, failing that,
@@ -237,10 +233,10 @@ pub(super) async fn admin_stream(
     // it back: a client that offered a subprotocol requires the server to
     // negotiate one (tokio-tungstenite errors otherwise; browsers are lenient
     // but the echo is the spec-correct 101 response).
-    let (token, offered_subprotocol) = match bearer_value(&headers) {
+    let (token, offered_subprotocol) = match bearer_value(&_headers) {
         Ok(t) => (t, None),
         Err(_) => {
-            let t = bearer_from_subprotocol(&headers)?;
+            let t = bearer_from_subprotocol(&_headers)?;
             (t, Some(format!("rtdb-admin.{t}")))
         }
     };

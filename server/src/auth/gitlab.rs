@@ -348,6 +348,7 @@ mod tests {
             presence_update_limit_per_sec: 20,
             presence_max_ttl_ms: 300_000,
             quota_cache_ttl_secs: 60,
+            admin_rate_limit_per_ip_rpm: 0,
         };
         assert!(GitlabProvider::from_config(&cfg).is_none());
         cfg.gitlab_client_id = Some("id".into());

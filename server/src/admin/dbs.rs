@@ -15,7 +15,7 @@ use crate::http_api::ApiJson;
 use crate::schema::SchemaDef;
 use crate::{AppState, db, ddl, schema_history, snapshot};
 
-use super::{OkResponse, require_admin};
+use super::OkResponse;
 
 #[derive(Deserialize)]
 pub(super) struct CreateDbRequest {
@@ -24,10 +24,9 @@ pub(super) struct CreateDbRequest {
 
 pub(super) async fn create_db(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
     ApiJson(body): ApiJson<CreateDbRequest>,
 ) -> Result<Json<OkResponse>, RtDbError> {
-    require_admin(&state, &headers).await?;
     db::create_database(&state.pool, &body.name).await?;
     Ok(Json(OkResponse { ok: true }))
 }
@@ -48,10 +47,9 @@ pub(super) struct DeleteDbRequest {
 /// will fail on their next op — acceptable for a deleted database.
 pub(super) async fn delete_db(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
     ApiJson(body): ApiJson<DeleteDbRequest>,
 ) -> Result<Json<OkResponse>, RtDbError> {
-    require_admin(&state, &headers).await?;
     if body.confirm != body.name {
         return Err(RtDbError::bad_request(
             "confirmation does not match database name",
@@ -75,10 +73,9 @@ pub(super) struct PushSchemaRequest {
 
 pub(super) async fn push_schema(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
     ApiJson(body): ApiJson<PushSchemaRequest>,
 ) -> Result<Json<OkResponse>, RtDbError> {
-    require_admin(&state, &headers).await?;
     body.schema
         .check_table_quota(state.runtime.hot.load().max_tables_per_db)
         .inspect_err(|_e| {
@@ -102,9 +99,8 @@ pub(super) struct DatabasesResponse {
 
 pub(super) async fn list_dbs(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
 ) -> Result<Json<DatabasesResponse>, RtDbError> {
-    require_admin(&state, &headers).await?;
     let databases = db::list_databases(&state.pool).await?;
     Ok(Json(DatabasesResponse { databases }))
 }
@@ -119,10 +115,9 @@ pub(super) struct ExportDbParams {
 /// `pg_dump` for seed data and clone-to-dev workflows.
 pub(super) async fn export_db(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
     QueryParams(params): QueryParams<ExportDbParams>,
 ) -> Result<Response, RtDbError> {
-    require_admin(&state, &headers).await?;
     if !db::database_exists(&state.pool, &params.db).await? {
         return Err(RtDbError::not_found("unknown database"));
     }
@@ -145,11 +140,10 @@ pub(super) struct ImportDbParams {
 /// the snapshot applied.
 pub(super) async fn import_db(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
     QueryParams(params): QueryParams<ImportDbParams>,
     body: String,
 ) -> Result<Json<OkResponse>, RtDbError> {
-    require_admin(&state, &headers).await?;
     match snapshot::import_database(&state.pool, &params.db, &body).await {
         Ok(applied) => {
             state.schemas.put(&params.db, applied).await;
@@ -178,10 +172,9 @@ pub(super) struct CloneDbParams {
 /// no-cleanup behavior) and its cache entry is dropped. See ENH-009.
 pub(super) async fn clone_db(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
     QueryParams(params): QueryParams<CloneDbParams>,
 ) -> Result<Json<OkResponse>, RtDbError> {
-    require_admin(&state, &headers).await?;
     if params.from == params.to {
         return Err(RtDbError::bad_request(
             "cannot clone a database onto itself; choose a different destination name",
@@ -241,10 +234,9 @@ pub(super) struct DbStatsResponse {
 
 pub(super) async fn db_stats(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
     Path(db): Path<String>,
 ) -> Result<Json<DbStatsResponse>, RtDbError> {
-    require_admin(&state, &headers).await?;
     if !db::database_exists(&state.pool, &db).await? {
         return Err(RtDbError::not_found("unknown database"));
     }
@@ -306,10 +298,9 @@ pub(super) struct AnonymousAccessResponse {
 
 pub(super) async fn get_anonymous_access(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
     Path(db): Path<String>,
 ) -> Result<Json<AnonymousAccessResponse>, RtDbError> {
-    require_admin(&state, &headers).await?;
     let (enabled,): (bool,) = sqlx::query_as(
         "SELECT COALESCE((
             SELECT anonymous_enabled FROM rtdb_auth.databases WHERE name = $1
@@ -334,11 +325,10 @@ pub(super) struct PatchAnonymousAccessRequest {
 
 pub(super) async fn patch_anonymous_access(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
     Path(db): Path<String>,
     ApiJson(body): ApiJson<PatchAnonymousAccessRequest>,
 ) -> Result<Json<OkResponse>, RtDbError> {
-    require_admin(&state, &headers).await?;
     let result =
         sqlx::query("UPDATE rtdb_auth.databases SET anonymous_enabled = $1 WHERE name = $2")
             .bind(body.enabled)

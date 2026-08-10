@@ -11,7 +11,7 @@ use crate::AppState;
 use crate::auth::session::{self, SessionInfo};
 use crate::error::RtDbError;
 
-use super::{OkResponse, require_admin};
+use super::OkResponse;
 
 const DEFAULT_LIMIT: i64 = 200;
 const MAX_LIMIT: i64 = 1000;
@@ -33,10 +33,9 @@ pub(super) struct SessionsResponse {
 
 pub(super) async fn list_sessions_handler(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
     QueryParams(params): QueryParams<SessionsParams>,
 ) -> Result<Json<SessionsResponse>, RtDbError> {
-    require_admin(&state, &headers).await?;
     let limit = params.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
     let sessions = session::list_sessions(&state.pool, params.user.as_deref(), limit).await?;
     Ok(Json(SessionsResponse { sessions }))
@@ -45,10 +44,9 @@ pub(super) async fn list_sessions_handler(
 /// Revoke a single session by its `token_hash` (path param).
 pub(super) async fn revoke_session_handler(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
     Path(token_hash): Path<String>,
 ) -> Result<Json<OkResponse>, RtDbError> {
-    require_admin(&state, &headers).await?;
     session::delete_session_by_hash(&state.pool, &token_hash).await?;
     Ok(Json(OkResponse { ok: true }))
 }
@@ -68,10 +66,9 @@ pub(super) struct RevokeUserResponse {
 /// (refuse to revoke every session instance-wide from one unscoped call).
 pub(super) async fn revoke_user_sessions_handler(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
     QueryParams(params): QueryParams<RevokeUserParams>,
 ) -> Result<Json<RevokeUserResponse>, RtDbError> {
-    require_admin(&state, &headers).await?;
     let revoked = session::delete_sessions_for_user(&state.pool, &params.user).await?;
     Ok(Json(RevokeUserResponse { ok: true, revoked }))
 }

@@ -70,6 +70,11 @@ services:
       # unauthenticated mint route can't be abused to flood the auth tables.
       RTDB_ANONYMOUS_SESSION_TTL_DAYS: ${RTDB_ANONYMOUS_SESSION_TTL_DAYS:-1}
       RTDB_ANONYMOUS_RATE_LIMIT_PER_IP_RPM: ${RTDB_ANONYMOUS_RATE_LIMIT_PER_IP_RPM:-10}
+      # SEC-109: per-IP rate limit on POST /admin/login to bound admin-key
+      # brute-force. 0 = unlimited (code default); the shipped default turns
+      # the mitigation on out-of-the-box. Each failure also increments the
+      # rtdb_admin_auth_failures_total counter and logs at WARN.
+      RTDB_ADMIN_RATE_LIMIT_PER_IP_RPM: ${RTDB_ADMIN_RATE_LIMIT_PER_IP_RPM:-10}
       # Webhook delivery registry (off by default). Mirrors SEC-001 SSRF
       # hardening: when enabled, registration requires https + rejects private
       # IP ranges; RTDB_WEBHOOK_ALLOW_HTTP is the dev escape hatch (off).

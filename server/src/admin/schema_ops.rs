@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use axum::Json;
-use axum::extract::{Path, Query as QueryParams, State};
+use axum::extract::{Extension, Path, Query as QueryParams, State};
 use axum::http::HeaderMap;
 use serde::{Deserialize, Serialize};
 
@@ -13,14 +13,13 @@ use crate::http_api::ApiJson;
 use crate::schema::SchemaDef;
 use crate::{AppState, db, schema_history};
 
-use super::{AdminPrincipal, require_admin};
+use super::AdminPrincipal;
 
 pub(super) async fn get_schema(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
     Path(db): Path<String>,
 ) -> Result<Json<crate::schema::SchemaDef>, RtDbError> {
-    require_admin(&state, &headers).await?;
     if !db::database_exists(&state.pool, &db).await? {
         return Err(RtDbError::not_found("unknown database"));
     }
@@ -42,11 +41,10 @@ pub(super) struct HistoryParams {
 /// self-heals on first read for databases created before this feature shipped.
 pub(super) async fn schema_history_list(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
     Path(db): Path<String>,
     QueryParams(params): QueryParams<HistoryParams>,
 ) -> Result<Json<serde_json::Value>, RtDbError> {
-    require_admin(&state, &headers).await?;
     if !db::database_exists(&state.pool, &db).await? {
         return Err(RtDbError::not_found("unknown database"));
     }
@@ -60,10 +58,9 @@ pub(super) async fn schema_history_list(
 /// the `schema` JSON blob. 404 on a database or version that does not exist.
 pub(super) async fn schema_history_get(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
     Path((db, version)): Path<(String, i64)>,
 ) -> Result<Json<schema_history::HistoryEntry>, RtDbError> {
-    require_admin(&state, &headers).await?;
     if !db::database_exists(&state.pool, &db).await? {
         return Err(RtDbError::not_found("unknown database"));
     }
@@ -86,11 +83,10 @@ pub(super) struct PreviewSchemaRequest {
 /// authoritative gate.
 pub(super) async fn preview_schema(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
     Path(db): Path<String>,
     ApiJson(body): ApiJson<PreviewSchemaRequest>,
 ) -> Result<Json<crate::schema_diff::SchemaDiff>, RtDbError> {
-    require_admin(&state, &headers).await?;
     if !db::database_exists(&state.pool, &db).await? {
         return Err(RtDbError::not_found("unknown database"));
     }
@@ -107,11 +103,11 @@ pub(super) async fn preview_schema(
 /// "camelCase"`, so the wire body is `{directives, dryRun}`.
 pub(super) async fn admin_migrate(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    Extension(principal): Extension<AdminPrincipal>,
     Path(db): Path<String>,
     ApiJson(body): ApiJson<crate::migrate::MigrateRequest>,
 ) -> Result<Json<crate::migrate::MigrateResult>, RtDbError> {
-    let principal = require_admin(&state, &headers).await?;
+    // SEC-108: `principal` is stashed by `require_admin_mw`.
     // SEC-107: an `evalExpr` directive interpolates client-supplied SQL text
     // (`expr`/`where`) directly into an `UPDATE … WHERE` executed inside the
     // committer's serialized turn. A denylist over SQL text cannot be made
@@ -166,11 +162,10 @@ pub(super) struct RestoreSchemaResponse {
 /// dropped, never the `doc` column.
 pub(super) async fn restore_schema(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
     Path(db): Path<String>,
     ApiJson(body): ApiJson<RestoreSchemaRequest>,
 ) -> Result<Json<RestoreSchemaResponse>, RtDbError> {
-    require_admin(&state, &headers).await?;
     if !db::database_exists(&state.pool, &db).await? {
         return Err(RtDbError::not_found("unknown database"));
     }

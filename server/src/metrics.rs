@@ -208,6 +208,9 @@ pub struct Metrics {
     quota_rejections_tables_total: AtomicU64,
     quota_rejections_storage_total: AtomicU64,
     quota_rejections_subs_total: AtomicU64,
+    /// SEC-109: admin-key login failures (wrong key guesses at `POST /admin/login`).
+    /// Monotonic counter for brute-force detection — a spike signals an attack.
+    admin_auth_failures_total: AtomicU64,
 }
 
 impl Metrics {
@@ -236,6 +239,11 @@ impl Metrics {
     }
     pub fn record_image_transform_error(&self) {
         self.image_transforms_error_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    /// SEC-109: record an admin-key login failure for brute-force detection.
+    pub fn record_admin_auth_failure(&self) {
+        self.admin_auth_failures_total
             .fetch_add(1, Ordering::Relaxed);
     }
     pub fn record_presence_update(&self) {
@@ -472,6 +480,7 @@ impl Metrics {
                 .quota_rejections_storage_total
                 .load(Ordering::Relaxed),
             quota_rejections_subs_total: self.quota_rejections_subs_total.load(Ordering::Relaxed),
+            admin_auth_failures_total: self.admin_auth_failures_total.load(Ordering::Relaxed),
             per_db_quota: self.per_db_quota_snapshot(),
         }
     }
@@ -535,6 +544,8 @@ pub struct MetricsSnapshot {
     pub quota_rejections_tables_total: u64,
     pub quota_rejections_storage_total: u64,
     pub quota_rejections_subs_total: u64,
+    /// SEC-109: total admin-key login failures (brute-force signal).
+    pub admin_auth_failures_total: u64,
     /// Per-database breakdown of the quota-rejection counters above (ENH-011).
     /// JSON-snapshot only — deliberately absent from the Prometheus scrape
     /// (per-db labels would blow up cardinality on the public export).
@@ -627,6 +638,16 @@ pub fn render_prometheus(snap: &MetricsSnapshot, version: &str, git_commit: &str
     s.push_str(&format!(
         "rtdb_quota_rejections_total{{kind=\"subs\"}} {}\n",
         snap.quota_rejections_subs_total
+    ));
+
+    // SEC-109: admin-key login failures (brute-force detection).
+    s.push_str(
+        "# HELP rtdb_admin_auth_failures_total Admin-key login failures at POST /admin/login (brute-force signal).\n",
+    );
+    s.push_str("# TYPE rtdb_admin_auth_failures_total counter\n");
+    s.push_str(&format!(
+        "rtdb_admin_auth_failures_total {}\n",
+        snap.admin_auth_failures_total
     ));
 
     s.push_str(
@@ -769,6 +790,7 @@ mod tests {
             quota_rejections_tables_total: 0,
             quota_rejections_storage_total: 0,
             quota_rejections_subs_total: 0,
+            admin_auth_failures_total: 0,
             per_db_quota: Vec::new(),
         };
         let body = render_prometheus(&snap, "0.0.0", "abc");
@@ -828,6 +850,7 @@ mod tests {
             quota_rejections_tables_total: 0,
             quota_rejections_storage_total: 0,
             quota_rejections_subs_total: 0,
+            admin_auth_failures_total: 0,
             per_db_quota: Vec::new(),
         };
         let body = render_prometheus(&snap, "0.0.0", "abc");
@@ -955,6 +978,7 @@ mod tests {
             quota_rejections_tables_total: 1,
             quota_rejections_storage_total: 2,
             quota_rejections_subs_total: 3,
+            admin_auth_failures_total: 0,
             per_db_quota: Vec::new(),
         };
         let body = render_prometheus(&snap, "0.0.0", "abc");

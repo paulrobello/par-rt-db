@@ -6,6 +6,7 @@ use common::{
     admin_delete, admin_get, admin_post, admin_post_raw, fresh_db, kanban_schema_json, spawn_app,
     test_state, test_state_with_backup_dir,
 };
+use rtdb_server::AppState;
 use rtdb_server::auth::PrincipalCtx;
 use rtdb_server::db;
 use rtdb_server::txn::{Step, Transaction, execute_txn};
@@ -1853,5 +1854,180 @@ async fn sec106_logout_without_csrf_clears_both_cookies() -> anyhow::Result<()> 
     }
     assert!(saw_session_clear, "logout cleared rtdb_session");
     assert!(saw_csrf_clear, "logout cleared rtdb-admin-csrf");
+    Ok(())
+}
+
+// SEC-108: every admin route (except login/logout/stream) must 401 without a
+// credential — enforced by the router-layer middleware, not per-handler. One
+// omission in a per-handler convention is a silent auth bypass; this table
+// exercises a representative route from every route group to prove the gate is
+// comprehensive. Excluded paths (/admin/login, /admin/logout, /admin/stream)
+// are exempt by design (they mint/clear credentials or authenticate inline).
+#[tokio::test]
+async fn sec108_admin_routes_401_without_credential() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state).await;
+    let client = reqwest::Client::new();
+
+    // (method, path). The middleware 401s before the handler runs, so the path
+    // params and body are irrelevant — any value that matches the route pattern
+    // triggers the gate. No Authorization header is sent on any request.
+    let routes: &[(reqwest::Method, &str)] = &[
+        // ---- Static-path GET routes ----
+        (reqwest::Method::GET, "/admin/dbs"),
+        (reqwest::Method::GET, "/admin/metrics"),
+        (reqwest::Method::GET, "/admin/config"),
+        (reqwest::Method::GET, "/admin/tokens"),
+        (reqwest::Method::GET, "/admin/sessions"),
+        (reqwest::Method::GET, "/admin/audit"),
+        (reqwest::Method::GET, "/admin/ops/recent"),
+        (reqwest::Method::GET, "/admin/subscriptions"),
+        (reqwest::Method::GET, "/admin/backups"),
+        (reqwest::Method::GET, "/admin/export-db"),
+        (reqwest::Method::GET, "/admin/allowlist?db=test"),
+        (reqwest::Method::GET, "/admin/admins"),
+        // ---- Static-path POST routes ----
+        (reqwest::Method::POST, "/admin/create-db"),
+        (reqwest::Method::POST, "/admin/delete-db"),
+        (reqwest::Method::POST, "/admin/push-schema"),
+        (reqwest::Method::POST, "/admin/mint-token"),
+        (reqwest::Method::POST, "/admin/backup"),
+        (reqwest::Method::POST, "/admin/restore"),
+        (reqwest::Method::POST, "/admin/import-db"),
+        (reqwest::Method::POST, "/admin/clone-db"),
+        // ---- Dynamic-path routes (handler never runs — middleware 401s first) ----
+        (reqwest::Method::GET, "/admin/dbs/testdb/schema"),
+        (reqwest::Method::GET, "/admin/dbs/testdb/stats"),
+        (reqwest::Method::POST, "/admin/db/testdb/query"),
+        (reqwest::Method::POST, "/admin/db/testdb/mutate"),
+        (reqwest::Method::POST, "/admin/db/testdb/migrate"),
+        (reqwest::Method::GET, "/admin/db/testdb/storage"),
+        (reqwest::Method::GET, "/admin/db/testdb/schedules"),
+        (reqwest::Method::GET, "/admin/db/testdb/webhooks"),
+        (reqwest::Method::GET, "/admin/db/testdb/anonymous-access"),
+        (reqwest::Method::PATCH, "/admin/db/testdb/anonymous-access"),
+        (reqwest::Method::GET, "/admin/backups/testdump"),
+        (reqwest::Method::DELETE, "/admin/backups/testdump"),
+        (reqwest::Method::DELETE, "/admin/sessions/abc123"),
+        // ---- Exempt routes DO NOT appear here (login/logout/stream) ----
+    ];
+
+    for (method, path) in routes {
+        let resp = client
+            .request(method.clone(), format!("http://{addr}{path}"))
+            .send()
+            .await?;
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::UNAUTHORIZED,
+            "SEC-108: {method} {path} should 401 without a credential"
+        );
+    }
+    Ok(())
+}
+
+// SEC-108: the exempt routes (/admin/login, /admin/logout) must NOT be gated —
+// they mint/clear credentials. If the middleware accidentally covered them, no
+// one could ever log in or out. We prove the exemption by sending the VALID
+// admin key: if the middleware gated /admin/login, it would 401 before the
+// handler could validate the key; instead it must reach the handler and
+// succeed (204 No Content + Set-Cookie).
+#[tokio::test]
+async fn sec108_login_and_logout_are_not_gated() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state).await;
+    let client = reqwest::Client::new();
+
+    // /admin/login with the VALID key: must succeed (not 401). If the middleware
+    // incorrectly gated this route, it would 401 for "missing admin bearer
+    // token" before the handler runs.
+    let resp = client
+        .post(format!("http://{addr}/admin/login"))
+        .json(&serde_json::json!({"adminKey": "test-admin-key"}))
+        .send()
+        .await?;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::NO_CONTENT,
+        "SEC-108: /admin/login with valid key must succeed (not gated by require_admin_mw)"
+    );
+
+    // /admin/logout with no credential: must succeed (not 401). Its only effect
+    // is clearing cookies, so it must be reachable without a credential.
+    let resp = client
+        .post(format!("http://{addr}/admin/logout"))
+        .send()
+        .await?;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::NO_CONTENT,
+        "SEC-108: /admin/logout must not be gated by require_admin_mw"
+    );
+    Ok(())
+}
+
+// SEC-109: rapid bad admin-key logins from one IP are rate-limited after the
+// configured threshold. With admin_rate_limit_per_ip_rpm = 3, the first 3
+// attempts are 401 (rate limiter allows, ct_eq rejects), and the 4th is 429
+// (rate limiter denies). Each failure also increments the
+// rtdb_admin_auth_failures_total counter.
+#[tokio::test]
+async fn sec109_admin_login_rate_limited_after_threshold() -> anyhow::Result<()> {
+    let mut config = common::test_config();
+    config.admin_rate_limit_per_ip_rpm = 3;
+    let pool = sqlx::PgPool::connect(&config.database_url)
+        .await
+        .expect("connect to test postgres");
+    db::bootstrap(&pool).await.expect("bootstrap rtdb_auth");
+    let state = AppState::new(pool, config, common::test_hot());
+    let addr = spawn_app(state.clone()).await;
+    let client = reqwest::Client::new();
+
+    // First 3 attempts: rate limiter allows, ct_eq rejects → 401.
+    for i in 0..3 {
+        let resp = client
+            .post(format!("http://{addr}/admin/login"))
+            .json(&serde_json::json!({"adminKey": "wrong-key"}))
+            .send()
+            .await?;
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::UNAUTHORIZED,
+            "attempt {} should be 401 (under rate limit)",
+            i + 1
+        );
+    }
+
+    // 4th attempt: rate limiter denies → 429 RATE_LIMITED.
+    let resp = client
+        .post(format!("http://{addr}/admin/login"))
+        .json(&serde_json::json!({"adminKey": "wrong-key"}))
+        .send()
+        .await?;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::TOO_MANY_REQUESTS,
+        "4th attempt should be 429 (rate-limited)"
+    );
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(body["code"], "RATE_LIMITED");
+
+    // SEC-109: each failure incremented the metric counter.
+    let snap = state
+        .runtime
+        .metrics
+        .snapshot(
+            &state.pool,
+            &state.realtime.subs,
+            state.runtime.started_at,
+            0,
+            0,
+        )
+        .await;
+    assert_eq!(
+        snap.admin_auth_failures_total, 4,
+        "4 bad login attempts should have recorded 4 admin auth failures"
+    );
+
     Ok(())
 }

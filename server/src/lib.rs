@@ -398,7 +398,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/healthz", get(health::handler))
         .route("/privacy", get(privacy::handler))
         .route("/metrics", get(prometheus_metrics_handler))
-        .merge(admin::admin_routes())
+        .merge(admin::admin_routes(state.clone()))
         .merge(http_api::http_api_routes())
         .merge(ws::ws_routes())
         .merge(auth::provider::auth_routes());

@@ -15,8 +15,6 @@ use crate::query::{Query, QueryResult, execute_query};
 use crate::txn::{Transaction, worst_case_affected};
 use crate::{AppState, db};
 
-use super::require_admin;
-
 #[derive(Deserialize)]
 pub(super) struct AdminQueryRequest {
     query: Query,
@@ -31,11 +29,10 @@ pub(super) struct AdminQueryResponse {
 /// per-row `ownerField`, so an admin sees every row in every table.
 pub(super) async fn admin_query(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
     Path(db): Path<String>,
     ApiJson(body): ApiJson<AdminQueryRequest>,
 ) -> Result<Json<AdminQueryResponse>, RtDbError> {
-    require_admin(&state, &headers).await?;
     if !db::database_exists(&state.pool, &db).await? {
         return Err(RtDbError::not_found("unknown database"));
     }
@@ -77,11 +74,10 @@ pub(super) struct AdminMutateResponse {
 /// (`MAX_AFFECTED_ROWS_PER_TXN`), so this is a per-instance tightening on top.
 pub(super) async fn admin_mutate(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
     Path(db): Path<String>,
     ApiJson(body): ApiJson<AdminMutateRequest>,
 ) -> Result<Json<AdminMutateResponse>, RtDbError> {
-    require_admin(&state, &headers).await?;
     if !db::database_exists(&state.pool, &db).await? {
         return Err(RtDbError::not_found("unknown database"));
     }

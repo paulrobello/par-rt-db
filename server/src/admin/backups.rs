@@ -18,7 +18,7 @@ use crate::AppState;
 use crate::error::RtDbError;
 use crate::http_api::ApiJson;
 
-use super::{OkResponse, require_admin};
+use super::OkResponse;
 
 #[derive(Serialize)]
 pub(super) struct BackupsResponse {
@@ -34,9 +34,8 @@ pub(super) struct BackupsResponse {
 /// enabled at boot is already visible at `/admin/config`.
 pub(super) async fn list_backups(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
 ) -> Result<Json<BackupsResponse>, RtDbError> {
-    require_admin(&state, &headers).await?;
     let backups = crate::backup::list_backups(&state.config.backup_dir).await?;
     let running = state.backup_running.load(Ordering::Acquire);
     Ok(Json(BackupsResponse { running, backups }))
@@ -59,9 +58,8 @@ impl Drop for BackupRunningGuard {
 /// task — no document tables or subscriptions are touched.
 pub(super) async fn create_backup(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
 ) -> Result<(StatusCode, Json<OkResponse>), RtDbError> {
-    require_admin(&state, &headers).await?;
     // `swap` to set-and-test: returns the PRIOR value. If it was already true,
     // a backup is in progress — reject without disturbing the flag.
     if state.backup_running.swap(true, Ordering::AcqRel) {
@@ -86,10 +84,9 @@ pub(super) async fn create_backup(
 /// `Body::from_stream` so a large dump does not have to fit in memory.
 pub(super) async fn download_backup(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
     Path(name): Path<String>,
 ) -> Result<Response, RtDbError> {
-    require_admin(&state, &headers).await?;
     crate::backup::validate_dump_name(&name)?;
     let mut path = PathBuf::from(&state.config.backup_dir);
     path.push(&name);
@@ -121,10 +118,9 @@ pub(super) async fn download_backup(
 /// if the file is gone.
 pub(super) async fn delete_backup(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
     Path(name): Path<String>,
 ) -> Result<StatusCode, RtDbError> {
-    require_admin(&state, &headers).await?;
     crate::backup::validate_dump_name(&name)?;
     let mut path = PathBuf::from(&state.config.backup_dir);
     path.push(&name);
@@ -157,10 +153,9 @@ pub(super) struct RestoreResponse {
 /// undisturbed. Returns the target DB name and cutover instructions.
 pub(super) async fn restore_backup(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
     ApiJson(body): ApiJson<RestoreRequest>,
 ) -> Result<Json<RestoreResponse>, RtDbError> {
-    require_admin(&state, &headers).await?;
     if body.confirm != body.name {
         return Err(RtDbError::bad_request(
             "confirmation does not match backup filename",
