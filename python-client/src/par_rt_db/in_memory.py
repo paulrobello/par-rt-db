@@ -942,12 +942,13 @@ class InMemoryRtDbClient:
                 or q.filter is not None
                 or q.search is not None
                 or q.vector_search is not None
+                or q.hybrid_search is not None
             ):
                 raise RtDbError(
                     ErrorCode.BAD_REQUEST,
                     "get cannot be combined with index, eq, range bounds, order, take, "
                     "unique, first, count, distinct, aggregate, paginate, filter, search, "
-                    "or vector search",
+                    "vector search, or hybrid search",
                 )
             return self.get(q.table, q.get)
 
@@ -1061,6 +1062,8 @@ class InMemoryRtDbClient:
                 or q.filter is not None
                 or q.search is not None
                 or q.take is not None
+                or q.paginate is not None
+                or q.hybrid_search is not None
             ):
                 raise RtDbError(
                     ErrorCode.BAD_REQUEST,
@@ -1089,11 +1092,13 @@ class InMemoryRtDbClient:
                 or count
                 or q.filter is not None
                 or q.vector_search is not None
+                or q.paginate is not None
+                or q.hybrid_search is not None
             ):
                 raise RtDbError(
                     ErrorCode.BAD_REQUEST,
                     "search cannot be combined with index, eq, range bounds, order, "
-                    "unique, first, count, filter, or vector search",
+                    "unique, first, count, filter, vector search, paginate, or hybrid search",
                 )
             # Full-text ranking (tsvector match + ts_rank) is not modeled
             # in-memory; every row in the table is treated as a candidate (the
@@ -1111,6 +1116,33 @@ class InMemoryRtDbClient:
                     row for row in candidates if _eval_filter_expr(q.search.filter, row.doc)
                 ]
             return [_merge_doc(row) for row in candidates]
+
+        # `hybridSearch` terminal — standalone like `vectorSearch`: rejects every
+        # peer. RRF ranking is not modeled in-memory, so a valid (peer-free)
+        # hybridSearch returns an empty list (the sound stub — the combination
+        # guards the server enforces are still exercised).
+        if q.hybrid_search is not None:
+            if (
+                q.index is not None
+                or eq
+                or has_range
+                or q.order is not None
+                or unique
+                or first
+                or count
+                or q.distinct
+                or q.aggregate is not None
+                or q.paginate is not None
+                or q.filter is not None
+                or q.search is not None
+                or q.vector_search is not None
+                or q.take is not None
+            ):
+                raise RtDbError(
+                    ErrorCode.BAD_REQUEST,
+                    "hybridSearch cannot be combined with any other terminal",
+                )
+            return []
 
         # Resolve index — required for `eq` and for any range bound.
         index_def: IndexDef | None = None

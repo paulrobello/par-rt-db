@@ -32,6 +32,9 @@ interface GoldenCase {
     | Array<{ name: string; status: string; order: number }>
     | { name: string; status: string; order: number };
   expected_scalar?: number;
+  expected_value?: number | null;
+  expected_groups?: Array<{ key: unknown; value: number | null }>;
+  expected_distinct?: Array<number | string>;
   expected_unordered?: boolean;
   expected_has_next_cursor?: boolean;
 }
@@ -39,8 +42,13 @@ interface GoldenCase {
 interface GoldenFixture {
   schema_table: string;
   schema_fields: Record<string, string>;
-  schema_indexes: Array<{ name: string; fields: string[] }>;
-  seed: Array<{ name: string; status: string; order: number }>;
+  schema_indexes: Array<{
+    name: string;
+    fields: string[];
+    search?: boolean;
+    vector?: { dimensions: number };
+  }>;
+  seed: Array<Record<string, unknown>>;
   cases: GoldenCase[];
 }
 
@@ -58,11 +66,21 @@ function buildSchema(fx: GoldenFixture) {
     if (ty === "string") fields[name] = t.string();
     else if (ty === "number") fields[name] = t.number();
     else if (ty === "optional(string)") fields[name] = t.optional(t.string());
-    else throw new Error(`fixture field type not implemented: ${ty}`);
+    else if (ty === "array(string)") fields[name] = t.array(t.string());
+    else if (ty.startsWith("vector(") && ty.endsWith(")")) {
+      const dims = Number.parseInt(ty.slice("vector(".length, -1), 10);
+      fields[name] = t.vector(dims);
+    } else throw new Error(`fixture field type not implemented: ${ty}`);
   }
   let builder = defineTable(fields);
   for (const ix of fx.schema_indexes) {
-    builder = builder.index(ix.name, ix.fields as [string, ...string[]]);
+    if (ix.search) {
+      builder = builder.searchIndex(ix.name, ix.fields as [string, ...string[]]);
+    } else if (ix.vector) {
+      builder = builder.vectorIndex(ix.name, ix.fields[0] as string, ix.vector.dimensions, []);
+    } else {
+      builder = builder.index(ix.name, ix.fields as [string, ...string[]]);
+    }
   }
   return defineSchema({ [fx.schema_table]: builder });
 }
@@ -91,6 +109,26 @@ function projectList(docs: unknown[]): Projected[] {
   return (docs as Array<Record<string, unknown>>).map(project);
 }
 
+/** Numeric-tolerant equality so the SQL-numeric server result and the JS number
+ * aggregate result agree (e.g. `6` == `6.0`). Recurses into arrays/objects. */
+function jsonEqNumeric(a: unknown, b: unknown): boolean {
+  if (typeof a === "number" && typeof b === "number") {
+    return a === b || Math.abs(a - b) < 1e-9;
+  }
+  if (a === null && b === null) return true;
+  if (Array.isArray(a) && Array.isArray(b)) {
+    return a.length === b.length && a.every((x, i) => jsonEqNumeric(x, b[i]));
+  }
+  if (a !== null && b !== null && typeof a === "object" && typeof b === "object") {
+    const ao = a as Record<string, unknown>;
+    const bo = b as Record<string, unknown>;
+    const ak = Object.keys(ao);
+    const bk = Object.keys(bo);
+    return ak.length === bk.length && ak.every((k) => k in bo && jsonEqNumeric(ao[k], bo[k]));
+  }
+  return a === b;
+}
+
 describe("QA-001 golden-vector parity", () => {
   const fx = loadFixture();
   const client = seedClient(fx);
@@ -102,6 +140,37 @@ describe("QA-001 golden-vector parity", () => {
 
       if (case_.expected_scalar !== undefined) {
         expect(result).toBe(case_.expected_scalar);
+        return;
+      }
+
+      if ("expected_value" in case_) {
+        // aggregate scalar: a bare number, or null for an empty match set.
+        // `in` (not !== undefined) so a present null is distinct from absent.
+        const wantVal = case_.expected_value ?? null;
+        expect(jsonEqNumeric(result, wantVal)).toBe(true);
+        return;
+      }
+
+      const wantGroups = case_.expected_groups;
+      if (wantGroups !== undefined) {
+        expect(Array.isArray(result)).toBe(true);
+        const got = result as Array<{ key: unknown; value: number | null }>;
+        expect(got.length).toBe(wantGroups.length);
+        for (let i = 0; i < got.length; i++) {
+          expect(got[i].key).toEqual(wantGroups[i].key);
+          expect(jsonEqNumeric(got[i].value, wantGroups[i].value)).toBe(true);
+        }
+        return;
+      }
+
+      const wantDistinct = case_.expected_distinct;
+      if (wantDistinct !== undefined) {
+        expect(Array.isArray(result)).toBe(true);
+        const got = result as unknown[];
+        expect(got.length).toBe(wantDistinct.length);
+        for (let i = 0; i < got.length; i++) {
+          expect(jsonEqNumeric(got[i], wantDistinct[i])).toBe(true);
+        }
         return;
       }
 

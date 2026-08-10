@@ -243,6 +243,7 @@ Before requesting review:
 - [ ] Relevant docs (`README`, `FEATURE_MATRIX`, `CHANGELOG`, package READMEs) are updated.
 - [ ] If the change adds or renames an env var, `.env.example`, `docker-compose.yml`'s `environment:` block (the allowlist that actually feeds the container), and the root README Configuration table are updated — `make env-drift-check` (first stage of `checkall`) guards this.
 - [ ] If the change adds a route, the root README Endpoints table and `server/README.md` are updated.
+- [ ] If the change adds or modifies a query terminal, `FilterExpr` variant, or mutation-step result shape, a case covering it is added to `wire-corpus/golden-vector.json` (the cross-client parity fixture consumed by all four golden-vector suites). The corpus is the source of truth for cross-client agreement; an uncovered terminal is a regression risk for the other three engines.
 
 When the PR lands, **rebase onto the latest target branch before merging** so
 the merge is a clean fast-forward. Squash-merge one commit per logical change;

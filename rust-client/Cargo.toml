@@ -47,6 +47,10 @@ name = "golden_vector"
 required-features = ["in_memory"]
 
 [[test]]
+name = "query_combinations"
+required-features = ["in_memory"]
+
+[[test]]
 name = "hot_config_test"
 required-features = ["admin"]
 

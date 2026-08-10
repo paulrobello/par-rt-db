@@ -47,13 +47,25 @@ def _build_schema(fx: dict[str, Any]) -> Any:
             return t.number()
         if spec == "optional(string)":
             return t.optional(t.string())
+        if spec == "array(string)":
+            return t.array(t.string())
+        if spec.startswith("vector(") and spec.endswith(")"):
+            dims = int(spec[len("vector(") : -1])
+            return t.vector(dims)
         raise AssertionError(f"fixture field type not implemented: {spec}")
 
     def table_fn(tb: Any) -> Any:
         for name, ty in fields.items():
             tb = tb.field(name, field_type(ty))
         for ix in indexes:
-            tb = tb.index(ix["name"], ix["fields"])
+            if ix.get("search"):
+                tb = tb.search_index(ix["name"], ix["fields"])
+            elif "vector" in ix:
+                field = ix["fields"][0]
+                dims = ix["vector"]["dimensions"]
+                tb = tb.vector_index(ix["name"], field, dims)
+            else:
+                tb = tb.index(ix["name"], ix["fields"])
         return tb
 
     return Schema.builder().table(table, table_fn).build()
@@ -86,6 +98,22 @@ def _project_list(docs: list[Any]) -> list[dict[str, Any]]:
     return [_project(d) for d in docs]
 
 
+def _json_eq_numeric(got: Any, want: Any) -> bool:
+    """Numeric-tolerant equality: ``6`` == ``6.0`` so the SQL-numeric server
+    result and the python float aggregate result agree."""
+    if isinstance(got, (int, float)) and isinstance(want, (int, float)):
+        return got == want or abs(got - want) < 1e-9
+    if got is None and want is None:
+        return True
+    if isinstance(got, list) and isinstance(want, list):
+        return len(got) == len(want) and all(
+            _json_eq_numeric(a, b) for a, b in zip(got, want, strict=False)
+        )
+    if isinstance(got, dict) and isinstance(want, dict):
+        return got.keys() == want.keys() and all(_json_eq_numeric(got[k], want[k]) for k in got)
+    return got == want
+
+
 def _run_case(c: InMemoryRtDbClient, case: dict[str, Any]) -> Any:
     q = Query.model_validate(case["query"])
     return c.run_query(q)
@@ -110,6 +138,45 @@ def test_golden_vector_case(seeded_client: InMemoryRtDbClient, case_id: str) -> 
         assert result == case["expected_scalar"], (
             f"{case_id}: expected count {case['expected_scalar']}, got {result}"
         )
+        return
+
+    if "expected_value" in case:
+        # aggregate scalar: a bare number, or None for an empty match set.
+        # `in` (not .get) so a present None (empty-set aggregate) is distinct
+        # from an absent field.
+        want = case["expected_value"]
+        assert _json_eq_numeric(result, want), (
+            f"{case_id}: aggregate scalar mismatch: got {result}, want {want}"
+        )
+        return
+
+    if "expected_groups" in case:
+        want_groups = case["expected_groups"]
+        assert isinstance(result, list), (
+            f"{case_id}: aggregate groupBy must return list, got {type(result).__name__}"
+        )
+        assert len(result) == len(want_groups), (
+            f"{case_id}: group count mismatch: got {len(result)}, want {len(want_groups)}"
+        )
+        for i, (g, w) in enumerate(zip(result, want_groups, strict=False)):
+            assert g["key"] == w["key"], (
+                f"{case_id}: group {i} key mismatch: got {g['key']}, want {w['key']}"
+            )
+            assert _json_eq_numeric(g["value"], w["value"]), (
+                f"{case_id}: group {i} value mismatch: got {g['value']}, want {w['value']}"
+            )
+        return
+
+    if "expected_distinct" in case:
+        want = case["expected_distinct"]
+        assert isinstance(result, list), (
+            f"{case_id}: distinct must return list, got {type(result).__name__}"
+        )
+        assert len(result) == len(want), (
+            f"{case_id}: distinct count mismatch: got {len(result)}, want {len(want)}"
+        )
+        for i, (g, w) in enumerate(zip(result, want, strict=False)):
+            assert _json_eq_numeric(g, w), f"{case_id}: distinct[{i}] mismatch: got {g}, want {w}"
         return
 
     if case.get("expected_unordered"):

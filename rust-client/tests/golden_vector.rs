@@ -14,8 +14,9 @@
 //! id-minting drift.
 
 use par_rt_db_client::in_memory::InMemoryRtDbClientOptions;
-use par_rt_db_client::schema::{FieldType, Schema, Table};
+use par_rt_db_client::schema::{DistanceMetric, FieldType, Schema, Table};
 use par_rt_db_client::{InMemoryRtDbClient, Mutation, Query, StepResult};
+use serde::Deserialize as _;
 use serde_json::{Value, json};
 use std::sync::atomic::{AtomicI64, Ordering};
 
@@ -35,6 +36,15 @@ struct Fixture {
 struct IndexSpec {
     name: String,
     fields: Vec<String>,
+    #[serde(default)]
+    search: bool,
+    #[serde(default)]
+    vector: Option<VectorIndexSpecFixture>,
+}
+
+#[derive(serde::Deserialize)]
+struct VectorIndexSpecFixture {
+    dimensions: u32,
 }
 
 #[derive(serde::Deserialize)]
@@ -45,15 +55,55 @@ struct Case {
     expected: Option<Value>,
     #[serde(default, rename = "expected_scalar")]
     expected_scalar: Option<i64>,
+    /// Scalar `aggregate` result; a present JSON `null` (empty-set aggregate) is
+    /// distinct from an absent field via the custom deserializer below.
+    #[serde(
+        default,
+        rename = "expected_value",
+        deserialize_with = "deserialize_present_value"
+    )]
+    expected_value: Option<Value>,
+    #[serde(default, rename = "expected_groups")]
+    expected_groups: Option<Vec<Value>>,
+    #[serde(default, rename = "expected_distinct")]
+    expected_distinct: Option<Vec<Value>>,
     #[serde(default, rename = "expected_unordered")]
     expected_unordered: bool,
     #[serde(default, rename = "expected_has_next_cursor")]
     expected_has_next_cursor: bool,
 }
 
+/// Deserialize a `Value` verbatim when present (including JSON `null`, which
+/// serde's `Option<Value>` would otherwise collapse to `None`).
+fn deserialize_present_value<'de, D>(deserializer: D) -> Result<Option<Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Some(Value::deserialize(deserializer)?))
+}
+
 fn load_fixture() -> Fixture {
     serde_json::from_str(include_str!("../../wire-corpus/golden-vector.json"))
         .expect("parse golden-vector.json")
+}
+
+fn field_type_from_shorthand(shorthand: &str) -> FieldType {
+    match shorthand {
+        "string" => FieldType::String,
+        "number" => FieldType::Number,
+        "optional(string)" => FieldType::optional(FieldType::String),
+        "array(string)" => FieldType::array(FieldType::String),
+        other => {
+            if let Some(rest) = other.strip_prefix("vector(") {
+                let dims = rest
+                    .trim_end_matches(')')
+                    .parse::<u32>()
+                    .unwrap_or_else(|_| panic!("vector(N): bad dimensions in {other}"));
+                return FieldType::vector(dims);
+            }
+            panic!("fixture field type not implemented: {other}");
+        }
+    }
 }
 
 fn build_schema(fx: &Fixture) -> Schema {
@@ -62,17 +112,23 @@ fn build_schema(fx: &Fixture) -> Schema {
     // implemented; new types must be added here.
     let mut table = Table::new();
     for (name, ty) in fx.schema_fields.as_object().expect("schema_fields object") {
-        let ft = match ty.as_str().expect("field type string") {
-            "string" => FieldType::String,
-            "number" => FieldType::Number,
-            "optional(string)" => FieldType::optional(FieldType::String),
-            other => panic!("fixture field type not implemented: {other}"),
-        };
-        table = table.field(name, ft);
+        table = table.field(
+            name,
+            field_type_from_shorthand(ty.as_str().expect("field type string")),
+        );
     }
     for ix in &fx.schema_indexes {
         let fields: Vec<&str> = ix.fields.iter().map(String::as_str).collect();
-        table = table.index(&ix.name, &fields);
+        if ix.search {
+            table = table.search_index(&ix.name, &fields, None);
+        } else if let Some(vec) = &ix.vector {
+            // A vector index names a single Vector field at fields[0].
+            let field = ix.fields.first().expect("vector index names a field");
+            table =
+                table.vector_index(&ix.name, field, vec.dimensions, &[], DistanceMetric::Cosine);
+        } else {
+            table = table.index(&ix.name, &fields);
+        }
     }
     Schema::builder().table(&fx.schema_table, table).build()
 }
@@ -118,6 +174,33 @@ fn project_list(docs: &[Value]) -> Vec<Value> {
     docs.iter().map(project).collect()
 }
 
+/// Compare two JSON values with numeric tolerance (so `6` == `6.0` across the
+/// SQL-numeric server result and the f64 client aggregate result).
+fn json_eq_numeric(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Number(x), Value::Number(y)) => match (x.as_f64(), y.as_f64()) {
+            (Some(xf), Some(yf)) => (xf - yf).abs() < f64::EPSILON || xf == yf,
+            _ => x == y,
+        },
+        (Value::Null, Value::Null) => true,
+        (Value::Array(x), Value::Array(y)) => {
+            x.len() == y.len() && x.iter().zip(y).all(|(a, b)| json_eq_numeric(a, b))
+        }
+        (Value::Object(x), Value::Object(y)) => {
+            x.len() == y.len()
+                && x.iter()
+                    .all(|(k, v)| y.get(k).is_some_and(|yv| json_eq_numeric(v, yv)))
+        }
+        _ => a == b,
+    }
+}
+
+fn assert_json_eq_numeric(got: &Value, want: &Value, msg: &str) {
+    if !json_eq_numeric(got, want) {
+        panic!("{msg}: got {got}, want {want}");
+    }
+}
+
 fn run_case(c: &InMemoryRtDbClient, case: &Case) -> Value {
     let q: Query = serde_json::from_value(case.query.clone()).expect("parse Query from fixture");
     c.run_query(&q).expect("run_query")
@@ -139,6 +222,61 @@ fn golden_vector_parity() {
                 case.id,
                 scalar
             );
+            continue;
+        }
+
+        if let Some(want) = &case.expected_value {
+            // aggregate scalar: a bare number, or null for an empty match set.
+            assert_json_eq_numeric(
+                &result,
+                want,
+                &format!("{}: aggregate scalar mismatch", case.id),
+            );
+            continue;
+        }
+
+        if let Some(want_groups) = &case.expected_groups {
+            let got = result
+                .as_array()
+                .unwrap_or_else(|| panic!("{}: aggregate groupBy must return array", case.id));
+            assert_eq!(
+                got.len(),
+                want_groups.len(),
+                "{}: group count mismatch",
+                case.id
+            );
+            for (i, (g, w)) in got.iter().zip(want_groups).enumerate() {
+                let wk = w
+                    .get("key")
+                    .unwrap_or_else(|| panic!("{}: group {i} missing key", case.id));
+                let wv = w
+                    .get("value")
+                    .unwrap_or_else(|| panic!("{}: group {i} missing value", case.id));
+                let gk = g
+                    .get("key")
+                    .unwrap_or_else(|| panic!("{}: group {i} missing key", case.id));
+                let gv = g
+                    .get("value")
+                    .unwrap_or_else(|| panic!("{}: group {i} missing value", case.id));
+                assert_eq!(gk, wk, "{}: group {i} key mismatch", case.id);
+                assert_json_eq_numeric(gv, wv, &format!("{}: group {i} value mismatch", case.id));
+            }
+            continue;
+        }
+
+        if let Some(want) = &case.expected_distinct {
+            let got = result
+                .as_array()
+                .unwrap_or_else(|| panic!("{}: distinct must return array", case.id));
+            assert_eq!(
+                got.len(),
+                want.len(),
+                "{}: distinct count mismatch",
+                case.id
+            );
+            for (i, (g, w)) in got.iter().zip(want).enumerate() {
+                assert_json_eq_numeric(g, w, &format!("{}: distinct[{i}] mismatch", case.id));
+            }
             continue;
         }
 

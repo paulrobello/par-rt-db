@@ -1007,9 +1007,11 @@ impl InMemoryRtDbClient {
     ///   matches (and [`Value::Null`] when zero match).
     /// - `count` → number of matching rows.
     /// - `take` / `collect` → array of merged docs.
-    /// - `search` / `vector_search` → empty array (no in-memory ranking; the
-    ///   guards still reject conflicting combinations so the cascade agrees with
-    ///   the server).
+    /// - `search` → token-AND matched docs narrowed by an optional `filter`
+    ///   (no in-memory ts_rank; result order is unspecified, compared as a set).
+    /// - `vector_search` → all docs narrowed by an optional `filter`, capped at
+    ///   `limit` (no in-memory distance model; same over-approximation as the
+    ///   ts/python clients).
     ///
     /// The harness is in-process — no `{result}` wire envelope; callers either
     /// match on the [`Value`] directly or use [`run`](Self::run) for typed
@@ -1042,12 +1044,13 @@ impl InMemoryRtDbClient {
                 || q.filter.is_some()
                 || q.search.is_some()
                 || q.vector_search.is_some()
+                || q.hybrid_search.is_some()
             {
                 return Err(RtDbError::new(
                     ErrorCode::BadRequest,
                     "get cannot be combined with index, eq, range bounds, order, take, \
                      unique, first, count, distinct, aggregate, paginate, filter, search, \
-                     or vector search",
+                     vector search, or hybrid search",
                 ));
             }
             // The DSL `get` terminal reuses the point-read primitive so the
@@ -1262,13 +1265,13 @@ impl InMemoryRtDbClient {
         }
 
         // `vectorSearch` terminal — cascade mirror of server `execute_query`.
-        // No in-memory ranking; return an empty array so the cascade agrees
-        // with the server without silently misranking by falling through to
-        // the collect path. A carried `filter` (the db-side `FilterExpr` DSL)
-        // is validated against the table's declared fields and run through
-        // `matches_filter` on the (empty) candidate set — same narrowing path
-        // as the `search` terminal, exercised even though the stub result set
-        // stays empty.
+        // In-memory replica approximation: there is no pgvector distance model
+        // client-side, so every table doc is a candidate; the carried `filter`
+        // (the db-side `FilterExpr` DSL) narrows the set, capped at `limit`.
+        // This is the same over-approximation the ts/python clients use; result
+        // order is unspecified (no ranking) so callers compare as a set. QA-103:
+        // the previous stub returned `[]` unconditionally, which diverged from
+        // the server (and the other clients) on every non-empty match.
         if let Some(vector) = &q.vector_search {
             if q.index.is_some()
                 || !eq.is_empty()
@@ -1277,8 +1280,12 @@ impl InMemoryRtDbClient {
                 || q.unique
                 || q.first
                 || q.count
+                || q.distinct
+                || q.aggregate.is_some()
+                || q.paginate.is_some()
                 || q.filter.is_some()
                 || q.search.is_some()
+                || q.hybrid_search.is_some()
                 || q.take.is_some()
             {
                 return Err(RtDbError::new(
@@ -1290,19 +1297,57 @@ impl InMemoryRtDbClient {
                 let fields: BTreeSet<String> = table_def.fields.keys().cloned().collect();
                 validate_filter(filter, &fields)?;
             }
-            let mut rows: Vec<Value> = Vec::new();
+            let mut rows: Vec<Value> = self.collect_all(&q.table);
             if let Some(filter) = &vector.filter {
                 rows.retain(|d| matches_filter(filter, d));
             }
+            rows.truncate(vector.limit as usize);
             return Ok(Value::Array(rows));
         }
 
-        // `search` terminal — same reasoning as `vectorSearch`: no in-memory
-        // ts_rank, but the guard exists so invalid combinations fail here
-        // instead of silently returning an unranked result. A carried `filter`
-        // (the db-side `FilterExpr` DSL) is validated against the table's
-        // declared fields and run through `matches_filter`, so the narrowing
-        // path is exercised even though the stub result set stays empty.
+        // `hybridSearch` terminal — cascade mirror of server `execute_query`.
+        // Standalone terminal like `vectorSearch`/`search`: rejects every other
+        // peer (HYBRID_SEARCH_PEERS = all except self). In-memory replica
+        // approximation: no pgvector distance + ts_rank blend client-side, so
+        // every table doc is a candidate, capped at `limit`. Same
+        // over-approximation the ts/python clients use; result order is
+        // unspecified (no ranking) so callers compare as a set.
+        if let Some(hybrid) = &q.hybrid_search {
+            if q.index.is_some()
+                || !eq.is_empty()
+                || has_range
+                || q.order.is_some()
+                || q.unique
+                || q.first
+                || q.count
+                || q.distinct
+                || q.aggregate.is_some()
+                || q.paginate.is_some()
+                || q.filter.is_some()
+                || q.search.is_some()
+                || q.vector_search.is_some()
+                || q.take.is_some()
+            {
+                return Err(RtDbError::new(
+                    ErrorCode::BadRequest,
+                    "hybridSearch cannot be combined with any other terminal",
+                ));
+            }
+            let mut rows: Vec<Value> = self.collect_all(&q.table);
+            rows.truncate(hybrid.limit as usize);
+            return Ok(Value::Array(rows));
+        }
+
+        // `search` terminal — cascade mirror of server `execute_query`.
+        // In-memory replica approximation: there is no ts_rank model
+        // client-side, so we mirror the ts-client's token-AND matching against
+        // the search index's text fields (a doc matches when every whitespace
+        // token of the query appears, case-insensitively, as a substring of at
+        // least one indexed field's string value); the carried `filter` then
+        // narrows the candidate set. Result order is unspecified (no ranking)
+        // so callers compare as a set. QA-103: the previous stub returned `[]`
+        // unconditionally, which diverged from the server (and the other
+        // clients) on every non-empty match.
         if let Some(search) = &q.search {
             if q.index.is_some()
                 || !eq.is_empty()
@@ -1311,20 +1356,44 @@ impl InMemoryRtDbClient {
                 || q.unique
                 || q.first
                 || q.count
+                || q.distinct
+                || q.aggregate.is_some()
+                || q.paginate.is_some()
                 || q.filter.is_some()
                 || q.vector_search.is_some()
+                || q.hybrid_search.is_some()
             {
                 return Err(RtDbError::new(
                     ErrorCode::BadRequest,
                     "search cannot be combined with index, eq, range bounds, order, \
-                     unique, first, count, filter, or vector search",
+                     unique, first, count, distinct, aggregate, paginate, filter, \
+                     vector search, or hybrid search",
                 ));
             }
             if let Some(filter) = &search.filter {
                 let fields: BTreeSet<String> = table_def.fields.keys().cloned().collect();
                 validate_filter(filter, &fields)?;
             }
-            let mut rows: Vec<Value> = Vec::new();
+            let index_def = require_index(&table_def, &search.index)?;
+            let index_fields: Vec<String> = index_def.fields.clone();
+            let tokens: Vec<String> = search
+                .query
+                .split_whitespace()
+                .map(|t| t.to_lowercase())
+                .collect();
+            let mut rows: Vec<Value> = self.collect_all(&q.table);
+            if !tokens.is_empty() {
+                rows.retain(|doc| {
+                    tokens.iter().all(|tok| {
+                        index_fields.iter().any(|f| {
+                            doc.get(f)
+                                .and_then(Value::as_str)
+                                .map(|s| s.to_lowercase().contains(tok))
+                                .unwrap_or(false)
+                        })
+                    })
+                });
+            }
             if let Some(filter) = &search.filter {
                 rows.retain(|d| matches_filter(filter, d));
             }
@@ -4095,7 +4164,8 @@ mod tests {
                     .field("note", FieldType::optional(FieldType::String))
                     .index("by_name", &["name"])
                     .index("by_status", &["status"])
-                    .index("by_status_and_order", &["status", "order"]),
+                    .index("by_status_and_order", &["status", "order"])
+                    .search_index("by_content", &["name"], None),
             )
             .build()
     }
@@ -4170,7 +4240,8 @@ mod tests {
                     .field("priority", FieldType::optional(FieldType::Number))
                     .index("by_name", &["name"])
                     .index("by_status", &["status"])
-                    .index("by_status_and_order", &["status", "order"]),
+                    .index("by_status_and_order", &["status", "order"])
+                    .search_index("by_content", &["name"], None),
             )
             .table("users", Table::new().field("email", FieldType::String))
             .build();
