@@ -6,7 +6,8 @@ use crate::ddl::{
 };
 use crate::error::RtDbError;
 use crate::schema::{
-    FieldType, MAX_FIELD_NAME_LEN, SchemaDef, TableDef, indexed_column_type, is_valid_identifier,
+    FieldType, MAX_FIELD_NAME_LEN, MAX_INDEX_NAME_LEN, MAX_TABLE_NAME_LEN, SchemaDef, TableDef,
+    indexed_column_type, is_valid_identifier,
 };
 use crate::txn::{DocOp, OpKind};
 use std::collections::BTreeSet;
@@ -117,8 +118,12 @@ pub struct SampleChange {
 /// the schema in order, and returns the derived resulting `SchemaDef`. Pure
 /// (no DB). Rejects: missing source table/field/index; a rename/changeType
 /// target that already exists or is produced by an earlier directive; a cast
-/// invalid for the old→new type pair; an out-of-scope `evalExpr` (contains a
-/// `FROM`/JOIN or a DDL verb keyword, or targets a missing table).
+/// invalid for the old→new type pair; an `evalExpr` whose `set` field is not a
+/// valid identifier, or that targets a missing table. `evalExpr`'s `expr`/`where`
+/// SQL text is intentionally NOT parsed here — a denylist over SQL text cannot
+/// be made sound, so containment is enforced structurally at the admin gate
+/// (`admin_migrate` admits `evalExpr` only to the root admin_key holder, not to
+/// delegated/OAuth-allowlist admins).
 pub fn plan_migration(old: &SchemaDef, directives: &[Directive]) -> Result<SchemaDef, RtDbError> {
     let mut schema = old.clone();
     for d in directives {
@@ -263,8 +268,8 @@ fn validate_one(schema: &mut SchemaDef, d: &Directive) -> Result<(), RtDbError> 
         Directive::EvalExpr {
             table,
             set,
-            expr,
-            where_clause,
+            expr: _,
+            where_clause: _,
         } => {
             let _ = table_mut(schema, table)?; // table must exist
             // `set` is a field path; the field need not exist (evalExpr may populate a
@@ -276,11 +281,15 @@ fn validate_one(schema: &mut SchemaDef, d: &Directive) -> Result<(), RtDbError> 
                     "evalExpr 'set' must be a valid field name, got '{set}'"
                 )));
             }
-            if has_sql_violation(expr) || where_clause.as_deref().is_some_and(has_sql_violation) {
-                return Err(RtDbError::bad_request(format!(
-                    "evalExpr for '{table}.{set}' is out of scope (no FROM/joins or DDL verbs)"
-                )));
-            }
+            // SEC-107: `expr`/`where` are raw SQL text interpolated unbound into the
+            // UPDATE statement in `apply_eval_expr`. A substring denylist over SQL
+            // cannot be made sound (bypassed by whitespace variants around ` FROM `,
+            // and `SELECT` without `FROM` reads like `pg_read_file`/`current_setting`
+            // were never listed). Containment is instead enforced by the admin gate:
+            // `admin_migrate` rejects an `evalExpr` directive from a delegated
+            // (OAuth-allowlist) admin and admits it only under the root admin_key,
+            // whose holder already has full server/DB access. The root admin is the
+            // trust boundary; this directive does not expand it.
         }
     }
     Ok(())
@@ -355,25 +364,39 @@ fn cast_valid_for(cast: Cast, old: &FieldType) -> bool {
     )
 }
 
-/// Rejects the scoped-raw-SQL boundary violations: a `FROM`/`JOIN` (cross-table)
-/// or any DDL verb. The admin is trusted; this is blast-radius scoping.
-fn has_sql_violation(sql: &str) -> bool {
-    let upper = sql.to_ascii_uppercase();
-    const FORBIDDEN: &[&str] = &[
-        " FROM ",
-        " JOIN ",
-        " INTO ",
-        "UPDATE ",
-        "DELETE ",
-        "INSERT ",
-        "DROP ",
-        "ALTER ",
-        "TRUNCATE ",
-        "CREATE ",
-        "GRANT ",
-        "REVOKE ",
-    ];
-    FORBIDDEN.iter().any(|kw| upper.contains(kw))
+// SEC-124 (recurring, prior SEC-008): the SQL-interpolation backstops here used
+// to be `debug_assert!(is_valid_identifier(...))`, which the Dockerfile's
+// `--release` build compiles away — so the stated control was absent from the
+// deployed binary. These real checks return `BadRequest` instead, so a malformed
+// identifier reaching the apply layer (a regression: upstream `SchemaDef::validate`
+// and the existence checks in `validate_one` reject it first) is rejected loudly
+// rather than emitted into SQL. Defense-in-depth — the bounds they enforce are
+// also the bounds the interpolation depends on.
+fn require_field_ident(name: &str) -> Result<(), RtDbError> {
+    if !is_valid_identifier(name, MAX_FIELD_NAME_LEN) {
+        return Err(RtDbError::bad_request(format!(
+            "invalid field identifier '{name}'"
+        )));
+    }
+    Ok(())
+}
+
+fn require_table_ident(name: &str) -> Result<(), RtDbError> {
+    if !is_valid_identifier(name, MAX_TABLE_NAME_LEN) {
+        return Err(RtDbError::bad_request(format!(
+            "invalid table identifier '{name}'"
+        )));
+    }
+    Ok(())
+}
+
+fn require_index_ident(name: &str) -> Result<(), RtDbError> {
+    if !is_valid_identifier(name, MAX_INDEX_NAME_LEN) {
+        return Err(RtDbError::bad_request(format!(
+            "invalid index identifier '{name}'"
+        )));
+    }
+    Ok(())
 }
 
 // ---- DB applier (Task 3) ---------------------------------------------------
@@ -486,14 +509,14 @@ async fn apply_rename_field(
     to: &str,
     fx: &mut MigrationEffects,
 ) -> Result<DirectiveReport, RtDbError> {
-    // SEC-008 defense-in-depth: `from` and `to` are interpolated into
-    // SQL string literals below (`doc ? '{from}'`). The upstream
-    // push_schema path rejects malformed identifiers, so a directive
-    // reaching here with a quote-bearing field name is a regression —
-    // assert it in debug builds rather than silently emitting broken
-    // SQL. Production builds trust the upstream validation.
-    debug_assert!(is_valid_identifier(from, MAX_FIELD_NAME_LEN));
-    debug_assert!(is_valid_identifier(to, MAX_FIELD_NAME_LEN));
+    // SEC-124: `from` and `to` are interpolated into the SQL string literals
+    // below (`doc ? '{from}'`, `doc - '{from}'`, `doc->'{from}'`, and the
+    // `jsonb_set` path literal in `rewrite_doc_key`). A real check — the prior
+    // `debug_assert!` compiled away under `--release` (the Dockerfile builds
+    // release). `from` is also existence-checked in `validate_one`, and `to`
+    // by `derived.validate()` upstream; this is the defense-in-depth backstop.
+    require_field_ident(from)?;
+    require_field_ident(to)?;
     let t = pg_table(table);
     // Rename the typed column only if the source field is indexed
     // (checked on the pre-migration table — the column still bears the
@@ -528,6 +551,12 @@ async fn apply_rename_table(
     to: &str,
     fx: &mut MigrationEffects,
 ) -> Result<DirectiveReport, RtDbError> {
+    // SEC-124: `from`/`to` flow into a `pg_table()` physical ident inside a
+    // double-quoted DDL literal; `pg_table` only lowercases + prefixes, so a
+    // quote-bearing name would still break out of the `"..."` quoting. Real
+    // check (prior site had no backstop at all).
+    require_table_ident(from)?;
+    require_table_ident(to)?;
     // Physical table rename; docs are untouched -> no DocOps, but the
     // table is recorded as touched so subscriptions re-run.
     sqlx::query(&format!(
@@ -553,9 +582,9 @@ async fn apply_drop_field(
     field: &str,
     fx: &mut MigrationEffects,
 ) -> Result<DirectiveReport, RtDbError> {
-    // SEC-008 defense-in-depth: see RenameField. `field` is interpolated
-    // unbound into `doc ? '{field}'` and `doc - '{field}'` literals.
-    debug_assert!(is_valid_identifier(field, MAX_FIELD_NAME_LEN));
+    // SEC-124: see RenameField. `field` is interpolated unbound into
+    // `doc ? '{field}'` and `doc - '{field}'` literals.
+    require_field_ident(field)?;
     let t = pg_table(table);
     // Reject dropping a field still referenced by an index — dropping
     // its typed column would desync the physical index from the derived
@@ -636,6 +665,12 @@ async fn apply_drop_index(
     name: &str,
     fx: &mut MigrationEffects,
 ) -> Result<DirectiveReport, RtDbError> {
+    // SEC-124: `table` and `name` are composed into the `i_{table}_{name}`
+    // index ident (both lowercased) and dropped inside a `"..."` literal;
+    // a quote-bearing value would still escape the quoting (prior site had
+    // no backstop). `name` is index-scoped (30-char cap, like push_schema).
+    require_table_ident(table)?;
+    require_index_ident(name)?;
     // Index ident mirrors ddl::push_schema's `i_{table}_{name}` (both
     // lowercased). No DocOps; the table is touched so subscriptions re-run.
     let idx = format!("i_{}_{}", table.to_lowercase(), name.to_lowercase());
@@ -710,9 +745,9 @@ async fn apply_set_default(
     value: &serde_json::Value,
     fx: &mut MigrationEffects,
 ) -> Result<DirectiveReport, RtDbError> {
-    // SEC-008 defense-in-depth: see RenameField. `field` is interpolated
-    // unbound into `NOT doc ? '{field}'` and a jsonb_set path literal.
-    debug_assert!(is_valid_identifier(field, MAX_FIELD_NAME_LEN));
+    // SEC-124: see RenameField. `field` is interpolated unbound into
+    // `NOT doc ? '{field}'` and a jsonb_set path literal.
+    require_field_ident(field)?;
     let t = pg_table(table);
     let value_json =
         serde_json::to_string(value).map_err(|e| RtDbError::internal(e.to_string()))?;
@@ -763,10 +798,9 @@ async fn apply_change_type(
     default: &Option<serde_json::Value>,
     fx: &mut MigrationEffects,
 ) -> Result<DirectiveReport, RtDbError> {
-    // SEC-008 defense-in-depth: see RenameField. `field` is interpolated
-    // unbound into `doc ? '{field}'`, `doc->'{field}'`, and a
-    // jsonb_set path literal.
-    debug_assert!(is_valid_identifier(field, MAX_FIELD_NAME_LEN));
+    // SEC-124: see RenameField. `field` is interpolated unbound into
+    // `doc ? '{field}'`, `doc->'{field}'`, and a jsonb_set path literal.
+    require_field_ident(field)?;
     let t = pg_table(table);
     let (pg_type, _nullable) = indexed_column_type(to).map_err(|_| {
         RtDbError::bad_request(format!(
@@ -864,12 +898,22 @@ async fn apply_eval_expr(
     where_clause: &Option<String>,
     fx: &mut MigrationEffects,
 ) -> Result<DirectiveReport, RtDbError> {
-    // Scope was already validated by `plan_migration`: `expr`/`where`
-    // carry no `FROM`/`JOIN`/DDL verbs, and `set` is a regex-clean field
-    // name. This is the scoped raw-SQL escape — the admin authors `expr`
-    // and `where` as SQL text bounded to this one table's `doc`. Capture
-    // the affected ids BEFORE the rewrite using the same `cond` so DocOps
-    // cover exactly the rows about to change.
+    // SEC-107: `expr` and `where` are raw SQL text interpolated unbound into the
+    // `UPDATE … SET … = to_jsonb(({expr})) WHERE {cond}` statement below. There
+    // is no parse-time containment — a substring denylist over SQL cannot be made
+    // sound (whitespace variants around ` FROM ` and `SELECT` without `FROM`
+    // both bypassed the prior `has_sql_violation` guard), so it was removed. The
+    // real boundary is the admin gate: `admin_migrate` admits an `evalExpr`
+    // directive only under the root admin_key, never under a delegated
+    // (OAuth-allowlist) admin. The root admin_key holder already has full
+    // server/DB access, so evalExpr under it does not expand their reach; a
+    // delegated admin must not reach other schemas (`rtdb_auth.machine_tokens`/
+    // `sessions`/`admins`, other tenants' documents) through this directive.
+    // `set` is the only field validated here (regex-clean field name); `expr`
+    // and `cond` run as-is against this database's `doc`.
+    //
+    // Capture the affected ids BEFORE the rewrite using the same `cond` so
+    // DocOps cover exactly the rows about to change.
     let t = pg_table(table);
     let cond = where_clause.clone().unwrap_or_else(|| "true".to_string());
     let ids = ids_where(tx, schema_name, &t, &cond).await?;
@@ -935,6 +979,13 @@ async fn rewrite_doc_key(
     from: &str,
     to: &str,
 ) -> Result<i64, RtDbError> {
+    // SEC-124: `from`/`to` are interpolated unbound into the SQL string
+    // literals (`doc - '{from}'`, `doc->'{from}'`, the `jsonb_set` path
+    // `{{"{to}"}}`). The caller (`apply_rename_field`) already checks both,
+    // but this helper's literals are a distinct interpolation site — re-check
+    // so a future caller can't bypass it (prior site had no backstop).
+    require_field_ident(from)?;
+    require_field_ident(to)?;
     let res = sqlx::query(&format!(
         "UPDATE \"{schema_name}\".\"{table}\" \
          SET doc = jsonb_set(doc - '{from}', '{{\"{to}\"}}', doc->'{from}', true) \
@@ -1030,8 +1081,11 @@ async fn all_ids(
 }
 
 /// Selects `id` for rows matching `cond`. `cond` is composed from validated
-/// field identifiers (regex-clean per the schema layer), never user data — the
-/// same pattern `ddl::push_schema` uses for its `WHERE doc ? '{field}'` backfill.
+/// field identifiers (regex-clean per the schema layer) for every caller EXCEPT
+/// `apply_eval_expr`, where `cond` is the admin-supplied `where` SQL text gated
+/// by the root admin_key (see `apply_eval_expr`). The `evalExpr` path is the
+/// scoped raw-SQL escape hatch; all other callers pass `doc ? '{field}'` shapes
+/// the same way `ddl::push_schema` does for its backfill.
 async fn ids_where(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     schema_name: &str,
@@ -1282,8 +1336,17 @@ mod tests {
         assert!(plan_migration(&schema, &d).is_err());
     }
 
+    // SEC-107: `plan_migration` intentionally does NOT inspect `expr`/`where` SQL
+    // text. The prior `has_sql_violation` denylist was unsound (bypassed by
+    // whitespace variants around ` FROM ` and by `SELECT` without `FROM`) and
+    // was removed. Containment is now structural: `admin_migrate` admits an
+    // evalExpr directive only under the root admin_key, never under a delegated
+    // (OAuth-allowlist) admin — covered by the HTTP-layer tests in
+    // migration_test.rs (`sec107_*`). This test pins the planner half: a
+    // FROM-clause `expr` is ACCEPTED here (the gate is the control, not the
+    // planner), so the next reader does not reintroduce a SQL denylist.
     #[test]
-    fn plan_rejects_evalexpr_with_from_clause() {
+    fn plan_does_not_inspect_evalexpr_sql_text() {
         let old = one_table_schema();
         let d = vec![Directive::EvalExpr {
             table: "users".into(),
@@ -1291,7 +1354,10 @@ mod tests {
             expr: "x FROM other".into(),
             where_clause: None,
         }];
-        assert!(plan_migration(&old, &d).is_err());
+        assert!(
+            plan_migration(&old, &d).is_ok(),
+            "planner no longer SQL-gates evalExpr; the admin gate does"
+        );
     }
 
     #[test]

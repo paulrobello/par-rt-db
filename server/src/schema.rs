@@ -190,8 +190,8 @@ pub struct SchemaDef {
 /// the DDL layer's physical names (`t_`/`f_` prefixes, `i_<table>_<index>`
 /// composition, all lowercased) stay within Postgres's 63-byte identifier limit:
 /// worst case `i_` + 30 + `_` + 30 = 63, exactly at the limit.
-const MAX_TABLE_NAME_LEN: usize = 30;
-const MAX_INDEX_NAME_LEN: usize = 30;
+pub(crate) const MAX_TABLE_NAME_LEN: usize = 30;
+pub(crate) const MAX_INDEX_NAME_LEN: usize = 30;
 pub(crate) const MAX_FIELD_NAME_LEN: usize = 60;
 
 /// Identifier regex `^[a-zA-Z][a-zA-Z0-9_]*$` bounded to `max_len` total chars.

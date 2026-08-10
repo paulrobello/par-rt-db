@@ -13,7 +13,7 @@ use crate::http_api::ApiJson;
 use crate::schema::SchemaDef;
 use crate::{AppState, db, schema_history};
 
-use super::require_admin;
+use super::{AdminPrincipal, require_admin};
 
 pub(super) async fn get_schema(
     State(state): State<Arc<AppState>>,
@@ -111,7 +111,28 @@ pub(super) async fn admin_migrate(
     Path(db): Path<String>,
     ApiJson(body): ApiJson<crate::migrate::MigrateRequest>,
 ) -> Result<Json<crate::migrate::MigrateResult>, RtDbError> {
-    require_admin(&state, &headers).await?;
+    let principal = require_admin(&state, &headers).await?;
+    // SEC-107: an `evalExpr` directive interpolates client-supplied SQL text
+    // (`expr`/`where`) directly into an `UPDATE … WHERE` executed inside the
+    // committer's serialized turn. A denylist over SQL text cannot be made
+    // sound, so containment is enforced structurally here: `evalExpr` is
+    // admitted only under the root `admin_key` (`AdminPrincipal::Key`), never
+    // under a delegated/OAuth-allowlist dashboard admin (`AdminPrincipal::User`).
+    // The root admin_key holder already has full server/DB access, so evalExpr
+    // under it does not expand their reach; a delegated admin must not reach
+    // `rtdb_auth.machine_tokens`/`sessions`/`admins` or other tenants' documents
+    // through it. All other directives (addIndex/renameField/etc.) remain
+    // available to allowlist admins.
+    if body
+        .directives
+        .iter()
+        .any(|d| matches!(d, crate::migrate::Directive::EvalExpr { .. }))
+        && !matches!(principal, AdminPrincipal::Key)
+    {
+        return Err(RtDbError::forbidden(
+            "evalExpr directive requires the root admin key",
+        ));
+    }
     if !db::database_exists(&state.pool, &db).await? {
         return Err(RtDbError::not_found("unknown database"));
     }

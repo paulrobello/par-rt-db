@@ -1555,3 +1555,197 @@ async fn drop_index_drops_search_and_vector_columns() {
         .expect("re-push schema after dropIndex must not collide");
     drop_db(&db).await;
 }
+
+// ---- SEC-107: evalExpr root-admin gate -------------------------------------
+//
+// `evalExpr` interpolates client SQL text into an UPDATE; containment is now
+// structural (root admin_key only), not a substring denylist. These exercise
+// the HTTP gate in `admin_migrate` — the one path the denylist used to guard.
+
+// POST helper carrying an arbitrary bearer (the OAuth-allowlist-admin session
+// token), mirroring dashboard_test's `bearer_get`.
+async fn bearer_post_migrate(
+    addr: std::net::SocketAddr,
+    path: &str,
+    token: &str,
+    body: serde_json::Value,
+) -> reqwest::Response {
+    reqwest::Client::new()
+        .post(format!("http://{addr}{path}"))
+        .header("Authorization", format!("Bearer {token}"))
+        .json(&body)
+        .send()
+        .await
+        .expect("send bearer migrate request")
+}
+
+// Seeds a user + session + rtdb_auth.admins row and returns the session bearer.
+// Distinct uuid-suffixed email/user_id per call so the shared dev Postgres's
+// UNIQUE/PK constraints never collide across test runs.
+async fn seed_oauth_allowlist_admin(state: &Arc<AppState>) -> String {
+    let suffix = uuid::Uuid::now_v7().simple();
+    let email = format!("migrate-admin-{suffix}@example.com");
+    let user_id = format!("u{suffix}");
+    let token = common::mint_user_session(&state.pool, &user_id, &email).await;
+    sqlx::query("INSERT INTO rtdb_auth.admins (email, github_id, added_at) VALUES ($1, NULL, $2)")
+        .bind(&email)
+        .bind(rtdb_server::db::now_ms())
+        .execute(&state.pool)
+        .await
+        .expect("insert rtdb_auth.admins row");
+    token
+}
+
+// SEC-107: an evalExpr directive submitted by a delegated (OAuth-allowlist)
+// dashboard admin is rejected 403 at the admin gate — it must not reach the
+// raw-SQL applier. This is the verified exploit path closed by the gate: a
+// delegated admin could otherwise read rtdb_auth.machine_tokens/sessions/admins
+// or any tenant's documents via `expr = (SELECT ... \nFROM rtdb_auth...)` and
+// read them back through /api/query. The newline-before-`FROM` and bare
+// `SELECT current_setting(...)` shapes bypassed the old denylist; the control
+// is now the root-admin gate, which this test exercises directly.
+#[tokio::test]
+async fn sec107_evalexpr_rejected_for_oauth_allowlist_admin() {
+    let db = setup_db_with_schema(
+        r#"{"tables":{"u":{"fields":{"name":{"type":"string"}},"indexes":[]}}}"#,
+    )
+    .await;
+    insert_doc(&db, "u", r#"{"name":"ada"}"#).await;
+    let addr = spawn_app(db.state.clone()).await;
+    let token = seed_oauth_allowlist_admin(&db.state).await;
+
+    let resp = bearer_post_migrate(
+        addr,
+        &format!("/admin/db/{}/migrate", db.name),
+        &token,
+        serde_json::json!({"directives":[
+            {"op":"evalExpr","table":"u","set":"upper","expr":"upper(doc->>'name')"}
+        ]}),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::FORBIDDEN,
+        "evalExpr from a delegated admin must be 403"
+    );
+    let body: serde_json::Value = resp.json().await.expect("json body");
+    assert_eq!(body["code"], "FORBIDDEN", "body: {body:?}");
+    drop_db(&db).await;
+}
+
+// SEC-107: the SAME evalExpr directive is admitted under the root admin_key
+// (the dashboard CLI / `rtdb` CLI automation path). The root admin_key holder
+// already has full server/DB access, so evalExpr under it does not expand
+// their reach — the gate rejects only the delegated-admin tier.
+#[tokio::test]
+async fn sec107_evalexpr_allowed_for_root_admin_key() {
+    let db = setup_db_with_schema(
+        r#"{"tables":{"u":{"fields":{"name":{"type":"string"}},"indexes":[]}}}"#,
+    )
+    .await;
+    let id = insert_doc(&db, "u", r#"{"name":"ada"}"#).await;
+    let addr = spawn_app(db.state.clone()).await;
+
+    let resp = admin_post(
+        addr,
+        &format!("/admin/db/{}/migrate", db.name),
+        serde_json::json!({"directives":[
+            {"op":"evalExpr","table":"u","set":"upper","expr":"upper(doc->>'name')"}
+        ]}),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "root admin admits evalExpr"
+    );
+    // The rewrite actually ran.
+    assert_eq!(get_doc(&db, "u", &id).await["upper"], "ADA");
+    drop_db(&db).await;
+}
+
+// SEC-107: a NON-evalExpr directive (renameField here) remains available to a
+// delegated admin — the gate is scoped to evalExpr only, not the whole migrate
+// route. Confirms the fix does not over-broadly lock down admin operations.
+#[tokio::test]
+async fn sec107_non_evalexpr_directive_allowed_for_oauth_allowlist_admin() {
+    let db = setup_db_with_schema(
+        r#"{"tables":{"u":{"fields":{"name":{"type":"string"}},"indexes":[]}}}"#,
+    )
+    .await;
+    insert_doc(&db, "u", r#"{"name":"ada"}"#).await;
+    let addr = spawn_app(db.state.clone()).await;
+    let token = seed_oauth_allowlist_admin(&db.state).await;
+
+    let resp = bearer_post_migrate(
+        addr,
+        &format!("/admin/db/{}/migrate", db.name),
+        &token,
+        serde_json::json!({"directives":[
+            {"op":"renameField","table":"u","from":"name","to":"displayName"}
+        ]}),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "non-evalExpr directives stay available to delegated admins"
+    );
+    drop_db(&db).await;
+}
+
+// ---- SEC-124: real identifier checks (release-mode) ------------------------
+//
+// The prior `debug_assert!(is_valid_identifier(...))` backstops compiled away
+// under `--release` (the Dockerfile builds release). These tests reach the NEW
+// real checks in the apply layer via `migrate_err`, which calls plan_migration
+// + apply_migration but NOT the upstream `derived.validate()` — so the apply
+// check is the only guard. `to` is a fresh identifier not existence-checked by
+// `validate_one`, so an invalid value reaches the apply function and the real
+// check fires.
+
+// SEC-124: renameField with a quote-bearing `to` is rejected BAD_REQUEST at the
+// apply layer (the real check that replaced `debug_assert!`). A stray quote
+// would otherwise break the `doc - '{from}'` / `jsonb_set` path literal SQL.
+#[tokio::test]
+async fn sec124_rename_field_rejects_invalid_target_identifier() {
+    let db = setup_db_with_schema(
+        r#"{"tables":{"u":{"fields":{"name":{"type":"string"}},"indexes":[]}}}"#,
+    )
+    .await;
+    let err = migrate_err(
+        &db,
+        r#"{"directives":[{"op":"renameField","table":"u","from":"name","to":"bad'id"}]}"#,
+    )
+    .await;
+    assert_eq!(err.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert!(
+        err.message.contains("invalid field identifier"),
+        "should name the field-identifier rejection: {}",
+        err.message
+    );
+    drop_db(&db).await;
+}
+
+// SEC-124: renameTable with a quote-bearing `to` is rejected BAD_REQUEST at the
+// apply layer — a NEW check at a site that previously had NO backstop at all
+// (the sibling-interpolation gap SEC-124 called out).
+#[tokio::test]
+async fn sec124_rename_table_rejects_invalid_target_identifier() {
+    let db = setup_db_with_schema(
+        r#"{"tables":{"users":{"fields":{"name":{"type":"string"}},"indexes":[]}}}"#,
+    )
+    .await;
+    let err = migrate_err(
+        &db,
+        r#"{"directives":[{"op":"renameTable","from":"users","to":"bad'table"}]}"#,
+    )
+    .await;
+    assert_eq!(err.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert!(
+        err.message.contains("invalid table identifier"),
+        "should name the table-identifier rejection: {}",
+        err.message
+    );
+    drop_db(&db).await;
+}
