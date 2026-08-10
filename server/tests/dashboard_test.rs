@@ -648,8 +648,8 @@ async fn metrics_prometheus_endpoint() -> anyhow::Result<()> {
         "missing gauge TYPE line: {body}"
     );
     assert!(
-        body.contains("rtdb_build_info{version="),
-        "missing build_info line: {body}"
+        !body.contains("rtdb_build_info"),
+        "build_info leaked on unauthenticated /metrics (SEC-129): {body}"
     );
     // The query we ran must be reflected: sample value >= 1.
     let qline = body

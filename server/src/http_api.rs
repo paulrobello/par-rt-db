@@ -812,7 +812,8 @@ async fn build_range_response(
                 .header(header::CONTENT_LENGTH, slice.len() as u64)
                 .body(Body::from(slice))
                 .map_err(|err| {
-                    RtDbError::internal(format!("failed to build range response: {err}"))
+                    tracing::error!(error = %err, "failed to build range response");
+                    RtDbError::internal("failed to build range response; see server logs")
                 })
         }
         RangeOutcome::Unsatisfiable => Response::builder()
@@ -820,7 +821,10 @@ async fn build_range_response(
             .header(header::ACCEPT_RANGES, ACCEPT_RANGES_BYTES)
             .header(header::CONTENT_RANGE, format!("bytes */{total}"))
             .body(Body::empty())
-            .map_err(|err| RtDbError::internal(format!("failed to build 416 response: {err}"))),
+            .map_err(|err| {
+                tracing::error!(error = %err, "failed to build 416 response");
+                RtDbError::internal("failed to build 416 response; see server logs")
+            }),
     }
 }
 
@@ -1005,7 +1009,10 @@ fn build_serve_response(
             .header(header::CONTENT_RANGE, format!("bytes */{total}"))
             .body(Body::empty()),
     };
-    result.map_err(|err| RtDbError::internal(format!("failed to build serve response: {err}")))
+    result.map_err(|err| {
+        tracing::error!(error = %err, "failed to build serve response");
+        RtDbError::internal("failed to build serve response; see server logs")
+    })
 }
 
 #[cfg(test)]

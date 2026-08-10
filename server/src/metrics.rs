@@ -554,12 +554,15 @@ pub struct MetricsSnapshot {
 
 /// Render the snapshot as Prometheus text-exposition format (version 0.0.4).
 ///
-/// Pure (no I/O) so it is trivially unit-testable. `version` and `git_commit`
-/// populate a `rtdb_build_info` gauge so a scrape also records which build is
-/// live — mirroring the identity fields on `/healthz` and `/admin/config`. Both
-/// are build-time constants (semver / hex sha or `"unknown"`), so they are
-/// interpolated into the label value without escaping.
-pub fn render_prometheus(snap: &MetricsSnapshot, version: &str, git_commit: &str) -> String {
+/// Pure (no I/O) so it is trivially unit-testable. When `fingerprint` is
+/// `Some((version, git_commit))`, a `rtdb_build_info` gauge records which build
+/// is live — mirroring the identity fields on `/healthz` and `/admin/config`.
+/// Pass `None` on an unauthenticated request so the exact build version and
+/// commit sha are not disclosed to an unauthenticated scraper (SEC-129 —
+/// liveness/metrics stay unauthenticated, build fingerprint is admin-gated).
+/// Both fields are build-time constants (semver / hex sha or `"unknown"`), so
+/// they are interpolated into the label value without escaping.
+pub fn render_prometheus(snap: &MetricsSnapshot, fingerprint: Option<(&str, &str)>) -> String {
     let mut s = String::with_capacity(1024);
     // Counters — monotonic totals incremented at the transport boundary.
     s.push_str("# HELP rtdb_queries_total Total query requests served (HTTP /api/query + WS).\n");
@@ -744,11 +747,14 @@ pub fn render_prometheus(snap: &MetricsSnapshot, version: &str, git_commit: &str
     s.push_str(&format!("rtdb_uptime_seconds {}\n", snap.uptime_seconds));
 
     // build_info: constant 1 gauge carrying version + git_commit labels.
-    s.push_str("# HELP rtdb_build_info Build identity (version, git_commit).\n");
-    s.push_str("# TYPE rtdb_build_info gauge\n");
-    s.push_str(&format!(
-        "rtdb_build_info{{version=\"{version}\",git_commit=\"{git_commit}\"}} 1\n"
-    ));
+    // Omitted entirely on an unauthenticated request (SEC-129).
+    if let Some((version, git_commit)) = fingerprint {
+        s.push_str("# HELP rtdb_build_info Build identity (version, git_commit).\n");
+        s.push_str("# TYPE rtdb_build_info gauge\n");
+        s.push_str(&format!(
+            "rtdb_build_info{{version=\"{version}\",git_commit=\"{git_commit}\"}} 1\n"
+        ));
+    }
     s
 }
 
@@ -793,7 +799,7 @@ mod tests {
             admin_auth_failures_total: 0,
             per_db_quota: Vec::new(),
         };
-        let body = render_prometheus(&snap, "0.0.0", "abc");
+        let body = render_prometheus(&snap, Some(("0.0.0", "abc")));
         assert!(
             body.contains("# TYPE rtdb_queries_total counter"),
             "missing counter TYPE: {body}"
@@ -853,7 +859,7 @@ mod tests {
             admin_auth_failures_total: 0,
             per_db_quota: Vec::new(),
         };
-        let body = render_prometheus(&snap, "0.0.0", "abc");
+        let body = render_prometheus(&snap, Some(("0.0.0", "abc")));
         // One metric name, one sample per skip class.
         assert!(
             body.contains("# TYPE rtdb_subs_skips_total counter"),
@@ -981,7 +987,7 @@ mod tests {
             admin_auth_failures_total: 0,
             per_db_quota: Vec::new(),
         };
-        let body = render_prometheus(&snap, "0.0.0", "abc");
+        let body = render_prometheus(&snap, Some(("0.0.0", "abc")));
         assert!(
             body.contains("# TYPE rtdb_quota_rejections_total counter"),
             "{body}"

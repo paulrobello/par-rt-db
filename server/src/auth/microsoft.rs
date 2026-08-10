@@ -338,7 +338,14 @@ fn parse_token_response(value: &serde_json::Value) -> Result<String, RtDbError> 
     match value.get("access_token").and_then(|v| v.as_str()) {
         Some(token) => Ok(token.to_string()),
         None => {
-            tracing::warn!(response = ?value, "microsoft token exchange returned no access_token");
+            // SEC-130: log only the response SHAPE (which keys are present),
+            // never the body — a response missing access_token may still carry
+            // id_token/refresh_token, which must not reach the logs.
+            let keys: Vec<&str> = value
+                .as_object()
+                .map(|m| m.keys().map(String::as_str).collect())
+                .unwrap_or_default();
+            tracing::warn!(present_keys = ?keys, "microsoft token exchange returned no access_token");
             Err(RtDbError::internal("microsoft token exchange failed"))
         }
     }
@@ -515,11 +522,22 @@ fn parse_identity(
     userinfo: &serde_json::Value,
 ) -> Result<MicrosoftIdentity, RtDbError> {
     let sub = claims.get("sub").and_then(|v| v.as_str()).ok_or_else(|| {
-        tracing::warn!(claims = ?claims, "microsoft id_token missing sub");
+        // SEC-130: log only which claim keys are present, never the full claims
+        // object — verified claims still carry PII (email, name) that must not
+        // reach the logs.
+        let keys: Vec<&str> = claims
+            .as_object()
+            .map(|m| m.keys().map(String::as_str).collect())
+            .unwrap_or_default();
+        tracing::warn!(present_keys = ?keys, "microsoft id_token missing sub");
         forbidden("no microsoft subject")
     })?;
     let tid = claims.get("tid").and_then(|v| v.as_str()).ok_or_else(|| {
-        tracing::warn!(claims = ?claims, "microsoft id_token missing tid");
+        let keys: Vec<&str> = claims
+            .as_object()
+            .map(|m| m.keys().map(String::as_str).collect())
+            .unwrap_or_default();
+        tracing::warn!(present_keys = ?keys, "microsoft id_token missing tid");
         forbidden("no microsoft tenant")
     })?;
 
@@ -548,7 +566,13 @@ fn parse_identity(
             .or_else(|| userinfo.get("email"))
             .and_then(|v| v.as_str())
             .ok_or_else(|| {
-                tracing::warn!(claims = ?claims, userinfo = ?userinfo, "xms_edov set but no email claim");
+                // SEC-130: log only the present claim/userinfo keys, never the
+                // bodies (PII: email, name).
+                tracing::warn!(
+                    claim_keys = ?claims.as_object().map(|m| m.keys().collect::<Vec<_>>()).unwrap_or_default(),
+                    userinfo_keys = ?userinfo.as_object().map(|m| m.keys().collect::<Vec<_>>()).unwrap_or_default(),
+                    "xms_edov set but no email claim"
+                );
                 forbidden("no email")
             })?;
         email.to_string()
@@ -563,8 +587,8 @@ fn parse_identity(
             .and_then(|v| v.as_str())
             .ok_or_else(|| {
                 tracing::warn!(
-                    claims = ?claims,
-                    userinfo = ?userinfo,
+                    claim_keys = ?claims.as_object().map(|m| m.keys().collect::<Vec<_>>()).unwrap_or_default(),
+                    userinfo_keys = ?userinfo.as_object().map(|m| m.keys().collect::<Vec<_>>()).unwrap_or_default(),
                     "no xms_edov and no preferred_username/upn — no usable microsoft identity"
                 );
                 forbidden("no verified email")

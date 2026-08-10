@@ -36,11 +36,17 @@ jobs:
 
       # --- Rust (server + rust-client) -------------------------------------
       # edition = "2024" in both Cargo.tomls ⇒ requires stable ≥ 1.85.
-      # `@stable` is dtolnay/rust-toolchain's canonical selector for the Rust
-      # *release channel* named stable; it always resolves to a published tag.
+      # SEC-138: pinned to an immutable commit SHA from master history. The
+      # `stable` *branch* of dtolnay/rust-toolchain is mutable (that is the
+      # whole point of pinning), so the channel selector moves into the input.
+      # SHA = 6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 (master HEAD at pin
+      # time; verified to resolve before pinning — and master-history SHAs are
+      # the only ones dtolnay guarantees are not garbage-collected). Bump
+      # deliberately: re-verify the new SHA resolves and is on master.
       - name: Set up Rust (stable)
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
+          toolchain: stable
           components: rustfmt, clippy
 
       - name: Rust build cache
@@ -54,8 +60,11 @@ jobs:
 
       # --- Python + uv (python-client) -------------------------------------
       # python-client requires Python >=3.12; uv resolves and installs it.
+      # SEC-138: pinned to an immutable commit SHA. SHA =
+      # d0cc045d04ccac9d8b7881df0226f9e82c39688e (the v6 annotated tag's
+      # target, verified to resolve before pinning). Bump deliberately.
       - name: Set up uv
-        uses: astral-sh/setup-uv@v6
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e
         with:
           enable-cache: true
 

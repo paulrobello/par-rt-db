@@ -330,6 +330,26 @@ async fn security_headers(req: Request, next: Next) -> Response {
     resp
 }
 
+/// SEC-129: best-effort admin check for the build fingerprint fields on the
+/// otherwise-unauthenticated `/metrics` and `/healthz` routes. Returns the
+/// `(version, git_commit)` tuple only when an admin bearer is present and
+/// validates; returns `None` on absence or any auth failure so liveness is
+/// never gated. The exact build version and commit sha are admin-only; the
+/// unauthenticated response keeps aggregate metrics / status only.
+async fn admin_fingerprint(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Option<(&'static str, &'static str)> {
+    let token = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))?;
+    crate::admin::authenticate_admin(state, token)
+        .await
+        .ok()
+        .map(|_| (env!("CARGO_PKG_VERSION"), env!("BUILD_GIT_COMMIT")))
+}
+
 /// `GET /metrics`: unauthenticated Prometheus text-exposition scrape endpoint.
 ///
 /// Content-negotiates on `Accept` so the operator dashboard's browser route at
@@ -377,8 +397,7 @@ async fn prometheus_metrics_handler(
             presence_sessions,
         )
         .await;
-    let body =
-        metrics::render_prometheus(&snap, env!("CARGO_PKG_VERSION"), env!("BUILD_GIT_COMMIT"));
+    let body = metrics::render_prometheus(&snap, admin_fingerprint(&state, &headers).await);
     let mut h = HeaderMap::new();
     h.insert(
         header::CONTENT_TYPE,

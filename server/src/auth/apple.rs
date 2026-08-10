@@ -98,6 +98,16 @@ impl OAuthProvider for AppleProvider {
         let client = reqwest::Client::new();
         let redirect_uri = self.redirect_uri(&state.config.public_url);
 
+        // SEC-002R: the id_token read below arrives ONLY from this
+        // server-initiated TLS POST to Apple's token endpoint, authenticated by
+        // the operator's ES256 client_secret JWT built above. It is never
+        // accepted from a client-controlled channel, which is why the deferred
+        // JWKS signature verification (SEC-002) is hardening rather than a
+        // missing control — forgery requires a TLS-path compromise. LATENT
+        // RISK: adding any future endpoint that accepts a client-supplied
+        // id_token (e.g. "sign in with the id_token I already have") would make
+        // the unverified signature trivially forgeable overnight. Such an
+        // endpoint MUST land JWKS verification first.
         let token_resp: serde_json::Value = client
             .post(Self::TOKEN_URL)
             .form(&TokenExchangeRequest {
@@ -124,7 +134,14 @@ impl OAuthProvider for AppleProvider {
             .get("id_token")
             .and_then(|v| v.as_str())
             .ok_or_else(|| {
-                tracing::warn!(response = ?token_resp, "apple token exchange returned no id_token");
+                // SEC-130: log only the response SHAPE (which keys are present),
+                // never the body — a token_resp with no id_token still carries
+                // access_token/refresh_token, which must not reach the logs.
+                let keys: Vec<&str> = token_resp
+                    .as_object()
+                    .map(|m| m.keys().map(String::as_str).collect())
+                    .unwrap_or_default();
+                tracing::warn!(present_keys = ?keys, "apple token exchange returned no id_token");
                 RtDbError::internal("apple token exchange failed")
             })?;
 

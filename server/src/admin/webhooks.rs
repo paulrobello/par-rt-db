@@ -146,7 +146,7 @@ pub(super) async fn admin_delete_webhook(
         // Table may not exist; treat as already-gone.
         return Ok(Json(OkResponse { ok: false }));
     }
-    let ok = crate::webhook::delete_webhook(&state.pool, id).await?;
+    let ok = crate::webhook::delete_webhook(&state.pool, id, &db).await?;
     Ok(Json(OkResponse { ok }))
 }
 
@@ -315,8 +315,14 @@ pub(super) async fn admin_list_deliveries(
     }
     let limit = params.limit.clamp(1, 1000);
     let offset = params.offset.max(0);
-    let deliveries =
-        crate::webhook::fetch_deliveries(&state.pool, id, params.status.as_deref(), limit, offset)
-            .await?;
+    let deliveries = crate::webhook::fetch_deliveries(
+        &state.pool,
+        id,
+        &db,
+        params.status.as_deref(),
+        limit,
+        offset,
+    )
+    .await?;
     Ok(Json(DeliveriesResponse { deliveries }))
 }

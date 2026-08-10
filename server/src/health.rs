@@ -11,16 +11,13 @@ use std::time::Duration;
 
 use axum::Json;
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 
 use crate::AppState;
 
-/// Git short sha injected by `build.rs`. `"unknown"` when neither
-/// `RTDB_BUILD_COMMIT` nor `git` was available at build time.
-const GIT_COMMIT: &str = env!("BUILD_GIT_COMMIT");
 /// Unix seconds the binary was built, injected by `build.rs` as a string so
 /// the const-eval is a plain `&str`; parsed to RFC3339 per request.
 const BUILD_TIMESTAMP_SECS: &str = env!("BUILD_TIMESTAMP_SECS");
@@ -31,30 +28,49 @@ const POSTGRES_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 #[derive(Serialize)]
 pub struct HealthReport {
     pub status: &'static str,
-    pub version: &'static str,
-    pub git_commit: &'static str,
-    pub build_timestamp: String,
+    // SEC-129: build fingerprint fields are admin-only — omitted from the
+    // unauthenticated response so an anonymous prober cannot pin the exact
+    // deployed version / commit. Populated only when the request carries a
+    // valid admin bearer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub git_commit: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub build_timestamp: Option<String>,
     pub started_at: String,
     pub uptime_seconds: u64,
     pub postgres: bool,
 }
 
 /// `GET /healthz`: 200 + `{status:"ok"}` when Postgres is reachable, 503 +
-/// `{status:"degraded"}` otherwise. The body shape is identical either way.
-pub async fn handler(State(state): State<Arc<AppState>>) -> Response {
+/// `{status:"degraded"}` otherwise. The body shape is identical either way
+/// for the liveness fields; the build fingerprint is included only for an
+/// admin-authenticated request (SEC-129).
+pub async fn handler(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     let postgres = postgres_reachable(&state.pool).await;
     let now = std::time::SystemTime::now();
     let uptime_seconds = now
         .duration_since(state.runtime.started_at)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let build_secs: u64 = BUILD_TIMESTAMP_SECS.parse().unwrap_or(0);
+
+    // SEC-129: include the build fingerprint only when admin-authed.
+    let fingerprint = crate::admin_fingerprint(&state, &headers).await;
+    let (version, git_commit, build_timestamp) = match fingerprint {
+        Some((v, c)) => (
+            Some(v),
+            Some(c),
+            Some(fmt_secs(BUILD_TIMESTAMP_SECS.parse().unwrap_or(0))),
+        ),
+        None => (None, None, None),
+    };
 
     let report = HealthReport {
         status: if postgres { "ok" } else { "degraded" },
-        version: env!("CARGO_PKG_VERSION"),
-        git_commit: GIT_COMMIT,
-        build_timestamp: fmt_secs(build_secs),
+        version,
+        git_commit,
+        build_timestamp,
         started_at: DateTime::<Utc>::from(state.runtime.started_at).to_rfc3339(),
         uptime_seconds,
         postgres,

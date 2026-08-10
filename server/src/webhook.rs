@@ -648,11 +648,16 @@ pub async fn create_webhook(
     })
 }
 
-/// Deletes webhook `id` (cascading its deliveries via the FK). Returns true if
-/// a row was removed. Called by `DELETE /admin/db/{db}/webhooks/{id}`.
-pub async fn delete_webhook(pool: &PgPool, id: i64) -> Result<bool, RtDbError> {
-    let res = sqlx::query("DELETE FROM rtdb.webhooks WHERE id = $1")
+/// Deletes webhook `id` scoped to `db` (cascading its deliveries via the FK).
+/// Returns true if a row was removed. The `db` scope is defense-in-depth — all
+/// callers are server-wide admins today — matching `edit_webhook`'s `id AND db`
+/// pattern so a future less-privileged caller can't delete another database's
+/// webhook by guessing its numeric id (SEC-134). Called by
+/// `DELETE /admin/db/{db}/webhooks/{id}`.
+pub async fn delete_webhook(pool: &PgPool, id: i64, db: &str) -> Result<bool, RtDbError> {
+    let res = sqlx::query("DELETE FROM rtdb.webhooks WHERE id = $1 AND db = $2")
         .bind(id)
+        .bind(db)
         .execute(pool)
         .await?;
     Ok(res.rows_affected() > 0)
@@ -809,25 +814,32 @@ pub async fn backfill_webhook_secrets(pool: &PgPool) -> Result<(), RtDbError> {
     Ok(())
 }
 
-/// Reads delivery rows for `webhook_id` newest-first (by `next_attempt DESC`
-/// then `id DESC` as a stable tie-breaker). `status` filters when `Some`;
-/// `limit`/`offset` page. Called by `GET /admin/db/{db}/webhooks/{id}/deliveries`.
+/// Reads delivery rows for `webhook_id` (which must belong to `db`) newest-first
+/// (by `next_attempt DESC` then `id DESC` as a stable tie-breaker). `status`
+/// filters when `Some`; `limit`/`offset` page. The `db` scope joins to
+/// `rtdb.webhooks` (the deliveries table has no `db` column of its own) so a
+/// delivery listing can't be reached by guessing another database's webhook id
+/// (SEC-134) — the same `id AND db` guarantee `edit_webhook` provides. Called by
+/// `GET /admin/db/{db}/webhooks/{id}/deliveries`.
 pub async fn fetch_deliveries(
     pool: &PgPool,
     webhook_id: i64,
+    db: &str,
     status: Option<&str>,
     limit: i64,
     offset: i64,
 ) -> Result<Vec<DeliveryRow>, RtDbError> {
     type Row = (i64, i32, String, i64, Option<String>, serde_json::Value);
     let rows: Vec<Row> = sqlx::query_as(
-        "SELECT id, attempts, status, next_attempt, last_error, payload \
-         FROM rtdb.webhook_deliveries \
-         WHERE webhook_id = $1 AND ($2::text IS NULL OR status = $2) \
-         ORDER BY next_attempt DESC, id DESC \
-         LIMIT $3 OFFSET $4",
+        "SELECT d.id, d.attempts, d.status, d.next_attempt, d.last_error, d.payload \
+         FROM rtdb.webhook_deliveries d \
+         JOIN rtdb.webhooks w ON w.id = d.webhook_id \
+         WHERE d.webhook_id = $1 AND w.db = $2 AND ($3::text IS NULL OR d.status = $3) \
+         ORDER BY d.next_attempt DESC, d.id DESC \
+         LIMIT $4 OFFSET $5",
     )
     .bind(webhook_id)
+    .bind(db)
     .bind(status)
     .bind(limit)
     .bind(offset)

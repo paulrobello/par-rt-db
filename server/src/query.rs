@@ -759,16 +759,12 @@ pub async fn execute_query(
     let owner_field = table_def.owner_field.as_deref();
     let collaborators_field = table_def.collaborators_field.as_deref();
 
-    // Principal markers (`{"$user":true}` / `{"$email":true}`) are valid only in
-    // a server-declared `authorize` predicate; a client-supplied `.filter()` is
-    // schema-validated at push time but a marker could still arrive over the
-    // wire, so reject it here at the query boundary (WS `Subscribe` + HTTP
-    // `/api/query`) before compilation. Field references are re-validated too;
-    // any failure surfaces as `BadRequest` (a malformed client query).
-    if let Some(filter) = &q.filter {
-        validate_filter_expr_fields(filter, table_def, false)
-            .map_err(|e| RtDbError::bad_request(e.message))?;
-    }
+    // Principal markers (`{"$user":true}` / `{"$email":true}`) and malformed
+    // field references are rejected inside `compile_filter` (SEC-125) — that
+    // validation now runs at the single compilation chokepoint, so q.filter,
+    // search.filter, vectorSearch.filter, and the by-query filters all get the
+    // Contains-array + orderable-field + principal-marker guards. The failure
+    // surfaces as `BadRequest` (a malformed client query).
 
     if let Some(id) = &q.get {
         reject_if_any_set(q, GET_PEERS, GET_MESSAGE)?;
@@ -1811,6 +1807,15 @@ fn compile_filter(
     table: &TableDef,
     start_pos: usize,
 ) -> Result<(String, Vec<EqBind>), RtDbError> {
+    // SEC-125: validate at the single compilation chokepoint so EVERY client
+    // filter entry point (q.filter, compile_scan_where's client filter,
+    // search.filter, vectorSearch.filter) gets the Contains-array and
+    // orderable-field guards. `allow_principal_markers = false` is correct for
+    // all of these — the authorize predicate is the only path that permits
+    // principal markers, and it bypasses `compile_filter` (compiling via
+    // `compile_filter_node` directly after `resolve_predicate_markers`).
+    validate_filter_expr_fields(filter, table, false)
+        .map_err(|e| RtDbError::bad_request(e.message))?;
     let mut binds: Vec<EqBind> = Vec::new();
     let sql = compile_filter_node(filter, table, start_pos, &mut binds)?;
     Ok((sql, binds))
@@ -2186,7 +2191,51 @@ fn field_lhs_and_bind(
             eq_bind_for(field_type, value)?,
         ))
     } else {
+        // SEC-126: reject a value whose JSON kind is incompatible with the
+        // field's declared type. Without this, `Gt{field:"title", value:5}`
+        // on a String field would compile to `(doc->>'title')::float8`, which
+        // Postgres evaluates per row and errors on the first non-numeric
+        // stored value — for a subscription re-running on every write, that
+        // is a fan_out re-run that fails forever and silently never pushes.
+        validate_jsonb_comparison_value(field, field_type, value)?;
         jsonb_lhs_and_bind(field, value)
+    }
+}
+
+/// Returns `Ok(())` when `value`'s JSON kind can be ordered against a field of
+/// declared type `ty`, else `Err(BadRequest)`. The `Optional` wrapper is
+/// unwrapped. The indexed path (`eq_bind_for`) already enforces this; this
+/// guards the jsonb path, which would otherwise cast on the value's kind and
+/// fail at execution time. Complex/unknown field types (Any, Union, Object,
+/// …) accept any scalar so existing callers are not widened.
+fn validate_jsonb_comparison_value(
+    field: &str,
+    ty: &FieldType,
+    value: &serde_json::Value,
+) -> Result<(), RtDbError> {
+    let inner = match ty {
+        FieldType::Optional { inner } => inner.as_ref(),
+        _ => ty,
+    };
+    let ok = match inner {
+        FieldType::String | FieldType::Id { .. } | FieldType::Bytes => value.is_string(),
+        FieldType::Number | FieldType::Int64 => value.is_number(),
+        FieldType::Boolean => value.is_boolean(),
+        // Any / Literal / Union / Array / Object / Record / Vector / Null:
+        // no reliable static check; accept any scalar (existing behavior).
+        _ => matches!(
+            value,
+            serde_json::Value::String(_)
+                | serde_json::Value::Number(_)
+                | serde_json::Value::Bool(_)
+        ),
+    };
+    if ok {
+        Ok(())
+    } else {
+        Err(RtDbError::bad_request(format!(
+            "filter on field '{field}' value kind does not match declared field type"
+        )))
     }
 }
 
@@ -3009,7 +3058,25 @@ mod tests {
 
     #[test]
     fn compile_not_contains_exists() {
-        let table = test_table_with_fields(&["owner", "editors", "archivedat"]);
+        // `editors` is an array-of-strings so `Contains` is a valid
+        // predicate (SEC-125's validate_filter_expr_fields enforces this).
+        let mut fields_map = BTreeMap::new();
+        fields_map.insert("owner".to_string(), FieldType::String);
+        fields_map.insert(
+            "editors".to_string(),
+            FieldType::Array {
+                element: Box::new(FieldType::String),
+            },
+        );
+        fields_map.insert("archivedat".to_string(), FieldType::String);
+        let table = TableDef {
+            fields: fields_map,
+            indexes: vec![],
+            owner_field: None,
+            collaborators_field: None,
+            ttl: None,
+            authorize: None,
+        };
         // Not
         let (sql, binds) = compile_filter(
             &FilterExpr::Not {
@@ -3356,5 +3423,35 @@ mod tests {
             },
             &ctx,
         ));
+    }
+
+    /// SEC-126: a comparison whose value kind does not match the declared field
+    /// type MUST be rejected at compile time, rather than compiling to a
+    /// per-row cast (`(doc->>'title')::float8`) that errors on the first
+    /// non-conforming stored value. For a subscription re-running on every
+    /// write, that silent failure mode never pushes — the dangerous case
+    /// CLAUDE.md calls out. This pins the compile-time gate.
+    #[test]
+    fn compile_filter_rejects_type_mismatched_comparison() {
+        let table = test_table_with_fields(&["title"]);
+        // Number value against a String field — would compile to
+        // `(doc->>'title')::float8` without the SEC-126 check.
+        let pred = FilterExpr::Gt {
+            field: "title".into(),
+            value: json!(5),
+        };
+        let err = compile_filter(&pred, &table, 1).unwrap_err();
+        assert!(
+            err.message.contains("value kind does not match"),
+            "expected type-mismatch message, got: {}",
+            err.message
+        );
+
+        // Sanity: same field with a matching String value still compiles.
+        let ok = FilterExpr::Gt {
+            field: "title".into(),
+            value: json!("a"),
+        };
+        assert!(compile_filter(&ok, &table, 1).is_ok());
     }
 }

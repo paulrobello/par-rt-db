@@ -99,14 +99,37 @@ async fn healthz_returns_diagnostics() -> anyhow::Result<()> {
     let body: serde_json::Value = serde_json::from_str(&text)?;
     assert_eq!(body["status"], "ok");
     assert_eq!(body["postgres"], true);
-    assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
-    assert!(body["git_commit"].is_string());
-    assert!(body["build_timestamp"].is_string());
+    // SEC-129: the build fingerprint (version/git_commit/build_timestamp) is
+    // gated behind admin auth; an unauthenticated request must not leak it.
+    assert!(
+        body["version"].is_null(),
+        "version leaked unauthenticated: {text}"
+    );
+    assert!(
+        body["git_commit"].is_null(),
+        "git_commit leaked unauthenticated: {text}"
+    );
+    assert!(
+        body["build_timestamp"].is_null(),
+        "build_timestamp leaked unauthenticated: {text}"
+    );
     assert!(body["started_at"].is_string());
     assert!(
         body["uptime_seconds"].as_u64().unwrap() < 120,
         "uptime should be near zero for a freshly spawned server"
     );
+
+    // An admin-authed request DOES surface the fingerprint (SEC-129).
+    let admin_resp = reqwest::Client::new()
+        .get(format!("http://{addr}/healthz"))
+        .header("Authorization", "Bearer canary-secret-admin-key")
+        .send()
+        .await?;
+    assert_eq!(admin_resp.status(), 200);
+    let admin_body: serde_json::Value = serde_json::from_str(&admin_resp.text().await?)?;
+    assert_eq!(admin_body["version"], env!("CARGO_PKG_VERSION"));
+    assert!(admin_body["git_commit"].is_string());
+    assert!(admin_body["build_timestamp"].is_string());
     Ok(())
 }
 

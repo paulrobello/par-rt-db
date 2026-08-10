@@ -6,6 +6,7 @@
 //! `PGUSER`/`PGPASSWORD`/`PGHOST`/`PGPORT`/`PGDATABASE` env vars on the child
 //! process; the URL never appears in argv (it would leak credentials in `ps`).
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Stdio;
 
@@ -183,9 +184,10 @@ pub(crate) fn restore_target_name(name: &str) -> String {
 /// Builds the dump filename `<dir>/rtdb-<UTC stamp>.dump` for the given
 /// timestamp, creating `dir` if needed.
 async fn backup_path(dir: &str, ms: i64) -> Result<PathBuf, RtDbError> {
-    tokio::fs::create_dir_all(dir)
-        .await
-        .map_err(|e| RtDbError::internal(format!("failed to create backup dir: {e}")))?;
+    tokio::fs::create_dir_all(dir).await.map_err(|e| {
+        tracing::error!(error = %e, "failed to create backup dir");
+        RtDbError::internal("failed to create backup dir; see server logs")
+    })?;
     let mut path = PathBuf::from(dir);
     path.push(format!("rtdb-{}.dump", format_timestamp_utc(ms)));
     Ok(path)
@@ -223,10 +225,10 @@ pub(crate) async fn perform_backup(database_url: &str, dir: &str) -> Result<Path
     cmd.stdout(Stdio::null());
     cmd.stderr(Stdio::piped());
 
-    let output = cmd
-        .output()
-        .await
-        .map_err(|e| RtDbError::internal(format!("failed to spawn pg_dump: {e}")))?;
+    let output = cmd.output().await.map_err(|e| {
+        tracing::error!(error = %e, "failed to spawn pg_dump");
+        RtDbError::internal("failed to spawn pg_dump; see server logs")
+    })?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         tracing::error!(
@@ -239,6 +241,16 @@ pub(crate) async fn perform_backup(database_url: &str, dir: &str) -> Result<Path
         // legitimate.
         let _ = tokio::fs::remove_file(&path).await;
         return Err(RtDbError::internal("pg_dump failed; see server logs"));
+    }
+    // SEC-133: the dump is a full logical copy of every tenant database,
+    // including rtdb_auth (password hashes, OAuth subjects, session rows).
+    // Harden it to 0o600 immediately after pg_dump writes it so a permissive
+    // umask (the default 0o022 yields 0o644) doesn't leave it world-readable.
+    // Best-effort: a failure to chmod is logged, not fatal — the dump exists
+    // and is valid; re-raising would discard a good backup over a perms quirk.
+    if let Err(e) = tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).await
+    {
+        tracing::warn!(path = %path.display(), error = %e, "failed to chmod dump to 0o600");
     }
     tracing::info!(path = %path.display(), "backup completed");
     Ok(path)
@@ -277,10 +289,10 @@ async fn drop_restore_target(pg: &PgEnv, target: &str) -> Result<(), RtDbError> 
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
-    let out = cmd
-        .output()
-        .await
-        .map_err(|e| RtDbError::internal(format!("failed to spawn dropdb: {e}")))?;
+    let out = cmd.output().await.map_err(|e| {
+        tracing::error!(error = %e, "failed to spawn dropdb");
+        RtDbError::internal("failed to spawn dropdb; see server logs")
+    })?;
     if !out.status.success() {
         tracing::warn!(
             stderr = %String::from_utf8_lossy(&out.stderr),
@@ -320,10 +332,10 @@ pub(crate) async fn restore_to_new_db(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
-    let out = createdb
-        .output()
-        .await
-        .map_err(|e| RtDbError::internal(format!("failed to spawn createdb: {e}")))?;
+    let out = createdb.output().await.map_err(|e| {
+        tracing::error!(error = %e, "failed to spawn createdb");
+        RtDbError::internal("failed to spawn createdb; see server logs")
+    })?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         tracing::error!(stderr = %stderr, target = %target, "createdb failed");
@@ -353,10 +365,10 @@ pub(crate) async fn restore_to_new_db(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
-    let out = restore
-        .output()
-        .await
-        .map_err(|e| RtDbError::internal(format!("failed to spawn pg_restore: {e}")))?;
+    let out = restore.output().await.map_err(|e| {
+        tracing::error!(error = %e, "failed to spawn pg_restore");
+        RtDbError::internal("failed to spawn pg_restore; see server logs")
+    })?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         tracing::error!(stderr = %stderr, target = %target, "pg_restore failed");
@@ -377,16 +389,16 @@ async fn prune_old(dir: &str, retention: u32) -> Result<(), RtDbError> {
         Ok(r) => r,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => {
-            return Err(RtDbError::internal(format!(
-                "failed to read backup dir: {e}"
-            )));
+            tracing::error!(error = %e, "failed to read backup dir");
+            return Err(RtDbError::internal(
+                "failed to read backup dir; see server logs",
+            ));
         }
     };
-    while let Some(entry) = reader
-        .next_entry()
-        .await
-        .map_err(|e| RtDbError::internal(format!("failed to read dir entry: {e}")))?
-    {
+    while let Some(entry) = reader.next_entry().await.map_err(|e| {
+        tracing::error!(error = %e, "failed to read dir entry");
+        RtDbError::internal("failed to read dir entry; see server logs")
+    })? {
         let name = entry.file_name().to_string_lossy().into_owned();
         if name.starts_with("rtdb-") && name.ends_with(".dump") {
             names.push(name);
@@ -417,16 +429,16 @@ pub(crate) async fn list_backups(dir: &str) -> Result<Vec<BackupFile>, RtDbError
         Ok(r) => r,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
         Err(e) => {
-            return Err(RtDbError::internal(format!(
-                "failed to read backup dir: {e}"
-            )));
+            tracing::error!(error = %e, "failed to read backup dir");
+            return Err(RtDbError::internal(
+                "failed to read backup dir; see server logs",
+            ));
         }
     };
-    while let Some(entry) = reader
-        .next_entry()
-        .await
-        .map_err(|e| RtDbError::internal(format!("failed to read dir entry: {e}")))?
-    {
+    while let Some(entry) = reader.next_entry().await.map_err(|e| {
+        tracing::error!(error = %e, "failed to read dir entry");
+        RtDbError::internal("failed to read dir entry; see server logs")
+    })? {
         let name = entry.file_name().to_string_lossy().into_owned();
         if !(name.starts_with("rtdb-") && name.ends_with(".dump")) {
             continue;
@@ -713,6 +725,20 @@ mod tests {
                 .map(|m| m.len() > 0)
                 .unwrap_or(false),
             "dump file should be non-empty"
+        );
+        // SEC-133: dump is a full copy of every tenant DB incl. rtdb_auth, so
+        // it must be hardened to 0o600 right after pg_dump writes it. `mode &
+        // 0o777` drops the file-type bits, leaving the permission bits.
+        let mode = tokio::fs::metadata(&path)
+            .await
+            .expect("metadata for mode")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "dump should be 0o600 (SEC-133), got {:o}",
+            mode & 0o777
         );
     }
 

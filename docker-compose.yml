@@ -23,6 +23,16 @@ services:
       interval: 5s
       timeout: 3s
       retries: 20
+    # SEC-136: the official postgres image already runs the daemon as the
+    # non-root `postgres` user (it enters as root only to chown the data dir,
+    # then gosu-drops). no-new-privileges is safe for that drop-privilege flow.
+    # cap_drop/read_only are deliberately NOT applied here — the first-boot
+    # entrypoint needs CAP_CHOWN/CAP_DAC_OVERRIDE to `chown -R postgres $PGDATA`
+    # and is not exercised in the build-time verification, so applying them
+    # blind risks breaking initdb on a fresh volume. The audit's RCE surface is
+    # the server's image-decode path, hardened on the `server` service below.
+    security_opt:
+      - no-new-privileges:true
 
   server:
     build:
@@ -164,6 +174,26 @@ services:
       RTDB_BACKUP_DIR: ${RTDB_BACKUP_DIR:-./backups}
       RTDB_BACKUP_RETENTION: ${RTDB_BACKUP_RETENTION:-7}
       RUST_LOG: ${RUST_LOG:-info}
+    # SEC-136: container hardening for the RCE surface (the image-decode path).
+    # read_only rootfs — the server's only runtime disk writes are temp files
+    # (/tmp) and the backup dump dir; both are writable tmpfs below. Everything
+    # else (moka cache, blobs, audit, webhooks) lives in Postgres or in memory.
+    # cap_drop ALL + no-new-privileges: the server binds 8300 (>1024, no cap
+    # needed) and never escalates; the non-root USER is set in the Dockerfile.
+    read_only: true
+    tmpfs:
+      # tokio/TLS temp files + pg_dump scratch space under a read-only rootfs.
+      - /tmp:rw,noexec,nosuid,nodev
+      # Default backup dir: RTDB_BACKUP_DIR defaults to ./backups, which at the
+      # container's CWD (/) resolves to /backups. tmpfs is RAM-backed: operators
+      # enabling RTDB_BACKUP_ENABLED for *retained* dumps must replace this tmpfs
+      # with a named/bind volume at their backup path (the persistence gap is
+      # pre-existing — the container writable layer was never retained either).
+      - /backups:rw,noexec,nosuid,nodev
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     ports:
       - "127.0.0.1:8300:8300"
 

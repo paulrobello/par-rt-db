@@ -1,0 +1,23 @@
+# cargo-audit configuration (https://rustsec.org/advisory-db/).
+#
+# SEC-003R: RUSTSEC-2023-0071 (rsa Marvin/timing sidechannel) is intentionally
+# ignored here after a reachability analysis proved the vulnerable code path is
+# never invoked. Drop this ignore only if (a) a fixed `rsa` is released AND
+# available in our tree, or (b) a new code path introduces an actual RSA use —
+# at which point re-run `cargo audit` and treat the finding as live.
+#
+# Reachability analysis (verified 2026-08-10 against this tree):
+#   * `cargo tree -i rsa` -> arrives via jsonwebtoken 10.4.0 only.
+#   * The advisory is a timing sidechannel on RSA *private-key* operations.
+#   * The ONLY jsonwebtoken use in this crate is ES256 *signing* via
+#     `EncodingKey::from_ec_pem` (auth/apple.rs), which routes to `ring` for the
+#     actual EC crypto — no RSA operation of any kind runs.
+#   * Zero references to `DecodingKey`, `jsonwebtoken::decode`, or `RS256`.
+#   * Both Apple id_token verification paths bypass jsonwebtoken entirely by
+#     hand-splitting the JWT on '.' and verifying iss/aud/exp directly.
+# Conclusion: the vulnerable rsa code is dead-transitively-imported but never
+# executed. Reassess if jsonwebtoken is upgraded to a version that changes the
+# signing path, or if a decode/verify path is introduced.
+
+[advisories]
+ignore = ["RUSTSEC-2023-0071"]

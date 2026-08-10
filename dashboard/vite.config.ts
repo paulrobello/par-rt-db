@@ -26,6 +26,9 @@ export default defineConfig({
   },
   build: {
     outDir: "dist",
-    sourcemap: true,
+    // SEC-137: never ship source maps — the dashboard SPA is served from a
+    // private repo via ServeDir, and a public /assets/*.js.map would recover
+    // the full TypeScript source of the operator console.
+    sourcemap: false,
   },
 });

@@ -93,7 +93,7 @@ pub struct Committers {
     metrics: Arc<Metrics>,
     quotas: Arc<crate::quota::UsageCache>,
     quota_cache_ttl_secs: u64,
-    channels: Mutex<HashMap<String, mpsc::Sender<CommitterRequest>>>,
+    channels: Arc<Mutex<HashMap<String, mpsc::Sender<CommitterRequest>>>>,
 }
 
 impl Committers {
@@ -125,7 +125,7 @@ impl Committers {
             metrics,
             quotas,
             quota_cache_ttl_secs,
-            channels: Mutex::new(HashMap::new()),
+            channels: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -220,7 +220,27 @@ impl Committers {
         }
 
         let (tx, rx) = mpsc::channel(CHANNEL_BUFFER);
-        tokio::spawn(run_committer(self.make_ctx(db.to_string()), rx));
+        let committer_handle = tokio::spawn(run_committer(self.make_ctx(db.to_string()), rx));
+        // SEC-127: supervisor — evicts the cached Sender when the committer
+        // task exits (panic or normal completion), so a dead entry is cleared
+        // immediately rather than lingering until `submit`'s send-failure path
+        // catches up on the next request. The `same_channel` guard avoids
+        // clobbering a concurrent respawn under the same db key.
+        {
+            let db_owned = db.to_string();
+            let channels = Arc::clone(&self.channels);
+            let supervised = tx.clone();
+            tokio::spawn(async move {
+                let _ = committer_handle.await;
+                let mut guard = channels.lock().await;
+                if guard
+                    .get(&db_owned)
+                    .is_some_and(|current| current.same_channel(&supervised))
+                {
+                    guard.remove(&db_owned);
+                }
+            });
+        }
         tokio::spawn(scheduler::run_scheduler(
             self.pool.clone(),
             db.to_string(),

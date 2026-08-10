@@ -48,11 +48,19 @@ RUN cd dashboard && bun run build
 FROM debian:bookworm-slim
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates postgresql-client \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    # SEC-136: run the server as a non-root, non-login, no-home system user.
+    # Port 8300 > 1024 so no CAP_NET_BIND_SERVICE is needed; the binary and the
+    # SPA dir are world-readable/executable; runtime writes go to /tmp and the
+    # backup dir, both provided as tmpfs in docker-compose (read_only rootfs).
+    && groupadd --system --gid 10001 rtdb \
+    && useradd --system --uid 10001 --gid rtdb --home-dir /app --no-create-home --shell /usr/sbin/nologin rtdb
 COPY --from=builder /build/server/target/release/rtdb-server /usr/local/bin/rtdb-server
 COPY --from=dashboard /build/dashboard/dist /app/dashboard-dist
+RUN chown -R rtdb:rtdb /app
 ENV RTDB_PORT=8300
 # Serve the bundled SPA same-origin. Override (e.g. to "") to make it API-only.
 ENV RTDB_STATIC_DIR=/app/dashboard-dist
 EXPOSE 8300
+USER rtdb
 ENTRYPOINT ["/usr/local/bin/rtdb-server"]

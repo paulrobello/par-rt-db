@@ -346,6 +346,15 @@ impl Config {
             Ok(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "false" | "0" | "no"),
             Err(_) => true,
         };
+        // SEC-131: surface the kill switch at boot so it does not silently
+        // survive into a copied `.env`. Local-dev only — production must keep
+        // the double-submit nonce enabled.
+        if !oauth_login_csrf {
+            tracing::warn!(
+                "RTDB_OAUTH_LOGIN_CSRF is disabled — OAuth login-CSRF (double-submit nonce) is OFF. \
+                 This is a local-dev break-glass; do NOT run production with this setting."
+            );
+        }
 
         // Webhook registry: default off, same truthy-spelling parse as audit.
         let webhooks_enabled = match std::env::var("RTDB_WEBHOOKS_ENABLED") {
@@ -888,19 +897,27 @@ pub async fn load_hot(
         sqlx::query_as("SELECT hot FROM rtdb_config WHERE id = 1")
             .fetch_optional(pool)
             .await
-            .map_err(|e| RtDbError::internal(format!("load rtdb_config: {e}")))?;
+            .map_err(|e| {
+                tracing::error!(error = %e, "load rtdb_config");
+                RtDbError::internal("failed to load rtdb_config; see server logs")
+            })?;
     match row {
         Some((v,)) => serde_json::from_value::<PersistedHotConfig>(v)
             .map(|persisted| Some(persisted.merge_onto(defaults.clone())))
-            .map_err(|e| RtDbError::internal(format!("decode rtdb_config: {e}"))),
+            .map_err(|e| {
+                tracing::error!(error = %e, "decode rtdb_config");
+                RtDbError::internal("failed to decode rtdb_config; see server logs")
+            }),
         None => Ok(None),
     }
 }
 
 /// Upserts the single hot row.
 pub async fn save_hot(pool: &sqlx::PgPool, hot: &HotConfig) -> Result<(), RtDbError> {
-    let v = serde_json::to_value(hot)
-        .map_err(|e| RtDbError::internal(format!("encode rtdb_config: {e}")))?;
+    let v = serde_json::to_value(hot).map_err(|e| {
+        tracing::error!(error = %e, "encode rtdb_config");
+        RtDbError::internal("failed to encode rtdb_config; see server logs")
+    })?;
     sqlx::query(
         "INSERT INTO rtdb_config (id, hot) VALUES (1, $1) \
          ON CONFLICT (id) DO UPDATE SET hot = EXCLUDED.hot",
@@ -908,7 +925,10 @@ pub async fn save_hot(pool: &sqlx::PgPool, hot: &HotConfig) -> Result<(), RtDbEr
     .bind(v)
     .execute(pool)
     .await
-    .map_err(|e| RtDbError::internal(format!("save rtdb_config: {e}")))?;
+    .map_err(|e| {
+        tracing::error!(error = %e, "save rtdb_config");
+        RtDbError::internal("failed to save rtdb_config; see server logs")
+    })?;
     Ok(())
 }
 

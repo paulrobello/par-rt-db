@@ -44,7 +44,18 @@ pub enum LoginOutcome {
 pub struct OAuthStateEntry {
     pub expires_at: i64,
     pub outcome: LoginOutcome,
+    /// SEC-132: the provider slug that minted this state (`P::name()` at
+    /// `/begin`). The callback rejects a state minted by a different provider
+    /// so a token from `/auth/github/begin` cannot be claimed at
+    /// `/auth/google/callback`'s exchange. Bound: `/begin` rejects when the
+    /// pending-states map exceeds `MAX_PENDING_STATES`.
+    pub provider: &'static str,
 }
+
+/// Cap on concurrently-pending OAuth state entries. `/begin` mints one per
+/// login attempt and entries self-expire after `STATE_TTL_MS`; this bound is a
+/// defense-in-depth against an attacker spamming `/begin` to grow the map.
+const MAX_PENDING_STATES: usize = 10_000;
 
 /// A pluggable OAuth provider. Each implementation owns its authorize URL,
 /// its callback path, and the full code-for-session exchange (`complete_login`)
@@ -107,14 +118,23 @@ fn unconfigured_response(name: &str) -> Response {
         .into_response()
 }
 
-/// `Pending → Claiming` for the first caller; `false` for a replay or an
-/// already-terminal/expired entry. This is the single-use claim that makes a
-/// replayed callback reject.
-async fn claim_pending(state: &Arc<AppState>, state_token: &str) -> bool {
+/// `Pending → Claiming` for the first caller; `false` for a replay, an
+/// already-terminal/expired entry, or a cross-provider claim (SEC-132: the
+/// state's minting provider must match the callback's provider). This is the
+/// single-use claim that makes a replayed or cross-provider callback reject.
+async fn claim_pending(
+    state: &Arc<AppState>,
+    state_token: &str,
+    expected_provider: &'static str,
+) -> bool {
     let mut states = state.auth.oauth_states.lock().await;
     let now = now_ms();
     match states.get_mut(state_token) {
-        Some(entry) if entry.expires_at > now && matches!(entry.outcome, LoginOutcome::Pending) => {
+        Some(entry)
+            if entry.expires_at > now
+                && matches!(entry.outcome, LoginOutcome::Pending)
+                && entry.provider == expected_provider =>
+        {
             entry.outcome = LoginOutcome::Claiming;
             true
         }
@@ -187,8 +207,13 @@ struct BeginResponse {
 /// against the live allowlist, mints a single-use state token, and returns the
 /// provider authorize URL + the state. The parent opens the authorize URL in a
 /// `noopener` popup and polls `/auth/state`. SEC-012 replaces the prior
-/// `window.opener` postMessage relay — `origin` is validated here and discarded
-/// (never interpolated anywhere), retiring the SEC-005 self-XSS surface.
+/// `window.opener` postMessage relay.
+///
+/// `origin` is a caller-supplied query parameter, NOT the browser-verified
+/// `Origin` header — so it only proves the caller knows an allowlisted value,
+/// not who they are. It is used solely to pick the post-login redirect target
+/// and is discarded (never interpolated), which retired the SEC-005 self-XSS
+/// surface; it is not an authentication of the caller.
 async fn provider_begin<P: OAuthProvider>(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -214,11 +239,18 @@ async fn provider_begin<P: OAuthProvider>(
     {
         let mut states = state.auth.oauth_states.lock().await;
         states.retain(|_, entry| entry.expires_at > now);
+        // SEC-132: bound the pending-states map so an attacker spamming
+        // `/begin` cannot grow it unbounded. Expired entries were just pruned;
+        // if live entries still exceed the cap, reject the new mint.
+        if states.len() >= MAX_PENDING_STATES {
+            return RtDbError::internal("too many pending login states; retry").into_response();
+        }
         states.insert(
             state_token.clone(),
             OAuthStateEntry {
                 expires_at: now + STATE_TTL_MS,
                 outcome: LoginOutcome::Pending,
+                provider: P::name(),
             },
         );
     }
@@ -280,7 +312,7 @@ async fn provider_callback<P: OAuthProvider>(
         }
     }
 
-    if !claim_pending(&state, &params.state).await {
+    if !claim_pending(&state, &params.state, P::name()).await {
         return RtDbError::bad_request("invalid or expired state").into_response();
     }
 
@@ -328,7 +360,7 @@ async fn apple_callback(
         }
     }
 
-    if !claim_pending(&state, &form.state).await {
+    if !claim_pending(&state, &form.state, AppleProvider::name()).await {
         return RtDbError::bad_request("invalid or expired state").into_response();
     }
 

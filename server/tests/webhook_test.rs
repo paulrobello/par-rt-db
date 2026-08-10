@@ -340,8 +340,11 @@ async fn webhook_delivery_end_to_end_posts_payload() -> anyhow::Result<()> {
     // ours to a later pass — the receiver then sees zero POSTs even though
     // `drain_once` returned a nonzero count. Loop (bounded by a deadline) until
     // our row reaches `delivered`; the receiver-side and body assertions below
-    // remain the precise per-webhook checks.
-    let deadline = Instant::now() + Duration::from_secs(10);
+    // remain the precise per-webhook checks. The deadline is generous because
+    // under full-suite parallel test load the shared delivery worker + Postgres
+    // contend, and this test cares about CORRECTNESS (exactly one matching POST),
+    // not speed.
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         rtdb_server::webhook::drain_once(&pool)
             .await
@@ -772,6 +775,70 @@ async fn webhook_deliveries_filter_sort_and_paginate() -> anyhow::Result<()> {
     )
     .await;
     assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    Ok(())
+}
+
+// SEC-134: delete_webhook and fetch_deliveries must scope on (id, db) the same
+// way edit_webhook does, so a caller can't act on another database's webhook by
+// guessing its numeric id. Both functions are exercised through their admin
+// routes: a cross-db DELETE reports ok:false and leaves the row intact, and a
+// cross-db deliveries listing sees nothing.
+#[tokio::test]
+async fn webhook_delete_and_deliveries_are_scoped_per_db() -> anyhow::Result<()> {
+    let state = test_state_with_webhooks().await;
+    let addr = spawn_app(state.clone()).await;
+    let name = fresh_db(&state).await;
+    let other = fresh_db(&state).await;
+
+    let id = create_webhook(
+        addr,
+        &name,
+        json!({"url": "http://example.com/hook", "events": ["*"]}),
+    )
+    .await;
+
+    // Seed one delivery so a cross-db listing that *ignored* the db scope would
+    // return it (and fail this test).
+    sqlx::query(
+        "INSERT INTO rtdb.webhook_deliveries \
+         (webhook_id, payload, attempts, next_attempt, status) \
+         VALUES ($1, $2, 0, $3, 'pending')",
+    )
+    .bind(id)
+    .bind(serde_json::json!({"db": name, "docId": "x", "kind": "insert"}))
+    .bind(1_700_000_000_000_i64)
+    .execute(&state.pool)
+    .await
+    .expect("seed delivery");
+
+    // Cross-db deliveries listing: the webhook belongs to `name`, so `other`
+    // sees none (the JOIN on w.db = $2 excludes it).
+    let body: Value = admin_get(addr, &format!("/admin/db/{other}/webhooks/{id}/deliveries"))
+        .await
+        .json()
+        .await
+        .expect("parse cross-db deliveries");
+    assert!(
+        body["deliveries"].as_array().unwrap().is_empty(),
+        "cross-db deliveries must be scoped out (SEC-134)"
+    );
+
+    // Cross-db delete: ok:false because the (id, other) pair matches no row.
+    let body: Value = admin_delete(addr, &format!("/admin/db/{other}/webhooks/{id}"))
+        .await
+        .json()
+        .await
+        .expect("parse cross-db delete");
+    assert_eq!(body["ok"], false, "cross-db delete must not remove the row");
+
+    // The webhook survives: deleting it from its own db succeeds.
+    let body: Value = admin_delete(addr, &format!("/admin/db/{name}/webhooks/{id}"))
+        .await
+        .json()
+        .await
+        .expect("parse same-db delete");
+    assert_eq!(body["ok"], true, "same-db delete removes the row");
 
     Ok(())
 }

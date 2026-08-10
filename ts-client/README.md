@@ -69,6 +69,25 @@ function Board({ projectId }: { projectId: string }) {
 }
 ```
 
+### Authentication & token storage
+
+The server's recommended auth mode is **cookie mode**: after OAuth sign-in the
+server sets an HttpOnly `rtdb_session` cookie that the browser attaches
+automatically, and `useRtDbAuth()` / `RtDbProvider` send `credentials: "include"`
+on auth requests. JS can never read the cookie, so an XSS or malicious
+extension cannot lift the session token — this is the default and the safest
+option for browser apps.
+
+The `getToken` option shown above (reading a token out of `localStorage`) is an
+**opt-in alternative** for non-browser clients or advanced setups where you
+mint and persist a machine/session token yourself. It is a tradeoff: a token in
+`localStorage` is readable by any JS running in your origin, so it is
+ XSS-exfiltrable. Do not use `getToken` + `localStorage` in a browser app
+unless you have a specific reason and have audited your CSP / dependency
+surface; prefer cookie mode. Machine tokens minted via the admin API are the
+right choice for server-to-server (`Node / CLI`) callers, where `localStorage`
+does not apply.
+
 ## Node / CLI
 
 ```ts
