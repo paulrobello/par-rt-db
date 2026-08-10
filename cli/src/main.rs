@@ -6,10 +6,10 @@
 //! curl. The server URL and credentials may be supplied via flags or the
 //! `RTDB_URL` / `RTDB_DB` / `RTDB_TOKEN` / `RTDB_ADMIN_KEY` env vars.
 //!
-//! Admin subcommands (`list-dbs`, `create-db`, `push-schema`, `mint-token`,
-//! `revoke-token`, `sessions list|revoke`) send the instance admin key as the
-//! bearer. Data-plane subcommands (`query`, `mutate`) send a machine token
-//! scoped to `--db`.
+//! Admin subcommands (`list-dbs`, `create-db`, `clone-db`, `push-schema`,
+//! `mint-token`, `revoke-token`, `sessions list|revoke`) send the instance
+//! admin key as the bearer. Data-plane subcommands (`query`, `mutate`) send a
+//! machine token scoped to `--db`.
 
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
@@ -49,6 +49,13 @@ enum Command {
     CreateDb {
         /// Database name to create.
         name: String,
+    },
+    /// Clone a database (schema + documents) into a new one. (admin)
+    CloneDb {
+        /// Source database to clone from.
+        from: String,
+        /// Destination database name (must not already exist).
+        to: String,
     },
     /// Push a SchemaDef JSON file to `--db`. (admin)
     PushSchema {
@@ -136,6 +143,11 @@ async fn main() -> Result<()> {
             let c = admin_client(&cli)?;
             c.create_db(name).await.map_err(map_err)?;
             eprintln!("created database {name}");
+        }
+        Command::CloneDb { from, to } => {
+            let c = admin_client(&cli)?;
+            c.clone_db(from, to).await.map_err(map_err)?;
+            eprintln!("cloned database {from} into {to}");
         }
         Command::PushSchema { file } => {
             let db = require_db(&cli)?;
@@ -320,6 +332,23 @@ mod tests {
             panic!("expected CreateDb");
         };
         assert_eq!(name, "mydb");
+
+        let cli = Cli::try_parse_from([
+            "rtdb",
+            "--url",
+            "http://x",
+            "--admin-key",
+            "k",
+            "clone-db",
+            "src",
+            "dst",
+        ])
+        .unwrap();
+        let Command::CloneDb { from, to } = cli.command else {
+            panic!("expected CloneDb");
+        };
+        assert_eq!(from, "src");
+        assert_eq!(to, "dst");
 
         let cli = Cli::try_parse_from([
             "rtdb",

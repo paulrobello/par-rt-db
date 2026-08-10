@@ -475,6 +475,20 @@ export class RtDbAdminClient {
     }
   }
 
+  /** Clones `from` (schema + documents) into a freshly created `to` (see server `admin::dbs::clone_db`, ENH-009). */
+  async cloneDb(from: string, to: string): Promise<void> {
+    const response = await this.fetchImpl(
+      `${this.url}/admin/clone-db?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`,
+      {
+        method: "POST",
+        headers: { Authorization: `Bearer ${this.adminKey}` },
+      },
+    );
+    if (!response.ok) {
+      await this.throwFromResponse(response);
+    }
+  }
+
   /** Read a database's pushed schema (GET /admin/dbs/{db}/schema). */
   async getSchema(db: string): Promise<SchemaJson> {
     return (await this.request("GET", `/admin/dbs/${encodeURIComponent(db)}/schema`)) as SchemaJson;

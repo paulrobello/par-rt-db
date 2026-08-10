@@ -96,6 +96,21 @@ impl Default for StepResult {
     }
 }
 
+/// Parse the `results` array returned by `/api/mutate`, `/admin/db/{db}/mutate`,
+/// and the WS `mutateOk` frame into typed [`StepResult`]s. Shared by the HTTP,
+/// admin, and WS mutate paths so the untagged-enum decode lives in one place.
+pub(crate) fn parse_step_results(
+    values: Vec<Value>,
+) -> Result<Vec<StepResult>, crate::error::RtDbError> {
+    values
+        .into_iter()
+        .map(|v| {
+            serde_json::from_value::<StepResult>(v)
+                .map_err(|e| crate::error::RtDbError::internal(format!("invalid step result: {e}")))
+        })
+        .collect()
+}
+
 pub struct Mutation {
     steps: Vec<Step>,
 }

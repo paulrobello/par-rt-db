@@ -131,6 +131,7 @@ mod tests {
             ErrorCode::Internal,
             ErrorCode::Conflict,
             ErrorCode::RateLimited,
+            ErrorCode::QuotaExceeded,
         ];
         for c in all {
             let v = serde_json::to_value(c).unwrap();

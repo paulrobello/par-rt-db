@@ -754,13 +754,7 @@ impl RtDbClient {
         let results = reply_rx
             .await
             .map_err(|_| RtDbError::internal("client is closed"))??;
-        results
-            .into_iter()
-            .map(|v| {
-                serde_json::from_value::<StepResult>(v)
-                    .map_err(|e| RtDbError::internal(format!("invalid step result: {e}")))
-            })
-            .collect()
+        crate::mutation::parse_step_results(results)
     }
 
     /// Schedule `txn` to fire at `when`. Resolves with the new schedule's id on

@@ -146,7 +146,7 @@ dev = [
 requires-dist = [
     { name = "httpx", marker = "extra == 'aio'", specifier = ">=0.28.1" },
     { name = "httpx", marker = "extra == 'http'", specifier = ">=0.28.1" },
-    { name = "pydantic", specifier = ">=2.13.4" },
+    { name = "pydantic", specifier = ">=2.13.4,<3" },
     { name = "websockets", marker = "extra == 'ws'", specifier = ">=17.0.1" },
 ]
 provides-extras = ["ws", "http", "aio"]

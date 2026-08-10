@@ -188,6 +188,51 @@ async def test_reconnectable_close_schedules_backoff():
         await client.close()
 
 
+async def test_unauthenticated_drive_backs_off_not_busy_spins():
+    """While get_token returns None, _drive applies backoff, not sleep(0).
+
+    Regression guard for ARC-128: the unauthenticated _drive path previously
+    called asyncio.sleep(0) in a tight loop while the token was None, instead
+    of using the same jittered exponential backoff the reconnect path uses.
+    """
+    sleeps: list[float] = []
+
+    async def _recording_sleep(delay: float) -> None:
+        sleeps.append(delay)
+        await asyncio.sleep(0)
+
+    async def _always_none() -> str | None:
+        return None
+
+    conn = FakeConn()
+    calls: list[str] = []
+
+    async def _connect(url: str) -> FakeConn:
+        calls.append(url)
+        return conn
+
+    client = RtDbClient(
+        "http://x",
+        "db",
+        get_token=_always_none,
+        heartbeat=10.0,
+        backoff_base=0.01,
+        backoff_max=0.05,
+        connect=_connect,
+        random=lambda: 0.5,
+        sleep=_recording_sleep,
+    )
+    await client.connect()
+    await _drain(20)
+    await client.close()
+
+    # The driver never opened a socket (no token), but it did sleep with
+    # backoff on each iteration — never sleep(0).
+    assert len(sleeps) >= 2, f"expected >=2 backoff sleeps, got {sleeps}"
+    assert all(d > 0 for d in sleeps), f"expected backoff > 0, got {sleeps}"
+    assert calls == [], "no socket should be opened while token is None"
+
+
 async def test_pong_resets_liveness():
     conn = FakeConn()
     client, _ = make_client(conn, heartbeat=0.05)

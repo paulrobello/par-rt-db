@@ -268,8 +268,16 @@ class RtDbClient:
             if self._closed:
                 return
             if token is None:
+                # No token yet: back off with the same jittered exponential delay
+                # the reconnect path uses (_schedule_reconnect), rather than
+                # busy-spinning on asyncio.sleep(0). _attempt is reset to 0 once
+                # an epoch authenticates successfully (see _epoch).
                 self._set_state(ConnectionState.IDLE)
-                await self._sleep(0)  # yield; caller reconnects via connect()
+                delay = _backoff_delay(
+                    self._attempt, self._backoff_base, self._backoff_max, self._random()
+                )
+                self._attempt += 1
+                await self._sleep(delay)
                 continue
             gen = self._generation
             await self._epoch(token, gen)

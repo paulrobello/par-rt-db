@@ -286,6 +286,17 @@ class RtDbAdminClient:
         )
         self._expect_ok(resp)
 
+    def clone_db(self, from_: str, to: str) -> None:
+        """``POST /admin/clone-db?from=<from>&to=<to>`` → ``{ok:true}``.
+
+        Clones ``from_`` (schema + documents) into a freshly created ``to`` in
+        one server-side step. ``to`` must not already exist; scope matches
+        ``export_db``/``import_db`` — storage blobs and scheduled transactions
+        are not copied.
+        """
+        resp = self._req("POST", "/admin/clone-db", params={"from": from_, "to": to})
+        self._expect_ok(resp)
+
     # --- allowlist ---
 
     def allowlist_add(self, db: str, email: str) -> None:
@@ -944,6 +955,17 @@ class AsyncRtDbAdminClient:
             content=jsonl,
             headers={"Content-Type": "application/x-ndjson"},
         )
+        self._expect_ok(resp)
+
+    async def clone_db(self, from_: str, to: str) -> None:
+        """``POST /admin/clone-db?from=<from>&to=<to>`` → ``{ok:true}`` (async).
+
+        Clones ``from_`` (schema + documents) into a freshly created ``to`` in
+        one server-side step. ``to`` must not already exist; scope matches
+        ``export_db``/``import_db`` — storage blobs and scheduled transactions
+        are not copied.
+        """
+        resp = await self._req("POST", "/admin/clone-db", params={"from": from_, "to": to})
         self._expect_ok(resp)
 
     # --- allowlist ---

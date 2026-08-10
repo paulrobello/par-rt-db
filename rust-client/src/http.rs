@@ -264,14 +264,7 @@ impl RtDbHttpClient {
             results: Vec<serde_json::Value>,
         }
         let parsed = self.deserialize::<MutateResponse>(resp).await?;
-        parsed
-            .results
-            .into_iter()
-            .map(|v| {
-                serde_json::from_value::<StepResult>(v)
-                    .map_err(|e| RtDbError::internal(format!("invalid step result: {e}")))
-            })
-            .collect()
+        crate::mutation::parse_step_results(parsed.results)
     }
 
     /// Upsert by index-field value: builds a one-step transaction that matches
@@ -901,6 +894,23 @@ impl RtDbHttpClient {
         self.expect_ok(resp).await
     }
 
+    /// `POST /admin/clone-db?from=<from>&to=<to>` → `{ok:true}`. Clones `from`
+    /// (schema + documents) into a freshly created `to` in one server-side step
+    /// (see server `admin::dbs::clone_db`, ENH-009). `to` must not already exist;
+    /// scope matches [`export_db`](Self::export_db)/[`import_db`](Self::import_db)
+    /// — storage blobs and scheduled transactions are not copied.
+    pub async fn clone_db(&self, from: &str, to: &str) -> Result<(), RtDbError> {
+        let resp = self
+            .client
+            .post(format!("{}/admin/clone-db", self.url))
+            .bearer_auth(&self.token)
+            .query(&[("from", from), ("to", to)])
+            .send()
+            .await
+            .map_err(|e| RtDbError::internal(format!("clone_db request failed: {e}")))?;
+        self.expect_ok(resp).await
+    }
+
     /// `GET /admin/dbs/{db}/schema` → the database's pushed `SchemaDef`.
     pub async fn get_schema(&self, db: &str) -> Result<crate::schema::SchemaDef, RtDbError> {
         self.get_json(&format!("/admin/dbs/{db}/schema"), &[]).await
@@ -1111,14 +1121,7 @@ impl RtDbHttpClient {
             results: Vec<serde_json::Value>,
         }
         let parsed = self.deserialize::<Resp>(resp).await?;
-        parsed
-            .results
-            .into_iter()
-            .map(|v| {
-                serde_json::from_value::<StepResult>(v)
-                    .map_err(|e| RtDbError::internal(format!("invalid step result: {e}")))
-            })
-            .collect()
+        crate::mutation::parse_step_results(parsed.results)
     }
 
     /// `POST /admin/backup` (empty body) → 202 `{ok:true}`. Triggers one

@@ -59,7 +59,7 @@ pub mod ws;
 pub use error::{ErrorCode, ErrorEnvelope, RtDbError, retry_on_precondition};
 pub use mutation::{Mutation, StepResult, Transaction};
 pub use query::{
-    HybridSearchOpts, Order, Paginate, Paginated, Query, TableQuery, VectorSearchOpts,
+    HybridSearchOpts, Order, Paginate, Paginated, Query, SearchOpts, TableQuery, VectorSearchOpts,
 };
 pub use schema::{DistanceMetric, FieldType, IndexDef, SchemaDef, TableDef, VectorIndexSpec};
 pub use wire::{
@@ -82,11 +82,11 @@ pub use ws::{
 
 #[cfg(feature = "admin")]
 pub use wire::admin::{
-    AdminMember, AuditEntry, AuditQuery, Cast, CastFailure, ConfigResponse, CreateWebhookOptions,
-    DbStats, Directive, DirectiveReport, HotConfig, HotConfigPatch, LatencyStats,
-    ListDeliveriesOptions, MigrateRequest, MigrateRequestOwned, MigrateResult, MintTokenOptions,
-    MintedToken, OpEvent, SampleChange, SessionInfo, SessionListOptions, TableStat, TokenInfo,
-    Webhook, WebhookDelivery, WebhookEditOptions,
+    AdminMember, AuditEntry, AuditQuery, BackupsListResponse, Cast, CastFailure, ConfigResponse,
+    CreateWebhookOptions, DbStats, Directive, DirectiveReport, HotConfig, HotConfigPatch,
+    LatencyStats, ListDeliveriesOptions, MetricsSnapshot, MigrateRequest, MigrateRequestOwned,
+    MigrateResult, MintTokenOptions, MintedToken, OpEvent, SampleChange, SessionInfo,
+    SessionListOptions, TableStat, TokenInfo, Webhook, WebhookDelivery, WebhookEditOptions,
 };
 
 #[cfg(feature = "admin")]
