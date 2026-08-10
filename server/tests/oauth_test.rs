@@ -614,6 +614,78 @@ async fn state_poll_returns_pending_before_callback() -> anyhow::Result<()> {
     Ok(())
 }
 
+// SEC-121: a leaked `state` URL alone is NOT the capability to poll. The poll
+// must also carry the `rtdb-oauth-state` cookie (set at /begin, same value);
+// without it, the server returns `expired`. This means a state token leaked
+// via an edge log, browser history, or the server's own TraceLayer cannot be
+// used to retrieve the session token — the attacker needs the cookie too.
+#[tokio::test]
+async fn sec121_state_poll_without_cookie_is_rejected() -> anyhow::Result<()> {
+    let mock = MockServer::start().await;
+    let (_state, addr) = oauth_state(&mock).await;
+
+    // Begin with a cookie-storing client so we capture the `rtdb-oauth-state`
+    // cookie AND the plaintext `state` token.
+    let cookie_client = no_redirect_client();
+    let state_token = begin_login(&cookie_client, addr, "http://localhost:5173").await;
+
+    // A SEPARATE bare client (no cookie store) sends ONLY the state token in
+    // the URL — simulating an attacker who captured the URL but has no cookie.
+    let bare_client = reqwest::Client::new();
+    let resp = bare_client
+        .get(format!("http://{addr}/auth/state?state={state_token}"))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: Value = resp.json().await?;
+    assert_eq!(
+        body["status"], "expired",
+        "SEC-121: /auth/state without the begin-cookie must be rejected"
+    );
+
+    // The cookie-storing client (which DOES carry rtdb-oauth-state) succeeds —
+    // the defense rejects only cookieless pollers, not the legit parent.
+    let resp = cookie_client
+        .get(format!("http://{addr}/auth/state?state={state_token}"))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: Value = resp.json().await?;
+    assert_eq!(
+        body["status"], "pending",
+        "the cookie-authenticated poll still works"
+    );
+    Ok(())
+}
+
+// SEC-121: a cookie with a MISMATCHED value (not equal to the state token) is
+// also rejected — the defense is a double-check, not a presence-only gate.
+#[tokio::test]
+async fn sec121_state_poll_with_mismatched_cookie_is_rejected() -> anyhow::Result<()> {
+    let mock = MockServer::start().await;
+    let (_state, addr) = oauth_state(&mock).await;
+
+    let cookie_client = no_redirect_client();
+    let state_token = begin_login(&cookie_client, addr, "http://localhost:5173").await;
+
+    // Send the right state token in the URL but a WRONG cookie value. We need a
+    // client that lets us override the cookie — reqwest's cookie_store would
+    // send the right one automatically, so use a bare client with a manual
+    // Cookie header carrying a bogus value.
+    let bare_client = reqwest::Client::new();
+    let resp = bare_client
+        .get(format!("http://{addr}/auth/state?state={state_token}"))
+        .header("cookie", "rtdb-oauth-state=not-the-real-state")
+        .send()
+        .await?;
+    let body: Value = resp.json().await?;
+    assert_eq!(
+        body["status"], "expired",
+        "SEC-121: a mismatched rtdb-oauth-state cookie must be rejected"
+    );
+    Ok(())
+}
+
 // SEC-012: when complete_login fails (the IdP rejects the code), the callback
 // marks the entry Failed and the poll returns `error`.
 #[tokio::test]

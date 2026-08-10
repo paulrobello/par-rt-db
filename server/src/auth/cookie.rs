@@ -118,6 +118,50 @@ pub(crate) fn clear_oauth_csrf_cookie() -> HeaderValue {
     .expect("static clear-cookie template is a valid header value")
 }
 
+/// SEC-121: cookie name binding the `/auth/state` poll to the browser that
+/// started the flow. Its value is the OAuth `state` token, set at `/begin`
+/// alongside `OAUTH_CSRF_COOKIE`. Unlike the CSRF cookie (cleared at
+/// `/callback` for one-shot hygiene), this one SURVIVES the callback so the
+/// post-callback poll — which is how the polling parent receives the token —
+/// still carries it. A leaked `state` value in a URL or log alone is not enough
+/// to poll: the cookie must also be present and match (same value, so an
+/// attacker still needs the cookie, not just the URL). `SameSite=None` so the
+/// cross-origin SDK poll (the SPA on a different origin than the server)
+/// attaches it via `credentials: "include"`.
+pub(crate) const OAUTH_STATE_COOKIE: &str = "rtdb-oauth-state";
+
+/// Reads the `rtdb-oauth-state` cookie value from the `Cookie:` header, if present.
+pub(crate) fn oauth_state_cookie(headers: &HeaderMap) -> Option<&str> {
+    let raw = headers.get(axum::http::header::COOKIE)?.to_str().ok()?;
+    raw.split(';').find_map(|pair| {
+        let (name, value) = pair.split_once('=')?;
+        (name.trim() == OAUTH_STATE_COOKIE).then_some(value.trim())
+    })
+}
+
+/// Builds the `Set-Cookie` for the SEC-121 poll-binding cookie. SameSite=None
+/// (cross-origin SDK poll), HttpOnly, Max-Age mirroring `CSRF_MAX_AGE_SECS`
+/// (10 min — matches `STATE_TTL_MS`). Same injection-char guard as the other
+/// cookie helpers (fails closed).
+pub(crate) fn set_oauth_state_cookie(value: &str, secure: bool) -> Result<HeaderValue, RtDbError> {
+    if value.is_empty()
+        || value
+            .bytes()
+            .any(|b| matches!(b, b';' | b',' | b' ' | b'\t' | b'\r' | b'\n') || b < 0x20)
+    {
+        return Err(RtDbError::internal(
+            "oauth state cookie value contains illegal characters",
+        ));
+    }
+    let mut s = format!(
+        "{OAUTH_STATE_COOKIE}={value}; HttpOnly; SameSite=None; Path=/; Max-Age={CSRF_MAX_AGE_SECS}"
+    );
+    if secure {
+        s.push_str("; Secure");
+    }
+    HeaderValue::from_str(&s).map_err(|_| RtDbError::internal("invalid oauth state cookie value"))
+}
+
 /// Cookie name carrying the admin double-submit CSRF nonce (SEC-106). READABLE
 /// (NOT HttpOnly) so dashboard JS can read it and echo the value in the
 /// `X-Rtdb-Csrf` header on mutating `/admin/*` requests. Its scope and lifetime

@@ -75,6 +75,10 @@ services:
       # the mitigation on out-of-the-box. Each failure also increments the
       # rtdb_admin_auth_failures_total counter and logs at WARN.
       RTDB_ADMIN_RATE_LIMIT_PER_IP_RPM: ${RTDB_ADMIN_RATE_LIMIT_PER_IP_RPM:-10}
+      # SEC-120: cookie Secure attribute ships on by default — a misconfigured
+      # proxy that strips X-Forwarded-Proto can no longer cause a session cookie
+      # to be sent over plain HTTP. Set to "false" ONLY for local-http dev.
+      RTDB_COOKIE_SECURE: ${RTDB_COOKIE_SECURE:-true}
       # Webhook delivery registry (off by default). Mirrors SEC-001 SSRF
       # hardening: when enabled, registration requires https + rejects private
       # IP ranges; RTDB_WEBHOOK_ALLOW_HTTP is the dev escape hatch (off).

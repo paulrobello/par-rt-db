@@ -218,6 +218,14 @@ pub struct Config {
     /// canonicalized by `client_ip_key` (CF-Connecting-IP preferred, rightmost
     /// XFF fallback). Boot-only (not hot-reloadable).
     pub admin_rate_limit_per_ip_rpm: u32,
+    /// RTDB_COOKIE_SECURE (default true). When true, the `Secure` attribute is
+    /// set on every session/CSRF cookie unconditionally — a misconfigured proxy
+    /// that drops `X-Forwarded-Proto` can no longer cause the cookie to be sent
+    /// over plain HTTP (SEC-120). When false, `Secure` follows
+    /// `request_is_secure` (the `X-Forwarded-Proto: https` check), which is the
+    /// local-http-dev escape hatch: a developer on `http://localhost` sets this
+    /// to `false` so the browser still accepts the cookie. Boot-only (not hot).
+    pub cookie_secure: bool,
 }
 
 impl Config {
@@ -540,6 +548,17 @@ impl Config {
             Err(_) => 0,
         };
 
+        // SEC-120: cookie `Secure` attribute ships ON by default. An explicit
+        // "false"/"0"/"no" (case-insensitive) is the local-http-dev escape
+        // hatch (the browser rejects Secure cookies over plain http). Anything
+        // else, including unset, stays on so production never accidentally sends
+        // a session cookie in the clear when a proxy strips
+        // `X-Forwarded-Proto`.
+        let cookie_secure = match std::env::var("RTDB_COOKIE_SECURE") {
+            Ok(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "false" | "0" | "no"),
+            Err(_) => true,
+        };
+
         Ok(Self {
             port,
             database_url,
@@ -603,6 +622,7 @@ impl Config {
             anonymous_rate_limit_per_ip_rpm,
             quota_cache_ttl_secs,
             admin_rate_limit_per_ip_rpm,
+            cookie_secure,
         })
     }
 }

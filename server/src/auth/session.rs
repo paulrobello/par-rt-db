@@ -35,6 +35,58 @@ pub async fn create_session(
     Ok(token)
 }
 
+/// SEC-120: mints a hashed, revocable admin-key login session. The plaintext
+/// token is returned exactly once and goes into the HttpOnly cookie (never the
+/// raw `config.admin_key`); only its sha256 digest is persisted in
+/// `rtdb_auth.admin_sessions`. Mirrors `create_session` but carries no
+/// `user_id` — the admin key is a configured secret, not an OAuth user. The row
+/// appears in `/admin/sessions` and is revocable via `DELETE /admin/sessions/{hash}`,
+/// so a stolen cookie is revocable without rotating the admin key (which would
+/// also invalidate outstanding signed storage URLs).
+pub async fn create_admin_session(pool: &PgPool, ttl_days: i64) -> Result<String, RtDbError> {
+    let token = random_token();
+    let hash = sha256_hex(&token);
+    let now = now_ms();
+    let expires_at = now + ttl_days * MS_PER_DAY;
+
+    sqlx::query(
+        "INSERT INTO rtdb_auth.admin_sessions (token_hash, expires_at, created_at) \
+         VALUES ($1, $2, $3)",
+    )
+    .bind(&hash)
+    .bind(expires_at)
+    .bind(now)
+    .execute(pool)
+    .await?;
+
+    Ok(token)
+}
+
+/// SEC-120: resolves an admin-key session token against `rtdb_auth.admin_sessions`.
+/// Returns `true` if a valid (non-expired) row matches; lazily deletes an expired
+/// row so it never needs a separate sweep. `false` if absent or expired (the
+/// caller falls through to the OAuth-user path).
+pub async fn resolve_admin_session(pool: &PgPool, token: &str) -> Result<bool, RtDbError> {
+    let hash = sha256_hex(token);
+    let row: Option<(i64,)> =
+        sqlx::query_as("SELECT expires_at FROM rtdb_auth.admin_sessions WHERE token_hash = $1")
+            .bind(&hash)
+            .fetch_optional(pool)
+            .await?;
+
+    let Some((expires_at,)) = row else {
+        return Ok(false);
+    };
+    if expires_at < now_ms() {
+        sqlx::query("DELETE FROM rtdb_auth.admin_sessions WHERE token_hash = $1")
+            .bind(&hash)
+            .execute(pool)
+            .await?;
+        return Ok(false);
+    }
+    Ok(true)
+}
+
 /// Resolves a session token to a `Principal::User`. `Ok(None)` if the token
 /// is absent or expired; an expired row is deleted lazily as part of this
 /// call so it never needs a separate sweep.
@@ -111,7 +163,9 @@ pub struct SessionInfo {
 
 /// Lists sessions newest-first. When `user_filter` is `Some`, matches rows whose
 /// `user_id` OR `users.email` equals it (an operator may paste either). `limit`
-/// is clamped to `[1, 1000]` by the caller.
+/// is clamped to `[1, 1000]` by the caller. SEC-120: admin-key login sessions
+/// (no user_id) are UNIONed in with a synthetic `(admin key)` marker so an
+/// operator sees and can revoke them alongside OAuth sessions.
 pub async fn list_sessions(
     pool: &PgPool,
     user_filter: Option<&str>,
@@ -128,6 +182,9 @@ pub async fn list_sessions(
         i64,
     );
     let rows: Vec<Row> = if let Some(u) = user_filter {
+        // User-filtered listing: only that user's OAuth sessions. Admin-key
+        // sessions carry no user_id and don't belong to any user, so they are
+        // excluded from a filtered query (they DO appear in the unfiltered list).
         sqlx::query_as(
             "SELECT s.token_hash, s.user_id, u.email, u.login, u.anonymous, \
                     s.created_at, s.expires_at \
@@ -144,7 +201,11 @@ pub async fn list_sessions(
             "SELECT s.token_hash, s.user_id, u.email, u.login, u.anonymous, \
                     s.created_at, s.expires_at \
              FROM rtdb_auth.sessions s JOIN rtdb_auth.users u ON u.id = s.user_id \
-             ORDER BY s.created_at DESC LIMIT $1",
+             UNION ALL \
+             SELECT token_hash, '(admin key)', NULL, 'Admin key', false, \
+                    created_at, expires_at \
+             FROM rtdb_auth.admin_sessions \
+             ORDER BY created_at DESC LIMIT $1",
         )
         .bind(limit)
         .fetch_all(pool)
@@ -166,14 +227,20 @@ pub async fn list_sessions(
         .collect())
 }
 
-/// Deletes one session by its token_hash (the admin revoke-one path). Idempotent:
-/// returns 0 if the row is already gone — never an error.
+/// Deletes one session by its token_hash (the admin revoke-one path). SEC-120:
+/// tries both `sessions` (OAuth user) and `admin_sessions` (admin-key login) so
+/// either kind is revocable through the same `DELETE /admin/sessions/{hash}`.
+/// Idempotent: returns 0 if the row is already gone — never an error.
 pub async fn delete_session_by_hash(pool: &PgPool, token_hash: &str) -> Result<u64, RtDbError> {
-    let result = sqlx::query("DELETE FROM rtdb_auth.sessions WHERE token_hash = $1")
+    let r1 = sqlx::query("DELETE FROM rtdb_auth.sessions WHERE token_hash = $1")
         .bind(token_hash)
         .execute(pool)
         .await?;
-    Ok(result.rows_affected())
+    let r2 = sqlx::query("DELETE FROM rtdb_auth.admin_sessions WHERE token_hash = $1")
+        .bind(token_hash)
+        .execute(pool)
+        .await?;
+    Ok(r1.rows_affected() + r2.rows_affected())
 }
 
 /// Deletes every session for `user_id` (the admin revoke-all path). Idempotent.

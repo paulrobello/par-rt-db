@@ -92,9 +92,11 @@ pub(super) fn bearer_from_subprotocol(headers: &HeaderMap) -> Result<&str, RtDbE
 }
 
 /// Authenticate a raw bearer credential as an admin: the admin key first
-/// (constant-time compare, no DB lookup), then a resolved session/machine
-/// principal admitted only if it is an OAuth user on `rtdb_auth.admins`. Shared
-/// by the header path and the WS-subprotocol path so both enforce identically.
+/// (constant-time compare, no DB lookup), then a hashed admin-key login session
+/// (SEC-120 — the cookie path carries a session token, not the raw key), then a
+/// resolved session/machine principal admitted only if it is an OAuth user on
+/// `rtdb_auth.admins`. Shared by the header path and the WS-subprotocol path so
+/// both enforce identically.
 pub(crate) async fn authenticate_admin(
     state: &AppState,
     token: &str,
@@ -107,6 +109,14 @@ pub(crate) async fn authenticate_admin(
         return Err(RtDbError::unauthorized("admin key not configured"));
     }
     if bool::from(token.as_bytes().ct_eq(state.config.admin_key.as_bytes())) {
+        return Ok(AdminPrincipal::Key);
+    }
+    // SEC-120: the dashboard cookie now carries a hashed admin session token
+    // (never the raw admin key). Resolve it against `rtdb_auth.admin_sessions`
+    // — a valid, non-expired row admits the request as `AdminPrincipal::Key`
+    // (same privilege tier as the raw key). Falls through to the OAuth path on
+    // a miss so a non-admin session is still rejected with the right code.
+    if auth::session::resolve_admin_session(&state.pool, token).await? {
         return Ok(AdminPrincipal::Key);
     }
     let principal = match auth::resolve_bearer(&state.pool, token).await {

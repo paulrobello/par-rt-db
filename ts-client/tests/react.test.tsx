@@ -176,7 +176,9 @@ describe("signInWithGitHub (begin + poll relay)", () => {
     expect(fetchSpy).toHaveBeenCalledWith(expect.stringContaining("/auth/github/begin?origin="), {
       credentials: "include",
     });
-    expect(fetchSpy).toHaveBeenCalledWith(expect.stringContaining("/auth/state?state=s1"));
+    expect(fetchSpy).toHaveBeenCalledWith(expect.stringContaining("/auth/state?state=s1"), {
+      credentials: "include",
+    });
     expect(openSpy).toHaveBeenCalledWith(
       "about:blank",
       "rtdb-auth",

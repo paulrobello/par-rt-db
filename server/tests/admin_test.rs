@@ -1857,6 +1857,116 @@ async fn sec106_logout_without_csrf_clears_both_cookies() -> anyhow::Result<()> 
     Ok(())
 }
 
+// ===== SEC-120: admin-key login mints a hashed, revocable session =====
+//
+// The cookie credential is NO LONGER the raw `config.admin_key` — it is a
+// freshly-minted opaque session token whose sha256 hash is persisted in
+// `rtdb_auth.admin_sessions`. The row appears in GET /admin/sessions (listed
+// as `(admin key)`) and is revocable via DELETE /admin/sessions/{hash}, so a
+// stolen cookie can be killed without rotating the admin key (which would also
+// invalidate outstanding signed storage URLs). The raw `Authorization: Bearer
+// <admin_key>` path is unchanged — CLI/automation keep working.
+
+#[tokio::test]
+async fn sec120_cookie_value_is_not_the_raw_admin_key() -> anyhow::Result<()> {
+    // The session cookie set at login is a fresh opaque token — NOT the admin
+    // key. A cookie-store compromise (XSS reading document.cookie is impossible
+    // because it is HttpOnly, but a proxy/log capture is) does not leak the
+    // admin key itself.
+    let state = test_state().await;
+    let addr = spawn_app(state).await;
+    let (_client, session, _csrf) = admin_login_cookies(addr).await;
+    assert_ne!(
+        session, "test-admin-key",
+        "SEC-120: the session cookie must NOT carry the raw admin key"
+    );
+    assert!(
+        session.len() >= 32,
+        "the session cookie is an opaque random token, not the admin key"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn sec120_admin_login_session_is_listed_and_revocable() -> anyhow::Result<()> {
+    // Login mints a session row in rtdb_auth.admin_sessions. The row appears in
+    // GET /admin/sessions (as "(admin key)"), and DELETE /admin/sessions/{hash}
+    // revokes it — after which the cookie no longer authenticates.
+    let state = test_state().await;
+    let addr = spawn_app(state).await;
+    let (client, _session, _csrf) = admin_login_cookies(addr).await;
+
+    // The cookie-authenticated client can hit an admin GET before revocation.
+    let resp = client
+        .get(format!("http://{addr}/admin/dbs"))
+        .send()
+        .await?;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "cookie auth works before revocation"
+    );
+
+    // List sessions via the bearer admin-key path (CLI/automation). Find the
+    // admin-key row — it has userId == "(admin key)".
+    let resp = admin_get(addr, "/admin/sessions").await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await?;
+    let sessions = body["sessions"]
+        .as_array()
+        .expect("sessions array in /admin/sessions");
+    let admin_row = sessions
+        .iter()
+        .find(|s| s["userId"].as_str() == Some("(admin key)"))
+        .expect("SEC-120: admin-key login session appears in /admin/sessions");
+    let hash = admin_row["tokenHash"]
+        .as_str()
+        .expect("admin session row carries a tokenHash");
+
+    // Revoke it via DELETE /admin/sessions/{hash}.
+    let resp = admin_delete(addr, &format!("/admin/sessions/{hash}")).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    // The same cookie-authenticated client is now rejected (session revoked).
+    let resp = client
+        .get(format!("http://{addr}/admin/dbs"))
+        .send()
+        .await?;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "SEC-120: after revoking the admin session, the cookie no longer authenticates"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn sec120_bearer_admin_key_still_authenticates() -> anyhow::Result<()> {
+    // The Authorization: Bearer <admin_key> path is unchanged — CLI, automation,
+    // and machine tokens that send the raw key in the header keep working
+    // regardless of whether any admin session exists.
+    let state = test_state().await;
+    let addr = spawn_app(state).await;
+    // Bearer admin-key GET works (this is the existing admin_get helper).
+    let resp = admin_get(addr, "/admin/dbs").await;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "SEC-120: bearer admin_key auth is unchanged"
+    );
+    // Bearer admin-key POST works too (already exercised by every admin_post
+    // test above; re-affirm explicitly here for SEC-120).
+    let name = fresh_name();
+    let resp = admin_post(
+        addr,
+        "/admin/create-db",
+        serde_json::json!({ "name": name }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    Ok(())
+}
+
 // SEC-108: every admin route (except login/logout/stream) must 401 without a
 // credential — enforced by the router-layer middleware, not per-handler. One
 // omission in a per-handler convention is a silent auth bypass; this table

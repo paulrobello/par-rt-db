@@ -421,7 +421,92 @@ pub fn build_router(state: Arc<AppState>) -> Router {
 
     router
         .layer(from_fn(security_headers))
-        .layer(TraceLayer::new_for_http())
+        .layer(
+            // SEC-121: the default `TraceLayer::new_for_http()` records the full
+            // request URI (including query string) in the span. The OAuth `state`
+            // and provider `code` transit `/auth/callback?…&state=…` and
+            // `/auth/state?state=…` — those would otherwise land in this server's
+            // trace logs and any OTel collector downstream. Override `make_span_with`
+            // to record the PATH ONLY for those two routes (enough for correlation);
+            // all other paths keep the full URI (default behavior).
+            TraceLayer::new_for_http().make_span_with(|request: &Request<_>| {
+                tracing::debug_span!(
+                    "http.request",
+                    method = %request.method(),
+                    uri = %redacted_request_uri(request.uri())
+                )
+            }),
+        )
         .layer(cors)
         .with_state(state)
+}
+
+/// SEC-121: true for paths whose query string carries OAuth secrets (`state`,
+/// `code`). Covers the generic callback (`/auth/callback`), every provider-
+/// scoped callback (`/auth/{provider}/callback`), and the state poll
+/// (`/auth/state`). For these, the TraceLayer records the PATH ONLY — never the
+/// query string. All other paths record the full URI (the default behavior).
+fn trace_should_redact_query(path: &str) -> bool {
+    path == "/auth/state"
+        || path == "/auth/callback"
+        || (path.ends_with("/callback") && path.starts_with("/auth/"))
+}
+
+/// SEC-121: returns the URI string to record in the HTTP trace span. For paths
+/// flagged by [`trace_should_redact_query`], the query string is stripped (the
+/// `state` and `code` params are secrets-in-URL). For everything else, the full
+/// URI is returned verbatim. Extracted as a pure function so it is unit-testable.
+fn redacted_request_uri(uri: &axum::http::Uri) -> std::borrow::Cow<'_, str> {
+    let path = uri.path();
+    if trace_should_redact_query(path) {
+        path.into()
+    } else {
+        uri.to_string().into()
+    }
+}
+
+#[cfg(test)]
+mod lib_tests {
+    use super::*;
+    use axum::http::Uri;
+
+    #[test]
+    fn redacts_query_on_oauth_callback_and_state_paths() {
+        // SEC-121: /auth/callback?code=…&state=SECRET must record the path only.
+        let uri: Uri = "/auth/callback?code=abc&state=SECRET".parse().unwrap();
+        assert_eq!(redacted_request_uri(&uri), "/auth/callback");
+
+        // /auth/state?state=SECRET likewise — path only.
+        let uri: Uri = "/auth/state?state=SECRET".parse().unwrap();
+        assert_eq!(redacted_request_uri(&uri), "/auth/state");
+
+        // Provider-scoped callbacks (/auth/github/callback, /auth/google/callback,
+        // etc.) also match the /auth/callback prefix.
+        let uri: Uri = "/auth/github/callback?code=abc&state=SECRET"
+            .parse()
+            .unwrap();
+        assert_eq!(redacted_request_uri(&uri), "/auth/github/callback");
+    }
+
+    #[test]
+    fn preserves_full_uri_on_non_sensitive_paths() {
+        // Non-sensitive paths keep the full URI (query string included) — the
+        // default behavior, so storage transforms (?w=&h=&format=) and admin
+        // query params (?db=&limit=) remain visible for correlation.
+        let uri: Uri = "/storage/abc?w=100&h=100&format=jpeg".parse().unwrap();
+        assert_eq!(
+            redacted_request_uri(&uri),
+            "/storage/abc?w=100&h=100&format=jpeg"
+        );
+
+        let uri: Uri = "/admin/audit?db=mydb&limit=50".parse().unwrap();
+        assert_eq!(redacted_request_uri(&uri), "/admin/audit?db=mydb&limit=50");
+    }
+
+    #[test]
+    fn redacts_even_when_query_is_absent_on_sensitive_paths() {
+        // A sensitive path with no query still records just the path.
+        let uri: Uri = "/auth/callback".parse().unwrap();
+        assert_eq!(redacted_request_uri(&uri), "/auth/callback");
+    }
 }

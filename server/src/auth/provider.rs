@@ -234,9 +234,19 @@ async fn provider_begin<P: OAuthProvider>(
     // attacker induced the victim to load (the attacker's own exchange) carries no
     // matching cookie and is rejected at `provider_callback`. SameSite=None so it
     // survives the provider → callback cross-site redirect.
-    let secure = crate::auth::cookie::request_is_secure(&headers);
+    let secure = state.config.cookie_secure || crate::auth::cookie::request_is_secure(&headers);
     if let Ok(csrf) = crate::auth::cookie::set_oauth_csrf_cookie(&state_token, secure) {
         response.headers_mut().append(SET_COOKIE, csrf);
+    }
+    // SEC-121: bind the `/auth/state` poll to the SAME browser. The `state` token
+    // alone transit URLs, edge logs, and the server's TraceLayer — a leaked URL
+    // without this cookie cannot poll for the resulting session token. Unlike the
+    // CSRF cookie (cleared at /callback for one-shot hygiene), this one survives
+    // the callback so the post-callback poll — which is how the parent receives
+    // the token — still carries it. Same value, so an attacker needs the cookie,
+    // not just the URL.
+    if let Ok(state_cookie) = crate::auth::cookie::set_oauth_state_cookie(&state_token, secure) {
+        response.headers_mut().append(SET_COOKIE, state_cookie);
     }
     response
 }
@@ -279,7 +289,7 @@ async fn provider_callback<P: OAuthProvider>(
         return unconfigured_response(P::name());
     };
 
-    let secure = crate::auth::cookie::request_is_secure(&headers);
+    let secure = state.config.cookie_secure || crate::auth::cookie::request_is_secure(&headers);
     match provider.complete_login(&state, &params.code).await {
         Ok(token) => {
             set_outcome(
@@ -327,7 +337,7 @@ async fn apple_callback(
         return unconfigured_response(AppleProvider::name());
     };
 
-    let secure = crate::auth::cookie::request_is_secure(&headers);
+    let secure = state.config.cookie_secure || crate::auth::cookie::request_is_secure(&headers);
     match provider.complete_login(&state, &form.code).await {
         Ok(token) => {
             set_outcome(&state, &form.state, LoginOutcome::Completed(token.clone())).await;
@@ -402,10 +412,24 @@ enum StateResponse {
 /// required, so this works cross-origin (the SDK on a different origin) where
 /// the `SameSite=Lax` session cookie would not be sent. Returns
 /// `pending | complete | expired | error`.
+///
+/// SEC-121: the `state` value appears in URLs, edge logs, and the server's
+/// TraceLayer, so a leaked URL alone is not enough to poll — the request must
+/// ALSO carry the `rtdb-oauth-state` cookie set at `/begin` with the same
+/// value. Constant-time compare for hygiene; a missing/mismatched cookie
+/// returns `Expired` (the caller already handles that indistinguishably from a
+/// timed-out flow, and the legit parent — which loaded `/begin` — always has
+/// the cookie).
 async fn auth_state(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     QueryParams(params): QueryParams<StateQuery>,
 ) -> Response {
+    let cookie_ok = crate::auth::cookie::oauth_state_cookie(&headers)
+        .is_some_and(|c| bool::from(c.as_bytes().ct_eq(params.state.as_bytes())));
+    if !cookie_ok {
+        return Json(StateResponse::Expired).into_response();
+    }
     match poll_login(&state, &params.state).await {
         PollResult::Pending => Json(StateResponse::Pending).into_response(),
         PollResult::Complete { token, user } => {
@@ -568,7 +592,7 @@ async fn anonymous(
         github_login: None,
         session_hash: None,
     };
-    let secure = crate::auth::cookie::request_is_secure(&headers);
+    let secure = state.config.cookie_secure || crate::auth::cookie::request_is_secure(&headers);
     let mut response = Json(AnonymousResponse {
         user: authed_user(&principal),
         token: token.clone(),

@@ -266,7 +266,12 @@ async function pollOAuthState(
 ): Promise<{ done: true; token: string } | { done: false }> {
   let resp: Response;
   try {
-    resp = await fetch(`${apiBase}/auth/state?state=${encodeURIComponent(state)}`);
+    // SEC-121: send credentials so the `rtdb-oauth-state` cookie (set at /begin,
+    // same value as `state`) is attached. Without it the server rejects the poll
+    // as if the flow had expired — a leaked `state` URL alone cannot poll.
+    resp = await fetch(`${apiBase}/auth/state?state=${encodeURIComponent(state)}`, {
+      credentials: "include",
+    });
   } catch {
     return { done: false };
   }

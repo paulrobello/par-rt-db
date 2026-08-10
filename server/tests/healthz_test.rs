@@ -66,6 +66,7 @@ fn test_config() -> Config {
         anonymous_rate_limit_per_ip_rpm: 0,
         quota_cache_ttl_secs: 60,
         admin_rate_limit_per_ip_rpm: 0,
+        cookie_secure: false,
     }
 }
 

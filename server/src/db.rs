@@ -153,6 +153,22 @@ async fn bootstrap_ddl(conn: &mut PgConnection) -> Result<(), RtDbError> {
     .execute(&mut *conn)
     .await?;
 
+    // SEC-120: admin-key login mints a hashed, revocable session row here (not
+    // the raw admin_key). Parallel to `sessions` but with no FK to `users` —
+    // the admin key is a configured secret, not a user row, and a synthetic
+    // user would pollute the OAuth `users` table and its `email`/`github_id`
+    // uniqueness constraints. Surfaced in `/admin/sessions` and revocable via
+    // `DELETE /admin/sessions/{token_hash}` alongside OAuth sessions.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS rtdb_auth.admin_sessions (
+            token_hash text PRIMARY KEY,
+            expires_at bigint NOT NULL,
+            created_at bigint NOT NULL
+        )",
+    )
+    .execute(&mut *conn)
+    .await?;
+
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS rtdb_auth.allowlist (
             db_name text NOT NULL,

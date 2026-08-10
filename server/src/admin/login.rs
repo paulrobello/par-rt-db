@@ -82,8 +82,17 @@ pub(super) async fn admin_login(
         tracing::warn!(ip = %ip_key, "admin login rejected: bad key");
         return Err(RtDbError::unauthorized("invalid admin key"));
     }
-    let secure = auth::cookie::request_is_secure(&headers);
-    let cookie = auth::cookie::set_session_cookie(&state.config.admin_key, secure)?;
+    // SEC-120: mint a hashed, revocable admin session row and put its plaintext
+    // token in the cookie — never the raw `config.admin_key`. The row lands in
+    // `/admin/sessions` and is revocable via `DELETE /admin/sessions/{hash}`,
+    // so a stolen cookie is revocable without rotating the admin key (which
+    // would also invalidate every outstanding signed storage URL). The TTL
+    // mirrors the OAuth session TTL (`session_ttl_days`, default 30) so the
+    // cookie Max-Age and the server-side row expire together.
+    let ttl_days = state.runtime.hot.load().session_ttl_days;
+    let admin_session_token = auth::session::create_admin_session(&state.pool, ttl_days).await?;
+    let secure = state.config.cookie_secure || auth::cookie::request_is_secure(&headers);
+    let cookie = auth::cookie::set_session_cookie(&admin_session_token, secure)?;
     // SEC-106: mint the readable CSRF nonce alongside the session cookie. The
     // dashboard reads it via `document.cookie` and echoes it in the
     // `X-Rtdb-Csrf` header on mutating admin requests; a cross-site forge
