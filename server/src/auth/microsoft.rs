@@ -852,6 +852,7 @@ mod tests {
             anonymous_rate_limit_per_ip_rpm: 0,
             static_dir: None,
             pool_max_connections: 75,
+            schema_cache_max_entries: 1024,
             rate_limit_per_token_rpm: 0,
             rate_limit_per_db_rpm: 0,
             audit_log_enabled: false,

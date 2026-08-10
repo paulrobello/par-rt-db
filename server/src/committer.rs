@@ -69,6 +69,15 @@ pub enum CommitterRequest {
         target_version: i64,
         reply: oneshot::Sender<Result<i64, RtDbError>>,
     },
+    /// Best-effort immediate retirement of all five per-db tasks. Enqueued by
+    /// `drop_db` behind any in-flight work so the committer exits once the
+    /// queue drains (it would otherwise block on `recv()` until all four
+    /// poller tasks independently detect db-deletion on their own poll cadence
+    /// — up to 60s). On receipt `run_committer` breaks its loop, drops `rx`,
+    /// and every poller's `committer_tx.closed()` resolves immediately. Does
+    /// not carry a reply: the cascade is fire-and-forget and the task exits
+    /// are not joined (ARC-125).
+    Shutdown,
 }
 
 /// Owns one serialized committer task per database. Every mutation and every
@@ -131,23 +140,40 @@ impl Committers {
 
     /// Removes `db`'s committer channel from the map so future mutate/subscribe
     /// requests 404 (the next `submit` would fail `database_exists` first
-    /// anyway after `drop_database`). Used by `delete-db`.
+    /// anyway after `drop_database`), then enqueues a best-effort `Shutdown`
+    /// so the five per-db tasks retire immediately rather than each waiting up
+    /// to its own poll cadence (ARC-125, recurring ARC-012). Used by
+    /// `delete-db`.
     ///
-    /// Does NOT cleanly stop the per-db committer, scheduler, or
-    /// mutation-log cleanup tasks: those tasks each hold their own clone of
-    /// the channel sender, so removing this map entry does not close the
-    /// channel. After `DROP SCHEMA CASCADE` removes `scheduled_txns` and
-    /// `mutations`, those tasks' next polls log best-effort errors and
-    /// continue until the process restarts. This preserves the single-writer
-    /// invariant — the channel itself stays single-consumer, and no new
-    /// requests can reach the orphan tasks — at the cost of short-lived
-    /// orphan tasks. A clean shutdown would require either a
-    /// `CommitterRequest::Shutdown` variant with an ACK round-trip or a
-    /// `JoinHandle` registry; both are invasive for a rare admin op, so the
-    /// map eviction is the documented minimum.
+    /// The five per-db tasks spawned by `channel_for` are: the committer
+    /// itself, the scheduler, the mutation-log cleanup task, the TTL reaper,
+    /// and the storage-quota warmer (the reaper and warmer were added after
+    /// the original three; the prior comment named only three). Each poller
+    /// task also holds its own clone of the channel sender, so removing the
+    /// map entry alone does not close the channel. The enqueued `Shutdown`
+    /// makes `run_committer` break its loop and drop `rx`; that drop makes
+    /// every poller's `committer_tx.closed()` selector resolve immediately, so
+    /// all five tasks exit near-instantly instead of each independently
+    /// detecting db-deletion on its own poll cadence (the scheduler polls
+    /// every 2s, the reaper/warmer/cleanup every 60s).
+    ///
+    /// `try_send` is used so `drop_db` never blocks on a full channel buffer;
+    /// on failure the db-deletion self-termination each poller already has
+    /// still retires the tasks (just slower). Residual: the five task exits
+    /// are not awaited (no `JoinHandle` registry), so a `drop_db` caller sees
+    /// the channel evicted immediately but the task teardown completes
+    /// asynchronously. The single-writer invariant is preserved throughout —
+    /// `Shutdown` runs inside the committer's serialized turn behind any
+    /// queued work, and no new requests can reach the retiring tasks once the
+    /// map entry is gone.
     pub async fn drop_db(&self, db: &str) {
-        let mut guard = self.channels.lock().await;
-        guard.remove(db);
+        let sender = {
+            let mut guard = self.channels.lock().await;
+            guard.remove(db)
+        };
+        if let Some(sender) = sender {
+            let _ = sender.try_send(CommitterRequest::Shutdown);
+        }
     }
 
     /// Bundles this `Committers`'s shared state with a per-task `db` into a
@@ -529,6 +555,16 @@ async fn run_committer(ctx: CommitterCtx, mut rx: mpsc::Receiver<CommitterReques
             } => {
                 let outcome = handle_restore_schema(&ctx, target_version).await;
                 let _ = reply.send(outcome);
+            }
+            CommitterRequest::Shutdown => {
+                // ARC-125: best-effort retirement requested by `drop_db`.
+                // Breaking here drops `rx`, which makes every poller task's
+                // `committer_tx.closed()` selector resolve immediately. Any
+                // requests queued ahead of this `Shutdown` were already
+                // processed in their serialized order, so the single-writer
+                // invariant is intact.
+                tracing::info!(db = %ctx.db, "committer: shutdown requested, exiting");
+                break;
             }
         }
     }

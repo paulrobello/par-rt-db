@@ -13,6 +13,24 @@ async fn main() {
         std::process::exit(1);
     });
 
+    // ARC-126: this server stores OAuth state, the op-feed, presence, and
+    // rate-limit counters in-process (no cross-replica coordination). Running
+    // more than one replica behind a load balancer silently breaks OAuth
+    // login (the callback lands on whichever replica the LB chose, which has
+    // no entry for the state minted on the begin replica), halves live-update
+    // and presence coverage (each browser sees only its own replica's
+    // events), and multiplies every client's rate-limit budget by the replica
+    // count. Deploy as a single instance; horizontal scaling is tracked as
+    // ENH-022. Emitted at WARN because violating this constraint is silent
+    // (no error — the login just never resolves), and the single supported
+    // topology is the one that needs no action.
+    tracing::warn!(
+        "single-instance topology required: OAuth state, op-feed, presence, \
+         and rate-limit counters are in-process — running multiple replicas \
+         behind a load balancer will silently break OAuth login, live updates, \
+         and rate limiting (ENH-022 tracks horizontal scaling)"
+    );
+
     let pool = PgPoolOptions::new()
         .max_connections(config.pool_max_connections)
         // A small warm pool keeps first-of-burst requests off the connect

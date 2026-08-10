@@ -39,6 +39,7 @@ pub fn test_config() -> Config {
         max_affected_docs: 100,
         static_dir: None,
         pool_max_connections: 75,
+        schema_cache_max_entries: 1024,
         rate_limit_per_token_rpm: 0,
         rate_limit_per_db_rpm: 0,
         audit_log_enabled: false,

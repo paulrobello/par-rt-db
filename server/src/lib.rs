@@ -60,6 +60,15 @@ use auth::provider::OAuthStateEntry;
 /// Realtime execution core: subscription state, the per-db committer tasks,
 /// and the live op-feed tap they publish to. Grouped so handlers that only
 /// need the reactive surface can reach for `state.realtime` as a unit.
+///
+/// **Instance-local (ARC-126):** `op_feed` and `presence` are in-process maps
+/// with no cross-replica coordination. The op-feed is the dashboard's live
+/// `/admin/stream` tap; presence is the ephemeral per-connection roster. A
+/// second replica behind a load balancer sees neither the other's op events
+/// nor its presence sessions, so live updates and presence silently
+/// half-work (each browser sticks to whichever replica served its
+/// handshake). This server is single-instance by design — see the boot WARN
+/// in `main.rs`. Horizontal scaling (ENH-022) would lift this.
 pub struct Realtime {
     pub subs: Arc<SubscriptionManager>,
     pub committers: Committers,
@@ -81,6 +90,16 @@ pub struct Runtime {
 
 /// Per-instance auth bookkeeping that is neither a config value nor a realtime
 /// concern. Grouped so `state.auth` is the only OAuth-session seam.
+///
+/// **Instance-local (ARC-126):** `oauth_states` is an in-process `HashMap`
+/// keyed by the single-use `state` token minted at `/auth/{provider}/begin`
+/// and consumed at `/auth/callback`. A second replica behind a load balancer
+/// has no entry for a state minted on the first, so the OAuth callback lands
+/// on the wrong replica and **the login silently fails** (the poll at
+/// `/auth/state?state=…` never resolves). `SameSite=Lax` + a sticky-session-
+/// less deploy reproduces this trivially. This server is single-instance by
+/// design — see the boot WARN in `main.rs`. Horizontal scaling (ENH-022)
+/// would lift this.
 pub struct Auth {
     pub oauth_states: tokio::sync::Mutex<HashMap<String, OAuthStateEntry>>,
 }
@@ -92,6 +111,11 @@ pub struct AppState {
     pub realtime: Realtime,
     pub runtime: Runtime,
     pub auth: Auth,
+    /// Instance-local (ARC-126): the fixed-window rate limiter is an
+    /// in-process counter map. A second replica sees none of the first's
+    /// requests, so a client's effective budget becomes `N × replicas` per
+    /// window — a silent weakening of the cap. This server is single-instance
+    /// by design (see the boot WARN in `main.rs`).
     pub rate_limiter: Arc<rate_limit::RateLimiter>,
     /// In-progress flag for the manual `/admin/backup` trigger. Set
     /// synchronously in the handler before the spawned `pg_dump` task and
@@ -115,7 +139,7 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(pool: sqlx::PgPool, config: Config, hot: HotConfig) -> Arc<Self> {
-        let schemas = SchemaCache::new();
+        let schemas = SchemaCache::with_capacity(config.schema_cache_max_entries);
         let metrics = metrics::Metrics::new();
         // The subscription manager records invalidation effectiveness on the
         // same `Metrics` the dashboard reads, and owns the skip-verification

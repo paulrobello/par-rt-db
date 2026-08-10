@@ -155,6 +155,11 @@ services:
       # committer-per-db model holds a connection per active db during fan-out,
       # so the pool must scale with the number of active databases.
       RTDB_POOL_MAX_CONNECTIONS: ${RTDB_POOL_MAX_CONNECTIONS:-75}
+      # In-memory pushed-schema cache bound (ARC-119). Entry-count cap on the
+      # per-process SchemaCache; LRU-evicted past the cap and transparently
+      # reloaded from Postgres. 0 = unbounded; default 1024 bounds a
+      # multi-tenant instance that creates and drops databases over time.
+      RTDB_SCHEMA_CACHE_MAX_ENTRIES: ${RTDB_SCHEMA_CACHE_MAX_ENTRIES:-1024}
       # HTTP rate limiting (fixed-window, in-memory). 0 = unlimited (default).
       # Per-machine-token caps each token; per-db is shared across all principals
       # of one database. OAuth sessions carry no token id and are rate-limited

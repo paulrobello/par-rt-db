@@ -74,6 +74,12 @@ pub struct Config {
     pub max_affected_docs: usize, // RTDB_MAX_AFFECTED_DOCS, default 100 (admin data-browser guardrail)
     pub static_dir: Option<String>, // RTDB_STATIC_DIR — unset/empty ⇒ API-only (no SPA served)
     pub pool_max_connections: u32, // RTDB_POOL_MAX_CONNECTIONS, default 75 (multi-tenant; one committer task + N sub re-runs per db)
+    // In-memory pushed-schema cache bound (ARC-119). Entry-count cap on the
+    // per-process `SchemaCache`; LRU-evicted past the cap, transparently
+    // reloaded from Postgres on the next `get`. 0 = unbounded (prior
+    // behavior); default 1024 covers multi-tenant instances that create and
+    // drop databases over time without growing the map forever.
+    pub schema_cache_max_entries: u64, // RTDB_SCHEMA_CACHE_MAX_ENTRIES, default 1024
     // HTTP rate limiting (v1, fixed-window, in-memory): 0 = unlimited.
     // RTDB_RATE_LIMIT_PER_TOKEN_RPM caps each machine token; OAuth sessions
     // carry no token id and are rate-limited per-db only. Default 0 preserves
@@ -353,6 +359,8 @@ impl Config {
         // headroom for concurrent subscription re-runs and HTTP reads
         // without overcommitting a typical Postgres `max_connections=100`.
         let pool_max_connections = env_parsed("RTDB_POOL_MAX_CONNECTIONS", 75u32)?;
+        // ARC-119: bound the per-process schema cache. 0 = unbounded.
+        let schema_cache_max_entries = env_parsed("RTDB_SCHEMA_CACHE_MAX_ENTRIES", 1024u64)?;
 
         let static_dir = std::env::var("RTDB_STATIC_DIR")
             .ok()
@@ -512,6 +520,7 @@ impl Config {
             max_affected_docs,
             static_dir,
             pool_max_connections,
+            schema_cache_max_entries,
             rate_limit_per_token_rpm,
             rate_limit_per_db_rpm,
             audit_log_enabled,
