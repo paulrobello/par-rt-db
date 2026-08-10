@@ -281,55 +281,7 @@ impl InMemoryRtDbClient {
         // unconditionally, which diverged from the server (and the other
         // clients) on every non-empty match.
         if let Some(search) = &q.search {
-            if q.index.is_some()
-                || !eq.is_empty()
-                || has_range
-                || q.order.is_some()
-                || q.unique
-                || q.first
-                || q.count
-                || q.distinct
-                || q.aggregate.is_some()
-                || q.paginate.is_some()
-                || q.filter.is_some()
-                || q.vector_search.is_some()
-                || q.hybrid_search.is_some()
-            {
-                return Err(RtDbError::new(
-                    ErrorCode::BadRequest,
-                    "search cannot be combined with index, eq, range bounds, order, \
-                     unique, first, count, distinct, aggregate, paginate, filter, \
-                     vector search, or hybrid search",
-                ));
-            }
-            if let Some(filter) = &search.filter {
-                let fields: BTreeSet<String> = table_def.fields.keys().cloned().collect();
-                validate_filter(filter, &fields)?;
-            }
-            let index_def = require_index(&table_def, &search.index)?;
-            let index_fields: Vec<String> = index_def.fields.clone();
-            let tokens: Vec<String> = search
-                .query
-                .split_whitespace()
-                .map(|t| t.to_lowercase())
-                .collect();
-            let mut rows: Vec<Value> = self.collect_all(&q.table);
-            if !tokens.is_empty() {
-                rows.retain(|doc| {
-                    tokens.iter().all(|tok| {
-                        index_fields.iter().any(|f| {
-                            doc.get(f)
-                                .and_then(Value::as_str)
-                                .map(|s| s.to_lowercase().contains(tok))
-                                .unwrap_or(false)
-                        })
-                    })
-                });
-            }
-            if let Some(filter) = &search.filter {
-                rows.retain(|d| matches_filter(filter, d));
-            }
-            return Ok(Value::Array(rows));
+            return self.execute_search_terminal(q, search, &table_def, eq, has_range);
         }
 
         // Resolve index — required for `eq` and for any range bound.
@@ -930,6 +882,75 @@ impl InMemoryRtDbClient {
         }
         let mut rows: Vec<Value> = self.collect_all(&q.table);
         rows.truncate(hybrid.limit as usize);
+        Ok(Value::Array(rows))
+    }
+
+    /// `search` terminal — cascade mirror of server `execute_query`.
+    /// In-memory replica approximation: there is no ts_rank model
+    /// client-side, so we mirror the ts-client's token-AND matching against
+    /// the search index's text fields (a doc matches when every whitespace
+    /// token of the query appears, case-insensitively, as a substring of at
+    /// least one indexed field's string value); the carried `filter` then
+    /// narrows the candidate set. Result order is unspecified (no ranking)
+    /// so callers compare as a set. QA-103: the previous stub returned `[]`
+    /// unconditionally, which diverged from the server (and the other
+    /// clients) on every non-empty match.
+    fn execute_search_terminal(
+        &self,
+        q: &Query,
+        search: &crate::wire::SearchQuery,
+        table_def: &TableDef,
+        eq: &[Value],
+        has_range: bool,
+    ) -> Result<Value, RtDbError> {
+        if q.index.is_some()
+            || !eq.is_empty()
+            || has_range
+            || q.order.is_some()
+            || q.unique
+            || q.first
+            || q.count
+            || q.distinct
+            || q.aggregate.is_some()
+            || q.paginate.is_some()
+            || q.filter.is_some()
+            || q.vector_search.is_some()
+            || q.hybrid_search.is_some()
+        {
+            return Err(RtDbError::new(
+                ErrorCode::BadRequest,
+                "search cannot be combined with index, eq, range bounds, order, \
+                 unique, first, count, distinct, aggregate, paginate, filter, \
+                 vector search, or hybrid search",
+            ));
+        }
+        if let Some(filter) = &search.filter {
+            let fields: BTreeSet<String> = table_def.fields.keys().cloned().collect();
+            validate_filter(filter, &fields)?;
+        }
+        let index_def = require_index(table_def, &search.index)?;
+        let index_fields: Vec<String> = index_def.fields.clone();
+        let tokens: Vec<String> = search
+            .query
+            .split_whitespace()
+            .map(|t| t.to_lowercase())
+            .collect();
+        let mut rows: Vec<Value> = self.collect_all(&q.table);
+        if !tokens.is_empty() {
+            rows.retain(|doc| {
+                tokens.iter().all(|tok| {
+                    index_fields.iter().any(|f| {
+                        doc.get(f)
+                            .and_then(Value::as_str)
+                            .map(|s| s.to_lowercase().contains(tok))
+                            .unwrap_or(false)
+                    })
+                })
+            });
+        }
+        if let Some(filter) = &search.filter {
+            rows.retain(|d| matches_filter(filter, d));
+        }
         Ok(Value::Array(rows))
     }
 }
