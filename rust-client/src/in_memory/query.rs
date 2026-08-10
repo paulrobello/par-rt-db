@@ -256,36 +256,7 @@ impl InMemoryRtDbClient {
         // the previous stub returned `[]` unconditionally, which diverged from
         // the server (and the other clients) on every non-empty match.
         if let Some(vector) = &q.vector_search {
-            if q.index.is_some()
-                || !eq.is_empty()
-                || has_range
-                || q.order.is_some()
-                || q.unique
-                || q.first
-                || q.count
-                || q.distinct
-                || q.aggregate.is_some()
-                || q.paginate.is_some()
-                || q.filter.is_some()
-                || q.search.is_some()
-                || q.hybrid_search.is_some()
-                || q.take.is_some()
-            {
-                return Err(RtDbError::new(
-                    ErrorCode::BadRequest,
-                    "vectorSearch cannot be combined with any other terminal",
-                ));
-            }
-            if let Some(filter) = &vector.filter {
-                let fields: BTreeSet<String> = table_def.fields.keys().cloned().collect();
-                validate_filter(filter, &fields)?;
-            }
-            let mut rows: Vec<Value> = self.collect_all(&q.table);
-            if let Some(filter) = &vector.filter {
-                rows.retain(|d| matches_filter(filter, d));
-            }
-            rows.truncate(vector.limit as usize);
-            return Ok(Value::Array(rows));
+            return self.execute_vector_search_terminal(q, vector, &table_def, eq, has_range);
         }
 
         // `hybridSearch` terminal — cascade mirror of server `execute_query`.
@@ -895,6 +866,54 @@ impl InMemoryRtDbClient {
         // The DSL `get` terminal reuses the point-read primitive so the
         // system-field merge path is shared with the Task 2 helper.
         Ok(self.get(&q.table, id).unwrap_or(Value::Null))
+    }
+
+    /// `vectorSearch` terminal — cascade mirror of server `execute_query`.
+    /// In-memory replica approximation: there is no pgvector distance model
+    /// client-side, so every table doc is a candidate; the carried `filter`
+    /// (the db-side `FilterExpr` DSL) narrows the set, capped at `limit`.
+    /// This is the same over-approximation the ts/python clients use; result
+    /// order is unspecified (no ranking) so callers compare as a set. QA-103:
+    /// the previous stub returned `[]` unconditionally, which diverged from
+    /// the server (and the other clients) on every non-empty match.
+    fn execute_vector_search_terminal(
+        &self,
+        q: &Query,
+        vector: &crate::wire::VectorSearchQuery,
+        table_def: &TableDef,
+        eq: &[Value],
+        has_range: bool,
+    ) -> Result<Value, RtDbError> {
+        if q.index.is_some()
+            || !eq.is_empty()
+            || has_range
+            || q.order.is_some()
+            || q.unique
+            || q.first
+            || q.count
+            || q.distinct
+            || q.aggregate.is_some()
+            || q.paginate.is_some()
+            || q.filter.is_some()
+            || q.search.is_some()
+            || q.hybrid_search.is_some()
+            || q.take.is_some()
+        {
+            return Err(RtDbError::new(
+                ErrorCode::BadRequest,
+                "vectorSearch cannot be combined with any other terminal",
+            ));
+        }
+        if let Some(filter) = &vector.filter {
+            let fields: BTreeSet<String> = table_def.fields.keys().cloned().collect();
+            validate_filter(filter, &fields)?;
+        }
+        let mut rows: Vec<Value> = self.collect_all(&q.table);
+        if let Some(filter) = &vector.filter {
+            rows.retain(|d| matches_filter(filter, d));
+        }
+        rows.truncate(vector.limit as usize);
+        Ok(Value::Array(rows))
     }
 }
 
