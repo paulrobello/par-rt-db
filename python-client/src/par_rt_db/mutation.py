@@ -10,7 +10,7 @@ Wire shapes (load-bearing — match the server exactly):
 * ``Step`` is tagged by ``op`` (camelCase variants: ``insert``/``patch``/
   ``replace``/``delete``/``expectVersion``/``expectAbsent``/``upsert``) with
   ``deny_unknown_fields`` mirrored via ``extra="forbid"``.
-* ``Transaction`` is ``{"steps": Step[]}``; the server caps at 256 steps —
+* ``Transaction`` is ``{"steps": Step[]}``; the server caps at 1024 steps —
   enforced client-side by the builder so an over-cap transaction never reaches
   the wire.
 * ``StepResult`` is untagged: ``{"id", "inserted"}`` (upsert) beats ``{"id"}``
@@ -32,12 +32,13 @@ from typing import Annotated, Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, model_serializer
 from pydantic_core.core_schema import SerializerFunctionWrapHandler
 
+from .errors import ErrorCode, RtDbError
 from .wire import FilterExpr, to_camel
 
-#: Client-side cap on transaction length. Mirrors ``server/src/txn.rs::MAX_STEPS``;
-#: the server rejects anything longer, so the builder raises eagerly to keep
-#: the over-cap payload off the wire.
-MAX_STEPS = 256
+#: Client-side cap on transaction length. Mirrors ``server/src/txn.rs::MAX_STEPS``
+#: (1024); the server rejects anything longer, so the builder raises eagerly to
+#: keep the over-cap payload off the wire.
+MAX_STEPS = 1024
 
 
 class _Step(BaseModel):
@@ -155,7 +156,7 @@ Step = Annotated[
 class Transaction(BaseModel):
     """A transaction: an ordered list of steps.
 
-    The server caps the step count at 256 (``server/src/txn.rs::MAX_STEPS``);
+    The server caps the step count at 1024 (``server/src/txn.rs::MAX_STEPS``);
     the ``Mutation`` builder enforces the same cap client-side so an over-cap
     transaction never reaches the wire. Direct ``model_validate`` callers (e.g.
     parsing server-emitted payloads) bypass the builder — keep those honest by
@@ -309,7 +310,10 @@ class _MutationBuilder:
 
     def build(self) -> Transaction:
         if len(self._steps) > MAX_STEPS:
-            raise ValueError(f"transaction exceeds max {MAX_STEPS} steps")
+            raise RtDbError(
+                ErrorCode.BAD_REQUEST,
+                f"transaction exceeds max {MAX_STEPS} steps",
+            )
         return Transaction(steps=self._steps)
 
 

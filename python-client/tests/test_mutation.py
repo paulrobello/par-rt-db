@@ -9,7 +9,7 @@ Wire shapes (load-bearing — match the server exactly):
 
 * ``Step`` is tagged by ``op`` (camelCase variants: ``insert``/``patch``/
   ``replace``/``delete``/``expectVersion``/``expectAbsent``/``upsert``).
-* ``Transaction`` is ``{"steps": Step[]}``; the server caps at 256 steps.
+* ``Transaction`` is ``{"steps": Step[]}``; the server caps at 1024 steps.
 * ``StepResult`` is untagged: ``{"id", "inserted"}`` (upsert) beats ``{"id"}``
   (insert) beats ``None`` — Union variant ORDER matters (richest first), mirroring
   the rust-client's ``#[serde(untagged)]`` declaration order.
@@ -24,6 +24,7 @@ import json
 import pytest
 from pydantic import TypeAdapter, ValidationError
 
+from par_rt_db.errors import ErrorCode, RtDbError
 from par_rt_db.mutation import MAX_STEPS, Mutation, StepResult, Transaction
 from par_rt_db.wire import FilterExpr
 
@@ -130,16 +131,41 @@ def test_step_result_upsert_beats_insert_when_both_could_match():
 
 
 def test_transaction_max_steps_enforced_client_side():
-    assert MAX_STEPS == 256
+    assert MAX_STEPS == 1024
     b = Mutation.builder()
     for _ in range(MAX_STEPS):
         b.delete("t", "x")
-    # The 256-step build succeeds (boundary is inclusive — server caps at >256).
-    Mutation.builder().build()
-    # The 257th step must trip the client-side guard.
+    # The MAX_STEPS-step build succeeds (boundary is inclusive — server caps at >MAX_STEPS).
+    b.build()
+    # One more step trips the client-side guard, raised as RtDbError (BAD_REQUEST)
+    # for taxonomy consistency with the rest of the client — not a bare ValueError.
     b.delete("t", "x")
-    with pytest.raises(ValueError):
+    with pytest.raises(RtDbError) as exc_info:
         b.build()
+    assert exc_info.value.code is ErrorCode.BAD_REQUEST
+
+
+def test_transaction_accepts_more_than_256_steps():
+    # ARC-104: the server raised MAX_STEPS 256 -> 1024, but the python client
+    # still enforced the stale 256 cap in the production ``Mutation.build()``
+    # path. A 300-step transaction is legal on the server and must build
+    # client-side; only >1024 rejects.
+    b = Mutation.builder()
+    for _ in range(300):
+        b.delete("t", "x")
+    b.build()  # must not raise
+
+
+def test_transaction_max_steps_matches_wire_corpus():
+    # ARC-104: the wire-corpus ``protocol_constants.max_steps`` is the canonical
+    # agreed value across the server and all four clients. A change to the
+    # server constant without updating the corpus AND every client fails here.
+    from pathlib import Path
+
+    corpus = json.loads(
+        (Path(__file__).resolve().parents[2] / "wire-corpus" / "wire-corpus.json").read_text()
+    )
+    assert corpus["protocol_constants"]["max_steps"] == MAX_STEPS
 
 
 def test_mutation_builder_returns_self():

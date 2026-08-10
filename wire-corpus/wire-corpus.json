@@ -156,5 +156,9 @@
   ],
   "rejects_schedule_info_unknown_status": [
     { "id": "j1", "kind": "oneshot", "dueAt": 1000, "status": "queued", "createdAt": 500, "firedCount": 0 }
-  ]
+  ],
+  "protocol_constants": {
+    "$comment": "ARC-104: canonical numeric limits shared across the server and all four clients. Each client's wire-parity test asserts its internal const equals the value recorded here, so a server change (e.g. server/src/txn.rs::MAX_STEPS) requires updating this fixture AND every client, or a test fails. Server source of truth: server/src/txn.rs:22 (MAX_STEPS).",
+    "max_steps": 1024
+  }
 }

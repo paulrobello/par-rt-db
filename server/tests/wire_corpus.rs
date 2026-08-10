@@ -61,6 +61,22 @@ where
     );
 }
 
+/// The `protocol_constants` section pins agreed scalar constants across the
+/// server and all clients. A server-side change to one without a corpus update
+/// fails here (ARC-104).
+#[test]
+fn protocol_constants_match_server() {
+    let corpus = load_corpus();
+    let consts = corpus
+        .get("protocol_constants")
+        .expect("corpus missing 'protocol_constants' object");
+    assert_eq!(
+        consts["max_steps"].as_u64().unwrap(),
+        rtdb_server::txn::MAX_STEPS as u64,
+        "wire-corpus protocol_constants.max_steps must match server txn::MAX_STEPS"
+    );
+}
+
 #[test]
 fn client_messages_round_trip() {
     let corpus = load_corpus();

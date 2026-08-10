@@ -20,6 +20,7 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 
+import { MAX_STEPS } from "../src/in_memory.js";
 import type {
   AuthedUser,
   AuthedUserKind,
@@ -53,6 +54,11 @@ interface Corpus {
   rejects_authed_user_unknown_kind: unknown[];
   rejects_schedule_info_unknown_kind: unknown[];
   rejects_schedule_info_unknown_status: unknown[];
+  // ARC-104: canonical numeric limits shared across the server and all four
+  // clients. An object (not an array) — each client asserts its internal const
+  // equals the value recorded here, so a server change requires updating the
+  // corpus AND every client or a test fails.
+  protocol_constants: { max_steps: number };
 }
 
 const CORPUS_PATH = resolve(__dirname, "../../wire-corpus/wire-corpus.json");
@@ -196,4 +202,17 @@ describe("wire-corpus: rejects fixtures are JSON-stable (TS cannot reject at run
       assertJsonRoundTrip(entry);
     });
   }
+});
+
+/**
+ * ARC-104: protocol constants (MAX_STEPS) are part of the four-client wire
+ * contract. The corpus records the canonical agreed value; each client asserts
+ * its internal const matches, so the next server change to the constant fails a
+ * test in every client unless the corpus (and each client) is updated too.
+ */
+describe("wire-corpus: protocol_constants match the implementation (ARC-104)", () => {
+  const corpus = loadCorpus();
+  it("MAX_STEPS matches the canonical corpus value", () => {
+    expect(corpus.protocol_constants.max_steps).toBe(MAX_STEPS);
+  });
 });

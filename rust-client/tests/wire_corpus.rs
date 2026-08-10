@@ -336,3 +336,23 @@ fn arc004_enums_round_trip_snake_case() {
         json!("error")
     );
 }
+
+/// ARC-104: `MAX_STEPS` is part of the four-client wire contract. The corpus
+/// records the canonical agreed value; assert the rust-client's const matches,
+/// so the next server change fails a test here unless the corpus (and every
+/// client) is updated too. Gated on `in_memory` (where `MAX_STEPS` lives).
+#[cfg(feature = "in_memory")]
+#[test]
+fn protocol_constants_max_steps_matches_corpus() {
+    let corpus = load_corpus();
+    let max_steps = corpus
+        .get("protocol_constants")
+        .and_then(|v| v.get("max_steps"))
+        .and_then(Value::as_u64)
+        .expect("corpus missing protocol_constants.max_steps");
+    assert_eq!(
+        max_steps as usize,
+        par_rt_db_client::in_memory::MAX_STEPS,
+        "MAX_STEPS drifted from wire-corpus protocol_constants.max_steps"
+    );
+}

@@ -54,7 +54,7 @@ import type {
  * error rather than silently misbehaving.
  */
 
-const MAX_STEPS = 256;
+export const MAX_STEPS = 1024;
 const MAX_TAKE = 4096;
 /** Hard cap on rows a single `patchByQuery`/`deleteByQuery` step may touch.
  * Mirrors server `txn::MAX_BY_QUERY_ROWS`; a larger match set is truncated. */

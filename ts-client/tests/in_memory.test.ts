@@ -3,6 +3,7 @@ import { RtDbError } from "../src/errors.js";
 import {
   evalFilterExpr,
   InMemoryRtDbClient,
+  MAX_STEPS,
   PresenceRooms,
   validateFilter,
 } from "../src/in_memory.js";
@@ -440,6 +441,32 @@ describe("InMemoryRtDbClient — transactions", () => {
     const docs = await c.query(api.items.query().withIndex("by_status", ["todo"]).collect());
     expect(docs).toHaveLength(1);
     expect((docs[0] as { name: string }).name).toBe("a");
+  });
+
+  it("rejects a txn exceeding MAX_STEPS with BAD_REQUEST (ARC-104)", async () => {
+    // MAX_STEPS mirrors server/src/txn.rs (1024). A txn with MAX_STEPS+1 steps
+    // is rejected at the top of executeTransaction, before any step runs.
+    const c = newClient();
+    let b = mutation();
+    for (let i = 0; i <= MAX_STEPS; i++) {
+      b = b.insert("items", { name: `n${i}`, status: "todo", order: i });
+    }
+    await expect(c.mutate(b.build())).rejects.toMatchObject({
+      code: "BAD_REQUEST",
+      message: expect.stringContaining("maximum"),
+    });
+  });
+
+  it("accepts a 300-step txn (ARC-104: cap raised 256 -> 1024)", async () => {
+    // The in-memory engine previously capped at 256, rejecting a legal 300-step
+    // txn. With MAX_STEPS=1024 it must execute.
+    const c = newClient();
+    let b = mutation();
+    for (let i = 0; i < 300; i++) {
+      b = b.insert("items", { name: `n${i}`, status: "todo", order: i });
+    }
+    const results = await c.mutate(b.build());
+    expect(results).toHaveLength(300);
   });
 });
 

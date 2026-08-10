@@ -55,7 +55,7 @@ use crate::wire::{
 };
 
 /// Maximum number of steps in a single transaction (mirrors the server cap).
-pub const MAX_STEPS: usize = 256;
+pub const MAX_STEPS: usize = 1024;
 /// Maximum rows returned from a single `take`/`collect` (mirrors the server cap).
 pub const MAX_TAKE: usize = 4096;
 /// Default/cap rows a single `patchByQuery`/`deleteByQuery` step may touch
@@ -4953,6 +4953,23 @@ mod tests {
         let err = c.mutate(&txn, None).await.unwrap_err();
         assert_eq!(err.code, ErrorCode::BadRequest);
         assert!(err.message.contains("maximum"), "got: {}", err.message);
+    }
+
+    #[tokio::test]
+    async fn txn_accepts_more_than_256_steps() {
+        // ARC-104: the server raised MAX_STEPS 256 -> 1024; the in-memory engine
+        // must accept a 300-step txn (previously over the stale 256 cap).
+        let mut c = new_client();
+        let mut m = Mutation::new();
+        for i in 0..300 {
+            m = m.insert(
+                "items",
+                json!({"name": format!("n{i}"), "status": "todo", "order": i}),
+            );
+        }
+        let txn = m.build();
+        let results = c.mutate(&txn, None).await.expect("300-step txn accepted");
+        assert_eq!(results.len(), 300);
     }
 
     #[tokio::test]

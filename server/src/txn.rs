@@ -19,7 +19,7 @@ use crate::schema::{
 /// (one step, server-side row cap) over unrolling per-id steps — that keeps a
 /// txn under this limit AND avoids client-side read-all-then-patch patterns.
 /// Raise further only if a measured workload genuinely needs >1024 atomic steps.
-const MAX_STEPS: usize = 1024;
+pub const MAX_STEPS: usize = 1024;
 
 /// Hard cap on the number of rows a single `PatchByQuery`/`DeleteByQuery` step
 /// may touch. A per-step safety backstop (these steps can affect many rows,
