@@ -1151,97 +1151,7 @@ class InMemoryRtDbClient:
         # field-bearing ops (SQL NULL semantics); an empty scalar set -> None
         # (count -> 0); groups are ordered by key asc and capped by MAX_TAKE.
         if q.aggregate is not None:
-            agg = q.aggregate
-            eq_len = len(typed_eq)
-            # `count` aggregates rows and consumes no aggregate field.
-            needs_field = agg.op != AggregateOp.COUNT
-
-            # Resolve the group field: groupBy always needs one index field
-            # beyond the eq prefix.
-            if agg.group_by:
-                if index_def is None or eq_len >= len(index_def.fields):
-                    raise RtDbError(
-                        ErrorCode.BAD_REQUEST,
-                        "aggregate groupBy requires an index field beyond the eq prefix",
-                    )
-                group_field = index_def.fields[eq_len]
-            else:
-                group_field = None
-
-            # Resolve the aggregate field (count consumes none; the rest need
-            # one beyond the eq prefix, or two when grouped).
-            if needs_field:
-                if index_def is None:
-                    raise RtDbError(
-                        ErrorCode.BAD_REQUEST,
-                        "aggregate requires an index field beyond the eq prefix",
-                    )
-                if agg.group_by:
-                    if eq_len + 1 >= len(index_def.fields):
-                        raise RtDbError(
-                            ErrorCode.BAD_REQUEST,
-                            "aggregate groupBy requires two index fields beyond the eq prefix",
-                        )
-                    agg_field = index_def.fields[eq_len + 1]
-                else:
-                    if eq_len >= len(index_def.fields):
-                        raise RtDbError(
-                            ErrorCode.BAD_REQUEST,
-                            "aggregate requires an index field beyond the eq prefix",
-                        )
-                    agg_field = index_def.fields[eq_len]
-                agg_pg = _pg_for_field(table_def, agg_field)
-                if agg.op in (AggregateOp.SUM, AggregateOp.AVG) and agg_pg not in (_NUMBER, _INT64):
-                    raise RtDbError(
-                        ErrorCode.BAD_REQUEST,
-                        f"aggregate op {agg.op} requires a numeric index field",
-                    )
-            else:
-                agg_field = None
-                agg_pg = _TEXT  # unused for count
-
-            if group_field is not None:
-                group_pg = _pg_for_field(table_def, group_field)
-                groups: list[tuple[Any, list[Any]]] = []
-                group_index: dict[str, int] = {}
-                for row in filtered:
-                    k = row.doc.get(group_field)
-                    if k is None:
-                        continue
-                    key = _dedupe_key(k)
-                    i = group_index.get(key)
-                    if i is None:
-                        i = len(groups)
-                        group_index[key] = i
-                        groups.append((k, []))
-                    if agg_field is not None:
-                        av = row.doc.get(agg_field)
-                        if av is not None:
-                            groups[i][1].append(av)
-                    else:
-                        # count: every row in the group counts (COUNT(*)).
-                        groups[i][1].append(1)
-                if agg.op == AggregateOp.COUNT:
-                    out: list[dict[str, Any]] = [{"key": k, "value": len(vs)} for k, vs in groups]
-                else:
-                    out = [
-                        {"key": k, "value": _apply_aggregate(agg.op, vs, agg_pg) if vs else None}
-                        for k, vs in groups
-                    ]
-                out.sort(
-                    key=cmp_to_key(lambda a, b: _compare_index_values(a["key"], b["key"], group_pg))
-                )
-                return out[:MAX_TAKE]
-            # Scalar path: count returns the matching-row count (0 if none);
-            # the field-bearing ops reduce their non-null agg values (None if empty).
-            if agg.op == AggregateOp.COUNT:
-                return len(filtered)
-            assert agg_field is not None  # needs_field is True for every non-count op
-            agg_values = [row.doc.get(agg_field) for row in filtered]
-            agg_values = [v for v in agg_values if v is not None]
-            if not agg_values:
-                return None
-            return _apply_aggregate(agg.op, agg_values, agg_pg)
+            return self._execute_aggregate_terminal(q, table_def, index_def, typed_eq, filtered)
 
         # Sort keys: unbound index fields (after the eq prefix), then
         # _creationTime, then _id. The unique id tiebreaker makes the order total.
@@ -1489,6 +1399,120 @@ class InMemoryRtDbClient:
                 distinct_values.append(v)
         distinct_values.sort(key=cmp_to_key(lambda a, b: _compare_index_values(a, b, field_pg)))
         return distinct_values[:MAX_TAKE]
+
+    def _execute_aggregate_terminal(
+        self,
+        q: Query,
+        table_def: TableDef,
+        index_def: IndexDef | None,
+        typed_eq: list[Any],
+        filtered: list[StoredRow],
+    ) -> Any:
+        """``aggregate`` terminal: ``<OP>`` over the index field after the eq
+        prefix (``groupBy``: group by that field, aggregate the next).
+
+        ``count`` aggregates rows, not a field — it consumes no aggregate index
+        field (a scalar ``count`` needs no index at all; a grouped ``count``
+        needs one index field beyond the eq prefix to group by). Null agg
+        values are skipped for the field-bearing ops (SQL ``NULL`` semantics);
+        an empty scalar set -> ``None`` (``count`` -> ``0``); groups are ordered
+        by key asc and capped by ``MAX_TAKE``.
+
+        Lift of the former inline ``if q.aggregate is not None:`` arm of
+        :meth:`run_query`; mirrors ``ts-client``'s ``executeAggregateTerminal``.
+        """
+        agg = q.aggregate
+        assert agg is not None  # caller dispatches only when set
+        eq_len = len(typed_eq)
+        # `count` aggregates rows and consumes no aggregate field.
+        needs_field = agg.op != AggregateOp.COUNT
+
+        # Resolve the group field: groupBy always needs one index field
+        # beyond the eq prefix.
+        if agg.group_by:
+            if index_def is None or eq_len >= len(index_def.fields):
+                raise RtDbError(
+                    ErrorCode.BAD_REQUEST,
+                    "aggregate groupBy requires an index field beyond the eq prefix",
+                )
+            group_field = index_def.fields[eq_len]
+        else:
+            group_field = None
+
+        # Resolve the aggregate field (count consumes none; the rest need
+        # one beyond the eq prefix, or two when grouped).
+        if needs_field:
+            if index_def is None:
+                raise RtDbError(
+                    ErrorCode.BAD_REQUEST,
+                    "aggregate requires an index field beyond the eq prefix",
+                )
+            if agg.group_by:
+                if eq_len + 1 >= len(index_def.fields):
+                    raise RtDbError(
+                        ErrorCode.BAD_REQUEST,
+                        "aggregate groupBy requires two index fields beyond the eq prefix",
+                    )
+                agg_field = index_def.fields[eq_len + 1]
+            else:
+                if eq_len >= len(index_def.fields):
+                    raise RtDbError(
+                        ErrorCode.BAD_REQUEST,
+                        "aggregate requires an index field beyond the eq prefix",
+                    )
+                agg_field = index_def.fields[eq_len]
+            agg_pg = _pg_for_field(table_def, agg_field)
+            if agg.op in (AggregateOp.SUM, AggregateOp.AVG) and agg_pg not in (_NUMBER, _INT64):
+                raise RtDbError(
+                    ErrorCode.BAD_REQUEST,
+                    f"aggregate op {agg.op} requires a numeric index field",
+                )
+        else:
+            agg_field = None
+            agg_pg = _TEXT  # unused for count
+
+        if group_field is not None:
+            group_pg = _pg_for_field(table_def, group_field)
+            groups: list[tuple[Any, list[Any]]] = []
+            group_index: dict[str, int] = {}
+            for row in filtered:
+                k = row.doc.get(group_field)
+                if k is None:
+                    continue
+                key = _dedupe_key(k)
+                i = group_index.get(key)
+                if i is None:
+                    i = len(groups)
+                    group_index[key] = i
+                    groups.append((k, []))
+                if agg_field is not None:
+                    av = row.doc.get(agg_field)
+                    if av is not None:
+                        groups[i][1].append(av)
+                else:
+                    # count: every row in the group counts (COUNT(*)).
+                    groups[i][1].append(1)
+            if agg.op == AggregateOp.COUNT:
+                out: list[dict[str, Any]] = [{"key": k, "value": len(vs)} for k, vs in groups]
+            else:
+                out = [
+                    {"key": k, "value": _apply_aggregate(agg.op, vs, agg_pg) if vs else None}
+                    for k, vs in groups
+                ]
+            out.sort(
+                key=cmp_to_key(lambda a, b: _compare_index_values(a["key"], b["key"], group_pg))
+            )
+            return out[:MAX_TAKE]
+        # Scalar path: count returns the matching-row count (0 if none);
+        # the field-bearing ops reduce their non-null agg values (None if empty).
+        if agg.op == AggregateOp.COUNT:
+            return len(filtered)
+        assert agg_field is not None  # needs_field is True for every non-count op
+        agg_values = [row.doc.get(agg_field) for row in filtered]
+        agg_values = [v for v in agg_values if v is not None]
+        if not agg_values:
+            return None
+        return _apply_aggregate(agg.op, agg_values, agg_pg)
 
     def run(self, q: Query, model: type = dict) -> Any:
         """Typed wrapper around :meth:`run_query` that deserializes the result
