@@ -1998,52 +1998,7 @@ export class InMemoryRtDbClient {
     // callers learn about invalid combinations here instead of silently getting
     // the wrong (unranked) result and then a 400 from the real server.
     if (q.vectorSearch !== undefined) {
-      if (
-        q.index !== undefined ||
-        eq.length > 0 ||
-        hasRange ||
-        q.order !== undefined ||
-        q.unique ||
-        q.first ||
-        q.count ||
-        q.distinct ||
-        q.aggregate !== undefined ||
-        q.paginate !== undefined ||
-        q.filter !== undefined ||
-        q.search !== undefined ||
-        q.take !== undefined ||
-        q.hybridSearch !== undefined
-      ) {
-        throw new RtDbError(
-          "BAD_REQUEST",
-          "vectorSearch cannot be combined with any other terminal",
-        );
-      }
-      const vs = q.vectorSearch;
-      const vectorDef = tableDef.indexes?.find((i) => i.name === vs.index && i.vector);
-      if (!vectorDef) {
-        throw new RtDbError("BAD_REQUEST", `vector index '${vs.index}' not found`);
-      }
-      // Validate the vector-search-level filter against declared fields once
-      // (mirrors server `compile_filter` composed into the vector WHERE) via the
-      // SAME evaluator `search` uses. The in-memory replica does not rank by
-      // vector distance, so it returns filter-narrowed candidates in insertion
-      // order (a deterministic stand-in that exercises the filter path); the
-      // real server ranks by the index's distance metric.
-      if (vs.filter) {
-        validateFilter(vs.filter, new Set(Object.keys(tableDef.fields)));
-      }
-      const out: unknown[] = [];
-      for (const row of this.rowsFor(q.table).values()) {
-        if (vs.filter && !evalFilterExpr(vs.filter, row.doc)) {
-          continue;
-        }
-        out.push(row.doc);
-        if (out.length >= vs.limit) {
-          break;
-        }
-      }
-      return out;
+      return this.executeVectorSearchTerminal(q, tableDef, eq, hasRange);
     }
 
     // Hybrid search terminal. Cascade mirror of server `execute_query`:
@@ -2470,6 +2425,60 @@ export class InMemoryRtDbClient {
     }
     const row = this.rowsFor(q.table).get(q.get!);
     return row ? this.mergeDoc(row) : null;
+  }
+
+  /** `vectorSearch` terminal: filter-narrowed candidates (in-memory does not
+   * rank by vector distance). Verbatim lift of the former inline
+   * `if (q.vectorSearch !== undefined) { ... }` arm. */
+  private executeVectorSearchTerminal(
+    q: QueryJson,
+    tableDef: TableJson,
+    eq: unknown[],
+    hasRange: boolean,
+  ): unknown {
+    if (
+      q.index !== undefined ||
+      eq.length > 0 ||
+      hasRange ||
+      q.order !== undefined ||
+      q.unique ||
+      q.first ||
+      q.count ||
+      q.distinct ||
+      q.aggregate !== undefined ||
+      q.paginate !== undefined ||
+      q.filter !== undefined ||
+      q.search !== undefined ||
+      q.take !== undefined ||
+      q.hybridSearch !== undefined
+    ) {
+      throw new RtDbError("BAD_REQUEST", "vectorSearch cannot be combined with any other terminal");
+    }
+    const vs = q.vectorSearch!;
+    const vectorDef = tableDef.indexes?.find((i) => i.name === vs.index && i.vector);
+    if (!vectorDef) {
+      throw new RtDbError("BAD_REQUEST", `vector index '${vs.index}' not found`);
+    }
+    // Validate the vector-search-level filter against declared fields once
+    // (mirrors server `compile_filter` composed into the vector WHERE) via the
+    // SAME evaluator `search` uses. The in-memory replica does not rank by
+    // vector distance, so it returns filter-narrowed candidates in insertion
+    // order (a deterministic stand-in that exercises the filter path); the
+    // real server ranks by the index's distance metric.
+    if (vs.filter) {
+      validateFilter(vs.filter, new Set(Object.keys(tableDef.fields)));
+    }
+    const out: unknown[] = [];
+    for (const row of this.rowsFor(q.table).values()) {
+      if (vs.filter && !evalFilterExpr(vs.filter, row.doc)) {
+        continue;
+      }
+      out.push(row.doc);
+      if (out.length >= vs.limit) {
+        break;
+      }
+    }
+    return out;
   }
 
   /** Merges a stored row with its system fields — a port of server `merge_doc`. */
