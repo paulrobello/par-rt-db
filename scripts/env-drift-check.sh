@@ -37,30 +37,27 @@ echo "env-drift-check: all $(echo "$documented" | wc -l | tr -d ' ') documented 
 # knows about `.env.example`. A `Config::from_env` key that is neither in
 # `.env.example` nor in docker-compose.yml would slip past it and silently keep
 # its code default in every docker deploy. This second pass closes that gap by
-# diffing every `std::env::var("RTDB_*")` call in config.rs against the
-# forwarded set.
+# diffing every `std::env::var("RTDB_*")` call across server/src/ (not just
+# config.rs — RTDB_ADMIN_EMAILS is read at main.rs) against the forwarded set.
 #
 # A short exempt list documents the keys that are intentionally defaulted in the
 # docker deploy — adding to this list requires a comment explaining why the code
 # default is the right value to ship with (not just "we forgot"). New keys
 # added to `Config::from_env` are NOT exempt and must be added to
 # docker-compose.yml at the same PR or this check fails.
+#
+# Every production RTDB_* key is forwarded with a code-matching default
+# (DOC2-001 / DOC2-019). The only exemptions are test-only keys.
 exempt=$(cat <<'EOF'
-RTDB_BACKUP_CRON
-RTDB_BACKUP_DIR
-RTDB_BACKUP_ENABLED
-RTDB_BACKUP_RETENTION
-RTDB_POOL_MAX_CONNECTIONS
-RTDB_PRESENCE_MAX_TTL_MS
-RTDB_RATE_LIMIT_PER_DB_RPM
-RTDB_RATE_LIMIT_PER_TOKEN_RPM
-RTDB_TTL_BATCH
-RTDB_TTL_SWEEP_INTERVAL_SECS
+RTDB_TEST_DATABASE_URL
 EOF
 )
+# RTDB_TEST_DATABASE_URL: read only inside #[cfg(test)] blocks in backup.rs
+# (integration tests point it at the dev Postgres). Not a production knob —
+# must never be forwarded to the docker deploy.
 
-# Pull every RTDB_* key that Config::from_env actually reads.
-read_in_code=$(grep -oE 'std::env::var\("RTDB_[A-Z_]+"\)' server/src/config.rs \
+# Pull every RTDB_* key the server reads (config.rs + main.rs + any module).
+read_in_code=$(grep -roE 'std::env::var\("RTDB_[A-Z_]+"\)' server/src/ \
   | sed -E 's/.*"(.+)".*/\1/' | sort -u)
 
 # Subtract the forwarded set and the exempt list. Anything left is a key the
@@ -75,7 +72,7 @@ missing_from_code=$(comm -23 \
   | grep -v '^$' || true)
 
 if [ -n "$missing_from_code" ]; then
-  echo "env drift: read by Config::from_env but NOT forwarded in docker-compose.yml and NOT on the exempt list:" >&2
+  echo "env drift: read by the server but NOT forwarded in docker-compose.yml and NOT on the exempt list:" >&2
   echo "$missing_from_code" | sed 's/^/  - /' >&2
   echo >&2
   echo "Either add each to docker-compose.yml's 'environment:' block with the code default," >&2
@@ -83,4 +80,4 @@ if [ -n "$missing_from_code" ]; then
   exit 1
 fi
 
-echo "env-drift-check: all $(echo "$read_in_code" | wc -l | tr -d ' ') Config::from_env keys are forwarded or explicitly exempt"
+echo "env-drift-check: all $(echo "$read_in_code" | wc -l | tr -d ' ') server-read RTDB_* keys are forwarded or explicitly exempt"

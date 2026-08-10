@@ -71,6 +71,7 @@ gitignored and rebuilt on demand.
 `make checkall` is the **definition of done**. It must pass before commit. It
 runs, across all six packages:
 
+- `env-drift-check` — fails first if a `RTDB_*` var documented in `.env.example` or read by the server is not forwarded to the container by `docker-compose.yml`'s `environment:` block
 - `fmt-check` — formatting check (cargo fmt, bun fmt-check, ruff format --check)
 - `lint` — `cargo clippy --all-targets --all-features -- -D warnings`, `bun run lint`, `uv run ruff check .`
 - `typecheck` — `cargo check`, `bun run typecheck`, `uv run pyright`
@@ -239,7 +240,7 @@ Before requesting review:
 - [ ] No real secrets in the diff. `pre-commit` (gitleaks) is installed and passes.
 - [ ] Commit messages follow Conventional Commits.
 - [ ] Relevant docs (`README`, `FEATURE_MATRIX`, `CHANGELOG`, package READMEs) are updated.
-- [ ] If the change adds or renames an env var, `.env.example` and the root README Configuration table are updated.
+- [ ] If the change adds or renames an env var, `.env.example`, `docker-compose.yml`'s `environment:` block (the allowlist that actually feeds the container), and the root README Configuration table are updated — `make env-drift-check` (first stage of `checkall`) guards this.
 - [ ] If the change adds a route, the root README Endpoints table and `server/README.md` are updated.
 
 When the PR lands, **rebase onto the latest target branch before merging** so

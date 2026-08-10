@@ -125,6 +125,31 @@ services:
       RTDB_PRESENCE_MAX_ROOM_BYTES: ${RTDB_PRESENCE_MAX_ROOM_BYTES:-256}
       RTDB_PRESENCE_BROADCAST_INTERVAL_MS: ${RTDB_PRESENCE_BROADCAST_INTERVAL_MS:-50}
       RTDB_PRESENCE_UPDATE_LIMIT_PER_SEC: ${RTDB_PRESENCE_UPDATE_LIMIT_PER_SEC:-20}
+      # Upper bound on a client-supplied presenceState ttlMs (over-cap is
+      # rejected, not clamped). Mirrors the server's code default.
+      RTDB_PRESENCE_MAX_TTL_MS: ${RTDB_PRESENCE_MAX_TTL_MS:-300000}
+      # Postgres connection-pool ceiling. Multi-tenant default (75): the
+      # committer-per-db model holds a connection per active db during fan-out,
+      # so the pool must scale with the number of active databases.
+      RTDB_POOL_MAX_CONNECTIONS: ${RTDB_POOL_MAX_CONNECTIONS:-75}
+      # HTTP rate limiting (fixed-window, in-memory). 0 = unlimited (default).
+      # Per-machine-token caps each token; per-db is shared across all principals
+      # of one database. OAuth sessions carry no token id and are rate-limited
+      # per-db only.
+      RTDB_RATE_LIMIT_PER_TOKEN_RPM: ${RTDB_RATE_LIMIT_PER_TOKEN_RPM:-0}
+      RTDB_RATE_LIMIT_PER_DB_RPM: ${RTDB_RATE_LIMIT_PER_DB_RPM:-0}
+      # Document TTL reaper. Sweep cadence per db and rows deleted per
+      # table per sweep. Best-effort, boot-only. Defaults mirror the server.
+      RTDB_TTL_SWEEP_INTERVAL_SECS: ${RTDB_TTL_SWEEP_INTERVAL_SECS:-60}
+      RTDB_TTL_BATCH: ${RTDB_TTL_BATCH:-5000}
+      # Managed pg_dump backup scheduler (off by default). Flip RTDB_BACKUP_ENABLED
+      # to true for daily 03:00 UTC dumps into RTDB_BACKUP_DIR, keeping the newest
+      # RTDB_BACKUP_RETENTION. The docker image installs postgresql-client so
+      # pg_dump is present. See deploy/README.md §Backups.
+      RTDB_BACKUP_ENABLED: ${RTDB_BACKUP_ENABLED:-false}
+      RTDB_BACKUP_CRON: ${RTDB_BACKUP_CRON:-0 3 * * *}
+      RTDB_BACKUP_DIR: ${RTDB_BACKUP_DIR:-./backups}
+      RTDB_BACKUP_RETENTION: ${RTDB_BACKUP_RETENTION:-7}
       RUST_LOG: ${RUST_LOG:-info}
     ports:
       - "127.0.0.1:8300:8300"

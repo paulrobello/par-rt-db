@@ -71,6 +71,11 @@ async fn main() {
         tokio::spawn(rtdb_server::backup::run_backup_task(
             db_url, dir, cron, retention,
         ));
+    } else {
+        tracing::info!(
+            "managed backups are disabled (RTDB_BACKUP_ENABLED is false); \
+             no scheduled pg_dump will run — set RTDB_BACKUP_ENABLED=true to enable"
+        );
     }
 
     let admin_emails: Vec<String> = match std::env::var("RTDB_ADMIN_EMAILS") {
