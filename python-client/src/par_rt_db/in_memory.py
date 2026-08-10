@@ -1192,18 +1192,7 @@ class InMemoryRtDbClient:
                 q.paginate, table_def, filtered, sort_cols, col_types, direction
             )
 
-        if unique:
-            if len(filtered) > 1:
-                raise RtDbError(
-                    ErrorCode.PRECONDITION_FAILED,
-                    "unique query matched multiple documents",
-                )
-            return _merge_doc(filtered[0]) if filtered else None
-        if first:
-            return _merge_doc(filtered[0]) if filtered else None
-
-        limit = q.take if q.take is not None else MAX_TAKE
-        return [_merge_doc(row) for row in filtered[:limit]]
+        return self._execute_collect_terminal(q, filtered)
 
     def _execute_get_terminal(self, q: Query, eq: list[Any], has_range: bool) -> Any:
         """``get(id)`` terminal: point read by id, exclusive of every other clause.
@@ -1513,6 +1502,32 @@ class InMemoryRtDbClient:
         if not agg_values:
             return None
         return _apply_aggregate(agg.op, agg_values, agg_pg)
+
+    def _execute_collect_terminal(self, q: Query, filtered: list[StoredRow]) -> Any:
+        """``unique`` / ``first`` / plain ``collect`` terminal over the sorted
+        matching set.
+
+        ``unique`` returns the single match or raises ``PRECONDITION_FAILED``
+        when more than one matches (and ``None`` when none match). ``first``
+        returns the head match or ``None``. The plain path returns the first
+        ``take`` rows (default ``MAX_TAKE``).
+
+        Lift of the former inline trailing tail of :meth:`run_query` (the
+        ``if unique: … if first: … return [...]`` block); mirrors
+        ``ts-client``'s ``executeCollectTerminal``.
+        """
+        if q.unique:
+            if len(filtered) > 1:
+                raise RtDbError(
+                    ErrorCode.PRECONDITION_FAILED,
+                    "unique query matched multiple documents",
+                )
+            return _merge_doc(filtered[0]) if filtered else None
+        if q.first:
+            return _merge_doc(filtered[0]) if filtered else None
+
+        limit = q.take if q.take is not None else MAX_TAKE
+        return [_merge_doc(row) for row in filtered[:limit]]
 
     def run(self, q: Query, model: type = dict) -> Any:
         """Typed wrapper around :meth:`run_query` that deserializes the result
