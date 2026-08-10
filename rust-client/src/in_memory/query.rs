@@ -267,29 +267,7 @@ impl InMemoryRtDbClient {
         // over-approximation the ts/python clients use; result order is
         // unspecified (no ranking) so callers compare as a set.
         if let Some(hybrid) = &q.hybrid_search {
-            if q.index.is_some()
-                || !eq.is_empty()
-                || has_range
-                || q.order.is_some()
-                || q.unique
-                || q.first
-                || q.count
-                || q.distinct
-                || q.aggregate.is_some()
-                || q.paginate.is_some()
-                || q.filter.is_some()
-                || q.search.is_some()
-                || q.vector_search.is_some()
-                || q.take.is_some()
-            {
-                return Err(RtDbError::new(
-                    ErrorCode::BadRequest,
-                    "hybridSearch cannot be combined with any other terminal",
-                ));
-            }
-            let mut rows: Vec<Value> = self.collect_all(&q.table);
-            rows.truncate(hybrid.limit as usize);
-            return Ok(Value::Array(rows));
+            return self.execute_hybrid_search_terminal(q, hybrid, eq, has_range);
         }
 
         // `search` terminal — cascade mirror of server `execute_query`.
@@ -913,6 +891,45 @@ impl InMemoryRtDbClient {
             rows.retain(|d| matches_filter(filter, d));
         }
         rows.truncate(vector.limit as usize);
+        Ok(Value::Array(rows))
+    }
+
+    /// `hybridSearch` terminal — cascade mirror of server `execute_query`.
+    /// Standalone terminal like `vectorSearch`/`search`: rejects every other
+    /// peer (HYBRID_SEARCH_PEERS = all except self). In-memory replica
+    /// approximation: no pgvector distance + ts_rank blend client-side, so
+    /// every table doc is a candidate, capped at `limit`. Same
+    /// over-approximation the ts/python clients use; result order is
+    /// unspecified (no ranking) so callers compare as a set.
+    fn execute_hybrid_search_terminal(
+        &self,
+        q: &Query,
+        hybrid: &crate::wire::HybridSearchQuery,
+        eq: &[Value],
+        has_range: bool,
+    ) -> Result<Value, RtDbError> {
+        if q.index.is_some()
+            || !eq.is_empty()
+            || has_range
+            || q.order.is_some()
+            || q.unique
+            || q.first
+            || q.count
+            || q.distinct
+            || q.aggregate.is_some()
+            || q.paginate.is_some()
+            || q.filter.is_some()
+            || q.search.is_some()
+            || q.vector_search.is_some()
+            || q.take.is_some()
+        {
+            return Err(RtDbError::new(
+                ErrorCode::BadRequest,
+                "hybridSearch cannot be combined with any other terminal",
+            ));
+        }
+        let mut rows: Vec<Value> = self.collect_all(&q.table);
+        rows.truncate(hybrid.limit as usize);
         Ok(Value::Array(rows))
     }
 }
