@@ -1239,8 +1239,12 @@ impl InMemoryRtDbClient {
         // `vectorSearch` terminal — cascade mirror of server `execute_query`.
         // No in-memory ranking; return an empty array so the cascade agrees
         // with the server without silently misranking by falling through to
-        // the collect path.
-        if q.vector_search.is_some() {
+        // the collect path. A carried `filter` (the db-side `FilterExpr` DSL)
+        // is validated against the table's declared fields and run through
+        // `matches_filter` on the (empty) candidate set — same narrowing path
+        // as the `search` terminal, exercised even though the stub result set
+        // stays empty.
+        if let Some(vector) = &q.vector_search {
             if q.index.is_some()
                 || !eq.is_empty()
                 || has_range
@@ -1257,7 +1261,15 @@ impl InMemoryRtDbClient {
                     "vectorSearch cannot be combined with any other terminal",
                 ));
             }
-            return Ok(Value::Array(Vec::new()));
+            if let Some(filter) = &vector.filter {
+                let fields: BTreeSet<String> = table_def.fields.keys().cloned().collect();
+                validate_filter(filter, &fields)?;
+            }
+            let mut rows: Vec<Value> = Vec::new();
+            if let Some(filter) = &vector.filter {
+                rows.retain(|d| matches_filter(filter, d));
+            }
+            return Ok(Value::Array(rows));
         }
 
         // `search` terminal — same reasoning as `vectorSearch`: no in-memory
@@ -4016,11 +4028,10 @@ fn require_index<'a>(table_def: &'a TableDef, name: &str) -> Result<&'a IndexDef
 mod tests {
     use super::*;
     use crate::mutation::Mutation;
-    use crate::query::{Paginate, Paginated, SearchOpts, TableQuery};
+    use crate::query::{Paginate, Paginated, SearchOpts, TableQuery, VectorSearchOpts};
     use crate::schema::{Schema, Table};
     use crate::wire::{AggregateOp, AggregateSpec, FilterExpr};
     use serde_json::json;
-    use std::collections::BTreeMap;
     use std::sync::{Arc, Mutex};
 
     /// The test schema mirrored from `ts-client/tests/in_memory.test.ts:10-20`.
@@ -6885,7 +6896,7 @@ mod tests {
         let v = c
             .run::<Vec<Value>>(
                 &TableQuery::new("items")
-                    .vector_search("by_embedding", vec![1.0, 0.0, 0.0], 5, BTreeMap::new())
+                    .vector_search("by_embedding", vec![1.0, 0.0, 0.0], 5, ())
                     .build(),
             )
             .expect("vector stub");
@@ -6902,7 +6913,7 @@ mod tests {
                     index: "by_embedding".into(),
                     vector: vec![1.0],
                     limit: 5,
-                    filter: BTreeMap::new(),
+                    filter: None,
                 }),
                 index: Some("by_name".into()),
                 ..Default::default()
@@ -6913,6 +6924,60 @@ mod tests {
             err.message.contains("vectorSearch cannot be combined"),
             "got: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn query_vector_search_with_filter_returns_empty_after_narrowing() {
+        // No in-memory vector ranking, so the vector stub stays empty; the
+        // carried `filter` (a `FilterExpr`) is still validated and run through
+        // `matches_filter` on the (empty) candidate set, exercising the same
+        // narrowing path as the `search` terminal.
+        let c = new_client();
+        let v = c
+            .run::<Vec<Value>>(
+                &TableQuery::new("items")
+                    .vector_search(
+                        "by_embedding",
+                        vec![1.0, 0.0, 0.0],
+                        5,
+                        VectorSearchOpts {
+                            filter: Some(FilterExpr::Eq {
+                                field: "status".into(),
+                                value: "done".into(),
+                            }),
+                        },
+                    )
+                    .build(),
+            )
+            .expect("vector search with filter narrows cleanly");
+        assert!(v.is_empty(), "vector stub still returns [] after narrowing");
+    }
+
+    #[tokio::test]
+    async fn query_vector_search_with_unknown_filter_field_is_bad_request() {
+        // The vector-search filter runs through `validate_filter` against the
+        // table's declared fields, so an unknown field surfaces as BadRequest
+        // before the (stub) result is returned.
+        let c = new_client();
+        let err = c
+            .run::<Vec<Value>>(
+                &TableQuery::new("items")
+                    .vector_search(
+                        "by_embedding",
+                        vec![1.0, 0.0, 0.0],
+                        5,
+                        VectorSearchOpts {
+                            filter: Some(FilterExpr::Eq {
+                                field: "nonexistent".into(),
+                                value: "x".into(),
+                            }),
+                        },
+                    )
+                    .build(),
+            )
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::BadRequest);
+        assert!(err.message.contains("nonexistent"), "got: {err}");
     }
 
     // ---- filter: eval_filter_expr + validate_filter ----------------

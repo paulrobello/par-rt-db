@@ -6,8 +6,8 @@ These mirror the on-the-wire JSON shapes defined by:
 and cross-checked against ts-client/src/protocol.ts and rust-client/src/wire.rs.
 
 Discriminator field names are load-bearing: FilterExpr is tagged by ``op`` (not
-``type``), and ``VectorSearchQuery.filter`` is an eq-map (``Record<string, unknown>``),
-not a nested ``FilterExpr``.
+``type``), and ``VectorSearchQuery.filter`` is the same full ``FilterExpr`` that
+``SearchQuery.filter`` is (omitted on the wire when ``None``).
 """
 
 import pytest
@@ -173,18 +173,28 @@ def test_vector_search_query_omits_filter_when_none() -> None:
     assert "filter" not in out
 
 
-def test_vector_search_query_omits_filter_when_empty() -> None:
-    # Server uses BTreeMap::is_empty — empty filter must also drop.
-    vq = VectorSearchQuery.model_validate({"index": "v", "vector": [0.1], "limit": 1, "filter": {}})
-    assert "filter" not in vq.model_dump(by_alias=True, mode="json")
-
-
-def test_vector_search_query_keeps_filter_when_non_empty() -> None:
+def test_vector_search_query_keeps_full_filter_expr() -> None:
+    # vectorSearch.filter is the full FilterExpr (the same type search uses);
+    # it round-trips byte-identical when present.
     vq = VectorSearchQuery.model_validate(
-        {"index": "v", "vector": [0.1], "limit": 1, "filter": {"status": "active"}}
+        {
+            "index": "v",
+            "vector": [0.1],
+            "limit": 1,
+            "filter": {"op": "eq", "field": "status", "value": "active"},
+        }
     )
     out = vq.model_dump(by_alias=True, mode="json")
-    assert out["filter"] == {"status": "active"}
+    assert out["filter"] == {"op": "eq", "field": "status", "value": "active"}
+
+
+def test_vector_search_query_rejects_eq_map_filter() -> None:
+    # The old eq-map shape (a bare field→value dict) is no longer valid: filter
+    # must be a tagged FilterExpr. A plain dict without an ``op`` is rejected.
+    with pytest.raises(ValidationError):
+        VectorSearchQuery.model_validate(
+            {"index": "v", "vector": [0.1], "limit": 1, "filter": {"status": "active"}}
+        )
 
 
 def test_hybrid_search_query_omits_optionals_when_absent() -> None:

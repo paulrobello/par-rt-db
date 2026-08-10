@@ -288,7 +288,6 @@ mod tests {
     use crate::query::TableQuery;
     use crate::wire::FilterExpr;
     use serde_json::json;
-    use std::collections::BTreeMap;
 
     fn collect_query() -> Query {
         TableQuery::new("items").collect()
@@ -464,7 +463,7 @@ mod tests {
                 .search("search_idx", "query", ())
                 .take(5),
             TableQuery::new("items")
-                .vector_search("vec_idx", vec![1.0, 0.0], 5, BTreeMap::new())
+                .vector_search("vec_idx", vec![1.0, 0.0], 5, ())
                 .take(5),
         ];
         for q in terminals {

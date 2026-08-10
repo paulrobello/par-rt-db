@@ -17,11 +17,12 @@ index eq + range queries with order/take/unique/first/count, filter expressions,
 keyset-cursor pagination, reactive subscriptions, and scheduled-job ``tick``).
 ``distinct``/``aggregate``/``vectorSearch``/``hybridSearch`` are NOT implemented:
 the first two raise :class:`RtDbError` ``BAD_REQUEST`` (stricter than the Rust
-harness, which silently falls through to ``collect`` for them), and the
-vector/hybrid terminals return an empty list after the same combination guards
-the server enforces — there is no in-memory vector ranking. ``search`` applies
-its optional ``filter`` (every table row is a candidate — ts_rank is not modeled)
-but otherwise does not rank.
+harness, which silently falls through to ``collect`` for them). ``vectorSearch``
+applies its optional ``filter`` but does not rank by vector similarity (every
+table row is a candidate — the sound over-approximation); ``hybridSearch``
+returns an empty list after the same combination guards the server enforces.
+``search`` applies its optional ``filter`` (every table row is a candidate —
+ts_rank is not modeled) but otherwise does not rank.
 
 Simplifications vs. the live server (be explicit when relying on these):
 
@@ -881,8 +882,10 @@ class InMemoryRtDbClient:
         * ``take`` / ``collect`` → ``list`` of merged docs.
         * ``paginate`` → ``{"docs": [...], "nextCursor"?: str}``.
         * ``search`` → list of merged docs narrowed by the terminal's optional
-          ``filter`` (ranking is not modeled — every table row is a candidate;
-          ``vectorSearch`` still returns an empty list).
+          ``filter`` (ranking is not modeled — every table row is a candidate).
+        * ``vectorSearch`` → list of merged docs narrowed by the terminal's
+          optional ``filter`` (vector similarity is not modeled — every table
+          row is a candidate; ``hybridSearch`` still returns an empty list).
 
         ``filter`` is structurally validated once up front, then evaluated per
         row. See the module docs for the unimplemented terminals.
@@ -1010,8 +1013,14 @@ class InMemoryRtDbClient:
                     ErrorCode.BAD_REQUEST, "aggregate cannot be combined with hybrid search"
                 )
 
-        # `vectorSearch` terminal — no in-memory ranking; return an empty array
-        # so the cascade agrees with the server without silently misranking.
+        # `vectorSearch` terminal — no in-memory vector ranking; every row in
+        # the table is treated as a candidate (the sound over-approximation — a
+        # real match can never be excluded, mirroring the `search` stub's
+        # treatment of ts_rank). A declared `filter` narrows that candidate set
+        # via the same `_eval_filter_expr` the db-side `.filter()` uses, so the
+        # narrowing path is exercised end-to-end without modeling vector
+        # similarity. The terminal's `limit` is not applied: without ranking
+        # there is no meaningful "top N" to pick.
         if q.vector_search is not None:
             if (
                 q.index is not None
@@ -1029,7 +1038,18 @@ class InMemoryRtDbClient:
                     ErrorCode.BAD_REQUEST,
                     "vectorSearch cannot be combined with any other terminal",
                 )
-            return []
+            if q.vector_search.filter is not None:
+                _validate_filter(q.vector_search.filter, set(table_def.fields.keys()))
+            vector_candidates: list[StoredRow] = [
+                row for (t, _id), row in self._docs.items() if t == q.table
+            ]
+            if q.vector_search.filter is not None:
+                vector_candidates = [
+                    row
+                    for row in vector_candidates
+                    if _eval_filter_expr(q.vector_search.filter, row.doc)
+                ]
+            return [_merge_doc(row) for row in vector_candidates]
         if q.search is not None:
             if (
                 q.index is not None

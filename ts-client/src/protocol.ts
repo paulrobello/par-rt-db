@@ -87,12 +87,15 @@ export interface AggregateGroup {
 }
 
 /** Mirrors server `query::VectorSearchQuery` byte-for-byte (camelCase, deny_unknown_fields).
- * `filter` is an eq-map over the index's declared `filterFields`; omitted on the wire when empty. */
+ * `filter` narrows vector-search results server-side via the db-side `FilterExpr` DSL
+ * (the full type — the same one `search` and the query-level `.filter()` use, not an
+ * eq-only map over the index's `filterFields`); omitted on the wire when absent so
+ * existing requests stay byte-identical. */
 export interface VectorQuery {
   index: string;
   vector: number[];
   limit: number;
-  filter?: Record<string, unknown>;
+  filter?: FilterExpr;
 }
 
 /** Mirrors server `query::HybridSearchQuery` byte-for-byte (camelCase,

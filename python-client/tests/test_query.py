@@ -7,9 +7,8 @@ and the builder ergonomics of ``ts-client/src/query.ts`` / ``rust-client/src/que
 Two shape corrections from the upstream brief (the plan predated a wire fix):
 
 * ``FilterExpr`` discriminator is ``op`` (lowercase variant), NOT ``type``.
-* ``VectorSearchQuery.filter`` is an eq-map ``dict[str, Any]`` over the index's
-  declared ``filterFields``, NOT a nested ``FilterExpr`` (server:
-  ``filter: BTreeMap<String, Value>``).
+* ``VectorSearchQuery.filter`` is the full ``FilterExpr`` (the same type
+  ``.filter()`` and ``search`` use), omitted when ``None``.
 """
 
 import pytest
@@ -245,14 +244,35 @@ def test_query_vector_search_without_filter():
     }
 
 
-def test_query_vector_search_filter_is_eq_map():
-    # vectorSearch.filter is an eq-map dict (NOT a FilterExpr); omitted when empty.
-    v = TableQuery("t").vector_search("vidx", [1.0, 2.0], limit=3, filter_={"owner_id": "p1"})
-    out = v.build().model_dump(by_alias=True, mode="json")["vectorSearch"]
-    assert out["filter"] == {"owner_id": "p1"}
-    # Empty filter dict is dropped (server's BTreeMap::is_empty skip rule).
-    v_empty = TableQuery("t").vector_search("vidx", [1.0], limit=1, filter_={})
-    assert "filter" not in v_empty.build().model_dump(by_alias=True, mode="json")["vectorSearch"]
+def test_query_vector_search_serializes_full_filter_expr():
+    # vectorSearch's filter is the FULL FilterExpr (the same type search uses).
+    flt = _filter_adapter.validate_python(
+        {
+            "op": "and",
+            "exprs": [
+                {"op": "eq", "field": "channel", "value": "#general"},
+                {"op": "gt", "field": "createdAt", "value": 1780000000000},
+            ],
+        }
+    )
+    out = (
+        TableQuery("t")
+        .vector_search("vidx", [1.0, 2.0], limit=3, filter_=flt)
+        .build()
+        .model_dump(by_alias=True, mode="json")["vectorSearch"]
+    )
+    assert out == {
+        "index": "vidx",
+        "vector": [1.0, 2.0],
+        "limit": 3,
+        "filter": {
+            "op": "and",
+            "exprs": [
+                {"op": "eq", "field": "channel", "value": "#general"},
+                {"op": "gt", "field": "createdAt", "value": 1780000000000},
+            ],
+        },
+    }
 
 
 def test_query_hybrid_search_required_only():

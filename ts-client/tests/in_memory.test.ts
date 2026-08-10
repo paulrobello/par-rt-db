@@ -2052,6 +2052,123 @@ describe("InMemoryRtDbClient — full-text search", () => {
   });
 });
 
+describe("InMemoryRtDbClient — vector search", () => {
+  const vectorSchema = defineSchema({
+    docs: defineTable({
+      embedding: t.vector(3),
+      userId: t.string(),
+      status: t.string(),
+    }).vectorIndex("by_embedding", "embedding", 3, ["userId"]),
+  });
+  const vectorApi = createApi(vectorSchema);
+
+  function vectorClient(): InMemoryRtDbClient {
+    let ms = 1_700_000_000_000;
+    const c = new InMemoryRtDbClient({ now: () => ms++, random: () => 0 });
+    c.pushSchema(vectorSchema);
+    return c;
+  }
+
+  async function seed(c: InMemoryRtDbClient): Promise<void> {
+    await c.mutate(
+      mutation()
+        .insert("docs", { embedding: [1, 0, 0], userId: "u1", status: "open" })
+        .build(),
+    );
+    await c.mutate(
+      mutation()
+        .insert("docs", { embedding: [0, 1, 0], userId: "u2", status: "open" })
+        .build(),
+    );
+    await c.mutate(
+      mutation()
+        .insert("docs", { embedding: [0, 0, 1], userId: "u1", status: "closed" })
+        .build(),
+    );
+  }
+
+  it("narrows results by a vector-search-level filter (full FilterExpr)", async () => {
+    const c = vectorClient();
+    await seed(c);
+    // Three docs total; the eq filter on `userId` narrows to the two u1 docs.
+    const docs = (await c.query(
+      vectorApi.docs
+        .query()
+        .vectorSearch("by_embedding", [1, 0, 0], {
+          limit: 10,
+          filter: { op: "eq", field: "userId", value: "u1" },
+        })
+        .collect(),
+    )) as Array<{ userId: string }>;
+    expect(docs.map((d) => d.userId)).toEqual(["u1", "u1"]);
+  });
+
+  it("respects `limit` after applying the filter", async () => {
+    const c = vectorClient();
+    await seed(c);
+    // Two u1 docs match the filter; limit:1 returns just the first.
+    const docs = (await c.query(
+      vectorApi.docs
+        .query()
+        .vectorSearch("by_embedding", [1, 0, 0], {
+          limit: 1,
+          filter: { op: "eq", field: "userId", value: "u1" },
+        })
+        .collect(),
+    )) as Array<{ userId: string }>;
+    expect(docs).toHaveLength(1);
+    expect(docs[0].userId).toBe("u1");
+  });
+
+  it("a compound and/in filter narrows on multiple fields", async () => {
+    const c = vectorClient();
+    await seed(c);
+    // u1 + status in [open, closed] matches both u1 docs.
+    const docs = (await c.query(
+      vectorApi.docs
+        .query()
+        .vectorSearch("by_embedding", [1, 0, 0], {
+          limit: 10,
+          filter: {
+            op: "and",
+            exprs: [
+              { op: "eq", field: "userId", value: "u1" },
+              { op: "in", field: "status", values: ["closed"] },
+            ],
+          },
+        })
+        .collect(),
+    )) as Array<{ userId: string; status: string }>;
+    expect(docs.map((d) => ({ userId: d.userId, status: d.status }))).toEqual([
+      { userId: "u1", status: "closed" },
+    ]);
+  });
+
+  it("rejects a vector-search-level filter on an unknown field (BAD_REQUEST)", async () => {
+    const c = vectorClient();
+    await seed(c);
+    await expect(
+      c.query(
+        vectorApi.docs
+          .query()
+          .vectorSearch("by_embedding", [1, 0, 0], {
+            limit: 10,
+            filter: { op: "eq", field: "nope", value: "x" },
+          })
+          .collect(),
+      ),
+    ).rejects.toThrow(/filter references unknown field 'nope'/);
+  });
+
+  it("rejects an unknown vector index (BAD_REQUEST)", async () => {
+    const c = vectorClient();
+    await seed(c);
+    await expect(
+      c.query(vectorApi.docs.query().vectorSearch("nope", [1, 0, 0], { limit: 10 }).collect()),
+    ).rejects.toThrow(/vector index 'nope' not found/);
+  });
+});
+
 describe("InMemoryRtDbClient — admin surface", () => {
   it("getAudit returns seeded rows newest-first in the documented shape", async () => {
     const c = newClient();

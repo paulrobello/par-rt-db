@@ -11,9 +11,9 @@ Wire shapes (load-bearing — match the server exactly):
 * ``Query.paginate`` serializes as ``{cursor?, numItems}`` with ``cursor``
   omitted when ``None``.
 * ``Query.vectorSearch`` is the one camelCase key on ``Query`` (the server uses
-  ``#[serde(rename = "vectorSearch")]``); its ``filter`` is an eq-map
-  ``dict[str, Any]`` over the index's declared ``filterFields`` (NOT a
-  ``FilterExpr``), omitted when ``None`` or empty.
+  ``#[serde(rename = "vectorSearch")]``); its ``filter`` is the full
+  ``FilterExpr`` (the same type ``.filter()`` and ``search`` use), omitted when
+  ``None``.
 
 ``QueryResult`` arrives untagged (the server's ``#[serde(untagged)]``); this
 module re-attaches a shape via the terminal (``get``/``collect``/``first``/
@@ -203,13 +203,14 @@ class TableQuery:
         vector: list[float],
         *,
         limit: int,
-        filter_: dict[str, Any] | None = None,
+        filter_: FilterExpr | None = None,
     ) -> TableQuery:
-        """Vector-similarity terminal. ``filter_`` is an eq-map over the index's
-        declared ``filterFields`` (NOT a ``FilterExpr``); omitted when ``None``
-        or empty (mirrors the server's ``BTreeMap::is_empty`` skip rule)."""
+        """Vector-similarity terminal. ``filter_`` is a ``FilterExpr`` (the same
+        type ``.filter()`` and ``search`` use) that narrows vector-search results
+        server-side; omitted when ``None``. The trailing underscore mirrors
+        ``search``'s ``filter_`` keyword."""
         payload: dict[str, Any] = {"index": index, "vector": vector, "limit": limit}
-        if filter_:
+        if filter_ is not None:
             payload["filter"] = filter_
         self._vector = VectorSearchQuery.model_validate(payload)
         return self

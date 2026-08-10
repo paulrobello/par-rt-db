@@ -3,7 +3,6 @@
 use crate::wire::{AggregateOp, AggregateSpec, FilterExpr, SearchQuery};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -98,21 +97,18 @@ pub struct Paginated<T> {
     pub next_cursor: Option<String>,
 }
 
-/// Optional arguments for [`TableQuery::vector_search`]. Carries the eq-map
-/// `filter` over the index's declared `filterFields`; defaults to empty (no
-/// filter on the wire). `From<BTreeMap<...>>` keeps the legacy positional call
-/// (`.vector_search(idx, vec, lim, filter_map)`) compiling unchanged; `From<()>`
-/// lets callers omit it (`.vector_search(idx, vec, lim, ())`) when they have no
-/// filter — matching the ts opts-bag / python keyword-only ergonomics.
+/// Optional arguments for [`TableQuery::vector_search`]: `filter` is an
+/// optional `FilterExpr` (the db-side `filter()` DSL) that narrows the vector
+/// search `WHERE` server-side. Defaults to `None` (no filter on the wire). The
+/// vector-search filter is nested on the terminal — distinct from the top-level
+/// `.filter()` builder, which is mutually exclusive with `vectorSearch` — so
+/// callers pass it through the `.vector_search(idx, vec, lim, { filter })`
+/// opts, not a chained `.filter()`. `From<()>` lets callers omit it
+/// (`.vector_search(idx, vec, lim, ())`); a `VectorSearchOpts { filter }`
+/// literal names the field.
 #[derive(Debug, Clone, Default)]
 pub struct VectorSearchOpts {
-    pub filter: BTreeMap<String, serde_json::Value>,
-}
-
-impl From<BTreeMap<String, serde_json::Value>> for VectorSearchOpts {
-    fn from(filter: BTreeMap<String, serde_json::Value>) -> Self {
-        Self { filter }
-    }
+    pub filter: Option<FilterExpr>,
 }
 
 impl From<()> for VectorSearchOpts {
@@ -240,15 +236,17 @@ impl TableQuery {
 
     /// Vector-similarity `vectorSearch` over a declared vector index. The server
     /// ranks by cosine distance and applies the carried `limit`; `filter` is an
-    /// eq-map over the index's declared `filterFields`. Standalone terminal —
-    /// unlike `search`, it carries its own `limit` and does NOT compose with
-    /// `take`/`collect` (the server rejects `vectorSearch` combined with any
-    /// other terminal).
+    /// optional `FilterExpr` (the db-side `filter()` DSL) that narrows the
+    /// vector search `WHERE` server-side. Standalone terminal — unlike `search`,
+    /// it carries its own `limit` and does NOT compose with `take`/`collect`
+    /// (the server rejects `vectorSearch` combined with any other terminal).
     ///
-    /// `opts` accepts any `Into<VectorSearchOpts>`: pass a `BTreeMap` for the
-    /// legacy positional shape (`.vector_search(idx, vec, lim, filter_map)`),
-    /// `()` to omit the filter, or a `VectorSearchOpts { filter }` literal. An
-    /// empty filter is omitted on the wire, so all three forms serialize
+    /// `opts` accepts any `Into<VectorSearchOpts>`: pass `()` to omit the
+    /// filter (`.vector_search(idx, vec, lim, ())`), or a
+    /// `VectorSearchOpts { filter }` literal to narrow results server-side via
+    /// a `FilterExpr`. The nested filter is distinct from the top-level
+    /// `.filter()` builder (which is mutually exclusive with `vectorSearch`)
+    /// and is omitted on the wire when `None`, so both forms serialize
     /// identically when no filter is wanted.
     pub fn vector_search(
         mut self,
@@ -379,7 +377,6 @@ mod tests {
     use super::*;
     use crate::wire::AggregateGroup;
     use serde_json::json;
-    use std::collections::BTreeMap;
 
     #[test]
     fn bare_table_query() {
@@ -655,11 +652,10 @@ mod tests {
 
     #[test]
     fn vector_builder_serializes_terminal() {
-        // Legacy positional form — `BTreeMap::new()` via `Into<VectorSearchOpts>`
-        // — still compiles unchanged. Wire key is camelCase `vectorSearch`
-        // (matches server); empty `filter` is skipped on the wire.
+        // `()` → `VectorSearchOpts::default()` (filter None) → omitted on the
+        // wire. Wire key is camelCase `vectorSearch` (matches server).
         let q = TableQuery::new("docs")
-            .vector_search("by_embedding", vec![1.0, 0.0, 0.0], 5, BTreeMap::new())
+            .vector_search("by_embedding", vec![1.0, 0.0, 0.0], 5, ())
             .take(10);
         assert_eq!(
             serde_json::to_value(&q).unwrap(),
@@ -669,8 +665,8 @@ mod tests {
 
     #[test]
     fn vector_search_omits_filter_via_unit() {
-        // `()` → `VectorSearchOpts::default()` (empty filter) → omitted on the
-        // wire. Byte-identical to the legacy `BTreeMap::new()` form above.
+        // `()` → `VectorSearchOpts::default()` (filter None) → omitted on the
+        // wire. Byte-identical to the bare form above.
         let q = TableQuery::new("docs")
             .vector_search("by_embedding", vec![1.0, 0.0, 0.0], 5, ())
             .take(10);
@@ -682,21 +678,34 @@ mod tests {
 
     #[test]
     fn vector_search_with_opts_struct_carries_filter() {
-        // Named-field opts bag — no `BTreeMap` to hand-build for the
-        // single-filter case. Non-empty filter is emitted on the wire.
-        let mut filter = BTreeMap::new();
-        filter.insert("userId".into(), json!("u1"));
+        // Named-field opts bag — a `FilterExpr` narrows the vector search
+        // server-side. Non-empty filter is emitted on the wire as the
+        // `FilterExpr` tagged shape, mirroring the `search` terminal.
         let q = TableQuery::new("docs")
             .vector_search(
                 "by_embedding",
                 vec![1.0, 0.0, 0.0],
                 5,
-                VectorSearchOpts { filter },
+                VectorSearchOpts {
+                    filter: Some(FilterExpr::Eq {
+                        field: "userId".into(),
+                        value: "u1".into(),
+                    }),
+                },
             )
             .take(10);
         assert_eq!(
             serde_json::to_value(&q).unwrap(),
-            json!({"table":"docs","vectorSearch":{"index":"by_embedding","vector":[1.0,0.0,0.0],"limit":5,"filter":{"userId":"u1"}},"take":10})
+            json!({
+                "table":"docs",
+                "vectorSearch":{
+                    "index":"by_embedding",
+                    "vector":[1.0,0.0,0.0],
+                    "limit":5,
+                    "filter":{"op":"eq","field":"userId","value":"u1"}
+                },
+                "take":10
+            })
         );
     }
 

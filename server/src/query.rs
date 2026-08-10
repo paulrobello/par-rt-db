@@ -1,5 +1,4 @@
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
 
 use sqlx::PgPool;
 
@@ -155,16 +154,20 @@ pub struct SearchQuery {
 /// A vector-similarity terminal over a declared vector index. `vector` is the
 /// caller-supplied query embedding (length must equal the index dimensions);
 /// ranked by the index's declared metric distance (`<=>`/`<->`/`<#>` for
-/// cosine/l2/ip) ascending. `filter` is an optional eq-map over the index's
-/// declared `filterFields`.
+/// cosine/l2/ip) ascending. `filter` is an optional `FilterExpr` (the db-side
+/// `filter()` DSL) narrowed into the `WHERE` — scoped vector search ("within
+/// tenant X"), matching the `search` terminal; omitted on the wire when `None`.
+/// A declared `filterFields` set is no longer required to filter (any field
+/// works — typed column when indexed, jsonb extraction otherwise), though
+/// declared filterFields still create indexed columns for fast eq.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct VectorSearchQuery {
     pub index: String,
     pub vector: Vec<f32>,
     pub limit: u32,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub filter: BTreeMap<String, serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter: Option<FilterExpr>,
 }
 
 /// A hybrid search terminal that fuses full-text (`search`) and vector
@@ -2351,25 +2354,6 @@ async fn execute_vector_search(
         )));
     }
 
-    // Build eq-binds for any filter entries; each key must be a declared
-    // filterField of this index. The field's declared `FieldType` types the
-    // value the same way `eq` prefixes are typed in `txn::eq_bind_for`.
-    let mut filter_binds: Vec<EqBind> = Vec::new();
-    let mut filter_cols: Vec<String> = Vec::new();
-    for (key, value) in &vs.filter {
-        if !vec_spec.filter_fields.iter().any(|f| f == key) {
-            return Err(RtDbError::bad_request(format!(
-                "vectorSearch filter key '{key}' is not a declared filterField of index '{}'",
-                vs.index
-            )));
-        }
-        let field_type = table_def.fields.get(key).ok_or_else(|| {
-            RtDbError::internal(format!("filterField '{key}' missing from table fields"))
-        })?;
-        filter_binds.push(eq_bind_for(field_type, value)?);
-        filter_cols.push(pg_col(key));
-    }
-
     let v_col = pg_vector_col(&index_def.name);
     let pg_schema_name = pg_schema(db);
     let table_ident = pg_table(table_name);
@@ -2384,57 +2368,47 @@ async fn execute_vector_search(
             .join(",")
     );
 
-    // Bind numbering: filter eq-binds first ($1..$k), then the per-row auth
-    // uid ($k+1) when owner/collaborators-enforced, then the `authorize`
-    // predicate's binds (when declared + user caller), then the query vector
-    // (cast to `vector`), then `limit`. The WHERE clause always excludes rows
-    // whose vector column is NULL, so undimensioned rows never surface as
-    // bogus nearest-neighbors. The per-row auth predicate (`doc->>'<field>'`
-    // = $n OR `doc->'<collabField>' ? $n) mirrors the main query path: both
-    // field names are `is_valid_identifier`-validated at schema push, so they
-    // are safe to interpolate into jsonb string-literal positions; the uid is
-    // `$n`-bound once, never interpolated.
+    // Bind numbering: the optional client `filter` (full `FilterExpr`, reusing
+    // `compile_filter`) compiles first at `$1`, then the per-row owner/
+    // collaborator uid and the `authorize` predicate, then the query vector
+    // (cast to `vector`), then `limit` — the same compose order `execute_search`
+    // uses. One shared accumulator keeps `compile_filter_node`'s
+    // `start_pos + binds.len()` placeholders correctly numbered. The WHERE always
+    // excludes rows whose vector column is NULL, so undimensioned rows never
+    // surface as bogus nearest-neighbors. Filtering is no longer restricted to
+    // declared `filterFields` (any field works — typed column when indexed, jsonb
+    // extraction otherwise); declared filterFields still create indexed columns.
     let owner = ctx.user_id.as_deref();
     let enforced_uid = row_auth_enforced_uid(owner_field, collaborators_field, owner);
-    let filter_count = filter_cols.len();
-    let filter_placeholders: Vec<String> = (1..=filter_count)
-        .map(|i| format!("${i}"))
-        .collect::<Vec<_>>();
-    // Owner/collaborator uid and `authorize` binds share one accumulator
-    // numbered from `auth_start` (= first post-filter position); `compile_filter_node`'s
-    // `start_pos + binds.len()` rule keeps placeholders correct as each is appended.
-    let mut auth_binds: Vec<EqBind> = Vec::new();
-    let mut auth_clause = String::new();
-    let auth_start = filter_count + 1;
+    let mut binds: Vec<EqBind> = Vec::new();
+    let mut extra = String::new();
+    let start = 1usize;
+    if let Some(filter) = &vs.filter {
+        let (fragment, filter_binds) = compile_filter(filter, table_def, start)?;
+        binds.extend(filter_binds);
+        extra.push_str(" AND (");
+        extra.push_str(&fragment);
+        extra.push(')');
+    }
     if let Some(uid) = enforced_uid {
-        let ph = auth_start + auth_binds.len();
-        auth_clause.push_str(" AND ");
-        auth_clause.push_str(&row_auth_predicate_body(
+        let ph = start + binds.len();
+        extra.push_str(" AND ");
+        extra.push_str(&row_auth_predicate_body(
             owner_field,
             collaborators_field,
             ph,
         ));
-        auth_binds.push(EqBind::Text(uid.to_string()));
+        binds.push(EqBind::Text(uid.to_string()));
     }
-    if let Some(frag) = authorize_predicate_body(table_def, ctx, auth_start, &mut auth_binds)? {
-        auth_clause.push_str(" AND ");
-        auth_clause.push_str(&frag);
+    if let Some(frag) = authorize_predicate_body(table_def, ctx, start, &mut binds)? {
+        extra.push_str(" AND ");
+        extra.push_str(&frag);
     }
-    let qvec_ph = auth_start + auth_binds.len();
+    let qvec_ph = start + binds.len();
     let limit_ph = qvec_ph + 1;
 
-    let mut where_clause = format!("\"{v_col}\" IS NOT NULL");
-    if !filter_cols.is_empty() {
-        let conds: Vec<String> = filter_cols
-            .iter()
-            .zip(filter_placeholders.iter())
-            .map(|(col, ph)| format!("\"{col}\" = {ph}"))
-            .collect();
-        where_clause = format!("{where_clause} AND {}", conds.join(" AND "));
-    }
-    where_clause.push_str(&auth_clause);
-
     let dist_op = vec_spec.metric.distance_op();
+    let where_clause = format!("\"{v_col}\" IS NOT NULL{extra}");
     let sql = format!(
         "SELECT \"id\", \"doc\", \"created_at\", \"version\" FROM \"{pg_schema_name}\".\"{table_ident}\" \
          WHERE {where_clause} \
@@ -2443,15 +2417,7 @@ async fn execute_vector_search(
     );
 
     let mut query = sqlx::query_as::<_, (String, serde_json::Value, i64, i64)>(&sql);
-    for bind in filter_binds {
-        query = match bind {
-            EqBind::Text(v) => query.bind(v),
-            EqBind::Num(v) => query.bind(v),
-            EqBind::Bool(v) => query.bind(v),
-            EqBind::I64(v) => query.bind(v),
-        };
-    }
-    for bind in auth_binds {
+    for bind in &binds {
         query = match bind {
             EqBind::Text(v) => query.bind(v),
             EqBind::Num(v) => query.bind(v),

@@ -68,19 +68,21 @@ export class TableQuery<DocT, Indexes extends string> {
   }
 
   /** Vector-similarity `vectorSearch` over a declared vector index. The server
-   * ranks by cosine distance and applies `limit`; `filter` is an eq-map over the
-   * index's declared `filterFields`. Terminal — the server rejects other
-   * terminals alongside it. */
+   * ranks by the index's distance metric and applies `limit`; the optional
+   * `filter` narrows results server-side via the full `FilterExpr` DSL (not to
+   * be confused with the query-level `.filter()` builder); omitted on the wire
+   * when absent so existing requests stay byte-identical. Terminal — the server
+   * rejects other terminals alongside it. */
   vectorSearch(
     index: string,
     vector: number[],
-    opts: { limit: number; filter?: Record<string, unknown> },
+    opts: { limit: number; filter?: FilterExpr },
   ): TableQuery<DocT, Indexes> {
     const vectorSearch: VectorQuery = {
       index,
       vector,
       limit: opts.limit,
-      ...(opts.filter && Object.keys(opts.filter).length > 0 ? { filter: opts.filter } : {}),
+      ...(opts.filter ? { filter: opts.filter } : {}),
     };
     return new TableQuery({ ...this.json, vectorSearch });
   }

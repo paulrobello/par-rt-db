@@ -1998,9 +1998,31 @@ export class InMemoryRtDbClient {
           "vectorSearch cannot be combined with any other terminal",
         );
       }
-      // No in-memory vector ranking; return an empty result rather than silently
-      // misranking by falling through to the collect path.
-      return [];
+      const vs = q.vectorSearch;
+      const vectorDef = tableDef.indexes?.find((i) => i.name === vs.index && i.vector);
+      if (!vectorDef) {
+        throw new RtDbError("BAD_REQUEST", `vector index '${vs.index}' not found`);
+      }
+      // Validate the vector-search-level filter against declared fields once
+      // (mirrors server `compile_filter` composed into the vector WHERE) via the
+      // SAME evaluator `search` uses. The in-memory replica does not rank by
+      // vector distance, so it returns filter-narrowed candidates in insertion
+      // order (a deterministic stand-in that exercises the filter path); the
+      // real server ranks by the index's distance metric.
+      if (vs.filter) {
+        validateFilter(vs.filter, new Set(Object.keys(tableDef.fields)));
+      }
+      const out: unknown[] = [];
+      for (const row of this.rowsFor(q.table).values()) {
+        if (vs.filter && !evalFilterExpr(vs.filter, row.doc)) {
+          continue;
+        }
+        out.push(row.doc);
+        if (out.length >= vs.limit) {
+          break;
+        }
+      }
+      return out;
     }
 
     // Hybrid search terminal. Cascade mirror of server `execute_query`:

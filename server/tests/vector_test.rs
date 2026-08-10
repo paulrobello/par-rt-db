@@ -409,7 +409,7 @@ async fn vector_search_rejects_non_finite_query_vector() {
                 index: "by_embedding".to_string(),
                 vector: vec![1.0, bad, 0.0],
                 limit: 1,
-                filter: BTreeMap::new(),
+                filter: None,
             }),
             ..empty_query()
         };
@@ -514,9 +514,9 @@ async fn vector_search_rejects_out_of_range_limit() {
     );
 }
 
-/// `filter` restricts to rows matching the eq-map over the index's declared
-/// filterFields. Two identical embeddings under different `userId`s, filtered
-/// to one, must return exactly that one.
+/// `filter` (a `FilterExpr`) restricts to rows matching the predicate. Two
+/// identical embeddings under different `userId`s, filtered to one, must return
+/// exactly that one.
 #[tokio::test]
 async fn vector_search_applies_eq_filter() {
     let state = test_state().await;
@@ -553,7 +553,7 @@ async fn vector_search_applies_eq_filter() {
             "index": "by_embedding",
             "vector": [1.0, 0.0, 0.0],
             "limit": 10,
-            "filter": {"userId": "a"}
+            "filter": {"op": "eq", "field": "userId", "value": "a"}
         }
     }))
     .expect("parse vectorSearch query");
@@ -599,13 +599,14 @@ async fn vector_search_rejects_combination_with_take() {
 fn vector_search_wire_round_trips() {
     let q = serde_json::from_value::<Query>(serde_json::json!({
         "table": "docs",
-        "vectorSearch": {"index": "by_embedding", "vector": [0.1, 0.2], "limit": 5, "filter": {"userId": "u1"}}
+        "vectorSearch": {"index": "by_embedding", "vector": [0.1, 0.2], "limit": 5, "filter": {"op": "eq", "field": "userId", "value": "u1"}}
     }))
     .expect("parse vectorSearch query");
     let back = serde_json::to_value(&q).expect("serialize query");
     assert_eq!(back["vectorSearch"]["index"], "by_embedding");
     assert_eq!(back["vectorSearch"]["limit"], 5);
-    assert_eq!(back["vectorSearch"]["filter"]["userId"], "u1");
+    assert_eq!(back["vectorSearch"]["filter"]["op"], "eq");
+    assert_eq!(back["vectorSearch"]["filter"]["field"], "userId");
     // camelCase on the wire; the snake_case Rust field never appears.
     assert!(back.get("vector_search").is_none());
     // Empty filter is skipped on serialize (default + skip_serializing_if).

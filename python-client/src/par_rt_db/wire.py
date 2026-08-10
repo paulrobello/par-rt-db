@@ -205,8 +205,8 @@ class SearchQuery(_Camel):
     ``authorize`` use), narrowing search results server-side. It is omitted on
     the wire when ``None`` (mirrors the server's
     ``#[serde(skip_serializing_if = "Option::is_none")]``), so existing requests
-    stay byte-identical. Unlike ``VectorSearchQuery.filter`` (an eq-map over the
-    index's ``filterFields``), this is the full ``FilterExpr``.
+    stay byte-identical. ``VectorSearchQuery.filter`` is the same full
+    ``FilterExpr`` type.
     """
 
     index: str
@@ -275,20 +275,22 @@ class AggregateGroup(_Camel):
 class VectorSearchQuery(_Camel):
     """Vector-similarity terminal: ``{index, vector, limit, filter?}``.
 
-    ``filter`` is an eq-map over the index's declared ``filterFields`` (NOT a
-    ``FilterExpr``); it is omitted on the wire when ``None`` or empty, mirroring
-    the server's ``BTreeMap::is_empty`` skip rule.
+    ``filter`` is the db-side ``FilterExpr`` (the same type ``.filter()``,
+    ``authorize``, and ``SearchQuery`` use), narrowing vector-search results
+    server-side. It is omitted on the wire when ``None`` (mirrors the server's
+    ``#[serde(skip_serializing_if = "Option::is_none")]``), so existing requests
+    stay byte-identical. Mirrors ``SearchQuery.filter`` exactly.
     """
 
     index: str
     vector: list[float]
     limit: int
-    filter: dict[str, Any] | None = None
+    filter: FilterExpr | None = None
 
     @model_serializer(mode="wrap")
-    def _drop_empty_filter(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+    def _drop_none_filter(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
         out = handler(self)
-        if not out.get("filter"):
+        if out.get("filter") is None:
             out.pop("filter", None)
         return out
 

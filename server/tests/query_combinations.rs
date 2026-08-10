@@ -111,7 +111,7 @@ fn vector_embedding_limit_1() -> VectorSearchQuery {
         index: "by_embedding".to_string(),
         vector: vec![0.0, 0.0, 0.0],
         limit: 1,
-        filter: std::collections::BTreeMap::new(),
+        filter: None,
     }
 }
 

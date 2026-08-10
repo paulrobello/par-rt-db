@@ -682,7 +682,7 @@ async fn vector_search_filters_to_own_rows() -> anyhow::Result<()> {
             index: "by_embedding".into(),
             vector: vec![1.0, 0.0, 0.0],
             limit: 10,
-            filter: BTreeMap::new(),
+            filter: None,
         }),
         ..notes_query()
     };
@@ -806,15 +806,17 @@ async fn vector_search_composes_filter_fields_with_owner() -> anyhow::Result<()>
         .await?;
     }
 
-    let mut filter = BTreeMap::new();
-    filter.insert("category".into(), serde_json::json!("x"));
+    let filter = rtdb_server::query::FilterExpr::Eq {
+        field: "category".into(),
+        value: serde_json::json!("x"),
+    };
     let q = Query {
         table: "docs".to_string(),
         vector_search: Some(rtdb_server::query::VectorSearchQuery {
             index: "by_embedding".into(),
             vector: vec![1.0, 0.0, 0.0],
             limit: 10,
-            filter,
+            filter: Some(filter),
         }),
         ..notes_query()
     };

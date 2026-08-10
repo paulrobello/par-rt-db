@@ -5,7 +5,6 @@ use crate::error::{ErrorEnvelope, RtDbError};
 use crate::mutation::Transaction;
 use crate::query::Query;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 
 pub type QueryRef = Query;
 
@@ -326,10 +325,13 @@ pub struct SearchQuery {
 
 /// A vector-similarity terminal over a declared vector index. `vector` is the
 /// caller-supplied query embedding (length must equal the index dimensions);
-/// ranked by cosine distance ascending. `filter` is an optional eq-map over
-/// the index's declared `filterFields`. Mirrors
-/// `server/src/query.rs::VectorSearchQuery` byte-for-byte (camelCase,
-/// deny_unknown_fields).
+/// ranked by cosine distance ascending. `filter` is an optional `FilterExpr`
+/// (the db-side `filter()` DSL) that narrows the vector search `WHERE`
+/// server-side. Mirrors `server/src/query.rs::VectorSearchQuery` byte-for-byte
+/// (camelCase, deny_unknown_fields). The nested `filter` is additive — omitted
+/// when `None`, so existing vector-search requests round-trip unchanged — and,
+/// like the standalone `search` terminal, may reference any field (not just
+/// declared filterFields).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct VectorSearchQuery {
@@ -339,8 +341,8 @@ pub struct VectorSearchQuery {
     // that silently dropped precision on a round-trip. f64 matches the wire.
     pub vector: Vec<f64>,
     pub limit: u32,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub filter: BTreeMap<String, serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter: Option<FilterExpr>,
 }
 
 /// A hybrid search terminal that fuses full-text (`search`) and vector
@@ -854,18 +856,19 @@ mod tests {
 
     #[test]
     fn vector_search_query_wire_shape() {
+        // `filter` omitted (None) → additive: same wire shape as before the field
+        // changed to Option<FilterExpr>.
         let q = VectorSearchQuery {
             index: "by_embedding".into(),
             vector: vec![1.0, 0.0, 0.0],
             limit: 5,
-            filter: BTreeMap::new(),
+            filter: None,
         };
-        // Empty `filter` is omitted on the wire (skip_serializing_if).
         assert_eq!(
             serde_json::to_value(&q).unwrap(),
             json!({"index":"by_embedding","vector":[1.0,0.0,0.0],"limit":5})
         );
-        // Round-trips; absent filter deserializes to empty.
+        // Round-trips; absent filter deserializes to None.
         let back: VectorSearchQuery = serde_json::from_value(json!({
             "index": "by_embedding",
             "vector": [1.0, 0.0, 0.0],
@@ -874,7 +877,7 @@ mod tests {
         .unwrap();
         assert_eq!(back.index, "by_embedding");
         assert_eq!(back.limit, 5);
-        assert!(back.filter.is_empty());
+        assert!(back.filter.is_none());
         // deny_unknown_fields: extra key rejected.
         assert!(
             serde_json::from_value::<VectorSearchQuery>(json!({
@@ -885,18 +888,40 @@ mod tests {
             }))
             .is_err()
         );
-        // A non-empty filter round-trips through the wire.
-        let mut filter = BTreeMap::new();
-        filter.insert("userId".into(), json!("u1"));
+        // `filter` present → emitted on the wire and round-trips through the
+        // `FilterExpr` tag (`op`, lowercase). Mirrors the search terminal's
+        // camelCase `filter` nesting.
         let with_filter = VectorSearchQuery {
             index: "by_embedding".into(),
             vector: vec![1.0],
             limit: 3,
-            filter,
+            filter: Some(FilterExpr::And {
+                exprs: vec![
+                    FilterExpr::Eq {
+                        field: "userId".into(),
+                        value: "u1".into(),
+                    },
+                    FilterExpr::Gte {
+                        field: "createdAt".into(),
+                        value: 1_780_000_000_000_i64.into(),
+                    },
+                ],
+            }),
         };
         assert_eq!(
             serde_json::to_value(&with_filter).unwrap(),
-            json!({"index":"by_embedding","vector":[1.0],"limit":3,"filter":{"userId":"u1"}})
+            json!({
+                "index":"by_embedding",
+                "vector":[1.0],
+                "limit":3,
+                "filter":{
+                    "op":"and",
+                    "exprs":[
+                        {"op":"eq","field":"userId","value":"u1"},
+                        {"op":"gte","field":"createdAt","value":1780000000000_i64}
+                    ]
+                }
+            })
         );
     }
 
