@@ -2114,32 +2114,7 @@ export class InMemoryRtDbClient {
     // (index set AND eqLen < fields.length) are mirrored here as BAD_REQUEST so
     // the in-memory cascade agrees with the server's accept/reject decision.
     if (q.distinct) {
-      if (!indexDef) {
-        throw new RtDbError("BAD_REQUEST", "distinct requires an index field beyond the eq prefix");
-      }
-      if (eqLen >= indexDef.fields.length) {
-        throw new RtDbError("BAD_REQUEST", "distinct requires an index field beyond the eq prefix");
-      }
-      const field = indexDef.fields[eqLen];
-      const fieldPg = indexColumnType(tableDef.fields[field]).pg;
-      const seen = new Set<unknown>();
-      const values: unknown[] = [];
-      for (const row of filtered) {
-        const v = row.doc[field];
-        // Skip null/undefined index values — they cannot match a typed column
-        // on the server (NULL filtering mirrors `WHERE "<col>" IS NOT NULL`).
-        if (v === null || v === undefined) continue;
-        const key =
-          typeof v === "number" || typeof v === "string" || typeof v === "boolean"
-            ? v
-            : JSON.stringify(v);
-        if (!seen.has(key)) {
-          seen.add(key);
-          values.push(v);
-        }
-      }
-      values.sort((a, b) => compareIndexValues(a, b, fieldPg));
-      return values.slice(0, MAX_TAKE);
+      return this.executeDistinctTerminal(tableDef, indexDef, eqLen, filtered);
     }
 
     // Aggregate terminal: run <OP> over the index field after the eq prefix
@@ -2499,6 +2474,43 @@ export class InMemoryRtDbClient {
    * former inline `if (q.count) { ... }` arm. */
   private executeCountTerminal(filtered: StoredRow[]): number {
     return filtered.length;
+  }
+
+  /** `distinct` terminal: unique values of the index field after the eq prefix
+   * over the matching set. Verbatim lift of the former inline
+   * `if (q.distinct) { ... }` arm. */
+  private executeDistinctTerminal(
+    tableDef: TableJson,
+    indexDef: IndexJson | null,
+    eqLen: number,
+    filtered: StoredRow[],
+  ): unknown {
+    if (!indexDef) {
+      throw new RtDbError("BAD_REQUEST", "distinct requires an index field beyond the eq prefix");
+    }
+    if (eqLen >= indexDef.fields.length) {
+      throw new RtDbError("BAD_REQUEST", "distinct requires an index field beyond the eq prefix");
+    }
+    const field = indexDef.fields[eqLen];
+    const fieldPg = indexColumnType(tableDef.fields[field]).pg;
+    const seen = new Set<unknown>();
+    const values: unknown[] = [];
+    for (const row of filtered) {
+      const v = row.doc[field];
+      // Skip null/undefined index values — they cannot match a typed column
+      // on the server (NULL filtering mirrors `WHERE "<col>" IS NOT NULL`).
+      if (v === null || v === undefined) continue;
+      const key =
+        typeof v === "number" || typeof v === "string" || typeof v === "boolean"
+          ? v
+          : JSON.stringify(v);
+      if (!seen.has(key)) {
+        seen.add(key);
+        values.push(v);
+      }
+    }
+    values.sort((a, b) => compareIndexValues(a, b, fieldPg));
+    return values.slice(0, MAX_TAKE);
   }
 
   /** Merges a stored row with its system fields — a port of server `merge_doc`. */
