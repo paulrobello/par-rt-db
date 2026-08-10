@@ -927,30 +927,7 @@ class InMemoryRtDbClient:
 
         # `get` terminal — exclusive of every other clause.
         if q.get is not None:
-            if (
-                q.index is not None
-                or eq
-                or has_range
-                or q.order is not None
-                or q.take is not None
-                or unique
-                or first
-                or count
-                or q.distinct
-                or q.aggregate is not None
-                or q.paginate is not None
-                or q.filter is not None
-                or q.search is not None
-                or q.vector_search is not None
-                or q.hybrid_search is not None
-            ):
-                raise RtDbError(
-                    ErrorCode.BAD_REQUEST,
-                    "get cannot be combined with index, eq, range bounds, order, take, "
-                    "unique, first, count, distinct, aggregate, paginate, filter, search, "
-                    "vector search, or hybrid search",
-                )
-            return self.get(q.table, q.get)
+            return self._execute_get_terminal(q, eq, has_range)
 
         # Conflicting-terminal guards.
         if unique and (
@@ -1417,6 +1394,41 @@ class InMemoryRtDbClient:
 
         limit = q.take if q.take is not None else MAX_TAKE
         return [_merge_doc(row) for row in filtered[:limit]]
+
+    def _execute_get_terminal(self, q: Query, eq: list[Any], has_range: bool) -> Any:
+        """``get(id)`` terminal: point read by id, exclusive of every other clause.
+
+        Lift of the former inline ``if q.get is not None:`` arm of
+        :meth:`run_query`; mirrors ``ts-client``'s ``executeGetTerminal``. The
+        ``unique``/``first``/``count`` locals of ``run_query`` are read here
+        straight off ``q`` (``bool | None`` — identical truthiness to the
+        ``bool(q.*)`` precomputed locals).
+        """
+        if (
+            q.index is not None
+            or eq
+            or has_range
+            or q.order is not None
+            or q.take is not None
+            or q.unique
+            or q.first
+            or q.count
+            or q.distinct
+            or q.aggregate is not None
+            or q.paginate is not None
+            or q.filter is not None
+            or q.search is not None
+            or q.vector_search is not None
+            or q.hybrid_search is not None
+        ):
+            raise RtDbError(
+                ErrorCode.BAD_REQUEST,
+                "get cannot be combined with index, eq, range bounds, order, take, "
+                "unique, first, count, distinct, aggregate, paginate, filter, search, "
+                "vector search, or hybrid search",
+            )
+        assert q.get is not None  # caller dispatches only when get is set
+        return self.get(q.table, q.get)
 
     def run(self, q: Query, model: type = dict) -> Any:
         """Typed wrapper around :meth:`run_query` that deserializes the result
