@@ -1865,30 +1865,7 @@ export class InMemoryRtDbClient {
       q.gt !== undefined || q.gte !== undefined || q.lt !== undefined || q.lte !== undefined;
 
     if (q.get !== undefined) {
-      if (
-        q.index !== undefined ||
-        eq.length > 0 ||
-        hasRange ||
-        q.order !== undefined ||
-        q.take !== undefined ||
-        q.unique ||
-        q.first ||
-        q.count ||
-        q.distinct ||
-        q.aggregate !== undefined ||
-        q.paginate !== undefined ||
-        q.filter !== undefined ||
-        q.search !== undefined ||
-        q.vectorSearch !== undefined ||
-        q.hybridSearch !== undefined
-      ) {
-        throw new RtDbError(
-          "BAD_REQUEST",
-          "get cannot be combined with index, eq, range bounds, order, take, unique, first, count, distinct, aggregate, paginate, filter, search, or vector search",
-        );
-      }
-      const row = this.rowsFor(q.table).get(q.get);
-      return row ? this.mergeDoc(row) : null;
+      return this.executeGetTerminal(q, eq, hasRange);
     }
 
     if (
@@ -2464,6 +2441,35 @@ export class InMemoryRtDbClient {
 
     const limit = q.take ?? MAX_TAKE;
     return filtered.slice(0, limit).map((row) => this.mergeDoc(row));
+  }
+
+  /** `get` terminal: point read by id. Verbatim lift of the former inline
+   * `if (q.get !== undefined) { ... }` arm. */
+  private executeGetTerminal(q: QueryJson, eq: unknown[], hasRange: boolean): unknown {
+    if (
+      q.index !== undefined ||
+      eq.length > 0 ||
+      hasRange ||
+      q.order !== undefined ||
+      q.take !== undefined ||
+      q.unique ||
+      q.first ||
+      q.count ||
+      q.distinct ||
+      q.aggregate !== undefined ||
+      q.paginate !== undefined ||
+      q.filter !== undefined ||
+      q.search !== undefined ||
+      q.vectorSearch !== undefined ||
+      q.hybridSearch !== undefined
+    ) {
+      throw new RtDbError(
+        "BAD_REQUEST",
+        "get cannot be combined with index, eq, range bounds, order, take, unique, first, count, distinct, aggregate, paginate, filter, search, or vector search",
+      );
+    }
+    const row = this.rowsFor(q.table).get(q.get!);
+    return row ? this.mergeDoc(row) : null;
   }
 
   /** Merges a stored row with its system fields — a port of server `merge_doc`. */
