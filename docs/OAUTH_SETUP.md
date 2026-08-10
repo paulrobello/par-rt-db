@@ -202,9 +202,10 @@ unconfigured google/gitlab.
    (see [Applying changes](#applying-changes)).
 
 par-rt-db requests the `openid email profile` scopes. A present email is
-required; the IdP's verification posture is trusted (an explicit
-`email_verified: false` rejects with `403 "email is not verified"`, but a
-missing `email_verified` is accepted — many IdPs omit it).
+required; the IdP must positively assert `email_verified: true` (boolean or
+the string `"true"`) — a missing `email_verified` is rejected as unverified
+(SEC-122). If your IdP genuinely verifies mail but omits the claim, patch its
+userinfo endpoint to emit it rather than relaxing this gate.
 
 ---
 
@@ -238,24 +239,37 @@ This is OIDC against Microsoft's well-known endpoints (derived from
 5. Set the env vars (see [Applying changes](#applying-changes)):
    - `RTDB_MICROSOFT_CLIENT_ID` — the application (client) id.
    - `RTDB_MICROSOFT_CLIENT_SECRET` — the secret **value**.
-   - `RTDB_MICROSOFT_TENANT` — `common` (default; any account), `organizations`,
-     `consumers`, or a specific tenant GUID. A GUID restricts sign-in to that
-     one Entra tenant.
+   - `RTDB_MICROSOFT_TENANT` — **set this to your specific tenant GUID.**
+     The default `common` accepts any Entra tenant and is unsafe: a tenant
+     admin can set any user's `mail` attribute to any address, and Microsoft
+     emits that address as the `email` claim. With `common`, an attacker who
+     controls an Entra tenant can spoof a victim's email and (without the
+     SEC-102 identity fix) adopt their account. Pinning a single tenant GUID
+     restricts sign-in to that one organization so only your own admins can
+     set mail attributes. `organizations`/`consumers` remain multi-tenant and
+     carry the same caveat — use a GUID unless you have a specific reason.
 
 The authorize URL uses `response_mode=query`, so the standard GET callback
 handles the redirect (no `form_post`, unlike Apple).
 
-**Email sourcing — read this if a Microsoft login fails with `no email`:**
-Microsoft's `oidc/userinfo` endpoint is sparse and **omits the email *and*
-`preferred_username` for Entra ID accounts**, returning only
-`{sub, name, given_name, family_name, picture}`. par-rt-db therefore reads the
-email from the **id_token** returned by the token exchange — the `email` claim
-for personal (MSA) accounts and `preferred_username` (the UPN, e.g.
-`you@org.com`) for work/school accounts — with the userinfo fields as a
-fallback. Identity is email-keyed and reuses an existing account when the
-address matches another provider. (The id_token payload is base64-decoded
-without signature verification — it arrived over TLS from the token endpoint,
-the same trust posture as the userinfo call.)
+**Identity & email sourcing (SEC-102 — read this if a Microsoft login behaves
+unexpectedly):** Microsoft identity is keyed on the immutable `sub`+`tid` pair
+from a **signature-verified id_token**, NOT on the `email` claim. The id_token
+is verified against Microsoft's published JWKS for the issuing tenant
+(cached for one hour; a JWKS fetch failure rejects the login — fail-closed),
+and `iss`/`aud`/`exp`/`tid` are all validated. The `email` claim is used for
+the contact address and for cross-provider account linking **only when
+`xms_edov == true`** (Microsoft's "email domain owner verified" signal — set
+when the domain was validated via a DNS TXT record). When `xms_edov` is
+absent (common for tenant-admin-set mail), the tenant-constrained UPN
+(`preferred_username`, e.g. `you@org.com`) is used as the contact address
+instead, and the spoofable `email` claim is ignored. This is the "nOAuth"
+defense: a tenant admin can set a victim's address as a user's `mail`
+attribute, but they cannot forge the victim's `sub` — so the spoofed email
+creates a fresh account instead of adopting the victim's row. If your IdP
+omits both `xms_edov` and `preferred_username` the login fails with
+`403 "no verified email"`; the fix is to emit one of them (the UPN is
+sufficient).
 
 ## Sign in with Apple
 

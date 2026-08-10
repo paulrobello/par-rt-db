@@ -93,6 +93,27 @@ async fn bootstrap_ddl(conn: &mut PgConnection) -> Result<(), RtDbError> {
     .execute(&mut *conn)
     .await?;
 
+    // SEC-102: Microsoft's stable subject identifier. The id_token `sub` is
+    // immutable per (user, app) pair and tied to the tenant (`tid`) — unlike
+    // the `email` claim, which Entra ID populates from the tenant-admin-settable
+    // `mail`/`otherMails` attribute and is therefore spoofable (the "nOAuth"
+    // account-takeover). Keying Microsoft identity on `microsoft_sub` instead
+    // of `email` defeats the takeover: a spoofed email can no longer adopt an
+    // existing row via `ON CONFLICT (email) DO UPDATE`. The composite value
+    // is `{tid}.{sub}` so a `sub` collision across tenants is never confused
+    // for the same identity. The partial unique index tolerates the many NULLs
+    // of non-Microsoft users. Idempotent ALTER so a running deployment adds it
+    // on boot; new deployments get the column via this same guard.
+    sqlx::query("ALTER TABLE rtdb_auth.users ADD COLUMN IF NOT EXISTS microsoft_sub TEXT NULL")
+        .execute(&mut *conn)
+        .await?;
+    sqlx::query(
+        "CREATE UNIQUE INDEX IF NOT EXISTS rtdb_auth_users_microsoft_sub_key \
+         ON rtdb_auth.users (microsoft_sub) WHERE microsoft_sub IS NOT NULL",
+    )
+    .execute(&mut *conn)
+    .await?;
+
     // Anonymous auth (2026-08-08): marks a user row minted by
     // `POST /auth/anonymous` (no OAuth identity, no email). `false` for every
     // existing/OAuth user. Idempotent ALTER so a running deployment adds it on

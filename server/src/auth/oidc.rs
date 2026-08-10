@@ -184,14 +184,15 @@ fn is_email_verified(value: &serde_json::Value) -> bool {
     }
 }
 
-/// Parses userinfo into a normalized identity. A present email is required.
+/// Parses userinfo into a normalized identity. A present, **verified** email
+/// is required.
 ///
-/// Unlike the google provider (which *requires* `email_verified` true), a
-/// generic OIDC IdP's email-verification guarantees vary and many omit
-/// `email_verified` from userinfo entirely. So the gate here is: trust the
-/// configured IdP's assertion unless it explicitly says the email is
-/// unverified (`email_verified: false` rejects). The operator chose this IdP
-/// and is responsible for its verification posture.
+/// SEC-122: the default is now unverified. A generic OIDC IdP's verification
+/// posture cannot be assumed, so an absent `email_verified` no longer trusts
+/// the address — the IdP must positively assert `email_verified: true` (as a
+/// boolean or the string `"true"`). Operators whose IdP genuinely verifies
+/// mail but omits the claim should patch their IdP's userinfo to emit it
+/// rather than relax this gate.
 fn parse_userinfo(value: serde_json::Value) -> Result<OidcIdentity, RtDbError> {
     let email = value
         .get("email")
@@ -199,9 +200,11 @@ fn parse_userinfo(value: serde_json::Value) -> Result<OidcIdentity, RtDbError> {
         .ok_or_else(|| RtDbError::forbidden("no email"))?
         .to_string();
 
-    if let Some(verified) = value.get("email_verified")
-        && !is_email_verified(verified)
-    {
+    let verified = value
+        .get("email_verified")
+        .map(is_email_verified)
+        .unwrap_or(false);
+    if !verified {
         return Err(RtDbError::forbidden("email is not verified"));
     }
 
@@ -249,10 +252,11 @@ mod tests {
     }
 
     #[test]
-    fn parse_userinfo_accepts_absent_verified_flag() {
-        // Many OIDC IdPs omit email_verified from userinfo — trust the IdP.
-        let id = parse_userinfo(json!({"sub": "9", "email": "c@x.com", "name": "C"})).unwrap();
-        assert_eq!(id.email, "c@x.com");
+    fn parse_userinfo_rejects_absent_verified_flag() {
+        // SEC-122: an absent email_verified is now treated as unverified, not
+        // verified. The IdP must positively assert email_verified.
+        let err = parse_userinfo(json!({"sub": "9", "email": "c@x.com", "name": "C"}));
+        assert!(err.is_err());
     }
 
     #[test]
