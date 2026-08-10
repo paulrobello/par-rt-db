@@ -1028,36 +1028,7 @@ class InMemoryRtDbClient:
         # similarity. The terminal's `limit` is not applied: without ranking
         # there is no meaningful "top N" to pick.
         if q.vector_search is not None:
-            if (
-                q.index is not None
-                or eq
-                or has_range
-                or q.order is not None
-                or unique
-                or first
-                or count
-                or q.filter is not None
-                or q.search is not None
-                or q.take is not None
-                or q.paginate is not None
-                or q.hybrid_search is not None
-            ):
-                raise RtDbError(
-                    ErrorCode.BAD_REQUEST,
-                    "vectorSearch cannot be combined with any other terminal",
-                )
-            if q.vector_search.filter is not None:
-                _validate_filter(q.vector_search.filter, set(table_def.fields.keys()))
-            vector_candidates: list[StoredRow] = [
-                row for (t, _id), row in self._docs.items() if t == q.table
-            ]
-            if q.vector_search.filter is not None:
-                vector_candidates = [
-                    row
-                    for row in vector_candidates
-                    if _eval_filter_expr(q.vector_search.filter, row.doc)
-                ]
-            return [_merge_doc(row) for row in vector_candidates]
+            return self._execute_vector_search_terminal(q, table_def, eq, has_range)
         if q.search is not None:
             if (
                 q.index is not None
@@ -1429,6 +1400,50 @@ class InMemoryRtDbClient:
             )
         assert q.get is not None  # caller dispatches only when get is set
         return self.get(q.table, q.get)
+
+    def _execute_vector_search_terminal(
+        self, q: Query, table_def: TableDef, eq: list[Any], has_range: bool
+    ) -> list[dict[str, Any]]:
+        """``vectorSearch`` terminal.
+
+        Lift of the former inline ``if q.vector_search is not None:`` arm of
+        :meth:`run_query`; mirrors ``ts-client``'s ``executeVectorSearchTerminal``.
+        Vector similarity is not modeled in-memory, so every table row is a
+        candidate (the sound over-approximation); a declared ``filter`` narrows
+        the set via :func:`_eval_filter_expr`. The terminal's ``limit`` is not
+        applied: without ranking there is no meaningful "top N".
+        """
+        assert q.vector_search is not None  # caller dispatches only when set
+        if (
+            q.index is not None
+            or eq
+            or has_range
+            or q.order is not None
+            or q.unique
+            or q.first
+            or q.count
+            or q.filter is not None
+            or q.search is not None
+            or q.take is not None
+            or q.paginate is not None
+            or q.hybrid_search is not None
+        ):
+            raise RtDbError(
+                ErrorCode.BAD_REQUEST,
+                "vectorSearch cannot be combined with any other terminal",
+            )
+        if q.vector_search.filter is not None:
+            _validate_filter(q.vector_search.filter, set(table_def.fields.keys()))
+        vector_candidates: list[StoredRow] = [
+            row for (t, _id), row in self._docs.items() if t == q.table
+        ]
+        if q.vector_search.filter is not None:
+            vector_candidates = [
+                row
+                for row in vector_candidates
+                if _eval_filter_expr(q.vector_search.filter, row.doc)
+            ]
+        return [_merge_doc(row) for row in vector_candidates]
 
     def run(self, q: Query, model: type = dict) -> Any:
         """Typed wrapper around :meth:`run_query` that deserializes the result
