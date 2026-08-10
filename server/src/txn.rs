@@ -1342,6 +1342,15 @@ pub async fn execute_txn(
     .execute(&mut *tx)
     .await?;
 
+    let mut sctx = StepCtx {
+        tx: &mut tx,
+        pg_schema_name: pg_schema_name.as_str(),
+        schema,
+        ctx,
+        owner,
+        write_set: &mut write_set,
+        results: &mut results,
+    };
     for step in &txn.steps {
         // ENH-005 Task 4: gate each step against the machine-token table
         // allowlist BEFORE any work. A scoped token cannot write a forbidden
@@ -1349,90 +1358,17 @@ pub async fn execute_txn(
         // full-access machine tokens) bypasses; the gate is a pure read. Runs
         // inside the sqlx tx so a `Forbidden` returns via `?` before commit and
         // rolls back the whole transaction.
-        authorize_table(ctx, step.table())?;
+        authorize_table(sctx.ctx, step.table())?;
         match step {
-            Step::Insert { table, doc } => {
-                step_insert(
-                    &mut tx,
-                    &pg_schema_name,
-                    schema,
-                    ctx,
-                    owner,
-                    &mut write_set,
-                    &mut results,
-                    table,
-                    doc,
-                )
-                .await?
-            }
-            Step::Patch { table, id, fields } => {
-                step_patch(
-                    &mut tx,
-                    &pg_schema_name,
-                    schema,
-                    ctx,
-                    owner,
-                    &mut write_set,
-                    &mut results,
-                    table,
-                    id,
-                    fields,
-                )
-                .await?
-            }
-            Step::Replace { table, id, doc } => {
-                step_replace(
-                    &mut tx,
-                    &pg_schema_name,
-                    schema,
-                    ctx,
-                    owner,
-                    &mut write_set,
-                    &mut results,
-                    table,
-                    id,
-                    doc,
-                )
-                .await?
-            }
-            Step::Delete { table, id } => {
-                step_delete(
-                    &mut tx,
-                    &pg_schema_name,
-                    schema,
-                    ctx,
-                    &mut write_set,
-                    &mut results,
-                    table,
-                    id,
-                )
-                .await?
-            }
+            Step::Insert { table, doc } => step_insert(&mut sctx, table, doc).await?,
+            Step::Patch { table, id, fields } => step_patch(&mut sctx, table, id, fields).await?,
+            Step::Replace { table, id, doc } => step_replace(&mut sctx, table, id, doc).await?,
+            Step::Delete { table, id } => step_delete(&mut sctx, table, id).await?,
             Step::ExpectVersion { table, id, version } => {
-                step_expect_version(
-                    &mut tx,
-                    &pg_schema_name,
-                    schema,
-                    ctx,
-                    &mut results,
-                    table,
-                    id,
-                    *version,
-                )
-                .await?
+                step_expect_version(&mut sctx, table, id, *version).await?
             }
             Step::ExpectAbsent { table, index, eq } => {
-                step_expect_absent(
-                    &mut tx,
-                    &pg_schema_name,
-                    schema,
-                    ctx,
-                    &mut results,
-                    table,
-                    index,
-                    eq,
-                )
-                .await?
+                step_expect_absent(&mut sctx, table, index, eq).await?
             }
             Step::Upsert {
                 table,
@@ -1440,63 +1376,18 @@ pub async fn execute_txn(
                 eq,
                 insert,
                 patch,
-            } => {
-                step_upsert(
-                    &mut tx,
-                    &pg_schema_name,
-                    schema,
-                    ctx,
-                    owner,
-                    &mut write_set,
-                    &mut results,
-                    table,
-                    index,
-                    eq,
-                    insert,
-                    patch,
-                )
-                .await?
-            }
+            } => step_upsert(&mut sctx, table, index, eq, insert, patch).await?,
             Step::PatchByQuery {
                 table,
                 filter,
                 patch,
                 limit,
-            } => {
-                step_patch_by_query(
-                    &mut tx,
-                    &pg_schema_name,
-                    schema,
-                    ctx,
-                    owner,
-                    &mut write_set,
-                    &mut results,
-                    table,
-                    filter,
-                    patch,
-                    *limit,
-                )
-                .await?
-            }
+            } => step_patch_by_query(&mut sctx, table, filter, patch, *limit).await?,
             Step::DeleteByQuery {
                 table,
                 filter,
                 limit,
-            } => {
-                step_delete_by_query(
-                    &mut tx,
-                    &pg_schema_name,
-                    schema,
-                    ctx,
-                    owner,
-                    &mut write_set,
-                    &mut results,
-                    table,
-                    filter,
-                    *limit,
-                )
-                .await?
-            }
+            } => step_delete_by_query(&mut sctx, table, filter, *limit).await?,
         }
     }
 
@@ -1504,211 +1395,198 @@ pub async fn execute_txn(
     Ok(TxnOutcome { results, write_set })
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Shared, borrow-only context for the `step_*` per-step handlers in
+/// [`execute_txn`]. Bundles the per-transaction borrows every step variant
+/// reads (the sqlx transaction, the resolved schema name, the schema catalog,
+/// the caller's principal, the derived owner id, the accumulating write set,
+/// and the result sink) so each `step_*` signature stays flat instead of
+/// carrying a 9+-argument list — the smell QA-002's per-step extraction
+/// reintroduced (QA-105). Helpers take `&StepCtx` and reborrow the `&mut`
+/// fields they need for the duration of each call. Follows the in-tree
+/// precedents: `CommitterCtx` (ARC-002) and `QueryWindow` (`query.rs`).
+///
+/// Not every field is read by every variant (e.g. `step_delete` ignores
+/// `owner`; the expect-* steps ignore `owner` and `write_set`); unused fields
+/// are simply not accessed, so no per-variant subset struct is warranted.
+struct StepCtx<'a> {
+    tx: &'a mut PgConnection,
+    pg_schema_name: &'a str,
+    schema: &'a SchemaDef,
+    ctx: &'a PrincipalCtx,
+    owner: Option<&'a str>,
+    write_set: &'a mut WriteSet,
+    results: &'a mut Vec<serde_json::Value>,
+}
+
 async fn step_insert(
-    tx: &mut PgConnection,
-    pg_schema_name: &str,
-    schema: &SchemaDef,
-    ctx: &PrincipalCtx,
-    owner: Option<&str>,
-    write_set: &mut WriteSet,
-    results: &mut Vec<serde_json::Value>,
+    sctx: &mut StepCtx<'_>,
     table: &str,
     doc: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<(), RtDbError> {
-    let table_def = schema.table(table)?;
+    let table_def = sctx.schema.table(table)?;
     let doc = stamp_ttl_default(table_def, doc.clone(), now_ms());
-    let doc = stamp_owner(table_def, doc, owner);
-    let doc = stamp_authorize(table_def, doc, ctx);
-    verify_authorize_doc(table_def, &doc, ctx)?;
-    let (id, stored, created_at) = do_insert(tx, pg_schema_name, table_def, table, &doc).await?;
-    write_set.touch(table, &id, OpKind::Insert);
+    let doc = stamp_owner(table_def, doc, sctx.owner);
+    let doc = stamp_authorize(table_def, doc, sctx.ctx);
+    verify_authorize_doc(table_def, &doc, sctx.ctx)?;
+    let (id, stored, created_at) =
+        do_insert(sctx.tx, sctx.pg_schema_name, table_def, table, &doc).await?;
+    sctx.write_set.touch(table, &id, OpKind::Insert);
     // Created in this txn: before = None (created), after = stored doc.
-    write_set.capture_doc(
+    sctx.write_set.capture_doc(
         table,
         &id,
         Some(None),
         Some(Some(&stored)),
         Some(created_at),
     );
-    results.push(serde_json::json!({ "id": id }));
+    sctx.results.push(serde_json::json!({ "id": id }));
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn step_patch(
-    tx: &mut PgConnection,
-    pg_schema_name: &str,
-    schema: &SchemaDef,
-    ctx: &PrincipalCtx,
-    owner: Option<&str>,
-    write_set: &mut WriteSet,
-    results: &mut Vec<serde_json::Value>,
+    sctx: &mut StepCtx<'_>,
     table: &str,
     id: &str,
     fields: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<(), RtDbError> {
-    let table_def = schema.table(table)?;
-    check_owner(tx, pg_schema_name, table_def, table, id, ctx).await?;
-    let fields = stamp_owner(table_def, fields.clone(), owner);
-    let fields = stamp_authorize(table_def, fields, ctx);
+    let table_def = sctx.schema.table(table)?;
+    check_owner(sctx.tx, sctx.pg_schema_name, table_def, table, id, sctx.ctx).await?;
+    let fields = stamp_owner(table_def, fields.clone(), sctx.owner);
+    let fields = stamp_authorize(table_def, fields, sctx.ctx);
     let (pre_doc, merged, created_at) =
-        do_patch(tx, pg_schema_name, table_def, table, id, &fields).await?;
-    verify_authorize_doc(table_def, &merged, ctx)?;
-    write_set.touch(table, id, OpKind::Patch);
+        do_patch(sctx.tx, sctx.pg_schema_name, table_def, table, id, &fields).await?;
+    verify_authorize_doc(table_def, &merged, sctx.ctx)?;
+    sctx.write_set.touch(table, id, OpKind::Patch);
     // `before` = pre-merge body (frozen on first touch by the helper
     // so a doc inserted earlier this txn stays `before = None`);
     // `after` = merged body.
-    write_set.capture_doc(
+    sctx.write_set.capture_doc(
         table,
         id,
         Some(Some(&pre_doc)),
         Some(Some(&merged)),
         Some(created_at),
     );
-    results.push(serde_json::Value::Null);
+    sctx.results.push(serde_json::Value::Null);
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn step_replace(
-    tx: &mut PgConnection,
-    pg_schema_name: &str,
-    schema: &SchemaDef,
-    ctx: &PrincipalCtx,
-    owner: Option<&str>,
-    write_set: &mut WriteSet,
-    results: &mut Vec<serde_json::Value>,
+    sctx: &mut StepCtx<'_>,
     table: &str,
     id: &str,
     doc: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<(), RtDbError> {
-    let table_def = schema.table(table)?;
-    check_owner(tx, pg_schema_name, table_def, table, id, ctx).await?;
-    let doc = stamp_owner(table_def, doc.clone(), owner);
-    let doc = stamp_authorize(table_def, doc, ctx);
+    let table_def = sctx.schema.table(table)?;
+    check_owner(sctx.tx, sctx.pg_schema_name, table_def, table, id, sctx.ctx).await?;
+    let doc = stamp_owner(table_def, doc.clone(), sctx.owner);
+    let doc = stamp_authorize(table_def, doc, sctx.ctx);
     let (old_doc, new_doc, created_at) =
-        do_replace(tx, pg_schema_name, table_def, table, id, &doc).await?;
-    verify_authorize_doc(table_def, &new_doc, ctx)?;
-    write_set.touch(table, id, OpKind::Replace);
-    write_set.capture_doc(
+        do_replace(sctx.tx, sctx.pg_schema_name, table_def, table, id, &doc).await?;
+    verify_authorize_doc(table_def, &new_doc, sctx.ctx)?;
+    sctx.write_set.touch(table, id, OpKind::Replace);
+    sctx.write_set.capture_doc(
         table,
         id,
         Some(Some(&old_doc)),
         Some(Some(&new_doc)),
         Some(created_at),
     );
-    results.push(serde_json::Value::Null);
+    sctx.results.push(serde_json::Value::Null);
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn step_delete(
-    tx: &mut PgConnection,
-    pg_schema_name: &str,
-    schema: &SchemaDef,
-    ctx: &PrincipalCtx,
-    write_set: &mut WriteSet,
-    results: &mut Vec<serde_json::Value>,
-    table: &str,
-    id: &str,
-) -> Result<(), RtDbError> {
-    let table_def = schema.table(table)?;
-    check_owner(tx, pg_schema_name, table_def, table, id, ctx).await?;
-    do_delete(tx, pg_schema_name, table, id).await?;
-    write_set.touch(table, id, OpKind::Delete);
+async fn step_delete(sctx: &mut StepCtx<'_>, table: &str, id: &str) -> Result<(), RtDbError> {
+    let table_def = sctx.schema.table(table)?;
+    check_owner(sctx.tx, sctx.pg_schema_name, table_def, table, id, sctx.ctx).await?;
+    do_delete(sctx.tx, sctx.pg_schema_name, table, id).await?;
+    sctx.write_set.touch(table, id, OpKind::Delete);
     // Delete records no value: `after = None` marks it deleted so
     // `fan_out` always re-runs (deleted ⇒ affects). `before` is left
     // for the helper to freeze at the earliest capture if this same
     // id was touched earlier in the txn, and `created_at` likewise
     // (a delete never fetches the row).
-    write_set.capture_doc(table, id, None, Some(None), None);
-    results.push(serde_json::Value::Null);
+    sctx.write_set
+        .capture_doc(table, id, None, Some(None), None);
+    sctx.results.push(serde_json::Value::Null);
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn step_expect_version(
-    tx: &mut PgConnection,
-    pg_schema_name: &str,
-    schema: &SchemaDef,
-    ctx: &PrincipalCtx,
-    results: &mut Vec<serde_json::Value>,
+    sctx: &mut StepCtx<'_>,
     table: &str,
     id: &str,
     version: i64,
 ) -> Result<(), RtDbError> {
-    let table_def = schema.table(table)?;
-    do_expect_version(tx, pg_schema_name, table_def, table, id, version, ctx).await?;
-    results.push(serde_json::Value::Null);
+    let table_def = sctx.schema.table(table)?;
+    do_expect_version(
+        sctx.tx,
+        sctx.pg_schema_name,
+        table_def,
+        table,
+        id,
+        version,
+        sctx.ctx,
+    )
+    .await?;
+    sctx.results.push(serde_json::Value::Null);
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn step_expect_absent(
-    tx: &mut PgConnection,
-    pg_schema_name: &str,
-    schema: &SchemaDef,
-    ctx: &PrincipalCtx,
-    results: &mut Vec<serde_json::Value>,
+    sctx: &mut StepCtx<'_>,
     table: &str,
     index: &str,
     eq: &[serde_json::Value],
 ) -> Result<(), RtDbError> {
-    let table_def = schema.table(table)?;
-    let rows = eq_lookup(tx, pg_schema_name, table_def, table, index, eq).await?;
+    let table_def = sctx.schema.table(table)?;
+    let rows = eq_lookup(sctx.tx, sctx.pg_schema_name, table_def, table, index, eq).await?;
     // Side-channel closure: only a matched doc the caller can see
     // counts as "present". A matched-but-invisible doc is "absent"
     // from the caller's view, so it does not fail the precondition.
     let present = rows
         .iter()
-        .any(|(_id, doc, _created_at)| doc_visible_to(doc, table_def, ctx));
+        .any(|(_id, doc, _created_at)| doc_visible_to(doc, table_def, sctx.ctx));
     if present {
         return Err(RtDbError::precondition(format!(
             "index '{index}' already has a matching document"
         )));
     }
-    results.push(serde_json::Value::Null);
+    sctx.results.push(serde_json::Value::Null);
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn step_upsert(
-    tx: &mut PgConnection,
-    pg_schema_name: &str,
-    schema: &SchemaDef,
-    ctx: &PrincipalCtx,
-    owner: Option<&str>,
-    write_set: &mut WriteSet,
-    results: &mut Vec<serde_json::Value>,
+    sctx: &mut StepCtx<'_>,
     table: &str,
     index: &str,
     eq: &[serde_json::Value],
     insert: &serde_json::Map<String, serde_json::Value>,
     patch: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<(), RtDbError> {
-    let table_def = schema.table(table)?;
-    let mut rows = eq_lookup(tx, pg_schema_name, table_def, table, index, eq).await?;
+    let table_def = sctx.schema.table(table)?;
+    let mut rows = eq_lookup(sctx.tx, sctx.pg_schema_name, table_def, table, index, eq).await?;
     if rows.len() > 1 {
         return Err(RtDbError::precondition("upsert matched multiple documents"));
     }
     match rows.pop() {
         None => {
-            let insert = stamp_owner(table_def, insert.clone(), owner);
-            let insert = stamp_authorize(table_def, insert, ctx);
-            verify_authorize_doc(table_def, &insert, ctx)?;
+            let insert = stamp_owner(table_def, insert.clone(), sctx.owner);
+            let insert = stamp_authorize(table_def, insert, sctx.ctx);
+            verify_authorize_doc(table_def, &insert, sctx.ctx)?;
             let (id, stored, created_at) =
-                do_insert(tx, pg_schema_name, table_def, table, &insert).await?;
-            write_set.touch(table, &id, OpKind::Upsert);
+                do_insert(sctx.tx, sctx.pg_schema_name, table_def, table, &insert).await?;
+            sctx.write_set.touch(table, &id, OpKind::Upsert);
             // Upsert-insert branch: same as Insert — created this txn.
-            write_set.capture_doc(
+            sctx.write_set.capture_doc(
                 table,
                 &id,
                 Some(None),
                 Some(Some(&stored)),
                 Some(created_at),
             );
-            results.push(serde_json::json!({ "id": id, "inserted": true }));
+            sctx.results
+                .push(serde_json::json!({ "id": id, "inserted": true }));
         }
         Some((id, doc_value, created_at)) => {
             let doc = match doc_value {
@@ -1717,49 +1595,44 @@ async fn step_upsert(
                     return Err(RtDbError::internal("stored doc is not a JSON object"));
                 }
             };
-            check_owner_doc(table_def, &doc, &id, ctx)?;
-            let patch = stamp_owner(table_def, patch.clone(), owner);
-            let patch = stamp_authorize(table_def, patch, ctx);
+            check_owner_doc(table_def, &doc, &id, sctx.ctx)?;
+            let patch = stamp_owner(table_def, patch.clone(), sctx.owner);
+            let patch = stamp_authorize(table_def, patch, sctx.ctx);
             let pre_doc = doc.clone();
             let merged = apply_patch(table_def, doc, &patch)?;
-            apply_update(tx, pg_schema_name, table_def, table, &id, &merged).await?;
-            verify_authorize_doc(table_def, &merged, ctx)?;
-            write_set.touch(table, &id, OpKind::Upsert);
+            apply_update(sctx.tx, sctx.pg_schema_name, table_def, table, &id, &merged).await?;
+            verify_authorize_doc(table_def, &merged, sctx.ctx)?;
+            sctx.write_set.touch(table, &id, OpKind::Upsert);
             // Upsert-update branch: same as Patch — before = matched
             // body (first touch), after = merged.
-            write_set.capture_doc(
+            sctx.write_set.capture_doc(
                 table,
                 &id,
                 Some(Some(&pre_doc)),
                 Some(Some(&merged)),
                 Some(created_at),
             );
-            results.push(serde_json::json!({ "id": id, "inserted": false }));
+            sctx.results
+                .push(serde_json::json!({ "id": id, "inserted": false }));
         }
     }
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn step_patch_by_query(
-    tx: &mut PgConnection,
-    pg_schema_name: &str,
-    schema: &SchemaDef,
-    ctx: &PrincipalCtx,
-    owner: Option<&str>,
-    write_set: &mut WriteSet,
-    results: &mut Vec<serde_json::Value>,
+    sctx: &mut StepCtx<'_>,
     table: &str,
     filter: &crate::query::FilterExpr,
     patch: &serde_json::Map<String, serde_json::Value>,
     limit_opt: Option<u32>,
 ) -> Result<(), RtDbError> {
-    let table_def = schema.table(table)?;
+    let pg_schema_name = sctx.pg_schema_name;
+    let table_def = sctx.schema.table(table)?;
     let limit = limit_opt
         .unwrap_or(MAX_BY_QUERY_ROWS)
         .min(MAX_BY_QUERY_ROWS);
     let (where_sql, binds, limit_ph) =
-        crate::query::compile_scan_where(table_def, ctx, owner, Some(filter))?;
+        crate::query::compile_scan_where(table_def, sctx.ctx, sctx.owner, Some(filter))?;
     let table_ident = pg_table(table);
     let base = format!(
         "SELECT \"id\", \"doc\", \"created_at\" FROM \"{pg_schema_name}\".\"{table_ident}\""
@@ -1780,7 +1653,7 @@ async fn step_patch_by_query(
     }
     // Fetch limit+1 so a full match set is detectable (`truncated`).
     query = query.bind(i64::from(limit) + 1);
-    let rows = query.fetch_all(&mut *tx).await?;
+    let rows = query.fetch_all(&mut *sctx.tx).await?;
     let truncated = rows.len() as u32 > limit;
     let take = std::cmp::min(rows.len(), limit as usize);
     for (id, doc_value, created_at) in rows.into_iter().take(take) {
@@ -1789,13 +1662,13 @@ async fn step_patch_by_query(
             _ => return Err(RtDbError::internal("stored doc is not a JSON object")),
         };
         let pre_doc = doc.clone();
-        let fields = stamp_owner(table_def, patch.clone(), owner);
-        let fields = stamp_authorize(table_def, fields, ctx);
+        let fields = stamp_owner(table_def, patch.clone(), sctx.owner);
+        let fields = stamp_authorize(table_def, fields, sctx.ctx);
         let merged = apply_patch(table_def, doc, &fields)?;
-        apply_update(tx, pg_schema_name, table_def, table, &id, &merged).await?;
-        verify_authorize_doc(table_def, &merged, ctx)?;
-        write_set.touch(table, &id, OpKind::Patch);
-        write_set.capture_doc(
+        apply_update(sctx.tx, pg_schema_name, table_def, table, &id, &merged).await?;
+        verify_authorize_doc(table_def, &merged, sctx.ctx)?;
+        sctx.write_set.touch(table, &id, OpKind::Patch);
+        sctx.write_set.capture_doc(
             table,
             &id,
             Some(Some(&pre_doc)),
@@ -1803,29 +1676,24 @@ async fn step_patch_by_query(
             Some(created_at),
         );
     }
-    results.push(serde_json::json!({ "patched": take, "truncated": truncated }));
+    sctx.results
+        .push(serde_json::json!({ "patched": take, "truncated": truncated }));
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn step_delete_by_query(
-    tx: &mut PgConnection,
-    pg_schema_name: &str,
-    schema: &SchemaDef,
-    ctx: &PrincipalCtx,
-    owner: Option<&str>,
-    write_set: &mut WriteSet,
-    results: &mut Vec<serde_json::Value>,
+    sctx: &mut StepCtx<'_>,
     table: &str,
     filter: &crate::query::FilterExpr,
     limit_opt: Option<u32>,
 ) -> Result<(), RtDbError> {
-    let table_def = schema.table(table)?;
+    let pg_schema_name = sctx.pg_schema_name;
+    let table_def = sctx.schema.table(table)?;
     let limit = limit_opt
         .unwrap_or(MAX_BY_QUERY_ROWS)
         .min(MAX_BY_QUERY_ROWS);
     let (where_sql, binds, limit_ph) =
-        crate::query::compile_scan_where(table_def, ctx, owner, Some(filter))?;
+        crate::query::compile_scan_where(table_def, sctx.ctx, sctx.owner, Some(filter))?;
     let table_ident = pg_table(table);
     let base = format!("SELECT \"id\" FROM \"{pg_schema_name}\".\"{table_ident}\"");
     let sql = if where_sql.is_empty() {
@@ -1843,7 +1711,7 @@ async fn step_delete_by_query(
         };
     }
     query = query.bind(i64::from(limit) + 1);
-    let rows = query.fetch_all(&mut *tx).await?;
+    let rows = query.fetch_all(&mut *sctx.tx).await?;
     let truncated = rows.len() as u32 > limit;
     let take = std::cmp::min(rows.len(), limit as usize);
     let ids: Vec<String> = rows.into_iter().take(take).map(|(id,)| id).collect();
@@ -1861,14 +1729,16 @@ async fn step_delete_by_query(
         for id in &ids {
             del = del.bind(id);
         }
-        del.execute(&mut *tx).await?;
+        del.execute(&mut *sctx.tx).await?;
     }
     for id in &ids {
-        write_set.touch(table, id, OpKind::Delete);
+        sctx.write_set.touch(table, id, OpKind::Delete);
         // Delete records no value: `after = None` ⇒ `fan_out` always re-runs.
-        write_set.capture_doc(table, id, None, Some(None), None);
+        sctx.write_set
+            .capture_doc(table, id, None, Some(None), None);
     }
-    results.push(serde_json::json!({ "deleted": deleted, "truncated": truncated }));
+    sctx.results
+        .push(serde_json::json!({ "deleted": deleted, "truncated": truncated }));
     Ok(())
 }
 

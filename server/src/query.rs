@@ -758,6 +758,20 @@ pub async fn execute_query(
     let table_def = schema.table(&q.table)?;
     let owner_field = table_def.owner_field.as_deref();
     let collaborators_field = table_def.collaborators_field.as_deref();
+    // Shared borrow-only context for the four read-path terminals that don't
+    // use the btree `QueryWindow` (point_read + the search family). Constructed
+    // once from the caller-resolved inputs and passed by shared reference;
+    // each terminal destructures it back into the same locals the inline body
+    // used. QA-105.
+    let sctx = SearchCtx {
+        pool,
+        db,
+        table_def,
+        table_name: q.table.as_str(),
+        owner_field,
+        collaborators_field,
+        ctx,
+    };
 
     // Principal markers (`{"$user":true}` / `{"$email":true}`) and malformed
     // field references are rejected inside `compile_filter` (SEC-125) — that
@@ -768,18 +782,7 @@ pub async fn execute_query(
 
     if let Some(id) = &q.get {
         reject_if_any_set(q, GET_PEERS, GET_MESSAGE)?;
-        return point_read(
-            pool,
-            db,
-            table_def,
-            &q.table,
-            id,
-            owner_field,
-            collaborators_field,
-            owner,
-            ctx,
-        )
-        .await;
+        return point_read(&sctx, id, owner).await;
     }
 
     if q.unique {
@@ -826,17 +829,7 @@ pub async fn execute_query(
     // else). Resolution and bind construction live in `execute_vector_search`.
     if let Some(vs) = &q.vector_search {
         reject_if_any_set(q, VECTOR_SEARCH_PEERS, VECTOR_SEARCH_MESSAGE)?;
-        return execute_vector_search(
-            pool,
-            db,
-            table_def,
-            &q.table,
-            vs,
-            owner_field,
-            collaborators_field,
-            ctx,
-        )
-        .await;
+        return execute_vector_search(&sctx, vs).await;
     }
 
     // Hybrid search terminal. Incompatible with every other terminal (including
@@ -845,17 +838,7 @@ pub async fn execute_query(
     // construction, and the fused SQL live in `execute_hybrid_search`.
     if let Some(hs) = &q.hybrid_search {
         reject_if_any_set(q, HYBRID_SEARCH_PEERS, HYBRID_SEARCH_MESSAGE)?;
-        return execute_hybrid_search(
-            pool,
-            db,
-            table_def,
-            &q.table,
-            hs,
-            owner_field,
-            collaborators_field,
-            ctx,
-        )
-        .await;
+        return execute_hybrid_search(&sctx, hs).await;
     }
 
     // Full-text search terminal. It ranks over a search index's tsvector and is
@@ -863,18 +846,7 @@ pub async fn execute_query(
     // the only field it composes with.
     if let Some(search) = &q.search {
         reject_if_any_set(q, SEARCH_PEERS, SEARCH_MESSAGE)?;
-        return execute_search(
-            pool,
-            db,
-            table_def,
-            &q.table,
-            search,
-            q.take,
-            owner_field,
-            collaborators_field,
-            ctx,
-        )
-        .await;
+        return execute_search(&sctx, search, q.take).await;
     }
 
     // Compile the index window (eq/range binds, client `filter`, owner/
@@ -2342,18 +2314,37 @@ fn plainto_tsquery_sql(language: Option<&str>, ph: usize) -> String {
 /// text is bound once via `$1` and reused in the `ORDER BY ts_rank`, so user
 /// text can never inject tsquery syntax. Unknown index / empty query →
 /// `BadRequest`, never a 500.
-#[allow(clippy::too_many_arguments)]
+/// Shared, borrow-only context for the read-path terminals that don't use the
+/// btree `QueryWindow` — `point_read` and the `search`/`vectorSearch`/
+/// `hybridSearch` family. Those four terminals share the same caller-resolved
+/// inputs (pool, db, the resolved table definition, the table name, and the
+/// per-row-auth fields derived from it, plus the principal), so `SearchCtx`
+/// bundles them the way `QueryWindow` bundles the index-window inputs and
+/// `StepCtx` (`txn.rs`) bundles the write-path inputs. Borrow-only: every
+/// field is a shared reference (these terminals read, never mutate), so it
+/// threads through `&SearchCtx` cleanly. QA-105.
+struct SearchCtx<'a> {
+    pool: &'a PgPool,
+    db: &'a str,
+    table_def: &'a TableDef,
+    table_name: &'a str,
+    owner_field: Option<&'a str>,
+    collaborators_field: Option<&'a str>,
+    ctx: &'a PrincipalCtx,
+}
+
 async fn execute_search(
-    pool: &PgPool,
-    db: &str,
-    table_def: &TableDef,
-    table_name: &str,
+    sctx: &SearchCtx<'_>,
     search: &SearchQuery,
     take: Option<u32>,
-    owner_field: Option<&str>,
-    collaborators_field: Option<&str>,
-    ctx: &PrincipalCtx,
 ) -> Result<QueryResult, RtDbError> {
+    let pool = sctx.pool;
+    let db = sctx.db;
+    let table_def = sctx.table_def;
+    let table_name = sctx.table_name;
+    let owner_field = sctx.owner_field;
+    let collaborators_field = sctx.collaborators_field;
+    let ctx = sctx.ctx;
     if search.query.trim().is_empty() {
         return Err(RtDbError::bad_request(
             "search query text must not be empty",
@@ -2439,17 +2430,17 @@ async fn execute_search(
 /// → `BadRequest`. Bind order: filter eq-binds occupy `$1..$k`, then (when the
 /// table is owner-gated and the caller is a user) the owner id occupies
 /// `$(k+1)`, then the query vector (`$n::vector`), then `limit`.
-#[allow(clippy::too_many_arguments)]
 async fn execute_vector_search(
-    pool: &PgPool,
-    db: &str,
-    table_def: &TableDef,
-    table_name: &str,
+    sctx: &SearchCtx<'_>,
     vs: &VectorSearchQuery,
-    owner_field: Option<&str>,
-    collaborators_field: Option<&str>,
-    ctx: &PrincipalCtx,
 ) -> Result<QueryResult, RtDbError> {
+    let pool = sctx.pool;
+    let db = sctx.db;
+    let table_def = sctx.table_def;
+    let table_name = sctx.table_name;
+    let owner_field = sctx.owner_field;
+    let collaborators_field = sctx.collaborators_field;
+    let ctx = sctx.ctx;
     let index_def = table_def
         .indexes
         .iter()
@@ -2579,17 +2570,17 @@ async fn execute_vector_search(
 /// `limit`. Column names come from `pg_search_col`/`pg_vector_col` over the
 /// resolved indexes (auto-selected when not named); all identifiers are
 /// schema-validated and double-quoted; every value is `$n`-bound.
-#[allow(clippy::too_many_arguments)]
 async fn execute_hybrid_search(
-    pool: &PgPool,
-    db: &str,
-    table_def: &TableDef,
-    table_name: &str,
+    sctx: &SearchCtx<'_>,
     hs: &HybridSearchQuery,
-    owner_field: Option<&str>,
-    collaborators_field: Option<&str>,
-    ctx: &PrincipalCtx,
 ) -> Result<QueryResult, RtDbError> {
+    let pool = sctx.pool;
+    let db = sctx.db;
+    let table_def = sctx.table_def;
+    let table_name = sctx.table_name;
+    let owner_field = sctx.owner_field;
+    let collaborators_field = sctx.collaborators_field;
+    let ctx = sctx.ctx;
     if hs.query.trim().is_empty() {
         return Err(RtDbError::bad_request(
             "hybrid search query text must not be empty",
@@ -2755,18 +2746,18 @@ async fn execute_hybrid_search(
     Ok(QueryResult::Docs(docs))
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn point_read(
-    pool: &PgPool,
-    db: &str,
-    table_def: &TableDef,
-    table_name: &str,
+    sctx: &SearchCtx<'_>,
     id: &str,
-    owner_field: Option<&str>,
-    collaborators_field: Option<&str>,
     owner: Option<&str>,
-    ctx: &PrincipalCtx,
 ) -> Result<QueryResult, RtDbError> {
+    let pool = sctx.pool;
+    let db = sctx.db;
+    let table_def = sctx.table_def;
+    let table_name = sctx.table_name;
+    let owner_field = sctx.owner_field;
+    let collaborators_field = sctx.collaborators_field;
+    let ctx = sctx.ctx;
     let pg_schema_name = pg_schema(db);
     let table_ident = pg_table(table_name);
     let row: Option<(String, serde_json::Value, i64, i64)> = sqlx::query_as(&format!(
