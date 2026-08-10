@@ -435,9 +435,7 @@ impl InMemoryRtDbClient {
         // `count` short-circuits before the sort (the count is the cardinality
         // of the filtered set, regardless of ordering).
         if q.count {
-            return Ok(Value::Number(serde_json::Number::from(
-                filtered.len() as i64
-            )));
+            return self.execute_count_terminal(&filtered);
         }
 
         // `distinct` terminal: unique values of the index field immediately
@@ -952,6 +950,14 @@ impl InMemoryRtDbClient {
             rows.retain(|d| matches_filter(filter, d));
         }
         Ok(Value::Array(rows))
+    }
+
+    /// `count` terminal — short-circuits before the sort (the count is the
+    /// cardinality of the filtered set, regardless of ordering).
+    fn execute_count_terminal(&self, filtered: &[StoredRow]) -> Result<Value, RtDbError> {
+        Ok(Value::Number(serde_json::Number::from(
+            filtered.len() as i64
+        )))
     }
 }
 
