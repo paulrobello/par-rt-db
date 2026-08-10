@@ -1135,7 +1135,7 @@ class InMemoryRtDbClient:
             filtered.append(row)
 
         if count:
-            return len(filtered)
+            return self._execute_count_terminal(filtered)
 
         # `distinct` terminal: unique values of the index field immediately
         # after the eq prefix over the matching set, sorted ascending, capped by
@@ -1464,6 +1464,14 @@ class InMemoryRtDbClient:
                 "hybridSearch cannot be combined with any other terminal",
             )
         return []
+
+    def _execute_count_terminal(self, filtered: list[StoredRow]) -> int:
+        """``count`` terminal: number of matching rows.
+
+        Lift of the former inline ``if count:`` arm of :meth:`run_query`; mirrors
+        ``ts-client``'s ``executeCountTerminal``.
+        """
+        return len(filtered)
 
     def run(self, q: Query, model: type = dict) -> Any:
         """Typed wrapper around :meth:`run_query` that deserializes the result
