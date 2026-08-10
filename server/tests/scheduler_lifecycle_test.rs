@@ -7,7 +7,7 @@ mod common;
 
 use std::time::Duration;
 
-use rtdb_server::{committer::CommitterRequest, db, scheduler};
+use rtdb_server::{committer::CommitterRequest, db, scheduler, txn::Transaction};
 
 #[tokio::test]
 async fn scheduler_exits_when_its_database_is_deleted() -> anyhow::Result<()> {
@@ -16,8 +16,19 @@ async fn scheduler_exits_when_its_database_is_deleted() -> anyhow::Result<()> {
     let db = format!("t{}", uuid::Uuid::now_v7().simple());
     db::create_database(&pool, &db).await?;
 
+    // Insert a far-future job so the scheduler uses the 2s poll cadence
+    // (MAX_SLEEP) instead of the 60s idle cadence (IDLE_SLEEP, ARC-102).
+    // Without a pending job, next_due returns None and the scheduler idles at
+    // 60s — too slow for this test's deletion-detection window. A far-future
+    // due_at keeps the scheduler polling at 2s so the deletion Err surfaces
+    // within the test timeout.
+    let far_future = i64::MAX - 1_000_000;
+    let txn = Transaction { steps: vec![] };
+    scheduler::insert(&pool, &db, "oneshot", far_future, &txn, None).await?;
+
     // No consumer is needed: the scheduler only sends on this channel when it
-    // claims due rows, and a freshly-created db has none, so it never blocks.
+    // claims due rows, and the far-future job never becomes due, so it never
+    // blocks.
     let (tx, _rx) = tokio::sync::mpsc::channel::<CommitterRequest>(8);
     let handle = tokio::spawn(scheduler::run_scheduler(pool.clone(), db.clone(), tx));
 

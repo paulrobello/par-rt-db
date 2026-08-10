@@ -387,13 +387,14 @@ pub async fn reschedule_cron_error(
 }
 
 use tokio::sync::mpsc::Sender;
-use tokio::time::{Duration, timeout};
+use tokio::time::Duration;
 
 use crate::committer::CommitterRequest;
 
-/// Maximum sleep between wakes. Bounds the latency of a job inserted with a
-/// sooner `due_at` than the current sleep target (the loop re-reads the min
-/// `due_at` each wake, so this only costs an occasional early wake).
+/// Maximum sleep between wakes when a db has at least one pending (future) job.
+/// Bounds the latency of a job inserted with a sooner `due_at` than the current
+/// sleep target (the loop re-reads the min `due_at` each wake, so this only
+/// costs an occasional early wake).
 const MAX_SLEEP: Duration = Duration::from_secs(2);
 
 /// The per-db scheduler loop. Owns recovery on start, then repeatedly: read
@@ -401,6 +402,15 @@ const MAX_SLEEP: Duration = Duration::from_secs(2);
 /// each as a fire-and-forget `RunScheduled` on the committer channel. Exits
 /// when the committer channel closes (its task died) — the next request to
 /// this db respawns both.
+///
+/// ARC-102: when `next_due` reports nothing due (either `None` = no jobs, or a
+/// future `due_at`), the loop skips the `claim_due` query entirely — there is
+/// nothing to claim. This removes the heavier `UPDATE … FOR UPDATE SKIP LOCKED`
+/// write from every poll on a db whose nearest job is not yet due (the idle
+/// write-every-2s the audit flagged). The `next_due` read still runs at the
+/// `MAX_SLEEP` cadence so a newly-inserted due job is caught promptly; reducing
+/// that read frequency further would require a notify-on-insert so an idle loop
+/// wakes immediately when `scheduler::insert` adds a row.
 pub async fn run_scheduler(pool: PgPool, db: String, committer_tx: Sender<CommitterRequest>) {
     if let Err(err) = ensure_table(&pool, &db).await {
         tracing::error!(db = %db, error = %err, "scheduler: ensure_table failed");
@@ -409,31 +419,51 @@ pub async fn run_scheduler(pool: PgPool, db: String, committer_tx: Sender<Commit
         tracing::error!(db = %db, error = %err, "scheduler: reset_running failed");
     }
     loop {
-        let sleep_target = match next_due(&pool, &db).await {
+        // `should_claim` is true only when a job is actually due; in all other
+        // cases we skip the claim_due query and just sleep + re-check next_due.
+        let (sleep, should_claim) = match next_due(&pool, &db).await {
             Ok(Some(due_at)) => {
                 let now = now_ms();
                 if due_at <= now {
-                    Duration::ZERO
+                    (Duration::ZERO, true)
                 } else {
-                    Duration::from_millis((due_at - now) as u64)
+                    // Future job: re-check at the 2s cadence so a newly-inserted
+                    // sooner job is picked up quickly, but skip the zero-row
+                    // claim_due query. ARC-102.
+                    (
+                        Duration::from_millis((due_at - now) as u64).min(MAX_SLEEP),
+                        false,
+                    )
                 }
             }
-            Ok(None) => MAX_SLEEP, // nothing pending
+            // Nothing pending: poll at MAX_SLEEP so a newly-inserted due job is
+            // caught promptly, but skip the claim_due write. ARC-102.
+            Ok(None) => (MAX_SLEEP, false),
             Err(err) => {
                 // The db may have been deleted (DROP SCHEMA) out from under this
-                // scheduler; if so, exit cleanly instead of erroring every 2s.
+                // scheduler; if so, exit cleanly instead of erroring every poll.
                 if matches!(crate::db::database_exists(&pool, &db).await, Ok(false)) {
                     tracing::info!(db = %db, "scheduler: database removed, exiting");
                     return;
                 }
                 tracing::error!(db = %db, error = %err, "scheduler: next_due failed");
-                MAX_SLEEP
+                (MAX_SLEEP, false)
             }
         };
-        let sleep = sleep_target.min(MAX_SLEEP);
         if !sleep.is_zero() {
-            // Bound the sleep so a shutdown/respawn can't hang the task.
-            let _ = timeout(MAX_SLEEP, tokio::time::sleep(sleep)).await;
+            // Select on the committer channel close so the longer IDLE_SLEEP
+            // can't delay exit detection — a closed channel means the committer
+            // task is gone and this scheduler is useless.
+            tokio::select! {
+                _ = tokio::time::sleep(sleep) => {}
+                _ = committer_tx.closed() => {
+                    tracing::debug!(db = %db, "scheduler: committer channel closed, exiting");
+                    return;
+                }
+            }
+        }
+        if !should_claim {
+            continue; // ARC-102: nothing due — skip claim_due
         }
         let now = now_ms();
         let claimed = match claim_due(&pool, &db, now, CLAIM_BATCH).await {

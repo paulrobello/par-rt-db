@@ -66,17 +66,18 @@ pub async fn check(pool: &PgPool, db: &str, mut_id: &str) -> Result<Option<Vec<V
 /// not on the mutation hot path. At-least-once semantics: a row may briefly
 /// outlive its `expires_at` until the next cleanup tick, which is harmless
 /// (a replay after TTL merely re-reads a slightly-still-cached result).
-pub async fn cleanup_expired(pool: &PgPool, db: &str) -> Result<(), RtDbError> {
+/// Returns the number of rows deleted so the caller can back off when idle.
+pub async fn cleanup_expired(pool: &PgPool, db: &str) -> Result<u64, RtDbError> {
     validate_db_name(db)?;
     let schema = pg_schema(db);
     let now = now_ms();
-    sqlx::query(&format!(
+    let res = sqlx::query(&format!(
         "DELETE FROM \"{schema}\".mutations WHERE expires_at < $1"
     ))
     .bind(now)
     .execute(pool)
     .await?;
-    Ok(())
+    Ok(res.rows_affected())
 }
 
 /// Periodic background loop that drains expired dedup rows for one database.
@@ -86,6 +87,13 @@ pub async fn cleanup_expired(pool: &PgPool, db: &str) -> Result<(), RtDbError> {
 /// resolves when the per-db committer task, the sole `Receiver` owner, dies)
 /// — so a dying committer task takes its cleanup task with it and the next
 /// request respawns both.
+///
+/// ARC-102: after a sweep that deletes zero rows, backs off to
+/// `CLEANUP_INTERVAL_IDLE` (5 min). On an idle db the dedup table is empty and
+/// a DELETE every 60s is pure overhead. Any sweep that deletes rows resets the
+/// cadence to `CLEANUP_INTERVAL` (60s). Expired rows are still filtered at
+/// read time (`check` adds `expires_at > now`), so delaying physical cleanup
+/// does not affect correctness.
 pub async fn run_cleanup(
     pool: PgPool,
     db: String,
@@ -96,17 +104,27 @@ pub async fn run_cleanup(
     if let Err(err) = ensure_table(&pool, &db).await {
         tracing::error!(db = %db, error = %err, "mutation_log cleanup: ensure_table failed");
     }
-    let mut tick = tokio::time::interval(CLEANUP_INTERVAL);
-    tick.tick().await; // interval's first tick fires immediately; skip it
+    let mut interval = CLEANUP_INTERVAL;
     loop {
         tokio::select! {
-            _ = tick.tick() => {
-                if let Err(err) = cleanup_expired(&pool, &db).await {
-                    if matches!(crate::db::database_exists(&pool, &db).await, Ok(false)) {
-                        tracing::info!(db = %db, "mutation_log cleanup: database removed, exiting");
-                        return;
+            _ = tokio::time::sleep(interval) => {
+                match cleanup_expired(&pool, &db).await {
+                    Ok(deleted) => {
+                        // ARC-102: back off when nothing was deleted; reset when
+                        // rows were reclaimed (the db is actively deduping).
+                        interval = if deleted == 0 {
+                            CLEANUP_INTERVAL_IDLE
+                        } else {
+                            CLEANUP_INTERVAL
+                        };
                     }
-                    tracing::warn!(db = %db, error = %err, "mutation_log cleanup failed");
+                    Err(err) => {
+                        if matches!(crate::db::database_exists(&pool, &db).await, Ok(false)) {
+                            tracing::info!(db = %db, "mutation_log cleanup: database removed, exiting");
+                            return;
+                        }
+                        tracing::warn!(db = %db, error = %err, "mutation_log cleanup failed");
+                    }
                 }
             }
             _ = committer_tx.closed() => {
@@ -119,6 +137,12 @@ pub async fn run_cleanup(
 
 /// How often `run_cleanup` sweeps expired dedup rows for one database.
 const CLEANUP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Backoff interval after a sweep that deleted zero rows (ARC-102). An idle
+/// db's dedup table is empty; sweeping every 60s wastes one query per minute
+/// per idle db. Expired rows are filtered at read time regardless, so a 5-min
+/// cleanup cadence does not affect correctness.
+const CLEANUP_INTERVAL_IDLE: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// Caches `results` under `mut_id` for `ttl_ms`. Uses `ON CONFLICT DO NOTHING`
 /// as a safety net only — the per-db committer already serializes every

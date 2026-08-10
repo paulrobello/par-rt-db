@@ -12,6 +12,16 @@ use crate::error::RtDbError;
 /// (SEC-008). Raising this is a code change, not a config knob.
 pub(crate) const HARD_MAX_FILE_SIZE: usize = 100 * 1024 * 1024;
 
+/// Default sampling interval for the subscription-skip shadow verifier
+/// (ARC-101). A wrong skip is otherwise silent (no error — the client just
+/// never hears the update), so the verifier ships ON at 1-in-1000: one extra
+/// query per thousand skips to re-run and diff against the last pushed result.
+/// This is the runtime detection for the one failure mode the architecture
+/// documents as silent; 0 disables it. A malformed/typo'd value falls back to
+/// this default (not 0) so a typo cannot silently disable the safety net
+/// (pre-empts ARC-118).
+pub(crate) const DEFAULT_SUBS_VERIFY_SKIP_EVERY: u64 = 1000;
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub port: u16,                            // RTDB_PORT, default 8300
@@ -121,11 +131,11 @@ pub struct Config {
     // a dropped realtime update — so it is logged at ERROR, counted in
     // `rtdb_subs_missed_pushes_total`, and the corrected result is pushed.
     //
-    // 0 = off (default). 1 = verify every skip (integration tests). 100 = 1%.
-    // Each verification costs exactly the Postgres round-trip the skip avoided,
-    // so this trades the optimization back for confidence — keep N large in
-    // production. Sampling is deterministic (every Nth skip), not random, so a
-    // test can pin it. RTDB_SUBS_VERIFY_SKIP_EVERY.
+    // 0 = off; ships ON at 1000 by default (ARC-101). 1 = verify every skip
+    // (integration tests). Each verification costs exactly the Postgres
+    // round-trip the skip avoided, so this trades the optimization back for
+    // confidence — keep N large in production. Sampling is deterministic (every
+    // Nth skip), not random, so a test can pin it. RTDB_SUBS_VERIFY_SKIP_EVERY.
     pub subs_verify_skip_every: u64,
     // Document TTL reaper. RTDB_TTL_SWEEP_INTERVAL_SECS (default 60) is the
     // per-db cadence; RTDB_TTL_BATCH (default 5000) bounds rows deleted per
@@ -342,12 +352,17 @@ impl Config {
             Err(_) => 7,
         };
 
-        // Skip verification: default off (0). An unparseable value falls back to
-        // off rather than to a costly rate, matching the permissiveness of the
-        // parses above while failing safe on the expensive side.
+        // Skip verification: ships ON at DEFAULT_SUBS_VERIFY_SKIP_EVERY (ARC-101).
+        // A wrong skip is otherwise silent, so the verifier is the runtime
+        // detection for the documented silent-failure mode. Both a missing var
+        // and an unparseable value fall back to the default (not 0), so a typo
+        // cannot silently disable the safety net (pre-empts ARC-118).
         let subs_verify_skip_every = match std::env::var("RTDB_SUBS_VERIFY_SKIP_EVERY") {
-            Ok(v) => v.trim().parse::<u64>().unwrap_or(0),
-            Err(_) => 0,
+            Ok(v) => v
+                .trim()
+                .parse::<u64>()
+                .unwrap_or(DEFAULT_SUBS_VERIFY_SKIP_EVERY),
+            Err(_) => DEFAULT_SUBS_VERIFY_SKIP_EVERY,
         };
 
         // Document TTL reaper. Best-effort expiry, so boot-only (not hot). An
@@ -862,6 +877,18 @@ mod tests {
     fn structurally_invalid_row_is_still_rejected() {
         let row = serde_json::json!({ "allowedOrigins": 42 });
         assert!(serde_json::from_value::<PersistedHotConfig>(row).is_err());
+    }
+
+    /// ARC-101: the subscription-skip shadow verifier ships ON by default so
+    /// `rtdb_subs_missed_pushes_total` is reachable in every deploy (including
+    /// production). A non-zero, non-trivial default is the whole fix; if this
+    /// regresses to 0 the metric becomes structurally incapable of moving.
+    #[test]
+    fn subs_verify_skip_default_ships_on_at_a_sampling_interval() {
+        assert_eq!(
+            DEFAULT_SUBS_VERIFY_SKIP_EVERY, 1000,
+            "ARC-101: the shadow verifier must ship ON (non-zero default)"
+        );
     }
 
     #[test]

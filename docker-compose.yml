@@ -105,8 +105,9 @@ services:
       RTDB_GITHUB_BASE_URL: ${RTDB_GITHUB_BASE_URL:-https://github.com}
       RTDB_GITHUB_API_URL: ${RTDB_GITHUB_API_URL:-https://api.github.com}
       RTDB_GITLAB_BASE_URL: ${RTDB_GITLAB_BASE_URL:-https://gitlab.com}
-      # Shadow-verify 1 subscription-invalidation skip in every N (0 = off).
-      RTDB_SUBS_VERIFY_SKIP_EVERY: ${RTDB_SUBS_VERIFY_SKIP_EVERY:-0}
+      # Shadow-verify 1 subscription-invalidation skip in every N. Ships ON at
+      # 1000 (ARC-101); 0 = off.
+      RTDB_SUBS_VERIFY_SKIP_EVERY: ${RTDB_SUBS_VERIFY_SKIP_EVERY:-1000}
       # On-the-fly image transforms on storage serve (ENH-014). All optional;
       # defaults mirror the server's code defaults.
       RTDB_IMAGE_TRANSFORMS_ENABLED: ${RTDB_IMAGE_TRANSFORMS_ENABLED:-true}

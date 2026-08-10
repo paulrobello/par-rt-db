@@ -244,6 +244,7 @@ impl Committers {
             db.to_string(),
             tx.clone(),
             self.ttl_sweep_interval,
+            self.schemas.clone(),
         ));
         // Per-db storage-quota cache warmer (ARC-004): periodically re-measures
         // the db's on-disk size off the committer turn so `enforce` is a cheap
@@ -573,7 +574,16 @@ async fn publish_taps(
     {
         tracing::warn!(db = %ctx.db, source, error = %err, "webhook enqueue failed");
     }
-    if refresh_quota_cache {
+    if refresh_quota_cache && ctx.hot.load().max_storage_bytes_per_db != 0 {
+        // ARC-103: gate the per-write cache refresh on a configured cap, mirroring
+        // `run_quota_warmer`'s tick gate above exactly. On a default instance
+        // (cap = 0) `enforce` returns Ok(0) immediately and the spawned catalog
+        // aggregate would populate a cache nothing reads — a per-mutation
+        // `pg_total_relation_size` scan competing with the serialized committer
+        // for the same pool. With a cap configured the warmer (ARC-004) keeps the
+        // reading bounded-stale; this spawn tightens it right after a growing
+        // write so a subsequent enforce sees the fresh size. Divergent gates are
+        // how this drifted in the first place — keep them identical.
         let quotas = ctx.quotas.clone();
         let pool = ctx.pool.clone();
         let db = ctx.db.clone();
