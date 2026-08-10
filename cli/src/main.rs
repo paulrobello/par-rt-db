@@ -7,8 +7,9 @@
 //! `RTDB_URL` / `RTDB_DB` / `RTDB_TOKEN` / `RTDB_ADMIN_KEY` env vars.
 //!
 //! Admin subcommands (`list-dbs`, `create-db`, `push-schema`, `mint-token`,
-//! `revoke-token`) send the instance admin key as the bearer. Data-plane
-//! subcommands (`query`, `mutate`) send a machine token scoped to `--db`.
+//! `revoke-token`, `sessions list|revoke`) send the instance admin key as the
+//! bearer. Data-plane subcommands (`query`, `mutate`) send a machine token
+//! scoped to `--db`.
 
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
@@ -67,6 +68,11 @@ enum Command {
         /// Token id (`tok_…`) to revoke.
         id: String,
     },
+    /// Manage active interactive sessions. (admin)
+    Sessions {
+        #[command(subcommand)]
+        command: SessionsCommand,
+    },
     /// Run a Query JSON against `--db` and print the result. (machine token)
     Query {
         /// Query JSON, e.g. `{"table":"items","take":10}`. Prefix with `@` to
@@ -89,6 +95,30 @@ enum Command {
         /// also honored; this flag forces it on.
         #[arg(long)]
         dry_run: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum SessionsCommand {
+    /// List active interactive sessions, newest-first.
+    List {
+        /// Filter by user id or email.
+        #[arg(long)]
+        user: Option<String>,
+        /// Cap the result count (server default 200, clamped to [1, 1000]).
+        #[arg(long)]
+        limit: Option<u64>,
+    },
+    /// Revoke a single session by token hash, or every session for a user.
+    Revoke {
+        /// Token hash (sha256 digest) of the session to revoke. Mutually
+        /// exclusive with `--user`.
+        #[arg(long)]
+        token_hash: Option<String>,
+        /// Revoke every session for this user id. Mutually exclusive with
+        /// `--token-hash`.
+        #[arg(long)]
+        user: Option<String>,
     },
 }
 
@@ -129,6 +159,43 @@ async fn main() -> Result<()> {
             let c = admin_client(&cli)?;
             c.revoke_token(id).await.map_err(map_err)?;
             eprintln!("revoked token {id}");
+        }
+        Command::Sessions { command } => {
+            let c = admin_client(&cli)?;
+            match command {
+                SessionsCommand::List { user, limit } => {
+                    let opts = par_rt_db_client::SessionListOptions {
+                        user: user.clone(),
+                        limit: limit.as_ref().map(|n| *n as i64),
+                    };
+                    let rows = c.list_sessions(Some(&opts)).await.map_err(map_err)?;
+                    for s in &rows {
+                        let email = s.email.as_deref().unwrap_or("-");
+                        let kind = if s.anonymous { "anon" } else { "user" };
+                        println!(
+                            "{}\t{}\t{}\t{}\texp={}",
+                            s.token_hash, s.user_id, kind, email, s.expires_at
+                        );
+                    }
+                    eprintln!("{} session(s)", rows.len());
+                }
+                SessionsCommand::Revoke { token_hash, user } => match (token_hash, user) {
+                    (Some(hash), None) => {
+                        c.revoke_session(hash).await.map_err(map_err)?;
+                        eprintln!("revoked session {hash}");
+                    }
+                    (None, Some(uid)) => {
+                        let r = c.revoke_user_sessions(uid).await.map_err(map_err)?;
+                        eprintln!("revoked {} session(s) for user {uid}", r.revoked);
+                    }
+                    (Some(_), Some(_)) => {
+                        anyhow::bail!("--token-hash and --user are mutually exclusive");
+                    }
+                    (None, None) => {
+                        anyhow::bail!("sessions revoke requires --token-hash or --user");
+                    }
+                },
+            }
         }
         Command::Query { query } => {
             let db = require_db(&cli)?;
@@ -302,6 +369,52 @@ mod tests {
             panic!("expected RevokeToken");
         };
         assert_eq!(id, "tok_1");
+
+        // `sessions list` parses with optional filters.
+        let cli = Cli::try_parse_from([
+            "rtdb",
+            "--url",
+            "http://x",
+            "--admin-key",
+            "k",
+            "sessions",
+            "list",
+            "--user",
+            "u1",
+            "--limit",
+            "50",
+        ])
+        .unwrap();
+        let Command::Sessions { command } = cli.command else {
+            panic!("expected Sessions");
+        };
+        let SessionsCommand::List { user, limit } = command else {
+            panic!("expected SessionsCommand::List");
+        };
+        assert_eq!(user.as_deref(), Some("u1"));
+        assert_eq!(limit, Some(50));
+
+        // `sessions revoke --token-hash` and `--user` both parse.
+        let cli = Cli::try_parse_from([
+            "rtdb",
+            "--url",
+            "http://x",
+            "--admin-key",
+            "k",
+            "sessions",
+            "revoke",
+            "--token-hash",
+            "abc123",
+        ])
+        .unwrap();
+        let Command::Sessions { command } = cli.command else {
+            panic!("expected Sessions");
+        };
+        let SessionsCommand::Revoke { token_hash, user } = command else {
+            panic!("expected SessionsCommand::Revoke");
+        };
+        assert_eq!(token_hash.as_deref(), Some("abc123"));
+        assert_eq!(user, None);
     }
 
     #[test]

@@ -85,8 +85,8 @@ pub use wire::admin::{
     AdminMember, AuditEntry, AuditQuery, Cast, CastFailure, ConfigResponse, CreateWebhookOptions,
     DbStats, Directive, DirectiveReport, HotConfig, HotConfigPatch, LatencyStats,
     ListDeliveriesOptions, MigrateRequest, MigrateRequestOwned, MigrateResult, MintTokenOptions,
-    MintedToken, OpEvent, SampleChange, TableStat, TokenInfo, Webhook, WebhookDelivery,
-    WebhookEditOptions,
+    MintedToken, OpEvent, SampleChange, SessionInfo, SessionListOptions, TableStat, TokenInfo,
+    Webhook, WebhookDelivery, WebhookEditOptions,
 };
 
 #[cfg(feature = "admin")]

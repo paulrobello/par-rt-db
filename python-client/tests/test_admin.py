@@ -34,6 +34,7 @@ from par_rt_db.admin import (
     RtDbAdminClient,
     SchemaHistoryEntry,
     SchemaHistorySummary,
+    SessionInfo,
     SubscriptionsResponse,
     TokenInfo,
     Webhook,
@@ -283,6 +284,100 @@ def test_list_tokens_sends_db_query_param() -> None:
     assert captured["url"].params["db"] == "kanban"
 
 
+# --- sync: interactive sessions (GET/DELETE /admin/sessions) --------------
+
+
+def test_list_sessions_parses_rows_and_sends_filters() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["url"] = request.url
+        return httpx.Response(
+            200,
+            json={
+                "sessions": [
+                    {
+                        "tokenHash": "abc",
+                        "userId": "u1",
+                        "email": "a@x.example",
+                        "login": None,
+                        "anonymous": False,
+                        "createdAt": 1000,
+                        "expiresAt": 2000,
+                    },
+                    {
+                        "tokenHash": "def",
+                        "userId": "u1",
+                        "email": None,
+                        "login": None,
+                        "anonymous": True,
+                        "createdAt": 1100,
+                        "expiresAt": 2100,
+                    },
+                ]
+            },
+        )
+
+    with _sync_client(handler) as c:
+        rows = c.list_sessions(user="u1", limit=50)
+    assert len(rows) == 2
+    assert all(isinstance(r, SessionInfo) for r in rows)
+    assert rows[0].token_hash == "abc"
+    assert rows[0].user_id == "u1"
+    assert rows[0].email == "a@x.example"
+    assert rows[0].login is None
+    assert rows[0].anonymous is False
+    assert rows[1].email is None
+    assert rows[1].anonymous is True
+    assert captured["url"].path == "/admin/sessions"
+    assert captured["url"].params["user"] == "u1"
+    assert captured["url"].params["limit"] == "50"
+
+
+def test_list_sessions_omits_unset_filters() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["url"] = request.url
+        return httpx.Response(200, json={"sessions": []})
+
+    with _sync_client(handler) as c:
+        rows = c.list_sessions()
+    assert rows == []
+    assert "user" not in captured["url"].params
+    assert "limit" not in captured["url"].params
+
+
+def test_revoke_session_deletes_by_token_hash() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["method"] = request.method
+        captured["url"] = request.url
+        return httpx.Response(200, json={"ok": True})
+
+    with _sync_client(handler) as c:
+        c.revoke_session("abc123")
+    assert captured["method"] == "DELETE"
+    assert captured["url"].path == "/admin/sessions/abc123"
+
+
+def test_revoke_user_sessions_deletes_with_user_query_and_parses_count() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["method"] = request.method
+        captured["url"] = request.url
+        return httpx.Response(200, json={"ok": True, "revoked": 3})
+
+    with _sync_client(handler) as c:
+        count = c.revoke_user_sessions("u1")
+    assert count == 3
+    assert captured["method"] == "DELETE"
+    assert captured["url"].path == "/admin/sessions"
+    assert captured["url"].params["user"] == "u1"
+
+
 # --- sync: error envelope -------------------------------------------------
 
 
@@ -380,6 +475,46 @@ async def test_async_list_tokens_parses_rows() -> None:
     assert rows[1].read_only is False
     assert rows[1].tables is None
     assert rows[1].revoked is True
+
+
+async def test_async_list_revoke_sessions_mirror_sync() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.setdefault("urls", []).append(
+            (request.method, request.url.path, dict(request.url.params))
+        )
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                json={
+                    "sessions": [
+                        {
+                            "tokenHash": "abc",
+                            "userId": "u1",
+                            "email": None,
+                            "login": None,
+                            "anonymous": False,
+                            "createdAt": 1,
+                            "expiresAt": 2,
+                        }
+                    ]
+                },
+            )
+        if request.url.path == "/admin/sessions/abc":
+            return httpx.Response(200, json={"ok": True})
+        return httpx.Response(200, json={"ok": True, "revoked": 2})
+
+    async with _async_client(handler) as c:
+        rows = await c.list_sessions(user="u1")
+        await c.revoke_session("abc")
+        count = await c.revoke_user_sessions("u1")
+    assert len(rows) == 1
+    assert rows[0].token_hash == "abc"
+    assert count == 2
+    assert ("GET", "/admin/sessions", {"user": "u1"}) in captured["urls"]
+    assert ("DELETE", "/admin/sessions/abc", {}) in captured["urls"]
+    assert ("DELETE", "/admin/sessions", {"user": "u1"}) in captured["urls"]
 
 
 # --- mirrored admin surface (ENH-005 parity sweep) -----------------------

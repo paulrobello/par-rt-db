@@ -9,8 +9,12 @@ import {
   OAUTH_POLL_INTERVAL_MS,
   OAUTH_POLL_TIMEOUT_MS,
   RtDbProvider,
+  signInWithApple,
   signInWithGitHub,
+  signInWithGitLab,
   signInWithGoogle,
+  signInWithMicrosoft,
+  signInWithOidc,
   Unauthenticated,
   useConnectionState,
   usePaginatedQuery,
@@ -253,6 +257,47 @@ describe("signInWithGoogle (begin + poll relay)", () => {
       "noopener,noreferrer,width=600,height=700",
     );
   });
+});
+
+describe("signInWith* convenience exports (all six providers)", () => {
+  // The server ships six providers; each convenience export must hit its own
+  // `/auth/{provider}/begin` URL. Iterating the full set here keeps a future
+  // provider addition from silently missing its convenience export.
+  const cases: Array<[string, (baseUrl: string) => Promise<string>]> = [
+    ["github", signInWithGitHub],
+    ["google", signInWithGoogle],
+    ["gitlab", signInWithGitLab],
+    ["microsoft", signInWithMicrosoft],
+    ["apple", signInWithApple],
+    ["oidc", signInWithOidc],
+  ];
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  it.each(cases)(
+    "signInWith%s begins the %s flow and resolves with the polled token",
+    async (provider, fn) => {
+      vi.useFakeTimers();
+      const fetchSpy = vi.spyOn(globalThis, "fetch");
+      fetchSpy.mockResolvedValueOnce(oauthResp({ authorizeUrl: "about:blank", state: "s1" }));
+      fetchSpy.mockResolvedValueOnce(
+        oauthResp({ status: "complete", token: `${provider}-tok`, user: { kind: "user" } }),
+      );
+      vi.spyOn(window, "open").mockReturnValue(null);
+
+      const promise = fn("http://h:8300");
+      await vi.advanceTimersByTimeAsync(OAUTH_POLL_INTERVAL_MS);
+
+      await expect(promise).resolves.toBe(`${provider}-tok`);
+      expect(fetchSpy).toHaveBeenCalledWith(
+        expect.stringContaining(`/auth/${provider}/begin?origin=`),
+        { credentials: "include" },
+      );
+    },
+  );
 });
 
 describe("useRtDbAuth signIn routing", () => {

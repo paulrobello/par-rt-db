@@ -139,6 +139,57 @@ pub struct TokenInfo {
     pub tables: Option<Vec<String>>,
 }
 
+// ---- interactive sessions (GET/DELETE /admin/sessions) ------------------
+//
+// Mirror `ts-client`'s `SessionInfo` + `listSessions`/`revokeSession`/
+// `revokeUserSessions` byte-for-byte (camelCase). `tokenHash` is a
+// non-reversible sha256 digest (the plaintext token is never stored), safe
+// to surface to an admin and used to target a row for revoke. `email`/`login`
+// are `None` when the user has none (e.g. an anonymous session).
+
+/// One active interactive session as returned by `GET /admin/sessions`.
+/// Mirrors `ts-client`'s `SessionInfo` (camelCase).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionInfo {
+    pub token_hash: String,
+    pub user_id: String,
+    /// `None` when the user has no email (e.g. an anonymous session).
+    #[serde(default)]
+    pub email: Option<String>,
+    /// `None` when the user has no login handle.
+    #[serde(default)]
+    pub login: Option<String>,
+    pub anonymous: bool,
+    pub created_at: i64,
+    pub expires_at: i64,
+}
+
+/// Optional filter for `list_sessions` (`GET /admin/sessions?user=&limit=`).
+/// Both fields optional: `user` filters by user id or email; `limit` pages the
+/// result (server default 200, clamped to `[1, 1000]`). Mirrors the
+/// `{user?, limit?}` shape in `ts-client`'s `listSessions`.
+#[derive(Debug, Clone, Default)]
+pub struct SessionListOptions {
+    pub user: Option<String>,
+    pub limit: Option<i64>,
+}
+
+/// Response wrapper for `GET /admin/sessions` → `{sessions:[...]}`.
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct SessionsResponse {
+    pub(crate) sessions: Vec<SessionInfo>,
+}
+
+/// Response for `DELETE /admin/sessions?user={userId}` → `{ok, revoked}` where
+/// `revoked` is the count of sessions dropped. Mirrors `ts-client`'s
+/// `revokeUserSessions` return shape.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RevokeUserSessionsResponse {
+    pub ok: bool,
+    pub revoked: i64,
+}
+
 /// p50/p95/p99 latency percentile triple (microseconds). Mirrors
 /// `server::metrics::LatencyStats`. Field names are already lowercase, so
 /// `rename_all = "camelCase"` leaves them as `p50`/`p95`/`p99` on the wire.

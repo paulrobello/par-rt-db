@@ -162,17 +162,22 @@ export function useConnectionState(): ConnectionState {
   return state;
 }
 
+/** Every OAuth provider the server ships. The union is the single source of
+ *  truth so the signIn signature, the popup helper, and the convenience
+ *  exports cannot drift apart. Keep this in sync with `server/src/auth`. */
+export type OAuthProvider = "github" | "google" | "gitlab" | "microsoft" | "apple" | "oidc";
+
 export function useRtDbAuth(): {
   state: AuthState;
   user: AuthedUser | null;
-  signIn: (provider?: "github" | "google" | "oidc") => Promise<void>;
+  signIn: (provider?: OAuthProvider) => Promise<void>;
   signInAnonymous: () => Promise<void>;
   signOut: () => Promise<void>;
 } {
   const { client, authBaseUrl, state, user } = useContextValue();
 
   const signIn = useCallback(
-    async (provider: "github" | "google" | "oidc" = "github") => {
+    async (provider: OAuthProvider = "github") => {
       // The OAuth popup runs in both modes; the server sets the HttpOnly
       // session cookie on its callback regardless. Token mode persists the
       // posted-back token; cookie mode ignores it and re-dials tokenless so the
@@ -299,7 +304,7 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
  * session token is ready. `noopener` means `window.open` returns null, so the
  * old postMessage/closed-poll relay is replaced by this poll.
  */
-function signInWithOAuth(baseUrl: string, provider: "github" | "google" | "oidc"): Promise<string> {
+function signInWithOAuth(baseUrl: string, provider: OAuthProvider): Promise<string> {
   const api = baseUrl.replace(/\/+$/, "");
   const spaOrigin = window.location.origin;
   return (async () => {
@@ -336,4 +341,23 @@ export function signInWithGoogle(baseUrl: string): Promise<string> {
  *  Active only when the server has `RTDB_OIDC_*` configured (any standards-compliant IdP). */
 export function signInWithOidc(baseUrl: string): Promise<string> {
   return signInWithOAuth(baseUrl, "oidc");
+}
+
+/** Begins the GitLab OAuth flow and resolves with the session token polled from `/auth/state`. */
+export function signInWithGitLab(baseUrl: string): Promise<string> {
+  return signInWithOAuth(baseUrl, "gitlab");
+}
+
+/** Begins the Microsoft (Entra ID / Azure AD v2) OAuth flow and resolves with the
+ *  session token polled from `/auth/state`. The server derives the authorize/token
+ *  endpoints from `RTDB_MICROSOFT_TENANT`. */
+export function signInWithMicrosoft(baseUrl: string): Promise<string> {
+  return signInWithOAuth(baseUrl, "microsoft");
+}
+
+/** Begins the Apple OAuth flow and resolves with the session token polled from
+ *  `/auth/state`. Apple uses `response_mode=form_post`, served by the server's
+ *  dedicated POST `/auth/apple/callback`. */
+export function signInWithApple(baseUrl: string): Promise<string> {
+  return signInWithOAuth(baseUrl, "apple");
 }

@@ -116,6 +116,25 @@ class TokenInfo(_Wire):
     tables: list[str] | None = None
 
 
+class SessionInfo(_Wire):
+    """One active interactive session row from ``GET /admin/sessions``.
+
+    ``tokenHash`` is a non-reversible sha256 digest (the plaintext token is
+    never stored), safe to surface to an admin and used to target a row for
+    revoke. ``email``/``login`` are ``None`` when the user has none (e.g. an
+    anonymous session). Mirrors the ts-client ``SessionInfo`` byte-for-byte
+    (camelCase on the wire).
+    """
+
+    token_hash: str
+    user_id: str
+    email: str | None = None
+    login: str | None = None
+    anonymous: bool = False
+    created_at: int
+    expires_at: int
+
+
 class TableStat(_Wire):
     """One row of ``DbStats.tables`` — ``{name, rowCount, sizeBytes}``."""
 

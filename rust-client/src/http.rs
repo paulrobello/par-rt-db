@@ -1341,6 +1341,72 @@ impl RtDbHttpClient {
         Ok(parsed.entries)
     }
 
+    // ── Interactive-session management (GET/DELETE /admin/sessions) ──
+    //
+    // Mirror `ts-client`'s `listSessions`/`revokeSession`/`revokeUserSessions`
+    // one-to-one — paths, query params, and return shapes are identical; only
+    // the method names are snake_cased. Each call carries the admin-key bearer
+    // like every other admin method.
+
+    /// `GET /admin/sessions?user=&limit=` → `{sessions:[...]}`, newest-first.
+    /// `opts = None` lists every session server-wide (server default limit 200,
+    /// clamped to `[1, 1000]`). `opts.user` filters by user id or email.
+    pub async fn list_sessions(
+        &self,
+        opts: Option<&crate::wire::admin::SessionListOptions>,
+    ) -> Result<Vec<crate::wire::admin::SessionInfo>, RtDbError> {
+        let user_s = opts.and_then(|o| o.user.clone());
+        let limit_s = opts.and_then(|o| o.limit).map(|n| n.to_string());
+        let mut q: Vec<(&str, &str)> = Vec::with_capacity(2);
+        if let Some(ref v) = user_s {
+            q.push(("user", v.as_str()));
+        }
+        if let Some(ref v) = limit_s {
+            q.push(("limit", v.as_str()));
+        }
+        let parsed: crate::wire::admin::SessionsResponse =
+            self.get_json("/admin/sessions", &q).await?;
+        Ok(parsed.sessions)
+    }
+
+    /// `DELETE /admin/sessions/{tokenHash}` → `{ok:true}`. Revokes a single
+    /// session by its non-reversible sha256 digest.
+    pub async fn revoke_session(&self, token_hash: &str) -> Result<(), RtDbError> {
+        let resp = self
+            .client
+            .delete(format!("{}/admin/sessions/{token_hash}", self.url))
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(|e| RtDbError::internal(format!("revoke_session request failed: {e}")))?;
+        self.expect_ok(resp).await
+    }
+
+    /// `DELETE /admin/sessions?user={userId}` → `{ok, revoked}`. Revokes every
+    /// session for a user; `revoked` is the count of sessions dropped.
+    pub async fn revoke_user_sessions(
+        &self,
+        user_id: &str,
+    ) -> Result<crate::wire::admin::RevokeUserSessionsResponse, RtDbError> {
+        let resp = self
+            .client
+            .delete(format!("{}/admin/sessions", self.url))
+            .bearer_auth(&self.token)
+            .query(&[("user", user_id)])
+            .send()
+            .await
+            .map_err(|e| {
+                RtDbError::internal(format!("revoke_user_sessions request failed: {e}"))
+            })?;
+        let status = resp.status();
+        if status.is_success() {
+            return self
+                .deserialize::<crate::wire::admin::RevokeUserSessionsResponse>(resp)
+                .await;
+        }
+        Err(self.error_response(resp).await)
+    }
+
     async fn post_json<Req: Serialize>(
         &self,
         path: &str,
@@ -3946,5 +4012,129 @@ mod admin_tests {
         assert_eq!(legacy.id, 3);
         assert_eq!(legacy.op, None);
         assert_eq!(legacy.principal, None);
+    }
+
+    // ── Interactive-session management (mirror ts-client admin.test.ts) ─────
+
+    #[tokio::test]
+    async fn list_sessions_builds_query_from_opts() {
+        let (server, client) = setup().await;
+        Mock::given(method("GET"))
+            .and(path("/admin/sessions"))
+            .and(query_param("user", "u1"))
+            .and(query_param("limit", "50"))
+            .and(header("authorization", BEARER))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "sessions": [
+                    {"tokenHash":"abc","userId":"u1","email":"a@x.example","login":null,
+                     "anonymous":false,"createdAt":1000,"expiresAt":2000},
+                    {"tokenHash":"def","userId":"u1","email":null,"login":null,
+                     "anonymous":true,"createdAt":1100,"expiresAt":2100}
+                ]
+            })))
+            .mount(&server)
+            .await;
+        let rows = client
+            .list_sessions(Some(&crate::wire::admin::SessionListOptions {
+                user: Some("u1".into()),
+                limit: Some(50),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].token_hash, "abc");
+        assert_eq!(rows[0].user_id, "u1");
+        assert_eq!(rows[0].email.as_deref(), Some("a@x.example"));
+        assert_eq!(rows[0].login, None);
+        assert!(!rows[0].anonymous);
+        assert_eq!(rows[1].email, None);
+        assert!(rows[1].anonymous);
+    }
+
+    #[tokio::test]
+    async fn list_sessions_none_opts_sends_no_query_params() {
+        let (server, client) = setup().await;
+        Mock::given(method("GET"))
+            .and(path("/admin/sessions"))
+            .and(header("authorization", BEARER))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"sessions": []})))
+            .mount(&server)
+            .await;
+        let rows = client.list_sessions(None).await.unwrap();
+        assert!(rows.is_empty());
+        let reqs = server.received_requests().await.unwrap();
+        assert_eq!(reqs.len(), 1);
+        let query = reqs[0].url.query().unwrap_or("");
+        for key in ["user", "limit"] {
+            assert!(
+                !query.contains(&format!("{key}=")),
+                "unexpected {key} in query: {query}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn revoke_session_deletes_by_token_hash() {
+        let (server, client) = setup().await;
+        Mock::given(method("DELETE"))
+            .and(path("/admin/sessions/abc123"))
+            .and(header("authorization", BEARER))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+            .mount(&server)
+            .await;
+        client.revoke_session("abc123").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn revoke_user_sessions_deletes_with_user_query_and_parses_count() {
+        let (server, client) = setup().await;
+        Mock::given(method("DELETE"))
+            .and(path("/admin/sessions"))
+            .and(query_param("user", "u1"))
+            .and(header("authorization", BEARER))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"ok": true, "revoked": 3})),
+            )
+            .mount(&server)
+            .await;
+        let r = client.revoke_user_sessions("u1").await.unwrap();
+        assert!(r.ok);
+        assert_eq!(r.revoked, 3);
+    }
+
+    #[test]
+    fn session_info_deserializes_wire_shapes() {
+        use crate::wire::admin::SessionInfo;
+        // Interactive session: email + login present.
+        let interactive: SessionInfo = serde_json::from_value(json!({
+            "tokenHash": "abc",
+            "userId": "u1",
+            "email": "a@x.example",
+            "login": "alice",
+            "anonymous": false,
+            "createdAt": 1000_i64,
+            "expiresAt": 2000_i64
+        }))
+        .unwrap();
+        assert_eq!(interactive.token_hash, "abc");
+        assert_eq!(interactive.user_id, "u1");
+        assert_eq!(interactive.email.as_deref(), Some("a@x.example"));
+        assert_eq!(interactive.login.as_deref(), Some("alice"));
+        assert!(!interactive.anonymous);
+
+        // Anonymous session: email/login are JSON `null` on the wire.
+        let anon: SessionInfo = serde_json::from_value(json!({
+            "tokenHash": "def",
+            "userId": "u2",
+            "email": null,
+            "login": null,
+            "anonymous": true,
+            "createdAt": 1100_i64,
+            "expiresAt": 2100_i64
+        }))
+        .unwrap();
+        assert_eq!(anon.email, None);
+        assert_eq!(anon.login, None);
+        assert!(anon.anonymous);
     }
 }

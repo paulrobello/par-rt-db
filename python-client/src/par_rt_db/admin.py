@@ -65,6 +65,7 @@ from .http_client import (
     OpEvent,
     SchemaHistoryEntry,
     SchemaHistorySummary,
+    SessionInfo,
     SubscriptionsResponse,
     TokenInfo,
     Webhook,
@@ -520,6 +521,48 @@ class RtDbAdminClient:
         """``GET /admin/tokens?db=<db>`` → ``[TokenInfo, ...]``."""
         resp = self._req("GET", "/admin/tokens", params={"db": db})
         return [TokenInfo.model_validate(t) for t in resp.json()["tokens"]]
+
+    # --- interactive sessions (GET/DELETE /admin/sessions) ---
+
+    def list_sessions(
+        self,
+        *,
+        user: str | None = None,
+        limit: int | None = None,
+    ) -> list[SessionInfo]:
+        """``GET /admin/sessions?user=&limit=`` → ``[SessionInfo, ...]``, newest-first.
+
+        Both filters are optional; omitted filters are not sent. ``user`` filters
+        by user id or email; ``limit`` is clamped server-side to ``[1, 1000]``
+        (default 200). Returns the active interactive sessions across the
+        instance — ``tokenHash`` is a non-reversible sha256 digest, safe to
+        surface and used to target a row for :meth:`revoke_session`.
+        """
+        params: dict[str, Any] = {}
+        if user is not None:
+            params["user"] = user
+        if limit is not None:
+            params["limit"] = limit
+        resp = self._req("GET", "/admin/sessions", params=params)
+        return [SessionInfo.model_validate(s) for s in resp.json()["sessions"]]
+
+    def revoke_session(self, token_hash: str) -> None:
+        """``DELETE /admin/sessions/{tokenHash}`` → ``{ok:true}``.
+
+        Revokes a single session by its non-reversible sha256 digest (the value
+        ``SessionInfo.token_hash`` carries).
+        """
+        resp = self._req("DELETE", f"/admin/sessions/{token_hash}")
+        self._expect_ok(resp)
+
+    def revoke_user_sessions(self, user_id: str) -> int:
+        """``DELETE /admin/sessions?user={userId}`` → count of sessions dropped.
+
+        Revokes every session for a user; returns the ``revoked`` count from the
+        server's ``{ok, revoked}`` response.
+        """
+        resp = self._req("DELETE", "/admin/sessions", params={"user": user_id})
+        return int(resp.json()["revoked"])
 
     # --- webhook surface (ENH-003) ---
 
@@ -1105,6 +1148,42 @@ class AsyncRtDbAdminClient:
         """``GET /admin/tokens?db=<db>`` → ``[TokenInfo, ...]`` (async)."""
         resp = await self._req("GET", "/admin/tokens", params={"db": db})
         return [TokenInfo.model_validate(t) for t in resp.json()["tokens"]]
+
+    # --- interactive sessions (GET/DELETE /admin/sessions) ---
+
+    async def list_sessions(
+        self,
+        *,
+        user: str | None = None,
+        limit: int | None = None,
+    ) -> list[SessionInfo]:
+        """``GET /admin/sessions?user=&limit=`` → ``[SessionInfo, ...]`` (async).
+
+        See :meth:`RtDbAdminClient.list_sessions` for filter semantics.
+        """
+        params: dict[str, Any] = {}
+        if user is not None:
+            params["user"] = user
+        if limit is not None:
+            params["limit"] = limit
+        resp = await self._req("GET", "/admin/sessions", params=params)
+        return [SessionInfo.model_validate(s) for s in resp.json()["sessions"]]
+
+    async def revoke_session(self, token_hash: str) -> None:
+        """``DELETE /admin/sessions/{tokenHash}`` → ``{ok:true}`` (async).
+
+        See :meth:`RtDbAdminClient.revoke_session`.
+        """
+        resp = await self._req("DELETE", f"/admin/sessions/{token_hash}")
+        self._expect_ok(resp)
+
+    async def revoke_user_sessions(self, user_id: str) -> int:
+        """``DELETE /admin/sessions?user={userId}`` → count of sessions dropped (async).
+
+        See :meth:`RtDbAdminClient.revoke_user_sessions`.
+        """
+        resp = await self._req("DELETE", "/admin/sessions", params={"user": user_id})
+        return int(resp.json()["revoked"])
 
     # --- webhook surface (ENH-003) ---
 
