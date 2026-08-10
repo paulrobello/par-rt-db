@@ -1,7 +1,7 @@
 # par-rt-db Client-Completeness Sweep — Design Spec
 
 **Date:** 2026-07-26
-**Status:** Proposed — design approved (per-item scope decisions below); implementation plans to follow
+**Status:** Implemented (2026-08-10) — the four clients (ts, rust, python, dashboard) are at feature parity; the per-item scope decisions below landed via the follow-on plans
 via the writing-plans skill, one short plan per item.
 **Repo:** `~/Repos/par-rt-db`
 **End goal:** close every open client-parity gap surfaced by the python-client spec's "Related"

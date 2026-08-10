@@ -1,6 +1,7 @@
 # int64 indexability (#13) + in-memory additive schema evolution (#19)
 
 **Date:** 2026-07-28
+**Status:** Implemented (2026-08-10) — `int64` field is HNSW-indexable (#13, server-only) and the ts/rust clients do additive in-memory schema evolution (#19).
 **Scope:** Two independent FEATURE_MATRIX gap closures, both additive. #13 is
 server-only (no wire change); #19 is ts-client + rust-client only (no server
 change). Plus the doc-sync the matrix itself needs.

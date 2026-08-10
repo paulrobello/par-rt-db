@@ -1,7 +1,7 @@
 # Document TTL / Auto-Expiry — Design
 
 **Date:** 2026-08-01
-**Status:** Draft (pending plan)
+**Status:** Implemented (2026-08-10)
 **Kanban:** `par-rt-db` — "Document TTL / auto-expiry" (`019fbe205cf57302af1f72f8c1e9ea8b`)
 **Estimate:** M
 

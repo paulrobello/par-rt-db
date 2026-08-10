@@ -1,7 +1,7 @@
 # Active-Session Management — Design
 
 **Date:** 2026-08-08
-**Status:** Approved (design), pending implementation
+**Status:** Implemented (2026-08-10)
 **Card:** kanban `par-rt-db` — *Active-session management (list + revoke from console)*
 Supersedes the card's endpoint sketch where noted (§5 deviations).
 

@@ -1,6 +1,6 @@
 # Per-Row Authorization Rules (v1: Owner-Field Match) — Design
 
-- **Status:** Implemented (v1: owner-field match). Board item #20 ("Add per-row authorization rules") shipped as the opt-in `ownerField` table declaration enforced server-side on query, mutate, and subscription re-run.
+- **Status:** Implemented (v1–v3: owner-field match, then collaborator/role fields, then the general `authorize` predicate DSL — see `2026-08-02-per-row-auth-predicate-dsl-design.md`). Board item #20 ("Add per-row authorization rules") shipped as the opt-in `ownerField` table declaration enforced server-side on query, mutate, and subscription re-run.
 - **Date:** 2026-07-24
 - **Related:** FEATURE_MATRIX #20; main design spec `2026-07-21-par-rt-db-design.md` ("Auth"); fine-grained invalidation `2026-07-24-fine-grained-subscription-invalidation-design.md`; implementation plan `docs/superpowers/plans/2026-07-24-per-row-authorization.md`.
 - **Scope:** This remains the design specification for the feature; what shipped under v1 is summarized in the Implementation-sketch cell of FEATURE_MATRIX #20 and detailed in the plan doc above.

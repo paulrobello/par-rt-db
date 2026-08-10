@@ -1,7 +1,7 @@
 # WebSocket Message-Level Rate Limiting — Design
 
 **Date:** 2026-08-01
-**Status:** Approved (design) → plan
+**Status:** Implemented (2026-08-10)
 **Kanban:** `par-rt-db` — "WebSocket message-level rate limiting" (`019fbe20719c7ef3a0ffb4de002202b8`)
 **Severity:** Low (fair-share / resource-protection hardening; no auth or correctness surface)
 

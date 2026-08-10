@@ -1,5 +1,7 @@
 # Signed, time-limited storage URLs — design
 
+**Status:** Implemented (2026-08-10) — `?exp=&sig=` HMAC-verified URLs on `GET /storage/{id}`; minted by `GET /api/storage/{db}/{id}/signed-url`. ENH-017.
+
 ## Problem
 
 Storage blobs are served two ways today (`server/src/http_api.rs`):

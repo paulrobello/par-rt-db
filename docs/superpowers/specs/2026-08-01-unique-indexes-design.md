@@ -1,7 +1,7 @@
 # Unique + Partial Index Constraints — Design
 
 **Date:** 2026-08-01
-**Status:** Approved (brainstormed 2026-08-01)
+**Status:** Implemented (2026-08-10)
 **Board:** par-rt-db → "Unique + partial index constraints" (in_progress)
 **Effort:** M
 

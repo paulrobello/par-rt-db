@@ -1,5 +1,7 @@
 # Close the `ExpectVersion`/`ExpectAbsent` Per-Row-Auth Side-Channel — Design
 
+**Status:** Implemented (2026-08-10) — both precondition steps folded into the per-row-auth principal check, closing the side-channel.
+
 ## Motivation
 
 `ExpectVersion { table, id, version }` and `ExpectAbsent { table, index, eq }` are

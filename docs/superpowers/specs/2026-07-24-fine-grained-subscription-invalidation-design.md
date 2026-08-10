@@ -1,6 +1,6 @@
 # Fine-Grained Subscription Invalidation (v1: Point Reads)
 
-- **Status:** Design
+- **Status:** Implemented (2026-07-29) — v3: point reads + eq-prefix/range indexed + ordered top-N boundary tracking (body "Shipped" notes: v2 2026-07-28, v3 2026-07-29)
 - **Date:** 2026-07-24
 - **Related:** FEATURE_MATRIX #21; main design spec `2026-07-21-par-rt-db-design.md` ("Reactivity", "Future").
 - **Scope:** Server-only. No protocol or wire change (no client mirror required).

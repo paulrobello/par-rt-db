@@ -1,5 +1,7 @@
 # Schema-typed mutation builder — design
 
+**Status:** Implemented (2026-08-10) — schema-typed `TxnBuilder` mirrored across the ts/rust/python clients; FEATURE_MATRIX #6.
+
 ## Problem
 
 `client/src/mutation.ts`'s `TxnBuilder` (`insert`, `patch`, `replace`, `delete`,

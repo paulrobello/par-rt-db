@@ -1,7 +1,7 @@
 # Schema Migration & Backfill
 
 **Date:** 2026-07-31
-**Status:** Design (pre-implementation)
+**Status:** Implemented (2026-08-10)
 **Scope:** Graduates the schema-migration policy past its additive-only MVP into a
 general, declarative, admin-driven migration capability covering rename, type
 coercion, removal, default backfill, and a scoped arbitrary-transform escape.

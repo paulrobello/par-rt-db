@@ -1,7 +1,7 @@
 # Per-State TTL / Lease for Ephemeral Presence State
 
 **Date:** 2026-08-06
-**Status:** Design (pre-implementation)
+**Status:** Implemented (2026-08-10)
 **Scope:** Adds an optional per-state time-to-live to the realtime presence
 layer (ENH-015, `docs/superpowers/specs/2026-08-06-presence-design.md`) so a
 connection's `state` in a room auto-clears a bounded duration after its last

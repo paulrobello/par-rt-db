@@ -1,7 +1,7 @@
 # Full-Text Search Filter (#11 follow-up) — Design
 
 **Date:** 2026-08-09
-**Status:** Proposed
+**Status:** Implemented (2026-08-10)
 **Parent:** `docs/superpowers/specs/2026-07-21-par-rt-db-design.md`, `FEATURE_MATRIX.md` row #11
 **Precedent:** Full-text search (#11, `execute_search`), the db-side `filter()` DSL (#15, `compile_filter` / `compile_filter_node`), and vector search (#17, whose eq-only `filter` is the narrower analog).
 

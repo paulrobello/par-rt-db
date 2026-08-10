@@ -1,5 +1,7 @@
 # File storage — design
 
+**Status:** Implemented (2026-08-10) — `storage.rs` bytea blobs + global `storage_index`; `POST /api/storage/{db}`, `GET /storage/{id}`; FEATURE_MATRIX #16.
+
 ## Problem
 
 par-rt-db can store structured documents but not the blobs that real apps attach

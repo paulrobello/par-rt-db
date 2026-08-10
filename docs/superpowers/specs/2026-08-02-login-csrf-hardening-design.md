@@ -1,6 +1,6 @@
 # Login-CSRF Hardening — Design
 
-**Status:** Design (pending implementation).
+**Status:** Implemented (2026-08-10).
 **Date:** 2026-08-02.
 **Repo:** `~/Repos/par-rt-db`.
 **Supersedes:** the "Accepted residual risk (login CSRF)" paragraph in

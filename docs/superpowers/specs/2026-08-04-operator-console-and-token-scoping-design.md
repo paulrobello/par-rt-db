@@ -1,7 +1,7 @@
 # Operator Console Pages + Token Scoping + Subscription Inspector — Design
 
 **Date:** 2026-08-04
-**Status:** Approved design (pending implementation)
+**Status:** Implemented (2026-08-10)
 **Covers:** ENH-005 (scoped & time-limited tokens, incl. table-level scoping), ENH-003 (webhook management page, full spec), ENH-004 (audit-log page, filterable), ENH-010 (live subscription inspector, incl. per-db counters), and a new Python admin client (full parity).
 
 ## 1. Overview

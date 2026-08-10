@@ -1,5 +1,7 @@
 # Safe mutation retry via idempotency keys — design
 
+**Status:** Implemented (2026-08-10) — server-side idempotency-key dedup on the committer path; FEATURE_MATRIX #4.
+
 ## Problem
 
 par-rt-db mutations are explicitly at-most-once: `client.ts` never auto-retries

@@ -1,7 +1,7 @@
 # ENH-011 — Per-Database Resource Quotas
 
 - **Date:** 2026-08-07
-- **Status:** Approved (design); implementation pending
+- **Status:** Implemented (2026-08-10)
 - **Source:** `ENHANCEMENTS.md` ENH-011
 - **Approach:** Hard enforcement, global caps (Approach 1)
 

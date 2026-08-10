@@ -1,7 +1,7 @@
 # On-the-Fly Image Transforms on Storage Serve
 
 **Date:** 2026-08-05
-**Status:** Design (pre-implementation)
+**Status:** Implemented (2026-08-10)
 **Scope:** Adds server-side image transforms (resize / quality / format) to the
 storage serve routes, so a single stored image yields any derived size on demand
 with an in-memory cache. Convex file-storage image-transform parity

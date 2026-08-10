@@ -2,7 +2,7 @@
 
 - **Date:** 2026-08-04
 - **Enhancement:** ENH-002 (`ENHANCEMENTS.md`)
-- **Status:** Design approved → implementation plan pending
+- **Status:** Implemented (2026-08-10)
 - **Depends on:** existing `backup.rs` (scheduled `pg_dump`, `list_backups`), `GET /admin/backups`, `delete-db` typed-confirm pattern.
 
 ## Problem

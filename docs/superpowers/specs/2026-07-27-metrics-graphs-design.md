@@ -1,7 +1,7 @@
 # Metrics Trend Graphs — Design
 
 - **Date:** 2026-07-27
-- **Status:** Approved (brainstormed)
+- **Status:** Implemented (2026-08-10)
 - **Scope:** `dashboard/` only — no server, SDK, or other-client changes
 - **Depends on:** existing `/admin/stream` `gauges` push (1 snapshot / second)
 

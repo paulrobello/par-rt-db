@@ -1,7 +1,7 @@
 # Realtime Presence Primitive
 
 **Date:** 2026-08-06
-**Status:** Design (pre-implementation)
+**Status:** Implemented (2026-08-10)
 **Scope:** Adds a transient, in-memory presence layer to the realtime surface —
 per-database "rooms" of ephemeral per-session state (online indicators, cursors,
 typing) that clients join over the existing `/sync` WebSocket and receive as live

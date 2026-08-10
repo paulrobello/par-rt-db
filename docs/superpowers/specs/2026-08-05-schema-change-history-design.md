@@ -1,6 +1,6 @@
 # ENH-013 — Schema Change History
 
-**Status:** Approved design · **Date:** 2026-08-05 · **Card:** `[ENH-013] Schema change history`
+**Status:** Implemented (2026-08-10) · **Date:** 2026-08-05 · **Card:** `[ENH-013] Schema change history`
 
 ## Problem
 

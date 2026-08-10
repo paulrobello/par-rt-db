@@ -1,7 +1,7 @@
 # Per-Row Authorization Predicate DSL (Model C) — Design
 
 **Date:** 2026-08-02
-**Status:** Approved (design) → plan
+**Status:** Implemented (2026-08-10)
 **Kanban:** `par-rt-db` — "Per-row auth general predicate DSL (model C)" (`019fbe207c807252a55bbbc19f8b457e`)
 **Severity:** Medium (authorization surface; additive, no change to existing ownerField/collaboratorsField semantics)
 **Related:** v1/v2 per-row auth spec `2026-07-24-per-row-authorization-design.md`; FEATURE_MATRIX #20; fine-grained invalidation `2026-07-24-fine-grained-subscription-invalidation-design.md`.

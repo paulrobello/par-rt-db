@@ -1,5 +1,7 @@
 # Scheduled & cron transactions — design
 
+**Status:** Implemented (2026-08-10) — `scheduler.rs` + `handle_scheduled` committer arm; `runAfter`/`runAt` + cron; FEATURE_MATRIX #9 / #10.
+
 ## Problem
 
 par-rt-db has no way to defer or repeat a mutation: a txn either runs now or not

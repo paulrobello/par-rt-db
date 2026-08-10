@@ -1,6 +1,6 @@
 # ENH-007 — Vector distance metric options (L2 / inner-product)
 
-Date: 2026-08-05 · Status: implementing · Source: `ENHANCEMENTS.md` ENH-007
+Date: 2026-08-05 · Status: Implemented (2026-08-10) · Source: `ENHANCEMENTS.md` ENH-007
 
 ## Goal
 

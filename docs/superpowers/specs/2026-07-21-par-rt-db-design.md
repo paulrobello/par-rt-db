@@ -1,7 +1,7 @@
 # par-rt-db — Self-Hosted Realtime Document DB (Design Spec)
 
 **Date:** 2026-07-21
-**Status:** Implemented — server is live at `rtdb.pardev.net`. See `FEATURE_MATRIX.md` §1 ("At parity today") and §2 (ranked gap matrix, all 21 rows ✅). Originally scoped as MVP-only; every "out of scope" item below has since shipped as a follow-on spec. Authoritative current source of truth: the code (`server/src/`, `ts-client/`, `rust-client/`, `python-client/`) and `FEATURE_MATRIX.md`, not this document.
+**Status:** Implemented — server is live at `rtdb.pardev.net`. See `FEATURE_MATRIX.md` §1 ("At parity today") and §2 (ranked gap matrix, all 26 rows ✅). Originally scoped as MVP-only; every "out of scope" item below has since shipped as a follow-on spec. Authoritative current source of truth: the code (`server/src/`, `ts-client/`, `rust-client/`, `python-client/`) and `FEATURE_MATRIX.md`, not this document.
 **Repo:** `~/Repos/par-rt-db`
 
 ## Purpose

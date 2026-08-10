@@ -1,7 +1,7 @@
 # OAuth Popup Relay Redesign (SEC-012) — Design
 
 **Date:** 2026-08-01
-**Status:** Approved (design) → plan
+**Status:** Implemented (2026-08-10)
 **Kanban:** `par-rt-db` — "[SEC-012] OAuth popup noopener breaks the postMessage relay" (`019fc00ba23d7ff29a922ce34196adf2`)
 **Severity:** Low (tabnabbing hardening for a trusted same-operator popup)
 

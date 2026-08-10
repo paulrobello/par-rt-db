@@ -2,7 +2,7 @@
 
 - **Date:** 2026-08-04
 - **Backlog card:** `019fce5b` (kanban)
-- **Status:** Design approved (Approach A) → implementation plan pending
+- **Status:** Implemented (2026-08-10)
 - **Related:** ENH-002 follow-up; `make dev-db-clean` valve (`scripts/dev-db-clean.sql`) stays as the safety net for the residual tail.
 
 ## Problem
