@@ -2016,87 +2016,7 @@ export class InMemoryRtDbClient {
     // relevance stand-in, not `ts_rank`) so match/no-match agrees with the
     // server while the combination guards agree too.
     if (q.search !== undefined) {
-      if (
-        q.index !== undefined ||
-        eq.length > 0 ||
-        hasRange ||
-        q.order !== undefined ||
-        q.unique ||
-        q.first ||
-        q.count ||
-        q.distinct ||
-        q.aggregate !== undefined ||
-        q.paginate !== undefined ||
-        q.filter !== undefined ||
-        q.vectorSearch !== undefined ||
-        q.hybridSearch !== undefined
-      ) {
-        throw new RtDbError(
-          "BAD_REQUEST",
-          "search cannot be combined with index, eq, range bounds, order, unique, first, count, distinct, aggregate, paginate, filter, or vector search",
-        );
-      }
-      // Full-text matching (not ts_rank ordering): mirror `plainto_tsquery`
-      // token-AND semantics closely enough that a unit test can assert
-      // match/no-match. The query is tokenized into lowercase word lexemes and a
-      // doc matches when every query lexeme appears in the concatenated text of
-      // the search index's declared fields. Ranking is a deterministic stand-in
-      // (query-lexeme frequency desc, then `created_at` desc, then `id` desc) —
-      // exact `ts_rank` order is intentionally not replicated. `take` (already
-      // capped to MAX_TAKE above) limits the result.
-      const search = q.search;
-      if (search.query.trim().length === 0) {
-        throw new RtDbError("BAD_REQUEST", "search query text must not be empty");
-      }
-      const searchDef = tableDef.indexes?.find((i) => i.name === search.index && i.search);
-      if (!searchDef) {
-        throw new RtDbError("BAD_REQUEST", `search index '${search.index}' not found`);
-      }
-      // Validate the search-level filter against declared fields once (mirrors
-      // server `compile_filter` composed into the search WHERE).
-      if (search.filter) {
-        validateFilter(search.filter, new Set(Object.keys(tableDef.fields)));
-      }
-      const queryTokens = [...new Set(ftsTokens(search.query))];
-      const limit = q.take ?? MAX_TAKE;
-      if (queryTokens.length === 0) {
-        return [];
-      }
-      const scored: Array<{ row: StoredRow; score: number }> = [];
-      for (const row of this.rowsFor(q.table).values()) {
-        if (search.filter && !evalFilterExpr(search.filter, row.doc)) {
-          continue;
-        }
-        const docTokens = ftsTokens(
-          searchDef.fields.map((f) => ftsStringify(row.doc[f])).join(" "),
-        );
-        let score = 0;
-        let allPresent = true;
-        for (const qt of queryTokens) {
-          let occurrences = 0;
-          for (const dt of docTokens) {
-            if (dt === qt) occurrences++;
-          }
-          if (occurrences === 0) {
-            allPresent = false;
-            break;
-          }
-          score += occurrences;
-        }
-        if (allPresent) scored.push({ row, score });
-      }
-      scored.sort((a, b) =>
-        a.score !== b.score
-          ? b.score - a.score
-          : a.row.createdAt !== b.row.createdAt
-            ? b.row.createdAt - a.row.createdAt
-            : a.row.id > b.row.id
-              ? -1
-              : a.row.id < b.row.id
-                ? 1
-                : 0,
-      );
-      return scored.slice(0, limit).map((s) => this.mergeDoc(s.row));
+      return this.executeSearchTerminal(q, tableDef, eq, hasRange);
     }
 
     const indexDef: IndexJson | null = q.index
@@ -2483,6 +2403,96 @@ export class InMemoryRtDbClient {
     // No in-memory hybrid ranking; return an empty result rather than silently
     // misranking by falling through to the collect path.
     return [];
+  }
+
+  /** `search` terminal: full-text token-AND matching with a deterministic
+   * relevance stand-in. Verbatim lift of the former inline
+   * `if (q.search !== undefined) { ... }` arm. */
+  private executeSearchTerminal(
+    q: QueryJson,
+    tableDef: TableJson,
+    eq: unknown[],
+    hasRange: boolean,
+  ): unknown {
+    if (
+      q.index !== undefined ||
+      eq.length > 0 ||
+      hasRange ||
+      q.order !== undefined ||
+      q.unique ||
+      q.first ||
+      q.count ||
+      q.distinct ||
+      q.aggregate !== undefined ||
+      q.paginate !== undefined ||
+      q.filter !== undefined ||
+      q.vectorSearch !== undefined ||
+      q.hybridSearch !== undefined
+    ) {
+      throw new RtDbError(
+        "BAD_REQUEST",
+        "search cannot be combined with index, eq, range bounds, order, unique, first, count, distinct, aggregate, paginate, filter, or vector search",
+      );
+    }
+    // Full-text matching (not ts_rank ordering): mirror `plainto_tsquery`
+    // token-AND semantics closely enough that a unit test can assert
+    // match/no-match. The query is tokenized into lowercase word lexemes and a
+    // doc matches when every query lexeme appears in the concatenated text of
+    // the search index's declared fields. Ranking is a deterministic stand-in
+    // (query-lexeme frequency desc, then `created_at` desc, then `id` desc) —
+    // exact `ts_rank` order is intentionally not replicated. `take` (already
+    // capped to MAX_TAKE above) limits the result.
+    const search = q.search!;
+    if (search.query.trim().length === 0) {
+      throw new RtDbError("BAD_REQUEST", "search query text must not be empty");
+    }
+    const searchDef = tableDef.indexes?.find((i) => i.name === search.index && i.search);
+    if (!searchDef) {
+      throw new RtDbError("BAD_REQUEST", `search index '${search.index}' not found`);
+    }
+    // Validate the search-level filter against declared fields once (mirrors
+    // server `compile_filter` composed into the search WHERE).
+    if (search.filter) {
+      validateFilter(search.filter, new Set(Object.keys(tableDef.fields)));
+    }
+    const queryTokens = [...new Set(ftsTokens(search.query))];
+    const limit = q.take ?? MAX_TAKE;
+    if (queryTokens.length === 0) {
+      return [];
+    }
+    const scored: Array<{ row: StoredRow; score: number }> = [];
+    for (const row of this.rowsFor(q.table).values()) {
+      if (search.filter && !evalFilterExpr(search.filter, row.doc)) {
+        continue;
+      }
+      const docTokens = ftsTokens(searchDef.fields.map((f) => ftsStringify(row.doc[f])).join(" "));
+      let score = 0;
+      let allPresent = true;
+      for (const qt of queryTokens) {
+        let occurrences = 0;
+        for (const dt of docTokens) {
+          if (dt === qt) occurrences++;
+        }
+        if (occurrences === 0) {
+          allPresent = false;
+          break;
+        }
+        score += occurrences;
+      }
+      if (allPresent) scored.push({ row, score });
+    }
+    scored.sort((a, b) =>
+      a.score !== b.score
+        ? b.score - a.score
+        : a.row.createdAt !== b.row.createdAt
+          ? b.row.createdAt - a.row.createdAt
+          : a.row.id > b.row.id
+            ? -1
+            : a.row.id < b.row.id
+              ? 1
+              : 0,
+    );
+    return scored.slice(0, limit).map((s) => this.mergeDoc(s.row));
   }
 
   /** Merges a stored row with its system fields — a port of server `merge_doc`. */
