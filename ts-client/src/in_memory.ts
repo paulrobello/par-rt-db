@@ -2166,18 +2166,7 @@ export class InMemoryRtDbClient {
       return this.paginateResult(q.paginate, tableDef, filtered, sortKeys, sortPgs, dir);
     }
 
-    if (q.unique) {
-      if (filtered.length > 1) {
-        throw new RtDbError("PRECONDITION_FAILED", "unique query matched multiple documents");
-      }
-      return filtered[0] ? this.mergeDoc(filtered[0]) : null;
-    }
-    if (q.first) {
-      return filtered[0] ? this.mergeDoc(filtered[0]) : null;
-    }
-
-    const limit = q.take ?? MAX_TAKE;
-    return filtered.slice(0, limit).map((row) => this.mergeDoc(row));
+    return this.executeCollectTerminal(q, filtered);
   }
 
   /** `get` terminal: point read by id. Verbatim lift of the former inline
@@ -2524,6 +2513,24 @@ export class InMemoryRtDbClient {
     }
     // Scalar count: COUNT(*) over the matching set (0 when empty).
     return filtered.length;
+  }
+
+  /** Collect terminal: the post-sort tail covering `unique` (at-most-one
+   * match), `first` (head), and the default `take`-limited collect. Verbatim
+   * lift of the former inline tail of `executeQuery`; mirrors the server's
+   * `execute_collect_terminal`. */
+  private executeCollectTerminal(q: QueryJson, filtered: StoredRow[]): unknown {
+    if (q.unique) {
+      if (filtered.length > 1) {
+        throw new RtDbError("PRECONDITION_FAILED", "unique query matched multiple documents");
+      }
+      return filtered[0] ? this.mergeDoc(filtered[0]) : null;
+    }
+    if (q.first) {
+      return filtered[0] ? this.mergeDoc(filtered[0]) : null;
+    }
+    const limit = q.take ?? MAX_TAKE;
+    return filtered.slice(0, limit).map((row) => this.mergeDoc(row));
   }
 
   /** Merges a stored row with its system fields — a port of server `merge_doc`. */
