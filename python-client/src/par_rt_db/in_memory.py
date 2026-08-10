@@ -13,16 +13,15 @@ interface.
 
 Parity is deliberately scoped to the documented core (schema push, insert /
 patch / replace / delete / expectVersion / expectAbsent / upsert, point reads,
-index eq + range queries with order/take/unique/first/count, filter expressions,
-keyset-cursor pagination, reactive subscriptions, and scheduled-job ``tick``).
-``distinct``/``aggregate``/``vectorSearch``/``hybridSearch`` are NOT implemented:
-the first two raise :class:`RtDbError` ``BAD_REQUEST`` (stricter than the Rust
-harness, which silently falls through to ``collect`` for them). ``vectorSearch``
-applies its optional ``filter`` but does not rank by vector similarity (every
-table row is a candidate — the sound over-approximation); ``hybridSearch``
-returns an empty list after the same combination guards the server enforces.
-``search`` applies its optional ``filter`` (every table row is a candidate —
-ts_rank is not modeled) but otherwise does not rank.
+index eq + range queries with order/take/unique/first/count, ``distinct`` and
+``aggregate`` (scalar + grouped), filter expressions, keyset-cursor pagination,
+reactive subscriptions, and scheduled-job ``tick``).
+``vectorSearch``/``hybridSearch``/``search`` apply their optional ``filter`` but
+do not rank by score: ``vectorSearch`` treats every table row as a candidate
+(the sound over-approximation — it does not rank by vector similarity),
+``hybridSearch`` returns an empty list after the same combination guards the
+server enforces, and ``search`` treats every table row as a candidate
+(``ts_rank`` is not modeled).
 
 Simplifications vs. the live server (be explicit when relying on these):
 
