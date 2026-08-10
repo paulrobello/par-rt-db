@@ -1883,8 +1883,20 @@ fn compile_filter_node(
             }
             Ok(format!("{lhs} IN ({})", placeholders.join(", ")))
         }
+        // SEC-117: wrap the inner predicate in COALESCE(..., FALSE) before
+        // negating. Postgres's three-valued logic would otherwise turn
+        // `NOT (lhs = $1)` into `NOT NULL` (= NULL, row excluded) when `lhs`
+        // is NULL — i.e. when the doc omits the field. The Rust doc evaluator
+        // (`filter_matches`) is two-valued and sees the absent field as a
+        // non-match, so `!false` = true = row visible. That divergence made
+        // the write path (which uses the doc evaluator) more permissive than
+        // the SQL read path — an authorization bypass for predicates like
+        // `authorize = Not(Eq{field:"banned", value:true})` over a doc that
+        // omits `banned`. COALESCE coerces the inner result to a real boolean
+        // before negation, so `NOT COALESCE(NULL, FALSE)` = `NOT FALSE` =
+        // TRUE = row visible — the SQL and Rust paths agree.
         FilterExpr::Not { expr } => Ok(format!(
-            "NOT ({})",
+            "NOT COALESCE(({}), FALSE)",
             compile_filter_node(expr, table, start_pos, binds)?
         )),
         FilterExpr::Contains { field, value } => {
@@ -1993,8 +2005,12 @@ fn render_filter_literal_node(node: &FilterExpr, table: &TableDef) -> Result<Str
             }
             Ok(format!("{lhs} IN ({})", lits.join(", ")))
         }
+        // SEC-117: COALESCE the inner predicate before negation for the same
+        // reason as `compile_filter_node` — keeps the partial-index predicate
+        // consistent with the read scan and the Rust doc evaluator over
+        // absent fields.
         FilterExpr::Not { expr } => Ok(format!(
-            "NOT ({})",
+            "NOT COALESCE(({}), FALSE)",
             render_filter_literal_node(expr, table)?
         )),
         FilterExpr::Contains { field, value } => {
@@ -2078,10 +2094,14 @@ fn cmp_json(a: Option<&serde_json::Value>, b: &serde_json::Value) -> Option<Orde
 /// elements — the only realistic auth case (e.g. `$user ∈ doc.editors[]`).
 ///
 /// `Not` note: `Not(Eq { field, value })` when `field` is absent evaluates the
-/// inner `Eq` to `false`, so `Not` yields `true`. For a server-declared
-/// `authorize` predicate this is acceptable — the predicate is validated and
-/// inserts are stamped/verified — but a `Not(Eq)` over an absent field is
-/// permissive by construction. Reviewers should be aware.
+/// inner `Eq` to `false`, so `Not` yields `true` (the row is visible). The SQL
+/// compile path (`compile_filter_node`) matches this: it emits
+/// `NOT COALESCE((<inner>), FALSE)`, so a NULL inner result (absent field) is
+/// coerced to FALSE before negation, yielding TRUE = row visible (SEC-117).
+/// The two evaluators agree over absent fields — this is load-bearing for
+/// `authorize` predicates, which use `filter_matches` on the write path and the
+/// SQL compile on the read path; a divergence there was an auth bypass.
+/// Reviewers adding a new comparison variant must keep both arms consistent.
 pub fn filter_matches(doc: &serde_json::Value, expr: &FilterExpr, ctx: &PrincipalCtx) -> bool {
     match expr {
         FilterExpr::Eq { field, value } => doc
@@ -2103,8 +2123,9 @@ pub fn filter_matches(doc: &serde_json::Value, expr: &FilterExpr, ctx: &Principa
             .is_some_and(|d| values.iter().any(|v| d == &resolve_value(v, ctx))),
         FilterExpr::And { exprs } => exprs.iter().all(|e| filter_matches(doc, e, ctx)),
         FilterExpr::Or { exprs } => exprs.iter().any(|e| filter_matches(doc, e, ctx)),
-        // `Not` inverts the inner boolean; see the doc comment for the
-        // absent-field-permissive subtlety.
+        // `Not` inverts the inner boolean. The SQL compile path emits
+        // `NOT COALESCE((<inner>), FALSE)` so a NULL inner (absent field)
+        // becomes FALSE→TRUE here and on SQL — the two agree (SEC-117).
         FilterExpr::Not { expr } => !filter_matches(doc, expr, ctx),
         FilterExpr::Contains { field, value } => doc
             .get(field)
@@ -3001,7 +3022,9 @@ mod tests {
             1,
         )
         .unwrap();
-        assert_eq!(sql, "NOT ((doc->>'owner') = $1)");
+        // SEC-117: Not wraps the inner in COALESCE(..., FALSE) so the SQL scan
+        // path matches the two-valued Rust doc evaluator over absent fields.
+        assert_eq!(sql, "NOT COALESCE(((doc->>'owner') = $1), FALSE)");
         assert_eq!(binds.len(), 1);
         // Contains: value in doc.editors[] -> jsonb membership
         let (sql, _) = compile_filter(
@@ -3317,9 +3340,12 @@ mod tests {
 
         // 4. Not(Eq) over an absent field -> true (the permissive direction
         //    called out in the implementation doc comment). The inner Eq is
-        //    false (field missing), so Not yields true. Acceptable for a
-        //    server-declared/validated authorize predicate; pinned here so the
-        //    behavior is explicit and visible to reviewers of Tasks 7-9.
+        //    false (field missing), so Not yields true. The SQL compile path
+        //    emits `NOT COALESCE((<inner>), FALSE)`, so it agrees over the
+        //    absent-field case (SEC-117); a cross-evaluator agreement test
+        //    lives in `per_row_auth_test.rs`. Acceptable for a server-declared
+        //    /validated authorize predicate; pinned here so the behavior is
+        //    explicit and visible to reviewers of Tasks 7-9.
         assert!(filter_matches(
             &doc,
             &FilterExpr::Not {

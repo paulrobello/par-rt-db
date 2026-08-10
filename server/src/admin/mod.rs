@@ -156,6 +156,10 @@ pub fn admin_routes() -> Router<Arc<AppState>> {
         .route("/admin/db/{db}/migrate", post(admin_migrate))
         .route("/admin/db/{db}/schema/restore", post(restore_schema))
         .route(
+            "/admin/db/{db}/anonymous-access",
+            get(get_anonymous_access).patch(patch_anonymous_access),
+        )
+        .route(
             "/admin/db/{db}/storage",
             get(admin_storage_list)
                 .post(admin_storage_upload)

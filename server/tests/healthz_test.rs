@@ -62,6 +62,8 @@ fn test_config() -> Config {
         presence_update_limit_per_sec: 20,
         presence_max_ttl_ms: 300_000,
         auth_anonymous_enabled: false,
+        anonymous_session_ttl_days: 1,
+        anonymous_rate_limit_per_ip_rpm: 0,
         quota_cache_ttl_secs: 60,
     }
 }

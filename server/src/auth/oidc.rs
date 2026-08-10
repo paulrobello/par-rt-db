@@ -344,6 +344,8 @@ mod tests {
             apple_private_key: None,
             max_affected_docs: 100,
             auth_anonymous_enabled: false,
+            anonymous_session_ttl_days: 1,
+            anonymous_rate_limit_per_ip_rpm: 0,
             static_dir: None,
             pool_max_connections: 75,
             rate_limit_per_token_rpm: 0,

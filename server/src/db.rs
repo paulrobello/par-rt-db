@@ -63,6 +63,22 @@ async fn bootstrap_ddl(conn: &mut PgConnection) -> Result<(), RtDbError> {
     .execute(&mut *conn)
     .await?;
 
+    // SEC-103: per-database anonymous-auth gate. An anonymous principal is
+    // authorized for a given database ONLY when this flag is TRUE for that db.
+    // The instance-wide `RTDB_AUTH_ANONYMOUS_ENABLED` remains a master kill
+    // switch (checked at mint + at authorize), so the effective gate is
+    // `master_kill AND per_db_flag`. Defaults FALSE — a deployment that turns
+    // on anonymous auth instance-wide does NOT open every database to the
+    // internet; an operator must opt-in each db explicitly via
+    // `PATCH /admin/db/{db}/anonymous-access`. Idempotent ALTER so an existing
+    // deployment adds the column on boot.
+    sqlx::query(
+        "ALTER TABLE rtdb_auth.databases \
+         ADD COLUMN IF NOT EXISTS anonymous_enabled boolean NOT NULL DEFAULT FALSE",
+    )
+    .execute(&mut *conn)
+    .await?;
+
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS rtdb_auth.users (
             id text PRIMARY KEY,

@@ -174,12 +174,32 @@ pub async fn authorize(pool: &PgPool, principal: &Principal, db: &str) -> Result
             if *expires_at < now_ms() {
                 return Err(RtDbError::unauthorized("session expired"));
             }
-            // An anonymous user is authorized for any database via the boot
-            // `RTDB_AUTH_ANONYMOUS_ENABLED` gate (checked at mint time) — it has
-            // no email, so it can never appear in a per-db allowlist. Per-row
-            // `ownerField` still scopes it to its own documents.
+            // SEC-103: an anonymous user is authorized for a database ONLY when
+            // that database has opted in via `rtdb_auth.databases.anonymous_enabled`.
+            // The instance-wide boot gate `RTDB_AUTH_ANONYMOUS_ENABLED` remains a
+            // master kill switch enforced at mint time (`POST /auth/anonymous`
+            // refuses when off), so no new anonymous principals arise while it is
+            // off; this per-db check is the additional gate that closes the
+            // "enabling anon for one guest app opens EVERY database" hole. The
+            // column defaults FALSE (safe), so a db must be explicitly opted in
+            // by an operator via `PATCH /admin/db/{db}/anonymous-access`. An
+            // anonymous principal authorized for db A is rejected for db B.
+            // Per-row `ownerField` still scopes it to its own documents.
             if *anonymous {
-                return Ok(());
+                let (allowed,): (bool,) = sqlx::query_as(
+                    "SELECT COALESCE((
+                        SELECT anonymous_enabled FROM rtdb_auth.databases WHERE name = $1
+                    ), FALSE)",
+                )
+                .bind(db)
+                .fetch_one(pool)
+                .await?;
+                if allowed {
+                    return Ok(());
+                }
+                return Err(RtDbError::forbidden(
+                    "anonymous access is not enabled for this database",
+                ));
             }
             let Some(email) = email else {
                 return Err(RtDbError::forbidden(

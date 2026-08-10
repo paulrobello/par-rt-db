@@ -173,11 +173,30 @@ pub struct Config {
     /// RTDB_AUTH_ANONYMOUS_ENABLED (default false). Master switch for
     /// `POST /auth/anonymous`, which mints an ephemeral user + session for a
     /// credential-less guest. Off ⇒ the endpoint returns 403 FORBIDDEN. An
-    /// anonymous user is authorized for any database via this boot gate (no
-    /// allowlist entry) and owns its own documents via per-row `ownerField`.
-    /// Opt-in like presence, but default-OFF (anonymous access is a per-app
-    /// decision). Boot-only (not hot-reloadable).
+    /// anonymous user is authorized for a database ONLY when that database has
+    /// opted in via `rtdb_auth.databases.anonymous_enabled` (SEC-103) — the
+    /// instance-wide boot gate is the master kill (checked at mint), the per-db
+    /// column is the additional gate (checked at `authorize`). An anonymous user
+    /// owns its own documents via per-row `ownerField`. Opt-in like presence,
+    /// but default-OFF (anonymous access is a per-app decision). Boot-only (not
+    /// hot-reloadable).
     pub auth_anonymous_enabled: bool,
+    /// RTDB_ANONYMOUS_SESSION_TTL_DAYS (default 1). Session TTL for anonymous
+    /// principals — deliberately short relative to the standard
+    /// `session_ttl_days` (30) so the ephemeral rows minted by the
+    /// unauthenticated `POST /auth/anonymous` route expire quickly rather than
+    /// accumulating as permanent `rtdb_auth.users`/`rtdb_auth.sessions` rows
+    /// (SEC-103). Boot-only (not hot-reloadable).
+    pub anonymous_session_ttl_days: i64,
+    /// RTDB_ANONYMOUS_RATE_LIMIT_PER_IP_RPM (default 0 = unlimited in code;
+    /// the shipped `.env.example`/`docker-compose.yml` set a non-zero default
+    /// so the mitigation is on out-of-the-box). Per-IP fixed-window rate limit
+    /// on the unauthenticated `POST /auth/anonymous` route — without it, an
+    /// attacker can mint unbounded anonymous users/sessions by hitting the
+    /// endpoint in a loop (SEC-103). The IP key is canonicalized by
+    /// `client_ip_key` (CF-Connecting-IP preferred, rightmost XFF fallback).
+    /// Boot-only (not hot-reloadable).
+    pub anonymous_rate_limit_per_ip_rpm: u32,
     /// RTDB_QUOTA_CACHE_TTL_SECS (default 60). TTL for the per-db quota
     /// counters (table count, storage bytes, active subs) maintained by the
     /// enforcement layer (ENH-011). 0 is interpreted as "no caching" by the
@@ -464,6 +483,23 @@ impl Config {
             Some(v) if !matches!(v.as_str(), "false" | "0" | "no")
         );
 
+        // SEC-103: short independent TTL for anonymous sessions so the
+        // ephemeral rows minted by the unauthenticated anon route expire
+        // quickly rather than living for the standard 30-day TTL. Default 1
+        // day; an unparseable value falls back to 1.
+        let anonymous_session_ttl_days = match std::env::var("RTDB_ANONYMOUS_SESSION_TTL_DAYS") {
+            Ok(v) => v.parse::<i64>().unwrap_or(1),
+            Err(_) => 1,
+        };
+        // SEC-103: per-IP rate limit on `POST /auth/anonymous`. 0 = unlimited
+        // (the code default; the shipped `.env.example`/`docker-compose.yml`
+        // set a non-zero default so the mitigation is on out-of-the-box).
+        let anonymous_rate_limit_per_ip_rpm =
+            match std::env::var("RTDB_ANONYMOUS_RATE_LIMIT_PER_IP_RPM") {
+                Ok(v) => v.parse::<u32>().unwrap_or(0),
+                Err(_) => 0,
+            };
+
         // Quota counter cache TTL (ENH-011). 0 = no caching. An unparseable
         // value falls back to the default, matching the parses above.
         let quota_cache_ttl_secs = match std::env::var("RTDB_QUOTA_CACHE_TTL_SECS") {
@@ -530,6 +566,8 @@ impl Config {
             presence_update_limit_per_sec,
             presence_max_ttl_ms,
             auth_anonymous_enabled,
+            anonymous_session_ttl_days,
+            anonymous_rate_limit_per_ip_rpm,
             quota_cache_ttl_secs,
         })
     }

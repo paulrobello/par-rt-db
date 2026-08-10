@@ -66,6 +66,10 @@ services:
       RTDB_OAUTH_LOGIN_CSRF: ${RTDB_OAUTH_LOGIN_CSRF:-true}
       # Anonymous auth (off by default). Mirrors the .env.example default.
       RTDB_AUTH_ANONYMOUS_ENABLED: ${RTDB_AUTH_ANONYMOUS_ENABLED:-false}
+      # SEC-103: short TTL + per-IP rate limit for anonymous sessions so the
+      # unauthenticated mint route can't be abused to flood the auth tables.
+      RTDB_ANONYMOUS_SESSION_TTL_DAYS: ${RTDB_ANONYMOUS_SESSION_TTL_DAYS:-1}
+      RTDB_ANONYMOUS_RATE_LIMIT_PER_IP_RPM: ${RTDB_ANONYMOUS_RATE_LIMIT_PER_IP_RPM:-10}
       # Webhook delivery registry (off by default). Mirrors SEC-001 SSRF
       # hardening: when enabled, registration requires https + rejects private
       # IP ranges; RTDB_WEBHOOK_ALLOW_HTTP is the dev escape hatch (off).

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use axum::Json;
 use axum::Router;
-use axum::extract::{Form, Query as QueryParams, State};
+use axum::extract::{ConnectInfo, Form, Query as QueryParams, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header::SET_COOKIE};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
@@ -493,9 +493,34 @@ struct AnonymousResponse {
     token: String,
 }
 
-async fn anonymous(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+async fn anonymous(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+) -> Response {
     if !state.config.auth_anonymous_enabled {
         return RtDbError::forbidden("anonymous authentication is disabled").into_response();
+    }
+    // SEC-103: per-IP rate limit on the unauthenticated mint route. Without
+    // it, an attacker can mint unbounded anonymous users/sessions by hitting
+    // this endpoint in a loop. The IP key is canonicalized by `client_ip_key`
+    // (CF-Connecting-IP preferred, rightmost XFF fallback, then the connection
+    // peer) — the same canonicalization the public storage route uses. Disabled
+    // when `anonymous_rate_limit_per_ip_rpm == 0` (code default; the shipped
+    // `.env.example`/`docker-compose.yml` set a non-zero default).
+    let ip_key = crate::http_api::client_ip_key(&headers, addr.ip());
+    let limit = state.config.anonymous_rate_limit_per_ip_rpm;
+    if limit > 0 {
+        match state
+            .rate_limiter
+            .check(crate::rate_limit::RateKey::Ip(ip_key.clone()), limit)
+            .await
+        {
+            crate::rate_limit::RateDecision::Denied { retry_after_secs } => {
+                return RtDbError::rate_limited(retry_after_secs).into_response();
+            }
+            crate::rate_limit::RateDecision::Allowed => {}
+        }
     }
     let user_id = crate::db::new_id();
     let now = now_ms();
@@ -514,7 +539,10 @@ async fn anonymous(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Re
         tracing::error!(error = %err, "anonymous user insert failed");
         return RtDbError::internal("failed to create anonymous user").into_response();
     }
-    let ttl_days = state.runtime.hot.load().session_ttl_days;
+    // SEC-103: short independent TTL for anonymous sessions (default 1 day)
+    // rather than the standard `session_ttl_days` (30), so the ephemeral rows
+    // minted by this unauthenticated route expire quickly.
+    let ttl_days = state.config.anonymous_session_ttl_days;
     let token = match session::create_session(&state.pool, &user_id, ttl_days).await {
         Ok(t) => t,
         Err(err) => return err.into_response(),

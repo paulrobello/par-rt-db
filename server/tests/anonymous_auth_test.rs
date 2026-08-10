@@ -95,8 +95,11 @@ async fn mint_anon(addr: std::net::SocketAddr) -> String {
 }
 
 // (anon-a) The endpoint mints a session token + HttpOnly cookie, and the token
-// resolves to an anonymous user principal that authorizes for any database
-// (no allowlist entry) — criterion 1.
+// resolves to an anonymous user principal. SEC-103: an anonymous principal is
+// authorized ONLY for a database that has opted in via
+// `rtdb_auth.databases.anonymous_enabled`; a db that exists but has NOT opted
+// in is rejected (Forbidden). The master kill switch
+// (`RTDB_AUTH_ANONYMOUS_ENABLED`) is checked at mint — criterion 1.
 #[tokio::test]
 async fn anonymous_mints_session_and_authorizes() -> anyhow::Result<()> {
     let state = anon_enabled_state().await;
@@ -138,10 +141,137 @@ async fn anonymous_mints_session_and_authorizes() -> anyhow::Result<()> {
     };
     assert!(!anon_uid.is_empty());
 
-    // Authorizes for an arbitrary database with no allowlist entry (boot gate).
-    // (The anon branch returns Ok before any db lookup, so the db need not exist.)
-    let db = format!("t{}", uuid::Uuid::now_v7().simple());
-    authorize(&state.pool, &principal, &db).await?;
+    // SEC-103: create db A and opt it in, then authorize succeeds.
+    let db_a = format!("t{}", uuid::Uuid::now_v7().simple());
+    rtdb_server::db::create_database(&state.pool, &db_a).await?;
+    opt_in_anonymous(&state.pool, &db_a).await;
+    authorize(&state.pool, &principal, &db_a).await?;
+
+    // SEC-103: create db B but do NOT opt it in → authorize rejects (Forbidden).
+    let db_b = format!("t{}", uuid::Uuid::now_v7().simple());
+    rtdb_server::db::create_database(&state.pool, &db_b).await?;
+    let err = authorize(&state.pool, &principal, &db_b)
+        .await
+        .expect_err("anon not authorized for non-opted-in db B");
+    assert_eq!(err.code, rtdb_server::error::ErrorCode::Forbidden);
+    Ok(())
+}
+
+/// SEC-103: opts a database in to anonymous principal access by setting the
+/// `rtdb_auth.databases.anonymous_enabled` column directly (the test analogue
+/// of `PATCH /admin/db/{db}/anonymous-access`).
+async fn opt_in_anonymous(pool: &sqlx::PgPool, db: &str) {
+    sqlx::query("UPDATE rtdb_auth.databases SET anonymous_enabled = TRUE WHERE name = $1")
+        .bind(db)
+        .execute(pool)
+        .await
+        .expect("opt in anonymous");
+}
+
+// (anon-sec103) The per-database gate is the core SEC-103 fix: an anonymous
+// principal authorized for db A is rejected for db B. This closes the "enabling
+// anon for one guest app makes EVERY database reachable" hole. The master kill
+// is on (anon was minted); db A opted in; db B did not.
+#[tokio::test]
+async fn sec103_anon_authorized_for_a_rejected_for_b() -> anyhow::Result<()> {
+    let state = anon_enabled_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let token = mint_anon(addr).await;
+    let principal = resolve_bearer(&state.pool, &token).await?;
+
+    let db_a = format!("t{}", uuid::Uuid::now_v7().simple());
+    rtdb_server::db::create_database(&state.pool, &db_a).await?;
+    opt_in_anonymous(&state.pool, &db_a).await;
+
+    let db_b = format!("t{}", uuid::Uuid::now_v7().simple());
+    rtdb_server::db::create_database(&state.pool, &db_b).await?;
+
+    // Authorized for A (opted in).
+    authorize(&state.pool, &principal, &db_a).await?;
+    // Rejected for B (not opted in) — the SEC-103 property.
+    let err = authorize(&state.pool, &principal, &db_b)
+        .await
+        .expect_err("anon must be rejected for non-opted-in db B");
+    assert_eq!(err.code, rtdb_server::error::ErrorCode::Forbidden);
+    // And the message names the per-db gate so an operator can diagnose it.
+    assert!(
+        err.message
+            .contains("anonymous access is not enabled for this database"),
+        "expected per-db anon message, got: {}",
+        err.message
+    );
+    Ok(())
+}
+
+// (anon-sec103-ttl) Anonymous sessions use the short independent TTL
+// (`anonymous_session_ttl_days`, default 1) rather than the standard 30-day
+// session TTL, so the ephemeral rows don't persist for a month. Verified by
+// reading back the session row's `expires_at`.
+#[tokio::test]
+async fn sec103_anon_session_uses_short_ttl() -> anyhow::Result<()> {
+    let state = anon_enabled_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let token = mint_anon(addr).await;
+
+    // The minted session row's expires_at should be ~1 day out (not ~30).
+    // `anonymous_session_ttl_days` defaults to 1 in test_config.
+    let hash = rtdb_server::db::sha256_hex(&token);
+    let (expires_at_ms,): (i64,) =
+        sqlx::query_as("SELECT expires_at FROM rtdb_auth.sessions WHERE token_hash = $1")
+            .bind(&hash)
+            .fetch_one(&state.pool)
+            .await?;
+    let now = rtdb_server::db::now_ms();
+    let delta_days = (expires_at_ms - now) as f64 / 86_400_000.0;
+    // ~1 day, well short of the 30-day standard TTL. Allow a generous window
+    // for test timing; the point is it's NOT 30 days.
+    assert!(
+        (0.9..=1.1).contains(&delta_days),
+        "anon session TTL should be ~1 day, got {delta_days:.2} days"
+    );
+    Ok(())
+}
+
+// (anon-sec103-ratelimit) POST /auth/anonymous is per-IP rate-limited when
+// `anonymous_rate_limit_per_ip_rpm > 0`: after the limit is exhausted within
+// one minute, further calls return 429 RATE_LIMITED. Closes the "unbounded
+// anon mint" flood vector.
+#[tokio::test]
+async fn sec103_anon_mint_is_ip_rate_limited() -> anyhow::Result<()> {
+    // Build a state with the per-IP anon rate limit turned on (2 RPM for a
+    // fast test). The default test_config sets it to 0 (off); override here.
+    let mut config = test_config();
+    config.auth_anonymous_enabled = true;
+    config.anonymous_rate_limit_per_ip_rpm = 2;
+    let pool = sqlx::PgPool::connect(&config.database_url)
+        .await
+        .expect("connect to test postgres");
+    rtdb_server::db::bootstrap(&pool).await.expect("bootstrap");
+    let state = AppState::new(pool, config, test_hot());
+    let addr = spawn_app(state.clone()).await;
+
+    let client = reqwest::Client::new();
+    let url = format!("http://{addr}/auth/anonymous");
+    // First 2 calls within the same minute are allowed.
+    for i in 0..2 {
+        let resp = client.post(&url).send().await?;
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::OK,
+            "call {} should be allowed",
+            i + 1
+        );
+    }
+    // Third call in the same minute is denied with 429 RATE_LIMITED.
+    let resp = client.post(&url).send().await?;
+    assert_eq!(resp.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+    // Retry-After header is present (the limiter surfaces a positive hint).
+    assert!(
+        resp.headers().get("retry-after").is_some(),
+        "Retry-After header should be present on a 429"
+    );
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(body["code"], "RATE_LIMITED");
     Ok(())
 }
 

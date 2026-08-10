@@ -631,7 +631,7 @@ async fn serve_public_handler(
 /// has the same spoofing shape as XFF, and the prior implementation parsed it
 /// as if it were a comma-separated IP list, which is simply wrong. CF-Connecting-IP
 /// + XFF cover every observed deployment shape.
-fn client_ip_key(headers: &HeaderMap, peer: std::net::IpAddr) -> String {
+pub(crate) fn client_ip_key(headers: &HeaderMap, peer: std::net::IpAddr) -> String {
     if let Some(cf) = headers
         .get("cf-connecting-ip")
         .and_then(|v| v.to_str().ok())

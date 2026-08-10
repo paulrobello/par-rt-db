@@ -290,3 +290,66 @@ pub(super) async fn db_stats(
         subs_used,
     }))
 }
+
+// ============================================================================
+// SEC-103: per-database anonymous-access toggle.
+// ============================================================================
+
+/// `GET /admin/db/{db}/anonymous-access` — returns whether the database has
+/// opted in to anonymous principal access. The instance-wide boot gate
+/// `RTDB_AUTH_ANONYMOUS_ENABLED` is NOT reflected here (it is a boot-time
+/// config, not a per-db property); this reports only the per-db flag.
+#[derive(Serialize)]
+pub(super) struct AnonymousAccessResponse {
+    enabled: bool,
+}
+
+pub(super) async fn get_anonymous_access(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(db): Path<String>,
+) -> Result<Json<AnonymousAccessResponse>, RtDbError> {
+    require_admin(&state, &headers).await?;
+    let (enabled,): (bool,) = sqlx::query_as(
+        "SELECT COALESCE((
+            SELECT anonymous_enabled FROM rtdb_auth.databases WHERE name = $1
+        ), FALSE)",
+    )
+    .bind(&db)
+    .fetch_one(&state.pool)
+    .await?;
+    Ok(Json(AnonymousAccessResponse { enabled }))
+}
+
+/// `PATCH /admin/db/{db}/anonymous-access` — opts the database in to (or out
+/// of) anonymous principal access. The instance-wide boot gate
+/// `RTDB_AUTH_ANONYMOUS_ENABLED` must be on for the per-db flag to take effect
+/// (anon minting is refused at `POST /auth/anonymous` while the master kill is
+/// off); this per-db flag is the additional gate checked at `authorize`. Sets
+/// the `rtdb_auth.databases.anonymous_enabled` column; the database must exist.
+#[derive(Deserialize)]
+pub(super) struct PatchAnonymousAccessRequest {
+    enabled: bool,
+}
+
+pub(super) async fn patch_anonymous_access(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(db): Path<String>,
+    ApiJson(body): ApiJson<PatchAnonymousAccessRequest>,
+) -> Result<Json<OkResponse>, RtDbError> {
+    require_admin(&state, &headers).await?;
+    let result =
+        sqlx::query("UPDATE rtdb_auth.databases SET anonymous_enabled = $1 WHERE name = $2")
+            .bind(body.enabled)
+            .bind(&db)
+            .execute(&state.pool)
+            .await?;
+    if result.rows_affected() == 0 {
+        return Err(RtDbError::not_found(format!(
+            "database '{db}' is not registered (create it before toggling anonymous access)"
+        )));
+    }
+    tracing::info!(db = %db, enabled = body.enabled, "anonymous-access toggled");
+    Ok(Json(OkResponse { ok: true }))
+}

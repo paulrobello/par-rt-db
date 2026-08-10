@@ -6,7 +6,7 @@ use rtdb_server::auth::PrincipalCtx;
 use rtdb_server::ddl::push_schema;
 use rtdb_server::error::ErrorCode;
 use rtdb_server::protocol::ServerMessage;
-use rtdb_server::query::{Query, QueryResult, execute_query};
+use rtdb_server::query::{FilterExpr, Query, QueryResult, execute_query};
 use rtdb_server::schema::{
     DistanceMetric, FieldType, IndexDef, SchemaDef, TableDef, VectorIndexSpec,
 };
@@ -2337,7 +2337,6 @@ async fn collab_or_predicate_composes_with_client_filter() -> anyhow::Result<()>
 /// it is public. No `ownerField`/`collaboratorsField`, so owner/collab
 /// enforcement is inert; the `authorize` predicate is the sole gate.
 fn authorize_schema() -> SchemaDef {
-    use rtdb_server::query::FilterExpr;
     let mut posts_fields = BTreeMap::new();
     posts_fields.insert("body".to_string(), FieldType::String);
     posts_fields.insert("owner".to_string(), FieldType::String);
@@ -4488,5 +4487,288 @@ async fn expect_absent_authorize_hides_invisible_doc() -> anyhow::Result<()> {
     .await
     .expect_err("owner sees his own row as present");
     assert_eq!(err.code, ErrorCode::PreconditionFailed);
+    Ok(())
+}
+
+// ============================================================================
+// SEC-117: SQL scan path and Rust doc evaluator must AGREE over absent fields
+// for every `Not(<comparison>)` authorize predicate. The SQL compile path
+// emits `NOT COALESCE((<inner>), FALSE)` so a NULL inner (absent field) is
+// coerced to FALSE before negation, yielding TRUE = row visible — matching
+// the two-valued Rust doc evaluator (`!false` = true). A divergence here is
+// an authorization bypass: the write path uses the doc evaluator, the read
+// path uses SQL. This test seeds a doc that OMITS the predicate field and
+// asserts both evaluators include it, for each comparison variant wrapped in
+// `Not`.
+// ============================================================================
+
+/// Builds a schema whose `items` table carries the given `authorize` predicate
+/// over a single declared `flag: Boolean` field. The field is declared so it
+/// passes schema validation, but seeded docs OMIT it, exercising the
+/// absent-field code path.
+fn sec117_schema(authorize: FilterExpr) -> SchemaDef {
+    let mut fields = BTreeMap::new();
+    fields.insert("flag".to_string(), FieldType::Boolean);
+    let mut tables = BTreeMap::new();
+    tables.insert(
+        "items".to_string(),
+        TableDef {
+            fields,
+            indexes: vec![],
+            owner_field: None,
+            collaborators_field: None,
+            ttl: None,
+            authorize: Some(authorize),
+        },
+    );
+    SchemaDef { tables }
+}
+
+/// Creates a fresh uniquely-named DB and pushes the given authorize schema.
+async fn sec117_setup(schema: SchemaDef) -> (sqlx::PgPool, common::TestDb, SchemaDef) {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = format!("t{}", uuid::Uuid::now_v7().simple());
+    rtdb_server::db::create_database(&pool, &db).await.unwrap();
+    push_schema(&pool, &db, schema.clone()).await.unwrap();
+    (pool, common::wrap_test_db(db), schema)
+}
+
+/// Inserts an `items` row that OMITS the `flag` field. The txn layer would
+/// reject such an insert (`field 'flag' is required`), so this writes the row
+/// via raw SQL — the doc jsonb carries no `flag` key, exercising the
+/// absent-field code path that an additive schema migration (adding `flag`
+/// to a table that already has rows) would produce in production. Returns the
+/// stored doc (system fields merged at read time) for `filter_matches`.
+async fn sec117_seed_without_flag(
+    pool: &PgPool,
+    db: &str,
+    _schema: &SchemaDef,
+) -> serde_json::Value {
+    let id = uuid::Uuid::now_v7().simple().to_string();
+    let pg_schema = rtdb_server::ddl::pg_schema(db);
+    let pg_table = rtdb_server::ddl::pg_table("items");
+    let now = rtdb_server::db::now_ms();
+    // Raw insert: `doc` jsonb has NO `flag` key. Identifiers are system-derived
+    // from the validated db name + lowercased table name, so double-quoting via
+    // format! is safe (same pattern as mutation_log.rs / db_stats).
+    let sql = format!(
+        "INSERT INTO \"{pg_schema}\".\"{pg_table}\" (id, doc, created_at, version) \
+         VALUES ($1, $2, $3, 1)"
+    );
+    sqlx::query(&sql)
+        .bind(&id)
+        .bind(serde_json::Value::Object(serde_json::Map::new()))
+        .bind(now)
+        .execute(pool)
+        .await
+        .expect("raw seed insert");
+    // Re-read via execute_query (bypass) so the doc has system fields merged
+    // in the same shape `filter_matches` sees on the enforcement path.
+    let get_q = Query {
+        table: "items".to_string(),
+        get: Some(id),
+        index: None,
+        eq: vec![],
+        gt: None,
+        gte: None,
+        lt: None,
+        lte: None,
+        order: None,
+        take: None,
+        unique: false,
+        first: false,
+        count: false,
+        distinct: false,
+        paginate: None,
+        filter: None,
+        search: None,
+        vector_search: None,
+        hybrid_search: None,
+        aggregate: None,
+    };
+    let res = execute_query(pool, db, _schema, &get_q, &PrincipalCtx::bypass())
+        .await
+        .expect("bypass get");
+    match res {
+        QueryResult::Doc(Some(d)) => d,
+        other => panic!("expected bypass Doc(Some), got {other:?}"),
+    }
+}
+
+/// Asserts the SQL scan path and Rust doc evaluator AGREE over a doc that
+/// omits the predicate field, for one `authorize` predicate. The user principal
+/// exercises the SQL path (predicate compiled into WHERE); the bypass-read doc
+/// is then handed to `filter_matches` for the Rust path. Both must yield the
+/// same visible/hidden verdict — the security property restored by SEC-117.
+async fn sec117_assert_agree(predicate: FilterExpr, expect_visible: bool) {
+    use rtdb_server::query::filter_matches;
+    let schema = sec117_schema(predicate.clone());
+    let (pool, db, schema) = sec117_setup(schema).await;
+    let stored_doc = sec117_seed_without_flag(&pool, &db, &schema).await;
+
+    // SQL scan path: query as a real user so `authorize` compiles into WHERE.
+    let q = Query {
+        table: "items".to_string(),
+        get: None,
+        index: None,
+        eq: vec![],
+        gt: None,
+        gte: None,
+        lt: None,
+        lte: None,
+        order: None,
+        take: None,
+        unique: false,
+        first: false,
+        count: false,
+        distinct: false,
+        paginate: None,
+        filter: None,
+        search: None,
+        vector_search: None,
+        hybrid_search: None,
+        aggregate: None,
+    };
+    let user_ctx = PrincipalCtx {
+        user_id: Some("alice".to_string()),
+        email: None,
+        ..Default::default()
+    };
+    let res = execute_query(&pool, &db, &schema, &q, &user_ctx)
+        .await
+        .expect("query executes");
+    let sql_visible = match res {
+        QueryResult::Docs(docs) => !docs.is_empty(),
+        QueryResult::Doc(Some(_)) => true,
+        QueryResult::Doc(None) => false,
+        other => panic!("expected Docs/Doc, got {other:?}"),
+    };
+
+    // Rust doc evaluator path: the enforcement point for point-reads and all
+    // four write pre-checks.
+    let rust_visible = filter_matches(&stored_doc, &predicate, &user_ctx);
+
+    assert_eq!(
+        sql_visible, rust_visible,
+        "SQL scan ({sql_visible}) and Rust doc evaluator ({rust_visible}) \
+         disagree over an absent-field Not(<cmp>) predicate — SEC-117 regression"
+    );
+    assert_eq!(
+        sql_visible, expect_visible,
+        "expected visible={expect_visible}, SQL scan returned visible={sql_visible}"
+    );
+}
+
+// `Not(Eq{flag, true})` over a doc that omits `flag`: both evaluators INCLUDE
+// the row. The SQL path emits `NOT COALESCE((doc flag = true), FALSE)`; absent
+// flag → NULL → COALESCE→FALSE → NOT→TRUE. The Rust path: inner Eq false →
+// `!false` = true. Before SEC-117 the SQL path emitted `NOT (...)` which under
+// three-valued logic gave `NOT NULL` = NULL = row EXCLUDED — a divergence that
+// made the write path (doc evaluator) more permissive than the read path, an
+// auth bypass.
+#[tokio::test]
+async fn sec117_not_eq_absent_field_agrees_include() -> anyhow::Result<()> {
+    sec117_assert_agree(
+        FilterExpr::Not {
+            expr: Box::new(FilterExpr::Eq {
+                field: "flag".into(),
+                value: json!(true),
+            }),
+        },
+        true,
+    )
+    .await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn sec117_not_neq_absent_field_agrees_include() -> anyhow::Result<()> {
+    sec117_assert_agree(
+        FilterExpr::Not {
+            expr: Box::new(FilterExpr::Neq {
+                field: "flag".into(),
+                value: json!(true),
+            }),
+        },
+        true,
+    )
+    .await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn sec117_not_gt_absent_field_agrees_include() -> anyhow::Result<()> {
+    sec117_assert_agree(
+        FilterExpr::Not {
+            expr: Box::new(FilterExpr::Gt {
+                field: "flag".into(),
+                value: json!(true),
+            }),
+        },
+        true,
+    )
+    .await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn sec117_not_gte_absent_field_agrees_include() -> anyhow::Result<()> {
+    sec117_assert_agree(
+        FilterExpr::Not {
+            expr: Box::new(FilterExpr::Gte {
+                field: "flag".into(),
+                value: json!(true),
+            }),
+        },
+        true,
+    )
+    .await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn sec117_not_lt_absent_field_agrees_include() -> anyhow::Result<()> {
+    sec117_assert_agree(
+        FilterExpr::Not {
+            expr: Box::new(FilterExpr::Lt {
+                field: "flag".into(),
+                value: json!(true),
+            }),
+        },
+        true,
+    )
+    .await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn sec117_not_lte_absent_field_agrees_include() -> anyhow::Result<()> {
+    sec117_assert_agree(
+        FilterExpr::Not {
+            expr: Box::new(FilterExpr::Lte {
+                field: "flag".into(),
+                value: json!(true),
+            }),
+        },
+        true,
+    )
+    .await;
+    Ok(())
+}
+
+// Sanity: a bare (non-negated) comparison over an absent field EXCLUDES on
+// both paths — no regression in the non-Not case. Both evaluators agree
+// (SQL: `lhs = $1` with NULL lhs → NULL → excluded; Rust: false).
+#[tokio::test]
+async fn sec117_bare_eq_absent_field_agrees_exclude() -> anyhow::Result<()> {
+    sec117_assert_agree(
+        FilterExpr::Eq {
+            field: "flag".into(),
+            value: json!(true),
+        },
+        false,
+    )
+    .await;
     Ok(())
 }
