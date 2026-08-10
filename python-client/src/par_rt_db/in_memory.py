@@ -1141,25 +1141,7 @@ class InMemoryRtDbClient:
         # after the eq prefix over the matching set, sorted ascending, capped by
         # MAX_TAKE. Nulls are skipped (mirror WHERE "<col>" IS NOT NULL).
         if q.distinct:
-            if index_def is None or len(typed_eq) >= len(index_def.fields):
-                raise RtDbError(
-                    ErrorCode.BAD_REQUEST,
-                    "distinct requires an index field beyond the eq prefix",
-                )
-            field = index_def.fields[len(typed_eq)]
-            field_pg = _pg_for_field(table_def, field)
-            seen: set[str] = set()
-            distinct_values: list[Any] = []
-            for row in filtered:
-                v = row.doc.get(field)
-                if v is None:
-                    continue
-                key = _dedupe_key(v)
-                if key not in seen:
-                    seen.add(key)
-                    distinct_values.append(v)
-            distinct_values.sort(key=cmp_to_key(lambda a, b: _compare_index_values(a, b, field_pg)))
-            return distinct_values[:MAX_TAKE]
+            return self._execute_distinct_terminal(table_def, index_def, typed_eq, filtered)
 
         # `aggregate` terminal: <OP> over the index field after the eq prefix
         # (groupBy: group by that field, aggregate the next). `count` aggregates
@@ -1472,6 +1454,41 @@ class InMemoryRtDbClient:
         ``ts-client``'s ``executeCountTerminal``.
         """
         return len(filtered)
+
+    def _execute_distinct_terminal(
+        self,
+        table_def: TableDef,
+        index_def: IndexDef | None,
+        typed_eq: list[Any],
+        filtered: list[StoredRow],
+    ) -> list[Any]:
+        """``distinct`` terminal: unique values of the index field immediately
+        after the eq prefix over the matching set, sorted ascending, capped by
+        ``MAX_TAKE``. Nulls are skipped (mirrors
+        ``WHERE "<col>" IS NOT NULL``).
+
+        Lift of the former inline ``if q.distinct:`` arm of :meth:`run_query`;
+        mirrors ``ts-client``'s ``executeDistinctTerminal``.
+        """
+        if index_def is None or len(typed_eq) >= len(index_def.fields):
+            raise RtDbError(
+                ErrorCode.BAD_REQUEST,
+                "distinct requires an index field beyond the eq prefix",
+            )
+        field = index_def.fields[len(typed_eq)]
+        field_pg = _pg_for_field(table_def, field)
+        seen: set[str] = set()
+        distinct_values: list[Any] = []
+        for row in filtered:
+            v = row.doc.get(field)
+            if v is None:
+                continue
+            key = _dedupe_key(v)
+            if key not in seen:
+                seen.add(key)
+                distinct_values.append(v)
+        distinct_values.sort(key=cmp_to_key(lambda a, b: _compare_index_values(a, b, field_pg)))
+        return distinct_values[:MAX_TAKE]
 
     def run(self, q: Query, model: type = dict) -> Any:
         """Typed wrapper around :meth:`run_query` that deserializes the result
