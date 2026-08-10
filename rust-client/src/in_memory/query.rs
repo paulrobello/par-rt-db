@@ -443,42 +443,12 @@ impl InMemoryRtDbClient {
         // MAX_TAKE. Ports ts `executeQuery` :1355-1382 and the server's distinct
         // arm. Null index values are skipped (mirror `WHERE "<col>" IS NOT NULL`).
         if q.distinct {
-            let idx = index_def.as_ref().ok_or_else(|| {
-                RtDbError::new(
-                    ErrorCode::BadRequest,
-                    "distinct requires an index field beyond the eq prefix",
-                )
-            })?;
-            if typed_eq.len() >= idx.fields.len() {
-                return Err(RtDbError::new(
-                    ErrorCode::BadRequest,
-                    "distinct requires an index field beyond the eq prefix",
-                ));
-            }
-            let field = idx.fields[typed_eq.len()].as_str();
-            let field_pg = table_def
-                .fields
-                .get(field)
-                .and_then(|ty| index_column_type(ty).ok())
-                .map(|it| it.pg)
-                .unwrap_or(PgType::Text);
-            let mut seen: BTreeSet<String> = BTreeSet::new();
-            let mut values: Vec<Value> = Vec::new();
-            for row in &filtered {
-                let Some(v) = row.doc.get(field) else {
-                    continue;
-                };
-                if v.is_null() {
-                    continue;
-                }
-                // Canonical JSON key so equal scalars dedupe.
-                if seen.insert(v.to_string()) {
-                    values.push(v.clone());
-                }
-            }
-            values.sort_by(|a, b| compare_index_values(a, b, field_pg));
-            let out: Vec<Value> = values.into_iter().take(MAX_TAKE).collect();
-            return Ok(Value::Array(out));
+            return self.execute_distinct_terminal(
+                &table_def,
+                index_def.as_ref(),
+                &typed_eq,
+                &filtered,
+            );
         }
 
         // `aggregate` terminal: <OP> over the index field after the eq prefix
@@ -958,6 +928,55 @@ impl InMemoryRtDbClient {
         Ok(Value::Number(serde_json::Number::from(
             filtered.len() as i64
         )))
+    }
+
+    /// `distinct` terminal: unique values of the index field immediately after
+    /// the eq prefix over the matching set, sorted ascending, capped by
+    /// MAX_TAKE. Ports ts `executeQuery` :1355-1382 and the server's distinct
+    /// arm. Null index values are skipped (mirror `WHERE "<col>" IS NOT NULL`).
+    fn execute_distinct_terminal(
+        &self,
+        table_def: &TableDef,
+        index_def: Option<&IndexDef>,
+        typed_eq: &[Value],
+        filtered: &[StoredRow],
+    ) -> Result<Value, RtDbError> {
+        let idx = index_def.ok_or_else(|| {
+            RtDbError::new(
+                ErrorCode::BadRequest,
+                "distinct requires an index field beyond the eq prefix",
+            )
+        })?;
+        if typed_eq.len() >= idx.fields.len() {
+            return Err(RtDbError::new(
+                ErrorCode::BadRequest,
+                "distinct requires an index field beyond the eq prefix",
+            ));
+        }
+        let field = idx.fields[typed_eq.len()].as_str();
+        let field_pg = table_def
+            .fields
+            .get(field)
+            .and_then(|ty| index_column_type(ty).ok())
+            .map(|it| it.pg)
+            .unwrap_or(PgType::Text);
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        let mut values: Vec<Value> = Vec::new();
+        for row in filtered {
+            let Some(v) = row.doc.get(field) else {
+                continue;
+            };
+            if v.is_null() {
+                continue;
+            }
+            // Canonical JSON key so equal scalars dedupe.
+            if seen.insert(v.to_string()) {
+                values.push(v.clone());
+            }
+        }
+        values.sort_by(|a, b| compare_index_values(a, b, field_pg));
+        let out: Vec<Value> = values.into_iter().take(MAX_TAKE).collect();
+        Ok(Value::Array(out))
     }
 }
 
