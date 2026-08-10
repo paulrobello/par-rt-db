@@ -25,7 +25,7 @@ use crate::auth::{
 };
 use crate::db::now_ms;
 use crate::error::{ErrorCode, RtDbError};
-use crate::protocol::{ClientMessage, ServerMessage};
+use crate::protocol::{ClientMessage, ScheduleWhen, ServerMessage};
 use crate::rate_limit::{RateDecision, evaluate};
 use crate::scheduler;
 use crate::subs::{ConnId, next_conn_id};
@@ -156,17 +156,15 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, headers: Hea
                         break;
                     }
                     Message::Text(text) => {
-                        let should_close = handle_text_frame(
-                            &mut socket,
-                            &state,
-                            &principal,
-                            &db,
+                        let fctx = FrameCtx {
+                            state: &state,
+                            principal: &principal,
+                            db: &db,
                             conn_id,
-                            &out_tx,
-                            &mut rate_limiter,
-                            &text,
-                        )
-                        .await;
+                            out_tx: &out_tx,
+                        };
+                        let should_close =
+                            handle_text_frame(&mut socket, &fctx, &mut rate_limiter, &text).await;
                         if should_close {
                             break;
                         }
@@ -299,37 +297,47 @@ async fn authenticate(
     Some((principal, db))
 }
 
+/// Shared, borrow-only context for the per-frame `handle_*` handlers that
+/// [`handle_text_frame`] dispatches to (QA-107). Bundles the per-connection
+/// reads every interactive frame shares — the app state, the authenticated
+/// principal, the database name, the connection id, and the outbound channel
+/// — so each handler signature stays flat. The socket and connection-level
+/// rate limiter stay in `handle_text_frame`'s preamble (handlers reply over
+/// the outbound channel, never via direct socket writes; the conn-level
+/// limiter is a flood valve checked once per frame before dispatch). Mirrors
+/// the `StepCtx`/`SearchCtx` pattern (QA-105) and the `CommitterCtx`
+/// precedent (ARC-002); handlers take `&FrameCtx` and copy out the shared
+/// reference fields at the top of the body.
+struct FrameCtx<'a> {
+    state: &'a Arc<AppState>,
+    principal: &'a Principal,
+    db: &'a str,
+    conn_id: ConnId,
+    out_tx: &'a UnboundedSender<ServerMessage>,
+}
+
 /// Validates and dispatches one post-auth text frame. Returns whether the
-/// connection should now close (frame too large, rate limit exceeded,
-/// malformed JSON, or an out-of-order `auth`); every other message is
-/// handled and the connection stays open. Every post-auth message arm —
-/// `Subscribe`, `Mutate`, and the schedule family (`Schedule`,
-/// `CancelSchedule`, `PauseSchedule`, `ResumeSchedule`, `ListSchedules`) —
-/// re-checks authorization for `principal` on `db` first — authorization
-/// can be revoked mid-session (e.g. an allowlist removal) — and on failure
-/// the operation errors (e.g. `SubscribeErr`/`MutateErr`) without closing
-/// the connection.
+/// connection should now close (frame too large, connection-level rate limit
+/// exceeded, malformed JSON, or an out-of-order `Auth`); every other message
+/// is handled and the connection stays open.
 ///
-/// `Subscribe` and `Mutate` additionally re-run `is_admin` per op (SEC-004):
-/// the admin bypass is re-justified against the live `rtdb_auth.admins` table
-/// on each message, so an OAuth user removed from the admin allowlist while
-/// holding an open `/sync` stops bypassing per-db `authorize` and stops
-/// mutating with `owner=None` on the next op. (The schedule family never
-/// carried the admin bypass, so it is unchanged.) `is_admin` returns false on
-/// DB error (`auth::is_admin`), so a transient Postgres outage fails safe:
-/// the bypass is withheld, not widened.
-// A3's `principal` param pushes this past clippy's default 7-argument
-// threshold; every param is independently needed by a different message arm,
-// so bundling them into a context struct would add indirection without
-// reducing coupling.
-#[allow(clippy::too_many_arguments)]
+/// The frame-size and per-connection rate-limit checks live here in the
+/// preamble (no handler needs them); the per-arm work is delegated to one
+/// `handle_*` per frame variant (the pattern `committer.rs` uses for its
+/// committer-request arms), keeping the dispatcher a thin match. The
+/// SEC-004 "re-run `authorize` (and `is_admin`) on every Subscribe and
+/// Mutate" invariant is made structural: those arms — and `Presence`, which
+/// carries the same admin-bypass re-justification — all funnel through
+/// [`authorize_op`] (the single authorization seam) rather than each
+/// copy-pasting the `is_admin → session_still_valid | authorize` block. The
+/// schedule family (`Schedule`, `CancelSchedule`, `PauseSchedule`,
+/// `ResumeSchedule`, `ListSchedules`) never carried the admin bypass and
+/// keeps its `authorize`-only gate. `is_admin` fails safe (false on DB
+/// error), so a transient Postgres outage withholds the bypass, never widens
+/// it.
 async fn handle_text_frame(
     socket: &mut WebSocket,
-    state: &Arc<AppState>,
-    principal: &Principal,
-    db: &str,
-    conn_id: ConnId,
-    out_tx: &UnboundedSender<ServerMessage>,
+    fctx: &FrameCtx<'_>,
     rate_limiter: &mut ConnRateLimiter,
     text: &str,
 ) -> bool {
@@ -357,299 +365,373 @@ async fn handle_text_frame(
             true
         }
         ClientMessage::Subscribe { query_id, query } => {
-            // SEC-004: re-justify the admin bypass against the live admin
-            // allowlist on every op — a principal removed from
-            // `rtdb_auth.admins` mid-connection must not keep bypassing
-            // per-db `authorize`. `is_admin` fails safe (returns false on DB
-            // error). Admins still must hold a live session, so the same
-            // per-op revocation check runs on the admin branch too.
-            let admin = is_admin(&state.pool, principal).await;
-            let authed = if admin {
-                session_still_valid(&state.pool, principal).await
-            } else {
-                authorize(&state.pool, principal, db).await
-            };
-            match authed {
-                Ok(()) => {
-                    if let RateDecision::Denied { retry_after_secs } =
-                        evaluate(state, principal, db).await
-                    {
-                        let _ = out_tx.send(ServerMessage::SubscribeErr {
-                            query_id,
-                            error: RtDbError::rate_limited(retry_after_secs),
-                        });
-                        return false;
-                    }
-                    // Admins subscribe with a bypass ctx (user_id None — they
-                    // see every row); everyone else is scoped to their own
-                    // identity via `principal.row_ctx()`.
-                    let principal_ctx = if admin {
-                        PrincipalCtx::bypass()
-                    } else {
-                        principal.row_ctx()
-                    };
-                    // Time the initial-query arm: committers.subscribe().await
-                    // resolves after the initial query has run, its result been
-                    // sent on `tx`, and the subscription registered (see
-                    // handle_subscribe). That covers the full first-eval cost
-                    // (channel + committer queue + execute_query + send +
-                    // register); subsequent push-on-change re-runs are NOT
-                    // included (they are fan_out work, not the initial query).
-                    let t = Instant::now();
-                    let sub_result = state
-                        .realtime
-                        .committers
-                        .subscribe(
-                            db,
-                            conn_id,
-                            query_id.clone(),
-                            *query,
-                            out_tx.clone(),
-                            principal_ctx,
-                        )
-                        .await;
-                    let elapsed_us = t.elapsed().as_micros() as u64;
-                    match sub_result {
-                        Ok(()) => {
-                            state.runtime.metrics.record_subscribe_duration(elapsed_us);
-                            state.runtime.metrics.record_query();
-                        }
-                        Err(error) => {
-                            let _ = out_tx.send(ServerMessage::SubscribeErr { query_id, error });
-                        }
-                    }
-                }
-                Err(error) => {
-                    let _ = out_tx.send(ServerMessage::SubscribeErr { query_id, error });
-                }
-            }
-            false
+            handle_subscribe(fctx, query_id, query).await
         }
         ClientMessage::Unsubscribe { query_id } => {
-            state.realtime.subs.remove(db, conn_id, &query_id).await;
+            fctx.state
+                .realtime
+                .subs
+                .remove(fctx.db, fctx.conn_id, &query_id)
+                .await;
             false
         }
         ClientMessage::Mutate {
             mut_id,
             idempotency_key,
             txn,
-        } => {
-            // SEC-004: re-justify the admin bypass on every op (see Subscribe).
-            let admin = is_admin(&state.pool, principal).await;
-            let authed = if admin {
-                session_still_valid(&state.pool, principal).await
-            } else {
-                authorize(&state.pool, principal, db).await
-            };
-            match authed {
-                Ok(()) => {
-                    if principal.is_read_only() {
-                        let _ = out_tx.send(ServerMessage::MutateErr {
-                            mut_id,
-                            error: RtDbError::forbidden("read-only token cannot mutate"),
-                        });
-                        return false;
-                    }
-                    if let RateDecision::Denied { retry_after_secs } =
-                        evaluate(state, principal, db).await
-                    {
-                        let _ = out_tx.send(ServerMessage::MutateErr {
-                            mut_id,
-                            error: RtDbError::rate_limited(retry_after_secs),
-                        });
-                        return false;
-                    }
-                    // Same admin guardrail as the HTTP data-browser path: reject
-                    // an over-budget mutation before it reaches the committer.
-                    // The bound is worst-case affected documents, not raw step
-                    // count — a by-query step can touch many rows (SEC-104).
-                    let cap = state.config.max_affected_docs;
-                    let worst = crate::txn::worst_case_affected(&txn);
-                    if admin && worst > cap {
-                        let _ = out_tx.send(ServerMessage::MutateErr {
-                            mut_id,
-                            error: RtDbError::bad_request(format!(
-                                "mutation could affect up to {worst} document(s), exceeding the limit of {cap}"
-                            )),
-                        });
-                        return false;
-                    }
-                    let principal_ctx = if admin {
-                        PrincipalCtx::bypass()
-                    } else {
-                        principal.row_ctx()
-                    };
-                    match state
-                        .realtime
-                        .committers
-                        .mutate(db, idempotency_key, txn, principal_ctx)
-                        .await
-                    {
-                        Ok(outcome) => {
-                            state.runtime.metrics.record_mutation();
-                            let _ = out_tx.send(ServerMessage::MutateOk {
-                                mut_id,
-                                results: outcome.results,
-                            });
-                        }
-                        Err(error) => {
-                            let _ = out_tx.send(ServerMessage::MutateErr { mut_id, error });
-                        }
-                    }
-                }
-                Err(error) => {
-                    let _ = out_tx.send(ServerMessage::MutateErr { mut_id, error });
-                }
-            }
-            false
-        }
+        } => handle_mutate(fctx, mut_id, idempotency_key, txn).await,
         ClientMessage::Ping => {
-            let _ = out_tx.send(ServerMessage::Pong);
+            let _ = fctx.out_tx.send(ServerMessage::Pong);
             false
         }
         ClientMessage::Schedule {
             schedule_id,
             when,
             txn,
-        } => {
-            let reply = match authorize(&state.pool, principal, db).await {
-                Ok(()) if principal.is_read_only() => ServerMessage::ScheduleErr {
-                    schedule_id,
-                    error: RtDbError::forbidden("read-only token cannot mutate"),
-                },
-                Ok(()) => match scheduler::resolve_when(when, now_ms()) {
-                    Ok((kind, due_at, cron)) => {
-                        match scheduler::insert(
-                            &state.pool,
-                            db,
-                            kind,
-                            due_at,
-                            &txn,
-                            cron.as_deref(),
-                        )
-                        .await
-                        {
-                            Ok(id) => ServerMessage::ScheduleOk { schedule_id, id },
-                            Err(error) => ServerMessage::ScheduleErr { schedule_id, error },
-                        }
-                    }
-                    Err(error) => ServerMessage::ScheduleErr { schedule_id, error },
-                },
-                Err(error) => ServerMessage::ScheduleErr { schedule_id, error },
-            };
-            let _ = out_tx.send(reply);
-            false
-        }
+        } => handle_schedule(fctx, schedule_id, when, txn).await,
         ClientMessage::CancelSchedule { schedule_id, id } => {
             run_simple_schedule(
-                state,
-                principal,
-                db,
-                out_tx,
+                fctx.state,
+                fctx.principal,
+                fctx.db,
+                fctx.out_tx,
                 schedule_id,
-                scheduler::cancel(&state.pool, db, &id),
+                scheduler::cancel(&fctx.state.pool, fctx.db, &id),
             )
             .await
         }
         ClientMessage::PauseSchedule { schedule_id, id } => {
             run_simple_schedule(
-                state,
-                principal,
-                db,
-                out_tx,
+                fctx.state,
+                fctx.principal,
+                fctx.db,
+                fctx.out_tx,
                 schedule_id,
-                scheduler::set_paused(&state.pool, db, &id, true),
+                scheduler::set_paused(&fctx.state.pool, fctx.db, &id, true),
             )
             .await
         }
         ClientMessage::ResumeSchedule { schedule_id, id } => {
             run_simple_schedule(
-                state,
-                principal,
-                db,
-                out_tx,
+                fctx.state,
+                fctx.principal,
+                fctx.db,
+                fctx.out_tx,
                 schedule_id,
-                scheduler::set_paused(&state.pool, db, &id, false),
+                scheduler::set_paused(&fctx.state.pool, fctx.db, &id, false),
             )
             .await
         }
         ClientMessage::ListSchedules { schedule_id } => {
-            let reply = match authorize(&state.pool, principal, db).await {
-                Ok(()) => match scheduler::list(&state.pool, db).await {
-                    Ok(schedules) => ServerMessage::ListSchedulesOk {
-                        schedule_id,
-                        schedules,
-                    },
-                    Err(error) => ServerMessage::ScheduleErr { schedule_id, error },
-                },
-                Err(error) => ServerMessage::ScheduleErr { schedule_id, error },
-            };
-            let _ = out_tx.send(reply);
-            false
+            handle_list_schedules(fctx, schedule_id).await
         }
-        // ENH-015 presence frames. Join re-runs `is_admin` + `authorize`
-        // (SEC-004 parity: revocation takes effect on open connections) and
-        // captures `authed_user(principal)` here — the load-bearing
-        // identity-capture point (the full `Principal` lives only at the WS
-        // layer; downstream code sees `PrincipalCtx` with no display identity).
-        // `PresenceState`/`LeavePresence` do NOT re-run `authorize`: membership
-        // implies prior auth, and keeping cursor updates off Postgres is a
-        // stated design rule. Presence is not routed through the committer and
-        // is not gated by the token/db RPM limiter. The Presence JOIN, like
-        // Subscribe/Mutate, still live-checks the session on the admin branch
-        // — admins must hold a live session (revocation applies to every
-        // interactive principal).
         ClientMessage::Presence {
             room,
             state: presence_state,
-        } => {
-            let admin = is_admin(&state.pool, principal).await;
-            let authed = if admin {
-                session_still_valid(&state.pool, principal).await
-            } else {
-                authorize(&state.pool, principal, db).await
-            };
-            if let Err(error) = authed {
-                let _ = out_tx.send(ServerMessage::PresenceErr { room, error });
-                return false;
-            }
-            let user = authed_user(principal);
-            match state
-                .realtime
-                .presence
-                .join(db, conn_id, &room, presence_state, user, out_tx.clone())
-                .await
-            {
-                Ok(()) => state.runtime.metrics.record_presence_update(),
-                Err(error) => {
-                    let _ = out_tx.send(ServerMessage::PresenceErr { room, error });
-                }
-            }
-            false
-        }
+        } => handle_presence(fctx, room, presence_state).await,
         ClientMessage::PresenceState {
             room,
             state: presence_state,
             ttl_ms,
-        } => {
-            match state
+        } => handle_presence_state(fctx, room, presence_state, ttl_ms).await,
+        ClientMessage::LeavePresence { room } => {
+            fctx.state
                 .realtime
                 .presence
-                .update_state(db, conn_id, &room, presence_state, ttl_ms)
-                .await
-            {
-                Ok(()) => state.runtime.metrics.record_presence_update(),
-                Err(error) => {
-                    let _ = out_tx.send(ServerMessage::PresenceErr { room, error });
-                }
-            }
-            false
-        }
-        ClientMessage::LeavePresence { room } => {
-            state.realtime.presence.leave(db, conn_id, &room).await;
+                .leave(fctx.db, fctx.conn_id, &room)
+                .await;
             false
         }
     }
+}
+
+/// SEC-004 per-op authorization guard — the single authorization seam for
+/// interactive WS frames. Re-justifies the admin bypass against the live
+/// `rtdb_auth.admins` allowlist (`is_admin`, fails safe to "not admin" on DB
+/// error) and, depending on the branch, either checks the admin session is
+/// still live (`session_still_valid`) or runs the per-db `authorize`.
+/// Returns the per-row principal context to use for the op plus whether the
+/// principal is currently a server-wide admin (the admin flag governs the
+/// `max_affected_docs` guardrail in [`handle_mutate`]). Subscribe, Mutate,
+/// and Presence all funnel through here so the "re-run `authorize` on every
+/// Subscribe and Mutate" invariant is structural — there is one function to
+/// audit, not three copy-pasted blocks. A principal removed from
+/// `rtdb_auth.admins` mid-connection loses the bypass on the next op;
+/// `is_admin` returns false on DB error so a transient Postgres outage
+/// withholds the bypass rather than widening it.
+async fn authorize_op(
+    pool: &sqlx::PgPool,
+    principal: &Principal,
+    db: &str,
+) -> Result<(PrincipalCtx, bool), RtDbError> {
+    let admin = is_admin(pool, principal).await;
+    if admin {
+        session_still_valid(pool, principal).await?;
+        Ok((PrincipalCtx::bypass(), true))
+    } else {
+        authorize(pool, principal, db).await?;
+        Ok((principal.row_ctx(), false))
+    }
+}
+
+/// Per-op token/db RPM check (SEC-003). Returns `Ok(())` or the
+/// `retry_after_secs` on denial. [`handle_subscribe`] and [`handle_mutate`]
+/// gate on this after [`authorize_op`]; the schedule and presence families
+/// are not RPM-limited (matching the original per-arm behavior).
+async fn check_rate_limit(state: &AppState, principal: &Principal, db: &str) -> Result<(), u32> {
+    if let RateDecision::Denied { retry_after_secs } = evaluate(state, principal, db).await {
+        Err(retry_after_secs)
+    } else {
+        Ok(())
+    }
+}
+
+/// `Subscribe` arm: re-run [`authorize_op`] (SEC-004), check the RPM limiter,
+/// then register the subscription via the committer. The initial-query
+/// duration is timed end to end (channel enqueue → committer queue →
+/// `execute_query` → send initial result → register); subsequent
+/// push-on-change re-runs are `fan_out` work and not included.
+async fn handle_subscribe(
+    fctx: &FrameCtx<'_>,
+    query_id: String,
+    query: Box<crate::query::Query>,
+) -> bool {
+    let state = fctx.state;
+    let principal = fctx.principal;
+    let db = fctx.db;
+    let conn_id = fctx.conn_id;
+    let out_tx = fctx.out_tx;
+
+    match authorize_op(&state.pool, principal, db).await {
+        Ok((principal_ctx, _)) => {
+            if let Err(retry_after_secs) = check_rate_limit(state, principal, db).await {
+                let _ = out_tx.send(ServerMessage::SubscribeErr {
+                    query_id,
+                    error: RtDbError::rate_limited(retry_after_secs),
+                });
+                return false;
+            }
+            let t = Instant::now();
+            let sub_result = state
+                .realtime
+                .committers
+                .subscribe(
+                    db,
+                    conn_id,
+                    query_id.clone(),
+                    *query,
+                    out_tx.clone(),
+                    principal_ctx,
+                )
+                .await;
+            let elapsed_us = t.elapsed().as_micros() as u64;
+            match sub_result {
+                Ok(()) => {
+                    state.runtime.metrics.record_subscribe_duration(elapsed_us);
+                    state.runtime.metrics.record_query();
+                }
+                Err(error) => {
+                    let _ = out_tx.send(ServerMessage::SubscribeErr { query_id, error });
+                }
+            }
+        }
+        Err(error) => {
+            let _ = out_tx.send(ServerMessage::SubscribeErr { query_id, error });
+        }
+    }
+    false
+}
+
+/// `Mutate` arm: re-run [`authorize_op`] (SEC-004), reject read-only tokens,
+/// check the RPM limiter, then enforce the admin `max_affected_docs`
+/// guardrail before dispatching to the committer. The guardrail rejects an
+/// over-budget mutation before it reaches the serialized committer turn —
+/// the bound is worst-case affected documents, not raw step count (a
+/// by-query step can touch many rows; SEC-104).
+async fn handle_mutate(
+    fctx: &FrameCtx<'_>,
+    mut_id: String,
+    idempotency_key: Option<String>,
+    txn: crate::txn::Transaction,
+) -> bool {
+    let state = fctx.state;
+    let principal = fctx.principal;
+    let db = fctx.db;
+    let out_tx = fctx.out_tx;
+
+    match authorize_op(&state.pool, principal, db).await {
+        Ok((principal_ctx, admin)) => {
+            if principal.is_read_only() {
+                let _ = out_tx.send(ServerMessage::MutateErr {
+                    mut_id,
+                    error: RtDbError::forbidden("read-only token cannot mutate"),
+                });
+                return false;
+            }
+            if let Err(retry_after_secs) = check_rate_limit(state, principal, db).await {
+                let _ = out_tx.send(ServerMessage::MutateErr {
+                    mut_id,
+                    error: RtDbError::rate_limited(retry_after_secs),
+                });
+                return false;
+            }
+            let cap = state.config.max_affected_docs;
+            let worst = crate::txn::worst_case_affected(&txn);
+            if admin && worst > cap {
+                let _ = out_tx.send(ServerMessage::MutateErr {
+                    mut_id,
+                    error: RtDbError::bad_request(format!(
+                        "mutation could affect up to {worst} document(s), exceeding the limit of {cap}"
+                    )),
+                });
+                return false;
+            }
+            match state
+                .realtime
+                .committers
+                .mutate(db, idempotency_key, txn, principal_ctx)
+                .await
+            {
+                Ok(outcome) => {
+                    state.runtime.metrics.record_mutation();
+                    let _ = out_tx.send(ServerMessage::MutateOk {
+                        mut_id,
+                        results: outcome.results,
+                    });
+                }
+                Err(error) => {
+                    let _ = out_tx.send(ServerMessage::MutateErr { mut_id, error });
+                }
+            }
+        }
+        Err(error) => {
+            let _ = out_tx.send(ServerMessage::MutateErr { mut_id, error });
+        }
+    }
+    false
+}
+
+/// `Schedule` arm: `authorize`-only gate (the schedule family never carried
+/// the admin bypass), reject read-only tokens, resolve the schedule timing,
+/// then insert the scheduled transaction.
+async fn handle_schedule(
+    fctx: &FrameCtx<'_>,
+    schedule_id: String,
+    when: ScheduleWhen,
+    txn: crate::txn::Transaction,
+) -> bool {
+    let state = fctx.state;
+    let principal = fctx.principal;
+    let db = fctx.db;
+    let out_tx = fctx.out_tx;
+
+    let reply = match authorize(&state.pool, principal, db).await {
+        Ok(()) if principal.is_read_only() => ServerMessage::ScheduleErr {
+            schedule_id,
+            error: RtDbError::forbidden("read-only token cannot mutate"),
+        },
+        Ok(()) => match scheduler::resolve_when(when, now_ms()) {
+            Ok((kind, due_at, cron)) => {
+                match scheduler::insert(&state.pool, db, kind, due_at, &txn, cron.as_deref()).await
+                {
+                    Ok(id) => ServerMessage::ScheduleOk { schedule_id, id },
+                    Err(error) => ServerMessage::ScheduleErr { schedule_id, error },
+                }
+            }
+            Err(error) => ServerMessage::ScheduleErr { schedule_id, error },
+        },
+        Err(error) => ServerMessage::ScheduleErr { schedule_id, error },
+    };
+    let _ = out_tx.send(reply);
+    false
+}
+
+/// `ListSchedules` arm: `authorize`-only gate, then list the database's
+/// scheduled transactions.
+async fn handle_list_schedules(fctx: &FrameCtx<'_>, schedule_id: String) -> bool {
+    let state = fctx.state;
+    let principal = fctx.principal;
+    let db = fctx.db;
+    let out_tx = fctx.out_tx;
+
+    let reply = match authorize(&state.pool, principal, db).await {
+        Ok(()) => match scheduler::list(&state.pool, db).await {
+            Ok(schedules) => ServerMessage::ListSchedulesOk {
+                schedule_id,
+                schedules,
+            },
+            Err(error) => ServerMessage::ScheduleErr { schedule_id, error },
+        },
+        Err(error) => ServerMessage::ScheduleErr { schedule_id, error },
+    };
+    let _ = out_tx.send(reply);
+    false
+}
+
+/// `Presence` JOIN arm: re-runs [`authorize_op`] (SEC-004 parity — revocation
+/// takes effect on open connections) and captures `authed_user(principal)`
+/// — the load-bearing identity-capture point (the full `Principal` lives
+/// only at the WS layer; downstream code sees `PrincipalCtx` with no display
+/// identity). Presence is not routed through the committer and is not gated
+/// by the token/db RPM limiter; the admin branch still live-checks the
+/// session (admins must hold a live session — revocation applies to every
+/// interactive principal).
+async fn handle_presence(
+    fctx: &FrameCtx<'_>,
+    room: String,
+    presence_state: Option<serde_json::Value>,
+) -> bool {
+    let state = fctx.state;
+    let principal = fctx.principal;
+    let db = fctx.db;
+    let conn_id = fctx.conn_id;
+    let out_tx = fctx.out_tx;
+
+    if let Err(error) = authorize_op(&state.pool, principal, db).await {
+        let _ = out_tx.send(ServerMessage::PresenceErr { room, error });
+        return false;
+    }
+    let user = authed_user(principal);
+    match state
+        .realtime
+        .presence
+        .join(db, conn_id, &room, presence_state, user, out_tx.clone())
+        .await
+    {
+        Ok(()) => state.runtime.metrics.record_presence_update(),
+        Err(error) => {
+            let _ = out_tx.send(ServerMessage::PresenceErr { room, error });
+        }
+    }
+    false
+}
+
+/// `PresenceState` arm: update cursor/state in an already-joined room. Does
+/// NOT re-run `authorize` — membership implies prior auth, and keeping
+/// cursor updates off Postgres is a stated design rule (ENH-015).
+async fn handle_presence_state(
+    fctx: &FrameCtx<'_>,
+    room: String,
+    presence_state: serde_json::Value,
+    ttl_ms: Option<u64>,
+) -> bool {
+    let state = fctx.state;
+    let db = fctx.db;
+    let conn_id = fctx.conn_id;
+    let out_tx = fctx.out_tx;
+
+    match state
+        .realtime
+        .presence
+        .update_state(db, conn_id, &room, presence_state, ttl_ms)
+        .await
+    {
+        Ok(()) => state.runtime.metrics.record_presence_update(),
+        Err(error) => {
+            let _ = out_tx.send(ServerMessage::PresenceErr { room, error });
+        }
+    }
+    false
 }
 
 /// Helper for the three structurally-identical WS schedule arms
