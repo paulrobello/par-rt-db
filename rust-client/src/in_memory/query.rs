@@ -38,32 +38,7 @@ impl InMemoryRtDbClient {
 
         // `get` terminal — exclusive of every other clause.
         if let Some(id) = &q.get {
-            if q.index.is_some()
-                || !eq.is_empty()
-                || has_range
-                || q.order.is_some()
-                || q.take.is_some()
-                || q.unique
-                || q.first
-                || q.count
-                || q.distinct
-                || q.aggregate.is_some()
-                || q.paginate.is_some()
-                || q.filter.is_some()
-                || q.search.is_some()
-                || q.vector_search.is_some()
-                || q.hybrid_search.is_some()
-            {
-                return Err(RtDbError::new(
-                    ErrorCode::BadRequest,
-                    "get cannot be combined with index, eq, range bounds, order, take, \
-                     unique, first, count, distinct, aggregate, paginate, filter, search, \
-                     vector search, or hybrid search",
-                ));
-            }
-            // The DSL `get` terminal reuses the point-read primitive so the
-            // system-field merge path is shared with the Task 2 helper.
-            return Ok(self.get(&q.table, id).unwrap_or(Value::Null));
+            return self.execute_get_terminal(q, id, eq, has_range);
         }
 
         // Conflicting-terminal guards (ports :919-939).
@@ -884,6 +859,42 @@ impl InMemoryRtDbClient {
             .map(|row| merge_doc(&row))
             .collect();
         Ok(Value::Array(out))
+    }
+
+    /// `get` terminal — exclusive of every other clause.
+    fn execute_get_terminal(
+        &self,
+        q: &Query,
+        id: &str,
+        eq: &[Value],
+        has_range: bool,
+    ) -> Result<Value, RtDbError> {
+        if q.index.is_some()
+            || !eq.is_empty()
+            || has_range
+            || q.order.is_some()
+            || q.take.is_some()
+            || q.unique
+            || q.first
+            || q.count
+            || q.distinct
+            || q.aggregate.is_some()
+            || q.paginate.is_some()
+            || q.filter.is_some()
+            || q.search.is_some()
+            || q.vector_search.is_some()
+            || q.hybrid_search.is_some()
+        {
+            return Err(RtDbError::new(
+                ErrorCode::BadRequest,
+                "get cannot be combined with index, eq, range bounds, order, take, \
+                 unique, first, count, distinct, aggregate, paginate, filter, search, \
+                 vector search, or hybrid search",
+            ));
+        }
+        // The DSL `get` terminal reuses the point-read primitive so the
+        // system-field merge path is shared with the Task 2 helper.
+        Ok(self.get(&q.table, id).unwrap_or(Value::Null))
     }
 }
 
