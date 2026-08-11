@@ -34,7 +34,7 @@ RUN mkdir -p server/src rust-client/src rust-client/tests cli/src \
               rust-client/tests/hot_config_test.rs rust-client/tests/ws_integration.rs \
               rust-client/tests/http_integration.rs \
     && cargo build --release --locked --manifest-path server/Cargo.toml --bin rtdb-server \
-    && rm -rf server/src rust-client/tests
+    && rm -rf server/src
 # Bake the live git sha into /healthz. The build context has no .git (rsync
 # excludes it), so build.rs falls back to this arg; "unknown" if unset.
 # Declared AFTER the dependency layer so a per-deploy commit change only
