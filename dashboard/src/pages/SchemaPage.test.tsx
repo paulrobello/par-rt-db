@@ -176,7 +176,7 @@ describe("SchemaPage", () => {
   it("surfaces a preview server error envelope", async () => {
     const user = userEvent.setup();
     adminClientMock.previewSchema.mockRejectedValue(
-      new RtDbRequestError("SCHEMA_VIOLATION", 400, "invalid table name"),
+      new RtDbRequestError("SCHEMA_VIOLATION", "invalid table name", undefined, 400),
     );
     render(<SchemaPage />);
     await screen.findByText("items");

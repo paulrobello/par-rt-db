@@ -1,6 +1,6 @@
+import type { SchemaJson } from "@par-rt-db/client";
 import { useCallback, useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
-import type { SchemaJson } from "@par-rt-db/client";
 import { Button, Placard, Spinner } from "../components/ui";
 import { RtDbRequestError, useAdmin } from "../lib/admin";
 import { formatFieldType } from "../lib/format";
@@ -82,7 +82,7 @@ export function SchemaPage() {
         setPreview({
           kind: "error",
           code: e.code,
-          status: e.status,
+          status: e.status ?? null,
           message: e.message,
         });
       } else {
@@ -123,7 +123,7 @@ export function SchemaPage() {
         setPreview({
           kind: "error",
           code: e.code,
-          status: e.status,
+          status: e.status ?? null,
           message: e.message,
         });
       } else {

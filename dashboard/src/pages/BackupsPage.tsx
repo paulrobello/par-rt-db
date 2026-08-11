@@ -86,7 +86,14 @@ export function BackupsPage() {
     setDownloading(file.name);
     setActionError(null);
     try {
-      await client.downloadBackup(file.name);
+      const resp = await client.downloadBackup(file.name);
+      const blob = await resp.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = file.name;
+      a.click();
+      URL.revokeObjectURL(url);
     } catch (e) {
       setActionError(e instanceof Error ? e.message : String(e));
     } finally {

@@ -1,6 +1,6 @@
+import type { SchemaHistoryEntry, SchemaHistoryEntrySummary, SchemaJson } from "@par-rt-db/client";
 import { useCallback, useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
-import type { SchemaHistoryEntry, SchemaHistoryEntrySummary, SchemaJson } from "@par-rt-db/client";
 import { Button, Placard, Spinner } from "../components/ui";
 import { RtDbRequestError, useAdmin } from "../lib/admin";
 import { formatDateTime, formatFieldType } from "../lib/format";
@@ -10,7 +10,7 @@ type DetailError = { code: string; status: number | null; message: string };
 
 function toDetailError(e: unknown): DetailError {
   if (e instanceof RtDbRequestError) {
-    return { code: e.code, status: e.status, message: e.message };
+    return { code: e.code, status: e.status ?? null, message: e.message };
   }
   return {
     code: "INTERNAL",

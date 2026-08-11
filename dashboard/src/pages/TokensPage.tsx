@@ -48,7 +48,7 @@ export function TokensPage() {
     setLoading(true);
     setListError(null);
     try {
-      setTokens((await client.listTokens(db)).tokens);
+      setTokens(await client.listTokens(db));
     } catch (e) {
       setListError(e instanceof Error ? e.message : String(e));
       setTokens([]);

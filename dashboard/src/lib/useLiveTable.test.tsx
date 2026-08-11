@@ -74,7 +74,7 @@ describe("useLiveTable cleanup on unmount", () => {
   it("polling (admin-key) path: clears the timer so adminQuery stops after unmount", async () => {
     vi.useFakeTimers();
     mocks.box.method = "adminkey";
-    mocks.adminQuery.mockResolvedValue({ result: [] });
+    mocks.adminQuery.mockResolvedValue([]);
 
     const { unmount } = renderHook(() => useLiveTable("db1", "items", "asc", 10));
 

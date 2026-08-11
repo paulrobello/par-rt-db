@@ -172,7 +172,7 @@ describe("SchemaHistoryPage", () => {
   it("surfaces a restore server error envelope", async () => {
     const user = userEvent.setup();
     adminClientMock.restoreSchema.mockRejectedValue(
-      new RtDbRequestError("BAD_REQUEST", 400, "confirm does not match db name"),
+      new RtDbRequestError("BAD_REQUEST", "confirm does not match db name", undefined, 400),
     );
     render(<SchemaHistoryPage />);
     await screen.findByText("v1");

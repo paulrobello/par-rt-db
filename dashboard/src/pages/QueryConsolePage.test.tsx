@@ -32,9 +32,7 @@ describe("QueryConsolePage", () => {
 
   it("runs the default query and shows the pretty-printed result", async () => {
     const user = userEvent.setup();
-    adminClientMock.adminQuery.mockResolvedValue({
-      result: [{ _id: "k1", name: "Ada" }],
-    });
+    adminClientMock.adminQuery.mockResolvedValue([{ _id: "k1", name: "Ada" }]);
     render(<QueryConsolePage />);
 
     await user.click(screen.getByRole("button", { name: "run" }));
@@ -50,7 +48,7 @@ describe("QueryConsolePage", () => {
 
   it("switches to mutate mode and runs the default transaction", async () => {
     const user = userEvent.setup();
-    adminClientMock.adminMutate.mockResolvedValue({ results: ["new-id"] });
+    adminClientMock.adminMutate.mockResolvedValue(["new-id"]);
     render(<QueryConsolePage />);
 
     await user.click(screen.getByRole("button", { name: "mutate" }));
@@ -66,7 +64,6 @@ describe("QueryConsolePage", () => {
       ],
     });
     expect(adminClientMock.adminQuery).not.toHaveBeenCalled();
-    expect(await screen.findByText(/"results":/)).toBeInTheDocument();
     expect(screen.getByText(/"new-id"/)).toBeInTheDocument();
   });
 
@@ -87,13 +84,13 @@ describe("QueryConsolePage", () => {
   it("surfaces a server error envelope (code + HTTP status + message)", async () => {
     const user = userEvent.setup();
     adminClientMock.adminQuery.mockRejectedValue(
-      new RtDbRequestError("QUERY_ERROR", 400, "unknown table: widgets"),
+      new RtDbRequestError("BAD_REQUEST", "unknown table: widgets", undefined, 400),
     );
     render(<QueryConsolePage />);
 
     await user.click(screen.getByRole("button", { name: "run" }));
 
-    expect(await screen.findByText(/QUERY_ERROR/)).toBeInTheDocument();
+    expect(await screen.findByText(/BAD_REQUEST/)).toBeInTheDocument();
     expect(screen.getByText(/HTTP 400/)).toBeInTheDocument();
     expect(screen.getByText(/unknown table: widgets/)).toBeInTheDocument();
   });

@@ -1,5 +1,5 @@
-import { useEffect, useRef, useState } from "react";
 import { RtDbClient } from "@par-rt-db/client";
+import { useEffect, useRef, useState } from "react";
 import { useAdmin } from "./admin";
 import { useSession } from "./session";
 
@@ -67,7 +67,7 @@ export function useLiveTable(
       try {
         const r = await admin.adminQuery(db, query);
         if (!cancelled) {
-          setDocs(r.result as Doc[]);
+          setDocs(r as Doc[]);
           setError(null);
         }
       } catch (e) {

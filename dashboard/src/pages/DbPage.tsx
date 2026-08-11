@@ -24,7 +24,7 @@ export function DbPage() {
     setError(null);
     setStats(null);
     client
-      .getStats(db)
+      .dbStats(db)
       .then((st) => {
         if (!cancelled) setStats(st);
       })

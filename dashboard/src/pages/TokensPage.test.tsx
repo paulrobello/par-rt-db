@@ -66,7 +66,7 @@ const expiredRow: TokenRow = {
 describe("TokensPage", () => {
   beforeEach(() => {
     for (const fn of Object.values(adminClientMock)) fn.mockReset();
-    adminClientMock.listTokens.mockResolvedValue({ tokens: [] });
+    adminClientMock.listTokens.mockResolvedValue([]);
     adminClientMock.revokeToken.mockResolvedValue({ ok: true });
   });
   afterEach(() => {
@@ -74,9 +74,7 @@ describe("TokensPage", () => {
   });
 
   it("lists tokens for the selected database", async () => {
-    adminClientMock.listTokens.mockResolvedValue({
-      tokens: [fullAccess, scoped, revokedRow, expiredRow],
-    });
+    adminClientMock.listTokens.mockResolvedValue([fullAccess, scoped, revokedRow, expiredRow]);
     render(<TokensPage />);
 
     // id (8-char prefix) + name for each row.
@@ -124,7 +122,7 @@ describe("TokensPage", () => {
   });
 
   it("requires a confirm click before revoking a token", async () => {
-    adminClientMock.listTokens.mockResolvedValue({ tokens: [fullAccess] });
+    adminClientMock.listTokens.mockResolvedValue([fullAccess]);
     const user = userEvent.setup();
     render(<TokensPage />);
     const row = (await screen.findByText("fulltd01")).closest("tr");

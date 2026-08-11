@@ -1,11 +1,11 @@
-import { useState } from "react";
-import { Link, useParams } from "react-router-dom";
 import type {
   DirectiveJson,
   DirectiveReportJson,
   MigrateRequestJson,
   MigrateResultJson,
 } from "@par-rt-db/client";
+import { useState } from "react";
+import { Link, useParams } from "react-router-dom";
 import { Button, Placard, Spinner } from "../components/ui";
 import { RtDbRequestError, useAdmin } from "../lib/admin";
 import s from "./MigratePage.module.css";
@@ -50,7 +50,7 @@ export function MigratePage() {
 
   function toError(e: unknown): Result {
     if (e instanceof RtDbRequestError) {
-      return { kind: "error", code: e.code, status: e.status, message: e.message };
+      return { kind: "error", code: e.code, status: e.status ?? null, message: e.message };
     }
     return {
       kind: "error",

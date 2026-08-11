@@ -28,7 +28,7 @@ export function SubscriptionsPage() {
     setLoading(true);
     setError(null);
     try {
-      setData(await client.getSubscriptions(db ? { db } : {}));
+      setData(await client.listSubscriptions(db ? { db } : {}));
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
       setData(null);

@@ -1,7 +1,7 @@
+import type { MigrateResultJson } from "@par-rt-db/client";
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { MigrateResultJson } from "@par-rt-db/client";
 
 // MigratePage runs a declarative migration through `client.migrate`. The
 // contract:
@@ -172,13 +172,13 @@ describe("MigratePage", () => {
   it("surfaces a server error envelope from a dry-run", async () => {
     const user = userEvent.setup();
     adminClientMock.migrate.mockRejectedValue(
-      new RtDbRequestError("MIGRATION_FAILED", 400, "unknown directive op"),
+      new RtDbRequestError("BAD_REQUEST", "unknown directive op", undefined, 400),
     );
     render(<MigratePage />);
 
     await user.click(screen.getByRole("button", { name: "dry-run" }));
 
-    expect(await screen.findByText(/MIGRATION_FAILED/)).toBeInTheDocument();
+    expect(await screen.findByText(/BAD_REQUEST/)).toBeInTheDocument();
     expect(screen.getByText(/unknown directive op/)).toBeInTheDocument();
   });
 

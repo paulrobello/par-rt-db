@@ -22,10 +22,9 @@ export function SessionsPage() {
     setLoading(true);
     setListError(null);
     try {
-      const { sessions } = await client.listSessions(
-        userFilter.trim() ? { user: userFilter.trim() } : undefined,
+      setSessions(
+        await client.listSessions(userFilter.trim() ? { user: userFilter.trim() } : undefined),
       );
-      setSessions(sessions);
     } catch (e) {
       setListError(e instanceof Error ? e.message : String(e));
       setSessions([]);

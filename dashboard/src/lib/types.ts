@@ -11,31 +11,30 @@ import type { AdminStreamFrame, DbSubCounters, ScheduleInfo } from "@par-rt-db/c
 // Wire-contract types: re-exported from the SDK (single source of truth).
 // ---------------------------------------------------------------------------
 
-export type {
-  AuthedUser,
-  QueryJson,
-  TransactionJson,
-  ScheduleInfo,
-  ScheduleWhen,
-  AuditEntry,
-  Webhook,
-  WebhookDelivery,
-  SubscriptionInfo,
-  SubscriptionsResponse,
-  SubscriptionsPrincipal,
-  DbSubCounters,
-  CreateWebhookOptions,
-  EditWebhookOptions,
-  GetAuditOptions,
-  ListDeliveriesOptions,
-  RtDbErrorEnvelope,
-} from "@par-rt-db/client";
-
 // Aliased re-exports — the dashboard's historical names for SDK types whose
 // canonical name differs. `FileMeta` is the SDK's `FileMetadata`; `SessionRow`
 // is the SDK's `SessionInfo` (same shape, dashboard-local name).
-export type { FileMetadata as FileMeta } from "@par-rt-db/client";
-export type { SessionInfo as SessionRow } from "@par-rt-db/client";
+export type {
+  AuditEntry,
+  AuthedUser,
+  CreateWebhookOptions,
+  DbSubCounters,
+  EditWebhookOptions,
+  FileMetadata as FileMeta,
+  GetAuditOptions,
+  ListDeliveriesOptions,
+  QueryJson,
+  RtDbErrorEnvelope,
+  ScheduleInfo,
+  ScheduleWhen,
+  SessionInfo as SessionRow,
+  SubscriptionInfo,
+  SubscriptionsPrincipal,
+  SubscriptionsResponse,
+  TransactionJson,
+  Webhook,
+  WebhookDelivery,
+} from "@par-rt-db/client";
 
 // ---------------------------------------------------------------------------
 // Op feed — derived from the SDK's exported `AdminStreamFrame`.
@@ -166,13 +165,6 @@ export interface TokenRow {
   expiresAt: number | null;
   readOnly: boolean;
   tables: string[] | null;
-}
-
-export interface AdminQueryResult {
-  result: unknown;
-}
-export interface AdminMutateResult {
-  results: unknown[];
 }
 
 // Schema preview diff — mirrors server/src/schema_diff.rs (camelCase wire).

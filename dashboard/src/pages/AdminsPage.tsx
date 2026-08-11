@@ -20,8 +20,7 @@ export function AdminsPage() {
     setLoading(true);
     setError(null);
     try {
-      const { admins: list } = await client.listAdmins();
-      setAdmins(list);
+      setAdmins(await client.adminsList());
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {

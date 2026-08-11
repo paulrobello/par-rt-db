@@ -9,7 +9,7 @@ import type { SubscriptionsResponse } from "../lib/types";
 // the initial fetch deterministic.
 
 const adminClientMock = vi.hoisted(() => ({
-  getSubscriptions: vi.fn(),
+  listSubscriptions: vi.fn(),
 }));
 
 vi.mock("../lib/admin", () => ({
@@ -57,16 +57,16 @@ const twoSubs: SubscriptionsResponse = {
 
 describe("SubscriptionsPage", () => {
   beforeEach(() => {
-    adminClientMock.getSubscriptions.mockReset();
+    adminClientMock.listSubscriptions.mockReset();
   });
 
   it("lists subscriptions and surfaces the invalidation counters", async () => {
-    adminClientMock.getSubscriptions.mockResolvedValue(twoSubs);
+    adminClientMock.listSubscriptions.mockResolvedValue(twoSubs);
     render(<SubscriptionsPage />);
 
     // Default db filter is "" (all databases) → call carries no db.
     await waitFor(() => {
-      expect(adminClientMock.getSubscriptions).toHaveBeenCalledWith({});
+      expect(adminClientMock.listSubscriptions).toHaveBeenCalledWith({});
     });
 
     // Both subscriptions render, including the system (null-principal) row.
@@ -79,7 +79,7 @@ describe("SubscriptionsPage", () => {
   });
 
   it("renders an empty state when there are no subscriptions", async () => {
-    adminClientMock.getSubscriptions.mockResolvedValue({
+    adminClientMock.listSubscriptions.mockResolvedValue({
       ...twoSubs,
       subscriptions: [],
       perDb: [],

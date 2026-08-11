@@ -1,5 +1,5 @@
-import { useEffect, useState } from "react";
 import type { QueryJson, TransactionJson } from "@par-rt-db/client";
+import { useEffect, useState } from "react";
 import { Button, Placard, Spinner } from "../components/ui";
 import { RtDbRequestError, useAdmin } from "../lib/admin";
 import s from "./QueryConsolePage.module.css";
@@ -82,7 +82,7 @@ export function QueryConsolePage() {
         setOutput({
           kind: "error",
           code: e.code,
-          status: e.status,
+          status: e.status ?? null,
           message: e.message,
         });
       } else {

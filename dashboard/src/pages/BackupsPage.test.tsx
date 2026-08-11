@@ -37,7 +37,9 @@ describe("BackupsPage", () => {
     for (const fn of Object.values(adminClientMock)) fn.mockReset();
     adminClientMock.listBackups.mockResolvedValue({ running: false, backups: [] });
     adminClientMock.backupNow.mockResolvedValue(undefined);
-    adminClientMock.downloadBackup.mockResolvedValue(undefined);
+    adminClientMock.downloadBackup.mockResolvedValue({
+      blob: () => Promise.resolve(new Blob(["dump"])),
+    } as Response);
     adminClientMock.deleteBackup.mockResolvedValue(undefined);
     adminClientMock.restoreBackup.mockResolvedValue({
       target: "db://primary",
