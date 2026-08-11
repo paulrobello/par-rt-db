@@ -1,0 +1,15 @@
+# ARC-120: Single source of truth for the Rust toolchain, honored by rustup
+# (local), the dtolnay/rust-toolchain action in CI (when the step omits its
+# `toolchain:` input), and the `rust:bookworm` Docker base image (which ships
+# rustup). Before this file existed the Dockerfile pinned `1.90-bookworm`,
+# CI used `@stable`, and local was 1.97.1 — three sources of truth that could
+# silently disagree (CI green, image build broken). All three now resolve to
+# `stable` from this file.
+#
+# Bumping to a pinned version (e.g. `channel = "1.97.1"`) is a one-line change
+# here that propagates everywhere; pin if reproducibility across time becomes
+# more important than picking up stable's bug fixes automatically.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

@@ -36,18 +36,17 @@ jobs:
 
       # --- Rust (server + rust-client) -------------------------------------
       # edition = "2024" in both Cargo.tomls ⇒ requires stable ≥ 1.85.
-      # SEC-138: pinned to an immutable commit SHA from master history. The
-      # `stable` *branch* of dtolnay/rust-toolchain is mutable (that is the
-      # whole point of pinning), so the channel selector moves into the input.
-      # SHA = 6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 (master HEAD at pin
-      # time; verified to resolve before pinning — and master-history SHAs are
-      # the only ones dtolnay guarantees are not garbage-collected). Bump
-      # deliberately: re-verify the new SHA resolves and is on master.
-      - name: Set up Rust (stable)
+      # ARC-120: the channel + components now live in the root
+      # `rust-toolchain.toml` (single source of truth, also honored by the
+      # `rust:bookworm` Docker base image and by rustup locally). The action
+      # picks them up automatically because the step omits its `toolchain:`
+      # input. SEC-138 still applies: the action ref is pinned to an
+      # immutable master-history SHA — `6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772`
+      # (master HEAD at pin time; master-history SHAs are the only ones
+      # dtolnay guarantees are not garbage-collected). Bump deliberately:
+      # re-verify the new SHA resolves and is on master.
+      - name: Set up Rust (from rust-toolchain.toml)
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
-        with:
-          toolchain: stable
-          components: rustfmt, clippy
 
       - name: Rust build cache
         uses: Swatinem/rust-cache@v2.7.5

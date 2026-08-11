@@ -7,8 +7,15 @@
 # built; rust-client/cli sources stay stubbed for the dep-cache layer and are
 # never compiled (--bin rtdb-server selects server alone). The shared target/
 # lands at the workspace root (/build/target).
-FROM rust:1.90-bookworm AS builder
+#
+# ARC-120: `rust:bookworm` (rolling tag) replaces the previous `1.90-bookworm`
+# pin so the base image tracks current stable; the rust-toolchain.toml file
+# copied just below is the authoritative pin and rustup (shipped in the image)
+# honors it. The previous 1.90 pin had drifted from CI's `stable` and from
+# local toolchains, risking green-CI / broken-image divergence.
+FROM rust:bookworm AS builder
 WORKDIR /build
+COPY rust-toolchain.toml ./
 COPY Cargo.toml Cargo.lock ./
 COPY server/Cargo.toml server/Cargo.toml
 COPY rust-client/Cargo.toml rust-client/Cargo.toml
@@ -30,7 +37,10 @@ ARG RTDB_BUILD_COMMIT=unknown
 ENV RTDB_BUILD_COMMIT=${RTDB_BUILD_COMMIT}
 COPY server/build.rs server/build.rs
 COPY server/src ./server/src
-COPY server/tests ./server/tests
+# ARC-120: `server/tests` is intentionally NOT copied into the release-builder
+# stage. `--bin rtdb-server` only compiles the binary, never the test targets,
+# so the tests dir is dead weight here AND a test-only edit would invalidate
+# this COPY layer's cache, forcing a full re-compile of the release binary.
 RUN cargo build --release --locked --manifest-path server/Cargo.toml --bin rtdb-server
 
 # ── Dashboard build stage ────────────────────────────────────────────────────
