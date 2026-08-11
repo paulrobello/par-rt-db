@@ -323,21 +323,29 @@ export interface ListDeliveriesOptions {
   offset?: number;
 }
 
-/** One new column reported by `previewSchema`. */
+/** One new column reported by `previewSchema`. `fieldType` is the
+ *  human-readable field type (e.g. `string`, `id<projects>`, `string?`). */
 export interface SchemaPreviewColumnAdd {
   name: string;
-  type: string;
+  fieldType: string;
 }
-/** One new table reported by `previewSchema`: its name plus the columns the
- *  additive-only push would add. */
+/** One new index reported by `previewSchema`. */
+export interface SchemaPreviewIndexAdd {
+  name: string;
+  fields: string[];
+}
+/** One new table reported by `previewSchema`: its name plus the columns and
+ *  indexes the additive-only push would add. */
 export interface SchemaPreviewTableAdd {
   table: string;
   columns: SchemaPreviewColumnAdd[];
+  indexes: SchemaPreviewIndexAdd[];
 }
-/** One rejection reported by `previewSchema`: a destructive change or type
- *  change the DDL layer will refuse. */
+/** One rejection reported by `previewSchema`: a drop or type change the DDL
+ *  layer will refuse. `item` is the bare column/index name. */
 export interface SchemaPreviewRejection {
   table: string;
+  item: string;
   reason: string;
 }
 /** Result of `previewSchema`: what an additive-only push would ADD and what it

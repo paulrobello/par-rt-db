@@ -45,6 +45,7 @@ export type {
   RtDbAdminClientOptions,
   SchemaPreviewColumnAdd,
   SchemaPreviewDiff,
+  SchemaPreviewIndexAdd,
   SchemaPreviewRejection,
   SchemaPreviewTableAdd,
   SessionInfo,
