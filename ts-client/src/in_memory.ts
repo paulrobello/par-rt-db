@@ -1193,8 +1193,12 @@ export class InMemoryRtDbClient {
         for (const ix of t.indexes ?? []) {
           ix.fields = ix.fields.filter((f) => f !== d.field);
         }
-        if (t.ownerField === d.field) t.ownerField = undefined;
-        if (t.collaboratorsField === d.field) t.collaboratorsField = undefined;
+        // ARC-133: `delete` rather than `= undefined` because TableJson's
+        // ownerField/collaboratorsField are `?:`-optional (omitted on the wire
+        // when unset, per protocol.ts); exactOptionalPropertyTypes forbids
+        // assigning literal `undefined` to them. `delete` removes the key.
+        if (t.ownerField === d.field) delete t.ownerField;
+        if (t.collaboratorsField === d.field) delete t.collaboratorsField;
         const rows = this.rowsFor(d.table);
         let affected = 0;
         for (const row of rows.values()) {
@@ -1486,8 +1490,21 @@ export class InMemoryRtDbClient {
     const id = `f${(++this.idCounter).toString(36)}`;
     const digest = await crypto.subtle.digest("SHA-256", bytes as BufferSource);
     const sha256 = [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
-    this.files.set(id, { bytes, contentType, createdAt: this.now() });
-    return { id, sha256, size: bytes.length, contentType };
+    // ARC-133: contentType is optional on the wire (omitted when unknown);
+    // exactOptionalPropertyTypes forbids passing literal `undefined`, so the
+    // key is included only when the caller supplied a value.
+    const meta = {
+      bytes,
+      createdAt: this.now(),
+      ...(contentType === undefined ? {} : { contentType }),
+    };
+    this.files.set(id, meta);
+    return {
+      id,
+      sha256,
+      size: bytes.length,
+      ...(contentType === undefined ? {} : { contentType }),
+    };
   }
 
   async deleteFile(id: string): Promise<void> {
@@ -1505,7 +1522,9 @@ export class InMemoryRtDbClient {
       id,
       sha256: "", // not tracked in-memory; only the http client computes it
       size: f.bytes.length,
-      contentType: f.contentType,
+      // ARC-133: include contentType only when present (omitted on the wire
+      // when unknown); exactOptionalPropertyTypes forbids literal undefined.
+      ...(f.contentType === undefined ? {} : { contentType: f.contentType }),
       creationTime: f.createdAt,
     };
   }
@@ -2579,12 +2598,14 @@ export class InMemoryRtDbClient {
     }
     const docs = fetched.map((row) => this.mergeDoc(row));
     // The next cursor is built from the page's last row; absent when the page is
-    // empty or this was the final page.
+    // empty or this was the final page. ARC-133:PaginatedResultJson.nextCursor
+    // is `?:`-optional, so the key is included only when a cursor exists
+    // (exactOptionalPropertyTypes forbids assigning literal `undefined`).
     const nextCursor =
       hasNext && fetched.length > 0
         ? encodeCursor(sortKeys.map((key) => this.sortValue(fetched[fetched.length - 1], key)))
         : undefined;
-    return { docs, nextCursor };
+    return { docs, ...(nextCursor === undefined ? {} : { nextCursor }) };
   }
 
   /** Decodes a paginate cursor, rethrowing the live client's generic parse error

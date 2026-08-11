@@ -336,7 +336,13 @@ export class RtDbClient {
       }
       const entry: QueuedMutate = {
         mutId,
-        idempotencyKey: opts?.idempotencyKey ?? opts?.mutId,
+        // ARC-133: only set `idempotencyKey` when it has a value. With
+        // exactOptionalPropertyTypes the `?:` field cannot accept a literal
+        // `undefined`, so the ?? chain must resolve to either a real key or
+        // omission (absence = server generates one), never an explicit undefined.
+        ...(opts?.idempotencyKey || opts?.mutId
+          ? { idempotencyKey: (opts?.idempotencyKey ?? opts?.mutId) as string }
+          : {}),
         txn,
         resolve,
         reject,
@@ -617,7 +623,7 @@ export class RtDbClient {
     this.send({
       type: "mutate",
       mutId: entry.mutId,
-      idempotencyKey: entry.idempotencyKey,
+      ...(entry.idempotencyKey === undefined ? {} : { idempotencyKey: entry.idempotencyKey }),
       txn: entry.txn,
     });
   }

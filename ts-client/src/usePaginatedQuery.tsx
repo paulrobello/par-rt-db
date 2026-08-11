@@ -104,8 +104,14 @@ export function usePaginatedQuery<T>(
       const cursor = page.cursor;
       const key = pageKey(cursor);
       if (!subs.has(key)) {
+        // ARC-133: Paginate.cursor is `?:`-optional; include only when non-empty
+        // (exactOptionalPropertyTypes forbids literal `undefined`).
+        const c = cursor || "";
         const q: RtQuery<PaginatedResultJson> = {
-          json: { ...baseQuery, paginate: { cursor: cursor || undefined, numItems: pageSize } },
+          json: {
+            ...baseQuery,
+            paginate: { ...(c === "" ? {} : { cursor: c }), numItems: pageSize },
+          },
         };
         const off = client.subscribe<PaginatedResultJson>(q, (result) => {
           setPages((prev) => {

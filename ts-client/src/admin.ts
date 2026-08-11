@@ -440,9 +440,12 @@ export class RtDbAdminClient {
 
   /** `credentials` value for `fetch` init: cookie mode sends `"include"` so the
    *  browser attaches the HttpOnly session cookie; bearer mode leaves it
-   *  `undefined` (the default, matching pre-cookie-mode behavior). */
-  private get creds(): RequestCredentials | undefined {
-    return this.cookieMode ? "include" : undefined;
+   *  absent (the default, matching pre-cookie-mode behavior). Returns a
+   *  spreadable Partial<RequestInit> so the `credentials` key is omitted
+   *  entirely in bearer mode — `exactOptionalPropertyTypes` (ARC-133) rejects
+   *  passing `undefined` literally to fetch's RequestInit.credentials. */
+  private get creds(): Pick<RequestInit, "credentials"> {
+    return this.cookieMode ? { credentials: "include" } : {};
   }
 
   async createDb(name: string): Promise<void> {
@@ -542,7 +545,7 @@ export class RtDbAdminClient {
       {
         method: "GET",
         headers: this.authHeaders(),
-        credentials: this.creds,
+        ...this.creds,
       },
     );
     if (!response.ok) {
@@ -558,7 +561,7 @@ export class RtDbAdminClient {
       {
         method: "POST",
         headers: { ...this.authHeaders(), "content-type": "application/x-ndjson" },
-        credentials: this.creds,
+        ...this.creds,
         body: jsonl,
       },
     );
@@ -574,7 +577,7 @@ export class RtDbAdminClient {
       {
         method: "POST",
         headers: this.authHeaders(),
-        credentials: this.creds,
+        ...this.creds,
       },
     );
     if (!response.ok) {
@@ -823,7 +826,7 @@ export class RtDbAdminClient {
     const response = await this.fetchImpl(`${this.url}/admin/backups/${encodeURIComponent(name)}`, {
       method: "GET",
       headers: this.authHeaders(),
-      credentials: this.creds,
+      ...this.creds,
     });
     if (!response.ok) {
       await this.throwFromResponse(response);
@@ -863,7 +866,7 @@ export class RtDbAdminClient {
       {
         method: "POST",
         headers: { ...this.authHeaders(), "content-type": blob.type || "application/octet-stream" },
-        credentials: this.creds,
+        ...this.creds,
         body: blob,
       },
     );
@@ -1049,8 +1052,8 @@ export class RtDbAdminClient {
         ...this.authHeaders(),
         ...(payload === undefined ? {} : { "content-type": "application/json" }),
       },
-      credentials: this.creds,
-      body: payload === undefined ? undefined : JSON.stringify(payload),
+      ...this.creds,
+      ...(payload === undefined ? {} : { body: JSON.stringify(payload) }),
     });
     const parsed: unknown = await response.json().catch(() => null);
     if (!response.ok) {

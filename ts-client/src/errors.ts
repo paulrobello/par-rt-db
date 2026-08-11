@@ -56,11 +56,17 @@ export interface RtDbErrorEnvelope {
 /** The single error type surfaced by every client transport. `status`, when
  *  present, is the originating HTTP response code (the wire envelope itself
  *  carries only `code`/`message`/`retryAfter`; the HTTP status is thread-able
- *  through the admin/HTTP error path for callers that surface it in the UI). */
+ *  through the admin/HTTP error path for callers that surface it in the UI).
+ *
+ *  ARC-133: `retryAfter`/`status` are typed `number | undefined` (not
+ *  `?:`-optional) because the constructor assigns the param verbatim — absent
+ *  flows through as a literal `undefined`, which `exactOptionalPropertyTypes`
+ *  forbids for `?:` fields but admits for `T | undefined`. Runtime is
+ *  unchanged: a `err.retryAfter === undefined` check behaves identically. */
 export class RtDbError extends Error {
   readonly code: RtDbErrorCode;
-  readonly retryAfter?: number;
-  readonly status?: number;
+  readonly retryAfter: number | undefined;
+  readonly status: number | undefined;
 
   constructor(code: RtDbErrorCode, message: string, retryAfter?: number, status?: number) {
     super(message);

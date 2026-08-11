@@ -155,11 +155,15 @@ export class TableQuery<DocT, Indexes extends string> {
   }
 
   paginate(cursor: string | undefined, numItems: number): RtQuery<PaginatedResultJson> {
+    // ARC-133: Paginate.cursor is `?:`-optional, so include it only when set
+    // (exactOptionalPropertyTypes forbids literal `undefined`). `cursor || ""`
+    // collapses empty string to absence — same runtime as before.
+    const c = cursor || "";
     return {
       json: {
         ...this.json,
         paginate: {
-          cursor: cursor || undefined,
+          ...(c === "" ? {} : { cursor: c }),
           numItems: numItems,
         },
       },
