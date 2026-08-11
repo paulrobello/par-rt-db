@@ -89,8 +89,12 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
+// ARC-130: response-shaped (returned by the paginate terminal). The caller
+// reads it; the server constructs it. `#[non_exhaustive]` lets the wire shape
+// gain fields later without a SemVer break for consumers that destructure it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct Paginated<T> {
     pub docs: Vec<T>,
     #[serde(skip_serializing_if = "Option::is_none")]

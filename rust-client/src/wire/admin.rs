@@ -79,8 +79,9 @@ pub(crate) struct DatabasesResponse {
 }
 
 /// Returned by `mint_token`: the server's `{tokenId, token}` shape, with the
-/// wire `tokenId` exposed as `token_id`.
+/// wire `tokenId` exposed as `token_id`. ARC-130 response-shaped.
 #[derive(Debug, Clone, Deserialize)]
+#[non_exhaustive]
 pub struct MintedToken {
     #[serde(rename = "tokenId")]
     pub token_id: String,
@@ -92,17 +93,19 @@ pub(crate) struct AllowlistListResponse {
     pub(crate) emails: Vec<String>,
 }
 
-/// One row of the admin allowlist returned by `GET /admin/admins`.
+/// One row of the admin allowlist returned by `GET /admin/admins`. ARC-130 response-shaped.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct AdminMember {
     pub email: String,
     pub github_id: Option<i64>,
 }
 
-/// One row of `DbStats.tables` (`GET /admin/dbs/{db}/stats`).
+/// One row of `DbStats.tables` (`GET /admin/dbs/{db}/stats`). ARC-130 response-shaped.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct TableStat {
     pub name: String,
     pub row_count: i64,
@@ -116,6 +119,7 @@ pub struct TableStat {
 /// serialize as JSON numbers and never approach `i64` range).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct DbStats {
     pub tables: Vec<TableStat>,
     pub total_size_bytes: i64,
@@ -128,9 +132,10 @@ pub struct DbStats {
     pub subs_used: i64,
 }
 
-/// One row of `TokenInfo` returned by `GET /admin/tokens?db=...`.
+/// One row of `TokenInfo` returned by `GET /admin/tokens?db=...`. ARC-130 response-shaped.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct TokenInfo {
     pub id: String,
     pub name: String,
@@ -162,6 +167,7 @@ pub struct TokenInfo {
 /// Mirrors `ts-client`'s `SessionInfo` (camelCase).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct SessionInfo {
     pub token_hash: String,
     pub user_id: String,
@@ -196,6 +202,7 @@ pub(crate) struct SessionsResponse {
 /// `revoked` is the count of sessions dropped. Mirrors `ts-client`'s
 /// `revokeUserSessions` return shape.
 #[derive(Debug, Clone, Deserialize)]
+#[non_exhaustive]
 pub struct RevokeUserSessionsResponse {
     pub ok: bool,
     pub revoked: i64,
@@ -206,6 +213,7 @@ pub struct RevokeUserSessionsResponse {
 /// `rename_all = "camelCase"` leaves them as `p50`/`p95`/`p99` on the wire.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct LatencyStats {
     pub p50: i64,
     pub p95: i64,
@@ -215,6 +223,7 @@ pub struct LatencyStats {
 /// `GET /admin/metrics` snapshot — server counters and gauges.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct MetricsSnapshot {
     pub queries_total: i64,
     pub mutations_total: i64,
@@ -264,6 +273,7 @@ pub struct MetricsSnapshot {
 /// token, a scheduled job, or admin bypass.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct SubscriptionsPrincipal {
     pub user_id: Option<String>,
     pub email: Option<String>,
@@ -273,6 +283,7 @@ pub struct SubscriptionsPrincipal {
 /// and the read-set class that governs its skip/re-run invalidation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct SubscriptionInfo {
     pub db: String,
     pub table: String,
@@ -285,6 +296,7 @@ pub struct SubscriptionInfo {
 /// [`SubscriptionsResponse::per_db`] and [`MetricsSnapshot::per_db_subs`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct DbSubCounters {
     pub db: String,
     pub reruns: u64,
@@ -300,6 +312,7 @@ pub struct DbSubCounters {
 /// totals server-wide, and `per_db` breaks them down per database.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct SubscriptionsResponse {
     pub subscriptions: Vec<SubscriptionInfo>,
     pub subs_reruns_total: u64,
@@ -311,9 +324,10 @@ pub struct SubscriptionsResponse {
 }
 
 /// Runtime-mutable hot-config subset of `ConfigResponse`. Mirrors
-/// `server/src/config::HotConfig` field-for-field.
+/// `server/src/config::HotConfig` field-for-field. ARC-130 response-shaped.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct HotConfig {
     pub allowed_origins: Vec<String>,
     pub session_ttl_days: i64,
@@ -329,6 +343,7 @@ pub struct HotConfig {
 /// identity + admin allowlist. Mirrors `server/src/admin::ConfigResponse`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct ConfigResponse {
     pub port: i64,
     pub public_url: String,
@@ -373,6 +388,7 @@ pub struct HotConfigPatch {
 /// `owner` is `Option<String>` for the `string | null` wire.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct OpEvent {
     pub db: String,
     pub table: String,
@@ -480,6 +496,7 @@ pub struct MigrateRequestOwned {
 /// `migrate::MigrateResult`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct MigrateResult {
     pub applied: bool,
     pub schema: crate::schema::SchemaDef,
@@ -491,6 +508,7 @@ pub struct MigrateResult {
 /// event that captured the snapshot: `"push"` | `"migrate"` | `"restore"`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct SchemaHistorySummary {
     pub version: i64,
     pub captured_at: i64,
@@ -505,6 +523,7 @@ pub struct SchemaHistorySummary {
 /// `Value` so an older snapshot never fails to deserialize.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct SchemaHistoryEntry {
     pub version: i64,
     pub captured_at: i64,
@@ -521,6 +540,7 @@ pub struct SchemaHistoryEntry {
 /// and later tasks can build it incrementally with `..Default::default()`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct DirectiveReport {
     pub op: String,
     pub affected_rows: i64,
@@ -534,6 +554,7 @@ pub struct DirectiveReport {
 /// `migrate::CastFailure`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct CastFailure {
     pub id: String,
     pub value: serde_json::Value,
@@ -543,6 +564,7 @@ pub struct CastFailure {
 /// `migrate::SampleChange`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct SampleChange {
     pub id: String,
     pub before: serde_json::Value,
@@ -553,6 +575,7 @@ pub struct SampleChange {
 /// server `backup::BackupFile` (camelCase on the wire).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct BackupFile {
     pub name: String,
     pub size_bytes: u64,
@@ -563,6 +586,7 @@ pub struct BackupFile {
 /// dump list, newest-first.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct BackupsListResponse {
     pub running: bool,
     pub backups: Vec<BackupFile>,
@@ -580,6 +604,7 @@ pub(crate) struct RestoreRequest<'a> {
 /// cutover instructions.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct RestoreResult {
     pub target: String,
     pub instructions: String,
@@ -598,6 +623,7 @@ pub struct RestoreResult {
 /// single-element `["*"]` to match every event.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct Webhook {
     pub id: i64,
     pub db: String,
@@ -626,6 +652,7 @@ pub struct Webhook {
 /// the worker will/did POST.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct WebhookDelivery {
     pub id: i64,
     pub attempts: i64,
@@ -702,6 +729,7 @@ pub struct ListDeliveriesOptions {
 /// system-initiated writes (TTL reaps, scheduled jobs).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct AuditEntry {
     pub id: i64,
     pub ts_ms: i64,

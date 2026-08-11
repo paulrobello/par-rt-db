@@ -404,8 +404,11 @@ fn is_false(b: &bool) -> bool {
 
 /// One `{key, value}` row from a grouped `aggregate` (`groupBy: true`) terminal.
 /// Mirrors `server/src/query.rs::AggregateGroup` byte-for-byte (camelCase).
+/// ARC-130: response-shaped — `#[non_exhaustive]` lets the wire shape gain
+/// fields later without breaking exhaustive destructures.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct AggregateGroup {
     pub key: serde_json::Value,
     pub value: serde_json::Value,

@@ -197,34 +197,30 @@ fn subscriptions_response_round_trip() {
     assert!(parsed.subscriptions[1].principal.is_none());
     assert_eq!(parsed.per_db[0].skips_indexed, 5);
 
-    // Nested-type camelCase, including the `null` principal on the wire.
-    let p = SubscriptionsPrincipal {
-        user_id: Some("u".into()),
-        email: None,
-    };
+    // Nested-type camelCase, including the `null` principal on the wire. These
+    // types are `#[non_exhaustive]` (ARC-130) — external crates can't construct
+    // them via struct literal, so the round-trip is JSON-in → JSON-out, which
+    // is exactly the wire-shape assertion this test cares about.
+    let p: SubscriptionsPrincipal =
+        serde_json::from_value(json!({"userId": "u", "email": null})).unwrap();
     assert_eq!(
         serde_json::to_value(&p).unwrap(),
         json!({"userId": "u", "email": null})
     );
-    let info = SubscriptionInfo {
-        db: "d".into(),
-        table: "t".into(),
-        terminal: "count".into(),
-        read_set_class: "point".into(),
-        principal: None,
-    };
+    let info: SubscriptionInfo = serde_json::from_value(json!({
+        "db": "d", "table": "t", "terminal": "count",
+        "readSetClass": "point", "principal": null
+    }))
+    .unwrap();
     assert_eq!(
         serde_json::to_value(&info).unwrap(),
         json!({"db":"d","table":"t","terminal":"count","readSetClass":"point","principal":null})
     );
-    let c = DbSubCounters {
-        db: "d".into(),
-        reruns: 1,
-        skips_point: 2,
-        skips_indexed: 3,
-        skips_ordered: 4,
-        missed: 5,
-    };
+    let c: DbSubCounters = serde_json::from_value(json!({
+        "db": "d", "reruns": 1,
+        "skipsPoint": 2, "skipsIndexed": 3, "skipsOrdered": 4, "missed": 5
+    }))
+    .unwrap();
     assert_eq!(
         serde_json::to_value(&c).unwrap(),
         json!({"db":"d","reruns":1,"skipsPoint":2,"skipsIndexed":3,"skipsOrdered":4,"missed":5})
