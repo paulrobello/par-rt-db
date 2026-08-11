@@ -3,6 +3,7 @@ import type { QueryJson, TransactionJson } from "@par-rt-db/client";
 import { useEffect, useState } from "react";
 import { Button, Placard, Spinner } from "../components/ui";
 import { RtDbRequestError, useAdmin } from "../lib/admin";
+import { toErrorMessage } from "../lib/errors";
 import s from "./QueryConsolePage.module.css";
 
 type Mode = "query" | "mutate";
@@ -65,7 +66,7 @@ export function QueryConsolePage() {
         kind: "error",
         code: "INVALID_JSON",
         status: null,
-        message: e instanceof Error ? e.message : String(e),
+        message: toErrorMessage(e),
       });
       return;
     }
@@ -91,7 +92,7 @@ export function QueryConsolePage() {
           kind: "error",
           code: "INTERNAL",
           status: null,
-          message: e instanceof Error ? e.message : String(e),
+          message: toErrorMessage(e),
         });
       }
     } finally {

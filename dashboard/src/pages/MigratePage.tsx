@@ -9,6 +9,7 @@ import { useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { Button, Placard, Spinner } from "../components/ui";
 import { RtDbRequestError, useAdmin } from "../lib/admin";
+import { toErrorMessage } from "../lib/errors";
 import s from "./MigratePage.module.css";
 
 type Result =
@@ -31,7 +32,7 @@ function parseDirectives(
     }
     return { ok: true, directives: parsed as DirectiveJson[] };
   } catch (e) {
-    return { ok: false, message: e instanceof Error ? e.message : String(e) };
+    return { ok: false, message: toErrorMessage(e) };
   }
 }
 
@@ -57,7 +58,7 @@ export function MigratePage() {
       kind: "error",
       code: "INTERNAL",
       status: null,
-      message: e instanceof Error ? e.message : String(e),
+      message: toErrorMessage(e),
     };
   }
 

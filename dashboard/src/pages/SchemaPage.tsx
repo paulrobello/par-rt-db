@@ -4,6 +4,7 @@ import { useCallback, useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { Button, Placard, Spinner } from "../components/ui";
 import { RtDbRequestError, useAdmin } from "../lib/admin";
+import { toErrorMessage } from "../lib/errors";
 import { formatFieldType } from "../lib/format";
 import type { SchemaDiff } from "../lib/types";
 import s from "./SchemaPage.module.css";
@@ -47,7 +48,7 @@ export function SchemaPage() {
         if (!cancelled) setSchema(sc);
       })
       .catch((e) => {
-        if (!cancelled) setError(e instanceof Error ? e.message : String(e));
+        if (!cancelled) setError(toErrorMessage(e));
       })
       .finally(() => {
         if (!cancelled) setLoading(false);
@@ -70,7 +71,7 @@ export function SchemaPage() {
         kind: "error",
         code: "INVALID_JSON",
         status: null,
-        message: e instanceof Error ? e.message : String(e),
+        message: toErrorMessage(e),
       });
       return;
     }
@@ -91,7 +92,7 @@ export function SchemaPage() {
           kind: "error",
           code: "INTERNAL",
           status: null,
-          message: e instanceof Error ? e.message : String(e),
+          message: toErrorMessage(e),
         });
       }
     } finally {
@@ -108,7 +109,7 @@ export function SchemaPage() {
         kind: "error",
         code: "INVALID_JSON",
         status: null,
-        message: e instanceof Error ? e.message : String(e),
+        message: toErrorMessage(e),
       });
       return;
     }
@@ -132,7 +133,7 @@ export function SchemaPage() {
           kind: "error",
           code: "INTERNAL",
           status: null,
-          message: e instanceof Error ? e.message : String(e),
+          message: toErrorMessage(e),
         });
       }
     } finally {

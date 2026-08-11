@@ -1,8 +1,10 @@
 /** File storage browser — list blobs, inspect metadata, and preview on-the-fly image transforms. */
-import { useCallback, useEffect, useRef, useState } from "react";
+
 import { appendImageParams, type TransformOpts } from "@par-rt-db/client";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Button, Placard, Spinner } from "../components/ui";
 import { useAdmin } from "../lib/admin";
+import { toErrorMessage } from "../lib/errors";
 import { formatBytes } from "../lib/format";
 import type { FileMeta } from "../lib/types";
 import s from "./StoragePage.module.css";
@@ -57,7 +59,7 @@ export function StoragePage() {
     try {
       setFiles(await client.listFiles(db));
     } catch (e) {
-      setListError(e instanceof Error ? e.message : String(e));
+      setListError(toErrorMessage(e));
       setFiles([]);
     } finally {
       setLoading(false);
@@ -88,7 +90,7 @@ export function StoragePage() {
       setSelected(null);
       await refresh();
     } catch (e) {
-      setUploadError(e instanceof Error ? e.message : String(e));
+      setUploadError(toErrorMessage(e));
     } finally {
       setUploading(false);
     }
@@ -118,7 +120,7 @@ export function StoragePage() {
       setConfirmingDelete(null);
       await refresh();
     } catch (e) {
-      setActionError(e instanceof Error ? e.message : String(e));
+      setActionError(toErrorMessage(e));
     } finally {
       setPendingId(null);
     }

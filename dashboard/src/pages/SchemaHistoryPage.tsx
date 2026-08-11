@@ -4,6 +4,7 @@ import { useCallback, useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { Button, Placard, Spinner } from "../components/ui";
 import { RtDbRequestError, useAdmin } from "../lib/admin";
+import { toErrorMessage } from "../lib/errors";
 import { formatDateTime, formatFieldType } from "../lib/format";
 import s from "./SchemaHistoryPage.module.css";
 
@@ -16,7 +17,7 @@ function toDetailError(e: unknown): DetailError {
   return {
     code: "INTERNAL",
     status: null,
-    message: e instanceof Error ? e.message : String(e),
+    message: toErrorMessage(e),
   };
 }
 
@@ -73,7 +74,7 @@ export function SchemaHistoryPage() {
         if (!cancelled) setHistory(entries);
       })
       .catch((e) => {
-        if (!cancelled) setListError(e instanceof Error ? e.message : String(e));
+        if (!cancelled) setListError(toErrorMessage(e));
       })
       .finally(() => {
         if (!cancelled) setLoading(false);

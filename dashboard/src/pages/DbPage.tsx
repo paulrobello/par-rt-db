@@ -3,6 +3,7 @@ import { useEffect, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { Button, Placard, Spinner } from "../components/ui";
 import { useAdmin } from "../lib/admin";
+import { toErrorMessage } from "../lib/errors";
 import { formatBytes, formatNumber } from "../lib/format";
 import type { DbStats } from "../lib/types";
 import s from "./DbPage.module.css";
@@ -30,7 +31,7 @@ export function DbPage() {
         if (!cancelled) setStats(st);
       })
       .catch((e) => {
-        if (!cancelled) setError(e instanceof Error ? e.message : String(e));
+        if (!cancelled) setError(toErrorMessage(e));
       })
       .finally(() => {
         if (!cancelled) setLoading(false);
@@ -48,7 +49,7 @@ export function DbPage() {
       await refreshDatabases();
       navigate("/databases");
     } catch (e) {
-      setDeleteError(e instanceof Error ? e.message : String(e));
+      setDeleteError(toErrorMessage(e));
     } finally {
       setDeleting(false);
     }

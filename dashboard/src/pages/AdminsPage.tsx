@@ -2,6 +2,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { Button, Placard, Spinner } from "../components/ui";
 import { useAdmin } from "../lib/admin";
+import { toErrorMessage } from "../lib/errors";
 import type { AdminMember } from "../lib/types";
 import s from "./AdminsPage.module.css";
 
@@ -23,7 +24,7 @@ export function AdminsPage() {
     try {
       setAdmins(await client.adminsList());
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(toErrorMessage(e));
     } finally {
       setLoading(false);
     }
@@ -48,7 +49,7 @@ export function AdminsPage() {
       setGithubId("");
       await load();
     } catch (e) {
-      setFormError(e instanceof Error ? e.message : String(e));
+      setFormError(toErrorMessage(e));
     } finally {
       setBusy(false);
     }
@@ -62,7 +63,7 @@ export function AdminsPage() {
       setConfirmEmail(null);
       await load();
     } catch (e) {
-      setFormError(e instanceof Error ? e.message : String(e));
+      setFormError(toErrorMessage(e));
     } finally {
       setBusy(false);
     }

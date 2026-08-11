@@ -10,6 +10,7 @@ import {
   useState,
 } from "react";
 import type { ConnectionState } from "../components/ui";
+import { toErrorMessage } from "./errors";
 import { useSession } from "./session";
 import type { MetricsSnapshot, OpEvent } from "./types";
 
@@ -146,7 +147,7 @@ export function AdminProvider({ children }: { children: ReactNode }) {
         setDatabases(await client.listDbs());
         ok();
       } catch (e) {
-        setDatabasesError(e instanceof Error ? e.message : String(e));
+        setDatabasesError(toErrorMessage(e));
         fail();
       } finally {
         setDatabasesLoading(false);

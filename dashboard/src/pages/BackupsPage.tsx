@@ -2,6 +2,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { Button, Placard, Spinner } from "../components/ui";
 import { type BackupFile, type RestoreResult, useAdmin } from "../lib/admin";
+import { toErrorMessage } from "../lib/errors";
 import { formatBytes } from "../lib/format";
 import s from "./BackupsPage.module.css";
 
@@ -52,7 +53,7 @@ export function BackupsPage() {
       setBackups([...r.backups].sort((a, b) => b.createdMs - a.createdMs));
       setRunning(r.running);
     } catch (e) {
-      setListError(e instanceof Error ? e.message : String(e));
+      setListError(toErrorMessage(e));
       setBackups([]);
     } finally {
       setLoading(false);
@@ -77,7 +78,7 @@ export function BackupsPage() {
       await client.backupNow();
       await refresh();
     } catch (e) {
-      setActionError(e instanceof Error ? e.message : String(e));
+      setActionError(toErrorMessage(e));
     } finally {
       setTriggering(false);
     }
@@ -96,7 +97,7 @@ export function BackupsPage() {
       a.click();
       URL.revokeObjectURL(url);
     } catch (e) {
-      setActionError(e instanceof Error ? e.message : String(e));
+      setActionError(toErrorMessage(e));
     } finally {
       setDownloading(null);
     }
@@ -110,7 +111,7 @@ export function BackupsPage() {
       setConfirmingDelete(null);
       await refresh();
     } catch (e) {
-      setActionError(e instanceof Error ? e.message : String(e));
+      setActionError(toErrorMessage(e));
     } finally {
       setPendingDelete(null);
     }
@@ -132,7 +133,7 @@ export function BackupsPage() {
       const r = await client.restoreBackup(target.name);
       setRestoreResult(r);
     } catch (e) {
-      setRestoreError(e instanceof Error ? e.message : String(e));
+      setRestoreError(toErrorMessage(e));
     } finally {
       setRestoreBusy(false);
     }

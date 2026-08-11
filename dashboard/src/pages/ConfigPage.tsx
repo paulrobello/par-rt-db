@@ -2,6 +2,7 @@
 import { useEffect, useState } from "react";
 import { Button, Placard, Spinner, StatusLamp } from "../components/ui";
 import { useAdmin } from "../lib/admin";
+import { toErrorMessage } from "../lib/errors";
 import { formatBytes } from "../lib/format";
 import type { ConfigResponse } from "../lib/types";
 import s from "./ConfigPage.module.css";
@@ -41,7 +42,7 @@ export function ConfigPage() {
         setMaxSubs(String(c.hot.maxSubsPerDb));
       })
       .catch((e) => {
-        if (!cancelled) setError(e instanceof Error ? e.message : String(e));
+        if (!cancelled) setError(toErrorMessage(e));
       })
       .finally(() => {
         if (!cancelled) setLoading(false);
@@ -114,7 +115,7 @@ export function ConfigPage() {
       setMaxSubs(String(c.hot.maxSubsPerDb));
       setSavedAt(true);
     } catch (e) {
-      setSaveError(e instanceof Error ? e.message : String(e));
+      setSaveError(toErrorMessage(e));
     } finally {
       setSaving(false);
     }

@@ -1,7 +1,8 @@
 import { useState } from "react";
+import { toErrorMessage } from "../lib/errors";
 import { useSession } from "../lib/session";
-import { Button, Field } from "./ui";
 import s from "./Login.module.css";
+import { Button, Field } from "./ui";
 
 export function Login() {
   const { signInWithAdminKey, signInWithOAuth, error } = useSession();
@@ -16,7 +17,7 @@ export function Login() {
     try {
       await signInWithAdminKey(key.trim());
     } catch (err) {
-      setLocalError(err instanceof Error ? err.message : String(err));
+      setLocalError(toErrorMessage(err));
     } finally {
       setBusy(false);
     }
@@ -28,7 +29,7 @@ export function Login() {
     try {
       await signInWithOAuth(provider);
     } catch (err) {
-      setLocalError(err instanceof Error ? err.message : String(err));
+      setLocalError(toErrorMessage(err));
     } finally {
       setBusy(false);
     }

@@ -2,6 +2,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { Button, Placard, Spinner } from "../components/ui";
 import { useAdmin } from "../lib/admin";
+import { toErrorMessage } from "../lib/errors";
 import type { Webhook, WebhookDelivery } from "../lib/types";
 import s from "./WebhooksPage.module.css";
 
@@ -107,7 +108,7 @@ export function WebhooksPage() {
     try {
       setWebhooks(await client.listWebhooks(db));
     } catch (e) {
-      setListError(e instanceof Error ? e.message : String(e));
+      setListError(toErrorMessage(e));
       setWebhooks([]);
     } finally {
       setLoading(false);
@@ -132,7 +133,7 @@ export function WebhooksPage() {
         const opts = status ? { status } : {};
         setDeliveries(await client.listDeliveries(db, id, opts));
       } catch (e) {
-        setDeliveriesError(e instanceof Error ? e.message : String(e));
+        setDeliveriesError(toErrorMessage(e));
         setDeliveries([]);
       } finally {
         setDeliveriesLoading(false);
@@ -200,7 +201,7 @@ export function WebhooksPage() {
       setCreateEnabled(true);
       await refresh();
     } catch (e) {
-      setCreateError(e instanceof Error ? e.message : String(e));
+      setCreateError(toErrorMessage(e));
     } finally {
       setCreating(false);
     }
@@ -240,7 +241,7 @@ export function WebhooksPage() {
       setEditingId(null);
       await refresh();
     } catch (e) {
-      setEditError(e instanceof Error ? e.message : String(e));
+      setEditError(toErrorMessage(e));
     } finally {
       setSaving(false);
     }
@@ -257,7 +258,7 @@ export function WebhooksPage() {
       if (deliveriesForId === wh.id) setDeliveriesForId(null);
       await refresh();
     } catch (e) {
-      setActionError(e instanceof Error ? e.message : String(e));
+      setActionError(toErrorMessage(e));
     } finally {
       setPendingId(null);
     }

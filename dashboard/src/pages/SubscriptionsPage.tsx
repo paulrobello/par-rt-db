@@ -2,6 +2,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { Placard, Spinner } from "../components/ui";
 import { useAdmin } from "../lib/admin";
+import { toErrorMessage } from "../lib/errors";
 import type { DbSubCounters, SubscriptionsResponse } from "../lib/types";
 import s from "./SubscriptionsPage.module.css";
 
@@ -31,7 +32,7 @@ export function SubscriptionsPage() {
     try {
       setData(await client.listSubscriptions(db ? { db } : {}));
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(toErrorMessage(e));
       setData(null);
     } finally {
       setLoading(false);

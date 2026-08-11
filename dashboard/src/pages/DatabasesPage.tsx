@@ -3,6 +3,7 @@ import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { Button, Field, LiveValue, Placard } from "../components/ui";
 import { useAdmin } from "../lib/admin";
+import { toErrorMessage } from "../lib/errors";
 import { formatNumber } from "../lib/format";
 import s from "./DatabasesPage.module.css";
 
@@ -34,7 +35,7 @@ export function DatabasesPage() {
       setNewName("");
       await refreshDatabases();
     } catch (e) {
-      setCreateError(e instanceof Error ? e.message : String(e));
+      setCreateError(toErrorMessage(e));
     } finally {
       setCreating(false);
     }

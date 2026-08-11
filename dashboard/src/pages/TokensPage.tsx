@@ -2,6 +2,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Button, Placard, Spinner } from "../components/ui";
 import { useAdmin } from "../lib/admin";
+import { toErrorMessage } from "../lib/errors";
 import type { TokenRow } from "../lib/types";
 import s from "./TokensPage.module.css";
 
@@ -51,7 +52,7 @@ export function TokensPage() {
     try {
       setTokens(await client.listTokens(db));
     } catch (e) {
-      setListError(e instanceof Error ? e.message : String(e));
+      setListError(toErrorMessage(e));
       setTokens([]);
     } finally {
       setLoading(false);
@@ -105,7 +106,7 @@ export function TokensPage() {
       setTablesText("");
       await refresh();
     } catch (e) {
-      setMintError(e instanceof Error ? e.message : String(e));
+      setMintError(toErrorMessage(e));
     } finally {
       setMinting(false);
     }
@@ -132,7 +133,7 @@ export function TokensPage() {
       setConfirmingRevoke(null);
       await refresh();
     } catch (e) {
-      setActionError(e instanceof Error ? e.message : String(e));
+      setActionError(toErrorMessage(e));
     } finally {
       setPendingId(null);
     }

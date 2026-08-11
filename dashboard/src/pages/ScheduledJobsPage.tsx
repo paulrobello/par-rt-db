@@ -1,9 +1,11 @@
 /** Scheduled jobs — create, list, and manage one-shot and cron transactions. */
+
+import type { TransactionJson } from "@par-rt-db/client";
 import { useCallback, useEffect, useState } from "react";
 import { Button, Placard, Spinner } from "../components/ui";
 import { useAdmin } from "../lib/admin";
+import { toErrorMessage } from "../lib/errors";
 import type { ScheduleInfo, ScheduleKind, ScheduleStatus, ScheduleWhen } from "../lib/types";
-import type { TransactionJson } from "@par-rt-db/client";
 import s from "./ScheduledJobsPage.module.css";
 
 type CreateMode = "afterMs" | "cron";
@@ -63,7 +65,7 @@ export function ScheduledJobsPage() {
     try {
       setJobs(await client.listSchedules(db));
     } catch (e) {
-      setListError(e instanceof Error ? e.message : String(e));
+      setListError(toErrorMessage(e));
       setJobs([]);
     } finally {
       setLoading(false);
@@ -101,7 +103,7 @@ export function ScheduledJobsPage() {
     try {
       txn = JSON.parse(txnText) as TransactionJson;
     } catch (e) {
-      setCreateError(e instanceof Error ? e.message : String(e));
+      setCreateError(toErrorMessage(e));
       return;
     }
     setCreating(true);
@@ -112,7 +114,7 @@ export function ScheduledJobsPage() {
       setCreateOk(`scheduled — id ${id.slice(0, 8)}`);
       await refresh();
     } catch (e) {
-      setCreateError(e instanceof Error ? e.message : String(e));
+      setCreateError(toErrorMessage(e));
     } finally {
       setCreating(false);
     }
@@ -130,7 +132,7 @@ export function ScheduledJobsPage() {
       }
       await refresh();
     } catch (e) {
-      setActionError(e instanceof Error ? e.message : String(e));
+      setActionError(toErrorMessage(e));
     } finally {
       setPendingId(null);
     }
@@ -145,7 +147,7 @@ export function ScheduledJobsPage() {
       setConfirmingCancel(null);
       await refresh();
     } catch (e) {
-      setActionError(e instanceof Error ? e.message : String(e));
+      setActionError(toErrorMessage(e));
     } finally {
       setPendingId(null);
     }

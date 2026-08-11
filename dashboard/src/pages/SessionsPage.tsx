@@ -2,6 +2,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { Button, Placard, Spinner } from "../components/ui";
 import { useAdmin } from "../lib/admin";
+import { toErrorMessage } from "../lib/errors";
 import type { SessionRow } from "../lib/types";
 import s from "./SessionsPage.module.css";
 
@@ -27,7 +28,7 @@ export function SessionsPage() {
         await client.listSessions(userFilter.trim() ? { user: userFilter.trim() } : undefined),
       );
     } catch (e) {
-      setListError(e instanceof Error ? e.message : String(e));
+      setListError(toErrorMessage(e));
       setSessions([]);
     } finally {
       setLoading(false);
@@ -49,7 +50,7 @@ export function SessionsPage() {
       setConfirmingRevoke(null);
       await refresh();
     } catch (e) {
-      setActionError(e instanceof Error ? e.message : String(e));
+      setActionError(toErrorMessage(e));
     } finally {
       setPendingHash(null);
     }

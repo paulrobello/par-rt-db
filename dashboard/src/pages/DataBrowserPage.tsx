@@ -1,9 +1,11 @@
 /** Live data browser — subscribe to a table, paginate via cursor, and render each row's cells. */
+
+import type { SchemaJson, TransactionJson } from "@par-rt-db/client";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
-import type { SchemaJson, TransactionJson } from "@par-rt-db/client";
 import { Button, LiveValue, Placard, Spinner, StatusLamp } from "../components/ui";
 import { useAdmin } from "../lib/admin";
+import { toErrorMessage } from "../lib/errors";
 import { formatNumber, formatTime } from "../lib/format";
 import { useLiveTable } from "../lib/useLiveTable";
 import s from "./DataBrowserPage.module.css";
@@ -74,7 +76,7 @@ export function DataBrowserPage() {
       await refresh();
       return true;
     } catch (e) {
-      setMutError(e instanceof Error ? e.message : String(e));
+      setMutError(toErrorMessage(e));
       return false;
     } finally {
       setMutBusy(false);

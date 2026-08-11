@@ -2,6 +2,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { Button, Placard, Spinner } from "../components/ui";
 import { useAdmin } from "../lib/admin";
+import { toErrorMessage } from "../lib/errors";
 import { formatDateTime } from "../lib/format";
 import type { AuditEntry, GetAuditOptions } from "../lib/types";
 import s from "./AuditPage.module.css";
@@ -85,7 +86,7 @@ export function AuditPage() {
       if (filters.source) opts.source = filters.source;
       setEntries(await client.getAudit(opts));
     } catch (e) {
-      setListError(e instanceof Error ? e.message : String(e));
+      setListError(toErrorMessage(e));
       setEntries([]);
     } finally {
       setLoading(false);
