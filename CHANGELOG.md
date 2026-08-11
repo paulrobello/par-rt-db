@@ -13,6 +13,49 @@ contract against Convex.
 
 ## [Unreleased]
 
+### Streaming storage upload/download (ENH-021)
+
+File size is now decoupled from server RAM. Uploads and downloads stream
+through the server in 1 MiB chunks instead of buffering the whole blob, so
+N concurrent uploads of a large file no longer cost N × filesize of resident
+memory, and `RTDB_MAX_FILE_SIZE` becomes a policy limit rather than a
+memory-safety limit. No wire, protocol, or route change — same `POST
+/api/storage/{db}` raw-body contract; the HTTP surface is unchanged.
+
+- **Chunked layout**: a new per-db `storage_chunks(blob_id, seq, bytes)` table
+  holds new blobs at 1 MiB chunks; the existing `storage` row stays as the
+  metadata record (id/sha256/size/contentType/createdAt/owner_id) with its
+  inline `bytes` now nullable. Created in `create_database` and retrofitted
+  idempotently by `storage::ensure_table`, so pre-ENH-021 databases upgrade
+  transparently. Legacy inline blobs still serve (full and ranged) via a
+  lazy `probe_layout` fallback — never eager-migrated at boot (the ARC-102
+  unbounded-work anti-pattern).
+- **Streaming upload**: `upload_handler` consumes `into_data_stream()`
+  instead of `to_bytes`, enforcing `RTDB_MAX_FILE_SIZE` incrementally
+  (aborts the moment the running total exceeds the limit, rather than after
+  buffering) and the per-db storage quota mid-stream (`QUOTA_EXCEEDED`/507,
+  committing nothing). Dedup (ENH-008) is preserved by writing chunks under
+  a provisional id, computing the final sha256 during the stream, and on a
+  content hit deleting the provisional chunks and returning the existing id.
+  `owner_id` (SEC-118) stamping is unchanged.
+- **Streaming download + chunk-aware Range**: serve builds an axum body from
+  a stream over `storage_chunks ORDER BY seq`; a `Range` request reads only
+  the covering chunk span, byte-trimming the first and last. The 206 /
+  `Content-Range` / 416 semantics are unchanged. Image transforms fetch all
+  chunks (the decoder needs the full bytes) and remain cache-keyed as whole
+  renders.
+- **Raised ceiling**: the compile-time `HARD_MAX_FILE_SIZE` clamp rose
+  50 MiB → 2 GiB (now a disk/quota guard, since upload no longer buffers).
+  The admin-mutable `RTDB_MAX_FILE_SIZE` default stays 50 MiB; a
+  compromised admin token still cannot raise the compile-time clamp.
+- **Client mirrors**: `ts-client` `upload` accepts
+  `Uint8Array | Blob | ReadableStream | ArrayBuffer | string` (passes the
+  body to `fetch` verbatim, no buffering); `rust-client` adds
+  `upload_stream<S: TryStream>` (`reqwest::Body::wrap_stream`); `python-client`
+  `upload` accepts `bytes | IO[bytes] | Iterable[bytes]` (sync) and
+  additionally `AsyncIterable[bytes]` (async). All keep their existing
+  buffer-accepting overloads.
+
 ### OpenTelemetry (OTLP) distributed tracing export (ENH-018)
 
 Span-level visibility into where a request's time goes — committer queue wait,

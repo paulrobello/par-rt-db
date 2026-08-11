@@ -1,5 +1,13 @@
+import type {
+  AuditEntry,
+  DbSubCounters,
+  GetAuditOptions,
+  SessionInfo,
+  SubscriptionInfo,
+  SubscriptionsResponse,
+} from "./admin.js";
 import { RtDbError } from "./errors.js";
-import type { FileMetadata, UploadResult } from "./http.js";
+import type { FileMetadata, UploadInput, UploadResult } from "./http.js";
 import { parseStepResults, type StepResult } from "./mutation.js";
 import { decodeCursor, encodeCursor } from "./pagination.js";
 import type {
@@ -26,14 +34,6 @@ import type {
 } from "./protocol.js";
 import type { RtQuery } from "./query.js";
 import type { SchemaDefinition } from "./schema.js";
-import type {
-  AuditEntry,
-  DbSubCounters,
-  GetAuditOptions,
-  SessionInfo,
-  SubscriptionInfo,
-  SubscriptionsResponse,
-} from "./admin.js";
 
 /**
  * In-memory implementation of the par-rt-db client for unit tests.
@@ -53,6 +53,52 @@ import type {
  * subscriptions). Gaps are marked with `TODO` and throw a clear `INTERNAL`
  * error rather than silently misbehaving.
  */
+
+/** Normalizes any {@link UploadInput} to `Uint8Array` for hashing/storage.
+ *  The in-memory harness is not a real transport, so streaming inputs are
+ *  read into memory in full (ENH-021). `Blob.arrayBuffer` handles `File` too
+ *  (a `Blob` subtype). Throws `BAD_REQUEST` for any other shape — matching the
+ *  http client's runtime guard. */
+async function toUint8Array(body: UploadInput): Promise<Uint8Array> {
+  if (body instanceof Uint8Array) {
+    return body;
+  }
+  if (typeof Blob !== "undefined" && body instanceof Blob) {
+    return new Uint8Array(await body.arrayBuffer());
+  }
+  if (body instanceof ReadableStream) {
+    const reader = body.getReader();
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+      if (value) {
+        chunks.push(value);
+        total += value.byteLength;
+      }
+    }
+    const out = new Uint8Array(total);
+    let offset = 0;
+    for (const c of chunks) {
+      out.set(c, offset);
+      offset += c.byteLength;
+    }
+    return out;
+  }
+  if (body instanceof ArrayBuffer) {
+    return new Uint8Array(body);
+  }
+  if (typeof body === "string") {
+    return new TextEncoder().encode(body);
+  }
+  throw new RtDbError(
+    "BAD_REQUEST",
+    "upload body must be Uint8Array, Blob, ReadableStream, ArrayBuffer, or string",
+  );
+}
 
 export const MAX_STEPS = 1024;
 const MAX_TAKE = 4096;
@@ -1484,9 +1530,13 @@ export class InMemoryRtDbClient {
   // app storage flows with no network. `getUrl` returns a synthetic
   // `memory://` handle — there is no real byte stream to serve.
 
-  /** Stores `bytes` and returns a server-shaped UploadResult. The id is a
-   * short counter-prefixed token (distinct in shape from document ids). */
-  async upload(bytes: Uint8Array, contentType?: string): Promise<UploadResult> {
+  /** Stores `body` and returns a server-shaped UploadResult. The id is a
+   * short counter-prefixed token (distinct in shape from document ids).
+   * The in-memory harness is not a real transport, so streaming inputs
+   * (`Blob`/`ReadableStream`/`ArrayBuffer`/`string`) are read into memory in
+   * full for hashing/storage (ENH-021); the live server streams them. */
+  async upload(body: UploadInput, contentType?: string): Promise<UploadResult> {
+    const bytes = await toUint8Array(body);
     const id = `f${(++this.idCounter).toString(36)}`;
     const digest = await crypto.subtle.digest("SHA-256", bytes as BufferSource);
     const sha256 = [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");

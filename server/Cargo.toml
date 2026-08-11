@@ -68,6 +68,14 @@ percent-encoding = "2"
 # `moka` is the LRU result cache keyed by (blob id, transform params).
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "webp"] }
 moka = { version = "0.12", features = ["future"] }
+# Streaming storage upload/download (ENH-021): the upload path consumes the
+# request body as a generic `futures::Stream<Item = Result<Bytes, _>>`, and the
+# download path builds an axum `Body::from_stream` over the chunk stream.
+futures = { workspace = true }
+# `ReceiverStream` adapts a tokio mpsc receiver into a `Stream` for the
+# streaming download path (ENH-021): a background task drains the chunk rows
+# and forwards each over a channel, so a 1 GiB download never materializes.
+tokio-stream = "0.1"
 # OpenTelemetry / OTLP tracing export (ENH-018). Optional + feature-gated behind
 # `otel` (default off). The exact versions are pinned because the
 # opentelemetry / tracing-opentelemetry pairing breaks across minor versions

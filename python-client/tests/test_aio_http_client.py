@@ -392,6 +392,93 @@ async def test_upload_posts_raw_bytes_and_returns_metadata() -> None:
     assert captured["headers"]["authorization"] == BEARER
 
 
+async def test_upload_streams_file_like_object() -> None:
+    """ENH-021: an ``io.BytesIO`` (file-like) round-trips and streams."""
+    import io
+
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["content"] = request.content
+        captured["headers"] = dict(request.headers)
+        return httpx.Response(
+            200,
+            json={"id": "f2", "sha256": "dead", "size": 23, "contentType": "image/png"},
+        )
+
+    async with _client(handler) as c:
+        up = await c.upload(io.BytesIO(b"file-like-streamed-body"), content_type="image/png")
+    assert isinstance(up, UploadResult)
+    assert up.id == "f2"
+    assert up.size == 23
+    assert captured["content"] == b"file-like-streamed-body"
+    assert captured["headers"]["content-type"] == "image/png"
+    # The async client adapts sync file-likes into an async generator, so httpx
+    # uses chunked transfer-encoding (no Content-Length) — bytes still arrive whole.
+    assert captured["headers"]["transfer-encoding"] == "chunked"
+    assert "content-length" not in captured["headers"]
+
+
+async def test_upload_streams_iterable_of_bytes() -> None:
+    """ENH-021: a sync iterable of bytes chunks round-trips and streams (chunked)."""
+
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["content"] = request.content
+        captured["headers"] = dict(request.headers)
+        return httpx.Response(
+            200,
+            json={"id": "f3", "sha256": "beef", "size": 14, "contentType": "image/png"},
+        )
+
+    async with _client(handler) as c:
+        up = await c.upload(iter([b"chunk1-", b"chunk2"]), content_type="image/png")
+    assert isinstance(up, UploadResult)
+    assert up.id == "f3"
+    assert up.size == 14
+    assert captured["content"] == b"chunk1-chunk2"
+    assert captured["headers"]["transfer-encoding"] == "chunked"
+    assert "content-length" not in captured["headers"]
+
+
+async def test_upload_streams_async_iterable_of_bytes() -> None:
+    """ENH-021: an async iterable of bytes chunks round-trips via httpx's async path."""
+
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["content"] = request.content
+        captured["headers"] = dict(request.headers)
+        return httpx.Response(
+            200,
+            json={"id": "f4", "sha256": "cafe", "size": 8, "contentType": "image/png"},
+        )
+
+    async def aiter_chunks():
+        yield b"foo"
+        yield b"bar"
+
+    async with _client(handler) as c:
+        up = await c.upload(aiter_chunks(), content_type="image/png")
+    assert isinstance(up, UploadResult)
+    assert up.id == "f4"
+    assert up.size == 8
+    assert captured["content"] == b"foobar"
+    assert captured["headers"]["transfer-encoding"] == "chunked"
+
+
+async def test_upload_rejects_wrong_type() -> None:
+    """A wrong-type input raises RtDbError(BAD_REQUEST) before any request."""
+    from par_rt_db import ErrorCode
+
+    async with _client(lambda req: httpx.Response(200, json={})) as c:
+        for bad in ("not-bytes", 42, 3.14, {"oops": True}, None):
+            with pytest.raises(RtDbError) as ei:
+                await c.upload(bad)  # type: ignore[arg-type]
+            assert ei.value.code is ErrorCode.BAD_REQUEST
+
+
 async def test_delete_file_posts_to_storage_path() -> None:
     captured: dict[str, Any] = {}
 

@@ -19,8 +19,8 @@ sync/async × data-plane/admin clients. ``[aio]`` is kept as an alias for
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from typing import TYPE_CHECKING, Any, Literal
+from collections.abc import AsyncIterable, AsyncIterator, Iterable, Mapping
+from typing import IO, TYPE_CHECKING, Any, Literal
 
 from .admin import (
     _AsyncAdminExecutor,
@@ -86,6 +86,30 @@ from .http_client import (
     UploadResult,
 )
 from .wire import BatchQueryOutcome, ScheduleInfo, ScheduleWhen
+
+# 64 KiB — matches httpx's ``IteratorByteStream.CHUNK_SIZE`` so the async
+# adaptation of a sync file-like object chunks at the same granularity.
+_ASYNC_UPLOAD_CHUNK = 65_536
+
+
+async def _async_iter_from_sync(stream: IO[bytes] | Iterable[bytes]) -> AsyncIterator[bytes]:
+    """Adapt a sync file-like / iterable of bytes into an async byte iterator.
+
+    ``httpx.AsyncClient`` rejects ``SyncByteStream`` bodies, so a sync
+    ``IO[bytes]`` or ``Iterable[bytes]`` passed to :meth:`upload` is read here
+    chunk-by-chunk (64 KiB for file-likes; per-item for iterables) and yielded
+    on the async path, letting httpx stream it without buffering it whole.
+    """
+    read = getattr(stream, "read", None)
+    if read is not None:
+        while True:
+            chunk = read(_ASYNC_UPLOAD_CHUNK)
+            if not chunk:
+                break
+            yield chunk
+    else:
+        for chunk in stream:
+            yield chunk
 
 
 class RtDbAsyncHttpClient:
@@ -281,19 +305,47 @@ class RtDbAsyncHttpClient:
 
     # --- storage (machine token; HTTP-only, bypasses the committer) ---
 
-    async def upload(self, data: bytes, *, content_type: str | None = None) -> UploadResult:
+    async def upload(
+        self,
+        data: bytes | IO[bytes] | Iterable[bytes] | AsyncIterable[bytes],
+        *,
+        content_type: str | None = None,
+    ) -> UploadResult:
         """``POST /api/storage/{db}`` with a raw body → server-computed metadata.
 
         ``content_type`` sets the ``Content-Type`` header AND is stored as the
         file's type; when ``None`` the header is left unset (httpx defaults to
         ``application/octet-stream``). Unlike every other method the body is NOT
         JSON.
+
+        ``data`` may be ``bytes`` (buffered), a binary file-like object (anything
+        with ``.read()``), an iterable of bytes chunks, or an async iterable of
+        bytes chunks. ``bytes`` and ``AsyncIterable`` are handed to httpx
+        directly; a sync file-like or sync iterable is adapted into an async
+        generator so httpx's ``AsyncClient`` streams it without buffering it
+        whole. Large files are therefore uploaded without being fully held in
+        memory (ENH-021).
         """
+        if isinstance(data, (str, Mapping)) or not isinstance(
+            data, (bytes, Iterable, AsyncIterable)
+        ):
+            raise RtDbError(
+                ErrorCode.BAD_REQUEST,
+                "upload data must be bytes, a file-like object, or an (async) iterable of bytes",
+            )
+        # ``bytes`` and ``AsyncIterable`` go straight to httpx (ByteStream is
+        # already async-safe; AsyncIterable is httpx's native async path). A
+        # sync ``IO[bytes]``/``Iterable[bytes]`` would produce a SyncByteStream,
+        # which AsyncClient rejects — wrap it in an async generator.
+        if isinstance(data, (bytes, AsyncIterable)):
+            body: bytes | AsyncIterable[bytes] = data
+        else:
+            body = _async_iter_from_sync(data)
         headers = {"Content-Type": content_type} if content_type is not None else None
         resp = await self._send(
             "POST",
             f"/api/storage/{self._db}",
-            content=data,
+            content=body,
             headers=headers,
         )
         return UploadResult.model_validate(resp.json())

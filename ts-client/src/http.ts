@@ -25,6 +25,12 @@ export interface UploadResult {
   contentType?: string;
 }
 
+/** Upload input accepted by {@link RtDbHttpClient.upload}: any `BodyInit`-compatible
+ * value the underlying `fetch` can stream without buffering. `Blob` and
+ * `ReadableStream` let a caller upload a multi-GB file without holding it in JS
+ * memory (ENH-021); `Uint8Array` remains the canonical in-memory form. */
+export type UploadInput = Uint8Array | Blob | ReadableStream<Uint8Array> | ArrayBuffer | string;
+
 /** Metadata for a stored file. `creationTime` is epoch milliseconds. */
 export interface FileMetadata {
   id: string;
@@ -170,17 +176,30 @@ export class RtDbHttpClient {
     return (body as { user: AuthedUser }).user;
   }
 
-  /** Upload raw bytes; the db is this client's db (injected into the path). */
-  async upload(bytes: Uint8Array, contentType?: string): Promise<UploadResult> {
+  /** Upload a streaming-capable body (ENH-021); the db is this client's db
+   *  (injected into the path). The input is forwarded to `fetch` verbatim so a
+   *  `Blob`/`ReadableStream` streams without buffering in JS memory. */
+  async upload(body: UploadInput, contentType?: string): Promise<UploadResult> {
+    if (
+      !(body instanceof Uint8Array) &&
+      typeof Blob !== "undefined" &&
+      !(body instanceof Blob) &&
+      !(body instanceof ReadableStream) &&
+      !(body instanceof ArrayBuffer) &&
+      typeof body !== "string"
+    ) {
+      throw new RtDbError(
+        "BAD_REQUEST",
+        "upload body must be Uint8Array, Blob, ReadableStream, ArrayBuffer, or string",
+      );
+    }
     const headers: Record<string, string> = { Authorization: `Bearer ${this.token}` };
     if (contentType) {
       headers["content-type"] = contentType;
     }
     const response = await this.fetchImpl(
       `${this.url}/api/storage/${encodeURIComponent(this.db)}`,
-      // `bytes` is a valid BodyInit at runtime; the cast works around the TS
-      // lib's `Uint8Array<ArrayBufferLike>` ↔ `BodyInit` variance.
-      { method: "POST", headers, body: bytes as BodyInit },
+      { method: "POST", headers, body: body as BodyInit },
     );
     return (await this.parse(response)) as UploadResult;
   }

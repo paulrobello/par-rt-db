@@ -1,4 +1,5 @@
-import { describe, it, expect } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { RtDbHttpClient } from "../src/http.js";
 import { InMemoryRtDbClient } from "../src/in_memory.js";
 
 describe("in-memory storage", () => {
@@ -19,6 +20,126 @@ describe("in-memory storage", () => {
 
     await c.deleteFile(up.id);
     await expect(c.getFileMetadata(up.id)).rejects.toBeTruthy();
+  });
+
+  it("accepts a Blob upload and round-trips the same bytes (ENH-021)", async () => {
+    const c = new InMemoryRtDbClient();
+    const bytes = new Uint8Array([10, 20, 30, 40, 50]);
+    const up = await c.upload(new Blob([bytes]), "application/octet-stream");
+    expect(up.size).toBe(5);
+    expect(up.sha256).toBeTypeOf("string");
+    // Same bytes via Uint8Array produce the same digest.
+    const ref = await c.upload(bytes);
+    expect(up.sha256).toBe(ref.sha256);
+  });
+
+  it("accepts a ReadableStream upload and round-trips the same bytes (ENH-021)", async () => {
+    const c = new InMemoryRtDbClient();
+    const bytes = new Uint8Array([1, 2, 3]);
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(bytes);
+        controller.close();
+      },
+    });
+    const up = await c.upload(stream, "image/png");
+    expect(up.size).toBe(3);
+    const ref = await c.upload(bytes);
+    expect(up.sha256).toBe(ref.sha256);
+  });
+
+  it("accepts ArrayBuffer and string uploads (ENH-021)", async () => {
+    const c = new InMemoryRtDbClient();
+    const buf = new ArrayBuffer(4);
+    new Uint8Array(buf).set([1, 2, 3, 4]);
+    const upBuf = await c.upload(buf);
+    expect(upBuf.size).toBe(4);
+    const upStr = await c.upload("hello");
+    expect(upStr.size).toBe(5);
+    const refStr = await c.upload(new TextEncoder().encode("hello"));
+    expect(upStr.sha256).toBe(refStr.sha256);
+  });
+
+  it("forwards a Blob body to fetch verbatim (ENH-021)", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ id: "f1", sha256: "abc", size: 3 }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    const http = new RtDbHttpClient({
+      url: "http://h:8300",
+      db: "kanban",
+      token: "tok",
+      fetch: fetchMock,
+    });
+    const blob = new Blob([new Uint8Array([1, 2, 3])]);
+    const res = await http.upload(blob, "image/png");
+    expect(res).toEqual({ id: "f1", sha256: "abc", size: 3 });
+    const init = fetchMock.mock.calls[0][1] as RequestInit;
+    // The body is the Blob itself — NOT buffered into an ArrayBuffer/Uint8Array.
+    expect(init.body).toBe(blob);
+    expect(init.headers).toMatchObject({
+      Authorization: "Bearer tok",
+      "content-type": "image/png",
+    });
+  });
+
+  it("forwards a ReadableStream body to fetch verbatim (ENH-021)", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ id: "f1", sha256: "abc", size: 3 }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    const http = new RtDbHttpClient({
+      url: "http://h:8300",
+      db: "kanban",
+      token: "tok",
+      fetch: fetchMock,
+    });
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new Uint8Array([1, 2, 3]));
+        controller.close();
+      },
+    });
+    await http.upload(stream);
+    const init = fetchMock.mock.calls[0][1] as RequestInit;
+    expect(init.body).toBe(stream);
+  });
+
+  it("still accepts Uint8Array unchanged (ENH-021 regression)", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ id: "f1", sha256: "abc", size: 4 }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    const http = new RtDbHttpClient({
+      url: "http://h:8300",
+      db: "kanban",
+      token: "tok",
+      fetch: fetchMock,
+    });
+    const bytes = new Uint8Array([1, 2, 3, 4]);
+    const res = await http.upload(bytes);
+    expect(res).toEqual({ id: "f1", sha256: "abc", size: 4 });
+    const init = fetchMock.mock.calls[0][1] as RequestInit;
+    expect(init.body).toBe(bytes);
+  });
+
+  it("throws BAD_REQUEST for an unsupported upload body type", async () => {
+    const http = new RtDbHttpClient({
+      url: "http://h:8300",
+      db: "kanban",
+      token: "tok",
+      fetch: vi.fn(),
+    });
+    await expect(http.upload(42 as unknown as never)).rejects.toMatchObject({
+      code: "BAD_REQUEST",
+      name: "RtDbError",
+    });
   });
 
   it("getUrl against the http client builds the public URL", async () => {

@@ -17,14 +17,17 @@ use crate::error::RtDbError;
 pub(crate) const MIN_ADMIN_KEY_LEN: usize = 16;
 
 /// Hard upper bound on `HotConfig::max_file_size`, enforced at boot seed
-/// (`HotConfig::from_env`) and at the upload buffering point
+/// (`HotConfig::from_env`) and at the upload streaming point
 /// (`http_api::upload_handler`). The hot-config value is admin-mutable via
 /// `PATCH /admin/config`, so without a compile-time ceiling an admin
-/// misconfiguration (or a compromised admin token) could buffer arbitrarily
-/// large blobs into Postgres `bytea`. 100 MiB is 2x the default (50 MiB),
-/// leaving legitimate operator headroom while bounding the worst case
-/// (SEC-008). Raising this is a code change, not a config knob.
-pub(crate) const HARD_MAX_FILE_SIZE: usize = 100 * 1024 * 1024;
+/// misconfiguration (or a compromised admin token) could accept arbitrarily
+/// large uploads. 2 GiB is the ENH-021 post-streaming ceiling: with the upload
+/// path now chunked (1 MiB at a time), memory is decoupled from file size, so
+/// this is a disk-quota / DoS guard rather than a memory-safety guard.
+/// `RTDB_MAX_FILE_SIZE` (default 50 MiB) is the policy limit an operator tunes
+/// per deployment; this const is the hard cap a compromised admin token cannot
+/// raise (SEC-008). Raising this is a code change, not a config knob.
+pub(crate) const HARD_MAX_FILE_SIZE: usize = 2 * 1024 * 1024 * 1024;
 
 /// Default sampling interval for the subscription-skip shadow verifier
 /// (ARC-101). A wrong skip is otherwise silent (no error — the client just

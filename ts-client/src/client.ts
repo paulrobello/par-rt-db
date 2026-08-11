@@ -1,6 +1,6 @@
 import { RtDbError } from "./errors.js";
+import type { TransformOpts, UploadInput } from "./http.js";
 import { RtDbHttpClient } from "./http.js";
-import type { TransformOpts } from "./http.js";
 import { parseStepResults, type StepResult } from "./mutation.js";
 import { projectOptimisticUpdate } from "./optimistic.js";
 import type {
@@ -394,8 +394,8 @@ export class RtDbClient {
   // params. The http client is rebuilt per call rather than cached so a rotated
   // token (setToken / re-auth) is always reflected.
 
-  upload(bytes: Uint8Array, contentType?: string) {
-    return this.httpForStorage().upload(bytes, contentType);
+  upload(body: UploadInput, contentType?: string) {
+    return this.httpForStorage().upload(body, contentType);
   }
 
   deleteFile(id: string) {

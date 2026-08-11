@@ -10,7 +10,8 @@ repository = "https://github.com/paulrobello/par-rt-db"
 [features]
 default = ["http"]
 http = ["dep:reqwest"]
-ws = ["dep:tokio", "dep:tokio-tungstenite", "dep:futures-util"]
+# `futures-util` is needed by `http` (streaming upload) as well as `ws`.
+ws = ["dep:tokio", "dep:tokio-tungstenite"]
 admin = ["http"]
 in_memory = ["dep:sha2"]
 
@@ -25,10 +26,11 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 base64.workspace = true
-reqwest = { workspace = true, optional = true }
+bytes.workspace = true
+reqwest = { workspace = true, features = ["stream"], optional = true }
 tokio = { workspace = true, features = ["macros", "rt", "sync", "time"], optional = true }
 tokio-tungstenite = { workspace = true, features = ["rustls-tls-webpki-roots"], optional = true }
-futures-util = { workspace = true, optional = true }
+futures-util = { workspace = true }
 sha2 = { workspace = true, optional = true }
 
 [dev-dependencies]

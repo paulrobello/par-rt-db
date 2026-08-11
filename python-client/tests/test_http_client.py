@@ -386,6 +386,66 @@ def test_upload_posts_raw_bytes_and_returns_metadata() -> None:
     assert captured["headers"]["authorization"] == BEARER
 
 
+def test_upload_streams_file_like_object() -> None:
+    """ENH-021: an ``io.BytesIO`` (file-like) round-trips and streams."""
+    import io
+
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["content"] = request.content
+        captured["headers"] = dict(request.headers)
+        return httpx.Response(
+            200,
+            json={"id": "f2", "sha256": "dead", "size": 23, "contentType": "image/png"},
+        )
+
+    client = _client(handler)
+    up = client.upload(io.BytesIO(b"file-like-streamed-body"), content_type="image/png")
+    assert isinstance(up, UploadResult)
+    assert up.id == "f2"
+    assert up.size == 23
+    assert captured["content"] == b"file-like-streamed-body"
+    assert captured["headers"]["content-type"] == "image/png"
+    # httpx sets Content-Length when the file-like object supports seek (BytesIO does)
+    assert captured["headers"]["content-length"] == "23"
+
+
+def test_upload_streams_iterable_of_bytes() -> None:
+    """ENH-021: an iterable of bytes chunks round-trips and streams (chunked)."""
+
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["content"] = request.content
+        captured["headers"] = dict(request.headers)
+        return httpx.Response(
+            200,
+            json={"id": "f3", "sha256": "beef", "size": 14, "contentType": "image/png"},
+        )
+
+    client = _client(handler)
+    up = client.upload(iter([b"chunk1-", b"chunk2"]), content_type="image/png")
+    assert isinstance(up, UploadResult)
+    assert up.id == "f3"
+    assert up.size == 14
+    assert captured["content"] == b"chunk1-chunk2"
+    # iter() returns a non-file-like iterator → chunked transfer-encoding
+    assert captured["headers"]["transfer-encoding"] == "chunked"
+    assert "content-length" not in captured["headers"]
+
+
+def test_upload_rejects_wrong_type() -> None:
+    """A wrong-type input raises RtDbError(BAD_REQUEST) before any request."""
+    from par_rt_db import ErrorCode
+
+    client = _client(lambda req: httpx.Response(200, json={}))
+    for bad in ("not-bytes", 42, 3.14, {"oops": True}, None):
+        with pytest.raises(RtDbError) as ei:
+            client.upload(bad)  # type: ignore[arg-type]
+        assert ei.value.code is ErrorCode.BAD_REQUEST
+
+
 def test_delete_file_posts_to_storage_path() -> None:
     captured: dict[str, Any] = {}
 

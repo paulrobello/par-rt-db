@@ -521,38 +521,13 @@ async fn upload_handler(
 
     // `max_file_size` is admin-mutable via PATCH /admin/config; clamp to the
     // compile-time HARD_MAX_FILE_SIZE so a misconfigured persisted row (or a
-    // compromised admin token) cannot buffer arbitrarily large blobs into
-    // Postgres bytea. The bearer is already authorized above; clamp ordering
-    // preserves the auth-before-buffering invariant (SEC-008).
+    // compromised admin token) cannot accept arbitrarily large uploads. The
+    // bearer is already authorized above; clamp ordering preserves the
+    // auth-before-buffering invariant (SEC-008). ENH-021: the streaming upload
+    // path enforces this incrementally as bytes arrive (rejecting the moment
+    // the running total crosses the line) rather than buffering the whole body
+    // first, so this is now a disk-quota/DoS guard rather than a memory guard.
     let limit = crate::config::HARD_MAX_FILE_SIZE.min(state.runtime.hot.load().max_file_size);
-    let bytes = axum::body::to_bytes(request.into_body(), limit)
-        .await
-        .map_err(|_| RtDbError::bad_request("upload exceeds max file size"))?;
-
-    let size = bytes.len() as i64;
-    // ENH-011: enforce per-db storage cap on the blob path. `storage::put`
-    // bypasses the committer (blobs don't touch document tables), so the upload
-    // route is the only place this cap applies to blobs — check `used + size`
-    // (not `enforce`, which would ignore the incoming blob) so a write that
-    // exactly fills to the cap is allowed and one byte over is not. Uniform —
-    // no admin bypass; the bearer above is already authorized.
-    let storage_cap = state.runtime.hot.load().max_storage_bytes_per_db;
-    if storage_cap > 0 {
-        let used = state
-            .quotas
-            .current_usage(&state.pool, &db, state.config.quota_cache_ttl_secs)
-            .await?;
-        if used + (size as u64) > storage_cap {
-            state
-                .runtime
-                .metrics
-                .record_quota_rejection(&db, crate::metrics::QuotaKind::Storage);
-            return Err(RtDbError::quota_exceeded(format!(
-                "upload of {size} bytes would exceed storage quota for db '{db}' ({used} used, limit {storage_cap})"
-            )));
-        }
-    }
-    let sha256 = storage::sha256_hex_bytes(&bytes);
     let content_type = headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
@@ -565,14 +540,56 @@ async fn upload_handler(
         Principal::User { user_id, .. } => Some(user_id.as_str()),
         Principal::Machine { .. } => None,
     };
-    let id = storage::put(
+    // ENH-021: stream the request body straight into the chunked storage path.
+    // 1 MiB at a time is resident — N concurrent uploads is N × 1 MiB, not N ×
+    // filesize. The quota check closure runs on every chunk so an over-cap
+    // upload aborts mid-stream and commits nothing (no orphaned chunks). The
+    // size check (against `limit`) is enforced inside `put_stream` on every
+    // chunk arrival.
+    // ENH-011 / ENH-021: per-db storage cap, enforced incrementally during the
+    // streaming upload. Sample the cached `used` once at the start (TTL-bounded,
+    // measure-on-miss — the per-db warmer keeps it fresh between uploads); the
+    // per-chunk check is then a pure in-memory `used + running > cap` so the hot
+    // path does no DB work per chunk. A concurrent upload can race this sample,
+    // but the post-upload cache refresh + the next request's check bound the
+    // overshoot. Aborting mid-stream commits nothing (the txn rolls back).
+    let storage_cap = state.runtime.hot.load().max_storage_bytes_per_db;
+    let baseline_used = if storage_cap > 0 {
+        state
+            .quotas
+            .current_usage(&state.pool, &db, state.config.quota_cache_ttl_secs)
+            .await?
+    } else {
+        0
+    };
+    let quota_db = db.clone();
+    let quota_metrics = state.runtime.metrics.clone();
+    let quota_check = move |running: u64| {
+        let db = quota_db.clone();
+        let metrics = quota_metrics.clone();
+        async move {
+            if storage_cap == 0 {
+                return Ok(());
+            }
+            if baseline_used + running > storage_cap {
+                metrics.record_quota_rejection(&db, crate::metrics::QuotaKind::Storage);
+                return Err(RtDbError::quota_exceeded(format!(
+                    "upload would exceed storage quota for db '{db}' ({baseline_used} used, \
+                     +{running} in flight, limit {storage_cap})"
+                )));
+            }
+            Ok(())
+        }
+    };
+    let body_stream = request.into_body().into_data_stream();
+    let result = storage::put_stream(
         &state.pool,
         &db,
-        &sha256,
-        size,
         content_type.as_deref(),
         owner_id,
-        &bytes,
+        limit as u64,
+        quota_check,
+        body_stream,
     )
     .await?;
     // ENH-011: best-effort post-upload refresh of the storage cache so the next
@@ -588,9 +605,9 @@ async fn upload_handler(
     }
     state.runtime.metrics.record_upload();
     Ok(Json(UploadResponse {
-        id,
-        sha256,
-        size,
+        id: result.id,
+        sha256: result.sha256,
+        size: result.size,
         content_type,
     }))
 }
@@ -804,37 +821,94 @@ async fn serve_bytes(
     // SEC-123: when a Range header is present on a plain blob fetch, resolve
     // the range against `octet_length(bytes)` first (cheap — no bytea crosses
     // the wire), then fetch ONLY the requested slice via `substring(bytes FROM
-    // ... FOR ...)`. A Range request on a multi-GB blob must not load the whole
-    // bytea into server memory just to slice it.
+    // ... FOR ...)` (legacy inline) or the covering chunk span (ENH-021). A
+    // Range request on a multi-GB blob must not load the whole bytea into
+    // server memory just to slice it.
     if supports_range {
         let raw_range = range_header.map(str::trim).filter(|s| !s.is_empty());
         if let Some(raw_range) = raw_range {
             return build_range_response(&state.pool, db, id, raw_range, IMMUTABLE).await;
         }
     }
-    let (bytes, content_type) = match resolved {
-        Some(Resolved::Transformed(cached)) => (cached.bytes, cached.content_type.to_string()),
+    match resolved {
+        Some(Resolved::Transformed(cached)) => build_serve_response(
+            cached.bytes.to_vec(),
+            cached.content_type,
+            IMMUTABLE,
+            supports_range,
+            range_header,
+        ),
         Some(Resolved::Raw {
             bytes,
             content_type,
-        }) => (bytes, content_type),
+        }) => build_serve_response(
+            bytes.to_vec(),
+            &content_type,
+            IMMUTABLE,
+            supports_range,
+            range_header,
+        ),
         None => {
-            let (raw, ct) = storage::get(&state.pool, db, id)
+            // Plain non-range serve. ENH-021: for a chunked blob, stream the
+            // chunks straight to the HTTP body via `Body::from_stream` so a 1
+            // GiB download never holds more than ~1 chunk (1 MiB) in memory at
+            // a time. Legacy inline blobs still reassemble the bytea (they have
+            // no chunk rows; the whole column is one TOAST row either way).
+            let probe = storage::probe_layout(&state.pool, db, id)
                 .await?
                 .ok_or_else(|| RtDbError::not_found("unknown file"))?;
-            (
-                raw,
-                ct.unwrap_or_else(|| "application/octet-stream".to_string()),
-            )
+            let content_type = probe
+                .1
+                .unwrap_or_else(|| "application/octet-stream".to_string());
+            let (served_ct, force_attachment) = resolve_served_content_type(&content_type);
+            let disposition = if force_attachment {
+                "attachment"
+            } else {
+                "inline"
+            };
+            match probe.0 {
+                storage::BlobLayout::Chunked => {
+                    // Stream chunks directly — no materialization. The
+                    // `stream_chunks` stream spawns a task that holds one
+                    // connection from the pool for the lifetime of the response;
+                    // axum drives the body stream to completion (and on client
+                    // disconnect the receiver drops, the sender errors, and the
+                    // task exits early — the connection returns to the pool).
+                    let chunk_stream =
+                        storage::stream_chunks(state.pool.clone(), db.to_string(), id.to_string());
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, served_ct)
+                        .header(header::CACHE_CONTROL, IMMUTABLE)
+                        .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
+                        .header(header::CONTENT_DISPOSITION, disposition)
+                        .header(header::ACCEPT_RANGES, ACCEPT_RANGES_BYTES)
+                        .body(Body::from_stream(chunk_stream))
+                        .map_err(|err| {
+                            tracing::error!(error = %err, "failed to build streaming serve response");
+                            RtDbError::internal(
+                                "failed to build streaming serve response; see server logs",
+                            )
+                        })
+                }
+                storage::BlobLayout::Inline => {
+                    // Legacy inline bytea — fetch and serve as one buffer. The
+                    // serve path for an inline blob was always whole-body; this
+                    // matches pre-ENH-021 behavior.
+                    let (raw, _) = storage::get(&state.pool, db, id)
+                        .await?
+                        .ok_or_else(|| RtDbError::not_found("unknown file"))?;
+                    build_serve_response(
+                        raw.to_vec(),
+                        &content_type,
+                        IMMUTABLE,
+                        supports_range,
+                        range_header,
+                    )
+                }
+            }
         }
-    };
-    build_serve_response(
-        bytes.to_vec(),
-        &content_type,
-        IMMUTABLE,
-        supports_range,
-        range_header,
-    )
+    }
 }
 
 /// SEC-123: builds the response for a `Range:` request against a stored blob by

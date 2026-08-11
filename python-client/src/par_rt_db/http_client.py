@@ -39,8 +39,8 @@ as ``from par_rt_db import <Model>`` (locked down by
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from typing import TYPE_CHECKING, Any, Literal
+from collections.abc import Iterable, Mapping
+from typing import IO, TYPE_CHECKING, Any, Literal
 
 from pydantic import TypeAdapter
 
@@ -410,14 +410,30 @@ class RtDbHttpClient:
 
     # --- storage (machine token; HTTP-only, bypasses the committer) ---
 
-    def upload(self, data: bytes, *, content_type: str | None = None) -> UploadResult:
+    def upload(
+        self,
+        data: bytes | IO[bytes] | Iterable[bytes],
+        *,
+        content_type: str | None = None,
+    ) -> UploadResult:
         """``POST /api/storage/{db}`` with a raw body → server-computed metadata.
 
         ``content_type`` sets the ``Content-Type`` header AND is stored as the
         file's type; when ``None`` the header is left unset (httpx defaults to
         ``application/octet-stream``). Unlike every other method the body is NOT
         JSON.
+
+        ``data`` may be ``bytes`` (buffered), a binary file-like object (anything
+        with ``.read()`` — streamed in 64 KiB chunks), or an iterable of bytes
+        chunks (streamed, chunked transfer-encoding). httpx handles all three
+        natively when passed via ``content=``, so large files are uploaded
+        without being fully buffered in memory (ENH-021).
         """
+        if isinstance(data, (str, Mapping)) or not isinstance(data, (bytes, Iterable)):
+            raise RtDbError(
+                ErrorCode.BAD_REQUEST,
+                "upload data must be bytes, a file-like object, or an iterable of bytes",
+            )
         headers = {"Content-Type": content_type} if content_type is not None else None
         resp = self._send(
             "POST",

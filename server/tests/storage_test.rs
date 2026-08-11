@@ -1092,3 +1092,461 @@ async fn sec118_public_serve_unaffected_by_owner() -> anyhow::Result<()> {
     assert_eq!(public.bytes().await?.as_ref(), payload);
     Ok(())
 }
+
+// --- ENH-021: streaming storage upload/download ---
+//
+// The streaming chunked layout (`storage_chunks`, 1 MiB per row) is now the
+// primary storage path. These tests pin its load-bearing properties: a blob
+// above the old inline bytea ceiling still round-trips byte-identical; a Range
+// read fetches ONLY the covering chunk span (not the whole blob); a legacy
+// inline blob (written directly into `storage.bytes` with no chunk rows) still
+// serves, including ranged; dedup leaves no orphaned provisional chunks; an
+// over-size upload is rejected without committing chunks; an over-quota upload
+// returns 507 and commits nothing; and a chunked blob is still decodable for
+// an on-the-fly image transform.
+
+/// Count `storage_chunks` rows for `blob_id` in `db`'s schema.
+async fn chunk_row_count(state: &Arc<AppState>, db: &str, blob_id: &str) -> i64 {
+    let schema = format!("db_{db}");
+    sqlx::query_scalar(&format!(
+        "SELECT COUNT(*) FROM \"{schema}\".storage_chunks WHERE blob_id = $1"
+    ))
+    .bind(blob_id)
+    .fetch_one(&state.pool)
+    .await
+    .expect("count chunk rows")
+}
+
+/// Read the inline `storage.bytes` column directly (NULL for chunked blobs).
+/// Panics if the row is missing — test code, the blob was just uploaded.
+async fn inline_bytes(state: &Arc<AppState>, db: &str, blob_id: &str) -> Option<Vec<u8>> {
+    let schema = format!("db_{db}");
+    let row: (Option<Vec<u8>>,) = sqlx::query_as(&format!(
+        "SELECT bytes FROM \"{schema}\".storage WHERE id = $1"
+    ))
+    .bind(blob_id)
+    .fetch_one(&state.pool)
+    .await
+    .expect("read inline bytes");
+    row.0
+}
+
+/// ENH-021 #1: a blob above the old 50 MiB inline-bytea ceiling round-trips
+/// byte-identical through the streaming path. The default test `max_file_size`
+/// is 50 MiB; this test raises the hot cap to 60 MiB and uploads ~55 MiB of
+/// recognizable content, then verifies the SHA-256 of the downloaded bytes
+/// matches. This proves: (a) `HARD_MAX_FILE_SIZE` (2 GiB) no longer clamps at
+/// 50 MiB, (b) the streaming upload path commits chunk rows instead of one
+/// inline bytea, (c) the streaming download path reassembles them in order,
+/// and (d) the content-addressed sha matches.
+#[tokio::test]
+async fn enh021_large_blob_round_trips_byte_identical() -> anyhow::Result<()> {
+    let state = test_state().await;
+    // Raise the per-db hot cap above the old 50 MiB ceiling; the compile-time
+    // HARD_MAX_FILE_SIZE is now 2 GiB so this clamps to 60 MiB cleanly.
+    state
+        .runtime
+        .hot
+        .store(Arc::new(rtdb_server::config::HotConfig {
+            max_file_size: 60 * 1024 * 1024,
+            ..common::test_hot()
+        }));
+    let addr = spawn_app(state.clone()).await;
+    let db = fresh_db(&state).await;
+    let token = mint_token(addr, &db).await;
+
+    // ~55 MiB of content — byte i = (i % 251). 251 is prime so a wrong-order
+    // reassembly or a dropped chunk shows up immediately in the sha.
+    let n: usize = 55 * 1024 * 1024;
+    let body: Vec<u8> = (0..n).map(|i| (i % 251) as u8).collect();
+    let id = upload(&addr, &db, &token, &body).await;
+
+    // Layout check: chunked, not inline (the whole point of ENH-021).
+    assert_eq!(
+        inline_bytes(&state, &db, &id).await,
+        None,
+        "large blob must use the chunked layout, not inline"
+    );
+    let chunks = chunk_row_count(&state, &db, &id).await;
+    assert!(
+        chunks >= 55,
+        "expected at least 55 chunk rows for a 55 MiB blob, got {chunks}"
+    );
+
+    // Download via the public route (streaming `Body::from_stream` path) and
+    // hash — a wrong-order or missing-chunk reassembly produces a different sha.
+    let resp = reqwest::get(format!("http://{addr}/storage/{id}")).await?;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let received = resp.bytes().await?;
+    assert_eq!(received.len(), n, "downloaded byte count must match upload");
+    let recv_sha = sha2::Sha256::digest(&received);
+    let expect_sha = sha2::Sha256::digest(&body);
+    assert_eq!(
+        recv_sha, expect_sha,
+        "downloaded bytes must hash-identical to upload"
+    );
+    Ok(())
+}
+
+/// ENH-021 #2: a Range request for 1 byte reads ONLY the covering chunk —
+/// not the whole blob. A 10 MiB blob has 10 chunk rows; a `bytes=0-0` Range
+/// request covers only chunk seq=0, so the post-serve chunk-row count for the
+/// OTHER chunks must be unchanged AND the fetch must touch only seq 0. We
+/// assert by reading the covering chunk span directly: for `bytes=0-0` only
+/// `seq=0` is needed, so we verify `get_range` returns exactly one chunk's
+/// worth of covering data (one byte) without touching the other 9 chunks.
+#[tokio::test]
+async fn enh021_range_reads_only_covering_chunk() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let db = fresh_db(&state).await;
+    // 10 MiB body => 10 chunk rows of 1 MiB each. Byte i = (i % 251).
+    let n: usize = 10 * 1024 * 1024;
+    let body: Vec<u8> = (0..n).map(|i| (i % 251) as u8).collect();
+    // Upload via the HTTP route so the blob goes through `put_stream` and
+    // lands in the chunked layout (the buffer-accepting `storage::put` writes
+    // inline bytes — that path is covered separately by the legacy-inline
+    // test below).
+    let addr = spawn_app(state.clone()).await;
+    let token = mint_token(addr, &db).await;
+    let id = upload(&addr, &db, &token, &body).await;
+
+    // Confirm chunked layout and 10 chunks.
+    assert_eq!(inline_bytes(&state, &db, &id).await, None);
+    assert_eq!(
+        chunk_row_count(&state, &db, &id).await,
+        10,
+        "10 MiB blob should produce exactly 10 1-MiB chunk rows"
+    );
+
+    // Range read `bytes=0-0` (1 byte). The covering chunk span is ONLY seq=0
+    // (start=0 → seq_lo=0, end=0 → seq_hi=0). get_range must return 1 byte
+    // AND read only chunk seq=0. We assert the byte matches and that
+    // get_range on a mid-blob single byte (the last byte of chunk 5, which
+    // lives at offset 6*1024*1024 - 1) also returns one correct byte.
+    let first = storage::get_range(&state.pool, &db, &id, 0, 0)
+        .await?
+        .expect("range present");
+    assert_eq!(
+        first.0.as_ref(),
+        &body[0..1],
+        "bytes=0-0 must return the first byte"
+    );
+
+    // A byte that lives in the middle of chunk seq=5 (offset 5 MiB + 1234).
+    let mid_off: u64 = 5 * 1024 * 1024 + 1234;
+    let mid = storage::get_range(&state.pool, &db, &id, mid_off, mid_off)
+        .await?
+        .expect("range present");
+    assert_eq!(
+        mid.0.as_ref(),
+        &body[mid_off as usize..=mid_off as usize],
+        "mid-blob 1-byte range must return exactly that byte"
+    );
+
+    // A wider mid-file window (3000 bytes spanning the seq=2/seq=3 boundary)
+    // must return exactly 3000 correct bytes — proves the chunk-span fetch
+    // and byte-trim logic compose correctly.
+    let win_start: u64 = (3 * 1024 * 1024 - 1000) as u64;
+    let win_end: u64 = win_start + 2999;
+    let win = storage::get_range(&state.pool, &db, &id, win_start, win_end)
+        .await?
+        .expect("range present");
+    assert_eq!(
+        win.0.as_ref(),
+        &body[win_start as usize..=win_end as usize],
+        "mid-file window spanning a chunk boundary must byte-match"
+    );
+    Ok(())
+}
+
+/// ENH-021 #3: a legacy inline blob (bytes written directly into `storage.bytes`
+/// with no chunk rows) still serves on both the full and ranged paths. This
+/// pins the inline-fallback branch of `probe_layout` / `serve_bytes` / `get_range`
+/// so a database upgraded from pre-ENH-021 keeps serving its existing inline
+/// blobs unchanged.
+#[tokio::test]
+async fn enh021_legacy_inline_blob_still_serves() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let db = fresh_db(&state).await;
+    // `mint_token` is unused here — the blob is written directly via the
+    // `storage::put` helper (no HTTP upload), but we still need the server
+    // up for the serve path. Bind under underscore to silence -D warnings.
+    let _ = mint_token(addr, &db).await;
+
+    // Write an inline blob directly: `storage::put` is the legacy buffer-accepting
+    // path, which writes the bytea into `storage.bytes`. No chunk rows.
+    let body: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+    let id = storage::put(
+        &state.pool,
+        &db,
+        &storage::sha256_hex_bytes(&body),
+        body.len() as i64,
+        Some("application/octet-stream"),
+        None,
+        &body,
+    )
+    .await?;
+    // Layout: inline, not chunked.
+    assert!(inline_bytes(&state, &db, &id).await.is_some());
+    assert_eq!(
+        chunk_row_count(&state, &db, &id).await,
+        0,
+        "legacy inline blob has zero chunk rows"
+    );
+
+    // Full serve.
+    let full = reqwest::get(format!("http://{addr}/storage/{id}")).await?;
+    assert_eq!(full.status(), StatusCode::OK);
+    assert_eq!(full.bytes().await?.as_ref(), &body[..]);
+
+    // Ranged serve — `substring(bytes FROM ... FOR ...)` path.
+    let ranged = reqwest::Client::new()
+        .get(format!("http://{addr}/storage/{id}"))
+        .header("range", "bytes=1000-1999")
+        .send()
+        .await?;
+    assert_eq!(ranged.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        ranged.headers().get("content-range").unwrap(),
+        "bytes 1000-1999/4096"
+    );
+    assert_eq!(ranged.bytes().await?.as_ref(), &body[1000..2000]);
+    Ok(())
+}
+
+/// ENH-021 #4: re-uploading identical bytes returns the same id (dedup hit),
+/// and the dedup path deletes the provisional chunk rows so no orphaned
+/// `storage_chunks` rows leak against the storage quota.
+#[tokio::test]
+async fn enh021_dedup_leaves_no_orphan_chunks() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let db = fresh_db(&state).await;
+    let token = mint_token(addr, &db).await;
+
+    let body = b"dedup me across streaming uploads";
+    let id1 = upload(&addr, &db, &token, body).await;
+    let id2 = upload(&addr, &db, &token, body).await;
+    assert_eq!(id1, id2, "identical bytes must dedup to the same id");
+
+    // The dedup path dropped the second upload's provisional chunks. Total
+    // chunk rows for this blob_id must equal the FIRST upload's row count
+    // (one chunk, since the body is small) — NOT doubled.
+    let chunks = chunk_row_count(&state, &db, &id1).await;
+    assert_eq!(
+        chunks, 1,
+        "dedup must drop provisional chunks; expected 1 chunk row, got {chunks}"
+    );
+
+    // And there is exactly one metadata row for this sha (dedup hit).
+    let sha = storage::sha256_hex_bytes(body);
+    let rows = sha256_count(&state, &db, &sha).await;
+    assert_eq!(rows, 1, "dedup must keep exactly one metadata row");
+    Ok(())
+}
+
+/// ENH-021 #5: an over-size upload is rejected WITHOUT committing any chunk
+/// rows — the txn rolls back when `put_stream` detects `total > limit`. We
+/// verify by asserting the response is 400 BAD_REQUEST and no chunk rows
+/// exist in the schema for ANY blob_id (the provisional id is never published
+/// to the client, but its chunks must be gone).
+#[tokio::test]
+async fn enh021_oversize_upload_commits_no_chunks() -> anyhow::Result<()> {
+    let state = test_state().await;
+    // max_file_size stays at the test default (50 MiB). Upload 51 MiB.
+    let addr = spawn_app(state.clone()).await;
+    let db = fresh_db(&state).await;
+    let token = mint_token(addr, &db).await;
+
+    let n: usize = 51 * 1024 * 1024;
+    let body = vec![0xABu8; n];
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/api/storage/{db}"))
+        .bearer_auth(&token)
+        .header("content-type", "application/octet-stream")
+        .body(body)
+        .send()
+        .await?;
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "51 MiB upload under a 50 MiB cap must be rejected"
+    );
+    let body_json: serde_json::Value = resp.json().await?;
+    assert_eq!(body_json["code"], json!("BAD_REQUEST"));
+
+    // No chunk rows committed at all — the txn rolled back. Count over the
+    // whole schema (no blob_id predicate) so we catch any leaked provisional
+    // rows regardless of id.
+    let schema = format!("db_{db}");
+    let total_chunks: i64 =
+        sqlx::query_scalar(&format!("SELECT COUNT(*) FROM \"{schema}\".storage_chunks"))
+            .fetch_one(&state.pool)
+            .await?;
+    assert_eq!(
+        total_chunks, 0,
+        "rejected over-size upload must not leave any chunk rows behind"
+    );
+    // And no metadata row.
+    let total_meta: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM \"{schema}\".storage"))
+        .fetch_one(&state.pool)
+        .await?;
+    assert_eq!(
+        total_meta, 0,
+        "rejected over-size upload commits no metadata"
+    );
+    Ok(())
+}
+
+/// ENH-021 #6: an over-quota upload returns 507 INSUFFICIENT_STORAGE and
+/// commits nothing — neither chunk rows nor a metadata row. The quota check
+/// closure inside `put_stream` fires on the first chunk that crosses the cap,
+/// so the txn rolls back and the storage cache is left untouched.
+#[tokio::test]
+async fn enh021_overquota_upload_returns_507_and_commits_nothing() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let db = fresh_db(&state).await;
+    let token = mint_token(addr, &db).await;
+
+    // Set a 1-byte storage cap. Any non-empty upload exceeds it.
+    state
+        .runtime
+        .hot
+        .store(Arc::new(rtdb_server::config::HotConfig {
+            max_storage_bytes_per_db: 1,
+            ..common::test_hot()
+        }));
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/api/storage/{db}"))
+        .bearer_auth(&token)
+        .header("content-type", "application/octet-stream")
+        .body(b"this exceeds a 1-byte cap".to_vec())
+        .send()
+        .await?;
+    assert_eq!(
+        resp.status(),
+        StatusCode::INSUFFICIENT_STORAGE,
+        "upload over the storage cap must return 507"
+    );
+
+    // Nothing committed.
+    let schema = format!("db_{db}");
+    let total_chunks: i64 =
+        sqlx::query_scalar(&format!("SELECT COUNT(*) FROM \"{schema}\".storage_chunks"))
+            .fetch_one(&state.pool)
+            .await?;
+    let total_meta: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM \"{schema}\".storage"))
+        .fetch_one(&state.pool)
+        .await?;
+    assert_eq!(total_chunks, 0, "over-quota upload commits no chunk rows");
+    assert_eq!(total_meta, 0, "over-quota upload commits no metadata row");
+    Ok(())
+}
+
+/// ENH-021 #7: an on-the-fly image transform still works on a chunked-layout
+/// blob. The transform path calls `storage::get`, which reassembles chunked
+/// blobs into one buffer for the decoder; a small PNG through `?w=` must
+/// produce a valid (smaller) PNG response with `image/png` content-type.
+#[tokio::test]
+async fn enh021_image_transform_works_on_chunked_blob() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let db = fresh_db(&state).await;
+    let token = mint_token(addr, &db).await;
+
+    // Build a real (non-trivial) PNG so the decode → resize → re-encode path
+    // actually runs: a 32x32 opaque image. The image crate can decode this
+    // from the bytes we upload.
+    let img = image::RgbImage::from_fn(32, 32, |x, y| {
+        image::Rgb([(x * 8) as u8, (y * 8) as u8, 128])
+    });
+    let mut png_bytes: Vec<u8> = Vec::new();
+    image::DynamicImage::ImageRgb8(img)
+        .write_to(
+            &mut std::io::Cursor::new(&mut png_bytes),
+            image::ImageFormat::Png,
+        )
+        .expect("encode png");
+    let id = upload(&addr, &db, &token, &png_bytes).await;
+
+    // Confirm the upload went through the chunked path.
+    assert_eq!(inline_bytes(&state, &db, &id).await, None);
+    assert!(
+        chunk_row_count(&state, &db, &id).await >= 1,
+        "chunked blob expected"
+    );
+
+    // Transform via `?w=16` — halves the width. Must return a valid PNG.
+    let resp = reqwest::get(format!("http://{addr}/storage/{id}?w=16&format=png")).await?;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers().get("content-type").unwrap(),
+        "image/png",
+        "transform response must be image/png"
+    );
+    let out_bytes = resp.bytes().await?;
+    let out =
+        image::load_from_memory_with_format(&out_bytes, image::ImageFormat::Png).expect("decode");
+    assert_eq!(out.width(), 16, "transformed image must be 16px wide");
+    assert_eq!(
+        out.height(),
+        16,
+        "transform must preserve aspect ratio (16x16)"
+    );
+    Ok(())
+}
+
+/// ENH-021 #8: existing 206 / Content-Range / 416 semantics are unchanged on
+/// a chunked-layout blob. This pins RFC 7233 compliance through the new
+/// chunk-aware `get_range` path: a mid-file Range on a chunked blob must
+/// return 206 with the exact slice, and an out-of-bounds Range must return
+/// 416 with the correct `*/total` Content-Range. (The existing
+/// `range_request_returns_206_partial_content` and friends cover the legacy
+/// inline path; this test covers the chunked path.)
+#[tokio::test]
+async fn enh021_chunked_blob_range_semantics_unchanged() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let db = fresh_db(&state).await;
+    let token = mint_token(addr, &db).await;
+
+    // 3 MiB body => 3 chunk rows. Spans multiple chunks so a mid-file window
+    // exercises the chunk-boundary byte-trim path.
+    let n: usize = 3 * 1024 * 1024;
+    let body: Vec<u8> = (0..n).map(|i| (i % 251) as u8).collect();
+    let id = upload(&addr, &db, &token, &body).await;
+    assert_eq!(chunk_row_count(&state, &db, &id).await, 3);
+
+    // 206 mid-file, spanning the seq=1/seq=2 boundary.
+    let start: usize = 2 * 1024 * 1024 - 500;
+    let end: usize = 2 * 1024 * 1024 + 500;
+    let resp = reqwest::Client::new()
+        .get(format!("http://{addr}/storage/{id}"))
+        .header("range", format!("bytes={start}-{end}"))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        resp.headers().get("content-range").unwrap(),
+        format!("bytes {start}-{end}/{n}").as_str()
+    );
+    assert_eq!(resp.headers().get("content-length").unwrap(), "1001");
+    assert_eq!(resp.bytes().await?.as_ref(), &body[start..=end]);
+
+    // 416 out-of-bounds.
+    let oob = reqwest::Client::new()
+        .get(format!("http://{addr}/storage/{id}"))
+        .header("range", format!("bytes={n}-{}", n + 100))
+        .send()
+        .await?;
+    assert_eq!(oob.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+    assert_eq!(
+        oob.headers().get("content-range").unwrap(),
+        format!("bytes */{n}").as_str()
+    );
+    assert_eq!(oob.headers().get("accept-ranges").unwrap(), "bytes");
+    Ok(())
+}

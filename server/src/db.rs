@@ -450,7 +450,7 @@ pub async fn create_database(pool: &PgPool, name: &str) -> Result<(), RtDbError>
             sha256       text NOT NULL,
             size         bigint NOT NULL,
             content_type text,
-            bytes        bytea NOT NULL,
+            bytes        bytea,
             created_at   bigint NOT NULL,
             owner_id     text
         )"
@@ -462,6 +462,22 @@ pub async fn create_database(pool: &PgPool, name: &str) -> Result<(), RtDbError>
     sqlx::query(&format!(
         "CREATE UNIQUE INDEX \"{schema_name}_storage_sha256_idx\"
          ON \"{schema_name}\".storage (sha256)"
+    ))
+    .execute(&mut *tx)
+    .await?;
+    // ENH-021: chunked storage. The streaming upload path writes 1 MiB chunk
+    // rows under a provisional id, computes the sha256 as bytes arrive, then
+    // promotes or dedups. The legacy `bytes` column is now nullable because a
+    // chunked upload keeps its bytes here and leaves the inline column NULL.
+    // `ensure_table` retrofits both changes (DROP NOT NULL + CREATE TABLE IF
+    // NOT EXISTS) onto databases created before this shipped.
+    sqlx::query(&format!(
+        "CREATE TABLE \"{schema_name}\".storage_chunks (
+            blob_id text NOT NULL,
+            seq     int  NOT NULL,
+            bytes   bytea NOT NULL,
+            PRIMARY KEY (blob_id, seq)
+        )"
     ))
     .execute(&mut *tx)
     .await?;

@@ -452,6 +452,9 @@ impl RtDbHttpClient {
 
     /// Upload raw bytes; `content_type` sets the Content-Type header and is
     /// stored as the file's type. Returns the server-computed metadata.
+    ///
+    /// For large files prefer [`Self::upload_stream`], which streams the body
+    /// through reqwest instead of buffering it whole in memory.
     pub async fn upload(
         &self,
         bytes: &[u8],
@@ -462,6 +465,41 @@ impl RtDbHttpClient {
             .post(format!("{}/api/storage/{}", self.url, self.db))
             .bearer_auth(&self.token)
             .body(bytes.to_vec());
+        if let Some(ct) = content_type {
+            req = req.header(reqwest::header::CONTENT_TYPE, ct);
+        }
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| RtDbError::internal(format!("upload request failed: {e}")))?;
+        self.deserialize::<UploadResult>(resp).await
+    }
+
+    /// Upload a streaming body without buffering it whole in memory. The server
+    /// (ENH-021) streams the request through to storage, so a file of any size
+    /// only occupies one chunk in flight at a time.
+    ///
+    /// `stream` is any `TryStream` whose `Ok` item converts into `bytes::Bytes`
+    /// (e.g. `Bytes`, `Vec<u8>`, `&'static [u8]`); chunks are forwarded to
+    /// reqwest's streaming body as they arrive. Pass `content_type` to set the
+    /// Content-Type header and the file's stored type, exactly like
+    /// [`Self::upload`].
+    pub async fn upload_stream<S>(
+        &self,
+        stream: S,
+        content_type: Option<&str>,
+    ) -> Result<UploadResult, RtDbError>
+    where
+        S: futures_util::stream::TryStream + Send + 'static,
+        bytes::Bytes: From<S::Ok>,
+        S::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
+        let body = reqwest::Body::wrap_stream(stream);
+        let mut req = self
+            .client
+            .post(format!("{}/api/storage/{}", self.url, self.db))
+            .bearer_auth(&self.token)
+            .body(body);
         if let Some(ct) = content_type {
             req = req.header(reqwest::header::CONTENT_TYPE, ct);
         }
@@ -1615,6 +1653,40 @@ mod tests {
             .unwrap();
         assert_eq!(up.id, "f1");
         assert_eq!(up.size, 9);
+        assert_eq!(up.content_type.as_deref(), Some("image/png"));
+    }
+
+    // ENH-021 mirror: `upload_stream` posts the concatenated chunk bytes as the
+    // raw request body (same wire contract as `upload`) without buffering the
+    // whole file in memory. Two chunks exercise the multi-item path; wiremock
+    // concatenates them into the body the matcher sees, and the byte-for-byte
+    // match proves the streaming path lands on the identical route / headers /
+    // body the server expects.
+    #[tokio::test]
+    async fn upload_stream_posts_chunked_body_and_returns_metadata() {
+        use bytes::Bytes;
+        use futures_util::stream;
+        let (server, client) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/api/storage/t%3Cuuid%3E"))
+            .and(header("authorization", "Bearer machine-token"))
+            .and(header("content-type", "image/png"))
+            .and(body_bytes("chunked-bytes"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "s1", "sha256": "def", "size": 13, "contentType": "image/png"
+            })))
+            .mount(&server)
+            .await;
+        let chunks: Vec<Result<Bytes, std::io::Error>> = vec![
+            Ok(Bytes::from_static(b"chunked-")),
+            Ok(Bytes::from_static(b"bytes")),
+        ];
+        let up = client
+            .upload_stream(stream::iter(chunks), Some("image/png"))
+            .await
+            .unwrap();
+        assert_eq!(up.id, "s1");
+        assert_eq!(up.size, 13);
         assert_eq!(up.content_type.as_deref(), Some("image/png"));
     }
 
