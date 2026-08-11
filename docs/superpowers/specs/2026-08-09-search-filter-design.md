@@ -42,8 +42,10 @@ The change is small because every ingredient already exists:
   eq on an indexed field is already an indexed lookup. One filter mechanism covers
   both Convex modes.
 - **Upgrading vector search's eq-only `filter` to the full `FilterExpr`.** Vector
-  search scoped its filter to eq-only deliberately (#17 non-goal); aligning it is a
-  separate, optional follow-up recorded here, not part of this feature.
+  search scoped its filter to eq-only deliberately (#17 non-goal) and was tracked
+  as a separate follow-up. That follow-up shipped same-day as commit `613c7a6`
+  (`feat(vector): upgrade vectorSearch filter to full FilterExpr (#17 follow-up)`),
+  so `vectorSearch` now composes with the full `FilterExpr` just like `search`.
 - **Composition with `order` / a `take` beyond the terminal's own limit.** Search
   keeps `ts_rank` ordering and its `take` → `LIMIT`; `filter` only narrows the
   `WHERE`.

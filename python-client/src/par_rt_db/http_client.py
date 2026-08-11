@@ -8,8 +8,9 @@ The sync HTTP surface — the python port of ``rust-client/src/http.rs``'s
 request bodies, and response shapes are identical to the rust-client; only the
 method names are snake_cased to match Python convention.
 
-The reactive WebSocket client (``/sync``) is a separate async surface and lands
-in a follow-on plan — this module is sync-only and depends only on ``httpx``.
+The reactive WebSocket client (``/sync``) ships as ``par_rt_db.ws_client``
+(``pip install par-rt-db[ws]``); this module is sync-only and depends only on
+``httpx``.
 
 ``httpx`` is an optional dependency (``pip install par-rt-db[http]``); it is
 imported lazily inside ``RtDbHttpClient.__init__`` so that importing this module

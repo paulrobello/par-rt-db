@@ -48,7 +48,7 @@ make dev-db-up
 make ts-client-install
 make dashboard-install
 make python-client-install
-# Cargo workspaces (server/, rust-client/) have no install step — cargo fetches on first build.
+# Cargo workspaces (server/, rust-client/, cli/) have no install step — cargo fetches on first build.
 
 # 3. Configure the minimum environment the server needs to run.
 export RTDB_DATABASE_URL='postgres://rtdb:rtdb@127.0.0.1:55434/rtdb'
@@ -57,6 +57,8 @@ export RTDB_PUBLIC_URL='http://localhost:8300'
 
 # 4. Build everything once to populate ts-client/dist (the dashboard links it).
 make build
+# Optional: build the `rtdb` CLI binary (also built by `make build` / `make checkall`).
+make rtdb-cli
 
 # 5. Run the full gate.
 make checkall
@@ -100,6 +102,7 @@ cd ts-client && bunx vitest run                 # ts-client tests
 cd rust-client && cargo test --all-features     # rust-client tests
 cd dashboard && bun run test                    # dashboard tests (vitest, 18 files)
 cd python-client && uv run pytest -q            # python-client tests
+cd cli && cargo test                            # cli tests (rtdb binary)
 
 # Single test:
 cargo test --test txn_test upsert_multiple_matches   # one integration binary, by name
@@ -200,6 +203,11 @@ Common contributor symptoms:
   commit with a longer timeout (e.g. 600000 ms) rather than re-running it
   unchanged; the staged changes are intact and recoverable. Do not
   `--no-verify` past it — run `make checkall` and fix the underlying warning.
+- **Dev Postgres accumulates leaked test schemas (`db_t<uuid-v7>`).** Tests
+  create uniquely-named databases per test for fast isolation and don't drop
+  them afterward. Over time these bloat `pg_dump` and slow the dev DB. Run
+  `make dev-db-clean` periodically to drop them (the cleanup is scoped to the
+  `db_t*` pattern and never touches `rtdb`/`rtdb_auth`/real databases).
 
 ## Invariants you must preserve
 
@@ -218,9 +226,9 @@ failing test.
   `ts-client/src/protocol.ts`, `rust-client/src/wire.rs`, and
   `python-client/src/par_rt_db/wire.py` are four implementations of the same
   protocol. The casing is deliberately non-uniform and load-bearing. Any
-  server change must be mirrored in **all three** clients — wire types, DSL
-  builders, and their tests. If a client doesn't yet cover a changed surface,
-  file the gap explicitly in `FEATURE_MATRIX.md` rather than letting it drift.
+  server change must be mirrored in **all four** — wire types, DSL builders,
+  and their tests. If a client doesn't yet cover a changed surface, file the
+  gap explicitly in `FEATURE_MATRIX.md` rather than letting it drift.
 - **Errors** — every failure is the `RtDbError` envelope `{code, message}`
   (codes/statuses in `error.rs`). Client-facing 500s carry a **generic**
   message — never stringify a sqlx/serde error into the body (log it via
@@ -250,7 +258,7 @@ failing test.
 When a feature lands or changes, update in the same PR:
 
 - [`FEATURE_MATRIX.md`](FEATURE_MATRIX.md) — flip rows ❌→✅, note client-mirror status, bump counts.
-- The relevant README(s) (`README.md`, `server/README.md`, `ts-client/README.md`, `rust-client/README.md`, `python-client/README.md`, `dashboard/README.md`, `deploy/README.md`).
+- The relevant README(s) (`README.md`, `server/README.md`, `ts-client/README.md`, `rust-client/README.md`, `python-client/README.md`, `dashboard/README.md`, `cli/README.md`, `deploy/README.md`).
 - [`CHANGELOG.md`](CHANGELOG.md) — add an entry under `[Unreleased]`.
 - [`docs/DOCUMENTATION_STYLE_GUIDE.md`](docs/DOCUMENTATION_STYLE_GUIDE.md) — the canonical style guide for all par-rt-db documentation (formatting, headings, tone, code-block conventions). Follow it for any documentation change.
 - Any skill that documents par-rt-db's surface.

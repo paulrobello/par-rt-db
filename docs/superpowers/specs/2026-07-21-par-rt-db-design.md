@@ -53,7 +53,7 @@ the follow-on specs indexed in `docs/superpowers/SPEC_STATUS.md`:
 - `.first()` → FEATURE_MATRIX #2 · `.replace()` → FEATURE_MATRIX #6
 - text search → FEATURE_MATRIX #11 · vector search → FEATURE_MATRIX #17 (spec `2026-07-23-vector-search-design.md`)
 - per-row authorization → FEATURE_MATRIX #20 (spec `2026-07-24-per-row-authorization-design.md`)
-- optimistic updates → FEATURE_MATRIX #12 (TS-only; Rust/Python pending)
+- optimistic updates → FEATURE_MATRIX #12 (shipped in all three client SDKs: ts-client + rust-client + python-client)
 - actions → 🚫 deliberate non-goal (no embedded JS runtime, no per-app server code; see FEATURE_MATRIX §3)
 
 Expected scale: low thousands of rows per database, a handful of concurrent

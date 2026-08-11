@@ -2,7 +2,7 @@ name: CI
 
 # ARC-003: gate every change. `make checkall` is the single source of truth for
 # the project's definition-of-done (fmt-check + clippy -D warnings + typecheck +
-# tests across server, ts-client, rust-client, python-client, dashboard).
+# tests across server, ts-client, rust-client, python-client, dashboard, cli).
 on:
   push:
   pull_request:

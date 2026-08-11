@@ -194,13 +194,16 @@ value (default 60).
 
 1. Read the cached `StorageUsage` for the db.
 2. **Fresh** (`now − computed_at_ms < ttl`) → enforce against `bytes`.
-3. **Stale or absent** → run the live query synchronously (sub-ms, at most once
-   per TTL window per db — negligible cost inside the serialized turn), update
-   the cache, enforce.
+3. **Stale or absent** → enforce against the stale reading anyway (ARC-004). The
+   serialized committer turn never runs `pg_total_relation_size` — it uses
+   whatever the cache holds (fresh *or* stale), so a writes path never blocks on
+   a relation-size scan. The only inline measure is a one-time cold-start
+   recomputation before the cache is seeded; thereafter a per-db background
+   warmer task (`run_quota_warmer`, fire-and-forget, self-terminating on db
+   removal) plus a best-effort `tokio::spawn` post-commit/`storage::put` refresh
+   keep the reading current. The warmer skips its tick entirely when no storage
+   cap is configured (default off).
 4. `bytes >= cap` → reject `QuotaExceeded` / HTTP **507**.
-5. **Post-commit best-effort refresh** — spawn a recompute for that db
-   (fire-and-forget, mirroring the audit/webhook tap pattern; never blocks the
-   client) so the next write sees a near-current value.
 
 The cache means a db can briefly overshoot its cap by the writes that land
 within one TTL window (≈ a few MB at 60 s). This is acceptable for fair
