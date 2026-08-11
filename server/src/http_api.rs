@@ -50,6 +50,23 @@ fn bearer_token(headers: &HeaderMap) -> Result<&str, RtDbError> {
         .ok_or_else(|| RtDbError::unauthorized("missing bearer token"))
 }
 
+/// The per-db auth prologue shared by the HTTP query/mutate/manage handlers:
+/// extract the bearer token, resolve it to a `Principal`, and authorize it for
+/// `db`. Returns the resolved principal so the caller can run per-row checks,
+/// rate-limit, or branch on `is_read_only()` — those stay at the call site
+/// because they vary per handler. ARC-115: collapses the 11 copy-pasted
+/// `bearer_token → resolve_bearer → authorize` triplets into one place.
+async fn authed(
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    db: &str,
+) -> Result<Principal, RtDbError> {
+    let token = bearer_token(headers)?;
+    let principal = resolve_bearer(&state.pool, token).await?;
+    authorize(&state.pool, &principal, db).await?;
+    Ok(principal)
+}
+
 /// Like `axum::Json`, but maps deserialization failures (unknown fields,
 /// unknown enum tags, malformed JSON) to the `RtDbError` wire envelope with
 /// `BadRequest` (400) instead of axum's default split between 400 and 422.
@@ -87,9 +104,7 @@ async fn query_handler(
     headers: HeaderMap,
     ApiJson(body): ApiJson<QueryRequest>,
 ) -> Result<Json<QueryResponse>, RtDbError> {
-    let token = bearer_token(&headers)?;
-    let principal = resolve_bearer(&state.pool, token).await?;
-    authorize(&state.pool, &principal, &body.db).await?;
+    let principal = authed(&state, &headers, &body.db).await?;
     check_http_rate_limits(&state, &principal, &body.db).await?;
 
     let schema = state.schemas.get(&state.pool, &body.db).await?;
@@ -163,9 +178,7 @@ async fn batch_query_handler(
             body.queries.len()
         )));
     }
-    let token = bearer_token(&headers)?;
-    let principal = resolve_bearer(&state.pool, token).await?;
-    authorize(&state.pool, &principal, &body.db).await?;
+    let principal = authed(&state, &headers, &body.db).await?;
     check_http_rate_limits(&state, &principal, &body.db).await?;
 
     let schema = state.schemas.get(&state.pool, &body.db).await?;
@@ -219,9 +232,7 @@ async fn mutate_handler(
     headers: HeaderMap,
     ApiJson(body): ApiJson<MutateRequest>,
 ) -> Result<Json<MutateResponse>, RtDbError> {
-    let token = bearer_token(&headers)?;
-    let principal = resolve_bearer(&state.pool, token).await?;
-    authorize(&state.pool, &principal, &body.db).await?;
+    let principal = authed(&state, &headers, &body.db).await?;
     if principal.is_read_only() {
         return Err(RtDbError::forbidden("read-only token cannot mutate"));
     }
@@ -266,9 +277,7 @@ async fn schedule_handler(
     headers: HeaderMap,
     ApiJson(body): ApiJson<ScheduleRequest>,
 ) -> Result<Json<ScheduleResponse>, RtDbError> {
-    let token = bearer_token(&headers)?;
-    let principal = resolve_bearer(&state.pool, token).await?;
-    authorize(&state.pool, &principal, &body.db).await?;
+    let principal = authed(&state, &headers, &body.db).await?;
     if principal.is_read_only() {
         return Err(RtDbError::forbidden("read-only token cannot mutate"));
     }
@@ -312,9 +321,7 @@ async fn run_manage_op(
     id: &str,
     op: ManageOp,
 ) -> Result<Json<ManageResponse>, RtDbError> {
-    let token = bearer_token(headers)?;
-    let principal = resolve_bearer(&state.pool, token).await?;
-    authorize(&state.pool, &principal, db).await?;
+    let principal = authed(state, headers, db).await?;
     if principal.is_read_only() {
         return Err(RtDbError::forbidden("read-only token cannot mutate"));
     }
@@ -370,9 +377,7 @@ async fn list_schedules_handler(
     headers: HeaderMap,
     ApiJson(body): ApiJson<ListRequest>,
 ) -> Result<Json<ListResponse>, RtDbError> {
-    let token = bearer_token(&headers)?;
-    let principal = resolve_bearer(&state.pool, token).await?;
-    authorize(&state.pool, &principal, &body.db).await?;
+    let principal = authed(&state, &headers, &body.db).await?;
     check_http_rate_limits(&state, &principal, &body.db).await?;
     let schedules = scheduler::list(&state.pool, &body.db).await?;
     Ok(Json(ListResponse { schedules }))
@@ -429,9 +434,7 @@ async fn upload_handler(
     Path(db): Path<String>,
     request: Request,
 ) -> Result<Json<UploadResponse>, RtDbError> {
-    let token = bearer_token(&headers)?;
-    let principal = resolve_bearer(&state.pool, token).await?;
-    authorize(&state.pool, &principal, &db).await?;
+    let principal = authed(&state, &headers, &db).await?;
     if principal.is_read_only() {
         return Err(RtDbError::forbidden("read-only token cannot mutate"));
     }
@@ -538,9 +541,7 @@ async fn signed_url_handler(
     Path((db, id)): Path<(String, String)>,
     AxumQuery(q): AxumQuery<HashMap<String, String>>,
 ) -> Result<Json<SignedUrlResponse>, RtDbError> {
-    let token = bearer_token(&headers)?;
-    let principal = resolve_bearer(&state.pool, token).await?;
-    authorize(&state.pool, &principal, &db).await?;
+    let principal = authed(&state, &headers, &db).await?;
     check_http_rate_limits(&state, &principal, &db).await?;
     // SEC-113: resolve the owning db and reject cross-db. A caller authorized
     // for db A must not be able to mint a URL for an id that lives in db B,
@@ -689,9 +690,7 @@ async fn serve_authed_handler(
     Path((db, id)): Path<(String, String)>,
     AxumQuery(q): AxumQuery<HashMap<String, String>>,
 ) -> Result<Response, RtDbError> {
-    let token = bearer_token(&headers)?;
-    let principal = resolve_bearer(&state.pool, token).await?;
-    authorize(&state.pool, &principal, &db).await?;
+    let principal = authed(&state, &headers, &db).await?;
     check_http_rate_limits(&state, &principal, &db).await?;
     // SEC-118: per-row owner check. Unknown id → 404 (matches today's
     // `serve_bytes` behavior for a missing blob).
@@ -1253,9 +1252,7 @@ async fn delete_handler(
     headers: HeaderMap,
     Path((db, id)): Path<(String, String)>,
 ) -> Result<Json<OkResponse>, RtDbError> {
-    let token = bearer_token(&headers)?;
-    let principal = resolve_bearer(&state.pool, token).await?;
-    authorize(&state.pool, &principal, &db).await?;
+    let principal = authed(&state, &headers, &db).await?;
     if principal.is_read_only() {
         return Err(RtDbError::forbidden("read-only token cannot mutate"));
     }
@@ -1280,9 +1277,7 @@ async fn metadata_handler(
     headers: HeaderMap,
     Path((db, id)): Path<(String, String)>,
 ) -> Result<Json<storage::FileMeta>, RtDbError> {
-    let token = bearer_token(&headers)?;
-    let principal = resolve_bearer(&state.pool, token).await?;
-    authorize(&state.pool, &principal, &db).await?;
+    let principal = authed(&state, &headers, &db).await?;
     check_http_rate_limits(&state, &principal, &db).await?;
     let meta = storage::get_meta(&state.pool, &db, &id)
         .await?
