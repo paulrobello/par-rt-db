@@ -57,3 +57,7 @@ required-features = ["admin"]
 [[test]]
 name = "ws_integration"
 required-features = ["ws", "http"]
+
+[[test]]
+name = "http_integration"
+required-features = ["admin", "http"]
