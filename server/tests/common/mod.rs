@@ -40,6 +40,9 @@ pub fn test_config() -> Config {
         static_dir: None,
         pool_max_connections: 75,
         schema_cache_max_entries: 1024,
+        slow_query_ms: 0,
+        slow_query_capacity: 200,
+        slow_query_log_params: false,
         rate_limit_per_token_rpm: 0,
         rate_limit_per_db_rpm: 0,
         audit_log_enabled: false,
@@ -141,6 +144,23 @@ pub async fn test_state_with_audit() -> Arc<AppState> {
     db::ensure_audit_table(&pool)
         .await
         .expect("ensure rtdb.audit_log");
+    AppState::new(pool, config, test_hot())
+}
+
+/// Like `test_state` but with the slow-query log enabled: `slow_query_ms` set
+/// to `ms` (so a query slower than that lands in the log) and
+/// `slow_query_log_params` set to `log_params`. Used by
+/// `tests/query_introspect_test.rs` to exercise the slow-query log end-to-end
+/// without touching env vars. Mirrors the `test_state_with_*` pattern.
+#[allow(dead_code)]
+pub async fn test_state_with_slow_queries(ms: u64, log_params: bool) -> Arc<AppState> {
+    let mut config = test_config();
+    config.slow_query_ms = ms;
+    config.slow_query_log_params = log_params;
+    let pool = sqlx::PgPool::connect(&config.database_url)
+        .await
+        .expect("connect to test postgres");
+    db::bootstrap(&pool).await.expect("bootstrap rtdb_auth");
     AppState::new(pool, config, test_hot())
 }
 

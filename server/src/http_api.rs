@@ -22,12 +22,13 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
 use crate::AppState;
-use crate::auth::{Principal, authorize, resolve_bearer};
+use crate::auth::{Principal, PrincipalCtx, authorize, resolve_bearer};
 use crate::db::now_ms;
 use crate::error::RtDbError;
 use crate::image_transform::{Resolved, TransformParams};
+use crate::metrics::SlowQueryRecord;
 use crate::protocol::{ScheduleInfo, ScheduleWhen};
-use crate::query::{Query, QueryResult, execute_query};
+use crate::query::{Query, QueryResult, compile_query, execute_query};
 use crate::rate_limit::{check_http_rate_limits, check_storage_public_rate_limit};
 use crate::scheduler;
 use crate::signed_url;
@@ -109,13 +110,21 @@ async fn query_handler(
 
     let schema = state.schemas.get(&state.pool, &body.db).await?;
     let principal_ctx = principal.row_ctx();
-    let t = Instant::now();
+    let started = Instant::now();
+    let started_at_ms = now_ms();
     let result = execute_query(&state.pool, &body.db, &schema, &body.query, &principal_ctx).await?;
-    state
-        .runtime
-        .metrics
-        .record_query_duration(t.elapsed().as_micros() as u64);
+    let elapsed_us = started.elapsed().as_micros() as u64;
+    state.runtime.metrics.record_query_duration(elapsed_us);
     state.runtime.metrics.record_query();
+    record_slow_query_if_threshold(
+        &state,
+        &body.db,
+        &body.query,
+        &schema,
+        &principal_ctx,
+        started_at_ms,
+        elapsed_us,
+    );
     Ok(Json(QueryResponse { result }))
 }
 
@@ -187,15 +196,23 @@ async fn batch_query_handler(
     for query in &body.queries {
         // Per-query timing: each successful execute_query feeds
         // query_latency individually (mirrors the per-query counter bump).
-        let t = Instant::now();
+        let started = Instant::now();
+        let started_at_ms = now_ms();
         let outcome =
             match execute_query(&state.pool, &body.db, &schema, query, &principal_ctx).await {
                 Ok(result) => {
-                    state
-                        .runtime
-                        .metrics
-                        .record_query_duration(t.elapsed().as_micros() as u64);
+                    let elapsed_us = started.elapsed().as_micros() as u64;
+                    state.runtime.metrics.record_query_duration(elapsed_us);
                     state.runtime.metrics.record_query();
+                    record_slow_query_if_threshold(
+                        &state,
+                        &body.db,
+                        query,
+                        &schema,
+                        &principal_ctx,
+                        started_at_ms,
+                        elapsed_us,
+                    );
                     BatchQueryOutcome {
                         ok: true,
                         result: Some(result),
@@ -211,6 +228,67 @@ async fn batch_query_handler(
         results.push(outcome);
     }
     Ok(Json(BatchQueryResponse { results }))
+}
+
+/// Slow-query log hook (ENH-019). Called after every successful query in
+/// `query_handler` and each iteration of `batch_query_handler`. When the query
+/// exceeded `Config::slow_query_ms`, re-compiles via the same `compile_query`
+/// the `/explain` route uses (the SQL string IS the executed SQL — compile is
+/// pure/deterministic, so a second compile yields the same string), formats
+/// the bound parameters (only when `slow_query_log_params` is set, to keep
+/// document content out of the log by default), and pushes a [`SlowQueryRecord`]
+/// into the bounded ring buffer on [`Metrics`]. The threshold check runs first
+/// and short-circuits both the re-compile and the record construction when the
+/// log is off (`slow_query_ms == 0`) or the query was fast — the common case.
+fn record_slow_query_if_threshold(
+    state: &Arc<AppState>,
+    db: &str,
+    q: &Query,
+    schema: &crate::schema::SchemaDef,
+    principal_ctx: &PrincipalCtx,
+    started_at_ms: i64,
+    elapsed_us: u64,
+) {
+    let threshold_ms = state.config.slow_query_ms;
+    if threshold_ms == 0 {
+        return;
+    }
+    let elapsed_ms = elapsed_us / 1000;
+    if elapsed_ms < threshold_ms {
+        return;
+    }
+    // Re-compile the same query to capture the exact SQL + ordered binds the
+    // real execute path used. Pure and non-async — no pool, no I/O. A compile
+    // error here would be a bug (the execute just succeeded), so on the
+    // off-chance it happens we drop the slow-query record rather than the
+    // successful query result.
+    let Ok((cq, _warnings)) = compile_query(db, schema, q, principal_ctx) else {
+        return;
+    };
+    let params = if state.config.slow_query_log_params {
+        Some(
+            cq.binds
+                .iter()
+                .map(|bind| match bind {
+                    crate::txn::EqBind::Text(v) => v.clone(),
+                    crate::txn::EqBind::Num(v) => v.to_string(),
+                    crate::txn::EqBind::Bool(v) => v.to_string(),
+                    crate::txn::EqBind::I64(v) => v.to_string(),
+                })
+                .collect::<Vec<String>>(),
+        )
+    } else {
+        None
+    };
+    state.runtime.metrics.record_slow_query(SlowQueryRecord {
+        started_at_ms,
+        duration_ms: elapsed_ms,
+        db: db.to_string(),
+        table: q.table.clone(),
+        terminal: cq.terminal.to_string(),
+        sql: cq.sql,
+        params,
+    });
 }
 
 #[derive(Deserialize)]

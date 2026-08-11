@@ -493,6 +493,47 @@ impl RtDbAdminClient {
         self.json_result::<T>(resp).await
     }
 
+    /// `POST /admin/db/{db}/explain` `{query}` → `{sql, params, terminal,
+    /// warnings}` (ENH-019). Compiles a Query DSL body for inspection without
+    /// executing it; the returned `sql` is byte-identical to what the read
+    /// path would run. Mirrors server `admin::observability::explain_query`.
+    pub async fn explain_query(
+        &self,
+        db: &str,
+        query: &crate::query::Query,
+    ) -> Result<crate::wire::admin::ExplainResult, RtDbError> {
+        #[derive(Serialize)]
+        struct Body<'a> {
+            query: &'a crate::query::Query,
+        }
+        let resp = self
+            .post_json(&format!("/admin/db/{}/explain", db), &Body { query })
+            .await?;
+        self.deserialize(resp).await
+    }
+
+    /// `GET /admin/slow-queries?db=<optional>&limit=<n>` → the slow-query log
+    /// (ENH-019). Returns the bounded in-memory ring newest-first, optionally
+    /// filtered by database. Mirrors server
+    /// `admin::observability::list_slow_queries`. Pass `None` for both args
+    /// for the unfiltered instance-wide ring.
+    pub async fn get_slow_queries(
+        &self,
+        db: Option<&str>,
+        limit: Option<u32>,
+    ) -> Result<crate::wire::admin::SlowQueriesResponse, RtDbError> {
+        let db_s = db.map(|d| d.to_string());
+        let limit_s = limit.map(|n| n.to_string());
+        let mut q: Vec<(&str, &str)> = Vec::with_capacity(2);
+        if let Some(ref d) = db_s {
+            q.push(("db", d.as_str()));
+        }
+        if let Some(ref n) = limit_s {
+            q.push(("limit", n.as_str()));
+        }
+        self.get_json("/admin/slow-queries", &q).await
+    }
+
     /// `POST /admin/db/{db}/mutate` `{txn, idempotencyKey?}` → `{results}`.
     /// Owner-bypass: an admin writes documents across every database regardless
     /// of `ownerField`. Mirrors [`mutate`](Self::mutate) but routes through the
@@ -2835,5 +2876,109 @@ mod admin_tests {
         assert_eq!(anon.email, None);
         assert_eq!(anon.login, None);
         assert!(anon.anonymous);
+    }
+
+    // Explain + slow-query log (ENH-019). `explain_query` posts the Query DSL
+    // to `/admin/db/{db}/explain` (singular `db`, same as `admin_query`) and
+    // deserializes the `{sql, params, terminal, warnings}` shape. The slow-
+    // query log is a GET with optional `db`/`limit` query params.
+
+    #[tokio::test]
+    async fn explain_query_posts_to_admin_db_singular_path_and_deserializes() {
+        let (server, client) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/admin/db/kanban/explain"))
+            .and(header("authorization", BEARER))
+            .and(body_partial_json(json!({"query": {"table": "items"}})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "sql": "SELECT doc FROM kanban.items LIMIT 10",
+                "params": ["active", "50"],
+                "terminal": "collect",
+                "warnings": []
+            })))
+            .mount(&server)
+            .await;
+        let q = TableQuery::new("items").take(10);
+        let got = client.explain_query("kanban", &q).await.unwrap();
+        assert_eq!(got.sql, "SELECT doc FROM kanban.items LIMIT 10");
+        assert_eq!(got.params, vec!["active".to_string(), "50".to_string()]);
+        assert_eq!(got.terminal, "collect");
+        assert!(got.warnings.is_empty());
+        // `query` rides in the body, `db` rides in the path
+        let body: Value =
+            serde_json::from_slice(&server.received_requests().await.unwrap()[0].body).unwrap();
+        assert!(
+            body.get("query").is_some(),
+            "explain body must carry query: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_slow_queries_passes_db_and_limit_query_params() {
+        let (server, client) = setup().await;
+        Mock::given(method("GET"))
+            .and(path("/admin/slow-queries"))
+            .and(query_param("db", "kanban"))
+            .and(query_param("limit", "5"))
+            .and(header("authorization", BEARER))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "queries": [
+                    {
+                        "startedAtMs": 1700000000000_i64,
+                        "durationMs": 42,
+                        "db": "kanban",
+                        "table": "projects",
+                        "terminal": "collect",
+                        "sql": "SELECT doc FROM kanban.projects",
+                        "params": ["active"]
+                    }
+                ],
+                "thresholdMs": 25,
+                "capacity": 200
+            })))
+            .mount(&server)
+            .await;
+        let resp = client
+            .get_slow_queries(Some("kanban"), Some(5))
+            .await
+            .unwrap();
+        assert_eq!(resp.threshold_ms, 25);
+        assert_eq!(resp.capacity, 200);
+        assert_eq!(resp.queries.len(), 1);
+        let row = &resp.queries[0];
+        assert_eq!(row.started_at_ms, 1700000000000_i64);
+        assert_eq!(row.duration_ms, 42);
+        assert_eq!(row.db, "kanban");
+        assert_eq!(row.table, "projects");
+        assert_eq!(row.terminal, "collect");
+        assert_eq!(row.params.as_deref(), Some(&["active".to_string()][..]));
+    }
+
+    #[tokio::test]
+    async fn get_slow_queries_omits_params_when_redacted() {
+        let (server, client) = setup().await;
+        Mock::given(method("GET"))
+            .and(path("/admin/slow-queries"))
+            .and(header("authorization", BEARER))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "queries": [
+                    {
+                        "startedAtMs": 1_i64,
+                        "durationMs": 99,
+                        "db": "x",
+                        "table": "t",
+                        "terminal": "get",
+                        "sql": "SELECT 1"
+                    }
+                ],
+                "thresholdMs": 0,
+                "capacity": 100
+            })))
+            .mount(&server)
+            .await;
+        // No db/limit params → neither query param should appear.
+        let resp = client.get_slow_queries(None, None).await.unwrap();
+        assert_eq!(resp.queries.len(), 1);
+        assert_eq!(resp.queries[0].params, None);
     }
 }

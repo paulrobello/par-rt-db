@@ -398,6 +398,41 @@ class SubscriptionsResponse(_Wire):
     per_db: list[DbSubCounters]
 
 
+class ExplainResult(_Wire):
+    """``POST /admin/db/{db}/explain`` response — compiled SQL, params, terminal,
+    warnings. Mirrors ``server::query::ExplainResult``."""
+
+    sql: str
+    params: list[str]
+    terminal: str
+    warnings: list[str]
+
+
+class SlowQueryEntry(_Wire):
+    """One row of :class:`SlowQueriesResponse.queries` — a single slow-query
+    record from the bounded in-memory ring. Mirrors
+    ``server::query::SlowQueryEntry``. ``params`` is omitted on the wire when
+    redacted by the server (so it deserializes to ``None`` here)."""
+
+    started_at_ms: int
+    duration_ms: int
+    db: str
+    table: str
+    terminal: str
+    sql: str
+    params: list[str] | None = None
+
+
+class SlowQueriesResponse(_Wire):
+    """``GET /admin/slow-queries`` response — the bounded slow-query ring plus the
+    config echo (``RTDB_SLOW_QUERY_THRESHOLD_MS`` / ``RTDB_SLOW_QUERY_RING_CAP``).
+    Mirrors ``server::query::SlowQueriesResponse``."""
+
+    queries: list[SlowQueryEntry]
+    threshold_ms: int
+    capacity: int
+
+
 # ``StepResult`` is a ``Union`` alias (no ``model_validate``); route through a
 # single ``TypeAdapter`` for the untagged per-step result, mirroring mutation.py
 # and the data-plane HTTP clients.

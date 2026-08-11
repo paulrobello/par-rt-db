@@ -163,7 +163,7 @@ pub struct AppState {
 impl AppState {
     pub fn new(pool: sqlx::PgPool, config: Config, hot: HotConfig) -> Arc<Self> {
         let schemas = SchemaCache::with_capacity(config.schema_cache_max_entries);
-        let metrics = metrics::Metrics::new();
+        let metrics = metrics::Metrics::with_slow_query_capacity(config.slow_query_capacity);
         // The subscription manager records invalidation effectiveness on the
         // same `Metrics` the dashboard reads, and owns the skip-verification
         // sampler — so it is built after metrics and before the committers.

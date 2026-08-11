@@ -1,9 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
 import type {
   AuditEntry,
+  ExplainResult,
   HotConfig,
   HotConfigPatch,
   SessionInfo,
+  SlowQueriesResponse,
+  SlowQueryEntry,
   SubscriptionInfo,
   SubscriptionsResponse,
   Webhook,
@@ -1275,5 +1278,104 @@ describe("RtDbAdminClient cookie mode (ARC-106)", () => {
     const result = await admin.streamAdmin().next();
     expect(result.done).toBe(true);
     expect(captured).toBeUndefined();
+  });
+});
+
+describe("RtDbAdminClient explain + slow-queries (ENH-019)", () => {
+  it("explainQuery POSTs {query} to /admin/db/{db}/explain and returns the body", async () => {
+    const result: ExplainResult = {
+      sql: 'SELECT "doc" FROM "kanban"."items"',
+      params: [],
+      terminal: "collect",
+      warnings: ["unindexed-filter:status"],
+    };
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(result));
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+    const q = { json: { table: "items" } };
+    await expect(admin.explainQuery("kanban", q)).resolves.toEqual(result);
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("http://h:8300/admin/db/kanban/explain");
+    expect(init.method).toBe("POST");
+    expect(init.headers.Authorization).toBe("Bearer k");
+    expect(JSON.parse(init.body)).toEqual({ query: { table: "items" } });
+  });
+
+  it("explainQuery accepts a raw QueryJson (no .json wrapper)", async () => {
+    const result: ExplainResult = {
+      sql: "SELECT 1",
+      params: [],
+      terminal: "count",
+      warnings: [],
+    };
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(result));
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+    await admin.explainQuery("dbx", { table: "items" });
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({ query: { table: "items" } });
+  });
+
+  it("explainQuery URL-encodes the db name", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(jsonResponse({ sql: "", params: [], terminal: "get", warnings: [] }));
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+    await admin.explainQuery("my/db", { table: "t" });
+    expect(fetchMock.mock.calls[0][0]).toBe("http://h:8300/admin/db/my%2Fdb/explain");
+  });
+
+  it("getSlowQueries GETs /admin/slow-queries with db + limit and returns the body", async () => {
+    const entries: SlowQueryEntry[] = [
+      {
+        startedAtMs: 1700000000000,
+        durationMs: 42,
+        db: "kanban",
+        table: "projects",
+        terminal: "collect",
+        sql: "select ...",
+        // params omitted by default (redacted)
+      },
+    ];
+    const payload: SlowQueriesResponse = {
+      queries: entries,
+      thresholdMs: 25,
+      capacity: 200,
+    };
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(payload));
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+    await expect(admin.getSlowQueries({ db: "kanban", limit: 10 })).resolves.toEqual(payload);
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("http://h:8300/admin/slow-queries?db=kanban&limit=10");
+    expect(init.method).toBe("GET");
+    expect(init.headers.Authorization).toBe("Bearer k");
+  });
+
+  it("getSlowQueries omits the query string when no opts are provided", async () => {
+    const payload: SlowQueriesResponse = { queries: [], thresholdMs: 0, capacity: 200 };
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(payload));
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+    await expect(admin.getSlowQueries()).resolves.toEqual(payload);
+    expect(fetchMock.mock.calls[0][0]).toBe("http://h:8300/admin/slow-queries");
+  });
+
+  it("getSlowQueries surfaces params when the server includes them", async () => {
+    // When RTDB_SLOW_QUERY_LOG_PARAMS=true the server emits params as string[].
+    const payload: SlowQueriesResponse = {
+      queries: [
+        {
+          startedAtMs: 1,
+          durationMs: 2,
+          db: "x",
+          table: "t",
+          terminal: "collect",
+          sql: "select ...",
+          params: ["active"],
+        },
+      ],
+      thresholdMs: 0,
+      capacity: 200,
+    };
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(payload));
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+    const got = await admin.getSlowQueries();
+    expect(got.queries[0].params).toEqual(["active"]);
   });
 });

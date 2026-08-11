@@ -73,6 +73,97 @@ impl LatencySamples {
     }
 }
 
+/// One entry in the slow-query log (ENH-019). Recorded at the existing query
+/// timing call sites in `http_api.rs` when a query's wall-clock duration
+/// exceeds `Config::slow_query_ms`. `sql` is the exact compiled string the
+/// real query path executed (the same string `/explain` returns); `params`
+/// is included only when `Config::slow_query_log_params` is set, to avoid
+/// capturing document content by default. `terminal` is the wire terminal
+/// (`get`/`count`/`collect`/…) for at-a-glance grouping.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SlowQueryRecord {
+    /// When the query started, as epoch milliseconds. i64 to match
+    /// [`crate::db::now_ms`]; negative values are not expected for realistic
+    /// wall-clock time but the type matches the rest of the codebase.
+    pub started_at_ms: i64,
+    /// Wall-clock duration in milliseconds.
+    pub duration_ms: u64,
+    pub db: String,
+    pub table: String,
+    pub terminal: String,
+    pub sql: String,
+    /// Bound parameters, included only when `RTDB_SLOW_QUERY_LOG_PARAMS=true`.
+    /// `None` otherwise to keep document content out of the log by default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub params: Option<Vec<String>>,
+}
+
+/// Bounded ring buffer of recent slow-query records (ENH-019). `record`
+/// pushes while the buffer has room, then overwrites in insertion order once
+/// full (cap set at construction from `Config::slow_query_capacity`).
+/// `recent` clones the filled slice newest-first for the `/admin/slow-queries`
+/// handler. Held under a `std::sync::Mutex` inside [`Metrics`]; the clone runs
+/// under the lock because the typical capacity (200) is a few-KB copy and the
+/// alternative (clone-under-lock vs. iterate-under-lock) makes no measurable
+/// difference at that size.
+#[derive(Default)]
+pub struct SlowQueryLog {
+    buf: Vec<SlowQueryRecord>,
+    /// Write cursor — next slot to overwrite when `buf.len() == cap`.
+    next: usize,
+    /// Maximum records to retain; `0` disables logging entirely (records are
+    /// discarded at the call site when the cap is 0, so this struct only ever
+    /// sees a non-zero cap in practice).
+    cap: usize,
+}
+
+impl SlowQueryLog {
+    /// Construct a log with the given bounded capacity. `cap == 0` produces an
+    /// inert log (no allocation, no retention) — the caller is expected to
+    /// short-circuit recording when the cap is 0; we still defend here.
+    pub fn with_capacity(cap: usize) -> Self {
+        Self {
+            buf: Vec::with_capacity(cap),
+            next: 0,
+            cap,
+        }
+    }
+
+    fn record(&mut self, entry: SlowQueryRecord) {
+        if self.cap == 0 {
+            return;
+        }
+        if self.buf.len() < self.cap {
+            self.buf.push(entry);
+            self.next = self.buf.len() % self.cap;
+        } else {
+            self.buf[self.next] = entry;
+            self.next = (self.next + 1) % self.cap;
+        }
+    }
+
+    /// Newest-first snapshot of the retained records. Iteration order in the
+    /// ring is insertion order with wrap-around, so we walk from `next` (the
+    /// oldest live slot once full) backwards to produce newest-first.
+    fn recent(&self) -> Vec<SlowQueryRecord> {
+        if self.buf.is_empty() {
+            return Vec::new();
+        }
+        let n = self.buf.len();
+        let mut out = Vec::with_capacity(n);
+        // Once full, `next` points at the oldest entry; before full, index 0
+        // is the oldest and `next == n`. Walk oldest -> newest, then reverse
+        // for newest-first.
+        for i in 0..n {
+            let idx = (self.next + i) % n;
+            out.push(self.buf[idx].clone());
+        }
+        out.reverse();
+        out
+    }
+}
+
 /// Which `subs::ReadSet` class decided a fan-out skip. Only the classes that
 /// CAN skip are represented — `Table` always re-runs, so it has no skip
 /// counter (its work shows up in `subs_reruns_total`).
@@ -173,6 +264,13 @@ pub struct Metrics {
     query_latency: Mutex<LatencySamples>,
     mutate_latency: Mutex<LatencySamples>,
     subscribe_latency: Mutex<LatencySamples>,
+    // ---- Slow-query log (ENH-019) ----
+    /// Bounded ring buffer of recent slow-query records. Populated at the
+    /// HTTP query timing call sites when a query's wall-clock duration
+    /// exceeds `Config::slow_query_ms`. Default cap is 0 (off); a non-zero
+    /// `RTDB_SLOW_QUERY_CAPACITY` enables it. The buffer is constructed with
+    /// the configured capacity at [`Metrics::with_capacity`].
+    slow_queries: Mutex<SlowQueryLog>,
     // ---- Subscription invalidation (see `subs::fan_out`) ----
     // Counted per subscription whose table WAS written; subscriptions on
     // untouched tables are the trivial fast path and are not counted, so
@@ -216,6 +314,16 @@ pub struct Metrics {
 impl Metrics {
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
+    }
+
+    /// Construct with a non-default slow-query log capacity (ENH-019). Used by
+    /// `Runtime::new` to thread `Config::slow_query_capacity` through. A cap of
+    /// 0 leaves the log inert (records are short-circuited at the call site).
+    pub fn with_slow_query_capacity(slow_query_cap: usize) -> Arc<Self> {
+        Arc::new(Self {
+            slow_queries: Mutex::new(SlowQueryLog::with_capacity(slow_query_cap)),
+            ..Self::default()
+        })
     }
 
     pub fn record_query(&self) {
@@ -296,6 +404,27 @@ impl Metrics {
         if let Ok(mut s) = self.subscribe_latency.lock() {
             s.record(us);
         }
+    }
+
+    /// Append a slow-query record to the bounded log (ENH-019). Callers
+    /// (`http_api.rs`) short-circuit on `Config::slow_query_ms == 0` before
+    /// constructing the record; the buffer here also defends against a 0 cap.
+    /// The mutex is held only across the in-memory push (no I/O).
+    pub fn record_slow_query(&self, entry: SlowQueryRecord) {
+        if let Ok(mut log) = self.slow_queries.lock() {
+            log.record(entry);
+        }
+    }
+
+    /// Newest-first snapshot of the retained slow-query records. Empty when
+    /// slow-query logging is off (`RTDB_SLOW_QUERY_CAPACITY=0`) or no query
+    /// has crossed the threshold yet. The `GET /admin/slow-queries` handler
+    /// applies the `?limit=` truncation after this returns.
+    pub fn recent_slow_queries(&self) -> Vec<SlowQueryRecord> {
+        self.slow_queries
+            .lock()
+            .map(|log| log.recent())
+            .unwrap_or_default()
     }
 
     /// A subscription on a written table was re-run by `fan_out`. Records both

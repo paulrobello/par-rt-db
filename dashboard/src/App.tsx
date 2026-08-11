@@ -18,6 +18,7 @@ import { ScheduledJobsPage } from "./pages/ScheduledJobsPage";
 import { SchemaHistoryPage } from "./pages/SchemaHistoryPage";
 import { SchemaPage } from "./pages/SchemaPage";
 import { SessionsPage } from "./pages/SessionsPage";
+import { SlowQueriesPage } from "./pages/SlowQueriesPage";
 import { StoragePage } from "./pages/StoragePage";
 import { SubscriptionsPage } from "./pages/SubscriptionsPage";
 import { TokensPage } from "./pages/TokensPage";
@@ -58,6 +59,7 @@ function Root() {
             <Route path="scheduled" element={<ScheduledJobsPage />} />
             <Route path="storage" element={<StoragePage />} />
             <Route path="subscriptions" element={<SubscriptionsPage />} />
+            <Route path="slow-queries" element={<SlowQueriesPage />} />
             <Route path="tokens" element={<TokensPage />} />
             <Route path="sessions" element={<SessionsPage />} />
             <Route path="webhooks" element={<WebhooksPage />} />

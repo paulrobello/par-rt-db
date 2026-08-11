@@ -91,7 +91,7 @@ best-effort calls `POST /auth/logout`.
 ### The dashboard surfaces
 
 Top-level nav (left rail) plus the per-database pages reached by drilling into
-a database. Nineteen routes mirror the admin API surface:
+a database. Twenty routes mirror the admin API surface:
 
 | Surface | Path | What it does |
 | --- | --- | --- |
@@ -106,6 +106,7 @@ a database. Nineteen routes mirror the admin API surface:
 | **Scheduled jobs** | `/scheduled` | Lists scheduled/cron jobs across databases; cancel/pause/resume controls. |
 | **Storage** | `/storage` | Per-database blob browser; size, sha256, contentType, createdAt; delete/revoke. |
 | **Subscriptions** | `/subscriptions` | Live-query inspector — every active subscription across databases with its read-set class and skip/re-run counters. |
+| **Slow queries** | `/slow-queries` | Bounded ring of queries that exceeded `RTDB_SLOW_QUERY_MS` (time, db, table, terminal, duration; expand for SQL + params). An inline explain panel compiles a Query JSON DSL to its SQL plan + bind values + compile-time warnings (`POST /admin/db/{db}/explain`, `GET /admin/slow-queries`). |
 | **Sessions** | `/sessions` | Active interactive sessions (OAuth/anonymous/admin-key) across the instance — filter by `user`, revoke a single session or every session for a user (`GET/DELETE /admin/sessions`). `token_hash` is a non-reversible sha256 digest. |
 | **Tokens** | `/tokens` | Per-database machine tokens (mint with optional `expiresAt`/`readOnly`/`tables` scoping, revoke, list — no secrets returned). |
 | **Webhooks** | `/webhooks` | Per-database webhook CRUD + recent delivery attempts (outbox drain). Requires `RTDB_WEBHOOKS_ENABLED=true`. |

@@ -51,6 +51,36 @@ produces a trace with `committer.mutate` (`queue_wait_ms: 5` on a queued
 request) and child `txn.execute` + `subs.fan_out` spans; with the default
 off, zero traces are exported.
 
+### Query introspection: explain + slow-query log (ENH-019)
+
+Two admin endpoints that make the query layer observable without running a
+query: one compiles a plan, the other replays the recent past. Both are
+admin-only and server-side; the explain path returns no rows.
+
+- **`POST /admin/db/{db}/explain`** — re-compiles a Query JSON DSL through the
+  same `compile_query` the real query path uses, returning
+  `{sql, params, terminal, warnings}`: the exact parameterized SQL Postgres
+  would execute, bind values formatted as strings (numbers/booleans via
+  `Display`), the query terminal kind (`get`/`collect`/`count`/`unique`/`first`/
+  `distinct`/`aggregate`/`paginate`/`search`/`vectorSearch`/`hybridSearch`),
+  and compile-time warnings (currently unindexed-filter — a filter on a field
+  with no backing index, the most common cause of a slow `collect`).
+- **`GET /admin/slow-queries`** — bounded in-memory ring (`VecDeque`, no
+  Postgres) of queries whose wall-clock duration exceeded `RTDB_SLOW_QUERY_MS`.
+  Each entry carries `startedAtMs`, `durationMs`, `db`, `table`, `terminal`,
+  the exact `sql` string explain emits (so a slow row is reproducible via
+  EXPLAIN), and `params` only when `RTDB_SLOW_QUERY_LOG_PARAMS=true` — the
+  default `false` keeps document content out of the admin log until an
+  operator opts in. The response includes `thresholdMs` (0 when logging is
+  disabled) and `capacity`.
+- **Config**: `RTDB_SLOW_QUERY_MS` (default 0 = disabled), `RTDB_SLOW_QUERY_CAPACITY`
+  (default 200; the response never returns more than this many rows),
+  `RTDB_SLOW_QUERY_LOG_PARAMS` (default false).
+- **Clients**: `RtDbAdminClient.explainQuery(db, query)` /
+  `getSlowQueries(opts?: { db?, limit? })` in the ts-client; dashboard Slow
+  queries page wires both (the page's inline explain panel accepts a Query
+  JSON DSL and renders the returned SQL, bind values, terminal, and warnings).
+
 ### Audit remediation (2026-07-25)
 
 Comprehensive remediation of the 2026-07-25 project audit (55 findings; 46

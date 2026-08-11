@@ -171,6 +171,12 @@ services:
       # reloaded from Postgres. 0 = unbounded; default 1024 bounds a
       # multi-tenant instance that creates and drops databases over time.
       RTDB_SCHEMA_CACHE_MAX_ENTRIES: ${RTDB_SCHEMA_CACHE_MAX_ENTRIES:-1024}
+      # Slow-query log (ENH-019). 0 ms = disabled (default); non-zero lands any
+      # query over the threshold into the bounded ring at GET /admin/slow-queries.
+      # Defaults mirror the server's code defaults.
+      RTDB_SLOW_QUERY_MS: ${RTDB_SLOW_QUERY_MS:-0}
+      RTDB_SLOW_QUERY_CAPACITY: ${RTDB_SLOW_QUERY_CAPACITY:-200}
+      RTDB_SLOW_QUERY_LOG_PARAMS: ${RTDB_SLOW_QUERY_LOG_PARAMS:-false}
       # HTTP rate limiting (fixed-window, in-memory). 0 = unlimited (default).
       # Per-machine-token caps each token; per-db is shared across all principals
       # of one database. OAuth sessions carry no token id and are rate-limited

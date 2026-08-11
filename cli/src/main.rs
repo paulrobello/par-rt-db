@@ -103,6 +103,21 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Explain a Query's compiled SQL against `--db` without running it. (admin)
+    Explain {
+        /// Query JSON, e.g. `{"table":"items","take":10}`. Prefix with `@` to
+        /// read from a file (`@query.json`).
+        query: String,
+    },
+    /// List recent slow queries across the instance. (admin)
+    SlowQueries {
+        /// Filter to one database.
+        #[arg(long)]
+        db: Option<String>,
+        /// Cap the result count.
+        #[arg(long)]
+        limit: Option<u32>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -151,6 +166,8 @@ async fn dispatch(cli: &Cli) -> Result<()> {
         Command::Query { query } => run_query(cli, query).await,
         Command::Mutate { txn } => run_mutate(cli, txn).await,
         Command::Migrate { file, dry_run } => run_migrate(cli, file, *dry_run).await,
+        Command::Explain { query } => run_explain(cli, query).await,
+        Command::SlowQueries { db, limit } => run_slow_queries(cli, db, *limit).await,
     }
 }
 
@@ -282,6 +299,28 @@ async fn run_migrate(cli: &Cli, file: &PathBuf, dry_run_flag: bool) -> Result<()
     if !result.applied {
         eprintln!("dry-run only — nothing applied (re-run without --dry-run to apply)");
     }
+    Ok(())
+}
+
+async fn run_explain(cli: &Cli, query: &str) -> Result<()> {
+    let db = require_db(cli)?;
+    require_admin(cli)?;
+    let json = read_json_arg(query)?;
+    let q: Query = serde_json::from_str(&json).context("parsing Query JSON")?;
+    let c = admin_client(cli)?;
+    let result = c.explain_query(&db, &q).await.map_err(map_err)?;
+    println!("{}", serde_json::to_string_pretty(&result)?);
+    Ok(())
+}
+
+async fn run_slow_queries(cli: &Cli, db: &Option<String>, limit: Option<u32>) -> Result<()> {
+    require_admin(cli)?;
+    let c = admin_client(cli)?;
+    let result = c
+        .get_slow_queries(db.as_deref(), limit)
+        .await
+        .map_err(map_err)?;
+    println!("{}", serde_json::to_string_pretty(&result)?);
     Ok(())
 }
 

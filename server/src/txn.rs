@@ -317,7 +317,7 @@ pub struct TxnOutcome {
 /// binds compared here always originate from JSON (which cannot carry NaN),
 /// so `PartialEq` is sound for the membership test.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum EqBind {
+pub enum EqBind {
     Text(String),
     Num(f64),
     Bool(bool),

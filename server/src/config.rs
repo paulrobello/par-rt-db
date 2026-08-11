@@ -88,6 +88,17 @@ pub struct Config {
     // behavior); default 1024 covers multi-tenant instances that create and
     // drop databases over time without growing the map forever.
     pub schema_cache_max_entries: u64, // RTDB_SCHEMA_CACHE_MAX_ENTRIES, default 1024
+    // Slow-query log (ENH-019). `slow_query_ms` is the threshold that lands a
+    // query in the bounded log (0 = off, the default); `slow_query_capacity`
+    // bounds the in-memory ring buffer (default 200); `slow_query_log_params`
+    // controls whether bound parameter values are captured alongside the SQL
+    // (default false — keeps document content out of the log until an operator
+    // opts in). The log surfaces at `GET /admin/slow-queries` and the SQL
+    // string is the exact text the real query path executed (the same string
+    // `/explain` returns), so a slow entry is reproducible via `EXPLAIN`.
+    pub slow_query_ms: u64,          // RTDB_SLOW_QUERY_MS, default 0 (off)
+    pub slow_query_capacity: usize,  // RTDB_SLOW_QUERY_CAPACITY, default 200
+    pub slow_query_log_params: bool, // RTDB_SLOW_QUERY_LOG_PARAMS, default false
     // HTTP rate limiting (v1, fixed-window, in-memory): 0 = unlimited.
     // RTDB_RATE_LIMIT_PER_TOKEN_RPM caps each machine token; OAuth sessions
     // carry no token id and are rate-limited per-db only. Default 0 preserves
@@ -398,6 +409,13 @@ impl Config {
         let pool_max_connections = env_parsed("RTDB_POOL_MAX_CONNECTIONS", 75u32)?;
         // ARC-119: bound the per-process schema cache. 0 = unbounded.
         let schema_cache_max_entries = env_parsed("RTDB_SCHEMA_CACHE_MAX_ENTRIES", 1024u64)?;
+        // ENH-019: slow-query log threshold + capacity + params capture.
+        // 0 ms disables the log entirely (the call site short-circuits before
+        // re-compiling). Default capacity is 200 entries; default params-off
+        // keeps document content out of the admin log.
+        let slow_query_ms = env_parsed("RTDB_SLOW_QUERY_MS", 0u64)?;
+        let slow_query_capacity = env_parsed("RTDB_SLOW_QUERY_CAPACITY", 200usize)?;
+        let slow_query_log_params = env_bool("RTDB_SLOW_QUERY_LOG_PARAMS", false);
 
         let static_dir = std::env::var("RTDB_STATIC_DIR")
             .ok()
@@ -581,6 +599,9 @@ impl Config {
             static_dir,
             pool_max_connections,
             schema_cache_max_entries,
+            slow_query_ms,
+            slow_query_capacity,
+            slow_query_log_params,
             rate_limit_per_token_rpm,
             rate_limit_per_db_rpm,
             audit_log_enabled,

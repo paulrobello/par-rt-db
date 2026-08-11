@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use axum::Json;
 use axum::extract::ws::{WebSocket, WebSocketUpgrade};
-use axum::extract::{FromRequest, Query as QueryParams, Request, State};
+use axum::extract::{FromRequest, Path, Query as QueryParams, Request, State};
 use axum::http::HeaderMap;
 use axum::response::Response;
 use serde::{Deserialize, Serialize};
@@ -317,4 +317,136 @@ async fn send_stream_json(
     use axum::extract::ws::Message;
     let text = serde_json::to_string(value).unwrap_or_else(|_| "{}".into());
     socket.send(Message::Text(text.into())).await
+}
+
+/// Body for `POST /admin/db/{db}/explain`: a single Query DSL document
+/// against the named database, identical in shape to `POST /api/query`. The
+/// handler compiles it (no execution) and returns the SQL + ordered binds +
+/// any warnings the compile produced.
+#[derive(Deserialize)]
+pub(super) struct ExplainBody {
+    query: crate::query::Query,
+}
+
+/// One row of the `/explain` response. `binds` is the ordered list of typed
+/// parameters the executor would pass to Postgres in `$1..$n` order; `params`
+/// is the same list formatted as strings for at-a-glance reading (booleans as
+/// `"true"`/`"false"`, numbers via `Display`). `sql` is the exact string the
+/// real query path executes — never interpolated from `params`, never
+/// re-rendered from a different code path.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct ExplainResponse {
+    sql: String,
+    params: Vec<String>,
+    terminal: String,
+    warnings: Vec<String>,
+}
+
+/// `POST /admin/db/{db}/explain` — compile a Query DSL body for inspection
+/// (ENH-019). The route runs the SAME `compile_query` the read path uses, so
+/// the returned `sql` is byte-identical to what `POST /api/query` would
+/// execute against that database. `params` is the ordered bind list (the
+/// `$1..$n` values, formatted as strings — the wire does not carry typed
+/// binds because clients display this, they do not re-execute it). No Postgres
+/// round-trip — `compile_query` is pure. `warnings` surfaces compile-time
+/// concerns (today: a filter on a declared-but-unindexed field).
+///
+/// Errors surface as the standard `RtDbError` envelope: `Forbidden` when the
+/// caller is not an admin (the admin middleware rejects before we get here,
+/// but `compile_query` also runs `authorize_table`), `BadRequest` for an
+/// unknown table or peer-incompatible terminals, and `Internal` only for
+/// genuinely unreachable states (e.g. a `schema.table()` lookup that the
+/// schema-cache invariant says cannot miss).
+pub(super) async fn admin_explain(
+    State(state): State<Arc<AppState>>,
+    Path(db): Path<String>,
+    Json(body): Json<ExplainBody>,
+) -> Result<Json<ExplainResponse>, RtDbError> {
+    let schema = state.schemas.get(&state.pool, &db).await?;
+    // Admins bypass the per-db allowlist but `compile_query` still runs
+    // `authorize_table` (machine-token tables allowlist gate). An admin
+    // explaining a query against an allowlisted-only table that the admin
+    // context can't reach would surface as `Forbidden` here — the desired
+    // posture, since `/explain` is a read-style introspection route.
+    // Construct a bypass `PrincipalCtx` (admin path; no user id) so the
+    // compile sees the same row-auth posture the admin-mutate paths use.
+    let principal_ctx = crate::auth::PrincipalCtx::bypass();
+    let (cq, _warnings) = crate::query::compile_query(&db, &schema, &body.query, &principal_ctx)?;
+    // Recompute warnings separately so the response can carry them even when
+    // the caller is a bypass principal (compile_query's warning pass is
+    // schema-only and independent of the principal).
+    let warnings = crate::query::collect_filter_warnings(&schema, &body.query);
+    let params = cq
+        .binds
+        .iter()
+        .map(|bind| match bind {
+            crate::txn::EqBind::Text(v) => v.clone(),
+            crate::txn::EqBind::Num(v) => v.to_string(),
+            crate::txn::EqBind::Bool(v) => v.to_string(),
+            crate::txn::EqBind::I64(v) => v.to_string(),
+        })
+        .collect::<Vec<String>>();
+    Ok(Json(ExplainResponse {
+        sql: cq.sql,
+        params,
+        terminal: cq.terminal.to_string(),
+        warnings,
+    }))
+}
+
+#[derive(Deserialize)]
+pub(super) struct SlowQueriesParams {
+    #[serde(default)]
+    db: Option<String>,
+    #[serde(default = "default_slow_queries_limit")]
+    limit: usize,
+}
+fn default_slow_queries_limit() -> usize {
+    100
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct SlowQueriesResponse {
+    queries: Vec<crate::metrics::SlowQueryRecord>,
+    /// The configured threshold (`RTDB_SLOW_QUERY_MS`) echoed back so the
+    /// dashboard can render "slow = > N ms" without a separate config call.
+    threshold_ms: u64,
+    /// The configured ring-buffer cap (`RTDB_SLOW_QUERY_CAPACITY`); the
+    /// response never returns more than this many rows regardless of `limit`.
+    capacity: usize,
+}
+
+/// `GET /admin/slow-queries?db=<optional>&limit=<n>` — the slow-query log
+/// (ENH-019). Returns the bounded in-memory ring newest-first, optionally
+/// filtered by database. `limit` defaults to 100 and is capped at the
+/// configured capacity (so an operator requesting more than the buffer can
+/// hold gets the buffer, not an error). When the log is off
+/// (`RTDB_SLOW_QUERY_MS=0`, the default) the response is an empty list plus
+/// the configured threshold so the dashboard can show "logging disabled".
+pub(super) async fn list_slow_queries(
+    State(state): State<Arc<AppState>>,
+    _headers: HeaderMap,
+    QueryParams(params): QueryParams<SlowQueriesParams>,
+) -> Result<Json<SlowQueriesResponse>, RtDbError> {
+    let threshold_ms = state.config.slow_query_ms;
+    let capacity = state.config.slow_query_capacity;
+    let limit = if capacity == 0 {
+        0
+    } else {
+        params.limit.min(capacity).max(1)
+    };
+    let mut rows = state.runtime.metrics.recent_slow_queries();
+    if let Some(db) = params.db.as_deref()
+        && !db.is_empty()
+    {
+        rows.retain(|r| r.db == db);
+    }
+    rows.truncate(limit);
+    Ok(Json(SlowQueriesResponse {
+        queries: rows,
+        threshold_ms,
+        capacity,
+    }))
 }

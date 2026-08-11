@@ -748,6 +748,234 @@ const HYBRID_SEARCH_MESSAGE: &str = "hybridSearch cannot be combined with any ot
 /// first+take / first+unique / count+take / count+unique / count+first / count+order -> BadRequest.
 /// `take: 0` is valid and returns an empty `Docs([])`, not an error.
 /// `unique` without an `index` scans the whole table (LIMIT 2) and applies the same 0/1/>1 rule.
+/// Compile a `Query` into a [`CompiledQuery`] — the SQL string and ordered
+/// typed binds the server will execute — plus a list of compile-time warnings
+/// (currently: filter on a declared-but-unindexed field). This is the single
+/// compile chokepoint for the read path: `execute_query` calls it then binds +
+/// fetches the result, and `POST /admin/db/{db}/explain` calls it to show the
+/// operator exactly the SQL the server would run (the "no second compiler that
+/// drifts" guarantee). Pure — takes the same args as `execute_query` MINUS the
+/// `pool`, performs no I/O, and is not async.
+///
+/// Mirrors `execute_query`'s terminal routing exactly: validate_db_name +
+/// authorize_table + table_def resolve → early returns for get/search/vector/
+/// hybrid (their compile fns) → compile_query_window → terminal-specific compile
+/// (count/distinct/aggregate/paginate/collect). The cascade-order invariants
+/// (peer rejection, take cap, range-bound mutual exclusion) are re-checked here
+/// so a request that would fail at execute time fails at compile time too — the
+/// compile path and the execute path reject the same shapes for the same
+/// reasons.
+pub fn compile_query(
+    db: &str,
+    schema: &SchemaDef,
+    q: &Query,
+    ctx: &PrincipalCtx,
+) -> Result<(CompiledQuery, Vec<String>), RtDbError> {
+    let warnings = collect_filter_warnings(schema, q);
+    validate_db_name(db)?;
+    authorize_table(ctx, &q.table)?;
+    let owner = ctx.user_id.as_deref();
+    let table_def = schema.table(&q.table)?;
+    let owner_field = table_def.owner_field.as_deref();
+    let collaborators_field = table_def.collaborators_field.as_deref();
+    let sctx = CompileSearchCtx {
+        db,
+        table_def,
+        table_name: q.table.as_str(),
+        owner_field,
+        collaborators_field,
+        ctx,
+    };
+    let _ = owner;
+
+    if let Some(id) = &q.get {
+        reject_if_any_set(q, GET_PEERS, GET_MESSAGE)?;
+        return Ok((compile_point_read(&sctx, id)?, warnings));
+    }
+
+    if q.unique {
+        reject_if_any_set(q, UNIQUE_PEERS, UNIQUE_MESSAGE)?;
+    }
+    if q.first {
+        reject_per_peer_set(q, FIRST_INCOMPATIBLES)?;
+    }
+    if q.count {
+        reject_per_peer_set(q, COUNT_INCOMPATIBLES)?;
+    }
+    if q.distinct {
+        reject_per_peer_set(q, DISTINCT_INCOMPATIBLES)?;
+    }
+    if q.aggregate.is_some() {
+        reject_per_peer_set(q, AGGREGATE_INCOMPATIBLES)?;
+    }
+    if q.paginate.is_some() {
+        reject_per_peer_set(q, PAGINATE_INCOMPATIBLES)?;
+    }
+    if q.gt.is_some() && q.gte.is_some() {
+        return Err(RtDbError::bad_request("gt and gte cannot both be set"));
+    }
+    if q.lt.is_some() && q.lte.is_some() {
+        return Err(RtDbError::bad_request("lt and lte cannot both be set"));
+    }
+    if let Some(take) = q.take
+        && take > MAX_TAKE
+    {
+        return Err(RtDbError::bad_request(format!(
+            "take exceeds maximum of {MAX_TAKE}"
+        )));
+    }
+
+    if let Some(vs) = &q.vector_search {
+        reject_if_any_set(q, VECTOR_SEARCH_PEERS, VECTOR_SEARCH_MESSAGE)?;
+        return Ok((compile_vector_search(&sctx, vs)?, warnings));
+    }
+    if let Some(hs) = &q.hybrid_search {
+        reject_if_any_set(q, HYBRID_SEARCH_PEERS, HYBRID_SEARCH_MESSAGE)?;
+        return Ok((compile_hybrid_search(&sctx, hs)?, warnings));
+    }
+    if let Some(search) = &q.search {
+        reject_if_any_set(q, SEARCH_PEERS, SEARCH_MESSAGE)?;
+        return Ok((compile_search(&sctx, search, q.take)?, warnings));
+    }
+
+    let w = compile_query_window(table_def, q, ctx, owner, owner_field, collaborators_field)?;
+
+    if q.count {
+        return Ok((compile_count_terminal(w, db, &q.table)?, warnings));
+    }
+    if q.distinct {
+        return Ok((compile_distinct_terminal(w, db, &q.table)?, warnings));
+    }
+    if let Some(agg) = &q.aggregate {
+        return Ok((
+            compile_aggregate_terminal(w, table_def, agg, db, &q.table)?,
+            warnings,
+        ));
+    }
+
+    let mut sort_cols: Vec<String> = match w.index_def {
+        Some(idx) => idx.fields[w.eq_len..]
+            .iter()
+            .map(|field_name| format!("\"{}\"", pg_col(field_name)))
+            .collect(),
+        None => Vec::new(),
+    };
+    sort_cols.push("\"created_at\"".to_string());
+    sort_cols.push("\"id\"".to_string());
+
+    let dir = match q.order {
+        Some(Order::Desc) => "DESC",
+        _ => "ASC",
+    };
+    let order_by = sort_cols
+        .iter()
+        .map(|col| format!("{col} {dir}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    if let Some(paginate) = &q.paginate {
+        let (cq, _ctx) = compile_paginate_terminal(
+            w, table_def, paginate, sort_cols, dir, &order_by, db, &q.table,
+        )?;
+        return Ok((cq, warnings));
+    }
+
+    Ok((
+        compile_collect_terminal(w, q.unique, q.first, q.take, &order_by, db, &q.table)?,
+        warnings,
+    ))
+}
+
+/// Compile-time warnings about a query's filter shape. Currently a single
+/// check: a `filter` predicate on a field the table declares but no index
+/// covers — such a filter compiles to a jsonb extraction and forces a
+/// sequential scan over the matching set. Walks the `FilterExpr` tree
+/// (And/Or/Not recurse; every leaf variant carries `field: String`) and emits
+/// one warning per offending field reference. Returns an empty vec when the
+/// query has no filter, or when every filtered field is covered by some index.
+/// A field counts as "indexed" iff it appears in any index's `fields` list or
+/// in any vector index's `filter_fields` list.
+pub fn collect_filter_warnings(schema: &SchemaDef, q: &Query) -> Vec<String> {
+    let table_def = match schema.table(&q.table) {
+        Ok(td) => td,
+        Err(_) => return Vec::new(),
+    };
+    let mut warnings = Vec::new();
+    if let Some(filter) = &q.filter {
+        collect_unindexed_filter_fields(filter, table_def, &mut warnings);
+    }
+    if let Some(search) = &q.search
+        && let Some(filter) = &search.filter
+    {
+        collect_unindexed_filter_fields(filter, table_def, &mut warnings);
+    }
+    if let Some(vs) = &q.vector_search
+        && let Some(filter) = &vs.filter
+    {
+        collect_unindexed_filter_fields(filter, table_def, &mut warnings);
+    }
+    // hybridSearch has no client filter field (only per-axis index resolution).
+    warnings.sort();
+    warnings.dedup();
+    warnings
+}
+
+/// Walk a `FilterExpr` tree and push one warning per leaf reference to a field
+/// the table declares but no index covers. And/Or/Not recurse; every leaf
+/// variant carries `field: String`. Unknown fields (not in `table_def.fields`)
+/// are skipped — `compile_filter` will reject them with a `BadRequest` at
+/// compile time, so warning about them here would be noise.
+fn collect_unindexed_filter_fields(
+    filter: &FilterExpr,
+    table_def: &TableDef,
+    out: &mut Vec<String>,
+) {
+    match filter {
+        FilterExpr::And { exprs } | FilterExpr::Or { exprs } => {
+            for e in exprs {
+                collect_unindexed_filter_fields(e, table_def, out);
+            }
+        }
+        FilterExpr::Not { expr } => {
+            collect_unindexed_filter_fields(expr, table_def, out);
+        }
+        FilterExpr::Eq { field, .. }
+        | FilterExpr::Neq { field, .. }
+        | FilterExpr::Gt { field, .. }
+        | FilterExpr::Gte { field, .. }
+        | FilterExpr::Lt { field, .. }
+        | FilterExpr::Lte { field, .. }
+        | FilterExpr::In { field, .. }
+        | FilterExpr::Contains { field, .. }
+        | FilterExpr::Exists { field } => {
+            if !table_def.fields.contains_key(field) {
+                return;
+            }
+            if field_is_indexed(table_def, field) {
+                return;
+            }
+            out.push(format!(
+                "filter on field '{field}' has no index; compiles to a jsonb extraction (sequential scan)"
+            ));
+        }
+    }
+}
+
+/// A field counts as indexed iff it appears in any index's `fields` list or in
+/// any vector index's `filter_fields` list.
+fn field_is_indexed(table_def: &TableDef, field: &str) -> bool {
+    table_def
+        .indexes
+        .iter()
+        .any(|idx| idx.fields.iter().any(|f| f == field))
+        || table_def.indexes.iter().any(|idx| {
+            idx.vector
+                .as_ref()
+                .map(|spec| spec.filter_fields.iter().any(|f| f == field))
+                .unwrap_or(false)
+        })
+}
+
 pub async fn execute_query(
     pool: &PgPool,
     db: &str,
@@ -770,25 +998,17 @@ pub async fn execute_query(
         terminal = q.terminal_name(),
     );
     async {
-        validate_db_name(db)?;
-        // ENH-005 Task 4: a machine token with a non-empty `tables` allowlist cannot
-        // read a table not on the list. `tables = None` (admin/`User`/scheduled/
-        // full-access machine tokens) and `tables = Some([])` bypass. The gate runs
-        // before the table def resolves so a `Forbidden` never leaks table metadata.
-        authorize_table(ctx, &q.table)?;
-        // Task 5: `ctx` carries `user_id` + `email` so Task 6+ can resolve `$email`
-        // markers. The SQL row-auth paths here only need the uid, so derive the
-        // legacy `owner: Option<&str>` view once and thread it unchanged —
-        // byte-identical behavior for ownerField/collaboratorsField.
+        // The read path is now compile-then-execute: `compile_query` produces
+        // the exact SQL + ordered binds (the same compile the /explain admin
+        // route uses), and this body binds them into sqlx and fetches. The
+        // cascade (validate_db_name, authorize_table, peer-rejection, take cap,
+        // range-bound mutual exclusion, terminal routing) runs inside
+        // `compile_query`; this body is the execute tail.
+        let (cq, _warnings) = compile_query(db, schema, q, ctx)?;
         let owner = ctx.user_id.as_deref();
         let table_def = schema.table(&q.table)?;
         let owner_field = table_def.owner_field.as_deref();
         let collaborators_field = table_def.collaborators_field.as_deref();
-        // Shared borrow-only context for the four read-path terminals that don't
-        // use the btree `QueryWindow` (point_read + the search family). Constructed
-        // once from the caller-resolved inputs and passed by shared reference;
-        // each terminal destructures it back into the same locals the inline body
-        // used. QA-105.
         let sctx = SearchCtx {
             pool,
             db,
@@ -798,130 +1018,47 @@ pub async fn execute_query(
             collaborators_field,
             ctx,
         };
-
-        // Principal markers (`{"$user":true}` / `{"$email":true}`) and malformed
-        // field references are rejected inside `compile_filter` (SEC-125) — that
-        // validation now runs at the single compilation chokepoint, so q.filter,
-        // search.filter, vectorSearch.filter, and the by-query filters all get the
-        // Contains-array + orderable-field + principal-marker guards. The failure
-        // surfaces as `BadRequest` (a malformed client query).
-
-        if let Some(id) = &q.get {
-            reject_if_any_set(q, GET_PEERS, GET_MESSAGE)?;
-            return point_read(&sctx, id, owner).await;
+        match cq.terminal {
+            "get" => point_read(&sctx, cq, owner).await,
+            "search" => execute_search(cq, pool).await,
+            "vectorSearch" => execute_vector_search(cq, pool).await,
+            "hybridSearch" => execute_hybrid_search(cq, pool).await,
+            "count" => execute_count_terminal(cq, pool).await,
+            "distinct" => execute_distinct_terminal(cq, pool).await,
+            "aggregate" => execute_aggregate_terminal(cq, pool).await,
+            "paginate" => {
+                // Re-derive the PaginateExecCtx the compile step produced. The
+                // ctx is pure metadata (index_def + eq_len + num_items); we
+                // can't thread it through compile_query's single return type
+                // without complicating the /explain contract (which doesn't
+                // need it), so the execute path re-resolves it from the same
+                // inputs compile used. The values are deterministic functions
+                // of (table_def, q, ctx) — `compile_query_window` is pure.
+                let w = compile_query_window(
+                    table_def,
+                    q,
+                    ctx,
+                    owner,
+                    owner_field,
+                    collaborators_field,
+                )?;
+                let num_items = q
+                    .paginate
+                    .as_ref()
+                    .map(|p| p.num_items.min(MAX_TAKE))
+                    .unwrap_or(0);
+                let paginate_ctx = PaginateExecCtx {
+                    index_def: w.index_def,
+                    eq_len: w.eq_len,
+                    num_items,
+                };
+                execute_paginate_terminal(cq, paginate_ctx, pool).await
+            }
+            "unique" | "first" | "collect" => execute_collect_terminal(cq, pool).await,
+            other => Err(RtDbError::internal(format!(
+                "unknown compiled terminal '{other}'"
+            ))),
         }
-
-        if q.unique {
-            reject_if_any_set(q, UNIQUE_PEERS, UNIQUE_MESSAGE)?;
-        }
-
-        if q.first {
-            reject_per_peer_set(q, FIRST_INCOMPATIBLES)?;
-        }
-
-        if q.count {
-            reject_per_peer_set(q, COUNT_INCOMPATIBLES)?;
-        }
-
-        if q.distinct {
-            reject_per_peer_set(q, DISTINCT_INCOMPATIBLES)?;
-        }
-
-        if q.aggregate.is_some() {
-            reject_per_peer_set(q, AGGREGATE_INCOMPATIBLES)?;
-        }
-
-        if q.paginate.is_some() {
-            reject_per_peer_set(q, PAGINATE_INCOMPATIBLES)?;
-        }
-
-        if q.gt.is_some() && q.gte.is_some() {
-            return Err(RtDbError::bad_request("gt and gte cannot both be set"));
-        }
-        if q.lt.is_some() && q.lte.is_some() {
-            return Err(RtDbError::bad_request("lt and lte cannot both be set"));
-        }
-
-        if let Some(take) = q.take
-            && take > MAX_TAKE
-        {
-            return Err(RtDbError::bad_request(format!(
-                "take exceeds maximum of {MAX_TAKE}"
-            )));
-        }
-
-        // Vector-similarity terminal. Incompatible with every other terminal; it
-        // carries its own `limit` and does not compose with `take` (or anything
-        // else). Resolution and bind construction live in `execute_vector_search`.
-        if let Some(vs) = &q.vector_search {
-            reject_if_any_set(q, VECTOR_SEARCH_PEERS, VECTOR_SEARCH_MESSAGE)?;
-            return execute_vector_search(&sctx, vs).await;
-        }
-
-        // Hybrid search terminal. Incompatible with every other terminal (including
-        // `search` and `vectorSearch` — hybrid IS their combination); it carries its
-        // own `limit` and fuses ts_rank + cosine distance via RRF. Resolution, bind
-        // construction, and the fused SQL live in `execute_hybrid_search`.
-        if let Some(hs) = &q.hybrid_search {
-            reject_if_any_set(q, HYBRID_SEARCH_PEERS, HYBRID_SEARCH_MESSAGE)?;
-            return execute_hybrid_search(&sctx, hs).await;
-        }
-
-        // Full-text search terminal. It ranks over a search index's tsvector and is
-        // incompatible with every index-based terminal; `take` (already capped) is
-        // the only field it composes with.
-        if let Some(search) = &q.search {
-            reject_if_any_set(q, SEARCH_PEERS, SEARCH_MESSAGE)?;
-            return execute_search(&sctx, search, q.take).await;
-        }
-
-        // Compile the index window (eq/range binds, client `filter`, owner/
-        // collaborator/`authorize` predicates, and placeholder offsets) shared by
-        // every remaining terminal. `compile_query_window` is a verbatim lift of
-        // the block that previously lived inline here; see its body for the
-        // bind-ordering and placeholder-numbering invariants.
-        let w = compile_query_window(table_def, q, ctx, owner, owner_field, collaborators_field)?;
-
-        if q.count {
-            return execute_count_terminal(w, pool, db, &q.table).await;
-        }
-
-        if q.distinct {
-            return execute_distinct_terminal(w, pool, db, &q.table).await;
-        }
-
-        if let Some(agg) = &q.aggregate {
-            return execute_aggregate_terminal(w, table_def, agg, pool, db, &q.table).await;
-        }
-
-        let mut sort_cols: Vec<String> = match w.index_def {
-            Some(idx) => idx.fields[w.eq_len..]
-                .iter()
-                .map(|field_name| format!("\"{}\"", pg_col(field_name)))
-                .collect(),
-            None => Vec::new(),
-        };
-        sort_cols.push("\"created_at\"".to_string());
-        sort_cols.push("\"id\"".to_string());
-
-        let dir = match q.order {
-            Some(Order::Desc) => "DESC",
-            _ => "ASC",
-        };
-        let order_by = sort_cols
-            .iter()
-            .map(|col| format!("{col} {dir}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-
-        if let Some(paginate) = &q.paginate {
-            return execute_paginate_terminal(
-                w, table_def, paginate, sort_cols, dir, &order_by, pool, db, &q.table,
-            )
-            .await;
-        }
-
-        execute_collect_terminal(w, q.unique, q.first, q.take, &order_by, pool, db, &q.table).await
     }
     .instrument(span)
     .await
@@ -933,11 +1070,32 @@ pub async fn execute_query(
 // cascade — setup → early-return terminals → validation flags → index-window
 // compilation → inline terminals — all inline. The helpers below decompose it
 // into a routing table without changing behavior: `compile_query_window` lifts
-// the index-window compilation block verbatim, and each `execute_*_terminal`
-// lifts one inline terminal body verbatim. Each terminal destructures the
-// `QueryWindow` back into the same locals the inline body used, so every SQL
-// fragment, bind ordering, placeholder offset, error variant, and evaluation
-// order is byte-for-byte identical to the pre-refactor cascade.
+// the index-window compilation block verbatim, and each `compile_*_terminal`
+// lifts one inline terminal's SQL-building block verbatim. Each terminal's
+// `execute_*` companion then binds the `CompiledQuery.binds` into sqlx in order
+// and fetches — the SQL string itself never varies between the compile and
+// execute paths because there is now only one SQL-builder per terminal.
+
+/// A compiled read query: the SQL string (with `$n` placeholders) plus the
+/// ordered typed binds to fill them, plus the wire terminal name for telemetry.
+/// Produced by [`compile_query`] (and the per-terminal `compile_*_terminal`
+/// helpers it dispatches to) and consumed by the matching `execute_*_terminal`
+/// helper, which binds `binds` into a sqlx query in order and fetches. The
+/// `/explain` admin route also consumes it — the SQL it shows the operator is
+/// exactly the string this struct carries, never a second compiler's output.
+///
+/// `binds` is `Vec<EqBind>` rather than a broader enum because every value a
+/// read path binds — eq/range binds, client filter binds, owner/collab uids,
+/// `authorize` predicate binds, LIMIT/cursor values, and the search/vector
+/// family's text queries, query vectors (as `[a,b,c]` text), and RRF `k` —
+/// fits one of the four `EqBind` variants. Encoding them all uniformly is what
+/// lets the execute tail be one shared bind loop per terminal.
+#[derive(Debug, Clone)]
+pub struct CompiledQuery {
+    pub sql: String,
+    pub binds: Vec<EqBind>,
+    pub terminal: &'static str,
+}
 
 /// The compiled index window shared by every non-early-return terminal in
 /// `execute_query`. Built once by `compile_query_window` and consumed by-value
@@ -1092,14 +1250,15 @@ fn compile_query_window<'a>(
     })
 }
 
-/// `count` terminal: `SELECT COUNT(*)` over the compiled window's WHERE clause.
-/// Verbatim lift of the former inline `if q.count { … }` block.
-async fn execute_count_terminal(
+/// `count` terminal SQL compilation: `SELECT COUNT(*)` over the compiled
+/// window's WHERE clause. The compile half of the former inline `if q.count`
+/// block — SQL and bind-order are byte-for-byte identical to the pre-refactor
+/// cascade; only the sqlx bind+fetch tail lives in `execute_count_terminal`.
+fn compile_count_terminal(
     w: QueryWindow<'_>,
-    pool: &PgPool,
     db: &str,
     table: &str,
-) -> Result<QueryResult, RtDbError> {
+) -> Result<CompiledQuery, RtDbError> {
     let QueryWindow {
         binds,
         range_binds,
@@ -1114,24 +1273,26 @@ async fn execute_count_terminal(
         sql.push_str(" WHERE ");
         sql.push_str(&where_conditions.join(" AND "));
     }
+    let mut all = Vec::with_capacity(binds.len() + range_binds.len() + filter_binds.len());
+    all.extend(binds);
+    all.extend(range_binds);
+    all.extend(filter_binds);
+    Ok(CompiledQuery {
+        sql,
+        binds: all,
+        terminal: "count",
+    })
+}
+
+/// `count` terminal execute tail: bind `CompiledQuery.binds` into a scalar
+/// `i64` query in order and fetch the count.
+async fn execute_count_terminal(
+    cq: CompiledQuery,
+    pool: &PgPool,
+) -> Result<QueryResult, RtDbError> {
+    let CompiledQuery { sql, binds, .. } = cq;
     let mut query = sqlx::query_scalar::<_, i64>(&sql);
     for bind in binds {
-        query = match bind {
-            EqBind::Text(v) => query.bind(v),
-            EqBind::Num(v) => query.bind(v),
-            EqBind::Bool(v) => query.bind(v),
-            EqBind::I64(v) => query.bind(v),
-        };
-    }
-    for bind in range_binds {
-        query = match bind {
-            EqBind::Text(v) => query.bind(v),
-            EqBind::Num(v) => query.bind(v),
-            EqBind::Bool(v) => query.bind(v),
-            EqBind::I64(v) => query.bind(v),
-        };
-    }
-    for bind in &filter_binds {
         query = match bind {
             EqBind::Text(v) => query.bind(v),
             EqBind::Num(v) => query.bind(v),
@@ -1143,20 +1304,20 @@ async fn execute_count_terminal(
     Ok(QueryResult::Count(count))
 }
 
-/// Distinct terminal: `SELECT DISTINCT` of the index field immediately after
-/// the eq prefix over the same eq/range WHERE clause every other terminal
-/// builds. The combination cascade already rejected every other terminal;
-/// `distinct` composes only with `index`/`eq`/range bounds. The preconditions
-/// below reject the no-index and no-remaining-field cases with the same
-/// BadRequest shape as a missing-index `eq` bind. Capped by `MAX_TAKE` for
-/// parity with `collect` (a distinct set bounded by the matching row count).
-/// Verbatim lift of the former inline `if q.distinct { … }` block.
-async fn execute_distinct_terminal(
+/// Distinct terminal SQL compilation: `SELECT DISTINCT` of the index field
+/// immediately after the eq prefix over the same eq/range WHERE clause every
+/// other terminal builds. The combination cascade already rejected every other
+/// terminal; `distinct` composes only with `index`/`eq`/range bounds. The
+/// preconditions below reject the no-index and no-remaining-field cases with
+/// the same BadRequest shape as a missing-index `eq` bind. Capped by `MAX_TAKE`
+/// for parity with `collect` (a distinct set bounded by the matching row count).
+/// Compile half of the former inline `if q.distinct { … }` block — SQL and
+/// bind-order byte-for-byte identical to the pre-refactor cascade.
+fn compile_distinct_terminal(
     w: QueryWindow<'_>,
-    pool: &PgPool,
     db: &str,
     table: &str,
-) -> Result<QueryResult, RtDbError> {
+) -> Result<CompiledQuery, RtDbError> {
     let QueryWindow {
         index_def,
         binds,
@@ -1192,7 +1353,25 @@ async fn execute_distinct_terminal(
         sql.push_str(&where_conditions.join(" AND "));
     }
     sql.push_str(&format!(" ORDER BY v LIMIT ${limit_placeholder}"));
-    let mut query = sqlx::query_as::<_, (serde_json::Value,)>(sql.as_str());
+    let mut all = Vec::with_capacity(binds.len() + range_binds.len() + filter_binds.len() + 1);
+    all.extend(binds);
+    all.extend(range_binds);
+    all.extend(filter_binds);
+    all.push(EqBind::I64(i64::from(MAX_TAKE)));
+    Ok(CompiledQuery {
+        sql,
+        binds: all,
+        terminal: "distinct",
+    })
+}
+
+/// Distinct terminal execute tail: bind + fetch, project rows to `Value`s.
+async fn execute_distinct_terminal(
+    cq: CompiledQuery,
+    pool: &PgPool,
+) -> Result<QueryResult, RtDbError> {
+    let CompiledQuery { sql, binds, .. } = cq;
+    let mut query = sqlx::query_as::<_, (serde_json::Value,)>(&sql);
     for bind in binds {
         query = match bind {
             EqBind::Text(v) => query.bind(v),
@@ -1201,46 +1380,29 @@ async fn execute_distinct_terminal(
             EqBind::I64(v) => query.bind(v),
         };
     }
-    for bind in range_binds {
-        query = match bind {
-            EqBind::Text(v) => query.bind(v),
-            EqBind::Num(v) => query.bind(v),
-            EqBind::Bool(v) => query.bind(v),
-            EqBind::I64(v) => query.bind(v),
-        };
-    }
-    for bind in &filter_binds {
-        query = match bind {
-            EqBind::Text(v) => query.bind(v),
-            EqBind::Num(v) => query.bind(v),
-            EqBind::Bool(v) => query.bind(v),
-            EqBind::I64(v) => query.bind(v),
-        };
-    }
-    query = query.bind(i64::from(MAX_TAKE));
     let rows = query.fetch_all(pool).await?;
     let values: Vec<serde_json::Value> = rows.into_iter().map(|(v,)| v).collect();
     Ok(QueryResult::Distinct(values))
 }
 
-/// Aggregate terminal: runs `<OP>("<col>")` (SUM/AVG/MIN/MAX) over the same
-/// eq/range WHERE clause every other terminal builds, returning one scalar
-/// (`Aggregate(value)`). With `group_by: true`, it groups by the index field
-/// after the eq prefix and aggregates the one after that, returning
-/// `AggregateGroups([{key,value},…])`. The combination cascade already
-/// rejected every other terminal; `aggregate` composes only with `index`/
-/// `eq`/range bounds/`filter`. The preconditions below reject the no-index,
+/// Aggregate terminal SQL compilation: runs `<OP>("<col>")` (SUM/AVG/MIN/MAX)
+/// over the same eq/range WHERE clause every other terminal builds, returning
+/// one scalar (`Aggregate(value)`). With `group_by: true`, it groups by the
+/// index field after the eq prefix and aggregates the one after that, returning
+/// `AggregateGroups([{key,value},…])`. The combination cascade already rejected
+/// every other terminal; `aggregate` composes only with `index`/`eq`/range
+/// bounds/`filter`. The preconditions below reject the no-index,
 /// no-remaining-field, and (for sum/avg) non-numeric-field cases. Group count
-/// is capped by `MAX_TAKE` for parity with `collect`. Verbatim lift of the
-/// former inline `if let Some(agg) = &q.aggregate { … }` block.
-async fn execute_aggregate_terminal(
+/// is capped by `MAX_TAKE` for parity with `collect`. Compile half of the
+/// former inline `if let Some(agg) = &q.aggregate { … }` block — SQL and
+/// bind-order byte-for-byte identical to the pre-refactor cascade.
+fn compile_aggregate_terminal(
     w: QueryWindow<'_>,
     table_def: &TableDef,
     agg: &AggregateSpec,
-    pool: &PgPool,
     db: &str,
     table: &str,
-) -> Result<QueryResult, RtDbError> {
+) -> Result<CompiledQuery, RtDbError> {
     let QueryWindow {
         index_def,
         binds,
@@ -1318,7 +1480,7 @@ async fn execute_aggregate_terminal(
     // scalar SUM/AVG/MIN/MAX over zero matching rows yields one row with
     // SQL NULL → `serde_json::Value::Null`; COUNT(*) over zero rows yields 0.
     if let Some(group_col) = group_col {
-        return aggregate_grouped(
+        return compile_aggregate_grouped(
             group_col,
             agg_expr,
             binds,
@@ -1328,11 +1490,9 @@ async fn execute_aggregate_terminal(
             limit_placeholder,
             &pg_schema_name,
             &table_ident,
-            pool,
-        )
-        .await;
+        );
     }
-    aggregate_scalar(
+    compile_aggregate_scalar(
         agg_expr,
         binds,
         range_binds,
@@ -1340,17 +1500,14 @@ async fn execute_aggregate_terminal(
         filter_binds,
         &pg_schema_name,
         &table_ident,
-        pool,
     )
-    .await
 }
 
-/// Grouped aggregate path: `SELECT to_jsonb(group_col), to_jsonb(OP(agg_col)) …
-/// GROUP BY … ORDER BY k LIMIT $`. Verbatim lift of the former grouped branch
-/// of `execute_aggregate_terminal`; the shared resolution (group column,
-/// aggregate field, type validation, `agg_expr`) lives in the caller.
+/// Grouped aggregate SQL compilation:
+/// `SELECT to_jsonb(group_col), to_jsonb(OP(agg_col)) … GROUP BY … ORDER BY k LIMIT $`.
+/// Verbatim lift of the former grouped branch's SQL builder.
 #[allow(clippy::too_many_arguments)]
-async fn aggregate_grouped(
+fn compile_aggregate_grouped(
     group_col: String,
     agg_expr: String,
     binds: Vec<EqBind>,
@@ -1360,8 +1517,7 @@ async fn aggregate_grouped(
     limit_placeholder: usize,
     pg_schema_name: &str,
     table_ident: &str,
-    pool: &PgPool,
-) -> Result<QueryResult, RtDbError> {
+) -> Result<CompiledQuery, RtDbError> {
     let mut sql = format!(
         "SELECT to_jsonb(\"{group_col}\") AS k, to_jsonb({agg_expr}) AS v FROM \"{pg_schema_name}\".\"{table_ident}\""
     );
@@ -1372,46 +1528,23 @@ async fn aggregate_grouped(
     sql.push_str(&format!(
         " GROUP BY \"{group_col}\" ORDER BY k LIMIT ${limit_placeholder}"
     ));
-    let mut query = sqlx::query_as::<_, (serde_json::Value, serde_json::Value)>(&sql);
-    for bind in binds {
-        query = match bind {
-            EqBind::Text(v) => query.bind(v),
-            EqBind::Num(v) => query.bind(v),
-            EqBind::Bool(v) => query.bind(v),
-            EqBind::I64(v) => query.bind(v),
-        };
-    }
-    for bind in range_binds {
-        query = match bind {
-            EqBind::Text(v) => query.bind(v),
-            EqBind::Num(v) => query.bind(v),
-            EqBind::Bool(v) => query.bind(v),
-            EqBind::I64(v) => query.bind(v),
-        };
-    }
-    for bind in &filter_binds {
-        query = match bind {
-            EqBind::Text(v) => query.bind(v),
-            EqBind::Num(v) => query.bind(v),
-            EqBind::Bool(v) => query.bind(v),
-            EqBind::I64(v) => query.bind(v),
-        };
-    }
-    query = query.bind(i64::from(MAX_TAKE));
-    let rows = query.fetch_all(pool).await?;
-    let groups: Vec<AggregateGroup> = rows
-        .into_iter()
-        .map(|(k, v)| AggregateGroup { key: k, value: v })
-        .collect();
-    Ok(QueryResult::AggregateGroups(groups))
+    let mut all = Vec::with_capacity(binds.len() + range_binds.len() + filter_binds.len() + 1);
+    all.extend(binds);
+    all.extend(range_binds);
+    all.extend(filter_binds);
+    all.push(EqBind::I64(i64::from(MAX_TAKE)));
+    Ok(CompiledQuery {
+        sql,
+        binds: all,
+        terminal: "aggregate",
+    })
 }
 
-/// Scalar (ungrouped) aggregate path:
+/// Scalar (ungrouped) aggregate SQL compilation:
 /// `SELECT COALESCE(to_jsonb(OP(agg_col)), 'null'::jsonb) …`.
-/// Verbatim lift of the former scalar branch of `execute_aggregate_terminal`;
-/// the shared resolution lives in the caller.
+/// Verbatim lift of the former scalar branch's SQL builder.
 #[allow(clippy::too_many_arguments)]
-async fn aggregate_scalar(
+fn compile_aggregate_scalar(
     agg_expr: String,
     binds: Vec<EqBind>,
     range_binds: Vec<EqBind>,
@@ -1419,8 +1552,7 @@ async fn aggregate_scalar(
     filter_binds: Vec<EqBind>,
     pg_schema_name: &str,
     table_ident: &str,
-    pool: &PgPool,
-) -> Result<QueryResult, RtDbError> {
+) -> Result<CompiledQuery, RtDbError> {
     let mut sql = format!(
         "SELECT COALESCE(to_jsonb({agg_expr}), 'null'::jsonb) AS v FROM \"{pg_schema_name}\".\"{table_ident}\""
     );
@@ -1428,53 +1560,86 @@ async fn aggregate_scalar(
         sql.push_str(" WHERE ");
         sql.push_str(&where_conditions.join(" AND "));
     }
-    let mut query = sqlx::query_as::<_, (serde_json::Value,)>(&sql);
-    for bind in binds {
-        query = match bind {
-            EqBind::Text(v) => query.bind(v),
-            EqBind::Num(v) => query.bind(v),
-            EqBind::Bool(v) => query.bind(v),
-            EqBind::I64(v) => query.bind(v),
-        };
-    }
-    for bind in range_binds {
-        query = match bind {
-            EqBind::Text(v) => query.bind(v),
-            EqBind::Num(v) => query.bind(v),
-            EqBind::Bool(v) => query.bind(v),
-            EqBind::I64(v) => query.bind(v),
-        };
-    }
-    for bind in &filter_binds {
-        query = match bind {
-            EqBind::Text(v) => query.bind(v),
-            EqBind::Num(v) => query.bind(v),
-            EqBind::Bool(v) => query.bind(v),
-            EqBind::I64(v) => query.bind(v),
-        };
-    }
-    let (v,) = query.fetch_one(pool).await?;
-    Ok(QueryResult::Aggregate(v))
+    let mut all = Vec::with_capacity(binds.len() + range_binds.len() + filter_binds.len());
+    all.extend(binds);
+    all.extend(range_binds);
+    all.extend(filter_binds);
+    Ok(CompiledQuery {
+        sql,
+        binds: all,
+        terminal: "aggregate",
+    })
 }
 
-/// Paginate terminal: keyset-paginated scan over the compiled window's WHERE
-/// clause, using `sort_cols` (the unbound index fields + `created_at` + `id`)
-/// and `dir`/`order_by` computed by the caller. Fetches one extra row to
-/// detect a next page; the cursor encodes the last row's sort-column values.
-/// Verbatim lift of the former inline
-/// `if let Some(paginate) = &q.paginate { … }` block.
+/// Aggregate terminal execute tail: branch on the `terminal` tag, bind, and
+/// fetch. The group vs scalar shape difference is encoded by which `query_as`
+/// decoder is used; `terminal` disambiguates which to call.
+async fn execute_aggregate_terminal(
+    cq: CompiledQuery,
+    pool: &PgPool,
+) -> Result<QueryResult, RtDbError> {
+    let CompiledQuery {
+        sql,
+        binds,
+        terminal,
+    } = cq;
+    // The grouped path is tagged `aggregate` and emits a 2-column row shape
+    // (k, v); the scalar path is also tagged `aggregate` but emits 1 column.
+    // The compiled SQL itself encodes the shape (its SELECT list), so dispatch
+    // on the SQL's projection rather than the tag. Both paths carry the same
+    // tag because the wire terminal is the same; the executor reads the SQL.
+    if sql.contains("GROUP BY") {
+        let mut query = sqlx::query_as::<_, (serde_json::Value, serde_json::Value)>(&sql);
+        for bind in binds {
+            query = match bind {
+                EqBind::Text(v) => query.bind(v),
+                EqBind::Num(v) => query.bind(v),
+                EqBind::Bool(v) => query.bind(v),
+                EqBind::I64(v) => query.bind(v),
+            };
+        }
+        let rows = query.fetch_all(pool).await?;
+        let groups: Vec<AggregateGroup> = rows
+            .into_iter()
+            .map(|(k, v)| AggregateGroup { key: k, value: v })
+            .collect();
+        Ok(QueryResult::AggregateGroups(groups))
+    } else {
+        let _ = terminal; // shape encoded by SQL; tag unused on this path
+        let mut query = sqlx::query_as::<_, (serde_json::Value,)>(&sql);
+        for bind in binds {
+            query = match bind {
+                EqBind::Text(v) => query.bind(v),
+                EqBind::Num(v) => query.bind(v),
+                EqBind::Bool(v) => query.bind(v),
+                EqBind::I64(v) => query.bind(v),
+            };
+        }
+        let (v,) = query.fetch_one(pool).await?;
+        Ok(QueryResult::Aggregate(v))
+    }
+}
+
+/// Paginate terminal SQL compilation: keyset-paginated scan over the compiled
+/// window's WHERE clause, using `sort_cols` (the unbound index fields +
+/// `created_at` + `id`) and `dir`/`order_by` computed by the caller. Fetches
+/// one extra row to detect a next page; the cursor encodes the last row's
+/// sort-column values. Compile half of the former inline
+/// `if let Some(paginate) = &q.paginate { … }` block — SQL and bind-order
+/// byte-for-byte identical to the pre-refactor cascade. The `index_def` +
+/// `eq_len` are returned alongside the [`CompiledQuery`] so the executor can
+/// build the next-page cursor from the last row's projected fields.
 #[allow(clippy::too_many_arguments)]
-async fn execute_paginate_terminal(
-    w: QueryWindow<'_>,
+fn compile_paginate_terminal<'a>(
+    w: QueryWindow<'a>,
     table_def: &TableDef,
     paginate: &Paginate,
     sort_cols: Vec<String>,
     dir: &str,
     order_by: &str,
-    pool: &PgPool,
     db: &str,
     table: &str,
-) -> Result<QueryResult, RtDbError> {
+) -> Result<(CompiledQuery, PaginateExecCtx<'a>), RtDbError> {
     let QueryWindow {
         index_def,
         binds,
@@ -1544,6 +1709,53 @@ async fn execute_paginate_terminal(
     sql.push_str(order_by);
     sql.push_str(&format!(" LIMIT ${limit_placeholder}"));
 
+    let mut all = Vec::with_capacity(
+        binds.len() + range_binds.len() + filter_binds.len() + cursor_binds.len() + 1,
+    );
+    all.extend(binds);
+    all.extend(range_binds);
+    all.extend(filter_binds);
+    all.extend(cursor_binds);
+    // Fetch one extra row so a next page can be detected without a second
+    // round-trip; the extra is discarded after the has-next check.
+    all.push(EqBind::I64(i64::from(num_items) + 1));
+
+    let cq = CompiledQuery {
+        sql,
+        binds: all,
+        terminal: "paginate",
+    };
+    Ok((
+        cq,
+        PaginateExecCtx {
+            index_def,
+            eq_len,
+            num_items,
+        },
+    ))
+}
+
+/// Postgres-fetch context the paginate executor needs to build the next-page
+/// cursor after the rows come back. Pure metadata — no SQL of its own.
+struct PaginateExecCtx<'a> {
+    index_def: Option<&'a IndexDef>,
+    eq_len: usize,
+    num_items: u32,
+}
+
+/// Paginate terminal execute tail: bind + fetch, then build the next-page
+/// cursor from the last row's sort-column values.
+async fn execute_paginate_terminal(
+    cq: CompiledQuery,
+    ctx: PaginateExecCtx<'_>,
+    pool: &PgPool,
+) -> Result<QueryResult, RtDbError> {
+    let CompiledQuery { sql, binds, .. } = cq;
+    let PaginateExecCtx {
+        index_def,
+        eq_len,
+        num_items,
+    } = ctx;
     let mut query = sqlx::query_as::<_, (String, serde_json::Value, i64, i64)>(&sql);
     for bind in binds {
         query = match bind {
@@ -1553,33 +1765,6 @@ async fn execute_paginate_terminal(
             EqBind::I64(v) => query.bind(v),
         };
     }
-    for bind in range_binds {
-        query = match bind {
-            EqBind::Text(v) => query.bind(v),
-            EqBind::Num(v) => query.bind(v),
-            EqBind::Bool(v) => query.bind(v),
-            EqBind::I64(v) => query.bind(v),
-        };
-    }
-    for bind in &filter_binds {
-        query = match bind {
-            EqBind::Text(v) => query.bind(v),
-            EqBind::Num(v) => query.bind(v),
-            EqBind::Bool(v) => query.bind(v),
-            EqBind::I64(v) => query.bind(v),
-        };
-    }
-    for bind in cursor_binds {
-        query = match bind {
-            EqBind::Text(v) => query.bind(v),
-            EqBind::Num(v) => query.bind(v),
-            EqBind::Bool(v) => query.bind(v),
-            EqBind::I64(v) => query.bind(v),
-        };
-    }
-    // Fetch one extra row so a next page can be detected without a second
-    // round-trip; the extra is discarded after the has-next check.
-    query = query.bind(i64::from(num_items) + 1);
     let mut rows = query.fetch_all(pool).await?;
 
     let has_next = rows.len() > num_items as usize;
@@ -1617,22 +1802,21 @@ async fn execute_paginate_terminal(
     }))
 }
 
-/// `unique`/`first`/`collect` fall-through terminal: scans the compiled
-/// window's WHERE clause ordered by `order_by`, applies a `limit` derived from
-/// `unique` (2), `first` (1), or `take` (defaulting to `MAX_TAKE`), and shapes
-/// the result (`Doc`/`Doc(None)` for unique/first, `Docs` for collect). Verbatim
-/// lift of the former inline fall-through block.
-#[allow(clippy::too_many_arguments)]
-async fn execute_collect_terminal(
+/// `unique`/`first`/`collect` fall-through terminal SQL compilation: scans the
+/// compiled window's WHERE clause ordered by `order_by`, applies a `limit`
+/// derived from `unique` (2), `first` (1), or `take` (defaulting to `MAX_TAKE`),
+/// and shapes the result (`Doc`/`Doc(None)` for unique/first, `Docs` for
+/// collect). Compile half of the former inline fall-through block — SQL and
+/// bind-order byte-for-byte identical to the pre-refactor cascade.
+fn compile_collect_terminal(
     w: QueryWindow<'_>,
     unique: bool,
     first: bool,
     take: Option<u32>,
     order_by: &str,
-    pool: &PgPool,
     db: &str,
     table: &str,
-) -> Result<QueryResult, RtDbError> {
+) -> Result<CompiledQuery, RtDbError> {
     let QueryWindow {
         binds,
         range_binds,
@@ -1662,6 +1846,38 @@ async fn execute_collect_terminal(
     sql.push_str(order_by);
     sql.push_str(&format!(" LIMIT ${limit_placeholder}"));
 
+    let mut all = Vec::with_capacity(binds.len() + range_binds.len() + filter_binds.len() + 1);
+    all.extend(binds);
+    all.extend(range_binds);
+    all.extend(filter_binds);
+    all.push(EqBind::I64(i64::from(limit)));
+    // The wire terminal name distinguishes the three shapes (unique/first/
+    // collect) for the executor's result-shaping switch and for /explain.
+    let terminal: &'static str = if unique {
+        "unique"
+    } else if first {
+        "first"
+    } else {
+        "collect"
+    };
+    Ok(CompiledQuery {
+        sql,
+        binds: all,
+        terminal,
+    })
+}
+
+/// `unique`/`first`/`collect` terminal execute tail: bind + fetch, then shape
+/// per the wire `terminal` tag (`unique`/`first` → `Doc`, `collect` → `Docs`).
+async fn execute_collect_terminal(
+    cq: CompiledQuery,
+    pool: &PgPool,
+) -> Result<QueryResult, RtDbError> {
+    let CompiledQuery {
+        sql,
+        binds,
+        terminal,
+    } = cq;
     let mut query = sqlx::query_as::<_, (String, serde_json::Value, i64, i64)>(&sql);
     for bind in binds {
         query = match bind {
@@ -1671,26 +1887,9 @@ async fn execute_collect_terminal(
             EqBind::I64(v) => query.bind(v),
         };
     }
-    for bind in range_binds {
-        query = match bind {
-            EqBind::Text(v) => query.bind(v),
-            EqBind::Num(v) => query.bind(v),
-            EqBind::Bool(v) => query.bind(v),
-            EqBind::I64(v) => query.bind(v),
-        };
-    }
-    for bind in &filter_binds {
-        query = match bind {
-            EqBind::Text(v) => query.bind(v),
-            EqBind::Num(v) => query.bind(v),
-            EqBind::Bool(v) => query.bind(v),
-            EqBind::I64(v) => query.bind(v),
-        };
-    }
-    query = query.bind(i64::from(limit));
     let mut rows = query.fetch_all(pool).await?;
 
-    if unique {
+    if terminal == "unique" {
         if rows.len() > 1 {
             return Err(RtDbError::precondition(
                 "unique query matched multiple documents",
@@ -1704,7 +1903,7 @@ async fn execute_collect_terminal(
         };
     }
 
-    if first {
+    if terminal == "first" {
         return match rows.pop() {
             Some((id, doc, created_at, version)) => Ok(QueryResult::Doc(Some(merge_doc(
                 id, doc, created_at, version,
@@ -2352,8 +2551,31 @@ fn plainto_tsquery_sql(language: Option<&str>, ph: usize) -> String {
 /// `StepCtx` (`txn.rs`) bundles the write-path inputs. Borrow-only: every
 /// field is a shared reference (these terminals read, never mutate), so it
 /// threads through `&SearchCtx` cleanly. QA-105.
+/// Shared borrow-only context for the four read-path terminals that don't
+/// use the btree `QueryWindow` (point_read + the search family). Constructed
+/// once from the caller-resolved inputs and passed by shared reference; each
+/// terminal destructures it back into the same locals the inline body used.
 struct SearchCtx<'a> {
     pool: &'a PgPool,
+    // `db` and `table_name` are read by the compile fns via `CompileSearchCtx`;
+    // they remain on this struct for symmetry and for any future execute tail
+    // that needs them (point_read today reads only pool + the auth helpers).
+    #[allow(dead_code)]
+    db: &'a str,
+    table_def: &'a TableDef,
+    #[allow(dead_code)]
+    table_name: &'a str,
+    owner_field: Option<&'a str>,
+    collaborators_field: Option<&'a str>,
+    ctx: &'a PrincipalCtx,
+}
+
+/// Compile-only view of [`SearchCtx`] — every field EXCEPT `pool`. The compile
+/// fns are pure (no I/O), so they take this smaller context; the execute tails
+/// take the pool directly. The fields here are the same names/types as
+/// `SearchCtx`'s, so the compile bodies read identically to the pre-refactor
+/// inline bodies.
+struct CompileSearchCtx<'a> {
     db: &'a str,
     table_def: &'a TableDef,
     table_name: &'a str,
@@ -2362,12 +2584,19 @@ struct SearchCtx<'a> {
     ctx: &'a PrincipalCtx,
 }
 
-async fn execute_search(
-    sctx: &SearchCtx<'_>,
+/// Full-text search terminal SQL compilation. Compile half of the former
+/// inline `execute_search` body — SQL and bind-order byte-for-byte identical
+/// to the pre-refactor cascade. Bind order: `$1` is the search query text
+/// (tsquery), the optional client `filter` compiles next at `$2`, then the
+/// per-row owner/collaborator and `authorize` predicates, then `LIMIT`. The
+/// search text and the limit are encoded as `EqBind::Text` / `EqBind::I64`
+/// respectively so the executor uses the same bind loop every other terminal
+/// does; this preserves the pre-refactor bind sequence exactly.
+fn compile_search(
+    sctx: &CompileSearchCtx<'_>,
     search: &SearchQuery,
     take: Option<u32>,
-) -> Result<QueryResult, RtDbError> {
-    let pool = sctx.pool;
+) -> Result<CompiledQuery, RtDbError> {
     let db = sctx.db;
     let table_def = sctx.table_def;
     let table_name = sctx.table_name;
@@ -2433,9 +2662,25 @@ async fn execute_search(
          ORDER BY ts_rank(\"{sv_col}\", {tsq}) DESC, \"created_at\" DESC, \"id\" DESC \
          LIMIT ${limit_ph}"
     );
-    let mut query =
-        sqlx::query_as::<_, (String, serde_json::Value, i64, i64)>(&sql).bind(&search.query);
-    for bind in &binds {
+    // The leading bind is the tsquery text (mirrors the pre-refactor
+    // `.bind(&search.query)` that came before the bind loop); the trailing
+    // bind is the LIMIT. Both are folded into the same Vec<EqBind> the
+    // executor drains in order.
+    let mut all = Vec::with_capacity(1 + binds.len() + 1);
+    all.push(EqBind::Text(search.query.clone()));
+    all.extend(binds);
+    all.push(EqBind::I64(i64::from(limit)));
+    Ok(CompiledQuery {
+        sql,
+        binds: all,
+        terminal: "search",
+    })
+}
+
+async fn execute_search(cq: CompiledQuery, pool: &PgPool) -> Result<QueryResult, RtDbError> {
+    let CompiledQuery { sql, binds, .. } = cq;
+    let mut query = sqlx::query_as::<_, (String, serde_json::Value, i64, i64)>(&sql);
+    for bind in binds {
         query = match bind {
             EqBind::Text(v) => query.bind(v),
             EqBind::Num(v) => query.bind(v),
@@ -2443,7 +2688,7 @@ async fn execute_search(
             EqBind::I64(v) => query.bind(v),
         };
     }
-    let rows = query.bind(i64::from(limit)).fetch_all(pool).await?;
+    let rows = query.fetch_all(pool).await?;
     let docs = rows
         .into_iter()
         .map(|(id, doc, created_at, version)| merge_doc(id, doc, created_at, version))
@@ -2451,19 +2696,23 @@ async fn execute_search(
     Ok(QueryResult::Docs(docs))
 }
 
-/// Vector-similarity terminal: ranks rows by the index's declared metric
-/// distance (`<=>`/`<->`/`<#>` for cosine/l2/ip) between the index's `v_<index>`
-/// column and the query vector, ascending, limited to `limit`. Optional `filter`
-/// eq-binds over the index's declared `filterFields`.
+/// Vector-similarity terminal SQL compilation: ranks rows by the index's
+/// declared metric distance (`<=>`/`<->`/`<#>` for cosine/l2/ip) between the
+/// index's `v_<index>` column and the query vector, ascending, limited to
+/// `limit`. Optional `filter` eq-binds over the index's declared `filterFields`.
 /// Unknown index / length mismatch / unknown filter key / out-of-range limit
 /// → `BadRequest`. Bind order: filter eq-binds occupy `$1..$k`, then (when the
 /// table is owner-gated and the caller is a user) the owner id occupies
-/// `$(k+1)`, then the query vector (`$n::vector`), then `limit`.
-async fn execute_vector_search(
-    sctx: &SearchCtx<'_>,
+/// `$(k+1)`, then the query vector (`$n::vector`), then `limit`. Compile half
+/// of the former inline `execute_vector_search` body — SQL and bind-order
+/// byte-for-byte identical to the pre-refactor cascade; the query vector (in
+/// its `[a,b,c]` text form) and the limit are encoded as `EqBind::Text` and
+/// `EqBind::I64` so the executor uses the same bind loop every other terminal
+/// does.
+fn compile_vector_search(
+    sctx: &CompileSearchCtx<'_>,
     vs: &VectorSearchQuery,
-) -> Result<QueryResult, RtDbError> {
-    let pool = sctx.pool;
+) -> Result<CompiledQuery, RtDbError> {
     let db = sctx.db;
     let table_def = sctx.table_def;
     let table_name = sctx.table_name;
@@ -2566,8 +2815,21 @@ async fn execute_vector_search(
          LIMIT ${limit_ph}"
     );
 
+    let mut all = Vec::with_capacity(binds.len() + 2);
+    all.extend(binds);
+    all.push(EqBind::Text(qvec_text));
+    all.push(EqBind::I64(i64::from(vs.limit)));
+    Ok(CompiledQuery {
+        sql,
+        binds: all,
+        terminal: "vectorSearch",
+    })
+}
+
+async fn execute_vector_search(cq: CompiledQuery, pool: &PgPool) -> Result<QueryResult, RtDbError> {
+    let CompiledQuery { sql, binds, .. } = cq;
     let mut query = sqlx::query_as::<_, (String, serde_json::Value, i64, i64)>(&sql);
-    for bind in &binds {
+    for bind in binds {
         query = match bind {
             EqBind::Text(v) => query.bind(v),
             EqBind::Num(v) => query.bind(v),
@@ -2575,11 +2837,7 @@ async fn execute_vector_search(
             EqBind::I64(v) => query.bind(v),
         };
     }
-    let rows = query
-        .bind(qvec_text)
-        .bind(i64::from(vs.limit))
-        .fetch_all(pool)
-        .await?;
+    let rows = query.fetch_all(pool).await?;
     let docs = rows
         .into_iter()
         .map(|(id, doc, created_at, version)| merge_doc(id, doc, created_at, version))
@@ -2587,23 +2845,26 @@ async fn execute_vector_search(
     Ok(QueryResult::Docs(docs))
 }
 
-/// Hybrid search terminal: fuses full-text (`ts_rank`) and vector ranking (the
-/// resolved vector index's metric operator) over the same table via RRF. The
-/// table must declare BOTH a search index (tsvector) AND a vector index; if
-/// either is missing → `BadRequest`. The candidate set is the UNION of rows
-/// matching `plainto_tsquery($text)` and rows with a non-null vector; both
-/// rankings are computed in a single statement with window functions and fused
-/// as `1/(k + r_text) + 1/(k + r_vec)` (default `k = 60`). Bind order: the text
-/// query (`$1`, referenced in WHERE/ts_rank), the owner id (`$2`) when
-/// owner-enforced, the query vector (`$n::vector`), the RRF constant `k`, then
-/// `limit`. Column names come from `pg_search_col`/`pg_vector_col` over the
-/// resolved indexes (auto-selected when not named); all identifiers are
-/// schema-validated and double-quoted; every value is `$n`-bound.
-async fn execute_hybrid_search(
-    sctx: &SearchCtx<'_>,
+/// Hybrid search terminal SQL compilation: fuses full-text (`ts_rank`) and
+/// vector ranking (the resolved vector index's metric operator) over the same
+/// table via RRF. The table must declare BOTH a search index (tsvector) AND a
+/// vector index; if either is missing → `BadRequest`. The candidate set is the
+/// UNION of rows matching `plainto_tsquery($text)` and rows with a non-null
+/// vector; both rankings are computed in a single statement with window
+/// functions and fused as `1/(k + r_text) + 1/(k + r_vec)` (default `k = 60`).
+/// Bind order: the text query (`$1`, referenced in WHERE/ts_rank), the owner id
+/// (`$2`) when owner-enforced, the query vector (`$n::vector`), the RRF constant
+/// `k`, then `limit`. Column names come from `pg_search_col`/`pg_vector_col`
+/// over the resolved indexes (auto-selected when not named); all identifiers
+/// are schema-validated and double-quoted; every value is `$n`-bound. Compile
+/// half of the former inline `execute_hybrid_search` body — SQL and bind-order
+/// byte-for-byte identical to the pre-refactor cascade; the text query, query
+/// vector (as `[a,b,c]` text), RRF `k`, and limit are all folded into the
+/// single `binds: Vec<EqBind>` the executor drains in order.
+fn compile_hybrid_search(
+    sctx: &CompileSearchCtx<'_>,
     hs: &HybridSearchQuery,
-) -> Result<QueryResult, RtDbError> {
-    let pool = sctx.pool;
+) -> Result<CompiledQuery, RtDbError> {
     let db = sctx.db;
     let table_def = sctx.table_def;
     let table_name = sctx.table_name;
@@ -2752,9 +3013,23 @@ async fn execute_hybrid_search(
          LIMIT ${limit_ph}"
     );
 
-    let mut query =
-        sqlx::query_as::<_, (String, serde_json::Value, i64, i64)>(&sql).bind(&hs.query);
-    for bind in auth_binds {
+    let mut all = Vec::with_capacity(1 + auth_binds.len() + 3);
+    all.push(EqBind::Text(hs.query.clone()));
+    all.extend(auth_binds);
+    all.push(EqBind::Text(qvec_text));
+    all.push(EqBind::I64(k));
+    all.push(EqBind::I64(i64::from(hs.limit)));
+    Ok(CompiledQuery {
+        sql,
+        binds: all,
+        terminal: "hybridSearch",
+    })
+}
+
+async fn execute_hybrid_search(cq: CompiledQuery, pool: &PgPool) -> Result<QueryResult, RtDbError> {
+    let CompiledQuery { sql, binds, .. } = cq;
+    let mut query = sqlx::query_as::<_, (String, serde_json::Value, i64, i64)>(&sql);
+    for bind in binds {
         query = match bind {
             EqBind::Text(v) => query.bind(v),
             EqBind::Num(v) => query.bind(v),
@@ -2762,12 +3037,7 @@ async fn execute_hybrid_search(
             EqBind::I64(v) => query.bind(v),
         };
     }
-    let rows = query
-        .bind(qvec_text)
-        .bind(k)
-        .bind(i64::from(hs.limit))
-        .fetch_all(pool)
-        .await?;
+    let rows = query.fetch_all(pool).await?;
     let docs = rows
         .into_iter()
         .map(|(id, doc, created_at, version)| merge_doc(id, doc, created_at, version))
@@ -2775,26 +3045,48 @@ async fn execute_hybrid_search(
     Ok(QueryResult::Docs(docs))
 }
 
+/// `get` (point read) terminal SQL compilation. Compile half of the former
+/// inline `point_read` body — SQL byte-for-byte identical to the pre-refactor
+/// cascade. The id bind is encoded as `EqBind::Text` so the executor uses the
+/// same bind loop every other terminal does. Per-row owner/collaborator and
+/// `authorize` filtering happen post-fetch in the executor (silent filter —
+/// Convex-like), so neither appears in the SQL.
+fn compile_point_read(sctx: &CompileSearchCtx<'_>, id: &str) -> Result<CompiledQuery, RtDbError> {
+    let db = sctx.db;
+    let table_name = sctx.table_name;
+    let pg_schema_name = pg_schema(db);
+    let table_ident = pg_table(table_name);
+    let sql = format!(
+        "SELECT \"id\", \"doc\", \"created_at\", \"version\" FROM \"{pg_schema_name}\".\"{table_ident}\" WHERE \"id\" = $1"
+    );
+    Ok(CompiledQuery {
+        sql,
+        binds: vec![EqBind::Text(id.to_string())],
+        terminal: "get",
+    })
+}
+
 async fn point_read(
     sctx: &SearchCtx<'_>,
-    id: &str,
+    cq: CompiledQuery,
     owner: Option<&str>,
 ) -> Result<QueryResult, RtDbError> {
     let pool = sctx.pool;
-    let db = sctx.db;
     let table_def = sctx.table_def;
-    let table_name = sctx.table_name;
     let owner_field = sctx.owner_field;
     let collaborators_field = sctx.collaborators_field;
     let ctx = sctx.ctx;
-    let pg_schema_name = pg_schema(db);
-    let table_ident = pg_table(table_name);
-    let row: Option<(String, serde_json::Value, i64, i64)> = sqlx::query_as(&format!(
-        "SELECT \"id\", \"doc\", \"created_at\", \"version\" FROM \"{pg_schema_name}\".\"{table_ident}\" WHERE \"id\" = $1"
-    ))
-    .bind(id)
-    .fetch_optional(pool)
-    .await?;
+    let CompiledQuery { sql, binds, .. } = cq;
+    let mut query = sqlx::query_as::<_, (String, serde_json::Value, i64, i64)>(&sql);
+    for bind in binds {
+        query = match bind {
+            EqBind::Text(v) => query.bind(v),
+            EqBind::Num(v) => query.bind(v),
+            EqBind::Bool(v) => query.bind(v),
+            EqBind::I64(v) => query.bind(v),
+        };
+    }
+    let row: Option<(String, serde_json::Value, i64, i64)> = query.fetch_optional(pool).await?;
 
     match row {
         Some((id, doc, created_at, version)) => {

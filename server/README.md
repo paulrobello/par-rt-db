@@ -62,6 +62,7 @@ alongside it: [`../ts-client/`](../ts-client) (browser/Node),
 | Backup lifecycle (when `RTDB_BACKUP_ENABLED=true`) | `src/backup.rs` (manual `pg_dump` trigger + dump list/download/delete; `pg_restore --no-owner --no-privileges` into a fresh `rtdb_restored_<stamp>` DB) |
 | Rate limiter (per-token + per-db fixed window) | `src/rate_limit.rs` (`RTDB_RATE_LIMIT_PER_TOKEN_RPM` / `RTDB_RATE_LIMIT_PER_DB_RPM`, 0 = off) |
 | OpenTelemetry / OTLP tracing (ENH-018, opt-in) | `src/tracing_setup.rs` (subscriber init + `OtelGuard` flush); span instrumentation in `committer.rs`/`subs.rs`/`query.rs`/`txn.rs`. The `otel` cargo feature (default off) gates the deps + subscriber; `RTDB_OTEL_ENABLED` (default false) gates it at runtime. `committer.mutate` carries `queue_wait_ms`. |
+| Query introspection (ENH-019) | `POST /admin/db/{db}/explain` (re-compiles a Query JSON via `compile_query`, returns `{sql, params, terminal, warnings}` — no rows) and `GET /admin/slow-queries` (bounded ring of queries that exceeded `RTDB_SLOW_QUERY_MS`). Ring + `SlowQueryRecord` in `src/metrics.rs`; explain + slow-query recording in `src/http_api.rs`; list endpoint in `src/admin/observability.rs`. `RTDB_SLOW_QUERY_MS=0` (default) disables; `RTDB_SLOW_QUERY_LOG_PARAMS=false` (default) keeps document content out of the log. |
 | Mutation-log dedup (idempotency) | `src/mutation_log.rs` |
 | Op feed (in-memory ring + `/admin/stream`) | `src/op_feed.rs` |
 | Snapshot export/import | `src/snapshot.rs` |

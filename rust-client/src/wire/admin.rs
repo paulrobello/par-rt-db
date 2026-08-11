@@ -786,3 +786,54 @@ pub(crate) struct DeliveriesResponse {
 pub(crate) struct AuditResponse {
     pub(crate) entries: Vec<AuditEntry>,
 }
+
+/// `POST /admin/db/{db}/explain` → the compiled SQL + ordered bind params for
+/// a Query DSL body (ENH-019). Mirrors server `admin::observability::ExplainResponse`.
+/// `sql` is byte-identical to what the read path executes; `params` carries
+/// the same `$1..$n` binds formatted as strings; `warnings` surfaces
+/// compile-time concerns (e.g. a filter on a declared-but-unindexed field).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct ExplainResult {
+    pub sql: String,
+    pub params: Vec<String>,
+    pub terminal: String,
+    pub warnings: Vec<String>,
+}
+
+/// One row of [`SlowQueriesResponse::queries`]: a recorded slow-query event
+/// (ENH-019). Mirrors server `metrics::SlowQueryRecord`. `params` is included
+/// only when the server has `RTDB_SLOW_QUERY_LOG_PARAMS=true` — otherwise it
+/// is omitted on the wire and deserializes to `None` to keep document content
+/// out of the log by default.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct SlowQueryEntry {
+    /// When the query started, as epoch milliseconds.
+    pub started_at_ms: i64,
+    /// Wall-clock duration in milliseconds.
+    pub duration_ms: u64,
+    pub db: String,
+    pub table: String,
+    pub terminal: String,
+    pub sql: String,
+    /// Bound parameters; `None` when the server redacts them (the default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<Vec<String>>,
+}
+
+/// `GET /admin/slow-queries?db=<optional>&limit=<n>` response (ENH-019): the
+/// bounded in-memory ring newest-first. Mirrors server
+/// `admin::observability::SlowQueriesResponse`. `threshold_ms` is the
+/// configured `RTDB_SLOW_QUERY_MS` (0 = logging disabled → `queries` is
+/// empty); `capacity` is the configured ring-buffer cap.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct SlowQueriesResponse {
+    pub queries: Vec<SlowQueryEntry>,
+    pub threshold_ms: u64,
+    pub capacity: usize,
+}

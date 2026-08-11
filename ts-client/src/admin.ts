@@ -355,6 +355,39 @@ export interface SchemaPreviewDiff {
   rejected: SchemaPreviewRejection[];
 }
 
+/** Result of POST /admin/db/{db}/explain — the compiled SQL for a query, with
+ *  bind values formatted as strings (numbers/booleans via Display) and any
+ *  compile-time warnings (e.g. unindexed-filter). `terminal` is the query
+ *  terminal kind (get|collect|count|unique|first|distinct|aggregate|paginate|
+ *  search|vectorSearch|hybridSearch). */
+export interface ExplainResult {
+  sql: string;
+  params: string[];
+  terminal: string;
+  warnings: string[];
+}
+
+/** One entry from GET /admin/slow-queries. `params` is omitted from the server
+ *  JSON when redacted (the default) and present as string[] when
+ *  `RTDB_SLOW_QUERY_LOG_PARAMS=true`. */
+export interface SlowQueryEntry {
+  startedAtMs: number;
+  durationMs: number;
+  db: string;
+  table: string;
+  terminal: string;
+  sql: string;
+  params?: string[];
+}
+
+/** Response envelope for GET /admin/slow-queries. `thresholdMs` is 0 when slow
+ *  query logging is disabled. */
+export interface SlowQueriesResponse {
+  queries: SlowQueryEntry[];
+  thresholdMs: number;
+  capacity: number;
+}
+
 function toSchemaJson(schema: SchemaDefinition<any> | SchemaJson): SchemaJson {
   return "toJSON" in schema && typeof schema.toJSON === "function"
     ? schema.toJSON()
@@ -695,6 +728,32 @@ export class RtDbAdminClient {
       query: json,
     });
     return (body as { result: unknown }).result;
+  }
+
+  /** Compile-time query introspection (POST /admin/db/{db}/explain). Accepts
+   *  either a typed `RtQuery<R>` builder or a raw `QueryJson` and returns the
+   *  compiled SQL (`$1`-bound, never interpolated literals), the bind params
+   *  formatted as strings, the terminal kind, and any compile warnings. */
+  async explainQuery(db: string, query: RtQuery<unknown> | QueryJson): Promise<ExplainResult> {
+    const json = "json" in query ? query.json : query;
+    return (await this.request("POST", `/admin/db/${encodeURIComponent(db)}/explain`, {
+      query: json,
+    })) as ExplainResult;
+  }
+
+  /** Slow-query log inspector (GET /admin/slow-queries). Returns recent slow
+   *  queries across every db (or one `db` when filtered), the configured
+   *  threshold (0 = logging disabled), and the ring-buffer capacity. `limit`
+   *  caps the number of entries returned. */
+  async getSlowQueries(opts?: { db?: string; limit?: number }): Promise<SlowQueriesResponse> {
+    const params = new URLSearchParams();
+    if (opts?.db) params.set("db", opts.db);
+    if (opts?.limit !== undefined) params.set("limit", String(opts.limit));
+    const qs = params.toString();
+    return (await this.request(
+      "GET",
+      `/admin/slow-queries${qs ? `?${qs}` : ""}`,
+    )) as SlowQueriesResponse;
   }
 
   /** Owner-bypass document write (POST /admin/db/{db}/mutate). Body shapes match /api/mutate;

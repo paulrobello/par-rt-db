@@ -17,6 +17,8 @@ Surface covered:
 * admins — ``/admin/admins`` (list / add / remove)
 * introspection — ``dbs/{db}/stats`` / ``metrics`` / ``ops/recent`` /
   ``config`` (get + patch)
+* query introspection (ENH-019) — ``db/{db}/explain`` (compiled SQL + params)
+  and ``slow-queries`` (the bounded slow-query ring)
 * owner-bypass data access — ``/admin/db/{db}/query|mutate``
 * managed backups — ``backup`` / ``backups`` / ``restore``
 * token management (ENH-005) — ``mint-token`` / ``revoke-token`` / ``tokens``
@@ -77,6 +79,7 @@ from .admin_models import (
     AuditEntry,
     ConfigResponse,
     DbStats,
+    ExplainResult,
     HotConfigPatch,
     MetricsSnapshot,
     MigrateResult,
@@ -85,6 +88,7 @@ from .admin_models import (
     SchemaHistoryEntry,
     SchemaHistorySummary,
     SessionInfo,
+    SlowQueriesResponse,
     SubscriptionsResponse,
     TokenInfo,
     Webhook,
@@ -624,6 +628,25 @@ def _op_get_subscriptions(db: str | None = None) -> _AdminRequest:
     )
 
 
+def _op_explain(db: str, query: Query | TableQuery) -> _AdminRequest:
+    built = query.build() if isinstance(query, TableQuery) else query
+    body = {"query": built.model_dump(by_alias=True, mode="json")}
+    return _AdminRequest(
+        "POST", f"/admin/db/{db}/explain", {"json": body}, _parse_model(ExplainResult)
+    )
+
+
+def _op_slow_queries(*, db: str | None = None, limit: int | None = None) -> _AdminRequest:
+    params: dict[str, Any] = {}
+    if db is not None:
+        params["db"] = db
+    if limit is not None:
+        params["limit"] = limit
+    return _AdminRequest(
+        "GET", "/admin/slow-queries", {"params": params}, _parse_model(SlowQueriesResponse)
+    )
+
+
 # ---------------------------------------------------------------------------
 # Executors — one sync, one async. Each performs the HTTP call described by an
 # ``_AdminRequest`` and hands the successful response to its ``parse`` closure.
@@ -688,12 +711,12 @@ class RtDbAdminClient:
 
     Full admin surface: db lifecycle (incl. clone), schema push/get/migrate +
     history/restore, export/import, allowlist + admin-member management,
-    introspection (stats/metrics/ops/config), owner-bypass query/mutate, managed
-    backups, the ENH-005 token triple, interactive sessions, webhooks, the audit
-    log, and the live subscription inspector. Routes, bodies, and response
-    models are byte-identical with the server and with
-    :class:`par_rt_db.http_client.RtDbHttpClient`'s admin methods (both delegate
-    to the same request layer — see :mod:`par_rt_db.admin`).
+    introspection (stats/metrics/ops/config + explain/slow-queries), owner-bypass
+    query/mutate, managed backups, the ENH-005 token triple, interactive
+    sessions, webhooks, the audit log, and the live subscription inspector.
+    Routes, bodies, and response models are byte-identical with the server and
+    with :class:`par_rt_db.http_client.RtDbHttpClient`'s admin methods (both
+    delegate to the same request layer — see :mod:`par_rt_db.admin`).
     """
 
     def __init__(
@@ -1208,6 +1231,37 @@ class RtDbAdminClient:
         """
         return self._executor.run(_op_get_subscriptions(db))
 
+    # --- query introspection (ENH-019) ---
+
+    def explain_query(self, db: str, query: Query | TableQuery) -> ExplainResult:
+        """``POST /admin/db/{db}/explain`` ``{query}`` → compiled SQL + params +
+        terminal + warnings.
+
+        Owner-bypass is implicit (admin route). The body shape mirrors
+        :meth:`admin_query` — ``db`` rides in the URL, the (optionally built)
+        :class:`Query` rides as ``{query}``. ``params`` is the bind-parameter
+        list (already stringified server-side); ``warnings`` carries any
+        over-approximation or redaction notices.
+        """
+        return self._executor.run(_op_explain(db, query))
+
+    def get_slow_queries(
+        self,
+        *,
+        db: str | None = None,
+        limit: int | None = None,
+    ) -> SlowQueriesResponse:
+        """``GET /admin/slow-queries[?db=&limit=]`` → bounded slow-query ring.
+
+        Each entry's ``params`` is ``None`` when the server redacted them (the
+        ring stores the bind list but the server may withhold it for queries
+        that touched sensitive fields). ``threshold_ms`` and ``capacity`` echo
+        the boot config (``RTDB_SLOW_QUERY_THRESHOLD_MS`` /
+        ``RTDB_SLOW_QUERY_RING_CAP``). Both filters are optional; omitted
+        filters are not sent.
+        """
+        return self._executor.run(_op_slow_queries(db=db, limit=limit))
+
 
 class AsyncRtDbAdminClient:
     """Async twin of :class:`RtDbAdminClient` (the ``[aio]`` extra).
@@ -1641,3 +1695,25 @@ class AsyncRtDbAdminClient:
         See :meth:`RtDbAdminClient.get_subscriptions` for response semantics.
         """
         return await self._executor.run(_op_get_subscriptions(db))
+
+    # --- query introspection (ENH-019) ---
+
+    async def explain_query(self, db: str, query: Query | TableQuery) -> ExplainResult:
+        """``POST /admin/db/{db}/explain`` → compiled SQL + params + warnings (async).
+
+        See :meth:`RtDbAdminClient.explain_query` for body semantics.
+        """
+        return await self._executor.run(_op_explain(db, query))
+
+    async def get_slow_queries(
+        self,
+        *,
+        db: str | None = None,
+        limit: int | None = None,
+    ) -> SlowQueriesResponse:
+        """``GET /admin/slow-queries[?db=&limit=]`` → bounded slow-query ring (async).
+
+        See :meth:`RtDbAdminClient.get_slow_queries` for filter and redaction
+        semantics.
+        """
+        return await self._executor.run(_op_slow_queries(db=db, limit=limit))

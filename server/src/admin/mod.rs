@@ -330,6 +330,12 @@ pub fn admin_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
             post(admin_resume_schedule),
         )
         .route("/admin/metrics", get(metrics_handler))
+        // ENH-019: query introspection. `/explain` compiles a Query DSL body
+        // for inspection (no execution); `/slow-queries` reads the bounded
+        // slow-query log. Both are admin-gated at the router layer like every
+        // other route in this table.
+        .route("/admin/db/{db}/explain", post(admin_explain))
+        .route("/admin/slow-queries", get(list_slow_queries))
         .route("/admin/config", get(get_config).patch(patch_config))
         .route("/admin/backup", post(create_backup))
         .route("/admin/backups", get(list_backups))

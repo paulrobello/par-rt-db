@@ -27,6 +27,7 @@ from par_rt_db.admin import (
     AuditEntry,
     ConfigResponse,
     DbStats,
+    ExplainResult,
     HotConfigPatch,
     MetricsSnapshot,
     MintedToken,
@@ -35,6 +36,7 @@ from par_rt_db.admin import (
     SchemaHistoryEntry,
     SchemaHistorySummary,
     SessionInfo,
+    SlowQueriesResponse,
     SubscriptionsResponse,
     TokenInfo,
     Webhook,
@@ -1711,3 +1713,168 @@ def test_metrics_snapshot_includes_per_db_subs() -> None:
     assert len(snap.per_db_subs) == 1
     assert snap.per_db_subs[0].db == "kanban"
     assert snap.per_db_subs[0].reruns == 5
+
+
+# --- ENH-019: query introspection (explain + slow-queries) ----------------
+
+
+_EXPLAIN_RESPONSE = {
+    "sql": 'SELECT "doc" FROM "items" WHERE ("doc" @> $1) LIMIT $2',
+    "params": ["active", "50"],
+    "terminal": "collect",
+    "warnings": ["over-approximated: membership check"],
+}
+
+
+def test_explain_result_model_validate_maps_camelcase() -> None:
+    r = ExplainResult.model_validate(_EXPLAIN_RESPONSE)
+    assert isinstance(r, ExplainResult)
+    assert r.sql.startswith("SELECT")
+    assert r.params == ["active", "50"]
+    assert r.terminal == "collect"
+    assert r.warnings == ["over-approximated: membership check"]
+
+
+def test_explain_query_posts_query_body_and_parses_result() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["method"] = request.method
+        captured["path"] = request.url.path
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json=_EXPLAIN_RESPONSE)
+
+    with _sync_client(handler) as c:
+        result = c.explain_query("dbx", TableQuery("items").take(50))
+    assert captured["method"] == "POST"
+    assert captured["path"] == "/admin/db/dbx/explain"
+    # db rides in the URL, not the body — mirrors admin_query
+    assert "db" not in captured["body"]
+    assert "query" in captured["body"]
+    assert isinstance(result, ExplainResult)
+    assert result.terminal == "collect"
+    assert result.params == ["active", "50"]
+
+
+def test_explain_query_accepts_built_query() -> None:
+    """A pre-built ``Query`` (not a ``TableQuery``) is sent as-is."""
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json=_EXPLAIN_RESPONSE)
+
+    built = TableQuery("items").take(2).build()
+    with _sync_client(handler) as c:
+        c.explain_query("dbx", built)
+    assert "query" in captured["body"]
+
+
+async def test_async_explain_query_builds_request() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["auth"] = request.headers["authorization"]
+        captured["path"] = request.url.path
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json=_EXPLAIN_RESPONSE)
+
+    async with _async_client(handler) as c:
+        result = await c.explain_query("dbx", TableQuery("items").take(2))
+    assert captured["auth"] == ADMIN_BEARER
+    assert captured["path"] == "/admin/db/dbx/explain"
+    assert isinstance(result, ExplainResult)
+    assert result.sql.startswith("SELECT")
+
+
+_SLOW_QUERY_ROW_WITH_PARAMS = {
+    "startedAtMs": 1700000000000,
+    "durationMs": 42,
+    "db": "kanban",
+    "table": "items",
+    "terminal": "collect",
+    "sql": 'SELECT "doc" FROM "items"',
+    "params": ["active"],
+}
+_SLOW_QUERY_ROW_REDACTED = {
+    "startedAtMs": 1700000001000,
+    "durationMs": 99,
+    "db": "other",
+    "table": "projects",
+    "terminal": "first",
+    "sql": 'SELECT "doc" FROM "projects" LIMIT 1',
+    # params omitted — redacted by the server
+}
+_SLOW_QUERIES_RESPONSE = {
+    "queries": [_SLOW_QUERY_ROW_WITH_PARAMS, _SLOW_QUERY_ROW_REDACTED],
+    "thresholdMs": 0,
+    "capacity": 200,
+}
+
+
+def test_slow_queries_response_model_validate_maps_camelcase() -> None:
+    r = SlowQueriesResponse.model_validate(_SLOW_QUERIES_RESPONSE)
+    assert isinstance(r, SlowQueriesResponse)
+    assert r.threshold_ms == 0
+    assert r.capacity == 200
+    assert len(r.queries) == 2
+    with_params = r.queries[0]
+    assert with_params.started_at_ms == 1700000000000
+    assert with_params.duration_ms == 42
+    assert with_params.db == "kanban"
+    assert with_params.table == "items"
+    assert with_params.terminal == "collect"
+    assert with_params.params == ["active"]
+    redacted = r.queries[1]
+    assert redacted.params is None  # omitted on the wire -> None
+    assert redacted.terminal == "first"
+
+
+def test_get_slow_queries_no_filters_omits_params() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["method"] = request.method
+        captured["path"] = request.url.path
+        captured["params"] = dict(request.url.params)
+        return httpx.Response(200, json=_SLOW_QUERIES_RESPONSE)
+
+    with _sync_client(handler) as c:
+        r = c.get_slow_queries()
+    assert captured["method"] == "GET"
+    assert captured["path"] == "/admin/slow-queries"
+    assert captured["params"] == {}
+    assert isinstance(r, SlowQueriesResponse)
+    assert r.capacity == 200
+
+
+def test_get_slow_queries_with_db_and_limit_sends_params() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["params"] = dict(request.url.params)
+        return httpx.Response(200, json=_SLOW_QUERIES_RESPONSE)
+
+    with _sync_client(handler) as c:
+        r = c.get_slow_queries(db="kanban", limit=5)
+    assert captured["params"] == {"db": "kanban", "limit": "5"}
+    assert isinstance(r, SlowQueriesResponse)
+    assert len(r.queries) == 2  # fixture has two rows; server-side filtering is not mocked
+
+
+async def test_async_get_slow_queries_builds_request() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["auth"] = request.headers["authorization"]
+        captured["path"] = request.url.path
+        captured["params"] = dict(request.url.params)
+        return httpx.Response(200, json=_SLOW_QUERIES_RESPONSE)
+
+    async with _async_client(handler) as c:
+        r = await c.get_slow_queries(db="kanban")
+    assert captured["auth"] == ADMIN_BEARER
+    assert captured["path"] == "/admin/slow-queries"
+    assert captured["params"] == {"db": "kanban"}
+    assert isinstance(r, SlowQueriesResponse)
+    assert r.threshold_ms == 0
