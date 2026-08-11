@@ -1,0 +1,41 @@
+# Root cargo workspace uniting par-rt-db's three Rust crates
+# (ARC-117). Before this, `server/`, `rust-client/`, and `cli/` were three
+# independent packages: each carried its own Cargo.lock and built its own
+# target/, and the shared dependencies happened to be version-aligned but
+# nothing enforced it. Under the workspace there is one Cargo.lock, one
+# shared target/, and the shared deps are declared once here so a version
+# drift between members is a compile error, not a silent divergence.
+#
+# The Makefile's per-crate invocations (`cd server && cargo ...`,
+# `--manifest-path rust-client/Cargo.toml`, etc.) keep working unchanged:
+# cargo resolves the workspace from the member manifest's location.
+[workspace]
+resolver = "2"
+members = ["server", "rust-client", "cli"]
+
+# Deps shared by two or more members. Members opt in via `dep.workspace = true`
+# and may ADD features (member features are unioned onto the base declared here)
+# but cannot remove `default-features` the workspace enables, so every base
+# below is the lowest common denominator; members re-add what they need
+# (e.g. server re-adds `cookies` on reqwest and `std` on sha2).
+[workspace.dependencies]
+# Shared by server + rust-client (+ cli for serde_json/anyhow).
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+base64 = "0.22"
+# Both server and rust-client use rustls-tls + json; server additionally needs
+# `cookies` (re-added in server/Cargo.toml). default-features = false is the
+# common baseline so neither pulls in the native-tls backend.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tokio = { version = "1" }
+# server wants default (std) features; rust-client compiles it without defaults
+# (optional, behind `in_memory`). Base = no defaults so rust-client stays
+# minimal; server re-adds `std` to preserve its prior behavior exactly.
+sha2 = { version = "0.10", default-features = false }
+tokio-tungstenite = { version = "0.26" }
+futures-util = { version = "0.3" }
+# dev-deps shared by server + rust-client.
+wiremock = "0.6"
+# dev-dep in server, prod dep in cli.
+anyhow = "1"

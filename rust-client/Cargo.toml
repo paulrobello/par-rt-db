@@ -21,19 +21,19 @@ warnings = "deny"
 all = { level = "warn", priority = -1 }
 
 [dependencies]
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-thiserror = "2"
-base64 = "0.22"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
-tokio = { version = "1", features = ["macros", "rt", "sync", "time"], optional = true }
-tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"], optional = true }
-futures-util = { version = "0.3", optional = true }
-sha2 = { version = "0.10", default-features = false, optional = true }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+base64.workspace = true
+reqwest = { workspace = true, optional = true }
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"], optional = true }
+tokio-tungstenite = { workspace = true, features = ["rustls-tls-webpki-roots"], optional = true }
+futures-util = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
-wiremock = "0.6"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+wiremock.workspace = true
 
 # ARC-110: declare each test binary's feature dependencies so `cargo check
 # --all-targets` (what `cargo test` builds) compiles under every feature

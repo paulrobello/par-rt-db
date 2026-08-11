@@ -9,18 +9,21 @@ arc-swap = "1"
 async-trait = "0.1"
 axum = { version = "0.8", features = ["ws"] }
 bytes = "1"
-tokio = { version = "1", features = ["full"] }
+tokio = { workspace = true, features = ["full"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace", "cors", "fs"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde.workspace = true
+serde_json.workspace = true
 sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres", "json"] }
-thiserror = "2"
+thiserror.workspace = true
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v7"] }
-sha2 = "0.10"
+# `std` re-adds sha2's default features (the workspace base ships
+# default-features = false so rust-client can stay minimal); this matches the
+# pre-workspace `sha2 = "0.10"` behavior exactly.
+sha2 = { workspace = true, features = ["std"] }
 hex = "0.4"
 rand = "0.8"
 subtle = "2"
@@ -28,8 +31,8 @@ subtle = "2"
 # compiled transitively via rustls (sqlx `tls-rustls`, reqwest `rustls-tls`);
 # naming it directly adds no new native build.
 ring = "0.17"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "cookies"] }
-base64 = "0.22"
+reqwest = { workspace = true, features = ["cookies"] }
+base64.workspace = true
 # Sign in with Apple (ENH-001): Apple rejects a static client_secret, so the
 # secret sent to Apple's token endpoint is a short-lived ES256 JWT the server
 # signs with the registered EC private key. 9.x uses `ring` (already in the
@@ -51,11 +54,11 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 moka = { version = "0.12", features = ["future"] }
 
 [dev-dependencies]
-anyhow = "1"
+anyhow.workspace = true
 tempfile = "3"
-tokio-tungstenite = "0.26"
-futures-util = "0.3"
-wiremock = "0.6"
+tokio-tungstenite.workspace = true
+futures-util.workspace = true
+wiremock.workspace = true
 
 # Match cli/ and rust-client/: a direct `cargo clippy`/`cargo build` (editor,
 # rust-analyzer, pre-commit) denies warnings without needing the Makefile's

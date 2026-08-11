@@ -1,24 +1,37 @@
 # ── Server build stage ───────────────────────────────────────────────────────
-# Compiles the release binary.
+# Compiles the release binary. The server is a member of the root cargo
+# workspace (ARC-117): its Cargo.toml references [workspace.dependencies] in
+# the root Cargo.toml, and the single lockfile lives at the workspace root,
+# so the builder needs both root manifests and all three member manifests for
+# `dep.workspace = true` resolution and `--locked`. Only the server binary is
+# built; rust-client/cli sources stay stubbed for the dep-cache layer and are
+# never compiled (--bin rtdb-server selects server alone). The shared target/
+# lands at the workspace root (/build/target).
 FROM rust:1.90-bookworm AS builder
-WORKDIR /build/server
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+COPY server/Cargo.toml server/Cargo.toml
+COPY rust-client/Cargo.toml rust-client/Cargo.toml
+COPY cli/Cargo.toml cli/Cargo.toml
 # Dependency layer: compile the whole dependency tree once, cached unless
-# Cargo.toml or Cargo.lock change. A throwaway main.rs lets cargo resolve and
-# build the deps without the real source (which arrives in the next layer).
-COPY server/Cargo.toml server/Cargo.lock ./
-RUN mkdir src && echo 'fn main() {}' > src/main.rs \
-    && cargo build --release --locked --bin rtdb-server \
-    && rm -rf src
+# Cargo.toml or Cargo.lock change. Throwaway main/lib so each member package
+# parses, then build the server deps without the real source (next layer).
+RUN mkdir -p server/src rust-client/src cli/src \
+    && echo 'fn main() {}' > server/src/main.rs \
+    && echo '' > rust-client/src/lib.rs \
+    && echo 'fn main() {}' > cli/src/main.rs \
+    && cargo build --release --locked --manifest-path server/Cargo.toml --bin rtdb-server \
+    && rm -rf server/src
 # Bake the live git sha into /healthz. The build context has no .git (rsync
 # excludes it), so build.rs falls back to this arg; "unknown" if unset.
 # Declared AFTER the dependency layer so a per-deploy commit change only
 # recompiles the app crate, not the entire dependency tree.
 ARG RTDB_BUILD_COMMIT=unknown
 ENV RTDB_BUILD_COMMIT=${RTDB_BUILD_COMMIT}
-COPY server/build.rs ./
-COPY server/src ./src
-COPY server/tests ./tests
-RUN cargo build --release --locked --bin rtdb-server
+COPY server/build.rs server/build.rs
+COPY server/src ./server/src
+COPY server/tests ./server/tests
+RUN cargo build --release --locked --manifest-path server/Cargo.toml --bin rtdb-server
 
 # ── Dashboard build stage ────────────────────────────────────────────────────
 # Bundles the operator console SPA (Vite + React + TS) and the @par-rt-db/client
@@ -55,7 +68,7 @@ RUN apt-get update \
     # backup dir, both provided as tmpfs in docker-compose (read_only rootfs).
     && groupadd --system --gid 10001 rtdb \
     && useradd --system --uid 10001 --gid rtdb --home-dir /app --no-create-home --shell /usr/sbin/nologin rtdb
-COPY --from=builder /build/server/target/release/rtdb-server /usr/local/bin/rtdb-server
+COPY --from=builder /build/target/release/rtdb-server /usr/local/bin/rtdb-server
 COPY --from=dashboard /build/dashboard/dist /app/dashboard-dist
 RUN chown -R rtdb:rtdb /app
 ENV RTDB_PORT=8300
