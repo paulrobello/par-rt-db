@@ -1,7 +1,7 @@
 # Backups Dashboard — View, Trigger, Download, Delete, Restore (ENH-002)
 
 - **Date:** 2026-08-04
-- **Enhancement:** ENH-002 (`ENHANCEMENTS.md`)
+- **Enhancement:** ENH-002 (kanban board; `ENHANCEMENTS.md` retired)
 - **Status:** Implemented (2026-08-10)
 - **Depends on:** existing `backup.rs` (scheduled `pg_dump`, `list_backups`), `GET /admin/backups`, `delete-db` typed-confirm pattern.
 

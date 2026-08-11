@@ -317,8 +317,8 @@ Per the project rule, any server protocol change is mirrored across all clients.
   network (sessions tracked by a local conn id; `presence`/`updatePresence`/
   `leavePresence` mutate local room state and fan out to local subscribers).
 - **`FEATURE_MATRIX.md`** — new row (Convex presence-component parity, all four
-  clients). **`ENHANCEMENTS.md`** — check the ENH-015 box. READMEs and this spec
-  stay in sync.
+  clients). **Kanban board** — close the ENH-015 enhancement card (`ENHANCEMENTS.md`
+  is retired; the backlog lives on the board). READMEs and this spec stay in sync.
 
 ## Testing
 

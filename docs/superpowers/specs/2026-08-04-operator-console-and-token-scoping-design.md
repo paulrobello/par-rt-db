@@ -131,7 +131,7 @@ Bootstrapped as part of ENH-005 (with the new token shapes so no rework), filled
 
 ## 7. Sequencing & branches
 
-Five units, each its own feature branch (per `ENHANCEMENTS.md`), lightest-dependency first:
+Five units, each its own feature branch (per the kanban-board enhancement workflow that superseded `ENHANCEMENTS.md`), lightest-dependency first:
 
 1. **ENH-005 tokens** (+ python admin bootstrap) — foundational; touches auth core + wire.
 2. **ENH-003 webhooks** (`PUT` + deliveries + `enabled`).
@@ -148,7 +148,7 @@ Within each unit: **server first** (contract source of truth), then the **client
 - **Single-writer invariant**: no new writer. The subscription inspector only *reads* the registry (behind async mutexes); it never executes txns outside the committer. Webhook/audit/storage writes go through their existing paths.
 - **SQL safety**: every new identifier is double-quoted; every value is `$n`-bound; no interpolation.
 - **Errors**: every new failure is an `RtDbError { code, message }` envelope; client-facing 500s stay generic.
-- **Docs**: `FEATURE_MATRIX.md` rows flip where parity is affected; each `ENHANCEMENTS.md` checkbox flips only after its gate passes; relevant README/skill notes update.
+- **Docs**: `FEATURE_MATRIX.md` rows flip where parity is affected; each kanban enhancement card closes only after its gate passes (`ENHANCEMENTS.md` is retired); relevant README/skill notes update.
 - **No `unwrap`/`expect` outside `#[cfg(test)]`**; zero clippy warnings.
 
 ## 9. Out of scope / follow-ups

@@ -2,7 +2,7 @@
 
 - **Date:** 2026-08-07
 - **Status:** Implemented (2026-08-10)
-- **Source:** `ENHANCEMENTS.md` ENH-011
+- **Source:** ENH-011 (originally `ENHANCEMENTS.md`, now retired — the enhancement backlog lives on the kanban board)
 - **Approach:** Hard enforcement, global caps (Approach 1)
 
 ## Overview
