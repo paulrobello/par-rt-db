@@ -31,17 +31,66 @@
 
 export const VERSION = "0.1.0";
 
-export { RtDbError } from "./errors.js";
+export type {
+  AdminStreamFrame,
+  AuditEntry,
+  BackupFile,
+  BackupsListResponse,
+  CreateWebhookOptions,
+  DbSubCounters,
+  EditWebhookOptions,
+  GetAuditOptions,
+  ListDeliveriesOptions,
+  RestoreResult,
+  RtDbAdminClientOptions,
+  SchemaPreviewColumnAdd,
+  SchemaPreviewDiff,
+  SchemaPreviewRejection,
+  SchemaPreviewTableAdd,
+  SessionInfo,
+  SubscriptionInfo,
+  SubscriptionsPrincipal,
+  SubscriptionsResponse,
+  Webhook,
+  WebhookDelivery,
+} from "./admin.js";
+export { RtDbAdminClient } from "./admin.js";
+export type { AuthState, ConnectionState, RtDbClientOptions, WebSocketLike } from "./client.js";
+export { RtDbClient } from "./client.js";
 export type { RtDbErrorCode, RtDbErrorEnvelope } from "./errors.js";
+export { RtDbError } from "./errors.js";
+export type {
+  FileMetadata,
+  RtDbHttpClientOptions,
+  SignedUrl,
+  TransformOpts,
+  UploadResult,
+} from "./http.js";
+export { appendImageParams, RtDbHttpClient } from "./http.js";
+export type { InMemoryRtDbClientOptions } from "./in_memory.js";
+export { InMemoryAdminClient, InMemoryRtDbClient, PresenceRooms } from "./in_memory.js";
+export { Migration } from "./migration.js";
+export type { StepInsertResult, StepResult, StepUpsertResult } from "./mutation.js";
+export { mutation, parseStepResults, TxnBuilder } from "./mutation.js";
+export type { OptimisticProjection } from "./optimistic.js";
+export { projectOptimisticUpdate } from "./optimistic.js";
+export { decodeCursor, encodeCursor } from "./pagination.js";
 export type {
   AuthedUser,
+  Cast,
+  CastFailureJson,
   ClientMessage,
-  FilterExpr,
+  DirectiveJson,
+  DirectiveReportJson,
   FieldTypeJson,
+  FilterExpr,
   IndexJson,
+  MigrateRequestJson,
+  MigrateResultJson,
   Order,
   PresenceMember,
   QueryJson,
+  SampleChangeJson,
   ScheduleInfo,
   ScheduleWhen,
   SchemaHistoryEntry,
@@ -56,7 +105,9 @@ export type {
   VectorIndexSpec,
   VectorQuery,
 } from "./protocol.js";
-export { defineSchema, defineTable, SchemaDefinition, TableDefinition, t } from "./schema.js";
+export type { ClientApi, RtQuery, TableApi } from "./query.js";
+export { createApi, TableQuery } from "./query.js";
+export { retryOnPrecondition } from "./retry.js";
 export type {
   Doc,
   DocFields,
@@ -68,53 +119,4 @@ export type {
   Validator,
   WithoutSystemFields,
 } from "./schema.js";
-export { createApi, TableQuery } from "./query.js";
-export type { ClientApi, RtQuery, TableApi } from "./query.js";
-export { mutation, parseStepResults, TxnBuilder } from "./mutation.js";
-export type { StepInsertResult, StepResult, StepUpsertResult } from "./mutation.js";
-export { Migration } from "./migration.js";
-export type {
-  Cast,
-  CastFailureJson,
-  DirectiveJson,
-  DirectiveReportJson,
-  MigrateRequestJson,
-  MigrateResultJson,
-  SampleChangeJson,
-} from "./protocol.js";
-export { projectOptimisticUpdate } from "./optimistic.js";
-export type { OptimisticProjection } from "./optimistic.js";
-export { retryOnPrecondition } from "./retry.js";
-export { encodeCursor, decodeCursor } from "./pagination.js";
-export { RtDbHttpClient, appendImageParams } from "./http.js";
-export type {
-  RtDbHttpClientOptions,
-  UploadResult,
-  FileMetadata,
-  SignedUrl,
-  TransformOpts,
-} from "./http.js";
-export { RtDbAdminClient } from "./admin.js";
-export type {
-  AdminStreamFrame,
-  AuditEntry,
-  BackupFile,
-  BackupsListResponse,
-  CreateWebhookOptions,
-  DbSubCounters,
-  EditWebhookOptions,
-  GetAuditOptions,
-  ListDeliveriesOptions,
-  RestoreResult,
-  RtDbAdminClientOptions,
-  SessionInfo,
-  SubscriptionInfo,
-  SubscriptionsPrincipal,
-  SubscriptionsResponse,
-  Webhook,
-  WebhookDelivery,
-} from "./admin.js";
-export { RtDbClient } from "./client.js";
-export type { AuthState, ConnectionState, RtDbClientOptions, WebSocketLike } from "./client.js";
-export { InMemoryAdminClient, InMemoryRtDbClient, PresenceRooms } from "./in_memory.js";
-export type { InMemoryRtDbClientOptions } from "./in_memory.js";
+export { defineSchema, defineTable, SchemaDefinition, TableDefinition, t } from "./schema.js";

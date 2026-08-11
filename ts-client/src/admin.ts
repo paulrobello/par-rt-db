@@ -1,23 +1,37 @@
+import type { WebSocketLike } from "./client.js";
 import { RtDbError } from "./errors.js";
+import type { FileMetadata } from "./http.js";
 import type {
   MigrateRequestJson,
   MigrateResultJson,
+  QueryJson,
+  ScheduleInfo,
+  ScheduleWhen,
   SchemaHistoryEntry,
   SchemaHistoryEntrySummary,
   SchemaJson,
   TransactionJson,
 } from "./protocol.js";
-import type { WebSocketLike } from "./client.js";
 import type { RtQuery } from "./query.js";
 import type { SchemaDefinition } from "./schema.js";
 
 export interface RtDbAdminClientOptions {
   url: string;
-  adminKey: string;
+  /** Instance admin key. When set, every request carries
+   *  `Authorization: Bearer <adminKey>` (the CLI/automation path). When omitted,
+   *  the client authenticates via the HttpOnly `rtdb_session` cookie: each
+   *  request is sent with `credentials: "include"` and the readable
+   *  `rtdb-admin-csrf` nonce is echoed as `X-Rtdb-Csrf` (the header the server's
+   *  admin-CSRF guard requires on cookie-authenticated mutating `/admin/*`
+   *  verbs). Cookie mode is how the operator dashboard — a same-origin SPA with
+   *  no JS-readable admin key — consumes this client. */
+  adminKey?: string;
   fetch?: typeof fetch;
   /** Injectable WebSocket constructor (browser/Node/bun). Defaults to the global
    *  `WebSocket`. The second arg carries the WS subprotocol(s) — `/admin/stream`
-   *  authenticates via the `rtdb-admin.<token>` subprotocol. */
+   *  authenticates via the `rtdb-admin.<token>` subprotocol in bearer mode; in
+   *  cookie mode the subprotocol is omitted (the browser attaches the session
+   *  cookie to the same-origin upgrade). */
   webSocketFactory?: (url: string, protocols?: string | string[]) => WebSocketLike;
 }
 
@@ -309,6 +323,30 @@ export interface ListDeliveriesOptions {
   offset?: number;
 }
 
+/** One new column reported by `previewSchema`. */
+export interface SchemaPreviewColumnAdd {
+  name: string;
+  type: string;
+}
+/** One new table reported by `previewSchema`: its name plus the columns the
+ *  additive-only push would add. */
+export interface SchemaPreviewTableAdd {
+  table: string;
+  columns: SchemaPreviewColumnAdd[];
+}
+/** One rejection reported by `previewSchema`: a destructive change or type
+ *  change the DDL layer will refuse. */
+export interface SchemaPreviewRejection {
+  table: string;
+  reason: string;
+}
+/** Result of `previewSchema`: what an additive-only push would ADD and what it
+ *  would REJECT (drops, type changes). Mirrors the server's `schema_diff`. */
+export interface SchemaPreviewDiff {
+  added: SchemaPreviewTableAdd[];
+  rejected: SchemaPreviewRejection[];
+}
+
 function toSchemaJson(schema: SchemaDefinition<any> | SchemaJson): SchemaJson {
   return "toJSON" in schema && typeof schema.toJSON === "function"
     ? schema.toJSON()
@@ -349,20 +387,54 @@ function parseAdminStreamFrame(data: unknown): AdminStreamFrame | null {
   return null;
 }
 
-/** Control-plane client for `/admin/*`, authorized with the instance admin key. */
+/** Reads the readable (non-HttpOnly) `rtdb-admin-csrf` cookie set alongside the
+ *  session cookie by `/admin/login` and the OAuth callback (SEC-106). Returns
+ *  `null` when no admin session is active, or when running where `document` is
+ *  undefined (SSR/Node). The value is echoed in the `X-Rtdb-Csrf` header on
+ *  cookie-mode admin requests — a cross-site forge cannot read this cookie and
+ *  so cannot set the header, forcing a preflight the CORS allowlist then gates. */
+function readAdminCsrfCookie(): string | null {
+  if (typeof document === "undefined") return null;
+  const match = document.cookie.match(/(?:^|;\s*)rtdb-admin-csrf=([^;]+)/);
+  return match ? match[1] : null;
+}
+
+/** Control-plane client for `/admin/*`. Authorize either with the instance
+ *  admin key (bearer mode — CLI/automation) or, when `adminKey` is omitted, via
+ *  the HttpOnly session cookie (cookie mode — same-origin browser consumers like
+ *  the operator dashboard). */
 export class RtDbAdminClient {
   private readonly url: string;
-  private readonly adminKey: string;
+  private readonly adminKey: string | undefined;
+  /** True when no `adminKey` was supplied — requests ride the session cookie. */
+  private readonly cookieMode: boolean;
   private readonly fetchImpl: typeof fetch;
   private readonly webSocketFactory: (url: string, protocols?: string | string[]) => WebSocketLike;
 
   constructor(options: RtDbAdminClientOptions) {
     this.url = options.url.replace(/\/+$/, "");
     this.adminKey = options.adminKey;
+    this.cookieMode = !options.adminKey;
     this.fetchImpl = options.fetch ?? globalThis.fetch;
     this.webSocketFactory =
       options.webSocketFactory ??
       ((url, protocols) => new WebSocket(url, protocols) as unknown as WebSocketLike);
+  }
+
+  /** Auth + CSRF headers for the current mode. Bearer mode sets
+   *  `Authorization: Bearer <key>`; cookie mode omits it and instead echoes the
+   *  readable `rtdb-admin-csrf` nonce. Merged into every outgoing request. */
+  private authHeaders(): Record<string, string> {
+    if (this.adminKey) return { Authorization: `Bearer ${this.adminKey}` };
+    const csrf = readAdminCsrfCookie();
+    return csrf ? { "X-Rtdb-Csrf": csrf } : {};
+  }
+
+  /** `credentials` value for `fetch` init: cookie mode sends `"include"` so the
+   *  browser attaches the HttpOnly session cookie; bearer mode leaves it
+   *  `undefined` (the default, matching pre-cookie-mode behavior). */
+  private get creds(): RequestCredentials | undefined {
+    return this.cookieMode ? "include" : undefined;
   }
 
   async createDb(name: string): Promise<void> {
@@ -377,6 +449,19 @@ export class RtDbAdminClient {
 
   async pushSchema(db: string, schema: SchemaDefinition<any> | SchemaJson): Promise<void> {
     await this.request("POST", "/admin/push-schema", { db, schema: toSchemaJson(schema) });
+  }
+
+  /** Preview an additive-only schema diff against the currently-applied schema
+   *  (POST /admin/db/{db}/schema/preview). Pure/advisory — does NOT apply.
+   *  Returns what the push would ADD and what it would REJECT (drops, type
+   *  changes the DDL layer refuses). */
+  async previewSchema(
+    db: string,
+    schema: SchemaDefinition<any> | SchemaJson,
+  ): Promise<SchemaPreviewDiff> {
+    return (await this.request("POST", `/admin/db/${encodeURIComponent(db)}/schema/preview`, {
+      schema: toSchemaJson(schema),
+    })) as SchemaPreviewDiff;
   }
 
   async listDbs(): Promise<string[]> {
@@ -448,7 +533,8 @@ export class RtDbAdminClient {
       `${this.url}/admin/export-db?db=${encodeURIComponent(db)}`,
       {
         method: "GET",
-        headers: { Authorization: `Bearer ${this.adminKey}` },
+        headers: this.authHeaders(),
+        credentials: this.creds,
       },
     );
     if (!response.ok) {
@@ -463,10 +549,8 @@ export class RtDbAdminClient {
       `${this.url}/admin/import-db?db=${encodeURIComponent(db)}`,
       {
         method: "POST",
-        headers: {
-          Authorization: `Bearer ${this.adminKey}`,
-          "content-type": "application/x-ndjson",
-        },
+        headers: { ...this.authHeaders(), "content-type": "application/x-ndjson" },
+        credentials: this.creds,
         body: jsonl,
       },
     );
@@ -481,7 +565,8 @@ export class RtDbAdminClient {
       `${this.url}/admin/clone-db?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`,
       {
         method: "POST",
-        headers: { Authorization: `Bearer ${this.adminKey}` },
+        headers: this.authHeaders(),
+        credentials: this.creds,
       },
     );
     if (!response.ok) {
@@ -588,12 +673,17 @@ export class RtDbAdminClient {
   }
 
   /** Owner-bypass document read (POST /admin/db/{db}/query). Admin sees every row regardless
-   *  of per-row ownerField. Body and result shapes match /api/query. */
-  async adminQuery<R>(db: string, query: RtQuery<R>): Promise<R> {
+   *  of per-row ownerField. Body and result shapes match /api/query. Accepts either a typed
+   *  `RtQuery<R>` builder (result typed as `R`) or a raw `QueryJson` (result typed as `unknown`,
+   *  for callers like the dashboard that construct the DSL directly). */
+  async adminQuery<R>(db: string, query: RtQuery<R>): Promise<R>;
+  async adminQuery(db: string, query: QueryJson): Promise<unknown>;
+  async adminQuery(db: string, query: RtQuery<unknown> | QueryJson): Promise<unknown> {
+    const json = "json" in query ? query.json : query;
     const body = await this.request("POST", `/admin/db/${encodeURIComponent(db)}/query`, {
-      query: query.json,
+      query: json,
     });
-    return (body as { result: R }).result;
+    return (body as { result: unknown }).result;
   }
 
   /** Owner-bypass document write (POST /admin/db/{db}/mutate). Body shapes match /api/mutate;
@@ -608,6 +698,51 @@ export class RtDbAdminClient {
       idempotencyKey: opts?.idempotencyKey,
     });
     return (body as { results: unknown[] }).results;
+  }
+
+  /** List scheduled jobs for `db` (GET /admin/db/{db}/schedules). */
+  async listSchedules(db: string): Promise<ScheduleInfo[]> {
+    const body = await this.request("GET", `/admin/db/${encodeURIComponent(db)}/schedules`);
+    return (body as { schedules: ScheduleInfo[] }).schedules;
+  }
+
+  /** Create a scheduled job (POST /admin/db/{db}/schedules). `when` selects
+   *  one-shot (`afterMs`/`runAt`) or recurring (`cron`); `txn` is the
+   *  transaction the scheduler executes at the due time. Returns the new id. */
+  async createSchedule(
+    db: string,
+    when: ScheduleWhen,
+    txn: TransactionJson,
+  ): Promise<{ id: string }> {
+    const body = await this.request("POST", `/admin/db/${encodeURIComponent(db)}/schedules`, {
+      when,
+      txn,
+    });
+    return body as { id: string };
+  }
+
+  /** Cancel a scheduled job (POST /admin/db/{db}/schedules/{id}/cancel). */
+  async cancelSchedule(db: string, id: string): Promise<{ ok: boolean }> {
+    return (await this.request(
+      "POST",
+      `/admin/db/${encodeURIComponent(db)}/schedules/${encodeURIComponent(id)}/cancel`,
+    )) as { ok: boolean };
+  }
+
+  /** Pause a scheduled job (POST /admin/db/{db}/schedules/{id}/pause). */
+  async pauseSchedule(db: string, id: string): Promise<{ ok: boolean }> {
+    return (await this.request(
+      "POST",
+      `/admin/db/${encodeURIComponent(db)}/schedules/${encodeURIComponent(id)}/pause`,
+    )) as { ok: boolean };
+  }
+
+  /** Resume a paused scheduled job (POST /admin/db/{db}/schedules/{id}/resume). */
+  async resumeSchedule(db: string, id: string): Promise<{ ok: boolean }> {
+    return (await this.request(
+      "POST",
+      `/admin/db/${encodeURIComponent(db)}/schedules/${encodeURIComponent(id)}/resume`,
+    )) as { ok: boolean };
   }
 
   /** Apply (or preview) a declarative schema migration (POST /admin/db/{db}/migrate).
@@ -679,7 +814,8 @@ export class RtDbAdminClient {
   async downloadBackup(name: string): Promise<Response> {
     const response = await this.fetchImpl(`${this.url}/admin/backups/${encodeURIComponent(name)}`, {
       method: "GET",
-      headers: { Authorization: `Bearer ${this.adminKey}` },
+      headers: this.authHeaders(),
+      credentials: this.creds,
     });
     if (!response.ok) {
       await this.throwFromResponse(response);
@@ -700,6 +836,41 @@ export class RtDbAdminClient {
       name,
       confirm: name,
     })) as RestoreResult;
+  }
+
+  /** List storage blobs for `db` (GET /admin/db/{db}/storage). */
+  async listFiles(db: string): Promise<FileMetadata[]> {
+    const body = await this.request("GET", `/admin/db/${encodeURIComponent(db)}/storage`);
+    return (body as { files: FileMetadata[] }).files;
+  }
+
+  /** Upload raw bytes to `db`'s storage (POST /admin/db/{db}/storage). The body
+   *  is the file itself (not JSON); the content-type is taken from the Blob's
+   *  `.type` (a File keeps its MIME type) so the server stores and serves it
+   *  back. The server enforces `maxFileSize` (413). Returns the new blob id. */
+  async uploadFile(db: string, body: Blob | ArrayBuffer): Promise<{ id: string }> {
+    const blob = body instanceof Blob ? body : new Blob([body]);
+    const response = await this.fetchImpl(
+      `${this.url}/admin/db/${encodeURIComponent(db)}/storage`,
+      {
+        method: "POST",
+        headers: { ...this.authHeaders(), "content-type": blob.type || "application/octet-stream" },
+        credentials: this.creds,
+        body: blob,
+      },
+    );
+    if (!response.ok) {
+      await this.throwFromResponse(response);
+    }
+    return (await response.json()) as { id: string };
+  }
+
+  /** Delete a storage blob (DELETE /admin/db/{db}/storage/{id}). */
+  async deleteFile(db: string, id: string): Promise<{ ok: boolean }> {
+    return (await this.request(
+      "DELETE",
+      `/admin/db/${encodeURIComponent(db)}/storage/${encodeURIComponent(id)}`,
+    )) as { ok: boolean };
   }
 
   /** List webhooks registered for `db` (GET /admin/db/{db}/webhooks). Returns an
@@ -780,7 +951,12 @@ export class RtDbAdminClient {
     const qs = params.toString();
     const wsUrl = `${this.url.replace(/^http/, "ws")}/admin/stream${qs ? `?${qs}` : ""}`;
 
-    const socket = this.webSocketFactory(wsUrl, `rtdb-admin.${this.adminKey}`);
+    // Bearer mode rides the admin key in the `rtdb-admin.<token>` subprotocol
+    // (browsers can't set headers on a WS handshake). Cookie mode omits it — the
+    // browser attaches the HttpOnly session cookie to the same-origin upgrade.
+    const socket = this.adminKey
+      ? this.webSocketFactory(wsUrl, `rtdb-admin.${this.adminKey}`)
+      : this.webSocketFactory(wsUrl);
 
     const queue: AdminStreamFrame[] = [];
     let resolveWaiter: (() => void) | null = null;
@@ -844,9 +1020,14 @@ export class RtDbAdminClient {
   private async throwFromResponse(response: Response): Promise<never> {
     const parsed: unknown = await response.json().catch(() => null);
     if (RtDbError.isEnvelope(parsed)) {
-      throw RtDbError.fromEnvelope(parsed);
+      throw RtDbError.fromEnvelope(parsed, response.status);
     }
-    throw new RtDbError("INTERNAL", `admin request failed with status ${response.status}`);
+    throw new RtDbError(
+      "INTERNAL",
+      `admin request failed with status ${response.status}`,
+      undefined,
+      response.status,
+    );
   }
 
   private async request(
@@ -857,17 +1038,23 @@ export class RtDbAdminClient {
     const response = await this.fetchImpl(`${this.url}${path}`, {
       method,
       headers: {
-        Authorization: `Bearer ${this.adminKey}`,
+        ...this.authHeaders(),
         ...(payload === undefined ? {} : { "content-type": "application/json" }),
       },
+      credentials: this.creds,
       body: payload === undefined ? undefined : JSON.stringify(payload),
     });
     const parsed: unknown = await response.json().catch(() => null);
     if (!response.ok) {
       if (RtDbError.isEnvelope(parsed)) {
-        throw RtDbError.fromEnvelope(parsed);
+        throw RtDbError.fromEnvelope(parsed, response.status);
       }
-      throw new RtDbError("INTERNAL", `admin request failed with status ${response.status}`);
+      throw new RtDbError(
+        "INTERNAL",
+        `admin request failed with status ${response.status}`,
+        undefined,
+        response.status,
+      );
     }
     return parsed;
   }

@@ -53,16 +53,21 @@ export interface RtDbErrorEnvelope {
   retryAfter?: number;
 }
 
-/** The single error type surfaced by every client transport. */
+/** The single error type surfaced by every client transport. `status`, when
+ *  present, is the originating HTTP response code (the wire envelope itself
+ *  carries only `code`/`message`/`retryAfter`; the HTTP status is thread-able
+ *  through the admin/HTTP error path for callers that surface it in the UI). */
 export class RtDbError extends Error {
   readonly code: RtDbErrorCode;
   readonly retryAfter?: number;
+  readonly status?: number;
 
-  constructor(code: RtDbErrorCode, message: string, retryAfter?: number) {
+  constructor(code: RtDbErrorCode, message: string, retryAfter?: number, status?: number) {
     super(message);
     this.name = "RtDbError";
     this.code = code;
     this.retryAfter = retryAfter;
+    this.status = status;
   }
 
   static isEnvelope(value: unknown): value is RtDbErrorEnvelope {
@@ -77,7 +82,7 @@ export class RtDbError extends Error {
     );
   }
 
-  static fromEnvelope(envelope: RtDbErrorEnvelope): RtDbError {
-    return new RtDbError(envelope.code, envelope.message, envelope.retryAfter);
+  static fromEnvelope(envelope: RtDbErrorEnvelope, status?: number): RtDbError {
+    return new RtDbError(envelope.code, envelope.message, envelope.retryAfter, status);
   }
 }

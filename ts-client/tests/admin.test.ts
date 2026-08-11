@@ -10,6 +10,7 @@ import type {
   WebhookDelivery,
 } from "../src/admin.js";
 import { RtDbAdminClient } from "../src/admin.js";
+import type { WebSocketLike } from "../src/client.js";
 import { RtDbError } from "../src/errors.js";
 import { Migration } from "../src/migration.js";
 import type {
@@ -1198,5 +1199,81 @@ describe("HotConfig quota fields (ENH-011)", () => {
     const e = RtDbError.fromEnvelope(raw as { code: "QUOTA_EXCEEDED"; message: string });
     expect(e.code).toBe("QUOTA_EXCEEDED");
     expect(e.message).toBe("too many tables");
+  });
+
+  it("RtDbError carries the HTTP status threaded through fromEnvelope/constructor", () => {
+    const raw: unknown = { code: "FORBIDDEN", message: "no" };
+    expect(RtDbError.fromEnvelope(raw as { code: "FORBIDDEN"; message: string }, 403).status).toBe(
+      403,
+    );
+    // Omitted status is undefined — backward compatible.
+    expect(
+      RtDbError.fromEnvelope(raw as { code: "FORBIDDEN"; message: string }).status,
+    ).toBeUndefined();
+    expect(new RtDbError("INTERNAL", "x", undefined, 500).status).toBe(500);
+  });
+});
+
+describe("RtDbAdminClient cookie mode (ARC-106)", () => {
+  it("omits adminKey: sends credentials:include, no Authorization, echoes X-Rtdb-Csrf", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ databases: [] }));
+    // Plant a readable CSRF cookie the way /admin/login does.
+    const old = document.cookie;
+    document.cookie = "rtdb-admin-csrf=nonce123;path=/";
+    try {
+      const admin = new RtDbAdminClient({ url: "http://h:8300", fetch: fetchMock });
+      await admin.listDbs();
+      const [, init] = fetchMock.mock.calls[0];
+      expect(init.credentials).toBe("include");
+      expect(init.headers.Authorization).toBeUndefined();
+      expect(init.headers["X-Rtdb-Csrf"]).toBe("nonce123");
+    } finally {
+      // best-effort cleanup; jsdom retains other cookies too
+      document.cookie = "rtdb-admin-csrf=;max-age=0;path=/";
+      if (old) document.cookie = old;
+    }
+  });
+
+  it("bearer mode (adminKey set) is unchanged: no credentials:include, Authorization present", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ databases: [] }));
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+    await admin.listDbs();
+    const [, init] = fetchMock.mock.calls[0];
+    expect(init.credentials).toBeUndefined();
+    expect(init.headers.Authorization).toBe("Bearer k");
+  });
+
+  it("cookie-mode errors carry the HTTP status on the thrown RtDbError", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(jsonResponse({ code: "FORBIDDEN", message: "no" }, 403));
+    const admin = new RtDbAdminClient({ url: "http://h:8300", fetch: fetchMock });
+    const e = (await admin.getConfig().catch((e: unknown) => e)) as RtDbError;
+    expect(e).toBeInstanceOf(RtDbError);
+    expect(e.status).toBe(403);
+  });
+
+  it("cookie-mode streamAdmin omits the rtdb-admin subprotocol", async () => {
+    // The factory inspects the protocols arg; in cookie mode it should be
+    // omitted (the browser attaches the session cookie to the upgrade).
+    let captured: string | string[] | undefined = "sentinel";
+    const admin = new RtDbAdminClient({
+      url: "http://h:8300",
+      fetch: vi.fn(),
+      webSocketFactory: (_url, protocols) => {
+        captured = protocols;
+        const sock: { close(): void; onclose: (() => void) | null } = {
+          close() {},
+          onclose: null,
+        };
+        // Fire onclose after the generator wires its handler so the internal
+        // await resolves and the generator exits cleanly instead of hanging.
+        queueMicrotask(() => sock.onclose?.());
+        return sock as unknown as WebSocketLike;
+      },
+    });
+    const result = await admin.streamAdmin().next();
+    expect(result.done).toBe(true);
+    expect(captured).toBeUndefined();
   });
 });
