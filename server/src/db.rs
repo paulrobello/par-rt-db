@@ -224,6 +224,30 @@ async fn bootstrap_ddl(conn: &mut PgConnection) -> Result<(), RtDbError> {
     .execute(&mut *conn)
     .await?;
 
+    // ENH-022 Stage 1: single-use OAuth login state in Postgres so a login
+    // begun on one replica can complete the callback on another. `/begin`
+    // inserts a `pending` row; `/callback` flips `pending` → `claiming`
+    // (UPDATE ... WHERE status = 'pending' RETURNING — single-use enforced by
+    // the DB, not a Mutex) then sets the terminal outcome; `/auth/state`
+    // consumes a terminal row in one statement. A background sweep deletes
+    // rows older than the 10-minute TTL (closes the SEC-132 unbounded-map
+    // note). A row is mutated only through its lifecycle; there is no second
+    // writer onto document tables, so the committer's single-writer
+    // invariant is untouched.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS rtdb_auth.oauth_states (
+            state       text PRIMARY KEY,
+            provider    text NOT NULL,
+            status      text NOT NULL DEFAULT 'pending',
+            session_token text,
+            created_at  bigint NOT NULL,
+            expires_at  bigint NOT NULL,
+            consumed_at bigint
+        )",
+    )
+    .execute(&mut *conn)
+    .await?;
+
     sqlx::query("CREATE SCHEMA IF NOT EXISTS rtdb")
         .execute(&mut *conn)
         .await?;

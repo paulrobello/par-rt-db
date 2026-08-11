@@ -1111,3 +1111,119 @@ async fn login_csrf_kill_switch_off_allows_cookieless_callback() -> anyhow::Resu
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
     Ok(())
 }
+
+/// ENH-022 Stage 1 headline fix: an OAuth login BEGUN on one replica
+/// (process) can be COMPLETED on a different replica that shares the same
+/// Postgres but holds none of the first's in-process state. Before the
+/// `rtdb_auth.oauth_states` table this silently failed — the callback landed
+/// on whichever replica the load balancer chose, which had no entry for the
+/// state minted on the begin replica. The table is the shared substrate that
+/// makes the two-replica login viable.
+///
+/// Two `AppState`s built against the same test pool stand in for two replicas
+/// (each would have had its own in-memory map). `/begin` hits replica A; the
+/// GitHub mocks + `/auth/callback` hit replica B; the `/auth/state` poll then
+/// resolves `complete`. GitHub CSRF is disabled so the cross-replica callback
+/// (which carries A's nonce cookie, not B's) is not gated out — isolating the
+/// state-sharing claim to the table itself.
+#[tokio::test]
+async fn cross_replica_login_completes_on_second_replica() -> anyhow::Result<()> {
+    let mock = MockServer::start().await;
+    mount_github_user_mocks(
+        &mock,
+        99001,
+        "xreplica",
+        json!([{"email": "xreplica@example.com", "verified": true, "primary": true}]),
+    )
+    .await;
+
+    let mut cfg = test_config();
+    cfg.github_base_url = mock.uri();
+    cfg.github_api_url = mock.uri();
+    cfg.github_client_id = Some("test-client".into());
+    cfg.github_client_secret = Some("test-secret".into());
+    cfg.oauth_login_csrf = false;
+
+    // One shared pool = one Postgres, as in a real multi-instance deploy.
+    let pool = sqlx::PgPool::connect(&cfg.database_url)
+        .await
+        .expect("connect to test postgres");
+    db::bootstrap(&pool).await.expect("bootstrap rtdb_auth");
+
+    // Replica A and replica B: distinct AppStates, same pool.
+    let state_a = AppState::new(pool.clone(), cfg.clone(), common::test_hot());
+    let addr_a = spawn_app(state_a.clone()).await;
+    let state_b = AppState::new(pool.clone(), cfg, common::test_hot());
+    let addr_b = spawn_app(state_b.clone()).await;
+
+    let client = no_redirect_client();
+
+    // 1. Begin on replica A — inserts the pending row into the shared table.
+    let state_token = begin_login(&client, addr_a, "http://localhost:5173").await;
+
+    // 2. Complete the callback against replica B. Before ENH-022 Stage 1 this
+    //    returned 400 (B's map had no entry for A's state); now B sees the row
+    //    A wrote and the GitHub exchange runs.
+    let resp = callback(&client, addr_b, &state_token).await;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "cross-replica callback must complete, not 400"
+    );
+
+    // 3. The poll (against B) resolves `complete` — the session token is
+    //    retrievable cross-replica too.
+    let poll = client
+        .get(format!("http://{addr_b}/auth/state?state={state_token}"))
+        .send()
+        .await
+        .expect("poll");
+    let pv: Value = poll.json().await.expect("poll json");
+    assert_eq!(pv["status"], "complete", "cross-replica poll must complete");
+    assert!(pv["token"].as_str().is_some());
+    assert_eq!(pv["user"]["email"].as_str(), Some("xreplica@example.com"));
+    Ok(())
+}
+
+/// ENH-022 Stage 1: single-use consumption is enforced at the database level.
+/// After a terminal outcome is polled once, a second `/auth/state` poll for
+/// the same token returns nothing terminal (Expired) — the `consumed_at`
+/// consumption in `poll_login` is one-shot.
+#[tokio::test]
+async fn oauth_state_is_single_use_at_the_db() -> anyhow::Result<()> {
+    let mock = MockServer::start().await;
+    mount_github_user_mocks(
+        &mock,
+        99002,
+        "singleuse",
+        json!([{"email": "single-use@example.com", "verified": true, "primary": true}]),
+    )
+    .await;
+    let (_state, addr) = oauth_state_with_csrf(&mock, false).await;
+    let client = no_redirect_client();
+    let state_token = begin_login(&client, addr, "http://localhost:5173").await;
+    let resp = callback(&client, addr, &state_token).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    // First poll consumes the terminal row.
+    let poll1 = client
+        .get(format!("http://{addr}/auth/state?state={state_token}"))
+        .send()
+        .await
+        .expect("first poll");
+    let pv1: Value = poll1.json().await.expect("first poll json");
+    assert_eq!(pv1["status"], "complete");
+
+    // Second poll: the row is consumed → no terminal row matches → Expired.
+    let poll2 = client
+        .get(format!("http://{addr}/auth/state?state={state_token}"))
+        .send()
+        .await
+        .expect("second poll");
+    let pv2: Value = poll2.json().await.expect("second poll json");
+    assert_eq!(
+        pv2["status"], "expired",
+        "a second poll must not re-deliver the session token"
+    );
+    Ok(())
+}

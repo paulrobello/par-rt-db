@@ -72,6 +72,27 @@ curl -fsS http://127.0.0.1:8300/healthz | jq .
 
 Then verify the public path: `curl -fsS https://rtdb.pardev.net/healthz | jq .`.
 
+## Topology: single instance (not horizontally scalable yet)
+
+**Deploy par-rt-db as a single process — do not run multiple replicas behind a
+load balancer.** The server logs a `WARN` at boot naming this constraint. Four
+pieces of state are held in-process with no cross-replica coordination, so a
+second replica **silently** degrades behavior (there is no error — it just
+half-works):
+
+| State | What breaks with 2 replicas |
+| --- | --- |
+| OAuth login state | A login begun on replica A (the `/begin` that minted the `state` token) whose callback is load-balanced to replica B. *(Fixed in ENH-022 Stage 1: `state` now lives in the `rtdb_auth.oauth_states` table, so a login begun on one replica completes on another.)* |
+| Op-feed (`/admin/stream`, dashboard live writes) | Each replica sees only the writes that hit it. *(ENH-022 Stage 2: fan out via Postgres `NOTIFY`.)* |
+| Presence (ENH-015 "who is online") | Membership fragments per replica; users on different replicas cannot see each other. *(ENH-022 Stage 3.)* |
+| Rate-limit counters | In-process counters multiply the effective budget by the replica count (a silent weakening of the cap). *(ENH-022 Stage 4.)* |
+
+The single-writer invariant is intact and must stay so: each database has
+exactly one committer task, and correctness depends on that serialized write
+path. Multi-instance here means multiple *readers/connection-holders*, not a
+second writer onto the same database — two committers for one database would be
+a correctness catastrophe. Horizontal scaling is tracked as ENH-022.
+
 ## Postgres image
 
 The compose stack uses [`pgvector/pgvector:pg17`](https://hub.docker.com/r/pgvector/pgvector)

@@ -765,6 +765,27 @@ that ultimately terminates a connection that never closes on its own.
 
 ## Known MVP limitations
 
+- **Deploy as a single instance — running multiple replicas behind a load
+  balancer is not yet supported.** Four pieces of server state are held
+  in-process with no cross-replica coordination, so a second replica
+  **silently** degrades behavior (no error — it just half-works):
+  - **OAuth login** — the single-use `state` token minted at `/begin` and
+    consumed at `/callback` lived in an in-process map, so a callback
+    load-balanced to a different replica than the one that minted the state
+    rejected with `400 invalid or expired state`. *(Fixed in ENH-022 Stage 1:
+    the table now lives in `rtdb_auth.oauth_states`, so a login begun on one
+    replica completes on another.)*
+  - **Op-feed** (`/admin/stream`, the dashboard live write feed) — each replica
+    sees only the writes that hit it. *(ENH-022 Stage 2 will fan these out via
+    Postgres `NOTIFY`.)*
+  - **Presence** (ENH-015 "who is online") — membership fragments per replica;
+    users on different replicas cannot see each other. *(ENH-022 Stage 3.)*
+  - **Rate limiting** — in-process counters multiply the effective budget by the
+    replica count (a silent weakening of the cap). *(ENH-022 Stage 4.)*
+  The server logs a `WARN` at boot naming this constraint. The single-writer
+  invariant (one committer task per database) is intact and must stay so —
+  multi-instance here means multiple *readers/connection-holders*, not a second
+  writer onto the same database. Horizontal scaling is tracked as ENH-022.
 - **Session expiry, machine-token revocation, allowlist removal, and admin-role
   revocation all take effect on open WebSocket connections.** The WS handler re-runs
   `authorize` on every `subscribe` and `mutate` (not just at connect) and re-runs

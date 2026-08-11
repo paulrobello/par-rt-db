@@ -26,36 +26,23 @@ use super::oidc::OidcProvider;
 
 const STATE_TTL_MS: i64 = 10 * 60 * 1000;
 
-/// Outcome of a pending OAuth login, driven by the callback. `Pending` →
-/// `Claiming` (first callback wins) → `Completed` | `Failed`.
-pub enum LoginOutcome {
-    Pending,
-    Claiming,
-    Completed(String),
-    Failed,
-}
-
-/// One pending `/auth/{provider}/begin` -> `/auth/callback` round trip: the
-/// expiry and the current `LoginOutcome`. Held in `AppState.auth.oauth_states`,
-/// keyed by the single-use state token minted at `begin`. The first callback
-/// flips `Pending` → `Claiming` (see `claim_pending`); after `complete_login`
-/// resolves it sets the terminal `Completed` | `Failed`. The poll endpoint
-/// removes the entry on a terminal outcome (one-shot retrieval).
-pub struct OAuthStateEntry {
-    pub expires_at: i64,
-    pub outcome: LoginOutcome,
-    /// SEC-132: the provider slug that minted this state (`P::name()` at
-    /// `/begin`). The callback rejects a state minted by a different provider
-    /// so a token from `/auth/github/begin` cannot be claimed at
-    /// `/auth/google/callback`'s exchange. Bound: `/begin` rejects when the
-    /// pending-states map exceeds `MAX_PENDING_STATES`.
-    pub provider: &'static str,
-}
+/// Lifecycle a single-use OAuth login `state` token passes through, persisted
+/// as the `status` column of `rtdb_auth.oauth_states` (ENH-022 Stage 1).
+/// `pending` → `claiming` (first callback wins, single-use enforced by the
+/// `UPDATE ... WHERE status = 'pending'` predicate) → `completed` | `failed`.
+/// Storing this in Postgres — not an in-process map — is what lets a login
+/// begun on one replica complete the callback on another.
+const STATUS_PENDING: &str = "pending";
+const STATUS_CLAIMING: &str = "claiming";
+const STATUS_COMPLETED: &str = "completed";
+const STATUS_FAILED: &str = "failed";
 
 /// Cap on concurrently-pending OAuth state entries. `/begin` mints one per
-/// login attempt and entries self-expire after `STATE_TTL_MS`; this bound is a
-/// defense-in-depth against an attacker spamming `/begin` to grow the map.
-const MAX_PENDING_STATES: usize = 10_000;
+/// login attempt and rows are swept after `STATE_TTL_MS`; this bound is a
+/// defense-in-depth against an attacker spamming `/begin` to grow the table
+/// (closes the SEC-132 unbounded-map note — the prior in-memory map was pruned
+/// only opportunistically).
+const MAX_PENDING_STATES: i64 = 10_000;
 
 /// A pluggable OAuth provider. Each implementation owns its authorize URL,
 /// its callback path, and the full code-for-session exchange (`complete_login`)
@@ -238,35 +225,56 @@ fn unconfigured_response(name: &str) -> Response {
         .into_response()
 }
 
-/// `Pending → Claiming` for the first caller; `false` for a replay, an
-/// already-terminal/expired entry, or a cross-provider claim (SEC-132: the
-/// state's minting provider must match the callback's provider). This is the
-/// single-use claim that makes a replayed or cross-provider callback reject.
+/// `pending → claiming` for the first caller; `false` for a replay, an
+/// already-terminal/expired row, or a cross-provider claim (SEC-132: the
+/// state's minting provider must match the callback's provider). Single-use is
+/// enforced by the database — the `WHERE status = 'pending'` predicate means a
+/// second callback (a replay, or a concurrent race across two replicas) matches
+/// zero rows and returns `false`. This is the row-level claim that makes a
+/// replayed or cross-provider callback reject.
 async fn claim_pending(
     state: &Arc<AppState>,
     state_token: &str,
     expected_provider: &'static str,
 ) -> bool {
-    let mut states = state.auth.oauth_states.lock().await;
     let now = now_ms();
-    match states.get_mut(state_token) {
-        Some(entry)
-            if entry.expires_at > now
-                && matches!(entry.outcome, LoginOutcome::Pending)
-                && entry.provider == expected_provider =>
-        {
-            entry.outcome = LoginOutcome::Claiming;
-            true
-        }
-        _ => false,
-    }
+    let result = sqlx::query(
+        "UPDATE rtdb_auth.oauth_states \
+         SET status = $1 \
+         WHERE state = $2 AND provider = $3 AND status = $4 AND expires_at > $5",
+    )
+    .bind(STATUS_CLAIMING)
+    .bind(state_token)
+    .bind(expected_provider)
+    .bind(STATUS_PENDING)
+    .bind(now)
+    .execute(&state.pool)
+    .await;
+    matches!(result, Ok(ref r) if r.rows_affected() == 1)
 }
 
-/// Sets the terminal outcome after `complete_login` (`Claiming → Completed | Failed`).
-async fn set_outcome(state: &Arc<AppState>, state_token: &str, outcome: LoginOutcome) {
-    let mut states = state.auth.oauth_states.lock().await;
-    if let Some(entry) = states.get_mut(state_token) {
-        entry.outcome = outcome;
+/// Sets the terminal outcome after `complete_login` (`claiming → completed |
+/// failed`). A `completed` row carries the minted session token the
+/// `/auth/state` poll reads; a `failed` row carries none. This does NOT set
+/// `consumed_at` — consumption is the poll's act (one-shot retrieval by the
+/// client), so a completed-but-unpolled row remains consumable.
+async fn set_outcome(state: &Arc<AppState>, state_token: &str, completed: Option<&str>) {
+    let (status, token): (&str, Option<&str>) = match completed {
+        Some(t) => (STATUS_COMPLETED, Some(t)),
+        None => (STATUS_FAILED, None),
+    };
+    if let Err(err) = sqlx::query(
+        "UPDATE rtdb_auth.oauth_states \
+         SET status = $1, session_token = $2 \
+         WHERE state = $3",
+    )
+    .bind(status)
+    .bind(token)
+    .bind(state_token)
+    .execute(&state.pool)
+    .await
+    {
+        tracing::warn!(error = %err, "oauth: failed to record terminal outcome");
     }
 }
 
@@ -277,38 +285,86 @@ enum PollResult {
     Expired,
 }
 
-/// One-shot retrieval for the `/auth/state` polling endpoint. Removes the
-/// entry on a terminal outcome; leaves it in place while pending. The
-/// `resolve_bearer` call happens after the lock is released so no Mutex is
-/// held across the await.
+/// One-shot retrieval for the `/auth/state` polling endpoint. Consumes a
+/// terminal row single-use: the `UPDATE ... WHERE status IN ('completed',
+/// 'failed') AND consumed_at IS NULL RETURNING` is the one-shot gate — exactly
+/// the first poll after completion matches, so a second poll for the same
+/// token does not re-deliver the session token. When no terminal row matches
+/// (the row is still pending/claiming, already consumed, missing, or expired)
+/// a fallback read distinguishes `Pending` (login still in flight) from
+/// `Expired` (consumed, never begun, or timed out).
 async fn poll_login(state: &Arc<AppState>, state_token: &str) -> PollResult {
-    let taken: Option<Result<String, ()>> = {
-        let mut states = state.auth.oauth_states.lock().await;
-        let now = now_ms();
-        states.retain(|_, e| e.expires_at > now);
-        match states.remove(state_token) {
-            None => None,
-            Some(entry) => match entry.outcome {
-                LoginOutcome::Pending | LoginOutcome::Claiming => {
-                    states.insert(state_token.to_string(), entry); // not ready — put back
-                    return PollResult::Pending;
-                }
-                LoginOutcome::Completed(t) => Some(Ok(t)),
-                LoginOutcome::Failed => Some(Err(())),
-            },
+    let now = now_ms();
+    // The single-use consume: only an unconsumed, unexpired, terminal row
+    // matches, so only the first poll after completion wins it.
+    let consumed: Option<(Option<String>, String)> = sqlx::query_as(
+        "UPDATE rtdb_auth.oauth_states \
+         SET consumed_at = $1 \
+         WHERE state = $2 \
+           AND status IN ($3, $4) \
+           AND consumed_at IS NULL \
+           AND expires_at > $1 \
+         RETURNING session_token, status",
+    )
+    .bind(now)
+    .bind(state_token)
+    .bind(STATUS_COMPLETED)
+    .bind(STATUS_FAILED)
+    .fetch_optional(&state.pool)
+    .await
+    .ok()
+    .flatten();
+
+    if let Some((token, status)) = consumed {
+        if status == STATUS_COMPLETED {
+            return match token {
+                Some(t) => match resolve_bearer(&state.pool, &t).await {
+                    Ok(principal @ Principal::User { .. }) => PollResult::Complete {
+                        token: t,
+                        user: authed_user(&principal),
+                    },
+                    _ => PollResult::Expired, // token did not resolve — treat as gone
+                },
+                None => PollResult::Expired,
+            };
         }
-    };
-    match taken {
-        None => PollResult::Expired,
-        Some(Err(())) => PollResult::Failed,
-        Some(Ok(token)) => match resolve_bearer(&state.pool, &token).await {
-            Ok(principal @ Principal::User { .. }) => PollResult::Complete {
-                token,
-                user: authed_user(&principal),
-            },
-            _ => PollResult::Expired, // token did not resolve — treat as gone
-        },
+        return PollResult::Failed;
     }
+
+    // No terminal row consumed: distinguish pending (login in flight) from
+    // expired (missing / already consumed / timed out).
+    let live: Option<String> = sqlx::query_scalar(
+        "SELECT status FROM rtdb_auth.oauth_states \
+         WHERE state = $1 AND status IN ($2, $3) AND expires_at > $4",
+    )
+    .bind(state_token)
+    .bind(STATUS_PENDING)
+    .bind(STATUS_CLAIMING)
+    .bind(now)
+    .fetch_optional(&state.pool)
+    .await
+    .ok()
+    .flatten();
+
+    if live.is_some() {
+        PollResult::Pending
+    } else {
+        PollResult::Expired
+    }
+}
+
+/// Deletes OAuth state rows past their TTL. Called opportunistically from
+/// `/begin` (keeps the pending-row cap honest) and by a gated background sweep
+/// task (ARC-102: no ungated poller — the task runs only while the server is
+/// up and writes nothing to document tables). Closes the SEC-132 note that the
+/// prior in-memory map was pruned only opportunistically.
+pub async fn sweep_oauth_states(pool: &sqlx::PgPool) -> Result<u64, RtDbError> {
+    let now = now_ms();
+    let r = sqlx::query("DELETE FROM rtdb_auth.oauth_states WHERE expires_at <= $1")
+        .bind(now)
+        .execute(pool)
+        .await?;
+    Ok(r.rows_affected())
 }
 
 #[derive(Deserialize)]
@@ -356,23 +412,40 @@ async fn provider_begin<P: OAuthProvider>(
 
     let state_token = random_token();
     let now = now_ms();
+    // Opportunistic TTL prune (cheap DELETE; the background sweep is the
+    // primary pruner). Keeps the pending-row cap below honest.
+    let _ = sweep_oauth_states(&state.pool).await;
+    // SEC-132: bound the pending-states table so an attacker spamming
+    // `/begin` cannot grow it unbounded. Count live `pending`/`claiming` rows
+    // and reject the new mint at the cap.
+    let pending: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM rtdb_auth.oauth_states \
+         WHERE status IN ($1, $2) AND expires_at > $3",
+    )
+    .bind(STATUS_PENDING)
+    .bind(STATUS_CLAIMING)
+    .bind(now)
+    .fetch_one(&state.pool)
+    .await
+    .unwrap_or(0);
+    if pending >= MAX_PENDING_STATES {
+        return RtDbError::internal("too many pending login states; retry").into_response();
+    }
+    if let Err(err) = sqlx::query(
+        "INSERT INTO rtdb_auth.oauth_states \
+         (state, provider, status, created_at, expires_at) \
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(&state_token)
+    .bind(P::name())
+    .bind(STATUS_PENDING)
+    .bind(now)
+    .bind(now + STATE_TTL_MS)
+    .execute(&state.pool)
+    .await
     {
-        let mut states = state.auth.oauth_states.lock().await;
-        states.retain(|_, entry| entry.expires_at > now);
-        // SEC-132: bound the pending-states map so an attacker spamming
-        // `/begin` cannot grow it unbounded. Expired entries were just pruned;
-        // if live entries still exceed the cap, reject the new mint.
-        if states.len() >= MAX_PENDING_STATES {
-            return RtDbError::internal("too many pending login states; retry").into_response();
-        }
-        states.insert(
-            state_token.clone(),
-            OAuthStateEntry {
-                expires_at: now + STATE_TTL_MS,
-                outcome: LoginOutcome::Pending,
-                provider: P::name(),
-            },
-        );
+        tracing::warn!(error = %err, "oauth: failed to insert pending state");
+        return RtDbError::internal("failed to begin login").into_response();
     }
 
     let redirect_uri = format!("{}{}", state.config.public_url, provider.callback_path());
@@ -437,23 +510,18 @@ async fn provider_callback<P: OAuthProvider>(
     }
 
     let Some(provider) = P::from_config(&state.config) else {
-        set_outcome(&state, &params.state, LoginOutcome::Failed).await;
+        set_outcome(&state, &params.state, None).await;
         return unconfigured_response(P::name());
     };
 
     let secure = state.config.cookie_secure || crate::auth::cookie::request_is_secure(&headers);
     match provider.complete_login(&state, &params.code).await {
         Ok(token) => {
-            set_outcome(
-                &state,
-                &params.state,
-                LoginOutcome::Completed(token.clone()),
-            )
-            .await;
+            set_outcome(&state, &params.state, Some(&token)).await;
             callback_close_response(&token, secure)
         }
         Err(err) => {
-            set_outcome(&state, &params.state, LoginOutcome::Failed).await;
+            set_outcome(&state, &params.state, None).await;
             err.into_response()
         }
     }
@@ -485,18 +553,18 @@ async fn apple_callback(
     }
 
     let Some(provider) = AppleProvider::from_config(&state.config) else {
-        set_outcome(&state, &form.state, LoginOutcome::Failed).await;
+        set_outcome(&state, &form.state, None).await;
         return unconfigured_response(AppleProvider::name());
     };
 
     let secure = state.config.cookie_secure || crate::auth::cookie::request_is_secure(&headers);
     match provider.complete_login(&state, &form.code).await {
         Ok(token) => {
-            set_outcome(&state, &form.state, LoginOutcome::Completed(token.clone())).await;
+            set_outcome(&state, &form.state, Some(&token)).await;
             callback_close_response(&token, secure)
         }
         Err(err) => {
-            set_outcome(&state, &form.state, LoginOutcome::Failed).await;
+            set_outcome(&state, &form.state, None).await;
             err.into_response()
         }
     }

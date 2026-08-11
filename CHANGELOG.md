@@ -13,6 +13,29 @@ contract against Convex.
 
 ## [Unreleased]
 
+### Cross-replica OAuth login state (ENH-022, Stage 0 + Stage 1)
+
+The single-use OAuth `state` token minted at `/auth/{provider}/begin` and
+consumed at `/auth/callback` now lives in a `rtdb_auth.oauth_states` table
+instead of an in-process `HashMap`. The lifecycle (`pending` → `claiming` →
+`completed` | `failed`) is enforced by the database: `claim_pending` does a
+conditional `UPDATE ... WHERE status = 'pending'` (single-use claim, replay →
+400, race-safe across replicas), and `poll_login` consumes a terminal row with
+`UPDATE ... WHERE consumed_at IS NULL RETURNING` so a second `/auth/state` poll
+for the same token delivers nothing. This **fixes the silent 2-replica OAuth
+login break** — a login begun on one replica completes on another — and closes
+the `SEC-132` note that the in-memory map was pruned only opportunistically. A
+gated 60 s background sweep deletes expired rows (no new ungated poller).
+
+This is Stage 1 of ENH-022; it does not by itself make multi-instance supported.
+Stage 0 documents the constraint that remains: a boot `WARN`, a "Known MVP
+limitations" entry in `README.md`, and a "Topology: single instance" section in
+`deploy/README.md` naming all four in-process state pieces (op-feed, presence,
+rate limiting remain instance-local; the single-writer committer invariant is
+untouched). Cross-instance op-feed, presence gossip, shared rate limiting, and
+the writer-funnelling decision are later stages. No wire/protocol/DSL change —
+no client mirror required.
+
 ### Typed backfill expression grammar — `evalExpr` closes SEC-107 (ENH-020)
 
 The `evalExpr` migrate directive's backfill expression is now a **closed, typed

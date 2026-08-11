@@ -47,7 +47,6 @@ pub mod txn;
 pub mod webhook;
 pub mod ws;
 
-use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -67,8 +66,6 @@ use tower::ServiceBuilder;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
-
-use auth::provider::OAuthStateEntry;
 
 /// Realtime execution core: subscription state, the per-db committer tasks,
 /// and the live op-feed tap they publish to. Grouped so handlers that only
@@ -104,17 +101,13 @@ pub struct Runtime {
 /// Per-instance auth bookkeeping that is neither a config value nor a realtime
 /// concern. Grouped so `state.auth` is the only OAuth-session seam.
 ///
-/// **Instance-local (ARC-126):** `oauth_states` is an in-process `HashMap`
-/// keyed by the single-use `state` token minted at `/auth/{provider}/begin`
-/// and consumed at `/auth/callback`. A second replica behind a load balancer
-/// has no entry for a state minted on the first, so the OAuth callback lands
-/// on the wrong replica and **the login silently fails** (the poll at
-/// `/auth/state?state=…` never resolves). `SameSite=Lax` + a sticky-session-
-/// less deploy reproduces this trivially. This server is single-instance by
-/// design — see the boot WARN in `main.rs`. Horizontal scaling (ENH-022)
-/// would lift this.
+/// **Cross-replica safe (ENH-022 Stage 1):** the single-use OAuth `state`
+/// token minted at `/auth/{provider}/begin` and consumed at `/auth/callback`
+/// now lives in the `rtdb_auth.oauth_states` table, not an in-process map. A
+/// callback load-balanced to a different replica finds the same row, so a
+/// login begun on one replica completes on another. The op-feed and presence
+/// maps remain instance-local (see `Realtime`) until later ENH-022 stages.
 pub struct Auth {
-    pub oauth_states: tokio::sync::Mutex<HashMap<String, OAuthStateEntry>>,
     /// Shared HTTP client for all OAuth providers' outbound calls (token
     /// exchange, userinfo fetch, JWKS fetch). One client for the process keeps
     /// a warm connection pool + TLS session across logins instead of paying the
@@ -246,10 +239,7 @@ impl AppState {
                 metrics,
                 started_at: SystemTime::now(),
             },
-            auth: Auth {
-                oauth_states: tokio::sync::Mutex::new(HashMap::new()),
-                http,
-            },
+            auth: Auth { http },
             rate_limiter: rate_limit::RateLimiter::new(),
             backup_running: Arc::new(AtomicBool::new(false)),
             image,

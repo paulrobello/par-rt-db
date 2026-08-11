@@ -60,6 +60,32 @@ async fn main() {
         std::process::exit(1);
     });
 
+    // ENH-022 Stage 1: gated background sweep of expired OAuth state rows.
+    // `rtdb_auth.oauth_states` is the cross-replica login-state table; rows
+    // live for the 10-minute login TTL and are also pruned opportunistically at
+    // `/begin`, but this task bounds the table even when `/begin` is idle
+    // (closes the SEC-132 unbounded-map note). It writes nothing to document
+    // tables — a pure reader+DELETE on a side table — so the committer's
+    // single-writer invariant is untouched. Runs for the process lifetime;
+    // best-effort (errors logged, never aborts).
+    {
+        let sweep_pool = pool.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            interval.tick().await; // skip the immediate first tick
+            loop {
+                interval.tick().await;
+                match auth::provider::sweep_oauth_states(&sweep_pool).await {
+                    Ok(n) if n > 0 => {
+                        tracing::debug!(expired = n, "oauth state sweep: pruned rows");
+                    }
+                    Ok(_) => {}
+                    Err(err) => tracing::warn!(error = %err, "oauth state sweep failed"),
+                }
+            }
+        });
+    }
+
     // Durable audit log table: only ensured when the feature is enabled at
     // boot. When off the table is permitted to not exist, and the
     // `GET /admin/audit` endpoint returns an empty list.
