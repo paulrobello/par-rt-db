@@ -89,20 +89,12 @@ struct MicrosoftIdentity {
 /// Cached Microsoft JWKS (JSON Web Key Set), keyed by tenant id. Providers are
 /// constructed per request (`from_config`), so a struct field could not hold
 /// the cache across requests — a module-level static does. TTL bounds the
-/// stale-key window; a refresh falls out naturally when an entry expires. The
-/// `reqwest::Client` is shared for the same reason.
+/// stale-key window; a refresh falls out naturally when an entry expires.
 static JWKS_CACHE: LazyLock<Cache<String, Arc<serde_json::Value>>> = LazyLock::new(|| {
     Cache::builder()
         .time_to_live(Duration::from_secs(3600))
         .max_capacity(64)
         .build()
-});
-
-static HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
-    reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new())
 });
 
 #[async_trait]
@@ -136,9 +128,10 @@ impl OAuthProvider for MicrosoftProvider {
     }
 
     async fn complete_login(&self, state: &Arc<AppState>, code: &str) -> Result<String, RtDbError> {
+        let http = state.auth.http.clone();
         let redirect_uri = self.redirect_uri(&state.config.public_url);
 
-        let token_resp: serde_json::Value = HTTP_CLIENT
+        let token_resp: serde_json::Value = http
             .post(self.token_endpoint())
             .form(&TokenExchangeRequest {
                 client_id: &self.client_id,
@@ -176,9 +169,9 @@ impl OAuthProvider for MicrosoftProvider {
         // which let a spoofed/relayed token dictate the identity. JWKS fetch
         // failures are fail-closed — a login is never admitted on the strength
         // of an unverified token.
-        let claims = verify_id_token(id_token, &self.client_id, &self.tenant).await?;
+        let claims = verify_id_token(&http, id_token, &self.client_id, &self.tenant).await?;
 
-        let userinfo: serde_json::Value = HTTP_CLIENT
+        let userinfo: serde_json::Value = http
             .get(Self::USERINFO_ENDPOINT)
             .header(
                 reqwest::header::AUTHORIZATION,
@@ -361,6 +354,7 @@ fn parse_token_response(value: &serde_json::Value) -> Result<String, RtDbError> 
 /// signature. JWKS fetch failures are fail-closed: a generic internal error
 /// rejects the login rather than admitting an unverified token.
 async fn verify_id_token(
+    http: &reqwest::Client,
     id_token: &str,
     client_id: &str,
     configured_tenant: &str,
@@ -424,7 +418,7 @@ async fn verify_id_token(
         return Err(forbidden("id_token tenant mismatch"));
     }
 
-    let jwks = fetch_jwks(tid).await?;
+    let jwks = fetch_jwks(http, tid).await?;
     let key_obj = jwks
         .get("keys")
         .and_then(|v| v.as_array())
@@ -478,12 +472,15 @@ async fn verify_id_token(
 /// Fetches the JWKS for a tenant, caching the parsed key set for one hour. The
 /// cache is keyed by tenant id so multiple tenants (a `common` deployment) do
 /// not collide. Fail-closed: any network/decode error rejects the login.
-async fn fetch_jwks(tid: &str) -> Result<Arc<serde_json::Value>, RtDbError> {
+async fn fetch_jwks(
+    http: &reqwest::Client,
+    tid: &str,
+) -> Result<Arc<serde_json::Value>, RtDbError> {
     if let Some(cached) = JWKS_CACHE.get(tid).await {
         return Ok(cached);
     }
     let url = format!("https://login.microsoftonline.com/{tid}/discovery/v2.0/keys");
-    let jwks: serde_json::Value = HTTP_CLIENT
+    let jwks: serde_json::Value = http
         .get(&url)
         .send()
         .await

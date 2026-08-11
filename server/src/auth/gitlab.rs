@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use serde::Serialize;
 
 use crate::AppState;
 use crate::auth::provider::OAuthProvider;
@@ -60,51 +59,22 @@ impl OAuthProvider for GitlabProvider {
     }
 
     async fn complete_login(&self, state: &Arc<AppState>, code: &str) -> Result<String, RtDbError> {
-        let client = reqwest::Client::new();
+        let http = state.auth.http.clone();
         let redirect_uri = self.redirect_uri(&state.config.public_url);
+        let token_url = format!("{}/oauth/token", self.base_url);
+        let userinfo_url = format!("{}/api/v4/user", self.base_url);
 
-        let token_resp: serde_json::Value = client
-            .post(format!("{}/oauth/token", self.base_url))
-            .form(&TokenExchangeRequest {
-                client_id: &self.client_id,
-                client_secret: &self.client_secret,
-                code,
-                redirect_uri: &redirect_uri,
-                grant_type: "authorization_code",
-            })
-            .send()
-            .await
-            .map_err(|err| {
-                tracing::warn!(error = %err, "gitlab token exchange request failed");
-                RtDbError::internal("gitlab token exchange failed")
-            })?
-            .json()
-            .await
-            .map_err(|err| {
-                tracing::warn!(error = %err, "gitlab token exchange response decode failed");
-                RtDbError::internal("gitlab token exchange failed")
-            })?;
-
-        let access_token = parse_token_response(token_resp)?;
-
-        let user: serde_json::Value = client
-            .get(format!("{}/api/v4/user", self.base_url))
-            .header(
-                reqwest::header::AUTHORIZATION,
-                format!("Bearer {access_token}"),
-            )
-            .send()
-            .await
-            .map_err(|err| {
-                tracing::warn!(error = %err, "gitlab user fetch request failed");
-                RtDbError::internal("gitlab user fetch failed")
-            })?
-            .json()
-            .await
-            .map_err(|err| {
-                tracing::warn!(error = %err, "gitlab user fetch response decode failed");
-                RtDbError::internal("gitlab user fetch failed")
-            })?;
+        let user = crate::auth::provider::oidc_exchange_and_fetch_userinfo(
+            &http,
+            Self::name(),
+            &token_url,
+            &userinfo_url,
+            &self.client_id,
+            &self.client_secret,
+            code,
+            &redirect_uri,
+        )
+        .await?;
 
         let identity = parse_user(user)?;
         let email = identity.email.to_lowercase();
@@ -136,30 +106,6 @@ impl OAuthProvider for GitlabProvider {
             state.runtime.hot.load().session_ttl_days,
         )
         .await
-    }
-}
-
-#[derive(Serialize)]
-struct TokenExchangeRequest<'a> {
-    client_id: &'a str,
-    client_secret: &'a str,
-    code: &'a str,
-    redirect_uri: &'a str,
-    grant_type: &'a str,
-}
-
-/// Extracts the access token from GitLab's token-exchange response. GitLab
-/// returns `{"access_token": "...", ...}` on success and
-/// `{"error": "...", "error_description": "..."}` on failure — the latter is
-/// surfaced as a generic internal error so the OAuth error text never reaches
-/// the response body.
-fn parse_token_response(value: serde_json::Value) -> Result<String, RtDbError> {
-    match value.get("access_token").and_then(|v| v.as_str()) {
-        Some(token) => Ok(token.to_string()),
-        None => {
-            tracing::warn!(response = ?value, "gitlab token exchange returned no access_token");
-            Err(RtDbError::internal("gitlab token exchange failed"))
-        }
     }
 }
 
@@ -198,19 +144,6 @@ fn parse_user(value: serde_json::Value) -> Result<GitlabIdentity, RtDbError> {
 mod tests {
     use super::*;
     use serde_json::json;
-
-    #[test]
-    fn parse_token_response_returns_access_token_on_success() {
-        let resp =
-            json!({"access_token": "glpat-abc", "token_type": "Bearer", "scope": "read_user"});
-        assert_eq!(parse_token_response(resp).unwrap(), "glpat-abc");
-    }
-
-    #[test]
-    fn parse_token_response_fails_on_error_body() {
-        let resp = json!({"error": "invalid_grant", "error_description": "Bad code"});
-        assert!(parse_token_response(resp).is_err());
-    }
 
     #[test]
     fn parse_user_accepts_confirmed_email() {

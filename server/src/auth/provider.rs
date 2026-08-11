@@ -94,6 +94,126 @@ pub trait OAuthProvider: Send + Sync {
     async fn complete_login(&self, state: &Arc<AppState>, code: &str) -> Result<String, RtDbError>;
 }
 
+// --- ARC-114: shared OIDC exchange + Template Method scope -----------------
+//
+// The six providers split into two shapes:
+//
+// 1. The common OIDC shape (Google, GitLab, generic OIDC): a standards-form
+//    `authorization_code` token exchange, then a single authenticated userinfo
+//    GET, then an email-keyed upsert. The token-exchange + userinfo-fetch half
+//    is byte-identical across these three (only URLs + the error-message slug
+//    differ), so it lives in `oidc_exchange_and_fetch_userinfo` below. Each
+//    provider keeps its own `parse_userinfo` (the verified-email signal differs
+//    — Google's `email_verified`, GitLab's `confirmed_at`, OIDC's required
+//    `email_verified`) and its own upsert.
+//
+// 2. Divergent flows that deliberately do NOT use the helper:
+//    - GitHub fetches `/user` AND `/user/emails` (two GETs, a User-Agent
+//      header, and a github_id-keyed two-phase upsert).
+//    - Microsoft verifies an id_token against a tenant JWKS and keys identity
+//      on `{tid}.{sub}` (SEC-102 — must NOT regress to email keying).
+//    - Apple signs an ES256 client_secret JWT and reads identity from the
+//      id_token (no userinfo GET at all).
+//
+// Forcing those three into a single template would either bloat it with
+// optional hooks or risk the very identity-keying regressions SEC-102 closed.
+// The shared helper below serves the clean trio; the rest keep their own
+// `complete_login`. The email-keyed upsert hoist into `auth/mod.rs` is
+// DEFERRED — only the three email-keyed providers share it, Microsoft/Apple/
+// GitHub diverge, so a unified upsert would be a half-applied abstraction
+// (filed as the ARC-114 residual).
+
+#[derive(Serialize)]
+struct AuthorizationCodeRequest<'a> {
+    client_id: &'a str,
+    client_secret: &'a str,
+    code: &'a str,
+    redirect_uri: &'a str,
+    grant_type: &'a str,
+}
+
+/// Extracts the `access_token` from a token-exchange response. Success ⇒ the
+/// token; an error/empty body ⇒ `{slug} token exchange failed` (generic, never
+/// leaking the OAuth error text). Shared by the three OIDC-shape providers.
+fn extract_access_token(
+    slug: &'static str,
+    value: &serde_json::Value,
+) -> Result<String, RtDbError> {
+    match value.get("access_token").and_then(|v| v.as_str()) {
+        Some(token) => Ok(token.to_string()),
+        None => {
+            tracing::warn!(response = ?value, "{slug} token exchange returned no access_token");
+            Err(RtDbError::internal(format!("{slug} token exchange failed")))
+        }
+    }
+}
+
+/// The shared token-exchange + userinfo-fetch half of the common OIDC login
+/// dance (ARC-114). Used by the Google, GitLab, and generic OIDC providers —
+/// the three whose flow is a standards-form `authorization_code` POST followed
+/// by a single authenticated userinfo GET. GitHub/Microsoft/Apple have
+/// divergent flows and do not call this.
+///
+/// `slug` is the provider name used in generic error bodies and tracing (e.g.
+/// "google"), preserving the per-provider error strings the callers previously
+/// emitted. Returns the userinfo JSON for the provider's own `parse_userinfo`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn oidc_exchange_and_fetch_userinfo(
+    http: &reqwest::Client,
+    slug: &'static str,
+    token_url: &str,
+    userinfo_url: &str,
+    client_id: &str,
+    client_secret: &str,
+    code: &str,
+    redirect_uri: &str,
+) -> Result<serde_json::Value, RtDbError> {
+    let token_resp: serde_json::Value = http
+        .post(token_url)
+        .form(&AuthorizationCodeRequest {
+            client_id,
+            client_secret,
+            code,
+            redirect_uri,
+            grant_type: "authorization_code",
+        })
+        .send()
+        .await
+        .map_err(|err| {
+            tracing::warn!(error = %err, "{slug} token exchange request failed");
+            RtDbError::internal(format!("{slug} token exchange failed"))
+        })?
+        .json()
+        .await
+        .map_err(|err| {
+            tracing::warn!(error = %err, "{slug} token exchange response decode failed");
+            RtDbError::internal(format!("{slug} token exchange failed"))
+        })?;
+
+    let access_token = extract_access_token(slug, &token_resp)?;
+
+    let userinfo: serde_json::Value = http
+        .get(userinfo_url)
+        .header(
+            reqwest::header::AUTHORIZATION,
+            format!("Bearer {access_token}"),
+        )
+        .send()
+        .await
+        .map_err(|err| {
+            tracing::warn!(error = %err, "{slug} userinfo fetch request failed");
+            RtDbError::internal(format!("{slug} userinfo fetch failed"))
+        })?
+        .json()
+        .await
+        .map_err(|err| {
+            tracing::warn!(error = %err, "{slug} userinfo fetch response decode failed");
+            RtDbError::internal(format!("{slug} userinfo fetch failed"))
+        })?;
+
+    Ok(userinfo)
+}
+
 fn bearer_token(headers: &HeaderMap) -> Option<&str> {
     if let Some(v) = headers
         .get(axum::http::header::AUTHORIZATION)
@@ -684,4 +804,30 @@ pub fn auth_routes() -> Router<Arc<AppState>> {
         .route("/auth/logout", post(logout))
         .route("/auth/me", get(me))
         .route("/auth/validate", get(validate))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn extract_access_token_returns_token_on_success() {
+        let resp = json!({"access_token": "ya29.x", "token_type": "Bearer", "expires_in": 3599});
+        assert_eq!(extract_access_token("google", &resp).unwrap(), "ya29.x");
+    }
+
+    #[test]
+    fn extract_access_token_fails_on_error_body() {
+        let resp = json!({"error": "invalid_grant", "error_description": "bad code"});
+        assert!(extract_access_token("google", &resp).is_err());
+    }
+
+    #[test]
+    fn extract_access_token_fails_when_access_token_absent() {
+        // A response with other keys but no access_token still fails — never
+        // admits on the strength of a malformed exchange.
+        let resp = json!({"token_type": "Bearer", "expires_in": 3599});
+        assert!(extract_access_token("oidc", &resp).is_err());
+    }
 }

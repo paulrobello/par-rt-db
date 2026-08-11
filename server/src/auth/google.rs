@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use serde::Serialize;
 
 use crate::AppState;
 use crate::auth::provider::OAuthProvider;
@@ -62,51 +61,20 @@ impl OAuthProvider for GoogleProvider {
     }
 
     async fn complete_login(&self, state: &Arc<AppState>, code: &str) -> Result<String, RtDbError> {
-        let client = reqwest::Client::new();
+        let http = state.auth.http.clone();
         let redirect_uri = self.redirect_uri(&state.config.public_url);
 
-        let token_resp: serde_json::Value = client
-            .post(TOKEN_URL)
-            .form(&TokenExchangeRequest {
-                client_id: &self.client_id,
-                client_secret: &self.client_secret,
-                code,
-                redirect_uri: &redirect_uri,
-                grant_type: "authorization_code",
-            })
-            .send()
-            .await
-            .map_err(|err| {
-                tracing::warn!(error = %err, "google token exchange request failed");
-                RtDbError::internal("google token exchange failed")
-            })?
-            .json()
-            .await
-            .map_err(|err| {
-                tracing::warn!(error = %err, "google token exchange response decode failed");
-                RtDbError::internal("google token exchange failed")
-            })?;
-
-        let access_token = parse_token_response(token_resp)?;
-
-        let userinfo: serde_json::Value = client
-            .get(USERINFO_URL)
-            .header(
-                reqwest::header::AUTHORIZATION,
-                format!("Bearer {access_token}"),
-            )
-            .send()
-            .await
-            .map_err(|err| {
-                tracing::warn!(error = %err, "google userinfo fetch request failed");
-                RtDbError::internal("google userinfo fetch failed")
-            })?
-            .json()
-            .await
-            .map_err(|err| {
-                tracing::warn!(error = %err, "google userinfo fetch response decode failed");
-                RtDbError::internal("google userinfo fetch failed")
-            })?;
+        let userinfo = crate::auth::provider::oidc_exchange_and_fetch_userinfo(
+            &http,
+            Self::name(),
+            TOKEN_URL,
+            USERINFO_URL,
+            &self.client_id,
+            &self.client_secret,
+            code,
+            &redirect_uri,
+        )
+        .await?;
 
         let identity = parse_userinfo(userinfo)?;
         let email = identity.email.to_lowercase();
@@ -139,29 +107,6 @@ impl OAuthProvider for GoogleProvider {
             state.runtime.hot.load().session_ttl_days,
         )
         .await
-    }
-}
-
-#[derive(Serialize)]
-struct TokenExchangeRequest<'a> {
-    client_id: &'a str,
-    client_secret: &'a str,
-    code: &'a str,
-    redirect_uri: &'a str,
-    grant_type: &'a str,
-}
-
-/// Extracts the access token from Google's token-exchange response. Google
-/// returns `{"access_token": "...", ...}` on success and
-/// `{"error": "invalid_grant", "error_description": "..."}` on failure — the
-/// latter is surfaced as a generic internal error.
-fn parse_token_response(value: serde_json::Value) -> Result<String, RtDbError> {
-    match value.get("access_token").and_then(|v| v.as_str()) {
-        Some(token) => Ok(token.to_string()),
-        None => {
-            tracing::warn!(response = ?value, "google token exchange returned no access_token");
-            Err(RtDbError::internal("google token exchange failed"))
-        }
     }
 }
 
@@ -204,18 +149,6 @@ fn parse_userinfo(value: serde_json::Value) -> Result<GoogleIdentity, RtDbError>
 mod tests {
     use super::*;
     use serde_json::json;
-
-    #[test]
-    fn parse_token_response_returns_access_token_on_success() {
-        let resp = json!({"access_token": "ya29.abc", "token_type": "Bearer", "expires_in": 3599});
-        assert_eq!(parse_token_response(resp).unwrap(), "ya29.abc");
-    }
-
-    #[test]
-    fn parse_token_response_fails_on_error_body() {
-        let resp = json!({"error": "invalid_grant", "error_description": "Bad code"});
-        assert!(parse_token_response(resp).is_err());
-    }
 
     #[test]
     fn parse_userinfo_accepts_verified_boolean_email() {

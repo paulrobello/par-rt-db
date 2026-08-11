@@ -95,7 +95,7 @@ impl OAuthProvider for AppleProvider {
         let client_secret =
             build_client_secret_jwt(&self.team_id, &self.client_id, &self.key_id, &key)?;
 
-        let client = reqwest::Client::new();
+        let client = state.auth.http.clone();
         let redirect_uri = self.redirect_uri(&state.config.public_url);
 
         // SEC-002R: the id_token read below arrives ONLY from this

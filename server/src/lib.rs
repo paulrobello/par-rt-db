@@ -50,7 +50,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use arc_swap::ArcSwap;
 use axum::extract::{Request, State};
@@ -114,6 +114,16 @@ pub struct Runtime {
 /// would lift this.
 pub struct Auth {
     pub oauth_states: tokio::sync::Mutex<HashMap<String, OAuthStateEntry>>,
+    /// Shared HTTP client for all OAuth providers' outbound calls (token
+    /// exchange, userinfo fetch, JWKS fetch). One client for the process keeps
+    /// a warm connection pool + TLS session across logins instead of paying the
+    /// handshake per login as `reqwest::Client::new()` did (ARC-114). The 10s
+    /// timeout matches the in-tree convention Microsoft's provider already used
+    /// via its former module-level `HTTP_CLIENT`; for the other providers it is
+    /// a sensible upper bound where previously there was none (a hung exchange
+    /// now fails at 10s instead of hanging indefinitely). Redirect policy is
+    /// reqwest's default (follow up to 10), matching `Client::new()`.
+    pub http: reqwest::Client,
 }
 
 pub struct AppState {
@@ -205,6 +215,16 @@ impl AppState {
             // self-terminates if it ever errors, and nothing awaits its handle.
             let _handle = presence.clone().run_flush_task();
         }
+        // ARC-114: one shared HTTP client for every OAuth provider's outbound
+        // calls, so logins reuse a warm connection pool instead of building a
+        // fresh client (and TLS handshake) per login. Built before the struct
+        // literal so it can move into `Auth`. A build failure is non-fatal — it
+        // falls back to `Client::new()` (the prior per-login behavior) so a
+        // misconfigured system still boots.
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         Arc::new(Self {
             pool,
             config,
@@ -222,6 +242,7 @@ impl AppState {
             },
             auth: Auth {
                 oauth_states: tokio::sync::Mutex::new(HashMap::new()),
+                http,
             },
             rate_limiter: rate_limit::RateLimiter::new(),
             backup_running: Arc::new(AtomicBool::new(false)),

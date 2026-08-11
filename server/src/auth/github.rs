@@ -56,7 +56,7 @@ impl OAuthProvider for GithubProvider {
     }
 
     async fn complete_login(&self, state: &Arc<AppState>, code: &str) -> Result<String, RtDbError> {
-        let client = reqwest::Client::new();
+        let client = state.auth.http.clone();
         let redirect_uri = self.redirect_uri(&state.config.public_url);
 
         let token_resp: serde_json::Value = client
