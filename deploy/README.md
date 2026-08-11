@@ -150,6 +150,43 @@ JSON snapshot with per-db breakdowns (storage, subs, quota rejections) stays at
 `GET /admin/metrics`, behind the admin key — do not scrape that from Prometheus,
 since per-db labels would blow up cardinality.
 
+## Tracing (OpenTelemetry / OTLP, ENH-018)
+
+`/metrics` answers "how much"; OTLP tracing answers "why was *this* request
+slow." It is opt-in at two layers: the docker image must be built with the
+`otel` cargo feature, and `RTDB_OTEL_ENABLED=true` must be set at runtime. The
+shipped `Dockerfile` does **not** build with `--features otel` by default (the
+default build carries no OTel code and is byte-compatible with tracing off), so
+enabling tracing is a `Dockerfile` one-line change (`cargo build --features
+otel --release`) plus the four `RTDB_OTEL_*` vars already forwarded by
+`docker-compose.yml`:
+
+| Var | Default | Meaning |
+|---|---|---|
+| `RTDB_OTEL_ENABLED` | `false` | Runtime master switch — `false` produces zero OTLP network calls even in a feature-compiled binary. |
+| `RTDB_OTEL_ENDPOINT` | `http://127.0.0.1:4317` | OTLP/gRPC collector endpoint (4317 is the standard port). |
+| `RTDB_OTEL_SERVICE_NAME` | `par-rt-db` | `service.name` resource attribute on every span. |
+| `RTDB_OTEL_SAMPLE_RATIO` | `0.05` | Head sampler ratio in `[0.0, 1.0]`; a malformed value fails boot. |
+
+Point `RTDB_OTEL_ENDPOINT` at a collector (e.g. an `otel/opentelemetry-collector`
+sidecar or a hosted backend). The spans worth alerting on:
+
+- **`committer.mutate`** — carries `queue_wait_ms`, the gap between enqueue and
+  dequeue in the per-db serialized queue. This is the single most useful
+  per-request latency signal and the one the architecture otherwise makes
+  invisible; a sustained non-zero value means writes are queuing behind the
+  single writer for that database.
+- **`subs.fan_out` / `subs.rerun`** — a slow subscription's re-run query blocks
+  all writes to that database (it runs inside the committer turn). Per-sub
+  `subs.rerun` spans (carrying `table`/`terminal`) make the offender obvious.
+- **`query.execute` / `txn.execute`** — splits "the DSL is slow" vs "Postgres
+  is slow".
+
+Span attributes are bounded (`db`, `table`, `terminal`, `steps`,
+`queue_wait_ms`) — never document ids, user ids, or content — so cardinality
+stays safe under the head sampler. The exporter flushes on SIGTERM, so a
+`compose down` does not drop the last in-flight batch.
+
 ## Secrets (`/docker/par-rt-db/.env`, not committed)
 
 - `POSTGRES_PASSWORD`, `RTDB_ADMIN_KEY` — `openssl rand -hex 32`. `RTDB_ADMIN_KEY`

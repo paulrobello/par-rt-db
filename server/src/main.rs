@@ -1,17 +1,23 @@
 use rtdb_server::{AppState, auth, build_router, config::Config, db};
 use sqlx::postgres::PgPoolOptions;
-use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
-        .init();
-
+    // Config is parsed BEFORE the tracing subscriber is installed so the
+    // runtime RTDB_OTEL_* knobs (master switch, endpoint, sample ratio) can
+    // gate the OTLP layer at boot (ENH-018). Any boot error from config is
+    // printed directly — there is no subscriber to log through yet.
     let config = Config::from_env().unwrap_or_else(|err| {
         eprintln!("failed to load configuration: {err}");
         std::process::exit(1);
     });
+
+    // ENH-018: install the global tracing subscriber. Default build → stdout
+    // fmt layer (byte-compatible with pre-ENH-018 behavior). `otel` feature +
+    // RTDB_OTEL_ENABLED=true → composes an OpenTelemetryLayer exporting OTLP
+    // spans to a collector. The guard flushes the exporter on shutdown_signal
+    // resolution (held for the process lifetime below).
+    let _otel_guard = rtdb_server::tracing_setup::init(&config);
 
     // ARC-126: this server stores OAuth state, the op-feed, presence, and
     // rate-limit counters in-process (no cross-replica coordination). Running

@@ -12,6 +12,7 @@ use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 
 use sqlx::{PgConnection, PgPool};
+use tracing::Instrument;
 
 use crate::auth::{PrincipalCtx, authorize_table};
 use crate::db::{new_id, now_ms, validate_db_name};
@@ -1298,6 +1299,13 @@ pub async fn execute_txn(
     txn: &Transaction,
     ctx: &PrincipalCtx,
 ) -> Result<TxnOutcome, RtDbError> {
+    // ENH-018: `txn.execute` spans the write path so "the DSL is slow" vs
+    // "Postgres is slow" is a distinguishable question. The step count is the
+    // useful cardinal attribute (one per request shape, not per document). The
+    // body runs in an instrumented `async` block because a sync `Span::enter`
+    // guard is `!Send` and would poison this `Send` future across the `.await`s.
+    let span = tracing::info_span!("txn.execute", db, steps = txn.steps.len());
+    async {
     validate_db_name(db)?;
     // Task 5: `ctx` carries `user_id` + `email`; the row-auth helpers below use
     // only the uid, so derive the legacy `owner: Option<&str>` view once and
@@ -1403,6 +1411,9 @@ pub async fn execute_txn(
 
     tx.commit().await?;
     Ok(TxnOutcome { results, write_set })
+    }
+    .instrument(span)
+    .await
 }
 
 /// Shared, borrow-only context for the `step_*` per-step handlers in

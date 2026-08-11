@@ -11,6 +11,7 @@
 use std::cmp::Ordering;
 
 use sqlx::PgPool;
+use tracing::Instrument;
 
 use crate::auth::{PrincipalCtx, authorize_table};
 use crate::db::validate_db_name;
@@ -754,158 +755,176 @@ pub async fn execute_query(
     q: &Query,
     ctx: &PrincipalCtx,
 ) -> Result<QueryResult, RtDbError> {
-    validate_db_name(db)?;
-    // ENH-005 Task 4: a machine token with a non-empty `tables` allowlist cannot
-    // read a table not on the list. `tables = None` (admin/`User`/scheduled/
-    // full-access machine tokens) and `tables = Some([])` bypass. The gate runs
-    // before the table def resolves so a `Forbidden` never leaks table metadata.
-    authorize_table(ctx, &q.table)?;
-    // Task 5: `ctx` carries `user_id` + `email` so Task 6+ can resolve `$email`
-    // markers. The SQL row-auth paths here only need the uid, so derive the
-    // legacy `owner: Option<&str>` view once and thread it unchanged —
-    // byte-identical behavior for ownerField/collaboratorsField.
-    let owner = ctx.user_id.as_deref();
-    let table_def = schema.table(&q.table)?;
-    let owner_field = table_def.owner_field.as_deref();
-    let collaborators_field = table_def.collaborators_field.as_deref();
-    // Shared borrow-only context for the four read-path terminals that don't
-    // use the btree `QueryWindow` (point_read + the search family). Constructed
-    // once from the caller-resolved inputs and passed by shared reference;
-    // each terminal destructures it back into the same locals the inline body
-    // used. QA-105.
-    let sctx = SearchCtx {
-        pool,
+    // ENH-018: wrap the read path in a `query.execute` span. The db/table/
+    // terminal attributes are bounded (one per database/table, not per
+    // document), so they are safe span attributes — never doc ids or content.
+    // Nesting: a query issued by a subscriber's re-run lands as a child of the
+    // `subs.rerun` span; a one-shot HTTP query is a root. The body runs inside
+    // an `async` block `.instrument`-ed with the span because a sync
+    // `Span::enter()` guard is `!Send` and would poison the future across the
+    // `.await`s below.
+    let span = tracing::info_span!(
+        "query.execute",
         db,
-        table_def,
-        table_name: q.table.as_str(),
-        owner_field,
-        collaborators_field,
-        ctx,
-    };
+        table = %q.table,
+        terminal = q.terminal_name(),
+    );
+    async {
+        validate_db_name(db)?;
+        // ENH-005 Task 4: a machine token with a non-empty `tables` allowlist cannot
+        // read a table not on the list. `tables = None` (admin/`User`/scheduled/
+        // full-access machine tokens) and `tables = Some([])` bypass. The gate runs
+        // before the table def resolves so a `Forbidden` never leaks table metadata.
+        authorize_table(ctx, &q.table)?;
+        // Task 5: `ctx` carries `user_id` + `email` so Task 6+ can resolve `$email`
+        // markers. The SQL row-auth paths here only need the uid, so derive the
+        // legacy `owner: Option<&str>` view once and thread it unchanged —
+        // byte-identical behavior for ownerField/collaboratorsField.
+        let owner = ctx.user_id.as_deref();
+        let table_def = schema.table(&q.table)?;
+        let owner_field = table_def.owner_field.as_deref();
+        let collaborators_field = table_def.collaborators_field.as_deref();
+        // Shared borrow-only context for the four read-path terminals that don't
+        // use the btree `QueryWindow` (point_read + the search family). Constructed
+        // once from the caller-resolved inputs and passed by shared reference;
+        // each terminal destructures it back into the same locals the inline body
+        // used. QA-105.
+        let sctx = SearchCtx {
+            pool,
+            db,
+            table_def,
+            table_name: q.table.as_str(),
+            owner_field,
+            collaborators_field,
+            ctx,
+        };
 
-    // Principal markers (`{"$user":true}` / `{"$email":true}`) and malformed
-    // field references are rejected inside `compile_filter` (SEC-125) — that
-    // validation now runs at the single compilation chokepoint, so q.filter,
-    // search.filter, vectorSearch.filter, and the by-query filters all get the
-    // Contains-array + orderable-field + principal-marker guards. The failure
-    // surfaces as `BadRequest` (a malformed client query).
+        // Principal markers (`{"$user":true}` / `{"$email":true}`) and malformed
+        // field references are rejected inside `compile_filter` (SEC-125) — that
+        // validation now runs at the single compilation chokepoint, so q.filter,
+        // search.filter, vectorSearch.filter, and the by-query filters all get the
+        // Contains-array + orderable-field + principal-marker guards. The failure
+        // surfaces as `BadRequest` (a malformed client query).
 
-    if let Some(id) = &q.get {
-        reject_if_any_set(q, GET_PEERS, GET_MESSAGE)?;
-        return point_read(&sctx, id, owner).await;
-    }
+        if let Some(id) = &q.get {
+            reject_if_any_set(q, GET_PEERS, GET_MESSAGE)?;
+            return point_read(&sctx, id, owner).await;
+        }
 
-    if q.unique {
-        reject_if_any_set(q, UNIQUE_PEERS, UNIQUE_MESSAGE)?;
-    }
+        if q.unique {
+            reject_if_any_set(q, UNIQUE_PEERS, UNIQUE_MESSAGE)?;
+        }
 
-    if q.first {
-        reject_per_peer_set(q, FIRST_INCOMPATIBLES)?;
-    }
+        if q.first {
+            reject_per_peer_set(q, FIRST_INCOMPATIBLES)?;
+        }
 
-    if q.count {
-        reject_per_peer_set(q, COUNT_INCOMPATIBLES)?;
-    }
+        if q.count {
+            reject_per_peer_set(q, COUNT_INCOMPATIBLES)?;
+        }
 
-    if q.distinct {
-        reject_per_peer_set(q, DISTINCT_INCOMPATIBLES)?;
-    }
+        if q.distinct {
+            reject_per_peer_set(q, DISTINCT_INCOMPATIBLES)?;
+        }
 
-    if q.aggregate.is_some() {
-        reject_per_peer_set(q, AGGREGATE_INCOMPATIBLES)?;
-    }
+        if q.aggregate.is_some() {
+            reject_per_peer_set(q, AGGREGATE_INCOMPATIBLES)?;
+        }
 
-    if q.paginate.is_some() {
-        reject_per_peer_set(q, PAGINATE_INCOMPATIBLES)?;
-    }
+        if q.paginate.is_some() {
+            reject_per_peer_set(q, PAGINATE_INCOMPATIBLES)?;
+        }
 
-    if q.gt.is_some() && q.gte.is_some() {
-        return Err(RtDbError::bad_request("gt and gte cannot both be set"));
-    }
-    if q.lt.is_some() && q.lte.is_some() {
-        return Err(RtDbError::bad_request("lt and lte cannot both be set"));
-    }
+        if q.gt.is_some() && q.gte.is_some() {
+            return Err(RtDbError::bad_request("gt and gte cannot both be set"));
+        }
+        if q.lt.is_some() && q.lte.is_some() {
+            return Err(RtDbError::bad_request("lt and lte cannot both be set"));
+        }
 
-    if let Some(take) = q.take
-        && take > MAX_TAKE
-    {
-        return Err(RtDbError::bad_request(format!(
-            "take exceeds maximum of {MAX_TAKE}"
-        )));
-    }
+        if let Some(take) = q.take
+            && take > MAX_TAKE
+        {
+            return Err(RtDbError::bad_request(format!(
+                "take exceeds maximum of {MAX_TAKE}"
+            )));
+        }
 
-    // Vector-similarity terminal. Incompatible with every other terminal; it
-    // carries its own `limit` and does not compose with `take` (or anything
-    // else). Resolution and bind construction live in `execute_vector_search`.
-    if let Some(vs) = &q.vector_search {
-        reject_if_any_set(q, VECTOR_SEARCH_PEERS, VECTOR_SEARCH_MESSAGE)?;
-        return execute_vector_search(&sctx, vs).await;
-    }
+        // Vector-similarity terminal. Incompatible with every other terminal; it
+        // carries its own `limit` and does not compose with `take` (or anything
+        // else). Resolution and bind construction live in `execute_vector_search`.
+        if let Some(vs) = &q.vector_search {
+            reject_if_any_set(q, VECTOR_SEARCH_PEERS, VECTOR_SEARCH_MESSAGE)?;
+            return execute_vector_search(&sctx, vs).await;
+        }
 
-    // Hybrid search terminal. Incompatible with every other terminal (including
-    // `search` and `vectorSearch` — hybrid IS their combination); it carries its
-    // own `limit` and fuses ts_rank + cosine distance via RRF. Resolution, bind
-    // construction, and the fused SQL live in `execute_hybrid_search`.
-    if let Some(hs) = &q.hybrid_search {
-        reject_if_any_set(q, HYBRID_SEARCH_PEERS, HYBRID_SEARCH_MESSAGE)?;
-        return execute_hybrid_search(&sctx, hs).await;
-    }
+        // Hybrid search terminal. Incompatible with every other terminal (including
+        // `search` and `vectorSearch` — hybrid IS their combination); it carries its
+        // own `limit` and fuses ts_rank + cosine distance via RRF. Resolution, bind
+        // construction, and the fused SQL live in `execute_hybrid_search`.
+        if let Some(hs) = &q.hybrid_search {
+            reject_if_any_set(q, HYBRID_SEARCH_PEERS, HYBRID_SEARCH_MESSAGE)?;
+            return execute_hybrid_search(&sctx, hs).await;
+        }
 
-    // Full-text search terminal. It ranks over a search index's tsvector and is
-    // incompatible with every index-based terminal; `take` (already capped) is
-    // the only field it composes with.
-    if let Some(search) = &q.search {
-        reject_if_any_set(q, SEARCH_PEERS, SEARCH_MESSAGE)?;
-        return execute_search(&sctx, search, q.take).await;
-    }
+        // Full-text search terminal. It ranks over a search index's tsvector and is
+        // incompatible with every index-based terminal; `take` (already capped) is
+        // the only field it composes with.
+        if let Some(search) = &q.search {
+            reject_if_any_set(q, SEARCH_PEERS, SEARCH_MESSAGE)?;
+            return execute_search(&sctx, search, q.take).await;
+        }
 
-    // Compile the index window (eq/range binds, client `filter`, owner/
-    // collaborator/`authorize` predicates, and placeholder offsets) shared by
-    // every remaining terminal. `compile_query_window` is a verbatim lift of
-    // the block that previously lived inline here; see its body for the
-    // bind-ordering and placeholder-numbering invariants.
-    let w = compile_query_window(table_def, q, ctx, owner, owner_field, collaborators_field)?;
+        // Compile the index window (eq/range binds, client `filter`, owner/
+        // collaborator/`authorize` predicates, and placeholder offsets) shared by
+        // every remaining terminal. `compile_query_window` is a verbatim lift of
+        // the block that previously lived inline here; see its body for the
+        // bind-ordering and placeholder-numbering invariants.
+        let w = compile_query_window(table_def, q, ctx, owner, owner_field, collaborators_field)?;
 
-    if q.count {
-        return execute_count_terminal(w, pool, db, &q.table).await;
-    }
+        if q.count {
+            return execute_count_terminal(w, pool, db, &q.table).await;
+        }
 
-    if q.distinct {
-        return execute_distinct_terminal(w, pool, db, &q.table).await;
-    }
+        if q.distinct {
+            return execute_distinct_terminal(w, pool, db, &q.table).await;
+        }
 
-    if let Some(agg) = &q.aggregate {
-        return execute_aggregate_terminal(w, table_def, agg, pool, db, &q.table).await;
-    }
+        if let Some(agg) = &q.aggregate {
+            return execute_aggregate_terminal(w, table_def, agg, pool, db, &q.table).await;
+        }
 
-    let mut sort_cols: Vec<String> = match w.index_def {
-        Some(idx) => idx.fields[w.eq_len..]
+        let mut sort_cols: Vec<String> = match w.index_def {
+            Some(idx) => idx.fields[w.eq_len..]
+                .iter()
+                .map(|field_name| format!("\"{}\"", pg_col(field_name)))
+                .collect(),
+            None => Vec::new(),
+        };
+        sort_cols.push("\"created_at\"".to_string());
+        sort_cols.push("\"id\"".to_string());
+
+        let dir = match q.order {
+            Some(Order::Desc) => "DESC",
+            _ => "ASC",
+        };
+        let order_by = sort_cols
             .iter()
-            .map(|field_name| format!("\"{}\"", pg_col(field_name)))
-            .collect(),
-        None => Vec::new(),
-    };
-    sort_cols.push("\"created_at\"".to_string());
-    sort_cols.push("\"id\"".to_string());
+            .map(|col| format!("{col} {dir}"))
+            .collect::<Vec<_>>()
+            .join(", ");
 
-    let dir = match q.order {
-        Some(Order::Desc) => "DESC",
-        _ => "ASC",
-    };
-    let order_by = sort_cols
-        .iter()
-        .map(|col| format!("{col} {dir}"))
-        .collect::<Vec<_>>()
-        .join(", ");
+        if let Some(paginate) = &q.paginate {
+            return execute_paginate_terminal(
+                w, table_def, paginate, sort_cols, dir, &order_by, pool, db, &q.table,
+            )
+            .await;
+        }
 
-    if let Some(paginate) = &q.paginate {
-        return execute_paginate_terminal(
-            w, table_def, paginate, sort_cols, dir, &order_by, pool, db, &q.table,
-        )
-        .await;
+        execute_collect_terminal(w, q.unique, q.first, q.take, &order_by, pool, db, &q.table).await
     }
-
-    execute_collect_terminal(w, q.unique, q.first, q.take, &order_by, pool, db, &q.table).await
+    .instrument(span)
+    .await
 }
 
 // ============ execute_query cascade helpers (QA-002) ============

@@ -13,6 +13,44 @@ contract against Convex.
 
 ## [Unreleased]
 
+### OpenTelemetry (OTLP) distributed tracing export (ENH-018)
+
+Span-level visibility into where a request's time goes — committer queue wait,
+SQL execution, subscription fan-out, per-terminal query compilation — exported
+over OTLP/gRPC to a collector. Opt-in: a new `otel` cargo feature (default off)
+gates the dependencies and subscriber wiring, and `RTDB_OTEL_ENABLED=false`
+(the default) gates it again at runtime, so a feature-compiled binary still
+makes zero OTLP network calls unless an operator opts in. Server-side only —
+no wire, DSL, protocol, or client-mirror change.
+
+- **Spans**: `committer.mutate` (carries `queue_wait_ms` — the gap between
+  enqueue and dequeue, the single most useful per-request latency signal and
+  the one the architecture made invisible), plus `committer.subscribe` /
+  `scheduled` / `migrate` / `reaper` / `restore_schema`, `subs.fan_out`,
+  `subs.rerun` (per subscription re-run), `query.execute`, and `txn.execute`.
+  Child spans nest under their parent (e.g. a mutate's `txn.execute` and
+  `subs.fan_out` are children of `committer.mutate`).
+- **Cardinality guard**: span attributes are bounded — `db`, `table`,
+  `terminal`, `steps`, `queue_wait_ms` — never doc ids, user ids, or document
+  content.
+- **Config**: `RTDB_OTEL_ENABLED`, `RTDB_OTEL_ENDPOINT` (default
+  `http://127.0.0.1:4317`, the standard OTLP/gRPC port), `RTDB_OTEL_SERVICE_NAME`
+  (default `par-rt-db`), `RTDB_OTEL_SAMPLE_RATIO` (default 0.05, clamped to
+  `[0, 1]`; a malformed value fails boot via `env_parsed` rather than silently
+  defaulting — ARC-118).
+- **Shutdown**: the OTLP exporter flushes on SIGTERM (a docker `compose down`
+  otherwise drops the last in-flight batch).
+- **Version matrix**: `opentelemetry`/`opentelemetry_sdk`/`opentelemetry-otlp`
+  0.31 + `tracing-opentelemetry` 0.32, pinned because that pairing breaks
+  across minor versions. The 0.31 API renames `TracerProvider` →
+  `SdkTracerProvider`, drops the runtime arg from `with_batch_exporter`, and
+  replaces `Resource::new` with a builder.
+
+Verified end-to-end against a local `otel/opentelemetry-collector`: a mutation
+produces a trace with `committer.mutate` (`queue_wait_ms: 5` on a queued
+request) and child `txn.execute` + `subs.fan_out` spans; with the default
+off, zero traces are exported.
+
 ### Audit remediation (2026-07-25)
 
 Comprehensive remediation of the 2026-07-25 project audit (55 findings; 46

@@ -4,6 +4,22 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 
+[features]
+# Default build carries no OpenTelemetry code (ENH-018). `otel` pulls in the
+# OTLP exporter + tracing-opentelemetry bridge; the subscriber layer in main.rs
+# is cfg-gated on it, and RTDB_OTEL_ENABLED gates it again at runtime so a
+# feature-compiled binary still makes zero OTLP calls unless an operator opts
+# in. The opentelemetry / tracing-opentelemetry version matrix is pinned (see
+# the dep lines) because that pairing breaks across minor versions — verified
+# to resolve together via `cargo tree -d` (no duplicate opentelemetry tree).
+default = []
+otel = [
+    "dep:opentelemetry",
+    "dep:opentelemetry_sdk",
+    "dep:opentelemetry-otlp",
+    "dep:tracing-opentelemetry",
+]
+
 [dependencies]
 arc-swap = "1"
 async-trait = "0.1"
@@ -52,6 +68,24 @@ percent-encoding = "2"
 # `moka` is the LRU result cache keyed by (blob id, transform params).
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "webp"] }
 moka = { version = "0.12", features = ["future"] }
+# OpenTelemetry / OTLP tracing export (ENH-018). Optional + feature-gated behind
+# `otel` (default off). The exact versions are pinned because the
+# opentelemetry / tracing-opentelemetry pairing breaks across minor versions
+# more often than most crates — 0.31.x + tracing-opentelemetry 0.32.x is the
+# verified-resolving matrix (checked with `cargo tree -d`, no duplicate tree).
+# The 0.31 API renames `TracerProvider` → `SdkTracerProvider`, drops the runtime
+# arg from `with_batch_exporter`, and replaces `Resource::new` with a builder —
+# the pre-0.27 sketch in the plan doc no longer compiles.
+opentelemetry = { version = "0.31", default-features = false, optional = true }
+opentelemetry_sdk = { version = "0.31", default-features = false, features = [
+    "trace",
+    "rt-tokio",
+], optional = true }
+opentelemetry-otlp = { version = "0.31", default-features = false, features = [
+    "trace",
+    "grpc-tonic",
+], optional = true }
+tracing-opentelemetry = { version = "0.32", optional = true }
 
 [dev-dependencies]
 anyhow.workspace = true

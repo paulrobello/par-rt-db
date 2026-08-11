@@ -42,6 +42,7 @@ pub mod signed_url;
 pub mod snapshot;
 pub mod storage;
 pub mod subs;
+pub mod tracing_setup;
 pub mod txn;
 pub mod webhook;
 pub mod ws;

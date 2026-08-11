@@ -15,6 +15,7 @@ use arc_swap::ArcSwap;
 use sqlx::PgPool;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::{Mutex, mpsc, oneshot};
+use tracing::Instrument;
 
 use crate::auth::PrincipalCtx;
 use crate::config::HotConfig;
@@ -36,6 +37,12 @@ pub enum CommitterRequest {
         idempotency_key: Option<String>,
         txn: Transaction,
         principal_ctx: PrincipalCtx,
+        /// Monotonic instant the request was enqueued (ENH-018). Subtracted
+        /// from `Instant::now()` at dequeue to produce `queue_wait_ms` on the
+        /// `committer.mutate` span — the gap between enqueue and execution is
+        /// invisible today and is the single most likely source of surprising
+        /// latency under load (the ARC-102 idle-poller class of problem).
+        enqueued_at: std::time::Instant,
         reply: oneshot::Sender<Result<TxnOutcome, RtDbError>>,
     },
     Subscribe {
@@ -410,12 +417,16 @@ impl Committers {
         principal_ctx: PrincipalCtx,
     ) -> Result<TxnOutcome, RtDbError> {
         let (reply, reply_rx) = oneshot::channel();
+        // ENH-018: stamp the enqueue instant so the committer's dequeue can
+        // derive `queue_wait_ms` on the `committer.mutate` span.
+        let enqueued_at = std::time::Instant::now();
         self.submit(
             db,
             CommitterRequest::Mutate {
                 idempotency_key,
                 txn,
                 principal_ctx,
+                enqueued_at,
                 reply,
             },
         )
@@ -719,14 +730,33 @@ async fn run_committer(ctx: CommitterCtx, mut rx: mpsc::Receiver<CommitterReques
         tracing::error!(db = %ctx.db, error = %err, "committer: storage::ensure_table failed");
     }
     while let Some(req) = rx.recv().await {
+        // ENH-018: the `db` field on every span is bounded (one per database
+        // name, not per document), so it is safe to put on a span attribute —
+        // unlike doc ids or content, which would blow up cardinality.
         match req {
             CommitterRequest::Mutate {
                 idempotency_key,
                 txn,
                 principal_ctx,
+                enqueued_at,
                 reply,
             } => {
-                let outcome = handle_mutate(&ctx, idempotency_key, txn, principal_ctx).await;
+                // ENH-018: `queue_wait_ms` is the delta between enqueue and
+                // dequeue — the gap the committer's serialized queue can
+                // introduce, and the single most useful per-request latency
+                // signal (the ARC-102 idle-poller class of problem). The span
+                // wraps the whole mutate via `.instrument` so the child
+                // `txn.execute` and `subs.fan_out` spans nest under it.
+                let queue_wait_ms = enqueued_at.elapsed().as_millis() as u64;
+                let span = tracing::info_span!(
+                    "committer.mutate",
+                    db = %ctx.db,
+                    queue_wait_ms,
+                    steps = txn.steps.len(),
+                );
+                let outcome = handle_mutate(&ctx, idempotency_key, txn, principal_ctx)
+                    .instrument(span)
+                    .await;
                 let _ = reply.send(outcome);
             }
             CommitterRequest::Subscribe {
@@ -737,8 +767,10 @@ async fn run_committer(ctx: CommitterCtx, mut rx: mpsc::Receiver<CommitterReques
                 principal_ctx,
                 reply,
             } => {
-                let result =
-                    handle_subscribe(&ctx, conn, query_id, *query, tx, principal_ctx).await;
+                let span = tracing::info_span!("committer.subscribe", db = %ctx.db);
+                let result = handle_subscribe(&ctx, conn, query_id, *query, tx, principal_ctx)
+                    .instrument(span)
+                    .await;
                 let _ = reply.send(result);
             }
             CommitterRequest::RunScheduled {
@@ -747,16 +779,35 @@ async fn run_committer(ctx: CommitterCtx, mut rx: mpsc::Receiver<CommitterReques
                 txn,
                 cron,
             } => {
-                if let Err(err) = handle_scheduled(&ctx, id, kind, *txn, cron).await {
+                let span = tracing::info_span!(
+                    "committer.scheduled",
+                    db = %ctx.db,
+                    kind,
+                    id,
+                );
+                let outcome = handle_scheduled(&ctx, id, kind, *txn, cron)
+                    .instrument(span)
+                    .await;
+                if let Err(err) = outcome {
                     tracing::error!(db = %ctx.db, error = %err, "scheduled job handling failed");
                 }
             }
             CommitterRequest::RunMigrate { request, reply } => {
-                let result = handle_migrate(&ctx, request).await;
+                let directives = request.directives.len();
+                let dry_run = request.dry_run;
+                let span = tracing::info_span!(
+                    "committer.migrate",
+                    db = %ctx.db,
+                    directives,
+                    dry_run,
+                );
+                let result = handle_migrate(&ctx, request).instrument(span).await;
                 let _ = reply.send(result);
             }
             CommitterRequest::RunReaper => {
-                if let Err(err) = handle_reaper(&ctx).await {
+                let span = tracing::info_span!("committer.reaper", db = %ctx.db);
+                let outcome = handle_reaper(&ctx).instrument(span).await;
+                if let Err(err) = outcome {
                     tracing::error!(db = %ctx.db, error = %err, "ttl reaper handling failed");
                 }
             }
@@ -764,7 +815,14 @@ async fn run_committer(ctx: CommitterCtx, mut rx: mpsc::Receiver<CommitterReques
                 target_version,
                 reply,
             } => {
-                let outcome = handle_restore_schema(&ctx, target_version).await;
+                let span = tracing::info_span!(
+                    "committer.restore_schema",
+                    db = %ctx.db,
+                    target_version,
+                );
+                let outcome = handle_restore_schema(&ctx, target_version)
+                    .instrument(span)
+                    .await;
                 let _ = reply.send(outcome);
             }
             CommitterRequest::Shutdown => {

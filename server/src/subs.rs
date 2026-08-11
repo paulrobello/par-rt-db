@@ -18,6 +18,7 @@ use serde::Serialize;
 use sqlx::PgPool;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc::UnboundedSender;
+use tracing::Instrument;
 
 use crate::auth::{PrincipalCtx, authorize_table};
 use crate::error::RtDbError;
@@ -1080,6 +1081,25 @@ impl SubscriptionManager {
         schema: &SchemaDef,
         write_set: &WriteSet,
     ) {
+        // ENH-018: wrap the whole re-run pass so a slow subscription (one whose
+        // re-run query is expensive) is identifiable in a trace as a child of
+        // `committer.mutate`/`committer.scheduled`/…. The per-sub `subs.rerun`
+        // spans nest under this one. The body runs in an instrumented `async`
+        // block because a sync `Span::enter` guard is `!Send` and would poison
+        // this `Send` future across the `.await`s in `fan_out_inner`.
+        let span = tracing::info_span!("subs.fan_out", db, tables = ?write_set.tables);
+        self.fan_out_inner(pool, db, schema, write_set)
+            .instrument(span)
+            .await;
+    }
+
+    async fn fan_out_inner(
+        &self,
+        pool: &PgPool,
+        db: &str,
+        schema: &SchemaDef,
+        write_set: &WriteSet,
+    ) {
         // Clone the shard Arc out under the outer lock, then drop the outer
         // guard before the per-subscription re-runs. This is the heart of
         // ARC-001: the re-runs (each a Postgres round-trip) hold only this
@@ -1119,8 +1139,25 @@ impl SubscriptionManager {
                 }
             };
 
-            let result =
-                match execute_query(pool, db, schema, &entry.query, &entry.principal_ctx).await {
+            let result = {
+                // ENH-018: one span per subscription re-run so an expensive
+                // subscription's query is identifiable by table/terminal in a
+                // trace. `read_set_class` names which skip class this would
+                // have been when verifying; `None` for a genuine re-run. The
+                // span instruments the `execute_query` future directly (a sync
+                // `enter()` guard would be `!Send` across the `.await`).
+                let rerun_span = tracing::info_span!(
+                    "subs.rerun",
+                    db,
+                    query_id,
+                    table = %entry.query.table,
+                    terminal = entry.query.terminal_name(),
+                    read_set_class = ?verifying,
+                );
+                match execute_query(pool, db, schema, &entry.query, &entry.principal_ctx)
+                    .instrument(rerun_span)
+                    .await
+                {
                     Ok(result) => result,
                     Err(err) => {
                         tracing::warn!(
@@ -1131,7 +1168,8 @@ impl SubscriptionManager {
                         );
                         continue;
                     }
-                };
+                }
+            };
 
             // Refresh an `Ordered` read's top-N boundary from the result just
             // computed, BEFORE the canonical diff: the boundary describes the

@@ -251,6 +251,25 @@ pub struct Config {
     /// local-http-dev escape hatch: a developer on `http://localhost` sets this
     /// to `false` so the browser still accepts the cookie. Boot-only (not hot).
     pub cookie_secure: bool,
+    // ---- OpenTelemetry / OTLP tracing export (ENH-018) ----
+    // All boot-only. The cargo `otel` feature gates the dependency + subscriber
+    // wiring; RTDB_OTEL_ENABLED gates it at runtime so a feature-compiled binary
+    // can still run with tracing off. Default off: structured logs go to stdout,
+    // aggregates go to Prometheus, and nothing correlates the two across one
+    // request unless an operator opts in by pointing at a collector.
+    /// RTDB_OTEL_ENABLED (default false). Runtime master switch — when false the
+    /// server makes zero OTLP network calls even if built `--features otel`.
+    pub otel_enabled: bool,
+    /// RTDB_OTEL_ENDPOINT (default `http://127.0.0.1:4317`). OTLP gRPC collector
+    /// endpoint (the standard OTLP/gRPC port).
+    pub otel_endpoint: String,
+    /// RTDB_OTEL_SERVICE_NAME (default `par-rt-db`). The `service.name` resource
+    /// attribute attached to every span.
+    pub otel_service_name: String,
+    /// RTDB_OTEL_SAMPLE_RATIO (default 0.05). Head sampler ratio in [0.0, 1.0].
+    /// A malformed value fails boot (ARC-118 via `env_parsed`) rather than
+    /// silently defaulting.
+    pub otel_sample_ratio: f64,
 }
 
 /// Boot-time env parse for a typed knob (ARC-118, folded with QA-106). Unset
@@ -514,6 +533,24 @@ impl Config {
         // cookie in the clear when a proxy strips `X-Forwarded-Proto`.
         let cookie_secure = env_bool("RTDB_COOKIE_SECURE", true);
 
+        // OpenTelemetry / OTLP tracing export (ENH-018). The cargo `otel`
+        // feature gates the deps + subscriber wiring; RTDB_OTEL_ENABLED is the
+        // runtime switch so a feature-compiled binary still defaults to zero
+        // OTLP network calls. Endpoint/service-name carry defaults so an
+        // operator only sets RTDB_OTEL_ENABLED=true + RTDB_OTEL_ENDPOINT. The
+        // sample ratio is parsed through `env_parsed` so a typo fails boot
+        // (ARC-118), then clamped to a valid head-sampler ratio.
+        let otel_enabled = env_bool("RTDB_OTEL_ENABLED", false);
+        let otel_endpoint = match std::env::var("RTDB_OTEL_ENDPOINT") {
+            Ok(v) if !v.trim().is_empty() => v,
+            _ => "http://127.0.0.1:4317".to_string(),
+        };
+        let otel_service_name = match std::env::var("RTDB_OTEL_SERVICE_NAME") {
+            Ok(v) if !v.trim().is_empty() => v,
+            _ => "par-rt-db".to_string(),
+        };
+        let otel_sample_ratio = env_parsed("RTDB_OTEL_SAMPLE_RATIO", 0.05f64)?.clamp(0.0, 1.0);
+
         Ok(Self {
             port,
             database_url,
@@ -580,6 +617,10 @@ impl Config {
             db_idle_reclaim_secs,
             admin_rate_limit_per_ip_rpm,
             cookie_secure,
+            otel_enabled,
+            otel_endpoint,
+            otel_service_name,
+            otel_sample_ratio,
         })
     }
 }
@@ -1062,7 +1103,14 @@ mod tests {
     /// `from_env` requires `RTDB_DATABASE_URL` and `RTDB_ADMIN_KEY`, so this test
     /// sets them for its lifetime and restores them at the end. All `RTDB_PRESENCE_*`
     /// vars are removed at the end so they don't leak into other lib tests.
+    ///
+    /// `#[serial]`: this and `otel_env_defaults_and_overrides` both mutate
+    /// process-global env and call `Config::from_env()`, so they must not run
+    /// concurrently (env mutation is not thread-safe across tests; a left-behind
+    /// `RTDB_OTEL_SAMPLE_RATIO`/`RTDB_ADMIN_RATE_LIMIT_PER_IP_RPM` breaks the
+    /// other's `from_env`). Same fix the webhook test suite took (b97bfb4).
     #[test]
+    #[serial_test::serial]
     fn presence_env_defaults_and_overrides() {
         // Rust 2024: env mutation is `unsafe` (not thread-safe in general). Within
         // a single test binary where no other test reads these vars, this is sound.
@@ -1246,5 +1294,96 @@ mod tests {
         assert!(validate_admin_key("my-admin-key-is-strong-0123").is_ok());
         // Contains "secret" but is long and not an exact match.
         assert!(validate_admin_key("a1b2c3secretd4e5f6a1b2").is_ok());
+    }
+
+    /// ENH-018: the four `RTDB_OTEL_*` boot knobs — defaults when unset, env
+    /// overrides honored, and a malformed sample ratio fails boot (ARC-118).
+    /// The runtime master switch ships OFF so a feature-compiled binary still
+    /// makes zero OTLP calls unless an operator opts in. Mirrors the
+    /// `presence_env_defaults_and_overrides` env-mutation pattern.
+    #[test]
+    #[serial_test::serial]
+    fn otel_env_defaults_and_overrides() {
+        unsafe {
+            let saved_db = std::env::var("RTDB_DATABASE_URL").ok();
+            let saved_key = std::env::var("RTDB_ADMIN_KEY").ok();
+            std::env::set_var("RTDB_DATABASE_URL", "postgres://test");
+            std::env::set_var("RTDB_ADMIN_KEY", "test-admin-key-0123");
+
+            // Defaults (vars unset): off, standard OTLP/gRPC endpoint + service
+            // name, 5% head sampling.
+            for v in [
+                "RTDB_OTEL_ENABLED",
+                "RTDB_OTEL_ENDPOINT",
+                "RTDB_OTEL_SERVICE_NAME",
+                "RTDB_OTEL_SAMPLE_RATIO",
+            ] {
+                std::env::remove_var(v);
+            }
+            let c = Config::from_env().expect("from_env with required vars set");
+            assert!(!c.otel_enabled, "default off — zero OTLP calls");
+            assert_eq!(c.otel_endpoint, "http://127.0.0.1:4317");
+            assert_eq!(c.otel_service_name, "par-rt-db");
+            assert!((c.otel_sample_ratio - 0.05).abs() < f64::EPSILON);
+
+            // Overrides: the switch accepts "true"; strings parse; ratio parses.
+            std::env::set_var("RTDB_OTEL_ENABLED", "true");
+            std::env::set_var("RTDB_OTEL_ENDPOINT", "http://collector:4317");
+            std::env::set_var("RTDB_OTEL_SERVICE_NAME", "rtdb-prod");
+            std::env::set_var("RTDB_OTEL_SAMPLE_RATIO", "0.5");
+            let c = Config::from_env().expect("from_env with required vars set");
+            assert!(c.otel_enabled);
+            assert_eq!(c.otel_endpoint, "http://collector:4317");
+            assert_eq!(c.otel_service_name, "rtdb-prod");
+            assert!((c.otel_sample_ratio - 0.5).abs() < f64::EPSILON);
+
+            // Default-on typo contract does NOT apply to otel_enabled (it's an
+            // opt-in, default-off knob), so an unrecognized spelling stays off —
+            // a typo cannot enable tracing unexpectedly.
+            std::env::set_var("RTDB_OTEL_ENABLED", "yes-please");
+            let c = Config::from_env().expect("from_env with required vars set");
+            assert!(!c.otel_enabled, "unrecognized spelling stays default-off");
+
+            // ARC-118: a present-but-unparseable ratio must fail boot naming the
+            // var, not silently revert to the default.
+            std::env::set_var("RTDB_OTEL_SAMPLE_RATIO", "not-a-number");
+            let err = Config::from_env()
+                .expect_err("ARC-118: malformed ratio must fail boot, not default");
+            assert!(
+                err.contains("RTDB_OTEL_SAMPLE_RATIO"),
+                "error names the var: {err}"
+            );
+            // Clear the malformed value immediately so it cannot leak into a
+            // parallel test that re-enters from_env (env mutation is global to
+            // the binary; a left-behind malformed value breaks every other
+            // test's from_env call). Mirrors the presence test's discipline.
+            std::env::remove_var("RTDB_OTEL_SAMPLE_RATIO");
+
+            // A ratio above 1.0 clamps to 1.0 (full sampling); below 0.0 to 0.0.
+            std::env::set_var("RTDB_OTEL_SAMPLE_RATIO", "2.0");
+            let c = Config::from_env().expect("clamp, not error");
+            assert!((c.otel_sample_ratio - 1.0).abs() < f64::EPSILON);
+            std::env::set_var("RTDB_OTEL_SAMPLE_RATIO", "-0.5");
+            let c = Config::from_env().expect("clamp, not error");
+            assert!(c.otel_sample_ratio.abs() < f64::EPSILON);
+
+            // Cleanup so nothing leaks into other lib tests.
+            for v in [
+                "RTDB_OTEL_ENABLED",
+                "RTDB_OTEL_ENDPOINT",
+                "RTDB_OTEL_SERVICE_NAME",
+                "RTDB_OTEL_SAMPLE_RATIO",
+            ] {
+                std::env::remove_var(v);
+            }
+            match saved_db {
+                Some(v) => std::env::set_var("RTDB_DATABASE_URL", v),
+                None => std::env::remove_var("RTDB_DATABASE_URL"),
+            }
+            match saved_key {
+                Some(v) => std::env::set_var("RTDB_ADMIN_KEY", v),
+                None => std::env::remove_var("RTDB_ADMIN_KEY"),
+            }
+        }
     }
 }

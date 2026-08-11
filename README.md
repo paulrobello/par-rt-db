@@ -329,6 +329,7 @@ boot:
 | `RTDB_ALLOWED_ORIGINS` | no | empty | Comma-separated browser origins; also the exact-match CORS allowlist for `/api/*` and `/auth/*`. **Hot-reloadable.** |
 | `RTDB_STATIC_DIR` | no | unset | Directory of static SPA build artifacts. Set/unset existing dir ⇒ dashboard served same-origin at the catch-all route fallback; unset/empty/missing ⇒ API-only. |
 | `RTDB_GITHUB_CLIENT_ID` + `RTDB_GITHUB_CLIENT_SECRET` | no | none | GitHub OAuth app credentials — both required to enable GitHub login. The other five providers (Google, GitLab, Microsoft, Apple, OIDC) follow the same `RTDB_<PROVIDER>_CLIENT_ID` + `_CLIENT_SECRET` pair pattern; see `.env.example` and [`docs/OAUTH_SETUP.md`](docs/OAUTH_SETUP.md). |
+| `RTDB_OTEL_ENABLED` | no | `false` | OpenTelemetry/OTLP tracing master switch (ENH-018). Requires the server built with the `otel` cargo feature; `false` (default) produces zero OTLP calls. Paired with `RTDB_OTEL_ENDPOINT` (default `http://127.0.0.1:4317`), `RTDB_OTEL_SERVICE_NAME` (default `par-rt-db`), and `RTDB_OTEL_SAMPLE_RATIO` (default `0.05`). See [Tracing](deploy/README.md#tracing-opentelemetry--otlp-enh-018). |
 
 The hot-reloadable settings (live on `AppState` as `Arc<ArcSwap<HotConfig>>`,
 seeded from env at first boot, persisted in a single-row `rtdb_config` table,
@@ -337,7 +338,7 @@ and swapable via `PATCH /admin/config` without a restart): `allowed_origins`,
 per-database quota caps `max_tables_per_db` / `max_storage_bytes_per_db` /
 `max_subs_per_db` (`0` = unlimited, ENH-011). The full set of boot-time vars —
 OAuth, rate limits, scheduling, presence, image transforms, backups, audit,
-webhooks, and more — is annotated in [`.env.example`](.env.example). `RTDB_ALLOWED_ORIGINS` is also the
+webhooks, OTLP tracing, and more — is annotated in [`.env.example`](.env.example). `RTDB_ALLOWED_ORIGINS` is also the
 exact-match CORS allowlist for `/api/*` and `/auth/*` (GET, POST, OPTIONS;
 `authorization` and `content-type` headers). Each OAuth provider is only active
 when both its client id and secret are set; a half-configured pair is treated

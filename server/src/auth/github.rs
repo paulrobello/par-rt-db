@@ -436,6 +436,10 @@ mod tests {
             db_idle_reclaim_secs: 0,
             admin_rate_limit_per_ip_rpm: 0,
             cookie_secure: false,
+            otel_enabled: false,
+            otel_endpoint: String::new(),
+            otel_service_name: String::new(),
+            otel_sample_ratio: 0.0,
         };
         assert!(GithubProvider::from_config(&cfg).is_none());
         cfg.github_client_id = Some("id".into());
