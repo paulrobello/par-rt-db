@@ -94,6 +94,7 @@ async fn newest_payload(pool: &sqlx::PgPool, webhook_id: i64) -> Value {
 // (a) Enqueue: a webhook matching the (table, event) gets one pending row with
 // the right payload; webhooks filtered out by table or by event get none.
 #[tokio::test]
+#[serial_test::serial]
 async fn webhook_enqueue_matches_table_and_event_filters() -> anyhow::Result<()> {
     let state = test_state_with_webhooks().await;
     let pool = state.pool.clone();
@@ -185,6 +186,7 @@ async fn webhook_enqueue_matches_table_and_event_filters() -> anyhow::Result<()>
 // (a.2) Disabled webhooks do not enqueue deliveries; enabled ones on the same
 // db/table/event still do. The `enabled` flag round-trips on create + list.
 #[tokio::test]
+#[serial_test::serial]
 async fn webhook_disabled_does_not_enqueue() -> anyhow::Result<()> {
     let state = test_state_with_webhooks().await;
     let pool = state.pool.clone();
@@ -291,6 +293,7 @@ async fn receive_hook(
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn webhook_delivery_end_to_end_posts_payload() -> anyhow::Result<()> {
     let state = test_state_with_webhooks().await;
     let pool = state.pool.clone();
@@ -392,6 +395,7 @@ async fn webhook_delivery_end_to_end_posts_payload() -> anyhow::Result<()> {
 // (c) Admin CRUD: create → list shows it → delete → gone. A non-admin bearer
 // is forbidden (403); a missing bearer is unauthorized (401).
 #[tokio::test]
+#[serial_test::serial]
 async fn webhook_admin_crud_and_non_admin_forbidden() -> anyhow::Result<()> {
     let state = test_state_with_webhooks().await;
     let addr = spawn_app(state.clone()).await;
@@ -497,6 +501,7 @@ async fn list_webhook_by_id(addr: SocketAddr, db: &str, id: i64) -> Value {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn webhook_put_edits_fields_and_clears_table() -> anyhow::Result<()> {
     let state = test_state_with_webhooks().await;
     let addr = spawn_app(state.clone()).await;
@@ -617,6 +622,7 @@ async fn webhook_put_edits_fields_and_clears_table() -> anyhow::Result<()> {
 // through. Seeds rows directly to avoid coupling this endpoint test to the
 // enqueue/drain machinery exercised above.
 #[tokio::test]
+#[serial_test::serial]
 async fn webhook_deliveries_filter_sort_and_paginate() -> anyhow::Result<()> {
     let state = test_state_with_webhooks().await;
     let pool = state.pool.clone();
@@ -788,6 +794,7 @@ async fn webhook_deliveries_filter_sort_and_paginate() -> anyhow::Result<()> {
 // routes: a cross-db DELETE reports ok:false and leaves the row intact, and a
 // cross-db deliveries listing sees nothing.
 #[tokio::test]
+#[serial_test::serial]
 async fn webhook_delete_and_deliveries_are_scoped_per_db() -> anyhow::Result<()> {
     let state = test_state_with_webhooks().await;
     let addr = spawn_app(state.clone()).await;
@@ -868,6 +875,7 @@ async fn receive_signed_hook(
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn webhook_delivery_carries_verifiable_signature() -> anyhow::Result<()> {
     let state = test_state_with_webhooks().await;
     let pool = state.pool.clone();
@@ -1005,6 +1013,7 @@ async fn webhook_delivery_carries_verifiable_signature() -> anyhow::Result<()> {
 // different from the prior one. The secret value itself is never accepted from
 // the client (no `secret` field on the request body).
 #[tokio::test]
+#[serial_test::serial]
 async fn webhook_rotate_secret_generates_new_value() -> anyhow::Result<()> {
     let state = test_state_with_webhooks().await;
     let addr = spawn_app(state.clone()).await;

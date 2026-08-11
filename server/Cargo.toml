@@ -59,6 +59,7 @@ tempfile = "3"
 tokio-tungstenite.workspace = true
 futures-util.workspace = true
 wiremock.workspace = true
+serial_test = "3"
 
 # Match cli/ and rust-client/: a direct `cargo clippy`/`cargo build` (editor,
 # rust-analyzer, pre-commit) denies warnings without needing the Makefile's
