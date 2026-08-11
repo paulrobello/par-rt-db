@@ -1099,10 +1099,13 @@ export class InMemoryRtDbClient {
    * the derived schema, but nothing is committed (`applied: false`).
    *
    * `evalExpr` has no in-memory SQL engine and throws `BAD_REQUEST` — same
-   * convention as the search/vector stubs. Affected-rows counts mirror the
-   * server: `renameField`/`setDefault`/`changeType`/`dropField` count the rows
-   * whose docs actually changed; `dropTable` counts every row (all deleted);
-   * `renameTable`/`dropIndex` report zero. */
+   * convention as the search/vector stubs. Both branches of the dual-accept
+   * `expr`/`where` union (the typed `ValueExprJson`/`FilterExpr` path from
+   * ENH-020 and the legacy raw-SQL string path) are unsupported here for the
+   * same reason: no SQL engine to compile either against. Affected-rows counts
+   * mirror the server: `renameField`/`setDefault`/`changeType`/`dropField`
+   * count the rows whose docs actually changed; `dropTable` counts every row
+   * (all deleted); `renameTable`/`dropIndex` report zero. */
   migrate(req: MigrateRequestJson): MigrateResultJson {
     const old = this.requireSchema();
     const planned: SchemaJson = clone(old);
@@ -1292,6 +1295,8 @@ export class InMemoryRtDbClient {
       }
       case "evalExpr": {
         // No SQL engine in the harness — throw rather than silently misbehave.
+        // Both dual-accept arms (typed ValueExprJson and legacy raw-SQL string)
+        // are unsupported here for the same reason.
         throw new RtDbError("BAD_REQUEST", "evalExpr unsupported in-memory");
       }
     }

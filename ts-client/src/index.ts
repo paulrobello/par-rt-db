@@ -83,6 +83,7 @@ export type {
   AuthedUser,
   Cast,
   CastFailureJson,
+  CaseWhenJson,
   ClientMessage,
   DirectiveJson,
   DirectiveReportJson,
@@ -106,6 +107,7 @@ export type {
   TableJson,
   TransactionJson,
   TtlDef,
+  ValueExprJson,
   VectorIndexSpec,
   VectorQuery,
 } from "./protocol.js";

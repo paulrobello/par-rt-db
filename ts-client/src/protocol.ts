@@ -204,9 +204,55 @@ export interface TransactionJson {
  * accepted by `Directive::ChangeType`. */
 export type Cast = "toString" | "toNumber" | "toInt64" | "toBoolean";
 
+// ---- ValueExpr (ENH-020 / SEC-107) ------------------------------------------
+//
+// Mirror server `migrate::ValueExpr` byte-for-byte: a closed, typed expression
+// grammar for `Directive::EvalExpr`'s backfill expression. Internally tagged by
+// `op` (camelCase variant names), `deny_unknown_fields` — the same shape
+// contract as `FilterExpr`. There is deliberately no subquery node, no
+// function-call-by-name node, and no raw-SQL escape; the only way to reach raw
+// SQL is the deprecated `Legacy(String)` arm of `EvalExpr.expr`, gated to the
+// root admin_key. See `server/src/migrate.rs` for the authoritative shapes.
+
+/** One branch of `ValueExprJson.case`. Mirrors server `migrate::CaseWhen`
+ * (camelCase, deny_unknown_fields): `{ when: FilterExpr, then: ValueExpr }`. */
+export interface CaseWhenJson {
+  when: FilterExpr;
+  then: ValueExprJson;
+}
+
+/** Mirrors server `migrate::ValueExpr` byte-for-byte (tag `op`, camelCase,
+ * `deny_unknown_fields`). The 14 variants: field/literal (leaves), concat/add/
+ * sub/mul/div/coalesce (n-ary and binary composites), lower/upper/trim (text),
+ * cast (scalar coercion reusing {@link Cast}), now (current timestamp), and
+ * case (conditional, whose `when` arms are {@link FilterExpr} predicates). */
+export type ValueExprJson =
+  | { op: "field"; field: string }
+  | { op: "literal"; value: unknown }
+  | { op: "concat"; parts: ValueExprJson[] }
+  | { op: "add"; left: ValueExprJson; right: ValueExprJson }
+  | { op: "sub"; left: ValueExprJson; right: ValueExprJson }
+  | { op: "mul"; left: ValueExprJson; right: ValueExprJson }
+  | { op: "div"; left: ValueExprJson; right: ValueExprJson }
+  | { op: "coalesce"; parts: ValueExprJson[] }
+  | { op: "lower"; value: ValueExprJson }
+  | { op: "upper"; value: ValueExprJson }
+  | { op: "trim"; value: ValueExprJson }
+  | { op: "cast"; value: ValueExprJson; to: Cast }
+  | { op: "now" }
+  | { op: "case"; whens: CaseWhenJson[]; otherwise: ValueExprJson };
+
 /** Mirrors server `migrate::Directive` byte-for-byte (tag `op`, camelCase,
  * `deny_unknown_fields`). `evalExpr.where` is the wire alias for the server's
- * `where_clause` field (serde `rename = "where"`). */
+ * `where_clause` field (serde `rename = "where"`).
+ *
+ * `evalExpr` is dual-accept (ENH-020, structurally closing SEC-107): `expr` is
+ * either a typed {@link ValueExprJson} (the safe, all-literals-bound path) or a
+ * legacy raw-SQL string (deprecated, gated to the root admin_key on the server);
+ * `where` is either a typed {@link FilterExpr} or a legacy raw-SQL predicate
+ * string. The two sources may not mix — typed `expr` requires typed `where`,
+ * legacy `expr` requires legacy `where`. The legacy string form is accepted for
+ * one deprecation cycle, then removed. */
 export type DirectiveJson =
   | { op: "renameField"; table: string; from: string; to: string }
   | { op: "renameTable"; from: string; to: string }
@@ -222,7 +268,13 @@ export type DirectiveJson =
   | { op: "dropTable"; name: string }
   | { op: "dropIndex"; table: string; name: string }
   | { op: "setDefault"; table: string; field: string; value: unknown }
-  | { op: "evalExpr"; table: string; set: string; expr: string; where?: string };
+  | {
+      op: "evalExpr";
+      table: string;
+      set: string;
+      expr: ValueExprJson | string;
+      where?: FilterExpr | string;
+    };
 
 /** Mirrors server `migrate::MigrateRequest` (camelCase; `dryRun` is
  * `#[serde(default)]` false). */

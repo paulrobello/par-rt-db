@@ -1354,7 +1354,9 @@ mod tests {
     #[test]
     fn migrate_directive_round_trip() {
         use crate::schema::FieldType;
-        use crate::wire::admin::{Cast, Directive, MigrateRequest, MigrateResult};
+        use crate::wire::admin::{
+            Cast, CondSource, Directive, ExprSource, MigrateRequest, MigrateResult, ValueExpr,
+        };
 
         let req = MigrateRequest {
             directives: &[
@@ -1373,8 +1375,8 @@ mod tests {
                 Directive::EvalExpr {
                     table: "users".into(),
                     set: "upper".into(),
-                    expr: "upper(doc->>'fullName')".into(),
-                    where_clause: Some("doc ? 'fullName'".into()),
+                    expr: ExprSource::Legacy("upper(doc->>'fullName')".into()),
+                    where_clause: Some(CondSource::Legacy("doc ? 'fullName'".into())),
                 },
             ],
             dry_run: true,
@@ -1410,8 +1412,8 @@ mod tests {
             Directive::EvalExpr {
                 table: "users".into(),
                 set: "upper".into(),
-                expr: "upper(doc->>'fullName')".into(),
-                where_clause: Some("doc ? 'fullName'".into()),
+                expr: ExprSource::Legacy("upper(doc->>'fullName')".into()),
+                where_clause: Some(CondSource::Legacy("doc ? 'fullName'".into())),
             },
         ]
         .iter()
@@ -1422,6 +1424,61 @@ mod tests {
             // Each directive round-trips through Deserialize.
             let _: &Directive = &serde_json::from_value::<Directive>(dumped).unwrap();
         }
+
+        // ENH-020: the typed `ValueExpr` path round-trips through the same
+        // `ExprSource::Typed` arm and serializes to the closed grammar's wire
+        // shape (tag `op`, camelCase variant names). `Case` exercises the
+        // nested `CaseWhen { when, then }` + `FilterExpr` binding.
+        let typed = Directive::EvalExpr {
+            table: "users".into(),
+            set: "greeting".into(),
+            expr: ExprSource::Typed(ValueExpr::Concat {
+                parts: vec![
+                    ValueExpr::Literal {
+                        value: json!("Hello, "),
+                    },
+                    ValueExpr::Upper {
+                        value: Box::new(ValueExpr::Field {
+                            field: "name".into(),
+                        }),
+                    },
+                ],
+            }),
+            where_clause: Some(CondSource::Typed(crate::wire::FilterExpr::Exists {
+                field: "name".into(),
+            })),
+        };
+        let typed_json = serde_json::to_value(&typed).unwrap();
+        assert_eq!(typed_json["op"], "evalExpr");
+        assert_eq!(typed_json["expr"]["op"], "concat");
+        assert_eq!(typed_json["expr"]["parts"][0]["op"], "literal");
+        assert_eq!(typed_json["expr"]["parts"][0]["value"], "Hello, ");
+        assert_eq!(typed_json["expr"]["parts"][1]["op"], "upper");
+        assert_eq!(typed_json["expr"]["parts"][1]["value"]["op"], "field");
+        assert_eq!(typed_json["expr"]["parts"][1]["value"]["field"], "name");
+        assert_eq!(typed_json["where"]["op"], "exists");
+        assert_eq!(typed_json["where"]["field"], "name");
+        // Round-trips back, and the typed payload survives (not rewritten to legacy).
+        let typed_back: Directive = serde_json::from_value(typed_json.clone()).unwrap();
+        match typed_back {
+            Directive::EvalExpr {
+                expr: ExprSource::Typed(ValueExpr::Concat { parts }),
+                where_clause: Some(CondSource::Typed(crate::wire::FilterExpr::Exists { .. })),
+                ..
+            } => {
+                assert_eq!(parts.len(), 2);
+            }
+            other => panic!("typed EvalExpr did not round-trip: {other:?}"),
+        }
+        // A hostile object that is not a valid `ValueExpr` is rejected — it
+        // does NOT silently fall through to `Legacy(String)`.
+        let hostile = json!({
+            "op": "evalExpr",
+            "table": "users",
+            "set": "greeting",
+            "expr": {"op": "bogusOp", "field": "name"}
+        });
+        assert!(serde_json::from_value::<Directive>(hostile).is_err());
 
         // MigrateResult deserializes the server shape (camelCase, nested
         // reports carry `affectedRows`).

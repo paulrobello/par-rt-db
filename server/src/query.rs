@@ -2062,7 +2062,7 @@ pub(crate) fn compile_scan_where(
 /// Compiles a `filter` into a fully-parenthesized SQL predicate plus its typed
 /// binds, with `$n` placeholders numbered from 1-based `start_pos`. Every leaf
 /// emits at least one bind, so the fragment is never empty.
-fn compile_filter(
+pub(crate) fn compile_filter(
     filter: &FilterExpr,
     table: &TableDef,
     start_pos: usize,

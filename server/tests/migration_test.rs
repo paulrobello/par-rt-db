@@ -707,6 +707,196 @@ async fn eval_expr_recomputes_indexed_column() {
     drop_db(&db).await;
 }
 
+// ---- ENH-020 Stage 1: typed ValueExpr grammar (SEC-107 structural close) ----
+//
+// The typed path replaces raw-SQL `expr`/`where` with a closed `ValueExpr` /
+// `FilterExpr`. Every literal is bound `$n`; every field reads `doc->'field'`
+// and is schema-validated. There is no raw-SQL node, so the SEC-107 injection
+// concern cannot arise from a typed payload. The legacy string form is retained
+// for one deprecation cycle (dual-accept).
+
+// (n) A typed ValueExpr::Upper(Field) mirrors legacy test (k): `upper` is set to
+// the uppercased `name`. The expr object deserializes through the `ValueExpr`
+// arm of the untagged `ExprSource`, not the legacy string arm.
+#[tokio::test]
+async fn eval_expr_typed_upper_field() {
+    let db = setup_db_with_schema(
+        r#"{"tables":{"u":{"fields":{"name":{"type":"string"},"upper":{"type":"optional","inner":{"type":"string"}}},"indexes":[]}}}"#,
+    )
+    .await;
+    let id = insert_doc(&db, "u", r#"{"name":"ada"}"#).await;
+    migrate(
+        &db,
+        r#"{"directives":[{"op":"evalExpr","table":"u","set":"upper","expr":{"op":"upper","value":{"op":"field","field":"name"}}}]}"#,
+    )
+    .await;
+    assert_eq!(get_doc(&db, "u", &id).await["upper"], "ADA");
+    drop_db(&db).await;
+}
+
+// (o) A typed ValueExpr with a typed FilterExpr `where` scopes the rewrite —
+// mirrors legacy test (l). `Concat` builds "x-" + the `tag` field.
+#[tokio::test]
+async fn eval_expr_typed_where_filters() {
+    let db = setup_db_with_schema(
+        r#"{"tables":{"u":{"fields":{"n":{"type":"number"},"tag":{"type":"string"},"label":{"type":"optional","inner":{"type":"string"}}},"indexes":[]}}}"#,
+    )
+    .await;
+    insert_doc(&db, "u", r#"{"n":1,"tag":"a"}"#).await;
+    insert_doc(&db, "u", r#"{"n":2,"tag":"b"}"#).await;
+    migrate(
+        &db,
+        r#"{"directives":[{"op":"evalExpr","table":"u","set":"label","expr":{"op":"concat","parts":[{"op":"literal","value":"x-"},{"op":"field","field":"tag"}]},"where":{"op":"gte","field":"n","value":2}}]}"#,
+    )
+    .await;
+    let docs = query_docs(&db, "u").await;
+    assert!(
+        docs.iter()
+            .any(|d| d.get("label").and_then(|v| v.as_str()) == Some("x-b")),
+        "n=2 row should have label=x-b, got {docs:?}"
+    );
+    let n1 = docs
+        .iter()
+        .find(|d| d.get("n").and_then(|v| v.as_f64()) == Some(1.0))
+        .expect("n=1 row exists");
+    assert!(
+        n1.get("label").is_none(),
+        "n=1 row should not carry label (predicate excluded it), got {n1:?}"
+    );
+    drop_db(&db).await;
+}
+
+// (p) SEC-107 structural close: a hostile ValueExpr object with an UNKNOWN `op`
+// fails to deserialize — it is rejected at the JSON boundary, never reaching the
+// compiler or the admin gate. A denylist is not involved; the grammar is closed
+// (`deny_unknown_fields` + a fixed variant set). This is the structural property
+// the legacy raw-SQL path could never provide. The two verified SEC-107 bypass
+// shapes — a newline before `FROM` and a bare `SELECT current_setting(...)`
+// without `FROM` — were attacks against the old denylist's *string* matching; on
+// the typed path neither can be expressed at all (there is no raw-SQL node), so
+// they are rejected structurally here, not by pattern. The legacy string path
+// still accepts them, gated to the root admin_key (see the sec107_* tests below).
+#[tokio::test]
+async fn eval_expr_typed_rejects_unknown_op() {
+    let db = setup_db_with_schema(
+        r#"{"tables":{"u":{"fields":{"name":{"type":"string"}},"indexes":[]}}}"#,
+    )
+    .await;
+    // A would-be SQL payload (either SEC-107 bypass shape) wrapped in a bogus op
+    // fails to deserialize — the closed variant set is the boundary.
+    let request: Result<MigrateRequest, _> = serde_json::from_str(
+        r#"{"directives":[{"op":"evalExpr","table":"u","set":"x","expr":{"op":"rawSql","sql":"(SELECT current_setting('...')\nFROM rtdb_auth.machine_tokens)"}}]}"#,
+    );
+    assert!(
+        request.is_err(),
+        "an unknown ValueExpr op (incl. any raw-SQL bypass) must fail to deserialize, got {request:?}"
+    );
+    drop_db(&db).await;
+}
+
+// (q) SEC-107 regression: a ValueExpr::Literal carrying SQL metacharacters lands
+// as a bound DATA value, not interpolated SQL. The literal is set verbatim into
+// the doc — if it were interpolated, the single quotes would break the statement
+// (a syntax error) or execute. Binding proves the value is inert.
+#[tokio::test]
+async fn eval_expr_typed_literal_is_bound_not_interpolated() {
+    let db = setup_db_with_schema(
+        r#"{"tables":{"u":{"fields":{"name":{"type":"string"},"note":{"type":"optional","inner":{"type":"string"}}},"indexes":[]}}}"#,
+    )
+    .await;
+    let hostile = "'); DROP TABLE t_u; --";
+    let id = insert_doc(&db, "u", r#"{"name":"ada"}"#).await;
+    let req = format!(
+        r#"{{"directives":[{{"op":"evalExpr","table":"u","set":"note","expr":{{"op":"literal","value":"{hostile}"}}}}]}}"#
+    );
+    migrate(&db, &req).await;
+    // The hostile string is stored verbatim as data — the table still exists and
+    // the value round-trips exactly.
+    assert_eq!(get_doc(&db, "u", &id).await["note"], hostile);
+    let schema_name = format!("db_{}", db.name);
+    assert!(
+        relation_exists(&db, &format!("{schema_name}.t_u")).await,
+        "table must survive a hostile literal (bound, not executed)"
+    );
+    drop_db(&db).await;
+}
+
+// (r) Typed expr rejects an undeclared field reference at plan time — the field
+// is validated against the table's TableDef before any DB work. Rejected by
+// `plan_migration` (pure, no DB), so the migration never reaches apply.
+#[tokio::test]
+async fn eval_expr_typed_rejects_undeclared_field() {
+    let db = setup_db_with_schema(
+        r#"{"tables":{"u":{"fields":{"name":{"type":"string"}},"indexes":[]}}}"#,
+    )
+    .await;
+    let request: MigrateRequest = serde_json::from_str(
+        r#"{"directives":[{"op":"evalExpr","table":"u","set":"x","expr":{"op":"field","field":"nonexistent"}}]}"#,
+    )
+    .expect("parse");
+    let err = plan_migration(&db.schema, &request.directives).expect_err("plan rejects");
+    assert!(
+        err.message.contains("undeclared field"),
+        "expected undeclared-field error, got: {}",
+        err.message
+    );
+    drop_db(&db).await;
+}
+
+// (s) Dual-accept guard: a typed `expr` with a legacy raw-SQL `where` is
+// rejected — the two sources may not mix. The typed path requires a typed
+// predicate so the whole statement is parameter-bound.
+#[tokio::test]
+async fn eval_expr_typed_rejects_legacy_where_mix() {
+    let db = setup_db_with_schema(
+        r#"{"tables":{"u":{"fields":{"name":{"type":"string"}},"indexes":[]}}}"#,
+    )
+    .await;
+    let err = migrate_err(
+        &db,
+        r#"{"directives":[{"op":"evalExpr","table":"u","set":"x","expr":{"op":"literal","value":1},"where":"true"}]}"#,
+    )
+    .await;
+    assert!(
+        err.message.contains("typed 'where'"),
+        "expected typed-where requirement error, got: {}",
+        err.message
+    );
+    drop_db(&db).await;
+}
+
+// (t) A typed Case expression: classify rows by a FilterExpr predicate. Proves
+// the Case arm compiles its `when` predicates via the read path's compile_filter
+// (field-validated, bound) and its `then`/`otherwise` via compile_value_expr.
+#[tokio::test]
+async fn eval_expr_typed_case() {
+    let db = setup_db_with_schema(
+        r#"{"tables":{"u":{"fields":{"n":{"type":"number"},"band":{"type":"optional","inner":{"type":"string"}}},"indexes":[]}}}"#,
+    )
+    .await;
+    insert_doc(&db, "u", r#"{"n":1}"#).await;
+    insert_doc(&db, "u", r#"{"n":5}"#).await;
+    insert_doc(&db, "u", r#"{"n":20}"#).await;
+    migrate(
+        &db,
+        r#"{"directives":[{"op":"evalExpr","table":"u","set":"band","expr":{"op":"case","whens":[{"when":{"op":"lt","field":"n","value":5},"then":{"op":"literal","value":"low"}},{"when":{"op":"lt","field":"n","value":10},"then":{"op":"literal","value":"mid"}}],"otherwise":{"op":"literal","value":"high"}}}]}"#,
+    )
+    .await;
+    let docs = query_docs(&db, "u").await;
+    let band_of = |n: f64| {
+        docs.iter()
+            .find(|d| d.get("n").and_then(|v| v.as_f64()) == Some(n))
+            .and_then(|d| d.get("band"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("?")
+            .to_string()
+    };
+    assert_eq!(band_of(1.0), "low");
+    assert_eq!(band_of(5.0), "mid");
+    assert_eq!(band_of(20.0), "high");
+    drop_db(&db).await;
+}
+
 // (m2) Dependent multi-directive batch: a later directive operates on an entity
 // an earlier directive renamed, addressing it by its NEW name. `apply_migration`
 // advances a per-directive working schema (mirroring `plan_migration`'s
@@ -1690,6 +1880,70 @@ async fn sec107_non_evalexpr_directive_allowed_for_oauth_allowlist_admin() {
         resp.status(),
         reqwest::StatusCode::OK,
         "non-evalExpr directives stay available to delegated admins"
+    );
+    drop_db(&db).await;
+}
+
+// ENH-020 / SEC-107: a TYPED evalExpr (closed ValueExpr grammar, every literal
+// bound, every field schema-validated) has no SQL-injection surface, so it is
+// admitted for a delegated (OAuth-allowlist) dashboard admin. This is the
+// capability the typed grammar unlocks — safe backfills without the root key.
+// The legacy raw-SQL form remains root-only (the preceding test).
+#[tokio::test]
+async fn enh020_typed_evalexpr_allowed_for_oauth_allowlist_admin() {
+    let db = setup_db_with_schema(
+        r#"{"tables":{"u":{"fields":{"name":{"type":"string"},"upper":{"type":"optional","inner":{"type":"string"}}},"indexes":[]}}}"#,
+    )
+    .await;
+    let id = insert_doc(&db, "u", r#"{"name":"ada"}"#).await;
+    let addr = spawn_app(db.state.clone()).await;
+    let token = seed_oauth_allowlist_admin(&db.state).await;
+
+    let resp = bearer_post_migrate(
+        addr,
+        &format!("/admin/db/{}/migrate", db.name),
+        &token,
+        serde_json::json!({"directives":[
+            {"op":"evalExpr","table":"u","set":"upper",
+             "expr":{"op":"upper","value":{"op":"field","field":"name"}}}
+        ]}),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "typed evalExpr should be admitted for a delegated admin (no SQL-injection surface)"
+    );
+    assert_eq!(get_doc(&db, "u", &id).await["upper"], "ADA");
+    drop_db(&db).await;
+}
+
+// ENH-020 / SEC-107: a delegated admin who mixes a typed `expr` with a legacy
+// raw-SQL `where` is still rejected 403 — the legacy `where` carries the
+// injection surface, so the root-admin gate fires on it.
+#[tokio::test]
+async fn enh020_typed_expr_legacy_where_rejected_for_delegated_admin() {
+    let db = setup_db_with_schema(
+        r#"{"tables":{"u":{"fields":{"name":{"type":"string"}},"indexes":[]}}}"#,
+    )
+    .await;
+    let addr = spawn_app(db.state.clone()).await;
+    let token = seed_oauth_allowlist_admin(&db.state).await;
+
+    let resp = bearer_post_migrate(
+        addr,
+        &format!("/admin/db/{}/migrate", db.name),
+        &token,
+        serde_json::json!({"directives":[
+            {"op":"evalExpr","table":"u","set":"x",
+             "expr":{"op":"literal","value":1},"where":"true"}
+        ]}),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::FORBIDDEN,
+        "legacy raw-SQL 'where' must still require the root admin key"
     );
     drop_db(&db).await;
 }

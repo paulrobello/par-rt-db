@@ -53,20 +53,157 @@ pub enum Directive {
     EvalExpr {
         table: String,
         set: String,
-        expr: String,
-        #[serde(default, rename = "where")]
-        where_clause: Option<String>,
+        /// ENH-020: dual-accept. A typed `ValueExpr` (safe, all-literals-bound
+        /// path) or a legacy raw-SQL string (deprecated, gated to the root
+        /// admin_key — the SEC-107 boundary until the string form is removed).
+        expr: ExprSource,
+        /// Dual-accept `where`: a typed `FilterExpr` (safe) or a legacy raw-SQL
+        /// predicate string (deprecated, same root-admin gate).
+        #[serde(default, skip_serializing_if = "Option::is_none", rename = "where")]
+        where_clause: Option<CondSource>,
     },
 }
 
-/// Closed set of sound coercions for `Directive::ChangeType`.
-#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+/// Closed set of sound coercions. Shared by `Directive::ChangeType` and
+/// `ValueExpr::Cast` — the four scalar casts that are sound to backfill.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum Cast {
     ToString,
     ToNumber,
     ToInt64,
     ToBoolean,
+}
+
+/// A closed, typed expression grammar for `Directive::EvalExpr`'s backfill
+/// expression (ENH-020 Stage 1, closing SEC-107). Mirrors `query::FilterExpr`'s
+/// serde conventions: `tag = "op"`, camelCase, `deny_unknown_fields`. Every
+/// `Literal` compiles to a bound `$n` placeholder (as jsonb); every `Field`
+/// resolves through the table's `TableDef` (errors on an unknown field) and
+/// reads `doc->'field'`. There is deliberately **no** subquery node, no
+/// function-call-by-name node, and no raw-SQL escape — the grammar is closed,
+/// so the SEC-107 injection concern cannot arise from a `ValueExpr` payload.
+/// The only way to reach raw SQL is the deprecated `Legacy(String)` source,
+/// which remains gated to the root admin_key (see `admin_migrate`).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "op", rename_all = "camelCase", deny_unknown_fields)]
+pub enum ValueExpr {
+    /// A declared field on this table (validated against `TableDef`). Reads
+    /// `doc->'field'` (jsonb). The field must be declared; the write target
+    /// (`EvalExpr.set`) need not be.
+    Field {
+        field: String,
+    },
+    /// Any JSON literal. Bound as `$n::jsonb`, so objects/arrays/null round-trip.
+    Literal {
+        value: serde_json::Value,
+    },
+    /// String concatenation. Postgres `concat(...)`, which ignores NULL args
+    /// (treats them as empty) — wrap operands in `Coalesce` for explicit control.
+    Concat {
+        parts: Vec<ValueExpr>,
+    },
+    /// Numeric arithmetic. Operands are cast to `::numeric`; the result is a
+    /// JSON number via the surrounding `to_jsonb`. Division by zero errors at
+    /// runtime — guard with `Case`/`Coalesce` when the divisor may be zero.
+    Add {
+        left: Box<ValueExpr>,
+        right: Box<ValueExpr>,
+    },
+    Sub {
+        left: Box<ValueExpr>,
+        right: Box<ValueExpr>,
+    },
+    Mul {
+        left: Box<ValueExpr>,
+        right: Box<ValueExpr>,
+    },
+    Div {
+        left: Box<ValueExpr>,
+        right: Box<ValueExpr>,
+    },
+    /// `COALESCE(parts...)` — first non-null, or NULL.
+    Coalesce {
+        parts: Vec<ValueExpr>,
+    },
+    /// Text casing / trim. Operand cast to `::text`.
+    Lower {
+        value: Box<ValueExpr>,
+    },
+    Upper {
+        value: Box<ValueExpr>,
+    },
+    Trim {
+        value: Box<ValueExpr>,
+    },
+    /// A closed scalar coercion. Reuses `Directive::ChangeType`'s `Cast` enum.
+    Cast {
+        value: Box<ValueExpr>,
+        to: Cast,
+    },
+    /// Current timestamp (`now()`), as jsonb.
+    Now,
+    /// Conditional: first matching `when`'s `then`, else `otherwise`. Each
+    /// `when` is a `FilterExpr` (compiled via the read path's `compile_filter`,
+    /// so its field references are schema-validated and its values bound).
+    Case {
+        whens: Vec<CaseWhen>,
+        otherwise: Box<ValueExpr>,
+    },
+}
+
+/// One branch of `ValueExpr::Case`. Wire shape `{ when, then }`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CaseWhen {
+    pub when: crate::query::FilterExpr,
+    pub then: ValueExpr,
+}
+
+/// Dual-accept source for `EvalExpr.expr`: a typed `ValueExpr` (the safe path)
+/// or a legacy raw-SQL string (the deprecated path, gated to root admin_key).
+/// `#[serde(untagged)]` tries `Typed` first; a string fails `ValueExpr` (an
+/// internally-tagged object) and falls through to `Legacy`. A hostile object
+/// that is not a valid `ValueExpr` fails both arms and is rejected — it does
+/// NOT silently become legacy.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(untagged)]
+pub enum ExprSource {
+    Typed(ValueExpr),
+    Legacy(String),
+}
+
+/// Dual-accept source for `EvalExpr.where`: a typed `FilterExpr` or a legacy
+/// raw-SQL predicate string. Same untagged discipline as `ExprSource`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(untagged)]
+pub enum CondSource {
+    Typed(crate::query::FilterExpr),
+    Legacy(String),
+}
+
+/// A bind for the migrate expression path. `EqBind`'s four typed variants cover
+/// `FilterExpr` values (compiled via `compile_filter`); `Json` covers
+/// `ValueExpr::Literal` (any JSON value, bound as jsonb). The two coexist in one
+/// UPDATE statement with contiguous `$n` numbering.
+#[derive(Debug, Clone)]
+enum MigrateBind {
+    Text(String),
+    Num(f64),
+    Bool(bool),
+    I64(i64),
+    Json(serde_json::Value),
+}
+
+impl From<crate::txn::EqBind> for MigrateBind {
+    fn from(b: crate::txn::EqBind) -> Self {
+        match b {
+            crate::txn::EqBind::Text(s) => MigrateBind::Text(s),
+            crate::txn::EqBind::Num(f) => MigrateBind::Num(f),
+            crate::txn::EqBind::Bool(b) => MigrateBind::Bool(b),
+            crate::txn::EqBind::I64(i) => MigrateBind::I64(i),
+        }
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -268,10 +405,10 @@ fn validate_one(schema: &mut SchemaDef, d: &Directive) -> Result<(), RtDbError> 
         Directive::EvalExpr {
             table,
             set,
-            expr: _,
-            where_clause: _,
+            expr,
+            where_clause,
         } => {
-            let _ = table_mut(schema, table)?; // table must exist
+            let t = table_mut(schema, table)?; // table must exist
             // `set` is a field path; the field need not exist (evalExpr may populate a
             // new key the caller adds via a later additive push), but the name must be
             // a valid identifier. It is interpolated into the `jsonb_set` key literal,
@@ -281,15 +418,25 @@ fn validate_one(schema: &mut SchemaDef, d: &Directive) -> Result<(), RtDbError> 
                     "evalExpr 'set' must be a valid field name, got '{set}'"
                 )));
             }
-            // SEC-107: `expr`/`where` are raw SQL text interpolated unbound into the
-            // UPDATE statement in `apply_eval_expr`. A substring denylist over SQL
-            // cannot be made sound (bypassed by whitespace variants around ` FROM `,
-            // and `SELECT` without `FROM` reads like `pg_read_file`/`current_setting`
-            // were never listed). Containment is instead enforced by the admin gate:
-            // `admin_migrate` rejects an `evalExpr` directive from a delegated
-            // (OAuth-allowlist) admin and admits it only under the root admin_key,
-            // whose holder already has full server/DB access. The root admin is the
-            // trust boundary; this directive does not expand it.
+            // ENH-020 / SEC-107: a typed `ValueExpr` payload is validated here —
+            // every `Field` must name a declared field on this table, and the
+            // grammar is closed (no subquery / function-call-by-name / raw-SQL
+            // node), so a typed `expr` cannot carry an injection by construction.
+            // The typed `where` (a `FilterExpr`) is likewise field-validated here
+            // via the same `validate_filter_expr_fields` chokepoint the read path
+            // uses. The legacy string `expr`/`where` forms remain raw SQL
+            // interpolated unbound — their containment boundary is the admin gate
+            // (`admin_migrate` admits a legacy `evalExpr` only to the root
+            // admin_key holder, whose reach it does not expand), retained for one
+            // deprecation cycle under the dual-accept rollout.
+            match expr {
+                ExprSource::Typed(ve) => validate_value_expr_fields(ve, t)?,
+                ExprSource::Legacy(_) => {}
+            }
+            if let Some(CondSource::Typed(f)) = where_clause {
+                crate::schema::validate_filter_expr_fields(f, t, false)
+                    .map_err(|e| RtDbError::bad_request(e.message))?;
+            }
         }
     }
     Ok(())
@@ -533,7 +680,7 @@ async fn apply_rename_field(
         .execute(&mut **tx)
         .await?;
     }
-    let ids = ids_where(tx, schema_name, &t, &format!("doc ? '{from}'")).await?;
+    let ids = ids_where(tx, schema_name, &t, &format!("doc ? '{from}'"), &[]).await?;
     let n = rewrite_doc_key(tx, schema_name, &t, from, to).await?;
     fx.touched.insert(table.to_string());
     push_ops(&mut fx.ops, table, &ids, OpKind::Patch);
@@ -613,7 +760,7 @@ async fn apply_drop_field(
     // reported `affected_rows`, and the DocOps to those carriers —
     // matching the spec's "DocOps for the affected rows" and the other
     // data-bearing directives. The typed-column drop below is table-wide.
-    let ids = ids_where(tx, schema_name, &t, &format!("doc ? '{field}'")).await?;
+    let ids = ids_where(tx, schema_name, &t, &format!("doc ? '{field}'"), &[]).await?;
     sqlx::query(&format!(
         "UPDATE \"{schema_name}\".\"{t}\" SET doc = doc - '{field}' \
          WHERE doc ? '{field}'"
@@ -754,7 +901,7 @@ async fn apply_set_default(
     // Capture the rows lacking the field BEFORE the update — after the
     // update they have it, so the `WHERE NOT doc ? '{field}'` predicate
     // would no longer match them.
-    let ids = ids_where(tx, schema_name, &t, &format!("NOT doc ? '{field}'")).await?;
+    let ids = ids_where(tx, schema_name, &t, &format!("NOT doc ? '{field}'"), &[]).await?;
     sqlx::query(&format!(
         "UPDATE \"{schema_name}\".\"{t}\" \
          SET doc = jsonb_set(doc, '{{\"{field}\"}}', $1::jsonb, true) \
@@ -827,7 +974,7 @@ async fn apply_change_type(
     // Only rows that carry the field have a value to cast, so scan just
     // those — `affected_rows` and the DocOps cover exactly the carriers,
     // matching the spec's "DocOps for the affected rows".
-    let ids = ids_where(tx, schema_name, &t, &format!("doc ? '{field}'")).await?;
+    let ids = ids_where(tx, schema_name, &t, &format!("doc ? '{field}'"), &[]).await?;
     for id in &ids {
         let row: Option<(Option<serde_json::Value>,)> = sqlx::query_as(&format!(
             "SELECT doc->'{field}' FROM \"{schema_name}\".\"{t}\" WHERE id = $1"
@@ -894,52 +1041,103 @@ async fn apply_eval_expr(
     derived: &SchemaDef,
     table: &str,
     set: &str,
-    expr: &str,
-    where_clause: &Option<String>,
+    expr: &ExprSource,
+    where_clause: &Option<CondSource>,
     fx: &mut MigrationEffects,
 ) -> Result<DirectiveReport, RtDbError> {
-    // SEC-107: `expr` and `where` are raw SQL text interpolated unbound into the
-    // `UPDATE … SET … = to_jsonb(({expr})) WHERE {cond}` statement below. There
-    // is no parse-time containment — a substring denylist over SQL cannot be made
-    // sound (whitespace variants around ` FROM ` and `SELECT` without `FROM`
-    // both bypassed the prior `has_sql_violation` guard), so it was removed. The
-    // real boundary is the admin gate: `admin_migrate` admits an `evalExpr`
-    // directive only under the root admin_key, never under a delegated
-    // (OAuth-allowlist) admin. The root admin_key holder already has full
-    // server/DB access, so evalExpr under it does not expand their reach; a
-    // delegated admin must not reach other schemas (`rtdb_auth.machine_tokens`/
-    // `sessions`/`admins`, other tenants' documents) through this directive.
-    // `set` is the only field validated here (regex-clean field name); `expr`
-    // and `cond` run as-is against this database's `doc`.
-    //
-    // Capture the affected ids BEFORE the rewrite using the same `cond` so
-    // DocOps cover exactly the rows about to change.
+    // Capture the affected ids BEFORE the rewrite using the same predicate so
+    // DocOps cover exactly the rows about to change. Scoping the indexed-column
+    // recompute by these ids (not by re-evaluating the predicate) is strictly
+    // correct even when `expr` modifies a field the predicate tests — a
+    // predicate-scoped recompute could miss a row whose new doc no longer
+    // matches it, leaving its `f_` column stale. Mirrors `setDefault`.
     let t = pg_table(table);
-    let cond = where_clause.clone().unwrap_or_else(|| "true".to_string());
-    let ids = ids_where(tx, schema_name, &t, &cond).await?;
-    sqlx::query(&format!(
-        "UPDATE \"{schema_name}\".\"{t}\" \
-         SET doc = jsonb_set(doc, '{{\"{set}\"}}', to_jsonb(({expr})), true) \
-         WHERE {cond}"
-    ))
-    .execute(&mut **tx)
-    .await?;
-    // Recompute every indexed `f_` column from the just-rewritten `doc`
-    // for exactly the rows that were rewritten. Scoping by the captured
-    // ids (rather than re-evaluating `cond`) is strictly correct even
-    // when `expr` modifies a field that `cond` tests — a `cond`-scoped
-    // recompute could otherwise miss an updated row whose new doc no
-    // longer matches `cond`, leaving its `f_` column stale. Mirrors the
-    // `setDefault` arm's `recompute_columns_for_ids` pattern.
-    recompute_all_indexed(tx, schema_name, &t, table, derived, &ids).await?;
+    let derived_table = table_def(derived, table)?;
+
+    match (expr, where_clause) {
+        // ENH-020 typed path: `expr` is a closed `ValueExpr`, `where` a
+        // `FilterExpr`. Every literal is bound `$n`; every field reads
+        // `doc->'field'`. The grammar is closed, so this path cannot carry the
+        // SEC-107 injection — there is no raw-SQL node to interpolate.
+        (ExprSource::Typed(ve), cond) => {
+            // Compile the typed `where` once for the id-SELECT ($1..).
+            let (cond_sql, cond_binds) = match cond {
+                Some(CondSource::Typed(f)) => {
+                    let (sql, binds) = crate::query::compile_filter(f, derived_table, 1)?;
+                    (sql, binds)
+                }
+                Some(CondSource::Legacy(_)) => {
+                    return Err(RtDbError::bad_request(
+                        "evalExpr typed 'expr' requires a typed 'where' (FilterExpr); \
+                         a legacy raw-SQL 'where' is not allowed on the typed path",
+                    ));
+                }
+                None => ("true".to_string(), Vec::new()),
+            };
+            let cond_migrate_binds: Vec<MigrateBind> =
+                cond_binds.iter().cloned().map(Into::into).collect();
+            let ids = ids_where(tx, schema_name, &t, &cond_sql, &cond_migrate_binds).await?;
+
+            // Compile `expr` ($1..), then re-compile `where` to continue
+            // numbering ($m+1..) for the UPDATE statement.
+            let mut expr_binds: Vec<MigrateBind> = Vec::new();
+            let expr_sql = compile_value_expr(ve, derived_table, 1, &mut expr_binds)?;
+            let (cond_sql2, cond_binds2) = match cond {
+                Some(CondSource::Typed(f)) => {
+                    let start = 1 + expr_binds.len();
+                    crate::query::compile_filter(f, derived_table, start)?
+                }
+                _ => ("true".to_string(), Vec::new()),
+            };
+            let mut all_binds = expr_binds;
+            all_binds.extend(cond_binds2.into_iter().map(Into::into));
+            let update_sql = format!(
+                "UPDATE \"{schema_name}\".\"{t}\" \
+                 SET doc = jsonb_set(doc, '{{\"{set}\"}}', to_jsonb(({expr_sql})), true) \
+                 WHERE {cond_sql2}"
+            );
+            bind_execute(&update_sql, &all_binds, tx).await?;
+
+            recompute_all_indexed(tx, schema_name, &t, table, derived, &ids).await?;
+            Ok(report(table, ids, fx))
+        }
+        // Legacy raw-SQL path (SEC-107 boundary, gated to root admin_key by
+        // `admin_migrate`). `expr` and `where` run as-is against this db's
+        // `doc`. Retained for one deprecation cycle under dual-accept.
+        (ExprSource::Legacy(raw), where_clause) => {
+            let (cond_sql, binds): (String, Vec<MigrateBind>) = match where_clause {
+                Some(CondSource::Legacy(cond)) => (cond.clone(), Vec::new()),
+                Some(CondSource::Typed(_)) => {
+                    return Err(RtDbError::bad_request(
+                        "evalExpr legacy raw-SQL 'expr' requires a legacy raw-SQL 'where'; \
+                         a typed 'where' is not allowed on the legacy path",
+                    ));
+                }
+                None => ("true".to_string(), Vec::new()),
+            };
+            let ids = ids_where(tx, schema_name, &t, &cond_sql, &binds).await?;
+            sqlx::query(&format!(
+                "UPDATE \"{schema_name}\".\"{t}\" \
+                 SET doc = jsonb_set(doc, '{{\"{set}\"}}', to_jsonb(({raw})), true) \
+                 WHERE {cond_sql}"
+            ))
+            .execute(&mut **tx)
+            .await?;
+            recompute_all_indexed(tx, schema_name, &t, table, derived, &ids).await?;
+            Ok(report(table, ids, fx))
+        }
+    }
+}
+
+fn report(table: &str, ids: Vec<String>, fx: &mut MigrationEffects) -> DirectiveReport {
     let n = ids.len() as i64;
     fx.touched.insert(table.to_string());
     push_ops(&mut fx.ops, table, &ids, OpKind::Patch);
-    Ok(DirectiveReport {
+    DirectiveReport {
         op: "evalExpr".into(),
         affected_rows: n,
         ..Default::default()
-    })
+    }
 }
 
 fn table_def<'a>(schema: &'a SchemaDef, table: &str) -> Result<&'a TableDef, RtDbError> {
@@ -947,6 +1145,184 @@ fn table_def<'a>(schema: &'a SchemaDef, table: &str) -> Result<&'a TableDef, RtD
         .tables
         .get(table)
         .ok_or_else(|| RtDbError::internal(format!("table '{table}' missing from schema")))
+}
+
+/// Walks a `ValueExpr` validating that every `Field` names a declared field on
+/// `table` (the same chokepoint `FilterExpr` uses — `check_field_declared`).
+/// Pure; called from `validate_one` so an unknown field fails the migration
+/// plan before any DB work. `Case` branches recurse and their `when` predicates
+/// go through the read path's `validate_filter_expr_fields`.
+pub(crate) fn validate_value_expr_fields(
+    ve: &ValueExpr,
+    table: &TableDef,
+) -> Result<(), RtDbError> {
+    match ve {
+        ValueExpr::Field { field } => {
+            if !table.fields.contains_key(field) {
+                return Err(RtDbError::bad_request(format!(
+                    "evalExpr 'expr' references undeclared field '{field}'"
+                )));
+            }
+        }
+        ValueExpr::Literal { .. } | ValueExpr::Now => {}
+        ValueExpr::Concat { parts } | ValueExpr::Coalesce { parts } => {
+            for p in parts {
+                validate_value_expr_fields(p, table)?;
+            }
+        }
+        ValueExpr::Add { left, right }
+        | ValueExpr::Sub { left, right }
+        | ValueExpr::Mul { left, right }
+        | ValueExpr::Div { left, right } => {
+            validate_value_expr_fields(left, table)?;
+            validate_value_expr_fields(right, table)?;
+        }
+        ValueExpr::Lower { value } | ValueExpr::Upper { value } | ValueExpr::Trim { value } => {
+            validate_value_expr_fields(value, table)?
+        }
+        ValueExpr::Cast { value, .. } => validate_value_expr_fields(value, table)?,
+        ValueExpr::Case { whens, otherwise } => {
+            for cw in whens {
+                crate::schema::validate_filter_expr_fields(&cw.when, table, false)
+                    .map_err(|e| RtDbError::bad_request(e.message))?;
+                validate_value_expr_fields(&cw.then, table)?;
+            }
+            validate_value_expr_fields(otherwise, table)?;
+        }
+    }
+    Ok(())
+}
+
+/// Compiles a `ValueExpr` into a SQL fragment plus its typed binds, with `$n`
+/// placeholders numbered from 1-based `start_pos`. Every `Literal` emits one
+/// bind (as jsonb); every `Field` inlines `doc->'field'` (the field name is
+/// schema-validated by `validate_value_expr_fields` and a safe jsonb key). The
+/// result is intended for `to_jsonb((<expr>))`, so each branch yields a value
+/// compatible with jsonb coercion. `Case` branches reuse the read path's
+/// `query::compile_filter` for their predicates — no forked compiler, so the
+/// SEC-117 three-valued-logic guards (COALESCE-wrapped negation, etc.) apply.
+/// There is no raw-SQL node — the grammar is closed, which is the SEC-107
+/// boundary.
+fn compile_value_expr(
+    ve: &ValueExpr,
+    table: &TableDef,
+    start_pos: usize,
+    binds: &mut Vec<MigrateBind>,
+) -> Result<String, RtDbError> {
+    Ok(match ve {
+        ValueExpr::Field { field } => {
+            // Text extraction — the expr result feeds `to_jsonb((EXPR))`, so a
+            // field yields text (mirrors the legacy `doc->>'field'` reads). The
+            // field name is schema-validated by `validate_value_expr_fields`.
+            format!("doc->>'{field}'")
+        }
+        ValueExpr::Literal { value } => {
+            // Placeholder numbering is `start_pos + binds.len()` — `start_pos`
+            // is the base for THIS compilation, and `binds.len()` is the offset
+            // accumulated by earlier siblings (the vec is shared across the
+            // recursion, mirroring `compile_filter_node`). Recursive calls pass
+            // `start_pos` unchanged so the offset is not double-counted.
+            let ph = start_pos + binds.len();
+            match value {
+                serde_json::Value::String(s) => {
+                    binds.push(MigrateBind::Text(s.clone()));
+                    format!("${ph}::text")
+                }
+                serde_json::Value::Number(n) => {
+                    binds.push(MigrateBind::Num(n.as_f64().unwrap_or(0.0)));
+                    format!("${ph}::numeric")
+                }
+                serde_json::Value::Bool(b) => {
+                    binds.push(MigrateBind::Bool(*b));
+                    format!("${ph}::boolean")
+                }
+                serde_json::Value::Null => "NULL".to_string(),
+                other => {
+                    binds.push(MigrateBind::Json(other.clone()));
+                    format!("${ph}::jsonb")
+                }
+            }
+        }
+        ValueExpr::Concat { parts } => {
+            let compiled: Vec<String> = parts
+                .iter()
+                .map(|p| compile_value_expr(p, table, start_pos, binds))
+                .collect::<Result<_, _>>()?;
+            format!("concat({})", compiled.join(", "))
+        }
+        ValueExpr::Add { left, right }
+        | ValueExpr::Sub { left, right }
+        | ValueExpr::Mul { left, right }
+        | ValueExpr::Div { left, right } => {
+            let op = match ve {
+                ValueExpr::Add { .. } => "+",
+                ValueExpr::Sub { .. } => "-",
+                ValueExpr::Mul { .. } => "*",
+                ValueExpr::Div { .. } => "/",
+                _ => unreachable!(),
+            };
+            let l = compile_value_expr(left, table, start_pos, binds)?;
+            let r = compile_value_expr(right, table, start_pos, binds)?;
+            format!("(({})::numeric {op} ({}))::numeric", l, r)
+        }
+        ValueExpr::Coalesce { parts } => {
+            let compiled: Vec<String> = parts
+                .iter()
+                .map(|p| compile_value_expr(p, table, start_pos, binds))
+                .collect::<Result<_, _>>()?;
+            format!("COALESCE({})", compiled.join(", "))
+        }
+        ValueExpr::Lower { value } => {
+            format!(
+                "lower(({})::text)",
+                compile_value_expr(value, table, start_pos, binds)?
+            )
+        }
+        ValueExpr::Upper { value } => {
+            format!(
+                "upper(({})::text)",
+                compile_value_expr(value, table, start_pos, binds)?
+            )
+        }
+        ValueExpr::Trim { value } => {
+            format!(
+                "btrim(({})::text)",
+                compile_value_expr(value, table, start_pos, binds)?
+            )
+        }
+        ValueExpr::Cast { value, to } => {
+            let cast_sql = match to {
+                Cast::ToString => "::text",
+                Cast::ToNumber => "::numeric",
+                Cast::ToInt64 => "::bigint",
+                Cast::ToBoolean => "::boolean",
+            };
+            format!(
+                "({}){}",
+                compile_value_expr(value, table, start_pos, binds)?,
+                cast_sql
+            )
+        }
+        ValueExpr::Now => "now()".to_string(),
+        ValueExpr::Case { whens, otherwise } => {
+            let mut fragments: Vec<String> = Vec::with_capacity(whens.len() + 1);
+            for cw in whens {
+                // Compile the predicate from the current tail (`start_pos +
+                // binds.len()`), then push its binds before compiling `then` so
+                // the then-expression numbers after them. `start_pos` is passed
+                // unchanged to the recursive `then`/`otherwise` calls — the
+                // shared `binds.len()` tracks the running offset.
+                let cur = start_pos + binds.len();
+                let (cond_sql, cond_binds) = crate::query::compile_filter(&cw.when, table, cur)?;
+                binds.extend(cond_binds.into_iter().map(Into::into));
+                let then_sql = compile_value_expr(&cw.then, table, start_pos, binds)?;
+                fragments.push(format!("WHEN {cond_sql} THEN {then_sql}"));
+            }
+            let else_sql = compile_value_expr(otherwise, table, start_pos, binds)?;
+            fragments.push(format!("ELSE {else_sql}"));
+            format!("CASE {} END", fragments.join(" "))
+        }
+    })
 }
 
 /// Reads the stored schema from the db's `meta` row inside `tx`. Before Task 6's
@@ -1077,7 +1453,7 @@ async fn all_ids(
     schema_name: &str,
     table: &str,
 ) -> Result<Vec<String>, RtDbError> {
-    ids_where(tx, schema_name, table, "true").await
+    ids_where(tx, schema_name, table, "true", &[]).await
 }
 
 /// Selects `id` for rows matching `cond`. `cond` is composed from validated
@@ -1091,13 +1467,43 @@ async fn ids_where(
     schema_name: &str,
     table: &str,
     cond: &str,
+    binds: &[MigrateBind],
 ) -> Result<Vec<String>, RtDbError> {
-    let rows: Vec<(String,)> = sqlx::query_as(&format!(
-        "SELECT id FROM \"{schema_name}\".\"{table}\" WHERE {cond}"
-    ))
-    .fetch_all(&mut **tx)
-    .await?;
+    let sql = format!("SELECT id FROM \"{schema_name}\".\"{table}\" WHERE {cond}");
+    let mut q = sqlx::query_as::<_, (String,)>(&sql);
+    for b in binds {
+        q = match b {
+            MigrateBind::Text(s) => q.bind(s),
+            MigrateBind::Num(f) => q.bind(f),
+            MigrateBind::Bool(b) => q.bind(b),
+            MigrateBind::I64(i) => q.bind(i),
+            MigrateBind::Json(v) => q.bind(sqlx::types::Json(v)),
+        };
+    }
+    let rows = q.fetch_all(&mut **tx).await?;
     Ok(rows.into_iter().map(|r| r.0).collect())
+}
+
+/// Runs an execute-only statement with the given binds (the UPDATE in
+/// `apply_eval_expr`'s typed path). Every `MigrateBind` becomes a bound `$n`,
+/// so no `ValueExpr` literal is ever interpolated into the SQL string.
+async fn bind_execute(
+    sql: &str,
+    binds: &[MigrateBind],
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> Result<(), RtDbError> {
+    let mut q = sqlx::query(sql);
+    for b in binds {
+        q = match b {
+            MigrateBind::Text(s) => q.bind(s),
+            MigrateBind::Num(f) => q.bind(f),
+            MigrateBind::Bool(b) => q.bind(b),
+            MigrateBind::I64(i) => q.bind(i),
+            MigrateBind::Json(v) => q.bind(sqlx::types::Json(v)),
+        };
+    }
+    q.execute(&mut **tx).await?;
+    Ok(())
 }
 
 fn push_ops(ops: &mut Vec<DocOp>, table: &str, ids: &[String], kind: OpKind) {
@@ -1174,8 +1580,8 @@ mod tests {
                 Directive::EvalExpr {
                     table: "users".into(),
                     set: "upper".into(),
-                    expr: "upper(doc->>'fullName')".into(),
-                    where_clause: Some("doc ? 'fullName'".into()),
+                    expr: ExprSource::Legacy("upper(doc->>'fullName')".into()),
+                    where_clause: Some(CondSource::Legacy("doc ? 'fullName'".into())),
                 },
             ],
             dry_run: true,
@@ -1351,7 +1757,7 @@ mod tests {
         let d = vec![Directive::EvalExpr {
             table: "users".into(),
             set: "name".into(),
-            expr: "x FROM other".into(),
+            expr: ExprSource::Legacy("x FROM other".into()),
             where_clause: None,
         }];
         assert!(
@@ -1553,7 +1959,7 @@ mod tests {
         let d = vec![Directive::EvalExpr {
             table: "users".into(),
             set: "name' WHERE 1=1".into(),
-            expr: "'x'".into(),
+            expr: ExprSource::Legacy("'x'".into()),
             where_clause: None,
         }];
         let err = plan_migration(&old, &d).unwrap_err();

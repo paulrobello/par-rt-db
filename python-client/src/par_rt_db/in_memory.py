@@ -620,7 +620,10 @@ class InMemoryRtDbClient:
 
         ``evalExpr`` has no in-memory SQL engine and raises
         :class:`RtDbError` ``BAD_REQUEST`` — same convention as the
-        search/vector stubs. Affected-rows counts mirror the server:
+        search/vector stubs. ENH-020's typed ``ValueExpr`` path is also
+        unsupported in-memory (no SQL engine to compile it to); both arms
+        (typed and legacy raw-SQL) raise identically. Affected-rows counts
+        mirror the server:
         ``renameField`` / ``setDefault`` / ``changeType`` / ``dropField`` count
         the rows whose docs actually changed; ``dropTable`` counts every row
         (all deleted); ``renameTable`` / ``dropIndex`` report zero.
@@ -686,6 +689,10 @@ class InMemoryRtDbClient:
         if isinstance(d, _SetDefault):
             return self._migrate_set_default(planned, d), d.table
         if isinstance(d, _EvalExpr):
+            # ENH-020: both the typed ``ValueExpr`` path and the legacy raw-SQL
+            # path are unsupported in-memory (no SQL engine here). ``d.expr``
+            # may now be a ``ValueExpr`` model OR a legacy ``str`` — irrelevant
+            # since either arm raises. The doc list above is unchanged.
             raise RtDbError(
                 ErrorCode.BAD_REQUEST,
                 f"evalExpr unsupported in-memory (table '{d.table}')",

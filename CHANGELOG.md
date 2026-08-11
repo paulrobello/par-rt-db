@@ -13,6 +13,28 @@ contract against Convex.
 
 ## [Unreleased]
 
+### Typed backfill expression grammar — `evalExpr` closes SEC-107 (ENH-020)
+
+The `evalExpr` migrate directive's backfill expression is now a **closed, typed
+`ValueExpr` grammar** instead of raw SQL. `Field`/`Literal`/`Concat`/arithmetic/
+`Coalesce`/`Lower`/`Upper`/`Trim`/`Cast`/`Now`/`Case` — every literal is bound
+as a `$n` parameter, every field is schema-validated against the table's
+`TableDef`, and there is no subquery, function-call-by-name, or raw-SQL node.
+The SEC-107 injection concern (a newline before `FROM` and a bare `SELECT`
+without `FROM` both bypassed the old denylist) cannot arise from a `ValueExpr`
+payload by construction.
+
+**Dual-accept rollout**: the legacy raw-SQL string form is still accepted for one
+deprecation cycle, but gated to the root `admin_key` only. The typed path is
+available to delegated dashboard admins for safe backfills. A typed `expr` mixed
+with a legacy `where` (or vice versa) is rejected.
+
+**Wire-breaking** for clients emitting the legacy string form that later want
+the safe path: migrate to `ValueExpr` before the string form is removed.
+`ValueExpr` is mirrored byte-identically across all four clients (ts-client
+`ValueExprJson`, rust-client `ValueExpr`, python-client `ValueExpr`) with
+`evalExprTyped`/`eval_expr_typed` builder ergonomics, plus wire-corpus cases.
+
 ### Streaming storage upload/download (ENH-021)
 
 File size is now decoupled from server RAM. Uploads and downloads stream

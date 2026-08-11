@@ -108,25 +108,37 @@ pub(super) async fn admin_migrate(
     ApiJson(body): ApiJson<crate::migrate::MigrateRequest>,
 ) -> Result<Json<crate::migrate::MigrateResult>, RtDbError> {
     // SEC-108: `principal` is stashed by `require_admin_mw`.
-    // SEC-107: an `evalExpr` directive interpolates client-supplied SQL text
-    // (`expr`/`where`) directly into an `UPDATE … WHERE` executed inside the
-    // committer's serialized turn. A denylist over SQL text cannot be made
-    // sound, so containment is enforced structurally here: `evalExpr` is
-    // admitted only under the root `admin_key` (`AdminPrincipal::Key`), never
-    // under a delegated/OAuth-allowlist dashboard admin (`AdminPrincipal::User`).
-    // The root admin_key holder already has full server/DB access, so evalExpr
-    // under it does not expand their reach; a delegated admin must not reach
+    // SEC-107: `evalExpr` has two execution paths. The legacy path interpolates
+    // client-supplied SQL text (`expr`/`where`) directly into an `UPDATE … WHERE`
+    // — a denylist over SQL text cannot be made sound, so containment is enforced
+    // structurally here: a LEGACY `evalExpr` (either `expr` or `where` carrying
+    // a raw-SQL string) is admitted only under the root `admin_key`
+    // (`AdminPrincipal::Key`), never under a delegated/OAuth-allowlist dashboard
+    // admin. The root admin_key holder already has full server/DB access, so it
+    // does not expand their reach; a delegated admin must not reach
     // `rtdb_auth.machine_tokens`/`sessions`/`admins` or other tenants' documents
-    // through it. All other directives (addIndex/renameField/etc.) remain
-    // available to allowlist admins.
-    if body
-        .directives
-        .iter()
-        .any(|d| matches!(d, crate::migrate::Directive::EvalExpr { .. }))
-        && !matches!(principal, AdminPrincipal::Key)
+    // through raw SQL. The TYPED path (ENH-020 — a closed `ValueExpr` /
+    // `FilterExpr` with every literal bound and every field schema-validated) has
+    // no SQL-injection surface by construction, so it is available to delegated
+    // admins for safe backfills. All other directives (renameField/etc.) are
+    // unaffected. The typed/legacy mix is additionally rejected at compile time
+    // in `apply_eval_expr`.
+    if !matches!(principal, AdminPrincipal::Key)
+        && body.directives.iter().any(|d| {
+            matches!(
+                d,
+                crate::migrate::Directive::EvalExpr {
+                    expr: crate::migrate::ExprSource::Legacy(_),
+                    ..
+                } | crate::migrate::Directive::EvalExpr {
+                    where_clause: Some(crate::migrate::CondSource::Legacy(_)),
+                    ..
+                }
+            )
+        })
     {
         return Err(RtDbError::forbidden(
-            "evalExpr directive requires the root admin key",
+            "legacy raw-SQL evalExpr requires the root admin key (use the typed ValueExpr form)",
         ));
     }
     if !db::database_exists(&state.pool, &db).await? {

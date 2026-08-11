@@ -297,6 +297,9 @@ impl InMemoryRtDbClient {
                     Some(table.clone()),
                 ))
             }
+            // ENH-020: both the typed `ValueExpr` path and the legacy raw-SQL
+            // string path are unsupported in-memory — there is no SQL engine
+            // here. The match ignores `expr`/`where_clause` entirely.
             Directive::EvalExpr { table, .. } => Err(RtDbError::new(
                 ErrorCode::BadRequest,
                 format!("evalExpr unsupported in-memory (table '{table}')"),

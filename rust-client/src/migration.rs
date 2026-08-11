@@ -11,7 +11,8 @@
 //! the full request body.
 
 use crate::schema::FieldType;
-use crate::wire::admin::{Cast, Directive, MigrateRequestOwned};
+use crate::wire::FilterExpr;
+use crate::wire::admin::{Cast, CondSource, Directive, ExprSource, MigrateRequestOwned, ValueExpr};
 use serde_json::Value;
 
 /// Builder for a schema migration — an ordered list of [`Directive`]s the
@@ -102,6 +103,9 @@ impl Migration {
         self
     }
 
+    /// Legacy raw-SQL `evalExpr` (deprecated, ENH-020 / SEC-107). Prefer
+    /// [`eval_expr_typed`](Self::eval_expr_typed) — the typed [`ValueExpr`]
+    /// path. This legacy form remains gated to the root admin_key server-side.
     pub fn eval_expr(
         mut self,
         table: &str,
@@ -112,8 +116,30 @@ impl Migration {
         self.directives.push(Directive::EvalExpr {
             table: table.into(),
             set: set.into(),
-            expr: expr.into(),
-            where_clause: where_clause.map(str::to_string),
+            expr: ExprSource::Legacy(expr.into()),
+            where_clause: where_clause.map(|w| CondSource::Legacy(w.into())),
+        });
+        self
+    }
+
+    /// Typed `evalExpr` (ENH-020, SEC-107 structural close). The safe path:
+    /// `expr` is a closed [`ValueExpr`] grammar and `where_clause` is an
+    /// optional typed [`FilterExpr`]. The two sources may not mix — pass both
+    /// typed, or use [`eval_expr`](Self::eval_expr) for the legacy raw-SQL
+    /// form (never combine a typed `expr` with a legacy `where`, or vice
+    /// versa).
+    pub fn eval_expr_typed(
+        mut self,
+        table: &str,
+        set: &str,
+        expr: ValueExpr,
+        where_clause: Option<FilterExpr>,
+    ) -> Self {
+        self.directives.push(Directive::EvalExpr {
+            table: table.into(),
+            set: set.into(),
+            expr: ExprSource::Typed(expr),
+            where_clause: where_clause.map(CondSource::Typed),
         });
         self
     }

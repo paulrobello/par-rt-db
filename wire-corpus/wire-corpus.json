@@ -122,6 +122,20 @@
         { "op": "evalExpr", "table": "users", "set": "upper", "expr": "upper(doc->>'fullName')", "where": "doc ? 'fullName'" }
       ],
       "dryRun": true
+    },
+    {
+      "directives": [
+        { "op": "evalExpr", "table": "users", "set": "upper",
+          "expr": { "op": "upper", "value": { "op": "field", "field": "fullName" } },
+          "where": { "op": "exists", "field": "fullName" } },
+        { "op": "evalExpr", "table": "events", "set": "label",
+          "expr": { "op": "concat", "parts": [ { "op": "literal", "value": "ev-" }, { "op": "cast", "value": { "op": "field", "field": "ts" }, "to": "toString" } ] } },
+        { "op": "evalExpr", "table": "events", "set": "band",
+          "expr": { "op": "case",
+            "whens": [ { "when": { "op": "lt", "field": "score", "value": 10 }, "then": { "op": "literal", "value": "low" } } ],
+            "otherwise": { "op": "coalesce", "parts": [ { "op": "field", "field": "score" }, { "op": "literal", "value": 0 } ] } } }
+      ],
+      "dryRun": false
     }
   ],
   "migrate_results": [

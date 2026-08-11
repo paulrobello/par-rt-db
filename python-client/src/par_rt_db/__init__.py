@@ -33,7 +33,7 @@ from typing import TYPE_CHECKING, Any
 from .cursor import decode_cursor, encode_cursor
 from .errors import ErrorCode, RtDbError
 from .in_memory import InMemoryRtDbClient
-from .migration import Cast, Migration
+from .migration import CaseWhen, Cast, Migration, ValueExpr
 from .mutation import Mutation, StepResult, Transaction
 from .query import Paginated, Query, TableQuery
 from .schema import Schema, SchemaDef, TableDef, t
@@ -60,6 +60,8 @@ __all__ = [
     "Mutation",
     "Migration",
     "Cast",
+    "CaseWhen",
+    "ValueExpr",
     "Transaction",
     "StepResult",
     "SchemaDef",

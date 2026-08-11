@@ -362,7 +362,7 @@ async fn migrate_eval_expr_unsupported() {
     let directives = vec![crate::wire::admin::Directive::EvalExpr {
         table: "items".into(),
         set: "upper".into(),
-        expr: "upper(doc->>'name')".into(),
+        expr: crate::wire::admin::ExprSource::Legacy("upper(doc->>'name')".into()),
         where_clause: None,
     }];
     let err = c.migrate_schema(&directives, false).unwrap_err();

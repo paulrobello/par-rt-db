@@ -1,9 +1,9 @@
-"""Declarative schema migration: ``Cast``, ``Directive`` (8 ops), ``MigrateRequest``,
-and the ``Migration`` builder.
+"""Declarative schema migration: ``Cast``, ``ValueExpr``, ``Directive`` (8 ops),
+``MigrateRequest``, and the ``Migration`` builder.
 
 Mirrors ``server/src/migrate.rs`` (the ``Directive`` enum + ``Cast`` +
-``MigrateRequest``) and the builder ergonomics of
-``ts-client/src/migration.ts`` / ``rust-client/src/migration.rs``.
+``ValueExpr`` / ``CaseWhen`` + ``MigrateRequest``) and the builder ergonomics
+of ``ts-client/src/migration.ts`` / ``rust-client/src/migration.rs``.
 
 Wire shapes (load-bearing — match the server exactly):
 
@@ -12,9 +12,25 @@ Wire shapes (load-bearing — match the server exactly):
   ``dropIndex`` / ``setDefault`` / ``evalExpr``) with ``deny_unknown_fields``
   mirrored via ``extra="forbid"`` — the same shape contract as ``mutation.Step``.
 * ``Cast`` is the closed set of sound coercions for ``changeType``
-  (``toString`` / ``toNumber`` / ``toInt64`` / ``toBoolean``).
+  (``toString`` / ``toNumber`` / ``toInt64`` / ``toBoolean``); it is also the
+  coercion set for ``ValueExpr.cast``.
+* ``ValueExpr`` is a closed, typed expression grammar for ``evalExpr.expr``
+  (ENH-020 Stage 1, closing SEC-107). Tagged by ``op`` (camelCase:
+  ``field`` / ``literal`` / ``concat`` / ``add`` / ``sub`` / ``mul`` / ``div``
+  / ``coalesce`` / ``lower`` / ``upper`` / ``trim`` / ``cast`` / ``now`` /
+  ``case``), ``deny_unknown_fields`` via ``extra="forbid"``. Mirrors
+  ``server/src/migrate.rs::ValueExpr`` and ``FilterExpr``'s serde conventions.
+  The grammar is closed (no subquery / function-by-name / raw-SQL node) so the
+  SEC-107 injection concern cannot arise from a ``ValueExpr`` payload.
+* ``CaseWhen`` is one branch of ``ValueExpr.case``: ``{when: FilterExpr,
+  then: ValueExpr}`` (camelCase, ``extra="forbid"``).
 * ``MigrateRequest`` is ``{"directives": Directive[], "dryRun": bool}``;
   ``dryRun`` defaults to ``False`` (server's ``#[serde(default)]``).
+* ``evalExpr`` is dual-accept (ENH-020): ``expr`` is EITHER a ``ValueExpr``
+  (typed safe path) OR a legacy raw-SQL ``str`` (deprecated, gated to the
+  root admin_key — the SEC-107 boundary). ``where`` is EITHER a ``FilterExpr``
+  OR a legacy raw-SQL ``str``. The two sources may not mix (a typed ``expr``
+  requires a typed ``where``, and vice versa) — enforced server-side.
 * ``evalExpr.where`` is the wire alias for the server's ``where_clause`` field
   (serde ``rename = "where"``); ``changeType.default`` and ``evalExpr.where``
   are omitted on the wire when unset, matching the ts-client's omit convention.
@@ -38,7 +54,7 @@ from pydantic import Field, model_serializer
 from pydantic_core.core_schema import SerializerFunctionWrapHandler
 
 from .schema import FieldType
-from .wire import _Camel
+from .wire import FilterExpr, _Camel
 
 
 class Cast(StrEnum):
@@ -46,13 +62,144 @@ class Cast(StrEnum):
 
     Mirrors ``server/src/migrate::Cast`` (camelCase on the wire). ``StrEnum``
     so pydantic v2 serializes the string value directly and
-    ``Cast.TO_STRING == "toString"`` for ergonomic builder calls.
+    ``Cast.TO_STRING == "toString"`` for ergonomic builder calls. Shared by
+    ``changeType`` and ``ValueExpr.cast`` (the four scalar casts sound to
+    backfill).
     """
 
     TO_STRING = "toString"
     TO_NUMBER = "toNumber"
     TO_INT64 = "toInt64"
     TO_BOOLEAN = "toBoolean"
+
+
+# --- ValueExpr (discriminator "op", camelCase) ---
+#
+# Closed, typed expression grammar for ``Directive.EvalExpr.expr`` (ENH-020
+# Stage 1, closing SEC-107). Mirrors ``server/src/migrate.rs::ValueExpr``
+# byte-for-byte: ``tag = "op"``, camelCase, ``deny_unknown_fields`` (via
+# ``extra="forbid"`` on ``_Camel``) — the same serde conventions as
+# ``wire.FilterExpr``. Every ``literal`` compiles to a bound ``$n`` placeholder
+# (as jsonb); every ``field`` resolves through the table's ``TableDef``. The
+# grammar is closed (no subquery / function-call-by-name / raw-SQL node) so the
+# SEC-107 injection concern cannot arise from a ``ValueExpr`` payload.
+#
+# Self-referential union pattern mirrors ``wire.FilterExpr``: ``from __future__
+# import annotations`` makes every annotation a string, the union references
+# the variant classes by name, and ``model_rebuild()`` at module foot resolves
+# the forward refs into a fully-built schema.
+
+
+class _ValueField(_Camel):
+    op: Literal["field"] = "field"
+    field: str
+
+
+class _ValueLiteral(_Camel):
+    op: Literal["literal"] = "literal"
+    value: Any
+
+
+class _ValueConcat(_Camel):
+    op: Literal["concat"] = "concat"
+    parts: list[ValueExpr]
+
+
+class _ValueAdd(_Camel):
+    op: Literal["add"] = "add"
+    left: ValueExpr
+    right: ValueExpr
+
+
+class _ValueSub(_Camel):
+    op: Literal["sub"] = "sub"
+    left: ValueExpr
+    right: ValueExpr
+
+
+class _ValueMul(_Camel):
+    op: Literal["mul"] = "mul"
+    left: ValueExpr
+    right: ValueExpr
+
+
+class _ValueDiv(_Camel):
+    op: Literal["div"] = "div"
+    left: ValueExpr
+    right: ValueExpr
+
+
+class _ValueCoalesce(_Camel):
+    op: Literal["coalesce"] = "coalesce"
+    parts: list[ValueExpr]
+
+
+class _ValueLower(_Camel):
+    op: Literal["lower"] = "lower"
+    value: ValueExpr
+
+
+class _ValueUpper(_Camel):
+    op: Literal["upper"] = "upper"
+    value: ValueExpr
+
+
+class _ValueTrim(_Camel):
+    op: Literal["trim"] = "trim"
+    value: ValueExpr
+
+
+class _ValueCast(_Camel):
+    op: Literal["cast"] = "cast"
+    value: ValueExpr
+    to: Cast
+
+
+class _ValueNow(_Camel):
+    op: Literal["now"] = "now"
+
+
+class _ValueCase(_Camel):
+    op: Literal["case"] = "case"
+    whens: list[CaseWhen]
+    otherwise: ValueExpr
+
+
+class CaseWhen(_Camel):
+    """One branch of ``ValueExpr.case``. Wire shape ``{when, then}``.
+
+    Mirrors ``server/src/migrate.rs::CaseWhen`` (camelCase,
+    ``deny_unknown_fields`` via ``extra="forbid"`` on ``_Camel``). ``when`` is
+    the read-path ``FilterExpr`` (field references schema-validated, values
+    bound); ``then`` is the typed expression result on a match.
+    """
+
+    when: FilterExpr
+    then: ValueExpr
+
+
+#: Discriminated union of all 14 ``ValueExpr`` ops. The ``op`` literal drives
+#: dispatch; ``deny_unknown_fields`` is per-variant via ``extra="forbid"`` on
+#: ``_Camel`` — the same shape contract as ``wire.FilterExpr``.
+ValueExpr = Annotated[
+    (
+        _ValueField
+        | _ValueLiteral
+        | _ValueConcat
+        | _ValueAdd
+        | _ValueSub
+        | _ValueMul
+        | _ValueDiv
+        | _ValueCoalesce
+        | _ValueLower
+        | _ValueUpper
+        | _ValueTrim
+        | _ValueCast
+        | _ValueNow
+        | _ValueCase
+    ),
+    Field(discriminator="op"),
+]
 
 
 # --- Directive (discriminator "op", camelCase) ---
@@ -114,12 +261,25 @@ class _SetDefault(_Camel):
 
 
 class _EvalExpr(_Camel):
+    """``evalExpr`` directive (ENH-020 dual-accept).
+
+    ``expr`` is EITHER a typed :data:`ValueExpr` (the safe path — closed
+    grammar, all literals bound, SEC-107 structural close) OR a legacy raw-SQL
+    ``str`` (deprecated, gated to the root admin_key until the string form is
+    removed). ``where_`` is EITHER a typed :data:`FilterExpr` OR a legacy
+    raw-SQL predicate ``str``. The two sources may not mix — a typed ``expr``
+    requires a typed ``where_`` (and vice versa); enforced server-side. The
+    untagged-object-vs-string union mirrors the server's ``ExprSource`` /
+    ``CondSource`` ``#[serde(untagged)]`` (object arm first; a bare string
+    fails the model parse and is taken as legacy).
+    """
+
     op: Literal["evalExpr"] = "evalExpr"
     table: str
     set: str
-    expr: str
+    expr: ValueExpr | str
     # `where` is a Python keyword — field is `where_`, wire alias is explicit.
-    where_: str | None = Field(default=None, alias="where")
+    where_: FilterExpr | str | None = Field(default=None, alias="where")
 
     @model_serializer(mode="wrap")
     def _drop_none_where(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
@@ -234,11 +394,35 @@ class _MigrationBuilder:
         expr: str,
         where: str | None = None,
     ) -> _MigrationBuilder:
-        """Append an ``evalExpr`` directive: evaluate the scoped raw-SQL ``expr``
-        (one table's ``doc`` jsonb, no joins/DDL) and assign the result to ``set``.
-        Optional ``where`` filters the target rows."""
+        """Append a legacy raw-SQL ``evalExpr`` directive (ENH-020 / SEC-107 —
+        deprecated). Evaluate the scoped raw-SQL ``expr`` (one table's ``doc``
+        jsonb, no joins/DDL) and assign the result to ``set``. Optional
+        ``where`` filters the target rows.
+
+        Prefer :meth:`eval_expr_typed` — the typed :class:`ValueExpr` path is
+        the safe form (closed grammar, all literals bound, no injection
+        surface). This legacy string form remains gated to the root
+        ``admin_key`` server-side; the two sources may not mix."""
         # ``model_validate`` for the same reason as ``rename_field`` — ``where``
         # is a Python keyword and can't appear as a constructor keyword arg.
+        self._directives.append(
+            _EvalExpr.model_validate({"table": table, "set": set, "expr": expr, "where": where})
+        )
+        return self
+
+    def eval_expr_typed(
+        self,
+        table: str,
+        set: str,
+        expr: ValueExpr,
+        where: FilterExpr | None = None,
+    ) -> _MigrationBuilder:
+        """Append a typed ``evalExpr`` directive (ENH-020, SEC-107 structural
+        close). The safe path: ``expr`` is a closed :class:`ValueExpr` grammar
+        and ``where`` is an optional typed :class:`FilterExpr`. The two sources
+        may not mix — pass both typed, or use :meth:`eval_expr` for the legacy
+        raw-SQL form (never combine a typed ``expr`` with a legacy ``where``,
+        or vice versa)."""
         self._directives.append(
             _EvalExpr.model_validate({"table": table, "set": set, "expr": expr, "where": where})
         )
@@ -269,5 +453,10 @@ Migration = _MigrationNamespace
 
 # Resolve deferred annotations (``from __future__ import annotations`` makes
 # every annotation a string; ``model_rebuild`` evaluates them so the
-# discriminated-union ``Directive`` schema is fully built before first use).
+# discriminated-union ``Directive`` and ``ValueExpr`` schemas are fully built
+# before first use). ``ValueExpr`` is mutually recursive with ``CaseWhen``
+# (``_ValueCase`` -> ``CaseWhen`` -> ``ValueExpr``); rebuilding ``CaseWhen``
+# first ensures both arms of the cycle resolve, then ``MigrateRequest``
+# cascades through ``Directive`` -> ``_EvalExpr`` -> ``ValueExpr``.
+CaseWhen.model_rebuild()
 MigrateRequest.model_rebuild()

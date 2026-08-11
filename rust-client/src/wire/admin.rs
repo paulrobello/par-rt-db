@@ -410,7 +410,12 @@ pub struct OpEvent {
 /// One schema-migration step. Wire shape mirrors server `migrate::Directive`:
 /// `tag = "op"`, `rename_all = "camelCase"`, `deny_unknown_fields` (the same
 /// shape contract as [`crate::mutation::Step`]). `evalExpr.where_clause` is
-/// renamed to the wire alias `where`.
+/// renamed to the wire alias `where`. ENH-020 (closing SEC-107) made
+/// `evalExpr` dual-accept: `expr` is either a typed [`ValueExpr`] (safe,
+/// all-literals-bound) or a legacy raw-SQL string (deprecated, gated to the
+/// root admin_key); `where` is either a typed [`crate::wire::FilterExpr`] or a
+/// legacy raw-SQL predicate string. The two sources may not mix. See
+/// [`ExprSource`] / [`CondSource`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "camelCase", deny_unknown_fields)]
 pub enum Directive {
@@ -450,14 +455,19 @@ pub enum Directive {
     EvalExpr {
         table: String,
         set: String,
-        expr: String,
-        #[serde(default, rename = "where")]
-        where_clause: Option<String>,
+        /// ENH-020: dual-accept. A typed [`ValueExpr`] (safe, all-literals-bound
+        /// path) or a legacy raw-SQL string (deprecated, gated to the root
+        /// admin_key — the SEC-107 boundary until the string form is removed).
+        expr: ExprSource,
+        /// Dual-accept `where`: a typed [`crate::wire::FilterExpr`] (safe) or a
+        /// legacy raw-SQL predicate string (deprecated, same root-admin gate).
+        #[serde(default, skip_serializing_if = "Option::is_none", rename = "where")]
+        where_clause: Option<CondSource>,
     },
 }
 
-/// Closed set of sound coercions for [`Directive::ChangeType`]. Mirrors
-/// server `migrate::Cast` (camelCase on the wire).
+/// Closed set of sound coercions for [`Directive::ChangeType`] and
+/// [`ValueExpr::Cast`]. Mirrors server `migrate::Cast` (camelCase on the wire).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Cast {
@@ -465,6 +475,117 @@ pub enum Cast {
     ToNumber,
     ToInt64,
     ToBoolean,
+}
+
+/// A closed, typed expression grammar for [`Directive::EvalExpr`]'s backfill
+/// expression (ENH-020 Stage 1, closing SEC-107). Mirrors server
+/// `migrate::ValueExpr` byte-for-byte: `tag = "op"`, camelCase,
+/// `deny_unknown_fields` (the same serde conventions as
+/// [`crate::wire::FilterExpr`]). Every `Literal` compiles to a bound `$n`
+/// placeholder (as jsonb); every `Field` resolves through the table's
+/// `TableDef` and reads `doc->'field'`. There is deliberately **no** subquery
+/// node, no function-call-by-name node, and no raw-SQL escape — the grammar is
+/// closed, so the SEC-107 injection concern cannot arise from a `ValueExpr`
+/// payload. The only way to reach raw SQL is the deprecated
+/// [`ExprSource::Legacy`] source, which remains gated to the root admin_key.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "camelCase", deny_unknown_fields)]
+pub enum ValueExpr {
+    /// A declared field on this table (validated against `TableDef`). Reads
+    /// `doc->'field'` (jsonb). The field must be declared; the write target
+    /// (`EvalExpr.set`) need not be.
+    Field {
+        field: String,
+    },
+    /// Any JSON literal. Bound as `$n::jsonb`, so objects/arrays/null round-trip.
+    Literal {
+        value: serde_json::Value,
+    },
+    /// String concatenation. Postgres `concat(...)`, which ignores NULL args
+    /// (treats them as empty) — wrap operands in `Coalesce` for explicit control.
+    Concat {
+        parts: Vec<ValueExpr>,
+    },
+    /// Numeric arithmetic. Operands are cast to `::numeric`; the result is a
+    /// JSON number via the surrounding `to_jsonb`. Division by zero errors at
+    /// runtime — guard with `Case`/`Coalesce` when the divisor may be zero.
+    Add {
+        left: Box<ValueExpr>,
+        right: Box<ValueExpr>,
+    },
+    Sub {
+        left: Box<ValueExpr>,
+        right: Box<ValueExpr>,
+    },
+    Mul {
+        left: Box<ValueExpr>,
+        right: Box<ValueExpr>,
+    },
+    Div {
+        left: Box<ValueExpr>,
+        right: Box<ValueExpr>,
+    },
+    /// `COALESCE(parts...)` — first non-null, or NULL.
+    Coalesce {
+        parts: Vec<ValueExpr>,
+    },
+    /// Text casing / trim. Operand cast to `::text`.
+    Lower {
+        value: Box<ValueExpr>,
+    },
+    Upper {
+        value: Box<ValueExpr>,
+    },
+    Trim {
+        value: Box<ValueExpr>,
+    },
+    /// A closed scalar coercion. Reuses [`Directive::ChangeType`]'s [`Cast`].
+    Cast {
+        value: Box<ValueExpr>,
+        to: Cast,
+    },
+    /// Current timestamp (`now()`), as jsonb.
+    Now,
+    /// Conditional: first matching `when`'s `then`, else `otherwise`. Each
+    /// `when` is a [`crate::wire::FilterExpr`] (field references schema-
+    /// validated, values bound).
+    Case {
+        whens: Vec<CaseWhen>,
+        otherwise: Box<ValueExpr>,
+    },
+}
+
+/// One branch of [`ValueExpr::Case`]. Wire shape `{ when, then }`. Mirrors
+/// server `migrate::CaseWhen` (camelCase, `deny_unknown_fields`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CaseWhen {
+    pub when: crate::wire::FilterExpr,
+    pub then: ValueExpr,
+}
+
+/// Dual-accept source for [`Directive::EvalExpr`]'s `expr`: a typed
+/// [`ValueExpr`] (the safe path) or a legacy raw-SQL string (the deprecated
+/// path, gated to root admin_key). `#[serde(untagged)]` tries `Typed` first; a
+/// string fails `ValueExpr` (an internally-tagged object) and falls through to
+/// `Legacy`. A hostile object that is not a valid `ValueExpr` fails both arms
+/// and is rejected — it does NOT silently become legacy. Mirrors server
+/// `migrate::ExprSource`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ExprSource {
+    Typed(ValueExpr),
+    Legacy(String),
+}
+
+/// Dual-accept source for [`Directive::EvalExpr`]'s `where`: a typed
+/// [`crate::wire::FilterExpr`] or a legacy raw-SQL predicate string. Same
+/// untagged discipline as [`ExprSource`]. Mirrors server `migrate::CondSource`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum CondSource {
+    Typed(crate::wire::FilterExpr),
+    Legacy(String),
 }
 
 /// Borrowed HTTP body for `POST /admin/db/{db}/migrate`. Mirrors server
