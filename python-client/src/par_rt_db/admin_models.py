@@ -4,7 +4,8 @@ The canonical home of the camelCase-on-the-wire / snake_case-in-Python response
 models used by every admin-bearing client (sync/async × data-plane/admin).
 Formerly defined in :mod:`par_rt_db.http_client`, these were moved out so the
 canonical admin module (:mod:`par_rt_db.admin`) no longer depends on the module
-it supersedes — see the layering note at ``AUDIT.md`` [ARC-108].
+it supersedes (ARC-108 collapsed the four duplicated admin model definitions into
+this one home).
 
 :mod:`par_rt_db.http_client` and :mod:`par_rt_db.aio_http_client` re-import
 these names so every existing ``from par_rt_db.http_client import X`` continues
