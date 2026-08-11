@@ -9,7 +9,9 @@
 mod common;
 
 use common::{env, setup};
-use par_rt_db_client::{ErrorCode, Mutation, Order, RtDbHttpClient, StepResult, TableQuery};
+use par_rt_db_client::{
+    ErrorCode, Mutation, Order, RtDbAdminClient, RtDbHttpClient, StepResult, TableQuery,
+};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -83,7 +85,7 @@ async fn admin_control_plane() {
     let Some((url, admin_key)) = env() else {
         return;
     };
-    let admin = RtDbHttpClient::new(&url, "", &admin_key);
+    let admin = RtDbAdminClient::new(&url, &admin_key);
     let new_db = format!("t{}", common::uuid_v7());
 
     admin.create_db(&new_db).await.unwrap();

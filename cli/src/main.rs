@@ -14,7 +14,7 @@
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
 use par_rt_db_client::{
-    MigrateRequestOwned, Query, RtDbError, RtDbHttpClient, SchemaDef, Transaction,
+    MigrateRequestOwned, Query, RtDbAdminClient, RtDbError, RtDbHttpClient, SchemaDef, Transaction,
 };
 use std::path::PathBuf;
 
@@ -285,13 +285,11 @@ async fn run_migrate(cli: &Cli, file: &PathBuf, dry_run_flag: bool) -> Result<()
     Ok(())
 }
 
-/// Build a client for an admin subcommand. The admin key is the bearer; the
-/// per-db field is unused by every admin endpoint (`push_schema` / `mint_token`
-/// carry `db` as a method arg, and `list_dbs` / `create_db` / `revoke_token`
-/// ignore it), so it's left empty.
-fn admin_client(cli: &Cli) -> Result<RtDbHttpClient> {
+/// Build a client for an admin subcommand (ARC-121: admin control plane now
+/// has its own `RtDbAdminClient` type). The admin key is the sole bearer.
+fn admin_client(cli: &Cli) -> Result<RtDbAdminClient> {
     let admin_key = require_admin(cli)?;
-    Ok(RtDbHttpClient::new(&cli.url, "", &admin_key))
+    Ok(RtDbAdminClient::new(&cli.url, &admin_key))
 }
 
 /// Build a client for a data-plane subcommand (`query` / `mutate`): machine

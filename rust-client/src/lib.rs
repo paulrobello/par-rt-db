@@ -45,6 +45,9 @@ pub mod schema;
 pub mod wire;
 
 #[cfg(feature = "admin")]
+pub mod admin;
+
+#[cfg(feature = "admin")]
 pub mod migration;
 
 #[cfg(feature = "http")]
@@ -70,6 +73,9 @@ pub use wire::{
 
 #[cfg(feature = "http")]
 pub use http::{Fit, OutFormat, RtDbHttpClient, TransformOpts};
+
+#[cfg(feature = "admin")]
+pub use admin::RtDbAdminClient;
 
 #[cfg(feature = "in_memory")]
 pub use in_memory::{InMemoryRtDbClient, PresenceHandle, PresenceRooms};

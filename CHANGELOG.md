@@ -172,6 +172,7 @@ that is the authoritative parity contract.
 - **`GET /admin/config`** is structurally redacted — `admin_key`, OAuth secrets, and `database_url` are exposed as configured-bools only, never values.
 - **C collation** — Postgres database uses deterministic C collation, eliminating collation-version warnings and making index ordering deterministic.
 - **OAuth callback HTML** — strict origin validator + interpolation escaping (security hardening).
+- **rust-client: `RtDbAdminClient` extracted** (ARC-121) — the admin control-plane methods (`/admin/*`) moved off `RtDbHttpClient` into a dedicated [`RtDbAdminClient`](rust-client/src/admin.rs) type, mirroring `ts-client`'s and `python`'s split between data plane and control plane. **Non-breaking:** every admin method remains on `RtDbHttpClient` as a `#[deprecated(note = "use RtDbAdminClient")]` thin delegation to the new type, so existing consumers (including the `rtdb` CLI, which migrated to `RtDbAdminClient` directly) keep compiling. Migrate by calling `RtDbHttpClient::admin_client()` (shares the connection pool) and invoking the same-named method on the returned `RtDbAdminClient`.
 
 ### Security
 
