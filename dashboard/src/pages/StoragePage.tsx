@@ -1,3 +1,4 @@
+/** File storage browser — list blobs, inspect metadata, and preview on-the-fly image transforms. */
 import { useCallback, useEffect, useRef, useState } from "react";
 import { appendImageParams, type TransformOpts } from "@par-rt-db/client";
 import { Button, Placard, Spinner } from "../components/ui";

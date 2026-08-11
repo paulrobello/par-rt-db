@@ -1,3 +1,13 @@
+//! Committer — the correctness core. Each database owns one committer task that
+//! serializes ALL writes, then — before dequeuing the next message — re-runs
+//! affected subscriptions, diffs against the last pushed value, and pushes only
+//! on change. This serialization is load-bearing: `execute_txn`/`execute_query`
+//! run READ COMMITTED with no row locking, so every durable write must pass
+//! through here. Handles four request arms — `RunMutate`, `RunScheduled`,
+//! `RunMigrate`, `RunReaper` — and publishes each at the four tap sites
+//! (subscription fan-out, op-feed, audit log, webhooks). Never add a second
+//! writer.
+
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 

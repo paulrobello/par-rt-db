@@ -1,3 +1,11 @@
+//! Configuration — boot-time `Config` (env-sourced, immutable) and
+//! runtime-mutable `HotConfig` (held on `AppState` as `Arc<ArcSwap<HotConfig>>`,
+//! persisted in a single-row `rtdb_config` table). The four hot settings —
+//! `allowed_origins`, `session_ttl_days`, `max_file_size`, `idempotency_ttl_ms`
+//! — swap live via `PATCH /admin/config` with no restart; the `CorsLayer` origin
+//! check re-reads `allowed_origins` per request. `GET /admin/config` is
+//! structurally redacted (secrets surface as configured-bools, never values).
+
 use serde::{Deserialize, Serialize};
 
 use crate::error::RtDbError;

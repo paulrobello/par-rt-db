@@ -1,3 +1,4 @@
+/** Schema viewer and push-schema editor with an additive-only diff preview before apply. */
 import type { SchemaJson } from "@par-rt-db/client";
 import { useCallback, useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";

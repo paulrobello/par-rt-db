@@ -1,3 +1,4 @@
+/** Webhook management — register webhooks and inspect the delivery outbox with retry state. */
 import { useCallback, useEffect, useState } from "react";
 import { Button, Placard, Spinner } from "../components/ui";
 import { useAdmin } from "../lib/admin";

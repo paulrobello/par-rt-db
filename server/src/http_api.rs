@@ -1,3 +1,12 @@
+//! One-shot HTTP API. Query and mutate routes route mutations through
+//! `Committers::mutate` so subscriptions fire regardless of which transport
+//! wrote (the WS handler in `ws` is the other transport, with one shared
+//! vocabulary — see `protocol`). Also carries the storage upload/serve routes,
+//! signed-URL minting, image-transform serving, the admin surface, and
+//! per-machine-token / per-db rate limiting
+//! (`RTDB_RATE_LIMIT_PER_TOKEN_RPM` / `RTDB_RATE_LIMIT_PER_DB_RPM`; over-limit →
+//! 429 `RATE_LIMITED` + `Retry-After`).
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;

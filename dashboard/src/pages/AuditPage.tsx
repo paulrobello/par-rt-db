@@ -1,3 +1,4 @@
+/** Durable audit log viewer — filter the optional audit_log by database, op kind, and write source. */
 import { useCallback, useEffect, useState } from "react";
 import { Button, Placard, Spinner } from "../components/ui";
 import { useAdmin } from "../lib/admin";

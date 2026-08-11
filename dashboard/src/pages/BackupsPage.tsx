@@ -1,3 +1,4 @@
+/** Backup and restore — list dumps, trigger a manual pg_dump, and restore into a fresh isolated DB. */
 import { useCallback, useEffect, useState } from "react";
 import { Button, Placard, Spinner } from "../components/ui";
 import { type BackupFile, type RestoreResult, useAdmin } from "../lib/admin";

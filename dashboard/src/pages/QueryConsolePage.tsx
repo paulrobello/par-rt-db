@@ -1,3 +1,4 @@
+/** Ad-hoc query and mutate console — compose JSON DSL and inspect the raw server response. */
 import type { QueryJson, TransactionJson } from "@par-rt-db/client";
 import { useEffect, useState } from "react";
 import { Button, Placard, Spinner } from "../components/ui";

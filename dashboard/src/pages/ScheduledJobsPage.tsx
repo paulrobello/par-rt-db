@@ -1,3 +1,4 @@
+/** Scheduled jobs — create, list, and manage one-shot and cron transactions. */
 import { useCallback, useEffect, useState } from "react";
 import { Button, Placard, Spinner } from "../components/ui";
 import { useAdmin } from "../lib/admin";

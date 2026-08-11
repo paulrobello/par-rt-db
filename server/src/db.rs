@@ -1,3 +1,10 @@
+//! Database lifecycle and shared storage helpers: name validation
+//! (`^[a-z][a-z0-9_]{0,32}$`), id generation (UUIDv7), `now_ms` timestamps, the
+//! per-database schema cache (`SchemaCache`), and the existence check the per-db
+//! tasks (committer, scheduler, reaper, mutation-log cleanup, quota warmer) use
+//! to self-terminate when their database is deleted. Physical names are
+//! lowercased and length-capped in `ddl` to fit Postgres's 63-byte limit.
+
 use std::sync::Arc;
 
 use rand::RngCore;

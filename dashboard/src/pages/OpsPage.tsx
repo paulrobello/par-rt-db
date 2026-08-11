@@ -1,3 +1,4 @@
+/** Live op feed — streaming view of durable document mutations across all tap sites. */
 import { Link } from "react-router-dom";
 import { Placard, StatusLamp } from "../components/ui";
 import { useAdmin } from "../lib/admin";

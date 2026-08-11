@@ -174,6 +174,7 @@ class _MigrationBuilder:
         self._dry_run: bool = False
 
     def rename_field(self, table: str, from_: str, to: str) -> _MigrationBuilder:
+        """Append a ``renameField`` directive: rename field ``from_`` to ``to`` on ``table``."""
         # ``model_validate`` (not direct construction) because ``from`` is a Python
         # keyword: pydantic's pyright plugin surfaces the wire alias ``from`` as the
         # constructor keyword, which can't be expressed in Python syntax. The dict
@@ -184,6 +185,7 @@ class _MigrationBuilder:
         return self
 
     def rename_table(self, from_: str, to: str) -> _MigrationBuilder:
+        """Append a ``renameTable`` directive: rename table ``from_`` to ``to``."""
         self._directives.append(_RenameTable.model_validate({"from": from_, "to": to}))
         return self
 
@@ -195,24 +197,33 @@ class _MigrationBuilder:
         cast: Cast,
         default: Any | None = None,
     ) -> _MigrationBuilder:
+        """Append a ``changeType`` directive: coerce ``field`` on ``table`` to the
+        new type ``to`` via ``cast`` (one of :class:`Cast`). ``default``
+        substitutes for un-coercible values; without it a single bad row rolls the
+        whole migrate back atomically."""
         self._directives.append(
             _ChangeType(table=table, field=field, to=to, cast=cast, default=default)
         )
         return self
 
     def drop_field(self, table: str, field: str) -> _MigrationBuilder:
+        """Append a ``dropField`` directive: remove ``field`` from ``table``'s schema."""
         self._directives.append(_DropField(table=table, field=field))
         return self
 
     def drop_table(self, name: str) -> _MigrationBuilder:
+        """Append a ``dropTable`` directive: drop table ``name``."""
         self._directives.append(_DropTable(name=name))
         return self
 
     def drop_index(self, table: str, name: str) -> _MigrationBuilder:
+        """Append a ``dropIndex`` directive: drop index ``name`` from ``table``."""
         self._directives.append(_DropIndex(table=table, name=name))
         return self
 
     def set_default(self, table: str, field: str, value: Any) -> _MigrationBuilder:
+        """Append a ``setDefault`` directive: stamp ``field`` on ``table`` with
+        ``value`` for rows that currently lack it."""
         self._directives.append(_SetDefault(table=table, field=field, value=value))
         return self
 
@@ -223,6 +234,9 @@ class _MigrationBuilder:
         expr: str,
         where: str | None = None,
     ) -> _MigrationBuilder:
+        """Append an ``evalExpr`` directive: evaluate the scoped raw-SQL ``expr``
+        (one table's ``doc`` jsonb, no joins/DDL) and assign the result to ``set``.
+        Optional ``where`` filters the target rows."""
         # ``model_validate`` for the same reason as ``rename_field`` — ``where``
         # is a Python keyword and can't appear as a constructor keyword arg.
         self._directives.append(
@@ -231,10 +245,13 @@ class _MigrationBuilder:
         return self
 
     def dry_run(self, dry_run: bool = True) -> _MigrationBuilder:
+        """Set the ``dryRun`` flag so :meth:`build` produces a preview-only
+        request (the server returns the report + derived schema without writing)."""
         self._dry_run = dry_run
         return self
 
     def build(self) -> MigrateRequest:
+        """Materialize the :class:`MigrateRequest` from the accumulated directives."""
         return MigrateRequest(directives=list(self._directives), dry_run=self._dry_run)
 
 

@@ -77,6 +77,9 @@ _AUTH_DEADLINE = 15.0
 
 
 class ConnectionState(StrEnum):
+    """Driver connection state machine: ``IDLE`` → ``CONNECTING`` → ``CONNECTED``
+    (or ``RECONNECTING`` on a drop) → ``CLOSED``."""
+
     IDLE = "idle"
     CONNECTING = "connecting"
     CONNECTED = "connected"
@@ -86,6 +89,8 @@ class ConnectionState(StrEnum):
 
 @dataclass
 class ClientStatus:
+    """Snapshot of the driver state returned by :meth:`RtDbClient.status`."""
+
     state: ConnectionState
     user: AuthedUser | None = None
 
@@ -240,6 +245,8 @@ class RtDbClient:
         self._presence_by_room: dict[str, _PresenceRoom] = {}
 
     def status(self) -> ClientStatus:
+        """Return the current connection state and authenticated user (``None``
+        before the first ``authOk``)."""
         return ClientStatus(self._state, self._user)
 
     async def connect(self) -> None:
@@ -249,6 +256,8 @@ class RtDbClient:
             self._task = asyncio.create_task(self._drive())
 
     async def close(self) -> None:
+        """Cancel the driver and mark the client ``CLOSED``. Rejects all pending
+        mutations and schedule ops and tears down the socket. Idempotent."""
         self._closed = True
         self._generation += 1
         self._ws = None
@@ -561,6 +570,12 @@ class RtDbClient:
     async def mutate(
         self, txn: Transaction, *, idempotency_key: str | None = None
     ) -> list[StepResult]:
+        """Submit ``txn`` for at-most-once execution. Sends immediately when
+        connected, otherwise queues and flushes on the next ``authOk``. With
+        ``optimistic_updates=True`` each matching subscription is overlaid before
+        dispatch and reconciled by the next ``queryUpdate``. Returns the per-step
+        results in order. ``idempotency_key`` opts into server-side dedup of a
+        retried mutate."""
         self._counter += 1
         mid = f"mut-{self._counter}"
         txn_dict = txn.model_dump(by_alias=True, mode="json")
@@ -584,18 +599,24 @@ class RtDbClient:
         # else: queued; ``_flush_on_auth`` sends it on the next authOk.
 
     async def schedule(self, txn: Transaction, when: ScheduleWhen) -> str:
+        """Schedule ``txn`` to run at ``when`` (a one-shot deadline or a cron
+        expression). Returns the new schedule's id."""
         return await self._sched_op("schedule", txn=txn, when=when)  # type: ignore[return-value]
 
     async def cancel_schedule(self, id: str) -> None:
+        """Cancel the scheduled job with ``id``."""
         await self._sched_op("cancel", id=id)
 
     async def pause_schedule(self, id: str) -> None:
+        """Pause the scheduled job with ``id`` (resumed via :meth:`resume_schedule`)."""
         await self._sched_op("pause", id=id)
 
     async def resume_schedule(self, id: str) -> None:
+        """Resume a previously paused scheduled job by ``id``."""
         await self._sched_op("resume", id=id)
 
     async def list_schedules(self) -> list[ScheduleInfo]:
+        """List the scheduled jobs on this database."""
         return await self._sched_op("list")  # type: ignore[return-value]
 
     async def _sched_op(self, kind: str, **fields: Any) -> Any:

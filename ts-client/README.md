@@ -230,7 +230,15 @@ mutations to local state before the server confirms them.
 
 ## Development
 
+The full gate runs from the **repo root** and covers all six packages; the
+integration suite is opt-in and lives under `ts-client/` (these are separate
+Makefiles — `make test-integration` is not a root target):
+
 ```sh
-make checkall          # from the repo root: fmt-check + lint + typecheck + test (all 6 packages)
-make test-integration  # opt-in; needs RTDB_TEST_SERVER_URL + RTDB_TEST_ADMIN_KEY
+# from the repo root — fmt-check + lint + typecheck + test across all six packages
+make checkall
+make env-drift-check   # confirms RTDB_* keys stay in sync across .env.example, compose, and source
+
+# from ts-client/ — opt-in live-server tests; needs RTDB_TEST_SERVER_URL + RTDB_TEST_ADMIN_KEY
+make test-integration
 ```

@@ -1,3 +1,4 @@
+/** Machine-token management — mint and revoke per-database tokens. */
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Button, Placard, Spinner } from "../components/ui";
 import { useAdmin } from "../lib/admin";

@@ -1,3 +1,9 @@
+//! Error model — the `RtDbError` envelope and the `ErrorCode` enum. Every
+//! failure surfaces to clients as `{code, message}`; `ErrorCode` maps to an HTTP
+//! status via `IntoResponse`. Client-facing 500s carry a generic message — never
+//! stringify a sqlx/serde error into the body (log it via `tracing`). The codes
+//! and statuses here are the contract the three client SDKs mirror.
+
 use axum::Json;
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};

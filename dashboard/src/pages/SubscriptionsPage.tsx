@@ -1,3 +1,4 @@
+/** Subscription inspector — live per-database subscriptions with skip/re-run and miss counters. */
 import { useCallback, useEffect, useState } from "react";
 import { Placard, Spinner } from "../components/ui";
 import { useAdmin } from "../lib/admin";

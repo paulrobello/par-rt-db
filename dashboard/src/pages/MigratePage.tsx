@@ -1,3 +1,4 @@
+/** Schema migration console — build directives, dry-run for a diff preview, then apply transactionally. */
 import type {
   DirectiveJson,
   DirectiveReportJson,

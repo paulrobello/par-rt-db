@@ -1,3 +1,4 @@
+/** Hot config viewer/editor — runtime-mutable allowed origins, session TTL, max file size, idempotency window. */
 import { useEffect, useState } from "react";
 import { Button, Placard, Spinner, StatusLamp } from "../components/ui";
 import { useAdmin } from "../lib/admin";

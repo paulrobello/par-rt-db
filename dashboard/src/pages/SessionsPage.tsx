@@ -1,3 +1,4 @@
+/** Active session management — list and revoke OAuth and anonymous sessions across the instance. */
 import { useCallback, useEffect, useState } from "react";
 import { Button, Placard, Spinner } from "../components/ui";
 import { useAdmin } from "../lib/admin";

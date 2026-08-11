@@ -1,3 +1,12 @@
+//! Schema DSL — `FieldType` (15 variants), `IndexDef` (btree / full-text search
+//! / vector), `TtlDef`, `TableDef` (fields, indexes, per-row `ownerField`/
+//! `collaboratorsField`/`authorize`, `ttl`), and `SchemaDef`. Wire shapes use
+//! `#[serde(tag = "type", rename_all = "camelCase", deny_unknown_fields)]` and
+//! are mirrored field-for-field by the three client SDKs. Validation
+//! (`validate_doc`/`validate_value`/`validate_filter_expr_fields`) is shared with
+//! the read and write paths; the index-value typing here must stay aligned with
+//! `ddl` (one typed column per indexed field). Schema changes are additive-only.
+
 use std::collections::{BTreeMap, HashSet};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};

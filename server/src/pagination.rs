@@ -1,3 +1,8 @@
+//! Cursor pagination primitives — base64 encode/decode of the sort-key array
+//! `[index values..., created_at, id]`. Cursors are opaque to clients and
+//! round-tripped by the `paginate` terminal in `query`; `created_at`/`id` are
+//! appended to make the ordering total so a paged scan is stable under writes.
+
 use crate::error::RtDbError;
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use serde_json::Value;

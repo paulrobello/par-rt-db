@@ -1,3 +1,4 @@
+/** Schema history — browse past pushed schemas and diff them against the current one. */
 import type { SchemaHistoryEntry, SchemaHistoryEntrySummary, SchemaJson } from "@par-rt-db/client";
 import { useCallback, useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";

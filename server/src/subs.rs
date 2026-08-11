@@ -1,3 +1,15 @@
+//! Subscription manager — live-query registration, invalidation, and fan-out.
+//!
+//! Runs inside the committer's serialized turn so a push never observes a
+//! partial write. Each subscription records a `ReadSet` (point / indexed /
+//! ordered) used to skip re-runs soundly when a written document provably cannot
+//! affect the result; any doubt over-approximates to re-run. Two safety nets
+//! guard the skip logic: an exhaustive `cmp_binds` match (a new `EqBind` variant
+//! is a compile error, not a silent under-approximation) and the
+//! `RTDB_SUBS_VERIFY_SKIP_EVERY` shadow-verify probe. `distinct`/`aggregate`/
+//! `search`/`vector`/`hybrid` stay table-level by design — their results depend
+//! on member values or a ranking function.
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};

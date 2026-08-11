@@ -1,3 +1,13 @@
+//! Transaction execution — the write path. A `Transaction` is an ordered list of
+//! steps (`Insert`/`Patch`/`Replace`/`Delete`/`ExpectVersion`/`ExpectAbsent`/
+//! `Upsert`) plus the predicate-driven bulk steps `PatchByQuery`/`DeleteByQuery`.
+//! Executes READ COMMITTED with no row locking and MUST run inside the
+//! committer's serialized turn (never call `execute_txn` outside it). Row
+//! visibility composes the client filter with `ownerField`/`collaboratorsField`/
+//! `authorize` so an interactive caller touches only rows it could read;
+//! `MAX_STEPS` (1024) bounds step count and `MAX_BY_QUERY_ROWS` (1000) bounds
+//! rows per by-query step.
+
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 

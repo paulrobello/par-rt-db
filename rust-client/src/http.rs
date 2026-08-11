@@ -505,6 +505,10 @@ impl RtDbHttpClient {
         self.deserialize::<FileMetadata>(resp).await
     }
 
+    /// Mint an HMAC-signed, time-limited public URL for `id` via
+    /// `GET /api/storage/{db}/{id}/signed-url`. Pass `ttl_seconds` to override
+    /// the server default lifetime; `None` omits the query parameter. Unlike
+    /// [`get_url`](Self::get_url), this makes a network request.
     pub async fn get_signed_url(
         &self,
         id: &str,

@@ -1,3 +1,4 @@
+/** Server metrics dashboard — request rates, subscription skip/re-run counters, and sparkline trends. */
 import type { ReactNode } from "react";
 import { Sparkline } from "../components/Sparkline";
 import { LiveValue, Placard, Spinner, StatusLamp } from "../components/ui";

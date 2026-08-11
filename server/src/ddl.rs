@@ -1,3 +1,10 @@
+//! Schema-to-Postgres DDL compilation. A pushed `SchemaDef` compiles to typed
+//! table DDL — one typed column per indexed field plus the `doc` jsonb column —
+//! and `CREATE [UNIQUE] INDEX` (optionally partial via a `where` predicate), plus
+//! the generated tsvector and vector columns for `search`/`vector` indexes.
+//! Identifier quoting and the 63-byte physical-name cap live here: every
+//! identifier is validated and double-quoted, every value is bound via `$n`.
+
 use std::collections::{BTreeSet, HashSet};
 
 use sqlx::PgPool;

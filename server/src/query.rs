@@ -1,3 +1,13 @@
+//! Read path — query compilation and execution. Compiles a `Query` (terminal +
+//! index/range/filter/order) into SQL against the typed index columns, merging
+//! the `doc` jsonb with system fields at read time. Terminals: `get`, `collect`,
+//! `first`, `unique`, `count`, `distinct`, `aggregate` (sum/avg/min/max/count),
+//! `paginate`, and the ranked `search`/`vectorSearch`/`hybridSearch`. Read
+//! visibility composes the client filter with the per-row authorization
+//! predicates (`ownerField`/`collaboratorsField`/`authorize`) and the
+//! `FilterExpr` variants those share. `MAX_TAKE` (4096) bounds result/group
+//! counts — scale via `paginate`, not larger collects.
+
 use std::cmp::Ordering;
 
 use sqlx::PgPool;

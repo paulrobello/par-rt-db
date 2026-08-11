@@ -1,3 +1,4 @@
+/** Single-database overview — stats, quota/usage, and links into schema, data, and storage. */
 import { useEffect, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { Button, Placard, Spinner } from "../components/ui";

@@ -139,42 +139,56 @@ class TableQuery:
     # --- builder methods (return self) ---
 
     def get(self, id_: str) -> TableQuery:
+        """Point-read terminal: read a single document by id. Mutually exclusive
+        with every other terminal (enforced at build time)."""
         self._get = id_
         return self
 
     def with_index(self, index: str) -> TableQuery:
+        """Select the index to scan; the eq prefix and range bounds apply to its
+        fields in declared order."""
         self._index = index
         return self
 
     def eq(self, *values: Any) -> TableQuery:
+        """Equality prefix on the index fields, one value per field in declared order."""
         self._eq = list(values)
         return self
 
     def gt(self, v: Any) -> TableQuery:
+        """Strict-greater-than range bound on the next index field after the eq prefix."""
         self._gt = v
         return self
 
     def gte(self, v: Any) -> TableQuery:
+        """Greater-than-or-equal range bound on the next index field after the eq prefix."""
         self._gte = v
         return self
 
     def lt(self, v: Any) -> TableQuery:
+        """Strict-less-than range bound on the next index field after the eq prefix."""
         self._lt = v
         return self
 
     def lte(self, v: Any) -> TableQuery:
+        """Less-than-or-equal range bound on the next index field after the eq prefix."""
         self._lte = v
         return self
 
     def order(self, direction: Literal["asc", "desc"]) -> TableQuery:
+        """Sort direction (``"asc"`` or ``"desc"``) for the ordered terminals
+        (``take``/``first``/``paginate``)."""
         self._order = direction
         return self
 
     def take(self, n: int) -> TableQuery:
+        """Cap results to the first ``n`` matching rows (``collect``/``unique`` terminal)."""
         self._take = n
         return self
 
     def filter(self, f: FilterExpr) -> TableQuery:
+        """Apply a ``FilterExpr`` predicate over document fields. Mutually exclusive
+        with ``search``/``vector_search``/``hybrid_search``."""
         self._filter = f
         return self
 
@@ -243,21 +257,27 @@ class TableQuery:
     # --- terminals ---
 
     def collect(self) -> TableQuery:
+        """Collect terminal (the default): return all matching rows as a list."""
         return self
 
     def unique(self) -> TableQuery:
+        """``unique`` terminal: de-duplicate matching rows by the index field value."""
         self._unique = True
         return self
 
     def first(self) -> TableQuery:
+        """``first`` terminal: return the first matching row, or ``None``."""
         self._first = True
         return self
 
     def count(self) -> TableQuery:
+        """``count`` terminal: return the number of matching rows."""
         self._count = True
         return self
 
     def distinct(self) -> TableQuery:
+        """``distinct`` terminal: return the unique values of the index field
+        after the eq prefix."""
         self._distinct = True
         return self
 
@@ -278,6 +298,9 @@ class TableQuery:
         return self
 
     def paginate(self, *, cursor: str | None = None, num_items: int) -> TableQuery:
+        """``paginate`` terminal: return a page of ``num_items`` rows starting after
+        the opaque ``cursor`` (``None`` for the first page). The result carries a
+        ``next_cursor`` that is ``None`` once exhausted."""
         self._paginate = _Paginate.model_validate({"cursor": cursor, "numItems": num_items})
         return self
 
@@ -340,24 +363,30 @@ class TableQuery:
 
     # test affordances mirroring rust's typed terminals
     def build_for_count(self) -> Query:
+        """Set the ``count`` terminal then build."""
         self._count = True
         return self.build()
 
     def build_for_first(self) -> Query:
+        """Set the ``first`` terminal then build."""
         self._first = True
         return self.build()
 
     def build_for_unique(self) -> Query:
+        """Set the ``unique`` terminal then build."""
         self._unique = True
         return self.build()
 
     def build_for_distinct(self) -> Query:
+        """Set the ``distinct`` terminal then build."""
         self._distinct = True
         return self.build()
 
     def build_for_aggregate(
         self, op: Literal["sum", "avg", "min", "max", "count"], *, group_by: bool = False
     ) -> Query:
+        """Set the ``aggregate`` terminal then build. See :meth:`aggregate` for
+        op/grouping semantics."""
         self.aggregate(op, group_by=group_by)
         return self.build()
 

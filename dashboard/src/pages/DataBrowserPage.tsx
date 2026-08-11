@@ -1,3 +1,4 @@
+/** Live data browser — subscribe to a table, paginate via cursor, and render each row's cells. */
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import type { SchemaJson, TransactionJson } from "@par-rt-db/client";

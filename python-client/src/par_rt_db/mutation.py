@@ -247,26 +247,35 @@ class _MutationBuilder:
         self._steps: list[Step] = []
 
     def insert(self, table: str, doc: dict[str, Any]) -> _MutationBuilder:
+        """Insert step: create a new document in ``table``. The server assigns
+        ``id``/``created_at``."""
         self._steps.append(_Insert(table=table, doc=doc))
         return self
 
     def patch(self, table: str, id: str, fields: dict[str, Any]) -> _MutationBuilder:
+        """Patch step: merge ``fields`` into the existing document at ``id`` in ``table``."""
         self._steps.append(_Patch(table=table, id=id, fields=fields))
         return self
 
     def replace(self, table: str, id: str, doc: dict[str, Any]) -> _MutationBuilder:
+        """Replace step: overwrite the document at ``id`` in ``table`` with ``doc``."""
         self._steps.append(_Replace(table=table, id=id, doc=doc))
         return self
 
     def delete(self, table: str, id: str) -> _MutationBuilder:
+        """Delete step: remove the document at ``id`` in ``table``."""
         self._steps.append(_Delete(table=table, id=id))
         return self
 
     def expect_version(self, table: str, id: str, version: int) -> _MutationBuilder:
+        """Expect-version precondition: the transaction aborts unless the
+        document at ``id`` is currently at ``version``."""
         self._steps.append(_ExpectVersion(table=table, id=id, version=version))
         return self
 
     def expect_absent(self, table: str, index: str, eq: list[Any]) -> _MutationBuilder:
+        """Expect-absent precondition: the transaction aborts unless no document
+        matches the ``index``/``eq`` equality prefix."""
         self._steps.append(_ExpectAbsent(table=table, index=index, eq=eq))
         return self
 
@@ -278,6 +287,8 @@ class _MutationBuilder:
         insert: dict[str, Any],
         patch: dict[str, Any],
     ) -> _MutationBuilder:
+        """Upsert step: if a document matches the ``index``/``eq`` prefix, apply
+        ``patch``; otherwise insert ``insert``."""
         self._steps.append(
             _Upsert(
                 table=table,
@@ -296,6 +307,9 @@ class _MutationBuilder:
         patch: dict[str, Any],
         limit: int | None = None,
     ) -> _MutationBuilder:
+        """Patch-by-query step: merge ``patch`` into every document in ``table``
+        matching ``filter``. ``limit`` caps the affected rows (default
+        ``MAX_BY_QUERY_ROWS`` server-side); a truncated run reports it."""
         self._steps.append(_PatchByQuery(table=table, filter=filter, patch=patch, limit=limit))
         return self
 
@@ -305,10 +319,15 @@ class _MutationBuilder:
         filter: FilterExpr,
         limit: int | None = None,
     ) -> _MutationBuilder:
+        """Delete-by-query step: remove every document in ``table`` matching
+        ``filter``. ``limit`` caps the affected rows (default
+        ``MAX_BY_QUERY_ROWS`` server-side); a truncated run reports it."""
         self._steps.append(_DeleteByQuery(table=table, filter=filter, limit=limit))
         return self
 
     def build(self) -> Transaction:
+        """Materialize the ``Transaction``, enforcing the client-side
+        ``MAX_STEPS`` cap so an over-cap payload never reaches the wire."""
         if len(self._steps) > MAX_STEPS:
             raise RtDbError(
                 ErrorCode.BAD_REQUEST,

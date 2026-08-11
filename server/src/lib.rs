@@ -1,3 +1,15 @@
+//! par-rt-db server crate — a self-hosted, Convex-inspired realtime document
+//! database (axum/tokio + Postgres 17).
+//!
+//! Clients send a declarative JSON DSL — typed queries and atomic multi-step
+//! transactions — over WebSocket (`/sync`) or one-shot HTTP; one generic server
+//! hosts many named databases. This crate root wires the runtime together:
+//! [`AppState`] (shared DB pool, hot config, caches, rate limiters), the axum
+//! [`build_router`] mounting every route, and static-SPA hosting via
+//! `RTDB_STATIC_DIR`. The committer (`committer`) is the correctness core; the
+//! authoritative design lives in
+//! `docs/superpowers/specs/2026-07-21-par-rt-db-design.md`.
+
 pub mod admin;
 pub mod audit;
 pub mod auth;

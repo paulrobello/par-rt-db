@@ -1,3 +1,4 @@
+/** Admin allowlist management — add and remove OAuth admin members (email / GitHub / GitLab ids). */
 import { useCallback, useEffect, useState } from "react";
 import { Button, Placard, Spinner } from "../components/ui";
 import { useAdmin } from "../lib/admin";

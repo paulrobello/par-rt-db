@@ -1,3 +1,10 @@
+//! Database snapshot and restore over a JSONL wire format. A snapshot is a
+//! leading `schema` line carrying the pushed `SchemaDef`, followed by one `doc`
+//! line per stored document (raw `doc` jsonb plus its `id`/`createdAt`/`version`
+//! columns). Restore replays a snapshot into a fresh database through the normal
+//! `push_schema` + `insert_snapshot_row` path. Distinct from the `pg_dump`-based
+//! backup/restore in `backup` / `admin/backups`.
+
 use sqlx::PgPool;
 
 use crate::db::validate_db_name;

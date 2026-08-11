@@ -1,3 +1,10 @@
+//! Per-database mutation log + idempotency store. Append-only rows back the
+//! op-feed replay window and the `Mutation-Id` dedup table (`store`/`seen` with
+//! a hot-config TTL — see `config::HotConfig::idempotency_ttl_ms`).
+//! `run_cleanup` is the per-db background task that trims old rows; like the
+//! scheduler and reaper it self-terminates when its database is deleted, and it
+//! writes only this side table — never document tables.
+
 use serde_json::Value;
 use sqlx::PgPool;
 

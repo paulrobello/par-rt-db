@@ -281,10 +281,13 @@ class TableBuilder:
         self._authorize: FilterExpr | None = None
 
     def field(self, name: str, ft: Any) -> TableBuilder:
+        """Declare a typed field ``name`` of type ``ft`` (a ``t.*`` constructor dict)."""
         self._fields[name] = ft
         return self
 
     def index(self, name: str, fields: list[str]) -> TableBuilder:
+        """Declare a btree index over ``fields``. Chain ``.unique()`` /
+        ``.where(pred)`` to refine it (see those methods)."""
         self._indexes.append({"name": name, "fields": fields})
         return self
 
@@ -352,6 +355,10 @@ class TableBuilder:
         return self
 
     def owner_field(self, name: str) -> TableBuilder:
+        """Declare the per-row owner field. ``name`` must reference a declared
+        id (or array-of-id) field whose value is the owning user id; the server
+        stamps it on insert and enforces owner-only read/mutate. Round-tripped
+        on the wire as ``ownerField``."""
         self._owner = name
         return self
 
@@ -393,12 +400,16 @@ class SchemaBuilder:
         self._tables: dict[str, dict[str, Any]] = {}
 
     def table(self, name: str, configure: Any) -> SchemaBuilder:
+        """Declare a table named ``name``. ``configure`` is a callable that
+        receives a :class:`TableBuilder` to populate the table's fields,
+        indexes, and per-row options."""
         tb = TableBuilder()
         configure(tb)
         self._tables[name] = tb._build()
         return self
 
     def build(self) -> SchemaDef:
+        """Validate the accumulated tables into a :class:`SchemaDef`."""
         return SchemaDef.model_validate({"tables": self._tables})
 
 
@@ -430,34 +441,42 @@ class _SchemaNamespace:
 
     @staticmethod
     def id(table: str) -> dict[str, Any]:
+        """``Id<Table>`` field referencing documents in ``table`` (a typed ``str``)."""
         return {"type": "id", "table": table}
 
     @staticmethod
     def literal(value: Any) -> dict[str, Any]:
+        """Literal singleton field holding the constant ``value``."""
         return {"type": "literal", "value": value}
 
     @staticmethod
     def optional(inner: Any) -> dict[str, Any]:
+        """Optional field wrapping ``inner`` (a field type); absent values are omitted."""
         return {"type": "optional", "inner": inner}
 
     @staticmethod
     def union(variants: list[Any]) -> dict[str, Any]:
+        """Union of alternative ``variants`` (a list of field types)."""
         return {"type": "union", "variants": variants}
 
     @staticmethod
     def array(element: Any) -> dict[str, Any]:
+        """Array field whose elements are all of type ``element``."""
         return {"type": "array", "element": element}
 
     @staticmethod
     def object(fields: dict[str, Any]) -> dict[str, Any]:
+        """Nested object field mapping each name to a field type."""
         return {"type": "object", "fields": fields}
 
     @staticmethod
     def record(value: Any) -> dict[str, Any]:
+        """Record field: a string-keyed map whose values are all of type ``value``."""
         return {"type": "record", "value": value}
 
     @staticmethod
     def vector(dimensions: int) -> dict[str, Any]:
+        """Embedding vector field of fixed ``dimensions`` (the column a vector index scans)."""
         return {"type": "vector", "dimensions": dimensions}
 
 

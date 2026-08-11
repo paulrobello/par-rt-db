@@ -1,3 +1,4 @@
+/** Database directory — search, create, and open each named database on the instance. */
 import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { Button, Field, LiveValue, Placard } from "../components/ui";
