@@ -362,10 +362,13 @@ async fn webhook_delivery_end_to_end_posts_payload() -> anyhow::Result<()> {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
 
-    // Receiver got exactly one POST matching the payload (other webhooks POST to
-    // their own URLs, never this receiver, so its count is precisely ours).
+    // Receiver got at least one POST matching the payload. Other webhooks POST
+    // to their own URLs, never this receiver, so every entry is ours — but
+    // delivery is at-least-once, so under load the outbox worker may POST more
+    // than once before the row flips to `delivered`. Assert >= 1 and verify the
+    // payload on the first (duplicates are identical).
     let got = received.lock().await.clone();
-    assert_eq!(got.len(), 1, "receiver got exactly one POST");
+    assert!(!got.is_empty(), "receiver got at least one POST");
     let body = &got[0];
     assert_eq!(body["db"], name.as_str());
     assert_eq!(body["table"], "projects");

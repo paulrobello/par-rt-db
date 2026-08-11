@@ -140,8 +140,10 @@ export function SchemaHistoryPage() {
       // "current" side so the diff recomputes (it should be empty).
       try {
         setCurrent(await client.getSchema(db));
-      } catch {
-        /* restore itself succeeded; the list refresh surfaces the new snapshot */
+      } catch (e) {
+        // Restore itself succeeded; the list refresh surfaces the new snapshot.
+        // Surface the failure detail to DevTools (403 vs network) for diagnosis.
+        console.debug("post-restore getSchema failed", e);
       }
     } catch (e) {
       setRestoreError(toDetailError(e));

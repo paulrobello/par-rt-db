@@ -45,8 +45,6 @@ struct Session {
     user: AuthedUser,
     state: serde_json::Value,
     tx: UnboundedSender<ServerMessage>,
-    #[allow(dead_code)] // read in Task 4's broadcast path
-    joined_at: i64,
     updated_at: i64,
     /// Absolute epoch-ms at which `state` should be cleared to null by
     /// `expire_once`. `None` = permanent (no ttl armed). Joins never arm it
@@ -173,7 +171,6 @@ impl PresenceManager {
                 user,
                 state: st,
                 tx,
-                joined_at: now,
                 updated_at: now,
                 expires_at: None,
             },

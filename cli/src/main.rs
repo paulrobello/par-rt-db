@@ -132,120 +132,155 @@ enum SessionsCommand {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    dispatch(&cli).await
+}
+
+/// Route a parsed `Cli` to its subcommand handler. Thin dispatcher so each
+/// subcommand's entry point is individually addressable from tests (the
+/// credential-validation and argument-validation paths return `Err` before any
+/// network I/O, so they are unit-testable without a live server).
+async fn dispatch(cli: &Cli) -> Result<()> {
     match &cli.command {
-        Command::ListDbs => {
-            let c = admin_client(&cli)?;
-            for db in c.list_dbs().await.map_err(map_err)? {
-                println!("{db}");
+        Command::ListDbs => run_list_dbs(cli).await,
+        Command::CreateDb { name } => run_create_db(cli, name).await,
+        Command::CloneDb { from, to } => run_clone_db(cli, from, to).await,
+        Command::PushSchema { file } => run_push_schema(cli, file).await,
+        Command::MintToken { db, name } => run_mint_token(cli, db, name).await,
+        Command::RevokeToken { id } => run_revoke_token(cli, id).await,
+        Command::Sessions { command } => run_sessions(cli, command).await,
+        Command::Query { query } => run_query(cli, query).await,
+        Command::Mutate { txn } => run_mutate(cli, txn).await,
+        Command::Migrate { file, dry_run } => run_migrate(cli, file, *dry_run).await,
+    }
+}
+
+async fn run_list_dbs(cli: &Cli) -> Result<()> {
+    let c = admin_client(cli)?;
+    for db in c.list_dbs().await.map_err(map_err)? {
+        println!("{db}");
+    }
+    Ok(())
+}
+
+async fn run_create_db(cli: &Cli, name: &str) -> Result<()> {
+    let c = admin_client(cli)?;
+    c.create_db(name).await.map_err(map_err)?;
+    eprintln!("created database {name}");
+    Ok(())
+}
+
+async fn run_clone_db(cli: &Cli, from: &str, to: &str) -> Result<()> {
+    let c = admin_client(cli)?;
+    c.clone_db(from, to).await.map_err(map_err)?;
+    eprintln!("cloned database {from} into {to}");
+    Ok(())
+}
+
+async fn run_push_schema(cli: &Cli, file: &PathBuf) -> Result<()> {
+    let db = require_db(cli)?;
+    let json =
+        std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
+    let schema: SchemaDef = serde_json::from_str(&json).context("parsing SchemaDef JSON")?;
+    let c = admin_client(cli)?;
+    c.push_schema(&db, &schema).await.map_err(map_err)?;
+    eprintln!("pushed schema to {db}");
+    Ok(())
+}
+
+async fn run_mint_token(cli: &Cli, db: &str, name: &str) -> Result<()> {
+    let c = admin_client(cli)?;
+    let minted = c.mint_token(db, name).await.map_err(map_err)?;
+    // `MintedToken` is response-only (Deserialize), so rebuild the wire
+    // shape `{tokenId, token}` for output.
+    let out = serde_json::json!({ "tokenId": minted.token_id, "token": minted.token });
+    println!("{}", serde_json::to_string_pretty(&out)?);
+    Ok(())
+}
+
+async fn run_revoke_token(cli: &Cli, id: &str) -> Result<()> {
+    let c = admin_client(cli)?;
+    c.revoke_token(id).await.map_err(map_err)?;
+    eprintln!("revoked token {id}");
+    Ok(())
+}
+
+async fn run_sessions(cli: &Cli, command: &SessionsCommand) -> Result<()> {
+    match command {
+        SessionsCommand::List { user, limit } => {
+            let c = admin_client(cli)?;
+            let opts = par_rt_db_client::SessionListOptions {
+                user: user.clone(),
+                limit: limit.as_ref().map(|n| *n as i64),
+            };
+            let rows = c.list_sessions(Some(&opts)).await.map_err(map_err)?;
+            for s in &rows {
+                let email = s.email.as_deref().unwrap_or("-");
+                let kind = if s.anonymous { "anon" } else { "user" };
+                println!(
+                    "{}\t{}\t{}\t{}\texp={}",
+                    s.token_hash, s.user_id, kind, email, s.expires_at
+                );
             }
+            eprintln!("{} session(s)", rows.len());
         }
-        Command::CreateDb { name } => {
-            let c = admin_client(&cli)?;
-            c.create_db(name).await.map_err(map_err)?;
-            eprintln!("created database {name}");
-        }
-        Command::CloneDb { from, to } => {
-            let c = admin_client(&cli)?;
-            c.clone_db(from, to).await.map_err(map_err)?;
-            eprintln!("cloned database {from} into {to}");
-        }
-        Command::PushSchema { file } => {
-            let db = require_db(&cli)?;
-            let json = std::fs::read_to_string(file)
-                .with_context(|| format!("reading {}", file.display()))?;
-            let schema: SchemaDef =
-                serde_json::from_str(&json).context("parsing SchemaDef JSON")?;
-            let c = admin_client(&cli)?;
-            c.push_schema(&db, &schema).await.map_err(map_err)?;
-            eprintln!("pushed schema to {db}");
-        }
-        Command::MintToken { db, name } => {
-            let c = admin_client(&cli)?;
-            let minted = c.mint_token(db, name).await.map_err(map_err)?;
-            // `MintedToken` is response-only (Deserialize), so rebuild the wire
-            // shape `{tokenId, token}` for output.
-            let out = serde_json::json!({ "tokenId": minted.token_id, "token": minted.token });
-            println!("{}", serde_json::to_string_pretty(&out)?);
-        }
-        Command::RevokeToken { id } => {
-            let c = admin_client(&cli)?;
-            c.revoke_token(id).await.map_err(map_err)?;
-            eprintln!("revoked token {id}");
-        }
-        Command::Sessions { command } => {
-            let c = admin_client(&cli)?;
-            match command {
-                SessionsCommand::List { user, limit } => {
-                    let opts = par_rt_db_client::SessionListOptions {
-                        user: user.clone(),
-                        limit: limit.as_ref().map(|n| *n as i64),
-                    };
-                    let rows = c.list_sessions(Some(&opts)).await.map_err(map_err)?;
-                    for s in &rows {
-                        let email = s.email.as_deref().unwrap_or("-");
-                        let kind = if s.anonymous { "anon" } else { "user" };
-                        println!(
-                            "{}\t{}\t{}\t{}\texp={}",
-                            s.token_hash, s.user_id, kind, email, s.expires_at
-                        );
-                    }
-                    eprintln!("{} session(s)", rows.len());
+        SessionsCommand::Revoke { token_hash, user } => {
+            // Validate the flag combination before acquiring a client so an
+            // arg error is surfaced (and is testable) without credentials.
+            let target = resolve_revoke_target(token_hash.as_deref(), user.as_deref())?;
+            let c = admin_client(cli)?;
+            match target {
+                RevokeTarget::TokenHash(hash) => {
+                    c.revoke_session(&hash).await.map_err(map_err)?;
+                    eprintln!("revoked session {hash}");
                 }
-                SessionsCommand::Revoke { token_hash, user } => match (token_hash, user) {
-                    (Some(hash), None) => {
-                        c.revoke_session(hash).await.map_err(map_err)?;
-                        eprintln!("revoked session {hash}");
-                    }
-                    (None, Some(uid)) => {
-                        let r = c.revoke_user_sessions(uid).await.map_err(map_err)?;
-                        eprintln!("revoked {} session(s) for user {uid}", r.revoked);
-                    }
-                    (Some(_), Some(_)) => {
-                        anyhow::bail!("--token-hash and --user are mutually exclusive");
-                    }
-                    (None, None) => {
-                        anyhow::bail!("sessions revoke requires --token-hash or --user");
-                    }
-                },
+                RevokeTarget::User(uid) => {
+                    let r = c.revoke_user_sessions(&uid).await.map_err(map_err)?;
+                    eprintln!("revoked {} session(s) for user {uid}", r.revoked);
+                }
             }
         }
-        Command::Query { query } => {
-            let db = require_db(&cli)?;
-            let token = require_token(&cli)?;
-            let json = read_json_arg(query)?;
-            let q: Query = serde_json::from_str(&json).context("parsing Query JSON")?;
-            let c = data_client(&cli, &db, &token);
-            let result: serde_json::Value = c.run(q).await.map_err(map_err)?;
-            println!("{}", serde_json::to_string_pretty(&result)?);
-        }
-        Command::Mutate { txn } => {
-            let db = require_db(&cli)?;
-            let token = require_token(&cli)?;
-            let json = read_json_arg(txn)?;
-            let t: Transaction = serde_json::from_str(&json).context("parsing Transaction JSON")?;
-            let c = data_client(&cli, &db, &token);
-            let results = c.mutate(&t, None).await.map_err(map_err)?;
-            println!("{}", serde_json::to_string_pretty(&results)?);
-        }
-        Command::Migrate { file, dry_run } => {
-            let db = require_db(&cli)?;
-            let json = std::fs::read_to_string(file)
-                .with_context(|| format!("reading {}", file.display()))?;
-            let req: MigrateRequestOwned =
-                serde_json::from_str(&json).context("parsing migrate JSON")?;
-            // CLI flag forces dry-run on; a `dryRun: true` in the file is also
-            // honored so a checked-in preview request can't be silently applied.
-            let dry_run = *dry_run || req.dry_run;
-            let c = admin_client(&cli)?;
-            let result = c
-                .migrate_schema(&db, &req.directives, dry_run)
-                .await
-                .map_err(map_err)?;
-            println!("{}", serde_json::to_string_pretty(&result)?);
-            if !result.applied {
-                eprintln!("dry-run only — nothing applied (re-run without --dry-run to apply)");
-            }
-        }
+    }
+    Ok(())
+}
+
+async fn run_query(cli: &Cli, query: &str) -> Result<()> {
+    let db = require_db(cli)?;
+    let token = require_token(cli)?;
+    let json = read_json_arg(query)?;
+    let q: Query = serde_json::from_str(&json).context("parsing Query JSON")?;
+    let c = data_client(cli, &db, &token);
+    let result: serde_json::Value = c.run(q).await.map_err(map_err)?;
+    println!("{}", serde_json::to_string_pretty(&result)?);
+    Ok(())
+}
+
+async fn run_mutate(cli: &Cli, txn: &str) -> Result<()> {
+    let db = require_db(cli)?;
+    let token = require_token(cli)?;
+    let json = read_json_arg(txn)?;
+    let t: Transaction = serde_json::from_str(&json).context("parsing Transaction JSON")?;
+    let c = data_client(cli, &db, &token);
+    let results = c.mutate(&t, None).await.map_err(map_err)?;
+    println!("{}", serde_json::to_string_pretty(&results)?);
+    Ok(())
+}
+
+async fn run_migrate(cli: &Cli, file: &PathBuf, dry_run_flag: bool) -> Result<()> {
+    let db = require_db(cli)?;
+    let json =
+        std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
+    let req: MigrateRequestOwned = serde_json::from_str(&json).context("parsing migrate JSON")?;
+    // CLI flag forces dry-run on; a `dryRun: true` in the file is also
+    // honored so a checked-in preview request can't be silently applied.
+    let dry_run = dry_run_flag || req.dry_run;
+    let c = admin_client(cli)?;
+    let result = c
+        .migrate_schema(&db, &req.directives, dry_run)
+        .await
+        .map_err(map_err)?;
+    println!("{}", serde_json::to_string_pretty(&result)?);
+    if !result.applied {
+        eprintln!("dry-run only — nothing applied (re-run without --dry-run to apply)");
     }
     Ok(())
 }
@@ -302,6 +337,26 @@ fn map_err(e: RtDbError) -> anyhow::Error {
         .and_then(|v| v.as_str().map(str::to_string))
         .unwrap_or_else(|| format!("{:?}", e.code));
     anyhow!("{code}: {}", e.message)
+}
+
+/// Which session(s) `sessions revoke` should target, resolved from the
+/// `--token-hash` / `--user` flags by [`resolve_revoke_target`].
+#[derive(Debug)]
+enum RevokeTarget {
+    TokenHash(String),
+    User(String),
+}
+
+/// Resolve `sessions revoke` flags into a single target. `--token-hash` and
+/// `--user` are mutually exclusive; at least one is required. Pure validation
+/// extracted from the handler so it is unit-testable without a server.
+fn resolve_revoke_target(token_hash: Option<&str>, user: Option<&str>) -> Result<RevokeTarget> {
+    match (token_hash, user) {
+        (Some(hash), None) => Ok(RevokeTarget::TokenHash(hash.to_string())),
+        (None, Some(uid)) => Ok(RevokeTarget::User(uid.to_string())),
+        (Some(_), Some(_)) => Err(anyhow!("--token-hash and --user are mutually exclusive")),
+        (None, None) => Err(anyhow!("sessions revoke requires --token-hash or --user")),
+    }
 }
 
 #[cfg(test)]
@@ -594,5 +649,163 @@ mod tests {
             std::env::remove_var("RTDB_DB");
             std::env::remove_var("RTDB_TOKEN");
         }
+    }
+
+    /// Build a `Cli` with the given command and no credentials. Used to verify
+    /// each subcommand fails fast (credential or arg validation) before network.
+    fn cli_with_command(command: Command) -> Cli {
+        Cli {
+            url: "http://x".into(),
+            db: None,
+            token: None,
+            admin_key: None,
+            command,
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_admin_subcommands_error_without_admin_key() {
+        // Each admin subcommand fails at the credential gate (require_admin)
+        // before any network I/O when no admin key is supplied.
+        assert!(dispatch(&cli_with_command(Command::ListDbs)).await.is_err());
+        assert!(
+            dispatch(&cli_with_command(Command::CreateDb { name: "d".into() }))
+                .await
+                .is_err()
+        );
+        assert!(
+            dispatch(&cli_with_command(Command::CloneDb {
+                from: "a".into(),
+                to: "b".into()
+            }))
+            .await
+            .is_err()
+        );
+        assert!(
+            dispatch(&cli_with_command(Command::MintToken {
+                db: "d".into(),
+                name: "n".into()
+            }))
+            .await
+            .is_err()
+        );
+        assert!(
+            dispatch(&cli_with_command(Command::RevokeToken { id: "t1".into() }))
+                .await
+                .is_err()
+        );
+        assert!(
+            dispatch(&cli_with_command(Command::Sessions {
+                command: SessionsCommand::List {
+                    user: None,
+                    limit: None
+                }
+            }))
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_push_schema_and_migrate_require_db() {
+        // push-schema and migrate need --db before they reach the admin gate;
+        // both error before any network when --db is absent.
+        assert!(
+            dispatch(&cli_with_command(Command::PushSchema {
+                file: "schema.json".into()
+            }))
+            .await
+            .is_err()
+        );
+        assert!(
+            dispatch(&cli_with_command(Command::Migrate {
+                file: "mig.json".into(),
+                dry_run: false
+            }))
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_query_and_mutate_require_db_and_token() {
+        // data-plane subcommands need both --db and --token; error without them.
+        assert!(
+            dispatch(&cli_with_command(Command::Query {
+                query: r#"{"table":"x"}"#.into()
+            }))
+            .await
+            .is_err()
+        );
+        assert!(
+            dispatch(&cli_with_command(Command::Mutate {
+                txn: r#"{"steps":[]}"#.into()
+            }))
+            .await
+            .is_err()
+        );
+        // With --db but no --token, still errors (require_token fires).
+        let with_db_no_token = Cli {
+            url: "http://x".into(),
+            db: Some("d".into()),
+            token: None,
+            admin_key: None,
+            command: Command::Query {
+                query: r#"{"table":"x"}"#.into(),
+            },
+        };
+        assert!(dispatch(&with_db_no_token).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn dispatch_sessions_revoke_validates_flag_combination() {
+        // resolve_revoke_target fires before the credential gate, so the arg
+        // validation is reachable (and its specific error surfaces) without a key.
+        let neither = cli_with_command(Command::Sessions {
+            command: SessionsCommand::Revoke {
+                token_hash: None,
+                user: None,
+            },
+        });
+        let err = dispatch(&neither).await.unwrap_err().to_string();
+        assert!(
+            err.contains("requires --token-hash or --user"),
+            "got: {err}"
+        );
+
+        let both = cli_with_command(Command::Sessions {
+            command: SessionsCommand::Revoke {
+                token_hash: Some("h".into()),
+                user: Some("u".into()),
+            },
+        });
+        let err = dispatch(&both).await.unwrap_err().to_string();
+        assert!(err.contains("mutually exclusive"), "got: {err}");
+    }
+
+    #[test]
+    fn resolve_revoke_target_token_hash_only() {
+        let t = resolve_revoke_target(Some("abc"), None).unwrap();
+        assert!(matches!(t, RevokeTarget::TokenHash(h) if h == "abc"));
+    }
+
+    #[test]
+    fn resolve_revoke_target_user_only() {
+        let t = resolve_revoke_target(None, Some("uid")).unwrap();
+        assert!(matches!(t, RevokeTarget::User(u) if u == "uid"));
+    }
+
+    #[test]
+    fn resolve_revoke_target_both_is_error() {
+        let err = resolve_revoke_target(Some("h"), Some("u"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("mutually exclusive"), "got: {err}");
+    }
+
+    #[test]
+    fn resolve_revoke_target_neither_is_error() {
+        let err = resolve_revoke_target(None, None).unwrap_err().to_string();
+        assert!(err.contains("requires"), "got: {err}");
     }
 }

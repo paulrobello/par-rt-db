@@ -91,8 +91,10 @@ export function AdminProvider({ children }: { children: ReactNode }) {
     const loadDbs = async () => {
       try {
         setDatabases(await client.listDbs());
-      } catch {
-        /* outages surface via the stream's connection state */
+      } catch (e) {
+        // Outages surface via the stream's connection state; surface the detail
+        // (e.g. 403 vs network) to DevTools so an operator can distinguish them.
+        console.debug("listDbs failed", e);
       }
     };
 

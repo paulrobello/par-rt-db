@@ -141,8 +141,10 @@ export function SessionProvider({ children }: { children: ReactNode }) {
       const endpoint = method === "oauth" ? "/auth/logout" : "/admin/logout";
       try {
         await fetch(endpoint, { method: "POST" });
-      } catch {
-        /* best-effort */
+      } catch (e) {
+        // Best-effort: local state clears regardless. Surface the failure to
+        // DevTools so a 403 (already-revoked) is distinguishable from a network drop.
+        console.debug("signOut request failed", e);
       }
     }
     setMethod(null);
