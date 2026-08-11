@@ -10,7 +10,7 @@
 
 ## ✅ All actionable audit items resolved
 
-Every one of the 133 audit findings is either **resolved** (≈125) or **explicitly deferred with a documented rationale** (8). The entire SECURITY domain (40/40), the bulk of architecture, all code-quality, and the documentation sweep landed gate-green.
+Every one of the 133 audit findings is either **resolved** (≈126) or **explicitly deferred with a documented rationale** (7). The entire SECURITY domain (40/40), the bulk of architecture (incl. ARC-102 step 4 idle reclamation), all code-quality, and the documentation sweep landed gate-green.
 
 ### Security — COMPLETE (40/40)
 All 4 Criticals, 12 High, 14 Medium, 10 Low. Highlights: SEC-101 stored XSS, SEC-102 Microsoft nOAuth (sub+tid + JWKS), SEC-103/105/106/107/117/118/119/120/121/122, admin route_layer + CSRF + revocable sessions, webhook DNS-pin + HMAC signing, container hardening, the lot. *(SEC-128 http_api.rs:60 deliberately skipped — client-facing 400 for the client's own malformed payload.)*
@@ -34,18 +34,28 @@ The orchestrator gate caught+fixed inline: a Phase 2A scheduler regression, an A
 
 ---
 
-## Explicitly deferred (8 items, with rationale)
+## Backlog status
 
-| Item | Why deferred |
-|------|--------------|
-| ARC-102 step 4 (idle-db reclamation) | Needs JoinHandle registry + ACK round-trip; steps 1-3 + Shutdown (ARC-125) landed |
-| ARC-114 upsert hoist | Microsoft (sub+tid)/GitHub/Apple diverge post-SEC-102; a unified upsert risks the SEC-102 regression. Shared client + Template Method (the uniform parts) done |
-| ARC-123 useAsync per-page | Each page's loading contract differs; force-applying would change semantics. Hook extracted + useLiveTable stream-driven |
-| QA-002R guard-block collapse | The residual cc is the combination-validation cascade (not a terminal arm); flagged follow-up |
-| SEC-107 least-priv Postgres role | evalExpr runs inside the committer tx; a scoped connection can't share it. Root-admin gate (SEC-107) closes the exposure; SET LOCAL ROLE is the future approach |
-| SEC-102 wiremock e2e | wiremock is GitHub-only in this repo; identity logic unit-tested |
-| DOC2-033 plan-side | Plan files are historical implementation guides; line numbers reference plan-writing-time state |
-| ARC-132 WebhooksPage | Watch-only (the audit's own designation); no action |
+**Closed — no further action (7).** These deferred items are accepted as-shipped
+(rationale recorded; not backlog):
+
+- **ARC-114** (OAuth upsert hoist) — providers diverge post-SEC-102; shared client + Template Method done, unifying the upsert would reopen SEC-102.
+- **ARC-123** (`useAsync` per-page) — hook extracted, `useLiveTable` stream-driven; per-page force-application changes semantics.
+- **QA-002R** (guard-block collapse) — residual cc is the combination-validation cascade, not a terminal arm.
+- **SEC-107** (least-priv Postgres role for `evalExpr`) — can't share the committer tx; root-admin gate closes the exposure.
+- **SEC-102** (wiremock e2e) — wiremock is GitHub-only here; identity logic unit-tested.
+- **DOC2-033** (plan-side line numbers) — plan files are historical guides.
+- **ARC-132** (WebhooksPage split) — watch-only by the audit's own designation.
+
+**Remaining open (0).** ARC-102 step 4 (idle-database reclamation) is now
+shipped: `Committers` tracks a per-db `last_activity` on every client touch, and
+a server-wide background sweep (`RTDB_DB_IDLE_RECLAIM_SECS`, default 0 = off)
+retires a database's five per-db tasks once it has had no client activity for
+that long AND has no live subscriptions AND no pending scheduled jobs. Reclaim
+marks the entry `draining` + enqueues the existing `Shutdown`; `channel_for`
+waits for a draining entry to clear before spawning a fresh task, so the new
+committer starts only after the old one is dead — preserving the single-writer
+invariant. The audit backlog is now empty.
 
 ---
 

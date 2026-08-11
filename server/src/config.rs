@@ -224,6 +224,16 @@ pub struct Config {
     /// reader; boot-only (not hot-reloadable) because the cache lives outside
     /// `HotConfig` and is rebuilt from `AppState` on its own cadence.
     pub quota_cache_ttl_secs: u64,
+    /// RTDB_DB_IDLE_RECLAIM_SECS (default 0 = disabled). When non-zero, a
+    /// background sweep retires a database's five per-db tasks (committer +
+    /// scheduler + mutation-log cleanup + TTL reaper + quota warmer) once it has
+    /// had no client activity for this long AND has no live subscriptions AND no
+    /// pending scheduled jobs (ARC-102 step 4). Steps 1–3 already gate each
+    /// poller's per-tick work, so an idle db's steady-state cost is near zero;
+    /// reclamation additionally releases the task slots and channel entries. The
+    /// next request respawns the tasks on demand. 0 preserves today's behavior
+    /// (tasks live for the process once spawned). Boot-only (not hot-reloadable).
+    pub db_idle_reclaim_secs: u64,
     /// RTDB_ADMIN_RATE_LIMIT_PER_IP_RPM (default 0 = unlimited). Per-IP fixed-
     /// window rate limit on `POST /admin/login` (SEC-109) — without it, an
     /// attacker can brute-force the admin key unbounded over the public
@@ -488,6 +498,11 @@ impl Config {
         // Quota counter cache TTL (ENH-011). 0 = no caching.
         let quota_cache_ttl_secs = env_parsed("RTDB_QUOTA_CACHE_TTL_SECS", 60u64)?;
 
+        // ARC-102 step 4: idle-database reclamation threshold. 0 = disabled
+        // (default); a non-zero value retires a db's per-db tasks once it has
+        // been client-idle this long with no live subs and no pending jobs.
+        let db_idle_reclaim_secs = env_parsed("RTDB_DB_IDLE_RECLAIM_SECS", 0u64)?;
+
         // SEC-109: per-IP rate limit on `POST /admin/login`. 0 = unlimited
         // (the default), preserving today's behavior.
         let admin_rate_limit_per_ip_rpm = env_parsed("RTDB_ADMIN_RATE_LIMIT_PER_IP_RPM", 0u32)?;
@@ -562,6 +577,7 @@ impl Config {
             anonymous_session_ttl_days,
             anonymous_rate_limit_per_ip_rpm,
             quota_cache_ttl_secs,
+            db_idle_reclaim_secs,
             admin_rate_limit_per_ip_rpm,
             cookie_secure,
         })

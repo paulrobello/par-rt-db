@@ -125,6 +125,10 @@ services:
       RTDB_MAX_SUBS_PER_DB: ${RTDB_MAX_SUBS_PER_DB:-0}
       # Quota counter cache TTL (0 = no caching).
       RTDB_QUOTA_CACHE_TTL_SECS: ${RTDB_QUOTA_CACHE_TTL_SECS:-60}
+      # Idle-database reclamation (ARC-102 step 4). 0 = disabled (default): a
+      # db's per-db tasks live for the process once spawned. Non-zero retires a
+      # db's tasks after this many idle seconds with no subs and no pending jobs.
+      RTDB_DB_IDLE_RECLAIM_SECS: ${RTDB_DB_IDLE_RECLAIM_SECS:-0}
       RTDB_GITHUB_BASE_URL: ${RTDB_GITHUB_BASE_URL:-https://github.com}
       RTDB_GITHUB_API_URL: ${RTDB_GITHUB_API_URL:-https://api.github.com}
       RTDB_GITLAB_BASE_URL: ${RTDB_GITLAB_BASE_URL:-https://gitlab.com}

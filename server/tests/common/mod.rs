@@ -73,6 +73,7 @@ pub fn test_config() -> Config {
         anonymous_session_ttl_days: 1,
         anonymous_rate_limit_per_ip_rpm: 0,
         quota_cache_ttl_secs: 60,
+        db_idle_reclaim_secs: 0,
         admin_rate_limit_per_ip_rpm: 0,
         cookie_secure: false,
     }
@@ -200,6 +201,21 @@ pub async fn test_state_with_skip_verification(every: u64) -> Arc<AppState> {
 pub async fn test_state_with_ttl_sweep(secs: u64) -> Arc<AppState> {
     let mut config = test_config();
     config.ttl_sweep_interval_secs = secs;
+    let pool = sqlx::PgPool::connect(&config.database_url)
+        .await
+        .expect("connect to test postgres");
+    db::bootstrap(&pool).await.expect("bootstrap rtdb_auth");
+    AppState::new(pool, config, test_hot())
+}
+
+/// Like `test_state` but with idle-database reclamation enabled at `secs`
+/// (default is 0 = disabled). Used by `tests/idle_reclaim_test.rs` so the
+/// reclamation sweep + `Committers::reclaim_idle_once` act within the test's
+/// window. Mirrors the `test_state_with_ttl_sweep` override pattern.
+#[allow(dead_code)]
+pub async fn test_state_with_idle_reclaim(secs: u64) -> Arc<AppState> {
+    let mut config = test_config();
+    config.db_idle_reclaim_secs = secs;
     let pool = sqlx::PgPool::connect(&config.database_url)
         .await
         .expect("connect to test postgres");

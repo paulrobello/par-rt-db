@@ -190,7 +190,12 @@ impl AppState {
             metrics.clone(),
             quotas.clone(),
             config.quota_cache_ttl_secs,
+            config.db_idle_reclaim_secs,
         );
+        // ARC-102 step 4: spawn the server-wide idle-reclamation sweep. A no-op
+        // when `db_idle_reclaim_secs` is 0 (the default), so a server that does
+        // not opt in pays zero background cost.
+        committers.spawn_idle_reclaimer();
         // Image transform cache shares the same `Arc<Metrics>` as Runtime and
         // the committers so its hit/miss/error counters surface on the dashboard.
         // Built before the struct literal so `metrics` can still move into Runtime.

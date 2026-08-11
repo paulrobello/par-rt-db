@@ -334,6 +334,7 @@ async fn one_shot_fires_and_writes() {
         Metrics::new(),
         Arc::new(quota::UsageCache::new()),
         60,
+        0,
     );
 
     // Schedule a one-shot due in the past so it fires on the scheduler's first
@@ -386,6 +387,7 @@ async fn cron_fires_and_stays_pending() {
         Metrics::new(),
         Arc::new(quota::UsageCache::new()),
         60,
+        0,
     );
 
     // `* * * * *` = every minute. Scheduled due in the past, so it fires once
@@ -443,6 +445,7 @@ async fn failing_cron_reschedules_anyway() {
         Metrics::new(),
         Arc::new(quota::UsageCache::new()),
         60,
+        0,
     );
 
     // A cron whose txn FAILS every fire: `ExpectVersion` against a document
@@ -519,6 +522,7 @@ async fn one_shot_catches_up_after_being_past_due() {
         Metrics::new(),
         Arc::new(quota::UsageCache::new()),
         60,
+        0,
     );
 
     // Warm the committer+scheduler up FIRST so the per-db scheduler loop is
@@ -567,6 +571,7 @@ async fn cron_skips_missed_windows() {
         Metrics::new(),
         Arc::new(quota::UsageCache::new()),
         60,
+        0,
     );
 
     // `* * * * *` (every minute) with due_at ~1 hour in the past. A naive
@@ -646,6 +651,7 @@ async fn failing_txn_marks_error_one_shot() {
         Metrics::new(),
         Arc::new(quota::UsageCache::new()),
         60,
+        0,
     );
 
     // A one-shot whose txn is set up to FAIL: step 1 inserts a doc, step 2 is

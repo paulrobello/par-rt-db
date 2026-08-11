@@ -112,7 +112,33 @@ pub struct Committers {
     metrics: Arc<Metrics>,
     quotas: Arc<crate::quota::UsageCache>,
     quota_cache_ttl_secs: u64,
-    channels: Arc<Mutex<HashMap<String, mpsc::Sender<CommitterRequest>>>>,
+    /// 0 = idle reclamation off (default, preserves today's behavior — a db's
+    /// tasks live for the process once spawned). When non-zero, a background
+    /// sweep retires per-db committers whose last client activity is older than
+    /// this and which hold no live subscriptions and no pending scheduled jobs
+    /// (ARC-102 step 4). See `reclaim_idle_once` / `spawn_idle_reclaimer`.
+    idle_threshold: std::time::Duration,
+    channels: Arc<Mutex<HashMap<String, ChannelEntry>>>,
+}
+
+/// One entry in the per-db channel map: the committer's sender plus the last
+/// time a client request touched this database (ARC-102 step 4). `last_activity`
+/// is refreshed on every `channel_for` hit, so it reflects client demand — a db
+/// whose only activity is its pollers ticking (and finding nothing to do) reads
+/// as idle and is reclaimable. Monotonic `Instant`, not wall-clock, so the idle
+/// comparison is immune to clock jumps.
+struct ChannelEntry {
+    sender: mpsc::Sender<CommitterRequest>,
+    last_activity: std::time::Instant,
+    /// Set by the idle-reclaim sweep when it has enqueued `Shutdown` for this
+    /// db's committer. A `channel_for` caller that finds a draining entry must
+    /// NOT use its sender (the task is exiting) — it waits for the supervisor
+    /// to clear the entry on the task's exit, then spawns a fresh task. This is
+    /// what keeps the single-writer invariant intact across idle reclamation:
+    /// the new committer can start only after the old one is dead (ARC-102
+    /// step 4). `drop_db` does not need this — it deletes the db, so a
+    /// concurrent `channel_for` misses `database_exists` and never respawns.
+    draining: bool,
 }
 
 impl Committers {
@@ -130,6 +156,7 @@ impl Committers {
         metrics: Arc<Metrics>,
         quotas: Arc<crate::quota::UsageCache>,
         quota_cache_ttl_secs: u64,
+        idle_reclaim_secs: u64,
     ) -> Self {
         Self {
             pool,
@@ -144,6 +171,7 @@ impl Committers {
             metrics,
             quotas,
             quota_cache_ttl_secs,
+            idle_threshold: std::time::Duration::from_secs(idle_reclaim_secs),
             channels: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -181,8 +209,8 @@ impl Committers {
             let mut guard = self.channels.lock().await;
             guard.remove(db)
         };
-        if let Some(sender) = sender {
-            let _ = sender.try_send(CommitterRequest::Shutdown);
+        if let Some(entry) = sender {
+            let _ = entry.sender.try_send(CommitterRequest::Shutdown);
         }
     }
 
@@ -223,7 +251,7 @@ impl Committers {
             let mut guard = self.channels.lock().await;
             if guard
                 .get(db)
-                .is_some_and(|current| current.same_channel(&sender))
+                .is_some_and(|current| current.sender.same_channel(&sender))
             {
                 guard.remove(db);
             }
@@ -232,90 +260,139 @@ impl Committers {
         Ok(())
     }
 
-    /// Returns `db`'s committer sender, lazily spawning the task on first
-    /// use. No `.await` occurs while `channels` is locked: the cache-hit
-    /// fast path checks and releases the lock immediately; on a miss, the
-    /// lock is dropped before the `database_exists` query, then re-acquired
-    /// to insert (double-checking in case another task won the race and
-    /// already spawned one).
+    /// Returns `db`'s committer sender, lazily spawning the task on first use.
+    /// No `.await` occurs while `channels` is locked: the cache-hit fast path
+    /// checks and releases the lock immediately; on a miss, the lock is dropped
+    /// before the `database_exists` query, then re-acquired to insert
+    /// (double-checking in case another task won the race and already spawned
+    /// one).
+    ///
+    /// ARC-102 step 4: an entry flagged `draining` (the idle-reclaim sweep has
+    /// enqueued `Shutdown`) is NEVER handed out — its task is exiting, so a
+    /// request queued on its sender would either race the shutdown or hang. A
+    /// caller that finds a draining entry waits for the supervisor to clear it
+    /// on the task's exit, then loops to pick up a concurrent respawn or spawn
+    /// one itself. This bounds the loop so a stuck drain surfaces as an error
+    /// instead of a hang, and guarantees the new committer starts only after the
+    /// old one is dead — preserving the single-writer invariant.
     async fn channel_for(&self, db: &str) -> Result<mpsc::Sender<CommitterRequest>, RtDbError> {
-        {
-            let guard = self.channels.lock().await;
-            if let Some(sender) = guard.get(db) {
-                return Ok(sender.clone());
-            }
-        }
-
-        if !database_exists(&self.pool, db).await? {
-            return Err(RtDbError::not_found(format!("database '{db}' not found")));
-        }
-
-        let mut guard = self.channels.lock().await;
-        if let Some(sender) = guard.get(db) {
-            return Ok(sender.clone());
-        }
-
-        let (tx, rx) = mpsc::channel(CHANNEL_BUFFER);
-        let committer_handle = tokio::spawn(run_committer(self.make_ctx(db.to_string()), rx));
-        // SEC-127: supervisor — evicts the cached Sender when the committer
-        // task exits (panic or normal completion), so a dead entry is cleared
-        // immediately rather than lingering until `submit`'s send-failure path
-        // catches up on the next request. The `same_channel` guard avoids
-        // clobbering a concurrent respawn under the same db key.
-        {
-            let db_owned = db.to_string();
-            let channels = Arc::clone(&self.channels);
-            let supervised = tx.clone();
-            tokio::spawn(async move {
-                let _ = committer_handle.await;
-                let mut guard = channels.lock().await;
-                if guard
-                    .get(&db_owned)
-                    .is_some_and(|current| current.same_channel(&supervised))
-                {
-                    guard.remove(&db_owned);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            // Fast path: a live (non-draining) entry. Refresh its idle clock
+            // (ARC-102 step 4) and return. A draining entry falls through to
+            // the wait; an absent entry falls through to the spawn.
+            let mut draining = false;
+            {
+                let mut guard = self.channels.lock().await;
+                if let Some(entry) = guard.get_mut(db) {
+                    if entry.draining {
+                        draining = true;
+                    } else {
+                        entry.last_activity = std::time::Instant::now();
+                        return Ok(entry.sender.clone());
+                    }
                 }
-            });
+            }
+            if draining {
+                if std::time::Instant::now() >= deadline {
+                    return Err(RtDbError::internal(
+                        "committer for database is draining and did not exit in time",
+                    ));
+                }
+                // The supervisor removes the draining entry once the task exits;
+                // retry to either observe its removal (→ spawn) or pick up a
+                // concurrent respawn.
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                continue;
+            }
+
+            // Miss: confirm the db exists, then spawn under the lock with a
+            // double-check (another caller may have spawned while we queried).
+            if !database_exists(&self.pool, db).await? {
+                return Err(RtDbError::not_found(format!("database '{db}' not found")));
+            }
+            let mut guard = self.channels.lock().await;
+            if let Some(entry) = guard.get_mut(db) {
+                if entry.draining {
+                    // Someone marked it draining while we checked existence.
+                    drop(guard);
+                    continue;
+                }
+                entry.last_activity = std::time::Instant::now();
+                return Ok(entry.sender.clone());
+            }
+
+            let (tx, rx) = mpsc::channel(CHANNEL_BUFFER);
+            let committer_handle = tokio::spawn(run_committer(self.make_ctx(db.to_string()), rx));
+            // SEC-127: supervisor — evicts the cached Sender when the committer
+            // task exits (panic or normal completion), so a dead entry is cleared
+            // immediately rather than lingering until `submit`'s send-failure path
+            // catches up on the next request. The `same_channel` guard avoids
+            // clobbering a concurrent respawn under the same db key. For a
+            // draining entry this removal is also the signal a waiting
+            // `channel_for` caller loops on (ARC-102 step 4).
+            {
+                let db_owned = db.to_string();
+                let channels = Arc::clone(&self.channels);
+                let supervised = tx.clone();
+                tokio::spawn(async move {
+                    let _ = committer_handle.await;
+                    let mut guard = channels.lock().await;
+                    if guard
+                        .get(&db_owned)
+                        .is_some_and(|current| current.sender.same_channel(&supervised))
+                    {
+                        guard.remove(&db_owned);
+                    }
+                });
+            }
+            tokio::spawn(scheduler::run_scheduler(
+                self.pool.clone(),
+                db.to_string(),
+                tx.clone(),
+            ));
+            // Per-db dedup-row expiry sweep (ARC-007): owns `mutation_log`'s
+            // periodic DELETE so `mutation_log::check` is a pure SELECT on the
+            // hot path. Exits when the committer channel closes (same lifecycle
+            // signal the scheduler task uses).
+            tokio::spawn(mutation_log::run_cleanup(
+                self.pool.clone(),
+                db.to_string(),
+                tx.clone(),
+            ));
+            // Per-db TTL reaper: enqueues a fire-and-forget `RunReaper` every
+            // `ttl_sweep_interval`; the committer's `handle_reaper` performs the
+            // batch delete inside its serialized turn. Same lifecycle as the
+            // scheduler/cleanup tasks (exits on channel close or db removal).
+            tokio::spawn(crate::reaper::run_reaper(
+                self.pool.clone(),
+                db.to_string(),
+                tx.clone(),
+                self.ttl_sweep_interval,
+                self.schemas.clone(),
+            ));
+            // Per-db storage-quota cache warmer (ARC-004): periodically re-measures
+            // the db's on-disk size off the committer turn so `enforce` is a cheap
+            // stale-read. Same lifecycle as the reaper/cleanup tasks (exits on
+            // channel close or db removal); a no-op tick when no storage cap is set.
+            tokio::spawn(run_quota_warmer(
+                self.pool.clone(),
+                db.to_string(),
+                self.quotas.clone(),
+                self.hot.clone(),
+                std::time::Duration::from_secs(self.quota_cache_ttl_secs),
+                tx.clone(),
+            ));
+            guard.insert(
+                db.to_string(),
+                ChannelEntry {
+                    sender: tx.clone(),
+                    last_activity: std::time::Instant::now(),
+                    draining: false,
+                },
+            );
+            return Ok(tx);
         }
-        tokio::spawn(scheduler::run_scheduler(
-            self.pool.clone(),
-            db.to_string(),
-            tx.clone(),
-        ));
-        // Per-db dedup-row expiry sweep (ARC-007): owns `mutation_log`'s
-        // periodic DELETE so `mutation_log::check` is a pure SELECT on the
-        // hot path. Exits when the committer channel closes (same lifecycle
-        // signal the scheduler task uses).
-        tokio::spawn(mutation_log::run_cleanup(
-            self.pool.clone(),
-            db.to_string(),
-            tx.clone(),
-        ));
-        // Per-db TTL reaper: enqueues a fire-and-forget `RunReaper` every
-        // `ttl_sweep_interval`; the committer's `handle_reaper` performs the
-        // batch delete inside its serialized turn. Same lifecycle as the
-        // scheduler/cleanup tasks (exits on channel close or db removal).
-        tokio::spawn(crate::reaper::run_reaper(
-            self.pool.clone(),
-            db.to_string(),
-            tx.clone(),
-            self.ttl_sweep_interval,
-            self.schemas.clone(),
-        ));
-        // Per-db storage-quota cache warmer (ARC-004): periodically re-measures
-        // the db's on-disk size off the committer turn so `enforce` is a cheap
-        // stale-read. Same lifecycle as the reaper/cleanup tasks (exits on
-        // channel close or db removal); a no-op tick when no storage cap is set.
-        tokio::spawn(run_quota_warmer(
-            self.pool.clone(),
-            db.to_string(),
-            self.quotas.clone(),
-            self.hot.clone(),
-            std::time::Duration::from_secs(self.quota_cache_ttl_secs),
-            tx.clone(),
-        ));
-        guard.insert(db.to_string(), tx.clone());
-        Ok(tx)
     }
 
     /// Executes `txn` on `db` and waits for the fan-out-then-reply cycle to
@@ -422,6 +499,130 @@ impl Committers {
             .await
             .map_err(|_| RtDbError::internal("committer task dropped the reply"))?
     }
+
+    /// Returns true when `db`'s committer task is currently spawned (it has a
+    /// live channel entry). A test/observability seam for idle reclamation
+    /// (ARC-102 step 4): production paths use `submit`/`channel_for`, which
+    /// respawn on demand, so a `false` here is not itself an error.
+    pub async fn is_spawned(&self, db: &str) -> bool {
+        self.channels.lock().await.contains_key(db)
+    }
+
+    /// One idle-reclamation sweep pass (ARC-102 step 4). A no-op when
+    /// `idle_threshold` is zero. Delegates to [`reclaim_idle_pass`]; tests call
+    /// this directly for determinism instead of waiting on the sweep loop's
+    /// cadence.
+    pub async fn reclaim_idle_once(&self) -> usize {
+        reclaim_idle_pass(&self.pool, &self.subs, &self.channels, self.idle_threshold).await
+    }
+
+    /// Spawns the long-lived idle-reclamation sweep for the whole server (one
+    /// task, not per-db). A no-op when `idle_threshold` is zero (the default),
+    /// so an instance that does not opt in pays zero background cost. The sweep
+    /// cadence is `min(idle_threshold, 60s)` so a db is retired within roughly
+    /// one sweep of going idle without spamming the lock on huge thresholds.
+    /// Called once from `AppState::new` after the `Committers` is constructed.
+    pub fn spawn_idle_reclaimer(&self) {
+        if self.idle_threshold.is_zero() {
+            return;
+        }
+        let channels = Arc::clone(&self.channels);
+        let subs = Arc::clone(&self.subs);
+        let pool = self.pool.clone();
+        let threshold = self.idle_threshold;
+        let sweep_interval = threshold.min(std::time::Duration::from_secs(60));
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(sweep_interval);
+            // Skip the immediate first tick — a db just spawned is fresh.
+            tick.tick().await;
+            loop {
+                tick.tick().await;
+                reclaim_idle_pass(&pool, &subs, &channels, threshold).await;
+            }
+        });
+    }
+}
+
+/// One idle-reclamation sweep pass (ARC-102 step 4), factored free so both the
+/// [`Committers::reclaim_idle_once`] test seam and the spawned sweep loop share
+/// one implementation. Returns the number of dbs retired this pass.
+///
+/// Soundness: a db meeting all three gates (stale activity, no live
+/// subscriptions, no pending scheduled jobs) has no outstanding client demand
+/// and no due background work, so retiring its tasks loses nothing — the next
+/// request respawns them via `channel_for`. The eviction re-checks
+/// `last_activity` under the lock so a request that arrived between snapshot and
+/// evict refreshes the clock and survives. The `Shutdown` is enqueued (not
+/// prepended), so it runs behind any in-flight queued work and the single-writer
+/// invariant holds. `scheduler::next_due` gates pending cron/one-shot jobs so a
+/// db with future due work is never reclaimed.
+async fn reclaim_idle_pass(
+    pool: &PgPool,
+    subs: &Arc<SubscriptionManager>,
+    channels: &Arc<Mutex<HashMap<String, ChannelEntry>>>,
+    threshold: std::time::Duration,
+) -> usize {
+    if threshold.is_zero() {
+        return 0;
+    }
+    let now = std::time::Instant::now();
+    // Snapshot stale candidates under the lock; release before the async per-db
+    // checks so a DB query (next_due) never blocks submits.
+    let candidates: Vec<String> = {
+        let guard = channels.lock().await;
+        guard
+            .iter()
+            .filter(|(_, e)| {
+                now.checked_duration_since(e.last_activity)
+                    .is_some_and(|age| age >= threshold)
+            })
+            .map(|(db, _)| db.clone())
+            .collect()
+    };
+    let mut reclaimed = 0;
+    for db in candidates {
+        // Cheap in-memory check first: a db with live subscriptions is not idle
+        // regardless of write activity — the audit's load-bearing guard.
+        if subs.count_for_db(&db).await > 0 {
+            continue;
+        }
+        // A pending (future-due or past-due-unclaimed) scheduled job means the
+        // db has due background work — reclaiming it would stall the cron /
+        // one-shot until the next client request. An error here (transient DB
+        // failure or a concurrently-dropped schema) is treated as "not idle this
+        // pass" — safe, never over-eager.
+        match crate::scheduler::next_due(pool, &db).await {
+            Ok(None) => {}
+            _ => continue,
+        }
+        // Mark the entry draining + enqueue Shutdown, but do NOT remove it.
+        // `channel_for` must not hand out a dying sender (the task is exiting),
+        // so a request arriving during the drain waits for the supervisor to
+        // clear the entry on the task's exit before spawning a fresh task — that
+        // ordering is what keeps the single-writer invariant intact. The
+        // supervisor removes the entry; reclaim never does (ARC-102 step 4).
+        let retire = {
+            let mut guard = channels.lock().await;
+            match guard.get_mut(&db) {
+                Some(entry)
+                    if !entry.draining
+                        && now
+                            .checked_duration_since(entry.last_activity)
+                            .is_some_and(|age| age >= threshold) =>
+                {
+                    entry.draining = true;
+                    Some(entry.sender.clone())
+                }
+                _ => None,
+            }
+        };
+        if let Some(sender) = retire {
+            let _ = sender.try_send(CommitterRequest::Shutdown);
+            tracing::info!(db = %db, "committer: idle database reclaimed (ARC-102)");
+            reclaimed += 1;
+        }
+    }
+    reclaimed
 }
 
 /// Shared, unchanging context for one per-db committer task: the pool, the
