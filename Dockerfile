@@ -23,12 +23,18 @@ COPY cli/Cargo.toml cli/Cargo.toml
 # Dependency layer: compile the whole dependency tree once, cached unless
 # Cargo.toml or Cargo.lock change. Throwaway main/lib so each member package
 # parses, then build the server deps without the real source (next layer).
-RUN mkdir -p server/src rust-client/src cli/src \
+# The rust-client [[test]] entries (ARC-110) name specific test files, which
+# cargo validates at manifest-parse time even when building a different member's
+# --bin — so the stub layer must create empty placeholders for them.
+RUN mkdir -p server/src rust-client/src rust-client/tests cli/src \
     && echo 'fn main() {}' > server/src/main.rs \
     && echo '' > rust-client/src/lib.rs \
     && echo 'fn main() {}' > cli/src/main.rs \
+    && touch rust-client/tests/golden_vector.rs rust-client/tests/query_combinations.rs \
+              rust-client/tests/hot_config_test.rs rust-client/tests/ws_integration.rs \
+              rust-client/tests/http_integration.rs \
     && cargo build --release --locked --manifest-path server/Cargo.toml --bin rtdb-server \
-    && rm -rf server/src
+    && rm -rf server/src rust-client/tests
 # Bake the live git sha into /healthz. The build context has no .git (rsync
 # excludes it), so build.rs falls back to this arg; "unknown" if unset.
 # Declared AFTER the dependency layer so a per-deploy commit change only
