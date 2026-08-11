@@ -34,6 +34,33 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4.2.2
 
+      # Reclaim runner disk before the build. The full debug build of the
+      # server + rust-client test graph (hundreds of `target/debug/deps`
+      # artifacts) plus the `pgvector/pgvector:pg17` Docker pull exhausts the
+      # ubuntu-latest root FS — observed as `rustc-LLVM ERROR: IO failure on
+      # output stream: No space left on device` mid-compile (three consecutive
+      # failures, 2026-08-11). ubuntu-latest ships ~5–7 GB of SDK/toolchain
+      # cruft this workflow never uses (Android, .NET, CodeQL, Haskell, the
+      # apt cache, stale Docker images); removing it head-of-queue prevents
+      # the disk-fill. Manual `rm` (not a third-party action) to keep the
+      # workflow's pinned-action discipline. `df -h` proves the reclamation.
+      - name: Free runner disk space
+        run: |
+          set -x
+          df -h /
+          sudo rm -rf \
+            /usr/local/lib/android \
+            /usr/share/dotnet \
+            /usr/local/share/powershell \
+            /opt/ghc \
+            /usr/local/.ghcup \
+            /usr/local/share/edge_driver \
+            /usr/local/share/gecko_driver \
+            /usr/local/share/chrome_driver
+          sudo apt-get clean
+          sudo docker system prune -af --volumes || true
+          df -h /
+
       # --- Rust (server + rust-client) -------------------------------------
       # edition = "2024" in both Cargo.tomls ⇒ requires stable ≥ 1.85.
       # ARC-120: the root `rust-toolchain.toml` is the single source of truth
