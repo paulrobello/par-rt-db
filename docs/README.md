@@ -15,8 +15,7 @@ contribution.
 - [`../CLAUDE.md`](../CLAUDE.md) — authoritative agent guidance: what the project is, the workspace layout, the invariants the codebase depends on, and how to verify work.
 - [`../CONTRIBUTING.md`](../CONTRIBUTING.md) — development environment, test/lint/format commands, commit and PR conventions, and the pre-commit hook setup.
 - [`../FEATURE_MATRIX.md`](../FEATURE_MATRIX.md) — Convex-parity contract; the source of truth for which features are implemented and mirrored across the four clients.
-- [`../ENHANCEMENTS.md`](../ENHANCEMENTS.md) — **retired.** The enhancement backlog now lives on the project kanban board (tagged `enhancement`); the `ENH-*` ids are preserved there and in `docs/superpowers/plans/*-enh-NNN-*.md` filenames.
-- [`../CHANGELOG.md`](../CHANGELOG.md) — released changes, following [Keep a Changelog](https://keepachangelog.com/).
+- [`../CHANGELOG.md`](../CHANGELOG.md) — released changes, following [Keep a Changelog](https://keepachangelog.com/). The historical enhancement candidate list (`ENHANCEMENTS.md`, ENH-001–022) was retired once all enhancements shipped; the backlog now lives on the project kanban board (tagged `enhancement`), and the `ENH-*` ids are preserved there and in `docs/superpowers/plans/*-enh-NNN-*.md` filenames.
 - [`../DESIGN.md`](../DESIGN.md) — dashboard visual design system and binding design.
 - [`../PRODUCT.md`](../PRODUCT.md) — product framing for the operator console.
 - [`../deploy/README.md`](../deploy/README.md) — production deployment runbook for the lenny2 Docker host (build on the x86_64 host, Cloudflare tunnel, secrets, backups, monitoring, rollback).
