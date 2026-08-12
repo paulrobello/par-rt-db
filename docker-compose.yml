@@ -136,6 +136,14 @@ services:
       RTDB_OTEL_ENDPOINT: ${RTDB_OTEL_ENDPOINT:-http://127.0.0.1:4317}
       RTDB_OTEL_SERVICE_NAME: ${RTDB_OTEL_SERVICE_NAME:-par-rt-db}
       RTDB_OTEL_SAMPLE_RATIO: ${RTDB_OTEL_SAMPLE_RATIO:-0.05}
+      # Cross-instance op-feed fan-out (ENH-022 Stage 2). Off by default —
+      # leave false for single-instance deploys (the default topology). When
+      # true, durable writes emit one pg_notify per DocOp and a per-process
+      # LISTEN task mirrors peer notifications into the local op-feed ring.
+      # RTDB_INSTANCE_ID tags NOTIFY payloads for self-dedupe; empty = auto-
+      # generated. Defaults mirror the server's code defaults.
+      RTDB_MULTI_INSTANCE: ${RTDB_MULTI_INSTANCE:-false}
+      RTDB_INSTANCE_ID: ${RTDB_INSTANCE_ID:-}
       RTDB_GITHUB_BASE_URL: ${RTDB_GITHUB_BASE_URL:-https://github.com}
       RTDB_GITHUB_API_URL: ${RTDB_GITHUB_API_URL:-https://api.github.com}
       RTDB_GITLAB_BASE_URL: ${RTDB_GITLAB_BASE_URL:-https://gitlab.com}

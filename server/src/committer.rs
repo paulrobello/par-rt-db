@@ -125,6 +125,15 @@ pub struct Committers {
     /// this and which hold no live subscriptions and no pending scheduled jobs
     /// (ARC-102 step 4). See `reclaim_idle_once` / `spawn_idle_reclaimer`.
     idle_threshold: std::time::Duration,
+    /// This process's replica id, used to tag cross-instance NOTIFY payloads so
+    /// a receiving instance can skip its own notifications (ENH-022 Stage 2).
+    /// Only meaningful when `multi_instance` is true.
+    instance_id: String,
+    /// When true, `publish_taps` also emits one `pg_notify` per DocOp so peer
+    /// replicas sharing this Postgres see the write in their op-feed rings
+    /// (ENH-022 Stage 2). Default false — a single-instance deploy never calls
+    /// `pg_notify`, so the feature is zero-cost when off.
+    multi_instance: bool,
     channels: Arc<Mutex<HashMap<String, ChannelEntry>>>,
 }
 
@@ -164,6 +173,8 @@ impl Committers {
         quotas: Arc<crate::quota::UsageCache>,
         quota_cache_ttl_secs: u64,
         idle_reclaim_secs: u64,
+        instance_id: String,
+        multi_instance: bool,
     ) -> Self {
         Self {
             pool,
@@ -179,6 +190,8 @@ impl Committers {
             quotas,
             quota_cache_ttl_secs,
             idle_threshold: std::time::Duration::from_secs(idle_reclaim_secs),
+            instance_id,
+            multi_instance,
             channels: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -240,6 +253,8 @@ impl Committers {
             ttl_batch: self.ttl_batch,
             metrics: self.metrics.clone(),
             quotas: self.quotas.clone(),
+            instance_id: self.instance_id.clone(),
+            multi_instance: self.multi_instance,
         }
     }
 
@@ -657,6 +672,14 @@ struct CommitterCtx {
     /// current by a per-db background warmer (`run_quota_warmer`) + the post-commit
     /// refresh. The upload route reads it via `current_usage` (TTL-bounded).
     quotas: Arc<crate::quota::UsageCache>,
+    /// This process's replica id (ENH-022 Stage 2). Tagged onto every NOTIFY
+    /// payload so a receiving instance can skip its own notifications. Only read
+    /// when `multi_instance` is true.
+    instance_id: String,
+    /// When true, `publish_taps` also emits one `pg_notify` per DocOp (ENH-022
+    /// Stage 2). False on a single-instance deploy — the publish tap is
+    /// zero-cost when off.
+    multi_instance: bool,
 }
 
 /// Per-db storage-quota cache warmer (ARC-004). Periodically re-measures the
@@ -885,6 +908,23 @@ async fn publish_taps(
     }
     // Op-feed completeness: every durable document write publishes here.
     ctx.op_feed.publish(&ctx.db, owner, &write_set.ops).await;
+    // ENH-022 Stage 2: cross-instance op-feed fan-out. When `multi_instance` is
+    // on, emit one `pg_notify` per DocOp so peer replicas sharing this Postgres
+    // inject the event into their own rings. Best-effort, like the audit/webhook
+    // taps below — a `pg_notify` failure logs and never fails the committed
+    // write. NOT a second writer: the write already committed inside this
+    // serialized turn; NOTIFY only notifies.
+    if ctx.multi_instance {
+        crate::notify::publish_ops(
+            &ctx.pool,
+            &ctx.instance_id,
+            &ctx.db,
+            owner,
+            source,
+            &write_set.ops,
+        )
+        .await;
+    }
     // Durable audit tap (the persistent counterpart to the op-feed above).
     if ctx.audit_log_enabled
         && let Err(err) =

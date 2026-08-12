@@ -292,6 +292,8 @@ mod tests {
             otel_endpoint: String::new(),
             otel_service_name: String::new(),
             otel_sample_ratio: 0.0,
+            multi_instance: false,
+            instance_id: None,
         };
         assert!(GitlabProvider::from_config(&cfg).is_none());
         cfg.gitlab_client_id = Some("id".into());

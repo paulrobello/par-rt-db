@@ -284,6 +284,23 @@ pub struct Config {
     /// A malformed value fails boot (ARC-118 via `env_parsed`) rather than
     /// silently defaulting.
     pub otel_sample_ratio: f64,
+    // ---- Cross-instance op-feed fan-out (ENH-022 Stage 2) ----
+    // Boot-only. When `multi_instance` is false (the default), the committer
+    // never calls `pg_notify` and `AppState::new` never spawns the LISTEN task
+    // — a single-instance deploy is byte-for-byte unchanged. When true, each
+    // durable DocOp also emits one `pg_notify('rtdb_ops', …)` at the committer's
+    // tap-site, and a per-process LISTEN task mirrors peer notifications into
+    // the local op-feed ring. `instance_id` tags payloads for self-dedupe; an
+    // explicit value is recommended in a multi-replica deploy so a restart
+    // keeps the same id, otherwise one is generated per boot.
+    /// RTDB_MULTI_INSTANCE (default false). Master switch for cross-instance
+    /// op-feed via Postgres LISTEN/NOTIFY. Leave false for single-instance
+    /// deploys (the default topology).
+    pub multi_instance: bool,
+    /// RTDB_INSTANCE_ID (default None = auto-generated). Stable replica id for
+    /// NOTIFY self-dedupe. Set to a distinct value per replica in a multi-
+    /// instance deploy; when unset, `AppState::new` generates a short hex id.
+    pub instance_id: Option<String>,
 }
 
 /// Boot-time env parse for a typed knob (ARC-118, folded with QA-106). Unset
@@ -572,6 +589,15 @@ impl Config {
         };
         let otel_sample_ratio = env_parsed("RTDB_OTEL_SAMPLE_RATIO", 0.05f64)?.clamp(0.0, 1.0);
 
+        // ENH-022 Stage 2: cross-instance op-feed fan-out. Off by default — a
+        // single-instance deploy is the supported topology. `instance_id` is
+        // optional; when unset (or empty), `AppState::new` generates one.
+        let multi_instance = env_bool("RTDB_MULTI_INSTANCE", false);
+        let instance_id = std::env::var("RTDB_INSTANCE_ID")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
         Ok(Self {
             port,
             database_url,
@@ -645,6 +671,8 @@ impl Config {
             otel_endpoint,
             otel_service_name,
             otel_sample_ratio,
+            multi_instance,
+            instance_id,
         })
     }
 }

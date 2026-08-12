@@ -54,12 +54,20 @@ impl OpFeed {
                 ts,
                 owner: owner.clone(),
             };
-            if ring.len() >= self.ring_cap {
-                ring.pop_front();
-            }
-            ring.push_back(event.clone());
-            let _ = self.tx.send(event);
+            push_event(&mut ring, self.ring_cap, &self.tx, event);
         }
+    }
+
+    /// Inject a single pre-built event into the ring + broadcast, WITHOUT
+    /// stamping a new `ts` (the event carries its origin-instance timestamp).
+    /// Used by the cross-instance NOTIFY listener (ENH-022 Stage 2) to replay an
+    /// event a peer replica already published, preserving the original write's
+    /// wall-clock time. Same ring/broadcast semantics as `publish` — this is the
+    /// listener's single entry into the local feed; it performs no write and no
+    /// committer interaction, so the single-writer invariant is intact.
+    pub async fn publish_injected(&self, event: OpEvent) {
+        let mut ring = self.ring.lock().await;
+        push_event(&mut ring, self.ring_cap, &self.tx, event);
     }
 
     /// Recent events (oldest-first), filtered by optional db/table, capped at `n`.
@@ -80,4 +88,21 @@ impl OpFeed {
     pub fn subscribe(&self) -> broadcast::Receiver<OpEvent> {
         self.tx.subscribe()
     }
+}
+
+/// Shared ring-push + broadcast for `publish` and `publish_injected`. Evicts the
+/// oldest entry when the ring is at `ring_cap`, then broadcasts to live
+/// subscribers. A lagged receiver (slower than the broadcast capacity) drops the
+/// event — that subscriber catches up via the ring on its next replay.
+fn push_event(
+    ring: &mut VecDeque<OpEvent>,
+    ring_cap: usize,
+    tx: &broadcast::Sender<OpEvent>,
+    event: OpEvent,
+) {
+    if ring.len() >= ring_cap {
+        ring.pop_front();
+    }
+    ring.push_back(event.clone());
+    let _ = tx.send(event);
 }

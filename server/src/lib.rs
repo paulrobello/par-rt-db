@@ -25,6 +25,7 @@ pub mod image_transform;
 pub mod metrics;
 pub mod migrate;
 pub mod mutation_log;
+pub mod notify;
 pub mod op_feed;
 pub mod pagination;
 pub mod presence;
@@ -71,14 +72,14 @@ use tower_http::trace::TraceLayer;
 /// and the live op-feed tap they publish to. Grouped so handlers that only
 /// need the reactive surface can reach for `state.realtime` as a unit.
 ///
-/// **Instance-local (ARC-126):** `op_feed` and `presence` are in-process maps
-/// with no cross-replica coordination. The op-feed is the dashboard's live
-/// `/admin/stream` tap; presence is the ephemeral per-connection roster. A
-/// second replica behind a load balancer sees neither the other's op events
-/// nor its presence sessions, so live updates and presence silently
-/// half-work (each browser sticks to whichever replica served its
-/// handshake). This server is single-instance by design — see the boot WARN
-/// in `main.rs`. Horizontal scaling (ENH-022) would lift this.
+/// **Op-feed is cross-instance under ENH-022 Stage 2** when
+/// `RTDB_MULTI_INSTANCE=true`: durable writes emit one `pg_notify` per DocOp
+/// and a per-process LISTEN task mirrors peer replicas' notifications into the
+/// local ring. Self-notifications are deduped by `instance_id`, so the
+/// single-publish contract still holds. Presence remains instance-local
+/// (ARC-126, Stage 3): a second replica still sees neither the other's
+/// presence sessions, so a browser's live roster reflects only its own
+/// replica. Rate-limit counters (on `AppState`) remain instance-local too.
 pub struct Realtime {
     pub subs: Arc<SubscriptionManager>,
     pub committers: Committers,
@@ -151,6 +152,10 @@ pub struct AppState {
     /// HMAC key for signing time-limited storage URLs (derived once at boot from
     /// `config.admin_key`). Shared by every request via `Arc`.
     pub signed_url_key: Arc<ring::hmac::Key>,
+    /// This process's replica id (ENH-022 Stage 2). Tags NOTIFY payloads for
+    /// cross-instance op-feed fan-out; auto-generated when `RTDB_INSTANCE_ID` is
+    /// unset. Surfaced for diagnostics + tests.
+    pub instance_id: String,
 }
 
 impl AppState {
@@ -171,6 +176,16 @@ impl AppState {
         // `maxStorageBytesPerDb` on every growing write) and Arc-shared onto
         // `AppState` for the storage/upload paths.
         let quotas = Arc::new(quota::UsageCache::new());
+        // ENH-022 Stage 2: resolve the instance id once. An explicit
+        // RTDB_INSTANCE_ID wins; otherwise generate a short hex id for this
+        // process. The id tags NOTIFY payloads so a receiver can skip its own
+        // notifications (self-dedupe). Generated before the committers so it can
+        // be threaded into `Committers::new`.
+        let instance_id = config
+            .instance_id
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(notify::generate_instance_id);
         let committers = Committers::new(
             pool.clone(),
             subs.clone(),
@@ -185,6 +200,8 @@ impl AppState {
             quotas.clone(),
             config.quota_cache_ttl_secs,
             config.db_idle_reclaim_secs,
+            instance_id.clone(),
+            config.multi_instance,
         );
         // ARC-102 step 4: spawn the server-wide idle-reclamation sweep. A no-op
         // when `db_idle_reclaim_secs` is 0 (the default), so a server that does
@@ -213,6 +230,18 @@ impl AppState {
             // Detach: the flush task runs for the lifetime of the process,
             // self-terminates if it ever errors, and nothing awaits its handle.
             let _handle = presence.clone().run_flush_task();
+        }
+        // ENH-022 Stage 2: cross-instance op-feed LISTEN task. Only spawned when
+        // `RTDB_MULTI_INSTANCE=true` — a single-instance deploy never pays the
+        // `PgListener` connection. Detach like the presence flush: the task runs
+        // for the process lifetime, reconnects on transient Postgres blips, and
+        // self-dedupe is handled inside it via `instance_id`.
+        if config.multi_instance {
+            tokio::spawn(notify::run_listener(
+                pool.clone(),
+                op_feed.clone(),
+                instance_id.clone(),
+            ));
         }
         // ARC-114: one shared HTTP client for every OAuth provider's outbound
         // calls, so logins reuse a warm connection pool instead of building a
@@ -245,6 +274,7 @@ impl AppState {
             image,
             quotas,
             signed_url_key,
+            instance_id,
         })
     }
 }

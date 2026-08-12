@@ -115,6 +115,42 @@ spoofable value is worse than a local one, because now an attacker can evict oth
   the LB supports it).
 - Replace the Stage 0 boot warning with an informational log naming the instance id.
 
+## Writer-funnelling decision *(criterion #7 — settled before Stage 2)*
+
+The single-writer invariant is load-bearing and non-negotiable: `subs.rs` skip-invalidation
+assumes writes to a database are serialized, and the committer is what serializes them. The
+question multi-instance forces is: **with two processes, which one owns the committer for a
+given database?**
+
+**Decision (Stages 1–2):** multi-instance means multiple *readers/connection-holders* behind a
+load balancer, **not** multiple writers for the same database. The writer for a database stays
+funnelled to **one committer owner**. Specifically:
+
+- **Stage 2 adds notification fan-out only — never a second writer.** `publish_taps` emits a
+  `pg_notify('rtdb_ops', …)` after the local `op_feed.publish`, and a per-instance `PgListener`
+  feeds received notifications into its own local op-feed ring. No `execute_txn` call site is
+  added; the NOTIFY path runs *after* commit, inside the existing committer's serialized turn,
+  exactly where the local op-feed/audit/webhook taps already run. A second instance receiving
+  the notification re-publishes it into an in-memory ring — it does not re-execute the write.
+- **The hard problem — guaranteeing one committer owner per db across processes — is explicitly
+  deferred.** `channel_for` spawns a committer per-db-per-process on first request. With two
+  instances both receiving writes to the same db, both would spawn a committer and `execute_txn`
+  would interleave across processes (READ COMMITTED, no cross-process lock) — a correctness
+  catastrophe. A real fix needs a Postgres advisory lock or a lease so the db's committer owner
+  is elected and failover is handled; that is a materially larger design and is **out of scope**
+  for this enhancement (future stage / separate card).
+- **Consequence for safe multi-instance operation:** until write-funnelling lands, a scaled
+  deploy must funnel writes — either sticky-session the `/sync` + `/api/*` write paths to one
+  owner per db, or run the db on exactly one writer instance with the others read-only. The
+  op-feed/presence/rate-limit work in Stages 2–4 is correct and valuable *independent of* the
+  funnelling mechanism: a notification that crosses to an instance that happens not to own that
+  db's writer is harmlessly published into that instance's local ring (and would, once presence
+  ships, reach its own subscribers). Self-notification is deduped by instance id; a cross-talk
+  duplicate into a non-owning instance's ring is a cosmetic extra entry, never a write.
+
+This satisfies criterion #7: the op-feed NOTIFY work in Stage 2 is built on the documented
+decision that writes stay funnelled to one owner, and Stage 2 itself adds no write path.
+
 ## Files to touch
 
 - `server/src/lib.rs` — `AppState`: drop `oauth_states`, add the listener handle + instance id

@@ -165,7 +165,7 @@ impl Step {
 /// The kind of write a step performed on a document. Recorded in `WriteSet.ops`
 /// so downstream consumers (e.g. the activity feed) can stream what happened
 /// without re-deriving it from the step list.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum OpKind {
     Insert,
