@@ -41,17 +41,26 @@
 //! A single-instance deploy is unchanged. `RTDB_INSTANCE_ID` is an optional
 //! stable replica id; when unset, one is generated at boot.
 
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use sqlx::postgres::PgListener;
 
 use crate::db::now_ms;
 use crate::op_feed::{OpEvent, OpFeed};
+use crate::presence::{PresenceManager, PresenceNotifyPayload};
 use crate::txn::{DocOp, OpKind};
 
-/// Postgres NOTIFY channel name. Fixed across every instance — all replicas
-/// LISTEN and NOTIFY on the same channel.
+/// Postgres NOTIFY channel name for op-feed fan-out. Fixed across every
+/// instance — all replicas LISTEN and NOTIFY on the same channel.
 pub const OP_FEED_CHANNEL: &str = "rtdb_ops";
+
+/// Postgres NOTIFY channel name for cross-instance presence gossip
+/// (ENH-022 Stage 3). Fixed across every instance — all replicas LISTEN and
+/// NOTIFY on the same channel. The payload is a [`PresenceNotifyPayload`]:
+/// a full per-room local snapshot. See `presence::gossip_publish`.
+pub const PRESENCE_CHANNEL: &str = "rtdb_presence";
 
 /// One NOTIFY payload per `DocOp`. `camelCase` on the wire for consistency with
 /// `OpEvent`. `instance_id` is the origin replica's id (self-dedupe); `source`
@@ -231,6 +240,104 @@ pub async fn run_listener(pool: PgPool, op_feed: std::sync::Arc<OpFeed>, own_ins
         }
         tracing::warn!(
             "notify listener: connection lost; reconnecting in {:?}",
+            backoff
+        );
+        tokio::time::sleep(backoff).await;
+    }
+}
+
+/// Long-lived LISTEN loop for the `rtdb_presence` channel (ENH-022 Stage 3).
+/// Spawned by `AppState::new` only when BOTH `RTDB_MULTI_INSTANCE` and
+/// `RTDB_PRESENCE_ENABLED` are true. For each notification: decode the
+/// [`PresenceNotifyPayload`], skip self-notifications (the origin instance is
+/// already the source of those members locally), and call
+/// `PresenceManager::ingest_peer_snapshot` to refresh the shadow map entry +
+/// `last_beat` and mark the room dirty so the next flush broadcasts the union.
+///
+/// Performs NO write and NO committer interaction — peer presence lives only
+/// in the in-memory shadow map inside `PresenceManager`. The single-writer
+/// invariant is intact; this listener is a second *reader* of the NOTIFY
+/// channel, not a second writer of document tables.
+///
+/// Resilient: same connect/listen error + 2s backoff loop as
+/// [`run_listener`]; the presence listener is the whole point of cross-
+/// instance presence, so a transient Postgres blip must not kill it silently.
+pub async fn run_presence_listener(
+    pool: PgPool,
+    presence: Arc<PresenceManager>,
+    own_instance_id: String,
+) {
+    let backoff = std::time::Duration::from_secs(2);
+    loop {
+        let mut listener = match PgListener::connect_with(&pool).await {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "presence listener: connect_with failed; retrying in {:?}",
+                    backoff
+                );
+                tokio::time::sleep(backoff).await;
+                continue;
+            }
+        };
+        if let Err(e) = listener.listen_all([PRESENCE_CHANNEL]).await {
+            tracing::error!(
+                error = %e,
+                "presence listener: listen_all failed; retrying in {:?}",
+                backoff
+            );
+            tokio::time::sleep(backoff).await;
+            continue;
+        }
+        tracing::info!(
+            "presence listener: LISTENing on '{}' for cross-instance presence (instance_id={})",
+            PRESENCE_CHANNEL,
+            own_instance_id
+        );
+        loop {
+            let notif = match listener.recv().await {
+                Ok(n) => n,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "presence listener: recv failed; reconnecting in {:?}",
+                        backoff
+                    );
+                    break;
+                }
+            };
+            let payload = match serde_json::from_str::<PresenceNotifyPayload>(notif.payload()) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "presence listener: failed to decode payload; skipping"
+                    );
+                    continue;
+                }
+            };
+            // Self-notification dedupe: same contract as the op-feed listener.
+            // A process always receives its own `pg_notify`; the local op
+            // already published into the local ring, so re-injecting would
+            // double-count. For presence, ingest would only duplicate members
+            // the local `peers` map already has under this instance id (which
+            // never happens — local members aren't in `peers`), so dedupe is
+            // defensive rather than load-bearing here, but skip for clarity.
+            if payload.instance_id == own_instance_id {
+                continue;
+            }
+            presence
+                .ingest_peer_snapshot(
+                    &payload.instance_id,
+                    &payload.db,
+                    &payload.room,
+                    payload.members,
+                )
+                .await;
+        }
+        tracing::warn!(
+            "presence listener: connection lost; reconnecting in {:?}",
             backoff
         );
         tokio::time::sleep(backoff).await;

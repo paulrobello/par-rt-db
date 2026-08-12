@@ -224,8 +224,25 @@ impl AppState {
         // server still has the manager (so `presenceErr` works) but no
         // spinning task. Built before the struct literal so `metrics` can
         // still move into Runtime.
+        //
+        // ENH-022 Stage 3: in multi-instance mode the manager carries the
+        // instance id + pool so it can `pg_notify` per-room snapshots to peer
+        // replicas, and the flush task also fires a liveness beat every
+        // `RTDB_PRESENCE_BEAT_INTERVAL_MS` (default 5s). Single-instance mode
+        // passes `multi_instance=false, pool=None` — the manager never touches
+        // NOTIFY, and every wire byte is unchanged.
         let presence_cfg = presence::PresenceConfig::from_config(&config);
-        let presence = presence::PresenceManager::new(Some(metrics.clone()), presence_cfg);
+        let presence = presence::PresenceManager::new(
+            Some(metrics.clone()),
+            presence_cfg,
+            config.multi_instance,
+            instance_id.clone(),
+            if config.multi_instance {
+                Some(pool.clone())
+            } else {
+                None
+            },
+        );
         if presence_cfg.enabled {
             // Detach: the flush task runs for the lifetime of the process,
             // self-terminates if it ever errors, and nothing awaits its handle.
@@ -240,6 +257,19 @@ impl AppState {
             tokio::spawn(notify::run_listener(
                 pool.clone(),
                 op_feed.clone(),
+                instance_id.clone(),
+            ));
+        }
+        // ENH-022 Stage 3: cross-instance presence LISTEN task. Only spawned
+        // when BOTH `RTDB_MULTI_INSTANCE=true` AND `RTDB_PRESENCE_ENABLED=true`
+        // — a single-instance deploy never pays the second `PgListener`
+        // connection. Detach like the op-feed listener: runs for the process
+        // lifetime, reconnects on transient Postgres blips, self-dedupes by
+        // `instance_id`. Performs NO write and NO committer interaction.
+        if config.multi_instance && presence_cfg.enabled {
+            tokio::spawn(notify::run_presence_listener(
+                pool.clone(),
+                presence.clone(),
                 instance_id.clone(),
             ));
         }

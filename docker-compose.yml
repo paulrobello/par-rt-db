@@ -170,6 +170,11 @@ services:
       # Upper bound on a client-supplied presenceState ttlMs (over-cap is
       # rejected, not clamped). Mirrors the server's code default.
       RTDB_PRESENCE_MAX_TTL_MS: ${RTDB_PRESENCE_MAX_TTL_MS:-300000}
+      # ENH-022 Stage 3 — cross-instance presence gossip (only active when
+      # RTDB_MULTI_INSTANCE=true). Beat interval + eviction timeout for the
+      # peer shadow map; inert in single-instance mode.
+      RTDB_PRESENCE_BEAT_INTERVAL_MS: ${RTDB_PRESENCE_BEAT_INTERVAL_MS:-5000}
+      RTDB_PRESENCE_BEAT_TIMEOUT_MS: ${RTDB_PRESENCE_BEAT_TIMEOUT_MS:-15000}
       # Postgres connection-pool ceiling. Multi-tenant default (75): the
       # committer-per-db model holds a connection per active db during fan-out,
       # so the pool must scale with the number of active databases.

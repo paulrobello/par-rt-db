@@ -94,6 +94,55 @@ Preserve that locally and add a gossip layer:
   update rate). The union must be bounded too — cap total members per room across instances, not just
   per instance.
 
+#### Stage 3 design (settled before implementation)
+
+The gossip layer lives entirely in `presence.rs`, gated on `RTDB_MULTI_INSTANCE` (the same flag Stage 2
+added). All four presence ops (`join`/`update_state`/`leave`/`remove_conn`) and the flush loop already
+mark rooms dirty; the gossip hook rides the **dirty set**, not the WS handler.
+
+- **Peer shadow map.** `PresenceManager` gains `peers: Mutex<HashMap<(String,String), HashMap<String, PeerSnapshot>>>`
+  keyed `(db, room) → instance_id → PeerSnapshot{ members: Vec<PresenceMember>, last_beat: i64 }`.
+  This is what other instances have reported for each room; it is read by `flush_once` to build the union
+  and never sent to local clients as-is.
+- **Publish on dirty.** When a room goes dirty (existing `mark_dirty`), if `multi_instance` is on,
+  publish `pg_notify('rtdb_presence', {instanceId, db, room, members})` where `members` is the room's
+  **full local member snapshot** (a delta would need reconciliation; a full snapshot per dirty room is
+  simpler, idempotent, and small — presence rooms are capped at `max_room_size`). This is best-effort
+  like the Stage 2 op-feed NOTIFY. Reuse `notify.rs`'s `pg_notify` plumbing pattern (separate channel).
+- **Receive in the listener.** The Stage 2 `run_listener` already holds one `PgListener` per instance.
+  Extend it (or add a sibling listener) to `LISTEN rtdb_presence` too: on a notification, store the
+  snapshot under `peers[(db,room)][instanceId]` (refreshing `last_beat`), then `mark_dirty(db, room)`
+  so the next flush broadcasts the updated union to local members. Skip self-notifications by `instanceId`.
+- **Union broadcast.** `flush_once` builds the union = local members ++ all `peers[(db,room)]` members,
+  deduped by `(origin_instance_id, connection_id)` (see namespacing below), capped at `max_room_size`
+  total. Local members always win the cap (a local member is never dropped in favor of a remote one).
+  The union is what local clients receive in `presenceSnapshot`.
+- **`connection_id` namespacing.** Local `ConnId` is a per-process integer, so instance A and B can both
+  have `conn 1`. Clients identify "me" by `connection_id` (to skip rendering their own cursor/state), so a
+  collision would make B's client mistake A's member for itself. **Decision:** in multi-instance mode,
+  prefix each member's `connection_id` with its origin instance id (`"{instanceId}:{connId}"`) when
+  building the union for the wire. Local-only members stay unprefixed in single-instance mode (unchanged
+  behavior). This is wire-compatible — clients treat `connection_id` as opaque — and only active in the
+  opt-in multi-instance path.
+- **Liveness beats + eviction.** Each instance NOTIFYs a beat on `rtdb_presence` every
+  `RTDB_PRESENCE_BEAT_INTERVAL_MS` (default 5000), carrying its full per-room snapshots so a peer that
+  missed an incremental update resyncs. The listener refreshes `last_beat` for every notification (beat
+  or snapshot). A sweep (riding the existing flush loop) evicts every `PeerSnapshot` whose `last_beat` is
+  older than `RTDB_PRESENCE_BEAT_TIMEOUT_MS` (default `3 × beat_interval` = 15000) — drop the entry,
+  mark affected rooms dirty so the union broadcast reflects the eviction. This is the "killing A evicts
+  its members within the beat timeout" contract: a dead instance stops beating, and within `beat_timeout`
+  its shadow entries expire and disappear from peers' unions.
+- **Bounded union.** `max_room_size` (existing config) caps the **union** in multi-instance mode (not just
+  the local room). Each instance's own local room is still capped at `max_room_size` on join (existing
+  guard unchanged), so the raw union is ≤ `N_instances × max_room_size`; the union cap drops the
+  highest-`connection_id` remote members beyond the limit. Presence is ephemeral, so dropping a remote
+  member means a stale view until the next beat — acceptable, and consistent with "over-approximate
+  freely, never under-approximate" (a dropped member reappears on the next snapshot/beat).
+- **Single-writer invariant.** Intact — presence is NOT committer-bound (it never was; it's a sibling).
+  The gossip layer adds only `pg_notify` publishes + in-memory shadow writes; no `execute_txn`, no
+  document write, no committer interaction. A second instance's presence members are mirrored into a
+  read-only shadow map, never written to document tables.
+
 ### Stage 4 — Shared rate limiting
 
 Simplest correct option: keep the in-memory fixed window per instance but divide configured limits by

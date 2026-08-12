@@ -65,6 +65,8 @@ fn test_config() -> Config {
         presence_broadcast_interval_ms: 50,
         presence_update_limit_per_sec: 20,
         presence_max_ttl_ms: 300_000,
+        presence_beat_interval_ms: 5000,
+        presence_beat_timeout_ms: 15000,
         auth_anonymous_enabled: false,
         anonymous_session_ttl_days: 1,
         anonymous_rate_limit_per_ip_rpm: 0,

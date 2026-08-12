@@ -205,6 +205,23 @@ pub struct Config {
     /// RTDB_PRESENCE_MAX_TTL_MS (default 300000 = 5 min). Upper bound on a
     /// client-supplied presenceState ttlMs; over-cap is rejected (no clamping).
     pub presence_max_ttl_ms: u64,
+    /// RTDB_PRESENCE_BEAT_INTERVAL_MS (default 5000). ENH-022 Stage 3
+    /// cross-instance presence gossip: cadence at which each instance
+    /// republishes its full per-room membership snapshot to peers via
+    /// `pg_notify('rtdb_presence', …)`. A peer that missed an incremental
+    /// NOTIFY resyncs off the next beat. Only consulted when
+    /// `RTDB_MULTI_INSTANCE=true` AND `RTDB_PRESENCE_ENABLED=true`; a
+    /// single-instance deploy never spawns the beat task and never reads this.
+    /// Floored at 1000ms so an operator typo cannot hot-spin the channel.
+    pub presence_beat_interval_ms: u64,
+    /// RTDB_PRESENCE_BEAT_TIMEOUT_MS (default 15000). ENH-022 Stage 3: a peer
+    /// whose last beat is older than this is assumed dead (crashed, network
+    /// partition) and its shadow entries are evicted from the local peer map,
+    /// so its members disappear from the union broadcast within this window.
+    /// Defaults to 3 × the beat interval. Floored at the beat interval so an
+    /// operator cannot set a timeout shorter than the cadence (which would
+    /// evict live peers on every tick).
+    pub presence_beat_timeout_ms: u64,
     /// RTDB_AUTH_ANONYMOUS_ENABLED (default false). Master switch for
     /// `POST /auth/anonymous`, which mints an ephemeral user + session for a
     /// credential-less guest. Off ⇒ the endpoint returns 403 FORBIDDEN. An
@@ -536,6 +553,16 @@ impl Config {
             env_parsed("RTDB_PRESENCE_UPDATE_LIMIT_PER_SEC", 20u32)?.max(1);
         let presence_max_ttl_ms = env_parsed("RTDB_PRESENCE_MAX_TTL_MS", 300_000u64)?.max(1000);
 
+        // ENH-022 Stage 3: cross-instance presence gossip beat + eviction
+        // timeout. Floored: interval ≥ 1s (a sub-second beat would hot-spin
+        // the rtdb_presence channel for no value — incremental NOTIFYs already
+        // cover changes between beats); timeout ≥ interval (a timeout shorter
+        // than the cadence would evict live peers every tick).
+        let presence_beat_interval_ms =
+            env_parsed("RTDB_PRESENCE_BEAT_INTERVAL_MS", 5000u64)?.max(1000);
+        let presence_beat_timeout_ms =
+            env_parsed("RTDB_PRESENCE_BEAT_TIMEOUT_MS", 15_000u64)?.max(presence_beat_interval_ms);
+
         // Anonymous auth master switch. Default-OFF (opt-in per app): only an
         // explicit truthy spelling ("true"/"1"/"yes") enables it; everything
         // else (incl. unset) leaves it off. `env_bool` enforces this so a typo
@@ -660,6 +687,8 @@ impl Config {
             presence_broadcast_interval_ms,
             presence_update_limit_per_sec,
             presence_max_ttl_ms,
+            presence_beat_interval_ms,
+            presence_beat_timeout_ms,
             auth_anonymous_enabled,
             anonymous_session_ttl_days,
             anonymous_rate_limit_per_ip_rpm,
