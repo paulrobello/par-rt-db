@@ -766,23 +766,19 @@ that ultimately terminates a connection that never closes on its own.
 ## Known MVP limitations
 
 - **Deploy as a single instance — running multiple replicas behind a load
-  balancer is not yet supported.** Four pieces of server state are held
-  in-process with no cross-replica coordination, so a second replica
-  **silently** degrades behavior (no error — it just half-works):
-  - **OAuth login** — the single-use `state` token minted at `/begin` and
-    consumed at `/callback` lived in an in-process map, so a callback
-    load-balanced to a different replica than the one that minted the state
-    rejected with `400 invalid or expired state`. *(Fixed in ENH-022 Stage 1:
-    the table now lives in `rtdb_auth.oauth_states`, so a login begun on one
-    replica completes on another.)*
-  - **Op-feed** (`/admin/stream`, the dashboard live write feed) — each replica
-    sees only the writes that hit it. *(ENH-022 Stage 2 will fan these out via
-    Postgres `NOTIFY`.)*
-  - **Presence** (ENH-015 "who is online") — membership fragments per replica;
-    users on different replicas cannot see each other. *(ENH-022 Stage 3.)*
+  balancer is not yet supported.** Of the four pieces of server state that were
+  once in-process, three now coordinate across replicas via Postgres
+  LISTEN/NOTIFY when `RTDB_MULTI_INSTANCE=true` (ENH-022 Stages 1–3): OAuth
+  login state, the op-feed, and presence. Two remaining constraints still make
+  an unscaled deploy **silently** unsafe (no error — it just half-works):
   - **Rate limiting** — in-process counters multiply the effective budget by the
     replica count (a silent weakening of the cap). *(ENH-022 Stage 4.)*
-  The server logs a `WARN` at boot naming this constraint. The single-writer
+  - **Write funnelling** — writes for a given database are not yet funnelled to
+    a single committer owner across processes. Two replicas both writing the
+    same database would interleave `execute_txn` (READ COMMITTED, no cross-
+    process lock) and break the subscription skip-invalidation logic. A real
+    fix needs a Postgres advisory lock or lease; it is a future stage.
+  The server logs a `WARN` at boot naming these constraints. The single-writer
   invariant (one committer task per database) is intact and must stay so —
   multi-instance here means multiple *readers/connection-holders*, not a second
   writer onto the same database. Horizontal scaling is tracked as ENH-022.

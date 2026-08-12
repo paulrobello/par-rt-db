@@ -19,22 +19,27 @@ async fn main() {
     // resolution (held for the process lifetime below).
     let _otel_guard = rtdb_server::tracing_setup::init(&config);
 
-    // ARC-126: this server stores OAuth state, the op-feed, presence, and
-    // rate-limit counters in-process (no cross-replica coordination). Running
-    // more than one replica behind a load balancer silently breaks OAuth
-    // login (the callback lands on whichever replica the LB chose, which has
-    // no entry for the state minted on the begin replica), halves live-update
-    // and presence coverage (each browser sees only its own replica's
-    // events), and multiplies every client's rate-limit budget by the replica
-    // count. Deploy as a single instance; horizontal scaling is tracked as
-    // ENH-022. Emitted at WARN because violating this constraint is silent
-    // (no error — the login just never resolves), and the single supported
-    // topology is the one that needs no action.
+    // ARC-126 / ENH-022: multi-instance status. OAuth login state
+    // (`rtdb_auth.oauth_states`), the op-feed, and presence now coordinate
+    // across replicas via Postgres LISTEN/NOTIFY when `RTDB_MULTI_INSTANCE=true`
+    // (ENH-022 Stages 1–3) — a login begun on one replica completes on another,
+    // and the op-feed/presence fan out across instances. Two pieces remain
+    // instance-local and still make an unscaled deploy unsafe: (1) rate-limit
+    // counters are per-process, so a client's effective budget multiplies by the
+    // replica count (ENH-022 Stage 4), and (2) writes for a given database are
+    // not yet funnelled to a single committer owner across processes — two
+    // replicas both writing the same database would interleave `execute_txn` and
+    // break the subscription skip-invalidation logic (the advisory-lock/lease
+    // fix is a future stage). Until both land, the supported topology is a single
+    // instance. Emitted at WARN because the remaining constraint is silent (no
+    // error — rate limits just weaken and concurrent writes to one db can miss
+    // invalidations), and a single instance needs no action.
     tracing::warn!(
-        "single-instance topology required: OAuth state, op-feed, presence, \
-         and rate-limit counters are in-process — running multiple replicas \
-         behind a load balancer will silently break OAuth login, live updates, \
-         and rate limiting (ENH-022 tracks horizontal scaling)"
+        "single-instance topology required: rate-limit counters are still \
+         per-process and writes for a database are not yet funnelled to one \
+         owner across processes — running multiple replicas is unsafe until \
+         ENH-022 Stages 4–5 land (Stages 1–3 fixed OAuth/op-feed/presence when \
+         RTDB_MULTI_INSTANCE=true)"
     );
 
     let pool = PgPoolOptions::new()

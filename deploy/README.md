@@ -75,17 +75,19 @@ Then verify the public path: `curl -fsS https://rtdb.pardev.net/healthz | jq .`.
 ## Topology: single instance (not horizontally scalable yet)
 
 **Deploy par-rt-db as a single process — do not run multiple replicas behind a
-load balancer.** The server logs a `WARN` at boot naming this constraint. Four
-pieces of state are held in-process with no cross-replica coordination, so a
-second replica **silently** degrades behavior (there is no error — it just
-half-works):
+load balancer.** The server logs a `WARN` at boot naming this constraint. Three
+of four formerly in-process pieces now coordinate across replicas via Postgres
+LISTEN/NOTIFY when `RTDB_MULTI_INSTANCE=true` (ENH-022 Stages 1–3); two
+remaining constraints still make a second replica **silently** unsafe (there is
+no error — it just half-works):
 
-| State | What breaks with 2 replicas |
+| State | Status with 2 replicas |
 | --- | --- |
-| OAuth login state | A login begun on replica A (the `/begin` that minted the `state` token) whose callback is load-balanced to replica B. *(Fixed in ENH-022 Stage 1: `state` now lives in the `rtdb_auth.oauth_states` table, so a login begun on one replica completes on another.)* |
-| Op-feed (`/admin/stream`, dashboard live writes) | Each replica sees only the writes that hit it. *(ENH-022 Stage 2: fan out via Postgres `NOTIFY`.)* |
-| Presence (ENH-015 "who is online") | Membership fragments per replica; users on different replicas cannot see each other. *(ENH-022 Stage 3.)* |
-| Rate-limit counters | In-process counters multiply the effective budget by the replica count (a silent weakening of the cap). *(ENH-022 Stage 4.)* |
+| OAuth login state | ✅ Fixed (ENH-022 Stage 1): `state` lives in the `rtdb_auth.oauth_states` table, so a login begun on one replica completes on another. |
+| Op-feed (`/admin/stream`, dashboard live writes) | ✅ Fixed (ENH-022 Stage 2): fans out across replicas via Postgres `NOTIFY` on the `rtdb_ops` channel. |
+| Presence (ENH-015 "who is online") | ✅ Fixed (ENH-022 Stage 3): per-room membership gossips via the `rtdb_presence` channel with liveness-beat eviction of dead replicas. |
+| Rate-limit counters | ⚠️ Still per-process: in-process counters multiply the effective budget by the replica count (a silent weakening of the cap). *(ENH-022 Stage 4.)* |
+| Write ownership | ⚠️ Not yet funnelled: two replicas both writing the same database would interleave `execute_txn` and break subscription skip-invalidation. A Postgres advisory lock / lease is a future stage. |
 
 The single-writer invariant is intact and must stay so: each database has
 exactly one committer task, and correctness depends on that serialized write
