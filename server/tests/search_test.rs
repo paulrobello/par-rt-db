@@ -994,3 +994,320 @@ async fn trgm_gin_index_dropped_by_reconcile() {
         "tsvector GIN survived reconcile"
     );
 }
+
+// --- phrase/operator search (FM-31) ---
+
+// A quoted phrase requires the words ADJACENT: only the doc where "database
+// notes" appears as a contiguous phrase matches; the doc carrying the same
+// words apart does not. The same words unquoted still match both — AND
+// semantics — pinning plain-query equivalence with the former
+// plainto_tsquery behavior through the websearch upgrade.
+#[tokio::test]
+async fn phrase_query_requires_adjacent_words() {
+    let state = test_state().await;
+    let (db, schema) = fresh_search_db(&state).await;
+    let pool = &state.pool;
+    insert_note(
+        pool,
+        &db,
+        &schema,
+        "adjacent",
+        "the database notes are great",
+    )
+    .await;
+    insert_note(pool, &db, &schema, "apart", "notes about the database").await;
+
+    let res = execute_query(
+        pool,
+        &db,
+        &schema,
+        &search_query("search_content", "\"database notes\""),
+        &PrincipalCtx::bypass(),
+    )
+    .await
+    .expect("phrase search");
+    assert_eq!(titles(&res), vec!["adjacent".to_string()]);
+
+    let res = execute_query(
+        pool,
+        &db,
+        &schema,
+        &search_query("search_content", "database notes"),
+        &PrincipalCtx::bypass(),
+    )
+    .await
+    .expect("plain AND search");
+    let titles = titles(&res);
+    assert_eq!(titles.len(), 2);
+    assert!(titles.contains(&"adjacent".to_string()));
+    assert!(titles.contains(&"apart".to_string()));
+}
+
+// The bare word `or` unions alternatives: a doc with either term matches.
+#[tokio::test]
+async fn or_operator_unions_alternatives() {
+    let state = test_state().await;
+    let (db, schema) = fresh_search_db(&state).await;
+    let pool = &state.pool;
+    insert_note(pool, &db, &schema, "alpha only", "").await;
+    insert_note(pool, &db, &schema, "beta only", "").await;
+    insert_note(pool, &db, &schema, "gamma", "").await;
+
+    let res = execute_query(
+        pool,
+        &db,
+        &schema,
+        &search_query("search_content", "alpha or beta"),
+        &PrincipalCtx::bypass(),
+    )
+    .await
+    .expect("or search");
+    let titles = titles(&res);
+    assert_eq!(titles.len(), 2);
+    assert!(titles.contains(&"alpha only".to_string()));
+    assert!(titles.contains(&"beta only".to_string()));
+    assert!(!titles.contains(&"gamma".to_string()));
+}
+
+// `-term` excludes docs carrying the negated word while keeping the positive
+// one.
+#[tokio::test]
+async fn minus_operator_excludes_term() {
+    let state = test_state().await;
+    let (db, schema) = fresh_search_db(&state).await;
+    let pool = &state.pool;
+    insert_note(pool, &db, &schema, "database intro", "database basics").await;
+    insert_note(pool, &db, &schema, "database cooking", "database recipes").await;
+
+    let res = execute_query(
+        pool,
+        &db,
+        &schema,
+        &search_query("search_content", "database -cooking"),
+        &PrincipalCtx::bypass(),
+    )
+    .await
+    .expect("minus search");
+    assert_eq!(titles(&res), vec!["database intro".to_string()]);
+}
+
+// Phrases work through a declared `language` regconfig too (the same
+// config string flows into websearch_to_tsquery and the generated column).
+#[tokio::test]
+async fn phrase_query_works_with_language_index() {
+    let state = test_state().await;
+    let (db, schema) = fresh_db_with(&state, lang_search_schema(Some("simple"))).await;
+    let pool = &state.pool;
+    insert_note(pool, &db, &schema, "adjacent", "quick fox lazy dog").await;
+    insert_note(pool, &db, &schema, "apart", "fox quick").await;
+
+    let res = execute_query(
+        pool,
+        &db,
+        &schema,
+        &search_query("search_content", "\"quick fox\""),
+        &PrincipalCtx::bypass(),
+    )
+    .await
+    .expect("language phrase search");
+    assert_eq!(titles(&res), vec!["adjacent".to_string()]);
+}
+
+// --- snippets (FM-31) ---
+
+// snippet: true attaches a `_searchSnippet` to every hit — a ts_headline
+// render wrapping the matched term in <mark>, honoring the server word
+// bound. Omitted, no snippet field appears.
+#[tokio::test]
+async fn snippet_returns_highlighted_fragment() {
+    let state = test_state().await;
+    let (db, schema) = fresh_search_db(&state).await;
+    let pool = &state.pool;
+    insert_note(
+        pool,
+        &db,
+        &schema,
+        "database notes",
+        "a database is a database",
+    )
+    .await;
+
+    let q: Query = serde_json::from_value(serde_json::json!({
+        "table": "notes",
+        "search": {"index": "search_content", "query": "database", "snippet": true}
+    }))
+    .expect("snippet query");
+    let res = execute_query(pool, &db, &schema, &q, &PrincipalCtx::bypass())
+        .await
+        .expect("snippet search");
+    match res {
+        QueryResult::Docs(docs) => {
+            assert_eq!(docs.len(), 1);
+            let snippet = docs[0]["_searchSnippet"]
+                .as_str()
+                .expect("_searchSnippet string");
+            assert!(
+                snippet.contains("<mark>database</mark>"),
+                "no highlighted term in {snippet}"
+            );
+            assert!(
+                snippet.split_whitespace().count() <= 37,
+                "snippet exceeds the server word bound: {snippet}"
+            );
+        }
+        other => panic!("expected Docs variant, got {other:?}"),
+    }
+
+    // Omitted snippet: docs carry no _searchSnippet field.
+    let res = execute_query(
+        pool,
+        &db,
+        &schema,
+        &search_query("search_content", "database"),
+        &PrincipalCtx::bypass(),
+    )
+    .await
+    .expect("plain search");
+    match res {
+        QueryResult::Docs(docs) => {
+            assert_eq!(docs.len(), 1);
+            assert!(
+                docs[0].get("_searchSnippet").is_none(),
+                "snippet field present without snippet: true"
+            );
+        }
+        other => panic!("expected Docs variant, got {other:?}"),
+    }
+}
+
+// An explicit `snippet: false` behaves exactly like omission (the wire
+// defaults to off; nothing is double-rendered).
+#[tokio::test]
+async fn snippet_false_behaves_like_omitted() {
+    let state = test_state().await;
+    let (db, schema) = fresh_search_db(&state).await;
+    let pool = &state.pool;
+    insert_note(pool, &db, &schema, "database notes", "").await;
+
+    let q: Query = serde_json::from_value(serde_json::json!({
+        "table": "notes",
+        "search": {"index": "search_content", "query": "database", "snippet": false}
+    }))
+    .expect("snippet-false query");
+    let res = execute_query(pool, &db, &schema, &q, &PrincipalCtx::bypass())
+        .await
+        .expect("snippet-false search");
+    match res {
+        QueryResult::Docs(docs) => {
+            assert_eq!(docs.len(), 1);
+            assert!(docs[0].get("_searchSnippet").is_none());
+        }
+        other => panic!("expected Docs variant, got {other:?}"),
+    }
+}
+
+// snippet highlights PHRASE queries — the headline renders from the same
+// websearch_to_tsquery the WHERE matched. ts_headline marks each matched
+// word, so a phrase hit shows as adjacent per-word marks.
+#[tokio::test]
+async fn snippet_highlights_phrase_queries() {
+    let state = test_state().await;
+    let (db, schema) = fresh_search_db(&state).await;
+    let pool = &state.pool;
+    insert_note(
+        pool,
+        &db,
+        &schema,
+        "adjacent",
+        "the database notes are great today",
+    )
+    .await;
+
+    let q: Query = serde_json::from_value(serde_json::json!({
+        "table": "notes",
+        "search": {
+            "index": "search_content",
+            "query": "\"database notes\"",
+            "snippet": true
+        }
+    }))
+    .expect("phrase snippet query");
+    let res = execute_query(pool, &db, &schema, &q, &PrincipalCtx::bypass())
+        .await
+        .expect("phrase snippet search");
+    match res {
+        QueryResult::Docs(docs) => {
+            assert_eq!(docs.len(), 1);
+            let snippet = docs[0]["_searchSnippet"]
+                .as_str()
+                .expect("_searchSnippet string");
+            assert!(
+                snippet.contains("<mark>database</mark> <mark>notes</mark>"),
+                "phrase words not contiguously highlighted in {snippet}"
+            );
+        }
+        other => panic!("expected Docs variant, got {other:?}"),
+    }
+}
+
+// Snippets compose with `filter`: narrowed hits are snippeted, filtered-out
+// rows are neither returned nor snippeted.
+#[tokio::test]
+async fn snippet_composes_with_filter() {
+    let state = test_state().await;
+    let (db, schema) = fresh_filter_db(&state).await;
+    let pool = &state.pool;
+    insert_post(pool, &db, &schema, "database intro", 1, "a").await;
+    insert_post(pool, &db, &schema, "database advanced", 2, "b").await;
+    insert_post(pool, &db, &schema, "cooking", 1, "c").await;
+
+    let q: Query = serde_json::from_value(serde_json::json!({
+        "table": "posts",
+        "search": {
+            "index": "search_title",
+            "query": "database",
+            "snippet": true,
+            "filter": {"op":"eq","field":"category","value":1}
+        }
+    }))
+    .expect("snippet+filter query");
+    let res = execute_query(pool, &db, &schema, &q, &PrincipalCtx::bypass())
+        .await
+        .expect("snippet+filter search");
+    match res {
+        QueryResult::Docs(docs) => {
+            assert_eq!(docs.len(), 1);
+            let snippet = docs[0]["_searchSnippet"]
+                .as_str()
+                .expect("_searchSnippet string");
+            assert!(
+                snippet.contains("<mark>database</mark>"),
+                "no highlighted term in {snippet}"
+            );
+        }
+        other => panic!("expected Docs variant, got {other:?}"),
+    }
+}
+
+// snippet + trgm mode is rejected up front — trgm matches substrings, so
+// there is no tsquery tree to highlight.
+#[tokio::test]
+async fn snippet_rejected_with_trgm_mode() {
+    let state = test_state().await;
+    let (db, schema) = fresh_search_db(&state).await;
+    let q: Query = serde_json::from_value(serde_json::json!({
+        "table": "notes",
+        "search": {
+            "index": "search_content",
+            "query": "conv",
+            "mode": "trgm",
+            "snippet": true
+        }
+    }))
+    .expect("snippet+trgm query");
+    let err = execute_query(&state.pool, &db, &schema, &q, &PrincipalCtx::bypass())
+        .await
+        .expect_err("snippet+trgm must fail");
+    assert_eq!(err.code, ErrorCode::BadRequest);
+    assert!(err.message.contains("tsquery mode"));
+}

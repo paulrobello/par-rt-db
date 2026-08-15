@@ -104,6 +104,7 @@ fn search_body_x() -> SearchQuery {
         query: "x".to_string(),
         filter: None,
         mode: None,
+        snippet: None,
     }
 }
 

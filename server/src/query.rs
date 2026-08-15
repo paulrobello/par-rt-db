@@ -38,6 +38,13 @@ const MAX_TAKE: u32 = 4096;
 /// Hard cap on `vectorSearch` `limit`.
 const VECTOR_SEARCH_MAX_LIMIT: u32 = 256;
 
+/// Server-fixed `ts_headline` options for `snippet: true` search results
+/// (FM-31). The client opts in with a boolean and can supply none of these —
+/// word bounds and highlight delimiters are server-owned. `<mark>` renders
+/// directly in HTML/React; MaxWords/MinWords are the PostgreSQL defaults made
+/// explicit so the bound is visible and owned here.
+const SNIPPET_HEADLINE_OPTS: &str = "StartSel=<mark>, StopSel=</mark>, MaxWords=35, MinWords=15";
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Order {
@@ -149,13 +156,17 @@ pub struct Paginate {
 
 /// A full-text search terminal over a declared search index. `index` names a
 /// search index on the query's table; `query` is free-form user text matched
-/// via `plainto_tsquery` so it can't inject tsquery syntax. `filter` is an
-/// optional db-side predicate (the `filter()` DSL) narrowed into the search
+/// via `websearch_to_tsquery` so it can't inject tsquery syntax while still
+/// honoring web search operators — quoted phrases (`"exact phrase"`), the
+/// bare word `or`, and `-term` negation (FM-31). `filter` is an optional
+/// db-side predicate (the `filter()` DSL) narrowed into the search
 /// WHERE — scoped search ("within channel X" / "last N ms"); omitted on the
 /// wire when `None` so existing requests deserialize unchanged. `mode` selects
-/// the match strategy (FM-30): `None`/`"tsquery"` is today's full-text
+/// the match strategy (FM-30): `None`/`"tsquery"` is the full-text
 /// behavior; `"trgm"` is substring/autocomplete matching over the index's text
 /// fields via `ILIKE`, ranked by trigram `similarity()` — see `SearchMode`.
+/// `snippet` (FM-31) opts each hit into a `_searchSnippet` field rendered by
+/// `ts_headline` with server-fixed options; tsquery mode only.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SearchQuery {
@@ -165,11 +176,13 @@ pub struct SearchQuery {
     pub filter: Option<FilterExpr>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<SearchMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snippet: Option<bool>,
 }
 
 /// Match mode for the `search` terminal. `Tsquery` (the default, and the
 /// behavior when `mode` is omitted) matches stemmed words via
-/// `tsvector @@ plainto_tsquery`, ranked by `ts_rank`. `Trgm` matches
+/// `tsvector @@ websearch_to_tsquery`, ranked by `ts_rank`. `Trgm` matches
 /// substrings case-insensitively (`ILIKE '%query%'`) over the search index's
 /// text fields — prefix/infix/autocomplete lookups FTS can't serve — ranked by
 /// `GREATEST(similarity(field, query))` (the doc's best-matching field), with
@@ -208,7 +221,7 @@ pub struct VectorSearchQuery {
 /// (`vectorSearch`) ranking over the SAME table into one result list via
 /// Reciprocal Rank Fusion (RRF). The table must declare BOTH a search index
 /// (tsvector) and a vector index; if either is missing → `BadRequest`. `query`
-/// is the text (matched via `plainto_tsquery`, like `search`); `vector` is the
+/// is the text (matched via `websearch_to_tsquery`, like `search`); `vector` is the
 /// query embedding (length must equal the chosen vector index's dimensions).
 /// `search_index`/`vector_index` optionally name the indexes to use; when
 /// `None`, the table's first search index / first vector index is auto-selected.
@@ -1043,7 +1056,14 @@ pub async fn execute_query(
         };
         match cq.terminal {
             "get" => point_read(&sctx, cq, owner).await,
-            "search" => execute_search(cq, pool).await,
+            // `snippet` travels on the query, not the CompiledQuery (whose
+            // shape is the /explain contract), so the execute tail gets it
+            // re-derived here — the same re-derive pattern the `paginate`
+            // arm below uses.
+            "search" => {
+                let snippet = q.search.as_ref().is_some_and(|s| s.snippet == Some(true));
+                execute_search(cq, pool, snippet).await
+            }
             "vectorSearch" => execute_vector_search(cq, pool).await,
             "hybridSearch" => execute_hybrid_search(cq, pool).await,
             "count" => execute_count_terminal(cq, pool).await,
@@ -2545,21 +2565,24 @@ fn jsonb_lhs_and_bind(
     }
 }
 
-/// `plainto_tsquery` SQL fragment honoring an optional search-index `language`
-/// (a `schema::validate_structure`-checked regconfig name interpolated as a
-/// literal). The query text stays a `$ph` bind, so user input can never inject
-/// tsquery syntax or escape the regconfig literal. The tsvector column and the
+/// `websearch_to_tsquery` SQL fragment honoring an optional search-index
+/// `language` (a `schema::validate_structure`-checked regconfig name
+/// interpolated as a literal). The query text stays a `$ph` bind, so user
+/// input can never inject tsquery syntax or escape the regconfig literal;
+/// `websearch_to_tsquery` additionally honors quoted phrases, the bare word
+/// `or`, and `-term` negation in the bound text (FM-31) — a pure superset of
+/// the former `plainto_tsquery` for plain terms. The tsvector column and the
 /// tsquery must share a regconfig for `@@` to match correctly, so every search
 /// path builds both from the same index `language`.
-fn plainto_tsquery_sql(language: Option<&str>, ph: usize) -> String {
+fn websearch_tsquery_sql(language: Option<&str>, ph: usize) -> String {
     match language {
-        Some(lang) => format!("plainto_tsquery('{lang}'::regconfig, ${ph})"),
-        None => format!("plainto_tsquery(${ph})"),
+        Some(lang) => format!("websearch_to_tsquery('{lang}'::regconfig, ${ph})"),
+        None => format!("websearch_to_tsquery(${ph})"),
     }
 }
 
 /// Full-text search terminal: matches a search index's generated tsvector
-/// against `plainto_tsquery(<query text>)` and ranks by `ts_rank` descending,
+/// against `websearch_to_tsquery(<query text>)` and ranks by `ts_rank` descending,
 /// with `(created_at, id)` tie-breakers. Composes with `take` (defaulting to
 /// `MAX_TAKE`); the caller has already rejected every other terminal. The query
 /// text is bound once via `$1` and reused in the `ORDER BY ts_rank`, so user
@@ -2614,7 +2637,9 @@ struct CompileSearchCtx<'a> {
 /// compiles next, then the per-row owner/collaborator and `authorize`
 /// predicates, then `LIMIT`. The search text/pattern and the limit are
 /// encoded as `EqBind::Text` / `EqBind::I64` respectively so the executor
-/// uses the same bind loop every other terminal does.
+/// uses the same bind loop every other terminal does. `snippet: true`
+/// (tsquery mode only) appends one trailing `ts_headline` column to the
+/// SELECT, reusing `$1` — bind order and count are unchanged.
 fn compile_search(
     sctx: &CompileSearchCtx<'_>,
     search: &SearchQuery,
@@ -2640,11 +2665,41 @@ fn compile_search(
             RtDbError::bad_request(format!("search index '{}' not found", search.index))
         })?;
     let sv_col = pg_search_col(&index_def.name);
-    let tsq = plainto_tsquery_sql(index_def.language.as_deref(), 1);
+    let tsq = websearch_tsquery_sql(index_def.language.as_deref(), 1);
     let limit = take.unwrap_or(MAX_TAKE);
     let pg_schema_name = pg_schema(db);
     let table_ident = pg_table(table_name);
     let mode = search.mode.unwrap_or_default();
+    // `snippet` needs a tsquery tree to highlight; trgm mode matches raw
+    // substrings, so the combination is rejected rather than silently
+    // ignored.
+    let snippet = search.snippet.unwrap_or(false);
+    if snippet && mode == SearchMode::Trgm {
+        return Err(RtDbError::bad_request(
+            "snippet is only supported in tsquery mode",
+        ));
+    }
+    // The headline renders from the same `websearch_to_tsquery($1)` the WHERE
+    // matched, so a snippet highlights exactly why the doc is a hit — phrases
+    // included. Source text is the index's fields in declared order
+    // (`concat_ws` skips NULL columns; a doc that matched the tsvector
+    // necessarily carries text in at least one of them). Options are the
+    // `SNIPPET_HEADLINE_OPTS` server constant, never client-supplied.
+    let snippet_col = if snippet {
+        let src = index_def
+            .fields
+            .iter()
+            .map(|field_name| format!("\"{}\"", pg_col(field_name)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let cfg = match index_def.language.as_deref() {
+            Some(lang) => format!("'{lang}'::regconfig, "),
+            None => String::new(),
+        };
+        format!(", ts_headline({cfg}concat_ws(' ', {src}), {tsq}, '{SNIPPET_HEADLINE_OPTS}')")
+    } else {
+        String::new()
+    };
 
     // `$1` is the search query text in both modes (the tsquery in `tsquery`
     // mode, the similarity argument in `trgm` mode). The optional client
@@ -2686,7 +2741,7 @@ fn compile_search(
     let limit_ph = start + binds.len();
     let sql = match mode {
         SearchMode::Tsquery => format!(
-            "SELECT \"id\", \"doc\", \"created_at\", \"version\" FROM \"{pg_schema_name}\".\"{table_ident}\" \
+            "SELECT \"id\", \"doc\", \"created_at\", \"version\"{snippet_col} FROM \"{pg_schema_name}\".\"{table_ident}\" \
              WHERE \"{sv_col}\" @@ {tsq}{extra} \
              ORDER BY ts_rank(\"{sv_col}\", {tsq}) DESC, \"created_at\" DESC, \"id\" DESC \
              LIMIT ${limit_ph}"
@@ -2735,8 +2790,39 @@ fn compile_search(
     })
 }
 
-async fn execute_search(cq: CompiledQuery, pool: &PgPool) -> Result<QueryResult, RtDbError> {
+/// Execute tail for the `search` terminal. Two row shapes, selected by the
+/// caller-re-derived `snippet` flag: the 4-column default, or a 5-column
+/// form whose trailing `ts_headline` render becomes each doc's
+/// `_searchSnippet` field (inserted after `merge_doc` — write-time
+/// validation rejects `_`-prefixed keys, so the additive field never
+/// collides with stored data).
+async fn execute_search(
+    cq: CompiledQuery,
+    pool: &PgPool,
+    snippet: bool,
+) -> Result<QueryResult, RtDbError> {
     let CompiledQuery { sql, binds, .. } = cq;
+    if snippet {
+        let mut query = sqlx::query_as::<_, (String, serde_json::Value, i64, i64, String)>(&sql);
+        for bind in binds {
+            query = match bind {
+                EqBind::Text(v) => query.bind(v),
+                EqBind::Num(v) => query.bind(v),
+                EqBind::Bool(v) => query.bind(v),
+                EqBind::I64(v) => query.bind(v),
+            };
+        }
+        let rows = query.fetch_all(pool).await?;
+        let docs = rows
+            .into_iter()
+            .map(|(id, doc, created_at, version, snippet_text)| {
+                let mut merged = merge_doc(id, doc, created_at, version)?;
+                merged["_searchSnippet"] = serde_json::Value::String(snippet_text);
+                Ok::<_, RtDbError>(merged)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        return Ok(QueryResult::Docs(docs));
+    }
     let mut query = sqlx::query_as::<_, (String, serde_json::Value, i64, i64)>(&sql);
     for bind in binds {
         query = match bind {
@@ -2907,7 +2993,7 @@ async fn execute_vector_search(cq: CompiledQuery, pool: &PgPool) -> Result<Query
 /// vector ranking (the resolved vector index's metric operator) over the same
 /// table via RRF. The table must declare BOTH a search index (tsvector) AND a
 /// vector index; if either is missing → `BadRequest`. The candidate set is the
-/// UNION of rows matching `plainto_tsquery($text)` and rows with a non-null
+/// UNION of rows matching `websearch_to_tsquery($text)` and rows with a non-null
 /// vector; both rankings are computed in a single statement with window
 /// functions and fused as `1/(k + r_text) + 1/(k + r_vec)` (default `k = 60`).
 /// Bind order: the text query (`$1`, referenced in WHERE/ts_rank), the owner id
@@ -3025,7 +3111,7 @@ fn compile_hybrid_search(
     let owner = ctx.user_id.as_deref();
     let enforced_uid = row_auth_enforced_uid(owner_field, collaborators_field, owner);
     let text_ph = 1usize;
-    let tsq = plainto_tsquery_sql(search_index.language.as_deref(), text_ph);
+    let tsq = websearch_tsquery_sql(search_index.language.as_deref(), text_ph);
     let mut auth_binds: Vec<EqBind> = Vec::new();
     let mut auth_clause = String::new();
     let auth_start = 2usize;
