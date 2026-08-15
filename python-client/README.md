@@ -122,9 +122,14 @@ point = TableQuery("items").get("i1").build()
 # Full-text search over a declared search index. `mode="trgm"` switches to
 # case-insensitive substring/autocomplete matching over the index's text fields
 # (FM-30); an omitted `mode` (or `"tsquery"`) is full-text — and omits `mode`
-# from the wire entirely, so existing requests stay byte-identical.
+# from the wire entirely, so existing requests stay byte-identical. The query
+# text honors web search operators (FM-31): quoted phrases require adjacency
+# (`"exact phrase"`), the bare word `or` unions, `-term` excludes. `snippet=True`
+# adds a server-rendered `_searchSnippet` (`<mark>`-highlighted fragment) to
+# each hit — tsquery mode only.
 search = TableQuery("items").search("by_name", "hello world").take(10).build()
 autocomplete = TableQuery("items").search("by_name", "conv", mode="trgm").take(10).build()
+phrase = TableQuery("items").search("by_name", '"release notes" -draft', snippet=True).build()
 
 # Vector similarity over a pgvector index (embeddings are client-supplied).
 vs = TableQuery("docs").vector_search("by_embedding", [0.1, 0.2, ...], limit=5).build()

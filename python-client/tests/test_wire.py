@@ -192,6 +192,49 @@ def test_search_query_rejects_unknown_mode() -> None:
         SearchQuery.model_validate({"index": "idx", "query": "conv", "mode": "fuzzy"})
 
 
+def test_search_query_omits_snippet_when_none() -> None:
+    # FM-31: `snippet` is optional and omitted entirely when unset, so existing
+    # requests stay byte-identical (the corpus `queries` section pins this).
+    sq = SearchQuery.model_validate({"index": "idx", "query": "hello"})
+    out = sq.model_dump(by_alias=True, mode="json")
+    assert out == {"index": "idx", "query": "hello"}
+    assert "snippet" not in out
+
+
+def test_search_query_round_trips_snippet() -> None:
+    # Both wire booleans round-trip: true opts hits into _searchSnippet, and an
+    # explicit false behaves like omission server-side but still serializes
+    # (the server skips only None).
+    for snippet in (True, False):
+        sq = SearchQuery.model_validate({"index": "idx", "query": "hi", "snippet": snippet})
+        assert sq.model_dump(by_alias=True, mode="json") == {
+            "index": "idx",
+            "query": "hi",
+            "snippet": snippet,
+        }
+
+
+def test_search_query_snippet_composes_with_mode_and_filter() -> None:
+    # The full FM-30+FM-31 shape round-trips together (tsquery is the only
+    # legal mode for a snippet; trgm is a server-side BadRequest).
+    sq = SearchQuery.model_validate(
+        {
+            "index": "idx",
+            "query": '"exact phrase" or -excluded',
+            "mode": "tsquery",
+            "snippet": True,
+            "filter": {"op": "eq", "field": "status", "value": "open"},
+        }
+    )
+    assert sq.model_dump(by_alias=True, mode="json") == {
+        "index": "idx",
+        "query": '"exact phrase" or -excluded',
+        "mode": "tsquery",
+        "snippet": True,
+        "filter": {"op": "eq", "field": "status", "value": "open"},
+    }
+
+
 def test_vector_search_query_omits_filter_when_none() -> None:
     vq = VectorSearchQuery.model_validate({"index": "v", "vector": [0.1, 0.2], "limit": 8})
     out = vq.model_dump(by_alias=True, mode="json")

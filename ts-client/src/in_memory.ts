@@ -157,11 +157,105 @@ function ftsStringify(v: unknown): string {
 }
 
 /** Split text into lowercase word tokens — an approximation of the lexemes
- * `plainto_tsquery` produces, close enough for match/no-match test parity.
+ * `websearch_to_tsquery` produces, close enough for match/no-match test parity.
  * Stemming/stopwords are deliberately not replicated (a deterministic stand-in
  * is sufficient; exact `ts_rank` ordering is out of scope for the harness). */
 function ftsTokens(s: string): string[] {
   return s.toLowerCase().match(/[a-z0-9]+/g) ?? [];
+}
+
+/** One `or`-separated alternative of a websearch-syntax query: the positive
+ * plain terms and phrases that must ALL be present (AND), plus the terms and
+ * phrases that must be absent (`-term` / `-"a phrase"` NOT). A query with no
+ * bare `or` parses to a single alternative. */
+interface WebsearchAlt {
+  terms: string[];
+  phrases: string[][];
+  excludedTerms: string[];
+  excludedPhrases: string[][];
+}
+
+/** Parse `websearch_to_tsquery` syntax (FM-31): quoted phrases ("a b") require
+ * adjacency, a bare case-insensitive `or` (outside quotes) splits alternatives,
+ * `-term`/`-"phrase"` negates, and remaining plain terms stay AND. Constructs
+ * the harness can't express exactly (stemming, stopword dropping, tsquery
+ * precedence between AND/OR) over-approximate — adjacency and exclusion are
+ * the observable behaviors tests pin. */
+function parseWebsearchQuery(q: string): WebsearchAlt[] {
+  const alts: WebsearchAlt[] = [{ terms: [], phrases: [], excludedTerms: [], excludedPhrases: [] }];
+  // `-?` prefix, then either a double-quoted phrase or a bare whitespace-free
+  // token. The phrase branch must come first so `-"a b"` stays one token.
+  const tokenRe = /(-?)(?:"([^"]*)"|(\S+))/g;
+  for (let m = tokenRe.exec(q); m !== null; m = tokenRe.exec(q)) {
+    const negated = m[1] === "-";
+    if (m[2] !== undefined) {
+      const words = ftsTokens(m[2]);
+      if (words.length === 0) continue;
+      (negated ? alts[alts.length - 1].excludedPhrases : alts[alts.length - 1].phrases).push(words);
+    } else if (m[3] !== undefined) {
+      const word = m[3].toLowerCase();
+      if (word === "or") {
+        alts.push({ terms: [], phrases: [], excludedTerms: [], excludedPhrases: [] });
+        continue;
+      }
+      const words = ftsTokens(m[3]);
+      if (words.length === 0) continue;
+      if (negated) alts[alts.length - 1].excludedTerms.push(...words);
+      else alts[alts.length - 1].terms.push(...words);
+    }
+  }
+  return alts;
+}
+
+/** True when `phrase` appears in `tokens` as a consecutive run (the adjacency
+ * a quoted websearch phrase requires), case-normalized upstream by ftsTokens. */
+function tokensContainRun(tokens: string[], phrase: string[]): boolean {
+  if (phrase.length === 0 || tokens.length < phrase.length) return false;
+  const last = tokens.length - phrase.length;
+  for (let i = 0; i <= last; i++) {
+    let ok = true;
+    for (let j = 0; j < phrase.length; j++) {
+      if (tokens[i + j] !== phrase[j]) {
+        ok = false;
+        break;
+      }
+    }
+    if (ok) return true;
+  }
+  return false;
+}
+
+function altMatches(alt: WebsearchAlt, docTokens: string[]): boolean {
+  for (const t of alt.excludedTerms) if (docTokens.includes(t)) return false;
+  for (const p of alt.excludedPhrases) if (tokensContainRun(docTokens, p)) return false;
+  for (const t of alt.terms) if (!docTokens.includes(t)) return false;
+  for (const p of alt.phrases) if (!tokensContainRun(docTokens, p)) return false;
+  if (alt.terms.length + alt.phrases.length === 0) {
+    // A pure-negation alternative (`-term` alone) mirrors `!term`: it matches
+    // every doc its exclusions don't rule out. A fully empty alternative
+    // (stray `or`) matches nothing.
+    return alt.excludedTerms.length + alt.excludedPhrases.length > 0;
+  }
+  return true;
+}
+
+/** Server-fixed word bound for harness snippets — mirrors the ts_headline
+ * `MaxWords=35` option the server pins for `snippet: true` (FM-31). */
+const SNIPPET_MAX_WORDS = 35;
+
+/** Snippet stand-in for the server's `ts_headline(<mark>, MaxWords=35)`: a
+ * window of ≤35 original-case words around the first matched term (or the
+ * doc's leading words when nothing marks cleanly), each matched term wrapped
+ * in `<mark>…</mark>`. Shape parity only — never byte-compared to Postgres. */
+function buildSearchSnippet(source: string, matchTerms: Set<string>): string {
+  const words = source.match(/[A-Za-z0-9]+/g) ?? [];
+  let first = words.findIndex((w) => matchTerms.has(w.toLowerCase()));
+  if (first === -1) first = 0;
+  const start = Math.max(0, first - 5);
+  return words
+    .slice(start, start + SNIPPET_MAX_WORDS)
+    .map((w) => (matchTerms.has(w.toLowerCase()) ? `<mark>${w}</mark>` : w))
+    .join(" ");
 }
 
 /** Indexed-column storage type, mirroring server `indexed_column_type`. */
@@ -2394,8 +2488,9 @@ export class InMemoryRtDbClient {
     return [];
   }
 
-  /** `search` terminal: full-text token-AND matching (default `tsquery` mode)
-   * or case-insensitive substring matching (`trgm` mode), each with a
+  /** `search` terminal: full-text matching under websearch syntax (default
+   * `tsquery` mode — quoted phrases, `or`, `-term`; FM-31) or
+   * case-insensitive substring matching (`trgm` mode), each with a
    * deterministic relevance stand-in. Verbatim lift of the former inline
    * `if (q.search !== undefined) { ... }` arm. */
   private executeSearchTerminal(
@@ -2424,11 +2519,13 @@ export class InMemoryRtDbClient {
         "search cannot be combined with index, eq, range bounds, order, unique, first, count, distinct, aggregate, paginate, filter, or vector search",
       );
     }
-    // Full-text matching (not ts_rank ordering): mirror `plainto_tsquery`
-    // token-AND semantics closely enough that a unit test can assert
-    // match/no-match. The query is tokenized into lowercase word lexemes and a
-    // doc matches when every query lexeme appears in the concatenated text of
-    // the search index's declared fields. Ranking is a deterministic stand-in
+    // Full-text matching (not ts_rank ordering): mirror
+    // `websearch_to_tsquery` semantics closely enough that a unit test can
+    // assert match/no-match — quoted phrases require adjacency, bare `or`
+    // unions alternatives, `-term` excludes, plain terms stay AND (a pure
+    // superset of the former plainto token-AND for plain input). A doc matches
+    // when ANY alternative matches against the concatenated text of the search
+    // index's declared fields. Ranking is a deterministic stand-in
     // (query-lexeme frequency desc, then `created_at` desc, then `id` desc) —
     // exact `ts_rank` order is intentionally not replicated. `take` (already
     // capped to MAX_TAKE above) limits the result.
@@ -2445,8 +2542,15 @@ export class InMemoryRtDbClient {
     if (search.filter) {
       validateFilter(search.filter, new Set(Object.keys(tableDef.fields)));
     }
+    // `snippet` needs a tsquery tree to highlight; trgm mode matches raw
+    // substrings, so the combination is rejected rather than silently
+    // ignored (mirrors server compile_search).
+    const snippet = search.snippet === true;
+    if (snippet && search.mode === "trgm") {
+      throw new RtDbError("BAD_REQUEST", "snippet is only supported in tsquery mode");
+    }
     const limit = q.take ?? MAX_TAKE;
-    const scored: Array<{ row: StoredRow; score: number }> = [];
+    const scored: Array<{ row: StoredRow; score: number; snippet?: string }> = [];
     if (search.mode === "trgm") {
       // `trgm` mode (ILIKE '%q%' + similarity() on the server): a doc matches
       // when ANY indexed field's lowercased text contains the lowercased query
@@ -2472,31 +2576,26 @@ export class InMemoryRtDbClient {
         if (best > 0) scored.push({ row, score: best });
       }
     } else {
-      const queryTokens = [...new Set(ftsTokens(search.query))];
-      if (queryTokens.length === 0) {
-        return [];
-      }
+      const alts = parseWebsearchQuery(search.query);
+      // Every positive lexeme across the alternatives (the query tree ts_headline
+      // would mark on the server) — reused for scoring and snippet highlights.
+      const positives = new Set(alts.flatMap((a) => [...a.terms, ...a.phrases.flat()]));
       for (const row of this.rowsFor(q.table).values()) {
         if (search.filter && !evalFilterExpr(search.filter, row.doc)) {
           continue;
         }
-        const docTokens = ftsTokens(
-          searchDef.fields.map((f) => ftsStringify(row.doc[f])).join(" "),
-        );
-        let score = 0;
-        let allPresent = true;
-        for (const qt of queryTokens) {
-          let occurrences = 0;
-          for (const dt of docTokens) {
-            if (dt === qt) occurrences++;
-          }
-          if (occurrences === 0) {
-            allPresent = false;
-            break;
-          }
-          score += occurrences;
+        const source = searchDef.fields.map((f) => ftsStringify(row.doc[f])).join(" ");
+        const docTokens = ftsTokens(source);
+        if (!alts.some((a) => altMatches(a, docTokens))) {
+          continue;
         }
-        if (allPresent) scored.push({ row, score });
+        let score = 0;
+        for (const dt of docTokens) {
+          if (positives.has(dt)) score++;
+        }
+        const hit: { row: StoredRow; score: number; snippet?: string } = { row, score };
+        if (snippet) hit.snippet = buildSearchSnippet(source, positives);
+        scored.push(hit);
       }
     }
     scored.sort((a, b) =>
@@ -2510,7 +2609,13 @@ export class InMemoryRtDbClient {
               ? 1
               : 0,
     );
-    return scored.slice(0, limit).map((s) => this.mergeDoc(s.row));
+    return scored
+      .slice(0, limit)
+      .map((s) =>
+        s.snippet !== undefined
+          ? { ...this.mergeDoc(s.row), _searchSnippet: s.snippet }
+          : this.mergeDoc(s.row),
+      );
   }
 
   /** `count` terminal: COUNT(*) over the matching set. Verbatim lift of the

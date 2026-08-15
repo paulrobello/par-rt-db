@@ -164,6 +164,28 @@ def test_corpus_schedule_infos_round_trip(entry: dict[str, Any]) -> None:
     assert dumped == entry, f"ScheduleInfo wire drift: {dumped} != {entry}"
 
 
+# --- corpus: read queries (the `Query` DSL wire model) ------------------------
+#
+# The `queries` section pins the read-query DSL every client must serialize
+# identically — including the search terminal's additive fields (`mode` FM-30,
+# operator-syntax query text and `snippet` FM-31). The python `Query` model
+# (par_rt_db.query) carries `extra='forbid'`, so this doubles as a
+# deny-unknown-fields check.
+
+
+@pytest.mark.parametrize(
+    "entry",
+    _corpus_section("queries"),
+    ids=lambda e: ",".join(sorted(e.keys() - {"table"})) or "bare",
+)
+def test_corpus_queries_round_trip(entry: dict[str, Any]) -> None:
+    from par_rt_db.query import Query
+
+    msg = Query.model_validate(entry)
+    dumped = msg.model_dump(by_alias=True, mode="json")
+    assert dumped == entry, f"Query wire drift: {dumped} != {entry}"
+
+
 # --- corpus: admin migrate wire (Directive list + MigrateResult) -------------
 #
 # The migrate types are part of the four-client wire contract (op tag, camelCase,

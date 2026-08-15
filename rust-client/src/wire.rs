@@ -308,16 +308,20 @@ pub struct ScheduleInfo {
 }
 
 /// A full-text search terminal over a declared search index. `index` names a
-/// search index on the query's table; `query` is free-form user text; `filter`
-/// is an optional `FilterExpr` (the db-side `filter()` DSL) that narrows the
-/// search `WHERE` server-side; `mode` selects the match strategy (FM-30) —
-/// `None`/`"tsquery"` is today's full-text behavior, `"trgm"` is
-/// substring/autocomplete matching over the index's text fields (see
-/// [`SearchMode`]). Mirrors `server/src/query.rs::SearchQuery` byte-for-byte
-/// (camelCase, deny_unknown_fields). The nested `filter` and `mode` are
-/// additive — omitted when `None`, so existing search requests round-trip
-/// unchanged — and `filter` is distinct from the Query-level top-level
-/// `filter` builder.
+/// search index on the query's table; `query` is free-form user text parsed
+/// with web-search operator syntax (FM-31) — quoted phrases require
+/// adjacency, the bare word `or` unions, `-term` excludes, plain terms stay
+/// ANDed; `filter` is an optional `FilterExpr` (the db-side `filter()` DSL)
+/// that narrows the search `WHERE` server-side; `mode` selects the match
+/// strategy (FM-30) — `None`/`"tsquery"` is today's full-text behavior,
+/// `"trgm"` is substring/autocomplete matching over the index's text fields
+/// (see [`SearchMode`]). `snippet` (FM-31) opts each hit into a
+/// `_searchSnippet` field — a server-rendered `<mark>`-highlighted fragment;
+/// tsquery mode only. Mirrors `server/src/query.rs::SearchQuery`
+/// byte-for-byte (camelCase, deny_unknown_fields). The nested `filter`,
+/// `mode`, and `snippet` are additive — omitted when `None`, so existing
+/// search requests round-trip unchanged — and `filter` is distinct from the
+/// Query-level top-level `filter` builder.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SearchQuery {
@@ -327,11 +331,13 @@ pub struct SearchQuery {
     pub filter: Option<FilterExpr>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<SearchMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snippet: Option<bool>,
 }
 
 /// Match mode for the `search` terminal. `Tsquery` (the default, and the
 /// behavior when `mode` is omitted) matches stemmed words via
-/// `tsvector @@ plainto_tsquery`, ranked by `ts_rank`. `Trgm` matches
+/// `tsvector @@ websearch_to_tsquery`, ranked by `ts_rank`. `Trgm` matches
 /// substrings case-insensitively (`ILIKE '%query%'`) over the search index's
 /// text fields — prefix/infix/autocomplete lookups FTS can't serve — ranked
 /// by `GREATEST(similarity(field, query))` (the doc's best-matching field),
@@ -837,6 +843,7 @@ mod tests {
             query: "hello world".into(),
             filter: None,
             mode: None,
+            snippet: None,
         };
         assert_eq!(
             serde_json::to_value(&q).unwrap(),
@@ -848,6 +855,7 @@ mod tests {
         assert_eq!(back.index, "search_content");
         assert!(back.filter.is_none());
         assert!(back.mode.is_none());
+        assert!(back.snippet.is_none());
 
         // `filter` present → emitted on the wire and round-trips through the
         // `FilterExpr` tag (`op`, lowercase). Mirrors the server's camelCase
@@ -868,6 +876,7 @@ mod tests {
                 ],
             }),
             mode: None,
+            snippet: None,
         };
         assert_eq!(
             serde_json::to_value(&with_filter).unwrap(),
@@ -895,6 +904,7 @@ mod tests {
             query: "conv".into(),
             filter: None,
             mode: Some(SearchMode::Trgm),
+            snippet: None,
         };
         assert_eq!(
             serde_json::to_value(&trgm).unwrap(),
@@ -913,6 +923,7 @@ mod tests {
             }),
             index: "search_body".into(),
             query: "conv".into(),
+            snippet: None,
         };
         assert_eq!(
             serde_json::to_value(&tsquery).unwrap(),
@@ -937,6 +948,49 @@ mod tests {
                 "index":"search_body","query":"conv","mode":"bogus"
             }))
             .is_err()
+        );
+    }
+
+    #[test]
+    fn search_query_snippet_wire_shape() {
+        // `snippet: Some(true)` → emitted on the wire and round-trips;
+        // `Some(false)` is honored when a caller names it (the server treats
+        // it exactly like omission). Mirrors the FM-31 corpus entry
+        // ("hello world" + snippet:true); operator-syntax query text is plain
+        // `query` string bytes — no new wire fields (covered by the other
+        // FM-31 corpus entry through tests/wire_corpus.rs).
+        let snippet = SearchQuery {
+            index: "search_body".into(),
+            query: "hello world".into(),
+            filter: None,
+            mode: None,
+            snippet: Some(true),
+        };
+        assert_eq!(
+            serde_json::to_value(&snippet).unwrap(),
+            json!({"index":"search_body","query":"hello world","snippet":true})
+        );
+        let back: SearchQuery = serde_json::from_value(json!({
+            "index":"search_body","query":"hello world","snippet":true
+        }))
+        .unwrap();
+        assert_eq!(back.snippet, Some(true));
+
+        // Omitted `snippet` deserializes to `None` and never re-serializes —
+        // existing traffic stays byte-identical.
+        let omitted: SearchQuery =
+            serde_json::from_value(json!({"index":"search_body","query":"hello world"})).unwrap();
+        assert_eq!(omitted.snippet, None);
+
+        // Explicit `Some(false)` serializes as `false` (additive opt-in the
+        // server reads as off — same behavior as omission).
+        let off = SearchQuery {
+            snippet: Some(false),
+            ..omitted.clone()
+        };
+        assert_eq!(
+            serde_json::to_value(&off).unwrap(),
+            json!({"index":"search_body","query":"hello world","snippet":false})
         );
     }
 

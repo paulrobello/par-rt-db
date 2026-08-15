@@ -62,13 +62,16 @@ export type SearchMode = "tsquery" | "trgm";
 /** Mirrors server `query::SearchQuery` byte-for-byte (camelCase, deny_unknown_fields).
  * `filter` narrows search results server-side via the db-side `FilterExpr` DSL
  * (the full type — not vector search's eq-only map); `mode` selects the match
- * strategy (`tsquery` default | `trgm` substring); both omitted on the wire
- * when absent so existing search requests stay byte-identical. */
+ * strategy (`tsquery` default | `trgm` substring); `snippet` (FM-31) opts each
+ * hit into a `_searchSnippet` ts_headline fragment (`<mark>`-wrapped,
+ * server-bounded; tsquery mode only) — all omitted on the wire when absent so
+ * existing search requests stay byte-identical. */
 export interface SearchQuery {
   index: string;
   query: string;
   filter?: FilterExpr;
   mode?: SearchMode;
+  snippet?: boolean;
 }
 
 /** Mirrors server `query::AggregateOp` byte-for-byte (lowercase variants).

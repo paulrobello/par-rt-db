@@ -214,22 +214,29 @@ SearchMode = Literal["tsquery", "trgm"]
 
 
 class SearchQuery(_Camel):
-    """Full-text search terminal: ``{index, query, filter?, mode?}``.
+    """Full-text search terminal: ``{index, query, filter?, mode?, snippet?}``.
 
     ``filter`` is the db-side ``FilterExpr`` (the same type ``.filter()`` and
     ``authorize`` use), narrowing search results server-side. ``mode`` selects
     the match strategy (FM-30): omitted/``"tsquery"`` is today's full-text
     behavior; ``"trgm"`` is substring matching over the index's text fields
-    (see ``SearchMode``). Both are omitted on the wire when ``None`` (mirrors
-    the server's ``#[serde(skip_serializing_if = "Option::is_none")]``), so
-    existing requests stay byte-identical. ``VectorSearchQuery.filter`` is the
-    same full ``FilterExpr`` type.
+    (see ``SearchMode``). ``snippet`` (FM-31) opts each hit into a
+    ``_searchSnippet`` field — a server-rendered ``ts_headline`` fragment with
+    matched terms wrapped in ``<mark>...</mark>``; tsquery mode only (the
+    server rejects it with ``mode="trgm"``). ``query`` honors web search
+    operators (FM-31): quoted phrases require adjacency, the bare word ``or``
+    unions, and ``-term`` excludes. ``filter``/``mode``/``snippet`` are omitted
+    on the wire when ``None`` (mirrors the server's
+    ``#[serde(skip_serializing_if = "Option::is_none")]``), so existing
+    requests stay byte-identical. ``VectorSearchQuery.filter`` is the same full
+    ``FilterExpr`` type.
     """
 
     index: str
     query: str
     filter: FilterExpr | None = None
     mode: SearchMode | None = None
+    snippet: bool | None = None
 
     @model_serializer(mode="wrap")
     def _drop_none_optionals(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
@@ -238,6 +245,8 @@ class SearchQuery(_Camel):
             out.pop("filter", None)
         if out.get("mode") is None:
             out.pop("mode", None)
+        if out.get("snippet") is None:
+            out.pop("snippet", None)
         return out
 
 

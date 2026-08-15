@@ -10,6 +10,7 @@
 //! referenced through `par_rt_db_client::wire::` because they are not (yet)
 //! re-exported from the crate root.
 
+use par_rt_db_client::Query;
 use par_rt_db_client::wire::{
     AuthedUser, ClientMessage, ScheduleInfo, ScheduleKind, ScheduleStatus, ScheduleWhen,
     ServerMessage, UserKind,
@@ -92,6 +93,21 @@ fn schedule_infos_round_trip() {
     let corpus = load_corpus();
     for (i, entry) in section(&corpus, "schedule_infos").iter().enumerate() {
         round_trip::<ScheduleInfo>("schedule_infos", i, entry);
+    }
+}
+
+/// The corpus `queries` section — embedded `Query` wire shapes covering
+/// filter/search/vectorSearch/paginate, including FM-31's operator-syntax
+/// search text and `snippet: true` (the operator syntax is plain `query`
+/// string bytes with no new wire fields; `snippet` must serialize back onto
+/// the terminal). `Query` lives in the query module and is re-exported from
+/// the crate root; it carries `deny_unknown_fields`, so this doubles as the
+/// rejection net for unknown query keys.
+#[test]
+fn queries_round_trip() {
+    let corpus = load_corpus();
+    for (i, entry) in section(&corpus, "queries").iter().enumerate() {
+        round_trip::<Query>("queries", i, entry);
     }
 }
 

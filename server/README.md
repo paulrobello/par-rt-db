@@ -96,7 +96,13 @@ search index carries a GIN trigram index (`tg_<table>_<index>`) beside its
 tsvector GIN, created on push with `IF NOT EXISTS` so existing deployments
 backfill on the next schema push; the tradeoff is roughly double the index
 storage over search fields. `mode` omitted (or `"tsquery"`) is today's
-full-text behavior, unchanged.
+full-text behavior, unchanged — except that query text is now parsed as
+websearch syntax (FM-31, `websearch_to_tsquery`): quoted phrases require
+adjacency, a bare `or` unions alternatives, `-term` excludes. An optional
+`snippet: true` (FM-31, tsquery mode only) attaches a `_searchSnippet` string
+to each hit — a `ts_headline` fragment with matched terms wrapped in `<mark>`,
+server-fixed word bounds (`MaxWords=35`, `MinWords=15`); `snippet` with
+`mode: "trgm"` is a `BAD_REQUEST`.
 
 ## Scheduling
 

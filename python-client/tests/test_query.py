@@ -273,6 +273,44 @@ def test_query_search_rejects_invalid_mode():
         TableQuery("t").search("idx", "conv", mode="fuzzy").build()  # type: ignore[arg-type]
 
 
+def test_query_search_emits_snippet_when_set():
+    # FM-31: snippet=True lands on the wire (each hit gains a server-rendered
+    # <mark>-highlighted `_searchSnippet`); an explicit False serializes too
+    # (the server skips only None) and behaves like omission server-side.
+    out = (
+        TableQuery("t")
+        .search("idx", '"exact phrase" or -excluded', snippet=True)
+        .build()
+        .model_dump(by_alias=True, mode="json")["search"]
+    )
+    assert out == {
+        "index": "idx",
+        "query": '"exact phrase" or -excluded',
+        "snippet": True,
+    }
+    explicit_false = (
+        TableQuery("t")
+        .search("idx", "hello", snippet=False)
+        .build()
+        .model_dump(by_alias=True, mode="json")["search"]
+    )
+    assert explicit_false == {"index": "idx", "query": "hello", "snippet": False}
+
+
+def test_query_search_omits_snippet_when_absent():
+    # Unset (the default) keeps existing requests byte-identical; it composes
+    # with the FM-30 mode opt without forcing either field onto the wire.
+    out = (
+        TableQuery("t")
+        .search("idx", "hello", mode="trgm")
+        .build()
+        .model_dump(by_alias=True, mode="json")["search"]
+    )
+    assert out == {"index": "idx", "query": "hello", "mode": "trgm"}
+    bare = TableQuery("t").search("idx", "hello").build()
+    assert "snippet" not in bare.model_dump(by_alias=True, mode="json")["search"]
+
+
 def test_query_vector_search_without_filter():
     v = TableQuery("t").vector_search("vidx", [1.0, 2.0], limit=3)
     assert v.build().model_dump(by_alias=True, mode="json")["vectorSearch"] == {

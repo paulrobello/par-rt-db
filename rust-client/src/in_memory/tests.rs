@@ -2918,6 +2918,7 @@ async fn query_search_rejects_conflicting_terminals() {
                 query: "hello".into(),
                 filter: None,
                 mode: None,
+                snippet: None,
             }),
             index: Some("by_name".into()),
             ..Default::default()
@@ -2948,6 +2949,7 @@ async fn query_search_with_filter_returns_empty_after_narrowing() {
                             value: "done".into(),
                         }),
                         mode: None,
+                        snippet: None,
                     },
                 )
                 .take(5),
@@ -2974,6 +2976,7 @@ async fn query_search_with_unknown_filter_field_is_bad_request() {
                             value: "x".into(),
                         }),
                         mode: None,
+                        snippet: None,
                     },
                 )
                 .take(5),
@@ -3037,6 +3040,7 @@ async fn query_search_trgm_substring_match_ranks_and_takes() {
                     SearchOpts {
                         filter: None,
                         mode: Some(SearchMode::Trgm),
+                        snippet: None,
                     },
                 )
                 .take(10),
@@ -3057,6 +3061,7 @@ async fn query_search_trgm_substring_match_ranks_and_takes() {
                     SearchOpts {
                         filter: None,
                         mode: Some(SearchMode::Trgm),
+                        snippet: None,
                     },
                 )
                 .take(2),
@@ -3082,6 +3087,7 @@ async fn query_search_trgm_is_case_insensitive_and_index_scoped() {
                         SearchOpts {
                             filter: None,
                             mode: Some(SearchMode::Trgm),
+                            snippet: None,
                         },
                     )
                     .take(5),
@@ -3099,6 +3105,7 @@ async fn query_search_trgm_is_case_insensitive_and_index_scoped() {
                     SearchOpts {
                         filter: None,
                         mode: Some(SearchMode::Trgm),
+                        snippet: None,
                     },
                 )
                 .take(5),
@@ -3136,6 +3143,7 @@ async fn query_search_trgm_requires_the_whole_query_as_substring() {
                     SearchOpts {
                         filter: None,
                         mode: Some(SearchMode::Trgm),
+                        snippet: None,
                     },
                 )
                 .take(5),
@@ -3170,6 +3178,7 @@ async fn query_search_trgm_composes_with_filter() {
                             value: "done".into(),
                         }),
                         mode: Some(SearchMode::Trgm),
+                        snippet: None,
                     },
                 )
                 .take(1),
@@ -3205,6 +3214,7 @@ async fn query_search_explicit_tsquery_mode_equals_omitted() {
                     SearchOpts {
                         filter: None,
                         mode: Some(SearchMode::Tsquery),
+                        snippet: None,
                     },
                 )
                 .take(5),
@@ -3225,7 +3235,15 @@ async fn query_search_rejects_empty_query_in_both_modes() {
             let err = c
                 .run::<Vec<Value>>(
                     &TableQuery::new("items")
-                        .search("by_content", query, SearchOpts { filter: None, mode })
+                        .search(
+                            "by_content",
+                            query,
+                            SearchOpts {
+                                filter: None,
+                                mode,
+                                snippet: None,
+                            },
+                        )
                         .take(5),
                 )
                 .unwrap_err();
@@ -3246,13 +3264,245 @@ async fn query_search_requires_a_search_index_in_both_modes() {
         let err = c
             .run::<Vec<Value>>(
                 &TableQuery::new("items")
-                    .search("by_name", "convex", SearchOpts { filter: None, mode })
+                    .search(
+                        "by_name",
+                        "convex",
+                        SearchOpts {
+                            filter: None,
+                            mode,
+                            snippet: None,
+                        },
+                    )
                     .take(5),
             )
             .unwrap_err();
         assert_eq!(err.code, ErrorCode::BadRequest, "mode {mode:?}");
         assert_eq!(err.message, "search index 'by_name' not found");
     }
+}
+
+#[tokio::test]
+async fn query_search_phrase_requires_adjacent_words() {
+    // A quoted phrase requires the words ADJACENT (FM-31): only the doc where
+    // "database notes" appears contiguously matches; the doc carrying the
+    // same words apart does not. Unquoted, the same words stay ANDed — so
+    // both docs match — pinning plain-query equivalence with the pre-FM-31
+    // token-AND behavior through the websearch upgrade (mirrors the server's
+    // `phrase_query_requires_adjacent_words`).
+    let mut c = new_client();
+    seed_search_items(
+        &mut c,
+        &[
+            ("the database notes are great", "todo"),
+            ("notes about the database", "todo"),
+        ],
+    )
+    .await;
+    let names = |v: &[Value]| -> Vec<String> {
+        v.iter()
+            .filter_map(|d| d["name"].as_str().map(String::from))
+            .collect()
+    };
+
+    let phrase = c
+        .run::<Vec<Value>>(
+            &TableQuery::new("items")
+                .search("by_content", "\"database notes\"", ())
+                .take(5),
+        )
+        .expect("phrase search");
+    assert_eq!(
+        names(&phrase),
+        ["the database notes are great".to_string()],
+        "only the adjacent doc matches a quoted phrase"
+    );
+
+    let plain = c
+        .run::<Vec<Value>>(
+            &TableQuery::new("items")
+                .search("by_content", "database notes", ())
+                .take(5),
+        )
+        .expect("plain AND search");
+    let plain_names = names(&plain);
+    assert_eq!(plain_names.len(), 2, "unquoted terms stay ANDed");
+    assert!(plain_names.contains(&"the database notes are great".to_string()));
+    assert!(plain_names.contains(&"notes about the database".to_string()));
+}
+
+#[tokio::test]
+async fn query_search_or_operator_unions_alternatives() {
+    // The bare word `or` unions alternatives (FM-31): a doc with either term
+    // matches; an unrelated doc does not (mirrors the server's
+    // `or_operator_unions_alternatives`).
+    let mut c = new_client();
+    seed_search_items(
+        &mut c,
+        &[
+            ("alpha only", "todo"),
+            ("beta only", "todo"),
+            ("gamma", "todo"),
+        ],
+    )
+    .await;
+    let v = c
+        .run::<Vec<Value>>(
+            &TableQuery::new("items")
+                .search("by_content", "alpha or beta", ())
+                .take(5),
+        )
+        .expect("or search");
+    let names: Vec<&str> = v.iter().filter_map(|d| d["name"].as_str()).collect();
+    assert_eq!(names.len(), 2);
+    assert!(names.contains(&"alpha only"));
+    assert!(names.contains(&"beta only"));
+    assert!(!names.contains(&"gamma"));
+}
+
+#[tokio::test]
+async fn query_search_minus_operator_excludes_term() {
+    // `-term` excludes docs carrying the negated word while keeping the
+    // positive one (FM-31; mirrors the server's `minus_operator_excludes_term`).
+    let mut c = new_client();
+    seed_search_items(
+        &mut c,
+        &[("database intro", "todo"), ("database cooking", "todo")],
+    )
+    .await;
+    let v = c
+        .run::<Vec<Value>>(
+            &TableQuery::new("items")
+                .search("by_content", "database -cooking", ())
+                .take(5),
+        )
+        .expect("minus search");
+    let names: Vec<&str> = v.iter().filter_map(|d| d["name"].as_str()).collect();
+    assert_eq!(names, ["database intro"]);
+}
+
+#[tokio::test]
+async fn query_search_snippet_marks_matched_terms() {
+    // snippet: true attaches a `_searchSnippet` to every hit — a ≤35-word
+    // excerpt with the matched word wrapped in <mark> (FM-31). Omitted or
+    // explicitly false, no snippet field appears (mirrors the server's
+    // `snippet_returns_highlighted_fragment` /
+    // `snippet_false_behaves_like_omitted`).
+    let mut c = new_client();
+    seed_search_items(&mut c, &[("the database notes are great", "todo")]).await;
+
+    let v = c
+        .run::<Vec<Value>>(
+            &TableQuery::new("items")
+                .search(
+                    "by_content",
+                    "database",
+                    SearchOpts {
+                        filter: None,
+                        mode: None,
+                        snippet: Some(true),
+                    },
+                )
+                .take(5),
+        )
+        .expect("snippet search");
+    assert_eq!(v.len(), 1);
+    let snippet = v[0]["_searchSnippet"].as_str().expect("snippet string");
+    assert!(
+        snippet.contains("<mark>database</mark>"),
+        "no highlighted term in {snippet}"
+    );
+    assert!(
+        snippet.split_whitespace().count() <= 35,
+        "snippet exceeds the word bound: {snippet}"
+    );
+
+    // Omitted snippet: no field.
+    let plain = c
+        .run::<Vec<Value>>(
+            &TableQuery::new("items")
+                .search("by_content", "database", ())
+                .take(5),
+        )
+        .expect("plain search");
+    assert_eq!(plain.len(), 1);
+    assert!(
+        plain[0].get("_searchSnippet").is_none(),
+        "snippet field present without snippet: true"
+    );
+
+    // Explicit `Some(false)` behaves exactly like omission.
+    let off = c
+        .run::<Vec<Value>>(
+            &TableQuery::new("items")
+                .search(
+                    "by_content",
+                    "database",
+                    SearchOpts {
+                        filter: None,
+                        mode: None,
+                        snippet: Some(false),
+                    },
+                )
+                .take(5),
+        )
+        .expect("snippet-false search");
+    assert_eq!(off.len(), 1);
+    assert!(off[0].get("_searchSnippet").is_none());
+}
+
+#[tokio::test]
+async fn query_search_snippet_highlights_phrase_queries() {
+    // The snippet render highlights the PHRASE words too — like the server's
+    // ts_headline, each matched word carries its own <mark>, adjacent for a
+    // phrase hit (mirrors `snippet_highlights_phrase_queries`).
+    let mut c = new_client();
+    seed_search_items(&mut c, &[("the database notes are great", "todo")]).await;
+    let v = c
+        .run::<Vec<Value>>(
+            &TableQuery::new("items")
+                .search(
+                    "by_content",
+                    "\"database notes\"",
+                    SearchOpts {
+                        filter: None,
+                        mode: None,
+                        snippet: Some(true),
+                    },
+                )
+                .take(5),
+        )
+        .expect("phrase snippet search");
+    assert_eq!(v.len(), 1);
+    let snippet = v[0]["_searchSnippet"].as_str().expect("snippet string");
+    assert!(
+        snippet.contains("<mark>database</mark> <mark>notes</mark>"),
+        "phrase words not contiguously highlighted in {snippet}"
+    );
+}
+
+#[tokio::test]
+async fn query_search_snippet_rejected_with_trgm_mode() {
+    // snippet + trgm is rejected up front — trgm matches substrings, so
+    // there is no tsquery tree to highlight (mirrors the server's
+    // `snippet_rejected_with_trgm_mode`).
+    let c = new_client();
+    let err = c
+        .run::<Vec<Value>>(
+            &TableQuery::new("items")
+                .search(
+                    "by_content",
+                    "conv",
+                    SearchOpts {
+                        filter: None,
+                        mode: Some(SearchMode::Trgm),
+                        snippet: Some(true),
+                    },
+                )
+                .take(5),
+        )
+        .unwrap_err();
+    assert_eq!(err.code, ErrorCode::BadRequest);
+    assert!(err.message.contains("tsquery mode"), "got: {err}");
 }
 
 #[tokio::test]

@@ -2285,6 +2285,159 @@ describe("InMemoryRtDbClient — trgm search (mode: 'trgm')", () => {
   });
 });
 
+describe("InMemoryRtDbClient — phrase/operator search (websearch syntax, FM-31)", () => {
+  const phraseSchema = defineSchema({
+    notes: defineTable({
+      title: t.string(),
+      body: t.string(),
+    }).searchIndex("search_text", ["title", "body"]),
+  });
+  const phraseApi = createApi(phraseSchema);
+
+  function phraseClient(): InMemoryRtDbClient {
+    let ms = 1_800_000_000_000;
+    const c = new InMemoryRtDbClient({ now: () => ms++, random: () => 0 });
+    c.pushSchema(phraseSchema);
+    return c;
+  }
+
+  async function seedPhrases(c: InMemoryRtDbClient): Promise<void> {
+    await c.mutate(
+      mutation().insert("notes", { title: "Database notes", body: "keep them close" }).build(),
+    );
+    await c.mutate(
+      mutation()
+        .insert("notes", { title: "Database", body: "scattered notes about lunch" })
+        .build(),
+    );
+  }
+
+  async function seedOr(c: InMemoryRtDbClient): Promise<void> {
+    await c.mutate(mutation().insert("notes", { title: "Alpha doc", body: "first" }).build());
+    await c.mutate(mutation().insert("notes", { title: "Beta doc", body: "second" }).build());
+    await c.mutate(mutation().insert("notes", { title: "Gamma doc", body: "neither" }).build());
+  }
+
+  async function seedMinus(c: InMemoryRtDbClient): Promise<void> {
+    await c.mutate(
+      mutation().insert("notes", { title: "Database intro", body: "cooking recipes" }).build(),
+    );
+    await c.mutate(
+      mutation().insert("notes", { title: "Database advanced", body: "query planning" }).build(),
+    );
+  }
+
+  it("a quoted phrase requires adjacent words", async () => {
+    const c = phraseClient();
+    await seedPhrases(c);
+    const docs = (await c.query(
+      phraseApi.notes.query().search("search_text", '"database notes"').take(10),
+    )) as Array<{ title: string }>;
+    expect(docs.map((d) => d.title)).toEqual(["Database notes"]);
+  });
+
+  it("the same words unquoted match both docs (plain AND is unchanged)", async () => {
+    const c = phraseClient();
+    await seedPhrases(c);
+    const docs = (await c.query(
+      phraseApi.notes.query().search("search_text", "database notes").take(10),
+    )) as Array<{ title: string }>;
+    expect(docs.map((d) => d.title).sort()).toEqual(["Database", "Database notes"]);
+  });
+
+  it("a bare 'or' unions alternatives", async () => {
+    const c = phraseClient();
+    await seedOr(c);
+    const docs = (await c.query(
+      phraseApi.notes.query().search("search_text", "alpha or beta").take(10),
+    )) as Array<{ title: string }>;
+    expect(docs.map((d) => d.title).sort()).toEqual(["Alpha doc", "Beta doc"]);
+    // 'or' outside quotes only — a quoted "or" is a literal term.
+    const literal = (await c.query(
+      phraseApi.notes.query().search("search_text", '"alpha or beta"').take(10),
+    )) as Array<{ title: string }>;
+    expect(literal).toEqual([]);
+  });
+
+  it("'-term' excludes docs carrying the negated word", async () => {
+    const c = phraseClient();
+    await seedMinus(c);
+    const docs = (await c.query(
+      phraseApi.notes.query().search("search_text", "database -cooking").take(10),
+    )) as Array<{ title: string }>;
+    expect(docs.map((d) => d.title)).toEqual(["Database advanced"]);
+  });
+
+  it("snippet:true attaches a <mark>-wrapped _searchSnippet to each hit", async () => {
+    const c = phraseClient();
+    await seedPhrases(c);
+    const docs = (await c.query(
+      phraseApi.notes.query().search("search_text", "database", { snippet: true }).take(10),
+    )) as Array<{ title: string; _searchSnippet?: string }>;
+    expect(docs).toHaveLength(2);
+    for (const d of docs) {
+      expect(typeof d._searchSnippet).toBe("string");
+      expect(d._searchSnippet).toContain("<mark>Database</mark>");
+      expect(d._searchSnippet?.split(" ").length).toBeLessThanOrEqual(35);
+    }
+  });
+
+  it("a phrase query snippet marks each adjacent word", async () => {
+    const c = phraseClient();
+    await seedPhrases(c);
+    const docs = (await c.query(
+      phraseApi.notes.query().search("search_text", '"database notes"', { snippet: true }).take(10),
+    )) as Array<{ title: string; _searchSnippet?: string }>;
+    expect(docs).toHaveLength(1);
+    expect(docs[0]._searchSnippet).toContain("<mark>Database</mark> <mark>notes</mark>");
+  });
+
+  it("snippet honors the ≤35-word bound on a long doc", async () => {
+    const c = phraseClient();
+    const words = Array.from({ length: 60 }, (_, i) => `w${i}`);
+    words[30] = "database";
+    await c.mutate(
+      mutation()
+        .insert("notes", { title: "long doc", body: words.join(" ") })
+        .build(),
+    );
+    const docs = (await c.query(
+      phraseApi.notes.query().search("search_text", "database", { snippet: true }).take(10),
+    )) as Array<{ title: string; _searchSnippet?: string }>;
+    expect(docs).toHaveLength(1);
+    expect(docs[0]._searchSnippet).toBeDefined();
+    expect(docs[0]._searchSnippet?.split(" ").length).toBe(35);
+  });
+
+  it("_searchSnippet is absent when snippet is omitted and when explicitly false", async () => {
+    const c = phraseClient();
+    await seedPhrases(c);
+    const omitted = (await c.query(
+      phraseApi.notes.query().search("search_text", "database").take(10),
+    )) as Array<{ title: string; _searchSnippet?: string }>;
+    expect(omitted).toHaveLength(2);
+    for (const d of omitted) expect(d._searchSnippet).toBeUndefined();
+    const off = (await c.query(
+      phraseApi.notes.query().search("search_text", "database", { snippet: false }).take(10),
+    )) as Array<{ title: string; _searchSnippet?: string }>;
+    expect(off).toHaveLength(2);
+    for (const d of off) expect(d._searchSnippet).toBeUndefined();
+  });
+
+  it("rejects snippet:true combined with mode 'trgm' (BAD_REQUEST)", async () => {
+    const c = phraseClient();
+    await seedPhrases(c);
+    await expect(
+      c.query(
+        phraseApi.notes
+          .query()
+          .search("search_text", "database", { mode: "trgm", snippet: true })
+          .take(10),
+      ),
+    ).rejects.toThrow(/snippet is only supported in tsquery mode/);
+  });
+});
+
 describe("InMemoryRtDbClient — vector search", () => {
   const vectorSchema = defineSchema({
     docs: defineTable({

@@ -20,12 +20,18 @@ reactive subscriptions, and scheduled-job ``tick``).
 ``vectorSearch`` treats every table row as a candidate (the sound
 over-approximation — it does not rank by vector similarity), ``hybridSearch``
 returns an empty list after the same combination guards the server enforces,
-and ``search`` treats every table row as a candidate in the default
-``tsquery`` mode (``ts_rank`` is not modeled) while ``trgm`` mode (FM-30)
-matches for real — case-insensitive substring containment over the index's
-fields, ranked by the pinned ``len(query) / len(field)`` similarity. Both
-modes share the server's ``compile_search`` validation prologue: empty query
-text and non-search index names are rejected.
+``search`` in ``trgm`` mode (FM-30) matches for real — case-insensitive
+substring containment over the index's fields, ranked by the pinned
+``len(query) / len(field)`` similarity — and ``search`` in the default
+``tsquery`` mode (FM-31) approximates the server's
+``websearch_to_tsquery`` match: quoted phrases require word adjacency
+(case-insensitive), the bare word ``or`` unions alternatives, ``-term``
+excludes, and other terms are ANDed (stemming and ``ts_rank`` are not
+modeled — see :func:`_parse_websearch`). ``snippet=True`` (FM-31) attaches a
+``_searchSnippet`` excerpt (≤35 words, matched terms wrapped in ``<mark>``)
+to each hit, and is rejected with ``mode="trgm"``. Both modes share the
+server's ``compile_search`` validation prologue: empty query text and
+non-search index names are rejected.
 
 Simplifications vs. the live server (be explicit when relying on these):
 
@@ -1310,12 +1316,14 @@ class InMemoryRtDbClient:
 
         Lift of the former inline ``if q.search is not None:`` arm of
         :meth:`run_query`; mirrors ``ts-client``'s ``executeSearchTerminal``.
-        Full-text ranking (tsvector match + ``ts_rank``) is not modeled
-        in-memory, so every table row is a candidate (the sound
-        over-approximation — a real match can never be excluded); a declared
-        ``filter`` narrows the set via :func:`_eval_filter_expr`. ``trgm`` mode
-        (FM-30) does match for real — substring containment is modeled — and
-        routes to :meth:`_execute_trgm_search`.
+        A declared ``filter`` narrows the candidate set via
+        :func:`_eval_filter_expr`. ``tsquery`` mode (the default) approximates
+        the server's ``websearch_to_tsquery`` match — quoted phrases require
+        adjacency, ``or`` unions, ``-term`` excludes, other terms ANDed
+        (:func:`_parse_websearch`; stemming and ``ts_rank`` are not modeled) —
+        and routes to :meth:`_execute_tsquery_search`. ``trgm`` mode (FM-30)
+        matches for real — substring containment is modeled — and routes to
+        :meth:`_execute_trgm_search`.
         """
         assert q.search is not None  # caller dispatches only when set
         if (
@@ -1338,7 +1346,9 @@ class InMemoryRtDbClient:
             )
         # Shared validation prologue — mirrors the server's ``compile_search``
         # order and applies to BOTH modes: empty query text, then search-index
-        # resolution (a btree name is not a search surface), then filter shape.
+        # resolution (a btree name is not a search surface), then the
+        # snippet+trgm rejection (a snippet needs a tsquery tree to highlight),
+        # then filter shape.
         if not q.search.query.strip():
             raise RtDbError(ErrorCode.BAD_REQUEST, "search query text must not be empty")
         search_def = next(
@@ -1346,6 +1356,8 @@ class InMemoryRtDbClient:
         )
         if search_def is None:
             raise RtDbError(ErrorCode.BAD_REQUEST, f"search index '{q.search.index}' not found")
+        if q.search.snippet is True and q.search.mode == "trgm":
+            raise RtDbError(ErrorCode.BAD_REQUEST, "snippet is only supported in tsquery mode")
         if q.search.filter is not None:
             _validate_filter(q.search.filter, set(table_def.fields.keys()))
         candidates: list[StoredRow] = [row for (t, _id), row in self._docs.items() if t == q.table]
@@ -1353,7 +1365,39 @@ class InMemoryRtDbClient:
             candidates = [row for row in candidates if _eval_filter_expr(q.search.filter, row.doc)]
         if q.search.mode == "trgm":
             return self._execute_trgm_search(q, search_def, candidates)
-        return [_merge_doc(row) for row in candidates]
+        return self._execute_tsquery_search(q, search_def, candidates)
+
+    def _execute_tsquery_search(
+        self, q: Query, search_def: IndexDef, candidates: list[StoredRow]
+    ) -> list[dict[str, Any]]:
+        """``search`` terminal, default ``tsquery`` mode (FM-31): websearch match.
+
+        Approximates the server's ``tsvector @@ websearch_to_tsquery`` over the
+        index's fields: exact case-insensitive word equality (stemming is not
+        modeled — ``"running"`` does not match ``runs``), phrases as contiguous
+        word runs, ``or`` as a union of AND-segments, ``-term`` as exclusion.
+        Ranking (``ts_rank``) is not modeled, so hits return in insertion
+        order and ``take`` is not applied (the matched set is a sound
+        superset of any server top-N). ``snippet=True`` attaches a
+        ``_searchSnippet`` to each hit — a ≤35-word excerpt with matched words
+        wrapped in ``<mark>`` (the ``ts_headline`` stand-in; the server's
+        MaxWords=35/MinWords=15 bounds are approximated by the word cap). The
+        caller's shared prologue already rejected an empty query, resolved the
+        search index, and rejected ``snippet`` + ``trgm``.
+        """
+        assert q.search is not None  # caller dispatches only in the tsquery arm
+        parsed = _parse_websearch(q.search.query)
+        snippet = q.search.snippet is True
+        out: list[dict[str, Any]] = []
+        for row in candidates:
+            words = _search_field_words(search_def, row.doc)
+            if not _websearch_matches(parsed, words):
+                continue
+            doc = _merge_doc(row)
+            if snippet:
+                doc["_searchSnippet"] = _websearch_snippet(parsed, words)
+            out.append(doc)
+        return out
 
     def _execute_trgm_search(
         self, q: Query, search_def: IndexDef, candidates: list[StoredRow]
@@ -3190,6 +3234,150 @@ def _compare_values(op: str, lhs: Any, rhs: Any) -> bool:
     if op == "lte":
         return lhs <= rhs
     return False
+
+
+# ---------------------------------------------------------------------------
+# Websearch `search` helpers (FM-31) — the tsquery-mode approximation
+# ---------------------------------------------------------------------------
+
+#: Word cap on the harness ``_searchSnippet`` excerpt — the server's
+#: ``ts_headline`` ``MaxWords=35`` bound (``SNIPPET_HEADLINE_OPTS`` in
+#: ``server/src/query.rs``). ``MinWords=15`` has no harness analogue: the
+#: excerpt simply runs to the cap (or the end of the text).
+_WEBSEARCH_SNIPPET_MAX_WORDS = 35
+
+
+@dataclass
+class _Websearch:
+    """Parsed websearch query — the output of :func:`_parse_websearch`.
+
+    ``segments`` are AND-groups joined by OR (websearch precedence: ``&``
+    binds tighter than ``|`` — ``a b or c`` is ``(a & b) | c``); each unit is
+    a word tuple — one word for a bare term, the phrase words for a quoted
+    span (matched as a contiguous run). ``excluded`` units (from ``-term``)
+    filter globally: a doc containing one never matches.
+    """
+
+    segments: list[list[tuple[str, ...]]]
+    excluded: list[tuple[str, ...]]
+
+
+def _websearch_tokens(text: str) -> list[tuple[bool, str]]:
+    """Split websearch text into ``(is_phrase, raw)`` tokens: quoted spans and
+    whitespace-delimited bare words. An unterminated quote takes the rest of
+    the text as one phrase (Postgres behavior)."""
+    tokens: list[tuple[bool, str]] = []
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch.isspace():
+            i += 1
+        elif ch == '"':
+            end = text.find('"', i + 1)
+            if end == -1:
+                tokens.append((True, text[i + 1 :]))
+                break
+            tokens.append((True, text[i + 1 : end]))
+            i = end + 1
+        else:
+            j = i
+            while j < n and not text[j].isspace() and text[j] != '"':
+                j += 1
+            tokens.append((False, text[i:j]))
+            i = j
+    return tokens
+
+
+def _parse_websearch(text: str) -> _Websearch:
+    """Approximate Postgres ``websearch_to_tsquery`` (FM-31).
+
+    Builds the same expression shape PG builds — OR-of-AND-segments over
+    positive units — where a unit is a bare word or a quoted phrase (matched
+    as a contiguous word run, case-insensitive). ``or`` (outside quotes,
+    case-insensitive) starts a new AND-segment; a doubled or leading ``or``
+    is a literal word (a PG quirk kept for parity: ``a or or b`` is
+    ``a | (or & b)``). ``-word`` — and ``-"a phrase"`` — excludes. Deliberate
+    simplifications vs. the live server: stemming is not modeled (exact word
+    equality — ``"running"`` misses a doc saying ``runs``), punctuation inside
+    tokens is kept verbatim, and an exclusion always filters the whole
+    result even where PG would scope it into one ``or`` branch (``x or -y``).
+    """
+    tokens = _websearch_tokens(text)
+    segments: list[list[tuple[str, ...]]] = [[]]
+    excluded: list[tuple[str, ...]] = []
+    i = 0
+    while i < len(tokens):
+        is_phrase, raw = tokens[i]
+        i += 1
+        if is_phrase:
+            unit = tuple(w.lower() for w in raw.split())
+            if unit:
+                segments[-1].append(unit)
+            continue
+        if raw.lower() == "or" and segments[-1]:
+            segments.append([])
+            continue
+        if raw.startswith("-"):
+            body = raw.lstrip("-")
+            if body:
+                excluded.append((body.lower(),))
+                continue
+            # A bare `-` negates the next token when it is a quoted phrase
+            # (`-"a b"` -> exclude the adjacent run); otherwise it carries no
+            # operand and is dropped.
+            if i < len(tokens) and tokens[i][0]:
+                phrase = tuple(w.lower() for w in tokens[i][1].split())
+                i += 1
+                if phrase:
+                    excluded.append(phrase)
+            continue
+        segments[-1].append((raw.lower(),))
+    return _Websearch(segments=[s for s in segments if s], excluded=excluded)
+
+
+def _search_field_words(search_def: IndexDef, doc: dict[str, Any]) -> list[str]:
+    """The search surface's text as a word list: the index's declared string
+    fields joined in order — the same concatenation the server's generated
+    tsvector column is built over (``coalesce(f, '') || ' ' || ...``), so
+    phrases may span field boundaries here too. Non-string values contribute
+    nothing (their tsvector text is empty)."""
+    parts = [v for field in search_def.fields if isinstance(v := doc.get(field), str)]
+    return " ".join(parts).split()
+
+
+def _websearch_unit_in(unit: tuple[str, ...], low_words: list[str]) -> bool:
+    """A unit matches when its words appear as a contiguous run in the
+    lowercased word list — a phrase needs adjacency; a lone word is a 1-run
+    (present anywhere)."""
+    n = len(unit)
+    if n == 0:
+        return False
+    return any(low_words[i : i + n] == list(unit) for i in range(len(low_words) - n + 1))
+
+
+def _websearch_matches(parsed: _Websearch, words: list[str]) -> bool:
+    """Evaluate a parsed websearch query against one doc's (original-case)
+    word list: no excluded unit may match, and some AND-segment must match in
+    full. No positive segments (a pure ``-term`` query, or bare punctuation)
+    matches everything not excluded — PG's bare ``!term`` behavior."""
+    low = [w.lower() for w in words]
+    if any(_websearch_unit_in(unit, low) for unit in parsed.excluded):
+        return False
+    return (not parsed.segments) or any(
+        all(_websearch_unit_in(unit, low) for unit in segment) for segment in parsed.segments
+    )
+
+
+def _websearch_snippet(parsed: _Websearch, words: list[str]) -> str:
+    """The ``_searchSnippet`` stand-in: a ≤35-word excerpt (the server's
+    ``ts_headline`` ``MaxWords`` bound) starting at the first matched word,
+    with every positive-unit word wrapped in ``<mark>...</mark>`` — phrases
+    render as adjacent per-word marks, like the server. Excluded words are
+    not marked (the headline renders the positive tree only)."""
+    mark = {w for segment in parsed.segments for unit in segment for w in unit}
+    start = next((i for i, w in enumerate(words) if w.lower() in mark), 0)
+    window = words[start : start + _WEBSEARCH_SNIPPET_MAX_WORDS]
+    return " ".join(f"<mark>{w}</mark>" if w.lower() in mark else w for w in window)
 
 
 # Suppress an unused-import warning for `field` (re-exported for parity with the

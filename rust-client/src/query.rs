@@ -144,17 +144,20 @@ impl From<()> for HybridSearchOpts {
 /// `FilterExpr` (the db-side `filter()` DSL) that narrows the search `WHERE`
 /// server-side; `mode` selects the match strategy (FM-30) — `None` keeps the
 /// default full-text (`tsquery`) behavior, `Some(SearchMode::Trgm)` opts into
-/// substring/autocomplete matching over the index's text fields. Both default
-/// to `None` (nothing extra on the wire). The search filter is nested on the
-/// terminal — distinct from the top-level `.filter()` builder, which is
+/// substring/autocomplete matching over the index's text fields; `snippet`
+/// (FM-31) opts each hit into a server-rendered `_searchSnippet` highlight
+/// fragment (tsquery mode only — the server rejects it with `trgm`). All
+/// default to `None` (nothing extra on the wire). The search filter is nested
+/// on the terminal — distinct from the top-level `.filter()` builder, which is
 /// mutually exclusive with `search` — so callers pass it through the
-/// `.search(idx, text, { filter, mode })` opts, not a chained `.filter()`.
-/// `From<()>` lets callers omit both (`.search(idx, text, ())`); a
-/// `SearchOpts { .. }` literal names the fields.
+/// `.search(idx, text, { filter, mode, snippet })` opts, not a chained
+/// `.filter()`. `From<()>` lets callers omit them (`.search(idx, text, ())`);
+/// a `SearchOpts { .. }` literal names the fields.
 #[derive(Debug, Clone, Default)]
 pub struct SearchOpts {
     pub filter: Option<FilterExpr>,
     pub mode: Option<SearchMode>,
+    pub snippet: Option<bool>,
 }
 
 impl From<()> for SearchOpts {
@@ -227,13 +230,17 @@ impl TableQuery {
     /// rejects every other terminal alongside it.
     ///
     /// `opts` accepts any `Into<SearchOpts>`: pass `()` to omit the filter
-    /// (`.search(idx, text, ())`), or a `SearchOpts { filter, mode }` literal to
-    /// narrow results server-side via a `FilterExpr` and/or opt into
-    /// substring/autocomplete matching via `SearchMode::Trgm` (FM-30; `mode` is
-    /// omitted on the wire when `None`, so both forms serialize identically when
-    /// the default tsquery behavior is wanted). The nested filter is distinct
-    /// from the top-level `.filter()` builder (which is mutually exclusive with
-    /// `search`) and is likewise omitted on the wire when `None`.
+    /// (`.search(idx, text, ())`), or a `SearchOpts { filter, mode, snippet }`
+    /// literal to narrow results server-side via a `FilterExpr`, opt into
+    /// substring/autocomplete matching via `SearchMode::Trgm` (FM-30), and/or
+    /// ask for a `_searchSnippet` highlight on each hit via `snippet:
+    /// Some(true)` (FM-31) — the query text itself honors web-search operator
+    /// syntax server-side (quoted phrases, bare `or`, `-term` exclusion).
+    /// `mode`/`snippet` are omitted on the wire when `None`, so both forms
+    /// serialize identically when the default behavior is wanted. The nested
+    /// filter is distinct from the top-level `.filter()` builder (which is
+    /// mutually exclusive with `search`) and is likewise omitted on the wire
+    /// when `None`.
     pub fn search(mut self, index: &str, query: &str, opts: impl Into<SearchOpts>) -> Self {
         let opts = opts.into();
         self.q.search = Some(SearchQuery {
@@ -241,6 +248,7 @@ impl TableQuery {
             query: query.into(),
             filter: opts.filter,
             mode: opts.mode,
+            snippet: opts.snippet,
         });
         self
     }
@@ -639,6 +647,7 @@ mod tests {
                         ],
                     }),
                     mode: None,
+                    snippet: None,
                 },
             )
             .take(10);
@@ -674,6 +683,7 @@ mod tests {
                 SearchOpts {
                     filter: None,
                     mode: Some(SearchMode::Trgm),
+                    snippet: None,
                 },
             )
             .take(10);
@@ -695,6 +705,7 @@ mod tests {
                 SearchOpts {
                     filter: None,
                     mode: Some(SearchMode::Tsquery),
+                    snippet: None,
                 },
             )
             .take(10);
@@ -703,6 +714,37 @@ mod tests {
             json!({
                 "table":"notes",
                 "search":{"index":"search_body","query":"conv","mode":"tsquery"},
+                "take":10
+            })
+        );
+    }
+
+    #[test]
+    fn search_with_opts_struct_carries_snippet() {
+        // `snippet` set → emitted on the wire nested on the terminal (FM-31),
+        // alongside operator-syntax query text (plain string bytes). Default
+        // `()` stays byte-identical to the pre-snippet shape (covered by
+        // `search_builder_serializes_terminal`).
+        let q = TableQuery::new("notes")
+            .search(
+                "search_body",
+                "\"exact phrase\" or -excluded",
+                SearchOpts {
+                    filter: None,
+                    mode: None,
+                    snippet: Some(true),
+                },
+            )
+            .take(10);
+        assert_eq!(
+            serde_json::to_value(&q).unwrap(),
+            json!({
+                "table":"notes",
+                "search":{
+                    "index":"search_body",
+                    "query":"\"exact phrase\" or -excluded",
+                    "snippet":true
+                },
                 "take":10
             })
         );

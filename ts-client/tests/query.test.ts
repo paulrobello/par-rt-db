@@ -327,6 +327,39 @@ describe("TableQuery.search", () => {
       take: 10,
     });
   });
+
+  it("includes snippet on the wire when provided (true and false)", () => {
+    const on = api.items
+      .query()
+      .search("search_content", "hello world", { snippet: true })
+      .take(10);
+    expect(on.json).toEqual({
+      table: "items",
+      search: { index: "search_content", query: "hello world", snippet: true },
+      take: 10,
+    });
+    // Explicit false is meaningful on the wire (server serializes Some(false));
+    // only undefined drops the field.
+    const off = api.items
+      .query()
+      .search("search_content", "hello world", { snippet: false })
+      .take(10);
+    expect(off.json.search).toEqual({
+      index: "search_content",
+      query: "hello world",
+      snippet: false,
+    });
+  });
+
+  it("omits snippet on the wire when not provided", () => {
+    const q = api.items.query().search("search_content", "hello world").take(10);
+    expect(q.json.search).not.toHaveProperty("snippet");
+    expect(q.json).toEqual({
+      table: "items",
+      search: { index: "search_content", query: "hello world" },
+      take: 10,
+    });
+  });
 });
 
 describe("TableQuery.vectorSearch", () => {

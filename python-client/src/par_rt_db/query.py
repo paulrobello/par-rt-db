@@ -200,6 +200,7 @@ class TableQuery:
         *,
         filter_: FilterExpr | None = None,
         mode: SearchMode | None = None,
+        snippet: bool | None = None,
     ) -> TableQuery:
         """Full-text search terminal. ``filter_`` is a ``FilterExpr`` (the same
         type ``.filter()`` and ``authorize`` use) that narrows search results
@@ -209,13 +210,20 @@ class TableQuery:
         exclusive with ``search``). ``mode`` selects the match strategy (FM-30):
         ``None`` (default) or ``"tsquery"`` is today's full-text behavior;
         ``"trgm"`` is case-insensitive substring/autocomplete matching over the
-        index's text fields. Omitted from the wire when ``None`` so existing
-        requests stay byte-identical."""
+        index's text fields. ``snippet`` (FM-31) opts each hit into a
+        ``_searchSnippet`` field — a server-rendered ``<mark>``-highlighted
+        fragment of the matched text; tsquery mode only (``snippet=True`` with
+        ``mode="trgm"`` is rejected server-side). ``query`` honors web search
+        operators (FM-31): quoted phrases require adjacency, the bare word
+        ``or`` unions, ``-term`` excludes. ``mode``/``snippet`` are omitted from
+        the wire when ``None`` so existing requests stay byte-identical."""
         payload: dict[str, Any] = {"index": index, "query": query}
         if filter_ is not None:
             payload["filter"] = filter_
         if mode is not None:
             payload["mode"] = mode
+        if snippet is not None:
+            payload["snippet"] = snippet
         self._search = SearchQuery.model_validate(payload)
         return self
 

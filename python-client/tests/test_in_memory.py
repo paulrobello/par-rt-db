@@ -559,32 +559,37 @@ def test_filter_reduces_the_result_set() -> None:
     assert {d["name"] for d in docs} == {"a", "c"}
 
 
-def test_search_filter_narrows_the_candidate_set() -> None:
-    # The in-memory search stub treats every table row as a candidate (ts_rank
-    # is not modeled); a declared terminal filter narrows that set via the same
-    # FilterExpr evaluator the db-side .filter() uses.
+def test_search_filter_narrows_the_matched_set() -> None:
+    # The tsquery approximation matches words for real (FM-31); a declared
+    # terminal filter narrows the matched set via the same FilterExpr
+    # evaluator the db-side .filter() uses.
     from par_rt_db.wire import FilterExpr
 
-    c = _new_client()
-    _seed_query_rows(c)  # a/todo/2, b/todo/1, c/done/3
-    flt = TypeAdapter(FilterExpr).validate_python({"op": "eq", "field": "status", "value": "todo"})
-    docs = c.run_query(TableQuery("items").search("search_name", "x", filter_=flt).build())
-    assert {d["name"] for d in docs} == {"a", "b"}
-    # Without a filter every table row is a candidate.
-    all_docs = c.run_query(TableQuery("items").search("search_name", "x").build())
-    assert {d["name"] for d in all_docs} == {"a", "b", "c"}
+    c = _new_search_client()
+    for row in (
+        {"title": "release notes", "body": "x", "status": "open"},
+        {"title": "meeting notes", "body": "x", "status": "open"},
+        {"title": "cooking notes", "body": "x", "status": "closed"},
+    ):
+        c.mutate(Mutation.builder().insert("notes", row).build())
+    flt = TypeAdapter(FilterExpr).validate_python({"op": "eq", "field": "status", "value": "open"})
+    docs = c.run_query(TableQuery("notes").search("search_all", "notes", filter_=flt).build())
+    assert {d["title"] for d in docs} == {"release notes", "meeting notes"}
+    # Without a filter every word-match is a hit.
+    all_docs = c.run_query(TableQuery("notes").search("search_all", "notes").build())
+    assert {d["title"] for d in all_docs} == {"release notes", "meeting notes", "cooking notes"}
     # A compound FilterExpr narrows further.
     flt2 = TypeAdapter(FilterExpr).validate_python(
         {
             "op": "and",
             "exprs": [
-                {"op": "eq", "field": "status", "value": "todo"},
-                {"op": "gt", "field": "order", "value": 1},
+                {"op": "eq", "field": "status", "value": "open"},
+                {"op": "eq", "field": "title", "value": "release notes"},
             ],
         }
     )
-    docs2 = c.run_query(TableQuery("items").search("search_name", "x", filter_=flt2).build())
-    assert {d["name"] for d in docs2} == {"a"}
+    docs2 = c.run_query(TableQuery("notes").search("search_all", "notes", filter_=flt2).build())
+    assert {d["title"] for d in docs2} == {"release notes"}
 
 
 def test_search_filter_rejects_unknown_field() -> None:
@@ -759,13 +764,162 @@ def test_search_rejects_empty_query_in_both_modes() -> None:
 
 
 def test_search_explicit_tsquery_mode_behaves_like_default() -> None:
-    # mode="tsquery" is the default: the candidate-set stub runs unchanged.
+    # mode="tsquery" is the default: the websearch approximation runs
+    # unchanged. The word "convex" matches the docs CARRYING that word — not
+    # "convexity explained" (no stemming) and not "totally unrelated" — and
+    # case-insensitively catches "ConVex Mirror".
     c = _new_search_client()
     _seed_trgm_rows(c)
-    default = c.run_query(TableQuery("notes").search("search_all", "conv").build())
-    explicit = c.run_query(TableQuery("notes").search("search_all", "conv", mode="tsquery").build())
+    default = c.run_query(TableQuery("notes").search("search_all", "convex").build())
+    explicit = c.run_query(
+        TableQuery("notes").search("search_all", "convex", mode="tsquery").build()
+    )
     assert explicit == default
-    assert {d["title"] for d in explicit} == {"convex", "misc", "other", "ConVex Mirror"}
+    assert {d["title"] for d in explicit} == {"convex", "ConVex Mirror"}
+
+
+# --- phrase/operator search + snippets (FM-31) --------------------------------
+#
+# Mirrors the server's `server/tests/search_test.rs` FM-31 block: the tsquery
+# approximation models websearch_to_tsquery's operator semantics (phrase
+# adjacency, `or` union, `-term` exclusion) and the `_searchSnippet`
+# ts_headline stand-in.
+
+
+def _seed_note(c: InMemoryRtDbClient, **fields: Any) -> None:
+    """Insert one ``notes`` row (the FM-31 fixtures' seeding shorthand)."""
+    c.mutate(Mutation.builder().insert("notes", fields).build())
+
+
+def test_search_phrase_query_requires_adjacent_words() -> None:
+    # A quoted phrase requires the words ADJACENT (case-insensitive): only the
+    # doc where "database notes" appears contiguously matches. The same words
+    # unquoted still match both — AND semantics, pinning plain-query
+    # equivalence with the former plainto_tsquery behavior.
+    c = _new_search_client()
+    _seed_note(c, title="adjacent", body="the database notes are great", status="open")
+    _seed_note(c, title="apart", body="notes about the database", status="open")
+
+    docs = c.run_query(TableQuery("notes").search("search_all", '"database notes"').build())
+    assert [d["title"] for d in docs] == ["adjacent"]
+
+    docs = c.run_query(TableQuery("notes").search("search_all", "database notes").build())
+    assert {d["title"] for d in docs} == {"adjacent", "apart"}
+
+
+def test_search_or_operator_unions_alternatives() -> None:
+    # The bare word `or` unions alternatives: a doc with either term matches,
+    # one with neither does not.
+    c = _new_search_client()
+    for title in ("alpha only", "beta only", "gamma"):
+        _seed_note(c, title=title, body="filler", status="open")
+
+    docs = c.run_query(TableQuery("notes").search("search_all", "alpha or beta").build())
+    assert {d["title"] for d in docs} == {"alpha only", "beta only"}
+    assert all(d["title"] != "gamma" for d in docs)
+
+
+def test_search_minus_operator_excludes_term() -> None:
+    # `-term` excludes docs carrying the negated word while keeping the
+    # positive one.
+    c = _new_search_client()
+    _seed_note(c, title="database intro", body="database basics", status="open")
+    _seed_note(c, title="database cooking", body="database recipes", status="open")
+
+    docs = c.run_query(TableQuery("notes").search("search_all", "database -cooking").build())
+    assert [d["title"] for d in docs] == ["database intro"]
+
+
+def test_search_snippet_returns_highlighted_fragment() -> None:
+    # snippet=True attaches a `_searchSnippet` to every hit — an excerpt with
+    # the matched term wrapped in <mark>, honoring the 35-word cap. Omitted,
+    # no snippet field appears.
+    c = _new_search_client()
+    _seed_note(c, title="database notes", body="a database is a database", status="open")
+
+    docs = c.run_query(TableQuery("notes").search("search_all", "database", snippet=True).build())
+    assert len(docs) == 1
+    snippet = docs[0]["_searchSnippet"]
+    assert isinstance(snippet, str)
+    assert "<mark>database</mark>" in snippet
+    assert len(snippet.split()) <= 35
+
+    plain = c.run_query(TableQuery("notes").search("search_all", "database").build())
+    assert len(plain) == 1
+    assert "_searchSnippet" not in plain[0]
+
+
+def test_search_snippet_caps_at_35_words() -> None:
+    # A long match deep in the text still yields a bounded excerpt that
+    # contains the marked term (the MaxWords=35 stand-in).
+    c = _new_search_client()
+    body = " ".join(f"w{i}" for i in range(100)) + " needle "
+    body += " ".join(f"z{i}" for i in range(50))
+    _seed_note(c, title="long", body=body, status="open")
+
+    docs = c.run_query(TableQuery("notes").search("search_all", "needle", snippet=True).build())
+    snippet = docs[0]["_searchSnippet"]
+    assert len(snippet.split()) == 35
+    assert snippet.startswith("<mark>needle</mark>")
+
+
+def test_search_snippet_false_behaves_like_omitted() -> None:
+    # An explicit snippet=False behaves exactly like omission (the wire
+    # defaults to off; nothing is rendered).
+    c = _new_search_client()
+    _seed_note(c, title="database notes", body="", status="open")
+
+    docs = c.run_query(TableQuery("notes").search("search_all", "database", snippet=False).build())
+    assert len(docs) == 1
+    assert "_searchSnippet" not in docs[0]
+
+
+def test_search_snippet_highlights_phrase_queries() -> None:
+    # A phrase hit renders as adjacent per-word marks, like ts_headline over
+    # the same websearch_to_tsquery the WHERE matched.
+    c = _new_search_client()
+    _seed_note(c, title="adjacent", body="the database notes are great today", status="open")
+
+    docs = c.run_query(
+        TableQuery("notes").search("search_all", '"database notes"', snippet=True).build()
+    )
+    assert len(docs) == 1
+    snippet = docs[0]["_searchSnippet"]
+    assert "<mark>database</mark> <mark>notes</mark>" in snippet
+
+
+def test_search_snippet_composes_with_filter() -> None:
+    # Snippets compose with `filter`: narrowed hits are snippeted,
+    # filtered-out rows are neither returned nor snippeted.
+    from par_rt_db.wire import FilterExpr
+
+    c = _new_search_client()
+    for title, status in (
+        ("database intro", "open"),
+        ("database advanced", "closed"),
+        ("cooking", "open"),
+    ):
+        _seed_note(c, title=title, body="", status=status)
+    flt = TypeAdapter(FilterExpr).validate_python({"op": "eq", "field": "status", "value": "open"})
+
+    docs = c.run_query(
+        TableQuery("notes").search("search_all", "database", snippet=True, filter_=flt).build()
+    )
+    assert [d["title"] for d in docs] == ["database intro"]
+    assert "<mark>database</mark>" in docs[0]["_searchSnippet"]
+
+
+def test_search_snippet_rejected_with_trgm_mode() -> None:
+    # snippet + trgm is rejected up front — trgm matches substrings, so there
+    # is no tsquery tree to highlight (mirrors the server's compile_search).
+    c = _new_search_client()
+    _seed_trgm_rows(c)
+    with pytest.raises(RtDbError) as ei:
+        c.run_query(
+            TableQuery("notes").search("search_all", "conv", mode="trgm", snippet=True).build()
+        )
+    assert ei.value.code is ErrorCode.BAD_REQUEST
+    assert ei.value.message == "snippet is only supported in tsquery mode"
 
 
 def test_vector_search_filter_narrows_the_candidate_set() -> None:

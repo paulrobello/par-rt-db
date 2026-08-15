@@ -194,6 +194,25 @@ should be idempotent. The in-memory test client (`InMemoryRtDbClient`) mirrors
 the store and exposes a timer-less `tick(nowMs?)` that fires due jobs
 synchronously in unit tests.
 
+## Search
+
+`.search(index, query, opts)` full-text queries a declared search index
+(composes with `.take(n)`; an optional `filter` narrows results server-side).
+The query text honors web-search operators (the server compiles it via
+`websearch_to_tsquery`): a quoted phrase (`"exact phrase"`) requires the words
+adjacent, a bare `or` unions alternatives, and `-term` excludes — plain terms
+stay AND. An optional `mode: "trgm"` switches to case-insensitive
+substring/autocomplete matching, and `snippet: true` (tsquery mode only —
+rejected with `mode: "trgm"`) adds a `_searchSnippet` string to each hit: a
+server-rendered excerpt with matched terms wrapped in `<mark>…</mark>`.
+
+```ts
+const hits = await db.query(
+  api.notes.query().search("search_text", '"release plan" -draft', { snippet: true }).take(10),
+);
+// hits[0]._searchSnippet → e.g. "… the <mark>release</mark> <mark>plan</mark> is …"
+```
+
 ## Realtime presence
 
 Ephemeral "who is online right now" data (online indicators, cursors, typing)

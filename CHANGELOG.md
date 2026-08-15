@@ -13,6 +13,23 @@ contract against Convex.
 
 ## [Unreleased]
 
+### Phrase/operator search + snippets (FM-31)
+
+Search query text is parsed by `websearch_to_tsquery` (was `plainto_tsquery`):
+quoted phrases (`"database notes"`) require adjacency, a bare `or` unions
+alternatives, `-term` excludes; plain multi-term queries keep AND semantics
+(pinned equivalent by tests). The query text stays `$n`-bound with the index's
+regconfig, so the upgrade is injection-safe. An optional additive
+`snippet: true` on the `search` terminal attaches a `_searchSnippet` string to
+every hit — a `ts_headline` fragment with matched terms wrapped in
+`<mark>…</mark>` and server-fixed word bounds (`MaxWords=35`, `MinWords=15`);
+the client supplies only the boolean. `snippet` is tsquery-mode only:
+`snippet: true` + `mode: "trgm"` is a `BAD_REQUEST` (trgm matches substrings —
+there is no tsquery tree to highlight). Mirrored in all four clients
+(`.search()` opts `snippet`) including the three in-memory harnesses
+(adjacent-phrase contains, or-union, minus-exclusion, `<mark>` excerpt stub).
+Spec: `docs/superpowers/specs/2026-08-15-phrase-search-snippets-design.md`.
+
 ### Substring/autocomplete search via pg_trgm (FM-30)
 
 The `search` terminal accepts an optional `mode: "tsquery"|"trgm"` (omitted =

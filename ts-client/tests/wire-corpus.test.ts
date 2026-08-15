@@ -29,6 +29,7 @@ import type {
   MigrateResultJson,
   ScheduleInfo,
   ScheduleWhen,
+  SearchQuery,
   ServerMessage,
 } from "../src/protocol.js";
 
@@ -179,6 +180,37 @@ describe("wire-corpus: raw-JSON sections round-trip", () => {
       assertJsonRoundTrip(entry);
     });
   }
+});
+
+/**
+ * FM-31 pins: the corpus `queries` section gained an operator-syntax search
+ * entry (`"exact phrase" or -excluded`) and a `snippet: true` entry. The
+ * generic loop above round-trips them raw; this block additionally type-checks
+ * every search entry against `SearchQuery` and asserts both FM-31 entries are
+ * present with their fields intact — a corpus or protocol drift on the search
+ * surface fails here, not just silently round-tripping.
+ */
+describe("wire-corpus: search query entries (FM-31 operators/snippet)", () => {
+  const corpus = loadCorpus();
+  const searchEntries = corpus.queries.filter(
+    (q): q is { table: string; search: SearchQuery } =>
+      typeof q === "object" && q !== null && "search" in q,
+  );
+  it("every search entry satisfies SearchQuery and round-trips", () => {
+    expect(searchEntries.length).toBeGreaterThan(0);
+    for (const entry of searchEntries) {
+      const _typeCheck: SearchQuery = entry.search;
+      void _typeCheck;
+      assertJsonRoundTrip(entry);
+    }
+  });
+  it("carries the FM-31 operator-syntax and snippet:true entries", () => {
+    const operator = searchEntries.find((e) => e.search.query.includes('"'));
+    expect(operator?.search.mode).toBeUndefined();
+    const snippet = searchEntries.find((e) => e.search.snippet === true);
+    expect(snippet?.search.query).toBe("hello world");
+    expect(snippet?.search.mode).toBeUndefined();
+  });
 });
 
 /**

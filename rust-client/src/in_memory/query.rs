@@ -15,11 +15,13 @@ impl InMemoryRtDbClient {
     ///   matches (and [`Value::Null`] when zero match).
     /// - `count` → number of matching rows.
     /// - `take` / `collect` → array of merged docs.
-    /// - `search` → token-AND matched docs narrowed by an optional `filter`
-    ///   (no in-memory ts_rank; result order is unspecified, compared as a
-    ///   set), or — under `mode: "trgm"` (FM-30) — case-insensitive substring
-    ///   matches ranked by approximate similarity, tie-broken and capped by
-    ///   `take`.
+    /// - `search` → websearch-operator matched docs narrowed by an optional
+    ///   `filter` (no in-memory ts_rank; result order is unspecified,
+    ///   compared as a set) — quoted phrases, `or` unions, and `-term`
+    ///   exclusion approximated (FM-31), optionally carrying a
+    ///   `_searchSnippet` highlight per hit (`snippet: true`) — or, under
+    ///   `mode: "trgm"` (FM-30), case-insensitive substring matches ranked by
+    ///   approximate similarity, tie-broken and capped by `take`.
     /// - `vector_search` → all docs narrowed by an optional `filter`, capped at
     ///   `limit` (no in-memory distance model; same over-approximation as the
     ///   ts/python clients).
@@ -673,25 +675,31 @@ impl InMemoryRtDbClient {
     }
 
     /// `search` terminal — cascade mirror of server `execute_query`.
-    /// In-memory replica approximation, by mode (FM-30):
+    /// In-memory replica approximation, by mode:
     /// - tsquery (the default, and explicit `SearchMode::Tsquery`): there is
-    ///   no ts_rank model client-side, so we mirror the ts-client's token-AND
-    ///   matching against the search index's text fields (a doc matches when
-    ///   every whitespace token of the query appears, case-insensitively, as
-    ///   a substring of at least one indexed field's string value). Result
-    ///   order is unspecified (no ranking) so callers compare as a set.
+    ///   no ts_rank model client-side, so matching approximates the server's
+    ///   `websearch_to_tsquery` (FM-31) with plain string ops — quoted
+    ///   phrases require their words adjacently, the bare word `or` unions
+    ///   adjacent operands, `-term`/`-"phrase"` excludes, and every other
+    ///   term must appear (case-insensitively, as a substring of at least
+    ///   one indexed field's string value — the pre-FM-31 token-AND
+    ///   approximation, so operator-free queries keep their meaning).
     ///   QA-103: the previous stub returned `[]` unconditionally, which
     ///   diverged from the server (and the other clients) on every non-empty
     ///   match.
-    /// - trgm: case-insensitive substring match (the WHOLE query as a
-    ///   contiguous substring of an indexed field's string value), ranked by
-    ///   the approximate similarity the three harnesses pin for cross-client
-    ///   agreement: query.len()/field.len() per containing field, max per
-    ///   doc (a shorter containing field is more similar), then created_at
-    ///   desc and id desc tiebreaks. `take` (already capped to MAX_TAKE in
-    ///   `run_query`) limits the ranked result.
+    /// - trgm (FM-30): case-insensitive substring match (the WHOLE query as
+    ///   a contiguous substring of an indexed field's string value), ranked
+    ///   by the approximate similarity the three harnesses pin for
+    ///   cross-client agreement: query.len()/field.len() per containing
+    ///   field, max per doc (a shorter containing field is more similar),
+    ///   then created_at desc and id desc tiebreaks. `take` (already capped
+    ///   to MAX_TAKE in `run_query`) limits the ranked result.
     ///
-    /// In both modes the carried `filter` narrows the candidate set.
+    /// `snippet: true` (tsquery mode only — rejected with `trgm`, mirroring
+    /// server `compile_search`) attaches a `_searchSnippet` to every hit: a
+    /// ≤35-word excerpt over the index's fields with matched words wrapped in
+    /// `<mark>…</mark>` (the harness's `ts_headline` approximation). In both
+    /// modes the carried `filter` narrows the candidate set.
     fn execute_search_terminal(
         &self,
         q: &Query,
@@ -742,6 +750,18 @@ impl InMemoryRtDbClient {
             .and_then(|indexes| indexes.iter().find(|i| i.name == search.index && i.search))
             .ok_or_else(search_not_found)?;
         let index_fields: Vec<String> = index_def.fields.clone();
+        // `snippet` needs a tsquery tree to highlight; trgm mode matches raw
+        // substrings, so the combination is rejected rather than silently
+        // ignored. Mirrors server `compile_search`, which runs this check
+        // after index resolution but before filter compilation — so this
+        // error wins over a filter-validation error, like on the server.
+        let snippet = search.snippet.unwrap_or(false);
+        if snippet && search.mode == Some(crate::wire::SearchMode::Trgm) {
+            return Err(RtDbError::new(
+                ErrorCode::BadRequest,
+                "snippet is only supported in tsquery mode",
+            ));
+        }
         if let Some(filter) = &search.filter {
             let fields: BTreeSet<String> = table_def.fields.keys().cloned().collect();
             validate_filter(filter, &fields)?;
@@ -795,25 +815,28 @@ impl InMemoryRtDbClient {
                 scored.into_iter().map(|(_, _, _, doc)| doc).collect(),
             ));
         }
-        let tokens: Vec<String> = search
-            .query
-            .split_whitespace()
-            .map(|t| t.to_lowercase())
-            .collect();
-        if !tokens.is_empty() {
-            rows.retain(|doc| {
-                tokens.iter().all(|tok| {
-                    index_fields.iter().any(|f| {
-                        doc.get(f)
-                            .and_then(Value::as_str)
-                            .map(|s| s.to_lowercase().contains(tok))
-                            .unwrap_or(false)
-                    })
-                })
-            });
-        }
+        // tsquery (default) mode — websearch operator approximation (FM-31).
+        // A doc matches when no excluded operand hits and every or-group has
+        // at least one operand hitting some indexed field; plain terms keep
+        // the pre-FM-31 token-AND meaning (each term a case-insensitive
+        // substring of some indexed field).
+        let parsed = parse_websearch_query(&search.query);
+        rows.retain(|doc| {
+            let texts = search_field_texts(doc, &index_fields);
+            !parsed
+                .excluded
+                .iter()
+                .any(|op| search_operand_matches(op, &texts))
+                && parsed
+                    .groups
+                    .iter()
+                    .all(|g| g.iter().any(|op| search_operand_matches(op, &texts)))
+        });
         if let Some(filter) = &search.filter {
             rows.retain(|d| matches_filter(filter, d));
+        }
+        if snippet {
+            attach_search_snippets(&mut rows, &index_fields, &parsed);
         }
         Ok(Value::Array(rows))
     }
@@ -1094,6 +1117,181 @@ impl InMemoryRtDbClient {
             .map(|row| merge_doc(&row))
             .collect();
         Ok(Value::Array(out))
+    }
+}
+
+/// One operand of a parsed websearch query (the FM-31 harness approximation
+/// of the server's `websearch_to_tsquery`): a bare word — matched as a
+/// case-insensitive substring, like the pre-FM-31 token-AND approximation —
+/// or a quoted phrase, whose words must appear adjacently (matched as the
+/// space-joined phrase being a substring of a field, which pins adjacency
+/// without a stemming model).
+#[derive(Debug, Clone, PartialEq)]
+enum SearchOperand {
+    Term(String),
+    Phrase(Vec<String>),
+}
+
+/// Parsed approximation of the server's `websearch_to_tsquery` (FM-31).
+/// `groups` are ANDed; within a group — a maximal run of operands separated
+/// by the bare word `or` — any operand matching suffices. `excluded`
+/// collects the `-term` / `-"phrase"` operands a matching doc must NOT
+/// contain. Plain terms stay ANDed exactly as before the server's FM-31
+/// upgrade (a pure superset); stemming is over-approximated as substring
+/// containment, as the harness always has.
+#[derive(Debug, Clone, Default)]
+struct WebsearchQuery {
+    groups: Vec<Vec<SearchOperand>>,
+    excluded: Vec<SearchOperand>,
+}
+
+/// Parses web-search operator syntax: `"exact phrase"` → adjacent-words
+/// phrase, the bare word `or` (outside quotes) unions adjacent operands,
+/// `-term` / `-"phrase"` negates, everything else is a plain ANDed term.
+/// Degenerate input (a lone `-`, an empty phrase, a trailing unterminated
+/// quote) is dropped or read to end-of-string — over-approximating where the
+/// server's lexing is subtler than plain string ops can be.
+fn parse_websearch_query(text: &str) -> WebsearchQuery {
+    let mut out = WebsearchQuery::default();
+    let mut current: Vec<SearchOperand> = Vec::new();
+    let mut or_pending = false;
+    let mut chars = text.chars().peekable();
+    while let Some(&c) = chars.peek() {
+        if c.is_whitespace() {
+            chars.next();
+            continue;
+        }
+        // `-` at a token start negates the word or quoted phrase that
+        // follows; a `-` standing alone (or before whitespace/end) is not an
+        // operator and is skipped rather than read as an empty term.
+        let negated = c == '-';
+        if negated {
+            chars.next();
+            if !chars.peek().is_some_and(|n| !n.is_whitespace()) {
+                continue;
+            }
+        }
+        let operand = if chars.peek() == Some(&'"') {
+            chars.next();
+            let mut phrase = String::new();
+            for ch in chars.by_ref() {
+                if ch == '"' {
+                    break;
+                }
+                phrase.push(ch);
+            }
+            let words: Vec<String> = phrase
+                .split_whitespace()
+                .map(|w| w.to_lowercase())
+                .collect();
+            (!words.is_empty()).then_some(SearchOperand::Phrase(words))
+        } else {
+            let mut word = String::new();
+            while let Some(&ch) = chars.peek() {
+                if ch.is_whitespace() || ch == '"' {
+                    break;
+                }
+                word.push(ch);
+                chars.next();
+            }
+            (!word.is_empty()).then_some(SearchOperand::Term(word.to_lowercase()))
+        };
+        let Some(operand) = operand else {
+            continue;
+        };
+        // The bare word `or` is the union operator, not an operand; a
+        // leading `or` (nothing to its left) is ignored.
+        if !negated && matches!(&operand, SearchOperand::Term(t) if t == "or") {
+            or_pending = !current.is_empty();
+            continue;
+        }
+        if negated {
+            out.excluded.push(operand);
+            continue;
+        }
+        if or_pending {
+            current.push(operand);
+            or_pending = false;
+        } else {
+            if !current.is_empty() {
+                out.groups.push(std::mem::take(&mut current));
+            }
+            current.push(operand);
+        }
+    }
+    if !current.is_empty() {
+        out.groups.push(current);
+    }
+    out
+}
+
+/// True when `op` matches any of `field_texts` (all pre-lowercased): a Term
+/// is a substring of some field; a Phrase is its space-joined words
+/// appearing contiguously in some field.
+fn search_operand_matches(op: &SearchOperand, field_texts: &[String]) -> bool {
+    match op {
+        SearchOperand::Term(t) => field_texts.iter().any(|f| f.contains(t.as_str())),
+        SearchOperand::Phrase(words) => {
+            let joined = words.join(" ");
+            field_texts.iter().any(|f| f.contains(joined.as_str()))
+        }
+    }
+}
+
+/// Lowercased string values of the index's fields on `doc` (missing and
+/// non-string fields contribute nothing) — the searchable text per doc.
+fn search_field_texts(doc: &Value, index_fields: &[String]) -> Vec<String> {
+    index_fields
+        .iter()
+        .filter_map(|f| doc.get(f).and_then(Value::as_str))
+        .map(|s| s.to_lowercase())
+        .collect()
+}
+
+/// Attaches the harness's `_searchSnippet` approximation (FM-31) to every
+/// hit: a plain excerpt of at most 35 words over the index's fields (joined
+/// like the server's `concat_ws(' ', …)` headline source), with every word
+/// containing a matched term wrapped in `<mark>…</mark>` (the server's
+/// ts_headline StartSel/StopSel; MaxWords=35). The excerpt window is centered
+/// on the first matched word so it shows why the doc is a hit.
+fn attach_search_snippets(rows: &mut [Value], index_fields: &[String], parsed: &WebsearchQuery) {
+    let terms: Vec<String> = parsed
+        .groups
+        .iter()
+        .flatten()
+        .flat_map(|op| match op {
+            SearchOperand::Term(t) => vec![t.clone()],
+            SearchOperand::Phrase(words) => words.clone(),
+        })
+        .collect();
+    for doc in rows.iter_mut() {
+        let text = index_fields
+            .iter()
+            .filter_map(|f| doc.get(f).and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let marked = |w: &str| {
+            let lw = w.to_lowercase();
+            terms.iter().any(|t| lw.contains(t.as_str()))
+        };
+        let words: Vec<&str> = text.split_whitespace().collect();
+        let first = words.iter().position(|w| marked(w)).unwrap_or(0);
+        let start = first.saturating_sub(15);
+        let end = (start + 35).min(words.len());
+        let snippet = words[start..end]
+            .iter()
+            .map(|w| {
+                if marked(w) {
+                    format!("<mark>{w}</mark>")
+                } else {
+                    (*w).to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        if let Some(obj) = doc.as_object_mut() {
+            obj.insert("_searchSnippet".to_string(), Value::String(snippet));
+        }
     }
 }
 

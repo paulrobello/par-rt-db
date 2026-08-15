@@ -60,18 +60,20 @@ export class TableQuery<DocT, Indexes extends string> {
    * `.filter()` builder, which is mutually exclusive with `search`); the
    * optional `mode` selects the match strategy — `tsquery` (default, word/stem
    * full-text) or `trgm` (case-insensitive substring, ranked by similarity);
-   * both omitted on the wire when absent so existing requests stay
-   * byte-identical. */
+   * the optional `snippet` (FM-31) opts each hit into a `_searchSnippet`
+   * fragment with matched terms wrapped in `<mark>` (tsquery mode only) — all
+   * omitted on the wire when absent so existing requests stay byte-identical. */
   search(
     index: string,
     query: string,
-    opts?: { filter?: FilterExpr; mode?: SearchMode },
+    opts?: { filter?: FilterExpr; mode?: SearchMode; snippet?: boolean },
   ): TableQuery<DocT, Indexes> {
     const search: SearchQuery = {
       index,
       query,
       ...(opts?.filter ? { filter: opts.filter } : {}),
       ...(opts?.mode ? { mode: opts.mode } : {}),
+      ...(opts?.snippet !== undefined ? { snippet: opts.snippet } : {}),
     };
     return new TableQuery({ ...this.json, search });
   }
