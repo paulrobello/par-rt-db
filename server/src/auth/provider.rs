@@ -225,32 +225,61 @@ fn unconfigured_response(name: &str) -> Response {
         .into_response()
 }
 
-/// `pending → claiming` for the first caller; `false` for a replay, an
+/// `pending → claiming` for the first caller; `None` for a replay, an
 /// already-terminal/expired row, or a cross-provider claim (SEC-132: the
 /// state's minting provider must match the callback's provider). Single-use is
 /// enforced by the database — the `WHERE status = 'pending'` predicate means a
 /// second callback (a replay, or a concurrent race across two replicas) matches
-/// zero rows and returns `false`. This is the row-level claim that makes a
-/// replayed or cross-provider callback reject.
+/// zero rows and returns `None`. This is the row-level claim that makes a
+/// replayed or cross-provider callback reject. On success returns the row's
+/// `anon_user_id` binding (FM-27): `Some(id)` when the login began from an
+/// anonymous session, `None` otherwise.
 async fn claim_pending(
     state: &Arc<AppState>,
     state_token: &str,
     expected_provider: &'static str,
-) -> bool {
+) -> Option<Option<String>> {
     let now = now_ms();
-    let result = sqlx::query(
-        "UPDATE rtdb_auth.oauth_states \
-         SET status = $1 \
-         WHERE state = $2 AND provider = $3 AND status = $4 AND expires_at > $5",
+    let row: Option<(Option<String>,)> = sqlx::query_as(
+        "UPDATE rtdb_auth.oauth_states SET status = $1 \
+         WHERE state = $2 AND provider = $3 AND status = $4 AND expires_at > $5 \
+         RETURNING anon_user_id",
     )
     .bind(STATUS_CLAIMING)
     .bind(state_token)
     .bind(expected_provider)
     .bind(STATUS_PENDING)
     .bind(now)
-    .execute(&state.pool)
-    .await;
-    matches!(result, Ok(ref r) if r.rows_affected() == 1)
+    .fetch_optional(&state.pool)
+    .await
+    .ok()
+    .flatten();
+    row.map(|(anon_user_id,)| anon_user_id)
+}
+
+/// FM-27: after a successful provider login whose state row was minted from
+/// an anonymous session, synchronously merge the anon footprint into the real
+/// account BEFORE `set_outcome` records the terminal state (so a crash before
+/// the merge simply leaves the login claiming and the next sign-in re-runs it —
+/// every merge step is idempotent). Merge failures are logged at ERROR and
+/// never fail the login.
+async fn merge_anon_into_real(state: &Arc<AppState>, anon_id: &str, session_token: &str) {
+    let real_id = match resolve_bearer(&state.pool, session_token).await {
+        Ok(Principal::User { user_id, .. }) if user_id != anon_id => user_id,
+        Ok(_) => return, // anon row was already merged away; nothing to do
+        Err(err) => {
+            tracing::error!(error = %err, "anon merge: could not resolve the fresh session");
+            return;
+        }
+    };
+    if let Err(err) = crate::merge::merge_users(state, anon_id, &real_id).await {
+        tracing::error!(
+            anon = %anon_id,
+            real = %real_id,
+            error = %err,
+            "anon->real merge failed; recovered by the next sign-in"
+        );
+    }
 }
 
 /// Sets the terminal outcome after `complete_login` (`claiming → completed |
@@ -431,16 +460,37 @@ async fn provider_begin<P: OAuthProvider>(
     if pending >= MAX_PENDING_STATES {
         return RtDbError::internal("too many pending login states; retry").into_response();
     }
+    // FM-27: if the caller holds an anonymous session, record its user id so the
+    // callback can merge the anon footprint into the real account after login.
+    // Server-side resolution of a verified session — never caller-supplied.
+    let anon_user_id = match bearer_token(&headers).map(|t| t.to_string()) {
+        Some(token) => match resolve_bearer(&state.pool, &token).await {
+            Ok(Principal::User {
+                anonymous: true,
+                user_id,
+                ..
+            }) => Some(user_id),
+            Ok(_) => None,
+            Err(err) => {
+                // Fail-open on purpose (a transient DB hiccup must not block
+                // login), but the merge binding is lost — make that visible.
+                tracing::warn!(error = %err, "oauth: failed to resolve anon binding at /begin");
+                None
+            }
+        },
+        None => None,
+    };
     if let Err(err) = sqlx::query(
         "INSERT INTO rtdb_auth.oauth_states \
-         (state, provider, status, created_at, expires_at) \
-         VALUES ($1, $2, $3, $4, $5)",
+         (state, provider, status, created_at, expires_at, anon_user_id) \
+         VALUES ($1, $2, $3, $4, $5, $6)",
     )
     .bind(&state_token)
     .bind(P::name())
     .bind(STATUS_PENDING)
     .bind(now)
     .bind(now + STATE_TTL_MS)
+    .bind(&anon_user_id)
     .execute(&state.pool)
     .await
     {
@@ -505,9 +555,10 @@ async fn provider_callback<P: OAuthProvider>(
         }
     }
 
-    if !claim_pending(&state, &params.state, P::name()).await {
-        return RtDbError::bad_request("invalid or expired state").into_response();
-    }
+    let anon_user_id = match claim_pending(&state, &params.state, P::name()).await {
+        Some(binding) => binding,
+        None => return RtDbError::bad_request("invalid or expired state").into_response(),
+    };
 
     let Some(provider) = P::from_config(&state.config) else {
         set_outcome(&state, &params.state, None).await;
@@ -517,6 +568,11 @@ async fn provider_callback<P: OAuthProvider>(
     let secure = state.config.cookie_secure || crate::auth::cookie::request_is_secure(&headers);
     match provider.complete_login(&state, &params.code).await {
         Ok(token) => {
+            // FM-27: merge the anon footprint into the real account before the
+            // terminal outcome is recorded (see merge_anon_into_real).
+            if let Some(anon_id) = &anon_user_id {
+                merge_anon_into_real(&state, anon_id, &token).await;
+            }
             set_outcome(&state, &params.state, Some(&token)).await;
             callback_close_response(&token, secure)
         }
@@ -548,9 +604,10 @@ async fn apple_callback(
         }
     }
 
-    if !claim_pending(&state, &form.state, AppleProvider::name()).await {
-        return RtDbError::bad_request("invalid or expired state").into_response();
-    }
+    let anon_user_id = match claim_pending(&state, &form.state, AppleProvider::name()).await {
+        Some(binding) => binding,
+        None => return RtDbError::bad_request("invalid or expired state").into_response(),
+    };
 
     let Some(provider) = AppleProvider::from_config(&state.config) else {
         set_outcome(&state, &form.state, None).await;
@@ -560,6 +617,11 @@ async fn apple_callback(
     let secure = state.config.cookie_secure || crate::auth::cookie::request_is_secure(&headers);
     match provider.complete_login(&state, &form.code).await {
         Ok(token) => {
+            // FM-27: merge the anon footprint into the real account before the
+            // terminal outcome is recorded (see merge_anon_into_real).
+            if let Some(anon_id) = &anon_user_id {
+                merge_anon_into_real(&state, anon_id, &token).await;
+            }
             set_outcome(&state, &form.state, Some(&token)).await;
             callback_close_response(&token, secure)
         }
@@ -740,7 +802,9 @@ async fn validate(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Res
 /// `RTDB_AUTH_ANONYMOUS_ENABLED` (default off): disabled ⇒ 403 FORBIDDEN. An
 /// anonymous user is authorized for any database via that boot gate (no
 /// allowlist entry) and owns its own documents via per-row `ownerField` (the
-/// anon `user_id`). The anon→real merge on a later OAuth sign-in is a follow-up.
+/// anon `user_id`). On a later OAuth sign-in with this session's bearer
+/// presented at `/begin`, the anon footprint is merged into the real account
+/// (`merge::merge_users`).
 #[derive(Serialize)]
 struct AnonymousResponse {
     user: AuthedUser,

@@ -16,6 +16,7 @@ mod backups;
 mod dbs;
 mod docs;
 mod login;
+mod merge;
 mod observability;
 mod schedules;
 mod schema_ops;
@@ -33,6 +34,7 @@ use backups::*;
 use dbs::*;
 use docs::*;
 use login::*;
+use merge::*;
 use observability::*;
 use schedules::*;
 use schema_ops::*;
@@ -266,6 +268,7 @@ pub fn admin_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/admin/logout", post(admin_logout))
         .route("/admin/create-db", post(create_db))
         .route("/admin/delete-db", post(delete_db))
+        .route("/admin/merge-users", post(merge_users_handler))
         .route("/admin/push-schema", post(push_schema))
         .route("/admin/dbs", get(list_dbs))
         .route("/admin/mint-token", post(mint_token))

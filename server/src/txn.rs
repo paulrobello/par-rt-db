@@ -230,7 +230,7 @@ pub struct DocValues {
 
 impl WriteSet {
     /// Records that the transaction wrote document `id` in `table` as `kind`.
-    fn touch(&mut self, table: &str, id: &str, kind: OpKind) {
+    pub(crate) fn touch(&mut self, table: &str, id: &str, kind: OpKind) {
         self.tables.insert(table.to_string());
         self.docs.insert((table.to_string(), id.to_string()));
         self.ops.push(DocOp {
@@ -268,7 +268,7 @@ impl WriteSet {
     ///   knows it, for `subs::OrderedRead`'s sort-key ranking. Recorded on the
     ///   first step that supplies it and never overwritten — every step that
     ///   supplies it supplies the same value.
-    fn capture_doc(
+    pub(crate) fn capture_doc(
         &mut self,
         table: &str,
         id: &str,
@@ -659,7 +659,7 @@ async fn do_insert(
 /// Updates an existing row's `doc`, every indexed-field column recomputed
 /// from `merged`, and bumps `version`. Shared by the `Patch` step and
 /// `Upsert`'s patch path.
-async fn apply_update(
+pub(crate) async fn apply_update(
     conn: &mut PgConnection,
     pg_schema_name: &str,
     table_def: &TableDef,

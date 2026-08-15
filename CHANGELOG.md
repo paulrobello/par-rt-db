@@ -13,6 +13,23 @@ contract against Convex.
 
 ## [Unreleased]
 
+### Anon→real account merge (FM-27)
+
+An anonymous user who later signs in with OAuth is merged into the real
+account. `GET /auth/{provider}/begin` resolves the caller's anon session
+server-side (never caller-supplied) and records it on the pending login row
+(`rtdb_auth.oauth_states.anon_user_id`); the callback then merges
+synchronously via `merge::merge_users`, crash-safe by ordering: per-database
+principal-bearing doc restamps each inside that db's committer turn
+(`CommitterRequest::RunMergeUsers`, publishing through the op-feed/audit/
+webhook taps with `source = "merge"`), storage blob owner swap, session
+re-point (an open WS or stored SDK token promotes to the real principal on
+its next op), then a guarded anon-row delete. Every step is idempotent; any
+interruption is recovered by signing in again. `POST /admin/merge-users`
+(typed confirm, 404 on a missing anon row) runs the merge synchronously as
+the operator escape hatch; `rtdb_merge_docs_total` counts restamped docs.
+Spec: `docs/superpowers/specs/2026-08-14-anon-merge-design.md`.
+
 ### Cross-replica OAuth login state (ENH-022, Stage 0 + Stage 1)
 
 The single-use OAuth `state` token minted at `/auth/{provider}/begin` and
@@ -245,7 +262,7 @@ that is the authoritative parity contract.
 #### Server
 
 - **Active-session management** — `GET /admin/sessions?user=&limit=&offset=` lists live sessions; `DELETE /admin/sessions?user=` revokes every session for a user; `DELETE /admin/sessions/{token_hash}` revokes one. Revocation is live per-op: an open `/sync` connection's next Subscribe/Mutate re-runs the session check and closes on a revoked token. Mirrored across ts/rust/python clients + the `rtdb` CLI.
-- **Anonymous auth** (`POST /auth/anonymous`, gated `RTDB_AUTH_ANONYMOUS_ENABLED`, default off) — mints an ephemeral `rtdb_auth.users` row (`anonymous = TRUE`, no email) plus a session, returning the session token in the body and setting the same HttpOnly cookie as OAuth. An anonymous user is a `Principal::User` with `anonymous = true`, `email = None` — `authorize` bypasses the per-db allowlist for it (its creation is its authorization), and per-row `ownerField` stamps its `user_id` so it owns its own drafts/cursors. The anon→real merge on a later OAuth sign-in is a follow-up (not yet shipped). ts-client exposes it as `useRtDbAuth().signInAnonymous()`; machine-side clients (rust/python) are out of scope. See FEATURE_MATRIX #20.
+- **Anonymous auth** (`POST /auth/anonymous`, gated `RTDB_AUTH_ANONYMOUS_ENABLED`, default off) — mints an ephemeral `rtdb_auth.users` row (`anonymous = TRUE`, no email) plus a session, returning the session token in the body and setting the same HttpOnly cookie as OAuth. An anonymous user is a `Principal::User` with `anonymous = true`, `email = None` — `authorize` bypasses the per-db allowlist for it (its creation is its authorization), and per-row `ownerField` stamps its `user_id` so it owns its own drafts/cursors. The anon→real merge on a later OAuth sign-in shipped 2026-08-14 — see the FM-27 entry above. ts-client exposes it as `useRtDbAuth().signInAnonymous()`; machine-side clients (rust/python) are out of scope. See FEATURE_MATRIX #20.
 - **By-query transaction steps** — `PatchByQuery{table, filter, patch, limit?}` and `DeleteByQuery{table, filter, limit?}` find rows matching the same `FilterExpr` `.filter()` accepts and act on them in one serialized committer turn. Row visibility matches the read path exactly (the caller's interactive filter composes with `ownerField`/`collaboratorsField`/`authorize`); each affected row records a `DocOp`/`WriteSet` entry so subscriptions, op-feed, audit, and webhooks fire per row. `MAX_BY_QUERY_ROWS = 1000` bounds rows per step; `MAX_BY_QUERY_STEPS_PER_TXN = 16` bounds by-query step count per transaction.
 - **`MAX_STEPS` 256 → 1024 + per-transaction affected-row budget (SEC-104)** — the per-transaction step cap is raised to 1024 (ARC-104), and a new aggregate budget `MAX_AFFECTED_ROWS_PER_TXN = 10000` bounds a transaction's worst-case row count (per-id steps count one document each; each by-query step counts up to its `limit`). An over-budget transaction is rejected **before** the committer — an over-cap write never becomes durable. Mirrored across all four clients (wire-corpus pinned).
 - **`count` aggregate** — the `aggregate` terminal now supports `sum`/`avg`/`min`/`max`/`count`. `count` counts rows and consumes no aggregate field; grouped `count` is the count-per-group the dashboards need.

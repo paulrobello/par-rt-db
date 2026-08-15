@@ -247,6 +247,12 @@ async fn bootstrap_ddl(conn: &mut PgConnection) -> Result<(), RtDbError> {
     )
     .execute(&mut *conn)
     .await?;
+    // FM-27: retrofit for existing installs — the anon-merge binding column
+    // (NULL when the login began from a non-anonymous session). Same pattern
+    // as storage.rs's `owner_id` retrofit.
+    sqlx::query("ALTER TABLE rtdb_auth.oauth_states ADD COLUMN IF NOT EXISTS anon_user_id text")
+        .execute(&mut *conn)
+        .await?;
 
     sqlx::query("CREATE SCHEMA IF NOT EXISTS rtdb")
         .execute(&mut *conn)

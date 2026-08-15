@@ -293,6 +293,10 @@ pub struct Metrics {
     /// Total expired documents deleted by the per-db TTL reaper across all
     /// dbs/tables. Global (no db/table labels) to match the neighboring counters.
     ttl_expired_total: AtomicU64,
+    // ---- Anon→real merge (FM-27) ----
+    /// Total documents re-stamped by the anon→real user merge across all
+    /// dbs/tables. Global (no db/table labels) to match the neighboring counters.
+    merge_docs_total: AtomicU64,
     // ---- Per-db subscription-invalidation counters (ENH-010) ----
     /// Per-db breakdown of the skip/re-run/missed counters above, keyed by db
     /// name. Updated alongside the globals in `fan_out`; read by the JSON
@@ -486,6 +490,11 @@ impl Metrics {
         self.ttl_expired_total.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Documents re-stamped by the anon→real merge (FM-27), across all dbs/tables.
+    pub fn record_merge_doc(&self) {
+        self.merge_docs_total.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Snapshot of the per-db subscription-invalidation counters, sorted by db
     /// name for stable output. Empty until a `fan_out` records a decision.
     pub fn per_db_subs_snapshot(&self) -> Vec<DbSubCounterRow> {
@@ -592,6 +601,7 @@ impl Metrics {
                 .load(Ordering::Relaxed),
             subs_missed_pushes_total: self.subs_missed_pushes_total.load(Ordering::Relaxed),
             ttl_expired_total: self.ttl_expired_total.load(Ordering::Relaxed),
+            merge_docs_total: self.merge_docs_total.load(Ordering::Relaxed),
             image_transforms_hit_total: self.image_transforms_hit_total.load(Ordering::Relaxed),
             image_transforms_miss_total: self.image_transforms_miss_total.load(Ordering::Relaxed),
             image_transforms_error_total: self.image_transforms_error_total.load(Ordering::Relaxed),
@@ -644,6 +654,8 @@ pub struct MetricsSnapshot {
     pub subs_missed_pushes_total: u64,
     /// Total expired documents deleted by the TTL reaper (all dbs/tables).
     pub ttl_expired_total: u64,
+    /// Total documents re-stamped by the anon→real user merge (all dbs/tables).
+    pub merge_docs_total: u64,
     /// Image-transform cache lookups, by outcome (ENH-014).
     pub image_transforms_hit_total: u64,
     pub image_transforms_miss_total: u64,
@@ -791,6 +803,16 @@ pub fn render_prometheus(snap: &MetricsSnapshot, fingerprint: Option<(&str, &str
         snap.ttl_expired_total
     ));
 
+    // Anon→real merge (FM-27).
+    s.push_str(
+        "# HELP rtdb_merge_docs_total Total documents re-stamped by the anon-to-real user merge across all dbs/tables.\n",
+    );
+    s.push_str("# TYPE rtdb_merge_docs_total counter\n");
+    s.push_str(&format!(
+        "rtdb_merge_docs_total {}\n",
+        snap.merge_docs_total
+    ));
+
     // Image transforms (ENH-014). `result` label mirrors the `class` label on
     // subs_skips_total: one metric name, one sample per outcome.
     s.push_str("# HELP rtdb_image_transforms_total Image transforms served, by result.\n");
@@ -912,6 +934,7 @@ mod tests {
             subs_skip_verifications_total: 15,
             subs_missed_pushes_total: 0,
             ttl_expired_total: 0,
+            merge_docs_total: 0,
             image_transforms_hit_total: 0,
             image_transforms_miss_total: 0,
             image_transforms_error_total: 0,
@@ -972,6 +995,7 @@ mod tests {
             subs_skip_verifications_total: 7,
             subs_missed_pushes_total: 9,
             ttl_expired_total: 0,
+            merge_docs_total: 0,
             image_transforms_hit_total: 0,
             image_transforms_miss_total: 0,
             image_transforms_error_total: 0,
@@ -1100,6 +1124,7 @@ mod tests {
             subs_skip_verifications_total: 0,
             subs_missed_pushes_total: 0,
             ttl_expired_total: 0,
+            merge_docs_total: 0,
             image_transforms_hit_total: 0,
             image_transforms_miss_total: 0,
             image_transforms_error_total: 0,
