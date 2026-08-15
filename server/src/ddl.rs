@@ -237,6 +237,11 @@ pub async fn push_schema(
     sqlx::query("CREATE EXTENSION IF NOT EXISTS vector")
         .execute(&mut *tx)
         .await?;
+    // Same for pg_trgm (FM-30 trigram search): installed at database creation
+    // since 2026-08-15, backfilled here for older databases.
+    sqlx::query("CREATE EXTENSION IF NOT EXISTS pg_trgm")
+        .execute(&mut *tx)
+        .await?;
 
     apply_schema_additive(&mut tx, &pg_schema_name, previous.as_ref(), &schema).await?;
 
@@ -321,6 +326,31 @@ async fn apply_schema_additive(
             .map(|t| t.indexes.iter().map(|index| index.name.as_str()).collect())
             .unwrap_or_default();
         for index in &new_table.indexes {
+            // Trigram GIN over a search index's text `f_` columns (FM-30):
+            // created for NEW and EXISTING search indexes alike — `IF NOT
+            // EXISTS` makes re-pushes a no-op and backfills search indexes that
+            // predate trgm mode (the backing `f_` columns exist by this point
+            // either way). Accelerates `search` mode `trgm` ILIKE; the query
+            // still works without it, just seq-scanned.
+            if index.search {
+                let trgm_ident = format!(
+                    "tg_{}_{}",
+                    table_name.to_lowercase(),
+                    index.name.to_lowercase()
+                );
+                let trgm_cols = index
+                    .fields
+                    .iter()
+                    .map(|field_name| format!("\"{}\" gin_trgm_ops", pg_col(field_name)))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                sqlx::query(&format!(
+                    "CREATE INDEX IF NOT EXISTS \"{trgm_ident}\" ON \"{pg_schema_name}\".\"{table_ident}\" \
+                     USING GIN ({trgm_cols})"
+                ))
+                .execute(&mut **tx)
+                .await?;
+            }
             if old_index_names.contains(index.name.as_str()) {
                 continue;
             }
@@ -583,6 +613,15 @@ pub async fn reconcile_schema_destructive(
         let index_ident = format!("i_{}_{}", table.to_lowercase(), index_name.to_lowercase());
         sqlx::query(&format!(
             "DROP INDEX IF EXISTS \"{pg_schema_name}\".\"{index_ident}\""
+        ))
+        .execute(&mut **tx)
+        .await?;
+        // A search index also owns a trigram GIN (FM-30) beside its tsvector
+        // GIN; btree/vector indexes have no `tg_` twin and the guarded drop is
+        // a no-op for them.
+        let trgm_ident = format!("tg_{}_{}", table.to_lowercase(), index_name.to_lowercase());
+        sqlx::query(&format!(
+            "DROP INDEX IF EXISTS \"{pg_schema_name}\".\"{trgm_ident}\""
         ))
         .execute(&mut **tx)
         .await?;

@@ -747,3 +747,250 @@ async fn search_filter_unknown_field_is_bad_request() {
     .expect_err("unknown filter field");
     assert_eq!(err.code, ErrorCode::BadRequest);
 }
+
+// --- trgm mode (FM-30) ---
+
+fn trgm_query(index: &str, query: &str) -> Query {
+    serde_json::from_value(serde_json::json!({
+        "table": "notes",
+        "search": {"index": index, "query": query, "mode": "trgm"}
+    }))
+    .expect("trgm search query")
+}
+
+// trgm matches substrings tsquery never can ("conv" is no lexeme anywhere) and
+// ranks by similarity — the exact-title doc scores 1.0 and comes first.
+#[tokio::test]
+async fn trgm_mode_matches_substrings_and_ranks_by_similarity() {
+    let state = test_state().await;
+    let (db, schema) = fresh_search_db(&state).await;
+    let pool = &state.pool;
+    insert_note(pool, &db, &schema, "convex", "").await;
+    insert_note(pool, &db, &schema, "convexity in practice", "").await;
+    insert_note(pool, &db, &schema, "cooking", "").await;
+
+    // Default (tsquery) mode: "conv" is not a word in any doc — zero matches.
+    let res = execute_query(
+        pool,
+        &db,
+        &schema,
+        &search_query("search_content", "conv"),
+        &PrincipalCtx::bypass(),
+    )
+    .await
+    .expect("tsquery search");
+    assert!(matches!(res, QueryResult::Docs(ref d) if d.is_empty()));
+
+    // trgm mode: prefix substring of both "convex" and "convexity".
+    let res = execute_query(
+        pool,
+        &db,
+        &schema,
+        &trgm_query("search_content", "conv"),
+        &PrincipalCtx::bypass(),
+    )
+    .await
+    .expect("trgm search");
+    let titles = titles(&res);
+    assert_eq!(titles.len(), 2);
+    assert_eq!(titles[0], "convex");
+    assert!(titles.contains(&"convexity in practice".to_string()));
+}
+
+// ILIKE is case-insensitive — autocomplete over mixed-case text.
+#[tokio::test]
+async fn trgm_mode_is_case_insensitive() {
+    let state = test_state().await;
+    let (db, schema) = fresh_search_db(&state).await;
+    let pool = &state.pool;
+    insert_note(pool, &db, &schema, "PostgreSQL Guide", "").await;
+
+    let res = execute_query(
+        pool,
+        &db,
+        &schema,
+        &trgm_query("search_content", "POSTGRE"),
+        &PrincipalCtx::bypass(),
+    )
+    .await
+    .expect("trgm search");
+    let titles = titles(&res);
+    assert_eq!(titles, vec!["PostgreSQL Guide".to_string()]);
+}
+
+// trgm composes with filter: an infix ("atab" inside "database") narrowed by an
+// eq predicate on an indexed field.
+#[tokio::test]
+async fn trgm_mode_composes_with_filter() {
+    let state = test_state().await;
+    let (db, schema) = fresh_filter_db(&state).await;
+    let pool = &state.pool;
+    insert_post(pool, &db, &schema, "database intro", 1, "a").await;
+    insert_post(pool, &db, &schema, "database advanced", 2, "b").await;
+    insert_post(pool, &db, &schema, "cooking", 1, "c").await;
+
+    let q: Query = serde_json::from_value(serde_json::json!({
+        "table": "posts",
+        "search": {
+            "index": "search_title",
+            "query": "atab",
+            "mode": "trgm",
+            "filter": {"op":"eq","field":"category","value":1}
+        }
+    }))
+    .expect("trgm+filter query");
+    let res = execute_query(pool, &db, &schema, &q, &PrincipalCtx::bypass())
+        .await
+        .expect("trgm+filter");
+    let titles = post_titles(&res);
+    assert_eq!(titles, vec!["database intro".to_string()]);
+}
+
+// trgm composes with take, capping the ranked result list.
+#[tokio::test]
+async fn trgm_mode_composes_with_take() {
+    let state = test_state().await;
+    let (db, schema) = fresh_filter_db(&state).await;
+    let pool = &state.pool;
+    insert_post(pool, &db, &schema, "database intro", 1, "a").await;
+    insert_post(pool, &db, &schema, "database advanced", 2, "b").await;
+
+    let q: Query = serde_json::from_value(serde_json::json!({
+        "table": "posts",
+        "search": {"index": "search_title", "query": "atab", "mode": "trgm"},
+        "take": 1
+    }))
+    .expect("trgm+take query");
+    let res = execute_query(pool, &db, &schema, &q, &PrincipalCtx::bypass())
+        .await
+        .expect("trgm+take");
+    assert_eq!(post_titles(&res).len(), 1);
+}
+
+// Explicit mode "tsquery" is accepted and behaves exactly like the default.
+#[tokio::test]
+async fn trgm_mode_explicit_tsquery_matches_default() {
+    let state = test_state().await;
+    let (db, schema) = fresh_search_db(&state).await;
+    let pool = &state.pool;
+    insert_note(pool, &db, &schema, "database notes", "database database").await;
+
+    let explicit: Query = serde_json::from_value(serde_json::json!({
+        "table": "notes",
+        "search": {"index": "search_content", "query": "database", "mode": "tsquery"}
+    }))
+    .expect("explicit tsquery");
+    let res = execute_query(pool, &db, &schema, &explicit, &PrincipalCtx::bypass())
+        .await
+        .expect("explicit tsquery search");
+    assert_eq!(titles(&res).len(), 1);
+
+    let res_default = execute_query(
+        pool,
+        &db,
+        &schema,
+        &search_query("search_content", "database"),
+        &PrincipalCtx::bypass(),
+    )
+    .await
+    .expect("default search");
+    assert_eq!(titles(&res_default), titles(&res));
+}
+
+// An unknown mode value fails Query deserialization (deny_unknown_fields +
+// enum) — a BadRequest at the transport boundary, never a silent fallback.
+#[test]
+fn trgm_mode_invalid_value_is_rejected() {
+    let parsed: Result<Query, _> = serde_json::from_value(serde_json::json!({
+        "table": "notes",
+        "search": {"index": "search_content", "query": "x", "mode": "fuzzy"}
+    }));
+    assert!(parsed.is_err());
+}
+
+async fn index_def(pool: &PgPool, schema_name: &str, index_name: &str) -> Option<String> {
+    sqlx::query_scalar("SELECT indexdef FROM pg_indexes WHERE schemaname = $1 AND indexname = $2")
+        .bind(schema_name)
+        .bind(index_name)
+        .fetch_optional(pool)
+        .await
+        .expect("read pg_indexes")
+}
+
+// Every search index carries a trigram GIN (`gin_trgm_ops`) beside its
+// tsvector GIN — and re-pushing the same schema is idempotent, and recreates
+// the trigram index if it is missing (the backfill for deployments whose
+// search indexes predate trgm mode).
+#[tokio::test]
+async fn trgm_gin_index_created_backfilled_and_idempotent() {
+    let state = test_state().await;
+    let (db, schema) = fresh_search_db(&state).await;
+    let pool = &state.pool;
+    let schema_name = ddl::pg_schema(&db);
+
+    let def = index_def(pool, &schema_name, "tg_notes_search_content")
+        .await
+        .expect("trigram GIN present after push");
+    assert!(def.contains("gin_trgm_ops"), "not a trigram GIN: {def}");
+    assert!(def.contains("f_title"), "missing title column: {def}");
+    assert!(def.contains("f_body"), "missing body column: {def}");
+
+    // Simulate a pre-FM-30 deployment: trigram index gone, schema unchanged.
+    sqlx::query(&format!(
+        "DROP INDEX \"{schema_name}\".\"tg_notes_search_content\""
+    ))
+    .execute(pool)
+    .await
+    .expect("drop trigram GIN");
+    ddl::push_schema(pool, &db, schema.clone())
+        .await
+        .expect("re-push schema");
+    assert!(
+        index_def(pool, &schema_name, "tg_notes_search_content")
+            .await
+            .is_some(),
+        "re-push did not backfill the trigram GIN"
+    );
+
+    // A third push over an existing index is a no-op, not an error.
+    ddl::push_schema(pool, &db, schema)
+        .await
+        .expect("idempotent push");
+}
+
+// Removing a search index via the destructive reconcile drops BOTH GIN
+// indexes (tsvector `i_` and trigram `tg_`).
+#[tokio::test]
+async fn trgm_gin_index_dropped_by_reconcile() {
+    let state = test_state().await;
+    let (db, schema) = fresh_search_db(&state).await;
+    let pool = &state.pool;
+    let schema_name = ddl::pg_schema(&db);
+
+    let mut target = schema.clone();
+    target
+        .tables
+        .get_mut("notes")
+        .expect("notes table")
+        .indexes
+        .retain(|i| !i.search);
+
+    let mut tx = pool.begin().await.expect("begin tx");
+    ddl::reconcile_schema_destructive(&mut tx, &db, &schema, &target)
+        .await
+        .expect("reconcile");
+    tx.commit().await.expect("commit");
+
+    assert!(
+        index_def(pool, &schema_name, "tg_notes_search_content")
+            .await
+            .is_none(),
+        "trigram GIN survived reconcile"
+    );
+    assert!(
+        index_def(pool, &schema_name, "i_notes_search_content")
+            .await
+            .is_none(),
+        "tsvector GIN survived reconcile"
+    );
+}

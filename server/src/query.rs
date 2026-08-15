@@ -152,7 +152,10 @@ pub struct Paginate {
 /// via `plainto_tsquery` so it can't inject tsquery syntax. `filter` is an
 /// optional db-side predicate (the `filter()` DSL) narrowed into the search
 /// WHERE — scoped search ("within channel X" / "last N ms"); omitted on the
-/// wire when `None` so existing requests deserialize unchanged.
+/// wire when `None` so existing requests deserialize unchanged. `mode` selects
+/// the match strategy (FM-30): `None`/`"tsquery"` is today's full-text
+/// behavior; `"trgm"` is substring/autocomplete matching over the index's text
+/// fields via `ILIKE`, ranked by trigram `similarity()` — see `SearchMode`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SearchQuery {
@@ -160,6 +163,26 @@ pub struct SearchQuery {
     pub query: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filter: Option<FilterExpr>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<SearchMode>,
+}
+
+/// Match mode for the `search` terminal. `Tsquery` (the default, and the
+/// behavior when `mode` is omitted) matches stemmed words via
+/// `tsvector @@ plainto_tsquery`, ranked by `ts_rank`. `Trgm` matches
+/// substrings case-insensitively (`ILIKE '%query%'`) over the search index's
+/// text fields — prefix/infix/autocomplete lookups FTS can't serve — ranked by
+/// `GREATEST(similarity(field, query))` (the doc's best-matching field), with
+/// `created_at`/`id` tiebreaks for determinism. Wire form is lowercase
+/// (`"tsquery"` | `"trgm"`); serialized only when the caller opts in, so
+/// existing traffic stays byte-identical.
+/// docs/superpowers/specs/2026-08-15-trgm-search-design.md.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SearchMode {
+    #[default]
+    Tsquery,
+    Trgm,
 }
 
 /// A vector-similarity terminal over a declared vector index. `vector` is the
@@ -2585,13 +2608,13 @@ struct CompileSearchCtx<'a> {
 }
 
 /// Full-text search terminal SQL compilation. Compile half of the former
-/// inline `execute_search` body — SQL and bind-order byte-for-byte identical
-/// to the pre-refactor cascade. Bind order: `$1` is the search query text
-/// (tsquery), the optional client `filter` compiles next at `$2`, then the
-/// per-row owner/collaborator and `authorize` predicates, then `LIMIT`. The
-/// search text and the limit are encoded as `EqBind::Text` / `EqBind::I64`
-/// respectively so the executor uses the same bind loop every other terminal
-/// does; this preserves the pre-refactor bind sequence exactly.
+/// inline `execute_search` body. Bind order: `$1` is the search query text;
+/// in `trgm` mode `$2` is the server-built `'%…%'` ILIKE pattern (so
+/// downstream placeholders shift by one); the optional client `filter`
+/// compiles next, then the per-row owner/collaborator and `authorize`
+/// predicates, then `LIMIT`. The search text/pattern and the limit are
+/// encoded as `EqBind::Text` / `EqBind::I64` respectively so the executor
+/// uses the same bind loop every other terminal does.
 fn compile_search(
     sctx: &CompileSearchCtx<'_>,
     search: &SearchQuery,
@@ -2621,18 +2644,23 @@ fn compile_search(
     let limit = take.unwrap_or(MAX_TAKE);
     let pg_schema_name = pg_schema(db);
     let table_ident = pg_table(table_name);
+    let mode = search.mode.unwrap_or_default();
 
-    // `$1` is the search query text (tsquery). The optional client `filter`
-    // compiles next at `$2`, then the per-row owner/collaborator and `authorize`
-    // predicates, then `LIMIT` — the same compose order `compile_scan_where` uses
-    // for reads. One shared accumulator keeps `compile_filter_node`'s
-    // `start_pos + binds.len()` placeholders correctly numbered. Schema-validated
-    // identifiers are interpolated; every value is `$n`-bound. With no filter and
-    // an owner-only table this emits the single-predicate form byte-identical to
-    // the pre-filter SQL.
+    // `$1` is the search query text in both modes (the tsquery in `tsquery`
+    // mode, the similarity argument in `trgm` mode). The optional client
+    // `filter` compiles next, then the per-row owner/collaborator and
+    // `authorize` predicates, then `LIMIT` — the same compose order
+    // `compile_scan_where` uses for reads. One shared accumulator keeps
+    // `compile_filter_node`'s `start_pos + binds.len()` placeholders correctly
+    // numbered. Schema-validated identifiers are interpolated; every value is
+    // `$n`-bound. With no filter and an owner-only table this emits the
+    // single-predicate form byte-identical to the pre-filter SQL.
     let mut binds: Vec<EqBind> = Vec::new();
     let mut extra = String::new();
-    let start = 2usize;
+    let start = match mode {
+        SearchMode::Tsquery => 2usize,
+        SearchMode::Trgm => 3,
+    };
     if let Some(filter) = &search.filter {
         let (fragment, filter_binds) = compile_filter(filter, table_def, start)?;
         binds.extend(filter_binds);
@@ -2656,18 +2684,48 @@ fn compile_search(
         extra.push_str(&frag);
     }
     let limit_ph = start + binds.len();
-    let sql = format!(
-        "SELECT \"id\", \"doc\", \"created_at\", \"version\" FROM \"{pg_schema_name}\".\"{table_ident}\" \
-         WHERE \"{sv_col}\" @@ {tsq}{extra} \
-         ORDER BY ts_rank(\"{sv_col}\", {tsq}) DESC, \"created_at\" DESC, \"id\" DESC \
-         LIMIT ${limit_ph}"
-    );
-    // The leading bind is the tsquery text (mirrors the pre-refactor
-    // `.bind(&search.query)` that came before the bind loop); the trailing
-    // bind is the LIMIT. Both are folded into the same Vec<EqBind> the
-    // executor drains in order.
-    let mut all = Vec::with_capacity(1 + binds.len() + 1);
+    let sql = match mode {
+        SearchMode::Tsquery => format!(
+            "SELECT \"id\", \"doc\", \"created_at\", \"version\" FROM \"{pg_schema_name}\".\"{table_ident}\" \
+             WHERE \"{sv_col}\" @@ {tsq}{extra} \
+             ORDER BY ts_rank(\"{sv_col}\", {tsq}) DESC, \"created_at\" DESC, \"id\" DESC \
+             LIMIT ${limit_ph}"
+        ),
+        // Trgm (FM-30): substring match over the index's text `f_` columns.
+        // `$1` (raw query text) feeds `similarity`; `$2` is the server-built
+        // `'%' || query || '%'` ILIKE pattern, bound — never interpolated. A
+        // result row ILIKE-matched some field, so at least one `similarity`
+        // argument is non-NULL and GREATEST is well-defined. The `created_at`/
+        // `id` tiebreaks keep ordering deterministic like the tsquery arm.
+        SearchMode::Trgm => {
+            let ilike = index_def
+                .fields
+                .iter()
+                .map(|field_name| format!("\"{}\" ILIKE $2", pg_col(field_name)))
+                .collect::<Vec<_>>()
+                .join(" OR ");
+            let sim = index_def
+                .fields
+                .iter()
+                .map(|field_name| format!("similarity(\"{}\", $1)", pg_col(field_name)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "SELECT \"id\", \"doc\", \"created_at\", \"version\" FROM \"{pg_schema_name}\".\"{table_ident}\" \
+                 WHERE ({ilike}){extra} \
+                 ORDER BY GREATEST({sim}) DESC, \"created_at\" DESC, \"id\" DESC \
+                 LIMIT ${limit_ph}"
+            )
+        }
+    };
+    // The leading bind(s) are the search text (and, in trgm mode, its
+    // `%…%` ILIKE pattern); the trailing bind is the LIMIT. All are folded
+    // into the same Vec<EqBind> the executor drains in order.
+    let mut all = Vec::with_capacity(start - 1 + binds.len() + 1);
     all.push(EqBind::Text(search.query.clone()));
+    if mode == SearchMode::Trgm {
+        all.push(EqBind::Text(format!("%{}%", search.query)));
+    }
     all.extend(binds);
     all.push(EqBind::I64(i64::from(limit)));
     Ok(CompiledQuery {

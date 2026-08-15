@@ -432,8 +432,12 @@ pub async fn create_database(pool: &PgPool, name: &str) -> Result<(), RtDbError>
         .map_err(map_duplicate_database_error)?;
     // Extensions are database-level in Postgres, and every par-rt-db "database" is
     // a schema in the single `rtdb` Postgres database — so this installs `vector`
-    // once into `rtdb`, available to all schemas. `IF NOT EXISTS` makes it idempotent.
+    // and `pg_trgm` once into `rtdb`, available to all schemas. `IF NOT EXISTS`
+    // makes them idempotent.
     sqlx::query("CREATE EXTENSION IF NOT EXISTS vector")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("CREATE EXTENSION IF NOT EXISTS pg_trgm")
         .execute(&mut *tx)
         .await?;
     sqlx::query(&format!(

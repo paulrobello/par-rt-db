@@ -570,6 +570,7 @@ async fn search_filters_to_own_rows() -> anyhow::Result<()> {
             index: "search_content".into(),
             query: "database".into(),
             filter: None,
+            mode: None,
         }),
         ..notes_query()
     };

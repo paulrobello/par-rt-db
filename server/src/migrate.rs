@@ -837,6 +837,14 @@ async fn apply_drop_index(
     let t_ident = pg_table(table);
     // A dropped search index leaves its generated `s_` tsvector column.
     if dropped_index.map(|i| i.search).unwrap_or(false) {
+        // …and its `tg_` trigram GIN (FM-30), dropped before any column it
+        // references.
+        let trgm_idx = format!("tg_{}_{}", table.to_lowercase(), name.to_lowercase());
+        sqlx::query(&format!(
+            "DROP INDEX IF EXISTS \"{schema_name}\".\"{trgm_idx}\""
+        ))
+        .execute(&mut **tx)
+        .await?;
         let sv_col = pg_search_col(name);
         sqlx::query(&format!(
             "ALTER TABLE \"{schema_name}\".\"{t_ident}\" DROP COLUMN IF EXISTS \"{sv_col}\""

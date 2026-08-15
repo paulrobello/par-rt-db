@@ -103,6 +103,7 @@ fn search_body_x() -> SearchQuery {
         index: "search_body".to_string(),
         query: "x".to_string(),
         filter: None,
+        mode: None,
     }
 }
 
