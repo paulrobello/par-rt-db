@@ -8,6 +8,8 @@
 //! gate is on the module declaration in `wire.rs`, not here, so this file
 //! compiles cleanly under `--all-features`.
 
+use std::collections::BTreeMap;
+
 use crate::schema::SchemaDef;
 use serde::{Deserialize, Serialize};
 
@@ -19,6 +21,14 @@ pub(crate) struct CreateDbRequest<'a> {
 #[derive(Serialize)]
 pub(crate) struct DeleteDbRequest<'a> {
     pub(crate) name: &'a str,
+    pub(crate) confirm: &'a str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct MergeUsersRequest<'a> {
+    pub(crate) anon_user_id: &'a str,
+    pub(crate) real_user_id: &'a str,
     pub(crate) confirm: &'a str,
 }
 
@@ -206,6 +216,46 @@ pub(crate) struct SessionsResponse {
 pub struct RevokeUserSessionsResponse {
     pub ok: bool,
     pub revoked: i64,
+}
+
+// ---- anon→real account merge (POST /admin/merge-users) -------------------
+//
+// Mirror `server::merge::MergeReport` and `ts-client`'s `MergeReport`
+// byte-for-byte (camelCase). Both serde directions are derived: the client
+// deserializes the server's report, and the CLI re-serializes it for output.
+
+/// A row skipped by the anon→real merge because the re-stamp would collide
+/// with an existing doc under a unique index. Mirrors `ts-client`'s
+/// `MergeConflict`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MergeConflict {
+    pub table: String,
+    pub id: String,
+}
+
+/// Per-database outcome of an anon→real merge: re-stamped-doc counts per
+/// table plus the rows skipped over unique-index conflicts. Mirrors
+/// `ts-client`'s `MergeDbResult`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MergeDbResult {
+    pub tables: BTreeMap<String, usize>,
+    pub conflicts: Vec<MergeConflict>,
+}
+
+/// Full-instance anon→real merge outcome from `POST /admin/merge-users`:
+/// per-db doc re-stamps, storage blobs repointed, sessions repointed (an
+/// open WS or stored SDK token promotes to the real principal on its next
+/// op), and whether the anon user row was deleted. Mirrors `ts-client`'s
+/// `MergeReport`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MergeReport {
+    pub dbs: BTreeMap<String, MergeDbResult>,
+    pub storage_repointed: u64,
+    pub sessions_repointed: u64,
+    pub anon_deleted: bool,
 }
 
 /// p50/p95/p99 latency percentile triple (microseconds). Mirrors

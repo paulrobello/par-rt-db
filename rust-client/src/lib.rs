@@ -90,9 +90,10 @@ pub use ws::{
 pub use wire::admin::{
     AdminMember, AuditEntry, AuditQuery, BackupsListResponse, Cast, CastFailure, ConfigResponse,
     CreateWebhookOptions, DbStats, Directive, DirectiveReport, HotConfig, HotConfigPatch,
-    LatencyStats, ListDeliveriesOptions, MetricsSnapshot, MigrateRequest, MigrateRequestOwned,
-    MigrateResult, MintTokenOptions, MintedToken, OpEvent, SampleChange, SessionInfo,
-    SessionListOptions, TableStat, TokenInfo, Webhook, WebhookDelivery, WebhookEditOptions,
+    LatencyStats, ListDeliveriesOptions, MergeConflict, MergeDbResult, MergeReport,
+    MetricsSnapshot, MigrateRequest, MigrateRequestOwned, MigrateResult, MintTokenOptions,
+    MintedToken, OpEvent, SampleChange, SessionInfo, SessionListOptions, TableStat, TokenInfo,
+    Webhook, WebhookDelivery, WebhookEditOptions,
 };
 
 #[cfg(feature = "admin")]

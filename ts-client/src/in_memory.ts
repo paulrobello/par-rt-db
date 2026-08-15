@@ -2,6 +2,7 @@ import type {
   AuditEntry,
   DbSubCounters,
   GetAuditOptions,
+  MergeReport,
   SessionInfo,
   SubscriptionInfo,
   SubscriptionsResponse,
@@ -3037,6 +3038,19 @@ export class InMemoryAdminClient {
   /** Revoke every session for a user. No-op in-memory; reports zero revoked. */
   revokeUserSessions(_userId: string): Promise<{ ok: boolean; revoked: number }> {
     return Promise.resolve({ ok: true, revoked: 0 });
+  }
+
+  /** Anon→real account merge. No-op in-memory; resolves an empty report
+   *  (nothing re-stamped, nothing repointed, no anon row deleted) — mirroring
+   *  `RtDbAdminClient.mergeUsers` for admin consumers unit-tested with no
+   *  network. */
+  mergeUsers(_anonUserId: string, _realUserId: string): Promise<MergeReport> {
+    return Promise.resolve({
+      dbs: {},
+      storageRepointed: 0,
+      sessionsRepointed: 0,
+      anonDeleted: false,
+    });
   }
 
   private emptySubscriptions(): SubscriptionsResponse {

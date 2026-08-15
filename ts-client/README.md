@@ -104,7 +104,10 @@ session token for the SDK/bearer path; an anonymous user owns its own documents
 via per-row `ownerField`. The admin client (`RtDbAdminClient`) additionally
 exposes the active-session management surface — `listSessions({ user?, limit? })`
 and `revokeSession(tokenHash)` / `revokeSessionsForUser(user)` — mirroring
-`GET/DELETE /admin/sessions`.
+`GET/DELETE /admin/sessions`, plus `mergeUsers(anonUserId, realUserId)` — the
+operator escape hatch that merges an anonymous user into a real one — mirroring
+`POST /admin/merge-users` (the typed `confirm == realUserId` guard is applied
+for you).
 
 ## Node / CLI
 

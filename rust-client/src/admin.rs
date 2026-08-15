@@ -855,6 +855,35 @@ impl RtDbAdminClient {
         Err(self.error_response(resp).await)
     }
 
+    // ── Anon→real account merge (POST /admin/merge-users) ────────────────────
+    //
+    // Mirror `ts-client`'s `mergeUsers` one-to-one — path, body, and return
+    // shape are identical; only the method name is snake_cased.
+
+    /// `POST /admin/merge-users` `{anonUserId, realUserId, confirm}` →
+    /// `MergeReport`. Runs the anon→real account merge synchronously (FM-27's
+    /// admin escape hatch). The server's typed guard is applied for you:
+    /// `confirm` is sent as `realUserId` (same pattern as `delete_db`). A 404
+    /// means the anon user row does not exist (nothing to merge).
+    pub async fn merge_users(
+        &self,
+        anon_user_id: &str,
+        real_user_id: &str,
+    ) -> Result<crate::wire::admin::MergeReport, RtDbError> {
+        let resp = self
+            .post_json(
+                "/admin/merge-users",
+                &crate::wire::admin::MergeUsersRequest {
+                    anon_user_id,
+                    real_user_id,
+                    confirm: real_user_id,
+                },
+            )
+            .await?;
+        self.deserialize::<crate::wire::admin::MergeReport>(resp)
+            .await
+    }
+
     async fn post_json<Req: Serialize>(
         &self,
         path: &str,
@@ -2876,6 +2905,63 @@ mod admin_tests {
         assert_eq!(anon.email, None);
         assert_eq!(anon.login, None);
         assert!(anon.anonymous);
+    }
+
+    // ── Anon→real account merge (mirror ts-client admin.test.ts) ─────────────
+
+    #[tokio::test]
+    async fn merge_users_posts_ids_and_confirm_equals_real() {
+        let (server, client) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/admin/merge-users"))
+            .and(header("authorization", BEARER))
+            .and(body_partial_json(
+                json!({"anonUserId": "u-anon", "realUserId": "u-real", "confirm": "u-real"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "dbs": {
+                    "kanban": {
+                        "tables": {"notes": 2, "cursors": 1},
+                        "conflicts": [{"table": "notes", "id": "n7"}]
+                    },
+                    "empty": {"tables": {}, "conflicts": []}
+                },
+                "storageRepointed": 4,
+                "sessionsRepointed": 1,
+                "anonDeleted": true
+            })))
+            .mount(&server)
+            .await;
+        let report = client.merge_users("u-anon", "u-real").await.unwrap();
+        assert_eq!(report.dbs.len(), 2);
+        let kanban = report.dbs.get("kanban").unwrap();
+        assert_eq!(kanban.tables.get("notes"), Some(&2));
+        assert_eq!(kanban.tables.get("cursors"), Some(&1));
+        assert_eq!(kanban.conflicts.len(), 1);
+        assert_eq!(kanban.conflicts[0].table, "notes");
+        assert_eq!(kanban.conflicts[0].id, "n7");
+        let empty = report.dbs.get("empty").unwrap();
+        assert!(empty.tables.is_empty());
+        assert!(empty.conflicts.is_empty());
+        assert_eq!(report.storage_repointed, 4);
+        assert_eq!(report.sessions_repointed, 1);
+        assert!(report.anon_deleted);
+    }
+
+    #[tokio::test]
+    async fn merge_users_surfaces_missing_anon_envelope() {
+        let (server, client) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/admin/merge-users"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+                "code": "NOT_FOUND",
+                "message": "anonymous user not found; nothing to merge"
+            })))
+            .mount(&server)
+            .await;
+        let err = client.merge_users("missing", "u-real").await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::NotFound);
+        assert_eq!(err.message, "anonymous user not found; nothing to merge");
     }
 
     // Explain + slow-query log (ENH-019). `explain_query` posts the Query DSL

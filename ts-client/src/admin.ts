@@ -79,6 +79,28 @@ export interface SessionInfo {
   createdAt: number;
   expiresAt: number;
 }
+/** A row skipped by the anon→real merge because the re-stamp would collide
+ *  with an existing doc under a unique index (server `merge::MergeConflict`). */
+export interface MergeConflict {
+  table: string;
+  id: string;
+}
+/** Per-database outcome of an anon→real merge: re-stamped-doc counts per
+ *  table plus the rows skipped over unique-index conflicts. */
+export interface MergeDbResult {
+  tables: Record<string, number>;
+  conflicts: MergeConflict[];
+}
+/** Full-instance anon→real merge outcome from `POST /admin/merge-users`:
+ *  per-db doc re-stamps, storage blobs repointed, sessions repointed (an
+ *  open WS or stored SDK token promotes to the real principal on its next
+ *  op), and whether the anon user row was deleted. */
+export interface MergeReport {
+  dbs: Record<string, MergeDbResult>;
+  storageRepointed: number;
+  sessionsRepointed: number;
+  anonDeleted: boolean;
+}
 /** Optional capabilities for `mintToken`. Omitted fields fall back to server
  *  defaults (full access: no expiry, read-write, all tables). */
 export interface MintTokenOptions {
@@ -658,6 +680,18 @@ export class RtDbAdminClient {
       ok: boolean;
       revoked: number;
     };
+  }
+
+  /** Run the anon→real account merge synchronously and return the full report
+   *  (POST /admin/merge-users). The server's typed guard is applied for you:
+   *  `confirm` is sent as `realUserId` (same pattern as `deleteDb`). A 404
+   *  means the anon user row does not exist (nothing to merge). */
+  async mergeUsers(anonUserId: string, realUserId: string): Promise<MergeReport> {
+    return (await this.request("POST", "/admin/merge-users", {
+      anonUserId,
+      realUserId,
+      confirm: realUserId,
+    })) as MergeReport;
   }
 
   /** Server metrics snapshot (GET /admin/metrics). */

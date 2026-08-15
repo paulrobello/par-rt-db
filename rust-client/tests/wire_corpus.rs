@@ -227,6 +227,45 @@ fn subscriptions_response_round_trip() {
     );
 }
 
+/// FM-27 anon→real merge report wire shape. Self-contained (not in the
+/// shared corpus — these admin-only response types landed with the merge)
+/// so the round-trip still asserts the exact camelCase keys the server emits.
+#[cfg(feature = "admin")]
+#[test]
+fn merge_report_round_trip() {
+    use par_rt_db_client::wire::admin::{MergeConflict, MergeDbResult, MergeReport};
+    let input = json!({
+        "dbs": {
+            "kanban": {
+                "tables": {"notes": 2, "cursors": 1},
+                "conflicts": [{"table": "notes", "id": "n7"}]
+            },
+            "demo": {"tables": {}, "conflicts": []}
+        },
+        "storageRepointed": 4,
+        "sessionsRepointed": 1,
+        "anonDeleted": true
+    });
+    let parsed: MergeReport = serde_json::from_value(input.clone()).expect("parse MergeReport");
+    let dumped = serde_json::to_value(&parsed).expect("serialize MergeReport");
+    assert_eq!(dumped, input, "wire drift in MergeReport");
+    assert_eq!(parsed.dbs["kanban"].tables["notes"], 2);
+    assert!(parsed.anon_deleted);
+
+    // Nested-type camelCase (`table`/`id` are single words, so this is a
+    // stability check more than a casing one).
+    let c: MergeConflict = serde_json::from_value(json!({"table": "notes", "id": "n7"})).unwrap();
+    assert_eq!(
+        serde_json::to_value(&c).unwrap(),
+        json!({"table": "notes", "id": "n7"})
+    );
+    let d: MergeDbResult = serde_json::from_value(json!({"tables": {}, "conflicts": []})).unwrap();
+    assert_eq!(
+        serde_json::to_value(&d).unwrap(),
+        json!({"tables": {}, "conflicts": []})
+    );
+}
+
 /// Confirms the `perDbSubs` field added to `MetricsSnapshot` (ENH-010)
 /// deserializes under its camelCase key and defaults to empty when an older
 /// server omits it. `MetricsSnapshot` is `Deserialize`-only (server emits it;

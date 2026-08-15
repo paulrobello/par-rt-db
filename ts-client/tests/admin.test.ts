@@ -4,6 +4,7 @@ import type {
   ExplainResult,
   HotConfig,
   HotConfigPatch,
+  MergeReport,
   SessionInfo,
   SlowQueriesResponse,
   SlowQueryEntry,
@@ -1167,6 +1168,51 @@ describe("RtDbAdminClient sessions", () => {
     expect(url).toBe("http://h:8300/admin/sessions?user=u1");
     expect(init.method).toBe("DELETE");
     expect(init.headers.Authorization).toBe("Bearer k");
+  });
+});
+
+describe("RtDbAdminClient mergeUsers", () => {
+  it("mergeUsers POSTs {anonUserId, realUserId, confirm: realUserId} and returns the MergeReport", async () => {
+    const report: MergeReport = {
+      dbs: {
+        kanban: {
+          tables: { tasks: 3, notes: 1 },
+          conflicts: [{ table: "tasks", id: "t7" }],
+        },
+      },
+      storageRepointed: 2,
+      sessionsRepointed: 1,
+      anonDeleted: true,
+    };
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(report));
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+    await expect(admin.mergeUsers("anon1", "real1")).resolves.toEqual(report);
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("http://h:8300/admin/merge-users");
+    expect(init.method).toBe("POST");
+    expect(init.headers.Authorization).toBe("Bearer k");
+    expect(JSON.parse(init.body)).toEqual({
+      anonUserId: "anon1",
+      realUserId: "real1",
+      confirm: "real1",
+    });
+  });
+
+  it("mergeUsers surfaces a 404 missing-anon-row envelope as RtDbError", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(
+        jsonResponse(
+          { code: "NOT_FOUND", message: "anonymous user not found; nothing to merge" },
+          404,
+        ),
+      );
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+    await expect(admin.mergeUsers("missing", "real1")).rejects.toMatchObject({
+      name: "RtDbError",
+      code: "NOT_FOUND",
+      message: "anonymous user not found; nothing to merge",
+    });
   });
 });
 

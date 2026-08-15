@@ -1009,6 +1009,17 @@ impl RtDbHttpClient {
     ) -> Result<crate::wire::admin::RevokeUserSessionsResponse, RtDbError> {
         self.admin_client().revoke_user_sessions(user_id).await
     }
+
+    #[deprecated(note = "use RtDbAdminClient")]
+    pub async fn merge_users(
+        &self,
+        anon_user_id: &str,
+        real_user_id: &str,
+    ) -> Result<crate::wire::admin::MergeReport, RtDbError> {
+        self.admin_client()
+            .merge_users(anon_user_id, real_user_id)
+            .await
+    }
 }
 
 #[cfg(test)]

@@ -93,6 +93,35 @@ class SessionInfo(_Wire):
     expires_at: int
 
 
+class MergeConflict(_Wire):
+    """One row of :class:`MergeDbResult.conflicts` — a document skipped
+    because re-stamping it would violate a unique index. Mirrors
+    ``server::merge::MergeConflict``."""
+
+    table: str
+    id: str
+
+
+class MergeDbResult(_Wire):
+    """Per-db outcome of the anon→real merge — restamped-doc counts per table
+    plus the rows skipped over a unique-index conflict. Mirrors
+    ``server::merge::MergeDbResult``."""
+
+    tables: dict[str, int]
+    conflicts: list[MergeConflict]
+
+
+class MergeReport(_Wire):
+    """``POST /admin/merge-users`` response — the full-instance merge outcome:
+    per-db re-stamp results, storage blob owner swaps, session re-points, and
+    the guarded anon-row delete. Mirrors ``server::merge::MergeReport``."""
+
+    dbs: dict[str, MergeDbResult]
+    storage_repointed: int
+    sessions_repointed: int
+    anon_deleted: bool
+
+
 class TableStat(_Wire):
     """One row of ``DbStats.tables`` — ``{name, rowCount, sizeBytes}``."""
 

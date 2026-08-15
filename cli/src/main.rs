@@ -7,9 +7,9 @@
 //! `RTDB_URL` / `RTDB_DB` / `RTDB_TOKEN` / `RTDB_ADMIN_KEY` env vars.
 //!
 //! Admin subcommands (`list-dbs`, `create-db`, `clone-db`, `push-schema`,
-//! `mint-token`, `revoke-token`, `sessions list|revoke`) send the instance
-//! admin key as the bearer. Data-plane subcommands (`query`, `mutate`) send a
-//! machine token scoped to `--db`.
+//! `mint-token`, `revoke-token`, `sessions list|revoke`, `merge-users`) send
+//! the instance admin key as the bearer. Data-plane subcommands (`query`,
+//! `mutate`) send a machine token scoped to `--db`.
 
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
@@ -79,6 +79,18 @@ enum Command {
     Sessions {
         #[command(subcommand)]
         command: SessionsCommand,
+    },
+    /// Merge an anonymous user into a real one, synchronously. (admin)
+    MergeUsers {
+        /// Anonymous user id whose data is merged away.
+        #[arg(long)]
+        anon: String,
+        /// Real user id that receives the anon user's data.
+        #[arg(long)]
+        real: String,
+        /// Typed confirmation — must equal `--real`.
+        #[arg(long)]
+        confirm: String,
     },
     /// Run a Query JSON against `--db` and print the result. (machine token)
     Query {
@@ -163,6 +175,11 @@ async fn dispatch(cli: &Cli) -> Result<()> {
         Command::MintToken { db, name } => run_mint_token(cli, db, name).await,
         Command::RevokeToken { id } => run_revoke_token(cli, id).await,
         Command::Sessions { command } => run_sessions(cli, command).await,
+        Command::MergeUsers {
+            anon,
+            real,
+            confirm,
+        } => run_merge_users(cli, anon, real, confirm).await,
         Command::Query { query } => run_query(cli, query).await,
         Command::Mutate { txn } => run_mutate(cli, txn).await,
         Command::Migrate { file, dry_run } => run_migrate(cli, file, *dry_run).await,
@@ -257,6 +274,19 @@ async fn run_sessions(cli: &Cli, command: &SessionsCommand) -> Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+async fn run_merge_users(cli: &Cli, anon: &str, real: &str, confirm: &str) -> Result<()> {
+    // Typed-confirmation guard — same pattern as the server's `merge-users`
+    // check. Validated before the credential gate so an arg error is surfaced
+    // (and is testable) without credentials.
+    if confirm != real {
+        return Err(anyhow!("--confirm must equal --real ({real})"));
+    }
+    let c = admin_client(cli)?;
+    let report = c.merge_users(anon, real).await.map_err(map_err)?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
 }
 
@@ -536,6 +566,34 @@ mod tests {
         };
         assert_eq!(token_hash.as_deref(), Some("abc123"));
         assert_eq!(user, None);
+
+        // `merge-users` parses its three required flags.
+        let cli = Cli::try_parse_from([
+            "rtdb",
+            "--url",
+            "http://x",
+            "--admin-key",
+            "k",
+            "merge-users",
+            "--anon",
+            "u-anon",
+            "--real",
+            "u-real",
+            "--confirm",
+            "u-real",
+        ])
+        .unwrap();
+        let Command::MergeUsers {
+            anon,
+            real,
+            confirm,
+        } = cli.command
+        else {
+            panic!("expected MergeUsers");
+        };
+        assert_eq!(anon, "u-anon");
+        assert_eq!(real, "u-real");
+        assert_eq!(confirm, "u-real");
     }
 
     #[test]
@@ -818,6 +876,31 @@ mod tests {
         });
         let err = dispatch(&both).await.unwrap_err().to_string();
         assert!(err.contains("mutually exclusive"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn dispatch_merge_users_validates_confirm_matches_real() {
+        // The typed-confirmation guard fires before the credential gate, so a
+        // mismatch surfaces its specific error without a key; a match proceeds
+        // to the credential gate and errors there instead.
+        let mismatch = cli_with_command(Command::MergeUsers {
+            anon: "u-anon".into(),
+            real: "u-real".into(),
+            confirm: "wrong".into(),
+        });
+        let err = dispatch(&mismatch).await.unwrap_err().to_string();
+        assert!(err.contains("--confirm must equal --real"), "got: {err}");
+
+        let match_no_key = cli_with_command(Command::MergeUsers {
+            anon: "u-anon".into(),
+            real: "u-real".into(),
+            confirm: "u-real".into(),
+        });
+        let err = dispatch(&match_no_key).await.unwrap_err().to_string();
+        assert!(
+            err.contains("--admin-key"),
+            "expected the credential-gate error, got: {err}"
+        );
     }
 
     #[test]

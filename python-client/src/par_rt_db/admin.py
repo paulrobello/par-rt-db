@@ -25,6 +25,8 @@ Surface covered:
   with the capability fields (``expiresAt``, ``readOnly``, ``tables``)
 * interactive sessions — ``GET/DELETE /admin/sessions`` (list / revoke-one /
   revoke-user)
+* user merge — ``POST /admin/merge-users`` (anon→real account merge, typed
+  confirm guard)
 * webhook management (ENH-003) — ``/admin/db/{db}/webhooks`` (list / create /
   edit / delete) plus ``.../{id}/deliveries`` for the delivery outbox
 * audit log (ENH-004) — ``/admin/audit`` durable per-write audit rows, filtered
@@ -81,6 +83,7 @@ from .admin_models import (
     DbStats,
     ExplainResult,
     HotConfigPatch,
+    MergeReport,
     MetricsSnapshot,
     MigrateResult,
     MintedToken,
@@ -501,6 +504,21 @@ def _op_revoke_user_sessions(user_id: str) -> _AdminRequest:
     )
 
 
+def _op_merge_users(anon_user_id: str, real_user_id: str) -> _AdminRequest:
+    return _AdminRequest(
+        "POST",
+        "/admin/merge-users",
+        {
+            "json": {
+                "anonUserId": anon_user_id,
+                "realUserId": real_user_id,
+                "confirm": real_user_id,
+            }
+        },
+        _parse_model(MergeReport),
+    )
+
+
 def _op_list_webhooks(db: str) -> _AdminRequest:
     return _AdminRequest(
         "GET",
@@ -713,7 +731,8 @@ class RtDbAdminClient:
     history/restore, export/import, allowlist + admin-member management,
     introspection (stats/metrics/ops/config + explain/slow-queries), owner-bypass
     query/mutate, managed backups, the ENH-005 token triple, interactive
-    sessions, webhooks, the audit log, and the live subscription inspector.
+    sessions, user merges, webhooks, the audit log, and the live subscription
+    inspector.
     Routes, bodies, and response models are byte-identical with the server and
     with :class:`par_rt_db.http_client.RtDbHttpClient`'s admin methods (both
     delegate to the same request layer — see :mod:`par_rt_db.admin`).
@@ -1075,6 +1094,20 @@ class RtDbAdminClient:
         server's ``{ok, revoked}`` response.
         """
         return self._executor.run(_op_revoke_user_sessions(user_id))
+
+    # --- user merge (POST /admin/merge-users) ---
+
+    def merge_users(self, anon_user_id: str, real_user_id: str) -> MergeReport:
+        """``POST /admin/merge-users`` ``{anonUserId, realUserId, confirm}`` →
+        :class:`MergeReport`.
+
+        Runs the anon→real account merge synchronously across every database
+        (per-table doc re-stamps, storage blob owner swap, session re-point,
+        guarded anon-row delete) and returns the full report. ``confirm`` is
+        sent equal to ``real_user_id`` (the typed guard, mirroring
+        :meth:`delete_db`); a missing anon row is refused with ``NOT_FOUND``.
+        """
+        return self._executor.run(_op_merge_users(anon_user_id, real_user_id))
 
     # --- webhook surface (ENH-003) ---
 
@@ -1581,6 +1614,16 @@ class AsyncRtDbAdminClient:
         See :meth:`RtDbAdminClient.revoke_user_sessions`.
         """
         return await self._executor.run(_op_revoke_user_sessions(user_id))
+
+    # --- user merge (POST /admin/merge-users) ---
+
+    async def merge_users(self, anon_user_id: str, real_user_id: str) -> MergeReport:
+        """``POST /admin/merge-users`` → :class:`MergeReport` (async).
+
+        See :meth:`RtDbAdminClient.merge_users` for the typed-confirm guard
+        and report semantics.
+        """
+        return await self._executor.run(_op_merge_users(anon_user_id, real_user_id))
 
     # --- webhook surface (ENH-003) ---
 

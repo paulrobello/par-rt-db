@@ -29,6 +29,7 @@ from par_rt_db.admin import (
     DbStats,
     ExplainResult,
     HotConfigPatch,
+    MergeReport,
     MetricsSnapshot,
     MintedToken,
     OpEvent,
@@ -42,6 +43,7 @@ from par_rt_db.admin import (
     Webhook,
     WebhookDelivery,
 )
+from par_rt_db.admin_models import MergeConflict, MergeDbResult
 from par_rt_db.errors import ErrorCode, RtDbError
 from par_rt_db.http_client import SubscriptionInfo
 from par_rt_db.schema import Schema
@@ -380,6 +382,52 @@ def test_revoke_user_sessions_deletes_with_user_query_and_parses_count() -> None
     assert captured["url"].params["user"] == "u1"
 
 
+# --- sync: user merge (POST /admin/merge-users) ---------------------------
+
+
+def test_merge_users_posts_typed_confirm_and_parses_report() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["method"] = request.method
+        captured["url"] = request.url
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "dbs": {
+                    "kanban": {
+                        "tables": {"cards": 3, "sessions": 1},
+                        "conflicts": [{"table": "cards", "id": "c9"}],
+                    }
+                },
+                "storageRepointed": 2,
+                "sessionsRepointed": 1,
+                "anonDeleted": True,
+            },
+        )
+
+    with _sync_client(handler) as c:
+        report = c.merge_users("anon1", "real1")
+    assert captured["method"] == "POST"
+    assert captured["url"].path == "/admin/merge-users"
+    assert captured["body"] == {
+        "anonUserId": "anon1",
+        "realUserId": "real1",
+        "confirm": "real1",
+    }
+    assert isinstance(report, MergeReport)
+    assert isinstance(report.dbs["kanban"], MergeDbResult)
+    assert report.dbs["kanban"].tables == {"cards": 3, "sessions": 1}
+    conflict = report.dbs["kanban"].conflicts[0]
+    assert isinstance(conflict, MergeConflict)
+    assert conflict.table == "cards"
+    assert conflict.id == "c9"
+    assert report.storage_repointed == 2
+    assert report.sessions_repointed == 1
+    assert report.anon_deleted is True
+
+
 # --- sync: error envelope -------------------------------------------------
 
 
@@ -517,6 +565,34 @@ async def test_async_list_revoke_sessions_mirror_sync() -> None:
     assert ("GET", "/admin/sessions", {"user": "u1"}) in captured["urls"]
     assert ("DELETE", "/admin/sessions/abc", {}) in captured["urls"]
     assert ("DELETE", "/admin/sessions", {"user": "u1"}) in captured["urls"]
+
+
+async def test_async_merge_users_mirrors_sync() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["method"] = request.method
+        captured["path"] = request.url.path
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={"dbs": {}, "storageRepointed": 0, "sessionsRepointed": 0, "anonDeleted": False},
+        )
+
+    async with _async_client(handler) as c:
+        report = await c.merge_users("anon1", "real1")
+    assert isinstance(report, MergeReport)
+    assert report.dbs == {}
+    assert report.storage_repointed == 0
+    assert report.sessions_repointed == 0
+    assert report.anon_deleted is False
+    assert captured["method"] == "POST"
+    assert captured["path"] == "/admin/merge-users"
+    assert captured["body"] == {
+        "anonUserId": "anon1",
+        "realUserId": "real1",
+        "confirm": "real1",
+    }
 
 
 # --- mirrored admin surface (ENH-005 parity sweep) -----------------------

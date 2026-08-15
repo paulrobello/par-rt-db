@@ -2386,4 +2386,14 @@ describe("InMemoryRtDbClient — admin surface", () => {
     const mine = await c.admin.listSubscriptions({ db: "db" });
     expect(mine.subscriptions).toHaveLength(1);
   });
+
+  it("mergeUsers is a no-op that resolves an empty report", async () => {
+    const c = newClient();
+    await expect(c.admin.mergeUsers("anon1", "real1")).resolves.toEqual({
+      dbs: {},
+      storageRepointed: 0,
+      sessionsRepointed: 0,
+      anonDeleted: false,
+    });
+  });
 });
