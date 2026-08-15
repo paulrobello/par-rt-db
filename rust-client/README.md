@@ -16,14 +16,16 @@ Crate name: `par-rt-db-client` → in Rust, `use par_rt_db_client::...`.
 | `http` | yes | `RtDbHttpClient` — typed query / mutate / `auth_me` |
 | `ws` | no | `RtDbClient` (`src/ws.rs`) — reactive WebSocket client (live query subscriptions + mutate) |
 | `admin` | no | `RtDbAdminClient` (`src/admin.rs`) — `/admin/*` control-plane client: db create/list/push-schema, schema/stats read-back, token mint/revoke/list, db + server-wide admin allowlist CRUD, metrics, hot config GET/PATCH, op-feed `recent`, owner-bypass query/mutate, snapshot export/import. Browser-only `login`/`logout`/`/admin/stream` are excluded (the Rust client is a machine client). Construct via `RtDbAdminClient::new(url, admin_key)` or `RtDbHttpClient::admin_client()` (shares the connection pool). The admin methods also remain on `RtDbHttpClient` as `#[deprecated]` re-exports (ARC-121, non-breaking). |
-| `in_memory` | no | `InMemoryRtDbClient` (`src/in_memory.rs`) — in-memory test harness (no network, no Postgres). Ports `ts-client/src/in_memory.ts`: schema push, mutate (with `mut_id` idempotency), one-shot query DSL (`get`/`first`/`unique`/`count`/`take`/`collect` + index eq + range + `order` + cursor-keyset `paginate`), `filter()` predicate evaluation, reactive `subscribe` (re-runs and fires `on_update` on change), `schedule`/`cancel_schedule`/`pause_schedule`/`resume_schedule`/`list_schedules` + a timer-less `tick(now_ms)` (one-shot catches up if past due; cron re-arms by `CRON_STEP_MS = 60_000` and skips missed windows), and the `upload`/`delete_file`/`get_file_metadata`/`get_url` storage stubs. `search`/`vector_search` honestly stub out `[]` (no in-memory ranking; rejected combinations still throw). |
+| `in_memory` | no | `InMemoryRtDbClient` (`src/in_memory.rs`) — in-memory test harness (no network, no Postgres). Ports `ts-client/src/in_memory.ts`: schema push, mutate (with `mut_id` idempotency), one-shot query DSL (`get`/`first`/`unique`/`count`/`take`/`collect` + index eq + range + `order` + cursor-keyset `paginate`), `filter()` predicate evaluation, reactive `subscribe` (re-runs and fires `on_update` on change), `schedule`/`cancel_schedule`/`pause_schedule`/`resume_schedule`/`list_schedules` + a timer-less `tick(now_ms)` (one-shot catches up if past due; cron re-arms by `CRON_STEP_MS = 60_000` and skips missed windows), and the `upload`/`delete_file`/`get_file_metadata`/`get_url` storage stubs. `search` approximates server behavior by mode — token-AND matching for `tsquery`, substring + similarity ranking for `trgm` (FM-30); `vector_search` over-approximates (no distance model — every table doc is a candidate, narrowed by the carried `filter`); rejected combinations still throw. |
 
 `core` (wire types, schema/query/mutation builders, error model) compiles with
 no features. `[lints.rust] warnings = "deny"` — same zero-warning posture as the
 server.
 
 The `http` surface also carries `.filter()` / `.search()` / `.vector_search()`
-query builders (predicate, full-text, and vector-similarity terminals), the
+query builders (predicate, full-text, and vector-similarity terminals;
+`.search()` takes an optional `mode: "tsquery" | "trgm"` — `trgm` is
+substring/autocomplete matching ranked by pg_trgm similarity, FM-30), the
 `.hybrid_search()` fused full-text+vector terminal (Reciprocal Rank Fusion),
 `.distinct()` (collapse duplicates on a field set), and `.aggregate()` (grouped
 `sum`/`avg`/`min`/`max`/`count`) terminals, the
@@ -45,8 +47,11 @@ It exposes the same data surface as the live clients (`push_schema`,
 so a unit test can swap it in behind a shared interface. Atomic rollback on step
 failure, system-field merging at read time, and cursor-keyset pagination all
 behave like the server. The harness is opt-in (gates a `sha2` dependency for
-SHA-256 file digests); `search`/`vector_search` honestly return `[]` (no
-in-memory ts_rank / vector ranking), while storage (`upload`/`delete_file`/
+SHA-256 file digests); `search` approximates ranking client-side (token-AND
+matching for `tsquery`, substring + `query.len()/field.len()` similarity
+ranking for `trgm`, FM-30) while `vector_search` has no distance model and
+over-approximates (every table doc is a candidate, narrowed by the carried
+`filter`); storage (`upload`/`delete_file`/
 `get_file_metadata`/`get_url`) is a real in-memory `HashMap` stub — both match
 the TS harness's surface so app-level storage flows can be exercised with no
 network.

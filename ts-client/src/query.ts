@@ -7,6 +7,7 @@ import type {
   Order,
   PaginatedResultJson,
   QueryJson,
+  SearchMode,
   SearchQuery,
   VectorQuery,
 } from "./protocol.js";
@@ -56,13 +57,21 @@ export class TableQuery<DocT, Indexes extends string> {
    * (e.g. `.search("idx", "text").take(10)`); the server rejects every other
    * terminal alongside it. The optional `filter` narrows results server-side via
    * the full `FilterExpr` DSL (not to be confused with the query-level
-   * `.filter()` builder, which is mutually exclusive with `search`); omitted on
-   * the wire when absent so existing requests stay byte-identical. */
-  search(index: string, query: string, opts?: { filter?: FilterExpr }): TableQuery<DocT, Indexes> {
+   * `.filter()` builder, which is mutually exclusive with `search`); the
+   * optional `mode` selects the match strategy — `tsquery` (default, word/stem
+   * full-text) or `trgm` (case-insensitive substring, ranked by similarity);
+   * both omitted on the wire when absent so existing requests stay
+   * byte-identical. */
+  search(
+    index: string,
+    query: string,
+    opts?: { filter?: FilterExpr; mode?: SearchMode },
+  ): TableQuery<DocT, Indexes> {
     const search: SearchQuery = {
       index,
       query,
       ...(opts?.filter ? { filter: opts.filter } : {}),
+      ...(opts?.mode ? { mode: opts.mode } : {}),
     };
     return new TableQuery({ ...this.json, search });
   }

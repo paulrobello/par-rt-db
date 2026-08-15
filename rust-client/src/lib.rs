@@ -67,8 +67,8 @@ pub use query::{
 pub use schema::{DistanceMetric, FieldType, IndexDef, SchemaDef, TableDef, VectorIndexSpec};
 pub use wire::{
     AggregateGroup, AggregateOp, AggregateSpec, AuthedUser, ClientMessage, FilterExpr,
-    PresenceMember, ScheduleInfo, ScheduleKind, ScheduleStatus, ScheduleWhen, SearchQuery,
-    ServerMessage, UserKind, VectorSearchQuery,
+    PresenceMember, ScheduleInfo, ScheduleKind, ScheduleStatus, ScheduleWhen, SearchMode,
+    SearchQuery, ServerMessage, UserKind, VectorSearchQuery,
 };
 
 #[cfg(feature = "http")]

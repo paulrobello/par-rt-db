@@ -205,26 +205,39 @@ FilterExpr = Annotated[
 ]
 
 
+#: Match mode for the ``search`` terminal (FM-30): ``"tsquery"`` (the default —
+#: today's full-text behavior, also the behavior when ``mode`` is omitted) or
+#: ``"trgm"`` (case-insensitive substring/autocomplete matching over the
+#: index's text fields). Mirrors ``server/src/query.rs::SearchMode`` (lowercase
+#: wire form); a value outside the set is rejected at parse time.
+SearchMode = Literal["tsquery", "trgm"]
+
+
 class SearchQuery(_Camel):
-    """Full-text search terminal: ``{index, query, filter?}``.
+    """Full-text search terminal: ``{index, query, filter?, mode?}``.
 
     ``filter`` is the db-side ``FilterExpr`` (the same type ``.filter()`` and
-    ``authorize`` use), narrowing search results server-side. It is omitted on
-    the wire when ``None`` (mirrors the server's
-    ``#[serde(skip_serializing_if = "Option::is_none")]``), so existing requests
-    stay byte-identical. ``VectorSearchQuery.filter`` is the same full
-    ``FilterExpr`` type.
+    ``authorize`` use), narrowing search results server-side. ``mode`` selects
+    the match strategy (FM-30): omitted/``"tsquery"`` is today's full-text
+    behavior; ``"trgm"`` is substring matching over the index's text fields
+    (see ``SearchMode``). Both are omitted on the wire when ``None`` (mirrors
+    the server's ``#[serde(skip_serializing_if = "Option::is_none")]``), so
+    existing requests stay byte-identical. ``VectorSearchQuery.filter`` is the
+    same full ``FilterExpr`` type.
     """
 
     index: str
     query: str
     filter: FilterExpr | None = None
+    mode: SearchMode | None = None
 
     @model_serializer(mode="wrap")
-    def _drop_none_filter(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+    def _drop_none_optionals(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
         out = handler(self)
         if out.get("filter") is None:
             out.pop("filter", None)
+        if out.get("mode") is None:
+            out.pop("mode", None)
         return out
 
 

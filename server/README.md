@@ -88,7 +88,15 @@ metric's opclass (`vector_cosine_ops` for cosine (default), `vector_l2_ops` for
 L2, `vector_ip_ops` for inner-product), ranked by that metric's distance
 operator and carrying an optional full `FilterExpr` (the same predicate DSL
 `.filter()` accepts). Embeddings are client-supplied (no server-side
-generation); the Postgres image is `pgvector/pgvector:pg17`.
+generation); the Postgres image is `pgvector/pgvector:pg17`. The `search`
+terminal also takes an optional `mode: "trgm"` (FM-30): substring/autocomplete
+matching via `pg_trgm` — case-insensitive `ILIKE '%q%'` over the index's text
+fields, ranked by `similarity()`, composing with `filter` and `take`. Every
+search index carries a GIN trigram index (`tg_<table>_<index>`) beside its
+tsvector GIN, created on push with `IF NOT EXISTS` so existing deployments
+backfill on the next schema push; the tradeoff is roughly double the index
+storage over search fields. `mode` omitted (or `"tsquery"`) is today's
+full-text behavior, unchanged.
 
 ## Scheduling
 

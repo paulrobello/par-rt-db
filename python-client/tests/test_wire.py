@@ -166,6 +166,32 @@ def test_search_query_shape() -> None:
     assert sq.model_dump(by_alias=True, mode="json") == {"index": "idx", "query": "hello"}
 
 
+def test_search_query_omits_mode_when_none() -> None:
+    # FM-30: `mode` is optional and omitted entirely when unset, so existing
+    # requests stay byte-identical (the corpus `queries` section pins this).
+    sq = SearchQuery.model_validate({"index": "idx", "query": "hello"})
+    out = sq.model_dump(by_alias=True, mode="json")
+    assert out == {"index": "idx", "query": "hello"}
+    assert "mode" not in out
+
+
+def test_search_query_round_trips_mode() -> None:
+    for mode in ("tsquery", "trgm"):
+        sq = SearchQuery.model_validate({"index": "idx", "query": "conv", "mode": mode})
+        assert sq.model_dump(by_alias=True, mode="json") == {
+            "index": "idx",
+            "query": "conv",
+            "mode": mode,
+        }
+
+
+def test_search_query_rejects_unknown_mode() -> None:
+    # The closed domain is {"tsquery", "trgm"}; anything else is rejected at
+    # parse time (the server's SearchMode enum rejects it as BadRequest).
+    with pytest.raises(ValidationError):
+        SearchQuery.model_validate({"index": "idx", "query": "conv", "mode": "fuzzy"})
+
+
 def test_vector_search_query_omits_filter_when_none() -> None:
     vq = VectorSearchQuery.model_validate({"index": "v", "vector": [0.1, 0.2], "limit": 8})
     out = vq.model_dump(by_alias=True, mode="json")

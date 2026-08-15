@@ -388,7 +388,10 @@ uncapped `SELECT COUNT(*)`, `first` is sugar over `take(1)`, `filter` carries
 an `eq`/`neq`/`gt`/`gte`/`lt`/`lte`/`in`/`not`/`contains`/`exists` + `and`/`or`
 predicate compiled to SQL, `search` ranks by `ts_rank` over a generated
 tsvector (and accepts an optional `filter` to narrow the `WHERE` in the same
-SQL pass — the same `FilterExpr` `.filter()` accepts), `vectorSearch` ranks by
+SQL pass — the same `FilterExpr` `.filter()` accepts; an optional
+`mode: "trgm"` switches to substring/autocomplete matching — case-insensitive
+`ILIKE` ranked by `pg_trgm` `similarity()`, backed by a GIN trigram index),
+`vectorSearch` ranks by
 the index's declared metric distance over a write-maintained pgvector column
 (also accepting an optional full `filter`), `hybridSearch` fuses the full-text
 (`ts_rank`) and `vectorSearch` rankings for the same table into one list via

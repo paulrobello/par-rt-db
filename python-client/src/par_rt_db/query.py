@@ -34,6 +34,7 @@ from .wire import (
     AggregateSpec,
     FilterExpr,
     HybridSearchQuery,
+    SearchMode,
     SearchQuery,
     VectorSearchQuery,
     to_camel,
@@ -198,16 +199,23 @@ class TableQuery:
         query: str,
         *,
         filter_: FilterExpr | None = None,
+        mode: SearchMode | None = None,
     ) -> TableQuery:
         """Full-text search terminal. ``filter_`` is a ``FilterExpr`` (the same
         type ``.filter()`` and ``authorize`` use) that narrows search results
         server-side; omitted when ``None``. The trailing underscore mirrors
         ``vector_search``'s ``filter_`` keyword. The nested search filter is
         distinct from the query-level ``.filter()`` builder (which is mutually
-        exclusive with ``search``)."""
+        exclusive with ``search``). ``mode`` selects the match strategy (FM-30):
+        ``None`` (default) or ``"tsquery"`` is today's full-text behavior;
+        ``"trgm"`` is case-insensitive substring/autocomplete matching over the
+        index's text fields. Omitted from the wire when ``None`` so existing
+        requests stay byte-identical."""
         payload: dict[str, Any] = {"index": index, "query": query}
         if filter_ is not None:
             payload["filter"] = filter_
+        if mode is not None:
+            payload["mode"] = mode
         self._search = SearchQuery.model_validate(payload)
         return self
 

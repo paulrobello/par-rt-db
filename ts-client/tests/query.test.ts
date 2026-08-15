@@ -308,6 +308,25 @@ describe("TableQuery.search", () => {
       take: 10,
     });
   });
+
+  it("includes mode on the wire when provided", () => {
+    const q = api.items.query().search("search_content", "conv", { mode: "trgm" }).take(10);
+    expect(q.json).toEqual({
+      table: "items",
+      search: { index: "search_content", query: "conv", mode: "trgm" },
+      take: 10,
+    });
+  });
+
+  it("omits mode on the wire when not provided", () => {
+    const q = api.items.query().search("search_content", "hello world").take(10);
+    expect(q.json.search).not.toHaveProperty("mode");
+    expect(q.json).toEqual({
+      table: "items",
+      search: { index: "search_content", query: "hello world" },
+      take: 10,
+    });
+  });
 });
 
 describe("TableQuery.vectorSearch", () => {

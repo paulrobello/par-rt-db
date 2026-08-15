@@ -2,7 +2,7 @@ use super::*;
 use crate::mutation::Mutation;
 use crate::query::{Paginate, Paginated, SearchOpts, TableQuery, VectorSearchOpts};
 use crate::schema::{Schema, Table};
-use crate::wire::{AggregateOp, AggregateSpec, FilterExpr};
+use crate::wire::{AggregateOp, AggregateSpec, FilterExpr, SearchMode};
 use serde_json::json;
 use std::sync::{Arc, Mutex};
 
@@ -2917,6 +2917,7 @@ async fn query_search_rejects_conflicting_terminals() {
                 index: "by_content".into(),
                 query: "hello".into(),
                 filter: None,
+                mode: None,
             }),
             index: Some("by_name".into()),
             ..Default::default()
@@ -2946,6 +2947,7 @@ async fn query_search_with_filter_returns_empty_after_narrowing() {
                             field: "status".into(),
                             value: "done".into(),
                         }),
+                        mode: None,
                     },
                 )
                 .take(5),
@@ -2971,6 +2973,7 @@ async fn query_search_with_unknown_filter_field_is_bad_request() {
                             field: "nonexistent".into(),
                             value: "x".into(),
                         }),
+                        mode: None,
                     },
                 )
                 .take(5),
@@ -2978,6 +2981,278 @@ async fn query_search_with_unknown_filter_field_is_bad_request() {
         .unwrap_err();
     assert_eq!(err.code, ErrorCode::BadRequest);
     assert!(err.message.contains("nonexistent"), "got: {err}");
+}
+
+/// Inserts `(name, status)` rows into `items` in order — the deterministic
+/// `new_client()` clock makes later inserts newer (`_creationTime` asc, ids
+/// lexicographically asc), which the trgm tie-break tests rely on.
+async fn seed_search_items(c: &mut InMemoryRtDbClient, rows: &[(&str, &str)]) {
+    for (i, (name, status)) in rows.iter().enumerate() {
+        c.mutate(
+            &Mutation::new()
+                .insert("items", json!({"name": name, "status": status, "order": i}))
+                .build(),
+            None,
+        )
+        .await
+        .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn query_search_trgm_substring_match_ranks_and_takes() {
+    // trgm matches the whole query as a case-insensitive SUBSTRING of an
+    // indexed field — "conv" hits "convex"/"Convex"/"convexity appendix",
+    // infixes server-side plainto_tsquery stemming cannot match. Ranking is
+    // the pinned cross-harness approximation: query.len()/field.len() per
+    // containing field, max per doc (shorter field = more similar), then
+    // created_at desc, then id desc; `take` truncates after ranking.
+    let mut c = new_client();
+    seed_search_items(
+        &mut c,
+        &[
+            ("unrelated", "todo"),
+            ("convexity appendix", "todo"),
+            ("convex", "todo"),
+            ("Convex", "todo"),
+        ],
+    )
+    .await;
+    let names = |v: &[Value]| -> Vec<String> {
+        v.iter()
+            .filter_map(|d| d["name"].as_str().map(String::from))
+            .collect()
+    };
+
+    // Untruncated (take above the match count): all three containing docs,
+    // ranked — "Convex"/"convex" tie at 4/6 and the LATER insert wins the
+    // created_at tie-break; "convexity appendix" (4/18) ranks last.
+    // "unrelated" never matched.
+    let all = c
+        .run::<Vec<Value>>(
+            &TableQuery::new("items")
+                .search(
+                    "by_content",
+                    "conv",
+                    SearchOpts {
+                        filter: None,
+                        mode: Some(SearchMode::Trgm),
+                    },
+                )
+                .take(10),
+        )
+        .expect("trgm search without take");
+    assert_eq!(
+        names(&all),
+        ["Convex", "convex", "convexity appendix"].map(String::from)
+    );
+
+    // take(2) truncates the ranked list (drops the lowest-similarity doc).
+    let capped = c
+        .run::<Vec<Value>>(
+            &TableQuery::new("items")
+                .search(
+                    "by_content",
+                    "conv",
+                    SearchOpts {
+                        filter: None,
+                        mode: Some(SearchMode::Trgm),
+                    },
+                )
+                .take(2),
+        )
+        .expect("trgm search with take");
+    assert_eq!(names(&capped), ["Convex", "convex"].map(String::from));
+}
+
+#[tokio::test]
+async fn query_search_trgm_is_case_insensitive_and_index_scoped() {
+    // Containment is lowercased on both sides; only the search index's
+    // declared fields (here just `name`) are matched — `status` containing
+    // the query never hits.
+    let mut c = new_client();
+    seed_search_items(&mut c, &[("Shiny Widget", "todo")]).await;
+    for query in ["widget", "SHINY", "sHiNy"] {
+        let v = c
+            .run::<Vec<Value>>(
+                &TableQuery::new("items")
+                    .search(
+                        "by_content",
+                        query,
+                        SearchOpts {
+                            filter: None,
+                            mode: Some(SearchMode::Trgm),
+                        },
+                    )
+                    .take(5),
+            )
+            .expect("trgm case-insensitive search");
+        assert_eq!(v.len(), 1, "query '{query}' should match");
+        assert_eq!(v[0]["name"], json!("Shiny Widget"));
+    }
+    let none = c
+        .run::<Vec<Value>>(
+            &TableQuery::new("items")
+                .search(
+                    "by_content",
+                    "tod", // substring of status="todo", not of name
+                    SearchOpts {
+                        filter: None,
+                        mode: Some(SearchMode::Trgm),
+                    },
+                )
+                .take(5),
+        )
+        .expect("trgm index-scoped search");
+    assert!(none.is_empty(), "non-indexed fields must not match");
+}
+
+#[tokio::test]
+async fn query_search_trgm_requires_the_whole_query_as_substring() {
+    // trgm matches the query as ONE contiguous substring; the tsquery
+    // approximation matches per-token. "con vex" over "convex" therefore
+    // diverges: both tokens are substrings (tsquery-mode hit) but the phrase
+    // is not (trgm miss).
+    let mut c = new_client();
+    seed_search_items(&mut c, &[("convex", "todo")]).await;
+    let tsquery = c
+        .run::<Vec<Value>>(
+            &TableQuery::new("items")
+                .search("by_content", "con vex", ())
+                .take(5),
+        )
+        .expect("default-mode search");
+    assert_eq!(
+        tsquery.len(),
+        1,
+        "token-AND approximation matches per-token"
+    );
+    let trgm = c
+        .run::<Vec<Value>>(
+            &TableQuery::new("items")
+                .search(
+                    "by_content",
+                    "con vex",
+                    SearchOpts {
+                        filter: None,
+                        mode: Some(SearchMode::Trgm),
+                    },
+                )
+                .take(5),
+        )
+        .expect("trgm search");
+    assert!(trgm.is_empty(), "trgm requires the contiguous phrase");
+}
+
+#[tokio::test]
+async fn query_search_trgm_composes_with_filter() {
+    // The carried FilterExpr narrows BEFORE ranking, so filter + take compose
+    // exactly as in tsquery mode.
+    let mut c = new_client();
+    seed_search_items(
+        &mut c,
+        &[
+            ("convex", "done"),
+            ("convexity appendix", "done"),
+            ("convex ruler", "todo"),
+        ],
+    )
+    .await;
+    let v = c
+        .run::<Vec<Value>>(
+            &TableQuery::new("items")
+                .search(
+                    "by_content",
+                    "conv",
+                    SearchOpts {
+                        filter: Some(FilterExpr::Eq {
+                            field: "status".into(),
+                            value: "done".into(),
+                        }),
+                        mode: Some(SearchMode::Trgm),
+                    },
+                )
+                .take(1),
+        )
+        .expect("trgm search with filter");
+    // "convex ruler" matches the substring but is filtered out; among the
+    // done docs "convex" (4/6) outranks "convexity appendix" (4/18) and
+    // take(1) keeps only it.
+    assert_eq!(v.len(), 1);
+    assert_eq!(v[0]["name"], json!("convex"));
+}
+
+#[tokio::test]
+async fn query_search_explicit_tsquery_mode_equals_omitted() {
+    // Explicit SearchMode::Tsquery routes through the same default path —
+    // results identical to mode omitted (both run against the same unchanged
+    // store, so array order is comparable).
+    let mut c = new_client();
+    seed_search_items(&mut c, &[("alpha beta", "todo"), ("gamma", "todo")]).await;
+    let omitted = c
+        .run::<Vec<Value>>(
+            &TableQuery::new("items")
+                .search("by_content", "alpha beta", ())
+                .take(5),
+        )
+        .expect("search with mode omitted");
+    let explicit = c
+        .run::<Vec<Value>>(
+            &TableQuery::new("items")
+                .search(
+                    "by_content",
+                    "alpha beta",
+                    SearchOpts {
+                        filter: None,
+                        mode: Some(SearchMode::Tsquery),
+                    },
+                )
+                .take(5),
+        )
+        .expect("search with explicit tsquery");
+    assert_eq!(omitted.len(), 1, "token-AND matches the containing doc");
+    assert_eq!(omitted, explicit, "explicit tsquery == default");
+}
+
+#[tokio::test]
+async fn query_search_rejects_empty_query_in_both_modes() {
+    // Empty (or whitespace-only) query text is BadRequest before the mode
+    // branch — mirrors server `compile_search` and the ts/python harnesses.
+    let mut c = new_client();
+    seed_search_items(&mut c, &[("convex", "todo")]).await;
+    for mode in [None, Some(SearchMode::Tsquery), Some(SearchMode::Trgm)] {
+        for query in ["", "   "] {
+            let err = c
+                .run::<Vec<Value>>(
+                    &TableQuery::new("items")
+                        .search("by_content", query, SearchOpts { filter: None, mode })
+                        .take(5),
+                )
+                .unwrap_err();
+            assert_eq!(err.code, ErrorCode::BadRequest, "mode {mode:?}");
+            assert_eq!(err.message, "search query text must not be empty");
+        }
+    }
+}
+
+#[tokio::test]
+async fn query_search_requires_a_search_index_in_both_modes() {
+    // The index check lives in the shared prologue (server `compile_search`
+    // runs it before the mode branch), so a btree index name is rejected for
+    // tsquery (the default) too — not just trgm.
+    let mut c = new_client();
+    seed_search_items(&mut c, &[("convex", "todo")]).await;
+    for mode in [None, Some(SearchMode::Tsquery), Some(SearchMode::Trgm)] {
+        let err = c
+            .run::<Vec<Value>>(
+                &TableQuery::new("items")
+                    .search("by_name", "convex", SearchOpts { filter: None, mode })
+                    .take(5),
+            )
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::BadRequest, "mode {mode:?}");
+        assert_eq!(err.message, "search index 'by_name' not found");
+    }
 }
 
 #[tokio::test]

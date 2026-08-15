@@ -1,6 +1,6 @@
 //! Query DSL: builds the exact `Query` JSON the server expects, and parses untagged results.
 
-use crate::wire::{AggregateOp, AggregateSpec, FilterExpr, SearchQuery};
+use crate::wire::{AggregateOp, AggregateSpec, FilterExpr, SearchMode, SearchQuery};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
@@ -142,15 +142,19 @@ impl From<()> for HybridSearchOpts {
 
 /// Optional arguments for [`TableQuery::search`]: `filter` is an optional
 /// `FilterExpr` (the db-side `filter()` DSL) that narrows the search `WHERE`
-/// server-side. Defaults to `None` (no filter on the wire). The search filter is
-/// nested on the terminal — distinct from the top-level `.filter()` builder,
-/// which is mutually exclusive with `search` — so callers pass it through the
-/// `.search(idx, text, { filter })` opts, not a chained `.filter()`. `From<()>`
-/// lets callers omit it (`.search(idx, text, ())`); a `SearchOpts { filter }`
-/// literal names the field.
+/// server-side; `mode` selects the match strategy (FM-30) — `None` keeps the
+/// default full-text (`tsquery`) behavior, `Some(SearchMode::Trgm)` opts into
+/// substring/autocomplete matching over the index's text fields. Both default
+/// to `None` (nothing extra on the wire). The search filter is nested on the
+/// terminal — distinct from the top-level `.filter()` builder, which is
+/// mutually exclusive with `search` — so callers pass it through the
+/// `.search(idx, text, { filter, mode })` opts, not a chained `.filter()`.
+/// `From<()>` lets callers omit both (`.search(idx, text, ())`); a
+/// `SearchOpts { .. }` literal names the fields.
 #[derive(Debug, Clone, Default)]
 pub struct SearchOpts {
     pub filter: Option<FilterExpr>,
+    pub mode: Option<SearchMode>,
 }
 
 impl From<()> for SearchOpts {
@@ -223,17 +227,20 @@ impl TableQuery {
     /// rejects every other terminal alongside it.
     ///
     /// `opts` accepts any `Into<SearchOpts>`: pass `()` to omit the filter
-    /// (`.search(idx, text, ())`), or a `SearchOpts { filter }` literal to narrow
-    /// results server-side via a `FilterExpr`. The nested filter is distinct from
-    /// the top-level `.filter()` builder (which is mutually exclusive with
-    /// `search`) and is omitted on the wire when `None`, so both forms serialize
-    /// identically when no filter is wanted.
+    /// (`.search(idx, text, ())`), or a `SearchOpts { filter, mode }` literal to
+    /// narrow results server-side via a `FilterExpr` and/or opt into
+    /// substring/autocomplete matching via `SearchMode::Trgm` (FM-30; `mode` is
+    /// omitted on the wire when `None`, so both forms serialize identically when
+    /// the default tsquery behavior is wanted). The nested filter is distinct
+    /// from the top-level `.filter()` builder (which is mutually exclusive with
+    /// `search`) and is likewise omitted on the wire when `None`.
     pub fn search(mut self, index: &str, query: &str, opts: impl Into<SearchOpts>) -> Self {
         let opts = opts.into();
         self.q.search = Some(SearchQuery {
             index: index.into(),
             query: query.into(),
             filter: opts.filter,
+            mode: opts.mode,
         });
         self
     }
@@ -631,6 +638,7 @@ mod tests {
                             },
                         ],
                     }),
+                    mode: None,
                 },
             )
             .take(10);
@@ -649,6 +657,52 @@ mod tests {
                         ]
                     }
                 },
+                "take":10
+            })
+        );
+    }
+
+    #[test]
+    fn search_with_opts_struct_carries_mode() {
+        // `mode` set → emitted on the wire as the lowercase variant, nested on
+        // the terminal (FM-30). Default `()` stays byte-identical to the
+        // pre-mode shape (covered by `search_builder_serializes_terminal`).
+        let q = TableQuery::new("notes")
+            .search(
+                "search_body",
+                "conv",
+                SearchOpts {
+                    filter: None,
+                    mode: Some(SearchMode::Trgm),
+                },
+            )
+            .take(10);
+        assert_eq!(
+            serde_json::to_value(&q).unwrap(),
+            json!({
+                "table":"notes",
+                "search":{"index":"search_body","query":"conv","mode":"trgm"},
+                "take":10
+            })
+        );
+
+        // Explicit `Tsquery` is honored when a caller names it (the server
+        // accepts it; clients never emit it implicitly).
+        let explicit = TableQuery::new("notes")
+            .search(
+                "search_body",
+                "conv",
+                SearchOpts {
+                    filter: None,
+                    mode: Some(SearchMode::Tsquery),
+                },
+            )
+            .take(10);
+        assert_eq!(
+            serde_json::to_value(&explicit).unwrap(),
+            json!({
+                "table":"notes",
+                "search":{"index":"search_body","query":"conv","mode":"tsquery"},
                 "take":10
             })
         );

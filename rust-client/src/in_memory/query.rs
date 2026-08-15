@@ -16,7 +16,10 @@ impl InMemoryRtDbClient {
     /// - `count` → number of matching rows.
     /// - `take` / `collect` → array of merged docs.
     /// - `search` → token-AND matched docs narrowed by an optional `filter`
-    ///   (no in-memory ts_rank; result order is unspecified, compared as a set).
+    ///   (no in-memory ts_rank; result order is unspecified, compared as a
+    ///   set), or — under `mode: "trgm"` (FM-30) — case-insensitive substring
+    ///   matches ranked by approximate similarity, tie-broken and capped by
+    ///   `take`.
     /// - `vector_search` → all docs narrowed by an optional `filter`, capped at
     ///   `limit` (no in-memory distance model; same over-approximation as the
     ///   ts/python clients).
@@ -272,14 +275,16 @@ impl InMemoryRtDbClient {
 
         // `search` terminal — cascade mirror of server `execute_query`.
         // In-memory replica approximation: there is no ts_rank model
-        // client-side, so we mirror the ts-client's token-AND matching against
-        // the search index's text fields (a doc matches when every whitespace
-        // token of the query appears, case-insensitively, as a substring of at
-        // least one indexed field's string value); the carried `filter` then
-        // narrows the candidate set. Result order is unspecified (no ranking)
-        // so callers compare as a set. QA-103: the previous stub returned `[]`
-        // unconditionally, which diverged from the server (and the other
-        // clients) on every non-empty match.
+        // client-side, so the default (tsquery) mode mirrors the ts-client's
+        // token-AND matching against the search index's text fields (a doc
+        // matches when every whitespace token of the query appears,
+        // case-insensitively, as a substring of at least one indexed field's
+        // string value); the carried `filter` then narrows the candidate set.
+        // Result order is unspecified (no ranking) so callers compare as a
+        // set. QA-103: the previous stub returned `[]` unconditionally, which
+        // diverged from the server (and the other clients) on every non-empty
+        // match. `mode: "trgm"` (FM-30) instead substring-matches and ranks
+        // by approximate similarity — see `execute_search_terminal`.
         if let Some(search) = &q.search {
             return self.execute_search_terminal(q, search, &table_def, eq, has_range);
         }
@@ -668,15 +673,25 @@ impl InMemoryRtDbClient {
     }
 
     /// `search` terminal — cascade mirror of server `execute_query`.
-    /// In-memory replica approximation: there is no ts_rank model
-    /// client-side, so we mirror the ts-client's token-AND matching against
-    /// the search index's text fields (a doc matches when every whitespace
-    /// token of the query appears, case-insensitively, as a substring of at
-    /// least one indexed field's string value); the carried `filter` then
-    /// narrows the candidate set. Result order is unspecified (no ranking)
-    /// so callers compare as a set. QA-103: the previous stub returned `[]`
-    /// unconditionally, which diverged from the server (and the other
-    /// clients) on every non-empty match.
+    /// In-memory replica approximation, by mode (FM-30):
+    /// - tsquery (the default, and explicit `SearchMode::Tsquery`): there is
+    ///   no ts_rank model client-side, so we mirror the ts-client's token-AND
+    ///   matching against the search index's text fields (a doc matches when
+    ///   every whitespace token of the query appears, case-insensitively, as
+    ///   a substring of at least one indexed field's string value). Result
+    ///   order is unspecified (no ranking) so callers compare as a set.
+    ///   QA-103: the previous stub returned `[]` unconditionally, which
+    ///   diverged from the server (and the other clients) on every non-empty
+    ///   match.
+    /// - trgm: case-insensitive substring match (the WHOLE query as a
+    ///   contiguous substring of an indexed field's string value), ranked by
+    ///   the approximate similarity the three harnesses pin for cross-client
+    ///   agreement: query.len()/field.len() per containing field, max per
+    ///   doc (a shorter containing field is more similar), then created_at
+    ///   desc and id desc tiebreaks. `take` (already capped to MAX_TAKE in
+    ///   `run_query`) limits the ranked result.
+    ///
+    /// In both modes the carried `filter` narrows the candidate set.
     fn execute_search_terminal(
         &self,
         q: &Query,
@@ -706,18 +721,85 @@ impl InMemoryRtDbClient {
                  vector search, or hybrid search",
             ));
         }
+        // Shared prologue (guard → empty query → search index → filter), run
+        // before the mode branch so both modes reject identically — mirrors
+        // server `compile_search` and the ts/python harnesses.
+        if search.query.trim().is_empty() {
+            return Err(RtDbError::new(
+                ErrorCode::BadRequest,
+                "search query text must not be empty",
+            ));
+        }
+        let search_not_found = || {
+            RtDbError::new(
+                ErrorCode::BadRequest,
+                format!("search index '{}' not found", search.index),
+            )
+        };
+        let index_def = table_def
+            .indexes
+            .as_ref()
+            .and_then(|indexes| indexes.iter().find(|i| i.name == search.index && i.search))
+            .ok_or_else(search_not_found)?;
+        let index_fields: Vec<String> = index_def.fields.clone();
         if let Some(filter) = &search.filter {
             let fields: BTreeSet<String> = table_def.fields.keys().cloned().collect();
             validate_filter(filter, &fields)?;
         }
-        let index_def = require_index(table_def, &search.index)?;
-        let index_fields: Vec<String> = index_def.fields.clone();
+        let mut rows: Vec<Value> = self.collect_all(&q.table);
+        if search.mode == Some(crate::wire::SearchMode::Trgm) {
+            if let Some(filter) = &search.filter {
+                rows.retain(|d| matches_filter(filter, d));
+            }
+            let needle = search.query.to_lowercase();
+            let query_len = search.query.len();
+            let mut scored: Vec<(f64, i64, String, Value)> = Vec::new();
+            for doc in rows {
+                let mut best: Option<f64> = None;
+                for field in &index_fields {
+                    if let Some(text) = doc.get(field).and_then(Value::as_str)
+                        && text.to_lowercase().contains(&needle)
+                    {
+                        // Empty fields cannot contain a non-empty query;
+                        // the 0.0 guard only pins the empty-query-on-empty
+                        // field case to a finite score instead of NaN.
+                        let score = if text.is_empty() {
+                            0.0
+                        } else {
+                            query_len as f64 / text.len() as f64
+                        };
+                        best = Some(best.map_or(score, |b: f64| b.max(score)));
+                    }
+                }
+                if let Some(score) = best {
+                    let created_at = doc
+                        .get("_creationTime")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(i64::MIN);
+                    let id = doc
+                        .get("_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    scored.push((score, created_at, id, doc));
+                }
+            }
+            scored.sort_by(|a, b| {
+                b.0.total_cmp(&a.0)
+                    .then_with(|| b.1.cmp(&a.1))
+                    .then_with(|| b.2.cmp(&a.2))
+            });
+            let limit = q.take.map(|t| t as usize).unwrap_or(MAX_TAKE);
+            scored.truncate(limit);
+            return Ok(Value::Array(
+                scored.into_iter().map(|(_, _, _, doc)| doc).collect(),
+            ));
+        }
         let tokens: Vec<String> = search
             .query
             .split_whitespace()
             .map(|t| t.to_lowercase())
             .collect();
-        let mut rows: Vec<Value> = self.collect_all(&q.table);
         if !tokens.is_empty() {
             rows.retain(|doc| {
                 tokens.iter().all(|tok| {

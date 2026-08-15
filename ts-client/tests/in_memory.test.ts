@@ -2188,6 +2188,103 @@ describe("InMemoryRtDbClient — full-text search", () => {
   });
 });
 
+describe("InMemoryRtDbClient — trgm search (mode: 'trgm')", () => {
+  const trgmSchema = defineSchema({
+    notes: defineTable({
+      title: t.string(),
+      body: t.string(),
+    }).searchIndex("search_text", ["title", "body"]),
+  });
+  const trgmApi = createApi(trgmSchema);
+
+  function trgmClient(): InMemoryRtDbClient {
+    let ms = 1_700_000_000_000;
+    const c = new InMemoryRtDbClient({ now: () => ms++, random: () => 0 });
+    c.pushSchema(trgmSchema);
+    return c;
+  }
+
+  async function seedTrgm(c: InMemoryRtDbClient): Promise<void> {
+    await c.mutate(
+      mutation()
+        .insert("notes", { title: "Convexity of trigrams", body: "similarity study" })
+        .build(),
+    );
+    await c.mutate(mutation().insert("notes", { title: "Release plan", body: "ship it" }).build());
+    await c.mutate(mutation().insert("notes", { title: "conv", body: "exact note" }).build());
+  }
+
+  it("matches infix substrings that tsquery word-matching cannot", async () => {
+    const c = trgmClient();
+    await seedTrgm(c);
+    // trgm: "conv" appears inside "Convexity of trigrams" (infix) and as an
+    // exact title.
+    const trgmDocs = (await c.query(
+      trgmApi.notes.query().search("search_text", "conv", { mode: "trgm" }).take(10),
+    )) as Array<{ title: string }>;
+    expect(trgmDocs.map((d) => d.title).sort()).toEqual(["Convexity of trigrams", "conv"]);
+    // Default (tsquery): token-AND requires the exact word "conv" — only the
+    // exact-title note matches; the infix hit is invisible.
+    const ftsDocs = (await c.query(
+      trgmApi.notes.query().search("search_text", "conv").take(10),
+    )) as Array<{ title: string }>;
+    expect(ftsDocs.map((d) => d.title)).toEqual(["conv"]);
+  });
+
+  it("matches case-insensitively", async () => {
+    const c = trgmClient();
+    await seedTrgm(c);
+    const docs = (await c.query(
+      trgmApi.notes.query().search("search_text", "cOnV", { mode: "trgm" }).take(10),
+    )) as Array<{ title: string }>;
+    expect(docs.map((d) => d.title).sort()).toEqual(["Convexity of trigrams", "conv"]);
+  });
+
+  it("ranks the shorter containing field first (query.length / field.length)", async () => {
+    const c = trgmClient();
+    await seedTrgm(c);
+    // "conv" in the exact 4-char title scores 1.0; inside the 22-char
+    // "Convexity of trigrams" it scores 4/22 — score dominates the
+    // createdAt tie-break (the infix note was inserted first).
+    const docs = (await c.query(
+      trgmApi.notes.query().search("search_text", "conv", { mode: "trgm" }).take(10),
+    )) as Array<{ title: string }>;
+    expect(docs.map((d) => d.title)).toEqual(["conv", "Convexity of trigrams"]);
+  });
+
+  it("narrows by a search-level filter and respects take", async () => {
+    const c = trgmClient();
+    await seedTrgm(c);
+    const filtered = (await c.query(
+      trgmApi.notes
+        .query()
+        .search("search_text", "conv", {
+          mode: "trgm",
+          filter: { op: "eq", field: "title", value: "Convexity of trigrams" },
+        })
+        .take(10),
+    )) as Array<{ title: string }>;
+    expect(filtered.map((d) => d.title)).toEqual(["Convexity of trigrams"]);
+    const taken = await c.query(
+      trgmApi.notes.query().search("search_text", "conv", { mode: "trgm" }).take(1),
+    );
+    expect(taken).toHaveLength(1);
+  });
+
+  it("explicit mode 'tsquery' behaves exactly like the omitted default", async () => {
+    const c = trgmClient();
+    await seedTrgm(c);
+    const infix = (await c.query(
+      trgmApi.notes.query().search("search_text", "conv", { mode: "tsquery" }).take(10),
+    )) as Array<{ title: string }>;
+    expect(infix.map((d) => d.title)).toEqual(["conv"]);
+    const word = (await c.query(
+      trgmApi.notes.query().search("search_text", "release", { mode: "tsquery" }).take(10),
+    )) as Array<{ title: string }>;
+    expect(word.map((d) => d.title)).toEqual(["Release plan"]);
+  });
+});
+
 describe("InMemoryRtDbClient — vector search", () => {
   const vectorSchema = defineSchema({
     docs: defineTable({

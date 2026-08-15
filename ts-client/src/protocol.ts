@@ -53,14 +53,22 @@ export type FilterExpr =
   | { op: "contains"; field: string; value: unknown }
   | { op: "exists"; field: string };
 
+/** Mirrors server `query::SearchMode` byte-for-byte (lowercase variants).
+ * `tsquery` is the default (word/stem full-text); `trgm` is case-insensitive
+ * substring matching ranked by trigram similarity. An omitted `mode` means
+ * `tsquery`; the server and clients never emit an explicit `"tsquery"`. */
+export type SearchMode = "tsquery" | "trgm";
+
 /** Mirrors server `query::SearchQuery` byte-for-byte (camelCase, deny_unknown_fields).
  * `filter` narrows search results server-side via the db-side `FilterExpr` DSL
- * (the full type — not vector search's eq-only map); omitted on the wire when
- * absent so existing search requests stay byte-identical. */
+ * (the full type — not vector search's eq-only map); `mode` selects the match
+ * strategy (`tsquery` default | `trgm` substring); both omitted on the wire
+ * when absent so existing search requests stay byte-identical. */
 export interface SearchQuery {
   index: string;
   query: string;
   filter?: FilterExpr;
+  mode?: SearchMode;
 }
 
 /** Mirrors server `query::AggregateOp` byte-for-byte (lowercase variants).

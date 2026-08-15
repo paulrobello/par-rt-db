@@ -12,7 +12,7 @@ Two shape corrections from the upstream brief (the plan predated a wire fix):
 """
 
 import pytest
-from pydantic import BaseModel, TypeAdapter
+from pydantic import BaseModel, TypeAdapter, ValidationError
 
 from par_rt_db.query import (
     Paginated,
@@ -233,6 +233,44 @@ def test_query_search_serializes_full_filter_expr():
             ],
         },
     }
+
+
+def test_query_search_emits_mode_only_when_set():
+    # FM-30: `mode` lands on the wire only when the caller opts in — unset (the
+    # default) keeps existing requests byte-identical.
+    out = (
+        TableQuery("t")
+        .search("idx", "conv", mode="trgm")
+        .build()
+        .model_dump(by_alias=True, mode="json")["search"]
+    )
+    assert out == {"index": "idx", "query": "conv", "mode": "trgm"}
+    # An explicit "tsquery" is legal on the wire (the server accepts it even
+    # though clients never need to emit it).
+    explicit = (
+        TableQuery("t")
+        .search("idx", "hello", mode="tsquery")
+        .build()
+        .model_dump(by_alias=True, mode="json")["search"]
+    )
+    assert explicit == {"index": "idx", "query": "hello", "mode": "tsquery"}
+
+
+def test_query_search_omits_mode_when_absent():
+    out = (
+        TableQuery("t")
+        .search("idx", "hello")
+        .build()
+        .model_dump(by_alias=True, mode="json")["search"]
+    )
+    assert "mode" not in out
+
+
+def test_query_search_rejects_invalid_mode():
+    # The closed domain is {"tsquery", "trgm"}; anything else fails validation
+    # at build time (the server rejects it as BadRequest).
+    with pytest.raises(ValidationError):
+        TableQuery("t").search("idx", "conv", mode="fuzzy").build()  # type: ignore[arg-type]
 
 
 def test_query_vector_search_without_filter():

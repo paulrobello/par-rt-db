@@ -16,12 +16,16 @@ patch / replace / delete / expectVersion / expectAbsent / upsert, point reads,
 index eq + range queries with order/take/unique/first/count, ``distinct`` and
 ``aggregate`` (scalar + grouped), filter expressions, keyset-cursor pagination,
 reactive subscriptions, and scheduled-job ``tick``).
-``vectorSearch``/``hybridSearch``/``search`` apply their optional ``filter`` but
-do not rank by score: ``vectorSearch`` treats every table row as a candidate
-(the sound over-approximation — it does not rank by vector similarity),
-``hybridSearch`` returns an empty list after the same combination guards the
-server enforces, and ``search`` treats every table row as a candidate
-(``ts_rank`` is not modeled).
+``vectorSearch``/``hybridSearch``/``search`` apply their optional ``filter``:
+``vectorSearch`` treats every table row as a candidate (the sound
+over-approximation — it does not rank by vector similarity), ``hybridSearch``
+returns an empty list after the same combination guards the server enforces,
+and ``search`` treats every table row as a candidate in the default
+``tsquery`` mode (``ts_rank`` is not modeled) while ``trgm`` mode (FM-30)
+matches for real — case-insensitive substring containment over the index's
+fields, ranked by the pinned ``len(query) / len(field)`` similarity. Both
+modes share the server's ``compile_search`` validation prologue: empty query
+text and non-search index names are rejected.
 
 Simplifications vs. the live server (be explicit when relying on these):
 
@@ -1309,7 +1313,9 @@ class InMemoryRtDbClient:
         Full-text ranking (tsvector match + ``ts_rank``) is not modeled
         in-memory, so every table row is a candidate (the sound
         over-approximation — a real match can never be excluded); a declared
-        ``filter`` narrows the set via :func:`_eval_filter_expr`.
+        ``filter`` narrows the set via :func:`_eval_filter_expr`. ``trgm`` mode
+        (FM-30) does match for real — substring containment is modeled — and
+        routes to :meth:`_execute_trgm_search`.
         """
         assert q.search is not None  # caller dispatches only when set
         if (
@@ -1330,12 +1336,74 @@ class InMemoryRtDbClient:
                 "search cannot be combined with index, eq, range bounds, order, "
                 "unique, first, count, filter, vector search, paginate, or hybrid search",
             )
+        # Shared validation prologue — mirrors the server's ``compile_search``
+        # order and applies to BOTH modes: empty query text, then search-index
+        # resolution (a btree name is not a search surface), then filter shape.
+        if not q.search.query.strip():
+            raise RtDbError(ErrorCode.BAD_REQUEST, "search query text must not be empty")
+        search_def = next(
+            (i for i in table_def.indexes if i.name == q.search.index and i.search), None
+        )
+        if search_def is None:
+            raise RtDbError(ErrorCode.BAD_REQUEST, f"search index '{q.search.index}' not found")
         if q.search.filter is not None:
             _validate_filter(q.search.filter, set(table_def.fields.keys()))
         candidates: list[StoredRow] = [row for (t, _id), row in self._docs.items() if t == q.table]
         if q.search.filter is not None:
             candidates = [row for row in candidates if _eval_filter_expr(q.search.filter, row.doc)]
+        if q.search.mode == "trgm":
+            return self._execute_trgm_search(q, search_def, candidates)
         return [_merge_doc(row) for row in candidates]
+
+    def _execute_trgm_search(
+        self, q: Query, search_def: IndexDef, candidates: list[StoredRow]
+    ) -> list[dict[str, Any]]:
+        """``search`` terminal, ``mode="trgm"`` (FM-30): substring matching.
+
+        Case-insensitive substring containment over the search index's declared
+        fields — the stand-in for the server's ``ILIKE '%query%'``. Ranking is
+        the deterministic similarity pinned across the client harnesses: a doc
+        scores ``len(query) / len(field)`` on each field whose lowercased value
+        contains the lowercased query (a shorter containing field is a closer
+        match) and ranks by its best field, mirroring the server's
+        ``GREATEST(similarity(...))`` shape. Ties break ``created_at`` desc
+        then ``id`` desc. ``take`` (capped to ``MAX_TAKE``) limits the result.
+        Non-string field values never contain the query. The caller's shared
+        prologue already rejected an empty query and resolved the search
+        index (``search_def``).
+        """
+        assert q.search is not None  # caller dispatches only in the trgm arm
+        needle = q.search.query.lower()
+        scored: list[tuple[float, StoredRow]] = []
+        for row in candidates:
+            best: float | None = None
+            for field in search_def.fields:
+                value = row.doc.get(field)
+                if not isinstance(value, str):
+                    continue
+                text = value.lower()
+                if needle in text:
+                    # An empty field cannot contain a non-empty query; keep the
+                    # empty-field case to a finite 0.0 score (rust harness parity).
+                    score = len(needle) / len(text) if text else 0.0
+                    if best is None or score > best:
+                        best = score
+            if best is not None:
+                scored.append((best, row))
+
+        def cmp(a: tuple[float, StoredRow], b: tuple[float, StoredRow]) -> int:
+            (sa, ra), (sb, rb) = a, b
+            c = (sa < sb) - (sa > sb)
+            if c != 0:
+                return c
+            c = (ra.created_at < rb.created_at) - (ra.created_at > rb.created_at)
+            if c != 0:
+                return c
+            return (ra.id < rb.id) - (ra.id > rb.id)
+
+        scored.sort(key=cmp_to_key(cmp))
+        limit = q.take if q.take is not None else MAX_TAKE
+        return [_merge_doc(row) for _score, row in scored[:limit]]
 
     def _execute_hybrid_search_terminal(
         self, q: Query, eq: list[Any], has_range: bool

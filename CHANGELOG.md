@@ -13,6 +13,22 @@ contract against Convex.
 
 ## [Unreleased]
 
+### Substring/autocomplete search via pg_trgm (FM-30)
+
+The `search` terminal accepts an optional `mode: "tsquery"|"trgm"` (omitted =
+today's full-text behavior, byte-identical). `trgm` runs case-insensitive
+`ILIKE '%q%'` over the search index's text fields — prefix, infix, and
+autocomplete fragments that lexeme-based tsquery cannot match — ranked by
+`GREATEST(similarity(field, q))` across fields (tie-break `created_at`/`id`
+desc), composing with `filter` and `take`. Backed by the `pg_trgm` extension
+(auto-created like pgvector) plus a GIN trigram index (`tg_<table>_<index>`)
+beside each search index's tsvector GIN: `CREATE INDEX IF NOT EXISTS` on every
+additive schema push, so pre-existing deployments backfill on the next push
+(idempotent); destructive reconcile and migrate `dropIndex` drop both GINs.
+Tradeoff: roughly double the index storage over search fields. Mirrored in all
+four clients (`.search()` opts `mode`) including the three in-memory harnesses.
+Spec: `docs/superpowers/specs/2026-08-15-trgm-search-design.md`.
+
 ### Anon→real account merge (FM-27)
 
 An anonymous user who later signs in with OAuth is merged into the real

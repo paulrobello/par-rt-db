@@ -119,8 +119,12 @@ payload = query.model_dump(by_alias=True, exclude_none=True)
 # Point read (one terminal, mutually exclusive with take/unique/first/count/paginate).
 point = TableQuery("items").get("i1").build()
 
-# Full-text search over a declared search index.
+# Full-text search over a declared search index. `mode="trgm"` switches to
+# case-insensitive substring/autocomplete matching over the index's text fields
+# (FM-30); an omitted `mode` (or `"tsquery"`) is full-text — and omits `mode`
+# from the wire entirely, so existing requests stay byte-identical.
 search = TableQuery("items").search("by_name", "hello world").take(10).build()
+autocomplete = TableQuery("items").search("by_name", "conv", mode="trgm").take(10).build()
 
 # Vector similarity over a pgvector index (embeddings are client-supplied).
 vs = TableQuery("docs").vector_search("by_embedding", [0.1, 0.2, ...], limit=5).build()

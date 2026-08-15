@@ -2394,8 +2394,9 @@ export class InMemoryRtDbClient {
     return [];
   }
 
-  /** `search` terminal: full-text token-AND matching with a deterministic
-   * relevance stand-in. Verbatim lift of the former inline
+  /** `search` terminal: full-text token-AND matching (default `tsquery` mode)
+   * or case-insensitive substring matching (`trgm` mode), each with a
+   * deterministic relevance stand-in. Verbatim lift of the former inline
    * `if (q.search !== undefined) { ... }` arm. */
   private executeSearchTerminal(
     q: QueryJson,
@@ -2444,31 +2445,59 @@ export class InMemoryRtDbClient {
     if (search.filter) {
       validateFilter(search.filter, new Set(Object.keys(tableDef.fields)));
     }
-    const queryTokens = [...new Set(ftsTokens(search.query))];
     const limit = q.take ?? MAX_TAKE;
-    if (queryTokens.length === 0) {
-      return [];
-    }
     const scored: Array<{ row: StoredRow; score: number }> = [];
-    for (const row of this.rowsFor(q.table).values()) {
-      if (search.filter && !evalFilterExpr(search.filter, row.doc)) {
-        continue;
-      }
-      const docTokens = ftsTokens(searchDef.fields.map((f) => ftsStringify(row.doc[f])).join(" "));
-      let score = 0;
-      let allPresent = true;
-      for (const qt of queryTokens) {
-        let occurrences = 0;
-        for (const dt of docTokens) {
-          if (dt === qt) occurrences++;
+    if (search.mode === "trgm") {
+      // `trgm` mode (ILIKE '%q%' + similarity() on the server): a doc matches
+      // when ANY indexed field's lowercased text contains the lowercased query
+      // as a substring — infix/prefix hits token-AND cannot make. Similarity
+      // ranking stand-in, pinned for cross-client harness parity: per doc,
+      // over the indexed fields that contain the query, score =
+      // query.length / field.length (a shorter containing field is more
+      // similar), max across fields. Same `created_at`/`id` tie-breaks as the
+      // tsquery path.
+      const needle = search.query.toLowerCase();
+      for (const row of this.rowsFor(q.table).values()) {
+        if (search.filter && !evalFilterExpr(search.filter, row.doc)) {
+          continue;
         }
-        if (occurrences === 0) {
-          allPresent = false;
-          break;
+        let best = 0;
+        for (const field of searchDef.fields) {
+          const text = ftsStringify(row.doc[field]).toLowerCase();
+          if (text.includes(needle)) {
+            const similarity = needle.length / text.length;
+            if (similarity > best) best = similarity;
+          }
         }
-        score += occurrences;
+        if (best > 0) scored.push({ row, score: best });
       }
-      if (allPresent) scored.push({ row, score });
+    } else {
+      const queryTokens = [...new Set(ftsTokens(search.query))];
+      if (queryTokens.length === 0) {
+        return [];
+      }
+      for (const row of this.rowsFor(q.table).values()) {
+        if (search.filter && !evalFilterExpr(search.filter, row.doc)) {
+          continue;
+        }
+        const docTokens = ftsTokens(
+          searchDef.fields.map((f) => ftsStringify(row.doc[f])).join(" "),
+        );
+        let score = 0;
+        let allPresent = true;
+        for (const qt of queryTokens) {
+          let occurrences = 0;
+          for (const dt of docTokens) {
+            if (dt === qt) occurrences++;
+          }
+          if (occurrences === 0) {
+            allPresent = false;
+            break;
+          }
+          score += occurrences;
+        }
+        if (allPresent) scored.push({ row, score });
+      }
     }
     scored.sort((a, b) =>
       a.score !== b.score

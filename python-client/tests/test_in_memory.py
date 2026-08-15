@@ -60,6 +60,10 @@ def _test_schema() -> Any:
                 .index("by_name", ["name"])
                 .index("by_status", ["status"])
                 .index("by_status_and_order", ["status", "order"])
+                # Not in the Rust/TS `items` fixtures — the search-terminal
+                # tests need a real search surface (the shared prologue rejects
+                # btree names for both modes, as the server does).
+                .search_index("search_name", ["name"])
             ),
         )
         .build()
@@ -125,6 +129,7 @@ def test_push_schema_additively_preserves_docs() -> None:
                 .index("by_name", ["name"])
                 .index("by_status", ["status"])
                 .index("by_status_and_order", ["status", "order"])
+                .search_index("search_name", ["name"])
             ),
         )
         .table("users", lambda tb: tb.field("email", t.string()))
@@ -563,10 +568,10 @@ def test_search_filter_narrows_the_candidate_set() -> None:
     c = _new_client()
     _seed_query_rows(c)  # a/todo/2, b/todo/1, c/done/3
     flt = TypeAdapter(FilterExpr).validate_python({"op": "eq", "field": "status", "value": "todo"})
-    docs = c.run_query(TableQuery("items").search("by_status", "x", filter_=flt).build())
+    docs = c.run_query(TableQuery("items").search("search_name", "x", filter_=flt).build())
     assert {d["name"] for d in docs} == {"a", "b"}
     # Without a filter every table row is a candidate.
-    all_docs = c.run_query(TableQuery("items").search("by_status", "x").build())
+    all_docs = c.run_query(TableQuery("items").search("search_name", "x").build())
     assert {d["name"] for d in all_docs} == {"a", "b", "c"}
     # A compound FilterExpr narrows further.
     flt2 = TypeAdapter(FilterExpr).validate_python(
@@ -578,7 +583,7 @@ def test_search_filter_narrows_the_candidate_set() -> None:
             ],
         }
     )
-    docs2 = c.run_query(TableQuery("items").search("by_status", "x", filter_=flt2).build())
+    docs2 = c.run_query(TableQuery("items").search("search_name", "x", filter_=flt2).build())
     assert {d["name"] for d in docs2} == {"a"}
 
 
@@ -591,8 +596,176 @@ def test_search_filter_rejects_unknown_field() -> None:
     _seed_query_rows(c)
     flt = TypeAdapter(FilterExpr).validate_python({"op": "eq", "field": "nope", "value": 1})
     with pytest.raises(RtDbError) as ei:
-        c.run_query(TableQuery("items").search("by_status", "x", filter_=flt).build())
+        c.run_query(TableQuery("items").search("search_name", "x", filter_=flt).build())
     assert ei.value.code is ErrorCode.BAD_REQUEST
+
+
+# --- search mode="trgm" (FM-30): substring matching + similarity ranking -----
+
+
+def _new_search_client() -> InMemoryRtDbClient:
+    # Same post-incrementing clock as `_new_client`, so `created_at` ascends
+    # with insertion order (the trgm ranking tie-break is created_at desc).
+    counter = [1_700_000_000_000]
+
+    def now() -> int:
+        v = counter[0]
+        counter[0] += 1
+        return v
+
+    c = InMemoryRtDbClient(InMemoryRtDbClientOptions(now=now, random=lambda: 0.0))
+    c.push_schema(
+        Schema.builder()
+        .table(
+            "notes",
+            lambda tb: (
+                tb.field("title", t.string())
+                .field("body", t.string())
+                .field("status", t.string())
+                .search_index("search_all", ["title", "body"])
+                .index("by_status", ["status"])
+            ),
+        )
+        .build()
+    )
+    return c
+
+
+def _seed_trgm_rows(c: InMemoryRtDbClient) -> None:
+    # Four notes; trgm scores for query "conv" (len 4) annotated per row —
+    # score = 4 / len(matching field), max across the index's two fields:
+    #   "convex"               -> 4/6  (title, the closest match)
+    #   "ConVex Mirror"        -> 4/13 (title, case-insensitive hit)
+    #   "convexity explained"  -> 4/19 (body)
+    #   "totally unrelated"    -> no match
+    for row in (
+        {"title": "convex", "body": "intro to shapes", "status": "open"},
+        {"title": "misc", "body": "convexity explained", "status": "open"},
+        {"title": "other", "body": "totally unrelated", "status": "closed"},
+        {"title": "ConVex Mirror", "body": "words", "status": "closed"},
+    ):
+        c.mutate(Mutation.builder().insert("notes", row).build())
+
+
+def test_search_trgm_matches_substrings() -> None:
+    # "conv" is an infix of "convex"/"convexity explained" — a plainto_tsquery
+    # lexeme would match none of these (FM-30's motivating case).
+    c = _new_search_client()
+    _seed_trgm_rows(c)
+    docs = c.run_query(TableQuery("notes").search("search_all", "conv", mode="trgm").build())
+    assert {d["title"] for d in docs} == {"convex", "misc", "ConVex Mirror"}
+    assert all(d["title"] != "other" for d in docs)
+
+
+def test_search_trgm_is_case_insensitive() -> None:
+    # Doc-side folding ("conv" matches the mixed-case title "ConVex Mirror")
+    # and query-side folding ("CONV" matches the lowercase title "convex").
+    c = _new_search_client()
+    _seed_trgm_rows(c)
+    docs = c.run_query(TableQuery("notes").search("search_all", "CONV", mode="trgm").build())
+    assert {d["title"] for d in docs} == {"convex", "misc", "ConVex Mirror"}
+
+
+def test_search_trgm_ranks_by_similarity() -> None:
+    # Shorter containing field = closer match: 4/6 > 4/13 > 4/19.
+    c = _new_search_client()
+    _seed_trgm_rows(c)
+    docs = c.run_query(TableQuery("notes").search("search_all", "conv", mode="trgm").build())
+    assert [d["title"] for d in docs] == ["convex", "ConVex Mirror", "misc"]
+
+
+def test_search_trgm_rank_takes_max_across_fields() -> None:
+    # The doc's score is its BEST matching field, not the first: "convex"/"conv"
+    # scores max(4/6, 4/4) = 1.0 via body, beating "convx" (4/5) — a
+    # first-field-only score (4/6) would rank it below.
+    c = _new_search_client()
+    for row in (
+        {"title": "convex", "body": "conv", "status": "open"},
+        {"title": "zz", "body": "convx", "status": "open"},
+    ):
+        c.mutate(Mutation.builder().insert("notes", row).build())
+    docs = c.run_query(TableQuery("notes").search("search_all", "conv", mode="trgm").build())
+    assert [d["title"] for d in docs] == ["convex", "zz"]
+
+
+def test_search_trgm_tiebreaks_created_at_desc() -> None:
+    # Equal scores (both bodies "convex twin", 4/11) tie-break created_at desc:
+    # the LATER insert ranks first.
+    c = _new_search_client()
+    for row in (
+        {"title": "older", "body": "convex twin", "status": "open"},
+        {"title": "newer", "body": "convex twin", "status": "open"},
+    ):
+        c.mutate(Mutation.builder().insert("notes", row).build())
+    docs = c.run_query(TableQuery("notes").search("search_all", "conv", mode="trgm").build())
+    assert [d["title"] for d in docs] == ["newer", "older"]
+
+
+def test_search_trgm_composes_with_filter_and_take() -> None:
+    from par_rt_db.wire import FilterExpr
+
+    c = _new_search_client()
+    _seed_trgm_rows(c)
+    flt = TypeAdapter(FilterExpr).validate_python({"op": "eq", "field": "status", "value": "open"})
+    docs = c.run_query(
+        TableQuery("notes").search("search_all", "conv", mode="trgm", filter_=flt).build()
+    )
+    # Only the two "open" notes; still similarity-ranked.
+    assert [d["title"] for d in docs] == ["convex", "misc"]
+    # take(1) keeps the top-ranked of the filtered set.
+    top = c.run_query(
+        TableQuery("notes").search("search_all", "conv", mode="trgm", filter_=flt).take(1).build()
+    )
+    assert [d["title"] for d in top] == ["convex"]
+
+
+def test_search_trgm_requires_a_search_index() -> None:
+    # trgm looks up the named index for its field list; a btree index (or a
+    # missing name) is not a search surface -> BAD_REQUEST, mirroring the
+    # server's index resolution.
+    c = _new_search_client()
+    _seed_trgm_rows(c)
+    with pytest.raises(RtDbError) as ei:
+        c.run_query(TableQuery("notes").search("by_status", "conv", mode="trgm").build())
+    assert ei.value.code is ErrorCode.BAD_REQUEST
+    assert "search index 'by_status' not found" in ei.value.message
+
+
+def test_search_tsquery_requires_a_search_index() -> None:
+    # The index check lives in the shared prologue (server compile_search runs
+    # it before the mode branch), so the tsquery stub rejects a btree name too.
+    c = _new_search_client()
+    _seed_trgm_rows(c)
+    with pytest.raises(RtDbError) as ei:
+        c.run_query(TableQuery("notes").search("by_status", "conv").build())
+    assert ei.value.code is ErrorCode.BAD_REQUEST
+    assert "search index 'by_status' not found" in ei.value.message
+
+
+def test_search_rejects_empty_query_in_both_modes() -> None:
+    # Empty (or whitespace-only) query text is BAD_REQUEST before the mode
+    # branch, mirroring the server's compile_search and the ts harness.
+    from par_rt_db.wire import SearchMode
+
+    c = _new_search_client()
+    _seed_trgm_rows(c)
+    modes: tuple[SearchMode | None, ...] = (None, "tsquery", "trgm")
+    for mode in modes:
+        for query in ("", "   "):
+            with pytest.raises(RtDbError) as ei:
+                c.run_query(TableQuery("notes").search("search_all", query, mode=mode).build())
+            assert ei.value.code is ErrorCode.BAD_REQUEST
+            assert ei.value.message == "search query text must not be empty"
+
+
+def test_search_explicit_tsquery_mode_behaves_like_default() -> None:
+    # mode="tsquery" is the default: the candidate-set stub runs unchanged.
+    c = _new_search_client()
+    _seed_trgm_rows(c)
+    default = c.run_query(TableQuery("notes").search("search_all", "conv").build())
+    explicit = c.run_query(TableQuery("notes").search("search_all", "conv", mode="tsquery").build())
+    assert explicit == default
+    assert {d["title"] for d in explicit} == {"convex", "misc", "other", "ConVex Mirror"}
 
 
 def test_vector_search_filter_narrows_the_candidate_set() -> None:

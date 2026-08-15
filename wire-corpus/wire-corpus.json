@@ -97,6 +97,8 @@
     { "table": "workItems", "filter": { "op": "eq", "field": "status", "value": "done" } },
     { "table": "workItems", "filter": { "op": "or", "exprs": [ { "op": "in", "field": "status", "values": [ "a", "b" ] }, { "op": "lte", "field": "order", "value": 5 } ] } },
     { "table": "notes", "search": { "index": "search_body", "query": "hello world" } },
+    { "table": "notes", "search": { "index": "search_body", "query": "conv", "mode": "trgm" } },
+    { "table": "notes", "search": { "index": "search_body", "query": "conv", "mode": "tsquery", "filter": { "op": "eq", "field": "status", "value": "open" } } },
     { "table": "embeds", "vectorSearch": { "index": "by_embedding", "vector": [ 1.0, 0.5, -0.5 ], "limit": 5 } },
     { "table": "embeds", "vectorSearch": { "index": "by_embedding", "vector": [ 1.0 ], "limit": 3, "filter": { "op": "eq", "field": "userId", "value": "u1" } } },
     { "table": "workItems", "paginate": { "numItems": 10 } },

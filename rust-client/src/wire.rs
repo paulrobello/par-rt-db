@@ -310,10 +310,14 @@ pub struct ScheduleInfo {
 /// A full-text search terminal over a declared search index. `index` names a
 /// search index on the query's table; `query` is free-form user text; `filter`
 /// is an optional `FilterExpr` (the db-side `filter()` DSL) that narrows the
-/// search `WHERE` server-side. Mirrors `server/src/query.rs::SearchQuery`
-/// byte-for-byte (camelCase, deny_unknown_fields). The nested `filter` is
+/// search `WHERE` server-side; `mode` selects the match strategy (FM-30) —
+/// `None`/`"tsquery"` is today's full-text behavior, `"trgm"` is
+/// substring/autocomplete matching over the index's text fields (see
+/// [`SearchMode`]). Mirrors `server/src/query.rs::SearchQuery` byte-for-byte
+/// (camelCase, deny_unknown_fields). The nested `filter` and `mode` are
 /// additive — omitted when `None`, so existing search requests round-trip
-/// unchanged — and distinct from the Query-level top-level `filter` builder.
+/// unchanged — and `filter` is distinct from the Query-level top-level
+/// `filter` builder.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SearchQuery {
@@ -321,6 +325,27 @@ pub struct SearchQuery {
     pub query: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filter: Option<FilterExpr>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<SearchMode>,
+}
+
+/// Match mode for the `search` terminal. `Tsquery` (the default, and the
+/// behavior when `mode` is omitted) matches stemmed words via
+/// `tsvector @@ plainto_tsquery`, ranked by `ts_rank`. `Trgm` matches
+/// substrings case-insensitively (`ILIKE '%query%'`) over the search index's
+/// text fields — prefix/infix/autocomplete lookups FTS can't serve — ranked
+/// by `GREATEST(similarity(field, query))` (the doc's best-matching field),
+/// with `created_at`/`id` tiebreaks for determinism. Wire form is lowercase
+/// (`"tsquery"` | `"trgm"`); serialized only when the caller opts in, so
+/// existing traffic stays byte-identical. Mirrors
+/// `server/src/query.rs::SearchMode` byte-for-byte (lowercase variants).
+/// docs/superpowers/specs/2026-08-15-trgm-search-design.md.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SearchMode {
+    #[default]
+    Tsquery,
+    Trgm,
 }
 
 /// A vector-similarity terminal over a declared vector index. `vector` is the
@@ -811,6 +836,7 @@ mod tests {
             index: "search_content".into(),
             query: "hello world".into(),
             filter: None,
+            mode: None,
         };
         assert_eq!(
             serde_json::to_value(&q).unwrap(),
@@ -821,6 +847,7 @@ mod tests {
                 .unwrap();
         assert_eq!(back.index, "search_content");
         assert!(back.filter.is_none());
+        assert!(back.mode.is_none());
 
         // `filter` present → emitted on the wire and round-trips through the
         // `FilterExpr` tag (`op`, lowercase). Mirrors the server's camelCase
@@ -840,6 +867,7 @@ mod tests {
                     },
                 ],
             }),
+            mode: None,
         };
         assert_eq!(
             serde_json::to_value(&with_filter).unwrap(),
@@ -854,6 +882,61 @@ mod tests {
                     ]
                 }
             })
+        );
+    }
+
+    #[test]
+    fn search_query_mode_wire_shape() {
+        // `mode` set → emitted on the wire as the lowercase variant and
+        // round-trips; `Tsquery` is accepted even though clients never emit it
+        // by default. Mirrors the FM-30 corpus entries ("conv" + trgm/tsquery).
+        let trgm = SearchQuery {
+            index: "search_body".into(),
+            query: "conv".into(),
+            filter: None,
+            mode: Some(SearchMode::Trgm),
+        };
+        assert_eq!(
+            serde_json::to_value(&trgm).unwrap(),
+            json!({"index":"search_body","query":"conv","mode":"trgm"})
+        );
+        let back: SearchQuery =
+            serde_json::from_value(json!({"index":"search_body","query":"conv","mode":"trgm"}))
+                .unwrap();
+        assert_eq!(back.mode, Some(SearchMode::Trgm));
+
+        let tsquery = SearchQuery {
+            mode: Some(SearchMode::Tsquery),
+            filter: Some(FilterExpr::Eq {
+                field: "status".into(),
+                value: "open".into(),
+            }),
+            index: "search_body".into(),
+            query: "conv".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(&tsquery).unwrap(),
+            json!({
+                "index":"search_body",
+                "query":"conv",
+                "filter":{"op":"eq","field":"status","value":"open"},
+                "mode":"tsquery"
+            })
+        );
+
+        // Omitted `mode` deserializes to `None` (tsquery default) and never
+        // re-serializes — existing traffic stays byte-identical.
+        let omitted: SearchQuery =
+            serde_json::from_value(json!({"index":"search_body","query":"hello world"})).unwrap();
+        assert_eq!(omitted.mode, None);
+
+        // Unknown mode strings are rejected (serde enum, mirroring the
+        // server's BadRequest on a bad mode).
+        assert!(
+            serde_json::from_value::<SearchQuery>(json!({
+                "index":"search_body","query":"conv","mode":"bogus"
+            }))
+            .is_err()
         );
     }
 
