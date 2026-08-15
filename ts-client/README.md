@@ -96,8 +96,9 @@ surface; prefer cookie mode. Machine tokens minted via the admin API are the
 right choice for server-to-server (`Node / CLI`) callers, where `localStorage`
 does not apply.
 
-For a credential-less guest, `useRtDbAuth().signInAnonymous()` (or
-`RtDbClient.signInAnonymous()` outside React) mints an ephemeral anonymous
+For a credential-less guest, `useRtDbAuth().signInAnonymous()` (or a plain
+`POST /auth/anonymous` outside React — see
+[React Native / Expo](#react-native--expo)) mints an ephemeral anonymous
 session — gated by the server's `RTDB_AUTH_ANONYMOUS_ENABLED` boot flag (default
 off ⇒ `403`). It sets the same HttpOnly cookie **and** returns the plaintext
 session token for the SDK/bearer path; an anonymous user owns its own documents
@@ -123,6 +124,54 @@ const [{ id }] = (await db.mutate(
   mutation().insert("items", { projectId: "p1", title: "x", status: "backlog", order: 1 }).build(),
 )) as [{ id: string }];
 ```
+
+## React Native / Expo
+
+The core clients run on React Native (Hermes) with **no polyfills** — the
+reactive `RtDbClient` uses RN's global `WebSocket`, `fetch`, and `setTimeout`
+directly, and every browser-only API (`localStorage`, `document`, `window`) sits
+behind a `typeof` guard so importing is safe. Smoke-tested end-to-end in an
+Expo iOS app (connect → subscribe → mutate → live push) against a local server.
+
+```tsx
+import * as SecureStore from "expo-secure-store";
+import { RtDbClient } from "@par-rt-db/client";
+
+const client = new RtDbClient({
+  url: "wss://rtdb.pardev.net",
+  db: "kanban",
+  // There is no localStorage in RN — keep the session token in the keychain.
+  getToken: () => SecureStore.getItemAsync("rtdb-token"),
+});
+```
+
+Per surface:
+
+- **Reactive client (`RtDbClient`)** — works as-is. The `webSocketFactory` /
+  `setTimeoutImpl` / `clearTimeoutImpl` options exist for substituting
+  platform-specific transports, but RN's globals satisfy the defaults. JS timers
+  pause while the app is backgrounded, so the heartbeat stalls; the client's
+  existing reconnect-with-backoff recovers the socket when the app foregrounds.
+- **HTTP client (`RtDbHttpClient`)** — works as-is. Pass `Uint8Array` or
+  `ArrayBuffer` to `upload()` (RN's `fetch` handles both; `Blob` works where
+  RN's Blob polyfill is present, `ReadableStream` does not exist in RN).
+- **Auth** — anonymous sign-in is a plain `fetch("…/auth/anonymous", { method:
+  "POST" })`; store the returned `{ token }` in `expo-secure-store` and feed it
+  back via `getToken` (this is exactly what `useRtDbAuth().signInAnonymous()`
+  does in the browser). The provider-OAuth helpers in `react` use
+  `window.open`, which RN does not have — open
+  `${url}/auth/{provider}/begin?origin=` with `openAuthSessionAsync` from
+  `expo-web-browser` and poll `GET /auth/state?state=` (the `state` token from
+  the begin response) until it returns the session token — the same poll the
+  browser SDK performs.
+- **Admin client (`RtDbAdminClient`)** — bearer mode (`adminKey`) works; the
+  cookie/CSRF mode is browser-only (no `document` in RN). Don't embed the admin
+  key in an app — keep admin calls server-side or in the CLI.
+
+The `react` entry (`useQuery` / `useMutation` / `usePresence` /
+`usePaginatedQuery` hooks) imports clean under RN (it depends only on `react`),
+so the hooks are usable in an Expo app; only the popup-based OAuth helpers
+within it are browser-only, per the auth bullet above.
 
 ## Scheduling
 

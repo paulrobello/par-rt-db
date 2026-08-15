@@ -184,6 +184,7 @@ export class RtDbHttpClient {
       !(body instanceof Uint8Array) &&
       typeof Blob !== "undefined" &&
       !(body instanceof Blob) &&
+      typeof ReadableStream !== "undefined" &&
       !(body instanceof ReadableStream) &&
       !(body instanceof ArrayBuffer) &&
       typeof body !== "string"
