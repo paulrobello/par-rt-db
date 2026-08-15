@@ -930,6 +930,29 @@ async fn txn_rejects_more_than_max_steps() {
 }
 
 #[tokio::test]
+async fn txn_rejects_nested_tree_exceeding_recursive_step_budget() {
+    // FM-28: flat length is 1 (just the schedule step); the recursive count
+    // is 1 + 1025 = 1026 > MAX_STEPS — a nested tree can't smuggle past the
+    // flat cap. Rejected pre-execution, so no doc lands and no job enqueues.
+    let mut c = new_client();
+    let mut nested = Mutation::new();
+    for i in 0..=MAX_STEPS {
+        nested = nested.insert(
+            "items",
+            json!({"name": format!("n{i}"), "status": "todo", "order": i}),
+        );
+    }
+    let txn = Mutation::new()
+        .schedule(ScheduleWhen::AfterMs { ms: 1000 }, nested.build())
+        .build();
+    let err = c.mutate(&txn, None).await.unwrap_err();
+    assert_eq!(err.code, ErrorCode::BadRequest);
+    assert!(err.message.contains("maximum"), "got: {}", err.message);
+    assert!(c.collect_all("items").is_empty(), "no doc applied");
+    assert!(c.list_schedules().is_empty(), "no job enqueued");
+}
+
+#[tokio::test]
 async fn txn_accepts_more_than_256_steps() {
     // ARC-104: the server raised MAX_STEPS 256 -> 1024; the in-memory engine
     // must accept a 300-step txn (previously over the stale 256 cap).
@@ -4001,6 +4024,55 @@ async fn tick_oneshot_with_failing_txn_marks_error_and_keeps_it() {
         "last_error recorded: {:?}",
         info.last_error
     );
+}
+
+#[tokio::test]
+async fn failed_txn_rolls_back_schedule_step_enqueue() {
+    // FM-28 rollback: the schedule step's enqueue joins the atomicity
+    // snapshot — a later step's error must not leave a phantom job that
+    // tick() would fire (mirrors the server's single sqlx transaction
+    // around the insert).
+    let (mut c, clock) = new_clock_client();
+    let txn = Mutation::new()
+        .schedule(ScheduleWhen::AfterMs { ms: 1000 }, insert_todo_txn())
+        .delete("items", "nonexistent") // NOT_FOUND -> rollback the enqueue
+        .build();
+    let err = c.mutate(&txn, None).await.unwrap_err();
+    assert_eq!(err.code, ErrorCode::NotFound);
+    assert!(c.list_schedules().is_empty(), "enqueue rolled back");
+    // Past the would-be due time: nothing fires.
+    *clock.lock().expect("not poisoned") += 2000;
+    c.tick(None);
+    let docs = c
+        .run::<Vec<Value>>(&TableQuery::new("items").collect())
+        .expect("collect ok");
+    assert!(docs.is_empty(), "no phantom job fired");
+}
+
+#[tokio::test]
+async fn failed_txn_rolls_back_cancel_schedule_step() {
+    // Same snapshot covers a cancel step's removal: a pre-existing job
+    // survives a txn that cancelled it and then failed.
+    let (mut c, clock) = new_clock_client();
+    let id = c
+        .schedule(insert_todo_txn(), ScheduleWhen::AfterMs { ms: 1000 })
+        .expect("schedule ok");
+    let txn = Mutation::new()
+        .cancel_schedule(id.clone())
+        .delete("items", "nonexistent") // NOT_FOUND -> rollback the cancel
+        .build();
+    let err = c.mutate(&txn, None).await.unwrap_err();
+    assert_eq!(err.code, ErrorCode::NotFound);
+    let jobs = c.list_schedules();
+    assert_eq!(jobs.len(), 1, "job survived the failed txn");
+    assert_eq!(jobs[0].id, id);
+    // The surviving job still fires on its original schedule.
+    *clock.lock().expect("not poisoned") += 2000;
+    c.tick(None);
+    let docs = c
+        .run::<Vec<Value>>(&TableQuery::new("items").collect())
+        .expect("collect ok");
+    assert_eq!(docs.len(), 1, "surviving job fired");
 }
 
 // ---- storage ----------------------------------------------------------

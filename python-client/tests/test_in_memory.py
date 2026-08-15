@@ -20,6 +20,7 @@ from par_rt_db.errors import ErrorCode, RtDbError
 from par_rt_db.in_memory import (
     MAX_AFFECTED_ROWS_PER_TXN,
     MAX_BY_QUERY_STEPS_PER_TXN,
+    MAX_STEPS,
     InMemoryRtDbClient,
     InMemoryRtDbClientOptions,
     is_hex_id,
@@ -1326,6 +1327,147 @@ def test_cancel_schedule_removes_the_job() -> None:
     with pytest.raises(RtDbError) as ei:
         c.cancel_schedule(sid)
     assert ei.value.code is ErrorCode.NOT_FOUND
+
+
+# --- FM-28: schedule/cancelSchedule as transaction steps ----------------------
+
+
+def test_schedule_step_enqueues_job_fired_by_tick() -> None:
+    c, clock = _new_clock_client()
+    inner = Mutation.builder().insert("items", {"name": "b", "status": "todo", "order": 2}).build()
+    txn = (
+        Mutation.builder()
+        .insert("items", {"name": "a", "status": "todo", "order": 1})
+        .schedule(_when.validate_python({"type": "afterMs", "ms": 1000}), inner)
+        .build()
+    )
+    results = c.mutate(txn)
+    # The insert applied now; the schedule step only enqueued (1 doc, 1 job).
+    assert len(c.run_query(TableQuery("items").build())) == 1
+    assert results[1] is not None
+    schedule_id = str(results[1].model_dump(by_alias=True)["scheduleId"])
+    jobs = c.list_schedules()
+    assert len(jobs) == 1
+    assert jobs[0].id == schedule_id
+    # Advance past the due time: tick fires the nested txn.
+    clock[0] += 2000
+    c.tick()
+    docs = c.run_query(TableQuery("items").build())
+    assert sorted(d["name"] for d in docs) == ["a", "b"]
+    # One-shot removed after its successful fire.
+    assert c.list_schedules() == []
+
+
+def test_cancel_schedule_step_removes_pending_job() -> None:
+    c, clock = _new_clock_client()
+    txn = (
+        Mutation.builder()
+        .schedule(_when.validate_python({"type": "afterMs", "ms": 1000}), _insert_todo_txn())
+        .build()
+    )
+    scheduled = c.mutate(txn)[0]
+    assert scheduled is not None
+    schedule_id = str(scheduled.model_dump(by_alias=True)["scheduleId"])
+    res = c.mutate(Mutation.builder().cancel_schedule(schedule_id).build())
+    assert res[0] is not None
+    assert res[0].model_dump(by_alias=True) == {"cancelled": True}
+    # Past due, nothing fires — the job is gone.
+    clock[0] += 2000
+    c.tick()
+    assert c.run_query(TableQuery("items").build()) == []
+    # Cancelling a missing id is a False result, not an error (step semantics
+    # differ deliberately from the standalone cancel op's NOT_FOUND).
+    res2 = c.mutate(Mutation.builder().cancel_schedule(schedule_id).build())
+    assert res2[0] is not None
+    assert res2[0].model_dump(by_alias=True) == {"cancelled": False}
+
+
+def test_recursive_step_budget_rejects_oversized_tree() -> None:
+    c, _clock = _new_clock_client()
+    # Each half fits the harness cap alone; only the recursive count (a
+    # schedule step = 1 + its nested steps) trips it: 128 + 1 + 128 > 256.
+    half = MAX_STEPS // 2
+    nested = Mutation.builder()
+    for i in range(half):
+        nested.insert("items", {"name": f"n{i}", "status": "todo", "order": i})
+    outer = Mutation.builder()
+    for i in range(half):
+        outer.insert("items", {"name": f"o{i}", "status": "todo", "order": i})
+    outer.schedule(_when.validate_python({"type": "afterMs", "ms": 1000}), nested.build())
+    with pytest.raises(RtDbError) as ei:
+        c.mutate(outer.build())
+    assert ei.value.code is ErrorCode.BAD_REQUEST
+    # Rejected before any write: no docs, no enqueued job.
+    assert c.run_query(TableQuery("items").build()) == []
+    assert c.list_schedules() == []
+
+
+def test_failed_txn_rolls_back_schedule_step_enqueue() -> None:
+    # FM-28 rollback: the schedule step's enqueue joins the atomicity snapshot —
+    # a later step's error must not leave a phantom job that tick() would fire
+    # (mirrors the server's single sqlx transaction around the insert).
+    c, clock = _new_clock_client()
+    with pytest.raises(RtDbError) as ei:
+        c.mutate(
+            Mutation.builder()
+            .schedule(
+                _when.validate_python({"type": "afterMs", "ms": 1000}),
+                _insert_todo_txn(),
+            )
+            .delete("items", "nonexistent")  # NOT_FOUND -> rollback the enqueue
+            .build()
+        )
+    assert ei.value.code is ErrorCode.NOT_FOUND
+    assert c.list_schedules() == []
+    # Past the would-be due time: nothing fires.
+    clock[0] += 2000
+    c.tick()
+    assert c.run_query(TableQuery("items").build()) == []
+
+
+def test_failed_txn_rolls_back_cancel_schedule_step() -> None:
+    # Same snapshot covers a cancel step's removal: a pre-existing job survives
+    # a txn that cancelled it and then failed.
+    c, clock = _new_clock_client()
+    sid = c.schedule(_insert_todo_txn(), _when.validate_python({"type": "afterMs", "ms": 1000}))
+    with pytest.raises(RtDbError):
+        c.mutate(
+            Mutation.builder()
+            .cancel_schedule(sid)
+            .delete("items", "nonexistent")  # NOT_FOUND -> rollback the cancel
+            .build()
+        )
+    jobs = c.list_schedules()
+    assert len(jobs) == 1 and jobs[0].id == sid
+    # The surviving job still fires on its original schedule.
+    clock[0] += 2000
+    c.tick()
+    assert len(c.run_query(TableQuery("items").build())) == 1
+
+
+def test_nested_schedule_step_fires_via_tick() -> None:
+    # schedule-in-schedule: the fired txn's own schedule step enqueues a new
+    # job (server equivalent: txn.rs chained schedule_step test).
+    c, clock = _new_clock_client()
+    inner = Mutation.builder().insert("items", {"name": "b", "status": "todo", "order": 2}).build()
+    outer_txn = (
+        Mutation.builder()
+        .insert("items", {"name": "a", "status": "todo", "order": 1})
+        .schedule(_when.validate_python({"type": "afterMs", "ms": 1000}), inner)
+        .build()
+    )
+    c.schedule(outer_txn, _when.validate_python({"type": "afterMs", "ms": 1000}))
+    # Fire the outer job: its insert applies and its schedule step enqueues the
+    # inner job (due at tick-time + 1000).
+    clock[0] += 2000
+    c.tick()
+    assert [d["name"] for d in c.run_query(TableQuery("items").build())] == ["a"]
+    assert len(c.list_schedules()) == 1
+    # Fire the inner job: doc b lands, one-shot consumed.
+    clock[0] += 2000
+    c.tick()
+    assert sorted(d["name"] for d in c.run_query(TableQuery("items").build())) == ["a", "b"]
+    assert c.list_schedules() == []
 
 
 # ---------------------------------------------------------------------------

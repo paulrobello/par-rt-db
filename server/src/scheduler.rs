@@ -50,7 +50,7 @@ pub(crate) fn resolve_when(
     }
 }
 
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool};
 
 use crate::ddl::pg_schema;
 use crate::txn::Transaction;
@@ -103,8 +103,12 @@ pub async fn ensure_table(pool: &PgPool, db: &str) -> Result<(), RtDbError> {
     Ok(())
 }
 
-pub async fn insert(
-    pool: &PgPool,
+/// Connection-bound variant of [`insert`] — runs on an OPEN sqlx transaction
+/// so a `Step::Schedule` inside `execute_txn` enqueues its row atomically with
+/// the txn's document writes (FM-28): the row becomes visible exactly at the
+/// caller's `tx.commit()` and rolls back with it. Identical SQL to `insert`.
+pub(crate) async fn insert_on(
+    conn: &mut PgConnection,
     db: &str,
     kind: &str,
     due_at: i64,
@@ -129,9 +133,21 @@ pub async fn insert(
     .bind(txn_json)
     .bind(cron)
     .bind(now_ms())
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
     Ok(id)
+}
+
+pub async fn insert(
+    pool: &PgPool,
+    db: &str,
+    kind: &str,
+    due_at: i64,
+    txn: &Transaction,
+    cron: Option<&str>,
+) -> Result<String, RtDbError> {
+    let mut conn = pool.acquire().await?;
+    insert_on(&mut conn, db, kind, due_at, txn, cron).await
 }
 
 pub async fn list(pool: &PgPool, db: &str) -> Result<Vec<ScheduleInfo>, RtDbError> {
@@ -186,6 +202,24 @@ pub async fn cancel(pool: &PgPool, db: &str, id: &str) -> Result<bool, RtDbError
     ))
     .bind(id)
     .execute(pool)
+    .await?;
+    Ok(res.rows_affected() > 0)
+}
+
+/// Connection-bound variant of [`cancel`] for `Step::CancelSchedule` — the
+/// DELETE rides the caller's open sqlx transaction (FM-28).
+pub(crate) async fn cancel_on(
+    conn: &mut PgConnection,
+    db: &str,
+    id: &str,
+) -> Result<bool, RtDbError> {
+    validate_db_name(db)?;
+    let schema = pg_schema(db);
+    let res = sqlx::query(&format!(
+        "DELETE FROM \"{schema}\".scheduled_txns WHERE id = $1"
+    ))
+    .bind(id)
+    .execute(&mut *conn)
     .await?;
     Ok(res.rows_affected() > 0)
 }

@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use crate::wire::FilterExpr;
+use crate::wire::{FilterExpr, ScheduleWhen};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Transaction {
@@ -68,6 +68,17 @@ pub enum Step {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         limit: Option<u32>,
     },
+    /// Schedule `txn` to run later. Mirrors
+    /// `server/src/txn.rs::Step::Schedule` byte-for-byte (FM-28).
+    Schedule {
+        when: ScheduleWhen,
+        txn: Box<Transaction>,
+    },
+    /// Cancel a previously scheduled job. Mirrors
+    /// `server/src/txn.rs::Step::CancelSchedule` byte-for-byte (FM-28).
+    CancelSchedule {
+        id: String,
+    },
 }
 
 /// One entry of `mutateOk.results`, positionally aligned with `steps`.
@@ -78,14 +89,33 @@ pub enum Step {
 /// greedily captured by `Insert`, silently dropping `inserted`. `PatchByQuery`
 /// and `DeleteByQuery` carry distinct fields (`patched`/`deleted` + `truncated`)
 /// that never collide with `{id}` / `{id, inserted}`, so their order relative
-/// to the others is unconstrained.
+/// to the others is unconstrained, and `Schedule`/`Cancelled` carry
+/// `scheduleId`/`cancelled`, which likewise never collide.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum StepResult {
-    Upsert { id: String, inserted: bool },
-    Insert { id: String },
-    PatchByQuery { patched: u32, truncated: bool },
-    DeleteByQuery { deleted: u32, truncated: bool },
+    Upsert {
+        id: String,
+        inserted: bool,
+    },
+    Insert {
+        id: String,
+    },
+    PatchByQuery {
+        patched: u32,
+        truncated: bool,
+    },
+    DeleteByQuery {
+        deleted: u32,
+        truncated: bool,
+    },
+    Schedule {
+        #[serde(rename = "scheduleId")]
+        schedule_id: String,
+    },
+    Cancelled {
+        cancelled: bool,
+    },
     Null,
 }
 
@@ -221,6 +251,21 @@ impl Mutation {
             filter,
             limit,
         });
+        self
+    }
+
+    /// Schedule `txn` to run later — `Step::Schedule` (FM-28).
+    pub fn schedule(mut self, when: ScheduleWhen, txn: Transaction) -> Self {
+        self.steps.push(Step::Schedule {
+            when,
+            txn: Box::new(txn),
+        });
+        self
+    }
+
+    /// Cancel a previously scheduled job — `Step::CancelSchedule` (FM-28).
+    pub fn cancel_schedule(mut self, id: impl Into<String>) -> Self {
+        self.steps.push(Step::CancelSchedule { id: id.into() });
         self
     }
 
@@ -374,6 +419,43 @@ mod tests {
                 deleted: 1000,
                 truncated: true
             }
+        ));
+    }
+
+    #[test]
+    fn schedule_and_cancel_schedule_serialize() {
+        let txn = Mutation::new()
+            .schedule(
+                ScheduleWhen::AfterMs { ms: 60_000 },
+                Transaction {
+                    steps: vec![Step::Insert {
+                        table: "workItems".into(),
+                        doc: Mutation::obj(json!({"title":"later"})),
+                    }],
+                },
+            )
+            .cancel_schedule("j1")
+            .build();
+        assert_eq!(
+            serde_json::to_value(&txn).unwrap(),
+            json!({
+                "steps": [
+                    { "op": "schedule", "when": { "type": "afterMs", "ms": 60000 },
+                      "txn": { "steps": [ { "op": "insert", "table": "workItems", "doc": { "title": "later" } } ] } },
+                    { "op": "cancelSchedule", "id": "j1" }
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn step_result_parses_schedule_and_cancelled() {
+        let sched: StepResult = serde_json::from_value(json!({"scheduleId":"s1"})).unwrap();
+        assert!(matches!(sched, StepResult::Schedule { schedule_id } if schedule_id == "s1"));
+        let cancelled: StepResult = serde_json::from_value(json!({"cancelled":true})).unwrap();
+        assert!(matches!(
+            cancelled,
+            StepResult::Cancelled { cancelled: true }
         ));
     }
 }

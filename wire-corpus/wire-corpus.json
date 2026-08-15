@@ -14,6 +14,8 @@
     { "type": "mutate", "mutId": "m1", "txn": { "steps": [] } },
     { "type": "mutate", "mutId": "m1", "idempotencyKey": "key1", "txn": { "steps": [] } },
     { "type": "mutate", "mutId": "m1", "txn": { "steps": [ { "op": "insert", "table": "workItems", "doc": { "title": "x" } } ] } },
+    { "type": "mutate", "mutId": "m4", "txn": { "steps": [ { "op": "schedule", "when": { "type": "afterMs", "ms": 60000 }, "txn": { "steps": [ { "op": "insert", "table": "workItems", "doc": { "title": "later" } } ] } } ] } },
+    { "type": "mutate", "mutId": "m5", "txn": { "steps": [ { "op": "cancelSchedule", "id": "0199ab_cd" } ] } },
     { "type": "schedule", "scheduleId": "s1", "when": { "type": "afterMs", "ms": 100 }, "txn": { "steps": [] } },
     { "type": "schedule", "scheduleId": "s1", "when": { "type": "runAt", "ms": 1700000000000 }, "txn": { "steps": [] } },
     { "type": "schedule", "scheduleId": "s1", "when": { "type": "cron", "expr": "*/5 * * * *" }, "txn": { "steps": [] } },

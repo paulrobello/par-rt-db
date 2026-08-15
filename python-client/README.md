@@ -34,7 +34,8 @@ The DSL layer is feature-complete: every server query terminal
 `collect`/`distinct`/`aggregate`/`filter`/`search`/`vector_search`/`hybrid_search`/`paginate`)
 and every mutation step
 (`insert`/`patch`/`replace`/`delete`/`expectVersion`/`expectAbsent`/`upsert`
-per-id steps, plus the `patch_by_query`/`delete_by_query` bulk steps)
+per-id steps, the `patch_by_query`/`delete_by_query` bulk steps, plus the
+`schedule(when, txn)`/`cancel_schedule(id)` scheduling steps)
 has a builder method that produces a wire-identical payload. Pydantic v2
 `extra="forbid"` mirrors the server's `deny_unknown_fields` on every variant.
 

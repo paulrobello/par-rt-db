@@ -459,6 +459,24 @@ describe("InMemoryRtDbClient — transactions", () => {
     });
   });
 
+  it("rejects a nested tree whose recursive step count exceeds MAX_STEPS (FM-28)", async () => {
+    // Flat length is 1 (just the schedule step); the recursive count is
+    // 1 + 1025 = 1026 > MAX_STEPS — a nested tree can't smuggle past the
+    // flat cap. Rejected pre-execution, so no doc lands and no job enqueues.
+    const c = newClient();
+    let nested = mutation();
+    for (let i = 0; i <= MAX_STEPS; i++) {
+      nested = nested.insert("items", { name: `n${i}`, status: "todo", order: i });
+    }
+    const txn = mutation().schedule({ type: "afterMs", ms: 1000 }, nested.build()).build();
+    await expect(c.mutate(txn)).rejects.toMatchObject({
+      code: "BAD_REQUEST",
+      message: expect.stringContaining("maximum"),
+    });
+    expect(await c.query(api.items.query().collect())).toEqual([]);
+    expect(await c.listSchedules()).toEqual([]);
+  });
+
   it("accepts a 300-step txn (ARC-104: cap raised 256 -> 1024)", async () => {
     // The in-memory engine previously capped at 256, rejecting a legal 300-step
     // txn. With MAX_STEPS=1024 it must execute.
@@ -1096,6 +1114,50 @@ describe("InMemoryRtDbClient — schedules", () => {
     });
     await expect(c.pauseSchedule("nope")).rejects.toMatchObject({ code: "NOT_FOUND" });
     await expect(c.resumeSchedule("nope")).rejects.toMatchObject({ code: "NOT_FOUND" });
+  });
+
+  it("a failed txn rolls back a schedule step's enqueue (FM-28)", async () => {
+    // The schedule step's enqueue joins the atomicity snapshot — a later
+    // step's error must not leave a phantom job that tick() would fire
+    // (mirrors the server's single sqlx transaction around the insert).
+    const { c, setNow } = newClockClient();
+    setNow(BASE);
+    await expect(
+      c.mutate(
+        mutation()
+          .schedule({ type: "afterMs", ms: 1000 }, insertTxn)
+          .delete("items", "nonexistent") // NOT_FOUND -> rollback the enqueue
+          .build(),
+      ),
+    ).rejects.toMatchObject({ name: "RtDbError", code: "NOT_FOUND" });
+    expect(await c.listSchedules()).toEqual([]);
+    // Past the would-be due time: nothing fires.
+    setNow(BASE + 2000);
+    c.tick();
+    expect(await c.query(api.items.query().collect())).toEqual([]);
+  });
+
+  it("a failed txn rolls back a cancelSchedule step (FM-28)", async () => {
+    // Same snapshot covers a cancel step's removal: a pre-existing job
+    // survives a txn that cancelled it and then failed.
+    const { c, setNow } = newClockClient();
+    setNow(BASE);
+    const { id } = await c.schedule(insertTxn, { type: "afterMs", ms: 1000 });
+    await expect(
+      c.mutate(
+        mutation()
+          .cancelSchedule(id)
+          .delete("items", "nonexistent") // NOT_FOUND -> rollback the cancel
+          .build(),
+      ),
+    ).rejects.toMatchObject({ name: "RtDbError", code: "NOT_FOUND" });
+    const jobs = await c.listSchedules();
+    expect(jobs).toHaveLength(1);
+    expect(jobs[0].id).toBe(id);
+    // The surviving job still fires on its original schedule.
+    setNow(BASE + 2000);
+    c.tick();
+    expect(await c.query(api.items.query().collect())).toHaveLength(1);
   });
 });
 

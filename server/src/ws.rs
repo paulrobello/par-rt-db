@@ -29,6 +29,7 @@ use crate::protocol::{ClientMessage, ScheduleWhen, ServerMessage};
 use crate::rate_limit::{RateDecision, evaluate};
 use crate::scheduler;
 use crate::subs::{ConnId, next_conn_id};
+use crate::txn::authorize_txn_tables;
 
 const AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_FRAME_BYTES: usize = 64 * 1024;
@@ -612,8 +613,10 @@ async fn handle_mutate(
 }
 
 /// `Schedule` arm: `authorize`-only gate (the schedule family never carried
-/// the admin bypass), reject read-only tokens, resolve the schedule timing,
-/// then insert the scheduled transaction.
+/// the admin bypass), reject read-only tokens, table-scope-check the txn
+/// recursively at enqueue (FM-28 — fire time runs as bypass, so this is the
+/// only scoped check), resolve the schedule timing, then insert the scheduled
+/// transaction.
 async fn handle_schedule(
     fctx: &FrameCtx<'_>,
     schedule_id: String,
@@ -630,16 +633,21 @@ async fn handle_schedule(
             schedule_id,
             error: RtDbError::forbidden("read-only token cannot mutate"),
         },
-        Ok(()) => match scheduler::resolve_when(when, now_ms()) {
-            Ok((kind, due_at, cron)) => {
-                match scheduler::insert(&state.pool, db, kind, due_at, &txn, cron.as_deref()).await
-                {
-                    Ok(id) => ServerMessage::ScheduleOk { schedule_id, id },
-                    Err(error) => ServerMessage::ScheduleErr { schedule_id, error },
+        Ok(()) => {
+            let prepared = authorize_txn_tables(&principal.row_ctx(), &txn)
+                .and_then(|()| scheduler::resolve_when(when, now_ms()));
+            match prepared {
+                Ok((kind, due_at, cron)) => {
+                    match scheduler::insert(&state.pool, db, kind, due_at, &txn, cron.as_deref())
+                        .await
+                    {
+                        Ok(id) => ServerMessage::ScheduleOk { schedule_id, id },
+                        Err(error) => ServerMessage::ScheduleErr { schedule_id, error },
+                    }
                 }
+                Err(error) => ServerMessage::ScheduleErr { schedule_id, error },
             }
-            Err(error) => ServerMessage::ScheduleErr { schedule_id, error },
-        },
+        }
         Err(error) => ServerMessage::ScheduleErr { schedule_id, error },
     };
     let _ = out_tx.send(reply);

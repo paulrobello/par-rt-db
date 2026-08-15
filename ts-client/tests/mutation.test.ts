@@ -71,6 +71,20 @@ describe("transaction builder", () => {
     });
   });
 
+  it("builds schedule + cancelSchedule steps with the wire shapes (FM-28)", () => {
+    const inner = mutation().insert("workItems", { title: "later" }).build();
+    const txn = mutation()
+      .schedule({ type: "afterMs", ms: 60000 }, inner)
+      .cancelSchedule("j1")
+      .build();
+    expect(txn).toEqual({
+      steps: [
+        { op: "schedule", when: { type: "afterMs", ms: 60000 }, txn: inner },
+        { op: "cancelSchedule", id: "j1" },
+      ],
+    });
+  });
+
   it("produces the same JSON step shape when built with a typed schema", () => {
     const schema = defineSchema({
       projects: defineTable({
@@ -185,6 +199,11 @@ describe("parseStepResults", () => {
     expect(parseStepResults([{ deleted: 1000, truncated: true }])).toEqual([
       { deleted: 1000, truncated: true },
     ]);
+  });
+
+  it("decodes {scheduleId} and {cancelled} as schedule step results (FM-28)", () => {
+    expect(parseStepResults([{ scheduleId: "s1" }])).toEqual([{ scheduleId: "s1" }]);
+    expect(parseStepResults([{ cancelled: false }])).toEqual([{ cancelled: false }]);
   });
 
   it("narrows by-query results via 'patched'/'deleted' keys", () => {

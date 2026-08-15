@@ -1,5 +1,5 @@
 import { RtDbError } from "./errors.js";
-import type { FilterExpr, StepJson, TransactionJson } from "./protocol.js";
+import type { FilterExpr, ScheduleWhen, StepJson, TransactionJson } from "./protocol.js";
 import type { IndexNamesOf, SchemaDefinition, TableNames, WithoutSystemFields } from "./schema.js";
 
 /**
@@ -9,16 +9,19 @@ import type { IndexNamesOf, SchemaDefinition, TableNames, WithoutSystemFields } 
  * with the shapes the server may emit. The richer upsert shape
  * (`{ id, inserted }`) is a separate variant from the plain `{ id }` so callers
  * can narrow with `'inserted' in r`; the by-query shapes (`{ patched }`/
- * `{ deleted }`, each with `truncated`) narrow via those own fields; `null`
- * covers `delete` of an absent doc and any other no-op. Variant order matters
- * for the rust/python decoders (richest first); here it is just documentation
- * since TS narrows structurally.
+ * `{ deleted }`, each with `truncated`) narrow via those own fields; the
+ * scheduler shapes (`{ scheduleId }`/`{ cancelled }`, FM-28) narrow via their
+ * own fields; `null` covers `delete` of an absent doc and any other no-op.
+ * Variant order matters for the rust/python decoders (richest first); here it
+ * is just documentation since TS narrows structurally.
  */
 export type StepResult =
   | StepUpsertResult
   | StepInsertResult
   | StepPatchByQueryResult
   | StepDeleteByQueryResult
+  | StepScheduleResult
+  | StepCancelScheduleResult
   | null;
 
 /** Result of an `upsert` step: the doc id and whether the insert branch ran. */
@@ -46,13 +49,24 @@ export interface StepDeleteByQueryResult {
   truncated: boolean;
 }
 
+/** Result of a `schedule` step: the id of the created scheduled job. */
+export interface StepScheduleResult {
+  scheduleId: string;
+}
+
+/** Result of a `cancelSchedule` step: whether a pending job was cancelled. */
+export interface StepCancelScheduleResult {
+  cancelled: boolean;
+}
+
 /**
  * Decodes one `mutateOk.results` entry (raw server JSON) into a {@link StepResult}.
  *
  * The server emits these shapes per the contract: `{ id, inserted }` (upsert),
  * `{ id }` (insert/patch/replace/delete of a present doc), `{ patched, truncated }`
- * (patchByQuery), `{ deleted, truncated }` (deleteByQuery), or `null` (delete of
- * an absent doc / no-op). Anything else is a server contract violation and is
+ * (patchByQuery), `{ deleted, truncated }` (deleteByQuery), `{ scheduleId }`
+ * (schedule), `{ cancelled }` (cancelSchedule), or `null` (delete of an absent
+ * doc / no-op). Anything else is a server contract violation and is
  * surfaced as an `RtDbError` rather than silently passed through — mirroring the
  * rust/python clients' strict untagged decoding.
  */
@@ -67,6 +81,8 @@ function parseStepResult(value: unknown): StepResult {
       patched?: unknown;
       deleted?: unknown;
       truncated?: unknown;
+      scheduleId?: unknown;
+      cancelled?: unknown;
     };
     if (typeof v.id === "string") {
       if (typeof v.inserted === "boolean") {
@@ -80,10 +96,16 @@ function parseStepResult(value: unknown): StepResult {
     if (typeof v.deleted === "number" && typeof v.truncated === "boolean") {
       return { deleted: v.deleted, truncated: v.truncated };
     }
+    if (typeof v.scheduleId === "string") {
+      return { scheduleId: v.scheduleId };
+    }
+    if (typeof v.cancelled === "boolean") {
+      return { cancelled: v.cancelled };
+    }
   }
   throw new RtDbError(
     "INTERNAL",
-    "malformed step result: expected {id}, {id, inserted}, {patched, truncated}, {deleted, truncated}, or null",
+    "malformed step result: expected {id}, {id, inserted}, {patched, truncated}, {deleted, truncated}, {scheduleId}, {cancelled}, or null",
   );
 }
 
@@ -169,6 +191,19 @@ export class TxnBuilder<S extends SchemaDefinition<any> = SchemaDefinition<any>>
 
   deleteByQuery<T extends TableNames<S>>(table: T, filter: FilterExpr, limit?: number): this {
     this.steps.push({ op: "deleteByQuery", table, filter, ...(limit !== undefined && { limit }) });
+    return this;
+  }
+
+  /** Schedules `txn` to run later (FM-28). The inner transaction is executed
+   * by the server's per-db scheduler, not in this transaction's turn. */
+  schedule(when: ScheduleWhen, txn: TransactionJson): this {
+    this.steps.push({ op: "schedule", when, txn });
+    return this;
+  }
+
+  /** Cancels a pending scheduled job by id (FM-28). */
+  cancelSchedule(id: string): this {
+    this.steps.push({ op: "cancelSchedule", id });
     return this;
   }
 

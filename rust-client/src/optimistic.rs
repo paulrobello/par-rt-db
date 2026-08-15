@@ -139,6 +139,9 @@ fn project_unfiltered_array(
             Step::PatchByQuery { .. } | Step::DeleteByQuery { .. } => {
                 return OptimisticProjection::Skip;
             }
+            // Schedule/CancelSchedule act on future execution, not this
+            // result — nothing to project.
+            Step::Schedule { .. } | Step::CancelSchedule { .. } => {}
         }
     }
     finalize(Value::Array(working), last)
@@ -168,6 +171,9 @@ fn project_filtered_array(query: &Query, last: &Value, txn: &Transaction) -> Opt
             Step::PatchByQuery { .. } | Step::DeleteByQuery { .. } => {
                 return OptimisticProjection::Skip;
             }
+            // Schedule/CancelSchedule act on future execution, not this
+            // result — nothing to project.
+            Step::Schedule { .. } | Step::CancelSchedule { .. } => {}
         }
     }
     finalize(Value::Array(working), last)
@@ -222,10 +228,12 @@ fn project_get(query: &Query, last: &Value, txn: &Transaction) -> OptimisticProj
 }
 
 impl Step {
-    /// The table this step targets. Every variant except `ExpectAbsent` carries
-    /// one; `ExpectAbsent` is a precondition with no data effect, so its table
-    /// is masked here (returning `None` makes the per-step table guard skip it,
-    /// which is harmless since the variant is a no-op in every projection).
+    /// The table this step targets. Every variant except `ExpectAbsent` and the
+    /// schedule steps carries one; `ExpectAbsent` is a precondition with no data
+    /// effect, so its table is masked here (returning `None` makes the per-step
+    /// table guard skip it, which is harmless since the variant is a no-op in
+    /// every projection). Schedule/CancelSchedule act on future execution, not
+    /// the queried table.
     fn table(&self) -> Option<&str> {
         match self {
             Step::Insert { table, .. }
@@ -236,7 +244,7 @@ impl Step {
             | Step::Upsert { table, .. }
             | Step::PatchByQuery { table, .. }
             | Step::DeleteByQuery { table, .. } => Some(table.as_str()),
-            Step::ExpectAbsent { .. } => None,
+            Step::ExpectAbsent { .. } | Step::Schedule { .. } | Step::CancelSchedule { .. } => None,
         }
     }
 }

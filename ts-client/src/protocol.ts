@@ -159,7 +159,8 @@ export type BatchQueryOutcomeJson =
   | { ok: true; result: unknown }
   | { ok: false; error: { code: string; message: string } };
 
-/** Mirrors server `txn::Step` (tag `op`, every step carries `table`). */
+/** Mirrors server `txn::Step` (tag `op`, camelCase; document steps carry
+ * `table`, the scheduler steps — `schedule`/`cancelSchedule` (FM-28) — do not). */
 export type StepJson =
   | { op: "insert"; table: string; doc: Record<string, unknown> }
   | { op: "patch"; table: string; id: string; fields: Record<string, unknown> }
@@ -187,7 +188,9 @@ export type StepJson =
       table: string;
       filter: FilterExpr;
       limit?: number;
-    };
+    }
+  | { op: "schedule"; when: ScheduleWhen; txn: TransactionJson }
+  | { op: "cancelSchedule"; id: string };
 
 export interface TransactionJson {
   steps: StepJson[];

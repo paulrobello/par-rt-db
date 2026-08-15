@@ -26,7 +26,7 @@ from pydantic import TypeAdapter, ValidationError
 
 from par_rt_db.errors import ErrorCode, RtDbError
 from par_rt_db.mutation import MAX_STEPS, Mutation, StepResult, Transaction
-from par_rt_db.wire import FilterExpr
+from par_rt_db.wire import AfterMs, FilterExpr
 
 
 def test_insert_patch_replace_delete_upsert_wire():
@@ -181,6 +181,8 @@ def test_mutation_builder_returns_self():
     assert b.upsert("t", "idx", ["v"], {"x": 1}, {"x": 2}) is b
     assert b.patch_by_query("t", flt, {"x": 1}) is b
     assert b.delete_by_query("t", flt) is b
+    assert b.schedule(AfterMs(ms=1000), Transaction(steps=[])) is b
+    assert b.cancel_schedule("j1") is b
 
 
 def _flt(expr: dict[str, object]) -> FilterExpr:
@@ -264,3 +266,29 @@ def test_step_result_patch_by_query_and_delete_by_query():
     assert sr.validate_python({"deleted": 2, "truncated": True}).model_dump(
         by_alias=True, mode="json"
     ) == {"deleted": 2, "truncated": True}
+
+
+def test_schedule_and_cancel_schedule_wire_shapes():
+    # FM-28: byte-exact wire shapes for the schedule/cancelSchedule steps —
+    # mirrors wire-corpus client_messages m4/m5.
+    inner = Mutation.builder().insert("workItems", {"title": "later"}).build()
+    m = Mutation.builder().schedule(AfterMs(ms=60_000), inner).cancel_schedule("0199ab_cd").build()
+    wire = json.loads(m.model_dump_json(by_alias=True))
+    assert wire["steps"][0] == {
+        "op": "schedule",
+        "when": {"type": "afterMs", "ms": 60000},
+        "txn": json.loads(inner.model_dump_json(by_alias=True)),
+    }
+    assert wire["steps"][1] == {"op": "cancelSchedule", "id": "0199ab_cd"}
+    # Round-trips through model_validate (corpus parity path).
+    assert json.loads(Mutation.model_validate(wire).model_dump_json(by_alias=True)) == wire
+
+
+def test_step_result_schedule_and_cancel_schedule():
+    sr = TypeAdapter(StepResult)
+    assert sr.validate_python({"scheduleId": "s1"}).model_dump(by_alias=True, mode="json") == {
+        "scheduleId": "s1"
+    }
+    assert sr.validate_python({"cancelled": True}).model_dump(by_alias=True, mode="json") == {
+        "cancelled": True
+    }

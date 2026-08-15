@@ -2,6 +2,8 @@
 //! `scheduler` accessors the per-db machine-token handlers use. Scheduled jobs
 //! carry no owner at the table level — `scheduler::insert` has no owner param
 //! and `committer::handle_scheduled` always executes with `owner = None`.
+//! Create runs the same enqueue-time recursive table-allowlist check as the
+//! other schedule surfaces (a no-op for the admin bypass principal).
 
 use std::sync::Arc;
 
@@ -10,6 +12,7 @@ use axum::extract::{Path, State};
 use axum::http::HeaderMap;
 use serde::{Deserialize, Serialize};
 
+use crate::auth::PrincipalCtx;
 use crate::db::now_ms;
 use crate::error::RtDbError;
 use crate::http_api::ApiJson;
@@ -65,6 +68,11 @@ pub(super) async fn admin_create_schedule(
     if !db::database_exists(&state.pool, &db).await? {
         return Err(RtDbError::not_found("unknown database"));
     }
+    // Uniform with the other three enqueue paths (FM-28). Admin is a bypass
+    // principal (`tables = None`) so this is a no-op today — it exists so
+    // the four surfaces cannot drift if admin principals ever carry scopes.
+    crate::txn::authorize_txn_tables(&PrincipalCtx::bypass(), &body.txn)?;
+
     let (kind, due_at, cron) = scheduler::resolve_when(body.when, now_ms())?;
     let id = scheduler::insert(&state.pool, &db, kind, due_at, &body.txn, cron.as_deref()).await?;
     Ok(Json(AdminScheduleCreateResponse { id }))

@@ -116,17 +116,32 @@ export const MAX_BY_QUERY_STEPS_PER_TXN = 16;
 export const MAX_AFFECTED_ROWS_PER_TXN = 10_000;
 
 /** SEC-104: total documents a txn could touch in the worst case. Per-id steps
- * count 1 each; each `patchByQuery`/`deleteByQuery` step counts up to its
+ * count 1 each; `schedule`/`cancelSchedule` count 0 (control-flow steps touch
+ * no documents); each `patchByQuery`/`deleteByQuery` step counts up to its
  * `limit` (default and cap `MAX_BY_QUERY_ROWS`). Mirrors server
  * `txn::worst_case_affected`. */
 export function worstCaseAffected(txn: TransactionJson): number {
   let total = 0;
   for (const step of txn.steps) {
+    if (step.op === "schedule" || step.op === "cancelSchedule") {
+      continue; // control-flow: touches no documents (server counts 0)
+    }
     if (step.op === "patchByQuery" || step.op === "deleteByQuery") {
       total += Math.min(step.limit ?? MAX_BY_QUERY_ROWS, MAX_BY_QUERY_ROWS);
     } else {
       total += 1;
     }
+  }
+  return total;
+}
+
+/** FM-28: recursive step count — a `schedule` step counts as itself plus
+ * every step in its nested txn. Mirrors the server's recursive gate against
+ * `MAX_STEPS` (a nested tree can't smuggle past the flat cap). */
+function countSteps(txn: TransactionJson): number {
+  let total = txn.steps.length;
+  for (const step of txn.steps) {
+    if (step.op === "schedule") total += countSteps(step.txn);
   }
   return total;
 }
@@ -1346,7 +1361,7 @@ export class InMemoryRtDbClient {
    * enforces the step cap, snapshots, applies every step (rolling back the
    * whole txn on any error), then notifies subscriptions. */
   private executeTransaction(txn: TransactionJson): unknown[] {
-    if (txn.steps.length > MAX_STEPS) {
+    if (countSteps(txn) > MAX_STEPS) {
       throw new RtDbError("BAD_REQUEST", `transaction exceeds maximum of ${MAX_STEPS} steps`);
     }
     // SEC-104: bound the worst-case row count before any step applies so an
@@ -1369,6 +1384,10 @@ export class InMemoryRtDbClient {
       );
     }
     const snapshot = this.snapshotTables();
+    // FM-28: a schedule/cancelSchedule step mutates the schedule store, so a
+    // failed txn must roll it back with the docs (the server inserts/deletes
+    // the scheduled_txns row on the open sqlx tx, which the rollback aborts).
+    const schedulesSnapshot = new Map(this.schedules);
     const results: unknown[] = [];
     const writeSet = new Set<string>();
     try {
@@ -1382,6 +1401,10 @@ export class InMemoryRtDbClient {
     } catch (error) {
       // Atomicity: any step's error rolls back everything already applied.
       this.restoreTables(snapshot);
+      this.schedules.clear();
+      for (const [id, job] of schedulesSnapshot) {
+        this.schedules.set(id, job);
+      }
       throw error;
     }
     this.notifySubs(writeSet);
@@ -1492,6 +1515,13 @@ export class InMemoryRtDbClient {
   /** Stores `txn` scheduled for `when` and returns its id. Cron validation is
    * deferred to the live server; the harness accepts any expression. */
   async schedule(txn: TransactionJson, when: ScheduleWhen): Promise<{ id: string }> {
+    return this.scheduleJob(txn, when);
+  }
+
+  /** Sync core of {@link schedule} — the body is synchronous, and the
+   * `Step::Schedule` transaction step (FM-28) reuses it from the sync
+   * `executeStep` path. */
+  private scheduleJob(txn: TransactionJson, when: ScheduleWhen): { id: string } {
     const id = this.newId();
     const now = this.now();
     const job: ScheduledJob = {
@@ -1699,6 +1729,16 @@ export class InMemoryRtDbClient {
     result: unknown;
     table?: string;
   } {
+    // The schedule control-flow steps (FM-28) target the scheduler, not a
+    // table. Cancel mirrors the server's standalone op: `cancelled: false`
+    // (not an error) when the id is missing or already fired/cancelled.
+    if (step.op === "schedule") {
+      const { id } = this.scheduleJob(step.txn, step.when);
+      return { result: { scheduleId: id } };
+    }
+    if (step.op === "cancelSchedule") {
+      return { result: { cancelled: this.schedules.delete(step.id) } };
+    }
     const table = step.table;
     switch (step.op) {
       case "insert": {

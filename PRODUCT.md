@@ -36,7 +36,7 @@ Confirmed backend surfaces the dashboard consumes (all shipped, HTTP/WS):
 
 - **Auth & session** — admin-key or OAuth admin login; `/auth/*` flows; session TTL; logout.
 - **Databases** — list/create databases; per-db metadata (schema read-back, machine tokens, table + row counts).
-- **Data browser** — read/query and mutate documents per database/table via admin doc routes (`POST /admin/db/{db}/query|mutate`, `owner=None`); mutations bounded by `RTDB_MAX_AFFECTED_DOCS` (server boot config, default 100), which counts the worst-case affected documents, not raw step count — per-id steps (`insert`/`patch`/`replace`/`delete`/`expectVersion`/`expectAbsent`/`upsert`) count one doc each, while each `patchByQuery`/`deleteByQuery` step counts up to its `limit` (ceiling `MAX_BY_QUERY_ROWS = 1000`).
+- **Data browser** — read/query and mutate documents per database/table via admin doc routes (`POST /admin/db/{db}/query|mutate`, `owner=None`); mutations bounded by `RTDB_MAX_AFFECTED_DOCS` (server boot config, default 100), which counts the worst-case affected documents, not raw step count — per-id steps (`insert`/`patch`/`replace`/`delete`/`expectVersion`/`expectAbsent`/`upsert`) count one doc each, `schedule`/`cancelSchedule` steps count zero (they touch no documents), while each `patchByQuery`/`deleteByQuery` step counts up to its `limit` (ceiling `MAX_BY_QUERY_ROWS = 1000`).
 - **Schema viewer** — the compiled schema for each database/table (typed indexed fields, `ownerField`, table stats).
 - **Metrics** — `GET /admin/metrics`, instance-wide counters and gauges.
 - **Live op feed** — `GET /admin/ops/recent` (recent) and `WS /admin/stream` (streaming) durable document mutations as they happen.

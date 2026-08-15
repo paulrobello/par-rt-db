@@ -167,7 +167,7 @@ since browsers cannot set headers on a WS handshake.
 | `GET /sync` | first WS frame | WebSocket upgrade. Speaks the realtime protocol (auth, subscribe, mutate, schedule, ping). |
 | `POST /api/query` | Bearer token | One-shot query against a database; see [Query shape](#query-shape). |
 | `POST /api/query-batch` | Bearer token | Fans out N queries in one round trip (per-query error isolation); each slot returns `{ok, result}` or `{ok:false, error}`. |
-| `POST /api/mutate` | Bearer token | One-shot transaction (`insert`/`patch`/`replace`/`delete`/`expectVersion`/`expectAbsent`/`upsert` + `patchByQuery`/`deleteByQuery` steps). |
+| `POST /api/mutate` | Bearer token | One-shot transaction (`insert`/`patch`/`replace`/`delete`/`expectVersion`/`expectAbsent`/`upsert` + `patchByQuery`/`deleteByQuery` + `schedule`/`cancelSchedule` steps). |
 | `POST /api/schedule` | Bearer token | Schedules a transaction: `afterMs`/`runAt` one-shot or `cron` (5-field, UTC, min-first); returns `{id}`. |
 | `POST /api/schedule/{id}/{cancel,pause,resume}` | Bearer token | Cancels, pauses, or resumes a scheduled job. |
 | `POST /api/schedules` | Bearer token | Lists scheduled jobs for a database (`ScheduleInfo[]`). |
@@ -400,9 +400,13 @@ Reciprocal Rank Fusion, `paginate` is opaque-cursor keyset pagination,
 
 `{"steps": [...]}` where each step is tagged by `"op"`: `insert`, `patch`,
 `replace`, `delete`, `expectVersion`, `expectAbsent`, `upsert` (per-id, one
-document each), plus the predicate-driven bulk steps `patchByQuery` and
+document each), the predicate-driven bulk steps `patchByQuery` and
 `deleteByQuery` (each finds rows matching a `filter` and acts on up to
-`MAX_BY_QUERY_ROWS` of them in one serialized committer turn) — see
+`MAX_BY_QUERY_ROWS` of them in one serialized committer turn), and the
+scheduler control-flow steps `schedule` (enqueues a nested txn by inserting
+the `scheduled_txns` row on the open sqlx transaction — atomic with the
+enclosing writes; step result `{"scheduleId": "<id>"}`) and `cancelSchedule`
+(`{"cancelled": <bool>}`, `false` on a missing/already-fired/already-cancelled job) — see
 `server/src/txn.rs`.
 
 ### WebSocket example: subscribe, then mutate

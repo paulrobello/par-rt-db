@@ -56,7 +56,8 @@ pub const MAX_BY_QUERY_STEPS_PER_TXN: usize = 16;
 pub const MAX_AFFECTED_ROWS_PER_TXN: usize = 10_000;
 
 /// SEC-104: total documents a txn could touch in the worst case. Per-id steps
-/// count 1 each; each `patchByQuery`/`deleteByQuery` step counts up to its
+/// count 1 each; `Schedule`/`CancelSchedule` count 0 (control-flow steps touch
+/// no documents); each `patchByQuery`/`deleteByQuery` step counts up to its
 /// `limit` (default and cap `MAX_BY_QUERY_ROWS`). Mirrors server
 /// `txn::worst_case_affected`. Used by [`Self::execute_transaction`]'s
 /// [`MAX_AFFECTED_ROWS_PER_TXN`] budget check.
@@ -67,10 +68,25 @@ pub fn worst_case_affected(txn: &Transaction) -> usize {
             Step::PatchByQuery { limit, .. } | Step::DeleteByQuery { limit, .. } => {
                 (*limit).unwrap_or(MAX_BY_QUERY_ROWS).min(MAX_BY_QUERY_ROWS) as usize
             }
+            Step::Schedule { .. } | Step::CancelSchedule { .. } => 0,
             _ => 1,
         })
         .sum()
 }
+
+/// FM-28: recursive step count — a `schedule` step counts as itself plus
+/// every step in its nested txn. Mirrors the server's recursive gate against
+/// [`MAX_STEPS`] (a nested tree can't smuggle past the flat cap).
+fn count_steps(txn: &Transaction) -> usize {
+    let mut total = txn.steps.len();
+    for step in &txn.steps {
+        if let Step::Schedule { txn: nested, .. } = step {
+            total += count_steps(nested);
+        }
+    }
+    total
+}
+
 /// Approximate cron re-fire interval for the in-memory stub. Real 5-field cron
 /// parsing is deferred to the server; the harness only needs crons to re-arm.
 pub const CRON_STEP_MS: i64 = 60_000;
@@ -491,7 +507,7 @@ impl InMemoryRtDbClient {
     /// (`ts-client/src/in_memory.ts:545-567`); the notify seam lives here so
     /// both mutate- and `tick`-driven writes fire subscription updates.
     fn execute_transaction(&mut self, txn: &Transaction) -> Result<Vec<StepResult>, RtDbError> {
-        if txn.steps.len() > MAX_STEPS {
+        if count_steps(txn) > MAX_STEPS {
             return Err(RtDbError::new(
                 ErrorCode::BadRequest,
                 format!("transaction exceeds maximum of {MAX_STEPS} steps"),
@@ -522,6 +538,11 @@ impl InMemoryRtDbClient {
             ));
         }
         let snapshot = self.snapshot_docs();
+        // FM-28: a schedule/cancelSchedule step mutates the schedule store, so
+        // a failed txn must roll it back with the docs (the server inserts/
+        // deletes the scheduled_txns row on the open sqlx tx, which the
+        // rollback aborts).
+        let schedules_snapshot = self.schedules.clone();
         let mut results = Vec::with_capacity(txn.steps.len());
         let mut write_set: BTreeSet<String> = BTreeSet::new();
         for step in &txn.steps {
@@ -536,6 +557,7 @@ impl InMemoryRtDbClient {
                     // Atomicity: any step's error rolls back everything already
                     // applied, mirroring the server's single-transaction semantics.
                     self.restore_docs(snapshot);
+                    self.schedules = schedules_snapshot;
                     return Err(error);
                 }
             }
@@ -641,6 +663,16 @@ impl InMemoryRtDbClient {
                     StepResult::DeleteByQuery { deleted, truncated },
                     Some(table.clone()),
                 ))
+            }
+            Step::Schedule { when, txn } => {
+                let schedule_id = self.schedule((**txn).clone(), when.clone())?;
+                Ok((StepResult::Schedule { schedule_id }, None))
+            }
+            Step::CancelSchedule { id } => {
+                // Matches the server: `false` (not an error) when the id is
+                // missing, already fired, or already cancelled.
+                let cancelled = self.cancel_schedule(id).is_ok();
+                Ok((StepResult::Cancelled { cancelled }, None))
             }
         }
     }

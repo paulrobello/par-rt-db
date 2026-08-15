@@ -113,7 +113,8 @@ function projectUnfilteredArray(
   }
   const working: ResultDoc[] = last.map((d) => ({ ...(d as ResultDoc) }));
   for (const step of txn.steps) {
-    if (step.table !== query.table) {
+    // schedule/cancelSchedule (FM-28) target the scheduler, not a table.
+    if (!("table" in step) || step.table !== query.table) {
       continue;
     }
     switch (step.op) {
@@ -168,7 +169,8 @@ function projectFilteredArray(
   }
   const working: ResultDoc[] = last.map((d) => ({ ...(d as ResultDoc) }));
   for (const step of txn.steps) {
-    if (step.table !== query.table) {
+    // schedule/cancelSchedule (FM-28) target the scheduler, not a table.
+    if (!("table" in step) || step.table !== query.table) {
       continue;
     }
     if (step.op === "delete") {
@@ -200,7 +202,8 @@ function projectGet(query: QueryJson, last: unknown, txn: TransactionJson): Opti
   let working: ResultDoc | null = last === null ? null : { ...last };
   const target = query.get;
   for (const step of txn.steps) {
-    if (step.table !== query.table) {
+    // schedule/cancelSchedule (FM-28) target the scheduler, not a table.
+    if (!("table" in step) || step.table !== query.table) {
       continue;
     }
     switch (step.op) {

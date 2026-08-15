@@ -71,6 +71,7 @@ from .mutation import (
     Step,
     StepResult,
     Transaction,
+    _CancelSchedule,
     _Delete,
     _DeleteByQuery,
     _ExpectAbsent,
@@ -79,6 +80,7 @@ from .mutation import (
     _Patch,
     _PatchByQuery,
     _Replace,
+    _Schedule,
     _Upsert,
 )
 from .query import Query, _terminal_of, parse_result
@@ -152,18 +154,34 @@ CRON_STEP_MS = 60_000
 def worst_case_affected(txn: Transaction) -> int:
     """SEC-104: total documents a txn could touch in the worst case.
 
-    Per-id steps count 1 each; each ``patchByQuery``/``deleteByQuery`` step
-    counts up to its ``limit`` (default and cap ``MAX_BY_QUERY_ROWS``). Mirrors
-    server ``txn::worst_case_affected``; used by ``_execute_transaction``'s
-    ``MAX_AFFECTED_ROWS_PER_TXN`` budget check.
+    Per-id steps count 1 each; ``schedule``/``cancelSchedule`` count 0
+    (control-flow steps touch no documents); each ``patchByQuery``/
+    ``deleteByQuery`` step counts up to its ``limit`` (default and cap
+    ``MAX_BY_QUERY_ROWS``). Mirrors server ``txn::worst_case_affected``; used
+    by ``_execute_transaction``'s ``MAX_AFFECTED_ROWS_PER_TXN`` budget check.
     """
     total = 0
     for step in txn.steps:
         if isinstance(step, (_PatchByQuery, _DeleteByQuery)):
             limit_opt = step.limit
             total += MAX_BY_QUERY_ROWS if limit_opt is None else min(limit_opt, MAX_BY_QUERY_ROWS)
+        elif isinstance(step, (_Schedule, _CancelSchedule)):
+            # Control-flow steps touch no documents (server counts 0).
+            continue
         else:
             total += 1
+    return total
+
+
+def _count_steps(txn: Transaction) -> int:
+    """FM-28: recursive step count — a ``schedule`` step counts as itself plus
+    every step in its nested txn. Mirrors the server's recursive ruling against
+    ``MAX_STEPS`` (a nested tree can't smuggle past the flat cap)."""
+    total = 0
+    for step in txn.steps:
+        total += 1
+        if isinstance(step, _Schedule):
+            total += _count_steps(step.txn)
     return total
 
 
@@ -187,7 +205,9 @@ _EXPECTED_INDEX_VALUE: dict[_PgType, str] = {
 
 # Type adapter for constructing ``StepResult`` values without importing the
 # private result-variant classes: ``{"id"}`` -> insert result,
-# ``{"id","inserted"}`` -> upsert result.
+# ``{"id","inserted"}`` -> upsert result, ``{patched|deleted, truncated}`` ->
+# by-query results, ``{"scheduleId"}`` / ``{"cancelled"}`` -> schedule-step
+# results.
 _STEP_RESULT = TypeAdapter(StepResult)
 
 
@@ -1561,7 +1581,9 @@ class InMemoryRtDbClient:
         return results
 
     def _execute_transaction(self, txn: Transaction) -> list[StepResult]:
-        if len(txn.steps) > MAX_STEPS:
+        # FM-28: count recursively — a schedule step contributes its nested
+        # txn's steps too, mirroring the server's recursive MAX_STEPS ruling.
+        if _count_steps(txn) > MAX_STEPS:
             raise RtDbError(
                 ErrorCode.BAD_REQUEST,
                 f"transaction exceeds maximum of {MAX_STEPS} steps",
@@ -1585,6 +1607,12 @@ class InMemoryRtDbClient:
         snapshot = dict(
             self._docs
         )  # shallow copy; StoredRow values are replaced, not mutated in place
+        # FM-28: schedule/cancelSchedule steps mutate the pending-jobs store, so
+        # it joins the rollback snapshot — a failed later step must not leave a
+        # phantom enqueued (or cancelled) job behind, mirroring the server's
+        # single sqlx transaction around the scheduled_txns insert.
+        # shallow copy; jobs are appended/removed, never edited in place
+        schedules_snapshot = list(self._schedules)
         results: list[StepResult] = []
         write_set: set[str] = set()
         for step in txn.steps:
@@ -1593,6 +1621,7 @@ class InMemoryRtDbClient:
             except RtDbError:
                 # Atomicity: any step's error rolls back everything already applied.
                 self._docs = snapshot
+                self._schedules = schedules_snapshot
                 raise
             results.append(result)
             if written_table is not None:
@@ -1686,6 +1715,31 @@ class InMemoryRtDbClient:
                 for row in take:
                     self._do_delete(table, row.id)
                 return _delete_by_query_result(len(take), truncated), table
+            case _Schedule(when=when, txn=nested_txn):
+                # FM-28: enqueue, don't execute — tick() fires the nested txn
+                # later through _execute_transaction (which re-validates it).
+                kind, due_at, cron = self._prepare_job(when)
+                job_id = self._new_id()
+                self._schedules.append(
+                    _ScheduledJob(
+                        id=job_id,
+                        kind=kind,
+                        txn=nested_txn,
+                        due_at=due_at,
+                        cron=cron,
+                        status="pending",
+                        created_at=self._now(),
+                        fired_count=0,
+                        last_error=None,
+                    )
+                )
+                return _schedule_result(job_id), None
+            case _CancelSchedule(id=job_id):
+                # Unlike the standalone cancel op (NOT_FOUND on a miss), the
+                # step reports {"cancelled": bool} — a miss is not an error.
+                before = len(self._schedules)
+                self._schedules = [j for j in self._schedules if j.id != job_id]
+                return _cancel_schedule_result(len(self._schedules) < before), None
             case _:
                 raise RtDbError(ErrorCode.INTERNAL, "unknown step op")
 
@@ -1976,28 +2030,32 @@ class InMemoryRtDbClient:
 
     # ---- schedules ------------------------------------------------------
 
+    def _prepare_job(self, when: ScheduleWhen) -> tuple[str, int, str | None]:
+        """(kind, due_at, cron) for a ``ScheduleWhen`` — shared by the
+        standalone ``schedule`` op and the ``schedule`` txn step. The clock
+        comes from the injectable ``now``, never ``time.time()`` directly."""
+        now = self._now()
+        match when:
+            case Cron(expr=expr_str):
+                return "cron", self._due_at_for(when, now), expr_str
+            case _:
+                return "oneshot", self._due_at_for(when, now), None
+
     def schedule(self, txn: Transaction, when: ScheduleWhen) -> str:
         """Store ``txn`` scheduled for ``when`` and return its id. Cron
         validation is deferred to the live server; the harness accepts any
         expression."""
         new_id = self._new_id()
-        now = self._now()
-        match when:
-            case Cron(expr=expr_str):
-                kind = "cron"
-                cron: str | None = expr_str
-            case _:
-                kind = "oneshot"
-                cron = None
+        kind, due_at, cron = self._prepare_job(when)
         self._schedules.append(
             _ScheduledJob(
                 id=new_id,
                 kind=kind,
                 txn=txn,
-                due_at=self._due_at_for(when, now),
+                due_at=due_at,
                 cron=cron,
                 status="pending",
-                created_at=now,
+                created_at=self._now(),
                 fired_count=0,
                 last_error=None,
             )
@@ -2201,6 +2259,14 @@ def _patch_by_query_result(patched: int, truncated: bool) -> StepResult:
 
 def _delete_by_query_result(deleted: int, truncated: bool) -> StepResult:
     return _STEP_RESULT.validate_python({"deleted": deleted, "truncated": truncated})
+
+
+def _schedule_result(schedule_id: str) -> StepResult:
+    return _STEP_RESULT.validate_python({"scheduleId": schedule_id})
+
+
+def _cancel_schedule_result(cancelled: bool) -> StepResult:
+    return _STEP_RESULT.validate_python({"cancelled": cancelled})
 
 
 # ---------------------------------------------------------------------------

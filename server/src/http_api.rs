@@ -361,6 +361,12 @@ async fn schedule_handler(
     }
     check_http_rate_limits(&state, &principal, &body.db).await?;
 
+    // FM-28 tightening: a scoped machine token cannot smuggle a future write
+    // into a table outside its allowlist via a scheduled job (matches the
+    // per-step gate `execute_txn` applies at fire time — but fire time runs
+    // as bypass, so enqueue time is the only scoped check).
+    crate::txn::authorize_txn_tables(&principal.row_ctx(), &body.txn)?;
+
     let (kind, due_at, cron) = scheduler::resolve_when(body.when, now_ms())?;
     let id = scheduler::insert(
         &state.pool,

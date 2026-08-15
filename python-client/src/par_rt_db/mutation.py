@@ -1,4 +1,4 @@
-"""Transaction DSL: ``Step`` (7 ops), ``StepResult``, ``Transaction``,
+"""Transaction DSL: ``Step`` (11 ops), ``StepResult``, ``Transaction``,
 and the ``Mutation`` builder.
 
 Mirrors ``server/src/txn.rs`` (the ``Step`` enum + ``Transaction`` struct +
@@ -8,7 +8,8 @@ untagged ``StepResult``) and the builder ergonomics of
 Wire shapes (load-bearing — match the server exactly):
 
 * ``Step`` is tagged by ``op`` (camelCase variants: ``insert``/``patch``/
-  ``replace``/``delete``/``expectVersion``/``expectAbsent``/``upsert``) with
+  ``replace``/``delete``/``expectVersion``/``expectAbsent``/``upsert``/
+  ``patchByQuery``/``deleteByQuery``/``schedule``/``cancelSchedule``) with
   ``deny_unknown_fields`` mirrored via ``extra="forbid"``.
 * ``Transaction`` is ``{"steps": Step[]}``; the server caps at 1024 steps —
   enforced client-side by the builder so an over-cap transaction never reaches
@@ -33,7 +34,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_serializer
 from pydantic_core.core_schema import SerializerFunctionWrapHandler
 
 from .errors import ErrorCode, RtDbError
-from .wire import FilterExpr, to_camel
+from .wire import FilterExpr, ScheduleWhen, to_camel
 
 #: Client-side cap on transaction length. Mirrors ``server/src/txn.rs::MAX_STEPS``
 #: (1024); the server rejects anything longer, so the builder raises eagerly to
@@ -135,7 +136,24 @@ class _DeleteByQuery(_Step):
         return out
 
 
-#: Discriminated union of all 9 step ops. The ``op`` literal drives dispatch;
+class _Schedule(_Step):
+    """FM-28: schedule a nested txn. The nested steps do NOT run at enqueue —
+    the server's scheduler fires them at ``when``; the in-memory harness's
+    ``tick()`` mirrors that."""
+
+    op: Literal["schedule"] = "schedule"
+    when: ScheduleWhen
+    txn: Transaction
+
+
+class _CancelSchedule(_Step):
+    """FM-28: cancel a previously-enqueued scheduled job by id."""
+
+    op: Literal["cancelSchedule"] = "cancelSchedule"
+    id: str
+
+
+#: Discriminated union of all 11 step ops. The ``op`` literal drives dispatch;
 #: ``deny_unknown_fields`` is per-variant via ``extra="forbid"`` on ``_Step``.
 Step = Annotated[
     (
@@ -148,6 +166,8 @@ Step = Annotated[
         | _Upsert
         | _PatchByQuery
         | _DeleteByQuery
+        | _Schedule
+        | _CancelSchedule
     ),
     Field(discriminator="op"),
 ]
@@ -225,13 +245,49 @@ class _StepDeleteByQuery(BaseModel):
     truncated: bool
 
 
+class _StepScheduleResult(BaseModel):
+    """Per-step result for ``schedule``: ``{"scheduleId"}`` — the id of the
+    enqueued job (cancellable via a later ``cancelSchedule`` step)."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        populate_by_name=True,
+        alias_generator=to_camel,
+    )
+
+    schedule_id: str
+
+
+class _StepCancelScheduleResult(BaseModel):
+    """Per-step result for ``cancelSchedule``: ``{"cancelled"}`` — ``False``
+    when no job with that id was pending (not an error, unlike the standalone
+    cancel op's ``NOT_FOUND``)."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        populate_by_name=True,
+        alias_generator=to_camel,
+    )
+
+    cancelled: bool
+
+
 #: Untagged per-step result, positionally aligned with ``Transaction.steps``.
 #: Variant order matters: ``_StepUpsert`` (richer) must precede ``_StepInsert``
 #: so ``{"id","inserted"}`` is captured as an upsert, not silently trimmed to an
 #: insert. ``None`` covers the ``null`` wire shape produced by ``expectVersion``/
 #: ``expectAbsent``/``patch``/``replace``/``delete``. ``patchByQuery``/
-#: ``deleteByQuery`` carry their own ``{patched|deleted, truncated}`` shape.
-StepResult = _StepUpsert | _StepInsert | _StepPatchByQuery | _StepDeleteByQuery | None
+#: ``deleteByQuery`` carry their own ``{patched|deleted, truncated}`` shape;
+#: ``schedule``/``cancelSchedule`` carry ``{scheduleId}`` / ``{cancelled}``.
+StepResult = (
+    _StepUpsert
+    | _StepInsert
+    | _StepPatchByQuery
+    | _StepDeleteByQuery
+    | _StepScheduleResult
+    | _StepCancelScheduleResult
+    | None
+)
 
 
 class _MutationBuilder:
@@ -323,6 +379,20 @@ class _MutationBuilder:
         ``filter``. ``limit`` caps the affected rows (default
         ``MAX_BY_QUERY_ROWS`` server-side); a truncated run reports it."""
         self._steps.append(_DeleteByQuery(table=table, filter=filter, limit=limit))
+        return self
+
+    def schedule(self, when: ScheduleWhen, txn: Transaction) -> _MutationBuilder:
+        """Schedule step: enqueue ``txn`` to run at ``when`` (one-shot or cron).
+        The nested steps do not run in this transaction — the server fires them
+        at the due time; the step result carries the job's ``scheduleId``."""
+        self._steps.append(_Schedule(op="schedule", when=when, txn=txn))
+        return self
+
+    def cancel_schedule(self, id: str) -> _MutationBuilder:
+        """Cancel-schedule step: remove the pending scheduled job ``id``. The
+        step result reports ``{"cancelled": bool}`` — ``False`` (not an error)
+        when no such job is pending."""
+        self._steps.append(_CancelSchedule(op="cancelSchedule", id=id))
         return self
 
     def build(self) -> Transaction:

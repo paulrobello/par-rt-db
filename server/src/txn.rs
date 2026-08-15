@@ -1,6 +1,8 @@
 //! Transaction execution — the write path. A `Transaction` is an ordered list of
 //! steps (`Insert`/`Patch`/`Replace`/`Delete`/`ExpectVersion`/`ExpectAbsent`/
-//! `Upsert`) plus the predicate-driven bulk steps `PatchByQuery`/`DeleteByQuery`.
+//! `Upsert`) plus the predicate-driven bulk steps `PatchByQuery`/`DeleteByQuery`
+//! and the scheduler control-flow steps `Schedule`/`CancelSchedule`, which
+//! target the scheduler's `scheduled_txns` table rather than document tables.
 //! Executes READ COMMITTED with no row locking and MUST run inside the
 //! committer's serialized turn (never call `execute_txn` outside it). Row
 //! visibility composes the client filter with `ownerField`/`collaboratorsField`/
@@ -19,6 +21,7 @@ use crate::db::{new_id, now_ms, validate_db_name};
 use crate::ddl::{pg_col, pg_schema, pg_table};
 use crate::error::RtDbError;
 use crate::query::{FilterExpr, filter_matches};
+use crate::scheduler;
 use crate::schema::{
     FieldType, IndexDef, SchemaDef, TableDef, indexed_column_type, validate_doc, validate_value,
 };
@@ -31,6 +34,22 @@ use crate::schema::{
 /// txn under this limit AND avoids client-side read-all-then-patch patterns.
 /// Raise further only if a measured workload genuinely needs >1024 atomic steps.
 pub const MAX_STEPS: usize = 1024;
+
+/// Recursive step count: every step counts 1, and a `Schedule` step adds its
+/// nested txn's count on top. The total tree must stay within `MAX_STEPS` —
+/// this bounds one request body's serialized size and blocks the nesting
+/// bomb (N steps each scheduling N steps). By-query caps are NOT applied to
+/// nested txns here: the nested txn executes in a future committer turn and
+/// `execute_txn` re-validates it fully at fire time.
+fn count_steps(txn: &Transaction) -> usize {
+    txn.steps
+        .iter()
+        .map(|step| match step {
+            Step::Schedule { txn, .. } => 1 + count_steps(txn),
+            _ => 1,
+        })
+        .sum()
+}
 
 /// Hard cap on the number of rows a single `PatchByQuery`/`DeleteByQuery` step
 /// may touch. A per-step safety backstop (these steps can affect many rows,
@@ -135,6 +154,26 @@ pub enum Step {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         limit: Option<u32>,
     },
+    /// Schedule `txn` to run later (FM-28). The `scheduled_txns` row is
+    /// inserted on the OPEN sqlx transaction, so the enqueue commits (or
+    /// rolls back) atomically with this txn's document writes. Step result is
+    /// `{"scheduleId": "<id>"}`; the job fires through the unchanged
+    /// scheduler → `RunScheduled` committer path as the system (bypass)
+    /// principal. Nested steps are table-scope-checked recursively at enqueue
+    /// (`authorize_txn_tables`) and fully re-validated by `execute_txn` at
+    /// fire time.
+    Schedule {
+        when: crate::protocol::ScheduleWhen,
+        txn: Box<Transaction>,
+    },
+    /// Cancel a previously scheduled job by id, on the open sqlx transaction.
+    /// Step result `{"cancelled": <bool>}` — `false` (not an error) when the
+    /// id is missing, already fired, or already cancelled. A fire currently
+    /// in flight completes; the job never fires again (the cron finalize
+    /// update touches 0 rows).
+    CancelSchedule {
+        id: String,
+    },
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -143,11 +182,11 @@ pub struct Transaction {
 }
 
 impl Step {
-    /// The table this step targets. Every variant carries one; the table-scope
-    /// gate (`authorize_table`) runs once per step inside `execute_txn` so a
-    /// machine token scoped to a subset of tables cannot reach a forbidden table
-    /// via any write path.
-    pub fn table(&self) -> &str {
+    /// The document table this step targets, or `None` for the schedule
+    /// control-flow steps (they touch no documents; the per-step table-scope
+    /// gate in `execute_txn` skips them, and `Step::Schedule` checks its
+    /// NESTED steps recursively via `authorize_txn_tables` instead).
+    pub fn table(&self) -> Option<&str> {
         match self {
             Step::Insert { table, .. }
             | Step::Patch { table, .. }
@@ -157,7 +196,8 @@ impl Step {
             | Step::ExpectAbsent { table, .. }
             | Step::Upsert { table, .. }
             | Step::PatchByQuery { table, .. }
-            | Step::DeleteByQuery { table, .. } => table,
+            | Step::DeleteByQuery { table, .. } => Some(table),
+            Step::Schedule { .. } | Step::CancelSchedule { .. } => None,
         }
     }
 }
@@ -1274,9 +1314,10 @@ fn row_auth_enforced_uid<'a>(table_def: &'a TableDef, owner: Option<&'a str>) ->
 /// Never call `execute_txn` from a non-committer production path.
 /// Worst-case number of documents `txn` could affect. Per-id steps
 /// (`Insert`/`Patch`/`Replace`/`Delete`/`ExpectVersion`/`ExpectAbsent`/`Upsert`)
-/// touch at most one each; each `PatchByQuery`/`DeleteByQuery` step touches up
-/// to its `limit` (default and ceiling [`MAX_BY_QUERY_ROWS`]). The estimate is
-/// an over-approximation — the actual count is lower when fewer rows match —
+/// touch at most one each; `Schedule`/`CancelSchedule` count 0 (control-flow
+/// steps touch no documents); each `PatchByQuery`/`DeleteByQuery` step touches
+/// up to its `limit` (default and ceiling [`MAX_BY_QUERY_ROWS`]). The estimate
+/// is an over-approximation — the actual count is lower when fewer rows match —
 /// and is used by [`execute_txn`]'s [`MAX_AFFECTED_ROWS_PER_TXN`] budget check
 /// and the admin `max_affected_docs` guardrail (admin/docs.rs, ws.rs). It must
 /// never under-approximate (that would weaken both caps). SEC-104.
@@ -1287,6 +1328,7 @@ pub fn worst_case_affected(txn: &Transaction) -> usize {
             Step::PatchByQuery { limit, .. } | Step::DeleteByQuery { limit, .. } => {
                 (*limit).unwrap_or(MAX_BY_QUERY_ROWS).min(MAX_BY_QUERY_ROWS) as usize
             }
+            Step::Schedule { .. } | Step::CancelSchedule { .. } => 0,
             _ => 1,
         })
         .sum()
@@ -1304,7 +1346,7 @@ pub async fn execute_txn(
     // useful cardinal attribute (one per request shape, not per document). The
     // body runs in an instrumented `async` block because a sync `Span::enter`
     // guard is `!Send` and would poison this `Send` future across the `.await`s.
-    let span = tracing::info_span!("txn.execute", db, steps = txn.steps.len());
+    let span = tracing::info_span!("txn.execute", db, steps = count_steps(txn));
     async {
     validate_db_name(db)?;
     // Task 5: `ctx` carries `user_id` + `email`; the row-auth helpers below use
@@ -1312,9 +1354,9 @@ pub async fn execute_txn(
     // thread it unchanged — byte-identical ownerField/collaboratorsField behavior.
     let owner = ctx.user_id.as_deref();
 
-    if txn.steps.len() > MAX_STEPS {
+    if count_steps(txn) > MAX_STEPS {
         return Err(RtDbError::bad_request(format!(
-            "transaction exceeds maximum of {MAX_STEPS} steps"
+            "transaction exceeds maximum of {MAX_STEPS} steps (counted recursively, including scheduled txns)"
         )));
     }
 
@@ -1362,6 +1404,7 @@ pub async fn execute_txn(
 
     let mut sctx = StepCtx {
         tx: &mut tx,
+        db,
         pg_schema_name: pg_schema_name.as_str(),
         schema,
         ctx,
@@ -1375,8 +1418,12 @@ pub async fn execute_txn(
         // table via any step variant. `tables = None` (admin/scheduled/`User`/
         // full-access machine tokens) bypasses; the gate is a pure read. Runs
         // inside the sqlx tx so a `Forbidden` returns via `?` before commit and
-        // rolls back the whole transaction.
-        authorize_table(sctx.ctx, step.table())?;
+        // rolls back the whole transaction. The schedule control-flow steps
+        // carry no table (`table() == None`); `Step::Schedule` checks its
+        // NESTED steps recursively in `step_schedule`.
+        if let Some(table) = step.table() {
+            authorize_table(sctx.ctx, table)?;
+        }
         match step {
             Step::Insert { table, doc } => step_insert(&mut sctx, table, doc).await?,
             Step::Patch { table, id, fields } => step_patch(&mut sctx, table, id, fields).await?,
@@ -1406,6 +1453,8 @@ pub async fn execute_txn(
                 filter,
                 limit,
             } => step_delete_by_query(&mut sctx, table, filter, *limit).await?,
+            Step::Schedule { when, txn } => step_schedule(&mut sctx, when, txn).await?,
+            Step::CancelSchedule { id } => step_cancel_schedule(&mut sctx, id).await?,
         }
     }
 
@@ -1431,6 +1480,7 @@ pub async fn execute_txn(
 /// are simply not accessed, so no per-variant subset struct is warranted.
 struct StepCtx<'a> {
     tx: &'a mut PgConnection,
+    db: &'a str,
     pg_schema_name: &'a str,
     schema: &'a SchemaDef,
     ctx: &'a PrincipalCtx,
@@ -1763,6 +1813,54 @@ async fn step_delete_by_query(
     Ok(())
 }
 
+/// Recursive table-scope check over every step in `txn`, including steps
+/// nested inside `Schedule` payloads. Runs at ENQUEUE time (the `Schedule`
+/// step here, and the standalone Schedule-op surfaces) so a scoped machine
+/// token cannot smuggle a future write into a forbidden table via a
+/// scheduled job. Bypass principals (`tables = None` — admin/full-access/
+/// interactive) are unaffected; per-row rules are deliberately NOT
+/// pre-checked (rows change between enqueue and fire; the firing job runs
+/// as the system principal — documented behavior, see the FM-28 spec).
+pub(crate) fn authorize_txn_tables(ctx: &PrincipalCtx, txn: &Transaction) -> Result<(), RtDbError> {
+    for step in &txn.steps {
+        if let Some(table) = step.table() {
+            authorize_table(ctx, table)?;
+        }
+        if let Step::Schedule { txn, .. } = step {
+            authorize_txn_tables(ctx, txn)?;
+        }
+    }
+    Ok(())
+}
+
+/// `Schedule` step: validate timing, recursively table-scope-check the
+/// nested txn against the CURRENT caller, and insert the `scheduled_txns`
+/// row on the open sqlx transaction — atomic with the enclosing txn's
+/// document writes (FM-28). The row becomes visible at `tx.commit()`; the
+/// scheduler's existing ≤2s poll picks it up from there.
+async fn step_schedule(
+    sctx: &mut StepCtx<'_>,
+    when: &crate::protocol::ScheduleWhen,
+    txn: &Transaction,
+) -> Result<(), RtDbError> {
+    authorize_txn_tables(sctx.ctx, txn)?;
+    let (kind, due_at, cron) = scheduler::resolve_when(when.clone(), now_ms())?;
+    let id = scheduler::insert_on(sctx.tx, sctx.db, kind, due_at, txn, cron.as_deref()).await?;
+    sctx.results.push(serde_json::json!({ "scheduleId": id }));
+    Ok(())
+}
+
+/// `CancelSchedule` step: DELETE the job row on the open sqlx transaction.
+/// `false` (not an error) when the id is missing/already-fired/already
+/// cancelled — matching the standalone cancel op. A fire in flight
+/// completes; the cron finalize update then touches 0 rows.
+async fn step_cancel_schedule(sctx: &mut StepCtx<'_>, id: &str) -> Result<(), RtDbError> {
+    let cancelled = scheduler::cancel_on(sctx.tx, sctx.db, id).await?;
+    sctx.results
+        .push(serde_json::json!({ "cancelled": cancelled }));
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1790,5 +1888,37 @@ mod tests {
                 .iter()
                 .any(|o| o.table == "tasks" && o.kind == OpKind::Delete)
         );
+    }
+
+    #[test]
+    fn count_steps_is_recursive() {
+        let txn = Transaction {
+            steps: vec![
+                Step::Insert {
+                    table: "t".to_string(),
+                    doc: serde_json::Map::new(),
+                },
+                Step::Schedule {
+                    when: crate::protocol::ScheduleWhen::AfterMs { ms: 1 },
+                    txn: Box::new(Transaction {
+                        steps: vec![
+                            Step::Delete {
+                                table: "t".to_string(),
+                                id: "x".to_string(),
+                            },
+                            Step::Schedule {
+                                when: crate::protocol::ScheduleWhen::RunAt { ms: 2 },
+                                txn: Box::new(Transaction {
+                                    steps: vec![Step::CancelSchedule {
+                                        id: "j".to_string(),
+                                    }],
+                                }),
+                            },
+                        ],
+                    }),
+                },
+            ],
+        };
+        assert_eq!(count_steps(&txn), 5);
     }
 }

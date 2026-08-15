@@ -143,7 +143,8 @@ Mutations submitted from the data browser are bounded by `RTDB_MAX_AFFECTED_DOCS
 (server boot config, default **100**), which counts the worst-case number of
 documents a transaction could touch — not the raw step count. Per-id steps
 (`insert`/`patch`/`replace`/`delete`/`expectVersion`/`expectAbsent`/`upsert`)
-count one document each; each `patchByQuery`/`deleteByQuery` step counts up to
+count one document each; `schedule`/`cancelSchedule` steps count zero (they
+touch no documents); each `patchByQuery`/`deleteByQuery` step counts up to
 its `limit` (default and ceiling `MAX_BY_QUERY_ROWS = 1000`). An over-budget
 transaction is rejected **before** the committer — an over-cap write never
 becomes durable. Non-admin mutations are bounded by `MAX_STEPS = 1024` (step
