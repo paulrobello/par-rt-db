@@ -41,7 +41,7 @@ pub const MAX_STEPS: usize = 1024;
 /// bomb (N steps each scheduling N steps). By-query caps are NOT applied to
 /// nested txns here: the nested txn executes in a future committer turn and
 /// `execute_txn` re-validates it fully at fire time.
-fn count_steps(txn: &Transaction) -> usize {
+pub(crate) fn count_steps(txn: &Transaction) -> usize {
     txn.steps
         .iter()
         .map(|step| match step {

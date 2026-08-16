@@ -47,6 +47,7 @@ pub mod subs;
 pub mod tracing_setup;
 pub mod txn;
 pub mod webhook;
+pub mod workflows;
 pub mod ws;
 
 use std::path::Path;
