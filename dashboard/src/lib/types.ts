@@ -28,12 +28,18 @@ export type {
   ScheduleInfo,
   ScheduleWhen,
   SessionInfo as SessionRow,
+  StepOutcome,
   SubscriptionInfo,
   SubscriptionsPrincipal,
   SubscriptionsResponse,
   TransactionJson,
   Webhook,
   WebhookDelivery,
+  WorkflowInfo,
+  WorkflowInfoFull,
+  WorkflowSpec,
+  WorkflowStatus,
+  WorkflowStepSpec,
 } from "@par-rt-db/client";
 
 // ---------------------------------------------------------------------------

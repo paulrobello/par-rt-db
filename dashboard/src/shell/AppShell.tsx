@@ -13,6 +13,7 @@ const NAV = [
   { to: "/subscriptions", label: "Subscriptions" },
   { to: "/slow-queries", label: "Slow queries" },
   { to: "/scheduled", label: "Scheduled" },
+  { to: "/workflows", label: "Workflows" },
   { to: "/storage", label: "Storage" },
   { to: "/tokens", label: "Tokens" },
   { to: "/sessions", label: "Sessions" },
