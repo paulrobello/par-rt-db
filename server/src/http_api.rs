@@ -498,8 +498,11 @@ async fn start_workflow_handler(
     crate::txn::authorize_spec_tables(&principal.row_ctx(), &body.spec)?;
     // Steps fire from the per-db scheduler, which only exists once the per-db
     // tasks spawn — ensure that before insert or the run sits `pending`
-    // forever on a cold db.
+    // forever on a cold db. The spawned scheduler's startup ensure is NOT
+    // ordered against this insert, so ensure the table inline too or a
+    // cold-db insert can lose the race and error once.
     state.realtime.committers.ensure_spawned(&body.db).await?;
+    workflows::ensure_table(&state.pool, &body.db).await?;
     let id = workflows::insert(&state.pool, &body.db, &body.spec).await?;
     Ok(Json(StartWorkflowResponse { id }))
 }
@@ -526,6 +529,9 @@ async fn list_workflows_handler(
 ) -> Result<Json<ListWorkflowsResponse>, RtDbError> {
     let principal = authed(&state, &headers, &body.db).await?;
     check_http_rate_limits(&state, &principal, &body.db).await?;
+    // Cold-db guard (the table is ensured only at scheduler startup): ensure
+    // inline so a db with no spawned tasks lists empty, not 500.
+    workflows::ensure_table(&state.pool, &body.db).await?;
     let workflows = workflows::list(&state.pool, &body.db, body.status.as_ref(), 100).await?;
     Ok(Json(ListWorkflowsResponse { workflows }))
 }
@@ -548,6 +554,10 @@ async fn cancel_workflow_handler(
         return Err(RtDbError::forbidden("read-only token cannot mutate"));
     }
     check_http_rate_limits(&state, &principal, &body.db).await?;
+    // Cold-db guard (the table is ensured only at scheduler startup): ensure
+    // inline so cancel on a db with no spawned tasks is a clean `false`, not
+    // a 500.
+    workflows::ensure_table(&state.pool, &body.db).await?;
     let cancelled = workflows::cancel(&state.pool, &body.db, &id).await?;
     Ok(Json(CancelWorkflowResponse { cancelled }))
 }

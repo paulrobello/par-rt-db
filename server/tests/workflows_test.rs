@@ -1143,3 +1143,67 @@ async fn admin_start_on_cold_db_advances_to_success() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+/// (15) The client-facing list route serves a cold db (no workflows table, no
+/// per-db tasks) — ensure-inline like the admin surface, not a 500.
+#[tokio::test]
+async fn http_list_serves_cold_db() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let db = fresh_db(&state).await;
+    let addr = spawn_app(state).await;
+    let token = mint_scoped_token(addr, &db, &["projects"]).await;
+
+    let resp = api_post(
+        addr,
+        "/api/workflows/list",
+        &token,
+        serde_json::json!({ "db": db }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(
+        body["workflows"].as_array().map(Vec::len),
+        Some(0),
+        "cold db lists zero runs, not an error"
+    );
+
+    Ok(())
+}
+
+/// (16) A cold-db client start succeeds on the FIRST attempt: `ensure_spawned`
+/// only queues the spawned scheduler's startup ensure, which is not ordered
+/// against this request's own insert — the start arm must also ensure the
+/// table inline or a cold-db insert can lose that race and error once. Pre-fix
+/// this is a race, not a deterministic failure; this test pins the post-fix
+/// first-try contract (the cold-list test (15) is the deterministic RED).
+/// Advancement is asserted to prove the spawned tasks claim the run.
+#[tokio::test]
+async fn http_start_on_cold_db_first_try_advances() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let addr = spawn_app(state).await;
+    let token = mint_scoped_token(addr, &db, &["projects"]).await;
+
+    let resp = api_post(
+        addr,
+        "/api/workflows",
+        &token,
+        serde_json::json!({ "db": db, "spec": projects_spec_json("cold-http") }),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "first attempt must succeed on a cold db"
+    );
+    let body: serde_json::Value = resp.json().await?;
+    let id = body["id"].as_str().expect("workflow id").to_string();
+
+    let full = await_status(&pool, &db, &id, |i| i.status == WorkflowStatus::Success).await;
+    assert_eq!(full.step_outcomes.len(), 1);
+    assert_eq!(projects_count(&pool, &db).await, 1);
+
+    Ok(())
+}

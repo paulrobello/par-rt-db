@@ -713,18 +713,24 @@ async fn handle_start_workflow(
             match prepared {
                 // Steps fire from the per-db scheduler, which only exists once
                 // the per-db tasks spawn — ensure that before insert or the
-                // run sits `pending` forever on a cold db.
+                // run sits `pending` forever on a cold db. The spawned
+                // scheduler's own startup ensure is NOT ordered against this
+                // insert, so ensure the table inline too or a cold-db insert
+                // can lose the race and error.
                 Ok(()) => match state.realtime.committers.ensure_spawned(db).await {
-                    Ok(()) => match workflows::insert(&state.pool, db, &spec).await {
-                        Ok(id) => match workflows::get(&state.pool, db, &id).await {
-                            Ok(Some(full)) => ServerMessage::StartWorkflowOk {
-                                workflow_id,
-                                info: full.info,
+                    Ok(()) => match workflows::ensure_table(&state.pool, db).await {
+                        Ok(()) => match workflows::insert(&state.pool, db, &spec).await {
+                            Ok(id) => match workflows::get(&state.pool, db, &id).await {
+                                Ok(Some(full)) => ServerMessage::StartWorkflowOk {
+                                    workflow_id,
+                                    info: full.info,
+                                },
+                                _ => ServerMessage::StartWorkflowErr {
+                                    workflow_id,
+                                    error: RtDbError::internal("workflow started but unreadable"),
+                                },
                             },
-                            _ => ServerMessage::StartWorkflowErr {
-                                workflow_id,
-                                error: RtDbError::internal("workflow started but unreadable"),
-                            },
+                            Err(error) => ServerMessage::StartWorkflowErr { workflow_id, error },
                         },
                         Err(error) => ServerMessage::StartWorkflowErr { workflow_id, error },
                     },
@@ -752,8 +758,14 @@ async fn handle_cancel_workflow(fctx: &FrameCtx<'_>, workflow_id: String, id: St
             false,
             Some(RtDbError::forbidden("read-only token cannot mutate")),
         ),
-        Ok(()) => match workflows::cancel(&state.pool, db, &id).await {
-            Ok(ok) => (ok, None),
+        // Cold-db guard (the table is ensured only at scheduler startup):
+        // ensure inline so cancel on a db with no spawned tasks is a clean
+        // `ok: false`, not an error.
+        Ok(()) => match workflows::ensure_table(&state.pool, db).await {
+            Ok(()) => match workflows::cancel(&state.pool, db, &id).await {
+                Ok(ok) => (ok, None),
+                Err(error) => (false, Some(error)),
+            },
             Err(error) => (false, Some(error)),
         },
         Err(error) => (false, Some(error)),
@@ -779,10 +791,16 @@ async fn handle_list_workflows(
     let out_tx = fctx.out_tx;
 
     let reply = match authorize(&state.pool, principal, db).await {
-        Ok(()) => match workflows::list(&state.pool, db, status.as_ref(), 100).await {
-            Ok(workflows) => ServerMessage::ListWorkflowsOk {
-                workflow_id,
-                workflows,
+        // Cold-db guard (the table is ensured only at scheduler startup):
+        // ensure inline so list on a db with no spawned tasks returns an
+        // empty page, not an error.
+        Ok(()) => match workflows::ensure_table(&state.pool, db).await {
+            Ok(()) => match workflows::list(&state.pool, db, status.as_ref(), 100).await {
+                Ok(workflows) => ServerMessage::ListWorkflowsOk {
+                    workflow_id,
+                    workflows,
+                },
+                Err(error) => ServerMessage::StartWorkflowErr { workflow_id, error },
             },
             Err(error) => ServerMessage::StartWorkflowErr { workflow_id, error },
         },
