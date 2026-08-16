@@ -260,8 +260,10 @@ type WfReply = oneshot::Sender<Result<WorkflowOutcome, RtDbError>>;
 enum WorkflowOutcome {
     /// `startWorkflowOk { info }` — the newly created run's projection.
     Info(WorkflowInfo),
-    /// `workflowAck { ok: true }` — cancel succeeded (no payload).
-    Ack,
+    /// `workflowAck { ok }` — cancel resolved. `false` means the server
+    /// found no active run (unknown or already terminal): a no-op, not a
+    /// failure.
+    Ack(bool),
     /// `listWorkflowsOk { workflows }`.
     List(Vec<WorkflowInfo>),
 }
@@ -898,15 +900,17 @@ impl RtDbClient {
         }
     }
 
-    /// Cancel a workflow run (FM-29). Resolves on `workflowAck.ok:true`;
-    /// rejects with [`RtDbError`] when the server returns `ok:false` (e.g. a
-    /// missing or already-terminal run).
-    pub async fn cancel_workflow(&self, id: &str) -> Result<(), RtDbError> {
+    /// Cancel a workflow run (FM-29). Resolves `true` on `workflowAck.ok:true`;
+    /// resolves `false` for a bare `ok:false` (unknown or already-terminal
+    /// run — a no-op, not a failure, matching
+    /// [`RtDbHttpClient::cancel_workflow`](crate::http::RtDbHttpClient::cancel_workflow));
+    /// rejects with [`RtDbError`] when the server returns an error envelope.
+    pub async fn cancel_workflow(&self, id: &str) -> Result<bool, RtDbError> {
         match self
             .queue_workflow(WorkflowMsg::Cancel { id: id.to_string() })
             .await?
         {
-            WorkflowOutcome::Ack => Ok(()),
+            WorkflowOutcome::Ack(ok) => Ok(ok),
             _ => Err(RtDbError::internal("unexpected workflow reply")),
         }
     }
@@ -1664,11 +1668,13 @@ fn apply_server_message(
         } => {
             if let Some(reply) = pending_workflows.remove(&workflow_id) {
                 if ok {
-                    let _ = reply.send(Ok(WorkflowOutcome::Ack));
+                    let _ = reply.send(Ok(WorkflowOutcome::Ack(true)));
+                } else if let Some(error) = error {
+                    let _ = reply.send(Err(error));
                 } else {
-                    let err =
-                        error.unwrap_or_else(|| RtDbError::internal("workflow operation failed"));
-                    let _ = reply.send(Err(err));
+                    // Bare ok:false = unknown/terminal run: a no-op, not a
+                    // failure (ts-client and http parity).
+                    let _ = reply.send(Ok(WorkflowOutcome::Ack(false)));
                 }
             }
         }
@@ -2683,12 +2689,14 @@ mod tests {
         let (tx_ack_err, rx_ack_err) = oneshot::channel();
         let (tx_list, rx_list) = oneshot::channel();
         let (tx_list_err, rx_list_err) = oneshot::channel();
+        let (tx_ack_noop, rx_ack_noop) = oneshot::channel();
         pending_workflows.insert("wf-1".into(), tx_ok);
         pending_workflows.insert("wf-2".into(), tx_err);
         pending_workflows.insert("wf-3".into(), tx_ack_ok);
         pending_workflows.insert("wf-4".into(), tx_ack_err);
         pending_workflows.insert("wf-5".into(), tx_list);
         pending_workflows.insert("wf-6".into(), tx_list_err);
+        pending_workflows.insert("wf-7".into(), tx_ack_noop);
 
         let info = WorkflowInfo {
             id: "wf1".into(),
@@ -2768,6 +2776,19 @@ mod tests {
             &mut pending_schedules,
             &mut pending_workflows,
         );
+        // Bare ok:false (no error envelope) = unknown/terminal run no-op:
+        // resolves Ack(false), it must not reject.
+        apply_server_message(
+            &inner,
+            ServerMessage::WorkflowAck {
+                workflow_id: "wf-7".into(),
+                ok: false,
+                error: None,
+            },
+            &mut pending,
+            &mut pending_schedules,
+            &mut pending_workflows,
+        );
 
         match rx_ok.await.unwrap().unwrap() {
             WorkflowOutcome::Info(info) => assert_eq!(info.id, "wf1"),
@@ -2777,7 +2798,11 @@ mod tests {
         assert_eq!(err.code, ErrorCode::BadRequest);
         assert!(matches!(
             rx_ack_ok.await.unwrap().unwrap(),
-            WorkflowOutcome::Ack
+            WorkflowOutcome::Ack(true)
+        ));
+        assert!(matches!(
+            rx_ack_noop.await.unwrap().unwrap(),
+            WorkflowOutcome::Ack(false)
         ));
         let ack_err = rx_ack_err.await.unwrap().unwrap_err();
         assert_eq!(ack_err.code, ErrorCode::NotFound);
