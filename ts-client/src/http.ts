@@ -6,6 +6,9 @@ import type {
   QueryJson,
   ScheduleInfo,
   ScheduleWhen,
+  WorkflowInfo,
+  WorkflowSpec,
+  WorkflowStatus,
   TransactionJson,
 } from "./protocol.js";
 import type { RtQuery } from "./query.js";
@@ -151,6 +154,32 @@ export class RtDbHttpClient {
   async listSchedules(): Promise<ScheduleInfo[]> {
     const body = await this.post("/api/schedules", { db: this.db });
     return (body as { schedules: ScheduleInfo[] }).schedules;
+  }
+
+  /** Starts a durable workflow run from `spec` (FM-29). The HTTP route returns
+   * only the new run's `{id}` — fetch the full row via the admin get route or
+   * the WS client's `startWorkflow`, which resolves the whole `WorkflowInfo`. */
+  async startWorkflow(spec: WorkflowSpec): Promise<{ id: string }> {
+    const body = await this.post("/api/workflows", { db: this.db, spec });
+    return { id: (body as { id: string }).id };
+  }
+
+  /** Cancels a pending/running workflow by id (FM-29). Resolves `false` for an
+   * unknown/terminal run (a no-op), `true` when a live run was cancelled. */
+  async cancelWorkflow(id: string): Promise<boolean> {
+    const body = await this.post(`/api/workflows/${encodeURIComponent(id)}/cancel`, {
+      db: this.db,
+    });
+    return (body as { cancelled: boolean }).cancelled;
+  }
+
+  /** Lists workflow runs, newest first, optionally filtered by `status` (FM-29). */
+  async listWorkflows(status?: WorkflowStatus): Promise<WorkflowInfo[]> {
+    const body = await this.post("/api/workflows/list", {
+      db: this.db,
+      ...(status === undefined ? {} : { status }),
+    });
+    return (body as { workflows: WorkflowInfo[] }).workflows;
   }
 
   /**

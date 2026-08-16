@@ -30,8 +30,14 @@ import type {
   ScheduleInfo,
   ScheduleWhen,
   SchemaJson,
+  StepOutcome,
+  StepRetry,
   TableJson,
   TransactionJson,
+  WorkflowInfo,
+  WorkflowInfoFull,
+  WorkflowSpec,
+  WorkflowStatus,
 } from "./protocol.js";
 import type { RtQuery } from "./query.js";
 import type { SchemaDefinition } from "./schema.js";
@@ -117,14 +123,19 @@ export const MAX_BY_QUERY_STEPS_PER_TXN = 16;
 export const MAX_AFFECTED_ROWS_PER_TXN = 10_000;
 
 /** SEC-104: total documents a txn could touch in the worst case. Per-id steps
- * count 1 each; `schedule`/`cancelSchedule` count 0 (control-flow steps touch
- * no documents); each `patchByQuery`/`deleteByQuery` step counts up to its
- * `limit` (default and cap `MAX_BY_QUERY_ROWS`). Mirrors server
- * `txn::worst_case_affected`. */
+ * count 1 each; control-flow steps (`schedule`/`cancelSchedule` FM-28,
+ * `startWorkflow`/`cancelWorkflow` FM-29) count 0 — they touch no documents;
+ * each `patchByQuery`/`deleteByQuery` step counts up to its `limit` (default
+ * and cap `MAX_BY_QUERY_ROWS`). Mirrors server `txn::worst_case_affected`. */
 export function worstCaseAffected(txn: TransactionJson): number {
   let total = 0;
   for (const step of txn.steps) {
-    if (step.op === "schedule" || step.op === "cancelSchedule") {
+    if (
+      step.op === "schedule" ||
+      step.op === "cancelSchedule" ||
+      step.op === "startWorkflow" ||
+      step.op === "cancelWorkflow"
+    ) {
       continue; // control-flow: touches no documents (server counts 0)
     }
     if (step.op === "patchByQuery" || step.op === "deleteByQuery") {
@@ -136,13 +147,17 @@ export function worstCaseAffected(txn: TransactionJson): number {
   return total;
 }
 
-/** FM-28: recursive step count — a `schedule` step counts as itself plus
- * every step in its nested txn. Mirrors the server's recursive gate against
- * `MAX_STEPS` (a nested tree can't smuggle past the flat cap). */
+/** FM-28/FM-29: recursive step count — a `schedule` step counts as itself plus
+ * every step in its nested txn; a `startWorkflow` step counts as itself plus
+ * every step of every txn in its spec. Mirrors the server's recursive gate
+ * against `MAX_STEPS` (a nested tree can't smuggle past the flat cap). */
 function countSteps(txn: TransactionJson): number {
   let total = txn.steps.length;
   for (const step of txn.steps) {
     if (step.op === "schedule") total += countSteps(step.txn);
+    if (step.op === "startWorkflow") {
+      for (const s of step.spec.steps) total += countSteps(s.txn);
+    }
   }
   return total;
 }
@@ -305,6 +320,79 @@ interface ScheduledJob {
 /** Approximate cron re-fire interval for the in-memory stub. Real 5-field cron
  * parsing is deferred to the server; the harness only needs crons to re-arm. */
 const CRON_STEP_MS = 60_000;
+
+/** FM-29: hard cap on steps per workflow spec. Mirrors server
+ * `workflows::MAX_WORKFLOW_STEPS`. */
+const MAX_WORKFLOW_STEPS = 64;
+
+/** FM-29: retry policy applied when a step spec omits `retry`. Mirrors server
+ * `protocol::StepRetry::default`. */
+const DEFAULT_STEP_RETRY: Required<StepRetry> = {
+  maxAttempts: 3,
+  initialRetryMs: 1_000,
+  maxRetryMs: 60_000,
+};
+
+/** FM-29: exponential backoff after the `attempts`-th failure of a step —
+ * `initialRetryMs * 2^(attempts-1)` (shift capped at 32), clamped to
+ * `maxRetryMs`. Mirrors server `workflows::backoff_ms`. */
+function backoffMs(retry: Required<StepRetry>, attempts: number): number {
+  const shift = Math.min(attempts - 1, 32);
+  return Math.min(retry.initialRetryMs * 2 ** shift, retry.maxRetryMs);
+}
+
+/** FM-29: submit-time spec validation. Mirrors server `workflows::validate_spec`
+ * (same checks, same BAD_REQUEST messages, including the recursive
+ * `MAX_STEPS` gate over the spec's step txns). */
+function validateWorkflowSpec(spec: WorkflowSpec): void {
+  if (spec.steps.length === 0) {
+    throw new RtDbError("BAD_REQUEST", "workflow must have at least one step");
+  }
+  if (spec.steps.length > MAX_WORKFLOW_STEPS) {
+    throw new RtDbError("BAD_REQUEST", `workflow exceeds ${MAX_WORKFLOW_STEPS} steps`);
+  }
+  for (const [i, step] of spec.steps.entries()) {
+    if (step.retry) {
+      if (step.retry.maxAttempts === 0) {
+        throw new RtDbError("BAD_REQUEST", `steps[${i}].retry.maxAttempts must be >= 1`);
+      }
+      const initial = step.retry.initialRetryMs ?? DEFAULT_STEP_RETRY.initialRetryMs;
+      const max = step.retry.maxRetryMs ?? DEFAULT_STEP_RETRY.maxRetryMs;
+      if (initial === 0 || max < initial) {
+        throw new RtDbError(
+          "BAD_REQUEST",
+          `steps[${i}].retry requires initialRetryMs > 0 and maxRetryMs >= initialRetryMs`,
+        );
+      }
+    }
+  }
+  const total = spec.steps.reduce((sum, s) => sum + countSteps(s.txn), 0);
+  if (total > MAX_STEPS) {
+    throw new RtDbError(
+      "BAD_REQUEST",
+      `workflow recursive step count ${total} exceeds MAX_STEPS ${MAX_STEPS}`,
+    );
+  }
+}
+
+/** FM-29: a stored workflow run in the in-memory harness. Field names mirror
+ * the server's `workflows` table columns; `sleepUntil` is always set (the
+ * column is NOT NULL server-side — insert computes the initial gate, later
+ * transitions overwrite it, terminal states leave it). */
+interface WorkflowRun {
+  id: string;
+  spec: WorkflowSpec;
+  status: WorkflowStatus;
+  currentStep: number;
+  attempts: number;
+  sleepUntil: number;
+  lastError?: string;
+  createdAt: number;
+  updatedAt: number;
+  startedAt?: number;
+  finishedAt?: number;
+  stepOutcomes: StepOutcome[];
+}
 
 /**
  * Shared in-memory presence backing: a `room -> connectionId -> member` map with
@@ -1134,6 +1222,7 @@ export class InMemoryRtDbClient {
   private readonly idempotency = new Map<string, unknown[]>();
   private readonly subs: Subscription[] = [];
   private readonly schedules = new Map<string, ScheduledJob>();
+  private readonly workflows = new Map<string, WorkflowRun>();
   private readonly files = new Map<
     string,
     { bytes: Uint8Array; contentType?: string; createdAt: number }
@@ -1482,7 +1571,9 @@ export class InMemoryRtDbClient {
     // FM-28: a schedule/cancelSchedule step mutates the schedule store, so a
     // failed txn must roll it back with the docs (the server inserts/deletes
     // the scheduled_txns row on the open sqlx tx, which the rollback aborts).
+    // FM-29: same for startWorkflow/cancelWorkflow and the workflow store.
     const schedulesSnapshot = new Map(this.schedules);
+    const workflowsSnapshot = new Map(this.workflows);
     const results: unknown[] = [];
     const writeSet = new Set<string>();
     try {
@@ -1499,6 +1590,10 @@ export class InMemoryRtDbClient {
       this.schedules.clear();
       for (const [id, job] of schedulesSnapshot) {
         this.schedules.set(id, job);
+      }
+      this.workflows.clear();
+      for (const [id, run] of workflowsSnapshot) {
+        this.workflows.set(id, run);
       }
       throw error;
     }
@@ -1653,6 +1748,86 @@ export class InMemoryRtDbClient {
     return [...this.schedules.values()].map((job) => this.toScheduleInfo(job));
   }
 
+  // ---- workflows (FM-29) ------------------------------------------------------
+
+  /** Starts a durable workflow run from `spec`, validating it like the server's
+   * `workflows::validate_spec`. Resolves the new run's info row (pending,
+   * gated at `now + steps[0].sleepBeforeMs`); `tick` advances it. */
+  async startWorkflow(spec: WorkflowSpec): Promise<WorkflowInfo> {
+    validateWorkflowSpec(spec);
+    return this.toWorkflowInfo(this.startWorkflowJob(spec));
+  }
+
+  /** Cancels a pending/running run: flips it to `cancelled` + `finishedAt`.
+   * Resolves `false` (a no-op, not an error) for an unknown or terminal run —
+   * the server's `workflows::cancel` contract. */
+  async cancelWorkflow(id: string): Promise<boolean> {
+    const run = this.workflows.get(id);
+    if (!run || (run.status !== "pending" && run.status !== "running")) {
+      return false;
+    }
+    run.status = "cancelled";
+    run.finishedAt = this.now();
+    run.updatedAt = this.now();
+    return true;
+  }
+
+  /** Lists runs, newest first (createdAt DESC), optionally filtered by
+   * `status` — the server `workflows::list` ordering. */
+  async listWorkflows(status?: WorkflowStatus): Promise<WorkflowInfo[]> {
+    return [...this.workflows.values()]
+      .filter((run) => status === undefined || run.status === status)
+      .sort((a, b) => b.createdAt - a.createdAt)
+      .map((run) => this.toWorkflowInfo(run));
+  }
+
+  /** Fetches one full run row — info plus the per-step outcome trail
+   * (mirrors `GET /admin/db/{db}/workflows/{id}`). NOT_FOUND on unknown id. */
+  async getWorkflow(id: string): Promise<WorkflowInfoFull> {
+    const run = this.workflows.get(id);
+    if (!run) {
+      throw new RtDbError("NOT_FOUND", `workflow '${id}' not found`);
+    }
+    return { ...this.toWorkflowInfo(run), stepOutcomes: [...run.stepOutcomes] };
+  }
+
+  /** Sync core of {@link startWorkflow} — the `Step::StartWorkflow` transaction
+   * step reuses it from the sync `executeStep` path (the server's
+   * `workflows::insert_on`). */
+  private startWorkflowJob(spec: WorkflowSpec): WorkflowRun {
+    const now = this.now();
+    const run: WorkflowRun = {
+      id: this.newId(),
+      spec,
+      status: "pending",
+      currentStep: 0,
+      attempts: 0,
+      sleepUntil: now + (spec.steps[0].sleepBeforeMs ?? 0),
+      createdAt: now,
+      updatedAt: now,
+      stepOutcomes: [],
+    };
+    this.workflows.set(run.id, run);
+    return run;
+  }
+
+  private toWorkflowInfo(run: WorkflowRun): WorkflowInfo {
+    return {
+      id: run.id,
+      name: run.spec.name,
+      status: run.status,
+      currentStep: run.currentStep,
+      stepCount: run.spec.steps.length,
+      attempts: run.attempts,
+      sleepUntil: run.sleepUntil,
+      createdAt: run.createdAt,
+      updatedAt: run.updatedAt,
+      ...(run.lastError === undefined ? {} : { lastError: run.lastError }),
+      ...(run.startedAt === undefined ? {} : { startedAt: run.startedAt }),
+      ...(run.finishedAt === undefined ? {} : { finishedAt: run.finishedAt }),
+    };
+  }
+
   // ---- file storage ----------------------------------------------------------
   //
   // Storage is HTTP-only on the live server; the in-memory harness mirrors the
@@ -1719,6 +1894,11 @@ export class InMemoryRtDbClient {
    * removed after a successful fire; crons are re-armed. Pass `nowMs` to drive
    * the clock deterministically; omit it to use the client's injected clock.
    *
+   * FM-29: also advances due workflow runs (pending + `sleepUntil <= now`)
+   * through the server's `handle_workflow_advance` semantics — claim to
+   * running, execute the current step txn atomically, then success/retry/
+   * exhaust transitions (see `advanceWorkflow`).
+   *
    * Also reaps expired documents: any table that declares a `ttl` has rows
    * removed whose TTL field value is a number strictly less than `now` (a no-op
    * for tables without TTL). Returns the count of documents reaped. The live
@@ -1747,7 +1927,102 @@ export class InMemoryRtDbClient {
         }
       }
     }
+    // FM-29: claim due pending runs (server `claim_due`), then advance each.
+    const due = [...this.workflows.values()].filter(
+      (run) => run.status === "pending" && run.sleepUntil <= now,
+    );
+    for (const run of due) {
+      run.status = "running";
+      if (run.startedAt === undefined) {
+        run.startedAt = now;
+      }
+      run.updatedAt = now;
+      this.advanceWorkflow(run, now);
+    }
     return this.reapTtl(now);
+  }
+
+  /** FM-29: drives one claimed run across step boundaries, mirroring the
+   * server committer's advance loop. Success on the last step finalizes;
+   * success earlier moves to the next step and applies its `sleepBeforeMs`
+   * gate (a future gate re-pends the run and ends this pass — a `now` gate
+   * continues in the same tick); failure re-pends with exponential backoff
+   * (no outcome recorded for retried attempts) or, once attempts are
+   * exhausted, marks the run failed with a terminal outcome. */
+  private advanceWorkflow(run: WorkflowRun, now: number): void {
+    for (;;) {
+      // Per-boundary liveness check: a cancel (or terminal transition) between
+      // steps ends the pass — the server re-checks the row each boundary.
+      const live = this.workflows.get(run.id);
+      if (live !== run || run.status !== "running") {
+        return;
+      }
+      const step = run.spec.steps[run.currentStep];
+      if (!step) {
+        return;
+      }
+      let execError: string | null = null;
+      try {
+        this.executeTransaction(step.txn);
+      } catch (e) {
+        execError = e instanceof Error ? e.message : String(e);
+      }
+      if (execError === null) {
+        const outcome: StepOutcome = {
+          stepIndex: run.currentStep,
+          status: "success",
+          attempts: run.attempts + 1,
+          at: now,
+        };
+        const isLast = run.currentStep + 1 >= run.spec.steps.length;
+        run.stepOutcomes.push(outcome);
+        run.updatedAt = now;
+        if (isLast) {
+          run.status = "success";
+          run.attempts = 0;
+          delete run.lastError;
+          run.finishedAt = now;
+          return;
+        }
+        run.currentStep += 1;
+        run.attempts = 0;
+        const next = run.spec.steps[run.currentStep];
+        const gate = now + (next.sleepBeforeMs ?? 0);
+        if (gate > now) {
+          run.status = "pending";
+          run.sleepUntil = gate;
+          run.updatedAt = now;
+          return;
+        }
+        continue;
+      }
+      const retry: Required<StepRetry> = step.retry
+        ? {
+            maxAttempts: step.retry.maxAttempts,
+            initialRetryMs: step.retry.initialRetryMs ?? DEFAULT_STEP_RETRY.initialRetryMs,
+            maxRetryMs: step.retry.maxRetryMs ?? DEFAULT_STEP_RETRY.maxRetryMs,
+          }
+        : DEFAULT_STEP_RETRY;
+      run.attempts += 1;
+      if (run.attempts < retry.maxAttempts) {
+        run.status = "pending";
+        run.sleepUntil = now + backoffMs(retry, run.attempts);
+        run.updatedAt = now;
+        return;
+      }
+      run.stepOutcomes.push({
+        stepIndex: run.currentStep,
+        status: "failed",
+        attempts: run.attempts,
+        at: now,
+        error: execError,
+      });
+      run.status = "failed";
+      run.lastError = execError;
+      run.finishedAt = now;
+      run.updatedAt = now;
+      return;
+    }
   }
 
   /** Removes documents whose TTL field value is a number strictly less than
@@ -1833,6 +2108,24 @@ export class InMemoryRtDbClient {
     }
     if (step.op === "cancelSchedule") {
       return { result: { cancelled: this.schedules.delete(step.id) } };
+    }
+    // The workflow control-flow steps (FM-29) target the workflow store the
+    // same way: start validates + inserts the run row, cancel mirrors the
+    // standalone op (`cancelled: false` for unknown/terminal runs).
+    if (step.op === "startWorkflow") {
+      validateWorkflowSpec(step.spec);
+      const run = this.startWorkflowJob(step.spec);
+      return { result: { workflowId: run.id } };
+    }
+    if (step.op === "cancelWorkflow") {
+      const run = this.workflows.get(step.id);
+      const cancelled = !!run && (run.status === "pending" || run.status === "running");
+      if (cancelled) {
+        run.status = "cancelled";
+        run.finishedAt = this.now();
+        run.updatedAt = this.now();
+      }
+      return { result: { cancelled } };
     }
     const table = step.table;
     switch (step.op) {
@@ -2993,7 +3286,10 @@ export class InMemoryRtDbClient {
   /** UUIDv7-shaped id (timestamp-prefixed for sort stability), 32 hex chars. */
   private newId(): string {
     const ts = this.now().toString(16).padStart(12, "0").slice(-12);
-    const rand = this.randomHex(19);
+    // The counter suffix guarantees uniqueness even under a deterministic
+    // `random: () => 0` — two ids minted in the same pinned instant (e.g. two
+    // workflow steps firing in one tick) must never collide.
+    const rand = this.randomHex(13) + (this.idCounter++ % 0x1000000).toString(16).padStart(6, "0");
     return `${ts}7${rand}`;
   }
 

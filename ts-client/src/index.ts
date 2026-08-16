@@ -107,12 +107,19 @@ export type {
   SearchQuery,
   ServerMessage,
   StepJson,
+  StepOutcome,
+  StepRetry,
   TableJson,
   TransactionJson,
   TtlDef,
   ValueExprJson,
   VectorIndexSpec,
   VectorQuery,
+  WorkflowInfo,
+  WorkflowInfoFull,
+  WorkflowSpec,
+  WorkflowStatus,
+  WorkflowStepSpec,
 } from "./protocol.js";
 export type { ClientApi, RtQuery, TableApi } from "./query.js";
 export { createApi, TableQuery } from "./query.js";

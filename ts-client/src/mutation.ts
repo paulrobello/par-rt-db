@@ -1,5 +1,11 @@
 import { RtDbError } from "./errors.js";
-import type { FilterExpr, ScheduleWhen, StepJson, TransactionJson } from "./protocol.js";
+import type {
+  FilterExpr,
+  ScheduleWhen,
+  StepJson,
+  TransactionJson,
+  WorkflowSpec,
+} from "./protocol.js";
 import type { IndexNamesOf, SchemaDefinition, TableNames, WithoutSystemFields } from "./schema.js";
 
 /**
@@ -11,7 +17,8 @@ import type { IndexNamesOf, SchemaDefinition, TableNames, WithoutSystemFields } 
  * can narrow with `'inserted' in r`; the by-query shapes (`{ patched }`/
  * `{ deleted }`, each with `truncated`) narrow via those own fields; the
  * scheduler shapes (`{ scheduleId }`/`{ cancelled }`, FM-28) narrow via their
- * own fields; `null` covers `delete` of an absent doc and any other no-op.
+ * own fields, as do the workflow shapes (`{ workflowId }`/`{ cancelled }`,
+ * FM-29); `null` covers `delete` of an absent doc and any other no-op.
  * Variant order matters for the rust/python decoders (richest first); here it
  * is just documentation since TS narrows structurally.
  */
@@ -22,6 +29,7 @@ export type StepResult =
   | StepDeleteByQueryResult
   | StepScheduleResult
   | StepCancelScheduleResult
+  | StepStartWorkflowResult
   | null;
 
 /** Result of an `upsert` step: the doc id and whether the insert branch ran. */
@@ -54,9 +62,15 @@ export interface StepScheduleResult {
   scheduleId: string;
 }
 
-/** Result of a `cancelSchedule` step: whether a pending job was cancelled. */
+/** Result of a `cancelSchedule` step: whether a pending job was cancelled.
+ * The `cancelWorkflow` step (FM-29) emits the same `{ cancelled }` shape. */
 export interface StepCancelScheduleResult {
   cancelled: boolean;
+}
+
+/** Result of a `startWorkflow` step (FM-29): the id of the created run. */
+export interface StepStartWorkflowResult {
+  workflowId: string;
 }
 
 /**
@@ -65,10 +79,10 @@ export interface StepCancelScheduleResult {
  * The server emits these shapes per the contract: `{ id, inserted }` (upsert),
  * `{ id }` (insert/patch/replace/delete of a present doc), `{ patched, truncated }`
  * (patchByQuery), `{ deleted, truncated }` (deleteByQuery), `{ scheduleId }`
- * (schedule), `{ cancelled }` (cancelSchedule), or `null` (delete of an absent
- * doc / no-op). Anything else is a server contract violation and is
- * surfaced as an `RtDbError` rather than silently passed through — mirroring the
- * rust/python clients' strict untagged decoding.
+ * (schedule), `{ cancelled }` (cancelSchedule, and cancelWorkflow FM-29), or
+ * `null` (delete of an absent doc / no-op). Anything else is a server contract
+ * violation and is surfaced as an `RtDbError` rather than silently passed
+ * through — mirroring the rust/python clients' strict untagged decoding.
  */
 function parseStepResult(value: unknown): StepResult {
   if (value === null) {
@@ -83,6 +97,7 @@ function parseStepResult(value: unknown): StepResult {
       truncated?: unknown;
       scheduleId?: unknown;
       cancelled?: unknown;
+      workflowId?: unknown;
     };
     if (typeof v.id === "string") {
       if (typeof v.inserted === "boolean") {
@@ -99,13 +114,16 @@ function parseStepResult(value: unknown): StepResult {
     if (typeof v.scheduleId === "string") {
       return { scheduleId: v.scheduleId };
     }
+    if (typeof v.workflowId === "string") {
+      return { workflowId: v.workflowId };
+    }
     if (typeof v.cancelled === "boolean") {
       return { cancelled: v.cancelled };
     }
   }
   throw new RtDbError(
     "INTERNAL",
-    "malformed step result: expected {id}, {id, inserted}, {patched, truncated}, {deleted, truncated}, {scheduleId}, {cancelled}, or null",
+    "malformed step result: expected {id}, {id, inserted}, {patched, truncated}, {deleted, truncated}, {scheduleId}, {workflowId}, {cancelled}, or null",
   );
 }
 
@@ -204,6 +222,19 @@ export class TxnBuilder<S extends SchemaDefinition<any> = SchemaDefinition<any>>
   /** Cancels a pending scheduled job by id (FM-28). */
   cancelSchedule(id: string): this {
     this.steps.push({ op: "cancelSchedule", id });
+    return this;
+  }
+
+  /** Starts a durable workflow run from `spec` (FM-29). The run advances on
+   * the server's per-db worker, not in this transaction's turn. */
+  startWorkflow(spec: WorkflowSpec): this {
+    this.steps.push({ op: "startWorkflow", spec });
+    return this;
+  }
+
+  /** Cancels a pending/running workflow by id (FM-29). */
+  cancelWorkflow(id: string): this {
+    this.steps.push({ op: "cancelWorkflow", id });
     return this;
   }
 

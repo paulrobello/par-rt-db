@@ -6,6 +6,10 @@ import type {
   MigrateResultJson,
   QueryJson,
   ScheduleInfo,
+  WorkflowInfo,
+  WorkflowInfoFull,
+  WorkflowSpec,
+  WorkflowStatus,
   ScheduleWhen,
   SchemaHistoryEntry,
   SchemaHistoryEntrySummary,
@@ -846,6 +850,58 @@ export class RtDbAdminClient {
     return (await this.request(
       "POST",
       `/admin/db/${encodeURIComponent(db)}/schedules/${encodeURIComponent(id)}/resume`,
+    )) as { ok: boolean };
+  }
+
+  /** List workflow runs for `db`, newest first (GET /admin/db/{db}/workflows).
+   *  `status` filters by lifecycle; `limit` defaults to 100 and caps at 500. */
+  async adminListWorkflows(
+    db: string,
+    opts: { status?: WorkflowStatus; limit?: number } = {},
+  ): Promise<WorkflowInfo[]> {
+    const params = new URLSearchParams();
+    if (opts.status !== undefined) params.set("status", opts.status);
+    if (opts.limit !== undefined) params.set("limit", String(opts.limit));
+    const qs = params.toString();
+    const body = await this.request(
+      "GET",
+      `/admin/db/${encodeURIComponent(db)}/workflows${qs ? `?${qs}` : ""}`,
+    );
+    return (body as { workflows: WorkflowInfo[] }).workflows;
+  }
+
+  /** Fetch one full run row — info plus the per-step outcome trail
+   *  (GET /admin/db/{db}/workflows/{id}). */
+  async adminGetWorkflow(db: string, id: string): Promise<WorkflowInfoFull> {
+    return (await this.request(
+      "GET",
+      `/admin/db/${encodeURIComponent(db)}/workflows/${encodeURIComponent(id)}`,
+    )) as WorkflowInfoFull;
+  }
+
+  /** Start a workflow run (POST /admin/db/{db}/workflows). The body is the
+   *  bare `WorkflowSpec` (no wrapper); returns the new run's id. */
+  async adminStartWorkflow(db: string, spec: WorkflowSpec): Promise<{ id: string }> {
+    return (await this.request("POST", `/admin/db/${encodeURIComponent(db)}/workflows`, spec)) as {
+      id: string;
+    };
+  }
+
+  /** Cancel a non-terminal run (POST /admin/db/{db}/workflows/{id}/cancel).
+   *  `ok:false` = unknown/terminal run (a no-op, not an error). */
+  async adminCancelWorkflow(db: string, id: string): Promise<{ ok: boolean }> {
+    return (await this.request(
+      "POST",
+      `/admin/db/${encodeURIComponent(db)}/workflows/${encodeURIComponent(id)}/cancel`,
+    )) as { ok: boolean };
+  }
+
+  /** Hard-delete one run row (DELETE /admin/db/{db}/workflows/{id}). Unlike
+   *  cancel, this removes the row entirely — including its outcome trail. */
+  async adminDeleteWorkflow(db: string, id: string): Promise<{ ok: boolean }> {
+    return (await this.request(
+      "DELETE",
+      `/admin/db/${encodeURIComponent(db)}/workflows/${encodeURIComponent(id)}`,
     )) as { ok: boolean };
   }
 

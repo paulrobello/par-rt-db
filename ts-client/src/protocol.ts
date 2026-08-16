@@ -142,6 +142,73 @@ export interface ScheduleInfo {
   firedCount: number;
 }
 
+// ---- Workflow wire types (FM-29) --------------------------------------------
+//
+// Mirror server `protocol`'s workflow family byte-for-byte (camelCase,
+// deny_unknown_fields; optional fields omitted on the wire when absent).
+// See `server/src/protocol.rs` for the authoritative shapes.
+
+/** Per-step retry policy. `maxAttempts` counts TOTAL attempts — the first try
+ * included. Defaults when a step omits `retry` (server `StepRetry::default`):
+ * 3 attempts, 1s initial backoff doubling to a 60s cap. */
+export interface StepRetry {
+  maxAttempts: number;
+  initialRetryMs?: number;
+  maxRetryMs?: number;
+}
+
+/** One workflow step: an ordinary `Transaction` plus policy. The txn may
+ * itself carry `schedule`/`cancelSchedule` steps (FM-28 rules apply). */
+export interface WorkflowStepSpec {
+  txn: TransactionJson;
+  retry?: StepRetry;
+  sleepBeforeMs?: number;
+}
+
+/** A submitted workflow definition. Stored verbatim per run — a run snapshots
+ * its spec, so template edits never drift a live run. */
+export interface WorkflowSpec {
+  name: string;
+  steps: WorkflowStepSpec[];
+}
+
+/** Run lifecycle, snake_case on the wire (mirrors server `WorkflowStatus`). */
+export type WorkflowStatus = "pending" | "running" | "success" | "failed" | "cancelled";
+
+/** Terminal record for one step: completed successfully, or exhausted its
+ * retries (`status: "failed"`). Individual retried attempts are NOT recorded —
+ * the `attempts` count carries them. `error` omitted unless failed. */
+export interface StepOutcome {
+  stepIndex: number;
+  status: "success" | "failed";
+  attempts: number;
+  at: number;
+  error?: string;
+}
+
+/** List/get projection of one run. `sleepUntil`/`lastError`/`startedAt`/
+ * `finishedAt` omitted on the wire when absent. */
+export interface WorkflowInfo {
+  id: string;
+  name: string;
+  status: WorkflowStatus;
+  currentStep: number;
+  stepCount: number;
+  attempts: number;
+  sleepUntil?: number;
+  lastError?: string;
+  createdAt: number;
+  updatedAt: number;
+  startedAt?: number;
+  finishedAt?: number;
+}
+
+/** `GET /admin/db/{db}/workflows/{id}` shape: the info row flattened (server
+ * `#[serde(flatten)]`) plus the per-step outcome trail. */
+export interface WorkflowInfoFull extends WorkflowInfo {
+  stepOutcomes: StepOutcome[];
+}
+
 /** Mirrors server `PaginatedResult` (cursor-based pagination). */
 export interface PaginatedResultJson {
   docs: unknown[];
@@ -171,7 +238,8 @@ export type BatchQueryOutcomeJson =
   | { ok: false; error: { code: string; message: string } };
 
 /** Mirrors server `txn::Step` (tag `op`, camelCase; document steps carry
- * `table`, the scheduler steps — `schedule`/`cancelSchedule` (FM-28) — do not). */
+ * `table`, the control-flow steps — `schedule`/`cancelSchedule` (FM-28) and
+ * `startWorkflow`/`cancelWorkflow` (FM-29) — do not). */
 export type StepJson =
   | { op: "insert"; table: string; doc: Record<string, unknown> }
   | { op: "patch"; table: string; id: string; fields: Record<string, unknown> }
@@ -201,7 +269,9 @@ export type StepJson =
       limit?: number;
     }
   | { op: "schedule"; when: ScheduleWhen; txn: TransactionJson }
-  | { op: "cancelSchedule"; id: string };
+  | { op: "cancelSchedule"; id: string }
+  | { op: "startWorkflow"; spec: WorkflowSpec }
+  | { op: "cancelWorkflow"; id: string };
 
 export interface TransactionJson {
   steps: StepJson[];
@@ -385,6 +455,9 @@ export type ClientMessage =
   | { type: "pauseSchedule"; scheduleId: string; id: string }
   | { type: "resumeSchedule"; scheduleId: string; id: string }
   | { type: "listSchedules"; scheduleId: string }
+  | { type: "startWorkflow"; workflowId: string; spec: WorkflowSpec }
+  | { type: "cancelWorkflow"; workflowId: string; id: string }
+  | { type: "listWorkflows"; workflowId: string; status?: WorkflowStatus }
   | { type: "presence"; room: string; state?: unknown }
   | { type: "presenceState"; room: string; state: unknown; ttlMs?: number }
   | { type: "leavePresence"; room: string }
@@ -402,6 +475,10 @@ export type ServerMessage =
   | { type: "scheduleErr"; scheduleId: string; error: RtDbErrorEnvelope }
   | { type: "scheduleAck"; scheduleId: string; ok: boolean; error?: RtDbErrorEnvelope }
   | { type: "listSchedulesOk"; scheduleId: string; schedules: ScheduleInfo[] }
+  | { type: "startWorkflowOk"; workflowId: string; info: WorkflowInfo }
+  | { type: "startWorkflowErr"; workflowId: string; error: RtDbErrorEnvelope }
+  | { type: "workflowAck"; workflowId: string; ok: boolean; error?: RtDbErrorEnvelope }
+  | { type: "listWorkflowsOk"; workflowId: string; workflows: WorkflowInfo[] }
   | { type: "presenceSnapshot"; room: string; members: PresenceMember[] }
   | { type: "presenceErr"; room: string; error: RtDbErrorEnvelope }
   | { type: "pong" };

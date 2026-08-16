@@ -21,6 +21,7 @@ import type {
   SchemaHistoryEntry,
   SchemaHistoryEntrySummary,
   TransactionJson,
+  WorkflowSpec,
 } from "../src/protocol.js";
 import { defineSchema, defineTable, t } from "../src/schema.js";
 
@@ -1423,5 +1424,76 @@ describe("RtDbAdminClient explain + slow-queries (ENH-019)", () => {
     const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
     const got = await admin.getSlowQueries();
     expect(got.queries[0].params).toEqual(["active"]);
+  });
+});
+
+describe("RtDbAdminClient workflows (FM-29)", () => {
+  const spec: WorkflowSpec = {
+    name: "onboard",
+    steps: [{ txn: { steps: [{ op: "insert", table: "items", doc: {} }] } }],
+  };
+  const info = {
+    id: "wf1",
+    name: "onboard",
+    status: "pending",
+    currentStep: 0,
+    stepCount: 1,
+    attempts: 0,
+    sleepUntil: 5,
+    createdAt: 1,
+    updatedAt: 1,
+  };
+
+  it("adminListWorkflows GETs the db workflows route with optional filters", async () => {
+    // Fresh Response per call — a Response body can be read only once, so a
+    // shared mockResolvedValue instance would fail the second call's json().
+    const fetchMock = vi
+      .fn()
+      .mockImplementation(() => Promise.resolve(jsonResponse({ workflows: [info] })));
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+
+    await expect(admin.adminListWorkflows("kanban")).resolves.toEqual([info]);
+    expect(fetchMock.mock.calls[0][0]).toBe("http://h:8300/admin/db/kanban/workflows");
+
+    await admin.adminListWorkflows("kanban", { status: "running", limit: 5 });
+    expect(fetchMock.mock.calls[1][0]).toBe(
+      "http://h:8300/admin/db/kanban/workflows?status=running&limit=5",
+    );
+  });
+
+  it("adminGetWorkflow GETs the full run row (info + stepOutcomes)", async () => {
+    const full = { ...info, stepOutcomes: [] };
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(full));
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+
+    await expect(admin.adminGetWorkflow("kanban", "wf1")).resolves.toEqual(full);
+    expect(fetchMock.mock.calls[0][0]).toBe("http://h:8300/admin/db/kanban/workflows/wf1");
+  });
+
+  it("adminStartWorkflow POSTs the spec and returns the new id", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ id: "wf2" }));
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+
+    await expect(admin.adminStartWorkflow("kanban", spec)).resolves.toEqual({ id: "wf2" });
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("http://h:8300/admin/db/kanban/workflows");
+    expect(init.method).toBe("POST");
+    expect(JSON.parse(init.body)).toEqual(spec);
+  });
+
+  it("adminCancelWorkflow / adminDeleteWorkflow hit their routes and return ok", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse({ ok: true }))
+      .mockResolvedValueOnce(jsonResponse({ ok: true }));
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+
+    await expect(admin.adminCancelWorkflow("kanban", "wf1")).resolves.toEqual({ ok: true });
+    await expect(admin.adminDeleteWorkflow("kanban", "wf1")).resolves.toEqual({ ok: true });
+    const calls = fetchMock.mock.calls;
+    expect(calls[0][0]).toBe("http://h:8300/admin/db/kanban/workflows/wf1/cancel");
+    expect(calls[0][1].method).toBe("POST");
+    expect(calls[1][0]).toBe("http://h:8300/admin/db/kanban/workflows/wf1");
+    expect(calls[1][1].method).toBe("DELETE");
   });
 });

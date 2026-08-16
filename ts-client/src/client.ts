@@ -12,6 +12,9 @@ import type {
   ScheduleWhen,
   ServerMessage,
   TransactionJson,
+  WorkflowInfo,
+  WorkflowSpec,
+  WorkflowStatus,
 } from "./protocol.js";
 import type { RtQuery } from "./query.js";
 
@@ -92,6 +95,21 @@ interface QueuedSchedule {
   reject: (error: RtDbError) => void;
 }
 
+/** The ClientMessage a workflow call will send once authenticated (FM-29). */
+type WorkflowMsg =
+  | { kind: "start"; spec: WorkflowSpec }
+  | { kind: "cancel"; id: string }
+  | { kind: "list"; status?: WorkflowStatus };
+
+/** A workflow call awaiting its server reply — the FM-29 analogue of
+ * {@link QueuedSchedule}, correlated by a `wf-${n}` id. */
+interface QueuedWorkflow {
+  workflowId: string;
+  msg: WorkflowMsg;
+  resolve: (value: unknown) => void;
+  reject: (error: RtDbError) => void;
+}
+
 const DEFAULT_BACKOFF = { baseMs: 500, maxMs: 15_000 };
 const DEFAULT_HEARTBEAT_MS = 20_000;
 /**
@@ -138,6 +156,8 @@ export class RtDbClient {
   private readonly unsentMutates: QueuedMutate[] = [];
   private readonly pendingSchedules = new Map<string, QueuedSchedule>();
   private readonly unsentSchedules: QueuedSchedule[] = [];
+  private readonly pendingWorkflows = new Map<string, QueuedWorkflow>();
+  private readonly unsentWorkflows: QueuedWorkflow[] = [];
   private readonly authListeners = new Set<(state: AuthState, user: AuthedUser | null) => void>();
   private readonly connListeners = new Set<(state: ConnectionState) => void>();
   /** Per-room presence callbacks. Inbound `presenceSnapshot` fans out to the
@@ -213,6 +233,7 @@ export class RtDbClient {
     this.setAuthState("unauthenticated");
     this.rejectAllMutates("client is closed");
     this.rejectAllSchedules("client is closed");
+    this.rejectAllWorkflows("client is closed");
     // Drop any overlay left by mutations that already resolved but whose
     // reconciling queryUpdate will now never arrive (no notify — the client is
     // closing). The state is reset to the last authoritative value.
@@ -235,6 +256,7 @@ export class RtDbClient {
     // reconnect; `openSocket` tears down the old socket without a reconnect.
     this.rejectAllMutates("connection reset for re-authentication");
     this.rejectAllSchedules("connection reset for re-authentication");
+    this.rejectAllWorkflows("connection reset for re-authentication");
     this.reconnectAttempt = 0;
     this.setAuthState("authenticating");
     this.openSocket();
@@ -385,6 +407,32 @@ export class RtDbClient {
    * `listSchedulesOk`. */
   listSchedules(): Promise<ScheduleInfo[]> {
     return this.queueSchedule<ScheduleInfo[]>({ kind: "list" });
+  }
+
+  /** Starts a durable workflow run from `spec` (FM-29). Resolves with the new
+   * run's `WorkflowInfo` on `startWorkflowOk`; rejects with `RtDbError` on
+   * `startWorkflowErr` (e.g. a spec validation failure). Queues while
+   * unauthenticated exactly like `mutate`. */
+  startWorkflow(spec: WorkflowSpec): Promise<WorkflowInfo> {
+    return this.queueWorkflow<WorkflowInfo>({ kind: "start", spec });
+  }
+
+  /** Cancels a pending/running workflow by id (FM-29). Resolves `true` on
+   * `workflowAck.ok:true`; a bare `ok:false` (unknown/terminal run) resolves
+   * `false` — not an error; `ok:false` carrying an `error` rejects. */
+  cancelWorkflow(id: string): Promise<boolean> {
+    return this.queueWorkflow<boolean>({ kind: "cancel", id });
+  }
+
+  /** Lists workflow runs, newest first, optionally filtered by `status`
+   * (FM-29). Resolves with the `workflows` array on `listWorkflowsOk`. A list
+   * failure arrives typed `startWorkflowErr` (the frame vocabulary has no
+   * `listWorkflowsErr` — the `listSchedules` precedent). */
+  listWorkflows(status?: WorkflowStatus): Promise<WorkflowInfo[]> {
+    return this.queueWorkflow<WorkflowInfo[]>({
+      kind: "list",
+      ...(status === undefined ? {} : { status }),
+    });
   }
 
   // ---- file storage ----------------------------------------------------------
@@ -566,6 +614,48 @@ export class RtDbClient {
         break;
       case "list":
         this.send({ type: "listSchedules", scheduleId: entry.scheduleId });
+        break;
+    }
+  }
+
+  /** Mints a `wf-${n}` correlation id and either dispatches (when authenticated)
+   * or queues the request for the next `authOk`, exactly like `mutate`. */
+  private queueWorkflow<T>(msg: WorkflowMsg): Promise<T> {
+    const workflowId = `wf-${++this.counter}`;
+    return new Promise<T>((resolve, reject) => {
+      if (this.stopped) {
+        reject(new RtDbError("INTERNAL", "client is closed"));
+        return;
+      }
+      const entry: QueuedWorkflow = {
+        workflowId,
+        msg,
+        resolve: resolve as (value: unknown) => void,
+        reject,
+      };
+      if (this.authState === "authenticated" && this.socket) {
+        this.dispatchWorkflow(entry);
+      } else {
+        this.unsentWorkflows.push(entry);
+      }
+    });
+  }
+
+  private dispatchWorkflow(entry: QueuedWorkflow): void {
+    this.pendingWorkflows.set(entry.workflowId, entry);
+    switch (entry.msg.kind) {
+      case "start":
+        this.send({ type: "startWorkflow", workflowId: entry.workflowId, spec: entry.msg.spec });
+        break;
+      case "cancel":
+        this.send({ type: "cancelWorkflow", workflowId: entry.workflowId, id: entry.msg.id });
+        break;
+      case "list":
+        this.send({
+          type: "listWorkflows",
+          workflowId: entry.workflowId,
+          ...(entry.msg.status === undefined ? {} : { status: entry.msg.status }),
+        });
         break;
     }
   }
@@ -798,6 +888,40 @@ export class RtDbClient {
         pending?.resolve(msg.schedules);
         break;
       }
+      case "startWorkflowOk": {
+        const pending = this.pendingWorkflows.get(msg.workflowId);
+        this.pendingWorkflows.delete(msg.workflowId);
+        pending?.resolve(msg.info);
+        break;
+      }
+      case "startWorkflowErr": {
+        // Also carries ListWorkflows failures: the server types both replies
+        // with this frame (no listWorkflowsErr exists), so a pending list
+        // entry under the same correlation id rejects here too.
+        const pending = this.pendingWorkflows.get(msg.workflowId);
+        this.pendingWorkflows.delete(msg.workflowId);
+        pending?.reject(RtDbError.fromEnvelope(msg.error));
+        break;
+      }
+      case "workflowAck": {
+        const pending = this.pendingWorkflows.get(msg.workflowId);
+        this.pendingWorkflows.delete(msg.workflowId);
+        if (msg.ok) {
+          pending?.resolve(true);
+        } else if (msg.error) {
+          pending?.reject(RtDbError.fromEnvelope(msg.error));
+        } else {
+          // Bare ok:false = unknown/terminal run: a no-op, not a failure.
+          pending?.resolve(false);
+        }
+        break;
+      }
+      case "listWorkflowsOk": {
+        const pending = this.pendingWorkflows.get(msg.workflowId);
+        this.pendingWorkflows.delete(msg.workflowId);
+        pending?.resolve(msg.workflows);
+        break;
+      }
       case "presenceSnapshot": {
         // Per-room fan-out, mirroring how `queryUpdate` routes to per-`queryId`
         // handlers via `subsById`.
@@ -838,6 +962,10 @@ export class RtDbClient {
     for (const entry of queuedSchedules) {
       this.dispatchSchedule(entry);
     }
+    const queuedWorkflows = this.unsentWorkflows.splice(0);
+    for (const entry of queuedWorkflows) {
+      this.dispatchWorkflow(entry);
+    }
   }
 
   private handleClose(code: number): void {
@@ -845,8 +973,9 @@ export class RtDbClient {
     this.clearHeartbeat();
     // In-flight (already-sent) mutations are never auto-resent — reject them.
     this.rejectPendingMutates("connection closed before the mutation was acknowledged");
-    // Same for in-flight schedule requests: they are never auto-resent.
+    // Same for in-flight schedule and workflow requests: they are never auto-resent.
     this.rejectPendingSchedules("connection closed before the schedule was acknowledged");
+    this.rejectPendingWorkflows("connection closed before the workflow call was acknowledged");
     if (code === 4401) {
       this.setAuthState("unauthenticated");
       this.setConnState("idle"); // an explicit connect() (e.g. after re-login) may revive
@@ -906,6 +1035,30 @@ export class RtDbClient {
     }
     const error = new RtDbError("INTERNAL", reason);
     for (const entry of this.unsentSchedules.splice(0)) {
+      entry.reject(error);
+    }
+  }
+
+  /** Rejects only in-flight (sent, unacked) workflow requests; never-sent ones stay queued. */
+  private rejectPendingWorkflows(reason: string): void {
+    if (this.pendingWorkflows.size === 0) {
+      return;
+    }
+    const error = new RtDbError("INTERNAL", reason);
+    for (const entry of this.pendingWorkflows.values()) {
+      entry.reject(error);
+    }
+    this.pendingWorkflows.clear();
+  }
+
+  /** Rejects every workflow request — in-flight and never-sent. Used on terminal teardown. */
+  private rejectAllWorkflows(reason: string): void {
+    this.rejectPendingWorkflows(reason);
+    if (this.unsentWorkflows.length === 0) {
+      return;
+    }
+    const error = new RtDbError("INTERNAL", reason);
+    for (const entry of this.unsentWorkflows.splice(0)) {
       entry.reject(error);
     }
   }

@@ -1161,6 +1161,248 @@ describe("InMemoryRtDbClient — schedules", () => {
   });
 });
 
+describe("InMemoryRtDbClient — workflows (FM-29)", () => {
+  const BASE = 1_700_000_000_000;
+  const insertTxn = (name: string) =>
+    mutation().insert("items", { name, status: "todo", order: 1 }).build();
+  /** A step that fails while a `name: "a"` row exists (expectAbsent on the
+   * by_name index) — deleting the row makes the next attempt succeed, so a
+   * test can drive deterministic fail-then-succeed retries. */
+  const failingWhilePresent = { txn: mutation().expectAbsent("items", "by_name", ["a"]).build() };
+
+  it("startWorkflow returns a pending info row; a no-sleep spec completes in one tick", async () => {
+    const { c, setNow } = newClockClient();
+    setNow(BASE);
+    const info = await c.startWorkflow({
+      name: "two-step",
+      steps: [{ txn: insertTxn("one") }, { txn: insertTxn("two") }],
+    });
+    expect(info).toMatchObject({
+      name: "two-step",
+      status: "pending",
+      currentStep: 0,
+      stepCount: 2,
+      attempts: 0,
+    });
+    expect(info.sleepUntil).toBe(BASE);
+    expect("startedAt" in info).toBe(false);
+    expect("finishedAt" in info).toBe(false);
+
+    c.tick();
+    const docs = await c.query(api.items.query().collect());
+    expect(docs.map((d) => (d as { name: string }).name).sort()).toEqual(["one", "two"]);
+    const after = (await c.listWorkflows()).find((w) => w.id === info.id);
+    expect(after?.status).toBe("success");
+    // Server `finalize_success` does NOT advance current_step — it stays at
+    // the 0-based index of the last executed step (1 for a 2-step run).
+    expect(after?.currentStep).toBe(1);
+    expect(after?.finishedAt).toBe(BASE);
+  });
+
+  it("sleepBeforeMs gates the next step across ticks", async () => {
+    const { c, setNow } = newClockClient();
+    setNow(BASE);
+    const { id } = await c.startWorkflow({
+      name: "gated",
+      steps: [{ txn: insertTxn("one") }, { txn: insertTxn("two"), sleepBeforeMs: 5000 }],
+    });
+
+    c.tick(); // step 0 advances; step 1 gated until BASE + 5000
+    let names = (await c.query(api.items.query().collect())).map(
+      (d) => (d as { name: string }).name,
+    );
+    expect(names).toEqual(["one"]);
+    const gated = (await c.listWorkflows()).find((w) => w.id === id);
+    expect(gated).toMatchObject({ status: "pending", currentStep: 1 });
+    expect(gated?.sleepUntil).toBe(BASE + 5000);
+
+    setNow(BASE + 4999);
+    c.tick(); // still before the gate
+    names = (await c.query(api.items.query().collect())).map((d) => (d as { name: string }).name);
+    expect(names).toEqual(["one"]);
+
+    setNow(BASE + 5000);
+    c.tick();
+    names = (await c.query(api.items.query().collect())).map((d) => (d as { name: string }).name);
+    expect(names.sort()).toEqual(["one", "two"]);
+    expect((await c.listWorkflows()).find((w) => w.id === id)?.status).toBe("success");
+  });
+
+  it("retry policy re-fires a failing step on later ticks with server backoff, then succeeds", async () => {
+    const { c, setNow } = newClockClient();
+    setNow(BASE);
+    const blocker = (await c.mutate(insertTxn("a")))[0] as { id: string }; // blocks expectAbsent
+    const { id } = await c.startWorkflow({
+      name: "flaky",
+      steps: [
+        {
+          ...failingWhilePresent,
+          retry: { maxAttempts: 3, initialRetryMs: 1000, maxRetryMs: 60_000 },
+        },
+      ],
+    });
+
+    c.tick(); // attempt 1 fails -> backoff 1000 * 2^0
+    let info = (await c.listWorkflows()).find((w) => w.id === id);
+    expect(info).toMatchObject({ status: "pending", currentStep: 0, attempts: 1 });
+    expect(info?.sleepUntil).toBe(BASE + 1000);
+
+    setNow(BASE + 1000);
+    c.tick(); // attempt 2 also fails (row still present) -> backoff 1000 * 2^1
+    info = (await c.listWorkflows()).find((w) => w.id === id);
+    expect(info).toMatchObject({ status: "pending", attempts: 2 });
+    expect(info?.sleepUntil).toBe(BASE + 1000 + 2000);
+
+    // Clear the blocker: attempt 3 (final allowed) now succeeds.
+    setNow(BASE + 3000);
+    await c.mutate(mutation().delete("items", blocker.id).build());
+    c.tick();
+    const full = await c.getWorkflow(id);
+    expect(full.status).toBe("success");
+    expect(full.attempts).toBe(0); // reset on finalize (server parity)
+    expect(full.stepOutcomes).toEqual([
+      { stepIndex: 0, status: "success", attempts: 3, at: BASE + 3000 },
+    ]);
+  });
+
+  it("exhausted attempts mark the run failed with the outcome trail and stop advancing", async () => {
+    const { c, setNow } = newClockClient();
+    setNow(BASE);
+    await c.mutate(insertTxn("a")); // blocker never clears
+    const { id } = await c.startWorkflow({
+      name: "doomed",
+      steps: [
+        { txn: insertTxn("never") },
+        {
+          ...failingWhilePresent,
+          retry: { maxAttempts: 2, initialRetryMs: 1000, maxRetryMs: 60_000 },
+        },
+      ],
+    });
+
+    c.tick(); // step 0 succeeds; step 1 attempt 1 fails
+    let info = (await c.listWorkflows()).find((w) => w.id === id);
+    expect(info).toMatchObject({ status: "pending", currentStep: 1, attempts: 1 });
+
+    setNow(BASE + 1000);
+    c.tick(); // attempt 2 = maxAttempts -> failed
+    info = (await c.listWorkflows()).find((w) => w.id === id);
+    expect(info?.status).toBe("failed");
+    expect(typeof info?.lastError).toBe("string");
+    expect(info?.finishedAt).toBe(BASE + 1000);
+
+    const full = await c.getWorkflow(id);
+    expect(full.stepOutcomes).toHaveLength(2);
+    expect(full.stepOutcomes[0]).toMatchObject({ stepIndex: 0, status: "success", attempts: 1 });
+    expect(full.stepOutcomes[1]).toMatchObject({ stepIndex: 1, status: "failed", attempts: 2 });
+    expect(typeof full.stepOutcomes[1].error).toBe("string");
+
+    // A failed run is terminal: later ticks change nothing.
+    setNow(BASE + 10_000);
+    c.tick();
+    expect((await c.getWorkflow(id)).status).toBe("failed");
+    const names = (await c.query(api.items.query().collect())).map(
+      (d) => (d as { name: string }).name,
+    );
+    expect(names).toEqual(["a", "never"]);
+  });
+
+  it("cancelWorkflow flips a pending run to cancelled and stops advancement", async () => {
+    const { c, setNow } = newClockClient();
+    setNow(BASE);
+    const { id } = await c.startWorkflow({
+      name: "cancelme",
+      steps: [{ txn: insertTxn("one") }, { txn: insertTxn("two"), sleepBeforeMs: 5000 }],
+    });
+
+    c.tick(); // step 0 done; step 1 gated
+    expect(await c.cancelWorkflow(id)).toBe(true);
+    expect((await c.listWorkflows()).find((w) => w.id === id)).toMatchObject({
+      status: "cancelled",
+      finishedAt: BASE,
+    });
+
+    setNow(BASE + 6000);
+    c.tick(); // cancelled runs never advance
+    const names = (await c.query(api.items.query().collect())).map(
+      (d) => (d as { name: string }).name,
+    );
+    expect(names).toEqual(["one"]);
+    // Terminal: a second cancel is ok:false (a no-op, not an error).
+    expect(await c.cancelWorkflow(id)).toBe(false);
+    expect(await c.cancelWorkflow("nope")).toBe(false);
+  });
+
+  it("listWorkflows filters by status, newest first", async () => {
+    const { c, setNow } = newClockClient();
+    setNow(BASE);
+    const { id: first } = await c.startWorkflow({ name: "a", steps: [{ txn: insertTxn("one") }] });
+    setNow(BASE + 10);
+    const { id: second } = await c.startWorkflow({ name: "b", steps: [{ txn: insertTxn("two") }] });
+    setNow(BASE + 20);
+    const { id: third } = await c.startWorkflow({
+      name: "c",
+      steps: [{ txn: insertTxn("three") }],
+    });
+    await c.cancelWorkflow(third);
+
+    const all = await c.listWorkflows();
+    expect(all.map((w) => w.id)).toEqual([third, second, first]); // createdAt DESC
+    expect((await c.listWorkflows("cancelled")).map((w) => w.id)).toEqual([third]);
+    expect((await c.listWorkflows("pending")).map((w) => w.id)).toEqual([second, first]);
+  });
+
+  it("startWorkflow / cancelWorkflow txn steps return wire results and drive tick", async () => {
+    const { c, setNow } = newClockClient();
+    setNow(BASE);
+    const spec = { name: "from-step", steps: [{ txn: insertTxn("one") }] };
+    const [started] = await c.mutate(mutation().startWorkflow(spec).build());
+    expect(typeof started).toBe("object");
+    expect("workflowId" in (started as object)).toBe(true);
+    expect(await c.listWorkflows()).toHaveLength(1);
+
+    // A cancel step for a live run cancels; for a missing run returns false.
+    const results = await c.mutate(
+      mutation()
+        .cancelWorkflow((started as { workflowId: string }).workflowId)
+        .cancelWorkflow("nope")
+        .build(),
+    );
+    expect(results).toEqual([{ cancelled: true }, { cancelled: false }]);
+    expect((await c.listWorkflows())[0].status).toBe("cancelled");
+
+    // Nothing fires on a later tick.
+    setNow(BASE + 5000);
+    c.tick();
+    expect(await c.query(api.items.query().collect())).toEqual([]);
+  });
+
+  it("a failed txn rolls back a startWorkflow step's run row", async () => {
+    const { c, setNow } = newClockClient();
+    setNow(BASE);
+    await expect(
+      c.mutate(
+        mutation()
+          .startWorkflow({ name: "phantom", steps: [{ txn: insertTxn("one") }] })
+          .delete("items", "nonexistent") // NOT_FOUND -> rollback the run row
+          .build(),
+      ),
+    ).rejects.toMatchObject({ name: "RtDbError", code: "NOT_FOUND" });
+    expect(await c.listWorkflows()).toEqual([]);
+    setNow(BASE + 5000);
+    c.tick();
+    expect(await c.query(api.items.query().collect())).toEqual([]);
+  });
+
+  it("rejects an empty spec like the server's validate_spec", async () => {
+    const { c } = newClockClient();
+    await expect(c.startWorkflow({ name: "empty", steps: [] })).rejects.toMatchObject({
+      name: "RtDbError",
+      code: "BAD_REQUEST",
+    });
+  });
+});
+
 describe("evalFilterExpr + validateFilter", () => {
   const fields = new Set(["name", "age", "active", "score", "tags"]);
 

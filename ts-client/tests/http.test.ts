@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { RtDbError } from "../src/errors.js";
 import { RtDbHttpClient } from "../src/http.js";
 import { mutation } from "../src/mutation.js";
+import type { WorkflowSpec } from "../src/protocol.js";
 import type { RtQuery } from "../src/query.js";
 
 function jsonResponse(body: unknown, status = 200): Response {
@@ -413,5 +414,78 @@ describe("RtDbHttpClient", () => {
     });
     await c2.getSignedUrl("f1");
     expect(noTtl.mock.calls[0][0]).toBe("http://h:8300/api/storage/kanban/f1/signed-url");
+  });
+});
+
+describe("RtDbHttpClient workflows (FM-29)", () => {
+  const spec: WorkflowSpec = {
+    name: "onboard",
+    steps: [{ txn: { steps: [{ op: "insert", table: "items", doc: {} }] } }],
+  };
+  const info = {
+    id: "wf1",
+    name: "onboard",
+    status: "pending",
+    currentStep: 0,
+    stepCount: 1,
+    attempts: 0,
+    sleepUntil: 5,
+    createdAt: 1,
+    updatedAt: 1,
+  };
+
+  it("posts startWorkflow to /api/workflows and returns {id}", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ id: "wf1" }));
+    const client = new RtDbHttpClient({
+      url: "http://h:8300",
+      db: "kanban",
+      token: "tok",
+      fetch: fetchMock,
+    });
+
+    await expect(client.startWorkflow(spec)).resolves.toEqual({ id: "wf1" });
+    const [calledUrl, init] = fetchMock.mock.calls[0];
+    expect(calledUrl).toBe("http://h:8300/api/workflows");
+    expect(init.method).toBe("POST");
+    expect(init.headers.Authorization).toBe("Bearer tok");
+    expect(JSON.parse(init.body)).toEqual({ db: "kanban", spec });
+  });
+
+  it("posts listWorkflows to /api/workflows/list with an optional status filter", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse({ workflows: [info] }))
+      .mockResolvedValueOnce(jsonResponse({ workflows: [] }));
+    const client = new RtDbHttpClient({
+      url: "http://h:8300",
+      db: "kanban",
+      token: "tok",
+      fetch: fetchMock,
+    });
+
+    await expect(client.listWorkflows()).resolves.toEqual([info]);
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({ db: "kanban" });
+
+    await expect(client.listWorkflows("failed")).resolves.toEqual([]);
+    expect(fetchMock.mock.calls[1][0]).toBe("http://h:8300/api/workflows/list");
+    expect(JSON.parse(fetchMock.mock.calls[1][1].body)).toEqual({
+      db: "kanban",
+      status: "failed",
+    });
+  });
+
+  it("posts cancelWorkflow to the per-id route and returns cancelled", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ cancelled: true }));
+    const client = new RtDbHttpClient({
+      url: "http://h:8300",
+      db: "kanban",
+      token: "tok",
+      fetch: fetchMock,
+    });
+
+    await expect(client.cancelWorkflow("wf1")).resolves.toBe(true);
+    const [calledUrl, init] = fetchMock.mock.calls[0];
+    expect(calledUrl).toBe("http://h:8300/api/workflows/wf1/cancel");
+    expect(JSON.parse(init.body)).toEqual({ db: "kanban" });
   });
 });
