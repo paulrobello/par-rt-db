@@ -7,14 +7,16 @@
 //! `RTDB_URL` / `RTDB_DB` / `RTDB_TOKEN` / `RTDB_ADMIN_KEY` env vars.
 //!
 //! Admin subcommands (`list-dbs`, `create-db`, `clone-db`, `push-schema`,
-//! `mint-token`, `revoke-token`, `sessions list|revoke`, `merge-users`) send
-//! the instance admin key as the bearer. Data-plane subcommands (`query`,
-//! `mutate`) send a machine token scoped to `--db`.
+//! `mint-token`, `revoke-token`, `sessions list|revoke`, `merge-users`,
+//! `workflows list|get|start|cancel`) send the instance admin key as the
+//! bearer. Data-plane subcommands (`query`, `mutate`) send a machine token
+//! scoped to `--db`.
 
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
 use par_rt_db_client::{
     MigrateRequestOwned, Query, RtDbAdminClient, RtDbError, RtDbHttpClient, SchemaDef, Transaction,
+    WorkflowListOptions, WorkflowSpec, WorkflowStatus,
 };
 use std::path::PathBuf;
 
@@ -130,6 +132,44 @@ enum Command {
         #[arg(long)]
         limit: Option<u32>,
     },
+    /// Manage durable workflow runs in `--db`. (admin)
+    Workflows {
+        #[command(subcommand)]
+        command: WorkflowsCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum WorkflowsCommand {
+    /// List workflow runs in `--db`, newest first.
+    List {
+        /// Filter by run status: pending|running|success|failed|cancelled.
+        #[arg(long)]
+        status: Option<String>,
+        /// Cap the result count (server default 100, clamped to [1, 500]).
+        #[arg(long)]
+        limit: Option<u32>,
+    },
+    /// Print one workflow run: the info row plus the per-step outcome trail.
+    Get {
+        /// Workflow run id to fetch.
+        #[arg(long)]
+        id: String,
+    },
+    /// Start a new workflow run from a WorkflowSpec JSON file.
+    Start {
+        /// Path to a JSON file containing a `WorkflowSpec` (wire shape:
+        /// `{"name": .., "steps": [{"txn": ..}]}`). An optional `@` prefix
+        /// matches the `query`/`mutate` file convention.
+        #[arg(long)]
+        file: String,
+    },
+    /// Cancel a workflow run.
+    Cancel {
+        /// Workflow run id to cancel.
+        #[arg(long)]
+        id: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -185,6 +225,7 @@ async fn dispatch(cli: &Cli) -> Result<()> {
         Command::Migrate { file, dry_run } => run_migrate(cli, file, *dry_run).await,
         Command::Explain { query } => run_explain(cli, query).await,
         Command::SlowQueries { db, limit } => run_slow_queries(cli, db, *limit).await,
+        Command::Workflows { command } => run_workflows(cli, command).await,
     }
 }
 
@@ -354,6 +395,53 @@ async fn run_slow_queries(cli: &Cli, db: &Option<String>, limit: Option<u32>) ->
     Ok(())
 }
 
+async fn run_workflows(cli: &Cli, command: &WorkflowsCommand) -> Result<()> {
+    match command {
+        WorkflowsCommand::List { status, limit } => {
+            let db = require_db(cli)?;
+            // Validate before the credential gate so a bad value surfaces its
+            // specific error (and is testable) without credentials.
+            let status = status.as_deref().map(parse_workflow_status).transpose()?;
+            let c = admin_client(cli)?;
+            let opts = WorkflowListOptions {
+                status,
+                limit: *limit,
+            };
+            let rows = c.list_workflows(&db, Some(&opts)).await.map_err(map_err)?;
+            println!("{}", serde_json::to_string_pretty(&rows)?);
+        }
+        WorkflowsCommand::Get { id } => {
+            let db = require_db(cli)?;
+            let c = admin_client(cli)?;
+            let full = c.get_workflow(&db, id).await.map_err(map_err)?;
+            println!("{}", serde_json::to_string_pretty(&full)?);
+        }
+        WorkflowsCommand::Start { file } => {
+            let db = require_db(cli)?;
+            let json = read_spec_file(file)?;
+            let spec: WorkflowSpec =
+                serde_json::from_str(&json).context("parsing WorkflowSpec JSON")?;
+            let c = admin_client(cli)?;
+            let id = c.start_workflow(&db, &spec).await.map_err(map_err)?;
+            let out = serde_json::json!({ "id": id });
+            println!("{}", serde_json::to_string_pretty(&out)?);
+        }
+        WorkflowsCommand::Cancel { id } => {
+            let db = require_db(cli)?;
+            let c = admin_client(cli)?;
+            let ok = c.cancel_workflow(&db, id).await.map_err(map_err)?;
+            let out = serde_json::json!({ "ok": ok });
+            println!("{}", serde_json::to_string_pretty(&out)?);
+            if !ok {
+                // ok:false = unknown or already-terminal run — a legitimate
+                // no-op on the server, not an error.
+                eprintln!("no-op: workflow run {id} is unknown or already terminal");
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Build a client for an admin subcommand (ARC-121: admin control plane now
 /// has its own `RtDbAdminClient` type). The admin key is the sole bearer.
 fn admin_client(cli: &Cli) -> Result<RtDbAdminClient> {
@@ -395,6 +483,14 @@ fn read_json_arg(arg: &str) -> Result<String> {
     }
 }
 
+/// Read a `--file` argument (`workflows start`): a filesystem path, optionally
+/// `@`-prefixed to match the `query`/`mutate` `@file` convention. Unlike
+/// [`read_json_arg`] a bare value is always a path, never inline JSON.
+fn read_spec_file(arg: &str) -> Result<String> {
+    let path = arg.strip_prefix('@').unwrap_or(arg);
+    std::fs::read_to_string(path).with_context(|| format!("reading {path}"))
+}
+
 /// Surface an `RtDbError` as `<CODE>: <message>`. `RtDbError`'s own Display
 /// (via thiserror) is just the message, so the wire code is recovered here by
 /// serializing `ErrorCode` (it carries `#[serde(rename_all = "SCREAMING_SNAKE_CASE")]`).
@@ -424,6 +520,16 @@ fn resolve_revoke_target(token_hash: Option<&str>, user: Option<&str>) -> Result
         (Some(_), Some(_)) => Err(anyhow!("--token-hash and --user are mutually exclusive")),
         (None, None) => Err(anyhow!("sessions revoke requires --token-hash or --user")),
     }
+}
+
+/// Validate `workflows list --status` against the five snake_case wire values.
+/// Delegates to `WorkflowStatus::from_str` (the closed wire domain) so the CLI
+/// can never send a status string the server doesn't define. Pure validation,
+/// extracted from the handler so it is unit-testable without a server.
+fn parse_workflow_status(raw: &str) -> Result<WorkflowStatus> {
+    raw.parse::<WorkflowStatus>().map_err(|_| {
+        anyhow!("invalid --status '{raw}' — expected pending|running|success|failed|cancelled")
+    })
 }
 
 #[cfg(test)]
@@ -927,5 +1033,286 @@ mod tests {
     fn resolve_revoke_target_neither_is_error() {
         let err = resolve_revoke_target(None, None).unwrap_err().to_string();
         assert!(err.contains("requires"), "got: {err}");
+    }
+
+    // ── workflows (FM-29) ─────────────────────────────────────────────────
+
+    #[test]
+    fn parses_workflows_subcommands() {
+        // `workflows list` parses bare and with both filters.
+        let cli = Cli::try_parse_from([
+            "rtdb",
+            "--url",
+            "http://x",
+            "--db",
+            "d",
+            "--admin-key",
+            "k",
+            "workflows",
+            "list",
+        ])
+        .unwrap();
+        let Command::Workflows { command } = cli.command else {
+            panic!("expected Workflows");
+        };
+        let WorkflowsCommand::List { status, limit } = command else {
+            panic!("expected WorkflowsCommand::List");
+        };
+        assert_eq!(status, None);
+        assert_eq!(limit, None);
+
+        let cli = Cli::try_parse_from([
+            "rtdb",
+            "--url",
+            "http://x",
+            "--db",
+            "d",
+            "--admin-key",
+            "k",
+            "workflows",
+            "list",
+            "--status",
+            "running",
+            "--limit",
+            "25",
+        ])
+        .unwrap();
+        let Command::Workflows { command } = cli.command else {
+            panic!("expected Workflows");
+        };
+        let WorkflowsCommand::List { status, limit } = command else {
+            panic!("expected WorkflowsCommand::List");
+        };
+        assert_eq!(status.as_deref(), Some("running"));
+        assert_eq!(limit, Some(25));
+
+        // `workflows get --id`.
+        let cli = Cli::try_parse_from([
+            "rtdb",
+            "--url",
+            "http://x",
+            "--db",
+            "d",
+            "--admin-key",
+            "k",
+            "workflows",
+            "get",
+            "--id",
+            "run1",
+        ])
+        .unwrap();
+        let Command::Workflows { command } = cli.command else {
+            panic!("expected Workflows");
+        };
+        let WorkflowsCommand::Get { id } = command else {
+            panic!("expected WorkflowsCommand::Get");
+        };
+        assert_eq!(id, "run1");
+
+        // `workflows start --file` parses a bare path and an `@`-prefixed one.
+        for arg in ["spec.json", "@spec.json"] {
+            let cli = Cli::try_parse_from([
+                "rtdb",
+                "--url",
+                "http://x",
+                "--db",
+                "d",
+                "--admin-key",
+                "k",
+                "workflows",
+                "start",
+                "--file",
+                arg,
+            ])
+            .unwrap();
+            let Command::Workflows { command } = cli.command else {
+                panic!("expected Workflows");
+            };
+            let WorkflowsCommand::Start { file } = command else {
+                panic!("expected WorkflowsCommand::Start");
+            };
+            assert_eq!(file, arg);
+        }
+
+        // `workflows cancel --id`.
+        let cli = Cli::try_parse_from([
+            "rtdb",
+            "--url",
+            "http://x",
+            "--db",
+            "d",
+            "--admin-key",
+            "k",
+            "workflows",
+            "cancel",
+            "--id",
+            "run1",
+        ])
+        .unwrap();
+        let Command::Workflows { command } = cli.command else {
+            panic!("expected Workflows");
+        };
+        let WorkflowsCommand::Cancel { id } = command else {
+            panic!("expected WorkflowsCommand::Cancel");
+        };
+        assert_eq!(id, "run1");
+    }
+
+    #[test]
+    fn parse_workflow_status_accepts_the_five_wire_values() {
+        for (raw, expected) in [
+            ("pending", WorkflowStatus::Pending),
+            ("running", WorkflowStatus::Running),
+            ("success", WorkflowStatus::Success),
+            ("failed", WorkflowStatus::Failed),
+            ("cancelled", WorkflowStatus::Cancelled),
+        ] {
+            assert_eq!(parse_workflow_status(raw).unwrap(), expected, "raw={raw}");
+        }
+    }
+
+    #[test]
+    fn parse_workflow_status_rejects_non_wire_values() {
+        // The wire domain is closed and snake_case-only: uppercase and the
+        // one-l spelling of cancelled are rejected alongside garbage.
+        for raw in ["bogus", "RUNNING", "canceled", ""] {
+            let err = parse_workflow_status(raw).unwrap_err().to_string();
+            assert!(err.contains("invalid --status"), "raw={raw} got: {err}");
+        }
+    }
+
+    #[test]
+    fn read_spec_file_reads_bare_and_at_prefixed_paths() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let path =
+            std::env::temp_dir().join(format!("rtdb-cli-spec-{}-{nonce}.json", std::process::id()));
+        let body = r#"{"name":"n","steps":[]}"#;
+        std::fs::write(&path, body).unwrap();
+        assert_eq!(read_spec_file(&path.display().to_string()).unwrap(), body);
+        assert_eq!(
+            read_spec_file(&format!("@{}", path.display())).unwrap(),
+            body
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn read_spec_file_missing_path_errors() {
+        assert!(read_spec_file("/nonexistent/rtdb-cli-spec-does-not-exist.json").is_err());
+        assert!(read_spec_file("@/nonexistent/rtdb-cli-spec-does-not-exist.json").is_err());
+    }
+
+    #[tokio::test]
+    async fn dispatch_workflows_list_validates_status_before_credentials() {
+        // --db supplied, no admin key: a bad --status surfaces its specific
+        // error (validation fires before the credential gate, no network); a
+        // good one proceeds to the credential gate and errors there instead.
+        let bad = Cli {
+            url: "http://x".into(),
+            db: Some("d".into()),
+            token: None,
+            admin_key: None,
+            command: Command::Workflows {
+                command: WorkflowsCommand::List {
+                    status: Some("bogus".into()),
+                    limit: None,
+                },
+            },
+        };
+        let err = dispatch(&bad).await.unwrap_err().to_string();
+        assert!(err.contains("invalid --status"), "got: {err}");
+
+        let good = Cli {
+            url: "http://x".into(),
+            db: Some("d".into()),
+            token: None,
+            admin_key: None,
+            command: Command::Workflows {
+                command: WorkflowsCommand::List {
+                    status: Some("running".into()),
+                    limit: None,
+                },
+            },
+        };
+        let err = dispatch(&good).await.unwrap_err().to_string();
+        assert!(
+            err.contains("--admin-key"),
+            "expected the credential-gate error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_workflows_subcommands_require_db() {
+        // Every workflows subcommand needs --db before it reaches the admin
+        // gate; all error before any network when --db is absent.
+        for command in [
+            WorkflowsCommand::List {
+                status: None,
+                limit: None,
+            },
+            WorkflowsCommand::Get { id: "run1".into() },
+            WorkflowsCommand::Start {
+                file: "spec.json".into(),
+            },
+            WorkflowsCommand::Cancel { id: "run1".into() },
+        ] {
+            let err = dispatch(&cli_with_command(Command::Workflows { command }))
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("--db"), "got: {err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_workflows_start_parses_spec_before_credentials() {
+        // The spec file is read + parsed before the credential gate: an
+        // invalid file surfaces its parse error without a key; a valid one
+        // proceeds to the credential gate and errors there instead.
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let bad_path = std::env::temp_dir().join(format!(
+            "rtdb-cli-wfspec-bad-{}-{nonce}.json",
+            std::process::id()
+        ));
+        let good_path = std::env::temp_dir().join(format!(
+            "rtdb-cli-wfspec-good-{}-{nonce}.json",
+            std::process::id()
+        ));
+        std::fs::write(&bad_path, r#"{"nope":true}"#).unwrap();
+        std::fs::write(&good_path, r#"{"name":"n","steps":[]}"#).unwrap();
+
+        let mk = |file: String| Cli {
+            url: "http://x".into(),
+            db: Some("d".into()),
+            token: None,
+            admin_key: None,
+            command: Command::Workflows {
+                command: WorkflowsCommand::Start { file },
+            },
+        };
+
+        let err = dispatch(&mk(bad_path.display().to_string()))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("parsing WorkflowSpec JSON"), "got: {err}");
+
+        let err = dispatch(&mk(good_path.display().to_string()))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("--admin-key"),
+            "expected the credential-gate error, got: {err}"
+        );
+
+        std::fs::remove_file(&bad_path).ok();
+        std::fs::remove_file(&good_path).ok();
     }
 }
