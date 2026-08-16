@@ -100,6 +100,7 @@ export class TableDefinition<
     readonly collaboratorsFieldName?: string,
     readonly ttlDef?: TtlDef,
     readonly authorizeDef?: FilterExpr,
+    readonly defaultsMap?: Record<string, unknown>,
   ) {}
 
   index<Name extends string>(
@@ -113,6 +114,7 @@ export class TableDefinition<
       this.collaboratorsFieldName,
       this.ttlDef,
       this.authorizeDef,
+      this.defaultsMap,
     );
   }
 
@@ -149,6 +151,7 @@ export class TableDefinition<
       this.collaboratorsFieldName,
       this.ttlDef,
       this.authorizeDef,
+      this.defaultsMap,
     );
   }
 
@@ -173,6 +176,7 @@ export class TableDefinition<
       this.collaboratorsFieldName,
       this.ttlDef,
       this.authorizeDef,
+      this.defaultsMap,
     );
   }
 
@@ -209,6 +213,7 @@ export class TableDefinition<
       this.collaboratorsFieldName,
       this.ttlDef,
       this.authorizeDef,
+      this.defaultsMap,
     );
   }
 
@@ -223,6 +228,7 @@ export class TableDefinition<
       this.collaboratorsFieldName,
       this.ttlDef,
       this.authorizeDef,
+      this.defaultsMap,
     );
   }
 
@@ -238,6 +244,7 @@ export class TableDefinition<
       field,
       this.ttlDef,
       this.authorizeDef,
+      this.defaultsMap,
     );
   }
 
@@ -258,6 +265,7 @@ export class TableDefinition<
       this.collaboratorsFieldName,
       ttlDef,
       this.authorizeDef,
+      this.defaultsMap,
     );
   }
 
@@ -276,6 +284,27 @@ export class TableDefinition<
       this.collaboratorsFieldName,
       this.ttlDef,
       predicate,
+      this.defaultsMap,
+    );
+  }
+
+  /** Declare field-level default values (FM-32): every key an inserted /
+   * replaced document omits is stamped from `map` (client-provided values
+   * always win; patch and upsert-update never re-apply). Runs after the ttl
+   * default stamp server-side, so a `ttl(field, durationMs)` on the same field
+   * wins over a `defaults` entry. Push-time-validated server-side (each key
+   * must be a declared field of this table, values non-null and matching the
+   * field's type); the client only declares it and round-trips it on the wire
+   * as `defaults`, omitted when the table declares none. */
+  defaults(map: Record<string, unknown>): TableDefinition<Fields, Indexes> {
+    return new TableDefinition(
+      this.fields,
+      this.indexes,
+      this.ownerFieldName,
+      this.collaboratorsFieldName,
+      this.ttlDef,
+      this.authorizeDef,
+      map,
     );
   }
 
@@ -295,6 +324,9 @@ export class TableDefinition<
     }
     if (this.authorizeDef) {
       json.authorize = this.authorizeDef;
+    }
+    if (this.defaultsMap && Object.keys(this.defaultsMap).length > 0) {
+      json.defaults = this.defaultsMap;
     }
     return json;
   }

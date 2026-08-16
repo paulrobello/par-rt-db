@@ -38,6 +38,10 @@ mutate, and subscription re-run; machine tokens bypass):
   "$user" })`).
 - `.ttl({ field: "expiresAt" })` — declares a document-TTL field; the server's
   per-db reaper deletes rows whose field value is past.
+- `.defaults({ status: "backlog" })` — declares field-level default values
+  (FM-32), stamped onto a **new** document that omits the key (insert / replace
+  / upsert-insert only; `patch` never re-applies — clearing a field stays
+  cleared).
 
 Push it with the admin client (admin key required):
 

@@ -706,6 +706,7 @@ impl InMemoryRtDbClient {
         doc: &Map<String, Value>,
     ) -> Result<String, RtDbError> {
         let stamped = stamp_ttl_default(table_def, doc, (self.now)());
+        let stamped = apply_defaults(table_def, &stamped);
         let doc_value = Value::Object(stamped);
         validate_doc(table_def, &doc_value)?;
         let stored = strip_unset_optionals(table_def, &doc_value);
@@ -759,7 +760,10 @@ impl InMemoryRtDbClient {
                 format!("document '{id}' not found"),
             ));
         }
-        let doc_value = Value::Object(doc.clone());
+        // Replace gets defaults but never a ttl stamp — the server stamps
+        // `default_duration_ms` on insert only.
+        let stamped = apply_defaults(table_def, doc);
+        let doc_value = Value::Object(stamped);
         validate_doc(table_def, &doc_value)?;
         let stored = strip_unset_optionals(table_def, &doc_value);
         self.check_unique_indexes(table_def, table_name, &stored, Some(id))?;
@@ -1572,7 +1576,7 @@ mod validate;
 // Cross-module helpers (private to this module's descendants).
 use migrate::detect_destructive_changes;
 use query::{collect_index_key, require_index};
-use validate::{matches_filter, stamp_ttl_default};
+use validate::{apply_defaults, matches_filter, stamp_ttl_default};
 
 // Public API re-exports (preserves `par_rt_db_client::in_memory::*`).
 pub use presence::{PresenceHandle, PresenceRooms};

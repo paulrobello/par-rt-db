@@ -22,6 +22,7 @@ fn owner_schema() -> SchemaDef {
     tables.insert(
         "notes".to_string(),
         TableDef {
+            defaults: std::collections::BTreeMap::new(),
             fields,
             indexes: vec![IndexDef {
                 name: "by_user".into(),

@@ -299,6 +299,9 @@ fn validate_one(schema: &mut SchemaDef, d: &Directive) -> Result<(), RtDbError> 
             if let Some(expr) = t.authorize.as_mut() {
                 rename_filter_fields(expr, from, to);
             }
+            if let Some(value) = t.defaults.remove(from) {
+                t.defaults.insert(to.clone(), value);
+            }
         }
         Directive::RenameTable { from, to } => {
             if schema.tables.contains_key(to) {
@@ -348,6 +351,10 @@ fn validate_one(schema: &mut SchemaDef, d: &Directive) -> Result<(), RtDbError> 
                 )));
             }
             t.fields.insert(field.clone(), new_ty.clone());
+            // A default was validated against the OLD type; the retyped field
+            // may no longer accept it, so the entry goes rather than risking a
+            // push-time-invalid derived schema (re-declare it on a later push).
+            t.defaults.remove(field);
         }
         Directive::DropField { table, field } => {
             let t = table_mut(schema, table)?;
@@ -376,6 +383,7 @@ fn validate_one(schema: &mut SchemaDef, d: &Directive) -> Result<(), RtDbError> 
             if t.collaborators_field.as_deref() == Some(field.as_str()) {
                 t.collaborators_field = None;
             }
+            t.defaults.remove(field);
         }
         Directive::DropTable { name } => {
             if schema.tables.remove(name).is_none() {
@@ -1630,6 +1638,7 @@ mod tests {
         tables.insert(
             "users".into(),
             TableDef {
+                defaults: std::collections::BTreeMap::new(),
                 fields,
                 indexes: vec![],
                 owner_field: None,
@@ -1731,6 +1740,7 @@ mod tests {
         tables.insert(
             "things".into(),
             TableDef {
+                defaults: std::collections::BTreeMap::new(),
                 fields,
                 indexes: vec![],
                 owner_field: None,
@@ -1801,6 +1811,7 @@ mod tests {
         tables.insert(
             "users".into(),
             TableDef {
+                defaults: std::collections::BTreeMap::new(),
                 fields,
                 indexes: vec![crate::schema::IndexDef {
                     name: "by_owner".into(),
@@ -1996,6 +2007,7 @@ mod tests {
         tables.insert(
             "node".into(),
             TableDef {
+                defaults: std::collections::BTreeMap::new(),
                 fields,
                 indexes: vec![],
                 owner_field: None,
@@ -2037,6 +2049,7 @@ mod tests {
         tables.insert(
             "user".into(),
             TableDef {
+                defaults: std::collections::BTreeMap::new(),
                 fields: user_fields,
                 indexes: vec![],
                 owner_field: None,
@@ -2048,6 +2061,7 @@ mod tests {
         tables.insert(
             "account".into(),
             TableDef {
+                defaults: std::collections::BTreeMap::new(),
                 fields: account_fields,
                 indexes: vec![],
                 owner_field: None,

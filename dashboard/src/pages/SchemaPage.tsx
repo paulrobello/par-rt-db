@@ -191,6 +191,17 @@ export function SchemaPage() {
                     ))}
                   </tbody>
                 </table>
+                {table.defaults && Object.keys(table.defaults).length > 0 && (
+                  <div className={s.indexes}>
+                    <span className={s.indexLabel}>defaults</span>
+                    {Object.entries(table.defaults).map(([fname, value]) => (
+                      <span key={fname} className={s.index}>
+                        <span className={s.indexName}>{fname}</span>
+                        <span className={s.indexFields}>= {JSON.stringify(value)}</span>
+                      </span>
+                    ))}
+                  </div>
+                )}
                 {table.indexes && table.indexes.length > 0 && (
                   <div className={s.indexes}>
                     <span className={s.indexLabel}>indexes</span>

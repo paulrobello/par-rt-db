@@ -235,6 +235,26 @@ pub(super) fn stamp_ttl_default(
     }
 }
 
+/// Applies the table's push-time-validated `defaults` (FM-32) to a NEW
+/// document: every key the doc omits is stamped from the schema. Runs after
+/// [`stamp_ttl_default`] (a ttl default on the same field wins) and before the
+/// owner/principal stamps (server-stamped values win). Callers are exactly the
+/// new-document paths — insert, replace, upsert-insert; `patch` (and
+/// upsert-update / patch-by-query) never re-apply, so clearing an optional
+/// field stays cleared. Mirrors server `txn::apply_defaults`; like
+/// `stamp_ttl_default` it runs BEFORE validation so a stamped value satisfies
+/// a required field. Returns a cloned map with the defaults set, otherwise the
+/// original doc cloned unchanged.
+pub(super) fn apply_defaults(table_def: &TableDef, doc: &Map<String, Value>) -> Map<String, Value> {
+    let mut out = doc.clone();
+    for (field, value) in &table_def.defaults {
+        if !out.contains_key(field) {
+            out.insert(field.clone(), value.clone());
+        }
+    }
+    out
+}
+
 /// Applies a patch's `fields` onto `doc` — a port of server `txn::apply_patch`
 /// and the TS `applyPatch` (`ts-client/src/in_memory.ts:243-265`). A `null`
 /// onto an `Optional` field whose inner type doesn't itself accept `null`

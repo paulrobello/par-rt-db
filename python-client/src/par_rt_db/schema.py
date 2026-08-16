@@ -228,8 +228,9 @@ class TtlDef(_S):
 
 class TableDef(_S):
     """One table: typed fields, indexes, optional per-row ``owner_field`` and
-    ``collaborators_field``, an optional ``ttl`` policy, and an optional
-    ``authorize`` per-row predicate (Model C)."""
+    ``collaborators_field``, an optional ``ttl`` policy, an optional
+    ``authorize`` per-row predicate (Model C), and optional field-level
+    ``defaults`` (FM-32)."""
 
     fields: dict[str, FieldType]
     indexes: list[IndexDef] = Field(default_factory=list)
@@ -237,6 +238,10 @@ class TableDef(_S):
     collaborators_field: str | None = None
     ttl: TtlDef | None = None
     authorize: FilterExpr | None = None
+    # Field-level default values (FM-32): literal values stamped onto a NEW
+    # document (insert/replace/upsert-insert) that omits the key. Wire name is
+    # `defaults`, omitted when empty (server `BTreeMap::is_empty` skip rule).
+    defaults: dict[str, Any] = Field(default_factory=dict)
 
     @model_serializer(mode="wrap")
     def _drop_absent_owner(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
@@ -252,6 +257,10 @@ class TableDef(_S):
         # "Option::is_none"); omit it on the wire when unset.
         if out.get("authorize") is None:
             out.pop("authorize", None)
+        # `defaults` is omitted on the wire when empty (server
+        # skip_serializing_if = "BTreeMap::is_empty").
+        if not out.get("defaults"):
+            out.pop("defaults", None)
         return out
 
 
@@ -279,6 +288,7 @@ class TableBuilder:
         self._owner: str | None = None
         self._collaborators: str | None = None
         self._authorize: FilterExpr | None = None
+        self._defaults: dict[str, Any] | None = None
 
     def field(self, name: str, ft: Any) -> TableBuilder:
         """Declare a typed field ``name`` of type ``ft`` (a ``t.*`` constructor dict)."""
@@ -382,6 +392,16 @@ class TableBuilder:
         self._authorize = predicate
         return self
 
+    def defaults(self, values: dict[str, Any]) -> TableBuilder:
+        """Declare field-level default values (FM-32). Each key must be a
+        declared field and each value a non-null literal matching that field's
+        type (server-validated at schema-push time). Applied to a NEW document
+        (insert/replace/upsert-insert) that omits the key; ``patch`` never
+        re-applies, so clearing an optional field stays cleared. Round-tripped
+        on the wire as ``defaults``, omitted when empty."""
+        self._defaults = dict(values)
+        return self
+
     def _build(self) -> dict[str, Any]:
         out: dict[str, Any] = {"fields": self._fields, "indexes": self._indexes}
         if self._owner is not None:
@@ -390,6 +410,8 @@ class TableBuilder:
             out["collaboratorsField"] = self._collaborators
         if self._authorize is not None:
             out["authorize"] = self._authorize
+        if self._defaults:
+            out["defaults"] = self._defaults
         return out
 
 

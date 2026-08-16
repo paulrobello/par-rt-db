@@ -74,6 +74,27 @@ describe("SchemaPage", () => {
     expect(screen.getByText("by_name")).toBeInTheDocument();
   });
 
+  // A table may declare field-level `defaults` (FM-32); the view renders each
+  // entry as a `field = value` chip beside the fields table.
+  it("renders declared field defaults", async () => {
+    adminClientMock.getSchema.mockResolvedValue({
+      tables: {
+        items: {
+          fields: { name: { type: "string" }, status: { type: "string" } },
+          indexes: [{ name: "by_name", fields: ["name"] }],
+          defaults: { status: "backlog" },
+        },
+      },
+    });
+    render(<SchemaPage />);
+    expect(await screen.findByText("items")).toBeInTheDocument();
+    expect(screen.getByText(/defaults/)).toBeInTheDocument();
+    // "status" appears twice by design: as a field row and as the default's
+    // key chip — assert both render rather than demanding a unique match.
+    expect(screen.getAllByText(/status/).length).toBe(2);
+    expect(screen.getByText(/= "backlog"/)).toBeInTheDocument();
+  });
+
   it("renders a vector index with its declared distance metric", async () => {
     adminClientMock.getSchema.mockResolvedValue(VECTOR_SCHEMA);
     render(<SchemaPage />);

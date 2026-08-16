@@ -700,6 +700,7 @@ mod tests {
         tables.insert(
             table.to_string(),
             TableDef {
+                defaults: std::collections::BTreeMap::new(),
                 fields,
                 indexes: vec![],
                 owner_field: None,

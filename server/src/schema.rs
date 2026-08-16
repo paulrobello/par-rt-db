@@ -188,6 +188,15 @@ pub struct TableDef {
     /// Server-validated at schema-push and migrate time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authorize: Option<FilterExpr>,
+    /// Field-level default values (FM-32). Applied to a NEW document
+    /// (insert / replace / upsert-insert) when it omits the key; `patch`
+    /// never re-applies, so clearing an optional field stays cleared.
+    /// Values are literals validated at push time against the field's
+    /// type. Stamped server values (ttl default, ownerField, authorize
+    /// `$user`) win over a default on the same field. Additive — schemas
+    /// without it deserialize unchanged.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub defaults: BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
@@ -527,6 +536,7 @@ impl TableDef {
         }
         self.validate_indexes(table_name)?;
         self.validate_ttl()?;
+        self.validate_defaults(table_name)?;
         Ok(())
     }
 
@@ -776,6 +786,27 @@ impl TableDef {
         Ok(())
     }
 
+    fn validate_defaults(&self, table_name: &str) -> Result<(), RtDbError> {
+        for (field, value) in &self.defaults {
+            let fty = self.fields.get(field).ok_or_else(|| {
+                RtDbError::schema(format!(
+                    "defaults key '{field}' is not a declared field of table '{table_name}'"
+                ))
+            })?;
+            if value.is_null() {
+                return Err(RtDbError::schema(format!(
+                    "defaults value for '{table_name}.{field}' must not be null"
+                )));
+            }
+            if !validate_value(fty, value) {
+                return Err(RtDbError::schema(format!(
+                    "defaults value for '{table_name}.{field}' does not match the field type"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     pub fn index(&self, name: &str) -> Result<&IndexDef, RtDbError> {
         self.indexes
             .iter()
@@ -971,6 +1002,7 @@ mod tests {
 
     fn simple_table() -> TableDef {
         TableDef {
+            defaults: std::collections::BTreeMap::new(),
             fields: BTreeMap::from([("name".to_string(), FieldType::String)]),
             indexes: vec![],
             owner_field: None,
@@ -1020,6 +1052,7 @@ mod tests {
     #[test]
     fn rejects_field_name_with_invalid_chars() {
         let table = TableDef {
+            defaults: std::collections::BTreeMap::new(),
             fields: BTreeMap::from([("a-b".to_string(), FieldType::String)]),
             indexes: vec![],
             owner_field: None,
@@ -1055,6 +1088,7 @@ mod tests {
     fn accepts_field_name_at_max_length_60() {
         let field_name = "a".repeat(60);
         let table = TableDef {
+            defaults: std::collections::BTreeMap::new(),
             fields: BTreeMap::from([(field_name, FieldType::String)]),
             indexes: vec![],
             owner_field: None,
@@ -1072,6 +1106,7 @@ mod tests {
     fn rejects_field_name_over_max_length_60() {
         let field_name = "a".repeat(61);
         let table = TableDef {
+            defaults: std::collections::BTreeMap::new(),
             fields: BTreeMap::from([(field_name, FieldType::String)]),
             indexes: vec![],
             owner_field: None,
@@ -1089,6 +1124,7 @@ mod tests {
     fn accepts_index_name_at_max_length_30() {
         let index_name = "a".repeat(30);
         let table = TableDef {
+            defaults: std::collections::BTreeMap::new(),
             fields: BTreeMap::from([("name".to_string(), FieldType::String)]),
             indexes: vec![IndexDef {
                 name: index_name,
@@ -1114,6 +1150,7 @@ mod tests {
     fn rejects_index_name_over_max_length_30() {
         let index_name = "a".repeat(31);
         let table = TableDef {
+            defaults: std::collections::BTreeMap::new(),
             fields: BTreeMap::from([("name".to_string(), FieldType::String)]),
             indexes: vec![IndexDef {
                 name: index_name,
@@ -1138,6 +1175,7 @@ mod tests {
     #[test]
     fn rejects_case_insensitive_field_name_collision() {
         let table = TableDef {
+            defaults: std::collections::BTreeMap::new(),
             fields: BTreeMap::from([
                 ("status".to_string(), FieldType::String),
                 ("Status".to_string(), FieldType::String),
@@ -1157,6 +1195,7 @@ mod tests {
     #[test]
     fn rejects_case_insensitive_index_name_collision() {
         let table = TableDef {
+            defaults: std::collections::BTreeMap::new(),
             fields: BTreeMap::from([("name".to_string(), FieldType::String)]),
             indexes: vec![
                 IndexDef {
@@ -1192,6 +1231,7 @@ mod tests {
     #[test]
     fn rejects_field_name_starting_with_underscore() {
         let table = TableDef {
+            defaults: std::collections::BTreeMap::new(),
             fields: BTreeMap::from([("_secret".to_string(), FieldType::String)]),
             indexes: vec![],
             owner_field: None,
@@ -1221,6 +1261,7 @@ mod tests {
     #[test]
     fn rejects_index_over_array_field() {
         let table = TableDef {
+            defaults: std::collections::BTreeMap::new(),
             fields: BTreeMap::from([(
                 "tags".to_string(),
                 FieldType::Array {
@@ -1250,6 +1291,7 @@ mod tests {
     #[test]
     fn rejects_index_with_empty_fields() {
         let table = TableDef {
+            defaults: std::collections::BTreeMap::new(),
             fields: BTreeMap::from([("name".to_string(), FieldType::String)]),
             indexes: vec![IndexDef {
                 name: "by_nothing".to_string(),
@@ -1274,6 +1316,7 @@ mod tests {
     #[test]
     fn rejects_index_with_duplicate_fields() {
         let table = TableDef {
+            defaults: std::collections::BTreeMap::new(),
             fields: BTreeMap::from([("name".to_string(), FieldType::String)]),
             indexes: vec![IndexDef {
                 name: "by_name".to_string(),
@@ -1298,6 +1341,7 @@ mod tests {
     #[test]
     fn rejects_duplicate_index_names() {
         let table = TableDef {
+            defaults: std::collections::BTreeMap::new(),
             fields: BTreeMap::from([("name".to_string(), FieldType::String)]),
             indexes: vec![
                 IndexDef {
@@ -1333,6 +1377,7 @@ mod tests {
     #[test]
     fn rejects_index_name_with_invalid_chars() {
         let table = TableDef {
+            defaults: std::collections::BTreeMap::new(),
             fields: BTreeMap::from([("name".to_string(), FieldType::String)]),
             indexes: vec![IndexDef {
                 name: "by-name".to_string(),
@@ -1357,6 +1402,7 @@ mod tests {
     #[test]
     fn rejects_index_referencing_unknown_field() {
         let table = TableDef {
+            defaults: std::collections::BTreeMap::new(),
             fields: BTreeMap::from([("name".to_string(), FieldType::String)]),
             indexes: vec![IndexDef {
                 name: "by_missing".to_string(),
@@ -1381,6 +1427,7 @@ mod tests {
     #[test]
     fn rejects_literal_with_non_scalar_value() {
         let table = TableDef {
+            defaults: std::collections::BTreeMap::new(),
             fields: BTreeMap::from([(
                 "x".to_string(),
                 FieldType::Literal {
@@ -1402,6 +1449,7 @@ mod tests {
     #[test]
     fn rejects_empty_union() {
         let table = TableDef {
+            defaults: std::collections::BTreeMap::new(),
             fields: BTreeMap::from([("x".to_string(), FieldType::Union { variants: vec![] })]),
             indexes: vec![],
             owner_field: None,
@@ -1418,6 +1466,7 @@ mod tests {
     #[test]
     fn rejects_optional_wrapping_optional() {
         let table = TableDef {
+            defaults: std::collections::BTreeMap::new(),
             fields: BTreeMap::from([(
                 "x".to_string(),
                 FieldType::Optional {
@@ -1624,6 +1673,7 @@ mod tests {
     #[test]
     fn record_field_validates_structurally_and_recurses() {
         let table = TableDef {
+            defaults: std::collections::BTreeMap::new(),
             fields: BTreeMap::from([(
                 "meta".to_string(),
                 FieldType::Record {
@@ -1717,6 +1767,7 @@ mod tests {
     #[test]
     fn rejects_index_over_record_field() {
         let table = TableDef {
+            defaults: std::collections::BTreeMap::new(),
             fields: BTreeMap::from([(
                 "meta".to_string(),
                 FieldType::Record {
@@ -1781,6 +1832,7 @@ mod tests {
     #[test]
     fn rejects_search_index_over_non_text_field() {
         let table = TableDef {
+            defaults: std::collections::BTreeMap::new(),
             fields: BTreeMap::from([("count".to_string(), FieldType::Number)]),
             indexes: vec![IndexDef {
                 name: "search_count".to_string(),
@@ -1805,6 +1857,7 @@ mod tests {
     #[test]
     fn accepts_search_index_over_optional_text_field() {
         let table = TableDef {
+            defaults: std::collections::BTreeMap::new(),
             fields: BTreeMap::from([(
                 "body".to_string(),
                 FieldType::Optional {
@@ -1905,6 +1958,7 @@ mod tests {
         let mut fields = BTreeMap::new();
         fields.insert("embedding".to_string(), FieldType::Vector { dimensions: 4 });
         let table = TableDef {
+            defaults: std::collections::BTreeMap::new(),
             fields,
             indexes: vec![IndexDef {
                 name: "by_emb".to_string(),
@@ -1933,6 +1987,7 @@ mod tests {
         fields.insert("embedding".to_string(), FieldType::Vector { dimensions: 4 });
         fields.insert("userId".to_string(), FieldType::String);
         let table = TableDef {
+            defaults: std::collections::BTreeMap::new(),
             fields,
             indexes: vec![IndexDef {
                 name: "by_emb".to_string(),
@@ -1960,6 +2015,7 @@ mod tests {
         let mut fields = BTreeMap::new();
         fields.insert("embedding".to_string(), FieldType::Vector { dimensions: 4 });
         let table = TableDef {
+            defaults: std::collections::BTreeMap::new(),
             fields,
             indexes: vec![IndexDef {
                 name: "by_emb".to_string(),
@@ -1989,6 +2045,7 @@ mod tests {
         let mut fields = BTreeMap::new();
         fields.insert("embedding".to_string(), FieldType::Vector { dimensions: 0 });
         let table = TableDef {
+            defaults: std::collections::BTreeMap::new(),
             fields,
             indexes: vec![IndexDef {
                 name: "by_emb".to_string(),
@@ -2017,6 +2074,7 @@ mod tests {
         fields.insert("a".to_string(), FieldType::Vector { dimensions: 4 });
         fields.insert("b".to_string(), FieldType::Vector { dimensions: 4 });
         let table = TableDef {
+            defaults: std::collections::BTreeMap::new(),
             fields,
             indexes: vec![IndexDef {
                 name: "by_emb".to_string(),
@@ -2044,6 +2102,7 @@ mod tests {
         let mut fields = BTreeMap::new();
         fields.insert("title".to_string(), FieldType::String);
         let table = TableDef {
+            defaults: std::collections::BTreeMap::new(),
             fields,
             indexes: vec![IndexDef {
                 name: "by_title".to_string(),
@@ -2071,6 +2130,7 @@ mod tests {
         let mut fields = BTreeMap::new();
         fields.insert("embedding".to_string(), FieldType::Vector { dimensions: 4 });
         let table = TableDef {
+            defaults: std::collections::BTreeMap::new(),
             fields,
             indexes: vec![IndexDef {
                 name: "by_emb".to_string(),
@@ -2104,6 +2164,7 @@ mod tests {
             },
         );
         let table = TableDef {
+            defaults: std::collections::BTreeMap::new(),
             fields,
             indexes: vec![IndexDef {
                 name: "by_emb".to_string(),
@@ -2350,6 +2411,7 @@ mod tests {
         let mut fields = BTreeMap::new();
         fields.insert("expiresAt".to_string(), FieldType::Number);
         TableDef {
+            defaults: std::collections::BTreeMap::new(),
             fields,
             indexes: vec![IndexDef {
                 name: "by_expiresAt".to_string(),
@@ -2489,6 +2551,7 @@ mod tests {
         );
         fields.insert("count".to_string(), FieldType::Number);
         TableDef {
+            defaults: std::collections::BTreeMap::new(),
             fields,
             indexes: vec![],
             owner_field: None,

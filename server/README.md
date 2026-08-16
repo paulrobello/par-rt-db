@@ -43,6 +43,15 @@ alongside it: [`../ts-client/`](../ts-client) (browser/Node),
   query, mutate, and subscription re-run; machine tokens and scheduled jobs
   bypass per-row rules. See
   [`../docs/superpowers/specs/2026-08-02-per-row-auth-predicate-dsl-design.md`](../docs/superpowers/specs/2026-08-02-per-row-auth-predicate-dsl-design.md).
+- Field-level default values (FEATURE_MATRIX #32): a table may declare
+  `defaults`, a map of field name → literal JSON value (additive wire key,
+  omitted when empty). Push-validated (key must be a declared field, value
+  non-null and type-correct) and stamped onto a **new** document that omits
+  the key — insert / replace / upsert-insert only; `patch` never re-applies,
+  and the ttl / owner / authorize stamps win over a defaults entry on the same
+  field. Migrate maintains the map (`renameField` re-keys; `dropField` /
+  `changeType` drop the entry). See
+  [`../docs/superpowers/specs/2026-08-16-field-defaults-design.md`](../docs/superpowers/specs/2026-08-16-field-defaults-design.md).
 
 ## Layout
 

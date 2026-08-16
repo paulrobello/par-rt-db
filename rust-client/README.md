@@ -40,7 +40,10 @@ validation. `search_index()` declares a full-text index in a `Schema`,
 `vector(N)` column + HNSW over a configurable distance metric — cosine by
 default, also L2 / inner-product; embeddings are client-supplied), and
 `owner_field()` opts a table into per-row authorization (server-enforced on
-read, mutate, and subscription re-run; machine tokens bypass).
+read, mutate, and subscription re-run; machine tokens bypass), and
+`defaults(&[(field, value), ...])` declares field-level default values (FM-32) —
+stamped onto a **new** document that omits the key (insert / replace /
+upsert-insert only; `patch` never re-applies).
 
 ### In-memory test harness (feature `in_memory`)
 

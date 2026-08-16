@@ -1157,6 +1157,25 @@ fn stamp_ttl_default(
     doc
 }
 
+/// Applies the table's push-time-validated `defaults` (FM-32) to a NEW
+/// document: every key the doc omits is stamped from the schema. Runs after
+/// `stamp_ttl_default` (a ttl default on the same field wins) and before the
+/// owner/authorize stamps (server-stamped principal values win). Callers are
+/// exactly the new-document paths — insert, replace, upsert-insert; `patch`
+/// (and upsert-update / patchByQuery) never re-apply, so clearing an optional
+/// field stays cleared.
+fn apply_defaults(
+    table_def: &TableDef,
+    mut doc: serde_json::Map<String, serde_json::Value>,
+) -> serde_json::Map<String, serde_json::Value> {
+    for (field, value) in &table_def.defaults {
+        if !doc.contains_key(field) {
+            doc.insert(field.clone(), value.clone());
+        }
+    }
+    doc
+}
+
 /// Whether `uid` may access a row given the table's declared `ownerField`
 /// and/or `collaboratorsField`: true when `uid` matches the doc's owner field
 /// OR appears in the doc's collaborators array. A missing/null owner field and
@@ -1531,6 +1550,7 @@ async fn step_insert(
 ) -> Result<(), RtDbError> {
     let table_def = sctx.schema.table(table)?;
     let doc = stamp_ttl_default(table_def, doc.clone(), now_ms());
+    let doc = apply_defaults(table_def, doc);
     let doc = stamp_owner(table_def, doc, sctx.owner);
     let doc = stamp_authorize(table_def, doc, sctx.ctx);
     verify_authorize_doc(table_def, &doc, sctx.ctx)?;
@@ -1585,7 +1605,8 @@ async fn step_replace(
 ) -> Result<(), RtDbError> {
     let table_def = sctx.schema.table(table)?;
     check_owner(sctx.tx, sctx.pg_schema_name, table_def, table, id, sctx.ctx).await?;
-    let doc = stamp_owner(table_def, doc.clone(), sctx.owner);
+    let doc = apply_defaults(table_def, doc.clone());
+    let doc = stamp_owner(table_def, doc, sctx.owner);
     let doc = stamp_authorize(table_def, doc, sctx.ctx);
     let (old_doc, new_doc, created_at) =
         do_replace(sctx.tx, sctx.pg_schema_name, table_def, table, id, &doc).await?;
@@ -1677,7 +1698,8 @@ async fn step_upsert(
     }
     match rows.pop() {
         None => {
-            let insert = stamp_owner(table_def, insert.clone(), sctx.owner);
+            let insert = apply_defaults(table_def, insert.clone());
+            let insert = stamp_owner(table_def, insert, sctx.owner);
             let insert = stamp_authorize(table_def, insert, sctx.ctx);
             verify_authorize_doc(table_def, &insert, sctx.ctx)?;
             let (id, stored, created_at) =

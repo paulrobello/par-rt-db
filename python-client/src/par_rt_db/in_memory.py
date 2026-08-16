@@ -1961,6 +1961,9 @@ class InMemoryRtDbClient:
         ttl = table_def.ttl
         if ttl is not None and ttl.default_duration_ms is not None and ttl.field not in doc:
             doc[ttl.field] = self._now() + ttl.default_duration_ms
+        # FM-32: after the ttl stamp (a ttl default on the same field wins),
+        # before validation — so a default can populate a required field.
+        _apply_defaults(table_def, doc)
         validate_doc(table_def, doc)
         stored = _strip_unset_optionals(table_def, doc)
         self._check_unique_indexes(table_def, table_name, stored, None)
@@ -1995,6 +1998,9 @@ class InMemoryRtDbClient:
         row = self._docs.get(key)
         if row is None:
             raise RtDbError(ErrorCode.NOT_FOUND, f"document '{sid}' not found")
+        # Replace writes a whole NEW document, so defaults apply (FM-32) —
+        # unlike patch, clearing a field then replacing re-stamps it.
+        _apply_defaults(table_def, doc)
         validate_doc(table_def, doc)
         stored = _strip_unset_optionals(table_def, doc)
         self._check_unique_indexes(table_def, table_name, stored, sid)
@@ -2787,6 +2793,21 @@ def validate_doc(table: TableDef, doc: dict[str, Any]) -> None:
                 raise RtDbError(ErrorCode.SCHEMA_VIOLATION, f"field '{field}' has an invalid value")
         elif field_ty.type != "optional":
             raise RtDbError(ErrorCode.SCHEMA_VIOLATION, f"field '{field}' is required")
+
+
+def _apply_defaults(table: TableDef, doc: dict[str, Any]) -> None:
+    """FM-32: stamp the table's push-time-validated ``defaults`` onto a NEW
+    document in place — every key the doc omits gets the schema's literal.
+    Mirrors server ``txn::apply_defaults``: runs after the ttl-default stamp
+    (a ttl ``defaultDurationMs`` on the same field wins) and before the
+    owner/principal stamps, and only on the new-document paths (insert,
+    replace, upsert-insert); patch / upsert-update / patchByQuery never
+    re-apply, so clearing an optional field stays cleared. ``deepcopy`` mirrors
+    the server's ``value.clone()`` so a nested array/object default is never
+    aliased into a stored doc."""
+    for field, value in table.defaults.items():
+        if field not in doc:
+            doc[field] = deepcopy(value)
 
 
 def _optional_rejects_null(ty: Any) -> bool:

@@ -241,6 +241,16 @@ pub struct TableDef {
     /// `server/src/schema.rs::TableDef` byte-for-byte (wire key `authorize`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authorize: Option<FilterExpr>,
+    /// Field-level default values (FM-32). Applied to a NEW document
+    /// (insert / replace / upsert-insert) when it omits the key; `patch`
+    /// never re-applies, so clearing an optional field stays cleared.
+    /// Values are literals the server validates at push time against the
+    /// field's type. Stamped server values (ttl default, ownerField,
+    /// authorize `$user`) win over a default on the same field. Additive —
+    /// schemas without it deserialize unchanged. Mirrors
+    /// `server/src/schema.rs::TableDef` byte-for-byte.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub defaults: BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -258,6 +268,7 @@ pub struct TableBuilder {
     collaborators_field: Option<String>,
     ttl: Option<TtlDef>,
     authorize: Option<FilterExpr>,
+    defaults: BTreeMap<String, serde_json::Value>,
     /// Index of the most recently pushed [`IndexDef`] in [`Self::indexes`], so
     /// the chainable `.unique()` / `.where_clause()` setters can configure it
     /// after `index`/`search_index`/`vector_index` returned `self`. `None`
@@ -274,6 +285,7 @@ impl TableBuilder {
             collaborators_field: None,
             ttl: None,
             authorize: None,
+            defaults: BTreeMap::new(),
             last_index: None,
         }
     }
@@ -413,6 +425,19 @@ impl TableBuilder {
         self.authorize = Some(predicate);
         self
     }
+
+    /// Declare field-level default values (FM-32). Each entry's key must name a
+    /// declared field and its value a non-null literal satisfying that field's
+    /// type (the server validates this at push time). The server stamps a
+    /// default onto a NEW document (insert / replace / upsert-insert) when it
+    /// omits the key; `patch` never re-applies. Server-stamped values (ttl
+    /// default, ownerField) win over a default on the same field.
+    pub fn defaults(mut self, entries: &[(&str, serde_json::Value)]) -> Self {
+        for (field, value) in entries {
+            self.defaults.insert((*field).to_string(), value.clone());
+        }
+        self
+    }
     fn finish(self) -> TableDef {
         let indexes = if self.indexes.is_empty() {
             None
@@ -426,6 +451,7 @@ impl TableBuilder {
             collaborators_field: self.collaborators_field,
             ttl: self.ttl,
             authorize: self.authorize,
+            defaults: self.defaults,
         }
     }
 }
@@ -911,6 +937,39 @@ mod tests {
                 .contains("collaboratorsField"),
             "collaboratorsField must be omitted on the wire when unset"
         );
+    }
+
+    #[test]
+    fn defaults_serializes_and_round_trips() {
+        // `defaults` (FM-32) is a field-name → literal map: present on the wire
+        // when non-empty, omitted entirely when empty, mirroring
+        // `server/src/schema.rs::TableDef`'s `skip_serializing_if =
+        // "BTreeMap::is_empty"` byte-for-byte.
+        let td = Table::new()
+            .field(
+                "status",
+                FieldType::union([FieldType::literal("backlog"), FieldType::literal("done")]),
+            )
+            .field("priority", FieldType::Number)
+            .defaults(&[("status", json!("backlog")), ("priority", json!(0))])
+            .finish();
+        let v = serde_json::to_value(&td).unwrap();
+        assert_eq!(v["defaults"], json!({"status": "backlog", "priority": 0}));
+        // Round-trips back through the wire type.
+        let back: TableDef = serde_json::from_value(v).unwrap();
+        assert_eq!(back.defaults.get("status"), Some(&json!("backlog")));
+        assert_eq!(back.defaults.get("priority"), Some(&json!(0)));
+        // Empty -> omitted entirely (not serialized as `{}` or null).
+        let none = Table::new().field("title", FieldType::String).finish();
+        assert!(
+            !serde_json::to_string(&none).unwrap().contains("defaults"),
+            "defaults must be omitted on the wire when empty"
+        );
+        // A table that never carried a `defaults` key (legacy wire payload)
+        // deserializes to an empty map.
+        let legacy = json!({"fields": {"title": {"type": "string"}}});
+        let from_legacy: TableDef = serde_json::from_value(legacy).unwrap();
+        assert!(from_legacy.defaults.is_empty());
     }
 
     #[test]

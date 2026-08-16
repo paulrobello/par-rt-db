@@ -226,6 +226,10 @@ schema = SchemaDef.model_validate(
                     },
                 ],
                 "ownerField": "owner",
+                # Field-level defaults (FM-32): stamped onto a NEW document
+                # that omits the key (insert/replace/upsert-insert only;
+                # patch never re-applies).
+                "defaults": {"n": 0},
             }
         }
     }

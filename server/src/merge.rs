@@ -352,6 +352,7 @@ mod tests {
             map.insert((*name).to_string(), ty.clone());
         }
         TableDef {
+            defaults: std::collections::BTreeMap::new(),
             fields: map,
             indexes: vec![],
             owner_field: None,

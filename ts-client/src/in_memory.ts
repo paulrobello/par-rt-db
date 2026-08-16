@@ -886,6 +886,29 @@ function stampTtlDefault(
   return doc;
 }
 
+/** Applies the table's push-time-validated `defaults` (FM-32) to a NEW
+ * document: every key the doc omits is stamped from the schema. Runs after
+ * `stampTtlDefault` (a ttl default on the same field wins — it stamped the key
+ * first) and before any principal stamps (server-stamped owner/authorize
+ * values win). Callers are exactly the new-document paths — insert, replace,
+ * upsert-insert; `patch` (and upsert-update / patchByQuery) never re-apply, so
+ * clearing an optional field stays cleared. Mirrors server `txn::apply_defaults`;
+ * returns the same `doc` reference when no stamp is needed, otherwise a
+ * shallow copy with the fields set. */
+function applyDefaults(table: TableJson, doc: Record<string, unknown>): Record<string, unknown> {
+  const defaults = table.defaults;
+  if (!defaults) return doc;
+  const missing = Object.keys(defaults).filter((field) => !(field in doc));
+  if (missing.length === 0) return doc;
+  const out: Record<string, unknown> = { ...doc };
+  for (const field of missing) {
+    // Clone so array/object defaults are never aliased into a doc (the server
+    // clones the serde value too).
+    out[field] = clone(defaults[field]);
+  }
+  return out;
+}
+
 /** Applies a patch's fields onto `doc` — a port of server `txn::apply_patch`. */
 function applyPatch(
   table: TableJson,
@@ -2208,7 +2231,7 @@ export class InMemoryRtDbClient {
   }
 
   private doInsert(tableName: string, tableDef: TableJson, doc: Record<string, unknown>): string {
-    const stamped = stampTtlDefault(tableDef, doc, this.now());
+    const stamped = applyDefaults(tableDef, stampTtlDefault(tableDef, doc, this.now()));
     validateDoc(tableDef, stamped);
     const stored = stripUnsetOptionals(tableDef, stamped);
     this.checkUniqueIndexes(tableName, tableDef, stored);
@@ -2235,8 +2258,9 @@ export class InMemoryRtDbClient {
     doc: Record<string, unknown>,
   ): void {
     const row = this.requireRow(tableName, id);
-    validateDoc(tableDef, doc);
-    const stored = stripUnsetOptionals(tableDef, doc);
+    const stamped = applyDefaults(tableDef, doc);
+    validateDoc(tableDef, stamped);
+    const stored = stripUnsetOptionals(tableDef, stamped);
     this.checkUniqueIndexes(tableName, tableDef, stored, row.id);
     row.doc = stored;
     row.version += 1;

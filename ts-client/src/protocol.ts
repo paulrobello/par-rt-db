@@ -572,6 +572,14 @@ export interface TableJson {
    * values are valid only here — client `.filter()` queries reject them.
    * Server-enforced; clients only declare it. Omitted on the wire when unset. */
   authorize?: FilterExpr;
+  /** Field-level default values (FM-32): a map of declared field name →
+   * literal JSON value stamped onto a NEW document that omits the key (insert,
+   * replace, and upsert's insert branch — never patch, upsert-update, or
+   * patchByQuery). Push-time-validated server-side (each key must be a declared
+   * field of the table; values non-null and matching the field's type);
+   * clients only declare it. Omitted on the wire when the table declares
+   * none. */
+  defaults?: Record<string, unknown>;
 }
 
 export interface SchemaJson {
