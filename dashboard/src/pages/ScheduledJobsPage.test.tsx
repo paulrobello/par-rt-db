@@ -1,3 +1,4 @@
+import type { StepJson, TransactionJson } from "@par-rt-db/client";
 import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -22,7 +23,7 @@ vi.mock("../lib/admin", () => ({
   }),
 }));
 
-import { ScheduledJobsPage } from "./ScheduledJobsPage";
+import { DEFAULT_TXN, ScheduledJobsPage } from "./ScheduledJobsPage";
 
 const cronJob: ScheduleInfo = {
   id: "cron0001-aaaa",
@@ -50,6 +51,15 @@ describe("ScheduledJobsPage", () => {
   });
   afterEach(() => {
     vi.useRealTimers();
+  });
+
+  it("ships a default template that satisfies the wire Step union", () => {
+    // The untouched template must deserialize server-side: the assignment
+    // below fails typecheck if a step shape drifts from the wire contract
+    // (e.g. a patch step carrying `doc` instead of `fields`).
+    const txn: TransactionJson = JSON.parse(DEFAULT_TXN);
+    const step: StepJson = txn.steps[0];
+    expect(step).toEqual({ op: "patch", table: "users", id: "k1...", fields: { ping: true } });
   });
 
   it("lists schedules for the selected database", async () => {

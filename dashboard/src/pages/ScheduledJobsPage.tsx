@@ -10,9 +10,9 @@ import s from "./ScheduledJobsPage.module.css";
 
 type CreateMode = "afterMs" | "cron";
 
-const DEFAULT_TXN = `{
+export const DEFAULT_TXN = `{
   "steps": [
-    { "op": "patch", "table": "users", "id": "k1...", "doc": { "ping": true } }
+    { "op": "patch", "table": "users", "id": "k1...", "fields": { "ping": true } }
   ]
 }`;
 
