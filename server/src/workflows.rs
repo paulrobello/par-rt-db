@@ -81,7 +81,8 @@ pub struct WorkflowRow {
 }
 
 /// `CREATE TABLE IF NOT EXISTS` for databases that predate this feature.
-/// Mirrors `scheduler::ensure_table`; called once at committer startup.
+/// Mirrors `scheduler::ensure_table`; called once at scheduler startup
+/// (`run_scheduler`), alongside the `scheduled_txns` ensure.
 pub async fn ensure_table(pool: &PgPool, db: &str) -> Result<(), RtDbError> {
     validate_db_name(db)?;
     let schema = pg_schema(db);
@@ -149,12 +150,15 @@ pub(crate) async fn insert_on(
 /// Start a run on the pool (WS/HTTP/admin surfaces). The first step's
 /// `sleepBeforeMs` becomes the initial advance gate.
 pub async fn insert(pool: &PgPool, db: &str, spec: &WorkflowSpec) -> Result<String, RtDbError> {
-    let gate = now_ms()
-        + spec
-            .steps
-            .first()
-            .and_then(|s| s.sleep_before_ms)
-            .unwrap_or(0) as i64;
+    // Clamp before the u64→i64 cast: a serde-accepted u64 above i64::MAX
+    // would wrap negative ⇒ an instantly-due gate.
+    let sleep_ms = spec
+        .steps
+        .first()
+        .and_then(|s| s.sleep_before_ms)
+        .unwrap_or(0)
+        .min(i64::MAX as u64) as i64;
+    let gate = now_ms().saturating_add(sleep_ms);
     let mut conn = pool.acquire().await?;
     insert_on(&mut conn, db, spec, gate).await
 }
@@ -347,6 +351,9 @@ pub async fn finalize_success(
     Ok(())
 }
 
+/// Terminal failure: `status = failed` with the final attempt count (bound
+/// from `outcome.attempts`, so `WorkflowInfo.attempts` matches the trail's
+/// last entry — `schedule_retry` carried the pre-terminal value).
 pub async fn mark_failed(
     pool: &PgPool,
     db: &str,
@@ -360,7 +367,7 @@ pub async fn mark_failed(
         serde_json::to_value(outcome).map_err(|_| RtDbError::internal("serialize outcome"))?;
     sqlx::query(&format!(
         "UPDATE \"{schema}\".workflows
-         SET status = 'failed', last_error = $2,
+         SET status = 'failed', last_error = $2, attempts = $5,
              step_outcomes = step_outcomes || $3::jsonb, finished_at = $4, updated_at = $4
          WHERE id = $1"
     ))
@@ -368,6 +375,7 @@ pub async fn mark_failed(
     .bind(error)
     .bind(&outcome_json)
     .bind(now_ms())
+    .bind(outcome.attempts as i32)
     .execute(pool)
     .await?;
     Ok(())

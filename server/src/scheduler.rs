@@ -1,7 +1,9 @@
 //! Per-database scheduled/cron transaction store + timer. Jobs are *data*
 //! (a declarative `Transaction` plus a `due_at`), not code — the scheduler
 //! drains due rows through the single-writer committer, which executes them
-//! via the normal `execute_txn` path. See
+//! via the normal `execute_txn` path. Since FM-29 the same timer also polls
+//! the `workflows` side table (`crate::workflows`) and enqueues claimed runs
+//! as `RunWorkflowAdvance`; the committer alone advances them. See
 //! `docs/superpowers/specs/2026-07-23-scheduled-cron-transactions-design.md`.
 
 use crate::db::{new_id, now_ms, validate_db_name};
@@ -431,20 +433,24 @@ use crate::committer::CommitterRequest;
 /// costs an occasional early wake).
 const MAX_SLEEP: Duration = Duration::from_secs(2);
 
-/// The per-db scheduler loop. Owns recovery on start, then repeatedly: read
-/// the nearest due time, sleep until it (capped), claim due rows, and enqueue
-/// each as a fire-and-forget `RunScheduled` on the committer channel. Exits
-/// when the committer channel closes (its task died) — the next request to
-/// this db respawns both.
+/// The per-db scheduler loop. Owns recovery on start (both `scheduled_txns`
+/// and, since FM-29, `workflows`: ensure tables + reset orphaned `running`
+/// rows), then repeatedly: read the nearest due time across BOTH tables,
+/// sleep until it (capped), claim due rows from each table that has them,
+/// and enqueue each as a fire-and-forget `RunScheduled` /
+/// `RunWorkflowAdvance` on the committer channel. Exits when the committer
+/// channel closes (its task died) — the next request to this db respawns
+/// both.
 ///
-/// ARC-102: when `next_due` reports nothing due (either `None` = no jobs, or a
-/// future `due_at`), the loop skips the `claim_due` query entirely — there is
-/// nothing to claim. This removes the heavier `UPDATE … FOR UPDATE SKIP LOCKED`
-/// write from every poll on a db whose nearest job is not yet due (the idle
-/// write-every-2s the audit flagged). The `next_due` read still runs at the
-/// `MAX_SLEEP` cadence so a newly-inserted due job is caught promptly; reducing
-/// that read frequency further would require a notify-on-insert so an idle loop
-/// wakes immediately when `scheduler::insert` adds a row.
+/// ARC-102: when a table's `next_due` reports nothing due (either `None` =
+/// no rows, or a future due time), the loop skips THAT table's `claim_due`
+/// query entirely — there is nothing to claim. This removes the heavier
+/// `UPDATE … FOR UPDATE SKIP LOCKED` write from every poll on a db whose
+/// nearest job is not yet due (the idle write-every-2s the audit flagged).
+/// The `next_due` reads still run at the `MAX_SLEEP` cadence so a
+/// newly-inserted due job is caught promptly; reducing that read frequency
+/// further would require a notify-on-insert so an idle loop wakes
+/// immediately when `scheduler::insert` adds a row.
 pub async fn run_scheduler(pool: PgPool, db: String, committer_tx: Sender<CommitterRequest>) {
     if let Err(err) = ensure_table(&pool, &db).await {
         tracing::error!(db = %db, error = %err, "scheduler: ensure_table failed");
@@ -452,37 +458,52 @@ pub async fn run_scheduler(pool: PgPool, db: String, committer_tx: Sender<Commit
     if let Err(err) = reset_running(&pool, &db).await {
         tracing::error!(db = %db, error = %err, "scheduler: reset_running failed");
     }
+    if let Err(err) = crate::workflows::ensure_table(&pool, &db).await {
+        tracing::error!(db = %db, error = %err, "scheduler: workflows ensure_table failed");
+    }
+    if let Err(err) = crate::workflows::reset_running(&pool, &db).await {
+        tracing::error!(db = %db, error = %err, "scheduler: workflows reset_running failed");
+    }
     loop {
-        // `should_claim` is true only when a job is actually due; in all other
-        // cases we skip the claim_due query and just sleep + re-check next_due.
-        let (sleep, should_claim) = match next_due(&pool, &db).await {
-            Ok(Some(due_at)) => {
-                let now = now_ms();
-                if due_at <= now {
-                    (Duration::ZERO, true)
-                } else {
-                    // Future job: re-check at the 2s cadence so a newly-inserted
-                    // sooner job is picked up quickly, but skip the zero-row
-                    // claim_due query. ARC-102.
-                    (
-                        Duration::from_millis((due_at - now) as u64).min(MAX_SLEEP),
-                        false,
-                    )
+        // `claim_sched`/`claim_wf` are true only when THAT table actually has
+        // something due; in all other cases its claim_due query is skipped
+        // (ARC-102 per-table). The wake target is the min of the two tables'
+        // nearest due times.
+        let sched_next = next_due(&pool, &db).await;
+        let wf_next = crate::workflows::next_due(&pool, &db).await;
+        // Per-table error handling mirrors the single-table loop this
+        // replaced: a failed read may mean the db was dropped (DROP SCHEMA)
+        // out from under this scheduler — exit cleanly in that case; else
+        // log per table and degrade that table to "nothing known this tick"
+        // while the other still participates in the wake/claim decisions.
+        if sched_next.is_err() || wf_next.is_err() {
+            if matches!(crate::db::database_exists(&pool, &db).await, Ok(false)) {
+                tracing::info!(db = %db, "scheduler: database removed, exiting");
+                return;
+            }
+            for (table, res) in [("scheduled_txns", &sched_next), ("workflows", &wf_next)] {
+                if let Err(err) = res {
+                    tracing::error!(db = %db, table, error = %err, "scheduler: next_due failed");
                 }
             }
-            // Nothing pending: poll at MAX_SLEEP so a newly-inserted due job is
-            // caught promptly, but skip the claim_due write. ARC-102.
-            Ok(None) => (MAX_SLEEP, false),
-            Err(err) => {
-                // The db may have been deleted (DROP SCHEMA) out from under this
-                // scheduler; if so, exit cleanly instead of erroring every poll.
-                if matches!(crate::db::database_exists(&pool, &db).await, Ok(false)) {
-                    tracing::info!(db = %db, "scheduler: database removed, exiting");
-                    return;
-                }
-                tracing::error!(db = %db, error = %err, "scheduler: next_due failed");
-                (MAX_SLEEP, false)
-            }
+        }
+        let now = now_ms();
+        let claim_sched = matches!(sched_next, Ok(Some(due)) if due <= now);
+        let claim_wf = matches!(wf_next, Ok(Some(due)) if due <= now);
+        let nearest = [sched_next.ok().flatten(), wf_next.ok().flatten()]
+            .into_iter()
+            .flatten()
+            .min();
+        let sleep = match nearest {
+            Some(due) if due <= now => Duration::ZERO,
+            // Future work: re-check at the 2s cadence so a newly-inserted
+            // sooner item is picked up quickly, but skip the zero-row
+            // claim_due queries. ARC-102.
+            Some(due) => Duration::from_millis((due - now) as u64).min(MAX_SLEEP),
+            // Nothing pending in either table: poll at MAX_SLEEP so a
+            // newly-inserted due item is caught promptly, but skip the
+            // claim_due writes. ARC-102.
+            None => MAX_SLEEP,
         };
         if !sleep.is_zero() {
             // Select on the committer channel close so the longer IDLE_SLEEP
@@ -496,32 +517,52 @@ pub async fn run_scheduler(pool: PgPool, db: String, committer_tx: Sender<Commit
                 }
             }
         }
-        if !should_claim {
-            continue; // ARC-102: nothing due — skip claim_due
-        }
-        let now = now_ms();
-        let claimed = match claim_due(&pool, &db, now, CLAIM_BATCH).await {
-            Ok(jobs) => jobs,
-            Err(err) => {
-                if matches!(crate::db::database_exists(&pool, &db).await, Ok(false)) {
-                    tracing::info!(db = %db, "scheduler: database removed, exiting");
+        if claim_sched {
+            let now = now_ms();
+            let claimed = match claim_due(&pool, &db, now, CLAIM_BATCH).await {
+                Ok(jobs) => jobs,
+                Err(err) => {
+                    if matches!(crate::db::database_exists(&pool, &db).await, Ok(false)) {
+                        tracing::info!(db = %db, "scheduler: database removed, exiting");
+                        return;
+                    }
+                    tracing::error!(db = %db, error = %err, "scheduler: claim_due failed");
+                    continue;
+                }
+            };
+            for job in claimed {
+                let req = CommitterRequest::RunScheduled {
+                    id: job.id,
+                    kind: job.kind,
+                    txn: Box::new(job.txn),
+                    cron: job.cron,
+                };
+                if committer_tx.send(req).await.is_err() {
+                    // Committer task is gone; this scheduler is now useless.
+                    tracing::warn!(db = %db, "scheduler: committer channel closed, exiting");
                     return;
                 }
-                tracing::error!(db = %db, error = %err, "scheduler: claim_due failed");
-                continue;
             }
-        };
-        for job in claimed {
-            let req = CommitterRequest::RunScheduled {
-                id: job.id,
-                kind: job.kind,
-                txn: Box::new(job.txn),
-                cron: job.cron,
+        }
+        if claim_wf {
+            let now = now_ms();
+            let claimed_wf = match crate::workflows::claim_due(&pool, &db, now, CLAIM_BATCH).await {
+                Ok(rows) => rows,
+                Err(err) => {
+                    if matches!(crate::db::database_exists(&pool, &db).await, Ok(false)) {
+                        tracing::info!(db = %db, "scheduler: database removed, exiting");
+                        return;
+                    }
+                    tracing::error!(db = %db, error = %err, "scheduler: workflows claim_due failed");
+                    Vec::new()
+                }
             };
-            if committer_tx.send(req).await.is_err() {
-                // Committer task is gone; this scheduler is now useless.
-                tracing::warn!(db = %db, "scheduler: committer channel closed, exiting");
-                return;
+            for row in claimed_wf {
+                let req = CommitterRequest::RunWorkflowAdvance { row: Box::new(row) };
+                if committer_tx.send(req).await.is_err() {
+                    tracing::warn!(db = %db, "scheduler: committer channel closed, exiting");
+                    return;
+                }
             }
         }
     }
