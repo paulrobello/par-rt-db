@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use arc_swap::ArcSwap;
 use sqlx::PgPool;
 
-use common::{TestDb, admin_post, fresh_db, kanban_schema_json, spawn_app, test_state};
+use common::{TestDb, admin_get, admin_post, fresh_db, kanban_schema_json, spawn_app, test_state};
 use rtdb_server::AppState;
 use rtdb_server::auth::PrincipalCtx;
 use rtdb_server::committer::Committers;
@@ -935,6 +935,142 @@ async fn scoped_token_cannot_schedule_nested_forbidden_table_ws() -> anyhow::Res
     assert!(
         scheduler::list(&pool, &db).await?.is_empty(),
         "no job row may survive the Forbidden"
+    );
+
+    Ok(())
+}
+
+// (14) Cold-db family (FM-29's workflows fix mirrored onto schedules): a db
+// with no data-plane traffic since creation has no spawned per-db tasks, and
+// the side table's creation-time rollout does not cover dbs created before it.
+// Simulate that legacy shape by dropping `scheduled_txns` outright — the admin
+// surfaces must still serve list (200 + empty) and manage (200 + `ok:false`)
+// by ensuring the table inline, not 500.
+#[tokio::test]
+async fn admin_schedules_family_serves_cold_db_without_side_table() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let addr = spawn_app(state).await;
+
+    let schema_name = rtdb_server::ddl::pg_schema(&db);
+    sqlx::query(&format!(
+        "DROP TABLE IF EXISTS \"{schema_name}\".scheduled_txns"
+    ))
+    .execute(&pool)
+    .await?;
+
+    let resp = admin_get(addr, &format!("/admin/db/{db}/schedules")).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await.expect("parse list response");
+    assert_eq!(body["schedules"], serde_json::json!([]));
+
+    let resp = admin_post(
+        addr,
+        &format!("/admin/db/{db}/schedules/no-such-job/cancel"),
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await.expect("parse cancel response");
+    assert_eq!(body["ok"], serde_json::json!(false));
+
+    Ok(())
+}
+
+// (15) A one-shot created via ADMIN create on a cold db (no Mutate/Subscribe
+// since creation, so no per-db tasks) with a past `runAt` must FIRE without
+// any prior data-plane op — the create surface spawns the per-db tasks and
+// ensures the table before insert, so the scheduler claims the row.
+#[tokio::test]
+async fn admin_created_one_shot_on_cold_db_fires() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let addr = spawn_app(state).await;
+    let schema = kanban_schema();
+
+    let resp = admin_post(
+        addr,
+        &format!("/admin/db/{db}/schedules"),
+        serde_json::json!({
+            "when": {"type": "runAt", "ms": rtdb_server::db::now_ms() - 1_000},
+            "txn": insert_txn_json("workItems"),
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    assert!(
+        poll_until(&pool, &db, &schema, "workItems", 1, Duration::from_secs(15)).await,
+        "cold-db admin-created one-shot must fire without a prior data-plane op"
+    );
+
+    Ok(())
+}
+
+// (16) Same liveness contract through the HTTP surface (`POST /api/schedule`)
+// with a scoped machine token: a past-due one-shot on a cold db fires.
+#[tokio::test]
+async fn http_created_one_shot_on_cold_db_fires() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let addr = spawn_app(state).await;
+    let schema = kanban_schema();
+    let token = mint_scoped_token(addr, &db, &["workItems"]).await;
+
+    let resp = api_post(
+        addr,
+        "/api/schedule",
+        &token,
+        serde_json::json!({
+            "db": db.to_string(),
+            "when": {"type": "runAt", "ms": rtdb_server::db::now_ms() - 1_000},
+            "txn": insert_txn_json("workItems"),
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    assert!(
+        poll_until(&pool, &db, &schema, "workItems", 1, Duration::from_secs(15)).await,
+        "cold-db HTTP-created one-shot must fire without a prior data-plane op"
+    );
+
+    Ok(())
+}
+
+// (17) Same liveness contract through the WS `Schedule` frame: a past-due
+// one-shot on a cold db is acked `scheduleOk` and then fires.
+#[tokio::test]
+async fn ws_created_one_shot_on_cold_db_fires() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let addr = spawn_app(state).await;
+    let schema = kanban_schema();
+    let token = mint_scoped_token(addr, &db, &["workItems"]).await;
+
+    let mut ws = ws_connect(addr).await;
+    let hello = ws_auth(&mut ws, &token, &db).await;
+    assert_eq!(hello["type"], serde_json::json!("authOk"));
+
+    ws_send_json(
+        &mut ws,
+        serde_json::json!({
+            "type": "schedule", "scheduleId": "cold1",
+            "when": {"type": "runAt", "ms": rtdb_server::db::now_ms() - 1_000},
+            "txn": insert_txn_json("workItems"),
+        }),
+    )
+    .await;
+    let reply = ws_recv_json(&mut ws).await;
+    assert_eq!(reply["type"], serde_json::json!("scheduleOk"));
+
+    assert!(
+        poll_until(&pool, &db, &schema, "workItems", 1, Duration::from_secs(15)).await,
+        "cold-db WS-created one-shot must fire without a prior data-plane op"
     );
 
     Ok(())

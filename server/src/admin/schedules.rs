@@ -52,6 +52,12 @@ pub(super) async fn admin_list_schedules(
     if !db::database_exists(&state.pool, &db).await? {
         return Err(RtDbError::not_found("unknown database"));
     }
+    // The `scheduled_txns` table is ensured at database creation, but dbs
+    // created before that side-table rollout (and any path that skips it)
+    // rely on the per-db scheduler's startup ensure — which never ran on a
+    // cold db. Ensure inline (the `admin_storage_list` precedent) instead of
+    // 500ing.
+    scheduler::ensure_table(&state.pool, &db).await?;
     let schedules = scheduler::list(&state.pool, &db).await?;
     Ok(Json(AdminScheduleListResponse { schedules }))
 }
@@ -73,6 +79,13 @@ pub(super) async fn admin_create_schedule(
     // the four surfaces cannot drift if admin principals ever carry scopes.
     crate::txn::authorize_txn_tables(&PrincipalCtx::bypass(), &body.txn)?;
 
+    // Fire time runs on the per-db scheduler, which only exists once the
+    // per-db tasks spawn — ensure that before insert or a job started on a
+    // cold db sits `pending` forever. The spawned scheduler's startup ensure
+    // is NOT ordered against this insert, so ensure the table inline too.
+    state.realtime.committers.ensure_spawned(&db).await?;
+    scheduler::ensure_table(&state.pool, &db).await?;
+
     let (kind, due_at, cron) = scheduler::resolve_when(body.when, now_ms())?;
     let id = scheduler::insert(&state.pool, &db, kind, due_at, &body.txn, cron.as_deref()).await?;
     Ok(Json(AdminScheduleCreateResponse { id }))
@@ -87,6 +100,8 @@ pub(super) async fn admin_cancel_schedule(
     if !db::database_exists(&state.pool, &db).await? {
         return Err(RtDbError::not_found("unknown database"));
     }
+    // Cold-db guard, as `admin_list_schedules` above.
+    scheduler::ensure_table(&state.pool, &db).await?;
     let ok = scheduler::cancel(&state.pool, &db, &id).await?;
     Ok(Json(AdminScheduleManageResponse { ok }))
 }
@@ -101,6 +116,8 @@ async fn admin_set_schedule_paused(
     if !db::database_exists(&state.pool, db).await? {
         return Err(RtDbError::not_found("unknown database"));
     }
+    // Cold-db guard, as `admin_list_schedules` above.
+    scheduler::ensure_table(&state.pool, db).await?;
     let ok = scheduler::set_paused(&state.pool, db, id, paused).await?;
     Ok(Json(AdminScheduleManageResponse { ok }))
 }

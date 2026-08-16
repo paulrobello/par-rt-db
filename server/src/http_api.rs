@@ -368,6 +368,15 @@ async fn schedule_handler(
     // as bypass, so enqueue time is the only scoped check).
     crate::txn::authorize_txn_tables(&principal.row_ctx(), &body.txn)?;
 
+    // Fire time runs on the per-db scheduler, which only exists once the
+    // per-db tasks spawn — ensure that before insert or the job sits pending
+    // forever on a cold db (no Mutate/Subscribe since creation). The spawned
+    // scheduler's startup ensure is NOT ordered against this insert, so
+    // ensure the table inline too or a cold-db insert can lose the race and
+    // error once.
+    state.realtime.committers.ensure_spawned(&body.db).await?;
+    scheduler::ensure_table(&state.pool, &body.db).await?;
+
     let (kind, due_at, cron) = scheduler::resolve_when(body.when, now_ms())?;
     let id = scheduler::insert(
         &state.pool,
@@ -411,6 +420,10 @@ async fn run_manage_op(
         return Err(RtDbError::forbidden("read-only token cannot mutate"));
     }
     check_http_rate_limits(state, &principal, db).await?;
+    // Cold-db guard (the table is ensured only at scheduler startup for dbs
+    // predating the create-time side-table rollout): ensure inline so manage
+    // ops on a db with no spawned tasks are a clean `false`, not a 500.
+    scheduler::ensure_table(&state.pool, db).await?;
     let ok = match op {
         ManageOp::Cancel => scheduler::cancel(&state.pool, db, id).await?,
         ManageOp::Pause => scheduler::set_paused(&state.pool, db, id, true).await?,
@@ -464,6 +477,10 @@ async fn list_schedules_handler(
 ) -> Result<Json<ListResponse>, RtDbError> {
     let principal = authed(&state, &headers, &body.db).await?;
     check_http_rate_limits(&state, &principal, &body.db).await?;
+    // Cold-db guard (the table is ensured only at scheduler startup for dbs
+    // predating the create-time side-table rollout): ensure inline so a db
+    // with no spawned tasks lists empty, not 500.
+    scheduler::ensure_table(&state.pool, &body.db).await?;
     let schedules = scheduler::list(&state.pool, &body.db).await?;
     Ok(Json(ListResponse { schedules }))
 }

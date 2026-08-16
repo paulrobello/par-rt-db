@@ -649,10 +649,31 @@ async fn handle_schedule(
                 .and_then(|()| scheduler::resolve_when(when, now_ms()));
             match prepared {
                 Ok((kind, due_at, cron)) => {
-                    match scheduler::insert(&state.pool, db, kind, due_at, &txn, cron.as_deref())
-                        .await
-                    {
-                        Ok(id) => ServerMessage::ScheduleOk { schedule_id, id },
+                    // Fire time runs on the per-db scheduler, which only
+                    // exists once the per-db tasks spawn — ensure that (and
+                    // the table inline: the spawned scheduler's startup
+                    // ensure is not ordered against this insert) or a job
+                    // scheduled on a cold db sits pending forever.
+                    let spawned = match state.realtime.committers.ensure_spawned(db).await {
+                        Ok(()) => scheduler::ensure_table(&state.pool, db).await,
+                        Err(error) => Err(error),
+                    };
+                    match spawned {
+                        Ok(()) => {
+                            match scheduler::insert(
+                                &state.pool,
+                                db,
+                                kind,
+                                due_at,
+                                &txn,
+                                cron.as_deref(),
+                            )
+                            .await
+                            {
+                                Ok(id) => ServerMessage::ScheduleOk { schedule_id, id },
+                                Err(error) => ServerMessage::ScheduleErr { schedule_id, error },
+                            }
+                        }
                         Err(error) => ServerMessage::ScheduleErr { schedule_id, error },
                     }
                 }
@@ -674,13 +695,22 @@ async fn handle_list_schedules(fctx: &FrameCtx<'_>, schedule_id: String) -> bool
     let out_tx = fctx.out_tx;
 
     let reply = match authorize(&state.pool, principal, db).await {
-        Ok(()) => match scheduler::list(&state.pool, db).await {
-            Ok(schedules) => ServerMessage::ListSchedulesOk {
-                schedule_id,
-                schedules,
-            },
-            Err(error) => ServerMessage::ScheduleErr { schedule_id, error },
-        },
+        Ok(()) => {
+            // Cold-db guard: ensure the side table inline (it is ensured only
+            // at scheduler startup / db creation) so a cold db lists empty
+            // instead of erroring.
+            let listed = match scheduler::ensure_table(&state.pool, db).await {
+                Ok(()) => scheduler::list(&state.pool, db).await,
+                Err(error) => Err(error),
+            };
+            match listed {
+                Ok(schedules) => ServerMessage::ListSchedulesOk {
+                    schedule_id,
+                    schedules,
+                },
+                Err(error) => ServerMessage::ScheduleErr { schedule_id, error },
+            }
+        }
         Err(error) => ServerMessage::ScheduleErr { schedule_id, error },
     };
     let _ = out_tx.send(reply);
@@ -898,8 +928,14 @@ async fn run_simple_schedule<'a>(
             false,
             Some(RtDbError::forbidden("read-only token cannot mutate")),
         ),
-        Ok(()) => match action.await {
-            Ok(ok) => (ok, None),
+        // Cold-db guard: ensure the side table inline (it is ensured only at
+        // scheduler startup / db creation) so a manage op on a cold db is a
+        // clean `ok:false` no-op instead of an error.
+        Ok(()) => match scheduler::ensure_table(&state.pool, db).await {
+            Ok(()) => match action.await {
+                Ok(ok) => (ok, None),
+                Err(error) => (false, Some(error)),
+            },
             Err(error) => (false, Some(error)),
         },
         Err(error) => (false, Some(error)),
