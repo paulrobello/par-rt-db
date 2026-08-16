@@ -288,12 +288,13 @@ from par_rt_db import Mutation
 from par_rt_db.wire import StepRetry, WorkflowSpec, WorkflowStepSpec
 
 txn = Mutation.builder().insert("work_items", {"title": "welcome"}).build()
+txn2 = Mutation.builder().insert("work_items", {"title": "follow-up"}).build()
 spec = WorkflowSpec(
     name="onboard",
     steps=[
         WorkflowStepSpec(txn=txn.model_dump(by_alias=True)),
         WorkflowStepSpec(
-            txn=txn2,
+            txn=txn2.model_dump(by_alias=True),
             retry=StepRetry(max_attempts=5),
             sleep_before_ms=60_000,
         ),

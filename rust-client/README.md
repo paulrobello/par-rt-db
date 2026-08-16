@@ -130,7 +130,7 @@ use par_rt_db_client::{StepRetry, WorkflowInfo, WorkflowSpec, WorkflowStepSpec};
 let spec = WorkflowSpec {
     name: "onboard".into(),
     steps: vec![
-        WorkflowStepSpec { txn, ..Default::default() },
+        WorkflowStepSpec { txn, retry: None, sleep_before_ms: None },
         WorkflowStepSpec {
             txn: txn2,
             retry: Some(StepRetry { max_attempts: 5, ..Default::default() }),
