@@ -320,6 +320,148 @@ pub struct ScheduleInfo {
     pub fired_count: i64,
 }
 
+/// Per-step retry policy (FM-29). `maxAttempts` counts TOTAL attempts — the
+/// first try included. Defaults when a step omits `retry`: 3 attempts, 1s
+/// initial backoff doubling to a 60s cap.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StepRetry {
+    pub max_attempts: u32,
+    #[serde(default = "default_initial_retry_ms")]
+    pub initial_retry_ms: u64,
+    #[serde(default = "default_max_retry_ms")]
+    pub max_retry_ms: u64,
+}
+
+fn default_initial_retry_ms() -> u64 {
+    1_000
+}
+
+fn default_max_retry_ms() -> u64 {
+    60_000
+}
+
+impl Default for StepRetry {
+    fn default() -> Self {
+        Self {
+            max_attempts: 3,
+            initial_retry_ms: 1_000,
+            max_retry_ms: 60_000,
+        }
+    }
+}
+
+/// One workflow step: an ordinary `Transaction` plus policy. The txn may
+/// itself carry `Schedule`/`CancelSchedule` steps (FM-28 rules apply).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkflowStepSpec {
+    pub txn: Transaction,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry: Option<StepRetry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sleep_before_ms: Option<u64>,
+}
+
+/// A submitted workflow definition. Stored verbatim per run — a run
+/// snapshots its spec, so template edits never drift a live run.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkflowSpec {
+    pub name: String,
+    pub steps: Vec<WorkflowStepSpec>,
+}
+
+/// Run lifecycle. Closed domain (ARC-004/QA-008 pattern — was never a free
+/// string). Snake-case wire: pending|running|success|failed|cancelled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowStatus {
+    Pending,
+    Running,
+    Success,
+    Failed,
+    Cancelled,
+}
+
+impl WorkflowStatus {
+    pub fn as_wire_str(&self) -> &'static str {
+        match self {
+            WorkflowStatus::Pending => "pending",
+            WorkflowStatus::Running => "running",
+            WorkflowStatus::Success => "success",
+            WorkflowStatus::Failed => "failed",
+            WorkflowStatus::Cancelled => "cancelled",
+        }
+    }
+}
+
+impl std::str::FromStr for WorkflowStatus {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "pending" => Ok(WorkflowStatus::Pending),
+            "running" => Ok(WorkflowStatus::Running),
+            "success" => Ok(WorkflowStatus::Success),
+            "failed" => Ok(WorkflowStatus::Failed),
+            "cancelled" => Ok(WorkflowStatus::Cancelled),
+            other => Err(format!("unknown WorkflowStatus: {other}")),
+        }
+    }
+}
+
+/// Terminal record for one step: completed successfully, or exhausted its
+/// retries (`status: failed`). Individual retried attempts are NOT recorded —
+/// the `attempts` count on the entry (and on the row) carries them.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StepOutcome {
+    pub step_index: u32,
+    pub status: OutcomeStatus,
+    pub attempts: u32,
+    pub at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OutcomeStatus {
+    Success,
+    Failed,
+}
+
+/// List/get projection of one run (FM-29).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkflowInfo {
+    pub id: String,
+    pub name: String,
+    pub status: WorkflowStatus,
+    pub current_step: u32,
+    pub step_count: u32,
+    pub attempts: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sleep_until: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<i64>,
+}
+
+/// `GET .../{id}` shape: the info row plus the per-step outcome trail.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkflowInfoFull {
+    #[serde(flatten)]
+    pub info: WorkflowInfo,
+    pub step_outcomes: Vec<StepOutcome>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -644,5 +786,68 @@ mod tests {
             .unwrap()["type"],
             serde_json::json!("presenceErr")
         );
+    }
+
+    #[test]
+    fn workflow_spec_wire_shape() {
+        let spec = serde_json::from_value::<WorkflowSpec>(serde_json::json!({
+            "name": "drip",
+            "steps": [
+                { "txn": { "steps": [ { "op": "insert", "table": "t", "doc": {} } ] } },
+                { "txn": { "steps": [] },
+                  "retry": { "maxAttempts": 5, "initialRetryMs": 500, "maxRetryMs": 2000 },
+                  "sleepBeforeMs": 86400000 }
+            ]
+        }))
+        .unwrap();
+        assert_eq!(spec.steps.len(), 2);
+        assert_eq!(spec.steps[1].sleep_before_ms, Some(86_400_000));
+        let retry = spec.steps[1].retry.unwrap();
+        assert_eq!(
+            (
+                retry.max_attempts,
+                retry.initial_retry_ms,
+                retry.max_retry_ms
+            ),
+            (5, 500, 2000)
+        );
+        // Omitted retry defaults on deserialize:
+        assert!(
+            serde_json::from_value::<StepRetry>(serde_json::json!({"maxAttempts": 2}))
+                .unwrap()
+                .initial_retry_ms
+                == 1_000
+        );
+        // Round-trip: absent optionals are SKIPPED on serialize (corpus parity).
+        let v = serde_json::to_value(&spec).unwrap();
+        assert!(v["steps"][0].get("retry").is_none());
+        assert!(v["steps"][0].get("sleepBeforeMs").is_none());
+    }
+
+    #[test]
+    fn workflow_status_wire_is_snake_case() {
+        assert_eq!(
+            serde_json::to_value(WorkflowStatus::Pending).unwrap(),
+            serde_json::json!("pending")
+        );
+        assert_eq!(
+            "failed".parse::<WorkflowStatus>().unwrap(),
+            WorkflowStatus::Failed
+        );
+        assert!("bogus".parse::<WorkflowStatus>().is_err());
+    }
+
+    #[test]
+    fn workflow_info_wire_shape() {
+        let info = serde_json::from_value::<WorkflowInfo>(serde_json::json!({
+            "id": "wf1", "name": "drip", "status": "pending",
+            "currentStep": 0, "stepCount": 3, "attempts": 0,
+            "sleepUntil": 123, "createdAt": 1, "updatedAt": 2
+        }))
+        .unwrap();
+        assert_eq!(info.step_count, 3);
+        assert!(info.last_error.is_none());
+        let v = serde_json::to_value(&info).unwrap();
+        assert!(v.get("lastError").is_none() && v.get("finishedAt").is_none());
     }
 }
