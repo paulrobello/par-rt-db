@@ -6,6 +6,8 @@ import json
 import pytest
 
 from par_rt_db import AfterMs, Mutation, TableQuery, Transaction
+from par_rt_db.errors import ErrorCode
+from par_rt_db.wire import WorkflowSpec, WorkflowStepSpec
 from par_rt_db.ws_client import (
     ConnectionState,
     RtDbClient,
@@ -540,5 +542,124 @@ async def test_schedule_lifecycle():
         ack_sid = _id(conn, "cancelSchedule")
         await conn.deliver('{"type":"scheduleAck","scheduleId":"' + ack_sid + '","ok":true}')
         await asyncio.wait_for(cancel, 1.0)  # resolves without error
+    finally:
+        await client.close()
+
+
+# --- FM-29: workflow frames ---------------------------------------------------
+
+
+def _wf_id(conn: FakeConn, typ: str) -> str:
+    """Read the correlation id (workflowId) the client assigned."""
+    for f in conn.sent:
+        d = json.loads(f)
+        if d.get("type") == typ:
+            return d["workflowId"]
+    raise AssertionError(f"no frame of type {typ}")
+
+
+def _wf_spec() -> WorkflowSpec:
+    txn = _insert_txn()
+    return WorkflowSpec(name="drip", steps=[WorkflowStepSpec(txn=txn.model_dump(by_alias=True))])
+
+
+_WF_INFO = (
+    '{"id":"wf-1","name":"drip","status":"pending","currentStep":0,'
+    '"stepCount":1,"attempts":0,"createdAt":100,"updatedAt":100}'
+)
+
+
+async def test_workflow_lifecycle():
+    conn = FakeConn()
+    client = await _connected(conn)
+    try:
+        start = asyncio.create_task(client.start_workflow(_wf_spec()))
+        await _drain()
+        # The startWorkflow frame carries the spec under "spec" (camelCase step
+        # policy keys) with the client-assigned workflowId correlation key.
+        sent = json.loads([f for f in conn.sent if '"startWorkflow"' in f][0])
+        assert sent["workflowId"] == _wf_id(conn, "startWorkflow")
+        assert sent["spec"]["name"] == "drip"
+        assert sent["spec"]["steps"][0]["txn"]["steps"][0]["op"] == "insert"
+        await conn.deliver(
+            '{"type":"startWorkflowOk","workflowId":"'
+            + _wf_id(conn, "startWorkflow")
+            + '","info":'
+            + _WF_INFO
+            + "}"
+        )
+        info = await asyncio.wait_for(start, 1.0)
+        assert info.id == "wf-1" and info.step_count == 1
+
+        listed = asyncio.create_task(client.list_workflows())
+        await _drain()
+        await conn.deliver(
+            '{"type":"listWorkflowsOk","workflowId":"'
+            + _wf_id(conn, "listWorkflows")
+            + '","workflows":['
+            + _WF_INFO
+            + "]}"
+        )
+        rows = await asyncio.wait_for(listed, 1.0)
+        assert [r.id for r in rows] == ["wf-1"]
+
+        cancel = asyncio.create_task(client.cancel_workflow("wf-1"))
+        await _drain()
+        await conn.deliver(
+            '{"type":"workflowAck","workflowId":"' + _wf_id(conn, "cancelWorkflow") + '","ok":true}'
+        )
+        assert await asyncio.wait_for(cancel, 1.0) is True
+    finally:
+        await client.close()
+
+
+async def test_list_workflows_with_status_sends_filter():
+    conn = FakeConn()
+    client = await _connected(conn)
+    try:
+        listed = asyncio.create_task(client.list_workflows(status="failed"))
+        await _drain()
+        sent = json.loads([f for f in conn.sent if '"listWorkflows"' in f][0])
+        assert sent["status"] == "failed"
+        await conn.deliver(
+            '{"type":"listWorkflowsOk","workflowId":"' + sent["workflowId"] + '","workflows":[]}'
+        )
+        assert await asyncio.wait_for(listed, 1.0) == []
+    finally:
+        await client.close()
+
+
+async def test_workflow_ack_false_raises():
+    conn = FakeConn()
+    client = await _connected(conn)
+    try:
+        cancel = asyncio.create_task(client.cancel_workflow("wf-gone"))
+        await _drain()
+        await conn.deliver(
+            '{"type":"workflowAck","workflowId":"'
+            + _wf_id(conn, "cancelWorkflow")
+            + '","ok":false,"error":{"code":"NOT_FOUND","message":"no run"}}'
+        )
+        with pytest.raises(RtDbError) as ei:
+            await asyncio.wait_for(cancel, 1.0)
+        assert ei.value.code is ErrorCode.NOT_FOUND
+    finally:
+        await client.close()
+
+
+async def test_start_workflow_err_rejects():
+    conn = FakeConn()
+    client = await _connected(conn)
+    try:
+        start = asyncio.create_task(client.start_workflow(_wf_spec()))
+        await _drain()
+        await conn.deliver(
+            '{"type":"startWorkflowErr","workflowId":"'
+            + _wf_id(conn, "startWorkflow")
+            + '","error":{"code":"BAD_REQUEST","message":"empty steps"}}'
+        )
+        with pytest.raises(RtDbError) as ei:
+            await asyncio.wait_for(start, 1.0)
+        assert ei.value.code is ErrorCode.BAD_REQUEST
     finally:
         await client.close()

@@ -47,6 +47,7 @@ from par_rt_db.admin_models import MergeConflict, MergeDbResult
 from par_rt_db.errors import ErrorCode, RtDbError
 from par_rt_db.http_client import SubscriptionInfo
 from par_rt_db.schema import Schema
+from par_rt_db.wire import WorkflowInfo, WorkflowInfoFull
 
 ADMIN_BEARER = "Bearer admin-key"
 URL = "https://rtdb.example"
@@ -1954,3 +1955,144 @@ async def test_async_get_slow_queries_builds_request() -> None:
     assert captured["params"] == {"db": "kanban"}
     assert isinstance(r, SlowQueriesResponse)
     assert r.threshold_ms == 0
+
+
+# --- workflow surface (FM-29) -------------------------------------------------
+
+_WF_ROW = {
+    "id": "wf-1",
+    "name": "drip",
+    "status": "pending",
+    "currentStep": 0,
+    "stepCount": 2,
+    "attempts": 0,
+    "createdAt": 100,
+    "updatedAt": 100,
+}
+
+
+def test_admin_list_workflows_gets_with_query_params() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["method"] = request.method
+        captured["path"] = request.url.path
+        captured["query"] = str(request.url.params)
+        return httpx.Response(200, json={"workflows": [_WF_ROW]})
+
+    with _sync_client(handler) as c:
+        rows = c.admin_list_workflows("kanban", status="pending", limit=5)
+    assert captured["method"] == "GET"
+    assert captured["path"] == "/admin/db/kanban/workflows"
+    assert "status=pending" in captured["query"] and "limit=5" in captured["query"]
+    assert len(rows) == 1
+    assert isinstance(rows[0], WorkflowInfo)
+    assert rows[0].step_count == 2
+
+    with _sync_client(handler) as c:
+        c.admin_list_workflows("kanban")
+    assert captured["query"] == ""
+
+
+def test_admin_start_workflow_posts_spec_returns_id() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["method"] = request.method
+        captured["path"] = request.url.path
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"id": "wf-9"})
+
+    from par_rt_db.wire import WorkflowSpec, WorkflowStepSpec
+
+    txn = Mutation.builder().insert("items", {"name": "x"}).build()
+    spec = WorkflowSpec(name="drip", steps=[WorkflowStepSpec(txn=txn.model_dump(by_alias=True))])
+    with _sync_client(handler) as c:
+        wid = c.admin_start_workflow("kanban", spec)
+    assert wid == "wf-9"
+    assert captured["method"] == "POST"
+    assert captured["path"] == "/admin/db/kanban/workflows"
+    assert captured["body"] == {
+        "name": "drip",
+        "steps": [{"txn": {"steps": [{"op": "insert", "table": "items", "doc": {"name": "x"}}]}}],
+    }
+
+
+def test_admin_get_workflow_returns_full_row() -> None:
+    full_row = {
+        **_WF_ROW,
+        "startedAt": 150,
+        "stepOutcomes": [{"stepIndex": 0, "status": "success", "attempts": 1, "at": 150}],
+    }
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["path"] = request.url.path
+        return httpx.Response(200, json=full_row)
+
+    with _sync_client(handler) as c:
+        full = c.admin_get_workflow("kanban", "wf-1")
+    assert captured["path"] == "/admin/db/kanban/workflows/wf-1"
+    assert isinstance(full, WorkflowInfoFull)
+    assert full.step_outcomes[0].status == "success"
+    assert full.started_at == 150
+
+
+def test_admin_cancel_and_delete_workflow_return_bools() -> None:
+    seen: list[tuple[str, str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content) if request.content else None
+        seen.append((request.method, request.url.path, body))
+        ok = request.method == "POST"  # cancel true, delete false
+        return httpx.Response(200, json={"ok": ok})
+
+    with _sync_client(handler) as c:
+        cancelled = c.admin_cancel_workflow("kanban", "wf-1")
+        deleted = c.admin_delete_workflow("kanban", "wf-1")
+    assert cancelled is True
+    assert deleted is False  # already-gone delete is a legitimate ok:false
+    assert seen == [
+        ("POST", "/admin/db/kanban/workflows/wf-1/cancel", {}),
+        ("DELETE", "/admin/db/kanban/workflows/wf-1", None),
+    ]
+
+
+async def test_async_admin_workflow_ops() -> None:
+    from par_rt_db.wire import WorkflowSpec, WorkflowStepSpec
+
+    txn = Mutation.builder().insert("items", {"name": "x"}).build()
+    spec = WorkflowSpec(name="drip", steps=[WorkflowStepSpec(txn=txn.model_dump(by_alias=True))])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/admin/db/kanban/workflows":
+            return httpx.Response(200, json={"workflows": [_WF_ROW]})
+        if request.method == "POST" and request.url.path == "/admin/db/kanban/workflows":
+            return httpx.Response(200, json={"id": "wf-9"})
+        if request.method == "GET" and request.url.path == "/admin/db/kanban/workflows/wf-1":
+            return httpx.Response(
+                200,
+                json={
+                    **_WF_ROW,
+                    "stepOutcomes": [
+                        {"stepIndex": 0, "status": "success", "attempts": 1, "at": 150}
+                    ],
+                },
+            )
+        if request.method == "POST" and request.url.path.endswith("/cancel"):
+            return httpx.Response(200, json={"ok": True})
+        if request.method == "DELETE":
+            return httpx.Response(200, json={"ok": False})
+        return httpx.Response(404, text=f"no mock for {request.url.path}")
+
+    async with _async_client(handler) as c:
+        rows = await c.admin_list_workflows("kanban")
+        wid = await c.admin_start_workflow("kanban", spec)
+        full = await c.admin_get_workflow("kanban", "wf-1")
+        cancelled = await c.admin_cancel_workflow("kanban", "wf-1")
+        deleted = await c.admin_delete_workflow("kanban", "wf-1")
+    assert [r.id for r in rows] == ["wf-1"]
+    assert wid == "wf-9"
+    assert full.step_outcomes[0].attempts == 1
+    assert cancelled is True
+    assert deleted is False

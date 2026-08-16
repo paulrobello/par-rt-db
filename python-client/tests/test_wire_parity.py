@@ -46,6 +46,14 @@ CLIENT_FIXTURES: list[str] = [
     '{"type": "pauseSchedule", "scheduleId": "s1", "id": "job-9"}',
     '{"type": "resumeSchedule", "scheduleId": "s1", "id": "job-9"}',
     '{"type": "listSchedules", "scheduleId": "s1"}',
+    # FM-29 workflow frames (mirrors server protocol.rs tests).
+    (
+        '{"type": "startWorkflow", "workflowId": "c1", '
+        '"spec": {"name": "drip", "steps": [{"txn": {"steps": []}}]}}'
+    ),
+    '{"type": "cancelWorkflow", "workflowId": "c2", "id": "wf9"}',
+    '{"type": "listWorkflows", "workflowId": "c3"}',
+    '{"type": "listWorkflows", "workflowId": "c3", "status": "failed"}',
 ]
 
 SERVER_FIXTURES: list[str] = [
@@ -61,6 +69,28 @@ SERVER_FIXTURES: list[str] = [
     (
         '{"type": "scheduleAck", "scheduleId": "s1", "ok": false, '
         '"error": {"code": "NOT_FOUND", "message": "x"}}'
+    ),
+    # FM-29 workflow frames (mirrors server protocol.rs tests). The
+    # startWorkflowOk info carries the omitted-when-None optional fields'
+    # absence; workflowAck mirrors scheduleAck's ok/error shape.
+    (
+        '{"type": "startWorkflowOk", "workflowId": "c1", "info": {"id": "wf1", "name": "drip", '
+        '"status": "pending", "currentStep": 0, "stepCount": 2, "attempts": 0, '
+        '"createdAt": 100, "updatedAt": 100}}'
+    ),
+    (
+        '{"type": "startWorkflowErr", "workflowId": "c1", '
+        '"error": {"code": "BAD_REQUEST", "message": "empty steps"}}'
+    ),
+    '{"type": "workflowAck", "workflowId": "c2", "ok": true}',
+    (
+        '{"type": "workflowAck", "workflowId": "c2", "ok": false, '
+        '"error": {"code": "NOT_FOUND", "message": "no run"}}'
+    ),
+    (
+        '{"type": "listWorkflowsOk", "workflowId": "c3", "workflows": [{"id": "wf1", '
+        '"name": "drip", "status": "running", "currentStep": 1, "stepCount": 2, '
+        '"attempts": 0, "sleepUntil": 9000, "createdAt": 100, "updatedAt": 150}]}'
     ),
 ]
 

@@ -72,6 +72,7 @@ from .http_client import (
     _BATCH_ADAPTER,
     _SCHEDULES_ADAPTER,
     _STEP_RESULT_ADAPTER,
+    _WORKFLOWS_ADAPTER,
     AdminMember,
     ConfigResponse,
     DbStats,
@@ -85,7 +86,14 @@ from .http_client import (
     TokenInfo,
     UploadResult,
 )
-from .wire import BatchQueryOutcome, ScheduleInfo, ScheduleWhen
+from .wire import (
+    BatchQueryOutcome,
+    ScheduleInfo,
+    ScheduleWhen,
+    WorkflowInfo,
+    WorkflowSpec,
+    WorkflowStatus,
+)
 
 # 64 KiB — matches httpx's ``IteratorByteStream.CHUNK_SIZE`` so the async
 # adaptation of a sync file-like object chunks at the same granularity.
@@ -281,6 +289,30 @@ class RtDbAsyncHttpClient:
         """``POST /api/schedules`` → every schedule for this db."""
         resp = await self._send("POST", "/api/schedules", json={"db": self._db})
         return _SCHEDULES_ADAPTER.validate_python(resp.json()["schedules"])
+
+    # --- data plane: workflows (POST /api/workflows*) — FM-29 ---
+
+    async def start_workflow(self, spec: WorkflowSpec) -> str:
+        """``POST /api/workflows`` → the new run's id."""
+        body = {"db": self._db, "spec": spec.model_dump(by_alias=True, mode="json")}
+        resp = await self._send("POST", "/api/workflows", json=body)
+        return str(resp.json()["id"])
+
+    async def list_workflows(self, status: WorkflowStatus | None = None) -> list[WorkflowInfo]:
+        """``POST /api/workflows/list`` → this db's runs, newest first (an
+        optional ``status`` filter; capped at 100 server-side)."""
+        body: dict[str, Any] = {"db": self._db}
+        if status is not None:
+            body["status"] = status
+        resp = await self._send("POST", "/api/workflows/list", json=body)
+        return _WORKFLOWS_ADAPTER.validate_python(resp.json()["workflows"])
+
+    async def cancel_workflow(self, id: str) -> bool:
+        """``POST /api/workflows/{id}/cancel`` → ``True`` when a pending/running
+        run flipped to cancelled; ``False`` for a missing or already-terminal
+        run (a no-op, not an error)."""
+        resp = await self._send("POST", f"/api/workflows/{id}/cancel", json={"db": self._db})
+        return bool(resp.json()["cancelled"])
 
     # --- data plane: batch query (POST /api/query-batch) ---
 

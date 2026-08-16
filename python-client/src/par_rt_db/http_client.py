@@ -110,7 +110,14 @@ from .migration import Directive, MigrateRequest
 from .mutation import StepResult, Transaction
 from .query import Query, TableQuery, _terminal_of, parse_result
 from .schema import SchemaDef
-from .wire import BatchQueryOutcome, ScheduleInfo, ScheduleWhen
+from .wire import (
+    BatchQueryOutcome,
+    ScheduleInfo,
+    ScheduleWhen,
+    WorkflowInfo,
+    WorkflowSpec,
+    WorkflowStatus,
+)
 
 if TYPE_CHECKING:
     import httpx
@@ -195,6 +202,7 @@ class SignedUrl(_Wire):
 # ``_STEP_RESULT_ADAPTER`` is imported from :mod:`par_rt_db.admin_models` (one
 # shared adapter across the data-plane and admin clients).
 _SCHEDULES_ADAPTER = TypeAdapter(list[ScheduleInfo])
+_WORKFLOWS_ADAPTER = TypeAdapter(list[WorkflowInfo])
 _BATCH_ADAPTER = TypeAdapter(list[BatchQueryOutcome])
 
 
@@ -386,6 +394,30 @@ class RtDbHttpClient:
         """``POST /api/schedules`` → every schedule for this db."""
         resp = self._send("POST", "/api/schedules", json={"db": self._db})
         return _SCHEDULES_ADAPTER.validate_python(resp.json()["schedules"])
+
+    # --- data plane: workflows (POST /api/workflows*) — FM-29 ---
+
+    def start_workflow(self, spec: WorkflowSpec) -> str:
+        """``POST /api/workflows`` → the new run's id."""
+        body = {"db": self._db, "spec": spec.model_dump(by_alias=True, mode="json")}
+        resp = self._send("POST", "/api/workflows", json=body)
+        return str(resp.json()["id"])
+
+    def list_workflows(self, status: WorkflowStatus | None = None) -> list[WorkflowInfo]:
+        """``POST /api/workflows/list`` → this db's runs, newest first (an
+        optional ``status`` filter; capped at 100 server-side)."""
+        body: dict[str, Any] = {"db": self._db}
+        if status is not None:
+            body["status"] = status
+        resp = self._send("POST", "/api/workflows/list", json=body)
+        return _WORKFLOWS_ADAPTER.validate_python(resp.json()["workflows"])
+
+    def cancel_workflow(self, id: str) -> bool:
+        """``POST /api/workflows/{id}/cancel`` → ``True`` when a pending/running
+        run flipped to cancelled; ``False`` for a missing or already-terminal
+        run (a no-op, not an error)."""
+        resp = self._send("POST", f"/api/workflows/{id}/cancel", json={"db": self._db})
+        return bool(resp.json()["cancelled"])
 
     # --- data plane: batch query (POST /api/query-batch) ---
 

@@ -32,15 +32,21 @@ from .wire import (
     ScheduleInfo,
     ScheduleWhen,
     ServerMessage,
+    WorkflowInfo,
+    WorkflowSpec,
+    WorkflowStatus,
     _ClientCancelSchedule,
+    _ClientCancelWorkflow,
     _ClientLeavePresence,
     _ClientListSchedules,
+    _ClientListWorkflows,
     _ClientMutate,
     _ClientPauseSchedule,
     _ClientPresence,
     _ClientPresenceState,
     _ClientResumeSchedule,
     _ClientSchedule,
+    _ClientStartWorkflow,
 )
 
 _logger = logging.getLogger(__name__)
@@ -166,6 +172,18 @@ class _SchedPending:
 
 
 @dataclass
+class _WfPending:
+    """One in-flight or queued workflow op, keyed by its correlation id
+    (``wf-{n}``). Mirrors :class:`_SchedPending` (FM-29)."""
+
+    future: asyncio.Future
+    frame: str
+    id: str = ""  # the workflowId correlation key; popped by this on drop
+    kind: str = ""  # "start" | "cancel" | "list"
+    sent: bool = False
+
+
+@dataclass
 class _PresenceRoom:
     """Internal per-room presence state (ENH-015), shared by every ``Presence``
     handle on that room. Mirrors ``_Sub``: ``cond`` wakes the async iterator;
@@ -238,6 +256,7 @@ class RtDbClient:
         self._counter = 0
         self._pending_mut: dict[str, Any] = {}
         self._pending_sched: dict[str, Any] = {}
+        self._pending_wf: dict[str, Any] = {}
         # Reverse index (mut_id -> query_ids) for optimistic-overlay rollback;
         # only populated when ``optimistic_updates`` is on.
         self._overlays: dict[str, set[str]] = {}
@@ -443,6 +462,10 @@ class RtDbClient:
             if not sp.sent:
                 await self._send(sp.frame)
                 sp.sent = True
+        for wp in list(self._pending_wf.values()):
+            if not wp.sent:
+                await self._send(wp.frame)
+                wp.sent = True
         # ENH-015: replay one join per joined room, using the latest join_state
         # (a pre-auth update_presence advances it, so the replay stays fresh).
         for room in list(self._presence_by_room):
@@ -464,6 +487,8 @@ class RtDbClient:
             self._on_mutate_err(msg)
         elif tag in ("scheduleOk", "scheduleErr", "scheduleAck", "listSchedulesOk"):
             self._on_sched(msg)
+        elif tag in ("startWorkflowOk", "startWorkflowErr", "workflowAck", "listWorkflowsOk"):
+            self._on_workflow(msg)
         elif tag == "presenceSnapshot":
             self._on_presence_snapshot(msg)
         elif tag == "presenceErr":
@@ -619,6 +644,32 @@ class RtDbClient:
         """List the scheduled jobs on this database."""
         return await self._sched_op("list")  # type: ignore[return-value]
 
+    # --- workflows (FM-29) ---------------------------------------------
+
+    async def start_workflow(self, spec: WorkflowSpec) -> WorkflowInfo:
+        """Start a workflow run from ``spec``. Returns the inserted run's info
+        projection (pending, step 0)."""
+        return await self._wf_op("start", spec=spec)  # type: ignore[return-value]
+
+    async def cancel_workflow(self, id: str) -> bool:
+        """Cancel the workflow run ``id``. ``True`` when a pending/running run
+        was cancelled; ``False`` when it was missing or already terminal."""
+        return await self._wf_op("cancel", id=id)  # type: ignore[return-value]
+
+    async def list_workflows(self, status: WorkflowStatus | None = None) -> list[WorkflowInfo]:
+        """List workflow runs on this database, newest first. ``status``
+        filters to that lifecycle state."""
+        return await self._wf_op("list", status=status)  # type: ignore[return-value]
+
+    async def _wf_op(self, kind: str, **fields: Any) -> Any:
+        self._counter += 1
+        wid = f"wf-{self._counter}"
+        frame = _build_wf_frame(kind, wid, fields)
+        fut = asyncio.get_running_loop().create_future()
+        self._pending_wf[wid] = _WfPending(fut, frame, id=wid, kind=kind)
+        await self._dispatch_send(wid, self._pending_wf)
+        return await fut
+
     async def _sched_op(self, kind: str, **fields: Any) -> Any:
         self._counter += 1
         sid = f"sch-{self._counter}"
@@ -664,6 +715,30 @@ class RtDbClient:
                     else {"code": "INTERNAL", "message": "schedule ack failed"}
                 )
                 sp.future.set_exception(RtDbError.from_envelope(env))
+
+    def _on_workflow(self, msg: Any) -> None:
+        wp = self._pending_wf.pop(msg.workflow_id, None)
+        if wp is None or wp.future.done():
+            return
+        tag = _tag(msg)
+        if tag == "startWorkflowOk":
+            wp.future.set_result(msg.info)
+        elif tag == "listWorkflowsOk":
+            wp.future.set_result(list(msg.workflows))
+        elif tag == "startWorkflowErr":
+            # Also carries listWorkflows failures — the server types list
+            # errors as this frame (no distinct list-error frame exists).
+            wp.future.set_exception(RtDbError.from_envelope(msg.error.model_dump()))
+        elif tag == "workflowAck":
+            if msg.ok:
+                wp.future.set_result(True)
+            else:
+                env = (
+                    msg.error.model_dump()
+                    if msg.error is not None
+                    else {"code": "INTERNAL", "message": "workflow ack failed"}
+                )
+                wp.future.set_exception(RtDbError.from_envelope(env))
 
     # --- presence (ENH-015) -------------------------------------------
     #
@@ -789,6 +864,10 @@ class RtDbClient:
             if sp.sent and not sp.future.done():
                 self._pending_sched.pop(sp.id, None)
                 sp.future.set_exception(RtDbError(ErrorCode.INTERNAL, reason))
+        for wp in list(self._pending_wf.values()):
+            if wp.sent and not wp.future.done():
+                self._pending_wf.pop(wp.id, None)
+                wp.future.set_exception(RtDbError(ErrorCode.INTERNAL, reason))
 
     def _reject_all_pending(self, reason: str) -> None:
         for mp in list(self._pending_mut.values()):
@@ -802,6 +881,10 @@ class RtDbClient:
             if not sp.future.done():
                 sp.future.set_exception(RtDbError(ErrorCode.INTERNAL, reason))
         self._pending_sched.clear()
+        for wp in list(self._pending_wf.values()):
+            if not wp.future.done():
+                wp.future.set_exception(RtDbError(ErrorCode.INTERNAL, reason))
+        self._pending_wf.clear()
 
     # --- optimistic updates -------------------------------------------
     #
@@ -1046,6 +1129,21 @@ def _build_sched_frame(kind: str, sid: str, fields: dict[str, Any]) -> str:
             by_alias=True
         )
     return _ClientListSchedules(schedule_id=sid).model_dump_json(by_alias=True)
+
+
+def _build_wf_frame(kind: str, wid: str, fields: dict[str, Any]) -> str:
+    """Serialize a workflow-op frame for correlation id ``wid`` (``wf-{n}``)."""
+    if kind == "start":
+        return _ClientStartWorkflow(workflow_id=wid, spec=fields["spec"]).model_dump_json(
+            by_alias=True
+        )
+    if kind == "cancel":
+        return _ClientCancelWorkflow(workflow_id=wid, id=fields["id"]).model_dump_json(
+            by_alias=True
+        )
+    return _ClientListWorkflows(workflow_id=wid, status=fields.get("status")).model_dump_json(
+        by_alias=True
+    )
 
 
 async def _default_connect(url: str) -> Connection:

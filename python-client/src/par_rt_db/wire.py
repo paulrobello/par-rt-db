@@ -120,6 +120,111 @@ class ScheduleInfo(_Camel):
         return out
 
 
+# --- Workflows (FM-29) ---
+
+
+class StepRetry(_Camel):
+    """Per-step retry policy. ``max_attempts`` counts TOTAL attempts — the
+    first try included. Defaults when a step omits ``retry`` (server side):
+    3 attempts, 1s initial backoff doubling to a 60s cap."""
+
+    max_attempts: int
+    initial_retry_ms: int = 1_000
+    max_retry_ms: int = 60_000
+
+
+class WorkflowStepSpec(_Camel):
+    """One workflow step: an ordinary ``Transaction`` plus policy. The txn may
+    itself carry schedule/cancelSchedule steps. ``retry``/``sleep_before_ms``
+    are omitted on the wire when ``None``.
+
+    ``txn`` is deliberately ``dict[str, Any]`` (the dumped ``Transaction``)
+    rather than the ``Transaction`` model itself, keeping the wire layer
+    decoupled from the DSL layer (avoids a circular import with
+    ``mutation.py``) — same convention as ``_ClientSchedule.txn``."""
+
+    txn: dict[str, Any]
+    retry: StepRetry | None = None
+    sleep_before_ms: int | None = None
+
+    @model_serializer(mode="wrap")
+    def _drop_none_optional(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        out = handler(self)
+        for alias in ("retry", "sleepBeforeMs"):
+            if out.get(alias) is None:
+                out.pop(alias, None)
+        return out
+
+
+class WorkflowSpec(_Camel):
+    """A submitted workflow definition. Stored verbatim per run — a run
+    snapshots its spec, so template edits never drift a live run."""
+
+    name: str
+    steps: list[WorkflowStepSpec]
+
+
+# Snake-case wire values (server enum is rename_all = "snake_case").
+WorkflowStatus = Literal["pending", "running", "success", "failed", "cancelled"]
+
+# Lowercase wire values (server OutcomeStatus enum).
+OutcomeStatus = Literal["success", "failed"]
+
+
+class StepOutcome(_Camel):
+    """Terminal record for one step: completed successfully, or exhausted its
+    retries (``status: "failed"``). Individual retried attempts are NOT
+    recorded — the ``attempts`` count carries them. ``error`` is omitted on
+    the wire when ``None``."""
+
+    step_index: int
+    status: OutcomeStatus
+    attempts: int
+    at: int
+    error: str | None = None
+
+    @model_serializer(mode="wrap")
+    def _drop_none_optional(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        out = handler(self)
+        if out.get("error") is None:
+            out.pop("error", None)
+        return out
+
+
+class WorkflowInfo(_Camel):
+    """List/get projection of one run. ``sleep_until``/``last_error``/
+    ``started_at``/``finished_at`` are omitted on the wire when ``None``."""
+
+    id: str
+    name: str
+    status: WorkflowStatus
+    current_step: int
+    step_count: int
+    attempts: int
+    sleep_until: int | None = None
+    last_error: str | None = None
+    created_at: int
+    updated_at: int
+    started_at: int | None = None
+    finished_at: int | None = None
+
+    @model_serializer(mode="wrap")
+    def _drop_none_optional(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        out = handler(self)
+        for alias in ("sleepUntil", "lastError", "startedAt", "finishedAt"):
+            if out.get(alias) is None:
+                out.pop(alias, None)
+        return out
+
+
+class WorkflowInfoFull(WorkflowInfo):
+    """The ``GET .../{id}`` shape: the info row (flattened on the wire — a
+    pydantic subclass models ``#[serde(flatten)]``) plus the per-step outcome
+    trail."""
+
+    step_outcomes: list[StepOutcome]
+
+
 # --- FilterExpr (discriminator "op", lowercase) ---
 
 
@@ -435,6 +540,38 @@ class _ClientListSchedules(_Camel):
     schedule_id: str
 
 
+class _ClientStartWorkflow(_Camel):
+    """FM-29 start a workflow run. ``spec`` snapshots the definition."""
+
+    type: Literal["startWorkflow"] = "startWorkflow"
+    workflow_id: str
+    spec: WorkflowSpec
+
+
+class _ClientCancelWorkflow(_Camel):
+    """FM-29 cancel a pending/running workflow run by id."""
+
+    type: Literal["cancelWorkflow"] = "cancelWorkflow"
+    workflow_id: str
+    id: str
+
+
+class _ClientListWorkflows(_Camel):
+    """FM-29 list runs, newest first. ``status`` is omitted on the wire when
+    ``None`` (no filter)."""
+
+    type: Literal["listWorkflows"] = "listWorkflows"
+    workflow_id: str
+    status: WorkflowStatus | None = None
+
+    @model_serializer(mode="wrap")
+    def _drop_none_status(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        out = handler(self)
+        if out.get("status") is None:
+            out.pop("status", None)
+        return out
+
+
 class _ClientPing(_Camel):
     type: Literal["ping"] = "ping"
 
@@ -493,6 +630,9 @@ ClientMessage = Annotated[
         | _ClientPauseSchedule
         | _ClientResumeSchedule
         | _ClientListSchedules
+        | _ClientStartWorkflow
+        | _ClientCancelWorkflow
+        | _ClientListWorkflows
         | _ClientPresence
         | _ClientPresenceState
         | _ClientLeavePresence
@@ -620,6 +760,47 @@ class _ServerListSchedulesOk(_Camel):
     schedules: list[ScheduleInfo]
 
 
+class _ServerStartWorkflowOk(_Camel):
+    """FM-29 run accepted — carries the re-read row's info projection."""
+
+    type: Literal["startWorkflowOk"] = "startWorkflowOk"
+    workflow_id: str
+    info: WorkflowInfo
+
+
+class _ServerStartWorkflowErr(_Camel):
+    """FM-29 the start op (and listWorkflows failures) were rejected. The
+    server types list failures as this same frame — there is no distinct
+    list-error frame."""
+
+    type: Literal["startWorkflowErr"] = "startWorkflowErr"
+    workflow_id: str
+    error: _ErrorEnvelope
+
+
+class _ServerWorkflowAck(_Camel):
+    """FM-29 reply to cancelWorkflow. ``error`` is omitted on the wire when
+    ``ok``."""
+
+    type: Literal["workflowAck"] = "workflowAck"
+    workflow_id: str
+    ok: bool
+    error: _ErrorEnvelope | None = None
+
+    @model_serializer(mode="wrap")
+    def _drop_error_when_none(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        out = handler(self)
+        if out.get("error") is None:
+            out.pop("error", None)
+        return out
+
+
+class _ServerListWorkflowsOk(_Camel):
+    type: Literal["listWorkflowsOk"] = "listWorkflowsOk"
+    workflow_id: str
+    workflows: list[WorkflowInfo]
+
+
 class _ServerPresenceSnapshot(_Camel):
     """ENH-015 fan-out of a room's current member list (server→client)."""
 
@@ -652,6 +833,10 @@ ServerMessage = Annotated[
         | _ServerScheduleErr
         | _ServerScheduleAck
         | _ServerListSchedulesOk
+        | _ServerStartWorkflowOk
+        | _ServerStartWorkflowErr
+        | _ServerWorkflowAck
+        | _ServerListWorkflowsOk
         | _ServerPresenceSnapshot
         | _ServerPresenceErr
         | _ServerPong

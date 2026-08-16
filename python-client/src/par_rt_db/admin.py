@@ -102,6 +102,7 @@ from .migration import Directive, MigrateRequest
 from .mutation import StepResult, Transaction
 from .query import Query, TableQuery, _terminal_of, parse_result
 from .schema import SchemaDef
+from .wire import WorkflowInfo, WorkflowInfoFull, WorkflowSpec, WorkflowStatus
 
 if TYPE_CHECKING:
     import httpx
@@ -172,6 +173,13 @@ def _parse_restored_version(resp: httpx.Response) -> int:
 
 def _parse_webhook_id(resp: httpx.Response) -> int:
     return int(resp.json()["id"])
+
+
+def _parse_ok_bool(resp: httpx.Response) -> bool:
+    """Read a ``{ok: bool}`` body as a return value — for routes where
+    ``ok:false`` is a legitimate outcome (e.g. cancelling/deleting a missing or
+    already-terminal workflow run), not an error."""
+    return bool(resp.json()["ok"])
 
 
 def _parse_step_results(resp: httpx.Response) -> list[StepResult]:
@@ -443,6 +451,53 @@ def _op_restore_backup(name: str) -> _AdminRequest:
         {"json": {"name": name, "confirm": name}},
         _parse_json_object,
     )
+
+
+# --- workflow surface (FM-29) ---
+
+
+def _op_admin_list_workflows(
+    db: str,
+    *,
+    status: WorkflowStatus | None = None,
+    limit: int | None = None,
+) -> _AdminRequest:
+    params: dict[str, Any] = {}
+    if status is not None:
+        params["status"] = status
+    if limit is not None:
+        params["limit"] = limit
+    return _AdminRequest(
+        "GET",
+        f"/admin/db/{db}/workflows",
+        {"params": params},
+        _parse_model_list(WorkflowInfo, "workflows"),
+    )
+
+
+def _op_admin_start_workflow(db: str, spec: WorkflowSpec) -> _AdminRequest:
+    return _AdminRequest(
+        "POST",
+        f"/admin/db/{db}/workflows",
+        {"json": spec.model_dump(by_alias=True, mode="json")},
+        lambda resp: str(resp.json()["id"]),
+    )
+
+
+def _op_admin_get_workflow(db: str, id: str) -> _AdminRequest:
+    return _AdminRequest(
+        "GET", f"/admin/db/{db}/workflows/{id}", {}, _parse_model(WorkflowInfoFull)
+    )
+
+
+def _op_admin_cancel_workflow(db: str, id: str) -> _AdminRequest:
+    return _AdminRequest(
+        "POST", f"/admin/db/{db}/workflows/{id}/cancel", {"json": {}}, _parse_ok_bool
+    )
+
+
+def _op_admin_delete_workflow(db: str, id: str) -> _AdminRequest:
+    return _AdminRequest("DELETE", f"/admin/db/{db}/workflows/{id}", {}, _parse_ok_bool)
 
 
 def _op_mint_token(
@@ -1025,6 +1080,43 @@ class RtDbAdminClient:
         """
         return self._executor.run(_op_restore_backup(name))
 
+    # --- workflow surface (FM-29) ---
+
+    def admin_list_workflows(
+        self,
+        db: str,
+        *,
+        status: WorkflowStatus | None = None,
+        limit: int | None = None,
+    ) -> list[WorkflowInfo]:
+        """``GET /admin/db/{db}/workflows`` → this db's runs, newest first.
+
+        ``status`` filters to a lifecycle state; ``limit`` caps the page.
+        Omitted filters are not sent.
+        """
+        return self._executor.run(_op_admin_list_workflows(db, status=status, limit=limit))
+
+    def admin_start_workflow(self, db: str, spec: WorkflowSpec) -> str:
+        """``POST /admin/db/{db}/workflows`` with the spec as the body → the new
+        run's id. The run snapshots ``spec`` at insert time."""
+        return self._executor.run(_op_admin_start_workflow(db, spec))
+
+    def admin_get_workflow(self, db: str, id: str) -> WorkflowInfoFull:
+        """``GET /admin/db/{db}/workflows/{id}`` → the full row including the
+        per-step outcome trail."""
+        return self._executor.run(_op_admin_get_workflow(db, id))
+
+    def admin_cancel_workflow(self, db: str, id: str) -> bool:
+        """``POST .../workflows/{id}/cancel`` → ``True`` when a pending/running
+        run flipped to cancelled; ``False`` when missing or already terminal (a
+        no-op, not an error)."""
+        return self._executor.run(_op_admin_cancel_workflow(db, id))
+
+    def admin_delete_workflow(self, db: str, id: str) -> bool:
+        """``DELETE /admin/db/{db}/workflows/{id}`` → ``True`` when the run row
+        was removed; ``False`` when it was already gone."""
+        return self._executor.run(_op_admin_delete_workflow(db, id))
+
     # --- token surface (ENH-005) ---
 
     def mint_token(
@@ -1553,6 +1645,42 @@ class AsyncRtDbAdminClient:
         See :meth:`RtDbAdminClient.restore_backup` for the typed-confirm guard.
         """
         return await self._executor.run(_op_restore_backup(name))
+
+    # --- workflow surface (FM-29) ---
+
+    async def admin_list_workflows(
+        self,
+        db: str,
+        *,
+        status: WorkflowStatus | None = None,
+        limit: int | None = None,
+    ) -> list[WorkflowInfo]:
+        """``GET /admin/db/{db}/workflows`` → this db's runs, newest first (async).
+
+        See :meth:`RtDbAdminClient.admin_list_workflows` for filter semantics.
+        """
+        return await self._executor.run(_op_admin_list_workflows(db, status=status, limit=limit))
+
+    async def admin_start_workflow(self, db: str, spec: WorkflowSpec) -> str:
+        """``POST /admin/db/{db}/workflows`` with the spec as the body → the new
+        run's id (async)."""
+        return await self._executor.run(_op_admin_start_workflow(db, spec))
+
+    async def admin_get_workflow(self, db: str, id: str) -> WorkflowInfoFull:
+        """``GET /admin/db/{db}/workflows/{id}`` → the full row with the outcome
+        trail (async)."""
+        return await self._executor.run(_op_admin_get_workflow(db, id))
+
+    async def admin_cancel_workflow(self, db: str, id: str) -> bool:
+        """``POST .../workflows/{id}/cancel`` → cancel outcome bool (async).
+
+        ``False`` is a legitimate no-op (missing/terminal run), not an error.
+        """
+        return await self._executor.run(_op_admin_cancel_workflow(db, id))
+
+    async def admin_delete_workflow(self, db: str, id: str) -> bool:
+        """``DELETE /admin/db/{db}/workflows/{id}`` → delete outcome bool (async)."""
+        return await self._executor.run(_op_admin_delete_workflow(db, id))
 
     # --- token surface (ENH-005) ---
 

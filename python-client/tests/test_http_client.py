@@ -1374,3 +1374,79 @@ def test_get_signed_url_passes_ttl_seconds():
     c = _client(handler)
     c.get_signed_url("f1", ttl_seconds=120)
     assert seen["ttl"] == "120"
+
+
+# --- data plane: workflows (FM-29) ------------------------------------------
+
+
+def test_start_workflow_posts_spec_returns_id() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["path"] = request.url.path
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"id": "wf-1"})
+
+    from par_rt_db.wire import WorkflowSpec, WorkflowStepSpec
+
+    client = _client(handler)
+    txn = Mutation.builder().insert("items", {"name": "x"}).build()
+    spec = WorkflowSpec(
+        name="drip", steps=[WorkflowStepSpec(txn=txn.model_dump(by_alias=True), sleep_before_ms=60)]
+    )
+    wid = client.start_workflow(spec)
+    assert wid == "wf-1"
+    assert captured["path"] == "/api/workflows"
+    assert captured["body"]["db"] == DB
+    assert captured["body"]["spec"]["name"] == "drip"
+    assert captured["body"]["spec"]["steps"][0]["sleepBeforeMs"] == 60
+
+
+def test_list_workflows_posts_status_filter() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["path"] = request.url.path
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "workflows": [
+                    {
+                        "id": "wf-1",
+                        "name": "drip",
+                        "status": "running",
+                        "currentStep": 1,
+                        "stepCount": 2,
+                        "attempts": 0,
+                        "sleepUntil": 9000,
+                        "createdAt": 100,
+                        "updatedAt": 150,
+                    }
+                ]
+            },
+        )
+
+    client = _client(handler)
+    wfs = client.list_workflows(status="running")
+    assert captured["path"] == "/api/workflows/list"
+    assert captured["body"] == {"db": DB, "status": "running"}
+    assert [w.id for w in wfs] == ["wf-1"]
+    assert wfs[0].current_step == 1 and wfs[0].sleep_until == 9000
+    # No filter -> body carries only db.
+    client.list_workflows()
+    assert captured["body"] == {"db": DB}
+
+
+def test_cancel_workflow_posts_db_returns_bool() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["path"] = request.url.path
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"cancelled": True})
+
+    client = _client(handler)
+    assert client.cancel_workflow("wf-1") is True
+    assert captured["path"] == "/api/workflows/wf-1/cancel"
+    assert captured["body"] == {"db": DB}

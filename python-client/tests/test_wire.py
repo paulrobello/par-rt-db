@@ -22,7 +22,12 @@ from par_rt_db.wire import (
     ScheduleWhen,
     SearchQuery,
     ServerMessage,
+    StepRetry,
     VectorSearchQuery,
+    WorkflowInfo,
+    WorkflowInfoFull,
+    WorkflowSpec,
+    WorkflowStepSpec,
 )
 
 
@@ -615,3 +620,180 @@ def test_migration_rejects_unknown_directive_fields() -> None:
         _RenameField.model_validate(
             {"op": "renameField", "table": "t", "from": "a", "to": "b", "bogus": 1}
         )
+
+
+# --- FM-29 workflow wire types ---
+
+
+def test_step_retry_defaults_and_camel_case() -> None:
+    r = StepRetry.model_validate({"maxAttempts": 2})
+    assert r.max_attempts == 2
+    assert r.initial_retry_ms == 1_000
+    assert r.max_retry_ms == 60_000
+    assert r.model_dump(by_alias=True, mode="json") == {
+        "maxAttempts": 2,
+        "initialRetryMs": 1000,
+        "maxRetryMs": 60000,
+    }
+
+
+def test_workflow_step_spec_omits_policy_when_absent() -> None:
+    s = WorkflowStepSpec.model_validate({"txn": {"steps": []}})
+    d = s.model_dump(by_alias=True, mode="json")
+    assert d == {"txn": {"steps": []}}
+    assert "retry" not in d and "sleepBeforeMs" not in d
+
+
+def test_workflow_step_spec_full_policy() -> None:
+    s = WorkflowStepSpec.model_validate(
+        {
+            "txn": {"steps": []},
+            "retry": {"maxAttempts": 5, "initialRetryMs": 500, "maxRetryMs": 2000},
+            "sleepBeforeMs": 86_400_000,
+        }
+    )
+    assert s.retry is not None and s.retry.max_attempts == 5
+    assert s.sleep_before_ms == 86_400_000
+
+
+def test_workflow_spec_round_trip() -> None:
+    spec = WorkflowSpec.model_validate(
+        {"name": "drip", "steps": [{"txn": {"steps": []}, "sleepBeforeMs": 60_000}]}
+    )
+    assert spec.name == "drip"
+    assert len(spec.steps) == 1
+
+
+def test_workflow_status_literal_domain() -> None:
+    info = WorkflowInfo.model_validate({**_WF_INFO_FIXTURE, "status": "running"})
+    assert info.status == "running"
+    with pytest.raises(ValidationError):
+        WorkflowInfo.model_validate({**_WF_INFO_FIXTURE, "status": "bogus"})
+
+
+_WF_INFO_FIXTURE = {
+    "id": "wf1",
+    "name": "drip",
+    "status": "pending",
+    "currentStep": 0,
+    "stepCount": 2,
+    "attempts": 0,
+    "createdAt": 100,
+    "updatedAt": 100,
+}
+
+
+def test_workflow_info_omits_optionals_when_absent() -> None:
+    d = WorkflowInfo.model_validate(_WF_INFO_FIXTURE).model_dump(by_alias=True, mode="json")
+    assert d == _WF_INFO_FIXTURE
+    for absent in ("sleepUntil", "lastError", "startedAt", "finishedAt"):
+        assert absent not in d
+
+
+def test_workflow_info_full_flattens_info() -> None:
+    full = WorkflowInfoFull.model_validate(
+        {
+            **_WF_INFO_FIXTURE,
+            "startedAt": 150,
+            "finishedAt": 200,
+            "stepOutcomes": [
+                {"stepIndex": 0, "status": "success", "attempts": 1, "at": 150},
+                {
+                    "stepIndex": 1,
+                    "status": "failed",
+                    "attempts": 3,
+                    "at": 200,
+                    "error": "boom",
+                },
+            ],
+        }
+    )
+    d = full.model_dump(by_alias=True, mode="json")
+    assert d["startedAt"] == 150 and d["finishedAt"] == 200
+    assert d["stepOutcomes"][1]["error"] == "boom"
+    assert "error" not in d["stepOutcomes"][0]
+    # flatten: no nested "info" key
+    assert "info" not in d
+
+
+def test_client_start_workflow_frame() -> None:
+    d = _client_adapter.validate_python(
+        {
+            "type": "startWorkflow",
+            "workflowId": "c1",
+            "spec": {"name": "drip", "steps": [{"txn": {"steps": []}}]},
+        }
+    ).model_dump(by_alias=True, mode="json")
+    assert d == {
+        "type": "startWorkflow",
+        "workflowId": "c1",
+        "spec": {"name": "drip", "steps": [{"txn": {"steps": []}}]},
+    }
+
+
+def test_client_cancel_workflow_frame() -> None:
+    assert _model({"type": "cancelWorkflow", "workflowId": "c2", "id": "wf9"}) == {
+        "type": "cancelWorkflow",
+        "workflowId": "c2",
+        "id": "wf9",
+    }
+
+
+def test_client_list_workflows_omits_status_when_none() -> None:
+    dumped = _client_adapter.validate_python(
+        {"type": "listWorkflows", "workflowId": "c3"}
+    ).model_dump(by_alias=True, mode="json")
+    assert dumped == {"type": "listWorkflows", "workflowId": "c3"}
+    assert "status" not in dumped
+
+
+def test_client_list_workflows_with_status() -> None:
+    dumped = _client_adapter.validate_python(
+        {"type": "listWorkflows", "workflowId": "c3", "status": "failed"}
+    ).model_dump(by_alias=True, mode="json")
+    assert dumped == {"type": "listWorkflows", "workflowId": "c3", "status": "failed"}
+
+
+def test_server_start_workflow_ok_carries_info() -> None:
+    dumped = _server_model(
+        {"type": "startWorkflowOk", "workflowId": "c1", "info": _WF_INFO_FIXTURE}
+    )
+    assert dumped["type"] == "startWorkflowOk"
+    assert dumped["info"]["stepCount"] == 2
+
+
+def test_server_start_workflow_err() -> None:
+    dumped = _server_model(
+        {
+            "type": "startWorkflowErr",
+            "workflowId": "c1",
+            "error": {"code": "BAD_REQUEST", "message": "empty steps"},
+        }
+    )
+    assert dumped["error"] == {"code": "BAD_REQUEST", "message": "empty steps"}
+
+
+def test_server_workflow_ack_ok_omits_error() -> None:
+    dumped = _server_model({"type": "workflowAck", "workflowId": "c2", "ok": True})
+    assert dumped == {"type": "workflowAck", "workflowId": "c2", "ok": True}
+    assert "error" not in dumped
+
+
+def test_server_workflow_ack_err_includes_error() -> None:
+    dumped = _server_model(
+        {
+            "type": "workflowAck",
+            "workflowId": "c2",
+            "ok": False,
+            "error": {"code": "NOT_FOUND", "message": "no run"},
+        }
+    )
+    assert dumped["ok"] is False
+    assert dumped["error"]["code"] == "NOT_FOUND"
+
+
+def test_server_list_workflows_ok() -> None:
+    dumped = _server_model(
+        {"type": "listWorkflowsOk", "workflowId": "c3", "workflows": [_WF_INFO_FIXTURE]}
+    )
+    assert dumped["workflows"][0]["id"] == "wf1"

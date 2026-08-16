@@ -1340,3 +1340,59 @@ async def test_admin_restore_backup_posts_name_and_confirm() -> None:
     }
     assert res["target"] == "rtdb_restored_20260728T143045Z"
     assert "rtdb_restored_20260728T143045Z" in res["instructions"]
+
+
+# --- data plane: workflows (FM-29) ------------------------------------------
+
+
+async def test_workflow_ops_round_trip() -> None:
+    from par_rt_db.wire import WorkflowSpec, WorkflowStepSpec
+
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.setdefault("paths", []).append(request.url.path)
+        captured["body"] = json.loads(request.content)
+        if request.url.path == "/api/workflows":
+            return httpx.Response(200, json={"id": "wf-1"})
+        if request.url.path == "/api/workflows/list":
+            return httpx.Response(
+                200,
+                json={
+                    "workflows": [
+                        {
+                            "id": "wf-1",
+                            "name": "drip",
+                            "status": "running",
+                            "currentStep": 1,
+                            "stepCount": 2,
+                            "attempts": 0,
+                            "sleepUntil": 9000,
+                            "createdAt": 100,
+                            "updatedAt": 150,
+                        }
+                    ]
+                },
+            )
+        if request.url.path == "/api/workflows/wf-1/cancel":
+            return httpx.Response(200, json={"cancelled": True})
+        return httpx.Response(404, text=f"no mock for {request.url.path}")
+
+    txn = Mutation.builder().insert("items", {"name": "x"}).build()
+    spec = WorkflowSpec(
+        name="drip", steps=[WorkflowStepSpec(txn=txn.model_dump(by_alias=True), sleep_before_ms=60)]
+    )
+    async with _client(handler) as c:
+        wid = await c.start_workflow(spec)
+        wfs = await c.list_workflows(status="running")
+        ok = await c.cancel_workflow(wid)
+    assert wid == "wf-1"
+    assert captured["paths"] == [
+        "/api/workflows",
+        "/api/workflows/list",
+        "/api/workflows/wf-1/cancel",
+    ]
+    assert captured["body"] == {"db": DB}
+    assert [w.id for w in wfs] == ["wf-1"]
+    assert wfs[0].sleep_until == 9000
+    assert ok is True

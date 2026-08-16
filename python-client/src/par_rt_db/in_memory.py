@@ -82,6 +82,7 @@ from .mutation import (
     StepResult,
     Transaction,
     _CancelSchedule,
+    _CancelWorkflow,
     _Delete,
     _DeleteByQuery,
     _ExpectAbsent,
@@ -91,6 +92,7 @@ from .mutation import (
     _PatchByQuery,
     _Replace,
     _Schedule,
+    _StartWorkflow,
     _Upsert,
 )
 from .query import Query, _terminal_of, parse_result
@@ -124,6 +126,11 @@ from .wire import (
     RunAt,
     ScheduleInfo,
     ScheduleWhen,
+    StepOutcome,
+    StepRetry,
+    WorkflowInfo,
+    WorkflowSpec,
+    WorkflowStatus,
     _FilterAnd,
     _FilterContains,
     _FilterEq,
@@ -263,6 +270,33 @@ class _ScheduledJob:
     created_at: int
     fired_count: int
     last_error: str | None
+
+
+@dataclass
+class _WorkflowRun:
+    """A stored workflow run (FM-29) — the in-memory mirror of the server's
+    ``workflows`` side-table row. The run snapshots its :class:`WorkflowSpec`
+    at insert time, so template edits never drift a live run.
+    :meth:`InMemoryRtDb.tick` claims due pending runs (→ running) and advances
+    them through :meth:`_advance_run` (the committer ``handle_workflow_advance``
+    port)."""
+
+    id: str
+    spec: WorkflowSpec
+    status: str  # "pending" | "running" | "success" | "failed" | "cancelled"
+    current_step: int
+    attempts: int
+    sleep_until: int | None
+    step_outcomes: list[StepOutcome]
+    last_error: str | None
+    created_at: int
+    updated_at: int
+    started_at: int | None
+    finished_at: int | None
+
+    @property
+    def step_count(self) -> int:
+        return len(self.spec.steps)
 
 
 @dataclass
@@ -581,13 +615,16 @@ class InMemoryRtDbClient:
         self._tables: dict[str, TableDef] = {}
         # Document store keyed by (table_name, id).
         self._docs: dict[tuple[str, str], StoredRow] = {}
-        # Counter for storage-upload id minting (also seeds connection_id when
-        # not injected — mirrors the TS harness's `c{N}` default).
+        # Counter for storage-upload id minting and the `_new_id` uniqueness
+        # suffix (the TS harness shares one `idCounter` for both; connection_id
+        # minting has its own `_conn_counter` here).
         self._id_counter: int = 0
         # mut_id -> cached results (idempotency short-circuit).
         self._idempotency: dict[str, list[StepResult]] = {}
         # Scheduled jobs (one-shot + cron).
         self._schedules: list[_ScheduledJob] = []
+        # Workflow runs (FM-29), insertion-ordered.
+        self._workflows: list[_WorkflowRun] = []
         # Reactive subscriptions.
         self._subscribers: list[_Subscription] = []
         # Storage stub: per-id blobs.
@@ -1725,6 +1762,12 @@ class InMemoryRtDbClient:
         # single sqlx transaction around the scheduled_txns insert.
         # shallow copy; jobs are appended/removed, never edited in place
         schedules_snapshot = list(self._schedules)
+        # FM-29: workflow steps mutate the runs store too — a startWorkflow
+        # appends and a cancelWorkflow flips status in place, so this snapshot
+        # is a deep copy (a rolled-back txn leaves no orphan run and no phantom
+        # cancel, mirroring the server's single sqlx transaction). Deep-copied
+        # because runs ARE edited in place, unlike scheduled jobs.
+        workflows_snapshot = deepcopy(self._workflows)
         results: list[StepResult] = []
         write_set: set[str] = set()
         for step in txn.steps:
@@ -1734,6 +1777,7 @@ class InMemoryRtDbClient:
                 # Atomicity: any step's error rolls back everything already applied.
                 self._docs = snapshot
                 self._schedules = schedules_snapshot
+                self._workflows = workflows_snapshot
                 raise
             results.append(result)
             if written_table is not None:
@@ -1852,6 +1896,15 @@ class InMemoryRtDbClient:
                 before = len(self._schedules)
                 self._schedules = [j for j in self._schedules if j.id != job_id]
                 return _cancel_schedule_result(len(self._schedules) < before), None
+            case _StartWorkflow(spec=wf_spec):
+                # FM-29: insert the run on the open txn — the rollback snapshot
+                # above restores it if a later step fails, so a rolled-back txn
+                # leaves no orphan run.
+                return _start_workflow_result(self._insert_workflow(wf_spec)), None
+            case _CancelWorkflow(id=wf_id):
+                # Same shape as cancelSchedule: {"cancelled": bool}, a miss or
+                # terminal run is a no-op False, not an error.
+                return _cancel_workflow_result(self.cancel_workflow(wf_id)), None
             case _:
                 raise RtDbError(ErrorCode.INTERNAL, "unknown step op")
 
@@ -2014,8 +2067,14 @@ class InMemoryRtDbClient:
         return def_
 
     def _new_id(self) -> str:
+        # The counter suffix guarantees uniqueness even under a deterministic
+        # ``random=lambda: 0.0`` — two ids minted in the same pinned instant
+        # (e.g. two workflow steps firing in one tick) must never collide
+        # (mirrors the TS harness's ``newId``).
         ts = self._now() & ((1 << 48) - 1)
-        rand = self._random_hex(19)
+        n = self._id_counter % 0x1000000
+        self._id_counter += 1
+        rand = self._random_hex(13) + f"{n:06x}"
         return f"{ts:012x}7{rand}"
 
     def _random_hex(self, count: int) -> str:
@@ -2199,6 +2258,168 @@ class InMemoryRtDbClient:
         """Snapshot of every scheduled job's public view."""
         return [_schedule_info(job) for job in self._schedules]
 
+    # ---- workflows (FM-29) ----------------------------------------------
+
+    def start_workflow(self, spec: WorkflowSpec) -> str:
+        """Insert a run from ``spec`` and return its id. The run starts
+        ``pending`` at step 0; the first step's ``sleepBeforeMs`` gates its
+        initial claim (``tick()`` advances it afterwards)."""
+        return self._insert_workflow(spec)
+
+    def cancel_workflow(self, id: str) -> bool:
+        """Flip a pending/running run to ``cancelled``. ``False`` when the run
+        is missing or already terminal (a no-op, not an error)."""
+        run = self._find_workflow(id)
+        if run is None or run.status not in ("pending", "running"):
+            return False
+        now = self._now()
+        run.status = "cancelled"
+        run.updated_at = now
+        run.finished_at = now
+        return True
+
+    def list_workflows(self, status: WorkflowStatus | None = None) -> list[WorkflowInfo]:
+        """Every run's info projection, newest first; ``status`` filters to a
+        lifecycle state."""
+        runs = [r for r in self._workflows if status is None or r.status == status]
+        runs.sort(key=lambda r: r.created_at, reverse=True)
+        return [_workflow_info(r) for r in runs]
+
+    def _insert_workflow(self, spec: WorkflowSpec) -> str:
+        if not spec.steps:
+            raise RtDbError(ErrorCode.BAD_REQUEST, "workflow spec must have at least one step")
+        now = self._now()
+        first = spec.steps[0]
+        gate: int | None = None
+        if first.sleep_before_ms is not None and first.sleep_before_ms > 0:
+            gate = now + first.sleep_before_ms
+        run = _WorkflowRun(
+            id=self._new_id(),
+            spec=spec,
+            status="pending",
+            current_step=0,
+            attempts=0,
+            sleep_until=gate,
+            step_outcomes=[],
+            last_error=None,
+            created_at=now,
+            updated_at=now,
+            started_at=None,
+            finished_at=None,
+        )
+        self._workflows.append(run)
+        return run.id
+
+    def _find_workflow(self, run_id: str) -> _WorkflowRun | None:
+        for r in self._workflows:
+            if r.id == run_id:
+                return r
+        return None
+
+    def _advance_workflows(self, now: int) -> None:
+        """One claim pass per tick (mirroring the server's scheduler poll
+        cadence): every due pending run flips to running (``startedAt`` stamped
+        on the first claim only), then each advances through
+        :meth:`_advance_run`. A run that a sibling's step cancelled mid-pass is
+        skipped by the in-loop status re-check."""
+        due = [
+            r
+            for r in self._workflows
+            if r.status == "pending" and (r.sleep_until is None or r.sleep_until <= now)
+        ]
+        for run in due:
+            # Re-resolve from the live store: a sibling run's step txn may have
+            # cancelled (or rolled back a cancel of) this one, and a failed
+            # sibling txn replaces self._workflows with its snapshot — the
+            # ``due`` reference would then read stale state.
+            live = self._find_workflow(run.id)
+            if live is None or live.status != "pending":
+                continue
+            live.status = "running"
+            if live.started_at is None:
+                live.started_at = now
+            live.updated_at = now
+            self._advance_run(live, now)
+
+    def _advance_run(self, run: _WorkflowRun, now: int) -> None:
+        """Advance one claimed run — the port of the committer's
+        ``handle_workflow_advance`` loop. Re-checks the status at every loop
+        boundary (only a running run continues — a cancel between steps stops
+        advancement), executes the current step's txn atomically, and on success
+        either moves to the next step (gating on its ``sleepBeforeMs``; a future
+        gate releases to pending, an immediate one keeps looping in this same
+        turn) or finalizes the run. On failure, retries with exponential backoff
+        until ``maxAttempts`` is exhausted, then marks the run failed with the
+        last error and a terminal failed outcome for the step."""
+        run_id = run.id
+        while True:
+            # Re-resolve from the live store at every boundary — the server
+            # re-reads the row's status each loop iteration
+            # (``workflows::status_of``), and here a failed step txn restores
+            # ``self._workflows`` from its deepcopy snapshot, detaching any
+            # prior reference. Mutations must land on the live object.
+            live = self._find_workflow(run_id)
+            if live is None or live.status != "running":
+                return
+            run = live
+            step = run.spec.steps[run.current_step]
+            retry = step.retry or _DEFAULT_STEP_RETRY
+            try:
+                txn = Transaction.model_validate(step.txn)
+                self._execute_transaction(txn)
+            except RtDbError as err:
+                # The failed txn's rollback replaced the store with its
+                # snapshot — re-resolve so attempts/backoff hit the live row.
+                restored = self._find_workflow(run_id)
+                if restored is None:
+                    return
+                run = restored
+                run.attempts += 1
+                run.updated_at = now
+                if run.attempts < retry.max_attempts:
+                    backoff = min(
+                        retry.initial_retry_ms * (2 ** min(run.attempts - 1, 32)),
+                        retry.max_retry_ms,
+                    )
+                    run.sleep_until = now + backoff
+                    run.status = "pending"
+                    return
+                run.status = "failed"
+                run.last_error = err.message
+                run.finished_at = now
+                run.step_outcomes.append(
+                    StepOutcome(
+                        step_index=run.current_step,
+                        status="failed",
+                        attempts=run.attempts,
+                        at=now,
+                        error=err.message,
+                    )
+                )
+                return
+            run.step_outcomes.append(
+                StepOutcome(
+                    step_index=run.current_step,
+                    status="success",
+                    attempts=run.attempts + 1,
+                    at=now,
+                )
+            )
+            run.attempts = 0
+            run.last_error = None
+            run.updated_at = now
+            if run.current_step == run.step_count - 1:
+                run.status = "success"
+                run.finished_at = now
+                return
+            run.current_step += 1
+            gate = now + (run.spec.steps[run.current_step].sleep_before_ms or 0)
+            if gate > now:
+                run.sleep_until = gate
+                run.status = "pending"
+                return
+            # gate due immediately — keep advancing in this same turn
+
     def _reap_ttl(self, now: int) -> int:
         """Remove docs whose declared TTL ``field`` (a number) is ``< now`` — the
         in-memory mirror of the server's per-tick TTL reaper. Fires only on
@@ -2228,9 +2449,13 @@ class InMemoryRtDbClient:
         atomic path as :meth:`mutate` (so reactive subscriptions see the write).
         One-shots are removed after a successful fire; crons re-arm by
         :data:`CRON_STEP_MS`. A job whose txn fails is marked ``error`` but left
-        in place (still due), so a subsequent ``tick`` retries it."""
+        in place (still due), so a subsequent ``tick`` retries it.
+
+        Workflows (FM-29): after schedules, one claim pass advances every due
+        pending run (see :meth:`_advance_workflows`)."""
         now = now_ms if now_ms is not None else self._now()
         self._reap_ttl(now)
+        self._advance_workflows(now)
         i = 0
         while i < len(self._schedules):
             job = self._schedules[i]
@@ -2378,6 +2603,14 @@ def _schedule_result(schedule_id: str) -> StepResult:
 
 
 def _cancel_schedule_result(cancelled: bool) -> StepResult:
+    return _STEP_RESULT.validate_python({"cancelled": cancelled})
+
+
+def _start_workflow_result(workflow_id: str) -> StepResult:
+    return _STEP_RESULT.validate_python({"workflowId": workflow_id})
+
+
+def _cancel_workflow_result(cancelled: bool) -> StepResult:
     return _STEP_RESULT.validate_python({"cancelled": cancelled})
 
 
@@ -2966,6 +3199,30 @@ def _schedule_info(job: _ScheduledJob) -> ScheduleInfo:
             "lastError": job.last_error,
             "createdAt": job.created_at,
             "firedCount": job.fired_count,
+        }
+    )
+
+
+#: The retry policy applied when a step omits ``retry`` — the server's Default
+#: (3 attempts, 1s initial backoff doubling to a 60s cap).
+_DEFAULT_STEP_RETRY = StepRetry(max_attempts=3)
+
+
+def _workflow_info(run: _WorkflowRun) -> WorkflowInfo:
+    return WorkflowInfo.model_validate(
+        {
+            "id": run.id,
+            "name": run.spec.name,
+            "status": run.status,
+            "currentStep": run.current_step,
+            "stepCount": run.step_count,
+            "attempts": run.attempts,
+            "sleepUntil": run.sleep_until,
+            "lastError": run.last_error,
+            "createdAt": run.created_at,
+            "updatedAt": run.updated_at,
+            "startedAt": run.started_at,
+            "finishedAt": run.finished_at,
         }
     )
 

@@ -37,7 +37,16 @@ from .migration import CaseWhen, Cast, Migration, ValueExpr
 from .mutation import Mutation, StepResult, Transaction
 from .query import Paginated, Query, TableQuery
 from .schema import Schema, SchemaDef, TableDef, t
-from .wire import AfterMs, Cron, FilterExpr, RunAt, ScheduleWhen
+from .wire import (
+    AfterMs,
+    Cron,
+    FilterExpr,
+    RunAt,
+    ScheduleWhen,
+    StepRetry,
+    WorkflowSpec,
+    WorkflowStepSpec,
+)
 
 if TYPE_CHECKING:
     from .admin import (
@@ -76,6 +85,9 @@ __all__ = [
     "AfterMs",
     "RunAt",
     "Cron",
+    "WorkflowSpec",
+    "WorkflowStepSpec",
+    "StepRetry",
     "InMemoryRtDbClient",
     "encode_cursor",
     "decode_cursor",

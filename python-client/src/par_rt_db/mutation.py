@@ -34,7 +34,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_serializer
 from pydantic_core.core_schema import SerializerFunctionWrapHandler
 
 from .errors import ErrorCode, RtDbError
-from .wire import FilterExpr, ScheduleWhen, to_camel
+from .wire import FilterExpr, ScheduleWhen, WorkflowSpec, to_camel
 
 #: Client-side cap on transaction length. Mirrors ``server/src/txn.rs::MAX_STEPS``
 #: (1024); the server rejects anything longer, so the builder raises eagerly to
@@ -153,7 +153,24 @@ class _CancelSchedule(_Step):
     id: str
 
 
-#: Discriminated union of all 11 step ops. The ``op`` literal drives dispatch;
+class _StartWorkflow(_Step):
+    """FM-29: start a workflow run from ``spec``. The run is inserted on the
+    open transaction — a rolled-back txn leaves no orphan run. Step result
+    ``{"workflowId": "<id>"}``."""
+
+    op: Literal["startWorkflow"] = "startWorkflow"
+    spec: WorkflowSpec
+
+
+class _CancelWorkflow(_Step):
+    """FM-29: cancel a workflow run by id. Step result ``{"cancelled": bool}`` —
+    ``False`` when missing or already terminal (not an error)."""
+
+    op: Literal["cancelWorkflow"] = "cancelWorkflow"
+    id: str
+
+
+#: Discriminated union of all 13 step ops. The ``op`` literal drives dispatch;
 #: ``deny_unknown_fields`` is per-variant via ``extra="forbid"`` on ``_Step``.
 Step = Annotated[
     (
@@ -168,6 +185,8 @@ Step = Annotated[
         | _DeleteByQuery
         | _Schedule
         | _CancelSchedule
+        | _StartWorkflow
+        | _CancelWorkflow
     ),
     Field(discriminator="op"),
 ]
@@ -272,13 +291,28 @@ class _StepCancelScheduleResult(BaseModel):
     cancelled: bool
 
 
+class _StepStartWorkflowResult(BaseModel):
+    """Per-step result for ``startWorkflow``: ``{"workflowId"}`` — the id of
+    the inserted run."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        populate_by_name=True,
+        alias_generator=to_camel,
+    )
+
+    workflow_id: str
+
+
 #: Untagged per-step result, positionally aligned with ``Transaction.steps``.
 #: Variant order matters: ``_StepUpsert`` (richer) must precede ``_StepInsert``
 #: so ``{"id","inserted"}`` is captured as an upsert, not silently trimmed to an
 #: insert. ``None`` covers the ``null`` wire shape produced by ``expectVersion``/
 #: ``expectAbsent``/``patch``/``replace``/``delete``. ``patchByQuery``/
 #: ``deleteByQuery`` carry their own ``{patched|deleted, truncated}`` shape;
-#: ``schedule``/``cancelSchedule`` carry ``{scheduleId}`` / ``{cancelled}``.
+#: ``schedule``/``cancelSchedule`` carry ``{scheduleId}`` / ``{cancelled}``;
+#: ``startWorkflow``/``cancelWorkflow`` carry ``{workflowId}`` /
+#: ``{cancelled}`` (the latter shares the cancelSchedule shape).
 StepResult = (
     _StepUpsert
     | _StepInsert
@@ -286,6 +320,7 @@ StepResult = (
     | _StepDeleteByQuery
     | _StepScheduleResult
     | _StepCancelScheduleResult
+    | _StepStartWorkflowResult
     | None
 )
 
@@ -393,6 +428,20 @@ class _MutationBuilder:
         step result reports ``{"cancelled": bool}`` — ``False`` (not an error)
         when no such job is pending."""
         self._steps.append(_CancelSchedule(op="cancelSchedule", id=id))
+        return self
+
+    def start_workflow(self, spec: WorkflowSpec) -> _MutationBuilder:
+        """Start-workflow step (FM-29): insert a workflow run from ``spec`` on
+        the open transaction. The step result carries the run's
+        ``{"workflowId": "<id>"}``."""
+        self._steps.append(_StartWorkflow(op="startWorkflow", spec=spec))
+        return self
+
+    def cancel_workflow(self, id: str) -> _MutationBuilder:
+        """Cancel-workflow step (FM-29): cancel the run ``id``. The step result
+        reports ``{"cancelled": bool}`` — ``False`` (not an error) when the run
+        is missing or already terminal."""
+        self._steps.append(_CancelWorkflow(op="cancelWorkflow", id=id))
         return self
 
     def build(self) -> Transaction:

@@ -27,7 +27,7 @@ from par_rt_db.in_memory import (
 )
 from par_rt_db.query import Query
 from par_rt_db.schema import Schema, t
-from par_rt_db.wire import AggregateSpec, ScheduleWhen
+from par_rt_db.wire import AggregateSpec, ScheduleWhen, StepRetry, WorkflowSpec, WorkflowStepSpec
 
 _when = TypeAdapter(ScheduleWhen)
 
@@ -2057,3 +2057,217 @@ def test_migrate_rejects_missing_source_field() -> None:
         c.migrate_schema(directives)
     assert ei.value.code is ErrorCode.BAD_REQUEST
     assert "does not exist" in ei.value.message
+
+
+# --- FM-29: workflows + tick advancement --------------------------------------
+
+
+def _wf_txn(name: str) -> Any:
+    return Mutation.builder().insert("items", {"name": name, "status": "todo", "order": 1}).build()
+
+
+def _wf_step(txn: Any, **kw: Any) -> Any:
+    return WorkflowStepSpec(txn=txn.model_dump(by_alias=True), **kw)
+
+
+def _wf_fail_step(**kw: Any) -> Any:
+    txn = Mutation.builder().delete("items", "missing").build()
+    return WorkflowStepSpec(txn=txn.model_dump(by_alias=True), **kw)
+
+
+def _wf(name: str, steps: list[Any]) -> Any:
+    return WorkflowSpec(name=name, steps=steps)
+
+
+def _wf_status(c: Any, wid: str) -> Any:
+    return next(w for w in c.list_workflows() if w.id == wid)
+
+
+def test_workflow_step_one_succeeds_in_one_tick() -> None:
+    c, _clock = _new_clock_client()
+    wid = c.start_workflow(_wf("single", [_wf_step(_wf_txn("a"))]))
+    assert is_hex_id(wid)
+    info = _wf_status(c, wid)
+    assert info.status == "pending" and info.step_count == 1 and info.current_step == 0
+    c.tick()
+    docs = c.run_query(TableQuery("items").build())
+    assert [d["name"] for d in docs] == ["a"]
+    assert _wf_status(c, wid).status == "success"
+
+
+def test_workflow_two_steps_advance_across_sleep_gate() -> None:
+    c, clock = _new_clock_client()
+    wid = c.start_workflow(
+        _wf("drip", [_wf_step(_wf_txn("a")), _wf_step(_wf_txn("b"), sleep_before_ms=1000)])
+    )
+    c.tick()  # fires step 1 only; step 2 gated at t0+1000
+    assert [d["name"] for d in c.run_query(TableQuery("items").build())] == ["a"]
+    info = _wf_status(c, wid)
+    assert info.status == "pending" and info.current_step == 1
+    assert info.sleep_until == clock[0] + 1000
+    c.tick()  # still before the gate
+    assert len(c.run_query(TableQuery("items").build())) == 1
+    clock[0] += 1000
+    c.tick()  # gate due -> step 2 fires -> terminal
+    assert sorted(d["name"] for d in c.run_query(TableQuery("items").build())) == ["a", "b"]
+    assert _wf_status(c, wid).status == "success"
+
+
+def test_workflow_initial_sleep_before_ms_gates_first_step() -> None:
+    c, clock = _new_clock_client()
+    wid = c.start_workflow(_wf("delayed", [_wf_step(_wf_txn("a"), sleep_before_ms=500)]))
+    c.tick()  # initial gate not yet due
+    assert c.run_query(TableQuery("items").build()) == []
+    assert _wf_status(c, wid).status == "pending"
+    clock[0] += 500
+    c.tick()
+    assert len(c.run_query(TableQuery("items").build())) == 1
+
+
+def test_workflow_no_sleep_chain_completes_in_one_tick() -> None:
+    c, _clock = _new_clock_client()
+    wid = c.start_workflow(_wf("chain", [_wf_step(_wf_txn("a")), _wf_step(_wf_txn("b"))]))
+    c.tick()  # both steps in one turn — no gate between them
+    assert sorted(d["name"] for d in c.run_query(TableQuery("items").build())) == ["a", "b"]
+    assert _wf_status(c, wid).status == "success"
+
+
+def test_workflow_retry_backoff_then_success() -> None:
+    c, clock = _new_clock_client()
+    # expectAbsent on by_name=["a"] fails while "a" exists; deleting it before
+    # the retry gate lets attempt 2 succeed.
+    c.mutate(
+        Mutation.builder().insert("items", {"name": "a", "status": "todo", "order": 1}).build(),
+        mut_id="seed",
+    )
+    step_txn = Mutation.builder().expect_absent("items", "by_name", ["a"]).build()
+    wid = c.start_workflow(
+        _wf(
+            "retry",
+            [
+                _wf_step(
+                    step_txn,
+                    retry=StepRetry(max_attempts=3, initial_retry_ms=100, max_retry_ms=60_000),
+                )
+            ],
+        )
+    )
+    c.tick()  # attempt 1 fails (PRECONDITION_FAILED) -> pending retry at t0+100
+    info = _wf_status(c, wid)
+    assert info.status == "pending" and info.attempts == 1
+    assert info.sleep_until == clock[0] + 100
+    c.tick()  # backoff not yet due
+    assert _wf_status(c, wid).attempts == 1
+    clock[0] += 100
+    doc = c.run_query(TableQuery("items").build())[0]
+    c.mutate(Mutation.builder().delete("items", doc["_id"]).build(), mut_id="rm")
+    c.tick()  # attempt 2: no matching doc -> succeeds -> terminal
+    info = _wf_status(c, wid)
+    assert info.status == "success" and info.attempts == 0
+    # attempts reset on the successful re-run boundary: the row-level attempts
+    # counter reflects the CURRENT step's attempt count (0 after success
+    # bookkeeping in record_step_success); the per-attempt trail lives in
+    # stepOutcomes, not exposed by list_workflows.
+
+
+def test_workflow_retry_exhaustion_marks_failed_with_outcome() -> None:
+    c, _clock = _new_clock_client()
+    wid = c.start_workflow(
+        _wf(
+            "doomed",
+            [_wf_fail_step(retry=StepRetry(max_attempts=2, initial_retry_ms=0, max_retry_ms=0))],
+        )
+    )
+    # 0ms backoff => the retry gate is immediately due, but each tick runs one
+    # claim pass (mirroring the server's scheduler poll cadence): tick 1 fails
+    # attempt 1 and releases to pending; tick 2 claims, fails attempt 2, and
+    # exhausts (attempts == maxAttempts) -> failed.
+    c.tick()
+    assert _wf_status(c, wid).attempts == 1
+    c.tick()
+    info = _wf_status(c, wid)
+    assert info.status == "failed"
+    assert info.attempts == 2
+    assert info.last_error is not None and "not found" in info.last_error
+    assert info.finished_at is not None
+
+
+def test_workflow_failed_step_rolls_back_its_partial_writes() -> None:
+    c, _clock = _new_clock_client()
+    # Step txn: insert ok, then delete-missing fails -> whole txn rolls back.
+    txn = (
+        Mutation.builder()
+        .insert("items", {"name": "ghost", "status": "todo", "order": 1})
+        .delete("items", "missing")
+        .build()
+    )
+    wid = c.start_workflow(
+        _wf(
+            "rollback",
+            [_wf_step(txn, retry=StepRetry(max_attempts=1, initial_retry_ms=0, max_retry_ms=0))],
+        )
+    )
+    c.tick()
+    assert c.run_query(TableQuery("items").build()) == []
+    assert _wf_status(c, wid).status == "failed"
+
+
+def test_cancel_workflow_stops_a_pending_run() -> None:
+    c, clock = _new_clock_client()
+    wid = c.start_workflow(
+        _wf("drip", [_wf_step(_wf_txn("a")), _wf_step(_wf_txn("b"), sleep_before_ms=1000)])
+    )
+    c.tick()  # step 1 done, step 2 pending at gate
+    assert c.cancel_workflow(wid) is True
+    clock[0] += 5000
+    c.tick()  # cancelled runs never advance
+    assert len(c.run_query(TableQuery("items").build())) == 1
+    assert _wf_status(c, wid).status == "cancelled"
+    # Cancelling again (terminal) is a no-op false, not an error.
+    assert c.cancel_workflow(wid) is False
+
+
+def test_list_workflows_filters_by_status() -> None:
+    c, _clock = _new_clock_client()
+    c.start_workflow(_wf("done", [_wf_step(_wf_txn("a"))]))
+    wid2 = c.start_workflow(
+        _wf(
+            "doomed",
+            [_wf_fail_step(retry=StepRetry(max_attempts=1, initial_retry_ms=0, max_retry_ms=0))],
+        )
+    )
+    c.tick()
+    assert [w.name for w in c.list_workflows(status="success")] == ["done"]
+    assert [w.id for w in c.list_workflows(status="failed")] == [wid2]
+    assert len(c.list_workflows()) == 2
+
+
+def test_start_workflow_step_enqueues_run_fired_by_tick() -> None:
+    c, _clock = _new_clock_client()
+    spec = _wf("nested", [_wf_step(_wf_txn("a"))])
+    m = Mutation.builder().start_workflow(spec).build()
+    res = c.mutate(m)[0]
+    assert res is not None
+    wid = str(res.model_dump(by_alias=True)["workflowId"])
+    assert is_hex_id(wid)
+    c.tick()
+    assert len(c.run_query(TableQuery("items").build())) == 1
+    assert _wf_status(c, wid).status == "success"
+
+
+def test_cancel_workflow_step_flips_pending_run() -> None:
+    c, clock = _new_clock_client()
+    wid = c.start_workflow(
+        _wf("drip", [_wf_step(_wf_txn("a")), _wf_step(_wf_txn("b"), sleep_before_ms=1000)])
+    )
+    c.tick()  # step 1 done; step 2 pending
+    res = c.mutate(Mutation.builder().cancel_workflow(wid).build())[0]
+    assert res is not None
+    assert res.model_dump()["cancelled"] is True
+    clock[0] += 5000
+    c.tick()
+    assert _wf_status(c, wid).status == "cancelled"
+    # Cancelling a terminal run through the step reports false, not an error.
+    res2 = c.mutate(Mutation.builder().cancel_workflow(wid).build())[0]
+    assert res2 is not None
+    assert res2.model_dump()["cancelled"] is False

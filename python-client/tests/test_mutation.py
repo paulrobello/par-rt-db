@@ -26,7 +26,7 @@ from pydantic import TypeAdapter, ValidationError
 
 from par_rt_db.errors import ErrorCode, RtDbError
 from par_rt_db.mutation import MAX_STEPS, Mutation, StepResult, Transaction
-from par_rt_db.wire import AfterMs, FilterExpr
+from par_rt_db.wire import AfterMs, FilterExpr, StepRetry, WorkflowSpec, WorkflowStepSpec
 
 
 def test_insert_patch_replace_delete_upsert_wire():
@@ -291,4 +291,50 @@ def test_step_result_schedule_and_cancel_schedule():
     }
     assert sr.validate_python({"cancelled": True}).model_dump(by_alias=True, mode="json") == {
         "cancelled": True
+    }
+
+
+# --- FM-29 workflow steps ---
+
+
+def _wf_spec() -> WorkflowSpec:
+    return WorkflowSpec(
+        name="drip",
+        steps=[
+            WorkflowStepSpec(
+                txn=Transaction(steps=[]).model_dump(by_alias=True),
+                retry=StepRetry(max_attempts=5, initial_retry_ms=500, max_retry_ms=2000),
+                sleep_before_ms=1000,
+            )
+        ],
+    )
+
+
+def test_start_and_cancel_workflow_wire_shapes():
+    spec = _wf_spec()
+    m = Mutation.builder().start_workflow(spec).cancel_workflow("wf9").build()
+    wire = json.loads(m.model_dump_json(by_alias=True))
+    assert wire["steps"][0] == {
+        "op": "startWorkflow",
+        "spec": json.loads(spec.model_dump_json(by_alias=True)),
+    }
+    assert wire["steps"][1] == {"op": "cancelWorkflow", "id": "wf9"}
+    # Round-trips through model_validate (corpus parity path).
+    assert json.loads(Mutation.model_validate(wire).model_dump_json(by_alias=True)) == wire
+
+
+def test_workflow_builder_methods_return_self():
+    b = Mutation.builder()
+    assert b.start_workflow(_wf_spec()) is b
+    assert b.cancel_workflow("wf1") is b
+
+
+def test_step_result_start_and_cancel_workflow():
+    sr = TypeAdapter(StepResult)
+    assert sr.validate_python({"workflowId": "wf1"}).model_dump(by_alias=True, mode="json") == {
+        "workflowId": "wf1"
+    }
+    # cancelWorkflow shares the {"cancelled": bool} shape with cancelSchedule.
+    assert sr.validate_python({"cancelled": False}).model_dump(by_alias=True, mode="json") == {
+        "cancelled": False
     }
