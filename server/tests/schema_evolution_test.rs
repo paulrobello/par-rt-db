@@ -41,6 +41,7 @@ fn priority_schema(variants: &[&str]) -> SchemaDef {
             collaborators_field: None,
             ttl: None,
             authorize: None,
+            soft_delete: false,
         },
     );
     SchemaDef { tables }
@@ -130,6 +131,7 @@ fn email_index_schema(unique: bool, where_clause: Option<FilterExpr>) -> SchemaD
             collaborators_field: None,
             ttl: None,
             authorize: None,
+            soft_delete: false,
         },
     );
     SchemaDef { tables }

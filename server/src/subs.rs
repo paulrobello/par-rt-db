@@ -1154,7 +1154,7 @@ impl SubscriptionManager {
                     terminal = entry.query.terminal_name(),
                     read_set_class = ?verifying,
                 );
-                match execute_query(pool, db, schema, &entry.query, &entry.principal_ctx)
+                match execute_query(pool, db, schema, &entry.query, &entry.principal_ctx, false)
                     .instrument(rerun_span)
                     .await
                 {
@@ -1289,6 +1289,7 @@ mod tests {
             collaborators_field: None,
             ttl: None,
             authorize: None,
+            soft_delete: false,
         }
     }
 

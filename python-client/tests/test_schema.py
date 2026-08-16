@@ -448,3 +448,68 @@ def test_schema_round_trips_through_json_parse():
     dumped = schema.model_dump_json(by_alias=True)
     reparsed = Schema.model_validate(json.loads(dumped))
     assert reparsed.model_dump_json(by_alias=True) == dumped
+
+
+# --- FM-33: onDelete + softDelete ---
+
+
+def test_id_on_delete_wire_emission_and_omission():
+    """``t.id(table, on_delete=...)`` emits the ``onDelete`` alias only when
+    set; a plain ``t.id(table)`` never carries the key."""
+    with_action = t.id("users", on_delete="cascade")
+    assert with_action == {"type": "id", "table": "users", "onDelete": "cascade"}
+    without = t.id("users")
+    assert without == {"type": "id", "table": "users"}
+
+    schema = (
+        Schema.builder()
+        .table(
+            "posts",
+            lambda tb: (
+                tb.field("authorId", t.id("users", on_delete="cascade"))
+                .field("editorId", t.optional(t.id("users", on_delete="setNull")))
+                .field("viewerId", t.id("users"))
+                .index("by_author", ["authorId"])
+                .index("by_editor", ["editorId"])
+            ),
+        )
+        .build()
+    )
+    wire = json.loads(schema.model_dump_json(by_alias=True))
+    fields = wire["tables"]["posts"]["fields"]
+    assert fields["authorId"] == {"type": "id", "table": "users", "onDelete": "cascade"}
+    assert fields["editorId"] == {
+        "type": "optional",
+        "inner": {"type": "id", "table": "users", "onDelete": "setNull"},
+    }
+    assert fields["viewerId"] == {"type": "id", "table": "users"}
+
+    # Round-trips through model_validate (a pushed schema parses back).
+    assert Schema.model_validate(json.loads(schema.model_dump_json(by_alias=True))) == schema
+
+
+def test_soft_delete_builder_emits_flag_only_when_set():
+    """``.soft_delete()`` on the table builder emits ``"softDelete": True``;
+    a plain table never carries the key (omit-when-false wire parity)."""
+    schema = (
+        Schema.builder()
+        .table(
+            "notes",
+            lambda tb: tb.field("body", t.string()).soft_delete(),
+        )
+        .table("logs", lambda tb: tb.field("line", t.string()))
+        .build()
+    )
+    wire = json.loads(schema.model_dump_json(by_alias=True))
+    assert wire["tables"]["notes"]["softDelete"] is True
+    assert "softDelete" not in wire["tables"]["logs"]
+
+    # Raw TableDef parity: absent and False both omit the key.
+    from par_rt_db.schema import TableDef
+
+    absent = TableDef.model_validate({"fields": {"a": {"type": "string"}}})
+    assert "softDelete" not in absent.model_dump(by_alias=True)
+    explicit_false = TableDef.model_validate(
+        {"fields": {"a": {"type": "string"}}, "softDelete": False}
+    )
+    assert "softDelete" not in explicit_false.model_dump(by_alias=True)

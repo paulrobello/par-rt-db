@@ -12,7 +12,9 @@ use sqlx::PgPool;
 use crate::db::{database_exists, load_schema, validate_db_name};
 use crate::error::RtDbError;
 use crate::query::compile_filter_literal;
-use crate::schema::{FieldType, SchemaDef, TableDef, indexed_column_type, is_widening_of};
+use crate::schema::{
+    FieldType, SchemaDef, TableDef, indexed_column_type, is_widening_of, strip_on_delete,
+};
 
 pub fn pg_table(user_table: &str) -> String {
     format!("t_{}", user_table.to_lowercase())
@@ -97,8 +99,12 @@ fn detect_destructive_changes(old: &SchemaDef, new: &SchemaDef) -> Result<(), Rt
                         "removed field '{table_name}.{field_name}'"
                     )));
                 }
+                // FM-33: compare with each side's `Id.on_delete` stripped —
+                // adding or changing an `onDelete` action alters runtime delete
+                // behavior only (no stored row shape), so it is additive, while
+                // changing the referenced table is still a type change.
                 Some(new_field_type)
-                    if new_field_type != old_field_type
+                    if strip_on_delete(new_field_type) != strip_on_delete(old_field_type)
                         && !is_widening_of(old_field_type, new_field_type) =>
                 {
                     return Err(RtDbError::bad_request(format!(
@@ -293,6 +299,11 @@ async fn apply_schema_additive(
                     let not_null = if nullable { "" } else { " NOT NULL" };
                     columns.push(format!("\"{col}\" {pg_type}{not_null}"));
                 }
+                // FM-33 soft delete: the stamp column exists on every
+                // soft-delete table from creation (nullable — NULL = live row).
+                if new_table.soft_delete {
+                    columns.push("\"deleted_at\" timestamptz".to_string());
+                }
                 let sql = format!(
                     "CREATE TABLE \"{pg_schema_name}\".\"{table_ident}\" ({})",
                     columns.join(", ")
@@ -315,6 +326,19 @@ async fn apply_schema_additive(
                     let expr = backfill_expr(pg_type, field_name)?;
                     sqlx::query(&format!(
                         "UPDATE \"{pg_schema_name}\".\"{table_ident}\" SET \"{col}\" = {expr} WHERE doc ? '{field_name}'"
+                    ))
+                    .execute(&mut **tx)
+                    .await?;
+                }
+
+                // FM-33 soft delete: adding the flag to an existing table adds
+                // the stamp column (`ADD COLUMN IF NOT EXISTS`, same additive
+                // pattern as the typed columns above). All existing rows have
+                // `deleted_at = NULL` — live — by construction.
+                if new_table.soft_delete && !old_table.soft_delete {
+                    sqlx::query(&format!(
+                        "ALTER TABLE \"{pg_schema_name}\".\"{table_ident}\" \
+                         ADD COLUMN IF NOT EXISTS \"deleted_at\" timestamptz"
                     ))
                     .execute(&mut **tx)
                     .await?;
@@ -351,7 +375,17 @@ async fn apply_schema_additive(
                 .execute(&mut **tx)
                 .await?;
             }
-            if old_index_names.contains(index.name.as_str()) {
+            // FM-33: adding `softDelete` to an existing table widens every
+            // unique index's partial predicate (`AND "deleted_at" IS NULL`, see
+            // the where_sql composition below). The declared-schema diff sees
+            // no index change (fields/where declared identically), so the
+            // existing-index skip below would silently keep the narrow
+            // predicate — bypass it and physically rebuild the unique ones.
+            let soft_delete_newly_added =
+                new_table.soft_delete && !old_table.is_some_and(|t| t.soft_delete);
+            let rebuild_for_soft_delete =
+                soft_delete_newly_added && index.unique && !index.search && index.vector.is_none();
+            if old_index_names.contains(index.name.as_str()) && !rebuild_for_soft_delete {
                 continue;
             }
             let index_ident = format!(
@@ -359,6 +393,13 @@ async fn apply_schema_additive(
                 table_name.to_lowercase(),
                 index.name.to_lowercase()
             );
+            if rebuild_for_soft_delete {
+                sqlx::query(&format!(
+                    "DROP INDEX IF EXISTS \"{pg_schema_name}\".\"{index_ident}\""
+                ))
+                .execute(&mut **tx)
+                .await?;
+            }
             if index.search {
                 // A full-text search index: a generated `tsvector` column over
                 // its text fields plus a GIN index on it. The referenced
@@ -437,14 +478,29 @@ async fn apply_schema_additive(
                 // `compile_filter_literal`). `Option<String>` already carries a
                 // leading " WHERE " when present; shadow-bind a `&str` for
                 // interpolation (`Option` has no `Display` impl).
-                let where_sql: Option<String> = match &index.r#where {
+                let mut where_sql = match &index.r#where {
                     Some(pred) => {
                         let frag = compile_filter_literal(pred, new_table)?;
-                        Some(format!(" WHERE {frag}"))
+                        format!(" WHERE {frag}")
                     }
-                    None => None,
+                    None => String::new(),
                 };
-                let where_sql = where_sql.as_deref().unwrap_or("");
+                // FM-33: a unique index on a soft-delete table excludes
+                // soft-deleted rows — a stamped row holding a key must never
+                // conflict with a fresh insert of the same key. The declared
+                // `where` composes (`AND`); a bare unique index gains
+                // `WHERE "deleted_at" IS NULL`. `render_filter_literal_node`
+                // parenthesizes every And/Or node, so appending is
+                // precedence-safe. Non-unique indexes are untouched (their
+                // `where` is scan shaping, not correctness).
+                if index.unique && new_table.soft_delete {
+                    if where_sql.is_empty() {
+                        where_sql = " WHERE \"deleted_at\" IS NULL".to_string();
+                    } else {
+                        where_sql.push_str(" AND \"deleted_at\" IS NULL");
+                    }
+                }
+                let where_sql = where_sql.as_str();
 
                 // Pre-check for a clear CONFLICT before CREATE UNIQUE INDEX (the
                 // CREATE itself remains the authoritative, race-free guarantee).
@@ -707,6 +763,8 @@ mod tests {
                 collaborators_field: None,
                 ttl: None,
                 authorize: None,
+
+                soft_delete: false,
             },
         );
         tables

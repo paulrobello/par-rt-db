@@ -85,6 +85,16 @@ describe("transaction builder", () => {
     });
   });
 
+  it("builds an undelete step with the wire shape (FM-33)", () => {
+    const txn = mutation().delete("items", "i2").undelete("items", "i2").build();
+    expect(txn).toEqual({
+      steps: [
+        { op: "delete", table: "items", id: "i2" },
+        { op: "undelete", table: "items", id: "i2" },
+      ],
+    });
+  });
+
   it("produces the same JSON step shape when built with a typed schema", () => {
     const schema = defineSchema({
       projects: defineTable({

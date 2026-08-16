@@ -106,7 +106,7 @@ async fn table_count(
     let mut q = take_query(table);
     q.take = None;
     q.count = true;
-    match execute_query(pool, db, schema, &q, &PrincipalCtx::bypass()).await? {
+    match execute_query(pool, db, schema, &q, &PrincipalCtx::bypass(), false).await? {
         QueryResult::Count(n) => Ok(n),
         other => panic!("expected Count variant, got {other:?}"),
     }
@@ -124,6 +124,7 @@ async fn count_docs(
         schema,
         &take_query(table),
         &PrincipalCtx::bypass(),
+        false,
     )
     .await?;
     match result {

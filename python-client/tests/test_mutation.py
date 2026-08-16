@@ -1,4 +1,4 @@
-"""Tests for ``par_rt_db.mutation``: ``Step`` (7 ops), ``StepResult``, ``Transaction``,
+"""Tests for ``par_rt_db.mutation``: ``Step`` (14 ops), ``StepResult``, ``Transaction``,
 and the ``Mutation`` builder.
 
 Mirrors ``server/src/txn.rs`` (the ``Step`` enum + ``Transaction`` struct +
@@ -8,7 +8,9 @@ untagged ``StepResult``) and the builder ergonomics of
 Wire shapes (load-bearing — match the server exactly):
 
 * ``Step`` is tagged by ``op`` (camelCase variants: ``insert``/``patch``/
-  ``replace``/``delete``/``expectVersion``/``expectAbsent``/``upsert``).
+  ``replace``/``delete``/``undelete``/``expectVersion``/``expectAbsent``/
+  ``upsert``/``patchByQuery``/``deleteByQuery``/``schedule``/``cancelSchedule``/
+  ``startWorkflow``/``cancelWorkflow``).
 * ``Transaction`` is ``{"steps": Step[]}``; the server caps at 1024 steps.
 * ``StepResult`` is untagged: ``{"id", "inserted"}`` (upsert) beats ``{"id"}``
   (insert) beats ``None`` — Union variant ORDER matters (richest first), mirroring
@@ -338,3 +340,26 @@ def test_step_result_start_and_cancel_workflow():
     assert sr.validate_python({"cancelled": False}).model_dump(by_alias=True, mode="json") == {
         "cancelled": False
     }
+
+
+# --- FM-33 undelete step ---
+
+
+def test_undelete_wire_shape():
+    m = Mutation.builder().undelete("notes", "n1").build()
+    wire = json.loads(m.model_dump_json(by_alias=True))
+    assert wire["steps"][0] == {"op": "undelete", "table": "notes", "id": "n1"}
+    # Round-trips through model_validate (corpus parity path).
+    assert json.loads(Mutation.model_validate(wire).model_dump_json(by_alias=True)) == wire
+
+
+def test_undelete_builder_returns_self():
+    b = Mutation.builder()
+    assert b.undelete("notes", "n1") is b
+
+
+def test_undelete_rejects_unknown_field():
+    with pytest.raises(ValidationError):
+        Transaction.model_validate(
+            {"steps": [{"op": "undelete", "table": "t", "id": "x", "bogus": 1}]}
+        )

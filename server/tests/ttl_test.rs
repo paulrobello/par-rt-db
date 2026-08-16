@@ -101,7 +101,7 @@ async fn get_doc(
         hybrid_search: None,
         aggregate: None,
     };
-    match execute_query(pool, db, schema, &query, &PrincipalCtx::bypass()).await {
+    match execute_query(pool, db, schema, &query, &PrincipalCtx::bypass(), false).await {
         Ok(QueryResult::Doc(Some(doc))) => doc,
         other => panic!("expected Doc(Some(..)) for id {id}, got {other:?}"),
     }
@@ -380,7 +380,7 @@ async fn doc_present(
         aggregate: None,
     };
     matches!(
-        execute_query(pool, db, schema, &query, &PrincipalCtx::bypass()).await,
+        execute_query(pool, db, schema, &query, &PrincipalCtx::bypass(), false).await,
         Ok(QueryResult::Doc(Some(_)))
     )
 }

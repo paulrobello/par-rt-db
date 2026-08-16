@@ -168,6 +168,13 @@ export class TxnBuilder<S extends SchemaDefinition<any> = SchemaDefinition<any>>
     return this;
   }
 
+  /** Restores a soft-deleted row (FM-33). Only legal on a table whose schema
+   * declares `.softDelete()`; idempotent when the row is already live. */
+  undelete<T extends TableNames<S>>(table: T, id: string): this {
+    this.steps.push({ op: "undelete", table, id });
+    return this;
+  }
+
   expectVersion<T extends TableNames<S>>(table: T, id: string, version: number): this {
     this.steps.push({ op: "expectVersion", table, id, version });
     return this;

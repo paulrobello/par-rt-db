@@ -37,6 +37,7 @@ fn owner_schema() -> SchemaDef {
             collaborators_field: None,
             ttl: None,
             authorize: None,
+            soft_delete: false,
         },
     );
     SchemaDef { tables }
@@ -341,7 +342,7 @@ async fn anonymous_owns_its_inserted_docs() -> anyhow::Result<()> {
     assert_eq!(outcome.write_set.docs.len(), 1);
 
     // The anon reads its own row back (1 visible doc).
-    match execute_query(&state.pool, &db, &schema, &collect_notes(), &ctx).await? {
+    match execute_query(&state.pool, &db, &schema, &collect_notes(), &ctx, false).await? {
         QueryResult::Docs(docs) => {
             assert_eq!(docs.len(), 1, "anon sees its own note");
             assert_eq!(docs[0]["_id"].as_str(), Some(id.as_str()));
@@ -356,7 +357,16 @@ async fn anonymous_owns_its_inserted_docs() -> anyhow::Result<()> {
         email: None,
         tables: None,
     };
-    match execute_query(&state.pool, &db, &schema, &collect_notes(), &other_ctx).await? {
+    match execute_query(
+        &state.pool,
+        &db,
+        &schema,
+        &collect_notes(),
+        &other_ctx,
+        false,
+    )
+    .await?
+    {
         QueryResult::Docs(docs) => assert_eq!(docs.len(), 0, "other user sees nothing"),
         other => panic!("expected Docs, got {other:?}"),
     }

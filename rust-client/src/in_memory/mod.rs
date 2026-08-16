@@ -20,7 +20,7 @@
 //! storage surfaces. The public surface (`par_rt_db_client::in_memory::*`) is
 //! unchanged - moved items are re-exported below.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -32,7 +32,9 @@ use sha2::{Digest, Sha256};
 use crate::error::{ErrorCode, RtDbError};
 use crate::mutation::{Step, StepResult, Transaction};
 use crate::query::{Order, Query};
-use crate::schema::{FieldType, IndexDef, SchemaDef, TableDef, is_widening_of};
+use crate::schema::{
+    FieldType, IndexDef, OnDeleteAction, SchemaDef, TableDef, is_widening_of, strip_on_delete,
+};
 use crate::wire::{
     AggregateOp, AuthedUser, FilterExpr, PresenceMember, ScheduleInfo, ScheduleKind,
     ScheduleStatus, ScheduleWhen,
@@ -54,6 +56,12 @@ pub const MAX_BY_QUERY_STEPS_PER_TXN: usize = 16;
 /// touch (mirrors `server/src/txn.rs::MAX_AFFECTED_ROWS_PER_TXN`). Per-id
 /// steps count 1 each; each by-query step counts up to its `limit`.
 pub const MAX_AFFECTED_ROWS_PER_TXN: usize = 10_000;
+/// FM-33: hard cap on the number of rows one initiating delete step's
+/// `onDelete` cascade may touch (mirrors
+/// `server/src/txn.rs::MAX_CASCADE_ROWS`) — children stamped/deleted/nulled
+/// plus the initiator itself, one shared counter across every row of a
+/// `deleteByQuery` step. Over → `conflict`, txn aborts atomically.
+pub const MAX_CASCADE_ROWS: usize = 10_000;
 
 /// SEC-104: total documents a txn could touch in the worst case. Per-id steps
 /// count 1 each; `Schedule`/`CancelSchedule`/`StartWorkflow`/`CancelWorkflow`
@@ -99,6 +107,36 @@ fn count_steps(txn: &Transaction) -> usize {
     total
 }
 
+/// The `onDelete` action `ty` declares when it references `parent_table`, or
+/// `None` when the type is not an `id`/`optional<id>` pointing at it (or
+/// declares no action). Push validation guarantees an `onDelete`-bearing `Id`
+/// appears only at the top level or directly under one `Optional`, so this
+/// two-shape walk is exhaustive. Mirrors `server/src/txn.rs::on_delete_ref`
+/// (FM-33).
+fn on_delete_ref(ty: &FieldType, parent_table: &str) -> Option<OnDeleteAction> {
+    match ty {
+        FieldType::Id {
+            table,
+            on_delete: Some(action),
+        } if table == parent_table => Some(*action),
+        FieldType::Optional { inner } => on_delete_ref(inner, parent_table),
+        _ => None,
+    }
+}
+
+/// Whether ANY table in `schema` declares an `onDelete` field referencing
+/// `parent` — i.e. deleting a `parent` row has app-level FK consequences the
+/// caller must honor (the TTL reaper's bulk-vs-cascade branch: a plain bulk
+/// delete is safe only when this returns `false`). Mirrors
+/// `server/src/txn.rs::has_on_delete_children` (FM-33).
+fn has_on_delete_children(schema: &SchemaDef, parent: &str) -> bool {
+    schema.tables.values().any(|td| {
+        td.fields
+            .values()
+            .any(|ty| on_delete_ref(ty, parent).is_some())
+    })
+}
+
 /// Approximate cron re-fire interval for the in-memory stub. Real 5-field cron
 /// parsing is deferred to the server; the harness only needs crons to re-arm.
 pub const CRON_STEP_MS: i64 = 60_000;
@@ -113,6 +151,11 @@ pub struct StoredRow {
     pub doc: Value,
     pub version: i64,
     pub created_at: i64,
+    /// FM-33: soft-delete stamp — `Some(ms)` marks the row soft-deleted
+    /// (invisible to every read and write lookup, restorable via the
+    /// `undelete` step); `None` = live. Only a `softDelete` table ever
+    /// stamps, mirroring the server's `deleted_at` column.
+    pub deleted_at: Option<i64>,
 }
 
 /// A stored scheduled job in the in-memory harness. `tick` fires due non-paused
@@ -459,20 +502,24 @@ impl InMemoryRtDbClient {
 
     /// Minimal point read — returns the merged doc (system fields included) for
     /// `(table, id)`, or `None` if absent. Mirrors the server's `get(id)` read
-    /// semantics. The full query DSL (`withIndex`, `order`, `take`, `filter`, …)
-    /// lands in Task 3; tests that need a quick read use this until then.
+    /// semantics; a soft-deleted row is absent (FM-33). The full query DSL
+    /// (`withIndex`, `order`, `take`, `filter`, …) lands in Task 3; tests that
+    /// need a quick read use this until then.
     pub fn get(&self, table: &str, id: &str) -> Option<Value> {
         self.docs
             .get(&(table.to_string(), id.to_string()))
+            .filter(|row| row.deleted_at.is_none())
             .map(merge_doc)
     }
 
     /// Test/debug helper — every merged doc in `table`, in unspecified order.
-    /// Not part of the query DSL; Task 3 replaces callers with proper queries.
+    /// Soft-deleted rows are excluded (FM-33). Not part of the query DSL;
+    /// Task 3 replaces callers with proper queries.
     pub fn collect_all(&self, table: &str) -> Vec<Value> {
         self.docs
             .iter()
             .filter(|((t, _), _)| t == table)
+            .filter(|(_, row)| row.deleted_at.is_none())
             .map(|(_, row)| merge_doc(row))
             .collect()
     }
@@ -559,11 +606,12 @@ impl InMemoryRtDbClient {
         let mut write_set: BTreeSet<String> = BTreeSet::new();
         for step in &txn.steps {
             match self.execute_step(step) {
-                Ok((result, written_table)) => {
+                Ok((result, written_tables)) => {
                     results.push(result);
-                    if let Some(table) = written_table {
-                        write_set.insert(table);
-                    }
+                    // FM-33: a cascading delete can write MULTIPLE tables in one
+                    // step (children + parent), so the per-step write result is a
+                    // Vec — the notify fan-out stays table-keyed.
+                    write_set.extend(written_tables);
                 }
                 Err(error) => {
                     // Atomicity: any step's error rolls back everything already
@@ -580,34 +628,59 @@ impl InMemoryRtDbClient {
 
     /// Per-step executor — ports `executeStep` (`ts-client/src/in_memory.ts:747-805`).
     /// Each step validates against the live schema, mutates `self.docs` (or, for
-    /// `Expect*`, just observes), and returns the [`StepResult`] plus the table
-    /// that was written (so the Task 5 notify path can fan out by table).
-    fn execute_step(&mut self, step: &Step) -> Result<(StepResult, Option<String>), RtDbError> {
+    /// `Expect*`, just observes), and returns the [`StepResult`] plus every
+    /// table that was written (the Task 5 notify path fans out by table; a
+    /// cascading delete may write several).
+    fn execute_step(&mut self, step: &Step) -> Result<(StepResult, Vec<String>), RtDbError> {
         match step {
             Step::Insert { table, doc } => {
                 let table_def = self.require_table(table)?.clone();
                 let id = self.do_insert(table, &table_def, doc)?;
-                Ok((StepResult::Insert { id }, Some(table.clone())))
+                Ok((StepResult::Insert { id }, vec![table.clone()]))
             }
             Step::Patch { table, id, fields } => {
                 let table_def = self.require_table(table)?.clone();
                 self.do_patch(&table_def, table, id, fields)?;
-                Ok((StepResult::Null, Some(table.clone())))
+                Ok((StepResult::Null, vec![table.clone()]))
             }
             Step::Replace { table, id, doc } => {
                 let table_def = self.require_table(table)?.clone();
                 self.do_replace(&table_def, table, id, doc)?;
-                Ok((StepResult::Null, Some(table.clone())))
+                Ok((StepResult::Null, vec![table.clone()]))
             }
             Step::Delete { table, id } => {
-                self.require_table(table)?;
-                self.do_delete(table, id)?;
-                Ok((StepResult::Null, Some(table.clone())))
+                let table_def = self.require_table(table)?.clone();
+                // FM-33: a soft-delete table stamps the row (never a cascade
+                // trigger); a hard delete expands the app-level `onDelete`
+                // rules with a FRESH visited set + budget, mirroring
+                // `server/src/txn.rs::step_delete`.
+                let mut touched = Vec::new();
+                if table_def.soft_delete {
+                    self.do_soft_delete(table, id)?;
+                    touched.push(table.clone());
+                } else {
+                    let mut visited = HashSet::new();
+                    let mut cascade_rows = 0usize;
+                    self.delete_row_cascade(
+                        table,
+                        id,
+                        &mut visited,
+                        &mut cascade_rows,
+                        false,
+                        &mut touched,
+                    )?;
+                }
+                Ok((StepResult::Null, touched))
+            }
+            Step::Undelete { table, id } => {
+                let table_def = self.require_table(table)?.clone();
+                self.do_undelete(&table_def, table, id)?;
+                Ok((StepResult::Null, vec![table.clone()]))
             }
             Step::ExpectVersion { table, id, version } => {
                 self.require_table(table)?;
                 self.do_expect_version(table, id, *version)?;
-                Ok((StepResult::Null, None))
+                Ok((StepResult::Null, Vec::new()))
             }
             Step::ExpectAbsent { table, index, eq } => {
                 let table_def = self.require_table(table)?.clone();
@@ -618,7 +691,7 @@ impl InMemoryRtDbClient {
                         format!("index '{index}' already has a matching document"),
                     ));
                 }
-                Ok((StepResult::Null, None))
+                Ok((StepResult::Null, Vec::new()))
             }
             Step::Upsert {
                 table,
@@ -643,13 +716,13 @@ impl InMemoryRtDbClient {
                             id: row.id.clone(),
                             inserted: false,
                         },
-                        Some(table.clone()),
+                        vec![table.clone()],
                     ))
                 } else {
                     let id = self.do_insert(table, &table_def, insert)?;
                     Ok((
                         StepResult::Upsert { id, inserted: true },
-                        Some(table.clone()),
+                        vec![table.clone()],
                     ))
                 }
             }
@@ -662,7 +735,7 @@ impl InMemoryRtDbClient {
                 let (patched, truncated) = self.patch_by_query(table, filter, patch, *limit)?;
                 Ok((
                     StepResult::PatchByQuery { patched, truncated },
-                    Some(table.clone()),
+                    vec![table.clone()],
                 ))
             }
             Step::DeleteByQuery {
@@ -670,21 +743,19 @@ impl InMemoryRtDbClient {
                 filter,
                 limit,
             } => {
-                let (deleted, truncated) = self.delete_by_query(table, filter, *limit)?;
-                Ok((
-                    StepResult::DeleteByQuery { deleted, truncated },
-                    Some(table.clone()),
-                ))
+                let ((deleted, truncated), touched) =
+                    self.delete_by_query(table, filter, *limit)?;
+                Ok((StepResult::DeleteByQuery { deleted, truncated }, touched))
             }
             Step::Schedule { when, txn } => {
                 let schedule_id = self.schedule((**txn).clone(), when.clone())?;
-                Ok((StepResult::Schedule { schedule_id }, None))
+                Ok((StepResult::Schedule { schedule_id }, Vec::new()))
             }
             Step::CancelSchedule { id } => {
                 // Matches the server: `false` (not an error) when the id is
                 // missing, already fired, or already cancelled.
                 let cancelled = self.cancel_schedule(id).is_ok();
-                Ok((StepResult::Cancelled { cancelled }, None))
+                Ok((StepResult::Cancelled { cancelled }, Vec::new()))
             }
             // FM-29: this harness does not model the workflow engine (the
             // ts/python harnesses do); workflow steps fail explicitly rather
@@ -719,6 +790,7 @@ impl InMemoryRtDbClient {
                 doc: stored,
                 version: 1,
                 created_at: (self.now)(),
+                deleted_at: None,
             },
         );
         Ok(id)
@@ -726,6 +798,7 @@ impl InMemoryRtDbClient {
 
     /// Patches an existing doc with `fields`, bumping `_version`. Ports
     /// `doPatch` (`ts-client/src/in_memory.ts:815-824`) — apply then update.
+    /// A soft-deleted row is absent to the lookup (FM-33).
     fn do_patch(
         &mut self,
         table_def: &TableDef,
@@ -734,9 +807,14 @@ impl InMemoryRtDbClient {
         fields: &Map<String, Value>,
     ) -> Result<(), RtDbError> {
         let key = (table_name.to_string(), id.to_string());
-        let row = self.docs.get(&key).cloned().ok_or_else(|| {
-            RtDbError::new(ErrorCode::NotFound, format!("document '{id}' not found"))
-        })?;
+        let row = self
+            .docs
+            .get(&key)
+            .filter(|row| row.deleted_at.is_none())
+            .cloned()
+            .ok_or_else(|| {
+                RtDbError::new(ErrorCode::NotFound, format!("document '{id}' not found"))
+            })?;
         let merged = apply_patch(table_def, &row.doc, fields)?;
         self.do_update(table_def, table_name, id, merged)?;
         Ok(())
@@ -745,7 +823,8 @@ impl InMemoryRtDbClient {
     /// Replaces an existing doc whole, bumping `_version`. Ports `doReplace`
     /// (`ts-client/src/in_memory.ts:826-836`) with the unique-index check
     /// threaded in before the write (TS calls `checkUniqueIndexes` with the
-    /// stored replacement doc and `excludeId = row.id`).
+    /// stored replacement doc and `excludeId = row.id`). A soft-deleted row is
+    /// absent to the lookup (FM-33).
     fn do_replace(
         &mut self,
         table_def: &TableDef,
@@ -754,7 +833,11 @@ impl InMemoryRtDbClient {
         doc: &Map<String, Value>,
     ) -> Result<(), RtDbError> {
         let key = (table_name.to_string(), id.to_string());
-        if !self.docs.contains_key(&key) {
+        let live = self
+            .docs
+            .get(&key)
+            .is_some_and(|row| row.deleted_at.is_none());
+        if !live {
             return Err(RtDbError::new(
                 ErrorCode::NotFound,
                 format!("document '{id}' not found"),
@@ -774,13 +857,239 @@ impl InMemoryRtDbClient {
         Ok(())
     }
 
-    /// Deletes a doc by id. Ports `doDelete` (`ts-client/src/in_memory.ts:838-842`).
+    /// Deletes a doc by id (hard). Only used by the TTL reaper's bulk branch
+    /// now; interactive deletes go through [`Self::delete_row_cascade`]
+    /// (FM-33). Ports `doDelete` (`ts-client/src/in_memory.ts:838-842`).
     fn do_delete(&mut self, table_name: &str, id: &str) -> Result<(), RtDbError> {
         let key = (table_name.to_string(), id.to_string());
         self.docs.remove(&key).ok_or_else(|| {
             RtDbError::new(ErrorCode::NotFound, format!("document '{id}' not found"))
         })?;
         Ok(())
+    }
+
+    /// Stamps the row soft-deleted (FM-33): sets `deleted_at` and bumps
+    /// `_version` (a stale client copy fails OCC against the stamped row).
+    /// An absent OR already-stamped row is `NotFound`, matching the
+    /// hard-delete miss — deleting an already-soft-deleted row is `NotFound`,
+    /// exactly like deleting a physically absent one. Mirrors
+    /// `server/src/txn.rs::do_soft_delete`.
+    fn do_soft_delete(&mut self, table_name: &str, id: &str) -> Result<(), RtDbError> {
+        let key = (table_name.to_string(), id.to_string());
+        let Some(row) = self.docs.get_mut(&key) else {
+            return Err(RtDbError::new(
+                ErrorCode::NotFound,
+                format!("document '{id}' not found"),
+            ));
+        };
+        if row.deleted_at.is_some() {
+            return Err(RtDbError::new(
+                ErrorCode::NotFound,
+                format!("document '{id}' not found"),
+            ));
+        }
+        row.deleted_at = Some((self.now)());
+        row.version += 1;
+        Ok(())
+    }
+
+    /// `undelete` step executor (FM-33): restore a soft-deleted row — clear
+    /// `deleted_at`, bump `_version` (a stale client copy fails OCC against
+    /// the restored row). `NotFound` when absent; idempotent `Ok` when the
+    /// row is present and already live; `BadRequest` on a table that does not
+    /// declare `softDelete`. The doc body is untouched (a soft delete never
+    /// modified it), so the restored row re-appears byte-identical. Restoring
+    /// re-enters the partial unique indexes (`WHERE deleted_at IS NULL`), so
+    /// a live duplicate holding the key conflicts — the server surfaces the
+    /// index violation as `conflict` on the restoring UPDATE; the harness
+    /// runs the same [`Self::check_unique_indexes`] pass the write paths use.
+    /// Mirrors `server/src/txn.rs::step_undelete`.
+    fn do_undelete(
+        &mut self,
+        table_def: &TableDef,
+        table: &str,
+        id: &str,
+    ) -> Result<(), RtDbError> {
+        if !table_def.soft_delete {
+            return Err(RtDbError::new(
+                ErrorCode::BadRequest,
+                format!("table '{table}' does not declare softDelete"),
+            ));
+        }
+        let key = (table.to_string(), id.to_string());
+        let Some(row) = self.docs.get(&key) else {
+            return Err(RtDbError::new(
+                ErrorCode::NotFound,
+                format!("document '{id}' not found"),
+            ));
+        };
+        if row.deleted_at.is_none() {
+            // Idempotent: restoring a live row changes nothing.
+            return Ok(());
+        }
+        // Clone out of the borrow so the unique check (a &self method) can
+        // run before the restore mutates the row.
+        let restored_doc = row.doc.clone();
+        self.check_unique_indexes(table_def, table, &restored_doc, Some(id))?;
+        if let Some(row) = self.docs.get_mut(&key) {
+            row.deleted_at = None;
+            row.version += 1;
+        }
+        Ok(())
+    }
+
+    /// Deletes row `id` of `table_name` expanding the app-level `onDelete`
+    /// rules (FM-33), mirroring `server/src/txn.rs::delete_row_cascade`:
+    ///
+    /// - `softDelete` table (unless `force_hard`): the row is STAMPED, not
+    ///   removed, and the recursion stops — nothing past a stamped row is
+    ///   touched. Soft delete is never itself a cascade trigger.
+    /// - Children first, parent last, walking every schema table field
+    ///   declaring an `onDelete` action referencing this table (deterministic
+    ///   BTreeMap order): `restrict` conflicts on the first live child
+    ///   (naming `table.field`); `cascade` recurses per live child; `setNull`
+    ///   patches `{field: null}` per live child (the key is REMOVED from the
+    ///   doc body — `apply_patch`'s unset semantics — and `_version` bumps).
+    /// - `visited` guards cycles (self- and mutual-reference) and lets a
+    ///   `deleteByQuery` step skip rows an earlier row's cascade already
+    ///   removed.
+    /// - `cascade_rows` is the shared per-initiating-step budget
+    ///   ([`MAX_CASCADE_ROWS`]): every stamped/deleted/nulled row plus each
+    ///   initiator counts; over-budget is a `conflict`, so the txn rolls
+    ///   back atomically (via the harness's snapshot/restore path).
+    /// - `force_hard` (reaper) physically removes rows even on `softDelete`
+    ///   tables and propagates through the recursion.
+    /// - `touched` accumulates every table written, for the notify fan-out.
+    fn delete_row_cascade(
+        &mut self,
+        table_name: &str,
+        id: &str,
+        visited: &mut HashSet<(String, String)>,
+        cascade_rows: &mut usize,
+        force_hard: bool,
+        touched: &mut Vec<String>,
+    ) -> Result<(), RtDbError> {
+        let table_def = self.require_table(table_name)?.clone();
+        if !visited.insert((table_name.to_string(), id.to_string())) {
+            return Ok(());
+        }
+        if *cascade_rows >= MAX_CASCADE_ROWS {
+            return Err(RtDbError::new(
+                ErrorCode::Conflict,
+                format!("onDelete cascade exceeds the limit of {MAX_CASCADE_ROWS} rows"),
+            ));
+        }
+        *cascade_rows += 1;
+
+        if table_def.soft_delete && !force_hard {
+            self.do_soft_delete(table_name, id)?;
+            touched.push(table_name.to_string());
+            return Ok(());
+        }
+
+        // Collect the child-walk plan from the schema's BTreeMap (deterministic
+        // order) BEFORE mutating: iterating the schema while calling `&mut
+        // self` helpers would conflict borrows. Each entry carries the child
+        // table def so the loop body never re-looks it up.
+        let schema = self
+            .schema
+            .clone()
+            .ok_or_else(|| RtDbError::internal("schema not pushed"))?;
+        let mut plan: Vec<(String, TableDef, String, OnDeleteAction)> = Vec::new();
+        for (child_table_name, child_table_def) in &schema.tables {
+            for (field_name, field_type) in &child_table_def.fields {
+                if let Some(action) = on_delete_ref(field_type, table_name) {
+                    plan.push((
+                        child_table_name.clone(),
+                        child_table_def.clone(),
+                        field_name.clone(),
+                        action,
+                    ));
+                }
+            }
+        }
+        for (child_table_name, child_table_def, field_name, action) in plan {
+            match action {
+                OnDeleteAction::Restrict => {
+                    let hits = self.visible_child_ids(&child_table_name, &field_name, id, true);
+                    if let Some(child_id) = hits.first() {
+                        return Err(RtDbError::new(
+                            ErrorCode::Conflict,
+                            format!(
+                                "cannot delete '{table_name}': '{child_table_name}.{field_name}' is referenced by document '{child_id}'"
+                            ),
+                        ));
+                    }
+                }
+                OnDeleteAction::Cascade => {
+                    let child_ids =
+                        self.visible_child_ids(&child_table_name, &field_name, id, false);
+                    for child_id in child_ids {
+                        self.delete_row_cascade(
+                            &child_table_name,
+                            &child_id,
+                            visited,
+                            cascade_rows,
+                            force_hard,
+                            touched,
+                        )?;
+                    }
+                }
+                OnDeleteAction::SetNull => {
+                    let child_ids =
+                        self.visible_child_ids(&child_table_name, &field_name, id, false);
+                    for child_id in child_ids {
+                        if *cascade_rows >= MAX_CASCADE_ROWS {
+                            return Err(RtDbError::new(
+                                ErrorCode::Conflict,
+                                format!(
+                                    "onDelete cascade exceeds the limit of {MAX_CASCADE_ROWS} rows"
+                                ),
+                            ));
+                        }
+                        *cascade_rows += 1;
+                        // `{field: null}` on the optional-id REMOVES the key
+                        // (apply_patch's unset semantics) and bumps `_version`.
+                        let mut fields = Map::new();
+                        fields.insert(field_name.clone(), Value::Null);
+                        self.do_patch(&child_table_def, &child_table_name, &child_id, &fields)?;
+                        touched.push(child_table_name.clone());
+                    }
+                }
+            }
+        }
+
+        self.do_delete(table_name, id)?;
+        touched.push(table_name.to_string());
+        Ok(())
+    }
+
+    /// Ids of live (non-soft-deleted) rows in `child_table` whose `field_name`
+    /// references `parent_id` (FM-33). Soft-deleted children are invisible to
+    /// every `onDelete` action. `limit_one` fetches a single hit (the
+    /// `restrict` existence probe); otherwise the fetch is capped at the
+    /// cascade row budget plus one (bounding memory on a pathological fan-out
+    /// without ever dropping a row that could still be processed within
+    /// budget — processing past the budget conflicts first). Mirrors
+    /// `server/src/txn.rs::visible_child_ids`.
+    fn visible_child_ids(
+        &self,
+        child_table: &str,
+        field: &str,
+        parent_id: &str,
+        limit_one: bool,
+    ) -> Vec<String> {
+        let cap = if limit_one { 1 } else { MAX_CASCADE_ROWS + 1 };
+        self.docs
+            .iter()
+            .filter(|((t, _), _)| t == child_table)
+            .filter(|(_, row)| row.deleted_at.is_none())
+            .filter(
+                |(_, row)| matches!(row.doc.get(field), Some(Value::String(s)) if s == parent_id),
+            )
+            .take(cap)
+            .map(|(_, row)| row.id.clone())
+            .collect()
     }
 
     /// Scans `table` for rows matching `filter`, returning their ids ordered by
@@ -804,6 +1113,9 @@ impl InMemoryRtDbClient {
             .docs
             .iter()
             .filter(|((t, _), _)| t == table)
+            // FM-33: a soft-deleted row is absent to every scan (the server's
+            // compile_scan_where composes the same live-only predicate).
+            .filter(|(_, row)| row.deleted_at.is_none())
             .filter(|(_, row)| matches_filter(filter, &row.doc))
             .map(|(_, row)| (row.created_at, row.id.clone()))
             .collect();
@@ -833,24 +1145,43 @@ impl InMemoryRtDbClient {
     }
 
     /// `deleteByQuery` executor: deletes every matching row via the same
-    /// `do_delete` path as a per-id `Delete`. Mirrors
-    /// `server/src/txn.rs::step_delete_by_query`.
+    /// `onDelete`-aware path as a per-id `Delete` — `delete_row_cascade`
+    /// unconditionally, whose soft branch stamps a `softDelete` table's row
+    /// without walking children. `visited` and the row budget are shared
+    /// across the whole step — a row already hard-deleted by an earlier row's
+    /// cascade is skipped (not a NotFound abort), and one budget bounds every
+    /// cascade the step starts. Returns the per-step result plus every table
+    /// written (for the notify fan-out). Mirrors
+    /// `server/src/txn.rs::step_delete_by_query` (FM-33).
     fn delete_by_query(
         &mut self,
         table: &str,
         filter: &FilterExpr,
         limit: Option<u32>,
-    ) -> Result<(u32, bool), RtDbError> {
-        let table_def = self.require_table(table)?;
-        let (ids, truncated) = self.scan_ids_by_filter(table_def, table, filter, limit)?;
+    ) -> Result<((u32, bool), Vec<String>), RtDbError> {
+        let table_def = self.require_table(table)?.clone();
+        let (ids, truncated) = self.scan_ids_by_filter(&table_def, table, filter, limit)?;
+        let deleted = ids.len() as u32;
+        let mut touched = Vec::new();
+        let mut visited = HashSet::new();
+        let mut cascade_rows = 0usize;
         for id in &ids {
-            self.do_delete(table, id)?;
+            self.delete_row_cascade(
+                table,
+                id,
+                &mut visited,
+                &mut cascade_rows,
+                false,
+                &mut touched,
+            )?;
         }
-        Ok((ids.len() as u32, truncated))
+        Ok(((deleted, truncated), touched))
     }
 
     /// Asserts a doc's current `_version` matches `expected`. Ports
-    /// `doExpectVersion` (`ts-client/src/in_memory.ts:844-852`).
+    /// `doExpectVersion` (`ts-client/src/in_memory.ts:844-852`). A soft-deleted
+    /// row is absent — `NotFound`, the same silent-miss as the server's
+    /// live-only lookup (FM-33).
     fn do_expect_version(
         &self,
         table_name: &str,
@@ -858,9 +1189,13 @@ impl InMemoryRtDbClient {
         expected: i64,
     ) -> Result<(), RtDbError> {
         let key = (table_name.to_string(), id.to_string());
-        let row = self.docs.get(&key).ok_or_else(|| {
-            RtDbError::new(ErrorCode::NotFound, format!("document '{id}' not found"))
-        })?;
+        let row = self
+            .docs
+            .get(&key)
+            .filter(|row| row.deleted_at.is_none())
+            .ok_or_else(|| {
+                RtDbError::new(ErrorCode::NotFound, format!("document '{id}' not found"))
+            })?;
         if row.version != expected {
             return Err(RtDbError::new(
                 ErrorCode::PreconditionFailed,
@@ -935,6 +1270,12 @@ impl InMemoryRtDbClient {
                 if matches!(exclude_id, Some(excl) if row.id == excl) {
                     continue;
                 }
+                // FM-33: soft-deleted rows are excluded from unique indexes
+                // (the server's partial predicate `AND "deleted_at" IS NULL`),
+                // so the same key is re-insertable while soft-deleted.
+                if row.deleted_at.is_some() {
+                    continue;
+                }
                 if let Some(pred) = &index.r#where
                     && !eval_filter_expr(pred, &row.doc)
                 {
@@ -992,6 +1333,12 @@ impl InMemoryRtDbClient {
         let mut matches = Vec::new();
         for ((t, _id), row) in &self.docs {
             if t != table_name {
+                continue;
+            }
+            // FM-33: soft-deleted rows are absent to `expectAbsent` and
+            // `upsert` — upserting a soft-deleted key inserts a fresh row, and
+            // expectAbsent passes.
+            if row.deleted_at.is_some() {
                 continue;
             }
             let all_match =
@@ -1395,17 +1742,38 @@ impl InMemoryRtDbClient {
     /// `now`, for every table that declares a `ttl`. Fires subscription fan-out
     /// for touched tables (mirroring `execute_transaction`). Returns the count
     /// removed. Ports TS `reapTtl` (`ts-client/src/in_memory.ts:1196-1221`).
+    ///
+    /// FM-33: when some table declares an `onDelete` field referencing an
+    /// expired table's, a bulk remove would strand (cascade/setNull) or ignore
+    /// (restrict) the children — so each expired row reaps through
+    /// [`Self::delete_row_cascade`] with `force_hard = true` (TTL expiry is a
+    /// real delete even on a `softDelete` table; the reaper is the collector
+    /// of last resort, mirroring `server/src/committer.rs::handle_reaper`).
+    /// `visited` is shared across each table's sweep (a row already cascaded
+    /// by an earlier expired row's cascade is skipped, not an error) while the
+    /// budget is fresh per initiating row; a per-row failure skips that row
+    /// and continues (at-least-once — it retries on the next tick). Otherwise
+    /// the bulk remove hard-deletes regardless of `soft_delete`, matching the
+    /// server's unconditional bulk `DELETE`.
     fn reap_ttl(&mut self, now: i64) -> usize {
+        let schema = match self.schema.clone() {
+            Some(s) => s,
+            None => return 0,
+        };
         // Collect the (table, id) keys to remove — we can't mutate `self.docs`
         // while iterating it, so gather first then drain. A doc qualifies only
         // when its TTL field is a JSON number strictly less than `now`; a
         // missing or non-numeric TTL field is left alone (over-approximate
         // safely: never reap a doc that might still be live).
         let mut to_remove: Vec<(String, String)> = Vec::new();
+        let mut cascade_tables: Vec<String> = Vec::new();
         for (table_name, table_def) in &self.tables {
             let Some(ttl) = &table_def.ttl else {
                 continue;
             };
+            if has_on_delete_children(&schema, table_name) {
+                cascade_tables.push(table_name.clone());
+            }
             for ((t, id), row) in &self.docs {
                 if t != table_name {
                     continue;
@@ -1417,12 +1785,51 @@ impl InMemoryRtDbClient {
                 }
             }
         }
+        // Group the removals by table: a cascade table's sweep shares ONE
+        // `visited` across all of its expired rows (server
+        // `committer.rs::handle_reaper` — a row already cascaded by an earlier
+        // expired row's cascade is skipped, not an error), while the budget is
+        // fresh per initiating row.
+        let mut by_table: HashMap<String, Vec<String>> = HashMap::new();
+        for (table_name, id) in to_remove {
+            by_table.entry(table_name).or_default().push(id);
+        }
         let mut removed = 0usize;
         let mut touched: BTreeSet<String> = BTreeSet::new();
-        for key in &to_remove {
-            if self.docs.remove(key).is_some() {
-                removed += 1;
-                touched.insert(key.0.clone());
+        for (table_name, ids) in &by_table {
+            if cascade_tables.contains(table_name) {
+                let mut visited = HashSet::new();
+                for id in ids {
+                    let mut cascade_rows = 0usize;
+                    let mut step_touched = Vec::new();
+                    if self
+                        .delete_row_cascade(
+                            table_name,
+                            id,
+                            &mut visited,
+                            &mut cascade_rows,
+                            true,
+                            &mut step_touched,
+                        )
+                        .is_ok()
+                    {
+                        removed += 1;
+                        touched.extend(step_touched);
+                    }
+                    // A per-row failure skips the row (at-least-once: it
+                    // remains expired and retries on the next tick).
+                }
+                continue;
+            }
+            for id in ids {
+                if self
+                    .docs
+                    .remove(&(table_name.clone(), id.clone()))
+                    .is_some()
+                {
+                    removed += 1;
+                    touched.insert(table_name.clone());
+                }
             }
         }
         if !touched.is_empty() {

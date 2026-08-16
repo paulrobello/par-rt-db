@@ -2886,3 +2886,572 @@ describe("InMemoryRtDbClient — admin surface", () => {
     });
   });
 });
+
+// ---------------------------------------------------------------------------
+// FM-33: cascade delete (onDelete) + soft delete — mirrors server
+// tests/cascade_test.rs scenarios against the harness.
+// ---------------------------------------------------------------------------
+
+/** parents + children with the action under test on children.parentId. setNull
+ *  needs the optional-id shape the push validator requires. */
+function fkSchema(onDelete: "cascade" | "restrict") {
+  return defineSchema({
+    parents: defineTable({ title: t.string() }),
+    children: defineTable({
+      note: t.string(),
+      parentId: t.id("parents", { onDelete }),
+    }).index("by_parent", ["parentId"]),
+  });
+}
+
+/** children is softDelete; grandchildren reference children with `onDelete`
+ *  from a hard table, pinning where a stamp stops the recursion. */
+function softChildSchema(onDelete: "cascade" | "restrict") {
+  return defineSchema({
+    parents: defineTable({ title: t.string() }),
+    children: defineTable({
+      note: t.string(),
+      parentId: t.id("parents", { onDelete }),
+    })
+      .index("by_parent", ["parentId"])
+      .softDelete(),
+    grandchildren: defineTable({
+      note: t.string(),
+      childId: t.id("children", { onDelete: "cascade" }),
+    }).index("by_child", ["childId"]),
+  });
+}
+
+/** tasks is softDelete with a unique name index; plain is a hard table. */
+const softTasksSchema = defineSchema({
+  tasks: defineTable({ name: t.string(), done: t.boolean() })
+    .index("by_name", ["name"])
+    .unique()
+    .index("by_done", ["done"])
+    .softDelete(),
+  plain: defineTable({ note: t.string() }),
+});
+
+type Fm33Schema = Parameters<InMemoryRtDbClient["pushSchema"]>[0];
+
+/** Client over a custom schema with the deterministic clock + RNG convention. */
+function fm33Client(schemaDef: Fm33Schema): InMemoryRtDbClient {
+  let ms = 1_700_000_000_000;
+  const c = new InMemoryRtDbClient({ now: () => ms++, random: () => 0 });
+  c.pushSchema(schemaDef);
+  return c;
+}
+
+async function put(
+  c: InMemoryRtDbClient,
+  table: string,
+  doc: Record<string, unknown>,
+): Promise<string> {
+  const [res] = await c.mutate(mutation().insert(table, doc).build());
+  return (res as { id: string }).id;
+}
+
+/** Point read on a table outside the shared api (structural RtQuery literal). */
+const rawGet = (c: InMemoryRtDbClient, table: string, id: string) =>
+  c.query<Record<string, unknown> | null>({ json: { table, get: id } });
+
+/** eq + count on a custom table's index. */
+const rawCount = (c: InMemoryRtDbClient, table: string, index: string, eq: unknown[]) =>
+  c.query<number>({ json: { table, index, eq, count: true } });
+
+function unwrap(doc: Record<string, unknown> | null): Record<string, unknown> {
+  if (doc === null) throw new Error("expected a live document");
+  return doc;
+}
+
+describe("InMemoryRtDbClient — onDelete cascade (FM-33)", () => {
+  it("deletes the parent and every cascaded child, fanning child-table subs out", async () => {
+    const c = fm33Client(fkSchema("cascade"));
+    const parentId = await put(c, "parents", { title: "p1" });
+    for (let i = 0; i < 3; i++) {
+      await put(c, "children", { note: `c${i}`, parentId });
+    }
+    const updates: unknown[] = [];
+    c.subscribe(
+      { json: { table: "children", index: "by_parent", eq: [parentId], count: true } },
+      (n) => updates.push(n),
+    );
+    expect(updates).toEqual([3]);
+
+    await c.mutate(mutation().delete("parents", parentId).build());
+
+    expect(await rawGet(c, "parents", parentId)).toBeNull();
+    expect(await rawCount(c, "children", "by_parent", [parentId])).toBe(0);
+    // The cascade's child-table write reached the subscription — the harness's
+    // mirror of the server's "every cascaded row is a first-class op" contract.
+    expect(updates).toEqual([3, 0]);
+  });
+
+  it("restrict blocks the parent delete with a Conflict and rolls the txn back", async () => {
+    const c = fm33Client(fkSchema("restrict"));
+    const free = await put(c, "parents", { title: "free" });
+    const held = await put(c, "parents", { title: "held" });
+    const childId = await put(c, "children", { note: "c", parentId: held });
+
+    await expect(
+      c.mutate(mutation().delete("parents", free).delete("parents", held).build()),
+    ).rejects.toMatchObject({
+      name: "RtDbError",
+      code: "CONFLICT",
+      message: /'children\.parentId' is referenced by/,
+    });
+    // Atomic: the earlier childless delete rolled back with the failed step.
+    expect(await rawGet(c, "parents", free)).not.toBeNull();
+    expect(await rawGet(c, "parents", held)).not.toBeNull();
+
+    // Deleting the child first unblocks the parent delete.
+    await c.mutate(mutation().delete("children", childId).build());
+    await c.mutate(mutation().delete("parents", held).build());
+    expect(await rawGet(c, "parents", held)).toBeNull();
+  });
+
+  it("setNull removes the child's field key (not null) and bumps its version", async () => {
+    const c = fm33Client(
+      defineSchema({
+        parents: defineTable({ title: t.string() }),
+        children: defineTable({
+          note: t.string(),
+          parentId: t.optional(t.id("parents", { onDelete: "setNull" })),
+        }).index("by_parent", ["parentId"]),
+      }),
+    );
+    const parentId = await put(c, "parents", { title: "p" });
+    const childId = await put(c, "children", { note: "c", parentId });
+
+    await c.mutate(mutation().delete("parents", parentId).build());
+
+    const child = unwrap(await rawGet(c, "children", childId));
+    expect(child).not.toHaveProperty("parentId"); // key REMOVED, not nulled
+    expect(child._version).toBe(2); // the setNull patch bumped it
+  });
+
+  it("terminates a self-referencing cascade cycle", async () => {
+    const c = fm33Client(
+      defineSchema({
+        nodes: defineTable({
+          name: t.string(),
+          parentId: t.optional(t.id("nodes", { onDelete: "cascade" })),
+        }).index("by_parent", ["parentId"]),
+      }),
+    );
+    const a = await put(c, "nodes", { name: "a" });
+    const b = await put(c, "nodes", { name: "b", parentId: a });
+    const d = await put(c, "nodes", { name: "c", parentId: b });
+    await c.mutate(mutation().patch("nodes", a, { parentId: a }).build()); // close the cycle
+
+    await c.mutate(mutation().delete("nodes", a).build());
+
+    expect(await rawGet(c, "nodes", a)).toBeNull();
+    expect(await rawGet(c, "nodes", b)).toBeNull();
+    expect(await rawGet(c, "nodes", d)).toBeNull();
+  });
+
+  it("stamps a softDelete child instead of recursing past it", async () => {
+    const c = fm33Client(softChildSchema("cascade"));
+    const parentId = await put(c, "parents", { title: "p" });
+    const childId = await put(c, "children", { note: "c", parentId });
+    const grandchildId = await put(c, "grandchildren", { note: "g", childId });
+
+    await c.mutate(mutation().delete("parents", parentId).build());
+
+    expect(await rawGet(c, "parents", parentId)).toBeNull();
+    expect(await rawGet(c, "children", childId)).toBeNull(); // stamped → invisible
+    // The stamped child is restorable with its body intact…
+    await c.mutate(mutation().undelete("children", childId).build());
+    expect(unwrap(await rawGet(c, "children", childId)).note).toBe("c");
+    // …and the cascade stopped at it: the grandchild survived, still pointing at it.
+    expect(unwrap(await rawGet(c, "grandchildren", grandchildId)).childId).toBe(childId);
+  });
+
+  it("a soft-deleted child is invisible to the parent's cascade", async () => {
+    const c = fm33Client(softChildSchema("cascade"));
+    const parentId = await put(c, "parents", { title: "p" });
+    const childId = await put(c, "children", { note: "c", parentId });
+    await c.mutate(mutation().delete("children", childId).build()); // stamp first
+
+    await c.mutate(mutation().delete("parents", parentId).build());
+
+    expect(await rawGet(c, "parents", parentId)).toBeNull();
+    // The stamped child stayed stamped (invisible) but was skipped, not removed.
+    await c.mutate(mutation().undelete("children", childId).build());
+    expect(await rawGet(c, "children", childId)).not.toBeNull();
+  });
+
+  it("a soft-deleted child does not block a restrict parent delete", async () => {
+    const c = fm33Client(softChildSchema("restrict"));
+    const parentId = await put(c, "parents", { title: "p" });
+    const childId = await put(c, "children", { note: "c", parentId });
+    await expect(c.mutate(mutation().delete("parents", parentId).build())).rejects.toMatchObject({
+      name: "RtDbError",
+      code: "CONFLICT",
+    });
+
+    await c.mutate(mutation().delete("children", childId).build()); // stamp
+    await c.mutate(mutation().delete("parents", parentId).build()); // now unblocked
+    expect(await rawGet(c, "parents", parentId)).toBeNull();
+  });
+
+  it("deleteByQuery cascades every matched row", async () => {
+    const c = fm33Client(fkSchema("cascade"));
+    const p1 = await put(c, "parents", { title: "p1" });
+    const p2 = await put(c, "parents", { title: "p2" });
+    const keeper = await put(c, "parents", { title: "keeper" });
+    await put(c, "children", { note: "c1", parentId: p1 });
+    await put(c, "children", { note: "c2", parentId: p2 });
+    await put(c, "children", { note: "ck", parentId: keeper });
+
+    const [res] = await c.mutate(
+      mutation()
+        .deleteByQuery("parents", { op: "in", field: "title", values: ["p1", "p2"] })
+        .build(),
+    );
+    expect(res).toEqual({ deleted: 2, truncated: false });
+    expect(await rawCount(c, "children", "by_parent", [p1])).toBe(0);
+    expect(await rawCount(c, "children", "by_parent", [p2])).toBe(0);
+    expect(await rawCount(c, "children", "by_parent", [keeper])).toBe(1);
+  });
+
+  it("deleteByQuery skips a matched row an earlier row's cascade already removed", async () => {
+    const c = fm33Client(
+      defineSchema({
+        nodes: defineTable({
+          name: t.string(),
+          parentId: t.optional(t.id("nodes", { onDelete: "cascade" })),
+        }).index("by_parent", ["parentId"]),
+      }),
+    );
+    const a1 = await put(c, "nodes", { name: "a1" });
+    const a2 = await put(c, "nodes", { name: "a2", parentId: a1 });
+
+    const [res] = await c.mutate(
+      mutation()
+        .deleteByQuery("nodes", { op: "in", field: "name", values: ["a1", "a2"] })
+        .build(),
+    );
+    expect(res).toEqual({ deleted: 2, truncated: false });
+    expect(await rawGet(c, "nodes", a1)).toBeNull();
+    expect(await rawGet(c, "nodes", a2)).toBeNull();
+  });
+
+  it("deleteByQuery on a softDelete table stamps instead of removing", async () => {
+    const c = fm33Client(softTasksSchema);
+    const t1 = await put(c, "tasks", { name: "one", done: false });
+    await put(c, "tasks", { name: "two", done: false });
+    await put(c, "tasks", { name: "three", done: true });
+
+    const [res] = await c.mutate(
+      mutation().deleteByQuery("tasks", { op: "eq", field: "done", value: false }).build(),
+    );
+    expect(res).toEqual({ deleted: 2, truncated: false });
+    expect(await rawCount(c, "tasks", "by_done", [false])).toBe(0);
+    expect(await rawCount(c, "tasks", "by_done", [true])).toBe(1); // "three" survived
+    // Stamped, not removed: the row restores.
+    await c.mutate(mutation().undelete("tasks", t1).build());
+    expect(await rawGet(c, "tasks", t1)).not.toBeNull();
+  });
+
+  it("rolls the whole txn back when a cascade exceeds the row budget", async () => {
+    const c = fm33Client(fkSchema("cascade"));
+    const parentId = await put(c, "parents", { title: "p" });
+    // 10_000 children = 10_001 cascade rows with the parent — one over budget.
+    // MAX_STEPS (1024) forces the seeding into batched txns.
+    for (let batch = 0; batch < 10; batch++) {
+      const m = mutation();
+      for (let i = 0; i < 1000; i++) {
+        m.insert("children", { note: `c${batch}-${i}`, parentId });
+      }
+      await c.mutate(m.build());
+    }
+
+    await expect(c.mutate(mutation().delete("parents", parentId).build())).rejects.toMatchObject({
+      name: "RtDbError",
+      code: "CONFLICT",
+      message: /onDelete cascade exceeds the limit of 10000 rows/,
+    });
+    // Atomic: nothing was deleted.
+    expect(await rawGet(c, "parents", parentId)).not.toBeNull();
+    expect(await rawCount(c, "children", "by_parent", [parentId])).toBe(10_000);
+  });
+
+  it("the ttl reaper hard-deletes and cascades even on a softDelete table", async () => {
+    const c = fm33Client(
+      defineSchema({
+        sessions: defineTable({ expiresAt: t.number() })
+          .index("by_expiresAt", ["expiresAt"])
+          .ttl("expiresAt", 1000)
+          .softDelete(),
+        events: defineTable({
+          kind: t.string(),
+          sessionId: t.id("sessions", { onDelete: "cascade" }),
+        }).index("by_session", ["sessionId"]),
+      }),
+    );
+    const sessionId = await put(c, "sessions", { expiresAt: 1 }); // already past
+    await put(c, "events", { kind: "login", sessionId });
+
+    expect(c.tick()).toBe(1);
+
+    // The session was HARD-deleted (not stamped — an undelete finds nothing)
+    // and the cascade removed its child event.
+    await expect(
+      c.mutate(mutation().undelete("sessions", sessionId).build()),
+    ).rejects.toMatchObject({ name: "RtDbError", code: "NOT_FOUND" });
+    expect(await rawCount(c, "events", "by_session", [sessionId])).toBe(0);
+  });
+});
+
+describe("InMemoryRtDbClient — soft delete (FM-33)", () => {
+  it("stamps a deleted row (version+1) and hides it from every read terminal", async () => {
+    const c = fm33Client(softTasksSchema);
+    const one = await put(c, "tasks", { name: "one", done: false });
+    await put(c, "tasks", { name: "two", done: false });
+
+    await c.mutate(mutation().delete("tasks", one).build());
+
+    expect(await rawGet(c, "tasks", one)).toBeNull();
+    expect(await rawCount(c, "tasks", "by_done", [false])).toBe(1);
+    const all = await c.query<Record<string, unknown>[]>({
+      json: { table: "tasks", index: "by_done", eq: [false], take: 10 },
+    });
+    expect(all.map((d) => d.name)).toEqual(["two"]);
+    // Double delete: the stamped row is already absent → NotFound.
+    await expect(c.mutate(mutation().delete("tasks", one).build())).rejects.toMatchObject({
+      name: "RtDbError",
+      code: "NOT_FOUND",
+    });
+  });
+
+  it("excludes stamped rows from unique indexes; undelete conflicts with a duplicate", async () => {
+    const c = fm33Client(softTasksSchema);
+    const original = await put(c, "tasks", { name: "dup", done: false });
+    await c.mutate(mutation().delete("tasks", original).build());
+
+    // The stamped row no longer holds the unique key…
+    const fresh = await put(c, "tasks", { name: "dup", done: false });
+    expect(fresh).not.toBe(original);
+
+    // …so restoring the original would collide with the live duplicate.
+    await expect(c.mutate(mutation().undelete("tasks", original).build())).rejects.toMatchObject({
+      name: "RtDbError",
+      code: "CONFLICT",
+    });
+  });
+
+  it("undelete restores (+1 version), is idempotent on a live row, and errors elsewhere", async () => {
+    const c = fm33Client(softTasksSchema);
+    const id = await put(c, "tasks", { name: "x", done: false });
+    await c.mutate(mutation().delete("tasks", id).build());
+    await c.mutate(mutation().undelete("tasks", id).build());
+
+    const doc = unwrap(await rawGet(c, "tasks", id));
+    expect(doc._version).toBe(3); // insert 1 → soft delete 2 → undelete 3
+    expect(doc.name).toBe("x");
+
+    // Idempotent: undeleting a live row is a no-op with no version bump.
+    await c.mutate(mutation().undelete("tasks", id).build());
+    expect(unwrap(await rawGet(c, "tasks", id))._version).toBe(3);
+
+    // Unknown id → NotFound; a table without softDelete → BadRequest.
+    await expect(
+      c.mutate(mutation().undelete("tasks", "ffffffffffffffffffffffffffffffff").build()),
+    ).rejects.toMatchObject({ name: "RtDbError", code: "NOT_FOUND" });
+    await expect(c.mutate(mutation().undelete("plain", "x").build())).rejects.toMatchObject({
+      name: "RtDbError",
+      code: "BAD_REQUEST",
+      message: /does not declare softDelete/,
+    });
+  });
+
+  it("upsert over a stamped key inserts a fresh row", async () => {
+    const c = fm33Client(softTasksSchema);
+    const original = await put(c, "tasks", { name: "k", done: false });
+    await c.mutate(mutation().delete("tasks", original).build());
+
+    const [res] = await c.mutate(
+      mutation()
+        .upsert("tasks", {
+          index: "by_name",
+          eq: ["k"],
+          insert: { name: "k", done: true },
+          patch: { done: true },
+        })
+        .build(),
+    );
+    expect(res).toEqual({ id: expect.any(String), inserted: true });
+    expect(await rawGet(c, "tasks", original)).toBeNull(); // still stamped
+    const fresh = await c.query<Record<string, unknown> | null>({
+      json: { table: "tasks", index: "by_name", eq: ["k"], unique: true },
+    });
+    expect(unwrap(fresh).done).toBe(true);
+  });
+
+  it("expectAbsent treats a stamped row as absent", async () => {
+    const c = fm33Client(softTasksSchema);
+    const id = await put(c, "tasks", { name: "live", done: false });
+    await expect(
+      c.mutate(mutation().expectAbsent("tasks", "by_name", ["live"]).build()),
+    ).rejects.toMatchObject({ name: "RtDbError", code: "PRECONDITION_FAILED" });
+
+    await c.mutate(mutation().delete("tasks", id).build());
+    await c.mutate(mutation().expectAbsent("tasks", "by_name", ["live"]).build()); // resolves
+  });
+
+  it("patch/replace/expectVersion see a stamped row as NotFound", async () => {
+    const c = fm33Client(softTasksSchema);
+    const id = await put(c, "tasks", { name: "n", done: false });
+    const version = unwrap(await rawGet(c, "tasks", id))._version as number;
+    await c.mutate(mutation().delete("tasks", id).build());
+
+    for (const txn of [
+      mutation().patch("tasks", id, { done: true }).build(),
+      mutation().replace("tasks", id, { name: "n2", done: true }).build(),
+      mutation().expectVersion("tasks", id, version).build(),
+    ]) {
+      await expect(c.mutate(txn)).rejects.toMatchObject({
+        name: "RtDbError",
+        code: "NOT_FOUND",
+      });
+    }
+  });
+});
+
+describe("InMemoryRtDbClient — onDelete push validation (FM-33)", () => {
+  it("rejects onDelete nested below a top-level id field", () => {
+    const c = new InMemoryRtDbClient();
+    expect(() =>
+      c.pushSchema(
+        defineSchema({
+          parents: defineTable({ title: t.string() }),
+          children: defineTable({
+            note: t.string(),
+            parentIds: t.array(t.id("parents", { onDelete: "cascade" })),
+          }),
+        }),
+      ),
+    ).toThrow(/onDelete is legal only on a top-level id or optional-id field/);
+  });
+
+  it("requires a single-field, non-unique, non-partial btree index on the field", () => {
+    const c = new InMemoryRtDbClient();
+    // No matching index at all (indexed on a different field).
+    expect(() =>
+      c.pushSchema(
+        defineSchema({
+          parents: defineTable({ title: t.string() }),
+          children: defineTable({
+            note: t.string(),
+            parentId: t.id("parents", { onDelete: "cascade" }),
+          }).index("by_note", ["note"]),
+        }),
+      ),
+    ).toThrow(/requires a single-field, non-unique, non-partial btree index/);
+
+    // A UNIQUE index does not count (the cascade walk needs duplicate keys).
+    expect(() =>
+      c.pushSchema(
+        defineSchema({
+          parents: defineTable({ title: t.string() }),
+          children: defineTable({
+            note: t.string(),
+            parentId: t.id("parents", { onDelete: "cascade" }),
+          })
+            .index("by_parent", ["parentId"])
+            .unique(),
+        }),
+      ),
+    ).toThrow(/requires a single-field, non-unique, non-partial btree index/);
+  });
+
+  it("requires setNull on an optional id and a known referenced table", () => {
+    const c = new InMemoryRtDbClient();
+    expect(() =>
+      c.pushSchema(
+        defineSchema({
+          parents: defineTable({ title: t.string() }),
+          children: defineTable({
+            note: t.string(),
+            parentId: t.id("parents", { onDelete: "setNull" }),
+          }).index("by_parent", ["parentId"]),
+        }),
+      ),
+    ).toThrow(/onDelete 'setNull' requires the id field to be optional/);
+
+    expect(() =>
+      c.pushSchema(
+        defineSchema({
+          children: defineTable({
+            note: t.string(),
+            parentId: t.id("ghost", { onDelete: "cascade" }),
+          }).index("by_parent", ["parentId"]),
+        }),
+      ),
+    ).toThrow(/references unknown table 'ghost'/);
+  });
+
+  it("treats adding or changing onDelete (and adding softDelete) as additive", async () => {
+    const parents = defineTable({ title: t.string() });
+    const c = new InMemoryRtDbClient();
+    c.pushSchema(
+      defineSchema({
+        parents,
+        children: defineTable({ note: t.string(), parentId: t.id("parents") }).index("by_parent", [
+          "parentId",
+        ]),
+      }),
+    );
+    // v2: add cascade — additive.
+    c.pushSchema(
+      defineSchema({
+        parents,
+        children: defineTable({
+          note: t.string(),
+          parentId: t.id("parents", { onDelete: "cascade" }),
+        }).index("by_parent", ["parentId"]),
+      }),
+    );
+    // v3: change the action — also additive.
+    c.pushSchema(
+      defineSchema({
+        parents,
+        children: defineTable({
+          note: t.string(),
+          parentId: t.id("parents", { onDelete: "restrict" }),
+        }).index("by_parent", ["parentId"]),
+      }),
+    );
+
+    // softDelete flag-add is additive too (table flags are never compared).
+    const c2 = new InMemoryRtDbClient();
+    c2.pushSchema(
+      defineSchema({
+        tasks: defineTable({ name: t.string() }).index("by_name", ["name"]).unique(),
+      }),
+    );
+    const [first] = await c2.mutate(mutation().insert("tasks", { name: "dup" }).build());
+    await expect(
+      c2.mutate(mutation().insert("tasks", { name: "dup" }).build()),
+    ).rejects.toMatchObject({ code: "CONFLICT" }); // the unique index holds pre-flag
+
+    c2.pushSchema(
+      defineSchema({
+        tasks: defineTable({ name: t.string() }).index("by_name", ["name"]).unique().softDelete(),
+      }),
+    );
+    // The live row still blocks…
+    await expect(
+      c2.mutate(mutation().insert("tasks", { name: "dup" }).build()),
+    ).rejects.toMatchObject({ code: "CONFLICT" });
+    // …but once soft-deleted (stamped), the same key is free.
+    await c2.mutate(
+      mutation()
+        .delete("tasks", (first as { id: string }).id)
+        .build(),
+    );
+    await c2.mutate(mutation().insert("tasks", { name: "dup" }).build());
+  });
+});

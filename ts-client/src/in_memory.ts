@@ -22,6 +22,7 @@ import type {
   IndexJson,
   MigrateRequestJson,
   MigrateResultJson,
+  OnDeleteAction,
   Order,
   Paginate,
   PaginatedResultJson,
@@ -121,6 +122,11 @@ export const MAX_BY_QUERY_STEPS_PER_TXN = 16;
  * touch. Mirrors server `txn::MAX_AFFECTED_ROWS_PER_TXN`. Per-id steps count 1
  * each; each by-query step counts up to its `limit` (default `MAX_BY_QUERY_ROWS`). */
 export const MAX_AFFECTED_ROWS_PER_TXN = 10_000;
+/** FM-33: hard cap on the total rows one initiating delete (per-id `delete` or
+ * one `deleteByQuery` step) may cascade through via `onDelete`. Mirrors server
+ * `txn::MAX_CASCADE_ROWS`; a cascade past the budget surfaces as Conflict and
+ * the whole txn rolls back. */
+const MAX_CASCADE_ROWS = 10_000;
 
 /** SEC-104: total documents a txn could touch in the worst case. Per-id steps
  * count 1 each; control-flow steps (`schedule`/`cancelSchedule` FM-28,
@@ -284,12 +290,15 @@ interface IndexedType {
 /** A stored row: the user doc plus its identity/history, kept separate so the
  * system fields (`_id`/`_creationTime`/`_version`) are merged in only at read
  * time — exactly as the server stores `doc` jsonb alongside `id`/`created_at`/
- * `version` columns. */
+ * `version` columns. `deletedAt` is the FM-33 soft-delete stamp: present only
+ * on a softDelete table's deleted rows (the server's `deleted_at` column),
+ * invisible to every read terminal and eq-lookup. */
 interface StoredRow {
   id: string;
   doc: Record<string, unknown>;
   createdAt: number;
   version: number;
+  deletedAt?: number;
 }
 
 interface Subscription {
@@ -617,7 +626,9 @@ function isWideningOf(old: FieldTypeJson, next: FieldTypeJson): boolean {
  * fields, and indexes; removing or retyping any existing table/field/index is a
  * `BAD_REQUEST` with the same message the live server returns. Additive changes
  * (new tables, new fields, new indexes) pass through. Field types and index
- * `fields`/`vector` are compared by `JSON.stringify` deep equality; index kind
+ * `fields`/`vector` are compared by `JSON.stringify` deep equality — after
+ * stripping `onDelete` actions (FM-33: adding or changing an action is
+ * additive); index kind
  * (btree vs search) by the presence/absence of `search`. A field-type change is
  * accepted when it is a safe widening (server `schema::is_widening_of`): a
  * finite literal-union that grows, or a single literal that becomes a union. */
@@ -632,10 +643,9 @@ function detectDestructiveChanges(oldSchema: SchemaJson, newSchema: SchemaJson):
       if (!newFieldType) {
         throw new RtDbError("BAD_REQUEST", `removed field '${tableName}.${fieldName}'`);
       }
-      if (
-        JSON.stringify(newFieldType) !== JSON.stringify(oldFieldType) &&
-        !isWideningOf(oldFieldType, newFieldType)
-      ) {
+      const strippedNew = JSON.stringify(stripOnDelete(newFieldType));
+      const strippedOld = JSON.stringify(stripOnDelete(oldFieldType));
+      if (strippedNew !== strippedOld && !isWideningOf(oldFieldType, newFieldType)) {
         throw new RtDbError("BAD_REQUEST", `changed type of field '${tableName}.${fieldName}'`);
       }
     }
@@ -658,6 +668,151 @@ function detectDestructiveChanges(oldSchema: SchemaJson, newSchema: SchemaJson):
       }
     }
   }
+}
+
+/** Strips `onDelete` from id fields, recursing through every compositor — a
+ * port of server `schema::strip_on_delete`. Used by the additive-push
+ * comparison so adding or changing an `onDelete` action (FM-33) never counts
+ * as a destructive field-type change. */
+function stripOnDelete(ty: FieldTypeJson): FieldTypeJson {
+  switch (ty.type) {
+    case "id":
+      return ty.onDelete !== undefined ? { type: "id", table: ty.table } : ty;
+    case "optional":
+      return { type: "optional", inner: stripOnDelete(ty.inner) };
+    case "union":
+      return { type: "union", variants: ty.variants.map(stripOnDelete) };
+    case "array":
+      return { type: "array", element: stripOnDelete(ty.element) };
+    case "object": {
+      const fields: Record<string, FieldTypeJson> = {};
+      for (const [key, fieldTy] of Object.entries(ty.fields)) {
+        fields[key] = stripOnDelete(fieldTy);
+      }
+      return { type: "object", fields };
+    }
+    case "record":
+      return { type: "record", value: stripOnDelete(ty.value) };
+    default:
+      return ty;
+  }
+}
+
+/** True iff an id field carrying `onDelete` appears anywhere in `ty` (at any
+ * nesting depth) — the probe behind the FM-33 push-validation rule that
+ * confines `onDelete` to a top-level id or optional-id field. */
+function fieldHasNestedOnDelete(ty: FieldTypeJson): boolean {
+  switch (ty.type) {
+    case "id":
+      return ty.onDelete !== undefined;
+    case "optional":
+      return fieldHasNestedOnDelete(ty.inner);
+    case "union":
+      return ty.variants.some(fieldHasNestedOnDelete);
+    case "array":
+      return fieldHasNestedOnDelete(ty.element);
+    case "object":
+      return Object.values(ty.fields).some(fieldHasNestedOnDelete);
+    case "record":
+      return fieldHasNestedOnDelete(ty.value);
+    default:
+      return false;
+  }
+}
+
+/** Validates `onDelete` declarations at push time — a port of server
+ * `schema::validate_on_delete` (FM-33). An action is legal only on a top-level
+ * `id` field (or one `optional` wrapping it — required for `setNull`); the
+ * referencing field needs a single-field, non-unique, non-partial btree index;
+ * and the referenced table must exist in the same schema. */
+function validateOnDelete(schema: SchemaJson): void {
+  for (const [tableName, table] of Object.entries(schema.tables)) {
+    for (const [fieldName, fieldTy] of Object.entries(table.fields)) {
+      const topId =
+        fieldTy.type === "id"
+          ? fieldTy
+          : fieldTy.type === "optional" && fieldTy.inner.type === "id"
+            ? fieldTy.inner
+            : null;
+      if (topId?.onDelete === undefined) {
+        if (fieldHasNestedOnDelete(fieldTy)) {
+          throw new RtDbError(
+            "SCHEMA_VIOLATION",
+            `field '${fieldName}' on table '${tableName}': onDelete is legal only on a top-level id or optional-id field`,
+          );
+        }
+        continue;
+      }
+      const action = topId.onDelete;
+      if (action === "setNull" && fieldTy.type !== "optional") {
+        throw new RtDbError(
+          "SCHEMA_VIOLATION",
+          `onDelete 'setNull' requires the id field to be optional`,
+        );
+      }
+      const hasIndex = (table.indexes ?? []).some(
+        (index) =>
+          !index.search &&
+          !index.vector &&
+          !index.unique &&
+          !index.where &&
+          index.fields.length === 1 &&
+          index.fields[0] === fieldName,
+      );
+      if (!hasIndex) {
+        throw new RtDbError(
+          "SCHEMA_VIOLATION",
+          `onDelete field '${fieldName}' on table '${tableName}' requires a single-field, non-unique, non-partial btree index on it`,
+        );
+      }
+    }
+  }
+  // Second pass (server order): every referenced table must exist.
+  for (const [tableName, table] of Object.entries(schema.tables)) {
+    for (const [fieldName, fieldTy] of Object.entries(table.fields)) {
+      const topId =
+        fieldTy.type === "id"
+          ? fieldTy
+          : fieldTy.type === "optional" && fieldTy.inner.type === "id"
+            ? fieldTy.inner
+            : null;
+      if (topId?.onDelete === undefined) {
+        continue;
+      }
+      if (!(topId.table in schema.tables)) {
+        throw new RtDbError(
+          "SCHEMA_VIOLATION",
+          `onDelete field '${fieldName}' on table '${tableName}' references unknown table '${topId.table}'`,
+        );
+      }
+    }
+  }
+}
+
+/** The `onDelete` action `ty` declares against `parentTable`, if any — a port
+ * of server `txn::on_delete_ref`. Only a top-level id (or one `optional`
+ * wrapping it) can carry one; push validation (`validateOnDelete`) keeps every
+ * other shape from reaching this walk. */
+function onDeleteRef(ty: FieldTypeJson, parentTable: string): OnDeleteAction | undefined {
+  if (ty.type === "id") {
+    return ty.table === parentTable ? ty.onDelete : undefined;
+  }
+  if (ty.type === "optional") {
+    return onDeleteRef(ty.inner, parentTable);
+  }
+  return undefined;
+}
+
+/** Per-initiating-delete cascade context (FM-33), mirroring the `visited` set
+ * and `cascade_rows` counter server `txn::delete_row_cascade` threads through
+ * one step. `visited` guards cycles AND lets a `deleteByQuery` skip rows an
+ * earlier matched row's cascade already removed; `rows` is the shared
+ * `MAX_CASCADE_ROWS` budget; `touched` collects every table the cascade wrote
+ * so the txn's subscription fan-out covers child tables, not just the step's. */
+interface CascadeCtx {
+  visited: Set<string>;
+  rows: number;
+  touched: Set<string>;
 }
 
 /** True iff `cast` can coerce from `old` — a port of server `migrate::cast_valid_for`.
@@ -1289,9 +1444,11 @@ export class InMemoryRtDbClient {
    * additive (server `ddl::detect_destructive_changes`): it throws BAD_REQUEST
    * on a removed/retyped table, field, or index, and otherwise merges — keeping
    * every existing table's rows and the idempotency cache intact, and seeding
-   * empty doc stores only for brand-new tables. */
+   * empty doc stores only for brand-new tables. Every push validates `onDelete`
+   * declarations (FM-33, SCHEMA_VIOLATION) like the server does. */
   pushSchema(schema: SchemaDefinition<any> | SchemaJson): void {
     const next = toSchemaJson(schema);
+    validateOnDelete(next);
     if (this.schema) {
       detectDestructiveChanges(this.schema, next);
       // Additive: keep existing tables' rows and the idempotency cache; only
@@ -1601,10 +1758,14 @@ export class InMemoryRtDbClient {
     const writeSet = new Set<string>();
     try {
       for (const step of txn.steps) {
-        const { result, table } = this.executeStep(step);
+        const { result, table, extraTables } = this.executeStep(step);
         results.push(result);
         if (table) {
           writeSet.add(table);
+        }
+        // FM-33: an onDelete cascade writes child tables beyond the step's own.
+        for (const extra of extraTables ?? []) {
+          writeSet.add(extra);
         }
       }
     } catch (error) {
@@ -2066,30 +2227,35 @@ export class InMemoryRtDbClient {
   /** Removes documents whose TTL field value is a number strictly less than
    * `now`, for every table that declares a `ttl`. Fires subscription fan-out
    * for touched tables (mirroring `executeTransaction`). Returns the count
-   * removed. */
+   * removed. FM-33: the reaper always HARD-deletes — even rows on a softDelete
+   * table — expanding onDelete cascades (`forceHard`) with one shared visited
+   * set and budget across the sweep, like the server's reaper batch. */
   private reapTtl(now: number): number {
     const tables = this.schema?.tables;
     if (!tables) {
       return 0;
     }
     let removed = 0;
-    const touched = new Set<string>();
+    const ctx: CascadeCtx = { visited: new Set(), rows: 0, touched: new Set() };
     for (const [tableName, rows] of this.tables) {
       const ttl = tables[tableName]?.ttl;
       if (!ttl) {
         continue;
       }
-      for (const [id, row] of rows) {
+      for (const row of [...rows.values()]) {
         const v = row.doc[ttl.field];
         if (typeof v === "number" && v < now) {
-          rows.delete(id);
+          // An earlier expiry's cascade may already have removed this row.
+          if (!rows.has(row.id)) {
+            continue;
+          }
+          this.deleteRowCascade(tableName, row.id, ctx, true);
           removed++;
-          touched.add(tableName);
         }
       }
     }
-    if (touched.size > 0) {
-      this.notifySubs(touched);
+    if (ctx.touched.size > 0) {
+      this.notifySubs(ctx.touched);
     }
     return removed;
   }
@@ -2128,6 +2294,7 @@ export class InMemoryRtDbClient {
   private executeStep(step: TransactionJson["steps"][number]): {
     result: unknown;
     table?: string;
+    extraTables?: string[];
   } {
     // The schedule control-flow steps (FM-28) target the scheduler, not a
     // table. Cancel mirrors the server's standalone op: `cancelled: false`
@@ -2175,8 +2342,13 @@ export class InMemoryRtDbClient {
         return { result: null, table };
       }
       case "delete": {
-        this.requireTable(table);
-        this.doDelete(table, step.id);
+        const tableDef = this.requireTable(table);
+        const extraTables = this.doDelete(tableDef, table, step.id);
+        return { result: null, table, extraTables };
+      }
+      case "undelete": {
+        const tableDef = this.requireTable(table);
+        this.doUndelete(tableDef, table, step.id);
         return { result: null, table };
       }
       case "expectVersion": {
@@ -2222,10 +2394,27 @@ export class InMemoryRtDbClient {
       case "deleteByQuery": {
         const tableDef = this.requireTable(table);
         const { rows, truncated } = this.scanByQuery(tableDef, table, step.filter, step.limit);
-        for (const row of rows) {
-          this.rowsFor(table).delete(row.id);
+        // FM-33: every matched row deletes through the same onDelete-aware path
+        // as a per-id delete — stamped on a softDelete table, else cascaded —
+        // with ONE shared visited set and row budget across the step, so a row
+        // an earlier matched row's cascade already removed is skipped, not a
+        // NotFound abort.
+        if (tableDef.softDelete) {
+          for (const row of rows) {
+            row.deletedAt = this.now();
+            row.version += 1;
+          }
+          return { result: { deleted: rows.length, truncated }, table };
         }
-        return { result: { deleted: rows.length, truncated }, table };
+        const ctx: CascadeCtx = { visited: new Set(), rows: 0, touched: new Set() };
+        for (const row of rows) {
+          this.deleteRowCascade(table, row.id, ctx, false);
+        }
+        return {
+          result: { deleted: rows.length, truncated },
+          table,
+          extraTables: [...ctx.touched],
+        };
       }
     }
   }
@@ -2266,10 +2455,146 @@ export class InMemoryRtDbClient {
     row.version += 1;
   }
 
-  private doDelete(tableName: string, id: string): void {
-    if (!this.rowsFor(tableName).delete(id)) {
+  /** Per-id delete — FM-33-aware. On a softDelete table this stamps `deletedAt`
+   * (+version bump) and never cascades; otherwise the row deletes through
+   * `deleteRowCascade` (onDelete expansion). Returns the cascade-touched tables
+   * (empty for a soft stamp) so the txn's subscription fan-out covers them. */
+  private doDelete(tableDef: TableJson, tableName: string, id: string): string[] {
+    if (tableDef.softDelete) {
+      const row = this.rowsFor(tableName).get(id);
+      if (!row || row.deletedAt !== undefined) {
+        throw new RtDbError("NOT_FOUND", `document '${id}' not found`);
+      }
+      row.deletedAt = this.now();
+      row.version += 1;
+      return [];
+    }
+    const ctx: CascadeCtx = { visited: new Set(), rows: 0, touched: new Set() };
+    this.deleteRowCascade(tableName, id, ctx, false);
+    return [...ctx.touched];
+  }
+
+  /** Restores a soft-deleted row (FM-33) — port of server `txn::step_undelete`.
+   * BadRequest on a table without `softDelete`; NotFound on an absent id;
+   * idempotent (no version bump) on a row that is already live. Restoring must
+   * not violate a unique index another live row now holds — checked BEFORE the
+   * stamp clears, surfacing as Conflict. */
+  private doUndelete(tableDef: TableJson, tableName: string, id: string): void {
+    if (!tableDef.softDelete) {
+      throw new RtDbError("BAD_REQUEST", `table '${tableName}' does not declare softDelete`);
+    }
+    const row = this.rowsFor(tableName).get(id);
+    if (!row) {
       throw new RtDbError("NOT_FOUND", `document '${id}' not found`);
     }
+    if (row.deletedAt === undefined) {
+      return;
+    }
+    this.checkUniqueIndexes(tableName, tableDef, row.doc, row.id);
+    delete row.deletedAt;
+    row.version += 1;
+  }
+
+  /** Hard delete with `onDelete` expansion — a port of server
+   * `txn::delete_row_cascade` (FM-33). Children-first-parent-last: for each
+   * child-table field declaring an action against `tableName`, restrict throws
+   * a Conflict naming `table.field` while a LIVE child references the row,
+   * cascade recurses (stamping instead of deleting when the CHILD table is
+   * softDelete — recursion stops there), and setNull removes the child's field
+   * key (+version bump, patch-shaped). A softDelete PARENT row stamps instead
+   * of deleting unless `forceHard` (the TTL reaper always hard-deletes). The
+   * `ctx` visited set guards self-reference cycles and lets a `deleteByQuery`
+   * step skip rows an earlier row's cascade already removed; its shared budget
+   * guards runaway cascades (over-budget → Conflict, the txn rolls back). */
+  private deleteRowCascade(
+    tableName: string,
+    id: string,
+    ctx: CascadeCtx,
+    forceHard: boolean,
+  ): void {
+    const key = `${tableName} ${id}`;
+    if (ctx.visited.has(key)) {
+      return;
+    }
+    ctx.visited.add(key);
+    if (ctx.rows >= MAX_CASCADE_ROWS) {
+      throw new RtDbError(
+        "CONFLICT",
+        `onDelete cascade exceeds the limit of ${MAX_CASCADE_ROWS} rows`,
+      );
+    }
+    ctx.rows++;
+    ctx.touched.add(tableName);
+
+    const schema = this.requireSchema();
+    const tableDef = this.requireTable(tableName);
+    const row = this.rowsFor(tableName).get(id);
+    if (!row || (tableDef.softDelete && row.deletedAt !== undefined)) {
+      throw new RtDbError("NOT_FOUND", `document '${id}' not found`);
+    }
+
+    // A softDelete parent stamps and stops — a stamped row is never a cascade
+    // trigger, so its own children are untouched.
+    if (tableDef.softDelete && !forceHard) {
+      row.deletedAt = this.now();
+      row.version += 1;
+      return;
+    }
+
+    for (const [childTableName, childTableDef] of Object.entries(schema.tables)) {
+      for (const [fieldName, fieldTy] of Object.entries(childTableDef.fields)) {
+        const action = onDeleteRef(fieldTy, tableName);
+        if (!action) continue;
+        const childIds = this.visibleChildIds(childTableName, fieldName, id);
+        if (action === "restrict") {
+          if (childIds.length > 0) {
+            throw new RtDbError(
+              "CONFLICT",
+              `cannot delete '${tableName}': '${childTableName}.${fieldName}' is referenced by document '${childIds[0]}'`,
+            );
+          }
+        } else if (action === "cascade") {
+          for (const childId of childIds) {
+            this.deleteRowCascade(childTableName, childId, ctx, forceHard);
+          }
+        } else {
+          // setNull: remove the child's field key (a null-on-optional patch)
+          // and bump its version — one budget slot per child, like the server.
+          for (const childId of childIds) {
+            if (ctx.rows >= MAX_CASCADE_ROWS) {
+              throw new RtDbError(
+                "CONFLICT",
+                `onDelete cascade exceeds the limit of ${MAX_CASCADE_ROWS} rows`,
+              );
+            }
+            ctx.rows++;
+            const childRow = this.rowsFor(childTableName).get(childId);
+            if (!childRow) continue; // visibleChildIds returns only live rows
+            const merged = applyPatch(childTableDef, childRow.doc, { [fieldName]: null });
+            this.doUpdate(childTableName, childTableDef, childRow, merged);
+            ctx.touched.add(childTableName);
+          }
+        }
+      }
+    }
+
+    // Parent last.
+    this.rowsFor(tableName).delete(id);
+  }
+
+  /** LIVE child rows whose `fieldName` references `parentId` — port of server
+   * `txn::visible_child_ids` (FM-33): a soft-deleted child is invisible to
+   * every action, so a stamped row neither blocks (restrict) nor receives
+   * (cascade/setNull) its parent's delete. */
+  private visibleChildIds(childTableName: string, fieldName: string, parentId: string): string[] {
+    const ids: string[] = [];
+    for (const row of this.rowsFor(childTableName).values()) {
+      if (row.deletedAt !== undefined) continue;
+      if (row.doc[fieldName] === parentId) {
+        ids.push(row.id);
+      }
+    }
+    return ids;
   }
 
   private doExpectVersion(tableName: string, id: string, expected: number): void {
@@ -2298,6 +2623,7 @@ export class InMemoryRtDbClient {
     const limit = Math.min(limitOpt ?? MAX_BY_QUERY_ROWS, MAX_BY_QUERY_ROWS);
     const matched: StoredRow[] = [];
     for (const row of this.rowsFor(tableName).values()) {
+      if (row.deletedAt !== undefined) continue; // FM-33: stamped rows are absent
       if (evalFilterExpr(filter, row.doc)) {
         matched.push(row);
       }
@@ -2347,6 +2673,7 @@ export class InMemoryRtDbClient {
       // NULLs are distinct under Postgres UNIQUE — skip when any key field is null/absent.
       if (candidateKey.some((v) => v === null || v === undefined)) continue;
       for (const row of this.rowsFor(tableName).values()) {
+        if (row.deletedAt !== undefined) continue; // FM-33: stamped rows are outside unique indexes
         if (excludeId !== undefined && row.id === excludeId) continue;
         if (pred && !evalFilterExpr(pred, row.doc)) continue;
         let collision = true;
@@ -2382,6 +2709,8 @@ export class InMemoryRtDbClient {
     const typed = eq.map((value, i) => coerceIndexValue(tableDef, index.fields[i], value));
     const matches: StoredRow[] = [];
     for (const row of this.rowsFor(tableName).values()) {
+      // FM-33: a soft-deleted row is absent to eq-lookup (expectAbsent/upsert).
+      if (row.deletedAt !== undefined) continue;
       if (index.fields.every((field, i) => row.doc[field] != null && row.doc[field] === typed[i])) {
         matches.push(row);
       }
@@ -2601,6 +2930,7 @@ export class InMemoryRtDbClient {
     }
     const filtered: StoredRow[] = [];
     for (const row of this.rowsFor(q.table).values()) {
+      if (row.deletedAt !== undefined) continue; // FM-33: stamped rows are invisible to every read terminal
       if (indexDef) {
         let ok = true;
         for (let i = 0; i < eqLen; i++) {
@@ -2728,7 +3058,8 @@ export class InMemoryRtDbClient {
       );
     }
     const row = this.rowsFor(q.table).get(q.get!);
-    return row ? this.mergeDoc(row) : null;
+    // FM-33: a soft-deleted row is absent to the get terminal.
+    return row && row.deletedAt === undefined ? this.mergeDoc(row) : null;
   }
 
   /** `vectorSearch` terminal: filter-narrowed candidates (in-memory does not
@@ -2774,6 +3105,7 @@ export class InMemoryRtDbClient {
     }
     const out: unknown[] = [];
     for (const row of this.rowsFor(q.table).values()) {
+      if (row.deletedAt !== undefined) continue; // FM-33: stamped rows are invisible
       if (vs.filter && !evalFilterExpr(vs.filter, row.doc)) {
         continue;
       }
@@ -2886,6 +3218,7 @@ export class InMemoryRtDbClient {
       // tsquery path.
       const needle = search.query.toLowerCase();
       for (const row of this.rowsFor(q.table).values()) {
+        if (row.deletedAt !== undefined) continue; // FM-33: stamped rows are invisible
         if (search.filter && !evalFilterExpr(search.filter, row.doc)) {
           continue;
         }
@@ -2905,6 +3238,7 @@ export class InMemoryRtDbClient {
       // would mark on the server) — reused for scoring and snippet highlights.
       const positives = new Set(alts.flatMap((a) => [...a.terms, ...a.phrases.flat()]));
       for (const row of this.rowsFor(q.table).values()) {
+        if (row.deletedAt !== undefined) continue; // FM-33: stamped rows are invisible
         if (search.filter && !evalFilterExpr(search.filter, row.doc)) {
           continue;
         }
@@ -3308,7 +3642,9 @@ export class InMemoryRtDbClient {
 
   private requireRow(tableName: string, id: string): StoredRow {
     const row = this.rowsFor(tableName).get(id);
-    if (!row) {
+    // FM-33: a soft-deleted row is absent to every per-id write lookup (patch,
+    // replace, expectVersion — the server's live-only WHERE clauses).
+    if (!row || row.deletedAt !== undefined) {
       throw new RtDbError("NOT_FOUND", `document '${id}' not found`);
     }
     return row;
@@ -3342,6 +3678,7 @@ export class InMemoryRtDbClient {
           doc: clone(row.doc),
           createdAt: row.createdAt,
           version: row.version,
+          ...(row.deletedAt !== undefined ? { deletedAt: row.deletedAt } : {}),
         });
       }
       out.set(tableName, copy);

@@ -102,6 +102,29 @@ describe("SchemaPage", () => {
     expect(screen.getByText("VEC·l2")).toBeInTheDocument();
   });
 
+  // FM-33: an id field may carry onDelete (cascade|restrict|setNull) and a
+  // table may declare softDelete — both surface in view mode (display-only).
+  it("renders onDelete on id fields and a softDelete table badge", async () => {
+    adminClientMock.getSchema.mockResolvedValue({
+      tables: {
+        projects: {
+          fields: { name: { type: "string" } },
+        },
+        tasks: {
+          fields: {
+            title: { type: "string" },
+            projectId: { type: "id", table: "projects", onDelete: "cascade" },
+          },
+          softDelete: true,
+        },
+      },
+    });
+    render(<SchemaPage />);
+    expect(await screen.findByText("tasks")).toBeInTheDocument();
+    expect(screen.getByText("id<projects>·cascade")).toBeInTheDocument();
+    expect(screen.getByText("soft delete")).toBeInTheDocument();
+  });
+
   it("defaults an unspecified vector index metric to cosine", async () => {
     adminClientMock.getSchema.mockResolvedValue({
       tables: {

@@ -62,9 +62,25 @@ class _FNull(_S):
     type: Literal["null"] = "null"
 
 
+#: FM-33: app-level action fired when the referenced row is hard-declared
+#: deleted via a ``Delete`` step — wire literals ``cascade`` | ``restrict`` |
+#: ``setNull`` (server ``schema.rs::OnDeleteAction``, camelCase rename).
+OnDeleteAction = Literal["cascade", "restrict", "setNull"]
+
+
 class _FId(_S):
     type: Literal["id"] = "id"
     table: str
+    # FM-33: optional `onDelete` action on the reference. Wire key `onDelete`,
+    # omitted when unset (server `skip_serializing_if = "Option::is_none"`).
+    on_delete: OnDeleteAction | None = None
+
+    @model_serializer(mode="wrap")
+    def _drop_absent_on_delete(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        out = handler(self)
+        if out.get("onDelete") is None:
+            out.pop("onDelete", None)
+        return out
 
 
 class _FLiteral(_S):
@@ -229,8 +245,8 @@ class TtlDef(_S):
 class TableDef(_S):
     """One table: typed fields, indexes, optional per-row ``owner_field`` and
     ``collaborators_field``, an optional ``ttl`` policy, an optional
-    ``authorize`` per-row predicate (Model C), and optional field-level
-    ``defaults`` (FM-32)."""
+    ``authorize`` per-row predicate (Model C), optional field-level
+    ``defaults`` (FM-32), and an optional ``soft_delete`` flag (FM-33)."""
 
     fields: dict[str, FieldType]
     indexes: list[IndexDef] = Field(default_factory=list)
@@ -242,6 +258,10 @@ class TableDef(_S):
     # document (insert/replace/upsert-insert) that omits the key. Wire name is
     # `defaults`, omitted when empty (server `BTreeMap::is_empty` skip rule).
     defaults: dict[str, Any] = Field(default_factory=dict)
+    # FM-33: `delete` steps stamp a tombstone instead of removing the row (see
+    # the harness / server txn docs). Wire key `softDelete`, omitted when false
+    # (server `skip_serializing_if = "is_false"`).
+    soft_delete: bool = False
 
     @model_serializer(mode="wrap")
     def _drop_absent_owner(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
@@ -261,6 +281,10 @@ class TableDef(_S):
         # skip_serializing_if = "BTreeMap::is_empty").
         if not out.get("defaults"):
             out.pop("defaults", None)
+        # `softDelete` is a bool flag (server skip_serializing_if = "is_false"):
+        # drop False, keep True.
+        if not out.get("softDelete"):
+            out.pop("softDelete", None)
         return out
 
 
@@ -289,6 +313,7 @@ class TableBuilder:
         self._collaborators: str | None = None
         self._authorize: FilterExpr | None = None
         self._defaults: dict[str, Any] | None = None
+        self._soft_delete: bool = False
 
     def field(self, name: str, ft: Any) -> TableBuilder:
         """Declare a typed field ``name`` of type ``ft`` (a ``t.*`` constructor dict)."""
@@ -402,6 +427,15 @@ class TableBuilder:
         self._defaults = dict(values)
         return self
 
+    def soft_delete(self) -> TableBuilder:
+        """Declare this table soft-delete (FM-33): ``delete``/``deleteByQuery``
+        stamp a ``deleted_at`` tombstone — invisible to every read and write
+        lookup — instead of removing the row, and an ``undelete(table, id)``
+        txn step restores it. The TTL reaper still hard-deletes. Round-tripped
+        on the wire as ``softDelete``, omitted when unset."""
+        self._soft_delete = True
+        return self
+
     def _build(self) -> dict[str, Any]:
         out: dict[str, Any] = {"fields": self._fields, "indexes": self._indexes}
         if self._owner is not None:
@@ -412,6 +446,8 @@ class TableBuilder:
             out["authorize"] = self._authorize
         if self._defaults:
             out["defaults"] = self._defaults
+        if self._soft_delete:
+            out["softDelete"] = True
         return out
 
 
@@ -462,9 +498,21 @@ class _SchemaNamespace:
     bytes = staticmethod(lambda: {"type": "bytes"})
 
     @staticmethod
-    def id(table: str) -> dict[str, Any]:
-        """``Id<Table>`` field referencing documents in ``table`` (a typed ``str``)."""
-        return {"type": "id", "table": table}
+    def id(table: str, on_delete: OnDeleteAction | None = None) -> dict[str, Any]:
+        """``Id<Table>`` field referencing documents in ``table`` (a typed ``str``).
+
+        ``on_delete`` (FM-33) declares the app-level action taken when the
+        referenced row is hard-deleted: ``"cascade"`` (delete the children too,
+        recursively), ``"restrict"`` (reject the parent delete with a conflict
+        while live children exist), or ``"setNull"`` (clear the field on each
+        child — requires wrapping in ``t.optional(t.id(...))``). Server-validated
+        at push time (the field needs a single-field, non-unique, non-partial
+        btree index; the referenced table must be declared). Omitted from the
+        wire when ``None``."""
+        out: dict[str, Any] = {"type": "id", "table": table}
+        if on_delete is not None:
+            out["onDelete"] = on_delete
+        return out
 
     @staticmethod
     def literal(value: Any) -> dict[str, Any]:

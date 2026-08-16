@@ -52,6 +52,20 @@ alongside it: [`../ts-client/`](../ts-client) (browser/Node),
   field. Migrate maintains the map (`renameField` re-keys; `dropField` /
   `changeType` drop the entry). See
   [`../docs/superpowers/specs/2026-08-16-field-defaults-design.md`](../docs/superpowers/specs/2026-08-16-field-defaults-design.md).
+- Cascade delete + soft delete (FEATURE_MATRIX #33): an `id` field may
+  declare `onDelete: cascade|restrict|setNull` (top-level or one `optional`
+  deep) and a table may declare `softDelete`. Enforced in the app layer
+  inside `execute_txn` (`delete_row_cascade`) — deliberately not SQL FKs, so
+  every cascaded/stamped/nulled row records its own `DocOp`/`WriteSet` entry
+  and subscriptions/op-feed/audit/webhooks fire per row. `Delete` on a
+  `softDelete` table stamps `deleted_at` instead of removing the row; reads
+  filter soft-deleted docs on every terminal (incl. `get`/search/vector),
+  unique indexes exclude soft-deleted rows, and an `undelete` step restores
+  (idempotent). One shared per-initiating-step budget (`MAX_CASCADE_ROWS`,
+  10_000) turns an over-budget cascade into a rolled-back `CONFLICT`; the
+  TTL reaper always hard-deletes. The admin query route accepts
+  `includeDeleted: true` to see soft-deleted rows. See
+  [`../docs/superpowers/specs/2026-08-16-cascade-delete-soft-delete-design.md`](../docs/superpowers/specs/2026-08-16-cascade-delete-soft-delete-design.md).
 
 ## Layout
 

@@ -317,7 +317,7 @@ fn validate_one(schema: &mut SchemaDef, d: &Directive) -> Result<(), RtDbError> 
             // would skip its own self-referential `Id { table: from }` fields —
             // rewrite those here first, lest the rename leave a dangling ref.
             for ft in def.fields.values_mut() {
-                if let FieldType::Id { table } = ft
+                if let FieldType::Id { table, .. } = ft
                     && table == from
                 {
                     *table = to.clone();
@@ -325,7 +325,7 @@ fn validate_one(schema: &mut SchemaDef, d: &Directive) -> Result<(), RtDbError> 
             }
             for t in schema.tables.values_mut() {
                 for ft in t.fields.values_mut() {
-                    if let FieldType::Id { table } = ft
+                    if let FieldType::Id { table, .. } = ft
                         && table == from
                     {
                         *table = to.clone();
@@ -1645,6 +1645,8 @@ mod tests {
                 collaborators_field: None,
                 ttl: None,
                 authorize: None,
+
+                soft_delete: false,
             },
         );
         SchemaDef { tables }
@@ -1747,6 +1749,8 @@ mod tests {
                 collaborators_field: None,
                 ttl: None,
                 authorize: None,
+
+                soft_delete: false,
             },
         );
         let schema = SchemaDef { tables };
@@ -1826,6 +1830,8 @@ mod tests {
                 collaborators_field: Some("collabs".into()),
                 ttl: None,
                 authorize: None,
+
+                soft_delete: false,
             },
         );
         SchemaDef { tables }
@@ -2001,6 +2007,7 @@ mod tests {
             "parent".into(),
             FieldType::Id {
                 table: "node".into(),
+                on_delete: None,
             },
         );
         let mut tables = BTreeMap::new();
@@ -2014,6 +2021,8 @@ mod tests {
                 collaborators_field: None,
                 ttl: None,
                 authorize: None,
+
+                soft_delete: false,
             },
         );
         let old = SchemaDef { tables };
@@ -2026,7 +2035,8 @@ mod tests {
         assert_eq!(
             got.tables["nodes"].fields["parent"],
             FieldType::Id {
-                table: "nodes".into()
+                table: "nodes".into(),
+                on_delete: None,
             },
             "self-referential Id must follow the rename"
         );
@@ -2043,6 +2053,7 @@ mod tests {
             "owner".into(),
             FieldType::Id {
                 table: "user".into(),
+                on_delete: None,
             },
         );
         let mut tables = BTreeMap::new();
@@ -2056,6 +2067,8 @@ mod tests {
                 collaborators_field: None,
                 ttl: None,
                 authorize: None,
+
+                soft_delete: false,
             },
         );
         tables.insert(
@@ -2068,6 +2081,8 @@ mod tests {
                 collaborators_field: None,
                 ttl: None,
                 authorize: None,
+
+                soft_delete: false,
             },
         );
         let old = SchemaDef { tables };
@@ -2079,7 +2094,8 @@ mod tests {
         assert_eq!(
             got.tables["account"].fields["owner"],
             FieldType::Id {
-                table: "users".into()
+                table: "users".into(),
+                on_delete: None,
             },
             "cross-table Id must follow the rename"
         );

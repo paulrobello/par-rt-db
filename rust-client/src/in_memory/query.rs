@@ -390,6 +390,12 @@ impl InMemoryRtDbClient {
             if t != &q.table {
                 continue;
             }
+            // FM-33: a soft-deleted row is absent to every read terminal
+            // (the server composes the same live-only predicate into every
+            // scan WHERE).
+            if row.deleted_at.is_some() {
+                continue;
+            }
             if let Some(idx) = &index_def {
                 let mut ok = true;
                 for (i, tv) in typed_eq.iter().enumerate() {

@@ -806,6 +806,7 @@ pub fn compile_query(
     schema: &SchemaDef,
     q: &Query,
     ctx: &PrincipalCtx,
+    include_deleted: bool,
 ) -> Result<(CompiledQuery, Vec<String>), RtDbError> {
     let warnings = collect_filter_warnings(schema, q);
     validate_db_name(db)?;
@@ -821,6 +822,7 @@ pub fn compile_query(
         owner_field,
         collaborators_field,
         ctx,
+        include_deleted,
     };
     let _ = owner;
 
@@ -874,7 +876,15 @@ pub fn compile_query(
         return Ok((compile_search(&sctx, search, q.take)?, warnings));
     }
 
-    let w = compile_query_window(table_def, q, ctx, owner, owner_field, collaborators_field)?;
+    let w = compile_query_window(
+        table_def,
+        q,
+        ctx,
+        owner,
+        owner_field,
+        collaborators_field,
+        include_deleted,
+    )?;
 
     if q.count {
         return Ok((compile_count_terminal(w, db, &q.table)?, warnings));
@@ -1018,6 +1028,7 @@ pub async fn execute_query(
     schema: &SchemaDef,
     q: &Query,
     ctx: &PrincipalCtx,
+    include_deleted: bool,
 ) -> Result<QueryResult, RtDbError> {
     // ENH-018: wrap the read path in a `query.execute` span. The db/table/
     // terminal attributes are bounded (one per database/table, not per
@@ -1040,7 +1051,7 @@ pub async fn execute_query(
         // cascade (validate_db_name, authorize_table, peer-rejection, take cap,
         // range-bound mutual exclusion, terminal routing) runs inside
         // `compile_query`; this body is the execute tail.
-        let (cq, _warnings) = compile_query(db, schema, q, ctx)?;
+        let (cq, _warnings) = compile_query(db, schema, q, ctx, include_deleted)?;
         let owner = ctx.user_id.as_deref();
         let table_def = schema.table(&q.table)?;
         let owner_field = table_def.owner_field.as_deref();
@@ -1084,6 +1095,7 @@ pub async fn execute_query(
                     owner,
                     owner_field,
                     collaborators_field,
+                    include_deleted,
                 )?;
                 let num_items = q
                     .paginate
@@ -1166,6 +1178,7 @@ fn compile_query_window<'a>(
     owner: Option<&str>,
     owner_field: Option<&str>,
     collaborators_field: Option<&str>,
+    include_deleted: bool,
 ) -> Result<QueryWindow<'a>, RtDbError> {
     let index_def: Option<&IndexDef> = match &q.index {
         Some(name) => Some(table_def.index(name)?),
@@ -1279,6 +1292,13 @@ fn compile_query_window<'a>(
     // fragment. Shares `filter_binds` so placeholders stay correctly numbered.
     if let Some(frag) = authorize_predicate_body(table_def, ctx, filter_start, &mut filter_binds)? {
         where_conditions.push(frag);
+    }
+    // FM-33 soft delete: a soft-delete table hides its stamped rows from every
+    // read terminal unless the caller passed `include_deleted` (admin docs
+    // pass-through only). The literal is bindless, so appending it here does
+    // not shift `filter_start`-based placeholder numbering.
+    if table_def.soft_delete && !include_deleted {
+        where_conditions.push("\"deleted_at\" IS NULL".to_string());
     }
     let limit_placeholder = filter_start + filter_binds.len();
 
@@ -2098,6 +2118,13 @@ pub(crate) fn compile_scan_where(
     if let Some(fragment) = authorize_predicate_body(table_def, ctx, 1, &mut binds)? {
         where_conditions.push(fragment);
     }
+    // FM-33 soft delete: by-query writes match exactly the rows the caller
+    // could read, and reads never see soft-deleted rows — so neither does a
+    // PatchByQuery/DeleteByQuery scan. Unconditional (no admin escape hatch on
+    // this path); the literal is bindless so `$n` numbering is unaffected.
+    if table_def.soft_delete {
+        where_conditions.push("\"deleted_at\" IS NULL".to_string());
+    }
     let limit_placeholder = 1 + binds.len();
     Ok((where_conditions.join(" AND "), binds, limit_placeholder))
 }
@@ -2628,6 +2655,9 @@ struct CompileSearchCtx<'a> {
     owner_field: Option<&'a str>,
     collaborators_field: Option<&'a str>,
     ctx: &'a PrincipalCtx,
+    /// FM-33: when `true` (admin `includeDeleted` pass-through), the
+    /// soft-delete literal is NOT composed — soft-deleted rows surface.
+    include_deleted: bool,
 }
 
 /// Full-text search terminal SQL compilation. Compile half of the former
@@ -2737,6 +2767,12 @@ fn compile_search(
     if let Some(frag) = authorize_predicate_body(table_def, ctx, start, &mut binds)? {
         extra.push_str(" AND ");
         extra.push_str(&frag);
+    }
+    // FM-33: hide soft-deleted rows from ranked search unless the admin
+    // `includeDeleted` pass-through is set. Bindless literal — `limit_ph`
+    // below is unaffected.
+    if table_def.soft_delete && !sctx.include_deleted {
+        extra.push_str(" AND \"deleted_at\" IS NULL");
     }
     let limit_ph = start + binds.len();
     let sql = match mode {
@@ -2947,6 +2983,12 @@ fn compile_vector_search(
         extra.push_str(" AND ");
         extra.push_str(&frag);
     }
+    // FM-33: hide soft-deleted rows from vector ranking unless the admin
+    // `includeDeleted` pass-through is set. Bindless literal — `qvec_ph`/`
+    // `limit_ph` below are unaffected.
+    if table_def.soft_delete && !sctx.include_deleted {
+        extra.push_str(" AND \"deleted_at\" IS NULL");
+    }
     let qvec_ph = start + binds.len();
     let limit_ph = qvec_ph + 1;
 
@@ -3129,6 +3171,12 @@ fn compile_hybrid_search(
         auth_clause.push_str(" AND ");
         auth_clause.push_str(&frag);
     }
+    // FM-33: hide soft-deleted rows from hybrid ranking unless the admin
+    // `includeDeleted` pass-through is set. Bindless literal — `qvec_ph`/`
+    // `k_ph`/`limit_ph` below are unaffected.
+    if table_def.soft_delete && !sctx.include_deleted {
+        auth_clause.push_str(" AND \"deleted_at\" IS NULL");
+    }
     let qvec_ph = auth_start + auth_binds.len();
     let k_ph = qvec_ph + 1;
     let limit_ph = k_ph + 1;
@@ -3200,8 +3248,16 @@ fn compile_point_read(sctx: &CompileSearchCtx<'_>, id: &str) -> Result<CompiledQ
     let table_name = sctx.table_name;
     let pg_schema_name = pg_schema(db);
     let table_ident = pg_table(table_name);
+    // FM-33: a soft-delete table's point read hides stamped rows the same way
+    // the scan terminals do — a deleted doc reads as absent unless the admin
+    // `includeDeleted` pass-through is set. Bindless literal appended to `$1`.
+    let soft_filter = if sctx.table_def.soft_delete && !sctx.include_deleted {
+        " AND \"deleted_at\" IS NULL"
+    } else {
+        ""
+    };
     let sql = format!(
-        "SELECT \"id\", \"doc\", \"created_at\", \"version\" FROM \"{pg_schema_name}\".\"{table_ident}\" WHERE \"id\" = $1"
+        "SELECT \"id\", \"doc\", \"created_at\", \"version\" FROM \"{pg_schema_name}\".\"{table_ident}\" WHERE \"id\" = $1{soft_filter}"
     );
     Ok(CompiledQuery {
         sql,
@@ -3497,6 +3553,8 @@ mod tests {
             collaborators_field: None,
             ttl: None,
             authorize: None,
+
+            soft_delete: false,
         }
     }
 
@@ -3515,6 +3573,8 @@ mod tests {
             collaborators_field: None,
             ttl: None,
             authorize: None,
+
+            soft_delete: false,
         }
     }
 
@@ -3595,6 +3655,8 @@ mod tests {
             collaborators_field: None,
             ttl: None,
             authorize: None,
+
+            soft_delete: false,
         };
         // Not
         let (sql, binds) = compile_filter(

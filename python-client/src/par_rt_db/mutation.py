@@ -1,4 +1,4 @@
-"""Transaction DSL: ``Step`` (11 ops), ``StepResult``, ``Transaction``,
+"""Transaction DSL: ``Step`` (14 ops), ``StepResult``, ``Transaction``,
 and the ``Mutation`` builder.
 
 Mirrors ``server/src/txn.rs`` (the ``Step`` enum + ``Transaction`` struct +
@@ -8,8 +8,9 @@ untagged ``StepResult``) and the builder ergonomics of
 Wire shapes (load-bearing — match the server exactly):
 
 * ``Step`` is tagged by ``op`` (camelCase variants: ``insert``/``patch``/
-  ``replace``/``delete``/``expectVersion``/``expectAbsent``/``upsert``/
-  ``patchByQuery``/``deleteByQuery``/``schedule``/``cancelSchedule``) with
+  ``replace``/``delete``/``undelete``/``expectVersion``/``expectAbsent``/
+  ``upsert``/``patchByQuery``/``deleteByQuery``/``schedule``/
+  ``cancelSchedule``/``startWorkflow``/``cancelWorkflow``) with
   ``deny_unknown_fields`` mirrored via ``extra="forbid"``.
 * ``Transaction`` is ``{"steps": Step[]}``; the server caps at 1024 steps —
   enforced client-side by the builder so an over-cap transaction never reaches
@@ -74,6 +75,16 @@ class _Replace(_Step):
 
 class _Delete(_Step):
     op: Literal["delete"] = "delete"
+    table: str
+    id: str
+
+
+class _Undelete(_Step):
+    """FM-33: restore a soft-deleted row (only legal on a ``softDelete``
+    table). ``NOT_FOUND`` when the row is absent; idempotent ``None`` result
+    when it is present and already live. Step result is ``None``."""
+
+    op: Literal["undelete"] = "undelete"
     table: str
     id: str
 
@@ -170,7 +181,7 @@ class _CancelWorkflow(_Step):
     id: str
 
 
-#: Discriminated union of all 13 step ops. The ``op`` literal drives dispatch;
+#: Discriminated union of all 14 step ops. The ``op`` literal drives dispatch;
 #: ``deny_unknown_fields`` is per-variant via ``extra="forbid"`` on ``_Step``.
 Step = Annotated[
     (
@@ -178,6 +189,7 @@ Step = Annotated[
         | _Patch
         | _Replace
         | _Delete
+        | _Undelete
         | _ExpectVersion
         | _ExpectAbsent
         | _Upsert
@@ -354,8 +366,17 @@ class _MutationBuilder:
         return self
 
     def delete(self, table: str, id: str) -> _MutationBuilder:
-        """Delete step: remove the document at ``id`` in ``table``."""
+        """Delete step: remove the document at ``id`` in ``table`` (a soft-delete
+        table gets a ``deleted_at`` stamp instead — FM-33)."""
         self._steps.append(_Delete(table=table, id=id))
+        return self
+
+    def undelete(self, table: str, id: str) -> _MutationBuilder:
+        """Undelete step (FM-33): restore the soft-deleted document at ``id`` in
+        ``table``. ``NOT_FOUND`` when the row is absent; idempotent when already
+        live. Rejected (``BAD_REQUEST``) on a table that does not declare
+        ``softDelete``."""
+        self._steps.append(_Undelete(table=table, id=id))
         return self
 
     def expect_version(self, table: str, id: str, version: int) -> _MutationBuilder:

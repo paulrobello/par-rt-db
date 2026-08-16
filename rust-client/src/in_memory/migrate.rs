@@ -84,7 +84,7 @@ impl InMemoryRtDbClient {
                 // Id references to `from` in other tables follow the rename.
                 for other in planned.tables.values_mut() {
                     for ft in other.fields.values_mut() {
-                        if let FieldType::Id { table } = ft
+                        if let FieldType::Id { table, .. } = ft
                             && table == from
                         {
                             *table = to.clone();
@@ -390,7 +390,12 @@ fn coerce_value(cast: crate::wire::admin::Cast, v: &Value) -> Option<Value> {
 /// touching stored docs.
 ///
 /// `FieldType`/`IndexDef`/`VectorIndexSpec` derive `PartialEq` (mirroring the
-/// server), so structural equality is a direct `!=`.
+/// server), so structural equality is a direct `!=`. FM-33: field types are
+/// compared with every `onDelete` action stripped (`strip_on_delete`) —
+/// adding or changing an action alters runtime delete behavior only (no
+/// stored row shape), so it is additive, while changing the referenced table
+/// is still a type change. The `softDelete` flag is deliberately NOT compared,
+/// matching the server's `detect_destructive_changes`.
 pub(super) fn detect_destructive_changes(
     old: &SchemaDef,
     new: &SchemaDef,
@@ -411,7 +416,7 @@ pub(super) fn detect_destructive_changes(
                     ));
                 }
                 Some(new_field_type)
-                    if old_field_type != new_field_type
+                    if strip_on_delete(old_field_type) != strip_on_delete(new_field_type)
                         && !is_widening_of(old_field_type, new_field_type) =>
                 {
                     return Err(RtDbError::new(

@@ -10,7 +10,7 @@
 
 use serde::Serialize;
 
-use crate::schema::{FieldType, SchemaDef};
+use crate::schema::{FieldType, SchemaDef, strip_on_delete};
 
 /// Result of comparing a pending schema against the currently-applied one.
 /// `added` lists every new table/column/index the push will create; `rejected`
@@ -96,7 +96,10 @@ pub fn diff(current: Option<&SchemaDef>, pending: &SchemaDef) -> SchemaDiff {
                     name: fname.clone(),
                     field_type: field_type_display(ftype),
                 }),
-                Some(existing) if existing != ftype => {
+                // FM-33: compare with each side's `Id.on_delete` stripped, so an
+                // added/changed `onDelete` action is not previewed as a
+                // rejection (mirrors `ddl::detect_destructive_changes`).
+                Some(existing) if strip_on_delete(existing) != strip_on_delete(ftype) => {
                     rejected.push(Rejection {
                         table: table_name.clone(),
                         item: fname.clone(),
@@ -210,7 +213,7 @@ fn field_type_display(ty: &FieldType) -> String {
         FieldType::Int64 => "int64".into(),
         FieldType::Bytes => "bytes".into(),
         FieldType::Any => "any".into(),
-        FieldType::Id { table } => format!("id<{table}>"),
+        FieldType::Id { table, .. } => format!("id<{table}>"),
         FieldType::Literal { value } => format!("literal({value})"),
         FieldType::Optional { inner } => format!("{}?", field_type_display(inner)),
         FieldType::Union { variants } => variants
@@ -242,6 +245,8 @@ mod tests {
             collaborators_field: None,
             ttl: None,
             authorize: None,
+
+            soft_delete: false,
         }
     }
 
@@ -425,7 +430,8 @@ mod tests {
         assert_eq!(field_type_display(&FieldType::String), "string");
         assert_eq!(
             field_type_display(&FieldType::Id {
-                table: "users".into()
+                table: "users".into(),
+                on_delete: None,
             }),
             "id<users>",
         );

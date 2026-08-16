@@ -343,3 +343,67 @@ describe("unique / where index builder", () => {
     ]);
   });
 });
+
+describe("onDelete / softDelete builders (FM-33)", () => {
+  it("t.id emits onDelete on the wire when set, omits it when absent", () => {
+    const s = defineSchema({
+      parents: defineTable({ title: t.string() }),
+      children: defineTable({
+        note: t.string(),
+        parentId: t.id("parents", { onDelete: "cascade" }),
+      }).index("by_parent", ["parentId"]),
+    });
+    expect(s.toJSON().tables.children.fields.parentId).toEqual({
+      type: "id",
+      table: "parents",
+      onDelete: "cascade",
+    });
+
+    const plain = defineSchema({
+      parents: defineTable({ title: t.string() }),
+      children: defineTable({ note: t.string(), parentId: t.id("parents") }),
+    });
+    expect(plain.toJSON().tables.children.fields.parentId).toEqual({
+      type: "id",
+      table: "parents",
+    });
+  });
+
+  it("t.id onDelete composes with t.optional (the setNull shape)", () => {
+    const s = defineSchema({
+      parents: defineTable({ title: t.string() }),
+      children: defineTable({
+        note: t.string(),
+        parentId: t.optional(t.id("parents", { onDelete: "setNull" })),
+      }).index("by_parent", ["parentId"]),
+    });
+    expect(s.toJSON().tables.children.fields.parentId).toEqual({
+      type: "optional",
+      inner: { type: "id", table: "parents", onDelete: "setNull" },
+    });
+  });
+
+  it(".softDelete() emits softDelete:true, omitted when unset", () => {
+    const soft = defineSchema({ tasks: defineTable({ name: t.string() }).softDelete() });
+    expect(soft.toJSON().tables.tasks).toEqual({
+      fields: { name: { type: "string" } },
+      softDelete: true,
+    });
+
+    const plain = defineSchema({ tasks: defineTable({ name: t.string() }) });
+    expect(plain.toJSON().tables.tasks).not.toHaveProperty("softDelete");
+  });
+
+  it(".softDelete() composes with indexes and other table options", () => {
+    const s = defineSchema({
+      tasks: defineTable({ name: t.string(), done: t.boolean() })
+        .index("by_done", ["done"])
+        .softDelete(),
+    });
+    expect(s.toJSON().tables.tasks).toEqual({
+      fields: { name: { type: "string" }, done: { type: "boolean" } },
+      indexes: [{ name: "by_done", fields: ["done"] }],
+      softDelete: true,
+    });
+  });
+});

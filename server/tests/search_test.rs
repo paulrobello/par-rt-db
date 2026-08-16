@@ -115,6 +115,7 @@ async fn search_returns_ranked_results() {
         &schema,
         &search_query("search_content", "database"),
         &PrincipalCtx::bypass(),
+        false,
     )
     .await
     .expect("search");
@@ -149,7 +150,7 @@ async fn search_with_take_limits_results() {
         "take": 1
     }))
     .expect("query");
-    let res = execute_query(pool, &db, &schema, &q, &PrincipalCtx::bypass())
+    let res = execute_query(pool, &db, &schema, &q, &PrincipalCtx::bypass(), false)
         .await
         .expect("search");
     let titles = titles(&res);
@@ -171,6 +172,7 @@ async fn search_with_no_matches_returns_empty() {
         &schema,
         &search_query("search_content", "supercalifragilistic"),
         &PrincipalCtx::bypass(),
+        false,
     )
     .await
     .expect("search");
@@ -188,6 +190,7 @@ async fn search_unknown_index_is_bad_request() {
         &schema,
         &search_query("nope", "database"),
         &PrincipalCtx::bypass(),
+        false,
     )
     .await
     .expect_err("unknown index");
@@ -207,6 +210,7 @@ async fn search_btree_index_is_bad_request() {
         &schema,
         &search_query("by_title", "database"),
         &PrincipalCtx::bypass(),
+        false,
     )
     .await
     .expect_err("btree used as search");
@@ -224,6 +228,7 @@ async fn search_empty_query_is_bad_request() {
         &schema,
         &search_query("search_content", "   "),
         &PrincipalCtx::bypass(),
+        false,
     )
     .await
     .expect_err("empty query");
@@ -242,9 +247,16 @@ async fn search_combined_with_index_is_bad_request() {
         "index": "by_title"
     }))
     .expect("query");
-    let err = execute_query(&state.pool, &db, &schema, &q, &PrincipalCtx::bypass())
-        .await
-        .expect_err("search + index");
+    let err = execute_query(
+        &state.pool,
+        &db,
+        &schema,
+        &q,
+        &PrincipalCtx::bypass(),
+        false,
+    )
+    .await
+    .expect_err("search + index");
     assert_eq!(err.code, ErrorCode::BadRequest);
 }
 
@@ -288,6 +300,7 @@ async fn adding_search_index_backfills_existing_rows() {
         &search_schema(),
         &search_query("search_content", "database"),
         &PrincipalCtx::bypass(),
+        false,
     )
     .await
     .expect("search");
@@ -336,6 +349,7 @@ async fn search_index_language_simple_matches_exact_word() {
         &schema,
         &search_query("search_content", "fox"),
         &PrincipalCtx::bypass(),
+        false,
     )
     .await
     .expect("search");
@@ -358,6 +372,7 @@ async fn search_index_language_simple_does_not_stem() {
         &schema_simple,
         &search_query("search_content", "database"),
         &PrincipalCtx::bypass(),
+        false,
     )
     .await
     .expect("search");
@@ -374,6 +389,7 @@ async fn search_index_language_simple_does_not_stem() {
         &schema_en,
         &search_query("search_content", "database"),
         &PrincipalCtx::bypass(),
+        false,
     )
     .await
     .expect("search");
@@ -539,7 +555,7 @@ async fn search_filter_omitted_behaves_like_plain_search() {
         "search": {"index": "search_title", "query": "database"}
     }))
     .expect("plain search query");
-    let res = execute_query(pool, &db, &schema, &q, &PrincipalCtx::bypass())
+    let res = execute_query(pool, &db, &schema, &q, &PrincipalCtx::bypass(), false)
         .await
         .expect("search");
     assert_eq!(post_titles(&res).len(), 2);
@@ -565,6 +581,7 @@ async fn search_filter_eq_on_indexed_field_narrows() {
             serde_json::json!({"op":"eq","field":"category","value":1}),
         ),
         &PrincipalCtx::bypass(),
+        false,
     )
     .await
     .expect("search+filter");
@@ -594,6 +611,7 @@ async fn search_filter_range_on_indexed_field_narrows() {
             serde_json::json!({"op":"gt","field":"category","value":1}),
         ),
         &PrincipalCtx::bypass(),
+        false,
     )
     .await
     .expect("search+filter");
@@ -621,6 +639,7 @@ async fn search_filter_eq_on_unindexed_field_narrows() {
             serde_json::json!({"op":"eq","field":"tag","value":"beta"}),
         ),
         &PrincipalCtx::bypass(),
+        false,
     )
     .await
     .expect("search+filter");
@@ -651,6 +670,7 @@ async fn search_filter_and_or_combine() {
             ]}),
         ),
         &PrincipalCtx::bypass(),
+        false,
     )
     .await
     .expect("search+filter");
@@ -669,6 +689,7 @@ async fn search_filter_and_or_combine() {
             ]}),
         ),
         &PrincipalCtx::bypass(),
+        false,
     )
     .await
     .expect("search+filter");
@@ -696,6 +717,7 @@ async fn search_filter_not_excludes() {
             serde_json::json!({"op":"not","expr":{"op":"eq","field":"tag","value":"beta"}}),
         ),
         &PrincipalCtx::bypass(),
+        false,
     )
     .await
     .expect("search+filter");
@@ -719,6 +741,7 @@ async fn search_filter_no_match_returns_empty() {
             serde_json::json!({"op":"eq","field":"category","value":99}),
         ),
         &PrincipalCtx::bypass(),
+        false,
     )
     .await
     .expect("search+filter");
@@ -742,6 +765,7 @@ async fn search_filter_unknown_field_is_bad_request() {
             serde_json::json!({"op":"eq","field":"nope","value":1}),
         ),
         &PrincipalCtx::bypass(),
+        false,
     )
     .await
     .expect_err("unknown filter field");
@@ -776,6 +800,7 @@ async fn trgm_mode_matches_substrings_and_ranks_by_similarity() {
         &schema,
         &search_query("search_content", "conv"),
         &PrincipalCtx::bypass(),
+        false,
     )
     .await
     .expect("tsquery search");
@@ -788,6 +813,7 @@ async fn trgm_mode_matches_substrings_and_ranks_by_similarity() {
         &schema,
         &trgm_query("search_content", "conv"),
         &PrincipalCtx::bypass(),
+        false,
     )
     .await
     .expect("trgm search");
@@ -811,6 +837,7 @@ async fn trgm_mode_is_case_insensitive() {
         &schema,
         &trgm_query("search_content", "POSTGRE"),
         &PrincipalCtx::bypass(),
+        false,
     )
     .await
     .expect("trgm search");
@@ -839,7 +866,7 @@ async fn trgm_mode_composes_with_filter() {
         }
     }))
     .expect("trgm+filter query");
-    let res = execute_query(pool, &db, &schema, &q, &PrincipalCtx::bypass())
+    let res = execute_query(pool, &db, &schema, &q, &PrincipalCtx::bypass(), false)
         .await
         .expect("trgm+filter");
     let titles = post_titles(&res);
@@ -861,7 +888,7 @@ async fn trgm_mode_composes_with_take() {
         "take": 1
     }))
     .expect("trgm+take query");
-    let res = execute_query(pool, &db, &schema, &q, &PrincipalCtx::bypass())
+    let res = execute_query(pool, &db, &schema, &q, &PrincipalCtx::bypass(), false)
         .await
         .expect("trgm+take");
     assert_eq!(post_titles(&res).len(), 1);
@@ -880,9 +907,16 @@ async fn trgm_mode_explicit_tsquery_matches_default() {
         "search": {"index": "search_content", "query": "database", "mode": "tsquery"}
     }))
     .expect("explicit tsquery");
-    let res = execute_query(pool, &db, &schema, &explicit, &PrincipalCtx::bypass())
-        .await
-        .expect("explicit tsquery search");
+    let res = execute_query(
+        pool,
+        &db,
+        &schema,
+        &explicit,
+        &PrincipalCtx::bypass(),
+        false,
+    )
+    .await
+    .expect("explicit tsquery search");
     assert_eq!(titles(&res).len(), 1);
 
     let res_default = execute_query(
@@ -891,6 +925,7 @@ async fn trgm_mode_explicit_tsquery_matches_default() {
         &schema,
         &search_query("search_content", "database"),
         &PrincipalCtx::bypass(),
+        false,
     )
     .await
     .expect("default search");
@@ -1023,6 +1058,7 @@ async fn phrase_query_requires_adjacent_words() {
         &schema,
         &search_query("search_content", "\"database notes\""),
         &PrincipalCtx::bypass(),
+        false,
     )
     .await
     .expect("phrase search");
@@ -1034,6 +1070,7 @@ async fn phrase_query_requires_adjacent_words() {
         &schema,
         &search_query("search_content", "database notes"),
         &PrincipalCtx::bypass(),
+        false,
     )
     .await
     .expect("plain AND search");
@@ -1059,6 +1096,7 @@ async fn or_operator_unions_alternatives() {
         &schema,
         &search_query("search_content", "alpha or beta"),
         &PrincipalCtx::bypass(),
+        false,
     )
     .await
     .expect("or search");
@@ -1085,6 +1123,7 @@ async fn minus_operator_excludes_term() {
         &schema,
         &search_query("search_content", "database -cooking"),
         &PrincipalCtx::bypass(),
+        false,
     )
     .await
     .expect("minus search");
@@ -1107,6 +1146,7 @@ async fn phrase_query_works_with_language_index() {
         &schema,
         &search_query("search_content", "\"quick fox\""),
         &PrincipalCtx::bypass(),
+        false,
     )
     .await
     .expect("language phrase search");
@@ -1137,7 +1177,7 @@ async fn snippet_returns_highlighted_fragment() {
         "search": {"index": "search_content", "query": "database", "snippet": true}
     }))
     .expect("snippet query");
-    let res = execute_query(pool, &db, &schema, &q, &PrincipalCtx::bypass())
+    let res = execute_query(pool, &db, &schema, &q, &PrincipalCtx::bypass(), false)
         .await
         .expect("snippet search");
     match res {
@@ -1165,6 +1205,7 @@ async fn snippet_returns_highlighted_fragment() {
         &schema,
         &search_query("search_content", "database"),
         &PrincipalCtx::bypass(),
+        false,
     )
     .await
     .expect("plain search");
@@ -1194,7 +1235,7 @@ async fn snippet_false_behaves_like_omitted() {
         "search": {"index": "search_content", "query": "database", "snippet": false}
     }))
     .expect("snippet-false query");
-    let res = execute_query(pool, &db, &schema, &q, &PrincipalCtx::bypass())
+    let res = execute_query(pool, &db, &schema, &q, &PrincipalCtx::bypass(), false)
         .await
         .expect("snippet-false search");
     match res {
@@ -1232,7 +1273,7 @@ async fn snippet_highlights_phrase_queries() {
         }
     }))
     .expect("phrase snippet query");
-    let res = execute_query(pool, &db, &schema, &q, &PrincipalCtx::bypass())
+    let res = execute_query(pool, &db, &schema, &q, &PrincipalCtx::bypass(), false)
         .await
         .expect("phrase snippet search");
     match res {
@@ -1271,7 +1312,7 @@ async fn snippet_composes_with_filter() {
         }
     }))
     .expect("snippet+filter query");
-    let res = execute_query(pool, &db, &schema, &q, &PrincipalCtx::bypass())
+    let res = execute_query(pool, &db, &schema, &q, &PrincipalCtx::bypass(), false)
         .await
         .expect("snippet+filter search");
     match res {
@@ -1305,9 +1346,16 @@ async fn snippet_rejected_with_trgm_mode() {
         }
     }))
     .expect("snippet+trgm query");
-    let err = execute_query(&state.pool, &db, &schema, &q, &PrincipalCtx::bypass())
-        .await
-        .expect_err("snippet+trgm must fail");
+    let err = execute_query(
+        &state.pool,
+        &db,
+        &schema,
+        &q,
+        &PrincipalCtx::bypass(),
+        false,
+    )
+    .await
+    .expect_err("snippet+trgm must fail");
     assert_eq!(err.code, ErrorCode::BadRequest);
     assert!(err.message.contains("tsquery mode"));
 }

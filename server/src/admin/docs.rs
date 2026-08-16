@@ -18,6 +18,11 @@ use crate::{AppState, db};
 #[derive(Deserialize)]
 pub(super) struct AdminQueryRequest {
     query: Query,
+    /// FM-33: when `true`, soft-deleted rows surface in the result (the
+    /// operator's "show deleted" toggle). Additive + defaulted, so existing
+    /// admin-dashboard traffic is unchanged.
+    #[serde(default, rename = "includeDeleted")]
+    include_deleted: bool,
 }
 
 #[derive(Serialize)]
@@ -43,6 +48,7 @@ pub(super) async fn admin_query(
         &schema,
         &body.query,
         &crate::auth::PrincipalCtx::bypass(),
+        body.include_deleted,
     )
     .await?;
     state.runtime.metrics.record_query();

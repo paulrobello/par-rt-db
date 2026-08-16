@@ -179,6 +179,7 @@ export function SchemaPage() {
               <div key={name} className={s.tableBlock}>
                 <div className={s.tableHead}>
                   <h2 className={s.tableName}>{name}</h2>
+                  {table.softDelete && <span className={s.owner}>soft delete</span>}
                   {table.ownerField && <span className={s.owner}>owner: {table.ownerField}</span>}
                 </div>
                 <table className={s.fields}>

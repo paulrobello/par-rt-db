@@ -131,6 +131,11 @@ fn project_unfiltered_array(
             Step::Patch { id, fields, .. } => merge_by_id(&mut working, id, fields),
             Step::Replace { id, doc, .. } => replace_by_id(&mut working, id, doc),
             Step::Delete { id, .. } => remove_by_id(&mut working, id),
+            // FM-33: the restored doc's body is not in the cached result
+            // (soft-deleted rows are invisible to reads), so there is nothing
+            // unambiguous to overlay — the authoritative update delivers the
+            // restored row. Same fallthrough as the ts-client's switch.
+            Step::Undelete { .. } => {}
             Step::Upsert { .. } => return OptimisticProjection::Skip,
             Step::ExpectVersion { .. } | Step::ExpectAbsent { .. } => {}
             // By-query steps match an unbounded set of rows by a filter this
@@ -163,6 +168,9 @@ fn project_filtered_array(query: &Query, last: &Value, txn: &Transaction) -> Opt
         }
         match step {
             Step::Delete { id, .. } => remove_by_id(&mut working, id),
+            // FM-33: undelete restores a doc whose body is not in this cached
+            // result — nothing unambiguous to overlay (ts-client fallthrough).
+            Step::Undelete { .. } => {}
             // insert/patch/replace/upsert are membership-ambiguous under a filter.
             Step::Insert { .. }
             | Step::Patch { .. }
@@ -225,8 +233,10 @@ fn project_get(query: &Query, last: &Value, txn: &Transaction) -> OptimisticProj
                 return OptimisticProjection::Skip;
             }
             // Insert (fresh id never matches a pre-existing get target),
-            // ExpectVersion/ExpectAbsent (preconditions, no data effect), and
-            // non-target Patch/Replace/Delete: nothing to do here.
+            // ExpectVersion/ExpectAbsent (preconditions, no data effect),
+            // Undelete (FM-33: the restored body is not the cached value, and
+            // restoring a live target is a no-op), and non-target
+            // Patch/Replace/Delete: nothing to do here.
             _ => {}
         }
     }
@@ -246,6 +256,7 @@ impl Step {
             | Step::Patch { table, .. }
             | Step::Replace { table, .. }
             | Step::Delete { table, .. }
+            | Step::Undelete { table, .. }
             | Step::ExpectVersion { table, .. }
             | Step::Upsert { table, .. }
             | Step::PatchByQuery { table, .. }

@@ -89,6 +89,14 @@ pub enum Step {
     CancelWorkflow {
         id: String,
     },
+    /// Restore a soft-deleted row (only legal on a table that declares
+    /// `softDelete`). `NotFound` when the row is absent; idempotent `Ok` when
+    /// it is present and already live. Mirrors
+    /// `server/src/txn.rs::Step::Undelete` byte-for-byte (FM-33).
+    Undelete {
+        table: String,
+        id: String,
+    },
 }
 
 /// One entry of `mutateOk.results`, positionally aligned with `steps`.
@@ -298,6 +306,19 @@ impl Mutation {
     /// a no-op not an error).
     pub fn cancel_workflow(mut self, id: impl Into<String>) -> Self {
         self.steps.push(Step::CancelWorkflow { id: id.into() });
+        self
+    }
+
+    /// Restore a soft-deleted row — `Step::Undelete` (FM-33). Only legal on a
+    /// table that declares `softDelete` (the server rejects otherwise with
+    /// `BAD_REQUEST`); `NOT_FOUND` when the row is absent, and an idempotent
+    /// `null` result when it is present and already live. The step's result is
+    /// `null`.
+    pub fn undelete(mut self, table: &str, id: &str) -> Self {
+        self.steps.push(Step::Undelete {
+            table: table.into(),
+            id: id.into(),
+        });
         self
     }
 
@@ -552,6 +573,30 @@ mod tests {
         assert!(matches!(
             cancelled,
             StepResult::Cancelled { cancelled: false }
+        ));
+    }
+
+    #[test]
+    fn undelete_serializes_and_round_trips() {
+        // FM-33: `undelete` emits `{"op":"undelete","table":...,"id":...}` —
+        // the same wire shape as `delete`, mirroring
+        // `server/src/txn.rs::Step::Undelete` byte-for-byte. The step's result
+        // is `null` (StepResult::Null — no new result variant).
+        let txn = Mutation::new().undelete("projects", "p1").build();
+        assert_eq!(
+            serde_json::to_value(&txn).unwrap(),
+            json!({
+                "steps": [
+                    {"op":"undelete","table":"projects","id":"p1"}
+                ]
+            })
+        );
+        // Round-trips back through the wire type.
+        let back: Transaction =
+            serde_json::from_value(serde_json::to_value(&txn).unwrap()).unwrap();
+        assert!(matches!(
+            back.steps.as_slice(),
+            [Step::Undelete { table, id }] if table == "projects" && id == "p1"
         ));
     }
 }

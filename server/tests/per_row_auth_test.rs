@@ -50,6 +50,7 @@ fn owner_schema() -> SchemaDef {
             collaborators_field: None,
             ttl: None,
             authorize: None,
+            soft_delete: false,
         },
     );
     let mut open_fields = BTreeMap::new();
@@ -64,6 +65,7 @@ fn owner_schema() -> SchemaDef {
             collaborators_field: None,
             ttl: None,
             authorize: None,
+            soft_delete: false,
         },
     );
     SchemaDef { tables }
@@ -143,7 +145,7 @@ async fn fetch_doc(
 ) -> Option<serde_json::Value> {
     let mut q = notes_query();
     q.get = Some(id.to_string());
-    match execute_query(pool, db, schema, &q, &PrincipalCtx::bypass())
+    match execute_query(pool, db, schema, &q, &PrincipalCtx::bypass(), false)
         .await
         .expect("fetch_doc query")
     {
@@ -199,6 +201,7 @@ async fn user_reads_only_own_rows_on_owner_table() -> anyhow::Result<()> {
             email: None,
             ..Default::default()
         },
+        false,
     )
     .await?;
 
@@ -239,6 +242,7 @@ async fn owner_filter_composes_with_client_filter() -> anyhow::Result<()> {
             email: None,
             ..Default::default()
         },
+        false,
     )
     .await?;
 
@@ -259,7 +263,7 @@ async fn bypass_owner_reads_all_rows() -> anyhow::Result<()> {
 
     let mut q = notes_query();
     q.take = Some(100);
-    let res = execute_query(&pool, &db, &schema, &q, &PrincipalCtx::bypass()).await?;
+    let res = execute_query(&pool, &db, &schema, &q, &PrincipalCtx::bypass(), false).await?;
 
     let mut got = titles(res);
     got.sort();
@@ -290,6 +294,7 @@ async fn get_point_read_filters_unowned() -> anyhow::Result<()> {
             email: None,
             ..Default::default()
         },
+        false,
     )
     .await?;
     match bob_res {
@@ -307,6 +312,7 @@ async fn get_point_read_filters_unowned() -> anyhow::Result<()> {
             email: None,
             ..Default::default()
         },
+        false,
     )
     .await?;
     match alice_res {
@@ -373,6 +379,7 @@ async fn non_owner_table_is_unaffected_by_owner() -> anyhow::Result<()> {
             email: None,
             ..Default::default()
         },
+        false,
     )
     .await?;
     let mut got: Vec<String> = match res {
@@ -541,6 +548,7 @@ async fn search_filters_to_own_rows() -> anyhow::Result<()> {
             collaborators_field: None,
             ttl: None,
             authorize: None,
+            soft_delete: false,
         },
     );
     let schema = SchemaDef { tables };
@@ -590,6 +598,7 @@ async fn search_filters_to_own_rows() -> anyhow::Result<()> {
                 email: None,
                 ..Default::default()
             },
+            false,
         )
         .await?,
     );
@@ -606,12 +615,14 @@ async fn search_filters_to_own_rows() -> anyhow::Result<()> {
                 email: None,
                 ..Default::default()
             },
+            false,
         )
         .await?,
     );
     assert_eq!(bob_titles, vec!["bob database".to_string()]);
 
-    let mut bypass = titles(execute_query(&pool, &db, &schema, &q, &PrincipalCtx::bypass()).await?);
+    let mut bypass =
+        titles(execute_query(&pool, &db, &schema, &q, &PrincipalCtx::bypass(), false).await?);
     bypass.sort();
     assert_eq!(
         bypass,
@@ -657,6 +668,7 @@ async fn vector_search_filters_to_own_rows() -> anyhow::Result<()> {
             collaborators_field: None,
             ttl: None,
             authorize: None,
+            soft_delete: false,
         },
     );
     let schema = SchemaDef { tables };
@@ -714,7 +726,8 @@ async fn vector_search_filters_to_own_rows() -> anyhow::Result<()> {
                     user_id: Some("alice".to_string()),
                     email: None,
                     ..Default::default()
-                }
+                },
+                false
             )
             .await?
         ),
@@ -731,13 +744,15 @@ async fn vector_search_filters_to_own_rows() -> anyhow::Result<()> {
                     user_id: Some("bob".to_string()),
                     email: None,
                     ..Default::default()
-                }
+                },
+                false
             )
             .await?
         ),
         vec!["bob".to_string()]
     );
-    let mut bypass = owners(execute_query(&pool, &db, &schema, &q, &PrincipalCtx::bypass()).await?);
+    let mut bypass =
+        owners(execute_query(&pool, &db, &schema, &q, &PrincipalCtx::bypass(), false).await?);
     bypass.sort();
     assert_eq!(bypass, vec!["alice".to_string(), "bob".to_string()]);
     Ok(())
@@ -786,6 +801,7 @@ async fn vector_search_composes_filter_fields_with_owner() -> anyhow::Result<()>
             collaborators_field: None,
             ttl: None,
             authorize: None,
+            soft_delete: false,
         },
     );
     let schema = SchemaDef { tables };
@@ -838,6 +854,7 @@ async fn vector_search_composes_filter_fields_with_owner() -> anyhow::Result<()>
             email: None,
             ..Default::default()
         },
+        false,
     )
     .await?;
     let docs = match res {
@@ -988,7 +1005,7 @@ async fn patch_on_unowned_doc_is_forbidden_and_atomic() -> anyhow::Result<()> {
     // ...and alice's preceding insert was rolled back (no "alice temp" row).
     let mut q = notes_query();
     q.take = Some(100);
-    let all = titles(execute_query(&pool, &db, &schema, &q, &PrincipalCtx::bypass()).await?);
+    let all = titles(execute_query(&pool, &db, &schema, &q, &PrincipalCtx::bypass(), false).await?);
     assert!(
         !all.iter().any(|t| t == "alice temp"),
         "preceding insert must be rolled back, got {all:?}"
@@ -1238,6 +1255,7 @@ async fn patch_cannot_transfer_ownership() -> anyhow::Result<()> {
                 email: None,
                 ..Default::default()
             },
+            false,
         )
         .await?,
     );
@@ -1740,6 +1758,7 @@ fn collab_schema() -> SchemaDef {
             collaborators_field: Some("collaborators".into()),
             ttl: None,
             authorize: None,
+            soft_delete: false,
         },
     );
     SchemaDef { tables }
@@ -1819,6 +1838,7 @@ async fn collab_owner_and_collaborator_both_read_shared_row() -> anyhow::Result<
             email: None,
             ..Default::default()
         },
+        false,
     )
     .await?;
     assert_eq!(titles(res), vec!["shared".to_string()]);
@@ -1834,6 +1854,7 @@ async fn collab_owner_and_collaborator_both_read_shared_row() -> anyhow::Result<
             email: None,
             ..Default::default()
         },
+        false,
     )
     .await?;
     assert_eq!(titles(res), vec!["shared".to_string()]);
@@ -1849,12 +1870,13 @@ async fn collab_owner_and_collaborator_both_read_shared_row() -> anyhow::Result<
             email: None,
             ..Default::default()
         },
+        false,
     )
     .await?;
     assert!(titles(res).is_empty());
 
     // Bypass caller sees everything (machine-token / admin path unchanged).
-    let res = execute_query(&pool, &db, &schema, &q, &PrincipalCtx::bypass()).await?;
+    let res = execute_query(&pool, &db, &schema, &q, &PrincipalCtx::bypass(), false).await?;
     assert_eq!(titles(res), vec!["shared".to_string()]);
     Ok(())
 }
@@ -1899,7 +1921,8 @@ async fn collab_missing_array_degrades_to_owner_only() -> anyhow::Result<()> {
                     user_id: Some("alice".to_string()),
                     email: None,
                     ..Default::default()
-                }
+                },
+                false
             )
             .await?
         ),
@@ -1916,7 +1939,8 @@ async fn collab_missing_array_degrades_to_owner_only() -> anyhow::Result<()> {
                     user_id: Some("bob".to_string()),
                     email: None,
                     ..Default::default()
-                }
+                },
+                false
             )
             .await?
         )
@@ -1947,6 +1971,7 @@ async fn collab_point_read_filters_non_collaborator() -> anyhow::Result<()> {
                 email: None,
                 ..Default::default()
             },
+            false,
         )
         .await?
         {
@@ -1964,6 +1989,7 @@ async fn collab_point_read_filters_non_collaborator() -> anyhow::Result<()> {
             email: None,
             ..Default::default()
         },
+        false,
     )
     .await?
     {
@@ -2305,6 +2331,7 @@ async fn collab_or_predicate_composes_with_client_filter() -> anyhow::Result<()>
                 email: None,
                 ..Default::default()
             },
+            false,
         )
         .await?,
     );
@@ -2329,6 +2356,7 @@ async fn collab_or_predicate_composes_with_client_filter() -> anyhow::Result<()>
                 email: None,
                 ..Default::default()
             },
+            false,
         )
         .await?,
     );
@@ -2383,6 +2411,7 @@ fn authorize_schema() -> SchemaDef {
             collaborators_field: None,
             ttl: None,
             authorize,
+            soft_delete: false,
         },
     );
     SchemaDef { tables }
@@ -2493,6 +2522,7 @@ async fn authorize_user_sees_own_and_public_not_others_private() -> anyhow::Resu
             email: None,
             ..Default::default()
         },
+        false,
     )
     .await?;
 
@@ -2521,7 +2551,7 @@ async fn authorize_bypass_sees_all_rows() -> anyhow::Result<()> {
 
     let mut q = posts_query();
     q.take = Some(100);
-    let res = execute_query(&pool, &db, &schema, &q, &PrincipalCtx::bypass()).await?;
+    let res = execute_query(&pool, &db, &schema, &q, &PrincipalCtx::bypass(), false).await?;
 
     let mut got = bodies(res);
     got.sort();
@@ -2559,6 +2589,7 @@ async fn authorize_count_filters_user() -> anyhow::Result<()> {
             email: None,
             ..Default::default()
         },
+        false,
     )
     .await?;
     match res {
@@ -2567,7 +2598,7 @@ async fn authorize_count_filters_user() -> anyhow::Result<()> {
     }
 
     // Bypass count sees all 4.
-    let res = execute_query(&pool, &db, &schema, &q, &PrincipalCtx::bypass()).await?;
+    let res = execute_query(&pool, &db, &schema, &q, &PrincipalCtx::bypass(), false).await?;
     match res {
         QueryResult::Count(n) => assert_eq!(n, 4),
         other => panic!("expected Count, got {other:?}"),
@@ -2599,6 +2630,7 @@ async fn client_filter_rejects_principal_marker() -> anyhow::Result<()> {
             email: None,
             ..Default::default()
         },
+        false,
     )
     .await
     .expect_err("client filter with $user marker must be rejected");
@@ -2648,6 +2680,7 @@ async fn authorize_get_filters_unauthorized_user() -> anyhow::Result<()> {
             email: None,
             ..Default::default()
         },
+        false,
     )
     .await?;
     match res {
@@ -2668,6 +2701,7 @@ async fn authorize_get_filters_unauthorized_user() -> anyhow::Result<()> {
             email: None,
             ..Default::default()
         },
+        false,
     )
     .await?;
     match res {
@@ -2679,7 +2713,7 @@ async fn authorize_get_filters_unauthorized_user() -> anyhow::Result<()> {
     // user-only; machine/admin/scheduled paths enforce nothing here).
     let mut q = posts_query();
     q.get = Some(b_priv_id.clone());
-    let res = execute_query(&pool, &db, &schema, &q, &PrincipalCtx::bypass()).await?;
+    let res = execute_query(&pool, &db, &schema, &q, &PrincipalCtx::bypass(), false).await?;
     match res {
         QueryResult::Doc(Some(d)) => assert_eq!(d["body"].as_str(), Some("b-priv")),
         other => panic!("bypass get(B-private) should return the doc, got {other:?}"),
@@ -2708,6 +2742,7 @@ async fn authorize_get_allows_other_users_public() -> anyhow::Result<()> {
             email: None,
             ..Default::default()
         },
+        false,
     )
     .await?;
     match res {
@@ -2737,7 +2772,7 @@ async fn fetch_post(
 ) -> Option<serde_json::Value> {
     let mut q = posts_query();
     q.get = Some(id.to_string());
-    match execute_query(pool, db, schema, &q, &PrincipalCtx::bypass()).await {
+    match execute_query(pool, db, schema, &q, &PrincipalCtx::bypass(), false).await {
         Ok(QueryResult::Doc(d)) => d,
         other => panic!("expected Doc, got {other:?}"),
     }
@@ -2803,7 +2838,7 @@ async fn authorize_patch_on_unauthorized_doc_is_forbidden_and_atomic() -> anyhow
     // ...and A's preceding insert was rolled back (no "a-temp" row).
     let mut q = posts_query();
     q.take = Some(100);
-    let all = bodies(execute_query(&pool, &db, &schema, &q, &PrincipalCtx::bypass()).await?);
+    let all = bodies(execute_query(&pool, &db, &schema, &q, &PrincipalCtx::bypass(), false).await?);
     assert!(
         !all.iter().any(|b| b == "a-temp"),
         "preceding insert must be rolled back, got {all:?}"
@@ -3057,6 +3092,7 @@ fn insert_stamp_schema() -> SchemaDef {
             collaborators_field: None,
             ttl: None,
             authorize,
+            soft_delete: false,
         }
     };
     let mut tables = BTreeMap::new();
@@ -3185,7 +3221,7 @@ async fn fetch_doc_bypass(
         hybrid_search: None,
         aggregate: None,
     };
-    match execute_query(pool, db, schema, &q, &PrincipalCtx::bypass()).await {
+    match execute_query(pool, db, schema, &q, &PrincipalCtx::bypass(), false).await {
         Ok(QueryResult::Doc(d)) => d,
         other => panic!("expected Doc, got {other:?}"),
     }
@@ -3329,7 +3365,7 @@ async fn authorize_insert_without_user_leaf_forbidden_when_predicate_fails() -> 
         hybrid_search: None,
         aggregate: None,
     };
-    let res = execute_query(&pool, &db, &schema, &q, &PrincipalCtx::bypass()).await?;
+    let res = execute_query(&pool, &db, &schema, &q, &PrincipalCtx::bypass(), false).await?;
     match res {
         QueryResult::Count(n) => assert_eq!(n, 0, "no row should be persisted"),
         other => panic!("expected Count, got {other:?}"),
@@ -3604,6 +3640,7 @@ async fn authorize_patch_re_stamps_eq_user_leaf_closing_injection() -> anyhow::R
             email: None,
             ..Default::default()
         },
+        false,
     )
     .await?;
     match res {
@@ -3900,6 +3937,7 @@ fn composed_schema() -> SchemaDef {
                 field: "visibility".into(),
                 value: json!("public"),
             }),
+            soft_delete: false,
         },
     );
     SchemaDef { tables }
@@ -3994,28 +4032,28 @@ async fn owner_and_authorize_both_gates_must_pass() -> anyhow::Result<()> {
     // (1) Scan: alice sees only the row she owns AND that is public.
     let mut q = docs_query();
     q.take = Some(100);
-    let mut got = bodies(execute_query(&pool, &db, &schema, &q, &alice).await?);
+    let mut got = bodies(execute_query(&pool, &db, &schema, &q, &alice, false).await?);
     got.sort();
     assert_eq!(got, vec!["alice-pub".to_string()]);
 
     // (2) Point-read: owning a row is not enough when `authorize` denies it.
     let mut q = docs_query();
     q.get = Some(owner_only.clone());
-    match execute_query(&pool, &db, &schema, &q, &alice).await? {
+    match execute_query(&pool, &db, &schema, &q, &alice, false).await? {
         QueryResult::Doc(None) => {}
         other => panic!("get(owner-pass/auth-fail) must be None, got {other:?}"),
     }
     // (3) Point-read: a public row is not enough when the caller doesn't own it.
     let mut q = docs_query();
     q.get = Some(auth_only.clone());
-    match execute_query(&pool, &db, &schema, &q, &alice).await? {
+    match execute_query(&pool, &db, &schema, &q, &alice, false).await? {
         QueryResult::Doc(None) => {}
         other => panic!("get(auth-pass/owner-fail) must be None, got {other:?}"),
     }
     // (4) Point-read: both gates pass → returned.
     let mut q = docs_query();
     q.get = Some(both.clone());
-    match execute_query(&pool, &db, &schema, &q, &alice).await? {
+    match execute_query(&pool, &db, &schema, &q, &alice, false).await? {
         QueryResult::Doc(Some(d)) => assert_eq!(d["body"].as_str(), Some("alice-pub")),
         other => panic!("get(both-pass) must return the doc, got {other:?}"),
     }
@@ -4222,7 +4260,7 @@ async fn expect_version_authorize_hides_invisible_doc() -> anyhow::Result<()> {
     let bob_id = seed_post(&pool, &db, &schema, "bob private", "bob", "private").await;
     let mut q = posts_query();
     q.get = Some(bob_id.clone());
-    let real_version = match execute_query(&pool, &db, &schema, &q, &PrincipalCtx::bypass())
+    let real_version = match execute_query(&pool, &db, &schema, &q, &PrincipalCtx::bypass(), false)
         .await
         .expect("fetch bob's post")
     {
@@ -4531,6 +4569,7 @@ fn sec117_schema(authorize: FilterExpr) -> SchemaDef {
             collaborators_field: None,
             ttl: None,
             authorize: Some(authorize),
+            soft_delete: false,
         },
     );
     SchemaDef { tables }
@@ -4599,7 +4638,7 @@ async fn sec117_seed_without_flag(
         hybrid_search: None,
         aggregate: None,
     };
-    let res = execute_query(pool, db, _schema, &get_q, &PrincipalCtx::bypass())
+    let res = execute_query(pool, db, _schema, &get_q, &PrincipalCtx::bypass(), false)
         .await
         .expect("bypass get");
     match res {
@@ -4647,7 +4686,7 @@ async fn sec117_assert_agree(predicate: FilterExpr, expect_visible: bool) {
         email: None,
         ..Default::default()
     };
-    let res = execute_query(&pool, &db, &schema, &q, &user_ctx)
+    let res = execute_query(&pool, &db, &schema, &q, &user_ctx, false)
         .await
         .expect("query executes");
     let sql_visible = match res {

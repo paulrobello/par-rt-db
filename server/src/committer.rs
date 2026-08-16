@@ -8,7 +8,7 @@
 //! `RunWorkflowAdvance`, and publishes each at the four tap sites (subscription
 //! fan-out, op-feed, audit log, webhooks). Never add a second writer.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -27,7 +27,7 @@ use crate::protocol::ServerMessage;
 use crate::query::{Query, canonical, execute_query};
 use crate::scheduler;
 use crate::subs::{ConnId, SubscriptionManager};
-use crate::txn::{DocOp, OpKind, Transaction, TxnOutcome, WriteSet, execute_txn};
+use crate::txn::{OpKind, Transaction, TxnOutcome, WriteSet, execute_txn};
 
 /// Bound on each per-db committer task's inbox.
 const CHANNEL_BUFFER: usize = 64;
@@ -1412,9 +1412,7 @@ fn failed_outcome(
 async fn handle_reaper(ctx: &CommitterCtx) -> Result<(), RtDbError> {
     let schema = ctx.schemas.get(&ctx.pool, &ctx.db).await?;
     let now = now_ms();
-    let mut tables: BTreeSet<String> = BTreeSet::new();
-    let mut docs: BTreeSet<(String, String)> = BTreeSet::new();
-    let mut ops: Vec<DocOp> = Vec::new();
+    let mut write_set = WriteSet::default();
     for (table_name, table_def) in &schema.tables {
         let Some(ttl) = &table_def.ttl else {
             continue;
@@ -1422,6 +1420,81 @@ async fn handle_reaper(ctx: &CommitterCtx) -> Result<(), RtDbError> {
         let pg_schema_name = crate::ddl::pg_schema(&ctx.db);
         let table_ident = crate::ddl::pg_table(table_name);
         let col = crate::ddl::pg_col(&ttl.field);
+        // FM-33: when some table declares an `onDelete` field referencing this
+        // one, a bulk DELETE would strand (cascade/setNull) or ignore
+        // (restrict) the children. Select the expired batch, then per-row
+        // cascade with `force_hard = true` — TTL expiry is a real delete even
+        // on a softDelete table; the reaper is the collector of last resort.
+        if crate::txn::has_on_delete_children(&schema, table_name) {
+            let ids: Vec<(String,)> = match sqlx::query_as(&format!(
+                "SELECT id FROM \"{pg_schema_name}\".\"{table_ident}\" \
+                 WHERE \"{col}\" IS NOT NULL AND \"{col}\" < $1 \
+                 ORDER BY \"{col}\" LIMIT $2"
+            ))
+            .bind(now)
+            .bind(ctx.ttl_batch)
+            .fetch_all(&ctx.pool)
+            .await
+            {
+                Ok(rows) => rows,
+                Err(e) => {
+                    if matches!(
+                        crate::db::database_exists(&ctx.pool, &ctx.db).await,
+                        Ok(false)
+                    ) {
+                        return Ok(());
+                    }
+                    tracing::warn!(
+                        db = %ctx.db, table = %table_name, error = %e,
+                        "ttl reaper select failed"
+                    );
+                    continue;
+                }
+            };
+            if ids.is_empty() {
+                continue;
+            }
+            let Ok(mut conn) = ctx.pool.acquire().await else {
+                continue;
+            };
+            // `visited` is shared across the sweep so a row already cascaded
+            // by an earlier expired row's cascade is skipped, not an error;
+            // the budget is fresh per initiating row (`MAX_CASCADE_ROWS` is
+            // per initiating delete).
+            let mut visited: HashSet<(String, String)> = HashSet::new();
+            for (id,) in ids {
+                let mut cascade_rows = 0usize;
+                if let Err(e) = crate::txn::delete_row_cascade(
+                    &mut conn,
+                    &pg_schema_name,
+                    &schema,
+                    table_name,
+                    &id,
+                    &mut write_set,
+                    &mut visited,
+                    &mut cascade_rows,
+                    true,
+                )
+                .await
+                {
+                    if matches!(
+                        crate::db::database_exists(&ctx.pool, &ctx.db).await,
+                        Ok(false)
+                    ) {
+                        return Ok(());
+                    }
+                    // Per-row statements autocommit, so cascade work before
+                    // the failure is durable and stays in `write_set` — it
+                    // publishes below. The failed row remains expired and
+                    // retries on the next sweep (at-least-once).
+                    tracing::warn!(
+                        db = %ctx.db, table = %table_name, doc_id = %id, error = %e,
+                        "ttl reaper cascade failed"
+                    );
+                }
+            }
+            continue;
+        }
         let rows: Vec<(String,)> = match sqlx::query_as(&format!(
             "DELETE FROM \"{pg_schema_name}\".\"{table_ident}\" WHERE id IN (
                  SELECT id FROM \"{pg_schema_name}\".\"{table_ident}\"
@@ -1454,30 +1527,20 @@ async fn handle_reaper(ctx: &CommitterCtx) -> Result<(), RtDbError> {
         if rows.is_empty() {
             continue;
         }
-        tables.insert(table_name.clone());
         for (id,) in rows {
-            docs.insert((table_name.clone(), id.clone()));
-            ops.push(DocOp {
-                table: table_name.clone(),
-                id,
-                kind: OpKind::Delete,
-            });
+            write_set.touch(table_name, &id, OpKind::Delete);
         }
     }
-    if ops.is_empty() {
+    if write_set.ops.is_empty() {
         return Ok(());
     }
-    let write_set = WriteSet {
-        tables,
-        docs,
-        ops: ops.clone(),
-        doc_values: BTreeMap::new(),
-    };
     // Four-tap publication (fan_out → op-feed → audit → webhook). No quota
     // refresh — the reaper only frees storage. `owner = None`, `source = "ttl"`
-    // (system-initiated expiry, no interactive principal).
+    // (system-initiated expiry, no interactive principal). On the cascade path
+    // the ops include the children (hard-deleted or setNull-patched), matching
+    // the op-feed's per-durable-write contract.
     publish_taps(ctx, &schema, &write_set, None, "ttl", true, false).await;
-    for _ in 0..ops.len() {
+    for _ in 0..write_set.ops.len() {
         ctx.metrics.record_ttl_expired();
     }
     Ok(())
@@ -1883,7 +1946,7 @@ async fn handle_subscribe(
     principal_ctx: PrincipalCtx,
 ) -> Result<(), RtDbError> {
     let schema = ctx.schemas.get(&ctx.pool, &ctx.db).await?;
-    let result = execute_query(&ctx.pool, &ctx.db, &schema, &query, &principal_ctx).await?;
+    let result = execute_query(&ctx.pool, &ctx.db, &schema, &query, &principal_ctx, false).await?;
     let last = canonical(&result);
     // Mirror `subs::fan_out`: a serialization failure is logged and surfaced
     // as an internal error so the subscriber sees an explicit error rather

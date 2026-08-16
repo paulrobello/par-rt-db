@@ -15,7 +15,13 @@ Parity is deliberately scoped to the documented core (schema push, insert /
 patch / replace / delete / expectVersion / expectAbsent / upsert, point reads,
 index eq + range queries with order/take/unique/first/count, ``distinct`` and
 ``aggregate`` (scalar + grouped), filter expressions, keyset-cursor pagination,
-reactive subscriptions, and scheduled-job ``tick``).
+reactive subscriptions, and scheduled-job ``tick``). FM-33 semantics are
+mirrored end-to-end: ``onDelete`` cascades (``cascade``/``restrict``/
+``setNull``, recursive, cycle-guarded, row-budgeted), ``softDelete`` tables
+(delete stamps a ``deleted_at`` tombstone that every read and write lookup
+filters; undelete restores; unique indexes ignore soft-deleted rows; the TTL
+reaper always hard-deletes), and push-time ``onDelete`` validation at the
+server's own rule depth.
 ``vectorSearch``/``hybridSearch``/``search`` apply their optional ``filter``:
 ``vectorSearch`` treats every table row as a candidate (the sound
 over-approximation — it does not rank by vector similarity), ``hybridSearch``
@@ -57,7 +63,7 @@ import math
 import time
 from collections.abc import Callable
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import cmp_to_key
 from typing import Any, Literal
 
@@ -93,6 +99,7 @@ from .mutation import (
     _Replace,
     _Schedule,
     _StartWorkflow,
+    _Undelete,
     _Upsert,
 )
 from .query import Query, _terminal_of, parse_result
@@ -166,6 +173,13 @@ MAX_BY_QUERY_STEPS_PER_TXN = 16
 #: touch (mirrors ``server/src/txn.rs::MAX_AFFECTED_ROWS_PER_TXN``). Per-id
 #: steps count 1 each; each by-query step counts up to its ``limit``.
 MAX_AFFECTED_ROWS_PER_TXN = 10_000
+#: FM-33: hard cap on the rows one initiating delete step's ``onDelete``
+#: cascade may touch (mirrors ``server/src/txn.rs::MAX_CASCADE_ROWS``) —
+#: children stamped/deleted/nulled plus each initiator, one shared budget
+#: across every row of a ``deleteByQuery`` step. Over-budget raises
+#: ``CONFLICT`` so the txn rolls back atomically. Read at call time so tests
+#: can pin it via ``monkeypatch.setattr``.
+MAX_CASCADE_ROWS = 10_000
 #: Approximate cron re-fire interval for the in-memory stub. Real 5-field cron
 #: parsing is deferred to the server; the harness only needs crons to re-arm.
 CRON_STEP_MS = 60_000
@@ -282,12 +296,23 @@ class StoredRow:
     """A stored row: the user doc plus its identity/history, kept separate so the
     system fields (``_id``/``_creationTime``/``_version``) are merged in only at
     read time — exactly as the server stores ``doc`` jsonb alongside ``id``/
-    ``created_at``/``version`` columns."""
+    ``created_at``/``version`` columns. FM-33: ``deleted_at`` is the soft-delete
+    tombstone column (``None`` = live); like the other system fields it is NEVER
+    merged into client-visible docs — soft-deleted rows are filtered everywhere
+    instead."""
 
     id: str
     doc: dict[str, Any]
     version: int
     created_at: int
+    deleted_at: int | None = None
+
+
+def _is_live(row: StoredRow) -> bool:
+    """FM-33: a soft-deleted row (``deleted_at`` stamped) is invisible to every
+    read terminal and write lookup — the harness mirror of the server's
+    ``deleted_at IS NULL`` literal."""
+    return row.deleted_at is None
 
 
 @dataclass
@@ -703,6 +728,9 @@ class InMemoryRtDbClient:
         server's ``ddl.rs::detect_destructive_changes``."""
         if self._schema is not None:
             _detect_destructive_changes(self._schema, schema)
+        # FM-33: the server validates `onDelete` placement/shape in
+        # `SchemaDef::validate` on every push; mirror both passes here.
+        _validate_on_delete(schema)
         self._schema = schema
         for name, def_ in schema.tables.items():
             self._tables[name] = def_
@@ -1006,14 +1034,17 @@ class InMemoryRtDbClient:
 
     def get(self, table: str, id: str) -> dict[str, Any] | None:
         """Minimal point read — the merged doc (system fields included) for
-        ``(table, id)``, or ``None`` if absent."""
+        ``(table, id)``, or ``None`` if absent. FM-33: a soft-deleted row is
+        absent (the server's ``compile_point_read`` ``deleted_at IS NULL``)."""
         row = self._docs.get((table, id))
-        return None if row is None else _merge_doc(row)
+        return None if row is None or not _is_live(row) else _merge_doc(row)
 
     def collect_all(self, table: str) -> list[dict[str, Any]]:
         """Test/debug helper — every merged doc in ``table``, in unspecified
-        order. Not part of the query DSL."""
-        return [_merge_doc(row) for (t, _), row in self._docs.items() if t == table]
+        order. Not part of the query DSL. FM-33: soft-deleted rows are skipped."""
+        return [
+            _merge_doc(row) for (t, _), row in self._docs.items() if t == table and _is_live(row)
+        ]
 
     # ---- query ----------------------------------------------------------
 
@@ -1221,10 +1252,14 @@ class InMemoryRtDbClient:
         if q.filter is not None:
             _validate_filter(q.filter, set(table_def.fields.keys()))
 
-        # Row fetch + filter (eq prefix -> range -> filter hook).
+        # Row fetch + filter (eq prefix -> range -> filter hook). FM-33:
+        # soft-deleted rows are absent to every read terminal (the server's
+        # `compile_scan_where` `deleted_at IS NULL` literal).
         filtered: list[StoredRow] = []
         for (t, _id), row in self._docs.items():
             if t != q.table:
+                continue
+            if not _is_live(row):
                 continue
             if index_def is not None:
                 ok = True
@@ -1380,7 +1415,7 @@ class InMemoryRtDbClient:
         if q.vector_search.filter is not None:
             _validate_filter(q.vector_search.filter, set(table_def.fields.keys()))
         vector_candidates: list[StoredRow] = [
-            row for (t, _id), row in self._docs.items() if t == q.table
+            row for (t, _id), row in self._docs.items() if t == q.table and _is_live(row)
         ]
         if q.vector_search.filter is not None:
             vector_candidates = [
@@ -1441,7 +1476,9 @@ class InMemoryRtDbClient:
             raise RtDbError(ErrorCode.BAD_REQUEST, "snippet is only supported in tsquery mode")
         if q.search.filter is not None:
             _validate_filter(q.search.filter, set(table_def.fields.keys()))
-        candidates: list[StoredRow] = [row for (t, _id), row in self._docs.items() if t == q.table]
+        candidates: list[StoredRow] = [
+            row for (t, _id), row in self._docs.items() if t == q.table and _is_live(row)
+        ]
         if q.search.filter is not None:
             candidates = [row for row in candidates if _eval_filter_expr(q.search.filter, row.doc)]
         if q.search.mode == "trgm":
@@ -1816,7 +1853,7 @@ class InMemoryRtDbClient:
         write_set: set[str] = set()
         for step in txn.steps:
             try:
-                result, written_table = self._execute_step(step)
+                result, written_tables = self._execute_step(step)
             except RtDbError:
                 # Atomicity: any step's error rolls back everything already applied.
                 self._docs = snapshot
@@ -1824,33 +1861,59 @@ class InMemoryRtDbClient:
                 self._workflows = workflows_snapshot
                 raise
             results.append(result)
-            if written_table is not None:
-                write_set.add(written_table)
+            write_set.update(written_tables)
         self._notify_subs(write_set)
         return results
 
-    def _execute_step(self, step: Step) -> tuple[StepResult, str | None]:
+    def _execute_step(self, step: Step) -> tuple[StepResult, set[str]]:
+        """Run one step, returning its result and the set of tables it wrote
+        (empty for read-only/control-flow steps). FM-33: a delete step's set
+        includes every child table its ``onDelete`` cascade touched, so
+        subscribers on those tables re-run."""
         match step:
             case _Insert(table=table, doc=doc):
                 table_def = self._require_table(table)
                 new_id = self._do_insert(table, table_def, doc)
-                return _insert_result(new_id), table
+                return _insert_result(new_id), {table}
             case _Patch(table=table, id=sid, fields=fields):
                 table_def = self._require_table(table)
                 self._do_patch(table_def, table, sid, fields)
-                return None, table
+                return None, {table}
             case _Replace(table=table, id=sid, doc=doc):
                 table_def = self._require_table(table)
                 self._do_replace(table_def, table, sid, doc)
-                return None, table
+                return None, {table}
             case _Delete(table=table, id=sid):
-                self._require_table(table)
-                self._do_delete(table, sid)
-                return None, table
+                table_def = self._require_table(table)
+                touched: set[str] = set()
+                self._do_delete(table_def, table, sid, touched)
+                return None, touched
+            case _Undelete(table=table, id=sid):
+                # FM-33: restore a soft-deleted row. BAD_REQUEST on a table
+                # without `softDelete`; NOT_FOUND when absent; idempotent None
+                # result when already live.
+                table_def = self._require_table(table)
+                if not table_def.soft_delete:
+                    raise RtDbError(
+                        ErrorCode.BAD_REQUEST,
+                        f"table '{table}' does not declare softDelete",
+                    )
+                row = self._docs.get((table, sid))
+                if row is None:
+                    raise RtDbError(ErrorCode.NOT_FOUND, f"document '{sid}' not found")
+                if _is_live(row):
+                    # Idempotent: restoring a live row changes nothing.
+                    return None, set()
+                # Restoring re-enters the live-row unique predicate — the
+                # server's physical partial unique index makes the UPDATE
+                # collide; the harness enforces the same CONFLICT up front.
+                self._check_unique_indexes(table_def, table, row.doc, sid)
+                self._docs[(table, sid)] = replace(row, deleted_at=None, version=row.version + 1)
+                return None, {table}
             case _ExpectVersion(table=table, id=sid, version=version):
-                self._require_table(table)
-                self._do_expect_version(table, sid, version)
-                return None, None
+                table_def = self._require_table(table)
+                self._do_expect_version(table_def, table, sid, version)
+                return None, set()
             case _ExpectAbsent(table=table, index=index, eq=eq_vals):
                 table_def = self._require_table(table)
                 rows = self._eq_lookup(table_def, table, index, eq_vals)
@@ -1859,7 +1922,7 @@ class InMemoryRtDbClient:
                         ErrorCode.PRECONDITION_FAILED,
                         f"index '{index}' already has a matching document",
                     )
-                return None, None
+                return None, set()
             case _Upsert(
                 table=table,
                 index=index,
@@ -1877,16 +1940,18 @@ class InMemoryRtDbClient:
                     row = rows[0]
                     merged = apply_patch(table_def, row.doc, patch_fields)
                     self._do_update(table_def, table, row.id, merged)
-                    return _upsert_result(row.id, False), table
+                    return _upsert_result(row.id, False), {table}
                 new_id = self._do_insert(table, table_def, insert_doc)
-                return _upsert_result(new_id, True), table
+                return _upsert_result(new_id, True), {table}
             case _PatchByQuery(table=table, filter=flt, patch=patch_fields, limit=limit_opt):
                 table_def = self._require_table(table)
                 _validate_filter(flt, set(table_def.fields.keys()))
+                # FM-33: soft-deleted rows are absent to the scan (the server
+                # selects through `compile_scan_where`'s `deleted_at IS NULL`).
                 matched = [
                     row
                     for (t, _id), row in self._docs.items()
-                    if t == table and _eval_filter_expr(flt, row.doc)
+                    if t == table and _is_live(row) and _eval_filter_expr(flt, row.doc)
                 ]
                 matched.sort(key=lambda r: (r.created_at, r.id))
                 limit = (
@@ -1897,14 +1962,14 @@ class InMemoryRtDbClient:
                 for row in take:
                     merged = apply_patch(table_def, row.doc, patch_fields)
                     self._do_update(table_def, table, row.id, merged)
-                return _patch_by_query_result(len(take), truncated), table
+                return _patch_by_query_result(len(take), truncated), {table}
             case _DeleteByQuery(table=table, filter=flt, limit=limit_opt):
                 table_def = self._require_table(table)
                 _validate_filter(flt, set(table_def.fields.keys()))
                 matched = [
                     row
                     for (t, _id), row in self._docs.items()
-                    if t == table and _eval_filter_expr(flt, row.doc)
+                    if t == table and _is_live(row) and _eval_filter_expr(flt, row.doc)
                 ]
                 matched.sort(key=lambda r: (r.created_at, r.id))
                 limit = (
@@ -1912,9 +1977,18 @@ class InMemoryRtDbClient:
                 )
                 truncated = len(matched) > limit
                 take = matched[:limit]
+                # FM-33: every selected row deletes through the same
+                # onDelete-aware path as a per-id delete (stamp on a
+                # softDelete table, else cascade). `visited` and the row
+                # budget are shared across the whole step: a row already
+                # handled by an earlier row's cascade is skipped, and one
+                # budget bounds every cascade the step starts.
+                visited: set[tuple[str, str]] = set()
+                cascade_rows = [0]
+                touched = {table}
                 for row in take:
-                    self._do_delete(table, row.id)
-                return _delete_by_query_result(len(take), truncated), table
+                    self._delete_row_cascade(table, row.id, visited, cascade_rows, False, touched)
+                return _delete_by_query_result(len(take), truncated), touched
             case _Schedule(when=when, txn=nested_txn):
                 # FM-28: enqueue, don't execute — tick() fires the nested txn
                 # later through _execute_transaction (which re-validates it).
@@ -1933,22 +2007,22 @@ class InMemoryRtDbClient:
                         last_error=None,
                     )
                 )
-                return _schedule_result(job_id), None
+                return _schedule_result(job_id), set()
             case _CancelSchedule(id=job_id):
                 # Unlike the standalone cancel op (NOT_FOUND on a miss), the
                 # step reports {"cancelled": bool} — a miss is not an error.
                 before = len(self._schedules)
                 self._schedules = [j for j in self._schedules if j.id != job_id]
-                return _cancel_schedule_result(len(self._schedules) < before), None
+                return _cancel_schedule_result(len(self._schedules) < before), set()
             case _StartWorkflow(spec=wf_spec):
                 # FM-29: insert the run on the open txn — the rollback snapshot
                 # above restores it if a later step fails, so a rolled-back txn
                 # leaves no orphan run.
-                return _start_workflow_result(self._insert_workflow(wf_spec)), None
+                return _start_workflow_result(self._insert_workflow(wf_spec)), set()
             case _CancelWorkflow(id=wf_id):
                 # Same shape as cancelSchedule: {"cancelled": bool}, a miss or
                 # terminal run is a no-op False, not an error.
-                return _cancel_workflow_result(self.cancel_workflow(wf_id)), None
+                return _cancel_workflow_result(self.cancel_workflow(wf_id)), set()
             case _:
                 raise RtDbError(ErrorCode.INTERNAL, "unknown step op")
 
@@ -1982,7 +2056,8 @@ class InMemoryRtDbClient:
     ) -> None:
         key = (table_name, sid)
         row = self._docs.get(key)
-        if row is None:
+        # FM-33: a soft-deleted row is absent to every write lookup.
+        if row is None or not _is_live(row):
             raise RtDbError(ErrorCode.NOT_FOUND, f"document '{sid}' not found")
         merged = apply_patch(table_def, row.doc, fields)
         self._do_update(table_def, table_name, sid, merged)
@@ -1996,7 +2071,8 @@ class InMemoryRtDbClient:
     ) -> None:
         key = (table_name, sid)
         row = self._docs.get(key)
-        if row is None:
+        # FM-33: a soft-deleted row is absent to every write lookup.
+        if row is None or not _is_live(row):
             raise RtDbError(ErrorCode.NOT_FOUND, f"document '{sid}' not found")
         # Replace writes a whole NEW document, so defaults apply (FM-32) —
         # unlike patch, clearing a field then replacing re-stamps it.
@@ -2007,14 +2083,175 @@ class InMemoryRtDbClient:
         row.doc = stored
         row.version += 1
 
-    def _do_delete(self, table_name: str, sid: str) -> None:
-        key = (table_name, sid)
-        if self._docs.pop(key, None) is None:
-            raise RtDbError(ErrorCode.NOT_FOUND, f"document '{sid}' not found")
+    def _do_delete(
+        self,
+        table_def: TableDef,
+        table_name: str,
+        sid: str,
+        touched: set[str],
+    ) -> None:
+        """Delete ``(table_name, sid)`` the FM-33 way: a ``softDelete`` table
+        stamps a ``deleted_at`` tombstone (live-row-guarded — an already-stamped
+        or absent row is ``NOT_FOUND``, and a soft delete never triggers a
+        cascade); anything else hard-deletes through
+        :meth:`_delete_row_cascade`, expanding the schema's ``onDelete`` rules."""
+        if table_def.soft_delete:
+            row = self._docs.get((table_name, sid))
+            if row is None or not _is_live(row):
+                raise RtDbError(ErrorCode.NOT_FOUND, f"document '{sid}' not found")
+            self._docs[(table_name, sid)] = replace(
+                row, deleted_at=self._now(), version=row.version + 1
+            )
+            touched.add(table_name)
+            return
+        visited: set[tuple[str, str]] = set()
+        cascade_rows = [0]
+        self._delete_row_cascade(table_name, sid, visited, cascade_rows, False, touched)
 
-    def _do_expect_version(self, table_name: str, sid: str, expected: int) -> None:
+    def _delete_row_cascade(
+        self,
+        table_name: str,
+        sid: str,
+        visited: set[tuple[str, str]],
+        cascade_rows: list[int],
+        force_hard: bool,
+        touched: set[str],
+    ) -> None:
+        """Delete row ``sid`` of ``table_name`` expanding the app-level
+        ``onDelete`` rules (FM-33) — the port of server
+        ``txn.rs::delete_row_cascade``. Not a SQL FK: the graph is declared in
+        the pushed schema and walked here, children first (recursively — a
+        child's own delete re-enters this walk), parent last.
+
+        * ``softDelete`` table (unless ``force_hard``): the row is STAMPED, not
+          removed, and the recursion stops — nothing past a stamped row is
+          touched, and a soft delete is never itself a cascade trigger.
+        * ``restrict``: the first live child (a ``LIMIT 1`` probe server-side)
+          aborts with ``CONFLICT`` naming ``child_table.field`` and the child.
+        * ``cascade``: recurse per live child; a ``softDelete`` child table
+          gets its stamp (its own delete semantics apply to every delete that
+          reaches it).
+        * ``setNull``: per live child, patch ``{field: None}`` — which REMOVES
+          the key (``apply_patch``'s unset semantics) — bumping ``version``.
+        * ``visited`` guards cycles (self- and mutual-reference) and lets a
+          ``deleteByQuery`` step skip rows an earlier row's cascade removed.
+          ``cascade_rows`` (one shared cell) is the
+          :data:`MAX_CASCADE_ROWS` budget; over-budget aborts with ``CONFLICT``.
+        * ``force_hard`` (the TTL reaper) physically removes rows even on
+          ``softDelete`` tables and propagates through the recursion.
+        * ``touched`` accumulates every table written, for subscriber fan-out
+          (the server's ``WriteSet.tables``).
+        """
+        table_def = self._require_table(table_name)
+        if (table_name, sid) in visited:
+            return
+        visited.add((table_name, sid))
+        if cascade_rows[0] >= MAX_CASCADE_ROWS:
+            raise RtDbError(
+                ErrorCode.CONFLICT,
+                f"onDelete cascade exceeds the limit of {MAX_CASCADE_ROWS} rows",
+            )
+        cascade_rows[0] += 1
+
+        if table_def.soft_delete and not force_hard:
+            row = self._docs.get((table_name, sid))
+            if row is None or not _is_live(row):
+                raise RtDbError(ErrorCode.NOT_FOUND, f"document '{sid}' not found")
+            self._docs[(table_name, sid)] = replace(
+                row, deleted_at=self._now(), version=row.version + 1
+            )
+            touched.add(table_name)
+            return
+
+        # Children first: every schema table field declaring an onDelete action
+        # referencing this table (the server's deterministic BTreeMap order is
+        # not correctness-relevant; insertion order here).
+        for child_table_name, child_table_def in self._tables.items():
+            for field_name, field_type in child_table_def.fields.items():
+                action = _on_delete_ref(field_type, table_name)
+                if action is None:
+                    continue
+                if action == "restrict":
+                    hits = self._visible_child_ids(
+                        child_table_def, child_table_name, field_name, sid, limit_one=True
+                    )
+                    if hits:
+                        raise RtDbError(
+                            ErrorCode.CONFLICT,
+                            f"cannot delete '{table_name}': "
+                            f"'{child_table_name}.{field_name}' is referenced "
+                            f"by document '{hits[0]}'",
+                        )
+                elif action == "cascade":
+                    for child_id in self._visible_child_ids(
+                        child_table_def, child_table_name, field_name, sid, limit_one=False
+                    ):
+                        self._delete_row_cascade(
+                            child_table_name, child_id, visited, cascade_rows, force_hard, touched
+                        )
+                else:  # setNull
+                    for child_id in self._visible_child_ids(
+                        child_table_def, child_table_name, field_name, sid, limit_one=False
+                    ):
+                        if cascade_rows[0] >= MAX_CASCADE_ROWS:
+                            raise RtDbError(
+                                ErrorCode.CONFLICT,
+                                f"onDelete cascade exceeds the limit of {MAX_CASCADE_ROWS} rows",
+                            )
+                        cascade_rows[0] += 1
+                        # `{field: None}` on the optional id REMOVES the key
+                        # (apply_patch's unset semantics) and bumps version.
+                        # Written as a fresh row (not _do_patch/_do_update, which
+                        # mutate in place) so a later cascade failure rolls the
+                        # null back with the txn snapshot — every cascade write
+                        # is snapshot-rollback-safe.
+                        child_row = self._docs[(child_table_name, child_id)]
+                        merged = apply_patch(child_table_def, child_row.doc, {field_name: None})
+                        self._docs[(child_table_name, child_id)] = replace(
+                            child_row, doc=merged, version=child_row.version + 1
+                        )
+                        touched.add(child_table_name)
+
+        # Parent last. A soft-deleted row only reaches here under force_hard —
+        # the stamp branch above returns first — so this is a physical remove.
+        if self._docs.pop((table_name, sid), None) is None:
+            raise RtDbError(ErrorCode.NOT_FOUND, f"document '{sid}' not found")
+        touched.add(table_name)
+
+    def _visible_child_ids(
+        self,
+        child_table_def: TableDef,
+        child_table_name: str,
+        field_name: str,
+        parent_id: str,
+        *,
+        limit_one: bool,
+    ) -> list[str]:
+        """Ids of live rows in ``child_table_name`` whose ``field_name``
+        references ``parent_id`` (the port of server ``visible_child_ids``).
+        Soft-deleted children are invisible to every ``onDelete`` action."""
+        out: list[str] = []
+        for (t, row_id), row in self._docs.items():
+            if t != child_table_name:
+                continue
+            if not _is_live(row):
+                continue
+            if row.doc.get(field_name) == parent_id:
+                out.append(row_id)
+                if limit_one:
+                    break
+        return out
+
+    def _do_expect_version(
+        self,
+        table_def: TableDef,
+        table_name: str,
+        sid: str,
+        expected: int,
+    ) -> None:
         row = self._docs.get((table_name, sid))
-        if row is None:
+        # FM-33: a soft-deleted row is absent — same NOT_FOUND as a miss.
+        if row is None or not _is_live(row):
             raise RtDbError(ErrorCode.NOT_FOUND, f"document '{sid}' not found")
         if row.version != expected:
             raise RtDbError(
@@ -2069,6 +2306,10 @@ class InMemoryRtDbClient:
             for (t, _row_id), row in self._docs.items():
                 if t != table_name:
                     continue
+                # FM-33: soft-deleted rows are outside the unique predicate
+                # (the server widens it with `deleted_at IS NULL`).
+                if not _is_live(row):
+                    continue
                 if exclude_id is not None and row.id == exclude_id:
                     continue
                 if pred is not None and not _eval_filter_expr(pred, row.doc):
@@ -2102,6 +2343,10 @@ class InMemoryRtDbClient:
         matches: list[StoredRow] = []
         for (t, _id), row in self._docs.items():
             if t != table_name:
+                continue
+            # FM-33: soft-deleted rows are absent to ExpectAbsent and Upsert
+            # (upserting a soft-deleted key inserts a fresh row).
+            if not _is_live(row):
                 continue
             if all(
                 (rv := row.doc.get(fld)) is not None and rv == tv
@@ -2478,9 +2723,22 @@ class InMemoryRtDbClient:
         in-memory mirror of the server's per-tick TTL reaper. Fires only on
         tables that declare ``ttl``; non-numeric or absent values are left alone.
         Notifies subscribers on each touched table so reactive subscriptions see
-        the expiry as a delete. Returns the count of removed docs."""
+        the expiry as a delete. Returns the count of removed docs.
+
+        FM-33: the reaper ALWAYS hard-deletes (``force_hard`` — even on a
+        ``softDelete`` table; the reaper is the purge mechanism), and when some
+        table declares an ``onDelete`` ref targeting the reaped table the expiry
+        runs through :meth:`_delete_row_cascade` so children follow their
+        declared action. Mirror of server ``handle_reaper``'s bulk-vs-cascade
+        branch: ``visited`` is shared across the sweep (a row cascaded by an
+        earlier expiry is skipped) while the budget is fresh per initiating
+        row; a failing row is skipped and retried on the next sweep, not fatal."""
         touched: set[str] = set()
         removed = 0
+        # Shared across the whole sweep: a row already hard-deleted (or
+        # stamped) by an earlier expiry's cascade is skipped, not an error.
+        # Locally scoped so a failed row retries on the NEXT sweep.
+        sweep_visited: set[tuple[str, str]] = set()
         # Snapshot the items — popping mid-iteration would skip rows.
         for (table, doc_id), row in list(self._docs.items()):
             tdef = self._tables.get(table)
@@ -2488,9 +2746,22 @@ class InMemoryRtDbClient:
                 continue
             value = row.doc.get(tdef.ttl.field)
             if isinstance(value, (int, float)) and value < now:
-                self._docs.pop((table, doc_id), None)
+                if any(
+                    _on_delete_ref(ft, table) is not None
+                    for other in self._tables.values()
+                    for ft in other.fields.values()
+                ):
+                    try:
+                        self._delete_row_cascade(table, doc_id, sweep_visited, [0], True, touched)
+                    except RtDbError:
+                        # Per-row failures are skipped and retried next sweep
+                        # (at-least-once, like the server's warn-and-continue);
+                        # cascade work before the failure stays, as server-side.
+                        continue
+                else:
+                    self._docs.pop((table, doc_id), None)
+                    touched.add(table)
                 removed += 1
-                touched.add(table)
         if touched:
             self._notify_subs(touched)
         return removed
@@ -3007,8 +3278,130 @@ def _detect_destructive_changes(old: SchemaDef, new: SchemaDef) -> None:
 
 def _field_type_signature(ty: Any) -> Any:
     """Structural signature of a ``FieldType`` for destructive-change detection
-    (the live server compares the parsed type tree directly)."""
-    return ty.model_dump(mode="json")
+    (the live server compares the parsed type tree directly). FM-33: ``onDelete``
+    is stripped first — the server's ``strip_on_delete`` — so adding or changing
+    the action is additive, while the referenced ``table`` still participates
+    (changing it remains a type change)."""
+    return _strip_on_delete_keys(ty.model_dump(mode="json"))
+
+
+def _strip_on_delete_keys(dumped: Any) -> Any:
+    """Recursively drop every ``onDelete`` key from a dumped field-type tree —
+    the wire-dump equivalent of server ``schema::strip_on_delete`` (the action
+    is behavior, not storage shape). Both the alias (``onDelete``) and the
+    field name (``on_delete``) are stripped: ``model_dump(mode="json")``
+    without ``by_alias`` emits field names."""
+    if isinstance(dumped, dict):
+        return {
+            k: _strip_on_delete_keys(v)
+            for k, v in dumped.items()
+            if k not in ("onDelete", "on_delete")
+        }
+    if isinstance(dumped, list):
+        return [_strip_on_delete_keys(v) for v in dumped]
+    return dumped
+
+
+def _on_delete_ref(ty: Any, parent_table: str) -> str | None:
+    """The ``onDelete`` action ``ty`` declares when it references
+    ``parent_table``, or ``None`` when the type is not an id/optional-id
+    pointing at it (or declares no action). Port of server
+    ``txn::on_delete_ref``; push validation guarantees an onDelete-bearing id
+    appears only at the top level or directly under one ``Optional``, so this
+    two-shape walk is exhaustive."""
+    match ty:
+        case _FId(table=table, on_delete=action) if table == parent_table:
+            return action
+        case _FOptional(inner=inner):
+            return _on_delete_ref(inner, parent_table)
+        case _:
+            return None
+
+
+def _field_has_nested_on_delete(ty: Any) -> bool:
+    """Whether any id variant reachable through the type's compositors carries
+    an ``onDelete`` action — used to reject actions nested deeper than the two
+    legal top-level shapes. Port of server ``field_has_nested_on_delete``."""
+    match ty:
+        case _FId(on_delete=action):
+            return action is not None
+        case _FOptional(inner=inner) | _FArray(element=inner) | _FRecord(value=inner):
+            return _field_has_nested_on_delete(inner)
+        case _FUnion(variants=variants):
+            return any(_field_has_nested_on_delete(v) for v in variants)
+        case _FObject(fields=fields):
+            return any(_field_has_nested_on_delete(v) for v in fields.values())
+        case _:
+            return False
+
+
+def _validate_on_delete(schema: SchemaDef) -> None:
+    """FM-33 push-time ``onDelete`` validation — the port of server
+    ``schema.rs::validate_on_delete`` plus the second referenced-table pass in
+    ``SchemaDef::validate``, with the server's exact ``SCHEMA_VIOLATION``
+    messages. An action is legal only on a TOP-LEVEL field, in one of two
+    shapes: ``id{table, onDelete}`` or ``optional{id{table, onDelete}}``
+    (nested deeper there is no well-defined "the ref field" to index or null).
+    ``setNull`` additionally requires the ``Optional`` wrapper, the field needs
+    a single-field, non-unique, non-partial btree index on it (the cascade
+    lookup must be an index scan; a partial ``where`` could hide children), and
+    the referenced table must be declared. Self-reference is legal."""
+    for table_name, table_def in schema.tables.items():
+        for field_name, field_type in table_def.fields.items():
+            action: str | None
+            is_optional: bool
+            match field_type:
+                case _FId(on_delete=a):
+                    action, is_optional = a, False
+                case _FOptional(inner=_FId(on_delete=a)):
+                    action, is_optional = a, True
+                case _:
+                    if _field_has_nested_on_delete(field_type):
+                        raise RtDbError(
+                            ErrorCode.SCHEMA_VIOLATION,
+                            f"field '{field_name}' on table '{table_name}': onDelete is legal "
+                            "only on a top-level id or optional-id field",
+                        )
+                    continue
+            if action is None:
+                continue
+            if action == "setNull" and not is_optional:
+                raise RtDbError(
+                    ErrorCode.SCHEMA_VIOLATION,
+                    f"field '{field_name}' on table '{table_name}': onDelete 'setNull' "
+                    "requires the id field to be optional",
+                )
+            has_ref_index = any(
+                not idx.search
+                and idx.vector is None
+                and not idx.unique
+                and idx.where is None
+                and len(idx.fields) == 1
+                and idx.fields[0] == field_name
+                for idx in table_def.indexes
+            )
+            if not has_ref_index:
+                raise RtDbError(
+                    ErrorCode.SCHEMA_VIOLATION,
+                    f"onDelete field '{field_name}' on table '{table_name}' requires a "
+                    "single-field, non-unique, non-partial btree index on it",
+                )
+    # Second pass (needs whole-schema access): every top-level onDelete id
+    # field must reference a table declared in this schema.
+    for table_name, table_def in schema.tables.items():
+        for field_name, field_type in table_def.fields.items():
+            ref_table: str | None = None
+            match field_type:
+                case _FId(table=ref, on_delete=action) if action is not None:
+                    ref_table = ref
+                case _FOptional(inner=_FId(table=ref, on_delete=action)) if action is not None:
+                    ref_table = ref
+            if ref_table is not None and ref_table not in schema.tables:
+                raise RtDbError(
+                    ErrorCode.SCHEMA_VIOLATION,
+                    f"onDelete field '{field_name}' on table '{table_name}' references "
+                    f"unknown table '{ref_table}'",
+                )
 
 
 def _literal_set(ty: Any) -> list[Any] | None:

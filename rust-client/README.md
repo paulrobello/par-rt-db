@@ -154,6 +154,35 @@ client adds `list_workflows`/`get_workflow`/`start_workflow`/`cancel_workflow`/
 in-memory test harness does NOT model the workflow engine (its workflow arms
 return `Internal` errors) — test workflow flows against a live server.
 
+## Cascade delete + soft delete (FM-33)
+
+Declare app-level foreign keys with `.on_delete()` on an id field — the
+server executes the action inside the deleting transaction (`cascade`
+recurses, `restrict` conflicts with a `table.field`-naming message, `setNull`
+clears the reference — legal only on an `optional` id). One delete may write
+several tables; cycles terminate and a 10,000-row cascade budget aborts
+atomically. `.soft_delete()` on a table swaps removal for a `deleted_at`
+stamp: the row disappears from every read, write lookup, and unique index
+(same key re-insertable) and comes back via `.undelete()` — idempotent,
+`NotFound` when absent, `BadRequest` on a table that doesn't declare
+`softDelete`.
+
+```rust
+use par_rt_db_client::schema::{FieldType, OnDeleteAction, Table};
+
+let table = Table::new()
+    .field("note", FieldType::String)
+    .field("parentId", FieldType::id("parents").on_delete(OnDeleteAction::Cascade))
+    .soft_delete();
+let txn = Mutation::new().undelete("children", &id).build();
+```
+
+Adding or changing an `onDelete` action (and adding the `softDelete` flag)
+is an additive schema push — runtime delete behavior only, no stored-row
+change. The TTL reaper hard-deletes expired rows even on a `softDelete`
+table and honors `onDelete` children. The `in_memory` harness mirrors all
+of this (see `src/in_memory/tests.rs`).
+
 ## Schema migration
 
 Destructive/type-changing schema transformations are a deliberate admin operation,

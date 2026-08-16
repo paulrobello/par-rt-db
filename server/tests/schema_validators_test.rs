@@ -209,6 +209,7 @@ async fn document_round_trips_through_insert_patch_and_query() -> anyhow::Result
             aggregate: None,
         },
         &PrincipalCtx::bypass(),
+        false,
     )
     .await?;
 

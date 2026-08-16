@@ -3,6 +3,7 @@ import type {
   FieldTypeJson,
   FilterExpr,
   IndexJson,
+  OnDeleteAction,
   SchemaJson,
   TableJson,
   TtlDef,
@@ -65,7 +66,20 @@ export const t = {
   number: (): Validator<number> => makeValidator({ type: "number" }),
   boolean: (): Validator<boolean> => makeValidator({ type: "boolean" }),
   null: (): Validator<null> => makeValidator({ type: "null" }),
-  id: <T extends string>(table: T): Validator<Id<T>> => makeValidator({ type: "id", table }),
+  /** An id referencing `table`. `opts.onDelete` (FM-33) declares the action the
+   * server takes on child rows when the referenced parent row is hard-deleted:
+   * `"cascade"` deletes the children (recursively, soft-deleting children whose
+   * own table declares `.softDelete()`), `"restrict"` blocks the parent delete
+   * with a Conflict while live children exist, `"setNull"` clears the child
+   * field (requires `t.optional(t.id(...))`). Legal only on a top-level or
+   * optional-wrapped id, and the field needs a single-field, non-unique,
+   * non-partial btree index. Omitted on the wire when absent. */
+  id: <T extends string>(table: T, opts?: { onDelete?: OnDeleteAction }): Validator<Id<T>> =>
+    makeValidator({
+      type: "id",
+      table,
+      ...(opts?.onDelete ? { onDelete: opts.onDelete } : {}),
+    }),
   literal: <L extends string | number | boolean>(value: L): Validator<L> =>
     makeValidator({ type: "literal", value }),
   optional: <T>(inner: Validator<T, boolean>): Validator<T | undefined, true> =>
@@ -101,6 +115,7 @@ export class TableDefinition<
     readonly ttlDef?: TtlDef,
     readonly authorizeDef?: FilterExpr,
     readonly defaultsMap?: Record<string, unknown>,
+    readonly softDeleteFlag?: boolean,
   ) {}
 
   index<Name extends string>(
@@ -115,6 +130,7 @@ export class TableDefinition<
       this.ttlDef,
       this.authorizeDef,
       this.defaultsMap,
+      this.softDeleteFlag,
     );
   }
 
@@ -152,6 +168,7 @@ export class TableDefinition<
       this.ttlDef,
       this.authorizeDef,
       this.defaultsMap,
+      this.softDeleteFlag,
     );
   }
 
@@ -177,6 +194,7 @@ export class TableDefinition<
       this.ttlDef,
       this.authorizeDef,
       this.defaultsMap,
+      this.softDeleteFlag,
     );
   }
 
@@ -214,6 +232,7 @@ export class TableDefinition<
       this.ttlDef,
       this.authorizeDef,
       this.defaultsMap,
+      this.softDeleteFlag,
     );
   }
 
@@ -229,6 +248,7 @@ export class TableDefinition<
       this.ttlDef,
       this.authorizeDef,
       this.defaultsMap,
+      this.softDeleteFlag,
     );
   }
 
@@ -245,6 +265,7 @@ export class TableDefinition<
       this.ttlDef,
       this.authorizeDef,
       this.defaultsMap,
+      this.softDeleteFlag,
     );
   }
 
@@ -266,6 +287,7 @@ export class TableDefinition<
       ttlDef,
       this.authorizeDef,
       this.defaultsMap,
+      this.softDeleteFlag,
     );
   }
 
@@ -285,6 +307,7 @@ export class TableDefinition<
       this.ttlDef,
       predicate,
       this.defaultsMap,
+      this.softDeleteFlag,
     );
   }
 
@@ -305,6 +328,26 @@ export class TableDefinition<
       this.ttlDef,
       this.authorizeDef,
       map,
+      this.softDeleteFlag,
+    );
+  }
+
+  /** Opt into soft delete (FM-33): `delete`/`deleteByQuery` stamp an internal
+   * `deleted_at` instead of removing the row. A soft-deleted row is invisible
+   * to every read terminal, eq-lookup (`expectAbsent`/`upsert`), and unique
+   * index, and an `undelete` mutation step restores it. The TTL reaper always
+   * hard-deletes. Server-enforced; the client only declares it and round-trips
+   * it on the wire as `softDelete: true`, omitted when unset. */
+  softDelete(): TableDefinition<Fields, Indexes> {
+    return new TableDefinition(
+      this.fields,
+      this.indexes,
+      this.ownerFieldName,
+      this.collaboratorsFieldName,
+      this.ttlDef,
+      this.authorizeDef,
+      this.defaultsMap,
+      true,
     );
   }
 
@@ -327,6 +370,9 @@ export class TableDefinition<
     }
     if (this.defaultsMap && Object.keys(this.defaultsMap).length > 0) {
       json.defaults = this.defaultsMap;
+    }
+    if (this.softDeleteFlag) {
+      json.softDelete = true;
     }
     return json;
   }

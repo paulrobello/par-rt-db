@@ -12,7 +12,9 @@ export function formatFieldType(f: FieldTypeJson): string {
     case "any":
       return f.type;
     case "id":
-      return `id<${f.table}>`;
+      // onDelete rides id fields (FM-33); compact suffix matches the index
+      // chips' `FTS·lang` / `VEC·metric` visual language.
+      return f.onDelete ? `id<${f.table}>·${f.onDelete}` : `id<${f.table}>`;
     case "literal":
       return `literal(${JSON.stringify(f.value)})`;
     case "optional":

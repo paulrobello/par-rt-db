@@ -258,7 +258,7 @@ async fn golden_vector_parity() -> anyhow::Result<()> {
 
     for case in &fx.cases {
         let q: Query = serde_json::from_value(case.query.clone()).expect("parse Query");
-        let result = execute_query(&pool, &db, &schema, &q, &PrincipalCtx::bypass())
+        let result = execute_query(&pool, &db, &schema, &q, &PrincipalCtx::bypass(), false)
             .await
             .map_err(|e| anyhow::anyhow!("case {}: {e:?}", case.id))?;
 

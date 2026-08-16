@@ -274,6 +274,7 @@ async fn insert_strips_explicit_null_optional_field() -> anyhow::Result<()> {
             aggregate: None,
         },
         &PrincipalCtx::bypass(),
+        false,
     )
     .await?;
     match query_result {
@@ -1139,6 +1140,7 @@ async fn patch_recomputes_int64_indexed_column() -> anyhow::Result<()> {
             aggregate: None,
         },
         &PrincipalCtx::bypass(),
+        false,
     )
     .await?;
     assert!(matches!(
@@ -1192,6 +1194,7 @@ async fn patch_recomputes_int64_indexed_column() -> anyhow::Result<()> {
             aggregate: None,
         },
         &PrincipalCtx::bypass(),
+        false,
     )
     .await?;
     match post {
@@ -1274,6 +1277,7 @@ async fn replace_recomputes_int64_indexed_column() -> anyhow::Result<()> {
             aggregate: None,
         },
         &PrincipalCtx::bypass(),
+        false,
     )
     .await?;
     match post {
@@ -1612,7 +1616,7 @@ async fn count_by_status(
         vector_search: None,
         hybrid_search: None,
     };
-    match execute_query(pool, db, schema, &q, &PrincipalCtx::bypass()).await? {
+    match execute_query(pool, db, schema, &q, &PrincipalCtx::bypass(), false).await? {
         QueryResult::Count(n) => Ok(n),
         other => panic!("expected Count, got {other:?}"),
     }

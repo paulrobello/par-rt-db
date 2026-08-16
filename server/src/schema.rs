@@ -14,6 +14,20 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use crate::error::RtDbError;
 use crate::query::FilterExpr;
 
+/// Referential action applied to child rows when the referenced parent row is
+/// hard-deleted (FM-33). Carried on the CHILD table's `id` field as an
+/// additive `onDelete` wire key (`cascade` | `restrict` | `setNull`); the
+/// cascade executes app-level inside `execute_txn` (not a SQL FK) so every
+/// cascaded row is a first-class `DocOp`. See
+/// `docs/superpowers/specs/2026-08-16-cascade-delete-soft-delete-design.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum OnDeleteAction {
+    Cascade,
+    Restrict,
+    SetNull,
+}
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase", deny_unknown_fields)]
 pub enum FieldType {
@@ -21,17 +35,39 @@ pub enum FieldType {
     Number,
     Boolean,
     Null,
-    Id { table: String },
-    Literal { value: serde_json::Value },
-    Optional { inner: Box<FieldType> },
-    Union { variants: Vec<FieldType> },
-    Array { element: Box<FieldType> },
-    Object { fields: BTreeMap<String, FieldType> },
+    Id {
+        table: String,
+        /// `onDelete` referential action (FM-33). Legal only on a TOP-LEVEL
+        /// field of the table (`Id` directly, or one `Optional` wrapping an
+        /// `Id`). Omitted on the wire when `None`, so existing schemas
+        /// deserialize unchanged.
+        #[serde(default, rename = "onDelete", skip_serializing_if = "Option::is_none")]
+        on_delete: Option<OnDeleteAction>,
+    },
+    Literal {
+        value: serde_json::Value,
+    },
+    Optional {
+        inner: Box<FieldType>,
+    },
+    Union {
+        variants: Vec<FieldType>,
+    },
+    Array {
+        element: Box<FieldType>,
+    },
+    Object {
+        fields: BTreeMap<String, FieldType>,
+    },
     Int64,
     Bytes,
     Any,
-    Record { value: Box<FieldType> },
-    Vector { dimensions: u32 },
+    Record {
+        value: Box<FieldType>,
+    },
+    Vector {
+        dimensions: u32,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -197,6 +233,50 @@ pub struct TableDef {
     /// without it deserialize unchanged.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub defaults: BTreeMap<String, serde_json::Value>,
+    /// Soft delete (FM-33): `Delete`/`DeleteByQuery` on this table stamp a
+    /// real `deleted_at timestamptz` column (row persists, invisible to every
+    /// read terminal and write lookup) instead of removing the row; unique
+    /// indexes gain `AND "deleted_at" IS NULL` so soft-deleted rows never
+    /// conflict; `Step::Undelete` restores. The TTL reaper still hard-deletes.
+    /// Omitted on the wire when false, so existing schemas deserialize
+    /// unchanged.
+    #[serde(default, rename = "softDelete", skip_serializing_if = "is_false")]
+    pub soft_delete: bool,
+}
+
+/// Strips every `Id` variant's `on_delete` action (recursively through
+/// `Optional`/`Union`/`Array`/`Record`/`Object`), keeping the referenced
+/// `table`. Used by the additive-push comparison (`ddl::detect_destructive_changes`
+/// and the advisory `schema_diff`) so adding or changing `onDelete` on an
+/// existing field is additive, while changing the referenced table is still a
+/// type change. A change to the action alters runtime delete behavior only —
+/// no stored row shape — which is why it is not destructive.
+pub(crate) fn strip_on_delete(ty: &FieldType) -> FieldType {
+    match ty {
+        FieldType::Id { table, .. } => FieldType::Id {
+            table: table.clone(),
+            on_delete: None,
+        },
+        FieldType::Optional { inner } => FieldType::Optional {
+            inner: Box::new(strip_on_delete(inner)),
+        },
+        FieldType::Union { variants } => FieldType::Union {
+            variants: variants.iter().map(strip_on_delete).collect(),
+        },
+        FieldType::Array { element } => FieldType::Array {
+            element: Box::new(strip_on_delete(element)),
+        },
+        FieldType::Object { fields } => FieldType::Object {
+            fields: fields
+                .iter()
+                .map(|(k, v)| (k.clone(), strip_on_delete(v)))
+                .collect(),
+        },
+        FieldType::Record { value } => FieldType::Record {
+            value: Box::new(strip_on_delete(value)),
+        },
+        other => other.clone(),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
@@ -537,6 +617,7 @@ impl TableDef {
         self.validate_indexes(table_name)?;
         self.validate_ttl()?;
         self.validate_defaults(table_name)?;
+        self.validate_on_delete(table_name)?;
         Ok(())
     }
 
@@ -807,6 +888,90 @@ impl TableDef {
         Ok(())
     }
 
+    /// `onDelete` push validation (FM-33). An action is legal only on a
+    /// TOP-LEVEL field in one of two shapes — `Id { on_delete: Some(_) }` or
+    /// `Optional { inner: Id { on_delete: Some(_) } }` (deeper nesting has no
+    /// well-defined "the ref field" to index or null). `setNull` additionally
+    /// requires the `Optional` wrapper (the cleared doc must stay valid — a
+    /// required id field cannot hold null). The field must carry a
+    /// single-field, non-unique, non-partial btree index on it, mirroring the
+    /// ttl rule: the cascade lookup `WHERE f_<field> = $1` must be an index
+    /// scan, and a partial `where` could hide children and orphan them.
+    /// Referenced-table existence needs whole-schema access and is checked in
+    /// [`SchemaDef::validate`]'s second pass. Self-reference is legal.
+    fn validate_on_delete(&self, table_name: &str) -> Result<(), RtDbError> {
+        for (field_name, field_type) in &self.fields {
+            // Resolve the (optional) top-level shape; anything else with an
+            // action embedded deeper is rejected below by the walker.
+            let (action, is_optional) = match field_type {
+                FieldType::Id { on_delete, .. } => (*on_delete, false),
+                FieldType::Optional { inner } => match &**inner {
+                    FieldType::Id { on_delete, .. } => (*on_delete, true),
+                    _ => {
+                        // No top-level action here — but an action nested
+                        // deeper (union/object/array/deeper optional) is
+                        // illegal.
+                        if self.field_has_nested_on_delete(field_type) {
+                            return Err(RtDbError::schema(format!(
+                                "field '{field_name}' on table '{table_name}': onDelete is legal only on a top-level id or optional-id field"
+                            )));
+                        }
+                        continue;
+                    }
+                },
+                _ => {
+                    if self.field_has_nested_on_delete(field_type) {
+                        return Err(RtDbError::schema(format!(
+                            "field '{field_name}' on table '{table_name}': onDelete is legal only on a top-level id or optional-id field"
+                        )));
+                    }
+                    continue;
+                }
+            };
+            let Some(action) = action else {
+                continue;
+            };
+            if action == OnDeleteAction::SetNull && !is_optional {
+                return Err(RtDbError::schema(format!(
+                    "field '{field_name}' on table '{table_name}': onDelete 'setNull' requires the id field to be optional"
+                )));
+            }
+            let has_ref_index = self.indexes.iter().any(|idx| {
+                !idx.search
+                    && idx.vector.is_none()
+                    && !idx.unique
+                    && idx.r#where.is_none()
+                    && idx.fields.len() == 1
+                    && idx.fields[0] == *field_name
+            });
+            if !has_ref_index {
+                return Err(RtDbError::schema(format!(
+                    "onDelete field '{field_name}' on table '{table_name}' requires a single-field, non-unique, non-partial btree index on it"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether any `Id` variant reachable through the type's compositors
+    /// carries an `onDelete` action — used to reject actions nested deeper
+    /// than the two legal top-level shapes.
+    fn field_has_nested_on_delete(&self, ty: &FieldType) -> bool {
+        match ty {
+            FieldType::Id { on_delete, .. } => on_delete.is_some(),
+            FieldType::Optional { inner }
+            | FieldType::Array { element: inner }
+            | FieldType::Record { value: inner } => self.field_has_nested_on_delete(inner),
+            FieldType::Union { variants } => {
+                variants.iter().any(|v| self.field_has_nested_on_delete(v))
+            }
+            FieldType::Object { fields } => {
+                fields.values().any(|v| self.field_has_nested_on_delete(v))
+            }
+            _ => false,
+        }
+    }
+
     pub fn index(&self, name: &str) -> Result<&IndexDef, RtDbError> {
         self.indexes
             .iter()
@@ -834,6 +999,33 @@ impl SchemaDef {
                 )));
             }
             table_def.validate_structure(table_name)?;
+        }
+        // FM-33 second pass (needs whole-schema access): every top-level
+        // `onDelete` id field must reference a table declared in this schema.
+        for (table_name, table_def) in &self.tables {
+            for (field_name, field_type) in &table_def.fields {
+                let ref_table = match field_type {
+                    FieldType::Id {
+                        table,
+                        on_delete: Some(_),
+                    } => Some(table),
+                    FieldType::Optional { inner } => match &**inner {
+                        FieldType::Id {
+                            table,
+                            on_delete: Some(_),
+                        } => Some(table),
+                        _ => continue,
+                    },
+                    _ => continue,
+                };
+                if let Some(ref_table) = ref_table
+                    && !self.tables.contains_key(ref_table)
+                {
+                    return Err(RtDbError::schema(format!(
+                        "onDelete field '{field_name}' on table '{table_name}' references unknown table '{ref_table}'"
+                    )));
+                }
+            }
         }
         Ok(())
     }
@@ -1009,6 +1201,8 @@ mod tests {
             collaborators_field: None,
             ttl: None,
             authorize: None,
+
+            soft_delete: false,
         }
     }
 
@@ -1059,6 +1253,8 @@ mod tests {
             collaborators_field: None,
             ttl: None,
             authorize: None,
+
+            soft_delete: false,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -1095,6 +1291,8 @@ mod tests {
             collaborators_field: None,
             ttl: None,
             authorize: None,
+
+            soft_delete: false,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -1113,6 +1311,8 @@ mod tests {
             collaborators_field: None,
             ttl: None,
             authorize: None,
+
+            soft_delete: false,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -1139,6 +1339,8 @@ mod tests {
             collaborators_field: None,
             ttl: None,
             authorize: None,
+
+            soft_delete: false,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -1165,6 +1367,8 @@ mod tests {
             collaborators_field: None,
             ttl: None,
             authorize: None,
+
+            soft_delete: false,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -1185,6 +1389,8 @@ mod tests {
             collaborators_field: None,
             ttl: None,
             authorize: None,
+
+            soft_delete: false,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -1221,6 +1427,8 @@ mod tests {
             collaborators_field: None,
             ttl: None,
             authorize: None,
+
+            soft_delete: false,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -1238,6 +1446,8 @@ mod tests {
             collaborators_field: None,
             ttl: None,
             authorize: None,
+
+            soft_delete: false,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -1281,6 +1491,8 @@ mod tests {
             collaborators_field: None,
             ttl: None,
             authorize: None,
+
+            soft_delete: false,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -1306,6 +1518,8 @@ mod tests {
             collaborators_field: None,
             ttl: None,
             authorize: None,
+
+            soft_delete: false,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -1331,6 +1545,8 @@ mod tests {
             collaborators_field: None,
             ttl: None,
             authorize: None,
+
+            soft_delete: false,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -1367,6 +1583,8 @@ mod tests {
             collaborators_field: None,
             ttl: None,
             authorize: None,
+
+            soft_delete: false,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -1392,6 +1610,8 @@ mod tests {
             collaborators_field: None,
             ttl: None,
             authorize: None,
+
+            soft_delete: false,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -1417,6 +1637,8 @@ mod tests {
             collaborators_field: None,
             ttl: None,
             authorize: None,
+
+            soft_delete: false,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -1439,6 +1661,8 @@ mod tests {
             collaborators_field: None,
             ttl: None,
             authorize: None,
+
+            soft_delete: false,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -1456,6 +1680,8 @@ mod tests {
             collaborators_field: None,
             ttl: None,
             authorize: None,
+
+            soft_delete: false,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -1480,6 +1706,8 @@ mod tests {
             collaborators_field: None,
             ttl: None,
             authorize: None,
+
+            soft_delete: false,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -1508,7 +1736,8 @@ mod tests {
         );
         assert_eq!(
             indexed_column_type(&FieldType::Id {
-                table: "projects".to_string()
+                table: "projects".to_string(),
+                on_delete: None,
             })
             .unwrap(),
             ("text", false)
@@ -1618,6 +1847,7 @@ mod tests {
     fn validate_value_id_requires_32_lowercase_hex_chars() {
         let ty = FieldType::Id {
             table: "projects".to_string(),
+            on_delete: None,
         };
         assert!(validate_value(
             &ty,
@@ -1685,6 +1915,8 @@ mod tests {
             collaborators_field: None,
             ttl: None,
             authorize: None,
+
+            soft_delete: false,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -1787,6 +2019,8 @@ mod tests {
             collaborators_field: None,
             ttl: None,
             authorize: None,
+
+            soft_delete: false,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -1847,6 +2081,8 @@ mod tests {
             collaborators_field: None,
             ttl: None,
             authorize: None,
+
+            soft_delete: false,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -1877,6 +2113,8 @@ mod tests {
             collaborators_field: None,
             ttl: None,
             authorize: None,
+
+            soft_delete: false,
         };
         let schema = SchemaDef {
             tables: BTreeMap::from([("items".to_string(), table)]),
@@ -1977,6 +2215,8 @@ mod tests {
             collaborators_field: None,
             ttl: None,
             authorize: None,
+
+            soft_delete: false,
         };
         assert!(table.validate_structure("docs").is_err());
     }
@@ -2006,6 +2246,8 @@ mod tests {
             collaborators_field: None,
             ttl: None,
             authorize: None,
+
+            soft_delete: false,
         };
         assert!(table.validate_structure("docs").is_ok());
     }
@@ -2034,6 +2276,8 @@ mod tests {
             collaborators_field: None,
             ttl: None,
             authorize: None,
+
+            soft_delete: false,
         };
         assert!(table.validate_structure("docs").is_err());
     }
@@ -2064,6 +2308,8 @@ mod tests {
             collaborators_field: None,
             ttl: None,
             authorize: None,
+
+            soft_delete: false,
         };
         assert!(table.validate_structure("docs").is_err());
     }
@@ -2093,6 +2339,8 @@ mod tests {
             collaborators_field: None,
             ttl: None,
             authorize: None,
+
+            soft_delete: false,
         };
         assert!(table.validate_structure("docs").is_err());
     }
@@ -2121,6 +2369,8 @@ mod tests {
             collaborators_field: None,
             ttl: None,
             authorize: None,
+
+            soft_delete: false,
         };
         assert!(table.validate_structure("docs").is_err());
     }
@@ -2149,6 +2399,8 @@ mod tests {
             collaborators_field: None,
             ttl: None,
             authorize: None,
+
+            soft_delete: false,
         };
         assert!(table.validate_structure("docs").is_err());
     }
@@ -2183,6 +2435,8 @@ mod tests {
             collaborators_field: None,
             ttl: None,
             authorize: None,
+
+            soft_delete: false,
         };
         assert!(table.validate_structure("docs").is_err());
     }
@@ -2426,6 +2680,8 @@ mod tests {
             collaborators_field: None,
             ttl,
             authorize: None,
+
+            soft_delete: false,
         }
     }
 
@@ -2558,6 +2814,8 @@ mod tests {
             collaborators_field: None,
             ttl: None,
             authorize: None,
+
+            soft_delete: false,
         }
     }
 

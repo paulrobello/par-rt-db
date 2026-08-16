@@ -111,7 +111,7 @@ async fn compile_query_collect_eq_prefix_yields_expected_sql() -> anyhow::Result
         serde_json::from_value(kanban_schema_json()).expect("parse kanban schema");
     let q = projects_query_by_status("active");
     let principal_ctx = PrincipalCtx::bypass();
-    let (cq, warnings) = compile_query(db.as_str(), &schema, &q, &principal_ctx)?;
+    let (cq, warnings) = compile_query(db.as_str(), &schema, &q, &principal_ctx, false)?;
     // No filter, no unindexed field references — warnings empty.
     assert!(
         warnings.is_empty(),
@@ -159,7 +159,7 @@ async fn compile_query_get_yields_point_read_sql() -> anyhow::Result<()> {
     }))
     .expect("parse get query");
     let principal_ctx = PrincipalCtx::bypass();
-    let (cq, _warnings) = compile_query(db.as_str(), &schema, &q, &principal_ctx)?;
+    let (cq, _warnings) = compile_query(db.as_str(), &schema, &q, &principal_ctx, false)?;
     assert_eq!(cq.terminal, "get");
     assert!(
         cq.sql.contains("WHERE \"id\" = $1"),
@@ -186,7 +186,7 @@ async fn compile_query_count_yields_count_sql() -> anyhow::Result<()> {
     let mut q = projects_query_by_status("active");
     q.count = true;
     let principal_ctx = PrincipalCtx::bypass();
-    let (cq, _warnings) = compile_query(db.as_str(), &schema, &q, &principal_ctx)?;
+    let (cq, _warnings) = compile_query(db.as_str(), &schema, &q, &principal_ctx, false)?;
     assert_eq!(cq.terminal, "count");
     assert!(
         cq.sql.contains("COUNT(*)"),
@@ -434,7 +434,7 @@ async fn compile_and_execute_share_one_sql_path() -> anyhow::Result<()> {
     }))
     .expect("parse get query");
     let ctx = PrincipalCtx::bypass();
-    let result = execute_query(&pool, db.as_str(), &schema, &q_get, &ctx).await?;
+    let result = execute_query(&pool, db.as_str(), &schema, &q_get, &ctx, false).await?;
     assert!(
         matches!(result, rtdb_server::query::QueryResult::Doc(None)),
         "expected the compiled point-read to execute and find no row, got {result:?}"
@@ -446,7 +446,7 @@ async fn compile_and_execute_share_one_sql_path() -> anyhow::Result<()> {
     // execute path interpolated literals while compile emitted placeholders, the
     // two strings would differ AND reintroduce the injection surface.
     let q_eq = projects_query_by_status("a-distinctive-eq-value-not-in-sql");
-    let (cq, _warnings) = compile_query(db.as_str(), &schema, &q_eq, &ctx)?;
+    let (cq, _warnings) = compile_query(db.as_str(), &schema, &q_eq, &ctx, false)?;
     assert!(
         cq.sql.contains("$1"),
         "expected $1 placeholder in compiled SQL, got: {}",

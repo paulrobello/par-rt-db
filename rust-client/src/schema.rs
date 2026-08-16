@@ -5,6 +5,20 @@ use std::collections::BTreeMap;
 
 use crate::wire::FilterExpr;
 
+/// Referential action applied to child rows when the referenced parent row is
+/// hard-deleted (FM-33). Carried on the CHILD table's `id` field as an
+/// additive `onDelete` wire key (`cascade` | `restrict` | `setNull`); the
+/// cascade executes app-level inside the server's `execute_txn` (not a SQL
+/// FK) so every cascaded row is a first-class op. Mirrors
+/// `server/src/schema.rs::OnDeleteAction` byte-for-byte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum OnDeleteAction {
+    Cascade,
+    Restrict,
+    SetNull,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase", deny_unknown_fields)]
 pub enum FieldType {
@@ -12,24 +26,60 @@ pub enum FieldType {
     Number,
     Boolean,
     Null,
-    Id { table: String },
-    Literal { value: serde_json::Value },
-    Optional { inner: Box<FieldType> },
-    Union { variants: Vec<FieldType> },
-    Array { element: Box<FieldType> },
-    Object { fields: BTreeMap<String, FieldType> },
+    Id {
+        table: String,
+        /// `onDelete` referential action (FM-33). Legal only on a TOP-LEVEL
+        /// field of the table (`Id` directly, or one `Optional` wrapping an
+        /// `Id`; server push validation enforces this). Omitted on the wire
+        /// when `None`, so existing schemas deserialize unchanged. Mirrors
+        /// `server/src/schema.rs::FieldType` byte-for-byte.
+        #[serde(default, rename = "onDelete", skip_serializing_if = "Option::is_none")]
+        on_delete: Option<OnDeleteAction>,
+    },
+    Literal {
+        value: serde_json::Value,
+    },
+    Optional {
+        inner: Box<FieldType>,
+    },
+    Union {
+        variants: Vec<FieldType>,
+    },
+    Array {
+        element: Box<FieldType>,
+    },
+    Object {
+        fields: BTreeMap<String, FieldType>,
+    },
     Int64,
     Bytes,
     Any,
-    Record { value: Box<FieldType> },
-    Vector { dimensions: u32 },
+    Record {
+        value: Box<FieldType>,
+    },
+    Vector {
+        dimensions: u32,
+    },
 }
 
 impl FieldType {
     pub fn id(table: &str) -> Self {
         FieldType::Id {
             table: table.into(),
+            on_delete: None,
         }
+    }
+    /// Declare the `onDelete` referential action on an id field (FM-33):
+    /// `.on_delete(OnDeleteAction::Cascade)` after `FieldType::id(table)`.
+    /// Mirrors the TS client's chainable `.onDelete(action)`. Only the `Id`
+    /// variant carries the action — on any other variant this is a no-op
+    /// (server push validation rejects a mis-placed `onDelete` anyway, and
+    /// only a top-level `Id` or `Optional<Id>` is legal).
+    pub fn on_delete(mut self, action: OnDeleteAction) -> Self {
+        if let FieldType::Id { on_delete, .. } = &mut self {
+            *on_delete = Some(action);
+        }
+        self
     }
     pub fn optional(inner: FieldType) -> Self {
         FieldType::Optional {
@@ -99,6 +149,42 @@ fn literal_set(ty: &FieldType) -> Option<Vec<&serde_json::Value>> {
             }
         }
         _ => None,
+    }
+}
+
+/// Recursively strips every `Id`'s `on_delete` action from `ty`, keeping the
+/// referenced `table` (FM-33). Used by the in-memory harness's
+/// `detect_destructive_changes` (mirroring `server/src/ddl.rs`): adding or
+/// changing an `onDelete` action alters runtime delete behavior only (no
+/// stored row shape), so it is additive, while changing the referenced table
+/// is still a type change. Public for the same reason as
+/// [`is_widening_of`]: its only in-crate consumer is the `in_memory` feature,
+/// and `pub` keeps the feature-less lib build free of dead-code warnings.
+pub fn strip_on_delete(ty: &FieldType) -> FieldType {
+    match ty {
+        FieldType::Id { table, .. } => FieldType::Id {
+            table: table.clone(),
+            on_delete: None,
+        },
+        FieldType::Optional { inner } => FieldType::Optional {
+            inner: Box::new(strip_on_delete(inner)),
+        },
+        FieldType::Union { variants } => FieldType::Union {
+            variants: variants.iter().map(strip_on_delete).collect(),
+        },
+        FieldType::Array { element } => FieldType::Array {
+            element: Box::new(strip_on_delete(element)),
+        },
+        FieldType::Object { fields } => FieldType::Object {
+            fields: fields
+                .iter()
+                .map(|(k, v)| (k.clone(), strip_on_delete(v)))
+                .collect(),
+        },
+        FieldType::Record { value } => FieldType::Record {
+            value: Box::new(strip_on_delete(value)),
+        },
+        other => other.clone(),
     }
 }
 
@@ -251,6 +337,14 @@ pub struct TableDef {
     /// `server/src/schema.rs::TableDef` byte-for-byte.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub defaults: BTreeMap<String, serde_json::Value>,
+    /// Soft delete (FM-33): `Delete`/`DeleteByQuery` rows on this table are
+    /// STAMPED (`deleted_at`) instead of removed — invisible to every read and
+    /// write lookup, restorable via the `undelete` mutation step, physically
+    /// removed only by the TTL reaper. Omitted on the wire when false, so
+    /// existing schemas deserialize unchanged. Mirrors
+    /// `server/src/schema.rs::TableDef` byte-for-byte.
+    #[serde(default, rename = "softDelete", skip_serializing_if = "is_false")]
+    pub soft_delete: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -269,6 +363,7 @@ pub struct TableBuilder {
     ttl: Option<TtlDef>,
     authorize: Option<FilterExpr>,
     defaults: BTreeMap<String, serde_json::Value>,
+    soft_delete: bool,
     /// Index of the most recently pushed [`IndexDef`] in [`Self::indexes`], so
     /// the chainable `.unique()` / `.where_clause()` setters can configure it
     /// after `index`/`search_index`/`vector_index` returned `self`. `None`
@@ -286,6 +381,7 @@ impl TableBuilder {
             ttl: None,
             authorize: None,
             defaults: BTreeMap::new(),
+            soft_delete: false,
             last_index: None,
         }
     }
@@ -438,6 +534,16 @@ impl TableBuilder {
         }
         self
     }
+
+    /// Declare soft delete (FM-33): rows on this table are stamped
+    /// (`deleted_at`) instead of removed on delete — invisible to every read
+    /// and write lookup, restorable via the `undelete` mutation step. Mirrors
+    /// the TS client's chainable `.softDelete()`; round-trips on the wire as
+    /// `softDelete: true` (omitted when false).
+    pub fn soft_delete(mut self) -> Self {
+        self.soft_delete = true;
+        self
+    }
     fn finish(self) -> TableDef {
         let indexes = if self.indexes.is_empty() {
             None
@@ -452,6 +558,7 @@ impl TableBuilder {
             ttl: self.ttl,
             authorize: self.authorize,
             defaults: self.defaults,
+            soft_delete: self.soft_delete,
         }
     }
 }
@@ -515,7 +622,8 @@ mod tests {
         );
         assert_eq!(
             serde_json::to_value(FieldType::Id {
-                table: "projects".into()
+                table: "projects".into(),
+                on_delete: None,
             })
             .unwrap(),
             json!({"type":"id","table":"projects"})
@@ -970,6 +1078,164 @@ mod tests {
         let legacy = json!({"fields": {"title": {"type": "string"}}});
         let from_legacy: TableDef = serde_json::from_value(legacy).unwrap();
         assert!(from_legacy.defaults.is_empty());
+    }
+
+    #[test]
+    fn on_delete_serializes_and_round_trips() {
+        // FM-33: `onDelete` rides on the id field — camelCase action tags
+        // (`cascade` | `restrict` | `setNull`), present only when set, mirroring
+        // `server/src/schema.rs::FieldType` byte-for-byte. A plain
+        // `FieldType::id(...)` and a legacy wire payload both stay `None`, so
+        // existing schemas serialize/deserialize unchanged.
+        for (action, wire) in [
+            (OnDeleteAction::Cascade, "cascade"),
+            (OnDeleteAction::Restrict, "restrict"),
+            (OnDeleteAction::SetNull, "setNull"),
+        ] {
+            let v = serde_json::to_value(FieldType::id("projects").on_delete(action)).unwrap();
+            assert_eq!(
+                v,
+                json!({"type":"id","table":"projects","onDelete":wire}),
+                "action {wire:?} must serialize as the camelCase wire tag"
+            );
+            // Round-trips back through the wire type.
+            let back: FieldType = serde_json::from_value(v).unwrap();
+            assert_eq!(back, FieldType::id("projects").on_delete(action));
+        }
+
+        // `None` omits the key entirely (not serialized as null).
+        let none = serde_json::to_value(FieldType::id("projects")).unwrap();
+        assert_eq!(none, json!({"type":"id","table":"projects"}));
+
+        // setNull composes with the `Optional` wrapper — the legal shape for a
+        // nullable reference (server push validation requires the wrapper).
+        let optional =
+            FieldType::optional(FieldType::id("projects").on_delete(OnDeleteAction::SetNull));
+        let v = serde_json::to_value(&optional).unwrap();
+        assert_eq!(
+            v,
+            json!({"type":"optional","inner":{"type":"id","table":"projects","onDelete":"setNull"}})
+        );
+        let back: FieldType = serde_json::from_value(v).unwrap();
+        assert_eq!(back, optional);
+    }
+
+    #[test]
+    fn on_delete_builder_is_additive_and_noop_off_id() {
+        // `.on_delete(...)` chains after `FieldType::id(...)` without disturbing
+        // existing call sites, and no-ops on a non-Id variant (server push
+        // validation rejects a misplaced onDelete anyway).
+        let with = FieldType::id("projects").on_delete(OnDeleteAction::Cascade);
+        assert_eq!(
+            with,
+            FieldType::Id {
+                table: "projects".into(),
+                on_delete: Some(OnDeleteAction::Cascade),
+            }
+        );
+        // Calling it twice overwrites (last wins), matching a struct-field set.
+        let swapped = FieldType::id("projects")
+            .on_delete(OnDeleteAction::Cascade)
+            .on_delete(OnDeleteAction::Restrict);
+        assert_eq!(
+            swapped,
+            FieldType::Id {
+                table: "projects".into(),
+                on_delete: Some(OnDeleteAction::Restrict),
+            }
+        );
+        // A non-Id variant passes through unchanged.
+        let passthrough = FieldType::optional(FieldType::String).on_delete(OnDeleteAction::Cascade);
+        assert_eq!(passthrough, FieldType::optional(FieldType::String));
+    }
+
+    #[test]
+    fn soft_delete_serializes_and_round_trips() {
+        // FM-33: `softDelete` is a table flag — present (camelCase) when true,
+        // omitted entirely when false, mirroring `server/src/schema.rs::TableDef`
+        // byte-for-byte. A legacy payload without the key deserializes to false.
+        let td = Table::new()
+            .field("title", FieldType::String)
+            .soft_delete()
+            .finish();
+        let v = serde_json::to_value(&td).unwrap();
+        assert_eq!(v["softDelete"], json!(true));
+        // Round-trips back through the wire type.
+        let back: TableDef = serde_json::from_value(v).unwrap();
+        assert!(back.soft_delete);
+        // False -> omitted entirely (not serialized as null or false).
+        let none = Table::new().field("title", FieldType::String).finish();
+        let none_json = serde_json::to_string(&none).unwrap();
+        assert!(
+            !none_json.contains("softDelete"),
+            "softDelete must be omitted on the wire when false"
+        );
+        let from_none: TableDef = serde_json::from_str(&none_json).unwrap();
+        assert!(!from_none.soft_delete);
+        // A table that never carried a `softDelete` key (legacy wire payload)
+        // deserializes to false.
+        let legacy = json!({"fields": {"title": {"type": "string"}}});
+        let from_legacy: TableDef = serde_json::from_value(legacy).unwrap();
+        assert!(!from_legacy.soft_delete);
+    }
+
+    #[test]
+    fn strip_on_delete_removes_actions_keeps_tables() {
+        // FM-33: strip every Id's onDelete recursively (through
+        // Optional/Union/Array/Object/Record) while keeping the referenced
+        // table — the harness's detect_destructive_changes compares
+        // stripped types so adding/changing an action is additive.
+        let ty = FieldType::Object {
+            fields: BTreeMap::from([
+                (
+                    "parent".into(),
+                    FieldType::optional(
+                        FieldType::id("projects").on_delete(OnDeleteAction::SetNull),
+                    ),
+                ),
+                (
+                    "aliases".into(),
+                    FieldType::Array {
+                        element: Box::new(
+                            FieldType::id("users").on_delete(OnDeleteAction::Cascade),
+                        ),
+                    },
+                ),
+                ("plain".into(), FieldType::id("teams")),
+                ("name".into(), FieldType::String),
+            ]),
+        };
+        let stripped = strip_on_delete(&ty);
+        assert_eq!(
+            stripped,
+            FieldType::Object {
+                fields: BTreeMap::from([
+                    (
+                        "parent".into(),
+                        FieldType::optional(FieldType::id("projects")),
+                    ),
+                    (
+                        "aliases".into(),
+                        FieldType::Array {
+                            element: Box::new(FieldType::id("users")),
+                        },
+                    ),
+                    ("plain".into(), FieldType::id("teams")),
+                    ("name".into(), FieldType::String),
+                ]),
+            },
+            "every Id keeps its table but loses the action"
+        );
+        // Stripping is idempotent, and a differing ACTION strips to equal
+        // while a differing TABLE does not (that stays a type change).
+        assert_eq!(strip_on_delete(&stripped), stripped);
+        let cascade = FieldType::id("projects").on_delete(OnDeleteAction::Cascade);
+        let restrict = FieldType::id("projects").on_delete(OnDeleteAction::Restrict);
+        assert_eq!(strip_on_delete(&cascade), strip_on_delete(&restrict));
+        assert_ne!(
+            strip_on_delete(&cascade),
+            strip_on_delete(&FieldType::id("users"))
+        );
     }
 
     #[test]

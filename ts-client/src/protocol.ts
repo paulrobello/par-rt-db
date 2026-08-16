@@ -237,6 +237,13 @@ export type BatchQueryOutcomeJson =
   | { ok: true; result: unknown }
   | { ok: false; error: { code: string; message: string } };
 
+/** Referential action applied to child rows when the referenced parent row is
+ * hard-deleted (FM-33). Carried on the CHILD table's `id` field as an additive
+ * `onDelete` wire key; the cascade executes app-level on the server (not a SQL
+ * FK) so every cascaded row is a first-class op-feed entry. Mirrors server
+ * `schema::OnDeleteAction` (camelCase wire values). */
+export type OnDeleteAction = "cascade" | "restrict" | "setNull";
+
 /** Mirrors server `txn::Step` (tag `op`, camelCase; document steps carry
  * `table`, the control-flow steps — `schedule`/`cancelSchedule` (FM-28) and
  * `startWorkflow`/`cancelWorkflow` (FM-29) — do not). */
@@ -245,6 +252,7 @@ export type StepJson =
   | { op: "patch"; table: string; id: string; fields: Record<string, unknown> }
   | { op: "replace"; table: string; id: string; doc: Record<string, unknown> }
   | { op: "delete"; table: string; id: string }
+  | { op: "undelete"; table: string; id: string }
   | { op: "expectVersion"; table: string; id: string; version: number }
   | { op: "expectAbsent"; table: string; index: string; eq: unknown[] }
   | {
@@ -489,7 +497,7 @@ export type FieldTypeJson =
   | { type: "number" }
   | { type: "boolean" }
   | { type: "null" }
-  | { type: "id"; table: string }
+  | { type: "id"; table: string; onDelete?: OnDeleteAction }
   | { type: "literal"; value: string | number | boolean }
   | { type: "optional"; inner: FieldTypeJson }
   | { type: "union"; variants: FieldTypeJson[] }
@@ -580,6 +588,12 @@ export interface TableJson {
    * clients only declare it. Omitted on the wire when the table declares
    * none. */
   defaults?: Record<string, unknown>;
+  /** Opt-in soft delete (FM-33): `delete`/`deleteByQuery` stamp an internal
+   * `deleted_at` instead of removing the row — the row becomes invisible to
+   * every read terminal, eq-lookup, and unique index, and an `undelete` step
+   * restores it. `true` only; omitted on the wire when false. Server-enforced;
+   * clients only declare it. */
+  softDelete?: boolean;
 }
 
 export interface SchemaJson {

@@ -53,6 +53,7 @@ fn vector_schema_with_metric(dim: u32, with_filter: bool, metric: DistanceMetric
             collaborators_field: None,
             ttl: None,
             authorize: None,
+            soft_delete: false,
         },
     );
     SchemaDef { tables }
@@ -351,9 +352,16 @@ async fn vector_search_ranks_by_cosine_and_applies_limit() {
         "vectorSearch": {"index": "by_embedding", "vector": [1.0, 0.0, 0.0], "limit": 2}
     }))
     .expect("parse vectorSearch query");
-    let res = execute_query(&state.pool, &db, &schema, &q, &PrincipalCtx::bypass())
-        .await
-        .expect("execute vectorSearch");
+    let res = execute_query(
+        &state.pool,
+        &db,
+        &schema,
+        &q,
+        &PrincipalCtx::bypass(),
+        false,
+    )
+    .await
+    .expect("execute vectorSearch");
     let docs = match res {
         QueryResult::Docs(d) => d,
         _ => panic!("expected Docs"),
@@ -383,9 +391,16 @@ async fn vector_search_rejects_length_mismatch() {
         "vectorSearch": {"index": "by_embedding", "vector": [1.0, 0.0], "limit": 1}
     }))
     .expect("parse vectorSearch query");
-    let err = execute_query(&state.pool, &db, &schema, &q, &PrincipalCtx::bypass())
-        .await
-        .expect_err("length mismatch should be rejected");
+    let err = execute_query(
+        &state.pool,
+        &db,
+        &schema,
+        &q,
+        &PrincipalCtx::bypass(),
+        false,
+    )
+    .await
+    .expect_err("length mismatch should be rejected");
     assert!(
         err.message.contains("dimensions"),
         "message names dimensions: {}",
@@ -414,9 +429,16 @@ async fn vector_search_rejects_non_finite_query_vector() {
             }),
             ..empty_query()
         };
-        let err = execute_query(&state.pool, &db, &schema, &q, &PrincipalCtx::bypass())
-            .await
-            .expect_err("non-finite query vector should be rejected");
+        let err = execute_query(
+            &state.pool,
+            &db,
+            &schema,
+            &q,
+            &PrincipalCtx::bypass(),
+            false,
+        )
+        .await
+        .expect_err("non-finite query vector should be rejected");
         assert_eq!(
             err.code,
             ErrorCode::BadRequest,
@@ -470,9 +492,16 @@ async fn vector_search_rejects_unknown_index() {
         "vectorSearch": {"index": "nope", "vector": [1.0, 0.0, 0.0], "limit": 1}
     }))
     .expect("parse vectorSearch query");
-    let err = execute_query(&state.pool, &db, &schema, &q, &PrincipalCtx::bypass())
-        .await
-        .expect_err("unknown index should be rejected");
+    let err = execute_query(
+        &state.pool,
+        &db,
+        &schema,
+        &q,
+        &PrincipalCtx::bypass(),
+        false,
+    )
+    .await
+    .expect_err("unknown index should be rejected");
     assert!(
         err.message.contains("vector index 'nope' not found"),
         "message names the missing index: {}",
@@ -492,9 +521,16 @@ async fn vector_search_rejects_out_of_range_limit() {
         "vectorSearch": {"index": "by_embedding", "vector": [1.0, 0.0, 0.0], "limit": 0}
     }))
     .expect("parse vectorSearch query");
-    let err = execute_query(&state.pool, &db, &schema, &q, &PrincipalCtx::bypass())
-        .await
-        .expect_err("limit < 1 should be rejected");
+    let err = execute_query(
+        &state.pool,
+        &db,
+        &schema,
+        &q,
+        &PrincipalCtx::bypass(),
+        false,
+    )
+    .await
+    .expect_err("limit < 1 should be rejected");
     assert!(
         err.message.contains("vectorSearch limit"),
         "message names the limit cap: {}",
@@ -505,9 +541,16 @@ async fn vector_search_rejects_out_of_range_limit() {
         "vectorSearch": {"index": "by_embedding", "vector": [1.0, 0.0, 0.0], "limit": 257}
     }))
     .expect("parse vectorSearch query");
-    let err = execute_query(&state.pool, &db, &schema, &q_hi, &PrincipalCtx::bypass())
-        .await
-        .expect_err("limit > 256 should be rejected");
+    let err = execute_query(
+        &state.pool,
+        &db,
+        &schema,
+        &q_hi,
+        &PrincipalCtx::bypass(),
+        false,
+    )
+    .await
+    .expect_err("limit > 256 should be rejected");
     assert!(
         err.message.contains("vectorSearch limit"),
         "message names the limit cap: {}",
@@ -558,9 +601,16 @@ async fn vector_search_applies_eq_filter() {
         }
     }))
     .expect("parse vectorSearch query");
-    let res = execute_query(&state.pool, &db, &schema, &q, &PrincipalCtx::bypass())
-        .await
-        .expect("execute vectorSearch with filter");
+    let res = execute_query(
+        &state.pool,
+        &db,
+        &schema,
+        &q,
+        &PrincipalCtx::bypass(),
+        false,
+    )
+    .await
+    .expect("execute vectorSearch with filter");
     let docs = match res {
         QueryResult::Docs(d) => d,
         _ => panic!("expected Docs"),
@@ -583,9 +633,16 @@ async fn vector_search_rejects_combination_with_take() {
         "take": 5
     }))
     .expect("parse vectorSearch query");
-    let err = execute_query(&state.pool, &db, &schema, &q, &PrincipalCtx::bypass())
-        .await
-        .expect_err("vectorSearch + take should be rejected");
+    let err = execute_query(
+        &state.pool,
+        &db,
+        &schema,
+        &q,
+        &PrincipalCtx::bypass(),
+        false,
+    )
+    .await
+    .expect_err("vectorSearch + take should be rejected");
     assert!(
         err.message.contains("cannot be combined"),
         "message calls out the combination: {}",
@@ -733,7 +790,7 @@ async fn hybrid_search_fuses_text_and_vector_via_rrf() {
         }
     }))
     .expect("parse hybridSearch query");
-    let res = execute_query(pool, &db, &schema, &q, &PrincipalCtx::bypass())
+    let res = execute_query(pool, &db, &schema, &q, &PrincipalCtx::bypass(), false)
         .await
         .expect("execute hybridSearch");
     let docs = match res {
@@ -776,7 +833,7 @@ async fn hybrid_search_auto_selects_and_names_indexes() {
         "hybridSearch": {"query": "database", "vector": [1.0, 0.0, 0.0], "limit": 5}
     }))
     .expect("parse auto hybridSearch");
-    let res = execute_query(pool, &db, &schema, &q, &PrincipalCtx::bypass())
+    let res = execute_query(pool, &db, &schema, &q, &PrincipalCtx::bypass(), false)
         .await
         .expect("auto-select hybridSearch");
     assert!(matches!(res, QueryResult::Docs(_)));
@@ -792,7 +849,7 @@ async fn hybrid_search_auto_selects_and_names_indexes() {
         }
     }))
     .expect("parse named hybridSearch");
-    let res = execute_query(pool, &db, &schema, &q, &PrincipalCtx::bypass())
+    let res = execute_query(pool, &db, &schema, &q, &PrincipalCtx::bypass(), false)
         .await
         .expect("named hybridSearch");
     assert!(matches!(res, QueryResult::Docs(_)));
@@ -806,7 +863,7 @@ async fn hybrid_search_auto_selects_and_names_indexes() {
         }
     }))
     .expect("parse bad-search-index hybridSearch");
-    let err = execute_query(pool, &db, &schema, &q, &PrincipalCtx::bypass())
+    let err = execute_query(pool, &db, &schema, &q, &PrincipalCtx::bypass(), false)
         .await
         .expect_err("unknown search index rejected");
     assert_eq!(err.code, ErrorCode::BadRequest);
@@ -823,9 +880,16 @@ async fn hybrid_search_requires_a_search_index() {
         "hybridSearch": {"query": "database", "vector": [1.0, 0.0, 0.0], "limit": 5}
     }))
     .expect("parse hybridSearch");
-    let err = execute_query(&state.pool, &db, &schema, &q, &PrincipalCtx::bypass())
-        .await
-        .expect_err("missing search index rejected");
+    let err = execute_query(
+        &state.pool,
+        &db,
+        &schema,
+        &q,
+        &PrincipalCtx::bypass(),
+        false,
+    )
+    .await
+    .expect_err("missing search index rejected");
     assert_eq!(err.code, ErrorCode::BadRequest);
     assert!(
         err.message.contains("search index"),
@@ -860,9 +924,16 @@ async fn hybrid_search_requires_a_vector_index() {
         "hybridSearch": {"query": "database", "vector": [1.0, 0.0, 0.0], "limit": 5}
     }))
     .expect("parse hybridSearch");
-    let err = execute_query(&state.pool, &name, &schema, &q, &PrincipalCtx::bypass())
-        .await
-        .expect_err("missing vector index rejected");
+    let err = execute_query(
+        &state.pool,
+        &name,
+        &schema,
+        &q,
+        &PrincipalCtx::bypass(),
+        false,
+    )
+    .await
+    .expect_err("missing vector index rejected");
     assert_eq!(err.code, ErrorCode::BadRequest);
     assert!(
         err.message.contains("vector index"),
@@ -882,9 +953,16 @@ async fn hybrid_search_is_mutually_exclusive_with_search() {
         "search": {"index": "search_body", "query": "database"}
     }))
     .expect("parse hybrid+search query");
-    let err = execute_query(&state.pool, &db, &schema, &q, &PrincipalCtx::bypass())
-        .await
-        .expect_err("hybrid+search rejected");
+    let err = execute_query(
+        &state.pool,
+        &db,
+        &schema,
+        &q,
+        &PrincipalCtx::bypass(),
+        false,
+    )
+    .await
+    .expect_err("hybrid+search rejected");
     assert_eq!(err.code, ErrorCode::BadRequest);
 }
 
@@ -899,9 +977,16 @@ async fn hybrid_search_rejects_length_mismatch() {
         "hybridSearch": {"query": "database", "vector": [1.0, 0.0], "limit": 5}
     }))
     .expect("parse mismatched hybridSearch");
-    let err = execute_query(&state.pool, &db, &schema, &q, &PrincipalCtx::bypass())
-        .await
-        .expect_err("length mismatch rejected");
+    let err = execute_query(
+        &state.pool,
+        &db,
+        &schema,
+        &q,
+        &PrincipalCtx::bypass(),
+        false,
+    )
+    .await
+    .expect_err("length mismatch rejected");
     assert_eq!(err.code, ErrorCode::BadRequest);
 }
 
@@ -1023,9 +1108,16 @@ async fn vector_search_honors_declared_metric() {
             "vectorSearch": {"index": "by_embedding", "vector": [1.0, 0.0], "limit": 1}
         }))
         .expect("parse vectorSearch query");
-        let res = execute_query(&state.pool, &db, &schema, &q, &PrincipalCtx::bypass())
-            .await
-            .expect("execute vectorSearch");
+        let res = execute_query(
+            &state.pool,
+            &db,
+            &schema,
+            &q,
+            &PrincipalCtx::bypass(),
+            false,
+        )
+        .await
+        .expect("execute vectorSearch");
         let docs = match res {
             QueryResult::Docs(d) => d,
             _ => panic!("expected Docs"),

@@ -238,6 +238,42 @@ covers the admin route. The in-memory harness models the engine: it validates
 the spec and advances runs on `tick()`, so workflow flows are testable with no
 network.
 
+## Cascade delete & soft delete
+
+Referential actions (FM-33) are declared on the CHILD table's id field — no
+SQL FK; the server expands the cascade app-level inside the txn so every
+cascaded row is a first-class op (op-feed, audit, webhooks, subscriptions):
+
+```ts
+const schema = defineSchema({
+  projects: defineTable({ title: t.string() }),
+  tasks: defineTable({
+    title: t.string(),
+    projectId: t.id("projects", { onDelete: "cascade" }), // or "restrict" / "setNull"
+  })
+    .index("by_project", ["projectId"]) // required: single-field, non-unique btree
+    .softDelete(), // opt in per table: delete stamps deletedAt instead of removing
+});
+
+// setNull needs the optional shape: t.optional(t.id("projects", { onDelete: "setNull" }))
+
+await db.mutate(mutation().delete("projects", projectId).build()); // cascades tasks
+await db.mutate(mutation().undelete("tasks", taskId).build()); // restore a soft-deleted row
+```
+
+`onDelete` deletes children (`cascade`), blocks while a live child references
+the row (`restrict`, Conflict), or clears the child's field (`setNull` — the
+key is removed and the child's version bumps). One initiating delete may
+cascade through at most 10,000 rows (Conflict + full rollback past that), and
+self-reference cycles terminate. On a `.softDelete()` table, `delete` /
+`deleteByQuery` stamp an internal `deletedAt` (+version) instead of removing:
+the row is invisible to every read terminal, eq-lookup, and unique index,
+per-id writes see NotFound, and `undelete` restores it (version+1, idempotent
+on a live row, Conflict when a live row now holds its unique key, BadRequest
+on a table without `softDelete`). A stamped row never triggers or receives a
+cascade, and the TTL reaper always hard-deletes. Adding or changing
+`onDelete` — and adding `softDelete` — is an additive schema push.
+
 ## Search
 
 `.search(index, query, opts)` full-text queries a declared search index

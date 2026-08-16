@@ -358,6 +358,8 @@ mod tests {
             owner_field: None,
             collaborators_field: None,
             authorize: None,
+
+            soft_delete: false,
             ttl: None,
         }
     }

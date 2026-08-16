@@ -65,7 +65,9 @@ pub use mutation::{Mutation, StepResult, Transaction};
 pub use query::{
     HybridSearchOpts, Order, Paginate, Paginated, Query, SearchOpts, TableQuery, VectorSearchOpts,
 };
-pub use schema::{DistanceMetric, FieldType, IndexDef, SchemaDef, TableDef, VectorIndexSpec};
+pub use schema::{
+    DistanceMetric, FieldType, IndexDef, OnDeleteAction, SchemaDef, TableDef, VectorIndexSpec,
+};
 pub use wire::{
     AggregateGroup, AggregateOp, AggregateSpec, AuthedUser, ClientMessage, FilterExpr,
     OutcomeStatus, PresenceMember, ScheduleInfo, ScheduleKind, ScheduleStatus, ScheduleWhen,

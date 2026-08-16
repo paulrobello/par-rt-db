@@ -375,7 +375,8 @@ pub(super) async fn admin_explain(
     // Construct a bypass `PrincipalCtx` (admin path; no user id) so the
     // compile sees the same row-auth posture the admin-mutate paths use.
     let principal_ctx = crate::auth::PrincipalCtx::bypass();
-    let (cq, _warnings) = crate::query::compile_query(&db, &schema, &body.query, &principal_ctx)?;
+    let (cq, _warnings) =
+        crate::query::compile_query(&db, &schema, &body.query, &principal_ctx, false)?;
     // Recompute warnings separately so the response can carry them even when
     // the caller is a bypass principal (compile_query's warning pass is
     // schema-only and independent of the principal).

@@ -33,7 +33,8 @@ The DSL layer is feature-complete: every server query terminal
 (`get`/`index`+`eq`/`gt`/`gte`/`lt`/`lte`/`order`/`take`/`unique`/`first`/`count`/
 `collect`/`distinct`/`aggregate`/`filter`/`search`/`vector_search`/`hybrid_search`/`paginate`)
 and every mutation step
-(`insert`/`patch`/`replace`/`delete`/`expectVersion`/`expectAbsent`/`upsert`
+(`insert`/`patch`/`replace`/`delete`/`undelete` (FM-33)/`expectVersion`/
+`expectAbsent`/`upsert`
 per-id steps, the `patch_by_query`/`delete_by_query` bulk steps, plus the
 `schedule(when, txn)`/`cancel_schedule(id)` scheduling steps and the
 `start_workflow(spec)`/`cancel_workflow(id)` workflow steps (FM-29))
@@ -319,6 +320,62 @@ submit time), so write idempotent step txns. The admin client adds
 `/admin/db/{db}/workflows` routes, and the in-memory harness models the
 engine (spec validation + `tick()` advance) so workflow flows are testable
 with no network.
+
+### Cascade delete + soft delete (FM-33)
+
+A table field declared as `t.id(table, on_delete=...)` — legal only on a
+top-level id (or `optional` id) field with a single-field, non-unique,
+non-partial btree index on it — makes the server expand that reference when the
+referenced row hard-deletes: `cascade` deletes the children (recursively),
+`restrict` rejects the delete with `CONFLICT` while live children exist, and
+`setNull` (requires the optional wrapper) removes the child's field key. A
+table built with `.soft_delete()` turns its own deletes into a `deleted_at`
+tombstone: the row disappears from every read, write lookup, and unique-index
+enforcement (the unique key frees up for re-insert), and `undelete` restores it
+(idempotent on a live row, `NOT_FOUND` when absent, `BAD_REQUEST` on a table
+without `softDelete`). A soft delete never triggers a cascade; the TTL reaper
+always hard-deletes.
+
+```python
+from par_rt_db import Mutation
+from par_rt_db.schema import Schema, t
+
+schema = (
+    Schema.builder()
+    .table("users", lambda tb: tb.field("name", t.string()))
+    .table(
+        "posts",
+        lambda tb: (
+            tb.field("title", t.string())
+            .field("authorId", t.id("users", on_delete="cascade"))
+            .index("by_author", ["authorId"])
+        ),
+    )
+    .table(
+        "comments",
+        lambda tb: (
+            tb.field("body", t.string())
+            .field("postId", t.id("posts", on_delete="cascade"))
+            .index("by_post", ["postId"])
+            .soft_delete()
+        ),
+    )
+    .build()
+)
+
+# Deleting the user cascades: posts hard-delete, comments soft-delete (stamped).
+db.push_schema(schema)
+db.mutate(Mutation.builder().delete("users", user_id).build())
+db.mutate(Mutation.builder().undelete("comments", comment_id).build())  # restore
+```
+
+On the wire, `onDelete` rides the id variant (omitted when unset) and
+`softDelete` rides the table (omitted when false); the undelete step is
+`{"op": "undelete", "table": ..., "id": ...}`. Cascades are bounded
+(`MAX_CASCADE_ROWS` per initiating step, `CONFLICT` past it), cycle-guarded,
+and atomic with the txn. The in-memory harness mirrors all of it — including
+push-time validation with the server's exact messages — in
+`tests/test_cascade.py`.
 
 ## Errors
 

@@ -1347,7 +1347,15 @@ async fn combination_matrix_cascade_outcomes_match_expectations() -> anyhow::Res
     for case in CASES {
         let mut q = base_query();
         (case.build)(&mut q);
-        let result = execute_query(&state.pool, &db, &schema, &q, &PrincipalCtx::bypass()).await;
+        let result = execute_query(
+            &state.pool,
+            &db,
+            &schema,
+            &q,
+            &PrincipalCtx::bypass(),
+            false,
+        )
+        .await;
         let actual = match result {
             Ok(_) => Outcome::Accept,
             Err(e) if e.code == ErrorCode::BadRequest => Outcome::Reject,

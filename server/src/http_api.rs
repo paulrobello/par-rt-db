@@ -113,7 +113,15 @@ async fn query_handler(
     let principal_ctx = principal.row_ctx();
     let started = Instant::now();
     let started_at_ms = now_ms();
-    let result = execute_query(&state.pool, &body.db, &schema, &body.query, &principal_ctx).await?;
+    let result = execute_query(
+        &state.pool,
+        &body.db,
+        &schema,
+        &body.query,
+        &principal_ctx,
+        false,
+    )
+    .await?;
     let elapsed_us = started.elapsed().as_micros() as u64;
     state.runtime.metrics.record_query_duration(elapsed_us);
     state.runtime.metrics.record_query();
@@ -200,7 +208,8 @@ async fn batch_query_handler(
         let started = Instant::now();
         let started_at_ms = now_ms();
         let outcome =
-            match execute_query(&state.pool, &body.db, &schema, query, &principal_ctx).await {
+            match execute_query(&state.pool, &body.db, &schema, query, &principal_ctx, false).await
+            {
                 Ok(result) => {
                     let elapsed_us = started.elapsed().as_micros() as u64;
                     state.runtime.metrics.record_query_duration(elapsed_us);
@@ -263,7 +272,7 @@ fn record_slow_query_if_threshold(
     // error here would be a bug (the execute just succeeded), so on the
     // off-chance it happens we drop the slow-query record rather than the
     // successful query result.
-    let Ok((cq, _warnings)) = compile_query(db, schema, q, principal_ctx) else {
+    let Ok((cq, _warnings)) = compile_query(db, schema, q, principal_ctx, false) else {
         return;
     };
     let params = if state.config.slow_query_log_params {
