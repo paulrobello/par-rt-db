@@ -10,6 +10,7 @@ use std::time::SystemTime;
 use serde::Serialize;
 use sqlx::PgPool;
 
+use crate::protocol::WorkflowStatus;
 use crate::subs::SubscriptionManager;
 
 /// Ring-buffer capacity for [`LatencySamples`] (1024 micros samples per bucket).
@@ -215,6 +216,16 @@ pub enum QuotaKind {
     Subs,
 }
 
+/// How one workflow step attempt ended (FM-29). Same label-not-name pattern
+/// as `QuotaKind`: the outcome becomes the `outcome` label on the aggregate
+/// `rtdb_workflow_steps_total` counter.
+#[derive(Debug, Clone, Copy)]
+pub enum WorkflowStepOutcome {
+    Success,
+    Retry,
+    Fail,
+}
+
 /// Per-database resource-quota rejection counters — the per-db breakdown of the
 /// global `quota_rejections_*_total` counters on [`Metrics`]. Same shape and
 /// same concurrency posture as [`DbSubCounters`]: held under a
@@ -238,6 +249,21 @@ pub struct DbQuotaCounterRow {
     pub tables: u64,
     pub storage: u64,
     pub subs: u64,
+}
+
+/// One db's workflow-run counts by status (FM-29), the JSON-snapshot shape.
+/// camelCase on the wire. Populated by a live `workflows::count_by_status`
+/// read (status counts are gauges, not monotonic counters), so unlike the
+/// counter-backed per-db sections there is no in-memory map behind it.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DbWorkflowStatusRow {
+    pub db: String,
+    pub pending: i64,
+    pub running: i64,
+    pub success: i64,
+    pub failed: i64,
+    pub cancelled: i64,
 }
 
 #[derive(Default)]
@@ -310,6 +336,13 @@ pub struct Metrics {
     quota_rejections_tables_total: AtomicU64,
     quota_rejections_storage_total: AtomicU64,
     quota_rejections_subs_total: AtomicU64,
+    // ---- Durable workflow steps (FM-29) ----
+    /// Workflow step attempts by outcome, across all dbs (no db/table labels,
+    /// matching the neighboring counters; the per-db status breakdown is a
+    /// live side-table read on the admin metrics JSON instead).
+    workflow_steps_success_total: AtomicU64,
+    workflow_steps_retry_total: AtomicU64,
+    workflow_steps_fail_total: AtomicU64,
     /// SEC-109: admin-key login failures (wrong key guesses at `POST /admin/login`).
     /// Monotonic counter for brute-force detection — a spike signals an attack.
     admin_auth_failures_total: AtomicU64,
@@ -557,6 +590,19 @@ impl Metrics {
         rows
     }
 
+    /// One workflow step attempt ended (FM-29): committed (`Success`), failed
+    /// with retries left (`Retry`), or exhausted its retries (`Fail`). Global
+    /// counter — the per-db run counts by status are served by
+    /// [`per_db_workflows_rows`] on the admin metrics JSON instead.
+    pub fn record_workflow_step(&self, outcome: WorkflowStepOutcome) {
+        let counter = match outcome {
+            WorkflowStepOutcome::Success => &self.workflow_steps_success_total,
+            WorkflowStepOutcome::Retry => &self.workflow_steps_retry_total,
+            WorkflowStepOutcome::Fail => &self.workflow_steps_fail_total,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub async fn snapshot(
         &self,
         pool: &PgPool,
@@ -621,8 +667,63 @@ impl Metrics {
             quota_rejections_subs_total: self.quota_rejections_subs_total.load(Ordering::Relaxed),
             admin_auth_failures_total: self.admin_auth_failures_total.load(Ordering::Relaxed),
             per_db_quota: self.per_db_quota_snapshot(),
+            workflow_steps_success_total: self.workflow_steps_success_total.load(Ordering::Relaxed),
+            workflow_steps_retry_total: self.workflow_steps_retry_total.load(Ordering::Relaxed),
+            workflow_steps_fail_total: self.workflow_steps_fail_total.load(Ordering::Relaxed),
+            per_db_workflows: Vec::new(),
         }
     }
+}
+
+/// Live per-db workflow-run counts by status for the `/admin/metrics` JSON
+/// (FM-29). Reads `workflows::count_by_status` per registered database — a
+/// gauge, not a counter, so there is no in-memory map to drain. Sorted by db
+/// name (`list_databases` already orders them). Best-effort per db: a database
+/// whose per-db tasks have not yet lazily ensured the `workflows` table
+/// (created but never touched by a client) is skipped rather than failing the
+/// whole snapshot. JSON-snapshot only — deliberately absent from the Prometheus
+/// scrape to avoid per-db label cardinality on the public export.
+pub async fn per_db_workflows_rows(pool: &PgPool) -> Vec<DbWorkflowStatusRow> {
+    let dbs = match crate::db::list_databases(pool).await {
+        Ok(dbs) => dbs,
+        Err(err) => {
+            tracing::warn!(error = %err, "failed to list databases for workflow counts");
+            return Vec::new();
+        }
+    };
+    let mut rows = Vec::with_capacity(dbs.len());
+    for db in dbs {
+        match crate::workflows::count_by_status(pool, &db).await {
+            Ok(counts) => {
+                let mut row = DbWorkflowStatusRow {
+                    db,
+                    pending: 0,
+                    running: 0,
+                    success: 0,
+                    failed: 0,
+                    cancelled: 0,
+                };
+                for (status, n) in counts {
+                    match status {
+                        WorkflowStatus::Pending => row.pending = n,
+                        WorkflowStatus::Running => row.running = n,
+                        WorkflowStatus::Success => row.success = n,
+                        WorkflowStatus::Failed => row.failed = n,
+                        WorkflowStatus::Cancelled => row.cancelled = n,
+                    }
+                }
+                rows.push(row);
+            }
+            Err(err) => {
+                tracing::debug!(
+                    error = %err,
+                    db,
+                    "skipping per-db workflow counts (table not ensured yet)"
+                );
+            }
+        }
+    }
+    rows
 }
 
 #[derive(Serialize)]
@@ -691,6 +792,19 @@ pub struct MetricsSnapshot {
     /// JSON-snapshot only — deliberately absent from the Prometheus scrape
     /// (per-db labels would blow up cardinality on the public export).
     pub per_db_quota: Vec<DbQuotaCounterRow>,
+    /// Workflow step attempts by outcome (FM-29), surfaced in BOTH the JSON
+    /// snapshot and the Prometheus scrape
+    /// (`rtdb_workflow_steps_total{outcome=…}`).
+    pub workflow_steps_success_total: u64,
+    pub workflow_steps_retry_total: u64,
+    pub workflow_steps_fail_total: u64,
+    /// Per-database workflow-run counts by status (FM-29). Populated only by
+    /// the `/admin/metrics` handler (a live side-table read — see
+    /// [`per_db_workflows_rows`]), so the periodic `/admin/stream` gauge ticks
+    /// and other `snapshot()` callers see an empty list. JSON-snapshot only —
+    /// deliberately absent from the Prometheus scrape (per-db labels would
+    /// blow up cardinality on the public export).
+    pub per_db_workflows: Vec<DbWorkflowStatusRow>,
 }
 
 /// Render the snapshot as Prometheus text-exposition format (version 0.0.4).
@@ -782,6 +896,23 @@ pub fn render_prometheus(snap: &MetricsSnapshot, fingerprint: Option<(&str, &str
     s.push_str(&format!(
         "rtdb_quota_rejections_total{{kind=\"subs\"}} {}\n",
         snap.quota_rejections_subs_total
+    ));
+
+    // Durable workflow steps (FM-29). Aggregate-by-outcome only — no per-db
+    // labels (cardinality). The per-db status counts live in the JSON snapshot.
+    s.push_str("# HELP rtdb_workflow_steps_total Workflow step attempts, by outcome.\n");
+    s.push_str("# TYPE rtdb_workflow_steps_total counter\n");
+    s.push_str(&format!(
+        "rtdb_workflow_steps_total{{outcome=\"success\"}} {}\n",
+        snap.workflow_steps_success_total
+    ));
+    s.push_str(&format!(
+        "rtdb_workflow_steps_total{{outcome=\"retry\"}} {}\n",
+        snap.workflow_steps_retry_total
+    ));
+    s.push_str(&format!(
+        "rtdb_workflow_steps_total{{outcome=\"fail\"}} {}\n",
+        snap.workflow_steps_fail_total
     ));
 
     // SEC-109: admin-key login failures (brute-force detection).
@@ -950,6 +1081,10 @@ mod tests {
             quota_rejections_subs_total: 0,
             admin_auth_failures_total: 0,
             per_db_quota: Vec::new(),
+            workflow_steps_success_total: 0,
+            workflow_steps_retry_total: 0,
+            workflow_steps_fail_total: 0,
+            per_db_workflows: Vec::new(),
         };
         let body = render_prometheus(&snap, Some(("0.0.0", "abc")));
         assert!(
@@ -1011,6 +1146,10 @@ mod tests {
             quota_rejections_subs_total: 0,
             admin_auth_failures_total: 0,
             per_db_quota: Vec::new(),
+            workflow_steps_success_total: 0,
+            workflow_steps_retry_total: 0,
+            workflow_steps_fail_total: 0,
+            per_db_workflows: Vec::new(),
         };
         let body = render_prometheus(&snap, Some(("0.0.0", "abc")));
         // One metric name, one sample per skip class.
@@ -1140,6 +1279,10 @@ mod tests {
             quota_rejections_subs_total: 3,
             admin_auth_failures_total: 0,
             per_db_quota: Vec::new(),
+            workflow_steps_success_total: 0,
+            workflow_steps_retry_total: 0,
+            workflow_steps_fail_total: 0,
+            per_db_workflows: Vec::new(),
         };
         let body = render_prometheus(&snap, Some(("0.0.0", "abc")));
         assert!(
@@ -1160,6 +1303,92 @@ mod tests {
         );
         // Per-db breakdown deliberately absent from the scrape (cardinality).
         assert!(!body.contains("db-a"), "per-db leaked into scrape: {body}");
+    }
+
+    #[test]
+    fn workflow_step_counters_record_and_render() {
+        // Mirrors `quota_rejections_land_in_snapshot_and_prometheus`: the
+        // three outcome counters increment via `record_workflow_step`, and the
+        // aggregate-by-outcome totals appear in the Prometheus scrape under one
+        // metric name with an `outcome` label (no per-db labels).
+        let m = Metrics::default();
+        m.record_workflow_step(WorkflowStepOutcome::Success);
+        m.record_workflow_step(WorkflowStepOutcome::Success);
+        m.record_workflow_step(WorkflowStepOutcome::Retry);
+        m.record_workflow_step(WorkflowStepOutcome::Fail);
+        assert_eq!(
+            m.workflow_steps_success_total.load(Ordering::Relaxed),
+            2,
+            "two successes"
+        );
+        assert_eq!(
+            m.workflow_steps_retry_total.load(Ordering::Relaxed),
+            1,
+            "one retry"
+        );
+        assert_eq!(
+            m.workflow_steps_fail_total.load(Ordering::Relaxed),
+            1,
+            "one terminal failure"
+        );
+        // Prometheus renders the three aggregate-by-outcome totals.
+        let snap = MetricsSnapshot {
+            queries_total: 0,
+            mutations_total: 0,
+            uploads_total: 0,
+            ws_connections: 0,
+            active_subscriptions: 0,
+            pool_size: 0,
+            pool_idle: 0,
+            uptime_seconds: 0,
+            query_latency: LatencyStats::default(),
+            mutate_latency: LatencyStats::default(),
+            subscribe_latency: LatencyStats::default(),
+            subs_reruns_total: 0,
+            subs_skips_point_total: 0,
+            subs_skips_indexed_total: 0,
+            subs_skips_ordered_total: 0,
+            subs_skip_verifications_total: 0,
+            subs_missed_pushes_total: 0,
+            ttl_expired_total: 0,
+            merge_docs_total: 0,
+            image_transforms_hit_total: 0,
+            image_transforms_miss_total: 0,
+            image_transforms_error_total: 0,
+            image_transform_bytes_total: 0,
+            presence_updates_total: 0,
+            presence_broadcasts_total: 0,
+            presence_ttl_expiries_total: 0,
+            presence_rooms: 0,
+            presence_sessions: 0,
+            per_db_subs: Vec::new(),
+            quota_rejections_tables_total: 0,
+            quota_rejections_storage_total: 0,
+            quota_rejections_subs_total: 0,
+            admin_auth_failures_total: 0,
+            per_db_quota: Vec::new(),
+            workflow_steps_success_total: 2,
+            workflow_steps_retry_total: 1,
+            workflow_steps_fail_total: 1,
+            per_db_workflows: Vec::new(),
+        };
+        let body = render_prometheus(&snap, Some(("0.0.0", "abc")));
+        assert!(
+            body.contains("# TYPE rtdb_workflow_steps_total counter"),
+            "{body}"
+        );
+        assert!(
+            body.contains("rtdb_workflow_steps_total{outcome=\"success\"} 2"),
+            "{body}"
+        );
+        assert!(
+            body.contains("rtdb_workflow_steps_total{outcome=\"retry\"} 1"),
+            "{body}"
+        );
+        assert!(
+            body.contains("rtdb_workflow_steps_total{outcome=\"fail\"} 1"),
+            "{body}"
+        );
     }
 
     #[test]

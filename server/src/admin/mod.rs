@@ -25,6 +25,7 @@ mod settings;
 mod storage_ops;
 mod tokens;
 mod webhooks;
+mod workflows;
 
 // Re-export each domain's handlers into the module scope so `admin_routes`
 // below resolves them unqualified (e.g. `mint_token` -> `tokens::mint_token`)
@@ -43,6 +44,7 @@ use settings::*;
 use storage_ops::*;
 use tokens::*;
 use webhooks::*;
+use workflows::*;
 
 /// Who an admin request was made as: the raw admin key (CLI/automation) or an
 /// OAuth user on the server-wide admin allowlist (browser dashboard). The
@@ -331,6 +333,18 @@ pub fn admin_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route(
             "/admin/db/{db}/schedules/{id}/resume",
             post(admin_resume_schedule),
+        )
+        .route(
+            "/admin/db/{db}/workflows",
+            get(admin_list_workflows).post(admin_create_workflow),
+        )
+        .route(
+            "/admin/db/{db}/workflows/{id}/cancel",
+            post(admin_cancel_workflow),
+        )
+        .route(
+            "/admin/db/{db}/workflows/{id}",
+            get(admin_get_workflow).delete(admin_delete_workflow),
         )
         .route("/admin/metrics", get(metrics_handler))
         // ENH-019: query introspection. `/explain` compiles a Query DSL body

@@ -1296,6 +1296,8 @@ async fn handle_workflow_advance(
                     true,
                 )
                 .await;
+                ctx.metrics
+                    .record_workflow_step(crate::metrics::WorkflowStepOutcome::Success);
                 let now = now_ms();
                 let finished = row.current_step as usize + 1 >= row.spec.steps.len();
                 let record = crate::protocol::StepOutcome {
@@ -1349,6 +1351,8 @@ async fn handle_workflow_advance(
                         now.saturating_add(backoff),
                     )
                     .await?;
+                    ctx.metrics
+                        .record_workflow_step(crate::metrics::WorkflowStepOutcome::Retry);
                     return Ok(());
                 }
                 let record = crate::protocol::StepOutcome {
@@ -1360,6 +1364,8 @@ async fn handle_workflow_advance(
                 };
                 crate::workflows::mark_failed(&ctx.pool, &ctx.db, &row.id, &record, &err.message)
                     .await?;
+                ctx.metrics
+                    .record_workflow_step(crate::metrics::WorkflowStepOutcome::Fail);
                 return Ok(());
             }
         }

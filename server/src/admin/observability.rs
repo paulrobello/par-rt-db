@@ -22,19 +22,22 @@ pub(super) async fn metrics_handler(
     _headers: HeaderMap,
 ) -> Result<Json<crate::metrics::MetricsSnapshot>, RtDbError> {
     let (presence_rooms, presence_sessions) = state.realtime.presence.counts().await;
-    Ok(Json(
-        state
-            .runtime
-            .metrics
-            .snapshot(
-                &state.pool,
-                &state.realtime.subs,
-                state.runtime.started_at,
-                presence_rooms,
-                presence_sessions,
-            )
-            .await,
-    ))
+    let mut snap = state
+        .runtime
+        .metrics
+        .snapshot(
+            &state.pool,
+            &state.realtime.subs,
+            state.runtime.started_at,
+            presence_rooms,
+            presence_sessions,
+        )
+        .await;
+    // Per-db workflow status counts are a live side-table read (one GROUP BY
+    // per database), populated here rather than inside `snapshot` so the
+    // periodic `/admin/stream` gauge ticks don't fan it out every second.
+    snap.per_db_workflows = crate::metrics::per_db_workflows_rows(&state.pool).await;
+    Ok(Json(snap))
 }
 
 #[derive(Deserialize)]

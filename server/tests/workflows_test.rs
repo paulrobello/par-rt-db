@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use common::{
-    admin_post, fresh_db, kanban_schema_json, spawn_app, test_hot, test_state,
-    test_state_with_audit,
+    admin_delete, admin_get, admin_post, fresh_db, kanban_schema_json, spawn_app, test_hot,
+    test_state, test_state_with_audit,
 };
 use rtdb_server::AppState;
 use rtdb_server::auth::PrincipalCtx;
@@ -939,6 +939,139 @@ async fn ws_start_list_cancel_roundtrip() -> anyhow::Result<()> {
     let listed = workflows::list(&pool, &db, None, 10).await?;
     assert_eq!(listed.len(), 1, "the rejected spec left exactly one run");
     assert_eq!(listed[0].status, WorkflowStatus::Cancelled);
+
+    Ok(())
+}
+
+// --- Task 6: admin routes + step metrics -------------------------------------
+// Same harness as the Task 5 HTTP section: `fresh_db` pushes the kanban
+// fixture, `ensure_table` stands in for the scheduler startup's lazy ensure,
+// and no per-db tasks run (the one-shot admin surfaces write the side table
+// directly, so runs stay `pending` for assertions).
+
+/// (12) Admin round-trip: create → list (unfiltered + status-filtered, with
+/// the bad-status `BadRequest`) → get (`WorkflowInfoFull`, 404 on unknown id)
+/// → cancel (`ok` true once then false) → delete (`ok` true once then false),
+/// plus the per-db status counts on the `/admin/metrics` JSON.
+#[tokio::test]
+async fn admin_routes_roundtrip() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    workflows::ensure_table(&pool, &db).await?;
+    let addr = spawn_app(state).await;
+
+    let resp = admin_post(
+        addr,
+        &format!("/admin/db/{db}/workflows"),
+        projects_spec_json("admin-run"),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await?;
+    let id = body["id"].as_str().expect("workflow id").to_string();
+
+    let listed = workflows::list(&pool, &db, None, 10).await?;
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].id, id);
+
+    // List: unfiltered shows the run; the status filter narrows it; a bad
+    // status value is a `BadRequest` envelope, not a 500.
+    let resp = admin_get(addr, &format!("/admin/db/{db}/workflows")).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(body["workflows"].as_array().map(Vec::len), Some(1));
+    assert_eq!(body["workflows"][0]["id"], serde_json::json!(id));
+    assert_eq!(body["workflows"][0]["name"], serde_json::json!("admin-run"));
+    assert_eq!(body["workflows"][0]["status"], serde_json::json!("pending"));
+    assert_eq!(body["workflows"][0]["stepCount"], serde_json::json!(1));
+
+    let resp = admin_get(addr, &format!("/admin/db/{db}/workflows?status=success")).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(body["workflows"].as_array().map(Vec::len), Some(0));
+
+    let resp = admin_get(addr, &format!("/admin/db/{db}/workflows?status=bogus")).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(body["code"], serde_json::json!("BAD_REQUEST"));
+
+    // An invalid spec is rejected at the surface before any run row exists.
+    let resp = admin_post(
+        addr,
+        &format!("/admin/db/{db}/workflows"),
+        serde_json::json!({ "name": "empty", "steps": [] }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert_eq!(
+        workflows::list(&pool, &db, None, 10).await?.len(),
+        1,
+        "no second run row may survive the rejected spec"
+    );
+
+    // Get: the full row (info flattened + stepOutcomes); unknown id 404s.
+    let resp = admin_get(addr, &format!("/admin/db/{db}/workflows/{id}")).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(body["id"], serde_json::json!(id));
+    assert_eq!(body["status"], serde_json::json!("pending"));
+    assert_eq!(body["stepOutcomes"].as_array().map(Vec::len), Some(0));
+
+    let resp = admin_get(addr, &format!("/admin/db/{db}/workflows/nope")).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(body["code"], serde_json::json!("NOT_FOUND"));
+
+    // Per-db status counts ride the /admin/metrics JSON (one pending run).
+    let resp = admin_get(addr, "/admin/metrics").await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await?;
+    let ours = body["perDbWorkflows"]
+        .as_array()
+        .expect("perDbWorkflows array")
+        .iter()
+        .find(|row| row["db"] == serde_json::json!(db))
+        .cloned()
+        .unwrap_or_else(|| panic!("no perDbWorkflows row for {db}"));
+    assert_eq!(ours["pending"], serde_json::json!(1));
+
+    // Cancel: true once, then false (already terminal).
+    let resp = admin_post(
+        addr,
+        &format!("/admin/db/{db}/workflows/{id}/cancel"),
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(body, serde_json::json!({ "ok": true }));
+
+    let resp = admin_post(
+        addr,
+        &format!("/admin/db/{db}/workflows/{id}/cancel"),
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(body, serde_json::json!({ "ok": false }));
+
+    // Delete: hard-removes the row — true once, then false, list empty after.
+    let resp = admin_delete(addr, &format!("/admin/db/{db}/workflows/{id}")).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(body, serde_json::json!({ "ok": true }));
+
+    let resp = admin_delete(addr, &format!("/admin/db/{db}/workflows/{id}")).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(body, serde_json::json!({ "ok": false }));
+
+    assert!(
+        workflows::list(&pool, &db, None, 10).await?.is_empty(),
+        "deleted run must not list"
+    );
 
     Ok(())
 }
