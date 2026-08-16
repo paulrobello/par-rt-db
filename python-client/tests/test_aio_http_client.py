@@ -242,14 +242,33 @@ async def test_schedule_manage_ops_post_to_id_paths() -> None:
         return httpx.Response(200, json={"ok": True})
 
     async with _client(handler) as c:
-        await c.cancel_schedule("sch-1")
-        await c.pause_schedule("sch-1")
-        await c.resume_schedule("sch-1")
+        assert await c.cancel_schedule("sch-1") is True
+        assert await c.pause_schedule("sch-1") is True
+        assert await c.resume_schedule("sch-1") is True
     assert seen == [
         "/api/schedule/sch-1/cancel",
         "/api/schedule/sch-1/pause",
         "/api/schedule/sch-1/resume",
     ]
+
+
+async def test_schedule_manage_op_no_op_resolves_false() -> None:
+    # 200 {ok: false} = unknown/terminal id: a no-op that resolves False —
+    # same contract as the WS scheduleAck bare ok:false arm, never a raise.
+    async with _client(lambda r: httpx.Response(200, json={"ok": False})) as c:
+        assert await c.cancel_schedule("sch-gone") is False
+        assert await c.pause_schedule("sch-gone") is False
+        assert await c.resume_schedule("sch-gone") is False
+
+
+async def test_schedule_manage_op_error_envelope_raises() -> None:
+    async with _client(
+        lambda r: httpx.Response(404, json={"code": "NOT_FOUND", "message": "missing job"})
+    ) as c:
+        with pytest.raises(RtDbError) as ei:
+            await c.cancel_schedule("sch-1")
+    assert ei.value.code.value == "NOT_FOUND"
+    assert ei.value.status_code == 404
 
 
 async def test_list_schedules_returns_schedule_info_list() -> None:

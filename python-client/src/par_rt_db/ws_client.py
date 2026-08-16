@@ -628,17 +628,20 @@ class RtDbClient:
         expression). Returns the new schedule's id."""
         return await self._sched_op("schedule", txn=txn, when=when)  # type: ignore[return-value]
 
-    async def cancel_schedule(self, id: str) -> None:
-        """Cancel the scheduled job with ``id``."""
-        await self._sched_op("cancel", id=id)
+    async def cancel_schedule(self, id: str) -> bool:
+        """Cancel the scheduled job with ``id``. ``True`` when a pending job
+        was cancelled; ``False`` when it was missing or already terminal."""
+        return await self._sched_op("cancel", id=id)  # type: ignore[return-value]
 
-    async def pause_schedule(self, id: str) -> None:
-        """Pause the scheduled job with ``id`` (resumed via :meth:`resume_schedule`)."""
-        await self._sched_op("pause", id=id)
+    async def pause_schedule(self, id: str) -> bool:
+        """Pause the scheduled job with ``id`` (resumed via
+        :meth:`resume_schedule`). ``False`` when the id was unknown."""
+        return await self._sched_op("pause", id=id)  # type: ignore[return-value]
 
-    async def resume_schedule(self, id: str) -> None:
-        """Resume a previously paused scheduled job by ``id``."""
-        await self._sched_op("resume", id=id)
+    async def resume_schedule(self, id: str) -> bool:
+        """Resume a previously paused scheduled job by ``id``. ``False`` when
+        the id was unknown."""
+        return await self._sched_op("resume", id=id)  # type: ignore[return-value]
 
     async def list_schedules(self) -> list[ScheduleInfo]:
         """List the scheduled jobs on this database."""
@@ -707,14 +710,15 @@ class RtDbClient:
             sp.future.set_exception(RtDbError.from_envelope(msg.error.model_dump()))
         elif tag == "scheduleAck":
             if msg.ok:
-                sp.future.set_result(None)
+                sp.future.set_result(True)
+            elif msg.error is not None:
+                sp.future.set_exception(RtDbError.from_envelope(msg.error.model_dump()))
             else:
-                env = (
-                    msg.error.model_dump()
-                    if msg.error is not None
-                    else {"code": "INTERNAL", "message": "schedule ack failed"}
-                )
-                sp.future.set_exception(RtDbError.from_envelope(env))
+                # Bare ok:false = unknown/terminal job id: a no-op, not a
+                # failure. The server sends no error envelope for a legit
+                # no-op cancel/pause/resume (ws.rs maps the scheduler's
+                # Ok(bool) => (ok, None)).
+                sp.future.set_result(False)
 
     def _on_workflow(self, msg: Any) -> None:
         wp = self._pending_wf.pop(msg.workflow_id, None)

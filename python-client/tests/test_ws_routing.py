@@ -541,7 +541,43 @@ async def test_schedule_lifecycle():
         await _drain()
         ack_sid = _id(conn, "cancelSchedule")
         await conn.deliver('{"type":"scheduleAck","scheduleId":"' + ack_sid + '","ok":true}')
-        await asyncio.wait_for(cancel, 1.0)  # resolves without error
+        assert await asyncio.wait_for(cancel, 1.0) is True
+    finally:
+        await client.close()
+
+
+async def test_schedule_ack_error_envelope_rejects():
+    conn = FakeConn()
+    client = await _connected(conn)
+    try:
+        cancel = asyncio.create_task(client.cancel_schedule("job-gone"))
+        await _drain()
+        await conn.deliver(
+            '{"type":"scheduleAck","scheduleId":"'
+            + _id(conn, "cancelSchedule")
+            + '","ok":false,"error":{"code":"NOT_FOUND","message":"missing job"}}'
+        )
+        with pytest.raises(RtDbError) as ei:
+            await asyncio.wait_for(cancel, 1.0)
+        assert ei.value.code is ErrorCode.NOT_FOUND
+    finally:
+        await client.close()
+
+
+async def test_schedule_ack_bare_no_op_resolves_false():
+    # Bare ok:false (no error envelope) = unknown/terminal job id: the
+    # server's legit no-op cancel (ws.rs maps the scheduler's Ok(bool) =>
+    # (ok, None)). The future resolves False — it must NOT raise a synthetic
+    # INTERNAL error.
+    conn = FakeConn()
+    client = await _connected(conn)
+    try:
+        cancel = asyncio.create_task(client.cancel_schedule("job-done"))
+        await _drain()
+        await conn.deliver(
+            '{"type":"scheduleAck","scheduleId":"' + _id(conn, "cancelSchedule") + '","ok":false}'
+        )
+        assert await asyncio.wait_for(cancel, 1.0) is False
     finally:
         await client.close()
 

@@ -373,22 +373,28 @@ class RtDbHttpClient:
         resp = self._send("POST", "/api/schedule", json=body)
         return str(resp.json()["id"])
 
-    def cancel_schedule(self, id: str) -> None:
-        """``POST /api/schedule/{id}/cancel``."""
-        self._manage_schedule(id, "cancel")
+    def cancel_schedule(self, id: str) -> bool:
+        """``POST /api/schedule/{id}/cancel`` → ``True`` when a pending job
+        was cancelled; ``False`` for a missing or already-terminal id (a
+        no-op, not an error)."""
+        return self._manage_schedule(id, "cancel")
 
-    def pause_schedule(self, id: str) -> None:
-        """``POST /api/schedule/{id}/pause``."""
-        self._manage_schedule(id, "pause")
+    def pause_schedule(self, id: str) -> bool:
+        """``POST /api/schedule/{id}/pause`` → ``True`` when a pending job
+        was paused; ``False`` when the id was unknown (a no-op)."""
+        return self._manage_schedule(id, "pause")
 
-    def resume_schedule(self, id: str) -> None:
-        """``POST /api/schedule/{id}/resume``."""
-        self._manage_schedule(id, "resume")
+    def resume_schedule(self, id: str) -> bool:
+        """``POST /api/schedule/{id}/resume`` → ``True`` when a paused job
+        was resumed; ``False`` when the id was unknown (a no-op)."""
+        return self._manage_schedule(id, "resume")
 
-    def _manage_schedule(self, id: str, op: str) -> None:
-        """Shared authorize-then-op for cancel/pause/resume (``{db}`` body → ``{ok}``)."""
+    def _manage_schedule(self, id: str, op: str) -> bool:
+        """Shared authorize-then-op for cancel/pause/resume (``{db}`` body →
+        the response's ``ok``: ``False`` = unknown/terminal id, a no-op —
+        real errors surface as non-200 envelopes via ``_send``)."""
         resp = self._send("POST", f"/api/schedule/{id}/{op}", json={"db": self._db})
-        self._expect_ok(resp)
+        return bool(resp.json()["ok"])
 
     def list_schedules(self) -> list[ScheduleInfo]:
         """``POST /api/schedules`` → every schedule for this db."""
@@ -762,9 +768,3 @@ class RtDbHttpClient:
         if not resp.is_success:
             raise RtDbError.from_http(resp.status_code, resp.content)
         return resp
-
-    @staticmethod
-    def _expect_ok(resp: httpx.Response) -> None:
-        """Assert the body is ``{ok: true}``; raise ``RtDbError`` otherwise."""
-        if not resp.json().get("ok"):
-            raise RtDbError(ErrorCode.INTERNAL, "admin request returned ok=false")

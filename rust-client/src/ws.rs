@@ -215,8 +215,10 @@ type SchedReply = oneshot::Sender<Result<ScheduleOutcome, RtDbError>>;
 enum ScheduleOutcome {
     /// `scheduleOk { id }` — the newly created schedule's id.
     Id(String),
-    /// `scheduleAck { ok: true }` — cancel/pause/resume succeeded (no payload).
-    Ack,
+    /// `scheduleAck { ok }` — cancel/pause/resume outcome. `false` means the
+    /// server found no such pending job (unknown or already-terminal id): a
+    /// no-op, not a failure.
+    Ack(bool),
     /// `listSchedulesOk { schedules }`.
     List(Vec<ScheduleInfo>),
 }
@@ -820,23 +822,25 @@ impl RtDbClient {
         }
     }
 
-    /// Cancel a scheduled job. Resolves on `scheduleAck.ok:true`; rejects with
-    /// [`RtDbError`] when the server returns `ok:false` (e.g. unknown id).
-    pub async fn cancel_schedule(&self, id: &str) -> Result<(), RtDbError> {
+    /// Cancel a scheduled job. Resolves `true` on `scheduleAck.ok:true`;
+    /// resolves `false` for a bare `ok:false` (unknown or already-terminal id —
+    /// a no-op, not a failure, matching the workflow-ack contract); rejects
+    /// with [`RtDbError`] when the server returns an error envelope.
+    pub async fn cancel_schedule(&self, id: &str) -> Result<bool, RtDbError> {
         self.manage_schedule(ScheduleMsg::Cancel { id: id.to_string() })
             .await
     }
 
     /// Pause a scheduled job until [`resume_schedule`](Self::resume_schedule).
     /// Same ack contract as [`cancel_schedule`](Self::cancel_schedule).
-    pub async fn pause_schedule(&self, id: &str) -> Result<(), RtDbError> {
+    pub async fn pause_schedule(&self, id: &str) -> Result<bool, RtDbError> {
         self.manage_schedule(ScheduleMsg::Pause { id: id.to_string() })
             .await
     }
 
     /// Resume a paused scheduled job. Same ack contract as
     /// [`cancel_schedule`](Self::cancel_schedule).
-    pub async fn resume_schedule(&self, id: &str) -> Result<(), RtDbError> {
+    pub async fn resume_schedule(&self, id: &str) -> Result<bool, RtDbError> {
         self.manage_schedule(ScheduleMsg::Resume { id: id.to_string() })
             .await
     }
@@ -850,11 +854,11 @@ impl RtDbClient {
         }
     }
 
-    /// Shared body for cancel/pause/resume: await the ack and surface `ok:false`
-    /// as an error.
-    async fn manage_schedule(&self, msg: ScheduleMsg) -> Result<(), RtDbError> {
+    /// Shared body for cancel/pause/resume: await the ack. A bare `ok:false` is
+    /// a no-op (resolves `false`), not an error.
+    async fn manage_schedule(&self, msg: ScheduleMsg) -> Result<bool, RtDbError> {
         match self.queue_schedule(msg).await? {
-            ScheduleOutcome::Ack => Ok(()),
+            ScheduleOutcome::Ack(ok) => Ok(ok),
             _ => Err(RtDbError::internal("unexpected schedule reply")),
         }
     }
@@ -1632,11 +1636,13 @@ fn apply_server_message(
         } => {
             if let Some(reply) = pending_schedules.remove(&schedule_id) {
                 if ok {
-                    let _ = reply.send(Ok(ScheduleOutcome::Ack));
+                    let _ = reply.send(Ok(ScheduleOutcome::Ack(true)));
+                } else if let Some(error) = error {
+                    let _ = reply.send(Err(error));
                 } else {
-                    let err =
-                        error.unwrap_or_else(|| RtDbError::internal("schedule operation failed"));
-                    let _ = reply.send(Err(err));
+                    // Bare ok:false = no such pending job (unknown or already
+                    // terminal): a no-op, not a failure (workflow-ack parity).
+                    let _ = reply.send(Ok(ScheduleOutcome::Ack(false)));
                 }
             }
         }
@@ -2568,8 +2574,9 @@ mod tests {
     }
 
     // Mirror of `mutate_ok_and_err_resolve_pending` for the schedule track:
-    // `scheduleOk`/`scheduleErr` resolve the pending reply, and a `scheduleAck`
-    // with `ok:false` surfaces the server's error envelope.
+    // `scheduleOk`/`scheduleErr` resolve the pending reply; a `scheduleAck`
+    // with `ok:false` surfaces the server's error envelope, while a BARE
+    // `ok:false` (no envelope) is the no-op signal — resolves Ack(false).
     #[tokio::test]
     async fn schedule_replies_resolve_pending() {
         let (inner, _) = rig_with_sub();
@@ -2581,11 +2588,13 @@ mod tests {
         let (tx_ack_ok, rx_ack_ok) = oneshot::channel();
         let (tx_ack_err, rx_ack_err) = oneshot::channel();
         let (tx_list, rx_list) = oneshot::channel();
+        let (tx_ack_noop, rx_ack_noop) = oneshot::channel();
         pending_schedules.insert("sch-1".into(), tx_ok);
         pending_schedules.insert("sch-2".into(), tx_err);
         pending_schedules.insert("sch-3".into(), tx_ack_ok);
         pending_schedules.insert("sch-4".into(), tx_ack_err);
         pending_schedules.insert("sch-5".into(), tx_list);
+        pending_schedules.insert("sch-6".into(), tx_ack_noop);
 
         apply_server_message(
             &inner,
@@ -2629,6 +2638,19 @@ mod tests {
             &mut pending_schedules,
             &mut pending_workflows,
         );
+        // Bare ok:false (no error envelope) = unknown/terminal job no-op:
+        // resolves Ack(false), it must not reject (workflow-ack parity).
+        apply_server_message(
+            &inner,
+            ServerMessage::ScheduleAck {
+                schedule_id: "sch-6".into(),
+                ok: false,
+                error: None,
+            },
+            &mut pending,
+            &mut pending_schedules,
+            &mut pending_workflows,
+        );
         apply_server_message(
             &inner,
             ServerMessage::ListSchedulesOk {
@@ -2657,10 +2679,14 @@ mod tests {
         assert_eq!(err.code, ErrorCode::BadRequest);
         assert!(matches!(
             rx_ack_ok.await.unwrap().unwrap(),
-            ScheduleOutcome::Ack
+            ScheduleOutcome::Ack(true)
         ));
         let ack_err = rx_ack_err.await.unwrap().unwrap_err();
         assert_eq!(ack_err.code, ErrorCode::NotFound);
+        assert!(matches!(
+            rx_ack_noop.await.unwrap().unwrap(),
+            ScheduleOutcome::Ack(false)
+        ));
         match rx_list.await.unwrap().unwrap() {
             ScheduleOutcome::List(list) => {
                 assert_eq!(list.len(), 1);

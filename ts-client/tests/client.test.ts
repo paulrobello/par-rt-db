@@ -183,7 +183,7 @@ describe("RtDbClient", () => {
     });
   });
 
-  it("resolves cancelSchedule on scheduleAck.ok:true and rejects on ok:false", async () => {
+  it("scheduleAck resolves true on ok:true, false on a bare ok:false no-op, rejects on error", async () => {
     const { client, sockets } = newClient();
     client.connect();
     sockets[0].open();
@@ -196,7 +196,7 @@ describe("RtDbClient", () => {
     };
     expect(okFrame.id).toBe("job-1");
     sockets[0].deliver({ type: "scheduleAck", scheduleId: okFrame.scheduleId, ok: true });
-    await expect(okPromise).resolves.toBeUndefined();
+    await expect(okPromise).resolves.toBe(true);
 
     const errPromise = client.pauseSchedule("job-missing");
     const errFrame = frames(sockets[0]).find((m) => m.type === "pauseSchedule") as unknown as {
@@ -209,6 +209,15 @@ describe("RtDbClient", () => {
       error: { code: "NOT_FOUND", message: "no such schedule" },
     });
     await expect(errPromise).rejects.toMatchObject({ name: "RtDbError", code: "NOT_FOUND" });
+
+    // Bare ok:false (no error envelope) = unknown/already-terminal job: the
+    // server's documented no-op ack, so the promise resolves false.
+    const noopPromise = client.resumeSchedule("job-done");
+    const noopFrame = frames(sockets[0]).find((m) => m.type === "resumeSchedule") as unknown as {
+      scheduleId: string;
+    };
+    sockets[0].deliver({ type: "scheduleAck", scheduleId: noopFrame.scheduleId, ok: false });
+    await expect(noopPromise).resolves.toBe(false);
   });
 
   it("resolves listSchedules with the schedules array on listSchedulesOk", async () => {

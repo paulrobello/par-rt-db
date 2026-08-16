@@ -376,27 +376,33 @@ impl RtDbHttpClient {
         Ok(parsed.id)
     }
 
-    /// Cancel a scheduled job (`POST /api/schedule/{id}/cancel`). The server
-    /// returns `{ok:true}` on success.
-    pub async fn cancel_schedule(&self, id: &str) -> Result<(), RtDbError> {
+    /// Cancel a scheduled job (`POST /api/schedule/{id}/cancel`). Resolves
+    /// `true` on `{ok:true}`; resolves `false` on `{ok:false}` (unknown or
+    /// already-terminal id — a no-op, not a failure, matching the WS ack
+    /// contract of [`RtDbClient::cancel_schedule`](crate::ws::RtDbClient::cancel_schedule));
+    /// rejects with [`RtDbError`] on a non-2xx error envelope.
+    pub async fn cancel_schedule(&self, id: &str) -> Result<bool, RtDbError> {
         self.manage_schedule(id, "cancel").await
     }
 
     /// Pause a scheduled job until [`resume_schedule`](Self::resume_schedule) is
-    /// called (`POST /api/schedule/{id}/pause`).
-    pub async fn pause_schedule(&self, id: &str) -> Result<(), RtDbError> {
+    /// called (`POST /api/schedule/{id}/pause`). Same ack contract as
+    /// [`cancel_schedule`](Self::cancel_schedule).
+    pub async fn pause_schedule(&self, id: &str) -> Result<bool, RtDbError> {
         self.manage_schedule(id, "pause").await
     }
 
-    /// Resume a paused scheduled job (`POST /api/schedule/{id}/resume`).
-    pub async fn resume_schedule(&self, id: &str) -> Result<(), RtDbError> {
+    /// Resume a paused scheduled job (`POST /api/schedule/{id}/resume`). Same
+    /// ack contract as [`cancel_schedule`](Self::cancel_schedule).
+    pub async fn resume_schedule(&self, id: &str) -> Result<bool, RtDbError> {
         self.manage_schedule(id, "resume").await
     }
 
     /// Shared authorize-then-op body for the three boolean manage handlers. `op`
     /// is always a hardcoded literal ("cancel" | "pause" | "resume"), never
-    /// caller-supplied, so interpolating it into the path is safe.
-    async fn manage_schedule(&self, id: &str, op: &str) -> Result<(), RtDbError> {
+    /// caller-supplied, so interpolating it into the path is safe. A 200
+    /// `{ok:false}` is the no-op signal — resolves `false`, not an error.
+    async fn manage_schedule(&self, id: &str, op: &str) -> Result<bool, RtDbError> {
         #[derive(Serialize)]
         #[serde(rename_all = "camelCase")]
         struct Body<'a> {
@@ -422,10 +428,7 @@ impl RtDbHttpClient {
             ok: bool,
         }
         let parsed = self.deserialize::<ManageResponse>(resp).await?;
-        if !parsed.ok {
-            return Err(RtDbError::internal("schedule operation returned ok=false"));
-        }
-        Ok(())
+        Ok(parsed.ok)
     }
 
     /// List scheduled jobs for this client's database (`POST /api/schedules`).
@@ -1284,9 +1287,34 @@ mod tests {
                 .mount(&server)
                 .await;
         }
-        client.cancel_schedule("job-1").await.unwrap();
-        client.pause_schedule("job-1").await.unwrap();
-        client.resume_schedule("job-1").await.unwrap();
+        assert!(client.cancel_schedule("job-1").await.unwrap());
+        assert!(client.pause_schedule("job-1").await.unwrap());
+        assert!(client.resume_schedule("job-1").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn schedule_manage_ok_false_resolves_false_and_errors_reject() {
+        let (server, client) = setup().await;
+        // 200 {ok:false} = unknown/terminal id: the no-op signal, resolves
+        // Ok(false) (same contract as the WS bare ack).
+        Mock::given(method("POST"))
+            .and(path("/api/schedule/job-9/cancel"))
+            .and(body_partial_json(json!({"db": "t<uuid>"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": false})))
+            .mount(&server)
+            .await;
+        // A real failure arrives as a non-2xx error envelope and still rejects.
+        Mock::given(method("POST"))
+            .and(path("/api/schedule/job-8/cancel"))
+            .and(body_partial_json(json!({"db": "t<uuid>"})))
+            .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+                "code": "NOT_FOUND", "message": "no such job"
+            })))
+            .mount(&server)
+            .await;
+        assert!(!client.cancel_schedule("job-9").await.unwrap());
+        let err = client.cancel_schedule("job-8").await.unwrap_err();
+        assert_eq!(err.code, crate::error::ErrorCode::NotFound);
     }
 
     #[test]

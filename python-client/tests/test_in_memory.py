@@ -1650,11 +1650,10 @@ def test_tick_cron_re_arms_and_fires_again_on_a_later_tick() -> None:
 def test_cancel_schedule_removes_the_job() -> None:
     c, _clock = _new_clock_client()
     sid = c.schedule(_insert_todo_txn(), _when.validate_python({"type": "afterMs", "ms": 1000}))
-    c.cancel_schedule(sid)
+    assert c.cancel_schedule(sid) is True
     assert c.list_schedules() == []
-    with pytest.raises(RtDbError) as ei:
-        c.cancel_schedule(sid)
-    assert ei.value.code is ErrorCode.NOT_FOUND
+    # Second cancel is a no-op, not an error (server scheduler::cancel contract).
+    assert c.cancel_schedule(sid) is False
 
 
 # --- FM-28: schedule/cancelSchedule as transaction steps ----------------------

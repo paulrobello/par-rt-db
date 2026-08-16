@@ -102,12 +102,11 @@ describe("RtDbHttpClient", () => {
     });
   });
 
-  it("posts cancel/pause/resume to the per-id routes and returns void on success", async () => {
+  it("posts cancel/pause/resume to the per-id routes and returns the body's ok", async () => {
     const fetchMock = vi
       .fn()
-      .mockResolvedValue(jsonResponse({ ok: true }))
       .mockResolvedValueOnce(jsonResponse({ ok: true }))
-      .mockResolvedValueOnce(jsonResponse({ ok: true }))
+      .mockResolvedValueOnce(jsonResponse({ ok: false }))
       .mockResolvedValueOnce(jsonResponse({ ok: true }));
     const client = new RtDbHttpClient({
       url: "http://h:8300",
@@ -116,9 +115,10 @@ describe("RtDbHttpClient", () => {
       fetch: fetchMock,
     });
 
-    await client.cancelSchedule("job-1");
-    await client.pauseSchedule("job-1");
-    await client.resumeSchedule("job-1");
+    await expect(client.cancelSchedule("job-1")).resolves.toBe(true);
+    // ok:false = unknown/already-terminal job: a 200 no-op, not an error.
+    await expect(client.pauseSchedule("job-1")).resolves.toBe(false);
+    await expect(client.resumeSchedule("job-1")).resolves.toBe(true);
 
     const routes = fetchMock.mock.calls.map((c) => c[0]);
     expect(routes).toEqual([

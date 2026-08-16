@@ -1106,14 +1106,11 @@ describe("InMemoryRtDbClient — schedules", () => {
     expect(typeof info.createdAt).toBe("number");
   });
 
-  it("cancel/pause/resume on an unknown id reject with NOT_FOUND", async () => {
+  it("cancel/pause/resume on an unknown id resolve false (no-op)", async () => {
     const { c } = newClockClient();
-    await expect(c.cancelSchedule("nope")).rejects.toMatchObject({
-      name: "RtDbError",
-      code: "NOT_FOUND",
-    });
-    await expect(c.pauseSchedule("nope")).rejects.toMatchObject({ code: "NOT_FOUND" });
-    await expect(c.resumeSchedule("nope")).rejects.toMatchObject({ code: "NOT_FOUND" });
+    await expect(c.cancelSchedule("nope")).resolves.toBe(false);
+    await expect(c.pauseSchedule("nope")).resolves.toBe(false);
+    await expect(c.resumeSchedule("nope")).resolves.toBe(false);
   });
 
   it("a failed txn rolls back a schedule step's enqueue (FM-28)", async () => {

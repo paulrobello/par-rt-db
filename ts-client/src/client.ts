@@ -386,21 +386,22 @@ export class RtDbClient {
     return this.queueSchedule<{ id: string }>({ kind: "schedule", when, txn });
   }
 
-  /** Cancels a scheduled job. Resolves on `scheduleAck.ok:true`; rejects with
-   * `RtDbError` when the server returns `ok:false` (e.g. unknown id). */
-  cancelSchedule(id: string): Promise<void> {
-    return this.queueSchedule<void>({ kind: "cancel", id });
+  /** Cancels a scheduled job. Resolves `true` on `scheduleAck.ok:true`; a bare
+   * `ok:false` (unknown/already-terminal job) resolves `false` — not an error;
+   * `ok:false` carrying an `error` rejects. */
+  cancelSchedule(id: string): Promise<boolean> {
+    return this.queueSchedule<boolean>({ kind: "cancel", id });
   }
 
   /** Pauses a scheduled job until `resumeSchedule`. Same ack contract as
    * `cancelSchedule`. */
-  pauseSchedule(id: string): Promise<void> {
-    return this.queueSchedule<void>({ kind: "pause", id });
+  pauseSchedule(id: string): Promise<boolean> {
+    return this.queueSchedule<boolean>({ kind: "pause", id });
   }
 
   /** Resumes a paused scheduled job. Same ack contract as `cancelSchedule`. */
-  resumeSchedule(id: string): Promise<void> {
-    return this.queueSchedule<void>({ kind: "resume", id });
+  resumeSchedule(id: string): Promise<boolean> {
+    return this.queueSchedule<boolean>({ kind: "resume", id });
   }
 
   /** Lists scheduled jobs. Resolves with the `schedules` array on
@@ -874,11 +875,12 @@ export class RtDbClient {
         const pending = this.pendingSchedules.get(msg.scheduleId);
         this.pendingSchedules.delete(msg.scheduleId);
         if (msg.ok) {
-          pending?.resolve(undefined);
+          pending?.resolve(true);
         } else if (msg.error) {
           pending?.reject(RtDbError.fromEnvelope(msg.error));
         } else {
-          pending?.reject(new RtDbError("INTERNAL", "schedule operation failed"));
+          // Bare ok:false = unknown/terminal job: a no-op, not a failure.
+          pending?.resolve(false);
         }
         break;
       }

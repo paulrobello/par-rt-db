@@ -2277,26 +2277,30 @@ class InMemoryRtDbClient:
         )
         return new_id
 
-    def cancel_schedule(self, id: str) -> None:
-        """Remove the scheduled job. :class:`RtDbError` ``NOT_FOUND`` if no such id."""
+    def cancel_schedule(self, id: str) -> bool:
+        """Remove the scheduled job. ``False`` when no such id exists (a no-op,
+        not an error) — the server's ``scheduler::cancel`` contract."""
         before = len(self._schedules)
         self._schedules = [j for j in self._schedules if j.id != id]
-        if len(self._schedules) == before:
-            raise RtDbError(ErrorCode.NOT_FOUND, f"schedule '{id}' not found")
+        return len(self._schedules) != before
 
-    def pause_schedule(self, id: str) -> None:
-        """Set the schedule's status to ``paused``. ``NOT_FOUND`` if no such id."""
+    def pause_schedule(self, id: str) -> bool:
+        """Flip a pending job to ``paused``. ``False`` when the job is missing
+        or not pending (a no-op, not an error)."""
         job = self._find_job(id)
-        if job is None:
-            raise RtDbError(ErrorCode.NOT_FOUND, f"schedule '{id}' not found")
+        if job is None or job.status != "pending":
+            return False
         job.status = "paused"
+        return True
 
-    def resume_schedule(self, id: str) -> None:
-        """Set a paused schedule's status back to ``pending``. ``NOT_FOUND`` if no such id."""
+    def resume_schedule(self, id: str) -> bool:
+        """Flip a paused job back to ``pending``. ``False`` when the job is
+        missing or not paused (a no-op, not an error)."""
         job = self._find_job(id)
-        if job is None:
-            raise RtDbError(ErrorCode.NOT_FOUND, f"schedule '{id}' not found")
+        if job is None or job.status != "paused":
+            return False
         job.status = "pending"
+        return True
 
     def list_schedules(self) -> list[ScheduleInfo]:
         """Snapshot of every scheduled job's public view."""

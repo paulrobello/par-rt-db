@@ -139,16 +139,30 @@ export class RtDbHttpClient {
     return { id: (body as { id: string }).id };
   }
 
-  async cancelSchedule(id: string): Promise<void> {
-    await this.post(`/api/schedule/${encodeURIComponent(id)}/cancel`, { db: this.db });
+  /** Cancels a scheduled job. Resolves `false` for an unknown/already-terminal
+   * job (a no-op), `true` when a live job was cancelled. */
+  async cancelSchedule(id: string): Promise<boolean> {
+    const body = await this.post(`/api/schedule/${encodeURIComponent(id)}/cancel`, {
+      db: this.db,
+    });
+    return (body as { ok: boolean }).ok;
   }
 
-  async pauseSchedule(id: string): Promise<void> {
-    await this.post(`/api/schedule/${encodeURIComponent(id)}/pause`, { db: this.db });
+  /** Pauses a scheduled job until `resumeSchedule`. Same `ok` contract as
+   * `cancelSchedule`. */
+  async pauseSchedule(id: string): Promise<boolean> {
+    const body = await this.post(`/api/schedule/${encodeURIComponent(id)}/pause`, {
+      db: this.db,
+    });
+    return (body as { ok: boolean }).ok;
   }
 
-  async resumeSchedule(id: string): Promise<void> {
-    await this.post(`/api/schedule/${encodeURIComponent(id)}/resume`, { db: this.db });
+  /** Resumes a paused scheduled job. Same `ok` contract as `cancelSchedule`. */
+  async resumeSchedule(id: string): Promise<boolean> {
+    const body = await this.post(`/api/schedule/${encodeURIComponent(id)}/resume`, {
+      db: this.db,
+    });
+    return (body as { ok: boolean }).ok;
   }
 
   async listSchedules(): Promise<ScheduleInfo[]> {

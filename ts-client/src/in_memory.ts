@@ -1730,18 +1730,33 @@ export class InMemoryRtDbClient {
     return { id };
   }
 
-  async cancelSchedule(id: string): Promise<void> {
-    if (!this.schedules.delete(id)) {
-      throw new RtDbError("NOT_FOUND", `schedule '${id}' not found`);
+  /** Cancels a scheduled job. Resolves `true` when a row was removed;
+   * `false` for an unknown id (a no-op, not an error) — the server's
+   * `scheduler::cancel` contract. */
+  async cancelSchedule(id: string): Promise<boolean> {
+    return this.schedules.delete(id);
+  }
+
+  /** Pauses a pending job. Resolves `false` when the job is missing or not
+   * pending — the server's `scheduler::set_paused(true)` contract. */
+  async pauseSchedule(id: string): Promise<boolean> {
+    const job = this.schedules.get(id);
+    if (!job || job.status !== "pending") {
+      return false;
     }
+    job.status = "paused";
+    return true;
   }
 
-  async pauseSchedule(id: string): Promise<void> {
-    this.requireSchedule(id).status = "paused";
-  }
-
-  async resumeSchedule(id: string): Promise<void> {
-    this.requireSchedule(id).status = "pending";
+  /** Resumes a paused job. Resolves `false` when the job is missing or not
+   * paused — the server's `scheduler::set_paused(false)` contract. */
+  async resumeSchedule(id: string): Promise<boolean> {
+    const job = this.schedules.get(id);
+    if (!job || job.status !== "paused") {
+      return false;
+    }
+    job.status = "pending";
+    return true;
   }
 
   async listSchedules(): Promise<ScheduleInfo[]> {
@@ -2065,14 +2080,6 @@ export class InMemoryRtDbClient {
       case "cron":
         return now + CRON_STEP_MS;
     }
-  }
-
-  private requireSchedule(id: string): ScheduledJob {
-    const job = this.schedules.get(id);
-    if (!job) {
-      throw new RtDbError("NOT_FOUND", `schedule '${id}' not found`);
-    }
-    return job;
   }
 
   private toScheduleInfo(job: ScheduledJob): ScheduleInfo {

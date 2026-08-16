@@ -268,22 +268,28 @@ class RtDbAsyncHttpClient:
         resp = await self._send("POST", "/api/schedule", json=body)
         return str(resp.json()["id"])
 
-    async def cancel_schedule(self, id: str) -> None:
-        """``POST /api/schedule/{id}/cancel``."""
-        await self._manage_schedule(id, "cancel")
+    async def cancel_schedule(self, id: str) -> bool:
+        """``POST /api/schedule/{id}/cancel`` → ``True`` when a pending job
+        was cancelled; ``False`` for a missing or already-terminal id (a
+        no-op, not an error)."""
+        return await self._manage_schedule(id, "cancel")
 
-    async def pause_schedule(self, id: str) -> None:
-        """``POST /api/schedule/{id}/pause``."""
-        await self._manage_schedule(id, "pause")
+    async def pause_schedule(self, id: str) -> bool:
+        """``POST /api/schedule/{id}/pause`` → ``True`` when a pending job
+        was paused; ``False`` when the id was unknown (a no-op)."""
+        return await self._manage_schedule(id, "pause")
 
-    async def resume_schedule(self, id: str) -> None:
-        """``POST /api/schedule/{id}/resume``."""
-        await self._manage_schedule(id, "resume")
+    async def resume_schedule(self, id: str) -> bool:
+        """``POST /api/schedule/{id}/resume`` → ``True`` when a paused job
+        was resumed; ``False`` when the id was unknown (a no-op)."""
+        return await self._manage_schedule(id, "resume")
 
-    async def _manage_schedule(self, id: str, op: str) -> None:
-        """Shared authorize-then-op for cancel/pause/resume (``{db}`` body → ``{ok}``)."""
+    async def _manage_schedule(self, id: str, op: str) -> bool:
+        """Shared authorize-then-op for cancel/pause/resume (``{db}`` body →
+        the response's ``ok``: ``False`` = unknown/terminal id, a no-op —
+        real errors surface as non-200 envelopes via ``_send``)."""
         resp = await self._send("POST", f"/api/schedule/{id}/{op}", json={"db": self._db})
-        self._expect_ok(resp)
+        return bool(resp.json()["ok"])
 
     async def list_schedules(self) -> list[ScheduleInfo]:
         """``POST /api/schedules`` → every schedule for this db."""
@@ -668,9 +674,3 @@ class RtDbAsyncHttpClient:
         if not resp.is_success:
             raise RtDbError.from_http(resp.status_code, resp.content)
         return resp
-
-    @staticmethod
-    def _expect_ok(resp: httpx.Response) -> None:
-        """Assert the body is ``{ok: true}``; raise ``RtDbError`` otherwise."""
-        if not resp.json().get("ok"):
-            raise RtDbError(ErrorCode.INTERNAL, "admin request returned ok=false")
