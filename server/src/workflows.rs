@@ -401,9 +401,6 @@ pub async fn cancel(pool: &PgPool, db: &str, id: &str) -> Result<bool, RtDbError
 
 /// Connection-bound variant of [`cancel`] for `Step::CancelWorkflow` — the
 /// UPDATE rides the caller's open sqlx transaction.
-// No caller yet: `Step::CancelWorkflow` lands in Task 4 (FM-29 plan) and
-// consumes this; remove the attribute then.
-#[allow(dead_code)]
 pub(crate) async fn cancel_on(
     conn: &mut PgConnection,
     db: &str,

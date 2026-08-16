@@ -12,19 +12,22 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
-use common::{fresh_db, test_hot, test_state};
+use common::{fresh_db, kanban_schema_json, test_hot, test_state, test_state_with_audit};
 use rtdb_server::AppState;
 use rtdb_server::auth::PrincipalCtx;
 use rtdb_server::committer::Committers;
 use rtdb_server::db::{SchemaCache, now_ms};
+use rtdb_server::error::ErrorCode;
 use rtdb_server::metrics::Metrics;
 use rtdb_server::op_feed::OpFeed;
 use rtdb_server::protocol::{
-    OutcomeStatus, WorkflowInfo, WorkflowInfoFull, WorkflowSpec, WorkflowStatus,
+    OutcomeStatus, ScheduleWhen, WorkflowInfo, WorkflowInfoFull, WorkflowSpec, WorkflowStatus,
 };
 use rtdb_server::quota;
+use rtdb_server::scheduler;
+use rtdb_server::schema::SchemaDef;
 use rtdb_server::subs::SubscriptionManager;
-use rtdb_server::txn::Transaction;
+use rtdb_server::txn::{Step, Transaction, execute_txn};
 use rtdb_server::workflows;
 
 fn one_step_spec(name: &str) -> WorkflowSpec {
@@ -297,4 +300,330 @@ async fn orphaned_running_row_resumes_to_success() {
     let full = await_status(&pool, &db, &id, |i| i.status == WorkflowStatus::Success).await;
     assert_eq!(full.step_outcomes.len(), 1);
     assert_eq!(projects_count(&pool, &db).await, 1);
+}
+
+// --- Task 4: `Step::StartWorkflow` / `Step::CancelWorkflow` txn steps -------
+// The harness mirrors `tests/schedule_step_test.rs`: `fresh_db` pushes the
+// kanban fixture, each test drives `execute_txn` directly with
+// `PrincipalCtx::bypass()`, and `ensure_table` stands in for the scheduler
+// startup's lazy ensure (no scheduler runs in these tests unless spawned).
+
+fn kanban_schema() -> SchemaDef {
+    serde_json::from_value(kanban_schema_json()).expect("parse kanban schema")
+}
+
+fn doc(value: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+    value.as_object().expect("json object").clone()
+}
+
+fn valid_project_doc() -> serde_json::Map<String, serde_json::Value> {
+    doc(serde_json::json!({
+        "name": "Alpha",
+        "description": null,
+        "status": "active",
+        "tags": ["a", "b"],
+        "updatedAt": 1.0
+    }))
+}
+
+/// A kanban-valid `workItems` doc. `projectId` is typed `id` (32-char hex);
+/// the type check is format-only (no cross-table existence check), so a fixed
+/// placeholder keeps the helper independent of any inserted project.
+fn valid_work_item_doc(title: &str) -> serde_json::Map<String, serde_json::Value> {
+    doc(serde_json::json!({
+        "projectId": "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6",
+        "title": title,
+        "status": "backlog",
+        "order": 1.0,
+        "completedAt": null
+    }))
+}
+
+/// (5) The StartWorkflow step commits atomically with the enclosing txn's
+/// writes, and a failing later step rolls the run row back with the txn —
+/// no orphan run survives.
+#[tokio::test]
+async fn start_workflow_step_is_atomic_with_writes() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+    workflows::ensure_table(&pool, &db).await?;
+
+    let outcome = execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![
+                Step::Insert {
+                    table: "projects".to_string(),
+                    doc: valid_project_doc(),
+                },
+                Step::StartWorkflow {
+                    spec: Box::new(one_step_spec("from-step")),
+                },
+            ],
+        },
+        &PrincipalCtx::bypass(),
+    )
+    .await?;
+    assert!(
+        outcome.results[1]["workflowId"].as_str().is_some(),
+        "startWorkflow result must carry a workflowId"
+    );
+
+    let listed = workflows::list(&pool, &db, None, 10).await?;
+    assert_eq!(listed.len(), 1, "exactly one run row");
+
+    // Rollback: a failing later step removes the run row too.
+    let err = execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![
+                Step::StartWorkflow {
+                    spec: Box::new(one_step_spec("rolled-back")),
+                },
+                Step::ExpectVersion {
+                    table: "projects".to_string(),
+                    id: "missing".to_string(),
+                    version: 9,
+                },
+            ],
+        },
+        &PrincipalCtx::bypass(),
+    )
+    .await
+    .expect_err("ExpectVersion on a missing doc must fail");
+    assert_eq!(err.code, ErrorCode::NotFound);
+    assert_eq!(
+        workflows::list(&pool, &db, None, 10).await?.len(),
+        1,
+        "rolled-back start must leave no orphan run row"
+    );
+
+    Ok(())
+}
+
+/// (6) CancelWorkflow step result shape + idempotence: first cancel reports
+/// true, a repeat reports false (already terminal).
+#[tokio::test]
+async fn cancel_workflow_step_result_shape() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+    workflows::ensure_table(&pool, &db).await?;
+    let id = workflows::insert(&pool, &db, &one_step_spec("cancelme")).await?;
+
+    let cancel = execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::CancelWorkflow { id: id.clone() }],
+        },
+        &PrincipalCtx::bypass(),
+    )
+    .await?;
+    assert_eq!(
+        cancel.results,
+        vec![serde_json::json!({ "cancelled": true })]
+    );
+
+    // Cancelling again is a no-op, not an error.
+    let again = execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::CancelWorkflow { id }],
+        },
+        &PrincipalCtx::bypass(),
+    )
+    .await?;
+    assert_eq!(
+        again.results,
+        vec![serde_json::json!({ "cancelled": false })]
+    );
+
+    Ok(())
+}
+
+/// (7) Submit-time validation and recursive table scoping: an empty spec is
+/// `BadRequest` before anything is written; a scoped machine token cannot
+/// smuggle a future write into a forbidden table via a workflow step that
+/// fires later as bypass — directly, or nested inside a `Schedule` payload.
+#[tokio::test]
+async fn spec_bounds_and_allowlist_rejected() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+    workflows::ensure_table(&pool, &db).await?;
+
+    let mut empty = one_step_spec("x");
+    empty.steps.clear();
+    let err = execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::StartWorkflow {
+                spec: Box::new(empty),
+            }],
+        },
+        &PrincipalCtx::bypass(),
+    )
+    .await
+    .expect_err("empty workflow spec must be rejected");
+    assert_eq!(err.code, ErrorCode::BadRequest);
+    assert!(
+        workflows::list(&pool, &db, None, 10).await?.is_empty(),
+        "no run row may survive a rejected spec"
+    );
+
+    let scoped = PrincipalCtx {
+        user_id: None,
+        email: None,
+        tables: Some(vec!["projects".to_string()]),
+    };
+
+    // The smuggle attempt: a spec whose step txn writes the forbidden table.
+    let mut smuggle = one_step_spec("scoped");
+    smuggle.steps[0].txn.steps = vec![Step::Insert {
+        table: "workItems".to_string(),
+        doc: valid_work_item_doc("smuggled"),
+    }];
+    let err = execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::StartWorkflow {
+                spec: Box::new(smuggle),
+            }],
+        },
+        &scoped,
+    )
+    .await
+    .expect_err("scoped token must not start a workflow writing workItems");
+    assert_eq!(err.code, ErrorCode::Forbidden);
+    assert!(
+        workflows::list(&pool, &db, None, 10).await?.is_empty(),
+        "no run row may survive the Forbidden"
+    );
+
+    // The Schedule-nesting bypass: every top-level step is control flow (no
+    // table of its own), but the scheduled txn starts a workflow writing the
+    // forbidden table — the `authorize_txn_tables` → `authorize_spec_tables`
+    // recursion blocks it.
+    let mut nested = one_step_spec("nested");
+    nested.steps[0].txn.steps = vec![Step::Insert {
+        table: "workItems".to_string(),
+        doc: valid_work_item_doc("nested"),
+    }];
+    let err = execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::Schedule {
+                when: ScheduleWhen::RunAt {
+                    ms: now_ms() + 600_000,
+                },
+                txn: Box::new(Transaction {
+                    steps: vec![Step::StartWorkflow {
+                        spec: Box::new(nested),
+                    }],
+                }),
+            }],
+        },
+        &scoped,
+    )
+    .await
+    .expect_err("scoped token must not smuggle a workflow via Schedule");
+    assert_eq!(err.code, ErrorCode::Forbidden);
+    assert!(
+        scheduler::list(&pool, &db).await?.is_empty(),
+        "no job row may survive the Forbidden"
+    );
+
+    Ok(())
+}
+
+/// (8) Op-feed tap coverage (spec §Testing item 11): a workflow started via
+/// the txn step publishes each step's writes through the committer's tap
+/// sites — one `rtdb.audit_log` row per step write with `source = 'workflow'`
+/// and no principal (steps fire as the system bypass principal). Uses
+/// `test_state_with_audit` so `state.realtime.committers` carries
+/// `audit_log_enabled = true` without touching env vars.
+#[tokio::test]
+async fn workflow_step_writes_publish_to_audit_tap() -> anyhow::Result<()> {
+    let state = test_state_with_audit().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    workflows::ensure_table(&pool, &db).await?;
+
+    let spec: WorkflowSpec = serde_json::from_value(serde_json::json!({
+        "name": "audited",
+        "steps": [insert_step("A0"), insert_step("A1")]
+    }))
+    .expect("parse audited workflow spec");
+    let outcome = state
+        .realtime
+        .committers
+        .mutate(
+            &db,
+            None,
+            Transaction {
+                steps: vec![Step::StartWorkflow {
+                    spec: Box::new(spec),
+                }],
+            },
+            PrincipalCtx::bypass(),
+        )
+        .await?;
+    let id = outcome.results[0]["workflowId"]
+        .as_str()
+        .expect("workflowId string")
+        .to_string();
+
+    let full = await_status(&pool, &db, &id, |i| i.status == WorkflowStatus::Success).await;
+    assert_eq!(full.step_outcomes.len(), 2);
+
+    // The tap writes land in the same committer turn AFTER each step txn
+    // commits, each on its own await — poll for the audit rows before
+    // asserting their content (ttl_test.rs's pattern).
+    let mut count: i64 = 0;
+    for _ in 0..100 {
+        count = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM rtdb.audit_log WHERE db = $1 AND source = 'workflow'",
+        )
+        .bind(db.as_str())
+        .fetch_one(&pool)
+        .await?;
+        if count == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(count, 2, "one audit row per workflow step write");
+
+    // owner = None in the tap payload ⇒ `principal` is NULL on every row.
+    let principals: Vec<(Option<String>,)> = sqlx::query_as(
+        "SELECT principal FROM rtdb.audit_log WHERE db = $1 AND source = 'workflow'",
+    )
+    .bind(db.as_str())
+    .fetch_all(&pool)
+    .await?;
+    assert_eq!(principals.len(), 2);
+    assert!(
+        principals.iter().all(|(p,)| p.is_none()),
+        "workflow step audit rows carry no principal"
+    );
+
+    Ok(())
 }
