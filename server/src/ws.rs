@@ -25,11 +25,12 @@ use crate::auth::{
 };
 use crate::db::now_ms;
 use crate::error::{ErrorCode, RtDbError};
-use crate::protocol::{ClientMessage, ScheduleWhen, ServerMessage};
+use crate::protocol::{ClientMessage, ScheduleWhen, ServerMessage, WorkflowSpec, WorkflowStatus};
 use crate::rate_limit::{RateDecision, evaluate};
 use crate::scheduler;
 use crate::subs::{ConnId, next_conn_id};
-use crate::txn::authorize_txn_tables;
+use crate::txn::{authorize_spec_tables, authorize_txn_tables};
+use crate::workflows;
 
 const AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_FRAME_BYTES: usize = 64 * 1024;
@@ -426,6 +427,16 @@ async fn handle_text_frame(
         ClientMessage::ListSchedules { schedule_id } => {
             handle_list_schedules(fctx, schedule_id).await
         }
+        ClientMessage::StartWorkflow { workflow_id, spec } => {
+            handle_start_workflow(fctx, workflow_id, spec).await
+        }
+        ClientMessage::CancelWorkflow { workflow_id, id } => {
+            handle_cancel_workflow(fctx, workflow_id, id).await
+        }
+        ClientMessage::ListWorkflows {
+            workflow_id,
+            status,
+        } => handle_list_workflows(fctx, workflow_id, status).await,
         ClientMessage::Presence {
             room,
             state: presence_state,
@@ -671,6 +682,105 @@ async fn handle_list_schedules(fctx: &FrameCtx<'_>, schedule_id: String) -> bool
             Err(error) => ServerMessage::ScheduleErr { schedule_id, error },
         },
         Err(error) => ServerMessage::ScheduleErr { schedule_id, error },
+    };
+    let _ = out_tx.send(reply);
+    false
+}
+
+/// `StartWorkflow` arm: `authorize`-only gate (the schedule family's
+/// precedent — workflows never carried the admin bypass), reject read-only
+/// tokens, then validate the spec and table-scope-check it recursively at
+/// submit (FM-29 — steps fire later as bypass, so this is the only scoped
+/// check), insert the run row, and re-read it for the `WorkflowInfo` reply.
+async fn handle_start_workflow(
+    fctx: &FrameCtx<'_>,
+    workflow_id: String,
+    spec: WorkflowSpec,
+) -> bool {
+    let state = fctx.state;
+    let principal = fctx.principal;
+    let db = fctx.db;
+    let out_tx = fctx.out_tx;
+
+    let reply = match authorize(&state.pool, principal, db).await {
+        Ok(()) if principal.is_read_only() => ServerMessage::StartWorkflowErr {
+            workflow_id,
+            error: RtDbError::forbidden("read-only token cannot mutate"),
+        },
+        Ok(()) => {
+            let prepared = workflows::validate_spec(&spec)
+                .and_then(|()| authorize_spec_tables(&principal.row_ctx(), &spec));
+            match prepared {
+                Ok(()) => match workflows::insert(&state.pool, db, &spec).await {
+                    Ok(id) => match workflows::get(&state.pool, db, &id).await {
+                        Ok(Some(full)) => ServerMessage::StartWorkflowOk {
+                            workflow_id,
+                            info: full.info,
+                        },
+                        _ => ServerMessage::StartWorkflowErr {
+                            workflow_id,
+                            error: RtDbError::internal("workflow started but unreadable"),
+                        },
+                    },
+                    Err(error) => ServerMessage::StartWorkflowErr { workflow_id, error },
+                },
+                Err(error) => ServerMessage::StartWorkflowErr { workflow_id, error },
+            }
+        }
+        Err(error) => ServerMessage::StartWorkflowErr { workflow_id, error },
+    };
+    let _ = out_tx.send(reply);
+    false
+}
+
+/// `CancelWorkflow` arm: `authorize`-only gate, reject read-only tokens, then
+/// flip the run to `cancelled` (`run_simple_schedule`'s ack shape).
+async fn handle_cancel_workflow(fctx: &FrameCtx<'_>, workflow_id: String, id: String) -> bool {
+    let state = fctx.state;
+    let principal = fctx.principal;
+    let db = fctx.db;
+    let out_tx = fctx.out_tx;
+
+    let (ok, error) = match authorize(&state.pool, principal, db).await {
+        Ok(()) if principal.is_read_only() => (
+            false,
+            Some(RtDbError::forbidden("read-only token cannot mutate")),
+        ),
+        Ok(()) => match workflows::cancel(&state.pool, db, &id).await {
+            Ok(ok) => (ok, None),
+            Err(error) => (false, Some(error)),
+        },
+        Err(error) => (false, Some(error)),
+    };
+    let _ = out_tx.send(ServerMessage::WorkflowAck {
+        workflow_id,
+        ok,
+        error,
+    });
+    false
+}
+
+/// `ListWorkflows` arm: `authorize`-only gate, then list the database's runs
+/// (optional status filter, capped at 100).
+async fn handle_list_workflows(
+    fctx: &FrameCtx<'_>,
+    workflow_id: String,
+    status: Option<WorkflowStatus>,
+) -> bool {
+    let state = fctx.state;
+    let principal = fctx.principal;
+    let db = fctx.db;
+    let out_tx = fctx.out_tx;
+
+    let reply = match authorize(&state.pool, principal, db).await {
+        Ok(()) => match workflows::list(&state.pool, db, status.as_ref(), 100).await {
+            Ok(workflows) => ServerMessage::ListWorkflowsOk {
+                workflow_id,
+                workflows,
+            },
+            Err(error) => ServerMessage::StartWorkflowErr { workflow_id, error },
+        },
+        Err(error) => ServerMessage::StartWorkflowErr { workflow_id, error },
     };
     let _ = out_tx.send(reply);
     false

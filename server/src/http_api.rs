@@ -27,13 +27,14 @@ use crate::db::now_ms;
 use crate::error::RtDbError;
 use crate::image_transform::{Resolved, TransformParams};
 use crate::metrics::SlowQueryRecord;
-use crate::protocol::{ScheduleInfo, ScheduleWhen};
+use crate::protocol::{ScheduleInfo, ScheduleWhen, WorkflowInfo, WorkflowSpec, WorkflowStatus};
 use crate::query::{Query, QueryResult, compile_query, execute_query};
 use crate::rate_limit::{check_http_rate_limits, check_storage_public_rate_limit};
 use crate::scheduler;
 use crate::signed_url;
 use crate::storage;
 use crate::txn::Transaction;
+use crate::workflows;
 
 fn bearer_token(headers: &HeaderMap) -> Result<&str, RtDbError> {
     if let Some(v) = headers
@@ -467,6 +468,86 @@ async fn list_schedules_handler(
     Ok(Json(ListResponse { schedules }))
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StartWorkflowRequest {
+    db: String,
+    spec: WorkflowSpec,
+}
+
+#[derive(Serialize)]
+struct StartWorkflowResponse {
+    id: String,
+}
+
+/// `POST /api/workflows`: start a run. Mirrors `schedule_handler` — FM-29's
+/// version of the FM-28 tightening: a scoped machine token cannot smuggle a
+/// future write into a table outside its allowlist via a workflow step (steps
+/// fire later as bypass, so submit time is the only scoped check).
+async fn start_workflow_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    ApiJson(body): ApiJson<StartWorkflowRequest>,
+) -> Result<Json<StartWorkflowResponse>, RtDbError> {
+    let principal = authed(&state, &headers, &body.db).await?;
+    if principal.is_read_only() {
+        return Err(RtDbError::forbidden("read-only token cannot mutate"));
+    }
+    check_http_rate_limits(&state, &principal, &body.db).await?;
+    workflows::validate_spec(&body.spec)?;
+    crate::txn::authorize_spec_tables(&principal.row_ctx(), &body.spec)?;
+    let id = workflows::insert(&state.pool, &body.db, &body.spec).await?;
+    Ok(Json(StartWorkflowResponse { id }))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ListWorkflowsRequest {
+    db: String,
+    #[serde(default)]
+    status: Option<WorkflowStatus>,
+}
+
+#[derive(Serialize)]
+struct ListWorkflowsResponse {
+    workflows: Vec<WorkflowInfo>,
+}
+
+/// `POST /api/workflows/list`: the db's runs, newest first (optional status
+/// filter; capped at 100 like the WS arm).
+async fn list_workflows_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    ApiJson(body): ApiJson<ListWorkflowsRequest>,
+) -> Result<Json<ListWorkflowsResponse>, RtDbError> {
+    let principal = authed(&state, &headers, &body.db).await?;
+    check_http_rate_limits(&state, &principal, &body.db).await?;
+    let workflows = workflows::list(&state.pool, &body.db, body.status.as_ref(), 100).await?;
+    Ok(Json(ListWorkflowsResponse { workflows }))
+}
+
+#[derive(Serialize)]
+struct CancelWorkflowResponse {
+    cancelled: bool,
+}
+
+/// `POST /api/workflows/{id}/cancel`: flip a non-terminal run to `cancelled`
+/// (`false` for a missing or already-terminal run — a no-op, not an error).
+async fn cancel_workflow_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    ApiJson(body): ApiJson<ManageRequest>,
+) -> Result<Json<CancelWorkflowResponse>, RtDbError> {
+    let principal = authed(&state, &headers, &body.db).await?;
+    if principal.is_read_only() {
+        return Err(RtDbError::forbidden("read-only token cannot mutate"));
+    }
+    check_http_rate_limits(&state, &principal, &body.db).await?;
+    let cancelled = workflows::cancel(&state.pool, &body.db, &id).await?;
+    Ok(Json(CancelWorkflowResponse { cancelled }))
+}
+
 /// HTTP one-shot routes, authorized via `Authorization: Bearer <token>`
 /// (machine token or user session) resolved and checked per-request.
 pub fn http_api_routes() -> Router<Arc<AppState>> {
@@ -479,6 +560,9 @@ pub fn http_api_routes() -> Router<Arc<AppState>> {
         .route("/api/schedule/{id}/pause", post(pause_handler))
         .route("/api/schedule/{id}/resume", post(resume_handler))
         .route("/api/schedules", post(list_schedules_handler))
+        .route("/api/workflows", post(start_workflow_handler))
+        .route("/api/workflows/list", post(list_workflows_handler))
+        .route("/api/workflows/{id}/cancel", post(cancel_workflow_handler))
         // Upload bypasses axum's 2 MiB default body limit; `to_bytes` inside
         // the handler enforces `RTDB_MAX_FILE_SIZE` as the sole ceiling.
         .route(

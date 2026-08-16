@@ -65,6 +65,19 @@ pub enum ClientMessage {
     ListSchedules {
         schedule_id: String,
     },
+    StartWorkflow {
+        workflow_id: String,
+        spec: WorkflowSpec,
+    },
+    CancelWorkflow {
+        workflow_id: String,
+        id: String,
+    },
+    ListWorkflows {
+        workflow_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<WorkflowStatus>,
+    },
     Presence {
         room: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -131,6 +144,25 @@ pub enum ServerMessage {
     ListSchedulesOk {
         schedule_id: String,
         schedules: Vec<ScheduleInfo>,
+    },
+    StartWorkflowOk {
+        workflow_id: String,
+        info: WorkflowInfo,
+    },
+    StartWorkflowErr {
+        workflow_id: String,
+        error: RtDbError,
+    },
+    /// Reply to cancelWorkflow. `error` is omitted on the wire when `ok`.
+    WorkflowAck {
+        workflow_id: String,
+        ok: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<RtDbError>,
+    },
+    ListWorkflowsOk {
+        workflow_id: String,
+        workflows: Vec<WorkflowInfo>,
     },
     PresenceSnapshot {
         room: String,
@@ -849,5 +881,205 @@ mod tests {
         assert!(info.last_error.is_none());
         let v = serde_json::to_value(&info).unwrap();
         assert!(v.get("lastError").is_none() && v.get("finishedAt").is_none());
+    }
+
+    fn sample_workflow_spec() -> WorkflowSpec {
+        serde_json::from_value(serde_json::json!({
+            "name": "drip",
+            "steps": [ { "txn": { "steps": [] } } ]
+        }))
+        .expect("sample workflow spec")
+    }
+
+    fn sample_workflow_info() -> WorkflowInfo {
+        WorkflowInfo {
+            id: "wf1".to_string(),
+            name: "drip".to_string(),
+            status: WorkflowStatus::Pending,
+            current_step: 0,
+            step_count: 2,
+            attempts: 0,
+            sleep_until: Some(123),
+            last_error: None,
+            created_at: 1,
+            updated_at: 2,
+            started_at: None,
+            finished_at: None,
+        }
+    }
+
+    // FM-29 WS frame vocabulary: tags/fields exactly match the wire shapes the
+    // WS handlers and the client SDKs speak (spec §Wire protocol, WS frames).
+    #[test]
+    fn workflow_frame_wire_shapes() {
+        let m = serde_json::to_value(ClientMessage::StartWorkflow {
+            workflow_id: "c1".to_string(),
+            spec: sample_workflow_spec(),
+        })
+        .unwrap();
+        assert_eq!(m["type"], serde_json::json!("startWorkflow"));
+        assert_eq!(m["workflowId"], serde_json::json!("c1"));
+        assert_eq!(m["spec"]["name"], serde_json::json!("drip"));
+
+        assert_eq!(
+            serde_json::to_value(ClientMessage::CancelWorkflow {
+                workflow_id: "c2".to_string(),
+                id: "wf9".to_string(),
+            })
+            .unwrap(),
+            serde_json::json!({"type": "cancelWorkflow", "workflowId": "c2", "id": "wf9"})
+        );
+
+        // status omitted when None, snake_case string when Some, and the
+        // filtered frame parses back.
+        assert_eq!(
+            serde_json::to_value(ClientMessage::ListWorkflows {
+                workflow_id: "c3".to_string(),
+                status: None,
+            })
+            .unwrap(),
+            serde_json::json!({"type": "listWorkflows", "workflowId": "c3"})
+        );
+        let m = serde_json::to_value(ClientMessage::ListWorkflows {
+            workflow_id: "c3".to_string(),
+            status: Some(WorkflowStatus::Failed),
+        })
+        .unwrap();
+        assert_eq!(m["status"], serde_json::json!("failed"));
+        match serde_json::from_value::<ClientMessage>(serde_json::json!({
+            "type": "listWorkflows", "workflowId": "c3", "status": "failed"
+        }))
+        .unwrap()
+        {
+            ClientMessage::ListWorkflows {
+                workflow_id,
+                status,
+            } => {
+                assert_eq!(workflow_id, "c3");
+                assert_eq!(status, Some(WorkflowStatus::Failed));
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+
+        let m = serde_json::to_value(ServerMessage::StartWorkflowOk {
+            workflow_id: "c1".to_string(),
+            info: sample_workflow_info(),
+        })
+        .unwrap();
+        assert_eq!(m["type"], serde_json::json!("startWorkflowOk"));
+        assert_eq!(m["workflowId"], serde_json::json!("c1"));
+        assert_eq!(m["info"]["id"], serde_json::json!("wf1"));
+
+        let m = serde_json::to_value(ServerMessage::StartWorkflowErr {
+            workflow_id: "c1".to_string(),
+            error: RtDbError::bad_request("bad spec"),
+        })
+        .unwrap();
+        assert_eq!(m["type"], serde_json::json!("startWorkflowErr"));
+        assert_eq!(m["error"]["code"], serde_json::json!("BAD_REQUEST"));
+
+        let m = serde_json::to_value(ServerMessage::WorkflowAck {
+            workflow_id: "c1".to_string(),
+            ok: true,
+            error: None,
+        })
+        .unwrap();
+        assert_eq!(m["type"], serde_json::json!("workflowAck"));
+        // `error` is skipped on the wire when the ack is clean.
+        assert!(m.get("error").is_none());
+        let m = serde_json::to_value(ServerMessage::WorkflowAck {
+            workflow_id: "c1".to_string(),
+            ok: false,
+            error: Some(RtDbError::not_found("no such run")),
+        })
+        .unwrap();
+        assert_eq!(m["ok"], serde_json::json!(false));
+        assert_eq!(m["error"]["code"], serde_json::json!("NOT_FOUND"));
+
+        let m = serde_json::to_value(ServerMessage::ListWorkflowsOk {
+            workflow_id: "c4".to_string(),
+            workflows: vec![sample_workflow_info()],
+        })
+        .unwrap();
+        assert_eq!(m["type"], serde_json::json!("listWorkflowsOk"));
+        assert_eq!(m["workflows"][0]["id"], serde_json::json!("wf1"));
+    }
+
+    #[test]
+    fn workflow_status_round_trips_all_variants() {
+        let all = [
+            (WorkflowStatus::Pending, "pending"),
+            (WorkflowStatus::Running, "running"),
+            (WorkflowStatus::Success, "success"),
+            (WorkflowStatus::Failed, "failed"),
+            (WorkflowStatus::Cancelled, "cancelled"),
+        ];
+        for (variant, wire) in all {
+            assert_eq!(
+                serde_json::to_value(variant).unwrap(),
+                serde_json::json!(wire)
+            );
+            assert_eq!(wire.parse::<WorkflowStatus>().unwrap(), variant);
+            assert_eq!(variant.as_wire_str(), wire);
+        }
+    }
+
+    #[test]
+    fn workflow_info_full_flatten_round_trip() {
+        let full = WorkflowInfoFull {
+            info: sample_workflow_info(),
+            step_outcomes: vec![StepOutcome {
+                step_index: 0,
+                status: OutcomeStatus::Success,
+                attempts: 1,
+                at: 99,
+                error: None,
+            }],
+        };
+        let v = serde_json::to_value(&full).unwrap();
+        // The flattened info keys land at the TOP level (no "info" wrapper),
+        // alongside stepOutcomes.
+        assert!(v.get("info").is_none());
+        assert_eq!(v["id"], serde_json::json!("wf1"));
+        assert_eq!(v["status"], serde_json::json!("pending"));
+        assert_eq!(v["stepCount"], serde_json::json!(2));
+        assert_eq!(v["stepOutcomes"][0]["stepIndex"], serde_json::json!(0));
+        let restored: WorkflowInfoFull = serde_json::from_value(v).unwrap();
+        assert_eq!(restored.info.id, "wf1");
+        assert_eq!(restored.info.step_count, 2);
+        assert_eq!(restored.step_outcomes.len(), 1);
+
+        // deny_unknown_fields: a bogus key is rejected on the plain info
+        // projection AND on the flattened full shape.
+        let bad_info = serde_json::json!({
+            "id": "wf1", "name": "drip", "status": "pending",
+            "currentStep": 0, "stepCount": 1, "attempts": 0,
+            "createdAt": 1, "updatedAt": 2, "bogus": true
+        });
+        assert!(serde_json::from_value::<WorkflowInfo>(bad_info).is_err());
+        let bad_full = serde_json::json!({
+            "id": "wf1", "name": "drip", "status": "pending",
+            "currentStep": 0, "stepCount": 1, "attempts": 0,
+            "createdAt": 1, "updatedAt": 2, "stepOutcomes": [], "bogus": true
+        });
+        assert!(serde_json::from_value::<WorkflowInfoFull>(bad_full).is_err());
+    }
+
+    // `maxAttempts` is the one required StepRetry field — omitting it is a
+    // deserialize error, while initialRetryMs/maxRetryMs default (3.2 §retry).
+    #[test]
+    fn step_retry_requires_max_attempts() {
+        assert!(
+            serde_json::from_value::<StepRetry>(serde_json::json!({
+                "initialRetryMs": 100, "maxRetryMs": 200
+            }))
+            .is_err(),
+            "a retry object without maxAttempts must not deserialize"
+        );
+        let r: StepRetry = serde_json::from_value(serde_json::json!({ "maxAttempts": 4 })).unwrap();
+        assert_eq!(
+            (r.max_attempts, r.initial_retry_ms, r.max_retry_ms),
+            (4, 1_000, 60_000)
+        );
     }
 }

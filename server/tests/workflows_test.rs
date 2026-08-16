@@ -12,7 +12,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
-use common::{fresh_db, kanban_schema_json, test_hot, test_state, test_state_with_audit};
+use common::{
+    admin_post, fresh_db, kanban_schema_json, spawn_app, test_hot, test_state,
+    test_state_with_audit,
+};
 use rtdb_server::AppState;
 use rtdb_server::auth::PrincipalCtx;
 use rtdb_server::committer::Committers;
@@ -624,6 +627,318 @@ async fn workflow_step_writes_publish_to_audit_tap() -> anyhow::Result<()> {
         principals.iter().all(|(p,)| p.is_none()),
         "workflow step audit rows carry no principal"
     );
+
+    Ok(())
+}
+
+// --- Task 5: WS frames + HTTP one-shot start/cancel/list surfaces -----------
+// The harness mirrors `schedule_step_test.rs`'s HTTP/WS sections: `fresh_db`
+// pushes the kanban fixture, `ensure_table` stands in for the scheduler
+// startup's lazy ensure (the one-shot surfaces write the side table directly,
+// so no per-db tasks run here and runs stay `pending` for assertions).
+
+/// Raw bearer POST to a per-db API route (mirrors `schedule_step_test.rs::
+/// api_post`).
+async fn api_post(
+    addr: std::net::SocketAddr,
+    path: &str,
+    token: &str,
+    body: serde_json::Value,
+) -> reqwest::Response {
+    reqwest::Client::new()
+        .post(format!("http://{addr}{path}"))
+        .header("Authorization", format!("Bearer {token}"))
+        .json(&body)
+        .send()
+        .await
+        .expect("send api request")
+}
+
+/// Mints a machine token scoped to `tables` (pattern: `admin_test.rs`
+/// mint-and-list capabilities test) and returns the raw bearer secret.
+async fn mint_scoped_token(addr: std::net::SocketAddr, db: &str, tables: &[&str]) -> String {
+    let resp = admin_post(
+        addr,
+        "/admin/mint-token",
+        serde_json::json!({
+            "db": db,
+            "name": "scoped",
+            "tables": tables,
+            "readOnly": false,
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await.expect("parse mint-token response");
+    body["token"].as_str().expect("token").to_string()
+}
+
+/// A one-step projects-insert workflow spec as raw JSON (the kanban-valid
+/// shape `one_step_spec` builds, for HTTP bodies and WS frames).
+fn projects_spec_json(name: &str) -> serde_json::Value {
+    serde_json::to_value(one_step_spec(name)).expect("serialize projects spec")
+}
+
+/// The smuggle shape: a one-step spec whose txn inserts into `workItems`.
+fn workitems_spec_json(name: &str) -> serde_json::Value {
+    serde_json::json!({
+        "name": name,
+        "steps": [ { "txn": { "steps": [ { "op": "insert", "table": "workItems",
+            "doc": serde_json::Value::Object(valid_work_item_doc("smuggled")) } ] } } ]
+    })
+}
+
+/// (9) HTTP happy path: `POST /api/workflows` returns `{id}`;
+/// `/api/workflows/list` round-trips the run (unfiltered and status-filtered);
+/// `/api/workflows/{id}/cancel` flips it (`true` once, then `false`).
+#[tokio::test]
+async fn http_start_list_cancel_roundtrip() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    workflows::ensure_table(&pool, &db).await?;
+    let addr = spawn_app(state).await;
+    let token = mint_scoped_token(addr, &db, &["projects"]).await;
+
+    let resp = api_post(
+        addr,
+        "/api/workflows",
+        &token,
+        serde_json::json!({ "db": db, "spec": projects_spec_json("http-drip") }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await?;
+    let id = body["id"].as_str().expect("workflow id").to_string();
+    assert!(
+        body.get("spec").is_none(),
+        "start reply carries only the id"
+    );
+
+    let listed = workflows::list(&pool, &db, None, 10).await?;
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].id, id);
+
+    let resp = api_post(
+        addr,
+        "/api/workflows/list",
+        &token,
+        serde_json::json!({ "db": db }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(body["workflows"].as_array().map(Vec::len), Some(1));
+    assert_eq!(body["workflows"][0]["id"], serde_json::json!(id));
+    assert_eq!(body["workflows"][0]["name"], serde_json::json!("http-drip"));
+    assert_eq!(body["workflows"][0]["status"], serde_json::json!("pending"));
+    assert_eq!(body["workflows"][0]["stepCount"], serde_json::json!(1));
+
+    // Status filter: the pending run does not match `success`.
+    let resp = api_post(
+        addr,
+        "/api/workflows/list",
+        &token,
+        serde_json::json!({ "db": db, "status": "success" }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(body["workflows"].as_array().map(Vec::len), Some(0));
+
+    let resp = api_post(
+        addr,
+        &format!("/api/workflows/{id}/cancel"),
+        &token,
+        serde_json::json!({ "db": db }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(body, serde_json::json!({ "cancelled": true }));
+
+    // Cancelling again: already terminal, still 200 with false.
+    let resp = api_post(
+        addr,
+        &format!("/api/workflows/{id}/cancel"),
+        &token,
+        serde_json::json!({ "db": db }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(body, serde_json::json!({ "cancelled": false }));
+
+    let listed = workflows::list(&pool, &db, None, 10).await?;
+    assert_eq!(listed[0].status, WorkflowStatus::Cancelled);
+
+    Ok(())
+}
+
+/// (10) HTTP submit-time gates: an empty spec is `BadRequest` and a scoped
+/// token cannot start a workflow writing a forbidden table — both before any
+/// run row is written.
+#[tokio::test]
+async fn http_start_rejects_bad_spec_and_forbidden_table() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    workflows::ensure_table(&pool, &db).await?;
+    let addr = spawn_app(state).await;
+    let token = mint_scoped_token(addr, &db, &["projects"]).await;
+
+    let empty = serde_json::json!({ "name": "empty", "steps": [] });
+    let resp = api_post(
+        addr,
+        "/api/workflows",
+        &token,
+        serde_json::json!({ "db": db, "spec": empty }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(body["code"], serde_json::json!("BAD_REQUEST"));
+    assert!(
+        workflows::list(&pool, &db, None, 10).await?.is_empty(),
+        "no run row may survive a rejected spec"
+    );
+
+    let resp = api_post(
+        addr,
+        "/api/workflows",
+        &token,
+        serde_json::json!({ "db": db, "spec": workitems_spec_json("smuggle") }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::FORBIDDEN);
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(body["code"], serde_json::json!("FORBIDDEN"));
+    assert!(
+        workflows::list(&pool, &db, None, 10).await?.is_empty(),
+        "no run row may survive the Forbidden"
+    );
+
+    Ok(())
+}
+
+// (11) WS frames: the `/sync` StartWorkflow/CancelWorkflow/ListWorkflows arms
+// (the plumbing mirrors `schedule_step_test.rs`'s WS section).
+type WsStream =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+async fn ws_connect(addr: std::net::SocketAddr) -> WsStream {
+    let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/sync"))
+        .await
+        .expect("connect websocket");
+    ws
+}
+
+async fn ws_send_json(ws: &mut WsStream, msg: serde_json::Value) {
+    use futures_util::SinkExt as _;
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        msg.to_string().into(),
+    ))
+    .await
+    .expect("send frame");
+}
+
+async fn ws_recv_json(ws: &mut WsStream) -> serde_json::Value {
+    use futures_util::StreamExt as _;
+    match ws.next().await.expect("stream ended").expect("frame ok") {
+        tokio_tungstenite::tungstenite::Message::Text(text) => {
+            serde_json::from_str(&text).expect("parse json")
+        }
+        other => panic!("expected text frame, got {other:?}"),
+    }
+}
+
+async fn ws_auth(ws: &mut WsStream, token: &str, db: &str) -> serde_json::Value {
+    ws_send_json(
+        ws,
+        serde_json::json!({"type": "auth", "token": token, "db": db}),
+    )
+    .await;
+    ws_recv_json(ws).await
+}
+
+#[tokio::test]
+async fn ws_start_list_cancel_roundtrip() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    workflows::ensure_table(&pool, &db).await?;
+    let addr = spawn_app(state).await;
+    let token = mint_scoped_token(addr, &db, &["projects"]).await;
+
+    let mut ws = ws_connect(addr).await;
+    let hello = ws_auth(&mut ws, &token, &db).await;
+    assert_eq!(hello["type"], serde_json::json!("authOk"));
+
+    ws_send_json(
+        &mut ws,
+        serde_json::json!({
+            "type": "startWorkflow", "workflowId": "c1",
+            "spec": projects_spec_json("ws-drip"),
+        }),
+    )
+    .await;
+    let reply = ws_recv_json(&mut ws).await;
+    assert_eq!(reply["type"], serde_json::json!("startWorkflowOk"));
+    assert_eq!(reply["workflowId"], serde_json::json!("c1"));
+    let id = reply["info"]["id"].as_str().expect("info.id").to_string();
+    assert_eq!(reply["info"]["name"], serde_json::json!("ws-drip"));
+    assert_eq!(reply["info"]["status"], serde_json::json!("pending"));
+
+    // A bad spec replies startWorkflowErr without dropping the connection.
+    let empty = serde_json::json!({ "name": "empty", "steps": [] });
+    ws_send_json(
+        &mut ws,
+        serde_json::json!({
+            "type": "startWorkflow", "workflowId": "c2", "spec": empty,
+        }),
+    )
+    .await;
+    let reply = ws_recv_json(&mut ws).await;
+    assert_eq!(reply["type"], serde_json::json!("startWorkflowErr"));
+    assert_eq!(reply["workflowId"], serde_json::json!("c2"));
+    assert_eq!(reply["error"]["code"], serde_json::json!("BAD_REQUEST"));
+
+    ws_send_json(
+        &mut ws,
+        serde_json::json!({
+            "type": "listWorkflows", "workflowId": "c3", "status": "pending",
+        }),
+    )
+    .await;
+    let reply = ws_recv_json(&mut ws).await;
+    assert_eq!(reply["type"], serde_json::json!("listWorkflowsOk"));
+    assert_eq!(reply["workflowId"], serde_json::json!("c3"));
+    assert_eq!(reply["workflows"].as_array().map(Vec::len), Some(1));
+    assert_eq!(reply["workflows"][0]["id"], serde_json::json!(id));
+
+    ws_send_json(
+        &mut ws,
+        serde_json::json!({ "type": "cancelWorkflow", "workflowId": "c4", "id": id }),
+    )
+    .await;
+    let reply = ws_recv_json(&mut ws).await;
+    assert_eq!(reply["type"], serde_json::json!("workflowAck"));
+    assert_eq!(reply["workflowId"], serde_json::json!("c4"));
+    assert_eq!(reply["ok"], serde_json::json!(true));
+    assert!(reply.get("error").is_none(), "clean ack omits error");
+
+    ws_send_json(
+        &mut ws,
+        serde_json::json!({ "type": "cancelWorkflow", "workflowId": "c5", "id": id }),
+    )
+    .await;
+    let reply = ws_recv_json(&mut ws).await;
+    assert_eq!(reply["type"], serde_json::json!("workflowAck"));
+    assert_eq!(reply["ok"], serde_json::json!(false));
+
+    let listed = workflows::list(&pool, &db, None, 10).await?;
+    assert_eq!(listed.len(), 1, "the rejected spec left exactly one run");
+    assert_eq!(listed[0].status, WorkflowStatus::Cancelled);
 
     Ok(())
 }
