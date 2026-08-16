@@ -22,6 +22,7 @@ use crate::optimistic::{OptimisticProjection, project_optimistic_update};
 use crate::query::Query;
 use crate::wire::{
     AuthedUser, ClientMessage, PresenceMember, ScheduleInfo, ScheduleWhen, ServerMessage,
+    WorkflowInfo, WorkflowSpec, WorkflowStatus,
 };
 
 #[cfg(test)]
@@ -249,6 +250,40 @@ struct QueuedSchedule {
     reply: SchedReply,
 }
 
+/// Reply channel for a workflow call the caller is awaiting.
+type WfReply = oneshot::Sender<Result<WorkflowOutcome, RtDbError>>;
+
+/// The typed success payload of a workflow-family reply. Each public method
+/// extracts the arm it expects and treats any other arm as an internal error
+/// (the server sends the reply matching the request kind).
+#[derive(Debug)]
+enum WorkflowOutcome {
+    /// `startWorkflowOk { info }` — the newly created run's projection.
+    Info(WorkflowInfo),
+    /// `workflowAck { ok: true }` — cancel succeeded (no payload).
+    Ack,
+    /// `listWorkflowsOk { workflows }`.
+    List(Vec<WorkflowInfo>),
+}
+
+/// The request kind a workflow call will send once authenticated, carried
+/// while queued so the driver can build the right `ClientMessage` frame on
+/// flush. Mirrors `ts-client`'s `WorkflowMsg`.
+enum WorkflowMsg {
+    Start { spec: WorkflowSpec },
+    Cancel { id: String },
+    List { status: Option<WorkflowStatus> },
+}
+
+/// A workflow call awaiting its turn to be sent. Same reconnect contract as
+/// [`QueuedSchedule`]: in-flight on a failed send it is re-queued and fired on
+/// the next `authOk`.
+struct QueuedWorkflow {
+    workflow_id: String,
+    msg: WorkflowMsg,
+    reply: WfReply,
+}
+
 /// Commands callers send to the driver task.
 enum Cmd {
     /// Nudge the driver to (re)connect / re-auth — `connect()` and token refresh.
@@ -264,6 +299,9 @@ enum Cmd {
     /// A caller-initiated schedule/list/manage call with its reply channel.
     /// Boxed for the same reason as [`Cmd::Mutate`].
     Schedule(Box<QueuedSchedule>),
+    /// A caller-initiated workflow call with its reply channel. Boxed for the
+    /// same reason as [`Cmd::Mutate`].
+    Workflow(Box<QueuedWorkflow>),
     /// Join a presence room (bookkeeping already done; driver sends the wire
     /// frame only after auth, mirroring `Cmd::Subscribe`). Idempotent within a
     /// session — deduped via the `sent_rooms` set in the session loop.
@@ -334,6 +372,7 @@ struct ClientInner {
     sub_counter: AtomicU64,
     mut_counter: AtomicU64,
     sched_counter: AtomicU64,
+    wf_counter: AtomicU64,
 }
 
 /// A cloneable handle to the reactive client. Cloning shares one driver; dropping
@@ -524,6 +563,7 @@ impl RtDbClient {
             sub_counter: AtomicU64::new(1),
             mut_counter: AtomicU64::new(1),
             sched_counter: AtomicU64::new(1),
+            wf_counter: AtomicU64::new(1),
         });
 
         tokio::spawn(drive(Driver {
@@ -843,6 +883,74 @@ impl RtDbClient {
             .map_err(|_| RtDbError::internal("client is closed"))?
     }
 
+    /// Start a durable workflow run (FM-29). Resolves with the new run's
+    /// [`WorkflowInfo`] on `startWorkflowOk`; rejects with [`RtDbError`] on
+    /// `startWorkflowErr` (e.g. a spec validation failure). While
+    /// unauthenticated, the request queues and fires on the next `authOk`,
+    /// mirroring [`schedule`](Self::schedule).
+    pub async fn start_workflow(&self, spec: &WorkflowSpec) -> Result<WorkflowInfo, RtDbError> {
+        match self
+            .queue_workflow(WorkflowMsg::Start { spec: spec.clone() })
+            .await?
+        {
+            WorkflowOutcome::Info(info) => Ok(info),
+            _ => Err(RtDbError::internal("unexpected workflow reply")),
+        }
+    }
+
+    /// Cancel a workflow run (FM-29). Resolves on `workflowAck.ok:true`;
+    /// rejects with [`RtDbError`] when the server returns `ok:false` (e.g. a
+    /// missing or already-terminal run).
+    pub async fn cancel_workflow(&self, id: &str) -> Result<(), RtDbError> {
+        match self
+            .queue_workflow(WorkflowMsg::Cancel { id: id.to_string() })
+            .await?
+        {
+            WorkflowOutcome::Ack => Ok(()),
+            _ => Err(RtDbError::internal("unexpected workflow reply")),
+        }
+    }
+
+    /// List workflow runs (FM-29). Resolves with the `workflows` array on
+    /// `listWorkflowsOk`. A failed list arrives typed `startWorkflowErr`
+    /// carrying this call's correlation id (the frame vocabulary has no
+    /// distinct list-error frame) and rejects here.
+    pub async fn list_workflows(
+        &self,
+        status: Option<WorkflowStatus>,
+    ) -> Result<Vec<WorkflowInfo>, RtDbError> {
+        match self.queue_workflow(WorkflowMsg::List { status }).await? {
+            WorkflowOutcome::List(workflows) => Ok(workflows),
+            _ => Err(RtDbError::internal("unexpected workflow reply")),
+        }
+    }
+
+    /// Mint a `wf-${n}` correlation id and either dispatch the request (when
+    /// authenticated) or queue it for the next `authOk`, exactly like
+    /// [`queue_schedule`](Self::queue_schedule). The driver routes the matching
+    /// `ServerMessage` reply back through [`WfReply`].
+    async fn queue_workflow(&self, msg: WorkflowMsg) -> Result<WorkflowOutcome, RtDbError> {
+        if self.is_closed() {
+            return Err(RtDbError::internal("client is closed"));
+        }
+        let workflow_id = format!(
+            "wf-{}",
+            self.inner.wf_counter.fetch_add(1, Ordering::Relaxed)
+        );
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let _ = self
+            .inner
+            .cmd_tx
+            .send(Cmd::Workflow(Box::new(QueuedWorkflow {
+                workflow_id,
+                msg,
+                reply: reply_tx,
+            })));
+        reply_rx
+            .await
+            .map_err(|_| RtDbError::internal("client is closed"))?
+    }
+
     fn set_state(&self, state: ConnectionState) {
         let mut status = self.inner.status_tx.borrow().clone();
         status.state = state;
@@ -886,6 +994,8 @@ async fn drive(mut driver: Driver) {
     let mut unsent: VecDeque<QueuedMutate> = VecDeque::new();
     let mut pending_schedules: HashMap<String, SchedReply> = HashMap::new();
     let mut unsent_schedules: VecDeque<QueuedSchedule> = VecDeque::new();
+    let mut pending_workflows: HashMap<String, WfReply> = HashMap::new();
+    let mut unsent_workflows: VecDeque<QueuedWorkflow> = VecDeque::new();
 
     loop {
         if driver.inner.closed.load(Ordering::SeqCst) {
@@ -915,6 +1025,8 @@ async fn drive(mut driver: Driver) {
             &mut unsent,
             &mut pending_schedules,
             &mut unsent_schedules,
+            &mut pending_workflows,
+            &mut unsent_workflows,
         )
         .await
         {
@@ -931,6 +1043,11 @@ async fn drive(mut driver: Driver) {
                     &mut unsent_schedules,
                     "authentication failed",
                 );
+                reject_all_workflows(
+                    &mut pending_workflows,
+                    &mut unsent_workflows,
+                    "authentication failed",
+                );
                 if !wait_for_poke(&mut driver).await {
                     break;
                 }
@@ -944,6 +1061,10 @@ async fn drive(mut driver: Driver) {
                 );
                 reject_inflight_schedules(
                     &mut pending_schedules,
+                    "connection closed before acknowledgment",
+                );
+                reject_inflight_workflows(
+                    &mut pending_workflows,
                     "connection closed before acknowledgment",
                 );
                 match backoff_wait(&mut driver, attempt).await {
@@ -962,6 +1083,11 @@ async fn drive(mut driver: Driver) {
     reject_all_schedules(
         &mut pending_schedules,
         &mut unsent_schedules,
+        "client is closed",
+    );
+    reject_all_workflows(
+        &mut pending_workflows,
+        &mut unsent_workflows,
         "client is closed",
     );
     driver.set_state(ConnectionState::Closed);
@@ -1019,6 +1145,9 @@ async fn backoff_wait(driver: &mut Driver, attempt: u32) -> WaitResult {
 
 /// Open, authenticate, and run one session until it ends. Owns the heartbeat and
 /// routes every inbound [`ServerMessage`] through [`apply_server_message`].
+// Nine plumbing params: the mutate/schedule/workflow pending+unsent pairs are
+// structurally parallel and threaded through together.
+#[allow(clippy::too_many_arguments)]
 async fn run_session(
     driver: &mut Driver,
     epoch: u64,
@@ -1027,6 +1156,8 @@ async fn run_session(
     unsent: &mut VecDeque<QueuedMutate>,
     pending_schedules: &mut HashMap<String, SchedReply>,
     unsent_schedules: &mut VecDeque<QueuedSchedule>,
+    pending_workflows: &mut HashMap<String, WfReply>,
+    unsent_workflows: &mut VecDeque<QueuedWorkflow>,
 ) -> SessionOutcome {
     if driver.inner.closed.load(Ordering::SeqCst)
         || driver.inner.generation.load(Ordering::SeqCst) != epoch
@@ -1162,6 +1293,17 @@ async fn run_session(
         }
     }
 
+    // Flush workflow calls queued while disconnected.
+    while let Some(q) = unsent_workflows.pop_front() {
+        match deliver_workflow(&mut sink, q, pending_workflows).await {
+            Ok(()) => {}
+            Err(q) => {
+                unsent_workflows.push_back(q);
+                return SessionOutcome::Reconnect;
+            }
+        }
+    }
+
     let mut liveness = Liveness::new(driver.inner.config.heartbeat);
     let mut ticker = interval(driver.inner.config.heartbeat);
     ticker.tick().await; // skip the immediate tick
@@ -1209,6 +1351,15 @@ async fn run_session(
                         }
                     }
                 }
+                Some(Cmd::Workflow(q)) => {
+                    match deliver_workflow(&mut sink, *q, pending_workflows).await {
+                        Ok(()) => {}
+                        Err(q) => {
+                            unsent_workflows.push_back(q);
+                            return SessionOutcome::Reconnect;
+                        }
+                    }
+                }
                 Some(Cmd::PresenceJoin { room, state }) => {
                     // Dedup within the session: the replay-at-session-start loop
                     // may have already sent this room's join.
@@ -1248,7 +1399,13 @@ async fn run_session(
             incoming = stream.next() => match incoming {
                 Some(Ok(WsMessage::Text(t))) => {
                     if let Ok(msg) = serde_json::from_str::<ServerMessage>(t.as_str()) {
-                        apply_server_message(&driver.inner, msg, pending, pending_schedules);
+                        apply_server_message(
+                            &driver.inner,
+                            msg,
+                            pending,
+                            pending_schedules,
+                            pending_workflows,
+                        );
                     }
                 }
                 Some(Ok(WsMessage::Ping(p))) => {
@@ -1353,6 +1510,38 @@ where
     Ok(())
 }
 
+/// Serialize + send a workflow frame, registering its reply on success.
+/// `Err(q)` means the send failed mid-session: the caller re-queues `q` so it
+/// fires on the next auth (same contract as [`deliver_schedule`]).
+async fn deliver_workflow<S>(
+    sink: &mut S,
+    q: QueuedWorkflow,
+    pending: &mut HashMap<String, WfReply>,
+) -> Result<(), QueuedWorkflow>
+where
+    S: Sink<WsMessage> + Unpin,
+{
+    let frame = match &q.msg {
+        WorkflowMsg::Start { spec } => ClientMessage::StartWorkflow {
+            workflow_id: q.workflow_id.clone(),
+            spec: spec.clone(),
+        },
+        WorkflowMsg::Cancel { id } => ClientMessage::CancelWorkflow {
+            workflow_id: q.workflow_id.clone(),
+            id: id.clone(),
+        },
+        WorkflowMsg::List { status } => ClientMessage::ListWorkflows {
+            workflow_id: q.workflow_id.clone(),
+            status: *status,
+        },
+    };
+    if send_text(sink, &frame).await.is_err() {
+        return Err(q);
+    }
+    pending.insert(q.workflow_id, q.reply);
+    Ok(())
+}
+
 /// Serialize a client message and send it as a text frame. Generic over the sink
 /// so the concrete tungstenite type is never named (it would pull
 /// `tokio::net::TcpStream`, needing the `net` feature).
@@ -1377,6 +1566,7 @@ fn apply_server_message(
     msg: ServerMessage,
     pending: &mut HashMap<String, MutReply>,
     pending_schedules: &mut HashMap<String, SchedReply>,
+    pending_workflows: &mut HashMap<String, WfReply>,
 ) {
     match msg {
         ServerMessage::QueryUpdate { query_id, result } => {
@@ -1452,6 +1642,42 @@ fn apply_server_message(
         } => {
             if let Some(reply) = pending_schedules.remove(&schedule_id) {
                 let _ = reply.send(Ok(ScheduleOutcome::List(schedules)));
+            }
+        }
+        ServerMessage::StartWorkflowOk { workflow_id, info } => {
+            if let Some(reply) = pending_workflows.remove(&workflow_id) {
+                let _ = reply.send(Ok(WorkflowOutcome::Info(info)));
+            }
+        }
+        ServerMessage::StartWorkflowErr { workflow_id, error } => {
+            // Also carries a failed `listWorkflows`' correlation id — the
+            // frame vocabulary has no distinct list-error frame, so both the
+            // start and list families reject through this arm.
+            if let Some(reply) = pending_workflows.remove(&workflow_id) {
+                let _ = reply.send(Err(error));
+            }
+        }
+        ServerMessage::WorkflowAck {
+            workflow_id,
+            ok,
+            error,
+        } => {
+            if let Some(reply) = pending_workflows.remove(&workflow_id) {
+                if ok {
+                    let _ = reply.send(Ok(WorkflowOutcome::Ack));
+                } else {
+                    let err =
+                        error.unwrap_or_else(|| RtDbError::internal("workflow operation failed"));
+                    let _ = reply.send(Err(err));
+                }
+            }
+        }
+        ServerMessage::ListWorkflowsOk {
+            workflow_id,
+            workflows,
+        } => {
+            if let Some(reply) = pending_workflows.remove(&workflow_id) {
+                let _ = reply.send(Ok(WorkflowOutcome::List(workflows)));
             }
         }
         ServerMessage::PresenceSnapshot { room, members } => {
@@ -1617,6 +1843,29 @@ fn reject_all_schedules(
     }
 }
 
+/// Reject every in-flight (sent, unacked) workflow call. Queued (never-sent)
+/// calls are left intact so they survive the reconnect — see
+/// [`reject_all_workflows`].
+fn reject_inflight_workflows(pending: &mut HashMap<String, WfReply>, reason: &str) {
+    let err = RtDbError::new(ErrorCode::Internal, reason);
+    for (_, reply) in pending.drain() {
+        let _ = reply.send(Err(err.clone()));
+    }
+}
+
+/// Reject every workflow call, in-flight and queued. Used on terminal teardown.
+fn reject_all_workflows(
+    pending: &mut HashMap<String, WfReply>,
+    unsent: &mut VecDeque<QueuedWorkflow>,
+    reason: &str,
+) {
+    reject_inflight_workflows(pending, reason);
+    let err = RtDbError::new(ErrorCode::Internal, reason);
+    for q in unsent.drain(..) {
+        let _ = q.reply.send(Err(err.clone()));
+    }
+}
+
 // ── helpers ──────────────────────────────────────────────────────────────────
 
 impl Driver {
@@ -1678,6 +1927,7 @@ fn jitter_fraction() -> f64 {
 mod tests {
     use super::*;
     use crate::query::TableQuery;
+    use crate::wire::WorkflowStepSpec;
     use serde_json::json;
 
     fn q(table: &str) -> Query {
@@ -1787,6 +2037,55 @@ mod tests {
     }
 
     #[test]
+    fn workflow_client_frame_shapes() {
+        let spec = WorkflowSpec {
+            name: "drip".into(),
+            steps: vec![WorkflowStepSpec {
+                txn: Transaction { steps: vec![] },
+                retry: None,
+                sleep_before_ms: None,
+            }],
+        };
+        let s = serde_json::to_value(ClientMessage::StartWorkflow {
+            workflow_id: "wf-1".into(),
+            spec,
+        })
+        .unwrap();
+        assert_eq!(
+            s,
+            json!({
+                "type":"startWorkflow",
+                "workflowId":"wf-1",
+                "spec":{"name":"drip","steps":[{"txn":{"steps":[]}}]}
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(ClientMessage::CancelWorkflow {
+                workflow_id: "wf-2".into(),
+                id: "wf-9".into(),
+            })
+            .unwrap(),
+            json!({"type":"cancelWorkflow","workflowId":"wf-2","id":"wf-9"})
+        );
+        assert_eq!(
+            serde_json::to_value(ClientMessage::ListWorkflows {
+                workflow_id: "wf-3".into(),
+                status: None,
+            })
+            .unwrap(),
+            json!({"type":"listWorkflows","workflowId":"wf-3"})
+        );
+        assert_eq!(
+            serde_json::to_value(ClientMessage::ListWorkflows {
+                workflow_id: "wf-3".into(),
+                status: Some(WorkflowStatus::Failed),
+            })
+            .unwrap(),
+            json!({"type":"listWorkflows","workflowId":"wf-3","status":"failed"})
+        );
+    }
+
+    #[test]
     fn server_messages_round_trip() {
         let cases = vec![
             json!({"type":"queryUpdate","queryId":"sub-1","result":[{"_id":"a"}]}),
@@ -1798,6 +2097,11 @@ mod tests {
             json!({"type":"scheduleAck","scheduleId":"sch-1","ok":true}),
             json!({"type":"scheduleAck","scheduleId":"sch-1","ok":false,"error":{"code":"NOT_FOUND","message":"missing job"}}),
             json!({"type":"listSchedulesOk","scheduleId":"sch-1","schedules":[]}),
+            json!({"type":"startWorkflowOk","workflowId":"wf-1","info":{"id":"wf1","name":"drip","status":"pending","currentStep":0,"stepCount":2,"attempts":0,"sleepUntil":123,"createdAt":1,"updatedAt":2}}),
+            json!({"type":"startWorkflowErr","workflowId":"wf-2","error":{"code":"BAD_REQUEST","message":"bad spec"}}),
+            json!({"type":"workflowAck","workflowId":"wf-3","ok":true}),
+            json!({"type":"workflowAck","workflowId":"wf-4","ok":false,"error":{"code":"NOT_FOUND","message":"no such run"}}),
+            json!({"type":"listWorkflowsOk","workflowId":"wf-5","workflows":[]}),
             json!({"type":"pong"}),
         ];
         for raw in cases {
@@ -1833,6 +2137,7 @@ mod tests {
             sub_counter: AtomicU64::new(1),
             mut_counter: AtomicU64::new(1),
             sched_counter: AtomicU64::new(1),
+            wf_counter: AtomicU64::new(1),
         });
         let query = q("items");
         let (tx, rx) = watch::channel(Snapshot::Pending);
@@ -1866,6 +2171,7 @@ mod tests {
         let (inner, rx) = rig_with_sub();
         let mut pending = HashMap::new();
         let mut pending_schedules: HashMap<String, SchedReply> = HashMap::new();
+        let mut pending_workflows: HashMap<String, WfReply> = HashMap::new();
         apply_server_message(
             &inner,
             ServerMessage::QueryUpdate {
@@ -1874,6 +2180,7 @@ mod tests {
             },
             &mut pending,
             &mut pending_schedules,
+            &mut pending_workflows,
         );
         assert!(matches!(rx.borrow().clone(), Snapshot::Value(_)));
     }
@@ -1883,6 +2190,7 @@ mod tests {
         let (inner, rx) = rig_with_sub();
         let mut pending = HashMap::new();
         let mut pending_schedules: HashMap<String, SchedReply> = HashMap::new();
+        let mut pending_workflows: HashMap<String, WfReply> = HashMap::new();
         apply_server_message(
             &inner,
             ServerMessage::SubscribeErr {
@@ -1891,6 +2199,7 @@ mod tests {
             },
             &mut pending,
             &mut pending_schedules,
+            &mut pending_workflows,
         );
         assert!(matches!(rx.borrow().clone(), Snapshot::Error(_)));
         let maps = inner.subs.lock().unwrap();
@@ -1903,6 +2212,7 @@ mod tests {
         let (inner, _) = rig_with_sub();
         let mut pending: HashMap<String, MutReply> = HashMap::new();
         let mut pending_schedules: HashMap<String, SchedReply> = HashMap::new();
+        let mut pending_workflows: HashMap<String, WfReply> = HashMap::new();
         let (tx_ok, rx_ok) = oneshot::channel();
         let (tx_err, rx_err) = oneshot::channel();
         pending.insert("mut-1".into(), tx_ok);
@@ -1916,6 +2226,7 @@ mod tests {
             },
             &mut pending,
             &mut pending_schedules,
+            &mut pending_workflows,
         );
         apply_server_message(
             &inner,
@@ -1925,6 +2236,7 @@ mod tests {
             },
             &mut pending,
             &mut pending_schedules,
+            &mut pending_workflows,
         );
         let ok = rx_ok.await.unwrap().unwrap();
         assert_eq!(ok.len(), 1);
@@ -1976,6 +2288,7 @@ mod tests {
         let (inner, rx) = rig_with_presence("doc:1");
         let mut pending = HashMap::new();
         let mut pending_schedules: HashMap<String, SchedReply> = HashMap::new();
+        let mut pending_workflows: HashMap<String, WfReply> = HashMap::new();
         apply_server_message(
             &inner,
             ServerMessage::PresenceSnapshot {
@@ -1984,6 +2297,7 @@ mod tests {
             },
             &mut pending,
             &mut pending_schedules,
+            &mut pending_workflows,
         );
         match rx.borrow().clone() {
             PresenceSnapshot::Members(m) => {
@@ -2000,6 +2314,7 @@ mod tests {
         let (inner, rx) = rig_with_presence("doc:1");
         let mut pending = HashMap::new();
         let mut pending_schedules: HashMap<String, SchedReply> = HashMap::new();
+        let mut pending_workflows: HashMap<String, WfReply> = HashMap::new();
         // A snapshot for a room we haven't joined should not affect our receiver.
         apply_server_message(
             &inner,
@@ -2009,6 +2324,7 @@ mod tests {
             },
             &mut pending,
             &mut pending_schedules,
+            &mut pending_workflows,
         );
         assert!(matches!(rx.borrow().clone(), PresenceSnapshot::Pending));
     }
@@ -2018,6 +2334,7 @@ mod tests {
         let (inner, rx) = rig_with_presence("doc:1");
         let mut pending = HashMap::new();
         let mut pending_schedules: HashMap<String, SchedReply> = HashMap::new();
+        let mut pending_workflows: HashMap<String, WfReply> = HashMap::new();
         apply_server_message(
             &inner,
             ServerMessage::PresenceErr {
@@ -2026,6 +2343,7 @@ mod tests {
             },
             &mut pending,
             &mut pending_schedules,
+            &mut pending_workflows,
         );
         match rx.borrow().clone() {
             PresenceSnapshot::Error(e) => {
@@ -2101,6 +2419,7 @@ mod tests {
         }
         let mut pending = HashMap::new();
         let mut pending_schedules: HashMap<String, SchedReply> = HashMap::new();
+        let mut pending_workflows: HashMap<String, WfReply> = HashMap::new();
         apply_server_message(
             &inner,
             ServerMessage::QueryUpdate {
@@ -2109,6 +2428,7 @@ mod tests {
             },
             &mut pending,
             &mut pending_schedules,
+            &mut pending_workflows,
         );
         match rx.borrow().clone() {
             Snapshot::Value(v) => {
@@ -2158,6 +2478,7 @@ mod tests {
 
         let mut pending: HashMap<String, MutReply> = HashMap::new();
         let mut pending_schedules: HashMap<String, SchedReply> = HashMap::new();
+        let mut pending_workflows: HashMap<String, WfReply> = HashMap::new();
         apply_server_message(
             &inner,
             ServerMessage::MutateErr {
@@ -2166,6 +2487,7 @@ mod tests {
             },
             &mut pending,
             &mut pending_schedules,
+            &mut pending_workflows,
         );
 
         match rx.borrow().clone() {
@@ -2206,6 +2528,7 @@ mod tests {
 
         let mut pending: HashMap<String, MutReply> = HashMap::new();
         let mut pending_schedules: HashMap<String, SchedReply> = HashMap::new();
+        let mut pending_workflows: HashMap<String, WfReply> = HashMap::new();
         let (reply_tx, _reply_rx) = oneshot::channel();
         pending.insert("mut-1".into(), reply_tx);
         apply_server_message(
@@ -2216,6 +2539,7 @@ mod tests {
             },
             &mut pending,
             &mut pending_schedules,
+            &mut pending_workflows,
         );
 
         // Receiver is unchanged — the overlaid value stays until the QueryUpdate
@@ -2245,6 +2569,7 @@ mod tests {
         let (inner, _) = rig_with_sub();
         let mut pending: HashMap<String, MutReply> = HashMap::new();
         let mut pending_schedules: HashMap<String, SchedReply> = HashMap::new();
+        let mut pending_workflows: HashMap<String, WfReply> = HashMap::new();
         let (tx_ok, rx_ok) = oneshot::channel();
         let (tx_err, rx_err) = oneshot::channel();
         let (tx_ack_ok, rx_ack_ok) = oneshot::channel();
@@ -2264,6 +2589,7 @@ mod tests {
             },
             &mut pending,
             &mut pending_schedules,
+            &mut pending_workflows,
         );
         apply_server_message(
             &inner,
@@ -2273,6 +2599,7 @@ mod tests {
             },
             &mut pending,
             &mut pending_schedules,
+            &mut pending_workflows,
         );
         apply_server_message(
             &inner,
@@ -2283,6 +2610,7 @@ mod tests {
             },
             &mut pending,
             &mut pending_schedules,
+            &mut pending_workflows,
         );
         apply_server_message(
             &inner,
@@ -2293,6 +2621,7 @@ mod tests {
             },
             &mut pending,
             &mut pending_schedules,
+            &mut pending_workflows,
         );
         apply_server_message(
             &inner,
@@ -2311,6 +2640,7 @@ mod tests {
             },
             &mut pending,
             &mut pending_schedules,
+            &mut pending_workflows,
         );
 
         match rx_ok.await.unwrap().unwrap() {
@@ -2333,6 +2663,134 @@ mod tests {
             other => panic!("expected List, got {other:?}"),
         }
         assert!(pending_schedules.is_empty());
+    }
+
+    // Mirror of `schedule_replies_resolve_pending` for the workflow track
+    // (FM-29): `startWorkflowOk`/`startWorkflowErr`/`workflowAck`/
+    // `listWorkflowsOk` resolve the pending reply. Note the error routing: the
+    // frame vocabulary has no listWorkflowsErr — a failed `listWorkflows`
+    // arrives as `startWorkflowErr` carrying the LIST call's correlation id
+    // (mirrors listSchedules → scheduleErr).
+    #[tokio::test]
+    async fn workflow_replies_resolve_pending() {
+        let (inner, _) = rig_with_sub();
+        let mut pending: HashMap<String, MutReply> = HashMap::new();
+        let mut pending_schedules: HashMap<String, SchedReply> = HashMap::new();
+        let mut pending_workflows: HashMap<String, WfReply> = HashMap::new();
+        let (tx_ok, rx_ok) = oneshot::channel();
+        let (tx_err, rx_err) = oneshot::channel();
+        let (tx_ack_ok, rx_ack_ok) = oneshot::channel();
+        let (tx_ack_err, rx_ack_err) = oneshot::channel();
+        let (tx_list, rx_list) = oneshot::channel();
+        let (tx_list_err, rx_list_err) = oneshot::channel();
+        pending_workflows.insert("wf-1".into(), tx_ok);
+        pending_workflows.insert("wf-2".into(), tx_err);
+        pending_workflows.insert("wf-3".into(), tx_ack_ok);
+        pending_workflows.insert("wf-4".into(), tx_ack_err);
+        pending_workflows.insert("wf-5".into(), tx_list);
+        pending_workflows.insert("wf-6".into(), tx_list_err);
+
+        let info = WorkflowInfo {
+            id: "wf1".into(),
+            name: "drip".into(),
+            status: WorkflowStatus::Pending,
+            current_step: 0,
+            step_count: 2,
+            attempts: 0,
+            sleep_until: None,
+            last_error: None,
+            created_at: 1,
+            updated_at: 2,
+            started_at: None,
+            finished_at: None,
+        };
+        apply_server_message(
+            &inner,
+            ServerMessage::StartWorkflowOk {
+                workflow_id: "wf-1".into(),
+                info: info.clone(),
+            },
+            &mut pending,
+            &mut pending_schedules,
+            &mut pending_workflows,
+        );
+        apply_server_message(
+            &inner,
+            ServerMessage::StartWorkflowErr {
+                workflow_id: "wf-2".into(),
+                error: RtDbError::new(ErrorCode::BadRequest, "bad spec"),
+            },
+            &mut pending,
+            &mut pending_schedules,
+            &mut pending_workflows,
+        );
+        apply_server_message(
+            &inner,
+            ServerMessage::WorkflowAck {
+                workflow_id: "wf-3".into(),
+                ok: true,
+                error: None,
+            },
+            &mut pending,
+            &mut pending_schedules,
+            &mut pending_workflows,
+        );
+        apply_server_message(
+            &inner,
+            ServerMessage::WorkflowAck {
+                workflow_id: "wf-4".into(),
+                ok: false,
+                error: Some(RtDbError::new(ErrorCode::NotFound, "no such run")),
+            },
+            &mut pending,
+            &mut pending_schedules,
+            &mut pending_workflows,
+        );
+        apply_server_message(
+            &inner,
+            ServerMessage::ListWorkflowsOk {
+                workflow_id: "wf-5".into(),
+                workflows: vec![info],
+            },
+            &mut pending,
+            &mut pending_schedules,
+            &mut pending_workflows,
+        );
+        // The binding ruling: a failed list arrives as startWorkflowErr with
+        // the list call's correlation id.
+        apply_server_message(
+            &inner,
+            ServerMessage::StartWorkflowErr {
+                workflow_id: "wf-6".into(),
+                error: RtDbError::new(ErrorCode::Internal, "list failed"),
+            },
+            &mut pending,
+            &mut pending_schedules,
+            &mut pending_workflows,
+        );
+
+        match rx_ok.await.unwrap().unwrap() {
+            WorkflowOutcome::Info(info) => assert_eq!(info.id, "wf1"),
+            other => panic!("expected Info, got {other:?}"),
+        }
+        let err = rx_err.await.unwrap().unwrap_err();
+        assert_eq!(err.code, ErrorCode::BadRequest);
+        assert!(matches!(
+            rx_ack_ok.await.unwrap().unwrap(),
+            WorkflowOutcome::Ack
+        ));
+        let ack_err = rx_ack_err.await.unwrap().unwrap_err();
+        assert_eq!(ack_err.code, ErrorCode::NotFound);
+        match rx_list.await.unwrap().unwrap() {
+            WorkflowOutcome::List(list) => {
+                assert_eq!(list.len(), 1);
+                assert_eq!(list[0].id, "wf1");
+            }
+            other => panic!("expected List, got {other:?}"),
+        }
+        let list_err = rx_list_err.await.unwrap().unwrap_err();
+        assert_eq!(list_err.code, ErrorCode::Internal);
+        assert!(pending_workflows.is_empty());
     }
 
     #[test]

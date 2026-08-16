@@ -56,11 +56,11 @@ pub const MAX_BY_QUERY_STEPS_PER_TXN: usize = 16;
 pub const MAX_AFFECTED_ROWS_PER_TXN: usize = 10_000;
 
 /// SEC-104: total documents a txn could touch in the worst case. Per-id steps
-/// count 1 each; `Schedule`/`CancelSchedule` count 0 (control-flow steps touch
-/// no documents); each `patchByQuery`/`deleteByQuery` step counts up to its
-/// `limit` (default and cap `MAX_BY_QUERY_ROWS`). Mirrors server
-/// `txn::worst_case_affected`. Used by [`Self::execute_transaction`]'s
-/// [`MAX_AFFECTED_ROWS_PER_TXN`] budget check.
+/// count 1 each; `Schedule`/`CancelSchedule`/`StartWorkflow`/`CancelWorkflow`
+/// count 0 (control-flow steps touch no documents); each `patchByQuery`/
+/// `deleteByQuery` step counts up to its `limit` (default and cap
+/// `MAX_BY_QUERY_ROWS`). Mirrors server `txn::worst_case_affected`. Used by
+/// [`Self::execute_transaction`]'s [`MAX_AFFECTED_ROWS_PER_TXN`] budget check.
 pub fn worst_case_affected(txn: &Transaction) -> usize {
     txn.steps
         .iter()
@@ -68,20 +68,32 @@ pub fn worst_case_affected(txn: &Transaction) -> usize {
             Step::PatchByQuery { limit, .. } | Step::DeleteByQuery { limit, .. } => {
                 (*limit).unwrap_or(MAX_BY_QUERY_ROWS).min(MAX_BY_QUERY_ROWS) as usize
             }
-            Step::Schedule { .. } | Step::CancelSchedule { .. } => 0,
+            Step::Schedule { .. }
+            | Step::CancelSchedule { .. }
+            | Step::StartWorkflow { .. }
+            | Step::CancelWorkflow { .. } => 0,
             _ => 1,
         })
         .sum()
 }
 
-/// FM-28: recursive step count — a `schedule` step counts as itself plus
-/// every step in its nested txn. Mirrors the server's recursive gate against
-/// [`MAX_STEPS`] (a nested tree can't smuggle past the flat cap).
+/// FM-28/FM-29: recursive step count — a `schedule` step counts as itself
+/// plus every step in its nested txn, and a `startWorkflow` step counts as
+/// itself plus the sum of its spec's step txns. Mirrors the server's recursive
+/// gate against [`MAX_STEPS`] (a nested tree can't smuggle past the flat cap).
 fn count_steps(txn: &Transaction) -> usize {
     let mut total = txn.steps.len();
     for step in &txn.steps {
-        if let Step::Schedule { txn: nested, .. } = step {
-            total += count_steps(nested);
+        match step {
+            Step::Schedule { txn: nested, .. } => total += count_steps(nested),
+            Step::StartWorkflow { spec } => {
+                total += spec
+                    .steps
+                    .iter()
+                    .map(|s| count_steps(&s.txn))
+                    .sum::<usize>();
+            }
+            _ => {}
         }
     }
     total
@@ -674,6 +686,13 @@ impl InMemoryRtDbClient {
                 let cancelled = self.cancel_schedule(id).is_ok();
                 Ok((StepResult::Cancelled { cancelled }, None))
             }
+            // FM-29: this harness does not model the workflow engine (the
+            // ts/python harnesses do); workflow steps fail explicitly rather
+            // than pretending to run.
+            Step::StartWorkflow { .. } | Step::CancelWorkflow { .. } => Err(RtDbError::new(
+                ErrorCode::Internal,
+                "workflow steps are not supported by the in-memory harness",
+            )),
         }
     }
 

@@ -884,6 +884,97 @@ impl RtDbAdminClient {
             .await
     }
 
+    // ── Workflow-run management (FM-29:
+    //     GET|POST /admin/db/{db}/workflows, GET|DELETE /admin/db/{db}/workflows/{id},
+    //     POST /admin/db/{db}/workflows/{id}/cancel) ────────────────────────────
+    //
+    // Mirror `ts-client`'s `adminListWorkflows`/`adminGetWorkflow`/
+    // `adminStartWorkflow`/`adminCancelWorkflow`/`adminDeleteWorkflow`
+    // one-to-one — paths, bodies, and return shapes are identical; only the
+    // method names are snake_cased.
+
+    /// `GET /admin/db/{db}/workflows?status=&limit=` → `{workflows:[...]}`,
+    /// newest first. `opts = None` for the server-default first page (limit
+    /// 100, clamped to `[1, 500]`, no status filter).
+    pub async fn list_workflows(
+        &self,
+        db: &str,
+        opts: Option<&crate::wire::admin::WorkflowListOptions>,
+    ) -> Result<Vec<crate::wire::WorkflowInfo>, RtDbError> {
+        let status_s = opts
+            .and_then(|o| o.status)
+            .map(|s| s.as_wire_str().to_string());
+        let limit_s = opts.and_then(|o| o.limit).map(|n| n.to_string());
+        let mut q: Vec<(&str, &str)> = Vec::with_capacity(2);
+        if let Some(ref v) = status_s {
+            q.push(("status", v.as_str()));
+        }
+        if let Some(ref v) = limit_s {
+            q.push(("limit", v.as_str()));
+        }
+        let parsed: crate::wire::admin::WorkflowsResponse = self
+            .get_json(&format!("/admin/db/{db}/workflows"), &q)
+            .await?;
+        Ok(parsed.workflows)
+    }
+
+    /// `GET /admin/db/{db}/workflows/{id}` → one full run row: the info
+    /// projection plus the per-step outcome trail (`WorkflowInfoFull`).
+    pub async fn get_workflow(
+        &self,
+        db: &str,
+        id: &str,
+    ) -> Result<crate::wire::WorkflowInfoFull, RtDbError> {
+        self.get_json(&format!("/admin/db/{db}/workflows/{id}"), &[])
+            .await
+    }
+
+    /// `POST /admin/db/{db}/workflows` with the bare `WorkflowSpec` body (no
+    /// wrapper) → `{id}`. Returns the new run's id.
+    pub async fn start_workflow(
+        &self,
+        db: &str,
+        spec: &crate::wire::WorkflowSpec,
+    ) -> Result<String, RtDbError> {
+        let resp = self
+            .post_json(&format!("/admin/db/{db}/workflows"), spec)
+            .await?;
+        #[derive(serde::Deserialize)]
+        struct Resp {
+            id: String,
+        }
+        Ok(self.deserialize::<Resp>(resp).await?.id)
+    }
+
+    /// `POST /admin/db/{db}/workflows/{id}/cancel` → `{ok}`. `Ok(false)` = an
+    /// unknown or already-terminal run (a no-op, not an error).
+    pub async fn cancel_workflow(&self, db: &str, id: &str) -> Result<bool, RtDbError> {
+        let resp = self
+            .client
+            .post(format!("{}/admin/db/{db}/workflows/{id}/cancel", self.url))
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(|e| RtDbError::internal(format!("cancel_workflow request failed: {e}")))?;
+        let parsed: crate::wire::admin::OkResponse = self.deserialize(resp).await?;
+        Ok(parsed.ok)
+    }
+
+    /// `DELETE /admin/db/{db}/workflows/{id}` → `{ok}`. Hard-deletes the run
+    /// row — unlike cancel, the outcome trail does not survive. `Ok(false)`
+    /// when already gone.
+    pub async fn delete_workflow(&self, db: &str, id: &str) -> Result<bool, RtDbError> {
+        let resp = self
+            .client
+            .delete(format!("{}/admin/db/{db}/workflows/{id}", self.url))
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(|e| RtDbError::internal(format!("delete_workflow request failed: {e}")))?;
+        let parsed: crate::wire::admin::OkResponse = self.deserialize(resp).await?;
+        Ok(parsed.ok)
+    }
+
     async fn post_json<Req: Serialize>(
         &self,
         path: &str,
@@ -3066,5 +3157,126 @@ mod admin_tests {
         let resp = client.get_slow_queries(None, None).await.unwrap();
         assert_eq!(resp.queries.len(), 1);
         assert_eq!(resp.queries[0].params, None);
+    }
+
+    // ── FM-29 workflow runs ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn list_workflows_builds_status_and_limit_query() {
+        let (server, client) = setup().await;
+        Mock::given(method("GET"))
+            .and(path("/admin/db/kanban/workflows"))
+            .and(header("authorization", BEARER))
+            .and(query_param("status", "failed"))
+            .and(query_param("limit", "5"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "workflows": [{
+                    "id": "wf1", "name": "drip", "status": "failed",
+                    "currentStep": 1, "stepCount": 3, "attempts": 3,
+                    "lastError": "version mismatch", "createdAt": 1, "updatedAt": 9
+                }]
+            })))
+            .mount(&server)
+            .await;
+        let list = client
+            .list_workflows(
+                "kanban",
+                Some(&crate::wire::admin::WorkflowListOptions {
+                    status: Some(crate::wire::WorkflowStatus::Failed),
+                    limit: Some(5),
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].id, "wf1");
+        assert_eq!(list[0].status, crate::wire::WorkflowStatus::Failed);
+        assert_eq!(list[0].last_error.as_deref(), Some("version mismatch"));
+    }
+
+    #[tokio::test]
+    async fn list_workflows_omits_unset_options() {
+        let (server, client) = setup().await;
+        Mock::given(method("GET"))
+            .and(path("/admin/db/kanban/workflows"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"workflows": []})))
+            .mount(&server)
+            .await;
+        let list = client.list_workflows("kanban", None).await.unwrap();
+        assert!(list.is_empty());
+        // `opts = None` → no status/limit query params on the wire.
+        let req = &server.received_requests().await.unwrap()[0];
+        let url = req.url.as_str();
+        assert!(!url.contains("status"), "status leaked: {url}");
+        assert!(!url.contains("limit"), "limit leaked: {url}");
+    }
+
+    #[tokio::test]
+    async fn get_workflow_returns_info_full_with_outcomes() {
+        let (server, client) = setup().await;
+        Mock::given(method("GET"))
+            .and(path("/admin/db/kanban/workflows/wf1"))
+            .and(header("authorization", BEARER))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "wf1", "name": "drip", "status": "success",
+                "currentStep": 2, "stepCount": 2, "attempts": 1,
+                "createdAt": 1, "updatedAt": 9, "startedAt": 2, "finishedAt": 9,
+                "stepOutcomes": [
+                    { "stepIndex": 0, "status": "success", "attempts": 1, "at": 5 },
+                    { "stepIndex": 1, "status": "failed", "attempts": 3, "at": 8,
+                      "error": "version mismatch" }
+                ]
+            })))
+            .mount(&server)
+            .await;
+        let full = client.get_workflow("kanban", "wf1").await.unwrap();
+        assert_eq!(full.info.id, "wf1");
+        assert_eq!(full.info.status, crate::wire::WorkflowStatus::Success);
+        assert_eq!(full.step_outcomes.len(), 2);
+        assert_eq!(full.step_outcomes[1].attempts, 3);
+    }
+
+    #[tokio::test]
+    async fn admin_start_workflow_posts_spec_and_returns_id() {
+        let (server, client) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/admin/db/kanban/workflows"))
+            .and(header("authorization", BEARER))
+            .and(body_partial_json(json!({
+                "name": "drip",
+                "steps": [ { "txn": { "steps": [] } } ]
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": "wf-7"})))
+            .mount(&server)
+            .await;
+        let spec = crate::wire::WorkflowSpec {
+            name: "drip".into(),
+            steps: vec![crate::wire::WorkflowStepSpec {
+                txn: Mutation::new().build(),
+                retry: None,
+                sleep_before_ms: None,
+            }],
+        };
+        let id = client.start_workflow("kanban", &spec).await.unwrap();
+        assert_eq!(id, "wf-7");
+    }
+
+    #[tokio::test]
+    async fn admin_cancel_and_delete_workflow_hit_their_paths() {
+        let (server, client) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/admin/db/kanban/workflows/wf-1/cancel"))
+            .and(header("authorization", BEARER))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/admin/db/kanban/workflows/wf-1"))
+            .and(header("authorization", BEARER))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+            .mount(&server)
+            .await;
+        client.cancel_workflow("kanban", "wf-1").await.unwrap();
+        client.delete_workflow("kanban", "wf-1").await.unwrap();
     }
 }

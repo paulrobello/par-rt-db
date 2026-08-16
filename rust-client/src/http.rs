@@ -3,7 +3,9 @@
 use crate::error::{ErrorEnvelope, RtDbError, retry_on_precondition};
 use crate::mutation::{Mutation, StepResult, Transaction};
 use crate::query::{Query, TableQuery, parse_result};
-use crate::wire::{AuthedUser, ScheduleInfo, ScheduleWhen};
+use crate::wire::{
+    AuthedUser, ScheduleInfo, ScheduleWhen, WorkflowInfo, WorkflowSpec, WorkflowStatus,
+};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::future::Future;
@@ -448,6 +450,98 @@ impl RtDbHttpClient {
             .map_err(|e| RtDbError::internal(format!("list schedules request failed: {e}")))?;
         let parsed = self.deserialize::<ListResponse>(resp).await?;
         Ok(parsed.schedules)
+    }
+
+    /// Start a durable workflow run (`POST /api/workflows`, FM-29). Returns
+    /// the new run's id. Mirrors `ts-client`'s `startWorkflow`.
+    pub async fn start_workflow(&self, spec: &WorkflowSpec) -> Result<String, RtDbError> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Body<'a> {
+            db: &'a str,
+            spec: &'a WorkflowSpec,
+        }
+        let body = Body { db: &self.db, spec };
+        let resp = self
+            .client
+            .post(format!("{}/api/workflows", self.url))
+            .bearer_auth(&self.token)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| RtDbError::internal(format!("start workflow request failed: {e}")))?;
+        #[derive(serde::Deserialize)]
+        struct StartResponse {
+            id: String,
+        }
+        let parsed = self.deserialize::<StartResponse>(resp).await?;
+        Ok(parsed.id)
+    }
+
+    /// Cancel a workflow run (`POST /api/workflows/{id}/cancel`, FM-29).
+    /// Returns `false` for a missing or already-terminal run — a no-op, not
+    /// an error.
+    pub async fn cancel_workflow(&self, id: &str) -> Result<bool, RtDbError> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Body<'a> {
+            db: &'a str,
+        }
+        let body = Body { db: &self.db };
+        let resp = self
+            .client
+            // `id` is caller-supplied, so percent-encode the path segment
+            // (same guard as `manage_schedule`).
+            .post(format!(
+                "{}/api/workflows/{}/cancel",
+                self.url,
+                encode_uri_component(id)
+            ))
+            .bearer_auth(&self.token)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| RtDbError::internal(format!("cancel workflow request failed: {e}")))?;
+        #[derive(serde::Deserialize)]
+        struct CancelResponse {
+            cancelled: bool,
+        }
+        let parsed = self.deserialize::<CancelResponse>(resp).await?;
+        Ok(parsed.cancelled)
+    }
+
+    /// List this database's workflow runs, newest first
+    /// (`POST /api/workflows/list`, FM-29). `status` optionally filters by
+    /// run state. Mirrors `ts-client`'s `listWorkflows`.
+    pub async fn list_workflows(
+        &self,
+        status: Option<WorkflowStatus>,
+    ) -> Result<Vec<WorkflowInfo>, RtDbError> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Body<'a> {
+            db: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            status: Option<WorkflowStatus>,
+        }
+        #[derive(serde::Deserialize)]
+        struct ListResponse {
+            workflows: Vec<WorkflowInfo>,
+        }
+        let body = Body {
+            db: &self.db,
+            status,
+        };
+        let resp = self
+            .client
+            .post(format!("{}/api/workflows/list", self.url))
+            .bearer_auth(&self.token)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| RtDbError::internal(format!("list workflows request failed: {e}")))?;
+        let parsed = self.deserialize::<ListResponse>(resp).await?;
+        Ok(parsed.workflows)
     }
 
     /// Upload raw bytes; `content_type` sets the Content-Type header and is
@@ -1250,6 +1344,88 @@ mod tests {
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].id, "job-1");
         assert_eq!(list[0].cron.as_deref(), Some("*/5 * * * *"));
+    }
+
+    #[tokio::test]
+    async fn start_workflow_posts_db_and_spec_and_returns_id() {
+        let (server, client) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/api/workflows"))
+            .and(header("authorization", "Bearer machine-token"))
+            .and(body_partial_json(json!({
+                "db": "t<uuid>",
+                "spec": {
+                    "name": "drip",
+                    "steps": [ { "txn": { "steps": [] } } ]
+                }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": "wf-7"})))
+            .mount(&server)
+            .await;
+        let spec = crate::wire::WorkflowSpec {
+            name: "drip".into(),
+            steps: vec![crate::wire::WorkflowStepSpec {
+                txn: Mutation::new().build(),
+                retry: None,
+                sleep_before_ms: None,
+            }],
+        };
+        let id = client.start_workflow(&spec).await.unwrap();
+        assert_eq!(id, "wf-7");
+    }
+
+    #[tokio::test]
+    async fn cancel_workflow_posts_db_body_and_returns_cancelled() {
+        let (server, client) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/api/workflows/wf-1/cancel"))
+            .and(body_partial_json(json!({"db": "t<uuid>"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"cancelled": false})))
+            .mount(&server)
+            .await;
+        // `false` (missing or already-terminal run) is a no-op, not an error.
+        assert!(!client.cancel_workflow("wf-1").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn list_workflows_posts_optional_status_filter() {
+        let (server, client) = setup().await;
+        // Some(status) serializes as a snake_case filter key in the body.
+        Mock::given(method("POST"))
+            .and(path("/api/workflows/list"))
+            .and(header("authorization", "Bearer machine-token"))
+            .and(body_partial_json(
+                json!({"db": "t<uuid>", "status": "failed"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"workflows": []})))
+            .mount(&server)
+            .await;
+        // None omits the key entirely — exact raw body, not a partial match.
+        Mock::given(method("POST"))
+            .and(path("/api/workflows/list"))
+            .and(body_bytes(
+                serde_json::to_string(&json!({"db": "t<uuid>"}))
+                    .unwrap()
+                    .into_bytes(),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "workflows": [{
+                    "id": "wf1", "name": "drip", "status": "success",
+                    "currentStep": 2, "stepCount": 2, "attempts": 1,
+                    "createdAt": 1, "updatedAt": 9, "finishedAt": 9
+                }]
+            })))
+            .mount(&server)
+            .await;
+        let failed = client
+            .list_workflows(Some(crate::wire::WorkflowStatus::Failed))
+            .await
+            .unwrap();
+        assert!(failed.is_empty());
+        let all = client.list_workflows(None).await.unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].id, "wf1");
+        assert_eq!(all[0].status, crate::wire::WorkflowStatus::Success);
     }
 
     #[tokio::test]

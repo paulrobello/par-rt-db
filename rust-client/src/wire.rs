@@ -57,6 +57,19 @@ pub enum ClientMessage {
     ListSchedules {
         schedule_id: String,
     },
+    StartWorkflow {
+        workflow_id: String,
+        spec: WorkflowSpec,
+    },
+    CancelWorkflow {
+        workflow_id: String,
+        id: String,
+    },
+    ListWorkflows {
+        workflow_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<WorkflowStatus>,
+    },
     Presence {
         room: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -121,6 +134,28 @@ pub enum ServerMessage {
     ListSchedulesOk {
         schedule_id: String,
         schedules: Vec<ScheduleInfo>,
+    },
+    StartWorkflowOk {
+        workflow_id: String,
+        info: WorkflowInfo,
+    },
+    StartWorkflowErr {
+        workflow_id: String,
+        error: RtDbError,
+    },
+    /// Reply to cancelWorkflow — and, per the server's single-error-frame
+    /// design, to a failed `listWorkflows` too (no `listWorkflowsErr` frame
+    /// exists; the list's correlation id rides `StartWorkflowErr`). `error`
+    /// is omitted on the wire when `ok`.
+    WorkflowAck {
+        workflow_id: String,
+        ok: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<RtDbError>,
+    },
+    ListWorkflowsOk {
+        workflow_id: String,
+        workflows: Vec<WorkflowInfo>,
     },
     PresenceSnapshot {
         room: String,
@@ -305,6 +340,158 @@ pub struct ScheduleInfo {
     pub last_error: Option<String>,
     pub created_at: i64,
     pub fired_count: i64,
+}
+
+/// Per-step retry policy (FM-29). `maxAttempts` counts TOTAL attempts — the
+/// first try included. Defaults when a step omits `retry`: 3 attempts, 1s
+/// initial backoff doubling to a 60s cap. Mirrors
+/// `server/src/protocol.rs::StepRetry` byte-for-byte.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StepRetry {
+    pub max_attempts: u32,
+    #[serde(default = "default_initial_retry_ms")]
+    pub initial_retry_ms: u64,
+    #[serde(default = "default_max_retry_ms")]
+    pub max_retry_ms: u64,
+}
+
+fn default_initial_retry_ms() -> u64 {
+    1_000
+}
+
+fn default_max_retry_ms() -> u64 {
+    60_000
+}
+
+impl Default for StepRetry {
+    fn default() -> Self {
+        Self {
+            max_attempts: 3,
+            initial_retry_ms: 1_000,
+            max_retry_ms: 60_000,
+        }
+    }
+}
+
+/// One workflow step: an ordinary [`Transaction`] plus policy. The txn may
+/// itself carry `Schedule`/`CancelSchedule` steps (FM-28 rules apply).
+/// Mirrors `server/src/protocol.rs::WorkflowStepSpec` byte-for-byte.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkflowStepSpec {
+    pub txn: Transaction,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry: Option<StepRetry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sleep_before_ms: Option<u64>,
+}
+
+/// A submitted workflow definition. Stored verbatim per run — a run
+/// snapshots its spec, so template edits never drift a live run. Mirrors
+/// `server/src/protocol.rs::WorkflowSpec` byte-for-byte.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkflowSpec {
+    pub name: String,
+    pub steps: Vec<WorkflowStepSpec>,
+}
+
+/// Run lifecycle (FM-29). Closed domain (ARC-004/QA-008 pattern). Snake-case
+/// wire: pending|running|success|failed|cancelled. Mirrors
+/// `server/src/protocol.rs::WorkflowStatus` byte-for-byte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowStatus {
+    Pending,
+    Running,
+    Success,
+    Failed,
+    Cancelled,
+}
+
+impl WorkflowStatus {
+    pub fn as_wire_str(&self) -> &'static str {
+        match self {
+            WorkflowStatus::Pending => "pending",
+            WorkflowStatus::Running => "running",
+            WorkflowStatus::Success => "success",
+            WorkflowStatus::Failed => "failed",
+            WorkflowStatus::Cancelled => "cancelled",
+        }
+    }
+}
+
+impl std::str::FromStr for WorkflowStatus {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "pending" => Ok(WorkflowStatus::Pending),
+            "running" => Ok(WorkflowStatus::Running),
+            "success" => Ok(WorkflowStatus::Success),
+            "failed" => Ok(WorkflowStatus::Failed),
+            "cancelled" => Ok(WorkflowStatus::Cancelled),
+            other => Err(format!("unknown WorkflowStatus: {other}")),
+        }
+    }
+}
+
+/// Terminal record for one step: completed successfully, or exhausted its
+/// retries (`status: failed`). Individual retried attempts are NOT recorded —
+/// the `attempts` count on the entry (and on the row) carries them. Mirrors
+/// `server/src/protocol.rs::StepOutcome` byte-for-byte.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StepOutcome {
+    pub step_index: u32,
+    pub status: OutcomeStatus,
+    pub attempts: u32,
+    pub at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Mirrors `server/src/protocol.rs::OutcomeStatus` byte-for-byte (lowercase).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OutcomeStatus {
+    Success,
+    Failed,
+}
+
+/// List/get projection of one run (FM-29). Optional fields are omitted on the
+/// wire when absent. Mirrors `server/src/protocol.rs::WorkflowInfo`
+/// byte-for-byte.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkflowInfo {
+    pub id: String,
+    pub name: String,
+    pub status: WorkflowStatus,
+    pub current_step: u32,
+    pub step_count: u32,
+    pub attempts: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sleep_until: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<i64>,
+}
+
+/// `GET .../{id}` shape: the info row plus the per-step outcome trail.
+/// Mirrors `server/src/protocol.rs::WorkflowInfoFull` byte-for-byte (the info
+/// fields flatten alongside `stepOutcomes`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkflowInfoFull {
+    #[serde(flatten)]
+    pub info: WorkflowInfo,
+    pub step_outcomes: Vec<StepOutcome>,
 }
 
 /// A full-text search terminal over a declared search index. `index` names a
@@ -1484,6 +1671,243 @@ mod tests {
         let back: ScheduleInfo = serde_json::from_value(v).unwrap();
         assert_eq!(back.cron.as_deref(), Some("*/5 * * * *"));
         assert_eq!(back.last_error.as_deref(), Some("boom"));
+    }
+
+    // ---- FM-29 workflow wire (fixtures mirror server protocol.rs tests) ----
+
+    #[test]
+    fn workflow_spec_wire_shape() {
+        let spec = serde_json::from_value::<WorkflowSpec>(serde_json::json!({
+            "name": "drip",
+            "steps": [
+                { "txn": { "steps": [ { "op": "insert", "table": "t", "doc": {} } ] } },
+                { "txn": { "steps": [] },
+                  "retry": { "maxAttempts": 5, "initialRetryMs": 500, "maxRetryMs": 2000 },
+                  "sleepBeforeMs": 86400000 }
+            ]
+        }))
+        .unwrap();
+        assert_eq!(spec.steps.len(), 2);
+        assert_eq!(spec.steps[1].sleep_before_ms, Some(86_400_000));
+        let retry = spec.steps[1].retry.unwrap();
+        assert_eq!(
+            (
+                retry.max_attempts,
+                retry.initial_retry_ms,
+                retry.max_retry_ms
+            ),
+            (5, 500, 2000)
+        );
+        // Omitted retry defaults on deserialize:
+        assert!(
+            serde_json::from_value::<StepRetry>(serde_json::json!({"maxAttempts": 2}))
+                .unwrap()
+                .initial_retry_ms
+                == 1_000
+        );
+        // Round-trip: absent optionals are SKIPPED on serialize (corpus parity).
+        let v = serde_json::to_value(&spec).unwrap();
+        assert!(v["steps"][0].get("retry").is_none());
+        assert!(v["steps"][0].get("sleepBeforeMs").is_none());
+    }
+
+    #[test]
+    fn workflow_status_wire_is_snake_case() {
+        assert_eq!(
+            serde_json::to_value(WorkflowStatus::Pending).unwrap(),
+            serde_json::json!("pending")
+        );
+        assert_eq!(
+            "failed".parse::<WorkflowStatus>().unwrap(),
+            WorkflowStatus::Failed
+        );
+        assert!("bogus".parse::<WorkflowStatus>().is_err());
+    }
+
+    #[test]
+    fn workflow_info_wire_shape() {
+        let info = serde_json::from_value::<WorkflowInfo>(serde_json::json!({
+            "id": "wf1", "name": "drip", "status": "pending",
+            "currentStep": 0, "stepCount": 3, "attempts": 0,
+            "sleepUntil": 123, "createdAt": 1, "updatedAt": 2
+        }))
+        .unwrap();
+        assert_eq!(info.step_count, 3);
+        assert!(info.last_error.is_none());
+        let v = serde_json::to_value(&info).unwrap();
+        assert!(v.get("lastError").is_none() && v.get("finishedAt").is_none());
+    }
+
+    #[test]
+    fn workflow_info_full_flattens_info_plus_outcomes() {
+        let full = serde_json::from_value::<WorkflowInfoFull>(serde_json::json!({
+            "id": "wf1", "name": "drip", "status": "success",
+            "currentStep": 2, "stepCount": 2, "attempts": 1,
+            "createdAt": 1, "updatedAt": 9, "startedAt": 2, "finishedAt": 9,
+            "stepOutcomes": [
+                { "stepIndex": 0, "status": "success", "attempts": 1, "at": 5 },
+                { "stepIndex": 1, "status": "failed", "attempts": 3, "at": 8,
+                  "error": "version mismatch" }
+            ]
+        }))
+        .unwrap();
+        assert_eq!(full.info.id, "wf1");
+        assert_eq!(full.step_outcomes.len(), 2);
+        assert_eq!(full.step_outcomes[0].status, OutcomeStatus::Success);
+        assert_eq!(full.step_outcomes[1].status, OutcomeStatus::Failed);
+        assert_eq!(
+            full.step_outcomes[1].error.as_deref(),
+            Some("version mismatch")
+        );
+        // Flatten round-trip: info fields sit at the top level beside
+        // stepOutcomes, byte-identical to the server's GET shape.
+        let v = serde_json::to_value(&full).unwrap();
+        assert_eq!(v["id"], serde_json::json!("wf1"));
+        assert_eq!(v["stepOutcomes"][1]["stepIndex"], serde_json::json!(1));
+        assert!(v["stepOutcomes"][0].get("error").is_none());
+    }
+
+    #[test]
+    fn workflow_client_message_variants() {
+        let spec = sample_workflow_spec();
+        let m = serde_json::to_value(ClientMessage::StartWorkflow {
+            workflow_id: "wf-1".into(),
+            spec: spec.clone(),
+        })
+        .unwrap();
+        assert_eq!(m["type"], serde_json::json!("startWorkflow"));
+        assert_eq!(m["workflowId"], serde_json::json!("wf-1"));
+        assert_eq!(m["spec"]["name"], serde_json::json!("drip"));
+
+        assert_eq!(
+            serde_json::to_value(ClientMessage::CancelWorkflow {
+                workflow_id: "wf-2".into(),
+                id: "wf9".into(),
+            })
+            .unwrap(),
+            serde_json::json!({"type": "cancelWorkflow", "workflowId": "wf-2", "id": "wf9"})
+        );
+
+        // status omitted when None, snake_case string when Some, and the
+        // filtered frame parses back.
+        assert_eq!(
+            serde_json::to_value(ClientMessage::ListWorkflows {
+                workflow_id: "wf-3".into(),
+                status: None,
+            })
+            .unwrap(),
+            serde_json::json!({"type": "listWorkflows", "workflowId": "wf-3"})
+        );
+        let m = serde_json::to_value(ClientMessage::ListWorkflows {
+            workflow_id: "wf-3".into(),
+            status: Some(WorkflowStatus::Failed),
+        })
+        .unwrap();
+        assert_eq!(m["status"], serde_json::json!("failed"));
+        match serde_json::from_value::<ClientMessage>(serde_json::json!({
+            "type": "listWorkflows", "workflowId": "wf-3", "status": "failed"
+        }))
+        .unwrap()
+        {
+            ClientMessage::ListWorkflows {
+                workflow_id,
+                status,
+            } => {
+                assert_eq!(workflow_id, "wf-3");
+                assert_eq!(status, Some(WorkflowStatus::Failed));
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+        // The start frame parses back too (spec round-trips through the frame).
+        match serde_json::from_value::<ClientMessage>(m_start_frame(&spec)).unwrap() {
+            ClientMessage::StartWorkflow { workflow_id, spec } => {
+                assert_eq!(workflow_id, "wf-1");
+                assert_eq!(spec.name, "drip");
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    fn m_start_frame(spec: &WorkflowSpec) -> serde_json::Value {
+        serde_json::json!({
+            "type": "startWorkflow", "workflowId": "wf-1",
+            "spec": serde_json::to_value(spec).unwrap()
+        })
+    }
+
+    fn sample_workflow_spec() -> WorkflowSpec {
+        serde_json::from_value(serde_json::json!({
+            "name": "drip",
+            "steps": [ { "txn": { "steps": [] } } ]
+        }))
+        .expect("sample workflow spec")
+    }
+
+    fn sample_workflow_info() -> WorkflowInfo {
+        WorkflowInfo {
+            id: "wf1".to_string(),
+            name: "drip".to_string(),
+            status: WorkflowStatus::Pending,
+            current_step: 0,
+            step_count: 2,
+            attempts: 0,
+            sleep_until: Some(123),
+            last_error: None,
+            created_at: 1,
+            updated_at: 2,
+            started_at: None,
+            finished_at: None,
+        }
+    }
+
+    #[test]
+    fn workflow_server_message_variants() {
+        let info = sample_workflow_info();
+        let m = serde_json::to_value(ServerMessage::StartWorkflowOk {
+            workflow_id: "wf-1".into(),
+            info: info.clone(),
+        })
+        .unwrap();
+        assert_eq!(m["type"], serde_json::json!("startWorkflowOk"));
+        assert_eq!(m["workflowId"], serde_json::json!("wf-1"));
+        assert_eq!(m["info"]["id"], serde_json::json!("wf1"));
+
+        let m = serde_json::to_value(ServerMessage::StartWorkflowErr {
+            workflow_id: "wf-1".into(),
+            error: RtDbError::new(crate::error::ErrorCode::BadRequest, "bad spec"),
+        })
+        .unwrap();
+        assert_eq!(m["type"], serde_json::json!("startWorkflowErr"));
+        assert_eq!(m["error"]["code"], serde_json::json!("BAD_REQUEST"));
+
+        let m = serde_json::to_value(ServerMessage::WorkflowAck {
+            workflow_id: "wf-1".into(),
+            ok: true,
+            error: None,
+        })
+        .unwrap();
+        assert_eq!(m["type"], serde_json::json!("workflowAck"));
+        // `error` is skipped on the wire when the ack is clean.
+        assert!(m.get("error").is_none());
+        let m = serde_json::to_value(ServerMessage::WorkflowAck {
+            workflow_id: "wf-1".into(),
+            ok: false,
+            error: Some(RtDbError::new(
+                crate::error::ErrorCode::NotFound,
+                "no such run",
+            )),
+        })
+        .unwrap();
+        assert_eq!(m["ok"], serde_json::json!(false));
+        assert_eq!(m["error"]["code"], serde_json::json!("NOT_FOUND"));
+
+        let m = serde_json::to_value(ServerMessage::ListWorkflowsOk {
+            workflow_id: "wf-4".into(),
+            workflows: vec![info],
+        })
+        .unwrap();
+        assert_eq!(m["type"], serde_json::json!("listWorkflowsOk"));
+        assert_eq!(m["workflows"][0]["id"], serde_json::json!("wf1"));
     }
 
     // ---- admin migrate wire (tag `op`, camelCase, `where` alias) -----------

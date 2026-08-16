@@ -20,7 +20,8 @@
 //!
 //! The `http` surface also carries `.filter()` / `.search()` / `.vector_search()` query
 //! builders, the `mutate_with_retry` precondition-conflict helper, `upsert_by_index` /
-//! `find_one_by_index` shortcuts, scheduled/cron transactions, and file storage
+//! `find_one_by_index` shortcuts, scheduled/cron transactions, durable
+//! workflows, and file storage
 //! (`upload` / `delete_file` / `get_file_metadata` / `get_url`).
 //!
 //! # Wire contract
@@ -67,8 +68,9 @@ pub use query::{
 pub use schema::{DistanceMetric, FieldType, IndexDef, SchemaDef, TableDef, VectorIndexSpec};
 pub use wire::{
     AggregateGroup, AggregateOp, AggregateSpec, AuthedUser, ClientMessage, FilterExpr,
-    PresenceMember, ScheduleInfo, ScheduleKind, ScheduleStatus, ScheduleWhen, SearchMode,
-    SearchQuery, ServerMessage, UserKind, VectorSearchQuery,
+    OutcomeStatus, PresenceMember, ScheduleInfo, ScheduleKind, ScheduleStatus, ScheduleWhen,
+    SearchMode, SearchQuery, ServerMessage, StepOutcome, StepRetry, UserKind, VectorSearchQuery,
+    WorkflowInfo, WorkflowInfoFull, WorkflowSpec, WorkflowStatus, WorkflowStepSpec,
 };
 
 #[cfg(feature = "http")]
@@ -93,7 +95,7 @@ pub use wire::admin::{
     LatencyStats, ListDeliveriesOptions, MergeConflict, MergeDbResult, MergeReport,
     MetricsSnapshot, MigrateRequest, MigrateRequestOwned, MigrateResult, MintTokenOptions,
     MintedToken, OpEvent, SampleChange, SessionInfo, SessionListOptions, TableStat, TokenInfo,
-    Webhook, WebhookDelivery, WebhookEditOptions,
+    Webhook, WebhookDelivery, WebhookEditOptions, WorkflowListOptions,
 };
 
 #[cfg(feature = "admin")]

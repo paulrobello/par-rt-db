@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use crate::wire::{FilterExpr, ScheduleWhen};
+use crate::wire::{FilterExpr, ScheduleWhen, WorkflowSpec};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Transaction {
@@ -79,6 +79,16 @@ pub enum Step {
     CancelSchedule {
         id: String,
     },
+    /// Start a durable workflow run. Mirrors
+    /// `server/src/txn.rs::Step::StartWorkflow` byte-for-byte (FM-29).
+    StartWorkflow {
+        spec: Box<WorkflowSpec>,
+    },
+    /// Cancel a workflow run. Mirrors
+    /// `server/src/txn.rs::Step::CancelWorkflow` byte-for-byte (FM-29).
+    CancelWorkflow {
+        id: String,
+    },
 }
 
 /// One entry of `mutateOk.results`, positionally aligned with `steps`.
@@ -115,6 +125,10 @@ pub enum StepResult {
     },
     Cancelled {
         cancelled: bool,
+    },
+    WorkflowId {
+        #[serde(rename = "workflowId")]
+        workflow_id: String,
     },
     Null,
 }
@@ -269,6 +283,24 @@ impl Mutation {
         self
     }
 
+    /// Start a durable workflow run — `Step::StartWorkflow` (FM-29). The
+    /// server snapshots `spec` per run and returns the run id as the step's
+    /// result (`{"workflowId": "..."}`).
+    pub fn start_workflow(mut self, spec: WorkflowSpec) -> Self {
+        self.steps.push(Step::StartWorkflow {
+            spec: Box::new(spec),
+        });
+        self
+    }
+
+    /// Cancel a workflow run — `Step::CancelWorkflow` (FM-29). The step's
+    /// result is `{"cancelled": <bool>}` (`false` = run already terminal,
+    /// a no-op not an error).
+    pub fn cancel_workflow(mut self, id: impl Into<String>) -> Self {
+        self.steps.push(Step::CancelWorkflow { id: id.into() });
+        self
+    }
+
     pub fn build(self) -> Transaction {
         Transaction { steps: self.steps }
     }
@@ -283,6 +315,7 @@ impl Default for Mutation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wire::{StepRetry, WorkflowStepSpec};
     use serde_json::json;
 
     #[test]
@@ -456,6 +489,69 @@ mod tests {
         assert!(matches!(
             cancelled,
             StepResult::Cancelled { cancelled: true }
+        ));
+    }
+
+    #[test]
+    fn start_and_cancel_workflow_serialize() {
+        let spec = WorkflowSpec {
+            name: "drip".into(),
+            steps: vec![
+                WorkflowStepSpec {
+                    txn: Transaction {
+                        steps: vec![Step::Insert {
+                            table: "workItems".into(),
+                            doc: Mutation::obj(json!({"title":"first"})),
+                        }],
+                    },
+                    retry: None,
+                    sleep_before_ms: None,
+                },
+                WorkflowStepSpec {
+                    txn: Transaction { steps: vec![] },
+                    retry: Some(StepRetry {
+                        max_attempts: 5,
+                        initial_retry_ms: 500,
+                        max_retry_ms: 2_000,
+                    }),
+                    sleep_before_ms: Some(86_400_000),
+                },
+            ],
+        };
+        let txn = Mutation::new()
+            .start_workflow(spec)
+            .cancel_workflow("wf1")
+            .build();
+        assert_eq!(
+            serde_json::to_value(&txn).unwrap(),
+            json!({
+                "steps": [
+                    { "op": "startWorkflow",
+                      "spec": {
+                        "name": "drip",
+                        "steps": [
+                          { "txn": { "steps": [ { "op": "insert", "table": "workItems", "doc": { "title": "first" } } ] } },
+                          { "txn": { "steps": [] },
+                            "retry": { "maxAttempts": 5, "initialRetryMs": 500, "maxRetryMs": 2000 },
+                            "sleepBeforeMs": 86400000 }
+                        ]
+                      } },
+                    { "op": "cancelWorkflow", "id": "wf1" }
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn step_result_parses_workflow_id() {
+        let wf: StepResult = serde_json::from_value(json!({"workflowId":"wf9"})).unwrap();
+        assert!(matches!(wf, StepResult::WorkflowId { workflow_id } if workflow_id == "wf9"));
+        // cancelWorkflow's `{"cancelled":<bool>}` result reuses the Cancelled
+        // variant (same wire shape as cancelSchedule's).
+        let cancelled: StepResult = serde_json::from_value(json!({"cancelled":false})).unwrap();
+        assert!(matches!(
+            cancelled,
+            StepResult::Cancelled { cancelled: false }
         ));
     }
 }

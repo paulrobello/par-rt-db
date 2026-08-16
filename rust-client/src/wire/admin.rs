@@ -208,6 +208,22 @@ pub(crate) struct SessionsResponse {
     pub(crate) sessions: Vec<SessionInfo>,
 }
 
+/// Optional filter for `list_workflows`
+/// (`GET /admin/db/{db}/workflows?status=&limit=`). Both fields optional:
+/// `status` filters by run state; `limit` pages the result (server default
+/// 100, clamped to `[1, 500]`). Mirrors ts-client's `listWorkflows` opts.
+#[derive(Debug, Clone, Default)]
+pub struct WorkflowListOptions {
+    pub status: Option<crate::wire::WorkflowStatus>,
+    pub limit: Option<u32>,
+}
+
+/// Response wrapper for `GET /admin/db/{db}/workflows` → `{workflows:[...]}`.
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct WorkflowsResponse {
+    pub(crate) workflows: Vec<crate::wire::WorkflowInfo>,
+}
+
 /// Response for `DELETE /admin/sessions?user={userId}` → `{ok, revoked}` where
 /// `revoked` is the count of sessions dropped. Mirrors `ts-client`'s
 /// `revokeUserSessions` return shape.
