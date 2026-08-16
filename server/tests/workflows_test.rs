@@ -634,8 +634,10 @@ async fn workflow_step_writes_publish_to_audit_tap() -> anyhow::Result<()> {
 // --- Task 5: WS frames + HTTP one-shot start/cancel/list surfaces -----------
 // The harness mirrors `schedule_step_test.rs`'s HTTP/WS sections: `fresh_db`
 // pushes the kanban fixture, `ensure_table` stands in for the scheduler
-// startup's lazy ensure (the one-shot surfaces write the side table directly,
-// so no per-db tasks run here and runs stay `pending` for assertions).
+// startup's lazy ensure. The start surfaces themselves now ensure the table
+// and spawn the per-db tasks (FM-29 cold-db liveness), so these tests start
+// gated specs (`gated_projects_spec_json`) to keep runs deterministically
+// `pending` for assertions.
 
 /// Raw bearer POST to a per-db API route (mirrors `schedule_step_test.rs::
 /// api_post`).
@@ -679,6 +681,17 @@ fn projects_spec_json(name: &str) -> serde_json::Value {
     serde_json::to_value(one_step_spec(name)).expect("serialize projects spec")
 }
 
+/// `projects_spec_json` with step 0 gated far into the future: the start
+/// surfaces spawn the per-db tasks (FM-29 cold-db liveness), so an
+/// immediately-due run would advance mid-test. The gate keeps these
+/// surface round-trip tests on a deterministically-`pending` run;
+/// advancement is covered by the engine tests and (14).
+fn gated_projects_spec_json(name: &str) -> serde_json::Value {
+    let mut spec = projects_spec_json(name);
+    spec["steps"][0]["sleepBeforeMs"] = serde_json::json!(600_000);
+    spec
+}
+
 /// The smuggle shape: a one-step spec whose txn inserts into `workItems`.
 fn workitems_spec_json(name: &str) -> serde_json::Value {
     serde_json::json!({
@@ -704,7 +717,7 @@ async fn http_start_list_cancel_roundtrip() -> anyhow::Result<()> {
         addr,
         "/api/workflows",
         &token,
-        serde_json::json!({ "db": db, "spec": projects_spec_json("http-drip") }),
+        serde_json::json!({ "db": db, "spec": gated_projects_spec_json("http-drip") }),
     )
     .await;
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
@@ -878,7 +891,7 @@ async fn ws_start_list_cancel_roundtrip() -> anyhow::Result<()> {
         &mut ws,
         serde_json::json!({
             "type": "startWorkflow", "workflowId": "c1",
-            "spec": projects_spec_json("ws-drip"),
+            "spec": gated_projects_spec_json("ws-drip"),
         }),
     )
     .await;
@@ -946,8 +959,8 @@ async fn ws_start_list_cancel_roundtrip() -> anyhow::Result<()> {
 // --- Task 6: admin routes + step metrics -------------------------------------
 // Same harness as the Task 5 HTTP section: `fresh_db` pushes the kanban
 // fixture, `ensure_table` stands in for the scheduler startup's lazy ensure,
-// and no per-db tasks run (the one-shot admin surfaces write the side table
-// directly, so runs stay `pending` for assertions).
+// and the started run is gated so it stays `pending` for assertions (the
+// admin start surface spawns the per-db tasks — see (14) for that coverage).
 
 /// (12) Admin round-trip: create → list (unfiltered + status-filtered, with
 /// the bad-status `BadRequest`) → get (`WorkflowInfoFull`, 404 on unknown id)
@@ -964,7 +977,7 @@ async fn admin_routes_roundtrip() -> anyhow::Result<()> {
     let resp = admin_post(
         addr,
         &format!("/admin/db/{db}/workflows"),
-        projects_spec_json("admin-run"),
+        gated_projects_spec_json("admin-run"),
     )
     .await;
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
@@ -1072,6 +1085,61 @@ async fn admin_routes_roundtrip() -> anyhow::Result<()> {
         workflows::list(&pool, &db, None, 10).await?.is_empty(),
         "deleted run must not list"
     );
+
+    Ok(())
+}
+
+// --- Cold-db liveness (FM-29 review) ------------------------------------------
+// Unlike every test above, these deliberately skip `workflows::ensure_table`
+// and `warm_up`/`mutate`: `fresh_db` creates document tables directly on the
+// pool and spawns nothing, so the db is "cold" — no `workflows` table (its
+// only ensure runs at per-db scheduler startup) and no committer/scheduler
+// tasks. That is the state of an admin-created db before its first client op.
+
+/// (13) The admin routes serve a cold db: list must not 500 on the missing
+/// `workflows` table (the `admin_storage_list` ensure-inline precedent).
+#[tokio::test]
+async fn admin_list_serves_cold_db() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let db = fresh_db(&state).await;
+    let addr = spawn_app(state).await;
+
+    let resp = admin_get(addr, &format!("/admin/db/{db}/workflows")).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(
+        body["workflows"].as_array().map(Vec::len),
+        Some(0),
+        "cold db lists zero runs, not an error"
+    );
+
+    Ok(())
+}
+
+/// (14) A run started via the admin surface on a cold db must advance: the
+/// start surface has to spawn the per-db tasks (steps fire from the per-db
+/// scheduler, which only exists after that spawn) or the row sits `pending`
+/// forever with nothing to claim it.
+#[tokio::test]
+async fn admin_start_on_cold_db_advances_to_success() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let addr = spawn_app(state).await;
+
+    let resp = admin_post(
+        addr,
+        &format!("/admin/db/{db}/workflows"),
+        projects_spec_json("cold-start"),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await?;
+    let id = body["id"].as_str().expect("workflow id").to_string();
+
+    let full = await_status(&pool, &db, &id, |i| i.status == WorkflowStatus::Success).await;
+    assert_eq!(full.step_outcomes.len(), 1);
+    assert_eq!(projects_count(&pool, &db).await, 1);
 
     Ok(())
 }

@@ -432,6 +432,16 @@ impl Committers {
         }
     }
 
+    /// Spawns `db`'s per-db tasks (committer + scheduler + reaper + warmers)
+    /// if not already running, without submitting anything. Workflow start
+    /// surfaces call this before `workflows::insert`: steps fire from the
+    /// per-db scheduler, which only exists once the tasks spawn — a run
+    /// started on a cold db (no Mutate/Subscribe since creation) would
+    /// otherwise sit `pending` until unrelated data-plane traffic spawns them.
+    pub(crate) async fn ensure_spawned(&self, db: &str) -> Result<(), RtDbError> {
+        self.channel_for(db).await.map(|_| ())
+    }
+
     /// Executes `txn` on `db` and waits for the fan-out-then-reply cycle to
     /// complete. `idempotency_key`, when present, is the caller-opted-in
     /// dedup key: a repeat call with the same `db` + key replays the first

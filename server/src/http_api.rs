@@ -496,6 +496,10 @@ async fn start_workflow_handler(
     check_http_rate_limits(&state, &principal, &body.db).await?;
     workflows::validate_spec(&body.spec)?;
     crate::txn::authorize_spec_tables(&principal.row_ctx(), &body.spec)?;
+    // Steps fire from the per-db scheduler, which only exists once the per-db
+    // tasks spawn — ensure that before insert or the run sits `pending`
+    // forever on a cold db.
+    state.realtime.committers.ensure_spawned(&body.db).await?;
     let id = workflows::insert(&state.pool, &body.db, &body.spec).await?;
     Ok(Json(StartWorkflowResponse { id }))
 }

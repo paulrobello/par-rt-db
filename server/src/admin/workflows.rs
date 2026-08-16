@@ -56,6 +56,10 @@ pub(super) async fn admin_list_workflows(
     if !db::database_exists(&state.pool, &db).await? {
         return Err(RtDbError::not_found("unknown database"));
     }
+    // The `workflows` table is ensured only at per-db scheduler startup, so a
+    // cold db (no Mutate/Subscribe since creation) has none — ensure it
+    // inline (the `admin_storage_list` precedent) instead of 500ing.
+    workflows::ensure_table(&state.pool, &db).await?;
     let status = params
         .status
         .as_deref()
@@ -79,12 +83,17 @@ pub(super) async fn admin_create_workflow(
     if !db::database_exists(&state.pool, &db).await? {
         return Err(RtDbError::not_found("unknown database"));
     }
+    workflows::ensure_table(&state.pool, &db).await?;
     workflows::validate_spec(&spec)?;
     // Uniform with the other start surfaces (FM-28's tightened pattern).
     // Admin is a bypass principal (`tables = None`) so this is a no-op today —
     // it exists so the four surfaces cannot drift if admin principals ever
     // carry scopes.
     crate::txn::authorize_spec_tables(&PrincipalCtx::bypass(), &spec)?;
+    // Steps fire from the per-db scheduler, which only exists once the per-db
+    // tasks spawn — ensure that before insert or the run sits `pending`
+    // forever on a cold db.
+    state.realtime.committers.ensure_spawned(&db).await?;
     let id = workflows::insert(&state.pool, &db, &spec).await?;
     Ok(Json(AdminWorkflowCreateResponse { id }))
 }
@@ -98,6 +107,7 @@ pub(super) async fn admin_get_workflow(
     if !db::database_exists(&state.pool, &db).await? {
         return Err(RtDbError::not_found("unknown database"));
     }
+    workflows::ensure_table(&state.pool, &db).await?;
     let workflow = workflows::get(&state.pool, &db, &id)
         .await?
         .ok_or_else(|| RtDbError::not_found("unknown workflow"))?;
@@ -114,6 +124,7 @@ pub(super) async fn admin_cancel_workflow(
     if !db::database_exists(&state.pool, &db).await? {
         return Err(RtDbError::not_found("unknown database"));
     }
+    workflows::ensure_table(&state.pool, &db).await?;
     let ok = workflows::cancel(&state.pool, &db, &id).await?;
     Ok(Json(AdminWorkflowManageResponse { ok }))
 }
@@ -128,6 +139,7 @@ pub(super) async fn admin_delete_workflow(
     if !db::database_exists(&state.pool, &db).await? {
         return Err(RtDbError::not_found("unknown database"));
     }
+    workflows::ensure_table(&state.pool, &db).await?;
     let ok = workflows::delete(&state.pool, &db, &id).await?;
     Ok(Json(AdminWorkflowManageResponse { ok }))
 }

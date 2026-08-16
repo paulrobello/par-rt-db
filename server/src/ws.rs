@@ -711,16 +711,22 @@ async fn handle_start_workflow(
             let prepared = workflows::validate_spec(&spec)
                 .and_then(|()| authorize_spec_tables(&principal.row_ctx(), &spec));
             match prepared {
-                Ok(()) => match workflows::insert(&state.pool, db, &spec).await {
-                    Ok(id) => match workflows::get(&state.pool, db, &id).await {
-                        Ok(Some(full)) => ServerMessage::StartWorkflowOk {
-                            workflow_id,
-                            info: full.info,
+                // Steps fire from the per-db scheduler, which only exists once
+                // the per-db tasks spawn — ensure that before insert or the
+                // run sits `pending` forever on a cold db.
+                Ok(()) => match state.realtime.committers.ensure_spawned(db).await {
+                    Ok(()) => match workflows::insert(&state.pool, db, &spec).await {
+                        Ok(id) => match workflows::get(&state.pool, db, &id).await {
+                            Ok(Some(full)) => ServerMessage::StartWorkflowOk {
+                                workflow_id,
+                                info: full.info,
+                            },
+                            _ => ServerMessage::StartWorkflowErr {
+                                workflow_id,
+                                error: RtDbError::internal("workflow started but unreadable"),
+                            },
                         },
-                        _ => ServerMessage::StartWorkflowErr {
-                            workflow_id,
-                            error: RtDbError::internal("workflow started but unreadable"),
-                        },
+                        Err(error) => ServerMessage::StartWorkflowErr { workflow_id, error },
                     },
                     Err(error) => ServerMessage::StartWorkflowErr { workflow_id, error },
                 },
