@@ -482,7 +482,9 @@ export class RtDbAdminClient {
     this.url = options.url.replace(/\/+$/, "");
     this.adminKey = options.adminKey;
     this.cookieMode = !options.adminKey;
-    this.fetchImpl = options.fetch ?? globalThis.fetch;
+    // Bind the global: browsers require Window as fetch's receiver, and a
+    // stored-unbound reference throws "Illegal invocation" when called.
+    this.fetchImpl = options.fetch ?? globalThis.fetch.bind(globalThis);
     this.webSocketFactory =
       options.webSocketFactory ??
       ((url, protocols) => new WebSocket(url, protocols) as unknown as WebSocketLike);

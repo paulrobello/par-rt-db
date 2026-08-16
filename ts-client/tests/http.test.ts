@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { RtDbError } from "../src/errors.js";
 import { RtDbHttpClient } from "../src/http.js";
 import { mutation } from "../src/mutation.js";
@@ -487,5 +487,28 @@ describe("RtDbHttpClient workflows (FM-29)", () => {
     const [calledUrl, init] = fetchMock.mock.calls[0];
     expect(calledUrl).toBe("http://h:8300/api/workflows/wf1/cancel");
     expect(JSON.parse(init.body)).toEqual({ db: "kanban" });
+  });
+});
+
+describe("RtDbHttpClient default fetch binding", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  // See the twin test in admin.test.ts: browsers require Window as fetch's
+  // receiver, so the default must never store a detached `globalThis.fetch`.
+  it("invokes the default global fetch with globalThis as its receiver", async () => {
+    const fetchMock = vi.fn(function (this: unknown) {
+      if (this !== globalThis) {
+        throw new TypeError("Failed to execute 'fetch' on 'Window': Illegal invocation");
+      }
+      return Promise.resolve(jsonResponse({ result: [{ _id: "a" }] }));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new RtDbHttpClient({ url: "http://h:8300", db: "kanban", token: "tok" });
+    const q: RtQuery<Array<{ _id: string }>> = { json: { table: "items" } };
+
+    await expect(client.query(q)).resolves.toEqual([{ _id: "a" }]);
+    expect(fetchMock).toHaveBeenCalledOnce();
   });
 });

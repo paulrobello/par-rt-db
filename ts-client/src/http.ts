@@ -84,7 +84,9 @@ export class RtDbHttpClient {
     this.url = options.url.replace(/\/+$/, "");
     this.db = options.db;
     this.token = options.token;
-    this.fetchImpl = options.fetch ?? globalThis.fetch;
+    // Bind the global: browsers require Window as fetch's receiver, and a
+    // stored-unbound reference throws "Illegal invocation" when called.
+    this.fetchImpl = options.fetch ?? globalThis.fetch.bind(globalThis);
   }
 
   async query<R>(query: RtQuery<R>): Promise<R> {

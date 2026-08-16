@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type {
   AuditEntry,
   ExplainResult,
@@ -1495,5 +1495,31 @@ describe("RtDbAdminClient workflows (FM-29)", () => {
     expect(calls[0][1].method).toBe("POST");
     expect(calls[1][0]).toBe("http://h:8300/admin/db/kanban/workflows/wf1");
     expect(calls[1][1].method).toBe("DELETE");
+  });
+});
+
+describe("RtDbAdminClient default fetch binding", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  // Browsers define fetch on Window and require Window as its receiver: a
+  // reference read off the global and stored, then called unbound, throws
+  // "Failed to execute 'fetch' on 'Window': Illegal invocation". The injected
+  // `fetch: fetchMock` used by every other test never exercises this default
+  // path, so a detached store regresses silently in Node-run suites while
+  // breaking every browser consumer (the operator dashboard).
+  it("invokes the default global fetch with globalThis as its receiver", async () => {
+    const fetchMock = vi.fn(function (this: unknown) {
+      if (this !== globalThis) {
+        throw new TypeError("Failed to execute 'fetch' on 'Window': Illegal invocation");
+      }
+      return Promise.resolve(jsonResponse({ databases: ["db1"] }));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k" });
+
+    await expect(admin.listDbs()).resolves.toEqual(["db1"]);
+    expect(fetchMock).toHaveBeenCalledOnce();
   });
 });
