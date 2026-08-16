@@ -153,7 +153,7 @@ from .wire import (
 )
 
 #: Maximum number of steps in a single transaction (mirrors the server cap).
-MAX_STEPS = 256
+MAX_STEPS = 1024
 #: Maximum number of steps in one workflow spec (mirrors
 #: ``server/src/workflows.rs::MAX_WORKFLOW_STEPS``).
 MAX_WORKFLOW_STEPS = 64

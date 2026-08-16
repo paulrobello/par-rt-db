@@ -1712,7 +1712,7 @@ def test_cancel_schedule_step_removes_pending_job() -> None:
 def test_recursive_step_budget_rejects_oversized_tree() -> None:
     c, _clock = _new_clock_client()
     # Each half fits the harness cap alone; only the recursive count (a
-    # schedule step = 1 + its nested steps) trips it: 128 + 1 + 128 > 256.
+    # schedule step = 1 + its nested steps) trips it: half + 1 + half > MAX_STEPS.
     half = MAX_STEPS // 2
     nested = Mutation.builder()
     for i in range(half):
@@ -2326,7 +2326,10 @@ def test_workflow_spec_nested_start_workflow_cannot_smuggle_past_max_steps() -> 
     )
     inner = WorkflowSpec(
         name="inner",
-        steps=[WorkflowStepSpec(txn=two_step_txn.model_dump(by_alias=True)) for _ in range(128)],
+        steps=[
+            WorkflowStepSpec(txn=two_step_txn.model_dump(by_alias=True))
+            for _ in range(MAX_STEPS // 2)
+        ],
     )
     outer_txn = (
         Mutation.builder()
@@ -2335,12 +2338,13 @@ def test_workflow_spec_nested_start_workflow_cannot_smuggle_past_max_steps() -> 
         .build()
     )
     # The outer spec is flat-tiny (one step, a 2-step txn), but the nested
-    # spec's txns push the recursive count to 2 + 128*2 = 258 > MAX_STEPS
-    # (256) — only the recursive counter catches the smuggle. Workflow steps
-    # themselves are control flow: worst_case_affected counts 0 documents.
+    # spec's txns push the recursive count to 2 + (MAX_STEPS // 2) * 2 =
+    # 2 + MAX_STEPS > MAX_STEPS — only the recursive counter catches the
+    # smuggle. Workflow steps themselves are control flow: worst_case_affected
+    # counts 0 documents.
     control_only = Mutation.builder().start_workflow(inner).cancel_workflow("wf-x").build()
     assert worst_case_affected(control_only) == 0
     with pytest.raises(RtDbError) as ei:
         c.start_workflow(_wf("smuggle", [_wf_step(outer_txn)]))
     assert ei.value.code is ErrorCode.BAD_REQUEST
-    assert "recursive step count 258 exceeds MAX_STEPS 256" in ei.value.message
+    assert f"recursive step count {2 + MAX_STEPS} exceeds MAX_STEPS {MAX_STEPS}" in ei.value.message
