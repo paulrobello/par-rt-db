@@ -647,6 +647,25 @@ async def test_workflow_ack_false_raises():
         await client.close()
 
 
+async def test_workflow_ack_bare_no_op_resolves_false():
+    # Bare ok:false (no error envelope) = unknown/terminal run: the server's
+    # legit no-op cancel (ws.rs maps workflows::cancel Ok(ok) => (ok, None)).
+    # The promise resolves False — it must NOT raise a synthetic error.
+    conn = FakeConn()
+    client = await _connected(conn)
+    try:
+        cancel = asyncio.create_task(client.cancel_workflow("wf-done"))
+        await _drain()
+        await conn.deliver(
+            '{"type":"workflowAck","workflowId":"'
+            + _wf_id(conn, "cancelWorkflow")
+            + '","ok":false}'
+        )
+        assert await asyncio.wait_for(cancel, 1.0) is False
+    finally:
+        await client.close()
+
+
 async def test_start_workflow_err_rejects():
     conn = FakeConn()
     client = await _connected(conn)

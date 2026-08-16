@@ -147,6 +147,9 @@ from .wire import (
 
 #: Maximum number of steps in a single transaction (mirrors the server cap).
 MAX_STEPS = 256
+#: Maximum number of steps in one workflow spec (mirrors
+#: ``server/src/workflows.rs::MAX_WORKFLOW_STEPS``).
+MAX_WORKFLOW_STEPS = 64
 #: Maximum rows returned from a single ``take``/``collect`` (mirrors the server cap).
 MAX_TAKE = 4096
 #: Hard cap on rows a single ``patchByQuery``/``deleteByQuery`` step may touch
@@ -171,7 +174,8 @@ CRON_STEP_MS = 60_000
 def worst_case_affected(txn: Transaction) -> int:
     """SEC-104: total documents a txn could touch in the worst case.
 
-    Per-id steps count 1 each; ``schedule``/``cancelSchedule`` count 0
+    Per-id steps count 1 each; ``schedule``/``cancelSchedule`` and the
+    workflow steps (``startWorkflow``/``cancelWorkflow``) count 0
     (control-flow steps touch no documents); each ``patchByQuery``/
     ``deleteByQuery`` step counts up to its ``limit`` (default and cap
     ``MAX_BY_QUERY_ROWS``). Mirrors server ``txn::worst_case_affected``; used
@@ -182,8 +186,9 @@ def worst_case_affected(txn: Transaction) -> int:
         if isinstance(step, (_PatchByQuery, _DeleteByQuery)):
             limit_opt = step.limit
             total += MAX_BY_QUERY_ROWS if limit_opt is None else min(limit_opt, MAX_BY_QUERY_ROWS)
-        elif isinstance(step, (_Schedule, _CancelSchedule)):
-            # Control-flow steps touch no documents (server counts 0).
+        elif isinstance(step, (_Schedule, _CancelSchedule, _StartWorkflow, _CancelWorkflow)):
+            # Control-flow steps touch no documents (server counts 0) —
+            # workflow steps included (txn::worst_case_affected).
             continue
         else:
             total += 1
@@ -192,14 +197,53 @@ def worst_case_affected(txn: Transaction) -> int:
 
 def _count_steps(txn: Transaction) -> int:
     """FM-28: recursive step count — a ``schedule`` step counts as itself plus
-    every step in its nested txn. Mirrors the server's recursive ruling against
-    ``MAX_STEPS`` (a nested tree can't smuggle past the flat cap)."""
+    every step in its nested txn; a ``startWorkflow`` step (FM-29) as itself
+    plus every step of every txn in its spec. Mirrors the server's recursive
+    ruling against ``MAX_STEPS`` (a nested tree can't smuggle past the flat
+    cap)."""
     total = 0
     for step in txn.steps:
         total += 1
         if isinstance(step, _Schedule):
             total += _count_steps(step.txn)
+        elif isinstance(step, _StartWorkflow):
+            total += sum(_count_steps(Transaction.model_validate(s.txn)) for s in step.spec.steps)
     return total
+
+
+def _validate_workflow_spec(spec: WorkflowSpec) -> None:
+    """FM-29: submit-time spec validation — same checks and BAD_REQUEST
+    messages as server ``workflows::validate_spec`` (and the ts harness's
+    ``validateWorkflowSpec``): 1..=MAX_WORKFLOW_STEPS steps, retry fields in
+    bounds, and the recursive step count summed across every step's txn
+    within ``MAX_STEPS`` (the FM-28 counter — bounds body size and the
+    nesting bomb)."""
+    if not spec.steps:
+        raise RtDbError(ErrorCode.BAD_REQUEST, "workflow must have at least one step")
+    if len(spec.steps) > MAX_WORKFLOW_STEPS:
+        raise RtDbError(ErrorCode.BAD_REQUEST, f"workflow exceeds {MAX_WORKFLOW_STEPS} steps")
+    for i, step in enumerate(spec.steps):
+        if step.retry is not None:
+            if step.retry.max_attempts == 0:
+                raise RtDbError(
+                    ErrorCode.BAD_REQUEST,
+                    f"steps[{i}].retry.maxAttempts must be >= 1",
+                )
+            if (
+                step.retry.initial_retry_ms == 0
+                or step.retry.max_retry_ms < step.retry.initial_retry_ms
+            ):
+                raise RtDbError(
+                    ErrorCode.BAD_REQUEST,
+                    f"steps[{i}].retry requires initialRetryMs > 0"
+                    " and maxRetryMs >= initialRetryMs",
+                )
+    total = sum(_count_steps(Transaction.model_validate(s.txn)) for s in spec.steps)
+    if total > MAX_STEPS:
+        raise RtDbError(
+            ErrorCode.BAD_REQUEST,
+            f"workflow recursive step count {total} exceeds MAX_STEPS {MAX_STEPS}",
+        )
 
 
 # Sentinel storage types mirroring ``PgType`` in the Rust harness. Selects the
@@ -2286,13 +2330,12 @@ class InMemoryRtDbClient:
         return [_workflow_info(r) for r in runs]
 
     def _insert_workflow(self, spec: WorkflowSpec) -> str:
-        if not spec.steps:
-            raise RtDbError(ErrorCode.BAD_REQUEST, "workflow spec must have at least one step")
+        _validate_workflow_spec(spec)
         now = self._now()
-        first = spec.steps[0]
-        gate: int | None = None
-        if first.sleep_before_ms is not None and first.sleep_before_ms > 0:
-            gate = now + first.sleep_before_ms
+        # The server column is NOT NULL — the insert gate is always
+        # ``now + unwrap_or(0)``: sleepBeforeMs absent/0 means due immediately
+        # (gate == the insert instant), not "no gate".
+        gate = now + (spec.steps[0].sleep_before_ms or 0)
         run = _WorkflowRun(
             id=self._new_id(),
             spec=spec,

@@ -732,13 +732,13 @@ class RtDbClient:
         elif tag == "workflowAck":
             if msg.ok:
                 wp.future.set_result(True)
+            elif msg.error is not None:
+                wp.future.set_exception(RtDbError.from_envelope(msg.error.model_dump()))
             else:
-                env = (
-                    msg.error.model_dump()
-                    if msg.error is not None
-                    else {"code": "INTERNAL", "message": "workflow ack failed"}
-                )
-                wp.future.set_exception(RtDbError.from_envelope(env))
+                # Bare ok:false = unknown/terminal run: a no-op, not a failure.
+                # The server sends no error envelope for a legit no-op cancel
+                # (ws.rs maps workflows::cancel Ok(ok) => (ok, None)).
+                wp.future.set_result(False)
 
     # --- presence (ENH-015) -------------------------------------------
     #

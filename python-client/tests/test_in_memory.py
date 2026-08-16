@@ -24,6 +24,7 @@ from par_rt_db.in_memory import (
     InMemoryRtDbClient,
     InMemoryRtDbClientOptions,
     is_hex_id,
+    worst_case_affected,
 )
 from par_rt_db.query import Query
 from par_rt_db.schema import Schema, t
@@ -2084,11 +2085,14 @@ def _wf_status(c: Any, wid: str) -> Any:
 
 
 def test_workflow_step_one_succeeds_in_one_tick() -> None:
-    c, _clock = _new_clock_client()
+    c, clock = _new_clock_client()
     wid = c.start_workflow(_wf("single", [_wf_step(_wf_txn("a"))]))
     assert is_hex_id(wid)
     info = _wf_status(c, wid)
     assert info.status == "pending" and info.step_count == 1 and info.current_step == 0
+    # sleepUntil is always set at insert (NOT NULL server column): an absent
+    # sleepBeforeMs gates at the insert instant, i.e. due immediately.
+    assert info.sleep_until == clock[0]
     c.tick()
     docs = c.run_query(TableQuery("items").build())
     assert [d["name"] for d in docs] == ["a"]
@@ -2171,19 +2175,20 @@ def test_workflow_retry_backoff_then_success() -> None:
 
 
 def test_workflow_retry_exhaustion_marks_failed_with_outcome() -> None:
-    c, _clock = _new_clock_client()
+    c, clock = _new_clock_client()
     wid = c.start_workflow(
         _wf(
             "doomed",
-            [_wf_fail_step(retry=StepRetry(max_attempts=2, initial_retry_ms=0, max_retry_ms=0))],
+            [_wf_fail_step(retry=StepRetry(max_attempts=2, initial_retry_ms=1, max_retry_ms=1))],
         )
     )
-    # 0ms backoff => the retry gate is immediately due, but each tick runs one
-    # claim pass (mirroring the server's scheduler poll cadence): tick 1 fails
-    # attempt 1 and releases to pending; tick 2 claims, fails attempt 2, and
-    # exhausts (attempts == maxAttempts) -> failed.
+    # 1ms backoff: tick 1 fails attempt 1 and releases to pending at now+1
+    # (each tick runs one claim pass, mirroring the server's scheduler poll
+    # cadence); advancing the clock past the gate lets tick 2 claim, fail
+    # attempt 2, and exhaust (attempts == maxAttempts) -> failed.
     c.tick()
     assert _wf_status(c, wid).attempts == 1
+    clock[0] += 1
     c.tick()
     info = _wf_status(c, wid)
     assert info.status == "failed"
@@ -2204,7 +2209,7 @@ def test_workflow_failed_step_rolls_back_its_partial_writes() -> None:
     wid = c.start_workflow(
         _wf(
             "rollback",
-            [_wf_step(txn, retry=StepRetry(max_attempts=1, initial_retry_ms=0, max_retry_ms=0))],
+            [_wf_step(txn, retry=StepRetry(max_attempts=1, initial_retry_ms=1, max_retry_ms=1))],
         )
     )
     c.tick()
@@ -2233,7 +2238,7 @@ def test_list_workflows_filters_by_status() -> None:
     wid2 = c.start_workflow(
         _wf(
             "doomed",
-            [_wf_fail_step(retry=StepRetry(max_attempts=1, initial_retry_ms=0, max_retry_ms=0))],
+            [_wf_fail_step(retry=StepRetry(max_attempts=1, initial_retry_ms=1, max_retry_ms=1))],
         )
     )
     c.tick()
@@ -2271,3 +2276,72 @@ def test_cancel_workflow_step_flips_pending_run() -> None:
     res2 = c.mutate(Mutation.builder().cancel_workflow(wid).build())[0]
     assert res2 is not None
     assert res2.model_dump()["cancelled"] is False
+
+
+def test_workflow_spec_validation_rejects_invalid_specs() -> None:
+    c, _clock = _new_clock_client()
+
+    def rejects(spec: Any, message: str) -> None:
+        with pytest.raises(RtDbError) as ei:
+            c.start_workflow(spec)
+        assert ei.value.code is ErrorCode.BAD_REQUEST
+        assert ei.value.message == message
+
+    rejects(_wf("empty", []), "workflow must have at least one step")
+    rejects(
+        _wf("too-many", [_wf_step(_wf_txn(f"s{i}")) for i in range(65)]),
+        "workflow exceeds 64 steps",
+    )
+    rejects(
+        _wf("zero-attempts", [_wf_step(_wf_txn("a"), retry=StepRetry(max_attempts=0))]),
+        "steps[0].retry.maxAttempts must be >= 1",
+    )
+    rejects(
+        _wf(
+            "zero-initial",
+            [_wf_step(_wf_txn("a"), retry=StepRetry(max_attempts=2, initial_retry_ms=0))],
+        ),
+        "steps[0].retry requires initialRetryMs > 0 and maxRetryMs >= initialRetryMs",
+    )
+    rejects(
+        _wf(
+            "inverted-cap",
+            [
+                _wf_step(
+                    _wf_txn("a"),
+                    retry=StepRetry(max_attempts=2, initial_retry_ms=500, max_retry_ms=100),
+                )
+            ],
+        ),
+        "steps[0].retry requires initialRetryMs > 0 and maxRetryMs >= initialRetryMs",
+    )
+
+
+def test_workflow_spec_nested_start_workflow_cannot_smuggle_past_max_steps() -> None:
+    c, _clock = _new_clock_client()
+    two_step_txn = (
+        Mutation.builder()
+        .insert("items", {"name": "a", "status": "todo", "order": 1})
+        .insert("items", {"name": "b", "status": "todo", "order": 2})
+        .build()
+    )
+    inner = WorkflowSpec(
+        name="inner",
+        steps=[WorkflowStepSpec(txn=two_step_txn.model_dump(by_alias=True)) for _ in range(128)],
+    )
+    outer_txn = (
+        Mutation.builder()
+        .insert("items", {"name": "x", "status": "todo", "order": 1})
+        .start_workflow(inner)
+        .build()
+    )
+    # The outer spec is flat-tiny (one step, a 2-step txn), but the nested
+    # spec's txns push the recursive count to 2 + 128*2 = 258 > MAX_STEPS
+    # (256) — only the recursive counter catches the smuggle. Workflow steps
+    # themselves are control flow: worst_case_affected counts 0 documents.
+    control_only = Mutation.builder().start_workflow(inner).cancel_workflow("wf-x").build()
+    assert worst_case_affected(control_only) == 0
+    with pytest.raises(RtDbError) as ei:
+        c.start_workflow(_wf("smuggle", [_wf_step(outer_txn)]))
+    assert ei.value.code is ErrorCode.BAD_REQUEST
+    assert "recursive step count 258 exceeds MAX_STEPS 256" in ei.value.message
