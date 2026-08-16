@@ -211,7 +211,7 @@ pub(crate) struct SessionsResponse {
 /// Optional filter for `list_workflows`
 /// (`GET /admin/db/{db}/workflows?status=&limit=`). Both fields optional:
 /// `status` filters by run state; `limit` pages the result (server default
-/// 100, clamped to `[1, 500]`). Mirrors ts-client's `listWorkflows` opts.
+/// 100, capped at 500). Mirrors ts-client's `listWorkflows` opts.
 #[derive(Debug, Clone, Default)]
 pub struct WorkflowListOptions {
     pub status: Option<crate::wire::WorkflowStatus>,

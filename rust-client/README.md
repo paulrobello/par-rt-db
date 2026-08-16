@@ -115,6 +115,42 @@ db.cancel_schedule(&id).await?;      // …or pause_schedule / resume_schedule
 let jobs: Vec<ScheduleInfo> = db.list_schedules().await?;
 ```
 
+## Durable workflows
+
+Durable declarative workflows (FM-29): a named spec of steps — each an
+ordinary `Transaction` plus optional `StepRetry` and `sleepBeforeMs` — that
+the server advances durably. `RtDbHttpClient::start_workflow` returns the new
+run id; the reactive `RtDbClient` (`ws` feature) trio returns `WorkflowInfo`
+directly; `Mutation::start_workflow(spec)` starts a run as a txn step,
+atomic with the txn's writes.
+
+```rust
+use par_rt_db_client::{StepRetry, WorkflowInfo, WorkflowSpec, WorkflowStepSpec};
+
+let spec = WorkflowSpec {
+    name: "onboard".into(),
+    steps: vec![
+        WorkflowStepSpec { txn, ..Default::default() },
+        WorkflowStepSpec {
+            txn: txn2,
+            retry: Some(StepRetry { max_attempts: 5, ..Default::default() }),
+            sleep_before_ms: Some(60_000),
+        },
+    ],
+};
+let id: String = db.start_workflow(&spec).await?;   // reactive client: WorkflowInfo
+db.cancel_workflow(&id).await?;                     // false for a missing/terminal run
+let runs: Vec<WorkflowInfo> = db.list_workflows(None).await?;
+```
+
+Steps fire as the system principal (a scoped machine token is confined at
+submit time); delivery is at-least-once per step, so write idempotent step
+txns. A step that exhausts its retries fails the run (terminal). The admin
+client adds `list_workflows`/`get_workflow`/`start_workflow`/`cancel_workflow`/
+`delete_workflow` over the `/admin/db/{db}/workflows` routes. Note: the
+in-memory test harness does NOT model the workflow engine (its workflow arms
+return `Internal` errors) — test workflow flows against a live server.
+
 ## Schema migration
 
 Destructive/type-changing schema transformations are a deliberate admin operation,

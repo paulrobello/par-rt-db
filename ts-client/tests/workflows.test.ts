@@ -89,7 +89,7 @@ describe("workflow wire types (FM-29)", () => {
       id: "wf1",
       name: "onboard",
       status: "success",
-      currentStep: 2,
+      currentStep: 1,
       stepCount: 2,
       attempts: 0,
       createdAt: 1700000000000,

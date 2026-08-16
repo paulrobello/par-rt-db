@@ -895,7 +895,7 @@ impl RtDbAdminClient {
 
     /// `GET /admin/db/{db}/workflows?status=&limit=` → `{workflows:[...]}`,
     /// newest first. `opts = None` for the server-default first page (limit
-    /// 100, clamped to `[1, 500]`, no status filter).
+    /// default 100, capped at 500, no status filter).
     pub async fn list_workflows(
         &self,
         db: &str,

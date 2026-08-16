@@ -35,7 +35,8 @@ The DSL layer is feature-complete: every server query terminal
 and every mutation step
 (`insert`/`patch`/`replace`/`delete`/`expectVersion`/`expectAbsent`/`upsert`
 per-id steps, the `patch_by_query`/`delete_by_query` bulk steps, plus the
-`schedule(when, txn)`/`cancel_schedule(id)` scheduling steps)
+`schedule(when, txn)`/`cancel_schedule(id)` scheduling steps and the
+`start_workflow(spec)`/`cancel_workflow(id)` workflow steps (FM-29))
 has a builder method that produces a wire-identical payload. Pydantic v2
 `extra="forbid"` mirrors the server's `deny_unknown_fields` on every variant.
 
@@ -274,6 +275,45 @@ result = admin.migrate_schema(
 it a single bad value rolls the whole migrate back atomically). `eval_expr` is the
 scoped raw-SQL escape hatch (one table's `doc` jsonb, no joins/DDL). See
 [`docs/superpowers/specs/2026-07-31-schema-migration-backfill-design.md`](../docs/superpowers/specs/2026-07-31-schema-migration-backfill-design.md).
+
+### Durable workflows (FM-29)
+
+A named spec of steps — each an ordinary dumped `Transaction` plus optional
+`StepRetry` and `sleep_before_ms` — the server advances durably (at-least-once
+per step; a step that exhausts its retries fails the run). The sync and async
+HTTP clients return the new run id; the reactive client returns `WorkflowInfo`.
+
+```python
+from par_rt_db import Mutation
+from par_rt_db.wire import StepRetry, WorkflowSpec, WorkflowStepSpec
+
+txn = Mutation.builder().insert("work_items", {"title": "welcome"}).build()
+spec = WorkflowSpec(
+    name="onboard",
+    steps=[
+        WorkflowStepSpec(txn=txn.model_dump(by_alias=True)),
+        WorkflowStepSpec(
+            txn=txn2,
+            retry=StepRetry(max_attempts=5),
+            sleep_before_ms=60_000,
+        ),
+    ],
+)
+run_id: str = db.start_workflow(spec)  # reactive client: WorkflowInfo
+db.cancel_workflow(run_id)  # False for a missing/terminal run
+runs = db.list_workflows("running")  # list[WorkflowInfo], newest first
+
+# …or start one atomically inside a txn:
+Mutation.builder().insert("users", {"name": "a"}).start_workflow(spec).build()
+```
+
+Steps fire as the system principal (a scoped machine token is confined at
+submit time), so write idempotent step txns. The admin client adds
+`admin_list_workflows`/`admin_start_workflow`/`admin_get_workflow`/
+`admin_cancel_workflow`/`admin_delete_workflow` (sync + async) over the
+`/admin/db/{db}/workflows` routes, and the in-memory harness models the
+engine (spec validation + `tick()` advance) so workflow flows are testable
+with no network.
 
 ## Errors
 

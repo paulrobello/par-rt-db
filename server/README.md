@@ -50,6 +50,7 @@ alongside it: [`../ts-client/`](../ts-client) (browser/Node),
 | --- | --- |
 | Correctness core (serialized writes + subscription fan-out) | `src/committer.rs`, `src/subs.rs` |
 | Scheduled / cron transactions | `src/scheduler.rs` (+ the `RunScheduled` arm in `src/committer.rs`) |
+| Durable declarative workflows (FM-29) | `src/workflows.rs` (+ the `RunWorkflowAdvance` arm in `src/committer.rs`; scheduler polls both tables) |
 | TTL reaper | `src/reaper.rs` (+ the `RunReaper` arm in `src/committer.rs`) |
 | Schema migration (destructive transforms) | `src/migrate.rs` (+ the `RunMigrate` arm in `src/committer.rs`) |
 | Schema change history + restore | `src/schema_history.rs`, `src/schema_diff.rs` (+ the `RunRestoreSchema` arm in `src/committer.rs`) |
@@ -76,7 +77,7 @@ alongside it: [`../ts-client/`](../ts-client) (browser/Node),
 | Wire messages | `src/protocol.rs` |
 | Error envelope | `src/error.rs` |
 | Transports | `src/ws.rs` (reactive), `src/http_api.rs` (one-shot) |
-| Admin control plane | `src/admin/` — `mod.rs` (shared core + assembled router) + twelve per-domain submodules (`login`, `dbs`, `schema_ops`, `tokens`, `docs`, `schedules`, `storage_ops`, `webhooks`, `backups`, `settings`, `observability`, `sessions`); all `/admin/*` routes + `/admin/stream` WS. `sessions` is the active-session management surface (`GET/DELETE /admin/sessions`, per-user + per-token-hash revocation; revocation takes effect on the next op over an already-open connection). |
+| Admin control plane | `src/admin/` — `mod.rs` (shared core + assembled router) + fourteen per-domain submodules (`login`, `dbs`, `schema_ops`, `tokens`, `docs`, `schedules`, `storage_ops`, `webhooks`, `backups`, `settings`, `observability`, `sessions`, `merge`, `workflows`); all `/admin/*` routes + `/admin/stream` WS. `sessions` is the active-session management surface (`GET/DELETE /admin/sessions`, per-user + per-token-hash revocation; revocation takes effect on the next op over an already-open connection). |
 | Signed, time-limited storage URLs (ENH-017) | `src/signed_url.rs` (HMAC over `admin_key`, `?exp=&sig=` verified on `GET /storage/{id}`) |
 | Auth (six OAuth providers + sessions + machine tokens + anonymous) | `src/auth/` — `mod.rs`, `provider.rs` (trait + dispatcher), `github.rs`, `google.rs`, `gitlab.rs`, `microsoft.rs` (Entra ID/Azure AD v2), `apple.rs` (ES256 JWT `client_secret` + `form_post`), `oidc.rs` (generic), `session.rs`, `tokens.rs`, `cookie.rs`. Anonymous auth (`POST /auth/anonymous`, gated `RTDB_AUTH_ANONYMOUS_ENABLED` default off) mints an ephemeral `Principal::User` (`anonymous = true`, `email = None`) that bypasses the per-db allowlist via its boot gate and owns its own documents via per-row `ownerField`. On a later OAuth sign-in, the anon footprint is merged into the real account (`src/merge.rs` — doc restamps in the committer, storage owner swap, session re-point, guarded anon-row delete); `POST /admin/merge-users` is the operator escape hatch. |
 
@@ -126,6 +127,45 @@ should write idempotent scheduled txns. A past-due one-shot fires immediately
 `Schedule` / `CancelSchedule` / `PauseSchedule` / `ResumeSchedule` /
 `ListSchedules`. HTTP surface: `POST /api/schedule`,
 `POST /api/schedule/{id}/{cancel,pause,resume}`, `POST /api/schedules`.
+
+## Durable workflows
+
+Durable declarative workflows (FM-29) live in `src/workflows.rs`. A run is a
+row in a per-db `workflows` side table snapshotting its `WorkflowSpec`: a
+`name` plus an ordered list of steps, each an ordinary declarative
+`Transaction` with an optional `retry` policy (`StepRetry` — `maxAttempts`
+counts TOTAL attempts, default 3; `initialRetryMs` default 1000 doubling to a
+`maxRetryMs` cap of 60000) and an optional `sleepBeforeMs` gate before the
+step. The per-db scheduler polls this table alongside `scheduled_txns` and
+enqueues due runs as `CommitterRequest::RunWorkflowAdvance`; the committer's
+arm (`handle_workflow_advance`) executes the current step's txn via the normal
+`execute_txn` + `subs.fan_out` path and publishes through the tap sites with
+`source = "workflow"` — op-feed, audit, and webhooks see every step. The
+single-writer invariant is intact (the scheduler only claims and enqueues).
+
+Semantics: steps fire as the **system (bypass) principal** — per-row
+`ownerField`/`authorize` rules don't apply to workflow writes, like scheduled
+jobs — so a scoped machine token is confined at **submit time**: all four
+start surfaces (the txn step, WS `startWorkflow` frame, `POST /api/workflows`,
+admin create) run `authorize_spec_tables`, a recursive table-allowlist check
+over every step's txn. Delivery is **at-least-once per step**: a crash
+mid-advance leaves the row `running`, recovered by `reset_running` at
+scheduler startup — write idempotent step txns. A step that exhausts its
+retries marks the run `failed` (terminal; `lastError` carries the final
+error). Cold-db liveness: every workflows surface ensures the side table
+inline, and the three standalone start surfaces call
+`Committers::ensure_spawned` + `ensure_table` before insert, so a workflow
+started on a db with no live per-db tasks both starts and advances.
+
+Surfaces: txn steps `startWorkflow`/`cancelWorkflow` (the run row inserts on
+the open sqlx tx, atomic with the txn's writes); WS frames
+`startWorkflow`/`cancelWorkflow`/`listWorkflows` (replies `startWorkflowOk`/
+`startWorkflowErr`/`workflowAck`/`listWorkflowsOk`); HTTP `POST
+/api/workflows`, `POST /api/workflows/list` (capped at 100), `POST
+/api/workflows/{id}/cancel`; admin `GET|POST /admin/db/{db}/workflows`,
+`GET /admin/db/{db}/workflows/{id}` (full row + step-outcome trail),
+`POST /admin/db/{db}/workflows/{id}/cancel`, `DELETE
+/admin/db/{db}/workflows/{id}`.
 
 ## File storage
 

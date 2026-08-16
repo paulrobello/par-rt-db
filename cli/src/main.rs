@@ -146,7 +146,7 @@ enum WorkflowsCommand {
         /// Filter by run status: pending|running|success|failed|cancelled.
         #[arg(long)]
         status: Option<String>,
-        /// Cap the result count (server default 100, clamped to [1, 500]).
+        /// Cap the result count (server default 100, capped at 500).
         #[arg(long)]
         limit: Option<u32>,
     },

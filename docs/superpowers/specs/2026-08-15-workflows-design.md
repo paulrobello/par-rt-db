@@ -119,9 +119,9 @@ entry per completed (or terminally failed) step attempt-batch, in order.
 ### WS frames (`ClientMessage`, tag `"type"`, camelCase)
 
 ```
-StartWorkflow  { workflowId: <correlation>, spec }      → ServerMsg echoing workflowId + WorkflowInfo
-CancelWorkflow { workflowId: <correlation>, id }        → echoes + { cancelled: bool }
-ListWorkflows  { workflowId: <correlation>, status? }   → echoes + [ WorkflowInfo ]
+StartWorkflow  { workflowId: <correlation>, spec }      → startWorkflowOk { workflowId, info: WorkflowInfo } | startWorkflowErr { workflowId, error }
+CancelWorkflow { workflowId: <correlation>, id }        → workflowAck { workflowId, ok, error? }
+ListWorkflows  { workflowId: <correlation>, status? }   → listWorkflowsOk { workflowId, workflows: [ WorkflowInfo ] }
 ```
 
 Mirrors the `Schedule`/`ListSchedules` correlation-id style. Authorized per
@@ -133,7 +133,7 @@ enforced at submit (see Semantics).
 ```
 POST /api/workflows            body = WorkflowSpec            → { id }        (start)
 POST /api/workflows/{id}/cancel                               → { cancelled } (cancel)
-POST /api/workflows/list       body = { status? }             → [ WorkflowInfo ]
+POST /api/workflows/list       body = { status? }             → { workflows: [ WorkflowInfo ] }
 ```
 
 Bearer-token authorized, same as `/api/schedule*`.
@@ -141,10 +141,10 @@ Bearer-token authorized, same as `/api/schedule*`.
 ### Admin routes
 
 ```
-GET    /admin/db/{db}/workflows?status=&limit=   → [ WorkflowInfo ]
+GET    /admin/db/{db}/workflows?status=&limit=   → { workflows: [ WorkflowInfo ] }
 POST   /admin/db/{db}/workflows                  (body = WorkflowSpec) → { id }
 GET    /admin/db/{db}/workflows/{id}             → WorkflowInfo + stepOutcomes
-POST   /admin/db/{db}/workflows/{id}/cancel      → { cancelled }
+POST   /admin/db/{db}/workflows/{id}/cancel      → { ok }
 DELETE /admin/db/{db}/workflows/{id}             → hard-delete one run row
 ```
 

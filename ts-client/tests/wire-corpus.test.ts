@@ -31,6 +31,10 @@ import type {
   ScheduleWhen,
   SearchQuery,
   ServerMessage,
+  StepRetry,
+  WorkflowInfo,
+  WorkflowSpec,
+  WorkflowStepSpec,
 } from "../src/protocol.js";
 
 interface Corpus {
@@ -210,6 +214,91 @@ describe("wire-corpus: search query entries (FM-31 operators/snippet)", () => {
     const snippet = searchEntries.find((e) => e.search.snippet === true);
     expect(snippet?.search.query).toBe("hello world");
     expect(snippet?.search.mode).toBeUndefined();
+  });
+});
+
+/**
+ * FM-29 pins: the corpus gained workflow entries — `startWorkflow` /
+ * `cancelWorkflow` txn steps inside `client_messages` Mutate frames, and the
+ * `startWorkflowOk` / `startWorkflowErr` / `workflowAck` / `listWorkflowsOk`
+ * server frames. The generic loops above round-trip them raw; this block
+ * additionally type-checks the spec family (`WorkflowSpec`, `WorkflowStepSpec`,
+ * `StepRetry`, `WorkflowInfo`) and asserts each entry is present with its
+ * load-bearing fields intact. The `retry` object carries all three fields
+ * (server `StepRetry` serde-defaults without `skip_serializing_if`, so a
+ * serialized retry always re-emits them — this pins the canonical full form),
+ * the second spec step pins optional-field absence, and `workflowAck` mirrors
+ * `scheduleAck`'s ok/error shape.
+ */
+describe("wire-corpus: workflow entries (FM-29 steps + frames)", () => {
+  const corpus = loadCorpus();
+  const startSteps = corpus.client_messages.flatMap((m) =>
+    m.type === "mutate" ? m.txn.steps.filter((s) => s.op === "startWorkflow") : [],
+  );
+  const cancelSteps = corpus.client_messages.flatMap((m) =>
+    m.type === "mutate" ? m.txn.steps.filter((s) => s.op === "cancelWorkflow") : [],
+  );
+
+  it("carries a startWorkflow step whose spec type-checks with retry and sleep", () => {
+    expect(startSteps).toHaveLength(1);
+    const spec: WorkflowSpec = startSteps[0].spec;
+    expect(spec.name).toBe("drip");
+    expect(spec.steps).toHaveLength(2);
+    const first: WorkflowStepSpec = spec.steps[0];
+    const retry: StepRetry = first.retry as StepRetry;
+    expect(retry).toEqual({ maxAttempts: 3, initialRetryMs: 1000, maxRetryMs: 60000 });
+    expect(first.sleepBeforeMs).toBe(60000);
+    // The second step pins optional-field absence (no retry, no sleep).
+    const second: WorkflowStepSpec = spec.steps[1];
+    expect(second.retry).toBeUndefined();
+    expect(second.sleepBeforeMs).toBeUndefined();
+  });
+
+  it("carries a cancelWorkflow step", () => {
+    expect(cancelSteps).toHaveLength(1);
+    expect(cancelSteps[0].id).toBe("wf-9");
+  });
+
+  it("carries the FM-29 server frames with WorkflowInfo type-checks", () => {
+    const okFrames = corpus.server_messages.filter(
+      (m): m is Extract<ServerMessage, { type: "startWorkflowOk" }> => m.type === "startWorkflowOk",
+    );
+    expect(okFrames).toHaveLength(1);
+    const info: WorkflowInfo = okFrames[0].info;
+    expect(info.status).toBe("pending");
+    // Optional fields omitted on the wire when absent (pending run).
+    expect(info.sleepUntil).toBeUndefined();
+    expect(info.lastError).toBeUndefined();
+    expect(info.startedAt).toBeUndefined();
+    expect(info.finishedAt).toBeUndefined();
+
+    const errFrames = corpus.server_messages.filter(
+      (m): m is Extract<ServerMessage, { type: "startWorkflowErr" }> =>
+        m.type === "startWorkflowErr",
+    );
+    expect(errFrames).toHaveLength(1);
+    expect(errFrames[0].error.code).toBe("BAD_REQUEST");
+
+    const ackFrames = corpus.server_messages.filter(
+      (m): m is Extract<ServerMessage, { type: "workflowAck" }> => m.type === "workflowAck",
+    );
+    expect(ackFrames).toHaveLength(2);
+    expect(ackFrames.filter((f) => f.ok)).toHaveLength(1);
+    expect(ackFrames.filter((f) => !f.ok && f.error)).toHaveLength(1);
+
+    const listFrames = corpus.server_messages.filter(
+      (m): m is Extract<ServerMessage, { type: "listWorkflowsOk" }> => m.type === "listWorkflowsOk",
+    );
+    expect(listFrames).toHaveLength(2);
+    expect(listFrames.some((f) => f.workflows.length === 0)).toBe(true);
+    const populated = listFrames.find((f) => f.workflows.length > 0);
+    expect(populated).toBeDefined();
+    const running = populated?.workflows.find((w) => w.status === "running");
+    expect(running?.sleepUntil).toBe(9000);
+    const failed = populated?.workflows.find((w) => w.status === "failed");
+    expect(failed?.lastError).toBe("boom");
+    expect(failed?.startedAt).toBe(110);
+    expect(failed?.finishedAt).toBe(200);
   });
 });
 

@@ -82,7 +82,7 @@ rtdb --url $URL --admin-key $KEY --db kanban workflows cancel --id <runId>
 
 `list` filters by `--status` — validated client-side against exactly
 `pending`|`running`|`success`|`failed`|`cancelled` — and pages with `--limit`
-(server default 100, clamped to `[1, 500]`). `get` prints the full run: the
+(server default 100, capped at 500). `get` prints the full run: the
 info fields plus the per-step outcome trail. `start` reads a `WorkflowSpec`
 JSON file (`{"name": .., "steps": [{"txn": <Transaction>, "retry"?: ..,
 "sleepBeforeMs"?: ..}]}`, `@`-prefix supported) and prints the new run id.

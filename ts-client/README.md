@@ -194,6 +194,46 @@ should be idempotent. The in-memory test client (`InMemoryRtDbClient`) mirrors
 the store and exposes a timer-less `tick(nowMs?)` that fires due jobs
 synchronously in unit tests.
 
+## Durable workflows
+
+Durable declarative workflows (FM-29) — multi-step txn pipelines with per-step
+retry and sleeps, executed server-side and observable without holding a
+connection. Both the reactive `RtDbClient` and the one-shot `RtDbHttpClient`
+expose the trio, and a txn can start (or cancel) a run as a step, atomic with
+its writes:
+
+```ts
+import type { WorkflowSpec } from "@par-rt-db/client";
+
+const spec: WorkflowSpec = {
+  name: "onboard",
+  steps: [
+    { txn: mutation().insert("workItems", { title: "welcome", done: false }).build() },
+    {
+      txn: { steps: [{ op: "patch", table: "workItems", id: itemId, fields: { done: true } }] },
+      retry: { maxAttempts: 5, initialRetryMs: 500, maxRetryMs: 30_000 },
+      sleepBeforeMs: 60_000,
+    },
+  ],
+};
+
+const info = await db.startWorkflow(spec);      // WorkflowInfo (status "pending")
+await db.cancelWorkflow(id);                    // false for a missing/terminal run (a no-op, not an error)
+const runs = await db.listWorkflows("running"); // WorkflowInfo[], newest first
+
+// …or start one atomically inside a txn:
+await db.mutate(mutation().insert("users", { name: "a" })
+  .startWorkflow(spec).build());
+```
+
+Steps are ordinary declarative txns firing as the system principal (a scoped
+machine token is confined at submit time, not per step); delivery is
+at-least-once per step, so write idempotent step txns. A step that exhausts
+its retries fails the run (terminal). `adminStartWorkflow` on the admin client
+covers the admin route. The in-memory harness models the engine: it validates
+the spec and advances runs on `tick()`, so workflow flows are testable with no
+network.
+
 ## Search
 
 `.search(index, query, opts)` full-text queries a declared search index

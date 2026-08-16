@@ -1,5 +1,5 @@
 {
-  "$comment": "Canonical cross-client wire-parity corpus (ARC-008). Every entry is the raw JSON object as it appears on the wire. Each client's parity test parses -> serializes -> deep-compares to the input. Bytes are authoritative; tag/field names are load-bearing (see server/src/protocol.rs header). Sections: 'client_messages' (incl. ENH-015 presence join/state/leave frames), 'server_messages' (incl. ENH-015 presenceSnapshot/presenceErr), 'authed_users', 'schedule_whens', 'schedule_infos', 'query_results', 'error_envelopes', 'queries' (embedded query shapes covering filter/search/vectorSearch/paginate), 'migrate_requests' / 'migrate_results' (admin migrate Directive list + response — op tag, camelCase, `where`/`from` aliases, cast literals), 'db_stats' (admin GET /admin/dbs/{db}/stats response, ENH-011 quota/usage fields — ARC-112), 'rejects_client_message_unknown_field' (must fail to parse where deny_unknown_fields / extra='forbid' applies).",
+  "$comment": "Canonical cross-client wire-parity corpus (ARC-008). Every entry is the raw JSON object as it appears on the wire. Each client's parity test parses -> serializes -> deep-compares to the input. Bytes are authoritative; tag/field names are load-bearing (see server/src/protocol.rs header). Sections: 'client_messages' (incl. ENH-015 presence join/state/leave frames, FM-29 startWorkflow/cancelWorkflow txn steps), 'server_messages' (incl. ENH-015 presenceSnapshot/presenceErr, FM-29 startWorkflowOk/startWorkflowErr/workflowAck/listWorkflowsOk), 'authed_users', 'schedule_whens', 'schedule_infos', 'query_results', 'error_envelopes', 'queries' (embedded query shapes covering filter/search/vectorSearch/paginate), 'migrate_requests' / 'migrate_results' (admin migrate Directive list + response — op tag, camelCase, `where`/`from` aliases, cast literals), 'db_stats' (admin GET /admin/dbs/{db}/stats response, ENH-011 quota/usage fields — ARC-112), 'rejects_client_message_unknown_field' (must fail to parse where deny_unknown_fields / extra='forbid' applies).",
   "client_messages": [
     { "type": "auth", "token": "t", "db": "d" },
     { "type": "auth", "db": "d" },
@@ -16,6 +16,8 @@
     { "type": "mutate", "mutId": "m1", "txn": { "steps": [ { "op": "insert", "table": "workItems", "doc": { "title": "x" } } ] } },
     { "type": "mutate", "mutId": "m4", "txn": { "steps": [ { "op": "schedule", "when": { "type": "afterMs", "ms": 60000 }, "txn": { "steps": [ { "op": "insert", "table": "workItems", "doc": { "title": "later" } } ] } } ] } },
     { "type": "mutate", "mutId": "m5", "txn": { "steps": [ { "op": "cancelSchedule", "id": "0199ab_cd" } ] } },
+    { "type": "mutate", "mutId": "m6", "txn": { "steps": [ { "op": "startWorkflow", "spec": { "name": "drip", "steps": [ { "txn": { "steps": [ { "op": "insert", "table": "workItems", "doc": { "title": "welcome" } } ] }, "retry": { "maxAttempts": 3, "initialRetryMs": 1000, "maxRetryMs": 60000 }, "sleepBeforeMs": 60000 }, { "txn": { "steps": [] } } ] } } ] } },
+    { "type": "mutate", "mutId": "m7", "txn": { "steps": [ { "op": "cancelWorkflow", "id": "wf-9" } ] } },
     { "type": "schedule", "scheduleId": "s1", "when": { "type": "afterMs", "ms": 100 }, "txn": { "steps": [] } },
     { "type": "schedule", "scheduleId": "s1", "when": { "type": "runAt", "ms": 1700000000000 }, "txn": { "steps": [] } },
     { "type": "schedule", "scheduleId": "s1", "when": { "type": "cron", "expr": "*/5 * * * *" }, "txn": { "steps": [] } },
@@ -51,6 +53,12 @@
     { "type": "listSchedulesOk", "scheduleId": "s1", "schedules": [] },
     { "type": "listSchedulesOk", "scheduleId": "s1", "schedules": [ { "id": "j1", "kind": "oneshot", "dueAt": 1000, "status": "pending", "createdAt": 500, "firedCount": 0 } ] },
     { "type": "listSchedulesOk", "scheduleId": "s1", "schedules": [ { "id": "j2", "kind": "cron", "dueAt": 2000, "cron": "*/5 * * * *", "status": "error", "lastError": "boom", "createdAt": 500, "firedCount": 3 } ] },
+    { "type": "startWorkflowOk", "workflowId": "w1", "info": { "id": "wf1", "name": "drip", "status": "pending", "currentStep": 0, "stepCount": 2, "attempts": 0, "createdAt": 100, "updatedAt": 100 } },
+    { "type": "startWorkflowErr", "workflowId": "w1", "error": { "code": "BAD_REQUEST", "message": "workflow must have at least one step" } },
+    { "type": "workflowAck", "workflowId": "w1", "ok": true },
+    { "type": "workflowAck", "workflowId": "w1", "ok": false, "error": { "code": "NOT_FOUND", "message": "no run" } },
+    { "type": "listWorkflowsOk", "workflowId": "w1", "workflows": [] },
+    { "type": "listWorkflowsOk", "workflowId": "w1", "workflows": [ { "id": "wf2", "name": "drip", "status": "running", "currentStep": 1, "stepCount": 2, "attempts": 0, "sleepUntil": 9000, "createdAt": 100, "updatedAt": 150 }, { "id": "wf3", "name": "drip", "status": "failed", "currentStep": 0, "stepCount": 2, "attempts": 3, "lastError": "boom", "createdAt": 100, "updatedAt": 200, "startedAt": 110, "finishedAt": 200 } ] },
     { "type": "presenceSnapshot", "room": "doc:1", "members": [ { "connectionId": "c1", "user": { "kind": "user", "email": "a@b.com", "name": null }, "state": { "cursor": { "x": 1, "y": 2 } } }, { "connectionId": "c2", "user": { "kind": "machine", "email": null, "name": null }, "state": {} } ] },
     { "type": "presenceErr", "room": "doc:1", "error": { "code": "FORBIDDEN", "message": "presence not enabled" } },
     { "type": "pong" }
