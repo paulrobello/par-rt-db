@@ -676,6 +676,168 @@ def test_int64_number_filter_values_still_compare_as_float8() -> None:
     )
 
 
+# --- filter: SEC-126 value-kind parity with the server -----------------------
+#
+# The server validates every value-carrying filter leaf BEFORE execution
+# (``query/filter.rs`` ``field_lhs_and_bind``): an INDEXED field types its
+# value through the eq-bind conversion (``dsl.rs`` ``eq_bind_for``), a declared
+# but non-indexed field through ``validate_jsonb_comparison_value``. A value
+# whose JSON kind does not match the declared type is ``BAD_REQUEST``, not a
+# lazy no-match. The int64 paths differ by design: the indexed path REQUIRES
+# the decimal-string wire form (and compares numerically — ENH-027 above),
+# the jsonb path REQUIRES a JSON number and rejects decimal strings.
+
+
+def _kind_client() -> InMemoryRtDbClient:
+    """Client over one seeded row of a table with indexed scalars
+    (``s``/``n``/``b``/``big``) and declared-but-NOT-indexed ones
+    (``plain_s``/``plain_n``/``opt_s``/``opt_big``) — both SEC-126 paths."""
+    schema = (
+        Schema.builder()
+        .table(
+            "rows",
+            lambda tb: (
+                tb.field("s", t.string())
+                .field("n", t.number())
+                .field("b", t.boolean())
+                .field("big", t.int64())
+                .field("plain_s", t.string())
+                .field("plain_n", t.number())
+                .field("opt_s", t.optional(t.string()))
+                .field("opt_big", t.optional(t.int64()))
+                .index("by_s", ["s"])
+                .index("by_n", ["n"])
+                .index("by_b", ["b"])
+                .index("by_big", ["big"])
+            ),
+        )
+        .build()
+    )
+    counter = [1_700_000_000_000]
+
+    def now() -> int:
+        v = counter[0]
+        counter[0] += 1
+        return v
+
+    c = InMemoryRtDbClient(InMemoryRtDbClientOptions(now=now, random=lambda: 0.0))
+    c.push_schema(schema)
+    c.mutate(
+        Mutation.builder()
+        .insert(
+            "rows",
+            {
+                "s": "x",
+                "n": 1.5,
+                "b": True,
+                "big": "15",
+                "plain_s": "y",
+                "plain_n": 2.5,
+                "opt_s": "z",
+                "opt_big": "9",
+            },
+        )
+        .build()
+    )
+    return c
+
+
+def _run_filter(c: InMemoryRtDbClient, expr: dict[str, object]) -> Any:
+    return c.run_query(TableQuery("rows").filter(_flt(expr)).build())
+
+
+def test_filter_rejects_number_on_string_field() -> None:
+    c = _kind_client()
+    with pytest.raises(RtDbError) as ei:
+        _run_filter(c, {"op": "eq", "field": "s", "value": 42})
+    assert ei.value.code is ErrorCode.BAD_REQUEST
+    # The same mismatch on the non-indexed (jsonb) path.
+    with pytest.raises(RtDbError) as ei:
+        _run_filter(c, {"op": "gt", "field": "plain_s", "value": 5})
+    assert ei.value.code is ErrorCode.BAD_REQUEST
+    # optional<string> unwraps before the kind check.
+    with pytest.raises(RtDbError) as ei:
+        _run_filter(c, {"op": "gt", "field": "opt_s", "value": 5})
+    assert ei.value.code is ErrorCode.BAD_REQUEST
+
+
+def test_filter_rejects_string_on_number_field() -> None:
+    c = _kind_client()
+    with pytest.raises(RtDbError) as ei:
+        _run_filter(c, {"op": "eq", "field": "n", "value": "5"})
+    assert ei.value.code is ErrorCode.BAD_REQUEST
+    with pytest.raises(RtDbError) as ei:
+        _run_filter(c, {"op": "gt", "field": "plain_n", "value": "5"})
+    assert ei.value.code is ErrorCode.BAD_REQUEST
+
+
+def test_filter_rejects_bool_on_string_field() -> None:
+    c = _kind_client()
+    with pytest.raises(RtDbError) as ei:
+        _run_filter(c, {"op": "eq", "field": "s", "value": True})
+    assert ei.value.code is ErrorCode.BAD_REQUEST
+
+
+def test_filter_rejects_string_on_boolean_field() -> None:
+    c = _kind_client()
+    with pytest.raises(RtDbError) as ei:
+        _run_filter(c, {"op": "eq", "field": "b", "value": "true"})
+    assert ei.value.code is ErrorCode.BAD_REQUEST
+
+
+def test_filter_rejects_wrong_kind_inside_in() -> None:
+    c = _kind_client()
+    with pytest.raises(RtDbError) as ei:
+        _run_filter(c, {"op": "in", "field": "s", "values": ["x", 5]})
+    assert ei.value.code is ErrorCode.BAD_REQUEST
+    with pytest.raises(RtDbError) as ei:
+        _run_filter(c, {"op": "in", "field": "plain_n", "values": [1, "2"]})
+    assert ei.value.code is ErrorCode.BAD_REQUEST
+
+
+def test_filter_int64_kind_asymmetry_between_indexed_and_jsonb_paths() -> None:
+    c = _kind_client()
+    # Indexed int64: the decimal-STRING wire form is required and compares
+    # numerically (ENH-027) — gt("9") keeps big="15".
+    docs = _run_filter(c, {"op": "gt", "field": "big", "value": "9"})
+    assert [d["big"] for d in docs] == ["15"]
+    # A JSON number on the indexed int64 path is rejected (eq_bind_for binds
+    # bigint from a string).
+    with pytest.raises(RtDbError) as ei:
+        _run_filter(c, {"op": "gt", "field": "big", "value": 9})
+    assert ei.value.code is ErrorCode.BAD_REQUEST
+    # Non-indexed int64 (jsonb path): the asymmetry — a decimal STRING is
+    # rejected, a JSON NUMBER is the accepted form (compares as float8).
+    with pytest.raises(RtDbError) as ei:
+        _run_filter(c, {"op": "gt", "field": "opt_big", "value": "9"})
+    assert ei.value.code is ErrorCode.BAD_REQUEST
+    docs = _run_filter(c, {"op": "gt", "field": "opt_big", "value": 5})
+    assert [d["opt_big"] for d in docs] == ["9"]
+
+
+def test_filter_kind_correct_values_still_match() -> None:
+    c = _kind_client()
+    assert [d["s"] for d in _run_filter(c, {"op": "eq", "field": "s", "value": "x"})] == ["x"]
+    assert [d["b"] for d in _run_filter(c, {"op": "eq", "field": "b", "value": True})] == [True]
+    assert [d["s"] for d in _run_filter(c, {"op": "in", "field": "s", "values": ["x", "q"]})] == [
+        "x"
+    ]
+    assert [d["n"] for d in _run_filter(c, {"op": "gt", "field": "n", "value": 1})] == [1.5]
+
+
+def test_patch_by_query_rejects_kind_mismatched_filter() -> None:
+    # By-query writes scan through the same validated filter (the server's
+    # compile_scan_where -> compile_filter path).
+    c = _kind_client()
+    with pytest.raises(RtDbError) as ei:
+        c.mutate(
+            Mutation.builder()
+            .patch_by_query("rows", _flt({"op": "eq", "field": "s", "value": 42}), {"s": "w"})
+            .build()
+        )
+    assert ei.value.code is ErrorCode.BAD_REQUEST
+
+
 def test_search_filter_narrows_the_matched_set() -> None:
     # The tsquery approximation matches words for real (FM-31); a declared
     # terminal filter narrows the matched set via the same FilterExpr

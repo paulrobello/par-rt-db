@@ -12,6 +12,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from ..errors import ErrorCode, RtDbError
+from ..schema import TableDef
 from ..wire import (
     FilterExpr,
     _FilterAnd,
@@ -29,10 +30,12 @@ from ..wire import (
 )
 
 
-def _validate_filter(expr: FilterExpr, fields: set[str]) -> None:
-    """Structural validation of a ``FilterExpr`` against a table's declared
-    fields. Raises ``BAD_REQUEST`` for an empty ``and``/``or``/``in``, an unknown
-    field, a non-string/number/boolean leaf value, or mixed-type ``in`` values."""
+def _validate_filter(expr: FilterExpr, table_def: TableDef) -> None:
+    """Structural + value-kind validation of a ``FilterExpr`` against a table's
+    declared fields (the prologue the server runs in ``compile_filter``).
+    Raises ``BAD_REQUEST`` for an empty ``and``/``or``/``in``, an unknown field,
+    a non-string/number/boolean leaf value, mixed-type ``in`` values, or a value
+    whose JSON kind does not match the field's declared type (SEC-126)."""
     match expr:
         case _FilterAnd(exprs=exprs) | _FilterOr(exprs=exprs):
             if not exprs:
@@ -40,12 +43,12 @@ def _validate_filter(expr: FilterExpr, fields: set[str]) -> None:
                     ErrorCode.BAD_REQUEST, f"{expr.op} filter requires at least one expr"
                 )
             for e in exprs:
-                _validate_filter(e, fields)
+                _validate_filter(e, table_def)
         case _FilterIn(field=fld, values=values):
             if not values:
                 raise RtDbError(ErrorCode.BAD_REQUEST, "in filter requires at least one value")
             for v in values:
-                _check_leaf_value(fld, v, fields)
+                _check_leaf_value(fld, v, table_def)
             first_kind = _in_value_kind(values[0])
             for v in values[1:]:
                 if _in_value_kind(v) != first_kind:
@@ -61,26 +64,65 @@ def _validate_filter(expr: FilterExpr, fields: set[str]) -> None:
             | _FilterLt(field=fld, value=val)
             | _FilterLte(field=fld, value=val)
         ):
-            _check_leaf_value(fld, val, fields)
+            _check_leaf_value(fld, val, table_def)
         case _FilterNot(expr=inner):
-            _validate_filter(inner, fields)
+            _validate_filter(inner, table_def)
         case _FilterContains(field=fld, value=val):
-            _check_leaf_value(fld, val, fields)
+            _check_leaf_value(fld, val, table_def)
         case _FilterExists(field=fld):
-            if fld not in fields:
+            if fld not in table_def.fields:
                 raise RtDbError(ErrorCode.BAD_REQUEST, f"filter references unknown field '{fld}'")
         case _:
             raise RtDbError(ErrorCode.INTERNAL, "unknown filter op")
 
 
-def _check_leaf_value(field: str, value: Any, fields: set[str]) -> None:
-    if field not in fields:
+def _check_leaf_value(field: str, value: Any, table_def: TableDef) -> None:
+    """Unknown-field + SEC-126 kind check for one value-carrying leaf. An
+    INDEXED field types its value through the same conversion as index eq binds
+    (server ``field_lhs_and_bind`` -> ``eq_bind_for``); a declared but
+    non-indexed field kind-checks against its declared type (server
+    ``validate_jsonb_comparison_value``)."""
+    if field not in table_def.fields:
         raise RtDbError(ErrorCode.BAD_REQUEST, f"filter references unknown field '{field}'")
-    if isinstance(value, bool):
+    # Deferred import: ``store`` imports this module at load time.
+    from .store import _coerce_index_value
+
+    if any(field in index.fields for index in table_def.indexes):
+        _coerce_index_value(table_def, field, value)
         return
-    if isinstance(value, str | float | int):
-        return
-    raise RtDbError(ErrorCode.BAD_REQUEST, "filter value must be a string, number, or boolean")
+    _validate_jsonb_comparison_value(field, table_def.fields[field], value)
+
+
+def _validate_jsonb_comparison_value(field: str, ty: Any, value: Any) -> None:
+    """SEC-126: reject a value whose JSON kind is incompatible with a declared
+    (non-indexed) field's type — a port of server
+    ``query/filter.rs::validate_jsonb_comparison_value``. The ``Optional``
+    wrapper is unwrapped first; ``string``/``id``/``bytes`` require a JSON
+    string, ``number``/``int64`` a JSON number (the jsonb-path asymmetry:
+    decimal strings are rejected here while the indexed path requires them),
+    ``boolean`` a JSON bool; every other field type accepts any non-null
+    scalar. Without this, ``gt{field:"note", value:5}`` on a String field
+    would compile to a per-row cast that errors on the first non-numeric
+    stored value."""
+    inner = ty
+    if _field_type_tag(inner) == "optional":
+        inner = ty.get("inner") if isinstance(ty, dict) else getattr(ty, "inner", None)
+    tag = _field_type_tag(inner)
+    if tag in ("string", "id", "bytes"):
+        ok = isinstance(value, str)
+    elif tag in ("number", "int64"):
+        ok = isinstance(value, float | int) and not isinstance(value, bool)
+    elif tag == "boolean":
+        ok = isinstance(value, bool)
+    else:
+        # any / literal / union / array / object / record / vector / null:
+        # no reliable static check; accept any scalar (server behavior).
+        ok = isinstance(value, str | float | int) and not isinstance(value, bool)
+    if not ok:
+        raise RtDbError(
+            ErrorCode.BAD_REQUEST,
+            f"filter on field '{field}' value kind does not match declared field type",
+        )
 
 
 def _in_value_kind(value: Any) -> str:

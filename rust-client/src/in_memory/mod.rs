@@ -1130,8 +1130,7 @@ impl InMemoryRtDbClient {
         filter: &FilterExpr,
         limit_opt: Option<u32>,
     ) -> Result<(Vec<String>, bool), RtDbError> {
-        let fields: BTreeSet<String> = table_def.fields.keys().cloned().collect();
-        validate_filter(filter, &fields)?;
+        validate_filter(filter, table_def)?;
         let limit = limit_opt
             .unwrap_or(MAX_BY_QUERY_ROWS)
             .min(MAX_BY_QUERY_ROWS);

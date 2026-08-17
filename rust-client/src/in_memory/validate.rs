@@ -337,12 +337,17 @@ enum ValueKind {
     Boolean,
 }
 
-/// Structural validation of a [`FilterExpr`] against a table's declared fields,
-/// mirroring server `query::compile_filter` and the TS `validateFilter`
+/// Structural + kind validation of a [`FilterExpr`] against a table's declared
+/// fields, mirroring server `query::compile_filter` (both its
+/// `validate_filter_expr_fields` pre-checks and the per-leaf
+/// `field_lhs_and_bind` typing) and the TS `validateFilter`
 /// (`ts-client/src/in_memory.ts:361-386`). Returns `BAD_REQUEST` for: an empty
 /// `and`/`or`, an empty `in`, an unknown field, a non-string/number/boolean
-/// leaf value, or mixed-type `in` values. Call once before evaluating per row.
-pub fn validate_filter(expr: &FilterExpr, fields: &BTreeSet<String>) -> Result<(), RtDbError> {
+/// leaf value, mixed-type `in` values, or a value whose JSON kind does not
+/// match the field's declared type (SEC-126 — indexed fields type through the
+/// eq-bind conversion, other declared fields through the jsonb kind check).
+/// Call once before evaluating per row.
+pub fn validate_filter(expr: &FilterExpr, table: &TableDef) -> Result<(), RtDbError> {
     match expr {
         FilterExpr::And { exprs } => {
             if exprs.is_empty() {
@@ -352,7 +357,7 @@ pub fn validate_filter(expr: &FilterExpr, fields: &BTreeSet<String>) -> Result<(
                 ));
             }
             for e in exprs {
-                validate_filter(e, fields)?;
+                validate_filter(e, table)?;
             }
             Ok(())
         }
@@ -364,7 +369,7 @@ pub fn validate_filter(expr: &FilterExpr, fields: &BTreeSet<String>) -> Result<(
                 ));
             }
             for e in exprs {
-                validate_filter(e, fields)?;
+                validate_filter(e, table)?;
             }
             Ok(())
         }
@@ -376,7 +381,7 @@ pub fn validate_filter(expr: &FilterExpr, fields: &BTreeSet<String>) -> Result<(
                 ));
             }
             for v in values {
-                check_leaf_value(field, v, fields)?;
+                check_leaf_value(field, v, table)?;
             }
             let first_kind = in_value_kind(&values[0]);
             for v in &values[1..] {
@@ -387,6 +392,9 @@ pub fn validate_filter(expr: &FilterExpr, fields: &BTreeSet<String>) -> Result<(
                     ));
                 }
             }
+            for v in values {
+                check_leaf_kind(field, v, table)?;
+            }
             Ok(())
         }
         FilterExpr::Eq { field, value }
@@ -394,35 +402,32 @@ pub fn validate_filter(expr: &FilterExpr, fields: &BTreeSet<String>) -> Result<(
         | FilterExpr::Gt { field, value }
         | FilterExpr::Gte { field, value }
         | FilterExpr::Lt { field, value }
-        | FilterExpr::Lte { field, value } => check_leaf_value(field, value, fields),
-        FilterExpr::Not { expr } => validate_filter(expr, fields),
-        FilterExpr::Contains { field, value } => check_leaf_value(field, value, fields),
+        | FilterExpr::Lte { field, value }
+        | FilterExpr::Contains { field, value } => check_leaf(field, value, table),
+        FilterExpr::Not { expr } => validate_filter(expr, table),
         FilterExpr::Exists { field } => {
-            if !fields.contains(field) {
-                return Err(RtDbError::new(
-                    ErrorCode::BadRequest,
-                    format!("filter references unknown field '{field}'"),
-                ));
-            }
+            leaf_field_type(field, table)?;
             Ok(())
         }
     }
 }
 
+/// Resolves a filter field to its declared type, `BAD_REQUEST`ing on an
+/// unknown field. The guard every leaf shape runs before its value checks.
+fn leaf_field_type<'a>(field: &str, table: &'a TableDef) -> Result<&'a FieldType, RtDbError> {
+    table.fields.get(field).ok_or_else(|| {
+        RtDbError::new(
+            ErrorCode::BadRequest,
+            format!("filter references unknown field '{field}'"),
+        )
+    })
+}
+
 /// `BAD_REQUEST` if `field` is not in the table's declared fields or `value`
 /// is not a string/number/boolean. Mirrors `checkLeafValue`
 /// (`ts-client/src/in_memory.ts:388-395`).
-fn check_leaf_value(
-    field: &str,
-    value: &Value,
-    fields: &BTreeSet<String>,
-) -> Result<(), RtDbError> {
-    if !fields.contains(field) {
-        return Err(RtDbError::new(
-            ErrorCode::BadRequest,
-            format!("filter references unknown field '{field}'"),
-        ));
-    }
+fn check_leaf_value(field: &str, value: &Value, table: &TableDef) -> Result<(), RtDbError> {
+    leaf_field_type(field, table)?;
     if !matches!(value, Value::String(_) | Value::Number(_) | Value::Bool(_)) {
         return Err(RtDbError::new(
             ErrorCode::BadRequest,
@@ -430,6 +435,68 @@ fn check_leaf_value(
         ));
     }
     Ok(())
+}
+
+/// One value-carrying leaf after the scalar guard: the SEC-126 kind check.
+fn check_leaf(field: &str, value: &Value, table: &TableDef) -> Result<(), RtDbError> {
+    check_leaf_value(field, value, table)?;
+    check_leaf_kind(field, value, table)
+}
+
+/// SEC-126: type-checks a leaf value against the field's declared type,
+/// mirroring server `query::field_lhs_and_bind`. A field appearing in any
+/// declared index types through the same eq-bind conversion as index `eq`
+/// prefixes ([`coerce_index_value`], the `eq_bind_for` mirror — an indexed
+/// int64 field takes its decimal-STRING wire form); any other declared field
+/// requires only the value's JSON kind to match the declared type
+/// ([`validate_jsonb_comparison_value`]). Mismatch is a `BAD_REQUEST` before
+/// any row is evaluated, not a permissive no-match.
+fn check_leaf_kind(field: &str, value: &Value, table: &TableDef) -> Result<(), RtDbError> {
+    let field_ty = leaf_field_type(field, table)?;
+    let indexed = table
+        .indexes
+        .iter()
+        .flatten()
+        .any(|idx| idx.fields.iter().any(|f| f == field));
+    if indexed {
+        return coerce_index_value(table, field, value).map(|_| ());
+    }
+    validate_jsonb_comparison_value(field, field_ty, value)
+}
+
+/// Returns `Ok(())` when `value`'s JSON kind can be compared against a
+/// declared-but-not-indexed field of type `ty`, else `Err(BadRequest)` — a
+/// port of server `query::validate_jsonb_comparison_value`. The `Optional`
+/// wrapper is unwrapped. Note the asymmetry with the indexed path: a
+/// non-indexed int64 filter takes JSON numbers and rejects the decimal-string
+/// wire form (the server casts `(doc->>'f')::float8`, never a typed `bigint`
+/// bind, on this path). Complex/unknown field types (Any, Literal, Union,
+/// Array, Object, …) accept any scalar so existing callers are not widened.
+fn validate_jsonb_comparison_value(
+    field: &str,
+    ty: &FieldType,
+    value: &Value,
+) -> Result<(), RtDbError> {
+    let inner = match ty {
+        FieldType::Optional { inner } => inner.as_ref(),
+        _ => ty,
+    };
+    let ok = match inner {
+        FieldType::String | FieldType::Id { .. } | FieldType::Bytes => value.is_string(),
+        FieldType::Number | FieldType::Int64 => value.is_number(),
+        FieldType::Boolean => value.is_boolean(),
+        // Any / Literal / Union / Array / Object / Record / Vector / Null:
+        // no reliable static check; accept any scalar (existing behavior).
+        _ => matches!(value, Value::String(_) | Value::Number(_) | Value::Bool(_)),
+    };
+    if ok {
+        Ok(())
+    } else {
+        Err(RtDbError::new(
+            ErrorCode::BadRequest,
+            format!("filter on field '{field}' value kind does not match declared field type"),
+        ))
+    }
 }
 
 /// Value-kind domain for an `in` value, mirroring `inValueKind`
@@ -501,9 +568,10 @@ fn compare_leaf(
         && is_int64_field(fields.get(field))
     {
         // The server binds a string filter value on an int64 field as
-        // `EqBind::I64` against the typed `bigint` column (indexed fields)
-        // and rejects it on the jsonb path — so any legal comparison is
-        // numeric. Parse both sides exactly as i64 (i64::MAX is not
+        // `EqBind::I64` against the typed `bigint` column (indexed fields);
+        // `validate_filter` (SEC-126) rejects the string form on the
+        // non-indexed jsonb path, so a validated string here is the typed
+        // bind. Parse both sides exactly as i64 (i64::MAX is not
         // f64-exact); an unparseable value never matches.
         let Some(lhs) = doc_val.as_str().and_then(|s| s.parse::<i64>().ok()) else {
             return false;

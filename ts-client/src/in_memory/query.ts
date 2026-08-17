@@ -28,7 +28,14 @@ import type {
   TableJson,
 } from "../protocol.js";
 import type { StoredRow } from "./store.js";
-import { evalFilterExpr, type FieldMap, isInt64String, validateFilter } from "./validate.js";
+import {
+  coerceIndexValue,
+  evalFilterExpr,
+  type FieldMap,
+  indexColumnType,
+  type PgType,
+  validateFilter,
+} from "./validate.js";
 
 const MAX_TAKE = 4096;
 
@@ -141,84 +148,6 @@ function buildSearchSnippet(source: string, matchTerms: Set<string>): string {
     .slice(start, start + SNIPPET_MAX_WORDS)
     .map((w) => (matchTerms.has(w.toLowerCase()) ? `<mark>${w}</mark>` : w))
     .join(" ");
-}
-
-/** Indexed-column storage type, mirroring server `indexed_column_type`. */
-type PgType = "text" | "number" | "boolean" | "int64";
-
-interface IndexedType {
-  pg: PgType;
-  nullable: boolean;
-}
-
-function typeTag(ty: { type: string }): string {
-  return ty.type;
-}
-
-/** Indexable column type — a port of server `schema::indexed_column_type`. */
-function indexColumnType(ty: TableJson["fields"][string]): IndexedType {
-  switch (ty.type) {
-    case "string":
-    case "id":
-      return { pg: "text", nullable: false };
-    case "number":
-      return { pg: "number", nullable: false };
-    case "int64":
-      return { pg: "int64", nullable: false };
-    case "boolean":
-      return { pg: "boolean", nullable: false };
-    case "literal":
-      if (typeof ty.value === "string") {
-        return { pg: "text", nullable: false };
-      }
-      throw new RtDbError("SCHEMA_VIOLATION", `field type '${typeTag(ty)}' is not indexable`);
-    case "union":
-      if (ty.variants.every((v) => v.type === "literal" && typeof v.value === "string")) {
-        return { pg: "text", nullable: false };
-      }
-      throw new RtDbError("SCHEMA_VIOLATION", `field type '${typeTag(ty)}' is not indexable`);
-    case "optional": {
-      const inner = indexColumnType(ty.inner);
-      return { pg: inner.pg, nullable: true };
-    }
-    default:
-      throw new RtDbError("SCHEMA_VIOLATION", `field type '${typeTag(ty)}' is not indexable`);
-  }
-}
-
-/** Type-checks an eq/range bind value, mirroring server `eq_bind_for`. */
-export function coerceIndexValue(table: TableJson, fieldName: string, value: unknown): unknown {
-  const fieldTy = table.fields[fieldName];
-  if (!fieldTy) {
-    throw new RtDbError("INTERNAL", `index references unknown field '${fieldName}'`);
-  }
-  const { pg } = indexColumnType(fieldTy);
-  switch (pg) {
-    case "text":
-      if (typeof value !== "string") {
-        throw new RtDbError("BAD_REQUEST", "eq value must be a string");
-      }
-      return value;
-    case "number":
-      if (typeof value !== "number") {
-        throw new RtDbError("BAD_REQUEST", "eq value must be a number");
-      }
-      return value;
-    case "int64":
-      // Canonical decimal string, validated exactly as on insert: `isInt64String`
-      // mirrors the server's `i64::from_str` (rejects a leading `+` and
-      // out-of-range values). eq is string === string, so the value is returned
-      // as-is; only the comparator parses to BigInt for ordering.
-      if (!isInt64String(value)) {
-        throw new RtDbError("BAD_REQUEST", "eq value must be an int64 string");
-      }
-      return value;
-    case "boolean":
-      if (typeof value !== "boolean") {
-        throw new RtDbError("BAD_REQUEST", "eq value must be a boolean");
-      }
-      return value;
-  }
 }
 
 /** `null`-sorts-last comparison for one sort key. JS relational ops order
@@ -556,10 +485,9 @@ function prepareScan(
   const lte =
     q.lte !== undefined && rangeField ? coerceIndexValue(tableDef, rangeField, q.lte) : null;
 
-  // Validate the filter against declared fields once (mirrors server compile_filter).
-  const fieldSet = new Set(Object.keys(tableDef.fields));
+  // Validate the filter against the table def once (mirrors server compile_filter).
   if (q.filter) {
-    validateFilter(q.filter, fieldSet);
+    validateFilter(q.filter, tableDef);
   }
 
   return { indexDef, typedEq, rangeField, rangeFieldPg, gt, gte, lt, lte };
@@ -741,7 +669,7 @@ function executeVectorSearchTerminal(
   // order (a deterministic stand-in that exercises the filter path); the
   // real server ranks by the index's distance metric.
   if (vs.filter) {
-    validateFilter(vs.filter, new Set(Object.keys(tableDef.fields)));
+    validateFilter(vs.filter, tableDef);
   }
   const out: unknown[] = [];
   for (const row of rowsFor(q.table).values()) {
@@ -835,7 +763,7 @@ function executeSearchTerminal(
   // Validate the search-level filter against declared fields once (mirrors
   // server `compile_filter` composed into the search WHERE).
   if (search.filter) {
-    validateFilter(search.filter, new Set(Object.keys(tableDef.fields)));
+    validateFilter(search.filter, tableDef);
   }
   // `snippet` needs a tsquery tree to highlight; trgm mode matches raw
   // substrings, so the combination is rejected rather than silently
@@ -937,14 +865,18 @@ function executeDistinctTerminal(
   const seen = new Set<unknown>();
   const values: unknown[] = [];
   for (const row of filtered) {
-    const v = row.doc[field];
-    // Skip null/undefined index values — they cannot match a typed column
-    // on the server (NULL filtering mirrors `WHERE "<col>" IS NOT NULL`).
-    if (v === null || v === undefined) continue;
+    // An absent optional field is SQL NULL in the typed column; DISTINCT
+    // keeps one NULL row (corpus `distinct-includes-null`; the server's
+    // NULLS-last asc ordering puts it after every string). A null key is
+    // distinct from the string "null" in the Set, so the two cannot collapse.
+    const raw = row.doc[field];
+    const v = raw === undefined ? null : raw;
     const key =
-      typeof v === "number" || typeof v === "string" || typeof v === "boolean"
-        ? v
-        : JSON.stringify(v);
+      v === null
+        ? null
+        : typeof v === "number" || typeof v === "string" || typeof v === "boolean"
+          ? v
+          : JSON.stringify(v);
     if (!seen.has(key)) {
       seen.add(key);
       values.push(v);

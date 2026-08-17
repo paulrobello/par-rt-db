@@ -226,7 +226,7 @@ def _prepare_scan(q: Query, table_def: TableDef, eq: list[Any], has_range: bool)
 
     # Compile the filter against the table's declared fields once up front.
     if q.filter is not None:
-        _validate_filter(q.filter, set(table_def.fields.keys()))
+        _validate_filter(q.filter, table_def)
     return _ScanPlan(
         index_def=index_def,
         typed_eq=typed_eq,
@@ -677,7 +677,7 @@ class _QueryEngine(_Core):
                 "vectorSearch cannot be combined with any other terminal",
             )
         if q.vector_search.filter is not None:
-            _validate_filter(q.vector_search.filter, set(table_def.fields.keys()))
+            _validate_filter(q.vector_search.filter, table_def)
         vector_candidates: list[StoredRow] = [
             row for (t, _id), row in self._docs.items() if t == q.table and _is_live(row)
         ]
@@ -739,7 +739,7 @@ class _QueryEngine(_Core):
         if q.search.snippet is True and q.search.mode == "trgm":
             raise RtDbError(ErrorCode.BAD_REQUEST, "snippet is only supported in tsquery mode")
         if q.search.filter is not None:
-            _validate_filter(q.search.filter, set(table_def.fields.keys()))
+            _validate_filter(q.search.filter, table_def)
         candidates: list[StoredRow] = [
             row for (t, _id), row in self._docs.items() if t == q.table and _is_live(row)
         ]
@@ -887,8 +887,9 @@ class _QueryEngine(_Core):
     ) -> list[Any]:
         """``distinct`` terminal: unique values of the index field immediately
         after the eq prefix over the matching set, sorted ascending, capped by
-        ``MAX_TAKE``. Nulls are skipped (mirrors
-        ``WHERE "<col>" IS NOT NULL``).
+        ``MAX_TAKE``. Absent field values appear as one ``None`` entry sorted
+        last — the server's ``SELECT DISTINCT to_jsonb("<col>")`` keeps a
+        single NULL row and ``ORDER BY v`` defaults to NULLS LAST.
 
         Lift of the former inline ``if q.distinct:`` arm of :meth:`run_query`;
         mirrors ``ts-client``'s ``executeDistinctTerminal``.
@@ -904,8 +905,6 @@ class _QueryEngine(_Core):
         distinct_values: list[Any] = []
         for row in filtered:
             v = row.doc.get(field)
-            if v is None:
-                continue
             key = _dedupe_key(v)
             if key not in seen:
                 seen.add(key)

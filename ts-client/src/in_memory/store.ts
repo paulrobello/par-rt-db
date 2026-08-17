@@ -64,9 +64,10 @@ import {
   onDeleteRef,
   validateOnDelete,
 } from "./migrate.js";
-import { coerceIndexValue, executeQuery, requireIndex } from "./query.js";
+import { executeQuery, requireIndex } from "./query.js";
 import {
   clone,
+  coerceIndexValue,
   evalFilterExpr,
   isBase64String,
   isHexId,
@@ -1714,7 +1715,7 @@ export class InMemoryRtDbClient {
     filter: FilterExpr,
     limitOpt: number | undefined,
   ): { rows: StoredRow[]; truncated: boolean } {
-    validateFilter(filter, new Set(Object.keys(tableDef.fields)));
+    validateFilter(filter, tableDef);
     const limit = Math.min(limitOpt ?? MAX_BY_QUERY_ROWS, MAX_BY_QUERY_ROWS);
     const matched: StoredRow[] = [];
     for (const row of this.rowsFor(tableName).values()) {

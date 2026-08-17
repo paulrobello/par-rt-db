@@ -1,0 +1,23 @@
+{
+  "name": "error-filter-kind-mismatch-indexed",
+  "$comment": "SEC-126 typing on the indexed path: a filter comparison leaf against an INDEXED field types its value through the same eq_bind_for conversion as index eq binds — a JSON number (42) against a declared string field is rejected with BAD_REQUEST ('eq value must be a string') before execution, not evaluated permissively. Mirrors server query/filter.rs field_lhs_and_bind → eq_bind_for (dsl.rs). Engines that lazily coerce or no-match instead of rejecting diverge from the server.",
+  "schema": {
+    "tables": {
+      "tasks": {
+        "fields": {
+          "name": { "type": "string" },
+          "status": { "type": "string" }
+        },
+        "indexes": [{ "name": "by_status", "fields": ["status"] }]
+      }
+    }
+  },
+  "seed": [{ "name": "a", "status": "todo" }],
+  "op": {
+    "query": {
+      "table": "tasks",
+      "filter": { "op": "eq", "field": "status", "value": 42 }
+    }
+  },
+  "expect": { "error": { "code": "BAD_REQUEST" } }
+}

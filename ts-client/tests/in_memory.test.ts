@@ -18,6 +18,7 @@ import type {
   PaginatedResultJson,
   PresenceMember,
   ScheduleInfo,
+  TableJson,
 } from "../src/protocol.js";
 import { createApi, type RtQuery } from "../src/query.js";
 import { defineSchema, defineTable, t } from "../src/schema.js";
@@ -1402,7 +1403,19 @@ describe("InMemoryRtDbClient — workflows (FM-29)", () => {
 });
 
 describe("evalFilterExpr + validateFilter", () => {
-  const fields = new Set(["name", "age", "active", "score", "tags"]);
+  // Type-less table (`any` fields, no indexes): the evaluator tests below
+  // predate the typed int64 arm (ENH-027) and exercise kind-based comparison
+  // only; `any` accepts every scalar filter value (the server's jsonb
+  // catch-all), so the structural guards are all that runs.
+  const table: TableJson = {
+    fields: {
+      name: { type: "any" },
+      age: { type: "any" },
+      active: { type: "any" },
+      score: { type: "any" },
+      tags: { type: "any" },
+    },
+  };
 
   // Type-less evaluator wrapper: the unit tests below predate the typed
   // int64 arm (ENH-027) and exercise kind-based comparison only.
@@ -1470,24 +1483,24 @@ describe("evalFilterExpr + validateFilter", () => {
   });
 
   it("validateFilter rejects an unknown field", () => {
-    expect(() => validateFilter({ op: "eq", field: "missing", value: "x" }, fields)).toThrow(
+    expect(() => validateFilter({ op: "eq", field: "missing", value: "x" }, table)).toThrow(
       /unknown field/,
     );
   });
 
   it("validateFilter rejects empty and/or and empty in", () => {
-    expect(() => validateFilter({ op: "and", exprs: [] }, fields)).toThrow(/at least one expr/);
-    expect(() => validateFilter({ op: "or", exprs: [] }, fields)).toThrow(/at least one expr/);
-    expect(() => validateFilter({ op: "in", field: "name", values: [] }, fields)).toThrow(
+    expect(() => validateFilter({ op: "and", exprs: [] }, table)).toThrow(/at least one expr/);
+    expect(() => validateFilter({ op: "or", exprs: [] }, table)).toThrow(/at least one expr/);
+    expect(() => validateFilter({ op: "in", field: "name", values: [] }, table)).toThrow(
       /at least one value/,
     );
   });
 
   it("validateFilter rejects a non-string/number/boolean value", () => {
-    expect(() => validateFilter({ op: "eq", field: "name", value: null }, fields)).toThrow(
+    expect(() => validateFilter({ op: "eq", field: "name", value: null }, table)).toThrow(
       /string, number, or boolean/,
     );
-    expect(() => validateFilter({ op: "eq", field: "tags", value: ["a"] }, fields)).toThrow(
+    expect(() => validateFilter({ op: "eq", field: "tags", value: ["a"] }, table)).toThrow(
       /string, number, or boolean/,
     );
   });
@@ -1502,20 +1515,131 @@ describe("evalFilterExpr + validateFilter", () => {
             { op: "in", field: "age", values: [1, 2] },
           ],
         },
-        fields,
+        table,
       ),
     ).not.toThrow();
   });
 
   it("validateFilter rejects mixed-type in values", () => {
-    expect(() => validateFilter({ op: "in", field: "age", values: [5, "ada"] }, fields)).toThrow(
+    expect(() => validateFilter({ op: "in", field: "age", values: [5, "ada"] }, table)).toThrow(
       /same type/,
     );
   });
 
   it("validateFilter accepts same-type in values", () => {
     expect(() =>
-      validateFilter({ op: "in", field: "age", values: [5, 6, 7] }, fields),
+      validateFilter({ op: "in", field: "age", values: [5, 6, 7] }, table),
+    ).not.toThrow();
+  });
+});
+
+describe("validateFilter: SEC-126 kind-mismatch rejection", () => {
+  // `title`/`count`/`big`/`flag` are INDEXED — filter values type through the
+  // same eq-bind conversion as query.eq binds (server eq_bind_for). `note`
+  // (optional string), `bigJsonb` (int64), and `active` (boolean) are declared
+  // but NOT indexed — the server's validate_jsonb_comparison_value path.
+  const table: TableJson = {
+    fields: {
+      title: { type: "string" },
+      note: { type: "optional", inner: { type: "string" } },
+      count: { type: "number" },
+      big: { type: "int64" },
+      bigJsonb: { type: "int64" },
+      flag: { type: "boolean" },
+      active: { type: "boolean" },
+    },
+    indexes: [
+      { name: "by_title", fields: ["title"] },
+      { name: "by_count", fields: ["count"] },
+      { name: "by_big", fields: ["big"] },
+      { name: "by_flag", fields: ["flag"] },
+    ],
+  };
+
+  it("rejects a number against an indexed string field (eq_bind_for path)", () => {
+    expect(() => validateFilter({ op: "eq", field: "title", value: 42 }, table)).toThrow(
+      /eq value must be a string/,
+    );
+  });
+
+  it("rejects a number against a non-indexed optional string field (jsonb kind check)", () => {
+    expect(() => validateFilter({ op: "gt", field: "note", value: 5 }, table)).toThrow(
+      /value kind does not match declared field type/,
+    );
+  });
+
+  it("rejects a string against a number field (indexed and non-indexed)", () => {
+    expect(() => validateFilter({ op: "eq", field: "count", value: "7" }, table)).toThrow(
+      /eq value must be a number/,
+    );
+  });
+
+  it("rejects boolean-vs-string and string-vs-boolean values", () => {
+    expect(() => validateFilter({ op: "eq", field: "title", value: true }, table)).toThrow(
+      /eq value must be a string/,
+    );
+    expect(() => validateFilter({ op: "eq", field: "note", value: true }, table)).toThrow(
+      /value kind does not match/,
+    );
+    expect(() => validateFilter({ op: "eq", field: "active", value: "yes" }, table)).toThrow(
+      /value kind does not match/,
+    );
+    expect(() => validateFilter({ op: "eq", field: "flag", value: "yes" }, table)).toThrow(
+      /eq value must be a boolean/,
+    );
+  });
+
+  it("rejects a wrong-kind value inside in (indexed and non-indexed)", () => {
+    expect(() => validateFilter({ op: "in", field: "title", values: ["a", 5] }, table)).toThrow(
+      /eq value must be a string/,
+    );
+    expect(() => validateFilter({ op: "in", field: "bigJsonb", values: [1, "2"] }, table)).toThrow(
+      /value kind does not match/,
+    );
+  });
+
+  it("int64 asymmetry: decimal string binds indexed, JSON number binds non-indexed", () => {
+    // Indexed int64 takes the typed bigint wire form (decimal string)…
+    expect(() => validateFilter({ op: "gt", field: "big", value: "15" }, table)).not.toThrow();
+    expect(() => validateFilter({ op: "eq", field: "big", value: 15 }, table)).toThrow(
+      /eq value must be an int64 string/,
+    );
+    // …while the non-indexed jsonb path takes a JSON number and rejects the
+    // decimal string — the server's actual (asymmetric) behavior.
+    expect(() => validateFilter({ op: "gt", field: "bigJsonb", value: 15 }, table)).not.toThrow();
+    expect(() => validateFilter({ op: "gt", field: "bigJsonb", value: "15" }, table)).toThrow(
+      /value kind does not match/,
+    );
+  });
+
+  it("an indexed int64 decimal-string value still compares numerically (ENH-027 preserved)", () => {
+    // Lexicographic ordering would say "15" < "9"; the typed bigint bind
+    // compares numerically, so only the lt(20) arm matches.
+    expect(
+      evalFilterExpr({ op: "lt", field: "big", value: "9" }, { big: "15" }, table.fields),
+    ).toBe(false);
+    expect(
+      evalFilterExpr({ op: "lt", field: "big", value: "20" }, { big: "15" }, table.fields),
+    ).toBe(true);
+  });
+
+  it("accepts kind-correct values across both paths", () => {
+    expect(() =>
+      validateFilter(
+        {
+          op: "and",
+          exprs: [
+            { op: "eq", field: "title", value: "a" },
+            { op: "gt", field: "count", value: 5 },
+            { op: "eq", field: "big", value: "-1" },
+            { op: "eq", field: "flag", value: true },
+            { op: "neq", field: "note", value: "x" },
+            { op: "lt", field: "bigJsonb", value: 100 },
+            { op: "eq", field: "active", value: false },
+          ],
+        },
+        table,
+      ),
     ).not.toThrow();
   });
 });

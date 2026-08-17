@@ -18,6 +18,30 @@ contract against Convex.
 > dated subsections below are chronological within `[Unreleased]`, not released
 > versions.
 
+### Error parity: engines reject kind-mismatched filter values like the server (SEC-126)
+
+The server's filter compile path validates every value-carrying filter leaf
+against the field's declared type and returns `BAD_REQUEST` on a JSON-kind
+mismatch (`server/src/query/filter.rs` — `field_lhs_and_bind` routes indexed
+fields through the `eq_bind_for` typed conversion and declared-but-not-indexed
+ones through `validate_jsonb_comparison_value`, the guard that closed
+SEC-126's fan-out-forever subscription failure). The three client in-memory
+engines evaluated those filters permissively — a number on a string field
+matched nothing instead of erroring — so code that passed offline tests could
+fail against the real server. All three engines now mirror the server
+exactly: indexed fields reuse the engine's eq-bind typing (declared string →
+JSON string, number → number, int64 → decimal string, boolean → bool —
+preserving the ENH-027 numeric-ordering fix), and non-indexed fields port
+`validate_jsonb_comparison_value` including its asymmetry (int64 takes a JSON
+number there; decimal strings are rejected). Read terminals, `search`/
+`vectorSearch` filters, and the `patchByQuery`/`deleteByQuery` write paths all
+validate. Two new corpus cases pin both paths
+(`error-filter-kind-mismatch-indexed` / `-jsonb`), and each client gains unit
+tests over both paths, `in`-combinator values, and the int64 asymmetry. While
+making the new coverage green, all three engines' distinct terminals were
+also fixed to include one `null` for absent optional index values (sorted
+last) instead of skipping them — the gap `distinct-includes-null` exposed.
+
 ### Semantics-corpus coverage: 11 previously unpinned DSL behaviors
 
 Card from the ENH-023 closing review. The corpus (`wire-corpus/semantics/`)

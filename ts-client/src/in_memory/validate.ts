@@ -2,16 +2,20 @@
  * Value/filter validation for the in-memory harness — the leaf module of the
  * `in_memory/` decomposition (mirrors `rust-client/src/in_memory/validate.rs`).
  *
- * Two concerns live here:
+ * Three concerns live here:
  * - structural validation + evaluation of the query DSL's `FilterExpr`
- *   (mirroring server `query::compile_filter_node` / `jsonb_lhs_and_bind`);
+ *   (mirroring server `query::compile_filter_node` / `field_lhs_and_bind` /
+ *   `jsonb_lhs_and_bind`, including the SEC-126 value-kind checks);
+ * - the eq-bind typing of index values (`indexColumnType` /
+ *   `coerceIndexValue`, mirroring server `eq_bind_for`) — shared by the query
+ *   engine's eq/range binds and the filter validator's indexed path;
  * - the pure JSON value predicates (`isHexId`, `isInt64String`, `clone`, …)
  *   shared by the store (`validateValue`), the query engine
  *   (`coerceIndexValue`), and the migration engine (`coerceValue`).
  */
 
 import { RtDbError } from "../errors.js";
-import type { FieldTypeJson, FilterExpr } from "../protocol.js";
+import type { FieldTypeJson, FilterExpr, TableJson } from "../protocol.js";
 
 /** Deep clone of a JSON doc (docs are pure JSON — safe to round-trip). */
 export function clone<T>(value: T): T {
@@ -44,29 +48,110 @@ export function isPlainObject(value: unknown): value is Record<string, unknown> 
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+/** Indexed-column storage type, mirroring server `indexed_column_type`. */
+export type PgType = "text" | "number" | "boolean" | "int64";
+
+interface IndexedType {
+  pg: PgType;
+  nullable: boolean;
+}
+
+function typeTag(ty: { type: string }): string {
+  return ty.type;
+}
+
+/** Indexable column type — a port of server `schema::indexed_column_type`. */
+export function indexColumnType(ty: TableJson["fields"][string]): IndexedType {
+  switch (ty.type) {
+    case "string":
+    case "id":
+      return { pg: "text", nullable: false };
+    case "number":
+      return { pg: "number", nullable: false };
+    case "int64":
+      return { pg: "int64", nullable: false };
+    case "boolean":
+      return { pg: "boolean", nullable: false };
+    case "literal":
+      if (typeof ty.value === "string") {
+        return { pg: "text", nullable: false };
+      }
+      throw new RtDbError("SCHEMA_VIOLATION", `field type '${typeTag(ty)}' is not indexable`);
+    case "union":
+      if (ty.variants.every((v) => v.type === "literal" && typeof v.value === "string")) {
+        return { pg: "text", nullable: false };
+      }
+      throw new RtDbError("SCHEMA_VIOLATION", `field type '${typeTag(ty)}' is not indexable`);
+    case "optional": {
+      const inner = indexColumnType(ty.inner);
+      return { pg: inner.pg, nullable: true };
+    }
+    default:
+      throw new RtDbError("SCHEMA_VIOLATION", `field type '${typeTag(ty)}' is not indexable`);
+  }
+}
+
+/** Type-checks an eq/range bind value, mirroring server `eq_bind_for`. */
+export function coerceIndexValue(table: TableJson, fieldName: string, value: unknown): unknown {
+  const fieldTy = table.fields[fieldName];
+  if (!fieldTy) {
+    throw new RtDbError("INTERNAL", `index references unknown field '${fieldName}'`);
+  }
+  const { pg } = indexColumnType(fieldTy);
+  switch (pg) {
+    case "text":
+      if (typeof value !== "string") {
+        throw new RtDbError("BAD_REQUEST", "eq value must be a string");
+      }
+      return value;
+    case "number":
+      if (typeof value !== "number") {
+        throw new RtDbError("BAD_REQUEST", "eq value must be a number");
+      }
+      return value;
+    case "int64":
+      // Canonical decimal string, validated exactly as on insert: `isInt64String`
+      // mirrors the server's `i64::from_str` (rejects a leading `+` and
+      // out-of-range values). eq is string === string, so the value is returned
+      // as-is; only the comparator parses to BigInt for ordering.
+      if (!isInt64String(value)) {
+        throw new RtDbError("BAD_REQUEST", "eq value must be an int64 string");
+      }
+      return value;
+    case "boolean":
+      if (typeof value !== "boolean") {
+        throw new RtDbError("BAD_REQUEST", "eq value must be a boolean");
+      }
+      return value;
+  }
+}
+
 type FilterLeafOp = "eq" | "neq" | "gt" | "gte" | "lt" | "lte";
 
 /**
  * Structural validation of a `FilterExpr` against a table's declared fields,
  * mirroring server `query::compile_filter_node` / `field_lhs_and_bind`
  * (`query.rs`). Throws `BAD_REQUEST` for an unknown field, an empty `and`/`or`,
- * an empty `in`, or a non-string/number/boolean leaf value. Call once before
+ * an empty `in`, a non-string/number/boolean leaf value, or — SEC-126 — a
+ * value whose JSON kind does not match the field's declared type (indexed
+ * fields type through the eq-bind conversion, other declared fields through
+ * the server's `validate_jsonb_comparison_value`). Call once before
  * evaluating per row.
  */
-export function validateFilter(node: FilterExpr, fields: ReadonlySet<string>): void {
+export function validateFilter(node: FilterExpr, table: TableJson): void {
   switch (node.op) {
     case "and":
     case "or":
       if (node.exprs.length === 0) {
         throw new RtDbError("BAD_REQUEST", `${node.op} filter requires at least one expr`);
       }
-      for (const e of node.exprs) validateFilter(e, fields);
+      for (const e of node.exprs) validateFilter(e, table);
       return;
     case "in": {
       if (node.values.length === 0) {
         throw new RtDbError("BAD_REQUEST", "in filter requires at least one value");
       }
-      for (const v of node.values) checkLeafValue(node.field, v, fields);
+      for (const v of node.values) checkLeafValue(node.field, v, table);
       const firstKind = inValueKind(node.values[0]);
       for (const v of node.values.slice(1)) {
         if (inValueKind(v) !== firstKind) {
@@ -76,27 +161,76 @@ export function validateFilter(node: FilterExpr, fields: ReadonlySet<string>): v
       return;
     }
     case "not":
-      validateFilter(node.expr, fields);
+      validateFilter(node.expr, table);
       return;
     case "contains":
-      checkLeafValue(node.field, node.value, fields);
+      checkLeafValue(node.field, node.value, table);
       return;
     case "exists":
-      if (!fields.has(node.field)) {
+      if (!Object.hasOwn(table.fields, node.field)) {
         throw new RtDbError("BAD_REQUEST", `filter references unknown field '${node.field}'`);
       }
       return;
     default:
-      checkLeafValue(node.field, node.value, fields);
+      checkLeafValue(node.field, node.value, table);
   }
 }
 
-function checkLeafValue(field: string, value: unknown, fields: ReadonlySet<string>): void {
-  if (!fields.has(field)) {
+function checkLeafValue(field: string, value: unknown, table: TableJson): void {
+  if (!Object.hasOwn(table.fields, field)) {
     throw new RtDbError("BAD_REQUEST", `filter references unknown field '${field}'`);
   }
   if (typeof value !== "string" && typeof value !== "number" && typeof value !== "boolean") {
     throw new RtDbError("BAD_REQUEST", "filter value must be a string, number, or boolean");
+  }
+  // SEC-126: reject a value whose JSON kind contradicts the declared field
+  // type BEFORE evaluation, exactly like server `field_lhs_and_bind` — left
+  // unchecked, `gt(5)` on a string field compiles to a float8 cast Postgres
+  // evaluates per row, so a subscription re-run on it fails forever and
+  // silently never pushes. Indexed fields type the value through the same
+  // eq-bind conversion as `query.eq` binds (`eq_bind_for`); other declared
+  // fields get the jsonb kind check.
+  const indexed = table.indexes?.some((idx) => idx.fields.includes(field)) ?? false;
+  if (indexed) {
+    coerceIndexValue(table, field, value);
+  } else {
+    validateJsonbComparisonValue(field, table.fields[field], value);
+  }
+}
+
+/** Mirrors server `validate_jsonb_comparison_value` (SEC-126): passes when
+ * `value`'s JSON kind can be ordered against a declared-but-not-indexed field
+ * of type `ty`; the `optional` wrapper is unwrapped first. Note the deliberate
+ * asymmetry with the indexed path: a non-indexed int64 field takes a JSON
+ * NUMBER (the jsonb `(doc->>'f')::float8` comparison) and rejects the decimal
+ * string the typed bigint column binds — that is the server's actual
+ * behavior. */
+function validateJsonbComparisonValue(field: string, ty: FieldTypeJson, value: unknown): void {
+  const inner = ty.type === "optional" ? ty.inner : ty;
+  let ok: boolean;
+  switch (inner.type) {
+    case "string":
+    case "id":
+    case "bytes":
+      ok = typeof value === "string";
+      break;
+    case "number":
+    case "int64":
+      ok = typeof value === "number";
+      break;
+    case "boolean":
+      ok = typeof value === "boolean";
+      break;
+    // Any / Literal / Union / Array / Object / Record / Vector / Null:
+    // no reliable static check; accept any scalar (existing behavior).
+    default:
+      ok = typeof value === "string" || typeof value === "number" || typeof value === "boolean";
+  }
+  if (!ok) {
+    throw new RtDbError(
+      "BAD_REQUEST",
+      `filter on field '${field}' value kind does not match declared field type`,
+    );
   }
 }
 

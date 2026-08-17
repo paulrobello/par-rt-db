@@ -1216,7 +1216,7 @@ class _InMemoryStoreCore:
                 return _upsert_result(new_id, True), {table}
             case _PatchByQuery(table=table, filter=flt, patch=patch_fields, limit=limit_opt):
                 table_def = self._require_table(table)
-                _validate_filter(flt, set(table_def.fields.keys()))
+                _validate_filter(flt, table_def)
                 # FM-33: soft-deleted rows are absent to the scan (the server
                 # selects through `compile_scan_where`'s `deleted_at IS NULL`).
                 matched = [
@@ -1238,7 +1238,7 @@ class _InMemoryStoreCore:
                 return _patch_by_query_result(len(take), truncated), {table}
             case _DeleteByQuery(table=table, filter=flt, limit=limit_opt):
                 table_def = self._require_table(table)
-                _validate_filter(flt, set(table_def.fields.keys()))
+                _validate_filter(flt, table_def)
                 matched = [
                     row
                     for (t, _id), row in self._docs.items()

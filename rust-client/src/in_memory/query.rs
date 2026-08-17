@@ -99,7 +99,8 @@ impl InMemoryRtDbClient {
         // `distinct` terminal: unique values of the index field immediately
         // after the eq prefix over the matching set, sorted ascending, capped by
         // MAX_TAKE. Ports ts `executeQuery` :1355-1382 and the server's distinct
-        // arm. Null index values are skipped (mirror `WHERE "<col>" IS NOT NULL`).
+        // arm. Null index values are included once (a single NULL, sorted
+        // last in ASC).
         if q.distinct {
             return self.execute_distinct_terminal(
                 &table_def,
@@ -294,8 +295,7 @@ impl InMemoryRtDbClient {
             ));
         }
         if let Some(filter) = &vector.filter {
-            let fields: BTreeSet<String> = table_def.fields.keys().cloned().collect();
-            validate_filter(filter, &fields)?;
+            validate_filter(filter, table_def)?;
         }
         let mut rows: Vec<Value> = self.collect_all(&q.table);
         if let Some(filter) = &vector.filter {
@@ -433,8 +433,7 @@ impl InMemoryRtDbClient {
             ));
         }
         if let Some(filter) = &search.filter {
-            let fields: BTreeSet<String> = table_def.fields.keys().cloned().collect();
-            validate_filter(filter, &fields)?;
+            validate_filter(filter, table_def)?;
         }
         let mut rows: Vec<Value> = self.collect_all(&q.table);
         if search.mode == Some(crate::wire::SearchMode::Trgm) {
@@ -519,10 +518,11 @@ impl InMemoryRtDbClient {
         )))
     }
 
-    /// `distinct` terminal: unique values of the index field immediately after
-    /// the eq prefix over the matching set, sorted ascending, capped by
-    /// MAX_TAKE. Ports ts `executeQuery` :1355-1382 and the server's distinct
-    /// arm. Null index values are skipped (mirror `WHERE "<col>" IS NOT NULL`).
+    /// `distinct` terminal: unique values of the index field immediately
+    /// after the eq prefix over the matching set, sorted ascending, capped
+    /// by MAX_TAKE. Ports ts `executeQuery` :1355-1382 and the server's
+    /// distinct arm. Null index values are included once (DISTINCT over a
+    /// nullable column keeps a single NULL, sorted last in ASC).
     fn execute_distinct_terminal(
         &self,
         table_def: &TableDef,
@@ -552,15 +552,13 @@ impl InMemoryRtDbClient {
         let mut seen: BTreeSet<String> = BTreeSet::new();
         let mut values: Vec<Value> = Vec::new();
         for row in filtered {
-            let Some(v) = row.doc.get(field) else {
-                continue;
-            };
-            if v.is_null() {
-                continue;
-            }
+            // An absent optional field stores SQL NULL, and DISTINCT keeps
+            // one NULL row (the corpus README's documented semantics);
+            // `compare_index_values` sorts the null last in ASC.
+            let v = row.doc.get(field).cloned().unwrap_or(Value::Null);
             // Canonical JSON key so equal scalars dedupe.
             if seen.insert(v.to_string()) {
-                values.push(v.clone());
+                values.push(v);
             }
         }
         values.sort_by(|a, b| compare_index_values(a, b, field_pg));
@@ -1115,8 +1113,7 @@ fn prepare_scan(
     // BAD_REQUEST cases (unknown field, empty and/or/in, mixed-type `in`
     // values, wrong value-kind) before any row is touched.
     if let Some(filter) = &q.filter {
-        let fields: BTreeSet<String> = table_def.fields.keys().cloned().collect();
-        validate_filter(filter, &fields)?;
+        validate_filter(filter, table_def)?;
     }
     Ok(ScanPlan {
         index_def,

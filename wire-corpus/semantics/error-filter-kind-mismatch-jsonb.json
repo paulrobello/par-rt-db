@@ -1,0 +1,26 @@
+{
+  "name": "error-filter-kind-mismatch-jsonb",
+  "$comment": "SEC-126 typing on the jsonb path: a filter value whose JSON kind does not match a declared-but-NOT-indexed field's type is rejected with BAD_REQUEST ('filter on field X value kind does not match declared field type') — gt(5) on a String field would otherwise compile to (doc->>'note')::float8, which Postgres evaluates per row and errors on the first non-numeric stored value: a fan-out subscription re-run that fails forever and silently never pushes (the failure SEC-126 closed). `note` is optional<string>, so the Optional wrapper is unwrapped before the kind check. Mirrors server query/filter.rs validate_jsonb_comparison_value.",
+  "schema": {
+    "tables": {
+      "tasks": {
+        "fields": {
+          "name": { "type": "string" },
+          "note": { "type": "optional", "inner": { "type": "string" } }
+        },
+        "indexes": [{ "name": "by_name", "fields": ["name"] }]
+      }
+    }
+  },
+  "seed": [
+    { "name": "a", "note": "first" },
+    { "name": "b" }
+  ],
+  "op": {
+    "query": {
+      "table": "tasks",
+      "filter": { "op": "gt", "field": "note", "value": 5 }
+    }
+  },
+  "expect": { "error": { "code": "BAD_REQUEST" } }
+}

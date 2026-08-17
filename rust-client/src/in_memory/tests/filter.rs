@@ -7,13 +7,29 @@ use super::*;
 // (`ts-client/tests/in_memory.test.ts:539-653`). These are the cases item C
 // fixed in the TS source — E must not regress them.
 
-/// The field set used by the unit tests below — mirrors the TS
-/// `new Set(["name", "age", "active", "score", "tags"])`.
-fn filter_unit_fields() -> BTreeSet<String> {
-    ["name", "age", "active", "score", "tags"]
-        .iter()
-        .map(|s| s.to_string())
-        .collect()
+/// The table used by the unit tests below — the TS suite's field set
+/// (`new Set(["name", "age", "active", "score", "tags"])`) with declared
+/// types. No indexes, so these exercise the declared-but-not-indexed
+/// (jsonb) kind-check path.
+fn filter_unit_table() -> TableDef {
+    Schema::builder()
+        .table(
+            "unit",
+            Table::new()
+                .field("name", FieldType::String)
+                .field("age", FieldType::Number)
+                .field("active", FieldType::Boolean)
+                .field("score", FieldType::Number)
+                .field(
+                    "tags",
+                    FieldType::Array {
+                        element: Box::new(FieldType::String),
+                    },
+                ),
+        )
+        .build()
+        .tables["unit"]
+        .clone()
 }
 
 // Type-less evaluator wrapper: the unit tests below predate the typed
@@ -42,13 +58,13 @@ fn int64_typed_fields() -> std::collections::BTreeMap<String, crate::schema::Fie
 
 #[test]
 fn eval_filter_eq_neq_on_strings_compare_the_doc_field_text() {
-    let fields = filter_unit_fields();
+    let table = filter_unit_table();
     validate_filter(
         &FilterExpr::Eq {
             field: "name".into(),
             value: json!("ada"),
         },
-        &fields,
+        &table,
     )
     .expect("valid");
     assert!(eval(
@@ -222,13 +238,13 @@ fn eval_filter_in_matches_membership() {
 
 #[test]
 fn validate_filter_rejects_an_unknown_field() {
-    let fields = filter_unit_fields();
+    let table = filter_unit_table();
     let err = validate_filter(
         &FilterExpr::Eq {
             field: "missing".into(),
             value: json!("x"),
         },
-        &fields,
+        &table,
     )
     .unwrap_err();
     assert_eq!(err.code, ErrorCode::BadRequest);
@@ -237,12 +253,12 @@ fn validate_filter_rejects_an_unknown_field() {
 
 #[test]
 fn validate_filter_rejects_empty_and_or_and_empty_in() {
-    let fields = filter_unit_fields();
-    let err = validate_filter(&FilterExpr::And { exprs: vec![] }, &fields).unwrap_err();
+    let table = filter_unit_table();
+    let err = validate_filter(&FilterExpr::And { exprs: vec![] }, &table).unwrap_err();
     assert_eq!(err.code, ErrorCode::BadRequest);
     assert!(err.message.contains("at least one expr"), "got: {err}");
 
-    let err = validate_filter(&FilterExpr::Or { exprs: vec![] }, &fields).unwrap_err();
+    let err = validate_filter(&FilterExpr::Or { exprs: vec![] }, &table).unwrap_err();
     assert_eq!(err.code, ErrorCode::BadRequest);
     assert!(err.message.contains("at least one expr"), "got: {err}");
 
@@ -251,7 +267,7 @@ fn validate_filter_rejects_empty_and_or_and_empty_in() {
             field: "name".into(),
             values: vec![],
         },
-        &fields,
+        &table,
     )
     .unwrap_err();
     assert_eq!(err.code, ErrorCode::BadRequest);
@@ -260,13 +276,13 @@ fn validate_filter_rejects_empty_and_or_and_empty_in() {
 
 #[test]
 fn validate_filter_rejects_a_non_string_number_boolean_value() {
-    let fields = filter_unit_fields();
+    let table = filter_unit_table();
     let err = validate_filter(
         &FilterExpr::Eq {
             field: "name".into(),
             value: Value::Null,
         },
-        &fields,
+        &table,
     )
     .unwrap_err();
     assert_eq!(err.code, ErrorCode::BadRequest);
@@ -280,7 +296,7 @@ fn validate_filter_rejects_a_non_string_number_boolean_value() {
             field: "tags".into(),
             value: json!(["a"]),
         },
-        &fields,
+        &table,
     )
     .unwrap_err();
     assert_eq!(err.code, ErrorCode::BadRequest);
@@ -292,7 +308,7 @@ fn validate_filter_rejects_a_non_string_number_boolean_value() {
 
 #[test]
 fn validate_filter_accepts_a_well_formed_nested_filter() {
-    let fields = filter_unit_fields();
+    let table = filter_unit_table();
     validate_filter(
         &FilterExpr::And {
             exprs: vec![
@@ -306,20 +322,20 @@ fn validate_filter_accepts_a_well_formed_nested_filter() {
                 },
             ],
         },
-        &fields,
+        &table,
     )
     .expect("well-formed nested filter");
 }
 
 #[test]
 fn validate_filter_rejects_mixed_type_in_values() {
-    let fields = filter_unit_fields();
+    let table = filter_unit_table();
     let err = validate_filter(
         &FilterExpr::In {
             field: "age".into(),
             values: vec![json!(5), json!("ada")],
         },
-        &fields,
+        &table,
     )
     .unwrap_err();
     assert_eq!(err.code, ErrorCode::BadRequest);
@@ -328,15 +344,214 @@ fn validate_filter_rejects_mixed_type_in_values() {
 
 #[test]
 fn validate_filter_accepts_same_type_in_values() {
-    let fields = filter_unit_fields();
+    let table = filter_unit_table();
     validate_filter(
         &FilterExpr::In {
             field: "age".into(),
             values: vec![json!(5), json!(6), json!(7)],
         },
-        &fields,
+        &table,
     )
     .expect("same-type in values");
+}
+
+// ---- filter: SEC-126 kind-mismatch rejection ---------------------
+//
+// Mirrors server `query::field_lhs_and_bind`: a value-carrying leaf whose
+// JSON kind does not match the field's declared type is a BAD_REQUEST
+// before evaluation — indexed fields type through the eq-bind conversion
+// (`coerce_index_value`, the `eq_bind_for` mirror), declared-but-not-
+// indexed fields through the jsonb kind check
+// (`validate_jsonb_comparison_value`).
+
+/// SEC-126 table: `status`/`score`/`big` are INDEXED (typed eq-bind path);
+/// `note`/`age`/`active`/`count` are declared but not indexed (jsonb
+/// kind-check path). `count` vs `big` pin the int64 asymmetry — the indexed
+/// field takes its decimal-string wire form, the non-indexed one JSON numbers.
+fn sec126_table() -> TableDef {
+    Schema::builder()
+        .table(
+            "tasks",
+            Table::new()
+                .field("name", FieldType::String)
+                .field("status", FieldType::String)
+                .field("note", FieldType::optional(FieldType::String))
+                .field("age", FieldType::Number)
+                .field("score", FieldType::Number)
+                .field("active", FieldType::Boolean)
+                .field("count", FieldType::Int64)
+                .field("big", FieldType::Int64)
+                .index("by_status", &["status"])
+                .index("by_score", &["score"])
+                .index("by_big", &["big"]),
+        )
+        .build()
+        .tables["tasks"]
+        .clone()
+}
+
+#[test]
+fn validate_filter_rejects_a_number_on_an_indexed_string_field() {
+    // The indexed path reuses the eq-bind conversion, so the error is the
+    // eq-bind one (mirrors server `eq_bind_for`).
+    let table = sec126_table();
+    let err = validate_filter(
+        &FilterExpr::Eq {
+            field: "status".into(),
+            value: json!(42),
+        },
+        &table,
+    )
+    .unwrap_err();
+    assert_eq!(err.code, ErrorCode::BadRequest);
+    assert!(
+        err.message.contains("eq value must be a string"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn validate_filter_rejects_a_number_on_a_non_indexed_string_field() {
+    // The jsonb kind-check path; the Optional wrapper is unwrapped first.
+    let table = sec126_table();
+    let err = validate_filter(
+        &FilterExpr::Gt {
+            field: "note".into(),
+            value: json!(5),
+        },
+        &table,
+    )
+    .unwrap_err();
+    assert_eq!(err.code, ErrorCode::BadRequest);
+    assert!(
+        err.message
+            .contains("value kind does not match declared field type"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn validate_filter_rejects_a_string_on_number_fields() {
+    let table = sec126_table();
+    // Non-indexed number field: jsonb kind check.
+    let err = validate_filter(
+        &FilterExpr::Eq {
+            field: "age".into(),
+            value: json!("42"),
+        },
+        &table,
+    )
+    .unwrap_err();
+    assert_eq!(err.code, ErrorCode::BadRequest);
+    assert!(
+        err.message
+            .contains("value kind does not match declared field type"),
+        "got: {err}"
+    );
+    // Indexed number field: eq-bind conversion.
+    let err = validate_filter(
+        &FilterExpr::Eq {
+            field: "score".into(),
+            value: json!("1"),
+        },
+        &table,
+    )
+    .unwrap_err();
+    assert_eq!(err.code, ErrorCode::BadRequest);
+    assert!(
+        err.message.contains("eq value must be a number"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn validate_filter_rejects_a_boolean_on_a_string_field() {
+    let table = sec126_table();
+    let err = validate_filter(
+        &FilterExpr::Eq {
+            field: "note".into(),
+            value: json!(true),
+        },
+        &table,
+    )
+    .unwrap_err();
+    assert_eq!(err.code, ErrorCode::BadRequest);
+    assert!(
+        err.message
+            .contains("value kind does not match declared field type"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn validate_filter_rejects_wrong_kind_values_inside_in() {
+    let table = sec126_table();
+    // Mixed kinds keep the same-type error (checked before the kind pass).
+    let err = validate_filter(
+        &FilterExpr::In {
+            field: "age".into(),
+            values: vec![json!(5), json!(true)],
+        },
+        &table,
+    )
+    .unwrap_err();
+    assert_eq!(err.code, ErrorCode::BadRequest);
+    assert!(err.message.contains("same type"), "got: {err}");
+    // Same kind as each other but wrong for the field: indexed string
+    // field, numbers.
+    let err = validate_filter(
+        &FilterExpr::In {
+            field: "status".into(),
+            values: vec![json!(42), json!(7)],
+        },
+        &table,
+    )
+    .unwrap_err();
+    assert_eq!(err.code, ErrorCode::BadRequest);
+    assert!(
+        err.message.contains("eq value must be a string"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn validate_filter_rejects_a_decimal_string_on_a_non_indexed_int64_field() {
+    // The SEC-126 asymmetry: the decimal-string wire form is only legal on
+    // the INDEXED (typed bigint) path; a non-indexed int64 filter takes JSON
+    // numbers and rejects it.
+    let table = sec126_table();
+    let err = validate_filter(
+        &FilterExpr::Gt {
+            field: "count".into(),
+            value: json!("9"),
+        },
+        &table,
+    )
+    .unwrap_err();
+    assert_eq!(err.code, ErrorCode::BadRequest);
+    assert!(
+        err.message
+            .contains("value kind does not match declared field type"),
+        "got: {err}"
+    );
+    // The indexed twin accepts the same string (ENH-027 behavior, kept).
+    validate_filter(
+        &FilterExpr::Gt {
+            field: "big".into(),
+            value: json!("9"),
+        },
+        &table,
+    )
+    .expect("indexed int64 takes the decimal-string wire form");
+    // A JSON number is the legal non-indexed int64 form.
+    validate_filter(
+        &FilterExpr::Gt {
+            field: "count".into(),
+            value: json!(9),
+        },
+        &table,
+    )
+    .expect("non-indexed int64 takes JSON numbers");
 }
 
 // ---- query: filter end-to-end ----------------------------------
@@ -665,4 +880,147 @@ fn int64_number_filter_values_still_compare_as_float8() {
         &json!({"n": "15"}),
         &fields,
     ));
+}
+
+// ---- filter: SEC-126 end-to-end ---------------------------------
+//
+// The kind check through `run_query`'s public surface: rejection fires in
+// `prepare_scan` before any row is evaluated, on both the indexed
+// (`users.name`) and non-indexed (`users.age`) paths.
+
+#[tokio::test]
+async fn query_filter_kind_mismatch_is_rejected_end_to_end() {
+    let mut c = new_users_client();
+    seed_users(&mut c).await;
+    // Indexed string field (`by_name`), number value → eq-bind rejection.
+    let err = c
+        .run_query(
+            &TableQuery::new("users")
+                .filter(FilterExpr::Eq {
+                    field: "name".into(),
+                    value: json!(42),
+                })
+                .collect(),
+        )
+        .unwrap_err();
+    assert_eq!(err.code, ErrorCode::BadRequest);
+    // Non-indexed number field, string value → jsonb kind-check rejection.
+    let err = c
+        .run_query(
+            &TableQuery::new("users")
+                .filter(FilterExpr::Gt {
+                    field: "age".into(),
+                    value: json!("30"),
+                })
+                .collect(),
+        )
+        .unwrap_err();
+    assert_eq!(err.code, ErrorCode::BadRequest);
+    // A kind-correct filter on the same table still matches.
+    let docs = c
+        .run::<Vec<Value>>(
+            &TableQuery::new("users")
+                .filter(FilterExpr::Gt {
+                    field: "age".into(),
+                    value: json!(20),
+                })
+                .collect(),
+        )
+        .expect("kind-correct filter still matches");
+    assert_eq!(docs.len(), 2);
+}
+
+/// int64 e2e table mirroring the corpus fixture `filter-int64-numeric-
+/// ordering`: `big` is the INDEXED int64 field (decimal-string wire form,
+/// numeric ordering), `count` the non-indexed twin (JSON numbers only).
+fn int64_e2e_schema() -> SchemaDef {
+    Schema::builder()
+        .table(
+            "tasks",
+            Table::new()
+                .field("name", FieldType::String)
+                .field("count", FieldType::Int64)
+                .field("big", FieldType::Int64)
+                .index("by_big", &["big"]),
+        )
+        .build()
+}
+
+#[tokio::test]
+async fn query_filter_int64_string_form_is_indexed_only_and_orders_numerically() {
+    let counter = Arc::new(Mutex::new(1_700_000_000_000_i64));
+    let mut c = InMemoryRtDbClient::new(
+        InMemoryRtDbClientOptions::default()
+            .now(move || {
+                let mut g = counter.lock().expect("counter not poisoned");
+                let v = *g;
+                *g += 1;
+                v
+            })
+            .random(|| 0.0),
+    );
+    c.push_schema(&int64_e2e_schema()).unwrap();
+    for (name, big) in [
+        ("fifteen", "15"),
+        ("nine", "9"),
+        ("negative", "-605"),
+        ("big", "1000000000000"),
+    ] {
+        c.mutate(
+            &Mutation::new()
+                .insert("tasks", json!({"name": name, "count": big, "big": big}))
+                .build(),
+            None,
+        )
+        .await
+        .unwrap();
+    }
+    // Indexed int64 + decimal string: the typed wire form — numeric
+    // ordering keeps 15 and 1000000000000 (lexicographic would keep
+    // neither). This is the preserved ENH-027 behavior.
+    let docs = c
+        .run::<Vec<Value>>(
+            &TableQuery::new("tasks")
+                .filter(FilterExpr::Gt {
+                    field: "big".into(),
+                    value: json!("9"),
+                })
+                .collect(),
+        )
+        .expect("indexed int64 string filter orders numerically");
+    let mut names: Vec<String> = docs
+        .iter()
+        .map(|d| d["name"].as_str().unwrap().to_string())
+        .collect();
+    names.sort();
+    assert_eq!(names, vec!["big".to_string(), "fifteen".to_string()]);
+    // Non-indexed int64 + decimal string: rejected (the asymmetry).
+    let err = c
+        .run_query(
+            &TableQuery::new("tasks")
+                .filter(FilterExpr::Gt {
+                    field: "count".into(),
+                    value: json!("9"),
+                })
+                .collect(),
+        )
+        .unwrap_err();
+    assert_eq!(err.code, ErrorCode::BadRequest);
+    // Non-indexed int64 + JSON number: the legal jsonb form.
+    let docs = c
+        .run::<Vec<Value>>(
+            &TableQuery::new("tasks")
+                .filter(FilterExpr::Gt {
+                    field: "count".into(),
+                    value: json!(9),
+                })
+                .collect(),
+        )
+        .expect("non-indexed int64 takes JSON numbers");
+    let mut names: Vec<String> = docs
+        .iter()
+        .map(|d| d["name"].as_str().unwrap().to_string())
+        .collect();
+    names.sort();
+    assert_eq!(names, vec!["big".to_string(), "fifteen".to_string()]);
 }
