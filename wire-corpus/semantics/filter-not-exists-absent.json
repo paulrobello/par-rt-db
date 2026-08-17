@@ -1,0 +1,31 @@
+{
+  "name": "filter-not-exists-absent",
+  "$comment": "Missing-field edge, negated: Not(Exists(note)) returns exactly the docs LACKING the field. SEC-117's pinpoint case — a negated Exists over an absent optional field must flip the inner false to true, agreeing across all four engines.",
+  "schema": {
+    "tables": {
+      "tasks": {
+        "fields": {
+          "name": { "type": "string" },
+          "note": { "type": "optional", "inner": { "type": "string" } }
+        },
+        "indexes": [{ "name": "by_name", "fields": ["name"] }]
+      }
+    }
+  },
+  "seed": [
+    { "name": "a", "note": "first" },
+    { "name": "b" },
+    { "name": "c", "note": "third" }
+  ],
+  "op": {
+    "query": {
+      "table": "tasks",
+      "filter": {
+        "op": "not",
+        "expr": { "op": "exists", "field": "note" }
+      }
+    }
+  },
+  "expect": [{ "name": "b" }],
+  "unordered": true
+}

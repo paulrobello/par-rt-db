@@ -1,0 +1,34 @@
+{
+  "name": "txn-upsert-multiple-matches-error",
+  "$comment": "Upsert whose eq matches MORE than one row fails the whole txn with PRECONDITION_FAILED (\"upsert matched multiple documents\" — code asserted, message not). Mirrors rust-client in_memory/tests/writes.rs upsert_rejects_multiple_matches and server txn.rs step_upsert.",
+  "schema": {
+    "tables": {
+      "users": {
+        "fields": {
+          "email": { "type": "string" },
+          "name": { "type": "string" }
+        },
+        "indexes": [{ "name": "by_email", "fields": ["email"] }]
+      }
+    }
+  },
+  "seed": [
+    { "email": "dup@example.com", "name": "Ann" },
+    { "email": "dup@example.com", "name": "Bob" }
+  ],
+  "op": {
+    "txn": {
+      "steps": [
+        {
+          "op": "upsert",
+          "table": "users",
+          "index": "by_email",
+          "eq": ["dup@example.com"],
+          "insert": { "email": "dup@example.com", "name": "New" },
+          "patch": { "name": "Patched" }
+        }
+      ]
+    }
+  },
+  "expect": { "error": { "code": "PRECONDITION_FAILED" } }
+}

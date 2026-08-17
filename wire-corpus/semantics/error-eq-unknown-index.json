@@ -1,0 +1,17 @@
+{
+  "name": "error-eq-unknown-index",
+  "$comment": "Read validation: eq binds naming an index the table does not declare fail with BAD_REQUEST.",
+  "schema": {
+    "tables": {
+      "tasks": {
+        "fields": { "name": { "type": "string" } },
+        "indexes": [{ "name": "by_name", "fields": ["name"] }]
+      }
+    }
+  },
+  "seed": [{ "name": "a" }],
+  "op": {
+    "query": { "table": "tasks", "index": "missing_index", "eq": ["a"] }
+  },
+  "expect": { "error": { "code": "BAD_REQUEST" } }
+}

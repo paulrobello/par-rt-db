@@ -1,0 +1,25 @@
+{
+  "name": "distinct-ascending",
+  "$comment": "distinct terminal over a single-field index with no eq prefix: unique values of index.fields[0], ascending (NULL index values are included — server SQL is SELECT DISTINCT to_jsonb(col) ORDER BY v). 'done' < 'todo' lexicographically.",
+  "schema": {
+    "tables": {
+      "tasks": {
+        "fields": {
+          "name": { "type": "string" },
+          "status": { "type": "string" }
+        },
+        "indexes": [{ "name": "by_status", "fields": ["status"] }]
+      }
+    }
+  },
+  "seed": [
+    { "name": "a", "status": "todo" },
+    { "name": "b", "status": "done" },
+    { "name": "c", "status": "todo" },
+    { "name": "d", "status": "done" }
+  ],
+  "op": {
+    "query": { "table": "tasks", "index": "by_status", "distinct": true }
+  },
+  "expect": ["done", "todo"]
+}

@@ -1,0 +1,35 @@
+{
+  "name": "aggregate-group-sum",
+  "$comment": "Grouped aggregate over [priority, order] with no eq: group by fields[0]=priority, aggregate fields[1]=order, rows sorted by key ascending. p1={b,d}=1+2=3, p2={a,e}=3+4=7, p3={c}=5.",
+  "schema": {
+    "tables": {
+      "tasks": {
+        "fields": {
+          "name": { "type": "string" },
+          "priority": { "type": "number" },
+          "order": { "type": "number" }
+        },
+        "indexes": [{ "name": "by_priority", "fields": ["priority", "order"] }]
+      }
+    }
+  },
+  "seed": [
+    { "name": "a", "priority": 2, "order": 3 },
+    { "name": "b", "priority": 1, "order": 1 },
+    { "name": "c", "priority": 3, "order": 5 },
+    { "name": "d", "priority": 1, "order": 2 },
+    { "name": "e", "priority": 2, "order": 4 }
+  ],
+  "op": {
+    "query": {
+      "table": "tasks",
+      "index": "by_priority",
+      "aggregate": { "op": "sum", "groupBy": true }
+    }
+  },
+  "expect": [
+    { "key": 1, "value": 3 },
+    { "key": 2, "value": 7 },
+    { "key": 3, "value": 5 }
+  ]
+}

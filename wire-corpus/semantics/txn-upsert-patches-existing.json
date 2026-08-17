@@ -1,0 +1,37 @@
+{
+  "name": "txn-upsert-patches-existing",
+  "$comment": "Upsert whose eq matches exactly one row takes the patch branch: result is {\"id\", \"inserted\":false} (id normalized out), and the follow-up read shows the patch MERGED onto the existing doc — the insert body is discarded, email unchanged, name patched. Uses the `then` follow-up read.",
+  "schema": {
+    "tables": {
+      "users": {
+        "fields": {
+          "email": { "type": "string" },
+          "name": { "type": "string" }
+        },
+        "indexes": [{ "name": "by_email", "fields": ["email"] }]
+      }
+    }
+  },
+  "seed": [{ "email": "a@example.com", "name": "Ann" }],
+  "op": {
+    "txn": {
+      "steps": [
+        {
+          "op": "upsert",
+          "table": "users",
+          "index": "by_email",
+          "eq": ["a@example.com"],
+          "insert": { "email": "a@example.com", "name": "New" },
+          "patch": { "name": "Patched" }
+        }
+      ]
+    }
+  },
+  "expect": [{ "inserted": false }],
+  "normalize": ["_id", "_creationTime", "_version", "id"],
+  "then": {
+    "query": { "table": "users" },
+    "expect": [{ "email": "a@example.com", "name": "Patched" }],
+    "unordered": true
+  }
+}

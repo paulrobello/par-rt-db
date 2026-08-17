@@ -1,0 +1,19 @@
+{
+  "name": "optional-null-stripped-on-insert",
+  "$comment": "Optional-field normalization: an explicit JSON null for an optional(string) field is STRIPPED at insert (strip_unset_optionals) — the stored doc simply lacks the key, so a collect returns a doc with no `note` member at all. Full-equality comparison (after system-field normalize) is what makes the absence itself the assertion. Mirrors rust-client in_memory behavior and server txn.rs do_insert.",
+  "schema": {
+    "tables": {
+      "tasks": {
+        "fields": {
+          "name": { "type": "string" },
+          "note": { "type": "optional", "inner": { "type": "string" } }
+        },
+        "indexes": [{ "name": "by_name", "fields": ["name"] }]
+      }
+    }
+  },
+  "seed": [{ "name": "a", "note": null }],
+  "op": { "query": { "table": "tasks" } },
+  "expect": [{ "name": "a" }],
+  "unordered": true
+}

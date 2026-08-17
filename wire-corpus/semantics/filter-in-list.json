@@ -1,0 +1,32 @@
+{
+  "name": "filter-in-list",
+  "$comment": "In membership over a non-empty value list: name in ['a','c'] returns exactly a and c.",
+  "schema": {
+    "tables": {
+      "tasks": {
+        "fields": {
+          "name": { "type": "string" },
+          "status": { "type": "string" }
+        },
+        "indexes": [{ "name": "by_name", "fields": ["name"] }]
+      }
+    }
+  },
+  "seed": [
+    { "name": "a", "status": "todo" },
+    { "name": "b", "status": "done" },
+    { "name": "c", "status": "todo" },
+    { "name": "d", "status": "done" }
+  ],
+  "op": {
+    "query": {
+      "table": "tasks",
+      "filter": { "op": "in", "field": "name", "values": ["a", "c"] }
+    }
+  },
+  "expect": [
+    { "name": "a", "status": "todo" },
+    { "name": "c", "status": "todo" }
+  ],
+  "unordered": true
+}

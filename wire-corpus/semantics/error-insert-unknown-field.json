@@ -1,0 +1,24 @@
+{
+  "name": "error-insert-unknown-field",
+  "$comment": "Write validation: inserting a doc with a field not declared on the table fails with SCHEMA_VIOLATION (\"unknown field\"), before any row is written.",
+  "schema": {
+    "tables": {
+      "tasks": {
+        "fields": {
+          "name": { "type": "string" },
+          "status": { "type": "string" }
+        },
+        "indexes": [{ "name": "by_name", "fields": ["name"] }]
+      }
+    }
+  },
+  "seed": [],
+  "op": {
+    "txn": {
+      "steps": [
+        { "op": "insert", "table": "tasks", "doc": { "name": "a", "bogus": 1 } }
+      ]
+    }
+  },
+  "expect": { "error": { "code": "SCHEMA_VIOLATION" } }
+}

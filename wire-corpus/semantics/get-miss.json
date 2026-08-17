@@ -1,0 +1,23 @@
+{
+  "name": "get-miss",
+  "$comment": "get terminal miss path: a well-formed 32-hex id that matches no row returns null (Doc(None)), not an error and not an empty array. One seeded row makes this a genuine miss rather than an empty table.",
+  "schema": {
+    "tables": {
+      "tasks": {
+        "fields": {
+          "name": { "type": "string" },
+          "status": { "type": "string" }
+        },
+        "indexes": [{ "name": "by_name", "fields": ["name"] }]
+      }
+    }
+  },
+  "seed": [{ "name": "a", "status": "todo" }],
+  "op": {
+    "query": {
+      "table": "tasks",
+      "get": "0123456789abcdef0123456789abcdef"
+    }
+  },
+  "expect": null
+}

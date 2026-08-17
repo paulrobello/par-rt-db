@@ -1,0 +1,36 @@
+{
+  "name": "search-term-in-all-docs",
+  "$comment": "search terminal over a declared search index, seedable without a model only when the term matches every doc: the client engines over-approximate search-text matching to the whole table, so a term present in ALL bodies makes the four implementations agree on the candidate set. The server ranks by ts_rank; result order is not portable, hence unordered. Derived from the golden-vector search case (search_task_filter_todo) minus the filter.",
+  "schema": {
+    "tables": {
+      "tasks": {
+        "fields": {
+          "name": { "type": "string" },
+          "status": { "type": "string" },
+          "body": { "type": "string" }
+        },
+        "indexes": [
+          { "name": "by_status", "fields": ["status"] },
+          { "name": "search_body", "fields": ["body"], "search": true }
+        ]
+      }
+    }
+  },
+  "seed": [
+    { "name": "a", "status": "todo", "body": "task alpha" },
+    { "name": "b", "status": "todo", "body": "task beta" },
+    { "name": "c", "status": "done", "body": "task gamma" }
+  ],
+  "op": {
+    "query": {
+      "table": "tasks",
+      "search": { "index": "search_body", "query": "task" }
+    }
+  },
+  "expect": [
+    { "name": "a", "status": "todo", "body": "task alpha" },
+    { "name": "b", "status": "todo", "body": "task beta" },
+    { "name": "c", "status": "done", "body": "task gamma" }
+  ],
+  "unordered": true
+}

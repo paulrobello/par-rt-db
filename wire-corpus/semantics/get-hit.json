@@ -1,0 +1,23 @@
+{
+  "name": "get-hit",
+  "$comment": "get terminal hit path: point read by id returns the single doc. The id is minted at seed time, so the seed carries a \"$id\" label and the query's get field uses the {\"$idRef\"} placeholder; the returned _id is projected out by normalize.",
+  "schema": {
+    "tables": {
+      "tasks": {
+        "fields": {
+          "name": { "type": "string" },
+          "status": { "type": "string" }
+        },
+        "indexes": [{ "name": "by_name", "fields": ["name"] }]
+      }
+    }
+  },
+  "seed": [
+    { "$id": "target", "doc": { "name": "a", "status": "todo" } },
+    { "doc": { "name": "b", "status": "done" } }
+  ],
+  "op": {
+    "query": { "table": "tasks", "get": { "$idRef": "target" } }
+  },
+  "expect": { "name": "a", "status": "todo" }
+}

@@ -1,0 +1,44 @@
+{
+  "name": "vector-search-full-set",
+  "$comment": "vectorSearch terminal seedable without a model: limit >= doc count makes every row a candidate, and since the client engines do not model pgvector ranking the result is compared unordered (the server ranks by cosine distance; the survivor set agrees). Derived from the golden-vector vector_search_filter_done case minus the filter.",
+  "schema": {
+    "tables": {
+      "tasks": {
+        "fields": {
+          "name": { "type": "string" },
+          "status": { "type": "string" },
+          "embedding": { "type": "vector", "dimensions": 3 }
+        },
+        "indexes": [
+          { "name": "by_status", "fields": ["status"] },
+          {
+            "name": "vector_embedding",
+            "fields": ["embedding"],
+            "vector": { "dimensions": 3 }
+          }
+        ]
+      }
+    }
+  },
+  "seed": [
+    { "name": "a", "status": "todo", "embedding": [1, 0, 0] },
+    { "name": "b", "status": "todo", "embedding": [0, 1, 0] },
+    { "name": "c", "status": "done", "embedding": [0, 0, 1] }
+  ],
+  "op": {
+    "query": {
+      "table": "tasks",
+      "vectorSearch": {
+        "index": "vector_embedding",
+        "vector": [1, 0, 0],
+        "limit": 5
+      }
+    }
+  },
+  "expect": [
+    { "name": "a", "status": "todo", "embedding": [1, 0, 0] },
+    { "name": "b", "status": "todo", "embedding": [0, 1, 0] },
+    { "name": "c", "status": "done", "embedding": [0, 0, 1] }
+  ],
+  "unordered": true
+}

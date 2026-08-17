@@ -1,0 +1,28 @@
+{
+  "name": "filter-neq-excludes-missing",
+  "$comment": "Missing-field edge on Neq: a doc lacking the field NEVER matches (SQL NULL exclusion — Neq is not the complement of Eq over nullable fields). Seeds: a has note 'x', b has 'y', c omits it (and its explicit seed null is stripped at insert). Neq note!='x' returns only b.",
+  "schema": {
+    "tables": {
+      "tasks": {
+        "fields": {
+          "name": { "type": "string" },
+          "note": { "type": "optional", "inner": { "type": "string" } }
+        },
+        "indexes": [{ "name": "by_name", "fields": ["name"] }]
+      }
+    }
+  },
+  "seed": [
+    { "name": "a", "note": "x" },
+    { "name": "b", "note": "y" },
+    { "name": "c" }
+  ],
+  "op": {
+    "query": {
+      "table": "tasks",
+      "filter": { "op": "neq", "field": "note", "value": "x" }
+    }
+  },
+  "expect": [{ "name": "b", "note": "y" }],
+  "unordered": true
+}

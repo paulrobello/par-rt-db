@@ -1,0 +1,31 @@
+{
+  "name": "filter-exists-present",
+  "$comment": "Exists tests field presence: note is present (non-null) on a and c, ABSENT on b (an explicit seed null is stripped at insert and does not count as present). SEC-117 pinned that an absent optional field is not-existing, not a null value that exists.",
+  "schema": {
+    "tables": {
+      "tasks": {
+        "fields": {
+          "name": { "type": "string" },
+          "note": { "type": "optional", "inner": { "type": "string" } }
+        },
+        "indexes": [{ "name": "by_name", "fields": ["name"] }]
+      }
+    }
+  },
+  "seed": [
+    { "name": "a", "note": "first" },
+    { "name": "b" },
+    { "name": "c", "note": "third" }
+  ],
+  "op": {
+    "query": {
+      "table": "tasks",
+      "filter": { "op": "exists", "field": "note" }
+    }
+  },
+  "expect": [
+    { "name": "a", "note": "first" },
+    { "name": "c", "note": "third" }
+  ],
+  "unordered": true
+}

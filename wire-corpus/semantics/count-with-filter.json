@@ -1,0 +1,28 @@
+{
+  "name": "count-with-filter",
+  "$comment": "count terminal composed with a filter expr (no index): returns a bare integer over the whole match set, uncapped by take limits. 2 of 3 seeds have status='done'.",
+  "schema": {
+    "tables": {
+      "tasks": {
+        "fields": {
+          "name": { "type": "string" },
+          "status": { "type": "string" }
+        },
+        "indexes": [{ "name": "by_status", "fields": ["status"] }]
+      }
+    }
+  },
+  "seed": [
+    { "name": "a", "status": "todo" },
+    { "name": "b", "status": "done" },
+    { "name": "c", "status": "done" }
+  ],
+  "op": {
+    "query": {
+      "table": "tasks",
+      "filter": { "op": "eq", "field": "status", "value": "done" },
+      "count": true
+    }
+  },
+  "expect": 2
+}

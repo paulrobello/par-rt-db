@@ -1,0 +1,35 @@
+{
+  "name": "filter-not-in",
+  "$comment": "not-in is expressed as Not(In(...)) — the DSL has no native notIn variant. Over docs where `name` is present on every row, Not(In) is the exact complement of the In case: b and d.",
+  "schema": {
+    "tables": {
+      "tasks": {
+        "fields": {
+          "name": { "type": "string" },
+          "status": { "type": "string" }
+        },
+        "indexes": [{ "name": "by_name", "fields": ["name"] }]
+      }
+    }
+  },
+  "seed": [
+    { "name": "a", "status": "todo" },
+    { "name": "b", "status": "done" },
+    { "name": "c", "status": "todo" },
+    { "name": "d", "status": "done" }
+  ],
+  "op": {
+    "query": {
+      "table": "tasks",
+      "filter": {
+        "op": "not",
+        "expr": { "op": "in", "field": "name", "values": ["a", "c"] }
+      }
+    }
+  },
+  "expect": [
+    { "name": "b", "status": "done" },
+    { "name": "d", "status": "done" }
+  ],
+  "unordered": true
+}

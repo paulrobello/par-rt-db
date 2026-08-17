@@ -1,0 +1,26 @@
+{
+  "name": "error-filter-null-value",
+  "$comment": "Null edge on the filter VALUE: a comparison leaf whose value is JSON null is rejected with BAD_REQUEST before execution — the SQL compile path accepts only string/number/boolean comparison values (\"filter value must be a string, number, or boolean\"), so Eq-null is not a way to match absent fields (use Not(Exists) instead). Derived from server query/filter.rs jsonb_lhs_and_bind + validate_jsonb_comparison_value; an engine that lazily evaluates Eq-null to no-match instead of rejecting diverges from the server.",
+  "schema": {
+    "tables": {
+      "tasks": {
+        "fields": {
+          "name": { "type": "string" },
+          "note": { "type": "optional", "inner": { "type": "string" } }
+        },
+        "indexes": [{ "name": "by_name", "fields": ["name"] }]
+      }
+    }
+  },
+  "seed": [
+    { "name": "a", "note": "first" },
+    { "name": "b" }
+  ],
+  "op": {
+    "query": {
+      "table": "tasks",
+      "filter": { "op": "eq", "field": "note", "value": null }
+    }
+  },
+  "expect": { "error": { "code": "BAD_REQUEST" } }
+}

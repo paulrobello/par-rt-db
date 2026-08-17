@@ -1,0 +1,55 @@
+{
+  "name": "txn-multi-step-per-step-results",
+  "$comment": "Multi-step txn asserting each step's result shape: upsert's insert branch returns {\"id\", \"inserted\":true}; patch returns null; patchByQuery returns {\"patched\", \"truncated\"}. Step 2 patches the seeded doc a (todo→done) via $idRef, so step 3's patchByQuery over status='todo' matches exactly b and the row c inserted by step 1. normalize adds \"id\": the upsert result's minted id is projected out on both sides.",
+  "schema": {
+    "tables": {
+      "tasks": {
+        "fields": {
+          "name": { "type": "string" },
+          "status": { "type": "string" },
+          "order": { "type": "number" }
+        },
+        "indexes": [
+          { "name": "by_name", "fields": ["name"] },
+          { "name": "by_status", "fields": ["status"] }
+        ]
+      }
+    }
+  },
+  "seed": [
+    { "$id": "a", "doc": { "name": "a", "status": "todo", "order": 1 } },
+    { "doc": { "name": "b", "status": "todo", "order": 2 } }
+  ],
+  "op": {
+    "txn": {
+      "steps": [
+        {
+          "op": "upsert",
+          "table": "tasks",
+          "index": "by_name",
+          "eq": ["c"],
+          "insert": { "name": "c", "status": "todo", "order": 3 },
+          "patch": { "order": 9 }
+        },
+        {
+          "op": "patch",
+          "table": "tasks",
+          "id": { "$idRef": "a" },
+          "fields": { "status": "done" }
+        },
+        {
+          "op": "patchByQuery",
+          "table": "tasks",
+          "filter": { "op": "eq", "field": "status", "value": "todo" },
+          "patch": { "status": "archived" }
+        }
+      ]
+    }
+  },
+  "expect": [
+    { "inserted": true },
+    null,
+    { "patched": 2, "truncated": false }
+  ],
+  "normalize": ["_id", "_creationTime", "_version", "id"]
+}

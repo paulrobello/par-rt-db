@@ -1,0 +1,28 @@
+{
+  "name": "error-insert-type-mismatch",
+  "$comment": "Write validation: a declared field whose value fails its declared type (a string where number is declared) fails with SCHEMA_VIOLATION.",
+  "schema": {
+    "tables": {
+      "tasks": {
+        "fields": {
+          "name": { "type": "string" },
+          "order": { "type": "number" }
+        },
+        "indexes": [{ "name": "by_name", "fields": ["name"] }]
+      }
+    }
+  },
+  "seed": [],
+  "op": {
+    "txn": {
+      "steps": [
+        {
+          "op": "insert",
+          "table": "tasks",
+          "doc": { "name": "a", "order": "not a number" }
+        }
+      ]
+    }
+  },
+  "expect": { "error": { "code": "SCHEMA_VIOLATION" } }
+}

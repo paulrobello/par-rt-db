@@ -1,0 +1,33 @@
+{
+  "name": "soft-delete-invisible",
+  "$comment": "Soft-delete visibility (FM-33): on a table declaring softDelete, a Delete step stamps deleted_at and the row disappears from every read terminal — the follow-up collect returns only the survivor. Delete's own step result is null.",
+  "schema": {
+    "tables": {
+      "tasks": {
+        "fields": {
+          "name": { "type": "string" },
+          "status": { "type": "string" }
+        },
+        "indexes": [{ "name": "by_name", "fields": ["name"] }],
+        "softDelete": true
+      }
+    }
+  },
+  "seed": [
+    { "$id": "gone", "doc": { "name": "a", "status": "todo" } },
+    { "doc": { "name": "b", "status": "done" } }
+  ],
+  "op": {
+    "txn": {
+      "steps": [
+        { "op": "delete", "table": "tasks", "id": { "$idRef": "gone" } }
+      ]
+    }
+  },
+  "expect": [null],
+  "then": {
+    "query": { "table": "tasks" },
+    "expect": [{ "name": "b", "status": "done" }],
+    "unordered": true
+  }
+}

@@ -1,0 +1,28 @@
+{
+  "name": "int64-field-string-wire",
+  "$comment": "int64 typed universe: an {\"type\":\"int64\"} field stores, binds, and returns its value as a decimal STRING (\"42\"), never a bare JSON number — the wire form all four implementations share. The eq bind against the int64 index field is likewise the string \"42\". Returned doc keeps total: \"42\".",
+  "schema": {
+    "tables": {
+      "counters": {
+        "fields": {
+          "name": { "type": "string" },
+          "total": { "type": "int64" }
+        },
+        "indexes": [{ "name": "by_total", "fields": ["total"] }]
+      }
+    }
+  },
+  "seed": [
+    { "name": "a", "total": "42" },
+    { "name": "b", "total": "7" }
+  ],
+  "op": {
+    "query": {
+      "table": "counters",
+      "index": "by_total",
+      "eq": ["42"],
+      "order": "asc"
+    }
+  },
+  "expect": [{ "name": "a", "total": "42" }]
+}

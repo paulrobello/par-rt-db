@@ -1,0 +1,17 @@
+{
+  "name": "error-eq-type-mismatch",
+  "$comment": "Bind typing: an eq value whose JSON kind does not match the index field's declared type (42 against a string index field) fails with BAD_REQUEST (\"eq value must be a string\"). Type direction per server dsl.rs eq_bind_for.",
+  "schema": {
+    "tables": {
+      "tasks": {
+        "fields": { "name": { "type": "string" } },
+        "indexes": [{ "name": "by_name", "fields": ["name"] }]
+      }
+    }
+  },
+  "seed": [{ "name": "a" }],
+  "op": {
+    "query": { "table": "tasks", "index": "by_name", "eq": [42] }
+  },
+  "expect": { "error": { "code": "BAD_REQUEST" } }
+}

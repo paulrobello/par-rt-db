@@ -1,0 +1,15 @@
+{
+  "name": "error-query-unknown-table",
+  "$comment": "Read validation: a query against a table the schema does not declare fails with NOT_FOUND (\"table not found\").",
+  "schema": {
+    "tables": {
+      "tasks": {
+        "fields": { "name": { "type": "string" } },
+        "indexes": [{ "name": "by_name", "fields": ["name"] }]
+      }
+    }
+  },
+  "seed": [{ "name": "a" }],
+  "op": { "query": { "table": "nope" } },
+  "expect": { "error": { "code": "NOT_FOUND" } }
+}

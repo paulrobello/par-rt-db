@@ -1,0 +1,37 @@
+{
+  "name": "collect-index-eq-ordered",
+  "$comment": "Compound index eq-prefix + order asc: the result order IS deterministic (index scan on [status, order]), so expect is compared as a sequence — b(1), d(2), a(3). Delta over golden-vector's take_after_order: this corpus pins the full ordered collect with the pushed-schema shape.",
+  "schema": {
+    "tables": {
+      "tasks": {
+        "fields": {
+          "name": { "type": "string" },
+          "status": { "type": "string" },
+          "order": { "type": "number" }
+        },
+        "indexes": [
+          { "name": "by_status_and_order", "fields": ["status", "order"] }
+        ]
+      }
+    }
+  },
+  "seed": [
+    { "name": "a", "status": "todo", "order": 3 },
+    { "name": "b", "status": "todo", "order": 1 },
+    { "name": "c", "status": "done", "order": 5 },
+    { "name": "d", "status": "todo", "order": 2 }
+  ],
+  "op": {
+    "query": {
+      "table": "tasks",
+      "index": "by_status_and_order",
+      "eq": ["todo"],
+      "order": "asc"
+    }
+  },
+  "expect": [
+    { "name": "b", "status": "todo", "order": 1 },
+    { "name": "d", "status": "todo", "order": 2 },
+    { "name": "a", "status": "todo", "order": 3 }
+  ]
+}

@@ -1,0 +1,39 @@
+{
+  "name": "paginate-last-full-page-no-cursor",
+  "$comment": "End-of-result edge: 4 rows, numItems=2 — the row count is an exact multiple of the page size, so the LAST page is full yet nextCursor is absent (an engine that emits a cursor whenever the page filled would loop forever). The \"$prev\" sentinel makes the runner fetch page 1's cursor and execute page 2; expect describes that second page.",
+  "schema": {
+    "tables": {
+      "tasks": {
+        "fields": {
+          "name": { "type": "string" },
+          "status": { "type": "string" },
+          "order": { "type": "number" }
+        },
+        "indexes": [
+          { "name": "by_status_and_order", "fields": ["status", "order"] }
+        ]
+      }
+    }
+  },
+  "seed": [
+    { "name": "b", "status": "todo", "order": 1 },
+    { "name": "c", "status": "done", "order": 5 },
+    { "name": "d", "status": "todo", "order": 2 },
+    { "name": "e", "status": "done", "order": 4 }
+  ],
+  "op": {
+    "query": {
+      "table": "tasks",
+      "index": "by_status_and_order",
+      "order": "asc",
+      "paginate": { "cursor": "$prev", "numItems": 2 }
+    }
+  },
+  "expect": {
+    "docs": [
+      { "name": "b", "status": "todo", "order": 1 },
+      { "name": "d", "status": "todo", "order": 2 }
+    ]
+  },
+  "expect_next_cursor": false
+}

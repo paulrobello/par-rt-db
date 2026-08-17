@@ -53,6 +53,10 @@ name = "query_combinations"
 required-features = ["in_memory"]
 
 [[test]]
+name = "semantics_corpus"
+required-features = ["in_memory"]
+
+[[test]]
 name = "hot_config_test"
 required-features = ["admin"]
 

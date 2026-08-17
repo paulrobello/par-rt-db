@@ -1,0 +1,40 @@
+{
+  "name": "paginate-cursor-resumes-short-last-page",
+  "$comment": "Cursor resume: 5 rows, numItems=3 — page 1 is rows 1-3; the \"$prev\" sentinel runs page 2, which must resume strictly AFTER page 1's last row (no boundary duplicate) and, being a short page (2 of 3), carry no nextCursor. Sorted [status, order] asc: (done,4) (done,5) (todo,1) (todo,2) (todo,3).",
+  "schema": {
+    "tables": {
+      "tasks": {
+        "fields": {
+          "name": { "type": "string" },
+          "status": { "type": "string" },
+          "order": { "type": "number" }
+        },
+        "indexes": [
+          { "name": "by_status_and_order", "fields": ["status", "order"] }
+        ]
+      }
+    }
+  },
+  "seed": [
+    { "name": "a", "status": "todo", "order": 3 },
+    { "name": "b", "status": "todo", "order": 1 },
+    { "name": "c", "status": "done", "order": 5 },
+    { "name": "d", "status": "todo", "order": 2 },
+    { "name": "e", "status": "done", "order": 4 }
+  ],
+  "op": {
+    "query": {
+      "table": "tasks",
+      "index": "by_status_and_order",
+      "order": "asc",
+      "paginate": { "cursor": "$prev", "numItems": 3 }
+    }
+  },
+  "expect": {
+    "docs": [
+      { "name": "d", "status": "todo", "order": 2 },
+      { "name": "a", "status": "todo", "order": 3 }
+    ]
+  },
+  "expect_next_cursor": false
+}

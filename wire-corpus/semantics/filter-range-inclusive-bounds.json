@@ -1,0 +1,38 @@
+{
+  "name": "filter-range-inclusive-bounds",
+  "$comment": "Boundary edge for gte/lte: both bounds are INCLUSIVE — And(order>=2, order<=3) over orders {1,2,3,4} returns 2 and 3. Pins that both boundary rows are kept (the classic off-by-one against the exclusive case).",
+  "schema": {
+    "tables": {
+      "tasks": {
+        "fields": {
+          "name": { "type": "string" },
+          "order": { "type": "number" }
+        },
+        "indexes": [{ "name": "by_order", "fields": ["order"] }]
+      }
+    }
+  },
+  "seed": [
+    { "name": "a", "order": 1 },
+    { "name": "b", "order": 2 },
+    { "name": "c", "order": 3 },
+    { "name": "d", "order": 4 }
+  ],
+  "op": {
+    "query": {
+      "table": "tasks",
+      "filter": {
+        "op": "and",
+        "exprs": [
+          { "op": "gte", "field": "order", "value": 2 },
+          { "op": "lte", "field": "order", "value": 3 }
+        ]
+      }
+    }
+  },
+  "expect": [
+    { "name": "b", "order": 2 },
+    { "name": "c", "order": 3 }
+  ],
+  "unordered": true
+}

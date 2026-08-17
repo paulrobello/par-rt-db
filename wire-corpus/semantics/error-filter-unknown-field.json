@@ -1,0 +1,20 @@
+{
+  "name": "error-filter-unknown-field",
+  "$comment": "Filter validation: a FilterExpr leaf referencing a field the table does not declare fails with BAD_REQUEST (\"filter references unknown field\"). Filtering an unindexed but DECLARED field is legal (jsonb extraction) — only undeclared fields error.",
+  "schema": {
+    "tables": {
+      "tasks": {
+        "fields": { "name": { "type": "string" } },
+        "indexes": [{ "name": "by_name", "fields": ["name"] }]
+      }
+    }
+  },
+  "seed": [{ "name": "a" }],
+  "op": {
+    "query": {
+      "table": "tasks",
+      "filter": { "op": "eq", "field": "bogus", "value": 1 }
+    }
+  },
+  "expect": { "error": { "code": "BAD_REQUEST" } }
+}

@@ -1,0 +1,34 @@
+{
+  "name": "filter-range-exclusive-bounds",
+  "$comment": "Boundary edge for gt/lt: both bounds are EXCLUSIVE — And(order>1, order<3) over orders {1,2,3} returns only order=2. Pins that neither boundary row leaks in.",
+  "schema": {
+    "tables": {
+      "tasks": {
+        "fields": {
+          "name": { "type": "string" },
+          "order": { "type": "number" }
+        },
+        "indexes": [{ "name": "by_order", "fields": ["order"] }]
+      }
+    }
+  },
+  "seed": [
+    { "name": "low", "order": 1 },
+    { "name": "mid", "order": 2 },
+    { "name": "high", "order": 3 }
+  ],
+  "op": {
+    "query": {
+      "table": "tasks",
+      "filter": {
+        "op": "and",
+        "exprs": [
+          { "op": "gt", "field": "order", "value": 1 },
+          { "op": "lt", "field": "order", "value": 3 }
+        ]
+      }
+    }
+  },
+  "expect": [{ "name": "mid", "order": 2 }],
+  "unordered": true
+}

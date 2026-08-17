@@ -1,0 +1,32 @@
+{
+  "name": "defaults-applied-on-insert",
+  "$comment": "Field defaults (FM-32): an insert that omits defaulted fields has them stamped from the table's `defaults` map. The txn's insert result is {\"id\"} (normalized); the follow-up collect reads the row back with status and score filled from the defaults. Defaults are literal values validated against the field type at push time.",
+  "schema": {
+    "tables": {
+      "tasks": {
+        "fields": {
+          "name": { "type": "string" },
+          "status": { "type": "string" },
+          "score": { "type": "number" }
+        },
+        "indexes": [{ "name": "by_name", "fields": ["name"] }],
+        "defaults": { "status": "active", "score": 0 }
+      }
+    }
+  },
+  "seed": [],
+  "op": {
+    "txn": {
+      "steps": [
+        { "op": "insert", "table": "tasks", "doc": { "name": "n" } }
+      ]
+    }
+  },
+  "expect": [{}],
+  "normalize": ["_id", "_creationTime", "_version", "id"],
+  "then": {
+    "query": { "table": "tasks" },
+    "expect": [{ "name": "n", "status": "active", "score": 0 }],
+    "unordered": true
+  }
+}

@@ -1,0 +1,28 @@
+{
+  "name": "error-paginate-malformed-cursor",
+  "$comment": "Cursor decode: a cursor string that is not valid base64 fails with BAD_REQUEST (\"invalid cursor base64\") — cursors are opaque minted tokens; garbage never silently returns page 1. Mirrors rust-client paginate_rejects_malformed_cursor_as_bad_request.",
+  "schema": {
+    "tables": {
+      "tasks": {
+        "fields": {
+          "name": { "type": "string" },
+          "order": { "type": "number" }
+        },
+        "indexes": [{ "name": "by_order", "fields": ["order"] }]
+      }
+    }
+  },
+  "seed": [
+    { "name": "a", "order": 1 },
+    { "name": "b", "order": 2 }
+  ],
+  "op": {
+    "query": {
+      "table": "tasks",
+      "index": "by_order",
+      "order": "asc",
+      "paginate": { "cursor": "!!!not-base64!!!", "numItems": 2 }
+    }
+  },
+  "expect": { "error": { "code": "BAD_REQUEST" } }
+}

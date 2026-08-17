@@ -1,0 +1,26 @@
+{
+  "name": "ttl-expired-row-visible-before-reap",
+  "$comment": "TTL visibility, as the server actually defines it: expiry is enforced by the background reaper (default sweep 60s), NOT by query-time filtering — so synchronously after seeding, BOTH rows are visible to a collect, including the row whose expiresAt (0) is in the past. The future row uses a fixed 2100-01-01 epoch-ms. This pins that an engine must NOT eagerly filter expired rows at read time (the rust/ts in-memory engines likewise only reap inside tick()). Deletion-by-reaper is async in every engine and is out of corpus scope. Derived from server/src/reaper.rs + query/terminals.rs (no ttl predicate in the read path).",
+  "schema": {
+    "tables": {
+      "sessions": {
+        "fields": {
+          "token": { "type": "string" },
+          "expiresAt": { "type": "number" }
+        },
+        "indexes": [{ "name": "by_expires_at", "fields": ["expiresAt"] }],
+        "ttl": { "field": "expiresAt" }
+      }
+    }
+  },
+  "seed": [
+    { "token": "expired", "expiresAt": 0 },
+    { "token": "live", "expiresAt": 4102444800000 }
+  ],
+  "op": { "query": { "table": "sessions" } },
+  "expect": [
+    { "token": "expired", "expiresAt": 0 },
+    { "token": "live", "expiresAt": 4102444800000 }
+  ],
+  "unordered": true
+}
