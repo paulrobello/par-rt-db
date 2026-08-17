@@ -1461,7 +1461,7 @@ async fn schema_preview_does_not_apply() -> anyhow::Result<()> {
 // --- Backups (ENH-002 Task 3) ---------------------------------------------
 //
 // `POST /admin/backup` triggers a `pg_dump` of `config.database_url` outside
-// the committer (pg_dump is a read). The handler sets `state.backup_running`
+// the committer (pg_dump is a read). The handler sets `state.runtime.backup_running`
 // synchronously before spawning the dump task, then returns 202 immediately.
 // The flag is cleared on completion (success or failure). A second POST while
 // the flag is set returns 409. `GET /admin/backups` reports the flag as

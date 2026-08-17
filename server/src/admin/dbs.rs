@@ -61,7 +61,7 @@ pub(super) async fn delete_db(
     state.realtime.committers.drop_db(&body.name).await;
     // ENH-011: drop the cached storage-usage entry so a future db that reuses
     // this name doesn't read a stale byte count from before the drop.
-    state.quotas.evict(&body.name);
+    state.limits.quotas.evict(&body.name);
     Ok(Json(OkResponse { ok: true }))
 }
 

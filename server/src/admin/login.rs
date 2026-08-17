@@ -47,6 +47,7 @@ pub(super) async fn admin_login(
     let limit = state.config.admin_rate_limit_per_ip_rpm;
     if limit > 0 {
         match state
+            .limits
             .rate_limiter
             .check(crate::rate_limit::RateKey::Ip(ip_key.clone()), limit)
             .await

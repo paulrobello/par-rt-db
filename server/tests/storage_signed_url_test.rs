@@ -80,7 +80,7 @@ async fn expired_signature_returns_403() -> anyhow::Result<()> {
     let (id, _) = seed(&state, &db).await;
 
     let past = rtdb_server::db::now_ms() - 1000;
-    let sig = signed_url::sign(&state.signed_url_key, &id, past);
+    let sig = signed_url::sign(&state.limits.signed_url_key, &id, past);
     let resp = reqwest::get(format!("http://{addr}/storage/{id}?exp={past}&sig={sig}")).await?;
     assert_eq!(resp.status(), 403);
     Ok(())
@@ -94,7 +94,7 @@ async fn tampered_signature_returns_403() -> anyhow::Result<()> {
     let (id, _) = seed(&state, &db).await;
 
     let exp = rtdb_server::db::now_ms() + 60_000;
-    let sig = signed_url::sign(&state.signed_url_key, &id, exp);
+    let sig = signed_url::sign(&state.limits.signed_url_key, &id, exp);
     let mut chars: Vec<char> = sig.chars().collect();
     let last_idx = chars.len() - 1;
     let last = chars[last_idx];
@@ -114,7 +114,7 @@ async fn tampered_id_returns_403() -> anyhow::Result<()> {
     let (id, _) = seed(&state, &db).await;
 
     let exp = rtdb_server::db::now_ms() + 60_000;
-    let sig = signed_url::sign(&state.signed_url_key, &id, exp);
+    let sig = signed_url::sign(&state.limits.signed_url_key, &id, exp);
     // Valid sig for `id`, fetched against a different id in the path.
     let resp = reqwest::get(format!(
         "http://{addr}/storage/other-id?exp={exp}&sig={sig}"
@@ -132,7 +132,7 @@ async fn tampered_exp_returns_403() -> anyhow::Result<()> {
     let (id, _) = seed(&state, &db).await;
 
     let exp = rtdb_server::db::now_ms() + 60_000;
-    let sig = signed_url::sign(&state.signed_url_key, &id, exp);
+    let sig = signed_url::sign(&state.limits.signed_url_key, &id, exp);
     // The sig was computed over `exp`; fetching with a different exp fails verify.
     let tampered_exp = exp + 1;
     let resp = reqwest::get(format!(
@@ -151,7 +151,7 @@ async fn partial_signature_returns_403() -> anyhow::Result<()> {
     let (id, _) = seed(&state, &db).await;
 
     let exp = rtdb_server::db::now_ms() + 60_000;
-    let sig = signed_url::sign(&state.signed_url_key, &id, exp);
+    let sig = signed_url::sign(&state.limits.signed_url_key, &id, exp);
 
     // exp without sig
     let r1 = reqwest::get(format!("http://{addr}/storage/{id}?exp={exp}")).await?;
