@@ -1,9 +1,10 @@
 /** Active session management — list and revoke OAuth and anonymous sessions across the instance. */
-import { useCallback, useEffect, useState } from "react";
+import { useState } from "react";
 import { Button, Placard, Spinner } from "../components/ui";
 import { useAdmin } from "../lib/admin";
 import { toErrorMessage } from "../lib/errors";
 import type { SessionRow } from "../lib/types";
+import { useAsync } from "../lib/useAsync";
 import s from "./SessionsPage.module.css";
 
 function timeLabel(ms: number): string {
@@ -13,34 +14,23 @@ function timeLabel(ms: number): string {
 export function SessionsPage() {
   const { client } = useAdmin();
   const [userFilter, setUserFilter] = useState("");
-  const [sessions, setSessions] = useState<SessionRow[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [listError, setListError] = useState<string | null>(null);
   const [pendingHash, setPendingHash] = useState<string | null>(null);
   const [confirmingRevoke, setConfirmingRevoke] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
 
-  const refresh = useCallback(async () => {
-    setLoading(true);
-    setListError(null);
-    try {
-      setSessions(
-        await client.listSessions(userFilter.trim() ? { user: userFilter.trim() } : undefined),
-      );
-    } catch (e) {
-      setListError(toErrorMessage(e));
-      setSessions([]);
-    } finally {
-      setLoading(false);
-    }
-  }, [client, userFilter]);
-
-  // Load once on mount. The filter is applied via the Refresh button (or Enter),
-  // not on every keystroke — see the toolbar below.
-  // biome-ignore lint/correctness/useExhaustiveDependencies: mount-only; Refresh re-fetches with the current filter
-  useEffect(() => {
-    void refresh();
-  }, []);
+  // Load once on mount ([client] only — the filter is applied via the Refresh
+  // button or Enter, not on every keystroke). `refresh` re-reads the current
+  // filter through the hook's fetcher ref.
+  const {
+    data: sessions,
+    loading,
+    error: listError,
+    refresh,
+  } = useAsync(
+    () => client.listSessions(userFilter.trim() ? { user: userFilter.trim() } : undefined),
+    [client],
+    [] as SessionRow[],
+  );
 
   async function revoke(row: SessionRow) {
     setPendingHash(row.tokenHash);

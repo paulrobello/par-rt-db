@@ -3,11 +3,12 @@
  *  RTDB_SLOW_QUERY_MS, and an inline explain panel that compiles a Query JSON
  *  DSL to its SQL plan + bind values + compile-time warnings. */
 import type { ExplainResult, QueryJson, SlowQueriesResponse } from "@par-rt-db/client";
-import { useCallback, useEffect, useState } from "react";
+import { useEffect, useState } from "react";
 import { Button, Placard, Spinner } from "../components/ui";
 import { RtDbRequestError, useAdmin } from "../lib/admin";
 import { toErrorMessage } from "../lib/errors";
 import { formatDateTime } from "../lib/format";
+import { useAsync } from "../lib/useAsync";
 import s from "./SlowQueriesPage.module.css";
 
 export function SlowQueriesPage() {
@@ -29,28 +30,14 @@ function SlowQueriesList() {
   const { client, databases } = useAdmin();
   // "" = all databases (the endpoint accepts an optional db filter).
   const [db, setDb] = useState<string>("");
-  const [data, setData] = useState<SlowQueriesResponse | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
   const [expanded, setExpanded] = useState<string | null>(null);
 
-  const refresh = useCallback(async () => {
-    setLoading(true);
-    setError(null);
-    try {
-      setData(await client.getSlowQueries(db ? { db } : {}));
-    } catch (e) {
-      setError(toErrorMessage(e));
-      setData(null);
-    } finally {
-      setLoading(false);
-    }
-  }, [client, db]);
-
   // Fetch on mount and whenever the db filter changes.
-  useEffect(() => {
-    void refresh();
-  }, [refresh]);
+  const { data, loading, error, refresh } = useAsync(
+    () => client.getSlowQueries(db ? { db } : {}),
+    [client, db],
+    null as SlowQueriesResponse | null,
+  );
 
   const queries = data?.queries ?? [];
   const disabled = data?.thresholdMs === 0;
