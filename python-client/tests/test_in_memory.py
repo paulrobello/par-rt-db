@@ -560,6 +560,122 @@ def test_filter_reduces_the_result_set() -> None:
     assert {d["name"] for d in docs} == {"a", "c"}
 
 
+# --- filter: typed int64 comparison (ENH-027 parity fix) ---------------------
+#
+# Found by ``server/tests/proptest_parity.rs``: a string filter value on a
+# declared ``int64`` field is the server's typed-``bigint`` wire form and must
+# order NUMERICALLY. The pre-fix evaluator compared the decimal strings
+# lexicographically ("15" < "9"), diverging from Postgres on every
+# digit-count-variant pair (the proptest counterexample was ``not(gt "-1")``
+# dropping a row with ``-605``, which the server keeps).
+
+
+def _int64_typed_fields() -> dict[str, Any]:
+    """Declared field map for the typed int64 comparison tests: the parity
+    fix against the server's typed bigint column path."""
+    return {"n": t.int64(), "opt_n": t.optional(t.int64()), "name": t.string()}
+
+
+def test_int64_string_filter_values_order_numerically() -> None:
+    from par_rt_db.in_memory import _eval_filter_expr
+
+    fields = _int64_typed_fields()
+    # The minimized proptest counterexample: "-605" > "-1" lexicographically
+    # ('6' sorts after '1') but -605 > -1 is false numerically — the server
+    # keeps this row, the pre-fix engine dropped it.
+    assert (
+        _eval_filter_expr(_flt({"op": "gt", "field": "n", "value": "-1"}), {"n": "-605"}, fields)
+        is False
+    )
+    # 15 > 9 numerically; lexicographically "15" < "9".
+    assert (
+        _eval_filter_expr(_flt({"op": "gt", "field": "n", "value": "9"}), {"n": "15"}, fields)
+        is True
+    )
+    assert (
+        _eval_filter_expr(_flt({"op": "lt", "field": "n", "value": "100"}), {"n": "99"}, fields)
+        is True
+    )
+    # Boundaries compare exactly (i64::MAX is not float-exact).
+    assert (
+        _eval_filter_expr(
+            _flt({"op": "lte", "field": "n", "value": "9223372036854775807"}),
+            {"n": "9223372036854775806"},
+            fields,
+        )
+        is True
+    )
+    assert (
+        _eval_filter_expr(
+            _flt({"op": "gte", "field": "n", "value": "-9223372036854775808"}),
+            {"n": "-9223372036854775807"},
+            fields,
+        )
+        is True
+    )
+    assert (
+        _eval_filter_expr(
+            _flt({"op": "gte", "field": "n", "value": "9223372036854775807"}),
+            {"n": "9223372036854775806"},
+            fields,
+        )
+        is False
+    )
+    # eq on canonical decimal strings still matches exactly.
+    assert (
+        _eval_filter_expr(_flt({"op": "eq", "field": "n", "value": "42"}), {"n": "42"}, fields)
+        is True
+    )
+
+
+def test_int64_typed_comparison_unwraps_optional_and_keeps_null_exclusion() -> None:
+    from par_rt_db.in_memory import _eval_filter_expr
+
+    fields = _int64_typed_fields()
+    # optional<int64> unwraps to the same typed comparison.
+    assert (
+        _eval_filter_expr(
+            _flt({"op": "gt", "field": "opt_n", "value": "9"}), {"opt_n": "15"}, fields
+        )
+        is True
+    )
+    # null/absent doc fields never match (SQL NULL exclusion) — unchanged.
+    assert (
+        _eval_filter_expr(
+            _flt({"op": "gt", "field": "opt_n", "value": "9"}), {"other": "15"}, fields
+        )
+        is False
+    )
+    assert (
+        _eval_filter_expr(
+            _flt({"op": "gt", "field": "opt_n", "value": "9"}), {"opt_n": None}, fields
+        )
+        is False
+    )
+    # `in` goes through the same leaf path, so it inherits the fix.
+    assert (
+        _eval_filter_expr(
+            _flt({"op": "in", "field": "n", "values": ["9", "15"]}), {"n": "15"}, fields
+        )
+        is True
+    )
+
+
+def test_int64_number_filter_values_still_compare_as_float8() -> None:
+    # The jsonb-path wire form (non-indexed int64 field): a NUMBER value
+    # compares via `(doc->>'f')::float8` on the server — unchanged behavior.
+    from par_rt_db.in_memory import _eval_filter_expr
+
+    fields = _int64_typed_fields()
+    assert (
+        _eval_filter_expr(_flt({"op": "gt", "field": "n", "value": 0}), {"n": "15"}, fields) is True
+    )
+    assert (
+        _eval_filter_expr(_flt({"op": "lt", "field": "n", "value": 9}), {"n": "15"}, fields)
+        is False
+    )
+
+
 def test_search_filter_narrows_the_matched_set() -> None:
     # The tsquery approximation matches words for real (FM-31); a declared
     # terminal filter narrows the matched set via the same FilterExpr

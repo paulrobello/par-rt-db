@@ -1719,7 +1719,7 @@ export class InMemoryRtDbClient {
     const matched: StoredRow[] = [];
     for (const row of this.rowsFor(tableName).values()) {
       if (row.deletedAt !== undefined) continue; // FM-33: stamped rows are absent
-      if (evalFilterExpr(filter, row.doc)) {
+      if (evalFilterExpr(filter, row.doc, tableDef.fields)) {
         matched.push(row);
       }
     }
@@ -1763,14 +1763,14 @@ export class InMemoryRtDbClient {
       if (!index.unique) continue;
       const pred = index.where;
       // A partial unique index constrains only rows matching its predicate.
-      if (pred && !evalFilterExpr(pred, candidateDoc)) continue;
+      if (pred && !evalFilterExpr(pred, candidateDoc, tableDef.fields)) continue;
       const candidateKey = index.fields.map((f) => candidateDoc[f]);
       // NULLs are distinct under Postgres UNIQUE — skip when any key field is null/absent.
       if (candidateKey.some((v) => v === null || v === undefined)) continue;
       for (const row of this.rowsFor(tableName).values()) {
         if (row.deletedAt !== undefined) continue; // FM-33: stamped rows are outside unique indexes
         if (excludeId !== undefined && row.id === excludeId) continue;
-        if (pred && !evalFilterExpr(pred, row.doc)) continue;
+        if (pred && !evalFilterExpr(pred, row.doc, tableDef.fields)) continue;
         let collision = true;
         for (let i = 0; i < index.fields.length; i++) {
           const rowVal = row.doc[index.fields[i]];

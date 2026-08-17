@@ -11,7 +11,7 @@
  */
 
 import { RtDbError } from "../errors.js";
-import type { FilterExpr } from "../protocol.js";
+import type { FieldTypeJson, FilterExpr } from "../protocol.js";
 
 /** Deep clone of a JSON doc (docs are pure JSON — safe to round-trip). */
 export function clone<T>(value: T): T {
@@ -106,23 +106,37 @@ function inValueKind(value: unknown): "string" | "number" | "boolean" {
   return "boolean";
 }
 
+/** The declared field map of a table (`tableDef.fields`), keyed by field name.
+ * Pass an empty object for type-less evaluation (e.g. unit tests). */
+export type FieldMap = Readonly<Record<string, FieldTypeJson>>;
+
 /**
  * Evaluate a `FilterExpr` predicate against a stored doc, mirroring server
  * `query::jsonb_lhs_and_bind` (`query.rs`): the filter value's kind picks the
  * comparison domain — string compares the doc field's `->>` text, number
- * compares it as `float8`, boolean as `boolean`. A null/absent field never
- * matches (SQL NULL exclusion). Assumes `validateFilter` already passed.
+ * compares it as `float8`, boolean as `boolean` — EXCEPT on a declared
+ * `int64` field, where a string value (the wire form the server types as a
+ * `bigint` bind, whether via an index's typed column or the jsonb path)
+ * compares numerically: decimal strings must order `-605 < -1 < 15`, not
+ * lexicographically (ENH-027 parity fix). A null/absent field never matches
+ * (SQL NULL exclusion). `fields` is the table's declared field map (pass an
+ * empty object for type-less evaluation, e.g. unit tests). Assumes
+ * `validateFilter` already passed.
  */
-export function evalFilterExpr(node: FilterExpr, doc: Record<string, unknown>): boolean {
+export function evalFilterExpr(
+  node: FilterExpr,
+  doc: Record<string, unknown>,
+  fields: FieldMap,
+): boolean {
   switch (node.op) {
     case "and":
-      return node.exprs.every((e) => evalFilterExpr(e, doc));
+      return node.exprs.every((e) => evalFilterExpr(e, doc, fields));
     case "or":
-      return node.exprs.some((e) => evalFilterExpr(e, doc));
+      return node.exprs.some((e) => evalFilterExpr(e, doc, fields));
     case "in":
-      return node.values.some((v) => compareLeaf("eq", node.field, v, doc));
+      return node.values.some((v) => compareLeaf("eq", node.field, v, doc, fields));
     case "not":
-      return !evalFilterExpr(node.expr, doc);
+      return !evalFilterExpr(node.expr, doc, fields);
     case "contains": {
       const arr = doc[node.field];
       const want = JSON.stringify(node.value);
@@ -133,7 +147,7 @@ export function evalFilterExpr(node: FilterExpr, doc: Record<string, unknown>): 
       return v !== undefined && v !== null;
     }
     default:
-      return compareLeaf(node.op, node.field, node.value, doc);
+      return compareLeaf(node.op, node.field, node.value, doc, fields);
   }
 }
 
@@ -142,10 +156,24 @@ function compareLeaf(
   field: string,
   filterValue: unknown,
   doc: Record<string, unknown>,
+  fields: FieldMap,
 ): boolean {
   const docVal = doc[field];
   if (docVal === null || docVal === undefined) {
     return false;
+  }
+  if (typeof filterValue === "string" && isInt64Field(fields[field])) {
+    // The server binds a string filter value on an int64 field as a typed
+    // `bigint` against the typed column (indexed fields) and rejects it on
+    // the jsonb path — so any legal comparison is numeric. Parse both sides
+    // exactly as i64 (i64::MAX is not float-exact); an unparseable value
+    // never matches.
+    const lhs = typeof docVal === "string" ? parseI64(docVal) : null;
+    if (lhs === null) {
+      return false;
+    }
+    const rhs = parseI64(filterValue);
+    return rhs === null ? false : compareValues(op, lhs, rhs);
   }
   if (typeof filterValue === "string") {
     return compareValues(op, docToText(docVal), filterValue);
@@ -158,6 +186,26 @@ function compareLeaf(
     return compareValues(op, docVal, filterValue as boolean);
   }
   return false;
+}
+
+/** Whether a declared field type is `int64` (an `optional<int64>` unwraps to
+ * it — mirrors the server's `eq_bind_for` Optional unwrap). */
+function isInt64Field(ty: FieldTypeJson | undefined): boolean {
+  if (ty === undefined) {
+    return false;
+  }
+  return ty.type === "int64" || (ty.type === "optional" && ty.inner.type === "int64");
+}
+
+/** Exact `i64::from_str` mirror: an optional `+`/`-` sign then one or more
+ * ASCII digits, within the i64 range. Returns the value as a `bigint` (i64
+ * is not JS-number-exact) or `null` when `s` is not a strict i64 decimal. */
+function parseI64(s: string): bigint | null {
+  if (!/^[+-]?\d+$/.test(s)) {
+    return null;
+  }
+  const n = BigInt(s);
+  return n >= -(2n ** 63n) && n <= 2n ** 63n - 1n ? n : null;
 }
 
 /** Mirrors Postgres `doc->>'field'`: the JSON text of the value. */
@@ -180,8 +228,8 @@ function docToNumber(docVal: unknown): number | null {
 
 function compareValues(
   op: FilterLeafOp,
-  lhs: string | number | boolean,
-  rhs: string | number | boolean,
+  lhs: string | number | boolean | bigint,
+  rhs: string | number | boolean | bigint,
 ): boolean {
   switch (op) {
     case "eq":

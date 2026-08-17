@@ -1222,7 +1222,9 @@ class _InMemoryStoreCore:
                 matched = [
                     row
                     for (t, _id), row in self._docs.items()
-                    if t == table and _is_live(row) and _eval_filter_expr(flt, row.doc)
+                    if t == table
+                    and _is_live(row)
+                    and _eval_filter_expr(flt, row.doc, table_def.fields)
                 ]
                 matched.sort(key=lambda r: (r.created_at, r.id))
                 limit = (
@@ -1240,7 +1242,9 @@ class _InMemoryStoreCore:
                 matched = [
                     row
                     for (t, _id), row in self._docs.items()
-                    if t == table and _is_live(row) and _eval_filter_expr(flt, row.doc)
+                    if t == table
+                    and _is_live(row)
+                    and _eval_filter_expr(flt, row.doc, table_def.fields)
                 ]
                 matched.sort(key=lambda r: (r.created_at, r.id))
                 limit = (
@@ -1566,7 +1570,7 @@ class _InMemoryStoreCore:
                 continue
             pred = index.where
             # A partial unique index constrains only rows matching its predicate.
-            if pred is not None and not _eval_filter_expr(pred, candidate_doc):
+            if pred is not None and not _eval_filter_expr(pred, candidate_doc, table_def.fields):
                 continue
             # Build the collision key from declared `fields` only. NULL/absent key
             # fields disable the constraint for this row (Postgres UNIQUE treats
@@ -1583,7 +1587,7 @@ class _InMemoryStoreCore:
                     continue
                 if exclude_id is not None and row.id == exclude_id:
                     continue
-                if pred is not None and not _eval_filter_expr(pred, row.doc):
+                if pred is not None and not _eval_filter_expr(pred, row.doc, table_def.fields):
                     continue
                 row_key = _collect_index_key(index.fields, row.doc)
                 if row_key is None:

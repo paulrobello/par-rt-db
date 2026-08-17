@@ -21,4 +21,5 @@ export {
   PresenceRooms,
   worstCaseAffected,
 } from "./store.js";
+export type { FieldMap } from "./validate.js";
 export { evalFilterExpr, validateFilter } from "./validate.js";

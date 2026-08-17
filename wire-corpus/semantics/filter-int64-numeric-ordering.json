@@ -1,10 +1,6 @@
 {
   "name": "filter-int64-numeric-ordering",
-  "$comment": "A string filter value on an indexed int64 field is the typed-bigint wire form and orders NUMERICALLY: gt(\"9\") over {15, 9, -605, 1000000000000} keeps 15 and 1000000000000 (lexicographic decimal-string compare would keep neither — \"15\" < \"9\" and \"1...\" < \"9\"). Found by the ENH-027 property test (server/tests/proptest_parity.rs), minimized; expect derived from the server. The rust engine was fixed with the case; ts/python engines still compare the strings lexicographically (compareLeaf/compare_leaf) and skip loudly until mirrored.",
-  "skip": {
-    "ts": "compareLeaf compares int64 decimal strings lexicographically; needs the typed-numeric arm the rust engine got (ENH-027)",
-    "python": "filter compare compares int64 decimal strings lexicographically; needs the typed-numeric arm the rust engine got (ENH-027)"
-  },
+  "$comment": "A string filter value on an indexed int64 field is the typed-bigint wire form and orders NUMERICALLY: gt(\"9\") over {15, 9, -605, 1000000000000} keeps 15 and 1000000000000 (lexicographic decimal-string compare would keep neither — \"15\" < \"9\" and \"1...\" < \"9\"). Found by the ENH-027 property test (server/tests/proptest_parity.rs), minimized; expect derived from the server. All three client engines (rust, ts, python) implement the typed numeric comparison.",
   "schema": {
     "tables": {
       "tasks": {

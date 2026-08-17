@@ -28,7 +28,7 @@ import type {
   TableJson,
 } from "../protocol.js";
 import type { StoredRow } from "./store.js";
-import { evalFilterExpr, isInt64String, validateFilter } from "./validate.js";
+import { evalFilterExpr, type FieldMap, isInt64String, validateFilter } from "./validate.js";
 
 const MAX_TAKE = 4096;
 
@@ -356,7 +356,7 @@ export function executeQuery(
   }
 
   const plan = prepareScan(q, tableDef, eq, hasRange);
-  const filtered = fetchFilteredRows(q, plan, rowsFor);
+  const filtered = fetchFilteredRows(q, plan, rowsFor, tableDef.fields);
 
   if (q.count) {
     return executeCountTerminal(filtered);
@@ -566,11 +566,14 @@ function prepareScan(
 }
 
 /** Row fetch + filter (eq prefix → range → filter hook). FM-33: stamped
- *  (soft-deleted) rows are invisible to every read terminal. */
+ *  (soft-deleted) rows are invisible to every read terminal. `fields` is the
+ *  table's declared field map — the filter evaluator's typed-int64 arm keys
+ *  off it (ENH-027). */
 function fetchFilteredRows(
   q: QueryJson,
   plan: ScanPlan,
   rowsFor: (table: string) => Map<string, StoredRow>,
+  fields: FieldMap,
 ): StoredRow[] {
   const { indexDef, typedEq, rangeField, rangeFieldPg, gt, gte, lt, lte } = plan;
   const eqLen = typedEq.length;
@@ -608,7 +611,7 @@ function fetchFilteredRows(
         continue;
       }
     }
-    if (q.filter && !evalFilterExpr(q.filter, row.doc)) {
+    if (q.filter && !evalFilterExpr(q.filter, row.doc, fields)) {
       continue;
     }
     filtered.push(row);
@@ -743,7 +746,7 @@ function executeVectorSearchTerminal(
   const out: unknown[] = [];
   for (const row of rowsFor(q.table).values()) {
     if (row.deletedAt !== undefined) continue; // FM-33: stamped rows are invisible
-    if (vs.filter && !evalFilterExpr(vs.filter, row.doc)) {
+    if (vs.filter && !evalFilterExpr(vs.filter, row.doc, tableDef.fields)) {
       continue;
     }
     out.push(row.doc);
@@ -855,7 +858,7 @@ function executeSearchTerminal(
     const needle = search.query.toLowerCase();
     for (const row of rowsFor(q.table).values()) {
       if (row.deletedAt !== undefined) continue; // FM-33: stamped rows are invisible
-      if (search.filter && !evalFilterExpr(search.filter, row.doc)) {
+      if (search.filter && !evalFilterExpr(search.filter, row.doc, tableDef.fields)) {
         continue;
       }
       let best = 0;
@@ -875,7 +878,7 @@ function executeSearchTerminal(
     const positives = new Set(alts.flatMap((a) => [...a.terms, ...a.phrases.flat()]));
     for (const row of rowsFor(q.table).values()) {
       if (row.deletedAt !== undefined) continue; // FM-33: stamped rows are invisible
-      if (search.filter && !evalFilterExpr(search.filter, row.doc)) {
+      if (search.filter && !evalFilterExpr(search.filter, row.doc, tableDef.fields)) {
         continue;
       }
       const source = searchDef.fields.map((f) => ftsStringify(row.doc[f])).join(" ");

@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import json
 import math
+import re
+from collections.abc import Mapping
 from typing import Any
 
 from ..errors import ErrorCode, RtDbError
@@ -89,16 +91,23 @@ def _in_value_kind(value: Any) -> str:
     return "boolean"
 
 
-def _eval_filter_expr(expr: FilterExpr, doc: dict[str, Any]) -> bool:
-    """Evaluate a ``FilterExpr`` predicate against a stored doc. A null/absent
-    field never matches (SQL NULL exclusion). Assumes ``_validate_filter`` passed."""
+def _eval_filter_expr(expr: FilterExpr, doc: dict[str, Any], fields: Mapping[str, Any]) -> bool:
+    """Evaluate a ``FilterExpr`` predicate against a stored doc. The filter
+    value's kind picks the comparison domain — string compares the doc field's
+    ``->>`` text, number compares it as ``float8``, boolean as ``boolean`` —
+    EXCEPT on a declared ``int64`` field, where a string value (the wire form
+    the server types as a ``bigint`` bind) compares numerically: decimal
+    strings must order ``-605 < -1 < 15``, not lexicographically (ENH-027
+    parity fix). A null/absent field never matches (SQL NULL exclusion).
+    ``fields`` is the table's declared field map (pass an empty mapping for
+    type-less evaluation, e.g. unit tests). Assumes ``_validate_filter`` passed."""
     match expr:
         case _FilterAnd(exprs=exprs):
-            return all(_eval_filter_expr(e, doc) for e in exprs)
+            return all(_eval_filter_expr(e, doc, fields) for e in exprs)
         case _FilterOr(exprs=exprs):
-            return any(_eval_filter_expr(e, doc) for e in exprs)
+            return any(_eval_filter_expr(e, doc, fields) for e in exprs)
         case _FilterIn(field=fld, values=values):
-            return any(_compare_leaf("eq", fld, v, doc) for v in values)
+            return any(_compare_leaf("eq", fld, v, doc, fields) for v in values)
         case (
             _FilterEq(field=fld, value=val)
             | _FilterNeq(field=fld, value=val)
@@ -107,9 +116,9 @@ def _eval_filter_expr(expr: FilterExpr, doc: dict[str, Any]) -> bool:
             | _FilterLt(field=fld, value=val)
             | _FilterLte(field=fld, value=val)
         ):
-            return _compare_leaf(expr.op, fld, val, doc)
+            return _compare_leaf(expr.op, fld, val, doc, fields)
         case _FilterNot(expr=inner):
-            return not _eval_filter_expr(inner, doc)
+            return not _eval_filter_expr(inner, doc, fields)
         case _FilterContains(field=fld, value=val):
             arr = doc.get(fld)
             want = json.dumps(val, sort_keys=True)
@@ -120,10 +129,23 @@ def _eval_filter_expr(expr: FilterExpr, doc: dict[str, Any]) -> bool:
             return False
 
 
-def _compare_leaf(op: str, field: str, filter_value: Any, doc: dict[str, Any]) -> bool:
+def _compare_leaf(
+    op: str, field: str, filter_value: Any, doc: dict[str, Any], fields: Mapping[str, Any]
+) -> bool:
     doc_val = doc.get(field)
     if doc_val is None:
         return False
+    if isinstance(filter_value, str) and _is_int64_field(fields.get(field)):
+        # The server binds a string filter value on an int64 field as a typed
+        # ``bigint`` against the typed column (indexed fields) and rejects it
+        # on the jsonb path — so any legal comparison is numeric. Parse both
+        # sides exactly as i64 (i64::MAX is not float-exact); an unparseable
+        # value never matches.
+        lhs = _parse_i64_exact(doc_val) if isinstance(doc_val, str) else None
+        if lhs is None:
+            return False
+        rhs = _parse_i64_exact(filter_value)
+        return False if rhs is None else _compare_values(op, lhs, rhs)
     if isinstance(filter_value, str):
         return _compare_values(op, _doc_to_text(doc_val), filter_value)
     if isinstance(filter_value, bool):
@@ -134,6 +156,44 @@ def _compare_leaf(op: str, field: str, filter_value: Any, doc: dict[str, Any]) -
             return False
         return _compare_values(op, lhs, float(filter_value))
     return False
+
+
+def _field_type_tag(ty: Any) -> Any:
+    """The ``type`` discriminator of a declared field type — a pydantic
+    ``FieldType`` instance (production, via ``TableDef.fields``) or the raw
+    dict the schema builders emit."""
+    if isinstance(ty, dict):
+        return ty.get("type")
+    return getattr(ty, "type", None)
+
+
+def _is_int64_field(ty: Any) -> bool:
+    """Whether a declared field type is ``int64`` (an ``optional<int64>``
+    unwraps to it — mirrors the rust ``is_int64_field`` / the server's
+    ``eq_bind_for`` Optional unwrap)."""
+    if ty is None:
+        return False
+    tag = _field_type_tag(ty)
+    if tag == "int64":
+        return True
+    if tag == "optional":
+        inner = ty.get("inner") if isinstance(ty, dict) else getattr(ty, "inner", None)
+        return _field_type_tag(inner) == "int64"
+    return False
+
+
+_I64_RE = re.compile(r"[+-]?\d+")
+
+
+def _parse_i64_exact(s: str) -> int | None:
+    """Exact ``i64::from_str`` mirror: an optional ``+``/``-`` sign then one
+    or more ASCII digits, within the i64 range. Returns ``None`` when ``s`` is
+    not a strict i64 decimal string (unlike store's ordering fallback
+    ``_parse_i64``, which maps unparseable to ``i64::MIN``)."""
+    if _I64_RE.fullmatch(s) is None:
+        return None
+    n = int(s)
+    return n if -(2**63) <= n <= 2**63 - 1 else None
 
 
 def _doc_to_text(doc_val: Any) -> str:

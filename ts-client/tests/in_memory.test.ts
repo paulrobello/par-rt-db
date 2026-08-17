@@ -13,6 +13,7 @@ import { Migration } from "../src/migration.js";
 import { mutation } from "../src/mutation.js";
 import { decodeCursor, encodeCursor } from "../src/pagination.js";
 import type {
+  FieldTypeJson,
   FilterExpr,
   PaginatedResultJson,
   PresenceMember,
@@ -1403,38 +1404,41 @@ describe("InMemoryRtDbClient — workflows (FM-29)", () => {
 describe("evalFilterExpr + validateFilter", () => {
   const fields = new Set(["name", "age", "active", "score", "tags"]);
 
+  // Type-less evaluator wrapper: the unit tests below predate the typed
+  // int64 arm (ENH-027) and exercise kind-based comparison only.
+  const evalTypeless = (node: FilterExpr, doc: Record<string, unknown>): boolean =>
+    evalFilterExpr(node, doc, {});
+
   it("eq/neq on strings compare the doc field's text", () => {
-    expect(evalFilterExpr({ op: "eq", field: "name", value: "ada" }, { name: "ada" })).toBe(true);
-    expect(evalFilterExpr({ op: "eq", field: "name", value: "ada" }, { name: "bob" })).toBe(false);
-    expect(evalFilterExpr({ op: "neq", field: "name", value: "ada" }, { name: "bob" })).toBe(true);
+    expect(evalTypeless({ op: "eq", field: "name", value: "ada" }, { name: "ada" })).toBe(true);
+    expect(evalTypeless({ op: "eq", field: "name", value: "ada" }, { name: "bob" })).toBe(false);
+    expect(evalTypeless({ op: "neq", field: "name", value: "ada" }, { name: "bob" })).toBe(true);
   });
 
   it("number domain compares numerically (gt/gte/lt/lte)", () => {
-    expect(evalFilterExpr({ op: "gt", field: "age", value: 30 }, { age: 42 })).toBe(true);
-    expect(evalFilterExpr({ op: "gt", field: "age", value: 50 }, { age: 42 })).toBe(false);
-    expect(evalFilterExpr({ op: "lte", field: "age", value: 42 }, { age: 42 })).toBe(true);
+    expect(evalTypeless({ op: "gt", field: "age", value: 30 }, { age: 42 })).toBe(true);
+    expect(evalTypeless({ op: "gt", field: "age", value: 50 }, { age: 42 })).toBe(false);
+    expect(evalTypeless({ op: "lte", field: "age", value: 42 }, { age: 42 })).toBe(true);
   });
 
   it("string ordering is lexicographic", () => {
-    expect(evalFilterExpr({ op: "lt", field: "name", value: "b" }, { name: "ada" })).toBe(true);
-    expect(evalFilterExpr({ op: "gte", field: "name", value: "a" }, { name: "ada" })).toBe(true);
+    expect(evalTypeless({ op: "lt", field: "name", value: "b" }, { name: "ada" })).toBe(true);
+    expect(evalTypeless({ op: "gte", field: "name", value: "a" }, { name: "ada" })).toBe(true);
   });
 
   it("boolean domain compares booleans", () => {
-    expect(evalFilterExpr({ op: "eq", field: "active", value: true }, { active: true })).toBe(true);
-    expect(evalFilterExpr({ op: "eq", field: "active", value: true }, { active: false })).toBe(
-      false,
-    );
+    expect(evalTypeless({ op: "eq", field: "active", value: true }, { active: true })).toBe(true);
+    expect(evalTypeless({ op: "eq", field: "active", value: true }, { active: false })).toBe(false);
   });
 
   it("a number filter value matches a numeric string field (float8 cast)", () => {
-    expect(evalFilterExpr({ op: "eq", field: "score", value: 5 }, { score: "5" })).toBe(true);
+    expect(evalTypeless({ op: "eq", field: "score", value: 5 }, { score: "5" })).toBe(true);
   });
 
   it("null/absent doc field never matches (SQL NULL exclusion)", () => {
-    expect(evalFilterExpr({ op: "eq", field: "name", value: "ada" }, { name: null })).toBe(false);
-    expect(evalFilterExpr({ op: "eq", field: "name", value: "ada" }, {})).toBe(false);
-    expect(evalFilterExpr({ op: "neq", field: "name", value: "ada" }, {})).toBe(false);
+    expect(evalTypeless({ op: "eq", field: "name", value: "ada" }, { name: null })).toBe(false);
+    expect(evalTypeless({ op: "eq", field: "name", value: "ada" }, {})).toBe(false);
+    expect(evalTypeless({ op: "neq", field: "name", value: "ada" }, {})).toBe(false);
   });
 
   it("and / or nest recursively", () => {
@@ -1451,18 +1455,18 @@ describe("evalFilterExpr + validateFilter", () => {
         },
       ],
     };
-    expect(evalFilterExpr(expr, { age: 42, name: "ada" })).toBe(true);
-    expect(evalFilterExpr(expr, { age: 42, name: "zed" })).toBe(false);
-    expect(evalFilterExpr(expr, { age: 10, name: "ada" })).toBe(false);
+    expect(evalTypeless(expr, { age: 42, name: "ada" })).toBe(true);
+    expect(evalTypeless(expr, { age: 42, name: "zed" })).toBe(false);
+    expect(evalTypeless(expr, { age: 10, name: "ada" })).toBe(false);
   });
 
   it("in matches membership", () => {
-    expect(
-      evalFilterExpr({ op: "in", field: "name", values: ["ada", "bob"] }, { name: "bob" }),
-    ).toBe(true);
-    expect(
-      evalFilterExpr({ op: "in", field: "name", values: ["ada", "bob"] }, { name: "zed" }),
-    ).toBe(false);
+    expect(evalTypeless({ op: "in", field: "name", values: ["ada", "bob"] }, { name: "bob" })).toBe(
+      true,
+    );
+    expect(evalTypeless({ op: "in", field: "name", values: ["ada", "bob"] }, { name: "zed" })).toBe(
+      false,
+    );
   });
 
   it("validateFilter rejects an unknown field", () => {
@@ -1513,6 +1517,70 @@ describe("evalFilterExpr + validateFilter", () => {
     expect(() =>
       validateFilter({ op: "in", field: "age", values: [5, 6, 7] }, fields),
     ).not.toThrow();
+  });
+});
+
+describe("evalFilterExpr: typed int64 comparison (ENH-027 parity fix)", () => {
+  // Found by `server/tests/proptest_parity.rs`: a string filter value on a
+  // declared `int64` field is the server's typed-`bigint` wire form and must
+  // order NUMERICALLY. The pre-fix evaluator compared the decimal strings
+  // lexicographically ("15" < "9"), diverging from Postgres on every
+  // digit-count-variant pair (the proptest counterexample was `not(gt "-1")`
+  // dropping a row with `-605`, which the server keeps).
+  const int64TypedFields: Record<string, FieldTypeJson> = {
+    n: { type: "int64" },
+    opt_n: { type: "optional", inner: { type: "int64" } },
+    name: { type: "string" },
+  };
+  const evalTyped = (node: FilterExpr, doc: Record<string, unknown>): boolean =>
+    evalFilterExpr(node, doc, int64TypedFields);
+
+  it("int64 string filter values order numerically", () => {
+    // The minimized proptest counterexample: "-605" > "-1" lexicographically
+    // ('6' sorts after '1') but -605 > -1 is false numerically — the server
+    // keeps this row, the pre-fix engine dropped it.
+    expect(evalTyped({ op: "gt", field: "n", value: "-1" }, { n: "-605" })).toBe(false);
+    // 15 > 9 numerically; lexicographically "15" < "9".
+    expect(evalTyped({ op: "gt", field: "n", value: "9" }, { n: "15" })).toBe(true);
+    expect(evalTyped({ op: "lt", field: "n", value: "100" }, { n: "99" })).toBe(true);
+    // Boundaries compare exactly (i64::MAX is not float-exact).
+    expect(
+      evalTyped(
+        { op: "lte", field: "n", value: "9223372036854775807" },
+        { n: "9223372036854775806" },
+      ),
+    ).toBe(true);
+    expect(
+      evalTyped(
+        { op: "gte", field: "n", value: "-9223372036854775808" },
+        { n: "-9223372036854775807" },
+      ),
+    ).toBe(true);
+    expect(
+      evalTyped(
+        { op: "gte", field: "n", value: "9223372036854775807" },
+        { n: "9223372036854775806" },
+      ),
+    ).toBe(false);
+    // eq on canonical decimal strings still matches exactly.
+    expect(evalTyped({ op: "eq", field: "n", value: "42" }, { n: "42" })).toBe(true);
+  });
+
+  it("typed comparison unwraps optional and keeps null exclusion", () => {
+    // optional<int64> unwraps to the same typed comparison.
+    expect(evalTyped({ op: "gt", field: "opt_n", value: "9" }, { opt_n: "15" })).toBe(true);
+    // null/absent doc fields never match (SQL NULL exclusion) — unchanged.
+    expect(evalTyped({ op: "gt", field: "opt_n", value: "9" }, { other: "15" })).toBe(false);
+    expect(evalTyped({ op: "gt", field: "opt_n", value: "9" }, { opt_n: null })).toBe(false);
+    // `in` goes through the same leaf path, so it inherits the fix.
+    expect(evalTyped({ op: "in", field: "n", values: ["9", "15"] }, { n: "15" })).toBe(true);
+  });
+
+  it("int64 number filter values still compare as float8", () => {
+    // The jsonb-path wire form (non-indexed int64 field): a NUMBER value
+    // compares via `(doc->>'f')::float8` on the server — unchanged behavior.
+    expect(evalTyped({ op: "gt", field: "n", value: 0 }, { n: "15" })).toBe(true);
+    expect(evalTyped({ op: "lt", field: "n", value: 9 }, { n: "15" })).toBe(false);
   });
 });
 

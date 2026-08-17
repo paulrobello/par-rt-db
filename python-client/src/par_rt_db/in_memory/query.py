@@ -8,6 +8,7 @@ one executor per terminal."""
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import cmp_to_key
 from typing import TYPE_CHECKING, Any
@@ -584,7 +585,7 @@ class _QueryEngine(_Core):
             return self._execute_hybrid_search_terminal(q, eq, has_range)
 
         plan = _prepare_scan(q, table_def, eq, has_range)
-        filtered = self._fetch_filtered_rows(q, plan)
+        filtered = self._fetch_filtered_rows(q, plan, table_def.fields)
 
         if q.count:
             return self._execute_count_terminal(filtered)
@@ -684,7 +685,7 @@ class _QueryEngine(_Core):
             vector_candidates = [
                 row
                 for row in vector_candidates
-                if _eval_filter_expr(q.vector_search.filter, row.doc)
+                if _eval_filter_expr(q.vector_search.filter, row.doc, table_def.fields)
             ]
         return [_merge_doc(row) for row in vector_candidates]
 
@@ -743,7 +744,11 @@ class _QueryEngine(_Core):
             row for (t, _id), row in self._docs.items() if t == q.table and _is_live(row)
         ]
         if q.search.filter is not None:
-            candidates = [row for row in candidates if _eval_filter_expr(q.search.filter, row.doc)]
+            candidates = [
+                row
+                for row in candidates
+                if _eval_filter_expr(q.search.filter, row.doc, table_def.fields)
+            ]
         if q.search.mode == "trgm":
             return self._execute_trgm_search(q, search_def, candidates)
         return self._execute_tsquery_search(q, search_def, candidates)
@@ -1078,11 +1083,14 @@ class _QueryEngine(_Core):
         ]
         return _paginate_result(paginate, table_def, filtered, sort_cols, col_types, direction)
 
-    def _fetch_filtered_rows(self, q: Query, plan: _ScanPlan) -> list[StoredRow]:
+    def _fetch_filtered_rows(
+        self, q: Query, plan: _ScanPlan, fields: Mapping[str, Any]
+    ) -> list[StoredRow]:
         """Row fetch + filter (eq prefix -> range -> filter hook) over
         ``self._docs``. FM-33: soft-deleted rows are absent to every read
         terminal (the server's ``compile_scan_where`` ``deleted_at IS NULL``
-        literal)."""
+        literal). ``fields`` is the table's declared field map — the filter
+        evaluator's typed-int64 arm keys off it (ENH-027)."""
         index_def = plan.index_def
         typed_eq = plan.typed_eq
         range_field = plan.range_field
@@ -1118,7 +1126,7 @@ class _QueryEngine(_Core):
                     continue
                 if lte is not None and _compare_index_values(v, lte, range_pg) > 0:
                     continue
-            if q.filter is not None and not _eval_filter_expr(q.filter, row.doc):
+            if q.filter is not None and not _eval_filter_expr(q.filter, row.doc, fields):
                 continue
             filtered.append(row)
         return filtered
