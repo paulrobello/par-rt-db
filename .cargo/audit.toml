@@ -1,0 +1,10 @@
+# cargo-audit configuration (SEC-202).
+#
+# RUSTSEC-2023-0071 — rsa 0.9.x Marvin attack (private-key recovery via
+# decryption/signing timing side channel). Reached here only via
+# jsonwebtoken's RSA id_token *verification*, which exercises public-key
+# operations only; the vulnerable private-key path (Apple client-secret
+# signing is ES256 via ring) is not used. No fixed release exists upstream.
+# Re-evaluate when jsonwebtoken adopts rsa 0.10.
+[advisories]
+ignore = ["RUSTSEC-2023-0071"]
