@@ -1,3 +1,10 @@
+//! The `OAuthProvider` trait and the dispatcher all six providers sit behind.
+//! Carries the login-ledger invariants: the OAuth `state` token is single-use
+//! (stored in `rtdb_auth.oauth_states`, so a login begun on one replica
+//! completes on another), login-CSRF is a double-submit nonce cookie
+//! constant-time-verified at `/callback`, and the anonymous mint is gated and
+//! rate-limited.
+
 use std::sync::Arc;
 
 use async_trait::async_trait;

@@ -1,3 +1,7 @@
+//! Microsoft / Entra ID v2 OAuth provider (`/auth/microsoft/*`). id_tokens are
+//! verified with `jsonwebtoken` (RS256 against the tenant JWKS); the
+//! client_secret is app-registered. See `docs/OAUTH_SETUP.md`.
+
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 

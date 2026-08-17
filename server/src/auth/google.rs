@@ -1,3 +1,7 @@
+//! Google OAuth provider (`/auth/google/*`). Optional — leave
+//! `RTDB_GOOGLE_CLIENT_ID` / `RTDB_GOOGLE_CLIENT_SECRET` unset to disable
+//! Google login.
+
 use std::sync::Arc;
 
 use async_trait::async_trait;

@@ -1,3 +1,9 @@
+//! Per-database authentication and authorization: machine tokens, OAuth
+//! sessions, and optional anonymous. The WS handler re-runs `authorize` on
+//! every Subscribe and Mutate — not just at connect — so revocation, allowlist
+//! changes, and session expiry take effect on open connections. This module
+//! owns the shared `authorize` gate every transport calls.
+
 pub mod apple;
 pub mod cookie;
 pub mod github;

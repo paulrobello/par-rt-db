@@ -1,3 +1,8 @@
+//! Binary entry point: loads `Config` from the `RTDB_*` environment, connects
+//! the Postgres pool, builds `AppState` and the router (API routes, admin
+//! plane, storage, SPA fallback), and serves HTTP with graceful shutdown on
+//! SIGTERM (the OTel exporter, if enabled, flushes on the way down).
+
 use rtdb_server::{AppState, auth, build_router, config::Config, db};
 use sqlx::postgres::PgPoolOptions;
 

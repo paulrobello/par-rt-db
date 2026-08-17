@@ -1,3 +1,8 @@
+//! Per-database machine tokens on `rtdb_auth.tokens`: mint (with optional
+//! scope/expiry), verify via sha256 hash, list, and revoke — the
+//! `Principal::Machine` source that bypasses per-row rules but never the
+//! db-level gate.
+
 use sqlx::PgPool;
 
 use crate::db::{new_id, now_ms, random_token, sha256_hex};
