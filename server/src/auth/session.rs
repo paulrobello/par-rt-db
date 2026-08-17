@@ -1,3 +1,7 @@
+//! Interactive session persistence on `rtdb_auth.sessions`: mint, lookup by
+//! sha256 token hash, list, and revoke. `expires_at` is enforced on every
+//! `authorize` re-run, so an expired session dies on its next op.
+
 use serde::Serialize;
 use sqlx::PgPool;
 

@@ -1,3 +1,11 @@
+//! The `/admin/*` control plane: the shared admin auth core (an
+//! `AdminPrincipal` accepts the root admin key or an OAuth session on the
+//! server-wide `rtdb_auth.admins` allowlist — cookie/CSRF mode for the
+//! dashboard, bearer mode for the CLI/SDKs) plus the assembled admin router
+//! over the per-domain submodules (login, dbs, schema_ops, tokens, docs,
+//! schedules, storage_ops, webhooks, backups, settings, observability,
+//! sessions, merge, workflows).
+
 use std::sync::Arc;
 
 use axum::Router;

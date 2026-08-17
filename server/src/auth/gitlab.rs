@@ -1,3 +1,6 @@
+//! GitLab OAuth provider (`/auth/gitlab/*`), configured via
+//! `RTDB_GITLAB_CLIENT_ID` / `RTDB_GITLAB_CLIENT_SECRET`.
+
 use std::sync::Arc;
 
 use async_trait::async_trait;

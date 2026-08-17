@@ -1,3 +1,8 @@
+//! Apple OAuth provider (`/auth/apple/*`): an ES256 JWT `client_secret` minted
+//! from the private key, `response_mode=form_post` callbacks, and user/email
+//! derived from the first `id_token` (name only on first authorization).
+//! Stable identity keys on Apple's `sub`.
+
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 

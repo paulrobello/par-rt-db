@@ -9,10 +9,12 @@ VPS and no reverse proxy is needed — TLS is terminated at Cloudflare's edge.
 
 - [One-time DNS/tunnel wiring (already done 2026-07-21)](#one-time-dnstunnel-wiring-already-done-2026-07-21)
 - [Deploy / update](#deploy--update)
+- [Topology: single instance (not horizontally scalable yet)](#topology-single-instance-not-horizontally-scalable-yet)
 - [Postgres image](#postgres-image)
 - [Collation](#collation)
 - [Subscription-invalidation observability](#subscription-invalidation-observability)
 - [Monitoring](#monitoring)
+- [Tracing (OpenTelemetry / OTLP, ENH-018)](#tracing-opentelemetry--otel-enh-018)
 - [Secrets (`/docker/par-rt-db/.env`, not committed)](#secrets-dockerpar-rt-dbenv-not-committed)
 - [Dashboard / SPA](#dashboard--spa)
 - [Admin bootstrap (after first deploy)](#admin-bootstrap-after-first-deploy)
@@ -95,6 +97,11 @@ path. Multi-instance here means multiple *readers/connection-holders*, not a
 second writer onto the same database — two committers for one database would be
 a correctness catastrophe. Horizontal scaling is tracked as ENH-022.
 
+When `RTDB_MULTI_INSTANCE=true`, also set `RTDB_INSTANCE_ID` to a stable,
+distinct value per replica (e.g. `rtdb-a`, `rtdb-b`): NOTIFY self-dedupe works
+with an auto-generated id, but a stable id makes logs and diagnostics easier to
+correlate across replicas.
+
 ## Postgres image
 
 The compose stack uses [`pgvector/pgvector:pg17`](https://hub.docker.com/r/pgvector/pgvector)
@@ -142,20 +149,48 @@ metrics exist for it on `/metrics` and `GET /admin/metrics`:
 - `rtdb_subs_missed_pushes_total` — **alert on any increase.** Non-zero means
   invalidation under-approximated. Only populated when verification is on.
 
-`RTDB_SUBS_VERIFY_SKIP_EVERY=N` (default 0 = off) shadow-verifies 1 skip in
-every N: the query runs anyway and its result is compared against the last
-pushed one. **Setting it in `.env` is not enough on its own** — compose's
+`RTDB_SUBS_VERIFY_SKIP_EVERY=N` shadow-verifies 1 skip in every N: the query
+runs anyway and its result is compared against the last pushed one. **It ships
+enabled at 1000** (`DEFAULT_SUBS_VERIFY_SKIP_EVERY` in `server/src/config.rs`;
+`.env.example` and compose agree) — set `0` to disable it.
+**Setting it in `.env` is not enough on its own** — compose's
 `environment:` block is an explicit allowlist, so a new `RTDB_*` key must also
 be forwarded there (this one is). After changing it, recreate the
 container (`docker compose up -d server`) and confirm
 `rtdb_subs_skip_verifications_total` starts climbing; if it stays 0 while skips
 accumulate, the variable isn't reaching the process. A divergence logs at ERROR, increments the counter, and pushes the
 corrected result (so it repairs, not just reports). Each verification costs the
-Postgres round-trip the skip avoided. **Prod runs a permanent standing canary at
-`RTDB_SUBS_VERIFY_SKIP_EVERY=200` (set 2026-07-30)** — a skipped update is
-silent, so the verifier stays on as a detector rather than being toggled off.
+Postgres round-trip the skip avoided. **Recommendation: keep a permanent
+standing canary on — e.g. `RTDB_SUBS_VERIFY_SKIP_EVERY=200`** (prod has run
+that setting since 2026-07-30). A skipped update is silent, so the verifier
+stays valuable as a detector rather than being toggled off.
 After changing invalidation logic, temporarily lower it to N=20 for a few days
 and confirm `rtdb_subs_missed_pushes_total` stays 0, then return it to 200.
+
+### Monitoring the invalidation canary
+
+Beyond the missed-push alert, watch the **rerun ratio** — the share of fan-out
+decisions that ended in a full table-level re-run rather than a provable skip.
+Subscription re-runs execute inside the committer turn, so a database whose
+re-runs dominate is one whose writes queue behind its own subscriber load
+(`distinct`/`aggregate`/`search`/`vector` subscriptions stay table-level and
+re-run on every write to their table — see `docs/ARCHITECTURE.md`). The ratio
+over `/metrics`:
+
+```promql
+rate(rtdb_subs_reruns_total[5m])
+  / (rate(rtdb_subs_reruns_total[5m]) + sum(rate(rtdb_subs_skips_total[5m])))
+```
+
+(`rtdb_subs_skips_total` carries a `class` label — point/indexed/ordered — so
+`sum()` collapses it to match the unlabeled rerun counter; both are
+instance-wide aggregates, deliberately without per-db labels to keep `/metrics`
+cardinality bounded.) A value near 0 means invalidation is proving most writes
+irrelevant; a sustained value above ~0.5 means re-runs dominate and writes on
+that instance are paying for subscriber load — treat it as a capacity signal
+and investigate which databases host the heavy subscriptions (per-db detail is
+in `GET /admin/metrics`, behind the admin key). Capacity work for fan-out is
+tracked as enhancement ENH-024.
 
 ## Monitoring
 
@@ -172,6 +207,13 @@ verification is on — prod runs `RTDB_SUBS_VERIFY_SKIP_EVERY=200`). The admin
 JSON snapshot with per-db breakdowns (storage, subs, quota rejections) stays at
 `GET /admin/metrics`, behind the admin key — do not scrape that from Prometheus,
 since per-db labels would blow up cardinality.
+
+Slow queries are a separate operator surface: `RTDB_SLOW_QUERY_MS` (default `0`
+= off) thresholds what counts as slow, `RTDB_SLOW_QUERY_CAPACITY` bounds the
+in-memory ring (default 200), and the captured rows surface via the admin API /
+dashboard. `RTDB_SLOW_QUERY_LOG_PARAMS=true` also records the query's bound
+parameter values — a privacy tradeoff, since params can contain user content;
+it defaults to `false`. See `.env.example` for the full set.
 
 ## Tracing (OpenTelemetry / OTLP, ENH-018)
 
@@ -212,6 +254,11 @@ stays safe under the head sampler. The exporter flushes on SIGTERM, so a
 
 ## Secrets (`/docker/par-rt-db/.env`, not committed)
 
+This section covers the secrets you must provision before first boot. The
+canonical reference for **every** `RTDB_*` variable (with defaults and
+commentary) is [`/.env.example`](../.env.example) — this file names only the
+operator-critical subset.
+
 - `POSTGRES_PASSWORD`, `RTDB_ADMIN_KEY` — `openssl rand -hex 32`. `RTDB_ADMIN_KEY`
   is also stored in parvault for admin CLI use.
 - `RTDB_GITHUB_CLIENT_ID` / `RTDB_GITHUB_CLIENT_SECRET` — from parvault
@@ -221,7 +268,11 @@ stays safe under the head sampler. The exporter flushes on SIGTERM, so a
   to disable Google login. **Both must be passed to the server in
   `docker-compose.yml`'s `environment:` block** (they are, alongside the GitHub
   pair) — the server reads them at boot, so a change needs `docker compose up -d`
-  to take effect.
+  to take effect. Provider setup (callbacks, scopes, env vars for all six
+  providers) is documented in [`docs/OAUTH_SETUP.md`](../docs/OAUTH_SETUP.md).
+- `RTDB_AUTH_ANONYMOUS_ENABLED` (default `false`) is the server-wide gate for
+  anonymous login; when it is on, each database still opts in individually via
+  `GET|PATCH /admin/db/{db}/anonymous-access` (SEC-103).
 - `RTDB_ALLOWED_ORIGINS` — the SPA origin(s); adjust when the client's final
   origin is known, then `docker compose up -d` to apply.
 - `RTDB_BUILD_COMMIT` (optional) — git short sha baked into `/healthz`. Set it
@@ -348,5 +399,28 @@ Common operator symptoms on the live deploy:
 
 ## Rollback
 
-`docker compose down` stops the stack (the named volume `rtdb-pg` persists
-data). To wipe data too: `docker compose down -v`.
+There are no image tags to pin: `make deploy` rsyncs the current checkout to
+lenny2 and builds in place, so rolling back a bad deploy means redeploying an
+older commit.
+
+1. On the workstation, from the repo root, check out the last-known-good commit
+   and redeploy it:
+
+   ```sh
+   git checkout <last-known-good-commit>
+   make deploy
+   ```
+
+   `make deploy` re-runs the gate, rsyncs that commit's source over
+   `/docker/par-rt-db` (the `.env` excludes keep the live secrets intact), and
+   rebuilds the image on the host (`docker compose up -d --build`).
+
+2. Verify: `curl -fsS https://rtdb.pardev.net/healthz | jq .` reports the
+   expected `git_commit` (the redeployed sha), and a spot query against a row
+   you know was affected by the bad deploy behaves correctly again.
+
+3. Return the workstation to the deploy branch (`git checkout main`) so the
+   next deploy doesn't silently re-ship the old commit.
+
+`docker compose down` only stops the stack (the named volume `rtdb-pg` persists
+data) — it is not a rollback. To wipe data too: `docker compose down -v`.

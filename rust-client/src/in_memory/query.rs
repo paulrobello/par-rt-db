@@ -1415,9 +1415,13 @@ pub fn type_tag(ty: &FieldType) -> &'static str {
 /// TS `IndexedType` (`ts-client/src/in_memory.ts:43-49`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PgType {
+    /// String-backed indexed values.
     Text,
+    /// `f64`-backed indexed values.
     Number,
+    /// Boolean indexed values.
     Boolean,
+    /// 64-bit integer indexed values (wire-encoded as strings).
     Int64,
 }
 
@@ -1425,7 +1429,9 @@ pub enum PgType {
 /// source field was wrapped in `Optional` (so callers can let null sort).
 #[derive(Debug, Clone, Copy)]
 pub struct IndexedType {
+    /// The storage type used for comparison/cursor encoding.
     pub pg: PgType,
+    /// Whether the source field was `Optional` (nulls sort first).
     pub nullable: bool,
 }
 

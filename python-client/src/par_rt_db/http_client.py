@@ -246,12 +246,22 @@ class RtDbHttpClient:
     def run(self, query: Query | TableQuery, *, model: type = dict) -> Any:
         """``POST /api/query`` → parse the result by the query's terminal.
 
-        ``model`` narrows each document: ``dict`` (default) returns raw dicts,
-        a pydantic ``BaseModel`` subclass validates each doc, and ``int``/``str``
-        /``float``/``Any`` cover the scalar results of ``count``/``aggregate``/
-        ``distinct``. The terminal is inferred from ``query`` (see
-        ``_terminal_of``); pass a ``Query`` built with the matching terminal so
-        the inferred shape matches what you expect.
+        The terminal is inferred from ``query`` (see ``_terminal_of``); pass a
+        ``Query`` built with the matching terminal so the inferred shape
+        matches what you expect.
+
+        Args:
+            query: The built ``Query`` or a ``TableQuery`` (built automatically).
+            model: Narrows each document — ``dict`` (default) returns raw
+                dicts, a pydantic ``BaseModel`` subclass validates each doc,
+                and ``int``/``str``/``float``/``Any`` cover the scalar results
+                of ``count``/``aggregate``/``distinct``.
+
+        Returns:
+            The query result shaped by its terminal (see ``model``).
+
+        Raises:
+            RtDbError: Any non-200 response envelope from the server.
         """
         built = query.build() if isinstance(query, TableQuery) else query
         body = {"db": self._db, "query": built.model_dump(by_alias=True, mode="json")}
@@ -293,8 +303,17 @@ class RtDbHttpClient:
     ) -> list[StepResult]:
         """``POST /api/mutate`` → one ``StepResult`` per step.
 
-        ``idempotency_key`` is omitted from the body when ``None`` (matches the
-        server's ``skip_serializing_if`` rule).
+        Args:
+            txn: The transaction to apply atomically.
+            idempotency_key: Optional server-side dedup key for a retried
+                mutate; omitted from the body when ``None`` (matches the
+                server's ``skip_serializing_if`` rule).
+
+        Returns:
+            One ``StepResult`` per step, in step order.
+
+        Raises:
+            RtDbError: Any non-200 response envelope (the txn rolled back).
         """
         body: dict[str, Any] = {
             "db": self._db,
@@ -406,11 +425,20 @@ class RtDbHttpClient:
         """Fan out over many queries in one round trip → one outcome per input.
 
         ``POST /api/query-batch`` runs auth/owner resolution once for the whole
-        request; each query's outcome lands in its own aligned slot. An errored
-        query becomes that slot's ``{ok: false, error}`` and never fails the
-        batch — only the db-level bearer/authorize gate returns non-200. Each
+        request; each query's outcome lands in its own aligned slot. Each
         ``BatchQueryOutcome.result`` is the raw untagged ``QueryResult``; decode
         with ``query.parse_result(model, terminal, outcome.result)`` per query.
+
+        Args:
+            queries: The built (or buildable) queries, in the desired order.
+
+        Returns:
+            One ``BatchQueryOutcome`` per input, length-aligned with it. An
+            errored query becomes that slot's ``{ok: false, error}`` and never
+            fails the batch.
+
+        Raises:
+            RtDbError: Only a db-level bearer/authorize failure (non-200).
         """
         wire_queries = [
             (q.build() if isinstance(q, TableQuery) else q).model_dump(by_alias=True, mode="json")
@@ -431,16 +459,23 @@ class RtDbHttpClient:
     ) -> UploadResult:
         """``POST /api/storage/{db}`` with a raw body → server-computed metadata.
 
-        ``content_type`` sets the ``Content-Type`` header AND is stored as the
-        file's type; when ``None`` the header is left unset (httpx defaults to
-        ``application/octet-stream``). Unlike every other method the body is NOT
-        JSON.
+        Unlike every other method the body is NOT JSON. httpx handles all three
+        ``data`` forms natively when passed via ``content=``, so large files are
+        uploaded without being fully buffered in memory (ENH-021).
 
-        ``data`` may be ``bytes`` (buffered), a binary file-like object (anything
-        with ``.read()`` — streamed in 64 KiB chunks), or an iterable of bytes
-        chunks (streamed, chunked transfer-encoding). httpx handles all three
-        natively when passed via ``content=``, so large files are uploaded
-        without being fully buffered in memory (ENH-021).
+        Args:
+            data: ``bytes`` (buffered), a binary file-like object (anything
+                with ``.read()`` — streamed in 64 KiB chunks), or an iterable
+                of bytes chunks (streamed, chunked transfer-encoding).
+            content_type: Sets the ``Content-Type`` header AND is stored as
+                the file's type; when ``None`` the header is left unset (httpx
+                defaults to ``application/octet-stream``).
+
+        Returns:
+            The server-computed ``UploadResult`` (id, sha256, size, type).
+
+        Raises:
+            RtDbError: Non-2xx, or ``data`` is not one of the three forms.
         """
         if isinstance(data, (str, Mapping)) or not isinstance(data, (bytes, Iterable)):
             raise RtDbError(

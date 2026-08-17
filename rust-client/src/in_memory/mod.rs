@@ -11,10 +11,10 @@
 //! [`crate::RtDbClient`]), and `subscribe` (reactive `query_update`s) - so a
 //! test can swap it in behind a shared interface.
 //!
-//! Split into a module directory (QA-108): [`presence`] (rooms/handles),
-//! [`query`] (the `run_query` engine with index/cursor/aggregate helpers),
-//! [`migrate`] (directive application and destructive-change detection), and
-//! [`validate`] (value/doc validators, coercion, `FilterExpr` evaluation). This
+//! Split into a module directory (QA-108): `presence` (rooms/handles),
+//! `query` (the `run_query` engine with index/cursor/aggregate helpers),
+//! `migrate` (directive application and destructive-change detection), and
+//! `validate` (value/doc validators, coercion, `FilterExpr` evaluation). This
 //! `mod.rs` holds the store, the executor (`execute_transaction`/`execute_step`
 //! and the per-step `do_*` helpers), and the reactive/subscription/scheduling/
 //! storage surfaces. The public surface (`par_rt_db_client::in_memory::*`) is
@@ -68,7 +68,7 @@ pub const MAX_CASCADE_ROWS: usize = 10_000;
 /// count 0 (control-flow steps touch no documents); each `patchByQuery`/
 /// `deleteByQuery` step counts up to its `limit` (default and cap
 /// `MAX_BY_QUERY_ROWS`). Mirrors server `txn::worst_case_affected`. Used by
-/// [`Self::execute_transaction`]'s [`MAX_AFFECTED_ROWS_PER_TXN`] budget check.
+/// `execute_transaction`'s [`MAX_AFFECTED_ROWS_PER_TXN`] budget check.
 pub fn worst_case_affected(txn: &Transaction) -> usize {
     txn.steps
         .iter()
@@ -147,9 +147,13 @@ pub const CRON_STEP_MS: i64 = 60_000;
 /// `version` columns.
 #[derive(Debug, Clone)]
 pub struct StoredRow {
+    /// Server-shaped opaque row id (uuid-v7 like the server mints).
     pub id: String,
+    /// The document body without system fields.
     pub doc: Value,
+    /// Optimistic-concurrency version, bumped on every write.
     pub version: i64,
+    /// Creation timestamp, epoch milliseconds.
     pub created_at: i64,
     /// FM-33: soft-delete stamp — `Some(ms)` marks the row soft-deleted
     /// (invisible to every read and write lookup, restorable via the
@@ -163,14 +167,23 @@ pub struct StoredRow {
 /// `ScheduledJob` interface at `ts-client/src/in_memory.ts:75-85`.
 #[derive(Debug, Clone)]
 pub struct ScheduledJob {
+    /// Opaque job id.
     pub id: String,
+    /// One-shot or cron.
     pub kind: ScheduleKind,
+    /// The declarative transaction to fire when due.
     pub txn: Transaction,
+    /// Next due time, epoch milliseconds.
     pub due_at: i64,
+    /// The cron expression for recurring jobs.
     pub cron: Option<String>,
+    /// Pending / paused / running / done / cancelled.
     pub status: ScheduleStatus,
+    /// Creation timestamp, epoch milliseconds.
     pub created_at: i64,
+    /// How many times the job has fired.
     pub fired_count: i64,
+    /// The last firing error, if any.
     pub last_error: Option<String>,
 }
 
@@ -178,9 +191,13 @@ pub struct ScheduledJob {
 /// `{ bytes, contentType?, createdAt }` record (`ts-client/src/in_memory.ts:498-501`).
 #[derive(Debug, Clone)]
 pub struct StoredBlob {
+    /// Raw blob bytes.
     pub bytes: Vec<u8>,
+    /// The stored `Content-Type`, when the upload carried one.
     pub content_type: Option<String>,
+    /// Upload timestamp, epoch milliseconds.
     pub created_at: i64,
+    /// SHA-256 hex digest of `bytes`.
     pub sha256: String,
 }
 
@@ -191,9 +208,13 @@ pub struct StoredBlob {
 /// depend on the `http` feature.
 #[derive(Debug, Clone)]
 pub struct UploadResult {
+    /// Server-assigned opaque file id.
     pub id: String,
+    /// SHA-256 hex digest of the stored bytes.
     pub sha256: String,
+    /// Size in bytes.
     pub size: i64,
+    /// The upload's `Content-Type`, when recorded.
     pub content_type: Option<String>,
 }
 
@@ -203,10 +224,15 @@ pub struct UploadResult {
 /// [`UploadResult`].
 #[derive(Debug, Clone)]
 pub struct FileMetadata {
+    /// Server-assigned opaque file id.
     pub id: String,
+    /// SHA-256 hex digest of the stored bytes.
     pub sha256: String,
+    /// Size in bytes.
     pub size: i64,
+    /// The stored `Content-Type`, when recorded.
     pub content_type: Option<String>,
+    /// Upload timestamp, epoch milliseconds.
     pub creation_time: i64,
 }
 

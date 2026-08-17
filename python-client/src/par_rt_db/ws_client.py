@@ -504,6 +504,15 @@ class RtDbClient:
         server-side subscription via refcount. When connected, the subscribe
         frame is sent immediately (scheduled on the loop); otherwise it is
         flushed on the next ``authOk`` via ``_flush_on_auth``.
+
+        Args:
+            query: The built ``Query`` or a ``TableQuery`` (built automatically).
+            model: Narrows each document (``dict`` default; a pydantic
+                ``BaseModel`` subclass validates each update).
+
+        Returns:
+            An async-context ``Subscription`` yielding the query's current
+            result on entry and every change thereafter.
         """
         from .query import TableQuery
 
@@ -595,12 +604,24 @@ class RtDbClient:
     async def mutate(
         self, txn: Transaction, *, idempotency_key: str | None = None
     ) -> list[StepResult]:
-        """Submit ``txn`` for at-most-once execution. Sends immediately when
-        connected, otherwise queues and flushes on the next ``authOk``. With
-        ``optimistic_updates=True`` each matching subscription is overlaid before
-        dispatch and reconciled by the next ``queryUpdate``. Returns the per-step
-        results in order. ``idempotency_key`` opts into server-side dedup of a
-        retried mutate."""
+        """Submit ``txn`` for at-most-once execution.
+
+        Sends immediately when connected, otherwise queues and flushes on the
+        next ``authOk``. With ``optimistic_updates=True`` each matching
+        subscription is overlaid before dispatch and reconciled by the next
+        ``queryUpdate``.
+
+        Args:
+            txn: The transaction to apply atomically.
+            idempotency_key: Opts into server-side dedup of a retried mutate.
+
+        Returns:
+            The per-step results, in step order.
+
+        Raises:
+            RtDbError: The server's ``mutateErr`` envelope, or rejection when
+                the client is closed.
+        """
         self._counter += 1
         mid = f"mut-{self._counter}"
         txn_dict = txn.model_dump(by_alias=True, mode="json")

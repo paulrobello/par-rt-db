@@ -94,7 +94,9 @@ pub(crate) struct DatabasesResponse {
 #[non_exhaustive]
 pub struct MintedToken {
     #[serde(rename = "tokenId")]
+    /// The minted token's stable id (for revoke/list).
     pub token_id: String,
+    /// The plaintext bearer token — shown once, never stored server-side.
     pub token: String,
 }
 
@@ -108,7 +110,9 @@ pub(crate) struct AllowlistListResponse {
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct AdminMember {
+    /// The admin's email (the allowlist key).
     pub email: String,
+    /// GitHub numeric id when linked.
     pub github_id: Option<i64>,
 }
 
@@ -117,8 +121,11 @@ pub struct AdminMember {
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct TableStat {
+    /// Table name.
     pub name: String,
+    /// Live row count.
     pub row_count: i64,
+    /// On-disk size in bytes.
     pub size_bytes: i64,
 }
 
@@ -131,14 +138,21 @@ pub struct TableStat {
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct DbStats {
+    /// Per-table stats.
     pub tables: Vec<TableStat>,
+    /// Whole-db size in bytes.
     pub total_size_bytes: i64,
     /// Per-db resource quotas (ENH-011); 0 = unlimited.
     pub tables_quota: i64,
+    /// Tables currently pushed.
     pub tables_used: i64,
+    /// Storage cap in bytes; 0 = unlimited.
     pub storage_quota_bytes: i64,
+    /// Storage currently used.
     pub storage_used_bytes: i64,
+    /// Subscription cap; 0 = unlimited.
     pub subs_quota: i64,
+    /// Live subscriptions.
     pub subs_used: i64,
 }
 
@@ -147,9 +161,13 @@ pub struct DbStats {
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct TokenInfo {
+    /// Stable token id (for revoke).
     pub id: String,
+    /// Operator-assigned label.
     pub name: String,
+    /// Mint time, epoch ms.
     pub created_at: i64,
+    /// Whether the token is revoked.
     pub revoked: bool,
     /// `null` = no expiry. Defaults to `None` for older servers that
     /// omit the field.
@@ -179,7 +197,9 @@ pub struct TokenInfo {
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct SessionInfo {
+    /// Non-reversible sha256 of the session token (revoke target).
     pub token_hash: String,
+    /// The authed user's id.
     pub user_id: String,
     /// `None` when the user has no email (e.g. an anonymous session).
     #[serde(default)]
@@ -187,8 +207,11 @@ pub struct SessionInfo {
     /// `None` when the user has no login handle.
     #[serde(default)]
     pub login: Option<String>,
+    /// Whether this is an anonymous session.
     pub anonymous: bool,
+    /// Login time, epoch ms.
     pub created_at: i64,
+    /// Expiry time, epoch ms.
     pub expires_at: i64,
 }
 
@@ -198,7 +221,9 @@ pub struct SessionInfo {
 /// `{user?, limit?}` shape in `ts-client`'s `listSessions`.
 #[derive(Debug, Clone, Default)]
 pub struct SessionListOptions {
+    /// Filter by user id or email.
     pub user: Option<String>,
+    /// Page size (server default 200, clamped to 1..=1000).
     pub limit: Option<i64>,
 }
 
@@ -214,7 +239,9 @@ pub(crate) struct SessionsResponse {
 /// 100, capped at 500). Mirrors ts-client's `listWorkflows` opts.
 #[derive(Debug, Clone, Default)]
 pub struct WorkflowListOptions {
+    /// Filter by run lifecycle state.
     pub status: Option<crate::wire::WorkflowStatus>,
+    /// Page size (server default 100, capped 500).
     pub limit: Option<u32>,
 }
 
@@ -230,7 +257,9 @@ pub(crate) struct WorkflowsResponse {
 #[derive(Debug, Clone, Deserialize)]
 #[non_exhaustive]
 pub struct RevokeUserSessionsResponse {
+    /// Always true on success.
     pub ok: bool,
+    /// How many sessions were dropped.
     pub revoked: i64,
 }
 
@@ -246,7 +275,9 @@ pub struct RevokeUserSessionsResponse {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MergeConflict {
+    /// The conflicting row's table.
     pub table: String,
+    /// The conflicting row's id.
     pub id: String,
 }
 
@@ -256,7 +287,9 @@ pub struct MergeConflict {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MergeDbResult {
+    /// Re-stamped-doc counts per table.
     pub tables: BTreeMap<String, usize>,
+    /// Rows skipped over unique-index collisions.
     pub conflicts: Vec<MergeConflict>,
 }
 
@@ -268,9 +301,13 @@ pub struct MergeDbResult {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MergeReport {
+    /// Per-db doc re-stamp outcomes.
     pub dbs: BTreeMap<String, MergeDbResult>,
+    /// Storage blobs moved to the real user.
     pub storage_repointed: u64,
+    /// Sessions re-pointed to the real user.
     pub sessions_repointed: u64,
+    /// Whether the anon user row was removed.
     pub anon_deleted: bool,
 }
 
@@ -281,8 +318,11 @@ pub struct MergeReport {
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct LatencyStats {
+    /// Median, microseconds.
     pub p50: i64,
+    /// 95th percentile, microseconds.
     pub p95: i64,
+    /// 99th percentile, microseconds.
     pub p99: i64,
 }
 
@@ -291,16 +331,27 @@ pub struct LatencyStats {
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct MetricsSnapshot {
+    /// Queries served since boot.
     pub queries_total: i64,
+    /// Transactions applied since boot.
     pub mutations_total: i64,
+    /// File uploads since boot.
     pub uploads_total: i64,
+    /// Open `/sync` sockets.
     pub ws_connections: i64,
+    /// Live query subscriptions.
     pub active_subscriptions: i64,
+    /// Postgres pool connections.
     pub pool_size: i64,
+    /// Idle pool connections.
     pub pool_idle: i64,
+    /// Process uptime.
     pub uptime_seconds: i64,
+    /// Query latency percentiles.
     pub query_latency: LatencyStats,
+    /// Mutation latency percentiles.
     pub mutate_latency: LatencyStats,
+    /// Subscribe latency percentiles.
     pub subscribe_latency: LatencyStats,
     /// Subscription-invalidation effectiveness: read-set decisions that
     /// ended in a re-run vs. a proven skip, split by the class that proved
@@ -315,10 +366,13 @@ pub struct MetricsSnapshot {
     #[serde(default)]
     pub subs_reruns_total: i64,
     #[serde(default)]
+    /// Skips proven by a `get(id)` point read.
     pub subs_skips_point_total: i64,
     #[serde(default)]
+    /// Skips proven by an eq-prefix window.
     pub subs_skips_indexed_total: i64,
     #[serde(default)]
+    /// Skips proven by a top-N sort boundary.
     pub subs_skips_ordered_total: i64,
     /// Sampled shadow verifications of skips and the ones that found the
     /// skip WRONG. `subs_missed_pushes_total > 0` means invalidation
@@ -326,6 +380,7 @@ pub struct MetricsSnapshot {
     #[serde(default)]
     pub subs_skip_verifications_total: i64,
     #[serde(default)]
+    /// Verifications that found a skip WRONG — alert on any increase.
     pub subs_missed_pushes_total: i64,
     /// ENH-010 per-db breakdown of the subscription counters above
     /// (`perDbSubs` on the wire). `#[serde(default)]` so an older server
@@ -341,7 +396,9 @@ pub struct MetricsSnapshot {
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct SubscriptionsPrincipal {
+    /// User id when interactive.
     pub user_id: Option<String>,
+    /// Email when known.
     pub email: Option<String>,
 }
 
@@ -351,10 +408,15 @@ pub struct SubscriptionsPrincipal {
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct SubscriptionInfo {
+    /// Which database the subscription reads.
     pub db: String,
+    /// The queried table.
     pub table: String,
+    /// The query terminal.
     pub terminal: String,
+    /// `point` / `indexed` / `ordered` / `table`.
     pub read_set_class: String,
+    /// Subscriber identity (`None` for machine/bypass).
     pub principal: Option<SubscriptionsPrincipal>,
 }
 
@@ -364,11 +426,17 @@ pub struct SubscriptionInfo {
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct DbSubCounters {
+    /// Which database.
     pub db: String,
+    /// Fan-out decisions that re-ran.
     pub reruns: u64,
+    /// Skips proven by a point read.
     pub skips_point: u64,
+    /// Skips proven by an eq-prefix window.
     pub skips_indexed: u64,
+    /// Skips proven by a top-N boundary.
     pub skips_ordered: u64,
+    /// Verifications that found a skip wrong.
     pub missed: u64,
 }
 
@@ -380,12 +448,19 @@ pub struct DbSubCounters {
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct SubscriptionsResponse {
+    /// Every live subscription.
     pub subscriptions: Vec<SubscriptionInfo>,
+    /// Server-wide re-runs.
     pub subs_reruns_total: u64,
+    /// Server-wide point skips.
     pub subs_skips_point_total: u64,
+    /// Server-wide indexed skips.
     pub subs_skips_indexed_total: u64,
+    /// Server-wide ordered skips.
     pub subs_skips_ordered_total: u64,
+    /// Server-wide missed pushes.
     pub subs_missed_pushes_total: u64,
+    /// The same counters per database.
     pub per_db: Vec<DbSubCounters>,
 }
 
@@ -395,13 +470,19 @@ pub struct SubscriptionsResponse {
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct HotConfig {
+    /// CORS allowlist (hot-reloaded per request).
     pub allowed_origins: Vec<String>,
+    /// Session cookie lifetime in days.
     pub session_ttl_days: i64,
+    /// Upload size cap in bytes.
     pub max_file_size: i64,
+    /// Idempotency-key retention window.
     pub idempotency_ttl_ms: i64,
     /// Per-db resource quotas (ENH-011); 0 = unlimited. Mirrors server.
     pub max_tables_per_db: i64,
+    /// Storage cap per db in bytes; 0 = unlimited.
     pub max_storage_bytes_per_db: i64,
+    /// Subscription cap per db; 0 = unlimited.
     pub max_subs_per_db: i64,
 }
 
@@ -411,19 +492,33 @@ pub struct HotConfig {
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct ConfigResponse {
+    /// HTTP listen port.
     pub port: i64,
+    /// Configured public origin.
     pub public_url: String,
+    /// GitHub OAuth base (overrideable for GitHub Enterprise).
     pub github_base_url: String,
+    /// GitHub API base.
     pub github_api_url: String,
+    /// Boot redaction: whether the DB URL is set.
     pub database_url_configured: bool,
+    /// Boot redaction: whether the admin key is set.
     pub admin_key_configured: bool,
+    /// Whether GitHub OAuth is configured.
     pub github_configured: bool,
+    /// Whether Google OAuth is configured.
     pub google_configured: bool,
+    /// Whether GitLab OAuth is configured.
     pub gitlab_configured: bool,
+    /// Whether generic OIDC is configured.
     pub oidc_configured: bool,
+    /// The runtime-mutable subset.
     pub hot: HotConfig,
+    /// Crate version.
     pub version: String,
+    /// Build commit label.
     pub git_commit: String,
+    /// The server-wide admin allowlist.
     pub admins: Vec<AdminMember>,
 }
 
@@ -434,18 +529,25 @@ pub struct ConfigResponse {
 #[serde(rename_all = "camelCase")]
 pub struct HotConfigPatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// New value; `None` leaves it unchanged.
     pub allowed_origins: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// New value; `None` leaves it unchanged.
     pub session_ttl_days: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// New value; `None` leaves it unchanged.
     pub max_file_size: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// New value; `None` leaves it unchanged.
     pub idempotency_ttl_ms: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// New value; `None` leaves it unchanged.
     pub max_tables_per_db: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// New value; `None` leaves it unchanged.
     pub max_storage_bytes_per_db: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// New value; `None` leaves it unchanged.
     pub max_subs_per_db: Option<i64>,
 }
 
@@ -456,11 +558,17 @@ pub struct HotConfigPatch {
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct OpEvent {
+    /// Which database.
     pub db: String,
+    /// Which table.
     pub table: String,
+    /// The document's id.
     pub doc_id: String,
+    /// The op kind (`insert`/`patch`/…).
     pub kind: String,
+    /// Commit time, epoch ms.
     pub ts: i64,
+    /// Per-row owner principal, when one applies.
     pub owner: Option<String>,
 }
 
@@ -485,41 +593,69 @@ pub struct OpEvent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "camelCase", deny_unknown_fields)]
 pub enum Directive {
+    /// Rename a field (re-keys indexes/defaults, keeps values).
     RenameField {
+        /// Which table.
         table: String,
+        /// Old field name.
         from: String,
+        /// New field name.
         to: String,
     },
+    /// Rename a table.
     RenameTable {
+        /// Old table name.
         from: String,
+        /// New table name.
         to: String,
     },
+    /// Coerce a field to a new type via a closed cast.
     ChangeType {
+        /// Which table.
         table: String,
+        /// Which field.
         field: String,
+        /// The new declared type.
         to: crate::schema::FieldType,
+        /// How to coerce existing values.
         cast: Cast,
         #[serde(default)]
+        /// Substitute for un-coercible rows (`None` = roll back on any).
         default: Option<serde_json::Value>,
     },
+    /// Remove a field (destructive).
     DropField {
+        /// Which table.
         table: String,
+        /// Which field.
         field: String,
     },
+    /// Remove a whole table (destructive).
     DropTable {
+        /// Which table.
         name: String,
     },
+    /// Remove an index.
     DropIndex {
+        /// Which table.
         table: String,
+        /// Which index.
         name: String,
     },
+    /// Backfill a default onto rows missing the field.
     SetDefault {
+        /// Which table.
         table: String,
+        /// Which field.
         field: String,
+        /// The literal to stamp.
         value: serde_json::Value,
     },
+    /// Compute and set a field from a typed expression.
     EvalExpr {
+        /// Which table.
         table: String,
+        /// The write-target field.
         set: String,
         /// ENH-020: dual-accept. A typed [`ValueExpr`] (safe, all-literals-bound
         /// path) or a legacy raw-SQL string (deprecated, gated to the root
@@ -537,9 +673,13 @@ pub enum Directive {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Cast {
+    /// Coerce to string.
     ToString,
+    /// Coerce to JSON number.
     ToNumber,
+    /// Coerce to 64-bit integer.
     ToInt64,
+    /// Coerce to boolean.
     ToBoolean,
 }
 
@@ -561,53 +701,75 @@ pub enum ValueExpr {
     /// `doc->'field'` (jsonb). The field must be declared; the write target
     /// (`EvalExpr.set`) need not be.
     Field {
+        /// The declared field to read.
         field: String,
     },
     /// Any JSON literal. Bound as `$n::jsonb`, so objects/arrays/null round-trip.
     Literal {
+        /// The literal value.
         value: serde_json::Value,
     },
     /// String concatenation. Postgres `concat(...)`, which ignores NULL args
     /// (treats them as empty) — wrap operands in `Coalesce` for explicit control.
     Concat {
+        /// The concatenation operands.
         parts: Vec<ValueExpr>,
     },
     /// Numeric arithmetic. Operands are cast to `::numeric`; the result is a
     /// JSON number via the surrounding `to_jsonb`. Division by zero errors at
     /// runtime — guard with `Case`/`Coalesce` when the divisor may be zero.
     Add {
+        /// Left operand (+).
         left: Box<ValueExpr>,
+        /// Right operand (+).
         right: Box<ValueExpr>,
     },
+    /// Subtraction (`left - right`).
     Sub {
+        /// Left operand (-).
         left: Box<ValueExpr>,
+        /// Right operand (-).
         right: Box<ValueExpr>,
     },
+    /// Multiplication (`left * right`).
     Mul {
+        /// Left operand (*).
         left: Box<ValueExpr>,
+        /// Right operand (*).
         right: Box<ValueExpr>,
     },
+    /// Division (`left / right`); by-zero errors at runtime.
     Div {
+        /// Left operand (/).
         left: Box<ValueExpr>,
+        /// Right operand (/).
         right: Box<ValueExpr>,
     },
     /// `COALESCE(parts...)` — first non-null, or NULL.
     Coalesce {
+        /// First-non-null candidates.
         parts: Vec<ValueExpr>,
     },
     /// Text casing / trim. Operand cast to `::text`.
     Lower {
+        /// Operand to lowercase.
         value: Box<ValueExpr>,
     },
+    /// Uppercase.
     Upper {
+        /// Operand to uppercase.
         value: Box<ValueExpr>,
     },
+    /// Trim surrounding whitespace.
     Trim {
+        /// Operand to trim.
         value: Box<ValueExpr>,
     },
     /// A closed scalar coercion. Reuses [`Directive::ChangeType`]'s [`Cast`].
     Cast {
+        /// Operand to coerce.
         value: Box<ValueExpr>,
+        /// Target scalar type.
         to: Cast,
     },
     /// Current timestamp (`now()`), as jsonb.
@@ -616,7 +778,9 @@ pub enum ValueExpr {
     /// `when` is a [`crate::wire::FilterExpr`] (field references schema-
     /// validated, values bound).
     Case {
+        /// Branch conditions, in order.
         whens: Vec<CaseWhen>,
+        /// Fallback when no `when` matches.
         otherwise: Box<ValueExpr>,
     },
 }
@@ -626,7 +790,9 @@ pub enum ValueExpr {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CaseWhen {
+    /// The branch condition.
     pub when: crate::wire::FilterExpr,
+    /// The value when it matches.
     pub then: ValueExpr,
 }
 
@@ -640,7 +806,9 @@ pub struct CaseWhen {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ExprSource {
+    /// The safe typed expression.
     Typed(ValueExpr),
+    /// Deprecated raw SQL (root admin_key only).
     Legacy(String),
 }
 
@@ -650,7 +818,9 @@ pub enum ExprSource {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum CondSource {
+    /// The safe typed predicate.
     Typed(crate::wire::FilterExpr),
+    /// Deprecated raw SQL (root admin_key only).
     Legacy(String),
 }
 
@@ -661,8 +831,10 @@ pub enum CondSource {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MigrateRequest<'a> {
+    /// The migration steps, applied in order.
     pub directives: &'a [Directive],
     #[serde(default)]
+    /// Preview only: validate, derive, commit nothing.
     pub dry_run: bool,
 }
 
@@ -672,8 +844,10 @@ pub struct MigrateRequest<'a> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MigrateRequestOwned {
+    /// The migration steps, applied in order.
     pub directives: Vec<Directive>,
     #[serde(default)]
+    /// Preview only: validate, derive, commit nothing.
     pub dry_run: bool,
 }
 
@@ -685,8 +859,11 @@ pub struct MigrateRequestOwned {
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct MigrateResult {
+    /// Whether the directives committed (`false` on dry-run).
     pub applied: bool,
+    /// The post-migration derived schema.
     pub schema: crate::schema::SchemaDef,
+    /// Per-directive outcome reports.
     pub directives: Vec<DirectiveReport>,
 }
 
@@ -697,10 +874,14 @@ pub struct MigrateResult {
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct SchemaHistorySummary {
+    /// Snapshot version (monotonic).
     pub version: i64,
+    /// Capture time, epoch ms.
     pub captured_at: i64,
+    /// `"push"` / `"migrate"` / `"restore"`.
     pub source: String,
     #[serde(default)]
+    /// Who captured it, when known.
     pub principal: Option<String>,
 }
 
@@ -712,11 +893,16 @@ pub struct SchemaHistorySummary {
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct SchemaHistoryEntry {
+    /// Snapshot version.
     pub version: i64,
+    /// Capture time, epoch ms.
     pub captured_at: i64,
+    /// `"push"` / `"migrate"` / `"restore"`.
     pub source: String,
     #[serde(default)]
+    /// Who captured it, when known.
     pub principal: Option<String>,
+    /// The captured schema JSON, verbatim.
     pub schema: serde_json::Value,
 }
 
@@ -743,7 +929,9 @@ pub(crate) struct PreviewSchemaRequest<'a> {
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct SchemaPreviewColumnAdd {
+    /// Column name.
     pub name: String,
+    /// Human-readable type (`string`, `id<projects>`, …).
     pub field_type: String,
 }
 
@@ -753,7 +941,9 @@ pub struct SchemaPreviewColumnAdd {
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct SchemaPreviewIndexAdd {
+    /// Index name.
     pub name: String,
+    /// The indexed fields.
     pub fields: Vec<String>,
 }
 
@@ -764,8 +954,11 @@ pub struct SchemaPreviewIndexAdd {
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct SchemaPreviewTableAdd {
+    /// New table name.
     pub table: String,
+    /// Columns the push would add.
     pub columns: Vec<SchemaPreviewColumnAdd>,
+    /// Indexes the push would add.
     pub indexes: Vec<SchemaPreviewIndexAdd>,
 }
 
@@ -776,8 +969,11 @@ pub struct SchemaPreviewTableAdd {
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct SchemaPreviewRejection {
+    /// Table holding the rejected item.
     pub table: String,
+    /// The column/index name.
     pub item: String,
+    /// Why the push would refuse it.
     pub reason: String,
 }
 
@@ -789,7 +985,9 @@ pub struct SchemaPreviewRejection {
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct SchemaPreviewDiff {
+    /// Additive changes a push would make.
     pub added: Vec<SchemaPreviewTableAdd>,
+    /// Drops/type changes a push would refuse.
     pub rejected: Vec<SchemaPreviewRejection>,
 }
 
@@ -802,11 +1000,15 @@ pub struct SchemaPreviewDiff {
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct DirectiveReport {
+    /// Which directive ran.
     pub op: String,
+    /// Rows touched.
     pub affected_rows: i64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// Rows that failed coercion (with their values).
     pub cast_failures: Vec<CastFailure>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// Before/after samples.
     pub sample_changes: Vec<SampleChange>,
 }
 
@@ -816,7 +1018,9 @@ pub struct DirectiveReport {
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct CastFailure {
+    /// The row's id.
     pub id: String,
+    /// The value that failed to coerce.
     pub value: serde_json::Value,
 }
 
@@ -826,8 +1030,11 @@ pub struct CastFailure {
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct SampleChange {
+    /// The row's id.
     pub id: String,
+    /// The row before the directive.
     pub before: serde_json::Value,
+    /// The row after.
     pub after: serde_json::Value,
 }
 
@@ -837,8 +1044,11 @@ pub struct SampleChange {
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct BackupFile {
+    /// Dump file name.
     pub name: String,
+    /// Dump size in bytes.
     pub size_bytes: u64,
+    /// Dump time, epoch ms.
     pub created_ms: i64,
 }
 
@@ -848,7 +1058,9 @@ pub struct BackupFile {
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct BackupsListResponse {
+    /// Whether a dump is in progress.
     pub running: bool,
+    /// On-disk dumps, newest-first.
     pub backups: Vec<BackupFile>,
 }
 
@@ -866,7 +1078,9 @@ pub(crate) struct RestoreRequest<'a> {
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct RestoreResult {
+    /// The freshly-created restore DB name.
     pub target: String,
+    /// Operator cutover instructions.
     pub instructions: String,
 }
 
@@ -885,12 +1099,18 @@ pub struct RestoreResult {
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct Webhook {
+    /// Webhook id.
     pub id: i64,
+    /// Owning database.
     pub db: String,
     #[serde(default)]
+    /// Scoped table, or `None` for all tables.
     pub table: Option<String>,
+    /// Delivery target.
     pub url: String,
+    /// Op names or `["*"]`.
     pub events: Vec<String>,
+    /// Registration time, epoch ms.
     pub created_at: i64,
     /// Added in ENH-003. `#[serde(default)]` so an older server that omits
     /// the field still parses (defaulting to `false`); a current server
@@ -914,11 +1134,17 @@ pub struct Webhook {
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct WebhookDelivery {
+    /// Delivery row id.
     pub id: i64,
+    /// Delivery attempts so far.
     pub attempts: i64,
+    /// `pending` / `retrying` / `delivered` / `failed`.
     pub status: String,
+    /// Scheduled retry time, epoch ms.
     pub next_attempt: i64,
+    /// The last failure, if any.
     pub last_error: Option<String>,
+    /// The exact JSON body queued for POST.
     pub payload: serde_json::Value,
 }
 
@@ -930,12 +1156,16 @@ pub struct WebhookDelivery {
 #[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateWebhookOptions {
+    /// Delivery target (required).
     pub url: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Scope to one table (all tables when `None`).
     pub table: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Op names to match ( `["*"]` when `None`).
     pub events: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Start enabled/disabled (enabled when `None`).
     pub enabled: Option<bool>,
 }
 
@@ -952,14 +1182,19 @@ pub struct CreateWebhookOptions {
 #[serde(rename_all = "camelCase")]
 pub struct WebhookEditOptions {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// New target URL.
     pub url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Tri-state: skip / clear to all-tables / set.
     pub table: Option<Option<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// New event set.
     pub events: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Enable/disable.
     pub enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// `Some(true)` generates a fresh signing secret.
     pub rotate_secret: Option<bool>,
 }
 
@@ -969,8 +1204,11 @@ pub struct WebhookEditOptions {
 /// offset=0). Mirrors `ListDeliveriesOptions` in `ts-client`.
 #[derive(Debug, Clone, Default)]
 pub struct ListDeliveriesOptions {
+    /// Filter by delivery status.
     pub status: Option<String>,
+    /// Page size (default 50, clamped to 1..=1000).
     pub limit: Option<i64>,
+    /// Page offset.
     pub offset: Option<i64>,
 }
 
@@ -991,20 +1229,26 @@ pub struct ListDeliveriesOptions {
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct AuditEntry {
+    /// Audit row id.
     pub id: i64,
+    /// Write time, epoch ms.
     pub ts_ms: i64,
+    /// Which database.
     pub db: String,
+    /// Which table.
     pub table: String,
     /// Wire `op`. `null` for system-initiated rows. Defaults to `None`
     /// for older servers that omit the field.
     #[serde(default)]
     pub op: Option<String>,
+    /// Which document.
     pub doc_id: String,
     /// Wire `principal` (the per-row owner when an interactive user wrote
     /// the doc, `null` for machine tokens / system sources). Defaults to
     /// `None` for older servers that omit the field.
     #[serde(default)]
     pub principal: Option<String>,
+    /// Tap arm (`mutate`/`ttl`/`merge`/…).
     pub source: String,
 }
 
@@ -1015,11 +1259,17 @@ pub struct AuditEntry {
 /// `AuditQuery` in `ts-client`.
 #[derive(Debug, Clone, Default)]
 pub struct AuditQuery {
+    /// Equality filter on table.
     pub table: Option<String>,
+    /// Equality filter on op.
     pub op: Option<String>,
+    /// Equality filter on principal.
     pub principal: Option<String>,
+    /// Equality filter on source.
     pub source: Option<String>,
+    /// Page size (default 100, clamped to 1..=1000).
     pub limit: Option<i64>,
+    /// Page offset.
     pub offset: Option<i64>,
 }
 
@@ -1056,9 +1306,13 @@ pub(crate) struct AuditResponse {
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct ExplainResult {
+    /// The compiled SQL (byte-identical to execution).
     pub sql: String,
+    /// The `$1..$n` binds, formatted as strings.
     pub params: Vec<String>,
+    /// Which terminal compiled.
     pub terminal: String,
+    /// Compile-time concerns (e.g. unindexed filter field).
     pub warnings: Vec<String>,
 }
 
@@ -1075,9 +1329,13 @@ pub struct SlowQueryEntry {
     pub started_at_ms: i64,
     /// Wall-clock duration in milliseconds.
     pub duration_ms: u64,
+    /// Which database.
     pub db: String,
+    /// Which table.
     pub table: String,
+    /// Which terminal.
     pub terminal: String,
+    /// The executed SQL.
     pub sql: String,
     /// Bound parameters; `None` when the server redacts them (the default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1093,7 +1351,10 @@ pub struct SlowQueryEntry {
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct SlowQueriesResponse {
+    /// Recorded events, newest-first.
     pub queries: Vec<SlowQueryEntry>,
+    /// Configured `RTDB_SLOW_QUERY_MS` (0 = disabled).
     pub threshold_ms: u64,
+    /// Ring-buffer cap.
     pub capacity: usize,
 }

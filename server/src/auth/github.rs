@@ -1,3 +1,7 @@
+//! GitHub OAuth provider (`/auth/github/*`): standard web flow; the user's
+//! email resolves against the GitHub API when the primary email is private.
+//! Enabled by `RTDB_GITHUB_CLIENT_ID` / `RTDB_GITHUB_CLIENT_SECRET`.
+
 use std::sync::Arc;
 
 use async_trait::async_trait;

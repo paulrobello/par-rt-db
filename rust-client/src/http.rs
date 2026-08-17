@@ -40,6 +40,11 @@ fn encode_uri_component(s: &str) -> String {
     out
 }
 
+/// One-shot HTTP client for one par-rt-db database: typed queries, atomic
+/// transactions, scheduling/cron, durable workflows, and file storage, all
+/// bearer-token authorized. For live query subscriptions use the reactive
+/// `RtDbClient` (`ws` feature); for `/admin/*` work obtain an admin client via
+/// `admin_client()` (the `admin` feature).
 pub struct RtDbHttpClient {
     url: String,
     db: String,
@@ -54,10 +59,14 @@ pub struct RtDbHttpClient {
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UploadResult {
+    /// Server-assigned opaque file id (usable in `get_url`/serve routes).
     pub id: String,
+    /// SHA-256 hex digest of the stored bytes.
     pub sha256: String,
+    /// Size in bytes.
     pub size: i64,
     #[serde(default)]
+    /// The upload's `Content-Type`, when the server recorded one.
     pub content_type: Option<String>,
 }
 
@@ -66,11 +75,16 @@ pub struct UploadResult {
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FileMetadata {
+    /// Server-assigned opaque file id.
     pub id: String,
+    /// SHA-256 hex digest of the stored bytes.
     pub sha256: String,
+    /// Size in bytes.
     pub size: i64,
     #[serde(default)]
+    /// The stored `Content-Type`, when the server recorded one.
     pub content_type: Option<String>,
+    /// Upload timestamp, epoch milliseconds.
     pub creation_time: i64,
 }
 
@@ -80,7 +94,9 @@ pub struct FileMetadata {
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SignedUrl {
+    /// The signed public URL.
     pub url: String,
+    /// Absolute expiry, epoch milliseconds — the URL stops working after it.
     pub expires_at: i64,
 }
 
@@ -91,8 +107,11 @@ pub struct SignedUrl {
 #[serde(rename_all = "kebab-case")]
 pub enum Fit {
     #[default]
+    /// Fit entirely inside the target box, preserving aspect ratio (default).
     Contain,
+    /// Fill the box, cropping the overflow.
     Cover,
+    /// Never upscale; downscale as `Contain` would.
     ScaleDown,
 }
 
@@ -111,8 +130,11 @@ impl Fit {
 #[serde(rename_all = "lowercase")]
 pub enum OutFormat {
     #[default]
+    /// Let the server pick (default).
     Auto,
+    /// JPEG output.
     Jpeg,
+    /// PNG output.
     Png,
 }
 
@@ -120,14 +142,21 @@ pub enum OutFormat {
 /// (ENH-014). All fields are optional; only `Some` fields appear in the query.
 #[derive(Debug, Clone, Default)]
 pub struct TransformOpts {
+    /// Target width in pixels.
     pub w: Option<u32>,
+    /// Target height in pixels.
     pub h: Option<u32>,
+    /// Resize fit mode.
     pub fit: Option<Fit>,
+    /// JPEG quality (1-100).
     pub q: Option<u8>,
+    /// Output format.
     pub format: Option<OutFormat>,
 }
 
 impl RtDbHttpClient {
+    /// Create a client for `db` at `url` authenticated with `token` (a machine
+    /// or session bearer token). A trailing `/` on `url` is trimmed.
     pub fn new(url: &str, db: &str, token: &str) -> Self {
         let url = url.trim_end_matches('/').to_string();
         Self {
@@ -607,6 +636,9 @@ impl RtDbHttpClient {
         self.deserialize::<UploadResult>(resp).await
     }
 
+    /// Delete the file `id` (`DELETE /api/storage/{db}/{id}`) — also revokes
+    /// its public serve URL. Idempotent: deleting an unknown id still returns
+    /// `Ok(())`.
     pub async fn delete_file(&self, id: &str) -> Result<(), RtDbError> {
         let resp = self
             .client
@@ -626,6 +658,7 @@ impl RtDbHttpClient {
         Ok(())
     }
 
+    /// Fetch stored metadata for `id` via `GET /api/storage/{db}/{id}/metadata`.
     pub async fn get_file_metadata(&self, id: &str) -> Result<FileMetadata, RtDbError> {
         let resp = self
             .client
@@ -786,7 +819,7 @@ impl RtDbHttpClient {
 /// and calling the same-named method on it. Gated on the `admin` feature.
 #[cfg(feature = "admin")]
 impl RtDbHttpClient {
-    /// Return a dedicated [`RtDbAdminClient`] sharing this client's connection
+    /// Return a dedicated [`RtDbAdminClient`](crate::admin::RtDbAdminClient) sharing this client's connection
     /// pool. The admin key is the same bearer this client carries. This is the
     /// non-deprecated entry point for admin work; the per-method shims below
     /// exist only for backward compatibility.
@@ -795,16 +828,22 @@ impl RtDbHttpClient {
     }
 
     #[deprecated(note = "use RtDbAdminClient")]
+    /// Deprecated ARC-121 shim — delegates to
+    /// [`RtDbAdminClient::create_db`](crate::admin::RtDbAdminClient::create_db).
     pub async fn create_db(&self, name: &str) -> Result<(), RtDbError> {
         self.admin_client().create_db(name).await
     }
 
     #[deprecated(note = "use RtDbAdminClient")]
+    /// Deprecated ARC-121 shim — delegates to
+    /// [`RtDbAdminClient::delete_db`](crate::admin::RtDbAdminClient::delete_db).
     pub async fn delete_db(&self, name: &str, confirm: &str) -> Result<(), RtDbError> {
         self.admin_client().delete_db(name, confirm).await
     }
 
     #[deprecated(note = "use RtDbAdminClient")]
+    /// Deprecated ARC-121 shim — delegates to
+    /// [`RtDbAdminClient::push_schema`](crate::admin::RtDbAdminClient::push_schema).
     pub async fn push_schema(
         &self,
         db: &str,
@@ -814,6 +853,8 @@ impl RtDbHttpClient {
     }
 
     #[deprecated(note = "use RtDbAdminClient")]
+    /// Deprecated ARC-121 shim — delegates to
+    /// [`RtDbAdminClient::migrate_schema`](crate::admin::RtDbAdminClient::migrate_schema).
     pub async fn migrate_schema(
         &self,
         db: &str,
@@ -826,11 +867,15 @@ impl RtDbHttpClient {
     }
 
     #[deprecated(note = "use RtDbAdminClient")]
+    /// Deprecated ARC-121 shim — delegates to
+    /// [`RtDbAdminClient::list_dbs`](crate::admin::RtDbAdminClient::list_dbs).
     pub async fn list_dbs(&self) -> Result<Vec<String>, RtDbError> {
         self.admin_client().list_dbs().await
     }
 
     #[deprecated(note = "use RtDbAdminClient")]
+    /// Deprecated ARC-121 shim — delegates to
+    /// [`RtDbAdminClient::mint_token`](crate::admin::RtDbAdminClient::mint_token).
     pub async fn mint_token(
         &self,
         db: &str,
@@ -840,6 +885,8 @@ impl RtDbHttpClient {
     }
 
     #[deprecated(note = "use RtDbAdminClient")]
+    /// Deprecated ARC-121 shim — delegates to
+    /// [`RtDbAdminClient::mint_token_with_options`](crate::admin::RtDbAdminClient::mint_token_with_options).
     pub async fn mint_token_with_options(
         &self,
         db: &str,
@@ -852,61 +899,85 @@ impl RtDbHttpClient {
     }
 
     #[deprecated(note = "use RtDbAdminClient")]
+    /// Deprecated ARC-121 shim — delegates to
+    /// [`RtDbAdminClient::revoke_token`](crate::admin::RtDbAdminClient::revoke_token).
     pub async fn revoke_token(&self, token_id: &str) -> Result<(), RtDbError> {
         self.admin_client().revoke_token(token_id).await
     }
 
     #[deprecated(note = "use RtDbAdminClient")]
+    /// Deprecated ARC-121 shim — delegates to
+    /// [`RtDbAdminClient::allowlist_add`](crate::admin::RtDbAdminClient::allowlist_add).
     pub async fn allowlist_add(&self, db: &str, email: &str) -> Result<(), RtDbError> {
         self.admin_client().allowlist_add(db, email).await
     }
 
     #[deprecated(note = "use RtDbAdminClient")]
+    /// Deprecated ARC-121 shim — delegates to
+    /// [`RtDbAdminClient::allowlist_remove`](crate::admin::RtDbAdminClient::allowlist_remove).
     pub async fn allowlist_remove(&self, db: &str, email: &str) -> Result<(), RtDbError> {
         self.admin_client().allowlist_remove(db, email).await
     }
 
     #[deprecated(note = "use RtDbAdminClient")]
+    /// Deprecated ARC-121 shim — delegates to
+    /// [`RtDbAdminClient::allowlist_list`](crate::admin::RtDbAdminClient::allowlist_list).
     pub async fn allowlist_list(&self, db: &str) -> Result<Vec<String>, RtDbError> {
         self.admin_client().allowlist_list(db).await
     }
 
     #[deprecated(note = "use RtDbAdminClient")]
+    /// Deprecated ARC-121 shim — delegates to
+    /// [`RtDbAdminClient::admins_list`](crate::admin::RtDbAdminClient::admins_list).
     pub async fn admins_list(&self) -> Result<Vec<crate::wire::admin::AdminMember>, RtDbError> {
         self.admin_client().admins_list().await
     }
 
     #[deprecated(note = "use RtDbAdminClient")]
+    /// Deprecated ARC-121 shim — delegates to
+    /// [`RtDbAdminClient::admins_add`](crate::admin::RtDbAdminClient::admins_add).
     pub async fn admins_add(&self, email: &str, github_id: Option<i64>) -> Result<(), RtDbError> {
         self.admin_client().admins_add(email, github_id).await
     }
 
     #[deprecated(note = "use RtDbAdminClient")]
+    /// Deprecated ARC-121 shim — delegates to
+    /// [`RtDbAdminClient::admins_remove`](crate::admin::RtDbAdminClient::admins_remove).
     pub async fn admins_remove(&self, email: &str) -> Result<(), RtDbError> {
         self.admin_client().admins_remove(email).await
     }
 
     #[deprecated(note = "use RtDbAdminClient")]
+    /// Deprecated ARC-121 shim — delegates to
+    /// [`RtDbAdminClient::export_db`](crate::admin::RtDbAdminClient::export_db).
     pub async fn export_db(&self, db: &str) -> Result<String, RtDbError> {
         self.admin_client().export_db(db).await
     }
 
     #[deprecated(note = "use RtDbAdminClient")]
+    /// Deprecated ARC-121 shim — delegates to
+    /// [`RtDbAdminClient::import_db`](crate::admin::RtDbAdminClient::import_db).
     pub async fn import_db(&self, db: &str, jsonl: &str) -> Result<(), RtDbError> {
         self.admin_client().import_db(db, jsonl).await
     }
 
     #[deprecated(note = "use RtDbAdminClient")]
+    /// Deprecated ARC-121 shim — delegates to
+    /// [`RtDbAdminClient::clone_db`](crate::admin::RtDbAdminClient::clone_db).
     pub async fn clone_db(&self, from: &str, to: &str) -> Result<(), RtDbError> {
         self.admin_client().clone_db(from, to).await
     }
 
     #[deprecated(note = "use RtDbAdminClient")]
+    /// Deprecated ARC-121 shim — delegates to
+    /// [`RtDbAdminClient::get_schema`](crate::admin::RtDbAdminClient::get_schema).
     pub async fn get_schema(&self, db: &str) -> Result<crate::schema::SchemaDef, RtDbError> {
         self.admin_client().get_schema(db).await
     }
 
     #[deprecated(note = "use RtDbAdminClient")]
+    /// Deprecated ARC-121 shim — delegates to
+    /// [`RtDbAdminClient::schema_history`](crate::admin::RtDbAdminClient::schema_history).
     pub async fn schema_history(
         &self,
         db: &str,
@@ -917,6 +988,8 @@ impl RtDbHttpClient {
     }
 
     #[deprecated(note = "use RtDbAdminClient")]
+    /// Deprecated ARC-121 shim — delegates to
+    /// [`RtDbAdminClient::schema_history_get`](crate::admin::RtDbAdminClient::schema_history_get).
     pub async fn schema_history_get(
         &self,
         db: &str,
@@ -926,6 +999,8 @@ impl RtDbHttpClient {
     }
 
     #[deprecated(note = "use RtDbAdminClient")]
+    /// Deprecated ARC-121 shim — delegates to
+    /// [`RtDbAdminClient::restore_schema`](crate::admin::RtDbAdminClient::restore_schema).
     pub async fn restore_schema(
         &self,
         db: &str,
@@ -938,11 +1013,15 @@ impl RtDbHttpClient {
     }
 
     #[deprecated(note = "use RtDbAdminClient")]
+    /// Deprecated ARC-121 shim — delegates to
+    /// [`RtDbAdminClient::db_stats`](crate::admin::RtDbAdminClient::db_stats).
     pub async fn db_stats(&self, db: &str) -> Result<crate::wire::admin::DbStats, RtDbError> {
         self.admin_client().db_stats(db).await
     }
 
     #[deprecated(note = "use RtDbAdminClient")]
+    /// Deprecated ARC-121 shim — delegates to
+    /// [`RtDbAdminClient::list_tokens`](crate::admin::RtDbAdminClient::list_tokens).
     pub async fn list_tokens(
         &self,
         db: &str,
@@ -951,11 +1030,15 @@ impl RtDbHttpClient {
     }
 
     #[deprecated(note = "use RtDbAdminClient")]
+    /// Deprecated ARC-121 shim — delegates to
+    /// [`RtDbAdminClient::metrics`](crate::admin::RtDbAdminClient::metrics).
     pub async fn metrics(&self) -> Result<crate::wire::admin::MetricsSnapshot, RtDbError> {
         self.admin_client().metrics().await
     }
 
     #[deprecated(note = "use RtDbAdminClient")]
+    /// Deprecated ARC-121 shim — delegates to
+    /// [`RtDbAdminClient::list_subscriptions`](crate::admin::RtDbAdminClient::list_subscriptions).
     pub async fn list_subscriptions(
         &self,
         db: Option<&str>,
@@ -964,11 +1047,15 @@ impl RtDbHttpClient {
     }
 
     #[deprecated(note = "use RtDbAdminClient")]
+    /// Deprecated ARC-121 shim — delegates to
+    /// [`RtDbAdminClient::get_config`](crate::admin::RtDbAdminClient::get_config).
     pub async fn get_config(&self) -> Result<crate::wire::admin::ConfigResponse, RtDbError> {
         self.admin_client().get_config().await
     }
 
     #[deprecated(note = "use RtDbAdminClient")]
+    /// Deprecated ARC-121 shim — delegates to
+    /// [`RtDbAdminClient::patch_config`](crate::admin::RtDbAdminClient::patch_config).
     pub async fn patch_config(
         &self,
         patch: &crate::wire::admin::HotConfigPatch,
@@ -977,6 +1064,8 @@ impl RtDbHttpClient {
     }
 
     #[deprecated(note = "use RtDbAdminClient")]
+    /// Deprecated ARC-121 shim — delegates to
+    /// [`RtDbAdminClient::ops_recent`](crate::admin::RtDbAdminClient::ops_recent).
     pub async fn ops_recent(
         &self,
         db: &str,
@@ -987,6 +1076,8 @@ impl RtDbHttpClient {
     }
 
     #[deprecated(note = "use RtDbAdminClient")]
+    /// Deprecated ARC-121 shim — delegates to
+    /// [`RtDbAdminClient::admin_query`](crate::admin::RtDbAdminClient::admin_query).
     pub async fn admin_query<T: DeserializeOwned>(
         &self,
         db: &str,
@@ -998,6 +1089,8 @@ impl RtDbHttpClient {
     }
 
     #[deprecated(note = "use RtDbAdminClient")]
+    /// Deprecated ARC-121 shim — delegates to
+    /// [`RtDbAdminClient::admin_mutate`](crate::admin::RtDbAdminClient::admin_mutate).
     pub async fn admin_mutate(
         &self,
         db: &str,
@@ -1010,26 +1103,36 @@ impl RtDbHttpClient {
     }
 
     #[deprecated(note = "use RtDbAdminClient")]
+    /// Deprecated ARC-121 shim — delegates to
+    /// [`RtDbAdminClient::backup_now`](crate::admin::RtDbAdminClient::backup_now).
     pub async fn backup_now(&self) -> Result<(), RtDbError> {
         self.admin_client().backup_now().await
     }
 
     #[deprecated(note = "use RtDbAdminClient")]
+    /// Deprecated ARC-121 shim — delegates to
+    /// [`RtDbAdminClient::list_backups`](crate::admin::RtDbAdminClient::list_backups).
     pub async fn list_backups(&self) -> Result<crate::wire::admin::BackupsListResponse, RtDbError> {
         self.admin_client().list_backups().await
     }
 
     #[deprecated(note = "use RtDbAdminClient")]
+    /// Deprecated ARC-121 shim — delegates to
+    /// [`RtDbAdminClient::download_backup`](crate::admin::RtDbAdminClient::download_backup).
     pub async fn download_backup(&self, name: &str) -> Result<Vec<u8>, RtDbError> {
         self.admin_client().download_backup(name).await
     }
 
     #[deprecated(note = "use RtDbAdminClient")]
+    /// Deprecated ARC-121 shim — delegates to
+    /// [`RtDbAdminClient::delete_backup`](crate::admin::RtDbAdminClient::delete_backup).
     pub async fn delete_backup(&self, name: &str) -> Result<(), RtDbError> {
         self.admin_client().delete_backup(name).await
     }
 
     #[deprecated(note = "use RtDbAdminClient")]
+    /// Deprecated ARC-121 shim — delegates to
+    /// [`RtDbAdminClient::restore_backup`](crate::admin::RtDbAdminClient::restore_backup).
     pub async fn restore_backup(
         &self,
         name: &str,
@@ -1038,6 +1141,8 @@ impl RtDbHttpClient {
     }
 
     #[deprecated(note = "use RtDbAdminClient")]
+    /// Deprecated ARC-121 shim — delegates to
+    /// [`RtDbAdminClient::list_webhooks`](crate::admin::RtDbAdminClient::list_webhooks).
     pub async fn list_webhooks(
         &self,
         db: &str,
@@ -1046,6 +1151,8 @@ impl RtDbHttpClient {
     }
 
     #[deprecated(note = "use RtDbAdminClient")]
+    /// Deprecated ARC-121 shim — delegates to
+    /// [`RtDbAdminClient::create_webhook`](crate::admin::RtDbAdminClient::create_webhook).
     pub async fn create_webhook(
         &self,
         db: &str,
@@ -1055,6 +1162,8 @@ impl RtDbHttpClient {
     }
 
     #[deprecated(note = "use RtDbAdminClient")]
+    /// Deprecated ARC-121 shim — delegates to
+    /// [`RtDbAdminClient::edit_webhook`](crate::admin::RtDbAdminClient::edit_webhook).
     pub async fn edit_webhook(
         &self,
         db: &str,
@@ -1065,11 +1174,15 @@ impl RtDbHttpClient {
     }
 
     #[deprecated(note = "use RtDbAdminClient")]
+    /// Deprecated ARC-121 shim — delegates to
+    /// [`RtDbAdminClient::delete_webhook`](crate::admin::RtDbAdminClient::delete_webhook).
     pub async fn delete_webhook(&self, db: &str, id: i64) -> Result<(), RtDbError> {
         self.admin_client().delete_webhook(db, id).await
     }
 
     #[deprecated(note = "use RtDbAdminClient")]
+    /// Deprecated ARC-121 shim — delegates to
+    /// [`RtDbAdminClient::list_deliveries`](crate::admin::RtDbAdminClient::list_deliveries).
     pub async fn list_deliveries(
         &self,
         db: &str,
@@ -1080,6 +1193,8 @@ impl RtDbHttpClient {
     }
 
     #[deprecated(note = "use RtDbAdminClient")]
+    /// Deprecated ARC-121 shim — delegates to
+    /// [`RtDbAdminClient::get_audit`](crate::admin::RtDbAdminClient::get_audit).
     pub async fn get_audit(
         &self,
         db: &str,
@@ -1089,6 +1204,8 @@ impl RtDbHttpClient {
     }
 
     #[deprecated(note = "use RtDbAdminClient")]
+    /// Deprecated ARC-121 shim — delegates to
+    /// [`RtDbAdminClient::list_sessions`](crate::admin::RtDbAdminClient::list_sessions).
     pub async fn list_sessions(
         &self,
         opts: Option<&crate::wire::admin::SessionListOptions>,
@@ -1097,11 +1214,15 @@ impl RtDbHttpClient {
     }
 
     #[deprecated(note = "use RtDbAdminClient")]
+    /// Deprecated ARC-121 shim — delegates to
+    /// [`RtDbAdminClient::revoke_session`](crate::admin::RtDbAdminClient::revoke_session).
     pub async fn revoke_session(&self, token_hash: &str) -> Result<(), RtDbError> {
         self.admin_client().revoke_session(token_hash).await
     }
 
     #[deprecated(note = "use RtDbAdminClient")]
+    /// Deprecated ARC-121 shim — delegates to
+    /// [`RtDbAdminClient::revoke_user_sessions`](crate::admin::RtDbAdminClient::revoke_user_sessions).
     pub async fn revoke_user_sessions(
         &self,
         user_id: &str,
@@ -1110,6 +1231,8 @@ impl RtDbHttpClient {
     }
 
     #[deprecated(note = "use RtDbAdminClient")]
+    /// Deprecated ARC-121 shim — delegates to
+    /// [`RtDbAdminClient::merge_users`](crate::admin::RtDbAdminClient::merge_users).
     pub async fn merge_users(
         &self,
         anon_user_id: &str,

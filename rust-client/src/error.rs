@@ -5,13 +5,22 @@ use std::future::Future;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+/// Stable error codes mirroring the server's `error::ErrorCode` one-to-one
+/// (serde `SCREAMING_SNAKE_CASE` on the wire).
 pub enum ErrorCode {
+    /// Missing or invalid credentials (HTTP 401).
     Unauthorized,
+    /// Authenticated but denied — allowlist or per-row-rule rejection (HTTP 403).
     Forbidden,
+    /// Target document does not exist (HTTP 404).
     NotFound,
+    /// Document or schema violates the pushed schema.
     SchemaViolation,
+    /// `expectVersion`/`expectAbsent` mismatch — the retryable write conflict (HTTP 409).
     PreconditionFailed,
+    /// Malformed request or DSL shape.
     BadRequest,
+    /// Server-side failure; carries a generic, non-leaking message (HTTP 500).
     Internal,
     /// Unique-index violation (mirrors server `error::ErrorCode::Conflict`,
     /// HTTP 409). Serialized as `"CONFLICT"` by the container `rename_all`.
@@ -28,30 +37,40 @@ pub enum ErrorCode {
 /// WS error frame). `retry_after` is present only on `RATE_LIMITED`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ErrorEnvelope {
+    /// Stable error code.
     pub code: ErrorCode,
+    /// Human-readable failure description.
     pub message: String,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
         rename = "retryAfter"
     )]
+    /// Seconds to wait, present only on `RATE_LIMITED`.
     pub retry_after: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, thiserror::Error)]
 #[error("{message}")]
+/// The client's error type: every failure surface is this `{code, message}`
+/// envelope (the server's wire error adopted directly). Serializable so a
+/// received wire error round-trips losslessly.
 pub struct RtDbError {
+    /// Stable error code.
     pub code: ErrorCode,
+    /// Human-readable failure description.
     pub message: String,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
         rename = "retryAfter"
     )]
+    /// Seconds to wait, present only on `RATE_LIMITED`.
     pub retry_after: Option<u32>,
 }
 
 impl RtDbError {
+    /// Build an error from a code and message.
     pub fn new(code: ErrorCode, message: impl Into<String>) -> Self {
         Self {
             code,
@@ -60,6 +79,7 @@ impl RtDbError {
         }
     }
 
+    /// Adopt a wire-received envelope as the error (no field changes).
     pub fn from_envelope(env: ErrorEnvelope) -> Self {
         Self {
             code: env.code,
@@ -68,6 +88,7 @@ impl RtDbError {
         }
     }
 
+    /// Shorthand for `ErrorCode::Internal`.
     pub fn internal(message: impl Into<String>) -> Self {
         Self::new(ErrorCode::Internal, message)
     }

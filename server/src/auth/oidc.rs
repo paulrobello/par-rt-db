@@ -1,3 +1,6 @@
+//! Generic OIDC provider (`/auth/oidc/*`): discovery-driven issuer, so any
+//! compliant IdP works via `RTDB_OIDC_*` env. See `docs/OAUTH_SETUP.md`.
+
 use std::sync::Arc;
 
 use async_trait::async_trait;

@@ -37,6 +37,8 @@
 //! storage), and the design spec
 //! (`docs/superpowers/specs/2026-07-22-rust-client-design.md`).
 
+#![warn(missing_docs)]
+
 pub mod cursor;
 pub mod error;
 pub mod mutation;

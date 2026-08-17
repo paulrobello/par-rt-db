@@ -75,6 +75,7 @@ pub enum ConnectionState {
 /// Snapshot of the client's connection + auth state.
 #[derive(Debug, Clone, Default)]
 pub struct ClientStatus {
+    /// Current connection state.
     pub state: ConnectionState,
     /// The authed user once `authOk` has arrived; `None` otherwise.
     pub user: Option<AuthedUser>,
