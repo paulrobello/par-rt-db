@@ -1894,7 +1894,7 @@ async fn sec120_admin_login_session_is_listed_and_revocable() -> anyhow::Result<
     // revokes it — after which the cookie no longer authenticates.
     let state = test_state().await;
     let addr = spawn_app(state).await;
-    let (client, _session, _csrf) = admin_login_cookies(addr).await;
+    let (client, session, _csrf) = admin_login_cookies(addr).await;
 
     // The cookie-authenticated client can hit an admin GET before revocation.
     let resp = client
@@ -1915,9 +1915,14 @@ async fn sec120_admin_login_session_is_listed_and_revocable() -> anyhow::Result<
     let sessions = body["sessions"]
         .as_array()
         .expect("sessions array in /admin/sessions");
+    // Match OUR session's tokenHash, not just any "(admin key)" row: tests in
+    // this binary run in parallel against the shared rtdb_auth, so several
+    // admin-key sessions are live at once — revoking a sibling test's row
+    // would leave ours valid and the final 401 assert flaky.
+    let own_hash = db::sha256_hex(&session);
     let admin_row = sessions
         .iter()
-        .find(|s| s["userId"].as_str() == Some("(admin key)"))
+        .find(|s| s["tokenHash"].as_str() == Some(own_hash.as_str()))
         .expect("SEC-120: admin-key login session appears in /admin/sessions");
     let hash = admin_row["tokenHash"]
         .as_str()
