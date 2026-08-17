@@ -18,6 +18,21 @@ contract against Convex.
 > dated subsections below are chronological within `[Unreleased]`, not released
 > versions.
 
+### Dev-db hygiene: `dev-db-clean` autocommit + `sc_` sweep
+
+`make dev-db-clean` rolled back wholesale with "out of shared memory" once
+leaked test schemas passed ~2.2k — the script dropped every schema in one
+DO-block transaction, and the catalog locks of thousands of cascading DROPs
+exceed `max_locks_per_transaction`. The script now generates the DROPs and
+executes them through psql `\gexec` in autocommit mode: each schema drop
+commits on its own, so progress is durable and an interruption resumes where
+it stopped (the script stays idempotent). Its pattern set now also covers the
+semantics-corpus runner's `sc_<stem>_<12hex>` databases (schemas +
+`rtdb_auth` registry rows) — the runner self-cleans through the same RAII
+harness as the integration suites, but its abort-tail had leaked 12 databases
+that no cleaner pattern matched. Verified live against 2,324 leaked schemas:
+exit 0, zero remaining.
+
 ### Property-based parity testing + int64 filter-comparison engine fix (ENH-027)
 
 `server/tests/proptest_parity.rs` generates schemas/documents/queries —
