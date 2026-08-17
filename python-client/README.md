@@ -293,7 +293,9 @@ from par_rt_db import Mutation
 from par_rt_db.wire import StepRetry, WorkflowSpec, WorkflowStepSpec
 from par_rt_db.ws_client import RtDbClient  # or RtDbHttpClient from par_rt_db.http_client
 
-db = RtDbClient("wss://rtdb.pardev.net", "mydb", get_token=get_token)  # as in the reactive example above
+db = RtDbClient(
+    "wss://rtdb.pardev.net", "mydb", get_token=get_token
+)  # as in the reactive example above
 
 txn = Mutation.builder().insert("work_items", {"title": "welcome"}).build()
 txn2 = Mutation.builder().insert("work_items", {"title": "follow-up"}).build()
