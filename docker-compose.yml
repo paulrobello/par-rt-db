@@ -81,9 +81,10 @@ services:
       RTDB_ANONYMOUS_SESSION_TTL_DAYS: ${RTDB_ANONYMOUS_SESSION_TTL_DAYS:-1}
       RTDB_ANONYMOUS_RATE_LIMIT_PER_IP_RPM: ${RTDB_ANONYMOUS_RATE_LIMIT_PER_IP_RPM:-10}
       # SEC-109: per-IP rate limit on POST /admin/login to bound admin-key
-      # brute-force. 0 = unlimited (code default); the shipped default turns
-      # the mitigation on out-of-the-box. Each failure also increments the
-      # rtdb_admin_auth_failures_total counter and logs at WARN.
+      # brute-force. 0 = unlimited; 10 is also the code default (SEC-203) —
+      # the shipped default keeps the mitigation on out-of-the-box. Each
+      # failure also increments the rtdb_admin_auth_failures_total counter
+      # and logs at WARN.
       RTDB_ADMIN_RATE_LIMIT_PER_IP_RPM: ${RTDB_ADMIN_RATE_LIMIT_PER_IP_RPM:-10}
       # SEC-120: cookie Secure attribute ships on by default — a misconfigured
       # proxy that strips X-Forwarded-Proto can no longer cause a session cookie
@@ -104,10 +105,11 @@ services:
       # .env.example default.
       RTDB_AUDIT_LOG_ENABLED: ${RTDB_AUDIT_LOG_ENABLED:-false}
       # Per-IP rate limit on the public storage serve route (SEC-004 / SEC-112).
-      # 0 = off. Shipped default is 600 RPM (10/sec) — the on-the-fly image
-      # transform path amplifies cost per request, and the route is
-      # unauthenticated, so leaving this off invites a cost flood. Set 0 only
-      # when an upstream proxy enforces its own per-IP cap.
+      # 0 = off. Shipped default is 600 RPM (10/sec) — deliberately looser
+      # than the 300 code default (SEC-203) for gallery-heavy traffic; the
+      # on-the-fly image transform path amplifies cost per request, and the
+      # route is unauthenticated, so leaving this off invites a cost flood.
+      # Set 0 only when an upstream proxy enforces its own per-IP cap.
       RTDB_STORAGE_RATE_LIMIT_PER_IP_RPM: ${RTDB_STORAGE_RATE_LIMIT_PER_IP_RPM:-600}
       # SEC-113: require a valid signed URL on every public storage fetch.
       # false (default) keeps the opaque-id-as-bearer-URL behavior (Convex

@@ -102,11 +102,12 @@ pub struct Config {
     pub slow_query_ms: u64,          // RTDB_SLOW_QUERY_MS, default 0 (off)
     pub slow_query_capacity: usize,  // RTDB_SLOW_QUERY_CAPACITY, default 200
     pub slow_query_log_params: bool, // RTDB_SLOW_QUERY_LOG_PARAMS, default false
-    // HTTP rate limiting (v1, fixed-window, in-memory): 0 = unlimited.
+    // HTTP rate limiting (v1, fixed-window, in-memory). These two bound
+    // *authenticated* traffic, so they deliberately stay 0 = unlimited
+    // (SEC-203 carve-out): a surprise non-zero default here can break real
+    // apps' legitimate throughput — opt in per deploy. 0 disables.
     // RTDB_RATE_LIMIT_PER_TOKEN_RPM caps each machine token; OAuth sessions
-    // carry no token id and are rate-limited per-db only. Default 0 preserves
-    // today's unlimited behavior; one noisy app on a multi-db instance can
-    // otherwise starve the others.
+    // carry no token id and are rate-limited per-db only.
     pub rate_limit_per_token_rpm: u32,
     pub rate_limit_per_db_rpm: u32, // RTDB_RATE_LIMIT_PER_DB_RPM, shared across all principals of one db
     // Durable audit log (global `rtdb.audit_log` table): when true, the
@@ -135,11 +136,11 @@ pub struct Config {
     // multicast, or cloud-metadata address. RTDB_WEBHOOK_ALLOW_HTTP.
     pub webhook_allow_http: bool,
     // Per-IP rate limit on the unauthenticated `GET /storage/{id}` route
-    // (SEC-004). 0 = unlimited (the default). The opaque blob id is not
-    // enumerable, but a holder of one valid id can otherwise hammer the route
-    // without bound — the on-the-fly image-transform path amplifies cost
-    // (each distinct `?w=&h=&...` set misses the cache and burns decode CPU).
-    // RTDB_STORAGE_RATE_LIMIT_PER_IP_RPM.
+    // (SEC-004 / SEC-203). Default 300 RPM — blob serving is high-volume
+    // legitimate traffic, but the opaque id is not a license to hammer the
+    // route: the on-the-fly image-transform path amplifies cost (each
+    // distinct `?w=&h=&...` set misses the cache and burns decode CPU).
+    // 0 disables. RTDB_STORAGE_RATE_LIMIT_PER_IP_RPM.
     pub storage_rate_limit_per_ip_rpm: u32,
     // SEC-113: when true, the public storage serve route (`GET /storage/{id}`)
     // requires a valid `?exp=&sig=` pair on every request — a holder of the
@@ -240,14 +241,13 @@ pub struct Config {
     /// accumulating as permanent `rtdb_auth.users`/`rtdb_auth.sessions` rows
     /// (SEC-103). Boot-only (not hot-reloadable).
     pub anonymous_session_ttl_days: i64,
-    /// RTDB_ANONYMOUS_RATE_LIMIT_PER_IP_RPM (default 0 = unlimited in code;
-    /// the shipped `.env.example`/`docker-compose.yml` set a non-zero default
-    /// so the mitigation is on out-of-the-box). Per-IP fixed-window rate limit
-    /// on the unauthenticated `POST /auth/anonymous` route — without it, an
-    /// attacker can mint unbounded anonymous users/sessions by hitting the
-    /// endpoint in a loop (SEC-103). The IP key is canonicalized by
-    /// `client_ip_key` (CF-Connecting-IP preferred, rightmost XFF fallback).
-    /// Boot-only (not hot-reloadable).
+    /// RTDB_ANONYMOUS_RATE_LIMIT_PER_IP_RPM (default 10; 0 disables — SEC-203).
+    /// Per-IP fixed-window rate limit on the unauthenticated
+    /// `POST /auth/anonymous` route — without it, an attacker can mint
+    /// unbounded anonymous users/sessions by hitting the endpoint in a loop
+    /// (SEC-103). The IP key is canonicalized by `client_ip_key`
+    /// (CF-Connecting-IP preferred, rightmost XFF fallback — trusted-proxy
+    /// gated). Boot-only (not hot-reloadable).
     pub anonymous_rate_limit_per_ip_rpm: u32,
     /// RTDB_QUOTA_CACHE_TTL_SECS (default 60). TTL for the per-db quota
     /// counters (table count, storage bytes, active subs) maintained by the
@@ -265,14 +265,13 @@ pub struct Config {
     /// next request respawns the tasks on demand. 0 preserves today's behavior
     /// (tasks live for the process once spawned). Boot-only (not hot-reloadable).
     pub db_idle_reclaim_secs: u64,
-    /// RTDB_ADMIN_RATE_LIMIT_PER_IP_RPM (default 0 = unlimited). Per-IP fixed-
-    /// window rate limit on `POST /admin/login` (SEC-109) — without it, an
-    /// attacker can brute-force the admin key unbounded over the public
-    /// endpoint. 0 preserves today's unlimited behavior (the limiter is off
-    /// unless an operator opts in); a non-zero value like 10 means one IP gets
-    /// 10 admin-login attempts per minute before 429. The IP key is
-    /// canonicalized by `client_ip_key` (CF-Connecting-IP preferred, rightmost
-    /// XFF fallback). Boot-only (not hot-reloadable).
+    /// RTDB_ADMIN_RATE_LIMIT_PER_IP_RPM (default 10; 0 disables — SEC-203).
+    /// Per-IP fixed-window rate limit on `POST /admin/login` (SEC-109) —
+    /// without it, an attacker can brute-force the admin key unbounded over
+    /// the public endpoint. 10 means one IP gets 10 admin-login attempts per
+    /// minute before 429. The IP key is canonicalized by `client_ip_key`
+    /// (CF-Connecting-IP preferred, rightmost XFF fallback — trusted-proxy
+    /// gated). Boot-only (not hot-reloadable).
     pub admin_rate_limit_per_ip_rpm: u32,
     /// RTDB_COOKIE_SECURE (default true). When true, the `Secure` attribute is
     /// set on every session/CSRF cookie unconditionally — a misconfigured proxy
@@ -496,7 +495,9 @@ impl Config {
 
         // Per-IP rate limit on the public storage route (SEC-004). 0 = off,
         // matching the existing per-token/per-db limiter convention.
-        let storage_rate_limit_per_ip_rpm = env_parsed("RTDB_STORAGE_RATE_LIMIT_PER_IP_RPM", 0u32)?;
+        // SEC-203: non-zero default — see the field doc above.
+        let storage_rate_limit_per_ip_rpm =
+            env_parsed("RTDB_STORAGE_RATE_LIMIT_PER_IP_RPM", 300u32)?;
 
         // SEC-113: require a valid signed URL on every public storage fetch.
         // Default false (Convex-parity: opaque public bearer URLs); operators
@@ -587,7 +588,7 @@ impl Config {
         // (the code default; the shipped `.env.example`/`docker-compose.yml`
         // set a non-zero default so the mitigation is on out-of-the-box).
         let anonymous_rate_limit_per_ip_rpm =
-            env_parsed("RTDB_ANONYMOUS_RATE_LIMIT_PER_IP_RPM", 0u32)?;
+            env_parsed("RTDB_ANONYMOUS_RATE_LIMIT_PER_IP_RPM", 10u32)?;
 
         // Quota counter cache TTL (ENH-011). 0 = no caching.
         let quota_cache_ttl_secs = env_parsed("RTDB_QUOTA_CACHE_TTL_SECS", 60u64)?;
@@ -599,7 +600,7 @@ impl Config {
 
         // SEC-109: per-IP rate limit on `POST /admin/login`. 0 = unlimited
         // (the default), preserving today's behavior.
-        let admin_rate_limit_per_ip_rpm = env_parsed("RTDB_ADMIN_RATE_LIMIT_PER_IP_RPM", 0u32)?;
+        let admin_rate_limit_per_ip_rpm = env_parsed("RTDB_ADMIN_RATE_LIMIT_PER_IP_RPM", 10u32)?;
 
         // SEC-120: cookie `Secure` attribute ships ON by default. An explicit
         // "false"/"0"/"no" (case-insensitive) is the local-http-dev escape
@@ -1256,18 +1257,22 @@ mod tests {
             let c = Config::from_env().expect("from_env with required vars set");
             assert!(!c.presence_enabled);
 
-            // SEC-109: RTDB_ADMIN_RATE_LIMIT_PER_IP_RPM defaults to 0 (off)
-            // and parses a non-zero override. ARC-118 (folded with QA-106):
-            // a present-but-unparseable value now fails boot loudly via
-            // `env_parsed` instead of silently reverting to the default — the
-            // silent-default-on-typo failure mode that could disable a safety
-            // net (e.g. RTDB_SUBS_VERIFY_SKIP_EVERY, ARC-101).
+            // SEC-109/SEC-203: RTDB_ADMIN_RATE_LIMIT_PER_IP_RPM defaults to
+            // 10 (0 disables) and parses an explicit override. ARC-118
+            // (folded with QA-106): a present-but-unparseable value now fails
+            // boot loudly via `env_parsed` instead of silently reverting to
+            // the default — the silent-default-on-typo failure mode that
+            // could disable a safety net (e.g. RTDB_SUBS_VERIFY_SKIP_EVERY,
+            // ARC-101).
             std::env::remove_var("RTDB_ADMIN_RATE_LIMIT_PER_IP_RPM");
             let c = Config::from_env().expect("from_env with required vars set");
-            assert_eq!(c.admin_rate_limit_per_ip_rpm, 0, "default is 0 = off");
-            std::env::set_var("RTDB_ADMIN_RATE_LIMIT_PER_IP_RPM", "10");
+            assert_eq!(c.admin_rate_limit_per_ip_rpm, 10, "default is 10 (SEC-203)");
+            std::env::set_var("RTDB_ADMIN_RATE_LIMIT_PER_IP_RPM", "0");
             let c = Config::from_env().expect("from_env with required vars set");
-            assert_eq!(c.admin_rate_limit_per_ip_rpm, 10);
+            assert_eq!(c.admin_rate_limit_per_ip_rpm, 0, "explicit 0 disables");
+            std::env::set_var("RTDB_ADMIN_RATE_LIMIT_PER_IP_RPM", "25");
+            let c = Config::from_env().expect("from_env with required vars set");
+            assert_eq!(c.admin_rate_limit_per_ip_rpm, 25);
             std::env::set_var("RTDB_ADMIN_RATE_LIMIT_PER_IP_RPM", "not-a-number");
             let err = Config::from_env()
                 .expect_err("ARC-118: malformed numeric must fail boot, not default");

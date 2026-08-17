@@ -13,6 +13,18 @@ contract against Convex.
 
 ## [Unreleased]
 
+### Security: non-zero per-IP rate-limit defaults (SEC-203)
+
+Code defaults change from 0 (off) to: `RTDB_ADMIN_RATE_LIMIT_PER_IP_RPM`
+0→10, `RTDB_ANONYMOUS_RATE_LIMIT_PER_IP_RPM` 0→10,
+`RTDB_STORAGE_RATE_LIMIT_PER_IP_RPM` 0→300. Explicit `0` still disables each.
+Behavior change only for bare-env deployments that set no env vars — the
+shipped `docker-compose.yml` already set 10/10/600 (compose keeps its
+deliberately looser 600 for gallery-heavy traffic; `.env.example` now ships
+300). `RTDB_RATE_LIMIT_PER_TOKEN_RPM` / `RTDB_RATE_LIMIT_PER_DB_RPM`
+deliberately stay 0: they bound authenticated traffic, where a surprise
+non-zero default can break real apps — opt in per deploy.
+
 ### Security: forwarding headers gated on `RTDB_TRUSTED_PROXY` (SEC-201)
 
 `CF-Connecting-IP` / `X-Forwarded-For` (per-IP rate-limit keys on the public
