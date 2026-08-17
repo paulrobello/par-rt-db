@@ -237,11 +237,15 @@ failing test.
   `is_admin` re-runs on every admin op. Don't add a cached auth check that
   bypasses this.
 - **Op-feed tap** — durable document mutations publish through the committer's
-  four tap sites (`handle_mutate`, `handle_scheduled`, `handle_migrate`, and
-  `handle_reaper` in `committer.rs`; plus `handle_restore_schema` for the
-  schema-restore arm). Any new code path that commits a document txn must
-  publish at the same tap sites, or the op-feed (and `/admin/stream`, the
-  audit log, and the webhook outbox) will silently miss those writes.
+  single enforcement point: every `handle_*` arm in `committer.rs` that commits
+  a document txn calls `publish_taps` — currently seven (`handle_mutate`,
+  `handle_scheduled`, `handle_migrate`, `handle_reaper`,
+  `handle_restore_schema`, `handle_merge_users`, `handle_workflow_advance`;
+  see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the canonical list and
+  each arm's `source` tag). Any new code path that commits a document txn must
+  publish through `publish_taps` the same way, or the op-feed (and
+  `/admin/stream`, the audit log, and the webhook outbox) will silently miss
+  those writes.
 - **Storage bypasses the committer** — `storage::put` writes directly to the
   `storage` side table because blobs don't touch document tables or
   subscriptions. `GET /storage/{id}` is the only unauthenticated route; keep
