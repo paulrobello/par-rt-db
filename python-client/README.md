@@ -64,6 +64,11 @@ pip install par-rt-db[ws]      # reactive WebSocket client (live queries, WS mut
 
 The DSL layer has no third-party dependency beyond pydantic.
 
+> **Docstring convention:** public APIs use Google-style docstrings
+> (`Args:` / `Returns:` / `Raises:`). The rollout across the package's
+> modules is incremental — new and edited docstrings follow the convention;
+> older prose docstrings convert on touch.
+
 Editable install for development:
 
 ```bash
