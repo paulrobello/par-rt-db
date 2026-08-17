@@ -5,12 +5,16 @@
 use base64::Engine;
 use serde_json::Value;
 
+/// Base64-encode a cursor keyset `[indexValues..., createdAt, id]` into the
+/// opaque server cursor format.
 pub fn encode_cursor(values: &[Value]) -> Result<String, crate::error::RtDbError> {
     let json = serde_json::to_string(values)
         .map_err(|e| crate::error::RtDbError::internal(format!("cursor encode failed: {e}")))?;
     Ok(base64::engine::general_purpose::STANDARD.encode(json))
 }
 
+/// Decode an opaque cursor back into its keyset values. Errors on non-base64
+/// or non-JSON input.
 pub fn decode_cursor(s: &str) -> Result<Vec<Value>, crate::error::RtDbError> {
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(s)

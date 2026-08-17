@@ -6,48 +6,71 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+/// Sort direction for `order` (wire `asc`/`desc`).
 pub enum Order {
+    /// Ascending.
     Asc,
+    /// Descending.
     Desc,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+/// Cursor-pagination terminal parameters.
 pub struct Paginate {
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// Opaque cursor from a previous page; `None` starts at the first page.
     pub cursor: Option<String>,
+    /// Page size.
     pub num_items: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
+/// The wire `Query` — one table plus at most one read terminal. Built via
+/// [`TableQuery`] (or constructed directly); sent with `POST /api/query` / WS
+/// `Query`.
 pub struct Query {
+    /// Table name.
     pub table: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Point-read terminal: the document id.
     pub get: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Index name for eq/range access.
     pub index: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// Eq-prefix values bound to the index's leading fields.
     pub eq: Vec<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Exclusive lower bound on the index field after the eq prefix.
     pub gt: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Inclusive lower bound on the index field after the eq prefix.
     pub gte: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Exclusive upper bound on the index field after the eq prefix.
     pub lt: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Inclusive upper bound on the index field after the eq prefix.
     pub lte: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Sort direction over the index.
     pub order: Option<Order>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// `take(N)` terminal: first N rows.
     pub take: Option<u32>,
     #[serde(default, skip_serializing_if = "is_false")]
+    /// `unique` terminal: the one matching row or `null` (error on >1).
     pub unique: bool,
     #[serde(default, skip_serializing_if = "is_false")]
+    /// `first` terminal: the first matching row or `null`.
     pub first: bool,
     #[serde(default, skip_serializing_if = "is_false")]
+    /// `count` terminal: number of matching rows.
     pub count: bool,
     #[serde(default, skip_serializing_if = "is_false")]
+    /// `distinct` terminal: unique values of the index field after the eq prefix.
     pub distinct: bool,
     /// Aggregate terminal: SUM/AVG/MIN/MAX over the index field after the eq
     /// prefix; `group_by` shifts to a grouped aggregate. Mutually exclusive with
@@ -55,6 +78,7 @@ pub struct Query {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub aggregate: Option<AggregateSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Cursor-pagination terminal.
     pub paginate: Option<Paginate>,
     /// Additional db-side WHERE predicate over doc fields; composes with
     /// index/order/take/cursor.
@@ -95,9 +119,14 @@ fn is_false(b: &bool) -> bool {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
+/// One page of cursor-paginated results. Feed `next_cursor` back into the
+/// next `paginate` call; `None` after the last page. `#[non_exhaustive]` so
+/// the wire shape can gain fields without breaking destructuring consumers.
 pub struct Paginated<T> {
+    /// This page's rows.
     pub docs: Vec<T>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// Cursor for the next page; `None` when exhausted.
     pub next_cursor: Option<String>,
 }
 
@@ -112,6 +141,7 @@ pub struct Paginated<T> {
 /// literal names the field.
 #[derive(Debug, Clone, Default)]
 pub struct VectorSearchOpts {
+    /// Server-side `FilterExpr` narrowing the vector search `WHERE`.
     pub filter: Option<FilterExpr>,
 }
 
@@ -129,8 +159,11 @@ impl From<()> for VectorSearchOpts {
 /// without minding positional order.
 #[derive(Debug, Clone, Default)]
 pub struct HybridSearchOpts {
+    /// Name the search index (auto-selected when `None`).
     pub search_index: Option<String>,
+    /// Name the vector index (auto-selected when `None`).
     pub vector_index: Option<String>,
+    /// RRF constant (server default when `None`).
     pub k: Option<u32>,
 }
 
@@ -155,8 +188,11 @@ impl From<()> for HybridSearchOpts {
 /// a `SearchOpts { .. }` literal names the fields.
 #[derive(Debug, Clone, Default)]
 pub struct SearchOpts {
+    /// Server-side `FilterExpr` narrowing the search `WHERE`.
     pub filter: Option<FilterExpr>,
+    /// `Some(SearchMode::Trgm)` opts into substring/autocomplete matching (FM-30).
     pub mode: Option<SearchMode>,
+    /// `Some(true)` attaches a `_searchSnippet` highlight per hit (FM-31, tsquery mode only).
     pub snippet: Option<bool>,
 }
 
@@ -172,6 +208,7 @@ pub struct TableQuery {
 }
 
 impl TableQuery {
+    /// Start building a query over `table`.
     pub fn new(table: &str) -> Self {
         Self {
             q: Query {
@@ -192,27 +229,34 @@ impl TableQuery {
         }
     }
 
+    /// Use `index` with the given eq-prefix values (one per leading index
+    /// field).
     pub fn with_index(mut self, index: &str, eq: &[serde_json::Value]) -> Self {
         self.q.index = Some(index.into());
         self.q.eq = eq.to_vec();
         self
     }
+    /// Exclusive lower bound on the index field after the eq prefix.
     pub fn gt(mut self, v: impl Into<serde_json::Value>) -> Self {
         self.q.gt = Some(v.into());
         self
     }
+    /// Inclusive lower bound on the index field after the eq prefix.
     pub fn gte(mut self, v: impl Into<serde_json::Value>) -> Self {
         self.q.gte = Some(v.into());
         self
     }
+    /// Exclusive upper bound on the index field after the eq prefix.
     pub fn lt(mut self, v: impl Into<serde_json::Value>) -> Self {
         self.q.lt = Some(v.into());
         self
     }
+    /// Inclusive upper bound on the index field after the eq prefix.
     pub fn lte(mut self, v: impl Into<serde_json::Value>) -> Self {
         self.q.lte = Some(v.into());
         self
     }
+    /// Sort direction over the index.
     pub fn order(mut self, o: Order) -> Self {
         self.q.order = Some(o);
         self
@@ -316,21 +360,26 @@ impl TableQuery {
         self
     }
 
+    /// Finish with the `take(N)` terminal.
     pub fn take(mut self, n: u32) -> Query {
         self.q.take = Some(n);
         self.q
     }
+    /// Finish with the collect-all terminal (`Vec<T>`).
     pub fn collect(self) -> Query {
         self.q
     }
+    /// Finish with the `unique` terminal (one row or `null`).
     pub fn unique(mut self) -> Query {
         self.q.unique = true;
         self.q
     }
+    /// Finish with the `first` terminal (first row or `null`).
     pub fn first(mut self) -> Query {
         self.q.first = true;
         self.q
     }
+    /// Finish with the `count` terminal (`i64`).
     pub fn count(mut self) -> Query {
         self.q.count = true;
         self.q
@@ -359,6 +408,8 @@ impl TableQuery {
         self.q.aggregate = Some(AggregateSpec { op, group_by });
         self.q
     }
+    /// Finish with the cursor-pagination terminal. Pass the previous page's
+    /// `next_cursor` (or `None` to start) and the page size.
     pub fn paginate(mut self, cursor: Option<&str>, num_items: u32) -> Query {
         self.q.paginate = Some(Paginate {
             cursor: cursor.map(|c| c.into()),
@@ -366,6 +417,7 @@ impl TableQuery {
         });
         self.q
     }
+    /// Finish with no terminal wrapper — return the raw `Query`.
     pub fn build(self) -> Query {
         self.q
     }

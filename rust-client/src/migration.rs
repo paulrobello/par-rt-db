@@ -30,6 +30,7 @@ pub struct Migration {
 }
 
 impl Migration {
+    /// Start an empty migration (no directives, `dry_run` off).
     pub fn new() -> Self {
         Self {
             directives: Vec::new(),
@@ -37,6 +38,8 @@ impl Migration {
         }
     }
 
+    /// Queue a `renameField` directive — re-keys the field (and its index
+    /// entries / defaults map) without touching stored values.
     pub fn rename_field(mut self, table: &str, from: &str, to: &str) -> Self {
         self.directives.push(Directive::RenameField {
             table: table.into(),
@@ -46,6 +49,7 @@ impl Migration {
         self
     }
 
+    /// Queue a `renameTable` directive.
     pub fn rename_table(mut self, from: &str, to: &str) -> Self {
         self.directives.push(Directive::RenameTable {
             from: from.into(),
@@ -54,6 +58,9 @@ impl Migration {
         self
     }
 
+    /// Queue a `changeType` directive — coerce `field` to `to` via the closed
+    /// `cast`; `default` substitutes for un-coercible rows (without it one bad
+    /// value rolls the whole migrate back atomically).
     pub fn change_type(
         mut self,
         table: &str,
@@ -72,6 +79,7 @@ impl Migration {
         self
     }
 
+    /// Queue a `dropField` directive (destructive).
     pub fn drop_field(mut self, table: &str, field: &str) -> Self {
         self.directives.push(Directive::DropField {
             table: table.into(),
@@ -80,12 +88,14 @@ impl Migration {
         self
     }
 
+    /// Queue a `dropTable` directive (destructive).
     pub fn drop_table(mut self, name: &str) -> Self {
         self.directives
             .push(Directive::DropTable { name: name.into() });
         self
     }
 
+    /// Queue a `dropIndex` directive.
     pub fn drop_index(mut self, table: &str, name: &str) -> Self {
         self.directives.push(Directive::DropIndex {
             table: table.into(),
@@ -94,6 +104,8 @@ impl Migration {
         self
     }
 
+    /// Queue a `setDefault` directive — stamps `value` onto every existing row
+    /// missing the field.
     pub fn set_default(mut self, table: &str, field: &str, value: Value) -> Self {
         self.directives.push(Directive::SetDefault {
             table: table.into(),

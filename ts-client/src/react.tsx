@@ -35,6 +35,10 @@ function useContextValue(): RtDbContextValue {
   return ctx;
 }
 
+/** Required React context provider around every hook in this module. Tracks
+ * the client's auth state (re-rendering on sign-in/out) and, in token mode,
+ * hydrates/persists the session token from `localStorage`; `authBaseUrl` is
+ * the server's HTTP origin used for the OAuth popup and logout. */
 export function RtDbProvider(props: {
   client: RtDbClient;
   authBaseUrl: string;
@@ -83,6 +87,11 @@ export function useRtDbClient(): RtDbClient {
   return useContextValue().client;
 }
 
+/** Subscribe to a live query built by `createApi` (`api.items.query()...`).
+ * Returns the query's current result, `undefined` until the first update
+ * arrives, and re-renders on every push. Pass `"skip"` to hold the
+ * subscription off (result stays `undefined`). Re-subscribes when the
+ * serialized query shape changes; an identical shape does not. */
 export function useQuery<R>(query: RtQuery<R> | "skip"): R | undefined {
   const { client } = useContextValue();
   const [value, setValue] = useState<R | undefined>(undefined);
@@ -108,6 +117,8 @@ export function useQuery<R>(query: RtQuery<R> | "skip"): R | undefined {
   return value;
 }
 
+/** Returns a stable `mutate(txn)` function that runs a transaction over the
+ * provider's client and resolves with one `StepResult` per step. */
 export function useMutation(): (txn: TransactionJson) => Promise<StepResult[]> {
   const { client } = useContextValue();
   return useCallback((txn: TransactionJson) => client.mutate(txn), [client]);
@@ -167,6 +178,11 @@ export function useConnectionState(): ConnectionState {
  *  exports cannot drift apart. Keep this in sync with `server/src/auth`. */
 export type OAuthProvider = "github" | "google" | "gitlab" | "microsoft" | "apple" | "oidc";
 
+/** The auth surface for React: current `state` + `user`, plus `signIn`
+ * (OAuth popup; provider defaults to GitHub), `signInAnonymous` (gated by
+ * the server's anonymous flag), and `signOut`. Works in both cookie mode
+ * (HttpOnly session cookie; no script-readable credential) and token mode
+ * (`getToken` + storage). */
 export function useRtDbAuth(): {
   state: AuthState;
   user: AuthedUser | null;

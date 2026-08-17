@@ -443,26 +443,35 @@ export class RtDbClient {
   // params. The http client is rebuilt per call rather than cached so a rotated
   // token (setToken / re-auth) is always reflected.
 
+  /** Upload raw bytes (`Uint8Array`/`ArrayBuffer`/`Blob`/`ReadableStream`) to
+   * `POST /api/storage/{db}`; resolves with `{ id, sha256, size, contentType }`. */
   upload(body: UploadInput, contentType?: string) {
     return this.httpForStorage().upload(body, contentType);
   }
 
+  /** Delete a stored file — also revokes its public serve URL (idempotent). */
   deleteFile(id: string) {
     return this.httpForStorage().deleteFile(id);
   }
 
+  /** Fetch stored metadata: `{ id, sha256, size, contentType?, creationTime }`. */
   getFileMetadata(id: string) {
     return this.httpForStorage().getFileMetadata(id);
   }
 
+  /** Mint an HMAC-signed, time-limited public URL for one blob (default 1h,
+   * max 7d). Unlike `getUrl` this makes a network request. */
   getSignedUrl(id: string, ttlSeconds?: number) {
     return this.httpForStorage().getSignedUrl(id, ttlSeconds);
   }
 
+  /** The public serve URL for `id` — no request is made. */
   getUrl(id: string) {
     return this.httpForStorage().getUrl(id);
   }
 
+  /** The public serve URL with image-transform params appended (`w`/`h`/`fit`/
+   * `q`/`format`) — no request is made. */
   transformUrl(id: string, opts: TransformOpts) {
     return this.httpForStorage().transformUrl(id, opts);
   }

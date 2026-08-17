@@ -6,6 +6,7 @@ use crate::mutation::Transaction;
 use crate::query::Query;
 use serde::{Deserialize, Serialize};
 
+/// Alias kept for naming continuity with the server's protocol module.
 pub type QueryRef = Query;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -15,75 +16,122 @@ pub type QueryRef = Query;
     rename_all_fields = "camelCase",
     deny_unknown_fields
 )]
+/// A client -> server `/sync` frame (tagged `{"type": "..."}`, camelCase).
 pub enum ClientMessage {
+    /// Authenticate the socket (first frame).
     Auth {
         // SEC-001 phase 2: optional — a browser dashboard authenticates over
         // `/sync` from the HttpOnly cookie, sending only `db`. CLI/SDK/machine
         // tokens still send `token` (the prior wire form); backward-compatible.
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        /// Bearer token; `None` when authenticating from the session cookie.
         token: Option<String>,
+        /// The database to authorize against.
         db: String,
     },
+    /// Start a live query subscription.
     Subscribe {
+        /// Caller-chosen correlation id for subsequent updates.
         query_id: String,
+        /// The built query.
         query: Box<Query>,
     },
+    /// Stop a subscription.
     Unsubscribe {
+        /// The subscription to stop.
         query_id: String,
     },
+    /// Run a transaction.
     Mutate {
+        /// Caller-chosen correlation id for the reply.
         mut_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        /// Optional idempotency key (same key replays the cached result).
         idempotency_key: Option<String>,
+        /// The transaction to apply.
         txn: Transaction,
     },
+    /// Schedule a transaction for later.
     Schedule {
+        /// Caller-chosen correlation id for the reply.
         schedule_id: String,
+        /// One-shot delay/absolute time, or cron.
         when: ScheduleWhen,
+        /// The transaction to fire when due.
         txn: Transaction,
     },
+    /// Cancel a scheduled job.
     CancelSchedule {
+        /// Correlation id for the reply.
         schedule_id: String,
+        /// The job to cancel.
         id: String,
     },
+    /// Pause a cron job.
     PauseSchedule {
+        /// Correlation id for the reply.
         schedule_id: String,
+        /// The job to pause.
         id: String,
     },
+    /// Resume a paused cron job.
     ResumeSchedule {
+        /// Correlation id for the reply.
         schedule_id: String,
+        /// The job to resume.
         id: String,
     },
+    /// List scheduled jobs.
     ListSchedules {
+        /// Correlation id for the reply.
         schedule_id: String,
     },
+    /// Start a durable workflow run.
     StartWorkflow {
+        /// Caller-chosen correlation id for the reply.
         workflow_id: String,
+        /// The run's spec (snapshotted server-side).
         spec: WorkflowSpec,
     },
+    /// Cancel a workflow run.
     CancelWorkflow {
+        /// Correlation id for the reply.
         workflow_id: String,
+        /// The run to cancel.
         id: String,
     },
+    /// List workflow runs.
     ListWorkflows {
+        /// Correlation id for the reply.
         workflow_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        /// Optional lifecycle filter.
         status: Option<WorkflowStatus>,
     },
+    /// Join a presence room (idempotent re-join refreshes `state`).
     Presence {
+        /// Room name.
         room: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        /// Opaque client-supplied presence blob.
         state: Option<serde_json::Value>,
     },
+    /// Update presence state without (re)joining.
     PresenceState {
+        /// Room name.
         room: String,
+        /// The new opaque blob (replaces the old).
         state: serde_json::Value,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        /// Per-state expiry override.
         ttl_ms: Option<u64>,
     },
+    /// Leave a presence room.
     LeavePresence {
+        /// Room to leave.
         room: String,
     },
+    /// Keepalive; the server replies `Pong`.
     Ping,
 }
 
@@ -93,54 +141,89 @@ pub enum ClientMessage {
     rename_all = "camelCase",
     rename_all_fields = "camelCase"
 )]
+/// A server -> client `/sync` frame (tagged `{"type": "..."}`, camelCase).
 pub enum ServerMessage {
+    /// Authentication succeeded.
     AuthOk {
+        /// The authed principal.
         user: AuthedUser,
     },
+    /// Authentication failed; the socket closes.
     AuthErr {
+        /// Why.
         error: RtDbError,
     },
+    /// A live query's new result (sent only on change).
     QueryUpdate {
+        /// Which subscription.
         query_id: String,
+        /// The query's new full result value.
         result: serde_json::Value,
     },
+    /// Transaction applied; one entry per step.
     MutateOk {
+        /// Correlation id from the request.
         mut_id: String,
+        /// Positionally aligned step results.
         results: Vec<serde_json::Value>,
     },
+    /// Transaction failed and rolled back.
     MutateErr {
+        /// Correlation id from the request.
         mut_id: String,
+        /// Why.
         error: RtDbError,
     },
+    /// Subscription rejected (bad query, authz).
     SubscribeErr {
+        /// Which subscription.
         query_id: String,
+        /// Why.
         error: RtDbError,
     },
+    /// Job scheduled.
     ScheduleOk {
+        /// Correlation id from the request.
         schedule_id: String,
+        /// The created job's id.
         id: String,
     },
+    /// Scheduling failed.
     ScheduleErr {
+        /// Correlation id from the request.
         schedule_id: String,
+        /// Why.
         error: RtDbError,
     },
     /// Reply to cancel/pause/resume. `error` is omitted on the wire when `ok`.
     ScheduleAck {
+        /// Correlation id from the request.
         schedule_id: String,
+        /// Whether the action applied.
         ok: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
+        /// Why it failed (absent when ok).
         error: Option<RtDbError>,
     },
+    /// Reply to `listSchedules`.
     ListSchedulesOk {
+        /// Correlation id from the request.
         schedule_id: String,
+        /// All jobs for the db.
         schedules: Vec<ScheduleInfo>,
     },
+    /// Run started.
     StartWorkflowOk {
+        /// Correlation id from the request.
         workflow_id: String,
+        /// The run's initial info row.
         info: WorkflowInfo,
     },
+    /// Run rejected (spec validation, authz).
     StartWorkflowErr {
+        /// Correlation id from the request.
         workflow_id: String,
+        /// Why.
         error: RtDbError,
     },
     /// Reply to cancelWorkflow — and, per the server's single-error-frame
@@ -148,23 +231,36 @@ pub enum ServerMessage {
     /// exists; the list's correlation id rides `StartWorkflowErr`). `error`
     /// is omitted on the wire when `ok`.
     WorkflowAck {
+        /// Correlation id from the request.
         workflow_id: String,
+        /// Whether the action applied.
         ok: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
+        /// Why it failed (absent when ok).
         error: Option<RtDbError>,
     },
+    /// Reply to `listWorkflows`.
     ListWorkflowsOk {
+        /// Correlation id from the request.
         workflow_id: String,
+        /// Matching runs, newest first.
         workflows: Vec<WorkflowInfo>,
     },
+    /// Full room membership (on join and on every change).
     PresenceSnapshot {
+        /// Which room.
         room: String,
+        /// Everyone currently in the room.
         members: Vec<PresenceMember>,
     },
+    /// Presence operation failed.
     PresenceErr {
+        /// Which room.
         room: String,
+        /// Why.
         error: RtDbError,
     },
+    /// Reply to `Ping`.
     Pong,
 }
 
@@ -174,11 +270,14 @@ pub enum ServerMessage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UserKind {
+    /// An OAuth/anonymous session principal.
     User,
+    /// A machine token principal.
     Machine,
 }
 
 impl UserKind {
+    /// The wire string (`"user"` / `"machine"`).
     pub fn as_wire_str(&self) -> &'static str {
         match self {
             UserKind::User => "user",
@@ -206,9 +305,13 @@ impl std::str::FromStr for UserKind {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+/// The authenticated principal returned by `authOk` / `GET /auth/me`.
 pub struct AuthedUser {
+    /// Session user or machine token.
     pub kind: UserKind,
+    /// Email when known (always `None` for anonymous/machine).
     pub email: Option<String>,
+    /// Display name when known.
     pub name: Option<String>,
     /// GitHub login. Absent on the wire for machine tokens / non-GitHub
     /// users; serde defaults a missing field to `None` so this stays
@@ -216,6 +319,7 @@ pub struct AuthedUser {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub github_login: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// GitHub numeric id when the login was via GitHub.
     pub github_id: Option<i64>,
 }
 
@@ -226,8 +330,11 @@ pub struct AuthedUser {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PresenceMember {
+    /// Opaque per-session key (the liveness unit).
     pub connection_id: String,
+    /// Who is connected.
     pub user: AuthedUser,
+    /// Their opaque presence blob.
     pub state: serde_json::Value,
 }
 
@@ -237,12 +344,21 @@ pub struct PresenceMember {
 #[serde(tag = "type", rename_all = "camelCase", deny_unknown_fields)]
 pub enum ScheduleWhen {
     /// Fire `ms` milliseconds from now.
-    AfterMs { ms: i64 },
+    AfterMs {
+        /// Milliseconds from now.
+        ms: i64,
+    },
     /// Fire at this UTC epoch-ms instant (in the past = fire immediately).
-    RunAt { ms: i64 },
+    RunAt {
+        /// Absolute UTC epoch-ms instant.
+        ms: i64,
+    },
     /// Fire on this 5-field cron schedule (UTC, min-first). The server validates
     /// the expression; the client does no cron parsing.
-    Cron { expr: String },
+    Cron {
+        /// 5-field cron expression (UTC, min-first).
+        expr: String,
+    },
 }
 
 /// Whether a scheduled job fires once or repeats on cron. Mirrors
@@ -251,11 +367,14 @@ pub enum ScheduleWhen {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ScheduleKind {
+    /// Fires once.
     Oneshot,
+    /// Repeats on a cron schedule.
     Cron,
 }
 
 impl ScheduleKind {
+    /// The wire string (`"oneshot"` / `"cron"`).
     pub fn as_wire_str(&self) -> &'static str {
         match self {
             ScheduleKind::Oneshot => "oneshot",
@@ -288,13 +407,18 @@ impl std::str::FromStr for ScheduleKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ScheduleStatus {
+    /// Waiting for its due time.
     Pending,
+    /// Currently executing (crash-recovered at startup).
     Running,
+    /// Held by pause; resume re-arms it.
     Paused,
+    /// Failed; `last_error` carries why.
     Error,
 }
 
 impl ScheduleStatus {
+    /// The wire string (`"pending"` etc.).
     pub fn as_wire_str(&self) -> &'static str {
         match self {
             ScheduleStatus::Pending => "pending",
@@ -330,15 +454,23 @@ impl std::str::FromStr for ScheduleStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ScheduleInfo {
+    /// Opaque job id.
     pub id: String,
+    /// One-shot or cron.
     pub kind: ScheduleKind,
+    /// Next due time, epoch ms.
     pub due_at: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// The cron expression, for cron jobs.
     pub cron: Option<String>,
+    /// Lifecycle state.
     pub status: ScheduleStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// The last firing error, if any.
     pub last_error: Option<String>,
+    /// Creation time, epoch ms.
     pub created_at: i64,
+    /// Times fired.
     pub fired_count: i64,
 }
 
@@ -349,10 +481,13 @@ pub struct ScheduleInfo {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct StepRetry {
+    /// TOTAL attempts including the first.
     pub max_attempts: u32,
     #[serde(default = "default_initial_retry_ms")]
+    /// First backoff delay; doubles per retry.
     pub initial_retry_ms: u64,
     #[serde(default = "default_max_retry_ms")]
+    /// Backoff cap.
     pub max_retry_ms: u64,
 }
 
@@ -380,10 +515,13 @@ impl Default for StepRetry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WorkflowStepSpec {
+    /// The step's transaction.
     pub txn: Transaction,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Per-step policy (server default 3/1s/60s when `None`).
     pub retry: Option<StepRetry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Gate the step until this many ms have passed.
     pub sleep_before_ms: Option<u64>,
 }
 
@@ -393,7 +531,9 @@ pub struct WorkflowStepSpec {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WorkflowSpec {
+    /// Run name (operator-facing).
     pub name: String,
+    /// Ordered steps; snapshot per run.
     pub steps: Vec<WorkflowStepSpec>,
 }
 
@@ -403,14 +543,20 @@ pub struct WorkflowSpec {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkflowStatus {
+    /// Not yet advanced.
     Pending,
+    /// Mid-run (or crashed mid-run, pre-recovery).
     Running,
+    /// All steps completed.
     Success,
+    /// A step exhausted its retries (terminal).
     Failed,
+    /// Cancelled by request (terminal).
     Cancelled,
 }
 
 impl WorkflowStatus {
+    /// The wire string (`"pending"` etc.).
     pub fn as_wire_str(&self) -> &'static str {
         match self {
             WorkflowStatus::Pending => "pending",
@@ -443,11 +589,16 @@ impl std::str::FromStr for WorkflowStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct StepOutcome {
+    /// Which step (0-based).
     pub step_index: u32,
+    /// Success or failed.
     pub status: OutcomeStatus,
+    /// Total attempts (retries included).
     pub attempts: u32,
+    /// Completion time, epoch ms.
     pub at: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// The final error on failure.
     pub error: Option<String>,
 }
 
@@ -455,7 +606,9 @@ pub struct StepOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum OutcomeStatus {
+    /// The step completed.
     Success,
+    /// The step exhausted its retries.
     Failed,
 }
 
@@ -465,21 +618,33 @@ pub enum OutcomeStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WorkflowInfo {
+    /// Opaque run id.
     pub id: String,
+    /// The spec's name.
     pub name: String,
+    /// Lifecycle state.
     pub status: WorkflowStatus,
+    /// 0-based index of the next/current step.
     pub current_step: u32,
+    /// Total steps in the spec.
     pub step_count: u32,
+    /// Current step's total attempts so far.
     pub attempts: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Epoch-ms gate before the next advance.
     pub sleep_until: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// The failure that ended the run.
     pub last_error: Option<String>,
+    /// Submission time, epoch ms.
     pub created_at: i64,
+    /// Last advance time, epoch ms.
     pub updated_at: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// First advance time.
     pub started_at: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Terminal transition time.
     pub finished_at: Option<i64>,
 }
 
@@ -490,7 +655,9 @@ pub struct WorkflowInfo {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WorkflowInfoFull {
     #[serde(flatten)]
+    /// The run's info projection.
     pub info: WorkflowInfo,
+    /// Terminal record per completed step.
     pub step_outcomes: Vec<StepOutcome>,
 }
 
@@ -512,13 +679,18 @@ pub struct WorkflowInfoFull {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SearchQuery {
+    /// The declared search index.
     pub index: String,
+    /// Free-form user text (web-search operator syntax).
     pub query: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Optional `FilterExpr` narrowing the `WHERE`.
     pub filter: Option<FilterExpr>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// `None` = tsquery (default); `Trgm` = substring matching.
     pub mode: Option<SearchMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// `Some(true)` adds a `_searchSnippet` per hit (tsquery only).
     pub snippet: Option<bool>,
 }
 
@@ -537,7 +709,9 @@ pub struct SearchQuery {
 #[serde(rename_all = "lowercase")]
 pub enum SearchMode {
     #[default]
+    /// Stemmed full-text via `websearch_to_tsquery` (default).
     Tsquery,
+    /// Case-insensitive substring/autocomplete via `pg_trgm`.
     Trgm,
 }
 
@@ -553,13 +727,17 @@ pub enum SearchMode {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct VectorSearchQuery {
+    /// The declared vector index.
     pub index: String,
     // ARC-008(a): f64 (not f32) — the server, TS, and Python clients all carry
     // full JSON-number precision, so narrowing to f32 here was the lone path
     // that silently dropped precision on a round-trip. f64 matches the wire.
+    /// Query embedding (length = index dimensions).
     pub vector: Vec<f64>,
+    /// Max neighbors to return.
     pub limit: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Optional `FilterExpr` narrowing the `WHERE`.
     pub filter: Option<FilterExpr>,
 }
 
@@ -573,14 +751,20 @@ pub struct VectorSearchQuery {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct HybridSearchQuery {
+    /// Full-text query text.
     pub query: String,
+    /// Query embedding.
     pub vector: Vec<f64>,
+    /// Fused result size.
     pub limit: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Named search index (auto-selected when `None`).
     pub search_index: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Named vector index (auto-selected when `None`).
     pub vector_index: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// RRF constant (server default 60).
     pub k: Option<u32>,
 }
 
@@ -591,10 +775,15 @@ pub struct HybridSearchQuery {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AggregateOp {
+    /// Sum (numeric field required).
     Sum,
+    /// Average (numeric field required).
     Avg,
+    /// Minimum.
     Min,
+    /// Maximum.
     Max,
+    /// Row count (no aggregate field consumed).
     Count,
 }
 
@@ -609,8 +798,10 @@ pub enum AggregateOp {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AggregateSpec {
+    /// Which aggregate.
     pub op: AggregateOp,
     #[serde(default, skip_serializing_if = "is_false")]
+    /// Group by the index field after the eq prefix.
     pub group_by: bool,
 }
 
@@ -628,7 +819,9 @@ fn is_false(b: &bool) -> bool {
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct AggregateGroup {
+    /// The group's key value.
     pub key: serde_json::Value,
+    /// The group's aggregate.
     pub value: serde_json::Value,
 }
 
@@ -645,48 +838,80 @@ pub struct AggregateGroup {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "lowercase", deny_unknown_fields)]
 pub enum FilterExpr {
+    /// `field == value`.
     Eq {
+        /// The declared field to compare.
         field: String,
+        /// The value to compare against.
         value: serde_json::Value,
     },
+    /// `field != value`.
     Neq {
+        /// The declared field to compare.
         field: String,
+        /// The value to compare against.
         value: serde_json::Value,
     },
+    /// `field > value`.
     Gt {
+        /// The declared field to compare.
         field: String,
+        /// The value to compare against.
         value: serde_json::Value,
     },
+    /// `field >= value`.
     Gte {
+        /// The declared field to compare.
         field: String,
+        /// The value to compare against.
         value: serde_json::Value,
     },
+    /// `field < value`.
     Lt {
+        /// The declared field to compare.
         field: String,
+        /// The value to compare against.
         value: serde_json::Value,
     },
+    /// `field <= value`.
     Lte {
+        /// The declared field to compare.
         field: String,
+        /// The value to compare against.
         value: serde_json::Value,
     },
+    /// `field` equals any of `values` (non-empty).
     In {
+        /// The declared field to compare.
         field: String,
+        /// The accepted values.
         values: Vec<serde_json::Value>,
     },
+    /// Every sub-expression matches.
     And {
+        /// The conjuncts.
         exprs: Vec<FilterExpr>,
     },
+    /// Any sub-expression matches.
     Or {
+        /// The disjuncts.
         exprs: Vec<FilterExpr>,
     },
+    /// Negation.
     Not {
+        /// The negated expression.
         expr: Box<FilterExpr>,
     },
+    /// `value` is a member of `doc.field[]`.
     Contains {
+        /// The array field to test.
         field: String,
+        /// The candidate member.
         value: serde_json::Value,
     },
+    /// The field is present and non-null.
     Exists {
+        /// The field to test.
         field: String,
     },
 }
@@ -703,10 +928,13 @@ pub enum FilterExpr {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BatchQueryOutcome {
+    /// Whether the query executed.
     pub ok: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// The raw untagged query result (present when ok).
     pub result: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// The `{code, message}` envelope (present when not ok).
     pub error: Option<ErrorEnvelope>,
 }
 

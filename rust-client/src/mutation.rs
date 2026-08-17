@@ -6,46 +6,77 @@ use serde_json::{Map, Value};
 use crate::wire::{FilterExpr, ScheduleWhen, WorkflowSpec};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// An ordered list of steps executed atomically by the server's committer.
 pub struct Transaction {
+    /// The steps, applied in order; any failure rolls the whole txn back.
     pub steps: Vec<Step>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "camelCase", deny_unknown_fields)]
+/// One write/control step (tagged `{"op": "..."}`, camelCase).
 pub enum Step {
+    /// Insert a new document; result is its id.
     Insert {
+        /// Target table.
         table: String,
+        /// The document body.
         doc: Map<String, Value>,
     },
+    /// Merge `fields` into an existing document; result is `null`.
     Patch {
+        /// Target table.
         table: String,
+        /// Document id.
         id: String,
+        /// Keys to merge in.
         fields: Map<String, Value>,
     },
+    /// Overwrite the whole document; result is `null`.
     Replace {
+        /// Target table.
         table: String,
+        /// Document id.
         id: String,
+        /// The full replacement body.
         doc: Map<String, Value>,
     },
+    /// Delete a document; result is `null`.
     Delete {
+        /// Target table.
         table: String,
+        /// Document id.
         id: String,
     },
+    /// Precondition: the row must be at exactly `version`.
     ExpectVersion {
+        /// Target table.
         table: String,
+        /// Document id.
         id: String,
+        /// The required current version.
         version: i64,
     },
+    /// Precondition: no row may match the index eq-prefix.
     ExpectAbsent {
+        /// Target table.
         table: String,
+        /// Index to probe.
         index: String,
+        /// The eq-prefix values.
         eq: Vec<Value>,
     },
+    /// Insert-or-patch keyed by an index eq-prefix match.
     Upsert {
+        /// Target table.
         table: String,
+        /// Index whose eq-prefix locates the row.
         index: String,
+        /// The eq-prefix values.
         eq: Vec<Value>,
+        /// Body applied when inserting.
         insert: Map<String, Value>,
+        /// Keys merged when the row exists.
         patch: Map<String, Value>,
     },
     /// Patch every row in `table` matching `filter`. At most `limit` rows
@@ -53,40 +84,52 @@ pub enum Step {
     /// `truncated: true`. Mirrors `server/src/txn.rs::Step::PatchByQuery`
     /// byte-for-byte.
     PatchByQuery {
+        /// Target table.
         table: String,
+        /// Which rows match.
         filter: FilterExpr,
+        /// Keys to merge into every match.
         patch: Map<String, Value>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        /// Row cap (server default/max 1000); `None` = server default.
         limit: Option<u32>,
     },
     /// Delete every row in `table` matching `filter` (same `limit`/`truncated`
     /// semantics as `PatchByQuery`). Mirrors
     /// `server/src/txn.rs::Step::DeleteByQuery` byte-for-byte.
     DeleteByQuery {
+        /// Target table.
         table: String,
+        /// Which rows match.
         filter: FilterExpr,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        /// Row cap (server default/max 1000); `None` = server default.
         limit: Option<u32>,
     },
     /// Schedule `txn` to run later. Mirrors
     /// `server/src/txn.rs::Step::Schedule` byte-for-byte (FM-28).
     Schedule {
+        /// One-shot delay/absolute time, or a cron expression.
         when: ScheduleWhen,
+        /// The nested transaction to fire when due.
         txn: Box<Transaction>,
     },
     /// Cancel a previously scheduled job. Mirrors
     /// `server/src/txn.rs::Step::CancelSchedule` byte-for-byte (FM-28).
     CancelSchedule {
+        /// The schedule id to cancel.
         id: String,
     },
     /// Start a durable workflow run. Mirrors
     /// `server/src/txn.rs::Step::StartWorkflow` byte-for-byte (FM-29).
     StartWorkflow {
+        /// The run's spec, snapshotted per run server-side.
         spec: Box<WorkflowSpec>,
     },
     /// Cancel a workflow run. Mirrors
     /// `server/src/txn.rs::Step::CancelWorkflow` byte-for-byte (FM-29).
     CancelWorkflow {
+        /// The workflow run id.
         id: String,
     },
     /// Restore a soft-deleted row (only legal on a table that declares
@@ -94,7 +137,9 @@ pub enum Step {
     /// it is present and already live. Mirrors
     /// `server/src/txn.rs::Step::Undelete` byte-for-byte (FM-33).
     Undelete {
+        /// Target table (must declare `softDelete`).
         table: String,
+        /// Document id.
         id: String,
     },
 }
@@ -112,32 +157,50 @@ pub enum Step {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum StepResult {
+    /// `{id, inserted}` from an upsert step.
     Upsert {
+        /// The row's id.
         id: String,
+        /// Whether the step inserted (vs patched).
         inserted: bool,
     },
+    /// `{id}` from an insert step.
     Insert {
+        /// The inserted row's id.
         id: String,
     },
+    /// `{patched, truncated}` from a patchByQuery step.
     PatchByQuery {
+        /// Rows patched.
         patched: u32,
+        /// Whether the match set exceeded `limit`.
         truncated: bool,
     },
+    /// `{deleted, truncated}` from a deleteByQuery step.
     DeleteByQuery {
+        /// Rows deleted.
         deleted: u32,
+        /// Whether the match set exceeded `limit`.
         truncated: bool,
     },
+    /// `{scheduleId}` from a schedule step.
     Schedule {
         #[serde(rename = "scheduleId")]
+        /// The created job's id (wire key `scheduleId`).
         schedule_id: String,
     },
+    /// `{cancelled}` from a cancelSchedule step.
     Cancelled {
+        /// Whether a pending job was actually cancelled.
         cancelled: bool,
     },
+    /// `{workflowId}` from a startWorkflow step.
     WorkflowId {
         #[serde(rename = "workflowId")]
+        /// The started run's id (wire key `workflowId`).
         workflow_id: String,
     },
+    /// `null` — the result of patch/delete/expect*/undelete steps.
     Null,
 }
 
@@ -164,11 +227,13 @@ pub(crate) fn parse_step_results(
         .collect()
 }
 
+/// Chainable builder producing a [`Transaction`].
 pub struct Mutation {
     steps: Vec<Step>,
 }
 
 impl Mutation {
+    /// Start an empty transaction.
     pub fn new() -> Self {
         Self { steps: Vec::new() }
     }
@@ -182,6 +247,7 @@ impl Mutation {
         }
     }
 
+    /// Queue an insert step.
     pub fn insert(mut self, table: &str, doc: Value) -> Self {
         self.steps.push(Step::Insert {
             table: table.into(),
@@ -189,6 +255,7 @@ impl Mutation {
         });
         self
     }
+    /// Queue a patch step (merge `fields` into the row).
     pub fn patch(mut self, table: &str, id: &str, fields: Value) -> Self {
         self.steps.push(Step::Patch {
             table: table.into(),
@@ -197,6 +264,7 @@ impl Mutation {
         });
         self
     }
+    /// Queue a replace step (overwrite the row).
     pub fn replace(mut self, table: &str, id: &str, doc: Value) -> Self {
         self.steps.push(Step::Replace {
             table: table.into(),
@@ -205,6 +273,7 @@ impl Mutation {
         });
         self
     }
+    /// Queue a delete step.
     pub fn delete(mut self, table: &str, id: &str) -> Self {
         self.steps.push(Step::Delete {
             table: table.into(),
@@ -212,6 +281,7 @@ impl Mutation {
         });
         self
     }
+    /// Queue a version precondition step.
     pub fn expect_version(mut self, table: &str, id: &str, version: i64) -> Self {
         self.steps.push(Step::ExpectVersion {
             table: table.into(),
@@ -220,6 +290,7 @@ impl Mutation {
         });
         self
     }
+    /// Queue an index-absence precondition step.
     pub fn expect_absent(mut self, table: &str, index: &str, eq: &[Value]) -> Self {
         self.steps.push(Step::ExpectAbsent {
             table: table.into(),
@@ -228,6 +299,7 @@ impl Mutation {
         });
         self
     }
+    /// Queue an upsert step keyed by the index eq-prefix.
     pub fn upsert(
         mut self,
         table: &str,
@@ -322,6 +394,7 @@ impl Mutation {
         self
     }
 
+    /// Finish to the wire `Transaction`.
     pub fn build(self) -> Transaction {
         Transaction { steps: self.steps }
     }

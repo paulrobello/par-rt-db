@@ -14,19 +14,30 @@ use crate::wire::FilterExpr;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum OnDeleteAction {
+    /// Delete the child rows too.
     Cascade,
+    /// Block the parent delete while live children reference it (Conflict).
     Restrict,
+    /// Clear the child's referencing field (the key is removed).
     SetNull,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase", deny_unknown_fields)]
+/// A field's declared type — the wire shape shared with the server (tagged
+/// `{"type": "..."}`, camelCase).
 pub enum FieldType {
+    /// JSON string.
     String,
+    /// JSON number (f64).
     Number,
+    /// JSON boolean.
     Boolean,
+    /// JSON null.
     Null,
+    /// Reference to a document in `table` (an id string on the wire).
     Id {
+        /// The referenced table's name.
         table: String,
         /// `onDelete` referential action (FM-33). Legal only on a TOP-LEVEL
         /// field of the table (`Id` directly, or one `Optional` wrapping an
@@ -36,33 +47,51 @@ pub enum FieldType {
         #[serde(default, rename = "onDelete", skip_serializing_if = "Option::is_none")]
         on_delete: Option<OnDeleteAction>,
     },
+    /// Exactly one accepted literal value (enum-like).
     Literal {
+        /// The accepted value.
         value: serde_json::Value,
     },
+    /// `T | null`.
     Optional {
+        /// The wrapped type.
         inner: Box<FieldType>,
     },
+    /// Any one of the variants.
     Union {
+        /// The accepted member types.
         variants: Vec<FieldType>,
     },
+    /// Array of `element`.
     Array {
+        /// The per-item type.
         element: Box<FieldType>,
     },
+    /// Fixed-shape nested object.
     Object {
+        /// The nested field names and types.
         fields: BTreeMap<String, FieldType>,
     },
+    /// 64-bit integer (wire-encoded as a string to keep JSON precision).
     Int64,
+    /// Binary payload (base64 on the wire).
     Bytes,
+    /// Any JSON value.
     Any,
+    /// Dynamic-key map with a uniform value type.
     Record {
+        /// The per-value type.
         value: Box<FieldType>,
     },
+    /// Embedding vector of fixed `dimensions` (pgvector).
     Vector {
+        /// The fixed dimension count.
         dimensions: u32,
     },
 }
 
 impl FieldType {
+    /// Shorthand for an id reference without an `onDelete` action.
     pub fn id(table: &str) -> Self {
         FieldType::Id {
             table: table.into(),
@@ -81,26 +110,31 @@ impl FieldType {
         }
         self
     }
+    /// Wrap `inner` as `Optional`.
     pub fn optional(inner: FieldType) -> Self {
         FieldType::Optional {
             inner: Box::new(inner),
         }
     }
+    /// A lone accepted literal value.
     pub fn literal(value: impl Into<serde_json::Value>) -> Self {
         FieldType::Literal {
             value: value.into(),
         }
     }
+    /// A union over the given variants.
     pub fn union(variants: impl IntoIterator<Item = FieldType>) -> Self {
         FieldType::Union {
             variants: variants.into_iter().collect(),
         }
     }
+    /// An array of `element`.
     pub fn array(element: FieldType) -> Self {
         FieldType::Array {
             element: Box::new(element),
         }
     }
+    /// An embedding vector type of `dimensions`.
     pub fn vector(dimensions: u32) -> Self {
         FieldType::Vector { dimensions }
     }
@@ -189,8 +223,11 @@ pub fn strip_on_delete(ty: &FieldType) -> FieldType {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// One declared index on a table (btree, search, or vector).
 pub struct IndexDef {
+    /// Index name (used in queries' `with_index`).
     pub name: String,
+    /// The indexed field names, in key order.
     pub fields: Vec<String>,
     /// `true` marks a full-text search index (mirrors server `schema.rs`: the
     /// server tsvectorizes its text `fields` into a GIN-indexed generated column
@@ -237,8 +274,11 @@ pub struct IndexDef {
 #[serde(rename_all = "lowercase")]
 pub enum DistanceMetric {
     #[default]
+    /// Cosine distance (default).
     Cosine,
+    /// Euclidean L2 distance.
     L2,
+    /// Inner product.
     Ip,
 }
 
@@ -258,8 +298,10 @@ impl DistanceMetric {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VectorIndexSpec {
+    /// Vector dimension count.
     pub dimensions: u32,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// Scalar fields usable as eq-filters in `vectorSearch`.
     pub filter_fields: Vec<String>,
     /// Distance metric used by this index (default `Cosine`). Omitted on the
     /// wire when `Cosine`, so existing schemas serialize identically.
@@ -280,15 +322,20 @@ fn is_false(b: &bool) -> bool {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TtlDef {
+    /// The declared numeric field holding each doc's epoch-ms expiry.
     pub field: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Stamped at insert time when the document omits `field`.
     pub default_duration_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// One table: fields, indexes, and opt-in per-row rules / TTL / defaults.
 pub struct TableDef {
+    /// Field name → declared type.
     pub fields: BTreeMap<String, FieldType>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// Declared indexes, if any.
     pub indexes: Option<Vec<IndexDef>>,
     /// Opt-in per-row authorization: names a declared, string-compatible field
     /// whose value is the owning user's id. When set, an authenticated user
@@ -348,13 +395,16 @@ pub struct TableDef {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// A whole schema: named tables. Pushed via `POST /admin/push-schema`.
 pub struct SchemaDef {
+    /// Table name → definition.
     pub tables: BTreeMap<String, TableDef>,
 }
 
 /// Finished schema (alias for the wire type).
 pub type Schema = SchemaDef;
 
+/// Chainable builder producing a [`TableDef`].
 pub struct TableBuilder {
     fields: BTreeMap<String, FieldType>,
     indexes: Vec<IndexDef>,
@@ -372,6 +422,7 @@ pub struct TableBuilder {
 }
 
 impl TableBuilder {
+    /// Start an empty table.
     pub fn new() -> Self {
         Self {
             fields: BTreeMap::new(),
@@ -385,10 +436,12 @@ impl TableBuilder {
             last_index: None,
         }
     }
+    /// Declare `name` with type `ft`.
     pub fn field(mut self, name: &str, ft: FieldType) -> Self {
         self.fields.insert(name.into(), ft);
         self
     }
+    /// Declare a btree index over `fields`.
     pub fn index(mut self, name: &str, fields: &[&str]) -> Self {
         self.indexes.push(IndexDef {
             name: name.into(),
@@ -573,18 +626,22 @@ impl Default for TableBuilder {
 pub type Table = TableBuilder;
 
 #[derive(Default)]
+/// Chainable builder producing a [`SchemaDef`].
 pub struct SchemaBuilder {
     tables: BTreeMap<String, TableDef>,
 }
 
 impl SchemaBuilder {
+    /// Start an empty schema.
     pub fn new() -> Self {
         Self::default()
     }
+    /// Add a table built by the `build` closure/builder under `name`.
     pub fn table(mut self, name: &str, build: impl OnceTable) -> Self {
         self.tables.insert(name.into(), build.finish_table());
         self
     }
+    /// Finish to the wire `SchemaDef`.
     pub fn build(self) -> SchemaDef {
         SchemaDef {
             tables: self.tables,
@@ -594,6 +651,7 @@ impl SchemaBuilder {
 
 /// Anything that can produce a `TableDef`. Implemented for the builder and (later) closures.
 pub trait OnceTable {
+    /// Consume into the finished [`TableDef`].
     fn finish_table(self) -> TableDef;
 }
 
@@ -604,6 +662,7 @@ impl OnceTable for TableBuilder {
 }
 
 impl SchemaDef {
+    /// Start a [`SchemaBuilder`] for this definition type.
     pub fn builder() -> SchemaBuilder {
         SchemaBuilder::new()
     }

@@ -24,10 +24,14 @@ export type Id<TableName extends string> = string & { readonly __idBrand: TableN
  */
 export type Int64 = string & { readonly __int64Brand: unique symbol };
 
+/** Convert a `bigint` or `number` into the wire representation of an `int64`
+ * field (a decimal string — see `Int64`). Numbers outside the safe-integer
+ * range should come in as `bigint`. */
 export function toInt64(value: bigint | number): Int64 {
   return String(value) as Int64;
 }
 
+/** Convert an `Int64` wire value back into a `bigint`. */
 export function fromInt64(value: Int64): bigint {
   return BigInt(value);
 }
@@ -378,6 +382,11 @@ export class TableDefinition<
   }
 }
 
+/** Declare one table from a field-name → validator map (e.g. `t.string()`),
+ * then chain `.index()`/`.searchIndex()`/`.vectorIndex()`/`.ownerField()`/
+ * `.collaboratorsField()`/`.authorize()`/`.ttl()`/`.defaults()`/`.softDelete()`.
+ * Both the runtime schema pushed to the server and the inferred TS document
+ * types derive from this one declaration — there is no codegen. */
 export function defineTable<Fields extends Record<string, Validator<unknown, boolean>>>(
   fields: Fields,
 ): TableDefinition<Fields> {
@@ -396,6 +405,10 @@ export class SchemaDefinition<Tables extends Record<string, TableDefinition<any,
   }
 }
 
+/** Declare the whole schema from a table-name → `TableDefinition` map. Pass
+ * the result to `createApi(schema)` for the typed query/mutation builders and
+ * to `admin.pushSchema(db, schema)` to push it (additive DDL only —
+ * destructive changes go through `Migration`). */
 export function defineSchema<Tables extends Record<string, TableDefinition<any, string>>>(
   tables: Tables,
 ): SchemaDefinition<Tables> {
