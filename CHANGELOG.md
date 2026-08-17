@@ -18,6 +18,55 @@ contract against Convex.
 > dated subsections below are chronological within `[Unreleased]`, not released
 > versions.
 
+### Property-based parity testing + int64 filter-comparison engine fix (ENH-027)
+
+`server/tests/proptest_parity.rs` generates schemas/documents/queries —
+filter trees to depth 3 over the full DSL operator set, int64 boundary
+values, optional/null/missing cells — and asserts the Postgres server and the
+rust-client in-memory engine agree (ordered comparison when the query's sort
+is deterministic, multiset otherwise, system fields projected per the ENH-023
+normalization). 64 cases run in the default suite (~4s; `PROPTEST_CASES`
+raises the count), and counterexample seeds persist under
+`server/proptest-regressions/` so found divergences re-run forever. Its first
+generation caught a real divergence, now fixed in **all three** client
+engines: an ordering filter (`gt`/`gte`/`lt`/`lte`, and `in`) with a
+decimal-string value on a declared `int64` field compared **lexicographically**
+in the in-memory engines (`gt("9")` excluded a row with `15`, because
+`"15" < "9"` as text) while the server binds typed bigints and compares
+numerically. The engines now parse both sides exactly as i64 when the filter
+value is a string and the field is a declared `int64` (mirroring the server's
+`eq_bind_for(Int64)` path); the minimized case is pinned as
+`wire-corpus/semantics/filter-int64-numeric-ordering.json`. CONTRIBUTING
+gains the rule: every proptest-found divergence also becomes a
+semantics-corpus case so all three clients inherit it.
+
+### Generated, drift-gated CLI reference (ENH-025)
+
+The `cli/README.md` command reference is now generated from the CLI's own
+clap definitions (`cli/src/bin/gen-cli-docs.rs` renders the shared
+`args::cli()` command at a pinned `term_width`), and `make cli-docs-check` —
+wired into `make checkall` — fails when the committed reference no longer
+matches the binary, ending the undocumented-subcommand drift class (audit
+DOC-202 found 7 of 16 commands undocumented and a false `--url` default).
+`make cli-docs` regenerates in place; prose outside the
+`cli-reference:begin/end` markers is untouched. The shipped binary now parses
+through the same shared command the generator renders.
+
+### Subscription rerun-ratio observability (ENH-024)
+
+The per-db subscription rows served by `GET /admin/subscriptions` and
+`GET /admin/metrics` (`perDbSubs`) now also carry the skip-class total and a
+`rerunRatio` (`reruns / (reruns + skips)`) computed from the per-db counters
+ENH-010 already kept — making a rerun-heavy subscription mix (table-level
+reruns of distinct/aggregate/search/vector subscriptions coupling write
+latency to subscriber load) visible before it surprises a production
+workload. The dashboard Subscriptions page renders the ratio with a warning
+treatment above 0.5, and `deploy/README.md`'s "Monitoring the invalidation
+fan-out" gives the instance-wide PromQL ratio, a sustained >0.5-for-15m alert
+threshold, and the remediation levers (narrow the subscription, split hot
+tables, quota caps). `DbSubCounters` is mirrored across the ts, rust, and
+python clients.
+
 ### Security: non-zero per-IP rate-limit defaults (SEC-203)
 
 Code defaults change from 0 (off) to: `RTDB_ADMIN_RATE_LIMIT_PER_IP_RPM`
