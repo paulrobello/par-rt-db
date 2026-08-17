@@ -26,7 +26,10 @@ rtdb --url https://rtdb.pardev.net --db kanban --token $RTDB_TOKEN query '{"tabl
 `@<path>` reads a JSON argument from a file; otherwise the argument is parsed as
 JSON inline. `--url` defaults to `http://127.0.0.1:8300`; `--db` selects the
 target database for data (query/mutate) commands; `--token` is a per-db machine
-token and `--admin-key` is the boot `RTDB_ADMIN_KEY` for admin commands.
+token and `--admin-key` is the boot `RTDB_ADMIN_KEY` for admin commands. Both
+credential flags read from the `RTDB_TOKEN` / `RTDB_ADMIN_KEY` env vars first —
+that is the preferred path, since flag values are visible in `ps` output and
+shell history (the CLI prints a warning when it sees them on the command line).
 
 ## Schema migration (`rtdb migrate`)
 

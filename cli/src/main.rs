@@ -32,11 +32,11 @@ struct Cli {
     db: Option<String>,
 
     /// Machine token for `query` / `mutate`. [env: RTDB_TOKEN]
-    #[arg(long, env = "RTDB_TOKEN")]
+    #[arg(long, env = "RTDB_TOKEN", hide_env_values = true)]
     token: Option<String>,
 
     /// Instance admin key — bearer for every admin subcommand. [env: RTDB_ADMIN_KEY]
-    #[arg(long, env = "RTDB_ADMIN_KEY")]
+    #[arg(long, env = "RTDB_ADMIN_KEY", hide_env_values = true)]
     admin_key: Option<String>,
 
     #[command(subcommand)]
@@ -198,8 +198,36 @@ enum SessionsCommand {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // SEC-204: emitted before parsing so it always precedes any connection
+    // error the subcommand produces.
+    if secrets_on_argv(std::env::args_os()) {
+        eprintln!(
+            "warning: --token/--admin-key on the command line is visible in ps and shell history; prefer RTDB_TOKEN / RTDB_ADMIN_KEY"
+        );
+    }
     let cli = Cli::parse();
     dispatch(&cli).await
+}
+
+/// SEC-204: `--token` / `--admin-key` values on the command line are visible
+/// to every process on the host (`ps`) and persist in shell history. The
+/// flags stay (scripts depend on them) — this only detects them so `main` can
+/// point at the env vars, which clap treats as an equal source. Exact names
+/// and their `=`-joined forms only, so sibling flags like `--token-hash`
+/// never match.
+fn secrets_on_argv<I, S>(args: I) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
+    use std::ffi::OsStr;
+    args.into_iter().any(|a| {
+        let a = a.as_ref();
+        a == OsStr::new("--token")
+            || a == OsStr::new("--admin-key")
+            || a.to_string_lossy().starts_with("--token=")
+            || a.to_string_lossy().starts_with("--admin-key=")
+    })
 }
 
 /// Route a parsed `Cli` to its subcommand handler. Thin dispatcher so each
@@ -536,6 +564,36 @@ fn parse_workflow_status(raw: &str) -> Result<WorkflowStatus> {
 mod tests {
     use super::*;
     use par_rt_db_client::ErrorCode;
+
+    // SEC-204: the argv-secret warning must fire for --token/--admin-key in
+    // either spaced or `=`-joined form, and not when credentials come from
+    // the environment (no flag on the command line). Sibling flags like
+    // --token-hash must not trigger it. (The eprintln itself is one line in
+    // main over this predicate — the harness here can't capture stderr.)
+    #[test]
+    fn argv_secret_detection() {
+        assert!(secrets_on_argv([
+            "rtdb", "--token", "sekret", "query", "{}"
+        ]));
+        assert!(secrets_on_argv([
+            "rtdb",
+            "--admin-key",
+            "sekret",
+            "list-dbs"
+        ]));
+        assert!(secrets_on_argv(["rtdb", "--token=sekret", "query", "{}"]));
+        assert!(secrets_on_argv(["rtdb", "--admin-key=sekret", "list-dbs"]));
+        assert!(!secrets_on_argv(["rtdb", "--url", "http://x", "list-dbs"]));
+        assert!(!secrets_on_argv([
+            "rtdb",
+            "--url",
+            "http://x",
+            "sessions",
+            "revoke",
+            "--token-hash",
+            "abc",
+        ]));
+    }
 
     #[test]
     fn parses_admin_subcommands() {
