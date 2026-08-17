@@ -96,7 +96,9 @@ committer (blobs don't touch document tables). See
 
 This walkthrough brings up a local server, creates a database, mints a machine token, and
 runs one mutate + one query. It assumes `docker` is available and that the repo is
-checked out at the root.
+checked out at the root; it also uses `cargo` and `jq` — see
+[CONTRIBUTING's development setup](CONTRIBUTING.md#development-setup) for the full
+tool list and first-time setup.
 
 ```bash
 # 1. Start the dev Postgres (127.0.0.1:55434) used by both the server and the tests.
@@ -165,6 +167,7 @@ since browsers cannot set headers on a WS handshake.
 | Method & path | Auth | Description |
 | --- | --- | --- |
 | `GET /healthz` | none | Liveness: `{status:"ok"\|"degraded", version, git_commit, build_timestamp, started_at, uptime_seconds, postgres}`. 503 when Postgres is unreachable. |
+| `GET /privacy` | none | par-rt-db's own privacy policy as static HTML (compile-time-embedded from `static/privacy.html`), so an OAuth consent screen's required privacy URL can point at the deployment itself. Public and stateless; works in API-only mode. |
 | `GET /metrics` | none | Prometheus text-exposition scrape endpoint. Content-negotiated on `Accept`: a browser (`text/html`) is served the SPA's `index.html` when `RTDB_STATIC_DIR` is set; everything else (Prometheus sends `application/openmetrics-text`, curl, API-only deploys) gets Prometheus text. Aggregate-only (no per-db, no principal data), same posture as `/healthz`. The admin JSON snapshot stays at `GET /admin/metrics`. |
 | `GET /sync` | first WS frame | WebSocket upgrade. Speaks the realtime protocol (auth, subscribe, mutate, schedule, ping). |
 | `POST /api/query` | Bearer token | One-shot query against a database; see [Query shape](#query-shape). |
