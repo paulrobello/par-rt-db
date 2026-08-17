@@ -149,9 +149,11 @@ metrics exist for it on `/metrics` and `GET /admin/metrics`:
 - `rtdb_subs_missed_pushes_total` — **alert on any increase.** Non-zero means
   invalidation under-approximated. Only populated when verification is on.
 
-`RTDB_SUBS_VERIFY_SKIP_EVERY=N` (default 0 = off) shadow-verifies 1 skip in
-every N: the query runs anyway and its result is compared against the last
-pushed one. **Setting it in `.env` is not enough on its own** — compose's
+`RTDB_SUBS_VERIFY_SKIP_EVERY=N` shadow-verifies 1 skip in every N: the query
+runs anyway and its result is compared against the last pushed one. **It ships
+enabled at 1000** (`DEFAULT_SUBS_VERIFY_SKIP_EVERY` in `server/src/config.rs`;
+`.env.example` and compose agree) — set `0` to disable it.
+**Setting it in `.env` is not enough on its own** — compose's
 `environment:` block is an explicit allowlist, so a new `RTDB_*` key must also
 be forwarded there (this one is). After changing it, recreate the
 container (`docker compose up -d server`) and confirm
