@@ -1,0 +1,39 @@
+{
+  "name": "filter-or-combinator",
+  "$comment": "FilterExpr Or is a disjunction over its exprs (SQL path compiles to (leaf) OR (leaf); in-memory filter_matches uses exprs.iter().any). Seeding a third status ('blocked') that matches NEITHER leaf pins that or selects exactly the union of its branches, not a catch-all. `filter` composes with a plain table scan (no index needed), so rows come back unordered.",
+  "schema": {
+    "tables": {
+      "tasks": {
+        "fields": {
+          "name": { "type": "string" },
+          "status": { "type": "string" }
+        },
+        "indexes": [{ "name": "by_status", "fields": ["status"] }]
+      }
+    }
+  },
+  "seed": [
+    { "name": "a", "status": "todo" },
+    { "name": "b", "status": "done" },
+    { "name": "c", "status": "blocked" },
+    { "name": "d", "status": "todo" }
+  ],
+  "op": {
+    "query": {
+      "table": "tasks",
+      "filter": {
+        "op": "or",
+        "exprs": [
+          { "op": "eq", "field": "status", "value": "todo" },
+          { "op": "eq", "field": "status", "value": "done" }
+        ]
+      }
+    }
+  },
+  "expect": [
+    { "name": "a", "status": "todo" },
+    { "name": "b", "status": "done" },
+    { "name": "d", "status": "todo" }
+  ],
+  "unordered": true
+}

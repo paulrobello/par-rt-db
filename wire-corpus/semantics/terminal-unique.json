@@ -1,0 +1,29 @@
+{
+  "name": "terminal-unique",
+  "$comment": "unique over a full-arity eq narrowed to exactly one row: compile_collect_terminal uses LIMIT 2 and the executor errors PRECONDITION_FAILED only when >1 row matches; 0/1 rows shape the result as Doc(Some/None) — the doc OBJECT itself. take/order are absent because UNIQUE_PEERS rejects them alongside distinct/aggregate; index/eq remain legal.",
+  "schema": {
+    "tables": {
+      "tasks": {
+        "fields": {
+          "name": { "type": "string" },
+          "status": { "type": "string" }
+        },
+        "indexes": [{ "name": "by_name", "fields": ["name"] }]
+      }
+    }
+  },
+  "seed": [
+    { "name": "a", "status": "todo" },
+    { "name": "b", "status": "done" },
+    { "name": "c", "status": "todo" }
+  ],
+  "op": {
+    "query": {
+      "table": "tasks",
+      "index": "by_name",
+      "eq": ["b"],
+      "unique": true
+    }
+  },
+  "expect": { "name": "b", "status": "done" }
+}

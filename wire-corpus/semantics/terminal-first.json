@@ -1,0 +1,29 @@
+{
+  "name": "terminal-first",
+  "$comment": "first is sugar over take(1): the same index sort with LIMIT 1, but shaped as QueryResult::Doc(Some) — serialized (untagged enum) as the SINGLE DOC OBJECT, not a one-element array (execute_collect_terminal terminal == \"first\" branch). Doc(None) would serialize as null. first composes with order/index (FIRST_INCOMPATIBLES only rejects take/unique/distinct/aggregate).",
+  "schema": {
+    "tables": {
+      "tasks": {
+        "fields": {
+          "name": { "type": "string" },
+          "order": { "type": "number" }
+        },
+        "indexes": [{ "name": "by_order", "fields": ["order"] }]
+      }
+    }
+  },
+  "seed": [
+    { "name": "a", "order": 1 },
+    { "name": "b", "order": 3 },
+    { "name": "c", "order": 2 }
+  ],
+  "op": {
+    "query": {
+      "table": "tasks",
+      "index": "by_order",
+      "order": "asc",
+      "first": true
+    }
+  },
+  "expect": { "name": "a", "order": 1 }
+}

@@ -1,0 +1,28 @@
+{
+  "name": "txn-step-expect-absent",
+  "$comment": "expectAbsent with a full-arity eq (eq_lookup requires eq.len() == index.fields.len()) that matches no live row passes as a no-op precondition and yields a null step result (step_expect_absent pushes Value::Null). A matching visible row would fail PRECONDITION_FAILED instead — not probed here. A seed row is present so the emptiness is a real lookup miss, not an empty table.",
+  "schema": {
+    "tables": {
+      "tasks": {
+        "fields": {
+          "name": { "type": "string" }
+        },
+        "indexes": [{ "name": "by_name", "fields": ["name"] }]
+      }
+    }
+  },
+  "seed": [{ "name": "a" }],
+  "op": {
+    "txn": {
+      "steps": [
+        {
+          "op": "expectAbsent",
+          "table": "tasks",
+          "index": "by_name",
+          "eq": ["ghost"]
+        }
+      ]
+    }
+  },
+  "expect": [null]
+}

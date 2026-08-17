@@ -18,6 +18,25 @@ contract against Convex.
 > dated subsections below are chronological within `[Unreleased]`, not released
 > versions.
 
+### Semantics-corpus coverage: 11 previously unpinned DSL behaviors
+
+Card from the ENH-023 closing review. The corpus (`wire-corpus/semantics/`)
+pins the behaviors it covers, but the README documented several DSL behaviors
+no fixture exercised — an engine diverging on any of them stayed green. All
+are data-only additions; all four runners dir-enumerate the corpus, so no
+count assertion needed bumping. Newly pinned: the five txn steps
+`replace`/`undelete`/`expectVersion`/`expectAbsent`/`deleteByQuery` (per-step
+result shapes — only insert/patch/upsert/patchByQuery were pinned before); the
+`or` combinator (every previously pinned combinator was an and/not chain); the
+`take`, `first`, and `unique` terminals; `distinct` including NULL index
+values; and `aggregate` returning null over an empty match set. Authoring
+`distinct-includes-null` surfaced a real server bug — the distinct terminal
+500s when the distinct-ed optional index field is missing on some rows
+(`to_jsonb(NULL)` is SQL NULL, which sqlx cannot decode into a JSON value;
+the aggregate terminal already COALESCEs around exactly this) — so the case
+pins the documented semantics for the three client engines and carries a loud
+`skip.server` until the one-line fix lands (filed as its own card).
+
 ### Dev-db hygiene: `dev-db-clean` autocommit + `sc_` sweep
 
 `make dev-db-clean` rolled back wholesale with "out of shared memory" once

@@ -1,0 +1,28 @@
+{
+  "name": "aggregate-empty-null",
+  "$comment": "Scalar aggregate over an EMPTY match set is bare null: compile_aggregate_scalar emits SELECT COALESCE(to_jsonb(SUM(col)), 'null'::jsonb), and SUM over zero rows is SQL NULL (both the COALESCE arm and to_jsonb(SQL NULL) itself land on JSON null). A matching row exists in the table (status 'todo'), so the empty set is a real eq miss, not an empty table. Wire shape: eq ['ghost'] on [status, order] leaves `order` as the aggregate field (sum requires a numeric field).",
+  "schema": {
+    "tables": {
+      "tasks": {
+        "fields": {
+          "name": { "type": "string" },
+          "status": { "type": "string" },
+          "order": { "type": "number" }
+        },
+        "indexes": [
+          { "name": "by_status_and_order", "fields": ["status", "order"] }
+        ]
+      }
+    }
+  },
+  "seed": [{ "name": "a", "status": "todo", "order": 3 }],
+  "op": {
+    "query": {
+      "table": "tasks",
+      "index": "by_status_and_order",
+      "eq": ["ghost"],
+      "aggregate": { "op": "sum" }
+    }
+  },
+  "expect": null
+}

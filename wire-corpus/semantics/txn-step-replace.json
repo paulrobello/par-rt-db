@@ -1,0 +1,37 @@
+{
+  "name": "txn-step-replace",
+  "$comment": "Replace swaps the whole doc body (do_replace validates the new doc as a COMPLETE document and apply_update stores it verbatim — no merge, unlike patch), so the old `status` key is gone afterwards. `status` is Optional because validate_doc requires every non-Optional schema field to be present — a required field could never disappear in a legal replace. Step result is null (step_replace pushes Value::Null).",
+  "schema": {
+    "tables": {
+      "tasks": {
+        "fields": {
+          "name": { "type": "string" },
+          "status": { "type": "optional", "inner": { "type": "string" } },
+          "tier": { "type": "optional", "inner": { "type": "string" } }
+        },
+        "indexes": [{ "name": "by_name", "fields": ["name"] }]
+      }
+    }
+  },
+  "seed": [
+    { "$id": "a", "doc": { "name": "a", "status": "todo" } }
+  ],
+  "op": {
+    "txn": {
+      "steps": [
+        {
+          "op": "replace",
+          "table": "tasks",
+          "id": { "$idRef": "a" },
+          "doc": { "name": "a", "tier": "gold" }
+        }
+      ]
+    }
+  },
+  "expect": [null],
+  "then": {
+    "query": { "table": "tasks" },
+    "expect": [{ "name": "a", "tier": "gold" }],
+    "unordered": true
+  }
+}

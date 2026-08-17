@@ -1,0 +1,37 @@
+{
+  "name": "txn-step-delete-by-query",
+  "$comment": "deleteByQuery step result is {\"deleted\", \"truncated\"} (step_delete_by_query). The filter (the same FilterExpr the read path compiles) matches exactly the two status='todo' rows; the default limit is MAX_BY_QUERY_ROWS=1000 and the scan fetches limit+1, so 2 matches are neither capped nor truncated. Hard delete (no softDelete on the table); the follow-up collect shows only the survivor.",
+  "schema": {
+    "tables": {
+      "tasks": {
+        "fields": {
+          "name": { "type": "string" },
+          "status": { "type": "string" }
+        },
+        "indexes": [{ "name": "by_status", "fields": ["status"] }]
+      }
+    }
+  },
+  "seed": [
+    { "name": "a", "status": "todo" },
+    { "name": "b", "status": "todo" },
+    { "name": "c", "status": "done" }
+  ],
+  "op": {
+    "txn": {
+      "steps": [
+        {
+          "op": "deleteByQuery",
+          "table": "tasks",
+          "filter": { "op": "eq", "field": "status", "value": "todo" }
+        }
+      ]
+    }
+  },
+  "expect": [{ "deleted": 2, "truncated": false }],
+  "then": {
+    "query": { "table": "tasks" },
+    "expect": [{ "name": "c", "status": "done" }],
+    "unordered": true
+  }
+}

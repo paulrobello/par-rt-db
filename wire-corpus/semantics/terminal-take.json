@@ -1,0 +1,32 @@
+{
+  "name": "terminal-take",
+  "$comment": "take caps the collect scan: compile_collect_terminal binds LIMIT = take over the index sort (unbound index fields, then created_at, then id — all in `order` direction). The seeded `order` values are distinct, so the index field alone determines the sequence and it is asserted IN ORDER (determinism ruling 2: explicit order over an index licenses sequence comparison); no insert-order tiebreak is relied on. Seeds are inserted in shuffled order so passing proves the sort, not insertion order.",
+  "schema": {
+    "tables": {
+      "tasks": {
+        "fields": {
+          "name": { "type": "string" },
+          "order": { "type": "number" }
+        },
+        "indexes": [{ "name": "by_order", "fields": ["order"] }]
+      }
+    }
+  },
+  "seed": [
+    { "name": "a", "order": 1 },
+    { "name": "b", "order": 3 },
+    { "name": "c", "order": 2 }
+  ],
+  "op": {
+    "query": {
+      "table": "tasks",
+      "index": "by_order",
+      "order": "asc",
+      "take": 2
+    }
+  },
+  "expect": [
+    { "name": "a", "order": 1 },
+    { "name": "c", "order": 2 }
+  ]
+}

@@ -1,0 +1,37 @@
+{
+  "name": "txn-step-expect-version",
+  "$comment": "OCC version semantics, derived from server code: ddl.rs creates the column as `\"version\" bigint NOT NULL DEFAULT 1` (so the seeded insert is _version 1) and apply_update runs `SET \"version\" = \"version\" + 1` (so the patch bumps it to 2). do_expect_version SELECTs the row's current version on the OPEN sqlx transaction, so it observes the bump from step 1 within the same txn; matching passes and both step results are null. A mismatch would be PRECONDITION_FAILED, not probed here.",
+  "schema": {
+    "tables": {
+      "tasks": {
+        "fields": {
+          "name": { "type": "string" },
+          "status": { "type": "string" }
+        },
+        "indexes": [{ "name": "by_name", "fields": ["name"] }]
+      }
+    }
+  },
+  "seed": [
+    { "$id": "a", "doc": { "name": "a", "status": "todo" } }
+  ],
+  "op": {
+    "txn": {
+      "steps": [
+        {
+          "op": "patch",
+          "table": "tasks",
+          "id": { "$idRef": "a" },
+          "fields": { "status": "done" }
+        },
+        {
+          "op": "expectVersion",
+          "table": "tasks",
+          "id": { "$idRef": "a" },
+          "version": 2
+        }
+      ]
+    }
+  },
+  "expect": [null, null]
+}

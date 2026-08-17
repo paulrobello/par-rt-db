@@ -1,0 +1,37 @@
+{
+  "name": "txn-step-undelete",
+  "$comment": "Undelete (FM-33) restores a soft-deleted row inside the same txn: delete stamps deleted_at (do_soft_delete), undelete clears it (UPDATE ... SET deleted_at = NULL WHERE deleted_at IS NOT NULL), so after commit the doc is visible to reads again with its body untouched. Both step results are null. Legal only because the table declares softDelete (else BadRequest from step_undelete).",
+  "schema": {
+    "tables": {
+      "tasks": {
+        "fields": {
+          "name": { "type": "string" },
+          "status": { "type": "string" }
+        },
+        "indexes": [{ "name": "by_name", "fields": ["name"] }],
+        "softDelete": true
+      }
+    }
+  },
+  "seed": [
+    { "$id": "cycled", "doc": { "name": "a", "status": "todo" } },
+    { "doc": { "name": "b", "status": "done" } }
+  ],
+  "op": {
+    "txn": {
+      "steps": [
+        { "op": "delete", "table": "tasks", "id": { "$idRef": "cycled" } },
+        { "op": "undelete", "table": "tasks", "id": { "$idRef": "cycled" } }
+      ]
+    }
+  },
+  "expect": [null, null],
+  "then": {
+    "query": { "table": "tasks" },
+    "expect": [
+      { "name": "a", "status": "todo" },
+      { "name": "b", "status": "done" }
+    ],
+    "unordered": true
+  }
+}
