@@ -12,7 +12,8 @@ DEPLOY_COMMIT := $(shell git rev-parse --short HEAD)
 	pre-commit pre-commit-update ts-client-build ts-client-install dashboard-install \
 	dashboard-test \
 	python-client-install python-client-test python-client-lint python-client-fmt \
-	python-client-typecheck python-client-checkall rust-client-check-features rtdb-cli deploy env-drift-check
+	python-client-typecheck python-client-checkall rust-client-check-features rtdb-cli deploy \
+	env-drift-check cli-docs cli-docs-check
 
 # The dashboard's typecheck/build resolve `@par-rt-db/client` from ts-client's
 # gitignored `dist/` (workspace link + exports.types). Build it first so the
@@ -128,13 +129,32 @@ rust-client-check-features:
 rtdb-cli:
 	cd cli && cargo build --release
 
+# ENH-025: regenerate the cli/README.md command reference (the
+# cli-reference:begin/end marker region) from the CLI's own clap definitions.
+cli-docs:
+	cd cli && cargo run --quiet --bin gen-cli-docs -- README.md
+
+# Gate half: regenerate a copy of the README and diff it against the committed
+# one — any difference means the documented reference is stale.
+cli-docs-check:
+	@tmpdir=$$(mktemp -d); \
+	cp cli/README.md "$$tmpdir/README.md"; \
+	if (cd cli && cargo run --quiet --bin gen-cli-docs -- "$$tmpdir/README.md") \
+		&& diff -u cli/README.md "$$tmpdir/README.md"; then \
+		rm -rf "$$tmpdir"; \
+	else \
+		status=$$?; rm -rf "$$tmpdir"; \
+		echo "cli/README.md command reference is stale — run 'make cli-docs' and commit the result" >&2; \
+		exit $$status; \
+	fi
+
 # Fails when a documented RTDB_* var isn't forwarded to the container by
 # docker-compose.yml (compose's `environment:` block is an explicit allowlist,
 # so a .env-only key silently does nothing).
 env-drift-check:
 	./scripts/env-drift-check.sh
 
-checkall: env-drift-check fmt-check lint typecheck test rust-client-check-features
+checkall: env-drift-check cli-docs-check fmt-check lint typecheck test rust-client-check-features
 
 pre-commit:
 	pre-commit run --all-files

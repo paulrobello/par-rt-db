@@ -35,17 +35,27 @@ Every flag has an environment-variable fallback — the preferred path, since
 flag values are visible in `ps` output and shell history (SEC-204; the CLI
 prints a warning when it sees a credential on the command line):
 
-| Env var | Flag | Used by |
-| --- | --- | --- |
-| `RTDB_URL` | `--url` | Every command (required — no default). |
-| `RTDB_DB` | `--db` | `query`, `mutate`, `push-schema`, `migrate`, `explain`, `workflows`. |
-| `RTDB_TOKEN` | `--token` | `query` / `mutate` (machine token). |
-| `RTDB_ADMIN_KEY` | `--admin-key` | Every admin subcommand. |
+Which commands consume each credential:
+
+- `RTDB_URL` / `--url` — every command (required; there is no default).
+- `RTDB_DB` / `--db` — `query`, `mutate`, `push-schema`, `migrate`, `explain`, `workflows`.
+- `RTDB_TOKEN` / `--token` — `query` / `mutate` (machine token).
+- `RTDB_ADMIN_KEY` / `--admin-key` — every admin subcommand.
+
+The full flag ↔ env mapping (kept in sync with the CLI definitions) is
+generated in
+[Global flags and environment variables](#global-flags-and-environment-variables)
+below.
 
 ## Commands
 
-`rtdb --help` (authoritative output, kept in sync with the CLI's argument
-definitions):
+The command reference in this section is generated from the CLI's own argument
+definitions (`cli/src/args.rs`) by `make cli-docs`, and `make cli-docs-check`
+(part of `make checkall`) fails when it is stale — a subcommand cannot land
+undocumented. Do not edit between the markers by hand.
+
+<!-- cli-reference:begin -->
+Full `rtdb --help` output:
 
 ```text
 Operator + CI CLI for par-rt-db
@@ -70,33 +80,303 @@ Commands:
   help          Print this message or the help of the given subcommand(s)
 
 Options:
-      --url <URL>              Server base URL (e.g. https://rtdb.pardev.net). [env: RTDB_URL=]
-      --db <DB>                Database name — used by `query`, `mutate`, and `push-schema`. [env: RTDB_DB=]
-      --token <TOKEN>          Machine token for `query` / `mutate`. [env: RTDB_TOKEN]
-      --admin-key <ADMIN_KEY>  Instance admin key — bearer for every admin subcommand. [env: RTDB_ADMIN_KEY]
+      --url <URL>              Server base URL (e.g. https://rtdb.pardev.net) [env: RTDB_URL=]
+      --db <DB>                Database name — used by `query`, `mutate`, and `push-schema` [env: RTDB_DB=]
+      --token <TOKEN>          Machine token for `query` / `mutate` [env: RTDB_TOKEN]
+      --admin-key <ADMIN_KEY>  Instance admin key — bearer for every admin subcommand [env: RTDB_ADMIN_KEY]
   -h, --help                   Print help
   -V, --version                Print version
 ```
 
-Per-command notes:
+### Global flags and environment variables
 
-| Command | Auth | Shape |
+| Flag | Env var | Description |
 | --- | --- | --- |
-| `list-dbs` | admin | Lists every database on the instance. |
-| `create-db <NAME>` | admin | Creates a new database. |
-| `clone-db <FROM> <TO>` | admin | Clones schema + documents; `TO` must not already exist. |
-| `push-schema <FILE>` | admin | Pushes a `SchemaDef` JSON file (additive) to `--db`. |
-| `mint-token <DB> <NAME>` | admin | Mints a machine token; prints `{tokenId, token}` — the plaintext token is shown once. |
-| `revoke-token <ID>` | admin | Revokes a machine token by id (`tok_…`). |
-| `sessions list [--user] [--limit]` | admin | Active interactive sessions, newest-first; `--user` filters by id or email, `--limit` caps (server default 200). |
-| `sessions revoke (--token-hash \| --user)` | admin | Revokes one session by sha256 token hash, or every session for a user (mutually exclusive flags). |
-| `merge-users --anon --real --confirm` | admin | Merges an anonymous user into a real one synchronously; `--confirm` must equal `--real`. |
-| `query <QUERY>` | machine token | Runs a Query JSON (or `@file`) against `--db`, prints the result. |
-| `mutate <TXN>` | machine token | Runs a Transaction JSON (or `@file`), prints step results. |
-| `migrate [--dry-run] <FILE>` | admin | See [Schema migration](#schema-migration-rtdb-migrate) below. |
-| `explain <QUERY>` | admin | Prints the compiled SQL + bind params for a Query JSON against `--db` — no rows. |
-| `slow-queries [--db] [--limit]` | admin | Recent slow queries across the instance (from the server's bounded ring). |
-| `workflows <sub>` | admin | See [Workflow runs](#workflow-runs-rtdb-workflows) below. |
+| `--url <URL>` | `RTDB_URL` | Server base URL (e.g. https://rtdb.pardev.net) **(required)** |
+| `--db <DB>` | `RTDB_DB` | Database name — used by `query`, `mutate`, and `push-schema` |
+| `--token <TOKEN>` | `RTDB_TOKEN` | Machine token for `query` / `mutate` |
+| `--admin-key <ADMIN_KEY>` | `RTDB_ADMIN_KEY` | Instance admin key — bearer for every admin subcommand |
+
+### `rtdb list-dbs`
+
+```text
+List every database on the instance. (admin)
+
+Usage: rtdb list-dbs
+
+Options:
+  -h, --help  Print help
+```
+
+### `rtdb create-db`
+
+```text
+Create a new database. (admin)
+
+Usage: rtdb create-db <NAME>
+
+Arguments:
+  <NAME>  Database name to create
+
+Options:
+  -h, --help  Print help
+```
+
+### `rtdb clone-db`
+
+```text
+Clone a database (schema + documents) into a new one. (admin)
+
+Usage: rtdb clone-db <FROM> <TO>
+
+Arguments:
+  <FROM>  Source database to clone from
+  <TO>    Destination database name (must not already exist)
+
+Options:
+  -h, --help  Print help
+```
+
+### `rtdb push-schema`
+
+```text
+Push a SchemaDef JSON file to `--db`. (admin)
+
+Usage: rtdb push-schema <FILE>
+
+Arguments:
+  <FILE>  Path to a JSON file containing a `SchemaDef` (wire shape: `{"tables": {<name>: {"fields": {..}}}}`)
+
+Options:
+  -h, --help  Print help
+```
+
+### `rtdb mint-token`
+
+```text
+Mint a machine token for a database. (admin)
+
+Usage: rtdb mint-token <DB> <NAME>
+
+Arguments:
+  <DB>    Database to mint the token for
+  <NAME>  Human-readable token name (e.g. "ci-seed")
+
+Options:
+  -h, --help  Print help
+```
+
+### `rtdb revoke-token`
+
+```text
+Revoke a machine token by id. (admin)
+
+Usage: rtdb revoke-token <ID>
+
+Arguments:
+  <ID>  Token id (`tok_…`) to revoke
+
+Options:
+  -h, --help  Print help
+```
+
+### `rtdb sessions`
+
+```text
+Manage active interactive sessions. (admin)
+
+Usage: rtdb sessions <COMMAND>
+
+Commands:
+  list    List active interactive sessions, newest-first
+  revoke  Revoke a single session by token hash, or every session for a user
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+```
+
+#### `rtdb sessions list`
+
+```text
+List active interactive sessions, newest-first
+
+Usage: rtdb sessions list [OPTIONS]
+
+Options:
+      --user <USER>    Filter by user id or email
+      --limit <LIMIT>  Cap the result count (server default 200, clamped to [1, 1000])
+  -h, --help           Print help
+```
+
+#### `rtdb sessions revoke`
+
+```text
+Revoke a single session by token hash, or every session for a user
+
+Usage: rtdb sessions revoke [OPTIONS]
+
+Options:
+      --token-hash <TOKEN_HASH>  Token hash (sha256 digest) of the session to revoke. Mutually exclusive with `--user`
+      --user <USER>              Revoke every session for this user id. Mutually exclusive with `--token-hash`
+  -h, --help                     Print help
+```
+
+### `rtdb merge-users`
+
+```text
+Merge an anonymous user into a real one, synchronously. (admin)
+
+Usage: rtdb merge-users --anon <ANON> --real <REAL> --confirm <CONFIRM>
+
+Options:
+      --anon <ANON>        Anonymous user id whose data is merged away
+      --real <REAL>        Real user id that receives the anon user's data
+      --confirm <CONFIRM>  Typed confirmation — must equal `--real`
+  -h, --help               Print help
+```
+
+### `rtdb query`
+
+```text
+Run a Query JSON against `--db` and print the result. (machine token)
+
+Usage: rtdb query <QUERY>
+
+Arguments:
+  <QUERY>  Query JSON, e.g. `{"table":"items","take":10}`. Prefix with `@` to read from a file (`@query.json`)
+
+Options:
+  -h, --help  Print help
+```
+
+### `rtdb mutate`
+
+```text
+Run a Transaction JSON against `--db` and print step results. (machine token)
+
+Usage: rtdb mutate <TXN>
+
+Arguments:
+  <TXN>  Transaction JSON (`{"steps":[..]}`). Prefix with `@` to read from a file (`@seed.json`)
+
+Options:
+  -h, --help  Print help
+```
+
+### `rtdb migrate`
+
+```text
+Apply (or preview with `--dry-run`) a migration directives JSON file to `--db`. (admin)
+
+Usage: rtdb migrate [OPTIONS] <FILE>
+
+Arguments:
+  <FILE>  Path to a JSON file containing a `MigrateRequestOwned` body (wire shape: `{"directives":[...], "dryRun"?: bool}`)
+
+Options:
+      --dry-run  Preview only — nothing is applied. The request's `dryRun` field is also honored; this flag forces it on
+  -h, --help     Print help
+```
+
+Directive reference and examples: [Schema migration (`rtdb migrate`)](#schema-migration-rtdb-migrate).
+
+### `rtdb explain`
+
+```text
+Explain a Query's compiled SQL against `--db` without running it. (admin)
+
+Usage: rtdb explain <QUERY>
+
+Arguments:
+  <QUERY>  Query JSON, e.g. `{"table":"items","take":10}`. Prefix with `@` to read from a file (`@query.json`)
+
+Options:
+  -h, --help  Print help
+```
+
+### `rtdb slow-queries`
+
+```text
+List recent slow queries across the instance. (admin)
+
+Usage: rtdb slow-queries [OPTIONS]
+
+Options:
+      --db <DB>        Filter to one database
+      --limit <LIMIT>  Cap the result count
+  -h, --help           Print help
+```
+
+### `rtdb workflows`
+
+```text
+Manage durable workflow runs in `--db`. (admin)
+
+Usage: rtdb workflows <COMMAND>
+
+Commands:
+  list    List workflow runs in `--db`, newest first
+  get     Print one workflow run: the info row plus the per-step outcome trail
+  start   Start a new workflow run from a WorkflowSpec JSON file
+  cancel  Cancel a workflow run
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+```
+
+Spec format and semantics: [Workflow runs (`rtdb workflows`)](#workflow-runs-rtdb-workflows).
+
+#### `rtdb workflows list`
+
+```text
+List workflow runs in `--db`, newest first
+
+Usage: rtdb workflows list [OPTIONS]
+
+Options:
+      --status <STATUS>  Filter by run status: pending|running|success|failed|cancelled
+      --limit <LIMIT>    Cap the result count (server default 100, capped at 500)
+  -h, --help             Print help
+```
+
+#### `rtdb workflows get`
+
+```text
+Print one workflow run: the info row plus the per-step outcome trail
+
+Usage: rtdb workflows get --id <ID>
+
+Options:
+      --id <ID>  Workflow run id to fetch
+  -h, --help     Print help
+```
+
+#### `rtdb workflows start`
+
+```text
+Start a new workflow run from a WorkflowSpec JSON file
+
+Usage: rtdb workflows start --file <FILE>
+
+Options:
+      --file <FILE>  Path to a JSON file containing a `WorkflowSpec` (wire shape: `{"name": .., "steps": [{"txn": ..}]}`). An optional `@` prefix matches the `query`/`mutate` file convention
+  -h, --help         Print help
+```
+
+#### `rtdb workflows cancel`
+
+```text
+Cancel a workflow run
+
+Usage: rtdb workflows cancel --id <ID>
+
+Options:
+      --id <ID>  Workflow run id to cancel
+  -h, --help     Print help
+```
+<!-- cli-reference:end -->
 
 ## Schema migration (`rtdb migrate`)
 

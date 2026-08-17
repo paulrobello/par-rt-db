@@ -3,30 +3,45 @@
 //! SEC-204 argv-secret predicate that warns when credentials are passed as
 //! flags instead of env vars.
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
-#[command(name = "rtdb", version, about = "Operator + CI CLI for par-rt-db")]
+// term_width is pinned so `--help` output — and the README section generated
+// from it by `gen-cli-docs` — is byte-identical regardless of terminal size.
+#[command(
+    name = "rtdb",
+    version,
+    about = "Operator + CI CLI for par-rt-db",
+    term_width = 80
+)]
 pub(crate) struct Cli {
-    /// Server base URL (e.g. https://rtdb.pardev.net). [env: RTDB_URL]
+    /// Server base URL (e.g. https://rtdb.pardev.net).
     #[arg(long, env = "RTDB_URL")]
     pub(crate) url: String,
 
-    /// Database name — used by `query`, `mutate`, and `push-schema`. [env: RTDB_DB]
+    /// Database name — used by `query`, `mutate`, and `push-schema`.
     #[arg(long, env = "RTDB_DB")]
     pub(crate) db: Option<String>,
 
-    /// Machine token for `query` / `mutate`. [env: RTDB_TOKEN]
+    /// Machine token for `query` / `mutate`.
     #[arg(long, env = "RTDB_TOKEN", hide_env_values = true)]
     pub(crate) token: Option<String>,
 
-    /// Instance admin key — bearer for every admin subcommand. [env: RTDB_ADMIN_KEY]
+    /// Instance admin key — bearer for every admin subcommand.
     #[arg(long, env = "RTDB_ADMIN_KEY", hide_env_values = true)]
     pub(crate) admin_key: Option<String>,
 
     #[command(subcommand)]
     pub(crate) command: Command,
+}
+
+/// The `rtdb` clap definition, shared by the shipped binary (`main` parses
+/// through it) and the README generator (`cli/src/bin/gen-cli-docs.rs`), so
+/// the documented reference and the real `--help` output come from one
+/// source.
+pub(crate) fn cli() -> clap::Command {
+    Cli::command()
 }
 
 #[derive(Subcommand, Debug)]

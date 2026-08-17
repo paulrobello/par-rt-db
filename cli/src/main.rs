@@ -23,7 +23,7 @@ mod output;
 
 use anyhow::Result;
 use args::{Cli, Command};
-use clap::Parser;
+use clap::FromArgMatches;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -34,7 +34,10 @@ async fn main() -> Result<()> {
             "warning: --token/--admin-key on the command line is visible in ps and shell history; prefer RTDB_TOKEN / RTDB_ADMIN_KEY"
         );
     }
-    let cli = Cli::parse();
+    // Parse through the same args::cli() command gen-cli-docs renders from,
+    // so the shipped binary and the documented reference share one clap
+    // definition (including its pinned term_width).
+    let cli = Cli::from_arg_matches(&args::cli().get_matches())?;
     dispatch(&cli).await
 }
 
