@@ -16,7 +16,7 @@ Crate name: `par-rt-db-client` → in Rust, `use par_rt_db_client::...`.
 | `http` | yes | `RtDbHttpClient` — typed query / mutate / `auth_me` |
 | `ws` | no | `RtDbClient` (`src/ws.rs`) — reactive WebSocket client (live query subscriptions + mutate) |
 | `admin` | no | `RtDbAdminClient` (`src/admin.rs`) — `/admin/*` control-plane client: db create/list/push-schema, schema/stats read-back, token mint/revoke/list, db + server-wide admin allowlist CRUD, metrics, hot config GET/PATCH, op-feed `recent`, owner-bypass query/mutate (incl. `include_deleted` for soft-deleted rows), snapshot export/import, schema preview (advisory additive/reject diff), admin schedules CRUD (list/create/cancel/pause/resume), admin storage (list/upload/delete), per-db anonymous-access toggle (SEC-103). Browser-only `login`/`logout`/`/admin/stream` are excluded (the Rust client is a machine client). Construct via `RtDbAdminClient::new(url, admin_key)` or `RtDbHttpClient::admin_client()` (shares the connection pool). The admin methods also remain on `RtDbHttpClient` as `#[deprecated]` re-exports (ARC-121, non-breaking). |
-| `in_memory` | no | `InMemoryRtDbClient` (`src/in_memory.rs`) — in-memory test harness (no network, no Postgres). Ports `ts-client/src/in_memory.ts`: schema push, mutate (with `mut_id` idempotency), one-shot query DSL (`get`/`first`/`unique`/`count`/`take`/`collect` + index eq + range + `order` + cursor-keyset `paginate`), `filter()` predicate evaluation, reactive `subscribe` (re-runs and fires `on_update` on change), `schedule`/`cancel_schedule`/`pause_schedule`/`resume_schedule`/`list_schedules` + a timer-less `tick(now_ms)` (one-shot catches up if past due; cron re-arms by `CRON_STEP_MS = 60_000` and skips missed windows), and the `upload`/`delete_file`/`get_file_metadata`/`get_url` storage stubs. `search` approximates server behavior by mode — websearch operator matching (quoted phrases, `or` unions, `-term` exclusion, FM-31) with optional `_searchSnippet` highlights for `tsquery`, substring + similarity ranking for `trgm` (FM-30); `vector_search` over-approximates (no distance model — every table doc is a candidate, narrowed by the carried `filter`); rejected combinations still throw. |
+| `in_memory` | no | `InMemoryRtDbClient` (`src/in_memory/`) — in-memory test harness (no network, no Postgres). Ports `ts-client/src/in_memory.ts`: schema push, mutate (with `mut_id` idempotency), one-shot query DSL (`get`/`first`/`unique`/`count`/`take`/`collect` + index eq + range + `order` + cursor-keyset `paginate`), `filter()` predicate evaluation, reactive `subscribe` (re-runs and fires `on_update` on change), `schedule`/`cancel_schedule`/`pause_schedule`/`resume_schedule`/`list_schedules` + a timer-less `tick(now_ms)` (one-shot catches up if past due; cron re-arms by `CRON_STEP_MS = 60_000` and skips missed windows), and the `upload`/`delete_file`/`get_file_metadata`/`get_url` storage stubs. `search` approximates server behavior by mode — websearch operator matching (quoted phrases, `or` unions, `-term` exclusion, FM-31) with optional `_searchSnippet` highlights for `tsquery`, substring + similarity ranking for `trgm` (FM-30); `vector_search` over-approximates (no distance model — every table doc is a candidate, narrowed by the carried `filter`); rejected combinations still throw. |
 
 `core` (wire types, schema/query/mutation builders, error model) compiles with
 no features. `[lints.rust] warnings = "deny"` — same zero-warning posture as the
@@ -48,7 +48,7 @@ upsert-insert only; `patch` never re-applies).
 ### In-memory test harness (feature `in_memory`)
 
 `InMemoryRtDbClient` mirrors the server's schema/query/txn/step-result semantics
-with no network and no Postgres — a direct port of `ts-client/src/in_memory.ts`.
+with no network and no Postgres — a direct port of `ts-client/src/in_memory/`.
 It exposes the same data surface as the live clients (`push_schema`,
 `run`/`run_query`, `mutate` with `mut_id` idempotency, and reactive `subscribe`)
 so a unit test can swap it in behind a shared interface. Atomic rollback on step
@@ -102,7 +102,11 @@ let _one: Option<Item> = db.get("items", "i1").await?;
 
 `run` deserializes `{result}` into `T` — use the terminal that matches `T`
 (`collect`/`take` → `Vec<T>`, `first`/`unique`/`get` → `Option<T>`,
-`count` → `i64`, `paginate` → `Paginated<T>`).
+`count` → `i64`, `paginate` → `Paginated<T>`). For many independent queries in
+one round trip, `batch_query(&[Query])` fans out via `POST /api/query-batch` and
+returns a length-aligned `Vec<BatchQueryOutcome>` (each slot's `result` is a raw
+`serde_json::Value` because a batch spans terminals; a per-query error is that
+slot's `{ok:false,error}` and never fails the call).
 
 ## Scheduling
 
@@ -187,15 +191,16 @@ of this (see `src/in_memory/tests.rs`).
 
 Destructive/type-changing schema transformations are a deliberate admin operation,
 separate from the additive `push_schema`. Build a `Migration` (feature `admin`)
-and apply it via `RtDbHttpClient::migrate_schema` — `POST /admin/db/{db}/migrate`
+and apply it via `db.admin_client().migrate_schema(...)` — `POST /admin/db/{db}/migrate`
 runs the directives transactionally inside the committer, so live queries, the op
-feed, audit, and webhooks all fire.
+feed, audit, and webhooks all fire. (`RtDbHttpClient::migrate_schema` still exists
+but is `#[deprecated]` — ARC-121 — prefer the admin client.)
 
 ```rust
 use par_rt_db_client::{Cast, FieldType, Migration};
 use serde_json::json;
 
-let result = db.migrate_schema("kanban", &Migration::new()
+let result = db.admin_client().migrate_schema("kanban", &Migration::new()
     .rename_field("items", "title", "summary")
     .change_type("items", "order", FieldType::String, Cast::ToString, Some(json!("0")))
     .set_default("items", "status", json!("backlog"))
@@ -213,8 +218,9 @@ escape hatch (one table's `doc` jsonb, no joins/DDL). See
 
 ## File storage
 
-`RtDbHttpClient` exposes file storage (`upload` / `delete_file` /
-`get_file_metadata` / `get_url` / `get_signed_url`):
+`RtDbHttpClient` exposes file storage (`upload` / `upload_stream` /
+`delete_file` / `get_file_metadata` / `get_url` / `get_signed_url` /
+`transform_url`):
 
 ```rust
 use par_rt_db_client::UploadResult;
@@ -225,7 +231,10 @@ db.delete_file(&up.id).await?;
 ```
 
 `upload` POSTs raw bytes to `POST /api/storage/{db}` (the client injects its
-db); `get_url` returns `{url}/storage/{id}`; `get_signed_url` calls
+db); `upload_stream` forwards a `TryStream` chunk-by-chunk instead of buffering
+the whole file (ENH-021 — one chunk in flight at a time); `get_url` returns
+`{url}/storage/{id}`; `transform_url(id, &TransformOpts)` appends image-transform
+params to that URL (no request made); `get_signed_url` calls
 `GET /api/storage/{db}/{id}/signed-url?ttlSeconds=` to mint a signed,
 time-limited URL (returns `{url, expiresAt}`). Storage is HTTP-only.
 
