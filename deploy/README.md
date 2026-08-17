@@ -66,6 +66,12 @@ cd /docker/par-rt-db
 docker compose up -d --build
 docker compose ps
 curl -fsS http://127.0.0.1:8300/healthz | jq .
+# -> {"status":"ok","started_at":..,"uptime_seconds":..,"postgres":true}
+# The build fingerprint ("version"/"git_commit"/"build_timestamp") is
+# admin-only (SEC-129) — omitted from unauthenticated responses so an
+# anonymous prober cannot pin the deployed version. To confirm the deployed
+# commit, re-run with the admin bearer:
+#   curl -fsS http://127.0.0.1:8300/healthz -H "Authorization: Bearer $RTDB_ADMIN_KEY" | jq .
 # -> {"status":"ok","version":"<crate-version>","git_commit":"<sha>","build_timestamp":..,
 #     "started_at":..,"uptime_seconds":..,"postgres":true}
 # A 503 with "status":"degraded"/"postgres":false means the server is up but
@@ -415,8 +421,9 @@ older commit.
    `/docker/par-rt-db` (the `.env` excludes keep the live secrets intact), and
    rebuilds the image on the host (`docker compose up -d --build`).
 
-2. Verify: `curl -fsS https://rtdb.pardev.net/healthz | jq .` reports the
-   expected `git_commit` (the redeployed sha), and a spot query against a row
+2. Verify: `curl -fsS https://rtdb.pardev.net/healthz -H "Authorization: Bearer $RTDB_ADMIN_KEY" | jq .`
+   reports the expected `git_commit` (the redeployed sha; the fingerprint is
+   admin-only — SEC-129), and a spot query against a row
    you know was affected by the bad deploy behaves correctly again.
 
 3. Return the workstation to the deploy branch (`git checkout main`) so the
