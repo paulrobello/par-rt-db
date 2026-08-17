@@ -46,211 +46,7 @@ impl InMemoryRtDbClient {
             return self.execute_get_terminal(q, id, eq, has_range);
         }
 
-        // Conflicting-terminal guards (ports :919-939).
-        if q.unique
-            && (q.take.is_some() || q.order.is_some() || q.distinct || q.aggregate.is_some())
-        {
-            return Err(RtDbError::new(
-                ErrorCode::BadRequest,
-                "unique cannot be combined with take, order, distinct, or aggregate",
-            ));
-        }
-        if q.first && q.unique {
-            return Err(RtDbError::new(
-                ErrorCode::BadRequest,
-                "first cannot be combined with unique",
-            ));
-        }
-        if q.first && q.take.is_some() {
-            return Err(RtDbError::new(
-                ErrorCode::BadRequest,
-                "first cannot be combined with take",
-            ));
-        }
-        if q.first && q.distinct {
-            return Err(RtDbError::new(
-                ErrorCode::BadRequest,
-                "first cannot be combined with distinct",
-            ));
-        }
-        if q.first && q.aggregate.is_some() {
-            return Err(RtDbError::new(
-                ErrorCode::BadRequest,
-                "first cannot be combined with aggregate",
-            ));
-        }
-        if q.count && q.unique {
-            return Err(RtDbError::new(
-                ErrorCode::BadRequest,
-                "count cannot be combined with unique",
-            ));
-        }
-        if q.count && q.take.is_some() {
-            return Err(RtDbError::new(
-                ErrorCode::BadRequest,
-                "count cannot be combined with take",
-            ));
-        }
-        if q.count && q.first {
-            return Err(RtDbError::new(
-                ErrorCode::BadRequest,
-                "count cannot be combined with first",
-            ));
-        }
-        if q.count && q.order.is_some() {
-            return Err(RtDbError::new(
-                ErrorCode::BadRequest,
-                "count cannot be combined with order",
-            ));
-        }
-        if q.count && q.distinct {
-            return Err(RtDbError::new(
-                ErrorCode::BadRequest,
-                "count cannot be combined with distinct",
-            ));
-        }
-        if q.count && q.aggregate.is_some() {
-            return Err(RtDbError::new(
-                ErrorCode::BadRequest,
-                "count cannot be combined with aggregate",
-            ));
-        }
-        // Paginate combination guards (ports `:940-955`): paginate is one-shot
-        // paging, so it cannot also narrow to count/unique/first/take. (`get`
-        // is rejected above; `order`, index, eq, and range bounds are allowed.)
-        if q.paginate.is_some() {
-            if q.count {
-                return Err(RtDbError::new(
-                    ErrorCode::BadRequest,
-                    "paginate cannot be combined with count",
-                ));
-            }
-            if q.unique {
-                return Err(RtDbError::new(
-                    ErrorCode::BadRequest,
-                    "paginate cannot be combined with unique",
-                ));
-            }
-            if q.first {
-                return Err(RtDbError::new(
-                    ErrorCode::BadRequest,
-                    "paginate cannot be combined with first",
-                ));
-            }
-            if q.take.is_some() {
-                return Err(RtDbError::new(
-                    ErrorCode::BadRequest,
-                    "paginate cannot be combined with take",
-                ));
-            }
-        }
-        if q.gt.is_some() && q.gte.is_some() {
-            return Err(RtDbError::new(
-                ErrorCode::BadRequest,
-                "gt and gte cannot both be set",
-            ));
-        }
-        if q.lt.is_some() && q.lte.is_some() {
-            return Err(RtDbError::new(
-                ErrorCode::BadRequest,
-                "lt and lte cannot both be set",
-            ));
-        }
-        if q.take.is_some_and(|t| t as usize > MAX_TAKE) {
-            return Err(RtDbError::new(
-                ErrorCode::BadRequest,
-                format!("take exceeds maximum of {MAX_TAKE}"),
-            ));
-        }
-
-        // `distinct`/`aggregate` are standalone terminals (like `count`): they
-        // compose only with index/eq/range/filter. `get`/`unique`/`first`/`count`
-        // rejected their own combinations above (validated first, matching the
-        // server's check order in query.rs), so these blocks only reject the
-        // remaining peers each terminal owns — mirroring the server's
-        // DISTINCT/AGGREGATE_INCOMPATIBLES tables.
-        if q.distinct {
-            if q.take.is_some() {
-                return Err(RtDbError::new(
-                    ErrorCode::BadRequest,
-                    "distinct cannot be combined with take",
-                ));
-            }
-            if q.order.is_some() {
-                return Err(RtDbError::new(
-                    ErrorCode::BadRequest,
-                    "distinct cannot be combined with order",
-                ));
-            }
-            if q.aggregate.is_some() {
-                return Err(RtDbError::new(
-                    ErrorCode::BadRequest,
-                    "distinct cannot be combined with aggregate",
-                ));
-            }
-            if q.paginate.is_some() {
-                return Err(RtDbError::new(
-                    ErrorCode::BadRequest,
-                    "distinct cannot be combined with paginate",
-                ));
-            }
-            if q.search.is_some() {
-                return Err(RtDbError::new(
-                    ErrorCode::BadRequest,
-                    "distinct cannot be combined with search",
-                ));
-            }
-            if q.vector_search.is_some() {
-                return Err(RtDbError::new(
-                    ErrorCode::BadRequest,
-                    "distinct cannot be combined with vector search",
-                ));
-            }
-            if q.hybrid_search.is_some() {
-                return Err(RtDbError::new(
-                    ErrorCode::BadRequest,
-                    "distinct cannot be combined with hybrid search",
-                ));
-            }
-        }
-        if q.aggregate.is_some() {
-            if q.take.is_some() {
-                return Err(RtDbError::new(
-                    ErrorCode::BadRequest,
-                    "aggregate cannot be combined with take",
-                ));
-            }
-            if q.order.is_some() {
-                return Err(RtDbError::new(
-                    ErrorCode::BadRequest,
-                    "aggregate cannot be combined with order",
-                ));
-            }
-            if q.paginate.is_some() {
-                return Err(RtDbError::new(
-                    ErrorCode::BadRequest,
-                    "aggregate cannot be combined with paginate",
-                ));
-            }
-            if q.search.is_some() {
-                return Err(RtDbError::new(
-                    ErrorCode::BadRequest,
-                    "aggregate cannot be combined with search",
-                ));
-            }
-            if q.vector_search.is_some() {
-                return Err(RtDbError::new(
-                    ErrorCode::BadRequest,
-                    "aggregate cannot be combined with vector search",
-                ));
-            }
-            if q.hybrid_search.is_some() {
-                return Err(RtDbError::new(
-                    ErrorCode::BadRequest,
-                    "aggregate cannot be combined with hybrid search",
-                ));
-            }
-        }
+        check_query_combinations(q)?;
 
         // `vectorSearch` terminal — cascade mirror of server `execute_query`.
         // In-memory replica approximation: there is no pgvector distance model
@@ -291,159 +87,8 @@ impl InMemoryRtDbClient {
             return self.execute_search_terminal(q, search, &table_def, eq, has_range);
         }
 
-        // Resolve index — required for `eq` and for any range bound.
-        let index_def: Option<IndexDef> = match &q.index {
-            Some(name) => Some(require_index(&table_def, name)?.clone()),
-            None if !eq.is_empty() => {
-                return Err(RtDbError::new(
-                    ErrorCode::BadRequest,
-                    "eq requires an index",
-                ));
-            }
-            _ => None,
-        };
-
-        // eq-arity check (server `eq_binds` length guard at :1033-1038).
-        if let Some(idx) = &index_def
-            && eq.len() > idx.fields.len()
-        {
-            return Err(RtDbError::new(
-                ErrorCode::BadRequest,
-                format!(
-                    "index '{}' expects at most {} eq value(s), got {}",
-                    idx.name,
-                    idx.fields.len(),
-                    eq.len()
-                ),
-            ));
-        }
-
-        // Type-check each eq prefix bind positionally.
-        let typed_eq: Vec<Value> = match &index_def {
-            Some(idx) => {
-                let mut out = Vec::with_capacity(eq.len());
-                for (i, value) in eq.iter().enumerate() {
-                    out.push(coerce_index_value(&table_def, &idx.fields[i], value)?);
-                }
-                out
-            }
-            None => Vec::new(),
-        };
-
-        // Range bounds apply to the next index field after the eq prefix.
-        let range_field: Option<&str> = if has_range {
-            let idx = index_def.as_ref().ok_or_else(|| {
-                RtDbError::new(ErrorCode::BadRequest, "range bound requires an index")
-            })?;
-            if eq.len() >= idx.fields.len() {
-                return Err(RtDbError::new(
-                    ErrorCode::BadRequest,
-                    "range bound requires a remaining index field after eq",
-                ));
-            }
-            Some(idx.fields[eq.len()].as_str())
-        } else {
-            None
-        };
-        // The range field's storage type selects the comparison domain for the
-        // bound checks below (int64 sorts numerically). `coerce_index_value`
-        // already validated indexability when binding each bound, so the lookup
-        // is guaranteed to succeed; the `Text` fallback is purely defensive.
-        let range_field_pg: PgType = match range_field {
-            Some(f) => table_def
-                .fields
-                .get(f)
-                .and_then(|ty| index_column_type(ty).ok())
-                .map(|it| it.pg)
-                .unwrap_or(PgType::Text),
-            None => PgType::Text,
-        };
-        let gt = match (&q.gt, range_field) {
-            (Some(v), Some(f)) => Some(coerce_index_value(&table_def, f, v)?),
-            _ => None,
-        };
-        let gte = match (&q.gte, range_field) {
-            (Some(v), Some(f)) => Some(coerce_index_value(&table_def, f, v)?),
-            _ => None,
-        };
-        let lt = match (&q.lt, range_field) {
-            (Some(v), Some(f)) => Some(coerce_index_value(&table_def, f, v)?),
-            _ => None,
-        };
-        let lte = match (&q.lte, range_field) {
-            (Some(v), Some(f)) => Some(coerce_index_value(&table_def, f, v)?),
-            _ => None,
-        };
-
-        // Compile the filter against the table's declared fields once up front,
-        // mirroring the server's compile-then-execute order. Surfaces the
-        // BAD_REQUEST cases (unknown field, empty and/or/in, mixed-type `in`
-        // values, wrong value-kind) before any row is touched.
-        if let Some(filter) = &q.filter {
-            let fields: BTreeSet<String> = table_def.fields.keys().cloned().collect();
-            validate_filter(filter, &fields)?;
-        }
-
-        // Row fetch + filter (eq prefix → range → filter hook).
-        let mut filtered: Vec<StoredRow> = Vec::new();
-        for ((t, _id), row) in &self.docs {
-            if t != &q.table {
-                continue;
-            }
-            // FM-33: a soft-deleted row is absent to every read terminal
-            // (the server composes the same live-only predicate into every
-            // scan WHERE).
-            if row.deleted_at.is_some() {
-                continue;
-            }
-            if let Some(idx) = &index_def {
-                let mut ok = true;
-                for (i, tv) in typed_eq.iter().enumerate() {
-                    match row.doc.get(&idx.fields[i]) {
-                        Some(v) if !v.is_null() && v == tv => {}
-                        _ => {
-                            ok = false;
-                            break;
-                        }
-                    }
-                }
-                if !ok {
-                    continue;
-                }
-            }
-            if let Some(field) = range_field {
-                let v = match row.doc.get(field) {
-                    Some(v) if !v.is_null() => v,
-                    _ => continue,
-                };
-                if let Some(bound) = &gt
-                    && compare_index_values(v, bound, range_field_pg) != std::cmp::Ordering::Greater
-                {
-                    continue;
-                }
-                if let Some(bound) = &gte
-                    && compare_index_values(v, bound, range_field_pg) == std::cmp::Ordering::Less
-                {
-                    continue;
-                }
-                if let Some(bound) = &lt
-                    && compare_index_values(v, bound, range_field_pg) != std::cmp::Ordering::Less
-                {
-                    continue;
-                }
-                if let Some(bound) = &lte
-                    && compare_index_values(v, bound, range_field_pg) == std::cmp::Ordering::Greater
-                {
-                    continue;
-                }
-            }
-            if let Some(expr) = &q.filter
-                && !matches_filter(expr, &row.doc)
-            {
-                continue;
-            }
-            filtered.push(row.clone());
-        }
+        let plan = prepare_scan(q, &table_def, eq, has_range)?;
+        let mut filtered = self.fetch_filtered_rows(q, &plan);
 
         // `count` short-circuits before the sort (the count is the cardinality
         // of the filtered set, regardless of ordering).
@@ -458,8 +103,8 @@ impl InMemoryRtDbClient {
         if q.distinct {
             return self.execute_distinct_terminal(
                 &table_def,
-                index_def.as_ref(),
-                &typed_eq,
+                plan.index_def.as_ref(),
+                &plan.typed_eq,
                 &filtered,
             );
         }
@@ -474,8 +119,8 @@ impl InMemoryRtDbClient {
             return self.execute_aggregate_terminal(
                 agg,
                 &table_def,
-                index_def.as_ref(),
-                &typed_eq,
+                plan.index_def.as_ref(),
+                &plan.typed_eq,
                 &filtered,
             );
         }
@@ -484,43 +129,7 @@ impl InMemoryRtDbClient {
         // `_creationTime`, then `_id`. The unique `id` tiebreaker means the
         // order is total — no row is ambiguous relative to another.
         let dir = q.order.unwrap_or(Order::Asc);
-        // Per-sort-column storage types — the comparator needs the domain to
-        // pick numeric vs lexicographic ordering (int64 indexes store decimal
-        // strings, which would otherwise sort lexicographically). The eq prefix
-        // and range field have already been validated as indexable by
-        // `coerce_index_value`; any remaining index field is schema-declared
-        // indexable, so the lookup is total — the `Text` fallback is defensive.
-        let sort_field_pgs: Vec<PgType> = match &index_def {
-            Some(idx) => idx.fields[typed_eq.len()..]
-                .iter()
-                .map(|f| {
-                    table_def
-                        .fields
-                        .get(f)
-                        .and_then(|ty| index_column_type(ty).ok())
-                        .map(|it| it.pg)
-                        .unwrap_or(PgType::Text)
-                })
-                .collect(),
-            None => Vec::new(),
-        };
-        filtered.sort_by(|a, b| {
-            if let Some(idx) = &index_def {
-                for (i, field) in idx.fields[typed_eq.len()..].iter().enumerate() {
-                    let av = a.doc.get(field).unwrap_or(&Value::Null);
-                    let bv = b.doc.get(field).unwrap_or(&Value::Null);
-                    let cmp = compare_index_values(av, bv, sort_field_pgs[i]);
-                    if cmp != std::cmp::Ordering::Equal {
-                        return dir_order(cmp, dir);
-                    }
-                }
-            }
-            let cmp = a.created_at.cmp(&b.created_at);
-            if cmp != std::cmp::Ordering::Equal {
-                return dir_order(cmp, dir);
-            }
-            dir_order(a.id.cmp(&b.id), dir)
-        });
+        sort_filtered_rows(&mut filtered, &table_def, &plan, dir);
 
         // `paginate` terminal: keyset-cursor paging over the sorted set. Ports
         // TS `executeQuery` :1135-1137 → `paginateResult` (`:1164-1202`). The
@@ -528,33 +137,83 @@ impl InMemoryRtDbClient {
         // eq prefix, then `_creationTime`, then `_id`); the cursor encodes one
         // value per column.
         if let Some(pag) = &q.paginate {
-            let mut sort_cols: Vec<SortCol> = Vec::new();
-            if let Some(idx) = &index_def {
-                for field in idx.fields[typed_eq.len()..].iter() {
-                    sort_cols.push(SortCol::Index(field.clone()));
-                }
-            }
-            sort_cols.push(SortCol::CreatedAt);
-            sort_cols.push(SortCol::Id);
-            // Mirror the sort caller's per-column storage types so keyset
-            // resume agrees with the ordering that produced `filtered`.
-            let col_types: Vec<PgType> = sort_cols
-                .iter()
-                .map(|c| match c {
-                    SortCol::Index(field) => table_def
-                        .fields
-                        .get(field)
-                        .and_then(|ty| index_column_type(ty).ok())
-                        .map(|it| it.pg)
-                        .unwrap_or(PgType::Text),
-                    SortCol::CreatedAt => PgType::Number,
-                    SortCol::Id => PgType::Text,
-                })
-                .collect();
-            return paginate_result(pag, &table_def, &filtered, &sort_cols, &col_types, dir);
+            return execute_paginate_terminal(pag, &table_def, &filtered, &plan, dir);
         }
 
         self.execute_collect_terminal(q, filtered)
+    }
+
+    /// Row fetch + filter (eq prefix → range → filter hook) over
+    /// `self.docs`, per `plan`. FM-33: a soft-deleted row is absent to every
+    /// read terminal (the server composes the same live-only predicate into
+    /// every scan WHERE). Mirrors the ts/python engines' `fetchFilteredRows`
+    /// / `_fetch_filtered_rows`.
+    fn fetch_filtered_rows(&self, q: &Query, plan: &ScanPlan) -> Vec<StoredRow> {
+        // Row fetch + filter (eq prefix → range → filter hook).
+        let mut filtered: Vec<StoredRow> = Vec::new();
+        for ((t, _id), row) in &self.docs {
+            if t != &q.table {
+                continue;
+            }
+            // FM-33: a soft-deleted row is absent to every read terminal
+            // (the server composes the same live-only predicate into every
+            // scan WHERE).
+            if row.deleted_at.is_some() {
+                continue;
+            }
+            if let Some(idx) = &plan.index_def {
+                let mut ok = true;
+                for (i, tv) in plan.typed_eq.iter().enumerate() {
+                    match row.doc.get(&idx.fields[i]) {
+                        Some(v) if !v.is_null() && v == tv => {}
+                        _ => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if !ok {
+                    continue;
+                }
+            }
+            if let Some(field) = plan.range_field.as_deref() {
+                let v = match row.doc.get(field) {
+                    Some(v) if !v.is_null() => v,
+                    _ => continue,
+                };
+                if let Some(bound) = &plan.gt
+                    && compare_index_values(v, bound, plan.range_field_pg)
+                        != std::cmp::Ordering::Greater
+                {
+                    continue;
+                }
+                if let Some(bound) = &plan.gte
+                    && compare_index_values(v, bound, plan.range_field_pg)
+                        == std::cmp::Ordering::Less
+                {
+                    continue;
+                }
+                if let Some(bound) = &plan.lt
+                    && compare_index_values(v, bound, plan.range_field_pg)
+                        != std::cmp::Ordering::Less
+                {
+                    continue;
+                }
+                if let Some(bound) = &plan.lte
+                    && compare_index_values(v, bound, plan.range_field_pg)
+                        == std::cmp::Ordering::Greater
+                {
+                    continue;
+                }
+            }
+            if let Some(expr) = &q.filter
+                && !matches_filter(expr, &row.doc)
+            {
+                continue;
+            }
+            filtered.push(row.clone());
+        }
+        filtered
     }
 
     /// `get` terminal — exclusive of every other clause.
@@ -1124,6 +783,434 @@ impl InMemoryRtDbClient {
             .collect();
         Ok(Value::Array(out))
     }
+}
+
+/// Conflicting-terminal guards, in the server's validation order: each
+/// terminal rejects the peers it cannot compose with, then the range-bound
+/// and take-cap checks apply to every remaining shape. Mirrors the ts/python
+/// engines' `checkQueryCombinations` / `_check_query_combinations`.
+fn check_query_combinations(q: &Query) -> Result<(), RtDbError> {
+    // Conflicting-terminal guards (ports :919-939).
+    if q.unique && (q.take.is_some() || q.order.is_some() || q.distinct || q.aggregate.is_some()) {
+        return Err(RtDbError::new(
+            ErrorCode::BadRequest,
+            "unique cannot be combined with take, order, distinct, or aggregate",
+        ));
+    }
+    if q.first && q.unique {
+        return Err(RtDbError::new(
+            ErrorCode::BadRequest,
+            "first cannot be combined with unique",
+        ));
+    }
+    if q.first && q.take.is_some() {
+        return Err(RtDbError::new(
+            ErrorCode::BadRequest,
+            "first cannot be combined with take",
+        ));
+    }
+    if q.first && q.distinct {
+        return Err(RtDbError::new(
+            ErrorCode::BadRequest,
+            "first cannot be combined with distinct",
+        ));
+    }
+    if q.first && q.aggregate.is_some() {
+        return Err(RtDbError::new(
+            ErrorCode::BadRequest,
+            "first cannot be combined with aggregate",
+        ));
+    }
+    if q.count && q.unique {
+        return Err(RtDbError::new(
+            ErrorCode::BadRequest,
+            "count cannot be combined with unique",
+        ));
+    }
+    if q.count && q.take.is_some() {
+        return Err(RtDbError::new(
+            ErrorCode::BadRequest,
+            "count cannot be combined with take",
+        ));
+    }
+    if q.count && q.first {
+        return Err(RtDbError::new(
+            ErrorCode::BadRequest,
+            "count cannot be combined with first",
+        ));
+    }
+    if q.count && q.order.is_some() {
+        return Err(RtDbError::new(
+            ErrorCode::BadRequest,
+            "count cannot be combined with order",
+        ));
+    }
+    if q.count && q.distinct {
+        return Err(RtDbError::new(
+            ErrorCode::BadRequest,
+            "count cannot be combined with distinct",
+        ));
+    }
+    if q.count && q.aggregate.is_some() {
+        return Err(RtDbError::new(
+            ErrorCode::BadRequest,
+            "count cannot be combined with aggregate",
+        ));
+    }
+    // Paginate combination guards (ports `:940-955`): paginate is one-shot
+    // paging, so it cannot also narrow to count/unique/first/take. (`get`
+    // is rejected above; `order`, index, eq, and range bounds are allowed.)
+    if q.paginate.is_some() {
+        if q.count {
+            return Err(RtDbError::new(
+                ErrorCode::BadRequest,
+                "paginate cannot be combined with count",
+            ));
+        }
+        if q.unique {
+            return Err(RtDbError::new(
+                ErrorCode::BadRequest,
+                "paginate cannot be combined with unique",
+            ));
+        }
+        if q.first {
+            return Err(RtDbError::new(
+                ErrorCode::BadRequest,
+                "paginate cannot be combined with first",
+            ));
+        }
+        if q.take.is_some() {
+            return Err(RtDbError::new(
+                ErrorCode::BadRequest,
+                "paginate cannot be combined with take",
+            ));
+        }
+    }
+    if q.gt.is_some() && q.gte.is_some() {
+        return Err(RtDbError::new(
+            ErrorCode::BadRequest,
+            "gt and gte cannot both be set",
+        ));
+    }
+    if q.lt.is_some() && q.lte.is_some() {
+        return Err(RtDbError::new(
+            ErrorCode::BadRequest,
+            "lt and lte cannot both be set",
+        ));
+    }
+    if q.take.is_some_and(|t| t as usize > MAX_TAKE) {
+        return Err(RtDbError::new(
+            ErrorCode::BadRequest,
+            format!("take exceeds maximum of {MAX_TAKE}"),
+        ));
+    }
+
+    // `distinct`/`aggregate` are standalone terminals (like `count`): they
+    // compose only with index/eq/range/filter. `get`/`unique`/`first`/`count`
+    // rejected their own combinations above (validated first, matching the
+    // server's check order in query.rs), so these blocks only reject the
+    // remaining peers each terminal owns — mirroring the server's
+    // DISTINCT/AGGREGATE_INCOMPATIBLES tables.
+    if q.distinct {
+        if q.take.is_some() {
+            return Err(RtDbError::new(
+                ErrorCode::BadRequest,
+                "distinct cannot be combined with take",
+            ));
+        }
+        if q.order.is_some() {
+            return Err(RtDbError::new(
+                ErrorCode::BadRequest,
+                "distinct cannot be combined with order",
+            ));
+        }
+        if q.aggregate.is_some() {
+            return Err(RtDbError::new(
+                ErrorCode::BadRequest,
+                "distinct cannot be combined with aggregate",
+            ));
+        }
+        if q.paginate.is_some() {
+            return Err(RtDbError::new(
+                ErrorCode::BadRequest,
+                "distinct cannot be combined with paginate",
+            ));
+        }
+        if q.search.is_some() {
+            return Err(RtDbError::new(
+                ErrorCode::BadRequest,
+                "distinct cannot be combined with search",
+            ));
+        }
+        if q.vector_search.is_some() {
+            return Err(RtDbError::new(
+                ErrorCode::BadRequest,
+                "distinct cannot be combined with vector search",
+            ));
+        }
+        if q.hybrid_search.is_some() {
+            return Err(RtDbError::new(
+                ErrorCode::BadRequest,
+                "distinct cannot be combined with hybrid search",
+            ));
+        }
+    }
+    if q.aggregate.is_some() {
+        if q.take.is_some() {
+            return Err(RtDbError::new(
+                ErrorCode::BadRequest,
+                "aggregate cannot be combined with take",
+            ));
+        }
+        if q.order.is_some() {
+            return Err(RtDbError::new(
+                ErrorCode::BadRequest,
+                "aggregate cannot be combined with order",
+            ));
+        }
+        if q.paginate.is_some() {
+            return Err(RtDbError::new(
+                ErrorCode::BadRequest,
+                "aggregate cannot be combined with paginate",
+            ));
+        }
+        if q.search.is_some() {
+            return Err(RtDbError::new(
+                ErrorCode::BadRequest,
+                "aggregate cannot be combined with search",
+            ));
+        }
+        if q.vector_search.is_some() {
+            return Err(RtDbError::new(
+                ErrorCode::BadRequest,
+                "aggregate cannot be combined with vector search",
+            ));
+        }
+        if q.hybrid_search.is_some() {
+            return Err(RtDbError::new(
+                ErrorCode::BadRequest,
+                "aggregate cannot be combined with hybrid search",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Everything the row scan needs besides the query itself: the resolved
+/// index, the type-checked eq prefix, and the coerced range bounds. Produced
+/// once by `prepare_scan`, consumed by `fetch_filtered_rows` /
+/// `sort_filtered_rows` / `execute_paginate_terminal`. Mirrors the ts/python
+/// engines' `ScanPlan` / `_ScanPlan`.
+struct ScanPlan {
+    index_def: Option<IndexDef>,
+    typed_eq: Vec<Value>,
+    range_field: Option<String>,
+    range_field_pg: PgType,
+    gt: Option<Value>,
+    gte: Option<Value>,
+    lt: Option<Value>,
+    lte: Option<Value>,
+}
+
+/// Index resolution, eq-prefix binding, range-bound coercion, and one-time
+/// filter validation — everything the row scan needs before touching a row.
+/// Mirrors the ts/python engines' `prepareScan` / `_prepare_scan`.
+fn prepare_scan(
+    q: &Query,
+    table_def: &TableDef,
+    eq: &[Value],
+    has_range: bool,
+) -> Result<ScanPlan, RtDbError> {
+    // Resolve index — required for `eq` and for any range bound.
+    let index_def: Option<IndexDef> = match &q.index {
+        Some(name) => Some(require_index(table_def, name)?.clone()),
+        None if !eq.is_empty() => {
+            return Err(RtDbError::new(
+                ErrorCode::BadRequest,
+                "eq requires an index",
+            ));
+        }
+        _ => None,
+    };
+
+    // eq-arity check (server `eq_binds` length guard at :1033-1038).
+    if let Some(idx) = &index_def
+        && eq.len() > idx.fields.len()
+    {
+        return Err(RtDbError::new(
+            ErrorCode::BadRequest,
+            format!(
+                "index '{}' expects at most {} eq value(s), got {}",
+                idx.name,
+                idx.fields.len(),
+                eq.len()
+            ),
+        ));
+    }
+
+    // Type-check each eq prefix bind positionally.
+    let typed_eq: Vec<Value> = match &index_def {
+        Some(idx) => {
+            let mut out = Vec::with_capacity(eq.len());
+            for (i, value) in eq.iter().enumerate() {
+                out.push(coerce_index_value(table_def, &idx.fields[i], value)?);
+            }
+            out
+        }
+        None => Vec::new(),
+    };
+
+    // Range bounds apply to the next index field after the eq prefix.
+    let range_field: Option<String> = if has_range {
+        let idx = index_def.as_ref().ok_or_else(|| {
+            RtDbError::new(ErrorCode::BadRequest, "range bound requires an index")
+        })?;
+        if eq.len() >= idx.fields.len() {
+            return Err(RtDbError::new(
+                ErrorCode::BadRequest,
+                "range bound requires a remaining index field after eq",
+            ));
+        }
+        Some(idx.fields[eq.len()].clone())
+    } else {
+        None
+    };
+    // The range field's storage type selects the comparison domain for the
+    // bound checks below (int64 sorts numerically). `coerce_index_value`
+    // already validated indexability when binding each bound, so the lookup
+    // is guaranteed to succeed; the `Text` fallback is purely defensive.
+    let range_field_pg: PgType = match range_field.as_deref() {
+        Some(f) => table_def
+            .fields
+            .get(f)
+            .and_then(|ty| index_column_type(ty).ok())
+            .map(|it| it.pg)
+            .unwrap_or(PgType::Text),
+        None => PgType::Text,
+    };
+    let gt = match (&q.gt, range_field.as_deref()) {
+        (Some(v), Some(f)) => Some(coerce_index_value(table_def, f, v)?),
+        _ => None,
+    };
+    let gte = match (&q.gte, range_field.as_deref()) {
+        (Some(v), Some(f)) => Some(coerce_index_value(table_def, f, v)?),
+        _ => None,
+    };
+    let lt = match (&q.lt, range_field.as_deref()) {
+        (Some(v), Some(f)) => Some(coerce_index_value(table_def, f, v)?),
+        _ => None,
+    };
+    let lte = match (&q.lte, range_field.as_deref()) {
+        (Some(v), Some(f)) => Some(coerce_index_value(table_def, f, v)?),
+        _ => None,
+    };
+
+    // Compile the filter against the table's declared fields once up front,
+    // mirroring the server's compile-then-execute order. Surfaces the
+    // BAD_REQUEST cases (unknown field, empty and/or/in, mixed-type `in`
+    // values, wrong value-kind) before any row is touched.
+    if let Some(filter) = &q.filter {
+        let fields: BTreeSet<String> = table_def.fields.keys().cloned().collect();
+        validate_filter(filter, &fields)?;
+    }
+    Ok(ScanPlan {
+        index_def,
+        typed_eq,
+        range_field,
+        range_field_pg,
+        gt,
+        gte,
+        lt,
+        lte,
+    })
+}
+
+/// Sorts the filtered set in place by the shared sort columns (unbound index
+/// fields after the eq prefix, then `_creationTime`, then `_id`) in direction
+/// `dir`. The unique `id` tiebreaker means the order is total — no row is
+/// ambiguous relative to another. Mirrors the ts/python engines'
+/// `sortFilteredRows` / `_sort_filtered_rows`.
+fn sort_filtered_rows(
+    filtered: &mut [StoredRow],
+    table_def: &TableDef,
+    plan: &ScanPlan,
+    dir: Order,
+) {
+    // Per-sort-column storage types — the comparator needs the domain to
+    // pick numeric vs lexicographic ordering (int64 indexes store decimal
+    // strings, which would otherwise sort lexicographically). The eq prefix
+    // and range field have already been validated as indexable by
+    // `coerce_index_value`; any remaining index field is schema-declared
+    // indexable, so the lookup is total — the `Text` fallback is defensive.
+    let sort_field_pgs: Vec<PgType> = match &plan.index_def {
+        Some(idx) => idx.fields[plan.typed_eq.len()..]
+            .iter()
+            .map(|f| {
+                table_def
+                    .fields
+                    .get(f)
+                    .and_then(|ty| index_column_type(ty).ok())
+                    .map(|it| it.pg)
+                    .unwrap_or(PgType::Text)
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+    filtered.sort_by(|a, b| {
+        if let Some(idx) = &plan.index_def {
+            for (i, field) in idx.fields[plan.typed_eq.len()..].iter().enumerate() {
+                let av = a.doc.get(field).unwrap_or(&Value::Null);
+                let bv = b.doc.get(field).unwrap_or(&Value::Null);
+                let cmp = compare_index_values(av, bv, sort_field_pgs[i]);
+                if cmp != std::cmp::Ordering::Equal {
+                    return dir_order(cmp, dir);
+                }
+            }
+        }
+        let cmp = a.created_at.cmp(&b.created_at);
+        if cmp != std::cmp::Ordering::Equal {
+            return dir_order(cmp, dir);
+        }
+        dir_order(a.id.cmp(&b.id), dir)
+    });
+}
+
+/// `paginate` terminal: keyset-cursor paging over the already-filtered,
+/// already-sorted set. The sort columns mirror the producing sort (unbound
+/// index fields after the eq prefix, then `_creationTime`, then `_id`); the
+/// cursor encodes one value per column. Mirrors the ts/python engines'
+/// `executePaginateTerminal` / `_execute_paginate_terminal`.
+fn execute_paginate_terminal(
+    pag: &crate::query::Paginate,
+    table_def: &TableDef,
+    filtered: &[StoredRow],
+    plan: &ScanPlan,
+    dir: Order,
+) -> Result<Value, RtDbError> {
+    let mut sort_cols: Vec<SortCol> = Vec::new();
+    if let Some(idx) = &plan.index_def {
+        for field in idx.fields[plan.typed_eq.len()..].iter() {
+            sort_cols.push(SortCol::Index(field.clone()));
+        }
+    }
+    sort_cols.push(SortCol::CreatedAt);
+    sort_cols.push(SortCol::Id);
+    // Mirror the sort caller's per-column storage types so keyset
+    // resume agrees with the ordering that produced `filtered`.
+    let col_types: Vec<PgType> = sort_cols
+        .iter()
+        .map(|c| match c {
+            SortCol::Index(field) => table_def
+                .fields
+                .get(field)
+                .and_then(|ty| index_column_type(ty).ok())
+                .map(|it| it.pg)
+                .unwrap_or(PgType::Text),
+            SortCol::CreatedAt => PgType::Number,
+            SortCol::Id => PgType::Text,
+        })
+        .collect();
+    paginate_result(pag, table_def, filtered, &sort_cols, &col_types, dir)
 }
 
 /// One operand of a parsed websearch query (the FM-31 harness approximation

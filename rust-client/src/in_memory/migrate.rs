@@ -15,102 +15,13 @@ impl InMemoryRtDbClient {
         planned: &mut SchemaDef,
         d: &crate::wire::admin::Directive,
     ) -> Result<(crate::wire::admin::DirectiveReport, Option<String>), RtDbError> {
-        use crate::wire::admin::{Directive, DirectiveReport};
+        use crate::wire::admin::Directive;
         match d {
             Directive::RenameField { table, from, to } => {
-                let t = migrate_table_mut(planned, table)?;
-                if t.fields.contains_key(to) {
-                    return Err(RtDbError::new(
-                        ErrorCode::BadRequest,
-                        format!("rename target '{table}.{to}' already exists"),
-                    ));
-                }
-                let ft = t.fields.remove(from).ok_or_else(|| {
-                    RtDbError::new(
-                        ErrorCode::BadRequest,
-                        format!("renamed field '{table}.{from}' does not exist"),
-                    )
-                })?;
-                t.fields.insert(to.clone(), ft);
-                if let Some(indexes) = t.indexes.as_mut() {
-                    for ix in indexes.iter_mut() {
-                        for f in ix.fields.iter_mut() {
-                            if f == from {
-                                *f = to.clone();
-                            }
-                        }
-                    }
-                }
-                if t.owner_field.as_deref() == Some(from.as_str()) {
-                    t.owner_field = Some(to.clone());
-                }
-                if t.collaborators_field.as_deref() == Some(from.as_str()) {
-                    t.collaborators_field = Some(to.clone());
-                }
-                let mut affected = 0i64;
-                for ((tname, _), row) in self.docs.iter_mut() {
-                    if tname != table {
-                        continue;
-                    }
-                    if let Some(obj) = row.doc.as_object_mut()
-                        && let Some(v) = obj.remove(from)
-                    {
-                        obj.insert(to.clone(), v);
-                        affected += 1;
-                    }
-                }
-                Ok((
-                    DirectiveReport {
-                        op: "renameField".into(),
-                        affected_rows: affected,
-                        ..Default::default()
-                    },
-                    Some(table.clone()),
-                ))
+                self.apply_rename_field_directive(planned, table, from, to)
             }
             Directive::RenameTable { from, to } => {
-                if planned.tables.contains_key(to) {
-                    return Err(RtDbError::new(
-                        ErrorCode::BadRequest,
-                        format!("rename target table '{to}' already exists"),
-                    ));
-                }
-                let def = planned.tables.remove(from).ok_or_else(|| {
-                    RtDbError::new(
-                        ErrorCode::BadRequest,
-                        format!("renamed table '{from}' does not exist"),
-                    )
-                })?;
-                // Id references to `from` in other tables follow the rename.
-                for other in planned.tables.values_mut() {
-                    for ft in other.fields.values_mut() {
-                        if let FieldType::Id { table, .. } = ft
-                            && table == from
-                        {
-                            *table = to.clone();
-                        }
-                    }
-                }
-                planned.tables.insert(to.clone(), def);
-                // Rename the live doc keys `(from, id)` → `(to, id)`.
-                let ids: Vec<String> = self
-                    .docs
-                    .keys()
-                    .filter_map(|(t, id)| if t == from { Some(id.clone()) } else { None })
-                    .collect();
-                for id in ids {
-                    if let Some(row) = self.docs.remove(&(from.clone(), id.clone())) {
-                        self.docs.insert((to.clone(), id), row);
-                    }
-                }
-                Ok((
-                    DirectiveReport {
-                        op: "renameTable".into(),
-                        affected_rows: 0,
-                        ..Default::default()
-                    },
-                    Some(to.clone()),
-                ))
+                self.apply_rename_table_directive(planned, from, to)
             }
             Directive::ChangeType {
                 table,
@@ -119,192 +30,380 @@ impl InMemoryRtDbClient {
                 cast,
                 default,
             } => {
-                let t = migrate_table_mut(planned, table)?;
-                let old_ty = t.fields.get(field).ok_or_else(|| {
-                    RtDbError::new(
-                        ErrorCode::BadRequest,
-                        format!("changed field '{table}.{field}' does not exist"),
-                    )
-                })?;
-                if !cast_valid_for(*cast, old_ty) {
-                    return Err(RtDbError::new(
-                        ErrorCode::BadRequest,
-                        format!("cast {cast:?} is not valid for {table}.{field}"),
-                    ));
-                }
-                // Drop the immutable borrow of `old_ty` before mutating `self.docs`.
-                let field_owned = field.clone();
-                let mut affected = 0i64;
-                for ((tname, _), row) in self.docs.iter_mut() {
-                    if tname != table {
-                        continue;
-                    }
-                    let Some(obj) = row.doc.as_object_mut() else {
-                        continue;
-                    };
-                    let Some(val) = obj.get(&field_owned).cloned() else {
-                        continue;
-                    };
-                    affected += 1;
-                    if let Some(coerced) = coerce_value(*cast, &val) {
-                        obj.insert(field_owned.clone(), coerced);
-                    } else if let Some(d) = default {
-                        let dv = coerce_value(*cast, d).unwrap_or_else(|| d.clone());
-                        obj.insert(field_owned.clone(), dv);
-                    } else {
-                        return Err(RtDbError::new(
-                            ErrorCode::BadRequest,
-                            format!(
-                                "changeType cannot coerce value in {table}.{} ({val}) and no default given",
-                                row.id
-                            ),
-                        ));
-                    }
-                }
-                // Fold the new type into the planned schema (field is guaranteed
-                // present by the lookup above).
-                t.fields.insert(field_owned, to.clone());
-                Ok((
-                    DirectiveReport {
-                        op: "changeType".into(),
-                        affected_rows: affected,
-                        ..Default::default()
-                    },
-                    Some(table.clone()),
-                ))
+                self.apply_change_type_directive(planned, table, field, to, cast, default.as_ref())
             }
             Directive::DropField { table, field } => {
-                let t = migrate_table_mut(planned, table)?;
-                if t.fields.remove(field).is_none() {
-                    return Err(RtDbError::new(
-                        ErrorCode::BadRequest,
-                        format!("dropped field '{table}.{field}' does not exist"),
-                    ));
-                }
-                if let Some(indexes) = t.indexes.as_mut() {
-                    for ix in indexes.iter_mut() {
-                        ix.fields.retain(|f| f != field);
-                    }
-                }
-                if t.owner_field.as_deref() == Some(field.as_str()) {
-                    t.owner_field = None;
-                }
-                if t.collaborators_field.as_deref() == Some(field.as_str()) {
-                    t.collaborators_field = None;
-                }
-                // `affected_rows` counts only rows whose `doc` actually changes
-                // (rows carrying the field) — server parity. `obj.remove` returns
-                // the removed value, so count the row iff the key was present.
-                let mut affected = 0i64;
-                for ((tname, _), row) in self.docs.iter_mut() {
-                    if tname != table {
-                        continue;
-                    }
-                    if let Some(obj) = row.doc.as_object_mut()
-                        && obj.remove(field).is_some()
-                    {
-                        affected += 1;
-                    }
-                }
-                Ok((
-                    DirectiveReport {
-                        op: "dropField".into(),
-                        affected_rows: affected,
-                        ..Default::default()
-                    },
-                    Some(table.clone()),
-                ))
+                self.apply_drop_field_directive(planned, table, field)
             }
-            Directive::DropTable { name } => {
-                if planned.tables.remove(name).is_none() {
-                    return Err(RtDbError::new(
-                        ErrorCode::BadRequest,
-                        format!("dropped table '{name}' does not exist"),
-                    ));
-                }
-                let to_remove: Vec<String> = self
-                    .docs
-                    .keys()
-                    .filter_map(|(t, id)| if t == name { Some(id.clone()) } else { None })
-                    .collect();
-                let affected = to_remove.len() as i64;
-                for id in to_remove {
-                    self.docs.remove(&(name.clone(), id));
-                }
-                Ok((
-                    DirectiveReport {
-                        op: "dropTable".into(),
-                        affected_rows: affected,
-                        ..Default::default()
-                    },
-                    Some(name.clone()),
-                ))
-            }
+            Directive::DropTable { name } => self.apply_drop_table_directive(planned, name),
             Directive::DropIndex { table, name } => {
-                let t = migrate_table_mut(planned, table)?;
-                let indexes = t.indexes.as_mut().ok_or_else(|| {
-                    RtDbError::new(
-                        ErrorCode::BadRequest,
-                        format!("dropped index '{table}.{name}' does not exist"),
-                    )
-                })?;
-                if !indexes.iter().any(|ix| &ix.name == name) {
-                    return Err(RtDbError::new(
-                        ErrorCode::BadRequest,
-                        format!("dropped index '{table}.{name}' does not exist"),
-                    ));
-                }
-                indexes.retain(|ix| &ix.name != name);
-                Ok((
-                    DirectiveReport {
-                        op: "dropIndex".into(),
-                        affected_rows: 0,
-                        ..Default::default()
-                    },
-                    Some(table.clone()),
-                ))
+                self.apply_drop_index_directive(planned, table, name)
             }
             Directive::SetDefault {
                 table,
                 field,
                 value,
-            } => {
-                let t = migrate_table_mut(planned, table)?;
-                if !t.fields.contains_key(field) {
-                    return Err(RtDbError::new(
-                        ErrorCode::BadRequest,
-                        format!("setDefault target '{table}.{field}' does not exist"),
-                    ));
-                }
-                let mut affected = 0i64;
-                for ((tname, _), row) in self.docs.iter_mut() {
-                    if tname != table {
-                        continue;
-                    }
-                    if let Some(obj) = row.doc.as_object_mut()
-                        && !obj.contains_key(field)
-                    {
-                        obj.insert(field.clone(), value.clone());
-                        affected += 1;
-                    }
-                }
-                Ok((
-                    DirectiveReport {
-                        op: "setDefault".into(),
-                        affected_rows: affected,
-                        ..Default::default()
-                    },
-                    Some(table.clone()),
-                ))
-            }
-            // ENH-020: both the typed `ValueExpr` path and the legacy raw-SQL
-            // string path are unsupported in-memory — there is no SQL engine
-            // here. The match ignores `expr`/`where_clause` entirely.
-            Directive::EvalExpr { table, .. } => Err(RtDbError::new(
-                ErrorCode::BadRequest,
-                format!("evalExpr unsupported in-memory (table '{table}')"),
-            )),
+            } => self.apply_set_default_directive(planned, table, field, value),
+            Directive::EvalExpr { table, .. } => self.apply_eval_expr_directive(table),
         }
+    }
+
+    /// `renameField` directive — one function per directive kind, dispatched
+    /// by [`Self::apply_migration_directive`]. Mirrors the ts/python engines'
+    /// `applyRenameFieldDirective` / `_apply_rename_field_directive`.
+    fn apply_rename_field_directive(
+        &mut self,
+        planned: &mut SchemaDef,
+        table: &str,
+        from: &str,
+        to: &str,
+    ) -> Result<(crate::wire::admin::DirectiveReport, Option<String>), RtDbError> {
+        use crate::wire::admin::DirectiveReport;
+        let t = migrate_table_mut(planned, table)?;
+        if t.fields.contains_key(to) {
+            return Err(RtDbError::new(
+                ErrorCode::BadRequest,
+                format!("rename target '{table}.{to}' already exists"),
+            ));
+        }
+        let ft = t.fields.remove(from).ok_or_else(|| {
+            RtDbError::new(
+                ErrorCode::BadRequest,
+                format!("renamed field '{table}.{from}' does not exist"),
+            )
+        })?;
+        t.fields.insert(to.to_string(), ft);
+        if let Some(indexes) = t.indexes.as_mut() {
+            for ix in indexes.iter_mut() {
+                for f in ix.fields.iter_mut() {
+                    if f == from {
+                        *f = to.to_string();
+                    }
+                }
+            }
+        }
+        if t.owner_field.as_deref() == Some(from) {
+            t.owner_field = Some(to.to_string());
+        }
+        if t.collaborators_field.as_deref() == Some(from) {
+            t.collaborators_field = Some(to.to_string());
+        }
+        let mut affected = 0i64;
+        for ((tname, _), row) in self.docs.iter_mut() {
+            if tname != table {
+                continue;
+            }
+            if let Some(obj) = row.doc.as_object_mut()
+                && let Some(v) = obj.remove(from)
+            {
+                obj.insert(to.to_string(), v);
+                affected += 1;
+            }
+        }
+        Ok((
+            DirectiveReport {
+                op: "renameField".into(),
+                affected_rows: affected,
+                ..Default::default()
+            },
+            Some(table.to_string()),
+        ))
+    }
+
+    /// `renameTable` directive — one function per directive kind, dispatched
+    /// by [`Self::apply_migration_directive`]. Mirrors the ts/python engines'
+    /// `applyRenameTableDirective` / `_apply_rename_table_directive`.
+    fn apply_rename_table_directive(
+        &mut self,
+        planned: &mut SchemaDef,
+        from: &str,
+        to: &str,
+    ) -> Result<(crate::wire::admin::DirectiveReport, Option<String>), RtDbError> {
+        use crate::wire::admin::DirectiveReport;
+        if planned.tables.contains_key(to) {
+            return Err(RtDbError::new(
+                ErrorCode::BadRequest,
+                format!("rename target table '{to}' already exists"),
+            ));
+        }
+        let def = planned.tables.remove(from).ok_or_else(|| {
+            RtDbError::new(
+                ErrorCode::BadRequest,
+                format!("renamed table '{from}' does not exist"),
+            )
+        })?;
+        // Id references to `from` in other tables follow the rename.
+        for other in planned.tables.values_mut() {
+            for ft in other.fields.values_mut() {
+                if let FieldType::Id { table, .. } = ft
+                    && table == from
+                {
+                    *table = to.to_string();
+                }
+            }
+        }
+        planned.tables.insert(to.to_string(), def);
+        // Rename the live doc keys `(from, id)` → `(to, id)`.
+        let ids: Vec<String> = self
+            .docs
+            .keys()
+            .filter_map(|(t, id)| if t == from { Some(id.clone()) } else { None })
+            .collect();
+        for id in ids {
+            if let Some(row) = self.docs.remove(&(from.to_string(), id.clone())) {
+                self.docs.insert((to.to_string(), id), row);
+            }
+        }
+        Ok((
+            DirectiveReport {
+                op: "renameTable".into(),
+                affected_rows: 0,
+                ..Default::default()
+            },
+            Some(to.to_string()),
+        ))
+    }
+
+    /// `changeType` directive — one function per directive kind, dispatched
+    /// by [`Self::apply_migration_directive`]. Mirrors the ts/python engines'
+    /// `applyChangeTypeDirective` / `_apply_change_type_directive`.
+    fn apply_change_type_directive(
+        &mut self,
+        planned: &mut SchemaDef,
+        table: &str,
+        field: &str,
+        to: &FieldType,
+        cast: &crate::wire::admin::Cast,
+        default: Option<&Value>,
+    ) -> Result<(crate::wire::admin::DirectiveReport, Option<String>), RtDbError> {
+        use crate::wire::admin::DirectiveReport;
+        let t = migrate_table_mut(planned, table)?;
+        let old_ty = t.fields.get(field).ok_or_else(|| {
+            RtDbError::new(
+                ErrorCode::BadRequest,
+                format!("changed field '{table}.{field}' does not exist"),
+            )
+        })?;
+        if !cast_valid_for(*cast, old_ty) {
+            return Err(RtDbError::new(
+                ErrorCode::BadRequest,
+                format!("cast {cast:?} is not valid for {table}.{field}"),
+            ));
+        }
+        // Drop the immutable borrow of `old_ty` before mutating `self.docs`.
+        let field_owned = field.to_string();
+        let mut affected = 0i64;
+        for ((tname, _), row) in self.docs.iter_mut() {
+            if tname != table {
+                continue;
+            }
+            let Some(obj) = row.doc.as_object_mut() else {
+                continue;
+            };
+            let Some(val) = obj.get(&field_owned).cloned() else {
+                continue;
+            };
+            affected += 1;
+            if let Some(coerced) = coerce_value(*cast, &val) {
+                obj.insert(field_owned.clone(), coerced);
+            } else if let Some(d) = default {
+                let dv = coerce_value(*cast, d).unwrap_or_else(|| d.clone());
+                obj.insert(field_owned.clone(), dv);
+            } else {
+                return Err(RtDbError::new(
+                    ErrorCode::BadRequest,
+                    format!(
+                        "changeType cannot coerce value in {table}.{} ({val}) and no default given",
+                        row.id
+                    ),
+                ));
+            }
+        }
+        // Fold the new type into the planned schema (field is guaranteed
+        // present by the lookup above).
+        t.fields.insert(field_owned, to.clone());
+        Ok((
+            DirectiveReport {
+                op: "changeType".into(),
+                affected_rows: affected,
+                ..Default::default()
+            },
+            Some(table.to_string()),
+        ))
+    }
+
+    /// `dropField` directive — one function per directive kind, dispatched
+    /// by [`Self::apply_migration_directive`]. Mirrors the ts/python engines'
+    /// `applyDropFieldDirective` / `_apply_drop_field_directive`.
+    fn apply_drop_field_directive(
+        &mut self,
+        planned: &mut SchemaDef,
+        table: &str,
+        field: &str,
+    ) -> Result<(crate::wire::admin::DirectiveReport, Option<String>), RtDbError> {
+        use crate::wire::admin::DirectiveReport;
+        let t = migrate_table_mut(planned, table)?;
+        if t.fields.remove(field).is_none() {
+            return Err(RtDbError::new(
+                ErrorCode::BadRequest,
+                format!("dropped field '{table}.{field}' does not exist"),
+            ));
+        }
+        if let Some(indexes) = t.indexes.as_mut() {
+            for ix in indexes.iter_mut() {
+                ix.fields.retain(|f| f != field);
+            }
+        }
+        if t.owner_field.as_deref() == Some(field) {
+            t.owner_field = None;
+        }
+        if t.collaborators_field.as_deref() == Some(field) {
+            t.collaborators_field = None;
+        }
+        // `affected_rows` counts only rows whose `doc` actually changes
+        // (rows carrying the field) — server parity. `obj.remove` returns
+        // the removed value, so count the row iff the key was present.
+        let mut affected = 0i64;
+        for ((tname, _), row) in self.docs.iter_mut() {
+            if tname != table {
+                continue;
+            }
+            if let Some(obj) = row.doc.as_object_mut()
+                && obj.remove(field).is_some()
+            {
+                affected += 1;
+            }
+        }
+        Ok((
+            DirectiveReport {
+                op: "dropField".into(),
+                affected_rows: affected,
+                ..Default::default()
+            },
+            Some(table.to_string()),
+        ))
+    }
+
+    /// `dropTable` directive — one function per directive kind, dispatched
+    /// by [`Self::apply_migration_directive`]. Mirrors the ts/python engines'
+    /// `applyDropTableDirective` / `_apply_drop_table_directive`.
+    fn apply_drop_table_directive(
+        &mut self,
+        planned: &mut SchemaDef,
+        name: &str,
+    ) -> Result<(crate::wire::admin::DirectiveReport, Option<String>), RtDbError> {
+        use crate::wire::admin::DirectiveReport;
+        if planned.tables.remove(name).is_none() {
+            return Err(RtDbError::new(
+                ErrorCode::BadRequest,
+                format!("dropped table '{name}' does not exist"),
+            ));
+        }
+        let to_remove: Vec<String> = self
+            .docs
+            .keys()
+            .filter_map(|(t, id)| if t == name { Some(id.clone()) } else { None })
+            .collect();
+        let affected = to_remove.len() as i64;
+        for id in to_remove {
+            self.docs.remove(&(name.to_string(), id));
+        }
+        Ok((
+            DirectiveReport {
+                op: "dropTable".into(),
+                affected_rows: affected,
+                ..Default::default()
+            },
+            Some(name.to_string()),
+        ))
+    }
+
+    /// `dropIndex` directive — one function per directive kind, dispatched
+    /// by [`Self::apply_migration_directive`]. Mirrors the ts/python engines'
+    /// `applyDropIndexDirective` / `_apply_drop_index_directive`.
+    fn apply_drop_index_directive(
+        &mut self,
+        planned: &mut SchemaDef,
+        table: &str,
+        name: &str,
+    ) -> Result<(crate::wire::admin::DirectiveReport, Option<String>), RtDbError> {
+        use crate::wire::admin::DirectiveReport;
+        let t = migrate_table_mut(planned, table)?;
+        let indexes = t.indexes.as_mut().ok_or_else(|| {
+            RtDbError::new(
+                ErrorCode::BadRequest,
+                format!("dropped index '{table}.{name}' does not exist"),
+            )
+        })?;
+        if !indexes.iter().any(|ix| ix.name == name) {
+            return Err(RtDbError::new(
+                ErrorCode::BadRequest,
+                format!("dropped index '{table}.{name}' does not exist"),
+            ));
+        }
+        indexes.retain(|ix| ix.name != name);
+        Ok((
+            DirectiveReport {
+                op: "dropIndex".into(),
+                affected_rows: 0,
+                ..Default::default()
+            },
+            Some(table.to_string()),
+        ))
+    }
+
+    /// `setDefault` directive — one function per directive kind, dispatched
+    /// by [`Self::apply_migration_directive`]. Mirrors the ts/python engines'
+    /// `applySetDefaultDirective` / `_apply_set_default_directive`.
+    fn apply_set_default_directive(
+        &mut self,
+        planned: &mut SchemaDef,
+        table: &str,
+        field: &str,
+        value: &Value,
+    ) -> Result<(crate::wire::admin::DirectiveReport, Option<String>), RtDbError> {
+        use crate::wire::admin::DirectiveReport;
+        let t = migrate_table_mut(planned, table)?;
+        if !t.fields.contains_key(field) {
+            return Err(RtDbError::new(
+                ErrorCode::BadRequest,
+                format!("setDefault target '{table}.{field}' does not exist"),
+            ));
+        }
+        let mut affected = 0i64;
+        for ((tname, _), row) in self.docs.iter_mut() {
+            if tname != table {
+                continue;
+            }
+            if let Some(obj) = row.doc.as_object_mut()
+                && !obj.contains_key(field)
+            {
+                obj.insert(field.to_string(), value.clone());
+                affected += 1;
+            }
+        }
+        Ok((
+            DirectiveReport {
+                op: "setDefault".into(),
+                affected_rows: affected,
+                ..Default::default()
+            },
+            Some(table.to_string()),
+        ))
+    }
+
+    /// `evalExpr` directive — no in-memory SQL engine exists, so both the
+    /// ENH-020 typed `ValueExpr` path and the legacy raw-SQL path raise
+    /// `BadRequest`. Mirrors the ts/python engines' `applyEvalExprDirective` /
+    /// `_apply_eval_expr_directive`.
+    fn apply_eval_expr_directive(
+        &mut self,
+        table: &str,
+    ) -> Result<(crate::wire::admin::DirectiveReport, Option<String>), RtDbError> {
+        Err(RtDbError::new(
+            ErrorCode::BadRequest,
+            format!("evalExpr unsupported in-memory (table '{table}')"),
+        ))
     }
 }
 
