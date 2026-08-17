@@ -167,6 +167,31 @@ stays valuable as a detector rather than being toggled off.
 After changing invalidation logic, temporarily lower it to N=20 for a few days
 and confirm `rtdb_subs_missed_pushes_total` stays 0, then return it to 200.
 
+### Monitoring the invalidation canary
+
+Beyond the missed-push alert, watch the **rerun ratio** — the share of fan-out
+decisions that ended in a full table-level re-run rather than a provable skip.
+Subscription re-runs execute inside the committer turn, so a database whose
+re-runs dominate is one whose writes queue behind its own subscriber load
+(`distinct`/`aggregate`/`search`/`vector` subscriptions stay table-level and
+re-run on every write to their table — see `docs/ARCHITECTURE.md`). The ratio
+over `/metrics`:
+
+```promql
+rate(rtdb_subs_reruns_total[5m])
+  / (rate(rtdb_subs_reruns_total[5m]) + sum(rate(rtdb_subs_skips_total[5m])))
+```
+
+(`rtdb_subs_skips_total` carries a `class` label — point/indexed/ordered — so
+`sum()` collapses it to match the unlabeled rerun counter; both are
+instance-wide aggregates, deliberately without per-db labels to keep `/metrics`
+cardinality bounded.) A value near 0 means invalidation is proving most writes
+irrelevant; a sustained value above ~0.5 means re-runs dominate and writes on
+that instance are paying for subscriber load — treat it as a capacity signal
+and investigate which databases host the heavy subscriptions (per-db detail is
+in `GET /admin/metrics`, behind the admin key). Capacity work for fan-out is
+tracked as enhancement ENH-024.
+
 ## Monitoring
 
 `GET /metrics` is the Prometheus scrape endpoint — plain text exposition,
