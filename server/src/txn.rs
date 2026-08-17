@@ -26,13 +26,19 @@ use tracing::Instrument;
 use crate::auth::{PrincipalCtx, authorize_table};
 use crate::db::{new_id, now_ms, validate_db_name};
 use crate::ddl::{pg_col, pg_schema, pg_table};
+use crate::dsl::{FilterExpr, filter_matches};
 use crate::error::RtDbError;
-use crate::query::{FilterExpr, filter_matches};
 use crate::scheduler;
 use crate::schema::{
-    FieldType, IndexDef, OnDeleteAction, SchemaDef, TableDef, indexed_column_type, validate_doc,
+    FieldType, OnDeleteAction, SchemaDef, TableDef, indexed_column_type, validate_doc,
     validate_value,
 };
+
+// ARC-202: the wire types this module used to define live in `dsl.rs` now;
+// re-exported so every `crate::txn::` path (and the integration tests'
+// `rtdb_server::txn::` paths) keep resolving unchanged.
+pub use crate::dsl::{EqBind, Step, Transaction, row_visible_to};
+pub(crate) use crate::dsl::{eq_bind_for, eq_binds};
 
 /// Maximum number of steps in a single transaction. A hard ceiling that bounds
 /// how much work one serialized committer turn can do. Raised from 256 → 1024
@@ -113,148 +119,6 @@ const MAX_CASCADE_ROWS: usize = 10_000;
 /// transaction and reverts on commit/rollback, so it never leaks to other pool
 /// users. SEC-104.
 const STATEMENT_TIMEOUT_MS: u64 = 60_000;
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "op", rename_all = "camelCase", deny_unknown_fields)]
-pub enum Step {
-    Insert {
-        table: String,
-        doc: serde_json::Map<String, serde_json::Value>,
-    },
-    Patch {
-        table: String,
-        id: String,
-        fields: serde_json::Map<String, serde_json::Value>,
-    },
-    Replace {
-        table: String,
-        id: String,
-        doc: serde_json::Map<String, serde_json::Value>,
-    },
-    Delete {
-        table: String,
-        id: String,
-    },
-    ExpectVersion {
-        table: String,
-        id: String,
-        version: i64,
-    },
-    ExpectAbsent {
-        table: String,
-        index: String,
-        eq: Vec<serde_json::Value>,
-    },
-    Upsert {
-        table: String,
-        index: String,
-        eq: Vec<serde_json::Value>,
-        insert: serde_json::Map<String, serde_json::Value>,
-        patch: serde_json::Map<String, serde_json::Value>,
-    },
-    /// Find every row in `table` matching `filter` (the same `FilterExpr` the
-    /// read path accepts) and apply `patch` to it, atomically, inside the
-    /// serialized committer turn. Visibility matches the read path exactly: an
-    /// interactive caller patches only rows they own/collaborate on and that
-    /// satisfy the table's `authorize` predicate; a bypass principal (machine
-    /// token/admin/scheduled) touches all matching rows. At most `limit` rows
-    /// (default `MAX_BY_QUERY_ROWS`); a larger match set patches `limit` and
-    /// reports `truncated: true`. Each patched row records a `DocOp`/`WriteSet`
-    /// entry, so subscriptions, the op-feed, audit log, and webhooks all fire
-    /// per row — the same contract as a per-id `Patch`.
-    PatchByQuery {
-        table: String,
-        filter: crate::query::FilterExpr,
-        patch: serde_json::Map<String, serde_json::Value>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        limit: Option<u32>,
-    },
-    /// Find every row in `table` matching `filter` and delete it (same
-    /// visibility/`limit`/`truncated` semantics as `PatchByQuery`). Enables
-    /// server-side cascades and bulk cleanup (e.g. a scheduled job deleting
-    /// expired rows by predicate) without a client-side read-all-then-delete.
-    DeleteByQuery {
-        table: String,
-        filter: crate::query::FilterExpr,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        limit: Option<u32>,
-    },
-    /// Schedule `txn` to run later (FM-28). The `scheduled_txns` row is
-    /// inserted on the OPEN sqlx transaction, so the enqueue commits (or
-    /// rolls back) atomically with this txn's document writes. Step result is
-    /// `{"scheduleId": "<id>"}`; the job fires through the unchanged
-    /// scheduler → `RunScheduled` committer path as the system (bypass)
-    /// principal. Nested steps are table-scope-checked recursively at enqueue
-    /// (`authorize_txn_tables`) and fully re-validated by `execute_txn` at
-    /// fire time.
-    Schedule {
-        when: crate::protocol::ScheduleWhen,
-        txn: Box<Transaction>,
-    },
-    /// Cancel a previously scheduled job by id, on the open sqlx transaction.
-    /// Step result `{"cancelled": <bool>}` — `false` (not an error) when the
-    /// id is missing, already fired, or already cancelled. A fire currently
-    /// in flight completes; the job never fires again (the cron finalize
-    /// update touches 0 rows).
-    CancelSchedule {
-        id: String,
-    },
-    /// Start a durable workflow run (FM-29). The `workflows` row is inserted on
-    /// the OPEN sqlx transaction — "write doc + start drip" is atomic; a
-    /// rolled-back txn leaves no orphan run. Step result `{"workflowId": "<id>"}`.
-    /// The spec is validated and table-scope-checked recursively at submit time;
-    /// steps fire later as the system (bypass) principal in the committer's
-    /// `RunWorkflowAdvance` turn.
-    StartWorkflow {
-        spec: Box<crate::protocol::WorkflowSpec>,
-    },
-    /// Cancel a workflow run by id, on the open sqlx transaction. Step result
-    /// `{"cancelled": <bool>}` — `false` when missing or already terminal. A run
-    /// whose advance is in flight stops at its next step boundary.
-    CancelWorkflow {
-        id: String,
-    },
-    /// Restore a soft-deleted row (FM-33): `UPDATE … SET deleted_at = NULL,
-    /// version = version + 1`. `NotFound` when the row is absent; idempotent
-    /// `Ok` when it is present and already live. Only legal on a table that
-    /// declares `softDelete`. Patch-shaped `DocOp` — the doc re-appears, so
-    /// content-bearing subscriptions re-run.
-    Undelete {
-        table: String,
-        id: String,
-    },
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct Transaction {
-    pub steps: Vec<Step>,
-}
-
-impl Step {
-    /// The document table this step targets, or `None` for the schedule and
-    /// workflow control-flow steps (they touch no documents; the per-step
-    /// table-scope gate in `execute_txn` skips them, and `Step::Schedule` /
-    /// `Step::StartWorkflow` check their NESTED steps recursively via
-    /// `authorize_txn_tables` / `authorize_spec_tables` instead).
-    pub fn table(&self) -> Option<&str> {
-        match self {
-            Step::Insert { table, .. }
-            | Step::Patch { table, .. }
-            | Step::Replace { table, .. }
-            | Step::Delete { table, .. }
-            | Step::ExpectVersion { table, .. }
-            | Step::ExpectAbsent { table, .. }
-            | Step::Upsert { table, .. }
-            | Step::PatchByQuery { table, .. }
-            | Step::DeleteByQuery { table, .. }
-            | Step::Undelete { table, .. } => Some(table),
-            Step::Schedule { .. }
-            | Step::CancelSchedule { .. }
-            | Step::StartWorkflow { .. }
-            | Step::CancelWorkflow { .. } => None,
-        }
-    }
-}
 
 /// The kind of write a step performed on a document. Recorded in `WriteSet.ops`
 /// so downstream consumers (e.g. the activity feed) can stream what happened
@@ -398,82 +262,6 @@ impl WriteSet {
 pub struct TxnOutcome {
     pub results: Vec<serde_json::Value>,
     pub write_set: WriteSet,
-}
-
-/// SQL bind for an eq-lookup value, typed per the index field's `FieldType`
-/// (`Optional` unwrapped). Prefix-friendly: callers may supply 0..=all of an
-/// index's fields; full-arity enforcement is the caller's responsibility.
-///
-/// `Clone` + `PartialEq` are derived so `subs::IndexedRead` can store typed
-/// binds (cloned from a query at registration) and compare a written doc's
-/// typed field value against the wanted bind in `in_window`. `Eq` is NOT
-/// derived: the `Num(f64)` arm admits NaN, which has no total order; the
-/// binds compared here always originate from JSON (which cannot carry NaN),
-/// so `PartialEq` is sound for the membership test.
-#[derive(Debug, Clone, PartialEq)]
-pub enum EqBind {
-    Text(String),
-    Num(f64),
-    Bool(bool),
-    I64(i64),
-}
-
-/// Resolves `eq` (a prefix of `index`'s fields, 0..=all) into typed SQL binds.
-/// Arity beyond the index's field count is a `BadRequest`; exact-arity
-/// enforcement for Task 5's call sites happens in `eq_lookup`.
-pub(crate) fn eq_binds(
-    table: &TableDef,
-    index: &IndexDef,
-    eq: &[serde_json::Value],
-) -> Result<Vec<EqBind>, RtDbError> {
-    if eq.len() > index.fields.len() {
-        return Err(RtDbError::bad_request(format!(
-            "index '{}' expects at most {} eq value(s), got {}",
-            index.name,
-            index.fields.len(),
-            eq.len()
-        )));
-    }
-
-    index
-        .fields
-        .iter()
-        .zip(eq.iter())
-        .map(|(field_name, value)| {
-            let field_type = table.fields.get(field_name).ok_or_else(|| {
-                RtDbError::internal(format!("index references unknown field '{field_name}'"))
-            })?;
-            eq_bind_for(field_type, value)
-        })
-        .collect()
-}
-
-/// Shared with `query.rs`, which reuses this to type range-bound (`gt`/`gte`/`lt`/`lte`)
-/// values the same way `eq` values are typed here.
-pub(crate) fn eq_bind_for(ty: &FieldType, value: &serde_json::Value) -> Result<EqBind, RtDbError> {
-    let (pg_type, _nullable) = indexed_column_type(ty)?;
-    match pg_type {
-        "text" => value
-            .as_str()
-            .map(|s| EqBind::Text(s.to_string()))
-            .ok_or_else(|| RtDbError::bad_request("eq value must be a string")),
-        "double precision" => value
-            .as_f64()
-            .map(EqBind::Num)
-            .ok_or_else(|| RtDbError::bad_request("eq value must be a number")),
-        "bigint" => value
-            .as_str()
-            .and_then(|s| s.parse::<i64>().ok())
-            .map(EqBind::I64)
-            .ok_or_else(|| RtDbError::bad_request("eq value must be an int64 string")),
-        "boolean" => value
-            .as_bool()
-            .map(EqBind::Bool)
-            .ok_or_else(|| RtDbError::bad_request("eq value must be a boolean")),
-        other => Err(RtDbError::internal(format!(
-            "unexpected pg type '{other}' for eq bind"
-        ))),
-    }
 }
 
 /// SQL bind for an indexed-column value extracted from a document, `None`
@@ -1235,30 +1023,6 @@ fn apply_defaults(
         }
     }
     doc
-}
-
-/// Whether `uid` may access a row given the table's declared `ownerField`
-/// and/or `collaboratorsField`: true when `uid` matches the doc's owner field
-/// OR appears in the doc's collaborators array. A missing/null owner field and
-/// a missing/null/empty/non-array collaborators array are treated as no-match.
-/// Shared by the read path's point-read filter and the write path's pre-check
-/// so OR-enforcement stays consistent across reads, writes, and subscriptions
-/// (subscriptions re-run `execute_query`, which carries the same semantics).
-pub fn row_visible_to(
-    doc: &serde_json::Value,
-    owner_field: Option<&str>,
-    collab_field: Option<&str>,
-    uid: &str,
-) -> bool {
-    let owner_match = owner_field
-        .and_then(|f| doc.get(f))
-        .and_then(|v| v.as_str())
-        .is_some_and(|s| s == uid);
-    let collab_match = collab_field
-        .and_then(|f| doc.get(f))
-        .and_then(|v| v.as_array())
-        .is_some_and(|arr| arr.iter().any(|v| v.as_str() == Some(uid)));
-    owner_match || collab_match
 }
 
 /// Ownership + authorize pre-check for patch/replace/delete: fetches the doc

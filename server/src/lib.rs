@@ -18,6 +18,7 @@ pub mod committer;
 pub mod config;
 pub mod db;
 pub mod ddl;
+pub mod dsl;
 pub mod error;
 pub mod health;
 pub mod http_api;

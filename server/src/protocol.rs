@@ -8,9 +8,8 @@
 //! deliberately non-uniform, so any change here must be reflected in all four
 //! implementations.
 
+use crate::dsl::{Query, Transaction};
 use crate::error::RtDbError;
-use crate::query::Query;
-use crate::txn::Transaction;
 
 /// Full WS client vocabulary. Consumed by the WS handler (Task 9) and mirrored
 /// by the TS client — wire tags and field names are load-bearing.
