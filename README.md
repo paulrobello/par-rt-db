@@ -22,6 +22,7 @@ with Postgres 17 storage. Authoritative design:
 - [Wire protocol](#wire-protocol)
 - [Pagination](#pagination)
 - [Scheduling](#scheduling)
+- [Durable workflows](#durable-workflows)
 - [Realtime presence](#realtime-presence)
 - [Make targets](#make-targets)
 - [Graceful shutdown](#graceful-shutdown)
@@ -41,7 +42,7 @@ Related documentation: [`CHANGELOG.md`](CHANGELOG.md), [`DESIGN.md`](DESIGN.md),
 | Package | Path | Stack | What it is |
 | --- | --- | --- | --- |
 | **Server** | [`server/`](server) | Rust (axum/tokio + Postgres 17) | The realtime database binary |
-| **TypeScript client** | [`ts-client/`](ts-client) | TS (`@par-rt-db/client`, bun) | Browser/Node SDK + React bindings + in-memory test harness |
+| **TypeScript client** | [`ts-client/`](ts-client) | TS (`@par-rt-db/client`, bun) | Browser/Node/React Native SDK + React bindings + in-memory test harness |
 | **Rust client** | [`rust-client/`](rust-client) | Rust (`par-rt-db-client`) | Rust SDK: http + reactive ws + admin + `.filter()`/`.search()`/`.vector_search()` builders |
 | **Python client** | [`python-client/`](python-client) | Python (`par-rt-db`, uv) | Python SDK: wire + schema/mutation/query DSL + sync HTTP/admin/storage + reactive WS |
 | **Dashboard** | [`dashboard/`](dashboard) | Vite + React 19 + TS (bun) | Operator console SPA served same-origin at `RTDB_STATIC_DIR` |
@@ -82,8 +83,9 @@ sequenceDiagram
     end
 ```
 
-The same path runs for scheduled/cron jobs (a per-db scheduler enqueues due jobs as
-`CommitterRequest::RunScheduled`). Reads that don't write go straight to Postgres
+The same path runs for scheduled/cron jobs and durable workflow steps (a per-db
+scheduler enqueues due work as `CommitterRequest::RunScheduled` /
+`RunWorkflowAdvance`). Reads that don't write go straight to Postgres
 through `execute_query` under READ COMMITTED. Auth re-runs `authorize` on every
 Subscribe/Mutate over an open WebSocket. File storage is HTTP-only and bypasses the
 committer (blobs don't touch document tables). See
@@ -145,7 +147,7 @@ curl -s -X POST http://localhost:8300/api/query \
 To run the full test suite instead (dev Postgres must be up):
 
 ```bash
-make test   # dev-db-up + fmt/clippy/typecheck/tests across all six packages
+make test   # dev-db-up + test suites across all six packages (fmt/clippy/typecheck live in make checkall)
 ```
 
 ## Endpoints
@@ -167,10 +169,13 @@ since browsers cannot set headers on a WS handshake.
 | `GET /sync` | first WS frame | WebSocket upgrade. Speaks the realtime protocol (auth, subscribe, mutate, schedule, ping). |
 | `POST /api/query` | Bearer token | One-shot query against a database; see [Query shape](#query-shape). |
 | `POST /api/query-batch` | Bearer token | Fans out N queries in one round trip (per-query error isolation); each slot returns `{ok, result}` or `{ok:false, error}`. |
-| `POST /api/mutate` | Bearer token | One-shot transaction (`insert`/`patch`/`replace`/`delete`/`expectVersion`/`expectAbsent`/`upsert` + `patchByQuery`/`deleteByQuery` + `schedule`/`cancelSchedule` steps). |
+| `POST /api/mutate` | Bearer token | One-shot transaction (`insert`/`patch`/`replace`/`delete`/`undelete`/`expectVersion`/`expectAbsent`/`upsert` + `patchByQuery`/`deleteByQuery` + `schedule`/`cancelSchedule` + `startWorkflow`/`cancelWorkflow` steps). |
 | `POST /api/schedule` | Bearer token | Schedules a transaction: `afterMs`/`runAt` one-shot or `cron` (5-field, UTC, min-first); returns `{id}`. |
 | `POST /api/schedule/{id}/{cancel,pause,resume}` | Bearer token | Cancels, pauses, or resumes a scheduled job. |
 | `POST /api/schedules` | Bearer token | Lists scheduled jobs for a database (`ScheduleInfo[]`). |
+| `POST /api/workflows` | Bearer token | Starts a durable workflow run from a `WorkflowSpec` (FM-29); returns `{id}`. See [Durable workflows](#durable-workflows). |
+| `POST /api/workflows/list` | Bearer token | Lists workflow runs for a database (`WorkflowInfo[]`, newest first; optional `status` filter). |
+| `POST /api/workflows/{id}/cancel` | Bearer token | Cancels a non-terminal run (`{ok:false}` = unknown/terminal — a no-op, not an error). |
 
 ### File storage (HTTP-only, bypasses the committer)
 
@@ -244,11 +249,15 @@ loss is `DROP TABLE` for tables absent from the target snapshot, and migrate dat
 
 | Method & path | Auth | Description |
 | --- | --- | --- |
-| `POST /admin/db/{db}/query` | Bearer admin key | Admin reads documents across any database (`owner=None`, bypassing per-row `ownerField`). |
+| `POST /admin/db/{db}/query` | Bearer admin key | Admin reads documents across any database (`owner=None`, bypassing per-row `ownerField`). Accepts `includeDeleted: true` (admin-route param, not a wire `Query` field) to surface soft-deleted rows. |
 | `POST /admin/db/{db}/mutate` | Bearer admin key | Admin writes documents across any database. Capped by `RTDB_MAX_AFFECTED_DOCS`. |
 | `GET /admin/db/{db}/schedules` | Bearer admin key | Lists scheduled jobs for a database (admin-scoped). |
 | `POST /admin/db/{db}/schedules` | Bearer admin key | Creates a scheduled job for a database (admin-scoped). |
 | `POST /admin/db/{db}/schedules/{id}/{cancel,pause,resume}` | Bearer admin key | Cancels, pauses, or resumes a scheduled job (admin-scoped). |
+| `GET|POST /admin/db/{db}/workflows` | Bearer admin key | Lists workflow runs for a database / starts one (admin-scoped; `POST` body is a `WorkflowSpec`). |
+| `GET|DELETE /admin/db/{db}/workflows/{id}` | Bearer admin key | Fetches one run's `WorkflowInfo` / deletes a terminal run's row. |
+| `POST /admin/db/{db}/workflows/{id}/cancel` | Bearer admin key | Cancels a non-terminal run (admin-scoped; `{ok:false}` = unknown/terminal). |
+| `GET|PATCH /admin/db/{db}/anonymous-access` | Bearer admin key | Per-database anonymous-auth toggle (SEC-103), on top of the instance-wide `RTDB_AUTH_ANONYMOUS_ENABLED` boot gate. |
 | `GET /admin/db/{db}/storage` | Bearer admin key | Lists blobs stored in a database (id, sha256, size, contentType, createdAt). |
 | `POST /admin/db/{db}/storage` | Bearer admin key | Uploads a blob (admin-scoped; same shape as `POST /api/storage/{db}`). |
 | `DELETE /admin/db/{db}/storage/{id}` | Bearer admin key | Deletes a blob (admin-scoped). |
@@ -261,6 +270,8 @@ loss is `DROP TABLE` for tables absent from the target snapshot, and migrate dat
 | `GET /admin/ops/recent` | Bearer admin key | Recent document-mutation op feed (durable). |
 | `GET /admin/audit?db=&limit=&offset=` | Bearer admin key | Audit log entries (`ts_ms, db, table, op, doc_id, principal, source`) — only when `RTDB_AUDIT_LOG_ENABLED=true`; 404 otherwise. |
 | `GET /admin/subscriptions` | Bearer admin key | Lists active subscriptions across all dbs (live query inspector). |
+| `POST /admin/db/{db}/explain` | Bearer admin key | Query introspection (ENH-019): re-compiles a `Query` through the real path and returns `{sql, params, terminal, warnings}` — a plan, no rows. |
+| `GET /admin/slow-queries` | Bearer admin key | Bounded in-memory ring of queries slower than `RTDB_SLOW_QUERY_MS` (default 0 = disabled; `RTDB_SLOW_QUERY_CAPACITY` default 200; `RTDB_SLOW_QUERY_LOG_PARAMS=false` keeps doc content out). |
 | `GET /admin/sessions?user=&limit=` | Bearer admin key | Lists active interactive sessions (OAuth/anonymous/admin-key). `?user=` filters by `user_id` or email (omitted ⇒ all, server-wide); `?limit=` clamped to `[1, 1000]`, default 200. `token_hash` is a non-reversible sha256 digest, safe to surface. |
 | `DELETE /admin/sessions/{token_hash}` | Bearer admin key | Revokes a single session by its `token_hash` (takes effect on the next op over an already-open connection — `session_still_valid` re-queries on every interactive Subscribe/Mutate/Presence). |
 | `DELETE /admin/sessions?user=` | Bearer admin key | Revokes every session for a user. Requires `?user=` — a bare `DELETE` is a 400 (refuses to revoke every session instance-wide from one unscoped call). |
@@ -294,7 +305,7 @@ setup (callback URLs, scopes, env-var pairs).
 | `POST /auth/logout` | Bearer session | Deletes the session for the given bearer token. Idempotent: always 200 unless the delete query itself fails. |
 | `GET /auth/me` | Bearer session | Returns the authenticated user. 401 for a machine token (session only). |
 | `GET /auth/validate` | Bearer token | Validates a presented session or machine token; returns the `AuthedUser`. Used by backends to check a player-supplied token. |
-| `POST /auth/anonymous` | none | Mints an ephemeral anonymous user + session for a credential-less guest (gated by `RTDB_AUTH_ANONYMOUS_ENABLED`, default off ⇒ `403 FORBIDDEN`). Sets the `HttpOnly` session cookie (browser path) **and** returns the plaintext session token in the body (SDK/bearer path — pass it as the WS/HTTP bearer, exactly like a machine token). Per-IP rate-limited; an anonymous user is authorized for any database via that boot gate (no allowlist entry) and owns its own documents via per-row `ownerField` (the anon `user_id`). On a later OAuth sign-in with that session's bearer presented at `/begin`, the anon footprint is merged into the real account — owned docs across all databases restamped, storage blob ownership swapped, the live session re-pointed — via `merge::merge_users` (`rtdb_merge_docs_total` counts restamped docs); `POST /admin/merge-users` is the operator escape hatch. |
+| `POST /auth/anonymous` | none | Mints an ephemeral anonymous user + session for a credential-less guest (gated by `RTDB_AUTH_ANONYMOUS_ENABLED`, default off ⇒ `403 FORBIDDEN`; a per-db toggle — `GET|PATCH /admin/db/{db}/anonymous-access`, SEC-103 — must also allow it). Sets the `HttpOnly` session cookie (browser path) **and** returns the plaintext session token in the body (SDK/bearer path — pass it as the WS/HTTP bearer, exactly like a machine token). Per-IP rate-limited; an anonymous user is authorized for any database via that boot gate (no allowlist entry) and owns its own documents via per-row `ownerField` (the anon `user_id`). On a later OAuth sign-in with that session's bearer presented at `/begin`, the anon footprint is merged into the real account — owned docs across all databases restamped, storage blob ownership swapped, the live session re-pointed — via `merge::merge_users` (`rtdb_merge_docs_total` counts restamped docs); `POST /admin/merge-users` is the operator escape hatch. |
 
 The live login flow (SEC-012): the browser hits `GET /auth/{provider}/begin` →
 opens the provider authorize URL in a `noopener,noreferrer` popup (reverse-tabnabbing
@@ -406,15 +417,20 @@ Reciprocal Rank Fusion, `paginate` is opaque-cursor keyset pagination,
 ### Transaction shape
 
 `{"steps": [...]}` where each step is tagged by `"op"`: `insert`, `patch`,
-`replace`, `delete`, `expectVersion`, `expectAbsent`, `upsert` (per-id, one
+`replace`, `delete`, `undelete` (softDelete tables only — clears the
+`deleted_at` stamp), `expectVersion`, `expectAbsent`, `upsert` (per-id, one
 document each), the predicate-driven bulk steps `patchByQuery` and
 `deleteByQuery` (each finds rows matching a `filter` and acts on up to
-`MAX_BY_QUERY_ROWS` of them in one serialized committer turn), and the
+`MAX_BY_QUERY_ROWS` of them in one serialized committer turn), the
 scheduler control-flow steps `schedule` (enqueues a nested txn by inserting
 the `scheduled_txns` row on the open sqlx transaction — atomic with the
 enclosing writes; step result `{"scheduleId": "<id>"}`) and `cancelSchedule`
-(`{"cancelled": <bool>}`, `false` on a missing/already-fired/already-cancelled job) — see
-`server/src/txn.rs`.
+(`{"cancelled": <bool>}`, `false` on a missing/already-fired/already-cancelled job), and the
+workflow control-flow steps `startWorkflow` (inserts the per-db `workflows`
+run row on the open sqlx transaction — atomic with the enclosing writes; step
+result `{"workflowId": "<id>"}`; the spec's tables are allowlist-checked at
+submit time) and `cancelWorkflow` (`{"cancelled": <bool>}`, `false` on a
+missing/terminal run — a no-op, not an error) — see `server/src/txn.rs`.
 
 ### WebSocket example: subscribe, then mutate
 
@@ -666,6 +682,52 @@ The WS surface adds `schedule` / `cancelSchedule` / `pauseSchedule` /
 `scheduleOk` / `scheduleErr` / `scheduleAck` / `listSchedulesOk`. Authorization is
 re-run on every op, not just at connect.
 
+## Durable workflows
+
+A workflow is a named spec of steps — each an ordinary declarative
+`Transaction` plus an optional `StepRetry` (`maxAttempts`, default 3; 1s
+initial backoff doubling to a 60s cap) and an optional `sleepBeforeMs` — that
+the server advances durably (FM-29). A run is a row in a per-db `workflows`
+side table; the scheduler timer enqueues each due step as
+`CommitterRequest::RunWorkflowAdvance` and the committer executes it through
+the normal `execute_txn` + `fan_out` path, so the single-writer invariant and
+the op-feed/audit/webhook taps hold for every step. Delivery is
+**at-least-once per step** with crash-resume (a row left `running` by a crash
+is re-armed at startup); a step that exhausts its retries fails the run.
+Steps fire as the system (bypass) principal — a scoped machine token is
+confined at submit time — so write idempotent step txns. A run's status is
+one of `pending` / `running` / `success` / `failed` / `cancelled`.
+
+Start runs via the HTTP `POST /api/workflows` routes, the WS
+`startWorkflow` / `cancelWorkflow` / `listWorkflows` frames, the admin CRUD
+routes, or the `startWorkflow` / `cancelWorkflow` txn steps (insertion atomic
+with the enclosing writes). All four clients mirror the surface:
+`startWorkflow` / `cancelWorkflow` / `listWorkflows` (ts, rust, python —
+reactive + HTTP) plus admin variants, the `rtdb workflows` CLI, and the
+dashboard Workflows page. Spec:
+[`docs/superpowers/specs/2026-08-15-workflows-design.md`](docs/superpowers/specs/2026-08-15-workflows-design.md).
+
+### TypeScript client
+
+```ts
+import { WorkflowSpec } from "@par-rt-db/client";
+
+const spec: WorkflowSpec = {
+  name: "onboard",
+  steps: [
+    { txn: { steps: [{ op: "insert", table: "work_items", doc: { title: "welcome" } }] } },
+    {
+      txn: { steps: [{ op: "insert", table: "work_items", doc: { title: "follow-up" } }] },
+      retry: { maxAttempts: 5 },
+      sleepBeforeMs: 60_000,
+    },
+  ],
+};
+const { id } = await client.startWorkflow(spec);
+await client.cancelWorkflow(id); // false for a missing/terminal run
+const runs = await client.listWorkflows("running"); // newest first
+```
+
 ## Realtime presence
 
 For ephemeral "who is online right now" data — online indicators, cursors,
@@ -813,7 +875,7 @@ that ultimately terminates a connection that never closes on its own.
 par-rt-db ships three client SDKs that each mirror the server's wire contract,
 plus an operator SPA and a CLI built on top of them:
 
-- [`ts-client/`](ts-client/README.md) — `@par-rt-db/client` (browser/Node): schema builder, reactive WebSocket client, React bindings, HTTP/admin clients, in-memory test harness.
+- [`ts-client/`](ts-client/README.md) — `@par-rt-db/client` (browser/Node/React Native): schema builder, reactive WebSocket client, React bindings, HTTP/admin clients, in-memory test harness.
 - [`rust-client/`](rust-client/README.md) — `par-rt-db-client` (Rust): http + reactive ws + admin, `.filter()`/`.search()`/`.vector_search()` builders.
 - [`python-client/`](python-client/README.md) — `par-rt-db` (Python): wire contract + schema/mutation/query DSL + sync HTTP/admin/storage + reactive WS.
 - [`dashboard/`](dashboard/README.md) — the operator console SPA (admin/operator UI served same-origin at `RTDB_STATIC_DIR`; consumes `ts-client`).
