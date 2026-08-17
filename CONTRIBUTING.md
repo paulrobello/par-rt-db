@@ -284,6 +284,7 @@ Before requesting review:
 - [ ] If the change adds a route, the root README Endpoints table and `server/README.md` are updated.
 - [ ] If the change adds or modifies a query terminal, `FilterExpr` variant, or mutation-step result shape, a case covering it is added to `wire-corpus/golden-vector.json` (the cross-client parity fixture consumed by all four golden-vector suites). The corpus is the source of truth for cross-client agreement; an uncovered terminal is a regression risk for the other three engines.
 - [ ] If the change alters any server behavior a client engine mirrors — step results, error codes, defaults, visibility (soft delete/TTL), cursor semantics — a case pinning the new behavior is added (or updated) in `wire-corpus/semantics/` per the authoring rule in [`wire-corpus/README.md`](wire-corpus/README.md).
+- [ ] If a property test (`server/tests/proptest_parity.rs`) found a server-vs-engine divergence, the fix also ships the minimized counterexample as a `wire-corpus/semantics/` case (so all three client engines inherit it, not just the rust one — unmirrored engines get a loud `skip` until they do) and commits the proptest seed under `server/proptest-regressions/`.
 
 When the PR lands, **rebase onto the latest target branch before merging** so
 the merge is a clean fast-forward. Squash-merge one commit per logical change;

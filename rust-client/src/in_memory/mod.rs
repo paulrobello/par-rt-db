@@ -20,7 +20,7 @@
 //! storage surfaces. The public surface (`par_rt_db_client::in_memory::*`) is
 //! unchanged - moved items are re-exported below.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -1142,7 +1142,7 @@ impl InMemoryRtDbClient {
             // FM-33: a soft-deleted row is absent to every scan (the server's
             // compile_scan_where composes the same live-only predicate).
             .filter(|(_, row)| row.deleted_at.is_none())
-            .filter(|(_, row)| matches_filter(filter, &row.doc))
+            .filter(|(_, row)| matches_filter(filter, &row.doc, &table_def.fields))
             .map(|(_, row)| (row.created_at, row.id.clone()))
             .collect();
         matching.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
@@ -1278,7 +1278,7 @@ impl InMemoryRtDbClient {
         for index in indexes.iter().filter(|i| i.unique) {
             // A partial unique index constrains only rows matching its predicate.
             if let Some(pred) = &index.r#where
-                && !eval_filter_expr(pred, candidate_doc)
+                && !eval_filter_expr(pred, candidate_doc, &table_def.fields)
             {
                 continue;
             }
@@ -1303,7 +1303,7 @@ impl InMemoryRtDbClient {
                     continue;
                 }
                 if let Some(pred) = &index.r#where
-                    && !eval_filter_expr(pred, &row.doc)
+                    && !eval_filter_expr(pred, &row.doc, &table_def.fields)
                 {
                     continue;
                 }

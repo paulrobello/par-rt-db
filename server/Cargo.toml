@@ -102,6 +102,17 @@ tokio-tungstenite.workspace = true
 futures-util.workspace = true
 wiremock.workspace = true
 serial_test = "3"
+# ENH-027 property-based parity testing (`tests/proptest_parity.rs`):
+# generative schemas/docs/queries executed against both Postgres (this crate)
+# and the rust-client in-memory engine, asserting identical results. Both are
+# server-only for now, so they live here rather than in the root
+# `[workspace.dependencies]` table (whose convention reserves it for deps
+# shared by two or more members — same precedent as `tempfile`/`serial_test`).
+# The path dev-dep pulls `in_memory` (which only adds `sha2`, already in the
+# tree via this crate's own dependency); its default `http` feature reuses the
+# reqwest already compiled for the server.
+proptest = "1"
+par-rt-db-client = { path = "../rust-client", features = ["in_memory"] }
 
 # Match cli/ and rust-client/: a direct `cargo clippy`/`cargo build` (editor,
 # rust-analyzer, pre-commit) denies warnings without needing the Makefile's

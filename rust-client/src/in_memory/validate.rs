@@ -4,6 +4,8 @@
 //! and `matches_filter` widen from private to `pub(super)` so the store/executor
 //! (in `mod.rs`) and `run_query` (in `query.rs`) can call them.
 
+use std::collections::BTreeMap;
+
 use super::*;
 
 /// Deep clone of a JSON doc. Docs are pure JSON — safe to round-trip — so
@@ -441,25 +443,35 @@ fn in_value_kind(value: &Value) -> ValueKind {
 }
 
 /// Evaluate a [`FilterExpr`] predicate against a stored doc, mirroring server
-/// `query::jsonb_lhs_and_bind` and the TS `evalFilterExpr`
-/// (`ts-client/src/in_memory.ts:410-421`): the filter value's kind picks the
-/// comparison domain — string compares the doc field's `->>` text, number
-/// compares it as `float8`, boolean as `boolean`. A null/absent field never
-/// matches (SQL NULL exclusion). Assumes [`validate_filter`] already passed.
-pub fn eval_filter_expr(expr: &FilterExpr, doc: &Value) -> bool {
+/// `query::field_lhs_and_bind` / `jsonb_lhs_and_bind` and the TS
+/// `evalFilterExpr` (`ts-client/src/in_memory.ts:410-421`): the filter value's
+/// kind picks the comparison domain — string compares the doc field's `->>`
+/// text, number compares it as `float8`, boolean as `boolean` — EXCEPT on a
+/// declared `int64` field, where a string value (the wire form the server
+/// types as a `bigint` bind, whether via an index's typed column or the jsonb
+/// path) compares numerically: decimal strings must order `-605 < -1 < 15`,
+/// not lexicographically (ENH-027 parity fix). A null/absent field never
+/// matches (SQL NULL exclusion). `fields` is the table's declared field map
+/// (pass an empty map for type-less evaluation, e.g. unit tests). Assumes
+/// [`validate_filter`] already passed.
+pub fn eval_filter_expr(
+    expr: &FilterExpr,
+    doc: &Value,
+    fields: &BTreeMap<String, FieldType>,
+) -> bool {
     match expr {
-        FilterExpr::And { exprs } => exprs.iter().all(|e| eval_filter_expr(e, doc)),
-        FilterExpr::Or { exprs } => exprs.iter().any(|e| eval_filter_expr(e, doc)),
+        FilterExpr::And { exprs } => exprs.iter().all(|e| eval_filter_expr(e, doc, fields)),
+        FilterExpr::Or { exprs } => exprs.iter().any(|e| eval_filter_expr(e, doc, fields)),
         FilterExpr::In { field, values } => values
             .iter()
-            .any(|v| compare_leaf(FilterOp::Eq, field, v, doc)),
-        FilterExpr::Eq { field, value } => compare_leaf(FilterOp::Eq, field, value, doc),
-        FilterExpr::Neq { field, value } => compare_leaf(FilterOp::Neq, field, value, doc),
-        FilterExpr::Gt { field, value } => compare_leaf(FilterOp::Gt, field, value, doc),
-        FilterExpr::Gte { field, value } => compare_leaf(FilterOp::Gte, field, value, doc),
-        FilterExpr::Lt { field, value } => compare_leaf(FilterOp::Lt, field, value, doc),
-        FilterExpr::Lte { field, value } => compare_leaf(FilterOp::Lte, field, value, doc),
-        FilterExpr::Not { expr } => !eval_filter_expr(expr, doc),
+            .any(|v| compare_leaf(FilterOp::Eq, field, v, doc, fields)),
+        FilterExpr::Eq { field, value } => compare_leaf(FilterOp::Eq, field, value, doc, fields),
+        FilterExpr::Neq { field, value } => compare_leaf(FilterOp::Neq, field, value, doc, fields),
+        FilterExpr::Gt { field, value } => compare_leaf(FilterOp::Gt, field, value, doc, fields),
+        FilterExpr::Gte { field, value } => compare_leaf(FilterOp::Gte, field, value, doc, fields),
+        FilterExpr::Lt { field, value } => compare_leaf(FilterOp::Lt, field, value, doc, fields),
+        FilterExpr::Lte { field, value } => compare_leaf(FilterOp::Lte, field, value, doc, fields),
+        FilterExpr::Not { expr } => !eval_filter_expr(expr, doc, fields),
         FilterExpr::Contains { field, value } => match doc.get(field) {
             Some(Value::Array(arr)) => arr.iter().any(|v| v == value),
             _ => false,
@@ -469,13 +481,38 @@ pub fn eval_filter_expr(expr: &FilterExpr, doc: &Value) -> bool {
 }
 
 /// Per-leaf comparison, mirroring `compareLeaf`
-/// (`ts-client/src/in_memory.ts:423-444`). `doc[field]` null/absent → `false`
-/// (SQL NULL exclusion); the filter value's kind picks the comparison domain.
-fn compare_leaf(op: FilterOp, field: &str, filter_value: &Value, doc: &Value) -> bool {
+/// (`ts-client/src/in_memory.ts:423-444`) plus the server's typed-column arm
+/// for declared `int64` fields (ENH-027 parity fix — see
+/// [`eval_filter_expr`]). `doc[field]` null/absent → `false` (SQL NULL
+/// exclusion); the filter value's kind picks the comparison domain, except
+/// that a string value against a declared `int64` field compares numerically.
+fn compare_leaf(
+    op: FilterOp,
+    field: &str,
+    filter_value: &Value,
+    doc: &Value,
+    fields: &BTreeMap<String, FieldType>,
+) -> bool {
     let doc_val = match doc.get(field) {
         Some(v) if !v.is_null() => v,
         _ => return false,
     };
+    if let Value::String(s) = filter_value
+        && is_int64_field(fields.get(field))
+    {
+        // The server binds a string filter value on an int64 field as
+        // `EqBind::I64` against the typed `bigint` column (indexed fields)
+        // and rejects it on the jsonb path — so any legal comparison is
+        // numeric. Parse both sides exactly as i64 (i64::MAX is not
+        // f64-exact); an unparseable value never matches.
+        let Some(lhs) = doc_val.as_str().and_then(|s| s.parse::<i64>().ok()) else {
+            return false;
+        };
+        return match s.parse::<i64>() {
+            Ok(rhs) => compare_values(op, &lhs, &rhs),
+            Err(_) => false,
+        };
+    }
     match filter_value {
         Value::String(s) => {
             let lhs = doc_to_text(doc_val);
@@ -494,6 +531,16 @@ fn compare_leaf(op: FilterOp, field: &str, filter_value: &Value, doc: &Value) ->
         },
         // Unreachable post-validate (`check_leaf_value` rejects non-string/
         // number/boolean values); defensively treat as no-match.
+        _ => false,
+    }
+}
+
+/// Whether a declared field type is `int64` (an `optional<int64>` unwraps to
+/// it — `eq_bind_for` unwraps `Optional` the same way).
+fn is_int64_field(ty: Option<&FieldType>) -> bool {
+    match ty {
+        Some(FieldType::Int64) => true,
+        Some(FieldType::Optional { inner }) => matches!(**inner, FieldType::Int64),
         _ => false,
     }
 }
@@ -559,9 +606,14 @@ fn compare_values<T: PartialEq + PartialOrd>(op: FilterOp, lhs: &T, rhs: &T) -> 
     }
 }
 
-/// Filter hook for [`InMemoryRtDbClient::run_query`]. Delegates to
-/// [`eval_filter_expr`]; validation runs once in `run_query` before the row
-/// loop, so by the time this runs the filter is structurally sound.
-pub(super) fn matches_filter(expr: &FilterExpr, doc: &Value) -> bool {
-    eval_filter_expr(expr, doc)
+/// Filter hook for [`InMemoryRtDbClient::run_query`] and the by-query write
+/// steps. Delegates to [`eval_filter_expr`]; validation runs once in
+/// `run_query` before the row loop, so by the time this runs the filter is
+/// structurally sound.
+pub(super) fn matches_filter(
+    expr: &FilterExpr,
+    doc: &Value,
+    fields: &BTreeMap<String, FieldType>,
+) -> bool {
+    eval_filter_expr(expr, doc, fields)
 }

@@ -88,7 +88,7 @@ impl InMemoryRtDbClient {
         }
 
         let plan = prepare_scan(q, &table_def, eq, has_range)?;
-        let mut filtered = self.fetch_filtered_rows(q, &plan);
+        let mut filtered = self.fetch_filtered_rows(q, &plan, &table_def.fields);
 
         // `count` short-circuits before the sort (the count is the cardinality
         // of the filtered set, regardless of ordering).
@@ -148,7 +148,12 @@ impl InMemoryRtDbClient {
     /// read terminal (the server composes the same live-only predicate into
     /// every scan WHERE). Mirrors the ts/python engines' `fetchFilteredRows`
     /// / `_fetch_filtered_rows`.
-    fn fetch_filtered_rows(&self, q: &Query, plan: &ScanPlan) -> Vec<StoredRow> {
+    fn fetch_filtered_rows(
+        &self,
+        q: &Query,
+        plan: &ScanPlan,
+        fields: &BTreeMap<String, FieldType>,
+    ) -> Vec<StoredRow> {
         // Row fetch + filter (eq prefix → range → filter hook).
         let mut filtered: Vec<StoredRow> = Vec::new();
         for ((t, _id), row) in &self.docs {
@@ -207,7 +212,7 @@ impl InMemoryRtDbClient {
                 }
             }
             if let Some(expr) = &q.filter
-                && !matches_filter(expr, &row.doc)
+                && !matches_filter(expr, &row.doc, fields)
             {
                 continue;
             }
@@ -294,7 +299,7 @@ impl InMemoryRtDbClient {
         }
         let mut rows: Vec<Value> = self.collect_all(&q.table);
         if let Some(filter) = &vector.filter {
-            rows.retain(|d| matches_filter(filter, d));
+            rows.retain(|d| matches_filter(filter, d, &table_def.fields));
         }
         rows.truncate(vector.limit as usize);
         Ok(Value::Array(rows))
@@ -434,7 +439,7 @@ impl InMemoryRtDbClient {
         let mut rows: Vec<Value> = self.collect_all(&q.table);
         if search.mode == Some(crate::wire::SearchMode::Trgm) {
             if let Some(filter) = &search.filter {
-                rows.retain(|d| matches_filter(filter, d));
+                rows.retain(|d| matches_filter(filter, d, &table_def.fields));
             }
             let needle = search.query.to_lowercase();
             let query_len = search.query.len();
@@ -498,7 +503,7 @@ impl InMemoryRtDbClient {
                     .all(|g| g.iter().any(|op| search_operand_matches(op, &texts)))
         });
         if let Some(filter) = &search.filter {
-            rows.retain(|d| matches_filter(filter, d));
+            rows.retain(|d| matches_filter(filter, d, &table_def.fields));
         }
         if snippet {
             attach_search_snippets(&mut rows, &index_fields, &parsed);
