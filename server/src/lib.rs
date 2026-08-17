@@ -195,16 +195,8 @@ impl AppState {
             schemas.clone(),
             op_feed.clone(),
             hot.clone(),
-            config.audit_log_enabled,
-            config.webhooks_enabled,
-            config.ttl_sweep_interval_secs,
-            config.ttl_batch,
             metrics.clone(),
-            quotas.clone(),
-            config.quota_cache_ttl_secs,
-            config.db_idle_reclaim_secs,
-            instance_id.clone(),
-            config.multi_instance,
+            committer::CommitterConfig::from_config(&config, quotas.clone(), instance_id.clone()),
         );
         // ARC-102 step 4: spawn the server-wide idle-reclamation sweep. A no-op
         // when `db_idle_reclaim_secs` is 0 (the default), so a server that does
