@@ -1,60 +1,20 @@
 /** Webhook management — register webhooks and inspect the delivery outbox with retry state. */
 import { useCallback, useEffect, useState } from "react";
+import {
+  timeLabel,
+  WebhookCreateForm,
+  WebhookDeliveriesPanel,
+  WebhookEditPanel,
+} from "../components/webhooks";
 import { Button, Placard, Spinner } from "../components/ui";
 import { useAdmin } from "../lib/admin";
 import { toErrorMessage } from "../lib/errors";
-import type { Webhook, WebhookDelivery } from "../lib/types";
+import type { Webhook } from "../lib/types";
 import s from "./WebhooksPage.module.css";
-
-function timeLabel(ms: number): string {
-  return new Date(ms).toLocaleString(undefined, { hour12: false });
-}
-
-/** Split a comma-separated events string into a trimmed, de-duplicated list,
- *  dropping empties. Empty input yields `[]` so the caller can decide whether
- *  to send the key at all (create defaults to `["*"]` server-side). */
-function parseEvents(text: string): string[] {
-  const out: string[] = [];
-  for (const raw of text.split(",")) {
-    const v = raw.trim();
-    if (v && !out.includes(v)) out.push(v);
-  }
-  return out;
-}
 
 /** Group events for the table cell — preserves order, joins with `, `. */
 function eventsLabel(events: string[]): string {
   return events.length === 0 ? "—" : events.join(", ");
-}
-
-/** Status badge tone for a delivery row. Tolerates unknown values by falling
- *  back to the neutral badge. */
-function deliveryBadgeClass(status: string): string {
-  switch (status) {
-    case "delivered":
-      return s.badgeDelivered;
-    case "pending":
-      return s.badgePending;
-    case "retrying":
-      return s.badgeRetrying;
-    case "failed":
-      return s.badgeFailed;
-    default:
-      return "";
-  }
-}
-
-/** A one-line preview of the delivery payload — JSON-stringified and truncated
- *  for the table cell; the title attribute carries the full text on hover. */
-function payloadPreview(payload: unknown): { title: string; text: string } {
-  const title = (() => {
-    try {
-      return JSON.stringify(payload);
-    } catch {
-      return String(payload);
-    }
-  })();
-  return { title, text: title.length > 60 ? `${title.slice(0, 60)}…` : title };
 }
 
 export function WebhooksPage() {
@@ -64,37 +24,15 @@ export function WebhooksPage() {
   const [loading, setLoading] = useState(false);
   const [listError, setListError] = useState<string | null>(null);
 
-  // Create-form state.
-  const [createUrl, setCreateUrl] = useState("");
-  const [createTable, setCreateTable] = useState("");
-  const [createEvents, setCreateEvents] = useState("");
-  const [createEnabled, setCreateEnabled] = useState(true);
-  const [creating, setCreating] = useState(false);
-  const [createError, setCreateError] = useState<string | null>(null);
-  const [createOk, setCreateOk] = useState<string | null>(null);
-
   // Per-row action state.
   const [actionError, setActionError] = useState<string | null>(null);
   const [pendingId, setPendingId] = useState<number | null>(null);
   const [confirmingDelete, setConfirmingDelete] = useState<number | null>(null);
 
-  // Inline edit state — when set, the edit panel renders above the create form.
+  // Inline edit / deliveries drill-down targets — the panels own their form
+  // and fetch state; the page tracks only which webhook each is bound to.
   const [editingId, setEditingId] = useState<number | null>(null);
-  const [editUrl, setEditUrl] = useState("");
-  const [editTable, setEditTable] = useState("");
-  const [editEvents, setEditEvents] = useState("");
-  const [editEnabled, setEditEnabled] = useState(true);
-  const [editClearTable, setEditClearTable] = useState(false);
-  const [saving, setSaving] = useState(false);
-  const [editError, setEditError] = useState<string | null>(null);
-
-  // Deliveries drill-down state — when set, a deliveries panel renders with a
-  // status filter and a sub-table.
   const [deliveriesForId, setDeliveriesForId] = useState<number | null>(null);
-  const [deliveries, setDeliveries] = useState<WebhookDelivery[]>([]);
-  const [deliveriesLoading, setDeliveriesLoading] = useState(false);
-  const [deliveriesError, setDeliveriesError] = useState<string | null>(null);
-  const [deliveriesStatus, setDeliveriesStatus] = useState<string>("");
 
   // Auto-select the first database once the list arrives.
   useEffect(() => {
@@ -124,127 +62,9 @@ export function WebhooksPage() {
     if (db) void refresh();
   }, [db, refresh]);
 
-  const loadDeliveries = useCallback(
-    async (id: number, status: string) => {
-      if (!db) return;
-      setDeliveriesLoading(true);
-      setDeliveriesError(null);
-      try {
-        const opts = status ? { status } : {};
-        setDeliveries(await client.listDeliveries(db, id, opts));
-      } catch (e) {
-        setDeliveriesError(toErrorMessage(e));
-        setDeliveries([]);
-      } finally {
-        setDeliveriesLoading(false);
-      }
-    },
-    [client, db],
-  );
-
-  // Refresh deliveries when the target or status filter changes.
-  useEffect(() => {
-    if (deliveriesForId === null) {
-      setDeliveries([]);
-      setDeliveriesError(null);
-      return;
-    }
-    void loadDeliveries(deliveriesForId, deliveriesStatus);
-  }, [deliveriesForId, deliveriesStatus, loadDeliveries]);
-
   function startEdit(wh: Webhook) {
     setEditingId(wh.id);
-    setEditUrl(wh.url);
-    setEditTable(wh.table ?? "");
-    setEditEvents(wh.events.join(", "));
-    setEditEnabled(wh.enabled);
-    setEditClearTable(wh.table === null);
-    setEditError(null);
     setDeliveriesForId(null);
-  }
-
-  function cancelEdit() {
-    setEditingId(null);
-    setEditError(null);
-  }
-
-  async function create() {
-    if (!db) return;
-    const url = createUrl.trim();
-    if (!url) {
-      setCreateError("url is required.");
-      return;
-    }
-    const events = parseEvents(createEvents);
-    // Send only the keys that differ from the server defaults so the body stays
-    // minimal: `table` only when set, `events` only when not `["*"]`, `enabled`
-    // only when false (server default is true).
-    const opts: {
-      url: string;
-      table?: string;
-      events?: string[];
-      enabled?: boolean;
-    } = { url };
-    if (createTable.trim()) opts.table = createTable.trim();
-    if (!(events.length === 1 && events[0] === "*")) opts.events = events;
-    if (!createEnabled) opts.enabled = false;
-
-    setCreating(true);
-    setCreateError(null);
-    setCreateOk(null);
-    try {
-      const { id } = await client.createWebhook(db, opts);
-      setCreateOk(`created — id ${id}`);
-      setCreateUrl("");
-      setCreateTable("");
-      setCreateEvents("");
-      setCreateEnabled(true);
-      await refresh();
-    } catch (e) {
-      setCreateError(toErrorMessage(e));
-    } finally {
-      setCreating(false);
-    }
-  }
-
-  async function saveEdit(id: number) {
-    if (!db) return;
-    const url = editUrl.trim();
-    if (!url) {
-      setEditError("url must not be empty.");
-      return;
-    }
-    // Build the partial body — only provided keys. `table` is a tri-state:
-    //   editClearTable true    -> null (clear to all-tables)
-    //   editClearTable false   -> the trimmed value, or omitted if blank
-    // `events` is sent when it parses to anything other than `["*"]`. `enabled`
-    // is always sent so toggling back to true works.
-    const events = parseEvents(editEvents);
-    const opts: {
-      url?: string;
-      table?: string | null;
-      events?: string[];
-      enabled?: boolean;
-    } = { url };
-    if (editClearTable) {
-      opts.table = null;
-    } else if (editTable.trim()) {
-      opts.table = editTable.trim();
-    }
-    if (!(events.length === 1 && events[0] === "*")) opts.events = events;
-    opts.enabled = editEnabled;
-
-    setSaving(true);
-    setEditError(null);
-    try {
-      await client.editWebhook(db, id, opts);
-      setEditingId(null);
-      await refresh();
-    } catch (e) {
-      setEditError(toErrorMessage(e));
-    } finally {
-      setSaving(false);
-    }
   }
 
   async function remove(wh: Webhook) {
@@ -263,6 +83,8 @@ export function WebhooksPage() {
       setPendingId(null);
     }
   }
+
+  const editing = editingId === null ? null : (webhooks.find((wh) => wh.id === editingId) ?? null);
 
   return (
     <section className={s.page}>
@@ -388,234 +210,30 @@ export function WebhooksPage() {
         </div>
       )}
 
-      {editingId !== null && (
-        <section className={s.editBlock}>
-          <Placard>Edit webhook #{editingId}</Placard>
-          <div className={s.toolbar}>
-            <label className={s.field}>
-              <span className={s.fieldLabel}>url</span>
-              <input
-                className={s.input}
-                value={editUrl}
-                onChange={(e) => setEditUrl(e.target.value)}
-                aria-label="url"
-              />
-            </label>
-            <label className={s.field}>
-              <span className={s.fieldLabel}>table (empty = all tables, or tick “clear”)</span>
-              <input
-                className={s.input}
-                value={editTable}
-                onChange={(e) => {
-                  setEditTable(e.target.value);
-                  if (e.target.value) setEditClearTable(false);
-                }}
-                placeholder="users, audit, …"
-                aria-label="table"
-                disabled={editClearTable}
-              />
-            </label>
-            <label className={s.field}>
-              <span className={s.fieldLabel}>clear table to all-tables</span>
-              <input
-                type="checkbox"
-                checked={editClearTable}
-                onChange={(e) => setEditClearTable(e.target.checked)}
-                aria-label="clear table"
-              />
-            </label>
-            <label className={s.field}>
-              <span className={s.fieldLabel}>events (comma-separated)</span>
-              <input
-                className={s.input}
-                value={editEvents}
-                onChange={(e) => setEditEvents(e.target.value)}
-                placeholder="insert, patch, …  (or *)"
-                aria-label="events"
-              />
-            </label>
-            <label className={s.field}>
-              <span className={s.fieldLabel}>enabled</span>
-              <div className={s.segment}>
-                <button
-                  type="button"
-                  onClick={() => setEditEnabled(true)}
-                  className={`${s.segBtn} ${editEnabled ? s.segBtnActive : ""}`}
-                  aria-pressed={editEnabled}
-                >
-                  enabled
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setEditEnabled(false)}
-                  className={`${s.segBtn} ${!editEnabled ? s.segBtnActive : ""}`}
-                  aria-pressed={!editEnabled}
-                >
-                  disabled
-                </button>
-              </div>
-            </label>
-          </div>
-          <div className={s.actions}>
-            <Button
-              variant="primary"
-              onClick={() => void saveEdit(editingId)}
-              disabled={saving || !db}
-            >
-              {saving ? "saving…" : "save"}
-            </Button>
-            {saving && <Spinner label="saving" />}
-            <Button onClick={() => cancelEdit()} disabled={saving}>
-              cancel
-            </Button>
-            <span className={s.hint}>
-              {editClearTable
-                ? "table will be cleared to all-tables"
-                : "leave table blank to leave the filter unchanged"}
-            </span>
-          </div>
-          {editError && <p className={s.error}>{editError}</p>}
-        </section>
+      {editing !== null && (
+        <WebhookEditPanel
+          key={editing.id}
+          client={client}
+          db={db}
+          webhook={editing}
+          onClose={() => setEditingId(null)}
+          onSaved={async () => {
+            setEditingId(null);
+            await refresh();
+          }}
+        />
       )}
 
       {deliveriesForId !== null && (
-        <section className={s.deliveriesBlock}>
-          <Placard>Deliveries — webhook #{deliveriesForId}</Placard>
-          <div className={s.deliveriesHead}>
-            <label className={s.field}>
-              <span className={s.fieldLabel}>status filter</span>
-              <select
-                className={s.select}
-                value={deliveriesStatus}
-                onChange={(e) => setDeliveriesStatus(e.target.value)}
-              >
-                <option value="">— any —</option>
-                <option value="pending">pending</option>
-                <option value="retrying">retrying</option>
-                <option value="delivered">delivered</option>
-                <option value="failed">failed</option>
-              </select>
-            </label>
-            <Button
-              onClick={() => void loadDeliveries(deliveriesForId, deliveriesStatus)}
-              disabled={deliveriesLoading}
-            >
-              {deliveriesLoading ? "refreshing…" : "refresh"}
-            </Button>
-            {deliveriesLoading && <Spinner label="loading deliveries" />}
-            <Button onClick={() => setDeliveriesForId(null)}>close</Button>
-          </div>
-          {deliveriesError && <p className={s.error}>{deliveriesError}</p>}
-          {deliveries.length === 0 ? (
-            <p className={s.muted}>no deliveries.</p>
-          ) : (
-            <div className={s.subTableWrap}>
-              <table className={s.table}>
-                <thead>
-                  <tr>
-                    <th>id</th>
-                    <th>status</th>
-                    <th>attempts</th>
-                    <th>next attempt</th>
-                    <th>last error</th>
-                    <th>payload</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {deliveries.map((d) => {
-                    const preview = payloadPreview(d.payload);
-                    return (
-                      <tr key={d.id}>
-                        <td className={s.idCell}>{d.id}</td>
-                        <td>
-                          <span className={`${s.badge} ${deliveryBadgeClass(d.status)}`}>
-                            {d.status}
-                          </span>
-                        </td>
-                        <td className="tnum">{d.attempts}</td>
-                        <td>{timeLabel(d.nextAttempt)}</td>
-                        <td className={s.errCell} title={d.lastError ?? ""}>
-                          {d.lastError ?? "—"}
-                        </td>
-                        <td className={s.payloadCell} title={preview.title}>
-                          {preview.text}
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            </div>
-          )}
-        </section>
+        <WebhookDeliveriesPanel
+          client={client}
+          db={db}
+          webhookId={deliveriesForId}
+          onClose={() => setDeliveriesForId(null)}
+        />
       )}
 
-      <section className={s.createBlock}>
-        <Placard>Create a webhook</Placard>
-        <div className={s.toolbar}>
-          <label className={s.field}>
-            <span className={s.fieldLabel}>url</span>
-            <input
-              className={s.input}
-              value={createUrl}
-              onChange={(e) => setCreateUrl(e.target.value)}
-              placeholder="https://example.com/hook"
-              aria-label="url"
-            />
-          </label>
-          <label className={s.field}>
-            <span className={s.fieldLabel}>table (empty = all tables)</span>
-            <input
-              className={s.input}
-              value={createTable}
-              onChange={(e) => setCreateTable(e.target.value)}
-              placeholder="users, audit, …"
-              aria-label="create table"
-            />
-          </label>
-          <label className={s.field}>
-            <span className={s.fieldLabel}>events (comma-separated, empty = *)</span>
-            <input
-              className={s.input}
-              value={createEvents}
-              onChange={(e) => setCreateEvents(e.target.value)}
-              placeholder="insert, patch, …"
-              aria-label="create events"
-            />
-          </label>
-          <label className={s.field}>
-            <span className={s.fieldLabel}>enabled</span>
-            <div className={s.segment}>
-              <button
-                type="button"
-                onClick={() => setCreateEnabled(true)}
-                className={`${s.segBtn} ${createEnabled ? s.segBtnActive : ""}`}
-                aria-pressed={createEnabled}
-              >
-                enabled
-              </button>
-              <button
-                type="button"
-                onClick={() => setCreateEnabled(false)}
-                className={`${s.segBtn} ${!createEnabled ? s.segBtnActive : ""}`}
-                aria-pressed={!createEnabled}
-              >
-                disabled
-              </button>
-            </div>
-          </label>
-        </div>
-
-        <div className={s.actions}>
-          <Button variant="primary" onClick={() => void create()} disabled={creating || !db}>
-            {creating ? "creating…" : "create"}
-          </Button>
-          {creating && <Spinner label="creating" />}
-          <span className={s.warn}>writes on matching doc changes</span>
-          {createOk && <span className={s.hint}>{createOk}</span>}
-        </div>
-        {createError && <p className={s.error}>{createError}</p>}
-      </section>
+      <WebhookCreateForm client={client} db={db} onCreated={refresh} />
     </section>
   );
 }
