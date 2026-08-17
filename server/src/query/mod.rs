@@ -546,9 +546,7 @@ pub async fn execute_query(
         let collaborators_field = table_def.collaborators_field.as_deref();
         let sctx = SearchCtx {
             pool,
-            db,
             table_def,
-            table_name: q.table.as_str(),
             owner_field,
             collaborators_field,
             ctx,

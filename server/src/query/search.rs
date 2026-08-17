@@ -70,26 +70,15 @@ fn websearch_tsquery_sql(language: Option<&str>, ph: usize) -> String {
 /// Shared, borrow-only context for the read-path terminals that don't use the
 /// btree `QueryWindow` — `point_read` and the `search`/`vectorSearch`/
 /// `hybridSearch` family. Those four terminals share the same caller-resolved
-/// inputs (pool, db, the resolved table definition, the table name, and the
-/// per-row-auth fields derived from it, plus the principal), so `SearchCtx`
+/// inputs (pool, the resolved table definition, and the per-row-auth fields
+/// derived from it, plus the principal), so `SearchCtx`
 /// bundles them the way `QueryWindow` bundles the index-window inputs and
 /// `StepCtx` (`txn.rs`) bundles the write-path inputs. Borrow-only: every
 /// field is a shared reference (these terminals read, never mutate), so it
 /// threads through `&SearchCtx` cleanly. QA-105.
-/// Shared borrow-only context for the four read-path terminals that don't
-/// use the btree `QueryWindow` (point_read + the search family). Constructed
-/// once from the caller-resolved inputs and passed by shared reference; each
-/// terminal destructures it back into the same locals the inline body used.
 pub(crate) struct SearchCtx<'a> {
     pub(crate) pool: &'a PgPool,
-    // `db` and `table_name` are read by the compile fns via `CompileSearchCtx`;
-    // they remain on this struct for symmetry and for any future execute tail
-    // that needs them (point_read today reads only pool + the auth helpers).
-    #[allow(dead_code)]
-    pub(crate) db: &'a str,
     pub(crate) table_def: &'a TableDef,
-    #[allow(dead_code)]
-    pub(crate) table_name: &'a str,
     pub(crate) owner_field: Option<&'a str>,
     pub(crate) collaborators_field: Option<&'a str>,
     pub(crate) ctx: &'a PrincipalCtx,
