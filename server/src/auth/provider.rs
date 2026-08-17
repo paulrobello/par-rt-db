@@ -509,7 +509,8 @@ async fn provider_begin<P: OAuthProvider>(
     // attacker induced the victim to load (the attacker's own exchange) carries no
     // matching cookie and is rejected at `provider_callback`. SameSite=None so it
     // survives the provider → callback cross-site redirect.
-    let secure = state.config.cookie_secure || crate::auth::cookie::request_is_secure(&headers);
+    let secure = state.config.cookie_secure
+        || crate::auth::cookie::request_is_secure(&headers, state.config.trusted_proxy);
     if let Ok(csrf) = crate::auth::cookie::set_oauth_csrf_cookie(&state_token, secure) {
         response.headers_mut().append(SET_COOKIE, csrf);
     }
@@ -565,7 +566,8 @@ async fn provider_callback<P: OAuthProvider>(
         return unconfigured_response(P::name());
     };
 
-    let secure = state.config.cookie_secure || crate::auth::cookie::request_is_secure(&headers);
+    let secure = state.config.cookie_secure
+        || crate::auth::cookie::request_is_secure(&headers, state.config.trusted_proxy);
     match provider.complete_login(&state, &params.code).await {
         Ok(token) => {
             // FM-27: merge the anon footprint into the real account before the
@@ -614,7 +616,8 @@ async fn apple_callback(
         return unconfigured_response(AppleProvider::name());
     };
 
-    let secure = state.config.cookie_secure || crate::auth::cookie::request_is_secure(&headers);
+    let secure = state.config.cookie_secure
+        || crate::auth::cookie::request_is_secure(&headers, state.config.trusted_proxy);
     match provider.complete_login(&state, &form.code).await {
         Ok(token) => {
             // FM-27: merge the anon footprint into the real account before the
@@ -826,7 +829,7 @@ async fn anonymous(
     // peer) — the same canonicalization the public storage route uses. Disabled
     // when `anonymous_rate_limit_per_ip_rpm == 0` (code default; the shipped
     // `.env.example`/`docker-compose.yml` set a non-zero default).
-    let ip_key = crate::http_api::client_ip_key(&headers, addr.ip());
+    let ip_key = crate::http_api::client_ip_key(&headers, addr.ip(), state.config.trusted_proxy);
     let limit = state.config.anonymous_rate_limit_per_ip_rpm;
     if limit > 0 {
         match state
@@ -876,7 +879,8 @@ async fn anonymous(
         github_login: None,
         session_hash: None,
     };
-    let secure = state.config.cookie_secure || crate::auth::cookie::request_is_secure(&headers);
+    let secure = state.config.cookie_secure
+        || crate::auth::cookie::request_is_secure(&headers, state.config.trusted_proxy);
     let mut response = Json(AnonymousResponse {
         user: authed_user(&principal),
         token: token.clone(),

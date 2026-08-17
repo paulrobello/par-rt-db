@@ -43,7 +43,7 @@ pub(super) async fn admin_login(
     // SEC-109: per-IP fixed-window rate limit. 0 = off (the default); a
     // non-zero value like 10 means one IP gets 10 attempts/minute before 429.
     // Checked BEFORE the ct_eq so a flood of guesses never reaches the compare.
-    let ip_key = crate::http_api::client_ip_key(&headers, addr.ip());
+    let ip_key = crate::http_api::client_ip_key(&headers, addr.ip(), state.config.trusted_proxy);
     let limit = state.config.admin_rate_limit_per_ip_rpm;
     if limit > 0 {
         match state
@@ -91,7 +91,8 @@ pub(super) async fn admin_login(
     // cookie Max-Age and the server-side row expire together.
     let ttl_days = state.runtime.hot.load().session_ttl_days;
     let admin_session_token = auth::session::create_admin_session(&state.pool, ttl_days).await?;
-    let secure = state.config.cookie_secure || auth::cookie::request_is_secure(&headers);
+    let secure = state.config.cookie_secure
+        || auth::cookie::request_is_secure(&headers, state.config.trusted_proxy);
     let cookie = auth::cookie::set_session_cookie(&admin_session_token, secure)?;
     // SEC-106: mint the readable CSRF nonce alongside the session cookie. The
     // dashboard reads it via `document.cookie` and echoes it in the

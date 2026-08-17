@@ -290,6 +290,7 @@ mod tests {
             db_idle_reclaim_secs: 0,
             admin_rate_limit_per_ip_rpm: 0,
             cookie_secure: false,
+            trusted_proxy: false,
             otel_enabled: false,
             otel_endpoint: String::new(),
             otel_service_name: String::new(),

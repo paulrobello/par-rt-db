@@ -58,7 +58,7 @@ use std::time::{Duration, SystemTime};
 use arc_swap::ArcSwap;
 use axum::extract::{Request, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
-use axum::middleware::{Next, from_fn};
+use axum::middleware::{Next, from_fn, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
 use axum::{Router, routing::get};
 use committer::Committers;
@@ -395,21 +395,23 @@ async fn set_static_cache_headers(req: Request, next: Next) -> Response {
 /// `X-Content-Type-Options`, `Referrer-Policy`, and `X-Frame-Options`
 /// unconditionally; `Content-Security-Policy` only on HTML responses (the
 /// dashboard bundle is same-origin and self-contained, so `'self'` holds); and
-/// `Strict-Transport-Security` only when the request arrived over HTTPS (the
-/// Cloudflare tunnel sets `X-Forwarded-Proto: https`, mirroring
-/// `auth::cookie::request_is_secure` — unconditional HSTS breaks plain-http
+/// `Strict-Transport-Security` only when the request arrived over HTTPS per
+/// `auth::cookie::request_is_secure` — the Cloudflare tunnel sets
+/// `X-Forwarded-Proto: https`, and SEC-201 gates that read on
+/// `RTDB_TRUSTED_PROXY` so a spoofed header cannot inject HSTS on a
+/// directly-reachable deploy (unconditional HSTS would also break plain-http
 /// local dev).
 ///
 /// A response that already carries a `Content-Security-Policy` header (the
 /// OAuth callback page at `auth/provider.rs` sets a stricter per-page one) is
 /// left alone — one source of truth per route, never overwrite an existing
 /// policy.
-async fn security_headers(req: Request, next: Next) -> Response {
-    let https = req
-        .headers()
-        .get("x-forwarded-proto")
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|s| s.eq_ignore_ascii_case("https"));
+async fn security_headers(
+    State(state): State<Arc<AppState>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let https = auth::cookie::request_is_secure(req.headers(), state.config.trusted_proxy);
     let mut resp = next.run(req).await;
     let headers = resp.headers_mut();
     headers.insert(
@@ -554,7 +556,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     }
 
     router
-        .layer(from_fn(security_headers))
+        .layer(from_fn_with_state(state.clone(), security_headers))
         .layer(
             // SEC-121: the default `TraceLayer::new_for_http()` records the full
             // request URI (including query string) in the span. The OAuth `state`

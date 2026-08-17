@@ -89,6 +89,11 @@ services:
       # proxy that strips X-Forwarded-Proto can no longer cause a session cookie
       # to be sent over plain HTTP. Set to "false" ONLY for local-http dev.
       RTDB_COOKIE_SECURE: ${RTDB_COOKIE_SECURE:-true}
+      # SEC-201: the shipped deploy sits behind the Cloudflare tunnel, so the
+      # forwarding headers (CF-Connecting-IP / X-Forwarded-For /
+      # X-Forwarded-Proto) are proxy-observed, not caller-controlled. Set to
+      # "false" only when the port is directly reachable.
+      RTDB_TRUSTED_PROXY: ${RTDB_TRUSTED_PROXY:-true}
       # Webhook delivery registry (off by default). Mirrors SEC-001 SSRF
       # hardening: when enabled, registration requires https + rejects private
       # IP ranges; RTDB_WEBHOOK_ALLOW_HTTP is the dev escape hatch (off).

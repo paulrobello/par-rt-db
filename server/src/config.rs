@@ -282,6 +282,16 @@ pub struct Config {
     /// local-http-dev escape hatch: a developer on `http://localhost` sets this
     /// to `false` so the browser still accepts the cookie. Boot-only (not hot).
     pub cookie_secure: bool,
+    /// RTDB_TRUSTED_PROXY (default false). When true, the server sits behind a
+    /// reverse proxy it controls and trusts the forwarding headers that proxy
+    /// sets: `CF-Connecting-IP` / `X-Forwarded-For` become the per-IP
+    /// rate-limit keys (`client_ip_key`), and `X-Forwarded-Proto` feeds
+    /// `request_is_secure` (cookie `Secure`, HSTS). When false (the safe
+    /// default), those headers are caller-controlled and ignored — the
+    /// connection peer address is used — so a directly reachable deploy
+    /// cannot have rate-limit buckets rotated via spoofed headers (SEC-201).
+    /// Boot-only (not hot-reloadable), like `cookie_secure`.
+    pub trusted_proxy: bool,
     // ---- OpenTelemetry / OTLP tracing export (ENH-018) ----
     // All boot-only. The cargo `otel` feature gates the dependency + subscriber
     // wiring; RTDB_OTEL_ENABLED gates it at runtime so a feature-compiled binary
@@ -598,6 +608,14 @@ impl Config {
         // cookie in the clear when a proxy strips `X-Forwarded-Proto`.
         let cookie_secure = env_bool("RTDB_COOKIE_SECURE", true);
 
+        // SEC-201: only trust forwarding headers (CF-Connecting-IP,
+        // X-Forwarded-For, X-Forwarded-Proto) when the deploy actually sits
+        // behind such a proxy. Default false: on a directly reachable port
+        // those headers are caller-controlled, and trusting them lets an
+        // attacker rotate per-IP rate-limit buckets (or flag cookie Secure /
+        // HSTS) with arbitrary header values.
+        let trusted_proxy = env_bool("RTDB_TRUSTED_PROXY", false);
+
         // OpenTelemetry / OTLP tracing export (ENH-018). The cargo `otel`
         // feature gates the deps + subscriber wiring; RTDB_OTEL_ENABLED is the
         // runtime switch so a feature-compiled binary still defaults to zero
@@ -696,6 +714,7 @@ impl Config {
             db_idle_reclaim_secs,
             admin_rate_limit_per_ip_rpm,
             cookie_secure,
+            trusted_proxy,
             otel_enabled,
             otel_endpoint,
             otel_service_name,

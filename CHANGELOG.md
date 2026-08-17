@@ -13,6 +13,19 @@ contract against Convex.
 
 ## [Unreleased]
 
+### Security: forwarding headers gated on `RTDB_TRUSTED_PROXY` (SEC-201)
+
+`CF-Connecting-IP` / `X-Forwarded-For` (per-IP rate-limit keys on the public
+storage, admin-login, and anonymous-auth routes) and `X-Forwarded-Proto`
+(cookie `Secure` attribute, HSTS) are now consulted only when the new
+`RTDB_TRUSTED_PROXY` env var is `true`. Default `false`: on a directly
+reachable port those headers are caller-controlled, and trusting them let an
+attacker mint a fresh rate-limit bucket per request. The shipped
+`docker-compose.yml` (behind the Cloudflare tunnel) sets it to `true`, so the
+deployed behavior is unchanged; bare-env deployments that DO sit behind a
+tunnel/proxy must set `RTDB_TRUSTED_PROXY=true` or rate limiting will key on
+the proxy's address instead of the client's.
+
 ### Phrase/operator search + snippets (FM-31)
 
 Search query text is parsed by `websearch_to_tsquery` (was `plainto_tsquery`):

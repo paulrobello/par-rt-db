@@ -810,7 +810,11 @@ async fn serve_public_handler(
     Path(id): Path<String>,
     AxumQuery(q): AxumQuery<HashMap<String, String>>,
 ) -> Result<Response, RtDbError> {
-    check_storage_public_rate_limit(&state, &client_ip_key(&headers, addr.ip())).await?;
+    check_storage_public_rate_limit(
+        &state,
+        &client_ip_key(&headers, addr.ip(), state.config.trusted_proxy),
+    )
+    .await?;
     let has_exp = q.contains_key("exp");
     let has_sig = q.contains_key("sig");
     // SEC-113: require-signature mode flips the default — without a complete,
@@ -850,7 +854,14 @@ async fn serve_public_handler(
 
 /// Canonical per-IP rate-limit key for an unauthenticated request (SEC-112).
 ///
-/// Order of preference:
+/// SEC-201: the forwarding headers below are only consulted when
+/// `trusted_proxy` is true (`RTDB_TRUSTED_PROXY`) — i.e. the deploy sits
+/// behind a reverse proxy that actually sets them. On a directly reachable
+/// port they are caller-controlled, and trusting them would let an attacker
+/// mint a fresh rate-limit bucket per request; the peer address wins
+/// outright instead.
+///
+/// Order of preference (trusted-proxy deploys only):
 /// 1. `CF-Connecting-IP` — set by the Cloudflare tunnel edge to the connecting
 ///    client. The deploy runs behind that tunnel, and CF appends (does not
 ///    replace) this header, so it is the most trustworthy identifier on the
@@ -866,7 +877,14 @@ async fn serve_public_handler(
 /// has the same spoofing shape as XFF, and the prior implementation parsed it
 /// as if it were a comma-separated IP list, which is simply wrong. CF-Connecting-IP
 /// + XFF cover every observed deployment shape.
-pub(crate) fn client_ip_key(headers: &HeaderMap, peer: std::net::IpAddr) -> String {
+pub(crate) fn client_ip_key(
+    headers: &HeaderMap,
+    peer: std::net::IpAddr,
+    trusted_proxy: bool,
+) -> String {
+    if !trusted_proxy {
+        return peer.to_string();
+    }
     if let Some(cf) = headers
         .get("cf-connecting-ip")
         .and_then(|v| v.to_str().ok())
@@ -1451,7 +1469,7 @@ mod client_ip_tests {
             ("cf-connecting-ip", "198.51.100.10"),
             ("x-forwarded-for", "10.1.1.1, 10.2.2.2, 10.3.3.3"),
         ]);
-        assert_eq!(client_ip_key(&h, peer()), "198.51.100.10");
+        assert_eq!(client_ip_key(&h, peer(), true), "198.51.100.10");
     }
 
     // SEC-112: the prior bug took the LEFTMOST XFF entry, which Cloudflare does
@@ -1462,7 +1480,7 @@ mod client_ip_tests {
     fn xff_takes_rightmost_hop_not_leftmost() {
         let h = headers_with(&[("x-forwarded-for", "10.4.4.4, 10.5.5.5, 198.51.100.20")]);
         assert_eq!(
-            client_ip_key(&h, peer()),
+            client_ip_key(&h, peer(), true),
             "198.51.100.20",
             "rightmost XFF hop is Cloudflare's observation"
         );
@@ -1472,7 +1490,7 @@ mod client_ip_tests {
     #[test]
     fn xff_single_hop() {
         let h = headers_with(&[("x-forwarded-for", "198.51.100.30")]);
-        assert_eq!(client_ip_key(&h, peer()), "198.51.100.30");
+        assert_eq!(client_ip_key(&h, peer(), true), "198.51.100.30");
     }
 
     // SEC-112: falling back to the connection peer when neither trusted header
@@ -1480,7 +1498,7 @@ mod client_ip_tests {
     #[test]
     fn falls_back_to_peer_when_no_proxy_headers() {
         let h = HeaderMap::new();
-        assert_eq!(client_ip_key(&h, peer()), peer().to_string());
+        assert_eq!(client_ip_key(&h, peer(), true), peer().to_string());
     }
 
     // SEC-112: empty/whitespace CF-Connecting-IP is ignored, not parsed as
@@ -1492,7 +1510,7 @@ mod client_ip_tests {
             ("cf-connecting-ip", "  "),
             ("x-forwarded-for", "198.51.100.40"),
         ]);
-        assert_eq!(client_ip_key(&h, peer()), "198.51.100.40");
+        assert_eq!(client_ip_key(&h, peer(), true), "198.51.100.40");
     }
 
     // SEC-112: trailing/leading whitespace is trimmed so "1.2.3.4 " and
@@ -1500,7 +1518,7 @@ mod client_ip_tests {
     #[test]
     fn cf_connecting_ip_is_trimmed() {
         let h = headers_with(&[("cf-connecting-ip", "  198.51.100.50  ")]);
-        assert_eq!(client_ip_key(&h, peer()), "198.51.100.50");
+        assert_eq!(client_ip_key(&h, peer(), true), "198.51.100.50");
     }
 
     // SEC-112: Forwarded (RFC 7239) is intentionally NOT consulted. The prior
@@ -1510,10 +1528,35 @@ mod client_ip_tests {
     fn forwarded_header_is_ignored() {
         let h = headers_with(&[("forwarded", "for=198.51.100.99")]);
         assert_eq!(
-            client_ip_key(&h, peer()),
+            client_ip_key(&h, peer(), true),
             peer().to_string(),
             "Forwarded header must not be trusted — peer fallback wins"
         );
+    }
+
+    // SEC-201: with RTDB_TRUSTED_PROXY=false (the code default), the
+    // forwarding headers are caller-controlled and must be ignored entirely —
+    // the peer address wins, so header rotation cannot mint fresh rate-limit
+    // buckets on a directly reachable deploy.
+    #[test]
+    fn untrusted_proxy_ignores_forwarding_headers() {
+        let h = headers_with(&[
+            ("cf-connecting-ip", "198.51.100.60"),
+            ("x-forwarded-for", "10.6.6.6, 198.51.100.61"),
+        ]);
+        assert_eq!(
+            client_ip_key(&h, peer(), false),
+            peer().to_string(),
+            "untrusted deploy must key on the peer address, not spoofable headers"
+        );
+    }
+
+    // SEC-201: with RTDB_TRUSTED_PROXY=true the header path is active again
+    // (the tests above all pass `true` — they cover the trusted-proxy path).
+    #[test]
+    fn trusted_proxy_reads_cf_connecting_ip() {
+        let h = headers_with(&[("cf-connecting-ip", "198.51.100.70")]);
+        assert_eq!(client_ip_key(&h, peer(), true), "198.51.100.70");
     }
 }
 

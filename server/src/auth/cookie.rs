@@ -215,11 +215,16 @@ pub(crate) fn clear_admin_csrf_cookie() -> HeaderValue {
 /// http dev has no such header → `false` → `Secure` is omitted so the cookie is
 /// still accepted by the browser. (CSRF is bounded by `SameSite=Lax` plus the
 /// server's CORS origin allowlist, which already gates cross-origin API access.)
-pub(crate) fn request_is_secure(headers: &HeaderMap) -> bool {
-    headers
-        .get("x-forwarded-proto")
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|s| s.eq_ignore_ascii_case("https"))
+///
+/// SEC-201: the header is only consulted when `trusted_proxy` is true
+/// (`RTDB_TRUSTED_PROXY`). On a directly reachable port it is
+/// caller-controlled; reporting not-secure is the safe answer there.
+pub(crate) fn request_is_secure(headers: &HeaderMap, trusted_proxy: bool) -> bool {
+    trusted_proxy
+        && headers
+            .get("x-forwarded-proto")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|s| s.eq_ignore_ascii_case("https"))
 }
 
 #[cfg(test)]
@@ -389,5 +394,21 @@ mod tests {
         let v = clear_admin_csrf_cookie().to_str().unwrap().to_string();
         assert!(v.contains("rtdb-admin-csrf="));
         assert!(v.contains("Max-Age=0"));
+    }
+
+    // SEC-201: X-Forwarded-Proto is only honored behind a trusted proxy —
+    // otherwise it is caller-controlled.
+    #[test]
+    fn request_is_secure_gated_on_trusted_proxy() {
+        let mut h = HeaderMap::new();
+        h.insert("x-forwarded-proto", "https".parse().unwrap());
+        assert!(!request_is_secure(&h, false));
+        assert!(request_is_secure(&h, true));
+    }
+
+    #[test]
+    fn request_is_secure_false_without_header() {
+        let h = HeaderMap::new();
+        assert!(!request_is_secure(&h, true));
     }
 }
