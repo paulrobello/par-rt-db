@@ -375,6 +375,376 @@ fn env_bool(key: &str, default: bool) -> bool {
     }
 }
 
+// ============================================================================
+// Per-subsystem env parsers (ARC-205)
+//
+// `Config::from_env` composes these constructors; each subsystem's knobs —
+// defaults, clamps, and the comments explaining them — live with its own
+// parser, so adding a provider or knob is one parser edit rather than another
+// line in the old monolith. `Config` itself stays FLAT: these are parse-time
+// groupings only, destructured into `Config`'s fields at the end of
+// `Config::from_env`, so no consumer of `Config` changes. Constructors that
+// parse numerics via `env_parsed` return `Result<Self, String>` so a
+// malformed value still fails boot naming the variable (ARC-118).
+// ============================================================================
+
+/// GitHub OAuth app credentials + API endpoints.
+struct GithubOAuthEnv {
+    client_id: Option<String>,
+    client_secret: Option<String>,
+    base_url: String,
+    api_url: String,
+}
+
+impl GithubOAuthEnv {
+    fn from_env() -> Self {
+        let client_id = std::env::var("RTDB_GITHUB_CLIENT_ID").ok();
+        let client_secret = std::env::var("RTDB_GITHUB_CLIENT_SECRET").ok();
+
+        let base_url = std::env::var("RTDB_GITHUB_BASE_URL")
+            .unwrap_or_else(|_| "https://github.com".to_string());
+
+        let api_url = std::env::var("RTDB_GITHUB_API_URL")
+            .unwrap_or_else(|_| "https://api.github.com".to_string());
+
+        Self {
+            client_id,
+            client_secret,
+            base_url,
+            api_url,
+        }
+    }
+}
+
+/// Google OAuth app credentials.
+struct GoogleOAuthEnv {
+    client_id: Option<String>,
+    client_secret: Option<String>,
+}
+
+impl GoogleOAuthEnv {
+    fn from_env() -> Self {
+        Self {
+            client_id: std::env::var("RTDB_GOOGLE_CLIENT_ID").ok(),
+            client_secret: std::env::var("RTDB_GOOGLE_CLIENT_SECRET").ok(),
+        }
+    }
+}
+
+/// GitLab OAuth app credentials + instance base URL.
+struct GitlabOAuthEnv {
+    client_id: Option<String>,
+    client_secret: Option<String>,
+    base_url: String,
+}
+
+impl GitlabOAuthEnv {
+    fn from_env() -> Self {
+        let client_id = std::env::var("RTDB_GITLAB_CLIENT_ID").ok();
+        let client_secret = std::env::var("RTDB_GITLAB_CLIENT_SECRET").ok();
+        let base_url = std::env::var("RTDB_GITLAB_BASE_URL")
+            .unwrap_or_else(|_| "https://gitlab.com".to_string());
+        Self {
+            client_id,
+            client_secret,
+            base_url,
+        }
+    }
+}
+
+/// Generic OpenID Connect provider endpoints (see the `oidc_*` field docs on
+/// `Config` for the active-only-when-all-set contract).
+struct OidcProviderEnv {
+    client_id: Option<String>,
+    client_secret: Option<String>,
+    authorize_url: Option<String>,
+    token_url: Option<String>,
+    userinfo_url: Option<String>,
+}
+
+impl OidcProviderEnv {
+    fn from_env() -> Self {
+        Self {
+            client_id: std::env::var("RTDB_OIDC_CLIENT_ID").ok(),
+            client_secret: std::env::var("RTDB_OIDC_CLIENT_SECRET").ok(),
+            authorize_url: std::env::var("RTDB_OIDC_AUTHORIZE_URL").ok(),
+            token_url: std::env::var("RTDB_OIDC_TOKEN_URL").ok(),
+            userinfo_url: std::env::var("RTDB_OIDC_USERINFO_URL").ok(),
+        }
+    }
+}
+
+/// Microsoft (Entra ID / Azure AD v2.0) credentials + tenant (see the
+/// `microsoft_*` field docs on `Config`).
+struct MicrosoftOAuthEnv {
+    client_id: Option<String>,
+    client_secret: Option<String>,
+    tenant: String,
+}
+
+impl MicrosoftOAuthEnv {
+    fn from_env() -> Self {
+        let client_id = std::env::var("RTDB_MICROSOFT_CLIENT_ID").ok();
+        let client_secret = std::env::var("RTDB_MICROSOFT_CLIENT_SECRET").ok();
+        // `tenant` defaults to "common" (any Microsoft account); an empty
+        // value falls back to that default so a blank RTDB_MICROSOFT_TENANT
+        // isn't interpolated into the endpoint URL.
+        let tenant = match std::env::var("RTDB_MICROSOFT_TENANT") {
+            Ok(v) if !v.trim().is_empty() => v,
+            _ => "common".to_string(),
+        };
+        Self {
+            client_id,
+            client_secret,
+            tenant,
+        }
+    }
+}
+
+/// Sign in with Apple credentials (see the `apple_*` field docs on `Config`).
+struct AppleOAuthEnv {
+    client_id: Option<String>,
+    team_id: Option<String>,
+    key_id: Option<String>,
+    private_key: Option<String>,
+}
+
+impl AppleOAuthEnv {
+    fn from_env() -> Self {
+        // Sign in with Apple. The private key is a PEM, which can't carry real
+        // newlines through most env stores, so `\n` escapes are unescaped here.
+        let client_id = std::env::var("RTDB_APPLE_CLIENT_ID").ok();
+        let team_id = std::env::var("RTDB_APPLE_TEAM_ID").ok();
+        let key_id = std::env::var("RTDB_APPLE_KEY_ID").ok();
+        let private_key = std::env::var("RTDB_APPLE_PRIVATE_KEY")
+            .ok()
+            .map(|v| v.replace("\\n", "\n"));
+        Self {
+            client_id,
+            team_id,
+            key_id,
+            private_key,
+        }
+    }
+}
+
+/// The five fixed-window `*_RPM` rate-limit knobs. 0 disables each limiter;
+/// the two unauthenticated-route limits ship non-zero defaults (SEC-203).
+struct RateLimitsEnv {
+    per_token_rpm: u32,
+    per_db_rpm: u32,
+    storage_per_ip_rpm: u32,
+    anonymous_per_ip_rpm: u32,
+    admin_per_ip_rpm: u32,
+}
+
+impl RateLimitsEnv {
+    fn from_env() -> Result<Self, String> {
+        // HTTP rate-limit ceilings: 0 = unlimited (the default), preserving
+        // today's behavior.
+        let per_token_rpm = env_parsed("RTDB_RATE_LIMIT_PER_TOKEN_RPM", 0u32)?;
+        let per_db_rpm = env_parsed("RTDB_RATE_LIMIT_PER_DB_RPM", 0u32)?;
+
+        // Per-IP rate limit on the public storage route (SEC-004). 0 = off,
+        // matching the existing per-token/per-db limiter convention.
+        // SEC-203: non-zero default — see the field doc on `Config`.
+        let storage_per_ip_rpm = env_parsed("RTDB_STORAGE_RATE_LIMIT_PER_IP_RPM", 300u32)?;
+
+        // SEC-103: per-IP rate limit on `POST /auth/anonymous`. 0 = unlimited
+        // (the code default; the shipped `.env.example`/`docker-compose.yml`
+        // set a non-zero default so the mitigation is on out-of-the-box).
+        let anonymous_per_ip_rpm = env_parsed("RTDB_ANONYMOUS_RATE_LIMIT_PER_IP_RPM", 10u32)?;
+
+        // SEC-109: per-IP rate limit on `POST /admin/login`. 0 = unlimited
+        // (the default), preserving today's behavior.
+        let admin_per_ip_rpm = env_parsed("RTDB_ADMIN_RATE_LIMIT_PER_IP_RPM", 10u32)?;
+
+        Ok(Self {
+            per_token_rpm,
+            per_db_rpm,
+            storage_per_ip_rpm,
+            anonymous_per_ip_rpm,
+            admin_per_ip_rpm,
+        })
+    }
+}
+
+/// Managed pg_dump backup scheduler knobs.
+struct BackupEnv {
+    enabled: bool,
+    cron: String,
+    dir: String,
+    retention: u32,
+}
+
+impl BackupEnv {
+    fn from_env() -> Result<Self, String> {
+        // Default off; cron/dir/retention carry their own defaults so an
+        // operator can flip just RTDB_BACKUP_ENABLED=true to get daily 03:00
+        // UTC dumps with 7-day retention. An empty RTDB_BACKUP_CRON falls
+        // back to the default (a blank cron would surface as
+        // `invalid cron expression` from `scheduler::next_fire` on every loop
+        // iteration, so clamp here).
+        let enabled = env_bool("RTDB_BACKUP_ENABLED", false);
+        let cron = match std::env::var("RTDB_BACKUP_CRON") {
+            Ok(v) if !v.trim().is_empty() => v,
+            _ => "0 3 * * *".to_string(),
+        };
+        let dir = match std::env::var("RTDB_BACKUP_DIR") {
+            Ok(v) if !v.trim().is_empty() => v,
+            _ => "./backups".to_string(),
+        };
+        let retention = env_parsed("RTDB_BACKUP_RETENTION", 7u32)?;
+        Ok(Self {
+            enabled,
+            cron,
+            dir,
+            retention,
+        })
+    }
+}
+
+/// Document TTL reaper knobs.
+struct TtlReaperEnv {
+    sweep_interval_secs: u64,
+    batch: i64,
+}
+
+impl TtlReaperEnv {
+    fn from_env() -> Result<Self, String> {
+        // Best-effort expiry, so boot-only (not hot).
+        // `tokio::time::interval` panics on a zero duration, so an explicit 0
+        // would crash every db's reaper task on its first poll — clamp to 1.
+        // `DELETE ... LIMIT 0` is a silent no-op (disables reaping) and a
+        // negative batch errors per sweep, so clamp the batch to at least 1.
+        let sweep_interval_secs = env_parsed("RTDB_TTL_SWEEP_INTERVAL_SECS", 60u64)?.max(1);
+        let batch = env_parsed("RTDB_TTL_BATCH", 5000i64)?.max(1);
+        Ok(Self {
+            sweep_interval_secs,
+            batch,
+        })
+    }
+}
+
+/// On-the-fly image transform knobs (ENH-014).
+struct ImageTransformEnv {
+    enabled: bool,
+    max_dim: u32,
+    max_pixels: u64,
+    cache_bytes: u64,
+    concurrency: usize,
+    default_quality: u8,
+}
+
+impl ImageTransformEnv {
+    fn from_env() -> Result<Self, String> {
+        // Boot-only operational knobs; default-on master switch + bounded
+        // numerics.
+        let enabled = env_bool("RTDB_IMAGE_TRANSFORMS_ENABLED", true);
+        let max_dim = env_parsed("RTDB_IMAGE_MAX_DIM", 2048u32)?.clamp(1, 8192);
+        let max_pixels = env_parsed("RTDB_IMAGE_MAX_PIXELS", 25_000_000u64)?.max(1_000_000);
+        let cache_bytes = env_parsed("RTDB_IMAGE_CACHE_BYTES", 256 * 1024 * 1024u64)?;
+        let concurrency = env_parsed("RTDB_IMAGE_CONCURRENCY", 4usize)?.max(1);
+        let default_quality = env_parsed("RTDB_IMAGE_DEFAULT_QUALITY", 80u8)?.clamp(1, 100);
+        Ok(Self {
+            enabled,
+            max_dim,
+            max_pixels,
+            cache_bytes,
+            concurrency,
+            default_quality,
+        })
+    }
+}
+
+/// Realtime presence knobs (ENH-015 / ENH-022 Stage 3).
+struct PresenceEnv {
+    enabled: bool,
+    max_state_bytes: usize,
+    max_room_size: usize,
+    max_rooms_per_conn: usize,
+    max_room_bytes: usize,
+    broadcast_interval_ms: u64,
+    update_limit_per_sec: u32,
+    max_ttl_ms: u64,
+    beat_interval_ms: u64,
+    beat_timeout_ms: u64,
+}
+
+impl PresenceEnv {
+    fn from_env() -> Result<Self, String> {
+        // Default-ON master switch + numerics; a 0 size/count/limit would be
+        // unusable (clamped to ≥1), and a 0 broadcast interval means
+        // "immediate" (NOT clamped).
+        let enabled = env_bool("RTDB_PRESENCE_ENABLED", true);
+        let max_state_bytes = env_parsed("RTDB_PRESENCE_MAX_STATE_BYTES", 1024usize)?.max(1);
+        let max_room_size = env_parsed("RTDB_PRESENCE_MAX_ROOM_SIZE", 100usize)?.max(1);
+        let max_rooms_per_conn = env_parsed("RTDB_PRESENCE_MAX_ROOMS_PER_CONN", 32usize)?.max(1);
+        let max_room_bytes = env_parsed("RTDB_PRESENCE_MAX_ROOM_BYTES", 256usize)?.max(1);
+        let broadcast_interval_ms = env_parsed("RTDB_PRESENCE_BROADCAST_INTERVAL_MS", 50u64)?;
+        let update_limit_per_sec = env_parsed("RTDB_PRESENCE_UPDATE_LIMIT_PER_SEC", 20u32)?.max(1);
+        let max_ttl_ms = env_parsed("RTDB_PRESENCE_MAX_TTL_MS", 300_000u64)?.max(1000);
+
+        // ENH-022 Stage 3: cross-instance presence gossip beat + eviction
+        // timeout. Floored: interval ≥ 1s (a sub-second beat would hot-spin
+        // the rtdb_presence channel for no value — incremental NOTIFYs already
+        // cover changes between beats); timeout ≥ interval (a timeout shorter
+        // than the cadence would evict live peers every tick).
+        let beat_interval_ms = env_parsed("RTDB_PRESENCE_BEAT_INTERVAL_MS", 5000u64)?.max(1000);
+        let beat_timeout_ms =
+            env_parsed("RTDB_PRESENCE_BEAT_TIMEOUT_MS", 15_000u64)?.max(beat_interval_ms);
+
+        Ok(Self {
+            enabled,
+            max_state_bytes,
+            max_room_size,
+            max_rooms_per_conn,
+            max_room_bytes,
+            broadcast_interval_ms,
+            update_limit_per_sec,
+            max_ttl_ms,
+            beat_interval_ms,
+            beat_timeout_ms,
+        })
+    }
+}
+
+/// OpenTelemetry / OTLP tracing export knobs (ENH-018).
+struct OtelEnv {
+    enabled: bool,
+    endpoint: String,
+    service_name: String,
+    sample_ratio: f64,
+}
+
+impl OtelEnv {
+    fn from_env() -> Result<Self, String> {
+        // The cargo `otel` feature gates the deps + subscriber wiring;
+        // RTDB_OTEL_ENABLED is the runtime switch so a feature-compiled binary
+        // still defaults to zero OTLP network calls. Endpoint/service-name
+        // carry defaults so an operator only sets RTDB_OTEL_ENABLED=true +
+        // RTDB_OTEL_ENDPOINT. The sample ratio is parsed through `env_parsed`
+        // so a typo fails boot (ARC-118), then clamped to a valid head-sampler
+        // ratio.
+        let enabled = env_bool("RTDB_OTEL_ENABLED", false);
+        let endpoint = match std::env::var("RTDB_OTEL_ENDPOINT") {
+            Ok(v) if !v.trim().is_empty() => v,
+            _ => "http://127.0.0.1:4317".to_string(),
+        };
+        let service_name = match std::env::var("RTDB_OTEL_SERVICE_NAME") {
+            Ok(v) if !v.trim().is_empty() => v,
+            _ => "par-rt-db".to_string(),
+        };
+        let sample_ratio = env_parsed("RTDB_OTEL_SAMPLE_RATIO", 0.05f64)?.clamp(0.0, 1.0);
+        Ok(Self {
+            enabled,
+            endpoint,
+            service_name,
+            sample_ratio,
+        })
+    }
+}
+
 impl Config {
     /// Reads boot-only values from env. Errors (String) name the missing or
     /// invalid variable. Per ARC-118, a numeric knob that is PRESENT but
@@ -402,47 +772,14 @@ impl Config {
         let public_url = std::env::var("RTDB_PUBLIC_URL")
             .unwrap_or_else(|_| "http://localhost:8300".to_string());
 
-        let github_client_id = std::env::var("RTDB_GITHUB_CLIENT_ID").ok();
-        let github_client_secret = std::env::var("RTDB_GITHUB_CLIENT_SECRET").ok();
-
-        let github_base_url = std::env::var("RTDB_GITHUB_BASE_URL")
-            .unwrap_or_else(|_| "https://github.com".to_string());
-
-        let github_api_url = std::env::var("RTDB_GITHUB_API_URL")
-            .unwrap_or_else(|_| "https://api.github.com".to_string());
-
-        let google_client_id = std::env::var("RTDB_GOOGLE_CLIENT_ID").ok();
-        let google_client_secret = std::env::var("RTDB_GOOGLE_CLIENT_SECRET").ok();
-
-        let gitlab_client_id = std::env::var("RTDB_GITLAB_CLIENT_ID").ok();
-        let gitlab_client_secret = std::env::var("RTDB_GITLAB_CLIENT_SECRET").ok();
-        let gitlab_base_url = std::env::var("RTDB_GITLAB_BASE_URL")
-            .unwrap_or_else(|_| "https://gitlab.com".to_string());
-
-        let oidc_client_id = std::env::var("RTDB_OIDC_CLIENT_ID").ok();
-        let oidc_client_secret = std::env::var("RTDB_OIDC_CLIENT_SECRET").ok();
-        let oidc_authorize_url = std::env::var("RTDB_OIDC_AUTHORIZE_URL").ok();
-        let oidc_token_url = std::env::var("RTDB_OIDC_TOKEN_URL").ok();
-        let oidc_userinfo_url = std::env::var("RTDB_OIDC_USERINFO_URL").ok();
-
-        // Microsoft (Entra ID / Azure AD v2.0). `tenant` defaults to "common"
-        // (any Microsoft account); an empty value falls back to that default so
-        // a blank RTDB_MICROSOFT_TENANT isn't interpolated into the endpoint URL.
-        let microsoft_client_id = std::env::var("RTDB_MICROSOFT_CLIENT_ID").ok();
-        let microsoft_client_secret = std::env::var("RTDB_MICROSOFT_CLIENT_SECRET").ok();
-        let microsoft_tenant = match std::env::var("RTDB_MICROSOFT_TENANT") {
-            Ok(v) if !v.trim().is_empty() => v,
-            _ => "common".to_string(),
-        };
-
-        // Sign in with Apple. The private key is a PEM, which can't carry real
-        // newlines through most env stores, so `\n` escapes are unescaped here.
-        let apple_client_id = std::env::var("RTDB_APPLE_CLIENT_ID").ok();
-        let apple_team_id = std::env::var("RTDB_APPLE_TEAM_ID").ok();
-        let apple_key_id = std::env::var("RTDB_APPLE_KEY_ID").ok();
-        let apple_private_key = std::env::var("RTDB_APPLE_PRIVATE_KEY")
-            .ok()
-            .map(|v| v.replace("\\n", "\n"));
+        // OAuth providers (ARC-205: each provider parses in its own
+        // constructor — see the `*Env` structs above).
+        let github = GithubOAuthEnv::from_env();
+        let google = GoogleOAuthEnv::from_env();
+        let gitlab = GitlabOAuthEnv::from_env();
+        let oidc = OidcProviderEnv::from_env();
+        let microsoft = MicrosoftOAuthEnv::from_env();
+        let apple = AppleOAuthEnv::from_env();
 
         let max_affected_docs = env_parsed("RTDB_MAX_AFFECTED_DOCS", 100usize)?;
 
@@ -468,17 +805,11 @@ impl Config {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
 
-        // HTTP rate-limit ceilings: 0 = unlimited (the default), preserving
-        // today's behavior.
-        let rate_limit_per_token_rpm = env_parsed("RTDB_RATE_LIMIT_PER_TOKEN_RPM", 0u32)?;
-        let rate_limit_per_db_rpm = env_parsed("RTDB_RATE_LIMIT_PER_DB_RPM", 0u32)?;
+        let rate_limits = RateLimitsEnv::from_env()?;
 
         // Audit log: default off (accepts "true"/"1"/"yes" to enable).
         let audit_log_enabled = env_bool("RTDB_AUDIT_LOG_ENABLED", false);
 
-        // Login-CSRF: default ON (security). SEC-131: surface the kill switch
-        // at boot so it does not silently survive into a copied `.env`.
-        // Local-dev only — production must keep the double-submit nonce enabled.
         let oauth_login_csrf = env_bool("RTDB_OAUTH_LOGIN_CSRF", true);
         if !oauth_login_csrf {
             tracing::warn!(
@@ -493,33 +824,12 @@ impl Config {
         // private/loopback targets, off by default.
         let webhook_allow_http = env_bool("RTDB_WEBHOOK_ALLOW_HTTP", false);
 
-        // Per-IP rate limit on the public storage route (SEC-004). 0 = off,
-        // matching the existing per-token/per-db limiter convention.
-        // SEC-203: non-zero default — see the field doc above.
-        let storage_rate_limit_per_ip_rpm =
-            env_parsed("RTDB_STORAGE_RATE_LIMIT_PER_IP_RPM", 300u32)?;
-
         // SEC-113: require a valid signed URL on every public storage fetch.
         // Default false (Convex-parity: opaque public bearer URLs); operators
         // who want signed-only access flip it on.
         let storage_require_signed_urls = env_bool("RTDB_STORAGE_REQUIRE_SIGNED_URLS", false);
 
-        // Managed pg_dump backup scheduler. Default off; cron/dir/retention
-        // carry their own defaults so an operator can flip just
-        // RTDB_BACKUP_ENABLED=true to get daily 03:00 UTC dumps with 7-day
-        // retention. An empty RTDB_BACKUP_CRON falls back to the default
-        // (a blank cron would surface as `invalid cron expression` from
-        // `scheduler::next_fire` on every loop iteration, so clamp here).
-        let backup_enabled = env_bool("RTDB_BACKUP_ENABLED", false);
-        let backup_cron = match std::env::var("RTDB_BACKUP_CRON") {
-            Ok(v) if !v.trim().is_empty() => v,
-            _ => "0 3 * * *".to_string(),
-        };
-        let backup_dir = match std::env::var("RTDB_BACKUP_DIR") {
-            Ok(v) if !v.trim().is_empty() => v,
-            _ => "./backups".to_string(),
-        };
-        let backup_retention = env_parsed("RTDB_BACKUP_RETENTION", 7u32)?;
+        let backup = BackupEnv::from_env()?;
 
         // Skip verification: ships ON at DEFAULT_SUBS_VERIFY_SKIP_EVERY
         // (ARC-101). A wrong skip is otherwise silent, so the verifier is the
@@ -531,48 +841,9 @@ impl Config {
             DEFAULT_SUBS_VERIFY_SKIP_EVERY,
         )?;
 
-        // Document TTL reaper. Best-effort expiry, so boot-only (not hot).
-        // `tokio::time::interval` panics on a zero duration, so an explicit 0
-        // would crash every db's reaper task on its first poll — clamp to 1.
-        // `DELETE ... LIMIT 0` is a silent no-op (disables reaping) and a
-        // negative batch errors per sweep, so clamp the batch to at least 1.
-        let ttl_sweep_interval_secs = env_parsed("RTDB_TTL_SWEEP_INTERVAL_SECS", 60u64)?.max(1);
-        let ttl_batch = env_parsed("RTDB_TTL_BATCH", 5000i64)?.max(1);
-
-        // On-the-fly image transforms on storage serve (ENH-014). Boot-only
-        // operational knobs; default-on master switch + bounded numerics.
-        let image_transforms_enabled = env_bool("RTDB_IMAGE_TRANSFORMS_ENABLED", true);
-        let image_max_dim = env_parsed("RTDB_IMAGE_MAX_DIM", 2048u32)?.clamp(1, 8192);
-        let image_max_pixels = env_parsed("RTDB_IMAGE_MAX_PIXELS", 25_000_000u64)?.max(1_000_000);
-        let image_cache_bytes = env_parsed("RTDB_IMAGE_CACHE_BYTES", 256 * 1024 * 1024u64)?;
-        let image_concurrency = env_parsed("RTDB_IMAGE_CONCURRENCY", 4usize)?.max(1);
-        let image_default_quality = env_parsed("RTDB_IMAGE_DEFAULT_QUALITY", 80u8)?.clamp(1, 100);
-
-        // Realtime presence (ENH-015). Default-ON master switch + numerics;
-        // a 0 size/count/limit would be unusable (clamped to ≥1), and a 0
-        // broadcast interval means "immediate" (NOT clamped).
-        let presence_enabled = env_bool("RTDB_PRESENCE_ENABLED", true);
-        let presence_max_state_bytes =
-            env_parsed("RTDB_PRESENCE_MAX_STATE_BYTES", 1024usize)?.max(1);
-        let presence_max_room_size = env_parsed("RTDB_PRESENCE_MAX_ROOM_SIZE", 100usize)?.max(1);
-        let presence_max_rooms_per_conn =
-            env_parsed("RTDB_PRESENCE_MAX_ROOMS_PER_CONN", 32usize)?.max(1);
-        let presence_max_room_bytes = env_parsed("RTDB_PRESENCE_MAX_ROOM_BYTES", 256usize)?.max(1);
-        let presence_broadcast_interval_ms =
-            env_parsed("RTDB_PRESENCE_BROADCAST_INTERVAL_MS", 50u64)?;
-        let presence_update_limit_per_sec =
-            env_parsed("RTDB_PRESENCE_UPDATE_LIMIT_PER_SEC", 20u32)?.max(1);
-        let presence_max_ttl_ms = env_parsed("RTDB_PRESENCE_MAX_TTL_MS", 300_000u64)?.max(1000);
-
-        // ENH-022 Stage 3: cross-instance presence gossip beat + eviction
-        // timeout. Floored: interval ≥ 1s (a sub-second beat would hot-spin
-        // the rtdb_presence channel for no value — incremental NOTIFYs already
-        // cover changes between beats); timeout ≥ interval (a timeout shorter
-        // than the cadence would evict live peers every tick).
-        let presence_beat_interval_ms =
-            env_parsed("RTDB_PRESENCE_BEAT_INTERVAL_MS", 5000u64)?.max(1000);
-        let presence_beat_timeout_ms =
-            env_parsed("RTDB_PRESENCE_BEAT_TIMEOUT_MS", 15_000u64)?.max(presence_beat_interval_ms);
+        let ttl = TtlReaperEnv::from_env()?;
+        let image = ImageTransformEnv::from_env()?;
+        let presence = PresenceEnv::from_env()?;
 
         // Anonymous auth master switch. Default-OFF (opt-in per app): only an
         // explicit truthy spelling ("true"/"1"/"yes") enables it; everything
@@ -584,11 +855,6 @@ impl Config {
         // ephemeral rows minted by the unauthenticated anon route expire
         // quickly rather than living for the standard 30-day TTL. Default 1.
         let anonymous_session_ttl_days = env_parsed("RTDB_ANONYMOUS_SESSION_TTL_DAYS", 1i64)?;
-        // SEC-103: per-IP rate limit on `POST /auth/anonymous`. 0 = unlimited
-        // (the code default; the shipped `.env.example`/`docker-compose.yml`
-        // set a non-zero default so the mitigation is on out-of-the-box).
-        let anonymous_rate_limit_per_ip_rpm =
-            env_parsed("RTDB_ANONYMOUS_RATE_LIMIT_PER_IP_RPM", 10u32)?;
 
         // Quota counter cache TTL (ENH-011). 0 = no caching.
         let quota_cache_ttl_secs = env_parsed("RTDB_QUOTA_CACHE_TTL_SECS", 60u64)?;
@@ -597,10 +863,6 @@ impl Config {
         // (default); a non-zero value retires a db's per-db tasks once it has
         // been client-idle this long with no live subs and no pending jobs.
         let db_idle_reclaim_secs = env_parsed("RTDB_DB_IDLE_RECLAIM_SECS", 0u64)?;
-
-        // SEC-109: per-IP rate limit on `POST /admin/login`. 0 = unlimited
-        // (the default), preserving today's behavior.
-        let admin_rate_limit_per_ip_rpm = env_parsed("RTDB_ADMIN_RATE_LIMIT_PER_IP_RPM", 10u32)?;
 
         // SEC-120: cookie `Secure` attribute ships ON by default. An explicit
         // "false"/"0"/"no" (case-insensitive) is the local-http-dev escape
@@ -617,23 +879,7 @@ impl Config {
         // HSTS) with arbitrary header values.
         let trusted_proxy = env_bool("RTDB_TRUSTED_PROXY", false);
 
-        // OpenTelemetry / OTLP tracing export (ENH-018). The cargo `otel`
-        // feature gates the deps + subscriber wiring; RTDB_OTEL_ENABLED is the
-        // runtime switch so a feature-compiled binary still defaults to zero
-        // OTLP network calls. Endpoint/service-name carry defaults so an
-        // operator only sets RTDB_OTEL_ENABLED=true + RTDB_OTEL_ENDPOINT. The
-        // sample ratio is parsed through `env_parsed` so a typo fails boot
-        // (ARC-118), then clamped to a valid head-sampler ratio.
-        let otel_enabled = env_bool("RTDB_OTEL_ENABLED", false);
-        let otel_endpoint = match std::env::var("RTDB_OTEL_ENDPOINT") {
-            Ok(v) if !v.trim().is_empty() => v,
-            _ => "http://127.0.0.1:4317".to_string(),
-        };
-        let otel_service_name = match std::env::var("RTDB_OTEL_SERVICE_NAME") {
-            Ok(v) if !v.trim().is_empty() => v,
-            _ => "par-rt-db".to_string(),
-        };
-        let otel_sample_ratio = env_parsed("RTDB_OTEL_SAMPLE_RATIO", 0.05f64)?.clamp(0.0, 1.0);
+        let otel = OtelEnv::from_env()?;
 
         // ENH-022 Stage 2: cross-instance op-feed fan-out. Off by default — a
         // single-instance deploy is the supported topology. `instance_id` is
@@ -649,27 +895,27 @@ impl Config {
             database_url,
             admin_key,
             public_url,
-            github_client_id,
-            github_client_secret,
-            github_base_url,
-            github_api_url,
-            google_client_id,
-            google_client_secret,
-            gitlab_client_id,
-            gitlab_client_secret,
-            gitlab_base_url,
-            oidc_client_id,
-            oidc_client_secret,
-            oidc_authorize_url,
-            oidc_token_url,
-            oidc_userinfo_url,
-            microsoft_client_id,
-            microsoft_client_secret,
-            microsoft_tenant,
-            apple_client_id,
-            apple_team_id,
-            apple_key_id,
-            apple_private_key,
+            github_client_id: github.client_id,
+            github_client_secret: github.client_secret,
+            github_base_url: github.base_url,
+            github_api_url: github.api_url,
+            google_client_id: google.client_id,
+            google_client_secret: google.client_secret,
+            gitlab_client_id: gitlab.client_id,
+            gitlab_client_secret: gitlab.client_secret,
+            gitlab_base_url: gitlab.base_url,
+            oidc_client_id: oidc.client_id,
+            oidc_client_secret: oidc.client_secret,
+            oidc_authorize_url: oidc.authorize_url,
+            oidc_token_url: oidc.token_url,
+            oidc_userinfo_url: oidc.userinfo_url,
+            microsoft_client_id: microsoft.client_id,
+            microsoft_client_secret: microsoft.client_secret,
+            microsoft_tenant: microsoft.tenant,
+            apple_client_id: apple.client_id,
+            apple_team_id: apple.team_id,
+            apple_key_id: apple.key_id,
+            apple_private_key: apple.private_key,
             max_affected_docs,
             static_dir,
             pool_max_connections,
@@ -677,49 +923,49 @@ impl Config {
             slow_query_ms,
             slow_query_capacity,
             slow_query_log_params,
-            rate_limit_per_token_rpm,
-            rate_limit_per_db_rpm,
+            rate_limit_per_token_rpm: rate_limits.per_token_rpm,
+            rate_limit_per_db_rpm: rate_limits.per_db_rpm,
             audit_log_enabled,
             oauth_login_csrf,
             webhooks_enabled,
             webhook_allow_http,
-            storage_rate_limit_per_ip_rpm,
+            storage_rate_limit_per_ip_rpm: rate_limits.storage_per_ip_rpm,
             storage_require_signed_urls,
-            backup_enabled,
-            backup_cron,
-            backup_dir,
-            backup_retention,
+            backup_enabled: backup.enabled,
+            backup_cron: backup.cron,
+            backup_dir: backup.dir,
+            backup_retention: backup.retention,
             subs_verify_skip_every,
-            ttl_sweep_interval_secs,
-            ttl_batch,
-            image_transforms_enabled,
-            image_max_dim,
-            image_max_pixels,
-            image_cache_bytes,
-            image_concurrency,
-            image_default_quality,
-            presence_enabled,
-            presence_max_state_bytes,
-            presence_max_room_size,
-            presence_max_rooms_per_conn,
-            presence_max_room_bytes,
-            presence_broadcast_interval_ms,
-            presence_update_limit_per_sec,
-            presence_max_ttl_ms,
-            presence_beat_interval_ms,
-            presence_beat_timeout_ms,
+            ttl_sweep_interval_secs: ttl.sweep_interval_secs,
+            ttl_batch: ttl.batch,
+            image_transforms_enabled: image.enabled,
+            image_max_dim: image.max_dim,
+            image_max_pixels: image.max_pixels,
+            image_cache_bytes: image.cache_bytes,
+            image_concurrency: image.concurrency,
+            image_default_quality: image.default_quality,
+            presence_enabled: presence.enabled,
+            presence_max_state_bytes: presence.max_state_bytes,
+            presence_max_room_size: presence.max_room_size,
+            presence_max_rooms_per_conn: presence.max_rooms_per_conn,
+            presence_max_room_bytes: presence.max_room_bytes,
+            presence_broadcast_interval_ms: presence.broadcast_interval_ms,
+            presence_update_limit_per_sec: presence.update_limit_per_sec,
+            presence_max_ttl_ms: presence.max_ttl_ms,
+            presence_beat_interval_ms: presence.beat_interval_ms,
+            presence_beat_timeout_ms: presence.beat_timeout_ms,
             auth_anonymous_enabled,
             anonymous_session_ttl_days,
-            anonymous_rate_limit_per_ip_rpm,
+            anonymous_rate_limit_per_ip_rpm: rate_limits.anonymous_per_ip_rpm,
             quota_cache_ttl_secs,
             db_idle_reclaim_secs,
-            admin_rate_limit_per_ip_rpm,
+            admin_rate_limit_per_ip_rpm: rate_limits.admin_per_ip_rpm,
             cookie_secure,
             trusted_proxy,
-            otel_enabled,
-            otel_endpoint,
-            otel_service_name,
-            otel_sample_ratio,
+            otel_enabled: otel.enabled,
+            otel_endpoint: otel.endpoint,
+            otel_service_name: otel.service_name,
+            otel_sample_ratio: otel.sample_ratio,
             multi_instance,
             instance_id,
         })
