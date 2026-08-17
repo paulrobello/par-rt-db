@@ -1101,6 +1101,8 @@ describe("RtDbAdminClient subscriptions", () => {
           skipsIndexed: 4,
           skipsOrdered: 5,
           missed: 0,
+          skips: 12,
+          rerunRatio: 0.5,
         },
       ],
     };

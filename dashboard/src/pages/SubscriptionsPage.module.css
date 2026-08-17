@@ -240,3 +240,10 @@
   color: var(--danger, #f44336);
   font-weight: 600;
 }
+
+/* Per-db rerun ratio > 0.5 sustained — a capacity signal (rerun-heavy
+ * subscriptions), not the correctness defect `alarmText` flags. */
+.warnText {
+  color: var(--warning, #ffc107);
+  font-weight: 600;
+}

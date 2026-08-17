@@ -1668,6 +1668,8 @@ _SUBS_RESPONSE = {
             "skipsIndexed": 2,
             "skipsOrdered": 1,
             "missed": 0,
+            "skips": 6,
+            "rerunRatio": 0.5384615384615384,
         }
     ],
 }
@@ -1696,6 +1698,9 @@ def test_subscriptions_response_model_validate_maps_camelcase() -> None:
     assert len(r.per_db) == 1
     assert r.per_db[0].db == "kanban"
     assert r.per_db[0].skips_indexed == 2
+    # ENH-024 totals: skips sums the classes, rerun_ratio = 7/(7+6).
+    assert r.per_db[0].skips == 6
+    assert r.per_db[0].rerun_ratio == 7 / 13
 
 
 def test_get_subscriptions_no_db_filter_omits_param() -> None:

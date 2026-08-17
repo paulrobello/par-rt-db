@@ -202,7 +202,9 @@ fn subscriptions_response_round_trip() {
                 "skipsPoint": 3,
                 "skipsIndexed": 5,
                 "skipsOrdered": 1,
-                "missed": 0
+                "missed": 0,
+                "skips": 9,
+                "rerunRatio": 0.5714285714285714
             }
         ]
     });
@@ -212,6 +214,8 @@ fn subscriptions_response_round_trip() {
     assert_eq!(dumped, input, "wire drift in SubscriptionsResponse");
     assert!(parsed.subscriptions[1].principal.is_none());
     assert_eq!(parsed.per_db[0].skips_indexed, 5);
+    assert_eq!(parsed.per_db[0].skips, 9);
+    assert_eq!(parsed.per_db[0].rerun_ratio, 12.0 / 21.0);
 
     // Nested-type camelCase, including the `null` principal on the wire. These
     // types are `#[non_exhaustive]` (ARC-130) — external crates can't construct
@@ -234,12 +238,13 @@ fn subscriptions_response_round_trip() {
     );
     let c: DbSubCounters = serde_json::from_value(json!({
         "db": "d", "reruns": 1,
-        "skipsPoint": 2, "skipsIndexed": 3, "skipsOrdered": 4, "missed": 5
+        "skipsPoint": 2, "skipsIndexed": 3, "skipsOrdered": 4, "missed": 5,
+        "skips": 9, "rerunRatio": 0.1
     }))
     .unwrap();
     assert_eq!(
         serde_json::to_value(&c).unwrap(),
-        json!({"db":"d","reruns":1,"skipsPoint":2,"skipsIndexed":3,"skipsOrdered":4,"missed":5})
+        json!({"db":"d","reruns":1,"skipsPoint":2,"skipsIndexed":3,"skipsOrdered":4,"missed":5,"skips":9,"rerunRatio":0.1})
     );
 }
 

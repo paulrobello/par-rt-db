@@ -1,6 +1,6 @@
 mod common;
 
-use common::{fresh_db, test_state};
+use common::{admin_get, fresh_db, spawn_app, test_state};
 use rtdb_server::auth::PrincipalCtx;
 use rtdb_server::error::ErrorCode;
 use rtdb_server::protocol::ServerMessage;
@@ -892,5 +892,116 @@ async fn inspector_snapshots_subscriptions_and_per_db_counters() -> anyhow::Resu
         )
         .await;
     assert_eq!(snap.subs_reruns_total, 2);
+    Ok(())
+}
+
+// ENH-024: the per-db rows carry the skip total and rerun ratio alongside the
+// class breakdown, and the same shape is served on the admin response itself
+// (`/admin/subscriptions` perDb — the same rows `/admin/metrics` perDbSubs
+// serves). A table-level (aggregate) subscription re-runs on every write to
+// its table; a point get(id) skips when the write touches a different
+// document — one commit moves both counters.
+#[tokio::test]
+async fn per_db_rows_expose_skips_total_and_rerun_ratio_on_admin_stats() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let db = fresh_db(&state).await;
+
+    // A doc for the point subscription to read (inserted before any
+    // subscription exists, so no fan-out decision counts it).
+    let insert = state
+        .realtime
+        .committers
+        .mutate(
+            &db,
+            None,
+            insert_work_item("backlog", 1.0),
+            PrincipalCtx::bypass(),
+        )
+        .await?;
+    let id = insert.results[0]["id"]
+        .as_str()
+        .expect("insert returns id")
+        .to_string();
+
+    // Table-level (aggregate) subscription — a plain collect has a Table read
+    // set, so every write to workItems re-runs it.
+    let (tx_agg, _rx_agg) = tokio::sync::mpsc::unbounded_channel();
+    state
+        .realtime
+        .committers
+        .subscribe(
+            &db,
+            next_conn_id(),
+            "agg".to_string(),
+            collect_work_items(),
+            tx_agg,
+            PrincipalCtx::bypass(),
+        )
+        .await?;
+    // Point subscription on one document.
+    let point_query: Query =
+        serde_json::from_value(serde_json::json!({ "table": "workItems", "get": id }))
+            .expect("parse get query");
+    let (tx_point, _rx_point) = tokio::sync::mpsc::unbounded_channel();
+    state
+        .realtime
+        .committers
+        .subscribe(
+            &db,
+            next_conn_id(),
+            "point".to_string(),
+            point_query,
+            tx_point,
+            PrincipalCtx::bypass(),
+        )
+        .await?;
+
+    // One commit that touches the table but not the point-read doc: the
+    // aggregate re-runs, the point read is skip-classified.
+    state
+        .realtime
+        .committers
+        .mutate(
+            &db,
+            None,
+            insert_work_item("backlog", 2.0),
+            PrincipalCtx::bypass(),
+        )
+        .await?;
+
+    let per_db = state.runtime.metrics.per_db_subs_snapshot();
+    assert_eq!(per_db.len(), 1);
+    let row = &per_db[0];
+    assert_eq!(row.db, db.as_str());
+    assert!(row.reruns > 0, "aggregate subscription re-ran");
+    assert!(row.skips > 0, "point read was skip-classified");
+    assert_eq!(
+        row.skips,
+        row.skips_point + row.skips_indexed + row.skips_ordered
+    );
+    assert_eq!(
+        row.rerun_ratio,
+        row.reruns as f64 / (row.reruns + row.skips) as f64
+    );
+    assert!((0.0..=1.0).contains(&row.rerun_ratio));
+
+    // The same shape on the admin response (camelCase keys): reruns > 0,
+    // skips > 0, rerunRatio in [0,1] and equal to reruns/(reruns+skips).
+    let addr = spawn_app(state.clone()).await;
+    let resp = admin_get(addr, "/admin/subscriptions").await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await?;
+    let rows = body["perDb"].as_array().expect("perDb array");
+    let json_row = rows
+        .iter()
+        .find(|r| r["db"].as_str() == Some(db.as_str()))
+        .expect("written db row present");
+    let reruns = json_row["reruns"].as_u64().expect("reruns");
+    let skips = json_row["skips"].as_u64().expect("skips total");
+    let ratio = json_row["rerunRatio"].as_f64().expect("rerunRatio");
+    assert!(reruns > 0, "admin response shows reruns > 0");
+    assert!(skips > 0, "admin response shows the skip total");
+    assert_eq!(ratio, reruns as f64 / (reruns + skips) as f64);
+    assert!((0.0..=1.0).contains(&ratio));
     Ok(())
 }

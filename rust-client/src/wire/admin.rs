@@ -438,6 +438,15 @@ pub struct DbSubCounters {
     pub skips_ordered: u64,
     /// Verifications that found a skip wrong.
     pub missed: u64,
+    /// Total skips across the three classes (ENH-024). `#[serde(default)]` so
+    /// an older server that omits it still deserializes (0).
+    #[serde(default)]
+    pub skips: u64,
+    /// `reruns / max(1, reruns + skips)` — in [0, 1]; sustained above 0.5
+    /// means re-runs dominate this db's fan-out (ENH-024). Defaulted for the
+    /// same older-server reason as `skips`.
+    #[serde(default)]
+    pub rerun_ratio: f64,
 }
 
 /// `GET /admin/subscriptions?db=<optional>` response (ENH-010): the live

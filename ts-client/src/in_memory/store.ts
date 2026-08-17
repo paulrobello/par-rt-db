@@ -2031,6 +2031,8 @@ export class InMemoryAdminClient {
             skipsIndexed: 0,
             skipsOrdered: 0,
             missed: 0,
+            skips: 0,
+            rerunRatio: 0,
           },
         ]
       : [];

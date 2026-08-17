@@ -171,6 +171,12 @@ class DbSubCounters(_Wire):
     skips_indexed: int
     skips_ordered: int
     missed: int
+    # ENH-024: ``skips`` totals the three classes and ``rerun_ratio`` is
+    # ``reruns / max(1, reruns + skips)`` in [0, 1] (sustained > 0.5 means
+    # re-runs dominate this db's fan-out). Defaulted so a client built against
+    # a newer server still deserializes an older server's response.
+    skips: int = 0
+    rerun_ratio: float = 0.0
 
 
 class MetricsSnapshot(_Wire):

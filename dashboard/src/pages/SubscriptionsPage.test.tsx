@@ -1,6 +1,7 @@
 import { render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { SubscriptionsResponse } from "../lib/types";
+import styles from "./SubscriptionsPage.module.css";
 
 // SubscriptionsPage lists active subscriptions (GET /admin/subscriptions) and a
 // counters panel. It must render rows for both interactive-user and system
@@ -51,6 +52,8 @@ const twoSubs: SubscriptionsResponse = {
       skipsIndexed: 2,
       skipsOrdered: 3,
       missed: 0,
+      skips: 6,
+      rerunRatio: 0.4,
     },
   ],
 };
@@ -86,5 +89,42 @@ describe("SubscriptionsPage", () => {
     });
     render(<SubscriptionsPage />);
     expect(await screen.findByText(/no active subscriptions/i)).toBeInTheDocument();
+  });
+
+  it("warns on a per-db rerun ratio above 0.5 and not below", async () => {
+    // db1 at 0.25 stays neutral; db2 at 0.80 gets the amber warning treatment.
+    adminClientMock.listSubscriptions.mockResolvedValue({
+      ...twoSubs,
+      perDb: [
+        {
+          db: "db1",
+          reruns: 2,
+          skipsPoint: 6,
+          skipsIndexed: 0,
+          skipsOrdered: 0,
+          missed: 0,
+          skips: 6,
+          rerunRatio: 0.25,
+        },
+        {
+          db: "db2",
+          reruns: 8,
+          skipsPoint: 2,
+          skipsIndexed: 0,
+          skipsOrdered: 0,
+          missed: 0,
+          skips: 2,
+          rerunRatio: 0.8,
+        },
+      ],
+    });
+    render(<SubscriptionsPage />);
+
+    const high = await screen.findByText("0.80");
+    expect(high.classList.contains(styles.warnText)).toBe(true);
+    expect(high.getAttribute("title")?.includes("write latency to its subscriber load")).toBe(true);
+
+    const low = screen.getByText("0.25");
+    expect(low.classList.contains(styles.warnText)).toBe(false);
   });
 });

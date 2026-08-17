@@ -126,6 +126,8 @@ export function SubscriptionsPage() {
         Re-runs vs. proven-irrelevant skips per read-set class. The registry keys on (connection,
         queryId), so per-subscriber counts are not tracked — these are the global and per-db totals.{" "}
         <code className={s.code}>missed</code> &gt; 0 is a correctness defect, not a tuning signal.
+        A per-db rerun ratio sustained above 0.5 means table-level re-runs dominate that database's
+        fan-out, coupling its write latency to its subscriber load.
       </p>
 
       <div className={s.counters}>
@@ -167,6 +169,7 @@ export function SubscriptionsPage() {
                 <th>skip · indexed</th>
                 <th>skip · ordered</th>
                 <th>missed</th>
+                <th>rerun ratio</th>
               </tr>
             </thead>
             <tbody>
@@ -201,6 +204,9 @@ function Counter({
 }
 
 function PerDbRow({ row }: { row: DbSubCounters }) {
+  // > 0.5 sustained = re-runs dominate this db's fan-out; warn (amber), unlike
+  // the red `missed > 0` alarm which signals a correctness defect.
+  const rerunWarn = row.rerunRatio > 0.5;
   return (
     <tr>
       <td className={s.mono}>{row.db}</td>
@@ -210,6 +216,12 @@ function PerDbRow({ row }: { row: DbSubCounters }) {
       <td className={s.num}>{row.skipsOrdered.toLocaleString()}</td>
       <td className={`${s.num} ${row.missed > 0 ? s.alarmText : ""}`}>
         {row.missed.toLocaleString()}
+      </td>
+      <td
+        className={`${s.num} ${rerunWarn ? s.warnText : ""}`}
+        title="Share of fan-out decisions that re-ran the query (reruns / (reruns + skips)). Sustained above 0.5 means rerun-heavy table-level subscriptions couple this database's write latency to its subscriber load — narrow the subscription, split hot tables, or cap subscriptions via quota."
+      >
+        {row.rerunRatio.toFixed(2)}
       </td>
     </tr>
   );

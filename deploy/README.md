@@ -173,7 +173,7 @@ stays valuable as a detector rather than being toggled off.
 After changing invalidation logic, temporarily lower it to N=20 for a few days
 and confirm `rtdb_subs_missed_pushes_total` stays 0, then return it to 200.
 
-### Monitoring the invalidation canary
+### Monitoring the invalidation fan-out
 
 Beyond the missed-push alert, watch the **rerun ratio** — the share of fan-out
 decisions that ended in a full table-level re-run rather than a provable skip.
@@ -193,10 +193,26 @@ rate(rtdb_subs_reruns_total[5m])
 instance-wide aggregates, deliberately without per-db labels to keep `/metrics`
 cardinality bounded.) A value near 0 means invalidation is proving most writes
 irrelevant; a sustained value above ~0.5 means re-runs dominate and writes on
-that instance are paying for subscriber load — treat it as a capacity signal
-and investigate which databases host the heavy subscriptions (per-db detail is
-in `GET /admin/metrics`, behind the admin key). Capacity work for fan-out is
-tracked as enhancement ENH-024.
+that instance are paying for subscriber load. Suggested alert: **ratio > 0.5
+sustained for 15m** — a capacity signal, not a correctness defect (that's
+`rtdb_subs_missed_pushes_total` above).
+
+To find *which* database is rerun-heavy (the Prometheus ratio is instance-wide),
+check the per-db `rerunRatio` — `perDb[]` on `GET /admin/subscriptions` and
+`perDbSubs[]` on `GET /admin/metrics`, behind the admin key (ENH-024). Each row
+carries `reruns`, `skips` (the class total), and `rerunRatio` in [0, 1]; the
+dashboard's Subscriptions page renders the same ratio per database and marks
+anything above 0.5 in amber. Remediation levers, in order of effectiveness:
+
+- **Narrow the subscription** — give the query an index/range read set
+  (`withIndex`/`eq`/`take` bounds) instead of a table-level
+  collect/count/aggregate, so writes outside the window are provably skipped.
+- **Split hot tables** — move the rows a table-level subscription doesn't need
+  (or the ones it does) into a separate table, so each write fans out to fewer
+  subscriptions.
+- **Quota caps** — `max_subs_per_db` (via `PATCH /admin/config`) bounds how
+  many subscriptions a database can hold, capping the worst-case fan-out per
+  committer turn.
 
 ## Monitoring
 

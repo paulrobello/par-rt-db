@@ -251,7 +251,10 @@ export interface SubscriptionInfo {
 }
 
 /** Per-db rollup of subscription-invalidation counters (the same fields the
- *  server totals across all dbs on `SubscriptionsResponse`). */
+ *  server totals across all dbs on `SubscriptionsResponse`). `skips` is the
+ *  total across the three classes and `rerunRatio` is
+ *  `reruns / max(1, reruns + skips)` — in [0, 1]; sustained above 0.5 means
+ *  re-runs dominate this db's fan-out (ENH-024). */
 export interface DbSubCounters {
   db: string;
   reruns: number;
@@ -259,6 +262,8 @@ export interface DbSubCounters {
   skipsIndexed: number;
   skipsOrdered: number;
   missed: number;
+  skips: number;
+  rerunRatio: number;
 }
 
 /** Response from `GET /admin/subscriptions`: the live subscription list plus

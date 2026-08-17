@@ -204,6 +204,14 @@ pub struct DbSubCounterRow {
     pub skips_indexed: u64,
     pub skips_ordered: u64,
     pub missed: u64,
+    /// Total skips across the three classes, so consumers can read the rerun
+    /// ratio without re-summing the class breakdown (ENH-024).
+    pub skips: u64,
+    /// `reruns / max(1, reruns + skips)` — always in [0, 1]. Sustained above
+    /// 0.5 means re-runs dominate this db's fan-out and its writes queue
+    /// behind subscriber load (see deploy/README.md "Monitoring the
+    /// invalidation fan-out" for the alert and remediation levers).
+    pub rerun_ratio: f64,
 }
 
 /// Which resource quota was exceeded. Mirrors the `SkipClass` pattern: the
@@ -530,19 +538,31 @@ impl Metrics {
 
     /// Snapshot of the per-db subscription-invalidation counters, sorted by db
     /// name for stable output. Empty until a `fan_out` records a decision.
+    /// `skips` is the class sum and `rerun_ratio` is `reruns / max(1, reruns +
+    /// skips)` — computed here so both admin surfaces (`/admin/metrics`
+    /// `perDbSubs` and `/admin/subscriptions` `perDb`) serve the same shape.
     pub fn per_db_subs_snapshot(&self) -> Vec<DbSubCounterRow> {
         let Ok(map) = self.per_db_subs.lock() else {
             return Vec::new();
         };
         let mut rows: Vec<DbSubCounterRow> = map
             .iter()
-            .map(|(db, c)| DbSubCounterRow {
-                db: db.clone(),
-                reruns: c.reruns.load(Ordering::Relaxed),
-                skips_point: c.skips_point.load(Ordering::Relaxed),
-                skips_indexed: c.skips_indexed.load(Ordering::Relaxed),
-                skips_ordered: c.skips_ordered.load(Ordering::Relaxed),
-                missed: c.missed.load(Ordering::Relaxed),
+            .map(|(db, c)| {
+                let reruns = c.reruns.load(Ordering::Relaxed);
+                let skips_point = c.skips_point.load(Ordering::Relaxed);
+                let skips_indexed = c.skips_indexed.load(Ordering::Relaxed);
+                let skips_ordered = c.skips_ordered.load(Ordering::Relaxed);
+                let skips = skips_point + skips_indexed + skips_ordered;
+                DbSubCounterRow {
+                    db: db.clone(),
+                    reruns,
+                    skips_point,
+                    skips_indexed,
+                    skips_ordered,
+                    missed: c.missed.load(Ordering::Relaxed),
+                    skips,
+                    rerun_ratio: reruns as f64 / reruns.saturating_add(skips).max(1) as f64,
+                }
             })
             .collect();
         rows.sort_by(|a, b| a.db.cmp(&b.db));
@@ -1206,6 +1226,15 @@ mod tests {
         assert_eq!(rows[1].db, "db-b");
         assert_eq!(rows[1].skips_indexed, 1);
         assert_eq!(rows[1].missed, 1);
+        // ENH-024 totals: skips sums the classes, ratio = reruns / max(1,
+        // reruns + skips) — db-a is 1/(1+3) = 0.25, db-b 0/(0+1) = 0.
+        assert_eq!(rows[0].skips, 3);
+        assert_eq!(rows[0].rerun_ratio, 0.25);
+        assert_eq!(rows[1].skips, 1);
+        assert_eq!(rows[1].rerun_ratio, 0.0);
+        for row in &rows {
+            assert!((0.0..=1.0).contains(&row.rerun_ratio));
+        }
         // Globals are the sum across dbs.
         assert_eq!(
             rows.iter().map(|r| r.skips_indexed).sum::<u64>(),
