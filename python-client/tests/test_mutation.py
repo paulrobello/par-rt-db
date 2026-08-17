@@ -129,7 +129,7 @@ def test_step_result_upsert_beats_insert_when_both_could_match():
     # The deserialized object must carry `inserted` (i.e. it became _StepUpsert,
     # not _StepInsert which would have dropped the field under extra="forbid").
     assert hasattr(out, "inserted")
-    assert out.inserted is False  # type: ignore[attr-defined]
+    assert out.inserted is False
 
 
 def test_transaction_max_steps_enforced_client_side():

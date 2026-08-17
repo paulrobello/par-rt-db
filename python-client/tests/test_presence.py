@@ -338,7 +338,7 @@ async def test_presence_err_sets_handle_error_and_drops_room() -> None:
         async def _connect2(url: str) -> _FakeConn:
             return conn2
 
-        client._connect = _connect2  # type: ignore[assignment]
+        client._connect = _connect2
         conn.close_code = 4000
         await conn._inbox.put(None)
         await _wait_until(lambda: any('"type":"auth"' in f for f in conn2.sent))
@@ -381,7 +381,7 @@ async def test_leave_presence_sends_leave_and_clears_room() -> None:
         async def _connect2(url: str) -> _FakeConn:
             return conn2
 
-        client._connect = _connect2  # type: ignore[assignment]
+        client._connect = _connect2
         conn.close_code = 4000
         await conn._inbox.put(None)
         await _wait_until(lambda: any('"type":"auth"' in f for f in conn2.sent))
@@ -492,7 +492,7 @@ async def test_reconnect_replays_active_presence_join_with_latest_state() -> Non
         async def _connect2(url: str) -> _FakeConn:
             return conn2
 
-        client._connect = _connect2  # type: ignore[assignment]
+        client._connect = _connect2
         conn.close_code = 4000
         await conn._inbox.put(None)
         await _wait_until(lambda: any('"type":"auth"' in f for f in conn2.sent))
@@ -525,7 +525,7 @@ async def test_rejoin_with_state_refreshes_cached_join_state() -> None:
         async def _connect2(url: str) -> _FakeConn:
             return conn2
 
-        client._connect = _connect2  # type: ignore[assignment]
+        client._connect = _connect2
         conn.close_code = 4000
         await conn._inbox.put(None)
         await _wait_until(lambda: any('"type":"auth"' in f for f in conn2.sent))
@@ -901,5 +901,5 @@ def _member(conn_id: str, state: object):
     return PresenceMember(
         connection_id=conn_id,
         user=AuthedUser(kind="user"),
-        state=state,  # type: ignore[arg-type]
+        state=state,
     )

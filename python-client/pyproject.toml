@@ -53,9 +53,10 @@ reportMissingImports = "error"
 #   reportUnknownMemberType, reportUnknownParameterType, reportAny
 # Also deferred (would fire on intentional defensive overapproximation in
 # in_memory.py): reportUnreachable.
-# Also deferred (would surface ~10 stale `# type: ignore` comments that pre-date
-# the current type accuracy — a separate cleanup): reportUnnecessaryTypeIgnoreComment.
 reportMissingTypeStubs = "warning"
 reportDuplicateImport = "warning"
 reportDeprecated = "warning"
 reportUnusedImport = "warning"
+# QA-203: stale-ignore detection is on — every `# type: ignore` must still be
+# suppressing something real.
+reportUnnecessaryTypeIgnoreComment = "error"
