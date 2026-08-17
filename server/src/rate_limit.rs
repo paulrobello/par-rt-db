@@ -143,6 +143,7 @@ pub async fn evaluate(state: &AppState, principal: &Principal, db: &str) -> Rate
     if token_limit > 0
         && let Principal::Machine { token_id, .. } = principal
         && let RateDecision::Denied { retry_after_secs } = state
+            .limits
             .rate_limiter
             .check(RateKey::Token(token_id.clone()), token_limit)
             .await
@@ -153,6 +154,7 @@ pub async fn evaluate(state: &AppState, principal: &Principal, db: &str) -> Rate
     let db_limit = state.config.rate_limit_per_db_rpm;
     if db_limit > 0
         && let RateDecision::Denied { retry_after_secs } = state
+            .limits
             .rate_limiter
             .check(RateKey::Db(db.to_string()), db_limit)
             .await
@@ -200,6 +202,7 @@ pub async fn check_storage_public_rate_limit(
         return Ok(());
     }
     match state
+        .limits
         .rate_limiter
         .check(RateKey::Ip(ip_key.to_string()), limit)
         .await

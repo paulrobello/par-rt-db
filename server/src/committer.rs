@@ -18,7 +18,7 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use tracing::Instrument;
 
 use crate::auth::PrincipalCtx;
-use crate::config::HotConfig;
+use crate::config::{Config, HotConfig};
 use crate::db::{SchemaCache, database_exists, now_ms};
 use crate::error::RtDbError;
 use crate::metrics::Metrics;
@@ -172,24 +172,65 @@ struct ChannelEntry {
     draining: bool,
 }
 
+/// Config scalars the committer needs (ARC-204): `Committers::new` takes
+/// these as one named struct instead of a positional list where same-typed
+/// neighbors (`u64` secs next to `u64` secs) could transpose silently. The
+/// six non-config handles (pool, subscription manager, schema cache,
+/// op-feed, hot config, metrics) stay separate parameters — they are
+/// dependencies, not config.
+pub struct CommitterConfig {
+    pub audit_log_enabled: bool,
+    pub webhooks_enabled: bool,
+    pub ttl_sweep_interval_secs: u64,
+    pub ttl_batch: i64,
+    /// Per-db storage-usage cache, shared with `AppState`'s storage paths.
+    /// A runtime handle rather than boot config, but carried here — paired
+    /// with `quota_cache_ttl_secs`, which configures its refresh — so
+    /// `Committers::new` stays under clippy's too-many-arguments threshold.
+    pub quotas: Arc<crate::quota::UsageCache>,
+    pub quota_cache_ttl_secs: u64,
+    /// 0 = idle reclamation off; see `Committer::idle_threshold`.
+    pub idle_reclaim_secs: u64,
+    /// This process's replica id. Resolved once at boot in `AppState::new`
+    /// (explicit `RTDB_INSTANCE_ID` or generated) and shared with presence,
+    /// the NOTIFY listeners, and `AppState.instance_id` — passed in rather
+    /// than re-derived here so every consumer tags payloads with the same id.
+    pub instance_id: String,
+    pub multi_instance: bool,
+}
+
+impl CommitterConfig {
+    /// Derive the committer's config slice from the boot `Config` in one
+    /// place. `quotas` and `instance_id` are the boot-built handles/ids
+    /// shared with `AppState` (see the field docs).
+    pub fn from_config(
+        config: &Config,
+        quotas: Arc<crate::quota::UsageCache>,
+        instance_id: String,
+    ) -> Self {
+        Self {
+            audit_log_enabled: config.audit_log_enabled,
+            webhooks_enabled: config.webhooks_enabled,
+            ttl_sweep_interval_secs: config.ttl_sweep_interval_secs,
+            ttl_batch: config.ttl_batch,
+            quotas,
+            quota_cache_ttl_secs: config.quota_cache_ttl_secs,
+            idle_reclaim_secs: config.db_idle_reclaim_secs,
+            instance_id,
+            multi_instance: config.multi_instance,
+        }
+    }
+}
+
 impl Committers {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         pool: PgPool,
         subs: Arc<SubscriptionManager>,
         schemas: SchemaCache,
         op_feed: Arc<crate::op_feed::OpFeed>,
         hot: Arc<ArcSwap<HotConfig>>,
-        audit_log_enabled: bool,
-        webhooks_enabled: bool,
-        ttl_sweep_interval_secs: u64,
-        ttl_batch: i64,
         metrics: Arc<Metrics>,
-        quotas: Arc<crate::quota::UsageCache>,
-        quota_cache_ttl_secs: u64,
-        idle_reclaim_secs: u64,
-        instance_id: String,
-        multi_instance: bool,
+        cfg: CommitterConfig,
     ) -> Self {
         Self {
             pool,
@@ -197,16 +238,16 @@ impl Committers {
             schemas,
             op_feed,
             hot,
-            audit_log_enabled,
-            webhooks_enabled,
-            ttl_sweep_interval: std::time::Duration::from_secs(ttl_sweep_interval_secs),
-            ttl_batch,
             metrics,
-            quotas,
-            quota_cache_ttl_secs,
-            idle_threshold: std::time::Duration::from_secs(idle_reclaim_secs),
-            instance_id,
-            multi_instance,
+            quotas: cfg.quotas,
+            audit_log_enabled: cfg.audit_log_enabled,
+            webhooks_enabled: cfg.webhooks_enabled,
+            ttl_sweep_interval: std::time::Duration::from_secs(cfg.ttl_sweep_interval_secs),
+            ttl_batch: cfg.ttl_batch,
+            quota_cache_ttl_secs: cfg.quota_cache_ttl_secs,
+            idle_threshold: std::time::Duration::from_secs(cfg.idle_reclaim_secs),
+            instance_id: cfg.instance_id,
+            multi_instance: cfg.multi_instance,
             channels: Arc::new(Mutex::new(HashMap::new())),
         }
     }

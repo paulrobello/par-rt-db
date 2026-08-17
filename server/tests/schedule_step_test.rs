@@ -17,7 +17,7 @@ use sqlx::PgPool;
 use common::{TestDb, admin_get, admin_post, fresh_db, kanban_schema_json, spawn_app, test_state};
 use rtdb_server::AppState;
 use rtdb_server::auth::PrincipalCtx;
-use rtdb_server::committer::Committers;
+use rtdb_server::committer::{CommitterConfig, Committers};
 use rtdb_server::db::SchemaCache;
 use rtdb_server::error::ErrorCode;
 use rtdb_server::metrics::Metrics;
@@ -148,16 +148,18 @@ async fn make_committers(state: &Arc<AppState>) -> Arc<Committers> {
         SchemaCache::new(),
         OpFeed::new(64, 32),
         Arc::new(ArcSwap::from_pointee(common::test_hot())),
-        false,
-        false,
-        60,
-        5000,
         Metrics::new(),
-        Arc::new(quota::UsageCache::new()),
-        60,
-        0,
-        String::new(),
-        false,
+        CommitterConfig {
+            quotas: Arc::new(quota::UsageCache::new()),
+            audit_log_enabled: false,
+            webhooks_enabled: false,
+            ttl_sweep_interval_secs: 60,
+            ttl_batch: 5000,
+            quota_cache_ttl_secs: 60,
+            idle_reclaim_secs: 0,
+            instance_id: String::new(),
+            multi_instance: false,
+        },
     ))
 }
 

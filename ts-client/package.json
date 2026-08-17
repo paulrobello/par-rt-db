@@ -5,10 +5,12 @@
   "license": "MIT",
   "exports": {
     ".": {
+      "development": "./src/index.ts",
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
     },
     "./react": {
+      "development": "./src/react.ts",
       "types": "./dist/react.d.ts",
       "import": "./dist/react.js"
     }

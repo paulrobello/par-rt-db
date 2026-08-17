@@ -93,13 +93,27 @@ pub struct Realtime {
     pub presence: Arc<presence::PresenceManager>,
 }
 
-/// Runtime-wide mutable/process state: hot-reloaded config, metrics, and the
-/// server's boot timestamp. Grouped so the `/admin/*` and health surfaces can
+/// Runtime-wide mutable/process state: hot-reloaded config, metrics, the
+/// server's boot timestamp, the manual-backup in-progress flag, and this
+/// process's replica id. Grouped so the `/admin/*` and health surfaces can
 /// reach for `state.runtime` as a unit.
 pub struct Runtime {
     pub hot: Arc<ArcSwap<HotConfig>>,
     pub metrics: Arc<metrics::Metrics>,
     pub started_at: SystemTime,
+    /// In-progress flag for the manual `/admin/backup` trigger. Set
+    /// synchronously in the handler before the spawned `pg_dump` task and
+    /// cleared on completion (success or failure). Read by `GET /admin/backups`
+    /// to populate `running`, and checked-and-set by the trigger to enforce
+    /// "one manual backup at a time" (409 on conflict). Atomic because the
+    /// trigger handler, the spawned dump task, and the listing handler all
+    /// touch it without serialization — the same way the cron backup task
+    /// (which never touches this flag) runs alongside them.
+    pub backup_running: Arc<AtomicBool>,
+    /// This process's replica id (ENH-022 Stage 2). Tags NOTIFY payloads for
+    /// cross-instance op-feed fan-out; auto-generated when `RTDB_INSTANCE_ID`
+    /// is unset. Surfaced for diagnostics + tests.
+    pub instance_id: String,
 }
 
 /// Per-instance auth bookkeeping that is neither a config value nor a realtime
@@ -124,28 +138,18 @@ pub struct Auth {
     pub http: reqwest::Client,
 }
 
-pub struct AppState {
-    pub pool: sqlx::PgPool,
-    pub config: Config,
-    pub schemas: SchemaCache,
-    pub realtime: Realtime,
-    pub runtime: Runtime,
-    pub auth: Auth,
+/// Request-path limiters, caches, and derived keys, built once at boot: the
+/// fixed-window rate limiter, the image-transform cache, the per-db
+/// storage-usage cache, and the HMAC key for signed storage URLs. Grouped so
+/// the HTTP surfaces that enforce caps and serve derived content can reach
+/// for `state.limits` as a unit.
+pub struct Limits {
     /// Instance-local (ARC-126): the fixed-window rate limiter is an
     /// in-process counter map. A second replica sees none of the first's
     /// requests, so a client's effective budget becomes `N × replicas` per
     /// window — a silent weakening of the cap. This server is single-instance
     /// by design (see the boot WARN in `main.rs`).
     pub rate_limiter: Arc<rate_limit::RateLimiter>,
-    /// In-progress flag for the manual `/admin/backup` trigger. Set
-    /// synchronously in the handler before the spawned `pg_dump` task and
-    /// cleared on completion (success or failure). Read by `GET /admin/backups`
-    /// to populate `running`, and checked-and-set by the trigger to enforce
-    /// "one manual backup at a time" (409 on conflict). Atomic because the
-    /// trigger handler, the spawned dump task, and the listing handler all
-    /// touch it without serialization — the same way the cron backup task
-    /// (which never touches this flag) runs alongside them.
-    pub backup_running: Arc<AtomicBool>,
     /// On-the-fly image transform cache (ENH-014). `Arc` because every storage
     /// serve request shares the one moka cache + concurrency semaphore.
     pub image: Arc<image_transform::TransformCache>,
@@ -155,10 +159,16 @@ pub struct AppState {
     /// HMAC key for signing time-limited storage URLs (derived once at boot from
     /// `config.admin_key`). Shared by every request via `Arc`.
     pub signed_url_key: Arc<ring::hmac::Key>,
-    /// This process's replica id (ENH-022 Stage 2). Tags NOTIFY payloads for
-    /// cross-instance op-feed fan-out; auto-generated when `RTDB_INSTANCE_ID` is
-    /// unset. Surfaced for diagnostics + tests.
-    pub instance_id: String,
+}
+
+pub struct AppState {
+    pub pool: sqlx::PgPool,
+    pub config: Config,
+    pub schemas: SchemaCache,
+    pub realtime: Realtime,
+    pub runtime: Runtime,
+    pub auth: Auth,
+    pub limits: Limits,
 }
 
 impl AppState {
@@ -195,16 +205,8 @@ impl AppState {
             schemas.clone(),
             op_feed.clone(),
             hot.clone(),
-            config.audit_log_enabled,
-            config.webhooks_enabled,
-            config.ttl_sweep_interval_secs,
-            config.ttl_batch,
             metrics.clone(),
-            quotas.clone(),
-            config.quota_cache_ttl_secs,
-            config.db_idle_reclaim_secs,
-            instance_id.clone(),
-            config.multi_instance,
+            committer::CommitterConfig::from_config(&config, quotas.clone(), instance_id.clone()),
         );
         // ARC-102 step 4: spawn the server-wide idle-reclamation sweep. A no-op
         // when `db_idle_reclaim_secs` is 0 (the default), so a server that does
@@ -300,14 +302,16 @@ impl AppState {
                 hot,
                 metrics,
                 started_at: SystemTime::now(),
+                backup_running: Arc::new(AtomicBool::new(false)),
+                instance_id,
             },
             auth: Auth { http },
-            rate_limiter: rate_limit::RateLimiter::new(),
-            backup_running: Arc::new(AtomicBool::new(false)),
-            image,
-            quotas,
-            signed_url_key,
-            instance_id,
+            limits: Limits {
+                rate_limiter: rate_limit::RateLimiter::new(),
+                image,
+                quotas,
+                signed_url_key,
+            },
         })
     }
 }

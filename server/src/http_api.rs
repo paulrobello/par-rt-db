@@ -686,6 +686,7 @@ async fn upload_handler(
     let storage_cap = state.runtime.hot.load().max_storage_bytes_per_db;
     let baseline_used = if storage_cap > 0 {
         state
+            .limits
             .quotas
             .current_usage(&state.pool, &db, state.config.quota_cache_ttl_secs)
             .await?
@@ -726,7 +727,7 @@ async fn upload_handler(
     // check sees fresh bytes. Fire-and-forget — mirrors the committer refresh
     // spawn; a failure here just leaves the entry stale (TTL-bounded self-heal).
     {
-        let quotas = state.quotas.clone();
+        let quotas = state.limits.quotas.clone();
         let pool = state.pool.clone();
         let db = db.clone();
         tokio::spawn(async move {
@@ -783,7 +784,7 @@ async fn signed_url_handler(
         .map(|v| v.clamp(1, signed_url::MAX_SIGNED_URL_TTL_SECS as i64) as u64)
         .unwrap_or(signed_url::DEFAULT_SIGNED_URL_TTL_SECS);
     let exp = now_ms() + (ttl as i64) * 1000;
-    let sig = signed_url::sign(&state.signed_url_key, &id, exp);
+    let sig = signed_url::sign(&state.limits.signed_url_key, &id, exp);
     let base = state.config.public_url.trim_end_matches('/');
     let url = format!("{base}/storage/{id}?exp={exp}&sig={sig}");
     Ok(Json(SignedUrlResponse {
@@ -841,7 +842,7 @@ async fn serve_public_handler(
         if now_ms() > exp {
             return Err(RtDbError::forbidden("invalid or expired signature"));
         }
-        if !signed_url::verify(&state.signed_url_key, &id, exp, sig) {
+        if !signed_url::verify(&state.limits.signed_url_key, &id, exp, sig) {
             return Err(RtDbError::forbidden("invalid or expired signature"));
         }
     }
@@ -956,11 +957,17 @@ async fn serve_bytes(
     // a stored blob produces a fresh id, so a cached response is always valid.
     const IMMUTABLE: &str = "public, max-age=31536000, immutable";
     // Parse params (None ⇒ passthrough); honor the enabled kill switch.
-    let params = TransformParams::parse(q, state.image.cfg())?;
+    let params = TransformParams::parse(q, state.limits.image.cfg())?;
     let resolved = match params {
         None => None,
-        Some(_) if !state.image.cfg().enabled => None,
-        Some(p) => Some(state.image.get_or_transform(&state.pool, db, id, p).await?),
+        Some(_) if !state.limits.image.cfg().enabled => None,
+        Some(p) => Some(
+            state
+                .limits
+                .image
+                .get_or_transform(&state.pool, db, id, p)
+                .await?,
+        ),
     };
     // Range requests apply only to plain blob fetches (no transform params).
     // Transformed images are cache-keyed as whole renders, so a Range header on

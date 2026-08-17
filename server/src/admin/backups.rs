@@ -37,11 +37,11 @@ pub(super) async fn list_backups(
     _headers: HeaderMap,
 ) -> Result<Json<BackupsResponse>, RtDbError> {
     let backups = crate::backup::list_backups(&state.config.backup_dir).await?;
-    let running = state.backup_running.load(Ordering::Acquire);
+    let running = state.runtime.backup_running.load(Ordering::Acquire);
     Ok(Json(BackupsResponse { running, backups }))
 }
 
-/// RAII guard that clears `AppState::backup_running` on drop, so the flag
+/// RAII guard that clears `AppState::runtime.backup_running` on drop, so the flag
 /// releases even if the spawned backup task panics (Drop runs during unwind) —
 /// a panic in the backup path can't lock out manual triggers until restart.
 pub(super) struct BackupRunningGuard(Arc<AtomicBool>);
@@ -62,12 +62,12 @@ pub(super) async fn create_backup(
 ) -> Result<(StatusCode, Json<OkResponse>), RtDbError> {
     // `swap` to set-and-test: returns the PRIOR value. If it was already true,
     // a backup is in progress — reject without disturbing the flag.
-    if state.backup_running.swap(true, Ordering::AcqRel) {
+    if state.runtime.backup_running.swap(true, Ordering::AcqRel) {
         return Err(RtDbError::conflict("backup already running"));
     }
     let url = state.config.database_url.clone();
     let dir = state.config.backup_dir.clone();
-    let flag = state.backup_running.clone();
+    let flag = state.runtime.backup_running.clone();
     tokio::spawn(async move {
         let _guard = BackupRunningGuard(flag);
         match crate::backup::perform_backup(&url, &dir).await {
