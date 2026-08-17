@@ -8,7 +8,7 @@ import {
   MAX_STEPS,
   PresenceRooms,
   validateFilter,
-} from "../src/in_memory.js";
+} from "../src/in_memory/index.js";
 import { Migration } from "../src/migration.js";
 import { mutation } from "../src/mutation.js";
 import { decodeCursor, encodeCursor } from "../src/pagination.js";

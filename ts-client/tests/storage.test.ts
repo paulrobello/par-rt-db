@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { RtDbHttpClient } from "../src/http.js";
-import { InMemoryRtDbClient } from "../src/in_memory.js";
+import { InMemoryRtDbClient } from "../src/in_memory/index.js";
 
 describe("in-memory storage", () => {
   it("uploads, serves-via-url-shape, deletes, and reports metadata", async () => {

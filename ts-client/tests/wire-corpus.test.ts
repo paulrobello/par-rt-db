@@ -20,7 +20,7 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 
-import { MAX_STEPS } from "../src/in_memory.js";
+import { MAX_STEPS } from "../src/in_memory/index.js";
 import type {
   AuthedUser,
   AuthedUserKind,

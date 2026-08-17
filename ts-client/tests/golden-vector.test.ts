@@ -19,7 +19,7 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 
-import { InMemoryRtDbClient } from "../src/in_memory.js";
+import { InMemoryRtDbClient } from "../src/in_memory/index.js";
 import { mutation } from "../src/mutation.js";
 import type { QueryJson } from "../src/protocol.js";
 import { defineSchema, defineTable, t } from "../src/schema.js";

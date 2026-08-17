@@ -15,7 +15,7 @@
  * surface from the surrounding modules (`./client.js`, `./http.js`,
  * `./admin.js`, `./schema.js`, `./query.js`, `./mutation.js`,
  * `./migration.js`, `./optimistic.js`, `./retry.js`, `./pagination.js`,
- * `./in_memory.js`, `./protocol.js`, `./errors.js`).
+ * `./in_memory/index.js`, `./protocol.js`, `./errors.js`).
  *
  * @example
  * ```typescript
@@ -46,8 +46,6 @@ export type {
   MergeDbResult,
   MergeReport,
   RestoreResult,
-  SlowQueriesResponse,
-  SlowQueryEntry,
   RtDbAdminClientOptions,
   SchemaPreviewColumnAdd,
   SchemaPreviewDiff,
@@ -55,6 +53,8 @@ export type {
   SchemaPreviewRejection,
   SchemaPreviewTableAdd,
   SessionInfo,
+  SlowQueriesResponse,
+  SlowQueryEntry,
   SubscriptionInfo,
   SubscriptionsPrincipal,
   SubscriptionsResponse,
@@ -74,8 +74,8 @@ export type {
   UploadResult,
 } from "./http.js";
 export { appendImageParams, RtDbHttpClient } from "./http.js";
-export type { InMemoryRtDbClientOptions } from "./in_memory.js";
-export { InMemoryAdminClient, InMemoryRtDbClient, PresenceRooms } from "./in_memory.js";
+export type { InMemoryRtDbClientOptions } from "./in_memory/index.js";
+export { InMemoryAdminClient, InMemoryRtDbClient, PresenceRooms } from "./in_memory/index.js";
 export { Migration } from "./migration.js";
 export type { StepInsertResult, StepResult, StepUpsertResult } from "./mutation.js";
 export { mutation, parseStepResults, TxnBuilder } from "./mutation.js";
@@ -84,9 +84,9 @@ export { projectOptimisticUpdate } from "./optimistic.js";
 export { decodeCursor, encodeCursor } from "./pagination.js";
 export type {
   AuthedUser,
+  CaseWhenJson,
   Cast,
   CastFailureJson,
-  CaseWhenJson,
   ClientMessage,
   DirectiveJson,
   DirectiveReportJson,

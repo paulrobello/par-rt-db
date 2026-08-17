@@ -10,7 +10,7 @@
  */
 import { describe, expect, it } from "vitest";
 import { RtDbError } from "../src/errors.js";
-import { InMemoryRtDbClient } from "../src/in_memory.js";
+import { InMemoryRtDbClient } from "../src/in_memory/index.js";
 import type { QueryJson } from "../src/protocol.js";
 import type { RtQuery } from "../src/query.js";
 import { defineSchema, defineTable, t } from "../src/schema.js";

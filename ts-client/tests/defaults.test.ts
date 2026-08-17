@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { InMemoryRtDbClient } from "../src/in_memory.js";
+import { InMemoryRtDbClient } from "../src/in_memory/index.js";
 import { createApi } from "../src/query.js";
 import { defineSchema, defineTable, t } from "../src/schema.js";
 
