@@ -37,6 +37,61 @@ only on change. Subscription registration rides the same queue.
 COMMITTED with no row locking. Never call `execute_txn` outside the committer;
 never add a second writer.
 
+```mermaid
+graph TD
+    subgraph transports["Two transports, one vocabulary"]
+        WS["/sync WebSocket — ws.rs"]
+        HTTP["One-shot HTTP — http_api.rs"]
+    end
+
+    CO["Committer task (per-db, single writer)<br />committer.rs + subs.rs"]
+
+    WS -->|"CommitterRequest::Mutate"| CO
+    HTTP -->|"Committers::mutate (same arm)"| CO
+
+    subgraph arms["Seven handle_* arms — every durable-write path"]
+        A1["handle_mutate"]
+        A2["handle_scheduled"]
+        A3["handle_migrate"]
+        A4["handle_reaper"]
+        A5["handle_restore_schema"]
+        A6["handle_merge_users"]
+        A7["handle_workflow_advance"]
+    end
+
+    CO --> arms
+    PT["publish_taps — the single enforcement point"]
+    arms --> PT
+
+    PT --> OP["Op-feed ring (op_feed.rs)<br />→ /admin/stream + dashboard"]
+    PT --> AU["Audit log (rtdb.audit_log)"]
+    PT --> WH["Webhook outbox (webhook_deliveries)"]
+    PT -->|"pg_notify rtdb_ops<br />(RTDB_MULTI_INSTANCE)"| NT["Peer replicas (notify.rs)"]
+
+    CO -->|"fan_out: re-run affected subs,<br />push only on change"| SUBS["Subscribers"]
+
+    subgraph tasks["Per-db background tasks — never write document tables"]
+        SC["Scheduler — scheduler.rs"]
+        RE["TTL reaper — reaper.rs"]
+        WF["Workflows poller — workflows.rs"]
+    end
+
+    SC -->|"claim/reset side table,<br />enqueue RunScheduled"| CO
+    RE -->|"enqueue RunReaper"| CO
+    WF -->|"enqueue RunWorkflowAdvance"| CO
+
+    classDef core fill:#1E1E1E,stroke:#4CAF50,stroke-width:3px,color:#E6E6E6
+    classDef arm fill:#1E1E1E,stroke:#2196F3,stroke-width:2px,color:#E6E6E6
+    classDef tap fill:#1E1E1E,stroke:#FFC107,stroke-width:2px,color:#E6E6E6
+    classDef task fill:#1E1E1E,stroke:#F44336,stroke-width:2px,color:#E6E6E6
+    classDef plain fill:#1E1E1E,stroke:#78909c,stroke-width:1px,color:#E6E6E6
+    class CO,SUBS core
+    class A1,A2,A3,A4,A5,A6,A7 arm
+    class PT,OP,AU,WH,NT tap
+    class SC,RE,WF task
+    class WS,HTTP plain
+```
+
 ### Skip-invalidation classes
 
 Invalidation skips soundly for three read-set classes (any doubt
@@ -169,6 +224,37 @@ runs only in `handle_reaper` inside the committer turn.
 `schema.rs` → `ddl.rs` → `txn.rs`/`query.rs`. A pushed schema compiles to
 Postgres DDL — one typed column per indexed field, documents stored as `doc`
 jsonb with system fields merged in at read time, schema changes additive-only.
+
+```mermaid
+graph LR
+    subgraph perdb["Per-database schema (created by db::create_database)"]
+        direction TB
+        DOC["Document tables — one typed column per indexed field<br />+ doc jsonb (system fields merged at read time)"]
+        SCHED["scheduled_txns — (due_at, txn) rows the scheduler claims"]
+        WFS["workflows — durable runs (snapshotted spec + step outcomes)"]
+        STOR["storage — bytea blobs + sha256/size/content_type"]
+        MUT["mutations — idempotency-key replay log"]
+        HIST["schema_history — captured schema versions (push/migrate/restore)"]
+    end
+
+    subgraph global["Server-wide schemas"]
+        direction TB
+        AUTH["rtdb_auth.* — databases, users, sessions, admin_sessions,<br />allowlist, machine_tokens, admins, oauth_states"]
+        SIDX["rtdb.storage_index — storage id → owning db"]
+        CFG["rtdb_config — single-row hot config"]
+        AUD["rtdb.audit_log — best-effort per-DocOp rows"]
+        WHK["rtdb.webhooks + webhook_deliveries — registrations + outbox"]
+    end
+
+    STOR -.->|"public GET /storage/{id} resolves the owning db"| SIDX
+
+    classDef doc fill:#1E1E1E,stroke:#4CAF50,stroke-width:3px,color:#E6E6E6
+    classDef side fill:#1E1E1E,stroke:#2196F3,stroke-width:2px,color:#E6E6E6
+    classDef glob fill:#1E1E1E,stroke:#FFC107,stroke-width:2px,color:#E6E6E6
+    class DOC doc
+    class SCHED,WFS,STOR,MUT,HIST side
+    class AUTH,SIDX,CFG,AUD,WHK glob
+```
 
 - **Indexes**: a btree index may declare `unique` + a partial `where` predicate
   (compiles to `CREATE [UNIQUE] INDEX … [WHERE …]`); a uniqueness violation
