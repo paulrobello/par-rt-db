@@ -263,7 +263,14 @@ fn parse_token_response(value: serde_json::Value) -> Result<String, RtDbError> {
     match value.get("access_token").and_then(|v| v.as_str()) {
         Some(token) => Ok(token.to_string()),
         None => {
-            tracing::warn!(response = ?value, "github token exchange returned no access_token");
+            // SEC-205: log only the response SHAPE (which keys are present),
+            // never the body — a response missing access_token can still carry
+            // id_token/refresh_token fragments (same pattern as apple.rs).
+            let keys: Vec<&str> = value
+                .as_object()
+                .map(|m| m.keys().map(String::as_str).collect())
+                .unwrap_or_default();
+            tracing::warn!(present_keys = ?keys, "github token exchange returned no access_token");
             Err(RtDbError::internal("github token exchange failed"))
         }
     }
