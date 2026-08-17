@@ -8,6 +8,7 @@
 use std::sync::Arc;
 
 use rand::RngCore;
+use rand::rngs::OsRng;
 use sha2::{Digest, Sha256};
 use sqlx::{PgConnection, PgPool};
 
@@ -660,9 +661,12 @@ pub fn sha256_hex(s: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
+/// Mints a 64-hex-char (256-bit) token from the OS CSPRNG. Backs session
+/// tokens, machine tokens, OAuth state, and CSRF nonces — all security
+/// values (SEC-206: OsRng by contract, not just in practice).
 pub fn random_token() -> String {
     let mut bytes = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    OsRng.fill_bytes(&mut bytes);
     hex::encode(bytes)
 }
 
