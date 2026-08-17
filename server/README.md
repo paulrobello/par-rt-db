@@ -85,7 +85,7 @@ alongside it: [`../ts-client/`](../ts-client) (browser/Node),
 | Webhook outbox (when `RTDB_WEBHOOKS_ENABLED=true`) | `src/webhook.rs` (per-`DocOp` outbox row drained by a boot worker; at-least-once) |
 | Backup lifecycle (when `RTDB_BACKUP_ENABLED=true`) | `src/backup.rs` (manual `pg_dump` trigger + dump list/download/delete; `pg_restore --no-owner --no-privileges` into a fresh `rtdb_restored_<stamp>` DB) |
 | Rate limiter (per-token + per-db fixed window) | `src/rate_limit.rs` (`RTDB_RATE_LIMIT_PER_TOKEN_RPM` / `RTDB_RATE_LIMIT_PER_DB_RPM`, 0 = off) |
-| OpenTelemetry / OTLP tracing (ENH-018, opt-in) | `src/tracing_setup.rs` (subscriber init + `OtelGuard` flush); span instrumentation in `committer.rs`/`subs.rs`/`query.rs`/`txn.rs`. The `otel` cargo feature (default off) gates the deps + subscriber; `RTDB_OTEL_ENABLED` (default false) gates it at runtime. `committer.mutate` carries `queue_wait_ms`. |
+| OpenTelemetry / OTLP tracing (ENH-018, opt-in) | `src/tracing_setup.rs` (subscriber init + `OtelGuard` flush); span instrumentation in `committer.rs`/`subs.rs`/`query/`/`txn.rs`. The `otel` cargo feature (default off) gates the deps + subscriber; `RTDB_OTEL_ENABLED` (default false) gates it at runtime. `committer.mutate` carries `queue_wait_ms`. |
 | Query introspection (ENH-019) | `POST /admin/db/{db}/explain` (re-compiles a Query JSON via `compile_query`, returns `{sql, params, terminal, warnings}` — no rows) and `GET /admin/slow-queries` (bounded ring of queries that exceeded `RTDB_SLOW_QUERY_MS`). Ring + `SlowQueryRecord` in `src/metrics.rs`; explain + slow-query recording in `src/http_api.rs`; list endpoint in `src/admin/observability.rs`. `RTDB_SLOW_QUERY_MS=0` (default) disables; `RTDB_SLOW_QUERY_LOG_PARAMS=false` (default) keeps document content out of the log. |
 | Mutation-log dedup (idempotency) | `src/mutation_log.rs` |
 | Op feed (in-memory ring + `/admin/stream`) | `src/op_feed.rs` |
@@ -95,13 +95,17 @@ alongside it: [`../ts-client/`](../ts-client) (browser/Node),
 | Health | `src/health.rs` |
 | Schema model + validation | `src/schema.rs` |
 | Schema → Postgres DDL | `src/ddl.rs` |
-| Write / read paths | `src/txn.rs`, `src/query.rs` |
+| Write / read paths | `src/txn.rs`, `src/query/` (`mod.rs` compile + dispatch, `filter.rs`, `terminals.rs`, `search.rs`, `row_auth.rs`) |
 | Pagination (cursor keyset) | `src/pagination.rs` |
-| Wire messages | `src/protocol.rs` |
+| Wire messages + query/txn DSL types | `src/protocol.rs`, `src/dsl.rs` (pure wire/DSL types shared by protocol/txn/query — zero SQL) |
 | Error envelope | `src/error.rs` |
 | Transports | `src/ws.rs` (reactive), `src/http_api.rs` (one-shot) |
 | Admin control plane | `src/admin/` — `mod.rs` (shared core + assembled router) + fourteen per-domain submodules (`login`, `dbs`, `schema_ops`, `tokens`, `docs`, `schedules`, `storage_ops`, `webhooks`, `backups`, `settings`, `observability`, `sessions`, `merge`, `workflows`); all `/admin/*` routes + `/admin/stream` WS. `sessions` is the active-session management surface (`GET/DELETE /admin/sessions`, per-user + per-token-hash revocation; revocation takes effect on the next op over an already-open connection). |
 | Signed, time-limited storage URLs (ENH-017) | `src/signed_url.rs` (HMAC over `admin_key`, `?exp=&sig=` verified on `GET /storage/{id}`) |
+| Database bootstrap + admin SQL | `src/db.rs` (create/drop database, `storage_index`, the `rtdb_auth` schema) |
+| Cross-replica fan-out (ENH-022) | `src/notify.rs` (`pg_notify` on the `rtdb_ops` channel; per-process LISTEN mirrors peer replicas into the local op-feed ring) |
+| Privacy policy | `src/privacy.rs` (serves `GET /privacy`) |
+| Static SPA serving | `src/static/` (last-resort router fallback reading `RTDB_STATIC_DIR`) |
 | Auth (six OAuth providers + sessions + machine tokens + anonymous) | `src/auth/` — `mod.rs`, `provider.rs` (trait + dispatcher), `github.rs`, `google.rs`, `gitlab.rs`, `microsoft.rs` (Entra ID/Azure AD v2), `apple.rs` (ES256 JWT `client_secret` + `form_post`), `oidc.rs` (generic), `session.rs`, `tokens.rs`, `cookie.rs`. Anonymous auth (`POST /auth/anonymous`, gated `RTDB_AUTH_ANONYMOUS_ENABLED` default off) mints an ephemeral `Principal::User` (`anonymous = true`, `email = None`) that bypasses the per-db allowlist via its boot gate and owns its own documents via per-row `ownerField`. On a later OAuth sign-in, the anon footprint is merged into the real account (`src/merge.rs` — doc restamps in the committer, storage owner swap, session re-point, guarded anon-row delete); `POST /admin/merge-users` is the operator escape hatch. |
 
 The read path compiles a db-side `filter()` predicate DSL to SQL, a full-text
@@ -127,6 +131,25 @@ adjacency, a bare `or` unions alternatives, `-term` excludes. An optional
 to each hit — a `ts_headline` fragment with matched terms wrapped in `<mark>`,
 server-fixed word bounds (`MaxWords=35`, `MinWords=15`); `snippet` with
 `mode: "trgm"` is a `BAD_REQUEST`.
+
+## HTTP surface
+
+Top-level routes registered in `src/lib.rs` / `src/http_api.rs` (the full
+endpoint table, including `/sync`, `/auth/*`, `/admin/*`, and storage, lives in
+the [root README](../README.md#endpoints)):
+
+- `GET /healthz` — liveness + Postgres reachability.
+- `GET /metrics` — unauthenticated Prometheus text-exposition scrape endpoint
+  (aggregate-only; content-negotiated so a browser is served the SPA instead
+  when `RTDB_STATIC_DIR` is set).
+- `GET /privacy` — the privacy-policy page served from `src/privacy.rs`.
+- `POST /api/query`, `POST /api/query-batch` — one-shot query and length-aligned
+  multi-query fan-out (auth and owner resolution run once per batch request).
+- `POST /api/mutate` — one-shot transactions (both transports route through the
+  committer, so subscriptions fire either way).
+
+Every `RTDB_*` knob name-dropped in this README is documented with its type,
+default, and meaning in the [root README's Configuration section](../README.md#configuration).
 
 ## Scheduling
 
@@ -232,6 +255,9 @@ startup (mirrors `mutations`/`scheduled_txns`).
 
 ## Develop
 
+The `make` targets below run **from the repo root** (they coordinate all six
+packages):
+
 ```sh
 make dev-db-up        # start dev Postgres on 127.0.0.1:55434 (required for tests)
 make test             # dev-db-up, then cargo test
@@ -240,9 +266,10 @@ make checkall         # fmt-check + clippy -D warnings + typecheck + test
 
 Run cargo directly from this directory: `cargo build`, `cargo clippy --all-targets
 --all-features -- -D warnings`, or a single test by name
-(`cargo test --test txn_test upsert_multiple_matches`). Integration test
-binaries mirror the modules: `txn_test`, `query_test`, `subs_test`, `ws_test`,
-`http_api_test`, `oauth_test`, `admin_test`, `healthz_test`.
+(`cargo test --test txn_test upsert_multiple_matches`). Integration tests live
+one binary per feature area under `tests/` (e.g. `txn_test`, `query_test`,
+`subs_test`, `oauth_test`, `workflows_test`, `cascade_test`) — run one with
+`cargo test --test <name>`; list them all with `ls tests/`.
 
 Tests share one Postgres instance and isolate by creating uniquely-named
 databases (`t<uuid>`) — never assume exclusive access, and never drop a database
