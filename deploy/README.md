@@ -306,9 +306,15 @@ Restore produces a verified `rtdb_restored_<stamp>` database alongside the live
 
 1. Trigger the restore from the console (or `POST /admin/restore` with
    `confirm == "<name>"`); verify row counts in the restored DB.
-2. Point `RTDB_DATABASE_URL` at `rtdb_restored_<stamp>` in `.env`.
-3. Restart the server (`docker compose up -d`).
-4. Once stable, drop the old database at your discretion.
+2. Edit the `RTDB_DATABASE_URL:` line in `docker-compose.yml`'s `environment:`
+   block to point at `rtdb_restored_<stamp>` — the URL is hardcoded in that
+   block (only `${POSTGRES_PASSWORD}` is interpolated), so setting it in
+   `.env` has no effect.
+3. Restart the server (`docker compose up -d server`).
+4. Verify the cutover: `curl -fsS localhost:8300/healthz` (or the tunnel URL)
+   reports `"status":"ok"`, and one query against a row known to exist only
+   in the restored data returns it.
+5. Once stable, drop the old database at your discretion.
 
 Credentials for `createdb`/`pg_restore` travel via the `PG*` env vars, never on
 the argv.
@@ -320,7 +326,8 @@ Common operator symptoms on the live deploy:
 - **`/healthz` returns 503 with `"status":"degraded"` / `"postgres":false`** —
   the server process is up but cannot reach Postgres. Check
   `docker compose ps`, the `rtdb-pg` container health, and the
-  `RTDB_DATABASE_URL` in `.env`. `curl -f` exits non-zero on the 503, so this
+  `RTDB_DATABASE_URL` line in `docker-compose.yml`'s `environment:` block.
+  `curl -f` exits non-zero on the 503, so this
   surfaces in deploy/wrapper scripts.
 - **A new `RTDB_*` var set in `.env` has no effect.** Compose's `environment:`
   block is an explicit allowlist — a key only present in `.env` is never passed
