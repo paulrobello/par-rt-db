@@ -25,7 +25,7 @@ working with zero providers configured.
 - [Verifying](#verifying)
 - [Hardening](#hardening)
 - [Troubleshooting](#troubleshooting)
-- [Adding a new provider (Microsoft, Apple, …)](#adding-a-new-provider-microsoft-apple-)
+- [Adding a new provider (e.g. a future IdP)](#adding-a-new-provider-eg-a-future-idp)
 
 ## How it works
 
@@ -36,7 +36,11 @@ working with zero providers configured.
   `rtdb-oauth-csrf` nonce cookie (Login-CSRF defense — see [Hardening](#hardening)),
   and returns the provider authorize URL + the state as JSON
   (`{ authorizeUrl, state }`). The caller opens `authorizeUrl` in a `noopener`
-  popup and polls `GET /auth/state?state=…` for completion.
+  popup and polls `GET /auth/state?state=…` for completion. If the caller holds
+  an anonymous session, `/begin` resolves it server-side so the callback merges
+  the anonymous footprint into the real account (anonymous sign-in and the
+  anon→real merge are documented on the
+  [`POST /auth/anonymous` endpoint](../README.md#endpoints)).
 - The provider redirects back to the callback (`/auth/callback` for GitHub,
   `/auth/{provider}/callback` for Google/GitLab/Microsoft/OIDC) with
   `?code=&state=` (Apple is the exception — it POSTs `code` + `state` as a form
@@ -415,7 +419,7 @@ or integrate with par-rt-db:
 | `403 "no verified email"` | The account's email isn't verified at the provider. Verify it, or (Google) ensure the account is a *Test user* while the consent screen is in Testing. |
 | Google login works only for one account | Consent screen still in *Testing*. **Publish app** → *In production*. |
 
-## Adding a new provider (Microsoft, Apple, …)
+## Adding a new provider (e.g. a future IdP)
 
 Each new provider is a small, self-contained implementation behind the
 `OAuthProvider` trait (`server/src/auth/provider.rs`):
