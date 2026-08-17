@@ -36,8 +36,10 @@ mutate, and subscription re-run; machine tokens bypass):
 - `.authorize(expr)` — a general `FilterExpr` predicate over doc fields plus
   `$user`/`$email` principal markers (e.g. `.authorize({ field: "userId", eq:
   "$user" })`).
-- `.ttl({ field: "expiresAt" })` — declares a document-TTL field; the server's
-  per-db reaper deletes rows whose field value is past.
+- `.ttl("expiresAt")` — declares a document-TTL field; the server's per-db
+  reaper deletes rows whose field value is past. The optional second argument
+  (`defaultDurationMs`) stamps the field at insert time when a document omits
+  it.
 - `.defaults({ status: "backlog" })` — declares field-level default values
   (FM-32), stamped onto a **new** document that omits the key (insert / replace
   / upsert-insert only; `patch` never re-applies — clearing a field stays
@@ -108,7 +110,7 @@ off ⇒ `403`). It sets the same HttpOnly cookie **and** returns the plaintext
 session token for the SDK/bearer path; an anonymous user owns its own documents
 via per-row `ownerField`. The admin client (`RtDbAdminClient`) additionally
 exposes the active-session management surface — `listSessions({ user?, limit? })`
-and `revokeSession(tokenHash)` / `revokeSessionsForUser(user)` — mirroring
+and `revokeSession(tokenHash)` / `revokeUserSessions(userId)` — mirroring
 `GET/DELETE /admin/sessions`, plus `mergeUsers(anonUserId, realUserId)` — the
 operator escape hatch that merges an anonymous user into a real one — mirroring
 `POST /admin/merge-users` (the typed `confirm == realUserId` guard is applied
@@ -123,6 +125,12 @@ import { schema } from "./schema";
 const db = new RtDbHttpClient({ url: "https://rtdb.pardev.net", db: "kanban", token: process.env.RTDB_TOKEN! });
 const api = createApi(schema);
 const rows = await db.query(api.items.query().withIndex("by_project", ["p1"]).collect());
+// Many queries in one round trip (`POST /api/query-batch`) — outcomes align with the
+// input order; a per-query error is that slot's { ok: false, error } and never throws:
+const [top, recent] = await db.batchQuery([
+  api.items.query().withIndex("by_project", ["p1"]).take(5).json,
+  api.items.query().order("desc").take(5).json,
+]);
 // An insert step returns `{ id }` (not a bare string); patch/delete/expect* return null.
 const [{ id }] = (await db.mutate(
   mutation().insert("items", { projectId: "p1", title: "x", status: "backlog", order: 1 }).build(),
@@ -207,7 +215,14 @@ expose the trio, and a txn can start (or cancel) a run as a step, atomic with
 its writes:
 
 ```ts
+import { RtDbHttpClient, createApi, mutation } from "@par-rt-db/client";
 import type { WorkflowSpec } from "@par-rt-db/client";
+
+const db = new RtDbHttpClient({ url: "https://rtdb.pardev.net", db: "kanban", token: process.env.RTDB_TOKEN! });
+
+// A spec is snapshotted verbatim per run, so step values are literals known
+// at build time — there is no prior-step output referencing.
+const itemId = "wi_123";
 
 const spec: WorkflowSpec = {
   name: "onboard",
@@ -221,7 +236,7 @@ const spec: WorkflowSpec = {
   ],
 };
 
-const info = await db.startWorkflow(spec);      // WorkflowInfo (status "pending")
+const { id } = await db.startWorkflow(spec);    // HTTP client → { id }; the reactive RtDbClient resolves WorkflowInfo
 await db.cancelWorkflow(id);                    // false for a missing/terminal run (a no-op, not an error)
 const runs = await db.listWorkflows("running"); // WorkflowInfo[], newest first
 
@@ -358,8 +373,9 @@ HTTP) expose file storage; `InMemoryRtDbClient` mirrors it in memory:
 ```ts
 const { id } = await db.upload(bytes, "image/png");   // → { id, sha256, size, contentType }
 db.getUrl(id);                                         // public URL for <img src> — no fetch
+db.transformUrl(id, { w: 128, fit: "cover" });         // same URL with image-transform params — no fetch
 const meta = await db.getFileMetadata(id);             // { id, sha256, size, contentType?, creationTime }
-const { url, expiresAt } = await db.getSignedUrl(id, { ttlSeconds: 3600 }); // signed, time-limited public URL
+const { url, expiresAt } = await db.getSignedUrl(id, 3600);  // signed, time-limited public URL
 await db.deleteFile(id);                               // revokes the public URL
 ```
 
@@ -371,7 +387,7 @@ reactive updates).
 
 ## In-memory test client
 
-`InMemoryRtDbClient` (`src/in_memory.ts`) is an in-memory implementation of the
+`InMemoryRtDbClient` (`src/in_memory/`) is an in-memory implementation of the
 client surface for unit tests — no server, no Postgres. It mirrors the schema,
 query, and transaction semantics, including cursor pagination, so app code can
 exercise the full DSL against it directly.
