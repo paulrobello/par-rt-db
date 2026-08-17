@@ -25,7 +25,7 @@ Package name: `par-rt-db` → in Python, `import par_rt_db`.
 | HTTP / admin / storage client (`RtDbHttpClient`, sync `httpx`) | shipped | `par_rt_db.http_client` (`[http]` extra) |
 | Async HTTP / admin / storage client (`RtDbAsyncHttpClient`, `httpx.AsyncClient`) | shipped | `par_rt_db.aio_http_client` (`[aio]` extra) |
 | Reactive WebSocket client (`RtDbClient`, `Subscription`) | shipped | `par_rt_db.ws_client` (`[ws]` extra) |
-| Admin control plane (`RtDbAdminClient` — db/token/schema allowlist CRUD, webhooks, metrics, hot config, sessions, backups, snapshot export/import) | shipped | `par_rt_db.admin` (`[http]` extra) |
+| Admin control plane (`RtDbAdminClient` — db/token/schema allowlist CRUD, webhooks, metrics, hot config, sessions, backups, snapshot export/import, schema preview, admin schedules CRUD, admin storage list/upload/delete, per-db anonymous-access toggle) | shipped | `par_rt_db.admin` (`[http]` extra; async twin `AsyncRtDbAdminClient` in the same module, `[aio]` extra) |
 | In-memory test harness (`InMemoryRtDbClient` — no network, no Postgres) | shipped | `par_rt_db.in_memory` |
 | Optimistic local-state updates (`OptimisticStore` for read-modify-write UI loops) | shipped | `par_rt_db.optimistic` |
 

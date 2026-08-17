@@ -14,9 +14,13 @@ to resolve to the same class object (the model-identity regression at
 locks this down). There is exactly one model type per response shape across the
 sync/async data-plane and admin clients.
 
-The storage models (``UploadResult`` / ``FileMetadata`` / ``SignedUrl``) are
-data-plane shapes and stay defined in :mod:`par_rt_db.http_client`; they reuse
-the :class:`_Wire` base re-exported from here.
+The storage models (``UploadResult`` / ``FileMetadata`` / ``SignedUrl``) were
+formerly defined in :mod:`par_rt_db.http_client` and are now defined here too
+(the admin file-storage surface — ENH/A3 — needs ``FileMetadata`` in the admin
+builders, and :mod:`par_rt_db.admin` cannot import from the module it
+supersedes); :mod:`par_rt_db.http_client` re-exports them so every existing
+``from par_rt_db.http_client import FileMetadata`` resolves to the same class
+object.
 """
 
 from __future__ import annotations
@@ -460,6 +464,91 @@ class SlowQueriesResponse(_Wire):
     queries: list[SlowQueryEntry]
     threshold_ms: int
     capacity: int
+
+
+# --- schema preview (POST /admin/db/{db}/schema/preview) ---
+
+
+class SchemaPreviewColumnAdd(_Wire):
+    """One new column reported by schema preview. ``field_type`` is the
+    human-readable field type (e.g. ``string``, ``id<projects>``, ``string?``).
+    Mirrors ``server::schema_diff::ColumnAdd``."""
+
+    name: str
+    field_type: str
+
+
+class SchemaPreviewIndexAdd(_Wire):
+    """One new index reported by schema preview. Mirrors
+    ``server::schema_diff::IndexAdd``."""
+
+    name: str
+    fields: list[str]
+
+
+class SchemaPreviewTableAdd(_Wire):
+    """One new table reported by schema preview: its name plus the columns and
+    indexes the additive-only push would add. Mirrors
+    ``server::schema_diff::TableAdd``."""
+
+    table: str
+    columns: list[SchemaPreviewColumnAdd]
+    indexes: list[SchemaPreviewIndexAdd]
+
+
+class SchemaPreviewRejection(_Wire):
+    """One rejection reported by schema preview: a drop or type change the DDL
+    layer will refuse. ``item`` is the bare column/index name. Mirrors
+    ``server::schema_diff::Rejection``."""
+
+    table: str
+    item: str
+    reason: str
+
+
+class SchemaPreviewDiff(_Wire):
+    """``POST /admin/db/{db}/schema/preview`` response — what an additive-only
+    push would ADD and what it would REJECT (drops, type changes). Mirrors
+    ``server::schema_diff::SchemaDiff``."""
+
+    added: list[SchemaPreviewTableAdd]
+    rejected: list[SchemaPreviewRejection]
+
+
+# --- storage models (data-plane shapes; shared with the admin storage surface) ---
+
+
+class UploadResult(_Wire):
+    """``POST /api/storage/{db}`` response: server-computed file identity.
+
+    ``content_type`` defaults to ``None`` so an older server omitting the field
+    still deserializes (mirrors the rust-client's ``#[serde(default)]``).
+    """
+
+    id: str
+    sha256: str
+    size: int
+    content_type: str | None = None
+
+
+class FileMetadata(_Wire):
+    """``GET /api/storage/{db}/{id}/metadata`` response: ``UploadResult`` plus
+    the server-recorded ``creationTime``. Also the row shape of the admin
+    ``GET /admin/db/{db}/storage`` listing."""
+
+    id: str
+    sha256: str
+    size: int
+    content_type: str | None = None
+    creation_time: int
+
+
+class SignedUrl(_Wire):
+    """``GET /api/storage/{db}/{id}/signed-url`` response: a time-limited signed
+    serve URL and its absolute expiry (epoch milliseconds)."""
+
+    url: str
+    expires_at: int
 
 
 # ``StepResult`` is a ``Union`` alias (no ``model_validate``); route through a

@@ -10,8 +10,8 @@ exist in exactly one place rather than four near-identical copies.
 Surface covered:
 
 * db lifecycle — ``create-db`` / ``delete-db`` / ``dbs`` / ``clone-db``
-* schema — ``push-schema`` / ``dbs/{db}/schema`` / ``dbs/{db}/migrate`` /
-  schema history (list / get-version / restore)
+* schema — ``push-schema`` / ``dbs/{db}/schema`` / ``db/{db}/schema/preview`` /
+  ``dbs/{db}/migrate`` / schema history (list / get-version / restore)
 * export / import — ``export-db`` / ``import-db``
 * allowlist — ``/admin/allowlist`` (add / remove / list)
 * admins — ``/admin/admins`` (list / add / remove)
@@ -33,6 +33,12 @@ Surface covered:
   by db/table/op/principal/source with limit/offset paging
 * live subscription inspector (ENH-010) — ``/admin/subscriptions`` for the live
   subscription table + fan-out counters, optionally filtered by db
+* scheduled jobs — ``GET|POST /admin/db/{db}/schedules`` plus
+  ``.../{id}/cancel|pause|resume`` (the admin view spans all principals)
+* file storage — ``GET|POST /admin/db/{db}/storage`` (raw-byte upload) plus
+  ``DELETE .../{id}`` (idempotent)
+* per-db anonymous-access toggle (SEC-103) —
+  ``GET|PATCH /admin/db/{db}/anonymous-access``
 
 Architecture (ARC-108): each admin operation is a *builder* function returning
 an :class:`_AdminRequest` (HTTP method, path, request kwargs, and a response
@@ -82,6 +88,7 @@ from .admin_models import (
     ConfigResponse,
     DbStats,
     ExplainResult,
+    FileMetadata,
     HotConfigPatch,
     MergeReport,
     MetricsSnapshot,
@@ -90,6 +97,7 @@ from .admin_models import (
     OpEvent,
     SchemaHistoryEntry,
     SchemaHistorySummary,
+    SchemaPreviewDiff,
     SessionInfo,
     SlowQueriesResponse,
     SubscriptionsResponse,
@@ -102,7 +110,14 @@ from .migration import Directive, MigrateRequest
 from .mutation import StepResult, Transaction
 from .query import Query, TableQuery, _terminal_of, parse_result
 from .schema import SchemaDef
-from .wire import WorkflowInfo, WorkflowInfoFull, WorkflowSpec, WorkflowStatus
+from .wire import (
+    ScheduleInfo,
+    ScheduleWhen,
+    WorkflowInfo,
+    WorkflowInfoFull,
+    WorkflowSpec,
+    WorkflowStatus,
+)
 
 if TYPE_CHECKING:
     import httpx
@@ -237,6 +252,15 @@ def _op_push_schema(db: str, schema: SchemaDef) -> _AdminRequest:
         "/admin/push-schema",
         {"json": {"db": db, "schema": schema.model_dump(by_alias=True, mode="json")}},
         _parse_expect_ok,
+    )
+
+
+def _op_preview_schema(db: str, schema: SchemaDef) -> _AdminRequest:
+    return _AdminRequest(
+        "POST",
+        f"/admin/db/{db}/schema/preview",
+        {"json": {"schema": schema.model_dump(by_alias=True, mode="json")}},
+        _parse_model(SchemaPreviewDiff),
     )
 
 
@@ -405,9 +429,15 @@ def _op_admin_query(
     query: Query | TableQuery,
     *,
     model: type,
+    include_deleted: bool | None = None,
 ) -> _AdminRequest:
     built = query.build() if isinstance(query, TableQuery) else query
-    body = {"query": built.model_dump(by_alias=True, mode="json")}
+    body: dict[str, Any] = {"query": built.model_dump(by_alias=True, mode="json")}
+    # ``includeDeleted`` is an internal admin-route param (NOT a wire ``Query``
+    # field): only a truthy value puts the key on the wire — never ``null``,
+    # absent by default so the server's live-rows-only default applies.
+    if include_deleted:
+        body["includeDeleted"] = True
     terminal = _terminal_of(built)
 
     def parse(resp: httpx.Response) -> Any:
@@ -498,6 +528,96 @@ def _op_admin_cancel_workflow(db: str, id: str) -> _AdminRequest:
 
 def _op_admin_delete_workflow(db: str, id: str) -> _AdminRequest:
     return _AdminRequest("DELETE", f"/admin/db/{db}/workflows/{id}", {}, _parse_ok_bool)
+
+
+# --- admin schedule management ---
+#
+# GET|POST /admin/db/{db}/schedules + POST .../{id}/cancel|pause|resume.
+# Mirrors the ts/rust admin clients one-to-one — paths, bodies, and response
+# shapes identical; reuses the wire ``ScheduleInfo``/``ScheduleWhen`` and the
+# DSL ``Transaction`` types the client already carries. The manage ops take the
+# id + op from the path and no body; ``ok:false`` means an unknown or terminal
+# id (a no-op, not an error), so they parse through ``_parse_ok_bool``.
+
+
+def _op_admin_list_schedules(db: str) -> _AdminRequest:
+    return _AdminRequest(
+        "GET", f"/admin/db/{db}/schedules", {}, _parse_model_list(ScheduleInfo, "schedules")
+    )
+
+
+def _op_admin_create_schedule(db: str, when: ScheduleWhen, txn: Transaction) -> _AdminRequest:
+    return _AdminRequest(
+        "POST",
+        f"/admin/db/{db}/schedules",
+        {
+            "json": {
+                "when": when.model_dump(by_alias=True, mode="json"),
+                "txn": txn.model_dump(by_alias=True, mode="json"),
+            }
+        },
+        lambda resp: str(resp.json()["id"]),
+    )
+
+
+def _op_admin_manage_schedule(db: str, id: str, op: str) -> _AdminRequest:
+    """Bodyless POST for cancel/pause/resume — ``op`` is only ever one of those
+    three literals, each a path segment the server routes on."""
+    return _AdminRequest("POST", f"/admin/db/{db}/schedules/{id}/{op}", {}, _parse_ok_bool)
+
+
+# --- admin file storage ---
+#
+# GET|POST /admin/db/{db}/storage + DELETE .../{id}. The upload body is the
+# file itself (raw bytes, not JSON); ``content_type`` sets the ``Content-Type``
+# header and is left unset when ``None`` (the server then stores the blob
+# untyped) — the same convention as the data-plane ``RtDbHttpClient.upload``.
+
+
+def _op_admin_list_files(db: str) -> _AdminRequest:
+    return _AdminRequest(
+        "GET", f"/admin/db/{db}/storage", {}, _parse_model_list(FileMetadata, "files")
+    )
+
+
+def _op_admin_upload_file(
+    db: str,
+    data: bytes,
+    *,
+    content_type: str | None = None,
+) -> _AdminRequest:
+    headers = {"Content-Type": content_type} if content_type is not None else None
+    return _AdminRequest(
+        "POST",
+        f"/admin/db/{db}/storage",
+        {"content": data, "headers": headers},
+        lambda resp: str(resp.json()["id"]),
+    )
+
+
+def _op_admin_delete_file(db: str, id: str) -> _AdminRequest:
+    return _AdminRequest("DELETE", f"/admin/db/{db}/storage/{id}", {}, _parse_expect_ok)
+
+
+# --- per-db anonymous-access toggle (SEC-103) ---
+
+
+def _op_get_anonymous_access(db: str) -> _AdminRequest:
+    return _AdminRequest(
+        "GET",
+        f"/admin/db/{db}/anonymous-access",
+        {},
+        lambda resp: bool(resp.json()["enabled"]),
+    )
+
+
+def _op_set_anonymous_access(db: str, enabled: bool) -> _AdminRequest:
+    return _AdminRequest(
+        "PATCH",
+        f"/admin/db/{db}/anonymous-access",
+        {"json": {"enabled": enabled}},
+        _parse_expect_ok,
+    )
 
 
 def _op_mint_token(
@@ -852,6 +972,18 @@ class RtDbAdminClient:
         """``POST /admin/push-schema`` ``{db, schema}`` → ``{ok:true}``."""
         self._executor.run(_op_push_schema(db, schema))
 
+    def preview_schema(self, db: str, schema: SchemaDef) -> SchemaPreviewDiff:
+        """``POST /admin/db/{db}/schema/preview`` ``{schema}`` → ``SchemaPreviewDiff``.
+
+        Pure/advisory — validates the pending schema and diffs it against the
+        currently-applied one WITHOUT applying anything: ``added`` lists every
+        new table/column/index an additive-only push would create, ``rejected``
+        lists every drop or type change the DDL layer would refuse
+        (``push_schema`` remains the authoritative gate). Same body shape as
+        :meth:`push_schema` minus the ``db`` key (it rides the path).
+        """
+        return self._executor.run(_op_preview_schema(db, schema))
+
     def get_schema(self, db: str) -> SchemaDef:
         """``GET /admin/dbs/{db}/schema`` → the database's pushed ``SchemaDef``."""
         return self._executor.run(_op_get_schema(db))
@@ -1009,14 +1141,30 @@ class RtDbAdminClient:
 
     # --- owner-bypass data access: admin query/mutate ---
 
-    def admin_query(self, db: str, query: Query | TableQuery, *, model: type = dict) -> Any:
-        """``POST /admin/db/{db}/query`` ``{query}`` → parsed ``{result}``.
+    def admin_query(
+        self,
+        db: str,
+        query: Query | TableQuery,
+        *,
+        model: type = dict,
+        include_deleted: bool | None = None,
+    ) -> Any:
+        """``POST /admin/db/{db}/query`` ``{query, includeDeleted?}`` → parsed
+        ``{result}``.
 
         Owner-bypass: an admin reads documents across every database regardless
         of ``ownerField``. ``db`` rides in the URL (singular ``db``), so the body
         omits it. Result parsing mirrors ``RtDbHttpClient.run``.
+
+        ``include_deleted`` is an internal admin-route parameter, NOT a wire
+        ``Query`` field: ``True`` surfaces soft-deleted (FM-33 ``deleted_at``)
+        rows so an operator can see them; ``None``/``False`` (the default)
+        omits the key entirely so the server's live-rows-only default applies —
+        the key is never sent as ``null``.
         """
-        return self._executor.run(_op_admin_query(db, query, model=model))
+        return self._executor.run(
+            _op_admin_query(db, query, model=model, include_deleted=include_deleted)
+        )
 
     def admin_mutate(
         self,
@@ -1116,6 +1264,100 @@ class RtDbAdminClient:
         """``DELETE /admin/db/{db}/workflows/{id}`` → ``True`` when the run row
         was removed; ``False`` when it was already gone."""
         return self._executor.run(_op_admin_delete_workflow(db, id))
+
+    # --- admin schedule management (GET|POST /admin/db/{db}/schedules) ---
+
+    def admin_list_schedules(self, db: str) -> list[ScheduleInfo]:
+        """``GET /admin/db/{db}/schedules`` → ``{schedules:[...]}``.
+
+        Lists every pending and in-flight scheduled job for the database (the
+        admin view spans all principals — scheduled jobs carry no owner).
+        """
+        return self._executor.run(_op_admin_list_schedules(db))
+
+    def admin_create_schedule(self, db: str, when: ScheduleWhen, txn: Transaction) -> str:
+        """``POST /admin/db/{db}/schedules`` ``{when, txn}`` → the new job's id.
+
+        Registers a scheduled job through the admin surface (the same enqueue
+        the ``Schedule`` mutation step and the WS ``schedule`` frame use).
+        ``when`` selects one-shot (``AfterMs``/``RunAt``) or recurring
+        (``Cron``); ``txn`` is the transaction the scheduler executes at the
+        due time.
+        """
+        return self._executor.run(_op_admin_create_schedule(db, when, txn))
+
+    def admin_cancel_schedule(self, db: str, id: str) -> bool:
+        """``POST .../schedules/{id}/cancel`` → ``True`` when a pending job was
+        cancelled; ``False`` for an unknown or already-fired id (a no-op, not
+        an error)."""
+        return self._executor.run(_op_admin_manage_schedule(db, id, "cancel"))
+
+    def admin_pause_schedule(self, db: str, id: str) -> bool:
+        """``POST .../schedules/{id}/pause`` → ``True`` when a pending job was
+        paused; ``False`` for an unknown or non-pausable id (a no-op)."""
+        return self._executor.run(_op_admin_manage_schedule(db, id, "pause"))
+
+    def admin_resume_schedule(self, db: str, id: str) -> bool:
+        """``POST .../schedules/{id}/resume`` → ``True`` when a paused job was
+        resumed; ``False`` for an unknown or non-paused id (a no-op)."""
+        return self._executor.run(_op_admin_manage_schedule(db, id, "resume"))
+
+    # --- admin file storage (GET|POST /admin/db/{db}/storage) ---
+
+    def admin_list_files(self, db: str) -> list[FileMetadata]:
+        """``GET /admin/db/{db}/storage`` → ``{files:[...]}``.
+
+        Lists every blob the database owns, newest first (the admin view spans
+        all principals — admin-uploaded blobs are owner-less, SEC-118).
+        """
+        return self._executor.run(_op_admin_list_files(db))
+
+    def admin_upload_file(
+        self,
+        db: str,
+        data: bytes,
+        *,
+        content_type: str | None = None,
+    ) -> str:
+        """``POST /admin/db/{db}/storage`` with the RAW bytes as the body (not
+        JSON) → the new blob's id.
+
+        ``content_type`` sets the ``Content-Type`` header AND is stored as the
+        file's type; when ``None`` the header is left unset and the server
+        stores the blob untyped (same convention as the data-plane
+        ``RtDbHttpClient.upload``). The server enforces the live ``maxFileSize``
+        (413). Admin uploads stay owner-less (SEC-118).
+        """
+        return self._executor.run(_op_admin_upload_file(db, data, content_type=content_type))
+
+    def admin_delete_file(self, db: str, id: str) -> None:
+        """``DELETE /admin/db/{db}/storage/{id}`` → ``{ok:true}``.
+
+        Idempotent — the server acks ok even when the blob is already gone.
+        Both the per-db blob row and the global ``storage_index`` row are
+        removed, so the public serve URL 404s afterward.
+        """
+        self._executor.run(_op_admin_delete_file(db, id))
+
+    # --- per-db anonymous-access toggle (SEC-103) ---
+
+    def get_anonymous_access(self, db: str) -> bool:
+        """``GET /admin/db/{db}/anonymous-access`` → the per-db flag.
+
+        Reports only the per-database opt-in; the instance-wide
+        ``RTDB_AUTH_ANONYMOUS_ENABLED`` boot gate is separate and always
+        applies on top (both must allow for an anonymous sign-in to succeed).
+        """
+        return self._executor.run(_op_get_anonymous_access(db))
+
+    def set_anonymous_access(self, db: str, enabled: bool) -> None:
+        """``PATCH /admin/db/{db}/anonymous-access`` ``{enabled}`` → ``{ok:true}``.
+
+        Flips the per-database anonymous-access flag; the instance-wide boot
+        gate must also be on for anon minting to work. A ``not_found`` error
+        means the database is not registered.
+        """
+        self._executor.run(_op_set_anonymous_access(db, enabled))
 
     # --- token surface (ENH-005) ---
 
@@ -1463,6 +1705,13 @@ class AsyncRtDbAdminClient:
         """``POST /admin/push-schema`` ``{db, schema}`` → ``{ok:true}`` (async)."""
         await self._executor.run(_op_push_schema(db, schema))
 
+    async def preview_schema(self, db: str, schema: SchemaDef) -> SchemaPreviewDiff:
+        """``POST /admin/db/{db}/schema/preview`` → ``SchemaPreviewDiff`` (async).
+
+        See :meth:`RtDbAdminClient.preview_schema` for diff semantics.
+        """
+        return await self._executor.run(_op_preview_schema(db, schema))
+
     async def get_schema(self, db: str) -> SchemaDef:
         """``GET /admin/dbs/{db}/schema`` → the database's pushed ``SchemaDef`` (async)."""
         return await self._executor.run(_op_get_schema(db))
@@ -1598,12 +1847,23 @@ class AsyncRtDbAdminClient:
 
     # --- owner-bypass data access: admin query/mutate ---
 
-    async def admin_query(self, db: str, query: Query | TableQuery, *, model: type = dict) -> Any:
-        """``POST /admin/db/{db}/query`` ``{query}`` → parsed ``{result}`` (async).
+    async def admin_query(
+        self,
+        db: str,
+        query: Query | TableQuery,
+        *,
+        model: type = dict,
+        include_deleted: bool | None = None,
+    ) -> Any:
+        """``POST /admin/db/{db}/query`` ``{query, includeDeleted?}`` → parsed
+        ``{result}`` (async).
 
-        See :meth:`RtDbAdminClient.admin_query` for owner-bypass semantics.
+        See :meth:`RtDbAdminClient.admin_query` for owner-bypass and
+        ``include_deleted`` semantics.
         """
-        return await self._executor.run(_op_admin_query(db, query, model=model))
+        return await self._executor.run(
+            _op_admin_query(db, query, model=model, include_deleted=include_deleted)
+        )
 
     async def admin_mutate(
         self,
@@ -1681,6 +1941,89 @@ class AsyncRtDbAdminClient:
     async def admin_delete_workflow(self, db: str, id: str) -> bool:
         """``DELETE /admin/db/{db}/workflows/{id}`` → delete outcome bool (async)."""
         return await self._executor.run(_op_admin_delete_workflow(db, id))
+
+    # --- admin schedule management (GET|POST /admin/db/{db}/schedules) ---
+
+    async def admin_list_schedules(self, db: str) -> list[ScheduleInfo]:
+        """``GET /admin/db/{db}/schedules`` → ``{schedules:[...]}`` (async).
+
+        See :meth:`RtDbAdminClient.admin_list_schedules` for semantics.
+        """
+        return await self._executor.run(_op_admin_list_schedules(db))
+
+    async def admin_create_schedule(self, db: str, when: ScheduleWhen, txn: Transaction) -> str:
+        """``POST /admin/db/{db}/schedules`` ``{when, txn}`` → the new id (async).
+
+        See :meth:`RtDbAdminClient.admin_create_schedule` for body semantics.
+        """
+        return await self._executor.run(_op_admin_create_schedule(db, when, txn))
+
+    async def admin_cancel_schedule(self, db: str, id: str) -> bool:
+        """``POST .../schedules/{id}/cancel`` → cancel outcome bool (async).
+
+        ``False`` is a legitimate no-op (unknown/fired id), not an error.
+        """
+        return await self._executor.run(_op_admin_manage_schedule(db, id, "cancel"))
+
+    async def admin_pause_schedule(self, db: str, id: str) -> bool:
+        """``POST .../schedules/{id}/pause`` → pause outcome bool (async).
+
+        ``False`` is a legitimate no-op (unknown/non-pausable id), not an error.
+        """
+        return await self._executor.run(_op_admin_manage_schedule(db, id, "pause"))
+
+    async def admin_resume_schedule(self, db: str, id: str) -> bool:
+        """``POST .../schedules/{id}/resume`` → resume outcome bool (async).
+
+        ``False`` is a legitimate no-op (unknown/non-paused id), not an error.
+        """
+        return await self._executor.run(_op_admin_manage_schedule(db, id, "resume"))
+
+    # --- admin file storage (GET|POST /admin/db/{db}/storage) ---
+
+    async def admin_list_files(self, db: str) -> list[FileMetadata]:
+        """``GET /admin/db/{db}/storage`` → ``{files:[...]}`` (async).
+
+        See :meth:`RtDbAdminClient.admin_list_files` for semantics.
+        """
+        return await self._executor.run(_op_admin_list_files(db))
+
+    async def admin_upload_file(
+        self,
+        db: str,
+        data: bytes,
+        *,
+        content_type: str | None = None,
+    ) -> str:
+        """``POST /admin/db/{db}/storage`` with raw bytes → the new blob id (async).
+
+        See :meth:`RtDbAdminClient.admin_upload_file` for the raw-body and
+        ``content_type`` semantics.
+        """
+        return await self._executor.run(_op_admin_upload_file(db, data, content_type=content_type))
+
+    async def admin_delete_file(self, db: str, id: str) -> None:
+        """``DELETE /admin/db/{db}/storage/{id}`` → ``{ok:true}`` (async).
+
+        See :meth:`RtDbAdminClient.admin_delete_file` for idempotency semantics.
+        """
+        await self._executor.run(_op_admin_delete_file(db, id))
+
+    # --- per-db anonymous-access toggle (SEC-103) ---
+
+    async def get_anonymous_access(self, db: str) -> bool:
+        """``GET /admin/db/{db}/anonymous-access`` → the per-db flag (async).
+
+        See :meth:`RtDbAdminClient.get_anonymous_access` for the two-gate rule.
+        """
+        return await self._executor.run(_op_get_anonymous_access(db))
+
+    async def set_anonymous_access(self, db: str, enabled: bool) -> None:
+        """``PATCH /admin/db/{db}/anonymous-access`` ``{enabled}`` (async).
+
+        See :meth:`RtDbAdminClient.set_anonymous_access` for semantics.
+        """
+        await self._executor.run(_op_set_anonymous_access(db, enabled))
 
     # --- token surface (ENH-005) ---
 

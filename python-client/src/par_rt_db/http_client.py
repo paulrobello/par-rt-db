@@ -85,6 +85,7 @@ from .admin_models import (
     DbStats,
     DbSubCounters,
     DirectiveReport,
+    FileMetadata,
     HotConfig,
     HotConfigPatch,
     LatencyStats,
@@ -96,14 +97,15 @@ from .admin_models import (
     SchemaHistoryEntry,
     SchemaHistorySummary,
     SessionInfo,
+    SignedUrl,
     SubscriptionInfo,
     SubscriptionsPrincipal,
     SubscriptionsResponse,
     TableStat,
     TokenInfo,
+    UploadResult,
     Webhook,
     WebhookDelivery,
-    _Wire,
 )
 from .errors import ErrorCode, RtDbError
 from .migration import Directive, MigrateRequest
@@ -163,39 +165,12 @@ __all__ = [
 ]
 
 
-# --- storage models (data-plane shapes; defined here, not admin shapes) ---
-
-
-class UploadResult(_Wire):
-    """``POST /api/storage/{db}`` response: server-computed file identity.
-
-    ``content_type`` defaults to ``None`` so an older server omitting the field
-    still deserializes (mirrors the rust-client's ``#[serde(default)]``).
-    """
-
-    id: str
-    sha256: str
-    size: int
-    content_type: str | None = None
-
-
-class FileMetadata(_Wire):
-    """``GET /api/storage/{db}/{id}/metadata`` response: ``UploadResult`` plus
-    the server-recorded ``creationTime``."""
-
-    id: str
-    sha256: str
-    size: int
-    content_type: str | None = None
-    creation_time: int
-
-
-class SignedUrl(_Wire):
-    """``GET /api/storage/{db}/{id}/signed-url`` response: a time-limited signed
-    serve URL and its absolute expiry (epoch milliseconds)."""
-
-    url: str
-    expires_at: int
+# The storage models (``UploadResult``/``FileMetadata``/``SignedUrl``) were
+# moved to :mod:`par_rt_db.admin_models` (the admin file-storage surface needs
+# ``FileMetadata`` in :mod:`par_rt_db.admin`, which cannot import this module).
+# They are re-exported via the import above so every existing
+# ``from par_rt_db.http_client import FileMetadata`` keeps resolving to the same
+# class object, and remain listed in ``__all__`` below.
 
 
 # ``list[...]`` aliases need a TypeAdapter to validate at runtime.

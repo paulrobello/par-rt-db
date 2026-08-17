@@ -20,7 +20,7 @@ from typing import Any
 import httpx
 import pytest
 
-from par_rt_db import Mutation, TableQuery, t
+from par_rt_db import AfterMs, Cron, Mutation, TableQuery, t
 from par_rt_db.admin import (
     AdminMember,
     AsyncRtDbAdminClient,
@@ -36,6 +36,7 @@ from par_rt_db.admin import (
     RtDbAdminClient,
     SchemaHistoryEntry,
     SchemaHistorySummary,
+    SchemaPreviewDiff,
     SessionInfo,
     SlowQueriesResponse,
     SubscriptionsResponse,
@@ -45,9 +46,9 @@ from par_rt_db.admin import (
 )
 from par_rt_db.admin_models import MergeConflict, MergeDbResult
 from par_rt_db.errors import ErrorCode, RtDbError
-from par_rt_db.http_client import SubscriptionInfo
+from par_rt_db.http_client import FileMetadata, SubscriptionInfo
 from par_rt_db.schema import Schema
-from par_rt_db.wire import WorkflowInfo, WorkflowInfoFull
+from par_rt_db.wire import ScheduleInfo, WorkflowInfo, WorkflowInfoFull
 
 ADMIN_BEARER = "Bearer admin-key"
 URL = "https://rtdb.example"
@@ -2096,3 +2097,334 @@ async def test_async_admin_workflow_ops() -> None:
     assert full.step_outcomes[0].attempts == 1
     assert cancelled is True
     assert deleted is False
+
+
+# --- schema preview (dry-run diff) ----------------------------------------
+
+
+def test_preview_schema_posts_schema_and_parses_diff() -> None:
+    captured: dict[str, Any] = {}
+    schema = Schema.builder().table("items", lambda tb: tb.field("sku", t.string())).build()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["method"] = request.method
+        captured["path"] = request.url.path
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "added": [
+                    {
+                        "table": "items",
+                        "columns": [{"name": "sku", "fieldType": "string"}],
+                        "indexes": [{"name": "by_sku", "fields": ["sku"]}],
+                    }
+                ],
+                "rejected": [{"table": "old", "item": "drop table", "reason": "destructive"}],
+            },
+        )
+
+    with _sync_client(handler) as c:
+        diff = c.preview_schema("dbx", schema)
+    assert captured["method"] == "POST"
+    assert captured["path"] == "/admin/db/dbx/schema/preview"
+    # db rides in the URL, not the body — same shape as push_schema minus the db key
+    assert "db" not in captured["body"]
+    assert "schema" in captured["body"]
+    assert isinstance(diff, SchemaPreviewDiff)
+    assert diff.added[0].table == "items"
+    assert diff.added[0].columns[0].name == "sku"
+    assert diff.added[0].columns[0].field_type == "string"
+    assert diff.added[0].indexes[0].fields == ["sku"]
+    assert diff.rejected[0].reason == "destructive"
+
+
+async def test_async_preview_schema_mirrors_sync() -> None:
+    captured: dict[str, Any] = {}
+    schema = Schema.builder().table("items", lambda tb: tb.field("sku", t.string())).build()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["path"] = request.url.path
+        captured["auth"] = request.headers["authorization"]
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"added": [], "rejected": []})
+
+    async with _async_client(handler) as c:
+        diff = await c.preview_schema("dbx", schema)
+    assert captured["auth"] == ADMIN_BEARER
+    assert captured["path"] == "/admin/db/dbx/schema/preview"
+    assert isinstance(diff, SchemaPreviewDiff)
+    assert diff.added == []
+    assert diff.rejected == []
+
+
+# --- admin_query includeDeleted (soft-delete visibility) ------------------
+
+
+def test_admin_query_omits_include_deleted_when_unset_or_false() -> None:
+    """``includeDeleted`` must be ABSENT from the body unless truthy-set — never
+    ``null`` (corpus-parity with the server's internal param)."""
+    bodies: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        return httpx.Response(200, json={"result": []})
+
+    with _sync_client(handler) as c:
+        c.admin_query("dbx", TableQuery("items").take(2))
+        c.admin_query("dbx", TableQuery("items").take(2), include_deleted=False)
+    assert len(bodies) == 2
+    for body in bodies:
+        assert "includeDeleted" not in body
+        assert "query" in body
+
+
+def test_admin_query_sends_include_deleted_when_true() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"result": [{"_id": "gone", "deleted_at": 5}]})
+
+    with _sync_client(handler) as c:
+        docs = c.admin_query("dbx", TableQuery("items").take(2), include_deleted=True)
+    assert captured["body"]["includeDeleted"] is True
+    assert len(docs) == 1
+
+
+async def test_async_admin_query_include_deleted_pair() -> None:
+    bodies: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        return httpx.Response(200, json={"result": []})
+
+    async with _async_client(handler) as c:
+        await c.admin_query("dbx", TableQuery("items").take(2))
+        await c.admin_query("dbx", TableQuery("items").take(2), include_deleted=True)
+    assert "includeDeleted" not in bodies[0]
+    assert bodies[1]["includeDeleted"] is True
+
+
+# --- admin schedule management (GET|POST /admin/db/{db}/schedules) --------
+
+
+_SCHEDULE_ROW = {
+    "id": "sch-1",
+    "kind": "oneshot",
+    "dueAt": 1700000000000,
+    "cron": None,
+    "status": "pending",
+    "lastError": None,
+    "createdAt": 1699999000000,
+    "firedCount": 0,
+}
+
+
+def test_admin_list_schedules_parses_rows() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["method"] = request.method
+        captured["path"] = request.url.path
+        return httpx.Response(200, json={"schedules": [_SCHEDULE_ROW]})
+
+    with _sync_client(handler) as c:
+        rows = c.admin_list_schedules("kanban")
+    assert captured["method"] == "GET"
+    assert captured["path"] == "/admin/db/kanban/schedules"
+    assert len(rows) == 1
+    assert isinstance(rows[0], ScheduleInfo)
+    assert rows[0].id == "sch-1"
+    assert rows[0].kind == "oneshot"
+    assert rows[0].due_at == 1700000000000
+    assert rows[0].status == "pending"
+    assert rows[0].cron is None
+    assert rows[0].fired_count == 0
+
+
+def test_admin_create_schedule_posts_when_and_txn() -> None:
+    captured: dict[str, Any] = {}
+    txn = Mutation.builder().insert("items", {"name": "x"}).build()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["method"] = request.method
+        captured["path"] = request.url.path
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"id": "sch-9"})
+
+    with _sync_client(handler) as c:
+        sid = c.admin_create_schedule("kanban", AfterMs(ms=5000), txn)
+    assert sid == "sch-9"
+    assert captured["method"] == "POST"
+    assert captured["path"] == "/admin/db/kanban/schedules"
+    assert captured["body"] == {
+        "when": {"type": "afterMs", "ms": 5000},
+        "txn": {"steps": [{"op": "insert", "table": "items", "doc": {"name": "x"}}]},
+    }
+
+
+def test_admin_cancel_pause_resume_schedules_hit_paths_and_return_bools() -> None:
+    """Three bodyless POSTs; ``ok:false`` (unknown/terminal id) is a legitimate
+    ``False`` return, not an error."""
+    seen: list[tuple[str, str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content) if request.content else None
+        seen.append((request.method, request.url.path, body))
+        ok = not request.url.path.endswith("/resume")  # resume misses → ok:false
+        return httpx.Response(200, json={"ok": ok})
+
+    with _sync_client(handler) as c:
+        cancelled = c.admin_cancel_schedule("kanban", "sch-1")
+        paused = c.admin_pause_schedule("kanban", "sch-1")
+        resumed = c.admin_resume_schedule("kanban", "sch-1")
+    assert cancelled is True
+    assert paused is True
+    assert resumed is False
+    assert seen == [
+        ("POST", "/admin/db/kanban/schedules/sch-1/cancel", None),
+        ("POST", "/admin/db/kanban/schedules/sch-1/pause", None),
+        ("POST", "/admin/db/kanban/schedules/sch-1/resume", None),
+    ]
+
+
+async def test_async_admin_schedule_ops() -> None:
+    txn = Mutation.builder().insert("items", {"name": "x"}).build()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/admin/db/kanban/schedules":
+            return httpx.Response(200, json={"schedules": [_SCHEDULE_ROW]})
+        if request.method == "POST" and request.url.path == "/admin/db/kanban/schedules":
+            return httpx.Response(200, json={"id": "sch-9"})
+        if request.method == "POST" and request.url.path.endswith("/cancel"):
+            return httpx.Response(200, json={"ok": True})
+        return httpx.Response(404, text=f"no mock for {request.method} {request.url.path}")
+
+    async with _async_client(handler) as c:
+        rows = await c.admin_list_schedules("kanban")
+        sid = await c.admin_create_schedule("kanban", Cron(expr="0 * * * *"), txn)
+        cancelled = await c.admin_cancel_schedule("kanban", "sch-1")
+    assert [r.id for r in rows] == ["sch-1"]
+    assert sid == "sch-9"
+    assert cancelled is True
+
+
+# --- admin file storage (GET|POST /admin/db/{db}/storage) -----------------
+
+
+_FILE_ROW = {
+    "id": "f1",
+    "sha256": "abc123def",
+    "size": 9,
+    "contentType": "text/plain",
+    "creationTime": 1700000000000,
+}
+
+
+def test_admin_list_files_parses_rows() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["method"] = request.method
+        captured["path"] = request.url.path
+        return httpx.Response(200, json={"files": [_FILE_ROW]})
+
+    with _sync_client(handler) as c:
+        rows = c.admin_list_files("kanban")
+    assert captured["method"] == "GET"
+    assert captured["path"] == "/admin/db/kanban/storage"
+    assert len(rows) == 1
+    assert isinstance(rows[0], FileMetadata)
+    assert rows[0].id == "f1"
+    assert rows[0].sha256 == "abc123def"
+    assert rows[0].size == 9
+    assert rows[0].content_type == "text/plain"
+    assert rows[0].creation_time == 1700000000000
+
+
+def test_admin_upload_file_posts_raw_bytes_with_content_type() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["method"] = request.method
+        captured["path"] = request.url.path
+        captured["content"] = request.content
+        captured["content_type"] = request.headers["content-type"]
+        return httpx.Response(200, json={"id": "f9"})
+
+    with _sync_client(handler) as c:
+        fid = c.admin_upload_file("kanban", b"raw-bytes", content_type="image/png")
+    assert fid == "f9"
+    assert captured["method"] == "POST"
+    assert captured["path"] == "/admin/db/kanban/storage"
+    # the body is the file itself, verbatim — NOT a JSON envelope
+    assert captured["content"] == b"raw-bytes"
+    assert captured["content_type"] == "image/png"
+
+
+def test_admin_upload_file_omits_content_type_when_none() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["content"] = request.content
+        captured["has_content_type"] = "content-type" in request.headers
+        return httpx.Response(200, json={"id": "f10"})
+
+    with _sync_client(handler) as c:
+        fid = c.admin_upload_file("kanban", b"untyped")
+    assert fid == "f10"
+    assert captured["content"] == b"untyped"
+    assert captured["has_content_type"] is False
+
+
+def test_admin_delete_file_hits_route() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["method"] = request.method
+        captured["path"] = request.url.path
+        return httpx.Response(200, json={"ok": True})
+
+    with _sync_client(handler) as c:
+        result = c.admin_delete_file("kanban", "f1")
+    assert result is None
+    assert captured["method"] == "DELETE"
+    assert captured["path"] == "/admin/db/kanban/storage/f1"
+
+
+# --- per-db anonymous-access toggle (SEC-103) ------------------------------
+
+
+def test_anonymous_access_get_and_set() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.setdefault("calls", []).append((request.method, request.url.path))
+        if request.method == "GET":
+            return httpx.Response(200, json={"enabled": True})
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"ok": True})
+
+    with _sync_client(handler) as c:
+        enabled = c.get_anonymous_access("kanban")
+        result = c.set_anonymous_access("kanban", False)
+    assert enabled is True
+    assert result is None
+    assert captured["calls"] == [
+        ("GET", "/admin/db/kanban/anonymous-access"),
+        ("PATCH", "/admin/db/kanban/anonymous-access"),
+    ]
+    assert captured["body"] == {"enabled": False}
+
+
+async def test_async_anonymous_access_ops() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, json={"enabled": False})
+        return httpx.Response(200, json={"ok": True})
+
+    async with _async_client(handler) as c:
+        enabled = await c.get_anonymous_access("kanban")
+        await c.set_anonymous_access("kanban", True)
+    assert enabled is False
