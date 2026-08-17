@@ -26,8 +26,8 @@ contribution.
 The [`superpowers/`](superpowers/) directory holds the design history of the project — written with the `superpowers` skill's brainstorm → spec → plan → implement cycle. Specs are the durable design record; plans are the execution breakdown that landed the spec.
 
 - [`superpowers/SPEC_STATUS.md`](superpowers/SPEC_STATUS.md) — at-a-glance status of every spec (implemented, in-progress, or shelved).
-- [`superpowers/specs/`](superpowers/specs/) — design specs (33 files): the `2026-07-21-par-rt-db-design.md` main spec is the authoritative protocol/semantics source; later specs cover clients (rust, python, dashboard), per-row authorization, fine-grained subscription invalidation, file storage, scheduling, schema migration, presence, quotas, schema history, image transforms, signed URLs, undo, and more.
-- [`superpowers/plans/`](superpowers/plans/) — implementation plans (58 files): per-spec execution breakdowns including the seven-phase realtime-dashboard series (`2026-07-24-realtime-dashboard-phase{1-auth,2-metadata,3a-metrics,3b-opfeed,4-config,5-admin-docs,6-static}.md`).
+- [`superpowers/specs/`](superpowers/specs/) — design specs: the `2026-07-21-par-rt-db-design.md` main spec is the authoritative protocol/semantics source; later specs cover clients (rust, python, dashboard), per-row authorization, fine-grained subscription invalidation, file storage, scheduling, schema migration, presence, quotas, schema history, image transforms, signed URLs, undo, and more.
+- [`superpowers/plans/`](superpowers/plans/) — implementation plans: per-spec execution breakdowns including the seven-phase realtime-dashboard series (`2026-07-24-realtime-dashboard-phase{1-auth,2-metadata,3a-metrics,3b-opfeed,4-config,5-admin-docs,6-static}.md`).
 
 When the code and a spec disagree, the code wins; fix the spec.
 
