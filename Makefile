@@ -134,7 +134,7 @@ rtdb-cli:
 env-drift-check:
 	./scripts/env-drift-check.sh
 
-checkall: env-drift-check fmt-check lint typecheck test
+checkall: env-drift-check fmt-check lint typecheck test rust-client-check-features
 
 pre-commit:
 	pre-commit run --all-files
