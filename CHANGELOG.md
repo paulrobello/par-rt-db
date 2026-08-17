@@ -13,6 +13,11 @@ contract against Convex.
 
 ## [Unreleased]
 
+> **Versioning note:** no release has been tagged yet — everything below is
+> unreleased. The eventual `0.1.0` cut is tracked as enhancement ENH-026; the
+> dated subsections below are chronological within `[Unreleased]`, not released
+> versions.
+
 ### Security: non-zero per-IP rate-limit defaults (SEC-203)
 
 Code defaults change from 0 (off) to: `RTDB_ADMIN_RATE_LIMIT_PER_IP_RPM`
