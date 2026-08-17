@@ -18,7 +18,7 @@ import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol, overload
 
 from pydantic import TypeAdapter
 
@@ -626,44 +626,52 @@ class RtDbClient:
     async def schedule(self, txn: Transaction, when: ScheduleWhen) -> str:
         """Schedule ``txn`` to run at ``when`` (a one-shot deadline or a cron
         expression). Returns the new schedule's id."""
-        return await self._sched_op("schedule", txn=txn, when=when)  # type: ignore[return-value]
+        return await self._sched_op("schedule", txn=txn, when=when)
 
     async def cancel_schedule(self, id: str) -> bool:
         """Cancel the scheduled job with ``id``. ``True`` when a pending job
         was cancelled; ``False`` when it was missing or already terminal."""
-        return await self._sched_op("cancel", id=id)  # type: ignore[return-value]
+        return await self._sched_op("cancel", id=id)
 
     async def pause_schedule(self, id: str) -> bool:
         """Pause the scheduled job with ``id`` (resumed via
         :meth:`resume_schedule`). ``False`` when the id was unknown."""
-        return await self._sched_op("pause", id=id)  # type: ignore[return-value]
+        return await self._sched_op("pause", id=id)
 
     async def resume_schedule(self, id: str) -> bool:
         """Resume a previously paused scheduled job by ``id``. ``False`` when
         the id was unknown."""
-        return await self._sched_op("resume", id=id)  # type: ignore[return-value]
+        return await self._sched_op("resume", id=id)
 
     async def list_schedules(self) -> list[ScheduleInfo]:
         """List the scheduled jobs on this database."""
-        return await self._sched_op("list")  # type: ignore[return-value]
+        return await self._sched_op("list")
 
     # --- workflows (FM-29) ---------------------------------------------
 
     async def start_workflow(self, spec: WorkflowSpec) -> WorkflowInfo:
         """Start a workflow run from ``spec``. Returns the inserted run's info
         projection (pending, step 0)."""
-        return await self._wf_op("start", spec=spec)  # type: ignore[return-value]
+        return await self._wf_op("start", spec=spec)
 
     async def cancel_workflow(self, id: str) -> bool:
         """Cancel the workflow run ``id``. ``True`` when a pending/running run
         was cancelled; ``False`` when it was missing or already terminal."""
-        return await self._wf_op("cancel", id=id)  # type: ignore[return-value]
+        return await self._wf_op("cancel", id=id)
 
     async def list_workflows(self, status: WorkflowStatus | None = None) -> list[WorkflowInfo]:
         """List workflow runs on this database, newest first. ``status``
         filters to that lifecycle state."""
-        return await self._wf_op("list", status=status)  # type: ignore[return-value]
+        return await self._wf_op("list", status=status)
 
+    @overload
+    async def _wf_op(self, kind: Literal["start"], *, spec: WorkflowSpec) -> WorkflowInfo: ...
+    @overload
+    async def _wf_op(self, kind: Literal["cancel"], *, id: str) -> bool: ...
+    @overload
+    async def _wf_op(
+        self, kind: Literal["list"], *, status: WorkflowStatus | None = ...
+    ) -> list[WorkflowInfo]: ...
     async def _wf_op(self, kind: str, **fields: Any) -> Any:
         self._counter += 1
         wid = f"wf-{self._counter}"
@@ -673,6 +681,14 @@ class RtDbClient:
         await self._dispatch_send(wid, self._pending_wf)
         return await fut
 
+    @overload
+    async def _sched_op(
+        self, kind: Literal["schedule"], *, txn: Transaction, when: ScheduleWhen
+    ) -> str: ...
+    @overload
+    async def _sched_op(self, kind: Literal["cancel", "pause", "resume"], *, id: str) -> bool: ...
+    @overload
+    async def _sched_op(self, kind: Literal["list"]) -> list[ScheduleInfo]: ...
     async def _sched_op(self, kind: str, **fields: Any) -> Any:
         self._counter += 1
         sid = f"sch-{self._counter}"

@@ -92,7 +92,7 @@ class Query(BaseModel):
     hybrid_search: HybridSearchQuery | None = Field(default=None, alias="hybridSearch")
     paginate: _Paginate | None = None
 
-    def model_dump(self, **kw: Any) -> dict[str, Any]:  # type: ignore[override]
+    def model_dump(self, **kw: Any) -> dict[str, Any]:
         out = super().model_dump(**kw)
         # Drop Nones to match the server's all-optional, omit-when-absent shape.
         return {k: v for k, v in out.items() if v is not None}

@@ -1105,7 +1105,7 @@ def test_webhook_delivery_model_validate_last_error_null() -> None:
     assert d.attempts == 1
     assert d.status == "delivered"
     assert d.last_error is None
-    assert d.payload["docId"] == "i1"  # type: ignore[index]
+    assert d.payload["docId"] == "i1"
 
 
 def test_webhook_delivery_model_validate_failed_with_error_and_opaque_payload() -> None:
