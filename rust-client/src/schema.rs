@@ -315,7 +315,7 @@ fn is_false(b: &bool) -> bool {
 
 /// Declarative document TTL (auto-expiry). `field` names a declared numeric
 /// field whose value is each document's absolute epoch-ms expiry; the in-memory
-/// harness's [`crate::in_memory::InMemoryRtDbClient::tick`] reaps rows whose
+/// harness's `InMemoryRtDbClient::tick` (feature `in_memory`) reaps rows whose
 /// value is in the past (mirroring the live server's per-db reaper).
 /// `default_duration_ms` stamps the field at insert time when the caller omits
 /// it. Mirrors `server/src/schema.rs::TtlDef` byte-for-byte (camelCase wire).

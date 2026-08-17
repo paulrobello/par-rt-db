@@ -408,7 +408,7 @@ impl RtDbHttpClient {
     /// Cancel a scheduled job (`POST /api/schedule/{id}/cancel`). Resolves
     /// `true` on `{ok:true}`; resolves `false` on `{ok:false}` (unknown or
     /// already-terminal id — a no-op, not a failure, matching the WS ack
-    /// contract of [`RtDbClient::cancel_schedule`](crate::ws::RtDbClient::cancel_schedule));
+    /// contract of `RtDbClient::cancel_schedule` (feature `ws`));
     /// rejects with [`RtDbError`] on a non-2xx error envelope.
     pub async fn cancel_schedule(&self, id: &str) -> Result<bool, RtDbError> {
         self.manage_schedule(id, "cancel").await
