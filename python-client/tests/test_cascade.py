@@ -16,7 +16,6 @@ import pytest
 from pydantic import TypeAdapter
 
 from par_rt_db import Mutation, TableQuery
-from par_rt_db import in_memory as im
 from par_rt_db.errors import ErrorCode, RtDbError
 from par_rt_db.in_memory import InMemoryRtDbClient, InMemoryRtDbClientOptions
 from par_rt_db.schema import Schema, SchemaDef
@@ -249,7 +248,7 @@ def test_self_reference_cycle_guard_terminates() -> None:
 def test_cascade_budget_conflict(monkeypatch: pytest.MonkeyPatch) -> None:
     """MAX_CASCADE_ROWS bounds rows per initiating delete step (shared across a
     deleteByQuery); over-budget raises CONFLICT and rolls the whole txn back."""
-    monkeypatch.setattr(im, "MAX_CASCADE_ROWS", 3)
+    monkeypatch.setattr("par_rt_db.in_memory.store.MAX_CASCADE_ROWS", 3)
     schema = _schema(
         {
             "parents": _USERS,
