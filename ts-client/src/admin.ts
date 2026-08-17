@@ -6,15 +6,15 @@ import type {
   MigrateResultJson,
   QueryJson,
   ScheduleInfo,
-  WorkflowInfo,
-  WorkflowInfoFull,
-  WorkflowSpec,
-  WorkflowStatus,
   ScheduleWhen,
   SchemaHistoryEntry,
   SchemaHistoryEntrySummary,
   SchemaJson,
   TransactionJson,
+  WorkflowInfo,
+  WorkflowInfoFull,
+  WorkflowSpec,
+  WorkflowStatus,
 } from "./protocol.js";
 import type { RtQuery } from "./query.js";
 import type { SchemaDefinition } from "./schema.js";
@@ -567,6 +567,26 @@ export class RtDbAdminClient {
     return (body as { emails: string[] }).emails;
   }
 
+  /** Whether `db` has opted in to anonymous principal access
+   *  (GET /admin/db/{db}/anonymous-access, SEC-103). Reports only the per-db
+   *  flag; the instance-wide boot gate `RTDB_AUTH_ANONYMOUS_ENABLED` is a
+   *  boot-time config and is not reflected here. */
+  async getAnonymousAccess(db: string): Promise<{ enabled: boolean }> {
+    return (await this.request("GET", `/admin/db/${encodeURIComponent(db)}/anonymous-access`)) as {
+      enabled: boolean;
+    };
+  }
+
+  /** Opt `db` in to (or out of) anonymous principal access
+   *  (PATCH /admin/db/{db}/anonymous-access, SEC-103). The instance-wide boot
+   *  gate must also be on for anon minting to work; this per-db flag is the
+   *  additional gate checked at `authorize`. */
+  async setAnonymousAccess(db: string, enabled: boolean): Promise<void> {
+    await this.request("PATCH", `/admin/db/${encodeURIComponent(db)}/anonymous-access`, {
+      enabled,
+    });
+  }
+
   /** Cookie-session login (POST /admin/login). Sets the server's HttpOnly `rtdb_session`
    *  cookie on 204. A browser auto-attaches the cookie thereafter; a Node caller must wire
    *  its own cookie jar onto the injected `fetch` to reuse the session. */
@@ -756,17 +776,31 @@ export class RtDbAdminClient {
     return body as SubscriptionsResponse;
   }
 
-  /** Owner-bypass document read (POST /admin/db/{db}/query). Admin sees every row regardless
-   *  of per-row ownerField. Body and result shapes match /api/query. Accepts either a typed
-   *  `RtQuery<R>` builder (result typed as `R`) or a raw `QueryJson` (result typed as `unknown`,
-   *  for callers like the dashboard that construct the DSL directly). */
-  async adminQuery<R>(db: string, query: RtQuery<R>): Promise<R>;
-  async adminQuery(db: string, query: QueryJson): Promise<unknown>;
-  async adminQuery(db: string, query: RtQuery<unknown> | QueryJson): Promise<unknown> {
+  /** Options for `adminQuery`. `includeDeleted` is an internal admin-route param
+   *  (NOT a wire `Query` field): `true` also returns soft-deleted rows — rows a
+   *  `softDelete` table stamped with `deleted_at` (FM-33) — so operators can see
+   *  them in the data browser. Omitted/false keeps the live-rows-only default. */
+  async adminQuery<R>(
+    db: string,
+    query: RtQuery<R>,
+    opts?: { includeDeleted?: boolean },
+  ): Promise<R>;
+  async adminQuery(
+    db: string,
+    query: QueryJson,
+    opts?: { includeDeleted?: boolean },
+  ): Promise<unknown>;
+  async adminQuery(
+    db: string,
+    query: RtQuery<unknown> | QueryJson,
+    opts?: { includeDeleted?: boolean },
+  ): Promise<unknown> {
     const json = "json" in query ? query.json : query;
-    const body = await this.request("POST", `/admin/db/${encodeURIComponent(db)}/query`, {
-      query: json,
-    });
+    const payload: { query: QueryJson; includeDeleted?: boolean } = { query: json };
+    if (opts?.includeDeleted) {
+      payload.includeDeleted = true;
+    }
+    const body = await this.request("POST", `/admin/db/${encodeURIComponent(db)}/query`, payload);
     return (body as { result: unknown }).result;
   }
 

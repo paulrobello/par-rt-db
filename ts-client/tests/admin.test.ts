@@ -374,6 +374,25 @@ describe("RtDbAdminClient — new endpoints", () => {
     expect(JSON.parse(init.body)).toEqual({ query: { table: "items" } });
   });
 
+  it("adminQuery includeDeleted:true adds the internal param; omitted keeps the body lean", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse({ result: [{ _id: "a", deleted_at: 1 }] }))
+      .mockResolvedValueOnce(jsonResponse({ result: [{ _id: "b" }] }));
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+    const q = { json: { table: "items" } };
+    await expect(admin.adminQuery("kanban", q, { includeDeleted: true })).resolves.toEqual([
+      { _id: "a", deleted_at: 1 },
+    ]);
+    await expect(admin.adminQuery("kanban", q)).resolves.toEqual([{ _id: "b" }]);
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({
+      query: { table: "items" },
+      includeDeleted: true,
+    });
+    // Default call: the param is absent entirely (wire shape unchanged).
+    expect(JSON.parse(fetchMock.mock.calls[1][1].body)).toEqual({ query: { table: "items" } });
+  });
+
   it("adminMutate POSTs {txn, idempotencyKey?} to /admin/db/{db}/mutate and unwraps {results}", async () => {
     const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ results: ["new-id"] }));
     const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
@@ -1169,6 +1188,28 @@ describe("RtDbAdminClient sessions", () => {
     expect(url).toBe("http://h:8300/admin/sessions?user=u1");
     expect(init.method).toBe("DELETE");
     expect(init.headers.Authorization).toBe("Bearer k");
+  });
+});
+
+describe("RtDbAdminClient anonymous access (SEC-103)", () => {
+  it("getAnonymousAccess GETs /admin/db/{db}/anonymous-access and unwraps {enabled}", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ enabled: true }));
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+    await expect(admin.getAnonymousAccess("kanban")).resolves.toEqual({ enabled: true });
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("http://h:8300/admin/db/kanban/anonymous-access");
+    expect(init.method).toBe("GET");
+    expect(init.headers.Authorization).toBe("Bearer k");
+  });
+
+  it("setAnonymousAccess PATCHes {enabled} and resolves void on {ok:true}", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ ok: true }));
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+    await expect(admin.setAnonymousAccess("kanban", false)).resolves.toBeUndefined();
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("http://h:8300/admin/db/kanban/anonymous-access");
+    expect(init.method).toBe("PATCH");
+    expect(JSON.parse(init.body)).toEqual({ enabled: false });
   });
 });
 
