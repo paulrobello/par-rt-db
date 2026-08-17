@@ -2,9 +2,9 @@
 
 A small operator CLI for [par-rt-db](../README.md), wrapping
 [`par-rt-db-client`](../rust-client) for CI and admin workflows against a running
-instance: list/create databases, push schema, query/mutate, mint/revoke tokens,
-run schema migrations, and observe/cancel durable workflow runs. Cargo binary
-name `rtdb`.
+instance: list/create/clone databases, push schema, query/mutate, mint/revoke
+tokens, manage sessions, run schema migrations, and observe/cancel durable
+workflow runs. Cargo binary name `rtdb`.
 
 ## Install
 
@@ -24,12 +24,79 @@ rtdb --url https://rtdb.pardev.net --db kanban --token $RTDB_TOKEN query '{"tabl
 ```
 
 `@<path>` reads a JSON argument from a file; otherwise the argument is parsed as
-JSON inline. `--url` defaults to `http://127.0.0.1:8300`; `--db` selects the
-target database for data (query/mutate) commands; `--token` is a per-db machine
-token and `--admin-key` is the boot `RTDB_ADMIN_KEY` for admin commands. Both
-credential flags read from the `RTDB_TOKEN` / `RTDB_ADMIN_KEY` env vars first —
-that is the preferred path, since flag values are visible in `ps` output and
-shell history (the CLI prints a warning when it sees them on the command line).
+JSON inline. `--url` is **required** (there is no default) and falls back to the
+`RTDB_URL` env var; `--db` selects the target database for data
+(query/mutate) commands; `--token` is a per-db machine token and `--admin-key`
+is the boot `RTDB_ADMIN_KEY` for admin commands.
+
+## Configuration
+
+Every flag has an environment-variable fallback — the preferred path, since
+flag values are visible in `ps` output and shell history (SEC-204; the CLI
+prints a warning when it sees a credential on the command line):
+
+| Env var | Flag | Used by |
+| --- | --- | --- |
+| `RTDB_URL` | `--url` | Every command (required — no default). |
+| `RTDB_DB` | `--db` | `query`, `mutate`, `push-schema`, `migrate`, `explain`, `workflows`. |
+| `RTDB_TOKEN` | `--token` | `query` / `mutate` (machine token). |
+| `RTDB_ADMIN_KEY` | `--admin-key` | Every admin subcommand. |
+
+## Commands
+
+`rtdb --help` (authoritative output, kept in sync with the CLI's argument
+definitions):
+
+```text
+Operator + CI CLI for par-rt-db
+
+Usage: rtdb [OPTIONS] --url <URL> <COMMAND>
+
+Commands:
+  list-dbs      List every database on the instance. (admin)
+  create-db     Create a new database. (admin)
+  clone-db      Clone a database (schema + documents) into a new one. (admin)
+  push-schema   Push a SchemaDef JSON file to `--db`. (admin)
+  mint-token    Mint a machine token for a database. (admin)
+  revoke-token  Revoke a machine token by id. (admin)
+  sessions      Manage active interactive sessions. (admin)
+  merge-users   Merge an anonymous user into a real one, synchronously. (admin)
+  query         Run a Query JSON against `--db` and print the result. (machine token)
+  mutate        Run a Transaction JSON against `--db` and print step results. (machine token)
+  migrate       Apply (or preview with `--dry-run`) a migration directives JSON file to `--db`. (admin)
+  explain       Explain a Query's compiled SQL against `--db` without running it. (admin)
+  slow-queries  List recent slow queries across the instance. (admin)
+  workflows     Manage durable workflow runs in `--db`. (admin)
+  help          Print this message or the help of the given subcommand(s)
+
+Options:
+      --url <URL>              Server base URL (e.g. https://rtdb.pardev.net). [env: RTDB_URL=]
+      --db <DB>                Database name — used by `query`, `mutate`, and `push-schema`. [env: RTDB_DB=]
+      --token <TOKEN>          Machine token for `query` / `mutate`. [env: RTDB_TOKEN]
+      --admin-key <ADMIN_KEY>  Instance admin key — bearer for every admin subcommand. [env: RTDB_ADMIN_KEY]
+  -h, --help                   Print help
+  -V, --version                Print version
+```
+
+Per-command notes:
+
+| Command | Auth | Shape |
+| --- | --- | --- |
+| `list-dbs` | admin | Lists every database on the instance. |
+| `create-db <NAME>` | admin | Creates a new database. |
+| `clone-db <FROM> <TO>` | admin | Clones schema + documents; `TO` must not already exist. |
+| `push-schema <FILE>` | admin | Pushes a `SchemaDef` JSON file (additive) to `--db`. |
+| `mint-token <DB> <NAME>` | admin | Mints a machine token; prints `{tokenId, token}` — the plaintext token is shown once. |
+| `revoke-token <ID>` | admin | Revokes a machine token by id (`tok_…`). |
+| `sessions list [--user] [--limit]` | admin | Active interactive sessions, newest-first; `--user` filters by id or email, `--limit` caps (server default 200). |
+| `sessions revoke (--token-hash \| --user)` | admin | Revokes one session by sha256 token hash, or every session for a user (mutually exclusive flags). |
+| `merge-users --anon --real --confirm` | admin | Merges an anonymous user into a real one synchronously; `--confirm` must equal `--real`. |
+| `query <QUERY>` | machine token | Runs a Query JSON (or `@file`) against `--db`, prints the result. |
+| `mutate <TXN>` | machine token | Runs a Transaction JSON (or `@file`), prints step results. |
+| `migrate [--dry-run] <FILE>` | admin | See [Schema migration](#schema-migration-rtdb-migrate) below. |
+| `explain <QUERY>` | admin | Prints the compiled SQL + bind params for a Query JSON against `--db` — no rows. |
+| `slow-queries [--db] [--limit]` | admin | Recent slow queries across the instance (from the server's bounded ring). |
+| `workflows <sub>` | admin | See [Workflow runs](#workflow-runs-rtdb-workflows) below. |
 
 ## Schema migration (`rtdb migrate`)
 
