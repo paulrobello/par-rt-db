@@ -93,6 +93,29 @@ impl RtDbAdminClient {
         self.expect_ok(resp).await
     }
 
+    /// `POST /admin/db/{db}/schema/preview` `{schema}` → `SchemaPreviewDiff`.
+    /// Pure/advisory — validates the pending schema and diffs it against the
+    /// currently-applied one WITHOUT applying anything: `added` lists every new
+    /// table/column/index an additive-only push would create, `rejected` lists
+    /// every drop or type change the DDL layer would refuse (`push_schema`
+    /// remains the authoritative gate). Same body shape as
+    /// [`push_schema`](Self::push_schema) minus the `db` key (it rides the
+    /// path). Mirrors `ts-client`'s `previewSchema` one-to-one.
+    pub async fn preview_schema(
+        &self,
+        db: &str,
+        schema: &crate::schema::SchemaDef,
+    ) -> Result<crate::wire::admin::SchemaPreviewDiff, RtDbError> {
+        let resp = self
+            .post_json(
+                &format!("/admin/db/{db}/schema/preview"),
+                &crate::wire::admin::PreviewSchemaRequest { schema },
+            )
+            .await?;
+        self.deserialize::<crate::wire::admin::SchemaPreviewDiff>(resp)
+            .await
+    }
+
     /// `POST /admin/db/{db}/migrate` `{directives, dryRun}` → `MigrateResult`.
     /// Apply (when `dry_run` is false) or preview (when `dry_run` is true) a
     /// declarative schema migration. The server validates and folds the
@@ -473,22 +496,38 @@ impl RtDbAdminClient {
         Ok(self.get_json::<Resp>("/admin/ops/recent", &q).await?.ops)
     }
 
-    /// `POST /admin/db/{db}/query` `{query}` → `{result}`. Owner-bypass: an
-    /// admin reads documents across every database regardless of `ownerField`.
-    /// Mirrors [`run`](Self::run) but routes through the admin path with `db`
-    /// in the URL (singular `db`, not the plural `dbs` of `get_schema`), so the
-    /// body omits `db`. Deserialize `{result}` into `T` the same way `run` does.
+    /// `POST /admin/db/{db}/query` `{query, includeDeleted?}` → `{result}`.
+    /// Owner-bypass: an admin reads documents across every database regardless
+    /// of `ownerField`. Mirrors [`run`](Self::run) but routes through the admin
+    /// path with `db` in the URL (singular `db`, not the plural `dbs` of
+    /// `get_schema`), so the body omits `db`. Deserialize `{result}` into `T`
+    /// the same way `run` does.
+    ///
+    /// `include_deleted` is an internal admin-route parameter, NOT a wire
+    /// `Query` field: `Some(true)` surfaces soft-deleted (FM-33 `deleted_at`)
+    /// rows so an operator can see them; `None` (the default) omits the key
+    /// entirely so the server's live-rows-only default applies.
     pub async fn admin_query<T: DeserializeOwned>(
         &self,
         db: &str,
         query: &crate::query::Query,
+        include_deleted: Option<bool>,
     ) -> Result<T, RtDbError> {
         #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
         struct Body<'a> {
             query: &'a crate::query::Query,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            include_deleted: Option<bool>,
         }
         let resp = self
-            .post_json(&format!("/admin/db/{}/query", db), &Body { query })
+            .post_json(
+                &format!("/admin/db/{}/query", db),
+                &Body {
+                    query,
+                    include_deleted,
+                },
+            )
             .await?;
         self.json_result::<T>(resp).await
     }
@@ -973,6 +1012,203 @@ impl RtDbAdminClient {
             .map_err(|e| RtDbError::internal(format!("delete_workflow request failed: {e}")))?;
         let parsed: crate::wire::admin::OkResponse = self.deserialize(resp).await?;
         Ok(parsed.ok)
+    }
+
+    // ── Admin schedule management
+    //     (GET|POST /admin/db/{db}/schedules,
+    //      POST /admin/db/{db}/schedules/{id}/cancel|pause|resume) ───────────
+    //
+    // Mirror `ts-client`'s `adminListSchedules`/`adminCreateSchedule`/
+    // `adminCancelSchedule`/`adminPauseSchedule`/`adminResumeSchedule`
+    // one-to-one — paths, bodies, and return shapes are identical; only the
+    // method names are snake_cased. Reuses the wire `ScheduleInfo`/
+    // `ScheduleWhen` and the DSL `Transaction` types the client already
+    // carries.
+
+    /// `GET /admin/db/{db}/schedules` → `{schedules:[...]}`. Lists every
+    /// pending and in-flight scheduled job for the database (the admin view
+    /// spans all principals).
+    pub async fn list_schedules(
+        &self,
+        db: &str,
+    ) -> Result<Vec<crate::wire::ScheduleInfo>, RtDbError> {
+        #[derive(serde::Deserialize)]
+        struct Resp {
+            schedules: Vec<crate::wire::ScheduleInfo>,
+        }
+        Ok(self
+            .get_json::<Resp>(&format!("/admin/db/{db}/schedules"), &[])
+            .await?
+            .schedules)
+    }
+
+    /// `POST /admin/db/{db}/schedules` `{when, txn}` → `{id}`. Registers a
+    /// scheduled job through the admin surface (the same enqueue the
+    /// `Schedule` mutation step and the WS `schedule` frame use). Returns the
+    /// new job's server-assigned id.
+    pub async fn create_schedule(
+        &self,
+        db: &str,
+        when: crate::wire::ScheduleWhen,
+        txn: &Transaction,
+    ) -> Result<String, RtDbError> {
+        #[derive(Serialize)]
+        struct Body<'a> {
+            when: crate::wire::ScheduleWhen,
+            txn: &'a Transaction,
+        }
+        #[derive(serde::Deserialize)]
+        struct Resp {
+            id: String,
+        }
+        let resp = self
+            .post_json(&format!("/admin/db/{db}/schedules"), &Body { when, txn })
+            .await?;
+        Ok(self.deserialize::<Resp>(resp).await?.id)
+    }
+
+    /// `POST /admin/db/{db}/schedules/{id}/cancel` → `{ok}`. `Ok(false)` = an
+    /// unknown or already-fired id (a no-op, not an error).
+    pub async fn cancel_schedule(&self, db: &str, id: &str) -> Result<bool, RtDbError> {
+        self.manage_schedule(db, id, "cancel").await
+    }
+
+    /// `POST /admin/db/{db}/schedules/{id}/pause` → `{ok}`. `Ok(false)` = an
+    /// unknown or non-pausable id (a no-op, not an error).
+    pub async fn pause_schedule(&self, db: &str, id: &str) -> Result<bool, RtDbError> {
+        self.manage_schedule(db, id, "pause").await
+    }
+
+    /// `POST /admin/db/{db}/schedules/{id}/resume` → `{ok}`. `Ok(false)` = an
+    /// unknown or non-paused id (a no-op, not an error).
+    pub async fn resume_schedule(&self, db: &str, id: &str) -> Result<bool, RtDbError> {
+        self.manage_schedule(db, id, "resume").await
+    }
+
+    // Shared bodyless-POST helper for the three manage ops (`cancel`/`pause`/
+    // `resume`) — the server's manage endpoints take the id + op from the
+    // path and no body, and ack `{ok: bool}` where `ok=false` means "unknown
+    // or terminal id" (a no-op). `op` is only ever one of the three literals
+    // above, each a path segment the server routes on.
+    async fn manage_schedule(
+        &self,
+        db: &str,
+        id: &str,
+        op: &'static str,
+    ) -> Result<bool, RtDbError> {
+        let resp = self
+            .client
+            .post(format!("{}/admin/db/{db}/schedules/{id}/{op}", self.url))
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(|e| RtDbError::internal(format!("manage_schedule request failed: {e}")))?;
+        let parsed: crate::wire::admin::OkResponse = self.deserialize(resp).await?;
+        Ok(parsed.ok)
+    }
+
+    // ── Admin file storage
+    //     (GET|POST /admin/db/{db}/storage, DELETE /admin/db/{db}/storage/{id}) ──
+    //
+    // Mirror `ts-client`'s `adminListFiles`/`adminUploadFile`/`adminDeleteFile`
+    // one-to-one — same paths, same raw-byte upload body, same `{files}`/`{id}`/
+    // `{ok}` response shapes; only the method names are snake_cased. Reuses
+    // `FileMetadata` from `http` (admin implies http).
+
+    /// `GET /admin/db/{db}/storage` → `{files:[...]}`. Lists every blob the
+    /// database owns (the admin view spans all principals).
+    pub async fn list_files(&self, db: &str) -> Result<Vec<crate::http::FileMetadata>, RtDbError> {
+        #[derive(serde::Deserialize)]
+        struct Resp {
+            files: Vec<crate::http::FileMetadata>,
+        }
+        Ok(self
+            .get_json::<Resp>(&format!("/admin/db/{db}/storage"), &[])
+            .await?
+            .files)
+    }
+
+    /// `POST /admin/db/{db}/storage` with the RAW bytes as the body (not
+    /// JSON) → `{id}`. `content_type` sets the `Content-Type` header; when
+    /// `None` no header is sent and the server stores the blob untyped.
+    /// Returns the new blob's server-assigned id.
+    pub async fn upload_file(
+        &self,
+        db: &str,
+        bytes: &[u8],
+        content_type: Option<&str>,
+    ) -> Result<String, RtDbError> {
+        #[derive(serde::Deserialize)]
+        struct Resp {
+            id: String,
+        }
+        let mut req = self
+            .client
+            .post(format!("{}/admin/db/{db}/storage", self.url))
+            .bearer_auth(&self.token)
+            .body(bytes.to_vec());
+        if let Some(ct) = content_type {
+            req = req.header(reqwest::header::CONTENT_TYPE, ct);
+        }
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| RtDbError::internal(format!("upload_file request failed: {e}")))?;
+        Ok(self.deserialize::<Resp>(resp).await?.id)
+    }
+
+    /// `DELETE /admin/db/{db}/storage/{id}` → `{ok:true}`. Idempotent — the
+    /// server acks ok even when the blob is already gone.
+    pub async fn delete_file(&self, db: &str, id: &str) -> Result<(), RtDbError> {
+        let resp = self
+            .client
+            .delete(format!("{}/admin/db/{db}/storage/{id}", self.url))
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(|e| RtDbError::internal(format!("delete_file request failed: {e}")))?;
+        self.expect_ok(resp).await
+    }
+
+    // ── Anonymous-access toggle (SEC-103:
+    //     GET|PATCH /admin/db/{db}/anonymous-access) ───────────────────────────
+    //
+    // Mirror `ts-client`'s `getAnonymousAccess`/`setAnonymousAccess`
+    // one-to-one — same paths and `{enabled}` shapes; only the method names
+    // are snake_cased.
+
+    /// `GET /admin/db/{db}/anonymous-access` → `{enabled: bool}`. This is the
+    /// per-database flag only — the instance-wide
+    /// `RTDB_AUTH_ANONYMOUS_ENABLED` boot gate is separate and always applies
+    /// on top (both must allow for an anonymous sign-in to succeed).
+    pub async fn get_anonymous_access(&self, db: &str) -> Result<bool, RtDbError> {
+        #[derive(serde::Deserialize)]
+        struct Resp {
+            enabled: bool,
+        }
+        Ok(self
+            .get_json::<Resp>(&format!("/admin/db/{db}/anonymous-access"), &[])
+            .await?
+            .enabled)
+    }
+
+    /// `PATCH /admin/db/{db}/anonymous-access` `{enabled}` → `{ok:true}`.
+    /// Flips the per-database anonymous-access flag; the instance-wide
+    /// `RTDB_AUTH_ANONYMOUS_ENABLED` boot gate is separate (see
+    /// [`get_anonymous_access`](Self::get_anonymous_access)). A `not_found`
+    /// error means the database is not registered.
+    pub async fn set_anonymous_access(&self, db: &str, enabled: bool) -> Result<(), RtDbError> {
+        #[derive(Serialize)]
+        struct Body {
+            enabled: bool,
+        }
+        let resp = self
+            .patch_json(
+                &format!("/admin/db/{db}/anonymous-access"),
+                &Body { enabled },
+            )
+            .await?;
+        self.expect_ok(resp).await
     }
 
     async fn post_json<Req: Serialize>(
@@ -1995,7 +2231,7 @@ mod admin_tests {
             .mount(&server)
             .await;
         let q = TableQuery::new("items").take(2);
-        let got: Vec<Value> = client.admin_query("kanban", &q).await.unwrap();
+        let got: Vec<Value> = client.admin_query("kanban", &q, None).await.unwrap();
         assert_eq!(got.len(), 2);
         // `db` rides in the path, not the body
         let body: Value =
@@ -2004,6 +2240,37 @@ mod admin_tests {
             body.get("db").is_none(),
             "admin_query body must not carry db: {body}"
         );
+        assert!(
+            body.get("query").is_some(),
+            "admin_query body must carry query: {body}"
+        );
+        // includeDeleted omitted when None (the default) — never `null`.
+        assert!(
+            body.get("includeDeleted").is_none(),
+            "admin_query must omit includeDeleted when None: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_query_includes_include_deleted_when_some() {
+        // Mirrors the ts-client pair test: `includeDeleted: true` rides the
+        // body when `Some(true)`, and the key stays absent when `None`.
+        let (server, client) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/admin/db/kanban/query"))
+            .and(header("authorization", BEARER))
+            .and(body_partial_json(json!({"includeDeleted": true})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "result": [{"_id": "a", "deleted_at": 5}]
+            })))
+            .mount(&server)
+            .await;
+        let q = TableQuery::new("items").take(1);
+        let got: Vec<Value> = client.admin_query("kanban", &q, Some(true)).await.unwrap();
+        assert_eq!(got.len(), 1);
+        let body: Value =
+            serde_json::from_slice(&server.received_requests().await.unwrap()[0].body).unwrap();
+        assert_eq!(body.get("includeDeleted"), Some(&json!(true)));
         assert!(
             body.get("query").is_some(),
             "admin_query body must carry query: {body}"
@@ -3278,5 +3545,300 @@ mod admin_tests {
             .await;
         client.cancel_workflow("kanban", "wf-1").await.unwrap();
         client.delete_workflow("kanban", "wf-1").await.unwrap();
+    }
+
+    // ── Schema preview (mirror ts-client admin.test.ts previewSchema) ────────
+
+    #[tokio::test]
+    async fn preview_schema_posts_schema_and_parses_diff() {
+        let (server, client) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/admin/db/kanban/schema/preview"))
+            .and(header("authorization", BEARER))
+            .and(body_partial_json(json!({
+                "schema": {"tables": {"notes": {"fields": {"body": {"type": "string"}}}}}
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "added": [
+                    {
+                        "table": "notes",
+                        "columns": [{"name": "body", "fieldType": "string"}],
+                        "indexes": [{"name": "by_body", "fields": ["body"]}]
+                    }
+                ],
+                "rejected": [
+                    {"table": "old", "item": "gone", "reason": "drop not allowed"}
+                ]
+            })))
+            .mount(&server)
+            .await;
+        let schema = SchemaDef::builder()
+            .table("notes", Table::new().field("body", FieldType::String))
+            .build();
+        let diff = client.preview_schema("kanban", &schema).await.unwrap();
+        assert_eq!(diff.added.len(), 1);
+        assert_eq!(diff.added[0].table, "notes");
+        assert_eq!(diff.added[0].columns.len(), 1);
+        assert_eq!(diff.added[0].columns[0].name, "body");
+        assert_eq!(diff.added[0].columns[0].field_type, "string");
+        assert_eq!(diff.added[0].indexes.len(), 1);
+        assert_eq!(diff.added[0].indexes[0].name, "by_body");
+        assert_eq!(diff.added[0].indexes[0].fields, vec!["body".to_string()]);
+        assert_eq!(diff.rejected.len(), 1);
+        assert_eq!(diff.rejected[0].table, "old");
+        assert_eq!(diff.rejected[0].item, "gone");
+        assert_eq!(diff.rejected[0].reason, "drop not allowed");
+    }
+
+    #[tokio::test]
+    async fn preview_schema_surfaces_invalid_schema_envelope() {
+        // Pure/advisory does not mean unvalidated: a malformed schema is a 400
+        // BEFORE any diff is computed, and the envelope surfaces as RtDbError.
+        let (server, client) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/admin/db/kanban/schema/preview"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "code": "BAD_REQUEST",
+                "message": "invalid schema: table name empty"
+            })))
+            .mount(&server)
+            .await;
+        let err = client
+            .preview_schema("kanban", &SchemaDef::builder().build())
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::BadRequest);
+        assert_eq!(err.message, "invalid schema: table name empty");
+    }
+
+    // ── Admin schedules (mirror ts-client admin.test.ts schedule suite) ─────
+
+    #[tokio::test]
+    async fn list_schedules_returns_rows() {
+        let (server, client) = setup().await;
+        Mock::given(method("GET"))
+            .and(path("/admin/db/kanban/schedules"))
+            .and(header("authorization", BEARER))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "schedules": [
+                    {"id":"s1","kind":"oneshot","dueAt":100,"status":"pending",
+                     "createdAt":10,"firedCount":0},
+                    {"id":"s2","kind":"cron","dueAt":200,"cron":"*/5 * * * *",
+                     "status":"paused","lastError":"boom","createdAt":20,"firedCount":3}
+                ]
+            })))
+            .mount(&server)
+            .await;
+        let rows = client.list_schedules("kanban").await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].id, "s1");
+        assert_eq!(rows[0].kind, crate::wire::ScheduleKind::Oneshot);
+        assert_eq!(rows[0].status, crate::wire::ScheduleStatus::Pending);
+        assert_eq!(rows[0].cron, None);
+        assert_eq!(rows[0].last_error, None);
+        assert_eq!(rows[1].id, "s2");
+        assert_eq!(rows[1].kind, crate::wire::ScheduleKind::Cron);
+        assert_eq!(rows[1].cron.as_deref(), Some("*/5 * * * *"));
+        assert_eq!(rows[1].status, crate::wire::ScheduleStatus::Paused);
+        assert_eq!(rows[1].last_error.as_deref(), Some("boom"));
+        assert_eq!(rows[1].fired_count, 3);
+    }
+
+    #[tokio::test]
+    async fn create_schedule_posts_when_and_txn_returns_id() {
+        let (server, client) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/admin/db/kanban/schedules"))
+            .and(header("authorization", BEARER))
+            .and(body_partial_json(json!({
+                "when": {"type": "afterMs", "ms": 5000},
+                "txn": {"steps": [{"op": "insert", "table": "notes", "doc": {"body": "hi"}}]}
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": "sch-9"})))
+            .mount(&server)
+            .await;
+        let txn = Mutation::new()
+            .insert("notes", json!({"body": "hi"}))
+            .build();
+        let id = client
+            .create_schedule(
+                "kanban",
+                crate::wire::ScheduleWhen::AfterMs { ms: 5000 },
+                &txn,
+            )
+            .await
+            .unwrap();
+        assert_eq!(id, "sch-9");
+    }
+
+    #[tokio::test]
+    async fn manage_schedules_hit_their_paths() {
+        // Mirrors `admin_cancel_and_delete_workflow_hit_their_paths`: the three
+        // manage ops POST their path segments with no body and return the ack.
+        let (server, client) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/admin/db/kanban/schedules/sch-1/cancel"))
+            .and(header("authorization", BEARER))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/admin/db/kanban/schedules/sch-1/pause"))
+            .and(header("authorization", BEARER))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/admin/db/kanban/schedules/sch-1/resume"))
+            .and(header("authorization", BEARER))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+            .mount(&server)
+            .await;
+        assert!(client.cancel_schedule("kanban", "sch-1").await.unwrap());
+        assert!(client.pause_schedule("kanban", "sch-1").await.unwrap());
+        assert!(client.resume_schedule("kanban", "sch-1").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn cancel_schedule_unknown_id_is_ok_false_not_error() {
+        // Server acks {ok:false} for an unknown/already-terminal id — a no-op,
+        // surfaced as Ok(false) rather than Err.
+        let (server, client) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/admin/db/kanban/schedules/missing/cancel"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": false})))
+            .mount(&server)
+            .await;
+        assert!(!client.cancel_schedule("kanban", "missing").await.unwrap());
+    }
+
+    // ── Admin storage (mirror ts-client admin.test.ts storage suite) ────────
+
+    #[tokio::test]
+    async fn list_files_returns_file_metadata() {
+        let (server, client) = setup().await;
+        Mock::given(method("GET"))
+            .and(path("/admin/db/kanban/storage"))
+            .and(header("authorization", BEARER))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "files": [
+                    {"id":"f1","sha256":"aa","size":10,"contentType":"image/png",
+                     "creationTime":100},
+                    {"id":"f2","sha256":"bb","size":20,"contentType":null,
+                     "creationTime":200}
+                ]
+            })))
+            .mount(&server)
+            .await;
+        let files = client.list_files("kanban").await.unwrap();
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].id, "f1");
+        assert_eq!(files[0].sha256, "aa");
+        assert_eq!(files[0].size, 10);
+        assert_eq!(files[0].content_type.as_deref(), Some("image/png"));
+        assert_eq!(files[0].creation_time, 100);
+        assert_eq!(files[1].content_type, None);
+    }
+
+    #[tokio::test]
+    async fn upload_file_posts_raw_bytes_with_content_type() {
+        let (server, client) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/admin/db/kanban/storage"))
+            .and(header("authorization", BEARER))
+            .and(header("content-type", "image/png"))
+            .and(body_string_contains("PNGDATA"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": "f9"})))
+            .mount(&server)
+            .await;
+        let id = client
+            .upload_file("kanban", b"PNGDATA".as_slice(), Some("image/png"))
+            .await
+            .unwrap();
+        assert_eq!(id, "f9");
+    }
+
+    #[tokio::test]
+    async fn upload_file_omits_content_type_header_when_none() {
+        let (server, client) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/admin/db/kanban/storage"))
+            .and(header("authorization", BEARER))
+            .and(body_string_contains("RAW"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": "f10"})))
+            .mount(&server)
+            .await;
+        let id = client
+            .upload_file("kanban", b"RAW".as_slice(), None)
+            .await
+            .unwrap();
+        assert_eq!(id, "f10");
+        // No content-type header may be sent when None (wiremock only matches
+        // the request above, so reaching here means the bare POST matched).
+        let reqs = server.received_requests().await.unwrap();
+        assert_eq!(reqs.len(), 1);
+        assert!(
+            reqs[0].headers.get("content-type").is_none(),
+            "content-type leaked: {:?}",
+            reqs[0].headers.get("content-type")
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_file_deletes_and_returns_ok() {
+        let (server, client) = setup().await;
+        Mock::given(method("DELETE"))
+            .and(path("/admin/db/kanban/storage/f9"))
+            .and(header("authorization", BEARER))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+            .mount(&server)
+            .await;
+        client.delete_file("kanban", "f9").await.unwrap();
+    }
+
+    // ── Anonymous-access toggle (mirror ts-client admin.test.ts) ────────────
+
+    #[tokio::test]
+    async fn get_anonymous_access_returns_enabled() {
+        let (server, client) = setup().await;
+        Mock::given(method("GET"))
+            .and(path("/admin/db/kanban/anonymous-access"))
+            .and(header("authorization", BEARER))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"enabled": true})))
+            .mount(&server)
+            .await;
+        assert!(client.get_anonymous_access("kanban").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn set_anonymous_access_patches_enabled() {
+        let (server, client) = setup().await;
+        Mock::given(method("PATCH"))
+            .and(path("/admin/db/kanban/anonymous-access"))
+            .and(header("authorization", BEARER))
+            .and(body_partial_json(json!({"enabled": false})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+            .mount(&server)
+            .await;
+        client.set_anonymous_access("kanban", false).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn set_anonymous_access_surfaces_unknown_db_envelope() {
+        let (server, client) = setup().await;
+        Mock::given(method("PATCH"))
+            .and(path("/admin/db/missing/anonymous-access"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+                "code": "NOT_FOUND",
+                "message": "database not registered"
+            })))
+            .mount(&server)
+            .await;
+        let err = client
+            .set_anonymous_access("missing", true)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::NotFound);
+        assert_eq!(err.message, "database not registered");
     }
 }

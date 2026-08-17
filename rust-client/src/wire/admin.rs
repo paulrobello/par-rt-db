@@ -720,6 +720,79 @@ pub struct SchemaHistoryEntry {
     pub schema: serde_json::Value,
 }
 
+// ---- schema preview (POST /admin/db/{db}/schema/preview) -----------------
+//
+// Mirror server `schema_diff::{SchemaDiff, TableAdd, ColumnAdd, IndexAdd,
+// Rejection}` byte-for-byte (camelCase) and `ts-client`'s `SchemaPreview*`
+// views. Both serde directions are derived: the client deserializes the
+// server's diff, and the CLI re-serializes it for output.
+
+/// Borrowed HTTP body for `POST /admin/db/{db}/schema/preview` — the same
+/// shape as [`PushSchemaRequest`] minus `db` (it rides the URL path).
+/// Serialize-only like every borrowed request wrapper (a `&SchemaDef` field
+/// cannot derive Deserialize).
+#[derive(Serialize)]
+pub(crate) struct PreviewSchemaRequest<'a> {
+    pub(crate) schema: &'a SchemaDef,
+}
+
+/// One new column reported by `preview_schema`. `field_type` is the
+/// human-readable field type (e.g. `string`, `id<projects>`, `string?`).
+/// Mirrors server `schema_diff::ColumnAdd`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct SchemaPreviewColumnAdd {
+    pub name: String,
+    pub field_type: String,
+}
+
+/// One new index reported by `preview_schema`. Mirrors server
+/// `schema_diff::IndexAdd`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct SchemaPreviewIndexAdd {
+    pub name: String,
+    pub fields: Vec<String>,
+}
+
+/// One new table reported by `preview_schema`: its name plus the columns and
+/// indexes the additive-only push would add. Mirrors server
+/// `schema_diff::TableAdd`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct SchemaPreviewTableAdd {
+    pub table: String,
+    pub columns: Vec<SchemaPreviewColumnAdd>,
+    pub indexes: Vec<SchemaPreviewIndexAdd>,
+}
+
+/// One rejection reported by `preview_schema`: a drop or type change the DDL
+/// layer will refuse. `item` is the bare column/index name. Mirrors server
+/// `schema_diff::Rejection`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct SchemaPreviewRejection {
+    pub table: String,
+    pub item: String,
+    pub reason: String,
+}
+
+/// Result of `preview_schema` (`POST /admin/db/{db}/schema/preview`): what an
+/// additive-only push would ADD and what it would REJECT (drops, type
+/// changes). Pure/advisory — the preview does not apply anything. Mirrors
+/// server `schema_diff::SchemaDiff`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct SchemaPreviewDiff {
+    pub added: Vec<SchemaPreviewTableAdd>,
+    pub rejected: Vec<SchemaPreviewRejection>,
+}
+
 /// Per-directive outcome. `castFailures` and `sampleChanges` are
 /// `skip_serializing_if = "Vec::is_empty"` on the server, so they surface as
 /// optional on the wire (absent when empty). Mirrors server

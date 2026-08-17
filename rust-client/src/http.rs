@@ -992,7 +992,9 @@ impl RtDbHttpClient {
         db: &str,
         query: &crate::query::Query,
     ) -> Result<T, RtDbError> {
-        self.admin_client().admin_query::<T>(db, query).await
+        // Keeps its pre-include_deleted 2-arg signature; the new flag defaults
+        // to None (key omitted on the wire).
+        self.admin_client().admin_query::<T>(db, query, None).await
     }
 
     #[deprecated(note = "use RtDbAdminClient")]
