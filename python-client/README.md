@@ -53,7 +53,7 @@ Or with [uv](https://docs.astral.sh/uv/):
 uv add par-rt-db
 ```
 
-Requires Python ≥ 3.12 and `pydantic>=2.7`. The optional HTTP and WebSocket
+Requires Python ≥ 3.12 (see `pyproject.toml` for the supported `pydantic` and, per extra, `httpx`/`websockets` versions). The optional HTTP and WebSocket
 client extras pull in `httpx` and `websockets` respectively:
 
 ```bash
@@ -200,7 +200,7 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-Install with `pip install par-rt-db[aio]` (same `httpx>=0.27` pin as `[http]`).
+Install with `pip install par-rt-db[aio]` (same `httpx` pin as `[http]`; see `pyproject.toml`).
 
 ### Schemas and cursors
 
@@ -291,6 +291,9 @@ HTTP clients return the new run id; the reactive client returns `WorkflowInfo`.
 ```python
 from par_rt_db import Mutation
 from par_rt_db.wire import StepRetry, WorkflowSpec, WorkflowStepSpec
+from par_rt_db.ws_client import RtDbClient  # or RtDbHttpClient from par_rt_db.http_client
+
+db = RtDbClient("wss://rtdb.pardev.net", "mydb", get_token=get_token)  # as in the reactive example above
 
 txn = Mutation.builder().insert("work_items", {"title": "welcome"}).build()
 txn2 = Mutation.builder().insert("work_items", {"title": "follow-up"}).build()
