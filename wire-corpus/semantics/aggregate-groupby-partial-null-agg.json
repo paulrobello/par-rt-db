@@ -1,0 +1,27 @@
+{
+  "name": "aggregate-groupby-partial-null-agg",
+  "$comment": "SQL aggregate semantics over partially-NULL input: SUM ignores NULL rows, so a group mixing rows that carry the optional aggregate field with rows that lack it sums only the present values (x = 1 + 5 = 6; row b contributes nothing).",
+  "schema": {
+    "tables": {
+      "tasks": {
+        "fields": {
+          "name": { "type": "string" },
+          "tag": { "type": "string" },
+          "n": { "type": "optional", "inner": { "type": "number" } }
+        },
+        "indexes": [{ "name": "by_tag", "fields": ["tag", "n"] }]
+      }
+    }
+  },
+  "seed": [
+    { "name": "a", "tag": "x", "n": 1 },
+    { "name": "b", "tag": "x" },
+    { "name": "c", "tag": "x", "n": 5 }
+  ],
+  "op": {
+    "query": { "table": "tasks", "index": "by_tag", "aggregate": { "op": "sum", "groupBy": true } }
+  },
+  "expect": [
+    { "key": "x", "value": 6 }
+  ]
+}

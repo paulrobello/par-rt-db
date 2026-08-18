@@ -936,14 +936,16 @@ function executeAggregateTerminal(
         throw new RtDbError("BAD_REQUEST", `aggregate op ${op} requires a numeric index field`);
       }
     }
-    // Group rows by `groupField` value (skip null/undefined group keys —
-    // the server's typed column excludes NULL), preserving first-seen order
-    // and then sorting by key ascending for parity with the server's ORDER BY k.
-    // `count` counts rows (one entry per row); else aggregate the field value.
+    // Group rows by `groupField` value, preserving first-seen order and then
+    // sorting by key ascending for parity with the server's ORDER BY k — rows
+    // missing the group field form one null group (the server's GROUP BY
+    // includes the SQL NULL group; compareIndexValues sorts it last, matching
+    // Postgres NULLS LAST). `count` counts rows (one entry per row); else
+    // aggregate the field's non-null values (SQL aggregates skip NULL — a
+    // group left with none aggregates to null).
     const groups = new Map<unknown, unknown[]>();
     for (const row of filtered) {
-      const k = row.doc[groupField];
-      if (k === null || k === undefined) continue;
+      const k = row.doc[groupField] ?? null;
       const entry = aggField !== undefined ? row.doc[aggField] : row;
       const existing = groups.get(k);
       if (existing) {
@@ -953,7 +955,16 @@ function executeAggregateTerminal(
       }
     }
     const out = Array.from(groups.entries())
-      .map(([k, values]) => ({ key: k, value: applyAggregate(op, values, aggFieldPg) }))
+      .map(([k, values]) => {
+        if (op === "count") {
+          return { key: k, value: applyAggregate(op, values, aggFieldPg) };
+        }
+        const present = values.filter((v) => v !== null && v !== undefined);
+        return {
+          key: k,
+          value: present.length > 0 ? applyAggregate(op, present, aggFieldPg) : null,
+        };
+      })
       .sort((a, b) => compareIndexValues(a.key, b.key, groupFieldPg))
       .slice(0, MAX_TAKE);
     return out;

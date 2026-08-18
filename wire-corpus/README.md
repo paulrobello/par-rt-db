@@ -78,7 +78,12 @@ keys projected out:
     where a missing optional value projects to SQL NULL, sorts last under
     the ORDER BY default, and decodes to JSON `null`)
   - `aggregate` → bare scalar (`null` over an empty match set) or, with
-    `groupBy`, an array of `{"key", "value"}` rows sorted by key ascending
+    `groupBy`, an array of `{"key", "value"}` rows sorted by key ascending;
+    rows missing the group field form one `key: null` group sorted last
+    (Postgres `GROUP BY` includes the SQL NULL group under `NULLS LAST`), and
+    a group whose aggregate input is entirely NULL aggregates to
+    `value: null` (SQL aggregates ignore NULL rows, so a partially-present
+    group aggregates the present values)
 - **txn op** — array of per-step results: `insert` → `{"id", }`; `patch`,
   `replace`, `delete`, `undelete`, `expectVersion`, `expectAbsent` → `null`;
   `upsert` → `{"id", "inserted"}`; `patchByQuery` → `{"patched", "truncated"}`;

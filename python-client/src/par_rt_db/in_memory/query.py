@@ -927,8 +927,10 @@ class _QueryEngine(_Core):
         field (a scalar ``count`` needs no index at all; a grouped ``count``
         needs one index field beyond the eq prefix to group by). Null agg
         values are skipped for the field-bearing ops (SQL ``NULL`` semantics);
-        an empty scalar set -> ``None`` (``count`` -> ``0``); groups are ordered
-        by key asc and capped by ``MAX_TAKE``.
+        an empty scalar set -> ``None`` (``count`` -> ``0``); rows missing the
+        group field form one ``null`` group, sorted last (the server's
+        ``GROUP BY`` includes the SQL ``NULL`` group under ``NULLS LAST``);
+        groups are ordered by key asc and capped by ``MAX_TAKE``.
 
         Lift of the former inline ``if q.aggregate is not None:`` arm of
         :meth:`run_query`; mirrors ``ts-client``'s ``executeAggregateTerminal``.
@@ -988,9 +990,10 @@ class _QueryEngine(_Core):
             groups: list[tuple[Any, list[Any]]] = []
             group_index: dict[str, int] = {}
             for row in filtered:
+                # Rows missing the group field form one null group (the
+                # server's GROUP BY includes the SQL NULL group; the sort
+                # below places it last, matching Postgres NULLS LAST).
                 k = row.doc.get(group_field)
-                if k is None:
-                    continue
                 key = _dedupe_key(k)
                 i = group_index.get(key)
                 if i is None:

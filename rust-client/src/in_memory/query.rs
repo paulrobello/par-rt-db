@@ -608,12 +608,14 @@ impl InMemoryRtDbClient {
                 let mut groups: Vec<(Value, u64)> = Vec::new();
                 let mut group_index: HashMap<String, usize> = HashMap::new();
                 for row in filtered {
-                    let Some(k) = row.doc.get(group_field.as_str()) else {
-                        continue;
-                    };
-                    if k.is_null() {
-                        continue;
-                    }
+                    // Rows missing the group field form one null group (the
+                    // server's GROUP BY includes the SQL NULL group; the sort
+                    // below places it last, matching Postgres NULLS LAST).
+                    let k = row
+                        .doc
+                        .get(group_field.as_str())
+                        .cloned()
+                        .unwrap_or(Value::Null);
                     let key = k.to_string();
                     let i = match group_index.get(&key).copied() {
                         Some(i) => i,
@@ -697,18 +699,15 @@ impl InMemoryRtDbClient {
                 .and_then(|ty| index_column_type(ty).ok())
                 .map(|it| it.pg)
                 .unwrap_or(PgType::Text);
-            // Group rows by `group_field` (skip null keys), preserving
-            // first-seen order; sort by key ascending after, for parity with
-            // the server's `ORDER BY k`.
+            // Group rows by `group_field`, preserving first-seen order; sort
+            // by key ascending after, for parity with the server's
+            // `ORDER BY k`. Rows missing the group field form one null group
+            // (the server's GROUP BY includes the SQL NULL group; the sort
+            // places it last, matching Postgres NULLS LAST).
             let mut groups: Vec<(Value, Vec<Value>)> = Vec::new();
             let mut group_index: HashMap<String, usize> = HashMap::new();
             for row in filtered {
-                let Some(k) = row.doc.get(group_field) else {
-                    continue;
-                };
-                if k.is_null() {
-                    continue;
-                }
+                let k = row.doc.get(group_field).cloned().unwrap_or(Value::Null);
                 let key = k.to_string();
                 let i = match group_index.get(&key).copied() {
                     Some(i) => i,

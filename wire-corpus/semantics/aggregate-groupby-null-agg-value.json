@@ -1,0 +1,27 @@
+{
+  "name": "aggregate-groupby-null-agg-value",
+  "$comment": "A group whose every row lacks the optional aggregate field: SQL SUM over an all-NULL input is NULL, so the group's value is JSON null — the grouped analog of the scalar terminal's null-over-empty (the scalar SQL COALESCEs this same cell; the grouped SQL does too). x sums normally; y aggregates to null.",
+  "schema": {
+    "tables": {
+      "tasks": {
+        "fields": {
+          "name": { "type": "string" },
+          "tag": { "type": "string" },
+          "n": { "type": "optional", "inner": { "type": "number" } }
+        },
+        "indexes": [{ "name": "by_tag", "fields": ["tag", "n"] }]
+      }
+    }
+  },
+  "seed": [
+    { "name": "a", "tag": "x", "n": 1 },
+    { "name": "b", "tag": "y" }
+  ],
+  "op": {
+    "query": { "table": "tasks", "index": "by_tag", "aggregate": { "op": "sum", "groupBy": true } }
+  },
+  "expect": [
+    { "key": "x", "value": 1 },
+    { "key": "y", "value": null }
+  ]
+}

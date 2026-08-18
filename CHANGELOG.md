@@ -18,6 +18,30 @@ contract against Convex.
 > dated subsections below are chronological within `[Unreleased]`, not released
 > versions.
 
+### Fix: grouped aggregate 500s on NULL group keys; engines include the null group (server + ts/rust/python)
+
+`aggregate` with `groupBy` over an optional indexed field returned `INTERNAL`
+(a 500) whenever matching rows lacked the group value — the same decode bug
+the distinct terminal had (`distinct-includes-null`, one card earlier):
+`GROUP BY` includes the SQL NULL group, its key projects to a SQL NULL cell,
+and sqlx's `serde_json::Value` decoder rejects NULL cells. The grouped
+executor now decodes the key as `Option<Value>` and surfaces the null group
+as `key: null`, sorted last (`ORDER BY k`'s NULLS LAST default — the key is
+deliberately NOT COALESCEd: jsonb `'null'` sorts before strings, so that
+would flip the order). The value cell is now COALESCEd in SQL like the scalar
+branch's, so a group whose aggregate input is entirely NULL returns
+`value: null` instead of a second 500 (SQL aggregates ignore NULL rows, so a
+partially-present group aggregates the present values). The three in-memory
+engines mirrored the bug differently — all three silently DROPPED the null
+group (on a since-corrected belief that the server's typed column excluded
+NULL), and the ts engine additionally fed missing agg values into its reducer
+(`sum` over a group with any row missing the field returned `NaN`, and an
+all-missing group returned `0`); all three now include the null group sorted
+last, skip null agg values, and return `null` for an all-null group. Three
+new corpus cases pin it: `aggregate-groupby-includes-null`,
+`aggregate-groupby-null-agg-value`, `aggregate-groupby-partial-null-agg`
+(all four runners green).
+
 ### Fix: distinct terminal 500s on NULL index values (server)
 
 `distinct` over an optional indexed field returned `INTERNAL` (a 500)

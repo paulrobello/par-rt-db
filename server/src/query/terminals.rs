@@ -660,8 +660,12 @@ fn compile_aggregate_terminal(
 }
 
 /// Grouped aggregate SQL compilation:
-/// `SELECT to_jsonb(group_col), to_jsonb(OP(agg_col)) … GROUP BY … ORDER BY k LIMIT $`.
-/// Verbatim lift of the former grouped branch's SQL builder.
+/// `SELECT to_jsonb(group_col), COALESCE(to_jsonb(OP(agg_col)), 'null'::jsonb) … GROUP BY … ORDER BY k LIMIT $`.
+/// The value COALESCE mirrors the scalar branch: a group whose aggregate
+/// input is entirely NULL aggregates to SQL NULL, which must surface as JSON
+/// null, not fail the decoder. The key is NOT COALESCEd — jsonb `'null'`
+/// sorts before every other scalar, so COALESCEing it would flip the NULLS
+/// LAST order `ORDER BY k` gives the SQL NULL group.
 #[allow(clippy::too_many_arguments)]
 fn compile_aggregate_grouped(
     group_col: String,
@@ -675,7 +679,7 @@ fn compile_aggregate_grouped(
     table_ident: &str,
 ) -> Result<CompiledQuery, RtDbError> {
     let mut sql = format!(
-        "SELECT to_jsonb(\"{group_col}\") AS k, to_jsonb({agg_expr}) AS v FROM \"{pg_schema_name}\".\"{table_ident}\""
+        "SELECT to_jsonb(\"{group_col}\") AS k, COALESCE(to_jsonb({agg_expr}), 'null'::jsonb) AS v FROM \"{pg_schema_name}\".\"{table_ident}\""
     );
     if !where_conditions.is_empty() {
         sql.push_str(" WHERE ");
@@ -745,7 +749,12 @@ pub(crate) async fn execute_aggregate_terminal(
     // on the SQL's projection rather than the tag. Both paths carry the same
     // tag because the wire terminal is the same; the executor reads the SQL.
     if sql.contains("GROUP BY") {
-        let mut query = sqlx::query_as::<_, (serde_json::Value, serde_json::Value)>(&sql);
+        // Rows missing the group field form one SQL NULL group, which sorts
+        // last under `ORDER BY k`'s NULLS LAST default — but sqlx cannot
+        // decode a NULL cell into `serde_json::Value`, so decode the key as
+        // `Option` and surface that group's key as JSON null (the value is
+        // COALESCEd in the SQL; see compile_aggregate_grouped).
+        let mut query = sqlx::query_as::<_, (Option<serde_json::Value>, serde_json::Value)>(&sql);
         for bind in binds {
             query = match bind {
                 EqBind::Text(v) => query.bind(v),
@@ -757,7 +766,10 @@ pub(crate) async fn execute_aggregate_terminal(
         let rows = query.fetch_all(pool).await?;
         let groups: Vec<AggregateGroup> = rows
             .into_iter()
-            .map(|(k, v)| AggregateGroup { key: k, value: v })
+            .map(|(k, v)| AggregateGroup {
+                key: k.unwrap_or(serde_json::Value::Null),
+                value: v,
+            })
             .collect();
         Ok(QueryResult::AggregateGroups(groups))
     } else {

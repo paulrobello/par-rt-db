@@ -1,0 +1,31 @@
+{
+  "name": "aggregate-groupby-includes-null",
+  "$comment": "Grouped aggregate over an indexed optional string with absent values: rows without the field form one SQL NULL group (GROUP BY groups NULLs together), which sorts last under ORDER BY k (Postgres ASC NULLS LAST) and surfaces as key null — mirroring the distinct terminal's include-null semantics. Groups: a={c}=3, x={a,e}=1+5=6, null={b,d}=2+4=6.",
+  "schema": {
+    "tables": {
+      "tasks": {
+        "fields": {
+          "name": { "type": "string" },
+          "tag": { "type": "optional", "inner": { "type": "string" } },
+          "n": { "type": "number" }
+        },
+        "indexes": [{ "name": "by_tag", "fields": ["tag", "n"] }]
+      }
+    }
+  },
+  "seed": [
+    { "name": "a", "tag": "x", "n": 1 },
+    { "name": "b", "n": 2 },
+    { "name": "c", "tag": "a", "n": 3 },
+    { "name": "d", "n": 4 },
+    { "name": "e", "tag": "x", "n": 5 }
+  ],
+  "op": {
+    "query": { "table": "tasks", "index": "by_tag", "aggregate": { "op": "sum", "groupBy": true } }
+  },
+  "expect": [
+    { "key": "a", "value": 3 },
+    { "key": "x", "value": 6 },
+    { "key": null, "value": 6 }
+  ]
+}
