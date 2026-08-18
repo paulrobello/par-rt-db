@@ -395,7 +395,7 @@ mirrored as the HTTP `Retry-After` header); every other code omits it:
 `{"table": "<name>", "get"?, "index"?, "eq"?, "order"?, "take"?, "unique"?, "first"?,
 "count"?, "filter"?, "search"?, "vectorSearch"?, "hybridSearch"?, "paginate"?, "distinct"?, "aggregate"?}`
 — exactly one terminal per query (terminals are mutually exclusive). See
-`server/src/query.rs` for full semantics: index prefix binds, range predicates
+`server/src/query/` for full semantics: index prefix binds, range predicates
 (`gt`/`gte`/`lt`/`lte`) follow the `eq` prefix, `order: "asc"|"desc"`, `take`
 capped at 4096, `unique` de-duplicates on the indexed fields, `count` is an
 uncapped `SELECT COUNT(*)`, `first` is sugar over `take(1)`, `filter` carries
@@ -414,8 +414,11 @@ the index's declared metric distance over a write-maintained pgvector column
 (also accepting an optional full `filter`), `hybridSearch` fuses the full-text
 (`ts_rank`) and `vectorSearch` rankings for the same table into one list via
 Reciprocal Rank Fusion, `paginate` is opaque-cursor keyset pagination,
-`distinct` collapses duplicates on a field set, and `aggregate` runs a grouped
-`sum`/`min`/`max`/`avg`/`count`.
+`distinct` returns the unique values of the index field after the `eq` prefix
+(ascending; NULLs included, sorted last), and `aggregate` runs a scalar
+`sum`/`min`/`max`/`avg`/`count`, optionally grouped (`groupBy`) by the next
+index field (rows missing the group value form one `key: null` group,
+sorted last).
 
 ### Transaction shape
 
@@ -803,10 +806,13 @@ fetches on first build.
 
 `make dev-db-up` (a prerequisite of `make test`) starts the dev Postgres on
 `127.0.0.1:55434` via `docker-compose.dev.yml` and waits for it to be healthy.
-`make dev-db-down` stops it. `make dev-db-clean` drops leaked test schemas
-(`db_t<uuid-v7>`) from the dev `rtdb` DB — tests create a database per test and
-don't drop it, so the dev DB bloats over time; run this periodically (it is
-scoped to the test pattern and never touches `rtdb`/`rtdb_auth`/real databases).
+`make dev-db-down` stops it. `make dev-db-clean` drops leaked test artifacts
+from the dev `rtdb` DB — per-test schemas (`db_t<uuid-v7>`; tests self-clean
+via RAII but a bounded tail leaks per binary) and the semantics-corpus
+runner's per-case databases (`sc_<case>_<hex>`, ENH-023) — each `DROP` in
+psql autocommit so a large sweep doesn't accumulate catalog locks. Run it
+periodically; it is scoped to those test patterns and never touches
+`rtdb`/`rtdb_auth`/real databases.
 
 ### Other workflow targets
 
@@ -830,7 +836,7 @@ scoped to the test pattern and never touches `rtdb`/`rtdb_auth`/real databases).
 
 `make python-client-test | python-client-lint | python-client-fmt | python-client-typecheck | python-client-checkall` run that one stage in `python-client/` only. Equivalent granular targets for the other packages are run directly with the package's tool (`cargo test` in `server/`/`rust-client/`, `bunx vitest run` in `ts-client/`, `bun run test` in `dashboard/`).
 
-> The dashboard ships a Vitest + React Testing Library suite (`session`, `useLiveTable`, `ConfigPage`); run it standalone with `make dashboard-test`, or as part of `make checkall`/`make test`.
+> The dashboard ships a Vitest + React Testing Library suite covering its pages and shared lib/hooks; run it standalone with `make dashboard-test`, or as part of `make checkall`/`make test`.
 
 ## Graceful shutdown
 
