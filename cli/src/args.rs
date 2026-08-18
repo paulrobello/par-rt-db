@@ -16,7 +16,7 @@ use std::path::PathBuf;
     term_width = 80
 )]
 pub(crate) struct Cli {
-    /// Server base URL (e.g. https://rtdb.pardev.net).
+    /// Server base URL (e.g. https://rtdb.example.com).
     #[arg(long, env = "RTDB_URL")]
     pub(crate) url: String,
 

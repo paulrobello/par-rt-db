@@ -74,7 +74,7 @@ working with zero providers configured.
 ## Prerequisites (all providers)
 
 1. **`RTDB_PUBLIC_URL`** must be set to the public origin of the deployment
-   (e.g. `https://rtdb.pardev.net`). It forms the base of every callback URL.
+   (e.g. `https://rtdb.example.com`). It forms the base of every callback URL.
 2. **`RTDB_ALLOWED_ORIGINS`** must include every frontend origin that will open
    the login popup — this is checked by the OAuth start endpoint, *independently
    of CORS*. A same-origin dashboard served from `RTDB_PUBLIC_URL` needs that
@@ -102,9 +102,9 @@ works; use an OAuth App unless you have a reason not to).
 1. Go to **GitHub → Settings → Developer settings → OAuth Apps → New OAuth App**.
 2. Fill in:
    - **Application name:** your choice (e.g. `par-rt-db`).
-   - **Homepage URL:** `RTDB_PUBLIC_URL` (e.g. `https://rtdb.pardev.net`).
+   - **Homepage URL:** `RTDB_PUBLIC_URL` (e.g. `https://rtdb.example.com`).
    - **Authorization callback URL:** `RTDB_PUBLIC_URL` + `/auth/callback`
-     (e.g. `https://rtdb.pardev.net/auth/callback`).
+     (e.g. `https://rtdb.example.com/auth/callback`).
 3. **Generate a new client secret** and copy it immediately (GitHub only shows
    it once). Note the **Client ID** too.
 4. Set `RTDB_GITHUB_CLIENT_ID` and `RTDB_GITHUB_CLIENT_SECRET` (see
@@ -137,7 +137,7 @@ Data access → Clients** — all scoped with `?project=par-rt-db`.
 2. **Brand information** (`/auth/branding`) — **App name**, **User support
    email**, and **Developer contact information** (all you). For the required
    **Privacy link**, the server serves its own policy at `RTDB_PUBLIC_URL` +
-   `/privacy` (e.g. `https://rtdb.pardev.net/privacy`) — use that, or any
+   `/privacy` (e.g. `https://rtdb.example.com/privacy`) — use that, or any
    reachable HTTPS policy page.
 3. **Data access** (`/auth/data-access`) — add the three scopes par-rt-db
    requests (Google lists them under Google APIs as):
@@ -150,7 +150,7 @@ Data access → Clients** — all scoped with `?project=par-rt-db`.
 4. **Clients** (`/auth/clients`) → **Create client**:
    - **Application type:** *Web application*.
    - **Authorized redirect URIs:** add `RTDB_PUBLIC_URL` + `/auth/google/callback`
-     (e.g. `https://rtdb.pardev.net/auth/google/callback`). This must match
+     (e.g. `https://rtdb.example.com/auth/google/callback`). This must match
      byte-for-byte, including `https://`.
    - Create, then copy the **Client ID** and **Client secret**.
 5. Set `RTDB_GOOGLE_CLIENT_ID` and `RTDB_GOOGLE_CLIENT_SECRET`
@@ -179,7 +179,7 @@ the deploy, or a dedicated service account):
 2. Fill in:
    - **Name:** your choice (e.g. `par-rt-db`).
    - **Redirect URI:** `RTDB_PUBLIC_URL` + `/auth/gitlab/callback`
-     (e.g. `https://rtdb.pardev.net/auth/gitlab/callback`). Must match
+     (e.g. `https://rtdb.example.com/auth/gitlab/callback`). Must match
      byte-for-byte, including `https://`.
    - **Confidential:** leave checked (the secret stays server-side).
    - **Scopes:** select **`read_user`** and **`email`** — the `email` scope is
@@ -218,7 +218,7 @@ unconfigured google/gitlab.
    `authorization_endpoint`, `token_endpoint`, and `userinfo_endpoint` URLs.
 2. Register a confidential OAuth/OIDC client at your IdP with the redirect URI
    `RTDB_PUBLIC_URL` + `/auth/oidc/callback`
-   (e.g. `https://rtdb.pardev.net/auth/oidc/callback`). This must match
+   (e.g. `https://rtdb.example.com/auth/oidc/callback`). This must match
    byte-for-byte, including `https://`.
 3. Set all five env vars — `RTDB_OIDC_CLIENT_ID`, `RTDB_OIDC_CLIENT_SECRET`,
    `RTDB_OIDC_AUTHORIZE_URL`, `RTDB_OIDC_TOKEN_URL`, `RTDB_OIDC_USERINFO_URL`
@@ -255,7 +255,7 @@ This is OIDC against Microsoft's well-known endpoints (derived from
    is the *Web* platform. SPA and Public-client platforms are for secret-less
    browser/native flows and do not match this server's design.
    - **Redirect URI:** `RTDB_PUBLIC_URL` + `/auth/microsoft/callback`
-     (e.g. `https://rtdb.pardev.net/auth/microsoft/callback`). Must match
+     (e.g. `https://rtdb.example.com/auth/microsoft/callback`). Must match
      byte-for-byte, including `https://`.
 4. **Certificates & secrets → New client secret** → copy the secret **Value**
    (not the Secret ID). The Value is hidden once you leave the page.
@@ -307,9 +307,9 @@ derives its four config pieces from them.
    identifier string (e.g. `com.example.rtdb`) — this is your
    `RTDB_APPLE_CLIENT_ID`. Enable **Sign In with Apple → Configure**:
    - **Primary App ID:** the App ID from step 1.
-   - **Domains:** the host of `RTDB_PUBLIC_URL` (e.g. `rtdb.pardev.net`).
+   - **Domains:** the host of `RTDB_PUBLIC_URL` (e.g. `rtdb.example.com`).
    - **Return URLs:** `RTDB_PUBLIC_URL` + `/auth/apple/callback`
-     (e.g. `https://rtdb.pardev.net/auth/apple/callback`). Must match
+     (e.g. `https://rtdb.example.com/auth/apple/callback`). Must match
      byte-for-byte. Apple does **not** allow `http`/`localhost` in production
      (Sandbox allows `localhost` for testing).
 3. Note your **Team ID** (10 chars, top-right of the portal) →
@@ -362,7 +362,7 @@ On the deploy host (`/docker/par-rt-db/.env`, mode 600 — store the secrets in
 **parvault**, matching how the GitHub secrets are already kept):
 
 ```sh
-# edit .env on lenny2, then recreate the server container to inject the new env:
+# edit .env on docker-host, then recreate the server container to inject the new env:
 cd /docker/par-rt-db
 $EDITOR .env            # set RTDB_GOOGLE_CLIENT_ID / _SECRET
 docker compose up -d    # no --build needed for an env-only change
@@ -379,13 +379,13 @@ returns `200` with the JSON body `{ authorizeUrl, state }`; an unconfigured one
 ```sh
 # expect 200 (JSON body with authorizeUrl + state). 503 = secrets not applied; 403 = origin not allowed.
 curl -s -o /dev/null -w "%{http_code}\n" \
-  "https://rtdb.pardev.net/auth/google/begin?origin=https://projects.pardev.net"
+  "https://rtdb.example.com/auth/google/begin?origin=https://projects.example.com"
 ```
 
 Then do a real end-to-end login from the frontend, and confirm the session with:
 
 ```sh
-curl -s https://rtdb.pardev.net/auth/me -H "Authorization: Bearer <session-token>" | jq .
+curl -s https://rtdb.example.com/auth/me -H "Authorization: Bearer <session-token>" | jq .
 ```
 
 ## Hardening

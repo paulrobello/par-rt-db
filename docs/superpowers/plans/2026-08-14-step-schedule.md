@@ -25,7 +25,7 @@
 - **AUTH-TOUCHING (Task 3):** the enqueue-time table-authorization tightening is user-approved ("tighten both in this card"), but its commits must be flagged for manual review in the session report — never slipped in silently.
 - No `unwrap()`/`expect()` outside `#[cfg(test)]`; zero clippy warnings under `-D warnings`; `make checkall` green before the branch merges (Task 7).
 - Sub-agents never touch the kanban board; the orchestrating session owns it.
-- Verification commands run from the right directories: `cargo` from `server/` / `rust-client/`, `bun` from `ts-client/`, `uv run` from `python-client/`, `make -C /Users/probello/Repos/par-rt-db` for repo-wide targets. Dev Postgres must be up (`make -C /Users/probello/Repos/par-rt-db dev-db-up`) for server integration tests.
+- Verification commands run from the right directories: `cargo` from `server/` / `rust-client/`, `bun` from `ts-client/`, `uv run` from `python-client/`, `make -C ~/Repos/par-rt-db` for repo-wide targets. Dev Postgres must be up (`make -C ~/Repos/par-rt-db dev-db-up`) for server integration tests.
 
 ## File Structure
 
@@ -367,10 +367,10 @@ NOTE: after this step, the ts/rust/python corpus round-trip tests FAIL until Tas
 - [ ] **Step 7: Verify**
 
 ```bash
-make -C /Users/probello/Repos/par-rt-db dev-db-up
-cd /Users/probello/Repos/par-rt-db/server && cargo test count_steps wire_corpus 2>&1 | tail -20; echo "EXIT=${PIPESTATUS[0]}"
-cd /Users/probello/Repos/par-rt-db/server && cargo test --test wire_corpus 2>&1 | tail -5; echo "EXIT=${PIPESTATUS[0]}"
-cd /Users/probello/Repos/par-rt-db/server && cargo clippy --all-targets -- -D warnings 2>&1 | tail -5; echo "EXIT=${PIPESTATUS[0]}"
+make -C ~/Repos/par-rt-db dev-db-up
+cd ~/Repos/par-rt-db/server && cargo test count_steps wire_corpus 2>&1 | tail -20; echo "EXIT=${PIPESTATUS[0]}"
+cd ~/Repos/par-rt-db/server && cargo test --test wire_corpus 2>&1 | tail -5; echo "EXIT=${PIPESTATUS[0]}"
+cd ~/Repos/par-rt-db/server && cargo clippy --all-targets -- -D warnings 2>&1 | tail -5; echo "EXIT=${PIPESTATUS[0]}"
 ```
 Expected: all pass, clippy clean. Also `grep -n '\.table()' server/src server/tests` returns only `Option`-aware call sites.
 
@@ -439,8 +439,8 @@ The 8 tests (spec §Testing, numbered as there):
 - [ ] **Step 2: Run them**
 
 ```bash
-make -C /Users/probello/Repos/par-rt-db dev-db-up
-cd /Users/probello/Repos/par-rt-db/server && cargo test --test schedule_step_test 2>&1 | tail -15; echo "EXIT=${PIPESTATUS[0]}"
+make -C ~/Repos/par-rt-db dev-db-up
+cd ~/Repos/par-rt-db/server && cargo test --test schedule_step_test 2>&1 | tail -15; echo "EXIT=${PIPESTATUS[0]}"
 ```
 Expected: 8 passed. If a fire test is flaky-slow, re-run once; a persistent failure is a code defect (R11: understand what the test tests before "fixing" it).
 
@@ -528,8 +528,8 @@ Use `reqwest` via the existing `admin_get/admin_post` helpers in common/mod.rs a
 - [ ] **Step 5: Verify + commit**
 
 ```bash
-cd /Users/probello/Repos/par-rt-db/server && cargo test --test schedule_step_test 2>&1 | tail -15; echo "EXIT=${PIPESTATUS[0]}"
-cd /Users/probello/Repos/par-rt-db/server && cargo clippy --all-targets -- -D warnings 2>&1 | tail -5; echo "EXIT=${PIPESTATUS[0]}"
+cd ~/Repos/par-rt-db/server && cargo test --test schedule_step_test 2>&1 | tail -15; echo "EXIT=${PIPESTATUS[0]}"
+cd ~/Repos/par-rt-db/server && cargo clippy --all-targets -- -D warnings 2>&1 | tail -5; echo "EXIT=${PIPESTATUS[0]}"
 git add server/src/ws.rs server/src/http_api.rs server/src/admin/schedules.rs server/tests/schedule_step_test.rs
 git commit -m "security(auth): recursive table-allowlist check at Schedule-op enqueue on all surfaces (FM-28)"
 ```
@@ -618,8 +618,8 @@ test("parseStepResult handles scheduleId and cancelled", () => {
 - [ ] **Step 4: Verify (typecheck is mandatory — green vitest is NOT typecheck) + commit**
 
 ```bash
-cd /Users/probello/Repos/par-rt-db/ts-client && bun run typecheck 2>&1 | tail -5; echo "EXIT=${PIPESTATUS[0]}"
-cd /Users/probello/Repos/par-rt-db/ts-client && bunx vitest run tests/mutation.test.ts tests/wire-corpus.test.ts tests/client.test.ts 2>&1 | tail -8; echo "EXIT=${PIPESTATUS[0]}"
+cd ~/Repos/par-rt-db/ts-client && bun run typecheck 2>&1 | tail -5; echo "EXIT=${PIPESTATUS[0]}"
+cd ~/Repos/par-rt-db/ts-client && bunx vitest run tests/mutation.test.ts tests/wire-corpus.test.ts tests/client.test.ts 2>&1 | tail -8; echo "EXIT=${PIPESTATUS[0]}"
 git add ts-client/src/protocol.ts ts-client/src/mutation.ts ts-client/tests/mutation.test.ts
 git commit -m "feat(ts-client): mirror Step::Schedule/CancelSchedule wire + builder (FM-28)"
 ```
@@ -713,8 +713,8 @@ Append to the built mutation (mirroring the existing assertions):
 - [ ] **Step 5: Verify + commit**
 
 ```bash
-cd /Users/probello/Repos/par-rt-db/rust-client && cargo test 2>&1 | tail -8; echo "EXIT=${PIPESTATUS[0]}"
-cd /Users/probello/Repos/par-rt-db/rust-client && cargo clippy --all-targets -- -D warnings 2>&1 | tail -5; echo "EXIT=${PIPESTATUS[0]}"
+cd ~/Repos/par-rt-db/rust-client && cargo test 2>&1 | tail -8; echo "EXIT=${PIPESTATUS[0]}"
+cd ~/Repos/par-rt-db/rust-client && cargo clippy --all-targets -- -D warnings 2>&1 | tail -5; echo "EXIT=${PIPESTATUS[0]}"
 git add rust-client/src/mutation.rs
 git commit -m "feat(rust-client): mirror Step::Schedule/CancelSchedule wire + builder (FM-28)"
 ```
@@ -846,8 +846,8 @@ def test_recursive_step_budget_rejects_oversized_tree():
 - [ ] **Step 5: Verify + commit**
 
 ```bash
-cd /Users/probello/Repos/par-rt-db/python-client && uv run pytest -q tests/test_mutation.py tests/test_in_memory.py tests/test_wire_parity.py 2>&1 | tail -5; echo "EXIT=${PIPESTATUS[0]}"
-cd /Users/probello/Repos/par-rt-db/python-client && uv run pyright 2>&1 | tail -3; echo "EXIT=${PIPESTATUS[0]}"
+cd ~/Repos/par-rt-db/python-client && uv run pytest -q tests/test_mutation.py tests/test_in_memory.py tests/test_wire_parity.py 2>&1 | tail -5; echo "EXIT=${PIPESTATUS[0]}"
+cd ~/Repos/par-rt-db/python-client && uv run pyright 2>&1 | tail -3; echo "EXIT=${PIPESTATUS[0]}"
 git add python-client/src/par_rt_db/mutation.py python-client/src/par_rt_db/in_memory.py python-client/tests/test_mutation.py python-client/tests/test_in_memory.py
 git commit -m "feat(python-client): mirror Step::Schedule/CancelSchedule + harness tick support (FM-28)"
 ```
@@ -874,11 +874,11 @@ git commit -m "feat(python-client): mirror Step::Schedule/CancelSchedule + harne
 - [ ] **Step 4: Full gate (definition of done)**
 
 ```bash
-make -C /Users/probello/Repos/par-rt-db dev-db-up
-make -C /Users/probello/Repos/par-rt-db checkall 2>/dev/null; echo "EXIT=$?"   # (capture to a log file if long; verify the EXIT line, never a piped tail)
+make -C ~/Repos/par-rt-db dev-db-up
+make -C ~/Repos/par-rt-db checkall 2>/dev/null; echo "EXIT=$?"   # (capture to a log file if long; verify the EXIT line, never a piped tail)
 ```
 
-Requires `ts-client/dist` built (main checkout has it; if the dashboard typecheck fails on a missing client build, run `make -C /Users/probello/Repos/par-rt-db ts-client-build` first).
+Requires `ts-client/dist` built (main checkout has it; if the dashboard typecheck fails on a missing client build, run `make -C ~/Repos/par-rt-db ts-client-build` first).
 
 - [ ] **Step 5: Commit**
 

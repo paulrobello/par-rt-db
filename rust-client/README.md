@@ -86,7 +86,7 @@ use serde_json::json;
 struct Item { _id: String, name: String, n: i64 }
 
 # let token = std::env::var("RTDB_TOKEN").unwrap();
-# let db = RtDbHttpClient::new("https://rtdb.pardev.net", "kanban", &token);
+# let db = RtDbHttpClient::new("https://rtdb.example.com", "kanban", &token);
 // Ordered scan into Vec<Item>.
 let rows: Vec<Item> = db.run(
     TableQuery::new("items").with_index("by_n", &[]).order(Order::Asc).take(10),

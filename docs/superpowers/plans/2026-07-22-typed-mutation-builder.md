@@ -232,7 +232,7 @@ Expected: exits 0, no Biome errors (in particular, no complaint about the unused
 - [ ] **Step 7: Commit**
 
 ```bash
-cd /Users/probello/Repos/par-rt-db
+cd ~/Repos/par-rt-db
 git add client/src/mutation.ts client/tests/mutation.types.test.ts
 git commit -m "$(cat <<'EOF'
 feat(client): type TxnBuilder against a schema
@@ -260,7 +260,7 @@ EOF
 
 - [ ] **Step 1: Read the current file to confirm exact append point**
 
-Run: `cat -n client/tests/mutation.test.ts` (from `/Users/probello/Repos/par-rt-db`)
+Run: `cat -n client/tests/mutation.test.ts` (from `~/Repos/par-rt-db`)
 
 Confirm the file currently has exactly two `it()` blocks inside one `describe("transaction builder", ...)` block (as of this plan being written): `"builds an ordered multi-step txn with table on every step"` and `"produces an empty txn when nothing is added"`, closed by a final `});` on the last line. The new test is added as a third `it()` inside that same `describe` block, immediately before its closing `});`.
 
@@ -342,7 +342,7 @@ Expected: 3 tests passed (the 2 pre-existing plus the new one), 0 failed.
 
 - [ ] **Step 4: Run the full project gate**
 
-Run: `cd /Users/probello/Repos/par-rt-db && make checkall`
+Run: `cd ~/Repos/par-rt-db && make checkall`
 
 Expected: fully green — `fmt-check`, `lint` (clippy `-D warnings` for `server/`, Biome for `client/`), `typecheck` (`cargo check --all-targets` for `server/`, `tsc --noEmit` for `client/`), and `test` (this starts the dev Postgres via `dev-db-up` then runs `cargo test` and `bun run test`) all pass with no errors.
 
@@ -351,7 +351,7 @@ If this fails specifically because `dev-db-up` cannot bind `127.0.0.1:55434` (a 
 - [ ] **Step 5: Commit**
 
 ```bash
-cd /Users/probello/Repos/par-rt-db
+cd ~/Repos/par-rt-db
 git add client/tests/mutation.test.ts
 git commit -m "$(cat <<'EOF'
 test(client): confirm typed TxnBuilder produces identical wire JSON

@@ -16,11 +16,11 @@ cargo install --path cli      # from the repo root
 ## Usage
 
 ```sh
-rtdb --url https://rtdb.pardev.net --admin-key $RTDB_ADMIN_KEY list-dbs
-rtdb --url https://rtdb.pardev.net --admin-key $RTDB_ADMIN_KEY create-db kanban
-rtdb --url https://rtdb.pardev.net --admin-key $RTDB_ADMIN_KEY push-schema --db kanban schema.json
-rtdb --url https://rtdb.pardev.net --db kanban --token $RTDB_TOKEN mutate '@seed.json'
-rtdb --url https://rtdb.pardev.net --db kanban --token $RTDB_TOKEN query '{"table":"items","take":10}'
+rtdb --url https://rtdb.example.com --admin-key $RTDB_ADMIN_KEY list-dbs
+rtdb --url https://rtdb.example.com --admin-key $RTDB_ADMIN_KEY create-db kanban
+rtdb --url https://rtdb.example.com --admin-key $RTDB_ADMIN_KEY push-schema --db kanban schema.json
+rtdb --url https://rtdb.example.com --db kanban --token $RTDB_TOKEN mutate '@seed.json'
+rtdb --url https://rtdb.example.com --db kanban --token $RTDB_TOKEN query '{"table":"items","take":10}'
 ```
 
 `@<path>` reads a JSON argument from a file; otherwise the argument is parsed as
@@ -80,7 +80,7 @@ Commands:
   help          Print this message or the help of the given subcommand(s)
 
 Options:
-      --url <URL>              Server base URL (e.g. https://rtdb.pardev.net) [env: RTDB_URL=]
+      --url <URL>              Server base URL (e.g. https://rtdb.example.com) [env: RTDB_URL=]
       --db <DB>                Database name — used by `query`, `mutate`, and `push-schema` [env: RTDB_DB=]
       --token <TOKEN>          Machine token for `query` / `mutate` [env: RTDB_TOKEN]
       --admin-key <ADMIN_KEY>  Instance admin key — bearer for every admin subcommand [env: RTDB_ADMIN_KEY]
@@ -92,7 +92,7 @@ Options:
 
 | Flag | Env var | Description |
 | --- | --- | --- |
-| `--url <URL>` | `RTDB_URL` | Server base URL (e.g. https://rtdb.pardev.net) **(required)** |
+| `--url <URL>` | `RTDB_URL` | Server base URL (e.g. https://rtdb.example.com) **(required)** |
 | `--db <DB>` | `RTDB_DB` | Database name — used by `query`, `mutate`, and `push-schema` |
 | `--token <TOKEN>` | `RTDB_TOKEN` | Machine token for `query` / `mutate` |
 | `--admin-key <ADMIN_KEY>` | `RTDB_ADMIN_KEY` | Instance admin key — bearer for every admin subcommand |

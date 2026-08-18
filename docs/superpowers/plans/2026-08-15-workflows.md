@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- `make checkall` (run as `make -C /Users/probello/Repos/par-rt-db checkall`) is the definition of done; server integration tests need the dev Postgres: `make -C /Users/probello/Repos/par-rt-db dev-db-up` first.
+- `make checkall` (run as `make -C ~/Repos/par-rt-db checkall`) is the definition of done; server integration tests need the dev Postgres: `make -C ~/Repos/par-rt-db dev-db-up` first.
 - Wire casing is load-bearing and deliberately non-uniform: `Step` is `#[serde(tag = "op", rename_all = "camelCase", deny_unknown_fields)]`; `ClientMessage`/`ServerMessage` are `tag = "type", rename_all = "camelCase"`; `WorkflowStatus` serializes snake_case (`"pending"` etc.). Every server wire change lands in ts-client + rust-client + python-client + in-memory harness in the same feature.
 - SQL: validate + double-quote every identifier (schema via `validate_db_name`/`pg_schema`), bind every value via `$n`. Never interpolate a value.
 - No `unwrap()`/`expect()` outside `#[cfg(test)]`; zero clippy warnings under `-D warnings`.
@@ -104,7 +104,7 @@ fn workflow_info_wire_shape() {
 
 - [ ] **Step 2: Run to verify failure**
 
-Run: `cd /Users/probello/Repos/par-rt-db/server && cargo test --lib protocol::tests::workflow -- --nocapture`
+Run: `cd ~/Repos/par-rt-db/server && cargo test --lib protocol::tests::workflow -- --nocapture`
 Expected: compile error (`WorkflowSpec` etc. not found).
 
 - [ ] **Step 3: Implement the types**
@@ -230,14 +230,14 @@ pub struct WorkflowInfoFull {
 
 - [ ] **Step 4: Run tests**
 
-Run: `cd /Users/probello/Repos/par-rt-db/server && cargo test --lib protocol::tests::workflow`
+Run: `cd ~/Repos/par-rt-db/server && cargo test --lib protocol::tests::workflow`
 Expected: 3 passed.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git -C /Users/probello/Repos/par-rt-db add server/src/protocol.rs
-git -C /Users/probello/Repos/par-rt-db commit -m "feat(workflows): FM-29 wire types — WorkflowSpec/StepRetry/WorkflowInfo (server)"
+git -C ~/Repos/par-rt-db add server/src/protocol.rs
+git -C ~/Repos/par-rt-db commit -m "feat(workflows): FM-29 wire types — WorkflowSpec/StepRetry/WorkflowInfo (server)"
 ```
 
 ---
@@ -313,7 +313,7 @@ fn backoff_doubles_and_caps() {
 
 - [ ] **Step 2: Run to verify failure**
 
-Run: `cd /Users/probello/Repos/par-rt-db/server && cargo test --lib workflows::`
+Run: `cd ~/Repos/par-rt-db/server && cargo test --lib workflows::`
 Expected: compile error (module missing).
 
 - [ ] **Step 3: Implement the module**
@@ -799,14 +799,14 @@ async fn insert_claim_reset_roundtrip() {
 
 - [ ] **Step 5: Run tests**
 
-Run: `make -C /Users/probello/Repos/par-rt-db dev-db-up && cd /Users/probello/Repos/par-rt-db/server && cargo test --lib workflows:: && cargo test --test workflows_test`
+Run: `make -C ~/Repos/par-rt-db dev-db-up && cd ~/Repos/par-rt-db/server && cargo test --lib workflows:: && cargo test --test workflows_test`
 Expected: unit tests 4 passed; integration test passed.
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git -C /Users/probello/Repos/par-rt-db add server/src/workflows.rs server/src/lib.rs server/src/txn.rs server/tests/workflows_test.rs
-git -C /Users/probello/Repos/par-rt-db commit -m "feat(workflows): FM-29 side table, claim/reset, spec validation + backoff"
+git -C ~/Repos/par-rt-db add server/src/workflows.rs server/src/lib.rs server/src/txn.rs server/tests/workflows_test.rs
+git -C ~/Repos/par-rt-db commit -m "feat(workflows): FM-29 side table, claim/reset, spec validation + backoff"
 ```
 
 ---
@@ -906,7 +906,7 @@ Test 4 — crash resume: insert a 1-step spec, manually `claim_due` (orphaning t
 
 - [ ] **Step 2: Run to verify failure**
 
-Run: `cd /Users/probello/Repos/par-rt-db/server && cargo test --test workflows_test`
+Run: `cd ~/Repos/par-rt-db/server && cargo test --test workflows_test`
 Expected: FAIL — run stays `pending` forever (advance never happens; test times out) or compile error for the missing arm.
 
 - [ ] **Step 3: Implement the committer arm**
@@ -1106,15 +1106,15 @@ if claim_wf {
 
 - [ ] **Step 5: Run engine tests**
 
-Run: `cd /Users/probello/Repos/par-rt-db/server && cargo test --test workflows_test`
+Run: `cd ~/Repos/par-rt-db/server && cargo test --test workflows_test`
 Expected: all pass (happy path, exhaustion, sleep gate, crash resume).
 
 - [ ] **Step 6: fmt/clippy then commit**
 
 ```bash
-cd /Users/probello/Repos/par-rt-db/server && cargo fmt && cargo clippy --all-targets -- -D warnings
-git -C /Users/probello/Repos/par-rt-db add server/src/committer.rs server/src/scheduler.rs server/tests/workflows_test.rs
-git -C /Users/probello/Repos/par-rt-db commit -m "feat(workflows): FM-29 committer RunWorkflowAdvance arm + scheduler dual-table poll"
+cd ~/Repos/par-rt-db/server && cargo fmt && cargo clippy --all-targets -- -D warnings
+git -C ~/Repos/par-rt-db add server/src/committer.rs server/src/scheduler.rs server/tests/workflows_test.rs
+git -C ~/Repos/par-rt-db commit -m "feat(workflows): FM-29 committer RunWorkflowAdvance arm + scheduler dual-table poll"
 ```
 
 ---
@@ -1285,8 +1285,8 @@ if let Step::StartWorkflow { spec, .. } = step {
 - [ ] **Step 5: Commit**
 
 ```bash
-git -C /Users/probello/Repos/par-rt-db add server/src/txn.rs server/tests/workflows_test.rs
-git -C /Users/probello/Repos/par-rt-db commit -m "feat(workflows): FM-29 startWorkflow/cancelWorkflow txn steps with submit-time scoping"
+git -C ~/Repos/par-rt-db add server/src/txn.rs server/tests/workflows_test.rs
+git -C ~/Repos/par-rt-db commit -m "feat(workflows): FM-29 startWorkflow/cancelWorkflow txn steps with submit-time scoping"
 ```
 
 ---
@@ -1459,13 +1459,13 @@ async fn start_workflow_handler(
 
 - [ ] **Step 6: Tests** — protocol serde tests pass; add HTTP e2e to `workflows_test.rs` using the harness's `admin_post`/HTTP helper (copy the pattern `schedule_step_test.rs` uses to hit `/api/…` with a machine token; assert `{id}` shape, list round-trip, cancel true/false).
 
-Run: `cd /Users/probello/Repos/par-rt-db/server && cargo test --lib protocol:: && cargo test --test workflows_test && cargo test --test ws_test` (ws regression).
+Run: `cd ~/Repos/par-rt-db/server && cargo test --lib protocol:: && cargo test --test workflows_test && cargo test --test ws_test` (ws regression).
 
 - [ ] **Step 7: Commit**
 
 ```bash
-git -C /Users/probello/Repos/par-rt-db add server/src/protocol.rs server/src/ws.rs server/src/http_api.rs server/tests/workflows_test.rs
-git -C /Users/probello/Repos/par-rt-db commit -m "feat(workflows): FM-29 WS frames + HTTP one-shot start/cancel/list routes"
+git -C ~/Repos/par-rt-db add server/src/protocol.rs server/src/ws.rs server/src/http_api.rs server/tests/workflows_test.rs
+git -C ~/Repos/par-rt-db commit -m "feat(workflows): FM-29 WS frames + HTTP one-shot start/cancel/list routes"
 ```
 
 ---
@@ -1534,8 +1534,8 @@ plus `pub enum WorkflowStepOutcome { Success, Retry, Fail }`, `pub fn record_wor
 - [ ] **Step 5: Commit**
 
 ```bash
-git -C /Users/probello/Repos/par-rt-db add server/src/admin/workflows.rs server/src/admin/mod.rs server/src/metrics.rs server/src/committer.rs server/tests/workflows_test.rs
-git -C /Users/probello/Repos/par-rt-db commit -m "feat(workflows): FM-29 admin routes + rtdb_workflow_steps_total metrics"
+git -C ~/Repos/par-rt-db add server/src/admin/workflows.rs server/src/admin/mod.rs server/src/metrics.rs server/src/committer.rs server/tests/workflows_test.rs
+git -C ~/Repos/par-rt-db commit -m "feat(workflows): FM-29 admin routes + rtdb_workflow_steps_total metrics"
 ```
 
 ---
@@ -1551,10 +1551,10 @@ git -C /Users/probello/Repos/par-rt-db commit -m "feat(workflows): FM-29 admin r
 
 - [ ] **Step 1: Read** `ts-client/src/` to map where `Schedule`/`CancelSchedule` landed (protocol, builder, client, harness, tests) — mirror every site.
 - [ ] **Step 2: Write failing tests** — protocol round-trip fixtures (start/cancel steps, spec/info shapes), builder tests, harness `tick()` test (a 2-step workflow with `sleepBeforeMs` advances across ticks; retry policy re-fires a failing step on later ticks; exhaustion marks failed), admin client test against the in-memory harness.
-- [ ] **Step 3: Run** `cd /Users/probello/Repos/par-rt-db/ts-client && bunx vitest run tests/` → new tests fail.
+- [ ] **Step 3: Run** `cd ~/Repos/par-rt-db/ts-client && bunx vitest run tests/` → new tests fail.
 - [ ] **Step 4: Implement** every mirror site. Harness `tick()` rule: due `pending` runs execute their current step txn against harness state; success appends outcome and applies `sleepBeforeMs` gate (compare against the harness's simulated clock); failure applies retry/backoff identically to the server (`backoffMs` helper mirrors `workflows::backoff_ms`); maxed attempts → `failed`.
 - [ ] **Step 5: Verify** `bunx vitest run tests/ && bun run typecheck` (green vitest is NOT typecheck — both must pass).
-- [ ] **Step 6: Commit** `git -C /Users/probello/Repos/par-rt-db add ts-client && git -C /Users/probello/Repos/par-rt-db commit -m "feat(clients): mirror FM-29 workflows into ts-client (wire, builders, ws/http, admin, harness)"`
+- [ ] **Step 6: Commit** `git -C ~/Repos/par-rt-db add ts-client && git -C ~/Repos/par-rt-db commit -m "feat(clients): mirror FM-29 workflows into ts-client (wire, builders, ws/http, admin, harness)"`
 
 ---
 
@@ -1567,7 +1567,7 @@ git -C /Users/probello/Repos/par-rt-db commit -m "feat(workflows): FM-29 admin r
 
 - [ ] **Step 1: Read** where `Step::Schedule`/schedule surfaces live in `rust-client/src/` and mirror every site (wire, builder, http, ws, admin, tests).
 - [ ] **Step 2: Failing tests** — wire round-trip (byte-compare serde_json against fixture strings taken from the server protocol tests), builder, admin mock (follow the existing schedule admin test pattern).
-- [ ] **Step 3: Implement**; **Step 4: Run** `cd /Users/probello/Repos/par-rt-db/rust-client && cargo test && cargo clippy --all-targets -- -D warnings`; **Step 5: Commit** `feat(clients): mirror FM-29 workflows into rust-client (wire, builders, http/ws, admin)`.
+- [ ] **Step 3: Implement**; **Step 4: Run** `cd ~/Repos/par-rt-db/rust-client && cargo test && cargo clippy --all-targets -- -D warnings`; **Step 5: Commit** `feat(clients): mirror FM-29 workflows into rust-client (wire, builders, http/ws, admin)`.
 
 ---
 
@@ -1580,7 +1580,7 @@ git -C /Users/probello/Repos/par-rt-db commit -m "feat(workflows): FM-29 admin r
 
 - [ ] **Step 1: Read** where schedule ops live in the python client and mirror every site.
 - [ ] **Step 2: Failing tests** (`uv run pytest -q tests/`): wire round-trip fixtures, DSL builder, harness tick advancement/retry/exhaustion, admin client.
-- [ ] **Step 3: Implement**; **Step 4: Run** `cd /Users/probello/Repos/par-rt-db/python-client && uv run pytest -q && uv run pyright`; **Step 5: Commit** `feat(clients): mirror FM-29 workflows into python-client (wire, DSL, ws/http, admin, harness)`.
+- [ ] **Step 3: Implement**; **Step 4: Run** `cd ~/Repos/par-rt-db/python-client && uv run pytest -q && uv run pyright`; **Step 5: Commit** `feat(clients): mirror FM-29 workflows into python-client (wire, DSL, ws/http, admin, harness)`.
 
 ---
 
@@ -1594,7 +1594,7 @@ git -C /Users/probello/Repos/par-rt-db commit -m "feat(workflows): FM-29 admin r
 
 - [ ] **Step 1: Failing tests** — argument-validation unit tests mirroring the existing CLI tests (bad `--status` errors before network; missing `--db` errors).
 - [ ] **Step 2: Implement** — `WorkflowsCommand` subcommand enum + dispatch arms calling the rust-client admin surface.
-- [ ] **Step 3: Run** `cd /Users/probello/Repos/par-rt-db/cli && cargo test && cargo clippy --all-targets -- -D warnings`; against a live dev server optionally (`rtdb workflows list --db …`).
+- [ ] **Step 3: Run** `cd ~/Repos/par-rt-db/cli && cargo test && cargo clippy --all-targets -- -D warnings`; against a live dev server optionally (`rtdb workflows list --db …`).
 - [ ] **Step 4: Commit** `feat(cli): rtdb workflows list|get|start|cancel (FM-29)`.
 
 ---
@@ -1609,7 +1609,7 @@ git -C /Users/probello/Repos/par-rt-db commit -m "feat(workflows): FM-29 admin r
 
 - [ ] **Step 1: Read** the dashboard structure (pages, shared components — status chips, tables, modals — and the api hook pattern); list the reuse set.
 - [ ] **Step 2: Implement** the page + route + nav ("Workflows").
-- [ ] **Step 3: Verify** — `cd /Users/probello/Repos/par-rt-db/dashboard && bun run build` (or the package's check target) passes; optional live check per the dashboard agentchrome workflow (login, navigate in-SPA).
+- [ ] **Step 3: Verify** — `cd ~/Repos/par-rt-db/dashboard && bun run build` (or the package's check target) passes; optional live check per the dashboard agentchrome workflow (login, navigate in-SPA).
 - [ ] **Step 4: Commit** `feat(dashboard): /workflows operator page — run list, step timeline, cancel/start (FM-29)`.
 
 ---
@@ -1621,7 +1621,7 @@ git -C /Users/probello/Repos/par-rt-db commit -m "feat(workflows): FM-29 admin r
 - [ ] **Step 1: FEATURE_MATRIX #29** → `✅` with client-mirror status sentence (pattern: row #28's wording).
 - [ ] **Step 2: CLAUDE.md** — data-pipeline step list gains `StartWorkflow`/`CancelWorkflow`; committer tap-site list adds `handle_workflow_advance` (six → seven arms); add one workflows sentence to the architecture section (scheduler polls both tables; single-writer preserved).
 - [ ] **Step 3: READMEs** — server (workflows table + semantics: at-least-once per step, bypass principal, submit-time scoping, retry defaults), each client (DSL/builder/admin snippets), dashboard (page mention).
-- [ ] **Step 4: Full gate** — `make -C /Users/probello/Repos/par-rt-db checkall` (needs dev-db-up; ts-client dist built). Fix everything it reports.
+- [ ] **Step 4: Full gate** — `make -C ~/Repos/par-rt-db checkall` (needs dev-db-up; ts-client dist built). Fix everything it reports.
 - [ ] **Step 5: Commit** `docs: FM-29 workflows — FEATURE_MATRIX #29 ✅, CLAUDE.md, READMEs`.
 - [ ] **Step 6: Board** — the orchestrator (not the task implementer) verifies acceptance criteria 2–4 per criterion and marks the card done: (2) retry/backoff + crash-resume tests green, (3) admin list/get verified, (4) checkall output inspected (exit code from the log, not a piped tail).
 

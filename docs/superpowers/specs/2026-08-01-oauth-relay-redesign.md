@@ -34,7 +34,7 @@ closed-poll rejects. This redesign fixes both.
 - Add `noopener,noreferrer` to every OAuth popup open (tabnabbing hardening).
 - Replace the `window.opener`/handle relay with a channel that works without
   either window handle, for **both** the same-origin dashboard (cookie mode) and
-  cross-origin SDK consumers (token mode, e.g. projects.pardev.net).
+  cross-origin SDK consumers (token mode, e.g. projects.example.com).
 - Preserve every existing invariant: HttpOnly cookie delivery (SEC-001/SEC-002),
   single-use TTL-bounded OAuth state, origin allowlist, CSRF defense, and the
   provider-pluggable `OAuthProvider` trait shape.
@@ -53,7 +53,7 @@ The kanban analysis proposed "the parent polls a cookie-authenticated
 `GET /auth/state`." The session cookie is `SameSite=Lax` (`auth/cookie.rs`), so
 the browser attaches it **only** to same-site requests. The dashboard is
 same-origin with the server, so that works there — but a cross-origin consumer
-(`projects.pardev.net` polling `rtdb.pardev.net`) would never send the cookie,
+(`projects.example.com` polling `rtdb.example.com`) would never send the cookie,
 and the poll could never see the session. Making it work cross-origin would
 require `SameSite=None; Secure`, broadening cookie exposure for every route. The
 state-token-keyed design below works for both without touching cookie scope.

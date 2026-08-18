@@ -47,7 +47,7 @@ name = "par-rt-db-client"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-authors = ["Paul Robello <probello@gmail.com>"]
+authors = ["Paul Robello <user@example.com>"]
 description = "Rust client for par-rt-db (HTTP + reactive WebSocket)"
 repository = "https://github.com/paulrobello/par-rt-db"
 

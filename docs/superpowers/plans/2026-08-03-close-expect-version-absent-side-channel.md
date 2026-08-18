@@ -300,7 +300,7 @@ Expected: no warnings. (If clippy flags the `if let ... && ...` let-chain style,
 - [ ] **Step 8: Commit**
 
 ```bash
-cd /Users/probello/Repos/par-rt-db
+cd ~/Repos/par-rt-db
 git add server/src/txn.rs server/tests/per_row_auth_test.rs
 git commit -m "fix(auth): close ExpectVersion per-row-auth side-channel
 
@@ -471,7 +471,7 @@ Expected: no warnings.
 - [ ] **Step 6: Commit**
 
 ```bash
-cd /Users/probello/Repos/par-rt-db
+cd ~/Repos/par-rt-db
 git add server/src/txn.rs server/tests/per_row_auth_test.rs
 git commit -m "fix(auth): close ExpectAbsent per-row-auth side-channel
 
@@ -502,13 +502,13 @@ Also update the ยง7 *Status* bullet that says *"`ExpectVersion`/`ExpectAbsent` โ
 
 - [ ] **Step 4: Run the full gate**
 
-Run: `cd /Users/probello/Repos/par-rt-db && make dev-db-up && make checkall`
+Run: `cd ~/Repos/par-rt-db && make dev-db-up && make checkall`
 Expected: green (fmt-check + clippy `-D warnings` + typecheck + the whole suite). The new tests are in `per_row_auth_test`; the existing per-row suites confirm no regression.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-cd /Users/probello/Repos/par-rt-db
+cd ~/Repos/par-rt-db
 git add FEATURE_MATRIX.md docs/superpowers/specs/2026-07-24-per-row-authorization-design.md docs/superpowers/specs/2026-08-02-per-row-auth-predicate-dsl-design.md
 git commit -m "docs(auth): mark ExpectVersion/ExpectAbsent side-channel resolved
 

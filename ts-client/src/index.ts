@@ -25,7 +25,7 @@
  *   items: defineTable({ title: t.string() }).index("by_title", ["title"]),
  * });
  * const api = createApi(schema);
- * const client = new RtDbClient({ url: "wss://rtdb.pardev.net", db: "kanban" });
+ * const client = new RtDbClient({ url: "wss://rtdb.example.com", db: "kanban" });
  * ```
  */
 

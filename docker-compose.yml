@@ -1,7 +1,7 @@
-# Production stack for lenny2 (standalone Docker, plain compose — not Swarm).
+# Production stack for docker-host (standalone Docker, plain compose — not Swarm).
 # Secrets come from a sibling .env file (never committed). See .env.example.
 # The server publishes on 127.0.0.1:8300 only; the host cloudflared tunnel
-# routes rtdb.pardev.net -> localhost:8300.
+# routes rtdb.example.com -> localhost:8300.
 services:
   postgres:
     image: pgvector/pgvector:pg17
@@ -48,11 +48,11 @@ services:
       RTDB_PORT: "8300"
       RTDB_DATABASE_URL: postgres://rtdb:${POSTGRES_PASSWORD}@postgres:5432/rtdb
       RTDB_ADMIN_KEY: ${RTDB_ADMIN_KEY:?set RTDB_ADMIN_KEY in .env}
-      RTDB_PUBLIC_URL: ${RTDB_PUBLIC_URL:-https://rtdb.pardev.net}
+      RTDB_PUBLIC_URL: ${RTDB_PUBLIC_URL:-https://rtdb.example.com}
       # Serves the bundled operator console SPA same-origin (baked into the
       # image at /app/dashboard-dist). Override to "" for an API-only deploy.
       RTDB_STATIC_DIR: ${RTDB_STATIC_DIR:-/app/dashboard-dist}
-      RTDB_ALLOWED_ORIGINS: ${RTDB_ALLOWED_ORIGINS:-https://projects.pardev.net}
+      RTDB_ALLOWED_ORIGINS: ${RTDB_ALLOWED_ORIGINS:-https://projects.example.com}
       RTDB_GITHUB_CLIENT_ID: ${RTDB_GITHUB_CLIENT_ID:-}
       RTDB_GITHUB_CLIENT_SECRET: ${RTDB_GITHUB_CLIENT_SECRET:-}
       RTDB_GOOGLE_CLIENT_ID: ${RTDB_GOOGLE_CLIENT_ID:-}

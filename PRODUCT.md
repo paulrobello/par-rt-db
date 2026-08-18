@@ -24,7 +24,7 @@ A self-hosted realtime document DB the operator fully controls — Convex's deve
 
 ## Operating Context
 
-- Deployed live at `rtdb.pardev.net` (host lenny2, docker compose behind a Cloudflare tunnel); the dashboard is a same-origin SPA served by the server itself from `RTDB_STATIC_DIR`. In the docker deploy the SPA is **baked into the image** (the `dashboard` build stage in `Dockerfile` copies `dist/` to `/app/dashboard-dist`), so a frontend change ships via `docker compose up -d --build` (image rebuild + server container recreate), not a live-mounted volume.
+- Reference deployment shape: `docker compose` behind a Cloudflare tunnel (host-agnostic; see `deploy/README.md`); the dashboard is a same-origin SPA served by the server itself from `RTDB_STATIC_DIR`. In the docker deploy the SPA is **baked into the image** (the `dashboard` build stage in `Dockerfile` copies `dist/` to `/app/dashboard-dist`), so a frontend change ships via `docker compose up -d --build` (image rebuild + server container recreate), not a live-mounted volume.
 - The operator authenticates either with the admin key (machine) or as an OAuth'd admin (GitHub, Google, GitLab, Microsoft, Apple, or a configured OIDC provider — allowlisted as admin).
 - Every database is isolated and named; the operator juggles several (e.g. the projects board, app datastores). Documents are JSON; indexed fields become typed Postgres columns, the rest lives in a `doc` jsonb column merged in at read time.
 - Realtime is central: subscriptions re-run on every write, and the op feed surfaces durable mutations as they happen. The dashboard must feel live, not request/response.
@@ -51,7 +51,7 @@ Constraints:
 
 ## Brand Commitments
 
-- Product name **par-rt-db**, under the **pardev.net** / **Parsidion** umbrella alongside other Paul Robello projects (e.g. the projects board at projects.pardev.net).
+- Product name **par-rt-db**, a self-hostable realtime document database.
 - No existing visual identity, logo, or design system for par-rt-db has been declared binding — the visual world is established in this work.
 
 ## Evidence on Hand
@@ -61,7 +61,7 @@ Constraints:
 - Server source: `server/src/` (`auth/`, `admin/`, `http_api.rs`, `ws.rs`, `committer.rs`, `schema.rs`, `query.rs`, `txn.rs`, `config.rs`, `storage.rs`).
 - Four client implementations of the wire contract: `server/src/protocol.rs`, `ts-client/src/protocol.ts`, `rust-client/src/wire.rs`, and `python-client/src/par_rt_db/wire.py` (the SPA will speak this protocol via the ts-client SDK).
 - `FEATURE_MATRIX.md` (#18) — the parity/feature contract.
-- Live instance: rtdb.pardev.net.
+- Deployment shape: self-hosted `docker compose` behind a Cloudflare tunnel (`deploy/README.md`); no specific hosted instance is assumed.
 - Absences to respect: no real usage metrics, customers, or testimonials exist; the dashboard must not synthesize social proof.
 
 ## Product Principles

@@ -288,7 +288,7 @@ outside `#[cfg(test)]`. Full list in [`../CLAUDE.md`](../CLAUDE.md).
 
 ## Deploy
 
-Deployed live at `rtdb.pardev.net` on host lenny2 (plain `docker compose`)
+In production the server runs as plain `docker compose` on a standalone Docker host,
 reached through a Cloudflare tunnel. Production stack and runbook:
 [`../Dockerfile`](../Dockerfile), [`../docker-compose.yml`](../docker-compose.yml),
 [`../deploy/README.md`](../deploy/README.md). Build on the x86_64 host, not from

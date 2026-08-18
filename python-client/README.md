@@ -171,7 +171,7 @@ async def main() -> None:
     async def get_token() -> str | None:
         return _token()  # your per-db machine token or OAuth session token
 
-    client = RtDbClient("wss://rtdb.pardev.net", "mydb", get_token=get_token)
+    client = RtDbClient("wss://rtdb.example.com", "mydb", get_token=get_token)
     await client.connect()
     async with client.subscribe(TableQuery("items").collect()) as sub:
         # ``_id`` is server-managed (reserved); insert user fields only.
@@ -206,7 +206,7 @@ from par_rt_db import Mutation, RtDbAsyncHttpClient, TableQuery
 
 async def main() -> None:
     # Same `(url, db, token)` shape as the sync client; `async with` closes it.
-    async with RtDbAsyncHttpClient("https://rtdb.pardev.net", "mydb", "<machine-token>") as client:
+    async with RtDbAsyncHttpClient("https://rtdb.example.com", "mydb", "<machine-token>") as client:
         rows = await client.run(TableQuery("items").collect())
         await client.mutate(
             Mutation.builder().insert("items", {"_id": "i1", "name": "widget", "n": 1}).build()
@@ -276,7 +276,7 @@ from par_rt_db import Cast, Migration
 from par_rt_db.schema import t
 from par_rt_db.admin import RtDbAdminClient
 
-admin = RtDbAdminClient("https://rtdb.pardev.net", ADMIN_KEY)
+admin = RtDbAdminClient("https://rtdb.example.com", ADMIN_KEY)
 result = admin.migrate_schema(
     "kanban",
     Migration.builder()
@@ -310,7 +310,7 @@ from par_rt_db.wire import StepRetry, WorkflowInfo, WorkflowSpec, WorkflowStepSp
 from par_rt_db.ws_client import RtDbClient  # or RtDbHttpClient from par_rt_db.http_client
 
 db = RtDbClient(
-    "wss://rtdb.pardev.net", "mydb", get_token=get_token
+    "wss://rtdb.example.com", "mydb", get_token=get_token
 )  # as in the reactive example above
 
 txn = Mutation.builder().insert("work_items", {"title": "welcome"}).build()

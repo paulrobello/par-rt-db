@@ -38,7 +38,7 @@ MVP spec accepted it for a personal, allowlisted deployment; this spec closes it
 attacker cannot forge for the victim. At `begin`, set a short-lived cookie whose
 value is the `state_token`; at `callback`, require the cookie to match the `state`
 query param. An attacker can know `state_A` but cannot write a cookie into the
-victim's `rtdb.pardev.net` cookie jar (only an `rtdb.pardev.net` response can, and
+victim's `rtdb.example.com` cookie jar (only an `rtdb.example.com` response can, and
 the attacker does not control that origin), so the victim's callback carries no
 matching cookie and is rejected.
 
@@ -130,7 +130,7 @@ session-cookie shape:
   client change) but **not verified** at `callback` — today's exact behavior.
 
 **`server/src/lib.rs` `cors_layer`** — add `.allow_credentials(true)`. This is
-required for a **cross-origin** consumer (e.g. `projects.pardev.net`) to have the
+required for a **cross-origin** consumer (e.g. `projects.example.com`) to have the
 CSRF cookie *stored* by its credentialed `/begin` fetch. It is safe because the
 origin check is already an exact-match `AllowOrigin::predicate` that echoes the
 specific request origin (never the `*` wildcard), which is the CORS-spec

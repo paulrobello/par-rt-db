@@ -66,7 +66,7 @@ description = "Python client for par-rt-db (self-hosted realtime document databa
 readme = "README.md"
 requires-python = ">=3.12"
 license = {text = "MIT"}
-authors = [{name = "Paul Robello", email = "probello@gmail.com"}]
+authors = [{name = "Paul Robello", email = "user@example.com"}]
 dependencies = ["pydantic>=2.7"]
 
 [project.optional-dependencies]

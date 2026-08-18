@@ -320,7 +320,7 @@ impl AppState {
 /// does not apply to the WS handshake, so a cookie-authenticated `/sync` or
 /// `/admin/stream` upgrade would otherwise admit any same-site origin (and the
 /// `SameSite=Lax` session cookie is scoped to the registrable domain, so every
-/// `*.pardev.net` host shares it). Browsers always send `Origin` on a WS
+/// `*.example.com` host shares it). Browsers always send `Origin` on a WS
 /// handshake; absent Origin = non-browser client (CLI/SDK/machine token), and
 /// the existing auth gates — the post-upgrade `Auth` frame on `/sync`, the
 /// `Authorization` header or `Sec-WebSocket-Protocol: rtdb-admin.<token>`

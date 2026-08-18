@@ -105,7 +105,7 @@ Add the constructor next to `conflict` (`RtDbError::new` is `pub`):
 
 - [ ] **Step 5: Gate + commit**
 
-`make -C /Users/probello/Repos/par-rt-db lint` (clippy clean), then:
+`make -C ~/Repos/par-rt-db lint` (clippy clean), then:
 ```bash
 git add server/src/error.rs
 git commit -m "feat(quotas): add QUOTA_EXCEEDED error code (507)"
@@ -560,7 +560,7 @@ Add the recorder (mirror `record_subs_skip` at :265):
 
 - [ ] **Step 8: Gate + commit**
 
-`cargo build --manifest-path server/Cargo.toml` (fix any snapshot field the compiler names), then `make -C /Users/probello/Repos/par-rt-db lint && cargo test --manifest-path server/Cargo.toml --lib quota`.
+`cargo build --manifest-path server/Cargo.toml` (fix any snapshot field the compiler names), then `make -C ~/Repos/par-rt-db lint && cargo test --manifest-path server/Cargo.toml --lib quota`.
 ```bash
 git add server/src/quota.rs server/src/lib.rs server/src/metrics.rs
 git commit -m "feat(quotas): UsageCache + measure + metrics counter (ENH-011)"
@@ -676,7 +676,7 @@ In `server/src/committer.rs` `handle_migrate`, immediately after `derived.valida
 
 ```bash
 cargo test --manifest-path server/Cargo.toml --test quota_test
-make -C /Users/probello/Repos/par-rt-db lint
+make -C ~/Repos/par-rt-db lint
 git add server/src/schema.rs server/src/admin.rs server/src/committer.rs server/tests/quota_test.rs
 git commit -m "feat(quotas): enforce maxTablesPerDb at push-schema + migrate (ENH-011)"
 ```
@@ -791,7 +791,7 @@ In `server/src/committer.rs` `handle_subscribe`, immediately before the `ctx.sub
 
 ```bash
 cargo test --manifest-path server/Cargo.toml --test quota_test
-make -C /Users/probello/Repos/par-rt-db lint
+make -C ~/Repos/par-rt-db lint
 git add server/src/subs.rs server/src/committer.rs server/tests/quota_test.rs
 git commit -m "feat(quotas): enforce maxSubsPerDb at subscribe (ENH-011)"
 ```
@@ -929,7 +929,7 @@ At the end of `handle_mutate` (after `execute_txn` succeeds, before returning), 
 
 ```bash
 cargo test --manifest-path server/Cargo.toml --test quota_test
-make -C /Users/probello/Repos/par-rt-db checkall
+make -C ~/Repos/par-rt-db checkall
 git add server/src/committer.rs server/src/lib.rs server/tests/quota_test.rs
 git commit -m "feat(quotas): enforce maxStorageBytesPerDb at mutate/scheduled/migrate (ENH-011)"
 ```
@@ -1027,7 +1027,7 @@ In `server/src/admin.rs` `delete_db` handler, after the database is dropped (whe
 
 ```bash
 cargo test --manifest-path server/Cargo.toml --test quota_test
-make -C /Users/probello/Repos/par-rt-db lint
+make -C ~/Repos/par-rt-db lint
 git add server/src/http_api.rs server/src/admin.rs server/tests/quota_test.rs
 git commit -m "feat(quotas): enforce storage cap at upload + evict on delete-db (ENH-011)"
 ```
@@ -1106,7 +1106,7 @@ In `db_stats`, before the return (reuse the already-computed `total_size_bytes`;
 
 ```bash
 cargo test --manifest-path server/Cargo.toml --test dashboard_test db_stats
-make -C /Users/probello/Repos/par-rt-db lint
+make -C ~/Repos/par-rt-db lint
 git add server/src/admin.rs server/tests/dashboard_test.rs
 git commit -m "feat(quotas): expose quota+usage in db_stats response (ENH-011)"
 ```
@@ -1156,7 +1156,7 @@ export interface HotConfigPatch {
 }
 ```
 
-- [ ] **Step 5: Run + gate + commit** (`cd ts-client && bunx vitest run && make -C /Users/probello/Repos/par-rt-db typecheck`)
+- [ ] **Step 5: Run + gate + commit** (`cd ts-client && bunx vitest run && make -C ~/Repos/par-rt-db typecheck`)
 ```bash
 git add ts-client/src/errors.ts ts-client/src/admin.ts ts-client/tests/
 git commit -m "feat(client-ts): mirror QUOTA_EXCEEDED + HotConfig quota fields (ENH-011)"
@@ -1188,7 +1188,7 @@ fn hot_config_round_trips_quota_fields() {
 
 - [ ] **Step 3: Implement** — in `rust-client/src/error.rs` add `QuotaExceeded,` to `ErrorCode`; in `rust-client/src/wire.rs` add the three fields to `HotConfig` (`max_storage_bytes_per_db: u64`) and the three `Option<…>` mirrors (`#[serde(default, skip_serializing_if = "Option::is_none")]`) to `HotConfigPatch`, matching the existing field style.
 
-- [ ] **Step 4: Run + gate + commit** (`cargo test --manifest-path rust-client/Cargo.toml && make -C /Users/probello/Repos/par-rt-db lint`)
+- [ ] **Step 4: Run + gate + commit** (`cargo test --manifest-path rust-client/Cargo.toml && make -C ~/Repos/par-rt-db lint`)
 ```bash
 git add rust-client/src/error.rs rust-client/src/wire.rs rust-client/tests/
 git commit -m "feat(client-rust): mirror QUOTA_EXCEEDED + HotConfig quota fields (ENH-011)"
@@ -1241,7 +1241,7 @@ git commit -m "feat(client-py): mirror QUOTA_EXCEEDED + HotConfig quota fields (
 
 - [ ] **Step 3: Usage bar** — in the db-stats view (consumes `/admin/db/{db}/stats`), render `storageUsedBytes`/`storageQuotaBytes` as "Storage: {used} / {quota}" (hide when quota == 0).
 
-- [ ] **Step 4: Gate + commit** (`make -C /Users/probello/Repos/par-rt-db ts-client-build && make -C /Users/probello/Repos/par-rt-db typecheck`)
+- [ ] **Step 4: Gate + commit** (`make -C ~/Repos/par-rt-db ts-client-build && make -C ~/Repos/par-rt-db typecheck`)
 ```bash
 git add dashboard/src/lib/types.ts dashboard/src/
 git commit -m "feat(dashboard): quota config inputs + storage usage bar (ENH-011)"
@@ -1257,7 +1257,7 @@ git commit -m "feat(dashboard): quota config inputs + storage usage bar (ENH-011
 
 - [ ] **Step 2: CLAUDE.md** — add a bullet to "Invariants you must preserve" documenting quotas (three caps in HotConfig; the enforcement points; cached live `pg_total_relation_size` measurement; no admin bypass; the best-effort post-commit refresh). Match surrounding bullet density.
 
-- [ ] **Step 3: Gate + commit** (`make -C /Users/probello/Repos/par-rt-db checkall` — the full gate, definition of done)
+- [ ] **Step 3: Gate + commit** (`make -C ~/Repos/par-rt-db checkall` — the full gate, definition of done)
 ```bash
 git add FEATURE_MATRIX.md CLAUDE.md
 git commit -m "docs(quotas): ENH-011 feature matrix + CLAUDE.md (done)"

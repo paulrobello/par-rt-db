@@ -1,13 +1,13 @@
-# Deploying par-rt-db to lenny2
+# Deploying par-rt-db to a Docker host
 
-lenny2 is a standalone Docker host (plain `docker compose`, not Swarm). Public
+The target is a standalone Docker host (plain `docker compose`, not Swarm). Public
 traffic reaches it through the host `cloudflared` tunnel, which routes
-`rtdb.pardev.net` -> `http://localhost:8300`. No ports 80/443 are opened on the
+`rtdb.example.com` -> `http://localhost:8300`. No ports 80/443 are opened on the
 VPS and no reverse proxy is needed — TLS is terminated at Cloudflare's edge.
 
 ## Table of contents
 
-- [One-time DNS/tunnel wiring (already done 2026-07-21)](#one-time-dnstunnel-wiring-already-done-2026-07-21)
+- [One-time DNS/tunnel wiring (already done 2026-07-21)](#one-time-dnstunnel-wiring)
 - [Deploy / update](#deploy--update)
 - [Topology: single instance (not horizontally scalable yet)](#topology-single-instance-not-horizontally-scalable-yet)
 - [Postgres image](#postgres-image)
@@ -22,19 +22,18 @@ VPS and no reverse proxy is needed — TLS is terminated at Cloudflare's edge.
 - [Troubleshooting](#troubleshooting)
 - [Rollback](#rollback)
 
-## One-time DNS/tunnel wiring (already done 2026-07-21)
+## One-time DNS/tunnel wiring
 
-- Proxied CNAME `rtdb.pardev.net` -> `<lenny2-tunnel-id>.cfargotunnel.com`
-  (overrides the `*.pardev.net` wildcard that points at lenny1).
-- Tunnel ingress rule `rtdb.pardev.net` -> `http://localhost:8300` appended to
-  the lenny2 tunnel.
-- No Cloudflare Access app — par-rt-db carries its own auth (documented
-  exception in `~/.claude/guides/infrastructure.md`).
+- Proxied CNAME `rtdb.example.com` -> `<tunnel-id>.cfargotunnel.com`
+  (overrides the `*.example.com` wildcard that points at another host).
+- Tunnel ingress rule `rtdb.example.com` -> `http://localhost:8300` appended to
+  the docker-host tunnel.
+- No Cloudflare Access app — par-rt-db carries its own auth.
 
 ## Deploy / update
 
 The preferred path is `make deploy` from the repo root: it runs `make checkall`
-first (the full gate), then rsyncs to lenny2 and runs `docker compose up -d
+first (the full gate), then rsyncs to docker-host and runs `docker compose up -d
 --build` with `RTDB_BUILD_COMMIT` baked in (so `/healthz` reports the deployed
 commit). See the [`Makefile`](../Makefile) `deploy` target for the canonical
 commands.
@@ -48,20 +47,20 @@ label: it skips `checkall`, and unless you export `RTDB_BUILD_COMMIT` yourself,
 `/healthz` reports `git_commit: "unknown"`. Use it only when you need to bypass
 the gate intentionally.
 
-Source is synced to `/docker/par-rt-db` on lenny2 and built there (the host is
+Source is synced to `/docker/par-rt-db` on docker-host and built there (the host is
 x86_64; do not `docker save` an arm64 image from a Mac).
 
 ```sh
 # from the repo root on the workstation:
 # .env/.env.* MUST be excluded — they are gitignored (don't exist in the
-# local checkout) but hold the live secrets on lenny2, so `--delete` without
+# local checkout) but hold the live secrets on docker-host, so `--delete` without
 # these excludes would wipe them out.
 rsync -az --delete \
   --exclude target/ --exclude .git/ --exclude .superpowers/ --exclude node_modules/ \
   --exclude .env --exclude '.env.*' \
-  ./ root@lenny2.par-com.net:/docker/par-rt-db/
+  ./ root@docker-host.example.com:/docker/par-rt-db/
 
-# on lenny2 (the .env there holds the secrets, mode 600):
+# on docker-host (the .env there holds the secrets, mode 600):
 cd /docker/par-rt-db
 docker compose up -d --build
 docker compose ps
@@ -78,7 +77,7 @@ curl -fsS http://127.0.0.1:8300/healthz | jq .
 # Postgres is not — `curl -f` exits non-zero so this surfaces in scripts.
 ```
 
-Then verify the public path: `curl -fsS https://rtdb.pardev.net/healthz | jq .`.
+Then verify the public path: `curl -fsS https://rtdb.example.com/healthz | jq .`.
 
 ## Topology: single instance (not horizontally scalable yet)
 
@@ -221,7 +220,7 @@ aggregate-only (no per-db, no principal data), same auth posture as `/healthz`
 (none). Content-negotiated on `Accept`: a browser (`text/html`) is served the
 SPA's `index.html` when `RTDB_STATIC_DIR` is set; everything else (Prometheus
 sends `application/openmetrics-text`, curl, API-only deploys) gets the
-Prometheus text. Point a scraper at `https://rtdb.pardev.net/metrics`.
+Prometheus text. Point a scraper at `https://rtdb.example.com/metrics`.
 
 The subscription-invalidation canary above is the one alert to wire up: alert
 on any increase of `rtdb_subs_missed_pushes_total` (only populated when
@@ -323,13 +322,13 @@ the bun/vite build and copies `dist/` to `/app/dashboard-dist`, and
 
 ```sh
 # create a database, push its schema, mint a machine token, allowlist a user:
-curl -s -X POST https://rtdb.pardev.net/admin/create-db \
+curl -s -X POST https://rtdb.example.com/admin/create-db \
   -H "Authorization: Bearer $RTDB_ADMIN_KEY" -d '{"name":"kanban"}'
-curl -s -X POST https://rtdb.pardev.net/admin/push-schema \
+curl -s -X POST https://rtdb.example.com/admin/push-schema \
   -H "Authorization: Bearer $RTDB_ADMIN_KEY" -d '{"db":"kanban","schema":{...}}'
-curl -s -X POST https://rtdb.pardev.net/admin/mint-token \
+curl -s -X POST https://rtdb.example.com/admin/mint-token \
   -H "Authorization: Bearer $RTDB_ADMIN_KEY" -d '{"db":"kanban","name":"cli"}'
-curl -s -X POST https://rtdb.pardev.net/admin/allowlist \
+curl -s -X POST https://rtdb.example.com/admin/allowlist \
   -H "Authorization: Bearer $RTDB_ADMIN_KEY" -d '{"db":"kanban","action":"add","email":"you@example.com"}'
 ```
 
@@ -422,7 +421,7 @@ Common operator symptoms on the live deploy:
 ## Rollback
 
 There are no image tags to pin: `make deploy` rsyncs the current checkout to
-lenny2 and builds in place, so rolling back a bad deploy means redeploying an
+docker-host and builds in place, so rolling back a bad deploy means redeploying an
 older commit.
 
 1. On the workstation, from the repo root, check out the last-known-good commit
@@ -437,7 +436,7 @@ older commit.
    `/docker/par-rt-db` (the `.env` excludes keep the live secrets intact), and
    rebuilds the image on the host (`docker compose up -d --build`).
 
-2. Verify: `curl -fsS https://rtdb.pardev.net/healthz -H "Authorization: Bearer $RTDB_ADMIN_KEY" | jq .`
+2. Verify: `curl -fsS https://rtdb.example.com/healthz -H "Authorization: Bearer $RTDB_ADMIN_KEY" | jq .`
    reports the expected `git_commit` (the redeployed sha; the fingerprint is
    admin-only — SEC-129), and a spot query against a row
    you know was affected by the bad deploy behaves correctly again.

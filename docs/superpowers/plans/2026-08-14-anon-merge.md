@@ -13,7 +13,7 @@
 ## Global Constraints
 
 - `make dev-db-up` before any test run (integration tests hit real Postgres on `127.0.0.1:55434`).
-- Gate: `make -C /Users/probello/Repos/par-rt-db checkall` (fmt + clippy `-D warnings` + typecheck + tests). Run from the repo root or with `-C` — a `cd`-shifted cwd silently gates only one package.
+- Gate: `make -C ~/Repos/par-rt-db checkall` (fmt + clippy `-D warnings` + typecheck + tests). Run from the repo root or with `-C` — a `cd`-shifted cwd silently gates only one package.
 - No `unwrap()`/`expect()` outside `#[cfg(test)]`. Zero clippy warnings.
 - SQL: double-quote every identifier built from names (`ddl::pg_table`/`pg_col`/`pg_schema`), bind every value via `$n`.
 - Single-writer invariant: document writes only inside the committer turn. Storage/session/user-row SQL is direct (storage bypasses the committer by design; auth tables are not document tables).
@@ -200,7 +200,7 @@ Note: `TableDef` may have more fields than the struct literal above shows — co
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test --manifest-path /Users/probello/Repos/par-rt-db/server/Cargo.toml --lib merge::` (no dev-db needed — pure unit tests)
+Run: `cargo test --manifest-path ~/Repos/par-rt-db/server/Cargo.toml --lib merge::` (no dev-db needed — pure unit tests)
 Expected: FAIL — `principal_bearing_fields`/`rewrite_doc` not defined.
 
 - [ ] **Step 3: Implement the two pure functions**
@@ -352,17 +352,17 @@ Remove the `tracing::warn!` `table =` line's awkward key derivation if it doesn'
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test --manifest-path /Users/probello/Repos/par-rt-db/server/Cargo.toml --lib merge::`
+Run: `cargo test --manifest-path ~/Repos/par-rt-db/server/Cargo.toml --lib merge::`
 Expected: PASS (5 tests).
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git -C /Users/probello/Repos/par-rt-db add server/src/merge.rs server/src/lib.rs
-git -C /Users/probello/Repos/par-rt-db commit -m "feat(merge): pure principal-bearing field derivation + doc rewrite (FM-27 task 1)"
+git -C ~/Repos/par-rt-db add server/src/merge.rs server/src/lib.rs
+git -C ~/Repos/par-rt-db commit -m "feat(merge): pure principal-bearing field derivation + doc rewrite (FM-27 task 1)"
 ```
 
-Verify staging with `git -C /Users/probello/Repos/par-rt-db show --stat HEAD` (both files present).
+Verify staging with `git -C ~/Repos/par-rt-db show --stat HEAD` (both files present).
 
 ---
 
@@ -589,7 +589,7 @@ Adapt freely where this sketch's assumptions don't match the real types (Query's
 
 - [ ] **Step 4: Run tests to verify they fail**
 
-Run: `make -C /Users/probello/Repos/par-rt-db dev-db-up && cargo test --manifest-path /Users/probello/Repos/par-rt-db/server/Cargo.toml --test merge_test`
+Run: `make -C ~/Repos/par-rt-db dev-db-up && cargo test --manifest-path ~/Repos/par-rt-db/server/Cargo.toml --test merge_test`
 Expected: FAIL — `merge_users` doesn't exist on `Committers` (compile error).
 
 - [ ] **Step 5: Implement the arm**
@@ -781,14 +781,14 @@ Adapt details to the real code: `err.code()` accessor vs `err.code` field (see `
 
 - [ ] **Step 6: Run tests to verify they pass**
 
-Run: `cargo test --manifest-path /Users/probello/Repos/par-rt-db/server/Cargo.toml --test merge_test`
+Run: `cargo test --manifest-path ~/Repos/par-rt-db/server/Cargo.toml --test merge_test`
 Expected: PASS (3 tests).
 
 - [ ] **Step 7: Commit**
 
 ```bash
-git -C /Users/probello/Repos/par-rt-db add server/src/committer.rs server/src/txn.rs server/src/metrics.rs server/tests/merge_test.rs
-git -C /Users/probello/Repos/par-rt-db commit -m "feat(merge): RunMergeUsers committer arm restamps principal-bearing docs (FM-27 task 2)"
+git -C ~/Repos/par-rt-db add server/src/committer.rs server/src/txn.rs server/src/metrics.rs server/tests/merge_test.rs
+git -C ~/Repos/par-rt-db commit -m "feat(merge): RunMergeUsers committer arm restamps principal-bearing docs (FM-27 task 2)"
 ```
 Verify with `git show --stat HEAD` (4 files).
 
@@ -885,7 +885,7 @@ Check the real column lists of `rtdb_auth.users`/`rtdb_auth.sessions` in `db.rs`
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cargo test --manifest-path /Users/probello/Repos/par-rt-db/server/Cargo.toml --test merge_test orchestrates`
+Run: `cargo test --manifest-path ~/Repos/par-rt-db/server/Cargo.toml --test merge_test orchestrates`
 Expected: FAIL — `merge::merge_users` / `MergeReport` not defined.
 
 - [ ] **Step 3: Implement the orchestrator**
@@ -1005,14 +1005,14 @@ pub async fn merge_users(
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `cargo test --manifest-path /Users/probello/Repos/par-rt-db/server/Cargo.toml --test merge_test`
+Run: `cargo test --manifest-path ~/Repos/par-rt-db/server/Cargo.toml --test merge_test`
 Expected: PASS (4 tests).
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git -C /Users/probello/Repos/par-rt-db add server/src/merge.rs server/tests/merge_test.rs
-git -C /Users/probello/Repos/par-rt-db commit -m "feat(merge): cross-db orchestration + storage swap + session re-point + guarded delete (FM-27 task 3)"
+git -C ~/Repos/par-rt-db add server/src/merge.rs server/tests/merge_test.rs
+git -C ~/Repos/par-rt-db commit -m "feat(merge): cross-db orchestration + storage swap + session re-point + guarded delete (FM-27 task 3)"
 ```
 
 ---
@@ -1085,7 +1085,7 @@ async fn admin_merge_users_endpoint_requires_confirm_and_runs_merge() -> anyhow:
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cargo test --manifest-path /Users/probello/Repos/par-rt-db/server/Cargo.toml --test merge_test admin_merge`
+Run: `cargo test --manifest-path ~/Repos/par-rt-db/server/Cargo.toml --test merge_test admin_merge`
 Expected: FAIL — route doesn't exist (404/405 or handler mismatch).
 
 - [ ] **Step 3: Implement the handler**
@@ -1140,14 +1140,14 @@ In `server/src/admin/mod.rs`: add `mod merge;` to the module list (line ~15) and
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `cargo test --manifest-path /Users/probello/Repos/par-rt-db/server/Cargo.toml --test merge_test`
+Run: `cargo test --manifest-path ~/Repos/par-rt-db/server/Cargo.toml --test merge_test`
 Expected: PASS (5 tests).
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git -C /Users/probello/Repos/par-rt-db add server/src/admin/merge.rs server/src/admin/mod.rs server/tests/merge_test.rs
-git -C /Users/probello/Repos/par-rt-db commit -m "feat(admin): POST /admin/merge-users escape hatch with typed confirm (FM-27 task 4)"
+git -C ~/Repos/par-rt-db add server/src/admin/merge.rs server/src/admin/mod.rs server/tests/merge_test.rs
+git -C ~/Repos/par-rt-db commit -m "feat(admin): POST /admin/merge-users escape hatch with typed confirm (FM-27 task 4)"
 ```
 
 ---
@@ -1387,14 +1387,14 @@ async fn oauth_login_merges_anon_footprint_end_to_end() -> anyhow::Result<()> {
 - [ ] **Step 7: Run test to verify it fails, then implement is already done — verify it passes**
 
 Steps 2–5 are the implementation; run the e2e now:
-Run: `cargo test --manifest-path /Users/probello/Repos/par-rt-db/server/Cargo.toml --test merge_test end_to_end`
+Run: `cargo test --manifest-path ~/Repos/par-rt-db/server/Cargo.toml --test merge_test end_to_end`
 Expected: PASS. If the binding assertion (step 3 of the test) fails, check `/begin` is reached with the cookie jar (the anon cookie must ride the GET — `cookie_store(true)` handles it) and that `bearer_token(headers)` reads the `rtdb_session` cookie.
 
 - [ ] **Step 8: Commit (auth-touching — flag for manual review)**
 
 ```bash
-git -C /Users/probello/Repos/par-rt-db add server/src/db.rs server/src/auth/provider.rs server/tests/merge_test.rs
-git -C /Users/probello/Repos/par-rt-db commit -m "feat(auth): bind anon session at OAuth /begin and merge into the real account at callback (FM-27 task 5)"
+git -C ~/Repos/par-rt-db add server/src/db.rs server/src/auth/provider.rs server/tests/merge_test.rs
+git -C ~/Repos/par-rt-db commit -m "feat(auth): bind anon session at OAuth /begin and merge into the real account at callback (FM-27 task 5)"
 ```
 This commit changes auth behavior — name it in the final report for manual review.
 
@@ -1415,16 +1415,16 @@ Each edit is a sentence-level strike-and-replace; keep the surrounding text inta
 - [ ] **Step 2: Run the full gate**
 
 ```bash
-make -C /Users/probello/Repos/par-rt-db dev-db-up
-make -C /Users/probello/Repos/par-rt-db checkall
+make -C ~/Repos/par-rt-db dev-db-up
+make -C ~/Repos/par-rt-db checkall
 ```
 Expected: green (fmt + clippy `-D warnings` + typecheck + all tests, including the 6 new merge tests). Check the exit code directly (`echo $?` right after), not through a pipe.
 
 - [ ] **Step 3: Commit**
 
 ```bash
-git -C /Users/probello/Repos/par-rt-db add FEATURE_MATRIX.md CLAUDE.md README.md server/src/auth/provider.rs
-git -C /Users/probello/Repos/par-rt-db commit -m "docs: anon-to-real merge shipped across FEATURE_MATRIX/CLAUDE.md/README (FM-27)"
+git -C ~/Repos/par-rt-db add FEATURE_MATRIX.md CLAUDE.md README.md server/src/auth/provider.rs
+git -C ~/Repos/par-rt-db commit -m "docs: anon-to-real merge shipped across FEATURE_MATRIX/CLAUDE.md/README (FM-27)"
 ```
 
 - [ ] **Step 4: Board + acceptance criteria**

@@ -353,14 +353,14 @@ async fn lazy_table_self_heals_for_preexisting_db() -> anyhow::Result<()> {
 - [ ] **Step 6: Run the tests**
 
 ```bash
-cd /Users/probello/Repos/par-rt-db && make dev-db-up && cd server && cargo test --test schema_history_test
+cd ~/Repos/par-rt-db && make dev-db-up && cd server && cargo test --test schema_history_test
 ```
 Expected: 3 tests PASS.
 
 - [ ] **Step 7: Verify the gate, then commit**
 
 ```bash
-cd /Users/probello/Repos/par-rt-db && make checkall
+cd ~/Repos/par-rt-db && make checkall
 git add server/src/schema_history.rs server/src/lib.rs server/src/admin.rs server/tests/schema_history_test.rs
 git commit -m "feat(schema): ENH-013 schema history capture + history endpoints"
 ```
@@ -414,7 +414,7 @@ async fn migrate_captures_a_version_and_dry_run_does_not() -> anyhow::Result<()>
 - [ ] **Step 2: Run it to verify it fails**
 
 ```bash
-cd /Users/probello/Repos/par-rt-db/server && cargo test --test schema_history_test migrate_captures
+cd ~/Repos/par-rt-db/server && cargo test --test schema_history_test migrate_captures
 ```
 Expected: FAIL — only 1 entry after migrate (the migrate did not capture).
 
@@ -443,7 +443,7 @@ Expected: PASS.
 - [ ] **Step 5: Verify the gate, then commit**
 
 ```bash
-cd /Users/probello/Repos/par-rt-db && make checkall
+cd ~/Repos/par-rt-db && make checkall
 git add server/src/committer.rs server/tests/schema_history_test.rs
 git commit -m "feat(schema): ENH-013 capture schema history on migrate"
 ```
@@ -803,7 +803,7 @@ Note: the additive-only `push` cannot create a "fewer-index" snapshot to restore
 - [ ] **Step 6: Run the tests**
 
 ```bash
-cd /Users/probello/Repos/par-rt-db/server && cargo test --test schema_history_test
+cd ~/Repos/par-rt-db/server && cargo test --test schema_history_test
 ```
 Expected: all PASS, including the refactor not breaking existing schema tests:
 
@@ -814,7 +814,7 @@ cargo test --test schema_evolution_test --test migration_test
 - [ ] **Step 7: Verify the gate, then commit**
 
 ```bash
-cd /Users/probello/Repos/par-rt-db && make checkall
+cd ~/Repos/par-rt-db && make checkall
 git add server/src/ddl.rs server/src/committer.rs server/src/admin.rs server/tests/schema_history_test.rs
 git commit -m "feat(schema): ENH-013 in-place destructive schema restore"
 ```
@@ -897,14 +897,14 @@ In the existing admin test file, add cases that assert the methods hit the right
 - [ ] **Step 4: Build + test**
 
 ```bash
-cd /Users/probello/Repos/par-rt-db/ts-client && bun install && bun run build && bunx vitest run tests/admin.test.ts
+cd ~/Repos/par-rt-db/ts-client && bun install && bun run build && bunx vitest run tests/admin.test.ts
 ```
 Expected: PASS.
 
 - [ ] **Step 5: Verify the gate, then commit**
 
 ```bash
-cd /Users/probello/Repos/par-rt-db && make checkall
+cd ~/Repos/par-rt-db && make checkall
 git add ts-client/src/protocol.ts ts-client/src/admin.ts ts-client/tests/
 git commit -m "feat(client): ENH-013 schema history + restore admin methods (ts-client)"
 ```
@@ -966,7 +966,7 @@ Import `SchemaHistoryEntrySummary` / `SchemaHistoryEntry` from `./types` in the 
 - [ ] **Step 3: Verify typecheck, then commit**
 
 ```bash
-cd /Users/probello/Repos/par-rt-db && make ts-client-build && cd dashboard && bunx tsc --noEmit
+cd ~/Repos/par-rt-db && make ts-client-build && cd dashboard && bunx tsc --noEmit
 git add dashboard/src/lib/admin.tsx dashboard/src/lib/types.ts
 git commit -m "feat(dashboard): ENH-013 schema history client methods"
 ```
@@ -1036,7 +1036,7 @@ Mirror the existing Schema/Migrate links in `DbPage.tsx` (a `<Link to={`/dbs/${d
 - [ ] **Step 7: Verify the gate, then commit**
 
 ```bash
-cd /Users/probello/Repos/par-rt-db && make checkall
+cd ~/Repos/par-rt-db && make checkall
 git add dashboard/src/pages/SchemaHistoryPage.tsx dashboard/src/pages/SchemaHistoryPage.module.css dashboard/src/pages/SchemaHistoryPage.test.tsx dashboard/src/App.tsx dashboard/src/pages/DbPage.tsx
 git commit -m "feat(dashboard): ENH-013 schema history page with diff + restore"
 ```
@@ -1066,7 +1066,7 @@ Where the admin/schema surface is documented, add: snapshots captured on push/mi
 - [ ] **Step 4: Verify the gate, then commit**
 
 ```bash
-cd /Users/probello/Repos/par-rt-db && make checkall
+cd ~/Repos/par-rt-db && make checkall
 git add FEATURE_MATRIX.md server/src/audit.rs server/src/webhook.rs
 git commit -m "docs: ENH-013 schema history + fix stale tap-site doc comments"
 ```

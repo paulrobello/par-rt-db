@@ -55,9 +55,9 @@ from par_rt_db.ws_client import _backoff_delay, _canonical_key, _sync_url
 
 def test_sync_url_flips_scheme_and_appends_sync():
     assert _sync_url("http://localhost:8300") == "ws://localhost:8300/sync"
-    assert _sync_url("https://rtdb.pardev.net") == "wss://rtdb.pardev.net/sync"
+    assert _sync_url("https://rtdb.example.com") == "wss://rtdb.example.com/sync"
     assert _sync_url("ws://localhost:8300/") == "ws://localhost:8300/sync"
-    assert _sync_url("wss://rtdb.pardev.net///") == "wss://rtdb.pardev.net/sync"
+    assert _sync_url("wss://rtdb.example.com///") == "wss://rtdb.example.com/sync"
 
 
 def test_canonical_key_is_order_independent():
@@ -1384,7 +1384,7 @@ from par_rt_db import Mutation, TableQuery
 from par_rt_db.ws_client import RtDbClient
 
 async def main():
-    client = RtDbClient("wss://rtdb.pardev.net", "mydb", get_token=lambda: _token())
+    client = RtDbClient("wss://rtdb.example.com", "mydb", get_token=lambda: _token())
     await client.connect()
     async with client.subscribe(TableQuery("items").collect()) as sub:
         await client.mutate(Mutation().insert("items", {"_id": "i1"}).build())

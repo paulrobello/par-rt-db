@@ -18,7 +18,7 @@
 - **`Cache-Control: public, max-depth=31536000, immutable`** on both raw and transformed serve (blobs are write-once).
 - **env-drift rule:** every new `RTDB_*` var must appear in `docker-compose.yml`'s `environment:` block (indent 6, `NAME: ${NAME:-default}`); should appear in `.env.example` (`NAME=default`). `scripts/env-drift-check.sh` (run by `make checkall`) fails otherwise.
 - **Clients mirror the core:** server + ts/rust/python each get the helper + tests. The server is the authority and re-validates every param.
-- **Working dir for commands:** run cargo from `server/` (or `-p rtdb-server`), bun from `ts-client/` or `dashboard/`, uv from `python-client/`. Prefer `make -C /Users/probello/Repos/par-rt-db <target>` from anywhere.
+- **Working dir for commands:** run cargo from `server/` (or `-p rtdb-server`), bun from `ts-client/` or `dashboard/`, uv from `python-client/`. Prefer `make -C ~/Repos/par-rt-db <target>` from anywhere.
 
 ## File Structure
 
@@ -160,8 +160,8 @@ RTDB_IMAGE_DEFAULT_QUALITY=80
 - [ ] **Step 7: Verify + commit**
 
 ```bash
-make -C /Users/probello/Repos/par-rt-db env-drift-check
-cd /Users/probello/Repos/par-rt-db/server && cargo check
+make -C ~/Repos/par-rt-db env-drift-check
+cd ~/Repos/par-rt-db/server && cargo check
 git add -A && git commit -m "feat(server): ENH-014 config + deps for image transforms"
 ```
 Expected: env-drift-check passes; `cargo check` compiles (new deps fetch).
@@ -264,7 +264,7 @@ mod tests {
 - [ ] **Step 2: Run to verify failure**
 
 ```bash
-cd /Users/probello/Repos/par-rt-db/server && cargo test image_transform
+cd ~/Repos/par-rt-db/server && cargo test image_transform
 ```
 Expected: FAIL (module/types not defined).
 
@@ -535,7 +535,7 @@ Add `pub mod image_transform;` to `server/src/lib.rs` (alphabetized with the oth
 - [ ] **Step 4: Run tests to verify pass**
 
 ```bash
-cd /Users/probello/Repos/par-rt-db/server && cargo test image_transform
+cd ~/Repos/par-rt-db/server && cargo test image_transform
 ```
 Expected: PASS. If `image::Limits` setters differ in the installed 0.25.x (e.g. `set_max_width` builder vs field assignment), adjust to the crate's actual API — the values (16384 / `max_pixels*4`) and the `Err(Limits)` ⇒ `TooLarge` mapping are the contract. If `JpegEncoder::new_with_quality`/`write_image` signature differs, adapt; the contract is "encode RGB8 at `quality`".
 
@@ -607,7 +607,7 @@ In `snapshot()`: `image_transforms_hit_total: self.image_transforms_hit_total.lo
 - [ ] **Step 6: Verify + commit**
 
 ```bash
-cd /Users/probello/Repos/par-rt-db/server && cargo test metrics
+cd ~/Repos/par-rt-db/server && cargo test metrics
 git add -A && git commit -m "feat(server): ENH-014 image transform metrics"
 ```
 
@@ -739,7 +739,7 @@ Then add `image,` to the `Arc::new(Self { … })` literal (`lib.rs:124-143`). **
 - [ ] **Step 4: Verify + commit**
 
 ```bash
-cd /Users/probello/Repos/par-rt-db/server && cargo test
+cd ~/Repos/par-rt-db/server && cargo test
 git add -A && git commit -m "feat(server): ENH-014 TransformCache + AppState wiring"
 ```
 Expected: full server test suite green (no behavior change yet — handlers not wired).
@@ -857,7 +857,7 @@ async fn authed_serve_also_transforms() -> anyhow::Result<()> {
 - [ ] **Step 2: Run to verify failure** — `make dev-db-up` then:
 
 ```bash
-cd /Users/probello/Repos/par-rt-db/server && cargo test --test image_transform_test
+cd ~/Repos/par-rt-db/server && cargo test --test image_transform_test
 ```
 Expected: FAIL (handlers ignore params).
 
@@ -922,8 +922,8 @@ async fn serve_bytes(
 - [ ] **Step 4: Run tests to verify pass**
 
 ```bash
-make -C /Users/probello/Repos/par-rt-db dev-db-up
-cd /Users/probello/Repos/par-rt-db/server && cargo test --test image_transform_test && cargo test --test storage_test
+make -C ~/Repos/par-rt-db dev-db-up
+cd ~/Repos/par-rt-db/server && cargo test --test image_transform_test && cargo test --test storage_test
 ```
 Expected: PASS (transforms + existing storage tests still green).
 

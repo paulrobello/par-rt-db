@@ -379,7 +379,7 @@ from par_rt_db import Mutation, TableQuery
 from par_rt_db import RtDbAsyncHttpClient
 
 async def main() -> None:
-    async with RtDbAsyncHttpClient("https://rtdb.pardev.net", "mydb", "<token>") as c:
+    async with RtDbAsyncHttpClient("https://rtdb.example.com", "mydb", "<token>") as c:
         rows = await c.run(TableQuery("items").collect())
         await c.mutate(Mutation().insert("items", {"_id": "i1", "n": 1}).build())
 

@@ -242,7 +242,7 @@ async fn replace_rolled_back_by_later_failed_step() -> anyhow::Result<()> {
 
 - [ ] **Step 2: Run the new tests to verify they fail to compile**
 
-Run: `cd server && make dev-db-up 2>/dev/null; cargo test --test txn_test replace_ -- --list` (from repo root: `cd /Users/probello/Repos/par-rt-db && make dev-db-up && cd server && cargo test --test txn_test replace_ -- --list`)
+Run: `cd server && make dev-db-up 2>/dev/null; cargo test --test txn_test replace_ -- --list` (from repo root: `cd ~/Repos/par-rt-db && make dev-db-up && cd server && cargo test --test txn_test replace_ -- --list`)
 Expected: compile error — `no variant named 'Replace' found for enum 'Step'`.
 
 - [ ] **Step 3: Add the `Step::Replace` variant**
@@ -304,13 +304,13 @@ In `server/src/txn.rs`, in `execute_txn`'s `match step` block, insert after the 
 
 - [ ] **Step 6: Run tests to verify they pass**
 
-Run: `cd /Users/probello/Repos/par-rt-db/server && cargo test --test txn_test replace_`
+Run: `cd ~/Repos/par-rt-db/server && cargo test --test txn_test replace_`
 Expected: 4 tests PASS (`replace_overwrites_doc_updates_typed_columns_and_bumps_version`, `replace_missing_id_returns_not_found`, `replace_schema_violation_is_rejected`, `replace_rolled_back_by_later_failed_step`).
 
 - [ ] **Step 7: Commit**
 
 ```bash
-cd /Users/probello/Repos/par-rt-db
+cd ~/Repos/par-rt-db
 git add server/src/txn.rs server/tests/txn_test.rs
 git commit -m "feat(server): add replace transaction step"
 ```
@@ -373,7 +373,7 @@ In `client/tests/mutation.test.ts`, replace the first `it` block (lines 5-37) wi
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cd /Users/probello/Repos/par-rt-db/client && bunx vitest run tests/mutation.test.ts`
+Run: `cd ~/Repos/par-rt-db/client && bunx vitest run tests/mutation.test.ts`
 Expected: FAIL — `mutation(...).replace is not a function` (TxnBuilder has no `replace` method yet), and a TS type error on `StepJson` not having an `"replace"` op.
 
 - [ ] **Step 3: Add `StepJson` variant**
@@ -397,7 +397,7 @@ In `client/src/mutation.ts`, insert after the `patch` method (after its closing 
 
 - [ ] **Step 5: Run test to verify it passes**
 
-Run: `cd /Users/probello/Repos/par-rt-db/client && bunx vitest run tests/mutation.test.ts`
+Run: `cd ~/Repos/par-rt-db/client && bunx vitest run tests/mutation.test.ts`
 Expected: PASS.
 
 - [ ] **Step 6: Update `FEATURE_MATRIX.md` row 6**
@@ -417,7 +417,7 @@ with:
 - [ ] **Step 7: Commit**
 
 ```bash
-cd /Users/probello/Repos/par-rt-db
+cd ~/Repos/par-rt-db
 git add client/src/protocol.ts client/src/mutation.ts client/tests/mutation.test.ts FEATURE_MATRIX.md
 git commit -m "feat(client): add .replace() transaction step, mark FEATURE_MATRIX rank 6 implemented"
 ```
@@ -430,7 +430,7 @@ git commit -m "feat(client): add .replace() transaction step, mark FEATURE_MATRI
 
 - [ ] **Step 1: Run the full gate from the repo root**
 
-Run: `cd /Users/probello/Repos/par-rt-db && make checkall`
+Run: `cd ~/Repos/par-rt-db && make checkall`
 Expected: PASS — fmt-check, clippy `-D warnings`, typecheck, and the full test suite (both `server/` and `client/`) all green.
 
 - [ ] **Step 2: Fix any failures**

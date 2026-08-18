@@ -56,4 +56,4 @@ Full detail and reasoning: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). The one
 
 ## Deployment
 
-Deployed live at `rtdb.pardev.net` on host lenny2 (plain `docker compose`, via a Cloudflare tunnel). **Build on the x86_64 host, not from an arm64 Mac.** Secrets come from a mode-600 `.env` (`.env.example` is the template). Full runbook: `deploy/README.md`. A new `RTDB_*` env var must be added to both `.env.example` and `docker-compose.yml`'s environment block, or `make checkall` fails at env-drift-check.
+Production runs as plain `docker compose` on a standalone Docker host behind a Cloudflare tunnel (deploy target set by `DEPLOY_HOST`; runbook: `deploy/README.md`). **Build on the x86_64 host, not from an arm64 Mac.** Secrets come from a mode-600 `.env` (`.env.example` is the template). A new `RTDB_*` env var must be added to both `.env.example` and `docker-compose.yml`'s environment block, or `make checkall` fails at env-drift-check.

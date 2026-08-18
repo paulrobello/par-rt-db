@@ -1292,9 +1292,9 @@ mod tests {
         let row = serde_json::json!({
             "maxFileSize": 52428800,
             "allowedOrigins": [
-                "https://projects.pardev.net",
-                "https://hack.pardev.net",
-                "https://rtdb.pardev.net"
+                "https://projects.example.com",
+                "https://hack.example.com",
+                "https://rtdb.example.com"
             ],
             "sessionTtlDays": 30
         });
@@ -1305,7 +1305,7 @@ mod tests {
         assert!(
             merged
                 .allowed_origins
-                .contains(&"https://hack.pardev.net".to_string())
+                .contains(&"https://hack.example.com".to_string())
         );
         assert_eq!(merged.max_file_size, 52428800);
         assert_eq!(merged.session_ttl_days, 30);

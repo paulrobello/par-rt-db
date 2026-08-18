@@ -1,11 +1,11 @@
 COMPOSE_DEV = docker compose -f docker-compose.dev.yml
 export RTDB_TEST_DATABASE_URL ?= postgres://rtdb:rtdb@127.0.0.1:55434/rtdb
-DEPLOY_HOST = root@lenny2.par-com.net
+DEPLOY_HOST ?= root@docker-host.example.com
 DEPLOY_PATH = /docker/par-rt-db
 # Short sha of the working-tree HEAD, baked into /healthz on deploy. Passed as
 # a shell env on the remote `docker compose up` (shell env overrides .env) so
 # the build arg — and thus the deployed binary's git_commit label — always tracks
-# the commit being deployed, without touching lenny2's .env.
+# the commit being deployed, without touching docker-host's .env.
 DEPLOY_COMMIT := $(shell git rev-parse --short HEAD)
 
 .PHONY: build test lint fmt fmt-check typecheck checkall dev-db-up dev-db-down dev-db-clean \
@@ -168,5 +168,5 @@ deploy: checkall
 	ssh $(DEPLOY_HOST) 'cd $(DEPLOY_PATH) && RTDB_BUILD_COMMIT=$(DEPLOY_COMMIT) docker compose up -d --build && docker compose ps'
 	ssh $(DEPLOY_HOST) 'curl -fsS http://127.0.0.1:8300/healthz'
 	@echo
-	curl -fsS https://rtdb.pardev.net/healthz
+	curl -fsS https://rtdb.example.com/healthz
 	@echo

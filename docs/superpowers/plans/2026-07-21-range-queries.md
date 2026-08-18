@@ -150,7 +150,7 @@ to:
 Run:
 
 ```bash
-cd /Users/probello/Repos/par-rt-db/server && cargo check --all-targets 2>&1 | grep -B2 "missing field"
+cd ~/Repos/par-rt-db/server && cargo check --all-targets 2>&1 | grep -B2 "missing field"
 ```
 
 `cargo check` will report every struct literal (across `tests/query_test.rs` and `tests/txn_test.rs`) that doesn't set `gt`/`gte`/`lt`/`lte`. For each one, insert these four lines immediately after that literal's `eq: ...,` line and before its `order: ...,` line:
@@ -595,7 +595,7 @@ async fn range_value_wrong_type_is_bad_request() -> anyhow::Result<()> {
 - [ ] **Step 6: Run the new tests to verify they fail**
 
 ```bash
-cd /Users/probello/Repos/par-rt-db && make dev-db-up
+cd ~/Repos/par-rt-db && make dev-db-up
 cd server && cargo test --test query_test range_ -- --nocapture
 ```
 
@@ -802,7 +802,7 @@ pub async fn execute_query(
 - [ ] **Step 8: Run the full query test file to verify everything passes**
 
 ```bash
-cd /Users/probello/Repos/par-rt-db/server && cargo test --test query_test
+cd ~/Repos/par-rt-db/server && cargo test --test query_test
 ```
 
 Expected: all tests pass (the pre-existing ones plus the 11 new `range_*` tests).
@@ -894,7 +894,7 @@ Append to `client/tests/query.test.ts`, inside the existing `describe("query bui
 - [ ] **Step 3: Run the tests to verify they fail**
 
 ```bash
-cd /Users/probello/Repos/par-rt-db/client && bunx vitest run tests/query.test.ts
+cd ~/Repos/par-rt-db/client && bunx vitest run tests/query.test.ts
 ```
 
 Expected: fails with a TypeScript error (`Property 'gt' does not exist on type 'TableQuery<...>'`), since `TableQuery` has no `gt`/`gte`/`lt`/`lte` methods yet.
@@ -944,7 +944,7 @@ to:
 - [ ] **Step 5: Run the tests to verify they pass**
 
 ```bash
-cd /Users/probello/Repos/par-rt-db/client && bunx vitest run tests/query.test.ts
+cd ~/Repos/par-rt-db/client && bunx vitest run tests/query.test.ts
 ```
 
 Expected: all tests pass, including the 3 new ones.
@@ -952,7 +952,7 @@ Expected: all tests pass, including the 3 new ones.
 - [ ] **Step 6: Typecheck the whole client package**
 
 ```bash
-cd /Users/probello/Repos/par-rt-db/client && bun run typecheck
+cd ~/Repos/par-rt-db/client && bun run typecheck
 ```
 
 Expected: clean — `QueryJson`'s new fields are all optional, so no existing call site needs updating.
@@ -989,14 +989,14 @@ Leave every other row and section unchanged — this plan is scoped to rank 1 on
 - [ ] **Step 2: Format only the files this plan touched**
 
 ```bash
-cd /Users/probello/Repos/par-rt-db/server && cargo fmt -- src/query.rs src/txn.rs tests/query_test.rs tests/txn_test.rs tests/common/mod.rs
-cd /Users/probello/Repos/par-rt-db/client && bunx biome format --write src/protocol.ts src/query.ts tests/query.test.ts
+cd ~/Repos/par-rt-db/server && cargo fmt -- src/query.rs src/txn.rs tests/query_test.rs tests/txn_test.rs tests/common/mod.rs
+cd ~/Repos/par-rt-db/client && bunx biome format --write src/protocol.ts src/query.ts tests/query.test.ts
 ```
 
 - [ ] **Step 3: Run the full verification gate**
 
 ```bash
-cd /Users/probello/Repos/par-rt-db && make checkall
+cd ~/Repos/par-rt-db && make checkall
 ```
 
 This runs `fmt-check`, `lint` (clippy `-D warnings` + biome lint), `typecheck` (cargo check + tsc), and `test` (starts the dev Postgres, then the full server + client suites). If anything fails, fix the root cause in the file it points at (not by loosening the check) and re-run `make checkall` from the top until it is fully green. Do not stop at the first green step — every one of fmt-check/lint/typecheck/test must pass in the same run.
@@ -1004,7 +1004,7 @@ This runs `fmt-check`, `lint` (clippy `-D warnings` + biome lint), `typecheck` (
 - [ ] **Step 4: Review the diff, then make the single commit**
 
 ```bash
-cd /Users/probello/Repos/par-rt-db && git status
+cd ~/Repos/par-rt-db && git status
 git diff --stat
 ```
 

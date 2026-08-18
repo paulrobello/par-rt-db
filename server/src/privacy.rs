@@ -1,6 +1,6 @@
 //! Unauthenticated `/privacy` &mdash; serves par-rt-db's own privacy policy as
 //! static HTML, so the OAuth consent screen's required privacy URL can point at
-//! the deployment itself (e.g. `https://rtdb.pardev.net/privacy`) instead of an
+//! the deployment itself (e.g. `https://rtdb.example.com/privacy`) instead of an
 //! externally hosted page. Like `/healthz`, it is **public and stateless**: the
 //! body is a compile-time-embedded HTML file, never `Config`, secrets, or user
 //! data.
@@ -51,6 +51,6 @@ mod tests {
         let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
         let body = std::str::from_utf8(&bytes).unwrap();
         assert!(body.contains("Privacy Policy"));
-        assert!(body.contains("PARCOM"));
+        assert!(body.contains("par-rt-db operator"));
     }
 }

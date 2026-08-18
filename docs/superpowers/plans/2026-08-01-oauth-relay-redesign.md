@@ -558,7 +558,7 @@
 
 - [ ] **Step 2: Typecheck the dashboard (against a freshly built ts-client)**
 
-  Run: `cd /Users/probello/Repos/par-rt-db && make ts-client-build && cd dashboard && bunx tsc --noEmit`
+  Run: `cd ~/Repos/par-rt-db && make ts-client-build && cd dashboard && bunx tsc --noEmit`
   Expected: typecheck clean.
 
 - [ ] **Step 3: Commit**
@@ -595,7 +595,7 @@
 
 ## Final verification
 
-- [ ] Run the whole gate: `cd /Users/probello/Repos/par-rt-db && make dev-db-up && make checkall`
+- [ ] Run the whole gate: `cd ~/Repos/par-rt-db && make dev-db-up && make checkall`
   Expected: fmt-check + clippy `-D warnings` + typecheck (server, ts-client, rust-client, dashboard, python-client) + all tests green. (If `oauth_test` intermittently `PoolTimedOut`s under full-suite load, retry — known transient contention, not a regression.)
 - [ ] After the gate is green and the branch is reviewed (SDD final review), merge to `main` (squash) and push, then `make deploy`.
 - [ ] **After deploy**, sync the projects vendored client: `cd ~/Repos/projects && make sync-client`, commit, and close the projects SEC-012 card (`019fbe75ff1073d3a4ee12c6e5cd38bd`).

@@ -49,7 +49,7 @@ Push it with the admin client (admin key required):
 
 ```ts
 import { RtDbAdminClient } from "@par-rt-db/client";
-const admin = new RtDbAdminClient({ url: "https://rtdb.pardev.net", adminKey: process.env.RTDB_ADMIN_KEY! });
+const admin = new RtDbAdminClient({ url: "https://rtdb.example.com", adminKey: process.env.RTDB_ADMIN_KEY! });
 await admin.createDb("kanban");
 await admin.pushSchema("kanban", schema);
 ```
@@ -62,7 +62,7 @@ import { RtDbProvider, useQuery, useMutation } from "@par-rt-db/client/react";
 import { createApi } from "@par-rt-db/client";
 import { schema } from "./schema";
 
-const client = new RtDbClient({ url: "wss://rtdb.pardev.net", db: "kanban", getToken: () => localStorage.getItem("rtdb-session-token") });
+const client = new RtDbClient({ url: "wss://rtdb.example.com", db: "kanban", getToken: () => localStorage.getItem("rtdb-session-token") });
 const api = createApi(schema);
 
 // RtDbProvider is required around any component using the hooks. `authBaseUrl`
@@ -70,7 +70,7 @@ const api = createApi(schema);
 // (any of the server's configured providers: GitHub/Google/GitLab/Microsoft/Apple/OIDC).
 function App() {
   return (
-    <RtDbProvider client={client} authBaseUrl="https://rtdb.pardev.net">
+    <RtDbProvider client={client} authBaseUrl="https://rtdb.example.com">
       <Board projectId="p1" />
     </RtDbProvider>
   );
@@ -122,7 +122,7 @@ for you).
 import { RtDbHttpClient, createApi, mutation } from "@par-rt-db/client";
 import { schema } from "./schema";
 
-const db = new RtDbHttpClient({ url: "https://rtdb.pardev.net", db: "kanban", token: process.env.RTDB_TOKEN! });
+const db = new RtDbHttpClient({ url: "https://rtdb.example.com", db: "kanban", token: process.env.RTDB_TOKEN! });
 const api = createApi(schema);
 const rows = await db.query(api.items.query().withIndex("by_project", ["p1"]).collect());
 // Many queries in one round trip (`POST /api/query-batch`) — outcomes align with the
@@ -174,7 +174,7 @@ import * as SecureStore from "expo-secure-store";
 import { RtDbClient } from "@par-rt-db/client";
 
 const client = new RtDbClient({
-  url: "wss://rtdb.pardev.net",
+  url: "wss://rtdb.example.com",
   db: "kanban",
   // There is no localStorage in RN — keep the session token in the keychain.
   getToken: () => SecureStore.getItemAsync("rtdb-token"),
@@ -242,7 +242,7 @@ its writes:
 import { RtDbHttpClient, createApi, mutation } from "@par-rt-db/client";
 import type { WorkflowSpec } from "@par-rt-db/client";
 
-const db = new RtDbHttpClient({ url: "https://rtdb.pardev.net", db: "kanban", token: process.env.RTDB_TOKEN! });
+const db = new RtDbHttpClient({ url: "https://rtdb.example.com", db: "kanban", token: process.env.RTDB_TOKEN! });
 
 // A spec is snapshotted verbatim per run, so step values are literals known
 // at build time — there is no prior-step output referencing.

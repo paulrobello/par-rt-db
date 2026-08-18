@@ -21,9 +21,9 @@ from par_rt_db.ws_client import (
 
 def test_sync_url_flips_scheme_and_appends_sync():
     assert _sync_url("http://localhost:8300") == "ws://localhost:8300/sync"
-    assert _sync_url("https://rtdb.pardev.net") == "wss://rtdb.pardev.net/sync"
+    assert _sync_url("https://rtdb.example.com") == "wss://rtdb.example.com/sync"
     assert _sync_url("ws://localhost:8300/") == "ws://localhost:8300/sync"
-    assert _sync_url("wss://rtdb.pardev.net///") == "wss://rtdb.pardev.net/sync"
+    assert _sync_url("wss://rtdb.example.com///") == "wss://rtdb.example.com/sync"
 
 
 def test_canonical_key_is_order_independent():

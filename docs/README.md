@@ -20,7 +20,7 @@ contribution.
 - [`../CHANGELOG.md`](../CHANGELOG.md) — released changes, following [Keep a Changelog](https://keepachangelog.com/). The historical enhancement candidate list (`ENHANCEMENTS.md`, ENH-001–022) was retired once all enhancements shipped; the backlog now lives on the project kanban board (tagged `enhancement`), and the `ENH-*` ids are preserved there and in `docs/superpowers/plans/*-enh-NNN-*.md` filenames.
 - [`../DESIGN.md`](../DESIGN.md) — dashboard visual design system (mode, palette, typography, components, motion).
 - [`../PRODUCT.md`](../PRODUCT.md) — product framing for the operator console.
-- [`../deploy/README.md`](../deploy/README.md) — production deployment runbook for the lenny2 Docker host (build on the x86_64 host, Cloudflare tunnel, secrets, backups, monitoring, rollback).
+- [`../deploy/README.md`](../deploy/README.md) — production deployment runbook (standalone Docker host: build on the x86_64 host, Cloudflare tunnel, secrets, backups, monitoring, rollback).
 
 ## Design specs and plans
 

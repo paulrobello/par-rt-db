@@ -678,7 +678,7 @@ HTTP client (`pip install par-rt-db[http]`) runs the built query against
 from par_rt_db import TableQuery
 from par_rt_db.http_client import RtDbHttpClient
 
-client = RtDbHttpClient("https://rtdb.pardev.net", db="myapp", token=TOKEN)
+client = RtDbHttpClient("https://rtdb.example.com", db="myapp", token=TOKEN)
 
 cursor = None
 while True:
@@ -892,7 +892,7 @@ periodically; it is scoped to those test patterns and never touches
 | `make checkall` | `fmt-check` + `lint` + `typecheck` + `test` across all six packages. **Definition of done; must pass before commit.** |
 | `make pre-commit` | `pre-commit run --all-files` (runs `gitleaks`, `detect-private-key`, etc.). |
 | `make pre-commit-update` | `pre-commit autoupdate`. |
-| `make deploy` | `checkall` → rsync to lenny2 → `docker compose up -d --build` → healthz probe. |
+| `make deploy` | `checkall` → rsync to the Docker host → `docker compose up -d --build` → healthz probe. |
 
 ### Granular python-client targets
 

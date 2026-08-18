@@ -306,7 +306,7 @@ Expected: clean. Fix anything flagged before committing.
 - [ ] **Step 10: Commit**
 
 ```bash
-cd /Users/probello/Repos/par-rt-db
+cd ~/Repos/par-rt-db
 git add server/src/schema.rs server/src/ddl.rs
 git commit -m "feat(schema): allow safe literal-union widening in pushSchema
 
@@ -440,7 +440,7 @@ Expected: clean.
 - [ ] **Step 4: Commit**
 
 ```bash
-cd /Users/probello/Repos/par-rt-db
+cd ~/Repos/par-rt-db
 git add server/tests/schema_evolution_test.rs
 git commit -m "test(schema): push_schema accepts literal-union widening end-to-end
 
@@ -487,7 +487,7 @@ kanban item add --project par-rt-db \
 
 - [ ] **Step 3: Run the full gate**
 
-Run: `cd /Users/probello/Repos/par-rt-db && make checkall`
+Run: `cd ~/Repos/par-rt-db && make checkall`
 Expected: green (fmt-check + clippy `-D warnings` + typecheck + the whole test suite). If the dev-db port is taken by a healthy sibling container, reuse it per the Global Constraints rather than re-running `make test`.
 
 - [ ] **Step 4: Move the kanban item to done**
@@ -501,7 +501,7 @@ kanban item done --id 019fb4df7ffd7b73b32cb8f0313a3c78
 - [ ] **Step 5: Commit the docs**
 
 ```bash
-cd /Users/probello/Repos/par-rt-db
+cd ~/Repos/par-rt-db
 git add FEATURE_MATRIX.md
 git commit -m "docs(feature-matrix): note literal-union widening in pushSchema (+ client gap)"
 ```

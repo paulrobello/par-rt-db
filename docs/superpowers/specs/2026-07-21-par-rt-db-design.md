@@ -1,15 +1,15 @@
 # par-rt-db — Self-Hosted Realtime Document DB (Design Spec)
 
 **Date:** 2026-07-21
-**Status:** Implemented — server is live at `rtdb.pardev.net`. See `FEATURE_MATRIX.md` §1 ("At parity today") and §2 (ranked gap matrix, all 26 rows ✅). Originally scoped as MVP-only; every "out of scope" item below has since shipped as a follow-on spec. Authoritative current source of truth: the code (`server/src/`, `ts-client/`, `rust-client/`, `python-client/`) and `FEATURE_MATRIX.md`, not this document.
+**Status:** Implemented — server is live at `rtdb.example.com`. See `FEATURE_MATRIX.md` §1 ("At parity today") and §2 (ranked gap matrix, all 26 rows ✅). Originally scoped as MVP-only; every "out of scope" item below has since shipped as a follow-on spec. Authoritative current source of truth: the code (`server/src/`, `ts-client/`, `rust-client/`, `python-client/`) and `FEATURE_MATRIX.md`, not this document.
 **Repo:** `~/Repos/par-rt-db`
 
 ## Purpose
 
 A self-hosted, Convex-inspired realtime document database written in Rust, deployed in
-Docker on lenny2. It replaces Convex cloud for Paul's personal projects. The MVP feature
+Docker on docker-host. It replaces Convex cloud for Paul's personal projects. The MVP feature
 set is exactly the set of Convex capabilities the kanban board (`~/Repos/projects`,
-projects.pardev.net) actually uses — inventoried from source, not guessed.
+projects.example.com) actually uses — inventoried from source, not guessed.
 
 The kanban app port itself is a **separate follow-up project** with its own spec/plan.
 This spec covers the server, the TypeScript client, and deployment.
@@ -21,7 +21,7 @@ This spec covers the server, the TypeScript client, and deployment.
 | Compatibility | Convex-inspired, own protocol | Drop-in Convex compat would require embedding V8 to run TS server functions; not worth it. |
 | Function model | Declarative query/transaction DSL sent by the client | No per-app server code, no JS runtime, one generic server serves every app. |
 | Tenancy | One instance, many named databases | New projects create a database, not a deployment. |
-| Exposure | Public at `rtdb.pardev.net` via Cloudflare tunnel → Traefik | Browser SPAs connect directly, like Convex. |
+| Exposure | Public at `rtdb.example.com` via Cloudflare tunnel → Traefik | Browser SPAs connect directly, like Convex. |
 | User auth | Built-in GitHub OAuth + per-database email allowlist | Kanban is a public SPA — static keys would be exposed. Matches today's Convex Auth + `ALLOWED_EMAILS` model exactly. |
 | Machine auth | Per-database bearer tokens (constant-time compare) | CLI/scanner/importer run on trusted hosts; replaces the kanban `/agent` + `AGENT_TOKEN` pattern. |
 | Storage | **Postgres 17 sidecar** (user's call; SQLite was the presented recommendation) | Battle-tested durability, JSONB, room to grow. par-rt-db is Postgres's only client, so no LISTEN/NOTIFY is needed — invalidation happens in-process after commit. |
@@ -68,11 +68,11 @@ flowchart LR
         CLI["CLI / scripts<br/>(HTTP + machine token)"]
         ADM["Admin CLI<br/>(HTTP + admin key)"]
     end
-    subgraph lenny2 [lenny2 docker-compose]
+    subgraph docker-host [docker-host docker-compose]
         RT["par-rt-db (Rust, axum+tokio)<br/>port 8300"]
         PG[("postgres:17<br/>named volume")]
     end
-    SPA -->|"wss rtdb.pardev.net"| RT
+    SPA -->|"wss rtdb.example.com"| RT
     CLI --> RT
     ADM --> RT
     RT -->|"only client"| PG
@@ -247,15 +247,15 @@ everywhere.
 - **TS client:** vitest integration suite against a locally running server; type-level
   tests asserting schema→hook inference.
 - **Acceptance (post-port, separate project):** kanban web + CLI + scanner running
-  against par-rt-db on lenny2 with GitHub sign-in and live board updates.
+  against par-rt-db on docker-host with GitHub sign-in and live board updates.
 - Makefile with standard targets (`build test lint fmt typecheck checkall`) covering
   both the Rust crate and the TS package; pre-commit with gitleaks before first push.
 
 ## Deployment
 
-- Multi-stage Dockerfile (musl or debian-slim runtime). docker-compose stack on lenny2:
+- Multi-stage Dockerfile (musl or debian-slim runtime). docker-compose stack on docker-host:
   `par-rt-db` (port 8300) + `postgres:17` + named volume; Traefik labels and Cloudflare
-  tunnel ingress for `rtdb.pardev.net` per the par-infra patterns (remember `$$`
+  tunnel ingress for `rtdb.example.com` per the par-infra patterns (remember `$$`
   escaping in compose env vars).
 - Nightly `pg_dump` to the host backup path.
 - Ports reserved in `~/.claude/used_ports.md`: **8300** (server), **55434** (dev/test
@@ -265,7 +265,7 @@ everywhere.
 
 1. `make checkall` green (Rust + TS).
 2. A demo app exercising every MVP feature runs against a local compose stack.
-3. Deployed on lenny2, reachable at `rtdb.pardev.net`, GitHub sign-in works, live
+3. Deployed on docker-host, reachable at `rtdb.example.com`, GitHub sign-in works, live
    updates propagate between two browser tabs and from an HTTP machine write.
 
 ## Future (explicitly deferred at MVP time; current status marked inline)

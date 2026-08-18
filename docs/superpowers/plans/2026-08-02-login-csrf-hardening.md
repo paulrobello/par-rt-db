@@ -568,7 +568,7 @@ Add `RTDB_OAUTH_LOGIN_CSRF` to the boot-config list alongside the other security
 
 - [ ] **Step 5: Run the env-drift check + the full gate.**
 
-Run: `cd /Users/probello/Repos/par-rt-db && make dev-db-up && make checkall 2>&1 | tail -40`
+Run: `cd ~/Repos/par-rt-db && make dev-db-up && make checkall 2>&1 | tail -40`
 Expected: PASS — env-drift-check reports `RTDB_OAUTH_LOGIN_CSRF` forwarded; fmt-check, clippy -D warnings, typecheck, and all tests (incl. the new oauth_test CSRF cases) pass.
 
 - [ ] **Step 6: Commit.**
@@ -578,7 +578,7 @@ git add .env.example docker-compose.yml CLAUDE.md FEATURE_MATRIX.md docs/superpo
 git commit -m "docs(auth): login-CSRF hardening shipped + spec-status sync (model-C predicate, python WS)"
 ```
 
-- [ ] **Step 7: Flag for manual review — DO NOT push or deploy.** This is an auth security change. Report to Paul: the commit range, the default-on posture, the break-glass env, the cross-origin consumer impact (projects.pardev.net + hackzors — board items already filed), and **wait for explicit confirmation before `git push` / `make deploy`.**
+- [ ] **Step 7: Flag for manual review — DO NOT push or deploy.** This is an auth security change. Report to Paul: the commit range, the default-on posture, the break-glass env, the cross-origin consumer impact (projects.example.com + hackzors — board items already filed), and **wait for explicit confirmation before `git push` / `make deploy`.**
 
 ---
 

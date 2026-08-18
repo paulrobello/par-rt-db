@@ -67,14 +67,14 @@ async fn authorize_user_branch_rejects_expired_session() -> anyhow::Result<()> {
     let resp = admin_post(
         addr,
         "/admin/allowlist",
-        json!({"db": name, "action": "add", "email": "probello@gmail.com"}),
+        json!({"db": name, "action": "add", "email": "user@example.com"}),
     )
     .await;
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
 
     let expired = Principal::User {
         user_id: "u1".to_string(),
-        email: "probello@gmail.com".to_string(),
+        email: "user@example.com".to_string(),
         name: None,
         expires_at: db::now_ms() - 1,
     };
@@ -207,7 +207,7 @@ In `authorize_user_branch_matches_allowlist_case_insensitively` (lines 293-328),
 ```rust
     let allowed = Principal::User {
         user_id: "u1".to_string(),
-        email: "Probello@Gmail.com".to_string(),
+        email: "User@Example.com".to_string(),
         name: None,
         expires_at: i64::MAX,
     };
@@ -280,7 +280,7 @@ Insert after line 348 (blank line between tests, matching the file's style). It 
 async fn session_expiry_mid_connection_denies_operations_but_keeps_connection_usable()
 -> anyhow::Result<()> {
     let mock = MockServer::start().await;
-    mount_github_mocks(&mock, verified_primary_email("probello@gmail.com")).await;
+    mount_github_mocks(&mock, verified_primary_email("user@example.com")).await;
     let (state, addr) = oauth_state(&mock).await;
     let db_name = fresh_db(&state).await;
     let token = login_flow(addr, "http://localhost:5173").await;
@@ -288,7 +288,7 @@ async fn session_expiry_mid_connection_denies_operations_but_keeps_connection_us
     let add_resp = admin_post(
         addr,
         "/admin/allowlist",
-        json!({"db": db_name, "action": "add", "email": "probello@gmail.com"}),
+        json!({"db": db_name, "action": "add", "email": "user@example.com"}),
     )
     .await;
     assert_eq!(add_resp.status(), reqwest::StatusCode::OK);

@@ -262,7 +262,7 @@ fn insert_work_item_txn() -> Value {
 #[tokio::test]
 async fn me_with_session_token_returns_email() -> anyhow::Result<()> {
     let mock = MockServer::start().await;
-    mount_github_mocks(&mock, verified_primary_email("probello@gmail.com")).await;
+    mount_github_mocks(&mock, verified_primary_email("user@example.com")).await;
     let (_state, addr) = oauth_state(&mock).await;
     let token = login_flow(addr, "http://localhost:5173").await;
 
@@ -274,7 +274,7 @@ async fn me_with_session_token_returns_email() -> anyhow::Result<()> {
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
     let body: Value = resp.json().await?;
     assert_eq!(body["user"]["kind"], json!("user"));
-    assert_eq!(body["user"]["email"], json!("probello@gmail.com"));
+    assert_eq!(body["user"]["email"], json!("user@example.com"));
     assert_eq!(body["user"]["githubLogin"], json!("paul"));
     assert_eq!(body["user"]["githubId"], json!(42));
     Ok(())
@@ -286,7 +286,7 @@ async fn me_with_session_token_returns_email() -> anyhow::Result<()> {
 #[tokio::test]
 async fn validate_with_session_token_returns_user() -> anyhow::Result<()> {
     let mock = MockServer::start().await;
-    mount_github_mocks(&mock, verified_primary_email("probello@gmail.com")).await;
+    mount_github_mocks(&mock, verified_primary_email("user@example.com")).await;
     let (_state, addr) = oauth_state(&mock).await;
     let token = login_flow(addr, "http://localhost:5173").await;
 
@@ -298,7 +298,7 @@ async fn validate_with_session_token_returns_user() -> anyhow::Result<()> {
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
     let body: Value = resp.json().await?;
     assert_eq!(body["user"]["kind"], json!("user"));
-    assert_eq!(body["user"]["email"], json!("probello@gmail.com"));
+    assert_eq!(body["user"]["email"], json!("user@example.com"));
     assert_eq!(body["user"]["githubLogin"], json!("paul"));
     assert_eq!(body["user"]["githubId"], json!(42));
     Ok(())
@@ -342,7 +342,7 @@ async fn validate_rejects_missing_token() -> anyhow::Result<()> {
 #[tokio::test]
 async fn session_token_authorizes_ws_only_while_allowlisted() -> anyhow::Result<()> {
     let mock = MockServer::start().await;
-    mount_github_mocks(&mock, verified_primary_email("probello@gmail.com")).await;
+    mount_github_mocks(&mock, verified_primary_email("user@example.com")).await;
     let (state, addr) = oauth_state(&mock).await;
     let db_name = fresh_db(&state).await;
     let token = login_flow(addr, "http://localhost:5173").await;
@@ -350,7 +350,7 @@ async fn session_token_authorizes_ws_only_while_allowlisted() -> anyhow::Result<
     let add_resp = admin_post(
         addr,
         "/admin/allowlist",
-        json!({"db": db_name, "action": "add", "email": "probello@gmail.com"}),
+        json!({"db": db_name, "action": "add", "email": "user@example.com"}),
     )
     .await;
     assert_eq!(add_resp.status(), reqwest::StatusCode::OK);
@@ -363,7 +363,7 @@ async fn session_token_authorizes_ws_only_while_allowlisted() -> anyhow::Result<
     let remove_resp = admin_post(
         addr,
         "/admin/allowlist",
-        json!({"db": db_name, "action": "remove", "email": "probello@gmail.com"}),
+        json!({"db": db_name, "action": "remove", "email": "user@example.com"}),
     )
     .await;
     assert_eq!(remove_resp.status(), reqwest::StatusCode::OK);
@@ -382,7 +382,7 @@ async fn session_token_authorizes_ws_only_while_allowlisted() -> anyhow::Result<
 async fn allowlist_removal_mid_session_fails_mutate_without_closing_connection()
 -> anyhow::Result<()> {
     let mock = MockServer::start().await;
-    mount_github_mocks(&mock, verified_primary_email("probello@gmail.com")).await;
+    mount_github_mocks(&mock, verified_primary_email("user@example.com")).await;
     let (state, addr) = oauth_state(&mock).await;
     let db_name = fresh_db(&state).await;
     let token = login_flow(addr, "http://localhost:5173").await;
@@ -390,7 +390,7 @@ async fn allowlist_removal_mid_session_fails_mutate_without_closing_connection()
     let add_resp = admin_post(
         addr,
         "/admin/allowlist",
-        json!({"db": db_name, "action": "add", "email": "probello@gmail.com"}),
+        json!({"db": db_name, "action": "add", "email": "user@example.com"}),
     )
     .await;
     assert_eq!(add_resp.status(), reqwest::StatusCode::OK);
@@ -425,7 +425,7 @@ async fn allowlist_removal_mid_session_fails_mutate_without_closing_connection()
     let remove_resp = admin_post(
         addr,
         "/admin/allowlist",
-        json!({"db": db_name, "action": "remove", "email": "probello@gmail.com"}),
+        json!({"db": db_name, "action": "remove", "email": "user@example.com"}),
     )
     .await;
     assert_eq!(remove_resp.status(), reqwest::StatusCode::OK);
@@ -467,7 +467,7 @@ async fn session_expiry_mid_connection_denies_operations_but_keeps_connection_us
     const SHORT_WINDOW_MS: i64 = 1_500;
 
     let mock = MockServer::start().await;
-    mount_github_mocks(&mock, verified_primary_email("probello@gmail.com")).await;
+    mount_github_mocks(&mock, verified_primary_email("user@example.com")).await;
     let (state, addr) = oauth_state(&mock).await;
     let db_name = fresh_db(&state).await;
     let token = login_flow(addr, "http://localhost:5173").await;
@@ -475,7 +475,7 @@ async fn session_expiry_mid_connection_denies_operations_but_keeps_connection_us
     let add_resp = admin_post(
         addr,
         "/admin/allowlist",
-        json!({"db": db_name, "action": "add", "email": "probello@gmail.com"}),
+        json!({"db": db_name, "action": "add", "email": "user@example.com"}),
     )
     .await;
     assert_eq!(add_resp.status(), reqwest::StatusCode::OK);
@@ -578,7 +578,7 @@ async fn github_begin_with_disallowed_origin_returns_forbidden() -> anyhow::Resu
 #[tokio::test]
 async fn replayed_state_returns_bad_request() -> anyhow::Result<()> {
     let mock = MockServer::start().await;
-    mount_github_mocks(&mock, verified_primary_email("probello@gmail.com")).await;
+    mount_github_mocks(&mock, verified_primary_email("user@example.com")).await;
     let (_state, addr) = oauth_state(&mock).await;
 
     let client = no_redirect_client();
@@ -720,7 +720,7 @@ async fn state_poll_returns_error_after_failed_login() -> anyhow::Result<()> {
 #[tokio::test]
 async fn logout_invalidates_session_for_me() -> anyhow::Result<()> {
     let mock = MockServer::start().await;
-    mount_github_mocks(&mock, verified_primary_email("probello@gmail.com")).await;
+    mount_github_mocks(&mock, verified_primary_email("user@example.com")).await;
     let (_state, addr) = oauth_state(&mock).await;
     let token = login_flow(addr, "http://localhost:5173").await;
 

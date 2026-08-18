@@ -27,7 +27,7 @@ Point at a different backend (default `http://127.0.0.1:8300`):
 ```bash
 RTDB_BACKEND=http://127.0.0.1:8300 make dev
 # or against the live instance (CORS/cookie caveats apply):
-RTDB_BACKEND=https://rtdb.pardev.net make dev
+RTDB_BACKEND=https://rtdb.example.com make dev
 ```
 
 Run a local backend to develop against:

@@ -352,14 +352,14 @@ async fn authorize_user_branch_matches_allowlist_case_insensitively() -> anyhow:
     let resp = admin_post(
         addr,
         "/admin/allowlist",
-        json!({"db": name, "action": "add", "email": "probello@gmail.com"}),
+        json!({"db": name, "action": "add", "email": "user@example.com"}),
     )
     .await;
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
 
     let allowed = Principal::User {
         user_id: "u1".to_string(),
-        email: Some("Probello@Gmail.com".to_string()),
+        email: Some("User@Example.com".to_string()),
         name: None,
         expires_at: i64::MAX,
         anonymous: false,
@@ -498,14 +498,14 @@ async fn authorize_user_branch_rejects_expired_session() -> anyhow::Result<()> {
     let resp = admin_post(
         addr,
         "/admin/allowlist",
-        json!({"db": name, "action": "add", "email": "probello@gmail.com"}),
+        json!({"db": name, "action": "add", "email": "user@example.com"}),
     )
     .await;
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
 
     let expired = Principal::User {
         user_id: "u1".to_string(),
-        email: Some("probello@gmail.com".to_string()),
+        email: Some("user@example.com".to_string()),
         name: None,
         expires_at: db::now_ms() - 1,
         anonymous: false,
