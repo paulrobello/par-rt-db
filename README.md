@@ -1,9 +1,51 @@
-# par-rt-db
+# PAR RT DB
+
+## Table of Contents
+
+* [About](#about)
+* [Features](#features)
+   * [Core Capabilities](#core-capabilities)
+   * [Advanced Features](#advanced-features)
+   * [Technical Excellence](#technical-excellence)
+* [Packages](#packages)
+* [How it works](#how-it-works)
+* [Prerequisites for running](#prerequisites-for-running)
+* [Prerequisites for dev](#prerequisites-for-dev)
+* [Quickstart](#quickstart)
+* [Endpoints](#endpoints)
+   * [Health, realtime, queries, mutations, scheduling](#health-realtime-queries-mutations-scheduling)
+   * [File storage (HTTP-only, bypasses the committer)](#file-storage-http-only-bypasses-the-committer)
+   * [Admin: databases, schema, tokens, allowlist](#admin-databases-schema-tokens-allowlist)
+   * [Admin: dashboard operator surface](#admin-dashboard-operator-surface)
+   * [Auth (OAuth + sessions)](#auth-oauth--sessions)
+* [Configuration](#configuration)
+* [Error envelope](#error-envelope)
+* [Wire protocol](#wire-protocol)
+* [Pagination](#pagination)
+* [Scheduling](#scheduling)
+* [Durable workflows](#durable-workflows)
+* [Realtime presence](#realtime-presence)
+* [Make targets](#make-targets)
+* [Graceful shutdown](#graceful-shutdown)
+* [Known MVP limitations](#known-mvp-limitations)
+* [Clients](#clients)
+* [FAQ](#faq)
+* [Roadmap](#roadmap)
+   * [Where we are](#where-we-are)
+   * [Where we're going](#where-were-going)
+* [What's new](#whats-new)
+* [Contributing](#contributing)
+* [License](#license)
 
 [![CI](https://github.com/paulrobello/par-rt-db/actions/workflows/ci.yml/badge.svg)](https://github.com/paulrobello/par-rt-db/actions/workflows/ci.yml)
-[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)  
+![Runs on Linux | MacOS](https://img.shields.io/badge/runs%20on-Linux%20%7C%20MacOS-blue)
+![Built with Rust](https://img.shields.io/badge/built%20with-Rust-orange)
+![Postgres 17](https://img.shields.io/badge/Postgres-17-blue)
+![Deploy: docker compose](https://img.shields.io/badge/deploy-docker%20compose-blue)
 
-A self-hosted, Convex-inspired realtime document database. Clients send a
+## About
+PAR RT DB is a self-hosted, Convex-inspired realtime document database. Clients send a
 **declarative JSON DSL** — typed queries and atomic multi-step transactions — over
 WebSocket (`/sync`) or one-shot HTTP; the server executes them and pushes live query
 updates on change. There is no embedded JS runtime and no per-app server code — one
@@ -11,31 +53,39 @@ generic server hosts many named databases for every app. Built in Rust on axum/t
 with Postgres 17 storage. Authoritative design:
 [`docs/superpowers/specs`](docs/superpowers/specs).
 
-## Table of contents
-
-- [Packages](#packages)
-- [How it works](#how-it-works)
-- [Quickstart](#quickstart)
-- [Endpoints](#endpoints)
-- [Configuration](#configuration)
-- [Error envelope](#error-envelope)
-- [Wire protocol](#wire-protocol)
-- [Pagination](#pagination)
-- [Scheduling](#scheduling)
-- [Durable workflows](#durable-workflows)
-- [Realtime presence](#realtime-presence)
-- [Make targets](#make-targets)
-- [Graceful shutdown](#graceful-shutdown)
-- [Known MVP limitations](#known-mvp-limitations)
-- [Clients](#clients)
-- [Contributing](#contributing)
-- [License](#license)
-
 Related documentation: [`CHANGELOG.md`](CHANGELOG.md), [`DESIGN.md`](DESIGN.md),
 [`PRODUCT.md`](PRODUCT.md), [`FEATURE_MATRIX.md`](FEATURE_MATRIX.md),
 [`deploy/README.md`](deploy/README.md) (production runbook),
 [`docs/README.md`](docs/README.md) (docs index),
 [`CONTRIBUTING.md`](CONTRIBUTING.md).
+
+[!["Buy Me A Coffee"](https://www.buymeacoffee.com/assets/img/custom_images/orange_img.png)](https://buymeacoffee.com/probello3)
+
+## Features
+
+### Core Capabilities
+- **Declarative JSON DSL**: typed queries and atomic multi-step transactions — no embedded JS runtime, no per-app server code
+- **Realtime live queries**: every subscribed query is re-evaluated after each committed transaction and pushed only when its serialized result changes
+- **Two transports, one vocabulary**: mutations route through the same committer path over WebSocket (`/sync`) or one-shot HTTP, so subscriptions fire regardless of which transport wrote
+- **Many databases per instance**: one generic server hosts many named databases for every app
+- **Typed schemas**: pushed schemas compile to additive Postgres DDL — one typed column per indexed field plus the `doc` jsonb body
+- **First-class SDKs**: TypeScript (with React bindings), Rust, and Python clients that mirror the wire contract directly, plus the `rtdb` CLI and an operator dashboard
+
+### Advanced Features
+- **Full-text search**: websearch-syntax `search` ranked by `ts_rank` with optional snippets, plus a `trgm` mode for substring/autocomplete matching
+- **Vector + hybrid search**: write-maintained pgvector columns ranked by the index's declared metric; `hybridSearch` fuses full-text and vector rankings via Reciprocal Rank Fusion
+- **Scheduling**: one-shot (`afterMs`/`runAt`) and 5-field UTC `cron` transactions with cancel/pause/resume — scheduled work is data, not server code
+- **Durable workflows**: multi-step specs with per-step retry, backoff, and sleep; at-least-once per step with crash-resume
+- **Realtime presence**: transient room membership and state ("who is online", cursors, typing) over the existing `/sync` socket — no extra infrastructure
+- **File storage**: opaque unauthenticated public URLs, signed time-limited URLs, HTTP `Range` support, and read-time image transforms
+- **Auth**: six optional OAuth providers (GitHub, Google, GitLab, Microsoft, Apple, generic OIDC), per-database machine tokens, optional anonymous access with anon→real account merge, and per-row `ownerField`/`authorize` rules
+- **Operator surfaces**: op feed, audit log, webhooks, Prometheus `/metrics` with optional OTLP tracing, backup/restore, schema migration with snapshot history and restore, hot-reloaded config, per-database quotas, slow-query ring, and query explain
+
+### Technical Excellence
+- **Single serialized committer per database**: all writes flow through one committer task per database and reads run under READ COMMITTED — realtime correctness without distributed coordination
+- **Rust on axum/tokio with Postgres 17 storage**: graceful shutdown waits for in-flight requests and open WebSockets before exiting
+- **One wire contract, four implementations**: the server and the ts/rust/python clients stay byte-identical, enforced by a shared semantics corpus ([`wire-corpus/`](wire-corpus/README.md))
+- **Security defaults**: constant-time key comparison, generic client-facing 500 messages (detail only in logs), typed `confirm` guards on destructive operations, path-traversal-guarded downloads
 
 ## Packages
 
@@ -91,6 +141,17 @@ Subscribe/Mutate over an open WebSocket. File storage is HTTP-only and bypasses 
 committer (blobs don't touch document tables). See
 [`server/README.md`](server/README.md) for the server layout and
 [`CLAUDE.md`](CLAUDE.md) for the full invariant list.
+
+## Prerequisites for running
+* Postgres 17 — the repo's `docker-compose.dev.yml` starts one on `127.0.0.1:55434` via `make dev-db-up`, or point `RTDB_DATABASE_URL` at your own
+* [Docker](https://www.docker.com/) — for the dev Postgres and for the production `docker compose` deploy path (see [`deploy/README.md`](deploy/README.md))
+* A Rust `stable` toolchain to build the server binary from source ([`rust-toolchain.toml`](rust-toolchain.toml) is the single source of truth)
+* `jq` for the Quickstart walkthrough
+* Per client SDK: bun/node for TypeScript, cargo for Rust, Python 3.12+ (uv) for Python
+
+## Prerequisites for dev
+* See [CONTRIBUTING's development setup](CONTRIBUTING.md#development-setup) for the full tool list and first-time setup
+* A GNU-compatible `make` — every target spans all six packages; first-time installs are `make ts-client-install`, `make dashboard-install`, and `make python-client-install` (see [Make targets](#make-targets))
 
 ## Quickstart
 
@@ -892,6 +953,43 @@ plus an operator SPA and a CLI built on top of them:
 - [`cli/`](cli/README.md) — `rtdb` operator/CI binary (wraps `par-rt-db-client`).
 
 [`FEATURE_MATRIX.md`](FEATURE_MATRIX.md) tracks parity vs. Convex, with per-row notes on which clients mirror each feature.
+
+## FAQ
+* Q: Do I need a Convex account?
+  * A: No. par-rt-db is Convex-*inspired* but fully self-hosted — storage is your own Postgres 17.
+* Q: Do I write server-side functions?
+  * A: No. Queries and transactions are a declarative JSON DSL; there is no embedded JS runtime and no per-app server code — one generic server hosts many databases.
+* Q: Can I use it over plain HTTP?
+  * A: Yes — one-shot `POST /api/query` / `POST /api/mutate` cover reads and writes. The WebSocket (`/sync`) is only needed for live subscriptions and presence.
+* Q: Which languages have client SDKs?
+  * A: TypeScript (`@par-rt-db/client`, with React bindings), Rust (`par-rt-db-client`), and Python (`par-rt-db`), plus the `rtdb` CLI and the operator dashboard.
+* Q: Is auth required?
+  * A: Machine tokens are the baseline. Each of the six OAuth providers is independently optional (blank env ⇒ its routes return 503), and anonymous access is opt-in (off by default).
+* Q: Can I run multiple replicas behind a load balancer?
+  * A: Not yet — deploy as a single instance. Three coordination channels already work across replicas (`RTDB_MULTI_INSTANCE=true`), but rate limiting and write funnelling do not; see [Known MVP limitations](#known-mvp-limitations) (ENH-022).
+
+## Roadmap
+
+### Where we are
+* **Core**: realtime live queries, atomic multi-step transactions, typed schemas compiled to Postgres DDL, WebSocket + HTTP transports, many databases per instance
+* **Query terminals**: `get`/`index`/`count`/`unique`/`first`/`take`, `filter` predicate DSL, full-text `search` (`ts_rank` + `trgm` mode), `vectorSearch` (pgvector), `hybridSearch` (RRF), `paginate` keyset pagination, `distinct`, `aggregate`
+* **Beyond documents**: scheduling (`afterMs`/`runAt`/`cron`), durable workflows, realtime presence, file storage with signed URLs and image transforms
+* **Auth**: six optional OAuth providers, per-db machine tokens, optional anonymous with anon→real merge, per-row `ownerField`/`authorize` rules
+* **Operations**: operator dashboard, `rtdb` CLI, op feed, audit log, webhooks, Prometheus metrics + optional OTLP tracing, backup/restore, schema migration with snapshot history, hot config, per-db quotas
+* [`FEATURE_MATRIX.md`](FEATURE_MATRIX.md) is the authoritative Convex-parity contract
+
+### Where we're going
+* Multi-instance rate limiting and cross-process write funnelling — the remaining ENH-022 stages that make a multi-replica deploy safe
+* The first tagged release (`v0.1.0`, ENH-026): lockstep client versions and the release process
+
+## What's new
+
+No release has been tagged yet — everything currently lives under `[Unreleased]` in
+[`CHANGELOG.md`](CHANGELOG.md) (the eventual `0.1.0` cut is tracked as ENH-026). Recent
+highlights from the unreleased section: grouped aggregates include the null group key,
+wire-corpus semantic alignment across the server and the three in-memory client engines,
+durable workflows, realtime presence, hybrid search, and schema migration with snapshot
+history and restore.
 
 ## Contributing
 
