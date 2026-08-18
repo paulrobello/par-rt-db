@@ -13,6 +13,7 @@ notes), see [`CLAUDE.md`](CLAUDE.md).
 - [Running tests](#running-tests)
 - [Style and formatting](#style-and-formatting)
 - [Commit messages](#commit-messages)
+- [Versioning](#versioning)
 - [Pre-commit hooks](#pre-commit-hooks)
 - [Troubleshooting](#troubleshooting)
 - [Invariants you must preserve](#invariants-you-must-preserve)
@@ -157,6 +158,16 @@ build: wire python-client into root make checkall
 Keep the subject line to one imperative sentence. Reference the FEATURE_MATRIX
 row or audit finding ID when the change implements one (`(#18)`, `(SEC-004)`,
 etc.).
+
+## Versioning
+
+All packages — `server`, `cli`, `dashboard`, and the three client SDKs
+(`ts-client`, `rust-client`, `python-client`) — version in **lockstep**: one
+version for the whole protocol surface, bumped together in the same release
+commit. The four implementations of the wire contract (`server/src/protocol.rs`
+plus the three client mirrors) are one unit; independent client versions would
+claim compatibility the four-way mirror does not have. The release procedure,
+including the lockstep bump, is [`docs/RELEASING.md`](docs/RELEASING.md).
 
 ## Pre-commit hooks
 

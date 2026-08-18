@@ -13,10 +13,10 @@ contract against Convex.
 
 ## [Unreleased]
 
-> **Versioning note:** no release has been tagged yet — everything below is
-> unreleased. The eventual `0.1.0` cut is tracked as enhancement ENH-026; the
-> dated subsections below are chronological within `[Unreleased]`, not released
-> versions.
+## [0.1.0] - 2026-08-18
+
+First tagged release. Everything below this heading shipped under `[Unreleased]`
+before the tag; the dated subsections are chronological within `0.1.0`.
 
 ### Fix: grouped aggregate 500s on NULL group keys; engines include the null group (server + ts/rust/python)
 
@@ -566,4 +566,5 @@ that is the authoritative parity contract.
 - Per-row `ownerField` pre-checks run inside the serialized transaction with no TOCTOU window; machine tokens and scheduled jobs bypass per-row rules but the db-level gate still runs first.
 - `GET /storage/{id}` is the single unauthenticated route — opaque uuid-v7 URLs, revoke by delete, cross-db isolated via `storage_index`.
 
-[Unreleased]: https://github.com/paulrobello/par-rt-db
+[Unreleased]: https://github.com/paulrobello/par-rt-db/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/paulrobello/par-rt-db/releases/tag/v0.1.0

@@ -9,6 +9,7 @@ contribution.
 - [`DOCUMENTATION_STYLE_GUIDE.md`](DOCUMENTATION_STYLE_GUIDE.md) — formatting, tone, and structure conventions for every doc in this repo and across the six packages.
 - [`ARCHITECTURE.md`](ARCHITECTURE.md) — server internals: the single-writer committer, per-database background tasks, data pipeline, transports, auth, storage, quotas, and the admin surface — with the reasoning behind each invariant.
 - [`OAUTH_SETUP.md`](OAUTH_SETUP.md) — register OAuth apps and wire them into par-rt-db (GitHub, Google, GitLab, Microsoft, Apple, generic OIDC). Each provider is independently optional.
+- [`RELEASING.md`](RELEASING.md) — the repeatable release procedure: lockstep version bump, CHANGELOG heading, gate, annotated tag, push (owner-confirmed).
 - [`clients.md`](clients.md) — the three client SDKs (TypeScript/Rust/Python) at a glance: surface comparison, the four-way wire parity contract, and links to each package's detailed README.
 
 ## Top-level docs (repo root)
