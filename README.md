@@ -123,7 +123,7 @@ sequenceDiagram
     Note over C,DB: Mutate → commit → live push
     C->>H: POST /api/mutate (or WS `mutate`)
     H->>Co: CommitterRequest::Mutate
-    Co->>DB: BEGIN; execute_txn (insert/patch/...)
+    Co->>DB: BEGIN + execute_txn (insert/patch/...)
     DB-->>Co: step results
     Co->>S: fan_out(affected tables)
     S->>DB: re-run affected subscriptions (READ COMMITTED)
