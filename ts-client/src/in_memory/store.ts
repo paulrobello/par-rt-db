@@ -1021,7 +1021,7 @@ export class InMemoryRtDbClient {
    * pending — the server's `scheduler::set_paused(true)` contract. */
   async pauseSchedule(id: string): Promise<boolean> {
     const job = this.schedules.get(id);
-    if (!job || job.status !== "pending") {
+    if (job?.status !== "pending") {
       return false;
     }
     job.status = "paused";
@@ -1032,7 +1032,7 @@ export class InMemoryRtDbClient {
    * paused — the server's `scheduler::set_paused(false)` contract. */
   async resumeSchedule(id: string): Promise<boolean> {
     const job = this.schedules.get(id);
-    if (!job || job.status !== "paused") {
+    if (job?.status !== "paused") {
       return false;
     }
     job.status = "pending";

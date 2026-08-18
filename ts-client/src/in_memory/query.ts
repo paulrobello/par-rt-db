@@ -625,6 +625,7 @@ function executeGetTerminal(
       "get cannot be combined with index, eq, range bounds, order, take, unique, first, count, distinct, aggregate, paginate, filter, search, or vector search",
     );
   }
+  // biome-ignore lint/style/noNonNullAssertion: dispatcher only calls this under q.get !== undefined
   const row = rowsFor(q.table).get(q.get!);
   // FM-33: a soft-deleted row is absent to the get terminal.
   return row && row.deletedAt === undefined ? mergeDoc(row) : null;
@@ -657,6 +658,7 @@ function executeVectorSearchTerminal(
   ) {
     throw new RtDbError("BAD_REQUEST", "vectorSearch cannot be combined with any other terminal");
   }
+  // biome-ignore lint/style/noNonNullAssertion: dispatcher only calls this under q.vectorSearch !== undefined
   const vs = q.vectorSearch!;
   const vectorDef = tableDef.indexes?.find((i) => i.name === vs.index && i.vector);
   if (!vectorDef) {
@@ -752,6 +754,7 @@ function executeSearchTerminal(
   // (query-lexeme frequency desc, then `created_at` desc, then `id` desc) —
   // exact `ts_rank` order is intentionally not replicated. `take` (already
   // capped to MAX_TAKE above) limits the result.
+  // biome-ignore lint/style/noNonNullAssertion: dispatcher only calls this under q.search !== undefined
   const search = q.search!;
   if (search.query.trim().length === 0) {
     throw new RtDbError("BAD_REQUEST", "search query text must not be empty");
@@ -908,6 +911,7 @@ function executeAggregateTerminal(
     }
     return false;
   };
+  // biome-ignore lint/style/noNonNullAssertion: dispatcher only calls this under q.aggregate !== undefined
   const { op, groupBy = false } = q.aggregate!;
   // `count` aggregates rows, not a field — it consumes no aggregate index
   // field (mirrors server `AggregateOp::needs_field`).

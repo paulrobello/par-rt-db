@@ -1312,6 +1312,7 @@ describe("RtDbAdminClient cookie mode (ARC-106)", () => {
     const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ databases: [] }));
     // Plant a readable CSRF cookie the way /admin/login does.
     const old = document.cookie;
+    // biome-ignore lint/suspicious/noDocumentCookie: jsdom has no Cookie Store API; document.cookie is the only way to plant a readable cookie
     document.cookie = "rtdb-admin-csrf=nonce123;path=/";
     try {
       const admin = new RtDbAdminClient({ url: "http://h:8300", fetch: fetchMock });
@@ -1322,7 +1323,9 @@ describe("RtDbAdminClient cookie mode (ARC-106)", () => {
       expect(init.headers["X-Rtdb-Csrf"]).toBe("nonce123");
     } finally {
       // best-effort cleanup; jsdom retains other cookies too
+      // biome-ignore lint/suspicious/noDocumentCookie: jsdom has no Cookie Store API
       document.cookie = "rtdb-admin-csrf=;max-age=0;path=/";
+      // biome-ignore lint/suspicious/noDocumentCookie: jsdom has no Cookie Store API
       if (old) document.cookie = old;
     }
   });
