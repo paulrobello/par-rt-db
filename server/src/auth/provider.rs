@@ -706,10 +706,8 @@ enum StateResponse {
     Error,
 }
 
-/// `GET /auth/state?state=`: provider-agnostic polling endpoint. The `state`
-/// token (minted at `/auth/{provider}/begin`) is the capability — no cookie
-/// required, so this works cross-origin (the SDK on a different origin) where
-/// the `SameSite=Lax` session cookie would not be sent. Returns
+/// `GET /auth/state?state=`: provider-agnostic polling endpoint keyed on the
+/// single-use `state` token minted at `/auth/{provider}/begin`. Returns
 /// `pending | complete | expired | error`.
 ///
 /// SEC-121: the `state` value appears in URLs, edge logs, and the server's

@@ -137,6 +137,30 @@ const [{ id }] = (await db.mutate(
 )) as [{ id: string }];
 ```
 
+Beyond the `collect`/`take` queries above, the builder carries `first()`,
+`unique()`, `count()`, `distinct()`, `aggregate(op, groupBy?)`, and
+`paginate(cursor, n)` — plus `.filter(expr)`, an `eq`/`neq`/`gt`/`gte`/`lt`/
+`lte`/`in`/`contains`/`exists`/`and`/`or`/`not` predicate over declared fields
+that narrows the matching set server-side. A filter value whose JSON kind
+contradicts the declared field type (a number against a string field) is
+rejected with `BAD_REQUEST` — on the server and in `InMemoryRtDbClient` alike —
+instead of silently matching nothing.
+
+```ts
+// given .index("by_project_status", ["projectId", "status"]) — distinct and
+// aggregate read the index field AFTER the eq prefix:
+const statuses = await db.query(
+  api.items.query().withIndex("by_project_status", ["p1"]).distinct(),
+);
+// → ["backlog", "done"] — unique values, ascending, nulls included and sorted last
+const perStatus = await db.query(
+  api.items.query().withIndex("by_project_status", ["p1"]).aggregate("count", true),
+);
+// → { key, value }[] ordered by key: rows missing the group field form one
+//   key:null group (sorted last); null aggregate values are skipped (SQL
+//   semantics), so a group whose values are all null returns value:null.
+```
+
 ## React Native / Expo
 
 The core clients run on React Native (Hermes) with **no polyfills** — the

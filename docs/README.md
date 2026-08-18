@@ -9,6 +9,7 @@ contribution.
 - [`DOCUMENTATION_STYLE_GUIDE.md`](DOCUMENTATION_STYLE_GUIDE.md) — formatting, tone, and structure conventions for every doc in this repo and across the six packages.
 - [`ARCHITECTURE.md`](ARCHITECTURE.md) — server internals: the single-writer committer, per-database background tasks, data pipeline, transports, auth, storage, quotas, and the admin surface — with the reasoning behind each invariant.
 - [`OAUTH_SETUP.md`](OAUTH_SETUP.md) — register OAuth apps and wire them into par-rt-db (GitHub, Google, GitLab, Microsoft, Apple, generic OIDC). Each provider is independently optional.
+- [`clients.md`](clients.md) — the three client SDKs (TypeScript/Rust/Python) at a glance: surface comparison, the four-way wire parity contract, and links to each package's detailed README.
 
 ## Top-level docs (repo root)
 
@@ -17,7 +18,7 @@ contribution.
 - [`../CONTRIBUTING.md`](../CONTRIBUTING.md) — development environment, test/lint/format commands, commit and PR conventions, and the pre-commit hook setup.
 - [`../FEATURE_MATRIX.md`](../FEATURE_MATRIX.md) — Convex-parity contract; the source of truth for which features are implemented and mirrored across the four clients.
 - [`../CHANGELOG.md`](../CHANGELOG.md) — released changes, following [Keep a Changelog](https://keepachangelog.com/). The historical enhancement candidate list (`ENHANCEMENTS.md`, ENH-001–022) was retired once all enhancements shipped; the backlog now lives on the project kanban board (tagged `enhancement`), and the `ENH-*` ids are preserved there and in `docs/superpowers/plans/*-enh-NNN-*.md` filenames.
-- [`../DESIGN.md`](../DESIGN.md) — dashboard visual design system and binding design.
+- [`../DESIGN.md`](../DESIGN.md) — dashboard visual design system (mode, palette, typography, components, motion).
 - [`../PRODUCT.md`](../PRODUCT.md) — product framing for the operator console.
 - [`../deploy/README.md`](../deploy/README.md) — production deployment runbook for the lenny2 Docker host (build on the x86_64 host, Cloudflare tunnel, secrets, backups, monitoring, rollback).
 
@@ -26,8 +27,9 @@ contribution.
 The [`superpowers/`](superpowers/) directory holds the design history of the project — written with the `superpowers` skill's brainstorm → spec → plan → implement cycle. Specs are the durable design record; plans are the execution breakdown that landed the spec.
 
 - [`superpowers/SPEC_STATUS.md`](superpowers/SPEC_STATUS.md) — at-a-glance status of every spec (implemented, in-progress, or shelved).
-- [`superpowers/specs/`](superpowers/specs/) — design specs: the `2026-07-21-par-rt-db-design.md` main spec is the authoritative protocol/semantics source; later specs cover clients (rust, python, dashboard), per-row authorization, fine-grained subscription invalidation, file storage, scheduling, schema migration, presence, quotas, schema history, image transforms, signed URLs, undo, and more.
+- [`superpowers/specs/`](superpowers/specs/) — design specs: the `2026-07-21-par-rt-db-design.md` main spec is the authoritative protocol/semantics source; later specs cover clients (rust, python, dashboard), per-row authorization, fine-grained subscription invalidation, file storage, scheduling, schema migration, presence, quotas, schema history, image transforms, signed URLs, durable workflows, full-text search, cascade delete, field defaults, and more.
 - [`superpowers/plans/`](superpowers/plans/) — implementation plans: per-spec execution breakdowns including the seven-phase realtime-dashboard series (`2026-07-24-realtime-dashboard-phase{1-auth,2-metadata,3a-metrics,3b-opfeed,4-config,5-admin-docs,6-static}.md`).
+- [`fable/`](fable/) — enhancement plan docs (ENH-023–027) from the fable-audit cycle: the behavioral-semantics corpus, subscription rerun observability, the generated CLI reference, the v0.1.0 release process, and query-DSL property testing.
 
 When the code and a spec disagree, the code wins; fix the spec.
 

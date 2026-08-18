@@ -16,7 +16,7 @@ Crate name: `par-rt-db-client` → in Rust, `use par_rt_db_client::...`.
 | `http` | yes | `RtDbHttpClient` — typed query / mutate / `auth_me` |
 | `ws` | no | `RtDbClient` (`src/ws.rs`) — reactive WebSocket client (live query subscriptions + mutate) |
 | `admin` | no | `RtDbAdminClient` (`src/admin.rs`) — `/admin/*` control-plane client: db create/list/push-schema, schema/stats read-back, token mint/revoke/list, db + server-wide admin allowlist CRUD, metrics, hot config GET/PATCH, op-feed `recent`, owner-bypass query/mutate (incl. `include_deleted` for soft-deleted rows), snapshot export/import, schema preview (advisory additive/reject diff), admin schedules CRUD (list/create/cancel/pause/resume), admin storage (list/upload/delete), per-db anonymous-access toggle (SEC-103). Browser-only `login`/`logout`/`/admin/stream` are excluded (the Rust client is a machine client). Construct via `RtDbAdminClient::new(url, admin_key)` or `RtDbHttpClient::admin_client()` (shares the connection pool). The admin methods also remain on `RtDbHttpClient` as `#[deprecated]` re-exports (ARC-121, non-breaking). |
-| `in_memory` | no | `InMemoryRtDbClient` (`src/in_memory/`) — in-memory test harness (no network, no Postgres). Ports `ts-client/src/in_memory/`: schema push, mutate (with `mut_id` idempotency), one-shot query DSL (`get`/`first`/`unique`/`count`/`take`/`collect` + index eq + range + `order` + cursor-keyset `paginate`), `filter()` predicate evaluation, reactive `subscribe` (re-runs and fires `on_update` on change), `schedule`/`cancel_schedule`/`pause_schedule`/`resume_schedule`/`list_schedules` + a timer-less `tick(now_ms)` (one-shot catches up if past due; cron re-arms by `CRON_STEP_MS = 60_000` and skips missed windows), and the `upload`/`delete_file`/`get_file_metadata`/`get_url` storage stubs. `search` approximates server behavior by mode — websearch operator matching (quoted phrases, `or` unions, `-term` exclusion, FM-31) with optional `_searchSnippet` highlights for `tsquery`, substring + similarity ranking for `trgm` (FM-30); `vector_search` over-approximates (no distance model — every table doc is a candidate, narrowed by the carried `filter`); rejected combinations still throw. |
+| `in_memory` | no | `InMemoryRtDbClient` (`src/in_memory/`) — in-memory test harness (no network, no Postgres). Ports `ts-client/src/in_memory/`: schema push, mutate (with `mut_id` idempotency), one-shot query DSL (`get`/`first`/`unique`/`count`/`take`/`collect`/`distinct`/`aggregate` + index eq + range + `order` + cursor-keyset `paginate`), `filter()` predicate evaluation (validated against the declared schema — a kind-mismatched value, e.g. a number on a string field, errors with `BAD_REQUEST` instead of silently matching nothing, SEC-126), reactive `subscribe` (re-runs and fires `on_update` on change), `schedule`/`cancel_schedule`/`pause_schedule`/`resume_schedule`/`list_schedules` + a timer-less `tick(now_ms)` (one-shot catches up if past due; cron re-arms by `CRON_STEP_MS = 60_000` and skips missed windows), and the `upload`/`delete_file`/`get_file_metadata`/`get_url` storage stubs. `search` approximates server behavior by mode — websearch operator matching (quoted phrases, `or` unions, `-term` exclusion, FM-31) with optional `_searchSnippet` highlights for `tsquery`, substring + similarity ranking for `trgm` (FM-30); `vector_search` over-approximates (no distance model — every table doc is a candidate, narrowed by the carried `filter`); rejected combinations still throw. |
 
 `core` (wire types, schema/query/mutation builders, error model) compiles with
 no features. `[lints.rust] warnings = "deny"` — same zero-warning posture as the
@@ -31,8 +31,12 @@ server-side (quoted phrases, bare `or`, `-term` exclusion) and `snippet: true`
 asks the server to attach a `<mark>`-highlighted `_searchSnippet` fragment to
 each hit, tsquery mode only), the
 `.hybrid_search()` fused full-text+vector terminal (Reciprocal Rank Fusion),
-`.distinct()` (collapse duplicates on a field set), and `.aggregate()` (grouped
-`sum`/`avg`/`min`/`max`/`count`) terminals, the
+`.distinct()` (unique values of the index field after the eq prefix, ascending —
+NULLs included once and sorted last), and `.aggregate()` (`sum`/`avg`/`min`/
+`max`/`count` over the index field after the eq prefix, `null` over an empty
+set; `groupBy` shifts to grouped `{key, value}` rows — rows missing the group
+field form one `key:null` group sorted last, null agg values are skipped (SQL
+semantics), and an all-null group yields `value:null`) terminals, the
 `mutate_with_retry` precondition-conflict helper, `upsert_by_index` /
 `find_one_by_index` shortcuts, and `validate_session_token` for session
 validation. `search_index()` declares a full-text index in a `Schema`,
@@ -102,7 +106,10 @@ let _one: Option<Item> = db.get("items", "i1").await?;
 
 `run` deserializes `{result}` into `T` — use the terminal that matches `T`
 (`collect`/`take` → `Vec<T>`, `first`/`unique`/`get` → `Option<T>`,
-`count` → `i64`, `paginate` → `Paginated<T>`). For many independent queries in
+`count` → `i64`, `paginate` → `Paginated<T>`, `distinct` →
+`Vec<serde_json::Value>` (or `Vec<String>`/`Vec<f64>` for a homogeneous index
+field), `aggregate` → `Option<serde_json::Value>` scalar or
+`Vec<AggregateGroup>` when `groupBy`). For many independent queries in
 one round trip, `batch_query(&[Query])` fans out via `POST /api/query-batch` and
 returns a length-aligned `Vec<BatchQueryOutcome>` (each slot's `result` is a raw
 `serde_json::Value` because a batch spans terminals; a per-query error is that

@@ -50,10 +50,11 @@ working with zero providers configured.
   the pending entry (a replay rejects with `400`), exchanges the code for an
   access token, fetches the user's **verified** email, upserts `rtdb_auth.users`,
   and returns popup-closing HTML. The session token is delivered twice — via the
-  HttpOnly session cookie **and** via the one-shot `/auth/state` poll. The
-  `state` token (not the cookie) is the poll capability, which is what makes
-  cross-origin SDK login work where the `SameSite=Lax` session cookie would not
-  be sent.
+  HttpOnly session cookie **and** via the one-shot `/auth/state` poll. The poll
+  is keyed on the `state` token plus a `SameSite=None` `rtdb-oauth-state` cookie
+  set at `/begin` (SEC-121 — a leaked state URL alone cannot poll), which is
+  what makes cross-origin SDK login work where the `SameSite=Lax` session
+  cookie would not be sent.
 - Identity is **email-keyed with cross-provider linking**: a user who first
   logs in via GitHub and later via Google (same verified email) resolves to the
   same account. Enabling more providers is additive, not fragmenting.
@@ -61,8 +62,9 @@ working with zero providers configured.
   GitHub picks the primary verified address (falling back to any verified one)
   and never trusts the unverified profile-level email; GitLab requires a
   confirmed email (`confirmed_at` set on `/api/v4/user`). The generic OIDC
-  provider trusts the configured IdP's assertion and rejects only when userinfo
-  explicitly says `email_verified: false` (many IdPs omit the field).
+  provider requires the IdP to positively assert `email_verified: true`
+  (boolean or the string `"true"`) — a missing `email_verified` is rejected
+  as unverified (SEC-122; see [OIDC (generic provider)](#oidc-generic-provider)).
 - A provider is "configured" only when its required env vars are all non-empty
   (`from_config` returns `None` otherwise) — the two credentials for
   GitHub/Google/GitLab, `RTDB_MICROSOFT_CLIENT_ID`/`_SECRET` for Microsoft
@@ -403,11 +405,13 @@ or integrate with par-rt-db:
   break-glass via `RTDB_OAUTH_LOGIN_CSRF=false` (default `true`).
 - **Reverse-tabnabbing + cross-origin poll.** The popup opens with
   `noopener,noreferrer`, so the authorize page has no `window.opener` handle.
-  Completion is relayed by the **parent** polling `GET /auth/state?state=` keyed
-  on the single-use state token — not by `window.opener.postMessage`. The state
-  token, not the session cookie, is the poll capability; this is what makes
-  cross-origin SDK login work where the `SameSite=Lax` session cookie would not
-  be sent on the poll request.
+  Completion is relayed by the **parent** polling `GET /auth/state?state=` —
+  not by `window.opener.postMessage`. SEC-121: the `state` value transits URLs
+  and logs, so the poll must also carry the `rtdb-oauth-state` cookie set at
+  `/begin` (constant-time-compared to the `state` param; a mismatch answers
+  `expired`). That cookie is `SameSite=None` — not the `SameSite=Lax` session
+  cookie — so cross-origin SDK login works as long as the `/begin` and
+  `/auth/state` fetches send `credentials: "include"`.
 
 ## Troubleshooting
 
@@ -416,7 +420,7 @@ or integrate with par-rt-db:
 | `503 {… "oauth not configured"}` | `CLIENT_ID`/`CLIENT_SECRET` not set in the **container's** env. Three causes: blank in `.env`, the container wasn't recreated after editing `.env`, or `docker-compose.yml` doesn't pass that provider's vars into the server `environment:` block (so they sit in `.env` unused — the bug that blocked Google on first enable). |
 | `403 "origin not allowed"` | The `origin=` you passed to `/auth/{provider}/begin` is not in `RTDB_ALLOWED_ORIGINS`. Add it (hot-reloadable via `PATCH /admin/config`). |
 | Provider error page: `redirect_uri_mismatch` | The callback URL registered at the provider doesn't exactly match `RTDB_PUBLIC_URL` + the callback path (see the [quick reference](#quick-reference)). Watch the scheme (`https://`) and trailing slash. |
-| `403 "no verified email"` | The account's email isn't verified at the provider. Verify it, or (Google) ensure the account is a *Test user* while the consent screen is in Testing. |
+| `403 "no verified email"` (OIDC/Microsoft: `"email is not verified"`) | The account's email isn't verified at the provider. Verify it, or (Google) ensure the account is a *Test user* while the consent screen is in Testing. |
 | Google login works only for one account | Consent screen still in *Testing*. **Publish app** → *In production*. |
 
 ## Adding a new provider (e.g. a future IdP)

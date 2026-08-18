@@ -151,8 +151,9 @@ write publishes here" guarantee extends to migrate (see `migrate.rs` and the
 ## Per-database background tasks
 
 `Committers::channel_for` spawns the per-db task set: committer, scheduler,
-TTL reaper, and mutation-log cleanup. All the non-committer tasks follow the
-same rule: **they never write document tables** — they only claim/enqueue work
+TTL reaper, mutation-log cleanup, and the storage-quota cache warmer. All the
+non-committer tasks follow the same rule: **they never write document
+tables** — they only claim/enqueue work
 back through the committer, preserving the single-writer invariant.
 
 ### Scheduler and durable workflows (`scheduler.rs`, `workflows.rs`)
@@ -182,13 +183,13 @@ only at scheduler startup), and all three standalone start surfaces (WS
 `Committers::ensure_spawned` + `workflows::ensure_table` BEFORE insert, so a
 workflow started on a cold db (no per-db tasks yet) both starts and advances.
 
-**Task lifecycle**: the scheduler and the mutation-log cleanup task
-self-terminate when they detect their database has been deleted (a
-`db::database_exists` check on a poll error, after `DROP SCHEMA` removes their
-tables), so `delete-db` (`POST /admin/delete-db`, typed `{name, confirm}`
-guard) retires the per-db tasks cleanly instead of leaving perpetual error-log
-spam — and dropping their channel senders lets the reactive committer task
-exit too.
+**Task lifecycle**: the poller tasks (scheduler, mutation-log cleanup, TTL
+reaper, quota warmer) self-terminate when they detect their database has been
+deleted (a `db::database_exists` check on a poll error, after `DROP SCHEMA`
+removes their tables), so `delete-db` (`POST /admin/delete-db`, typed
+`{name, confirm}` guard) retires the per-db tasks cleanly instead of leaving
+perpetual error-log spam — and dropping their channel senders lets the
+reactive committer task exit too.
 
 **Idle-database reclamation** (`RTDB_DB_IDLE_RECLAIM_SECS`, default 0 = off,
 ARC-102 step 4): when non-zero, a server-wide background sweep retires a
@@ -230,9 +231,11 @@ graph LR
     subgraph perdb["Per-database schema (created by db::create_database)"]
         direction TB
         DOC["Document tables — one typed column per indexed field<br />+ doc jsonb (system fields merged at read time)"]
+        META["meta — live derived schema (key/value jsonb)"]
         SCHED["scheduled_txns — (due_at, txn) rows the scheduler claims"]
         WFS["workflows — durable runs (snapshotted spec + step outcomes)"]
-        STOR["storage — bytea blobs + sha256/size/content_type"]
+        STOR["storage — blob rows (sha256/size/content_type,<br />inline bytes for legacy blobs)"]
+        CHUNK["storage_chunks — 1 MiB bytea chunks (streamed uploads, ENH-021)"]
         MUT["mutations — idempotency-key replay log"]
         HIST["schema_history — captured schema versions (push/migrate/restore)"]
     end
@@ -252,7 +255,7 @@ graph LR
     classDef side fill:#1E1E1E,stroke:#2196F3,stroke-width:2px,color:#E6E6E6
     classDef glob fill:#1E1E1E,stroke:#FFC107,stroke-width:2px,color:#E6E6E6
     class DOC doc
-    class SCHED,WFS,STOR,MUT,HIST side
+    class SCHED,WFS,STOR,CHUNK,MUT,HIST,META side
     class AUTH,SIDX,CFG,AUD,WHK glob
 ```
 
@@ -387,8 +390,10 @@ defense, SEC-012); completion is relayed by the parent polling
 `GET /auth/state?state=` keyed on the single-use state token minted by
 `GET /auth/{provider}/begin` (not `window.opener.postMessage`, which
 `noopener` severs) — the callback sets the HttpOnly session cookie and closes
-the popup without interpolating the parent origin. The state token (not the
-cookie) is the poll capability, so the flow works cross-origin where the
+the popup without interpolating the parent origin. The poll is keyed on the
+state token plus the `SameSite=None` `rtdb-oauth-state` cookie set at `/begin`
+(SEC-121 — constant-time-compared to the `state` param, so a leaked state URL
+alone cannot poll), which is what lets the flow work cross-origin where the
 `SameSite=Lax` session cookie would not be sent. Login-CSRF is defended by a
 double-submit nonce cookie (`rtdb-oauth-csrf`, value = the `state` token;
 `SameSite=None;HttpOnly`, 10-min) set at `/begin` and constant-time-verified at
@@ -438,7 +443,10 @@ client SDKs and the `rtdb sessions list|revoke` CLI.
 ## File storage
 
 HTTP-only and bypasses the committer (`storage.rs`, `http_api.rs`): per-db
-`bytea` blobs in a `storage` side table + a global `rtdb.storage_index(id →
+`bytea` blobs in a `storage` side table — streamed uploads (ENH-021) land as
+1 MiB chunks in a companion `storage_chunks` table with the `storage` row's
+`bytes` left NULL; legacy blobs keep inline bytes, and reads probe chunks
+first — plus a global `rtdb.storage_index(id →
 db)` for opaque public-serve resolution. Upload (`POST /api/storage/{db}`) and
 the authed routes carry `{db}` in the path (raw bodies can't carry it; session
 principals aren't db-scoped) and reuse the `bearer → resolve_bearer →
@@ -610,9 +618,11 @@ the DB role (new — the server previously only ran `CREATE SCHEMA`/
 
 ## Hot config and dynamic CORS
 
-`config.rs`, `lib.rs`. Four settings — `allowed_origins`, `session_ttl_days`,
-`max_file_size`, `idempotency_ttl_ms` — are runtime-mutable, held on
-`AppState` as `Arc<ArcSwap<HotConfig>>` and persisted in a single-row
+`config.rs`, `lib.rs`. Seven settings — `allowed_origins`, `session_ttl_days`,
+`max_file_size`, `idempotency_ttl_ms`, plus the three ENH-011 quota caps
+(`maxTablesPerDb`/`maxStorageBytesPerDb`/`maxSubsPerDb`) — are
+runtime-mutable, held on `AppState` as `Arc<ArcSwap<HotConfig>>` and
+persisted in a single-row
 `rtdb_config` table (boot seeds from env when no row exists; a malformed row
 warns and falls back to env rather than blocking startup). Every consumer
 reads `state.hot.load()` (the committer reads `idempotency_ttl_ms` live at

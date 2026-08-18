@@ -19,7 +19,7 @@ Package name: `par-rt-db` → in Python, `import par_rt_db`.
 | Core wire types (`ClientMessage`, `ServerMessage`, `ScheduleWhen`, `FilterExpr`, …) | shipped | `par_rt_db.wire` |
 | Schema DSL (`SchemaDef`, `TableDef`, `t` field constructors, `SchemaBuilder`) | shipped | `par_rt_db.schema` |
 | Query DSL (`Query`, `TableQuery` builder, `Paginated`, `parse_result`) | shipped | `par_rt_db.query` |
-| Mutation DSL (`Mutation` builder, `Transaction`, `StepResult`, 9 step ops) | shipped | `par_rt_db.mutation` |
+| Mutation DSL (`Mutation` builder, `Transaction`, `StepResult`, 14 step ops) | shipped | `par_rt_db.mutation` |
 | Cursor codec (`encode_cursor` / `decode_cursor`) | shipped | `par_rt_db.cursor` |
 | Error model (`RtDbError`, `ErrorCode`, `retry_on_precondition`) | shipped | `par_rt_db.errors` |
 | HTTP / admin / storage client (`RtDbHttpClient`, sync `httpx`) | shipped | `par_rt_db.http_client` (`[http]` extra) |
@@ -106,7 +106,8 @@ payload = txn.model_dump(by_alias=True, exclude_none=True)
 ```
 
 The builder caps at 1024 steps (matching `server/src/txn.rs::MAX_STEPS`) and
-raises `ValueError` eagerly so an over-cap transaction never reaches the wire.
+raises `RtDbError` (`BAD_REQUEST`) eagerly so an over-cap transaction never
+reaches the wire.
 Add `expect_version` / `expect_absent` preconditions for optimistic-concurrency
 patterns; combine with `retry_on_precondition` from `par_rt_db.errors` for
 read-modify-write loops.
@@ -123,7 +124,8 @@ payload = query.model_dump(by_alias=True, exclude_none=True)
 # => {"table": "items", "index": "by_n", "eq": ["kanban-board-1"],
 #     "order": "asc", "take": 10}
 
-# Point read (one terminal, mutually exclusive with take/unique/first/count/paginate).
+# Point read (one terminal, mutually exclusive with take/unique/first/count/
+# distinct/aggregate/paginate).
 point = TableQuery("items").get("i1").build()
 
 # Full-text search over a declared search index. `mode="trgm"` switches to
@@ -141,6 +143,15 @@ phrase = TableQuery("items").search("by_name", '"release notes" -draft', snippet
 # Vector similarity over a pgvector index (embeddings are client-supplied).
 vs = TableQuery("docs").vector_search("by_embedding", [0.1, 0.2, ...], limit=5).build()
 ```
+
+`distinct` and `aggregate` follow the server's SQL NULL semantics: `distinct`
+returns the unique values of the index field after the eq prefix, ascending,
+with NULLs included and sorted last; a grouped `aggregate` puts rows missing
+the group field into one `key: null` group (sorted last), skips null agg
+values, and yields `value: null` for a group whose agg values are all null.
+`filter()` values are validated against the field's declared type — a
+kind-mismatched value (a number on a string field) errors with `BAD_REQUEST`
+instead of silently matching nothing.
 
 Over the reactive WebSocket (`/sync`), send a `subscribe` frame carrying the
 serialized query; the server pushes a `queryUpdate` on every committed write
@@ -295,7 +306,7 @@ HTTP clients return the new run id; the reactive client returns `WorkflowInfo`.
 
 ```python
 from par_rt_db import Mutation
-from par_rt_db.wire import StepRetry, WorkflowSpec, WorkflowStepSpec
+from par_rt_db.wire import StepRetry, WorkflowInfo, WorkflowSpec, WorkflowStepSpec
 from par_rt_db.ws_client import RtDbClient  # or RtDbHttpClient from par_rt_db.http_client
 
 db = RtDbClient(
@@ -315,9 +326,9 @@ spec = WorkflowSpec(
         ),
     ],
 )
-run_id: str = db.start_workflow(spec)  # reactive client: WorkflowInfo
-db.cancel_workflow(run_id)  # False for a missing/terminal run
-runs = db.list_workflows("running")  # list[WorkflowInfo], newest first
+info: WorkflowInfo = await db.start_workflow(spec)  # HTTP clients return the run id
+await db.cancel_workflow(info.id)  # False for a missing/terminal run
+runs = await db.list_workflows("running")  # list[WorkflowInfo], newest first
 
 # …or start one atomically inside a txn:
 Mutation.builder().insert("users", {"name": "a"}).start_workflow(spec).build()
@@ -389,7 +400,7 @@ push-time validation with the server's exact messages — in
 
 ## Errors
 
-Every failure is `RtDbError { code, message }` with `ErrorCode` matching the
+Every failure is `RtDbError { code, message, retryAfter? }` with `ErrorCode` matching the
 server's `SCREAMING_SNAKE_CASE` codes (`UNAUTHORIZED`, `PRECONDITION_FAILED`,
 `SCHEMA_VIOLATION`, …). `RtDbError.from_http(status, body)` parses the wire
 envelope; `RtDbError.from_envelope(dict)` builds one from an already-parsed
