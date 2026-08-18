@@ -1,6 +1,6 @@
 {
   "name": "distinct-includes-null",
-  "$comment": "Distinct over an indexed optional string with absent values: rows without the field store SQL NULL in the f_tag column, and DISTINCT keeps one NULL row (README: NULL index values are included; to_jsonb(NULL) is null). Ordering derivation (verified live on the dev Postgres): under the terminal's current SQL, SELECT DISTINCT to_jsonb(col) AS v ... ORDER BY v makes the null row SQL NULL and ASC uses the default NULLS LAST; under a COALESCE(to_jsonb(col), 'null'::jsonb) shape (like the aggregate terminal's) the jsonb scalar ordering also places 'null' AFTER strings (probed: '\"a\"' < 'null'). Either way the strings come first ascending with null last. skip/server: the server 500s today — sqlx's serde_json::Value decode rejects the SQL NULL cell (UnexpectedNullError -> INTERNAL via From<sqlx::Error>), so this runner cannot express the documented semantics until the distinct terminal wraps its projection like the aggregate terminal does. The three in-memory engines execute the case normally.",
+  "$comment": "Distinct over an indexed optional string with absent values: rows without the field store SQL NULL in the f_tag column, and DISTINCT keeps one NULL row (README: NULL index values are included). Ordering derivation (verified live on the dev Postgres): the terminal projects SELECT DISTINCT to_jsonb(col) AS v ... ORDER BY v, so the absent-value row is SQL NULL and ASC uses the default NULLS LAST — strings first ascending, null last. (jsonb-type ordering would place 'null' BEFORE strings, which is why the fix decodes the SQL NULL cell as Option rather than COALESCEing the projection.)",
   "schema": {
     "tables": {
       "tasks": {
@@ -21,8 +21,5 @@
   "op": {
     "query": { "table": "tasks", "index": "by_tag", "distinct": true }
   },
-  "expect": ["a", "x", null],
-  "skip": {
-    "server": "server distinct terminal 500s (INTERNAL) on NULL index values: to_jsonb(NULL) is SQL NULL and sqlx cannot decode a NULL jsonb cell into serde_json::Value; needs the aggregate terminal's COALESCE treatment. Case pins the documented semantics for the client engines."
-  }
+  "expect": ["a", "x", null]
 }

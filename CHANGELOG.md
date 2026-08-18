@@ -18,6 +18,22 @@ contract against Convex.
 > dated subsections below are chronological within `[Unreleased]`, not released
 > versions.
 
+### Fix: distinct terminal 500s on NULL index values (server)
+
+`distinct` over an optional indexed field returned `INTERNAL` (a 500)
+whenever matching rows lacked the value: the terminal projects
+`SELECT DISTINCT to_jsonb(col) … ORDER BY v`, `to_jsonb(NULL)` is SQL
+NULL, and sqlx's `serde_json::Value` decoder rejects NULL cells. The
+executor now decodes the projection as `Option<Value>` and surfaces a
+missing value as JSON `null` — sorted last, because the unchanged
+`ORDER BY v` already places the SQL NULL row last (Postgres ASC defaults
+to NULLS LAST, jsonb-type ordering would not: probed live, jsonb `'null'`
+sorts BEFORE strings, so a COALESCE-style projection would have flipped
+the pinned order). This is the server half of the
+`distinct-includes-null` parity gap the SEC-126 entry's engine fixes
+exposed — the corpus case's `skip.server` is removed and all four runners
+now execute it green.
+
 ### Error parity: engines reject kind-mismatched filter values like the server (SEC-126)
 
 The server's filter compile path validates every value-carrying filter leaf

@@ -520,7 +520,11 @@ pub(crate) async fn execute_distinct_terminal(
     pool: &PgPool,
 ) -> Result<QueryResult, RtDbError> {
     let CompiledQuery { sql, binds, .. } = cq;
-    let mut query = sqlx::query_as::<_, (serde_json::Value,)>(&sql);
+    // Rows missing an optional indexed field project to a SQL NULL cell
+    // (`to_jsonb(NULL)` is SQL NULL), which sorts last under the ORDER BY
+    // default — but sqlx cannot decode a NULL cell into `serde_json::Value`,
+    // so decode as `Option` and surface those rows as JSON null.
+    let mut query = sqlx::query_as::<_, (Option<serde_json::Value>,)>(&sql);
     for bind in binds {
         query = match bind {
             EqBind::Text(v) => query.bind(v),
@@ -530,7 +534,10 @@ pub(crate) async fn execute_distinct_terminal(
         };
     }
     let rows = query.fetch_all(pool).await?;
-    let values: Vec<serde_json::Value> = rows.into_iter().map(|(v,)| v).collect();
+    let values: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|(v,)| v.unwrap_or(serde_json::Value::Null))
+        .collect();
     Ok(QueryResult::Distinct(values))
 }
 

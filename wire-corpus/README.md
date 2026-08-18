@@ -75,7 +75,8 @@ keys projected out:
   - `count` → bare integer
   - `distinct` → array of scalar values (ascending; NULL index values are
     included — the server SQL is `SELECT DISTINCT to_jsonb(col) … ORDER BY v`,
-    and `to_jsonb(NULL)` is `null`)
+    where a missing optional value projects to SQL NULL, sorts last under
+    the ORDER BY default, and decodes to JSON `null`)
   - `aggregate` → bare scalar (`null` over an empty match set) or, with
     `groupBy`, an array of `{"key", "value"}` rows sorted by key ascending
 - **txn op** — array of per-step results: `insert` → `{"id", }`; `patch`,
