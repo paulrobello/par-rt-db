@@ -113,7 +113,7 @@ pub(super) async fn patch_config(
         }
         // SEC-008: reject an over-ceiling value at PATCH time so the persisted
         // row can't advertise a limit `http_api` silently clamps back down to
-        // `HARD_MAX_FILE_SIZE` (100 MiB). Without this, the configured value
+        // `HARD_MAX_FILE_SIZE` (2 GiB). Without this, the configured value
         // and the enforced value disagree.
         if size > crate::config::HARD_MAX_FILE_SIZE {
             return Err(RtDbError::bad_request(format!(

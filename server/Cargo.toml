@@ -102,6 +102,11 @@ tokio-tungstenite.workspace = true
 futures-util.workspace = true
 wiremock.workspace = true
 serial_test = "3"
+# RS256 signing in the `auth/microsoft.rs` id_token unit tests: throwaway
+# runtime-generated keys (never a PEM/key literal in the repo, so gitleaks
+# stays meaningful). 0.9 is already in the tree via jsonwebtoken's rust_crypto
+# backend — declaring it adds no new crates to the build.
+rsa = "0.9"
 # ENH-027 property-based parity testing (`tests/proptest_parity.rs`):
 # generative schemas/docs/queries executed against both Postgres (this crate)
 # and the rust-client in-memory engine, asserting identical results. Both are

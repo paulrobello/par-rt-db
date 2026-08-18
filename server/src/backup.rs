@@ -692,28 +692,213 @@ mod tests {
         assert_eq!(listed[2].size_bytes, 2);
     }
 
-    /// End-to-end shell-out to a real `pg_dump`. Self-skips when `pg_dump` is
-    /// not on PATH (CI / devs without postgres-client) so `cargo test --lib`
-    /// stays green; run with `cargo test --lib backup -- --ignored` against a
-    /// live dev Postgres on 127.0.0.1:55434.
-    #[tokio::test]
-    #[ignore = "requires pg_dump on PATH + a live Postgres; self-skips otherwise"]
-    async fn perform_backup_against_dev_postgres() {
-        let probe = tokio::process::Command::new("pg_dump")
+    /// Major version from a tool `--version` line or `server_version` —
+    /// `"pg_dump (PostgreSQL) 16.4 (Ubuntu …)"` → 16. The first
+    /// whitespace-delimited token starting with a digit is the version.
+    fn version_major(text: &str) -> Option<u32> {
+        text.split_whitespace()
+            .find(|t| t.starts_with(|c: char| c.is_ascii_digit()))
+            .and_then(|t| t.split('.').next()?.parse::<u32>().ok())
+    }
+
+    /// Shared prelude for the end-to-end pg-tool tests: returns the base URL
+    /// and its parsed `PgEnv`, or `None` after an eprintln (the historical
+    /// probe style) when the test must self-skip — a pg tool missing from
+    /// PATH, the dev Postgres unreachable (`cargo test --lib` without
+    /// `make dev-db-up` must stay green), or a pg_dump client older than the
+    /// server (an older pg_dump hard-fails against a newer server; CI images
+    /// can ship older clients than the pg17 dev DB).
+    async fn pg_tool_env() -> Option<(String, PgEnv)> {
+        let out = match tokio::process::Command::new("pg_dump")
             .arg("--version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::null())
-            .stdout(Stdio::null())
-            .status()
-            .await;
-        if !matches!(probe, Ok(s) if s.success()) {
-            eprintln!("skipping: pg_dump not found on PATH");
-            return;
+            .output()
+            .await
+        {
+            Ok(o) if o.status.success() => o,
+            _ => {
+                eprintln!("skipping: pg_dump not found on PATH");
+                return None;
+            }
+        };
+        let client_version = String::from_utf8_lossy(&out.stdout).into_owned();
+        let client_major = match version_major(&client_version) {
+            Some(m) => m,
+            None => {
+                eprintln!("skipping: cannot parse pg_dump version from {client_version:?}");
+                return None;
+            }
+        };
+        for tool in ["pg_restore", "createdb", "dropdb"] {
+            let probe = tokio::process::Command::new(tool)
+                .arg("--version")
+                .stderr(Stdio::null())
+                .stdout(Stdio::null())
+                .status()
+                .await;
+            if !matches!(probe, Ok(s) if s.success()) {
+                eprintln!("skipping: {tool} not found on PATH");
+                return None;
+            }
         }
-        let url = std::env::var("RTDB_TEST_DATABASE_URL")
+
+        let base_url = std::env::var("RTDB_TEST_DATABASE_URL")
             .unwrap_or_else(|_| "postgres://rtdb:rtdb@127.0.0.1:55434/rtdb".into());
+        let pool = match sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_secs(2))
+            .connect(&base_url)
+            .await
+        {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("skipping: dev postgres unreachable at {base_url}: {e}");
+                return None;
+            }
+        };
+        let server_version: Result<(i64,), _> =
+            sqlx::query_as("SELECT current_setting('server_version_num')::bigint / 10000")
+                .fetch_one(&pool)
+                .await;
+        let server_major = match server_version {
+            Ok((major,)) => major as u32,
+            Err(e) => {
+                eprintln!("skipping: cannot read server version: {e}");
+                pool.close().await;
+                return None;
+            }
+        };
+        pool.close().await;
+        if client_major < server_major {
+            eprintln!(
+                "skipping: pg_dump client v{client_major} is older than server v{server_major}; \
+                 pg_dump would refuse the newer server"
+            );
+            return None;
+        }
+        let pg = parse_pg_env(&base_url).expect("url parses — it just connected");
+        Some((base_url, pg))
+    }
+
+    /// `createdb <name>` through the module's PG-env discipline (credentials
+    /// via env, never argv) — the same spawn shape `restore_to_new_db` uses.
+    async fn createdb(pg: &PgEnv, name: &str) {
+        let mut cmd = tokio::process::Command::new("createdb");
+        apply_pg_env(&mut cmd, pg, pg.database.as_deref());
+        cmd.arg(name)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        let out = cmd.output().await.expect("spawn createdb");
+        assert!(
+            out.status.success(),
+            "createdb {name} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// Best-effort RAII teardown for the physical Postgres databases a test
+    /// created (the dedicated dump source, any `rtdb_restored_*` target), so a
+    /// failed assertion does not leak them. `Drop` cannot await on the test's
+    /// runtime, so the drops run on a dedicated thread with its own runtime +
+    /// maintenance pool — a std-thread mirror of the cleanup worker in
+    /// tests/common/mod.rs. `WITH (FORCE)` so a restored-target pool still
+    /// winding down cannot block the drop. The names are quote-free by
+    /// construction (`t<32hex>` / `rtdb_restored_<stamp>`), so the quoted
+    /// identifier cannot be broken out of.
+    struct DropDbs {
+        base_url: String,
+        names: Vec<String>,
+    }
+
+    impl Drop for DropDbs {
+        fn drop(&mut self) {
+            let base_url = std::mem::take(&mut self.base_url);
+            let names = std::mem::take(&mut self.names);
+            std::thread::spawn(move || {
+                let rt = match tokio::runtime::Runtime::new() {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        eprintln!("backup-test cleanup: runtime build failed: {e}");
+                        return;
+                    }
+                };
+                rt.block_on(async move {
+                    let pool = match sqlx::postgres::PgPoolOptions::new()
+                        .max_connections(1)
+                        .connect(&base_url)
+                        .await
+                    {
+                        Ok(p) => p,
+                        Err(e) => {
+                            eprintln!("backup-test cleanup: connect failed: {e}");
+                            return;
+                        }
+                    };
+                    for name in names {
+                        if let Err(e) =
+                            sqlx::query(&format!("DROP DATABASE IF EXISTS \"{name}\" WITH (FORCE)"))
+                                .execute(&pool)
+                                .await
+                        {
+                            eprintln!("backup-test cleanup: drop {name} failed: {e}");
+                        }
+                    }
+                    pool.close().await;
+                });
+            });
+        }
+    }
+
+    /// End-to-end `perform_backup` against the dev Postgres, dumping a
+    /// DEDICATED throwaway database — never the shared `rtdb` DB, which every
+    /// concurrently-running test binary mutates (a pg_dump racing their DDL
+    /// can fail mid-dump; that nondeterminism is why this test was originally
+    /// `#[ignore]`d). Self-skips via `pg_tool_env`.
+    #[tokio::test]
+    async fn perform_backup_against_dev_postgres() {
+        let Some((base_url, pg)) = pg_tool_env().await else {
+            return;
+        };
+
+        // `t<uuid-v7>` is merge_test.rs's throwaway-physical-DB convention: a
+        // uuid suffix keeps parallel runs distinct. Note dev-db-clean reaps
+        // schemas inside `rtdb`, not physical DBs — the guard below is the
+        // real cleanup; this name only keeps the artifact in the recognizable
+        // test namespace if a hard kill leaks it.
+        let src = format!("t{}", uuid::Uuid::now_v7().simple());
+        createdb(&pg, &src).await;
+        let _dbs = DropDbs {
+            base_url: base_url.clone(),
+            names: vec![src.clone()],
+        };
+
+        let src_url = url_with_db(&base_url, &src);
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&src_url)
+            .await
+            .expect("connect dedicated source db");
+        crate::db::bootstrap(&pool)
+            .await
+            .expect("bootstrap rtdb_auth in source db");
+        // One seeded registry row so the dump provably carries data, not just
+        // bootstrap DDL.
+        sqlx::query("INSERT INTO rtdb_auth.databases (name, created_at) VALUES ($1, $2)")
+            .bind(format!("src_marker_{}", uuid::Uuid::now_v7().simple()))
+            .bind(crate::db::now_ms())
+            .execute(&pool)
+            .await
+            .expect("seed marker row");
+        pool.close().await;
+
         let dir = tempfile::tempdir().unwrap();
         let dir_path = dir.path().to_str().unwrap().to_string();
-        let path = perform_backup(&url, &dir_path).await.expect("backup ok");
+        let path = perform_backup(&src_url, &dir_path)
+            .await
+            .expect("backup ok");
         assert!(
             path.exists(),
             "dump file should exist at {}",
@@ -742,60 +927,126 @@ mod tests {
         );
     }
 
-    /// End-to-end restore into a fresh DB. Self-skips when `pg_restore`/`createdb`
-    /// are absent or there is no live dev Postgres. Run with
-    /// `cargo test --lib restore -- --ignored` against 127.0.0.1:55434.
+    /// End-to-end dump → restore round-trip from a DEDICATED throwaway source
+    /// database (same rationale as `perform_backup_against_dev_postgres`),
+    /// proving CONTENT survival — not just schema: the restored
+    /// `rtdb_restored_*` DB must carry `rtdb_auth` and the seeded registry
+    /// row verbatim. Also pins the retry contract: restoring the same dump
+    /// twice errors with `Conflict`, because `restore_to_new_db` never
+    /// pre-drops an existing target (`drop_restore_target` only cleans up
+    /// after a FAILED pg_restore). Self-skips via `pg_tool_env`.
     #[tokio::test]
-    #[ignore = "requires pg_restore + createdb on PATH + a live Postgres; self-skips otherwise"]
     async fn restore_to_new_db_against_dev_postgres() {
-        for tool in ["pg_dump", "pg_restore", "createdb", "dropdb"] {
-            let probe = tokio::process::Command::new(tool)
-                .arg("--version")
-                .stderr(Stdio::null())
-                .stdout(Stdio::null())
-                .status()
-                .await;
-            if !matches!(probe, Ok(s) if s.success()) {
-                eprintln!("skipping: {tool} not found on PATH");
-                return;
-            }
-        }
-        let url = std::env::var("RTDB_TEST_DATABASE_URL")
-            .unwrap_or_else(|_| "postgres://rtdb:rtdb@127.0.0.1:55434/rtdb".into());
+        let Some((base_url, pg)) = pg_tool_env().await else {
+            return;
+        };
+
+        // `t<uuid-v7>` throwaway physical DB — see the backup test's note.
+        let src = format!("t{}", uuid::Uuid::now_v7().simple());
+        createdb(&pg, &src).await;
+        let mut dbs = DropDbs {
+            base_url: base_url.clone(),
+            names: vec![src.clone()],
+        };
+
+        let src_url = url_with_db(&base_url, &src);
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&src_url)
+            .await
+            .expect("connect dedicated source db");
+        crate::db::bootstrap(&pool)
+            .await
+            .expect("bootstrap rtdb_auth in source db");
+        // bootstrap seeds nothing into rtdb_auth.databases (only
+        // db::create_database inserts registry rows), so this is the ONLY row
+        // — a fixed created_at gives an exact-value assertion after restore.
+        let marker_db = format!("marker_{}", uuid::Uuid::now_v7().simple());
+        const MARKER_CREATED_AT: i64 = 1_234_567_890_123;
+        sqlx::query("INSERT INTO rtdb_auth.databases (name, created_at) VALUES ($1, $2)")
+            .bind(&marker_db)
+            .bind(MARKER_CREATED_AT)
+            .execute(&pool)
+            .await
+            .expect("seed marker row");
+        pool.close().await;
+
         let dir = tempfile::tempdir().unwrap();
         let dir_path = dir.path().to_str().unwrap().to_string();
 
-        // Make a real dump first (reuse the existing, now pub(crate), perform_backup).
-        let dumped = perform_backup(&url, &dir_path).await.expect("backup ok");
+        // Make a real dump of the dedicated source first.
+        let dumped = perform_backup(&src_url, &dir_path)
+            .await
+            .expect("backup ok");
         let name = dumped.file_name().unwrap().to_string_lossy().into_owned();
 
         // Restore into a fresh target DB.
-        let target = restore_to_new_db(&url, &dir_path, &name)
+        let target = restore_to_new_db(&src_url, &dir_path, &name)
             .await
             .expect("restore ok");
+        dbs.names.push(target.clone());
+        assert_eq!(target, restore_target_name(&name));
         assert!(target.starts_with("rtdb_restored_"));
 
-        // The restored DB must contain the rtdb_auth schema (system tables) — proves
-        // the archive restored into the new DB. Connect via a fresh pool.
-        let target_url = url_with_db(&url, &target);
-        let pool = sqlx::postgres::PgPoolOptions::new()
+        // Content proof: rtdb_auth exists in the target (the query itself
+        // fails otherwise) and the seeded row survived verbatim — exactly one
+        // registry row, with its exact created_at.
+        let target_url = url_with_db(&base_url, &target);
+        let tpool = sqlx::postgres::PgPoolOptions::new()
             .max_connections(1)
             .connect(&target_url)
             .await
-            .expect("connect target");
-        let row: (i64,) = sqlx::query_as("SELECT count(*) FROM rtdb_auth.databases")
-            .fetch_one(&pool)
+            .expect("connect restored db");
+        let (count,): (i64,) = sqlx::query_as("SELECT count(*) FROM rtdb_auth.databases")
+            .fetch_one(&tpool)
             .await
-            .expect("query restored db");
-        assert!(
-            row.0 >= 0,
-            "rtdb_auth.databases must exist in the restored db"
+            .expect("rtdb_auth.databases must exist in the restored db");
+        assert_eq!(
+            count, 1,
+            "restored registry must carry exactly the seeded row"
         );
-        pool.close().await;
+        let (created_at,): (i64,) =
+            sqlx::query_as("SELECT created_at FROM rtdb_auth.databases WHERE name = $1")
+                .bind(&marker_db)
+                .fetch_one(&tpool)
+                .await
+                .expect("marker row must survive the round-trip");
+        assert_eq!(
+            created_at, MARKER_CREATED_AT,
+            "seeded value must survive verbatim"
+        );
+        tpool.close().await;
 
-        // Clean up the restored DB so the test is repeatable.
-        let pg = parse_pg_env(&url).unwrap();
-        let _ = drop_restore_target(&pg, &target).await;
+        // Retry with the same dump: the target already exists, createdb hits
+        // "already exists", and the code maps that to Conflict — it does NOT
+        // drop-and-recreate. Assert the code's actual contract.
+        let err = restore_to_new_db(&src_url, &dir_path, &name)
+            .await
+            .expect_err("restoring over an existing target must fail");
+        assert_eq!(err.code, crate::error::ErrorCode::Conflict);
+        assert!(
+            err.message.contains("already exists"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    /// A well-formed name whose file is absent fails `not_found` before any pg
+    /// tool is spawned (the exists-check precedes `parse_pg_env` and every
+    /// child process), so this needs no probes and always runs.
+    #[tokio::test]
+    async fn restore_to_new_db_missing_dump_is_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.path().to_str().unwrap().to_string();
+        let err = restore_to_new_db(
+            "postgres://u:p@127.0.0.1:55434/rtdb",
+            &dir_path,
+            "rtdb-20260728T143045Z.dump",
+        )
+        .await
+        .expect_err("missing dump must be rejected");
+        assert_eq!(err.code, crate::error::ErrorCode::NotFound);
+        assert_eq!(err.message, "backup file not found");
     }
 
     /// Helper for the test: swap the dbname in a postgres:// URL.

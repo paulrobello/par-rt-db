@@ -624,6 +624,7 @@ fn is_email_verified(value: &serde_json::Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::ErrorCode;
     use serde_json::json;
 
     #[test]
@@ -900,5 +901,629 @@ mod tests {
             multi_instance: false,
             instance_id: None,
         }
+    }
+
+    // --- parse_token_response / verify_id_token / fetch_jwks ----------------
+    // JWT fixtures below are hand-built RS256 tokens signed by throwaway
+    // runtime-generated keys — no PEM or key literal ever lives in the repo
+    // (gitleaks/detect-private-key stay meaningful), same pattern as the
+    // Apple ES256 tests.
+
+    #[test]
+    fn parse_token_response_failures_are_generic_internal_errors() {
+        // SEC-130: the OAuth error text never reaches the caller, and a
+        // non-object body (an HTML error page, a bare string) has no
+        // access_token either — both are generic internal errors.
+        let err = parse_token_response(&json!({"error": "invalid_grant"})).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Internal);
+        assert_eq!(err.message, "microsoft token exchange failed");
+
+        let err = parse_token_response(&json!("<html>bad gateway</html>")).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Internal);
+        assert_eq!(err.message, "microsoft token exchange failed");
+    }
+
+    /// Throwaway RSA-2048 key generated at runtime for signing test id_tokens.
+    fn fresh_rsa_key() -> rsa::RsaPrivateKey {
+        rsa::RsaPrivateKey::new(&mut rand::rngs::OsRng, 2048).expect("generate RSA-2048 key")
+    }
+
+    fn b64url(bytes: &[u8]) -> String {
+        use base64::Engine;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+    }
+
+    /// JWKS entry for a key's public half — base64url-no-pad of the minimal
+    /// big-endian n/e bytes, the encoding `DecodingKey::from_rsa_components`
+    /// parses.
+    fn jwks_entry(key: &rsa::RsaPrivateKey, kid: &str) -> serde_json::Value {
+        use rsa::traits::PublicKeyParts;
+        json!({
+            "kty": "RSA",
+            "use": "sig",
+            "kid": kid,
+            "n": b64url(&key.n().to_bytes_be()),
+            "e": b64url(&key.e().to_bytes_be()),
+        })
+    }
+
+    /// Hand-built RS256 JWT with a real PKCS#1v1.5 signature over the
+    /// `header.payload` signing input.
+    fn sign_rs256_jwt(key: &rsa::RsaPrivateKey, kid: &str, claims: &serde_json::Value) -> String {
+        use rsa::pkcs1v15::SigningKey;
+        use rsa::signature::{SignatureEncoding, Signer};
+        use sha2::Sha256;
+
+        let header = json!({"alg": "RS256", "typ": "JWT", "kid": kid});
+        let signing_input = format!(
+            "{}.{}",
+            b64url(&serde_json::to_vec(&header).unwrap()),
+            b64url(&serde_json::to_vec(claims).unwrap()),
+        );
+        let signature = SigningKey::<Sha256>::new(key.clone()).sign(signing_input.as_bytes());
+        format!("{signing_input}.{}", b64url(&signature.to_vec()))
+    }
+
+    /// uuid-bearing tenant id — tests run in parallel against the shared
+    /// module-level JWKS_CACHE, so every seeded tid must be unique.
+    fn unique_tid() -> String {
+        format!("tid-{}", uuid::Uuid::now_v7().simple())
+    }
+
+    /// Seeds the JWKS cache for a fresh unique tid with `key` under `kid` and
+    /// returns the tid, so `verify_id_token` resolves the key with no network.
+    async fn seed_jwks_for(key: &rsa::RsaPrivateKey, kid: &str) -> String {
+        let tid = unique_tid();
+        JWKS_CACHE
+            .insert(
+                tid.clone(),
+                Arc::new(json!({"keys": [jwks_entry(key, kid)]})),
+            )
+            .await;
+        tid
+    }
+
+    const TEST_CLIENT_ID: &str = "test-client-id";
+
+    /// Claims of a well-formed Microsoft v2.0 id_token for `tid`, with `exp`
+    /// offset `exp_offset_secs` from now.
+    fn ms_claims(tid: &str, exp_offset_secs: i64) -> serde_json::Value {
+        let now = chrono::Utc::now().timestamp();
+        json!({
+            "iss": format!("https://login.microsoftonline.com/{tid}/v2.0"),
+            "aud": TEST_CLIENT_ID,
+            "exp": now + exp_offset_secs,
+            "iat": now,
+            "tid": tid,
+            "sub": "AAAAAAAAAAAAAAAAAAAAAA",
+            "preferred_username": "alice@contoso.example",
+            "name": "Alice Example",
+        })
+    }
+
+    #[tokio::test]
+    async fn verify_id_token_accepts_a_valid_rs256_token_from_the_cached_jwks() {
+        let key = fresh_rsa_key();
+        let tid = seed_jwks_for(&key, "kid-1").await;
+        let token = sign_rs256_jwt(&key, "kid-1", &ms_claims(&tid, 3600));
+
+        let claims = verify_id_token(&reqwest::Client::new(), &token, TEST_CLIENT_ID, "common")
+            .await
+            .expect("valid id_token verifies");
+
+        assert_eq!(claims["tid"].as_str(), Some(tid.as_str()));
+        assert_eq!(claims["preferred_username"], "alice@contoso.example");
+    }
+
+    #[tokio::test]
+    async fn verify_id_token_accepts_a_token_from_the_pinned_tenant() {
+        let key = fresh_rsa_key();
+        let tid = seed_jwks_for(&key, "kid-1").await;
+        let token = sign_rs256_jwt(&key, "kid-1", &ms_claims(&tid, 3600));
+
+        // configured tenant == token tid, and not a multi-tenant selector.
+        verify_id_token(&reqwest::Client::new(), &token, TEST_CLIENT_ID, &tid)
+            .await
+            .expect("pinned-tenant token verifies");
+    }
+
+    #[tokio::test]
+    async fn verify_id_token_rejects_malformed_tokens() {
+        let header = b64url(br#"{"alg":"RS256","kid":"k"}"#);
+        let non_json_header = format!("{}.{}.sig", b64url(b"not-json"), b64url(br#"{"tid":"t"}"#));
+        let non_json_payload = format!("{header}.{}.sig", b64url(b"not-json"));
+        let non_b64_payload = format!("{header}.!!.sig");
+        for bad in [
+            "no-dots-at-all",
+            "!!!.e30.sig",
+            non_json_header.as_str(),
+            non_json_payload.as_str(),
+            non_b64_payload.as_str(),
+        ] {
+            let err = verify_id_token(&reqwest::Client::new(), bad, TEST_CLIENT_ID, "common")
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, ErrorCode::Forbidden, "input: {bad}");
+            assert_eq!(err.message, "malformed id_token", "input: {bad}");
+        }
+    }
+
+    #[tokio::test]
+    async fn verify_id_token_rejects_a_header_without_kid() {
+        let token = format!(
+            "{}.{}.sig",
+            b64url(br#"{"alg":"RS256","typ":"JWT"}"#),
+            b64url(br#"{"tid":"t"}"#)
+        );
+        let err = verify_id_token(&reqwest::Client::new(), &token, TEST_CLIENT_ID, "common")
+            .await
+            .unwrap_err();
+        assert_eq!(err.message, "id_token missing kid");
+    }
+
+    #[tokio::test]
+    async fn verify_id_token_rejects_a_payload_without_tid() {
+        let token = format!(
+            "{}.{}.sig",
+            b64url(br#"{"alg":"RS256","typ":"JWT","kid":"k"}"#),
+            b64url(br#"{"sub":"s"}"#)
+        );
+        let err = verify_id_token(&reqwest::Client::new(), &token, TEST_CLIENT_ID, "common")
+            .await
+            .unwrap_err();
+        assert_eq!(err.message, "id_token missing tid");
+    }
+
+    #[tokio::test]
+    async fn verify_id_token_rejects_a_tid_other_than_the_pinned_tenant() {
+        let key = fresh_rsa_key();
+        // JWKS seeded so a regression in check order degrades to a cache hit,
+        // never a live network fetch from a unit test.
+        let tid = seed_jwks_for(&key, "kid-1").await;
+        let token = sign_rs256_jwt(&key, "kid-1", &ms_claims(&tid, 3600));
+
+        let err = verify_id_token(
+            &reqwest::Client::new(),
+            &token,
+            TEST_CLIENT_ID,
+            "contoso.example",
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Forbidden);
+        assert_eq!(err.message, "id_token tenant mismatch");
+    }
+
+    #[tokio::test]
+    async fn verify_id_token_rejects_a_kid_absent_from_the_jwks() {
+        let key = fresh_rsa_key();
+        let tid = seed_jwks_for(&key, "some-other-kid").await;
+        let token = sign_rs256_jwt(&key, "kid-1", &ms_claims(&tid, 3600));
+
+        let err = verify_id_token(&reqwest::Client::new(), &token, TEST_CLIENT_ID, "common")
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Forbidden);
+        assert_eq!(err.message, "id_token signature verification failed");
+    }
+
+    #[tokio::test]
+    async fn verify_id_token_rejects_incomplete_jwks_entries() {
+        use rsa::traits::PublicKeyParts;
+        let key = fresh_rsa_key();
+        let http = reqwest::Client::new();
+
+        // No "n" component.
+        let tid = unique_tid();
+        JWKS_CACHE
+            .insert(
+                tid.clone(),
+                Arc::new(json!({"keys": [{"kty": "RSA", "kid": "k", "e": "AQAB"}]})),
+            )
+            .await;
+        let err = verify_id_token(
+            &http,
+            &sign_rs256_jwt(&key, "k", &ms_claims(&tid, 3600)),
+            TEST_CLIENT_ID,
+            "common",
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.message, "JWKS key missing n");
+
+        // No "e" component.
+        let tid = unique_tid();
+        JWKS_CACHE
+            .insert(
+                tid.clone(),
+                Arc::new(json!({"keys": [{"kty": "RSA", "kid": "k",
+                        "n": b64url(&key.n().to_bytes_be())}]})),
+            )
+            .await;
+        let err = verify_id_token(
+            &http,
+            &sign_rs256_jwt(&key, "k", &ms_claims(&tid, 3600)),
+            TEST_CLIENT_ID,
+            "common",
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.message, "JWKS key missing e");
+
+        // "n" present but not base64 — the decoding key cannot be built.
+        let tid = unique_tid();
+        JWKS_CACHE
+            .insert(
+                tid.clone(),
+                Arc::new(json!({"keys": [{"kty": "RSA", "kid": "k",
+                    "n": "!!not-base64!!", "e": "AQAB"}]})),
+            )
+            .await;
+        let err = verify_id_token(
+            &http,
+            &sign_rs256_jwt(&key, "k", &ms_claims(&tid, 3600)),
+            TEST_CLIENT_ID,
+            "common",
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.message, "id_token signature verification failed");
+    }
+
+    #[tokio::test]
+    async fn verify_id_token_rejects_a_signature_made_by_a_different_key() {
+        let signing_key = fresh_rsa_key();
+        let jwks_key = fresh_rsa_key();
+        let tid = seed_jwks_for(&jwks_key, "kid-1").await;
+        let token = sign_rs256_jwt(&signing_key, "kid-1", &ms_claims(&tid, 3600));
+
+        let err = verify_id_token(&reqwest::Client::new(), &token, TEST_CLIENT_ID, "common")
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Forbidden);
+        assert_eq!(err.message, "id_token signature verification failed");
+    }
+
+    #[tokio::test]
+    async fn verify_id_token_rejects_wrong_audience_issuer_or_expired_tokens() {
+        let key = fresh_rsa_key();
+        let tid = seed_jwks_for(&key, "kid-1").await;
+        let http = reqwest::Client::new();
+
+        let mut wrong_aud = ms_claims(&tid, 3600);
+        wrong_aud["aud"] = json!("some-other-app");
+        let err = verify_id_token(
+            &http,
+            &sign_rs256_jwt(&key, "kid-1", &wrong_aud),
+            TEST_CLIENT_ID,
+            "common",
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Forbidden);
+
+        let mut wrong_iss = ms_claims(&tid, 3600);
+        wrong_iss["iss"] = json!("https://login.microsoftonline.com/someone-else/v2.0");
+        let err = verify_id_token(
+            &http,
+            &sign_rs256_jwt(&key, "kid-1", &wrong_iss),
+            TEST_CLIENT_ID,
+            "common",
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Forbidden);
+
+        // exp an hour in the past — well beyond the default validation leeway.
+        let err = verify_id_token(
+            &http,
+            &sign_rs256_jwt(&key, "kid-1", &ms_claims(&tid, -3600)),
+            TEST_CLIENT_ID,
+            "common",
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Forbidden);
+        assert_eq!(err.message, "id_token signature verification failed");
+    }
+
+    #[tokio::test]
+    async fn fetch_jwks_returns_a_cached_key_set_without_a_network_round_trip() {
+        let tid = unique_tid();
+        let jwks = Arc::new(json!({"keys": [{"kty": "RSA", "kid": "k"}]}));
+        JWKS_CACHE.insert(tid.clone(), Arc::clone(&jwks)).await;
+
+        let fetched = fetch_jwks(&reqwest::Client::new(), &tid)
+            .await
+            .expect("cache hit");
+
+        assert!(
+            Arc::ptr_eq(&fetched, &jwks),
+            "the cached Arc must be returned as-is, not re-fetched"
+        );
+    }
+
+    // --- upsert_user (shared dev Postgres; every value uuid-unique) ---------
+
+    /// Connects to the shared dev Postgres (RTDB_TEST_DATABASE_URL override,
+    /// default 127.0.0.1:55434/rtdb — the DB is shared, never created/dropped)
+    /// and bootstraps rtdb_auth.
+    async fn users_pool() -> PgPool {
+        let url = std::env::var("RTDB_TEST_DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://rtdb:rtdb@127.0.0.1:55434/rtdb".into());
+        let pool = sqlx::PgPool::connect(&url)
+            .await
+            .expect("connect to dev postgres");
+        crate::db::bootstrap(&pool)
+            .await
+            .expect("bootstrap rtdb_auth");
+        pool
+    }
+
+    fn uniq(prefix: &str) -> String {
+        format!("{prefix}-{}", uuid::Uuid::now_v7().simple())
+    }
+
+    async fn user_row(pool: &PgPool, id: &str) -> (String, String, Option<String>) {
+        sqlx::query_as::<_, (String, String, Option<String>)>(
+            "SELECT login, email, microsoft_sub FROM rtdb_auth.users WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .expect("user row exists")
+    }
+
+    /// Direct-inserts a non-Microsoft user (microsoft_sub NULL) keyed on a
+    /// unique email — the pre-existing account the link/nOAuth/conflict tests
+    /// target.
+    async fn insert_email_user(pool: &PgPool, login: &str, email: &str) -> String {
+        let id = new_id();
+        sqlx::query(
+            "INSERT INTO rtdb_auth.users (id, login, email, created_at) \
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(&id)
+        .bind(login)
+        .bind(email)
+        .bind(now_ms())
+        .execute(pool)
+        .await
+        .expect("pre-insert email-keyed user");
+        id
+    }
+
+    #[tokio::test]
+    async fn upsert_user_inserts_a_brand_new_microsoft_user() {
+        let pool = users_pool().await;
+        let sub = uniq("tid.sub");
+        let login = uniq("ms-login");
+        let email = format!("{}@ms-test.example", uniq("alice"));
+
+        let id = upsert_user(&pool, &sub, &login, &email, false)
+            .await
+            .expect("insert brand-new user");
+
+        let (row_login, row_email, row_sub) = user_row(&pool, &id).await;
+        assert_eq!(row_login, login);
+        assert_eq!(row_email, email);
+        assert_eq!(row_sub.as_deref(), Some(sub.as_str()));
+    }
+
+    #[tokio::test]
+    async fn upsert_user_reuses_the_account_and_refreshes_login_and_email() {
+        let pool = users_pool().await;
+        let sub = uniq("tid.sub");
+        let first_id = upsert_user(
+            &pool,
+            &sub,
+            &uniq("ms-login-a"),
+            &format!("{}@ms-test.example", uniq("a")),
+            false,
+        )
+        .await
+        .expect("initial insert");
+
+        let new_login = uniq("ms-login-b");
+        let new_email = format!("{}@ms-test.example", uniq("b"));
+        let second_id = upsert_user(&pool, &sub, &new_login, &new_email, false)
+            .await
+            .expect("returning-user upsert");
+
+        assert_eq!(
+            second_id, first_id,
+            "a returning microsoft_sub reuses the row"
+        );
+        let (row_login, row_email, row_sub) = user_row(&pool, &first_id).await;
+        assert_eq!(row_login, new_login, "login follows the tenant-side change");
+        assert_eq!(row_email, new_email, "email follows the tenant-side change");
+        assert_eq!(row_sub.as_deref(), Some(sub.as_str()));
+    }
+
+    #[tokio::test]
+    async fn upsert_user_links_an_email_keyed_account_when_domain_verified() {
+        let pool = users_pool().await;
+        let email = format!("{}@ms-test.example", uniq("carol"));
+        let existing_id = insert_email_user(&pool, &uniq("gh-carol"), &email).await;
+
+        let sub = uniq("tid.sub");
+        let id = upsert_user(&pool, &sub, &uniq("ms-login-carol"), &email, true)
+            .await
+            .expect("link by DNS-verified email");
+
+        assert_eq!(
+            id, existing_id,
+            "the existing account is adopted, not forked"
+        );
+        let (_, _, row_sub) = user_row(&pool, &existing_id).await;
+        assert_eq!(row_sub.as_deref(), Some(sub.as_str()));
+    }
+
+    #[tokio::test]
+    async fn upsert_user_never_adopts_an_email_keyed_account_without_domain_verification() {
+        let pool = users_pool().await;
+        // nOAuth shape: the token asserts an email a tenant admin can set;
+        // xms_edov absent => the contact address is the caller's own (UPN)
+        // address and the victim row is never touched.
+        let victim_email = format!("{}@ms-test.example", uniq("victim"));
+        let victim_id = insert_email_user(&pool, &uniq("gh-victim"), &victim_email).await;
+
+        let sub = uniq("tid.sub");
+        let attacker_email = format!("{}@ms-test.example", uniq("attacker"));
+        let id = upsert_user(
+            &pool,
+            &sub,
+            &uniq("ms-login-attacker"),
+            &attacker_email,
+            false,
+        )
+        .await
+        .expect("a fresh account is created instead");
+
+        assert_ne!(id, victim_id, "the victim account is never adopted");
+        let (_, row_email, row_sub) = user_row(&pool, &victim_id).await;
+        assert_eq!(row_email, victim_email);
+        assert_eq!(row_sub, None, "the victim row stays unlinked");
+    }
+
+    /// The step-3 INSERT hits the `users_email_key` UNIQUE index: the incoming
+    /// (unverified) identity re-asserts an email another row already owns.
+    #[tokio::test]
+    async fn upsert_user_maps_a_unique_violation_on_insert_to_a_precondition_error() {
+        let pool = users_pool().await;
+        let taken_email = format!("{}@ms-test.example", uniq("taken"));
+        let owner_id = insert_email_user(&pool, &uniq("gh-owner"), &taken_email).await;
+
+        let err = upsert_user(
+            &pool,
+            &uniq("tid.sub"),
+            &uniq("ms-login"),
+            &taken_email,
+            false,
+        )
+        .await
+        .unwrap_err();
+
+        // A deliberate 409 conflict, never a generic internal error.
+        assert_eq!(err.code, ErrorCode::PreconditionFailed);
+        assert_ne!(err.code, ErrorCode::Internal);
+        assert!(err.message.contains("already linked"), "{}", err.message);
+
+        let (_, row_email, row_sub) = user_row(&pool, &owner_id).await;
+        assert_eq!(row_email, taken_email);
+        assert_eq!(row_sub, None, "the failed tx rolled back — owner untouched");
+    }
+
+    /// The step-1 UPDATE refreshes to an email another row already owns — the
+    /// other 23505 route through `map_conflict`.
+    #[tokio::test]
+    async fn upsert_user_maps_a_unique_violation_on_refresh_to_a_precondition_error() {
+        let pool = users_pool().await;
+        let sub = uniq("tid.sub");
+        let original_email = format!("{}@ms-test.example", uniq("a"));
+        let id = upsert_user(&pool, &sub, &uniq("ms-login-a"), &original_email, false)
+            .await
+            .expect("initial insert");
+        let taken_email = format!("{}@ms-test.example", uniq("b"));
+        insert_email_user(&pool, &uniq("gh-b"), &taken_email).await;
+
+        let err = upsert_user(&pool, &sub, &uniq("ms-login-a2"), &taken_email, false)
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code, ErrorCode::PreconditionFailed);
+        assert!(err.message.contains("already linked"), "{}", err.message);
+        let (_, row_email, _) = user_row(&pool, &id).await;
+        assert_eq!(row_email, original_email, "the failed refresh rolled back");
+    }
+
+    // --- parse_identity: remaining email/name selection branches ------------
+
+    #[test]
+    fn parse_identity_reads_email_verified_from_userinfo_and_accepts_string_true() {
+        // `email_verified` may live in userinfo (not the claims) and may be
+        // the string "true" — both must count as verified.
+        let id = parse_identity(
+            &json!({"sub": "A", "tid": "t", "xms_edov": true, "email": "a@dns-verified.com"}),
+            &json!({"email_verified": "true"}),
+        )
+        .unwrap();
+        assert_eq!(id.contact_email, "a@dns-verified.com");
+        assert!(id.email_domain_verified);
+    }
+
+    #[test]
+    fn parse_identity_rejects_a_string_false_email_verified_in_userinfo() {
+        let err = parse_identity(
+            &json!({"sub": "A", "tid": "t", "xms_edov": true, "email": "a@b.com"}),
+            &json!({"email_verified": "false"}),
+        );
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn parse_identity_treats_a_non_bool_non_string_email_verified_as_unverified() {
+        // A number is neither a bool nor the string "true" — unverified.
+        let err = parse_identity(
+            &json!({
+                "sub": "A", "tid": "t", "xms_edov": true,
+                "email": "a@b.com", "email_verified": 1
+            }),
+            &json!({}),
+        );
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn parse_identity_falls_back_to_the_userinfo_email_when_claims_have_none() {
+        let id = parse_identity(
+            &json!({"sub": "A", "tid": "t", "xms_edov": true}),
+            &json!({"email": "from-userinfo@dns-verified.com"}),
+        )
+        .unwrap();
+        assert_eq!(id.contact_email, "from-userinfo@dns-verified.com");
+    }
+
+    #[test]
+    fn parse_identity_rejects_xms_edov_true_when_no_email_exists_anywhere() {
+        // xms_edov set but neither claims nor userinfo carry an email — the
+        // verified-email path has nothing to use (a UPN is NOT substituted).
+        let err = parse_identity(
+            &json!({"sub": "A", "tid": "t", "xms_edov": true}),
+            &json!({"preferred_username": "upn-only@contoso.example"}),
+        );
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn parse_identity_falls_back_to_the_legacy_upn_claim() {
+        // v1-era tokens carry `upn` instead of `preferred_username`; a
+        // non-bool xms_edov counts as unverified and takes the UPN path.
+        let id = parse_identity(
+            &json!({"sub": "A", "tid": "t", "upn": "legacy@contoso.example", "xms_edov": "true"}),
+            &json!({}),
+        )
+        .unwrap();
+        assert!(!id.email_domain_verified);
+        assert_eq!(id.contact_email, "legacy@contoso.example");
+    }
+
+    #[test]
+    fn parse_identity_prefers_userinfo_name_and_falls_back_to_the_claim_name() {
+        // A preferred_username is required for a usable identity (the contact
+        // email); the assertions are about the `name` preference only.
+        let from_userinfo = parse_identity(
+            &json!({"sub": "A", "tid": "t", "preferred_username": "name-test@t.example", "name": "From Claims"}),
+            &json!({"name": "From Userinfo"}),
+        )
+        .unwrap();
+        assert_eq!(from_userinfo.name.as_deref(), Some("From Userinfo"));
+
+        let from_claims = parse_identity(
+            &json!({"sub": "A", "tid": "t", "preferred_username": "name-test@t.example", "name": "From Claims"}),
+            &json!({}),
+        )
+        .unwrap();
+        assert_eq!(from_claims.name.as_deref(), Some("From Claims"));
     }
 }
