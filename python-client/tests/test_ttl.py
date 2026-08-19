@@ -120,13 +120,17 @@ def test_tick_reaps_explicit_caller_value() -> None:
 
 
 def test_absent_ttl_field_is_left_alone() -> None:
-    """A doc that omits the TTL field (optional field, no default declared) is
-    never reaped - the reaper only removes docs whose field is a number < now."""
+    """A legacy doc that predates the TTL field (no value stamped) is never
+    reaped - the reaper only removes docs whose field is a number < now. The
+    schema is server-valid (required numeric TTL field + by_expires index, no
+    default), so an absent value only arises for docs written before the field
+    existed - the row is seeded directly to reach that state."""
     schema = Schema.model_validate(
         {
             "tables": {
                 _TABLE: {
-                    "fields": {"expiresAt": {"type": "optional", "inner": {"type": "number"}}},
+                    "fields": {"expiresAt": {"type": "number"}},
+                    "indexes": [{"name": "by_expires", "fields": ["expiresAt"]}],
                     "ttl": {"field": "expiresAt"},  # no defaultDurationMs
                 }
             }
@@ -134,19 +138,23 @@ def test_absent_ttl_field_is_left_alone() -> None:
     )
     c = InMemoryRtDbClient(InMemoryRtDbClientOptions(now=lambda: 10_000, random=lambda: 0.5))
     c.push_schema(schema)
-    doc_id = _insert(c, {})
-    # No default -> expiresAt stays absent; ticking far into the future keeps it.
+    doc_id = _insert(c, {"expiresAt": 5})
+    del c._docs[(_TABLE, doc_id)].doc["expiresAt"]  # legacy doc: field absent
     c.tick(now_ms=1_000_000)
     assert c.get(_TABLE, doc_id) is not None
 
 
 def test_non_numeric_ttl_value_is_left_alone() -> None:
-    """A non-numeric TTL value is never reaped (the reaper's isinstance guard)."""
+    """A non-numeric TTL value is never reaped (the reaper's isinstance guard).
+    The schema is server-valid (numeric TTL field + by_expires index); the
+    non-numeric value only arises in pre-validation docs, so it is written
+    directly onto the stored row."""
     schema = Schema.model_validate(
         {
             "tables": {
                 _TABLE: {
-                    "fields": {"expiresAt": {"type": "any"}},
+                    "fields": {"expiresAt": {"type": "number"}},
+                    "indexes": [{"name": "by_expires", "fields": ["expiresAt"]}],
                     "ttl": {"field": "expiresAt"},
                 }
             }
@@ -154,7 +162,8 @@ def test_non_numeric_ttl_value_is_left_alone() -> None:
     )
     c = InMemoryRtDbClient(InMemoryRtDbClientOptions(now=lambda: 10_000, random=lambda: 0.5))
     c.push_schema(schema)
-    doc_id = _insert(c, {"expiresAt": "not-a-number"})
+    doc_id = _insert(c, {"expiresAt": 5})
+    c._docs[(_TABLE, doc_id)].doc["expiresAt"] = "not-a-number"
     c.tick(now_ms=1_000_000)
     assert c.get(_TABLE, doc_id) is not None
 

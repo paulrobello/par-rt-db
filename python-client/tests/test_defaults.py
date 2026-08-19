@@ -187,6 +187,7 @@ def test_ttl_default_wins_over_defaults_entry_on_same_field() -> None:
             "tables": {
                 "sessions": {
                     "fields": {"expiresAt": {"type": "number"}},
+                    "indexes": [{"name": "by_expiresAt", "fields": ["expiresAt"]}],
                     "ttl": {"field": "expiresAt", "defaultDurationMs": 1000},
                     "defaults": {"expiresAt": 999_999},
                 }

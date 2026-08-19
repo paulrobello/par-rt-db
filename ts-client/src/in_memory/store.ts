@@ -63,6 +63,7 @@ import {
   detectDestructiveChanges,
   onDeleteRef,
   validateOnDelete,
+  validateSchema,
 } from "./migrate.js";
 import { executeQuery, requireIndex } from "./query.js";
 import {
@@ -717,10 +718,12 @@ export class InMemoryRtDbClient {
    * additive (server `ddl::detect_destructive_changes`): it throws BAD_REQUEST
    * on a removed/retyped table, field, or index, and otherwise merges — keeping
    * every existing table's rows and the idempotency cache intact, and seeding
-   * empty doc stores only for brand-new tables. Every push validates `onDelete`
-   * declarations (FM-33, SCHEMA_VIOLATION) like the server does. */
+   * empty doc stores only for brand-new tables. Every push validates TTL and
+   * index-field rules (`validateSchema`) and `onDelete` declarations (FM-33),
+   * both SCHEMA_VIOLATION, like the server does. */
   pushSchema(schema: SchemaDefinition<any> | SchemaJson): void {
     const next = toSchemaJson(schema);
+    validateSchema(next);
     validateOnDelete(next);
     if (this.schema) {
       detectDestructiveChanges(this.schema, next);

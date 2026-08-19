@@ -140,6 +140,76 @@ def test_push_schema_rejects_changing_a_search_index_language() -> None:
     assert "changed language of search index 'search_name'" in ei.value.message
 
 
+# ---------------------------------------------------------------------------
+# push-time schema validation (server schema.rs::validate parity)
+# ---------------------------------------------------------------------------
+
+
+def test_push_schema_rejects_ttl_on_a_non_numeric_field() -> None:
+    c = InMemoryRtDbClient()
+    bad = Schema.model_validate(
+        {
+            "tables": {
+                "items": {
+                    "fields": {"name": {"type": "string"}, "order": {"type": "number"}},
+                    "indexes": [{"name": "by_order", "fields": ["order"]}],
+                    "ttl": {"field": "name"},
+                }
+            }
+        }
+    )
+    with pytest.raises(RtDbError) as ei:
+        c.push_schema(bad)
+    assert ei.value.code is ErrorCode.SCHEMA_VIOLATION
+    assert "ttl.field 'name' must be a number or bigint field" in ei.value.message
+
+
+def test_push_schema_rejects_ttl_without_a_matching_btree_index() -> None:
+    c = InMemoryRtDbClient()
+    bad = Schema.model_validate(
+        {
+            "tables": {
+                "items": {
+                    "fields": {"name": {"type": "string"}, "order": {"type": "number"}},
+                    "indexes": [{"name": "by_name", "fields": ["name"]}],
+                    "ttl": {"field": "order"},
+                }
+            }
+        }
+    )
+    with pytest.raises(RtDbError) as ei:
+        c.push_schema(bad)
+    assert ei.value.code is ErrorCode.SCHEMA_VIOLATION
+    assert (
+        "ttl.field 'order' requires a single-field, non-unique, non-partial btree index on it"
+        in ei.value.message
+    )
+
+
+def test_push_schema_rejects_an_index_over_a_non_indexable_field() -> None:
+    c = InMemoryRtDbClient()
+    bad = Schema.model_validate(
+        {
+            "tables": {
+                "items": {
+                    "fields": {
+                        "name": {"type": "string"},
+                        "tags": {"type": "array", "element": {"type": "string"}},
+                    },
+                    "indexes": [
+                        {"name": "by_name", "fields": ["name"]},
+                        {"name": "by_tags", "fields": ["tags"]},
+                    ],
+                }
+            }
+        }
+    )
+    with pytest.raises(RtDbError) as ei:
+        c.push_schema(bad)
+    assert ei.value.code is ErrorCode.SCHEMA_VIOLATION
+    assert "field type 'array' is not indexable" in ei.value.message
+
+
 def test_push_schema_additively_preserves_docs() -> None:
     c = _new_client()
     c.mutate(

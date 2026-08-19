@@ -23,7 +23,7 @@ import type {
   TableJson,
 } from "../protocol.js";
 import type { StoredRow } from "./store.js";
-import { clone, isInt64String } from "./validate.js";
+import { clone, indexColumnType, isInt64String } from "./validate.js";
 
 /** Returns the values a finite literal-union (or lone literal) accepts, mirroring
  *  server `schema::literal_set`: a lone `literal` yields its single value, and a
@@ -123,6 +123,80 @@ export function detectDestructiveChanges(oldSchema: SchemaJson, newSchema: Schem
       }
       if ((newIndex.language ?? null) !== (oldIndex.language ?? null)) {
         throw new RtDbError("BAD_REQUEST", `changed language of search index '${oldIndex.name}'`);
+      }
+    }
+  }
+}
+
+/** Push-time schema validation — the TTL and index-field rules of server
+ *  `schema::validate` (`schema::validate_indexes` + `validate_ttl`), mirroring
+ *  the rust harness's `SchemaDef::validate`: index fields must be declared and
+ *  indexable, search indexes must cover text fields, and a TTL must name a
+ *  numeric field carrying a single-field, non-unique, non-partial btree index.
+ *  Deliberately a subset — identifier formats, owner/collaborator fields,
+ *  defaults, and `onDelete` shapes stay server-side (the last has its own
+ *  `validateOnDelete` pass). */
+export function validateSchema(schema: SchemaJson): void {
+  for (const [tableName, table] of Object.entries(schema.tables)) {
+    for (const index of table.indexes ?? []) {
+      if (index.fields.length === 0) {
+        throw new RtDbError(
+          "SCHEMA_VIOLATION",
+          `index '${index.name}' on table '${tableName}' has no fields`,
+        );
+      }
+      // A vector index's `fields[0]` is a Vector column, which is not
+      // btree-indexable — the server validates vector specs in their own
+      // branch and skips the per-field loop below.
+      if (index.vector) {
+        continue;
+      }
+      for (const fieldName of index.fields) {
+        const fieldType = table.fields[fieldName];
+        if (!fieldType) {
+          throw new RtDbError(
+            "SCHEMA_VIOLATION",
+            `index '${index.name}' on table '${tableName}' references unknown field '${fieldName}'`,
+          );
+        }
+        const { pg } = indexColumnType(fieldType);
+        if (index.search && pg !== "text") {
+          throw new RtDbError(
+            "SCHEMA_VIOLATION",
+            `search index '${index.name}' on table '${tableName}' has non-text field '${fieldName}'`,
+          );
+        }
+      }
+    }
+    const ttl = table.ttl;
+    if (ttl) {
+      const fieldType = table.fields[ttl.field];
+      if (!fieldType) {
+        throw new RtDbError("SCHEMA_VIOLATION", `ttl.field '${ttl.field}' is not a declared field`);
+      }
+      if (fieldType.type !== "number" && fieldType.type !== "int64") {
+        throw new RtDbError(
+          "SCHEMA_VIOLATION",
+          `ttl.field '${ttl.field}' must be a number or bigint field`,
+        );
+      }
+      const hasTtlIndex = (table.indexes ?? []).some(
+        (idx) =>
+          !idx.search &&
+          !idx.vector &&
+          !idx.unique &&
+          !idx.where &&
+          idx.fields.length === 1 &&
+          idx.fields[0] === ttl.field,
+      );
+      if (!hasTtlIndex) {
+        throw new RtDbError(
+          "SCHEMA_VIOLATION",
+          `ttl.field '${ttl.field}' requires a single-field, non-unique, non-partial btree index on it`,
+        );
+      }
+      if (ttl.defaultDurationMs != null && ttl.defaultDurationMs <= 0) {
+        throw new RtDbError("SCHEMA_VIOLATION", "ttl.defaultDurationMs must be greater than 0");
       }
     }
   }

@@ -2142,6 +2142,59 @@ describe("InMemoryRtDbClient — additive schema push", () => {
   });
 });
 
+describe("InMemoryRtDbClient — push-time schema validation", () => {
+  // Server parity (schema.rs::validate): pushSchema validates the TTL and
+  // index-field rules before installing the schema, mirroring the rust
+  // harness's SchemaDef::validate — the live server 422s these pushes with
+  // the same messages.
+
+  /** Push `schema` and return the thrown RtDbError (fails the test if the
+   *  push succeeds). */
+  function pushError(schema: ReturnType<typeof defineSchema>): RtDbError {
+    try {
+      new InMemoryRtDbClient().pushSchema(schema);
+    } catch (e) {
+      return e as RtDbError;
+    }
+    throw new Error("expected pushSchema to throw");
+  }
+
+  it("ttl on a non-numeric field is rejected", () => {
+    const bad = defineSchema({
+      items: defineTable({ name: t.string(), order: t.number() })
+        .index("by_order", ["order"])
+        .ttl("name"),
+    });
+    const err = pushError(bad);
+    expect(err.code).toBe("SCHEMA_VIOLATION");
+    expect(err.message).toMatch(/ttl\.field 'name' must be a number or bigint field/);
+  });
+
+  it("ttl without a matching single-field btree index is rejected", () => {
+    const bad = defineSchema({
+      items: defineTable({ name: t.string(), order: t.number() })
+        .index("by_name", ["name"])
+        .ttl("order"),
+    });
+    const err = pushError(bad);
+    expect(err.code).toBe("SCHEMA_VIOLATION");
+    expect(err.message).toMatch(
+      /ttl\.field 'order' requires a single-field, non-unique, non-partial btree index on it/,
+    );
+  });
+
+  it("an index over a non-indexable field is rejected", () => {
+    const bad = defineSchema({
+      items: defineTable({ name: t.string(), tags: t.array(t.string()) })
+        .index("by_name", ["name"])
+        .index("by_tags", ["tags"]),
+    });
+    const err = pushError(bad);
+    expect(err.code).toBe("SCHEMA_VIOLATION");
+    expect(err.message).toMatch(/field type 'array' is not indexable/);
+  });
+});
+
 describe("InMemoryRtDbClient — literal-union widening (pushSchema parity)", () => {
   // Mirrors server `schema::is_widening_of` (server/src/schema.rs). A second
   // `pushSchema` that widens a finite literal-union field (or a single literal

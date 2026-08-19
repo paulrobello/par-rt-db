@@ -816,6 +816,77 @@ def _index_column_type(ty: Any) -> _IndexedType:
             raise RtDbError(ErrorCode.SCHEMA_VIOLATION, f"field type '{ty.type}' is not indexable")
 
 
+def _validate_schema(schema: SchemaDef) -> None:
+    """Push-time schema validation — the TTL and index-field rules of server
+    ``schema.rs::validate`` (``validate_indexes`` + ``validate_ttl``), mirroring
+    the rust harness's ``SchemaDef::validate`` and the TS ``validateSchema``:
+    index fields must be declared and indexable, search indexes must cover text
+    fields, and a TTL must name a numeric field carrying a single-field,
+    non-unique, non-partial btree index. Deliberately a subset — identifier
+    formats, owner/collaborator fields, defaults, and ``onDelete`` shapes stay
+    server-side (the last has its own ``_validate_on_delete`` pass)."""
+    for table_name, table in schema.tables.items():
+        for index in table.indexes:
+            if not index.fields:
+                raise RtDbError(
+                    ErrorCode.SCHEMA_VIOLATION,
+                    f"index '{index.name}' on table '{table_name}' has no fields",
+                )
+            # A vector index's ``fields[0]`` is a Vector column, which is not
+            # btree-indexable — the server validates vector specs in their own
+            # branch and skips the per-field loop below.
+            if index.vector is not None:
+                continue
+            for field_name in index.fields:
+                field_type = table.fields.get(field_name)
+                if field_type is None:
+                    raise RtDbError(
+                        ErrorCode.SCHEMA_VIOLATION,
+                        f"index '{index.name}' on table '{table_name}' references unknown"
+                        f" field '{field_name}'",
+                    )
+                pg = _index_column_type(field_type).pg
+                if index.search and pg != _TEXT:
+                    raise RtDbError(
+                        ErrorCode.SCHEMA_VIOLATION,
+                        f"search index '{index.name}' on table '{table_name}' has non-text"
+                        f" field '{field_name}'",
+                    )
+        ttl = table.ttl
+        if ttl is not None:
+            field_type = table.fields.get(ttl.field)
+            if field_type is None:
+                raise RtDbError(
+                    ErrorCode.SCHEMA_VIOLATION,
+                    f"ttl.field '{ttl.field}' is not a declared field",
+                )
+            if not isinstance(field_type, _FNumber | _FInt64):
+                raise RtDbError(
+                    ErrorCode.SCHEMA_VIOLATION,
+                    f"ttl.field '{ttl.field}' must be a number or bigint field",
+                )
+            has_ttl_index = any(
+                not idx.search
+                and idx.vector is None
+                and not idx.unique
+                and idx.where is None
+                and len(idx.fields) == 1
+                and idx.fields[0] == ttl.field
+                for idx in table.indexes
+            )
+            if not has_ttl_index:
+                raise RtDbError(
+                    ErrorCode.SCHEMA_VIOLATION,
+                    f"ttl.field '{ttl.field}' requires a single-field, non-unique,"
+                    " non-partial btree index on it",
+                )
+            if ttl.default_duration_ms is not None and ttl.default_duration_ms <= 0:
+                raise RtDbError(
+                    ErrorCode.SCHEMA_VIOLATION,
+                    "ttl.defaultDurationMs must be greater than 0",
+                )
+
+
 def _pg_for_field(table_def: TableDef, field: str) -> _PgType:
     """Storage type for an index sort column, defensive ``_TEXT`` fallback."""
     field_ty = table_def.fields.get(field)
@@ -1026,10 +1097,13 @@ class _InMemoryStoreCore:
         """Install ``schema`` as this client's sole in-memory database schema,
         merging additively on subsequent pushes: existing docs and idempotency
         entries are preserved, and ``_tables`` is repopulated from the new schema
-        (folding in new fields/indexes/tables without touching rows). Destructive
-        changes — a removed/changed table, field, or index — raise
-        :class:`RtDbError` ``BAD_REQUEST`` with the same messages as the live
-        server's ``ddl.rs::detect_destructive_changes``."""
+        (folding in new fields/indexes/tables without touching rows). Every
+        push validates TTL and index-field rules (``_validate_schema``, the
+        server's ``schema.validate()`` order). Destructive changes — a
+        removed/changed table, field, or index — raise :class:`RtDbError`
+        ``BAD_REQUEST`` with the same messages as the live server's
+        ``ddl.rs::detect_destructive_changes``."""
+        _validate_schema(schema)
         if self._schema is not None:
             _detect_destructive_changes(self._schema, schema)
         # FM-33: the server validates `onDelete` placement/shape in
