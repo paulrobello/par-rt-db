@@ -151,6 +151,31 @@ Mutations, scheduling, and workflows also run over the WS client
 `pauseSchedule(_:)`, `resumeSchedule(_:)`, `listSchedules()`,
 `startWorkflow(_:)`, `cancelWorkflow(_:)`, `listWorkflows()`).
 
+Presence rooms (ENH-015): `presence(room:state:)` joins (or attaches to) a
+room and returns a `PresenceHandle` whose `current`/`stream` carry
+`PresenceSnapshot` — `.pending` until the first `presenceSnapshot`, then
+`.members([PresenceMember])`, or `.rejected` if the server refuses the join.
+Joined rooms replay with their freshest state on every reconnect;
+`updatePresence(room:state:ttlMs:)` broadcasts a new per-connection state
+(`ttlMs` heartbeats the state; nil means no expiry) and
+`leavePresence(room:)` is the explicit leave — stopping a handle's stream
+only stops listening.
+
+```swift
+let room = await client.presence(room: "doc:1", state: .object(["mode": .string("edit")]))
+if case .members(let members) = room.current { print(members.map(\.connectionId)) }
+await client.updatePresence(room: "doc:1", state: .object(["mode": .string("view")]))
+await client.leavePresence(room: "doc:1")
+```
+
+Optimistic updates (off by default — `RtDbClientConfig.optimisticUpdates`):
+with the flag on, every `mutate` overlays its projected effect on each
+matching subscription immediately (synthetic `__optimistic__` ids for
+inserts), reconciles to the authoritative `queryUpdate`, and rolls back to
+the last server value on `mutateErr`, a disconnect-reject, or `close()`. The
+projection is conservative — only unambiguous `collect`/`take`/`get`/filter-
+delete shapes overlay; everything else waits for server truth.
+
 ## DSL examples
 
 Numeric convention: the query and mutation builders take `Int` for numeric
@@ -318,10 +343,10 @@ let result = try await retryOnPrecondition {
 | Schema DSL — 15 field types, btree/search/vector/unique/partial indexes, `ownerField`/`collaboratorsField`/`authorize`, `ttl`, `defaults`, `softDelete`, `onDelete` | ✅ |
 | HTTP client — query/query-batch/mutate (+ idempotency key, retry helper), schedule ops, workflow ops, full storage surface, `pushSchema`/`previewSchema`, `authMe` | ✅ |
 | WS client — auth/reconnect/heartbeat, shared subscriptions with replay, mutate-over-WS, schedule + workflow ops | ✅ |
+| Presence (ENH-015) — `presence(room:state:)` / `updatePresence(room:state:ttlMs:)` / `leavePresence(room:)`, `PresenceSnapshot` fan-out, reconnect replay of joined rooms | ✅ |
+| Optimistic updates — `RtDbClientConfig.optimisticUpdates` (default off), overlay on mutate, reconcile on `queryUpdate`, rollback on `mutateErr`/reject/close | ✅ |
 | `ParRtDbUI` — `@Observable LiveQuery<T>` | ✅ |
 | Admin client + migrate DSL | Deferred — gap card: "Swift client: admin client + migrate DSL" (dashboard + `rtdb` CLI cover ops today) |
-| Presence | Deferred — gap card: "Swift client: presence + optimistic updates" (one card, shared with optimistic updates) |
-| Optimistic updates | Deferred — gap card: "Swift client: presence + optimistic updates" (one card, shared with presence) |
 | In-memory engine + semantics/golden corpus runner | Deferred — gap card: "Swift client: in-memory engine + semantics/golden corpus runner" |
 | OAuth login-flow helpers | Not in v1 (spec decision — the `getToken` hook is the integration seam) |
 

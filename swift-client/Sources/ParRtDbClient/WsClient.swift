@@ -29,6 +29,13 @@ public struct RtDbClientConfig: Sendable {
     /// presumed dead after `2 * heartbeatMs` without a pong. `0` disables the
     /// heartbeat (ts-client parity).
     public var heartbeatMs: UInt64 = 20000
+    /// When true, a `mutate` overlays `projectOptimisticUpdate`'s projected
+    /// effect on each matching subscription immediately (before the server
+    /// round-trip); the overlay is reconciled to the authoritative
+    /// `queryUpdate` and rolled back on `mutateErr`/reject/close. Off ⇒
+    /// byte-for-byte the pre-optimistic behavior (rust `Config::
+    /// optimistic_updates`).
+    public var optimisticUpdates: Bool = false
 
     public init() {}
 }
@@ -201,6 +208,86 @@ struct TypedSubscriptionSink<T: Codable & Sendable>: SubscriptionSink {
     }
 }
 
+// MARK: - Presence (ENH-015)
+
+/// One observable member-list state for a presence room — the presence
+/// counterpart of `QuerySnapshot` (rust `ws.rs::PresenceSnapshot`):
+/// `.pending` until the first `presenceSnapshot`, then the latest member
+/// list on each fan-out, or `.rejected` if the server rejects the join.
+public enum PresenceSnapshot: Equatable, Sendable {
+    /// No `presenceSnapshot` has arrived yet (a fresh handle starts here).
+    case pending
+    /// The latest member list from a `presenceSnapshot`.
+    case members([PresenceMember])
+    /// The server rejected the join (e.g. presence not enabled).
+    case rejected(RtDbError)
+}
+
+/// Latest-value cell behind `PresenceHandle.current` — the non-generic
+/// sibling of `LatestSnapshotBox` (a synchronous read needs a non-actor
+/// home; the room entry writes, the handle reads).
+/// @unchecked Sendable: `snapshot` is only ever touched while holding `lock`.
+final class LatestPresenceBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var snapshot: PresenceSnapshot
+
+    init(_ snapshot: PresenceSnapshot) {
+        self.snapshot = snapshot
+    }
+
+    var value: PresenceSnapshot {
+        lock.withLock { snapshot }
+    }
+
+    func store(_ snapshot: PresenceSnapshot) {
+        lock.withLock { self.snapshot = snapshot }
+    }
+}
+
+/// A presence-room handle returned by `RtDbClient.presence(room:state:)`.
+/// `current` is the room's latest snapshot; `stream` yields each subsequent
+/// snapshot (never `.pending`) and finishes when the room is left or the
+/// client becomes terminal. Stopping iteration stops LISTENING only — the
+/// room membership survives until `leavePresence(room:)` (rust: `Presence`
+/// is a watch receiver; dropping it does not leave the room).
+public struct PresenceHandle: Sendable {
+    private let box: LatestPresenceBox
+    private let storedStream: AsyncStream<PresenceSnapshot>
+
+    init(box: LatestPresenceBox, stream: AsyncStream<PresenceSnapshot>) {
+        self.box = box
+        storedStream = stream
+    }
+
+    /// The latest snapshot without waiting.
+    public var current: PresenceSnapshot {
+        box.value
+    }
+
+    /// Every snapshot from here on; finishes when the room is left or the
+    /// client becomes terminal. Single-consumer.
+    public var stream: AsyncStream<PresenceSnapshot> {
+        storedStream
+    }
+}
+
+/// One presence listener's delivery target, held by the room entry and
+/// written from the actor (the presence sibling of `SubscriptionSink`).
+struct PresenceSink: Sendable {
+    let id = UUID()
+    let box: LatestPresenceBox
+    let continuation: AsyncStream<PresenceSnapshot>.Continuation
+
+    func deliver(_ snapshot: PresenceSnapshot) {
+        box.store(snapshot)
+        continuation.yield(snapshot)
+    }
+
+    func finish() {
+        continuation.finish()
+    }
+}
+
 // MARK: - Deadline race
 
 /// Task-group child outcome for `withDeadline`: which side of the race won.
@@ -303,13 +390,19 @@ public actor RtDbClient {
     /// One server subscription shared by every caller subscribed to the same
     /// query shape (rust `SubState`): the wire id, the query for replay, the
     /// live handles' sinks, the refcount, and the latest snapshot for
-    /// late-joiner seeding (watch-channel parity).
+    /// late-joiner seeding (watch-channel parity). The two `optimistic*`
+    /// fields are rust's per-sub `OptimisticState`: `serverLast` is the
+    /// projection base (most recent authoritative result, set on each
+    /// `queryUpdate`); `optimisticActive` is true while an overlay is
+    /// covering the sinks (set on apply, cleared on reconcile/rollback).
     private struct SubscriptionEntry {
         let queryId: String
         let query: Query
         var refcount: Int
         var latest: RawSnapshot
         var sinks: [any SubscriptionSink]
+        var optimisticActive: Bool = false
+        var serverLast: JSONValue?
     }
 
     /// Canonical query shape -> entry (rust `by_key`).
@@ -320,6 +413,35 @@ public actor RtDbClient {
     /// unordered; rust's HashMap replay order is unspecified — this is stricter).
     private var subscriptionOrder: [String] = []
     private var subCounter = 1
+
+    /// Reverse index for optimistic rollback (rust `SubMaps::overlays`):
+    /// mutId → the queryIds that mutation overlaid. When a `mutateErr` or a
+    /// reject path drops a mutation, every subscription it overlaid is
+    /// reverted to its `serverLast` base.
+    private var overlaysByMutId: [String: Set<String>] = [:]
+
+    /// One presence room, shared by every caller that joined it (rust
+    /// `PresenceRoomState`): the latest join/update `state` (so a reconnect
+    /// replays with the freshest value), the latest snapshot for late-joiner
+    /// seeding, and the live handles' sinks. Rooms are unique per client —
+    /// one connection joins a room once.
+    private struct PresenceRoom {
+        let room: String
+        var state: JSONValue?
+        var latest: PresenceSnapshot
+        var sinks: [PresenceSink]
+    }
+
+    /// Joined presence rooms (rust `PresenceMaps::by_room`), plus the join
+    /// order so replay is deterministic (a Dict iterates unordered).
+    private var presenceRooms: [String: PresenceRoom] = [:]
+    private var presenceOrder: [String] = []
+    /// Rooms whose join frame was sent on the CURRENT session (rust's
+    /// per-session `sent_rooms` set): dedups join-vs-replay, and gates
+    /// `presenceState`/`leavePresence` to rooms actually joined this session.
+    /// Cleared at each session start; replay (and any join that raced it)
+    /// repopulates it.
+    private var sentPresenceRooms: Set<String> = []
 
     /// A mutate call awaiting its turn (rust `QueuedMutate`): queued while
     /// unauthenticated or re-queued when a send failed mid-session; moved to
@@ -702,11 +824,18 @@ public actor RtDbClient {
             }
             self.user = user
             lastPongMs = scheduler.now()
+            // Fresh per-session presence-join tracker (rust's run_session-
+            // local `sent_rooms`): replay repopulates it just below. A join
+            // racing the replays may send its own frame first — the replay's
+            // set-insert then dedups it.
+            sentPresenceRooms.removeAll()
             setState(.connected)
             // Task 14 (rust run_session post-authOk): re-establish every live
-            // subscription, then flush the ops queued while unauthenticated.
+            // subscription, then replay joined presence rooms, then flush the
+            // ops queued while unauthenticated.
             guard
                 await replaySubscriptions(on: transport),
+                await replayPresenceRooms(on: transport),
                 await flushQueuedOps(on: transport)
             else {
                 return .reconnect
@@ -938,6 +1067,114 @@ public actor RtDbClient {
         }
     }
 
+    // MARK: Presence (ENH-015)
+
+    /// Join presence room `room`, optionally with initial `state` — the Swift
+    /// mirror of rust's `presence`. The first `presenceSnapshot` (the server
+    /// sends one on join listing current members) resolves `.pending` →
+    /// `.members`. Multiple joins to the same room share ONE wire membership
+    /// (dedup by room name); each call returns a fresh handle seeded with the
+    /// room's current snapshot. While disconnected the join is registered and
+    /// replayed on the next successful auth — the same gate as `subscribe`.
+    /// Stopping the returned handle's stream stops listening but does NOT
+    /// leave the room; call `leavePresence(room:)` for that, mirroring the TS
+    /// client where the returned unsubscribe only removes the listener.
+    public func presence(room: String, state: JSONValue? = nil) async -> PresenceHandle {
+        let (stream, continuation) = AsyncStream<PresenceSnapshot>.makeStream(
+            of: PresenceSnapshot.self, bufferingPolicy: .bufferingNewest(16)
+        )
+        let sink = PresenceSink(box: LatestPresenceBox(.pending), continuation: continuation)
+        continuation.onTermination = { [weak self] _ in
+            Task { await self?.dropPresenceListener(room: room, sinkId: sink.id) }
+        }
+        var seeded: PresenceSnapshot = .pending
+        if var entry = presenceRooms[room] {
+            // Refresh the cached join state so a reconnect replays with the
+            // latest value (mirrors the TS client's joinedRooms.set on join).
+            if let state {
+                entry.state = state
+            }
+            seeded = entry.latest
+            entry.sinks.append(sink)
+            presenceRooms[room] = entry
+        } else {
+            presenceRooms[room] = PresenceRoom(
+                room: room, state: state, latest: .pending, sinks: [sink]
+            )
+            presenceOrder.append(room)
+        }
+        // Join frame, deduped per session (rust's Cmd::PresenceJoin arm): a
+        // join racing the session-start replay must not double-send, and a
+        // replay that already joined skips. Best-effort — a failed send means
+        // the session is dying; the entry stays registered and the next
+        // session's replay covers it.
+        if let transport = currentTransport, self.state == .connected, sentPresenceRooms.insert(room).inserted {
+            try? await transport.send(
+                try Self.frame(.presence(room: room, state: presenceRooms[room]?.state))
+            )
+        }
+        // Watch-channel parity: a late joiner's `current` (and stream) start
+        // at the room's LATEST snapshot — never re-deliver `.pending`.
+        if case .pending = seeded {} else {
+            sink.deliver(seeded)
+        }
+        return PresenceHandle(box: sink.box, stream: stream)
+    }
+
+    /// Broadcast updated `state` for this connection in `room` — the server
+    /// fans out a fresh `presenceSnapshot` to every member. Also updates the
+    /// cached join state so a reconnect re-joins with the latest value.
+    /// No-op if this client has not joined `room` (mirrors the live server,
+    /// which would not relay an update from a non-member).
+    ///
+    /// `ttlMs` (ENH-015 presence-ttl) tells the server to clear this
+    /// connection's `state` to null `ttlMs` after the last refresh (the
+    /// member stays in the room); nil means no expiry. Pass a value for a
+    /// heartbeat-style refresh, nil for a plain update. While disconnected
+    /// the frame is not sent — the cached state above rides the next join
+    /// replay, which re-joins with the freshest value.
+    public func updatePresence(room: String, state: JSONValue, ttlMs: UInt64? = nil) async {
+        guard var entry = presenceRooms[room] else { return }
+        entry.state = state
+        presenceRooms[room] = entry
+        // Relay only while joined on this session (rust's Cmd::PresenceUpdate
+        // arm checks `sent_rooms`).
+        if sentPresenceRooms.contains(room), let transport = currentTransport, self.state == .connected {
+            try? await transport.send(
+                try Self.frame(.presenceState(room: room, state: state, ttlMs: ttlMs))
+            )
+        }
+    }
+
+    /// Leave presence room `room`: drops the local membership (finishing
+    /// every handle's stream — rust drops the room's watch sender) so the
+    /// next reconnect does not replay the join, and sends
+    /// `{type:"leavePresence"}` if this session had joined the room. Local
+    /// state is cleared regardless of auth state, so a buffered pre-auth
+    /// join does not replay after the caller has already left.
+    public func leavePresence(room: String) async {
+        if let entry = presenceRooms.removeValue(forKey: room) {
+            for sink in entry.sinks {
+                sink.finish()
+            }
+        }
+        presenceOrder.removeAll { $0 == room }
+        // Only send leavePresence if this room was joined on this session
+        // (rust's Cmd::PresenceLeave arm): a leave issued while disconnected
+        // must not fire on the next session — the room was never joined there.
+        if sentPresenceRooms.remove(room) != nil, let transport = currentTransport, state == .connected {
+            try? await transport.send(try Self.frame(.leavePresence(room: room)))
+        }
+    }
+
+    /// One handle's stream terminated: remove only that listener (rust: a
+    /// dropped watch receiver). The room membership itself survives.
+    private func dropPresenceListener(room: String, sinkId: UUID) {
+        guard var entry = presenceRooms[room] else { return }
+        entry.sinks.removeAll { $0.id == sinkId }
+        presenceRooms[room] = entry
+    }
+
     // MARK: Task 14 — mutations
 
     /// Submit a transaction, resolving to one `StepResult` per step. Pass
@@ -950,24 +1187,39 @@ public actor RtDbClient {
     }
 
     private func submitMutation(_ txn: Transaction, idempotencyKey: String?) async throws -> [JSONValue] {
-        try await submitOp(mutations) { id, continuation in
+        // Terminal gate before the optimistic apply (rust's mutate checks
+        // is_closed first — a closed client must not overlay anything).
+        guard !terminal else {
+            throw Self.closedError
+        }
+        // Mint the correlation id here (rust's mutate does) so the optimistic
+        // overlay can be recorded under the mutId the reply will correlate on
+        // — before the send, so subscribers see the overlay before the caller
+        // awaits (rust applies in `mutate` before dispatching the command).
+        let id = mutations.nextId()
+        if config.optimisticUpdates {
+            applyOptimistic(mutId: id, txn: txn)
+        }
+        return try await submitOp(mutations, id: id) { id, continuation in
             MutationCall(id: id, idempotencyKey: idempotencyKey, txn: txn, continuation: continuation)
         }
     }
 
     /// Shared submit for every op family (mutation / schedule / workflow —
     /// structurally identical in the rust driver, differing only in payload):
-    /// mint the correlation id, register the call as pending BEFORE the send,
-    /// re-queue on a failed send, or queue outright while unauthenticated —
-    /// then park for the reply.
+    /// mint the correlation id (or take the caller's pre-minted one — the
+    /// optimistic apply hook must run under the same id), register the call
+    /// as pending BEFORE the send, re-queue on a failed send, or queue
+    /// outright while unauthenticated — then park for the reply.
     private func submitOp<Reply: Sendable, Call: OpCall>(
         _ family: OpFamily<Call>,
+        id preMintedId: String? = nil,
         makeCall: (String, AsyncStream<Result<Reply, RtDbError>>.Continuation) -> Call
     ) async throws -> Reply {
         guard !terminal else {
             throw Self.closedError
         }
-        let id = family.nextId()
+        let id = preMintedId ?? family.nextId()
         let (stream, continuation) = AsyncStream<Result<Reply, RtDbError>>.makeStream(
             of: Result<Reply, RtDbError>.self, bufferingPolicy: .unbounded
         )
@@ -1095,6 +1347,27 @@ public actor RtDbClient {
         return true
     }
 
+    /// Replay `presence` join frames for every joined room, in join order,
+    /// each with the latest cached state (rust run_session's presence replay)
+    /// — the server lost this connection's presence on disconnect, so a
+    /// fresh join frame is required (not `presenceState`). Rooms already
+    /// joined on this session (a `presence` call that raced the replay) are
+    /// deduped via `sentPresenceRooms`. False when a send failed — the
+    /// session is dying; the caller returns `.reconnect` and the next session
+    /// replays again.
+    private func replayPresenceRooms(on transport: any WebSocketTransport) async -> Bool {
+        for room in presenceOrder {
+            guard let entry = presenceRooms[room] else { continue }
+            guard sentPresenceRooms.insert(room).inserted else { continue }
+            do {
+                try await transport.send(Self.frame(.presence(room: room, state: entry.state)))
+            } catch {
+                return false
+            }
+        }
+        return true
+    }
+
     /// Send every op queued while unauthenticated, in queue order. Each call
     /// is registered as pending BEFORE its send; on a failed send it stays at
     /// the queue head (order preserved) for the next session.
@@ -1131,6 +1404,11 @@ public actor RtDbClient {
         switch message {
         case let .queryUpdate(queryId, result):
             guard let key = queryIdToKey[queryId], var entry = subscriptionsByKey[key] else { return }
+            // Reconcile (rust apply_server_message): the authoritative result
+            // supersedes any in-flight overlay and becomes the new projection
+            // base for the next optimistic apply.
+            entry.optimisticActive = false
+            entry.serverLast = result
             entry.latest = .value(result)
             subscriptionsByKey[key] = entry
             for sink in entry.sinks {
@@ -1151,11 +1429,16 @@ public actor RtDbClient {
                 call.continuation.yield(.success(results))
                 call.continuation.finish()
             }
+            // No revert (rust MutateOk arm): the reconciling `queryUpdate`(s)
+            // arrive and supersede any overlay. Just drop the reverse index —
+            // the overlays are no longer rollback-eligible.
+            overlaysByMutId.removeValue(forKey: mutId)
         case let .mutateErr(mutId, error):
             if let call = mutations.pending.removeValue(forKey: mutId) {
                 call.continuation.yield(.failure(error))
                 call.continuation.finish()
             }
+            revertOverlays(forMutId: mutId)
         case let .scheduleOk(scheduleId, id):
             replySchedule(scheduleId, .success(.id(id)))
         case let .scheduleErr(scheduleId, error):
@@ -1190,8 +1473,28 @@ public actor RtDbClient {
             replyWorkflow(workflowId, .success(.list(workflows)))
         case .authOk, .authErr, .pong:
             break // lifecycle-owned — the receive loop never dispatches these
-        case .presenceSnapshot, .presenceErr:
-            break // presence lands with a later task
+        case let .presenceSnapshot(room, members):
+            // Per-room fan-out (rust PresenceSnapshot arm): anyone holding a
+            // handle for this room observes the new member list. A snapshot
+            // for a room this client has not joined is dropped, exactly like
+            // the by_id guard on queryUpdate.
+            guard var presenceRoom = presenceRooms[room] else { return }
+            presenceRoom.latest = .members(members)
+            presenceRooms[room] = presenceRoom
+            for sink in presenceRoom.sinks {
+                sink.deliver(.members(members))
+            }
+        case let .presenceErr(room, error):
+            // The server rejected the join (e.g. presence not enabled).
+            // Surface the error on the room's handles; the room stays
+            // registered (rust keeps the map entry — a later snapshot can
+            // still arrive if the server changes its mind).
+            guard var presenceRoom = presenceRooms[room] else { return }
+            presenceRoom.latest = .rejected(error)
+            presenceRooms[room] = presenceRoom
+            for sink in presenceRoom.sinks {
+                sink.deliver(.rejected(error))
+            }
         }
     }
 
@@ -1211,22 +1514,97 @@ public actor RtDbClient {
         }
     }
 
+    // MARK: Optimistic updates (wiring for projectOptimisticUpdate)
+
+    /// Mirror of rust's `apply_optimistic` (ts `applyOptimistic`): for each
+    /// live subscription whose `serverLast` base is known, project `txn`
+    /// onto it; for each non-`.skip` projection, push the overlaid value to
+    /// the shape's sinks immediately (before the server round-trip) and
+    /// record its queryId under `mutId` in `overlaysByMutId` so a later
+    /// rollback can find it. Runs in `submitMutation` before the send — no
+    /// suspension points — so no shape can vanish mid-apply.
+    private func applyOptimistic(mutId: String, txn: Transaction) {
+        let now = Int64(Date().timeIntervalSince1970 * 1000)
+        var touched: Set<String> = []
+        var projections: [(key: String, value: JSONValue)] = []
+        for (key, entry) in subscriptionsByKey {
+            guard let base = entry.serverLast else { continue }
+            if case let .overlaid(value) = projectOptimisticUpdate(
+                query: entry.query, last: base, txn: txn, now: now
+            ) {
+                projections.append((key, value))
+                touched.insert(entry.queryId)
+            }
+        }
+        for (key, value) in projections {
+            guard var entry = subscriptionsByKey[key] else { continue }
+            entry.optimisticActive = true
+            entry.latest = .value(value)
+            subscriptionsByKey[key] = entry
+            for sink in entry.sinks {
+                sink.deliver(.value(value))
+            }
+        }
+        if !touched.isEmpty {
+            overlaysByMutId[mutId] = touched
+        }
+    }
+
+    /// Revert one subscription's overlay (rust `revert_overlay`): if one is
+    /// active and a `serverLast` base exists, push the base back to the
+    /// sinks and clear `optimisticActive`. No-op when no overlay is active
+    /// (e.g. a `queryUpdate` already reconciled).
+    private func revertOverlay(queryId: String) {
+        guard let key = queryIdToKey[queryId], var entry = subscriptionsByKey[key] else { return }
+        guard entry.optimisticActive, let base = entry.serverLast else { return }
+        entry.optimisticActive = false
+        entry.latest = .value(base)
+        subscriptionsByKey[key] = entry
+        for sink in entry.sinks {
+            sink.deliver(.value(base))
+        }
+    }
+
+    /// Reverse-index revert (rust `revert_overlays_for`): drop `mutId`'s
+    /// entry from `overlaysByMutId` and revert every subscription it had
+    /// overlaid. Called from the `mutateErr` arm and every reject path.
+    private func revertOverlays(forMutId mutId: String) {
+        if let queryIds = overlaysByMutId.removeValue(forKey: mutId) {
+            for queryId in queryIds {
+                revertOverlay(queryId: queryId)
+            }
+        }
+    }
+
     /// Reject every SENT-but-unacked op (rust `reject_inflight`): the
     /// connection dropped after the send and before the acknowledgment.
-    /// Queued (never-sent) calls survive for the next session.
+    /// Queued (never-sent) calls survive for the next session. A rejected
+    /// mutation never gets its `mutateOk`/`mutateErr`, so its overlays are
+    /// rolled back here.
     private func rejectInflightOperations(reason: String) {
         let error = RtDbError(code: .internal, message: reason)
-        mutations.rejectPending(error: error)
+        for call in mutations.pending.values {
+            revertOverlays(forMutId: call.id)
+            call.fail(error)
+        }
+        mutations.pending.removeAll()
         schedules.rejectPending(error: error)
         workflows.rejectPending(error: error)
     }
 
     /// Reject every op, in-flight AND queued, and finish every subscription
-    /// stream (rust `reject_all` at terminal teardown). Idempotent.
+    /// and presence stream (rust `reject_all` at terminal teardown; rust
+    /// drops the presence watch senders with the driver). Idempotent.
     private func rejectAllOperations(reason: String) {
         rejectInflightOperations(reason: reason)
         let error = RtDbError(code: .internal, message: reason)
-        mutations.rejectQueued(error: error)
+        // Queued mutations also had overlays applied (the apply hook runs in
+        // submitMutation before the send), so revert them too.
+        for call in mutations.queued {
+            revertOverlays(forMutId: call.id)
+            call.fail(error)
+        }
+        mutations.queued.removeAll()
         schedules.rejectQueued(error: error)
         workflows.rejectQueued(error: error)
         for entry in subscriptionsByKey.values {
@@ -1237,6 +1615,14 @@ public actor RtDbClient {
         subscriptionsByKey.removeAll()
         queryIdToKey.removeAll()
         subscriptionOrder.removeAll()
+        overlaysByMutId.removeAll()
+        for room in presenceRooms.values {
+            for sink in room.sinks {
+                sink.finish()
+            }
+        }
+        presenceRooms.removeAll()
+        presenceOrder.removeAll()
     }
 
     /// Test seam (Task 14): queued-but-unsent mutation count, so tests can

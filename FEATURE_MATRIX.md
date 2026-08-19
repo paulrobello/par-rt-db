@@ -352,11 +352,15 @@ terminal (incl. `search`/`vectorSearch`/`hybridSearch`/`paginate`/`aggregate`/
 idempotency key, schedule ops, workflow ops, the full storage surface incl.
 signed URLs and image transforms, `pushSchema`/`previewSchema`), a reactive WS
 client (auth/reconnect/heartbeat, shape-deduplicated subscriptions with replay,
-mutate-over-WS, schedule + workflow ops), and a `ParRtDbUI` `@Observable
+mutate-over-WS, schedule + workflow ops), presence rooms (ENH-015 — join /
+`presenceState` with ttl / leave, snapshot fan-out, reconnect replay of joined
+rooms), and optimistic updates (`RtDbClientConfig.optimisticUpdates`, default
+off — a mutate overlays the projected effect on each matching subscription
+immediately and reconciles to the authoritative `queryUpdate`, rolling back on
+`mutateErr`/reject/close), plus a `ParRtDbUI` `@Observable
 LiveQuery` for SwiftUI. Its deferred surfaces are gap cards on the board, not
 absences: admin client + migrate DSL ("Swift client: admin client + migrate
-DSL"), presence + optimistic updates ("Swift client: presence + optimistic
-updates"), and the in-memory engine + semantics/golden corpus runner ("Swift
+DSL") and the in-memory engine + semantics/golden corpus runner ("Swift
 client: in-memory engine + semantics/golden corpus runner"). Darwin-only (Swift 6, iOS 17+/
 macOS 14) — its Makefile lines are Darwin-guarded in the root gate and covered
 by a macOS CI lane. Spec:

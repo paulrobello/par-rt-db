@@ -686,10 +686,12 @@ struct WsClientTests {
         fake: FakeTransport,
         scheduler: ManualScheduler,
         getToken: @escaping @Sendable () async -> String? = { "tok" },
-        random: @escaping @Sendable () -> Double = { 0.0 }
+        random: @escaping @Sendable () -> Double = { 0.0 },
+        config: RtDbClientConfig = RtDbClientConfig()
     ) -> RtDbClient {
         RtDbClient(
             url: "ws://rtdb.test", db: "app", getToken: getToken,
+            config: config,
             transportFactory: { _ in fake }, scheduler: scheduler, random: random
         )
     }
@@ -1206,10 +1208,12 @@ struct WsClientTests {
         sent.filter { $0.contains(#""type":"\#(type)""#) }
     }
 
-    private func connectedClient() async throws -> Task14Harness {
+    private func connectedClient(
+        config: RtDbClientConfig = RtDbClientConfig()
+    ) async throws -> Task14Harness {
         let fake = FakeTransport()
         let scheduler = ManualScheduler()
-        let client = makeClient(fake: fake, scheduler: scheduler)
+        let client = makeClient(fake: fake, scheduler: scheduler, config: config)
         await client.connect()
         await fake.release(authOkFrame)
         _ = try await waitUntilState(client, .connected)
@@ -1827,5 +1831,447 @@ struct WsClientTests {
         } catch let error as RtDbError {
             #expect(error == RtDbError(code: .internal, message: "client is closed"))
         }
+    }
+
+    // MARK: Presence (ENH-015)
+
+    /// A `presenceSnapshot` member object for the wire, as the server sends it.
+    private func memberFrame(cid: String) -> String {
+        #"{"connectionId":"\#(cid)","user":{"kind":"machine"},"state":{}}"#
+    }
+
+    private func member(_ cid: String) -> PresenceMember {
+        PresenceMember(connectionId: cid, user: AuthedUser(kind: .machine), state: .object([:]))
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func presenceJoinSendsFrameAndDeliversSnapshot() async throws {
+        let harness = try await connectedClient()
+        let handle = await harness.client.presence(
+            room: "doc:1", state: .object(["mode": .string("edit")])
+        )
+        try await waitUntil("presence frame") {
+            await frames(ofType: "presence", in: harness.fake.sent).count == 1
+        }
+        let frame = try #require(await frames(ofType: "presence", in: harness.fake.sent).first)
+        #expect(stringValue(in: frame, "room") == "doc:1")
+        #expect(frame.contains(#""state":{"mode":"edit"}"#))
+        #expect(handle.current == .pending)
+        let bothMembers = memberFrame(cid: "c1") + "," + memberFrame(cid: "c2")
+        await harness.fake.release(
+            #"{"type":"presenceSnapshot","room":"doc:1","members":[\#(bothMembers)]}"#
+        )
+        try await waitUntil("members snapshot") {
+            handle.current == .members([member("c1"), member("c2")])
+        }
+        await harness.client.close()
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func presenceJoinOmitsStateWhenNone() async throws {
+        let harness = try await connectedClient()
+        _ = await harness.client.presence(room: "doc:2")
+        try await waitUntil("presence frame") {
+            await frames(ofType: "presence", in: harness.fake.sent).count == 1
+        }
+        let frame = try #require(await frames(ofType: "presence", in: harness.fake.sent).first)
+        #expect(stringValue(in: frame, "room") == "doc:2")
+        #expect(frame.contains("state") == false)
+        await harness.client.close()
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func secondPresenceHandleSharesOneJoinAndSeedsLatest() async throws {
+        let harness = try await connectedClient()
+        let first = await harness.client.presence(room: "doc:1")
+        try await waitUntil("presence frame") {
+            await frames(ofType: "presence", in: harness.fake.sent).count == 1
+        }
+        await harness.fake.release(
+            #"{"type":"presenceSnapshot","room":"doc:1","members":[\#(memberFrame(cid: "c1"))]}"#
+        )
+        let expected = PresenceSnapshot.members([member("c1")])
+        try await waitUntil("first handle valued") { first.current == expected }
+        // A second handle attaches to the SAME wire membership: seeded with
+        // the room's latest snapshot, and no second join frame.
+        let second = await harness.client.presence(room: "doc:1")
+        #expect(second.current == expected)
+        #expect(await frames(ofType: "presence", in: harness.fake.sent).count == 1)
+        // Both handles see the next fan-out.
+        await harness.fake.release(
+            #"{"type":"presenceSnapshot","room":"doc:1","members":[\#(memberFrame(cid: "c9"))]}"#
+        )
+        let updated = PresenceSnapshot.members([member("c9")])
+        try await waitUntil("both handles updated") {
+            first.current == updated && second.current == updated
+        }
+        await harness.client.close()
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func presenceSnapshotForUnknownRoomIsIgnored() async throws {
+        let harness = try await connectedClient()
+        let handle = await harness.client.presence(room: "doc:1")
+        try await waitUntil("presence frame") {
+            await frames(ofType: "presence", in: harness.fake.sent).count == 1
+        }
+        // A snapshot for a room this client has not joined is dropped.
+        await harness.fake.release(
+            #"{"type":"presenceSnapshot","room":"doc:other","members":[\#(memberFrame(cid: "c9"))]}"#
+        )
+        try await Task.sleep(nanoseconds: 100_000_000)
+        #expect(handle.current == .pending)
+        await harness.client.close()
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func presenceErrSurfacesRejectedSnapshot() async throws {
+        let harness = try await connectedClient()
+        let handle = await harness.client.presence(room: "doc:1")
+        try await waitUntil("presence frame") {
+            await frames(ofType: "presence", in: harness.fake.sent).count == 1
+        }
+        await harness.fake.release(
+            #"{"type":"presenceErr","room":"doc:1","error":{"code":"FORBIDDEN","message":"presence not enabled"}}"#
+        )
+        let expected = RtDbError(code: .forbidden, message: "presence not enabled")
+        try await waitUntil("rejected snapshot") { handle.current == .rejected(expected) }
+        await harness.client.close()
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func updatePresenceSendsStateFrameAndCarriesTtl() async throws {
+        let harness = try await connectedClient()
+        _ = await harness.client.presence(room: "doc:1")
+        try await waitUntil("presence frame") {
+            await frames(ofType: "presence", in: harness.fake.sent).count == 1
+        }
+        await harness.client.updatePresence(
+            room: "doc:1", state: .object(["n": .int(2)]), ttlMs: 5000
+        )
+        try await waitUntil("presenceState frame") {
+            await frames(ofType: "presenceState", in: harness.fake.sent).count == 1
+        }
+        let first = try #require(
+            await frames(ofType: "presenceState", in: harness.fake.sent).first
+        )
+        #expect(first.contains(#""ttlMs":5000"#))
+        #expect(first.contains(#""n":2"#))
+        // Without ttlMs the frame omits the field entirely.
+        await harness.client.updatePresence(room: "doc:1", state: .object(["n": .int(3)]))
+        try await waitUntil("second presenceState frame") {
+            await frames(ofType: "presenceState", in: harness.fake.sent).count == 2
+        }
+        let second = try #require(
+            await frames(ofType: "presenceState", in: harness.fake.sent).last
+        )
+        #expect(second.contains("ttlMs") == false)
+        await harness.client.close()
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func updatePresenceForUnjoinedRoomIsNoOp() async throws {
+        let harness = try await connectedClient()
+        await harness.client.updatePresence(room: "never-joined", state: .object([:]))
+        try await Task.sleep(nanoseconds: 100_000_000)
+        #expect(await frames(ofType: "presenceState", in: harness.fake.sent).isEmpty)
+        #expect(await frames(ofType: "presence", in: harness.fake.sent).isEmpty)
+        await harness.client.close()
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func leavePresenceSendsFrameFinishesStreamsAndStopsReplay() async throws {
+        let harness = try await connectedClient()
+        let handle = await harness.client.presence(room: "doc:1")
+        try await waitUntil("presence frame") {
+            await frames(ofType: "presence", in: harness.fake.sent).count == 1
+        }
+        await harness.client.leavePresence(room: "doc:1")
+        try await waitUntil("leavePresence frame") {
+            await frames(ofType: "leavePresence", in: harness.fake.sent).count == 1
+        }
+        let leave = try #require(
+            await frames(ofType: "leavePresence", in: harness.fake.sent).first
+        )
+        #expect(stringValue(in: leave, "room") == "doc:1")
+        // The room's streams finish (rust drops the watch sender with the
+        // room) — a fresh iteration returns nil immediately.
+        var iterator = handle.stream.makeAsyncIterator()
+        let next = await iterator.next()
+        #expect(next == nil)
+        // Routing no longer knows the room: a late snapshot is dropped.
+        await harness.fake.release(
+            #"{"type":"presenceSnapshot","room":"doc:1","members":[\#(memberFrame(cid: "c1"))]}"#
+        )
+        try await Task.sleep(nanoseconds: 100_000_000)
+        #expect(handle.current == .pending)
+        // Reconnect: the left room must NOT be replayed.
+        try await waitForWaiter(on: harness.fake, count: 1)
+        await harness.fake.enqueueClose(nil)
+        _ = try await waitUntilState(harness.client, .reconnecting)
+        harness.scheduler.advance(250)
+        try await waitUntil("second dial") {
+            await harness.fake.connectedUrls.count == 2
+        }
+        try await waitForWaiter(on: harness.fake, count: 1)
+        await harness.fake.release(authOkFrame)
+        _ = try await waitUntilState(harness.client, .connected)
+        try await Task.sleep(nanoseconds: 150_000_000)
+        #expect(await frames(ofType: "presence", in: harness.fake.sent).count == 1)
+        #expect(await frames(ofType: "leavePresence", in: harness.fake.sent).count == 1)
+        await harness.client.close()
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func reconnectReplaysJoinedRoomsWithFreshState() async throws {
+        let harness = try await connectedClient()
+        _ = await harness.client.presence(room: "doc:1", state: .object(["mode": .string("view")]))
+        try await waitUntil("presence frame") {
+            await frames(ofType: "presence", in: harness.fake.sent).count == 1
+        }
+        await harness.client.updatePresence(
+            room: "doc:1", state: .object(["mode": .string("edit")])
+        )
+        try await waitUntil("presenceState frame") {
+            await frames(ofType: "presenceState", in: harness.fake.sent).count == 1
+        }
+        // Drop the session; the server lost this connection's presence.
+        try await waitForWaiter(on: harness.fake, count: 1)
+        await harness.fake.enqueueClose(nil)
+        _ = try await waitUntilState(harness.client, .reconnecting)
+        harness.scheduler.advance(250)
+        try await waitUntil("second dial") {
+            await harness.fake.connectedUrls.count == 2
+        }
+        try await waitForWaiter(on: harness.fake, count: 1)
+        await harness.fake.release(authOkFrame)
+        _ = try await waitUntilState(harness.client, .connected)
+        // Exactly one replayed join, carrying the FRESHEST cached state —
+        // and no extra presenceState after it.
+        try await waitUntil("replayed join") {
+            await frames(ofType: "presence", in: harness.fake.sent).count == 2
+        }
+        let replay = try #require(await frames(ofType: "presence", in: harness.fake.sent).last)
+        #expect(stringValue(in: replay, "room") == "doc:1")
+        #expect(replay.contains(#""mode":"edit""#))
+        try await Task.sleep(nanoseconds: 150_000_000)
+        #expect(await frames(ofType: "presenceState", in: harness.fake.sent).count == 1)
+        await harness.client.close()
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func preAuthPresenceJoinsReplayOnConnect() async throws {
+        let fake = FakeTransport()
+        let scheduler = ManualScheduler()
+        let client = makeClient(fake: fake, scheduler: scheduler)
+        // Join while idle: registered, nothing on the wire.
+        let handle = await client.presence(room: "doc:1", state: .object(["a": .int(1)]))
+        #expect(handle.current == .pending)
+        #expect(await frames(ofType: "presence", in: fake.sent).isEmpty)
+        await client.connect()
+        await fake.release(authOkFrame)
+        _ = try await waitUntilState(client, .connected)
+        try await waitUntil("replayed join") {
+            await frames(ofType: "presence", in: fake.sent).count == 1
+        }
+        let frame = try #require(await frames(ofType: "presence", in: fake.sent).first)
+        #expect(stringValue(in: frame, "room") == "doc:1")
+        #expect(frame.contains(#""a":1"#))
+        await client.close()
+    }
+
+    // MARK: Optimistic updates (wiring for projectOptimisticUpdate)
+
+    /// Shared prefix: a connected client with `optimisticUpdates` on, one
+    /// collect subscription on `t`, and the server base `[a(1)]` delivered.
+    private func optimisticHarness() async throws -> (
+        harness: Task14Harness, sub: Subscription<[Task14Doc]>
+    ) {
+        var config = RtDbClientConfig()
+        config.optimisticUpdates = true
+        let harness = try await connectedClient(config: config)
+        let sub = try await harness.client.subscribe(
+            TableQuery("t").collect().build(), as: [Task14Doc].self
+        )
+        try await waitUntil("subscribe frame") {
+            await frames(ofType: "subscribe", in: harness.fake.sent).isEmpty == false
+        }
+        await harness.fake.release(
+            #"{"type":"queryUpdate","queryId":"sub-1","result":[{"_id":"a","n":1}]}"#
+        )
+        try await waitUntil("base snapshot") {
+            sub.current == .value([Task14Doc(id: "a", num: 1)])
+        }
+        return (harness, sub)
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func optimisticMutateOverlaysImmediatelyAndReconciles() async throws {
+        let (harness, sub) = try await optimisticHarness()
+        let base = [Task14Doc(id: "a", num: 1)]
+        // The insert overlays before any server reply.
+        let txn = try MutationBuilder().insert("t", ["n": .int(2)]).build()
+        let mutateTask = Task { try await harness.client.mutate(txn) }
+        try await waitUntil("mutate frame") {
+            await frames(ofType: "mutate", in: harness.fake.sent).isEmpty == false
+        }
+        try await waitUntil("overlaid snapshot") {
+            if case let .value(docs) = sub.current {
+                return docs.count == 2 && docs[1] == Task14Doc(id: docs[1].id, num: 2)
+            }
+            return false
+        }
+        if case let .value(docs) = sub.current {
+            #expect(docs[1].id.hasPrefix("__optimistic__"))
+        }
+        // mutateOk does NOT revert — the reconciling queryUpdate supersedes.
+        await harness.fake.release(
+            #"{"type":"mutateOk","mutId":"mut-1","results":[{"id":"srv-1"}]}"#
+        )
+        _ = try await mutateTask.value
+        try await Task.sleep(nanoseconds: 150_000_000)
+        guard case let .value(afterAck) = sub.current else {
+            Issue.record("expected the overlay to survive mutateOk")
+            await harness.client.close()
+            return
+        }
+        #expect(afterAck.count == 2)
+        // The authoritative queryUpdate reconciles to server truth and
+        // becomes the new projection base.
+        await harness.fake.release(
+            #"{"type":"queryUpdate","queryId":"sub-1","result":[{"_id":"a","n":1},{"_id":"srv-1","n":2}]}"#
+        )
+        let reconciled = [Task14Doc(id: "a", num: 1), Task14Doc(id: "srv-1", num: 2)]
+        try await waitUntil("reconciled") { sub.current == .value(reconciled) }
+        // A second mutate projects from the RECONCILED base.
+        let txn2 = try MutationBuilder().patch("t", "srv-1", ["n": .int(3)]).build()
+        let secondTask = Task { try await harness.client.mutate(txn2) }
+        try await waitUntil("second overlay") {
+            if case let .value(docs) = sub.current {
+                return docs.count == 2 && docs[1] == Task14Doc(id: "srv-1", num: 3)
+            }
+            return false
+        }
+        await harness.fake.release(
+            #"{"type":"mutateOk","mutId":"mut-2","results":[null]}"#
+        )
+        _ = try await secondTask.value
+        await harness.client.close()
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func optimisticMutateErrRollsBackToServerBase() async throws {
+        let (harness, sub) = try await optimisticHarness()
+        let base: QuerySnapshot<[Task14Doc]> = .value([Task14Doc(id: "a", num: 1)])
+        let txn = try MutationBuilder().insert("t", ["n": .int(2)]).build()
+        let mutateTask = Task { try await harness.client.mutate(txn) }
+        try await waitUntil("overlaid snapshot") {
+            if case let .value(docs) = sub.current {
+                return docs.count == 2
+            }
+            return false
+        }
+        // mutateErr rejects the call AND reverts every overlay it made.
+        await harness.fake.release(
+            #"{"type":"mutateErr","mutId":"mut-1","error":{"code":"INTERNAL","message":"boom"}}"#
+        )
+        do {
+            _ = try await mutateTask.value
+            Issue.record("mutateErr should reject the mutate call")
+        } catch let error as RtDbError {
+            #expect(error == RtDbError(code: .internal, message: "boom"))
+        }
+        try await waitUntil("reverted to base") { sub.current == base }
+        await harness.client.close()
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func optimisticDisabledByDefaultLeavesSnapshotsAlone() async throws {
+        // Default config: optimisticUpdates off ⇒ pre-optimistic behavior.
+        let harness = try await connectedClient()
+        let sub = try await harness.client.subscribe(
+            TableQuery("t").collect().build(), as: [Task14Doc].self
+        )
+        try await waitUntil("subscribe frame") {
+            await frames(ofType: "subscribe", in: harness.fake.sent).isEmpty == false
+        }
+        await harness.fake.release(
+            #"{"type":"queryUpdate","queryId":"sub-1","result":[{"_id":"a","n":1}]}"#
+        )
+        let base: QuerySnapshot<[Task14Doc]> = .value([Task14Doc(id: "a", num: 1)])
+        try await waitUntil("base snapshot") { sub.current == base }
+        let txn = try MutationBuilder().insert("t", ["n": .int(2)]).build()
+        let mutateTask = Task { try await harness.client.mutate(txn) }
+        try await waitUntil("mutate frame") {
+            await frames(ofType: "mutate", in: harness.fake.sent).isEmpty == false
+        }
+        try await Task.sleep(nanoseconds: 150_000_000)
+        #expect(sub.current == base)
+        await harness.fake.release(
+            #"{"type":"mutateOk","mutId":"mut-1","results":[{"id":"srv-1"}]}"#
+        )
+        _ = try? await mutateTask.value
+        await harness.client.close()
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func optimisticSkipDoesNotOverlay() async throws {
+        // A filtered read only projects deletes — an insert must not overlay.
+        var config = RtDbClientConfig()
+        config.optimisticUpdates = true
+        let harness = try await connectedClient(config: config)
+        let sub = try await harness.client.subscribe(
+            TableQuery("t").filter(.eq(field: "n", value: .int(1))).collect().build(),
+            as: [Task14Doc].self
+        )
+        try await waitUntil("subscribe frame") {
+            await frames(ofType: "subscribe", in: harness.fake.sent).isEmpty == false
+        }
+        await harness.fake.release(
+            #"{"type":"queryUpdate","queryId":"sub-1","result":[{"_id":"a","n":1}]}"#
+        )
+        let base: QuerySnapshot<[Task14Doc]> = .value([Task14Doc(id: "a", num: 1)])
+        try await waitUntil("base snapshot") { sub.current == base }
+        let txn = try MutationBuilder().insert("t", ["n": .int(2)]).build()
+        let mutateTask = Task { try await harness.client.mutate(txn) }
+        try await waitUntil("mutate frame") {
+            await frames(ofType: "mutate", in: harness.fake.sent).isEmpty == false
+        }
+        try await Task.sleep(nanoseconds: 150_000_000)
+        #expect(sub.current == base)
+        await harness.fake.release(
+            #"{"type":"mutateOk","mutId":"mut-1","results":[{"id":"srv-1"}]}"#
+        )
+        _ = try? await mutateTask.value
+        await harness.client.close()
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func queuedOptimisticMutationRevertsOnClose() async throws {
+        let (harness, sub) = try await optimisticHarness()
+        let base: QuerySnapshot<[Task14Doc]> = .value([Task14Doc(id: "a", num: 1)])
+        // Drop the session so the next mutate queues (never sent) — the
+        // overlay still applies at submit, from the known base.
+        try await waitForWaiter(on: harness.fake, count: 1)
+        await harness.fake.enqueueClose(nil)
+        _ = try await waitUntilState(harness.client, .reconnecting)
+        let txn = try MutationBuilder().insert("t", ["n": .int(2)]).build()
+        let mutateTask = Task { try await harness.client.mutate(txn) }
+        try await waitUntil("overlaid while queued") {
+            if case let .value(docs) = sub.current {
+                return docs.count == 2
+            }
+            return false
+        }
+        try await waitUntilQueuedMutations(harness.client, 1)
+        // close() rejects the queued call — and its overlay reverts with it.
+        await harness.client.close()
+        do {
+            _ = try await mutateTask.value
+            Issue.record("close() should reject the queued mutation")
+        } catch let error as RtDbError {
+            #expect(error == RtDbError(code: .internal, message: "client is closed"))
+        }
+        try await waitUntil("reverted on close") { sub.current == base }
     }
 }
