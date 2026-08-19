@@ -164,11 +164,13 @@ etc.).
 
 ## Versioning
 
-All packages — `server`, `cli`, `dashboard`, and the three client SDKs
-(`ts-client`, `rust-client`, `python-client`) — version in **lockstep**: one
-version for the whole protocol surface, bumped together in the same release
-commit. The five implementations of the wire contract (`server/src/protocol.rs`
-plus the four client mirrors, `swift-client` included) are one unit;
+All packages — `server`, `cli`, `dashboard`, and the four client SDKs
+(`ts-client`, `rust-client`, `python-client`, `swift-client`) — version in
+**lockstep**: one version for the whole protocol surface, bumped together in
+the same release commit. `swift-client` carries no manifest version — SPM has
+no version field, so the repo's release tag is its version — but it is part of
+the lockstep unit all the same. The five implementations of the wire contract
+(`server/src/protocol.rs` plus the four client mirrors) are one unit;
 independent client versions would claim compatibility the five-way mirror does
 not have. The release procedure,
 including the lockstep bump, is [`docs/RELEASING.md`](docs/RELEASING.md).

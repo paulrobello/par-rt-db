@@ -1,9 +1,12 @@
 # Releasing par-rt-db
 
 The repeatable cut procedure. Everything versions in **lockstep** — `server`,
-`cli`, `dashboard`, and the three client SDKs share one version (see
+`cli`, `dashboard`, and the client SDKs (`ts-client`, `rust-client`,
+`python-client`, `swift-client`) share one version (see
 [`../CONTRIBUTING.md`'s Versioning section](../CONTRIBUTING.md#versioning)).
-Nothing here publishes to a registry; a release is a git tag plus the CHANGELOG
+`swift-client` has no manifest version to bump — SPM carries no version field,
+so the release tag itself is its version. Nothing here publishes to a registry;
+a release is a git tag plus the CHANGELOG
 heading. Publishing the SDKs to crates.io / npm / PyPI is a separate,
 user-approved decision.
 
@@ -14,12 +17,17 @@ user-approved decision.
    - `ts-client/package.json`, `dashboard/package.json`
    - `python-client/pyproject.toml`
    Regenerate the lockfiles (`cargo build` for `Cargo.lock`; `bun install` from
-   the root for the bun lockfile) and commit them.
+   the root for the bun lockfile) and commit them. `swift-client` is absent
+   from this list on purpose: SPM manifests carry no version field, so the
+   release tag is its version — consumers pin the tag.
 2. **Update `CHANGELOG.md`**: move the accumulated `[Unreleased]` entries under
    a new `## [0.x.y] - <date>` heading, leave a fresh empty `## [Unreleased]`
    on top, and update the footer compare links
    (`[Unreleased]: …/compare/v0.x.y...HEAD`, `[0.x.y]: …/releases/tag/v0.x.y`).
-3. **Run the gate**: `make checkall` from the repo root must be green.
+3. **Run the gate**: `make checkall` from the repo root must be green. On
+   Darwin that already sweeps `swift-client` (the aggregate fmt/lint/typecheck/
+   test targets carry Darwin-guarded swift lines); on Linux those lines skip
+   loudly and the macOS CI job runs `make swift-client-checkall`.
 4. **Commit**: `release: v0.x.y` (versions, lockfiles, CHANGELOG together).
 5. **Tag the release commit** (annotated, so it carries the release message):
    ```bash

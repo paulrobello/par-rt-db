@@ -4,8 +4,9 @@ All notable changes to par-rt-db will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
-Each package is versioned independently; the three client SDKs (ts/rust/python)
-and the dashboard + cli packages are at `0.1.0` until the first tagged release.
+All packages version in lockstep (see [`docs/RELEASING.md`](docs/RELEASING.md)):
+one version for the whole protocol surface, currently `0.1.0`. `swift-client`
+carries no manifest version — the repo's release tag is its version.
 
 Feature entries cross-reference the rows in
 [`FEATURE_MATRIX.md`](FEATURE_MATRIX.md), which is the authoritative parity
