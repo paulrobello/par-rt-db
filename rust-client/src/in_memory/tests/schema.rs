@@ -141,6 +141,193 @@ fn push_schema_allows_widening_a_literal_union() {
     }
 }
 
+// Server parity (ddl.rs:148-169): a second push that flips `unique`, attaches
+// or changes a `where` predicate, or changes a search index's `language` is a
+// breaking index change — rejected with the exact server messages. The
+// detector previously stopped after the vector arm and treated all three as
+// additive (kanban 01a018aa83697c12b15a3fae8c17867c).
+#[test]
+fn push_schema_rejects_flipping_an_index_to_unique() {
+    let mut c = InMemoryRtDbClient::new(InMemoryRtDbClientOptions::default());
+    c.push_schema(&test_schema()).unwrap();
+    let flipped = Schema::builder()
+        .table(
+            "items",
+            Table::new()
+                .field("name", FieldType::String)
+                .field("status", FieldType::String)
+                .field("order", FieldType::Number)
+                .field("note", FieldType::optional(FieldType::String))
+                .index("by_name", &["name"])
+                .unique()
+                .index("by_status", &["status"])
+                .index("by_status_and_order", &["status", "order"])
+                .search_index("by_content", &["name"], None),
+        )
+        .build();
+    let err = c.push_schema(&flipped).unwrap_err();
+    assert!(
+        matches!(err.code, ErrorCode::BadRequest),
+        "got: {:?}",
+        err.code
+    );
+    assert!(
+        err.message
+            .contains("changed uniqueness of index 'by_name'"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn push_schema_rejects_changing_an_index_partial_predicate() {
+    let mut c = InMemoryRtDbClient::new(InMemoryRtDbClientOptions::default());
+    c.push_schema(&test_schema()).unwrap();
+    let flipped = Schema::builder()
+        .table(
+            "items",
+            Table::new()
+                .field("name", FieldType::String)
+                .field("status", FieldType::String)
+                .field("order", FieldType::Number)
+                .field("note", FieldType::optional(FieldType::String))
+                .index("by_name", &["name"])
+                .index("by_status", &["status"])
+                .where_clause(FilterExpr::Eq {
+                    field: "status".into(),
+                    value: json!("todo"),
+                })
+                .index("by_status_and_order", &["status", "order"])
+                .search_index("by_content", &["name"], None),
+        )
+        .build();
+    let err = c.push_schema(&flipped).unwrap_err();
+    assert!(
+        matches!(err.code, ErrorCode::BadRequest),
+        "got: {:?}",
+        err.code
+    );
+    assert!(
+        err.message
+            .contains("changed partial predicate of index 'by_status'"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn push_schema_rejects_changing_a_search_index_language() {
+    let mut c = InMemoryRtDbClient::new(InMemoryRtDbClientOptions::default());
+    c.push_schema(&test_schema()).unwrap();
+    let flipped = Schema::builder()
+        .table(
+            "items",
+            Table::new()
+                .field("name", FieldType::String)
+                .field("status", FieldType::String)
+                .field("order", FieldType::Number)
+                .field("note", FieldType::optional(FieldType::String))
+                .index("by_name", &["name"])
+                .index("by_status", &["status"])
+                .index("by_status_and_order", &["status", "order"])
+                .search_index("by_content", &["name"], Some("spanish")),
+        )
+        .build();
+    let err = c.push_schema(&flipped).unwrap_err();
+    assert!(
+        matches!(err.code, ErrorCode::BadRequest),
+        "got: {:?}",
+        err.code
+    );
+    assert!(
+        err.message
+            .contains("changed language of search index 'by_content'"),
+        "got: {err}"
+    );
+}
+
+// Server parity (schema.rs::validate, kanban 01a018aa861c7f208e00aed1af1b8b16):
+// push_schema validates the schema before installing it — TTL shape and
+// indexability of index fields — with the server's messages and
+// SCHEMA_VIOLATION code. The harness previously accepted schemas the live
+// server 422s.
+#[test]
+fn push_schema_rejects_ttl_on_a_non_numeric_field() {
+    let mut c = InMemoryRtDbClient::new(InMemoryRtDbClientOptions::default());
+    let bad = Schema::builder()
+        .table(
+            "items",
+            Table::new()
+                .field("name", FieldType::String)
+                .field("order", FieldType::Number)
+                .index("by_order", &["order"])
+                .ttl("name", None),
+        )
+        .build();
+    let err = c.push_schema(&bad).unwrap_err();
+    assert!(
+        matches!(err.code, ErrorCode::SchemaViolation),
+        "got: {:?}",
+        err.code
+    );
+    assert!(
+        err.message
+            .contains("ttl.field 'name' must be a number or bigint field"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn push_schema_rejects_ttl_without_a_matching_btree_index() {
+    let mut c = InMemoryRtDbClient::new(InMemoryRtDbClientOptions::default());
+    // `order` is numeric but no single-field btree index sits on it.
+    let bad = Schema::builder()
+        .table(
+            "items",
+            Table::new()
+                .field("name", FieldType::String)
+                .field("order", FieldType::Number)
+                .index("by_name", &["name"])
+                .ttl("order", None),
+        )
+        .build();
+    let err = c.push_schema(&bad).unwrap_err();
+    assert!(
+        matches!(err.code, ErrorCode::SchemaViolation),
+        "got: {:?}",
+        err.code
+    );
+    assert!(
+        err.message.contains(
+            "ttl.field 'order' requires a single-field, non-unique, non-partial btree index on it"
+        ),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn push_schema_rejects_an_index_over_a_non_indexable_field() {
+    let mut c = InMemoryRtDbClient::new(InMemoryRtDbClientOptions::default());
+    let bad = Schema::builder()
+        .table(
+            "items",
+            Table::new()
+                .field("name", FieldType::String)
+                .field("tags", FieldType::array(FieldType::String))
+                .index("by_name", &["name"])
+                .index("by_tags", &["tags"]),
+        )
+        .build();
+    let err = c.push_schema(&bad).unwrap_err();
+    assert!(
+        matches!(err.code, ErrorCode::SchemaViolation),
+        "got: {:?}",
+        err.code
+    );
+    assert!(
+        err.message.contains("field type 'array' is not indexable"),
+        "got: {err}"
+    );
+}
+
 #[test]
 fn push_schema_rejects_narrowing_a_literal_union() {
     // Server parity: a second push that narrows a literal-union field —

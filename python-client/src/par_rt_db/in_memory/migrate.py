@@ -195,6 +195,11 @@ def _detect_destructive_changes(old: SchemaDef, new: SchemaDef) -> None:
                     ErrorCode.BAD_REQUEST,
                     f"changed partial predicate of index '{old_index.name}'",
                 )
+            if (new_index.language or None) != (old_index.language or None):
+                raise RtDbError(
+                    ErrorCode.BAD_REQUEST,
+                    f"changed language of search index '{old_index.name}'",
+                )
 
 
 def _field_type_signature(ty: Any) -> Any:

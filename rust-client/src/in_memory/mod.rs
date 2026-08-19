@@ -426,12 +426,17 @@ impl InMemoryRtDbClient {
     /// schema (folding in new fields/indexes/tables without touching rows).
     /// Destructive changes — a removed/changed table, field, or index — return
     /// [`ErrorCode::BadRequest`] with the same messages as the live server's
-    /// `ddl.rs::detect_destructive_changes`.
+    /// `ddl.rs::detect_destructive_changes`. The schema is validated first
+    /// ([`SchemaDef::validate`], mirroring the server's `schema.validate()`
+    /// before `detect_destructive_changes`), so an invalid TTL or a
+    /// non-indexable index field fails with [`ErrorCode::SchemaViolation`]
+    /// exactly as the live server 422s.
     ///
     /// Ports `pushSchema` in `ts-client/src/in_memory.ts:512-519`. The Rust
     /// signature takes the typed [`SchemaDef`] directly (no `toSchemaJson`
     /// conversion needed since the builder already produces the wire shape).
     pub fn push_schema(&mut self, schema: &SchemaDef) -> Result<(), RtDbError> {
+        schema.validate()?;
         if let Some(prev) = &self.schema {
             detect_destructive_changes(prev, schema)?;
         }

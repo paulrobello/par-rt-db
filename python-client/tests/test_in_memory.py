@@ -112,6 +112,34 @@ def test_push_schema_rejects_a_destructive_second_push() -> None:
     assert "solo" not in c.to_schema_json().tables  # type: ignore[union-attr]
 
 
+def test_push_schema_rejects_changing_a_search_index_language() -> None:
+    # Server parity (ddl.rs): a language change on an existing search index is
+    # a breaking index change, not an additive edit.
+    c = InMemoryRtDbClient()
+    c.push_schema(_test_schema())
+    flipped = (
+        Schema.builder()
+        .table(
+            "items",
+            lambda tb: (
+                tb.field("name", t.string())
+                .field("status", t.string())
+                .field("order", t.number())
+                .field("note", t.optional(t.string()))
+                .index("by_name", ["name"])
+                .index("by_status", ["status"])
+                .index("by_status_and_order", ["status", "order"])
+                .search_index("search_name", ["name"], language="spanish")
+            ),
+        )
+        .build()
+    )
+    with pytest.raises(RtDbError) as ei:
+        c.push_schema(flipped)
+    assert ei.value.code is ErrorCode.BAD_REQUEST
+    assert "changed language of search index 'search_name'" in ei.value.message
+
+
 def test_push_schema_additively_preserves_docs() -> None:
     c = _new_client()
     c.mutate(

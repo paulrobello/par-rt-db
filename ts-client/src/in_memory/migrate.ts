@@ -77,7 +77,10 @@ function isWideningOf(old: FieldTypeJson, next: FieldTypeJson): boolean {
  *  additive); index kind
  *  (btree vs search) by the presence/absence of `search`. A field-type change is
  *  accepted when it is a safe widening (server `schema::is_widening_of`): a
- *  finite literal-union that grows, or a single literal that becomes a union. */
+ *  finite literal-union that grows, or a single literal that becomes a union.
+ *  Flipping `unique`, attaching/changing a `where` predicate, or changing a
+ *  search index's `language` are all breaking index changes too — rejected with
+ *  the server's messages. */
 export function detectDestructiveChanges(oldSchema: SchemaJson, newSchema: SchemaJson): void {
   for (const [tableName, oldTable] of Object.entries(oldSchema.tables)) {
     const newTable = newSchema.tables[tableName];
@@ -111,6 +114,15 @@ export function detectDestructiveChanges(oldSchema: SchemaJson, newSchema: Schem
       }
       if (JSON.stringify(newIndex.vector ?? null) !== JSON.stringify(oldIndex.vector ?? null)) {
         throw new RtDbError("BAD_REQUEST", `changed vector spec of index '${oldIndex.name}'`);
+      }
+      if (!!newIndex.unique !== !!oldIndex.unique) {
+        throw new RtDbError("BAD_REQUEST", `changed uniqueness of index '${oldIndex.name}'`);
+      }
+      if (JSON.stringify(newIndex.where ?? null) !== JSON.stringify(oldIndex.where ?? null)) {
+        throw new RtDbError("BAD_REQUEST", `changed partial predicate of index '${oldIndex.name}'`);
+      }
+      if ((newIndex.language ?? null) !== (oldIndex.language ?? null)) {
+        throw new RtDbError("BAD_REQUEST", `changed language of search index '${oldIndex.name}'`);
       }
     }
   }

@@ -2022,6 +2022,66 @@ describe("InMemoryRtDbClient — additive schema push", () => {
       .index("by_status_and_order", ["status", "order"]),
   });
 
+  /** items with `by_name` flipped to unique — destructive
+   *  (ddl.rs "changed uniqueness of index"). */
+  const itemsWithUniqueNameIndex = defineSchema({
+    items: defineTable({
+      name: t.string(),
+      status: t.string(),
+      order: t.number(),
+      note: t.optional(t.string()),
+    })
+      .index("by_name", ["name"])
+      .unique()
+      .index("by_status", ["status"])
+      .index("by_status_and_order", ["status", "order"]),
+  });
+
+  /** items with a `where` predicate attached to `by_status` — destructive
+   *  (ddl.rs "changed partial predicate of index"). */
+  const itemsWithWhereOnStatus = defineSchema({
+    items: defineTable({
+      name: t.string(),
+      status: t.string(),
+      order: t.number(),
+      note: t.optional(t.string()),
+    })
+      .index("by_name", ["name"])
+      .index("by_status", ["status"])
+      .where({ op: "eq", field: "status", value: "todo" })
+      .index("by_status_and_order", ["status", "order"]),
+  });
+
+  /** items plus a language-less `by_content` search index — the base for the
+   *  language-flip pair below. */
+  const itemsWithSearch = defineSchema({
+    items: defineTable({
+      name: t.string(),
+      status: t.string(),
+      order: t.number(),
+      note: t.optional(t.string()),
+    })
+      .index("by_name", ["name"])
+      .index("by_status", ["status"])
+      .index("by_status_and_order", ["status", "order"])
+      .searchIndex("by_content", ["name"]),
+  });
+
+  /** items with `by_content`'s language changed to spanish — destructive
+   *  (ddl.rs "changed language of search index"). */
+  const itemsWithSearchSpanish = defineSchema({
+    items: defineTable({
+      name: t.string(),
+      status: t.string(),
+      order: t.number(),
+      note: t.optional(t.string()),
+    })
+      .index("by_name", ["name"])
+      .index("by_status", ["status"])
+      .index("by_status_and_order", ["status", "order"])
+      .searchIndex("by_content", ["name"], "spanish"),
+  });
+
   it("an additive second push preserves existing docs and they remain queryable", async () => {
     const c = new InMemoryRtDbClient();
     c.pushSchema(schema);
@@ -2055,6 +2115,30 @@ describe("InMemoryRtDbClient — additive schema push", () => {
     const c = new InMemoryRtDbClient();
     c.pushSchema(schema);
     expect(() => c.pushSchema(itemsWithChangedFieldType)).toThrow(/changed type of field 'items\./);
+  });
+
+  it("flipping an index to unique is destructive", () => {
+    const c = new InMemoryRtDbClient();
+    c.pushSchema(schema);
+    expect(() => c.pushSchema(itemsWithUniqueNameIndex)).toThrow(
+      /changed uniqueness of index 'by_name'/,
+    );
+  });
+
+  it("attaching a where predicate to an existing index is destructive", () => {
+    const c = new InMemoryRtDbClient();
+    c.pushSchema(schema);
+    expect(() => c.pushSchema(itemsWithWhereOnStatus)).toThrow(
+      /changed partial predicate of index 'by_status'/,
+    );
+  });
+
+  it("changing a search index's language is destructive", () => {
+    const c = new InMemoryRtDbClient();
+    c.pushSchema(itemsWithSearch);
+    expect(() => c.pushSchema(itemsWithSearchSpanish)).toThrow(
+      /changed language of search index 'by_content'/,
+    );
   });
 });
 

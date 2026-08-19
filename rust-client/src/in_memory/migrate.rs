@@ -562,7 +562,118 @@ pub(super) fn detect_destructive_changes(
                     format!("changed vector spec of index '{}'", old_index.name),
                 ));
             }
+            if new_index.unique != old_index.unique {
+                return Err(RtDbError::new(
+                    ErrorCode::BadRequest,
+                    format!("changed uniqueness of index '{}'", old_index.name),
+                ));
+            }
+            if new_index.r#where != old_index.r#where {
+                return Err(RtDbError::new(
+                    ErrorCode::BadRequest,
+                    format!("changed partial predicate of index '{}'", old_index.name),
+                ));
+            }
+            if new_index.language != old_index.language {
+                return Err(RtDbError::new(
+                    ErrorCode::BadRequest,
+                    format!("changed language of search index '{}'", old_index.name),
+                ));
+            }
         }
     }
     Ok(())
+}
+
+/// Push-time schema validation — the TTL and index-field rules of server
+/// `schema::validate` (`schema.rs::validate_indexes` + `validate_ttl`), so an
+/// in-memory `push_schema` rejects with `SCHEMA_VIOLATION` what the live
+/// server 422s: index fields must be declared and indexable, search indexes
+/// must cover text fields, and a TTL must name a numeric field carrying a
+/// single-field, non-unique, non-partial btree index. This is deliberately a
+/// subset — identifier formats, owner/collaborator fields, defaults, and
+/// `onDelete` shapes stay server-side.
+impl SchemaDef {
+    /// Validates TTL and index-field rules (see the impl docs) — called by
+    /// [`InMemoryRtDbClient::push_schema`] before the destructive-change check.
+    pub fn validate(&self) -> Result<(), RtDbError> {
+        for (table_name, table) in &self.tables {
+            for index in table.indexes.iter().flatten() {
+                if index.fields.is_empty() {
+                    return Err(RtDbError::new(
+                        ErrorCode::SchemaViolation,
+                        format!(
+                            "index '{}' on table '{table_name}' has no fields",
+                            index.name
+                        ),
+                    ));
+                }
+                // A vector index's `fields[0]` is a Vector column, which is not
+                // btree-indexable — the server validates vector specs in their
+                // own branch and skips the per-field loop below.
+                if index.vector.is_some() {
+                    continue;
+                }
+                for field_name in &index.fields {
+                    let field_type = table.fields.get(field_name).ok_or_else(|| {
+                        RtDbError::new(
+                            ErrorCode::SchemaViolation,
+                            format!(
+                                "index '{}' on table '{table_name}' references unknown field '{field_name}'",
+                                index.name
+                            ),
+                        )
+                    })?;
+                    let indexed = index_column_type(field_type)?;
+                    if index.search && indexed.pg != PgType::Text {
+                        return Err(RtDbError::new(
+                            ErrorCode::SchemaViolation,
+                            format!(
+                                "search index '{}' on table '{table_name}' has non-text field '{field_name}'",
+                                index.name
+                            ),
+                        ));
+                    }
+                }
+            }
+            if let Some(ttl) = &table.ttl {
+                let field_type = table.fields.get(&ttl.field).ok_or_else(|| {
+                    RtDbError::new(
+                        ErrorCode::SchemaViolation,
+                        format!("ttl.field '{}' is not a declared field", ttl.field),
+                    )
+                })?;
+                if !matches!(field_type, FieldType::Number | FieldType::Int64) {
+                    return Err(RtDbError::new(
+                        ErrorCode::SchemaViolation,
+                        format!("ttl.field '{}' must be a number or bigint field", ttl.field),
+                    ));
+                }
+                let has_ttl_index = table.indexes.iter().flatten().any(|idx| {
+                    !idx.search
+                        && idx.vector.is_none()
+                        && !idx.unique
+                        && idx.r#where.is_none()
+                        && idx.fields.len() == 1
+                        && idx.fields[0] == ttl.field
+                });
+                if !has_ttl_index {
+                    return Err(RtDbError::new(
+                        ErrorCode::SchemaViolation,
+                        format!(
+                            "ttl.field '{}' requires a single-field, non-unique, non-partial btree index on it",
+                            ttl.field
+                        ),
+                    ));
+                }
+                if ttl.default_duration_ms.is_some_and(|d| d <= 0) {
+                    return Err(RtDbError::new(
+                        ErrorCode::SchemaViolation,
+                        "ttl.defaultDurationMs must be greater than 0".to_string(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
 }

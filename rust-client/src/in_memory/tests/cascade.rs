@@ -166,6 +166,7 @@ fn reaper_schema() -> SchemaDef {
             Table::new()
                 .field("kind", FieldType::String)
                 .field("expiresAt", FieldType::Number)
+                .index("by_expiresAt", &["expiresAt"])
                 .ttl("expiresAt", None)
                 .soft_delete(),
         )
