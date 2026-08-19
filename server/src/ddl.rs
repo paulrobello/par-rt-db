@@ -237,9 +237,16 @@ pub async fn push_schema(
     let pg_schema_name = pg_schema(db);
     let mut tx = pool.begin().await?;
 
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(crate::db::EXTENSION_LOCK_KEY)
+        .execute(&mut *tx)
+        .await?;
+
     // Covers databases created before pgvector shipped: ensure the extension is
     // present the first time a vector-index schema is pushed. No-op if already
-    // installed (Task 1 installs it at database creation).
+    // installed (Task 1 installs it at database creation). Serialized by
+    // EXTENSION_LOCK_KEY: concurrent IF NOT EXISTS inserts race on
+    // pg_extension_name_index (see db.rs).
     sqlx::query("CREATE EXTENSION IF NOT EXISTS vector")
         .execute(&mut *tx)
         .await?;

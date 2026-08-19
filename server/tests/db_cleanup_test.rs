@@ -12,8 +12,65 @@ mod common;
 
 use std::time::Duration;
 
-use common::{TestDb, ensure_cleanup_worker, test_state};
+use common::{TestDb, ensure_cleanup_worker, kanban_schema_json, test_state};
 use rtdb_server::db;
+
+/// Regression: `CREATE EXTENSION IF NOT EXISTS` is check-then-insert — two
+/// concurrent `create_database` calls can both see the extension absent and
+/// the loser dies on `pg_extension_name_index` (observed as a recurring CI
+/// failure in `admin_test`'s fresh-db setup). `EXTENSION_LOCK_KEY`
+/// serializes them; this test hammers the concurrent path so a fresh
+/// Postgres (where the extensions start absent) exercises the window.
+#[tokio::test]
+async fn concurrent_database_creation_succeeds() {
+    let state = test_state().await;
+    ensure_cleanup_worker(&state.config.database_url);
+
+    let mut handles = Vec::new();
+    for _ in 0..16 {
+        let pool = state.pool.clone();
+        handles.push(tokio::spawn(async move {
+            let name = format!("t{}", uuid::Uuid::now_v7().simple());
+            db::create_database(&pool, &name).await?;
+            Ok::<_, rtdb_server::error::RtDbError>(TestDb(name))
+        }));
+    }
+    for handle in handles {
+        let _db = handle.await.expect("join").expect("create db");
+    }
+}
+
+/// Same race, `push_schema` side: its extension backfill shares
+/// `EXTENSION_LOCK_KEY`, so concurrent first pushes (each to its own fresh
+/// database) must all succeed.
+#[tokio::test]
+async fn concurrent_schema_push_into_fresh_databases_succeeds() {
+    let state = test_state().await;
+    ensure_cleanup_worker(&state.config.database_url);
+
+    let mut names = Vec::new();
+    for _ in 0..8 {
+        let name = format!("t{}", uuid::Uuid::now_v7().simple());
+        db::create_database(&state.pool, &name)
+            .await
+            .expect("create db");
+        names.push(name);
+    }
+
+    let mut handles = Vec::new();
+    for name in names {
+        let pool = state.pool.clone();
+        handles.push(tokio::spawn(async move {
+            let schema: rtdb_server::schema::SchemaDef =
+                serde_json::from_value(kanban_schema_json()).expect("parse kanban schema fixture");
+            rtdb_server::ddl::push_schema(&pool, &name, schema).await?;
+            Ok::<_, rtdb_server::error::RtDbError>(TestDb(name))
+        }));
+    }
+    for handle in handles {
+        let _db = handle.await.expect("join").expect("push schema");
+    }
+}
 
 /// Dropping a `TestDb` must clean up its database via the dedicated worker
 /// thread (own runtime + pool), even though the test runs on a current-thread

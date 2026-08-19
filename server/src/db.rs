@@ -409,6 +409,15 @@ pub async fn ensure_webhooks_tables(pool: &PgPool) -> Result<(), RtDbError> {
     Ok(())
 }
 
+/// Advisory lock key serializing extension installation. `CREATE EXTENSION IF
+/// NOT EXISTS` is check-then-insert and not atomic under concurrency: two
+/// sessions that both see the extension absent both insert into `pg_extension`,
+/// and the loser fails on `pg_extension_name_index` — observed in CI when
+/// parallel test binaries create databases simultaneously. Shared with
+/// `ddl::push_schema`'s backfill so every pairing (create↔create,
+/// create↔push, push↔push) serializes on the same key.
+pub const EXTENSION_LOCK_KEY: i64 = 727_002;
+
 /// Registers a new tenant database: validates `name`, creates its Postgres schema
 /// and `meta` table, and records it in the `rtdb_auth.databases` registry, all in
 /// one transaction.
@@ -416,6 +425,11 @@ pub async fn create_database(pool: &PgPool, name: &str) -> Result<(), RtDbError>
     validate_db_name(name)?;
 
     let mut tx = pool.begin().await?;
+
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(EXTENSION_LOCK_KEY)
+        .execute(&mut *tx)
+        .await?;
 
     let existing: Option<(String,)> =
         sqlx::query_as("SELECT name FROM rtdb_auth.databases WHERE name = $1")
@@ -434,7 +448,7 @@ pub async fn create_database(pool: &PgPool, name: &str) -> Result<(), RtDbError>
     // Extensions are database-level in Postgres, and every par-rt-db "database" is
     // a schema in the single `rtdb` Postgres database — so this installs `vector`
     // and `pg_trgm` once into `rtdb`, available to all schemas. `IF NOT EXISTS`
-    // makes them idempotent.
+    // makes them idempotent (serialized by EXTENSION_LOCK_KEY above).
     sqlx::query("CREATE EXTENSION IF NOT EXISTS vector")
         .execute(&mut *tx)
         .await?;
