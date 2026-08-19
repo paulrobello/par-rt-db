@@ -316,20 +316,21 @@ public actor RtDbClient {
     /// unordered; rust's HashMap replay order is unspecified — this is stricter).
     private var subscriptionOrder: [String] = []
     private var subCounter = 1
-    private var mutCounter = 1
-    private var schedCounter = 1
-    private var wfCounter = 1
 
     /// A mutate call awaiting its turn (rust `QueuedMutate`): queued while
     /// unauthenticated or re-queued when a send failed mid-session; moved to
-    /// `pendingMutations` once on the wire. The reply mailbox is an unbounded
-    /// AsyncStream — a reply that races the send's return is buffered, never
-    /// lost.
+    /// the family's pending map once on the wire. The reply mailbox is an
+    /// unbounded AsyncStream — a reply that races the send's return is
+    /// buffered, never lost.
     private struct MutationCall: OpCall {
-        let mutId: String
+        let id: String
         let idempotencyKey: String?
         let txn: Transaction
         let continuation: AsyncStream<Result<[JSONValue], RtDbError>>.Continuation
+
+        func message() -> ClientMessage {
+            .mutate(mutId: id, idempotencyKey: idempotencyKey, txn: txn)
+        }
 
         func fail(_ error: RtDbError) {
             continuation.yield(.failure(error))
@@ -337,8 +338,7 @@ public actor RtDbClient {
         }
     }
 
-    private var queuedMutations: [MutationCall] = []
-    private var pendingMutations: [String: MutationCall] = [:]
+    private let mutations = OpFamily<MutationCall>(prefix: "mut-")
 
     /// The typed success payload of a schedule-family reply (rust
     /// `ScheduleOutcome`).
@@ -359,9 +359,13 @@ public actor RtDbClient {
     }
 
     private struct ScheduleCall: OpCall {
-        let scheduleId: String
+        let id: String
         let request: ScheduleRequest
         let continuation: AsyncStream<Result<ScheduleReply, RtDbError>>.Continuation
+
+        func message() -> ClientMessage {
+            RtDbClient.scheduleFrame(scheduleId: id, request: request)
+        }
 
         func fail(_ error: RtDbError) {
             continuation.yield(.failure(error))
@@ -369,8 +373,7 @@ public actor RtDbClient {
         }
     }
 
-    private var queuedSchedules: [ScheduleCall] = []
-    private var pendingSchedules: [String: ScheduleCall] = [:]
+    private let schedules = OpFamily<ScheduleCall>(prefix: "sch-")
 
     /// The typed success payload of a workflow-family reply (rust
     /// `WorkflowOutcome`).
@@ -389,9 +392,13 @@ public actor RtDbClient {
     }
 
     private struct WorkflowCall: OpCall {
-        let workflowId: String
+        let id: String
         let request: WorkflowRequest
         let continuation: AsyncStream<Result<WorkflowReply, RtDbError>>.Continuation
+
+        func message() -> ClientMessage {
+            RtDbClient.workflowFrame(workflowId: id, request: request)
+        }
 
         func fail(_ error: RtDbError) {
             continuation.yield(.failure(error))
@@ -399,8 +406,7 @@ public actor RtDbClient {
         }
     }
 
-    private var queuedWorkflows: [WorkflowCall] = []
-    private var pendingWorkflows: [String: WorkflowCall] = [:]
+    private let workflows = OpFamily<WorkflowCall>(prefix: "wf-")
 
     public init(
         url: String,
@@ -924,37 +930,46 @@ public actor RtDbClient {
     }
 
     private func submitMutation(_ txn: Transaction, idempotencyKey: String?) async throws -> [JSONValue] {
+        try await submitOp(mutations) { id, continuation in
+            MutationCall(id: id, idempotencyKey: idempotencyKey, txn: txn, continuation: continuation)
+        }
+    }
+
+    /// Shared submit for every op family (mutation / schedule / workflow —
+    /// structurally identical in the rust driver, differing only in payload):
+    /// mint the correlation id, register the call as pending BEFORE the send,
+    /// re-queue on a failed send, or queue outright while unauthenticated —
+    /// then park for the reply.
+    private func submitOp<Reply: Sendable, Call: OpCall>(
+        _ family: OpFamily<Call>,
+        makeCall: (String, AsyncStream<Result<Reply, RtDbError>>.Continuation) -> Call
+    ) async throws -> Reply {
         guard !terminal else {
             throw Self.closedError
         }
-        let mutId = "mut-\(mutCounter)"
-        mutCounter += 1
-        let (stream, continuation) = AsyncStream<Result<[JSONValue], RtDbError>>.makeStream(
-            of: Result<[JSONValue], RtDbError>.self, bufferingPolicy: .unbounded
+        let id = family.nextId()
+        let (stream, continuation) = AsyncStream<Result<Reply, RtDbError>>.makeStream(
+            of: Result<Reply, RtDbError>.self, bufferingPolicy: .unbounded
         )
-        let call = MutationCall(
-            mutId: mutId, idempotencyKey: idempotencyKey, txn: txn, continuation: continuation
-        )
+        let call = makeCall(id, continuation)
         if let transport = currentTransport, state == .connected {
             // Registered BEFORE the send: a reply that races the send's return
             // finds its entry and is buffered, never dropped.
-            pendingMutations[mutId] = call
+            family.pending[id] = call
             do {
-                try await transport.send(
-                    Self.frame(.mutate(mutId: mutId, idempotencyKey: idempotencyKey, txn: txn))
-                )
+                try await transport.send(Self.frame(call.message()))
             } catch {
                 // The frame never hit the wire: re-queue for the next session's
                 // flush (rust re-queues on a failed mid-session send). If the
                 // reply somehow raced the failed send, the entry is gone — the
                 // existence check keeps this a no-op.
-                if pendingMutations[mutId] != nil {
-                    pendingMutations.removeValue(forKey: mutId)
-                    queuedMutations.append(call)
+                if family.pending[id] != nil {
+                    family.pending.removeValue(forKey: id)
+                    family.queued.append(call)
                 }
             }
         } else {
-            queuedMutations.append(call)
+            family.queued.append(call)
         }
         return try await Self.park(stream)
     }
@@ -1002,31 +1017,9 @@ public actor RtDbClient {
     }
 
     private func submitSchedule(_ request: ScheduleRequest) async throws -> ScheduleReply {
-        guard !terminal else {
-            throw Self.closedError
+        try await submitOp(schedules) { id, continuation in
+            ScheduleCall(id: id, request: request, continuation: continuation)
         }
-        let scheduleId = "sch-\(schedCounter)"
-        schedCounter += 1
-        let (stream, continuation) = AsyncStream<Result<ScheduleReply, RtDbError>>.makeStream(
-            of: Result<ScheduleReply, RtDbError>.self, bufferingPolicy: .unbounded
-        )
-        let call = ScheduleCall(scheduleId: scheduleId, request: request, continuation: continuation)
-        if let transport = currentTransport, state == .connected {
-            pendingSchedules[scheduleId] = call
-            do {
-                try await transport.send(
-                    Self.frame(Self.scheduleFrame(scheduleId: scheduleId, request: request))
-                )
-            } catch {
-                if pendingSchedules[scheduleId] != nil {
-                    pendingSchedules.removeValue(forKey: scheduleId)
-                    queuedSchedules.append(call)
-                }
-            }
-        } else {
-            queuedSchedules.append(call)
-        }
-        return try await Self.park(stream)
     }
 
     // MARK: Task 14 — workflow ops
@@ -1056,31 +1049,9 @@ public actor RtDbClient {
     }
 
     private func submitWorkflow(_ request: WorkflowRequest) async throws -> WorkflowReply {
-        guard !terminal else {
-            throw Self.closedError
+        try await submitOp(workflows) { id, continuation in
+            WorkflowCall(id: id, request: request, continuation: continuation)
         }
-        let workflowId = "wf-\(wfCounter)"
-        wfCounter += 1
-        let (stream, continuation) = AsyncStream<Result<WorkflowReply, RtDbError>>.makeStream(
-            of: Result<WorkflowReply, RtDbError>.self, bufferingPolicy: .unbounded
-        )
-        let call = WorkflowCall(workflowId: workflowId, request: request, continuation: continuation)
-        if let transport = currentTransport, state == .connected {
-            pendingWorkflows[workflowId] = call
-            do {
-                try await transport.send(
-                    Self.frame(Self.workflowFrame(workflowId: workflowId, request: request))
-                )
-            } catch {
-                if pendingWorkflows[workflowId] != nil {
-                    pendingWorkflows.removeValue(forKey: workflowId)
-                    queuedWorkflows.append(call)
-                }
-            }
-        } else {
-            queuedWorkflows.append(call)
-        }
-        return try await Self.park(stream)
     }
 
     // MARK: Task 14 — session wiring
@@ -1108,74 +1079,27 @@ public actor RtDbClient {
     /// is registered as pending BEFORE its send; on a failed send it stays at
     /// the queue head (order preserved) for the next session.
     private func flushQueuedOps(on transport: any WebSocketTransport) async -> Bool {
-        guard await flushMutations(on: transport) else { return false }
-        guard await flushSchedules(on: transport) else { return false }
-        return await flushWorkflows(on: transport)
+        guard await flushFamily(mutations, on: transport) else { return false }
+        guard await flushFamily(schedules, on: transport) else { return false }
+        return await flushFamily(workflows, on: transport)
     }
 
-    private func flushMutations(on transport: any WebSocketTransport) async -> Bool {
-        while let call = queuedMutations.first {
-            pendingMutations[call.mutId] = call
-            let frame = try? Self.frame(
-                .mutate(mutId: call.mutId, idempotencyKey: call.idempotencyKey, txn: call.txn)
-            )
+    /// Flush one family's queue. Each call is registered as pending BEFORE its
+    /// send; on a failed send it stays at the queue head (order preserved) for
+    /// the next session.
+    private func flushFamily(
+        _ family: OpFamily<some OpCall>, on transport: any WebSocketTransport
+    ) async -> Bool {
+        while let call = family.queued.first {
+            family.pending[call.id] = call
+            let frame = try? Self.frame(call.message())
             guard let frame, await (try? transport.send(frame)) != nil else {
-                unpendMutationIfUnacked(call.mutId)
+                family.unpendIfUnacked(call.id)
                 return false
             }
-            queuedMutations.removeFirst()
+            family.queued.removeFirst()
         }
         return true
-    }
-
-    private func flushSchedules(on transport: any WebSocketTransport) async -> Bool {
-        while let call = queuedSchedules.first {
-            pendingSchedules[call.scheduleId] = call
-            let frame = try? Self.frame(
-                Self.scheduleFrame(scheduleId: call.scheduleId, request: call.request)
-            )
-            guard let frame, await (try? transport.send(frame)) != nil else {
-                unpendScheduleIfUnacked(call.scheduleId)
-                return false
-            }
-            queuedSchedules.removeFirst()
-        }
-        return true
-    }
-
-    private func flushWorkflows(on transport: any WebSocketTransport) async -> Bool {
-        while let call = queuedWorkflows.first {
-            pendingWorkflows[call.workflowId] = call
-            let frame = try? Self.frame(
-                Self.workflowFrame(workflowId: call.workflowId, request: call.request)
-            )
-            guard let frame, await (try? transport.send(frame)) != nil else {
-                unpendWorkflowIfUnacked(call.workflowId)
-                return false
-            }
-            queuedWorkflows.removeFirst()
-        }
-        return true
-    }
-
-    /// Drop a flushed call's pending registration on a failed send — no-op if
-    /// the reply already raced the send's return (the entry is gone).
-    private func unpendMutationIfUnacked(_ mutId: String) {
-        if pendingMutations[mutId] != nil {
-            pendingMutations.removeValue(forKey: mutId)
-        }
-    }
-
-    private func unpendScheduleIfUnacked(_ scheduleId: String) {
-        if pendingSchedules[scheduleId] != nil {
-            pendingSchedules.removeValue(forKey: scheduleId)
-        }
-    }
-
-    private func unpendWorkflowIfUnacked(_ workflowId: String) {
-        if pendingWorkflows[workflowId] != nil {
-            pendingWorkflows.removeValue(forKey: workflowId)
-        }
     }
 
     // swiftlint:disable cyclomatic_complexity function_body_length
@@ -1203,12 +1127,12 @@ public actor RtDbClient {
                 sink.finish()
             }
         case let .mutateOk(mutId, results):
-            if let call = pendingMutations.removeValue(forKey: mutId) {
+            if let call = mutations.pending.removeValue(forKey: mutId) {
                 call.continuation.yield(.success(results))
                 call.continuation.finish()
             }
         case let .mutateErr(mutId, error):
-            if let call = pendingMutations.removeValue(forKey: mutId) {
+            if let call = mutations.pending.removeValue(forKey: mutId) {
                 call.continuation.yield(.failure(error))
                 call.continuation.finish()
             }
@@ -1254,14 +1178,14 @@ public actor RtDbClient {
     // swiftlint:enable cyclomatic_complexity function_body_length
 
     private func replySchedule(_ scheduleId: String, _ result: Result<ScheduleReply, RtDbError>) {
-        if let call = pendingSchedules.removeValue(forKey: scheduleId) {
+        if let call = schedules.pending.removeValue(forKey: scheduleId) {
             call.continuation.yield(result)
             call.continuation.finish()
         }
     }
 
     private func replyWorkflow(_ workflowId: String, _ result: Result<WorkflowReply, RtDbError>) {
-        if let call = pendingWorkflows.removeValue(forKey: workflowId) {
+        if let call = workflows.pending.removeValue(forKey: workflowId) {
             call.continuation.yield(result)
             call.continuation.finish()
         }
@@ -1272,9 +1196,9 @@ public actor RtDbClient {
     /// Queued (never-sent) calls survive for the next session.
     private func rejectInflightOperations(reason: String) {
         let error = RtDbError(code: .internal, message: reason)
-        rejectPending(&pendingMutations, error: error)
-        rejectPending(&pendingSchedules, error: error)
-        rejectPending(&pendingWorkflows, error: error)
+        mutations.rejectPending(error: error)
+        schedules.rejectPending(error: error)
+        workflows.rejectPending(error: error)
     }
 
     /// Reject every op, in-flight AND queued, and finish every subscription
@@ -1282,9 +1206,9 @@ public actor RtDbClient {
     private func rejectAllOperations(reason: String) {
         rejectInflightOperations(reason: reason)
         let error = RtDbError(code: .internal, message: reason)
-        rejectQueued(&queuedMutations, error: error)
-        rejectQueued(&queuedSchedules, error: error)
-        rejectQueued(&queuedWorkflows, error: error)
+        mutations.rejectQueued(error: error)
+        schedules.rejectQueued(error: error)
+        workflows.rejectQueued(error: error)
         for entry in subscriptionsByKey.values {
             for sink in entry.sinks {
                 sink.finish()
@@ -1298,7 +1222,7 @@ public actor RtDbClient {
     /// Test seam (Task 14): queued-but-unsent mutation count, so tests can
     /// deterministically order two queued calls.
     func queuedMutationCountForTesting() -> Int {
-        queuedMutations.count
+        mutations.queued.count
     }
 
     // MARK: Helpers
@@ -1450,27 +1374,65 @@ public actor RtDbClient {
             .listWorkflows(workflowId: workflowId, status: nil)
         }
     }
+}
 
-    /// Reject every pending (sent, unacked) call of one family. Sync, so
-    /// `inout` is legal here.
-    private func rejectPending(_ pending: inout [String: some OpCall], error: RtDbError) {
+/// One op call's shared surface — the three families (mutation, schedule,
+/// workflow) differ only in their reply payload and wire frame; correlation,
+/// frame construction, and rejection are identical.
+private protocol OpCall: Sendable {
+    /// The correlation id the call travels (and is replied to) under.
+    var id: String { get }
+    /// The wire frame this call sends.
+    func message() -> ClientMessage
+    /// The rejection path — payload-free.
+    func fail(_ error: RtDbError)
+}
+
+/// One op family's bookkeeping (rust: the driver's pending + unsent maps, one
+/// pair per op kind): calls queued while unauthenticated, calls on the wire
+/// awaiting their reply, and the correlation-id mint. A class so the shared
+/// submit/flush generics can reach the same actor-confined storage across
+/// `await`s — every access is actor-isolated, so a reply racing a send finds
+/// (or has already consumed) its entry exactly as with the direct maps.
+private final class OpFamily<Call: OpCall> {
+    var queued: [Call] = []
+    var pending: [String: Call] = [:]
+
+    private var counter = 1
+    private let prefix: String
+
+    init(prefix: String) {
+        self.prefix = prefix
+    }
+
+    /// Mint the next correlation id (`mut-1`, `sch-2`, …) in submit order.
+    func nextId() -> String {
+        let id = "\(prefix)\(counter)"
+        counter += 1
+        return id
+    }
+
+    /// Drop a flushed call's pending registration on a failed send — no-op if
+    /// the reply already raced the send's return (the entry is gone).
+    func unpendIfUnacked(_ id: String) {
+        if pending[id] != nil {
+            pending.removeValue(forKey: id)
+        }
+    }
+
+    /// Reject every pending (sent, unacked) call of this family.
+    func rejectPending(error: RtDbError) {
         for call in pending.values {
             call.fail(error)
         }
         pending.removeAll()
     }
 
-    /// Reject every queued (never-sent) call of one family.
-    private func rejectQueued(_ queued: inout [some OpCall], error: RtDbError) {
+    /// Reject every queued (never-sent) call of this family.
+    func rejectQueued(error: RtDbError) {
         for call in queued {
             call.fail(error)
         }
         queued.removeAll()
     }
-}
-
-/// One op call's rejection path — the three families differ only in their
-/// reply payload, and rejection is payload-free.
-private protocol OpCall: Sendable {
-    func fail(_ error: RtDbError)
 }
