@@ -3,8 +3,9 @@
 Swift client for [par-rt-db](../README.md): the fifth implementation of the wire
 contract (after the server, ts-client, rust-client, and python-client). One
 UI-free core package (`ParRtDbClient` — wire types, query/mutation/schema DSLs,
-one-shot HTTP client, reactive WebSocket client) plus a thin SwiftUI package
-(`ParRtDbUI` — an `@Observable LiveQuery` wrapper). Design and scope:
+one-shot HTTP client, admin client + migrate DSL, reactive WebSocket client)
+plus a thin SwiftUI package (`ParRtDbUI` — an `@Observable LiveQuery` wrapper).
+Design and scope:
 [docs/superpowers/specs/2026-08-18-swift-client-design.md](../docs/superpowers/specs/2026-08-18-swift-client-design.md).
 
 ## Requirements
@@ -286,6 +287,46 @@ let meta: JSONValue = try await http.getFileMetadata(id) // {id, sha256, size, c
 try await http.deleteFile(id)                            // idempotent; revokes the public URL
 ```
 
+## Admin client
+
+`RtDbAdminClient` (an actor, like `RtDbHttpClient`) keys the whole `/admin/*`
+control plane with the instance admin key — the Swift mirror of the rust
+client's admin surface: database lifecycle (create/delete/clone/export/
+import), the schema plane (push/preview/get/history/restore), declarative
+migrations, tokens + allowlist + admins, metrics/hot-config/op-feed/audit/
+sessions/merge-users, owner-bypass admin query/mutate, explain + slow
+queries, backups, webhooks + deliveries, and the admin views of workflows,
+schedules, and file storage.
+
+```swift
+let admin = RtDbAdminClient(url: "https://rtdb.example.com", adminKey: adminKey)
+
+try await admin.createDb("myapp")
+try await admin.pushSchema(db: "myapp", schema: schema)
+
+// Declarative migration: preview first, then apply.
+let migration = Migration()
+    .renameField("tasks", from: "done", to: "isDone")
+    .setDefault("tasks", field: "priority", value: .int(0))
+let directives = migration.build()
+let preview = try await admin.migrateSchema(db: "myapp", directives: directives, dryRun: true)
+if preview.schema.tables["tasks"] != nil {   // dry-run derives the shape, commits nothing
+    _ = try await admin.migrateSchema(db: "myapp", directives: directives, dryRun: false)
+}
+
+let metrics = try await admin.metrics()            // counters, gauges, latency percentiles
+let tokens = try await admin.listTokens("myapp")   // minted machine tokens
+```
+
+The `Migration` builder queues every directive kind — `renameField`,
+`renameTable`, `changeType` (with a `Cast` + optional substitution default),
+`dropField`, `dropTable`, `dropIndex`, `setDefault`, and `evalExpr` in both
+the legacy raw-SQL form and the typed `ValueExpr` grammar (ENH-020 — field
+reads, literals, concat/arithmetic, `coalesce`, text ops, closed casts,
+`now`, and `case`/`when` branches; no raw-SQL escape). `build()` yields the
+directives for `migrateSchema`; `buildRequest()` wraps them with the dry-run
+flag.
+
 ## Error handling
 
 Every failure is the standard `RtDbError` envelope — `{code, message}` (plus
@@ -314,12 +355,14 @@ let result = try await retryOnPrecondition {
 
 ## Testing
 
-- `swift test` from `swift-client/` — 265 tests in 20 suites (Swift Testing
+- `swift test` from `swift-client/` — 348 tests in 23 suites (Swift Testing
   framework): wire-type round-trips, DSL builder shapes, URLProtocol-mocked
-  HTTP tests, fake-transport WS tests, and `LiveQuery` main-actor tests.
+  HTTP + admin tests, fake-transport WS tests, and `LiveQuery` main-actor
+  tests.
 - The wire layer runs the shared [`wire-corpus/wire-corpus.json`](../wire-corpus/wire-corpus.json)
-  parity corpus (ARC-008): every message/user/schedule/query section must
-  round-trip value-identically, and every `rejects_*` section must be rejected.
+  parity corpus (ARC-008): every message/user/schedule/query/migrate section
+  must round-trip value-identically, and every `rejects_*` section must be
+  rejected.
 - Live-server integration tests ship in the suite (`LiveIntegrationTests`):
   `httpPushQueryMutateRoundTrip` (schema push, inserts, ordered scan, count
   terminal, blob upload/serve round trip, error envelope against a real
@@ -346,7 +389,8 @@ let result = try await retryOnPrecondition {
 | Presence (ENH-015) — `presence(room:state:)` / `updatePresence(room:state:ttlMs:)` / `leavePresence(room:)`, `PresenceSnapshot` fan-out, reconnect replay of joined rooms | ✅ |
 | Optimistic updates — `RtDbClientConfig.optimisticUpdates` (default off), overlay on mutate, reconcile on `queryUpdate`, rollback on `mutateErr`/reject/close | ✅ |
 | `ParRtDbUI` — `@Observable LiveQuery<T>` | ✅ |
-| Admin client + migrate DSL | Deferred — gap card: "Swift client: admin client + migrate DSL" (dashboard + `rtdb` CLI cover ops today) |
+| Admin client — the full `/admin/*` control plane (db CRUD/clone/export/import, schema push/preview/get/history/restore, tokens, allowlist, admins, metrics, hot config, op feed, audit, sessions, merge-users, owner-bypass query/mutate, explain, slow queries, backups, webhooks + deliveries, admin workflow/schedule/file views) | ✅ |
+| Migrate DSL — `Migration` builder for every directive kind (incl. the typed `ValueExpr` evalExpr path), `Directive` wire family pinned by the corpus | ✅ |
 | In-memory engine + semantics/golden corpus runner | Deferred — gap card: "Swift client: in-memory engine + semantics/golden corpus runner" |
 | OAuth login-flow helpers | Not in v1 (spec decision — the `getToken` hook is the integration seam) |
 

@@ -22,10 +22,11 @@ import Testing
 //
 // Sections covered: client_messages (30), server_messages (30),
 // authed_users (4), schedule_whens (3), schedule_infos (8), queries (13),
-// the five rejects_* sections (6 total), and protocol_constants.max_steps.
-// The admin-plane migrate sections are intentionally not covered (the
-// swift client has no admin surface yet); query_results / error_envelopes /
-// db_stats belong to their owning tasks' types.
+// the admin-plane migrate sections — migrate_requests (3) and
+// migrate_results (2), through MigrateRequest/MigrateResult — the five
+// rejects_* sections (6 total), and protocol_constants.max_steps.
+// query_results / error_envelopes / db_stats belong to their owning tasks'
+// types.
 //
 // NOTE: the generic helpers below use Issue.record rather than #expect —
 // the expectation macro's autoclosure thunk inside a generic function trips
@@ -189,6 +190,20 @@ struct WireCorpusTests {
     /// acceptance net.
     @Test func queriesRoundTrip() throws {
         try corpusRoundTrip(Query.self, "queries", WireCorpus())
+    }
+
+    /// Admin-plane migrate request bodies — the `Directive` family (op tags,
+    /// the `where` alias, `changeType.default`'s plain-null Option, and the
+    /// untagged legacy-string vs typed-ValueExpr `expr`/`where` sources).
+    @Test func migrateRequestsRoundTrip() throws {
+        try corpusRoundTrip(MigrateRequest.self, "migrate_requests", WireCorpus())
+    }
+
+    /// Admin-plane migrate responses — `MigrateResult` with the embedded
+    /// post-migration `SchemaDef` and the per-directive reports (whose
+    /// `castFailures`/`sampleChanges` are omit-when-empty on the wire).
+    @Test func migrateResultsRoundTrip() throws {
+        try corpusRoundTrip(MigrateResult.self, "migrate_results", WireCorpus())
     }
 
     // MARK: - Reject sections
