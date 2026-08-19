@@ -162,6 +162,18 @@ describe("RtDbAdminClient — new endpoints", () => {
     expect(init.method).toBe("POST");
   });
 
+  it("throws RtDbError INTERNAL when a non-204 2xx body is not valid JSON", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response("not-json", { status: 200 }));
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+
+    await expect(admin.listBackups()).rejects.toBeInstanceOf(RtDbError);
+    await expect(admin.listBackups()).rejects.toMatchObject({
+      name: "RtDbError",
+      code: "INTERNAL",
+      message: "admin request to /admin/backups returned 2xx with no JSON object body",
+    });
+  });
+
   it("adminsList GETs /admin/admins and unwraps {admins}", async () => {
     const fetchMock = vi
       .fn()

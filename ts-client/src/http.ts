@@ -243,11 +243,13 @@ export class RtDbHttpClient {
     if (contentType) {
       headers["content-type"] = contentType;
     }
-    const response = await this.fetchImpl(
-      `${this.url}/api/storage/${encodeURIComponent(this.db)}`,
-      { method: "POST", headers, body: body as BodyInit },
-    );
-    return (await this.parse(response)) as UploadResult;
+    const path = `/api/storage/${encodeURIComponent(this.db)}`;
+    const response = await this.fetchImpl(`${this.url}${path}`, {
+      method: "POST",
+      headers,
+      body: body as BodyInit,
+    });
+    return (await this.parse(response, path)) as UploadResult;
   }
 
   async deleteFile(id: string): Promise<void> {
@@ -293,7 +295,7 @@ export class RtDbHttpClient {
       },
       body: JSON.stringify(payload),
     });
-    return this.parse(response);
+    return this.parse(response, path);
   }
 
   private async get(path: string, bearer: string): Promise<unknown> {
@@ -303,7 +305,7 @@ export class RtDbHttpClient {
         Authorization: `Bearer ${bearer}`,
       },
     });
-    return this.parse(response);
+    return this.parse(response, path);
   }
 
   /** Throws on a non-2xx `response` (envelope-aware); resolves nothing on success. */
@@ -319,13 +321,19 @@ export class RtDbHttpClient {
   }
 
   /** Parses `response.json()`, throwing an envelope-aware error on non-2xx. */
-  private async parse(response: Response): Promise<unknown> {
+  private async parse(response: Response, path: string): Promise<unknown> {
     const parsed: unknown = await response.json().catch(() => null);
     if (!response.ok) {
       if (RtDbError.isEnvelope(parsed)) {
         throw RtDbError.fromEnvelope(parsed);
       }
       throw new RtDbError("INTERNAL", `request failed with status ${response.status}`);
+    }
+    // A 2xx must carry a JSON object body. Returning null here (empty body,
+    // HTML gateway page, invalid JSON) TypeErrors downstream when callers
+    // destructure `.result` and friends instead of surfacing an RtDbError.
+    if (parsed === null || typeof parsed !== "object") {
+      throw new RtDbError("INTERNAL", `${path} returned 2xx with no JSON object body`);
     }
     return parsed;
   }

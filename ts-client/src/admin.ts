@@ -1257,6 +1257,20 @@ export class RtDbAdminClient {
         response.status,
       );
     }
+    // 202 (backupNow) and 204 (logout, backup delete) legitimately carry no
+    // body — callers discard it. Any other 2xx must carry a JSON object:
+    // returning null here (empty body, HTML gateway page, invalid JSON)
+    // TypeErrors downstream when callers destructure fields instead of
+    // surfacing an RtDbError.
+    const bodylessOk = response.status === 202 || response.status === 204;
+    if (!bodylessOk && (parsed === null || typeof parsed !== "object")) {
+      throw new RtDbError(
+        "INTERNAL",
+        `admin request to ${path} returned 2xx with no JSON object body`,
+        undefined,
+        response.status,
+      );
+    }
     return parsed;
   }
 }

@@ -244,6 +244,43 @@ describe("RtDbHttpClient", () => {
     await expect(client.mutate(mutation().build())).rejects.toBeInstanceOf(RtDbError);
   });
 
+  it("throws RtDbError INTERNAL when a 2xx body is not valid JSON", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response("not-json", { status: 200 }));
+    const client = new RtDbHttpClient({
+      url: "http://h:8300",
+      db: "kanban",
+      token: "tok",
+      fetch: fetchMock,
+    });
+    const q: RtQuery<unknown> = { json: { table: "items" } };
+
+    await expect(client.query(q)).rejects.toBeInstanceOf(RtDbError);
+    await expect(client.query(q)).rejects.toMatchObject({
+      name: "RtDbError",
+      code: "INTERNAL",
+      message: "/api/query returned 2xx with no JSON object body",
+    });
+  });
+
+  it("throws RtDbError INTERNAL when a 2xx body is empty or literal JSON null", async () => {
+    for (const body of ["", "null"]) {
+      const fetchMock = vi.fn().mockResolvedValue(new Response(body, { status: 200 }));
+      const client = new RtDbHttpClient({
+        url: "http://h:8300",
+        db: "kanban",
+        token: "tok",
+        fetch: fetchMock,
+      });
+      const q: RtQuery<unknown> = { json: { table: "items" } };
+
+      await expect(client.query(q)).rejects.toMatchObject({
+        name: "RtDbError",
+        code: "INTERNAL",
+        message: "/api/query returned 2xx with no JSON object body",
+      });
+    }
+  });
+
   it("validateSessionToken GETs /auth/validate with the presented bearer and returns the user", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       jsonResponse({
