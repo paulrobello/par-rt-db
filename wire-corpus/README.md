@@ -1,8 +1,7 @@
 # wire-corpus — shared parity fixtures
 
-This directory holds the fixture data that keeps the server and the three client
-in-memory engines (`ts-client`, `rust-client`, `python-client`) honest against
-each other. Two layers live here:
+This directory holds the fixture data that keeps the server and the client
+implementations honest against each other. Three artifacts live here:
 
 - [`golden-vector.json`](golden-vector.json) — the **wire/behavior parity
   vector** for the query DSL over one shared seeded dataset (added by
@@ -13,9 +12,21 @@ each other. Two layers live here:
   expected result), covering behavior the golden vector does not — transactions
   with per-step results, write-then-read visibility, defaults, soft delete, TTL,
   cursors, and error codes.
+- [`wire-corpus.json`](wire-corpus.json) — the **wire-shape parity corpus**
+  (ARC-008): client/server messages, authed users, schedule whens/infos, and
+  queries that every wire implementation must encode/decode value-identically —
+  and the same unknown fields must be rejected. Run by the server and all four
+  clients (ts/rust/python/swift), so a drifted wire type fails whichever
+  package drifted.
 
-The server is the source of truth for every expected value in both layers. A
-divergence between any client engine and these fixtures is a bug in the client
+**Runner scope:** the server and the three client in-memory engines
+(`ts-client`, `rust-client`, `python-client`) execute `golden-vector.json` and
+`semantics/`; `swift-client` runs `wire-corpus.json` only — its semantics and
+golden-vector runners wait on its in-memory engine (gap card: "Swift client:
+in-memory engine + semantics/golden corpus runner").
+
+The server is the source of truth for every expected value in both behavioral
+layers. A divergence between any client engine and these fixtures is a bug in the client
 (or, if the server moved, a stale fixture — fix the fixture in the same change).
 
 ## Table of contents

@@ -3,6 +3,10 @@ name: CI
 # ARC-003: gate every change. `make checkall` is the single source of truth for
 # the project's definition-of-done (fmt-check + clippy -D warnings + typecheck +
 # tests across server, ts-client, rust-client, python-client, dashboard, cli).
+# The Swift client's gate stays off the ubuntu image — swiftformat/swiftlint
+# are brew-only there (recent ubuntu images may carry a Swift toolchain, but
+# the lint pair is the decisive gap). Its Makefile lines are Darwin-guarded
+# (skipped loudly here) and gated by the macOS `swift` job below instead.
 on:
   push:
   pull_request:
@@ -139,3 +143,24 @@ jobs:
       # rust-client/Cargo.toml make the per-test gating declarative.
       - name: rust-client feature-combination gate (ARC-110)
         run: make rust-client-check-features
+
+  # --- Swift client (macOS runner) --------------------------------------
+  # `swift build`/`swift test` need the Swift 6 toolchain, which ships with the
+  # Xcode on macos-latest; swiftformat/swiftlint come from Homebrew (the runner
+  # image usually carries both — `brew install` is a fast no-op when it does).
+  # Same pinned checkout ref as the ubuntu job (SEC-138 discipline: no
+  # floating tags).
+  swift:
+    name: make swift-client-checkall
+    runs-on: macos-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4.2.2
+
+      - name: Install swiftformat & swiftlint
+        run: brew install swiftformat swiftlint
+
+      - name: Run make swift-client-checkall
+        run: make swift-client-checkall

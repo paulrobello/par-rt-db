@@ -1,0 +1,11 @@
+included:
+  - Sources
+  - Tests
+line_length:
+  warning: 120
+identifier_name:
+  min_length: 2
+  excluded:
+    - k # HybridSearchQuery.k — the wire field name (the RRF constant), not style
+type_body_length: 1100 # WsClientTests.swift + WsClient.swift accumulate Tasks 12+13+14 suites/surfaces (+ fix-round tests) in one file per the task layout
+file_length: 1800 # WsClientTests.swift accumulates Tasks 12+13+14 suites (+ fix-round tests) in one file per the task layout

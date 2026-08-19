@@ -69,7 +69,7 @@ Related documentation: [`CHANGELOG.md`](CHANGELOG.md), [`DESIGN.md`](DESIGN.md),
 - **Two transports, one vocabulary**: mutations route through the same committer path over WebSocket (`/sync`) or one-shot HTTP, so subscriptions fire regardless of which transport wrote
 - **Many databases per instance**: one generic server hosts many named databases for every app
 - **Typed schemas**: pushed schemas compile to additive Postgres DDL — one typed column per indexed field plus the `doc` jsonb body
-- **First-class SDKs**: TypeScript (with React bindings), Rust, and Python clients that mirror the wire contract directly, plus the `rtdb` CLI and an operator dashboard
+- **First-class SDKs**: TypeScript (with React bindings), Rust, Python, and Swift (iOS/macOS) clients that mirror the wire contract directly, plus the `rtdb` CLI and an operator dashboard
 
 ### Advanced Features
 - **Full-text search**: websearch-syntax `search` ranked by `ts_rank` with optional snippets, plus a `trgm` mode for substring/autocomplete matching
@@ -84,7 +84,7 @@ Related documentation: [`CHANGELOG.md`](CHANGELOG.md), [`DESIGN.md`](DESIGN.md),
 ### Technical Excellence
 - **Single serialized committer per database**: all writes flow through one committer task per database and reads run under READ COMMITTED — realtime correctness without distributed coordination
 - **Rust on axum/tokio with Postgres 17 storage**: graceful shutdown waits for in-flight requests and open WebSockets before exiting
-- **One wire contract, four implementations**: the server and the ts/rust/python clients stay byte-identical, enforced by a shared semantics corpus ([`wire-corpus/`](wire-corpus/README.md))
+- **One wire contract, five implementations**: the server and the ts/rust/python clients stay byte-identical, enforced by a shared semantics corpus ([`wire-corpus/`](wire-corpus/README.md)); the Swift client mirrors the same wire types, pinned by the wire-parity corpus
 - **Security defaults**: constant-time key comparison, generic client-facing 500 messages (detail only in logs), typed `confirm` guards on destructive operations, path-traversal-guarded downloads
 
 ## Packages
@@ -95,10 +95,11 @@ Related documentation: [`CHANGELOG.md`](CHANGELOG.md), [`DESIGN.md`](DESIGN.md),
 | **TypeScript client** | [`ts-client/`](ts-client) | TS (`@par-rt-db/client`, bun) | Browser/Node/React Native SDK + React bindings + in-memory test harness |
 | **Rust client** | [`rust-client/`](rust-client) | Rust (`par-rt-db-client`) | Rust SDK: http + reactive ws + admin + `.filter()`/`.search()`/`.vector_search()` builders |
 | **Python client** | [`python-client/`](python-client) | Python (`par-rt-db`, uv) | Python SDK: wire + schema/mutation/query DSL + sync HTTP/admin/storage + reactive WS |
+| **Swift client** | [`swift-client/`](swift-client) | Swift 6 (`ParRtDbClient`/`ParRtDbUI`, SPM) | iOS 17+/macOS 14 SDK: wire + query/mutation/schema DSL + HTTP + reactive WS + SwiftUI `LiveQuery` (Darwin only) |
 | **Dashboard** | [`dashboard/`](dashboard) | Vite + React 19 + TS (bun) | Operator console SPA served same-origin at `RTDB_STATIC_DIR` |
 | **`rtdb` CLI** | [`cli/`](cli) | Rust (`rtdb` binary, cargo) | Operator/CI wrapper around `par-rt-db-client`: list/create dbs, push schema, query/mutate, mint/revoke tokens |
 
-The server is the source of truth; the three SDKs (ts/rust/python) each mirror
+The server is the source of truth; the four SDKs (ts/rust/python/swift) each mirror
 its wire contract directly, the CLI wraps `rust-client`, and the dashboard SPA
 consumes `ts-client`. See [`FEATURE_MATRIX.md`](FEATURE_MATRIX.md) for the
 Convex-parity contract and [`CLAUDE.md`](CLAUDE.md) for contributor guidance.
@@ -151,7 +152,7 @@ committer (blobs don't touch document tables). See
 
 ## Prerequisites for dev
 * See [CONTRIBUTING's development setup](CONTRIBUTING.md#development-setup) for the full tool list and first-time setup
-* A GNU-compatible `make` — every target spans all six packages; first-time installs are `make ts-client-install`, `make dashboard-install`, and `make python-client-install` (see [Make targets](#make-targets))
+* A GNU-compatible `make` — every target spans all seven packages (swift-client's lines are Darwin-guarded and skip loudly on Linux); first-time installs are `make ts-client-install`, `make dashboard-install`, and `make python-client-install` (see [Make targets](#make-targets))
 
 ## Quickstart
 
@@ -840,8 +841,11 @@ Rust and Python reactive clients mirror them as `presence` / `update_presence` /
 
 ## Make targets
 
-Each `make` target spans **all six packages** (server, ts-client, rust-client,
-python-client, dashboard, cli). The composition is summarized below; see the
+Each `make` target spans **all seven packages** (server, ts-client, rust-client,
+python-client, swift-client, dashboard, cli). The swift-client lines in every
+sweep are Darwin-guarded — on Linux they print `Skipping swift-client (non-Darwin
+host)` and the macOS CI job runs `make swift-client-checkall` instead. The
+composition is summarized below; see the
 [`Makefile`](Makefile) for the canonical commands.
 
 ### First-time install (per package)
@@ -943,12 +947,13 @@ that ultimately terminates a connection that never closes on its own.
 
 ## Clients
 
-par-rt-db ships three client SDKs that each mirror the server's wire contract,
+par-rt-db ships four client SDKs that each mirror the server's wire contract,
 plus an operator SPA and a CLI built on top of them:
 
 - [`ts-client/`](ts-client/README.md) — `@par-rt-db/client` (browser/Node/React Native): schema builder, reactive WebSocket client, React bindings, HTTP/admin clients, in-memory test harness.
 - [`rust-client/`](rust-client/README.md) — `par-rt-db-client` (Rust): http + reactive ws + admin, `.filter()`/`.search()`/`.vector_search()` builders.
 - [`python-client/`](python-client/README.md) — `par-rt-db` (Python): wire contract + schema/mutation/query DSL + sync HTTP/admin/storage + reactive WS.
+- [`swift-client/`](swift-client/README.md) — `ParRtDbClient`/`ParRtDbUI` (Swift 6, iOS 17+/macOS 14): wire + query/mutation/schema DSL + HTTP + reactive WS + SwiftUI `LiveQuery`; admin/presence/optimistic/in-memory-engine surfaces deferred (see its README's coverage table).
 - [`dashboard/`](dashboard/README.md) — the operator console SPA (admin/operator UI served same-origin at `RTDB_STATIC_DIR`; consumes `ts-client`).
 - [`cli/`](cli/README.md) — `rtdb` operator/CI binary (wraps `par-rt-db-client`).
 
@@ -962,7 +967,7 @@ plus an operator SPA and a CLI built on top of them:
 * Q: Can I use it over plain HTTP?
   * A: Yes — one-shot `POST /api/query` / `POST /api/mutate` cover reads and writes. The WebSocket (`/sync`) is only needed for live subscriptions and presence.
 * Q: Which languages have client SDKs?
-  * A: TypeScript (`@par-rt-db/client`, with React bindings), Rust (`par-rt-db-client`), and Python (`par-rt-db`), plus the `rtdb` CLI and the operator dashboard.
+  * A: TypeScript (`@par-rt-db/client`, with React bindings), Rust (`par-rt-db-client`), Python (`par-rt-db`), and Swift (`ParRtDbClient`, iOS 17+/macOS 14), plus the `rtdb` CLI and the operator dashboard.
 * Q: Is auth required?
   * A: Machine tokens are the baseline. Each of the six OAuth providers is independently optional (blank env ⇒ its routes return 503), and anonymous access is opt-in (off by default).
 * Q: Can I run multiple replicas behind a load balancer?

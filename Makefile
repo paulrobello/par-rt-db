@@ -8,12 +8,23 @@ DEPLOY_PATH = /docker/par-rt-db
 # the commit being deployed, without touching docker-host's .env.
 DEPLOY_COMMIT := $(shell git rev-parse --short HEAD)
 
+# swift-client needs the Swift 6 toolchain; this repo's gate only carries one
+# on Darwin (the ubuntu CI image has no Swift). Every swift line in the
+# aggregate sweeps is guarded by this test: it runs on the Mac (and the
+# macos-latest CI job), and echoes a loud skip on Linux so the ubuntu gate
+# stays green without silently dropping the package.
+SWIFT_OS := $(shell uname -s)
+SWIFT_SKIP := @echo "Skipping swift-client (non-Darwin host)"
+SWIFT_IF_DARWIN = $(if $(filter Darwin,$(SWIFT_OS)),cd swift-client && $(1),$(SWIFT_SKIP))
+
 .PHONY: build test lint fmt fmt-check typecheck checkall dev-db-up dev-db-down dev-db-clean \
 	pre-commit pre-commit-update ts-client-build ts-client-install dashboard-install \
 	dashboard-test \
 	python-client-install python-client-test python-client-lint python-client-fmt \
 	python-client-typecheck python-client-checkall rust-client-check-features rtdb-cli deploy \
-	env-drift-check cli-docs cli-docs-check
+	env-drift-check cli-docs cli-docs-check \
+	swift-client-build swift-client-test swift-client-lint swift-client-fmt \
+	swift-client-fmt-check swift-client-typecheck swift-client-checkall
 
 # The dashboard's typecheck/build resolve `@par-rt-db/client` from ts-client's
 # gitignored `dist/` (workspace link + exports.types). Build it first so the
@@ -26,6 +37,7 @@ build: ts-client-build
 	cd rust-client && cargo build --all-features
 	cd cli && cargo build --all-features
 	cd dashboard && bun run build
+	$(call SWIFT_IF_DARWIN,swift build)
 
 fmt:
 	cd server && cargo fmt --all
@@ -34,6 +46,7 @@ fmt:
 	cd cli && cargo fmt --all
 	cd dashboard && bun run fmt
 	cd python-client && uv run ruff format .
+	$(call SWIFT_IF_DARWIN,swiftformat .)
 
 fmt-check:
 	cd server && cargo fmt --all -- --check
@@ -42,6 +55,7 @@ fmt-check:
 	cd cli && cargo fmt --all -- --check
 	cd dashboard && bun run fmt-check
 	cd python-client && uv run ruff format --check .
+	$(call SWIFT_IF_DARWIN,swiftformat --lint .)
 
 lint:
 	cd server && cargo clippy --all-targets --all-features -- -D warnings
@@ -50,6 +64,7 @@ lint:
 	cd cli && cargo clippy --all-targets --all-features -- -D warnings
 	cd dashboard && bun run lint
 	cd python-client && uv run ruff check .
+	$(call SWIFT_IF_DARWIN,swiftlint --strict)
 
 typecheck: ts-client-build
 	cd server && cargo check --all-targets
@@ -58,6 +73,7 @@ typecheck: ts-client-build
 	cd cli && cargo check --all-targets --all-features
 	cd dashboard && bun run typecheck
 	cd python-client && uv run pyright
+	$(call SWIFT_IF_DARWIN,swift build)
 
 dev-db-up:
 	$(COMPOSE_DEV) up -d --wait
@@ -78,6 +94,7 @@ test: dev-db-up
 	cd cli && cargo test --all-features
 	cd dashboard && bun run test
 	cd python-client && uv run pytest -q
+	$(call SWIFT_IF_DARWIN,swift test)
 
 ts-client-install:
 	cd ts-client && bun install
@@ -108,6 +125,32 @@ python-client-typecheck:
 	cd python-client && uv run pyright
 
 python-client-checkall: python-client-fmt python-client-lint python-client-typecheck python-client-test
+
+# Darwin-guarded (see SWIFT_IF_DARWIN at the top): `swift build` doubles as
+# typecheck — the Swift compiler has no separate check-only surface in SPM.
+swift-client-build:
+	$(call SWIFT_IF_DARWIN,swift build)
+
+swift-client-test:
+	$(call SWIFT_IF_DARWIN,swift test)
+
+swift-client-lint:
+	$(call SWIFT_IF_DARWIN,swiftlint --strict)
+
+swift-client-fmt:
+	$(call SWIFT_IF_DARWIN,swiftformat .)
+
+# Check-only twin of swift-client-fmt: the gate fails on unformatted Swift
+# instead of silently applying the format. Must run before the applying fmt in
+# swift-client-checkall — a check after the apply could never fail — matching
+# the root checkall, which carries fmt-check with no apply step at all.
+swift-client-fmt-check:
+	$(call SWIFT_IF_DARWIN,swiftformat --lint .)
+
+swift-client-typecheck:
+	$(call SWIFT_IF_DARWIN,swift build)
+
+swift-client-checkall: swift-client-fmt-check swift-client-fmt swift-client-lint swift-client-typecheck swift-client-test
 
 # ARC-110: verify the rust-client library AND its test targets compile under
 # every meaningful feature combination, not only --all-features. The [[test]]
