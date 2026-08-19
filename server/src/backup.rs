@@ -182,14 +182,30 @@ pub(crate) fn restore_target_name(name: &str) -> String {
 }
 
 /// Builds the dump filename `<dir>/rtdb-<UTC stamp>.dump` for the given
-/// timestamp, creating `dir` if needed.
+/// timestamp, creating `dir` if needed. The stamp has second resolution, so two
+/// backups inside the same second (two manual `POST /admin/backup` triggers)
+/// would silently overwrite one dump file; the stamp advances until the name is
+/// free. The grammar is unchanged — listing, validation, and restore-target
+/// naming are unaffected.
 async fn backup_path(dir: &str, ms: i64) -> Result<PathBuf, RtDbError> {
     tokio::fs::create_dir_all(dir).await.map_err(|e| {
         tracing::error!(error = %e, "failed to create backup dir");
         RtDbError::internal("failed to create backup dir; see server logs")
     })?;
+    let mut stamp_ms = ms;
     let mut path = PathBuf::from(dir);
-    path.push(format!("rtdb-{}.dump", format_timestamp_utc(ms)));
+    path.push(format!("rtdb-{}.dump", format_timestamp_utc(stamp_ms)));
+    // Bounded: 60 colliding future-stamped files cannot occur in practice (the
+    // stamp starts at `now`); on exhaustion the last path is returned and the
+    // write overwrites, which is the pre-collision-guard behavior.
+    for _ in 0..60 {
+        if !tokio::fs::try_exists(&path).await.unwrap_or(false) {
+            return Ok(path);
+        }
+        stamp_ms += 1000;
+        path = PathBuf::from(dir);
+        path.push(format!("rtdb-{}.dump", format_timestamp_utc(stamp_ms)));
+    }
     Ok(path)
 }
 
@@ -278,10 +294,11 @@ fn apply_pg_env(cmd: &mut tokio::process::Command, pg: &PgEnv, db_override: Opti
     }
 }
 
-/// `dropdb <target>` — used to clean up a half-populated restore target so a
-/// retry starts clean. Best-effort: failures are logged; the caller maps nothing
-/// because a leftover target is not fatal (the next `createdb` will surface the
-/// conflict).
+/// `dropdb <target>` — cleans up a half-populated restore target after a FAILED
+/// `pg_restore`, and pre-drops an existing target at the start of a retry so the
+/// restore is idempotent (drop-and-recreate). Best-effort: failures are logged;
+/// the caller maps nothing because a leftover target is not fatal (the next
+/// `createdb` will surface the conflict with the manual recovery step).
 async fn drop_restore_target(pg: &PgEnv, target: &str) -> Result<(), RtDbError> {
     let mut cmd = tokio::process::Command::new("dropdb");
     apply_pg_env(&mut cmd, pg, pg.database.as_deref());
@@ -323,6 +340,14 @@ pub(crate) async fn restore_to_new_db(
     }
     let pg = parse_pg_env(database_url)?;
 
+    // Pre-drop an existing target so retrying the same dump is idempotent
+    // (drop-and-recreate) instead of dead-ending on a 409. The target is always
+    // `rtdb_restored_<stamp>` derived from the dump name — never the live DB —
+    // so this stays inside the restore-safety invariant. Best-effort: if the
+    // drop fails (e.g. an operator still holds a connection to the target),
+    // `createdb` below surfaces the conflict with the manual recovery step.
+    let _ = drop_restore_target(&pg, &target).await;
+
     // 1) `createdb <target>` — connects to the original db (PGDATABASE = original)
     //    so it has somewhere to attach. The target name is the only argv.
     let mut createdb = tokio::process::Command::new("createdb");
@@ -341,7 +366,7 @@ pub(crate) async fn restore_to_new_db(
         tracing::error!(stderr = %stderr, target = %target, "createdb failed");
         if stderr.contains("already exists") {
             return Err(RtDbError::conflict(
-                "restore target database already exists",
+                "restore target database already exists and could not be dropped automatically; close active connections to it or drop it manually (dropdb), then retry",
             ));
         }
         return Err(RtDbError::internal("createdb failed; see server logs"));
@@ -584,6 +609,27 @@ mod tests {
                 "rtdb-20260727T030000Z.dump",
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn backup_path_advances_past_same_second_collision() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.path().to_str().unwrap().to_string();
+        const MS: i64 = 1_785_249_000_000; // 2026-07-28T14:30:00Z
+        let first = backup_path(&dir_path, MS).await.unwrap();
+        assert_eq!(
+            first.file_name().unwrap().to_string_lossy(),
+            "rtdb-20260728T143000Z.dump"
+        );
+        tokio::fs::write(&first, b"dump").await.unwrap();
+        // A second backup in the same second must not overwrite: the stamp
+        // advances one second and the filename grammar stays intact.
+        let second = backup_path(&dir_path, MS).await.unwrap();
+        assert_eq!(
+            second.file_name().unwrap().to_string_lossy(),
+            "rtdb-20260728T143001Z.dump"
+        );
+        assert_ne!(first, second);
     }
 
     #[test]
@@ -932,9 +978,10 @@ mod tests {
     /// proving CONTENT survival — not just schema: the restored
     /// `rtdb_restored_*` DB must carry `rtdb_auth` and the seeded registry
     /// row verbatim. Also pins the retry contract: restoring the same dump
-    /// twice errors with `Conflict`, because `restore_to_new_db` never
-    /// pre-drops an existing target (`drop_restore_target` only cleans up
-    /// after a FAILED pg_restore). Self-skips via `pg_tool_env`.
+    /// twice pre-drops the existing target and succeeds (idempotent
+    /// drop-and-recreate); when the pre-drop cannot run (a connection still
+    /// open on the target), the retry fails with `Conflict` naming the manual
+    /// recovery step. Self-skips via `pg_tool_env`.
     #[tokio::test]
     async fn restore_to_new_db_against_dev_postgres() {
         let Some((base_url, pg)) = pg_tool_env().await else {
@@ -1017,18 +1064,40 @@ mod tests {
         );
         tpool.close().await;
 
-        // Retry with the same dump: the target already exists, createdb hits
-        // "already exists", and the code maps that to Conflict — it does NOT
-        // drop-and-recreate. Assert the code's actual contract.
+        // Retry with the same dump: the existing target is pre-dropped and the
+        // restore is an idempotent drop-and-recreate into the same target name.
+        let retried = restore_to_new_db(&src_url, &dir_path, &name)
+            .await
+            .expect("retry restore ok");
+        assert_eq!(retried, target, "retry must recreate the same target");
+
+        // When the pre-drop cannot run — a connection still open on the target
+        // — the retry fails with Conflict naming the manual recovery step
+        // instead of dead-ending the operator.
+        let held = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&target_url)
+            .await
+            .expect("connect to hold the target open");
+        sqlx::query("SELECT 1")
+            .execute(&held)
+            .await
+            .expect("open the backend session");
         let err = restore_to_new_db(&src_url, &dir_path, &name)
             .await
-            .expect_err("restoring over an existing target must fail");
+            .expect_err("restore over a held target must fail");
         assert_eq!(err.code, crate::error::ErrorCode::Conflict);
         assert!(
             err.message.contains("already exists"),
             "got: {}",
             err.message
         );
+        assert!(
+            err.message.contains("dropdb"),
+            "conflict must name the manual recovery step, got: {}",
+            err.message
+        );
+        held.close().await;
     }
 
     /// A well-formed name whose file is absent fails `not_found` before any pg
