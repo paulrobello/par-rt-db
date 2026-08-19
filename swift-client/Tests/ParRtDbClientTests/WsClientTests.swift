@@ -1426,6 +1426,80 @@ struct WsClientTests {
         await harness.client.close()
     }
 
+    /// Stopping consumption WITHOUT calling cancel() must still release the
+    /// handle — the rust client gets this for free from Drop, and the Swift
+    /// stand-in is the stream's onTermination handler. Cancelling the
+    /// iterating task is the abandonment AsyncStream actually surfaces
+    /// (a plain `break` is unobservable while the shape is registered).
+    @Test(.timeLimit(.minutes(1)))
+    func abandoningIterationByTaskCancelUnsubscribes() async throws {
+        let harness = try await connectedClient()
+        let sub = try await harness.client.subscribe(
+            TableQuery("t").collect().build(), as: [Task14Doc].self
+        )
+        try await waitUntil("subscribe frame") {
+            await frames(ofType: "subscribe", in: harness.fake.sent).isEmpty == false
+        }
+        // Consume the stream in a task, then drop the task — no cancel().
+        let consumer = Task {
+            for await _ in sub.stream {}
+        }
+        consumer.cancel()
+        _ = await consumer.value
+        // The terminated consumption releases the only handle's ref:
+        // unsubscribe must land with no explicit cancel().
+        try await waitUntil("unsubscribe after abandon") {
+            await frames(ofType: "unsubscribe", in: harness.fake.sent).count == 1
+        }
+        let unsubscribe = try #require(
+            await frames(ofType: "unsubscribe", in: harness.fake.sent).first
+        )
+        #expect(stringValue(in: unsubscribe, "queryId") == "sub-1")
+        await harness.client.close()
+    }
+
+    /// One handle, both release paths: the iterating task is cancelled
+    /// (onTermination fires) AND cancel() is called explicitly. Exactly-once
+    /// demands the membership guard hold across the async termination hop —
+    /// a double release would drop the shared shape while sub2 still holds
+    /// it, so the survivor receiving a fresh update is the discriminator.
+    @Test(.timeLimit(.minutes(1)))
+    func cancelAndAbandonedTerminationReleaseExactlyOnce() async throws {
+        let harness = try await connectedClient()
+        let query = try TableQuery("t").collect().build()
+        let sub1 = try await harness.client.subscribe(query, as: [Task14Doc].self)
+        let sub2 = try await harness.client.subscribe(query, as: [Task14Doc].self)
+        try await waitUntil("one subscribe frame") {
+            await frames(ofType: "subscribe", in: harness.fake.sent).count == 1
+        }
+        // Release path 1: cancel sub1's consuming task.
+        let consumer = Task {
+            for await _ in sub1.stream {}
+        }
+        consumer.cancel()
+        _ = await consumer.value
+        // Settle so the termination handler's actor hop lands before the
+        // explicit cancel — the ordering where the double-fire must no-op.
+        try await Task.sleep(nanoseconds: 100_000_000)
+        // Release path 2: explicit cancel() of the SAME handle — releases
+        // nothing more; the shape is still alive for sub2.
+        await sub1.cancel()
+        #expect(await frames(ofType: "unsubscribe", in: harness.fake.sent).isEmpty)
+        await harness.fake.release(
+            #"{"type":"queryUpdate","queryId":"sub-1","result":[{"_id":"a","n":2}]}"#
+        )
+        let expected2 = [Task14Doc(id: "a", num: 2)]
+        try await waitUntil("survivor updated") {
+            sub2.current == .value(expected2)
+        }
+        // The survivor's release is the one that unsubscribes — total 1.
+        await sub2.cancel()
+        try await waitUntil("exactly one unsubscribe") {
+            await frames(ofType: "unsubscribe", in: harness.fake.sent).count == 1
+        }
+        await harness.client.close()
+    }
+
     // MARK: Task 14: mutations
 
     @Test(.timeLimit(.minutes(1)))

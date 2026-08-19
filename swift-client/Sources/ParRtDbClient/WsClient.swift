@@ -117,7 +117,11 @@ final class LatestSnapshotBox<T: Codable & Sendable>: @unchecked Sendable {
 /// joiner sees the current value immediately — watch-channel parity); `stream`
 /// yields each subsequent snapshot and never yields `.pending`; `cancel()`
 /// drops this handle's ref — the last one for the shape sends
-/// `{type:"unsubscribe"}`. The stream is single-consumer.
+/// `{type:"unsubscribe"}`. Cancelling the task iterating `stream` releases
+/// the same ref via the stream's termination handler (the Swift stand-in for
+/// rust's `Drop`; a plain `break` from the loop is unobservable while the
+/// shape is registered, so explicit `cancel()` remains the deterministic
+/// teardown path). The stream is single-consumer.
 public struct Subscription<T: Codable & Sendable>: Sendable {
     private let box: LatestSnapshotBox<T>
     private let storedStream: AsyncStream<QuerySnapshot<T>>
@@ -862,6 +866,18 @@ public actor RtDbClient {
             box: LatestSnapshotBox(.pending),
             continuation: continuation
         )
+        // Cancelling the task iterating the stream (a SwiftUI `.task` consumer
+        // that disappears) must release the handle's ref without an explicit
+        // cancel() — the rust client gets this from Drop. A mere `break` from
+        // the loop is not observable while the registry retains the sink's
+        // continuation, so deterministic teardown still needs cancel(). The
+        // handler is synchronous and off-actor: it only hops to the actor,
+        // where the sink-membership guard in cancelSubscription makes the
+        // double-fire (task cancellation + explicit cancel) release exactly
+        // once.
+        continuation.onTermination = { [weak self] _ in
+            Task { await self?.cancelSubscription(key: key, sinkId: sink.id) }
+        }
         var seeded: RawSnapshot = .pending
         if var entry = subscriptionsByKey[key] {
             seeded = entry.latest
@@ -898,7 +914,11 @@ public actor RtDbClient {
     /// the last release removes the shape and sends `{type:"unsubscribe"}`.
     /// Idempotent per handle: `Subscription` is a copyable struct whose copies
     /// share one sinkId, and rust's Drop-fires-once guarantee has no Swift
-    /// equivalent — a repeated or copied-handle cancel releases exactly once.
+    /// equivalent — a repeated or copied-handle cancel, and an explicit
+    /// cancel() racing the stream's onTermination, all release exactly once
+    /// (the sink is removed from the registry synchronously, before this
+    /// function's only suspension point, so every later attempt fails the
+    /// membership guard).
     private func cancelSubscription(key: String, sinkId: UUID) async {
         guard var entry = subscriptionsByKey[key],
               let sinkIndex = entry.sinks.firstIndex(where: { $0.id == sinkId })
