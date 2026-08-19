@@ -6,7 +6,7 @@ implementations honest against each other. Three artifacts live here:
 - [`golden-vector.json`](golden-vector.json) — the **wire/behavior parity
   vector** for the query DSL over one shared seeded dataset (added by
   QA-001/QA-103). Catches wire-shape, sort-comparator, boundary, terminal, and
-  filter-semantics divergence across the four implementations.
+  filter-semantics divergence across the five implementations.
 - [`semantics/`](semantics/) — the **behavioral-semantics corpus** (ENH-023):
   one JSON file per case, each self-contained (own schema + seed + operation +
   expected result), covering behavior the golden vector does not — transactions
@@ -19,11 +19,11 @@ implementations honest against each other. Three artifacts live here:
   clients (ts/rust/python/swift), so a drifted wire type fails whichever
   package drifted.
 
-**Runner scope:** the server and the three client in-memory engines
-(`ts-client`, `rust-client`, `python-client`) execute `golden-vector.json` and
-`semantics/`; `swift-client` runs `wire-corpus.json` only — its semantics and
-golden-vector runners wait on its in-memory engine (gap card: "Swift client:
-in-memory engine + semantics/golden corpus runner").
+**Runner scope:** the server and all four client in-memory engines
+(`ts-client`, `rust-client`, `python-client`, `swift-client`) execute
+`golden-vector.json` and `semantics/`; every client also runs
+`wire-corpus.json` (the swift client has since it landed; the semantics and
+golden-vector runners shipped with its in-memory engine on 2026-08-19).
 
 The server is the source of truth for every expected value in both behavioral
 layers. A divergence between any client engine and these fixtures is a bug in the client
@@ -46,11 +46,11 @@ exercising the new behavior — in the same change.** This mirrors the
 long-standing golden-vector convention (see the PR checklist in
 [`CONTRIBUTING.md`](../CONTRIBUTING.md)): the corpus is the source of truth for
 cross-engine agreement, and an uncovered behavior is a standing regression risk
-for the other three engines. A semantics change without a fixture fails review
+for the other four engines. A semantics change without a fixture fails review
 the same way an untested code change does.
 
 When a behavior is already pinned by a case, CHANGE the existing case in the
-same commit as the server change — all four runners consume the files directly,
+same commit as the server change — all five runners consume the files directly,
 so a deliberate semantic flip turns exactly the cases that pinned the old
 behavior red until the fixture is updated. Never delete a case to make a runner
 green; either the client is wrong or the fixture is stale.
@@ -73,7 +73,7 @@ JSON object:
 | `normalize` | no | Keys projected out of both the actual and expected trees before comparison — the projection applies RECURSIVELY to every object in both trees (docs nested inside `paginate.docs`, step results, ...). Defaults to `["_id", "_creationTime", "_version"]` when absent; a present list REPLACES the default (txn cases add `"id"` for minted step-result ids). |
 | `expect_next_cursor` | paginate cases | `true`/`false`: assert the `paginate` result carries (or omits) a `nextCursor`. The cursor value itself is generated and never compared. Required on every paginate case whose `expect` is a result (a paginate error case asserts the error instead and carries no `expect_next_cursor`). |
 | `then` | no | `{"query": <Query DSL>, "expect": ..., "unordered"?, "normalize"?}` — a follow-up read executed after `op` succeeds and its `expect` has been checked. For write-then-read visibility cases (soft delete, defaults, upsert-patch). Inherits the case-level `normalize` unless it gives its own. `then` runs only after `op` SUCCEEDS; an error case (`expect` is `{"error": ...}`) must not carry `then` (runners do not execute it there). |
-| `skip` | no | `{"ts" \| "rust" \| "python" \| "server": "reason"}` — a named runner may skip the case, loudly, until the gap is closed. Absent means every runner must execute the case. |
+| `skip` | no | `{"ts" \| "rust" \| "python" \| "server" \| "swift": "reason"}` — a named runner may skip the case, loudly, until the gap is closed. Absent means every runner must execute the case. |
 
 ### `expect` shapes
 

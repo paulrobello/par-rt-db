@@ -57,7 +57,7 @@ interface SemanticsCase {
   normalize?: string[];
   expect_next_cursor?: boolean;
   then?: ThenBlock;
-  skip?: Partial<Record<"ts" | "rust" | "python" | "server", string>>;
+  skip?: Partial<Record<"ts" | "rust" | "python" | "server" | "swift", string>>;
 }
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {

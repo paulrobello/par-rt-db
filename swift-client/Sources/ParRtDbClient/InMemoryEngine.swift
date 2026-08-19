@@ -421,7 +421,10 @@ func validateValue(_ ty: FieldType, _ value: JSONValue) -> Bool {
     case (.null, .null): return true
     case (.id, _): return isHexId(value)
     case let (.literal(accepted), actual): return jsonEq(accepted, actual)
-    case let (.optional(inner), .null): return validateValue(inner, .null)
+    // Server: `Optional { inner } => value.is_null() || validate_value(inner,
+    // value)` — null is accepted for ANY optional; stripUnsetOptionals then
+    // drops the key when the inner type does not itself accept null.
+    case (.optional, .null): return true
     case let (.optional(inner), actual): return validateValue(inner, actual)
     case let (.union(variants), _):
         return variants.contains { validateValue($0, value) }

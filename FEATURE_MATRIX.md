@@ -366,9 +366,11 @@ rooms), and optimistic updates (`RtDbClientConfig.optimisticUpdates`, default
 off — a mutate overlays the projected effect on each matching subscription
 immediately and reconciles to the authoritative `queryUpdate`, rolling back on
 `mutateErr`/reject/close), plus a `ParRtDbUI` `@Observable
-LiveQuery` for SwiftUI. Its one deferred surface is a gap card on the board,
-not an absence: the in-memory engine + semantics/golden corpus runner ("Swift
-client: in-memory engine + semantics/golden corpus runner"). Darwin-only (Swift 6, iOS 17+/
+LiveQuery` for SwiftUI. The in-memory engine and its corpus runners shipped
+(2026-08-19): the engine mirrors the server's DSL/step-result/system-field
+semantics, and swift-client is the fifth runner of both behavioral corpora —
+`wire-corpus/semantics/` (all 53 cases) and `wire-corpus/golden-vector.json`
+(all 38 cases) — so its deferred-surfaces list is now empty. Darwin-only (Swift 6, iOS 17+/
 macOS 14) — its Makefile lines are Darwin-guarded in the root gate and covered
 by a macOS CI lane. Spec:
 `docs/superpowers/specs/2026-08-18-swift-client-design.md`.

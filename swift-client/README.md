@@ -355,14 +355,23 @@ let result = try await retryOnPrecondition {
 
 ## Testing
 
-- `swift test` from `swift-client/` — 348 tests in 23 suites (Swift Testing
+- `swift test` from `swift-client/` — 387 tests in 26 suites (Swift Testing
   framework): wire-type round-trips, DSL builder shapes, URLProtocol-mocked
-  HTTP + admin tests, fake-transport WS tests, and `LiveQuery` main-actor
-  tests.
+  HTTP + admin tests, fake-transport WS tests, in-memory engine tests, and
+  `LiveQuery` main-actor tests.
 - The wire layer runs the shared [`wire-corpus/wire-corpus.json`](../wire-corpus/wire-corpus.json)
   parity corpus (ARC-008): every message/user/schedule/query/migrate section
   must round-trip value-identically, and every `rejects_*` section must be
   rejected.
+- The in-memory engine runs both behavioral corpora against
+  [`wire-corpus/semantics/`](../wire-corpus/semantics) (ENH-023 — all 53
+  cases: per-case schema/seed/op/expect with `normalize` projection,
+  `unordered` multiset compare, `$idRef` substitution, the `$prev` paginate
+  sentinel, and error-code assertions) and
+  [`wire-corpus/golden-vector.json`](../wire-corpus/golden-vector.json)
+  (QA-001 — all 38 cases over the shared seeded dataset), the same fixtures
+  the server and the ts/rust/python engines execute; the server is the source
+  of truth for every expected value.
 - Live-server integration tests ship in the suite (`LiveIntegrationTests`):
   `httpPushQueryMutateRoundTrip` (schema push, inserts, ordered scan, count
   terminal, blob upload/serve round trip, error envelope against a real
@@ -391,7 +400,7 @@ let result = try await retryOnPrecondition {
 | `ParRtDbUI` — `@Observable LiveQuery<T>` | ✅ |
 | Admin client — the full `/admin/*` control plane (db CRUD/clone/export/import, schema push/preview/get/history/restore, tokens, allowlist, admins, metrics, hot config, op feed, audit, sessions, merge-users, owner-bypass query/mutate, explain, slow queries, backups, webhooks + deliveries, admin workflow/schedule/file views) | ✅ |
 | Migrate DSL — `Migration` builder for every directive kind (incl. the typed `ValueExpr` evalExpr path), `Directive` wire family pinned by the corpus | ✅ |
-| In-memory engine + semantics/golden corpus runner | Deferred — gap card: "Swift client: in-memory engine + semantics/golden corpus runner" |
+| In-memory engine — `InMemoryRtDbClient` mirrors the server's DSL/step-result/system-field semantics; fifth runner of `wire-corpus/semantics/` (53 cases) + `wire-corpus/golden-vector.json` (38 cases) | ✅ (2026-08-19) |
 | OAuth login-flow helpers | Not in v1 (spec decision — the `getToken` hook is the integration seam) |
 
 ## License
