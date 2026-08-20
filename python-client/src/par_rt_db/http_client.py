@@ -74,6 +74,7 @@ from .admin import (
     _op_push_schema,
     _op_restore_backup,
     _op_revoke_token,
+    _require_json_object,
     _SyncAdminExecutor,
 )
 from .admin_models import (
@@ -777,4 +778,9 @@ class RtDbHttpClient:
         resp = self._client.request(method, path, **kwargs)
         if not resp.is_success:
             raise RtDbError.from_http(resp.status_code, resp.content)
+        # Every data-plane route answers with a JSON object body; an
+        # unparseable one must surface as RtDbError naming the route
+        # (ts/rust/swift parity), not a raw JSONDecodeError at the caller's
+        # resp.json()[...] subscript.
+        _require_json_object(resp, path)
         return resp

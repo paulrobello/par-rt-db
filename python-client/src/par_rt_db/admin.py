@@ -142,6 +142,11 @@ class _AdminRequest:
     path: str
     request_kwargs: dict[str, Any]
     parse: Callable[[httpx.Response], Any]
+    # Raw-body ops (binary dump download, JSONL export) legitimately answer
+    # with a non-JSON 2xx body; the executors skip the JSON-object guard for
+    # them. Void routes need no flag — their body-less 202/204 statuses are
+    # exempted directly.
+    raw_body: bool = False
 
 
 # --- response parse helpers (shared by every builder of the same shape) ---
@@ -219,6 +224,23 @@ def _parse_model_list[T: BaseModel](
         return [model_cls.model_validate(x) for x in resp.json()[key]]
 
     return parse
+
+
+def _require_json_object(resp: httpx.Response, path: str) -> None:
+    """Raise :class:`RtDbError` unless a 2xx ``resp`` carries a JSON object body.
+
+    ts/rust/swift parity: an unparseable 2xx body (empty body, HTML gateway
+    page, invalid JSON) must surface as ``RtDbError`` INTERNAL naming the
+    route — otherwise the caller's ``resp.json()[...]`` raises a raw
+    ``JSONDecodeError`` far from the request that caused it. Shared by the
+    admin executors and both data-plane ``_send`` helpers.
+    """
+    try:
+        body = resp.json()
+    except ValueError as e:
+        raise RtDbError(ErrorCode.INTERNAL, f"{path} returned 2xx with no JSON object body") from e
+    if not isinstance(body, dict):
+        raise RtDbError(ErrorCode.INTERNAL, f"{path} returned 2xx with no JSON object body")
 
 
 # --- request builders (one per admin operation) ---
@@ -324,7 +346,9 @@ def _op_restore_schema(db: str, version: int, *, confirm: str) -> _AdminRequest:
 
 
 def _op_export_db(db: str) -> _AdminRequest:
-    return _AdminRequest("GET", "/admin/export-db", {"params": {"db": db}}, _parse_text)
+    return _AdminRequest(
+        "GET", "/admin/export-db", {"params": {"db": db}}, _parse_text, raw_body=True
+    )
 
 
 def _op_import_db(db: str, jsonl: str) -> _AdminRequest:
@@ -467,7 +491,7 @@ def _op_list_backups() -> _AdminRequest:
 
 
 def _op_download_backup(name: str) -> _AdminRequest:
-    return _AdminRequest("GET", f"/admin/backups/{name}", {}, _parse_bytes)
+    return _AdminRequest("GET", f"/admin/backups/{name}", {}, _parse_bytes, raw_body=True)
 
 
 def _op_delete_backup(name: str) -> _AdminRequest:
@@ -863,6 +887,11 @@ class _SyncAdminExecutor:
         resp = self._client.request(req.method, req.path, **req.request_kwargs)
         if not resp.is_success:
             raise RtDbError.from_http(resp.status_code, resp.content)
+        # 202 (backupNow) and 204 (backup delete) carry no body; raw_body ops
+        # (dump download, export) carry non-JSON bodies. Every other 2xx must
+        # be a JSON object — ts admin parity.
+        if not req.raw_body and resp.status_code not in (202, 204):
+            _require_json_object(resp, f"admin request to {req.path}")
         return req.parse(resp)
 
 
@@ -880,6 +909,10 @@ class _AsyncAdminExecutor:
         resp = await self._client.request(req.method, req.path, **req.request_kwargs)
         if not resp.is_success:
             raise RtDbError.from_http(resp.status_code, resp.content)
+        # Same guard as the sync executor: body-less 202/204 and raw-body ops
+        # are exempt; every other 2xx must be a JSON object.
+        if not req.raw_body and resp.status_code not in (202, 204):
+            _require_json_object(resp, f"admin request to {req.path}")
         return req.parse(resp)
 
 

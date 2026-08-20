@@ -448,6 +448,41 @@ def test_non_2xx_raises_rtdb_error_with_code() -> None:
     assert ei.value.code is ErrorCode.UNAUTHORIZED
 
 
+def test_2xx_without_json_object_body_is_rtdb_error() -> None:
+    """A 2xx that is not a JSON object raises RtDbError INTERNAL naming the
+    route (ts admin parity) — never a raw JSONDecodeError from a parse
+    closure."""
+    client = _sync_client(
+        _handler_map({("GET", "/admin/dbs", ""): httpx.Response(200, text="not-json")})
+    )
+    with client as c, pytest.raises(RtDbError) as ei:
+        c.list_dbs()
+    assert ei.value.code is ErrorCode.INTERNAL
+    assert ei.value.message == "admin request to /admin/dbs returned 2xx with no JSON object body"
+
+
+def test_delete_backup_204_and_download_raw_body_bypass_the_guard() -> None:
+    """The JSON-object guard must not fire for body-less 204s or raw-body ops
+    (binary dump download) — the exemption ts admin models with its 202/204
+    status check."""
+    name = "rtdb-20260728T143045Z.dump"
+    client = _sync_client(
+        _handler_map(
+            {
+                ("DELETE", f"/admin/backups/{name}", ""): httpx.Response(204),
+                ("GET", f"/admin/backups/{name}", ""): httpx.Response(
+                    200,
+                    content=b"PGDMP\x00binary-dump",
+                    headers={"content-type": "application/octet-stream"},
+                ),
+            }
+        )
+    )
+    with client as c:
+        c.delete_backup(name)
+        assert c.download_backup(name) == b"PGDMP\x00binary-dump"
+
+
 # --- async: mint / revoke / list mirror -----------------------------------
 
 
@@ -985,6 +1020,20 @@ async def test_async_list_dbs_gets_databases_list() -> None:
         dbs = await c.list_dbs()
     assert dbs == ["x", "y"]
     assert captured["auth"] == ADMIN_BEARER
+
+
+async def test_async_2xx_without_json_object_body_is_rtdb_error() -> None:
+    """Async executor mirror: a 2xx non-JSON body raises RtDbError INTERNAL
+    naming the route (ts admin parity)."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text="not-json")
+
+    async with _async_client(handler) as c:
+        with pytest.raises(RtDbError) as ei:
+            await c.list_dbs()
+    assert ei.value.code is ErrorCode.INTERNAL
+    assert ei.value.message == "admin request to /admin/dbs returned 2xx with no JSON object body"
 
 
 async def test_async_create_db_posts_name() -> None:

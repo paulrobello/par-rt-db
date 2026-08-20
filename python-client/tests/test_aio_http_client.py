@@ -366,6 +366,19 @@ async def test_non_envelope_error_is_internal_with_status_in_message() -> None:
     assert "500" in ei.value.message
 
 
+async def test_2xx_without_json_object_body_is_rtdb_error() -> None:
+    """Async mirror of the sync guard: a 2xx body that is not a JSON object
+    raises RtDbError INTERNAL naming the route — never a raw
+    JSONDecodeError from the caller's resp.json()["result"] subscript."""
+    async with _client(
+        _handler_map({("POST", "/api/query", ""): httpx.Response(200, text="not-json")})
+    ) as c:
+        with pytest.raises(RtDbError) as ei:
+            await c.run(TableQuery("items").count())
+    assert err_internal(ei.value)
+    assert ei.value.message == "/api/query returned 2xx with no JSON object body"
+
+
 def err_internal(err: RtDbError) -> bool:
     from par_rt_db.errors import ErrorCode
 

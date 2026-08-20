@@ -373,6 +373,31 @@ def test_non_envelope_error_is_internal_with_status_in_message() -> None:
     assert "500" in ei.value.message
 
 
+@pytest.mark.parametrize(
+    "body",
+    ["not-json", "", "null", "[1, 2]"],
+    ids=["invalid-json", "empty", "literal-null", "json-array"],
+)
+def test_2xx_without_json_object_body_is_rtdb_error(body: str) -> None:
+    """A 2xx that is not a JSON object raises RtDbError INTERNAL naming the
+    route (ts/rust/swift parity) — never a raw JSONDecodeError from the
+    caller's ``resp.json()["result"]`` subscript."""
+    client = _client(_handler_map({("POST", "/api/query", ""): httpx.Response(200, text=body)}))
+    with pytest.raises(RtDbError) as ei:
+        client.run(TableQuery("items").count())
+    assert err_internal(ei.value)
+    assert ei.value.message == "/api/query returned 2xx with no JSON object body"
+
+
+def test_2xx_json_object_result_still_returns_result() -> None:
+    """Control for the guard above: a well-formed ``{result: ...}`` body
+    passes through unchanged."""
+    client = _client(
+        _handler_map({("POST", "/api/query", ""): httpx.Response(200, json={"result": 7})})
+    )
+    assert client.run(TableQuery("items").count()) == 7
+
+
 def err_internal(err: RtDbError) -> bool:
     from par_rt_db.errors import ErrorCode
 
