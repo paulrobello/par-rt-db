@@ -609,7 +609,11 @@ task) and is gated by an `AppState` `backup_running` flag (a second call while
 running → 409). `POST /admin/restore` restores a dump into a **fresh
 `rtdb_restored_<stamp>` Postgres DB** via `createdb` + `pg_restore
 --no-owner --no-privileges` — the live `rtdb` DB is never touched, so the
-single-writer invariant is preserved and there are no locks/races.
+single-writer invariant is preserved and there are no locks/races. An existing
+target of the same name is pre-dropped (the name is `rtdb_restored_`-scoped,
+never the live DB), so retrying the same dump is an idempotent
+drop-and-recreate; when the drop cannot run (a connection still open on the
+target), the route 409s naming the manual recovery step.
 `GET|DELETE /admin/backups/{name}` download/delete a dump; all name-bearing
 routes pass `backup::validate_dump_name` (path-traversal guard). Restore
 requires a typed `confirm == name`. **`CREATEDB` privilege** is required on
