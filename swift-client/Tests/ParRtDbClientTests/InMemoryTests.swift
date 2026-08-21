@@ -1188,6 +1188,220 @@ struct InMemoryTests {
         #expect(try count(client.query(Query(table: "items", count: true))) == 1)
     }
 
+    @Test func awaitSignalParksThenDeliversPayload() throws {
+        let client = deterministicClient()
+        let info = try client.startWorkflow(WorkflowSpec(name: "gate", steps: [
+            .awaitSignal(name: "approve", timeoutMs: 60000)
+        ]))
+        // First tick parks: waiting + visibility columns, gate one timeout out.
+        _ = try client.tick(nowMs: pinnedNow)
+        let parked = try client.getWorkflow(info.id).info
+        #expect(parked.status == .waiting)
+        #expect(parked.waitingFor == "approve")
+        #expect(parked.waitedSince == pinnedNow)
+        #expect(parked.sleepUntil == pinnedNow + 60000)
+        // Delivery flips the run due; the next tick consumes the payload as a
+        // success outcome carrying it verbatim, then the run finishes (last
+        // step) with the wait columns cleared.
+        try client.signalWorkflow(info.id, name: "approve", payload: .object(["v": .int(2)]))
+        _ = try client.tick(nowMs: pinnedNow + 1)
+        let full = try client.getWorkflow(info.id)
+        #expect(full.info.status == .success)
+        #expect(full.info.waitingFor == nil)
+        #expect(full.info.waitedSince == nil)
+        #expect(full.stepOutcomes.count == 1)
+        #expect(full.stepOutcomes.first?.status == .success)
+        #expect(full.stepOutcomes.first?.attempts == 1)
+        #expect(full.stepOutcomes.first?.signal == .object(["v": .int(2)]))
+    }
+
+    @Test func awaitSignalTimeoutRetriesWithFreshTimeoutThenDelivers() throws {
+        let client = deterministicClient()
+        // Backoff for attempt 1 would be 1000ms; the timeout gate is 5000ms —
+        // pinning the re-park gate at now + 5000 proves FULL-timeout retry,
+        // not backoff.
+        let info = try client.startWorkflow(WorkflowSpec(name: "gate", steps: [
+            .awaitSignal(name: "approve", timeoutMs: 5000, retry: StepRetry(maxAttempts: 3))
+        ]))
+        _ = try client.tick(nowMs: pinnedNow)
+        #expect(try client.getWorkflow(info.id).info.status == .waiting)
+        // Gate expires: timed-out attempt 1 re-parks with a fresh full gate.
+        _ = try client.tick(nowMs: pinnedNow + 5000)
+        let state = try client.getWorkflow(info.id).info
+        #expect(state.status == .waiting)
+        #expect(state.attempts == 1)
+        #expect(state.waitedSince == pinnedNow + 5000)
+        #expect(state.sleepUntil == pinnedNow + 10000)
+        // A delivery while re-parked still succeeds and resets the count.
+        try client.signalWorkflow(info.id, name: "approve", payload: .string("go"))
+        _ = try client.tick(nowMs: pinnedNow + 5001)
+        let full = try client.getWorkflow(info.id)
+        #expect(full.info.status == .success)
+        #expect(full.info.attempts == 0)
+        #expect(full.stepOutcomes.first?.attempts == 2)
+        #expect(full.stepOutcomes.first?.signal == .string("go"))
+    }
+
+    @Test func awaitSignalExhaustsToTypedTimeoutError() throws {
+        let client = deterministicClient()
+        let info = try client.startWorkflow(WorkflowSpec(name: "gate", steps: [
+            .awaitSignal(name: "approve", timeoutMs: 100, retry: StepRetry(maxAttempts: 2))
+        ]))
+        _ = try client.tick(nowMs: pinnedNow) // park
+        _ = try client.tick(nowMs: pinnedNow + 100) // timed-out attempt 1, re-park
+        let state = try client.getWorkflow(info.id).info
+        #expect(state.attempts == 1)
+        _ = try client.tick(nowMs: pinnedNow + 200) // attempt 2 = maxAttempts: terminal
+        let full = try client.getWorkflow(info.id)
+        #expect(full.info.status == .failed)
+        #expect(full.info.attempts == 2)
+        #expect(full.info.lastError == "awaitSignal 'approve' timed out")
+        #expect(full.info.waitingFor == nil)
+        #expect(full.stepOutcomes.count == 1)
+        #expect(full.stepOutcomes.first?.status == .failed)
+        #expect(full.stepOutcomes.first?.error == "awaitSignal 'approve' timed out")
+        #expect(full.stepOutcomes.first?.signal == nil)
+        // Terminal: no further ticks resurrect it, and delivery is a typed
+        // conflict (not waiting).
+        #expect(throws: RtDbError.self) {
+            try client.signalWorkflow(info.id, name: "approve")
+        }
+    }
+
+    @Test func awaitSignalWithoutTimeoutWaitsForeverUntilSignal() throws {
+        let client = deterministicClient()
+        let info = try client.startWorkflow(WorkflowSpec(name: "gate", steps: [
+            .awaitSignal(name: "approve")
+        ]))
+        _ = try client.tick(nowMs: pinnedNow) // park
+        // Heat the clock arbitrarily far: an omitted timeoutMs is never due —
+        // only a delivery or cancel wakes the run.
+        _ = try client.tick(nowMs: pinnedNow + 10_000_000_000)
+        let state = try client.getWorkflow(info.id).info
+        #expect(state.status == .waiting)
+        #expect(state.waitedSince == pinnedNow)
+        // Deliver WITH a payload — like every server integration test. (An
+        // absent payload leaves the slot nil, so the wake is classified by
+        // the payload-slot discriminator exactly as the server classifies
+        // it; payload-carrying deliveries are the tested path.)
+        try client.signalWorkflow(info.id, name: "approve", payload: .bool(true))
+        _ = try client.tick(nowMs: pinnedNow + 10_000_000_001)
+        let full = try client.getWorkflow(info.id)
+        #expect(full.info.status == .success)
+        #expect(full.stepOutcomes.first?.signal == .bool(true))
+    }
+
+    @Test func awaitSignalDeliveryIsLatestWins() throws {
+        let client = deterministicClient()
+        let info = try client.startWorkflow(WorkflowSpec(name: "gate", steps: [
+            .awaitSignal(name: "approve", timeoutMs: 60000)
+        ]))
+        _ = try client.tick(nowMs: pinnedNow)
+        // Every delivery while the wait is unconsumed acks and overwrites the
+        // slot; the consumed payload is the last one delivered.
+        try client.signalWorkflow(info.id, name: "approve", payload: .object(["v": .int(1)]))
+        try client.signalWorkflow(info.id, name: "approve", payload: .object(["v": .int(2)]))
+        try client.signalWorkflow(info.id, name: "approve", payload: .object(["v": .int(3)]))
+        _ = try client.tick(nowMs: pinnedNow + 1)
+        let outcome = try client.getWorkflow(info.id).stepOutcomes.first
+        #expect(outcome?.signal == .object(["v": .int(3)]))
+    }
+
+    @Test func awaitSignalCancelWhileWaiting() throws {
+        let client = deterministicClient()
+        let info = try client.startWorkflow(WorkflowSpec(name: "gate", steps: [
+            .awaitSignal(name: "approve", timeoutMs: 60000)
+        ]))
+        _ = try client.tick(nowMs: pinnedNow)
+        #expect(client.cancelWorkflow(info.id))
+        let cancelled = try client.getWorkflow(info.id).info
+        #expect(cancelled.status == .cancelled)
+        // Leave-waiting rule: the wait columns drop with the flip.
+        #expect(cancelled.waitingFor == nil)
+        #expect(cancelled.waitedSince == nil)
+        // A cancelled wait never wakes — delivery is a typed conflict.
+        #expect(throws: RtDbError.self) {
+            try client.signalWorkflow(info.id, name: "approve")
+        }
+        _ = try client.tick(nowMs: pinnedNow + 120_000)
+        #expect(try client.getWorkflow(info.id).info.status == .cancelled)
+    }
+
+    @Test func awaitSignalTypedDeliveryErrors() throws {
+        let client = deterministicClient()
+        // Unknown id: NOT_FOUND.
+        #expect(throws: RtDbError.self) {
+            try client.signalWorkflow("nope", name: "approve")
+        }
+        // Name mismatch on a waiting row: CONFLICT naming both names.
+        let info = try client.startWorkflow(WorkflowSpec(name: "gate", steps: [
+            .awaitSignal(name: "approve", timeoutMs: 60000)
+        ]))
+        _ = try client.tick(nowMs: pinnedNow)
+        do {
+            try client.signalWorkflow(info.id, name: "deny")
+            Issue.record("a mismatched signal name should reject")
+        } catch let error as RtDbError {
+            #expect(error.code == .conflict)
+            #expect(error.message == "workflow waiting on 'approve', got 'deny'")
+        }
+        // Not waiting (an ordinary pending run has no wait name): CONFLICT.
+        let plain = try client.startWorkflow(WorkflowSpec(name: "run", steps: [
+            WorkflowStepSpec(txn: Transaction(steps: []))
+        ]))
+        do {
+            try client.signalWorkflow(plain.id, name: "approve")
+            Issue.record("signaling a run that is not waiting should reject")
+        } catch let error as RtDbError {
+            #expect(error.code == .conflict)
+            #expect(error.message == "workflow is not waiting for a signal")
+        }
+    }
+
+    @Test func awaitSignalSubmitValidationMirrorsTheServer() throws {
+        let client = deterministicClient()
+        // The builders make an illegal step hard to construct; decode one off
+        // the wire instead. Neither txn nor awaitSignal:
+        let neither = try JSONDecoder().decode(
+            WorkflowSpec.self,
+            from: Data(#"{"name":"bad","steps":[{"sleepBeforeMs":5}]}"#.utf8)
+        )
+        #expect(throws: RtDbError.self) {
+            try client.startWorkflow(neither)
+        }
+        // Both:
+        let both = try JSONDecoder().decode(
+            WorkflowSpec.self,
+            from: Data(
+                #"{"name":"bad","steps":[{"txn":{"steps":[]},"awaitSignal":{"name":"a"}}]}"#.utf8
+            )
+        )
+        #expect(throws: RtDbError.self) {
+            try client.startWorkflow(both)
+        }
+        // Name and timeout bounds carry the server's verbatim messages. The
+        // raw AwaitSignalSpec init bypasses the factory's eager checks so
+        // the ENGINE's submit-time validation is what rejects these.
+        do {
+            _ = try client.startWorkflow(WorkflowSpec(name: "bad", steps: [
+                WorkflowStepSpec(txn: nil, awaitSignal: AwaitSignalSpec(name: ""))
+            ]))
+            Issue.record("an empty signal name should reject")
+        } catch let error as RtDbError {
+            #expect(error.message == "steps[0].awaitSignal.name must be 1..=256 chars")
+        }
+        do {
+            _ = try client.startWorkflow(WorkflowSpec(name: "bad", steps: [
+                WorkflowStepSpec(
+                    txn: nil, awaitSignal: AwaitSignalSpec(name: "a", timeoutMs: 0)
+                )
+            ]))
+            Issue.record("a zero timeoutMs should reject")
+        } catch let error as RtDbError {
+            #expect(error.message == "steps[0].awaitSignal.timeoutMs must be > 0")
+        }
+    }
+
     // MARK: Storage
 
     @Test func uploadMintsDeterministicIdAndDigest() throws {

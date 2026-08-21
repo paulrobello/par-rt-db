@@ -653,6 +653,20 @@ public actor RtDbAdminClient {
         return response.ok
     }
 
+    /// `POST /admin/db/{db}/workflows/{id}/signal` `{name, payload?}` →
+    /// `{ok}`. Ok only on delivery — the typed failures (unknown id, not
+    /// waiting, name mismatch) surface as NOT_FOUND/CONFLICT errors.
+    public func signalWorkflow(
+        _ db: String, id: String, name: String, payload: JSONValue? = nil
+    ) async throws -> Bool {
+        let response: OkResponse = try await postJson(
+            "signal workflow",
+            "/admin/db/\(encodePath(db))/workflows/\(encodePath(id))/signal",
+            SignalWorkflowParams(name: name, payload: payload)
+        )
+        return response.ok
+    }
+
     /// `DELETE /admin/db/{db}/workflows/{id}` → `{ok}`. Hard-deletes the run
     /// row — unlike cancel, the outcome trail does not survive. False when
     /// already gone.
@@ -1097,6 +1111,11 @@ private struct EmptyRequest: Encodable {}
 
 private struct OkResponse: Decodable {
     let ok: Bool
+}
+
+private struct SignalWorkflowParams: Encodable {
+    let name: String
+    let payload: JSONValue?
 }
 
 private struct DatabasesResponse: Decodable {

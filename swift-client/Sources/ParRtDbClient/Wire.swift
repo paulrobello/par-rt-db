@@ -162,6 +162,9 @@ public enum ClientMessage: Equatable, Codable, Sendable {
     case startWorkflow(workflowId: String, spec: WorkflowSpec)
     /// Cancel a workflow run.
     case cancelWorkflow(workflowId: String, id: String)
+    /// Deliver a named signal to a waiting run (`awaitSignal` steps). The
+    /// reply reuses `workflowAck`.
+    case signalWorkflow(workflowId: String, id: String, name: String, payload: JSONValue?)
     /// List workflow runs; `status` filters by lifecycle.
     case listWorkflows(workflowId: String, status: WorkflowStatus?)
     /// Join a presence room; `state` is the opaque presence blob.
@@ -175,7 +178,7 @@ public enum ClientMessage: Equatable, Codable, Sendable {
 
     enum CodingKeys: String, CodingKey, CaseIterable {
         case type, token, db, queryId, query, mutId, idempotencyKey, txn
-        case scheduleId, when, id, workflowId, spec, status
+        case scheduleId, when, id, workflowId, spec, status, name, payload
         case room, state, ttlMs
     }
 
@@ -279,6 +282,17 @@ public enum ClientMessage: Equatable, Codable, Sendable {
                 workflowId: container.decode(String.self, forKey: .workflowId),
                 id: container.decode(String.self, forKey: .id)
             )
+        case "signalWorkflow":
+            try rejectUnknownVariantFields(
+                "ClientMessage", variant: payload.tag, keys: payload.keys,
+                allowed: ["type", "workflowId", "id", "name", "payload"]
+            )
+            self = try .signalWorkflow(
+                workflowId: container.decode(String.self, forKey: .workflowId),
+                id: container.decode(String.self, forKey: .id),
+                name: container.decode(String.self, forKey: .name),
+                payload: container.decodeIfPresent(JSONValue.self, forKey: .payload)
+            )
         case "listWorkflows":
             try rejectUnknownVariantFields(
                 "ClientMessage", variant: payload.tag, keys: payload.keys,
@@ -377,6 +391,12 @@ public enum ClientMessage: Equatable, Codable, Sendable {
             try container.encode("cancelWorkflow", forKey: .type)
             try container.encode(workflowId, forKey: .workflowId)
             try container.encode(id, forKey: .id)
+        case let .signalWorkflow(workflowId, id, name, payload):
+            try container.encode("signalWorkflow", forKey: .type)
+            try container.encode(workflowId, forKey: .workflowId)
+            try container.encode(id, forKey: .id)
+            try container.encode(name, forKey: .name)
+            try container.encodeIfPresent(payload, forKey: .payload)
         case let .listWorkflows(workflowId, status):
             try container.encode("listWorkflows", forKey: .type)
             try container.encode(workflowId, forKey: .workflowId)
@@ -806,34 +826,76 @@ public struct StepRetry: Equatable, Codable, Sendable {
     }
 }
 
+/// Mirrors server/src/protocol.rs::AwaitSignalSpec — an `awaitSignal` step's
+/// wait declaration: park the run until a signal named `name` is delivered;
+/// `timeoutMs` bounds each wait attempt (omitted = wait indefinitely, cancel
+/// is the escape). CamelCase, unknown fields rejected; `timeoutMs` omitted
+/// when nil.
+public struct AwaitSignalSpec: Equatable, Codable, Sendable {
+    public var name: String
+    public var timeoutMs: UInt64?
+
+    public init(name: String, timeoutMs: UInt64? = nil) {
+        self.name = name
+        self.timeoutMs = timeoutMs
+    }
+
+    enum CodingKeys: String, CodingKey, CaseIterable {
+        case name, timeoutMs
+    }
+
+    public init(from decoder: Decoder) throws {
+        try decoder.rejectUnknownKeys("AwaitSignalSpec", as: CodingKeys.self)
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        name = try container.decode(String.self, forKey: .name)
+        timeoutMs = try container.decodeIfPresent(UInt64.self, forKey: .timeoutMs)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(name, forKey: .name)
+        try container.encodeIfPresent(timeoutMs, forKey: .timeoutMs)
+    }
+}
+
 /// Mirrors server/src/protocol.rs::WorkflowStepSpec — camelCase, unknown
-/// fields rejected; `retry`/`sleepBeforeMs` omitted when nil.
+/// fields rejected; the optional fields are omitted when nil. A step carries
+/// exactly one of `txn`/`awaitSignal` (the server's `validate_spec` enforces
+/// it at submit; the `awaitSignal(name:timeoutMs:)` factory in
+/// MutationDsl.swift constructs the wait variant).
 public struct WorkflowStepSpec: Equatable, Codable, Sendable {
-    public var txn: Transaction
+    public var txn: Transaction?
+    public var awaitSignal: AwaitSignalSpec?
     public var retry: StepRetry?
     public var sleepBeforeMs: UInt64?
 
-    public init(txn: Transaction, retry: StepRetry? = nil, sleepBeforeMs: UInt64? = nil) {
+    public init(
+        txn: Transaction?, awaitSignal: AwaitSignalSpec? = nil, retry: StepRetry? = nil,
+        sleepBeforeMs: UInt64? = nil
+    ) {
         self.txn = txn
+        self.awaitSignal = awaitSignal
         self.retry = retry
         self.sleepBeforeMs = sleepBeforeMs
     }
 
     enum CodingKeys: String, CodingKey, CaseIterable {
-        case txn, retry, sleepBeforeMs
+        case txn, awaitSignal, retry, sleepBeforeMs
     }
 
     public init(from decoder: Decoder) throws {
         try decoder.rejectUnknownKeys("WorkflowStepSpec", as: CodingKeys.self)
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        txn = try container.decode(Transaction.self, forKey: .txn)
+        txn = try container.decodeIfPresent(Transaction.self, forKey: .txn)
+        awaitSignal = try container.decodeIfPresent(AwaitSignalSpec.self, forKey: .awaitSignal)
         retry = try container.decodeIfPresent(StepRetry.self, forKey: .retry)
         sleepBeforeMs = try container.decodeIfPresent(UInt64.self, forKey: .sleepBeforeMs)
     }
 
     public func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
-        try container.encode(txn, forKey: .txn)
+        try container.encodeIfPresent(txn, forKey: .txn)
+        try container.encodeIfPresent(awaitSignal, forKey: .awaitSignal)
         try container.encodeIfPresent(retry, forKey: .retry)
         try container.encodeIfPresent(sleepBeforeMs, forKey: .sleepBeforeMs)
     }
@@ -872,6 +934,7 @@ public struct WorkflowSpec: Equatable, Codable, Sendable {
 public enum WorkflowStatus: String, Codable, Sendable {
     case pending
     case running
+    case waiting
     case success
     case failed
     case cancelled
@@ -884,26 +947,30 @@ public enum OutcomeStatus: String, Codable, Sendable {
 }
 
 /// Mirrors server/src/protocol.rs::StepOutcome — camelCase, unknown fields
-/// rejected; `error` omitted when nil.
+/// rejected; `error`/`signal` omitted when nil. `signal` carries a delivered
+/// awaitSignal payload verbatim (success outcomes only).
 public struct StepOutcome: Equatable, Codable, Sendable {
     public var stepIndex: UInt32
     public var status: OutcomeStatus
     public var attempts: UInt32
     public var at: Int64
     public var error: String?
+    public var signal: JSONValue?
 
     public init(
-        stepIndex: UInt32, status: OutcomeStatus, attempts: UInt32, at: Int64, error: String? = nil
+        stepIndex: UInt32, status: OutcomeStatus, attempts: UInt32, at: Int64, error: String? = nil,
+        signal: JSONValue? = nil
     ) {
         self.stepIndex = stepIndex
         self.status = status
         self.attempts = attempts
         self.at = at
         self.error = error
+        self.signal = signal
     }
 
     enum CodingKeys: String, CodingKey, CaseIterable {
-        case stepIndex, status, attempts, at, error
+        case stepIndex, status, attempts, at, error, signal
     }
 
     public init(from decoder: Decoder) throws {
@@ -914,6 +981,7 @@ public struct StepOutcome: Equatable, Codable, Sendable {
         attempts = try container.decode(UInt32.self, forKey: .attempts)
         at = try container.decode(Int64.self, forKey: .at)
         error = try container.decodeIfPresent(String.self, forKey: .error)
+        signal = try container.decodeIfPresent(JSONValue.self, forKey: .signal)
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -923,6 +991,7 @@ public struct StepOutcome: Equatable, Codable, Sendable {
         try container.encode(attempts, forKey: .attempts)
         try container.encode(at, forKey: .at)
         try container.encodeIfPresent(error, forKey: .error)
+        try container.encodeIfPresent(signal, forKey: .signal)
     }
 }
 
@@ -937,6 +1006,8 @@ public struct WorkflowInfo: Equatable, Codable, Sendable {
     public var attempts: UInt32
     public var sleepUntil: Int64?
     public var lastError: String?
+    public var waitingFor: String?
+    public var waitedSince: Int64?
     public var createdAt: Int64
     public var updatedAt: Int64
     public var startedAt: Int64?
@@ -945,8 +1016,8 @@ public struct WorkflowInfo: Equatable, Codable, Sendable {
     public init(
         id: String, name: String, status: WorkflowStatus, currentStep: UInt32,
         stepCount: UInt32, attempts: UInt32, sleepUntil: Int64? = nil,
-        lastError: String? = nil, createdAt: Int64, updatedAt: Int64,
-        startedAt: Int64? = nil, finishedAt: Int64? = nil
+        lastError: String? = nil, waitingFor: String? = nil, waitedSince: Int64? = nil,
+        createdAt: Int64, updatedAt: Int64, startedAt: Int64? = nil, finishedAt: Int64? = nil
     ) {
         self.id = id
         self.name = name
@@ -956,6 +1027,8 @@ public struct WorkflowInfo: Equatable, Codable, Sendable {
         self.attempts = attempts
         self.sleepUntil = sleepUntil
         self.lastError = lastError
+        self.waitingFor = waitingFor
+        self.waitedSince = waitedSince
         self.createdAt = createdAt
         self.updatedAt = updatedAt
         self.startedAt = startedAt
@@ -964,7 +1037,8 @@ public struct WorkflowInfo: Equatable, Codable, Sendable {
 
     enum CodingKeys: String, CodingKey, CaseIterable {
         case id, name, status, currentStep, stepCount, attempts
-        case sleepUntil, lastError, createdAt, updatedAt, startedAt, finishedAt
+        case sleepUntil, lastError, waitingFor, waitedSince
+        case createdAt, updatedAt, startedAt, finishedAt
     }
 
     public init(from decoder: Decoder) throws {
@@ -978,6 +1052,8 @@ public struct WorkflowInfo: Equatable, Codable, Sendable {
         attempts = try container.decode(UInt32.self, forKey: .attempts)
         sleepUntil = try container.decodeIfPresent(Int64.self, forKey: .sleepUntil)
         lastError = try container.decodeIfPresent(String.self, forKey: .lastError)
+        waitingFor = try container.decodeIfPresent(String.self, forKey: .waitingFor)
+        waitedSince = try container.decodeIfPresent(Int64.self, forKey: .waitedSince)
         createdAt = try container.decode(Int64.self, forKey: .createdAt)
         updatedAt = try container.decode(Int64.self, forKey: .updatedAt)
         startedAt = try container.decodeIfPresent(Int64.self, forKey: .startedAt)
@@ -994,6 +1070,8 @@ public struct WorkflowInfo: Equatable, Codable, Sendable {
         try container.encode(attempts, forKey: .attempts)
         try container.encodeIfPresent(sleepUntil, forKey: .sleepUntil)
         try container.encodeIfPresent(lastError, forKey: .lastError)
+        try container.encodeIfPresent(waitingFor, forKey: .waitingFor)
+        try container.encodeIfPresent(waitedSince, forKey: .waitedSince)
         try container.encode(createdAt, forKey: .createdAt)
         try container.encode(updatedAt, forKey: .updatedAt)
         try container.encodeIfPresent(startedAt, forKey: .startedAt)

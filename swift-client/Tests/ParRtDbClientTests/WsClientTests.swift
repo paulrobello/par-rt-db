@@ -1757,6 +1757,45 @@ struct WsClientTests {
     }
 
     @Test(.timeLimit(.minutes(1)))
+    func signalWorkflowRoundTrip() async throws {
+        let harness = try await connectedClient()
+        // Payload present travels verbatim under its wire spelling.
+        async let signalOp: Void = harness.client.signalWorkflow(
+            "run-9", name: "approve", payload: .object(["v": .int(2)])
+        )
+        try await waitUntil("signalWorkflow frame") {
+            await frames(ofType: "signalWorkflow", in: harness.fake.sent).isEmpty == false
+        }
+        let frame = try #require(await frames(ofType: "signalWorkflow", in: harness.fake.sent).first)
+        #expect(stringValue(in: frame, "workflowId") == "wf-1")
+        #expect(stringValue(in: frame, "id") == "run-9")
+        #expect(stringValue(in: frame, "name") == "approve")
+        #expect(frame.contains(#""payload":{"v":2}"#))
+        // The reply reuses workflowAck; ok:true resolves without throwing.
+        await harness.fake.release(#"{"type":"workflowAck","workflowId":"wf-1","ok":true}"#)
+        try await signalOp
+        // A nil payload is omitted from the frame entirely.
+        async let bareSignal: Void = harness.client.signalWorkflow("run-9", name: "nudge")
+        try await waitUntil("bare signalWorkflow frame") {
+            await frames(ofType: "signalWorkflow", in: harness.fake.sent).count == 2
+        }
+        let bare = try #require(await frames(ofType: "signalWorkflow", in: harness.fake.sent).last)
+        #expect(bare.contains("payload") == false)
+        // Typed delivery failures ride the ack's error envelope as rejections.
+        await harness.fake.release(
+            #"{"type":"workflowAck","workflowId":"wf-2","ok":false,"#
+                + #""error":{"code":"CONFLICT","message":"workflow is not waiting for a signal"}}"#
+        )
+        do {
+            try await bareSignal
+            Issue.record("ok:false with an error should reject the signal call")
+        } catch let error as RtDbError {
+            #expect(error.code == .conflict)
+        }
+        await harness.client.close()
+    }
+
+    @Test(.timeLimit(.minutes(1)))
     func scheduleErrRejectsSchedule() async throws {
         let harness = try await connectedClient()
         let txn = try oneInsertTxn(1)

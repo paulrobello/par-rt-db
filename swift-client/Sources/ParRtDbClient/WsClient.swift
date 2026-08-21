@@ -514,6 +514,7 @@ public actor RtDbClient {
     private enum WorkflowRequest: Sendable {
         case start(spec: WorkflowSpec)
         case cancel(id: String)
+        case signal(id: String, name: String, payload: JSONValue?)
         case list
     }
 
@@ -1312,6 +1313,19 @@ public actor RtDbClient {
         }
     }
 
+    /// Deliver a named signal to a waiting run (`awaitSignal` steps). Same
+    /// ack contract as `cancelWorkflow` — typed delivery failures (unknown id,
+    /// not waiting, name mismatch) ride the ack's `error` envelope as
+    /// NOT_FOUND/CONFLICT rejections.
+    public func signalWorkflow(
+        _ id: String, name: String, payload: JSONValue? = nil
+    ) async throws {
+        guard case .ack = try await submitWorkflow(.signal(id: id, name: name, payload: payload))
+        else {
+            throw RtDbError(code: .internal, message: "unexpected workflow reply")
+        }
+    }
+
     /// List this database's workflow runs.
     public func listWorkflows() async throws -> [WorkflowInfo] {
         guard case let .list(workflows) = try await submitWorkflow(.list) else {
@@ -1776,6 +1790,8 @@ public actor RtDbClient {
             .startWorkflow(workflowId: workflowId, spec: spec)
         case let .cancel(id):
             .cancelWorkflow(workflowId: workflowId, id: id)
+        case let .signal(id, name, payload):
+            .signalWorkflow(workflowId: workflowId, id: id, name: name, payload: payload)
         case .list:
             .listWorkflows(workflowId: workflowId, status: nil)
         }
