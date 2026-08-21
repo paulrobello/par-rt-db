@@ -402,8 +402,9 @@ public struct TtlDef: Equatable, Codable, Sendable {
 
 /// One table: fields, indexes, and opt-in per-row rules / TTL / defaults.
 /// Mirrors rust-client `TableDef` — `indexes` omitted when nil, `ownerField` /
-/// `collaboratorsField` / `ttl` / `updatedAtField` / `authorize` omitted when
-/// nil, `defaults` omitted when empty, `softDelete` omitted when false.
+/// `collaboratorsField` / `ttl` / `updatedAtField` / `autoIncrementField` /
+/// `authorize` omitted when nil, `defaults` omitted when empty, `softDelete`
+/// omitted when false.
 public struct TableDef: Equatable, Codable, Sendable {
     /// Field name to declared type.
     public var fields: [String: FieldType]
@@ -427,6 +428,13 @@ public struct TableDef: Equatable, Codable, Sendable {
     /// (the int64 wire convention). Must differ from `ttl.field`; no index is
     /// required on the field. Server-enforced; the client only declares it.
     public var updatedAtField: String?
+    /// Server-assigned per-table monotonic counter (FM-37): names a declared
+    /// `int64` field stamped with the next counter value on insert (and
+    /// upsert's insert branch), overwriting any client-supplied value.
+    /// Immutable after insert — a patch or replace that changes the stored
+    /// value is rejected. Legal in a unique index (the ticket-number
+    /// guarantee). Server-enforced; the client only declares it.
+    public var autoIncrementField: String?
     /// Opt-in per-row authorization predicate: a `FilterExpr` over this table's
     /// declared doc fields and the principal's markers (`{"$user":true}` /
     /// `{"$email":true}`). Marker values are valid only here — client
@@ -448,6 +456,7 @@ public struct TableDef: Equatable, Codable, Sendable {
         collaboratorsField: String? = nil,
         ttl: TtlDef? = nil,
         updatedAtField: String? = nil,
+        autoIncrementField: String? = nil,
         authorize: FilterExpr? = nil,
         defaults: [String: JSONValue] = [:],
         softDelete: Bool = false
@@ -458,13 +467,14 @@ public struct TableDef: Equatable, Codable, Sendable {
         self.collaboratorsField = collaboratorsField
         self.ttl = ttl
         self.updatedAtField = updatedAtField
+        self.autoIncrementField = autoIncrementField
         self.authorize = authorize
         self.defaults = defaults
         self.softDelete = softDelete
     }
 
     enum CodingKeys: String, CodingKey {
-        case fields, indexes, ttl, updatedAtField, authorize, defaults
+        case fields, indexes, ttl, updatedAtField, autoIncrementField, authorize, defaults
         case ownerField, collaboratorsField, softDelete
     }
 
@@ -478,6 +488,9 @@ public struct TableDef: Equatable, Codable, Sendable {
         )
         ttl = try container.decodeIfPresent(TtlDef.self, forKey: .ttl)
         updatedAtField = try container.decodeIfPresent(String.self, forKey: .updatedAtField)
+        autoIncrementField = try container.decodeIfPresent(
+            String.self, forKey: .autoIncrementField
+        )
         authorize = try container.decodeIfPresent(FilterExpr.self, forKey: .authorize)
         defaults = try container.decodeIfPresent(
             [String: JSONValue].self, forKey: .defaults
@@ -493,6 +506,7 @@ public struct TableDef: Equatable, Codable, Sendable {
         try container.encodeIfPresent(collaboratorsField, forKey: .collaboratorsField)
         try container.encodeIfPresent(ttl, forKey: .ttl)
         try container.encodeIfPresent(updatedAtField, forKey: .updatedAtField)
+        try container.encodeIfPresent(autoIncrementField, forKey: .autoIncrementField)
         try container.encodeIfPresent(authorize, forKey: .authorize)
         if !defaults.isEmpty {
             try container.encode(defaults, forKey: .defaults)
@@ -671,6 +685,17 @@ public struct TableBuilder: Sendable {
         with { $0.updatedAtField = field }
     }
 
+    /// Declare the server-assigned per-table counter field (wire
+    /// `autoIncrementField`): `field` names a declared `int64` field the
+    /// server stamps with the next counter value on insert (and upsert's
+    /// insert branch), overwriting any client-supplied value. Immutable
+    /// after insert — a patch or replace that changes the stored value is
+    /// rejected. Must differ from `ttl.field` and `updatedAtField`.
+    /// Server-enforced; the client only declares it.
+    public func autoIncrementField(_ field: String) -> TableBuilder {
+        with { $0.autoIncrementField = field }
+    }
+
     /// Declare the per-row authorization predicate: a `FilterExpr` over this
     /// table's declared doc fields and the principal's markers
     /// (`{"$user":true}` / `{"$email":true}`). Marker values are valid only
@@ -706,6 +731,7 @@ public struct TableBuilder: Sendable {
             collaboratorsField: acc.collaboratorsField,
             ttl: acc.ttl,
             updatedAtField: acc.updatedAtField,
+            autoIncrementField: acc.autoIncrementField,
             authorize: acc.authorize,
             defaults: acc.defaults,
             softDelete: acc.softDelete
@@ -721,6 +747,7 @@ private struct Acc: Sendable {
     var collaboratorsField: String?
     var ttl: TtlDef?
     var updatedAtField: String?
+    var autoIncrementField: String?
     var authorize: FilterExpr?
     var defaults: [String: JSONValue] = [:]
     var softDelete = false

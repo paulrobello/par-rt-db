@@ -584,6 +584,17 @@ export interface TableJson {
    * Server-enforced; clients only declare it. Omitted on the wire when
    * unset. */
   updatedAtField?: string;
+  /** Opt-in server-assigned per-table monotonic counter (FM-37): names a
+   * declared `int64` field stamped from a per-table Postgres sequence on
+   * insert (and upsert's insert branch) with the next value as a decimal
+   * string (the int64 wire convention), overwriting any client-supplied
+   * value. Immutable after insert — a patch or replace that changes the
+   * stored value is rejected. Must be declared `int64` exactly and differ
+   * from `ttl.field` and `updatedAtField`. Legal in a unique index (the
+   * ticket-number guarantee); gaps are possible on rolled-back transactions.
+   * Server-enforced; clients only declare it. Omitted on the wire when
+   * unset. */
+  autoIncrementField?: string;
   /** Opt-in per-row authorization predicate (Model C). A general `FilterExpr`
    * over this table's declared doc fields and the principal's markers
    * (`{"$user":true}` / `{"$email":true}`). Enforced on the same

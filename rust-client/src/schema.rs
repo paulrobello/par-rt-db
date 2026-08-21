@@ -379,6 +379,20 @@ pub struct TableDef {
         rename = "updatedAtField"
     )]
     pub updated_at_field: Option<String>,
+    /// Server-assigned per-table monotonic counter (FM-37): names a declared
+    /// `int64` field the server stamps from a per-table sequence on insert
+    /// (and upsert's insert branch), overwriting any client-supplied value
+    /// (the `ownerField` authority model). Immutable after insert — a patch
+    /// or replace that changes the stored value is rejected. Additive —
+    /// schemas without it deserialize unchanged. Mirrors
+    /// `server/src/schema.rs::TableDef` byte-for-byte (wire key
+    /// `autoIncrementField`).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "autoIncrementField"
+    )]
+    pub auto_increment_field: Option<String>,
     /// Opt-in per-row authorization predicate (Model C). A general `FilterExpr`
     /// over this table's declared doc fields and the principal's markers
     /// (`{"$user":true}` / `{"$email":true}`). Enforced on the same
@@ -426,6 +440,7 @@ pub struct TableBuilder {
     collaborators_field: Option<String>,
     ttl: Option<TtlDef>,
     updated_at_field: Option<String>,
+    auto_increment_field: Option<String>,
     authorize: Option<FilterExpr>,
     defaults: BTreeMap<String, serde_json::Value>,
     soft_delete: bool,
@@ -446,6 +461,7 @@ impl TableBuilder {
             collaborators_field: None,
             ttl: None,
             updated_at_field: None,
+            auto_increment_field: None,
             authorize: None,
             defaults: BTreeMap::new(),
             soft_delete: false,
@@ -591,6 +607,22 @@ impl TableBuilder {
         self
     }
 
+    /// Declare a server-assigned per-table monotonic counter (FM-37). `field`
+    /// names a declared `int64` field the server stamps with the next
+    /// per-table sequence value on insert (and upsert's insert branch) —
+    /// AFTER defaults, overwriting any client-supplied value (and any
+    /// `defaults` entry on the same field). After insert the field is
+    /// immutable: a patch / upsert-update patch / patchByQuery supplying a
+    /// different value is rejected, and a replace must round-trip the stored
+    /// value (omitted/null is filled back in). The value is a decimal string
+    /// (the int64 wire convention). Server-enforced on the live server; the
+    /// client only declares it and round-trips it on the wire as
+    /// `autoIncrementField`.
+    pub fn auto_increment_field(mut self, field: &str) -> Self {
+        self.auto_increment_field = Some(field.into());
+        self
+    }
+
     /// Declare the per-row authorization predicate (Model C). `predicate` is a
     /// `FilterExpr` over this table's declared doc fields and the principal's
     /// markers (`{"$user":true}` / `{"$email":true}`). Enforced on the same
@@ -638,6 +670,7 @@ impl TableBuilder {
             collaborators_field: self.collaborators_field,
             ttl: self.ttl,
             updated_at_field: self.updated_at_field,
+            auto_increment_field: self.auto_increment_field,
             authorize: self.authorize,
             defaults: self.defaults,
             soft_delete: self.soft_delete,
@@ -1291,6 +1324,33 @@ mod tests {
                 .unwrap()
                 .contains("updatedAtField"),
             "updatedAtField must be omitted on the wire when unset"
+        );
+    }
+
+    #[test]
+    fn auto_increment_field_serializes_and_round_trips() {
+        // FM-37: `autoIncrementField` is an opt-in table-level hint — present
+        // on the wire (camelCase) when set, omitted entirely when absent,
+        // mirroring `server/src/schema.rs::TableDef` byte-for-byte. Stamping
+        // is server-only; the client only declares and round-trips it.
+        let td = Table::new()
+            .field("title", FieldType::String)
+            .field("num", FieldType::Int64)
+            .index("by_title", &["title"])
+            .auto_increment_field("num")
+            .finish();
+        let json = serde_json::to_value(&td).unwrap();
+        assert_eq!(json["autoIncrementField"], "num");
+        // Round-trips back through the wire type.
+        let back: TableDef = serde_json::from_value(json).unwrap();
+        assert_eq!(back.auto_increment_field.as_deref(), Some("num"));
+        // Absent -> omitted entirely (not serialized as null).
+        let none = Table::new().field("title", FieldType::String).finish();
+        assert!(
+            !serde_json::to_string(&none)
+                .unwrap()
+                .contains("autoIncrementField"),
+            "autoIncrementField must be omitted on the wire when unset"
         );
     }
 

@@ -231,6 +231,7 @@ schema = SchemaDef.model_validate(
                     "name": t.string(),
                     "n": t.number(),
                     "updatedAt": t.number(),
+                    "ticketNum": t.int64(),
                     "embedding": t.vector(384),
                     "owner": t.id("users"),
                 },
@@ -253,6 +254,13 @@ schema = SchemaDef.model_validate(
                 # version-bumping write, overwriting any client-supplied value
                 # (a decimal string on an int64 field).
                 "updatedAtField": "updatedAt",
+                # Server-assigned autoIncrementField (FM-37): names a declared
+                # int64 field stamped with the next value of a per-table
+                # monotonic counter on insert (and upsert's insert branch),
+                # overwriting any client-supplied value as a decimal string.
+                # Immutable after insert — a patch or replace that changes the
+                # stored value is rejected; legal in a unique index.
+                "autoIncrementField": "ticketNum",
             }
         }
     }

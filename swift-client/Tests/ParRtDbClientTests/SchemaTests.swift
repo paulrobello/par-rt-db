@@ -644,6 +644,22 @@ struct SchemaBuilderTests {
         #expect(try wireValue(none).objectValue?["updatedAtField"] == nil)
     }
 
+    @Test func autoIncrementFieldSerializesAndRoundTrips() throws {
+        // Mirrors the server's autoIncrementField push round-trip (FM-37):
+        // camelCase wire key when set, omitted when unset.
+        let table = TableBuilder()
+            .field("title", .string)
+            .field("num", .int64)
+            .index("by_title", on: ["title"])
+            .autoIncrementField("num")
+            .finish()
+        #expect(try wireValue(table).objectValue?["autoIncrementField"] == .string("num"))
+        #expect(try roundTrip(table) == table)
+        // Omitted when unset — an ordinary table serializes without the key.
+        let none = TableBuilder().field("title", .string).finish()
+        #expect(try wireValue(none).objectValue?["autoIncrementField"] == nil)
+    }
+
     @Test func softDeleteSerializesAndRoundTrips() throws {
         // Mirrors rust `soft_delete_serializes_and_round_trips`.
         let table = TableBuilder()
@@ -667,6 +683,7 @@ struct SchemaBuilderTests {
         #expect(table.collaboratorsField == nil)
         #expect(table.ttl == nil)
         #expect(table.updatedAtField == nil)
+        #expect(table.autoIncrementField == nil)
         #expect(table.authorize == nil)
         #expect(table.defaults.isEmpty)
         #expect(!table.softDelete)

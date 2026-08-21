@@ -585,16 +585,18 @@ pub(super) fn detect_destructive_changes(
     Ok(())
 }
 
-/// Push-time schema validation — the TTL, `updatedAtField`, and index-field
-/// rules of server `schema::validate` (`schema.rs::validate_indexes` +
-/// `validate_ttl` + `validate_updated_at`), so an
+/// Push-time schema validation — the TTL, `updatedAtField`,
+/// `autoIncrementField`, and index-field rules of server `schema::validate`
+/// (`schema.rs::validate_indexes` + `validate_ttl` + `validate_updated_at` +
+/// `validate_auto_increment`), so an
 /// in-memory `push_schema` rejects with `SCHEMA_VIOLATION` what the live
 /// server 422s: index fields must be declared and indexable, search indexes
 /// must cover text fields, a TTL must name a numeric field carrying a
-/// single-field, non-unique, non-partial btree index, and `updatedAtField`
-/// must name a declared number/int64 field distinct from `ttl.field`. This is
-/// deliberately a subset — identifier formats, owner/collaborator fields,
-/// defaults, and `onDelete` shapes stay server-side.
+/// single-field, non-unique, non-partial btree index, `updatedAtField`
+/// must name a declared number/int64 field distinct from `ttl.field`, and
+/// `autoIncrementField` must name a declared int64 field distinct from both.
+/// This is deliberately a subset — identifier formats, owner/collaborator
+/// fields, defaults, and `onDelete` shapes stay server-side.
 impl SchemaDef {
     /// Validates TTL and index-field rules (see the impl docs) — called by
     /// [`InMemoryRtDbClient::push_schema`] before the destructive-change check.
@@ -699,6 +701,48 @@ impl SchemaDef {
                         ErrorCode::SchemaViolation,
                         format!(
                             "updatedAtField '{field}' must differ from ttl.field (both stamps write unconditionally; a shared field would drop the expiry)"
+                        ),
+                    ));
+                }
+            }
+            // `autoIncrementField` (FM-37) push validation — the same rules
+            // as the server's `validate_auto_increment` minus the
+            // identifier-format check (identifier formats stay server-side,
+            // like the rest of this subset): the field must be declared
+            // `int64` exactly (the counter produces int64; a `number` would
+            // lose precision) and differ from `ttl.field` and
+            // `updatedAtField` (both stamp unconditionally on writes the
+            // counter must survive verbatim).
+            if let Some(field) = &table.auto_increment_field {
+                let fty = table.fields.get(field).ok_or_else(|| {
+                    RtDbError::new(
+                        ErrorCode::SchemaViolation,
+                        format!("autoIncrementField '{field}' is not a declared field"),
+                    )
+                })?;
+                if !matches!(fty, FieldType::Int64) {
+                    return Err(RtDbError::new(
+                        ErrorCode::SchemaViolation,
+                        format!("autoIncrementField '{field}' must be an int64 field"),
+                    ));
+                }
+                if table.ttl.as_ref().is_some_and(|ttl| &ttl.field == field) {
+                    return Err(RtDbError::new(
+                        ErrorCode::SchemaViolation,
+                        format!(
+                            "autoIncrementField '{field}' must differ from ttl.field (the ttl reaper would delete counter rows)"
+                        ),
+                    ));
+                }
+                if table
+                    .updated_at_field
+                    .as_ref()
+                    .is_some_and(|at| at == field)
+                {
+                    return Err(RtDbError::new(
+                        ErrorCode::SchemaViolation,
+                        format!(
+                            "autoIncrementField '{field}' must differ from updatedAtField (the timestamp would overwrite the counter on every write)"
                         ),
                     ));
                 }

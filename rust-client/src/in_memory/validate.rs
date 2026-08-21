@@ -289,11 +289,28 @@ pub(super) fn apply_defaults(table_def: &TableDef, doc: &Map<String, Value>) -> 
 /// onto an `Optional` field whose inner type doesn't itself accept `null`
 /// deletes the key (mirroring `strip_unset_optionals`'s single representation
 /// of an unset optional); the merged doc is then re-validated whole.
+///
+/// The auto-increment field (FM-37) is server-assigned and immutable after
+/// insert. A patch may carry it back unchanged (round-trip friendly), but any
+/// different value — including a type-shifted form of the same number — is
+/// rejected. Mirrors the check at the top of server `txn::apply_patch`;
+/// because every patch-shaped path here (`Patch`, upsert's update branch,
+/// `patchByQuery`, cascade setNull) funnels through this function, one check
+/// covers them all exactly as on the server.
 pub fn apply_patch(
     table: &TableDef,
     doc: &Value,
     fields: &Map<String, Value>,
 ) -> Result<Value, RtDbError> {
+    if let Some(auto) = &table.auto_increment_field
+        && let Some(value) = fields.get(auto)
+        && doc.get(auto) != Some(value)
+    {
+        return Err(RtDbError::new(
+            ErrorCode::BadRequest,
+            format!("autoIncrementField '{auto}' cannot be changed"),
+        ));
+    }
     let mut merged = match doc.as_object() {
         Some(m) => m.clone(),
         None => Map::new(),

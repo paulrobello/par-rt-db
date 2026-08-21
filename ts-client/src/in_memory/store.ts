@@ -672,6 +672,16 @@ function applyPatch(
   doc: Record<string, unknown>,
   fields: Record<string, unknown>,
 ): Record<string, unknown> {
+  // The auto-increment field is server-assigned and immutable after insert.
+  // A patch may carry it back unchanged (round-trip friendly), but any
+  // different value — including a type-shifted form of the same number — is
+  // rejected. Covers `patch`, upsert's update branch, and `patchByQuery`
+  // (every patch-shaped path funnels through here). Mirrors the check at the
+  // top of server `txn::apply_patch`.
+  const auto = table.autoIncrementField;
+  if (auto !== undefined && auto in fields && doc[auto] !== fields[auto]) {
+    throw new RtDbError("BAD_REQUEST", `autoIncrementField '${auto}' cannot be changed`);
+  }
   const merged: Record<string, unknown> = { ...doc };
   for (const [field, value] of Object.entries(fields)) {
     const fieldTy = table.fields[field];
@@ -701,6 +711,11 @@ export class InMemoryRtDbClient {
   private readonly random: () => number;
   private schema: SchemaJson | null = null;
   private readonly tables = new Map<string, Map<string, StoredRow>>();
+  /** Next value of each table's auto-increment counter (FM-37) — the
+   * in-memory stand-in for the server's per-table Postgres sequence.
+   * Monotonic from 1; absent until the first stamp (a table that declares
+   * no `autoIncrementField` never touches it). */
+  private readonly autoCounters = new Map<string, bigint>();
   private readonly idempotency = new Map<string, unknown[]>();
   private readonly subs: Subscription[] = [];
   private readonly schedules = new Map<string, ScheduledJob>();
@@ -1593,10 +1608,15 @@ export class InMemoryRtDbClient {
   }
 
   private doInsert(tableName: string, tableDef: TableJson, doc: Record<string, unknown>): string {
-    // Server `step_insert` order: ttl default → updatedAt stamp → defaults.
-    const stamped = applyDefaults(
+    // Server `step_insert` order: ttl default → updatedAt stamp → defaults →
+    // autoIncrement stamp (the counter wins over a defaults entry).
+    const stamped = this.stampAutoIncrement(
+      tableName,
       tableDef,
-      stampUpdatedAt(tableDef, stampTtlDefault(tableDef, doc, this.now()), this.now()),
+      applyDefaults(
+        tableDef,
+        stampUpdatedAt(tableDef, stampTtlDefault(tableDef, doc, this.now()), this.now()),
+      ),
     );
     validateDoc(tableDef, stamped);
     const stored = stripUnsetOptionals(tableDef, stamped);
@@ -1619,6 +1639,33 @@ export class InMemoryRtDbClient {
     this.doUpdate(tableName, tableDef, row, merged);
   }
 
+  /** Stamps the table's `autoIncrementField` (FM-37) with the next value of
+   * the per-table counter, overwriting any client-supplied value — the same
+   * authority model as `stampUpdatedAt`, one step later (the counter wins
+   * over a `defaults` entry on the same field). Runs on the two insert paths
+   * only (`insert` and upsert's insert branch — both funnel through
+   * `doInsert`); after insert the field is immutable (`applyPatch` /
+   * `doReplace` reject changes). The value is a decimal string, matching the
+   * int64 wire convention. Mirrors server `txn::stamp_auto_increment`
+   * (minus gap semantics: the in-memory counter only advances on stamps, so
+   * it is gap-free where a rolled-back server txn still consumes its
+   * number). */
+  private stampAutoIncrement(
+    tableName: string,
+    tableDef: TableJson,
+    doc: Record<string, unknown>,
+  ): Record<string, unknown> {
+    const field = tableDef.autoIncrementField;
+    if (field === undefined) {
+      return doc;
+    }
+    const next = (this.autoCounters.get(tableName) ?? 0n) + 1n;
+    this.autoCounters.set(tableName, next);
+    const out: Record<string, unknown> = { ...doc };
+    out[field] = String(next);
+    return out;
+  }
+
   private doReplace(
     tableDef: TableJson,
     tableName: string,
@@ -1628,7 +1675,24 @@ export class InMemoryRtDbClient {
     const row = this.requireRow(tableName, id);
     // Server `step_replace` order: defaults → updatedAt stamp (the stamp wins
     // over a defaults entry on the same field).
-    const stamped = stampUpdatedAt(tableDef, applyDefaults(tableDef, doc), this.now());
+    let stamped = stampUpdatedAt(tableDef, applyDefaults(tableDef, doc), this.now());
+    // FM-37: a replace validates as a complete document, so the server-stamped
+    // auto-increment value must be present: an omitted (or null) field is
+    // filled from the stored row (preserved, never re-assigned), and a
+    // supplied value must equal the stored one — round-trip replace works,
+    // changing the counter does not. A stored doc that PREDATES the
+    // declaration (no stored value) has no value to preserve, so a replace
+    // may set one — first-set, like an insert. Mirrors the preserve-or-reject
+    // block in server `txn::do_replace`.
+    const auto = tableDef.autoIncrementField;
+    if (auto !== undefined && row.doc[auto] !== undefined) {
+      const stored = row.doc[auto];
+      if (stamped[auto] == null) {
+        stamped = { ...stamped, [auto]: stored };
+      } else if (stamped[auto] !== stored) {
+        throw new RtDbError("BAD_REQUEST", `autoIncrementField '${auto}' cannot be changed`);
+      }
+    }
     validateDoc(tableDef, stamped);
     const stored = stripUnsetOptionals(tableDef, stamped);
     this.checkUniqueIndexes(tableName, tableDef, stored, row.id);

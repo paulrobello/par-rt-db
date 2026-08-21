@@ -50,6 +50,16 @@ mutate, and subscription re-run; machine tokens bypass):
   upsert both branches, patchByQuery, cascade setNull), overwriting any
   client-supplied value — a JSON number on `number`, a decimal string on
   `int64`. Must differ from `ttl.field`; no index required.
+- `.autoIncrementField("num")` — declares a server-assigned per-table
+  monotonic counter (FM-37): names a declared `int64` field the server stamps
+  with the next sequence value on insert (and upsert's insert branch) as a
+  decimal string, overwriting any client-supplied value (a `defaults` entry
+  on the field loses to the stamp). Immutable after insert — a patch or
+  replace that changes the stored value is rejected; round-tripping the
+  equal value is allowed, and a replace that omits the field keeps the
+  stored one. Must be `int64` exactly and differ from `ttl.field` and
+  `updatedAtField`; legal in a unique index (the ticket-number guarantee).
+  Gaps are possible on rolled-back transactions.
 
 Push it with the admin client (admin key required):
 

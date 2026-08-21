@@ -128,9 +128,10 @@ export function detectDestructiveChanges(oldSchema: SchemaJson, newSchema: Schem
   }
 }
 
-/** Push-time schema validation — the TTL, updatedAtField, and index-field rules
- *  of server `schema::validate` (`schema::validate_indexes` + `validate_ttl` +
- *  `validate_updated_at`), mirroring the rust harness's `SchemaDef::validate`:
+/** Push-time schema validation — the TTL, updatedAtField, autoIncrementField,
+ *  and index-field rules of server `schema::validate` (`schema::validate_indexes`
+ *  + `validate_ttl` + `validate_updated_at` + `validate_auto_increment`),
+ *  mirroring the rust harness's `SchemaDef::validate`:
  *  index fields must be declared and indexable, search indexes must cover text
  *  fields, and a TTL must name a numeric field carrying a single-field,
  *  non-unique, non-partial btree index. Deliberately a subset — identifier
@@ -225,6 +226,43 @@ export function validateSchema(schema: SchemaJson): void {
         throw new RtDbError(
           "SCHEMA_VIOLATION",
           `updatedAtField '${updatedAt}' must differ from ttl.field (both stamps write unconditionally; a shared field would drop the expiry)`,
+        );
+      }
+    }
+    // FM-37 `autoIncrementField` push validation — mirrors server
+    // `schema::validate_auto_increment` (minus the identifier-format check,
+    // which stays server-side like every other identifier rule here): the
+    // field must be declared `int64` exactly (the counter produces int64; a
+    // `number` would lose precision, an `optional` would admit a missing
+    // counter) and must differ from `ttl.field` and `updatedAtField` (both
+    // stamp unconditionally on writes the counter must survive verbatim). A
+    // `defaults` entry on the field is allowed but always loses to the
+    // stamp.
+    const autoIncrement = table.autoIncrementField;
+    if (autoIncrement !== undefined) {
+      const fieldType = table.fields[autoIncrement];
+      if (!fieldType) {
+        throw new RtDbError(
+          "SCHEMA_VIOLATION",
+          `autoIncrementField '${autoIncrement}' is not a declared field`,
+        );
+      }
+      if (fieldType.type !== "int64") {
+        throw new RtDbError(
+          "SCHEMA_VIOLATION",
+          `autoIncrementField '${autoIncrement}' must be an int64 field`,
+        );
+      }
+      if (ttl !== undefined && ttl.field === autoIncrement) {
+        throw new RtDbError(
+          "SCHEMA_VIOLATION",
+          `autoIncrementField '${autoIncrement}' must differ from ttl.field (the ttl reaper would delete counter rows)`,
+        );
+      }
+      if (updatedAt !== undefined && updatedAt === autoIncrement) {
+        throw new RtDbError(
+          "SCHEMA_VIOLATION",
+          `autoIncrementField '${autoIncrement}' must differ from updatedAtField (the timestamp would overwrite the counter on every write)`,
         );
       }
     }

@@ -51,7 +51,14 @@ upsert-insert only; `patch` never re-applies). `updated_at_field(field)`
 declares a server-stamped update timestamp (FM-36) — the named `number`/`int64`
 field is overwritten with the current epoch-ms on every version-bumping write
 (insert, patch, replace, upsert, patchByQuery, cascade setNull), so any
-client-supplied value never survives.
+client-supplied value never survives. `auto_increment_field(field)` declares a
+server-assigned per-table monotonic counter (FM-37) — the named `int64` field
+is stamped with the next per-table sequence value on insert (and upsert's
+insert branch), after defaults, overwriting any client-supplied value (and any
+`defaults` entry on the field); the decimal-string value is immutable after
+insert (a patch / upsert-update patch / patchByQuery supplying a different
+value is rejected, and a replace must round-trip the stored value —
+omitted/null is filled back in).
 
 ### In-memory test harness (feature `in_memory`)
 

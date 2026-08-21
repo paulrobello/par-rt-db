@@ -380,6 +380,291 @@ struct InMemoryTests {
         #expect(stamped != 12345)
     }
 
+    // MARK: autoIncrementField (FM-37)
+
+    private func counterSchema() throws -> SchemaDef {
+        try SchemaBuilder()
+            .table("tickets") {
+                $0.field("title", .string)
+                    .field("num", .int64)
+                    .index("by_title", on: ["title"])
+                    .autoIncrementField("num")
+            }
+            .build()
+    }
+
+    private func insertTicket(
+        _ client: InMemoryRtDbClient, _ doc: [String: JSONValue]
+    ) throws -> String {
+        let results = try client.mutate(Transaction(steps: [
+            .insert(table: "tickets", doc: doc)
+        ]))
+        guard case let .insert(id) = results[0] else {
+            throw RtDbError(code: .internal, message: "expected insert result")
+        }
+        return id
+    }
+
+    /// The stored `num` counter of a tickets doc — a decimal string (the
+    /// int64 wire convention).
+    private func storedCounter(_ doc: JSONValue) -> String? {
+        guard case let .string(text)? = doc.objectValue?["num"] else { return nil }
+        return text
+    }
+
+    /// Asserts `body` throws a BAD_REQUEST whose message contains `fragment`.
+    private func expectBadRequest(_ fragment: String, _ body: () throws -> Void) throws {
+        do {
+            try body()
+            Issue.record("expected BAD_REQUEST containing '\(fragment)'")
+        } catch let error as RtDbError {
+            #expect(error.code == .badRequest)
+            #expect(error.message.contains(fragment))
+        }
+    }
+
+    @Test func pushRejectsUndeclaredAutoIncrementField() throws {
+        let schema = try SchemaBuilder()
+            .table("tickets") {
+                $0.field("title", .string)
+                    .field("num", .int64)
+                    .index("by_title", on: ["title"])
+                    .autoIncrementField("nope")
+            }
+            .build()
+        try expectPushError(schema, "autoIncrementField 'nope' is not a declared field")
+    }
+
+    @Test func pushRejectsNonInt64AutoIncrementField() throws {
+        let numberField = try SchemaBuilder()
+            .table("tickets") {
+                $0.field("title", .string)
+                    .field("num", .number)
+                    .index("by_title", on: ["title"])
+                    .autoIncrementField("num")
+            }
+            .build()
+        try expectPushError(numberField, "autoIncrementField 'num' must be an int64 field")
+        let optionalField = try SchemaBuilder()
+            .table("tickets") {
+                $0.field("title", .string)
+                    .field("num", .optional(.int64))
+                    .autoIncrementField("num")
+            }
+            .build()
+        try expectPushError(optionalField, "autoIncrementField 'num' must be an int64 field")
+    }
+
+    @Test func pushRejectsCounterCollidingWithTtlOrUpdatedAt() throws {
+        let ttlCollision = try SchemaBuilder()
+            .table("sessions") {
+                $0.field("token", .string)
+                    .field("expiresAt", .int64)
+                    .index("by_token", on: ["token"])
+                    .index("by_expiresAt", on: ["expiresAt"])
+                    .ttl("expiresAt")
+                    .autoIncrementField("expiresAt")
+            }
+            .build()
+        try expectPushError(ttlCollision, "must differ from ttl.field")
+        let updatedAtCollision = try SchemaBuilder()
+            .table("tasks") {
+                $0.field("title", .string)
+                    .field("updatedAt", .int64)
+                    .index("by_title", on: ["title"])
+                    .updatedAtField("updatedAt")
+                    .autoIncrementField("updatedAt")
+            }
+            .build()
+        try expectPushError(updatedAtCollision, "must differ from updatedAtField")
+    }
+
+    @Test func insertAssignsSequentialValuesOverwritingClientValue() throws {
+        let client = deterministicClient()
+        try client.pushSchema(counterSchema())
+        let first = try insertTicket(client, ["title": .string("A"), "num": .string("999")])
+        let second = try insertTicket(client, ["title": .string("B")])
+        let third = try insertTicket(client, ["title": .string("C"), "num": .string("5")])
+        #expect(try storedCounter(client.query(Query(table: "tickets", get: first))) == "1")
+        #expect(try storedCounter(client.query(Query(table: "tickets", get: second))) == "2")
+        #expect(try storedCounter(client.query(Query(table: "tickets", get: third))) == "3")
+    }
+
+    @Test func autoIncrementStampWinsOverDefaultsEntry() throws {
+        let client = deterministicClient()
+        try client.pushSchema(
+            SchemaBuilder()
+                .table("tickets") {
+                    $0.field("title", .string)
+                        .field("num", .int64)
+                        .index("by_title", on: ["title"])
+                        .autoIncrementField("num")
+                        .defaults(["num": .string("42")])
+                }
+                .build()
+        )
+        let id = try insertTicket(client, ["title": .string("A")])
+        #expect(try storedCounter(client.query(Query(table: "tickets", get: id))) == "1")
+    }
+
+    @Test func patchCannotChangeTheCounter() throws {
+        let client = deterministicClient()
+        try client.pushSchema(counterSchema())
+        let id = try insertTicket(client, ["title": .string("A")])
+
+        try expectBadRequest("autoIncrementField 'num' cannot be changed") {
+            try client.mutate(Transaction(steps: [
+                .patch(table: "tickets", id: id, fields: ["num": .string("99")])
+            ]))
+        }
+        #expect(try storedCounter(client.query(Query(table: "tickets", get: id))) == "1")
+
+        // Round-tripping the same value is allowed.
+        try client.mutate(Transaction(steps: [
+            .patch(table: "tickets", id: id, fields: ["num": .string("1"), "title": .string("A2")])
+        ]))
+        let doc = try client.query(Query(table: "tickets", get: id))
+        #expect(storedCounter(doc) == "1")
+        #expect(doc.objectValue?["title"] == .string("A2"))
+    }
+
+    @Test func replacePreservesOrRejectsTheCounter() throws {
+        let client = deterministicClient()
+        try client.pushSchema(counterSchema())
+        let id = try insertTicket(client, ["title": .string("A")])
+
+        // A replace that omits the field keeps the stored value (it validates
+        // as a complete document only because the engine fills it back in).
+        try client.mutate(Transaction(steps: [
+            .replace(table: "tickets", id: id, doc: ["title": .string("A2")])
+        ]))
+        var doc = try client.query(Query(table: "tickets", get: id))
+        #expect(storedCounter(doc) == "1")
+        #expect(doc.objectValue?["title"] == .string("A2"))
+
+        // A replace that changes the value is rejected.
+        try expectBadRequest("autoIncrementField 'num' cannot be changed") {
+            try client.mutate(Transaction(steps: [
+                .replace(
+                    table: "tickets", id: id,
+                    doc: ["title": .string("A3"), "num": .string("5")]
+                )
+            ]))
+        }
+
+        // Round-tripping the stored value works.
+        try client.mutate(Transaction(steps: [
+            .replace(
+                table: "tickets", id: id,
+                doc: ["title": .string("A4"), "num": .string("1")]
+            )
+        ]))
+        doc = try client.query(Query(table: "tickets", get: id))
+        #expect(storedCounter(doc) == "1")
+        #expect(doc.objectValue?["title"] == .string("A4"))
+    }
+
+    @Test func upsertInsertAssignsAndUpdatePreserves() throws {
+        let client = deterministicClient()
+        try client.pushSchema(counterSchema())
+        let results = try client.mutate(Transaction(steps: [
+            .upsert(
+                table: "tickets", index: "by_title", eq: [.string("A")],
+                insert: ["title": .string("A"), "num": .string("999")],
+                patch: [:]
+            )
+        ]))
+        guard case let .upsert(id, inserted) = results[0], inserted else {
+            Issue.record("expected upsert-insert result")
+            return
+        }
+        #expect(try storedCounter(client.query(Query(table: "tickets", get: id))) == "1")
+
+        // Update branch: carrying the stored value is fine...
+        try client.mutate(Transaction(steps: [
+            .upsert(
+                table: "tickets", index: "by_title", eq: [.string("A")],
+                insert: [:],
+                patch: ["title": .string("A2"), "num": .string("1")]
+            )
+        ]))
+        #expect(try storedCounter(client.query(Query(table: "tickets", get: id))) == "1")
+
+        // ...changing it is not.
+        try expectBadRequest("autoIncrementField 'num' cannot be changed") {
+            try client.mutate(Transaction(steps: [
+                .upsert(
+                    table: "tickets", index: "by_title", eq: [.string("A2")],
+                    insert: [:],
+                    patch: ["num": .string("42")]
+                )
+            ]))
+        }
+        #expect(try storedCounter(client.query(Query(table: "tickets", get: id))) == "1")
+    }
+
+    @Test func patchByQueryCannotChangeTheCounter() throws {
+        let client = deterministicClient()
+        try client.pushSchema(counterSchema())
+        let id = try insertTicket(client, ["title": .string("A")])
+
+        try expectBadRequest("autoIncrementField 'num' cannot be changed") {
+            try client.mutate(Transaction(steps: [
+                .patchByQuery(
+                    table: "tickets",
+                    filter: .eq(field: "title", value: .string("A")),
+                    patch: ["num": .string("99")],
+                    limit: nil
+                )
+            ]))
+        }
+        #expect(try storedCounter(client.query(Query(table: "tickets", get: id))) == "1")
+    }
+
+    @Test func declarationAddedToPopulatedTableRepositionsPastMax() throws {
+        let client = deterministicClient()
+        // v1: plain int64 field, client-supplied values (no counter yet).
+        let v1 = try SchemaBuilder()
+            .table("tickets") {
+                $0.field("title", .string)
+                    .field("num", .int64)
+                    .index("by_title", on: ["title"])
+            }
+            .build()
+        try client.pushSchema(v1)
+        _ = try insertTicket(client, ["title": .string("t1"), "num": .string("41")])
+        _ = try insertTicket(client, ["title": .string("t2"), "num": .string("7")])
+
+        // v2: same schema plus the declaration — additive push.
+        try client.pushSchema(counterSchema())
+        let id = try insertTicket(client, ["title": .string("new")])
+        #expect(
+            try storedCounter(client.query(Query(table: "tickets", get: id))) == "42",
+            "the counter is repositioned past the stored max, not restarted at 1"
+        )
+    }
+
+    @Test func rePushDoesNotDisturbTheCounter() throws {
+        let client = deterministicClient()
+        try client.pushSchema(counterSchema())
+        _ = try insertTicket(client, ["title": .string("A")])
+        _ = try insertTicket(client, ["title": .string("B")])
+
+        // An unrelated additive push (new field) must not reposition anything.
+        let evolved = try SchemaBuilder()
+            .table("tickets") {
+                $0.field("title", .string)
+                    .field("num", .int64)
+                    .field("owner", .optional(.string))
+                    .index("by_title", on: ["title"])
+                    .autoIncrementField("num")
+            }
+            .build()
+        try client.pushSchema(evolved)
+        let id = try insertTicket(client, ["title": .string("C")])
+        #expect(try storedCounter(client.query(Query(table: "tickets", get: id))) == "3")
+    }
+
     @Test func insertRejectsReservedAndUnknownFields() throws {
         let client = deterministicClient()
         try client.pushSchema(itemsSchema())

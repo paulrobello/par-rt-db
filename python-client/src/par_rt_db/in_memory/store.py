@@ -761,6 +761,24 @@ def _stamp_updated_at(table_def: TableDef, target: dict[str, Any], now: int) -> 
     return {**target, field: value}
 
 
+def _stored_int_max(docs: dict[tuple[str, str], StoredRow], table: str, field: str) -> int:
+    """Largest stored integer value of ``field`` across ``table``'s rows —
+    the in-memory stand-in for the server's ``max((doc->>'{field}')::bigint)``
+    physical scan (soft-deleted rows included: tombstones are still rows)."""
+    best = 0
+    for (t, _id), row in docs.items():
+        if t != table:
+            continue
+        value = row.doc.get(field)
+        if not isinstance(value, str):
+            continue
+        try:
+            best = max(best, int(value))
+        except ValueError:
+            continue
+    return best
+
+
 def _optional_rejects_null(ty: Any) -> bool:
     """``True`` iff ``ty`` is an ``Optional`` whose inner type does not itself
     accept ``None`` (so a null value should be stripped to "key absent")."""
@@ -788,6 +806,14 @@ def apply_patch(table: TableDef, doc: dict[str, Any], fields: dict[str, Any]) ->
     """Apply a patch's ``fields`` onto ``doc``. A ``None`` onto an ``Optional``
     field whose inner type doesn't itself accept ``None`` deletes the key; the
     merged doc is then re-validated whole. Raises ``SCHEMA_VIOLATION`` on violation."""
+    # FM-37: the auto-increment field is server-assigned and immutable after
+    # insert. A patch may carry it back unchanged (round-trip friendly), but
+    # any different value — including a type-shifted form of the same number —
+    # is rejected. Every patch-shaped path funnels through here (patch,
+    # upsert's update branch, patchByQuery), mirroring server ``apply_patch``.
+    auto = table.auto_increment_field
+    if auto is not None and auto in fields and doc.get(auto) != fields[auto]:
+        raise RtDbError(ErrorCode.BAD_REQUEST, f"autoIncrementField '{auto}' cannot be changed")
     merged = dict(doc)
     for fld, value in fields.items():
         field_ty = table.fields.get(fld)
@@ -936,6 +962,39 @@ def _validate_schema(schema: SchemaDef) -> None:
                     ErrorCode.SCHEMA_VIOLATION,
                     f"updatedAtField '{updated_at}' must differ from ttl.field (both stamps"
                     " write unconditionally; a shared field would drop the expiry)",
+                )
+        # FM-37: `autoIncrementField` names a declared `int64` field exactly
+        # (the counter produces int64; a `number` would lose precision, an
+        # `optional` would admit a missing counter) and must differ from
+        # `ttl.field` and `updatedAtField` (both stamp unconditionally on
+        # writes the counter must survive verbatim). A `defaults` entry on the
+        # field is allowed but always loses to the stamp (server
+        # `validate_auto_increment`; the identifier-format check stays
+        # server-side like the other identifier rules).
+        auto = table.auto_increment_field
+        if auto is not None:
+            auto_ty = table.fields.get(auto)
+            if auto_ty is None:
+                raise RtDbError(
+                    ErrorCode.SCHEMA_VIOLATION,
+                    f"autoIncrementField '{auto}' is not a declared field",
+                )
+            if not isinstance(auto_ty, _FInt64):
+                raise RtDbError(
+                    ErrorCode.SCHEMA_VIOLATION,
+                    f"autoIncrementField '{auto}' must be an int64 field",
+                )
+            if ttl is not None and ttl.field == auto:
+                raise RtDbError(
+                    ErrorCode.SCHEMA_VIOLATION,
+                    f"autoIncrementField '{auto}' must differ from ttl.field (the ttl reaper"
+                    " would delete counter rows)",
+                )
+            if table.updated_at_field == auto:
+                raise RtDbError(
+                    ErrorCode.SCHEMA_VIOLATION,
+                    f"autoIncrementField '{auto}' must differ from updatedAtField (the"
+                    " timestamp would overwrite the counter on every write)",
                 )
 
 
@@ -1118,6 +1177,12 @@ class _InMemoryStoreCore:
         # suffix (the TS harness shares one `idCounter` for both; connection_id
         # minting has its own `_conn_counter` here).
         self._id_counter: int = 0
+        # FM-37: per-table auto-increment counters — the LAST value handed out
+        # (0 = untouched), the stand-in for the server's per-table Postgres
+        # sequence. Deliberately NOT part of the txn rollback snapshot: the
+        # server's `nextval` is non-transactional, so a rolled-back txn still
+        # consumes its number (monotonic, not gap-free) — same here.
+        self._auto_counters: dict[str, int] = {}
         # mut_id -> cached results (idempotency short-circuit).
         self._idempotency: dict[str, list[StepResult]] = {}
         # Scheduled jobs (one-shot + cron).
@@ -1162,9 +1227,43 @@ class _InMemoryStoreCore:
         # FM-33: the server validates `onDelete` placement/shape in
         # `SchemaDef::validate` on every push; mirror both passes here.
         _validate_on_delete(schema)
+        # FM-37: mirror `ddl::apply_sequence` — when a table's declaration is
+        # newly added or changed, reposition its counter so the next stamp is
+        # strictly past every stored value of the new field AND strictly past
+        # anything already consumed (forward-only: max with the current
+        # position). An unchanged declaration leaves the counter untouched (a
+        # re-push must not disturb it); a REMOVED declaration keeps the
+        # counter too (the server's sequence persists until the table drops).
+        for name, new_def in schema.tables.items():
+            field = new_def.auto_increment_field
+            if field is None:
+                continue
+            old = self._tables.get(name)
+            if old is not None and old.auto_increment_field == field:
+                continue
+            stored_max = _stored_int_max(self._docs, name, field)
+            self._auto_counters[name] = max(self._auto_counters.get(name, 0), stored_max)
         self._schema = schema
         for name, def_ in schema.tables.items():
             self._tables[name] = def_
+
+    def _stamp_auto_increment(
+        self, table_name: str, table_def: TableDef, doc: dict[str, Any]
+    ) -> dict[str, Any]:
+        """FM-37: stamp the table's ``autoIncrementField`` with the next value
+        of its per-table counter, overwriting any client-supplied value — the
+        same authority model as ``_stamp_updated_at``. Runs on the two insert
+        paths only (insert / upsert's insert branch, both via ``_do_insert``);
+        after insert the field is immutable (``apply_patch`` / ``_do_replace``
+        reject changes). The value is a decimal string, matching the int64 wire
+        convention. Returns a NEW dict; the counter bump is not rolled back
+        (gaps on rollback, like the server's sequence)."""
+        field = table_def.auto_increment_field
+        if field is None:
+            return doc
+        next_value = self._auto_counters.get(table_name, 0) + 1
+        self._auto_counters[table_name] = next_value
+        return {**doc, field: str(next_value)}
 
     def to_schema_json(self) -> SchemaDef | None:
         """Snapshot of the currently-installed schema (or ``None`` before
@@ -1447,6 +1546,11 @@ class _InMemoryStoreCore:
         # FM-32: after the ttl stamp (a ttl default on the same field wins),
         # before validation — so a default can populate a required field.
         _apply_defaults(table_def, doc)
+        # FM-37: the auto-increment stamp runs LAST among the insert stamps
+        # (server `step_insert` order) — after defaults, so a `defaults` entry
+        # on the same field loses — and before validation, so a required
+        # counter field is always populated.
+        doc = self._stamp_auto_increment(table_name, table_def, doc)
         validate_doc(table_def, doc)
         stored = _strip_unset_optionals(table_def, doc)
         self._check_unique_indexes(table_def, table_name, stored, None)
@@ -1493,6 +1597,23 @@ class _InMemoryStoreCore:
         # `defaults` entry on the stamped field still loses.
         _apply_defaults(table_def, doc)
         doc = _stamp_updated_at(table_def, doc, self._now())
+        # FM-37: a replace validates as a complete document, so the stamped
+        # counter must be present — an omitted field is filled from the stored
+        # row (preserved, never re-assigned), and a supplied value must equal
+        # the stored one (round-trip replace works, changing the counter does
+        # not). A stored doc that PREDATES the declaration has no value to
+        # preserve, so a replace may set one — first-set, like an insert
+        # (mirrors server `do_replace`; runs after the stamps so a `defaults`
+        # entry on the field is rejected rather than silently winning).
+        auto = table_def.auto_increment_field
+        if auto is not None and row.doc.get(auto) is not None:
+            supplied = doc.get(auto)
+            if supplied is None:
+                doc = {**doc, auto: row.doc[auto]}
+            elif supplied != row.doc[auto]:
+                raise RtDbError(
+                    ErrorCode.BAD_REQUEST, f"autoIncrementField '{auto}' cannot be changed"
+                )
         validate_doc(table_def, doc)
         stored = _strip_unset_optionals(table_def, doc)
         self._check_unique_indexes(table_def, table_name, stored, sid)

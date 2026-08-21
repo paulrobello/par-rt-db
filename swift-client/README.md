@@ -274,8 +274,11 @@ indexes (`searchIndex(_:on:language:)`), vector indexes
 (`vectorIndex(_:on:dimensions:filterFields:metric:)`), partial indexes
 (`whereClause(_:)`), `collaboratorsField`, `authorize(_:)`, `defaults(_:)`,
 `updatedAtField(_:)` (server stamps the named `number`/`int64` field with
-epoch-ms on every write, overwriting any client value), and `onDelete` on id
-fields (`.id("projects").onDelete(.cascade)`).
+epoch-ms on every write, overwriting any client value),
+`autoIncrementField(_:)` (server stamps the named `int64` field with the next
+per-table counter value on insert, overwriting any client value; immutable
+after insert), and `onDelete` on id fields
+(`.id("projects").onDelete(.cascade)`).
 
 ## Storage
 
@@ -396,7 +399,7 @@ let result = try await retryOnPrecondition {
 | Wire types — fifth implementation of the contract | ✅ (+ `wire-corpus.json` parity runner, ARC-008) |
 | Query DSL — every terminal incl. `search`/`vectorSearch`/`hybridSearch`/`paginate`/`aggregate`/`distinct` | ✅ |
 | Mutation DSL — all 14 step ops, recursive step-cap enforcement | ✅ |
-| Schema DSL — 15 field types, btree/search/vector/unique/partial indexes, `ownerField`/`collaboratorsField`/`authorize`, `ttl`, `updatedAtField`, `defaults`, `softDelete`, `onDelete` | ✅ |
+| Schema DSL — 15 field types, btree/search/vector/unique/partial indexes, `ownerField`/`collaboratorsField`/`authorize`, `ttl`, `updatedAtField`, `autoIncrementField`, `defaults`, `softDelete`, `onDelete` | ✅ |
 | HTTP client — query/query-batch/mutate (+ idempotency key, retry helper), schedule ops, workflow ops, full storage surface, `pushSchema`/`previewSchema`, `authMe` | ✅ |
 | WS client — auth/reconnect/heartbeat, shared subscriptions with replay, mutate-over-WS, schedule + workflow ops | ✅ |
 | Presence (ENH-015) — `presence(room:state:)` / `updatePresence(room:state:ttlMs:)` / `leavePresence(room:)`, `PresenceSnapshot` fan-out, reconnect replay of joined rooms | ✅ |

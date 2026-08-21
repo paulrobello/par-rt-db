@@ -113,14 +113,16 @@ public func detectDestructiveChanges(_ oldSchema: SchemaDef, _ newSchema: Schema
 // MARK: - Push-time validation
 
 // swiftlint:disable cyclomatic_complexity function_body_length
-/// Push-time schema validation — the TTL, updatedAtField, and index-field
-/// rules of server `schema::validate` (migrate.ts `validateSchema`): index
-/// fields must be declared and indexable, search indexes must cover text
-/// fields, a TTL must name a numeric field carrying a single-field,
-/// non-unique, non-partial btree index, and an `updatedAtField` must name a
-/// declared numeric field differing from `ttl.field`. Deliberately a subset —
-/// identifier formats, owner/collaborators fields, and `defaults` shapes stay
-/// server-side (`onDelete` has its own `validateOnDelete` pass).
+/// Push-time schema validation — the TTL, updatedAtField, autoIncrementField,
+/// and index-field rules of server `schema::validate` (migrate.ts
+/// `validateSchema`): index fields must be declared and indexable, search
+/// indexes must cover text fields, a TTL must name a numeric field carrying a
+/// single-field, non-unique, non-partial btree index, an `updatedAtField`
+/// must name a declared numeric field differing from `ttl.field`, and an
+/// `autoIncrementField` must name a declared `int64` field differing from
+/// both. Deliberately a subset — identifier formats, owner/collaborators
+/// fields, and `defaults` shapes stay server-side (`onDelete` has its own
+/// `validateOnDelete` pass).
 public func validateSchema(_ schema: SchemaDef) throws {
     for (tableName, table) in schema.tables {
         for index in table.indexes ?? [] {
@@ -207,6 +209,38 @@ public func validateSchema(_ schema: SchemaDef) throws {
                     code: .schemaViolation,
                     message: "updatedAtField '\(field)' must differ from ttl.field (both "
                         + "stamps write unconditionally; a shared field would drop the expiry)"
+                )
+            }
+        }
+        if let field = table.autoIncrementField {
+            guard let fieldType = table.fields[field] else {
+                throw RtDbError(
+                    code: .schemaViolation,
+                    message: "autoIncrementField '\(field)' is not a declared field"
+                )
+            }
+            // Exactly int64 (server `validate_auto_increment`): the counter
+            // produces int64 — a `number` would lose precision, an
+            // `optional` would admit a missing counter.
+            let tag = fieldTypeTag(fieldType)
+            guard tag == "int64" else {
+                throw RtDbError(
+                    code: .schemaViolation,
+                    message: "autoIncrementField '\(field)' must be an int64 field"
+                )
+            }
+            if let ttl = table.ttl, ttl.field == field {
+                throw RtDbError(
+                    code: .schemaViolation,
+                    message: "autoIncrementField '\(field)' must differ from ttl.field "
+                        + "(the ttl reaper would delete counter rows)"
+                )
+            }
+            if let updatedAt = table.updatedAtField, updatedAt == field {
+                throw RtDbError(
+                    code: .schemaViolation,
+                    message: "autoIncrementField '\(field)' must differ from updatedAtField "
+                        + "(the timestamp would overwrite the counter on every write)"
                 )
             }
         }

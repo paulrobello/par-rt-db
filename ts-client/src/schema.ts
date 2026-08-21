@@ -121,6 +121,7 @@ export class TableDefinition<
     readonly defaultsMap?: Record<string, unknown>,
     readonly softDeleteFlag?: boolean,
     readonly updatedAtFieldName?: string,
+    readonly autoIncrementFieldName?: string,
   ) {}
 
   index<Name extends string>(
@@ -137,6 +138,7 @@ export class TableDefinition<
       this.defaultsMap,
       this.softDeleteFlag,
       this.updatedAtFieldName,
+      this.autoIncrementFieldName,
     );
   }
 
@@ -176,6 +178,7 @@ export class TableDefinition<
       this.defaultsMap,
       this.softDeleteFlag,
       this.updatedAtFieldName,
+      this.autoIncrementFieldName,
     );
   }
 
@@ -203,6 +206,7 @@ export class TableDefinition<
       this.defaultsMap,
       this.softDeleteFlag,
       this.updatedAtFieldName,
+      this.autoIncrementFieldName,
     );
   }
 
@@ -242,6 +246,7 @@ export class TableDefinition<
       this.defaultsMap,
       this.softDeleteFlag,
       this.updatedAtFieldName,
+      this.autoIncrementFieldName,
     );
   }
 
@@ -259,6 +264,7 @@ export class TableDefinition<
       this.defaultsMap,
       this.softDeleteFlag,
       this.updatedAtFieldName,
+      this.autoIncrementFieldName,
     );
   }
 
@@ -277,6 +283,7 @@ export class TableDefinition<
       this.defaultsMap,
       this.softDeleteFlag,
       this.updatedAtFieldName,
+      this.autoIncrementFieldName,
     );
   }
 
@@ -300,6 +307,7 @@ export class TableDefinition<
       this.defaultsMap,
       this.softDeleteFlag,
       this.updatedAtFieldName,
+      this.autoIncrementFieldName,
     );
   }
 
@@ -321,6 +329,7 @@ export class TableDefinition<
       this.defaultsMap,
       this.softDeleteFlag,
       this.updatedAtFieldName,
+      this.autoIncrementFieldName,
     );
   }
 
@@ -343,6 +352,7 @@ export class TableDefinition<
       map,
       this.softDeleteFlag,
       this.updatedAtFieldName,
+      this.autoIncrementFieldName,
     );
   }
 
@@ -363,6 +373,7 @@ export class TableDefinition<
       this.defaultsMap,
       true,
       this.updatedAtFieldName,
+      this.autoIncrementFieldName,
     );
   }
 
@@ -387,6 +398,35 @@ export class TableDefinition<
       this.defaultsMap,
       this.softDeleteFlag,
       field,
+      this.autoIncrementFieldName,
+    );
+  }
+
+  /** Declare the server-assigned per-table counter (FM-37). `field` names a
+   * declared `int64` field the server stamps with the next value of a
+   * per-table Postgres sequence on insert (and upsert's insert branch) —
+   * overwriting any client-supplied value, and winning over a `defaults`
+   * entry on the same field — as a decimal string (the int64 wire
+   * convention). After insert the field is immutable: a patch or replace
+   * that changes the stored value is rejected (round-tripping the equal
+   * value is allowed). The field must be declared `int64` exactly and must
+   * differ from `ttl.field` and `updatedAtField`; it is legal in a unique
+   * index (the ticket-number guarantee), and gaps are possible on
+   * rolled-back transactions (sequences are monotonic, not gap-free).
+   * Server-enforced; the client only declares it and round-trips it on the
+   * wire as `autoIncrementField`. */
+  autoIncrementField(field: string): TableDefinition<Fields, Indexes> {
+    return new TableDefinition(
+      this.fields,
+      this.indexes,
+      this.ownerFieldName,
+      this.collaboratorsFieldName,
+      this.ttlDef,
+      this.authorizeDef,
+      this.defaultsMap,
+      this.softDeleteFlag,
+      this.updatedAtFieldName,
+      field,
     );
   }
 
@@ -407,6 +447,9 @@ export class TableDefinition<
     if (this.updatedAtFieldName) {
       json.updatedAtField = this.updatedAtFieldName;
     }
+    if (this.autoIncrementFieldName) {
+      json.autoIncrementField = this.autoIncrementFieldName;
+    }
     if (this.authorizeDef) {
       json.authorize = this.authorizeDef;
     }
@@ -423,7 +466,7 @@ export class TableDefinition<
 /** Declare one table from a field-name → validator map (e.g. `t.string()`),
  * then chain `.index()`/`.searchIndex()`/`.vectorIndex()`/`.ownerField()`/
  * `.collaboratorsField()`/`.authorize()`/`.ttl()`/`.defaults()`/`.softDelete()`/
- * `.updatedAtField()`.
+ * `.updatedAtField()`/`.autoIncrementField()`.
  * Both the runtime schema pushed to the server and the inferred TS document
  * types derive from this one declaration — there is no codegen. */
 export function defineTable<Fields extends Record<string, Validator<unknown, boolean>>>(

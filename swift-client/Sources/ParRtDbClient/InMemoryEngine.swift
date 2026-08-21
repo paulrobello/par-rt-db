@@ -112,6 +112,11 @@ public final class StoredRow {
 /// shared-live-map semantics. Not Sendable.
 final class RowStore {
     var rows: [String: StoredRow] = [:]
+    /// Next value of the table's `autoIncrementField` counter — the mirror of
+    /// the server's per-table Postgres sequence (which starts at 1). Lives on
+    /// the store so it follows table lifecycle: a migrate rename moves it, a
+    /// drop discards it, and a recreated table starts fresh.
+    var autoIncrementNext: Int64 = 1
 }
 
 // MARK: - Presence
@@ -575,12 +580,47 @@ func applyDefaults(_ table: TableDef, _ doc: [String: JSONValue]) -> [String: JS
     return out
 }
 
+/// Stamps the table's `autoIncrementField` (FM-37) with the next value of the
+/// table's monotonic counter, overwriting any client-supplied value — the
+/// same authority model as `stampUpdatedAt` (server `txn::stamp_auto_increment`,
+/// whose per-table Postgres sequence the `RowStore` counter mirrors). Runs on
+/// the two insert paths only (`insert` and upsert's insert branch), AFTER
+/// `applyDefaults` (a defaults entry on the field always loses to the stamp);
+/// after insert the field is immutable (`applyPatch` / `doReplace` reject
+/// changes). The value is a decimal string, matching the int64 wire
+/// convention. The counter advances only when stamped — including on an
+/// insert that later fails validation, mirroring the server's
+/// non-transactional `nextval` (monotonic, not gap-free).
+func stampAutoIncrement(
+    _ store: RowStore, _ table: TableDef, _ doc: [String: JSONValue]
+) -> [String: JSONValue] {
+    guard let field = table.autoIncrementField else {
+        return doc
+    }
+    let next = store.autoIncrementNext
+    store.autoIncrementNext += 1
+    var out = doc
+    out[field] = .string(String(next))
+    return out
+}
+
 /// Applies a patch's fields onto `doc` — a port of server `txn::apply_patch`
 /// (store.ts `applyPatch`). A null on an optional field whose inner type
 /// rejects null removes the key.
 func applyPatch(
     _ table: TableDef, _ doc: [String: JSONValue], _ fields: [String: JSONValue]
 ) throws -> [String: JSONValue] {
+    // The auto-increment field is server-assigned and immutable after insert.
+    // A patch may carry it back unchanged (round-trip friendly), but any
+    // different value — including a type-shifted form of the same number —
+    // is rejected. Covers `patch`, upsert's update branch, `patchByQuery`,
+    // and cascade setNull (every patch-shaped path funnels through here).
+    if let auto = table.autoIncrementField, let value = fields[auto], doc[auto] != value {
+        throw RtDbError(
+            code: .badRequest,
+            message: "autoIncrementField '\(auto)' cannot be changed"
+        )
+    }
     var merged = doc
     for (field, value) in fields {
         guard let fieldTy = table.fields[field] else {
@@ -744,7 +784,32 @@ public final class InMemoryRtDbClient: MigrationStore {
                 tables[tableName] = RowStore()
             }
         }
+        repositionAutoIncrementCounters(from: self.schema, to: schema)
         self.schema = schema
+    }
+
+    /// A push that ADDS an `autoIncrementField` declaration to a table with
+    /// existing rows positions the counter past the stored max (the server's
+    /// DDL creates the sequence `START max+1`), so numbering continues past
+    /// pre-declaration values instead of overwriting them. A re-push of an
+    /// already-declared counter never repositions — the counter only moves
+    /// forward.
+    private func repositionAutoIncrementCounters(from current: SchemaDef?, to next: SchemaDef) {
+        guard let current else { return } // first push: every store is empty
+        for (name, table) in next.tables {
+            guard let field = table.autoIncrementField,
+                  current.tables[name]?.autoIncrementField == nil,
+                  let store = tables[name] else { continue }
+            var maxStored: Int64 = 0
+            for row in store.rows.values {
+                if case let .string(text)? = row.doc[field] {
+                    if let value = Int64(text), value > maxStored {
+                        maxStored = value
+                    }
+                }
+            }
+            store.autoIncrementNext = max(store.autoIncrementNext, maxStored + 1)
+        }
     }
 
     /// Applies (or previews) a declarative schema migration — a port of
@@ -1547,6 +1612,7 @@ public final class InMemoryRtDbClient: MigrationStore {
         var stamped = stampTtlDefault(tableDef, doc, nowFn())
         stamped = stampUpdatedAt(tableDef, stamped, nowFn())
         stamped = applyDefaults(tableDef, stamped)
+        stamped = stampAutoIncrement(rowStore(tableName), tableDef, stamped)
         try validateDoc(tableDef, stamped)
         let stored = stripUnsetOptionals(tableDef, stamped)
         try checkUniqueIndexes(tableName, tableDef, stored)
@@ -1576,8 +1642,31 @@ public final class InMemoryRtDbClient: MigrationStore {
         // (only insert stamps it — store.ts `doReplace`). The updatedAt
         // stamp DOES restamp on replace.
         let stamped = stampUpdatedAt(tableDef, applyDefaults(tableDef, doc), nowFn())
-        try validateDoc(tableDef, stamped)
-        let stored = stripUnsetOptionals(tableDef, stamped)
+        // A replace validates as a complete document, so the server-stamped
+        // auto-increment value must be present: an omitted (or null) field is
+        // filled from the stored row (preserved, never re-assigned), and a
+        // supplied value must equal the stored one — round-trip replace
+        // works, changing the counter does not. A stored doc that PREDATES
+        // the declaration (written before the counter was added) has no
+        // value to preserve, so a replace may set one — first-set, like an
+        // insert (server `txn::do_replace`).
+        var resolved = stamped
+        if let auto = tableDef.autoIncrementField, let storedCounter = row.doc[auto] {
+            if let supplied = resolved[auto] {
+                if case .null = supplied {
+                    resolved[auto] = storedCounter
+                } else if supplied != storedCounter {
+                    throw RtDbError(
+                        code: .badRequest,
+                        message: "autoIncrementField '\(auto)' cannot be changed"
+                    )
+                }
+            } else {
+                resolved[auto] = storedCounter
+            }
+        }
+        try validateDoc(tableDef, resolved)
+        let stored = stripUnsetOptionals(tableDef, resolved)
         try checkUniqueIndexes(tableName, tableDef, stored, excludeId: row.id)
         row.doc = stored
         row.version += 1

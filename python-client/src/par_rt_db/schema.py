@@ -260,6 +260,13 @@ class TableDef(_S):
     # value. Wire key `updatedAtField`, omitted when unset (server
     # `skip_serializing_if = "Option::is_none"`).
     updated_at_field: str | None = None
+    # FM-37: names a declared `int64` field the server stamps from a
+    # per-table monotonic counter on insert (and upsert's insert branch),
+    # overwriting any client-supplied value. Immutable after insert — a patch
+    # or replace that changes the stored value is rejected. Wire key
+    # `autoIncrementField`, omitted when unset (server
+    # `skip_serializing_if = "Option::is_none"`).
+    auto_increment_field: str | None = None
     authorize: FilterExpr | None = None
     # Field-level default values (FM-32): literal values stamped onto a NEW
     # document (insert/replace/upsert-insert) that omits the key. Wire name is
@@ -284,6 +291,10 @@ class TableDef(_S):
         # skip_serializing_if = "Option::is_none"); omit it on the wire when unset.
         if out.get("updatedAtField") is None:
             out.pop("updatedAtField", None)
+        # `autoIncrementField` is likewise an opt-in table option (FM-37,
+        # server skip_serializing_if = "Option::is_none").
+        if out.get("autoIncrementField") is None:
+            out.pop("autoIncrementField", None)
         # `authorize` is an opt-in predicate (server skip_serializing_if =
         # "Option::is_none"); omit it on the wire when unset.
         if out.get("authorize") is None:
@@ -326,6 +337,7 @@ class TableBuilder:
         self._defaults: dict[str, Any] | None = None
         self._soft_delete: bool = False
         self._updated_at: str | None = None
+        self._auto_increment: str | None = None
 
     def field(self, name: str, ft: Any) -> TableBuilder:
         """Declare a typed field ``name`` of type ``ft`` (a ``t.*`` constructor dict)."""
@@ -460,6 +472,20 @@ class TableBuilder:
         self._updated_at = name
         return self
 
+    def auto_increment_field(self, name: str) -> TableBuilder:
+        """Declare the server-assigned auto-increment counter field (FM-37).
+        ``name`` must reference a declared ``int64`` field; the server stamps it
+        with the next value of a per-table monotonic counter on insert and on
+        upsert's insert branch — overwriting any client-supplied value (a
+        ``defaults`` entry on the field loses the same way). After insert the
+        field is immutable: a patch or replace that changes the stored value
+        is rejected, while round-tripping it unchanged is allowed. The value is
+        a decimal string (the int64 wire convention) and is legal in a unique
+        index (the ticket-number guarantee). The client only declares the field
+        and round-trips it on the wire as ``autoIncrementField``."""
+        self._auto_increment = name
+        return self
+
     def _build(self) -> dict[str, Any]:
         out: dict[str, Any] = {"fields": self._fields, "indexes": self._indexes}
         if self._owner is not None:
@@ -474,6 +500,8 @@ class TableBuilder:
             out["softDelete"] = True
         if self._updated_at is not None:
             out["updatedAtField"] = self._updated_at
+        if self._auto_increment is not None:
+            out["autoIncrementField"] = self._auto_increment
         return out
 
 

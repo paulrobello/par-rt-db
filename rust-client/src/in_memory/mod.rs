@@ -354,6 +354,13 @@ pub struct InMemoryRtDbClient {
     /// Document store keyed by `(table_name, id)` — flat representation of the
     /// TS `Map<string, Map<string, StoredRow>>`.
     docs: HashMap<(String, String), StoredRow>,
+    /// FM-37: per-table auto-increment counters — the in-memory stand-in for
+    /// the server's per-table Postgres sequences, holding the LAST value
+    /// handed out (absent = never handed out; the first stamp lazily
+    /// initializes from the stored max, mirroring the server's `setval(max)`
+    /// on sequence creation). Persisted across additive schema pushes — a
+    /// re-push never disturbs a table's numbering.
+    auto_increment_counters: HashMap<String, i64>,
     /// Counter for storage-upload id minting (`f{++counter}` per
     /// `ts-client/src/in_memory.ts:647`).
     id_counter: u64,
@@ -407,6 +414,7 @@ impl InMemoryRtDbClient {
             schema: None,
             tables: HashMap::new(),
             docs: HashMap::new(),
+            auto_increment_counters: HashMap::new(),
             id_counter,
             idempotency: HashMap::new(),
             schedules: Vec::new(),
@@ -809,6 +817,62 @@ impl InMemoryRtDbClient {
         }
     }
 
+    /// Stamps the table's `autoIncrementField` (FM-37) with the next value of
+    /// the table's counter, overwriting any client-supplied value — the same
+    /// authority model as [`stamp_updated_at`]. Runs on the two insert paths
+    /// only ([`Self::do_insert`] covers `Insert` and upsert's insert branch),
+    /// AFTER defaults, so the stamp also wins over a `defaults` entry; after
+    /// insert the field is immutable (`apply_patch` / [`Self::do_replace`]
+    /// reject changes). The value is a decimal string, matching the int64
+    /// wire convention. Mirrors server `txn::stamp_auto_increment`; the
+    /// harness's counter is monotonic (a failed txn rolls its docs back but
+    /// the consumed number is NOT reclaimed, matching the server's
+    /// non-transactional `nextval`).
+    ///
+    /// A table's counter is created lazily on first stamp and positioned past
+    /// the max value already stored in the table's rows (server DDL creates
+    /// the sequence with `setval(max)` at push time, so a declaration added
+    /// to a populated table continues past the stored max rather than
+    /// restarting at 1). Until a stamp is requested the counter map holds no
+    /// entry, so re-pushes never disturb an established numbering.
+    fn stamp_auto_increment(
+        &mut self,
+        table_name: &str,
+        table_def: &TableDef,
+        mut doc: Map<String, Value>,
+    ) -> Map<String, Value> {
+        if let Some(field) = &table_def.auto_increment_field {
+            let next = match self.auto_increment_counters.get_mut(table_name) {
+                Some(counter) => {
+                    *counter += 1;
+                    *counter
+                }
+                None => {
+                    // Lazy sequence creation: position past the stored max
+                    // (0 on an empty table → first stamp is 1). Soft-deleted
+                    // rows count — the server scans the physical column.
+                    let max = self
+                        .docs
+                        .iter()
+                        .filter(|(key, _)| key.0 == table_name)
+                        .filter_map(|(_, row)| {
+                            row.doc
+                                .get(field)
+                                .and_then(Value::as_str)
+                                .and_then(|s| s.parse::<i64>().ok())
+                        })
+                        .max()
+                        .unwrap_or(0);
+                    self.auto_increment_counters
+                        .insert(table_name.to_string(), max + 1);
+                    max + 1
+                }
+            };
+            doc.insert(field.clone(), Value::String(next.to_string()));
+        }
+        doc
+    }
+
     /// Inserts a new doc, minting the id and stamping `_creationTime` /
     /// `_version = 1`. Ports `doInsert` (`ts-client/src/in_memory.ts:807-813`)
     /// with the unique-index check threaded in before the write.
@@ -825,6 +889,10 @@ impl InMemoryRtDbClient {
         let stamped = stamp_ttl_default(table_def, doc, now);
         let stamped = stamp_updated_at(table_def, &stamped, now);
         let stamped = apply_defaults(table_def, &stamped);
+        // FM-37: the auto-increment stamp runs LAST (server insert order),
+        // so it overwrites any client value AND any defaults entry on the
+        // field.
+        let stamped = self.stamp_auto_increment(table_name, table_def, stamped);
         let doc_value = Value::Object(stamped);
         validate_doc(table_def, &doc_value)?;
         let stored = strip_unset_optionals(table_def, &doc_value);
@@ -884,22 +952,46 @@ impl InMemoryRtDbClient {
         doc: &Map<String, Value>,
     ) -> Result<(), RtDbError> {
         let key = (table_name.to_string(), id.to_string());
-        let live = self
-            .docs
-            .get(&key)
-            .is_some_and(|row| row.deleted_at.is_none());
-        if !live {
-            return Err(RtDbError::new(
-                ErrorCode::NotFound,
-                format!("document '{id}' not found"),
-            ));
-        }
+        let prev_doc = match self.docs.get(&key) {
+            Some(row) if row.deleted_at.is_none() => row.doc.clone(),
+            _ => {
+                return Err(RtDbError::new(
+                    ErrorCode::NotFound,
+                    format!("document '{id}' not found"),
+                ));
+            }
+        };
         // Replace gets defaults but never a ttl stamp — the server stamps
         // `default_duration_ms` on insert only. The updatedAt stamp DOES
         // apply (replace is a version-bumping write) and runs after
         // defaults, so it wins on the same field (server replace order).
         let stamped = apply_defaults(table_def, doc);
-        let stamped = stamp_updated_at(table_def, &stamped, (self.now)());
+        let mut stamped = stamp_updated_at(table_def, &stamped, (self.now)());
+        // FM-37: a replace validates as a complete document, so the
+        // server-stamped counter must be present — an omitted/null field is
+        // filled from the stored row (preserved, never re-assigned), and a
+        // supplied value must equal the stored one (round-trip replace
+        // works, changing the counter does not). A stored doc that PREDATES
+        // the declaration (written before the counter was added) has no
+        // value to preserve, so a replace may set one — first-set, like an
+        // insert. Mirrors the preserve-or-reject in server
+        // `txn::do_replace`; runs after defaults exactly as there.
+        if let Some(auto) = &table_def.auto_increment_field
+            && let Some(prev) = prev_doc.get(auto)
+        {
+            match stamped.get(auto) {
+                None | Some(Value::Null) => {
+                    stamped.insert(auto.clone(), prev.clone());
+                }
+                Some(value) if value != prev => {
+                    return Err(RtDbError::new(
+                        ErrorCode::BadRequest,
+                        format!("autoIncrementField '{auto}' cannot be changed"),
+                    ));
+                }
+                Some(_) => {}
+            }
+        }
         let doc_value = Value::Object(stamped);
         validate_doc(table_def, &doc_value)?;
         let stored = strip_unset_optionals(table_def, &doc_value);
