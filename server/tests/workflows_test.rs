@@ -24,7 +24,8 @@ use rtdb_server::error::ErrorCode;
 use rtdb_server::metrics::Metrics;
 use rtdb_server::op_feed::OpFeed;
 use rtdb_server::protocol::{
-    OutcomeStatus, ScheduleWhen, WorkflowInfo, WorkflowInfoFull, WorkflowSpec, WorkflowStatus,
+    OutcomeStatus, ScheduleWhen, StepOutcome, WorkflowInfo, WorkflowInfoFull, WorkflowSpec,
+    WorkflowStatus,
 };
 use rtdb_server::quota;
 use rtdb_server::scheduler;
@@ -78,6 +79,111 @@ async fn insert_claim_reset_roundtrip() {
     assert_eq!(full.info.status, WorkflowStatus::Cancelled);
     assert!(full.step_outcomes.is_empty());
     assert!(workflows::delete(&pool, &db, &id).await.unwrap());
+}
+
+/// Task 2: the awaitSignal side-table lifecycle — park (visibility columns +
+/// gate), deliver (latest-wins slot write + wake flip), consume (atomic step
+/// boundary), and the typed delivery classification. No committer needed.
+#[tokio::test]
+async fn await_signal_side_table_lifecycle() {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    workflows::ensure_table(&pool, &db).await.unwrap();
+    let spec: WorkflowSpec = serde_json::from_value(serde_json::json!({
+        "name": "gate", "steps": [ { "awaitSignal": { "name": "approve", "timeoutMs": 50 } } ]
+    }))
+    .unwrap();
+    let id = workflows::insert(&pool, &db, &spec).await.unwrap();
+    // Park: waiting + visibility columns; not claimable before the gate.
+    workflows::park_waiting(&pool, &db, &id, 0, "approve", now_ms() + 60_000)
+        .await
+        .unwrap();
+    let full = workflows::get(&pool, &db, &id).await.unwrap().unwrap();
+    assert_eq!(full.info.status, WorkflowStatus::Waiting);
+    assert_eq!(full.info.waiting_for.as_deref(), Some("approve"));
+    assert!(full.info.waited_since.is_some());
+    assert!(
+        workflows::claim_due(&pool, &db, now_ms(), 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    // next_due sees the waiting gate:
+    assert!(workflows::next_due(&pool, &db).await.unwrap().is_some());
+
+    // Delivery: latest-wins + wake flip.
+    let d1 = workflows::deliver_signal(&pool, &db, &id, "wrong", None)
+        .await
+        .unwrap();
+    assert!(matches!(d1, workflows::SignalDelivery::NameMismatch { .. }));
+    let d2 = workflows::deliver_signal(
+        &pool,
+        &db,
+        &id,
+        "approve",
+        Some(serde_json::json!({"v": 1})),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(d2, workflows::SignalDelivery::Delivered));
+    let d3 = workflows::deliver_signal(
+        &pool,
+        &db,
+        &id,
+        "approve",
+        Some(serde_json::json!({"v": 2})),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(d3, workflows::SignalDelivery::Delivered));
+    let claimed = workflows::claim_due(&pool, &db, now_ms(), 10)
+        .await
+        .unwrap();
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].signal_payload, Some(serde_json::json!({"v": 2})));
+
+    // Consume + boundary clears the wait columns.
+    let outcome = StepOutcome {
+        step_index: 0,
+        status: OutcomeStatus::Success,
+        attempts: 1,
+        at: now_ms(),
+        error: None,
+        signal: Some(serde_json::json!({"v": 2})),
+    };
+    workflows::record_signal_success(&pool, &db, &id, 1, &outcome)
+        .await
+        .unwrap();
+    let full = workflows::get(&pool, &db, &id).await.unwrap().unwrap();
+    assert_eq!(full.info.status, WorkflowStatus::Running);
+    assert!(full.info.waiting_for.is_none() && full.info.waited_since.is_none());
+    assert_eq!(full.step_outcomes.len(), 1);
+    assert_eq!(
+        full.step_outcomes[0].signal,
+        Some(serde_json::json!({"v": 2}))
+    );
+
+    // Typed classification against a fresh parked row + unknown id.
+    let id2 = workflows::insert(&pool, &db, &spec).await.unwrap();
+    assert!(matches!(
+        workflows::deliver_signal(&pool, &db, "nope", "approve", None)
+            .await
+            .unwrap(),
+        workflows::SignalDelivery::NotFound
+    ));
+    workflows::cancel(&pool, &db, &id2).await.unwrap();
+    assert!(matches!(
+        workflows::deliver_signal(&pool, &db, &id2, "approve", None)
+            .await
+            .unwrap(),
+        workflows::SignalDelivery::NotWaiting
+    ));
+    let full2 = workflows::get(&pool, &db, &id2).await.unwrap().unwrap();
+    assert!(
+        full2.info.waiting_for.is_none(),
+        "cancel clears wait columns"
+    );
 }
 
 // --- Task 3: advancement engine (committer arm + scheduler dual poll) ------

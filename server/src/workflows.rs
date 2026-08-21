@@ -102,6 +102,12 @@ pub struct WorkflowRow {
     pub attempts: u32,
     pub sleep_until: i64,
     pub step_outcomes: Vec<StepOutcome>,
+    /// awaitSignal side-table columns (`None` on rows never parked). Set on
+    /// a claim = the wait timed out (delivery flips to `pending` first), so
+    /// the advancer reads them to classify the wake.
+    pub wait_name: Option<String>,
+    pub waited_since: Option<i64>,
+    pub signal_payload: Option<serde_json::Value>,
 }
 
 /// `CREATE TABLE IF NOT EXISTS` for databases that predate this feature.
@@ -132,6 +138,16 @@ pub async fn ensure_table(pool: &PgPool, db: &str) -> Result<(), RtDbError> {
     sqlx::query(&format!(
         "CREATE INDEX IF NOT EXISTS \"{schema}_workflows_due_idx\"
          ON \"{schema}\".workflows (status, sleep_until)"
+    ))
+    .execute(pool)
+    .await?;
+    // Lazy upgrade for databases that predate awaitSignal (CREATE TABLE IF
+    // NOT EXISTS does not touch an existing table).
+    sqlx::query(&format!(
+        "ALTER TABLE \"{schema}\".workflows
+            ADD COLUMN IF NOT EXISTS wait_name text,
+            ADD COLUMN IF NOT EXISTS waited_since bigint,
+            ADD COLUMN IF NOT EXISTS signal_payload jsonb"
     ))
     .execute(pool)
     .await?;
@@ -187,9 +203,11 @@ pub async fn insert(pool: &PgPool, db: &str, spec: &WorkflowSpec) -> Result<Stri
     insert_on(&mut conn, db, spec, gate).await
 }
 
-/// Atomically claims up to `batch` due rows: `pending`+`sleep_until <= now` →
-/// `running`. `FOR UPDATE SKIP LOCKED` makes the claim safe even if a second
-/// claimer ever exists (today there is exactly one scheduler poller per db).
+/// Atomically claims up to `batch` due rows: `pending`/`waiting` rows whose
+/// `sleep_until <= now` → `running` (a claimed `waiting` row = the wait timed
+/// out — a delivery flips the row to `pending` before it can be due).
+/// `FOR UPDATE SKIP LOCKED` makes the claim safe even if a second claimer
+/// ever exists (today there is exactly one scheduler poller per db).
 pub async fn claim_due(
     pool: &PgPool,
     db: &str,
@@ -198,7 +216,8 @@ pub async fn claim_due(
 ) -> Result<Vec<WorkflowRow>, RtDbError> {
     validate_db_name(db)?;
     let schema = pg_schema(db);
-    let rows: Vec<(
+    #[allow(clippy::type_complexity)]
+    type ClaimRow = (
         String,
         String,
         serde_json::Value,
@@ -206,16 +225,21 @@ pub async fn claim_due(
         i32,
         i64,
         serde_json::Value,
-    )> = sqlx::query_as(&format!(
+        Option<String>,
+        Option<i64>,
+        Option<serde_json::Value>,
+    );
+    let rows: Vec<ClaimRow> = sqlx::query_as(&format!(
         "UPDATE \"{schema}\".workflows
              SET status = 'running', started_at = COALESCE(started_at, $2), updated_at = $2
              WHERE id IN (
                  SELECT id FROM \"{schema}\".workflows
-                 WHERE status = 'pending' AND sleep_until <= $1
+                 WHERE status IN ('pending', 'waiting') AND sleep_until <= $1
                  ORDER BY sleep_until LIMIT $3
                  FOR UPDATE SKIP LOCKED
              )
-             RETURNING id, name, spec, current_step, attempts, sleep_until, step_outcomes"
+             RETURNING id, name, spec, current_step, attempts, sleep_until, step_outcomes,
+                       wait_name, waited_since, signal_payload"
     ))
     .bind(now)
     .bind(now)
@@ -224,7 +248,18 @@ pub async fn claim_due(
     .await?;
     rows.into_iter()
         .map(
-            |(id, name, spec, current_step, attempts, sleep_until, outcomes)| {
+            |(
+                id,
+                name,
+                spec,
+                current_step,
+                attempts,
+                sleep_until,
+                outcomes,
+                wait_name,
+                waited_since,
+                signal_payload,
+            )| {
                 Ok(WorkflowRow {
                     id: id.clone(),
                     name,
@@ -234,6 +269,9 @@ pub async fn claim_due(
                     attempts: attempts.max(0) as u32,
                     sleep_until,
                     step_outcomes: serde_json::from_value(outcomes).map_err(deser_err(db, &id))?,
+                    wait_name,
+                    waited_since,
+                    signal_payload,
                 })
             },
         )
@@ -262,13 +300,15 @@ pub async fn reset_running(pool: &PgPool, db: &str) -> Result<u64, RtDbError> {
     Ok(res.rows_affected())
 }
 
-/// Min `sleep_until` among `pending` rows, or `None` if nothing is queued.
-/// `MIN` is SQL `NULL` when no rows match, which sqlx deserializes as `None`.
+/// Min `sleep_until` among `pending`/`waiting` rows, or `None` if nothing is
+/// queued. `MIN` is SQL `NULL` when no rows match, which sqlx deserializes
+/// as `None`.
 pub async fn next_due(pool: &PgPool, db: &str) -> Result<Option<i64>, RtDbError> {
     validate_db_name(db)?;
     let schema = pg_schema(db);
     let row: Option<(Option<i64>,)> = sqlx::query_as(&format!(
-        "SELECT MIN(sleep_until) FROM \"{schema}\".workflows WHERE status = 'pending'"
+        "SELECT MIN(sleep_until) FROM \"{schema}\".workflows
+         WHERE status IN ('pending', 'waiting')"
     ))
     .fetch_optional(pool)
     .await?;
@@ -351,6 +391,143 @@ pub async fn schedule_retry(
     Ok(())
 }
 
+/// Serialized-size cap on a signal payload, enforced in `deliver_signal`
+/// so every surface (HTTP body limit, WS frame, admin) gets the same bound.
+pub const MAX_SIGNAL_PAYLOAD_BYTES: usize = 64 * 1024;
+
+/// Outcome of a delivery attempt — the classification the three surfaces
+/// map onto typed errors (spec §Delivery).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SignalDelivery {
+    Delivered,
+    NotFound,
+    NotWaiting,
+    NameMismatch { waiting_on: String },
+}
+
+/// Park the run at an `awaitSignal` step: `waiting` + the signal name +
+/// the timeout gate. `gate` is `i64::MAX` when the step omits `timeoutMs`
+/// (never due — only a delivery or cancel wakes the run). `attempts` is
+/// persisted so a timeout retry that re-parks keeps its count.
+pub async fn park_waiting(
+    pool: &PgPool,
+    db: &str,
+    id: &str,
+    attempts: u32,
+    name: &str,
+    gate: i64,
+) -> Result<(), RtDbError> {
+    validate_db_name(db)?;
+    let schema = pg_schema(db);
+    sqlx::query(&format!(
+        "UPDATE \"{schema}\".workflows
+            SET status = 'waiting', attempts = $2, wait_name = $3,
+                waited_since = $4, sleep_until = $5, signal_payload = NULL,
+                updated_at = $4
+         WHERE id = $1"
+    ))
+    .bind(id)
+    .bind(attempts as i32)
+    .bind(name)
+    .bind(now_ms())
+    .bind(gate)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Consume a delivered signal and write the step boundary in one UPDATE
+/// (atomic consume + bookkeeping — spec §Semantics). Row stays `running`.
+pub async fn record_signal_success(
+    pool: &PgPool,
+    db: &str,
+    id: &str,
+    next_step: u32,
+    outcome: &StepOutcome,
+) -> Result<(), RtDbError> {
+    validate_db_name(db)?;
+    let schema = pg_schema(db);
+    let outcome_json = serde_json::to_value(outcome).map_err(|err| {
+        tracing::error!(error = %err, db, "failed to serialize workflow step outcome");
+        RtDbError::internal("failed to record workflow step")
+    })?;
+    sqlx::query(&format!(
+        "UPDATE \"{schema}\".workflows
+            SET current_step = $2, attempts = 0,
+                step_outcomes = step_outcomes || $3::jsonb,
+                wait_name = NULL, waited_since = NULL, signal_payload = NULL,
+                updated_at = $4
+         WHERE id = $1"
+    ))
+    .bind(id)
+    .bind(next_step as i32)
+    .bind(&outcome_json)
+    .bind(now_ms())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Deliver a signal: latest-wins slot write + wake flip in one conditional
+/// UPDATE. Matches a `waiting` row AND a `pending` row whose `wait_name`
+/// survived an earlier delivery (latest-wins: every delivery while the wait
+/// is unconsumed ACKs and overwrites the slot; an ordinary `pending` row has
+/// `wait_name` NULL and never matches). Zero rows ⇒ re-read to classify
+/// (spec §Delivery). Side-table only — the `workflows::cancel`-from-handlers
+/// precedent.
+pub async fn deliver_signal(
+    pool: &PgPool,
+    db: &str,
+    id: &str,
+    name: &str,
+    payload: Option<serde_json::Value>,
+) -> Result<SignalDelivery, RtDbError> {
+    validate_db_name(db)?;
+    if let Some(p) = &payload {
+        let size = serde_json::to_vec(p)
+            .map_err(|err| {
+                tracing::error!(error = %err, db, "failed to serialize signal payload");
+                RtDbError::internal("failed to deliver signal")
+            })?
+            .len();
+        if size > MAX_SIGNAL_PAYLOAD_BYTES {
+            return Err(RtDbError::bad_request(format!(
+                "signal payload exceeds {MAX_SIGNAL_PAYLOAD_BYTES} bytes"
+            )));
+        }
+    }
+    let schema = pg_schema(db);
+    let now = now_ms();
+    let res = sqlx::query(&format!(
+        "UPDATE \"{schema}\".workflows
+            SET status = 'pending', sleep_until = $2, signal_payload = $3,
+                updated_at = $2
+         WHERE id = $1 AND status IN ('waiting', 'pending') AND wait_name = $4"
+    ))
+    .bind(id)
+    .bind(now)
+    .bind(payload)
+    .bind(name)
+    .execute(pool)
+    .await?;
+    if res.rows_affected() > 0 {
+        return Ok(SignalDelivery::Delivered);
+    }
+    let row: Option<(Option<String>, String)> = sqlx::query_as(&format!(
+        "SELECT wait_name, status FROM \"{schema}\".workflows WHERE id = $1"
+    ))
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+    match row {
+        None => Ok(SignalDelivery::NotFound),
+        Some((waiting_on, status)) if status == "waiting" => Ok(SignalDelivery::NameMismatch {
+            waiting_on: waiting_on.unwrap_or_default(),
+        }),
+        Some(_) => Ok(SignalDelivery::NotWaiting),
+    }
+}
+
 pub async fn finalize_success(
     pool: &PgPool,
     db: &str,
@@ -364,7 +541,8 @@ pub async fn finalize_success(
     sqlx::query(&format!(
         "UPDATE \"{schema}\".workflows
          SET status = 'success', attempts = 0, last_error = NULL,
-             step_outcomes = step_outcomes || $2::jsonb, finished_at = $3, updated_at = $3
+             step_outcomes = step_outcomes || $2::jsonb, finished_at = $3, updated_at = $3,
+             wait_name = NULL, waited_since = NULL, signal_payload = NULL
          WHERE id = $1"
     ))
     .bind(id)
@@ -392,7 +570,8 @@ pub async fn mark_failed(
     sqlx::query(&format!(
         "UPDATE \"{schema}\".workflows
          SET status = 'failed', last_error = $2, attempts = $5,
-             step_outcomes = step_outcomes || $3::jsonb, finished_at = $4, updated_at = $4
+             step_outcomes = step_outcomes || $3::jsonb, finished_at = $4, updated_at = $4,
+             wait_name = NULL, waited_since = NULL, signal_payload = NULL
          WHERE id = $1"
     ))
     .bind(id)
@@ -407,14 +586,16 @@ pub async fn mark_failed(
 
 /// Cancel: flip a non-terminal row to `cancelled`. Returns false for a
 /// missing or already-terminal run. An in-flight `running` arm notices at
-/// its next step boundary (`status_of`).
+/// its next step boundary (`status_of`). Waiting rows are cancellable —
+/// the wait columns drop with the flip (leave-`waiting` rule).
 pub async fn cancel(pool: &PgPool, db: &str, id: &str) -> Result<bool, RtDbError> {
     validate_db_name(db)?;
     let schema = pg_schema(db);
     let res = sqlx::query(&format!(
         "UPDATE \"{schema}\".workflows
-         SET status = 'cancelled', finished_at = $2, updated_at = $2
-         WHERE id = $1 AND status IN ('pending', 'running')"
+         SET status = 'cancelled', finished_at = $2, updated_at = $2,
+             wait_name = NULL, waited_since = NULL, signal_payload = NULL
+         WHERE id = $1 AND status IN ('pending', 'running', 'waiting')"
     ))
     .bind(id)
     .bind(now_ms())
@@ -475,6 +656,8 @@ type InfoRow = (
     i32,            // attempts
     Option<i64>,    // sleep_until
     Option<String>, // last_error
+    Option<String>, // wait_name
+    Option<i64>,    // waited_since
     i64,            // created_at
     i64,            // updated_at
     Option<i64>,    // started_at
@@ -492,22 +675,28 @@ fn info_from_row(row: InfoRow) -> Result<WorkflowInfo, RtDbError> {
         attempts,
         sleep_until,
         last_error,
+        wait_name,
+        waited_since,
         created_at,
         updated_at,
         started_at,
         finished_at,
     ) = row;
+    let status = parse_status(&status)?;
+    // Projected only while `waiting` — terminal rows never leak stale wait
+    // columns even if a leave-waiting op somehow missed (they NULL them).
+    let waiting = status == WorkflowStatus::Waiting;
     Ok(WorkflowInfo {
         id,
         name,
-        status: parse_status(&status)?,
+        status,
         current_step: current_step.max(0) as u32,
         step_count: step_count.max(0) as u32,
         attempts: attempts.max(0) as u32,
         sleep_until,
         last_error,
-        waiting_for: None,
-        waited_since: None,
+        waiting_for: waiting.then_some(wait_name).flatten(),
+        waited_since: waiting.then_some(waited_since).flatten(),
         created_at,
         updated_at,
         started_at,
@@ -525,7 +714,8 @@ pub async fn list(
     let schema = pg_schema(db);
     let rows: Vec<InfoRow> = sqlx::query_as(&format!(
         "SELECT id, name, status, current_step, jsonb_array_length(spec->'steps'), attempts,
-                sleep_until, last_error, created_at, updated_at, started_at, finished_at
+                sleep_until, last_error, wait_name, waited_since,
+                created_at, updated_at, started_at, finished_at
          FROM \"{schema}\".workflows
          WHERE ($1::text IS NULL OR status = $1)
          ORDER BY created_at DESC LIMIT $2"
@@ -552,6 +742,8 @@ pub async fn get(pool: &PgPool, db: &str, id: &str) -> Result<Option<WorkflowInf
         i32,
         Option<i64>,
         Option<String>,
+        Option<String>,
+        Option<i64>,
         i64,
         i64,
         Option<i64>,
@@ -560,7 +752,8 @@ pub async fn get(pool: &PgPool, db: &str, id: &str) -> Result<Option<WorkflowInf
     );
     let row: Option<FullRow> = sqlx::query_as(&format!(
         "SELECT id, name, status, current_step, jsonb_array_length(spec->'steps'), attempts,
-                sleep_until, last_error, created_at, updated_at, started_at, finished_at,
+                sleep_until, last_error, wait_name, waited_since,
+                created_at, updated_at, started_at, finished_at,
                 step_outcomes
          FROM \"{schema}\".workflows WHERE id = $1"
     ))
@@ -577,6 +770,8 @@ pub async fn get(pool: &PgPool, db: &str, id: &str) -> Result<Option<WorkflowInf
             attempts,
             sleep_until,
             last_error,
+            wait_name,
+            waited_since,
             created_at,
             updated_at,
             started_at,
@@ -594,6 +789,8 @@ pub async fn get(pool: &PgPool, db: &str, id: &str) -> Result<Option<WorkflowInf
                 attempts,
                 sleep_until,
                 last_error,
+                wait_name,
+                waited_since,
                 created_at,
                 updated_at,
                 started_at,
