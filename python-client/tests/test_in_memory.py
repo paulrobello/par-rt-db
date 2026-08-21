@@ -2903,6 +2903,37 @@ def test_await_signal_parks_delivers_and_advances_with_payload() -> None:
     assert _wf_status(c, wid).waiting_for is None
 
 
+def test_await_signal_payloadless_delivery_consumes_gate() -> None:
+    c, _ = _new_clock_client()
+    wid = c.start_workflow(
+        _wf(
+            "gated",
+            [
+                _wf_step(_wf_txn("pre")),
+                _wf_wait_step("approve", timeout_ms=60_000),
+                _wf_step(_wf_txn("post")),
+            ],
+        )
+    )
+    c.tick()  # step 1 done, step 2 parks
+    assert _wf_status(c, wid).status == "waiting"
+    # Deliver WITHOUT a payload: the slot is set to JSON null (None), never
+    # left clear — the wait is consumed, not left to time out.
+    assert c.signal_workflow(wid, "approve") is True
+    c.tick()
+    info = _wf_status(c, wid)
+    assert info.status == "success"
+    assert sorted(d["name"] for d in c.run_query(TableQuery("items").build())) == [
+        "post",
+        "pre",
+    ]
+    run = _wf_run(c, wid)
+    # A delivered JSON null is None in Python — recorded, and the delivery
+    # consumed the gate without burning a timeout attempt.
+    assert run.step_outcomes[1].signal is None
+    assert run.step_outcomes[1].attempts == 1
+
+
 def test_await_signal_timeout_retries_with_fresh_timeout_then_succeeds() -> None:
     c, clock = _new_clock_client()
     wid = c.start_workflow(

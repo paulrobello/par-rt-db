@@ -1215,6 +1215,25 @@ struct InMemoryTests {
         #expect(full.stepOutcomes.first?.signal == .object(["v": .int(2)]))
     }
 
+    @Test func awaitSignalPayloadlessDeliveryConsumesGate() throws {
+        let client = deterministicClient()
+        let info = try client.startWorkflow(WorkflowSpec(name: "gate", steps: [
+            .awaitSignal(name: "approve", timeoutMs: 60000)
+        ]))
+        _ = try client.tick(nowMs: pinnedNow)
+        #expect(try client.getWorkflow(info.id).info.status == .waiting)
+        // No payload — the delivery still sets the slot (JSON null), so the
+        // next tick consumes the wait rather than timing it out.
+        try client.signalWorkflow(info.id, name: "approve")
+        _ = try client.tick(nowMs: pinnedNow + 1)
+        let full = try client.getWorkflow(info.id)
+        #expect(full.info.status == .success)
+        #expect(full.stepOutcomes.count == 1)
+        #expect(full.stepOutcomes.first?.attempts == 1)
+        // JSON null in the slot — present, not nil (absent).
+        #expect(full.stepOutcomes.first?.signal == .null)
+    }
+
     @Test func awaitSignalTimeoutRetriesWithFreshTimeoutThenDelivers() throws {
         let client = deterministicClient()
         // Backoff for attempt 1 would be 1000ms; the timeout gate is 5000ms —

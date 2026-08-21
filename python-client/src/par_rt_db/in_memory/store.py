@@ -291,6 +291,12 @@ class _ScheduledJob:
     last_error: str | None
 
 
+# The awaitSignal slot's "no delivery" state — a sentinel, not None, because
+# a delivered JSON null is None in Python (the server distinguishes them as
+# SQL NULL vs jsonb null; ``signal_workflow`` always sets the slot).
+_NO_SIGNAL = object()
+
+
 @dataclass
 class _WorkflowRun:
     """A stored workflow run (FM-29) — the in-memory mirror of the server's
@@ -299,7 +305,7 @@ class _WorkflowRun:
     :meth:`InMemoryRtDb.tick` claims due pending/waiting runs (→ running) and
     advances them through :meth:`_advance_run` (the committer
     ``handle_workflow_advance`` port). The awaitSignal side-table columns
-    (``wait_name``/``waited_since``/``signal_payload``) are ``None`` on rows
+    (``wait_name``/``waited_since``/``signal_payload``) are unset on rows
     never parked, and a claimed ``waiting`` row reads them to discriminate a
     delivery (payload set) from a timed-out wait."""
 
@@ -315,10 +321,10 @@ class _WorkflowRun:
     updated_at: int
     started_at: int | None
     finished_at: int | None
-    # awaitSignal side-table columns (None on rows never parked).
+    # awaitSignal side-table columns (unset on rows never parked).
     wait_name: str | None = None
     waited_since: int | None = None
-    signal_payload: Any | None = None
+    signal_payload: Any = _NO_SIGNAL
 
     @property
     def step_count(self) -> int:
@@ -2168,7 +2174,7 @@ class _InMemoryStoreCore:
         run.status = "cancelled"
         run.wait_name = None
         run.waited_since = None
-        run.signal_payload = None
+        run.signal_payload = _NO_SIGNAL
         run.updated_at = now
         run.finished_at = now
         return True
@@ -2178,7 +2184,9 @@ class _InMemoryStoreCore:
         the in-memory mirror of server ``workflows::deliver_signal``. The slot
         is latest-wins (every delivery while the wait is unconsumed overwrites
         the payload) and the wake lands on the NEXT tick: the run flips to
-        ``pending`` due immediately, and the claim pass advances it.
+        ``pending`` due immediately, and the claim pass advances it. An
+        omitted payload is delivered as JSON null — the slot is always set on
+        a delivery, so the wait is consumed either way.
 
         Raises the server's typed errors: ``NOT_FOUND`` for an unknown run,
         ``CONFLICT`` when the run is not waiting for a signal, and ``CONFLICT``
@@ -2363,9 +2371,9 @@ class _InMemoryStoreCore:
         loop should continue in this same turn (a consumed signal whose next
         step's gate is already due), ``False`` when the run parked, timed out
         into a retry, or finalized."""
-        if run.signal_payload is not None:
+        if run.signal_payload is not _NO_SIGNAL:
             payload = run.signal_payload
-            run.signal_payload = None
+            run.signal_payload = _NO_SIGNAL
             run.step_outcomes.append(
                 StepOutcome(
                     step_index=run.current_step,
@@ -2401,7 +2409,7 @@ class _InMemoryStoreCore:
             run.wait_name = sig.name
             run.waited_since = now
             run.sleep_until = timeout_gate
-            run.signal_payload = None
+            run.signal_payload = _NO_SIGNAL
             run.updated_at = now
             return False
         # The run parked and its gate expired: a timed-out attempt. A retry
@@ -2413,7 +2421,7 @@ class _InMemoryStoreCore:
             run.wait_name = sig.name
             run.waited_since = now
             run.sleep_until = timeout_gate
-            run.signal_payload = None
+            run.signal_payload = _NO_SIGNAL
             return False
         error = f"awaitSignal '{sig.name}' timed out"
         run.status = "failed"
@@ -2421,7 +2429,7 @@ class _InMemoryStoreCore:
         run.finished_at = now
         run.wait_name = None
         run.waited_since = None
-        run.signal_payload = None
+        run.signal_payload = _NO_SIGNAL
         run.step_outcomes.append(
             StepOutcome(
                 step_index=run.current_step,

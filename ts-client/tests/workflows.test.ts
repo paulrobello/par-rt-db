@@ -640,6 +640,36 @@ describe("InMemoryRtDbClient awaitSignal steps", () => {
     expect(await itemNames(c)).toEqual(["one", "two"]);
   });
 
+  it("a payload-less delivery consumes the gate (signal: null, present not absent)", async () => {
+    const { c, setNow } = newEngine();
+    setNow(BASE);
+    const { id } = await c.startWorkflow({
+      name: "approval",
+      steps: [
+        { txn: insertTxn("one") },
+        { awaitSignal: { name: "approve", timeoutMs: 30_000 } },
+        { txn: insertTxn("two") },
+      ],
+    });
+
+    c.tick();
+    expect((await c.listWorkflows()).find((w) => w.id === id)).toMatchObject({
+      status: "waiting",
+      currentStep: 1,
+    });
+
+    setNow(BASE + 1_000);
+    // No payload key at all — the delivery must still consume the gate.
+    expect(await c.signalWorkflow(id, "approve")).toBe(true);
+    c.tick();
+    const done = await c.getWorkflow(id);
+    expect(done.status).toBe("success");
+    expect(done.stepOutcomes[1].attempts).toBe(1);
+    expect("signal" in done.stepOutcomes[1]).toBe(true);
+    expect(done.stepOutcomes[1].signal).toBe(null);
+    expect(await itemNames(c)).toEqual(["one", "two"]);
+  });
+
   it("times out, re-parks with a FRESH full timeout (not backoff), then succeeds on a signal", async () => {
     const { c, setNow } = newEngine();
     setNow(BASE);

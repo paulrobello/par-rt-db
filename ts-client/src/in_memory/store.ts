@@ -1193,7 +1193,9 @@ export class InMemoryRtDbClient {
    * the run wakes on the next `tick`). Typed errors mirror the server's
    * `SignalDelivery` classification: unknown id → NOT_FOUND; a parked run
    * waiting on a different name → CONFLICT naming both; any other non-waiting
-   * state → CONFLICT. A payload over 64 KiB serialized rejects BAD_REQUEST. */
+   * state → CONFLICT. A payload over 64 KiB serialized rejects BAD_REQUEST.
+   * An omitted payload is delivered as JSON null — the slot is always set on
+   * a delivery (undefined stays exclusively the no-signal state). */
   async signalWorkflow(id: string, name: string, payload?: unknown): Promise<boolean> {
     if (payload !== undefined) {
       const size = new TextEncoder().encode(JSON.stringify(payload)).length;
@@ -1214,7 +1216,7 @@ export class InMemoryRtDbClient {
       const now = this.now();
       run.status = "pending";
       run.sleepUntil = now;
-      run.signalPayload = payload;
+      run.signalPayload = payload ?? null;
       run.updatedAt = now;
       return true;
     }

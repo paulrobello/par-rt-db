@@ -121,9 +121,10 @@ Both omitted unless `status == "waiting"`.
 signal?: Value   // verbatim payload of the signal that satisfied the step
 ```
 
-Omitted for txn steps and for outcomes that ended in failure. A delivery that
-omits `payload` leaves `signal` omitted; a delivery carrying an explicit JSON
-`null` records `signal: null` (the jsonb column distinguishes them).
+Omitted for txn steps and for outcomes that ended in failure. An omitted
+payload is delivered as JSON null, so the outcome records `signal: null`
+either way; `signal` is omitted only on outcomes that ended without a signal
+(timeout failures).
 
 ### WS frame
 

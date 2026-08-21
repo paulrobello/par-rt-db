@@ -485,7 +485,10 @@ pub async fn record_signal_success(
 /// is unconsumed ACKs and overwrites the slot; an ordinary `pending` row has
 /// `wait_name` NULL and never matches). Zero rows ⇒ re-read to classify
 /// (spec §Delivery). Side-table only — the `workflows::cancel`-from-handlers
-/// precedent.
+/// precedent. An omitted payload is delivered as JSON null so the slot is
+/// always SET on a delivery — SQL NULL stays exclusively the no-signal state
+/// (the committer's wake discriminator) — and the step outcome records
+/// `signal: null`.
 pub async fn deliver_signal(
     pool: &PgPool,
     db: &str,
@@ -517,7 +520,7 @@ pub async fn deliver_signal(
     ))
     .bind(id)
     .bind(now)
-    .bind(payload)
+    .bind(payload.unwrap_or(serde_json::Value::Null))
     .bind(name)
     .execute(pool)
     .await?;

@@ -1244,7 +1244,9 @@ public final class InMemoryRtDbClient: MigrationStore {
     /// unconsumed overwrites the slot; an ordinary pending run never matches).
     /// The flipped run is due on the next `tick`. Typed errors mirror the
     /// server's classification: NOT_FOUND unknown id, CONFLICT not-waiting,
-    /// CONFLICT name mismatch naming both names.
+    /// CONFLICT name mismatch naming both names. An omitted payload is
+    /// delivered as JSON null — the slot is always set on a delivery (nil
+    /// stays exclusively the no-signal state).
     public func signalWorkflow(_ id: String, name: String, payload: JSONValue? = nil) throws {
         if let payload {
             let encoded = try JSONEncoder().encode(payload)
@@ -1262,7 +1264,7 @@ public final class InMemoryRtDbClient: MigrationStore {
         if run.status == .waiting || run.status == .pending, run.waitName == name {
             run.status = .pending
             run.sleepUntil = now
-            run.signalPayload = payload
+            run.signalPayload = payload ?? .null
             run.updatedAt = now
             return
         }

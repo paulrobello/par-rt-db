@@ -1415,6 +1415,66 @@ async fn await_signal_parks_delivers_and_advances_with_payload() -> anyhow::Resu
     Ok(())
 }
 
+/// (17b) A payload-less delivery consumes the gate: the omitted payload is
+/// delivered as JSON null (never SQL NULL, which is the no-signal state), so
+/// the run completes and the outcome records `signal: null` — present, not
+/// omitted — without burning a timeout attempt.
+#[tokio::test]
+async fn await_signal_payloadless_delivery_consumes_gate() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    workflows::ensure_table(&pool, &db).await?;
+    let committers = make_committers(&state).await;
+    warm_up(&committers, &db).await;
+    let addr = spawn_app(state.clone()).await;
+    let token = mint_scoped_token(addr, &db, &["projects"]).await;
+
+    let id = workflows::insert(
+        &pool,
+        &db,
+        &await_gate_spec("payloadless", "approve", Some(60_000), 5),
+    )
+    .await?;
+
+    let parked = await_status(&pool, &db, &id, |i| i.status == WorkflowStatus::Waiting).await;
+    assert_eq!(parked.info.current_step, 1);
+
+    let resp = api_post(
+        addr,
+        &format!("/api/workflows/{id}/signal"),
+        &token,
+        serde_json::json!({ "db": db, "name": "approve" }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(body, serde_json::json!({ "delivered": true }));
+
+    let done = await_status(&pool, &db, &id, |i| i.status == WorkflowStatus::Success).await;
+    assert_eq!(done.step_outcomes.len(), 3);
+    assert_eq!(done.step_outcomes[1].attempts, 1);
+    // The committer records `signal: null` in the stored trail — but the
+    // typed `signal: Option<Value>` collapses JSON null to None on every read
+    // (deserialize null → None, re-serialize → omitted), so present-vs-absent
+    // is asserted on the raw jsonb column (a missing key would parse to Null
+    // too — `.get` is what distinguishes them).
+    let stored: serde_json::Value = sqlx::query_scalar(&format!(
+        "SELECT step_outcomes FROM \"db_{db}\".workflows WHERE id = $1"
+    ))
+    .bind(&id)
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(
+        stored[1].get("signal"),
+        Some(&serde_json::Value::Null),
+        "an omitted payload records signal: null — present, not absent"
+    );
+    assert_eq!(projects_count(&pool, &db).await, 2);
+
+    Ok(())
+}
+
 /// (18) Timeout retry waits a FRESH full timeoutMs (never backoff): the first
 /// re-park carries attempts == 1 and a gate ≈ timeoutMs past the re-park
 /// (backoff at initialRetryMs 10 would leave ~10 ms); a delivery into the
