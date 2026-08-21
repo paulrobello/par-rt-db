@@ -351,6 +351,10 @@ pub fn admin_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
             post(admin_cancel_workflow),
         )
         .route(
+            "/admin/db/{db}/workflows/{id}/signal",
+            post(admin_signal_workflow),
+        )
+        .route(
             "/admin/db/{db}/workflows/{id}",
             get(admin_get_workflow).delete(admin_delete_workflow),
         )
