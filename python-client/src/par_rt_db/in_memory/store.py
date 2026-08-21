@@ -115,6 +115,11 @@ CRON_STEP_MS = 60_000
 #: job can occupy a row for; ``schedule``/the ``schedule`` step reject a
 #: non-positive or over-cap value with ``BAD_REQUEST``.
 MAX_EVERY_MS = 365 * 24 * 60 * 60 * 1000
+#: Serialized-size cap on one signal payload (mirrors
+#: ``server/src/workflows.rs::MAX_SIGNAL_PAYLOAD_BYTES``, 64 KiB). Enforced in
+#: ``signal_workflow`` before any run lookup — the same first-check position
+#: the server's ``deliver_signal`` uses.
+MAX_SIGNAL_PAYLOAD_BYTES = 64 * 1024
 
 
 def worst_case_affected(txn: Transaction) -> int:
@@ -2205,7 +2210,15 @@ class _InMemoryStoreCore:
 
         Raises the server's typed errors: ``NOT_FOUND`` for an unknown run,
         ``CONFLICT`` when the run is not waiting for a signal, and ``CONFLICT``
-        naming both names when it waits on a different one."""
+        naming both names when it waits on a different one. A payload over
+        64 KiB serialized rejects ``BAD_REQUEST``."""
+        if payload is not None:
+            size = len(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
+            if size > MAX_SIGNAL_PAYLOAD_BYTES:
+                raise RtDbError(
+                    ErrorCode.BAD_REQUEST,
+                    f"signal payload exceeds {MAX_SIGNAL_PAYLOAD_BYTES} bytes",
+                )
         run = self._find_workflow(id)
         if run is None:
             raise RtDbError(ErrorCode.NOT_FOUND, "unknown workflow")

@@ -21,6 +21,7 @@ from par_rt_db.in_memory import (
     MAX_AFFECTED_ROWS_PER_TXN,
     MAX_BY_QUERY_STEPS_PER_TXN,
     MAX_EVERY_MS,
+    MAX_SIGNAL_PAYLOAD_BYTES,
     MAX_STEPS,
     InMemoryRtDbClient,
     InMemoryRtDbClientOptions,
@@ -3089,6 +3090,25 @@ def test_signal_workflow_typed_delivery_errors() -> None:
     assert err.message == "workflow waiting on 'approve', got 'reject'"
     # None of the failed deliveries consumed the wait.
     assert _wf_status(c, wid2).status == "waiting"
+
+
+def test_signal_workflow_rejects_oversized_payload() -> None:
+    c, _ = _new_clock_client()
+    wid = c.start_workflow(_wf("gated", [_wf_wait_step("approve")]))
+    c.tick()
+    assert _wf_status(c, wid).status == "waiting"
+    # Over-cap payload rejects BAD_REQUEST before any run state is touched
+    # (the server's deliver_signal checks the size first).
+    big = {"blob": "x" * MAX_SIGNAL_PAYLOAD_BYTES}
+    with pytest.raises(RtDbError) as ei:
+        c.signal_workflow(wid, "approve", big)
+    assert ei.value.code is ErrorCode.BAD_REQUEST
+    assert ei.value.message == f"signal payload exceeds {MAX_SIGNAL_PAYLOAD_BYTES} bytes"
+    # The rejection left the wait unconsumed; an at-cap payload still delivers.
+    assert _wf_status(c, wid).status == "waiting"
+    assert c.signal_workflow(wid, "approve", "x" * (MAX_SIGNAL_PAYLOAD_BYTES - 16)) is True
+    c.tick()
+    assert _wf_status(c, wid).status == "success"
 
 
 def test_await_signal_spec_validation_rejects_invalid_steps() -> None:
