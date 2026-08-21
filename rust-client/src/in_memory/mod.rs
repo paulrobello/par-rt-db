@@ -95,10 +95,11 @@ fn count_steps(txn: &Transaction) -> usize {
         match step {
             Step::Schedule { txn: nested, .. } => total += count_steps(nested),
             Step::StartWorkflow { spec } => {
+                // An `awaitSignal` step carries no txn, so it nests nothing.
                 total += spec
                     .steps
                     .iter()
-                    .map(|s| count_steps(&s.txn))
+                    .map(|s| s.txn.as_ref().map_or(0, count_steps))
                     .sum::<usize>();
             }
             _ => {}
@@ -809,7 +810,9 @@ impl InMemoryRtDbClient {
             }
             // FM-29: this harness does not model the workflow engine (the
             // ts/python harnesses do); workflow steps fail explicitly rather
-            // than pretending to run.
+            // than pretending to run. awaitSignal engine behavior (park /
+            // deliver / timeout) is likewise pinned by the server's
+            // integration tests, not ported here.
             Step::StartWorkflow { .. } | Step::CancelWorkflow { .. } => Err(RtDbError::new(
                 ErrorCode::Internal,
                 "workflow steps are not supported by the in-memory harness",

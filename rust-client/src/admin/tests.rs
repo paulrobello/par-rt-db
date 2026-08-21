@@ -5,7 +5,7 @@ use crate::query::TableQuery;
 use crate::schema::{FieldType, SchemaDef, Table};
 use serde_json::{Value, json};
 use wiremock::matchers::{
-    body_partial_json, body_string_contains, header, method, path, query_param,
+    body_bytes, body_partial_json, body_string_contains, header, method, path, query_param,
 };
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -2169,7 +2169,8 @@ async fn admin_start_workflow_posts_spec_and_returns_id() {
     let spec = crate::wire::WorkflowSpec {
         name: "drip".into(),
         steps: vec![crate::wire::WorkflowStepSpec {
-            txn: Mutation::new().build(),
+            txn: Some(Mutation::new().build()),
+            await_signal: None,
             retry: None,
             sleep_before_ms: None,
         }],
@@ -2195,6 +2196,43 @@ async fn admin_cancel_and_delete_workflow_hit_their_paths() {
         .await;
     client.cancel_workflow("kanban", "wf-1").await.unwrap();
     client.delete_workflow("kanban", "wf-1").await.unwrap();
+}
+
+#[tokio::test]
+async fn admin_signal_workflow_posts_name_and_optional_payload() {
+    let (server, client) = setup().await;
+    Mock::given(method("POST"))
+        .and(path("/admin/db/kanban/workflows/wf-1/signal"))
+        .and(header("authorization", BEARER))
+        .and(body_partial_json(
+            json!({"name": "approve", "payload": {"ok": true}}),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+        .mount(&server)
+        .await;
+    // `payload: None` omits the key — exact raw body, not a partial match.
+    Mock::given(method("POST"))
+        .and(path("/admin/db/kanban/workflows/wf-1/signal"))
+        .and(body_bytes(
+            serde_json::to_string(&json!({"name": "approve"}))
+                .unwrap()
+                .into_bytes(),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+        .mount(&server)
+        .await;
+    assert!(
+        client
+            .signal_workflow("kanban", "wf-1", "approve", Some(&json!({"ok": true})))
+            .await
+            .unwrap()
+    );
+    assert!(
+        client
+            .signal_workflow("kanban", "wf-1", "approve", None)
+            .await
+            .unwrap()
+    );
 }
 
 // ── Schema preview (mirror ts-client admin.test.ts previewSchema) ────────
