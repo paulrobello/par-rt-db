@@ -141,6 +141,12 @@ fn has_on_delete_children(schema: &SchemaDef, parent: &str) -> bool {
 /// parsing is deferred to the server; the harness only needs crons to re-arm.
 pub const CRON_STEP_MS: i64 = 60_000;
 
+/// Upper bound on an interval job's `everyMs`: one year in ms. Guards
+/// `now + every_ms` against i64 overflow and bounds the horizon a recurring
+/// job can occupy the registry for. Mirrors
+/// `server/src/scheduler.rs::MAX_EVERY_MS`.
+pub const MAX_EVERY_MS: i64 = 365 * 24 * 60 * 60 * 1000;
+
 /// A stored row: the user doc plus its identity/history, kept separate so the
 /// system fields (`_id`/`_creationTime`/`_version`) are merged in only at read
 /// time — exactly as the server stores `doc` jsonb alongside `id`/`created_at`/
@@ -169,14 +175,16 @@ pub struct StoredRow {
 pub struct ScheduledJob {
     /// Opaque job id.
     pub id: String,
-    /// One-shot or cron.
+    /// One-shot, cron, or interval.
     pub kind: ScheduleKind,
     /// The declarative transaction to fire when due.
     pub txn: Transaction,
     /// Next due time, epoch milliseconds.
     pub due_at: i64,
-    /// The cron expression for recurring jobs.
+    /// The cron expression for cron jobs.
     pub cron: Option<String>,
+    /// The fixed recurrence for interval jobs.
+    pub every_ms: Option<i64>,
     /// Pending / paused / running / done / cancelled.
     pub status: ScheduleStatus,
     /// Creation timestamp, epoch milliseconds.
@@ -1634,19 +1642,40 @@ impl InMemoryRtDbClient {
     // Ports `schedule`/`cancelSchedule`/`pauseSchedule`/`resumeSchedule`/
     // `listSchedules`/`tick` (`ts-client/src/in_memory.ts:600-706`). Cron
     // validation is deferred to the live server; the harness only needs the
-    // `dueAt`-driven re-arm cadence (`CRON_STEP_MS`). One-shots catch up if
-    // past due (fire once even if `due_at < now`); crons step by
-    // `CRON_STEP_MS` and skip missed windows (re-arm to the next interval,
-    // never fire N times for N missed windows).
+    // `dueAt`-driven re-arm cadence. One-shots catch up if past due (fire
+    // once even if `due_at < now`); crons step by `CRON_STEP_MS` and
+    // intervals by their `everyMs` — both skip missed windows (re-arm to the
+    // next interval, never fire N times for N missed windows).
 
     /// Stores `txn` scheduled for `when` and returns its id. Cron validation
-    /// is deferred to the live server; the harness accepts any expression.
-    /// Ports `schedule` (`ts-client/src/in_memory.ts:600-617`).
+    /// is deferred to the live server; the harness accepts any expression,
+    /// but an interval `everyMs` is validated here (positive and at most
+    /// [`MAX_EVERY_MS`], mirroring the server's `resolve_when`). Ports
+    /// `schedule` (`ts-client/src/in_memory.ts:600-617`).
     pub fn schedule(&mut self, txn: Transaction, when: ScheduleWhen) -> Result<String, RtDbError> {
+        let every_ms = match &when {
+            ScheduleWhen::Interval { every_ms } => {
+                if *every_ms <= 0 {
+                    return Err(RtDbError::new(
+                        ErrorCode::BadRequest,
+                        "everyMs must be positive".to_string(),
+                    ));
+                }
+                if *every_ms > MAX_EVERY_MS {
+                    return Err(RtDbError::new(
+                        ErrorCode::BadRequest,
+                        format!("everyMs must be at most {MAX_EVERY_MS}"),
+                    ));
+                }
+                Some(*every_ms)
+            }
+            _ => None,
+        };
         let id = self.new_id();
         let now = (self.now)();
         let kind = match &when {
             ScheduleWhen::Cron { .. } => ScheduleKind::Cron,
+            ScheduleWhen::Interval { .. } => ScheduleKind::Interval,
             _ => ScheduleKind::Oneshot,
         };
         let cron = match &when {
@@ -1659,6 +1688,7 @@ impl InMemoryRtDbClient {
             txn,
             due_at: self.due_at_for(&when, now),
             cron,
+            every_ms,
             status: ScheduleStatus::Pending,
             created_at: now,
             fired_count: 0,
@@ -1696,9 +1726,14 @@ impl InMemoryRtDbClient {
         Ok(())
     }
 
-    /// Sets a paused schedule's status back to `Pending`. NOT_FOUND if no such
-    /// id. Ports `resumeSchedule` (`ts-client/src/in_memory.ts:629-631`).
+    /// Sets a paused schedule's status back to `Pending`, shifting an interval
+    /// job's due time one full interval from now (windows elapsed while
+    /// paused are skipped, never backfilled — mirrors the server's
+    /// `set_paused`; cron recompute is deferred to the server and one-shots
+    /// keep their due_at). NOT_FOUND if no such id. Ports `resumeSchedule`
+    /// (`ts-client/src/in_memory.ts:629-631`).
     pub fn resume_schedule(&mut self, id: &str) -> Result<(), RtDbError> {
+        let now = (self.now)();
         let job = self
             .schedules
             .iter_mut()
@@ -1707,6 +1742,11 @@ impl InMemoryRtDbClient {
                 RtDbError::new(ErrorCode::NotFound, format!("schedule '{id}' not found"))
             })?;
         job.status = ScheduleStatus::Pending;
+        if job.kind == ScheduleKind::Interval
+            && let Some(ms) = job.every_ms
+        {
+            job.due_at = now + ms;
+        }
         Ok(())
     }
 
@@ -1719,7 +1759,8 @@ impl InMemoryRtDbClient {
     /// Fires every due non-paused job by applying its txn through the same
     /// atomic path as [`mutate`](Self::mutate) (so reactive subscriptions see
     /// the write). One-shots are removed after a successful fire; crons are
-    /// re-armed by `CRON_STEP_MS`. A job whose txn fails is marked `Error` but
+    /// re-armed by `CRON_STEP_MS` and intervals by their `everyMs`. A job
+    /// whose txn fails is marked `Error` but
     /// left in place (still due), so a subsequent `tick` retries it — matching
     /// the TS harness, where only `Paused` jobs are skipped. Pass `now_ms` to
     /// drive the clock deterministically; omit it to use the client's injected
@@ -1746,6 +1787,7 @@ impl InMemoryRtDbClient {
             let txn = job.txn.clone();
             let job_id = job.id.clone();
             let kind = job.kind;
+            let every_ms = job.every_ms;
             match self.execute_transaction(&txn) {
                 Ok(_results) => {
                     // Re-borrow the job (it may have moved if execute_transaction
@@ -1765,6 +1807,19 @@ impl InMemoryRtDbClient {
                                 j.due_at = now + CRON_STEP_MS;
                                 j.status = ScheduleStatus::Pending;
                             }
+                            // Interval re-arms from each actual fire time (cron
+                            // parity: windows missed during the fire's latency
+                            // are skipped, not backfilled).
+                            ScheduleKind::Interval => match every_ms {
+                                Some(ms) => {
+                                    j.due_at = now + ms;
+                                    j.status = ScheduleStatus::Pending;
+                                }
+                                None => {
+                                    j.status = ScheduleStatus::Error;
+                                    j.last_error = Some("interval job missing everyMs".to_string());
+                                }
+                            },
                         }
                     }
                 }
@@ -1774,6 +1829,11 @@ impl InMemoryRtDbClient {
                         j.last_error = Some(error.message);
                         if kind == ScheduleKind::Cron {
                             j.due_at = now + CRON_STEP_MS;
+                        }
+                        if kind == ScheduleKind::Interval
+                            && let Some(ms) = every_ms
+                        {
+                            j.due_at = now + ms;
                         }
                     }
                 }
@@ -1885,13 +1945,15 @@ impl InMemoryRtDbClient {
 
     /// Initial `due_at` for a schedule's `when`, mirroring `dueAtFor`
     /// (`ts-client/src/in_memory.ts:708-717`). `afterMs` is relative to `now`,
-    /// `runAt` is absolute (in the past = fire on the next tick), and `cron`
-    /// steps by `CRON_STEP_MS` from `now` (real cron parsing is server-side).
+    /// `runAt` is absolute (in the past = fire on the next tick), `cron`
+    /// steps by `CRON_STEP_MS` from `now` (real cron parsing is server-side),
+    /// and `interval` is one `everyMs` from `now`.
     fn due_at_for(&self, when: &ScheduleWhen, now: i64) -> i64 {
         match when {
             ScheduleWhen::AfterMs { ms } => now + ms,
             ScheduleWhen::RunAt { ms } => *ms,
             ScheduleWhen::Cron { .. } => now + CRON_STEP_MS,
+            ScheduleWhen::Interval { every_ms } => now + every_ms,
         }
     }
 
@@ -1972,14 +2034,15 @@ impl InMemoryRtDbClient {
 }
 
 /// Builds the public [`ScheduleInfo`] view of an in-memory [`ScheduledJob`].
-/// Mirrors `toScheduleInfo` (`ts-client/src/in_memory.ts:727-743`): `cron` and
-/// `last_error` are present only when set.
+/// Mirrors `toScheduleInfo` (`ts-client/src/in_memory.ts:727-743`): `cron`,
+/// `every_ms`, and `last_error` are present only when set.
 fn schedule_info(job: &ScheduledJob) -> ScheduleInfo {
     ScheduleInfo {
         id: job.id.clone(),
         kind: job.kind,
         due_at: job.due_at,
         cron: job.cron.clone(),
+        every_ms: job.every_ms,
         status: job.status,
         last_error: job.last_error.clone(),
         created_at: job.created_at,

@@ -1,0 +1,21 @@
+{
+  "name": "error-schedule-interval-everyms-nonpositive",
+  "$comment": "Interval scheduling validation: an interval when whose everyMs is non-positive (0 or negative) is rejected with BAD_REQUEST before any row is written. Mirrors server scheduler.rs resolve_when; the same validation is mirrored in every client engine's schedule path.",
+  "schema": {
+    "tables": {
+      "tasks": {
+        "fields": { "name": { "type": "string" } },
+        "indexes": [{ "name": "by_name", "fields": ["name"] }]
+      }
+    }
+  },
+  "seed": [{ "name": "a" }],
+  "op": {
+    "txn": {
+      "steps": [
+        { "op": "schedule", "when": { "type": "interval", "everyMs": 0 }, "txn": { "steps": [] } }
+      ]
+    }
+  },
+  "expect": { "error": { "code": "BAD_REQUEST" } }
+}

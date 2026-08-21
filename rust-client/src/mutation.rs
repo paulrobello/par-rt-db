@@ -109,7 +109,8 @@ pub enum Step {
     /// Schedule `txn` to run later. Mirrors
     /// `server/src/txn.rs::Step::Schedule` byte-for-byte (FM-28).
     Schedule {
-        /// One-shot delay/absolute time, or a cron expression.
+        /// One-shot delay/absolute time, a cron expression, or a fixed
+        /// interval.
         when: ScheduleWhen,
         /// The nested transaction to fire when due.
         txn: Box<Transaction>,

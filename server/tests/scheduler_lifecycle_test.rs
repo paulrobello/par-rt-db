@@ -24,7 +24,7 @@ async fn scheduler_exits_when_its_database_is_deleted() -> anyhow::Result<()> {
     // within the test timeout.
     let far_future = i64::MAX - 1_000_000;
     let txn = Transaction { steps: vec![] };
-    scheduler::insert(&pool, &db, "oneshot", far_future, &txn, None).await?;
+    scheduler::insert(&pool, &db, "oneshot", far_future, &txn, None, None).await?;
 
     // No consumer is needed: the scheduler only sends on this channel when it
     // claims due rows, and the far-future job never becomes due, so it never

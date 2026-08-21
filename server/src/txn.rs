@@ -2104,8 +2104,17 @@ async fn step_schedule(
     txn: &Transaction,
 ) -> Result<(), RtDbError> {
     authorize_txn_tables(sctx.ctx, txn)?;
-    let (kind, due_at, cron) = scheduler::resolve_when(when.clone(), now_ms())?;
-    let id = scheduler::insert_on(sctx.tx, sctx.db, kind, due_at, txn, cron.as_deref()).await?;
+    let (kind, due_at, cron, every_ms) = scheduler::resolve_when(when.clone(), now_ms())?;
+    let id = scheduler::insert_on(
+        sctx.tx,
+        sctx.db,
+        kind,
+        due_at,
+        txn,
+        cron.as_deref(),
+        every_ms,
+    )
+    .await?;
     sctx.results.push(serde_json::json!({ "scheduleId": id }));
     Ok(())
 }

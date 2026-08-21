@@ -128,14 +128,16 @@ export interface HybridSearchQuery {
 export type ScheduleWhen =
   | { type: "afterMs"; ms: number }
   | { type: "runAt"; ms: number }
-  | { type: "cron"; expr: string };
+  | { type: "cron"; expr: string }
+  | { type: "interval"; everyMs: number };
 
-/** Mirrors server `protocol::ScheduleInfo` (camelCase; `cron`/`lastError` omitted when absent). */
+/** Mirrors server `protocol::ScheduleInfo` (camelCase; `cron`/`everyMs`/`lastError` omitted when absent). */
 export interface ScheduleInfo {
   id: string;
-  kind: "oneshot" | "cron";
+  kind: "oneshot" | "cron" | "interval";
   dueAt: number;
   cron?: string;
+  everyMs?: number;
   status: "pending" | "running" | "paused" | "error";
   lastError?: string;
   createdAt: number;

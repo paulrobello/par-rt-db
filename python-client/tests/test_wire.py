@@ -76,6 +76,9 @@ def test_schedule_when_variants() -> None:
     assert adapter.validate_python({"type": "cron", "expr": "*/5 * * * *"}).model_dump(
         by_alias=True, mode="json"
     ) == {"type": "cron", "expr": "*/5 * * * *"}
+    assert adapter.validate_python({"type": "interval", "everyMs": 300000}).model_dump(
+        by_alias=True, mode="json"
+    ) == {"type": "interval", "everyMs": 300000}
 
 
 def test_schedule_info_omits_optional_when_absent() -> None:
@@ -92,6 +95,21 @@ def test_schedule_info_omits_optional_when_absent() -> None:
     d = si.model_dump(by_alias=True, mode="json")
     assert d["id"] == "j1" and d["dueAt"] == 100 and d["firedCount"] == 0
     assert "cron" not in d and "lastError" not in d
+    # everyMs rides only on interval rows (same omit-when-None rule as cron).
+    interval = ScheduleInfo.model_validate(
+        {
+            "id": "j9",
+            "kind": "interval",
+            "dueAt": 100,
+            "everyMs": 300000,
+            "status": "pending",
+            "createdAt": 1,
+            "firedCount": 0,
+        }
+    )
+    di = interval.model_dump(by_alias=True, mode="json")
+    assert di["kind"] == "interval" and di["everyMs"] == 300000
+    assert "cron" not in di and "lastError" not in di
 
 
 def test_filter_expr_leaves_and_combinators() -> None:

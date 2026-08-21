@@ -486,6 +486,45 @@ async fn schedule_rejects_negative_after_ms_http() -> anyhow::Result<()> {
     Ok(())
 }
 
+// (l2) a non-positive or over-cap everyMs on an interval schedule is rejected
+// before any row is written.
+#[tokio::test]
+async fn schedule_rejects_bad_every_ms_http() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let name = fresh_db(&state).await;
+    let (_, token) = mint_token(addr, &name).await;
+
+    for bad in [0i64, -1, rtdb_server::scheduler::MAX_EVERY_MS + 1] {
+        let resp = api_post(
+            addr,
+            "/api/schedule",
+            &token,
+            json!({
+                "db": name,
+                "when": {"type": "interval", "everyMs": bad},
+                "txn": {"steps": []},
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+        let body: serde_json::Value = resp.json().await?;
+        assert_eq!(body["code"], "BAD_REQUEST");
+    }
+
+    // No row was written.
+    let resp = api_post(addr, "/api/schedules", &token, json!({"db": name})).await;
+    let body: serde_json::Value = resp.json().await?;
+    assert!(
+        body["schedules"]
+            .as_array()
+            .expect("schedules array")
+            .is_empty()
+    );
+
+    Ok(())
+}
+
 // (j2) authorize's User branch rejects a session whose expiry has passed,
 // even for an allowlisted email — the email is added to the allowlist first
 // so expiry is the only possible reason for rejection.

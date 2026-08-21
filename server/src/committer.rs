@@ -62,6 +62,7 @@ pub enum CommitterRequest {
         kind: String,
         txn: Box<Transaction>,
         cron: Option<String>,
+        every_ms: Option<i64>,
     },
     /// Apply a declarative schema migration on this database. Serialized through
     /// the per-db committer like `Mutate`, so the migration's DDL+DML and the
@@ -899,6 +900,7 @@ async fn run_committer(ctx: CommitterCtx, mut rx: mpsc::Receiver<CommitterReques
                 kind,
                 txn,
                 cron,
+                every_ms,
             } => {
                 let span = tracing::info_span!(
                     "committer.scheduled",
@@ -906,7 +908,7 @@ async fn run_committer(ctx: CommitterCtx, mut rx: mpsc::Receiver<CommitterReques
                     kind,
                     id,
                 );
-                let outcome = handle_scheduled(&ctx, id, kind, *txn, cron)
+                let outcome = handle_scheduled(&ctx, id, kind, *txn, cron, every_ms)
                     .instrument(span)
                     .await;
                 if let Err(err) = outcome {
@@ -1166,6 +1168,7 @@ async fn handle_scheduled(
     kind: String,
     txn: Transaction,
     cron: Option<String>,
+    every_ms: Option<i64>,
 ) -> Result<(), RtDbError> {
     let schema = match ctx.schemas.get(&ctx.pool, &ctx.db).await {
         Ok(schema) => schema,
@@ -1211,7 +1214,7 @@ async fn handle_scheduled(
                 "cron" => match cron.as_deref() {
                     Some(expr) => match scheduler::next_fire(expr, now_ms()) {
                         Ok(next) => {
-                            scheduler::finalize_cron_next(&ctx.pool, &ctx.db, &id, next).await
+                            scheduler::finalize_recurring_next(&ctx.pool, &ctx.db, &id, next).await
                         }
                         Err(err) => {
                             scheduler::mark_error(&ctx.pool, &ctx.db, &id, &err.message).await
@@ -1220,6 +1223,24 @@ async fn handle_scheduled(
                     None => {
                         scheduler::mark_error(&ctx.pool, &ctx.db, &id, "cron job missing expr")
                             .await
+                    }
+                },
+                // Interval re-arms from each actual fire time (cron parity:
+                // windows missed during the fire's latency are skipped, not
+                // backfilled).
+                "interval" => match every_ms {
+                    Some(ms) => {
+                        scheduler::finalize_recurring_next(&ctx.pool, &ctx.db, &id, now_ms() + ms)
+                            .await
+                    }
+                    None => {
+                        scheduler::mark_error(
+                            &ctx.pool,
+                            &ctx.db,
+                            &id,
+                            "interval job missing everyMs",
+                        )
+                        .await
                     }
                 },
                 other => {
@@ -1239,7 +1260,7 @@ async fn handle_scheduled(
                 "cron" => match cron.as_deref() {
                     Some(expr) => match scheduler::next_fire(expr, now_ms()) {
                         Ok(next) => {
-                            let _ = scheduler::reschedule_cron_error(
+                            let _ = scheduler::reschedule_recurring_error(
                                 &ctx.pool, &ctx.db, &id, next, &msg,
                             )
                             .await;
@@ -1248,6 +1269,21 @@ async fn handle_scheduled(
                             let _ = scheduler::mark_error(&ctx.pool, &ctx.db, &id, &msg).await;
                         }
                     },
+                    None => {
+                        let _ = scheduler::mark_error(&ctx.pool, &ctx.db, &id, &msg).await;
+                    }
+                },
+                "interval" => match every_ms {
+                    Some(ms) => {
+                        let _ = scheduler::reschedule_recurring_error(
+                            &ctx.pool,
+                            &ctx.db,
+                            &id,
+                            now_ms() + ms,
+                            &msg,
+                        )
+                        .await;
+                    }
                     None => {
                         let _ = scheduler::mark_error(&ctx.pool, &ctx.db, &id, &msg).await;
                     }

@@ -74,7 +74,7 @@ Related documentation: [`CHANGELOG.md`](CHANGELOG.md), [`DESIGN.md`](DESIGN.md),
 ### Advanced Features
 - **Full-text search**: websearch-syntax `search` ranked by `ts_rank` with optional snippets, plus a `trgm` mode for substring/autocomplete matching
 - **Vector + hybrid search**: write-maintained pgvector columns ranked by the index's declared metric; `hybridSearch` fuses full-text and vector rankings via Reciprocal Rank Fusion
-- **Scheduling**: one-shot (`afterMs`/`runAt`) and 5-field UTC `cron` transactions with cancel/pause/resume — scheduled work is data, not server code
+- **Scheduling**: one-shot (`afterMs`/`runAt`), 5-field UTC `cron`, and fixed-interval (`everyMs`) transactions with cancel/pause/resume — scheduled work is data, not server code
 - **Durable workflows**: multi-step specs with per-step retry, backoff, and sleep; at-least-once per step with crash-resume
 - **Server-stamped `updatedAt`**: a table may declare `updatedAtField` naming a `number`/`int64` field the server stamps with epoch-ms on every version-bumping write (insert/patch/replace/upsert/patchByQuery/cascade setNull), overwriting client-supplied values — no more hand-rolled timestamps in every mutation, and orderable with a declared index
 - **Realtime presence**: transient room membership and state ("who is online", cursors, typing) over the existing `/sync` socket — no extra infrastructure
@@ -236,7 +236,7 @@ since browsers cannot set headers on a WS handshake.
 | `POST /api/query` | Bearer token | One-shot query against a database; see [Query shape](#query-shape). |
 | `POST /api/query-batch` | Bearer token | Fans out N queries in one round trip (per-query error isolation); each slot returns `{ok, result}` or `{ok:false, error}`. |
 | `POST /api/mutate` | Bearer token | One-shot transaction (`insert`/`patch`/`replace`/`delete`/`undelete`/`expectVersion`/`expectAbsent`/`upsert` + `patchByQuery`/`deleteByQuery` + `schedule`/`cancelSchedule` + `startWorkflow`/`cancelWorkflow` steps). |
-| `POST /api/schedule` | Bearer token | Schedules a transaction: `afterMs`/`runAt` one-shot or `cron` (5-field, UTC, min-first); returns `{id}`. |
+| `POST /api/schedule` | Bearer token | Schedules a transaction: `afterMs`/`runAt` one-shot, `cron` (5-field, UTC, min-first), or `interval` (fixed `everyMs`); returns `{id}`. |
 | `POST /api/schedule/{id}/{cancel,pause,resume}` | Bearer token | Cancels, pauses, or resumes a scheduled job. |
 | `POST /api/schedules` | Bearer token | Lists scheduled jobs for a database (`ScheduleInfo[]`). |
 | `POST /api/workflows` | Bearer token | Starts a durable workflow run from a `WorkflowSpec` (FM-29); returns `{id}`. See [Durable workflows](#durable-workflows). |
@@ -720,12 +720,17 @@ server-side code. `when` is one of:
   fires immediately).
 - `{type: "cron", expr}` — fire on a 5-field standard cron expression (UTC,
   min-first, e.g. `"*/5 * * * *"` = every 5 minutes). The server validates `expr`.
+- `{type: "interval", everyMs}` — fire every `everyMs` milliseconds, first fire
+  one interval from now (e.g. `300000` = every 5 minutes, no cron expression
+  needed). `everyMs` must be positive and at most 31,536,000,000 (one year).
 
 A per-database scheduler timer claims due rows and enqueues each through the
 single-writer committer, which executes it via the normal transaction path (so
 subscriptions fire on schedule-driven writes too). Delivery is **at-least-once**:
 apps should write idempotent scheduled transactions. A one-shot catches up if past
-due; a cron **skips** missed windows with no backfill. Each job's lifecycle is
+due; a cron or interval job **skips** missed windows with no backfill (each fire
+re-arms from its actual fire time, and `resume` shifts the next fire one full
+interval/expression step from the resume). Each job's lifecycle is
 managed with `cancel` / `pause` / `resume` and listed via `listSchedules`.
 
 ### HTTP example: schedule a one-shot, then list
@@ -979,7 +984,7 @@ plus an operator SPA and a CLI built on top of them:
 ### Where we are
 * **Core**: realtime live queries, atomic multi-step transactions, typed schemas compiled to Postgres DDL, WebSocket + HTTP transports, many databases per instance
 * **Query terminals**: `get`/`index`/`count`/`unique`/`first`/`take`, `filter` predicate DSL, full-text `search` (`ts_rank` + `trgm` mode), `vectorSearch` (pgvector), `hybridSearch` (RRF), `paginate` keyset pagination, `distinct`, `aggregate`
-* **Beyond documents**: scheduling (`afterMs`/`runAt`/`cron`), durable workflows, realtime presence, file storage with signed URLs and image transforms
+* **Beyond documents**: scheduling (`afterMs`/`runAt`/`cron`/`interval`), durable workflows, realtime presence, file storage with signed URLs and image transforms
 * **Auth**: six optional OAuth providers, per-db machine tokens, optional anonymous with anon→real merge, per-row `ownerField`/`authorize` rules
 * **Operations**: operator dashboard, `rtdb` CLI, op feed, audit log, webhooks, Prometheus metrics + optional OTLP tracing, backup/restore, schema migration with snapshot history, hot config, per-db quotas
 * [`FEATURE_MATRIX.md`](FEATURE_MATRIX.md) is the authoritative Convex-parity contract

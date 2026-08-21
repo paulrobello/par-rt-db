@@ -17,6 +17,7 @@ export {
   InMemoryRtDbClient,
   MAX_AFFECTED_ROWS_PER_TXN,
   MAX_BY_QUERY_STEPS_PER_TXN,
+  MAX_EVERY_MS,
   MAX_STEPS,
   PresenceRooms,
   worstCaseAffected,

@@ -438,9 +438,10 @@ class _MutationBuilder:
         return self
 
     def schedule(self, when: ScheduleWhen, txn: Transaction) -> _MutationBuilder:
-        """Schedule step: enqueue ``txn`` to run at ``when`` (one-shot or cron).
-        The nested steps do not run in this transaction — the server fires them
-        at the due time; the step result carries the job's ``scheduleId``."""
+        """Schedule step: enqueue ``txn`` to run at ``when`` (one-shot, cron, or
+        interval). The nested steps do not run in this transaction — the server
+        fires them at the due time; the step result carries the job's
+        ``scheduleId``."""
         self._steps.append(_Schedule(op="schedule", when=when, txn=txn))
         return self
 

@@ -2661,6 +2661,7 @@ mod tests {
                     kind: ScheduleKind::Cron,
                     due_at: 9000,
                     cron: Some("*/5 * * * *".into()),
+                    every_ms: None,
                     status: ScheduleStatus::Pending,
                     last_error: None,
                     created_at: 1000,

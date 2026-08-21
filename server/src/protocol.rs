@@ -251,17 +251,25 @@ pub enum ScheduleWhen {
     RunAt { ms: i64 },
     /// Fire on this 5-field cron schedule (UTC, min-first).
     Cron { expr: String },
+    /// Fire every `every_ms` milliseconds, starting one interval from now.
+    /// Missed windows (downtime, pause) are skipped, never backfilled —
+    /// each fire re-arms from its actual fire time, like cron recompute.
+    Interval {
+        #[serde(rename = "everyMs")]
+        every_ms: i64,
+    },
 }
 
 /// Whether a scheduled job fires once (`ScheduleWhen::AfterMs`/`RunAt`) or
-/// repeats on a cron expression. Closed domain — was a free `String`
-/// (ARC-004/QA-008). Serializes as `"oneshot"` / `"cron"`, byte-identical to
-/// the prior stringly-typed bytes.
+/// repeats (`Cron` on an expression, `Interval` every N ms). Closed domain —
+/// was a free `String` (ARC-004/QA-008). Serializes as `"oneshot"` / `"cron"`
+/// / `"interval"`, byte-identical to the prior stringly-typed bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ScheduleKind {
     Oneshot,
     Cron,
+    Interval,
 }
 
 impl ScheduleKind {
@@ -269,6 +277,7 @@ impl ScheduleKind {
         match self {
             ScheduleKind::Oneshot => "oneshot",
             ScheduleKind::Cron => "cron",
+            ScheduleKind::Interval => "interval",
         }
     }
 }
@@ -285,6 +294,7 @@ impl std::str::FromStr for ScheduleKind {
         match s {
             "oneshot" => Ok(ScheduleKind::Oneshot),
             "cron" => Ok(ScheduleKind::Cron),
+            "interval" => Ok(ScheduleKind::Interval),
             other => Err(format!("unknown ScheduleKind: {other}")),
         }
     }
@@ -344,6 +354,9 @@ pub struct ScheduleInfo {
     pub due_at: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cron: Option<String>,
+    /// Interval jobs only: the fixed recurrence in ms (`kind: "interval"`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub every_ms: Option<i64>,
     pub status: ScheduleStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
@@ -659,6 +672,10 @@ mod tests {
             })
             .unwrap(),
             serde_json::json!({"type": "cron", "expr": "*/5 * * * *"})
+        );
+        assert_eq!(
+            serde_json::to_value(ScheduleWhen::Interval { every_ms: 5_000 }).unwrap(),
+            serde_json::json!({"type": "interval", "everyMs": 5000})
         );
     }
 

@@ -478,6 +478,7 @@ pub async fn create_database(pool: &PgPool, name: &str) -> Result<(), RtDbError>
             due_at      bigint NOT NULL,
             txn         jsonb NOT NULL,
             cron        text,
+            every_ms    bigint,
             status      text NOT NULL,
             last_error  text,
             created_at  bigint NOT NULL,

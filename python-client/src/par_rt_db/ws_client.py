@@ -645,8 +645,9 @@ class RtDbClient:
         # else: queued; ``_flush_on_auth`` sends it on the next authOk.
 
     async def schedule(self, txn: Transaction, when: ScheduleWhen) -> str:
-        """Schedule ``txn`` to run at ``when`` (a one-shot deadline or a cron
-        expression). Returns the new schedule's id."""
+        """Schedule ``txn`` to run at ``when`` (a one-shot deadline, a cron
+        expression, or a fixed ``everyMs`` interval). Returns the new schedule's
+        id."""
         return await self._sched_op("schedule", txn=txn, when=when)
 
     async def cancel_schedule(self, id: str) -> bool:

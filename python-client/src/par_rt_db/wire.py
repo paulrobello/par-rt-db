@@ -4,7 +4,8 @@ Mirrors ``server/src/protocol.rs`` and ``server/src/query.rs`` (cross-checked
 against ``ts-client/src/protocol.ts`` and ``rust-client/src/wire.rs``) field-for-field.
 Discriminator unions:
 
-* ``ScheduleWhen`` is tagged by ``type`` (camelCase variants: ``afterMs``/``runAt``/``cron``).
+* ``ScheduleWhen`` is tagged by ``type`` (camelCase variants:
+  ``afterMs``/``runAt``/``cron``/``interval``).
 * ``FilterExpr`` is tagged by ``op`` (lowercase variants: ``eq``/``neq``/``gt``/``gte``/
   ``lt``/``lte``/``in``/``and``/``or``/``not``/``contains``/``exists``).
 
@@ -84,7 +85,12 @@ class Cron(_Camel):
     expr: str
 
 
-ScheduleWhen = Annotated[AfterMs | RunAt | Cron, Field(discriminator="type")]
+class Interval(_Camel):
+    type: Literal["interval"] = "interval"
+    every_ms: int
+
+
+ScheduleWhen = Annotated[AfterMs | RunAt | Cron | Interval, Field(discriminator="type")]
 
 # Backwards-compat aliases — the underscore spellings were the only way to
 # reach these before ARC-109 re-exported them from the package root. Kept so an
@@ -97,15 +103,17 @@ _Cron = Cron
 class ScheduleInfo(_Camel):
     """A scheduled job's public view (returned by ``listSchedules``).
 
-    ``cron``/``lastError`` are omitted on the wire when ``None``. ``kind`` and
+    ``cron``/``everyMs``/``lastError`` are omitted on the wire when ``None``
+    (only interval jobs carry ``everyMs`` — exactly like ``cron``). ``kind`` and
     ``status`` are narrowed to ``Literal`` unions (ARC-004/QA-008) mirroring the
     server's ``ScheduleKind`` / ``ScheduleStatus`` enums.
     """
 
     id: str
-    kind: Literal["oneshot", "cron"]
+    kind: Literal["oneshot", "cron", "interval"]
     due_at: int
     cron: str | None = None
+    every_ms: int | None = None
     status: Literal["pending", "running", "paused", "error"]
     last_error: str | None = None
     created_at: int
@@ -114,7 +122,7 @@ class ScheduleInfo(_Camel):
     @model_serializer(mode="wrap")
     def _drop_none_optional(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
         out = handler(self)
-        for alias in ("cron", "lastError"):
+        for alias in ("cron", "everyMs", "lastError"):
             if out.get(alias) is None:
                 out.pop(alias, None)
         return out

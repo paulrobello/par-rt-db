@@ -1108,6 +1108,108 @@ describe("InMemoryRtDbClient — schedules", () => {
     expect(typeof info.createdAt).toBe("number");
   });
 
+  it("an interval schedule fires repeatedly, re-arming from each fire", async () => {
+    const { c, setNow } = newClockClient();
+    setNow(BASE);
+    const { id } = await c.schedule(insertTxn, { type: "interval", everyMs: 1000 });
+
+    let info = (await c.listSchedules()).find((s) => s.id === id) as ScheduleInfo;
+    expect(info.kind).toBe("interval");
+    expect(info.everyMs).toBe(1000);
+    expect(info.dueAt).toBe(BASE + 1000);
+
+    setNow(BASE + 1000);
+    c.tick();
+    expect(await c.query(api.items.query().collect())).toHaveLength(1);
+
+    setNow(BASE + 2000);
+    c.tick();
+    expect(await c.query(api.items.query().collect())).toHaveLength(2);
+    info = (await c.listSchedules()).find((s) => s.id === id) as ScheduleInfo;
+    expect(info.firedCount).toBe(2);
+    expect(info.dueAt).toBe(BASE + 3000);
+  });
+
+  it("an interval schedule skips missed windows on a big clock jump", async () => {
+    const { c, setNow } = newClockClient();
+    setNow(BASE);
+    const { id } = await c.schedule(insertTxn, { type: "interval", everyMs: 1000 });
+
+    setNow(BASE + 5500); // five windows elapsed — one fire, no backfill
+    c.tick();
+    expect(await c.query(api.items.query().collect())).toHaveLength(1);
+    const info = (await c.listSchedules()).find((s) => s.id === id) as ScheduleInfo;
+    expect(info.firedCount).toBe(1);
+    expect(info.dueAt).toBe(BASE + 6500); // re-armed from the fire time
+  });
+
+  it("pause halts an interval job; resume shifts its dueAt from the resume point", async () => {
+    const { c, setNow } = newClockClient();
+    setNow(BASE);
+    const { id } = await c.schedule(insertTxn, { type: "interval", everyMs: 1000 });
+    await c.pauseSchedule(id);
+
+    setNow(BASE + 5000);
+    c.tick();
+    expect(await c.query(api.items.query().collect())).toHaveLength(0);
+
+    await c.resumeSchedule(id);
+    let info = (await c.listSchedules()).find((s) => s.id === id) as ScheduleInfo;
+    expect(info.status).toBe("pending");
+    expect(info.dueAt).toBe(BASE + 5000 + 1000); // shifted from resume, not the stale dueAt
+
+    setNow(BASE + 6000);
+    c.tick();
+    expect(await c.query(api.items.query().collect())).toHaveLength(1);
+    info = (await c.listSchedules()).find((s) => s.id === id) as ScheduleInfo;
+    expect(info.dueAt).toBe(BASE + 7000);
+  });
+
+  it("a failing interval txn re-arms from the failure time", async () => {
+    const { c, setNow } = newClockClient();
+    setNow(BASE);
+    const failTxn = mutation().delete("items", "nonexistent").build(); // NOT_FOUND
+    const { id } = await c.schedule(failTxn, { type: "interval", everyMs: 1000 });
+
+    setNow(BASE + 1000);
+    c.tick();
+    let info = (await c.listSchedules()).find((s) => s.id === id) as ScheduleInfo;
+    expect(info.status).toBe("error");
+    expect(info.lastError).toBeDefined();
+    expect(info.dueAt).toBe(BASE + 2000); // re-armed despite the failure
+
+    setNow(BASE + 2000);
+    c.tick();
+    info = (await c.listSchedules()).find((s) => s.id === id) as ScheduleInfo;
+    expect(info.firedCount).toBe(0); // failures don't count as fires
+    expect(info.dueAt).toBe(BASE + 3000);
+  });
+
+  it("rejects a non-positive or over-cap everyMs with BAD_REQUEST", async () => {
+    const { c } = newClockClient();
+    await expect(c.schedule(insertTxn, { type: "interval", everyMs: 0 })).rejects.toMatchObject({
+      name: "RtDbError",
+      code: "BAD_REQUEST",
+    });
+    await expect(c.schedule(insertTxn, { type: "interval", everyMs: -5 })).rejects.toMatchObject({
+      name: "RtDbError",
+      code: "BAD_REQUEST",
+    });
+    await expect(
+      c.schedule(insertTxn, { type: "interval", everyMs: 31_536_000_001 }),
+    ).rejects.toMatchObject({ name: "RtDbError", code: "BAD_REQUEST" });
+    expect(await c.listSchedules()).toEqual([]); // no row written
+  });
+
+  it("the schedule txn step applies the same everyMs validation", async () => {
+    const { c, setNow } = newClockClient();
+    setNow(BASE);
+    await expect(
+      c.mutate(mutation().schedule({ type: "interval", everyMs: 0 }, insertTxn).build()),
+    ).rejects.toMatchObject({ name: "RtDbError", code: "BAD_REQUEST" });
+    expect(await c.listSchedules()).toEqual([]);
+  });
+
   it("cancel/pause/resume on an unknown id resolve false (no-op)", async () => {
     const { c } = newClockClient();
     await expect(c.cancelSchedule("nope")).resolves.toBe(false);

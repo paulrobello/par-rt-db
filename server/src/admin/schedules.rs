@@ -86,8 +86,17 @@ pub(super) async fn admin_create_schedule(
     state.realtime.committers.ensure_spawned(&db).await?;
     scheduler::ensure_table(&state.pool, &db).await?;
 
-    let (kind, due_at, cron) = scheduler::resolve_when(body.when, now_ms())?;
-    let id = scheduler::insert(&state.pool, &db, kind, due_at, &body.txn, cron.as_deref()).await?;
+    let (kind, due_at, cron, every_ms) = scheduler::resolve_when(body.when, now_ms())?;
+    let id = scheduler::insert(
+        &state.pool,
+        &db,
+        kind,
+        due_at,
+        &body.txn,
+        cron.as_deref(),
+        every_ms,
+    )
+    .await?;
     Ok(Json(AdminScheduleCreateResponse { id }))
 }
 

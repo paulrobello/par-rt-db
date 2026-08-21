@@ -386,7 +386,7 @@ async fn schedule_handler(
     state.realtime.committers.ensure_spawned(&body.db).await?;
     scheduler::ensure_table(&state.pool, &body.db).await?;
 
-    let (kind, due_at, cron) = scheduler::resolve_when(body.when, now_ms())?;
+    let (kind, due_at, cron, every_ms) = scheduler::resolve_when(body.when, now_ms())?;
     let id = scheduler::insert(
         &state.pool,
         &body.db,
@@ -394,6 +394,7 @@ async fn schedule_handler(
         due_at,
         &body.txn,
         cron.as_deref(),
+        every_ms,
     )
     .await?;
     Ok(Json(ScheduleResponse { id }))

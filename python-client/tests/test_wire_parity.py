@@ -289,7 +289,8 @@ def test_corpus_authed_user_rejects_unknown_kind(entry: dict[str, Any]) -> None:
     ids=lambda e: f"kind={e.get('kind')}",
 )
 def test_corpus_schedule_info_rejects_unknown_kind(entry: dict[str, Any]) -> None:
-    """ARC-004/QA-008: ``ScheduleInfo.kind`` is now ``Literal["oneshot","cron"]``."""
+    """ARC-004/QA-008: ``ScheduleInfo.kind`` is now ``Literal["oneshot","cron",
+    "interval"]``."""
     with pytest.raises(ValidationError):
         ScheduleInfo.model_validate(entry)
 

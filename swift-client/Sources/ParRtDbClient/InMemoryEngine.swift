@@ -41,6 +41,10 @@ public enum InMemoryLimits {
     /// Approximate cron re-fire interval for the in-memory stub (real 5-field
     /// cron parsing stays server-side; the engine only needs crons to re-arm).
     static let cronStepMs: Int64 = 60000
+    /// Upper bound on an interval job's `everyMs`: one year in ms (server
+    /// `scheduler::MAX_EVERY_MS`). The schedule path rejects a non-positive
+    /// or over-cap value with BAD_REQUEST.
+    public static let maxEveryMs: Int64 = 365 * 24 * 60 * 60 * 1000
     /// FM-29: hard cap on steps per workflow spec (server
     /// `workflows::MAX_WORKFLOW_STEPS`).
     static let maxWorkflowSteps = 64
@@ -285,6 +289,7 @@ final class ScheduledJob {
     let txn: Transaction
     var dueAt: Int64
     var cron: String?
+    var everyMs: Int64?
     var status: ScheduleStatus
     let createdAt: Int64
     var firedCount: Int64
@@ -292,13 +297,15 @@ final class ScheduledJob {
 
     init(
         id: String, kind: ScheduleKind, txn: Transaction, dueAt: Int64, cron: String?,
-        status: ScheduleStatus, createdAt: Int64, firedCount: Int64, lastError: String? = nil
+        everyMs: Int64?, status: ScheduleStatus, createdAt: Int64, firedCount: Int64,
+        lastError: String? = nil
     ) {
         self.id = id
         self.kind = kind
         self.txn = txn
         self.dueAt = dueAt
         self.cron = cron
+        self.everyMs = everyMs
         self.status = status
         self.createdAt = createdAt
         self.firedCount = firedCount
@@ -996,9 +1003,25 @@ public final class InMemoryRtDbClient: MigrationStore {
         let now = nowFn()
         var kind = ScheduleKind.oneshot
         var cron: String?
+        var everyMs: Int64?
         if case let .cron(expr) = when {
             kind = .cron
             cron = expr
+        }
+        if case let .interval(ms) = when {
+            // Server `scheduler::resolve_when`: everyMs must be positive and
+            // at most MAX_EVERY_MS.
+            if ms <= 0 {
+                throw RtDbError(code: .badRequest, message: "everyMs must be positive")
+            }
+            if ms > InMemoryLimits.maxEveryMs {
+                throw RtDbError(
+                    code: .badRequest,
+                    message: "everyMs must be at most \(InMemoryLimits.maxEveryMs)"
+                )
+            }
+            kind = .interval
+            everyMs = ms
         }
         let job = ScheduledJob(
             id: id,
@@ -1006,6 +1029,7 @@ public final class InMemoryRtDbClient: MigrationStore {
             txn: txn,
             dueAt: dueAtFor(when, now),
             cron: cron,
+            everyMs: everyMs,
             status: .pending,
             createdAt: now,
             firedCount: 0
@@ -1032,10 +1056,18 @@ public final class InMemoryRtDbClient: MigrationStore {
         return true
     }
 
-    /// Resumes a paused job: false when missing or not paused.
+    /// Resumes a paused job: false when missing or not paused. An interval
+    /// job re-arms one full interval from resume (windows elapsed while
+    /// paused are skipped, never backfilled — server `scheduler::set_paused`);
+    /// a cron's next fire can't be recomputed engine-side (no cron parser —
+    /// `cronStepMs` only approximates it at fire time), so its dueAt is
+    /// left alone.
     @discardableResult
     public func resumeSchedule(_ id: String) -> Bool {
         guard let job = schedules[id], job.status == .paused else { return false }
+        if job.kind == .interval, let ms = job.everyMs {
+            job.dueAt = nowFn() + ms
+        }
         job.status = .pending
         return true
     }
@@ -1050,6 +1082,7 @@ public final class InMemoryRtDbClient: MigrationStore {
         case let .afterMs(ms): now + ms
         case let .runAt(ms): ms
         case .cron: now + InMemoryLimits.cronStepMs
+        case let .interval(ms): now + ms
         }
     }
 
@@ -1059,6 +1092,7 @@ public final class InMemoryRtDbClient: MigrationStore {
             kind: job.kind,
             dueAt: job.dueAt,
             cron: job.cron,
+            everyMs: job.everyMs,
             status: job.status,
             lastError: job.lastError,
             createdAt: job.createdAt,
@@ -1212,6 +1246,12 @@ public final class InMemoryRtDbClient: MigrationStore {
                 if job.kind == .oneshot {
                     schedules.removeValue(forKey: id)
                     scheduleOrder.removeAll { $0 == id }
+                } else if job.kind == .interval, let ms = job.everyMs {
+                    // Interval re-arms from each actual fire time (cron
+                    // parity: windows missed during the fire's latency are
+                    // skipped, not backfilled).
+                    job.dueAt = now + ms
+                    job.status = .pending
                 } else {
                     job.dueAt = now + InMemoryLimits.cronStepMs
                     job.status = .pending
@@ -1221,6 +1261,11 @@ public final class InMemoryRtDbClient: MigrationStore {
                 job.lastError = errorMessage(error)
                 if job.kind == .cron {
                     job.dueAt = now + InMemoryLimits.cronStepMs
+                }
+                // Interval re-arms after a failure too — recurring kinds keep
+                // firing; only a one-shot records the error and stops.
+                if job.kind == .interval, let ms = job.everyMs {
+                    job.dueAt = now + ms
                 }
             }
         }

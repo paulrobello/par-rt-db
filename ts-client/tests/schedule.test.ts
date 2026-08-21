@@ -2,14 +2,16 @@ import { describe, expect, it } from "vitest";
 import type { ClientMessage, ScheduleInfo, ScheduleWhen, ServerMessage } from "../src/protocol.js";
 
 describe("schedule wire types", () => {
-  it("ScheduleWhen mirrors server tags (afterMs / runAt / cron)", () => {
+  it("ScheduleWhen mirrors server tags (afterMs / runAt / cron / interval)", () => {
     const afterMs: ScheduleWhen = { type: "afterMs", ms: 100 };
     const runAt: ScheduleWhen = { type: "runAt", ms: 9 };
     const cron: ScheduleWhen = { type: "cron", expr: "*/5 * * * *" };
+    const interval: ScheduleWhen = { type: "interval", everyMs: 300000 };
 
     expect(afterMs).toEqual({ type: "afterMs", ms: 100 });
     expect(runAt).toEqual({ type: "runAt", ms: 9 });
     expect(cron).toEqual({ type: "cron", expr: "*/5 * * * *" });
+    expect(interval).toEqual({ type: "interval", everyMs: 300000 });
   });
 
   it("ClientMessage.schedule shape", () => {
@@ -114,7 +116,7 @@ describe("schedule wire types", () => {
     });
   });
 
-  it("ScheduleInfo shape (cron + lastError optional)", () => {
+  it("ScheduleInfo shape (cron + everyMs + lastError optional)", () => {
     const oneshot: ScheduleInfo = {
       id: "job-1",
       kind: "oneshot",
@@ -133,8 +135,17 @@ describe("schedule wire types", () => {
       createdAt: 1700000000000,
       firedCount: 3,
     };
+    const interval: ScheduleInfo = {
+      id: "job-3",
+      kind: "interval",
+      dueAt: 1700000000000,
+      everyMs: 300000,
+      status: "pending",
+      createdAt: 1700000000000,
+      firedCount: 1,
+    };
 
-    // oneshot omits the optional cron/lastError fields entirely.
+    // oneshot omits the optional cron/everyMs/lastError fields entirely.
     expect(oneshot).toEqual({
       id: "job-1",
       kind: "oneshot",
@@ -152,6 +163,15 @@ describe("schedule wire types", () => {
       lastError: "boom",
       createdAt: 1700000000000,
       firedCount: 3,
+    });
+    expect(interval).toEqual({
+      id: "job-3",
+      kind: "interval",
+      dueAt: 1700000000000,
+      everyMs: 300000,
+      status: "pending",
+      createdAt: 1700000000000,
+      firedCount: 1,
     });
   });
 });

@@ -190,6 +190,7 @@ async fn pending_scheduled_job_protects_db() -> anyhow::Result<()> {
         now_ms() + 3_600_000,
         &insert_work_item(),
         None,
+        None,
     )
     .await?;
 

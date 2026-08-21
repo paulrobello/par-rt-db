@@ -10,8 +10,9 @@ storage, admin control plane) ships here (``[http]`` extra), its async twin
 
 Importing :mod:`par_rt_db` exposes the public DSL surface so
 ``from par_rt_db import Mutation, TableQuery, t`` works without per-module
-imports. The ``ScheduleWhen`` union and its ``AfterMs``/``RunAt``/``Cron``
-variants are re-exported here (the ``schedule()`` methods require them), as are
+imports. The ``ScheduleWhen`` union and its ``AfterMs``/``RunAt``/``Cron``/
+``Interval`` variants are re-exported here (the ``schedule()`` methods require
+them), as are
 ``Schema`` and ``InMemoryRtDbClient``. The full wire-protocol families
 (``ClientMessage``/``ServerMessage``/``ScheduleInfo``/...) remain accessible via
 :mod:`par_rt_db.wire`; only the DSL symbols needed to build queries,
@@ -41,6 +42,7 @@ from .wire import (
     AfterMs,
     Cron,
     FilterExpr,
+    Interval,
     RunAt,
     ScheduleWhen,
     StepRetry,
@@ -85,6 +87,7 @@ __all__ = [
     "AfterMs",
     "RunAt",
     "Cron",
+    "Interval",
     "WorkflowSpec",
     "WorkflowStepSpec",
     "StepRetry",

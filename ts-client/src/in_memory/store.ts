@@ -211,10 +211,11 @@ type ScheduleStatus = "pending" | "running" | "paused" | "error";
  * jobs by applying `txn` through the same atomic path as `mutate`. */
 interface ScheduledJob {
   id: string;
-  kind: "oneshot" | "cron";
+  kind: "oneshot" | "cron" | "interval";
   txn: TransactionJson;
   dueAt: number;
   cron?: string;
+  everyMs?: number;
   status: ScheduleStatus;
   createdAt: number;
   firedCount: number;
@@ -224,6 +225,11 @@ interface ScheduledJob {
 /** Approximate cron re-fire interval for the in-memory stub. Real 5-field cron
  * parsing is deferred to the server; the harness only needs crons to re-arm. */
 const CRON_STEP_MS = 60_000;
+
+/** Upper bound on an interval job's `everyMs`: one year in ms. Mirrors server
+ * `scheduler::MAX_EVERY_MS`; bounds `now + everyMs` and the horizon a recurring
+ * job can occupy a row for. */
+export const MAX_EVERY_MS = 365 * 24 * 60 * 60 * 1000;
 
 /** FM-29: hard cap on steps per workflow spec. Mirrors server
  * `workflows::MAX_WORKFLOW_STEPS`. */
@@ -1010,7 +1016,10 @@ export class InMemoryRtDbClient {
   // ---- schedules ------------------------------------------------------------
 
   /** Stores `txn` scheduled for `when` and returns its id. Cron validation is
-   * deferred to the live server; the harness accepts any expression. */
+   * deferred to the live server; the harness accepts any expression. An
+   * interval's `everyMs` IS validated here (mirroring server
+   * `scheduler::resolve_when`) — the shared core of the public `schedule` and
+   * the `Schedule` txn step. */
   async schedule(txn: TransactionJson, when: ScheduleWhen): Promise<{ id: string }> {
     return this.scheduleJob(txn, when);
   }
@@ -1019,11 +1028,19 @@ export class InMemoryRtDbClient {
    * `Step::Schedule` transaction step (FM-28) reuses it from the sync
    * `executeStep` path. */
   private scheduleJob(txn: TransactionJson, when: ScheduleWhen): { id: string } {
+    if (when.type === "interval") {
+      if (when.everyMs <= 0) {
+        throw new RtDbError("BAD_REQUEST", "everyMs must be positive");
+      }
+      if (when.everyMs > MAX_EVERY_MS) {
+        throw new RtDbError("BAD_REQUEST", `everyMs must be at most ${MAX_EVERY_MS}`);
+      }
+    }
     const id = this.newId();
     const now = this.now();
     const job: ScheduledJob = {
       id,
-      kind: when.type === "cron" ? "cron" : "oneshot",
+      kind: when.type === "cron" ? "cron" : when.type === "interval" ? "interval" : "oneshot",
       txn,
       dueAt: this.dueAtFor(when, now),
       status: "pending",
@@ -1032,6 +1049,9 @@ export class InMemoryRtDbClient {
     };
     if (when.type === "cron") {
       job.cron = when.expr;
+    }
+    if (when.type === "interval") {
+      job.everyMs = when.everyMs;
     }
     this.schedules.set(id, job);
     return { id };
@@ -1056,13 +1076,19 @@ export class InMemoryRtDbClient {
   }
 
   /** Resumes a paused job. Resolves `false` when the job is missing or not
-   * paused — the server's `scheduler::set_paused(false)` contract. */
+   * paused — the server's `scheduler::set_paused(false)` contract. An interval
+   * job's next fire shifts to `now + everyMs` (windows elapsed while paused are
+   * skipped, never backfilled); a cron's `dueAt` is left alone — the harness
+   * cannot recompute a real cron fire, unlike the server. */
   async resumeSchedule(id: string): Promise<boolean> {
     const job = this.schedules.get(id);
     if (job?.status !== "paused") {
       return false;
     }
     job.status = "pending";
+    if (job.kind === "interval" && job.everyMs !== undefined) {
+      job.dueAt = this.now() + job.everyMs;
+    }
     return true;
   }
 
@@ -1213,8 +1239,10 @@ export class InMemoryRtDbClient {
 
   /** Fires every due non-paused job by applying its txn through the same atomic
    * path as `mutate` (so reactive subscriptions see the write). One-shots are
-   * removed after a successful fire; crons are re-armed. Pass `nowMs` to drive
-   * the clock deterministically; omit it to use the client's injected clock.
+   * removed after a successful fire; crons and intervals are re-armed (an
+   * interval from each actual fire time — missed windows are skipped, never
+   * backfilled). Pass `nowMs` to drive the clock deterministically; omit it to
+   * use the client's injected clock.
    *
    * FM-29: also advances due workflow runs (pending + `sleepUntil <= now`)
    * through the server's `handle_workflow_advance` semantics — claim to
@@ -1238,7 +1266,11 @@ export class InMemoryRtDbClient {
         if (job.kind === "oneshot") {
           this.schedules.delete(job.id);
         } else {
-          job.dueAt = now + CRON_STEP_MS;
+          // Interval re-arms from each actual fire time (cron parity: windows
+          // missed during the fire's latency are skipped, not backfilled).
+          const stepMs =
+            job.kind === "interval" && job.everyMs !== undefined ? job.everyMs : CRON_STEP_MS;
+          job.dueAt = now + stepMs;
           job.status = "pending";
         }
       } catch (e) {
@@ -1246,6 +1278,8 @@ export class InMemoryRtDbClient {
         job.lastError = e instanceof Error ? e.message : String(e);
         if (job.kind === "cron") {
           job.dueAt = now + CRON_STEP_MS;
+        } else if (job.kind === "interval" && job.everyMs !== undefined) {
+          job.dueAt = now + job.everyMs;
         }
       }
     }
@@ -1391,6 +1425,8 @@ export class InMemoryRtDbClient {
         return when.ms;
       case "cron":
         return now + CRON_STEP_MS;
+      case "interval":
+        return now + when.everyMs;
     }
   }
 
@@ -1405,6 +1441,9 @@ export class InMemoryRtDbClient {
     };
     if (job.cron !== undefined) {
       info.cron = job.cron;
+    }
+    if (job.everyMs !== undefined) {
+      info.everyMs = job.everyMs;
     }
     if (job.lastError !== undefined) {
       info.lastError = job.lastError;

@@ -269,6 +269,228 @@ async fn tick_cron_skips_missed_windows_does_not_backfill() {
     assert_eq!(info.due_at, 1_700_000_000_000_i64 + big_jump + CRON_STEP_MS);
 }
 
+// ---- interval ----------------------------------------------------------
+//
+// Mirrors the cron tests above with `when: {type: "interval", everyMs: N}`:
+// the initial due is one interval out, each fire re-arms from the actual
+// fire time, and missed windows are skipped — server scheduler.rs parity.
+
+const EVERY_MS: i64 = 5_000;
+
+#[tokio::test]
+async fn interval_schedule_initial_due_is_one_interval_out() {
+    let (mut c, _clock) = new_clock_client();
+    c.schedule(
+        insert_todo_txn(),
+        ScheduleWhen::Interval { every_ms: EVERY_MS },
+    )
+    .expect("schedule ok");
+
+    let list = c.list_schedules();
+    assert_eq!(list.len(), 1);
+    let info = &list[0];
+    assert_eq!(info.kind.as_wire_str(), "interval");
+    assert_eq!(info.every_ms, Some(EVERY_MS));
+    assert_eq!(info.due_at, 1_700_000_000_000_i64 + EVERY_MS);
+    assert_eq!(info.cron, None, "interval jobs carry no cron expr");
+}
+
+#[tokio::test]
+async fn tick_interval_re_arms_and_fires_again_on_a_later_tick() {
+    let (mut c, clock) = new_clock_client();
+    c.schedule(
+        insert_todo_txn(),
+        ScheduleWhen::Interval { every_ms: EVERY_MS },
+    )
+    .expect("schedule ok");
+
+    // First fire: advance one interval.
+    *clock.lock().expect("not poisoned") += EVERY_MS;
+    c.tick(None);
+    assert_eq!(
+        c.run::<Vec<Value>>(&TableQuery::new("items").collect())
+            .expect("collect")
+            .len(),
+        1,
+        "interval fired once"
+    );
+    // Immediately re-ticking without advancing the clock does nothing —
+    // the next due_at is the fire time + every_ms.
+    c.tick(None);
+    let info = &c.list_schedules()[0];
+    assert_eq!(info.fired_count, 1, "fired_count tracks successful fires");
+    assert_eq!(info.due_at, 1_700_000_000_000_i64 + EVERY_MS + EVERY_MS);
+
+    // Advance one more interval — it fires again.
+    *clock.lock().expect("not poisoned") += EVERY_MS;
+    c.tick(None);
+    assert_eq!(
+        c.run::<Vec<Value>>(&TableQuery::new("items").collect())
+            .expect("collect")
+            .len(),
+        2,
+        "interval fired a second time after re-arm"
+    );
+    assert_eq!(c.list_schedules()[0].fired_count, 2);
+}
+
+#[tokio::test]
+async fn tick_interval_skips_missed_windows_does_not_backfill() {
+    // A big clock jump past several windows fires exactly once and re-arms
+    // one interval ahead of `now` (never `due_at + N × every_ms`).
+    let (mut c, _clock) = new_clock_client();
+    c.schedule(
+        insert_todo_txn(),
+        ScheduleWhen::Interval { every_ms: EVERY_MS },
+    )
+    .expect("schedule ok");
+
+    // Jump 10 × every_ms past the due time and tick once.
+    let big_jump = EVERY_MS * 10;
+    c.tick(Some(1_700_000_000_000_i64 + big_jump));
+
+    let docs = c
+        .run::<Vec<Value>>(&TableQuery::new("items").collect())
+        .expect("collect");
+    assert_eq!(docs.len(), 1, "missed windows are not backfilled");
+    let info = &c.list_schedules()[0];
+    assert_eq!(info.fired_count, 1, "fired exactly once");
+    assert_eq!(info.due_at, 1_700_000_000_000_i64 + big_jump + EVERY_MS);
+}
+
+#[tokio::test]
+async fn pause_halts_interval_and_resume_shifts_one_full_interval() {
+    // Mirrors the server's `set_paused`: resume shifts due_at to
+    // `now + every_ms` — windows elapsed while paused are skipped, never
+    // backfilled (unlike cron, the harness CAN recompute an interval).
+    let (mut c, clock) = new_clock_client();
+    let id = c
+        .schedule(
+            insert_todo_txn(),
+            ScheduleWhen::Interval { every_ms: EVERY_MS },
+        )
+        .expect("schedule ok");
+    c.pause_schedule(&id).expect("pause ok");
+
+    // Due while paused (10 intervals past) — no fire.
+    *clock.lock().expect("not poisoned") += EVERY_MS * 10;
+    c.tick(None);
+    assert_eq!(
+        c.run::<Vec<Value>>(&TableQuery::new("items").collect())
+            .expect("collect")
+            .len(),
+        0,
+        "paused interval does not fire"
+    );
+
+    c.resume_schedule(&id).expect("resume ok");
+    let info = c
+        .list_schedules()
+        .into_iter()
+        .find(|s| s.id == id)
+        .expect("resumed job listed");
+    assert_eq!(info.status.as_wire_str(), "pending");
+    // Shifted one full interval past the RESUME time, not the original due.
+    let resumed_at = 1_700_000_000_000_i64 + EVERY_MS * 10;
+    assert_eq!(info.due_at, resumed_at + EVERY_MS);
+
+    // Not due at the resume time itself — fires only one interval later.
+    c.tick(None);
+    assert_eq!(
+        c.run::<Vec<Value>>(&TableQuery::new("items").collect())
+            .expect("collect")
+            .len(),
+        0,
+        "resumed interval is one full interval out"
+    );
+    *clock.lock().expect("not poisoned") += EVERY_MS;
+    c.tick(None);
+    assert_eq!(
+        c.run::<Vec<Value>>(&TableQuery::new("items").collect())
+            .expect("collect")
+            .len(),
+        1,
+        "fired one interval after resume"
+    );
+}
+
+#[tokio::test]
+async fn schedule_interval_rejects_invalid_everyms() {
+    // Server parity (`resolve_when`): non-positive and over-cap everyMs are
+    // BAD_REQUEST; the cap itself (MAX_EVERY_MS, one year) is accepted.
+    let (mut c, _clock) = new_clock_client();
+    for bad_every_ms in [0, -1, MAX_EVERY_MS + 1] {
+        let err = c
+            .schedule(
+                insert_todo_txn(),
+                ScheduleWhen::Interval {
+                    every_ms: bad_every_ms,
+                },
+            )
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::BadRequest, "everyMs={bad_every_ms}");
+    }
+    assert!(
+        c.list_schedules().is_empty(),
+        "rejected intervals store no job"
+    );
+    c.schedule(
+        insert_todo_txn(),
+        ScheduleWhen::Interval {
+            every_ms: MAX_EVERY_MS,
+        },
+    )
+    .expect("the cap itself is accepted");
+    assert_eq!(c.list_schedules()[0].every_ms, Some(MAX_EVERY_MS));
+}
+
+#[tokio::test]
+async fn tick_interval_with_failing_txn_re_arms_and_retries_next_interval() {
+    // Mirrors the server's error path (`reschedule_recurring_error`): a
+    // failed interval fire is marked Error and re-armed one interval out —
+    // unlike a failed oneshot, it retries on a later tick.
+    let (mut c, clock) = new_clock_client();
+    let id = c
+        .schedule(
+            // Reference an unknown table to force a NOT_FOUND.
+            Mutation::new().insert("missing", json!({"x": 1})).build(),
+            ScheduleWhen::Interval { every_ms: EVERY_MS },
+        )
+        .expect("schedule ok");
+
+    *clock.lock().expect("not poisoned") += EVERY_MS;
+    c.tick(None);
+    let info = c
+        .list_schedules()
+        .into_iter()
+        .find(|s| s.id == id)
+        .expect("failed interval kept in registry");
+    assert_eq!(info.status.as_wire_str(), "error");
+    assert!(info.last_error.is_some(), "last_error recorded");
+    let re_armed_at = 1_700_000_000_000_i64 + EVERY_MS;
+    assert_eq!(info.due_at, re_armed_at + EVERY_MS);
+
+    // Still one interval out — an immediate re-tick does not retry.
+    c.tick(None);
+    let info = c
+        .list_schedules()
+        .into_iter()
+        .find(|s| s.id == id)
+        .expect("job still listed");
+    assert_eq!(info.due_at, re_armed_at + EVERY_MS);
+
+    // One interval later it retries (and fails again, re-arming onward).
+    *clock.lock().expect("not poisoned") += EVERY_MS;
+    c.tick(None);
+    let info = c
+        .list_schedules()
+        .into_iter()
+        .find(|s| s.id == id)
+        .expect("job still listed");
+    assert_eq!(info.status.as_wire_str(), "error");
+    assert_eq!(info.due_at, re_armed_at + EVERY_MS + EVERY_MS);
+}
+
 #[tokio::test]
 async fn tick_oneshot_in_the_past_fires_immediately_catch_up() {
     // Brief: one-shot catches up if past due — a `RunAt` in the past fires

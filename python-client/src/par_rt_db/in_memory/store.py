@@ -64,6 +64,7 @@ from ..wire import (
     AfterMs,
     AuthedUser,
     Cron,
+    Interval,
     PresenceMember,
     RunAt,
     ScheduleInfo,
@@ -108,6 +109,11 @@ MAX_CASCADE_ROWS = 10_000
 #: Approximate cron re-fire interval for the in-memory stub. Real 5-field cron
 #: parsing is deferred to the server; the harness only needs crons to re-arm.
 CRON_STEP_MS = 60_000
+#: Upper bound on an interval job's ``everyMs``: one year in ms (mirrors
+#: ``server/src/scheduler.rs::MAX_EVERY_MS``). Bounds the horizon a recurring
+#: job can occupy a row for; ``schedule``/the ``schedule`` step reject a
+#: non-positive or over-cap value with ``BAD_REQUEST``.
+MAX_EVERY_MS = 365 * 24 * 60 * 60 * 1000
 
 
 def worst_case_affected(txn: Transaction) -> int:
@@ -248,10 +254,11 @@ class _ScheduledJob:
     jobs by applying ``txn`` through the same atomic path as :meth:`mutate`."""
 
     id: str
-    kind: str  # "oneshot" | "cron"
+    kind: str  # "oneshot" | "cron" | "interval"
     txn: Transaction
     due_at: int
     cron: str | None
+    every_ms: int | None
     status: str  # "pending" | "paused" | "error"
     created_at: int
     fired_count: int
@@ -1053,6 +1060,7 @@ def _schedule_info(job: _ScheduledJob) -> ScheduleInfo:
             "kind": job.kind,
             "dueAt": job.due_at,
             "cron": job.cron,
+            "everyMs": job.every_ms,
             "status": job.status,
             "lastError": job.last_error,
             "createdAt": job.created_at,
@@ -1400,22 +1408,9 @@ class _InMemoryStoreCore:
             case _Schedule(when=when, txn=nested_txn):
                 # FM-28: enqueue, don't execute — tick() fires the nested txn
                 # later through _execute_transaction (which re-validates it).
-                kind, due_at, cron = self._prepare_job(when)
-                job_id = self._new_id()
-                self._schedules.append(
-                    _ScheduledJob(
-                        id=job_id,
-                        kind=kind,
-                        txn=nested_txn,
-                        due_at=due_at,
-                        cron=cron,
-                        status="pending",
-                        created_at=self._now(),
-                        fired_count=0,
-                        last_error=None,
-                    )
-                )
-                return _schedule_result(job_id), set()
+                # Routes through schedule() so the when is validated (everyMs
+                # bounds) identically on the step and standalone paths.
+                return _schedule_result(self.schedule(nested_txn, when)), set()
             case _CancelSchedule(id=job_id):
                 # Unlike the standalone cancel op (NOT_FOUND on a miss), the
                 # step reports {"cancelled": bool} — a miss is not an error.
@@ -1912,23 +1907,34 @@ class _InMemoryStoreCore:
             h.unsubscribe()
         self._presence_rooms.leave(room, self._connection_id)
 
-    def _prepare_job(self, when: ScheduleWhen) -> tuple[str, int, str | None]:
-        """(kind, due_at, cron) for a ``ScheduleWhen`` — shared by the
+    def _prepare_job(self, when: ScheduleWhen) -> tuple[str, int, str | None, int | None]:
+        """(kind, due_at, cron, every_ms) for a ``ScheduleWhen`` — shared by the
         standalone ``schedule`` op and the ``schedule`` txn step. The clock
-        comes from the injectable ``now``, never ``time.time()`` directly."""
+        comes from the injectable ``now``, never ``time.time()`` directly.
+        ``everyMs`` is validated here (positive, at most :data:`MAX_EVERY_MS`)
+        before any row is created, mirroring the server's ``resolve_when``."""
         now = self._now()
         match when:
+            case Interval(every_ms=every_ms):
+                if every_ms <= 0:
+                    raise RtDbError(ErrorCode.BAD_REQUEST, "everyMs must be positive")
+                if every_ms > MAX_EVERY_MS:
+                    raise RtDbError(
+                        ErrorCode.BAD_REQUEST, f"everyMs must be at most {MAX_EVERY_MS}"
+                    )
+                return "interval", self._due_at_for(when, now), None, every_ms
             case Cron(expr=expr_str):
-                return "cron", self._due_at_for(when, now), expr_str
+                return "cron", self._due_at_for(when, now), expr_str, None
             case _:
-                return "oneshot", self._due_at_for(when, now), None
+                return "oneshot", self._due_at_for(when, now), None, None
 
     def schedule(self, txn: Transaction, when: ScheduleWhen) -> str:
         """Store ``txn`` scheduled for ``when`` and return its id. Cron
         validation is deferred to the live server; the harness accepts any
-        expression."""
+        expression. ``everyMs`` (interval) IS validated — positive and at most
+        :data:`MAX_EVERY_MS` — mirroring the server's ``resolve_when``."""
         new_id = self._new_id()
-        kind, due_at, cron = self._prepare_job(when)
+        kind, due_at, cron, every_ms = self._prepare_job(when)
         self._schedules.append(
             _ScheduledJob(
                 id=new_id,
@@ -1936,6 +1942,7 @@ class _InMemoryStoreCore:
                 txn=txn,
                 due_at=due_at,
                 cron=cron,
+                every_ms=every_ms,
                 status="pending",
                 created_at=self._now(),
                 fired_count=0,
@@ -1962,11 +1969,17 @@ class _InMemoryStoreCore:
 
     def resume_schedule(self, id: str) -> bool:
         """Flip a paused job back to ``pending``. ``False`` when the job is
-        missing or not paused (a no-op, not an error)."""
+        missing or not paused (a no-op, not an error). An interval job's
+        ``due_at`` shifts to ``now + everyMs`` (windows elapsed while paused
+        are skipped, never backfilled — mirrors the server's ``set_paused``
+        resume arm); one-shots and crons keep their ``due_at`` (the harness
+        cannot recompute a cron's next fire)."""
         job = self._find_job(id)
         if job is None or job.status != "paused":
             return False
         job.status = "pending"
+        if job.kind == "interval" and job.every_ms is not None:
+            job.due_at = self._now() + job.every_ms
         return True
 
     def list_schedules(self) -> list[ScheduleInfo]:
@@ -2185,8 +2198,10 @@ class _InMemoryStoreCore:
         every due non-paused scheduled job by applying its txn through the same
         atomic path as :meth:`mutate` (so reactive subscriptions see the write).
         One-shots are removed after a successful fire; crons re-arm by
-        :data:`CRON_STEP_MS`. A job whose txn fails is marked ``error`` but left
-        in place (still due), so a subsequent ``tick`` retries it.
+        :data:`CRON_STEP_MS` and interval jobs by their ``everyMs`` (missed
+        windows are skipped, never backfilled). A job whose txn fails is marked
+        ``error`` but left in place (recurring kinds re-arm), so a subsequent
+        ``tick`` retries it.
 
         Workflows (FM-29): after schedules, one claim pass advances every due
         pending run (see :meth:`_advance_workflows`)."""
@@ -2211,6 +2226,9 @@ class _InMemoryStoreCore:
                     j.last_error = err.message
                     if kind == "cron":
                         j.due_at = now + CRON_STEP_MS
+                    elif kind == "interval" and j.every_ms is not None:
+                        # Error path re-arms too (server reschedule_recurring_error).
+                        j.due_at = now + j.every_ms
             else:
                 j = self._find_job(job_id)
                 if j is not None:
@@ -2220,7 +2238,10 @@ class _InMemoryStoreCore:
                         # job shifts into this index).
                         self._schedules = [s for s in self._schedules if s.id != job_id]
                         continue
-                    j.due_at = now + CRON_STEP_MS
+                    if kind == "interval" and j.every_ms is not None:
+                        j.due_at = now + j.every_ms
+                    else:
+                        j.due_at = now + CRON_STEP_MS
                     j.status = "pending"
             i += 1
 
@@ -2236,6 +2257,8 @@ class _InMemoryStoreCore:
                 return now + ms
             case RunAt(ms=ms):
                 return ms
+            case Interval(every_ms=every_ms):
+                return now + every_ms
             case _:
                 return now + CRON_STEP_MS  # cron
 

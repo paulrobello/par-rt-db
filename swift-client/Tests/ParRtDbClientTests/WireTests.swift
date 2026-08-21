@@ -399,8 +399,11 @@ struct WireDslTests {
         try expectEncodes(
             ScheduleWhen.cron(expr: "*/5 * * * *"), as: #"{"type":"cron","expr":"*/5 * * * *"}"#
         )
+        try expectEncodes(
+            ScheduleWhen.interval(everyMs: 300_000), as: #"{"type":"interval","everyMs":300000}"#
+        )
         let whens = [ScheduleWhen.afterMs(ms: 100), .runAt(ms: 1_700_000_000_000),
-                     .cron(expr: "0 * * * *")]
+                     .cron(expr: "0 * * * *"), .interval(everyMs: 300_000)]
         for when in whens {
             #expect(try roundTrip(when) == when)
         }
@@ -413,7 +416,7 @@ struct WireDslTests {
     }
 
     @Test func scheduleInfoCorpusFixtures() throws {
-        // Corpus schedule_infos — cron/lastError omitted when nil.
+        // Corpus schedule_infos — cron/everyMs/lastError omitted when nil.
         let fixtures = [
             #"{"id":"j1","kind":"oneshot","dueAt":1000,"status":"pending","createdAt":500,"firedCount":0}"#,
             """
@@ -427,6 +430,14 @@ struct WireDslTests {
             """
             {"id":"j8","kind":"cron","dueAt":2300,"cron":"0 * * * *",
             "status":"error","lastError":"kaboom","createdAt":500,"firedCount":7}
+            """,
+            """
+            {"id":"j9","kind":"interval","dueAt":2400,"everyMs":300000,
+            "status":"pending","createdAt":500,"firedCount":0}
+            """,
+            """
+            {"id":"j10","kind":"interval","dueAt":2500,"everyMs":60000,
+            "status":"error","lastError":"boom","createdAt":500,"firedCount":2}
             """
         ]
         for json in fixtures {
@@ -437,7 +448,7 @@ struct WireDslTests {
 
     @Test func scheduleInfoRejectsUnknownKindAndStatus() {
         let rejectFixtures = [
-            #"{"id":"j1","kind":"interval","dueAt":1000,"status":"pending","createdAt":500,"firedCount":0}"#,
+            #"{"id":"j1","kind":"recurring","dueAt":1000,"status":"pending","createdAt":500,"firedCount":0}"#,
             #"{"id":"j1","kind":"oneshot","dueAt":1000,"status":"queued","createdAt":500,"firedCount":0}"#
         ]
         for json in rejectFixtures {
@@ -1011,10 +1022,12 @@ struct WireEnumRoundTripTests {
     // MARK: - Schedule scalars
 
     @Test func scheduleKindAndStatusWireStrings() throws {
-        // Full case sets — the corpus fixtures exercise only oneshot/cron by
-        // way of kinds and pending/error statuses; running/paused are wire
-        // strings too (server protocol.rs ScheduleStatus).
-        let kinds: [(ScheduleKind, String)] = [(.oneshot, "oneshot"), (.cron, "cron")]
+        // Full case sets — the corpus fixtures exercise oneshot/cron/interval
+        // kinds and pending/error statuses; running/paused are wire strings
+        // too (server protocol.rs ScheduleStatus).
+        let kinds: [(ScheduleKind, String)] = [
+            (.oneshot, "oneshot"), (.cron, "cron"), (.interval, "interval")
+        ]
         let statuses: [(ScheduleStatus, String)] = [
             (.pending, "pending"), (.running, "running"),
             (.paused, "paused"), (.error, "error")
@@ -1029,7 +1042,7 @@ struct WireEnumRoundTripTests {
         }
         // Closed domains: the reject fixtures from scheduleInfoRejectsUnknown*
         // as bare strings.
-        expectDecodingThrows(ScheduleKind.self, #""interval""#)
+        expectDecodingThrows(ScheduleKind.self, #""recurring""#)
         expectDecodingThrows(ScheduleStatus.self, #""queued""#)
     }
 

@@ -44,6 +44,16 @@ const pausedJob: ScheduleInfo = {
   firedCount: 0,
 };
 
+const intervalJob: ScheduleInfo = {
+  id: "ivl00003-cccc",
+  kind: "interval",
+  dueAt: Date.now() + 30_000,
+  everyMs: 300_000,
+  status: "pending",
+  createdAt: Date.now() - 3_000,
+  firedCount: 1,
+};
+
 describe("ScheduledJobsPage", () => {
   beforeEach(() => {
     for (const fn of Object.values(adminClientMock)) fn.mockReset();
@@ -70,6 +80,14 @@ describe("ScheduledJobsPage", () => {
     expect(screen.getByText("paused00")).toBeInTheDocument();
     expect(screen.getByText("*/5 * * * *")).toBeInTheDocument();
     expect(screen.getByText("3", { selector: ".tnum" })).toBeInTheDocument();
+  });
+
+  it("renders an interval job's everyMs the way cron rows show their expression", async () => {
+    adminClientMock.listSchedules.mockResolvedValue([intervalJob]);
+    render(<ScheduledJobsPage />);
+
+    expect(await screen.findByText("ivl00003")).toBeInTheDocument();
+    expect(screen.getByText("every 300000 ms")).toBeInTheDocument();
   });
 
   it("calls pauseSchedule for a pending job when pause is clicked", async () => {

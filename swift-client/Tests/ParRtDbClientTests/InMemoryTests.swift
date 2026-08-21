@@ -771,6 +771,119 @@ struct InMemoryTests {
         #expect(try count(client.query(Query(table: "items", count: true))) == 1)
     }
 
+    @Test func intervalScheduleFiresEveryIntervalAndRearmsFromFireTime() throws {
+        let client = deterministicClient()
+        try client.pushSchema(itemsSchema())
+        let id = try client.schedule(
+            Transaction(steps: [.insert(table: "items", doc: ["title": .string("s"), "n": .int(1)])]),
+            when: .interval(everyMs: 1000)
+        )
+        // Initial due is one full interval out; nothing fires before it.
+        _ = try client.tick(nowMs: pinnedNow + 999)
+        #expect(try count(client.query(Query(table: "items", count: true))) == 0)
+        _ = try client.tick(nowMs: pinnedNow + 1000)
+        #expect(try count(client.query(Query(table: "items", count: true))) == 1)
+        // Recurring: re-armed one interval from each fire, it fires again and
+        // the job stays listed with its everyMs exposed.
+        _ = try client.tick(nowMs: pinnedNow + 1999)
+        #expect(try count(client.query(Query(table: "items", count: true))) == 1)
+        _ = try client.tick(nowMs: pinnedNow + 2000)
+        #expect(try count(client.query(Query(table: "items", count: true))) == 2)
+        let job = try #require(client.listSchedules().first { $0.id == id })
+        #expect(job.kind == .interval)
+        #expect(job.everyMs == 1000)
+        #expect(job.dueAt == pinnedNow + 3000)
+        #expect(job.firedCount == 2)
+    }
+
+    @Test func intervalScheduleSkipsMissedWindowsOnClockJump() throws {
+        let client = deterministicClient()
+        try client.pushSchema(itemsSchema())
+        _ = try client.schedule(
+            Transaction(steps: [.insert(table: "items", doc: ["title": .string("s"), "n": .int(1)])]),
+            when: .interval(everyMs: 1000)
+        )
+        // A big clock jump lands 10 intervals past due: exactly one fire
+        // (never a backfill burst), re-armed a full interval from the fire.
+        _ = try client.tick(nowMs: pinnedNow + 10000)
+        #expect(try count(client.query(Query(table: "items", count: true))) == 1)
+        #expect(client.listSchedules().first?.dueAt == pinnedNow + 11000)
+    }
+
+    @Test func intervalScheduleResumeShiftsDueAtWithoutBackfill() throws {
+        let client = deterministicClient()
+        try client.pushSchema(itemsSchema())
+        let id = try client.schedule(
+            Transaction(steps: [.insert(table: "items", doc: ["title": .string("s"), "n": .int(1)])]),
+            when: .interval(everyMs: 1000)
+        )
+        #expect(client.pauseSchedule(id))
+        // Several windows elapse while paused with no fire.
+        _ = try client.tick(nowMs: pinnedNow + 9000)
+        #expect(try count(client.query(Query(table: "items", count: true))) == 0)
+        #expect(client.resumeSchedule(id))
+        // Resume re-arms one full interval from the resume clock (nowFn is
+        // pinned), not the stale pre-pause dueAt.
+        #expect(client.listSchedules().first?.dueAt == pinnedNow + 1000)
+        _ = try client.tick(nowMs: pinnedNow + 1000)
+        #expect(try count(client.query(Query(table: "items", count: true))) == 1)
+    }
+
+    @Test func intervalScheduleValidatesEveryMs() throws {
+        let client = deterministicClient()
+        try client.pushSchema(itemsSchema())
+        let txn = Transaction(steps: [.insert(table: "items", doc: ["title": .string("s"), "n": .int(1)])])
+        for bad: Int64 in [0, -5] {
+            do {
+                _ = try client.schedule(txn, when: .interval(everyMs: bad))
+                Issue.record("expected non-positive everyMs \(bad) to be rejected")
+            } catch let error as RtDbError {
+                #expect(error.code == .badRequest)
+                #expect(error.message == "everyMs must be positive")
+            }
+        }
+        do {
+            _ = try client.schedule(txn, when: .interval(everyMs: InMemoryLimits.maxEveryMs + 1))
+            Issue.record("expected over-cap everyMs to be rejected")
+        } catch let error as RtDbError {
+            #expect(error.code == .badRequest)
+            #expect(error.message == "everyMs must be at most \(InMemoryLimits.maxEveryMs)")
+        }
+        // The cap itself is accepted, and the Schedule step path validates
+        // too (a BAD_REQUEST step aborts the whole txn — no job is written).
+        _ = try client.schedule(txn, when: .interval(everyMs: InMemoryLimits.maxEveryMs))
+        do {
+            _ = try client.mutate(Transaction(steps: [
+                .schedule(when: .interval(everyMs: 0), txn: Transaction(steps: []))
+            ]))
+            Issue.record("expected the schedule step to reject a non-positive everyMs")
+        } catch let error as RtDbError {
+            #expect(error.code == .badRequest)
+        }
+        #expect(client.listSchedules().count == 1)
+    }
+
+    @Test func intervalScheduleRearmsAfterFailedFire() throws {
+        let client = deterministicClient()
+        try client.pushSchema(itemsSchema())
+        // A patch of a missing document throws NOT_FOUND: the fire fails but
+        // a recurring interval re-arms instead of dying.
+        let id = try client.schedule(
+            Transaction(steps: [.patch(table: "items", id: "ffffffffffffffffffffffffffffff", fields: ["n": .int(2)])]),
+            when: .interval(everyMs: 1000)
+        )
+        _ = try client.tick(nowMs: pinnedNow + 1000)
+        let job = try #require(client.listSchedules().first { $0.id == id })
+        #expect(job.status == .error)
+        #expect(job.lastError != nil)
+        #expect(job.dueAt == pinnedNow + 2000)
+        // The errored interval still fires on its next window — recurring
+        // kinds keep going after a failure.
+        _ = try client.tick(nowMs: pinnedNow + 2000)
+        let after = try #require(client.listSchedules().first { $0.id == id })
+        #expect(after.dueAt == pinnedNow + 3000)
+    }
+
     // MARK: Workflows
 
     @Test func workflowAdvancesToSuccessOnTick() throws {

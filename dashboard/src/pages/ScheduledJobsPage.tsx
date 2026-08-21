@@ -1,4 +1,4 @@
-/** Scheduled jobs — create, list, and manage one-shot and cron transactions. */
+/** Scheduled jobs — create, list, and manage one-shot, cron, and interval transactions. */
 
 import type { TransactionJson } from "@par-rt-db/client";
 import { useCallback, useEffect, useState } from "react";
@@ -8,7 +8,7 @@ import { toErrorMessage } from "../lib/errors";
 import type { ScheduleInfo, ScheduleKind, ScheduleStatus, ScheduleWhen } from "../lib/types";
 import s from "./ScheduledJobsPage.module.css";
 
-type CreateMode = "afterMs" | "cron";
+type CreateMode = "afterMs" | "cron" | "interval";
 
 export const DEFAULT_TXN = `{
   "steps": [
@@ -42,6 +42,7 @@ export function ScheduledJobsPage() {
   // Create-form state.
   const [mode, setMode] = useState<CreateMode>("afterMs");
   const [afterMs, setAfterMs] = useState("60000");
+  const [everyMs, setEveryMs] = useState("60000");
   const [cronExpr, setCronExpr] = useState("*/5 * * * *");
   const [txnText, setTxnText] = useState(DEFAULT_TXN);
   const [creating, setCreating] = useState(false);
@@ -86,6 +87,13 @@ export function ScheduledJobsPage() {
         return { error: "afterMs must be a non-negative number of milliseconds." };
       }
       return { type: "afterMs", ms };
+    }
+    if (mode === "interval") {
+      const ms = Number(everyMs);
+      if (!Number.isFinite(ms) || ms <= 0) {
+        return { error: "everyMs must be a positive number of milliseconds." };
+      }
+      return { type: "interval", everyMs: ms };
     }
     const expr = cronExpr.trim();
     if (!expr) return { error: "cron expression is required." };
@@ -225,6 +233,12 @@ export function ScheduledJobsPage() {
                           <br />
                           <span className={s.hint}>next: {nextFireLabel(job)}</span>
                         </>
+                      ) : job.kind === "interval" ? (
+                        <>
+                          <span className={s.cronExpr}>every {job.everyMs ?? "—"} ms</span>
+                          <br />
+                          <span className={s.hint}>next: {nextFireLabel(job)}</span>
+                        </>
                       ) : (
                         nextFireLabel(job)
                       )}
@@ -279,7 +293,7 @@ export function ScheduledJobsPage() {
         <Placard>Create a scheduled job</Placard>
         <div className={s.toolbar}>
           <div className={s.segment}>
-            {(["afterMs", "cron"] as const).map((m) => (
+            {(["afterMs", "cron", "interval"] as const).map((m) => (
               <button
                 key={m}
                 type="button"
@@ -287,7 +301,7 @@ export function ScheduledJobsPage() {
                 className={`${s.segBtn} ${mode === m ? s.segBtnActive : ""}`}
                 aria-pressed={mode === m}
               >
-                {m === "afterMs" ? "one-shot" : "cron"}
+                {m === "afterMs" ? "one-shot" : m}
               </button>
             ))}
           </div>
@@ -298,6 +312,15 @@ export function ScheduledJobsPage() {
                 className={s.input}
                 value={afterMs}
                 onChange={(e) => setAfterMs(e.target.value)}
+              />
+            </label>
+          ) : mode === "interval" ? (
+            <label className={s.field}>
+              <span className={s.fieldLabel}>everyMs (ms)</span>
+              <input
+                className={s.input}
+                value={everyMs}
+                onChange={(e) => setEveryMs(e.target.value)}
               />
             </label>
           ) : (

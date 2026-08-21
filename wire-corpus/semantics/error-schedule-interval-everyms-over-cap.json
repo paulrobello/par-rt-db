@@ -1,0 +1,21 @@
+{
+  "name": "error-schedule-interval-everyms-over-cap",
+  "$comment": "Interval scheduling validation: everyMs is capped at 31,536,000,000 ms (365 days — server scheduler.rs MAX_EVERY_MS); an over-cap value is rejected with BAD_REQUEST. The cap constant is mirrored in every client engine so all runners reject the same boundary.",
+  "schema": {
+    "tables": {
+      "tasks": {
+        "fields": { "name": { "type": "string" } },
+        "indexes": [{ "name": "by_name", "fields": ["name"] }]
+      }
+    }
+  },
+  "seed": [{ "name": "a" }],
+  "op": {
+    "txn": {
+      "steps": [
+        { "op": "schedule", "when": { "type": "interval", "everyMs": 31536000001 }, "txn": { "steps": [] } }
+      ]
+    }
+  },
+  "expect": { "error": { "code": "BAD_REQUEST" } }
+}

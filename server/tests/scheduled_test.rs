@@ -57,7 +57,7 @@ async fn insert_list_cancel_roundtrip() {
     scheduler::ensure_table(&pool, &db).await.unwrap();
 
     let txn = empty_txn();
-    let id = scheduler::insert(&pool, &db, "oneshot", 123, &txn, None)
+    let id = scheduler::insert(&pool, &db, "oneshot", 123, &txn, None, None)
         .await
         .unwrap();
     let listed = scheduler::list(&pool, &db).await.unwrap();
@@ -78,7 +78,7 @@ async fn pause_resume_cron_recomputes_due() {
     let db = unique_db(&pool).await;
     scheduler::ensure_table(&pool, &db).await.unwrap();
     let txn = empty_txn();
-    let id = scheduler::insert(&pool, &db, "cron", 1, &txn, Some("*/5 * * * *"))
+    let id = scheduler::insert(&pool, &db, "cron", 1, &txn, Some("*/5 * * * *"), None)
         .await
         .unwrap();
 
@@ -103,10 +103,10 @@ async fn claim_due_and_finalize() {
     let db = unique_db(&pool).await;
     scheduler::ensure_table(&pool, &db).await.unwrap();
     let txn = empty_txn();
-    let one = scheduler::insert(&pool, &db, "oneshot", 1, &txn, None)
+    let one = scheduler::insert(&pool, &db, "oneshot", 1, &txn, None, None)
         .await
         .unwrap();
-    let cron = scheduler::insert(&pool, &db, "cron", 1, &txn, Some("*/5 * * * *"))
+    let cron = scheduler::insert(&pool, &db, "cron", 1, &txn, Some("*/5 * * * *"), None)
         .await
         .unwrap();
 
@@ -119,7 +119,7 @@ async fn claim_due_and_finalize() {
         .await
         .unwrap();
     let next = scheduler::next_fire("*/5 * * * *", rtdb_server::db::now_ms()).unwrap();
-    scheduler::finalize_cron_next(&pool, &db, &cron, next)
+    scheduler::finalize_recurring_next(&pool, &db, &cron, next)
         .await
         .unwrap();
 
@@ -136,7 +136,7 @@ async fn reset_running_recovers_orphans() {
     let db = unique_db(&pool).await;
     scheduler::ensure_table(&pool, &db).await.unwrap();
     let txn = empty_txn();
-    let _id = scheduler::insert(&pool, &db, "oneshot", 1, &txn, None)
+    let _id = scheduler::insert(&pool, &db, "oneshot", 1, &txn, None, None)
         .await
         .unwrap();
     // Simulate a crash mid-fire: the committer claimed but never finalized.
@@ -161,13 +161,13 @@ async fn next_due_and_mark_error() {
     // Empty table → nothing due.
     assert!(scheduler::next_due(&pool, &db).await.unwrap().is_none());
 
-    let _a = scheduler::insert(&pool, &db, "oneshot", 50, &txn, None)
+    let _a = scheduler::insert(&pool, &db, "oneshot", 50, &txn, None, None)
         .await
         .unwrap();
-    let b = scheduler::insert(&pool, &db, "oneshot", 10, &txn, None)
+    let b = scheduler::insert(&pool, &db, "oneshot", 10, &txn, None, None)
         .await
         .unwrap();
-    let _c = scheduler::insert(&pool, &db, "oneshot", 90, &txn, None)
+    let _c = scheduler::insert(&pool, &db, "oneshot", 90, &txn, None, None)
         .await
         .unwrap();
 
@@ -193,7 +193,7 @@ async fn pause_resume_one_shot_keeps_due_at() {
     let db = unique_db(&pool).await;
     scheduler::ensure_table(&pool, &db).await.unwrap();
     let txn = empty_txn();
-    let id = scheduler::insert(&pool, &db, "oneshot", 42, &txn, None)
+    let id = scheduler::insert(&pool, &db, "oneshot", 42, &txn, None, None)
         .await
         .unwrap();
 
@@ -349,7 +349,7 @@ async fn one_shot_fires_and_writes() {
             doc: serde_json::json!({ "n": 42 }).as_object().unwrap().clone(),
         }],
     };
-    let _id = scheduler::insert(&pool, &db, "oneshot", 1, &txn, None)
+    let _id = scheduler::insert(&pool, &db, "oneshot", 1, &txn, None, None)
         .await
         .unwrap();
 
@@ -407,7 +407,7 @@ async fn cron_fires_and_stays_pending() {
             doc: serde_json::json!({ "n": 7 }).as_object().unwrap().clone(),
         }],
     };
-    let _id = scheduler::insert(&pool, &db, "cron", 1, &txn, Some("* * * * *"))
+    let _id = scheduler::insert(&pool, &db, "cron", 1, &txn, Some("* * * * *"), None)
         .await
         .unwrap();
 
@@ -472,7 +472,7 @@ async fn failing_cron_reschedules_anyway() {
             version: 999,
         }],
     };
-    let _id = scheduler::insert(&pool, &db, "cron", 1, &txn, Some("* * * * *"))
+    let _id = scheduler::insert(&pool, &db, "cron", 1, &txn, Some("* * * * *"), None)
         .await
         .unwrap();
 
@@ -558,7 +558,7 @@ async fn one_shot_catches_up_after_being_past_due() {
         }],
     };
     let one_hour_ago = rtdb_server::db::now_ms() - 3_600_000;
-    let _id = scheduler::insert(&pool, &db, "oneshot", one_hour_ago, &txn, None)
+    let _id = scheduler::insert(&pool, &db, "oneshot", one_hour_ago, &txn, None, None)
         .await
         .unwrap();
 
@@ -606,9 +606,17 @@ async fn cron_skips_missed_windows() {
         }],
     };
     let one_hour_ago = rtdb_server::db::now_ms() - 3_600_000;
-    let _id = scheduler::insert(&pool, &db, "cron", one_hour_ago, &txn, Some("* * * * *"))
-        .await
-        .unwrap();
+    let _id = scheduler::insert(
+        &pool,
+        &db,
+        "cron",
+        one_hour_ago,
+        &txn,
+        Some("* * * * *"),
+        None,
+    )
+    .await
+    .unwrap();
 
     let before = rtdb_server::db::now_ms();
     warm_up_committer(&committers, &db).await;
@@ -698,7 +706,7 @@ async fn failing_txn_marks_error_one_shot() {
             },
         ],
     };
-    let _id = scheduler::insert(&pool, &db, "oneshot", 1, &txn, None)
+    let _id = scheduler::insert(&pool, &db, "oneshot", 1, &txn, None, None)
         .await
         .unwrap();
 
@@ -736,4 +744,159 @@ async fn failing_txn_marks_error_one_shot() {
         !appeared,
         "failing txn's write must be rolled back — no doc with n=123 should exist"
     );
+}
+
+/// Unit-level: resuming a paused interval job shifts `due_at` to
+/// `now + every_ms` — windows elapsed while paused are skipped, never
+/// backfilled (a resume that kept the stale `due_at` would fire immediately
+/// for every missed window).
+#[tokio::test]
+async fn pause_resume_interval_shifts_due_from_resume() {
+    let pool = test_pool().await;
+    let db = unique_db(&pool).await;
+    scheduler::ensure_table(&pool, &db).await.unwrap();
+    let txn = empty_txn();
+    let id = scheduler::insert(&pool, &db, "interval", 1, &txn, None, Some(60_000))
+        .await
+        .unwrap();
+
+    let info = &scheduler::list(&pool, &db).await.unwrap()[0];
+    assert_eq!(info.kind, ScheduleKind::Interval);
+    assert_eq!(info.every_ms, Some(60_000));
+
+    assert!(scheduler::set_paused(&pool, &db, &id, true).await.unwrap());
+    assert!(scheduler::set_paused(&pool, &db, &id, false).await.unwrap());
+    let info = &scheduler::list(&pool, &db).await.unwrap()[0];
+    assert_eq!(info.status, ScheduleStatus::Pending);
+    let now = rtdb_server::db::now_ms();
+    // One full interval out from the resume instant — not the stale due_at
+    // (1), not a catch-up burst.
+    assert!(
+        info.due_at >= now + 59_000 && info.due_at <= now + 60_000,
+        "resume must shift due_at to now + everyMs, got {} vs now {}",
+        info.due_at,
+        now
+    );
+}
+
+/// E2E (decision-pinning): an interval job fires repeatedly, re-arming from
+/// each fire; pause stops fires outright; resume shifts the next fire one
+/// full interval from the resume instant instead of backfilling the windows
+/// that elapsed while paused.
+#[tokio::test]
+async fn interval_fires_repeatedly_and_skips_paused_windows() {
+    let pool = test_pool().await;
+    let db = unique_db(&pool).await;
+    let _schema = push_simple_schema(&pool, &db).await;
+    let committers = Committers::new(
+        pool.clone(),
+        SubscriptionManager::new(),
+        SchemaCache::new(),
+        OpFeed::new(64, 32),
+        Arc::new(ArcSwap::from_pointee(common::test_hot())),
+        Metrics::new(),
+        CommitterConfig {
+            quotas: Arc::new(quota::UsageCache::new()),
+            audit_log_enabled: false,
+            webhooks_enabled: false,
+            ttl_sweep_interval_secs: 60,
+            ttl_batch: 5000,
+            quota_cache_ttl_secs: 60,
+            idle_reclaim_secs: 0,
+            instance_id: String::new(),
+            multi_instance: false,
+        },
+    );
+
+    const EVERY_MS: i64 = 400;
+    // Due in the past so the first fire is immediate (catch-up path); every
+    // later fire re-arms one interval out from its fire time.
+    let txn = empty_txn();
+    let id = scheduler::insert(&pool, &db, "interval", 1, &txn, None, Some(EVERY_MS))
+        .await
+        .unwrap();
+
+    warm_up_committer(&committers, &db).await;
+
+    // Fires repeatedly: fired_count reaches >= 2 (two fires one interval
+    // apart) and the row stays pending — the recurring shape.
+    let info = poll_list(&pool, &db, Duration::from_secs(15), |l| {
+        l.iter()
+            .find(|i| {
+                i.id == id
+                    && i.kind == ScheduleKind::Interval
+                    && i.status == ScheduleStatus::Pending
+                    && i.fired_count >= 2
+            })
+            .cloned()
+    })
+    .await
+    .expect("interval job should fire repeatedly and stay pending");
+    assert_eq!(info.every_ms, Some(EVERY_MS));
+
+    // Pause. set_paused only transitions pending→paused, so a fire claimed
+    // just before the call makes it return false (the row is 'running') —
+    // retry until it lands. Once it returns true the row is quiescent: any
+    // earlier claim would have made the UPDATE miss, and later claims only
+    // take pending rows.
+    let pause_deadline = Instant::now() + Duration::from_secs(8);
+    let mut paused_landed = false;
+    while Instant::now() < pause_deadline {
+        if scheduler::set_paused(&pool, &db, &id, true).await.unwrap() {
+            paused_landed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(paused_landed, "failed to pause the interval job");
+    let f1 = scheduler::list(&pool, &db)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|i| i.id == id)
+        .map(|i| i.fired_count)
+        .expect("paused row must still be listed");
+
+    // Let >= 3 windows elapse while paused — no fires.
+    tokio::time::sleep(Duration::from_millis(1_400)).await;
+    let f_still = scheduler::list(&pool, &db)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|i| i.id == id)
+        .unwrap();
+    assert_eq!(
+        f_still.fired_count, f1,
+        "a paused interval job must not fire"
+    );
+    assert_eq!(f_still.status, ScheduleStatus::Paused);
+
+    // Resume: the next fire shifts one full interval from the resume instant
+    // — it must NOT be immediately due (that would be backfill).
+    assert!(scheduler::set_paused(&pool, &db, &id, false).await.unwrap());
+    let resumed_at = rtdb_server::db::now_ms();
+    let info = scheduler::list(&pool, &db)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|i| i.id == id)
+        .unwrap();
+    assert_eq!(info.status, ScheduleStatus::Pending);
+    assert!(
+        info.due_at >= resumed_at + EVERY_MS - 100,
+        "resume must shift due_at one interval out (>= resume + {}ms), got due_at {} vs resumed_at {}",
+        EVERY_MS - 100,
+        info.due_at,
+        resumed_at
+    );
+
+    // And it fires exactly once more from the shifted due — observed as
+    // fired_count reaching f1 + 1 (no burst of missed windows).
+    let f2 = poll_list(&pool, &db, Duration::from_secs(10), |l| {
+        l.iter()
+            .find(|i| i.id == id && i.fired_count > f1)
+            .map(|i| i.fired_count)
+    })
+    .await;
+    assert!(f2.is_some(), "interval job should fire again after resume");
 }

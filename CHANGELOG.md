@@ -14,6 +14,25 @@ contract against Convex.
 
 ## [Unreleased]
 
+### Feature: interval recurrence for scheduled transactions (`when: {type:"interval", everyMs}` — server + all four clients)
+
+The third recurrence shape alongside one-shot (`afterMs`/`runAt`) and cron: a
+fixed interval in milliseconds, for poll loops, cache refreshes, and agent
+tooling where a cron expression is heavyweight (Convex offers both interval and
+cron). First `due_at` = now + `everyMs`; after each fire the job re-arms from
+its actual fire time, and `resume` shifts the next fire to `now + everyMs` —
+missed windows (downtime, pause) are skipped, never backfilled, matching cron's
+no-backfill ruling. `everyMs` must be positive and ≤ 31,536,000,000 (one year —
+`scheduler::MAX_EVERY_MS`, mirrored in every client) else `BadRequest` before
+any row is written. `scheduled_txns` gains a nullable `every_ms` column
+(additive `ALTER ... ADD COLUMN IF NOT EXISTS` for pre-existing databases;
+backups are pg_dump-based and carry it as-is), `ScheduleKind`/`ScheduleInfo`
+gain `"interval"`/`everyMs` on the wire, and all four SDKs mirror the when
+variant, builder, validation, and in-engine `tick()` semantics — pinned by
+wire-corpus entries (interval when + `everyMs` ScheduleInfos) and two
+semantics-corpus error cases (non-positive and over-cap `everyMs`), plus the
+server e2e test `interval_fires_repeatedly_and_skips_paused_windows`.
+
 ### Fix: upsert-insert now stamps the ttl `defaultDurationMs` (server; engines already did)
 
 The server's upsert insert branch applied FM-32 defaults but skipped the

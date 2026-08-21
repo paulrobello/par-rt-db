@@ -359,11 +359,20 @@ pub enum ScheduleWhen {
         /// 5-field cron expression (UTC, min-first).
         expr: String,
     },
+    /// Fire every `every_ms` milliseconds, starting one interval from now.
+    /// Missed windows (downtime, pause) are skipped, never backfilled —
+    /// each fire re-arms from its actual fire time, like cron recompute.
+    Interval {
+        /// The fixed recurrence in milliseconds.
+        #[serde(rename = "everyMs")]
+        every_ms: i64,
+    },
 }
 
-/// Whether a scheduled job fires once or repeats on cron. Mirrors
-/// `server/src/protocol.rs::ScheduleKind` (ARC-004/QA-008): serializes as
-/// `"oneshot"` / `"cron"`, byte-identical to the prior `String` form.
+/// Whether a scheduled job fires once or repeats on cron or a fixed interval.
+/// Mirrors `server/src/protocol.rs::ScheduleKind` (ARC-004/QA-008): serializes
+/// as `"oneshot"` / `"cron"` / `"interval"`, byte-identical to the prior
+/// `String` form.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ScheduleKind {
@@ -371,14 +380,17 @@ pub enum ScheduleKind {
     Oneshot,
     /// Repeats on a cron schedule.
     Cron,
+    /// Repeats on a fixed interval.
+    Interval,
 }
 
 impl ScheduleKind {
-    /// The wire string (`"oneshot"` / `"cron"`).
+    /// The wire string (`"oneshot"` / `"cron"` / `"interval"`).
     pub fn as_wire_str(&self) -> &'static str {
         match self {
             ScheduleKind::Oneshot => "oneshot",
             ScheduleKind::Cron => "cron",
+            ScheduleKind::Interval => "interval",
         }
     }
 }
@@ -395,6 +407,7 @@ impl std::str::FromStr for ScheduleKind {
         match s {
             "oneshot" => Ok(ScheduleKind::Oneshot),
             "cron" => Ok(ScheduleKind::Cron),
+            "interval" => Ok(ScheduleKind::Interval),
             other => Err(format!("unknown ScheduleKind: {other}")),
         }
     }
@@ -448,21 +461,24 @@ impl std::str::FromStr for ScheduleStatus {
     }
 }
 
-/// A scheduled job's public view (returned by `listSchedules`). `cron` and
-/// `last_error` are omitted on the wire when absent. Mirrors
+/// A scheduled job's public view (returned by `listSchedules`). `cron`,
+/// `everyMs`, and `last_error` are omitted on the wire when absent. Mirrors
 /// `server/src/protocol.rs::ScheduleInfo`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ScheduleInfo {
     /// Opaque job id.
     pub id: String,
-    /// One-shot or cron.
+    /// One-shot, cron, or interval.
     pub kind: ScheduleKind,
     /// Next due time, epoch ms.
     pub due_at: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     /// The cron expression, for cron jobs.
     pub cron: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Interval jobs only: the fixed recurrence in ms (`kind: "interval"`).
+    pub every_ms: Option<i64>,
     /// Lifecycle state.
     pub status: ScheduleStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1727,10 +1743,22 @@ mod tests {
             .unwrap(),
             json!({"type": "cron", "expr": "*/5 * * * *"})
         );
+        assert_eq!(
+            serde_json::to_value(ScheduleWhen::Interval { every_ms: 5_000 }).unwrap(),
+            json!({"type": "interval", "everyMs": 5000})
+        );
         // deny_unknown_fields.
         assert!(
             serde_json::from_value::<ScheduleWhen>(json!({"type": "afterMs", "ms": 1, "x": 9}))
                 .is_err()
+        );
+        assert!(
+            serde_json::from_value::<ScheduleWhen>(json!({
+                "type": "interval",
+                "everyMs": 1,
+                "x": 9
+            }))
+            .is_err()
         );
     }
 
@@ -1854,6 +1882,7 @@ mod tests {
             kind: ScheduleKind::Oneshot,
             due_at: 1000,
             cron: None,
+            every_ms: None,
             status: ScheduleStatus::Pending,
             last_error: None,
             created_at: 500,
@@ -1876,6 +1905,7 @@ mod tests {
             kind: ScheduleKind::Cron,
             due_at: 2000,
             cron: Some("*/5 * * * *".into()),
+            every_ms: None,
             status: ScheduleStatus::Error,
             last_error: Some("boom".into()),
             created_at: 500,
@@ -1895,10 +1925,36 @@ mod tests {
                 "firedCount": 3
             })
         );
+        let interval = ScheduleInfo {
+            id: "j3".into(),
+            kind: ScheduleKind::Interval,
+            due_at: 2400,
+            cron: None,
+            every_ms: Some(300_000),
+            status: ScheduleStatus::Pending,
+            last_error: None,
+            created_at: 500,
+            fired_count: 0,
+        };
+        let iv = serde_json::to_value(&interval).unwrap();
+        assert_eq!(
+            iv,
+            json!({
+                "id": "j3",
+                "kind": "interval",
+                "dueAt": 2400,
+                "everyMs": 300000,
+                "status": "pending",
+                "createdAt": 500,
+                "firedCount": 0
+            })
+        );
         // Round-trips back.
         let back: ScheduleInfo = serde_json::from_value(v).unwrap();
         assert_eq!(back.cron.as_deref(), Some("*/5 * * * *"));
         assert_eq!(back.last_error.as_deref(), Some("boom"));
+        let back: ScheduleInfo = serde_json::from_value(iv).unwrap();
+        assert_eq!(back.every_ms, Some(300_000));
     }
 
     // ---- FM-29 workflow wire (fixtures mirror server protocol.rs tests) ----

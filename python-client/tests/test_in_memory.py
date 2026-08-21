@@ -20,6 +20,7 @@ from par_rt_db.errors import ErrorCode, RtDbError
 from par_rt_db.in_memory import (
     MAX_AFFECTED_ROWS_PER_TXN,
     MAX_BY_QUERY_STEPS_PER_TXN,
+    MAX_EVERY_MS,
     MAX_STEPS,
     InMemoryRtDbClient,
     InMemoryRtDbClientOptions,
@@ -2021,6 +2022,125 @@ def test_tick_cron_re_arms_and_fires_again_on_a_later_tick() -> None:
     clock[0] += CRON_STEP_MS + 1
     c.tick()
     assert len(c.run_query(TableQuery("items").build())) == 2
+
+
+# --- interval recurrence (when: {type: "interval", everyMs}) --------------------
+
+
+def test_interval_initial_due_is_now_plus_every_ms() -> None:
+    every = 5_000
+    c, clock = _new_clock_client()
+    t0 = clock[0]
+    c.schedule(_insert_todo_txn(), _when.validate_python({"type": "interval", "everyMs": every}))
+    info = c.list_schedules()
+    assert len(info) == 1
+    assert info[0].kind == "interval"
+    assert info[0].every_ms == every
+    assert info[0].due_at == t0 + every
+    # Not due at t0 — one full interval must elapse first.
+    c.tick()
+    assert c.run_query(TableQuery("items").build()) == []
+
+
+def test_tick_interval_re_arms_from_the_fire_time_and_fires_again() -> None:
+    every = 5_000
+    c, clock = _new_clock_client()
+    c.schedule(_insert_todo_txn(), _when.validate_python({"type": "interval", "everyMs": every}))
+    clock[0] += every + 1
+    c.tick()
+    assert len(c.run_query(TableQuery("items").build())) == 1
+    # Re-armed from the fire time: the next window is every ms out again.
+    assert c.list_schedules()[0].due_at == clock[0] + every
+    clock[0] += every + 1
+    c.tick()
+    assert len(c.run_query(TableQuery("items").build())) == 2
+
+
+def test_tick_interval_skips_missed_windows_on_a_big_clock_jump() -> None:
+    every = 5_000
+    c, clock = _new_clock_client()
+    c.schedule(_insert_todo_txn(), _when.validate_python({"type": "interval", "everyMs": every}))
+    clock[0] += every * 10  # ten windows elapse before the first tick
+    c.tick()
+    # Fires once from the due instant — no backfill of the missed windows.
+    assert len(c.run_query(TableQuery("items").build())) == 1
+    assert c.list_schedules()[0].due_at == clock[0] + every
+
+
+def test_pause_then_resume_shifts_interval_due_from_resume_time() -> None:
+    every = 5_000
+    c, clock = _new_clock_client()
+    sid = c.schedule(
+        _insert_todo_txn(), _when.validate_python({"type": "interval", "everyMs": every})
+    )
+    c.pause_schedule(sid)
+    clock[0] += every * 3  # windows elapse while paused
+    c.tick()  # paused -> no fire
+    assert c.run_query(TableQuery("items").build()) == []
+    c.resume_schedule(sid)
+    # Resume shifts due_at to now + every (paused windows are skipped); the
+    # original due instant is already past but must not fire immediately.
+    assert c.list_schedules()[0].due_at == clock[0] + every
+    c.tick()
+    assert c.run_query(TableQuery("items").build()) == []
+    clock[0] += every + 1
+    c.tick()
+    assert len(c.run_query(TableQuery("items").build())) == 1
+
+
+def test_tick_interval_error_path_re_arms_and_retries() -> None:
+    every = 5_000
+    c, clock = _new_clock_client()
+    # A txn that fails at fire time: the target doc does not exist.
+    bad_txn = Mutation.builder().delete("items", "nonexistent").build()
+    c.schedule(bad_txn, _when.validate_python({"type": "interval", "everyMs": every}))
+    clock[0] += every + 1
+    c.tick()
+    job = c.list_schedules()[0]
+    assert job.status == "error"
+    assert job.last_error is not None
+    assert job.fired_count == 0
+    # The error path re-arms too (server reschedule_recurring_error), so a
+    # later tick retries the job instead of hot-looping on a past due_at.
+    assert job.due_at == clock[0] + every
+
+
+@pytest.mark.parametrize("bad", [0, -1])
+def test_schedule_interval_rejects_non_positive_every_ms(bad: int) -> None:
+    c, _clock = _new_clock_client()
+    with pytest.raises(RtDbError) as ei:
+        c.schedule(_insert_todo_txn(), _when.validate_python({"type": "interval", "everyMs": bad}))
+    assert ei.value.code is ErrorCode.BAD_REQUEST
+    # Rejected before any row is written.
+    assert c.list_schedules() == []
+
+
+def test_schedule_interval_rejects_over_cap_every_ms() -> None:
+    c, _clock = _new_clock_client()
+    with pytest.raises(RtDbError) as ei:
+        c.schedule(
+            _insert_todo_txn(),
+            _when.validate_python({"type": "interval", "everyMs": MAX_EVERY_MS + 1}),
+        )
+    assert ei.value.code is ErrorCode.BAD_REQUEST
+    assert c.list_schedules() == []
+
+
+def test_schedule_step_rejects_invalid_interval_every_ms() -> None:
+    # The txn `schedule` step routes through the same validated schedule() path.
+    c, _clock = _new_clock_client()
+    txn = (
+        Mutation.builder()
+        .insert("items", {"name": "a", "status": "todo", "order": 1})
+        .schedule(_when.validate_python({"type": "interval", "everyMs": 0}), _insert_todo_txn())
+        .build()
+    )
+    with pytest.raises(RtDbError) as ei:
+        c.mutate(txn)
+    assert ei.value.code is ErrorCode.BAD_REQUEST
+    # The whole txn rolled back: no doc, no enqueued job.
+    assert c.run_query(TableQuery("items").build()) == []
+    assert c.list_schedules() == []
 
 
 def test_cancel_schedule_removes_the_job() -> None:

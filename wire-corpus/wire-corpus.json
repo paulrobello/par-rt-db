@@ -21,6 +21,7 @@
     { "type": "schedule", "scheduleId": "s1", "when": { "type": "afterMs", "ms": 100 }, "txn": { "steps": [] } },
     { "type": "schedule", "scheduleId": "s1", "when": { "type": "runAt", "ms": 1700000000000 }, "txn": { "steps": [] } },
     { "type": "schedule", "scheduleId": "s1", "when": { "type": "cron", "expr": "*/5 * * * *" }, "txn": { "steps": [] } },
+    { "type": "schedule", "scheduleId": "s1", "when": { "type": "interval", "everyMs": 300000 }, "txn": { "steps": [] } },
     { "type": "cancelSchedule", "scheduleId": "s1", "id": "job-9" },
     { "type": "pauseSchedule", "scheduleId": "s1", "id": "job-9" },
     { "type": "resumeSchedule", "scheduleId": "s1", "id": "job-9" },
@@ -30,7 +31,8 @@
     { "type": "presenceState", "room": "doc:1", "state": { "typing": true } },
     { "type": "leavePresence", "room": "doc:1" },
     { "type": "ping" },
-    { "type": "mutate", "mutId": "m8", "txn": { "steps": [ { "op": "undelete", "table": "tasks", "id": "t-1" } ] } }
+    { "type": "mutate", "mutId": "m8", "txn": { "steps": [ { "op": "undelete", "table": "tasks", "id": "t-1" } ] } },
+    { "type": "mutate", "mutId": "m9", "txn": { "steps": [ { "op": "schedule", "when": { "type": "interval", "everyMs": 300000 }, "txn": { "steps": [] } } ] } }
   ],
   "server_messages": [
     { "type": "authOk", "user": { "kind": "user", "email": "a@b.com", "name": null, "githubLogin": "alice", "githubId": 12345 } },
@@ -73,7 +75,8 @@
   "schedule_whens": [
     { "type": "afterMs", "ms": 100 },
     { "type": "runAt", "ms": 1700000000000 },
-    { "type": "cron", "expr": "*/5 * * * *" }
+    { "type": "cron", "expr": "*/5 * * * *" },
+    { "type": "interval", "everyMs": 300000 }
   ],
   "schedule_infos": [
     { "id": "j1", "kind": "oneshot", "dueAt": 1000, "status": "pending", "createdAt": 500, "firedCount": 0 },
@@ -83,7 +86,9 @@
     { "id": "j5", "kind": "cron", "dueAt": 2000, "cron": "*/5 * * * *", "status": "pending", "createdAt": 500, "firedCount": 0 },
     { "id": "j6", "kind": "cron", "dueAt": 2100, "cron": "0 * * * *", "status": "running", "createdAt": 500, "firedCount": 4 },
     { "id": "j7", "kind": "cron", "dueAt": 2200, "cron": "0 * * * *", "status": "paused", "createdAt": 500, "firedCount": 4 },
-    { "id": "j8", "kind": "cron", "dueAt": 2300, "cron": "0 * * * *", "status": "error", "lastError": "kaboom", "createdAt": 500, "firedCount": 7 }
+    { "id": "j8", "kind": "cron", "dueAt": 2300, "cron": "0 * * * *", "status": "error", "lastError": "kaboom", "createdAt": 500, "firedCount": 7 },
+    { "id": "j9", "kind": "interval", "dueAt": 2400, "everyMs": 300000, "status": "pending", "createdAt": 500, "firedCount": 0 },
+    { "id": "j10", "kind": "interval", "dueAt": 2500, "everyMs": 60000, "status": "error", "lastError": "boom", "createdAt": 500, "firedCount": 2 }
   ],
   "query_results": [
     null,
@@ -181,7 +186,7 @@
     { "kind": "robot", "email": null, "name": null }
   ],
   "rejects_schedule_info_unknown_kind": [
-    { "id": "j1", "kind": "interval", "dueAt": 1000, "status": "pending", "createdAt": 500, "firedCount": 0 }
+    { "id": "j1", "kind": "recurring", "dueAt": 1000, "status": "pending", "createdAt": 500, "firedCount": 0 }
   ],
   "rejects_schedule_info_unknown_status": [
     { "id": "j1", "kind": "oneshot", "dueAt": 1000, "status": "queued", "createdAt": 500, "firedCount": 0 }

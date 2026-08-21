@@ -1,6 +1,6 @@
 # Scheduled & cron transactions — design
 
-**Status:** Implemented (2026-08-10) — `scheduler.rs` + `handle_scheduled` committer arm; `runAfter`/`runAt` + cron; FEATURE_MATRIX #9 / #10.
+**Status:** Implemented (2026-08-10) — `scheduler.rs` + `handle_scheduled` committer arm; `runAfter`/`runAt` + cron; FEATURE_MATRIX #9 / #10. **Interval recurrence added (2026-08-20)** — `when: {type:"interval", everyMs}` as the third recurrence shape; see the interval notes inline.
 
 ## Problem
 
@@ -80,10 +80,11 @@ the `mutation_log::ensure_table` lifecycle.
 ```sql
 CREATE TABLE "<schema>".scheduled_txns (
     id          text PRIMARY KEY,          -- uuid v7 (db::new_id), server-generated, returned to client
-    kind        text NOT NULL,             -- 'oneshot' | 'cron'
+    kind        text NOT NULL,             -- 'oneshot' | 'cron' | 'interval'
     due_at      bigint NOT NULL,           -- epoch ms UTC; next fire time
     txn         jsonb NOT NULL,            -- the declarative Transaction (data, not code)
     cron        text,                      -- 5-field cron expr when kind='cron', else NULL
+    every_ms    bigint,                    -- fixed recurrence in ms when kind='interval', else NULL (added 2026-08-20; ALTER ADD IF NOT EXISTS for pre-existing dbs)
     status      text NOT NULL,             -- 'pending' | 'running' | 'paused' | 'error'
     last_error  text,                      -- error message when status='error', else NULL
     created_at  bigint NOT NULL,
@@ -137,10 +138,15 @@ finalizes:
   `UPDATE … SET status='pending', due_at=$next, fired_count=fired_count+1,
   last_error=NULL WHERE id=$1`. The cron expression is re-parsed each fire and
   `next_fire = Schedule::after(now_utc).next()`.
+- **interval, success** (added 2026-08-20) → same UPDATE with
+  `next = fire_time + every_ms`. Re-arming from the actual fire time mirrors
+  cron's recompute-from-now: a delayed fire shifts the series forward rather
+  than backfilling.
 - **failure** (the txn returned a step error / precondition failure) → one-shot:
-  `UPDATE … SET status='error', last_error=$msg`; cron: log the error via
-  `tracing` and still reschedule the next fire (`status='pending', due_at=$next`)
-  so one bad payload cannot permanently stall a recurring job.
+  `UPDATE … SET status='error', last_error=$msg`; cron and interval: log the
+  error via `tracing` and still reschedule the next fire
+  (`status='pending', due_at=$next`) so one bad payload cannot permanently stall
+  a recurring job.
 
 A `RunScheduled` whose row no longer exists (it was cancelled between claim and
 execution) is a no-op.
@@ -170,6 +176,10 @@ guarantee.
 - **Cron missed windows** are skipped entirely: on catch-up the next fire is
   `Schedule::after(now).next()`, i.e. the next scheduled time *after now*, never
   a backfill of the windows the server was down for.
+- **Interval missed windows** (downtime, or windows elapsed while paused) are
+  skipped the same way: each fire re-arms from its actual fire time, and
+  `resume` shifts the next fire to `now + every_ms` — one fire after the resume,
+  never a burst of backfill fires.
 - **All cron expressions are evaluated in UTC.** `due_at` is UTC epoch ms (the
   existing `now_ms()`), and next-fire is computed against a `DateTime<Utc>`. No
   timezone database is needed in the scheduler.
@@ -190,7 +200,10 @@ ListSchedules     { scheduleId }
 ```
 
 where `When` is a tagged enum: `{ "type": "afterMs", "ms": <i64> }` |
-`{ "type": "runAt", "ms": <i64> }` | `{ "type": "cron", "expr": "<5-field>" }`.
+`{ "type": "runAt", "ms": <i64> }` | `{ "type": "cron", "expr": "<5-field>" }` |
+`{ "type": "interval", "everyMs": <i64> }` (added 2026-08-20: fire every
+`everyMs` milliseconds, first fire one interval from now; `everyMs` must be
+positive and ≤ 31,536,000,000 — one year — else `BadRequest`).
 `scheduleId` is reply-correlation, mirroring `mutId` (client-generated, never
 persisted); `id` is the server job id.
 
@@ -203,10 +216,11 @@ ScheduleAck       { scheduleId, ok: bool, error: Option<RtDbError> }   // cancel
 ListSchedulesOk   { scheduleId, schedules: Vec<ScheduleInfo> }
 ```
 
-`ScheduleInfo` carries `{ id, kind, dueAt, cron, status, lastError, createdAt,
-firedCount }` (`cron` and `lastError` omitted on the wire when null, like
-`github_login`). `pause`/`resume` apply to cron jobs (and a not-yet-fired
-one-shot); `cancel` deletes any job.
+`ScheduleInfo` carries `{ id, kind, dueAt, cron, everyMs, status, lastError,
+createdAt, firedCount }` (`cron`, `everyMs`, and `lastError` omitted on the wire
+when null, like `github_login`). `pause`/`resume` apply to cron and interval
+jobs (and a not-yet-fired one-shot; resuming an interval job shifts its next
+fire to `now + everyMs`); `cancel` deletes any job.
 
 **HTTP** — parallel one-shot routes, authorized like `/api/query` and
 `/api/mutate`:
@@ -228,8 +242,8 @@ token revocation, allowlist changes, and session expiry take effect live.
 Scheduled-txn execution failure does **not** retry (covered above): a one-shot
 records `status='error'` and stops; a cron logs and reschedules. Failures are
 visible in `listSchedules` via `last_error`/`status`. A malformed scheduling
-request — an unparseable cron expression or a negative `afterMs` — is rejected
-with `BadRequest` before any row is written.
+request — an unparseable cron expression, a negative `afterMs`, or a non-positive
+/ over-cap `everyMs` — is rejected with `BadRequest` before any row is written.
 
 Note on `runAt` in the past: a one-shot with `runAt <= now` is accepted and fires
 immediately on the next due-scan (this is the catch-up path and the natural
@@ -237,7 +251,7 @@ meaning of "run at this time"). It is not an error.
 
 ### Clients
 
-**TS SDK.** `client.schedule(txn, when: { afterMs } | { runAt } | { cron })`
+**TS SDK.** `client.schedule(txn, when: { afterMs } | { runAt } | { cron } | { interval })`
 → `Promise<{ id: string }>` on the reactive WS client; `http.schedule(...)` on
 the HTTP client. Plus `cancelSchedule(id)`, `pauseSchedule(id)`,
 `resumeSchedule(id)`, and `listSchedules()` on both. `protocol.ts` gains the new

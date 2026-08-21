@@ -355,10 +355,10 @@ class RtDbHttpClient:
     def schedule(self, txn: Transaction, when: ScheduleWhen) -> str:
         """``POST /api/schedule`` → the new schedule's id.
 
-        ``when`` is a ``ScheduleWhen`` (``AfterMs``/``RunAt``/``Cron``, imported
-        from the package root — ``from par_rt_db import AfterMs``). One-shot jobs
-        past due run immediately; cron jobs skip missed windows (server-side
-        semantics).
+        ``when`` is a ``ScheduleWhen`` (``AfterMs``/``RunAt``/``Cron``/
+        ``Interval``, imported from the package root — ``from par_rt_db import
+        AfterMs``). One-shot jobs past due run immediately; recurring jobs
+        (cron/interval) skip missed windows (server-side semantics).
         """
         body = {
             "db": self._db,

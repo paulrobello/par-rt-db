@@ -221,7 +221,7 @@ Both the reactive `RtDbClient` (WS) and the one-shot `RtDbHttpClient` expose
 scheduled/cron transactions:
 
 ```ts
-// Schedule a txn — `when` is afterMs / runAt (one-shot) or cron (5-field, UTC, min-first).
+// Schedule a txn — `when` is afterMs / runAt (one-shot), cron (5-field, UTC, min-first), or interval (everyMs).
 const { id } = await db.schedule(
   mutation().insert("tasks", { title: "deferred", done: false }).build(),
   { type: "afterMs", ms: 60_000 },

@@ -18,10 +18,11 @@ from par_rt_db.schema import Schema as _Schema
 
 def test_schedule_when_union_exported() -> None:
     # ``ScheduleWhen`` is an ``Annotated`` alias over the discriminated union;
-    # the three concrete variants are the classes callers construct.
+    # the four concrete variants are the classes callers construct.
     assert par_rt_db.AfterMs is wire.AfterMs
     assert par_rt_db.RunAt is wire.RunAt
     assert par_rt_db.Cron is wire.Cron
+    assert par_rt_db.Interval is wire.Interval
     assert par_rt_db.ScheduleWhen is wire.ScheduleWhen
 
 
@@ -33,11 +34,12 @@ def test_in_memory_client_exported() -> None:
     assert par_rt_db.InMemoryRtDbClient is _InMemoryRtDbClient
 
 
-def test_all_six_names_listed_in_dunder_all() -> None:
+def test_all_public_names_listed_in_dunder_all() -> None:
     for name in (
         "AfterMs",
         "RunAt",
         "Cron",
+        "Interval",
         "ScheduleWhen",
         "Schema",
         "InMemoryRtDbClient",

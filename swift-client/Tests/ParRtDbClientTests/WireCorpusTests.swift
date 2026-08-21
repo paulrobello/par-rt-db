@@ -20,8 +20,8 @@ import Testing
 // shortest form, `2.0` -> `2`, the documented JSONValue caveat), and
 // booleans stay distinct from numbers inside containers.
 //
-// Sections covered: client_messages (30), server_messages (30),
-// authed_users (4), schedule_whens (3), schedule_infos (8), queries (13),
+// Sections covered: client_messages (32), server_messages (30),
+// authed_users (4), schedule_whens (4), schedule_infos (10), queries (13),
 // the admin-plane migrate sections — migrate_requests (3) and
 // migrate_results (2), through MigrateRequest/MigrateResult — the five
 // rejects_* sections (6 total), and protocol_constants.max_steps.
