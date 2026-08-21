@@ -527,11 +527,33 @@ func stampTtlDefault(
     return out
 }
 
+/// Stamps the table's `updatedAtField` (FM-36) with the current epoch-ms,
+/// overwriting any client-supplied value — the same authority model as the
+/// ttl `defaultDurationMs` stamp (server `txn::stamp_updated_at`). Runs on
+/// every version-bumping write path: insert, patch, replace, upsert (both
+/// branches), patchByQuery, and cascade setNull. The value follows the
+/// field's wire convention: a JSON number on `number`, a decimal string on
+/// `int64` (int64 travels as strings end to end).
+func stampUpdatedAt(
+    _ table: TableDef, _ doc: [String: JSONValue], _ now: Int64
+) -> [String: JSONValue] {
+    guard let field = table.updatedAtField else {
+        return doc
+    }
+    var out = doc
+    if case .int64 = table.fields[field] {
+        out[field] = .string(String(now))
+    } else {
+        out[field] = .int(now)
+    }
+    return out
+}
+
 /// Applies the table's push-time-validated `defaults` (FM-32) to a NEW
 /// document (store.ts `applyDefaults`): every key the doc omits is stamped.
-/// Runs after `stampTtlDefault` (a ttl default on the same field wins). Only
-/// the new-document paths call it — insert, replace, upsert-insert; patch
-/// never re-applies.
+/// Runs after `stampTtlDefault` and `stampUpdatedAt` (both stamps win over a
+/// default on the same field). Only the new-document paths call it — insert,
+/// replace, upsert-insert; patch never re-applies.
 func applyDefaults(_ table: TableDef, _ doc: [String: JSONValue]) -> [String: JSONValue] {
     guard !table.defaults.isEmpty else { return doc }
     let missing = table.defaults.keys.filter { doc[$0] == nil }
@@ -1422,7 +1444,7 @@ public final class InMemoryRtDbClient: MigrationStore {
                     table: table, extraTables: []
                 )
             }
-            let merged = try applyPatch(tableDef, row.doc, patch)
+            let merged = try applyPatch(tableDef, row.doc, stampUpdatedAt(tableDef, patch, nowFn()))
             try doUpdate(table, tableDef, row, merged)
             return StepExecution(
                 result: .object(["id": .string(row.id), "inserted": .bool(false)]),
@@ -1432,7 +1454,11 @@ public final class InMemoryRtDbClient: MigrationStore {
             let tableDef = try requireTable(table)
             let (rows, truncated) = try scanByQuery(tableDef, table, filter, limit)
             for row in rows {
-                let merged = try applyPatch(tableDef, row.doc, patch)
+                // Fresh stamp per row, exactly as the server restamps inside
+                // its per-row loop.
+                let merged = try applyPatch(
+                    tableDef, row.doc, stampUpdatedAt(tableDef, patch, nowFn())
+                )
                 try doUpdate(table, tableDef, row, merged)
             }
             return StepExecution(
@@ -1474,6 +1500,7 @@ public final class InMemoryRtDbClient: MigrationStore {
         _ tableName: String, _ tableDef: TableDef, _ doc: [String: JSONValue]
     ) throws -> String {
         var stamped = stampTtlDefault(tableDef, doc, nowFn())
+        stamped = stampUpdatedAt(tableDef, stamped, nowFn())
         stamped = applyDefaults(tableDef, stamped)
         try validateDoc(tableDef, stamped)
         let stored = stripUnsetOptionals(tableDef, stamped)
@@ -1489,7 +1516,10 @@ public final class InMemoryRtDbClient: MigrationStore {
         _ tableDef: TableDef, _ tableName: String, _ id: String, _ fields: [String: JSONValue]
     ) throws {
         let row = try requireRow(tableName, id)
-        let merged = try applyPatch(tableDef, row.doc, fields)
+        // The updatedAt stamp rides IN the patch payload, so the merged doc
+        // carries it even when the patch does not mention the field.
+        let stamped = stampUpdatedAt(tableDef, fields, nowFn())
+        let merged = try applyPatch(tableDef, row.doc, stamped)
         try doUpdate(tableName, tableDef, row, merged)
     }
 
@@ -1498,8 +1528,9 @@ public final class InMemoryRtDbClient: MigrationStore {
     ) throws {
         let row = try requireRow(tableName, id)
         // Defaults re-apply on a full replace; the TTL default does NOT
-        // (only insert stamps it — store.ts `doReplace`).
-        let stamped = applyDefaults(tableDef, doc)
+        // (only insert stamps it — store.ts `doReplace`). The updatedAt
+        // stamp DOES restamp on replace.
+        let stamped = stampUpdatedAt(tableDef, applyDefaults(tableDef, doc), nowFn())
         try validateDoc(tableDef, stamped)
         let stored = stripUnsetOptionals(tableDef, stamped)
         try checkUniqueIndexes(tableName, tableDef, stored, excludeId: row.id)
@@ -1605,6 +1636,8 @@ public final class InMemoryRtDbClient: MigrationStore {
                 } else {
                     // setNull: remove the child's field key (a null-on-optional
                     // patch) and bump its version — one budget slot per child.
+                    // The patch payload carries the CHILD table's updatedAt
+                    // stamp when it declares one.
                     for childId in childIds {
                         if context.rows >= InMemoryLimits.maxCascadeRows {
                             throw RtDbError(
@@ -1617,7 +1650,10 @@ public final class InMemoryRtDbClient: MigrationStore {
                         guard let childRow = rowStore(childTableName).rows[childId] else {
                             continue // visibleChildIds returns only live rows
                         }
-                        let merged = try applyPatch(childTableDef, childRow.doc, [fieldName: .null])
+                        let stamped = stampUpdatedAt(
+                            childTableDef, [fieldName: .null], nowFn()
+                        )
+                        let merged = try applyPatch(childTableDef, childRow.doc, stamped)
                         try doUpdate(childTableName, childTableDef, childRow, merged)
                         context.touched.insert(childTableName)
                     }

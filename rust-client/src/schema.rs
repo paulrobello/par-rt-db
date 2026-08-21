@@ -365,6 +365,20 @@ pub struct TableDef {
     /// byte-for-byte (wire key `ttl`).
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "ttl")]
     pub ttl: Option<TtlDef>,
+    /// Server-stamped update timestamp (FM-36): names a declared
+    /// `number`/`int64` field the server stamps with the current epoch-ms on
+    /// every version-bumping write — insert, patch, replace, upsert (both
+    /// branches), patchByQuery, and cascade setNull — overwriting any
+    /// client-supplied value (the `ownerField` authority model). Server-only
+    /// enforcement; the client only declares it. Additive — schemas without
+    /// it deserialize unchanged. Mirrors `server/src/schema.rs::TableDef`
+    /// byte-for-byte (wire key `updatedAtField`).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "updatedAtField"
+    )]
+    pub updated_at_field: Option<String>,
     /// Opt-in per-row authorization predicate (Model C). A general `FilterExpr`
     /// over this table's declared doc fields and the principal's markers
     /// (`{"$user":true}` / `{"$email":true}`). Enforced on the same
@@ -411,6 +425,7 @@ pub struct TableBuilder {
     owner_field: Option<String>,
     collaborators_field: Option<String>,
     ttl: Option<TtlDef>,
+    updated_at_field: Option<String>,
     authorize: Option<FilterExpr>,
     defaults: BTreeMap<String, serde_json::Value>,
     soft_delete: bool,
@@ -430,6 +445,7 @@ impl TableBuilder {
             owner_field: None,
             collaborators_field: None,
             ttl: None,
+            updated_at_field: None,
             authorize: None,
             defaults: BTreeMap::new(),
             soft_delete: false,
@@ -563,6 +579,18 @@ impl TableBuilder {
         self
     }
 
+    /// Declare a server-stamped update timestamp (FM-36). `field` names a
+    /// declared `number`/`int64` field the server stamps with the current
+    /// epoch-ms on every version-bumping write — insert, patch, replace,
+    /// upsert (both branches), patchByQuery, and cascade setNull —
+    /// overwriting any client-supplied value. Server-enforced on the live
+    /// server; the client only declares it and round-trips it on the wire
+    /// as `updatedAtField`.
+    pub fn updated_at_field(mut self, field: &str) -> Self {
+        self.updated_at_field = Some(field.into());
+        self
+    }
+
     /// Declare the per-row authorization predicate (Model C). `predicate` is a
     /// `FilterExpr` over this table's declared doc fields and the principal's
     /// markers (`{"$user":true}` / `{"$email":true}`). Enforced on the same
@@ -609,6 +637,7 @@ impl TableBuilder {
             owner_field: self.owner_field,
             collaborators_field: self.collaborators_field,
             ttl: self.ttl,
+            updated_at_field: self.updated_at_field,
             authorize: self.authorize,
             defaults: self.defaults,
             soft_delete: self.soft_delete,
@@ -1236,6 +1265,33 @@ mod tests {
         let legacy = json!({"fields": {"title": {"type": "string"}}});
         let from_legacy: TableDef = serde_json::from_value(legacy).unwrap();
         assert!(!from_legacy.soft_delete);
+    }
+
+    #[test]
+    fn updated_at_field_serializes_and_round_trips() {
+        // FM-36: `updatedAtField` is an opt-in table-level hint — present on
+        // the wire (camelCase) when set, omitted entirely when absent, mirroring
+        // `server/src/schema.rs::TableDef` byte-for-byte. Stamping is
+        // server-only; the client only declares and round-trips it.
+        let td = Table::new()
+            .field("title", FieldType::String)
+            .field("updatedAt", FieldType::Number)
+            .index("by_title", &["title"])
+            .updated_at_field("updatedAt")
+            .finish();
+        let json = serde_json::to_value(&td).unwrap();
+        assert_eq!(json["updatedAtField"], "updatedAt");
+        // Round-trips back through the wire type.
+        let back: TableDef = serde_json::from_value(json).unwrap();
+        assert_eq!(back.updated_at_field.as_deref(), Some("updatedAt"));
+        // Absent -> omitted entirely (not serialized as null).
+        let none = Table::new().field("title", FieldType::String).finish();
+        assert!(
+            !serde_json::to_string(&none)
+                .unwrap()
+                .contains("updatedAtField"),
+            "updatedAtField must be omitted on the wire when unset"
+        );
     }
 
     #[test]

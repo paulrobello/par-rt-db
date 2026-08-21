@@ -1,0 +1,35 @@
+{
+  "name": "updated-at-field-overwritten-on-insert",
+  "$comment": "Server-stamped updatedAtField (FM-36): an insert supplying its own updatedAt value has it overwritten by the server's epoch-ms stamp. Determinism: the follow-up read filters updatedAt > 123 — a kept client value (123 > 123 is false) or an absent key would not match, so only a server stamp (wall-clock epoch-ms, far past 123) makes the row visible. The stamped value itself is generated, so it is normalized out of the expected doc.",
+  "schema": {
+    "tables": {
+      "tasks": {
+        "fields": {
+          "title": { "type": "string" },
+          "updatedAt": { "type": "number" }
+        },
+        "indexes": [{ "name": "by_title", "fields": ["title"] }],
+        "updatedAtField": "updatedAt"
+      }
+    }
+  },
+  "seed": [],
+  "op": {
+    "txn": {
+      "steps": [
+        { "op": "insert", "table": "tasks", "doc": { "title": "a", "updatedAt": 123 } }
+      ]
+    }
+  },
+  "expect": [{}],
+  "normalize": ["_id", "_creationTime", "_version", "id"],
+  "then": {
+    "query": {
+      "table": "tasks",
+      "filter": { "op": "gt", "field": "updatedAt", "value": 123 }
+    },
+    "expect": [{ "title": "a" }],
+    "normalize": ["_id", "_creationTime", "_version", "updatedAt"],
+    "unordered": true
+  }
+}

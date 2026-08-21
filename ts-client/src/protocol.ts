@@ -573,6 +573,15 @@ export interface TableJson {
    * at insert time when the document omits it. Server-enforced; clients only
    * declare it. Omitted on the wire when unset. */
   ttl?: TtlDef;
+  /** Opt-in server-stamped last-write time (FM-36): names a declared
+   * `number` or `int64` field the server stamps with the current epoch-ms on
+   * every version-bumping write (insert, patch, replace, upsert both
+   * branches, patchByQuery, cascade setNull), overwriting any client-supplied
+   * value — a JSON number on `number`, a decimal string on `int64` (the int64
+   * wire convention). Must differ from `ttl.field`. No index required.
+   * Server-enforced; clients only declare it. Omitted on the wire when
+   * unset. */
+  updatedAtField?: string;
   /** Opt-in per-row authorization predicate (Model C). A general `FilterExpr`
    * over this table's declared doc fields and the principal's markers
    * (`{"$user":true}` / `{"$email":true}`). Enforced on the same

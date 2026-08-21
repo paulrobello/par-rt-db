@@ -613,6 +613,30 @@ function stampTtlDefault(
   return doc;
 }
 
+/** Stamps the table's `updatedAtField` (FM-36) with the current epoch-ms,
+ * overwriting any client-supplied value — the same authority model as
+ * `stampTtlDefault`. Runs on every version-bumping write path: insert, patch,
+ * replace, upsert (both branches), patchByQuery, and cascade setNull. On the
+ * patch-shaped paths the stamp rides INSIDE the patch payload (applied before
+ * `applyPatch`), so a client-supplied value is replaced before validation
+ * ever sees it. The value matches the field's wire convention: a JSON number
+ * on `number`, a decimal string on `int64`. Mirrors server
+ * `txn::stamp_updated_at`; returns the same `target` reference when the table
+ * declares no `updatedAtField`, otherwise a shallow copy with the field set. */
+function stampUpdatedAt(
+  table: TableJson,
+  target: Record<string, unknown>,
+  now: number,
+): Record<string, unknown> {
+  const field = table.updatedAtField;
+  if (field === undefined) {
+    return target;
+  }
+  const out: Record<string, unknown> = { ...target };
+  out[field] = table.fields[field]?.type === "int64" ? String(now) : now;
+  return out;
+}
+
 /** Applies the table's push-time-validated `defaults` (FM-32) to a NEW
  * document: every key the doc omits is stamped from the schema. Runs after
  * `stampTtlDefault` (a ttl default on the same field wins — it stamped the key
@@ -1477,7 +1501,12 @@ export class InMemoryRtDbClient {
           return { result: { id, inserted: true }, table };
         }
         const row = rows[0];
-        const merged = applyPatch(tableDef, row.doc, step.patch);
+        // FM-36: upsert-update stamps the patch payload like `patch` does.
+        const merged = applyPatch(
+          tableDef,
+          row.doc,
+          stampUpdatedAt(tableDef, step.patch, this.now()),
+        );
         this.doUpdate(table, tableDef, row, merged);
         return { result: { id: row.id, inserted: false }, table };
       }
@@ -1485,7 +1514,13 @@ export class InMemoryRtDbClient {
         const tableDef = this.requireTable(table);
         const { rows, truncated } = this.scanByQuery(tableDef, table, step.filter, step.limit);
         for (const row of rows) {
-          const merged = applyPatch(tableDef, row.doc, step.patch);
+          // FM-36: stamp per matched row with a fresh clock read, like the
+          // server's per-row `now_ms()` in `step_patch_by_query`.
+          const merged = applyPatch(
+            tableDef,
+            row.doc,
+            stampUpdatedAt(tableDef, step.patch, this.now()),
+          );
           this.doUpdate(table, tableDef, row, merged);
         }
         return { result: { patched: rows.length, truncated }, table };
@@ -1519,7 +1554,11 @@ export class InMemoryRtDbClient {
   }
 
   private doInsert(tableName: string, tableDef: TableJson, doc: Record<string, unknown>): string {
-    const stamped = applyDefaults(tableDef, stampTtlDefault(tableDef, doc, this.now()));
+    // Server `step_insert` order: ttl default → updatedAt stamp → defaults.
+    const stamped = applyDefaults(
+      tableDef,
+      stampUpdatedAt(tableDef, stampTtlDefault(tableDef, doc, this.now()), this.now()),
+    );
     validateDoc(tableDef, stamped);
     const stored = stripUnsetOptionals(tableDef, stamped);
     this.checkUniqueIndexes(tableName, tableDef, stored);
@@ -1535,7 +1574,9 @@ export class InMemoryRtDbClient {
     fields: Record<string, unknown>,
   ): void {
     const row = this.requireRow(tableName, id);
-    const merged = applyPatch(tableDef, row.doc, fields);
+    // FM-36: the updatedAt stamp rides inside the patch payload (server
+    // `step_patch`), overwriting any client-supplied value pre-merge.
+    const merged = applyPatch(tableDef, row.doc, stampUpdatedAt(tableDef, fields, this.now()));
     this.doUpdate(tableName, tableDef, row, merged);
   }
 
@@ -1546,7 +1587,9 @@ export class InMemoryRtDbClient {
     doc: Record<string, unknown>,
   ): void {
     const row = this.requireRow(tableName, id);
-    const stamped = applyDefaults(tableDef, doc);
+    // Server `step_replace` order: defaults → updatedAt stamp (the stamp wins
+    // over a defaults entry on the same field).
+    const stamped = stampUpdatedAt(tableDef, applyDefaults(tableDef, doc), this.now());
     validateDoc(tableDef, stamped);
     const stored = stripUnsetOptionals(tableDef, stamped);
     this.checkUniqueIndexes(tableName, tableDef, stored, row.id);
@@ -1669,7 +1712,13 @@ export class InMemoryRtDbClient {
             ctx.rows++;
             const childRow = this.rowsFor(childTableName).get(childId);
             if (!childRow) continue; // visibleChildIds returns only live rows
-            const merged = applyPatch(childTableDef, childRow.doc, { [fieldName]: null });
+            // FM-36: the setNull patch carries the CHILD table's updatedAt
+            // stamp (server `delete_row_cascade`).
+            const merged = applyPatch(
+              childTableDef,
+              childRow.doc,
+              stampUpdatedAt(childTableDef, { [fieldName]: null }, this.now()),
+            );
             this.doUpdate(childTableName, childTableDef, childRow, merged);
             ctx.touched.add(childTableName);
           }

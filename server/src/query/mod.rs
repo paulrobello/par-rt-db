@@ -657,6 +657,7 @@ mod tests {
             owner_field: None,
             collaborators_field: None,
             ttl: None,
+            updated_at_field: None,
             authorize: None,
 
             soft_delete: false,
@@ -677,6 +678,7 @@ mod tests {
             owner_field: None,
             collaborators_field: None,
             ttl: None,
+            updated_at_field: None,
             authorize: None,
 
             soft_delete: false,
@@ -759,6 +761,7 @@ mod tests {
             owner_field: None,
             collaborators_field: None,
             ttl: None,
+            updated_at_field: None,
             authorize: None,
 
             soft_delete: false,

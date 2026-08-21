@@ -181,6 +181,9 @@ export function SchemaPage() {
                   <h2 className={s.tableName}>{name}</h2>
                   {table.softDelete && <span className={s.owner}>soft delete</span>}
                   {table.ownerField && <span className={s.owner}>owner: {table.ownerField}</span>}
+                  {table.updatedAtField && (
+                    <span className={s.owner}>updatedAt: {table.updatedAtField}</span>
+                  )}
                 </div>
                 <table className={s.fields}>
                   <tbody>

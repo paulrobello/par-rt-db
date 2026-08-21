@@ -135,6 +135,251 @@ struct InMemoryTests {
         #expect(doc.objectValue?["priority"] == .int(5))
     }
 
+    // MARK: updatedAtField (FM-36)
+
+    /// Epoch-ms floor: any real stamp is far past this, so a stamped value is
+    /// distinguishable from every client-supplied literal used below.
+    private let ancient: Int64 = 1_000_000_000_000
+
+    /// Client with a monotonically increasing clock (each `now` call +1), so
+    /// every later stamp is strictly greater than every earlier one — the
+    /// engine-level stand-in for the server tests' `tick()` sleeps.
+    private func monotonicClient() -> InMemoryRtDbClient {
+        let clock = MonotonicMs(1_700_000_000_000)
+        return InMemoryRtDbClient(options: InMemoryRtDbClientOptions(
+            now: { clock.next() },
+            random: { 0 }
+        ))
+    }
+
+    private func updatedAtSchema(_ fieldType: FieldType) throws -> SchemaDef {
+        try SchemaBuilder()
+            .table("tasks") {
+                $0.field("title", .string)
+                    .field("updatedAt", fieldType)
+                    .index("by_title", on: ["title"])
+                    .updatedAtField("updatedAt")
+            }
+            .build()
+    }
+
+    private func insertTask(
+        _ client: InMemoryRtDbClient, _ doc: [String: JSONValue]
+    ) throws -> String {
+        let results = try client.mutate(Transaction(steps: [
+            .insert(table: "tasks", doc: doc)
+        ]))
+        guard case let .insert(id) = results[0] else {
+            throw RtDbError(code: .internal, message: "expected insert result")
+        }
+        return id
+    }
+
+    private func stampedNumber(_ doc: JSONValue) -> Int64 {
+        guard case let .int(stamped)? = doc.objectValue?["updatedAt"] else {
+            Issue.record("expected numeric updatedAt stamp")
+            return -1
+        }
+        return stamped
+    }
+
+    @Test func pushRejectsUndeclaredUpdatedAtField() throws {
+        let schema = try SchemaBuilder()
+            .table("tasks") {
+                $0.field("title", .string)
+                    .field("updatedAt", .number)
+                    .index("by_title", on: ["title"])
+                    .updatedAtField("nope")
+            }
+            .build()
+        try expectPushError(schema, "updatedAtField 'nope' is not a declared field")
+    }
+
+    @Test func pushRejectsNonNumericUpdatedAtField() throws {
+        let schema = try updatedAtSchema(.string)
+        try expectPushError(schema, "updatedAtField 'updatedAt' must be a number or bigint field")
+    }
+
+    @Test func pushRejectsUpdatedAtFieldMatchingTtlField() throws {
+        let schema = try SchemaBuilder()
+            .table("sessions") {
+                $0.field("token", .string)
+                    .field("expiresAt", .number)
+                    .index("by_token", on: ["token"])
+                    .index("by_expiresAt", on: ["expiresAt"])
+                    .ttl("expiresAt")
+                    .updatedAtField("expiresAt")
+            }
+            .build()
+        try expectPushError(schema, "must differ from ttl.field")
+    }
+
+    private func expectPushError(_ schema: SchemaDef, _ fragment: String) throws {
+        do {
+            try deterministicClient().pushSchema(schema)
+            Issue.record("expected pushSchema failure containing '\(fragment)'")
+        } catch let error as RtDbError {
+            #expect(error.message.contains(fragment))
+        }
+    }
+
+    @Test func insertStampsUpdatedAtOverwritingClientValue() throws {
+        let client = monotonicClient()
+        try client.pushSchema(updatedAtSchema(.number))
+        let id = try insertTask(client, ["title": .string("A"), "updatedAt": .int(123)])
+        let doc = try client.query(Query(table: "tasks", get: id))
+        let stamped = stampedNumber(doc)
+        #expect(stamped > ancient)
+    }
+
+    @Test func insertStampsInt64UpdatedAtAsDecimalString() throws {
+        let client = monotonicClient()
+        try client.pushSchema(updatedAtSchema(.int64))
+        let id = try insertTask(client, ["title": .string("A")])
+        let doc = try client.query(Query(table: "tasks", get: id))
+        // int64 fields hold decimal strings end to end (wire convention)
+        guard case let .string(text) = doc.objectValue?["updatedAt"], let stamped = Int64(text)
+        else {
+            Issue.record("expected int64 updatedAt stamp as a decimal string")
+            return
+        }
+        #expect(stamped > ancient)
+    }
+
+    @Test func patchRestampsOverwritingClientValue() throws {
+        let client = monotonicClient()
+        try client.pushSchema(updatedAtSchema(.number))
+        let id = try insertTask(client, ["title": .string("A")])
+        let first = try stampedNumber(client.query(Query(table: "tasks", get: id)))
+
+        try client.mutate(Transaction(steps: [
+            .patch(table: "tasks", id: id, fields: ["title": .string("B"), "updatedAt": .int(1)])
+        ]))
+        let doc = try client.query(Query(table: "tasks", get: id))
+        #expect(stampedNumber(doc) > first)
+        #expect(doc.objectValue?["title"] == .string("B"))
+    }
+
+    @Test func replaceRestamps() throws {
+        let client = monotonicClient()
+        try client.pushSchema(updatedAtSchema(.number))
+        let id = try insertTask(client, ["title": .string("A")])
+        let first = try stampedNumber(client.query(Query(table: "tasks", get: id)))
+
+        try client.mutate(Transaction(steps: [
+            .replace(table: "tasks", id: id, doc: ["title": .string("A2"), "updatedAt": .int(7)])
+        ]))
+        #expect(try stampedNumber(client.query(Query(table: "tasks", get: id))) > first)
+    }
+
+    @Test func upsertInsertStampsAndUpdateRestamps() throws {
+        let client = monotonicClient()
+        try client.pushSchema(updatedAtSchema(.number))
+        let results = try client.mutate(Transaction(steps: [
+            .upsert(
+                table: "tasks", index: "by_title", eq: [.string("A")],
+                insert: ["title": .string("A"), "updatedAt": .int(9)],
+                patch: [:]
+            )
+        ]))
+        guard case let .upsert(id, inserted) = results[0], inserted else {
+            Issue.record("expected upsert-insert result")
+            return
+        }
+        let first = try stampedNumber(client.query(Query(table: "tasks", get: id)))
+        #expect(first > ancient)
+
+        try client.mutate(Transaction(steps: [
+            .upsert(
+                table: "tasks", index: "by_title", eq: [.string("A")],
+                insert: ["title": .string("A")],
+                patch: ["title": .string("A3"), "updatedAt": .int(5)]
+            )
+        ]))
+        #expect(try stampedNumber(client.query(Query(table: "tasks", get: id))) > first)
+    }
+
+    @Test func patchByQueryRestamps() throws {
+        let client = monotonicClient()
+        try client.pushSchema(updatedAtSchema(.number))
+        let id = try insertTask(client, ["title": .string("A")])
+        let first = try stampedNumber(client.query(Query(table: "tasks", get: id)))
+
+        try client.mutate(Transaction(steps: [
+            .patchByQuery(
+                table: "tasks",
+                filter: .eq(field: "title", value: .string("A")),
+                patch: ["updatedAt": .int(3)],
+                limit: nil
+            )
+        ]))
+        #expect(try stampedNumber(client.query(Query(table: "tasks", get: id))) > first)
+    }
+
+    @Test func cascadeSetNullRestampsChild() throws {
+        let client = monotonicClient()
+        try client.pushSchema(
+            SchemaBuilder()
+                .table("parents") {
+                    $0.field("name", .string)
+                        .index("by_name", on: ["name"])
+                }
+                .table("children") {
+                    $0.field("parentId", .optional(.id("parents").onDelete(.setNull)))
+                        .field("title", .string)
+                        .field("updatedAt", .number)
+                        .index("by_parentId", on: ["parentId"])
+                        .updatedAtField("updatedAt")
+                }
+                .build()
+        )
+        let results = try client.mutate(Transaction(steps: [
+            .insert(table: "parents", doc: ["name": .string("P")])
+        ]))
+        guard case let .insert(parent) = results[0] else {
+            Issue.record("expected parent insert result")
+            return
+        }
+        let childResults = try client.mutate(Transaction(steps: [
+            .insert(
+                table: "children",
+                doc: ["parentId": .string(parent), "title": .string("C")]
+            )
+        ]))
+        guard case let .insert(child) = childResults[0] else {
+            Issue.record("expected child insert result")
+            return
+        }
+        let childQuery = { try client.query(Query(table: "children", get: child)) }
+        let first = try stampedNumber(childQuery())
+
+        try client.mutate(Transaction(steps: [
+            .delete(table: "parents", id: parent)
+        ]))
+        let doc = try childQuery()
+        #expect(doc.objectValue?["parentId"] == nil)
+        #expect(stampedNumber(doc) > first)
+    }
+
+    @Test func updatedAtStampWinsOverDefaultsEntry() throws {
+        let client = monotonicClient()
+        try client.pushSchema(
+            SchemaBuilder()
+                .table("tasks") {
+                    $0.field("title", .string)
+                        .field("updatedAt", .number)
+                        .index("by_title", on: ["title"])
+                        .updatedAtField("updatedAt")
+                        .defaults(["updatedAt": .int(12345)])
+                }
+                .build()
+        )
+        let id = try insertTask(client, ["title": .string("A")])
+        let stamped = try stampedNumber(client.query(Query(table: "tasks", get: id)))
+        #expect(stamped > ancient)
+        #expect(stamped != 12345)
+    }
+
     @Test func insertRejectsReservedAndUnknownFields() throws {
         let client = deterministicClient()
         try client.pushSchema(itemsSchema())

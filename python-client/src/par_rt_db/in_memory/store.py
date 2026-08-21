@@ -737,6 +737,23 @@ def _apply_defaults(table: TableDef, doc: dict[str, Any]) -> None:
             doc[field] = deepcopy(value)
 
 
+def _stamp_updated_at(table_def: TableDef, target: dict[str, Any], now: int) -> dict[str, Any]:
+    """FM-36: stamp the table's ``updatedAtField`` with ``now`` (epoch ms),
+    overwriting any client-supplied value — the same authority family as the
+    ttl ``defaultDurationMs`` stamp. Mirrors server ``txn::stamp_updated_at``
+    and runs at the same seams, on every version-bumping write path: insert,
+    patch, replace, upsert (both branches), patchByQuery, and cascade setNull
+    (stamped onto the CHILD table's def). The value follows the field's wire
+    convention: a JSON number on a ``number`` field, a decimal string on an
+    ``int64`` field. Returns a NEW dict — the incoming doc/fields belong to
+    the caller's step and are never mutated."""
+    field = table_def.updated_at_field
+    if field is None:
+        return target
+    value: Any = str(now) if isinstance(table_def.fields.get(field), _FInt64) else now
+    return {**target, field: value}
+
+
 def _optional_rejects_null(ty: Any) -> bool:
     """``True`` iff ``ty`` is an ``Optional`` whose inner type does not itself
     accept ``None`` (so a null value should be stripped to "key absent")."""
@@ -817,12 +834,14 @@ def _index_column_type(ty: Any) -> _IndexedType:
 
 
 def _validate_schema(schema: SchemaDef) -> None:
-    """Push-time schema validation — the TTL and index-field rules of server
-    ``schema.rs::validate`` (``validate_indexes`` + ``validate_ttl``), mirroring
-    the rust harness's ``SchemaDef::validate`` and the TS ``validateSchema``:
-    index fields must be declared and indexable, search indexes must cover text
-    fields, and a TTL must name a numeric field carrying a single-field,
-    non-unique, non-partial btree index. Deliberately a subset — identifier
+    """Push-time schema validation — the TTL, ``updatedAtField``, and
+    index-field rules of server ``schema.rs::validate`` (``validate_indexes`` +
+    ``validate_ttl`` + ``validate_updated_at``), mirroring the rust harness's
+    ``SchemaDef::validate`` and the TS ``validateSchema``: index fields must be
+    declared and indexable, search indexes must cover text fields, a TTL must
+    name a numeric field carrying a single-field, non-unique, non-partial
+    btree index, and an ``updatedAtField`` must be a declared number/int64
+    field distinct from ``ttl.field``. Deliberately a subset — identifier
     formats, owner/collaborator fields, defaults, and ``onDelete`` shapes stay
     server-side (the last has its own ``_validate_on_delete`` pass)."""
     for table_name, table in schema.tables.items():
@@ -884,6 +903,32 @@ def _validate_schema(schema: SchemaDef) -> None:
                 raise RtDbError(
                     ErrorCode.SCHEMA_VIOLATION,
                     "ttl.defaultDurationMs must be greater than 0",
+                )
+        # FM-36: `updatedAtField` names a declared number/int64 field (the
+        # stamp is an epoch-ms number — a decimal string on an int64 field)
+        # distinct from `ttl.field` (both stamps write unconditionally, so a
+        # shared field would silently drop the expiry). No index required:
+        # the stamp never queries the field (server `validate_updated_at`;
+        # the identifier-format check stays server-side like the other
+        # identifier rules).
+        updated_at = table.updated_at_field
+        if updated_at is not None:
+            updated_at_ty = table.fields.get(updated_at)
+            if updated_at_ty is None:
+                raise RtDbError(
+                    ErrorCode.SCHEMA_VIOLATION,
+                    f"updatedAtField '{updated_at}' is not a declared field",
+                )
+            if not isinstance(updated_at_ty, _FNumber | _FInt64):
+                raise RtDbError(
+                    ErrorCode.SCHEMA_VIOLATION,
+                    f"updatedAtField '{updated_at}' must be a number or bigint field",
+                )
+            if ttl is not None and ttl.field == updated_at:
+                raise RtDbError(
+                    ErrorCode.SCHEMA_VIOLATION,
+                    f"updatedAtField '{updated_at}' must differ from ttl.field (both stamps"
+                    " write unconditionally; a shared field would drop the expiry)",
                 )
 
 
@@ -1283,7 +1328,15 @@ class _InMemoryStoreCore:
                     )
                 if rows:
                     row = rows[0]
-                    merged = apply_patch(table_def, row.doc, patch_fields)
+                    # FM-36: the update branch stamps the patch fields before
+                    # the merge (server `step_upsert`), so an upsert that never
+                    # mentions the field still restamps, and a client-supplied
+                    # value is overwritten.
+                    merged = apply_patch(
+                        table_def,
+                        row.doc,
+                        _stamp_updated_at(table_def, patch_fields, self._now()),
+                    )
                     self._do_update(table_def, table, row.id, merged)
                     return _upsert_result(row.id, False), {table}
                 new_id = self._do_insert(table, table_def, insert_doc)
@@ -1307,7 +1360,13 @@ class _InMemoryStoreCore:
                 truncated = len(matched) > limit
                 take = matched[:limit]
                 for row in take:
-                    merged = apply_patch(table_def, row.doc, patch_fields)
+                    # FM-36: stamp per row with a fresh `now` (server
+                    # `step_patch_by_query`), exactly like a per-id patch.
+                    merged = apply_patch(
+                        table_def,
+                        row.doc,
+                        _stamp_updated_at(table_def, patch_fields, self._now()),
+                    )
                     self._do_update(table_def, table, row.id, merged)
                 return _patch_by_query_result(len(take), truncated), {table}
             case _DeleteByQuery(table=table, filter=flt, limit=limit_opt):
@@ -1384,6 +1443,12 @@ class _InMemoryStoreCore:
         ttl = table_def.ttl
         if ttl is not None and ttl.default_duration_ms is not None and ttl.field not in doc:
             doc[ttl.field] = self._now() + ttl.default_duration_ms
+        # FM-36: the updatedAt stamp sits between the ttl default and the
+        # FM-32 defaults (server `step_insert` order): it overwrites any
+        # client-supplied value, a `defaults` entry on the same field loses
+        # (the key is already present when defaults run), and it runs before
+        # validation so a required updatedAt field is populated.
+        doc = _stamp_updated_at(table_def, doc, self._now())
         # FM-32: after the ttl stamp (a ttl default on the same field wins),
         # before validation — so a default can populate a required field.
         _apply_defaults(table_def, doc)
@@ -1408,7 +1473,11 @@ class _InMemoryStoreCore:
         # FM-33: a soft-deleted row is absent to every write lookup.
         if row is None or not _is_live(row):
             raise RtDbError(ErrorCode.NOT_FOUND, f"document '{sid}' not found")
-        merged = apply_patch(table_def, row.doc, fields)
+        # FM-36: stamp the patch fields before the merge (server `step_patch`)
+        # — a patch that never mentions the field still restamps, and a
+        # client-supplied value is overwritten. Before `apply_patch`'s whole-
+        # doc validation, so a legacy doc missing the field re-populates.
+        merged = apply_patch(table_def, row.doc, _stamp_updated_at(table_def, fields, self._now()))
         self._do_update(table_def, table_name, sid, merged)
 
     def _do_replace(
@@ -1424,8 +1493,11 @@ class _InMemoryStoreCore:
         if row is None or not _is_live(row):
             raise RtDbError(ErrorCode.NOT_FOUND, f"document '{sid}' not found")
         # Replace writes a whole NEW document, so defaults apply (FM-32) —
-        # unlike patch, clearing a field then replacing re-stamps it.
+        # unlike patch, clearing a field then replacing re-stamps it. The
+        # FM-36 stamp runs after defaults (server `step_replace` order), so a
+        # `defaults` entry on the stamped field still loses.
         _apply_defaults(table_def, doc)
+        doc = _stamp_updated_at(table_def, doc, self._now())
         validate_doc(table_def, doc)
         stored = _strip_unset_optionals(table_def, doc)
         self._check_unique_indexes(table_def, table_name, stored, sid)
@@ -1553,9 +1625,16 @@ class _InMemoryStoreCore:
                         # Written as a fresh row (not _do_patch/_do_update, which
                         # mutate in place) so a later cascade failure rolls the
                         # null back with the txn snapshot — every cascade write
-                        # is snapshot-rollback-safe.
+                        # is snapshot-rollback-safe. FM-36: the CHILD table's
+                        # updatedAtField joins the null patch (server
+                        # `delete_row_cascade`) — setNull is a version-bumping
+                        # write, so the child restamps.
                         child_row = self._docs[(child_table_name, child_id)]
-                        merged = apply_patch(child_table_def, child_row.doc, {field_name: None})
+                        merged = apply_patch(
+                            child_table_def,
+                            child_row.doc,
+                            _stamp_updated_at(child_table_def, {field_name: None}, self._now()),
+                        )
                         self._docs[(child_table_name, child_id)] = replace(
                             child_row, doc=merged, version=child_row.version + 1
                         )

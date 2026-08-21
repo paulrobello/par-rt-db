@@ -585,14 +585,16 @@ pub(super) fn detect_destructive_changes(
     Ok(())
 }
 
-/// Push-time schema validation — the TTL and index-field rules of server
-/// `schema::validate` (`schema.rs::validate_indexes` + `validate_ttl`), so an
+/// Push-time schema validation — the TTL, `updatedAtField`, and index-field
+/// rules of server `schema::validate` (`schema.rs::validate_indexes` +
+/// `validate_ttl` + `validate_updated_at`), so an
 /// in-memory `push_schema` rejects with `SCHEMA_VIOLATION` what the live
 /// server 422s: index fields must be declared and indexable, search indexes
-/// must cover text fields, and a TTL must name a numeric field carrying a
-/// single-field, non-unique, non-partial btree index. This is deliberately a
-/// subset — identifier formats, owner/collaborator fields, defaults, and
-/// `onDelete` shapes stay server-side.
+/// must cover text fields, a TTL must name a numeric field carrying a
+/// single-field, non-unique, non-partial btree index, and `updatedAtField`
+/// must name a declared number/int64 field distinct from `ttl.field`. This is
+/// deliberately a subset — identifier formats, owner/collaborator fields,
+/// defaults, and `onDelete` shapes stay server-side.
 impl SchemaDef {
     /// Validates TTL and index-field rules (see the impl docs) — called by
     /// [`InMemoryRtDbClient::push_schema`] before the destructive-change check.
@@ -670,6 +672,34 @@ impl SchemaDef {
                     return Err(RtDbError::new(
                         ErrorCode::SchemaViolation,
                         "ttl.defaultDurationMs must be greater than 0".to_string(),
+                    ));
+                }
+            }
+            // `updatedAtField` (FM-36) push validation — the same rules as the
+            // server's `validate_updated_at` minus the identifier-format check
+            // (identifier formats stay server-side, like the rest of this
+            // subset): the field must be declared numeric and differ from
+            // `ttl.field` (both stamps write unconditionally; a shared field
+            // would silently drop the expiry).
+            if let Some(field) = &table.updated_at_field {
+                let fty = table.fields.get(field).ok_or_else(|| {
+                    RtDbError::new(
+                        ErrorCode::SchemaViolation,
+                        format!("updatedAtField '{field}' is not a declared field"),
+                    )
+                })?;
+                if !matches!(fty, FieldType::Number | FieldType::Int64) {
+                    return Err(RtDbError::new(
+                        ErrorCode::SchemaViolation,
+                        format!("updatedAtField '{field}' must be a number or bigint field"),
+                    ));
+                }
+                if table.ttl.as_ref().is_some_and(|ttl| &ttl.field == field) {
+                    return Err(RtDbError::new(
+                        ErrorCode::SchemaViolation,
+                        format!(
+                            "updatedAtField '{field}' must differ from ttl.field (both stamps write unconditionally; a shared field would drop the expiry)"
+                        ),
                     ));
                 }
             }

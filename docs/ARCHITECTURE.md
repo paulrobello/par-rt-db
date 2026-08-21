@@ -271,6 +271,20 @@ graph LR
   `defaultDurationMs` stamp and the principal stamps (`ownerField`, authorize
   `$user`) winning over a defaults entry on the same field; migrate
   `renameField` re-keys the map and `dropField`/`changeType` drop entries.
+- **Server-stamped `updatedAtField`** (FM-36): a table may name a declared
+  `number`/`int64` field (additive wire key, omitted when unset;
+  push-validated — declared, numeric, and distinct from `ttl.field`) that the
+  server stamps with the current epoch-ms on every version-bumping write:
+  insert, patch, replace, upsert (both branches), patchByQuery, and cascade
+  `setNull`, overwriting any client-supplied value (the `ownerField` authority
+  model). The stamp's value form follows the field's wire convention — a JSON
+  number on `number`, a decimal string on `int64` — and it wins over a
+  `defaults` entry on the same field (same authority family as the ttl
+  default). It sits in the doc body and, when the field is indexed, the typed
+  column — so it is orderable with a declared index. Deliberately NOT stamped:
+  snapshot replay (`insert_snapshot_row` preserves the stored value verbatim)
+  and the anon→real merge restamp (an administrative ownership rewrite, not a
+  content write).
 - **Cascade delete + soft delete** (FM-33): an `id` field may declare
   `onDelete: cascade|restrict|setNull` (legal top-level or one `optional`
   deep) and a table may declare `softDelete` — both enforced **in the app layer

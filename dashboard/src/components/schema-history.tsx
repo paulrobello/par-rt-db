@@ -312,6 +312,9 @@ export function SchemaVersionDetail({ client, db, version, onRestored }: SchemaV
                 <div className={s.tableHead}>
                   <h3 className={s.tableName}>{name}</h3>
                   {table.ownerField && <span className={s.owner}>owner: {table.ownerField}</span>}
+                  {table.updatedAtField && (
+                    <span className={s.owner}>updatedAt: {table.updatedAtField}</span>
+                  )}
                 </div>
                 <table className={s.fields}>
                   <tbody>

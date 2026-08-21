@@ -253,10 +253,12 @@ let schema = SchemaBuilder()
             .field("project", .id("projects"))
             .field("assignee", .string)
             .field("expiresAt", .number)
+            .field("updatedAt", .number)
             .index("by_done", on: ["done"])
             .index("by_project", on: ["project"])
             .index("by_expires_at", on: ["expiresAt"])   // ttl requires an index on its field
             .ttl("expiresAt", defaultDurationMs: 3_600_000)
+            .updatedAtField("updatedAt")   // server stamps epoch-ms on every write
             .ownerField("assignee")
             .softDelete()
     }
@@ -270,8 +272,10 @@ The full `FieldType` set is supported (15 variants — including `int64`, `bytes
 `any`, `record`, `vector`, `literal`, `union`, `array`, `object`), plus search
 indexes (`searchIndex(_:on:language:)`), vector indexes
 (`vectorIndex(_:on:dimensions:filterFields:metric:)`), partial indexes
-(`whereClause(_:)`), `collaboratorsField`, `authorize(_:)`, `defaults(_:)`, and
-`onDelete` on id fields (`.id("projects").onDelete(.cascade)`).
+(`whereClause(_:)`), `collaboratorsField`, `authorize(_:)`, `defaults(_:)`,
+`updatedAtField(_:)` (server stamps the named `number`/`int64` field with
+epoch-ms on every write, overwriting any client value), and `onDelete` on id
+fields (`.id("projects").onDelete(.cascade)`).
 
 ## Storage
 
@@ -392,7 +396,7 @@ let result = try await retryOnPrecondition {
 | Wire types — fifth implementation of the contract | ✅ (+ `wire-corpus.json` parity runner, ARC-008) |
 | Query DSL — every terminal incl. `search`/`vectorSearch`/`hybridSearch`/`paginate`/`aggregate`/`distinct` | ✅ |
 | Mutation DSL — all 14 step ops, recursive step-cap enforcement | ✅ |
-| Schema DSL — 15 field types, btree/search/vector/unique/partial indexes, `ownerField`/`collaboratorsField`/`authorize`, `ttl`, `defaults`, `softDelete`, `onDelete` | ✅ |
+| Schema DSL — 15 field types, btree/search/vector/unique/partial indexes, `ownerField`/`collaboratorsField`/`authorize`, `ttl`, `updatedAtField`, `defaults`, `softDelete`, `onDelete` | ✅ |
 | HTTP client — query/query-batch/mutate (+ idempotency key, retry helper), schedule ops, workflow ops, full storage surface, `pushSchema`/`previewSchema`, `authMe` | ✅ |
 | WS client — auth/reconnect/heartbeat, shared subscriptions with replay, mutate-over-WS, schedule + workflow ops | ✅ |
 | Presence (ENH-015) — `presence(room:state:)` / `updatePresence(room:state:ttlMs:)` / `leavePresence(room:)`, `PresenceSnapshot` fan-out, reconnect replay of joined rooms | ✅ |

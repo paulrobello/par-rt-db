@@ -128,14 +128,14 @@ export function detectDestructiveChanges(oldSchema: SchemaJson, newSchema: Schem
   }
 }
 
-/** Push-time schema validation — the TTL and index-field rules of server
- *  `schema::validate` (`schema::validate_indexes` + `validate_ttl`), mirroring
- *  the rust harness's `SchemaDef::validate`: index fields must be declared and
- *  indexable, search indexes must cover text fields, and a TTL must name a
- *  numeric field carrying a single-field, non-unique, non-partial btree index.
- *  Deliberately a subset — identifier formats, owner/collaborator fields,
- *  defaults, and `onDelete` shapes stay server-side (the last has its own
- *  `validateOnDelete` pass). */
+/** Push-time schema validation — the TTL, updatedAtField, and index-field rules
+ *  of server `schema::validate` (`schema::validate_indexes` + `validate_ttl` +
+ *  `validate_updated_at`), mirroring the rust harness's `SchemaDef::validate`:
+ *  index fields must be declared and indexable, search indexes must cover text
+ *  fields, and a TTL must name a numeric field carrying a single-field,
+ *  non-unique, non-partial btree index. Deliberately a subset — identifier
+ *  formats, owner/collaborator fields, defaults, and `onDelete` shapes stay
+ *  server-side (the last has its own `validateOnDelete` pass). */
 export function validateSchema(schema: SchemaJson): void {
   for (const [tableName, table] of Object.entries(schema.tables)) {
     for (const index of table.indexes ?? []) {
@@ -197,6 +197,35 @@ export function validateSchema(schema: SchemaJson): void {
       }
       if (ttl.defaultDurationMs != null && ttl.defaultDurationMs <= 0) {
         throw new RtDbError("SCHEMA_VIOLATION", "ttl.defaultDurationMs must be greater than 0");
+      }
+    }
+    // FM-36 `updatedAtField` push validation — mirrors server
+    // `schema::validate_updated_at` (minus the identifier-format check, which
+    // stays server-side like every other identifier rule here): the field must
+    // be declared numeric (the stamp is an epoch-ms number — a decimal string
+    // on `int64`, matching the int64 wire convention) and must differ from
+    // `ttl.field` (both stamps write unconditionally, so a shared field would
+    // silently drop the expiry). No index is required on the field.
+    const updatedAt = table.updatedAtField;
+    if (updatedAt !== undefined) {
+      const fieldType = table.fields[updatedAt];
+      if (!fieldType) {
+        throw new RtDbError(
+          "SCHEMA_VIOLATION",
+          `updatedAtField '${updatedAt}' is not a declared field`,
+        );
+      }
+      if (fieldType.type !== "number" && fieldType.type !== "int64") {
+        throw new RtDbError(
+          "SCHEMA_VIOLATION",
+          `updatedAtField '${updatedAt}' must be a number or bigint field`,
+        );
+      }
+      if (ttl !== undefined && ttl.field === updatedAt) {
+        throw new RtDbError(
+          "SCHEMA_VIOLATION",
+          `updatedAtField '${updatedAt}' must differ from ttl.field (both stamps write unconditionally; a shared field would drop the expiry)`,
+        );
       }
     }
   }

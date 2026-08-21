@@ -113,13 +113,14 @@ public func detectDestructiveChanges(_ oldSchema: SchemaDef, _ newSchema: Schema
 // MARK: - Push-time validation
 
 // swiftlint:disable cyclomatic_complexity function_body_length
-/// Push-time schema validation — the TTL and index-field rules of server
-/// `schema::validate` (migrate.ts `validateSchema`): index fields must be
-/// declared and indexable, search indexes must cover text fields, and a TTL
-/// must name a numeric field carrying a single-field, non-unique, non-partial
-/// btree index. Deliberately a subset — identifier formats, owner/
-/// collaborators fields, and `defaults` shapes stay server-side (`onDelete`
-/// has its own `validateOnDelete` pass).
+/// Push-time schema validation — the TTL, updatedAtField, and index-field
+/// rules of server `schema::validate` (migrate.ts `validateSchema`): index
+/// fields must be declared and indexable, search indexes must cover text
+/// fields, a TTL must name a numeric field carrying a single-field,
+/// non-unique, non-partial btree index, and an `updatedAtField` must name a
+/// declared numeric field differing from `ttl.field`. Deliberately a subset —
+/// identifier formats, owner/collaborators fields, and `defaults` shapes stay
+/// server-side (`onDelete` has its own `validateOnDelete` pass).
 public func validateSchema(_ schema: SchemaDef) throws {
     for (tableName, table) in schema.tables {
         for index in table.indexes ?? [] {
@@ -184,6 +185,28 @@ public func validateSchema(_ schema: SchemaDef) throws {
                 throw RtDbError(
                     code: .schemaViolation,
                     message: "ttl.defaultDurationMs must be greater than 0"
+                )
+            }
+        }
+        if let field = table.updatedAtField {
+            guard let fieldType = table.fields[field] else {
+                throw RtDbError(
+                    code: .schemaViolation,
+                    message: "updatedAtField '\(field)' is not a declared field"
+                )
+            }
+            let tag = fieldTypeTag(fieldType)
+            guard tag == "number" || tag == "int64" else {
+                throw RtDbError(
+                    code: .schemaViolation,
+                    message: "updatedAtField '\(field)' must be a number or bigint field"
+                )
+            }
+            if let ttl = table.ttl, ttl.field == field {
+                throw RtDbError(
+                    code: .schemaViolation,
+                    message: "updatedAtField '\(field)' must differ from ttl.field (both "
+                        + "stamps write unconditionally; a shared field would drop the expiry)"
                 )
             }
         }

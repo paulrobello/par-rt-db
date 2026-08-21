@@ -214,6 +214,19 @@ pub struct TableDef {
     /// deserialize unchanged. See `TtlDef`.
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "ttl")]
     pub ttl: Option<TtlDef>,
+    /// Server-stamped update timestamp (FM-36): names a declared
+    /// `number`/`int64` field the server stamps with the current epoch-ms on
+    /// every version-bumping write to the row — insert, patch, replace,
+    /// upsert-update, patchByQuery, and cascade setNull — overwriting any
+    /// client-supplied value (the `ownerField` authority model). Snapshot
+    /// import replays stored docs verbatim and never re-stamps. Additive —
+    /// schemas without it deserialize unchanged.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "updatedAtField"
+    )]
+    pub updated_at_field: Option<String>,
     /// Opt-in per-row authorization predicate (Model C). A general
     /// `FilterExpr` over this table's declared doc fields and the principal's
     /// markers (`{"$user":true}` / `{"$email":true}`). Enforced on the same
@@ -616,6 +629,7 @@ impl TableDef {
         }
         self.validate_indexes(table_name)?;
         self.validate_ttl()?;
+        self.validate_updated_at()?;
         self.validate_defaults(table_name)?;
         self.validate_on_delete(table_name)?;
         Ok(())
@@ -862,6 +876,36 @@ impl TableDef {
                 return Err(RtDbError::schema(
                     "ttl.defaultDurationMs must be greater than 0".to_string(),
                 ));
+            }
+        }
+        Ok(())
+    }
+
+    /// `updatedAtField` push validation: the field must be declared with a
+    /// numeric type (the stamp is an epoch-ms number — a decimal string on an
+    /// `int64` field, matching the int64 wire convention) and must differ
+    /// from `ttl.field` (both stamps write unconditionally, so a shared field
+    /// would silently drop the expiry). No index is required: the stamp never
+    /// queries the field, it is indexable like any other numeric field.
+    fn validate_updated_at(&self) -> Result<(), RtDbError> {
+        if let Some(field) = &self.updated_at_field {
+            if !is_valid_identifier(field, MAX_FIELD_NAME_LEN) {
+                return Err(RtDbError::schema(format!(
+                    "updatedAtField '{field}' is not a valid identifier"
+                )));
+            }
+            let fty = self.fields.get(field).ok_or_else(|| {
+                RtDbError::schema(format!("updatedAtField '{field}' is not a declared field"))
+            })?;
+            if !matches!(fty, FieldType::Number | FieldType::Int64) {
+                return Err(RtDbError::schema(format!(
+                    "updatedAtField '{field}' must be a number or bigint field"
+                )));
+            }
+            if self.ttl.as_ref().is_some_and(|ttl| &ttl.field == field) {
+                return Err(RtDbError::schema(format!(
+                    "updatedAtField '{field}' must differ from ttl.field (both stamps write unconditionally; a shared field would drop the expiry)"
+                )));
             }
         }
         Ok(())
@@ -1200,6 +1244,7 @@ mod tests {
             owner_field: None,
             collaborators_field: None,
             ttl: None,
+            updated_at_field: None,
             authorize: None,
 
             soft_delete: false,
@@ -1252,6 +1297,7 @@ mod tests {
             owner_field: None,
             collaborators_field: None,
             ttl: None,
+            updated_at_field: None,
             authorize: None,
 
             soft_delete: false,
@@ -1290,6 +1336,7 @@ mod tests {
             owner_field: None,
             collaborators_field: None,
             ttl: None,
+            updated_at_field: None,
             authorize: None,
 
             soft_delete: false,
@@ -1310,6 +1357,7 @@ mod tests {
             owner_field: None,
             collaborators_field: None,
             ttl: None,
+            updated_at_field: None,
             authorize: None,
 
             soft_delete: false,
@@ -1338,6 +1386,7 @@ mod tests {
             owner_field: None,
             collaborators_field: None,
             ttl: None,
+            updated_at_field: None,
             authorize: None,
 
             soft_delete: false,
@@ -1366,6 +1415,7 @@ mod tests {
             owner_field: None,
             collaborators_field: None,
             ttl: None,
+            updated_at_field: None,
             authorize: None,
 
             soft_delete: false,
@@ -1388,6 +1438,7 @@ mod tests {
             owner_field: None,
             collaborators_field: None,
             ttl: None,
+            updated_at_field: None,
             authorize: None,
 
             soft_delete: false,
@@ -1426,6 +1477,7 @@ mod tests {
             owner_field: None,
             collaborators_field: None,
             ttl: None,
+            updated_at_field: None,
             authorize: None,
 
             soft_delete: false,
@@ -1445,6 +1497,7 @@ mod tests {
             owner_field: None,
             collaborators_field: None,
             ttl: None,
+            updated_at_field: None,
             authorize: None,
 
             soft_delete: false,
@@ -1490,6 +1543,7 @@ mod tests {
             owner_field: None,
             collaborators_field: None,
             ttl: None,
+            updated_at_field: None,
             authorize: None,
 
             soft_delete: false,
@@ -1517,6 +1571,7 @@ mod tests {
             owner_field: None,
             collaborators_field: None,
             ttl: None,
+            updated_at_field: None,
             authorize: None,
 
             soft_delete: false,
@@ -1544,6 +1599,7 @@ mod tests {
             owner_field: None,
             collaborators_field: None,
             ttl: None,
+            updated_at_field: None,
             authorize: None,
 
             soft_delete: false,
@@ -1582,6 +1638,7 @@ mod tests {
             owner_field: None,
             collaborators_field: None,
             ttl: None,
+            updated_at_field: None,
             authorize: None,
 
             soft_delete: false,
@@ -1609,6 +1666,7 @@ mod tests {
             owner_field: None,
             collaborators_field: None,
             ttl: None,
+            updated_at_field: None,
             authorize: None,
 
             soft_delete: false,
@@ -1636,6 +1694,7 @@ mod tests {
             owner_field: None,
             collaborators_field: None,
             ttl: None,
+            updated_at_field: None,
             authorize: None,
 
             soft_delete: false,
@@ -1660,6 +1719,7 @@ mod tests {
             owner_field: None,
             collaborators_field: None,
             ttl: None,
+            updated_at_field: None,
             authorize: None,
 
             soft_delete: false,
@@ -1679,6 +1739,7 @@ mod tests {
             owner_field: None,
             collaborators_field: None,
             ttl: None,
+            updated_at_field: None,
             authorize: None,
 
             soft_delete: false,
@@ -1705,6 +1766,7 @@ mod tests {
             owner_field: None,
             collaborators_field: None,
             ttl: None,
+            updated_at_field: None,
             authorize: None,
 
             soft_delete: false,
@@ -1914,6 +1976,7 @@ mod tests {
             owner_field: None,
             collaborators_field: None,
             ttl: None,
+            updated_at_field: None,
             authorize: None,
 
             soft_delete: false,
@@ -2018,6 +2081,7 @@ mod tests {
             owner_field: None,
             collaborators_field: None,
             ttl: None,
+            updated_at_field: None,
             authorize: None,
 
             soft_delete: false,
@@ -2080,6 +2144,7 @@ mod tests {
             owner_field: None,
             collaborators_field: None,
             ttl: None,
+            updated_at_field: None,
             authorize: None,
 
             soft_delete: false,
@@ -2112,6 +2177,7 @@ mod tests {
             owner_field: None,
             collaborators_field: None,
             ttl: None,
+            updated_at_field: None,
             authorize: None,
 
             soft_delete: false,
@@ -2214,6 +2280,7 @@ mod tests {
             owner_field: None,
             collaborators_field: None,
             ttl: None,
+            updated_at_field: None,
             authorize: None,
 
             soft_delete: false,
@@ -2245,6 +2312,7 @@ mod tests {
             owner_field: None,
             collaborators_field: None,
             ttl: None,
+            updated_at_field: None,
             authorize: None,
 
             soft_delete: false,
@@ -2275,6 +2343,7 @@ mod tests {
             owner_field: None,
             collaborators_field: None,
             ttl: None,
+            updated_at_field: None,
             authorize: None,
 
             soft_delete: false,
@@ -2307,6 +2376,7 @@ mod tests {
             owner_field: None,
             collaborators_field: None,
             ttl: None,
+            updated_at_field: None,
             authorize: None,
 
             soft_delete: false,
@@ -2338,6 +2408,7 @@ mod tests {
             owner_field: None,
             collaborators_field: None,
             ttl: None,
+            updated_at_field: None,
             authorize: None,
 
             soft_delete: false,
@@ -2368,6 +2439,7 @@ mod tests {
             owner_field: None,
             collaborators_field: None,
             ttl: None,
+            updated_at_field: None,
             authorize: None,
 
             soft_delete: false,
@@ -2398,6 +2470,7 @@ mod tests {
             owner_field: None,
             collaborators_field: None,
             ttl: None,
+            updated_at_field: None,
             authorize: None,
 
             soft_delete: false,
@@ -2434,6 +2507,7 @@ mod tests {
             owner_field: None,
             collaborators_field: None,
             ttl: None,
+            updated_at_field: None,
             authorize: None,
 
             soft_delete: false,
@@ -2679,6 +2753,7 @@ mod tests {
             owner_field: None,
             collaborators_field: None,
             ttl,
+            updated_at_field: None,
             authorize: None,
 
             soft_delete: false,
@@ -2813,6 +2888,7 @@ mod tests {
             owner_field: None,
             collaborators_field: None,
             ttl: None,
+            updated_at_field: None,
             authorize: None,
 
             soft_delete: false,

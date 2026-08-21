@@ -740,7 +740,10 @@ impl InMemoryRtDbClient {
                     ));
                 }
                 if let Some(row) = rows.into_iter().next() {
-                    let merged = apply_patch(&table_def, &row.doc, patch)?;
+                    // FM-36: the update branch restamps `updatedAtField` into
+                    // the patch fields (server `step_upsert` update branch).
+                    let patch = stamp_updated_at(&table_def, patch, (self.now)());
+                    let merged = apply_patch(&table_def, &row.doc, &patch)?;
                     self.do_update(&table_def, table, &row.id, merged)?;
                     Ok((
                         StepResult::Upsert {
@@ -807,7 +810,12 @@ impl InMemoryRtDbClient {
         table_def: &TableDef,
         doc: &Map<String, Value>,
     ) -> Result<String, RtDbError> {
-        let stamped = stamp_ttl_default(table_def, doc, (self.now)());
+        // One `now` for both stamps (the server's insert path stamps ttl and
+        // updatedAt from the same instant), then defaults — a defaults entry
+        // on the updatedAt field loses to the stamp (server insert order).
+        let now = (self.now)();
+        let stamped = stamp_ttl_default(table_def, doc, now);
+        let stamped = stamp_updated_at(table_def, &stamped, now);
         let stamped = apply_defaults(table_def, &stamped);
         let doc_value = Value::Object(stamped);
         validate_doc(table_def, &doc_value)?;
@@ -846,7 +854,11 @@ impl InMemoryRtDbClient {
             .ok_or_else(|| {
                 RtDbError::new(ErrorCode::NotFound, format!("document '{id}' not found"))
             })?;
-        let merged = apply_patch(table_def, &row.doc, fields)?;
+        // FM-36: stamp `updatedAtField` into the patch fields before the
+        // merge — the same seam the server stamps (step_patch, and via the
+        // shared patch paths patchByQuery + cascade setNull land here too).
+        let fields = stamp_updated_at(table_def, fields, (self.now)());
+        let merged = apply_patch(table_def, &row.doc, &fields)?;
         self.do_update(table_def, table_name, id, merged)?;
         Ok(())
     }
@@ -875,8 +887,11 @@ impl InMemoryRtDbClient {
             ));
         }
         // Replace gets defaults but never a ttl stamp — the server stamps
-        // `default_duration_ms` on insert only.
+        // `default_duration_ms` on insert only. The updatedAt stamp DOES
+        // apply (replace is a version-bumping write) and runs after
+        // defaults, so it wins on the same field (server replace order).
         let stamped = apply_defaults(table_def, doc);
+        let stamped = stamp_updated_at(table_def, &stamped, (self.now)());
         let doc_value = Value::Object(stamped);
         validate_doc(table_def, &doc_value)?;
         let stored = strip_unset_optionals(table_def, &doc_value);
@@ -2013,7 +2028,7 @@ mod validate;
 // Cross-module helpers (private to this module's descendants).
 use migrate::detect_destructive_changes;
 use query::{collect_index_key, require_index};
-use validate::{apply_defaults, matches_filter, stamp_ttl_default};
+use validate::{apply_defaults, matches_filter, stamp_ttl_default, stamp_updated_at};
 
 // Public API re-exports (preserves `par_rt_db_client::in_memory::*`).
 pub use presence::{PresenceHandle, PresenceRooms};

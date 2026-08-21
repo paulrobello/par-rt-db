@@ -1,0 +1,39 @@
+{
+  "name": "updated-at-field-patch-keeps-server-authority",
+  "$comment": "Server-stamped updatedAtField (FM-36) on the patch path: a patch supplying its own updatedAt value cannot leave it in the doc — the server stamps the merged row. Determinism: the follow-up read filters updatedAt > 123, so a doc carrying the client's literal 123 (or no value at all) would be invisible; only a server stamp (wall-clock epoch-ms) matches. Also pins that the stamp survives a patch that does not otherwise mention the field.",
+  "schema": {
+    "tables": {
+      "tasks": {
+        "fields": {
+          "title": { "type": "string" },
+          "updatedAt": { "type": "number" }
+        },
+        "indexes": [{ "name": "by_title", "fields": ["title"] }],
+        "updatedAtField": "updatedAt"
+      }
+    }
+  },
+  "seed": [{ "$id": "a", "doc": { "title": "a" } }],
+  "op": {
+    "txn": {
+      "steps": [
+        {
+          "op": "patch",
+          "table": "tasks",
+          "id": { "$idRef": "a" },
+          "fields": { "title": "b", "updatedAt": 123 }
+        }
+      ]
+    }
+  },
+  "expect": [null],
+  "then": {
+    "query": {
+      "table": "tasks",
+      "filter": { "op": "gt", "field": "updatedAt", "value": 123 }
+    },
+    "expect": [{ "title": "b" }],
+    "normalize": ["_id", "_creationTime", "_version", "updatedAt"],
+    "unordered": true
+  }
+}

@@ -44,6 +44,12 @@ mutate, and subscription re-run; machine tokens bypass):
   (FM-32), stamped onto a **new** document that omits the key (insert / replace
   / upsert-insert only; `patch` never re-applies — clearing a field stays
   cleared).
+- `.updatedAtField("updatedAt")` — declares a server-stamped last-write field
+  (FM-36): names a declared `number` or `int64` field the server stamps with
+  the current epoch-ms on every version-bumping write (insert, patch, replace,
+  upsert both branches, patchByQuery, cascade setNull), overwriting any
+  client-supplied value — a JSON number on `number`, a decimal string on
+  `int64`. Must differ from `ttl.field`; no index required.
 
 Push it with the admin client (admin key required):
 

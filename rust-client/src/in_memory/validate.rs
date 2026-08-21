@@ -237,6 +237,33 @@ pub(super) fn stamp_ttl_default(
     }
 }
 
+/// Stamps the table's `updatedAtField` (FM-36) with `now`, overwriting any
+/// client-supplied value — the same authority model as the server's owner
+/// stamp. Runs on every version-bumping write path: insert, patch, replace,
+/// upsert (both branches), patchByQuery, and cascade setNull. The value
+/// matches the field's wire convention: a JSON number on `number`, a decimal
+/// string on `int64`. Mirrors server `txn::stamp_updated_at`; like
+/// [`stamp_ttl_default`] it runs BEFORE validation so the stamp satisfies a
+/// required field. Returns a cloned map with the field stamped, otherwise the
+/// original doc cloned unchanged.
+pub(super) fn stamp_updated_at(
+    table_def: &TableDef,
+    doc: &Map<String, Value>,
+    now: i64,
+) -> Map<String, Value> {
+    if let Some(field) = &table_def.updated_at_field {
+        let mut out = doc.clone();
+        let value = match table_def.fields.get(field) {
+            Some(FieldType::Int64) => Value::String(now.to_string()),
+            _ => Value::from(now),
+        };
+        out.insert(field.clone(), value);
+        out
+    } else {
+        doc.clone()
+    }
+}
+
 /// Applies the table's push-time-validated `defaults` (FM-32) to a NEW
 /// document: every key the doc omits is stamped from the schema. Runs after
 /// [`stamp_ttl_default`] (a ttl default on the same field wins) and before the

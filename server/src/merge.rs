@@ -361,6 +361,7 @@ mod tests {
 
             soft_delete: false,
             ttl: None,
+            updated_at_field: None,
         }
     }
 

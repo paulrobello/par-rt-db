@@ -14,6 +14,23 @@ contract against Convex.
 
 ## [Unreleased]
 
+### Feature: server-stamped `updatedAtField` (FM-36, server + ts/rust/python/swift)
+
+A table may declare `updatedAtField`, naming a declared `number`/`int64`
+field the server stamps with the current epoch-ms on every version-bumping
+write — insert, patch, replace, upsert (both branches), `patchByQuery`, and
+cascade `setNull` — overwriting any client-supplied value (the `ownerField`
+authority model). The value follows the field's wire convention (JSON number
+on `number`, decimal string on `int64`), sits in both the doc body and the
+typed column when the field is indexed (so "order by recently updated" works
+with a declared index), and wins over a `defaults` entry on the same field.
+Push-time validation rejects an undeclared, non-numeric, or `ttl.field`-colliding
+declaration. Snapshot export/import replays stored docs verbatim — import
+never re-stamps. Mirrored in all four client SDKs (schema DSL builder +
+in-memory engine stamping at the same seam) with semantics-corpus cases
+pinning the wire shape and stamp authority (`updated-at-field-*`), and the
+dashboard Schema page (and schema history) show an `updatedAt` badge.
+
 ## [0.1.0] - 2026-08-18
 
 First tagged release. Everything below this heading shipped under `[Unreleased]`

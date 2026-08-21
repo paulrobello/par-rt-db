@@ -628,6 +628,22 @@ struct SchemaBuilderTests {
         #expect(try wireValue(none).objectValue?["ttl"] == nil)
     }
 
+    @Test func updatedAtFieldSerializesAndRoundTrips() throws {
+        // Mirrors the server's `push_accepts_and_round_trips_updated_at_field`
+        // (FM-36): camelCase wire key when set, omitted when unset.
+        let table = TableBuilder()
+            .field("title", .string)
+            .field("updatedAt", .number)
+            .index("by_title", on: ["title"])
+            .updatedAtField("updatedAt")
+            .finish()
+        #expect(try wireValue(table).objectValue?["updatedAtField"] == .string("updatedAt"))
+        #expect(try roundTrip(table) == table)
+        // Omitted when unset — an ordinary table serializes without the key.
+        let none = TableBuilder().field("title", .string).finish()
+        #expect(try wireValue(none).objectValue?["updatedAtField"] == nil)
+    }
+
     @Test func softDeleteSerializesAndRoundTrips() throws {
         // Mirrors rust `soft_delete_serializes_and_round_trips`.
         let table = TableBuilder()
@@ -650,6 +666,7 @@ struct SchemaBuilderTests {
         #expect(table.ownerField == nil)
         #expect(table.collaboratorsField == nil)
         #expect(table.ttl == nil)
+        #expect(table.updatedAtField == nil)
         #expect(table.authorize == nil)
         #expect(table.defaults.isEmpty)
         #expect(!table.softDelete)

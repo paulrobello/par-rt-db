@@ -1006,6 +1006,29 @@ fn stamp_ttl_default(
     doc
 }
 
+/// Stamps the table's `updatedAtField` (FM-36) with the current epoch-ms,
+/// overwriting any client-supplied value — the same authority model as
+/// `stamp_owner`. Runs on every version-bumping write path: insert, patch,
+/// replace, upsert (both branches), patchByQuery, and cascade setNull. The
+/// value matches the field's wire convention (`validate_value` /
+/// `scalar_bind`): a JSON number on `number`, a decimal string on `int64`.
+/// Snapshot replay (`insert_snapshot_row`) is not a step path and preserves
+/// the stored value verbatim — import never re-stamps.
+fn stamp_updated_at(
+    table_def: &TableDef,
+    mut doc: serde_json::Map<String, serde_json::Value>,
+    now: i64,
+) -> serde_json::Map<String, serde_json::Value> {
+    if let Some(field) = &table_def.updated_at_field {
+        let value = match table_def.fields.get(field) {
+            Some(FieldType::Int64) => serde_json::Value::String(now.to_string()),
+            _ => serde_json::Value::from(now),
+        };
+        doc.insert(field.clone(), value);
+    }
+    doc
+}
+
 /// Applies the table's push-time-validated `defaults` (FM-32) to a NEW
 /// document: every key the doc omits is stamped from the schema. Runs after
 /// `stamp_ttl_default` (a ttl default on the same field wins) and before the
@@ -1383,7 +1406,9 @@ async fn step_insert(
     doc: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<(), RtDbError> {
     let table_def = sctx.schema.table(table)?;
-    let doc = stamp_ttl_default(table_def, doc.clone(), now_ms());
+    let now = now_ms();
+    let doc = stamp_ttl_default(table_def, doc.clone(), now);
+    let doc = stamp_updated_at(table_def, doc, now);
     let doc = apply_defaults(table_def, doc);
     let doc = stamp_owner(table_def, doc, sctx.owner);
     let doc = stamp_authorize(table_def, doc, sctx.ctx);
@@ -1413,6 +1438,7 @@ async fn step_patch(
     check_owner(sctx.tx, sctx.pg_schema_name, table_def, table, id, sctx.ctx).await?;
     let fields = stamp_owner(table_def, fields.clone(), sctx.owner);
     let fields = stamp_authorize(table_def, fields, sctx.ctx);
+    let fields = stamp_updated_at(table_def, fields, now_ms());
     let (pre_doc, merged, created_at) =
         do_patch(sctx.tx, sctx.pg_schema_name, table_def, table, id, &fields).await?;
     verify_authorize_doc(table_def, &merged, sctx.ctx)?;
@@ -1440,6 +1466,7 @@ async fn step_replace(
     let table_def = sctx.schema.table(table)?;
     check_owner(sctx.tx, sctx.pg_schema_name, table_def, table, id, sctx.ctx).await?;
     let doc = apply_defaults(table_def, doc.clone());
+    let doc = stamp_updated_at(table_def, doc, now_ms());
     let doc = stamp_owner(table_def, doc, sctx.owner);
     let doc = stamp_authorize(table_def, doc, sctx.ctx);
     let (old_doc, new_doc, created_at) =
@@ -1554,6 +1581,7 @@ async fn step_upsert(
     match rows.pop() {
         None => {
             let insert = apply_defaults(table_def, insert.clone());
+            let insert = stamp_updated_at(table_def, insert, now_ms());
             let insert = stamp_owner(table_def, insert, sctx.owner);
             let insert = stamp_authorize(table_def, insert, sctx.ctx);
             verify_authorize_doc(table_def, &insert, sctx.ctx)?;
@@ -1581,6 +1609,7 @@ async fn step_upsert(
             check_owner_doc(table_def, &doc, &id, sctx.ctx)?;
             let patch = stamp_owner(table_def, patch.clone(), sctx.owner);
             let patch = stamp_authorize(table_def, patch, sctx.ctx);
+            let patch = stamp_updated_at(table_def, patch, now_ms());
             let pre_doc = doc.clone();
             let merged = apply_patch(table_def, doc, &patch)?;
             apply_update(sctx.tx, sctx.pg_schema_name, table_def, table, &id, &merged).await?;
@@ -1647,6 +1676,7 @@ async fn step_patch_by_query(
         let pre_doc = doc.clone();
         let fields = stamp_owner(table_def, patch.clone(), sctx.owner);
         let fields = stamp_authorize(table_def, fields, sctx.ctx);
+        let fields = stamp_updated_at(table_def, fields, now_ms());
         let merged = apply_patch(table_def, doc, &fields)?;
         apply_update(sctx.tx, pg_schema_name, table_def, table, &id, &merged).await?;
         verify_authorize_doc(table_def, &merged, sctx.ctx)?;
@@ -1933,6 +1963,7 @@ pub(crate) fn delete_row_cascade<'a>(
                             // recomputes to NULL and `version` bumps.
                             let mut fields = serde_json::Map::new();
                             fields.insert(field_name.clone(), serde_json::Value::Null);
+                            let fields = stamp_updated_at(child_table_def, fields, now_ms());
                             let (pre_doc, merged, created_at) = do_patch(
                                 conn,
                                 pg_schema_name,

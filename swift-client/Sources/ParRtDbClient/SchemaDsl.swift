@@ -402,8 +402,8 @@ public struct TtlDef: Equatable, Codable, Sendable {
 
 /// One table: fields, indexes, and opt-in per-row rules / TTL / defaults.
 /// Mirrors rust-client `TableDef` — `indexes` omitted when nil, `ownerField` /
-/// `collaboratorsField` / `ttl` / `authorize` omitted when nil, `defaults`
-/// omitted when empty, `softDelete` omitted when false.
+/// `collaboratorsField` / `ttl` / `updatedAtField` / `authorize` omitted when
+/// nil, `defaults` omitted when empty, `softDelete` omitted when false.
 public struct TableDef: Equatable, Codable, Sendable {
     /// Field name to declared type.
     public var fields: [String: FieldType]
@@ -419,6 +419,14 @@ public struct TableDef: Equatable, Codable, Sendable {
     public var collaboratorsField: String?
     /// Declarative document TTL.
     public var ttl: TtlDef?
+    /// Server-stamped last-write time (FM-36): names a declared `number` or
+    /// `int64` field the server stamps with the current epoch-ms on every
+    /// version-bumping write (insert, patch, replace, upsert — both branches,
+    /// patchByQuery, cascade setNull), overwriting any client-supplied value.
+    /// A `number` field takes a JSON number, an `int64` field a decimal string
+    /// (the int64 wire convention). Must differ from `ttl.field`; no index is
+    /// required on the field. Server-enforced; the client only declares it.
+    public var updatedAtField: String?
     /// Opt-in per-row authorization predicate: a `FilterExpr` over this table's
     /// declared doc fields and the principal's markers (`{"$user":true}` /
     /// `{"$email":true}`). Marker values are valid only here — client
@@ -439,6 +447,7 @@ public struct TableDef: Equatable, Codable, Sendable {
         ownerField: String? = nil,
         collaboratorsField: String? = nil,
         ttl: TtlDef? = nil,
+        updatedAtField: String? = nil,
         authorize: FilterExpr? = nil,
         defaults: [String: JSONValue] = [:],
         softDelete: Bool = false
@@ -448,13 +457,14 @@ public struct TableDef: Equatable, Codable, Sendable {
         self.ownerField = ownerField
         self.collaboratorsField = collaboratorsField
         self.ttl = ttl
+        self.updatedAtField = updatedAtField
         self.authorize = authorize
         self.defaults = defaults
         self.softDelete = softDelete
     }
 
     enum CodingKeys: String, CodingKey {
-        case fields, indexes, ttl, authorize, defaults
+        case fields, indexes, ttl, updatedAtField, authorize, defaults
         case ownerField, collaboratorsField, softDelete
     }
 
@@ -467,6 +477,7 @@ public struct TableDef: Equatable, Codable, Sendable {
             String.self, forKey: .collaboratorsField
         )
         ttl = try container.decodeIfPresent(TtlDef.self, forKey: .ttl)
+        updatedAtField = try container.decodeIfPresent(String.self, forKey: .updatedAtField)
         authorize = try container.decodeIfPresent(FilterExpr.self, forKey: .authorize)
         defaults = try container.decodeIfPresent(
             [String: JSONValue].self, forKey: .defaults
@@ -481,6 +492,7 @@ public struct TableDef: Equatable, Codable, Sendable {
         try container.encodeIfPresent(ownerField, forKey: .ownerField)
         try container.encodeIfPresent(collaboratorsField, forKey: .collaboratorsField)
         try container.encodeIfPresent(ttl, forKey: .ttl)
+        try container.encodeIfPresent(updatedAtField, forKey: .updatedAtField)
         try container.encodeIfPresent(authorize, forKey: .authorize)
         if !defaults.isEmpty {
             try container.encode(defaults, forKey: .defaults)
@@ -649,6 +661,16 @@ public struct TableBuilder: Sendable {
         with { $0.ttl = TtlDef(field: field, defaultDurationMs: defaultDurationMs) }
     }
 
+    /// Declare the server-stamped last-write field (wire `updatedAtField`):
+    /// `field` names a declared `number` or `int64` field the server stamps
+    /// with the current epoch-ms on every version-bumping write (insert,
+    /// patch, replace, upsert — both branches, patchByQuery, cascade
+    /// setNull), overwriting any client-supplied value. Must differ from
+    /// `ttl.field`. Server-enforced; the client only declares it.
+    public func updatedAtField(_ field: String) -> TableBuilder {
+        with { $0.updatedAtField = field }
+    }
+
     /// Declare the per-row authorization predicate: a `FilterExpr` over this
     /// table's declared doc fields and the principal's markers
     /// (`{"$user":true}` / `{"$email":true}`). Marker values are valid only
@@ -660,7 +682,7 @@ public struct TableBuilder: Sendable {
     /// Declare field-level default values. Each key must name a declared field
     /// and its value a non-null literal satisfying that field's type (the
     /// server validates at push time). Server-stamped values (ttl default,
-    /// ownerField) win over a default on the same field.
+    /// updatedAtField, ownerField) win over a default on the same field.
     public func defaults(_ values: [String: JSONValue]) -> TableBuilder {
         with { $0.defaults.merge(values) { _, new in new } }
     }
@@ -683,6 +705,7 @@ public struct TableBuilder: Sendable {
             ownerField: acc.ownerField,
             collaboratorsField: acc.collaboratorsField,
             ttl: acc.ttl,
+            updatedAtField: acc.updatedAtField,
             authorize: acc.authorize,
             defaults: acc.defaults,
             softDelete: acc.softDelete
@@ -697,6 +720,7 @@ private struct Acc: Sendable {
     var ownerField: String?
     var collaboratorsField: String?
     var ttl: TtlDef?
+    var updatedAtField: String?
     var authorize: FilterExpr?
     var defaults: [String: JSONValue] = [:]
     var softDelete = false

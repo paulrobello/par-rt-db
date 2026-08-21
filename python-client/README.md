@@ -230,6 +230,7 @@ schema = SchemaDef.model_validate(
                 "fields": {
                     "name": t.string(),
                     "n": t.number(),
+                    "updatedAt": t.number(),
                     "embedding": t.vector(384),
                     "owner": t.id("users"),
                 },
@@ -247,6 +248,11 @@ schema = SchemaDef.model_validate(
                 # that omits the key (insert/replace/upsert-insert only;
                 # patch never re-applies).
                 "defaults": {"n": 0},
+                # Server-stamped updatedAtField (FM-36): names a declared
+                # number/int64 field the server stamps with epoch-ms on every
+                # version-bumping write, overwriting any client-supplied value
+                # (a decimal string on an int64 field).
+                "updatedAtField": "updatedAt",
             }
         }
     }

@@ -245,14 +245,21 @@ class TtlDef(_S):
 class TableDef(_S):
     """One table: typed fields, indexes, optional per-row ``owner_field`` and
     ``collaborators_field``, an optional ``ttl`` policy, an optional
-    ``authorize`` per-row predicate (Model C), optional field-level
-    ``defaults`` (FM-32), and an optional ``soft_delete`` flag (FM-33)."""
+    ``updated_at_field`` stamp policy (FM-36), an optional ``authorize``
+    per-row predicate (Model C), optional field-level ``defaults`` (FM-32),
+    and an optional ``soft_delete`` flag (FM-33)."""
 
     fields: dict[str, FieldType]
     indexes: list[IndexDef] = Field(default_factory=list)
     owner_field: str | None = None
     collaborators_field: str | None = None
     ttl: TtlDef | None = None
+    # FM-36: names a declared number/int64 field the server stamps with the
+    # current epoch-ms on every version-bumping write (insert, patch, replace,
+    # upsert, patchByQuery, cascade setNull), overwriting any client-supplied
+    # value. Wire key `updatedAtField`, omitted when unset (server
+    # `skip_serializing_if = "Option::is_none"`).
+    updated_at_field: str | None = None
     authorize: FilterExpr | None = None
     # Field-level default values (FM-32): literal values stamped onto a NEW
     # document (insert/replace/upsert-insert) that omits the key. Wire name is
@@ -273,6 +280,10 @@ class TableDef(_S):
         # `ttl` is a behavior toggle (server skip_serializing_if = "Option::is_none").
         if out.get("ttl") is None:
             out.pop("ttl", None)
+        # `updatedAtField` is an opt-in stamp policy (FM-36, server
+        # skip_serializing_if = "Option::is_none"); omit it on the wire when unset.
+        if out.get("updatedAtField") is None:
+            out.pop("updatedAtField", None)
         # `authorize` is an opt-in predicate (server skip_serializing_if =
         # "Option::is_none"); omit it on the wire when unset.
         if out.get("authorize") is None:
@@ -314,6 +325,7 @@ class TableBuilder:
         self._authorize: FilterExpr | None = None
         self._defaults: dict[str, Any] | None = None
         self._soft_delete: bool = False
+        self._updated_at: str | None = None
 
     def field(self, name: str, ft: Any) -> TableBuilder:
         """Declare a typed field ``name`` of type ``ft`` (a ``t.*`` constructor dict)."""
@@ -436,6 +448,18 @@ class TableBuilder:
         self._soft_delete = True
         return self
 
+    def updated_at_field(self, name: str) -> TableBuilder:
+        """Declare the server-stamped updated-at field (FM-36). ``name`` must
+        reference a declared ``number`` or ``int64`` field; the server stamps it
+        with the current epoch-ms on every version-bumping write — insert,
+        patch, replace, upsert (both branches), patchByQuery, and cascade
+        setNull — overwriting any client-supplied value. The value follows the
+        field's wire convention: a JSON number on a ``number`` field, a decimal
+        string on an ``int64`` field. The client only declares the field and
+        round-trips it on the wire as ``updatedAtField``."""
+        self._updated_at = name
+        return self
+
     def _build(self) -> dict[str, Any]:
         out: dict[str, Any] = {"fields": self._fields, "indexes": self._indexes}
         if self._owner is not None:
@@ -448,6 +472,8 @@ class TableBuilder:
             out["defaults"] = self._defaults
         if self._soft_delete:
             out["softDelete"] = True
+        if self._updated_at is not None:
+            out["updatedAtField"] = self._updated_at
         return out
 
 

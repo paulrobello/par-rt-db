@@ -47,7 +47,11 @@ default, also L2 / inner-product; embeddings are client-supplied), and
 read, mutate, and subscription re-run; machine tokens bypass), and
 `defaults(&[(field, value), ...])` declares field-level default values (FM-32) —
 stamped onto a **new** document that omits the key (insert / replace /
-upsert-insert only; `patch` never re-applies).
+upsert-insert only; `patch` never re-applies). `updated_at_field(field)`
+declares a server-stamped update timestamp (FM-36) — the named `number`/`int64`
+field is overwritten with the current epoch-ms on every version-bumping write
+(insert, patch, replace, upsert, patchByQuery, cascade setNull), so any
+client-supplied value never survives.
 
 ### In-memory test harness (feature `in_memory`)
 

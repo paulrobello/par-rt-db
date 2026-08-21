@@ -120,6 +120,7 @@ export class TableDefinition<
     readonly authorizeDef?: FilterExpr,
     readonly defaultsMap?: Record<string, unknown>,
     readonly softDeleteFlag?: boolean,
+    readonly updatedAtFieldName?: string,
   ) {}
 
   index<Name extends string>(
@@ -135,6 +136,7 @@ export class TableDefinition<
       this.authorizeDef,
       this.defaultsMap,
       this.softDeleteFlag,
+      this.updatedAtFieldName,
     );
   }
 
@@ -173,6 +175,7 @@ export class TableDefinition<
       this.authorizeDef,
       this.defaultsMap,
       this.softDeleteFlag,
+      this.updatedAtFieldName,
     );
   }
 
@@ -199,6 +202,7 @@ export class TableDefinition<
       this.authorizeDef,
       this.defaultsMap,
       this.softDeleteFlag,
+      this.updatedAtFieldName,
     );
   }
 
@@ -237,6 +241,7 @@ export class TableDefinition<
       this.authorizeDef,
       this.defaultsMap,
       this.softDeleteFlag,
+      this.updatedAtFieldName,
     );
   }
 
@@ -253,6 +258,7 @@ export class TableDefinition<
       this.authorizeDef,
       this.defaultsMap,
       this.softDeleteFlag,
+      this.updatedAtFieldName,
     );
   }
 
@@ -270,6 +276,7 @@ export class TableDefinition<
       this.authorizeDef,
       this.defaultsMap,
       this.softDeleteFlag,
+      this.updatedAtFieldName,
     );
   }
 
@@ -292,6 +299,7 @@ export class TableDefinition<
       this.authorizeDef,
       this.defaultsMap,
       this.softDeleteFlag,
+      this.updatedAtFieldName,
     );
   }
 
@@ -312,6 +320,7 @@ export class TableDefinition<
       predicate,
       this.defaultsMap,
       this.softDeleteFlag,
+      this.updatedAtFieldName,
     );
   }
 
@@ -333,6 +342,7 @@ export class TableDefinition<
       this.authorizeDef,
       map,
       this.softDeleteFlag,
+      this.updatedAtFieldName,
     );
   }
 
@@ -352,6 +362,31 @@ export class TableDefinition<
       this.authorizeDef,
       this.defaultsMap,
       true,
+      this.updatedAtFieldName,
+    );
+  }
+
+  /** Declare the server-stamped last-write field (FM-36). `field` names a
+   * declared `number` or `int64` field the server stamps with the current
+   * epoch-ms on every version-bumping write — insert, patch, replace, upsert
+   * (both branches), patchByQuery, and cascade setNull — overwriting any
+   * client-supplied value (a JSON number on `number`, a decimal string on
+   * `int64`). The stamp sits in the same authority family as the ttl
+   * `defaultDurationMs` stamp (before field defaults fill), and the field
+   * must differ from `ttl.field`. No index is required on the field.
+   * Server-enforced; the client only declares it and round-trips it on the
+   * wire as `updatedAtField`. */
+  updatedAtField(field: string): TableDefinition<Fields, Indexes> {
+    return new TableDefinition(
+      this.fields,
+      this.indexes,
+      this.ownerFieldName,
+      this.collaboratorsFieldName,
+      this.ttlDef,
+      this.authorizeDef,
+      this.defaultsMap,
+      this.softDeleteFlag,
+      field,
     );
   }
 
@@ -369,6 +404,9 @@ export class TableDefinition<
     if (this.ttlDef) {
       json.ttl = this.ttlDef;
     }
+    if (this.updatedAtFieldName) {
+      json.updatedAtField = this.updatedAtFieldName;
+    }
     if (this.authorizeDef) {
       json.authorize = this.authorizeDef;
     }
@@ -384,7 +422,8 @@ export class TableDefinition<
 
 /** Declare one table from a field-name → validator map (e.g. `t.string()`),
  * then chain `.index()`/`.searchIndex()`/`.vectorIndex()`/`.ownerField()`/
- * `.collaboratorsField()`/`.authorize()`/`.ttl()`/`.defaults()`/`.softDelete()`.
+ * `.collaboratorsField()`/`.authorize()`/`.ttl()`/`.defaults()`/`.softDelete()`/
+ * `.updatedAtField()`.
  * Both the runtime schema pushed to the server and the inferred TS document
  * types derive from this one declaration — there is no codegen. */
 export function defineTable<Fields extends Record<string, Validator<unknown, boolean>>>(
