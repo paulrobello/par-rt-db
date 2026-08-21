@@ -95,6 +95,12 @@ async fn await_signal_side_table_lifecycle() {
     }))
     .unwrap();
     let id = workflows::insert(&pool, &db, &spec).await.unwrap();
+    // Only the advance arm parks, on a row it holds `running` — claim first
+    // (the `status = 'running'` guard on `park_waiting`).
+    let claimed = workflows::claim_due(&pool, &db, now_ms(), 10)
+        .await
+        .unwrap();
+    assert_eq!(claimed.len(), 1);
     // Park: waiting + visibility columns; not claimable before the gate.
     workflows::park_waiting(&pool, &db, &id, 0, "approve", now_ms() + 60_000)
         .await

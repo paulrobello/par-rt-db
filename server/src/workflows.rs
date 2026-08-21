@@ -408,7 +408,10 @@ pub enum SignalDelivery {
 /// Park the run at an `awaitSignal` step: `waiting` + the signal name +
 /// the timeout gate. `gate` is `i64::MAX` when the step omits `timeoutMs`
 /// (never due — only a delivery or cancel wakes the run). `attempts` is
-/// persisted so a timeout retry that re-parks keeps its count.
+/// persisted so a timeout retry that re-parks keeps its count. The
+/// `status = 'running'` guard makes a cancel that lands mid-advance win the
+/// race: the UPDATE silently misses, and a cancelled row never resurrects
+/// as `waiting`.
 pub async fn park_waiting(
     pool: &PgPool,
     db: &str,
@@ -424,7 +427,7 @@ pub async fn park_waiting(
             SET status = 'waiting', attempts = $2, wait_name = $3,
                 waited_since = $4, sleep_until = $5, signal_payload = NULL,
                 updated_at = $4
-         WHERE id = $1"
+         WHERE id = $1 AND status = 'running'"
     ))
     .bind(id)
     .bind(attempts as i32)
@@ -437,7 +440,9 @@ pub async fn park_waiting(
 }
 
 /// Consume a delivered signal and write the step boundary in one UPDATE
-/// (atomic consume + bookkeeping — spec §Semantics). Row stays `running`.
+/// (atomic consume + bookkeeping — spec §Semantics). Row stays `running`;
+/// the `status = 'running'` guard keeps a mid-advance cancel final (the
+/// boundary silently misses rather than outranking the cancel).
 pub async fn record_signal_success(
     pool: &PgPool,
     db: &str,
@@ -457,7 +462,7 @@ pub async fn record_signal_success(
                 step_outcomes = step_outcomes || $3::jsonb,
                 wait_name = NULL, waited_since = NULL, signal_payload = NULL,
                 updated_at = $4
-         WHERE id = $1"
+         WHERE id = $1 AND status = 'running'"
     ))
     .bind(id)
     .bind(next_step as i32)
@@ -605,7 +610,10 @@ pub async fn cancel(pool: &PgPool, db: &str, id: &str) -> Result<bool, RtDbError
 }
 
 /// Connection-bound variant of [`cancel`] for `Step::CancelWorkflow` — the
-/// UPDATE rides the caller's open sqlx transaction.
+/// UPDATE rides the caller's open sqlx transaction. Covers `waiting` rows
+/// like [`cancel`] (cancel is the escape for a wait without a timeout); the
+/// wait columns stay put — inert on a terminal row (`info_from_row`
+/// projects them only while `waiting`).
 pub(crate) async fn cancel_on(
     conn: &mut PgConnection,
     db: &str,
@@ -616,7 +624,7 @@ pub(crate) async fn cancel_on(
     let res = sqlx::query(&format!(
         "UPDATE \"{schema}\".workflows
          SET status = 'cancelled', finished_at = $2, updated_at = $2
-         WHERE id = $1 AND status IN ('pending', 'running')"
+         WHERE id = $1 AND status IN ('pending', 'running', 'waiting')"
     ))
     .bind(id)
     .bind(now_ms())
