@@ -121,10 +121,11 @@ Both omitted unless `status == "waiting"`.
 signal?: Value   // verbatim payload of the signal that satisfied the step
 ```
 
-Omitted for txn steps and for outcomes that ended in failure. An omitted
-payload is delivered as JSON null, so the outcome records `signal: null`
-either way; `signal` is omitted only on outcomes that ended without a signal
-(timeout failures).
+Omitted for txn steps and for outcomes that ended in failure. In the stored
+trail an omitted payload is delivered as JSON null, so the recorded outcome
+carries `"signal": null` just like an explicit one; served read-back
+projections collapse that present null to omitted (a pre-existing
+`Option<Value>` wire limitation shared by all five implementations).
 
 ### WS frame
 

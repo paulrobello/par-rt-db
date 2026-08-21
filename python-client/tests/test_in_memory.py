@@ -2934,6 +2934,35 @@ def test_await_signal_payloadless_delivery_consumes_gate() -> None:
     assert run.step_outcomes[1].attempts == 1
 
 
+def test_await_signal_no_phantom_delivery_after_failed_txn_rollback() -> None:
+    c, clock = _new_clock_client()
+    wid = c.start_workflow(
+        _wf(
+            "gate",
+            [
+                _wf_wait_step(
+                    "approve",
+                    timeout_ms=5_000,
+                    retry=StepRetry(max_attempts=1),
+                )
+            ],
+        )
+    )
+    c.tick()  # park at the timeout gate
+    assert _wf_status(c, wid).status == "waiting"
+    # A failed client txn rolls the runs store back from its deepcopy
+    # snapshot — the no-signal sentinel must survive the copy intact (a
+    # copied sentinel would read as a delivery on the next claim).
+    with pytest.raises(RtDbError):
+        c.mutate(Mutation.builder().delete("items", "missing").build())
+    clock[0] += 5_000  # past the timeout gate, still undelivered
+    c.tick()
+    assert _wf_status(c, wid).status == "failed", "the timeout path, not a phantom success"
+    run = _wf_run(c, wid)
+    assert run.last_error == "awaitSignal 'approve' timed out"
+    assert run.step_outcomes[0].signal is None, "no phantom signal in the outcome"
+
+
 def test_await_signal_timeout_retries_with_fresh_timeout_then_succeeds() -> None:
     c, clock = _new_clock_client()
     wid = c.start_workflow(

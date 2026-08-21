@@ -293,8 +293,23 @@ class _ScheduledJob:
 
 # The awaitSignal slot's "no delivery" state — a sentinel, not None, because
 # a delivered JSON null is None in Python (the server distinguishes them as
-# SQL NULL vs jsonb null; ``signal_workflow`` always sets the slot).
-_NO_SIGNAL = object()
+# SQL NULL vs jsonb null; ``signal_workflow`` always sets the slot). The
+# sentinel must be copy-stable: ``_execute_transaction`` rolls back by
+# restoring a ``deepcopy`` of the runs store, and a copied sentinel would
+# break the ``is not _NO_SIGNAL`` discriminator (a parked run would consume
+# a phantom delivery after any failed txn).
+class _NoSignal:
+    def __repr__(self) -> str:
+        return "_NO_SIGNAL"
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> _NoSignal:
+        return self
+
+    def __copy__(self) -> _NoSignal:
+        return self
+
+
+_NO_SIGNAL = _NoSignal()
 
 
 @dataclass
