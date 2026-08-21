@@ -1,0 +1,45 @@
+{
+  "name": "upsert-insert-stamps-ttl-default",
+  "$comment": "An upsert taking the insert branch creates a brand-new row, so the table's ttl defaultDurationMs stamps the expiry field exactly like a plain insert (spec 2026-08-01-document-ttl-design: \"defaultDurationMs only ever fills the field in at insert time when the client omitted it\"). The server historically skipped the stamp in the upsert branch — silently non-expiring rows, diverging from all four client engines. Determinism: the follow-up read filters expiresAt > 0, so an absent field (the pre-fix server) yields no match while any stamped wall-clock value matches; the generated value itself is normalized out of the expected doc.",
+  "schema": {
+    "tables": {
+      "sessions": {
+        "fields": {
+          "token": { "type": "string" },
+          "expiresAt": { "type": "number" }
+        },
+        "indexes": [
+          { "name": "by_token", "fields": ["token"] },
+          { "name": "by_expiresAt", "fields": ["expiresAt"] }
+        ],
+        "ttl": { "field": "expiresAt", "defaultDurationMs": 3600000 }
+      }
+    }
+  },
+  "seed": [],
+  "op": {
+    "txn": {
+      "steps": [
+        {
+          "op": "upsert",
+          "table": "sessions",
+          "index": "by_token",
+          "eq": ["t"],
+          "insert": { "token": "t" },
+          "patch": {}
+        }
+      ]
+    }
+  },
+  "expect": [{ "inserted": true }],
+  "normalize": ["_id", "_creationTime", "_version", "id"],
+  "then": {
+    "query": {
+      "table": "sessions",
+      "filter": { "op": "gt", "field": "expiresAt", "value": 0 }
+    },
+    "expect": [{ "token": "t" }],
+    "normalize": ["_id", "_creationTime", "_version", "expiresAt"],
+    "unordered": true
+  }
+}

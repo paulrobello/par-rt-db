@@ -14,6 +14,24 @@ contract against Convex.
 
 ## [Unreleased]
 
+### Fix: upsert-insert now stamps the ttl `defaultDurationMs` (server; engines already did)
+
+The server's upsert insert branch applied FM-32 defaults but skipped the
+ttl-default stamp, so a document born via upsert on a TTL table silently
+carried no expiry — and the server diverged from all four client engines,
+whose shared insert paths stamp it. The branch now mirrors `step_insert`'s
+exact order (ttl stamp → updatedAt stamp → defaults → owner → authorize).
+Upsert-update and replace are unchanged: after insert the field is ordinary
+(the ttl design's "never re-stamped after insert" ruling). Pinned by
+`server/tests/ttl_test.rs` (upsert-insert stamps within the insert window;
+upsert-update leaves the stored expiry untouched) and two semantics-corpus
+cases — `upsert-insert-stamps-ttl-default` and
+`replace-keeps-supplied-ttl-no-restamp` (which also documents that the spec's
+"replace omitting the field stops expiry" scenario is unreachable: a declared
+ttl field is required, so such a replace is a `SCHEMA_VIOLATION` on every
+runner). Found during the FM-36 client mirrors (two agents independently
+flagged it).
+
 ### Feature: server-stamped `updatedAtField` (FM-36, server + ts/rust/python/swift)
 
 A table may declare `updatedAtField`, naming a declared `number`/`int64`

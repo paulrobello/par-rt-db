@@ -989,9 +989,11 @@ fn verify_authorize_doc(
 }
 
 /// Stamps the TTL field at insert time when the table declares a
-/// `default_duration_ms` and the document omits the field. After this, the TTL
-/// field is ordinary (patch/replace manipulate it normally). See
-/// `docs/superpowers/specs/2026-08-01-document-ttl-design.md`.
+/// `default_duration_ms` and the document omits the field. Both insert paths
+/// stamp — the `Insert` step and upsert's insert branch (a doc born via
+/// upsert is born at insert time; the engines' shared insert paths agree).
+/// After this, the TTL field is ordinary (patch/replace manipulate it
+/// normally). See `docs/superpowers/specs/2026-08-01-document-ttl-design.md`.
 fn stamp_ttl_default(
     table_def: &TableDef,
     mut doc: serde_json::Map<String, serde_json::Value>,
@@ -1580,8 +1582,10 @@ async fn step_upsert(
     }
     match rows.pop() {
         None => {
-            let insert = apply_defaults(table_def, insert.clone());
-            let insert = stamp_updated_at(table_def, insert, now_ms());
+            let now = now_ms();
+            let insert = stamp_ttl_default(table_def, insert.clone(), now);
+            let insert = stamp_updated_at(table_def, insert, now);
+            let insert = apply_defaults(table_def, insert);
             let insert = stamp_owner(table_def, insert, sctx.owner);
             let insert = stamp_authorize(table_def, insert, sctx.ctx);
             verify_authorize_doc(table_def, &insert, sctx.ctx)?;

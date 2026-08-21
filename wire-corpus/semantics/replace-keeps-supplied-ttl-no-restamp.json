@@ -1,0 +1,42 @@
+{
+  "name": "replace-keeps-supplied-ttl-no-restamp",
+  "$comment": "Pins the ttl-design ruling that replace never stamps the ttl default (\"no special handling ... defaultDurationMs is never re-stamped after insert\"): the seed insert stamps expiresAt at wall-clock now+1h, the replace then supplies an explicit tiny literal, and the follow-up read returns exactly that literal — the stored expiry is the caller's, with no stamp assistance on the replace path. (The spec's sibling scenario — a replace that OMITS expiresAt leaving the row non-expiring, 'Mongo semantics' — is unreachable under shipped validation: validate_ttl admits only a bare number/int64 field, which is required, so a replace omitting it is a SCHEMA_VIOLATION on every runner. Companion to upsert-insert-stamps-ttl-default, which pins the insert-branch stamp.)",
+  "schema": {
+    "tables": {
+      "sessions": {
+        "fields": {
+          "token": { "type": "string" },
+          "expiresAt": { "type": "number" }
+        },
+        "indexes": [
+          { "name": "by_token", "fields": ["token"] },
+          { "name": "by_expiresAt", "fields": ["expiresAt"] }
+        ],
+        "ttl": { "field": "expiresAt", "defaultDurationMs": 3600000 }
+      }
+    }
+  },
+  "seed": [{ "$id": "a", "doc": { "token": "t" } }],
+  "op": {
+    "txn": {
+      "steps": [
+        {
+          "op": "replace",
+          "table": "sessions",
+          "id": { "$idRef": "a" },
+          "doc": { "token": "t2", "expiresAt": 123 }
+        }
+      ]
+    }
+  },
+  "expect": [null],
+  "then": {
+    "query": {
+      "table": "sessions",
+      "filter": { "op": "eq", "field": "token", "value": "t2" }
+    },
+    "expect": [{ "token": "t2", "expiresAt": 123 }],
+    "normalize": ["_id", "_creationTime", "_version"],
+    "unordered": true
+  }
+}

@@ -824,3 +824,150 @@ async fn reaper_ignores_tables_without_ttl() {
 
     let _ = db::drop_database(&pool, &db).await;
 }
+
+// (g) Upsert taking the INSERT branch is an insert — the ttl default stamps
+// there exactly like the `Insert` step. The server historically skipped it
+// (only FM-32 defaults ran in that branch), silently producing non-expiring
+// rows and diverging from all four client engines, whose shared insert paths
+// stamp it. Pinned to the same `_creationTime + defaultDurationMs ± SLACK_MS`
+// window as test (a). The upsert eq lookup needs an index on `userId`, so
+// these two tests carry their own fixture variant.
+fn sessions_upsert_schema() -> SchemaDef {
+    let mut json = sessions_schema_json();
+    json["tables"]["sessions"]["indexes"]
+        .as_array_mut()
+        .expect("indexes array")
+        .push(serde_json::json!({ "name": "by_userId", "fields": ["userId"] }));
+    serde_json::from_value(json).expect("parse upsert sessions schema")
+}
+
+async fn setup_upsert_ttl_db(pool: &sqlx::PgPool) -> common::TestDb {
+    let name = format!("t{}", uuid::Uuid::now_v7().simple());
+    db::create_database(pool, &name)
+        .await
+        .expect("create fresh database");
+    ddl::push_schema(pool, &name, sessions_upsert_schema())
+        .await
+        .expect("push upsert sessions schema");
+    common::wrap_test_db(name)
+}
+
+#[tokio::test]
+async fn upsert_insert_stamps_ttl_default_when_field_absent() {
+    let state = common::test_state().await;
+    let pool = state.pool.clone();
+    let db = setup_upsert_ttl_db(&pool).await;
+    let schema = sessions_upsert_schema();
+
+    let outcome = execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::Upsert {
+                table: "sessions".to_string(),
+                index: "by_userId".to_string(),
+                eq: vec![serde_json::json!("u1")],
+                insert: serde_json::json!({ "userId": "u1" })
+                    .as_object()
+                    .expect("object")
+                    .clone(),
+                patch: serde_json::json!({}).as_object().expect("object").clone(),
+            }],
+        },
+        &PrincipalCtx::bypass(),
+    )
+    .await
+    .expect("upsert txn");
+    assert_eq!(outcome.results[0]["inserted"], serde_json::json!(true));
+    let id = outcome.results[0]["id"]
+        .as_str()
+        .expect("id string")
+        .to_string();
+
+    let doc = get_doc(&pool, &db, &schema, "sessions", &id).await;
+    let expires_at = doc["expiresAt"]
+        .as_i64()
+        .expect("expiresAt stamped as a number on the upsert insert branch");
+    let creation_time = doc["_creationTime"]
+        .as_i64()
+        .expect("_creationTime present");
+
+    let lower = creation_time + DEFAULT_DURATION_MS - SLACK_MS;
+    let upper = creation_time + DEFAULT_DURATION_MS + SLACK_MS;
+    assert!(
+        expires_at >= lower && expires_at <= upper,
+        "expiresAt={expires_at} not within [{lower}, {upper}] — a doc born via \
+         upsert-insert must expire like any other insert"
+    );
+
+    let _ = db::drop_database(&pool, &db).await;
+}
+
+// (h) Upsert taking the UPDATE branch never re-stamps: after insert the TTL
+// field is ordinary, so a patch that omits it leaves the stored expiry exactly
+// as it was (spec: "defaultDurationMs is never re-stamped after insert").
+#[tokio::test]
+async fn upsert_update_does_not_restamp_ttl_field() {
+    let state = common::test_state().await;
+    let pool = state.pool.clone();
+    let db = setup_upsert_ttl_db(&pool).await;
+    let schema = sessions_upsert_schema();
+
+    let outcome = execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::Insert {
+                table: "sessions".to_string(),
+                doc: serde_json::json!({ "userId": "u1" })
+                    .as_object()
+                    .expect("object")
+                    .clone(),
+            }],
+        },
+        &PrincipalCtx::bypass(),
+    )
+    .await
+    .expect("insert txn");
+    let id = outcome.results[0]["id"]
+        .as_str()
+        .expect("id string")
+        .to_string();
+    let first = get_doc(&pool, &db, &schema, "sessions", &id).await;
+    let first_expires = first["expiresAt"].as_i64().expect("insert stamped expiry");
+
+    execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::Upsert {
+                table: "sessions".to_string(),
+                index: "by_userId".to_string(),
+                eq: vec![serde_json::json!("u1")],
+                insert: serde_json::json!({ "userId": "u1" })
+                    .as_object()
+                    .expect("object")
+                    .clone(),
+                patch: serde_json::json!({ "userId": "u1" })
+                    .as_object()
+                    .expect("object")
+                    .clone(),
+            }],
+        },
+        &PrincipalCtx::bypass(),
+    )
+    .await
+    .expect("upsert txn");
+
+    let doc = get_doc(&pool, &db, &schema, "sessions", &id).await;
+    assert_eq!(
+        doc["expiresAt"].as_i64(),
+        Some(first_expires),
+        "upsert-update must leave the stored expiry untouched"
+    );
+
+    let _ = db::drop_database(&pool, &db).await;
+}
