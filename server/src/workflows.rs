@@ -33,6 +33,26 @@ pub fn validate_spec(spec: &WorkflowSpec) -> Result<(), RtDbError> {
         )));
     }
     for (i, step) in spec.steps.iter().enumerate() {
+        match (&step.txn, &step.await_signal) {
+            (Some(_), Some(_)) | (None, None) => {
+                return Err(RtDbError::bad_request(format!(
+                    "steps[{i}] must carry exactly one of txn or awaitSignal"
+                )));
+            }
+            (Some(_), None) => {}
+            (None, Some(sig)) => {
+                if sig.name.is_empty() || sig.name.len() > 256 {
+                    return Err(RtDbError::bad_request(format!(
+                        "steps[{i}].awaitSignal.name must be 1..=256 chars"
+                    )));
+                }
+                if sig.timeout_ms == Some(0) {
+                    return Err(RtDbError::bad_request(format!(
+                        "steps[{i}].awaitSignal.timeoutMs must be > 0"
+                    )));
+                }
+            }
+        }
         if let Some(r) = &step.retry {
             if r.max_attempts == 0 {
                 return Err(RtDbError::bad_request(format!(
@@ -46,7 +66,11 @@ pub fn validate_spec(spec: &WorkflowSpec) -> Result<(), RtDbError> {
             }
         }
     }
-    let total: usize = spec.steps.iter().map(|s| count_steps(&s.txn)).sum();
+    let total: usize = spec
+        .steps
+        .iter()
+        .map(|s| s.txn.as_ref().map_or(0, count_steps))
+        .sum();
     if total > MAX_STEPS {
         return Err(RtDbError::bad_request(format!(
             "workflow recursive step count {total} exceeds MAX_STEPS {MAX_STEPS}"
@@ -482,6 +506,8 @@ fn info_from_row(row: InfoRow) -> Result<WorkflowInfo, RtDbError> {
         attempts: attempts.max(0) as u32,
         sleep_until,
         last_error,
+        waiting_for: None,
+        waited_since: None,
         created_at,
         updated_at,
         started_at,
@@ -624,12 +650,13 @@ mod tests {
     }
     fn step_txn() -> WorkflowStepSpec {
         WorkflowStepSpec {
-            txn: Transaction {
+            txn: Some(Transaction {
                 steps: vec![Step::Insert {
                     table: "t".into(),
                     doc: serde_json::Map::new(),
                 }],
-            },
+            }),
+            await_signal: None,
             retry: None,
             sleep_before_ms: None,
         }
@@ -678,16 +705,61 @@ mod tests {
                 .collect(),
         };
         let s1 = WorkflowStepSpec {
-            txn: big.clone(),
+            txn: Some(big.clone()),
+            await_signal: None,
             retry: None,
             sleep_before_ms: None,
         };
         let s2 = WorkflowStepSpec {
-            txn: big,
+            txn: Some(big),
+            await_signal: None,
             retry: None,
             sleep_before_ms: None,
         };
         assert!(validate_spec(&spec_with(vec![s1, s2])).is_err()); // 1200 > MAX_STEPS(1024)
+    }
+
+    #[test]
+    fn validate_rejects_await_signal_abuse() {
+        let mk = |steps: Vec<serde_json::Value>| {
+            serde_json::from_value::<WorkflowSpec>(serde_json::json!({"name": "v", "steps": steps}))
+                .unwrap()
+        };
+        // neither txn nor awaitSignal:
+        assert!(validate_spec(&mk(vec![serde_json::json!({ "sleepBeforeMs": 5 })])).is_err());
+        // both:
+        assert!(
+            validate_spec(&mk(vec![serde_json::json!({
+            "txn": { "steps": [] }, "awaitSignal": { "name": "a" } })]))
+            .is_err()
+        );
+        // empty + oversize name:
+        assert!(
+            validate_spec(&mk(vec![
+                serde_json::json!({ "awaitSignal": { "name": "" } })
+            ]))
+            .is_err()
+        );
+        assert!(
+            validate_spec(&mk(vec![
+                serde_json::json!({ "awaitSignal": { "name": "x".repeat(257) } })
+            ]))
+            .is_err()
+        );
+        // timeoutMs 0:
+        assert!(
+            validate_spec(&mk(vec![
+                serde_json::json!({ "awaitSignal": { "name": "a", "timeoutMs": 0 } })
+            ]))
+            .is_err()
+        );
+        // valid minimal:
+        assert!(
+            validate_spec(&mk(vec![
+                serde_json::json!({ "awaitSignal": { "name": "a" } })
+            ]))
+            .is_ok()
+        );
     }
 
     #[test]

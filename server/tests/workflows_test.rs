@@ -498,10 +498,12 @@ async fn spec_bounds_and_allowlist_rejected() -> anyhow::Result<()> {
 
     // The smuggle attempt: a spec whose step txn writes the forbidden table.
     let mut smuggle = one_step_spec("scoped");
-    smuggle.steps[0].txn.steps = vec![Step::Insert {
-        table: "workItems".to_string(),
-        doc: valid_work_item_doc("smuggled"),
-    }];
+    smuggle.steps[0].txn = Some(Transaction {
+        steps: vec![Step::Insert {
+            table: "workItems".to_string(),
+            doc: valid_work_item_doc("smuggled"),
+        }],
+    });
     let err = execute_txn(
         &pool,
         &db,
@@ -526,10 +528,12 @@ async fn spec_bounds_and_allowlist_rejected() -> anyhow::Result<()> {
     // forbidden table — the `authorize_txn_tables` → `authorize_spec_tables`
     // recursion blocks it.
     let mut nested = one_step_spec("nested");
-    nested.steps[0].txn.steps = vec![Step::Insert {
-        table: "workItems".to_string(),
-        doc: valid_work_item_doc("nested"),
-    }];
+    nested.steps[0].txn = Some(Transaction {
+        steps: vec![Step::Insert {
+            table: "workItems".to_string(),
+            doc: valid_work_item_doc("nested"),
+        }],
+    });
     let err = execute_txn(
         &pool,
         &db,

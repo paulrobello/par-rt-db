@@ -1353,19 +1353,21 @@ async fn handle_workflow_advance(
             crate::workflows::mark_failed(&ctx.pool, &ctx.db, &row.id, &outcome, msg).await?;
             return Ok(());
         };
+        // Every step carries exactly one of txn/awaitSignal (submit-time
+        // `validate_spec`); an awaitSignal step parks the run rather than
+        // executing. Reaching a txn-less step on this path means the parking
+        // arm is absent — mark failed rather than panic the committer task,
+        // mirroring the out-of-range guard above.
+        let Some(txn) = &step.txn else {
+            let outcome = failed_outcome(&row, "awaitSignal step reached without signal support");
+            let msg = "workflow awaitSignal step not yet supported";
+            crate::workflows::mark_failed(&ctx.pool, &ctx.db, &row.id, &outcome, msg).await?;
+            return Ok(());
+        };
         let retry = step.retry.unwrap_or_default();
         let exec = match quota_err.take() {
             Some(e) => Err(e),
-            None => {
-                execute_txn(
-                    &ctx.pool,
-                    &ctx.db,
-                    &schema,
-                    &step.txn,
-                    &PrincipalCtx::bypass(),
-                )
-                .await
-            }
+            None => execute_txn(&ctx.pool, &ctx.db, &schema, txn, &PrincipalCtx::bypass()).await,
         };
         match exec {
             Ok(outcome) => {
@@ -1393,6 +1395,7 @@ async fn handle_workflow_advance(
                     attempts: row.attempts + 1,
                     at: now,
                     error: None,
+                    signal: None,
                 };
                 if finished {
                     crate::workflows::finalize_success(&ctx.pool, &ctx.db, &row.id, &record)
@@ -1448,6 +1451,7 @@ async fn handle_workflow_advance(
                     attempts: row.attempts,
                     at: now,
                     error: Some(err.message.clone()),
+                    signal: None,
                 };
                 crate::workflows::mark_failed(&ctx.pool, &ctx.db, &row.id, &record, &err.message)
                     .await?;
@@ -1471,6 +1475,7 @@ fn failed_outcome(
         attempts: row.attempts.max(1),
         at: now_ms(),
         error: Some(error.to_string()),
+        signal: None,
     }
 }
 

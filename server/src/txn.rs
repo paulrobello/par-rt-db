@@ -65,7 +65,7 @@ pub(crate) fn count_steps(txn: &Transaction) -> usize {
                 1 + spec
                     .steps
                     .iter()
-                    .map(|s| count_steps(&s.txn))
+                    .map(|s| s.txn.as_ref().map_or(0, count_steps))
                     .sum::<usize>()
             }
             _ => 1,
@@ -2213,7 +2213,10 @@ pub(crate) fn authorize_spec_tables(
     spec: &crate::protocol::WorkflowSpec,
 ) -> Result<(), RtDbError> {
     for step in &spec.steps {
-        authorize_txn_tables(ctx, &step.txn)?;
+        // An awaitSignal step carries no txn and touches no tables.
+        if let Some(txn) = &step.txn {
+            authorize_txn_tables(ctx, txn)?;
+        }
     }
     Ok(())
 }

@@ -433,6 +433,16 @@ async fn handle_text_frame(
         ClientMessage::CancelWorkflow { workflow_id, id } => {
             handle_cancel_workflow(fctx, workflow_id, id).await
         }
+        // Wire type landed ahead of the delivering handler (Task 3): ack
+        // failure so an early client gets a clean reply, never silence.
+        ClientMessage::SignalWorkflow { workflow_id, .. } => {
+            let _ = fctx.out_tx.send(ServerMessage::WorkflowAck {
+                workflow_id,
+                ok: false,
+                error: Some(RtDbError::bad_request("signalWorkflow not yet implemented")),
+            });
+            false
+        }
         ClientMessage::ListWorkflows {
             workflow_id,
             status,

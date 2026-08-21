@@ -72,6 +72,15 @@ pub enum ClientMessage {
         workflow_id: String,
         id: String,
     },
+    /// Deliver a named signal to a waiting run (`awaitSignal` steps). The
+    /// reply reuses `ServerMessage::WorkflowAck`.
+    SignalWorkflow {
+        workflow_id: String,
+        id: String,
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        payload: Option<serde_json::Value>,
+    },
     ListWorkflows {
         workflow_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -395,12 +404,28 @@ impl Default for StepRetry {
     }
 }
 
-/// One workflow step: an ordinary `Transaction` plus policy. The txn may
-/// itself carry `Schedule`/`CancelSchedule` steps (FM-28 rules apply).
+/// An `awaitSignal` step's wait declaration (spec §Wire): park the run
+/// until a signal named `name` is delivered; `timeoutMs` bounds each wait
+/// attempt (omitted = wait indefinitely, cancel is the escape).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AwaitSignalSpec {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+}
+
+/// One workflow step: either an ordinary `Transaction` or an
+/// [`AwaitSignalSpec`] wait (exactly one — `validate_spec` enforces it),
+/// plus policy. The txn may itself carry `Schedule`/`CancelSchedule` steps
+/// (FM-28 rules apply).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WorkflowStepSpec {
-    pub txn: Transaction,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub txn: Option<Transaction>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub await_signal: Option<AwaitSignalSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry: Option<StepRetry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -417,12 +442,13 @@ pub struct WorkflowSpec {
 }
 
 /// Run lifecycle. Closed domain (ARC-004/QA-008 pattern — was never a free
-/// string). Snake-case wire: pending|running|success|failed|cancelled.
+/// string). Snake-case wire: pending|running|waiting|success|failed|cancelled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkflowStatus {
     Pending,
     Running,
+    Waiting,
     Success,
     Failed,
     Cancelled,
@@ -433,6 +459,7 @@ impl WorkflowStatus {
         match self {
             WorkflowStatus::Pending => "pending",
             WorkflowStatus::Running => "running",
+            WorkflowStatus::Waiting => "waiting",
             WorkflowStatus::Success => "success",
             WorkflowStatus::Failed => "failed",
             WorkflowStatus::Cancelled => "cancelled",
@@ -446,6 +473,7 @@ impl std::str::FromStr for WorkflowStatus {
         match s {
             "pending" => Ok(WorkflowStatus::Pending),
             "running" => Ok(WorkflowStatus::Running),
+            "waiting" => Ok(WorkflowStatus::Waiting),
             "success" => Ok(WorkflowStatus::Success),
             "failed" => Ok(WorkflowStatus::Failed),
             "cancelled" => Ok(WorkflowStatus::Cancelled),
@@ -466,6 +494,8 @@ pub struct StepOutcome {
     pub at: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -489,6 +519,10 @@ pub struct WorkflowInfo {
     pub sleep_until: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting_for: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waited_since: Option<i64>,
     pub created_at: i64,
     pub updated_at: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -873,6 +907,76 @@ mod tests {
     }
 
     #[test]
+    fn await_signal_step_wire_shape() {
+        let spec = serde_json::from_value::<WorkflowSpec>(serde_json::json!({
+            "name": "gate",
+            "steps": [ { "awaitSignal": { "name": "approve", "timeoutMs": 3_600_000 } } ]
+        }))
+        .expect("parse awaitSignal spec");
+        let step = &spec.steps[0];
+        assert!(step.txn.is_none());
+        let sig = step.await_signal.as_ref().expect("awaitSignal present");
+        assert_eq!(sig.name, "approve");
+        assert_eq!(sig.timeout_ms, Some(3_600_000));
+        // Round-trip omits absent optionals:
+        let v = serde_json::to_value(&spec).unwrap();
+        assert!(v["steps"][0].get("txn").is_none());
+        assert!(v["steps"][0].get("sleepBeforeMs").is_none());
+        // deny_unknown_fields:
+        assert!(
+            serde_json::from_value::<WorkflowSpec>(serde_json::json!({
+                "name": "g", "steps": [ { "awaitSignal": { "name": "a", "bogus": 1 } } ]
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn waiting_status_wire_is_snake_case() {
+        assert_eq!(
+            serde_json::to_value(WorkflowStatus::Waiting).unwrap(),
+            serde_json::json!("waiting")
+        );
+        assert_eq!(
+            "waiting".parse::<WorkflowStatus>().unwrap(),
+            WorkflowStatus::Waiting
+        );
+    }
+
+    #[test]
+    fn workflow_info_wait_fields_omit_when_absent() {
+        let info = serde_json::from_value::<WorkflowInfo>(serde_json::json!({
+            "id": "w1", "name": "n", "status": "waiting", "currentStep": 1,
+            "stepCount": 2, "attempts": 0, "createdAt": 1, "updatedAt": 2,
+            "waitingFor": "approve", "waitedSince": 1234
+        }))
+        .expect("info");
+        assert_eq!(info.waiting_for.as_deref(), Some("approve"));
+        assert_eq!(info.waited_since, Some(1234));
+        let v = serde_json::to_value(WorkflowInfo {
+            waiting_for: None,
+            waited_since: None,
+            ..info
+        })
+        .unwrap();
+        assert!(v.get("waitingFor").is_none() && v.get("waitedSince").is_none());
+    }
+
+    #[test]
+    fn signal_workflow_frame_wire_shape() {
+        let m = serde_json::to_value(ClientMessage::SignalWorkflow {
+            workflow_id: "c1".into(),
+            id: "w1".into(),
+            name: "approve".into(),
+            payload: Some(serde_json::json!({"ok": true})),
+        })
+        .unwrap();
+        assert_eq!(m["type"], "signalWorkflow");
+        assert_eq!(m["name"], "approve");
+        assert_eq!(m["payload"]["ok"], true);
+    }
+
+    #[test]
     fn workflow_status_wire_is_snake_case() {
         assert_eq!(
             serde_json::to_value(WorkflowStatus::Pending).unwrap(),
@@ -917,6 +1021,8 @@ mod tests {
             attempts: 0,
             sleep_until: Some(123),
             last_error: None,
+            waiting_for: None,
+            waited_since: None,
             created_at: 1,
             updated_at: 2,
             started_at: None,
@@ -1026,6 +1132,7 @@ mod tests {
         let all = [
             (WorkflowStatus::Pending, "pending"),
             (WorkflowStatus::Running, "running"),
+            (WorkflowStatus::Waiting, "waiting"),
             (WorkflowStatus::Success, "success"),
             (WorkflowStatus::Failed, "failed"),
             (WorkflowStatus::Cancelled, "cancelled"),
@@ -1050,6 +1157,7 @@ mod tests {
                 attempts: 1,
                 at: 99,
                 error: None,
+                signal: None,
             }],
         };
         let v = serde_json::to_value(&full).unwrap();
